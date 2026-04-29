@@ -153,6 +153,12 @@ def test_runtime_status_reports_readiness_and_default_safety() -> None:
     assert payload["safety"]["automated_order_submission_block_reason"] == "paused"
     assert payload["safety"]["last_change"]["action"] == "bootstrap"
     assert payload["counts"] == {"open_orders": 0, "active_execution_jobs": 0}
+    assert payload["symbols"] == {
+        "monitored": [],
+        "scheduled_today": [],
+        "filled_today": [],
+        "failed_today": [],
+    }
     assert payload["liveness"]["monitoring"]["status"] == "not_started"
 
     with app.state.db_session_factory() as session:
@@ -943,5 +949,118 @@ def test_order_execution_and_position_read_endpoints_return_persisted_state() ->
     assert len(positions_payload) == 1
     assert positions_payload[0]["symbol"] == "005930"
     assert positions_payload[0]["average_price"] == "70950.5000"
+
+    engine.dispose()
+
+
+def test_runtime_status_exposes_core_facing_symbol_summary() -> None:
+    app, engine = build_test_app(settings=Settings(database_url="sqlite:///:memory:", runtime_mode="paper"))
+    now_seoul = datetime.now(runtime_service.KRX_TIMEZONE)
+    today_utc = now_seoul.replace(hour=9, minute=5, second=0, microsecond=0).astimezone(UTC)
+
+    with app.state.db_session_factory() as session:
+        paper_plan = ExecutionPlan(
+            external_plan_id="paper-summary-plan",
+            source="kai-trading-core",
+            mode="paper",
+            status="accepted",
+        )
+        monitored_item = ExecutionPlanItem(
+            symbol="005930",
+            side="sell",
+            intent="target_sell",
+            status="target_sell_monitoring",
+        )
+        scheduled_item = ExecutionPlanItem(
+            symbol="000660",
+            side="buy",
+            intent="next_open_buy",
+            status="next_open_buy_scheduled",
+        )
+        failed_item = ExecutionPlanItem(
+            symbol="035420",
+            side="buy",
+            intent="next_open_buy",
+            status="next_open_buy_failed",
+        )
+        paper_plan.items.extend([monitored_item, scheduled_item, failed_item])
+        session.add(paper_plan)
+        session.flush()
+
+        session.add(
+            ExecutionJob(
+                execution_plan_item_id=scheduled_item.id,
+                job_type="next_open_buy",
+                status="scheduled",
+                scheduled_for=today_utc,
+            )
+        )
+        open_order = BrokerOrder(
+            execution_plan_item_id=scheduled_item.id,
+            idempotency_key="paper-open-order",
+            broker_order_id="kis-open-1",
+            symbol="000660",
+            side="buy",
+            status="open",
+            quantity=3,
+            submitted_at=today_utc,
+            last_broker_sync_at=today_utc,
+        )
+        failed_order = BrokerOrder(
+            execution_plan_item_id=failed_item.id,
+            idempotency_key="paper-failed-order",
+            broker_order_id="kis-failed-1",
+            symbol="035420",
+            side="buy",
+            status="failed",
+            quantity=2,
+            submitted_at=today_utc,
+            last_broker_sync_at=today_utc,
+            last_error_message="broker rejected order",
+        )
+        session.add_all([open_order, failed_order])
+        session.flush()
+        session.add(
+            ExecutionFill(
+                broker_order_pk=open_order.id,
+                broker_fill_id="fill-paper-1",
+                symbol="000660",
+                side="buy",
+                quantity=3,
+                price=Decimal("125000.0000"),
+                filled_at=today_utc,
+                payload={"source": "broker"},
+            )
+        )
+
+        live_plan = ExecutionPlan(
+            external_plan_id="live-summary-plan",
+            source="kai-trading-core",
+            mode="live",
+            status="accepted",
+        )
+        live_plan.items.append(
+            ExecutionPlanItem(
+                symbol="251340",
+                side="sell",
+                intent="target_sell",
+                status="target_sell_monitoring",
+            )
+        )
+        session.add(live_plan)
+        session.commit()
+
+    client = TestClient(app)
+    response = client.get("/runtime/status")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["counts"] == {"open_orders": 1, "active_execution_jobs": 1}
+    assert payload["symbols"] == {
+        "monitored": ["005930"],
+        "scheduled_today": ["000660"],
+        "filled_today": ["000660"],
+        "failed_today": ["035420"],
+    }
 
     engine.dispose()

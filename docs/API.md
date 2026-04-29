@@ -39,6 +39,10 @@ Current foundation response includes:
 - `liveness.monitoring`
 - `counts.open_orders`
 - `counts.active_execution_jobs`
+- `symbols.monitored`
+- `symbols.scheduled_today`
+- `symbols.filled_today`
+- `symbols.failed_today`
 
 ### `GET /runtime/safety`
 Returns safety controls and operator override state.

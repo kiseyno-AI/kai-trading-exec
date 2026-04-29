@@ -1,6 +1,7 @@
 import os
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import func, select
 from sqlalchemy.exc import SQLAlchemyError
@@ -10,7 +11,10 @@ from app.core.config import Settings
 from app.db.session import ping_database
 from app.models.runtime import (
     BrokerOrder,
+    ExecutionFill,
     ExecutionJob,
+    ExecutionPlan,
+    ExecutionPlanItem,
     MonitoringCheckpoint,
 )
 from app.services.broker_auth import build_broker_session_summary
@@ -22,6 +26,9 @@ from app.services.runtime_controls import (
 
 OPEN_ORDER_STATUSES = ("submitted", "open", "partially_filled")
 ACTIVE_JOB_STATUSES = ("queued", "scheduled", "running", "retrying")
+MONITORED_INTENTS = ("target_sell", "stop_sell")
+FAILED_ORDER_STATUSES = ("rejected", "failed")
+KRX_TIMEZONE = ZoneInfo("Asia/Seoul")
 
 
 @dataclass(frozen=True)
@@ -93,6 +100,85 @@ def runtime_counts(db: Session) -> dict[str, int]:
     return {
         "open_orders": int(open_orders or 0),
         "active_execution_jobs": int(active_jobs or 0),
+    }
+
+
+def runtime_symbol_summary(
+    *,
+    settings: Settings,
+    db: Session,
+) -> dict[str, list[str]]:
+    monitored_symbols = db.scalars(
+        select(ExecutionPlanItem.symbol)
+        .join(ExecutionPlanItem.plan)
+        .where(
+            ExecutionPlan.mode == settings.runtime_mode,
+            ExecutionPlanItem.intent.in_(MONITORED_INTENTS),
+        )
+    ).all()
+
+    today_seoul = datetime.now(KRX_TIMEZONE).date()
+
+    scheduled_today: set[str] = set()
+    scheduled_jobs = db.execute(
+        select(ExecutionPlanItem.symbol, ExecutionJob.scheduled_for)
+        .select_from(ExecutionJob)
+        .join(ExecutionJob.plan_item)
+        .join(ExecutionPlanItem.plan)
+        .where(
+            ExecutionPlan.mode == settings.runtime_mode,
+            ExecutionJob.status.in_(ACTIVE_JOB_STATUSES),
+        )
+    ).all()
+    for symbol, scheduled_for in scheduled_jobs:
+        if scheduled_for is None:
+            continue
+        if scheduled_for.astimezone(KRX_TIMEZONE).date() == today_seoul:
+            scheduled_today.add(symbol)
+
+    filled_today: set[str] = set()
+    fills = db.execute(
+        select(ExecutionFill.symbol, ExecutionFill.filled_at)
+        .select_from(ExecutionFill)
+        .join(ExecutionFill.broker_order)
+        .join(BrokerOrder.plan_item)
+        .join(ExecutionPlanItem.plan)
+        .where(ExecutionPlan.mode == settings.runtime_mode)
+        .order_by(ExecutionFill.filled_at.desc(), ExecutionFill.id.desc())
+    ).all()
+    for symbol, filled_at in fills:
+        if filled_at.astimezone(KRX_TIMEZONE).date() == today_seoul:
+            filled_today.add(symbol)
+
+    failed_today: set[str] = set()
+    failed_orders = db.execute(
+        select(
+            BrokerOrder.symbol,
+            BrokerOrder.last_broker_sync_at,
+            BrokerOrder.submitted_at,
+            BrokerOrder.updated_at,
+        )
+        .select_from(BrokerOrder)
+        .join(BrokerOrder.plan_item)
+        .join(ExecutionPlanItem.plan)
+        .where(
+            ExecutionPlan.mode == settings.runtime_mode,
+            BrokerOrder.status.in_(FAILED_ORDER_STATUSES),
+        )
+        .order_by(BrokerOrder.updated_at.desc(), BrokerOrder.id.desc())
+    ).all()
+    for symbol, last_broker_sync_at, submitted_at, updated_at in failed_orders:
+        observed_at = last_broker_sync_at or submitted_at or updated_at
+        if observed_at is None:
+            continue
+        if observed_at.astimezone(KRX_TIMEZONE).date() == today_seoul:
+            failed_today.add(symbol)
+
+    return {
+        "monitored": sorted(set(monitored_symbols)),
+        "scheduled_today": sorted(scheduled_today),
+        "filled_today": sorted(filled_today),
+        "failed_today": sorted(failed_today),
     }
 
 
@@ -174,6 +260,12 @@ def build_runtime_status(
         "workers": [],
         "last_heartbeat_at": None,
     }
+    symbols: dict[str, list[str]] = {
+        "monitored": [],
+        "scheduled_today": [],
+        "filled_today": [],
+        "failed_today": [],
+    }
     broker = build_broker_session_summary(settings=settings, db=None)
     counts_available = True
 
@@ -207,6 +299,7 @@ def build_runtime_status(
             },
             "broker": broker,
             "counts": counts,
+            "symbols": symbols,
         }
 
     schema = check_runtime_schema(db)
@@ -241,6 +334,7 @@ def build_runtime_status(
             },
             "broker": broker,
             "counts": counts,
+            "symbols": symbols,
         }
 
     try:
@@ -249,6 +343,7 @@ def build_runtime_status(
         counts = runtime_counts(db)
         monitoring = monitoring_payload(db)
         broker = build_broker_session_summary(settings=settings, db=db)
+        symbols = runtime_symbol_summary(settings=settings, db=db)
     except SQLAlchemyError as exc:
         db.rollback()
         dependencies["runtime_schema"] = "error"
@@ -277,4 +372,5 @@ def build_runtime_status(
         },
         "broker": broker,
         "counts": counts,
+        "symbols": symbols,
     }
