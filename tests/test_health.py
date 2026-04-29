@@ -547,6 +547,7 @@ def test_execution_plan_intake_and_read_endpoints() -> None:
     assert items_by_symbol["005930"]["side"] == "buy"
     assert items_by_symbol["005930"]["limit_price"] == "71000.0000"
     assert items_by_symbol["005930"]["time_in_force"] == "day"
+    assert items_by_symbol["000660"]["status"] == "target_sell_monitoring"
     assert items_by_symbol["000660"]["trigger_price"] == "125000.0000"
 
     assert client.get("/orders").json() == []
@@ -634,7 +635,7 @@ def test_execution_plan_intake_schedules_next_open_buy_jobs() -> None:
         assert [item.symbol for item in items] == ["000660", "005930"]
         items_by_symbol = {item.symbol: item for item in items}
         assert items_by_symbol["005930"].status == "next_open_buy_scheduled"
-        assert items_by_symbol["000660"].status == "pending"
+        assert items_by_symbol["000660"].status == "target_sell_monitoring"
 
         jobs = session.scalars(
             select(ExecutionJob)
@@ -645,6 +646,73 @@ def test_execution_plan_intake_schedules_next_open_buy_jobs() -> None:
         assert jobs[0].status == "scheduled"
         assert jobs[0].scheduled_for is not None
         assert jobs[0].attempts == 0
+
+    engine.dispose()
+
+
+def test_monitoring_items_use_short_pending_config_status_and_stay_evaluable() -> None:
+    app, engine = build_test_app(
+        Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+        )
+    )
+    client = TestClient(app)
+
+    response = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-target-sell-missing-config",
+            "source": "kai-trading-core",
+            "items": [
+                {
+                    "symbol": "000660",
+                    "side": "sell",
+                    "intent": "target_sell",
+                    "quantity_policy": {"kind": "percent", "fraction": 0.5},
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 201
+    plan_item_id = response.json()["persisted_execution_item_ids"][0]
+
+    plans_response = client.get("/execution-plans")
+    assert plans_response.status_code == 200
+    item = plans_response.json()[0]["items"][0]
+    assert item["execution_plan_item_id"] == plan_item_id
+    assert item["status"] == "target_sell_pending_config"
+    assert len(item["status"]) <= 32
+
+    evaluation = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "invalid config should not fail persistence",
+            "prices": [
+                {
+                    "symbol": "000660",
+                    "price": "125100.00",
+                }
+            ],
+        },
+    )
+
+    assert evaluation.status_code == 200
+    payload = evaluation.json()
+    assert payload["evaluated_item_count"] == 1
+    assert payload["triggered_item_count"] == 0
+    assert payload["submitted_order_count"] == 0
+    assert payload["items"][0]["execution_plan_item_id"] == plan_item_id
+    assert payload["items"][0]["outcome"] == "invalid_configuration"
+
+    with app.state.db_session_factory() as session:
+        plan_item = session.get(ExecutionPlanItem, plan_item_id)
+        assert plan_item is not None
+        assert plan_item.status == "target_sell_pending_config"
+        assert len(plan_item.status) <= 32
 
     engine.dispose()
 

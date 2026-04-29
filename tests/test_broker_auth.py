@@ -35,6 +35,8 @@ from app.models.runtime import (
     BrokerSessionEvent,
     ExecutionJob,
     ExecutionPlanItem,
+    ExecutionPosition,
+    MonitoringCheckpoint,
 )
 
 
@@ -901,6 +903,382 @@ def test_dispatch_due_next_open_buy_job_recovers_stale_running_job() -> None:
         plan_item = session.get(ExecutionPlanItem, plan_item_id)
         assert plan_item is not None
         assert plan_item.status == "broker_order_submitted"
+
+    engine.dispose()
+
+
+def test_monitoring_evaluate_triggers_target_sell_order_from_position_and_price_snapshot() -> None:
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(broker_order_id="kis-sell-100"),
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+        ),
+        broker_adapter=broker_adapter,
+    )
+    client = TestClient(app)
+
+    resume = client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "console", "reason": "enable automation"},
+    )
+    assert resume.status_code == 200
+
+    plan_response = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-target-sell-monitor-1",
+            "source": "kai-trading-core",
+            "items": [
+                {
+                    "symbol": "005930",
+                    "side": "sell",
+                    "intent": "target_sell",
+                    "quantity_policy": {"kind": "percent", "fraction": 0.5},
+                    "trigger_price": "125000.00",
+                    "time_in_force": "day",
+                    "risk_context": {"exchange": "KRX"},
+                }
+            ],
+        },
+    )
+    assert plan_response.status_code == 201
+    plan_item_id = plan_response.json()["persisted_execution_item_ids"][0]
+
+    with app.state.db_session_factory() as session:
+        session.add(
+            ExecutionPosition(
+                symbol="005930",
+                quantity=10,
+                average_price=Decimal("120000.0000"),
+                updated_from="reconciliation",
+                raw_payload={"source": "broker"},
+            )
+        )
+        session.commit()
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "intraday trigger check",
+            "prices": [
+                {
+                    "symbol": "005930",
+                    "price": "125100.00",
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["evaluated_item_count"] == 1
+    assert payload["triggered_item_count"] == 1
+    assert payload["submitted_order_count"] == 1
+    assert payload["blocked_item_count"] == 0
+    assert payload["items"][0]["execution_plan_item_id"] == plan_item_id
+    assert payload["items"][0]["outcome"] == "submitted"
+    assert payload["items"][0]["symbol"] == "005930"
+    assert payload["items"][0]["intent"] == "target_sell"
+    assert payload["items"][0]["trigger_price"] == "125000.0000"
+    assert payload["items"][0]["observed_price"] == "125100.0000"
+
+    assert broker_adapter.authenticate_calls == 1
+    assert len(broker_adapter.order_calls) == 1
+    assert broker_adapter.order_calls[0].execution_plan_item_id == plan_item_id
+    assert broker_adapter.order_calls[0].side == "sell"
+    assert broker_adapter.order_calls[0].quantity == 5
+    assert broker_adapter.order_calls[0].order_type == "market"
+    assert broker_adapter.order_calls[0].exchange == "KRX"
+
+    runtime_status = client.get("/runtime/status")
+    assert runtime_status.status_code == 200
+    assert runtime_status.json()["liveness"]["monitoring"]["status"] == "running"
+
+    with app.state.db_session_factory() as session:
+        plan_item = session.get(ExecutionPlanItem, plan_item_id)
+        assert plan_item is not None
+        assert plan_item.status == "broker_order_submitted"
+
+        order = session.scalar(
+            select(BrokerOrder).where(BrokerOrder.execution_plan_item_id == plan_item_id)
+        )
+        assert order is not None
+        assert order.idempotency_key == f"monitoring:target_sell:{plan_item_id}"
+        assert order.status == "submitted"
+
+        checkpoint = session.scalar(
+            select(MonitoringCheckpoint).where(
+                MonitoringCheckpoint.worker_name == "intraday_target_stop_monitor"
+            )
+        )
+        assert checkpoint is not None
+        assert checkpoint.status == "running"
+        assert checkpoint.last_heartbeat_at is not None
+        assert checkpoint.last_success_at is not None
+
+    engine.dispose()
+
+
+def test_monitoring_evaluate_reports_blocked_stop_sell_trigger_when_runtime_is_paused() -> None:
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(broker_order_id="kis-sell-200"),
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+        ),
+        broker_adapter=broker_adapter,
+    )
+    client = TestClient(app)
+
+    plan_response = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-stop-sell-monitor-1",
+            "source": "kai-trading-core",
+            "items": [
+                {
+                    "symbol": "005930",
+                    "side": "sell",
+                    "intent": "stop_sell",
+                    "quantity_policy": {"kind": "shares", "quantity": 3},
+                    "trigger_price": "70000.00",
+                    "limit_price": "69950.00",
+                    "time_in_force": "day",
+                }
+            ],
+        },
+    )
+    assert plan_response.status_code == 201
+    plan_item_id = plan_response.json()["persisted_execution_item_ids"][0]
+
+    with app.state.db_session_factory() as session:
+        session.add(
+            ExecutionPosition(
+                symbol="005930",
+                quantity=10,
+                average_price=Decimal("70950.5000"),
+                updated_from="reconciliation",
+                raw_payload={"source": "broker"},
+            )
+        )
+        session.commit()
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "paused trigger check",
+            "prices": [
+                {
+                    "symbol": "005930",
+                    "price": "69900.00",
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["evaluated_item_count"] == 1
+    assert payload["triggered_item_count"] == 1
+    assert payload["submitted_order_count"] == 0
+    assert payload["blocked_item_count"] == 1
+    assert payload["items"][0]["execution_plan_item_id"] == plan_item_id
+    assert payload["items"][0]["outcome"] == "blocked"
+    assert payload["items"][0]["block_reason"] == "paused"
+
+    assert broker_adapter.authenticate_calls == 0
+    assert broker_adapter.order_calls == []
+
+    runtime_status = client.get("/runtime/status")
+    assert runtime_status.status_code == 200
+    assert runtime_status.json()["liveness"]["monitoring"]["status"] == "running"
+
+    with app.state.db_session_factory() as session:
+        plan_item = session.get(ExecutionPlanItem, plan_item_id)
+        assert plan_item is not None
+        assert plan_item.status == "stop_sell_triggered_blocked"
+
+        order = session.scalar(
+            select(BrokerOrder).where(BrokerOrder.execution_plan_item_id == plan_item_id)
+        )
+        assert order is None
+
+        checkpoint = session.scalar(
+            select(MonitoringCheckpoint).where(
+                MonitoringCheckpoint.worker_name == "intraday_target_stop_monitor"
+            )
+        )
+        assert checkpoint is not None
+        assert checkpoint.status == "running"
+        assert checkpoint.last_heartbeat_at is not None
+
+    engine.dispose()
+
+
+def test_monitoring_evaluate_tracks_remaining_shares_across_triggered_items() -> None:
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(broker_order_id="kis-sell-oversell-guard"),
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+        ),
+        broker_adapter=broker_adapter,
+    )
+    client = TestClient(app)
+
+    resume = client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "console", "reason": "enable automation"},
+    )
+    assert resume.status_code == 200
+
+    plan_response = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-target-sell-monitor-remaining-shares",
+            "source": "kai-trading-core",
+            "items": [
+                {
+                    "symbol": "005930",
+                    "side": "sell",
+                    "intent": "target_sell",
+                    "quantity_policy": {"kind": "shares", "quantity": 6},
+                    "trigger_price": "125000.00",
+                    "time_in_force": "day",
+                    "risk_context": {"exchange": "KRX"},
+                },
+                {
+                    "symbol": "005930",
+                    "side": "sell",
+                    "intent": "target_sell",
+                    "quantity_policy": {"kind": "shares", "quantity": 6},
+                    "trigger_price": "125000.00",
+                    "time_in_force": "day",
+                    "risk_context": {"exchange": "KRX"},
+                },
+            ],
+        },
+    )
+    assert plan_response.status_code == 201
+    first_item_id, second_item_id = plan_response.json()["persisted_execution_item_ids"]
+
+    with app.state.db_session_factory() as session:
+        session.add(
+            ExecutionPosition(
+                symbol="005930",
+                quantity=10,
+                average_price=Decimal("120000.0000"),
+                updated_from="reconciliation",
+                raw_payload={"source": "broker"},
+            )
+        )
+        session.commit()
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "multiple triggered sells should not oversell",
+            "prices": [
+                {
+                    "symbol": "005930",
+                    "price": "125100.00",
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["evaluated_item_count"] == 2
+    assert payload["triggered_item_count"] == 2
+    assert payload["submitted_order_count"] == 1
+    assert payload["blocked_item_count"] == 0
+    assert len(payload["items"]) == 2
+    assert payload["items"][0]["execution_plan_item_id"] == first_item_id
+    assert payload["items"][0]["symbol"] == "005930"
+    assert payload["items"][0]["intent"] == "target_sell"
+    assert payload["items"][0]["trigger_price"] == "125000.0000"
+    assert payload["items"][0]["observed_price"] == "125100.0000"
+    assert payload["items"][0]["outcome"] == "submitted"
+    assert payload["items"][0]["order"]["quantity"] == 6
+
+    assert payload["items"][1] == {
+        "execution_plan_item_id": second_item_id,
+        "symbol": "005930",
+        "intent": "target_sell",
+        "trigger_price": "125000.0000",
+        "observed_price": "125100.0000",
+        "outcome": "no_position",
+        "message": "no sellable execution position is available for this trigger",
+    }
+
+    assert broker_adapter.authenticate_calls == 1
+    assert len(broker_adapter.order_calls) == 1
+    assert broker_adapter.order_calls[0].execution_plan_item_id == first_item_id
+    assert broker_adapter.order_calls[0].side == "sell"
+    assert broker_adapter.order_calls[0].quantity == 6
+    assert broker_adapter.order_calls[0].order_type == "market"
+    assert broker_adapter.order_calls[0].exchange == "KRX"
+
+    with app.state.db_session_factory() as session:
+        first_item = session.get(ExecutionPlanItem, first_item_id)
+        second_item = session.get(ExecutionPlanItem, second_item_id)
+        assert first_item is not None
+        assert second_item is not None
+        assert first_item.status == "broker_order_submitted"
+        assert second_item.status == "target_sell_monitoring"
+
+        orders = session.scalars(
+            select(BrokerOrder)
+            .where(BrokerOrder.symbol == "005930")
+            .order_by(BrokerOrder.created_at.asc(), BrokerOrder.id.asc())
+        ).all()
+        assert len(orders) == 1
+        assert orders[0].execution_plan_item_id == first_item_id
+        assert orders[0].quantity == 6
 
     engine.dispose()
 

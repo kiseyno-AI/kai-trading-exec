@@ -149,6 +149,42 @@ Current response includes:
 - `failed_job_count`
 - `jobs[]`
 
+## Monitoring APIs
+
+### `POST /monitoring/evaluate`
+Evaluate persisted intraday `target_sell` / `stop_sell` plan items against a
+supplied set of symbol-price snapshots.
+
+This is the current operator/manual monitoring surface until a background
+monitoring loop exists.
+
+Suggested body shape:
+- `actor`
+- `source`
+- `reason`
+- `observed_at`
+- `prices[]`
+  - `symbol`
+  - `price`
+
+Current response includes:
+- `triggered_at`
+- `worker_name`
+- `evaluated_item_count`
+- `triggered_item_count`
+- `submitted_order_count`
+- `blocked_item_count`
+- `items[]`
+  - `execution_plan_item_id`
+  - `symbol`
+  - `intent`
+  - `trigger_price`
+  - `observed_price`
+  - `outcome`
+  - `message`
+  - `block_reason`
+  - `order`
+
 ### `GET /orders`
 List broker orders with internal normalized statuses.
 
