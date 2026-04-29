@@ -519,6 +519,409 @@ def test_broker_authenticate_endpoint_surfaces_adapter_failure() -> None:
     engine.dispose()
 
 
+def test_restart_reuses_persisted_broker_session_for_due_job_dispatch(tmp_path) -> None:
+    database_url = f"sqlite:///{tmp_path / 'restart-dispatch-session.db'}"
+    settings = Settings(
+        database_url=database_url,
+        runtime_mode="paper",
+        kis_app_key="paper-key",
+        kis_app_secret="paper-secret",
+        kis_account_number="12345678",
+    )
+    initial_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(),
+    )
+    app, engine = build_test_app(
+        settings=settings,
+        broker_adapter=initial_adapter,
+    )
+    client = TestClient(app)
+
+    resume = client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "console", "reason": "enable automation"},
+    )
+    assert resume.status_code == 200
+
+    authenticate = client.post(
+        "/broker/session/authenticate",
+        json={
+            "actor": "ops",
+            "source": "console",
+            "reason": "persist reusable session before restart",
+        },
+    )
+    assert authenticate.status_code == 200
+
+    plan_response = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-restart-dispatch-session",
+            "source": "kai-trading-core",
+            "market_date": "2024-01-03",
+            "items": [
+                {
+                    "symbol": "005930",
+                    "side": "buy",
+                    "intent": "next_open_buy",
+                    "quantity_policy": {"kind": "shares", "quantity": 5},
+                    "limit_price": "71000.00",
+                    "time_in_force": "day",
+                }
+            ],
+        },
+    )
+    assert plan_response.status_code == 201
+    plan_item_id = plan_response.json()["persisted_execution_item_ids"][0]
+
+    client.close()
+    engine.dispose()
+
+    restarted_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(broker_order_id="kis-order-101"),
+    )
+    restarted_app, restarted_engine = build_test_app(
+        settings=settings,
+        broker_adapter=restarted_adapter,
+    )
+    restarted_client = TestClient(restarted_app)
+
+    runtime_status = restarted_client.get("/runtime/status")
+    assert runtime_status.status_code == 200
+    runtime_payload = runtime_status.json()
+    assert runtime_payload["safety"]["paused"] is False
+    assert runtime_payload["counts"]["active_execution_jobs"] == 1
+    assert runtime_payload["broker"]["status"] == "active"
+    assert runtime_payload["broker"]["access_token_present"] is True
+
+    dispatch_response = restarted_client.post("/execution-jobs/dispatch")
+
+    assert dispatch_response.status_code == 200
+    dispatch_payload = dispatch_response.json()
+    assert dispatch_payload["due_job_count"] == 1
+    assert dispatch_payload["completed_job_count"] == 1
+    assert dispatch_payload["retrying_job_count"] == 0
+    assert dispatch_payload["failed_job_count"] == 0
+    assert dispatch_payload["jobs"][0]["execution_plan_item_id"] == plan_item_id
+    assert dispatch_payload["jobs"][0]["status"] == "completed"
+
+    assert restarted_adapter.authenticate_calls == 0
+    assert len(restarted_adapter.order_calls) == 1
+    assert restarted_adapter.order_calls[0].execution_plan_item_id == plan_item_id
+
+    with restarted_app.state.db_session_factory() as session:
+        broker_session = session.get(BrokerSession, "kis:paper")
+        assert broker_session is not None
+        assert broker_session.access_token == "top-secret-token"
+
+        events = session.query(BrokerSessionEvent).order_by(BrokerSessionEvent.occurred_at).all()
+        assert [(event.action, event.outcome) for event in events] == [
+            ("authenticate", "applied"),
+        ]
+
+        job = session.scalar(
+            select(ExecutionJob).where(ExecutionJob.execution_plan_item_id == plan_item_id)
+        )
+        assert job is not None
+        assert job.status == "completed"
+        assert job.attempts == 1
+
+        order = session.scalar(
+            select(BrokerOrder).where(BrokerOrder.execution_plan_item_id == plan_item_id)
+        )
+        assert order is not None
+        assert order.status == "submitted"
+
+    restarted_client.close()
+    restarted_engine.dispose()
+
+
+def test_restart_recovers_stale_running_dispatch_job_after_interrupted_outage(
+    tmp_path,
+) -> None:
+    database_url = f"sqlite:///{tmp_path / 'restart-recover-running-job.db'}"
+    settings = Settings(
+        database_url=database_url,
+        runtime_mode="paper",
+        kis_app_key="paper-key",
+        kis_app_secret="paper-secret",
+        kis_account_number="12345678",
+    )
+    app, engine = build_test_app(
+        settings=settings,
+        broker_adapter=StubBrokerAdapter(
+            config=BrokerConfig(
+                provider="kis",
+                mode="paper",
+                configured=True,
+                api_base_url=KIS_PAPER_API_BASE_URL,
+            ),
+            token_grant=build_token_grant(),
+            order_placement=build_order_placement(),
+        ),
+    )
+    client = TestClient(app)
+
+    resume = client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "console", "reason": "enable automation"},
+    )
+    assert resume.status_code == 200
+
+    plan_response = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-restart-recover-running-job",
+            "source": "kai-trading-core",
+            "market_date": "2024-01-03",
+            "items": [
+                {
+                    "symbol": "005930",
+                    "side": "buy",
+                    "intent": "next_open_buy",
+                    "quantity_policy": {"kind": "shares", "quantity": 5},
+                    "limit_price": "71000.00",
+                    "time_in_force": "day",
+                }
+            ],
+        },
+    )
+    assert plan_response.status_code == 201
+    plan_item_id = plan_response.json()["persisted_execution_item_ids"][0]
+
+    with app.state.db_session_factory() as session:
+        job = session.scalar(select(ExecutionJob).where(ExecutionJob.job_type == "next_open_buy"))
+        assert job is not None
+        job.status = "running"
+        job.locked_at = datetime.now(UTC) - timedelta(minutes=10)
+        job.attempts = 1
+        job.last_error = None
+
+        plan_item = session.get(ExecutionPlanItem, plan_item_id)
+        assert plan_item is not None
+        plan_item.status = "next_open_buy_dispatching"
+        session.commit()
+
+    client.close()
+    engine.dispose()
+
+    restarted_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(broker_order_id="kis-order-102"),
+    )
+    restarted_app, restarted_engine = build_test_app(
+        settings=settings,
+        broker_adapter=restarted_adapter,
+    )
+    restarted_client = TestClient(restarted_app)
+
+    dispatch_response = restarted_client.post("/execution-jobs/dispatch")
+
+    assert dispatch_response.status_code == 200
+    dispatch_payload = dispatch_response.json()
+    assert dispatch_payload["due_job_count"] == 1
+    assert dispatch_payload["completed_job_count"] == 1
+    assert dispatch_payload["retrying_job_count"] == 0
+    assert dispatch_payload["failed_job_count"] == 0
+    assert dispatch_payload["jobs"][0]["execution_plan_item_id"] == plan_item_id
+    assert dispatch_payload["jobs"][0]["status"] == "completed"
+
+    assert restarted_adapter.authenticate_calls == 1
+    assert len(restarted_adapter.order_calls) == 1
+
+    with restarted_app.state.db_session_factory() as session:
+        job = session.scalar(select(ExecutionJob).where(ExecutionJob.job_type == "next_open_buy"))
+        assert job is not None
+        assert job.status == "completed"
+        assert job.attempts == 2
+        assert job.locked_at is None
+        assert job.last_error is None
+
+        order = session.scalar(
+            select(BrokerOrder).where(BrokerOrder.execution_plan_item_id == plan_item_id)
+        )
+        assert order is not None
+        assert order.status == "submitted"
+
+        plan_item = session.get(ExecutionPlanItem, plan_item_id)
+        assert plan_item is not None
+        assert plan_item.status == "broker_order_submitted"
+
+    restarted_client.close()
+    restarted_engine.dispose()
+
+
+def test_restart_preserves_reconciliation_positions_for_monitoring_evaluation(
+    tmp_path,
+) -> None:
+    database_url = f"sqlite:///{tmp_path / 'restart-monitoring-reconciliation.db'}"
+    settings = Settings(
+        database_url=database_url,
+        runtime_mode="paper",
+        kis_app_key="paper-key",
+        kis_app_secret="paper-secret",
+        kis_account_number="12345678",
+    )
+    app, engine = build_test_app(
+        settings=settings,
+        broker_adapter=StubBrokerAdapter(
+            config=BrokerConfig(
+                provider="kis",
+                mode="paper",
+                configured=True,
+                api_base_url=KIS_PAPER_API_BASE_URL,
+            ),
+            token_grant=build_token_grant(),
+            order_placement=build_order_placement(broker_order_id="kis-sell-201"),
+        ),
+    )
+    client = TestClient(app)
+
+    resume = client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "console", "reason": "enable automation"},
+    )
+    assert resume.status_code == 200
+
+    plan_response = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-restart-monitoring-reconciliation",
+            "source": "kai-trading-core",
+            "items": [
+                {
+                    "symbol": "005930",
+                    "side": "sell",
+                    "intent": "target_sell",
+                    "quantity_policy": {"kind": "percent", "fraction": 0.5},
+                    "trigger_price": "125000.00",
+                    "time_in_force": "day",
+                    "risk_context": {"exchange": "KRX"},
+                }
+            ],
+        },
+    )
+    assert plan_response.status_code == 201
+    plan_item_id = plan_response.json()["persisted_execution_item_ids"][0]
+
+    with app.state.db_session_factory() as session:
+        session.add(
+            ExecutionPosition(
+                symbol="005930",
+                quantity=10,
+                average_price=Decimal("120000.0000"),
+                updated_from="reconciliation",
+                last_reconciled_at=datetime(2026, 4, 29, 9, 4, tzinfo=UTC),
+                raw_payload={"source": "broker"},
+            )
+        )
+        session.commit()
+
+    client.close()
+    engine.dispose()
+
+    restarted_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(broker_order_id="kis-sell-202"),
+    )
+    restarted_app, restarted_engine = build_test_app(
+        settings=settings,
+        broker_adapter=restarted_adapter,
+    )
+    restarted_client = TestClient(restarted_app)
+
+    positions_response = restarted_client.get("/positions")
+    assert positions_response.status_code == 200
+    positions_payload = positions_response.json()
+    assert len(positions_payload) == 1
+    assert positions_payload[0]["symbol"] == "005930"
+    assert positions_payload[0]["updated_from"] == "reconciliation"
+    assert positions_payload[0]["last_reconciled_at"] == "2026-04-29T09:04:00"
+
+    runtime_before = restarted_client.get("/runtime/status")
+    assert runtime_before.status_code == 200
+    assert runtime_before.json()["liveness"]["monitoring"]["status"] == "not_started"
+
+    evaluation_response = restarted_client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "resume target/stop monitoring after restart",
+            "prices": [
+                {
+                    "symbol": "005930",
+                    "price": "125100.00",
+                }
+            ],
+        },
+    )
+
+    assert evaluation_response.status_code == 200
+    evaluation_payload = evaluation_response.json()
+    assert evaluation_payload["triggered_item_count"] == 1
+    assert evaluation_payload["submitted_order_count"] == 1
+    assert evaluation_payload["blocked_item_count"] == 0
+    assert evaluation_payload["items"][0]["execution_plan_item_id"] == plan_item_id
+    assert evaluation_payload["items"][0]["outcome"] == "submitted"
+
+    runtime_after = restarted_client.get("/runtime/status")
+    assert runtime_after.status_code == 200
+    assert runtime_after.json()["liveness"]["monitoring"]["status"] == "running"
+
+    assert restarted_adapter.authenticate_calls == 1
+    assert len(restarted_adapter.order_calls) == 1
+
+    with restarted_app.state.db_session_factory() as session:
+        plan_item = session.get(ExecutionPlanItem, plan_item_id)
+        assert plan_item is not None
+        assert plan_item.status == "broker_order_submitted"
+
+        order = session.scalar(
+            select(BrokerOrder).where(BrokerOrder.execution_plan_item_id == plan_item_id)
+        )
+        assert order is not None
+        assert order.status == "submitted"
+
+        checkpoint = session.scalar(
+            select(MonitoringCheckpoint).where(
+                MonitoringCheckpoint.worker_name == "intraday_target_stop_monitor"
+            )
+        )
+        assert checkpoint is not None
+        assert checkpoint.status == "running"
+        assert checkpoint.last_success_at is not None
+
+    restarted_client.close()
+    restarted_engine.dispose()
+
+
 def test_place_order_endpoint_persists_normalized_order_and_events() -> None:
     broker_adapter = StubBrokerAdapter(
         config=BrokerConfig(
