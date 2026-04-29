@@ -13,3 +13,4 @@ htmlcov/
 ruff_cache/
 dist/
 build/
+var/
