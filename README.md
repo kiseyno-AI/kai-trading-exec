@@ -40,7 +40,46 @@ Dedicated execution runtime for real order placement, realtime monitoring, and e
 - `AGENTS.md` — local guidance for Codex/agent work in this repo
 - `TASKS.md` — short backlog / launch sequence
 - `docs/API.md` — proposed northbound and operational API contract
-- `apps/api/app/main.py` — minimal FastAPI runtime skeleton
+- `apps/api/app/main.py` — FastAPI runtime entrypoint
+- `apps/api/alembic/` — migration baseline for exec-owned runtime tables
+
+## Local development
+
+Create an environment and install the API plus test dependencies:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e ".[dev]"
+```
+
+Apply the execution-runtime schema to the default local SQLite database:
+
+```bash
+PYTHONPATH=apps/api alembic upgrade head
+```
+
+Start the service:
+
+```bash
+PYTHONPATH=apps/api uvicorn app.main:app --host 127.0.0.1 --port 8010
+```
+
+Useful checks:
+
+```bash
+curl http://127.0.0.1:8010/health
+curl http://127.0.0.1:8010/runtime/status
+```
+
+The default database is `sqlite:///./var/kai_trading_exec.db`. Override settings
+with `KAI_EXEC_` environment variables, for example:
+
+```bash
+KAI_EXEC_RUNTIME_MODE=paper \
+KAI_EXEC_DATABASE_URL=postgresql+psycopg://user:pass@localhost/kai_exec \
+PYTHONPATH=apps/api uvicorn app.main:app --host 127.0.0.1 --port 8010
+```
 
 ## Boot target
 

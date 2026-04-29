@@ -1,26 +1,62 @@
+import logging
+from contextlib import asynccontextmanager
+from datetime import UTC, datetime
+
 from fastapi import FastAPI
+from sqlalchemy.engine import Engine
+from sqlalchemy.orm import Session, sessionmaker
 
-app = FastAPI(title="kai-trading-exec", version="0.1.0")
+from app.api.routes.health import router as health_router
+from app.api.routes.runtime import router as runtime_router
+from app.core.config import Settings, get_settings
+from app.core.logging import configure_logging
+from app.db.session import create_db_engine, create_session_factory
+from app.services.runtime import RuntimeMetadata
+
+LOGGER = logging.getLogger(__name__)
 
 
-@app.get("/health")
-def health() -> dict[str, object]:
-    return {
-        "status": "ok",
-        "service": "kai-trading-exec",
-        "mode": "bootstrap",
-    }
+def create_app(
+    settings: Settings | None = None,
+    *,
+    engine: Engine | None = None,
+    session_factory: sessionmaker[Session] | None = None,
+) -> FastAPI:
+    app_settings = settings or get_settings()
+    configure_logging(app_settings)
+
+    db_engine = engine or create_db_engine(app_settings)
+    db_session_factory = session_factory or create_session_factory(db_engine)
+    runtime_metadata = RuntimeMetadata(
+        started_at=datetime.now(UTC),
+    )
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        LOGGER.info(
+            "service_starting",
+            extra={
+                "service": app_settings.service_name,
+                "environment": app_settings.environment,
+                "runtime_mode": app_settings.runtime_mode,
+            },
+        )
+        yield
+        LOGGER.info("service_stopping", extra={"service": app_settings.service_name})
+
+    app = FastAPI(
+        title=app_settings.service_name,
+        version="0.1.0",
+        lifespan=lifespan,
+    )
+    app.state.settings = app_settings
+    app.state.db_engine = db_engine
+    app.state.db_session_factory = db_session_factory
+    app.state.runtime_metadata = runtime_metadata
+
+    app.include_router(health_router)
+    app.include_router(runtime_router)
+    return app
 
 
-@app.get("/runtime/status")
-def runtime_status() -> dict[str, object]:
-    return {
-        "service": "kai-trading-exec",
-        "mode": "bootstrap",
-        "ready": False,
-        "message": "Execution runtime bootstrap scaffold only. See TASKS.md and ARCHITECTURE.md.",
-        "safety": {
-            "paused": True,
-            "kill_switch": False,
-        },
-    }
+app = create_app()

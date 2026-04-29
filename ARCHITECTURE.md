@@ -93,12 +93,18 @@ That includes:
 
 ### Exec-owned truth
 - `execution_plan_items`
+- `execution_jobs`
 - `broker_orders`
 - `broker_order_events`
 - `execution_fills`
 - `execution_positions`
 - `runtime_control_state`
 - `monitoring_checkpoints`
+
+The baseline migration also creates `execution_plans` as the parent intake
+record for `execution_plan_items`. These tables are the initial durable boundary
+for runtime state and are intentionally separate from strategy/read ownership in
+`kai-trading-core`.
 
 ### Core-owned truth
 - signal-decider decisions
