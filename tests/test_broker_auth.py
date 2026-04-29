@@ -2,6 +2,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 
 from fastapi.testclient import TestClient
+import pytest
 from sqlalchemy import select
 
 from app.broker.base import (
@@ -663,6 +664,77 @@ def test_place_order_endpoint_is_idempotent() -> None:
     assert first.status_code == 201
     assert second.status_code == 200
     assert second.json()["duplicate"] is True
+    assert broker_adapter.authenticate_calls == 1
+    assert len(broker_adapter.order_calls) == 1
+
+    with app.state.db_session_factory() as session:
+        orders = session.scalars(select(BrokerOrder)).all()
+        assert len(orders) == 1
+
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("control_path", "reason"),
+    [
+        ("/controls/pause", "pause after submission"),
+        ("/controls/kill-switch", "kill switch after submission"),
+    ],
+)
+def test_place_order_endpoint_returns_existing_order_when_runtime_is_blocked(
+    control_path: str,
+    reason: str,
+) -> None:
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(),
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+        ),
+        broker_adapter=broker_adapter,
+    )
+    client = TestClient(app)
+
+    client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "console", "reason": "enable automation"},
+    )
+
+    payload = {
+        "idempotency_key": "repeat-order-after-pause-1",
+        "symbol": "005930",
+        "side": "buy",
+        "quantity": 5,
+        "order_type": "limit",
+        "limit_price": "71000.00",
+        "time_in_force": "day",
+        "exchange": "KRX",
+    }
+
+    first = client.post("/orders", json=payload)
+    pause = client.post(
+        control_path,
+        json={"actor": "ops", "source": "console", "reason": reason},
+    )
+    second = client.post("/orders", json=payload)
+
+    assert first.status_code == 201
+    assert pause.status_code == 200
+    assert second.status_code == 200
+    assert second.json()["duplicate"] is True
+    assert second.json()["order"]["idempotency_key"] == payload["idempotency_key"]
     assert broker_adapter.authenticate_calls == 1
     assert len(broker_adapter.order_calls) == 1
 

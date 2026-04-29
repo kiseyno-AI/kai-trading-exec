@@ -40,17 +40,6 @@ def place_broker_order(
     adapter: BrokerAdapter,
     command: PlaceOrderRequest,
 ) -> PlaceBrokerOrderResult:
-    control_state = ensure_runtime_control_state(settings=settings, db=db)
-    if not automated_order_submission_allowed(control_state):
-        return PlaceBrokerOrderResult(
-            status_code=409,
-            payload={
-                "message": "automated order submission is blocked by runtime safety controls",
-                "block_reason": automated_order_submission_block_reason(control_state),
-                "safety": runtime_safety_payload(control_state),
-            },
-        )
-
     existing = _load_order_by_idempotency_key(db=db, idempotency_key=command.idempotency_key)
     if existing is not None:
         return PlaceBrokerOrderResult(
@@ -59,6 +48,17 @@ def place_broker_order(
                 "duplicate": True,
                 "message": "order with this idempotency_key already exists",
                 "order": serialize_broker_order(existing, include_events=True),
+            },
+        )
+
+    control_state = ensure_runtime_control_state(settings=settings, db=db)
+    if not automated_order_submission_allowed(control_state):
+        return PlaceBrokerOrderResult(
+            status_code=409,
+            payload={
+                "message": "automated order submission is blocked by runtime safety controls",
+                "block_reason": automated_order_submission_block_reason(control_state),
+                "safety": runtime_safety_payload(control_state),
             },
         )
 
