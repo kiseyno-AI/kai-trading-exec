@@ -1,9 +1,9 @@
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, JSON, Numeric, String, Text, func
+from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Integer, JSON, Numeric, String, Text, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
@@ -90,6 +90,8 @@ class ExecutionPlan(TimestampMixin, Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     external_plan_id: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
     source: Mapped[str] = mapped_column(String(64), nullable=False)
+    market_date: Mapped[date | None] = mapped_column(Date())
+    strategy_run_id: Mapped[str | None] = mapped_column(String(128))
     mode: Mapped[str] = mapped_column(String(16), nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="accepted")
     requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -117,6 +119,9 @@ class ExecutionPlanItem(TimestampMixin, Base):
     intent: Mapped[str] = mapped_column(String(64), nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
     quantity_policy: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    limit_price: Mapped[Decimal | None] = mapped_column(Numeric(18, 4))
+    trigger_price: Mapped[Decimal | None] = mapped_column(Numeric(18, 4))
+    time_in_force: Mapped[str | None] = mapped_column(String(32))
     risk_context: Mapped[dict[str, Any] | None] = mapped_column(JSON)
     decision_snapshot_id: Mapped[str | None] = mapped_column(String(128))
 
