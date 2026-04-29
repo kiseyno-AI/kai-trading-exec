@@ -14,6 +14,7 @@ from app.models.runtime import (
     MonitoringCheckpoint,
     RuntimeControlState,
 )
+from app.services.schema import check_runtime_schema
 
 RUNTIME_CONTROL_ID = "global"
 OPEN_ORDER_STATUSES = ("submitted", "open", "partially_filled")
@@ -23,7 +24,10 @@ ACTIVE_JOB_STATUSES = ("queued", "scheduled", "running", "retrying")
 @dataclass(frozen=True)
 class RuntimeMetadata:
     started_at: datetime
-    process_id: int = os.getpid()
+
+    @property
+    def process_id(self) -> int:
+        return os.getpid()
 
 
 def liveness_payload(runtime: RuntimeMetadata) -> dict[str, object]:
@@ -188,6 +192,39 @@ def build_runtime_status(
             settings,
             f"database unavailable: {exc.__class__.__name__}",
         )
+        readiness = readiness_payload(
+            dependencies_ok=False,
+            safety=safety,
+            counts_available=counts_available,
+        )
+        return {
+            "service": settings.service_name,
+            "environment": settings.environment,
+            "mode": safety["mode"],
+            "ready": readiness["ready"],
+            "readiness": readiness,
+            "safety": safety,
+            "dependencies": dependencies,
+            "liveness": {
+                **liveness_payload(runtime),
+                "monitoring": monitoring,
+            },
+            "counts": counts,
+        }
+
+    schema = check_runtime_schema(db)
+    dependencies["runtime_schema"] = str(schema["status"])
+    if schema["status"] != "ok":
+        counts_available = False
+        missing_tables = schema.get("missing_tables") or []
+        if missing_tables:
+            schema_reason = (
+                "runtime schema incomplete: "
+                f"missing {', '.join(str(table) for table in missing_tables)}; run migrations"
+            )
+        else:
+            schema_reason = "runtime schema unavailable; run migrations"
+        safety = default_safety(settings, schema_reason)
         readiness = readiness_payload(
             dependencies_ok=False,
             safety=safety,

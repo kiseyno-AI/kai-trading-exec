@@ -1,3 +1,5 @@
+from datetime import UTC, datetime
+
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, inspect
 from sqlalchemy.orm import sessionmaker
@@ -7,7 +9,8 @@ from app.core.config import Settings, load_settings
 from app.db.base import Base
 from app.main import create_app
 from app.models import EXEC_OWNED_TABLES
-from app.models.runtime import RuntimeControlState
+from app.models.runtime import ExecutionFill, RuntimeControlState
+from app.services import runtime as runtime_service
 
 
 def build_test_app(settings: Settings | None = None):
@@ -71,6 +74,16 @@ def test_health_returns_dependency_aware_payload() -> None:
     engine.dispose()
 
 
+def test_runtime_metadata_reads_process_id_at_liveness_time(monkeypatch) -> None:
+    runtime = runtime_service.RuntimeMetadata(started_at=datetime.now(UTC))
+
+    monkeypatch.setattr(runtime_service.os, "getpid", lambda: 111)
+    assert runtime_service.liveness_payload(runtime)["process_id"] == 111
+
+    monkeypatch.setattr(runtime_service.os, "getpid", lambda: 222)
+    assert runtime_service.liveness_payload(runtime)["process_id"] == 222
+
+
 def test_runtime_status_reports_readiness_and_default_safety() -> None:
     app, engine = build_test_app()
     client = TestClient(app)
@@ -92,6 +105,24 @@ def test_runtime_status_reports_readiness_and_default_safety() -> None:
         state = session.get(RuntimeControlState, "global")
         assert state is not None
         assert state.paused is True
+
+    engine.dispose()
+
+
+def test_runtime_status_requires_complete_exec_owned_schema() -> None:
+    app, engine = build_test_app(settings=Settings(automation_enabled=True))
+    ExecutionFill.__table__.drop(engine)
+    client = TestClient(app)
+
+    response = client.get("/runtime/status")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ready"] is False
+    assert payload["dependencies"]["database"] == "ok"
+    assert payload["dependencies"]["runtime_schema"] == "missing"
+    assert "database or runtime schema dependency is not ready" in payload["readiness"]["reasons"]
+    assert "execution_fills" in payload["safety"]["readiness_reason"]
 
     engine.dispose()
 
