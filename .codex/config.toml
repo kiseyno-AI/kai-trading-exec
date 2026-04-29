@@ -1,0 +1,9 @@
+model = "gpt-5.5"
+reasoning_effort = "high"
+
+[tools]
+web_search = true
+
+[repo]
+name = "kai-trading-exec"
+primary_branch = "main"

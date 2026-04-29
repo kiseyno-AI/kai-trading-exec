@@ -1,0 +1,161 @@
+# ARCHITECTURE
+
+## Mission
+
+Keep real trading execution and monitoring alive, isolated, and auditable even when `kai-trading-core` is restarted, redeployed, or temporarily unhealthy.
+
+## Core design principle
+
+**Execution state belongs to `kai-trading-exec`.**
+
+That includes:
+- execution plans accepted for processing
+- submitted broker orders
+- order state transitions
+- fill events
+- position-affecting execution outcomes
+- runtime pause / kill-switch state
+- monitoring loop liveness and checkpoints
+
+`kai-trading-core` may read or summarize this state, but should not be the source of truth for it.
+
+## Proposed topology
+
+- `kai-trading-core` (strategy/read service)
+- `kai-trading-exec` (execution runtime service)
+- shared Postgres with clearly owned tables/schemas, or a dedicated execution schema
+- KIS broker APIs / realtime feeds
+- optional message/event bridge later if polling is insufficient
+
+## Responsibility split
+
+### In `kai-trading-core`
+- produce candidate actions and execution plans
+- decide whether automation is enabled
+- expose dashboard-facing aggregated views
+- request runtime status from exec service
+- correlate planned vs actual outcomes for analytics
+
+### In `kai-trading-exec`
+- validate and accept execution plans
+- schedule next-open and intraday execution jobs
+- place, amend, cancel orders
+- watch open orders / fills / positions continuously
+- enforce operational safety controls
+- persist exact broker-facing facts and lifecycle timestamps
+- reconcile internal state against broker truth after disconnects or restarts
+
+## Service interfaces
+
+### Northbound API from core/web to exec
+- `GET /health`
+- `GET /runtime/status`
+- `GET /runtime/safety`
+- `GET /execution-plans`
+- `POST /execution-plans`
+- `GET /orders`
+- `GET /executions`
+- `GET /positions`
+- `POST /controls/pause`
+- `POST /controls/resume`
+- `POST /controls/kill-switch`
+
+### Southbound integrations inside exec
+- KIS REST trading endpoints
+- KIS realtime order/fill notices
+- KIS portfolio/order inquiry endpoints for reconciliation
+- Postgres persistence
+
+## Runtime model
+
+`kai-trading-exec` should be split internally into small subsystems:
+
+1. **API process**
+   - operator/control endpoints
+   - plan intake
+   - read endpoints for status/orders/executions
+
+2. **scheduler / dispatcher**
+   - turns accepted plans into due execution jobs
+   - handles next-open and intraday scheduling
+
+3. **broker adapter**
+   - encapsulates KIS-specific request signing, retries, throttling, and response normalization
+
+4. **monitoring loop**
+   - tracks open orders, fills, target/stop triggers, and stale states
+
+5. **reconciliation worker**
+   - periodic truth sync against broker APIs
+   - repair drift after transient failures or process restarts
+
+## Data ownership rules
+
+### Exec-owned truth
+- `execution_plan_items`
+- `broker_orders`
+- `broker_order_events`
+- `execution_fills`
+- `execution_positions`
+- `runtime_control_state`
+- `monitoring_checkpoints`
+
+### Core-owned truth
+- signal-decider decisions
+- factor/screening data
+- historical evaluation artifacts
+- planning policies and strategy configuration
+
+### Linked analytics views
+Core may join or ingest exec outputs for:
+- planned vs actual execution outcome review
+- dashboard summaries
+- post-trade analysis
+- agent-assisted review
+
+## Failure isolation goals
+
+A restart of `kai-trading-core` must **not**:
+- stop open-order monitoring
+- clear runtime pause state
+- lose kill-switch state
+- interrupt realtime notice ingestion
+- orphan in-flight execution jobs
+
+A restart of `kai-trading-exec` should recover from persisted state and reconciliation without requiring core re-dispatch.
+
+## Safety design requirements
+
+- default-safe automation gates
+- explicit live-trading mode separation from mock/sim modes
+- idempotent order submission keys
+- operator kill-switch with durable persisted state
+- full audit trail for all outbound broker actions
+- rate limiting / retry budget controls
+- stale-monitor alarms and heartbeat timestamps
+
+## Delivery phases
+
+### Phase 1
+- repo bootstrap
+- runtime skeleton
+- health/status endpoints
+- execution plan schema draft
+- persistent safety state
+
+### Phase 2
+- real execution plan intake
+- KIS adapter abstraction
+- next-open execution flow
+- order persistence lifecycle
+
+### Phase 3
+- intraday target/stop monitoring
+- reconciliation loop
+- runtime safety controls
+- core integration endpoints
+
+### Phase 4
+- dashboard/operator read models
+- alerting/observability
+- post-trade analytics hooks
