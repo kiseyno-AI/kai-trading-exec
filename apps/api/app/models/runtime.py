@@ -36,6 +36,52 @@ class RuntimeControlState(TimestampMixin, Base):
     kill_switch_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     automation_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     readiness_reason: Mapped[str | None] = mapped_column(Text)
+    last_transition_action: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default="bootstrap",
+    )
+    last_transition_actor: Mapped[str | None] = mapped_column(String(128))
+    last_transition_source: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        default="system",
+    )
+    last_transition_reason: Mapped[str | None] = mapped_column(Text)
+    last_transition_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+    last_transition_event_id: Mapped[str | None] = mapped_column(String(36))
+
+    events: Mapped[list["RuntimeControlEvent"]] = relationship(back_populates="control_state")
+
+
+class RuntimeControlEvent(TimestampMixin, Base):
+    __tablename__ = "runtime_control_events"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    runtime_control_state_id: Mapped[str] = mapped_column(
+        ForeignKey("runtime_control_state.id"),
+        nullable=False,
+        index=True,
+    )
+    action: Mapped[str] = mapped_column(String(32), nullable=False)
+    outcome: Mapped[str] = mapped_column(String(16), nullable=False)
+    actor: Mapped[str | None] = mapped_column(String(128))
+    source: Mapped[str] = mapped_column(String(64), nullable=False, default="operator")
+    reason: Mapped[str | None] = mapped_column(Text)
+    message: Mapped[str | None] = mapped_column(Text)
+    previous_state: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    current_state: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    occurred_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+
+    control_state: Mapped[RuntimeControlState] = relationship(back_populates="events")
 
 
 class ExecutionPlan(TimestampMixin, Base):
@@ -184,4 +230,3 @@ class MonitoringCheckpoint(TimestampMixin, Base):
     last_heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_success_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     details: Mapped[dict[str, Any] | None] = mapped_column(JSON)
-

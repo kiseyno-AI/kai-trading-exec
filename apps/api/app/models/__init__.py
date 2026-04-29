@@ -7,11 +7,13 @@ from app.models.runtime import (
     ExecutionPlanItem,
     ExecutionPosition,
     MonitoringCheckpoint,
+    RuntimeControlEvent,
     RuntimeControlState,
 )
 
 EXEC_OWNED_TABLES = (
     RuntimeControlState.__tablename__,
+    RuntimeControlEvent.__tablename__,
     ExecutionPlan.__tablename__,
     ExecutionPlanItem.__tablename__,
     ExecutionJob.__tablename__,
@@ -32,6 +34,6 @@ __all__ = [
     "ExecutionPlanItem",
     "ExecutionPosition",
     "MonitoringCheckpoint",
+    "RuntimeControlEvent",
     "RuntimeControlState",
 ]
-

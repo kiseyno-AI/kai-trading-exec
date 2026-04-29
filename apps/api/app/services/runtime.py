@@ -12,11 +12,13 @@ from app.models.runtime import (
     BrokerOrder,
     ExecutionJob,
     MonitoringCheckpoint,
-    RuntimeControlState,
 )
 from app.services.schema import check_runtime_schema
+from app.services.runtime_controls import (
+    ensure_runtime_control_state,
+    runtime_safety_payload,
+)
 
-RUNTIME_CONTROL_ID = "global"
 OPEN_ORDER_STATUSES = ("submitted", "open", "partially_filled")
 ACTIVE_JOB_STATUSES = ("queued", "scheduled", "running", "retrying")
 
@@ -44,43 +46,19 @@ def default_safety(settings: Settings, reason: str) -> dict[str, object]:
         "mode": settings.runtime_mode,
         "paused": True,
         "kill_switch_enabled": False,
-        "automation_enabled": settings.automation_enabled,
+        "automation_enabled": False,
+        "automated_order_submission_allowed": False,
+        "automated_order_submission_block_reason": "paused",
         "readiness_reason": reason,
         "updated_at": None,
-    }
-
-
-def get_or_create_runtime_control_state(
-    *,
-    settings: Settings,
-    db: Session,
-) -> RuntimeControlState:
-    state = db.get(RuntimeControlState, RUNTIME_CONTROL_ID)
-    if state is not None:
-        return state
-
-    state = RuntimeControlState(
-        id=RUNTIME_CONTROL_ID,
-        mode=settings.runtime_mode,
-        paused=not settings.automation_enabled,
-        kill_switch_enabled=False,
-        automation_enabled=settings.automation_enabled,
-        readiness_reason="initialized fail-closed until operator controls are enabled",
-    )
-    db.add(state)
-    db.commit()
-    db.refresh(state)
-    return state
-
-
-def safety_payload(state: RuntimeControlState) -> dict[str, object]:
-    return {
-        "mode": state.mode,
-        "paused": state.paused,
-        "kill_switch_enabled": state.kill_switch_enabled,
-        "automation_enabled": state.automation_enabled,
-        "readiness_reason": state.readiness_reason,
-        "updated_at": state.updated_at.isoformat() if state.updated_at else None,
+        "last_change": {
+            "action": "bootstrap",
+            "actor": None,
+            "source": "system",
+            "reason": reason,
+            "changed_at": None,
+            "event_id": None,
+        },
     }
 
 
@@ -246,8 +224,8 @@ def build_runtime_status(
         }
 
     try:
-        state = get_or_create_runtime_control_state(settings=settings, db=db)
-        safety = safety_payload(state)
+        state = ensure_runtime_control_state(settings=settings, db=db)
+        safety = runtime_safety_payload(state)
         counts = runtime_counts(db)
         monitoring = monitoring_payload(db)
     except SQLAlchemyError as exc:
