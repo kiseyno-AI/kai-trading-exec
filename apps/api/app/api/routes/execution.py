@@ -20,9 +20,14 @@ router = APIRouter(tags=["execution"])
 
 @router.get("/execution-plans")
 def execution_plans(
+    request: Request,
     db: Annotated[Session, Depends(get_db_session)],
 ) -> list[dict[str, object]]:
-    return list_execution_plans(db)
+    settings: Settings = get_settings(request)
+    return list_execution_plans(
+        settings=settings,
+        db=db,
+    )
 
 
 @router.post("/execution-plans")

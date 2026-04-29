@@ -95,9 +95,14 @@ def create_execution_plan(
     )
 
 
-def list_execution_plans(db: Session) -> list[dict[str, object]]:
+def list_execution_plans(
+    *,
+    settings: Settings,
+    db: Session,
+) -> list[dict[str, object]]:
     plans = db.scalars(
         select(ExecutionPlan)
+        .where(ExecutionPlan.mode == settings.runtime_mode)
         .options(selectinload(ExecutionPlan.items))
         .order_by(ExecutionPlan.accepted_at.desc(), ExecutionPlan.created_at.desc()),
     ).all()

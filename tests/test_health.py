@@ -611,6 +611,111 @@ def test_duplicate_execution_plan_is_rejected() -> None:
     engine.dispose()
 
 
+def test_execution_plan_intake_allows_same_plan_id_in_different_runtime_modes(tmp_path) -> None:
+    database_url = f"sqlite:///{tmp_path / 'shared-execution-plans.db'}"
+    payload = {
+        "plan_id": "shared-plan",
+        "source": "kai-trading-core",
+        "items": [
+            {
+                "symbol": "005930",
+                "side": "buy",
+                "intent": "next_open_buy",
+            }
+        ],
+    }
+
+    paper_app, paper_engine = build_test_app(
+        Settings(
+            database_url=database_url,
+            runtime_mode="paper",
+        )
+    )
+    live_app, live_engine = build_test_app(
+        Settings(
+            database_url=database_url,
+            runtime_mode="live",
+        )
+    )
+
+    paper_client = TestClient(paper_app)
+    live_client = TestClient(live_app)
+
+    paper_response = paper_client.post("/execution-plans", json=payload)
+    live_response = live_client.post("/execution-plans", json=payload)
+
+    assert paper_response.status_code == 201
+    assert live_response.status_code == 201
+    assert paper_response.json()["runtime"]["mode"] == "paper"
+    assert live_response.json()["runtime"]["mode"] == "live"
+
+    with paper_app.state.db_session_factory() as session:
+        persisted_plans = session.scalars(
+            select(ExecutionPlan)
+            .where(ExecutionPlan.external_plan_id == "shared-plan")
+            .order_by(ExecutionPlan.mode.asc())
+        ).all()
+        assert [plan.mode for plan in persisted_plans] == ["live", "paper"]
+
+    paper_engine.dispose()
+    live_engine.dispose()
+
+
+def test_execution_plan_reads_are_filtered_to_active_runtime_mode() -> None:
+    app, engine = build_test_app(
+        Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+        )
+    )
+
+    with app.state.db_session_factory() as session:
+        paper_plan = ExecutionPlan(
+            external_plan_id="paper-plan",
+            source="kai-trading-core",
+            mode="paper",
+            status="accepted",
+        )
+        paper_plan.items.append(
+            ExecutionPlanItem(
+                symbol="005930",
+                side="buy",
+                intent="next_open_buy",
+                status="pending",
+            )
+        )
+        live_plan = ExecutionPlan(
+            external_plan_id="live-plan",
+            source="kai-trading-core",
+            mode="live",
+            status="accepted",
+        )
+        live_plan.items.append(
+            ExecutionPlanItem(
+                symbol="000660",
+                side="sell",
+                intent="target_sell",
+                status="pending",
+            )
+        )
+        session.add_all([paper_plan, live_plan])
+        session.commit()
+
+    client = TestClient(app)
+
+    response = client.get("/execution-plans")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert len(payload) == 1
+    assert payload[0]["plan_id"] == "paper-plan"
+    assert payload[0]["mode"] == "paper"
+    assert payload[0]["item_count"] == 1
+    assert payload[0]["items"][0]["symbol"] == "005930"
+
+    engine.dispose()
+
+
 def test_order_execution_and_position_read_endpoints_return_persisted_state() -> None:
     app, engine = build_test_app()
 
