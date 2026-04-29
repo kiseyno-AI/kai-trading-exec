@@ -1,10 +1,13 @@
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
+from sqlalchemy import update
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings
-from app.models.runtime import RuntimeControlEvent, RuntimeControlState
+from app.models.runtime import RuntimeControlEvent, RuntimeControlState, new_id
 
 RUNTIME_CONTROL_ID = "global"
 DEFAULT_CONTROL_SOURCE = "operator"
@@ -49,28 +52,12 @@ def ensure_runtime_control_state(
     settings: Settings,
     db: Session,
 ) -> RuntimeControlState:
-    state = db.get(RuntimeControlState, RUNTIME_CONTROL_ID)
-    if state is None:
-        now = datetime.now(UTC)
-        state = RuntimeControlState(
-            id=RUNTIME_CONTROL_ID,
-            mode=settings.runtime_mode,
-            paused=True,
-            kill_switch_enabled=False,
-            automation_enabled=False,
-            readiness_reason="initialized fail-closed until operator controls are enabled",
-            last_transition_action="bootstrap",
-            last_transition_source="system",
-            last_transition_reason="initialized fail-closed until operator controls are enabled",
-            last_transition_at=now,
-        )
-        db.add(state)
-        db.commit()
-        db.refresh(state)
-        return state
-
-    if state.mode != settings.runtime_mode:
-        state.mode = settings.runtime_mode
+    state, changed = _load_runtime_control_state(
+        settings=settings,
+        db=db,
+        sync_mode=True,
+    )
+    if changed:
         db.commit()
         db.refresh(state)
     return state
@@ -125,7 +112,11 @@ def pause_runtime(
     db: Session,
     command: ControlCommand,
 ) -> ControlActionResult:
-    state = ensure_runtime_control_state(settings=settings, db=db)
+    state, _ = _load_runtime_control_state(
+        settings=settings,
+        db=db,
+        sync_mode=True,
+    )
     previous_state = _state_snapshot(state)
 
     if state.kill_switch_enabled:
@@ -159,7 +150,11 @@ def resume_runtime(
     db: Session,
     command: ControlCommand,
 ) -> ControlActionResult:
-    state = ensure_runtime_control_state(settings=settings, db=db)
+    state, _ = _load_runtime_control_state(
+        settings=settings,
+        db=db,
+        sync_mode=True,
+    )
     previous_state = _state_snapshot(state)
 
     if state.kill_switch_enabled:
@@ -193,32 +188,165 @@ def enable_kill_switch(
     db: Session,
     command: ControlCommand,
 ) -> ControlActionResult:
-    state = ensure_runtime_control_state(settings=settings, db=db)
+    state, _ = _load_runtime_control_state(
+        settings=settings,
+        db=db,
+        sync_mode=False,
+    )
     previous_state = _state_snapshot(state)
 
     if state.kill_switch_enabled:
+        if state.mode != settings.runtime_mode:
+            state.mode = settings.runtime_mode
+            previous_state = _state_snapshot(state)
         message = "kill switch is already active"
         outcome = "noop"
-    else:
-        state.mode = settings.runtime_mode
-        state.paused = True
-        state.kill_switch_enabled = True
-        state.automation_enabled = False
-        state.readiness_reason = (
-            "kill switch enabled by operator; automated order submission is blocked"
+        return _finalize_action(
+            db=db,
+            state=state,
+            command=command,
+            action="kill_switch",
+            outcome=outcome,
+            message=message,
+            previous_state=previous_state,
         )
-        message = "kill switch enabled; automated order submission is durably blocked"
-        outcome = "applied"
 
+    occurred_at = datetime.now(UTC)
+    event_id = new_id()
+    readiness_reason = (
+        "kill switch enabled by operator; automated order submission is blocked"
+    )
+    current_state = {
+        "mode": settings.runtime_mode,
+        "paused": True,
+        "kill_switch_enabled": True,
+        "automation_enabled": False,
+        "readiness_reason": readiness_reason,
+    }
+    result = db.execute(
+        update(RuntimeControlState)
+        .where(
+            RuntimeControlState.id == state.id,
+            RuntimeControlState.kill_switch_enabled.is_(False),
+        )
+        .values(
+            mode=settings.runtime_mode,
+            paused=True,
+            kill_switch_enabled=True,
+            automation_enabled=False,
+            readiness_reason=readiness_reason,
+            last_transition_action="kill_switch",
+            last_transition_actor=command.actor,
+            last_transition_source=command.source,
+            last_transition_reason=command.reason,
+            last_transition_at=occurred_at,
+            last_transition_event_id=event_id,
+        ),
+    )
+    if result.rowcount:
+        event = RuntimeControlEvent(
+            id=event_id,
+            runtime_control_state_id=state.id,
+            action="kill_switch",
+            outcome="applied",
+            actor=command.actor,
+            source=command.source,
+            reason=command.reason,
+            message="kill switch enabled; automated order submission is durably blocked",
+            previous_state=previous_state,
+            current_state=current_state,
+            occurred_at=occurred_at,
+        )
+        db.add(event)
+        db.commit()
+        db.refresh(state)
+        db.refresh(event)
+        return ControlActionResult(
+            action="kill_switch",
+            outcome="applied",
+            message=event.message or "",
+            event_id=event.id,
+            safety=runtime_safety_payload(state),
+        )
+
+    db.refresh(state)
+    if state.mode != settings.runtime_mode:
+        state.mode = settings.runtime_mode
     return _finalize_action(
         db=db,
         state=state,
         command=command,
         action="kill_switch",
-        outcome=outcome,
-        message=message,
-        previous_state=previous_state,
+        outcome="noop",
+        message="kill switch is already active",
+        previous_state=_state_snapshot(state),
     )
+
+
+def _load_runtime_control_state(
+    *,
+    settings: Settings,
+    db: Session,
+    sync_mode: bool,
+) -> tuple[RuntimeControlState, bool]:
+    state = db.get(RuntimeControlState, RUNTIME_CONTROL_ID)
+    created = False
+    if state is None:
+        created = _insert_runtime_control_state_if_missing(settings=settings, db=db)
+        state = db.get(RuntimeControlState, RUNTIME_CONTROL_ID)
+    if state is None:
+        raise RuntimeError("runtime control state bootstrap failed")
+
+    changed = created
+    if sync_mode and state.mode != settings.runtime_mode:
+        state.mode = settings.runtime_mode
+        changed = True
+    return state, changed
+
+
+def _insert_runtime_control_state_if_missing(
+    *,
+    settings: Settings,
+    db: Session,
+) -> bool:
+    values = _bootstrap_state_values(settings=settings)
+    dialect_name = db.get_bind().dialect.name
+    if dialect_name == "sqlite":
+        result = db.execute(
+            sqlite_insert(RuntimeControlState)
+            .values(**values)
+            .on_conflict_do_nothing(index_elements=[RuntimeControlState.id]),
+        )
+        return bool(result.rowcount)
+    if dialect_name == "postgresql":
+        result = db.execute(
+            postgresql_insert(RuntimeControlState)
+            .values(**values)
+            .on_conflict_do_nothing(index_elements=[RuntimeControlState.id]),
+        )
+        return bool(result.rowcount)
+
+    db.add(RuntimeControlState(**values))
+    db.flush()
+    return True
+
+
+def _bootstrap_state_values(*, settings: Settings) -> dict[str, object]:
+    now = datetime.now(UTC)
+    readiness_reason = "initialized fail-closed until operator controls are enabled"
+    return {
+        "id": RUNTIME_CONTROL_ID,
+        "mode": settings.runtime_mode,
+        "paused": True,
+        "kill_switch_enabled": False,
+        "automation_enabled": False,
+        "readiness_reason": readiness_reason,
+        "last_transition_action": "bootstrap",
+        "last_transition_source": "system",
+        "last_transition_reason": readiness_reason,
+        "last_transition_at": now,
+        "last_transition_event_id": None,
+    }
 
 
 def _state_snapshot(state: RuntimeControlState) -> dict[str, object]:

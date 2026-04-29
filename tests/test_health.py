@@ -1,7 +1,8 @@
+import threading
 from datetime import UTC, datetime
 
 from fastapi.testclient import TestClient
-from sqlalchemy import inspect, select
+from sqlalchemy import inspect, select, text
 
 from app.core.config import Settings, load_settings
 from app.db.base import Base
@@ -9,7 +10,7 @@ from app.db.session import create_db_engine, create_session_factory
 from app.main import create_app
 from app.models import EXEC_OWNED_TABLES
 from app.models.runtime import ExecutionFill, RuntimeControlEvent, RuntimeControlState
-from app.services import runtime as runtime_service
+from app.services import runtime as runtime_service, runtime_controls
 
 
 def build_test_app(settings: Settings | None = None):
@@ -19,6 +20,57 @@ def build_test_app(settings: Settings | None = None):
     session_factory = create_session_factory(engine)
     app = create_app(
         settings=app_settings,
+        engine=engine,
+        session_factory=session_factory,
+    )
+    return app, engine
+
+
+def build_unmigrated_runtime_safety_app(database_url: str):
+    settings = Settings(database_url=database_url)
+    engine = create_db_engine(settings)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                CREATE TABLE runtime_control_state (
+                    id VARCHAR(32) PRIMARY KEY NOT NULL,
+                    mode VARCHAR(16) NOT NULL,
+                    paused BOOLEAN NOT NULL,
+                    kill_switch_enabled BOOLEAN NOT NULL,
+                    automation_enabled BOOLEAN NOT NULL,
+                    readiness_reason TEXT,
+                    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO runtime_control_state (
+                    id,
+                    mode,
+                    paused,
+                    kill_switch_enabled,
+                    automation_enabled,
+                    readiness_reason
+                )
+                VALUES (
+                    'global',
+                    'mock',
+                    1,
+                    0,
+                    0,
+                    'initialized fail-closed until operator controls are enabled'
+                )
+                """
+            )
+        )
+    session_factory = create_session_factory(engine)
+    app = create_app(
+        settings=settings,
         engine=engine,
         session_factory=session_factory,
     )
@@ -154,6 +206,29 @@ def test_runtime_safety_endpoint_reports_bootstrap_metadata() -> None:
     engine.dispose()
 
 
+def test_runtime_safety_fails_closed_when_runtime_safety_migration_is_missing(
+    tmp_path,
+) -> None:
+    app, engine = build_unmigrated_runtime_safety_app(
+        f"sqlite:///{tmp_path / 'runtime-safety-baseline.db'}"
+    )
+    client = TestClient(app)
+
+    response = client.get("/runtime/safety")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["paused"] is True
+    assert payload["kill_switch_enabled"] is False
+    assert payload["automation_enabled"] is False
+    assert payload["automated_order_submission_allowed"] is False
+    assert payload["automated_order_submission_block_reason"] == "paused"
+    assert payload["last_change"]["action"] == "bootstrap"
+    assert "run migrations" in payload["readiness_reason"]
+
+    engine.dispose()
+
+
 def test_runtime_control_endpoints_record_transitions_and_audit() -> None:
     app, engine = build_test_app()
     client = TestClient(app)
@@ -273,6 +348,74 @@ def test_runtime_control_endpoints_record_transitions_and_audit() -> None:
             ("kill_switch", "noop"),
             ("resume", "rejected"),
         ]
+
+    engine.dispose()
+
+
+def test_kill_switch_transition_is_serialized_under_concurrent_requests(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    settings = Settings(database_url=f"sqlite:///{tmp_path / 'runtime-safety-race.db'}")
+    app, engine = build_test_app(settings)
+
+    with app.state.db_session_factory() as session:
+        runtime_controls.ensure_runtime_control_state(settings=settings, db=session)
+
+    barrier = threading.Barrier(2)
+    original_state_snapshot = runtime_controls._state_snapshot
+
+    def synchronized_state_snapshot(state: RuntimeControlState) -> dict[str, object]:
+        snapshot = original_state_snapshot(state)
+        if not state.kill_switch_enabled:
+            barrier.wait(timeout=5)
+        return snapshot
+
+    monkeypatch.setattr(runtime_controls, "_state_snapshot", synchronized_state_snapshot)
+
+    results = []
+
+    def worker(actor: str) -> None:
+        with app.state.db_session_factory() as session:
+            results.append(
+                runtime_controls.enable_kill_switch(
+                    settings=settings,
+                    db=session,
+                    command=runtime_controls.ControlCommand(
+                        actor=actor,
+                        source="test",
+                        reason="concurrent kill switch request",
+                    ),
+                )
+            )
+
+    threads = [
+        threading.Thread(target=worker, args=("alpha",)),
+        threading.Thread(target=worker, args=("beta",)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert sorted(result.outcome for result in results) == ["applied", "noop"]
+    applied_result = next(result for result in results if result.outcome == "applied")
+    noop_result = next(result for result in results if result.outcome == "noop")
+    assert noop_result.safety["kill_switch_enabled"] is True
+    assert noop_result.safety["last_change"]["event_id"] == applied_result.event_id
+
+    with app.state.db_session_factory() as session:
+        state = session.get(RuntimeControlState, "global")
+        assert state is not None
+        assert state.kill_switch_enabled is True
+        assert state.last_transition_event_id == applied_result.event_id
+
+        events = session.scalars(
+            select(RuntimeControlEvent)
+            .where(RuntimeControlEvent.action == "kill_switch")
+            .order_by(RuntimeControlEvent.occurred_at)
+        ).all()
+        assert [event.outcome for event in events] == ["applied", "noop"]
 
     engine.dispose()
 

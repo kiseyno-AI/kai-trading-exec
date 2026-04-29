@@ -62,6 +62,22 @@ def default_safety(settings: Settings, reason: str) -> dict[str, object]:
     }
 
 
+def build_runtime_safety(
+    *,
+    settings: Settings,
+    db: Session,
+) -> dict[str, object]:
+    try:
+        state = ensure_runtime_control_state(settings=settings, db=db)
+    except SQLAlchemyError as exc:
+        db.rollback()
+        return default_safety(
+            settings,
+            f"runtime state unavailable: {exc.__class__.__name__}; run migrations",
+        )
+    return runtime_safety_payload(state)
+
+
 def runtime_counts(db: Session) -> dict[str, int]:
     open_orders = db.scalar(
         select(func.count())
