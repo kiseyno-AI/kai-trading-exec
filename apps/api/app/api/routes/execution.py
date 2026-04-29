@@ -5,7 +5,11 @@ from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 
 from app.api.dependencies import get_broker_adapter, get_db_session, get_settings
-from app.api.schemas.execution import ExecutionPlanRequest, PlaceOrderRequest
+from app.api.schemas.execution import (
+    ExecutionPlanRequest,
+    MonitoringEvaluationRequest,
+    PlaceOrderRequest,
+)
 from app.broker.base import BrokerAdapter
 from app.core.config import Settings
 from app.services.broker_orders import place_broker_order
@@ -17,6 +21,7 @@ from app.services.execution_api import (
     list_execution_positions,
 )
 from app.services.execution_jobs import dispatch_due_execution_jobs, list_execution_jobs
+from app.services.monitoring import evaluate_monitoring
 
 router = APIRouter(tags=["execution"])
 
@@ -71,6 +76,23 @@ def dispatch_execution_jobs(
         settings=settings,
         db=db,
         adapter=adapter,
+    )
+    return JSONResponse(status_code=result.status_code, content=result.payload)
+
+
+@router.post("/monitoring/evaluate")
+def monitoring_evaluate(
+    request: Request,
+    db: Annotated[Session, Depends(get_db_session)],
+    adapter: Annotated[BrokerAdapter, Depends(get_broker_adapter)],
+    payload: MonitoringEvaluationRequest = Body(...),
+) -> JSONResponse:
+    settings: Settings = get_settings(request)
+    result = evaluate_monitoring(
+        settings=settings,
+        db=db,
+        adapter=adapter,
+        command=payload,
     )
     return JSONResponse(status_code=result.status_code, content=result.payload)
 

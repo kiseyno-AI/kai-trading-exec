@@ -547,6 +547,7 @@ def test_execution_plan_intake_and_read_endpoints() -> None:
     assert items_by_symbol["005930"]["side"] == "buy"
     assert items_by_symbol["005930"]["limit_price"] == "71000.0000"
     assert items_by_symbol["005930"]["time_in_force"] == "day"
+    assert items_by_symbol["000660"]["status"] == "target_sell_monitoring"
     assert items_by_symbol["000660"]["trigger_price"] == "125000.0000"
 
     assert client.get("/orders").json() == []
@@ -634,7 +635,7 @@ def test_execution_plan_intake_schedules_next_open_buy_jobs() -> None:
         assert [item.symbol for item in items] == ["000660", "005930"]
         items_by_symbol = {item.symbol: item for item in items}
         assert items_by_symbol["005930"].status == "next_open_buy_scheduled"
-        assert items_by_symbol["000660"].status == "pending"
+        assert items_by_symbol["000660"].status == "target_sell_monitoring"
 
         jobs = session.scalars(
             select(ExecutionJob)

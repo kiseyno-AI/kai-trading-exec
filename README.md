@@ -73,6 +73,9 @@ curl http://127.0.0.1:8010/runtime/status
 curl http://127.0.0.1:8010/broker/session
 curl http://127.0.0.1:8010/execution-jobs
 curl -X POST http://127.0.0.1:8010/execution-jobs/dispatch
+curl -X POST http://127.0.0.1:8010/monitoring/evaluate \
+  -H 'content-type: application/json' \
+  -d '{"prices":[{"symbol":"005930","price":"125100.00"}]}'
 curl http://127.0.0.1:8010/orders
 ```
 
@@ -108,9 +111,10 @@ Operator broker-session endpoints:
 Initial broker-order submission endpoint:
 - `POST /orders`
 
-Current next-open execution slice:
+Current execution slices:
 - `POST /execution-plans` schedules durable `execution_jobs` for eligible `next_open_buy` items
 - `POST /execution-jobs/dispatch` manually dispatches due jobs through the existing KIS adapter path
+- `POST /monitoring/evaluate` evaluates persisted `target_sell` / `stop_sell` items against supplied price snapshots, places sell orders through the existing KIS adapter path when triggers fire, and updates monitoring liveness checkpoints
 
 ## Boot target
 

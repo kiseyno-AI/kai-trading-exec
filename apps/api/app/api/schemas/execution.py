@@ -151,3 +151,38 @@ class PlaceOrderRequest(BaseModel):
             raise ValueError("limit_price is required for limit orders")
         if self.order_type == "market" and self.limit_price is not None:
             raise ValueError("limit_price must be omitted for market orders")
+
+
+class MonitoringPriceRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    symbol: str = Field(min_length=1, max_length=32)
+    price: Decimal = Field(gt=0)
+
+    @field_validator("symbol")
+    @classmethod
+    def normalize_monitoring_symbol(cls, value: str) -> str:
+        normalized = value.strip().upper()
+        if not normalized:
+            raise ValueError("symbol must not be empty")
+        return normalized
+
+
+class MonitoringEvaluationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    actor: str | None = Field(default=None, max_length=128)
+    source: str = Field(default="operator", max_length=64)
+    reason: str | None = None
+    observed_at: datetime | None = None
+    prices: list[MonitoringPriceRequest] = Field(min_length=1)
+
+    @field_validator("actor", "source")
+    @classmethod
+    def normalize_monitoring_text_fields(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("field must not be empty")
+        return normalized

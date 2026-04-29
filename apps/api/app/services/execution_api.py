@@ -55,8 +55,10 @@ def create_execution_plan(
         ],
     )
     from app.services.execution_jobs import materialize_execution_jobs
+    from app.services.monitoring import materialize_monitoring_plan_items
 
     materialize_execution_jobs(plan)
+    materialize_monitoring_plan_items(plan)
     db.add(plan)
 
     try:
