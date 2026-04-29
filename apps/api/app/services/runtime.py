@@ -1,9 +1,9 @@
 import os
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import func, select
+from sqlalchemy import distinct, func, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -108,78 +108,72 @@ def runtime_symbol_summary(
     settings: Settings,
     db: Session,
 ) -> dict[str, list[str]]:
+    today_start_utc, tomorrow_start_utc = _current_krx_day_utc_bounds()
+    failed_observed_at = func.coalesce(
+        BrokerOrder.last_broker_sync_at,
+        BrokerOrder.submitted_at,
+        BrokerOrder.updated_at,
+    )
     monitored_symbols = db.scalars(
-        select(ExecutionPlanItem.symbol)
+        select(distinct(ExecutionPlanItem.symbol))
         .join(ExecutionPlanItem.plan)
         .where(
             ExecutionPlan.mode == settings.runtime_mode,
             ExecutionPlanItem.intent.in_(MONITORED_INTENTS),
         )
     ).all()
-
-    today_seoul = datetime.now(KRX_TIMEZONE).date()
-
-    scheduled_today: set[str] = set()
-    scheduled_jobs = db.execute(
-        select(ExecutionPlanItem.symbol, ExecutionJob.scheduled_for)
+    scheduled_today = db.scalars(
+        select(distinct(ExecutionPlanItem.symbol))
         .select_from(ExecutionJob)
         .join(ExecutionJob.plan_item)
         .join(ExecutionPlanItem.plan)
         .where(
             ExecutionPlan.mode == settings.runtime_mode,
             ExecutionJob.status.in_(ACTIVE_JOB_STATUSES),
+            ExecutionJob.scheduled_for.is_not(None),
+            ExecutionJob.scheduled_for >= today_start_utc,
+            ExecutionJob.scheduled_for < tomorrow_start_utc,
         )
     ).all()
-    for symbol, scheduled_for in scheduled_jobs:
-        if scheduled_for is None:
-            continue
-        if scheduled_for.astimezone(KRX_TIMEZONE).date() == today_seoul:
-            scheduled_today.add(symbol)
-
-    filled_today: set[str] = set()
-    fills = db.execute(
-        select(ExecutionFill.symbol, ExecutionFill.filled_at)
+    filled_today = db.scalars(
+        select(distinct(ExecutionFill.symbol))
         .select_from(ExecutionFill)
         .join(ExecutionFill.broker_order)
         .join(BrokerOrder.plan_item)
         .join(ExecutionPlanItem.plan)
-        .where(ExecutionPlan.mode == settings.runtime_mode)
-        .order_by(ExecutionFill.filled_at.desc(), ExecutionFill.id.desc())
-    ).all()
-    for symbol, filled_at in fills:
-        if filled_at.astimezone(KRX_TIMEZONE).date() == today_seoul:
-            filled_today.add(symbol)
-
-    failed_today: set[str] = set()
-    failed_orders = db.execute(
-        select(
-            BrokerOrder.symbol,
-            BrokerOrder.last_broker_sync_at,
-            BrokerOrder.submitted_at,
-            BrokerOrder.updated_at,
+        .where(
+            ExecutionPlan.mode == settings.runtime_mode,
+            ExecutionFill.filled_at >= today_start_utc,
+            ExecutionFill.filled_at < tomorrow_start_utc,
         )
+    ).all()
+    failed_today = db.scalars(
+        select(distinct(BrokerOrder.symbol))
         .select_from(BrokerOrder)
         .join(BrokerOrder.plan_item)
         .join(ExecutionPlanItem.plan)
         .where(
             ExecutionPlan.mode == settings.runtime_mode,
             BrokerOrder.status.in_(FAILED_ORDER_STATUSES),
+            failed_observed_at.is_not(None),
+            failed_observed_at >= today_start_utc,
+            failed_observed_at < tomorrow_start_utc,
         )
-        .order_by(BrokerOrder.updated_at.desc(), BrokerOrder.id.desc())
     ).all()
-    for symbol, last_broker_sync_at, submitted_at, updated_at in failed_orders:
-        observed_at = last_broker_sync_at or submitted_at or updated_at
-        if observed_at is None:
-            continue
-        if observed_at.astimezone(KRX_TIMEZONE).date() == today_seoul:
-            failed_today.add(symbol)
 
     return {
-        "monitored": sorted(set(monitored_symbols)),
+        "monitored": sorted(monitored_symbols),
         "scheduled_today": sorted(scheduled_today),
         "filled_today": sorted(filled_today),
         "failed_today": sorted(failed_today),
     }
+
+
+def _current_krx_day_utc_bounds(now: datetime | None = None) -> tuple[datetime, datetime]:
+    current_krx = (now or datetime.now(KRX_TIMEZONE)).astimezone(KRX_TIMEZONE)
+    day_start_krx = current_krx.replace(hour=0, minute=0, second=0, microsecond=0)
+    next_day_start_krx = day_start_krx + timedelta(days=1)
+    return day_start_krx.astimezone(UTC), next_day_start_krx.astimezone(UTC)
 
 
 def monitoring_payload(db: Session) -> dict[str, object]:

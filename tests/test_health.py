@@ -1,5 +1,5 @@
 import threading
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 from fastapi.testclient import TestClient
@@ -955,8 +955,15 @@ def test_order_execution_and_position_read_endpoints_return_persisted_state() ->
 
 def test_runtime_status_exposes_core_facing_symbol_summary() -> None:
     app, engine = build_test_app(settings=Settings(database_url="sqlite:///:memory:", runtime_mode="paper"))
-    now_seoul = datetime.now(runtime_service.KRX_TIMEZONE)
-    today_utc = now_seoul.replace(hour=9, minute=5, second=0, microsecond=0).astimezone(UTC)
+    today_start_utc, _ = runtime_service._current_krx_day_utc_bounds()
+    today_edge_utc = today_start_utc + timedelta(minutes=15)
+    today_later_utc = today_start_utc + timedelta(hours=1)
+    yesterday_edge_utc = today_start_utc - timedelta(minutes=15)
+    # SQLite commonly drops tzinfo for DateTime(timezone=True); keep the fixture naive
+    # to verify the runtime summary still treats persisted values as UTC.
+    today_edge_naive = today_edge_utc.replace(tzinfo=None)
+    today_later_naive = today_later_utc.replace(tzinfo=None)
+    yesterday_edge_naive = yesterday_edge_utc.replace(tzinfo=None)
 
     with app.state.db_session_factory() as session:
         paper_plan = ExecutionPlan(
@@ -971,11 +978,23 @@ def test_runtime_status_exposes_core_facing_symbol_summary() -> None:
             intent="target_sell",
             status="target_sell_monitoring",
         )
+        duplicate_monitored_item = ExecutionPlanItem(
+            symbol="005930",
+            side="sell",
+            intent="stop_sell",
+            status="stop_sell_monitoring",
+        )
         scheduled_item = ExecutionPlanItem(
             symbol="000660",
             side="buy",
             intent="next_open_buy",
             status="next_open_buy_scheduled",
+        )
+        historical_scheduled_item = ExecutionPlanItem(
+            symbol="207940",
+            side="buy",
+            intent="next_open_buy",
+            status="next_open_buy_retry_pending",
         )
         failed_item = ExecutionPlanItem(
             symbol="035420",
@@ -983,17 +1002,47 @@ def test_runtime_status_exposes_core_facing_symbol_summary() -> None:
             intent="next_open_buy",
             status="next_open_buy_failed",
         )
-        paper_plan.items.extend([monitored_item, scheduled_item, failed_item])
+        historical_failed_item = ExecutionPlanItem(
+            symbol="051910",
+            side="buy",
+            intent="next_open_buy",
+            status="next_open_buy_failed",
+        )
+        historical_fill_item = ExecutionPlanItem(
+            symbol="066570",
+            side="buy",
+            intent="next_open_buy",
+            status="filled",
+        )
+        paper_plan.items.extend(
+            [
+                monitored_item,
+                duplicate_monitored_item,
+                scheduled_item,
+                historical_scheduled_item,
+                failed_item,
+                historical_failed_item,
+                historical_fill_item,
+            ]
+        )
         session.add(paper_plan)
         session.flush()
 
-        session.add(
-            ExecutionJob(
-                execution_plan_item_id=scheduled_item.id,
-                job_type="next_open_buy",
-                status="scheduled",
-                scheduled_for=today_utc,
-            )
+        session.add_all(
+            [
+                ExecutionJob(
+                    execution_plan_item_id=scheduled_item.id,
+                    job_type="next_open_buy",
+                    status="scheduled",
+                    scheduled_for=today_edge_naive,
+                ),
+                ExecutionJob(
+                    execution_plan_item_id=historical_scheduled_item.id,
+                    job_type="next_open_buy",
+                    status="retrying",
+                    scheduled_for=yesterday_edge_naive,
+                ),
+            ]
         )
         open_order = BrokerOrder(
             execution_plan_item_id=scheduled_item.id,
@@ -1003,8 +1052,8 @@ def test_runtime_status_exposes_core_facing_symbol_summary() -> None:
             side="buy",
             status="open",
             quantity=3,
-            submitted_at=today_utc,
-            last_broker_sync_at=today_utc,
+            submitted_at=today_edge_naive,
+            last_broker_sync_at=today_edge_naive,
         )
         failed_order = BrokerOrder(
             execution_plan_item_id=failed_item.id,
@@ -1014,23 +1063,75 @@ def test_runtime_status_exposes_core_facing_symbol_summary() -> None:
             side="buy",
             status="failed",
             quantity=2,
-            submitted_at=today_utc,
-            last_broker_sync_at=today_utc,
+            submitted_at=today_edge_naive,
+            last_broker_sync_at=None,
             last_error_message="broker rejected order",
         )
-        session.add_all([open_order, failed_order])
+        historical_failed_order = BrokerOrder(
+            execution_plan_item_id=historical_failed_item.id,
+            idempotency_key="paper-failed-order-yesterday",
+            broker_order_id="kis-failed-2",
+            symbol="051910",
+            side="buy",
+            status="rejected",
+            quantity=1,
+            submitted_at=yesterday_edge_naive,
+            last_broker_sync_at=None,
+            last_error_message="historical rejection",
+        )
+        historical_filled_order = BrokerOrder(
+            execution_plan_item_id=historical_fill_item.id,
+            idempotency_key="paper-filled-order-yesterday",
+            broker_order_id="kis-filled-2",
+            symbol="066570",
+            side="buy",
+            status="filled",
+            quantity=4,
+            submitted_at=yesterday_edge_naive,
+            last_broker_sync_at=yesterday_edge_naive,
+        )
+        session.add_all(
+            [
+                open_order,
+                failed_order,
+                historical_failed_order,
+                historical_filled_order,
+            ]
+        )
         session.flush()
-        session.add(
-            ExecutionFill(
-                broker_order_pk=open_order.id,
-                broker_fill_id="fill-paper-1",
-                symbol="000660",
-                side="buy",
-                quantity=3,
-                price=Decimal("125000.0000"),
-                filled_at=today_utc,
-                payload={"source": "broker"},
-            )
+        session.add_all(
+            [
+                ExecutionFill(
+                    broker_order_pk=open_order.id,
+                    broker_fill_id="fill-paper-1",
+                    symbol="000660",
+                    side="buy",
+                    quantity=2,
+                    price=Decimal("125000.0000"),
+                    filled_at=today_edge_naive,
+                    payload={"source": "broker"},
+                ),
+                ExecutionFill(
+                    broker_order_pk=open_order.id,
+                    broker_fill_id="fill-paper-2",
+                    symbol="000660",
+                    side="buy",
+                    quantity=1,
+                    price=Decimal("125050.0000"),
+                    filled_at=today_later_naive,
+                    payload={"source": "broker"},
+                ),
+                ExecutionFill(
+                    broker_order_pk=historical_filled_order.id,
+                    broker_fill_id="fill-paper-old",
+                    symbol="066570",
+                    side="buy",
+                    quantity=4,
+                    price=Decimal("88000.0000"),
+                    filled_at=yesterday_edge_naive,
+                    payload={"source": "broker"},
+                ),
+            ]
         )
 
         live_plan = ExecutionPlan(
@@ -1055,7 +1156,7 @@ def test_runtime_status_exposes_core_facing_symbol_summary() -> None:
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["counts"] == {"open_orders": 1, "active_execution_jobs": 1}
+    assert payload["counts"] == {"open_orders": 1, "active_execution_jobs": 2}
     assert payload["symbols"] == {
         "monitored": ["005930"],
         "scheduled_today": ["000660"],
