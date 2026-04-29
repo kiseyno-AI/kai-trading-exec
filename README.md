@@ -71,6 +71,8 @@ Useful checks:
 curl http://127.0.0.1:8010/health
 curl http://127.0.0.1:8010/runtime/status
 curl http://127.0.0.1:8010/broker/session
+curl http://127.0.0.1:8010/execution-jobs
+curl -X POST http://127.0.0.1:8010/execution-jobs/dispatch
 curl http://127.0.0.1:8010/orders
 ```
 
@@ -105,6 +107,10 @@ Operator broker-session endpoints:
 
 Initial broker-order submission endpoint:
 - `POST /orders`
+
+Current next-open execution slice:
+- `POST /execution-plans` schedules durable `execution_jobs` for eligible `next_open_buy` items
+- `POST /execution-jobs/dispatch` manually dispatches due jobs through the existing KIS adapter path
 
 ## Boot target
 

@@ -39,6 +39,7 @@ def place_broker_order(
     db: Session,
     adapter: BrokerAdapter,
     command: PlaceOrderRequest,
+    request_source: str = "post:/orders",
 ) -> PlaceBrokerOrderResult:
     existing = _load_order_by_idempotency_key(db=db, idempotency_key=command.idempotency_key)
     if existing is not None:
@@ -89,7 +90,7 @@ def place_broker_order(
         quantity=command.quantity,
         limit_price=command.limit_price,
         request_metadata={
-            "source": "post:/orders",
+            "source": request_source,
             "requested_at": datetime.now(UTC).isoformat(),
             "time_in_force": command.time_in_force,
         },

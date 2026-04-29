@@ -16,6 +16,7 @@ from app.services.execution_api import (
     list_execution_plans,
     list_execution_positions,
 )
+from app.services.execution_jobs import dispatch_due_execution_jobs, list_execution_jobs
 
 router = APIRouter(tags=["execution"])
 
@@ -43,6 +44,33 @@ def create_execution_plan_handler(
         settings=settings,
         db=db,
         command=payload,
+    )
+    return JSONResponse(status_code=result.status_code, content=result.payload)
+
+
+@router.get("/execution-jobs")
+def execution_jobs(
+    request: Request,
+    db: Annotated[Session, Depends(get_db_session)],
+) -> list[dict[str, object]]:
+    settings: Settings = get_settings(request)
+    return list_execution_jobs(
+        settings=settings,
+        db=db,
+    )
+
+
+@router.post("/execution-jobs/dispatch")
+def dispatch_execution_jobs(
+    request: Request,
+    db: Annotated[Session, Depends(get_db_session)],
+    adapter: Annotated[BrokerAdapter, Depends(get_broker_adapter)],
+) -> JSONResponse:
+    settings: Settings = get_settings(request)
+    result = dispatch_due_execution_jobs(
+        settings=settings,
+        db=db,
+        adapter=adapter,
     )
     return JSONResponse(status_code=result.status_code, content=result.payload)
 

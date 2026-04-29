@@ -112,6 +112,43 @@ Suggested response shape:
 ### `GET /execution-plans`
 List accepted plans and lifecycle state.
 
+For the current next-open slice, eligible `next_open_buy` items transition to
+`next_open_buy_scheduled` and receive a durable `execution_job` scheduled for
+the market open on `market_date`. Items without enough scheduling information
+remain persisted but do not receive a dispatchable job yet.
+
+### `GET /execution-jobs`
+List execution jobs for the active runtime mode.
+
+Current response includes:
+- `execution_job_id`
+- `execution_plan_item_id`
+- `job_type`
+- `status`
+- `scheduled_for`
+- `locked_at`
+- `attempts`
+- `last_error`
+- `symbol`
+- `side`
+- `intent`
+
+### `POST /execution-jobs/dispatch`
+Manually dispatch due execution jobs through the broker adapter boundary.
+
+This is the current operator/manual execution surface until a background
+dispatcher loop exists.
+
+Current response includes:
+- `blocked`
+- `block_reason`
+- `triggered_at`
+- `due_job_count`
+- `completed_job_count`
+- `retrying_job_count`
+- `failed_job_count`
+- `jobs[]`
+
 ### `GET /orders`
 List broker orders with internal normalized statuses.
 
