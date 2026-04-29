@@ -1,0 +1,21 @@
+name: Auto Comment
+
+on:
+  pull_request:
+    types: [opened]
+
+permissions:
+  pull-requests: write
+  issues: write
+
+jobs:
+  auto-comment:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: wow-actions/auto-comment@v1
+        with:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          pullRequestOpened: |
+            @codex check it.
+            If no changes are needed, reply with exactly: "looks good to merge".
+            If changes are needed, reply with a short comment that clearly says changes are required.
