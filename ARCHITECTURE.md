@@ -99,6 +99,7 @@ That includes:
 - `execution_fills`
 - `execution_positions`
 - `runtime_control_state`
+- `runtime_control_events`
 - `monitoring_checkpoints`
 
 The baseline migration also creates `execution_plans` as the parent intake

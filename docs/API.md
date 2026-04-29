@@ -34,6 +34,19 @@ Current foundation response includes:
 ### `GET /runtime/safety`
 Returns safety controls and operator override state.
 
+Current response includes:
+- `paused`, `kill_switch_enabled`, `automation_enabled`
+- `automated_order_submission_allowed`
+- `automated_order_submission_block_reason`
+- `readiness_reason`
+- `last_change`
+  - `action`
+  - `actor`
+  - `source`
+  - `reason`
+  - `changed_at`
+  - `event_id`
+
 ## Persistence boundary
 
 The initial migration creates the exec-owned runtime tables only:
@@ -49,6 +62,9 @@ The initial migration creates the exec-owned runtime tables only:
 
 These tables are owned by `kai-trading-exec`; strategy generation and dashboard
 read models remain outside this repository boundary.
+
+Safety control actions are additionally audited in:
+- `runtime_control_events`
 
 ## Execution plan intake
 
@@ -97,8 +113,24 @@ Return exec-runtime position view used for monitoring logic.
 ### `POST /controls/pause`
 Pause new automated execution actions but keep monitoring alive.
 
+Suggested body shape:
+- `actor`
+- `source`
+- `reason`
+
 ### `POST /controls/resume`
 Resume automated execution if kill-switch is not active.
 
+`resume` returns `409` when the kill-switch is active because that requires an
+explicit reset flow outside the resume endpoint.
+
 ### `POST /controls/kill-switch`
 Durably disable all automated order submission until explicit operator reset.
+
+Current control responses include:
+- `action`
+- `outcome` (`applied`, `noop`, `rejected`)
+- `changed`
+- `message`
+- `event_id`
+- `safety` (current `GET /runtime/safety` payload)

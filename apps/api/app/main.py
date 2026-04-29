@@ -6,6 +6,7 @@ from fastapi import FastAPI
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
+from app.api.routes.controls import router as controls_router
 from app.api.routes.health import router as health_router
 from app.api.routes.runtime import router as runtime_router
 from app.core.config import Settings, get_settings
@@ -56,6 +57,7 @@ def create_app(
 
     app.include_router(health_router)
     app.include_router(runtime_router)
+    app.include_router(controls_router)
     return app
 
 
