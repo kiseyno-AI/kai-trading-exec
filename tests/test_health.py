@@ -1,5 +1,6 @@
 import threading
 from datetime import UTC, datetime
+from decimal import Decimal
 
 from fastapi.testclient import TestClient
 from sqlalchemy import inspect, select, text
@@ -9,7 +10,15 @@ from app.db.base import Base
 from app.db.session import create_db_engine, create_session_factory
 from app.main import create_app
 from app.models import EXEC_OWNED_TABLES
-from app.models.runtime import ExecutionFill, RuntimeControlEvent, RuntimeControlState
+from app.models.runtime import (
+    BrokerOrder,
+    ExecutionFill,
+    ExecutionPlan,
+    ExecutionPlanItem,
+    ExecutionPosition,
+    RuntimeControlEvent,
+    RuntimeControlState,
+)
 from app.services import runtime as runtime_service, runtime_controls
 
 
@@ -470,3 +479,328 @@ def test_runtime_safety_state_survives_restart(tmp_path) -> None:
         ]
 
     restarted_engine.dispose()
+
+
+def test_execution_plan_intake_and_read_endpoints() -> None:
+    app, engine = build_test_app(
+        Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+        )
+    )
+    client = TestClient(app)
+
+    response = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-20260429-open",
+            "source": "kai-trading-core",
+            "market_date": "2026-04-29",
+            "strategy_run_id": "run-123",
+            "requested_at": "2026-04-29T09:00:00Z",
+            "items": [
+                {
+                    "symbol": "005930",
+                    "side": "BUY",
+                    "intent": "next_open_buy",
+                    "quantity_policy": {"kind": "shares", "quantity": 10},
+                    "limit_price": "71000.00",
+                    "time_in_force": "DAY",
+                    "decision_snapshot_id": "decision-1",
+                },
+                {
+                    "symbol": "000660",
+                    "side": "sell",
+                    "intent": "target_sell",
+                    "quantity_policy": {"kind": "percent", "fraction": 0.5},
+                    "trigger_price": "125000.00",
+                    "risk_context": {"stop": "tighten"},
+                },
+            ],
+        },
+    )
+
+    assert response.status_code == 201
+    payload = response.json()
+    assert payload["plan_id"] == "plan-20260429-open"
+    assert payload["accepted_item_count"] == 2
+    assert payload["rejected_item_count"] == 0
+    assert payload["validation_failures"] == []
+    assert len(payload["persisted_execution_item_ids"]) == 2
+    assert payload["runtime"]["mode"] == "paper"
+
+    plans_response = client.get("/execution-plans")
+    assert plans_response.status_code == 200
+    plans_payload = plans_response.json()
+    assert len(plans_payload) == 1
+    plan = plans_payload[0]
+    assert plan["plan_id"] == "plan-20260429-open"
+    assert plan["source"] == "kai-trading-core"
+    assert plan["market_date"] == "2026-04-29"
+    assert plan["strategy_run_id"] == "run-123"
+    assert plan["mode"] == "paper"
+    assert plan["status"] == "accepted"
+    assert plan["item_count"] == 2
+    items_by_symbol = {item["symbol"]: item for item in plan["items"]}
+    assert set(items_by_symbol) == {"005930", "000660"}
+    assert items_by_symbol["005930"]["side"] == "buy"
+    assert items_by_symbol["005930"]["limit_price"] == "71000.0000"
+    assert items_by_symbol["005930"]["time_in_force"] == "day"
+    assert items_by_symbol["000660"]["trigger_price"] == "125000.0000"
+
+    assert client.get("/orders").json() == []
+    assert client.get("/executions").json() == []
+    assert client.get("/positions").json() == []
+
+    with app.state.db_session_factory() as session:
+        persisted_plan = session.scalar(
+            select(ExecutionPlan).where(
+                ExecutionPlan.external_plan_id == "plan-20260429-open"
+            )
+        )
+        assert persisted_plan is not None
+        assert persisted_plan.market_date is not None
+        assert persisted_plan.market_date.isoformat() == "2026-04-29"
+        assert persisted_plan.strategy_run_id == "run-123"
+
+        persisted_items = session.scalars(
+            select(ExecutionPlanItem)
+            .where(ExecutionPlanItem.execution_plan_id == persisted_plan.id)
+            .order_by(ExecutionPlanItem.created_at)
+        ).all()
+        assert len(persisted_items) == 2
+        assert persisted_items[0].limit_price == Decimal("71000.0000")
+        assert persisted_items[0].time_in_force == "day"
+        assert persisted_items[1].trigger_price == Decimal("125000.0000")
+
+    engine.dispose()
+
+
+def test_duplicate_execution_plan_is_rejected() -> None:
+    app, engine = build_test_app()
+    client = TestClient(app)
+    payload = {
+        "plan_id": "duplicate-plan",
+        "source": "kai-trading-core",
+        "items": [
+            {
+                "symbol": "005930",
+                "side": "buy",
+                "intent": "next_open_buy",
+            }
+        ],
+    }
+
+    first_response = client.post("/execution-plans", json=payload)
+    second_response = client.post("/execution-plans", json=payload)
+
+    assert first_response.status_code == 201
+    assert second_response.status_code == 409
+    second_payload = second_response.json()
+    assert second_payload["plan_id"] == "duplicate-plan"
+    assert second_payload["accepted_item_count"] == 0
+    assert second_payload["rejected_item_count"] == 1
+    assert second_payload["persisted_execution_item_ids"] == []
+    assert second_payload["validation_failures"] == [
+        {
+            "field": "plan_id",
+            "message": "execution plan with this plan_id already exists",
+        }
+    ]
+
+    engine.dispose()
+
+
+def test_execution_plan_intake_allows_same_plan_id_in_different_runtime_modes(tmp_path) -> None:
+    database_url = f"sqlite:///{tmp_path / 'shared-execution-plans.db'}"
+    payload = {
+        "plan_id": "shared-plan",
+        "source": "kai-trading-core",
+        "items": [
+            {
+                "symbol": "005930",
+                "side": "buy",
+                "intent": "next_open_buy",
+            }
+        ],
+    }
+
+    paper_app, paper_engine = build_test_app(
+        Settings(
+            database_url=database_url,
+            runtime_mode="paper",
+        )
+    )
+    live_app, live_engine = build_test_app(
+        Settings(
+            database_url=database_url,
+            runtime_mode="live",
+        )
+    )
+
+    paper_client = TestClient(paper_app)
+    live_client = TestClient(live_app)
+
+    paper_response = paper_client.post("/execution-plans", json=payload)
+    live_response = live_client.post("/execution-plans", json=payload)
+
+    assert paper_response.status_code == 201
+    assert live_response.status_code == 201
+    assert paper_response.json()["runtime"]["mode"] == "paper"
+    assert live_response.json()["runtime"]["mode"] == "live"
+
+    with paper_app.state.db_session_factory() as session:
+        persisted_plans = session.scalars(
+            select(ExecutionPlan)
+            .where(ExecutionPlan.external_plan_id == "shared-plan")
+            .order_by(ExecutionPlan.mode.asc())
+        ).all()
+        assert [plan.mode for plan in persisted_plans] == ["live", "paper"]
+
+    paper_engine.dispose()
+    live_engine.dispose()
+
+
+def test_execution_plan_reads_are_filtered_to_active_runtime_mode() -> None:
+    app, engine = build_test_app(
+        Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+        )
+    )
+
+    with app.state.db_session_factory() as session:
+        paper_plan = ExecutionPlan(
+            external_plan_id="paper-plan",
+            source="kai-trading-core",
+            mode="paper",
+            status="accepted",
+        )
+        paper_plan.items.append(
+            ExecutionPlanItem(
+                symbol="005930",
+                side="buy",
+                intent="next_open_buy",
+                status="pending",
+            )
+        )
+        live_plan = ExecutionPlan(
+            external_plan_id="live-plan",
+            source="kai-trading-core",
+            mode="live",
+            status="accepted",
+        )
+        live_plan.items.append(
+            ExecutionPlanItem(
+                symbol="000660",
+                side="sell",
+                intent="target_sell",
+                status="pending",
+            )
+        )
+        session.add_all([paper_plan, live_plan])
+        session.commit()
+
+    client = TestClient(app)
+
+    response = client.get("/execution-plans")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert len(payload) == 1
+    assert payload[0]["plan_id"] == "paper-plan"
+    assert payload[0]["mode"] == "paper"
+    assert payload[0]["item_count"] == 1
+    assert payload[0]["items"][0]["symbol"] == "005930"
+
+    engine.dispose()
+
+
+def test_order_execution_and_position_read_endpoints_return_persisted_state() -> None:
+    app, engine = build_test_app()
+
+    with app.state.db_session_factory() as session:
+        plan = ExecutionPlan(
+            external_plan_id="plan-with-broker-state",
+            source="kai-trading-core",
+            mode="mock",
+            status="accepted",
+        )
+        item = ExecutionPlanItem(
+            symbol="005930",
+            side="buy",
+            intent="next_open_buy",
+            status="pending",
+        )
+        plan.items.append(item)
+        session.add(plan)
+        session.flush()
+
+        order = BrokerOrder(
+            execution_plan_item_id=item.id,
+            idempotency_key="broker-order-1",
+            broker_order_id="kis-100",
+            symbol="005930",
+            side="buy",
+            status="open",
+            quantity=10,
+            limit_price=Decimal("71000.0000"),
+            submitted_at=datetime(2026, 4, 29, 9, 1, tzinfo=UTC),
+            last_broker_sync_at=datetime(2026, 4, 29, 9, 2, tzinfo=UTC),
+            raw_broker_payload={"result": "accepted"},
+        )
+        session.add(order)
+        session.flush()
+
+        session.add(
+            ExecutionFill(
+                broker_order_pk=order.id,
+                broker_fill_id="fill-1",
+                symbol="005930",
+                side="buy",
+                quantity=10,
+                price=Decimal("70950.5000"),
+                filled_at=datetime(2026, 4, 29, 9, 3, tzinfo=UTC),
+                payload={"fill": "full"},
+            )
+        )
+        session.add(
+            ExecutionPosition(
+                symbol="005930",
+                quantity=10,
+                average_price=Decimal("70950.5000"),
+                updated_from="reconciliation",
+                last_reconciled_at=datetime(2026, 4, 29, 9, 4, tzinfo=UTC),
+                raw_payload={"source": "broker"},
+            )
+        )
+        session.commit()
+
+    client = TestClient(app)
+
+    orders_response = client.get("/orders")
+    executions_response = client.get("/executions")
+    positions_response = client.get("/positions")
+
+    assert orders_response.status_code == 200
+    assert executions_response.status_code == 200
+    assert positions_response.status_code == 200
+
+    orders_payload = orders_response.json()
+    executions_payload = executions_response.json()
+    positions_payload = positions_response.json()
+
+    assert len(orders_payload) == 1
+    assert orders_payload[0]["broker_order_id"] == "kis-100"
+    assert orders_payload[0]["status"] == "open"
+    assert orders_payload[0]["limit_price"] == "71000.0000"
+
+    assert len(executions_payload) == 1
+    assert executions_payload[0]["broker_fill_id"] == "fill-1"
+    assert executions_payload[0]["price"] == "70950.5000"
+
+    assert len(positions_payload) == 1
+    assert positions_payload[0]["symbol"] == "005930"
+    assert positions_payload[0]["average_price"] == "70950.5000"
+
+    engine.dispose()
