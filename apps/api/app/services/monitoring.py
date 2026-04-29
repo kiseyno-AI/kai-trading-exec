@@ -53,9 +53,9 @@ def materialize_monitoring_plan_items(plan: ExecutionPlan) -> None:
         if item.intent not in MONITORED_INTENTS:
             continue
         if _monitoring_item_is_configured(item):
-            item.status = f"{item.intent}_monitoring"
+            item.status = _monitoring_status(item.intent)
             continue
-        item.status = f"{item.intent}_pending_configuration"
+        item.status = _pending_configuration_status(item.intent)
 
 
 def evaluate_monitoring(
@@ -68,7 +68,7 @@ def evaluate_monitoring(
 ) -> EvaluateMonitoringResult:
     triggered_at = _normalize_utc(now or command.observed_at or datetime.now(UTC))
     prices = {price.symbol: price for price in command.prices}
-    positions = _load_positions_by_symbol(db)
+    remaining_quantities_by_symbol = _load_remaining_quantities_by_symbol(db)
     items = _load_monitored_items(settings=settings, db=db)
     results: list[dict[str, object]] = []
     triggered_item_count = 0
@@ -83,7 +83,7 @@ def evaluate_monitoring(
         if price is None:
             continue
         if not _monitoring_item_is_configured(item):
-            item.status = f"{item.intent}_pending_configuration"
+            item.status = _pending_configuration_status(item.intent)
             results.append(
                 {
                     "execution_plan_item_id": item.id,
@@ -99,7 +99,7 @@ def evaluate_monitoring(
 
         if not _is_triggered(item=item, observed_price=price.price):
             if item.status in BLOCKED_MONITORING_STATUSES:
-                item.status = f"{item.intent}_monitoring"
+                item.status = _monitoring_status(item.intent)
             results.append(
                 {
                     "execution_plan_item_id": item.id,
@@ -114,8 +114,10 @@ def evaluate_monitoring(
             continue
 
         triggered_item_count += 1
-        position = positions.get(item.symbol)
-        quantity = _resolve_sell_quantity(item=item, position=position)
+        quantity = _resolve_sell_quantity(
+            item=item,
+            remaining_quantity=remaining_quantities_by_symbol.get(item.symbol),
+        )
         if quantity is None:
             results.append(
                 {
@@ -157,6 +159,11 @@ def evaluate_monitoring(
             "observed_price": _serialize_decimal(price.price),
         }
         if placement.status_code == 201:
+            _reserve_remaining_quantity(
+                remaining_quantities_by_symbol=remaining_quantities_by_symbol,
+                symbol=item.symbol,
+                quantity=quantity,
+            )
             submitted_order_count += 1
             item_result["outcome"] = "submitted"
             item_result["order"] = placement.payload.get("order")
@@ -174,6 +181,13 @@ def evaluate_monitoring(
             continue
 
         if placement.payload.get("duplicate") is True:
+            duplicate_quantity = _serialized_order_quantity(placement.payload.get("order"))
+            if duplicate_quantity is not None:
+                _reserve_remaining_quantity(
+                    remaining_quantities_by_symbol=remaining_quantities_by_symbol,
+                    symbol=item.symbol,
+                    quantity=duplicate_quantity,
+                )
             item_result["outcome"] = "duplicate"
             item_result["order"] = placement.payload.get("order")
             item_result["message"] = placement.payload.get("message")
@@ -227,11 +241,15 @@ def _load_monitored_items(
     ).all()
 
 
-def _load_positions_by_symbol(db: Session) -> dict[str, ExecutionPosition]:
+def _load_remaining_quantities_by_symbol(db: Session) -> dict[str, int]:
     positions = db.scalars(
         select(ExecutionPosition).order_by(ExecutionPosition.symbol.asc())
     ).all()
-    return {position.symbol: position for position in positions}
+    return {
+        position.symbol: position.quantity
+        for position in positions
+        if position.quantity > 0
+    }
 
 
 def _monitoring_item_is_configured(item: ExecutionPlanItem) -> bool:
@@ -273,9 +291,9 @@ def _is_triggered(
 def _resolve_sell_quantity(
     *,
     item: ExecutionPlanItem,
-    position: ExecutionPosition | None,
+    remaining_quantity: int | None,
 ) -> int | None:
-    if position is None or position.quantity <= 0:
+    if remaining_quantity is None or remaining_quantity <= 0:
         return None
     quantity_policy = item.quantity_policy
     if not isinstance(quantity_policy, dict):
@@ -284,24 +302,54 @@ def _resolve_sell_quantity(
     kind = quantity_policy.get("kind")
     if kind == "shares":
         quantity = _parse_positive_int(quantity_policy.get("quantity"))
-        if quantity is None or quantity > position.quantity:
+        if quantity is None or quantity > remaining_quantity:
             return None
         return quantity
     if kind == "percent":
         fraction = _parse_fraction(quantity_policy.get("fraction"))
         if fraction is None:
             return None
-        raw_quantity = (Decimal(position.quantity) * fraction).quantize(
+        raw_quantity = (Decimal(remaining_quantity) * fraction).quantize(
             Decimal("1"),
             rounding=ROUND_DOWN,
         )
         quantity = int(raw_quantity)
         if quantity <= 0:
             quantity = 1
-        if quantity > position.quantity:
-            quantity = position.quantity
+        if quantity > remaining_quantity:
+            quantity = remaining_quantity
         return quantity
     return None
+
+
+def _monitoring_status(intent: str) -> str:
+    return f"{intent}_monitoring"
+
+
+def _pending_configuration_status(intent: str) -> str:
+    return f"{intent}_pending_config"
+
+
+def _reserve_remaining_quantity(
+    *,
+    remaining_quantities_by_symbol: dict[str, int],
+    symbol: str,
+    quantity: int,
+) -> None:
+    remaining_quantity = remaining_quantities_by_symbol.get(symbol)
+    if remaining_quantity is None or remaining_quantity <= 0 or quantity <= 0:
+        return
+    updated_quantity = remaining_quantity - quantity
+    if updated_quantity > 0:
+        remaining_quantities_by_symbol[symbol] = updated_quantity
+        return
+    remaining_quantities_by_symbol.pop(symbol, None)
+
+
+def _serialized_order_quantity(order_payload: object) -> int | None:
+    if not isinstance(order_payload, dict):
+        return None
+    return _parse_positive_int(order_payload.get("quantity"))
 
 
 def _parse_positive_int(value: object) -> int | None:

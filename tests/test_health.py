@@ -650,6 +650,73 @@ def test_execution_plan_intake_schedules_next_open_buy_jobs() -> None:
     engine.dispose()
 
 
+def test_monitoring_items_use_short_pending_config_status_and_stay_evaluable() -> None:
+    app, engine = build_test_app(
+        Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+        )
+    )
+    client = TestClient(app)
+
+    response = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-target-sell-missing-config",
+            "source": "kai-trading-core",
+            "items": [
+                {
+                    "symbol": "000660",
+                    "side": "sell",
+                    "intent": "target_sell",
+                    "quantity_policy": {"kind": "percent", "fraction": 0.5},
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 201
+    plan_item_id = response.json()["persisted_execution_item_ids"][0]
+
+    plans_response = client.get("/execution-plans")
+    assert plans_response.status_code == 200
+    item = plans_response.json()[0]["items"][0]
+    assert item["execution_plan_item_id"] == plan_item_id
+    assert item["status"] == "target_sell_pending_config"
+    assert len(item["status"]) <= 32
+
+    evaluation = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "invalid config should not fail persistence",
+            "prices": [
+                {
+                    "symbol": "000660",
+                    "price": "125100.00",
+                }
+            ],
+        },
+    )
+
+    assert evaluation.status_code == 200
+    payload = evaluation.json()
+    assert payload["evaluated_item_count"] == 1
+    assert payload["triggered_item_count"] == 0
+    assert payload["submitted_order_count"] == 0
+    assert payload["items"][0]["execution_plan_item_id"] == plan_item_id
+    assert payload["items"][0]["outcome"] == "invalid_configuration"
+
+    with app.state.db_session_factory() as session:
+        plan_item = session.get(ExecutionPlanItem, plan_item_id)
+        assert plan_item is not None
+        assert plan_item.status == "target_sell_pending_config"
+        assert len(plan_item.status) <= 32
+
+    engine.dispose()
+
+
 def test_duplicate_execution_plan_is_rejected() -> None:
     app, engine = build_test_app()
     client = TestClient(app)
