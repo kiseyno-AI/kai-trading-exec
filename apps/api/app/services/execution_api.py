@@ -54,6 +54,9 @@ def create_execution_plan(
             for item in command.items
         ],
     )
+    from app.services.execution_jobs import materialize_execution_jobs
+
+    materialize_execution_jobs(plan)
     db.add(plan)
 
     try:

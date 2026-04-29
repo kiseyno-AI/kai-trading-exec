@@ -1,4 +1,4 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 from fastapi.testclient import TestClient
@@ -33,6 +33,7 @@ from app.models.runtime import (
     BrokerOrderEvent,
     BrokerSession,
     BrokerSessionEvent,
+    ExecutionJob,
     ExecutionPlanItem,
 )
 
@@ -611,6 +612,291 @@ def test_place_order_endpoint_persists_normalized_order_and_events() -> None:
             "submit_requested",
             "submit_acknowledged",
         ]
+
+        plan_item = session.get(ExecutionPlanItem, plan_item_id)
+        assert plan_item is not None
+        assert plan_item.status == "broker_order_submitted"
+
+    engine.dispose()
+
+
+def test_dispatch_due_next_open_buy_job_places_broker_order() -> None:
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(),
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+        ),
+        broker_adapter=broker_adapter,
+    )
+    client = TestClient(app)
+
+    resume = client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "console", "reason": "enable automation"},
+    )
+    assert resume.status_code == 200
+
+    plan_response = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-next-open-dispatch-1",
+            "source": "kai-trading-core",
+            "market_date": "2024-01-03",
+            "items": [
+                {
+                    "symbol": "005930",
+                    "side": "buy",
+                    "intent": "next_open_buy",
+                    "quantity_policy": {"kind": "shares", "quantity": 5},
+                    "limit_price": "71000.00",
+                    "time_in_force": "day",
+                }
+            ],
+        },
+    )
+    assert plan_response.status_code == 201
+    plan_item_id = plan_response.json()["persisted_execution_item_ids"][0]
+
+    dispatch_response = client.post("/execution-jobs/dispatch")
+
+    assert dispatch_response.status_code == 200
+    dispatch_payload = dispatch_response.json()
+    assert dispatch_payload["blocked"] is False
+    assert dispatch_payload["due_job_count"] == 1
+    assert dispatch_payload["completed_job_count"] == 1
+    assert dispatch_payload["retrying_job_count"] == 0
+    assert dispatch_payload["failed_job_count"] == 0
+    assert len(dispatch_payload["jobs"]) == 1
+    assert dispatch_payload["jobs"][0]["execution_plan_item_id"] == plan_item_id
+    assert dispatch_payload["jobs"][0]["status"] == "completed"
+
+    assert broker_adapter.authenticate_calls == 1
+    assert len(broker_adapter.order_calls) == 1
+    assert broker_adapter.order_calls[0].execution_plan_item_id == plan_item_id
+    assert broker_adapter.order_calls[0].quantity == 5
+    assert broker_adapter.order_calls[0].order_type == "limit"
+    assert broker_adapter.order_calls[0].time_in_force == "day"
+
+    with app.state.db_session_factory() as session:
+        job = session.scalar(select(ExecutionJob).where(ExecutionJob.job_type == "next_open_buy"))
+        assert job is not None
+        assert job.status == "completed"
+        assert job.attempts == 1
+
+        order = session.scalar(
+            select(BrokerOrder).where(BrokerOrder.execution_plan_item_id == plan_item_id)
+        )
+        assert order is not None
+        assert order.status == "submitted"
+        assert order.idempotency_key == f"execution-job:{job.id}"
+
+        plan_item = session.get(ExecutionPlanItem, plan_item_id)
+        assert plan_item is not None
+        assert plan_item.status == "broker_order_submitted"
+
+    engine.dispose()
+
+
+def test_dispatch_due_next_open_buy_job_keeps_retrying_duplicate_retryable_order() -> None:
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_error=BrokerAdapterError(
+            "rate limited by broker",
+            status_code=503,
+            classification=BrokerErrorClassification.RATE_LIMIT,
+            retryable=True,
+            code="RATE_LIMIT",
+            normalized_status=NormalizedBrokerOrderStatus.RETRY_PENDING,
+            response_payload={"msg_cd": "RATE_LIMIT", "msg1": "rate limited by broker"},
+            observed_at=datetime(2026, 4, 30, 9, 5, tzinfo=UTC),
+        ),
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+        ),
+        broker_adapter=broker_adapter,
+    )
+    client = TestClient(app)
+
+    client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "console", "reason": "enable automation"},
+    )
+
+    plan_response = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-next-open-dispatch-duplicate-retry",
+            "source": "kai-trading-core",
+            "market_date": "2024-01-03",
+            "items": [
+                {
+                    "symbol": "005930",
+                    "side": "buy",
+                    "intent": "next_open_buy",
+                    "quantity_policy": {"kind": "shares", "quantity": 5},
+                    "limit_price": "71000.00",
+                    "time_in_force": "day",
+                }
+            ],
+        },
+    )
+    assert plan_response.status_code == 201
+    plan_item_id = plan_response.json()["persisted_execution_item_ids"][0]
+
+    first_dispatch = client.post("/execution-jobs/dispatch")
+    assert first_dispatch.status_code == 200
+    first_payload = first_dispatch.json()
+    assert first_payload["due_job_count"] == 1
+    assert first_payload["completed_job_count"] == 0
+    assert first_payload["retrying_job_count"] == 1
+    assert first_payload["failed_job_count"] == 0
+    assert first_payload["jobs"][0]["status"] == "retrying"
+
+    second_dispatch = client.post("/execution-jobs/dispatch")
+    assert second_dispatch.status_code == 200
+    second_payload = second_dispatch.json()
+    assert second_payload["due_job_count"] == 1
+    assert second_payload["completed_job_count"] == 0
+    assert second_payload["retrying_job_count"] == 1
+    assert second_payload["failed_job_count"] == 0
+    assert second_payload["jobs"][0]["status"] == "retrying"
+
+    assert broker_adapter.authenticate_calls == 1
+    assert len(broker_adapter.order_calls) == 1
+
+    with app.state.db_session_factory() as session:
+        job = session.scalar(select(ExecutionJob).where(ExecutionJob.job_type == "next_open_buy"))
+        assert job is not None
+        assert job.status == "retrying"
+        assert job.attempts == 2
+        assert job.last_error == "existing broker order is retry_pending"
+
+        order = session.scalar(
+            select(BrokerOrder).where(BrokerOrder.execution_plan_item_id == plan_item_id)
+        )
+        assert order is not None
+        assert order.status == "retry_pending"
+
+        plan_item = session.get(ExecutionPlanItem, plan_item_id)
+        assert plan_item is not None
+        assert plan_item.status == "next_open_buy_retry_pending"
+
+    engine.dispose()
+
+
+def test_dispatch_due_next_open_buy_job_recovers_stale_running_job() -> None:
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(),
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+        ),
+        broker_adapter=broker_adapter,
+    )
+    client = TestClient(app)
+
+    client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "console", "reason": "enable automation"},
+    )
+
+    plan_response = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-next-open-dispatch-recover-running",
+            "source": "kai-trading-core",
+            "market_date": "2024-01-03",
+            "items": [
+                {
+                    "symbol": "005930",
+                    "side": "buy",
+                    "intent": "next_open_buy",
+                    "quantity_policy": {"kind": "shares", "quantity": 5},
+                    "limit_price": "71000.00",
+                    "time_in_force": "day",
+                }
+            ],
+        },
+    )
+    assert plan_response.status_code == 201
+    plan_item_id = plan_response.json()["persisted_execution_item_ids"][0]
+
+    with app.state.db_session_factory() as session:
+        job = session.scalar(select(ExecutionJob).where(ExecutionJob.job_type == "next_open_buy"))
+        assert job is not None
+        job.status = "running"
+        job.locked_at = datetime.now(UTC) - timedelta(minutes=10)
+        job.attempts = 1
+        job.last_error = None
+
+        plan_item = session.get(ExecutionPlanItem, plan_item_id)
+        assert plan_item is not None
+        plan_item.status = "next_open_buy_dispatching"
+        session.commit()
+
+    dispatch_response = client.post("/execution-jobs/dispatch")
+
+    assert dispatch_response.status_code == 200
+    dispatch_payload = dispatch_response.json()
+    assert dispatch_payload["due_job_count"] == 1
+    assert dispatch_payload["completed_job_count"] == 1
+    assert dispatch_payload["retrying_job_count"] == 0
+    assert dispatch_payload["failed_job_count"] == 0
+    assert dispatch_payload["jobs"][0]["status"] == "completed"
+
+    assert broker_adapter.authenticate_calls == 1
+    assert len(broker_adapter.order_calls) == 1
+
+    with app.state.db_session_factory() as session:
+        job = session.scalar(select(ExecutionJob).where(ExecutionJob.job_type == "next_open_buy"))
+        assert job is not None
+        assert job.status == "completed"
+        assert job.attempts == 2
+        assert job.locked_at is None
+        assert job.last_error is None
+
+        order = session.scalar(
+            select(BrokerOrder).where(BrokerOrder.execution_plan_item_id == plan_item_id)
+        )
+        assert order is not None
+        assert order.status == "submitted"
 
         plan_item = session.get(ExecutionPlanItem, plan_item_id)
         assert plan_item is not None

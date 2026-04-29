@@ -12,6 +12,7 @@ from app.main import create_app
 from app.models import EXEC_OWNED_TABLES
 from app.models.runtime import (
     BrokerOrder,
+    ExecutionJob,
     ExecutionFill,
     ExecutionPlan,
     ExecutionPlanItem,
@@ -572,6 +573,78 @@ def test_execution_plan_intake_and_read_endpoints() -> None:
         assert persisted_items[0].limit_price == Decimal("71000.0000")
         assert persisted_items[0].time_in_force == "day"
         assert persisted_items[1].trigger_price == Decimal("125000.0000")
+
+    engine.dispose()
+
+
+def test_execution_plan_intake_schedules_next_open_buy_jobs() -> None:
+    app, engine = build_test_app(
+        Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+        )
+    )
+    client = TestClient(app)
+
+    response = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-20260430-open",
+            "source": "kai-trading-core",
+            "market_date": "2026-04-30",
+            "items": [
+                {
+                    "symbol": "005930",
+                    "side": "buy",
+                    "intent": "next_open_buy",
+                    "quantity_policy": {"kind": "shares", "quantity": 10},
+                    "limit_price": "71000.00",
+                    "time_in_force": "day",
+                },
+                {
+                    "symbol": "000660",
+                    "side": "sell",
+                    "intent": "target_sell",
+                    "quantity_policy": {"kind": "percent", "fraction": 0.5},
+                    "trigger_price": "125000.00",
+                },
+            ],
+        },
+    )
+
+    assert response.status_code == 201
+
+    runtime_status = client.get("/runtime/status")
+    assert runtime_status.status_code == 200
+    assert runtime_status.json()["counts"]["active_execution_jobs"] == 1
+
+    with app.state.db_session_factory() as session:
+        plan = session.scalar(
+            select(ExecutionPlan).where(
+                ExecutionPlan.external_plan_id == "plan-20260430-open"
+            )
+        )
+        assert plan is not None
+
+        items = session.scalars(
+            select(ExecutionPlanItem)
+            .where(ExecutionPlanItem.execution_plan_id == plan.id)
+            .order_by(ExecutionPlanItem.symbol.asc())
+        ).all()
+        assert [item.symbol for item in items] == ["000660", "005930"]
+        items_by_symbol = {item.symbol: item for item in items}
+        assert items_by_symbol["005930"].status == "next_open_buy_scheduled"
+        assert items_by_symbol["000660"].status == "pending"
+
+        jobs = session.scalars(
+            select(ExecutionJob)
+            .where(ExecutionJob.execution_plan_item_id == items_by_symbol["005930"].id)
+        ).all()
+        assert len(jobs) == 1
+        assert jobs[0].job_type == "next_open_buy"
+        assert jobs[0].status == "scheduled"
+        assert jobs[0].scheduled_for is not None
+        assert jobs[0].attempts == 0
 
     engine.dispose()
 
