@@ -70,6 +70,8 @@ Useful checks:
 ```bash
 curl http://127.0.0.1:8010/health
 curl http://127.0.0.1:8010/runtime/status
+curl http://127.0.0.1:8010/broker/session
+curl http://127.0.0.1:8010/orders
 ```
 
 The default database is `sqlite:///./var/kai_trading_exec.db`. Override settings
@@ -78,8 +80,31 @@ with `KAI_EXEC_` environment variables, for example:
 ```bash
 KAI_EXEC_RUNTIME_MODE=paper \
 KAI_EXEC_DATABASE_URL=postgresql+psycopg://user:pass@localhost/kai_exec \
+KAI_EXEC_KIS_APP_KEY=paper-app-key \
+KAI_EXEC_KIS_APP_SECRET=paper-app-secret \
+KAI_EXEC_KIS_ACCOUNT_NUMBER=12345678 \
 PYTHONPATH=apps/api uvicorn app.main:app --host 127.0.0.1 --port 8010
 ```
+
+KIS auth/session settings currently supported:
+- `KAI_EXEC_KIS_APP_KEY`
+- `KAI_EXEC_KIS_APP_SECRET`
+- `KAI_EXEC_KIS_ACCOUNT_NUMBER`
+- `KAI_EXEC_KIS_ACCOUNT_PRODUCT_CODE`
+- `KAI_EXEC_KIS_HTS_ID`
+- `KAI_EXEC_KIS_BASE_URL`
+- `KAI_EXEC_KIS_MOCK_BASE_URL`
+- `KAI_EXEC_KIS_CUSTOMER_TYPE`
+- `KAI_EXEC_KIS_USE_HASHKEY`
+- `KAI_EXEC_KIS_REQUEST_TIMEOUT_SECONDS`
+
+Operator broker-session endpoints:
+- `GET /broker/session`
+- `POST /broker/session/authenticate`
+- `POST /broker/session/revoke`
+
+Initial broker-order submission endpoint:
+- `POST /orders`
 
 ## Boot target
 

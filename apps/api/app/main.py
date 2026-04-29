@@ -1,15 +1,19 @@
 import logging
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
+from typing import Callable
 
 from fastapi import FastAPI
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
+from app.api.routes.broker import router as broker_router
 from app.api.routes.controls import router as controls_router
 from app.api.routes.execution import router as execution_router
 from app.api.routes.health import router as health_router
 from app.api.routes.runtime import router as runtime_router
+from app.broker.base import BrokerAdapter
+from app.broker.kis import KisBrokerAdapter
 from app.core.config import Settings, get_settings
 from app.core.logging import configure_logging
 from app.db.session import create_db_engine, create_session_factory
@@ -23,6 +27,7 @@ def create_app(
     *,
     engine: Engine | None = None,
     session_factory: sessionmaker[Session] | None = None,
+    broker_adapter_factory: Callable[[Settings], BrokerAdapter] | None = None,
 ) -> FastAPI:
     app_settings = settings or get_settings()
     configure_logging(app_settings)
@@ -55,9 +60,13 @@ def create_app(
     app.state.db_engine = db_engine
     app.state.db_session_factory = db_session_factory
     app.state.runtime_metadata = runtime_metadata
+    app.state.broker_adapter_factory = broker_adapter_factory or (
+        lambda current_settings: KisBrokerAdapter(settings=current_settings)
+    )
 
     app.include_router(health_router)
     app.include_router(runtime_router)
+    app.include_router(broker_router)
     app.include_router(controls_router)
     app.include_router(execution_router)
     return app

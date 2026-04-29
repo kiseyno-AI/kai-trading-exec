@@ -24,6 +24,15 @@ Current foundation response includes:
 - `mode`
 - `ready`
 - `readiness.reasons[]`
+- `broker.provider`
+- `broker.status`
+- `broker.configured`
+- `broker.access_token_present`
+- `broker.access_token_expires_at`
+- `broker.approval_key_present`
+- `broker.shared_realtime_subscriptions_supported`
+- `broker.reconnect_supported`
+- `broker.bounded_rest_reconciliation_supported`
 - `safety.paused`
 - `safety.kill_switch_enabled`
 - `safety.automation_enabled`
@@ -51,6 +60,9 @@ Current response includes:
 
 The initial migration creates the exec-owned runtime tables only:
 - `runtime_control_state`
+- `runtime_control_events`
+- `broker_sessions`
+- `broker_session_events`
 - `execution_plans`
 - `execution_plan_items`
 - `execution_jobs`
@@ -63,8 +75,9 @@ The initial migration creates the exec-owned runtime tables only:
 These tables are owned by `kai-trading-exec`; strategy generation and dashboard
 read models remain outside this repository boundary.
 
-Safety control actions are additionally audited in:
+Safety control and broker auth actions are additionally audited in:
 - `runtime_control_events`
+- `broker_session_events`
 
 ## Execution plan intake
 
@@ -102,6 +115,50 @@ List accepted plans and lifecycle state.
 ### `GET /orders`
 List broker orders with internal normalized statuses.
 
+### `POST /orders`
+Submit an initial broker order through the KIS adapter boundary.
+
+Suggested body shape:
+- `idempotency_key`
+- `execution_plan_item_id` (optional but recommended when tied to an accepted plan item)
+- `symbol`
+- `side` (`buy`, `sell`)
+- `quantity`
+- `order_type` (`limit`, `market`)
+- `limit_price` (required for `limit`, omitted for `market`)
+- `time_in_force` (`day`)
+- `exchange` (`KRX`, `SOR`)
+
+Current response includes:
+- `duplicate`
+- `message`
+- `order`
+  - `broker_order_pk`
+  - `broker_name`
+  - `idempotency_key`
+  - `broker_order_id`
+  - `status`
+  - `request_metadata`
+  - `response_metadata`
+  - `last_error_classification`
+  - `last_error_code`
+  - `last_error_message`
+  - `last_error_retryable`
+  - `events[]`
+
+Current normalized broker-order lifecycle states include:
+- `submission_pending`
+- `submitted`
+- `open`
+- `partially_filled`
+- `filled`
+- `cancel_pending`
+- `canceled`
+- `rejected`
+- `retry_pending`
+- `failed`
+- `expired`
+
 ### `GET /executions`
 List fills / actual execution outcomes.
 
@@ -134,3 +191,47 @@ Current control responses include:
 - `message`
 - `event_id`
 - `safety` (current `GET /runtime/safety` payload)
+
+## Broker session APIs
+
+### `GET /broker/session`
+Returns the current KIS broker-session summary for the active runtime mode.
+
+Current response includes:
+- `provider`
+- `mode`
+- `configured`
+- `status` (`disabled`, `missing_credentials`, `uninitialized`, `active`, `expired`, `revoked`, `error`)
+- `api_base_url`
+- `access_token_present`
+- `access_token_expires_at`
+- `approval_key_present`
+- `approval_key_issued_at`
+- `shared_realtime_subscriptions_supported`
+- `reconnect_supported`
+- `bounded_rest_reconciliation_supported`
+- `websocket_approval_path`
+- `reconnect_strategy`
+- `last_authenticated_at`
+- `last_revoked_at`
+- `last_error`
+
+### `POST /broker/session/authenticate`
+Issue or reuse a KIS access token for the active runtime mode.
+
+Suggested body shape:
+- `actor`
+- `source`
+- `reason`
+- `force`
+
+Current response includes:
+- `action`
+- `outcome` (`applied`, `noop`, `rejected`)
+- `changed`
+- `message`
+- `event_id`
+- `session` (current `GET /broker/session` payload)
+
+### `POST /broker/session/revoke`
+Revoke the currently stored KIS access token and clear the local broker session.

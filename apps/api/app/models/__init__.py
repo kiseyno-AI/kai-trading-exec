@@ -1,6 +1,8 @@
 from app.models.runtime import (
     BrokerOrder,
     BrokerOrderEvent,
+    BrokerSession,
+    BrokerSessionEvent,
     ExecutionFill,
     ExecutionJob,
     ExecutionPlan,
@@ -14,6 +16,8 @@ from app.models.runtime import (
 EXEC_OWNED_TABLES = (
     RuntimeControlState.__tablename__,
     RuntimeControlEvent.__tablename__,
+    BrokerSession.__tablename__,
+    BrokerSessionEvent.__tablename__,
     ExecutionPlan.__tablename__,
     ExecutionPlanItem.__tablename__,
     ExecutionJob.__tablename__,
@@ -27,6 +31,8 @@ EXEC_OWNED_TABLES = (
 __all__ = [
     "BrokerOrder",
     "BrokerOrderEvent",
+    "BrokerSession",
+    "BrokerSessionEvent",
     "EXEC_OWNED_TABLES",
     "ExecutionFill",
     "ExecutionJob",
