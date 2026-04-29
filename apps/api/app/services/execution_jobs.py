@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, date, datetime, time
+from datetime import UTC, date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
@@ -13,7 +13,7 @@ from app.broker.base import (
     NormalizedBrokerOrderStatus,
 )
 from app.core.config import Settings
-from app.models.runtime import ExecutionJob, ExecutionPlan, ExecutionPlanItem
+from app.models.runtime import BrokerOrder, ExecutionJob, ExecutionPlan, ExecutionPlanItem
 from app.services.broker_orders import place_broker_order
 from app.services.runtime_controls import (
     automated_order_submission_allowed,
@@ -25,6 +25,31 @@ from app.services.runtime_controls import (
 KRX_TIMEZONE = ZoneInfo("Asia/Seoul")
 NEXT_OPEN_BUY_JOB_TYPE = "next_open_buy"
 DISPATCHABLE_JOB_STATUSES = ("queued", "scheduled", "retrying")
+MIN_STALE_RUNNING_JOB_SECONDS = 30
+STALE_RUNNING_JOB_TIMEOUT_MULTIPLIER = 3
+COMPLETED_JOB_ORDER_STATUSES = frozenset(
+    {
+        NormalizedBrokerOrderStatus.SUBMITTED.value,
+        NormalizedBrokerOrderStatus.OPEN.value,
+        NormalizedBrokerOrderStatus.PARTIALLY_FILLED.value,
+        NormalizedBrokerOrderStatus.FILLED.value,
+        NormalizedBrokerOrderStatus.CANCEL_PENDING.value,
+        NormalizedBrokerOrderStatus.CANCELED.value,
+        NormalizedBrokerOrderStatus.EXPIRED.value,
+    }
+)
+RETRYING_JOB_ORDER_STATUSES = frozenset(
+    {
+        NormalizedBrokerOrderStatus.SUBMISSION_PENDING.value,
+        NormalizedBrokerOrderStatus.RETRY_PENDING.value,
+    }
+)
+FAILED_JOB_ORDER_STATUSES = frozenset(
+    {
+        NormalizedBrokerOrderStatus.REJECTED.value,
+        NormalizedBrokerOrderStatus.FAILED.value,
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -92,6 +117,11 @@ def dispatch_due_execution_jobs(
             },
         )
 
+    _recover_stale_running_jobs(
+        settings=settings,
+        db=db,
+        triggered_at=triggered_at,
+    )
     jobs = db.scalars(
         select(ExecutionJob)
         .join(ExecutionJob.plan_item)
@@ -179,6 +209,42 @@ def _claim_job(
     db.commit()
 
 
+def _recover_stale_running_jobs(
+    *,
+    settings: Settings,
+    db: Session,
+    triggered_at: datetime,
+) -> None:
+    running_jobs = db.scalars(
+        select(ExecutionJob)
+        .join(ExecutionJob.plan_item)
+        .join(ExecutionPlanItem.plan)
+        .where(
+            ExecutionPlan.mode == settings.runtime_mode,
+            ExecutionJob.status == "running",
+        )
+        .options(selectinload(ExecutionJob.plan_item))
+        .order_by(ExecutionJob.locked_at.asc(), ExecutionJob.created_at.asc())
+    ).all()
+
+    recovered_any = False
+    for job in running_jobs:
+        if not _is_stale_running_job(
+            settings=settings,
+            job=job,
+            triggered_at=triggered_at,
+        ):
+            continue
+        job.status = "retrying"
+        job.locked_at = None
+        job.last_error = "recovered stale running job after interrupted dispatch"
+        job.plan_item.status = "next_open_buy_retry_pending"
+        recovered_any = True
+
+    if recovered_any:
+        db.commit()
+
+
 def _dispatch_job(
     *,
     settings: Settings,
@@ -236,26 +302,26 @@ def _dispatch_job(
             last_error=str(result.payload.get("message") or "dispatch blocked by safety controls"),
             plan_item_status=None,
         )
-    if result.payload.get("duplicate") is True or order_status in {
-        NormalizedBrokerOrderStatus.SUBMITTED.value,
-        NormalizedBrokerOrderStatus.OPEN.value,
-        NormalizedBrokerOrderStatus.PARTIALLY_FILLED.value,
-        NormalizedBrokerOrderStatus.FILLED.value,
-    }:
-        return _finish_job(
+    if order_status is None:
+        order_status = _load_order_status(
             db=db,
-            job_id=job_id,
-            status="completed",
-            last_error=None,
-            plan_item_status=None,
+            idempotency_key=command.idempotency_key,
         )
-    if order_status == NormalizedBrokerOrderStatus.RETRY_PENDING.value:
+    finished_from_order_status = _finish_job_from_order_status(
+        db=db,
+        job_id=job_id,
+        payload=result.payload,
+        order_status=order_status,
+    )
+    if finished_from_order_status is not None:
+        return finished_from_order_status
+    if result.payload.get("duplicate") is True:
         return _finish_job(
             db=db,
             job_id=job_id,
-            status="retrying",
-            last_error=str(result.payload.get("message") or "broker retry requested"),
-            plan_item_status="next_open_buy_retry_pending",
+            status="failed",
+            last_error="duplicate broker order exists with an unrecognized status",
+            plan_item_status="next_open_buy_failed",
         )
     return _finish_job(
         db=db,
@@ -287,6 +353,82 @@ def _finish_job(
         job.plan_item.status = plan_item_status
     db.commit()
     return status
+
+
+def _load_order_status(
+    *,
+    db: Session,
+    idempotency_key: str,
+) -> str | None:
+    return db.scalar(
+        select(BrokerOrder.status).where(BrokerOrder.idempotency_key == idempotency_key)
+    )
+
+
+def _finish_job_from_order_status(
+    *,
+    db: Session,
+    job_id: str,
+    payload: dict[str, object],
+    order_status: str | None,
+) -> str | None:
+    if order_status in COMPLETED_JOB_ORDER_STATUSES:
+        return _finish_job(
+            db=db,
+            job_id=job_id,
+            status="completed",
+            last_error=None,
+            plan_item_status=None,
+        )
+    if order_status in RETRYING_JOB_ORDER_STATUSES:
+        return _finish_job(
+            db=db,
+            job_id=job_id,
+            status="retrying",
+            last_error=_retrying_job_message(payload=payload, order_status=order_status),
+            plan_item_status="next_open_buy_retry_pending",
+        )
+    if order_status in FAILED_JOB_ORDER_STATUSES:
+        return _finish_job(
+            db=db,
+            job_id=job_id,
+            status="failed",
+            last_error=_failed_job_message(payload=payload, order_status=order_status),
+            plan_item_status="next_open_buy_failed",
+        )
+    return None
+
+
+def _retrying_job_message(
+    *,
+    payload: dict[str, object],
+    order_status: str,
+) -> str:
+    duplicate = payload.get("duplicate") is True
+    if duplicate:
+        if order_status == NormalizedBrokerOrderStatus.SUBMISSION_PENDING.value:
+            return "existing broker order submission is still pending"
+        return f"existing broker order is {order_status}"
+    message = payload.get("message")
+    if isinstance(message, str) and message:
+        return message
+    if order_status == NormalizedBrokerOrderStatus.SUBMISSION_PENDING.value:
+        return "broker order submission is still pending"
+    return "broker retry requested"
+
+
+def _failed_job_message(
+    *,
+    payload: dict[str, object],
+    order_status: str,
+) -> str:
+    duplicate = payload.get("duplicate") is True
+    message = payload.get("message")
+    if not duplicate and isinstance(message, str) and message:
+        return message
+    if duplicate:
+        return f"existing broker order is {order_status}"
+    return f"broker order submission ended in {order_status}"
 
 
 def _build_place_order_request(job: ExecutionJob) -> PlaceOrderRequest:
@@ -349,6 +491,22 @@ def _is_due(job: ExecutionJob, triggered_at: datetime) -> bool:
     if scheduled_for is None:
         return True
     return _normalize_utc(scheduled_for) <= triggered_at
+
+
+def _is_stale_running_job(
+    *,
+    settings: Settings,
+    job: ExecutionJob,
+    triggered_at: datetime,
+) -> bool:
+    if job.locked_at is None:
+        return True
+    stale_after_seconds = max(
+        settings.kis_request_timeout_seconds * STALE_RUNNING_JOB_TIMEOUT_MULTIPLIER,
+        MIN_STALE_RUNNING_JOB_SECONDS,
+    )
+    cutoff = triggered_at - timedelta(seconds=stale_after_seconds)
+    return _normalize_utc(job.locked_at) <= cutoff
 
 
 def _normalize_utc(value: datetime) -> datetime:
