@@ -111,9 +111,11 @@ def list_execution_plans(
 
 def list_broker_orders(db: Session) -> list[dict[str, object]]:
     orders = db.scalars(
-        select(BrokerOrder).order_by(BrokerOrder.created_at.desc(), BrokerOrder.id.desc()),
+        select(BrokerOrder)
+        .options(selectinload(BrokerOrder.events))
+        .order_by(BrokerOrder.created_at.desc(), BrokerOrder.id.desc()),
     ).all()
-    return [_serialize_broker_order(order) for order in orders]
+    return [serialize_broker_order(order) for order in orders]
 
 
 def list_execution_fills(db: Session) -> list[dict[str, object]]:
@@ -173,10 +175,15 @@ def _serialize_execution_plan_item(item: ExecutionPlanItem) -> dict[str, object]
     }
 
 
-def _serialize_broker_order(order: BrokerOrder) -> dict[str, object]:
-    return {
+def serialize_broker_order(
+    order: BrokerOrder,
+    *,
+    include_events: bool = False,
+) -> dict[str, object]:
+    payload = {
         "broker_order_pk": order.id,
         "execution_plan_item_id": order.execution_plan_item_id,
+        "broker_name": order.broker_name,
         "idempotency_key": order.idempotency_key,
         "broker_order_id": order.broker_order_id,
         "symbol": order.symbol,
@@ -186,12 +193,45 @@ def _serialize_broker_order(order: BrokerOrder) -> dict[str, object]:
         "limit_price": _serialize_decimal(order.limit_price),
         "submitted_at": _serialize_datetime(order.submitted_at),
         "last_broker_sync_at": _serialize_datetime(order.last_broker_sync_at),
+        "request_metadata": order.request_metadata,
+        "response_metadata": order.response_metadata,
+        "last_error_classification": order.last_error_classification,
+        "last_error_code": order.last_error_code,
+        "last_error_message": order.last_error_message,
+        "last_error_retryable": order.last_error_retryable,
         "raw_broker_payload": order.raw_broker_payload,
         "created_at": _serialize_datetime(order.created_at),
         "updated_at": _serialize_datetime(order.updated_at),
+        "event_count": len(order.events),
     }
+    if include_events:
+        payload["events"] = [
+            serialize_broker_order_event(event)
+            for event in sorted(
+                order.events,
+                key=lambda item: (_serialize_datetime(item.observed_at) or "", item.id),
+            )
+        ]
+    return payload
 
 
+def serialize_broker_order_event(event) -> dict[str, object]:
+    return {
+        "broker_order_event_id": event.id,
+        "event_type": event.event_type,
+        "event_source": event.event_source,
+        "normalized_status": event.normalized_status,
+        "broker_status": event.broker_status,
+        "error_classification": event.error_classification,
+        "retryable": event.retryable,
+        "message": event.message,
+        "request_payload": event.request_payload,
+        "response_payload": event.response_payload,
+        "payload": event.payload,
+        "observed_at": _serialize_datetime(event.observed_at),
+        "created_at": _serialize_datetime(event.created_at),
+        "updated_at": _serialize_datetime(event.updated_at),
+    }
 def _serialize_execution_fill(fill: ExecutionFill) -> dict[str, object]:
     return {
         "execution_fill_id": fill.id,

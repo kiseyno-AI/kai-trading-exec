@@ -96,6 +96,54 @@ class RuntimeControlEvent(TimestampMixin, Base):
     control_state: Mapped[RuntimeControlState] = relationship(back_populates="events")
 
 
+class BrokerSession(TimestampMixin, Base):
+    __tablename__ = "broker_sessions"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    provider: Mapped[str] = mapped_column(String(32), nullable=False)
+    mode: Mapped[str] = mapped_column(String(16), nullable=False)
+    api_base_url: Mapped[str | None] = mapped_column(String(255))
+    token_type: Mapped[str | None] = mapped_column(String(32))
+    access_token: Mapped[str | None] = mapped_column(Text)
+    access_token_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    refresh_token: Mapped[str | None] = mapped_column(Text)
+    refresh_token_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    approval_key: Mapped[str | None] = mapped_column(Text)
+    approval_key_issued_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_authenticated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error: Mapped[str | None] = mapped_column(Text)
+    last_error_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    events: Mapped[list["BrokerSessionEvent"]] = relationship(back_populates="broker_session")
+
+
+class BrokerSessionEvent(TimestampMixin, Base):
+    __tablename__ = "broker_session_events"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    broker_session_id: Mapped[str] = mapped_column(
+        ForeignKey("broker_sessions.id"),
+        nullable=False,
+        index=True,
+    )
+    action: Mapped[str] = mapped_column(String(32), nullable=False)
+    outcome: Mapped[str] = mapped_column(String(16), nullable=False)
+    actor: Mapped[str | None] = mapped_column(String(128))
+    source: Mapped[str] = mapped_column(String(64), nullable=False, default="operator")
+    reason: Mapped[str | None] = mapped_column(Text)
+    message: Mapped[str | None] = mapped_column(Text)
+    previous_state: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    current_state: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    occurred_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+
+    broker_session: Mapped[BrokerSession] = relationship(back_populates="events")
+
+
 class ExecutionPlan(TimestampMixin, Base):
     __tablename__ = "execution_plans"
     __table_args__ = (
@@ -176,6 +224,7 @@ class BrokerOrder(TimestampMixin, Base):
         ForeignKey("execution_plan_items.id"),
         index=True,
     )
+    broker_name: Mapped[str] = mapped_column(String(32), nullable=False, default="kis")
     idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
     broker_order_id: Mapped[str | None] = mapped_column(String(128), index=True)
     symbol: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
@@ -185,6 +234,12 @@ class BrokerOrder(TimestampMixin, Base):
     limit_price: Mapped[Decimal | None] = mapped_column(Numeric(18, 4))
     submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_broker_sync_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    request_metadata: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    response_metadata: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    last_error_classification: Mapped[str | None] = mapped_column(String(64))
+    last_error_code: Mapped[str | None] = mapped_column(String(64))
+    last_error_message: Mapped[str | None] = mapped_column(Text)
+    last_error_retryable: Mapped[bool | None] = mapped_column(Boolean)
     raw_broker_payload: Mapped[dict[str, Any] | None] = mapped_column(JSON)
 
     plan_item: Mapped[ExecutionPlanItem | None] = relationship(back_populates="broker_orders")
@@ -202,7 +257,14 @@ class BrokerOrderEvent(TimestampMixin, Base):
         index=True,
     )
     event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    event_source: Mapped[str | None] = mapped_column(String(32))
+    normalized_status: Mapped[str | None] = mapped_column(String(32))
     broker_status: Mapped[str | None] = mapped_column(String(64))
+    error_classification: Mapped[str | None] = mapped_column(String(64))
+    retryable: Mapped[bool | None] = mapped_column(Boolean)
+    message: Mapped[str | None] = mapped_column(Text)
+    request_payload: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    response_payload: Mapped[dict[str, Any] | None] = mapped_column(JSON)
     payload: Mapped[dict[str, Any] | None] = mapped_column(JSON)
     observed_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

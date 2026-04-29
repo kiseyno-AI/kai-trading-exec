@@ -51,8 +51,12 @@ That includes:
 - `GET /health`
 - `GET /runtime/status`
 - `GET /runtime/safety`
+- `GET /broker/session`
 - `GET /execution-plans`
+- `POST /broker/session/authenticate`
+- `POST /broker/session/revoke`
 - `POST /execution-plans`
+- `POST /orders`
 - `GET /orders`
 - `GET /executions`
 - `GET /positions`
@@ -80,7 +84,7 @@ That includes:
    - handles next-open and intraday scheduling
 
 3. **broker adapter**
-   - encapsulates KIS-specific request signing, retries, throttling, and response normalization
+   - encapsulates KIS-specific request signing, retries, throttling, auth/session, realtime approval, and response normalization
 
 4. **monitoring loop**
    - tracks open orders, fills, target/stop triggers, and stale states
@@ -92,6 +96,8 @@ That includes:
 ## Data ownership rules
 
 ### Exec-owned truth
+- `broker_sessions`
+- `broker_session_events`
 - `execution_plan_items`
 - `execution_jobs`
 - `broker_orders`
@@ -103,7 +109,9 @@ That includes:
 - `monitoring_checkpoints`
 
 The baseline migration also creates `execution_plans` as the parent intake
-record for `execution_plan_items`. These tables are the initial durable boundary
+record for `execution_plan_items`. Broker session state is likewise exec-owned so
+KIS authentication survives process restarts without leaking into
+`kai-trading-core`. These tables are the initial durable boundary
 for runtime state and are intentionally separate from strategy/read ownership in
 `kai-trading-core`.
 

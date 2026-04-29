@@ -13,6 +13,7 @@ from app.models.runtime import (
     ExecutionJob,
     MonitoringCheckpoint,
 )
+from app.services.broker_auth import build_broker_session_summary
 from app.services.schema import check_runtime_schema
 from app.services.runtime_controls import (
     ensure_runtime_control_state,
@@ -173,6 +174,7 @@ def build_runtime_status(
         "workers": [],
         "last_heartbeat_at": None,
     }
+    broker = build_broker_session_summary(settings=settings, db=None)
     counts_available = True
 
     try:
@@ -203,6 +205,7 @@ def build_runtime_status(
                 **liveness_payload(runtime),
                 "monitoring": monitoring,
             },
+            "broker": broker,
             "counts": counts,
         }
 
@@ -236,6 +239,7 @@ def build_runtime_status(
                 **liveness_payload(runtime),
                 "monitoring": monitoring,
             },
+            "broker": broker,
             "counts": counts,
         }
 
@@ -244,6 +248,7 @@ def build_runtime_status(
         safety = runtime_safety_payload(state)
         counts = runtime_counts(db)
         monitoring = monitoring_payload(db)
+        broker = build_broker_session_summary(settings=settings, db=db)
     except SQLAlchemyError as exc:
         db.rollback()
         dependencies["runtime_schema"] = "error"
@@ -270,5 +275,6 @@ def build_runtime_status(
             **liveness_payload(runtime),
             "monitoring": monitoring,
         },
+        "broker": broker,
         "counts": counts,
     }
