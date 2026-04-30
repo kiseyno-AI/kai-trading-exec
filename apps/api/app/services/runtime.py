@@ -302,8 +302,6 @@ def readiness_payload(
         reasons.append("kill switch is enabled")
     if safety["paused"]:
         reasons.append("runtime is paused")
-    if not safety["automation_enabled"]:
-        reasons.append("automation is disabled")
     if not counts_available:
         reasons.append("runtime counters are unavailable")
 

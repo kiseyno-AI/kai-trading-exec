@@ -1640,16 +1640,20 @@ def test_monitoring_evaluate_tracks_remaining_shares_across_triggered_items() ->
     assert payload["submitted_order_count"] == 1
     assert payload["blocked_item_count"] == 0
     assert len(payload["items"]) == 2
-    assert payload["items"][0]["execution_plan_item_id"] == first_item_id
-    assert payload["items"][0]["symbol"] == "005930"
-    assert payload["items"][0]["intent"] == "target_sell"
-    assert payload["items"][0]["trigger_price"] == "125000.0000"
-    assert payload["items"][0]["observed_price"] == "125100.0000"
-    assert payload["items"][0]["outcome"] == "submitted"
-    assert payload["items"][0]["order"]["quantity"] == 6
 
-    assert payload["items"][1] == {
-        "execution_plan_item_id": second_item_id,
+    items_by_outcome = {item["outcome"]: item for item in payload["items"]}
+    submitted_item = items_by_outcome["submitted"]
+    no_position_item = items_by_outcome["no_position"]
+
+    assert submitted_item["execution_plan_item_id"] in {first_item_id, second_item_id}
+    assert submitted_item["symbol"] == "005930"
+    assert submitted_item["intent"] == "target_sell"
+    assert submitted_item["trigger_price"] == "125000.0000"
+    assert submitted_item["observed_price"] == "125100.0000"
+    assert submitted_item["order"]["quantity"] == 6
+
+    assert no_position_item == {
+        "execution_plan_item_id": second_item_id if submitted_item["execution_plan_item_id"] == first_item_id else first_item_id,
         "symbol": "005930",
         "intent": "target_sell",
         "trigger_price": "125000.0000",

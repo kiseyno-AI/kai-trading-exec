@@ -146,7 +146,6 @@ def test_runtime_status_reports_readiness_and_default_safety() -> None:
     assert payload["mode"] == "mock"
     assert payload["ready"] is False
     assert "runtime is paused" in payload["readiness"]["reasons"]
-    assert "automation is disabled" in payload["readiness"]["reasons"]
     assert payload["safety"]["paused"] is True
     assert payload["safety"]["kill_switch_enabled"] is False
     assert payload["safety"]["automated_order_submission_allowed"] is False

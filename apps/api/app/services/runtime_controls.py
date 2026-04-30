@@ -63,12 +63,12 @@ def ensure_runtime_control_state(
     return state
 
 
+def effective_automation_enabled(state: RuntimeControlState) -> bool:
+    return not state.kill_switch_enabled and not state.paused
+
+
 def automated_order_submission_allowed(state: RuntimeControlState) -> bool:
-    return (
-        not state.kill_switch_enabled
-        and not state.paused
-        and state.automation_enabled
-    )
+    return effective_automation_enabled(state)
 
 
 def automated_order_submission_block_reason(state: RuntimeControlState) -> str | None:
@@ -76,8 +76,6 @@ def automated_order_submission_block_reason(state: RuntimeControlState) -> str |
         return "kill_switch"
     if state.paused:
         return "paused"
-    if not state.automation_enabled:
-        return "automation_disabled"
     return None
 
 
@@ -97,7 +95,7 @@ def runtime_safety_payload(state: RuntimeControlState) -> dict[str, object]:
         "mode": state.mode,
         "paused": state.paused,
         "kill_switch_enabled": state.kill_switch_enabled,
-        "automation_enabled": state.automation_enabled,
+        "automation_enabled": effective_automation_enabled(state),
         "automated_order_submission_allowed": automated_order_submission_allowed(state),
         "automated_order_submission_block_reason": automated_order_submission_block_reason(state),
         "readiness_reason": state.readiness_reason,
@@ -122,7 +120,7 @@ def pause_runtime(
     if state.kill_switch_enabled:
         message = "kill switch already active; automated order submission remains blocked"
         outcome = "noop"
-    elif state.paused and not state.automation_enabled:
+    elif state.paused:
         message = "runtime is already paused"
         outcome = "noop"
     else:
@@ -160,7 +158,7 @@ def resume_runtime(
     if state.kill_switch_enabled:
         message = "kill switch is active; explicit reset flow is required before resume"
         outcome = "rejected"
-    elif not state.paused and state.automation_enabled:
+    elif not state.paused:
         message = "runtime is already accepting automated actions"
         outcome = "noop"
     else:
