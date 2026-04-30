@@ -17,6 +17,11 @@ from app.models.runtime import (
     ExecutionPlanItem,
     MonitoringCheckpoint,
 )
+from app.services.monitoring import (
+    MONITORING_RUNTIME_TOPOLOGY,
+    MONITORING_SELECTION_STRATEGY,
+    PENDING_DISPATCH_MONITORING_STATUSES,
+)
 from app.services.broker_auth import build_broker_session_summary
 from app.services.schema import check_runtime_schema
 from app.services.runtime_controls import (
@@ -176,13 +181,51 @@ def _current_krx_day_utc_bounds(now: datetime | None = None) -> tuple[datetime, 
     return day_start_krx.astimezone(UTC), next_day_start_krx.astimezone(UTC)
 
 
-def monitoring_payload(db: Session) -> dict[str, object]:
+def monitoring_payload(
+    *,
+    settings: Settings,
+    db: Session,
+) -> dict[str, object]:
+    backlog_symbols = db.scalars(
+        select(distinct(ExecutionPlanItem.symbol))
+        .join(ExecutionPlanItem.plan)
+        .where(
+            ExecutionPlan.mode == settings.runtime_mode,
+            ExecutionPlanItem.status.in_(tuple(PENDING_DISPATCH_MONITORING_STATUSES)),
+        )
+        .order_by(ExecutionPlanItem.symbol.asc())
+    ).all()
+    backlog_item_count = int(
+        db.scalar(
+            select(func.count())
+            .select_from(ExecutionPlanItem)
+            .join(ExecutionPlanItem.plan)
+            .where(
+                ExecutionPlan.mode == settings.runtime_mode,
+                ExecutionPlanItem.status.in_(tuple(PENDING_DISPATCH_MONITORING_STATUSES)),
+            )
+        )
+        or 0
+    )
     checkpoints = db.scalars(select(MonitoringCheckpoint)).all()
     if not checkpoints:
         return {
             "status": "not_started",
+            "topology": MONITORING_RUNTIME_TOPOLOGY,
+            "scheduler": {
+                "selection_strategy": MONITORING_SELECTION_STRATEGY,
+                "max_symbols_per_cycle": settings.monitoring_max_symbols_per_cycle,
+            },
+            "dispatcher": {
+                "max_broker_actions_per_cycle": settings.monitoring_max_broker_actions_per_cycle,
+                "last_cycle_action_count": 0,
+                "backlog_item_count": backlog_item_count,
+                "backlog_symbols": backlog_symbols,
+            },
             "workers": [],
             "last_heartbeat_at": None,
+            "last_success_at": None,
+            "last_cycle": None,
         }
 
     heartbeat_values = [
@@ -190,9 +233,39 @@ def monitoring_payload(db: Session) -> dict[str, object]:
         for checkpoint in checkpoints
         if checkpoint.last_heartbeat_at is not None
     ]
+    success_values = [
+        checkpoint.last_success_at
+        for checkpoint in checkpoints
+        if checkpoint.last_success_at is not None
+    ]
     last_heartbeat = max(heartbeat_values).isoformat() if heartbeat_values else None
+    last_success = max(success_values).isoformat() if success_values else None
+    latest_checkpoint = max(
+        checkpoints,
+        key=lambda checkpoint: (
+            checkpoint.last_heartbeat_at or checkpoint.last_success_at or datetime.min.replace(tzinfo=UTC)
+        ),
+    )
+    latest_details = latest_checkpoint.details or {}
+    if backlog_item_count > 0 or any(checkpoint.status == "degraded" for checkpoint in checkpoints):
+        status = "degraded"
+    elif last_heartbeat:
+        status = "running"
+    else:
+        status = "not_started"
     return {
-        "status": "running" if last_heartbeat else "not_started",
+        "status": status,
+        "topology": MONITORING_RUNTIME_TOPOLOGY,
+        "scheduler": {
+            "selection_strategy": MONITORING_SELECTION_STRATEGY,
+            "max_symbols_per_cycle": settings.monitoring_max_symbols_per_cycle,
+        },
+        "dispatcher": {
+            "max_broker_actions_per_cycle": settings.monitoring_max_broker_actions_per_cycle,
+            "last_cycle_action_count": int(latest_details.get("dispatch_action_count", 0) or 0),
+            "backlog_item_count": backlog_item_count,
+            "backlog_symbols": backlog_symbols,
+        },
         "workers": [
             {
                 "name": checkpoint.worker_name,
@@ -211,6 +284,8 @@ def monitoring_payload(db: Session) -> dict[str, object]:
             for checkpoint in checkpoints
         ],
         "last_heartbeat_at": last_heartbeat,
+        "last_success_at": last_success,
+        "last_cycle": latest_details or None,
     }
 
 
@@ -251,8 +326,21 @@ def build_runtime_status(
     counts: dict[str, int] = {"open_orders": 0, "active_execution_jobs": 0}
     monitoring: dict[str, object] = {
         "status": "not_started",
+        "topology": MONITORING_RUNTIME_TOPOLOGY,
+        "scheduler": {
+            "selection_strategy": MONITORING_SELECTION_STRATEGY,
+            "max_symbols_per_cycle": settings.monitoring_max_symbols_per_cycle,
+        },
+        "dispatcher": {
+            "max_broker_actions_per_cycle": settings.monitoring_max_broker_actions_per_cycle,
+            "last_cycle_action_count": 0,
+            "backlog_item_count": 0,
+            "backlog_symbols": [],
+        },
         "workers": [],
         "last_heartbeat_at": None,
+        "last_success_at": None,
+        "last_cycle": None,
     }
     symbols: dict[str, list[str]] = {
         "monitored": [],
@@ -335,7 +423,7 @@ def build_runtime_status(
         state = ensure_runtime_control_state(settings=settings, db=db)
         safety = runtime_safety_payload(state)
         counts = runtime_counts(db)
-        monitoring = monitoring_payload(db)
+        monitoring = monitoring_payload(settings=settings, db=db)
         broker = build_broker_session_summary(settings=settings, db=db)
         symbols = runtime_symbol_summary(settings=settings, db=db)
     except SQLAlchemyError as exc:

@@ -103,6 +103,10 @@ KIS auth/session settings currently supported:
 - `KAI_EXEC_KIS_USE_HASHKEY`
 - `KAI_EXEC_KIS_REQUEST_TIMEOUT_SECONDS`
 
+Monitoring runtime settings currently supported:
+- `KAI_EXEC_MONITORING_MAX_SYMBOLS_PER_CYCLE`
+- `KAI_EXEC_MONITORING_MAX_BROKER_ACTIONS_PER_CYCLE`
+
 Operator broker-session endpoints:
 - `GET /broker/session`
 - `POST /broker/session/authenticate`
@@ -114,7 +118,7 @@ Initial broker-order submission endpoint:
 Current execution slices:
 - `POST /execution-plans` schedules durable `execution_jobs` for eligible `next_open_buy` items
 - `POST /execution-jobs/dispatch` manually dispatches due jobs through the existing KIS adapter path
-- `POST /monitoring/evaluate` evaluates persisted `target_sell` / `stop_sell` items against supplied price snapshots, places sell orders through the existing KIS adapter path when triggers fire, and updates monitoring liveness checkpoints
+- `POST /monitoring/evaluate` runs the shared symbol-monitoring scheduler against supplied price snapshots, round-robins triggered symbols, caps broker actions per cycle, persists dispatch backlog explicitly, and updates monitoring liveness checkpoints
 
 ## Boot target
 

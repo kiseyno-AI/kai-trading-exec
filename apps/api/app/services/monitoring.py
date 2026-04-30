@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
@@ -18,6 +19,12 @@ BLOCKED_MONITORING_STATUSES = frozenset(
     {
         "target_sell_triggered_blocked",
         "stop_sell_triggered_blocked",
+    }
+)
+PENDING_DISPATCH_MONITORING_STATUSES = frozenset(
+    {
+        "target_sell_triggered_pending_dispatch",
+        "stop_sell_triggered_pending_dispatch",
     }
 )
 NON_MONITORABLE_PLAN_ITEM_STATUSES = frozenset(
@@ -40,12 +47,20 @@ NON_MONITORABLE_PLAN_ITEM_STATUSES = frozenset(
     }
 )
 MONITORING_WORKER_NAME = "intraday_target_stop_monitor"
+MONITORING_RUNTIME_TOPOLOGY = "shared_symbol_scheduler"
+MONITORING_SELECTION_STRATEGY = "round_robin_by_symbol"
 
 
 @dataclass(frozen=True)
 class EvaluateMonitoringResult:
     status_code: int
     payload: dict[str, object]
+
+
+@dataclass(frozen=True)
+class PendingMonitoringAction:
+    item: ExecutionPlanItem
+    observed_price: Decimal
 
 
 def materialize_monitoring_plan_items(plan: ExecutionPlan) -> None:
@@ -70,10 +85,18 @@ def evaluate_monitoring(
     prices = {price.symbol: price for price in command.prices}
     remaining_quantities_by_symbol = _load_remaining_quantities_by_symbol(db)
     items = _load_monitored_items(settings=settings, db=db)
-    results: list[dict[str, object]] = []
+    result_by_item_id: dict[str, dict[str, object]] = {}
+    evaluated_item_ids: list[str] = []
+    actions_by_symbol: dict[str, deque[PendingMonitoringAction]] = {}
+    symbol_order: list[str] = []
+    evaluated_symbols: set[str] = set()
+    triggered_symbols: set[str] = set()
+    submitted_symbols: set[str] = set()
     triggered_item_count = 0
     submitted_order_count = 0
     blocked_item_count = 0
+    deferred_item_count = 0
+    dispatch_action_count = 0
 
     for item in items:
         if item.status in NON_MONITORABLE_PLAN_ITEM_STATUSES:
@@ -82,133 +105,170 @@ def evaluate_monitoring(
         price = prices.get(item.symbol)
         if price is None:
             continue
+        evaluated_item_ids.append(item.id)
+        evaluated_symbols.add(item.symbol)
         if not _monitoring_item_is_configured(item):
             item.status = _pending_configuration_status(item.intent)
-            results.append(
-                {
-                    "execution_plan_item_id": item.id,
-                    "symbol": item.symbol,
-                    "intent": item.intent,
-                    "trigger_price": _serialize_decimal(item.trigger_price),
-                    "observed_price": _serialize_decimal(price.price),
-                    "outcome": "invalid_configuration",
-                    "message": "target/stop monitoring item is missing sell-side trigger configuration",
-                }
+            result_by_item_id[item.id] = _monitoring_result_payload(
+                item=item,
+                observed_price=price.price,
+                outcome="invalid_configuration",
+                message="target/stop monitoring item is missing sell-side trigger configuration",
             )
             continue
 
         if not _is_triggered(item=item, observed_price=price.price):
-            if item.status in BLOCKED_MONITORING_STATUSES:
+            if item.status in (
+                BLOCKED_MONITORING_STATUSES | PENDING_DISPATCH_MONITORING_STATUSES
+            ):
                 item.status = _monitoring_status(item.intent)
-            results.append(
-                {
-                    "execution_plan_item_id": item.id,
-                    "symbol": item.symbol,
-                    "intent": item.intent,
-                    "trigger_price": _serialize_decimal(item.trigger_price),
-                    "observed_price": _serialize_decimal(price.price),
-                    "outcome": "waiting",
-                    "message": "trigger condition not met",
-                }
+            result_by_item_id[item.id] = _monitoring_result_payload(
+                item=item,
+                observed_price=price.price,
+                outcome="waiting",
+                message="trigger condition not met",
             )
             continue
 
         triggered_item_count += 1
+        triggered_symbols.add(item.symbol)
+        if item.symbol not in actions_by_symbol:
+            actions_by_symbol[item.symbol] = deque()
+            symbol_order.append(item.symbol)
+        actions_by_symbol[item.symbol].append(
+            PendingMonitoringAction(item=item, observed_price=price.price)
+        )
+
+    max_broker_actions = settings.monitoring_max_broker_actions_per_cycle
+    pending_symbols = deque(symbol_order)
+    while pending_symbols:
+        symbol = pending_symbols.popleft()
+        symbol_actions = actions_by_symbol.get(symbol)
+        if not symbol_actions:
+            continue
+
+        action = symbol_actions.popleft()
+        if action.item.status in PENDING_DISPATCH_MONITORING_STATUSES:
+            action.item.status = _monitoring_status(action.item.intent)
         quantity = _resolve_sell_quantity(
-            item=item,
-            remaining_quantity=remaining_quantities_by_symbol.get(item.symbol),
+            item=action.item,
+            remaining_quantity=remaining_quantities_by_symbol.get(action.item.symbol),
         )
         if quantity is None:
-            results.append(
-                {
-                    "execution_plan_item_id": item.id,
-                    "symbol": item.symbol,
-                    "intent": item.intent,
-                    "trigger_price": _serialize_decimal(item.trigger_price),
-                    "observed_price": _serialize_decimal(price.price),
-                    "outcome": "no_position",
-                    "message": "no sellable execution position is available for this trigger",
-                }
+            result_by_item_id[action.item.id] = _monitoring_result_payload(
+                item=action.item,
+                observed_price=action.observed_price,
+                outcome="no_position",
+                message="no sellable execution position is available for this trigger",
             )
-            continue
-
-        order_request = PlaceOrderRequest(
-            idempotency_key=f"monitoring:{item.intent}:{item.id}",
-            execution_plan_item_id=item.id,
-            symbol=item.symbol,
-            side="sell",
-            quantity=quantity,
-            order_type="limit" if item.limit_price is not None else "market",
-            limit_price=item.limit_price,
-            time_in_force=item.time_in_force or "day",
-            exchange=_plan_item_exchange(item),
-        )
-        placement = place_broker_order(
-            settings=settings,
-            db=db,
-            adapter=adapter,
-            command=order_request,
-            request_source=f"monitoring:{MONITORING_WORKER_NAME}",
-        )
-
-        item_result = {
-            "execution_plan_item_id": item.id,
-            "symbol": item.symbol,
-            "intent": item.intent,
-            "trigger_price": _serialize_decimal(item.trigger_price),
-            "observed_price": _serialize_decimal(price.price),
-        }
-        if placement.status_code == 201:
-            _reserve_remaining_quantity(
-                remaining_quantities_by_symbol=remaining_quantities_by_symbol,
-                symbol=item.symbol,
+        elif dispatch_action_count >= max_broker_actions:
+            symbol_actions.appendleft(action)
+            pending_symbols.appendleft(symbol)
+            break
+        else:
+            dispatch_action_count += 1
+            placement = _place_monitoring_order(
+                settings=settings,
+                db=db,
+                adapter=adapter,
+                item=action.item,
                 quantity=quantity,
             )
-            submitted_order_count += 1
-            item_result["outcome"] = "submitted"
-            item_result["order"] = placement.payload.get("order")
-            results.append(item_result)
-            continue
-
-        if placement.status_code == 409 and "block_reason" in placement.payload:
-            blocked_item_count += 1
-            item.status = f"{item.intent}_triggered_blocked"
-            db.commit()
-            item_result["outcome"] = "blocked"
-            item_result["block_reason"] = placement.payload.get("block_reason")
-            item_result["message"] = placement.payload.get("message")
-            results.append(item_result)
-            continue
-
-        if placement.payload.get("duplicate") is True:
-            duplicate_quantity = _serialized_order_quantity(placement.payload.get("order"))
-            if duplicate_quantity is not None:
+            if placement.status_code == 201:
                 _reserve_remaining_quantity(
                     remaining_quantities_by_symbol=remaining_quantities_by_symbol,
-                    symbol=item.symbol,
-                    quantity=duplicate_quantity,
+                    symbol=action.item.symbol,
+                    quantity=quantity,
                 )
-            item_result["outcome"] = "duplicate"
-            item_result["order"] = placement.payload.get("order")
-            item_result["message"] = placement.payload.get("message")
-            results.append(item_result)
-            continue
+                submitted_order_count += 1
+                submitted_symbols.add(action.item.symbol)
+                result_by_item_id[action.item.id] = _monitoring_result_payload(
+                    item=action.item,
+                    observed_price=action.observed_price,
+                    outcome="submitted",
+                    order=placement.payload.get("order"),
+                )
+            elif placement.status_code == 409 and "block_reason" in placement.payload:
+                blocked_item_count += 1
+                action.item.status = f"{action.item.intent}_triggered_blocked"
+                db.commit()
+                result_by_item_id[action.item.id] = _monitoring_result_payload(
+                    item=action.item,
+                    observed_price=action.observed_price,
+                    outcome="blocked",
+                    block_reason=placement.payload.get("block_reason"),
+                    message=placement.payload.get("message"),
+                )
+            elif placement.payload.get("duplicate") is True:
+                duplicate_quantity = _serialized_order_quantity(placement.payload.get("order"))
+                if duplicate_quantity is not None:
+                    _reserve_remaining_quantity(
+                        remaining_quantities_by_symbol=remaining_quantities_by_symbol,
+                        symbol=action.item.symbol,
+                        quantity=duplicate_quantity,
+                    )
+                result_by_item_id[action.item.id] = _monitoring_result_payload(
+                    item=action.item,
+                    observed_price=action.observed_price,
+                    outcome="duplicate",
+                    order=placement.payload.get("order"),
+                    message=placement.payload.get("message"),
+                )
+            else:
+                result_by_item_id[action.item.id] = _monitoring_result_payload(
+                    item=action.item,
+                    observed_price=action.observed_price,
+                    outcome="error",
+                    message=placement.payload.get("message"),
+                )
 
-        item_result["outcome"] = "error"
-        item_result["message"] = placement.payload.get("message")
-        results.append(item_result)
+        if symbol_actions:
+            pending_symbols.append(symbol)
+
+    backlog_symbols: set[str] = set()
+    for symbol, symbol_actions in actions_by_symbol.items():
+        while symbol_actions:
+            action = symbol_actions.popleft()
+            backlog_symbols.add(symbol)
+            deferred_item_count += 1
+            action.item.status = _pending_dispatch_status(action.item.intent)
+            result_by_item_id[action.item.id] = _monitoring_result_payload(
+                item=action.item,
+                observed_price=action.observed_price,
+                outcome="deferred",
+                message="broker action capacity reached for this monitoring cycle",
+            )
+
+    results = [
+        result_by_item_id[item_id]
+        for item_id in evaluated_item_ids
+        if item_id in result_by_item_id
+    ]
+    checkpoint_details = {
+        "topology": MONITORING_RUNTIME_TOPOLOGY,
+        "selection_strategy": MONITORING_SELECTION_STRATEGY,
+        "max_symbols_per_cycle": settings.monitoring_max_symbols_per_cycle,
+        "max_broker_actions_per_cycle": max_broker_actions,
+        "dispatch_action_count": dispatch_action_count,
+        "evaluated_item_count": len(results),
+        "triggered_item_count": triggered_item_count,
+        "submitted_order_count": submitted_order_count,
+        "blocked_item_count": blocked_item_count,
+        "deferred_item_count": deferred_item_count,
+        "price_count": len(prices),
+        "evaluated_symbol_count": len(evaluated_symbols),
+        "triggered_symbol_count": len(triggered_symbols),
+        "submitted_symbols": sorted(submitted_symbols),
+        "backlog_item_count": deferred_item_count,
+        "backlog_symbols": sorted(backlog_symbols),
+    }
 
     checkpoint = _update_monitoring_checkpoint(
         db=db,
         worker_name=MONITORING_WORKER_NAME,
         triggered_at=triggered_at,
-        details={
-            "evaluated_item_count": len(results),
-            "triggered_item_count": triggered_item_count,
-            "submitted_order_count": submitted_order_count,
-            "blocked_item_count": blocked_item_count,
-            "price_count": len(prices),
-        },
+        status="degraded" if deferred_item_count > 0 else "running",
+        details=checkpoint_details,
     )
     return EvaluateMonitoringResult(
         status_code=200,
@@ -219,6 +279,7 @@ def evaluate_monitoring(
             "triggered_item_count": triggered_item_count,
             "submitted_order_count": submitted_order_count,
             "blocked_item_count": blocked_item_count,
+            "deferred_item_count": deferred_item_count,
             "items": results,
         },
     )
@@ -237,7 +298,12 @@ def _load_monitored_items(
             ExecutionPlanItem.intent.in_(tuple(MONITORED_INTENTS)),
         )
         .options(selectinload(ExecutionPlanItem.plan))
-        .order_by(ExecutionPlanItem.created_at.asc(), ExecutionPlanItem.id.asc())
+        .order_by(
+            ExecutionPlan.accepted_at.asc(),
+            ExecutionPlan.id.asc(),
+            ExecutionPlanItem.plan_item_index.asc(),
+            ExecutionPlanItem.id.asc(),
+        )
     ).all()
 
 
@@ -326,6 +392,10 @@ def _monitoring_status(intent: str) -> str:
     return f"{intent}_monitoring"
 
 
+def _pending_dispatch_status(intent: str) -> str:
+    return f"{intent}_triggered_pending_dispatch"
+
+
 def _pending_configuration_status(intent: str) -> str:
     return f"{intent}_pending_config"
 
@@ -388,6 +458,7 @@ def _update_monitoring_checkpoint(
     db: Session,
     worker_name: str,
     triggered_at: datetime,
+    status: str,
     details: dict[str, object],
 ) -> MonitoringCheckpoint:
     checkpoint = db.scalar(
@@ -396,7 +467,7 @@ def _update_monitoring_checkpoint(
     if checkpoint is None:
         checkpoint = MonitoringCheckpoint(worker_name=worker_name)
         db.add(checkpoint)
-    checkpoint.status = "running"
+    checkpoint.status = status
     checkpoint.last_heartbeat_at = triggered_at
     checkpoint.last_success_at = triggered_at
     checkpoint.details = details
@@ -415,3 +486,57 @@ def _serialize_decimal(value: Decimal | None) -> str | None:
     if value is None:
         return None
     return f"{value:.4f}"
+
+
+def _place_monitoring_order(
+    *,
+    settings: Settings,
+    db: Session,
+    adapter: BrokerAdapter,
+    item: ExecutionPlanItem,
+    quantity: int,
+):
+    order_request = PlaceOrderRequest(
+        idempotency_key=f"monitoring:{item.intent}:{item.id}",
+        execution_plan_item_id=item.id,
+        symbol=item.symbol,
+        side="sell",
+        quantity=quantity,
+        order_type="limit" if item.limit_price is not None else "market",
+        limit_price=item.limit_price,
+        time_in_force=item.time_in_force or "day",
+        exchange=_plan_item_exchange(item),
+    )
+    return place_broker_order(
+        settings=settings,
+        db=db,
+        adapter=adapter,
+        command=order_request,
+        request_source=f"monitoring:{MONITORING_WORKER_NAME}",
+    )
+
+
+def _monitoring_result_payload(
+    *,
+    item: ExecutionPlanItem,
+    observed_price: Decimal,
+    outcome: str,
+    message: str | None = None,
+    block_reason: object | None = None,
+    order: object | None = None,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "execution_plan_item_id": item.id,
+        "symbol": item.symbol,
+        "intent": item.intent,
+        "trigger_price": _serialize_decimal(item.trigger_price),
+        "observed_price": _serialize_decimal(observed_price),
+        "outcome": outcome,
+    }
+    if message is not None:
+        payload["message"] = message
+    if block_reason is not None:
+        payload["block_reason"] = block_reason
+    if order is not None:
+        payload["order"] = order
+    return payload

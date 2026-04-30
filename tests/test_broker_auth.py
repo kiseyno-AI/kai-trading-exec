@@ -1686,6 +1686,164 @@ def test_monitoring_evaluate_tracks_remaining_shares_across_triggered_items() ->
     engine.dispose()
 
 
+def test_monitoring_evaluate_round_robins_symbols_when_dispatch_capacity_is_bounded() -> None:
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(broker_order_id="kis-shared-monitor-runtime"),
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+            monitoring_max_symbols_per_cycle=128,
+            monitoring_max_broker_actions_per_cycle=2,
+        ),
+        broker_adapter=broker_adapter,
+    )
+    client = TestClient(app)
+
+    resume = client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "console", "reason": "enable automation"},
+    )
+    assert resume.status_code == 200
+
+    plan_response = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-shared-monitor-runtime-round-robin",
+            "source": "kai-trading-core",
+            "items": [
+                {
+                    "symbol": "005930",
+                    "side": "sell",
+                    "intent": "target_sell",
+                    "quantity_policy": {"kind": "shares", "quantity": 1},
+                    "trigger_price": "125000.00",
+                    "time_in_force": "day",
+                    "risk_context": {"exchange": "KRX"},
+                },
+                {
+                    "symbol": "005930",
+                    "side": "sell",
+                    "intent": "target_sell",
+                    "quantity_policy": {"kind": "shares", "quantity": 1},
+                    "trigger_price": "125000.00",
+                    "time_in_force": "day",
+                    "risk_context": {"exchange": "KRX"},
+                },
+                {
+                    "symbol": "000660",
+                    "side": "sell",
+                    "intent": "target_sell",
+                    "quantity_policy": {"kind": "shares", "quantity": 1},
+                    "trigger_price": "90000.00",
+                    "time_in_force": "day",
+                    "risk_context": {"exchange": "KRX"},
+                },
+            ],
+        },
+    )
+    assert plan_response.status_code == 201
+    first_item_id, second_item_id, third_item_id = plan_response.json()["persisted_execution_item_ids"]
+
+    with app.state.db_session_factory() as session:
+        session.add_all(
+            [
+                ExecutionPosition(
+                    symbol="005930",
+                    quantity=2,
+                    average_price=Decimal("120000.0000"),
+                    updated_from="reconciliation",
+                    raw_payload={"source": "broker"},
+                ),
+                ExecutionPosition(
+                    symbol="000660",
+                    quantity=1,
+                    average_price=Decimal("88000.0000"),
+                    updated_from="reconciliation",
+                    raw_payload={"source": "broker"},
+                ),
+            ]
+        )
+        session.commit()
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "shared symbol scheduler should round robin before draining one symbol",
+            "prices": [
+                {
+                    "symbol": "005930",
+                    "price": "125100.00",
+                },
+                {
+                    "symbol": "000660",
+                    "price": "90100.00",
+                },
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["evaluated_item_count"] == 3
+    assert payload["triggered_item_count"] == 3
+    assert payload["submitted_order_count"] == 2
+    assert payload["blocked_item_count"] == 0
+    assert payload["deferred_item_count"] == 1
+    assert payload["items"][0]["execution_plan_item_id"] == first_item_id
+    assert payload["items"][0]["outcome"] == "submitted"
+    assert payload["items"][1]["execution_plan_item_id"] == second_item_id
+    assert payload["items"][1]["outcome"] == "deferred"
+    assert payload["items"][1]["message"] == "broker action capacity reached for this monitoring cycle"
+    assert payload["items"][2]["execution_plan_item_id"] == third_item_id
+    assert payload["items"][2]["outcome"] == "submitted"
+
+    assert broker_adapter.authenticate_calls == 1
+    assert len(broker_adapter.order_calls) == 2
+    assert [call.execution_plan_item_id for call in broker_adapter.order_calls] == [
+        first_item_id,
+        third_item_id,
+    ]
+
+    runtime_status = client.get("/runtime/status")
+    assert runtime_status.status_code == 200
+    monitoring = runtime_status.json()["liveness"]["monitoring"]
+    assert monitoring["status"] == "degraded"
+    assert monitoring["topology"] == "shared_symbol_scheduler"
+    assert monitoring["scheduler"]["selection_strategy"] == "round_robin_by_symbol"
+    assert monitoring["dispatcher"]["max_broker_actions_per_cycle"] == 2
+    assert monitoring["dispatcher"]["last_cycle_action_count"] == 2
+    assert monitoring["dispatcher"]["backlog_item_count"] == 1
+    assert monitoring["dispatcher"]["backlog_symbols"] == ["005930"]
+    assert monitoring["last_cycle"]["deferred_item_count"] == 1
+
+    with app.state.db_session_factory() as session:
+        first_item = session.get(ExecutionPlanItem, first_item_id)
+        second_item = session.get(ExecutionPlanItem, second_item_id)
+        third_item = session.get(ExecutionPlanItem, third_item_id)
+        assert first_item is not None
+        assert second_item is not None
+        assert third_item is not None
+        assert first_item.status == "broker_order_submitted"
+        assert second_item.status == "target_sell_triggered_pending_dispatch"
+        assert third_item.status == "broker_order_submitted"
+
+    engine.dispose()
+
+
 def test_place_order_endpoint_is_idempotent() -> None:
     broker_adapter = StubBrokerAdapter(
         config=BrokerConfig(

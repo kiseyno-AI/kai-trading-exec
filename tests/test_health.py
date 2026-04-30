@@ -159,7 +159,14 @@ def test_runtime_status_reports_readiness_and_default_safety() -> None:
         "filled_today": [],
         "failed_today": [],
     }
-    assert payload["liveness"]["monitoring"]["status"] == "not_started"
+    monitoring = payload["liveness"]["monitoring"]
+    assert monitoring["status"] == "not_started"
+    assert monitoring["topology"] == "shared_symbol_scheduler"
+    assert monitoring["scheduler"]["selection_strategy"] == "round_robin_by_symbol"
+    assert monitoring["scheduler"]["max_symbols_per_cycle"] == 128
+    assert monitoring["dispatcher"]["max_broker_actions_per_cycle"] == 32
+    assert monitoring["dispatcher"]["backlog_item_count"] == 0
+    assert monitoring["last_cycle"] is None
 
     with app.state.db_session_factory() as session:
         state = session.get(RuntimeControlState, "global")

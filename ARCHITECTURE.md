@@ -88,6 +88,8 @@ That includes:
 
 4. **monitoring loop**
    - tracks open orders, fills, target/stop triggers, and stale states
+   - multiplexes many symbols through a shared scheduler instead of one OS worker per symbol
+   - applies bounded broker-action capacity and explicit backlog reporting
 
 5. **reconciliation worker**
    - periodic truth sync against broker APIs
