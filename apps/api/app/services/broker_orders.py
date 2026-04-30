@@ -16,7 +16,7 @@ from app.broker.base import (
     NormalizedBrokerOrderStatus,
 )
 from app.core.config import Settings
-from app.models.runtime import BrokerOrder, BrokerOrderEvent, ExecutionPlanItem
+from app.models.runtime import BrokerOrder, BrokerOrderEvent, ExecutionPlan, ExecutionPlanItem
 from app.services.broker_auth import ensure_authenticated_broker_session
 from app.services.execution_api import serialize_broker_order
 from app.services.runtime_controls import (
@@ -67,7 +67,11 @@ def place_broker_order(
             },
         )
 
-    plan_item = _load_plan_item(db=db, command=command)
+    plan_item = _load_plan_item(
+        settings=settings,
+        db=db,
+        command=command,
+    )
     if plan_item is None and command.execution_plan_item_id is not None:
         return PlaceBrokerOrderResult(
             status_code=404,
@@ -265,12 +269,20 @@ def _load_order_by_idempotency_key(
 
 def _load_plan_item(
     *,
+    settings: Settings,
     db: Session,
     command: PlaceOrderRequest,
 ) -> ExecutionPlanItem | None:
     if command.execution_plan_item_id is None:
         return None
-    return db.get(ExecutionPlanItem, command.execution_plan_item_id)
+    return db.scalar(
+        select(ExecutionPlanItem)
+        .join(ExecutionPlanItem.plan)
+        .where(
+            ExecutionPlanItem.id == command.execution_plan_item_id,
+            ExecutionPlan.mode == settings.runtime_mode,
+        )
+    )
 
 
 def _validate_plan_item(

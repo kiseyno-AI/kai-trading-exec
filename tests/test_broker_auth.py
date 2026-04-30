@@ -2206,6 +2206,106 @@ def test_place_order_idempotency_keys_are_scoped_to_runtime_mode(tmp_path) -> No
     live_engine.dispose()
 
 
+def test_place_order_execution_plan_item_ids_are_scoped_to_runtime_mode(tmp_path) -> None:
+    database_url = f"sqlite:///{tmp_path / 'cross-mode-plan-item.db'}"
+    paper_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(broker_order_id="paper-order-200"),
+    )
+    live_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="live",
+            configured=True,
+            api_base_url=KIS_LIVE_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(broker_order_id="live-order-200"),
+    )
+    paper_app, paper_engine = build_test_app(
+        settings=Settings(
+            database_url=database_url,
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+        ),
+        broker_adapter=paper_adapter,
+    )
+    live_app, live_engine = build_test_app(
+        settings=Settings(
+            database_url=database_url,
+            runtime_mode="live",
+            kis_app_key="live-key",
+            kis_app_secret="live-secret",
+            kis_account_number="87654321",
+        ),
+        broker_adapter=live_adapter,
+    )
+    paper_client = TestClient(paper_app)
+    live_client = TestClient(live_app)
+
+    paper_client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "console", "reason": "enable paper automation"},
+    )
+
+    live_plan = live_client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "live-plan-foreign-item-1",
+            "source": "signal-decider",
+            "items": [
+                {
+                    "symbol": "005930",
+                    "side": "buy",
+                    "intent": "manual_buy",
+                    "quantity_policy": {"kind": "shares", "quantity": 5},
+                    "limit_price": "71000.00",
+                }
+            ],
+        },
+    )
+    assert live_plan.status_code == 201
+    live_plan_item_id = live_plan.json()["persisted_execution_item_ids"][0]
+
+    response = paper_client.post(
+        "/orders",
+        json={
+            "idempotency_key": "paper-order-with-live-item-1",
+            "execution_plan_item_id": live_plan_item_id,
+            "symbol": "005930",
+            "side": "buy",
+            "quantity": 5,
+            "order_type": "limit",
+            "limit_price": "71000.00",
+            "time_in_force": "day",
+            "exchange": "KRX",
+        },
+    )
+
+    assert response.status_code == 404
+    assert response.json() == {
+        "message": "execution_plan_item_id was not found",
+        "execution_plan_item_id": live_plan_item_id,
+    }
+    assert paper_adapter.authenticate_calls == 0
+    assert len(paper_adapter.order_calls) == 0
+
+    with paper_app.state.db_session_factory() as session:
+        orders = session.scalars(select(BrokerOrder)).all()
+        assert orders == []
+
+    paper_engine.dispose()
+    live_engine.dispose()
+
+
 @pytest.mark.parametrize(
     ("control_path", "reason"),
     [
