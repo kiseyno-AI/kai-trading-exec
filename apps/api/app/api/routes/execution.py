@@ -116,20 +116,26 @@ def place_order_handler(
 
 @router.get("/orders")
 def orders(
+    request: Request,
     db: Annotated[Session, Depends(get_db_session)],
 ) -> list[dict[str, object]]:
-    return list_broker_orders(db)
+    settings: Settings = get_settings(request)
+    return list_broker_orders(settings=settings, db=db)
 
 
 @router.get("/executions")
 def executions(
+    request: Request,
     db: Annotated[Session, Depends(get_db_session)],
 ) -> list[dict[str, object]]:
-    return list_execution_fills(db)
+    settings: Settings = get_settings(request)
+    return list_execution_fills(settings=settings, db=db)
 
 
 @router.get("/positions")
 def positions(
+    request: Request,
     db: Annotated[Session, Depends(get_db_session)],
 ) -> list[dict[str, object]]:
-    return list_execution_positions(db)
+    settings: Settings = get_settings(request)
+    return list_execution_positions(settings=settings, db=db)

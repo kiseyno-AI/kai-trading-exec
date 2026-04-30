@@ -222,6 +222,13 @@ class ExecutionJob(TimestampMixin, Base):
 
 class BrokerOrder(TimestampMixin, Base):
     __tablename__ = "broker_orders"
+    __table_args__ = (
+        UniqueConstraint(
+            "idempotency_key",
+            "mode",
+            name="uq_broker_orders_idempotency_key_mode",
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     execution_plan_item_id: Mapped[str | None] = mapped_column(
@@ -229,7 +236,8 @@ class BrokerOrder(TimestampMixin, Base):
         index=True,
     )
     broker_name: Mapped[str] = mapped_column(String(32), nullable=False, default="kis")
-    idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
+    mode: Mapped[str] = mapped_column(String(16), nullable=False, default="mock")
+    idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
     broker_order_id: Mapped[str | None] = mapped_column(String(128), index=True)
     symbol: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
     side: Mapped[str] = mapped_column(String(16), nullable=False)
@@ -301,9 +309,17 @@ class ExecutionFill(TimestampMixin, Base):
 
 class ExecutionPosition(TimestampMixin, Base):
     __tablename__ = "execution_positions"
+    __table_args__ = (
+        UniqueConstraint(
+            "symbol",
+            "mode",
+            name="uq_execution_positions_symbol_mode",
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
-    symbol: Mapped[str] = mapped_column(String(32), nullable=False, unique=True)
+    mode: Mapped[str] = mapped_column(String(16), nullable=False, default="mock")
+    symbol: Mapped[str] = mapped_column(String(32), nullable=False)
     quantity: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     average_price: Mapped[Decimal | None] = mapped_column(Numeric(18, 4))
     updated_from: Mapped[str] = mapped_column(String(64), nullable=False, default="bootstrap")
@@ -313,9 +329,17 @@ class ExecutionPosition(TimestampMixin, Base):
 
 class MonitoringCheckpoint(TimestampMixin, Base):
     __tablename__ = "monitoring_checkpoints"
+    __table_args__ = (
+        UniqueConstraint(
+            "worker_name",
+            "mode",
+            name="uq_monitoring_checkpoints_worker_name_mode",
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
-    worker_name: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    worker_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    mode: Mapped[str] = mapped_column(String(16), nullable=False, default="mock")
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="not_started")
     last_heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_success_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

@@ -83,7 +83,10 @@ def evaluate_monitoring(
 ) -> EvaluateMonitoringResult:
     triggered_at = _normalize_utc(now or command.observed_at or datetime.now(UTC))
     prices = {price.symbol: price for price in command.prices}
-    remaining_quantities_by_symbol = _load_remaining_quantities_by_symbol(db)
+    remaining_quantities_by_symbol = _load_remaining_quantities_by_symbol(
+        settings=settings,
+        db=db,
+    )
     items = _load_monitored_items(settings=settings, db=db)
     result_by_item_id: dict[str, dict[str, object]] = {}
     evaluated_item_ids: list[str] = []
@@ -264,6 +267,7 @@ def evaluate_monitoring(
     }
 
     checkpoint = _update_monitoring_checkpoint(
+        settings=settings,
         db=db,
         worker_name=MONITORING_WORKER_NAME,
         triggered_at=triggered_at,
@@ -346,9 +350,15 @@ def _load_monitored_items(
     ).all()
 
 
-def _load_remaining_quantities_by_symbol(db: Session) -> dict[str, int]:
+def _load_remaining_quantities_by_symbol(
+    *,
+    settings: Settings,
+    db: Session,
+) -> dict[str, int]:
     positions = db.scalars(
-        select(ExecutionPosition).order_by(ExecutionPosition.symbol.asc())
+        select(ExecutionPosition)
+        .where(ExecutionPosition.mode == settings.runtime_mode)
+        .order_by(ExecutionPosition.symbol.asc())
     ).all()
     return {
         position.symbol: position.quantity
@@ -494,6 +504,7 @@ def _plan_item_exchange(item: ExecutionPlanItem) -> str:
 
 def _update_monitoring_checkpoint(
     *,
+    settings: Settings,
     db: Session,
     worker_name: str,
     triggered_at: datetime,
@@ -501,10 +512,16 @@ def _update_monitoring_checkpoint(
     details: dict[str, object],
 ) -> MonitoringCheckpoint:
     checkpoint = db.scalar(
-        select(MonitoringCheckpoint).where(MonitoringCheckpoint.worker_name == worker_name)
+        select(MonitoringCheckpoint).where(
+            MonitoringCheckpoint.worker_name == worker_name,
+            MonitoringCheckpoint.mode == settings.runtime_mode,
+        )
     )
     if checkpoint is None:
-        checkpoint = MonitoringCheckpoint(worker_name=worker_name)
+        checkpoint = MonitoringCheckpoint(
+            worker_name=worker_name,
+            mode=settings.runtime_mode,
+        )
         db.add(checkpoint)
     checkpoint.status = status
     checkpoint.last_heartbeat_at = triggered_at

@@ -114,26 +114,43 @@ def list_execution_plans(
     ).all()
     return [_serialize_execution_plan(plan) for plan in plans]
 
-
-def list_broker_orders(db: Session) -> list[dict[str, object]]:
+def list_broker_orders(
+    *,
+    settings: Settings,
+    db: Session,
+) -> list[dict[str, object]]:
     orders = db.scalars(
         select(BrokerOrder)
+        .where(BrokerOrder.mode == settings.runtime_mode)
         .options(selectinload(BrokerOrder.events))
         .order_by(BrokerOrder.created_at.desc(), BrokerOrder.id.desc()),
     ).all()
     return [serialize_broker_order(order) for order in orders]
 
 
-def list_execution_fills(db: Session) -> list[dict[str, object]]:
+def list_execution_fills(
+    *,
+    settings: Settings,
+    db: Session,
+) -> list[dict[str, object]]:
     fills = db.scalars(
-        select(ExecutionFill).order_by(ExecutionFill.filled_at.desc(), ExecutionFill.id.desc()),
+        select(ExecutionFill)
+        .join(ExecutionFill.broker_order)
+        .where(BrokerOrder.mode == settings.runtime_mode)
+        .order_by(ExecutionFill.filled_at.desc(), ExecutionFill.id.desc()),
     ).all()
     return [_serialize_execution_fill(fill) for fill in fills]
 
 
-def list_execution_positions(db: Session) -> list[dict[str, object]]:
+def list_execution_positions(
+    *,
+    settings: Settings,
+    db: Session,
+) -> list[dict[str, object]]:
     positions = db.scalars(
-        select(ExecutionPosition).order_by(ExecutionPosition.symbol.asc()),
+        select(ExecutionPosition)
+        .where(ExecutionPosition.mode == settings.runtime_mode)
+        .order_by(ExecutionPosition.symbol.asc()),
     ).all()
     return [_serialize_execution_position(position) for position in positions]
 
@@ -239,6 +256,8 @@ def serialize_broker_order_event(event) -> dict[str, object]:
         "created_at": _serialize_datetime(event.created_at),
         "updated_at": _serialize_datetime(event.updated_at),
     }
+
+
 def _serialize_execution_fill(fill: ExecutionFill) -> dict[str, object]:
     return {
         "execution_fill_id": fill.id,

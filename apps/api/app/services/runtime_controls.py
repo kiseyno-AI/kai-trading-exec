@@ -194,9 +194,6 @@ def enable_kill_switch(
     previous_state = _state_snapshot(state)
 
     if state.kill_switch_enabled:
-        if state.mode != settings.runtime_mode:
-            state.mode = settings.runtime_mode
-            previous_state = _state_snapshot(state)
         message = "kill switch is already active"
         outcome = "noop"
         return _finalize_action(

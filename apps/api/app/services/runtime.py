@@ -91,16 +91,28 @@ def build_runtime_safety(
     return runtime_safety_payload(state)
 
 
-def runtime_counts(db: Session) -> dict[str, int]:
+def runtime_counts(
+    *,
+    settings: Settings,
+    db: Session,
+) -> dict[str, int]:
     open_orders = db.scalar(
         select(func.count())
         .select_from(BrokerOrder)
-        .where(BrokerOrder.status.in_(OPEN_ORDER_STATUSES)),
+        .where(
+            BrokerOrder.mode == settings.runtime_mode,
+            BrokerOrder.status.in_(OPEN_ORDER_STATUSES),
+        ),
     )
     active_jobs = db.scalar(
         select(func.count())
         .select_from(ExecutionJob)
-        .where(ExecutionJob.status.in_(ACTIVE_JOB_STATUSES)),
+        .join(ExecutionJob.plan_item)
+        .join(ExecutionPlanItem.plan)
+        .where(
+            ExecutionPlan.mode == settings.runtime_mode,
+            ExecutionJob.status.in_(ACTIVE_JOB_STATUSES),
+        ),
     )
     return {
         "open_orders": int(open_orders or 0),
@@ -144,10 +156,8 @@ def runtime_symbol_summary(
         select(distinct(ExecutionFill.symbol))
         .select_from(ExecutionFill)
         .join(ExecutionFill.broker_order)
-        .join(BrokerOrder.plan_item)
-        .join(ExecutionPlanItem.plan)
         .where(
-            ExecutionPlan.mode == settings.runtime_mode,
+            BrokerOrder.mode == settings.runtime_mode,
             ExecutionFill.filled_at >= today_start_utc,
             ExecutionFill.filled_at < tomorrow_start_utc,
         )
@@ -155,10 +165,8 @@ def runtime_symbol_summary(
     failed_today = db.scalars(
         select(distinct(BrokerOrder.symbol))
         .select_from(BrokerOrder)
-        .join(BrokerOrder.plan_item)
-        .join(ExecutionPlanItem.plan)
         .where(
-            ExecutionPlan.mode == settings.runtime_mode,
+            BrokerOrder.mode == settings.runtime_mode,
             BrokerOrder.status.in_(FAILED_ORDER_STATUSES),
             failed_observed_at.is_not(None),
             failed_observed_at >= today_start_utc,
@@ -208,6 +216,11 @@ def monitoring_payload(
         or 0
     )
     checkpoints = db.scalars(select(MonitoringCheckpoint)).all()
+    checkpoints = [
+        checkpoint
+        for checkpoint in checkpoints
+        if checkpoint.mode == settings.runtime_mode
+    ]
     if not checkpoints:
         return {
             "status": "not_started",
@@ -420,7 +433,7 @@ def build_runtime_status(
     try:
         state = ensure_runtime_control_state(settings=settings, db=db)
         safety = runtime_safety_payload(state)
-        counts = runtime_counts(db)
+        counts = runtime_counts(settings=settings, db=db)
         monitoring = monitoring_payload(settings=settings, db=db)
         broker = build_broker_session_summary(settings=settings, db=db)
         symbols = runtime_symbol_summary(settings=settings, db=db)
