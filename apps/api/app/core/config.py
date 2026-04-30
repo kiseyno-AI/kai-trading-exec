@@ -20,7 +20,7 @@ class Settings(BaseModel):
     api_host: str = "127.0.0.1"
     api_port: int = Field(default=8010, ge=1, le=65535)
     automation_enabled: bool = False
-    autonomous_runtime_enabled: bool = True
+    autonomous_runtime_enabled: bool = False
     dispatch_loop_interval_seconds: float = Field(default=1.0, gt=0, le=3600)
     monitoring_loop_interval_seconds: float = Field(default=1.0, gt=0, le=3600)
     monitoring_max_symbols_per_cycle: int = Field(default=128, ge=1, le=10000)

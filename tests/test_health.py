@@ -123,6 +123,18 @@ def test_settings_load_from_environment() -> None:
     assert settings.log_level == "DEBUG"
 
 
+def test_autonomous_runtime_stays_opt_in_by_default() -> None:
+    default_settings = load_settings({})
+    assert default_settings.autonomous_runtime_enabled is False
+
+    opted_in_settings = load_settings(
+        {
+            "KAI_EXEC_AUTONOMOUS_RUNTIME_ENABLED": "true",
+        }
+    )
+    assert opted_in_settings.autonomous_runtime_enabled is True
+
+
 def test_health_returns_dependency_aware_payload() -> None:
     app, engine = build_test_app()
     client = TestClient(app)
