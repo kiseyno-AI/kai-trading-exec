@@ -104,6 +104,9 @@ KIS auth/session settings currently supported:
 - `KAI_EXEC_KIS_REQUEST_TIMEOUT_SECONDS`
 
 Monitoring runtime settings currently supported:
+- `KAI_EXEC_AUTONOMOUS_RUNTIME_ENABLED`
+- `KAI_EXEC_DISPATCH_LOOP_INTERVAL_SECONDS`
+- `KAI_EXEC_MONITORING_LOOP_INTERVAL_SECONDS`
 - `KAI_EXEC_MONITORING_MAX_SYMBOLS_PER_CYCLE`
 - `KAI_EXEC_MONITORING_MAX_BROKER_ACTIONS_PER_CYCLE`
 
@@ -117,8 +120,10 @@ Initial broker-order submission endpoint:
 
 Current execution slices:
 - `POST /execution-plans` schedules durable `execution_jobs` for eligible `next_open_buy` items
-- `POST /execution-jobs/dispatch` manually dispatches due jobs through the existing KIS adapter path
-- `POST /monitoring/evaluate` runs the shared symbol-monitoring scheduler against supplied price snapshots, round-robins triggered symbols, caps broker actions per cycle, persists dispatch backlog explicitly, and updates monitoring liveness checkpoints
+- the autonomous dispatch loop submits due jobs on its configured cadence
+- the autonomous monitoring loop retries persisted triggered/backlogged monitoring items on its configured cadence and can evaluate fresh triggers when a monitoring price source is configured
+- `POST /execution-jobs/dispatch` remains available as an operator/manual dispatch override
+- `POST /monitoring/evaluate` remains available as an operator/manual monitoring override; it runs the shared symbol-monitoring scheduler against supplied price snapshots, round-robins triggered symbols, caps broker actions per cycle, persists dispatch backlog explicitly, and updates monitoring liveness checkpoints
 
 ## Boot target
 

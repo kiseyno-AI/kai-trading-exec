@@ -20,6 +20,9 @@ class Settings(BaseModel):
     api_host: str = "127.0.0.1"
     api_port: int = Field(default=8010, ge=1, le=65535)
     automation_enabled: bool = False
+    autonomous_runtime_enabled: bool = False
+    dispatch_loop_interval_seconds: float = Field(default=1.0, gt=0, le=3600)
+    monitoring_loop_interval_seconds: float = Field(default=1.0, gt=0, le=3600)
     monitoring_max_symbols_per_cycle: int = Field(default=128, ge=1, le=10000)
     monitoring_max_broker_actions_per_cycle: int = Field(default=32, ge=1, le=10000)
     kis_app_key: str | None = None
@@ -53,6 +56,9 @@ _ENV_FIELDS = {
     "API_HOST": "api_host",
     "API_PORT": "api_port",
     "AUTOMATION_ENABLED": "automation_enabled",
+    "AUTONOMOUS_RUNTIME_ENABLED": "autonomous_runtime_enabled",
+    "DISPATCH_LOOP_INTERVAL_SECONDS": "dispatch_loop_interval_seconds",
+    "MONITORING_LOOP_INTERVAL_SECONDS": "monitoring_loop_interval_seconds",
     "MONITORING_MAX_SYMBOLS_PER_CYCLE": "monitoring_max_symbols_per_cycle",
     "MONITORING_MAX_BROKER_ACTIONS_PER_CYCLE": "monitoring_max_broker_actions_per_cycle",
     "KIS_APP_KEY": "kis_app_key",

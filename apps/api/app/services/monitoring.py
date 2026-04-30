@@ -8,7 +8,11 @@ from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, selectinload
 
-from app.api.schemas.execution import MonitoringEvaluationRequest, PlaceOrderRequest
+from app.api.schemas.execution import (
+    MonitoringEvaluationRequest,
+    MonitoringPriceRequest,
+    PlaceOrderRequest,
+)
 from app.broker.base import BrokerAdapter
 from app.core.config import Settings
 from app.models.runtime import ExecutionPlan, ExecutionPlanItem, ExecutionPosition, MonitoringCheckpoint
@@ -60,7 +64,7 @@ class EvaluateMonitoringResult:
 @dataclass(frozen=True)
 class PendingMonitoringAction:
     item: ExecutionPlanItem
-    observed_price: Decimal
+    observed_price: Decimal | None
 
 
 def materialize_monitoring_plan_items(plan: ExecutionPlan) -> None:
@@ -81,8 +85,63 @@ def evaluate_monitoring(
     command: MonitoringEvaluationRequest,
     now: datetime | None = None,
 ) -> EvaluateMonitoringResult:
-    triggered_at = _normalize_utc(now or command.observed_at or datetime.now(UTC))
-    prices = {price.symbol: price for price in command.prices}
+    return _evaluate_monitoring_cycle(
+        settings=settings,
+        db=db,
+        adapter=adapter,
+        prices={price.symbol: price for price in command.prices},
+        triggered_at=_normalize_utc(now or command.observed_at or datetime.now(UTC)),
+        allow_persisted_triggered_without_price=False,
+        update_checkpoint_if_idle=True,
+    )
+
+
+def run_autonomous_monitoring_cycle(
+    *,
+    settings: Settings,
+    db: Session,
+    adapter: BrokerAdapter,
+    prices: list[MonitoringPriceRequest] | None = None,
+    now: datetime | None = None,
+) -> EvaluateMonitoringResult:
+    return _evaluate_monitoring_cycle(
+        settings=settings,
+        db=db,
+        adapter=adapter,
+        prices={price.symbol: price for price in (prices or [])},
+        triggered_at=_normalize_utc(now or datetime.now(UTC)),
+        allow_persisted_triggered_without_price=True,
+        update_checkpoint_if_idle=False,
+    )
+
+
+def list_autonomous_monitoring_symbols(
+    *,
+    settings: Settings,
+    db: Session,
+) -> list[str]:
+    seen: set[str] = set()
+    symbols: list[str] = []
+    for item in _load_monitored_items(settings=settings, db=db):
+        if item.status in NON_MONITORABLE_PLAN_ITEM_STATUSES:
+            continue
+        if item.symbol in seen:
+            continue
+        seen.add(item.symbol)
+        symbols.append(item.symbol)
+    return symbols
+
+
+def _evaluate_monitoring_cycle(
+    *,
+    settings: Settings,
+    db: Session,
+    adapter: BrokerAdapter,
+    prices: dict[str, MonitoringPriceRequest],
+    triggered_at: datetime,
+    allow_persisted_triggered_without_price: bool,
+    update_checkpoint_if_idle: bool,
+) -> EvaluateMonitoringResult:
     remaining_quantities_by_symbol = _load_remaining_quantities_by_symbol(
         settings=settings,
         db=db,
@@ -95,43 +154,58 @@ def evaluate_monitoring(
     evaluated_symbols: set[str] = set()
     triggered_symbols: set[str] = set()
     submitted_symbols: set[str] = set()
+    retried_triggered_symbols: set[str] = set()
     triggered_item_count = 0
     submitted_order_count = 0
     blocked_item_count = 0
     deferred_item_count = 0
     dispatch_action_count = 0
+    retried_triggered_item_count = 0
 
     for item in items:
         if item.status in NON_MONITORABLE_PLAN_ITEM_STATUSES:
             continue
 
         price = prices.get(item.symbol)
-        if price is None:
+        observed_price = price.price if price is not None else None
+        retry_persisted_trigger = (
+            allow_persisted_triggered_without_price
+            and price is None
+            and item.status in (
+                BLOCKED_MONITORING_STATUSES | PENDING_DISPATCH_MONITORING_STATUSES
+            )
+        )
+        if price is None and not retry_persisted_trigger:
             continue
+
         evaluated_item_ids.append(item.id)
         evaluated_symbols.add(item.symbol)
         if not _monitoring_item_is_configured(item):
             item.status = _pending_configuration_status(item.intent)
             result_by_item_id[item.id] = _monitoring_result_payload(
                 item=item,
-                observed_price=price.price,
+                observed_price=observed_price,
                 outcome="invalid_configuration",
                 message="target/stop monitoring item is missing sell-side trigger configuration",
             )
             continue
 
-        if not _is_triggered(item=item, observed_price=price.price):
+        if price is not None and not _is_triggered(item=item, observed_price=price.price):
             if item.status in (
                 BLOCKED_MONITORING_STATUSES | PENDING_DISPATCH_MONITORING_STATUSES
             ):
                 item.status = _monitoring_status(item.intent)
             result_by_item_id[item.id] = _monitoring_result_payload(
                 item=item,
-                observed_price=price.price,
+                observed_price=observed_price,
                 outcome="waiting",
                 message="trigger condition not met",
             )
             continue
+
+        if retry_persisted_trigger:
+            retried_triggered_item_count += 1
+            retried_triggered_symbols.add(item.symbol)
 
         triggered_item_count += 1
         triggered_symbols.add(item.symbol)
@@ -139,7 +213,7 @@ def evaluate_monitoring(
             actions_by_symbol[item.symbol] = deque()
             symbol_order.append(item.symbol)
         actions_by_symbol[item.symbol].append(
-            PendingMonitoringAction(item=item, observed_price=price.price)
+            PendingMonitoringAction(item=item, observed_price=observed_price)
         )
 
     max_broker_actions = settings.monitoring_max_broker_actions_per_cycle
@@ -151,7 +225,9 @@ def evaluate_monitoring(
             continue
 
         action = symbol_actions.popleft()
-        if action.item.status in PENDING_DISPATCH_MONITORING_STATUSES:
+        if action.item.status in (
+            BLOCKED_MONITORING_STATUSES | PENDING_DISPATCH_MONITORING_STATUSES
+        ):
             action.item.status = _monitoring_status(action.item.intent)
         quantity = _resolve_sell_quantity(
             item=action.item,
@@ -261,24 +337,28 @@ def evaluate_monitoring(
         "price_count": len(prices),
         "evaluated_symbol_count": len(evaluated_symbols),
         "triggered_symbol_count": len(triggered_symbols),
+        "retried_triggered_item_count": retried_triggered_item_count,
+        "retried_triggered_symbols": sorted(retried_triggered_symbols),
         "submitted_symbols": sorted(submitted_symbols),
         "backlog_item_count": deferred_item_count,
         "backlog_symbols": sorted(backlog_symbols),
     }
 
-    checkpoint = _update_monitoring_checkpoint(
-        settings=settings,
-        db=db,
-        worker_name=MONITORING_WORKER_NAME,
-        triggered_at=triggered_at,
-        status="degraded" if deferred_item_count > 0 else "running",
-        details=checkpoint_details,
-    )
+    checkpoint = None
+    if items or update_checkpoint_if_idle:
+        checkpoint = _update_monitoring_checkpoint(
+            settings=settings,
+            db=db,
+            worker_name=MONITORING_WORKER_NAME,
+            triggered_at=triggered_at,
+            status="degraded" if deferred_item_count > 0 else "running",
+            details=checkpoint_details,
+        )
     return EvaluateMonitoringResult(
         status_code=200,
         payload={
             "triggered_at": triggered_at.isoformat(),
-            "worker_name": checkpoint.worker_name,
+            "worker_name": checkpoint.worker_name if checkpoint is not None else MONITORING_WORKER_NAME,
             "evaluated_item_count": len(results),
             "triggered_item_count": triggered_item_count,
             "submitted_order_count": submitted_order_count,
@@ -575,7 +655,7 @@ def _place_monitoring_order(
 def _monitoring_result_payload(
     *,
     item: ExecutionPlanItem,
-    observed_price: Decimal,
+    observed_price: Decimal | None,
     outcome: str,
     message: str | None = None,
     block_reason: object | None = None,

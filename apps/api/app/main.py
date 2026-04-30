@@ -17,6 +17,7 @@ from app.broker.kis import KisBrokerAdapter
 from app.core.config import Settings, get_settings
 from app.core.logging import configure_logging
 from app.db.session import create_db_engine, create_session_factory
+from app.services.autonomous_runtime import AutonomousRuntimeCoordinator
 from app.services.runtime import RuntimeMetadata
 
 LOGGER = logging.getLogger(__name__)
@@ -28,6 +29,7 @@ def create_app(
     engine: Engine | None = None,
     session_factory: sessionmaker[Session] | None = None,
     broker_adapter_factory: Callable[[Settings], BrokerAdapter] | None = None,
+    monitoring_price_source: object | None = None,
 ) -> FastAPI:
     app_settings = settings or get_settings()
     configure_logging(app_settings)
@@ -36,6 +38,15 @@ def create_app(
     db_session_factory = session_factory or create_session_factory(db_engine)
     runtime_metadata = RuntimeMetadata(
         started_at=datetime.now(UTC),
+    )
+    resolved_broker_adapter_factory = broker_adapter_factory or (
+        lambda current_settings: KisBrokerAdapter(settings=current_settings)
+    )
+    autonomous_runtime = AutonomousRuntimeCoordinator(
+        settings=app_settings,
+        session_factory=db_session_factory,
+        broker_adapter_factory=resolved_broker_adapter_factory,
+        monitoring_price_source=monitoring_price_source,
     )
 
     @asynccontextmanager
@@ -48,7 +59,9 @@ def create_app(
                 "runtime_mode": app_settings.runtime_mode,
             },
         )
+        await autonomous_runtime.start()
         yield
+        await autonomous_runtime.stop()
         LOGGER.info("service_stopping", extra={"service": app_settings.service_name})
 
     app = FastAPI(
@@ -60,9 +73,8 @@ def create_app(
     app.state.db_engine = db_engine
     app.state.db_session_factory = db_session_factory
     app.state.runtime_metadata = runtime_metadata
-    app.state.broker_adapter_factory = broker_adapter_factory or (
-        lambda current_settings: KisBrokerAdapter(settings=current_settings)
-    )
+    app.state.broker_adapter_factory = resolved_broker_adapter_factory
+    app.state.autonomous_runtime = autonomous_runtime
 
     app.include_router(health_router)
     app.include_router(runtime_router)
