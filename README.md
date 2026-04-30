@@ -150,4 +150,4 @@ First implementation target:
 
 ## Validation runbook
 
-Use [docs/LIVE_VALIDATION.md](/private/tmp/kai-trading-exec-issue-22/docs/LIVE_VALIDATION.md) for the guarded single-cycle live validation path, prerequisites, and failure handling notes.
+Use [docs/LIVE_VALIDATION.md](docs/LIVE_VALIDATION.md) for the guarded single-cycle live validation path, prerequisites, and failure handling notes.
