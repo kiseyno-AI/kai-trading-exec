@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session, selectinload
 
 from app.api.schemas.execution import MonitoringEvaluationRequest, PlaceOrderRequest
@@ -290,12 +290,51 @@ def _load_monitored_items(
     settings: Settings,
     db: Session,
 ) -> list[ExecutionPlanItem]:
+    symbol_candidates = (
+        select(
+            ExecutionPlanItem.symbol.label("symbol"),
+            ExecutionPlan.accepted_at.label("accepted_at"),
+            ExecutionPlan.id.label("plan_id"),
+            ExecutionPlanItem.plan_item_index.label("plan_item_index"),
+            ExecutionPlanItem.id.label("item_id"),
+            func.row_number()
+            .over(
+                partition_by=ExecutionPlanItem.symbol,
+                order_by=(
+                    ExecutionPlan.accepted_at.asc(),
+                    ExecutionPlan.id.asc(),
+                    ExecutionPlanItem.plan_item_index.asc(),
+                    ExecutionPlanItem.id.asc(),
+                ),
+            )
+            .label("symbol_rank"),
+        )
+        .join(ExecutionPlanItem.plan)
+        .where(
+            ExecutionPlan.mode == settings.runtime_mode,
+            ExecutionPlanItem.intent.in_(tuple(MONITORED_INTENTS)),
+        )
+        .subquery()
+    )
+    # Bound the working set by distinct symbol before loading per-symbol items.
+    selected_symbols = (
+        select(symbol_candidates.c.symbol)
+        .where(symbol_candidates.c.symbol_rank == 1)
+        .order_by(
+            symbol_candidates.c.accepted_at.asc(),
+            symbol_candidates.c.plan_id.asc(),
+            symbol_candidates.c.plan_item_index.asc(),
+            symbol_candidates.c.item_id.asc(),
+        )
+        .limit(settings.monitoring_max_symbols_per_cycle)
+    )
     return db.scalars(
         select(ExecutionPlanItem)
         .join(ExecutionPlanItem.plan)
         .where(
             ExecutionPlan.mode == settings.runtime_mode,
             ExecutionPlanItem.intent.in_(tuple(MONITORED_INTENTS)),
+            ExecutionPlanItem.symbol.in_(selected_symbols),
         )
         .options(selectinload(ExecutionPlanItem.plan))
         .order_by(
