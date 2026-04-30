@@ -70,6 +70,7 @@ Useful checks:
 ```bash
 curl http://127.0.0.1:8010/health
 curl http://127.0.0.1:8010/runtime/status
+curl http://127.0.0.1:8010/runtime/daily-board
 curl http://127.0.0.1:8010/broker/session
 curl http://127.0.0.1:8010/execution-jobs
 curl -X POST http://127.0.0.1:8010/execution-jobs/dispatch
@@ -77,6 +78,8 @@ curl -X POST http://127.0.0.1:8010/monitoring/evaluate \
   -H 'content-type: application/json' \
   -d '{"prices":[{"symbol":"005930","price":"125100.00"}]}'
 curl http://127.0.0.1:8010/orders
+curl http://127.0.0.1:8010/symbols
+curl http://127.0.0.1:8010/symbols/005930
 ```
 
 The default database is `sqlite:///./var/kai_trading_exec.db`. Override settings
@@ -124,6 +127,9 @@ Current execution slices:
 - the autonomous monitoring loop retries persisted triggered/backlogged monitoring items on its configured cadence and can evaluate fresh triggers when a monitoring price source is configured
 - `POST /execution-jobs/dispatch` remains available as an operator/manual dispatch override
 - `POST /monitoring/evaluate` remains available as an operator/manual monitoring override; it runs the shared symbol-monitoring scheduler against supplied price snapshots, round-robins triggered symbols, caps broker actions per cycle, persists dispatch backlog explicitly, and updates monitoring liveness checkpoints
+- `GET /symbols` exposes symbol-level readback rows for core/web consumers
+- `GET /symbols/{symbol}` exposes per-symbol execution, monitoring, order, fill, and position history
+- `GET /runtime/daily-board` exposes a compact current-day board with runtime status plus symbol rows
 
 ## Boot target
 
@@ -141,3 +147,7 @@ First implementation target:
 - `kai-trading-core`: strategy, planning, dashboards, long-horizon orchestration
 - `kai-trading-web`: UI and operator console
 - `kai-trading-exec`: low-latency trading execution runtime
+
+## Validation runbook
+
+Use [docs/LIVE_VALIDATION.md](/private/tmp/kai-trading-exec-issue-22/docs/LIVE_VALIDATION.md) for the guarded single-cycle live validation path, prerequisites, and failure handling notes.

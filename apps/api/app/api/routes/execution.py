@@ -1,6 +1,6 @@
 from typing import Annotated
 
-from fastapi import APIRouter, Body, Depends, Request
+from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 
@@ -15,10 +15,12 @@ from app.core.config import Settings
 from app.services.broker_orders import place_broker_order
 from app.services.execution_api import (
     create_execution_plan,
+    get_runtime_symbol_detail,
     list_broker_orders,
     list_execution_fills,
     list_execution_plans,
     list_execution_positions,
+    list_runtime_symbols,
 )
 from app.services.execution_jobs import dispatch_due_execution_jobs, list_execution_jobs
 from app.services.monitoring import evaluate_monitoring
@@ -139,3 +141,29 @@ def positions(
 ) -> list[dict[str, object]]:
     settings: Settings = get_settings(request)
     return list_execution_positions(settings=settings, db=db)
+
+
+@router.get("/symbols")
+def symbols(
+    request: Request,
+    db: Annotated[Session, Depends(get_db_session)],
+) -> list[dict[str, object]]:
+    settings: Settings = get_settings(request)
+    return list_runtime_symbols(settings=settings, db=db)
+
+
+@router.get("/symbols/{symbol}")
+def symbol_detail(
+    symbol: str,
+    request: Request,
+    db: Annotated[Session, Depends(get_db_session)],
+) -> dict[str, object]:
+    settings: Settings = get_settings(request)
+    payload = get_runtime_symbol_detail(
+        settings=settings,
+        db=db,
+        symbol=symbol,
+    )
+    if payload is None:
+        raise HTTPException(status_code=404, detail="symbol was not found")
+    return payload

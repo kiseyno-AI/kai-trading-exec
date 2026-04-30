@@ -23,6 +23,7 @@ from app.services.monitoring import (
     PENDING_DISPATCH_MONITORING_STATUSES,
 )
 from app.services.broker_auth import build_broker_session_summary
+from app.services.execution_api import list_runtime_symbols
 from app.services.schema import check_runtime_schema
 from app.services.runtime_controls import (
     ensure_runtime_control_state,
@@ -470,6 +471,43 @@ def build_runtime_status(
         },
         "broker": broker,
         "counts": counts,
+        "symbols": symbols,
+    }
+
+
+def build_runtime_daily_board(
+    *,
+    settings: Settings,
+    runtime: RuntimeMetadata,
+    db: Session,
+    autonomous_runtime: dict[str, object] | None = None,
+) -> dict[str, object]:
+    runtime_status = build_runtime_status(
+        settings=settings,
+        runtime=runtime,
+        db=db,
+        autonomous_runtime=autonomous_runtime,
+    )
+    symbols: list[dict[str, object]] = []
+    if runtime_status["dependencies"]["database"] == "ok" and runtime_status["dependencies"]["runtime_schema"] == "ok":
+        try:
+            symbols = list_runtime_symbols(settings=settings, db=db)
+        except SQLAlchemyError:
+            db.rollback()
+            symbols = []
+
+    return {
+        "generated_at": datetime.now(UTC).isoformat(),
+        "market_date": datetime.now(KRX_TIMEZONE).date().isoformat(),
+        "mode": settings.runtime_mode,
+        "runtime": runtime_status,
+        "totals": {
+            "symbol_count": len(symbols),
+            "monitored_symbol_count": sum(symbol["monitored"] for symbol in symbols),
+            "open_order_symbol_count": sum(symbol["open_order_count"] > 0 for symbol in symbols),
+            "filled_symbol_count": sum(symbol["fill_count"] > 0 for symbol in symbols),
+            "position_symbol_count": sum(symbol["position_quantity"] > 0 for symbol in symbols),
+        },
         "symbols": symbols,
     }
 
