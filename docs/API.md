@@ -37,6 +37,16 @@ Current foundation response includes:
 - `safety.kill_switch_enabled`
 - `safety.automation_enabled`
 - `liveness.monitoring`
+  - `status` (`not_started`, `running`, `degraded`)
+  - `topology` (`shared_symbol_scheduler`)
+  - `scheduler.selection_strategy`
+  - `scheduler.max_symbols_per_cycle`
+  - `dispatcher.max_broker_actions_per_cycle`
+  - `dispatcher.last_cycle_action_count`
+  - `dispatcher.backlog_item_count`
+  - `dispatcher.backlog_symbols[]`
+  - `last_success_at`
+  - `last_cycle`
 - `counts.open_orders`
 - `counts.active_execution_jobs`
 - `symbols.monitored`
@@ -178,6 +188,7 @@ Current response includes:
 - `triggered_item_count`
 - `submitted_order_count`
 - `blocked_item_count`
+- `deferred_item_count`
 - `items[]`
   - `execution_plan_item_id`
   - `symbol`
@@ -188,6 +199,14 @@ Current response includes:
   - `message`
   - `block_reason`
   - `order`
+
+Triggered sell actions are dispatched through a shared symbol scheduler. The
+current scheduler:
+- preserves persisted plan-item order within each symbol
+- round-robins across symbols before draining one symbol
+- caps broker-order attempts per evaluation cycle
+- leaves excess triggered items in an explicit pending-dispatch backlog that
+  surfaces as degraded monitoring status in `GET /runtime/status`
 
 ### `GET /orders`
 List broker orders with internal normalized statuses.

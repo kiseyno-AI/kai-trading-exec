@@ -169,7 +169,10 @@ class ExecutionPlan(TimestampMixin, Base):
     )
     raw_payload: Mapped[dict[str, Any] | None] = mapped_column(JSON)
 
-    items: Mapped[list["ExecutionPlanItem"]] = relationship(back_populates="plan")
+    items: Mapped[list["ExecutionPlanItem"]] = relationship(
+        back_populates="plan",
+        order_by="ExecutionPlanItem.plan_item_index",
+    )
 
 
 class ExecutionPlanItem(TimestampMixin, Base):
@@ -181,6 +184,7 @@ class ExecutionPlanItem(TimestampMixin, Base):
         nullable=False,
         index=True,
     )
+    plan_item_index: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     symbol: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
     side: Mapped[str] = mapped_column(String(16), nullable=False)
     intent: Mapped[str] = mapped_column(String(64), nullable=False)

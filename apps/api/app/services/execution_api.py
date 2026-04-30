@@ -40,6 +40,7 @@ def create_execution_plan(
         raw_payload=command.model_dump(mode="json"),
         items=[
             ExecutionPlanItem(
+                plan_item_index=index,
                 symbol=item.symbol,
                 side=item.side,
                 intent=item.intent,
@@ -51,7 +52,7 @@ def create_execution_plan(
                 risk_context=item.risk_context,
                 decision_snapshot_id=item.decision_snapshot_id,
             )
-            for item in command.items
+            for index, item in enumerate(command.items)
         ],
     )
     from app.services.execution_jobs import materialize_execution_jobs
@@ -141,6 +142,7 @@ def _serialize_execution_plan(plan: ExecutionPlan) -> dict[str, object]:
     items = sorted(
         plan.items,
         key=lambda item: (
+            item.plan_item_index,
             item.created_at,
             item.id,
         ),
