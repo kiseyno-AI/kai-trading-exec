@@ -827,6 +827,7 @@ def test_restart_preserves_reconciliation_positions_for_monitoring_evaluation(
     with app.state.db_session_factory() as session:
         session.add(
             ExecutionPosition(
+                mode="paper",
                 symbol="005930",
                 quantity=10,
                 average_price=Decimal("120000.0000"),
@@ -1363,6 +1364,7 @@ def test_monitoring_evaluate_triggers_target_sell_order_from_position_and_price_
     with app.state.db_session_factory() as session:
         session.add(
             ExecutionPosition(
+                mode="paper",
                 symbol="005930",
                 quantity=10,
                 average_price=Decimal("120000.0000"),
@@ -1484,6 +1486,7 @@ def test_monitoring_evaluate_reports_blocked_stop_sell_trigger_when_runtime_is_p
     with app.state.db_session_factory() as session:
         session.add(
             ExecutionPosition(
+                mode="paper",
                 symbol="005930",
                 quantity=10,
                 average_price=Decimal("70950.5000"),
@@ -1609,6 +1612,7 @@ def test_monitoring_evaluate_tracks_remaining_shares_across_triggered_items() ->
     with app.state.db_session_factory() as session:
         session.add(
             ExecutionPosition(
+                mode="paper",
                 symbol="005930",
                 quantity=10,
                 average_price=Decimal("120000.0000"),
@@ -1760,6 +1764,7 @@ def test_monitoring_evaluate_round_robins_symbols_when_dispatch_capacity_is_boun
         session.add_all(
             [
                 ExecutionPosition(
+                    mode="paper",
                     symbol="005930",
                     quantity=2,
                     average_price=Decimal("120000.0000"),
@@ -1767,6 +1772,7 @@ def test_monitoring_evaluate_round_robins_symbols_when_dispatch_capacity_is_boun
                     raw_payload={"source": "broker"},
                 ),
                 ExecutionPosition(
+                    mode="paper",
                     symbol="000660",
                     quantity=1,
                     average_price=Decimal("88000.0000"),
@@ -1918,6 +1924,7 @@ def test_monitoring_evaluate_limits_loaded_symbols_per_cycle() -> None:
         session.add_all(
             [
                 ExecutionPosition(
+                    mode="paper",
                     symbol="005930",
                     quantity=1,
                     average_price=Decimal("120000.0000"),
@@ -1925,6 +1932,7 @@ def test_monitoring_evaluate_limits_loaded_symbols_per_cycle() -> None:
                     raw_payload={"source": "broker"},
                 ),
                 ExecutionPosition(
+                    mode="paper",
                     symbol="000660",
                     quantity=1,
                     average_price=Decimal("88000.0000"),
@@ -1932,6 +1940,7 @@ def test_monitoring_evaluate_limits_loaded_symbols_per_cycle() -> None:
                     raw_payload={"source": "broker"},
                 ),
                 ExecutionPosition(
+                    mode="paper",
                     symbol="035420",
                     quantity=1,
                     average_price=Decimal("175000.0000"),
@@ -2065,6 +2074,95 @@ def test_place_order_endpoint_is_idempotent() -> None:
         assert len(orders) == 1
 
     engine.dispose()
+
+
+def test_place_order_idempotency_keys_are_scoped_to_runtime_mode(tmp_path) -> None:
+    database_url = f"sqlite:///{tmp_path / 'cross-mode-idempotency.db'}"
+    paper_app, paper_engine = build_test_app(
+        settings=Settings(
+            database_url=database_url,
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+        ),
+        broker_adapter=StubBrokerAdapter(
+            config=BrokerConfig(
+                provider="kis",
+                mode="paper",
+                configured=True,
+                api_base_url=KIS_PAPER_API_BASE_URL,
+            ),
+            token_grant=build_token_grant(),
+            order_placement=build_order_placement(broker_order_id="paper-order-100"),
+        ),
+    )
+    live_app, live_engine = build_test_app(
+        settings=Settings(
+            database_url=database_url,
+            runtime_mode="live",
+            kis_app_key="live-key",
+            kis_app_secret="live-secret",
+            kis_account_number="87654321",
+        ),
+        broker_adapter=StubBrokerAdapter(
+            config=BrokerConfig(
+                provider="kis",
+                mode="live",
+                configured=True,
+                api_base_url=KIS_LIVE_API_BASE_URL,
+            ),
+            token_grant=build_token_grant(),
+            order_placement=build_order_placement(broker_order_id="live-order-100"),
+        ),
+    )
+    paper_client = TestClient(paper_app)
+    live_client = TestClient(live_app)
+
+    for client in (paper_client, live_client):
+        client.post(
+            "/controls/resume",
+            json={"actor": "ops", "source": "console", "reason": "enable automation"},
+        )
+
+    payload = {
+        "idempotency_key": "cross-mode-repeat-order-1",
+        "symbol": "005930",
+        "side": "buy",
+        "quantity": 5,
+        "order_type": "limit",
+        "limit_price": "71000.00",
+        "time_in_force": "day",
+        "exchange": "KRX",
+    }
+
+    paper_response = paper_client.post("/orders", json=payload)
+    live_response = live_client.post("/orders", json=payload)
+
+    assert paper_response.status_code == 201
+    assert live_response.status_code == 201
+    assert paper_response.json()["duplicate"] is False
+    assert live_response.json()["duplicate"] is False
+    assert paper_response.json()["order"]["broker_order_id"] == "paper-order-100"
+    assert live_response.json()["order"]["broker_order_id"] == "live-order-100"
+
+    assert [order["broker_order_id"] for order in paper_client.get("/orders").json()] == [
+        "paper-order-100"
+    ]
+    assert [order["broker_order_id"] for order in live_client.get("/orders").json()] == [
+        "live-order-100"
+    ]
+
+    with paper_app.state.db_session_factory() as session:
+        orders = session.scalars(
+            select(BrokerOrder)
+            .where(BrokerOrder.idempotency_key == payload["idempotency_key"])
+            .order_by(BrokerOrder.mode.asc())
+        ).all()
+        assert [order.mode for order in orders] == ["live", "paper"]
+
+    paper_engine.dispose()
+    live_engine.dispose()
 
 
 @pytest.mark.parametrize(

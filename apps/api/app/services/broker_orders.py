@@ -41,7 +41,11 @@ def place_broker_order(
     command: PlaceOrderRequest,
     request_source: str = "post:/orders",
 ) -> PlaceBrokerOrderResult:
-    existing = _load_order_by_idempotency_key(db=db, idempotency_key=command.idempotency_key)
+    existing = _load_order_by_idempotency_key(
+        settings=settings,
+        db=db,
+        idempotency_key=command.idempotency_key,
+    )
     if existing is not None:
         return PlaceBrokerOrderResult(
             status_code=200,
@@ -83,6 +87,7 @@ def place_broker_order(
     order = BrokerOrder(
         broker_name=adapter.provider,
         execution_plan_item_id=plan_item.id if plan_item else None,
+        mode=settings.runtime_mode,
         idempotency_key=command.idempotency_key,
         symbol=command.symbol,
         side=command.side,
@@ -101,6 +106,7 @@ def place_broker_order(
     except IntegrityError:
         db.rollback()
         duplicate = _load_order_by_idempotency_key(
+            settings=settings,
             db=db,
             idempotency_key=command.idempotency_key,
         )
@@ -187,6 +193,7 @@ def place_broker_order(
                 "message": str(exc),
                 "order": serialize_broker_order(
                     _load_order_by_idempotency_key(
+                        settings=settings,
                         db=db,
                         idempotency_key=command.idempotency_key,
                     )
@@ -225,7 +232,11 @@ def place_broker_order(
         plan_item.status = _plan_item_status_for_order_status(order.status)
 
     db.commit()
-    persisted = _load_order_by_idempotency_key(db=db, idempotency_key=command.idempotency_key)
+    persisted = _load_order_by_idempotency_key(
+        settings=settings,
+        db=db,
+        idempotency_key=command.idempotency_key,
+    )
     return PlaceBrokerOrderResult(
         status_code=201,
         payload={
@@ -238,12 +249,16 @@ def place_broker_order(
 
 def _load_order_by_idempotency_key(
     *,
+    settings: Settings,
     db: Session,
     idempotency_key: str,
 ) -> BrokerOrder | None:
     return db.scalar(
         select(BrokerOrder)
-        .where(BrokerOrder.idempotency_key == idempotency_key)
+        .where(
+            BrokerOrder.mode == settings.runtime_mode,
+            BrokerOrder.idempotency_key == idempotency_key,
+        )
         .options(selectinload(BrokerOrder.events))
     )
 

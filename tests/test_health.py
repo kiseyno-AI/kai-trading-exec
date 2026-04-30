@@ -892,6 +892,7 @@ def test_order_execution_and_position_read_endpoints_return_persisted_state() ->
 
         order = BrokerOrder(
             execution_plan_item_id=item.id,
+            mode="mock",
             idempotency_key="broker-order-1",
             broker_order_id="kis-100",
             symbol="005930",
@@ -920,6 +921,7 @@ def test_order_execution_and_position_read_endpoints_return_persisted_state() ->
         )
         session.add(
             ExecutionPosition(
+                mode="mock",
                 symbol="005930",
                 quantity=10,
                 average_price=Decimal("70950.5000"),
@@ -956,6 +958,126 @@ def test_order_execution_and_position_read_endpoints_return_persisted_state() ->
     assert len(positions_payload) == 1
     assert positions_payload[0]["symbol"] == "005930"
     assert positions_payload[0]["average_price"] == "70950.5000"
+
+    engine.dispose()
+
+
+def test_order_execution_and_position_reads_are_filtered_to_active_runtime_mode() -> None:
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+        )
+    )
+
+    with app.state.db_session_factory() as session:
+        paper_plan = ExecutionPlan(
+            external_plan_id="paper-read-plan",
+            source="kai-trading-core",
+            mode="paper",
+            status="accepted",
+        )
+        paper_item = ExecutionPlanItem(
+            symbol="005930",
+            side="buy",
+            intent="next_open_buy",
+            status="pending",
+        )
+        paper_plan.items.append(paper_item)
+
+        live_plan = ExecutionPlan(
+            external_plan_id="live-read-plan",
+            source="kai-trading-core",
+            mode="live",
+            status="accepted",
+        )
+        live_item = ExecutionPlanItem(
+            symbol="005930",
+            side="buy",
+            intent="next_open_buy",
+            status="pending",
+        )
+        live_plan.items.append(live_item)
+        session.add_all([paper_plan, live_plan])
+        session.flush()
+
+        paper_order = BrokerOrder(
+            execution_plan_item_id=paper_item.id,
+            mode="paper",
+            idempotency_key="paper-order-read-1",
+            broker_order_id="paper-order-100",
+            symbol="005930",
+            side="buy",
+            status="open",
+            quantity=2,
+            limit_price=Decimal("71000.0000"),
+            submitted_at=datetime(2026, 4, 29, 9, 1, tzinfo=UTC),
+        )
+        live_order = BrokerOrder(
+            execution_plan_item_id=live_item.id,
+            mode="live",
+            idempotency_key="live-order-read-1",
+            broker_order_id="live-order-100",
+            symbol="005930",
+            side="buy",
+            status="open",
+            quantity=3,
+            limit_price=Decimal("72000.0000"),
+            submitted_at=datetime(2026, 4, 29, 9, 2, tzinfo=UTC),
+        )
+        session.add_all([paper_order, live_order])
+        session.flush()
+
+        session.add_all(
+            [
+                ExecutionFill(
+                    broker_order_pk=paper_order.id,
+                    broker_fill_id="paper-fill-1",
+                    symbol="005930",
+                    side="buy",
+                    quantity=2,
+                    price=Decimal("70950.0000"),
+                    filled_at=datetime(2026, 4, 29, 9, 3, tzinfo=UTC),
+                ),
+                ExecutionFill(
+                    broker_order_pk=live_order.id,
+                    broker_fill_id="live-fill-1",
+                    symbol="005930",
+                    side="buy",
+                    quantity=3,
+                    price=Decimal("71950.0000"),
+                    filled_at=datetime(2026, 4, 29, 9, 4, tzinfo=UTC),
+                ),
+                ExecutionPosition(
+                    mode="paper",
+                    symbol="005930",
+                    quantity=2,
+                    average_price=Decimal("70950.0000"),
+                    updated_from="reconciliation",
+                ),
+                ExecutionPosition(
+                    mode="live",
+                    symbol="005930",
+                    quantity=3,
+                    average_price=Decimal("71950.0000"),
+                    updated_from="reconciliation",
+                ),
+            ]
+        )
+        session.commit()
+
+    client = TestClient(app)
+
+    orders_payload = client.get("/orders").json()
+    executions_payload = client.get("/executions").json()
+    positions_payload = client.get("/positions").json()
+
+    assert [order["broker_order_id"] for order in orders_payload] == ["paper-order-100"]
+    assert [fill["broker_fill_id"] for fill in executions_payload] == ["paper-fill-1"]
+    assert len(positions_payload) == 1
+    assert positions_payload[0]["symbol"] == "005930"
+    assert positions_payload[0]["quantity"] == 2
+    assert positions_payload[0]["average_price"] == "70950.0000"
 
     engine.dispose()
 
@@ -1053,6 +1175,7 @@ def test_runtime_status_exposes_core_facing_symbol_summary() -> None:
         )
         open_order = BrokerOrder(
             execution_plan_item_id=scheduled_item.id,
+            mode="paper",
             idempotency_key="paper-open-order",
             broker_order_id="kis-open-1",
             symbol="000660",
@@ -1064,6 +1187,7 @@ def test_runtime_status_exposes_core_facing_symbol_summary() -> None:
         )
         failed_order = BrokerOrder(
             execution_plan_item_id=failed_item.id,
+            mode="paper",
             idempotency_key="paper-failed-order",
             broker_order_id="kis-failed-1",
             symbol="035420",
@@ -1076,6 +1200,7 @@ def test_runtime_status_exposes_core_facing_symbol_summary() -> None:
         )
         historical_failed_order = BrokerOrder(
             execution_plan_item_id=historical_failed_item.id,
+            mode="paper",
             idempotency_key="paper-failed-order-yesterday",
             broker_order_id="kis-failed-2",
             symbol="051910",
@@ -1088,6 +1213,7 @@ def test_runtime_status_exposes_core_facing_symbol_summary() -> None:
         )
         historical_filled_order = BrokerOrder(
             execution_plan_item_id=historical_fill_item.id,
+            mode="paper",
             idempotency_key="paper-filled-order-yesterday",
             broker_order_id="kis-filled-2",
             symbol="066570",
@@ -1170,5 +1296,88 @@ def test_runtime_status_exposes_core_facing_symbol_summary() -> None:
         "filled_today": ["000660"],
         "failed_today": ["035420"],
     }
+
+    engine.dispose()
+
+
+def test_runtime_status_counts_are_filtered_to_active_runtime_mode() -> None:
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+        )
+    )
+
+    with app.state.db_session_factory() as session:
+        paper_plan = ExecutionPlan(
+            external_plan_id="paper-count-plan",
+            source="kai-trading-core",
+            mode="paper",
+            status="accepted",
+        )
+        paper_item = ExecutionPlanItem(
+            symbol="005930",
+            side="buy",
+            intent="next_open_buy",
+            status="next_open_buy_scheduled",
+        )
+        paper_plan.items.append(paper_item)
+
+        live_plan = ExecutionPlan(
+            external_plan_id="live-count-plan",
+            source="kai-trading-core",
+            mode="live",
+            status="accepted",
+        )
+        live_item = ExecutionPlanItem(
+            symbol="000660",
+            side="buy",
+            intent="next_open_buy",
+            status="next_open_buy_scheduled",
+        )
+        live_plan.items.append(live_item)
+        session.add_all([paper_plan, live_plan])
+        session.flush()
+
+        session.add_all(
+            [
+                ExecutionJob(
+                    execution_plan_item_id=paper_item.id,
+                    job_type="next_open_buy",
+                    status="scheduled",
+                ),
+                ExecutionJob(
+                    execution_plan_item_id=live_item.id,
+                    job_type="next_open_buy",
+                    status="running",
+                ),
+                BrokerOrder(
+                    execution_plan_item_id=paper_item.id,
+                    mode="paper",
+                    idempotency_key="paper-count-order",
+                    broker_order_id="paper-count-order-1",
+                    symbol="005930",
+                    side="buy",
+                    status="open",
+                    quantity=1,
+                ),
+                BrokerOrder(
+                    execution_plan_item_id=live_item.id,
+                    mode="live",
+                    idempotency_key="live-count-order",
+                    broker_order_id="live-count-order-1",
+                    symbol="000660",
+                    side="buy",
+                    status="open",
+                    quantity=1,
+                ),
+            ]
+        )
+        session.commit()
+
+    client = TestClient(app)
+    payload = client.get("/runtime/status").json()
+
+    assert payload["counts"] == {"open_orders": 1, "active_execution_jobs": 1}
 
     engine.dispose()

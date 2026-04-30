@@ -304,6 +304,7 @@ def _dispatch_job(
         )
     if order_status is None:
         order_status = _load_order_status(
+            settings=settings,
             db=db,
             idempotency_key=command.idempotency_key,
         )
@@ -357,11 +358,15 @@ def _finish_job(
 
 def _load_order_status(
     *,
+    settings: Settings,
     db: Session,
     idempotency_key: str,
 ) -> str | None:
     return db.scalar(
-        select(BrokerOrder.status).where(BrokerOrder.idempotency_key == idempotency_key)
+        select(BrokerOrder.status).where(
+            BrokerOrder.mode == settings.runtime_mode,
+            BrokerOrder.idempotency_key == idempotency_key,
+        )
     )
 
 
