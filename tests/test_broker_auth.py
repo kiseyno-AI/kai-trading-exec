@@ -34,6 +34,7 @@ from app.models.runtime import (
     BrokerOrderEvent,
     BrokerSession,
     BrokerSessionEvent,
+    ExecutionFill,
     ExecutionJob,
     ExecutionPlanItem,
     ExecutionPosition,
@@ -2445,6 +2446,168 @@ def test_place_order_endpoint_persists_retryable_failure() -> None:
         assert order is not None
         assert order.status == "retry_pending"
         assert order.last_error_code == "RATE_LIMIT"
+
+    engine.dispose()
+
+
+def test_live_mode_cycle_exposes_symbol_readback_and_daily_board_views() -> None:
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="live",
+            configured=True,
+            api_base_url=KIS_LIVE_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(broker_order_id="kis-live-cycle-1"),
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="live",
+            kis_app_key="live-key",
+            kis_app_secret="live-secret",
+            kis_account_number="12345678",
+        ),
+        broker_adapter=broker_adapter,
+    )
+    client = TestClient(app)
+
+    resume = client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "console", "reason": "enable guarded live validation"},
+    )
+    assert resume.status_code == 200
+
+    plan_response = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-live-readback-cycle",
+            "source": "kai-trading-core",
+            "market_date": "2024-01-03",
+            "items": [
+                {
+                    "symbol": "005930",
+                    "side": "buy",
+                    "intent": "next_open_buy",
+                    "quantity_policy": {"kind": "shares", "quantity": 3},
+                    "limit_price": "71000.00",
+                    "time_in_force": "day",
+                    "risk_context": {"exchange": "KRX"},
+                },
+                {
+                    "symbol": "005930",
+                    "side": "sell",
+                    "intent": "target_sell",
+                    "quantity_policy": {"kind": "shares", "quantity": 3},
+                    "trigger_price": "76000.00",
+                    "time_in_force": "day",
+                    "risk_context": {"exchange": "KRX"},
+                },
+            ],
+        },
+    )
+    assert plan_response.status_code == 201
+    buy_item_id, monitor_item_id = plan_response.json()["persisted_execution_item_ids"]
+
+    dispatch_response = client.post("/execution-jobs/dispatch")
+    assert dispatch_response.status_code == 200
+    dispatch_payload = dispatch_response.json()
+    assert dispatch_payload["completed_job_count"] == 1
+    assert dispatch_payload["jobs"][0]["execution_plan_item_id"] == buy_item_id
+    assert dispatch_payload["jobs"][0]["status"] == "completed"
+
+    with app.state.db_session_factory() as session:
+        order = session.scalar(
+            select(BrokerOrder).where(BrokerOrder.execution_plan_item_id == buy_item_id)
+        )
+        assert order is not None
+        session.add(
+            ExecutionFill(
+                broker_order_pk=order.id,
+                broker_fill_id="fill-live-cycle-1",
+                symbol="005930",
+                side="buy",
+                quantity=3,
+                price=Decimal("71000.0000"),
+                filled_at=datetime(2026, 4, 30, 9, 5, tzinfo=UTC),
+                payload={"source": "broker"},
+            )
+        )
+        session.add(
+            ExecutionPosition(
+                mode="live",
+                symbol="005930",
+                quantity=3,
+                average_price=Decimal("71000.0000"),
+                updated_from="reconciliation",
+                raw_payload={"source": "broker"},
+            )
+        )
+        session.commit()
+
+    plans_payload = client.get("/execution-plans").json()
+    orders_payload = client.get("/orders").json()
+    executions_payload = client.get("/executions").json()
+    positions_payload = client.get("/positions").json()
+    symbols_payload = client.get("/symbols").json()
+    symbol_detail_payload = client.get("/symbols/005930").json()
+    runtime_status_payload = client.get("/runtime/status").json()
+    daily_board_payload = client.get("/runtime/daily-board").json()
+
+    assert len(plans_payload) == 1
+    assert plans_payload[0]["mode"] == "live"
+    assert plans_payload[0]["item_count"] == 2
+    assert len(orders_payload) == 1
+    assert orders_payload[0]["broker_order_id"] == "kis-live-cycle-1"
+    assert len(executions_payload) == 1
+    assert executions_payload[0]["broker_fill_id"] == "fill-live-cycle-1"
+    assert len(positions_payload) == 1
+    assert positions_payload[0]["symbol"] == "005930"
+    assert positions_payload[0]["quantity"] == 3
+
+    assert len(symbols_payload) == 1
+    assert symbols_payload[0]["symbol"] == "005930"
+    assert symbols_payload[0]["monitored"] is True
+    assert symbols_payload[0]["plan_item_count"] == 2
+    assert symbols_payload[0]["order_count"] == 1
+    assert symbols_payload[0]["fill_count"] == 1
+    assert symbols_payload[0]["position_quantity"] == 3
+    assert symbols_payload[0]["monitoring_statuses"] == ["target_sell_monitoring"]
+
+    assert symbol_detail_payload["symbol"] == "005930"
+    assert symbol_detail_payload["mode"] == "live"
+    assert symbol_detail_payload["summary"]["monitored"] is True
+    assert symbol_detail_payload["summary"]["fill_count"] == 1
+    assert symbol_detail_payload["position"]["quantity"] == 3
+    assert len(symbol_detail_payload["plan_items"]) == 2
+    assert len(symbol_detail_payload["orders"]) == 1
+    assert len(symbol_detail_payload["fills"]) == 1
+    assert {item["execution_plan_item_id"] for item in symbol_detail_payload["plan_items"]} == {
+        buy_item_id,
+        monitor_item_id,
+    }
+
+    assert runtime_status_payload["mode"] == "live"
+    assert runtime_status_payload["broker"]["status"] == "active"
+    assert runtime_status_payload["symbols"]["monitored"] == ["005930"]
+    assert runtime_status_payload["counts"]["open_orders"] == 1
+    assert runtime_status_payload["counts"]["active_execution_jobs"] == 0
+
+    assert daily_board_payload["mode"] == "live"
+    assert daily_board_payload["runtime"]["mode"] == "live"
+    assert daily_board_payload["totals"] == {
+        "symbol_count": 1,
+        "monitored_symbol_count": 1,
+        "open_order_symbol_count": 1,
+        "filled_symbol_count": 1,
+        "position_symbol_count": 1,
+    }
+    assert len(daily_board_payload["symbols"]) == 1
+    assert daily_board_payload["symbols"][0]["symbol"] == "005930"
+
+    missing_symbol_response = client.get("/symbols/000660")
+    assert missing_symbol_response.status_code == 404
 
     engine.dispose()
 

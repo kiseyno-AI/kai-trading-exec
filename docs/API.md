@@ -75,6 +75,37 @@ Current foundation response includes:
 - `symbols.filled_today`
 - `symbols.failed_today`
 
+### `GET /runtime/daily-board`
+Returns a compact current-KRX-day board for core/web/operator readback.
+
+Current response includes:
+- `generated_at`
+- `market_date`
+- `mode`
+- `runtime`
+  - the full `GET /runtime/status` payload for the active runtime mode
+- `totals`
+  - `symbol_count`
+  - `monitored_symbol_count`
+  - `open_order_symbol_count`
+  - `filled_symbol_count`
+  - `position_symbol_count`
+- `symbols[]`
+  - `symbol`
+  - `mode`
+  - `monitored`
+  - `monitoring_statuses[]`
+  - `intents[]`
+  - `plan_item_count`
+  - `latest_plan_item_status`
+  - `order_count`
+  - `open_order_count`
+  - `fill_count`
+  - `filled_quantity`
+  - `position_quantity`
+  - `position_average_price`
+  - `latest_activity_at`
+
 ### `GET /runtime/safety`
 Returns safety controls and operator override state.
 
@@ -167,6 +198,59 @@ Current response includes:
 - `symbol`
 - `side`
 - `intent`
+
+### `GET /symbols`
+List symbol-level execution readback rows for the active runtime mode.
+
+Current response includes:
+- `symbol`
+- `mode`
+- `monitored`
+- `monitoring_statuses[]`
+- `intents[]`
+- `plan_item_count`
+- `latest_plan_item_status`
+- `order_count`
+- `open_order_count`
+- `fill_count`
+- `filled_quantity`
+- `position_quantity`
+- `position_average_price`
+- `latest_activity_at`
+
+### `GET /symbols/{symbol}`
+Return the full exec-owned readback view for one symbol in the active runtime mode.
+
+Current response includes:
+- `symbol`
+- `mode`
+- `summary`
+  - same fields returned by `GET /symbols`
+- `monitoring`
+  - `monitored`
+  - `statuses[]`
+  - `pending_dispatch_count`
+- `position`
+  - serialized current `execution_positions` row when present
+- `plan_items[]`
+  - execution-plan item plus parent-plan context (`plan_id`, `plan_source`, `plan_market_date`, `plan_status`, ...)
+- `orders[]`
+  - serialized broker order plus audit events
+- `fills[]`
+  - serialized execution fills
+
+### `GET /orders`
+List stored broker orders for the active runtime mode.
+
+### `GET /executions`
+List stored execution fills for the active runtime mode.
+
+### `GET /positions`
+List stored execution positions for the active runtime mode.
+
+`GET /executions` and `GET /positions` reflect durable exec-owned broker truth as fills
+and position updates arrive. Order acknowledgement alone does not create fill or
+position rows.
 
 ### `POST /execution-jobs/dispatch`
 Manually dispatch due execution jobs through the broker adapter boundary.

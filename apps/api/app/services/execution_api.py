@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from collections import defaultdict
 from datetime import date, datetime
 from decimal import Decimal
 
@@ -15,6 +16,9 @@ from app.models.runtime import (
     ExecutionPlanItem,
     ExecutionPosition,
 )
+
+MONITORED_INTENTS = frozenset({"target_sell", "stop_sell"})
+OPEN_ORDER_STATUSES = frozenset({"submitted", "open", "partially_filled"})
 
 
 @dataclass(frozen=True)
@@ -114,6 +118,7 @@ def list_execution_plans(
     ).all()
     return [_serialize_execution_plan(plan) for plan in plans]
 
+
 def list_broker_orders(
     *,
     settings: Settings,
@@ -153,6 +158,88 @@ def list_execution_positions(
         .order_by(ExecutionPosition.symbol.asc()),
     ).all()
     return [_serialize_execution_position(position) for position in positions]
+
+
+def list_runtime_symbols(
+    *,
+    settings: Settings,
+    db: Session,
+) -> list[dict[str, object]]:
+    state = _load_runtime_symbol_state(settings=settings, db=db)
+    return [
+        _serialize_runtime_symbol_summary(
+            settings=settings,
+            symbol=symbol,
+            plan_items=state["plan_items_by_symbol"].get(symbol, []),
+            orders=state["orders_by_symbol"].get(symbol, []),
+            fills=state["fills_by_symbol"].get(symbol, []),
+            position=state["positions_by_symbol"].get(symbol),
+        )
+        for symbol in state["symbols"]
+    ]
+
+
+def get_runtime_symbol_detail(
+    *,
+    settings: Settings,
+    db: Session,
+    symbol: str,
+) -> dict[str, object] | None:
+    normalized_symbol = _normalize_symbol(symbol)
+    state = _load_runtime_symbol_state(
+        settings=settings,
+        db=db,
+        symbol=normalized_symbol,
+    )
+    if normalized_symbol not in state["symbols"]:
+        return None
+
+    plan_items = state["plan_items_by_symbol"].get(normalized_symbol, [])
+    orders = state["orders_by_symbol"].get(normalized_symbol, [])
+    fills = state["fills_by_symbol"].get(normalized_symbol, [])
+    position = state["positions_by_symbol"].get(normalized_symbol)
+    summary = _serialize_runtime_symbol_summary(
+        settings=settings,
+        symbol=normalized_symbol,
+        plan_items=plan_items,
+        orders=orders,
+        fills=fills,
+        position=position,
+    )
+    monitoring_statuses = sorted(
+        {
+            item.status
+            for item in plan_items
+            if item.intent in MONITORED_INTENTS
+        }
+    )
+    return {
+        "symbol": normalized_symbol,
+        "mode": settings.runtime_mode,
+        "summary": summary,
+        "monitoring": {
+            "monitored": any(item.intent in MONITORED_INTENTS for item in plan_items),
+            "statuses": monitoring_statuses,
+            "pending_dispatch_count": sum(
+                1
+                for item in plan_items
+                if item.status.endswith("_pending_dispatch")
+            ),
+        },
+        "position": _serialize_execution_position(position) if position is not None else None,
+        "plan_items": [
+            _serialize_execution_plan_item_detail(item)
+            for item in _sort_plan_items_desc(plan_items)
+        ],
+        "orders": [
+            serialize_broker_order(order, include_events=True)
+            for order in orders
+        ],
+        "fills": [
+            _serialize_execution_fill(fill)
+            for fill in fills
+        ],
+    }
 
 
 def _serialize_execution_plan(plan: ExecutionPlan) -> dict[str, object]:
@@ -197,6 +284,22 @@ def _serialize_execution_plan_item(item: ExecutionPlanItem) -> dict[str, object]
         "created_at": _serialize_datetime(item.created_at),
         "updated_at": _serialize_datetime(item.updated_at),
     }
+
+
+def _serialize_execution_plan_item_detail(item: ExecutionPlanItem) -> dict[str, object]:
+    payload = _serialize_execution_plan_item(item)
+    payload.update(
+        {
+            "execution_plan_id": item.execution_plan_id,
+            "plan_id": item.plan.external_plan_id,
+            "plan_source": item.plan.source,
+            "plan_market_date": _serialize_date(item.plan.market_date),
+            "plan_requested_at": _serialize_datetime(item.plan.requested_at),
+            "plan_accepted_at": _serialize_datetime(item.plan.accepted_at),
+            "plan_status": item.plan.status,
+        }
+    )
+    return payload
 
 
 def serialize_broker_order(
@@ -298,3 +401,158 @@ def _serialize_datetime(value: datetime | None) -> str | None:
 
 def _serialize_decimal(value: Decimal | None) -> str | None:
     return str(value) if value is not None else None
+
+
+def _normalize_symbol(symbol: str) -> str:
+    return symbol.strip().upper()
+
+
+def _load_runtime_symbol_state(
+    *,
+    settings: Settings,
+    db: Session,
+    symbol: str | None = None,
+) -> dict[str, object]:
+    plan_items_query = (
+        select(ExecutionPlanItem)
+        .join(ExecutionPlanItem.plan)
+        .where(ExecutionPlan.mode == settings.runtime_mode)
+        .options(selectinload(ExecutionPlanItem.plan))
+        .order_by(
+            ExecutionPlan.accepted_at.desc(),
+            ExecutionPlan.created_at.desc(),
+            ExecutionPlanItem.plan_item_index.asc(),
+            ExecutionPlanItem.id.asc(),
+        )
+    )
+    orders_query = (
+        select(BrokerOrder)
+        .where(BrokerOrder.mode == settings.runtime_mode)
+        .options(selectinload(BrokerOrder.events))
+        .order_by(BrokerOrder.created_at.desc(), BrokerOrder.id.desc())
+    )
+    fills_query = (
+        select(ExecutionFill)
+        .join(ExecutionFill.broker_order)
+        .where(BrokerOrder.mode == settings.runtime_mode)
+        .order_by(ExecutionFill.filled_at.desc(), ExecutionFill.id.desc())
+    )
+    positions_query = (
+        select(ExecutionPosition)
+        .where(ExecutionPosition.mode == settings.runtime_mode)
+        .order_by(ExecutionPosition.symbol.asc())
+    )
+    if symbol is not None:
+        plan_items_query = plan_items_query.where(ExecutionPlanItem.symbol == symbol)
+        orders_query = orders_query.where(BrokerOrder.symbol == symbol)
+        fills_query = fills_query.where(ExecutionFill.symbol == symbol)
+        positions_query = positions_query.where(ExecutionPosition.symbol == symbol)
+
+    plan_items = db.scalars(plan_items_query).all()
+    orders = db.scalars(orders_query).all()
+    fills = db.scalars(fills_query).all()
+    positions = db.scalars(positions_query).all()
+
+    plan_items_by_symbol: dict[str, list[ExecutionPlanItem]] = defaultdict(list)
+    orders_by_symbol: dict[str, list[BrokerOrder]] = defaultdict(list)
+    fills_by_symbol: dict[str, list[ExecutionFill]] = defaultdict(list)
+    positions_by_symbol: dict[str, ExecutionPosition] = {}
+    symbols: set[str] = set()
+
+    for item in plan_items:
+        plan_items_by_symbol[item.symbol].append(item)
+        symbols.add(item.symbol)
+    for order in orders:
+        orders_by_symbol[order.symbol].append(order)
+        symbols.add(order.symbol)
+    for fill in fills:
+        fills_by_symbol[fill.symbol].append(fill)
+        symbols.add(fill.symbol)
+    for position in positions:
+        positions_by_symbol[position.symbol] = position
+        symbols.add(position.symbol)
+
+    return {
+        "symbols": sorted(symbols),
+        "plan_items_by_symbol": plan_items_by_symbol,
+        "orders_by_symbol": orders_by_symbol,
+        "fills_by_symbol": fills_by_symbol,
+        "positions_by_symbol": positions_by_symbol,
+    }
+
+
+def _serialize_runtime_symbol_summary(
+    *,
+    settings: Settings,
+    symbol: str,
+    plan_items: list[ExecutionPlanItem],
+    orders: list[BrokerOrder],
+    fills: list[ExecutionFill],
+    position: ExecutionPosition | None,
+) -> dict[str, object]:
+    monitoring_statuses = sorted(
+        {
+            item.status
+            for item in plan_items
+            if item.intent in MONITORED_INTENTS
+        }
+    )
+    latest_plan_item = _sort_plan_items_desc(plan_items)[0] if plan_items else None
+    latest_activity_at = _serialize_datetime(
+        _latest_datetime(
+            [
+                item.updated_at for item in plan_items
+            ]
+            + [
+                order.updated_at for order in orders
+            ]
+            + [
+                fill.filled_at for fill in fills
+            ]
+            + [
+                position.updated_at
+                for position in [position]
+                if position is not None
+            ]
+        )
+    )
+    return {
+        "symbol": symbol,
+        "mode": settings.runtime_mode,
+        "monitored": any(item.intent in MONITORED_INTENTS for item in plan_items),
+        "monitoring_statuses": monitoring_statuses,
+        "intents": sorted({item.intent for item in plan_items}),
+        "plan_item_count": len(plan_items),
+        "latest_plan_item_status": latest_plan_item.status if latest_plan_item is not None else None,
+        "order_count": len(orders),
+        "open_order_count": sum(order.status in OPEN_ORDER_STATUSES for order in orders),
+        "fill_count": len(fills),
+        "filled_quantity": sum(fill.quantity for fill in fills),
+        "position_quantity": position.quantity if position is not None else 0,
+        "position_average_price": (
+            _serialize_decimal(position.average_price)
+            if position is not None
+            else None
+        ),
+        "latest_activity_at": latest_activity_at,
+    }
+
+
+def _sort_plan_items_desc(plan_items: list[ExecutionPlanItem]) -> list[ExecutionPlanItem]:
+    return sorted(
+        plan_items,
+        key=lambda item: (
+            item.plan.accepted_at,
+            item.plan.created_at,
+            item.plan_item_index,
+            item.id,
+        ),
+        reverse=True,
+    )
+
+
+def _latest_datetime(values: list[datetime | None]) -> datetime | None:
+    concrete_values = [value for value in values if value is not None]
+    if not concrete_values:
+        return None
+    return max(concrete_values)

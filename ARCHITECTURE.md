@@ -50,9 +50,12 @@ That includes:
 ### Northbound API from core/web to exec
 - `GET /health`
 - `GET /runtime/status`
+- `GET /runtime/daily-board`
 - `GET /runtime/safety`
 - `GET /broker/session`
 - `GET /execution-plans`
+- `GET /symbols`
+- `GET /symbols/{symbol}`
 - `POST /broker/session/authenticate`
 - `POST /broker/session/revoke`
 - `POST /execution-plans`
