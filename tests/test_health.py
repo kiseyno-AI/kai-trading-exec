@@ -23,8 +23,16 @@ from app.models.runtime import (
 from app.services import runtime as runtime_service, runtime_controls
 
 
-def build_test_app(settings: Settings | None = None):
+def build_test_app(
+    settings: Settings | None = None,
+    *,
+    autonomous_runtime_enabled: bool = False,
+    monitoring_price_source: object | None = None,
+):
     app_settings = settings or Settings(database_url="sqlite:///:memory:")
+    app_settings = app_settings.model_copy(
+        update={"autonomous_runtime_enabled": autonomous_runtime_enabled}
+    )
     engine = create_db_engine(app_settings)
     Base.metadata.create_all(engine)
     session_factory = create_session_factory(engine)
@@ -32,12 +40,20 @@ def build_test_app(settings: Settings | None = None):
         settings=app_settings,
         engine=engine,
         session_factory=session_factory,
+        monitoring_price_source=monitoring_price_source,
     )
     return app, engine
 
 
-def build_unmigrated_runtime_safety_app(database_url: str):
-    settings = Settings(database_url=database_url)
+def build_unmigrated_runtime_safety_app(
+    database_url: str,
+    *,
+    autonomous_runtime_enabled: bool = False,
+):
+    settings = Settings(
+        database_url=database_url,
+        autonomous_runtime_enabled=autonomous_runtime_enabled,
+    )
     engine = create_db_engine(settings)
     with engine.begin() as connection:
         connection.execute(
@@ -159,6 +175,7 @@ def test_runtime_status_reports_readiness_and_default_safety() -> None:
         "failed_today": [],
     }
     monitoring = payload["liveness"]["monitoring"]
+    autonomous = payload["liveness"]["autonomous"]
     assert monitoring["status"] == "not_started"
     assert monitoring["topology"] == "shared_symbol_scheduler"
     assert monitoring["scheduler"]["selection_strategy"] == "round_robin_by_symbol"
@@ -166,6 +183,9 @@ def test_runtime_status_reports_readiness_and_default_safety() -> None:
     assert monitoring["dispatcher"]["max_broker_actions_per_cycle"] == 32
     assert monitoring["dispatcher"]["backlog_item_count"] == 0
     assert monitoring["last_cycle"] is None
+    assert autonomous["enabled"] is False
+    assert autonomous["dispatch"]["status"] == "disabled"
+    assert autonomous["monitoring"]["status"] == "disabled"
 
     with app.state.db_session_factory() as session:
         state = session.get(RuntimeControlState, "global")

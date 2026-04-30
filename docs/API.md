@@ -36,6 +36,27 @@ Current foundation response includes:
 - `safety.paused`
 - `safety.kill_switch_enabled`
 - `safety.automation_enabled`
+- `liveness.autonomous`
+  - `enabled`
+  - `dispatch`
+    - `worker_name`
+    - `status` (`disabled`, `idle`, `running`, `error`)
+    - `poll_interval_seconds`
+    - `last_started_at`
+    - `last_heartbeat_at`
+    - `last_success_at`
+    - `last_error`
+    - `last_cycle`
+  - `monitoring`
+    - `worker_name`
+    - `status` (`disabled`, `idle`, `running`, `error`)
+    - `poll_interval_seconds`
+    - `price_source_configured`
+    - `last_started_at`
+    - `last_heartbeat_at`
+    - `last_success_at`
+    - `last_error`
+    - `last_cycle`
 - `liveness.monitoring`
   - `status` (`not_started`, `running`, `degraded`)
   - `topology` (`shared_symbol_scheduler`)
@@ -150,8 +171,8 @@ Current response includes:
 ### `POST /execution-jobs/dispatch`
 Manually dispatch due execution jobs through the broker adapter boundary.
 
-This is the current operator/manual execution surface until a background
-dispatcher loop exists.
+The autonomous runtime now dispatches due jobs on its configured cadence.
+This endpoint remains as an operator/manual override.
 
 Current response includes:
 - `blocked`
@@ -169,8 +190,10 @@ Current response includes:
 Evaluate persisted intraday `target_sell` / `stop_sell` plan items against a
 supplied set of symbol-price snapshots.
 
-This is the current operator/manual monitoring surface until a background
-monitoring loop exists.
+The autonomous runtime now retries persisted `*_triggered_pending_dispatch` and
+`*_triggered_blocked` monitoring items on its configured cadence, and can also
+evaluate fresh triggers when a monitoring price source is configured. This
+endpoint remains as an operator/manual override.
 
 Suggested body shape:
 - `actor`

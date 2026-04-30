@@ -17,7 +17,15 @@ def runtime_status(
 ) -> dict[str, object]:
     settings: Settings = get_settings(request)
     runtime: RuntimeMetadata = get_runtime_metadata(request)
-    return build_runtime_status(settings=settings, runtime=runtime, db=db)
+    autonomous_runtime = None
+    if hasattr(request.app.state, "autonomous_runtime"):
+        autonomous_runtime = request.app.state.autonomous_runtime.snapshot()
+    return build_runtime_status(
+        settings=settings,
+        runtime=runtime,
+        db=db,
+        autonomous_runtime=autonomous_runtime,
+    )
 
 
 @router.get("/safety")

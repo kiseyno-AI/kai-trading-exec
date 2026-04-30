@@ -1,5 +1,6 @@
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+import time
 
 from fastapi.testclient import TestClient
 import pytest
@@ -163,16 +164,42 @@ class StubBrokerAdapter:
         return headers
 
 
+class StaticMonitoringPriceSource:
+    def __init__(self, prices_by_symbol: dict[str, Decimal]) -> None:
+        self.prices_by_symbol = prices_by_symbol
+        self.calls: list[list[str]] = []
+
+    def get_prices(
+        self,
+        *,
+        symbols: list[str],
+        observed_at: datetime,
+        settings: Settings,
+    ) -> list[dict[str, str]]:
+        del observed_at, settings
+        self.calls.append(list(symbols))
+        return [
+            {"symbol": symbol, "price": str(self.prices_by_symbol[symbol])}
+            for symbol in symbols
+            if symbol in self.prices_by_symbol
+        ]
+
+
 def build_test_app(
     *,
     settings: Settings,
     broker_adapter: StubBrokerAdapter | None = None,
+    monitoring_price_source: object | None = None,
+    autonomous_runtime_enabled: bool = False,
 ):
-    engine = create_db_engine(settings)
+    effective_settings = settings.model_copy(
+        update={"autonomous_runtime_enabled": autonomous_runtime_enabled}
+    )
+    engine = create_db_engine(effective_settings)
     Base.metadata.create_all(engine)
     session_factory = create_session_factory(engine)
     app = create_app(
-        settings=settings,
+        settings=effective_settings,
         engine=engine,
         session_factory=session_factory,
         broker_adapter_factory=(
@@ -180,8 +207,18 @@ def build_test_app(
             if broker_adapter is not None
             else None
         ),
+        monitoring_price_source=monitoring_price_source,
     )
     return app, engine
+
+
+def wait_for(predicate, *, timeout_seconds: float = 1.5, interval_seconds: float = 0.02) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        time.sleep(interval_seconds)
+    assert predicate()
 
 
 def build_token_grant() -> BrokerTokenGrant:
@@ -2310,3 +2347,325 @@ def test_place_order_endpoint_persists_retryable_failure() -> None:
         assert order.last_error_code == "RATE_LIMIT"
 
     engine.dispose()
+
+
+def test_autonomous_dispatch_loop_progresses_due_plan_without_manual_dispatch() -> None:
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(broker_order_id="kis-auto-dispatch-1"),
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+            dispatch_loop_interval_seconds=0.05,
+            monitoring_loop_interval_seconds=60,
+        ),
+        broker_adapter=broker_adapter,
+        autonomous_runtime_enabled=True,
+    )
+    with TestClient(app) as client:
+        resume = client.post(
+            "/controls/resume",
+            json={"actor": "ops", "source": "console", "reason": "enable autonomous runtime"},
+        )
+        assert resume.status_code == 200
+
+        plan_response = client.post(
+            "/execution-plans",
+            json={
+                "plan_id": "plan-autonomous-dispatch",
+                "source": "kai-trading-core",
+                "market_date": "2024-01-03",
+                "items": [
+                    {
+                        "symbol": "005930",
+                        "side": "buy",
+                        "intent": "next_open_buy",
+                        "quantity_policy": {"kind": "shares", "quantity": 5},
+                        "limit_price": "71000.00",
+                        "time_in_force": "day",
+                        "risk_context": {"exchange": "KRX"},
+                    }
+                ],
+            },
+        )
+        assert plan_response.status_code == 201
+        plan_item_id = plan_response.json()["persisted_execution_item_ids"][0]
+
+        wait_for(lambda: len(broker_adapter.order_calls) == 1)
+
+        runtime_status = client.get("/runtime/status")
+        assert runtime_status.status_code == 200
+        autonomous = runtime_status.json()["liveness"]["autonomous"]
+        assert autonomous["enabled"] is True
+        assert autonomous["dispatch"]["status"] == "running"
+        assert autonomous["dispatch"]["last_success_at"] is not None
+        assert autonomous["dispatch"]["last_cycle"] is not None
+
+        with app.state.db_session_factory() as session:
+            job = session.scalar(select(ExecutionJob))
+            plan_item = session.get(ExecutionPlanItem, plan_item_id)
+            order = session.scalar(select(BrokerOrder))
+            assert job is not None
+            assert plan_item is not None
+            assert order is not None
+            assert job.status == "completed"
+            assert plan_item.status == "broker_order_submitted"
+            assert order.broker_order_id == "kis-auto-dispatch-1"
+
+    engine.dispose()
+
+
+def test_autonomous_monitoring_loop_triggers_target_sell_from_price_source() -> None:
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(broker_order_id="kis-auto-monitor-1"),
+    )
+    price_source = StaticMonitoringPriceSource({"005930": Decimal("125100.00")})
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+            dispatch_loop_interval_seconds=60,
+            monitoring_loop_interval_seconds=0.05,
+        ),
+        broker_adapter=broker_adapter,
+        monitoring_price_source=price_source,
+        autonomous_runtime_enabled=True,
+    )
+    with TestClient(app) as client:
+        resume = client.post(
+            "/controls/resume",
+            json={"actor": "ops", "source": "console", "reason": "enable autonomous runtime"},
+        )
+        assert resume.status_code == 200
+
+        plan_response = client.post(
+            "/execution-plans",
+            json={
+                "plan_id": "plan-autonomous-monitoring",
+                "source": "kai-trading-core",
+                "items": [
+                    {
+                        "symbol": "005930",
+                        "side": "sell",
+                        "intent": "target_sell",
+                        "quantity_policy": {"kind": "shares", "quantity": 1},
+                        "trigger_price": "125000.00",
+                        "time_in_force": "day",
+                        "risk_context": {"exchange": "KRX"},
+                    }
+                ],
+            },
+        )
+        assert plan_response.status_code == 201
+        plan_item_id = plan_response.json()["persisted_execution_item_ids"][0]
+
+        with app.state.db_session_factory() as session:
+            session.add(
+                ExecutionPosition(
+                    mode="paper",
+                    symbol="005930",
+                    quantity=1,
+                    average_price=Decimal("120000.0000"),
+                    updated_from="reconciliation",
+                    raw_payload={"source": "broker"},
+                )
+            )
+            session.commit()
+
+        wait_for(lambda: len(broker_adapter.order_calls) == 1)
+
+        runtime_status = client.get("/runtime/status")
+        assert runtime_status.status_code == 200
+        payload = runtime_status.json()
+        assert payload["liveness"]["monitoring"]["status"] == "running"
+        autonomous = payload["liveness"]["autonomous"]["monitoring"]
+        assert autonomous["status"] == "running"
+        assert autonomous["price_source_configured"] is True
+        assert autonomous["last_success_at"] is not None
+        assert price_source.calls
+
+        with app.state.db_session_factory() as session:
+            plan_item = session.get(ExecutionPlanItem, plan_item_id)
+            order = session.scalar(select(BrokerOrder))
+            checkpoint = session.scalar(select(MonitoringCheckpoint))
+            assert plan_item is not None
+            assert order is not None
+            assert checkpoint is not None
+            assert plan_item.status == "broker_order_submitted"
+            assert order.broker_order_id == "kis-auto-monitor-1"
+            assert checkpoint.status == "running"
+
+    engine.dispose()
+
+
+def test_autonomous_monitoring_loop_retries_pending_dispatch_after_restart_without_price_source(
+    tmp_path,
+) -> None:
+    database_url = f"sqlite:///{tmp_path / 'autonomous-monitoring-restart.db'}"
+    first_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(broker_order_id="kis-monitor-initial-1"),
+    )
+    first_app, first_engine = build_test_app(
+        settings=Settings(
+            database_url=database_url,
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+            monitoring_max_broker_actions_per_cycle=1,
+        ),
+        broker_adapter=first_adapter,
+    )
+    first_client = TestClient(first_app)
+
+    resume = first_client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "console", "reason": "enable monitoring"},
+    )
+    assert resume.status_code == 200
+
+    plan_response = first_client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-monitoring-backlog-restart",
+            "source": "kai-trading-core",
+            "items": [
+                {
+                    "symbol": "005930",
+                    "side": "sell",
+                    "intent": "target_sell",
+                    "quantity_policy": {"kind": "shares", "quantity": 1},
+                    "trigger_price": "125000.00",
+                    "time_in_force": "day",
+                    "risk_context": {"exchange": "KRX"},
+                },
+                {
+                    "symbol": "005930",
+                    "side": "sell",
+                    "intent": "target_sell",
+                    "quantity_policy": {"kind": "shares", "quantity": 1},
+                    "trigger_price": "125000.00",
+                    "time_in_force": "day",
+                    "risk_context": {"exchange": "KRX"},
+                },
+            ],
+        },
+    )
+    assert plan_response.status_code == 201
+    first_item_id, second_item_id = plan_response.json()["persisted_execution_item_ids"]
+
+    with first_app.state.db_session_factory() as session:
+        session.add(
+            ExecutionPosition(
+                mode="paper",
+                symbol="005930",
+                quantity=2,
+                average_price=Decimal("120000.0000"),
+                updated_from="reconciliation",
+                raw_payload={"source": "broker"},
+            )
+        )
+        session.commit()
+
+    evaluation = first_client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "seed triggered monitoring backlog before restart",
+            "prices": [{"symbol": "005930", "price": "125100.00"}],
+        },
+    )
+    assert evaluation.status_code == 200
+    assert evaluation.json()["submitted_order_count"] == 1
+    assert evaluation.json()["deferred_item_count"] == 1
+
+    with first_app.state.db_session_factory() as session:
+        second_item = session.get(ExecutionPlanItem, second_item_id)
+        assert second_item is not None
+        assert second_item.status == "target_sell_triggered_pending_dispatch"
+
+    first_client.close()
+    first_engine.dispose()
+
+    restarted_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(broker_order_id="kis-monitor-restarted-2"),
+    )
+    restarted_app, restarted_engine = build_test_app(
+        settings=Settings(
+            database_url=database_url,
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+            monitoring_max_broker_actions_per_cycle=1,
+            dispatch_loop_interval_seconds=60,
+            monitoring_loop_interval_seconds=0.05,
+        ),
+        broker_adapter=restarted_adapter,
+        autonomous_runtime_enabled=True,
+    )
+    with TestClient(restarted_app) as restarted_client:
+        wait_for(lambda: len(restarted_adapter.order_calls) == 1)
+
+        runtime_status = restarted_client.get("/runtime/status")
+        assert runtime_status.status_code == 200
+        monitoring = runtime_status.json()["liveness"]["monitoring"]
+        autonomous = runtime_status.json()["liveness"]["autonomous"]["monitoring"]
+        assert monitoring["status"] == "running"
+        assert autonomous["status"] == "running"
+        assert autonomous["last_cycle"] is not None
+        assert autonomous["last_cycle"]["price_count"] == 0
+
+        with restarted_app.state.db_session_factory() as session:
+            first_item = session.get(ExecutionPlanItem, first_item_id)
+            second_item = session.get(ExecutionPlanItem, second_item_id)
+            orders = session.scalars(select(BrokerOrder).order_by(BrokerOrder.created_at.asc())).all()
+            checkpoint = session.scalar(select(MonitoringCheckpoint))
+            assert first_item is not None
+            assert second_item is not None
+            assert checkpoint is not None
+            assert first_item.status == "broker_order_submitted"
+            assert second_item.status == "broker_order_submitted"
+            assert [order.broker_order_id for order in orders] == [
+                "kis-monitor-initial-1",
+                "kis-monitor-restarted-2",
+            ]
+            assert checkpoint.details["retried_triggered_item_count"] >= 1
+
+    restarted_engine.dispose()

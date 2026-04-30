@@ -329,6 +329,7 @@ def build_runtime_status(
     settings: Settings,
     runtime: RuntimeMetadata,
     db: Session,
+    autonomous_runtime: dict[str, object] | None = None,
 ) -> dict[str, object]:
     dependencies = {
         "database": "ok",
@@ -353,6 +354,7 @@ def build_runtime_status(
         "last_success_at": None,
         "last_cycle": None,
     }
+    autonomous = autonomous_runtime or _default_autonomous_runtime_payload(settings)
     symbols: dict[str, list[str]] = {
         "monitored": [],
         "scheduled_today": [],
@@ -388,6 +390,7 @@ def build_runtime_status(
             "dependencies": dependencies,
             "liveness": {
                 **liveness_payload(runtime),
+                "autonomous": autonomous,
                 "monitoring": monitoring,
             },
             "broker": broker,
@@ -423,6 +426,7 @@ def build_runtime_status(
             "dependencies": dependencies,
             "liveness": {
                 **liveness_payload(runtime),
+                "autonomous": autonomous,
                 "monitoring": monitoring,
             },
             "broker": broker,
@@ -461,9 +465,38 @@ def build_runtime_status(
         "dependencies": dependencies,
         "liveness": {
             **liveness_payload(runtime),
+            "autonomous": autonomous,
             "monitoring": monitoring,
         },
         "broker": broker,
         "counts": counts,
         "symbols": symbols,
+    }
+
+
+def _default_autonomous_runtime_payload(settings: Settings) -> dict[str, object]:
+    default_status = "idle" if settings.autonomous_runtime_enabled else "disabled"
+    return {
+        "enabled": settings.autonomous_runtime_enabled,
+        "dispatch": {
+            "worker_name": "execution_job_dispatch_loop",
+            "status": default_status,
+            "poll_interval_seconds": settings.dispatch_loop_interval_seconds,
+            "last_started_at": None,
+            "last_heartbeat_at": None,
+            "last_success_at": None,
+            "last_error": None,
+            "last_cycle": None,
+        },
+        "monitoring": {
+            "worker_name": "monitoring_dispatch_loop",
+            "status": default_status,
+            "poll_interval_seconds": settings.monitoring_loop_interval_seconds,
+            "last_started_at": None,
+            "last_heartbeat_at": None,
+            "last_success_at": None,
+            "last_error": None,
+            "last_cycle": None,
+            "price_source_configured": False,
+        },
     }
