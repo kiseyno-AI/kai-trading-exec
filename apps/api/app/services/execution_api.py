@@ -336,7 +336,11 @@ def serialize_broker_order(
             serialize_broker_order_event(event)
             for event in sorted(
                 order.events,
-                key=lambda item: (_serialize_datetime(item.observed_at) or "", item.id),
+                key=lambda item: (
+                    _serialize_datetime(item.observed_at) or "",
+                    _serialize_datetime(item.created_at) or "",
+                    item.id,
+                ),
             )
         ]
     return payload

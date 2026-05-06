@@ -256,6 +256,10 @@ class BrokerOrder(TimestampMixin, Base):
 
     plan_item: Mapped[ExecutionPlanItem | None] = relationship(back_populates="broker_orders")
     events: Mapped[list["BrokerOrderEvent"]] = relationship(back_populates="broker_order")
+    execution_failure: Mapped["ExecutionFailure | None"] = relationship(
+        back_populates="broker_order",
+        uselist=False,
+    )
     fills: Mapped[list["ExecutionFill"]] = relationship(back_populates="broker_order")
 
 
@@ -285,6 +289,54 @@ class BrokerOrderEvent(TimestampMixin, Base):
     )
 
     broker_order: Mapped[BrokerOrder] = relationship(back_populates="events")
+
+
+class ExecutionFailure(TimestampMixin, Base):
+    __tablename__ = "execution_failures"
+    __table_args__ = (
+        UniqueConstraint(
+            "broker_order_pk",
+            name="uq_execution_failures_broker_order_pk",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    mode: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
+    broker_order_pk: Mapped[str] = mapped_column(
+        ForeignKey("broker_orders.id"),
+        nullable=False,
+        index=True,
+    )
+    execution_plan_id: Mapped[str | None] = mapped_column(String(36), index=True)
+    execution_plan_item_id: Mapped[str | None] = mapped_column(String(36), index=True)
+    plan_id: Mapped[str | None] = mapped_column(String(128), index=True)
+    plan_source: Mapped[str | None] = mapped_column(String(64))
+    strategy_run_id: Mapped[str | None] = mapped_column(String(128))
+    decision_actor: Mapped[str | None] = mapped_column(String(128))
+    broker_name: Mapped[str] = mapped_column(String(32), nullable=False, default="kis")
+    account: Mapped[str | None] = mapped_column(String(64))
+    idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    symbol: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    side: Mapped[str] = mapped_column(String(16), nullable=False)
+    intent: Mapped[str | None] = mapped_column(String(64))
+    requested_quantity: Mapped[int] = mapped_column(Integer, nullable=False)
+    requested_limit_price: Mapped[Decimal | None] = mapped_column(Numeric(18, 4))
+    requested_notional: Mapped[Decimal | None] = mapped_column(Numeric(18, 4))
+    classification: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    broker_error_classification: Mapped[str | None] = mapped_column(String(64))
+    broker_error_code: Mapped[str | None] = mapped_column(String(64))
+    broker_error_message: Mapped[str] = mapped_column(Text, nullable=False)
+    retryable: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="open", index=True)
+    first_failed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    latest_failed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    status_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    status_updated_by: Mapped[str | None] = mapped_column(String(128))
+    status_updated_source: Mapped[str | None] = mapped_column(String(64))
+    status_updated_reason: Mapped[str | None] = mapped_column(Text)
+    raw_context: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+
+    broker_order: Mapped[BrokerOrder] = relationship(back_populates="execution_failure")
 
 
 class ExecutionFill(TimestampMixin, Base):

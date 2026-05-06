@@ -186,3 +186,32 @@ class MonitoringEvaluationRequest(BaseModel):
         if not normalized:
             raise ValueError("field must not be empty")
         return normalized
+
+
+class ExecutionFailureStatusUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    status: str = Field(min_length=1, max_length=16)
+    actor: str | None = Field(default=None, max_length=128)
+    source: str = Field(default="operator", max_length=64)
+    reason: str | None = None
+
+    @field_validator("status")
+    @classmethod
+    def normalize_status(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if not normalized:
+            raise ValueError("status must not be empty")
+        if normalized not in {"open", "resolved", "ignored"}:
+            raise ValueError("status must be 'open', 'resolved', or 'ignored'")
+        return normalized
+
+    @field_validator("actor", "source")
+    @classmethod
+    def normalize_text_fields(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("field must not be empty")
+        return normalized
