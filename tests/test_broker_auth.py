@@ -1350,6 +1350,328 @@ def test_dispatch_due_next_open_buy_job_recovers_stale_running_job() -> None:
     engine.dispose()
 
 
+def test_execution_plan_items_preserve_cross_decider_identity_without_symbol_date_collision() -> None:
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+        ),
+    )
+    client = TestClient(app)
+
+    response = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-cross-decider-identity-1",
+            "source": "kai-trading-core",
+            "market_date": "2024-01-03",
+            "items": [
+                {
+                    "symbol": "005930",
+                    "side": "buy",
+                    "intent": "next_open_buy",
+                    "quantity_policy": {"kind": "shares", "quantity": 5},
+                    "limit_price": "71000.00",
+                    "time_in_force": "day",
+                    "agent_name": "signal-decider",
+                    "decision_snapshot_id": "signal-snapshot-1",
+                    "decision_run_id": "signal-decision-run-1",
+                    "source_plan_item_id": "core-signal-item-1",
+                    "source_market_date": "2024-01-03",
+                },
+                {
+                    "symbol": "005930",
+                    "side": "sell",
+                    "intent": "target_sell",
+                    "quantity_policy": {"kind": "shares", "quantity": 5},
+                    "trigger_price": "76000.00",
+                    "time_in_force": "day",
+                    "decision_agent_name": "short-term-decider",
+                    "decision_snapshot_id": "short-term-snapshot-1",
+                    "decision_run_id": "short-term-decision-run-1",
+                    "source_plan_item_id": "core-short-term-item-1",
+                    "source_market_date": "2024-01-03",
+                },
+            ],
+        },
+    )
+    assert response.status_code == 201
+
+    plans_payload = client.get("/execution-plans").json()
+    assert len(plans_payload) == 1
+    items_by_source = {
+        item["source_plan_item_id"]: item
+        for item in plans_payload[0]["items"]
+    }
+    assert set(items_by_source) == {"core-signal-item-1", "core-short-term-item-1"}
+
+    signal_item = items_by_source["core-signal-item-1"]
+    assert signal_item["symbol"] == "005930"
+    assert signal_item["status"] == "next_open_buy_scheduled"
+    assert signal_item["decision_agent_name"] == "signal-decider"
+    assert signal_item["agent_name"] == "signal-decider"
+    assert signal_item["decision_snapshot_id"] == "signal-snapshot-1"
+    assert signal_item["decision_run_id"] == "signal-decision-run-1"
+    assert signal_item["source_market_date"] == "2024-01-03"
+
+    short_term_item = items_by_source["core-short-term-item-1"]
+    assert short_term_item["symbol"] == "005930"
+    assert short_term_item["status"] == "target_sell_monitoring"
+    assert short_term_item["decision_agent_name"] == "short-term-decider"
+    assert short_term_item["agent_name"] == "short-term-decider"
+    assert short_term_item["decision_snapshot_id"] == "short-term-snapshot-1"
+    assert short_term_item["decision_run_id"] == "short-term-decision-run-1"
+    assert short_term_item["source_market_date"] == "2024-01-03"
+
+    symbol_detail_payload = client.get("/symbols/005930").json()
+    source_identity_by_item = {
+        item["source_identity"]["source_plan_item_id"]: item["source_identity"]["decision_agent_name"]
+        for item in symbol_detail_payload["plan_items"]
+    }
+    assert source_identity_by_item == {
+        "core-signal-item-1": "signal-decider",
+        "core-short-term-item-1": "short-term-decider",
+    }
+
+    engine.dispose()
+
+
+def test_short_term_trigger_and_chase_buy_items_are_safely_blocked() -> None:
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(),
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+        ),
+        broker_adapter=broker_adapter,
+    )
+    client = TestClient(app)
+
+    resume = client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "console", "reason": "enable automation"},
+    )
+    assert resume.status_code == 200
+
+    response = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-short-term-entry-safety-1",
+            "source": "kai-trading-core",
+            "market_date": "2024-01-03",
+            "items": [
+                {
+                    "symbol": "005930",
+                    "side": "buy",
+                    "intent": "tactical_buy",
+                    "quantity_policy": {"kind": "shares", "quantity": 3},
+                    "trigger_price": "71000.00",
+                    "chase_limit_price": "71200.00",
+                    "decision_agent_name": "short-term-decider",
+                    "source_plan_item_id": "core-tactical-entry-1",
+                },
+                {
+                    "symbol": "000660",
+                    "side": "buy",
+                    "intent": "next_open_buy",
+                    "quantity_policy": {"kind": "shares", "quantity": 2},
+                    "limit_price": "120000.00",
+                    "trigger_price": "119500.00",
+                    "chase_limit_price": "120500.00",
+                    "decision_agent_name": "short-term-decider",
+                    "source_plan_item_id": "core-trigger-chase-entry-1",
+                },
+            ],
+        },
+    )
+    assert response.status_code == 201
+
+    plans_payload = client.get("/execution-plans").json()
+    items_by_source = {
+        item["source_plan_item_id"]: item
+        for item in plans_payload[0]["items"]
+    }
+    assert items_by_source["core-tactical-entry-1"]["status"] == "unsupported_semantics"
+    assert items_by_source["core-trigger-chase-entry-1"]["status"] == "pending_configuration"
+
+    jobs_payload = client.get("/execution-jobs").json()
+    assert jobs_payload == []
+
+    dispatch_payload = client.post("/execution-jobs/dispatch").json()
+    assert dispatch_payload["due_job_count"] == 0
+    assert dispatch_payload["completed_job_count"] == 0
+    assert dispatch_payload["retrying_job_count"] == 0
+    assert dispatch_payload["failed_job_count"] == 0
+    assert broker_adapter.order_calls == []
+    assert client.get("/orders").json() == []
+
+    engine.dispose()
+
+
+def test_orders_monitoring_fills_and_positions_retain_decider_identity() -> None:
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(broker_order_id="kis-identity-100"),
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+        ),
+        broker_adapter=broker_adapter,
+    )
+    client = TestClient(app)
+
+    resume = client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "console", "reason": "enable automation"},
+    )
+    assert resume.status_code == 200
+
+    plan_response = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-identity-retention-1",
+            "source": "kai-trading-core",
+            "market_date": "2024-01-03",
+            "items": [
+                {
+                    "symbol": "005930",
+                    "side": "buy",
+                    "intent": "next_open_buy",
+                    "quantity_policy": {"kind": "shares", "quantity": 5},
+                    "limit_price": "71000.00",
+                    "time_in_force": "day",
+                    "decision_agent_name": "signal-decider",
+                    "decision_snapshot_id": "signal-order-snapshot-1",
+                    "decision_run_id": "signal-order-run-1",
+                    "source_plan_item_id": "core-signal-order-1",
+                },
+                {
+                    "symbol": "005930",
+                    "side": "sell",
+                    "intent": "target_sell",
+                    "quantity_policy": {"kind": "shares", "quantity": 5},
+                    "trigger_price": "76000.00",
+                    "time_in_force": "day",
+                    "decision_agent_name": "short-term-decider",
+                    "decision_snapshot_id": "short-monitor-snapshot-1",
+                    "decision_run_id": "short-monitor-run-1",
+                    "source_plan_item_id": "core-short-monitor-1",
+                },
+            ],
+        },
+    )
+    assert plan_response.status_code == 201
+    buy_item_id, sell_item_id = plan_response.json()["persisted_execution_item_ids"]
+
+    dispatch_response = client.post("/execution-jobs/dispatch")
+    assert dispatch_response.status_code == 200
+    assert dispatch_response.json()["completed_job_count"] == 1
+
+    with app.state.db_session_factory() as session:
+        buy_order = session.scalar(
+            select(BrokerOrder).where(BrokerOrder.execution_plan_item_id == buy_item_id)
+        )
+        assert buy_order is not None
+        session.add(
+            ExecutionFill(
+                broker_order_pk=buy_order.id,
+                broker_fill_id="fill-identity-1",
+                symbol="005930",
+                side="buy",
+                quantity=5,
+                price=Decimal("71000.0000"),
+                filled_at=datetime(2026, 5, 1, 9, 5, tzinfo=UTC),
+                payload={"source": "broker"},
+            )
+        )
+        session.add(
+            ExecutionPosition(
+                mode="paper",
+                symbol="005930",
+                quantity=5,
+                average_price=Decimal("71000.0000"),
+                updated_from="reconciliation",
+                raw_payload={"source": "broker"},
+            )
+        )
+        session.commit()
+
+    monitoring_response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "identity retention check",
+            "prices": [{"symbol": "005930", "price": "76010.00"}],
+        },
+    )
+    assert monitoring_response.status_code == 200
+    monitoring_item = monitoring_response.json()["items"][0]
+    assert monitoring_item["execution_plan_item_id"] == sell_item_id
+    assert monitoring_item["source_identity"]["decision_agent_name"] == "short-term-decider"
+    assert monitoring_item["source_identity"]["source_plan_item_id"] == "core-short-monitor-1"
+    assert monitoring_item["order"]["source_identity"]["decision_agent_name"] == "short-term-decider"
+    assert monitoring_item["order"]["source_identity"]["decision_snapshot_id"] == "short-monitor-snapshot-1"
+
+    orders_payload = client.get("/orders").json()
+    orders_by_item_id = {
+        order["execution_plan_item_id"]: order
+        for order in orders_payload
+    }
+    assert orders_by_item_id[buy_item_id]["source_identity"]["decision_agent_name"] == "signal-decider"
+    assert orders_by_item_id[buy_item_id]["source_identity"]["source_plan_item_id"] == "core-signal-order-1"
+    assert orders_by_item_id[sell_item_id]["source_identity"]["decision_agent_name"] == "short-term-decider"
+    assert orders_by_item_id[sell_item_id]["source_identity"]["source_plan_item_id"] == "core-short-monitor-1"
+
+    fills_payload = client.get("/executions").json()
+    assert len(fills_payload) == 1
+    assert fills_payload[0]["source_identity"]["decision_agent_name"] == "signal-decider"
+    assert fills_payload[0]["source_identity"]["source_plan_item_id"] == "core-signal-order-1"
+
+    positions_payload = client.get("/positions").json()
+    assert len(positions_payload) == 1
+    position_identity_by_source = {
+        identity["source_plan_item_id"]: identity["decision_agent_name"]
+        for identity in positions_payload[0]["source_identities"]
+    }
+    assert position_identity_by_source == {
+        "core-short-monitor-1": "short-term-decider",
+        "core-signal-order-1": "signal-decider",
+    }
+
+    symbol_detail_payload = client.get("/symbols/005930").json()
+    symbol_position_identity_by_source = {
+        identity["source_plan_item_id"]: identity["decision_agent_name"]
+        for identity in symbol_detail_payload["position"]["source_identities"]
+    }
+    assert symbol_position_identity_by_source == position_identity_by_source
+
+    engine.dispose()
+
+
 def test_monitoring_evaluate_triggers_target_sell_order_from_position_and_price_snapshot() -> None:
     broker_adapter = StubBrokerAdapter(
         config=BrokerConfig(
@@ -1695,15 +2017,15 @@ def test_monitoring_evaluate_tracks_remaining_shares_across_triggered_items() ->
     assert submitted_item["observed_price"] == "125100.0000"
     assert submitted_item["order"]["quantity"] == 6
 
-    assert no_position_item == {
-        "execution_plan_item_id": second_item_id if submitted_item["execution_plan_item_id"] == first_item_id else first_item_id,
-        "symbol": "005930",
-        "intent": "target_sell",
-        "trigger_price": "125000.0000",
-        "observed_price": "125100.0000",
-        "outcome": "no_position",
-        "message": "no sellable execution position is available for this trigger",
-    }
+    assert no_position_item["execution_plan_item_id"] == (
+        second_item_id if submitted_item["execution_plan_item_id"] == first_item_id else first_item_id
+    )
+    assert no_position_item["symbol"] == "005930"
+    assert no_position_item["intent"] == "target_sell"
+    assert no_position_item["trigger_price"] == "125000.0000"
+    assert no_position_item["observed_price"] == "125100.0000"
+    assert no_position_item["outcome"] == "no_position"
+    assert no_position_item["message"] == "no sellable execution position is available for this trigger"
 
     assert broker_adapter.authenticate_calls == 1
     assert len(broker_adapter.order_calls) == 1

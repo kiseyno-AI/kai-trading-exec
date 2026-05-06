@@ -2,7 +2,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Any
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class ExecutionPlanItemRequest(BaseModel):
@@ -16,7 +16,39 @@ class ExecutionPlanItemRequest(BaseModel):
     trigger_price: Decimal | None = None
     time_in_force: str | None = Field(default=None, max_length=32)
     risk_context: dict[str, Any] | None = None
+    decision_agent_name: str | None = Field(default=None, max_length=128)
     decision_snapshot_id: str | None = Field(default=None, max_length=128)
+    decision_run_id: str | None = Field(default=None, max_length=128)
+    source_plan_item_id: str | None = Field(default=None, max_length=128)
+    source_market_date: date | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_identity_aliases(cls, value: object) -> object:
+        if not isinstance(value, dict):
+            return value
+        normalized = dict(value)
+        _copy_alias_value(
+            normalized,
+            destination="decision_agent_name",
+            aliases=("decision_agent_name", "agent_name"),
+        )
+        _copy_alias_value(
+            normalized,
+            destination="decision_run_id",
+            aliases=("decision_run_id", "run_id"),
+        )
+        _copy_alias_value(
+            normalized,
+            destination="source_plan_item_id",
+            aliases=("source_plan_item_id", "core_plan_item_id", "plan_item_id"),
+        )
+        _copy_alias_value(
+            normalized,
+            destination="source_market_date",
+            aliases=("source_market_date", "strategy_market_date", "market_date"),
+        )
+        return normalized
 
     @field_validator("symbol")
     @classmethod
@@ -35,6 +67,16 @@ class ExecutionPlanItemRequest(BaseModel):
         if not normalized:
             raise ValueError("field must not be empty")
         return normalized.lower()
+
+    @field_validator("decision_agent_name", "decision_snapshot_id", "decision_run_id", "source_plan_item_id")
+    @classmethod
+    def normalize_identity_fields(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("field must not be empty")
+        return normalized
 
 
 class ExecutionPlanRequest(BaseModel):
@@ -215,3 +257,18 @@ class ExecutionFailureStatusUpdateRequest(BaseModel):
         if not normalized:
             raise ValueError("field must not be empty")
         return normalized
+
+
+def _copy_alias_value(
+    payload: dict[str, Any],
+    *,
+    destination: str,
+    aliases: tuple[str, ...],
+) -> None:
+    if payload.get(destination) is not None:
+        return
+    for alias in aliases:
+        value = payload.get(alias)
+        if value is not None:
+            payload[destination] = value
+            return

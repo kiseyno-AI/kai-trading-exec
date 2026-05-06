@@ -60,7 +60,7 @@ class DispatchExecutionJobsResult:
 
 def materialize_execution_jobs(plan: ExecutionPlan) -> None:
     for item in plan.items:
-        if item.intent != NEXT_OPEN_BUY_JOB_TYPE:
+        if item.intent != NEXT_OPEN_BUY_JOB_TYPE or item.status != "pending":
             continue
         if _next_open_buy_quantity(item) is None or plan.market_date is None or item.side != "buy":
             item.status = "next_open_buy_pending_configuration"

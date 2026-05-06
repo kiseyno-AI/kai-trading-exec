@@ -17,6 +17,7 @@ from app.broker.base import BrokerAdapter
 from app.core.config import Settings
 from app.models.runtime import ExecutionPlan, ExecutionPlanItem, ExecutionPosition, MonitoringCheckpoint
 from app.services.broker_orders import place_broker_order
+from app.services.plan_item_identity import serialize_plan_item_source_identity
 
 MONITORED_INTENTS = frozenset({"target_sell", "stop_sell"})
 BLOCKED_MONITORING_STATUSES = frozenset(
@@ -69,7 +70,7 @@ class PendingMonitoringAction:
 
 def materialize_monitoring_plan_items(plan: ExecutionPlan) -> None:
     for item in plan.items:
-        if item.intent not in MONITORED_INTENTS:
+        if item.intent not in MONITORED_INTENTS or item.status != "pending":
             continue
         if _monitoring_item_is_configured(item):
             item.status = _monitoring_status(item.intent)
@@ -668,6 +669,7 @@ def _monitoring_result_payload(
         "trigger_price": _serialize_decimal(item.trigger_price),
         "observed_price": _serialize_decimal(observed_price),
         "outcome": outcome,
+        "source_identity": serialize_plan_item_source_identity(item),
     }
     if message is not None:
         payload["message"] = message
