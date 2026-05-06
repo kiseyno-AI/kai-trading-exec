@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 
 from app.api.dependencies import get_broker_adapter, get_db_session, get_settings
 from app.api.schemas.execution import (
+    ExecutionFailureStatusUpdateRequest,
     ExecutionPlanRequest,
     MonitoringEvaluationRequest,
     PlaceOrderRequest,
@@ -21,6 +22,11 @@ from app.services.execution_api import (
     list_execution_plans,
     list_execution_positions,
     list_runtime_symbols,
+)
+from app.services.execution_failures import (
+    ExecutionFailureStatusUpdateCommand,
+    list_execution_failures,
+    update_execution_failure_status,
 )
 from app.services.execution_jobs import dispatch_due_execution_jobs, list_execution_jobs
 from app.services.monitoring import evaluate_monitoring
@@ -123,6 +129,44 @@ def orders(
 ) -> list[dict[str, object]]:
     settings: Settings = get_settings(request)
     return list_broker_orders(settings=settings, db=db)
+
+
+@router.get("/execution-failures")
+def execution_failures(
+    request: Request,
+    db: Annotated[Session, Depends(get_db_session)],
+    classification: str | None = None,
+    status: str | None = None,
+) -> list[dict[str, object]]:
+    settings: Settings = get_settings(request)
+    return list_execution_failures(
+        settings=settings,
+        db=db,
+        classification=classification,
+        status=status,
+    )
+
+
+@router.patch("/execution-failures/{failure_id}")
+def update_execution_failure(
+    failure_id: str,
+    request: Request,
+    db: Annotated[Session, Depends(get_db_session)],
+    payload: ExecutionFailureStatusUpdateRequest = Body(...),
+) -> JSONResponse:
+    settings: Settings = get_settings(request)
+    result = update_execution_failure_status(
+        settings=settings,
+        db=db,
+        failure_id=failure_id,
+        command=ExecutionFailureStatusUpdateCommand(
+            status=payload.status,
+            actor=payload.actor,
+            source=payload.source,
+            reason=payload.reason,
+        ),
+    )
+    return JSONResponse(status_code=result.status_code, content=result.payload)
 
 
 @router.get("/executions")

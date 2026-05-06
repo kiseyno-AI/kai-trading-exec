@@ -163,10 +163,12 @@ class AutonomousRuntimeCoordinator:
                 adapter=adapter,
                 now=started_at,
             )
-            return {
+            payload = {
                 "status_code": result.status_code,
                 **result.payload,
             }
+            self._store_cycle_payload(worker_key="dispatch", payload=payload)
+            return payload
 
     async def _run_monitoring_cycle(self, started_at: datetime) -> dict[str, object]:
         return await asyncio.to_thread(self._monitoring_cycle_sync, started_at)
@@ -198,13 +200,15 @@ class AutonomousRuntimeCoordinator:
                 prices=prices,
                 now=started_at,
             )
-            return {
+            payload = {
                 "status_code": result.status_code,
                 "monitored_symbols": symbols,
                 "price_count": len(prices),
                 "price_source_configured": self.monitoring_price_source is not None,
                 **result.payload,
             }
+            self._store_cycle_payload(worker_key="monitoring", payload=payload)
+            return payload
 
     def _load_monitoring_prices(
         self,
@@ -271,6 +275,16 @@ class AutonomousRuntimeCoordinator:
             state.status = "error"
             state.last_heartbeat_at = heartbeat_at
             state.last_error = error
+
+    def _store_cycle_payload(
+        self,
+        *,
+        worker_key: str,
+        payload: dict[str, object],
+    ) -> None:
+        with self._lock:
+            state = self._state_for(worker_key)
+            state.last_cycle = payload
 
     def _state_for(self, worker_key: str) -> AutonomousWorkerState:
         if worker_key == "dispatch":

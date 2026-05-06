@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -18,6 +18,7 @@ from app.broker.base import (
 from app.core.config import Settings
 from app.models.runtime import BrokerOrder, BrokerOrderEvent, ExecutionPlan, ExecutionPlanItem
 from app.services.broker_auth import ensure_authenticated_broker_session
+from app.services.execution_failures import record_actionable_execution_failure
 from app.services.execution_api import serialize_broker_order
 from app.services.runtime_controls import (
     automated_order_submission_allowed,
@@ -105,6 +106,7 @@ def place_broker_order(
         },
     )
     db.add(order)
+    request_observed_at = datetime.now(UTC)
     try:
         db.flush()
     except IntegrityError:
@@ -132,7 +134,7 @@ def place_broker_order(
         normalized_status=NormalizedBrokerOrderStatus.SUBMISSION_PENDING.value,
         request_payload=_order_command_payload(command),
         payload={"provider": adapter.provider},
-        observed_at=datetime.now(UTC),
+        observed_at=request_observed_at,
     )
     db.add(request_event)
     if plan_item is not None:
@@ -161,8 +163,13 @@ def place_broker_order(
             ),
         )
     except BrokerAdapterError as exc:
+        observed_at = exc.observed_at or datetime.now(UTC)
+        event_observed_at = _response_event_observed_at(
+            observed_at=observed_at,
+            request_observed_at=request_observed_at,
+        )
         order.status = exc.normalized_status.value
-        order.last_broker_sync_at = exc.observed_at or datetime.now(UTC)
+        order.last_broker_sync_at = observed_at
         order.request_metadata = exc.request_metadata or order.request_metadata
         order.response_metadata = exc.response_metadata or None
         order.last_error_classification = exc.classification.value
@@ -183,11 +190,23 @@ def place_broker_order(
                 request_payload=exc.request_payload or _order_command_payload(command),
                 response_payload=exc.response_payload or None,
                 payload={"provider": adapter.provider},
-                observed_at=exc.observed_at or datetime.now(UTC),
+                observed_at=event_observed_at,
             )
         )
         if plan_item is not None:
             plan_item.status = _plan_item_status_for_order_status(order.status)
+        record_actionable_execution_failure(
+            settings=settings,
+            db=db,
+            order=order,
+            plan_item=plan_item,
+            broker_error_classification=exc.classification.value,
+            broker_error_code=exc.code,
+            broker_error_message=str(exc),
+            retryable=exc.retryable,
+            observed_at=observed_at,
+            request_source=request_source,
+        )
         db.commit()
         db.refresh(order)
         return PlaceBrokerOrderResult(
@@ -218,6 +237,10 @@ def place_broker_order(
     order.last_error_message = None
     order.last_error_retryable = None
     order.raw_broker_payload = placement.response_payload
+    event_observed_at = _response_event_observed_at(
+        observed_at=placement.observed_at,
+        request_observed_at=request_observed_at,
+    )
     db.add(
         BrokerOrderEvent(
             broker_order_pk=order.id,
@@ -229,7 +252,7 @@ def place_broker_order(
             request_payload=placement.request_payload,
             response_payload=placement.response_payload,
             payload={"provider": adapter.provider},
-            observed_at=placement.observed_at,
+            observed_at=event_observed_at,
         )
     )
     if plan_item is not None:
@@ -313,3 +336,14 @@ def _plan_item_status_for_order_status(order_status: str) -> str:
     if order_status == NormalizedBrokerOrderStatus.FAILED.value:
         return "broker_order_failed"
     return order_status
+
+
+def _response_event_observed_at(
+    *,
+    observed_at: datetime,
+    request_observed_at: datetime,
+) -> datetime:
+    minimum = request_observed_at + timedelta(microseconds=1)
+    if observed_at >= minimum:
+        return observed_at
+    return minimum

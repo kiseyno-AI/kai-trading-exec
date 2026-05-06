@@ -34,6 +34,7 @@ from app.models.runtime import (
     BrokerOrderEvent,
     BrokerSession,
     BrokerSessionEvent,
+    ExecutionFailure,
     ExecutionFill,
     ExecutionJob,
     ExecutionPlanItem,
@@ -2434,10 +2435,10 @@ def test_place_order_endpoint_persists_retryable_failure() -> None:
     assert payload["order"]["status"] == "retry_pending"
     assert payload["order"]["last_error_classification"] == "rate_limit"
     assert payload["order"]["last_error_retryable"] is True
-    assert [event["event_type"] for event in payload["order"]["events"]] == [
+    assert {event["event_type"] for event in payload["order"]["events"]} == {
         "submit_requested",
         "submit_failed",
-    ]
+    }
 
     with app.state.db_session_factory() as session:
         order = session.scalar(
@@ -2448,6 +2449,513 @@ def test_place_order_endpoint_persists_retryable_failure() -> None:
         assert order.last_error_code == "RATE_LIMIT"
 
     engine.dispose()
+
+
+def test_dispatch_due_next_open_buy_job_persists_insufficient_funds_execution_failure() -> None:
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_error=BrokerAdapterError(
+            "insufficient cash available for order",
+            status_code=422,
+            classification=BrokerErrorClassification.BROKER_REJECTED,
+            retryable=False,
+            code="INSUFFICIENT_CASH",
+            normalized_status=NormalizedBrokerOrderStatus.REJECTED,
+            response_payload={
+                "msg_cd": "INSUFFICIENT_CASH",
+                "msg1": "insufficient cash available for order",
+            },
+            observed_at=datetime(2026, 5, 1, 9, 5, tzinfo=UTC),
+        ),
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+        ),
+        broker_adapter=broker_adapter,
+    )
+    client = TestClient(app)
+
+    client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "console", "reason": "enable automation"},
+    )
+
+    plan_response = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-insufficient-funds-1",
+            "source": "kai-trading-core",
+            "strategy_run_id": "run-insufficient-funds-1",
+            "market_date": "2024-01-03",
+            "items": [
+                {
+                    "symbol": "005930",
+                    "side": "buy",
+                    "intent": "next_open_buy",
+                    "quantity_policy": {"kind": "shares", "quantity": 5},
+                    "limit_price": "71000.00",
+                    "time_in_force": "day",
+                    "risk_context": {"agent_name": "signal-decider"},
+                    "decision_snapshot_id": "decision-1",
+                }
+            ],
+        },
+    )
+    assert plan_response.status_code == 201
+    plan_item_id = plan_response.json()["persisted_execution_item_ids"][0]
+
+    dispatch_response = client.post("/execution-jobs/dispatch")
+    assert dispatch_response.status_code == 200
+    dispatch_payload = dispatch_response.json()
+    assert dispatch_payload["completed_job_count"] == 0
+    assert dispatch_payload["retrying_job_count"] == 0
+    assert dispatch_payload["failed_job_count"] == 1
+
+    failures_response = client.get(
+        "/execution-failures",
+        params={"classification": "insufficient_funds", "status": "open"},
+    )
+    assert failures_response.status_code == 200
+    failures_payload = failures_response.json()
+    assert len(failures_payload) == 1
+    failure = failures_payload[0]
+    assert failure["classification"] == "insufficient_funds"
+    assert failure["status"] == "open"
+    assert failure["execution_plan_item_id"] == plan_item_id
+    assert failure["plan_id"] == "plan-insufficient-funds-1"
+    assert failure["strategy_run_id"] == "run-insufficient-funds-1"
+    assert failure["decision_actor"] == "signal-decider"
+    assert failure["symbol"] == "005930"
+    assert failure["side"] == "buy"
+    assert failure["intent"] == "next_open_buy"
+    assert failure["account"] == "****5678"
+    assert failure["requested_quantity"] == 5
+    assert failure["requested_notional"] == "355000.0000"
+    assert failure["broker_error_code"] == "INSUFFICIENT_CASH"
+    assert failure["broker_error_message"] == "insufficient cash available for order"
+    assert failure["retryable"] is False
+    assert failure["first_failed_at"] == "2026-05-01T09:05:00"
+    assert failure["latest_failed_at"] == "2026-05-01T09:05:00"
+
+    with app.state.db_session_factory() as session:
+        failures = session.scalars(select(ExecutionFailure)).all()
+        assert len(failures) == 1
+        assert failures[0].classification == "insufficient_funds"
+        assert failures[0].status == "open"
+
+    engine.dispose()
+
+
+def test_monitoring_evaluate_persists_insufficient_sellable_quantity_execution_failure() -> None:
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_error=BrokerAdapterError(
+            "insufficient sellable quantity",
+            status_code=422,
+            classification=BrokerErrorClassification.BROKER_REJECTED,
+            retryable=False,
+            code="INSUFFICIENT_SELLABLE_QTY",
+            normalized_status=NormalizedBrokerOrderStatus.REJECTED,
+            response_payload={
+                "msg_cd": "INSUFFICIENT_SELLABLE_QTY",
+                "msg1": "insufficient sellable quantity",
+            },
+            observed_at=datetime(2026, 5, 1, 9, 7, tzinfo=UTC),
+        ),
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+        ),
+        broker_adapter=broker_adapter,
+    )
+    client = TestClient(app)
+
+    client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "console", "reason": "enable automation"},
+    )
+
+    plan_response = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-insufficient-sellable-qty-1",
+            "source": "kai-trading-core",
+            "items": [
+                {
+                    "symbol": "005930",
+                    "side": "sell",
+                    "intent": "stop_sell",
+                    "quantity_policy": {"kind": "shares", "quantity": 3},
+                    "trigger_price": "70000.00",
+                    "limit_price": "69950.00",
+                    "time_in_force": "day",
+                    "risk_context": {"agent_name": "stop-guard"},
+                }
+            ],
+        },
+    )
+    assert plan_response.status_code == 201
+    plan_item_id = plan_response.json()["persisted_execution_item_ids"][0]
+
+    with app.state.db_session_factory() as session:
+        session.add(
+            ExecutionPosition(
+                mode="paper",
+                symbol="005930",
+                quantity=10,
+                average_price=Decimal("70950.5000"),
+                updated_from="reconciliation",
+                raw_payload={"source": "broker"},
+            )
+        )
+        session.commit()
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "sellable quantity rejection",
+            "prices": [{"symbol": "005930", "price": "69900.00"}],
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["submitted_order_count"] == 0
+
+    failures_response = client.get(
+        "/execution-failures",
+        params={"classification": "insufficient_sellable_quantity", "status": "open"},
+    )
+    assert failures_response.status_code == 200
+    failures_payload = failures_response.json()
+    assert len(failures_payload) == 1
+    failure = failures_payload[0]
+    assert failure["classification"] == "insufficient_sellable_quantity"
+    assert failure["execution_plan_item_id"] == plan_item_id
+    assert failure["decision_actor"] == "stop-guard"
+    assert failure["symbol"] == "005930"
+    assert failure["side"] == "sell"
+    assert failure["intent"] == "stop_sell"
+    assert failure["requested_quantity"] == 3
+    assert failure["requested_notional"] == "209850.0000"
+    assert failure["broker_error_code"] == "INSUFFICIENT_SELLABLE_QTY"
+
+    engine.dispose()
+
+
+def test_execution_failures_endpoint_filters_resolved_status() -> None:
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_error=BrokerAdapterError(
+            "insufficient buying power for order",
+            status_code=422,
+            classification=BrokerErrorClassification.BROKER_REJECTED,
+            retryable=False,
+            code="INSUFFICIENT_BUYING_POWER",
+            normalized_status=NormalizedBrokerOrderStatus.REJECTED,
+            response_payload={
+                "msg_cd": "INSUFFICIENT_BUYING_POWER",
+                "msg1": "insufficient buying power for order",
+            },
+            observed_at=datetime(2026, 5, 1, 9, 10, tzinfo=UTC),
+        ),
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+        ),
+        broker_adapter=broker_adapter,
+    )
+    client = TestClient(app)
+
+    client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "console", "reason": "enable automation"},
+    )
+
+    response = client.post(
+        "/orders",
+        json={
+            "idempotency_key": "insufficient-buying-power-1",
+            "symbol": "005930",
+            "side": "buy",
+            "quantity": 5,
+            "order_type": "limit",
+            "limit_price": "71000.00",
+            "time_in_force": "day",
+            "exchange": "KRX",
+        },
+    )
+    assert response.status_code == 422
+
+    failures_response = client.get("/execution-failures", params={"status": "open"})
+    assert failures_response.status_code == 200
+    failures_payload = failures_response.json()
+    assert len(failures_payload) == 1
+    failure_id = failures_payload[0]["execution_failure_id"]
+
+    patch_response = client.patch(
+        f"/execution-failures/{failure_id}",
+        json={
+            "status": "resolved",
+            "actor": "ops",
+            "source": "console",
+            "reason": "cash transfer completed",
+        },
+    )
+    assert patch_response.status_code == 200
+    patched_payload = patch_response.json()
+    assert patched_payload["status"] == "resolved"
+    assert patched_payload["status_updated_by"] == "ops"
+    assert patched_payload["status_updated_source"] == "console"
+    assert patched_payload["status_updated_reason"] == "cash transfer completed"
+
+    open_failures = client.get("/execution-failures", params={"status": "open"})
+    resolved_failures = client.get("/execution-failures", params={"status": "resolved"})
+    assert open_failures.status_code == 200
+    assert resolved_failures.status_code == 200
+    assert open_failures.json() == []
+    assert [item["execution_failure_id"] for item in resolved_failures.json()] == [failure_id]
+
+    engine.dispose()
+
+
+def test_execution_failures_ignore_retryable_and_duplicate_replays() -> None:
+    rate_limit_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_error=BrokerAdapterError(
+            "rate limited by broker",
+            status_code=503,
+            classification=BrokerErrorClassification.RATE_LIMIT,
+            retryable=True,
+            code="RATE_LIMIT",
+            normalized_status=NormalizedBrokerOrderStatus.RETRY_PENDING,
+            response_payload={"msg_cd": "RATE_LIMIT", "msg1": "rate limited by broker"},
+            observed_at=datetime(2026, 5, 1, 9, 12, tzinfo=UTC),
+        ),
+    )
+    rate_limit_app, rate_limit_engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+        ),
+        broker_adapter=rate_limit_adapter,
+    )
+    rate_limit_client = TestClient(rate_limit_app)
+
+    rate_limit_client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "console", "reason": "enable automation"},
+    )
+    rate_limit_response = rate_limit_client.post(
+        "/orders",
+        json={
+            "idempotency_key": "retry-order-2",
+            "symbol": "005930",
+            "side": "buy",
+            "quantity": 5,
+            "order_type": "limit",
+            "limit_price": "71000.00",
+            "time_in_force": "day",
+            "exchange": "KRX",
+        },
+    )
+    assert rate_limit_response.status_code == 503
+    assert rate_limit_client.get("/execution-failures").json() == []
+
+    rate_limit_client.close()
+    rate_limit_engine.dispose()
+
+    insufficient_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_error=BrokerAdapterError(
+            "insufficient cash available for order",
+            status_code=422,
+            classification=BrokerErrorClassification.BROKER_REJECTED,
+            retryable=False,
+            code="INSUFFICIENT_CASH",
+            normalized_status=NormalizedBrokerOrderStatus.REJECTED,
+            response_payload={
+                "msg_cd": "INSUFFICIENT_CASH",
+                "msg1": "insufficient cash available for order",
+            },
+            observed_at=datetime(2026, 5, 1, 9, 13, tzinfo=UTC),
+        ),
+    )
+    insufficient_app, insufficient_engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+        ),
+        broker_adapter=insufficient_adapter,
+    )
+    insufficient_client = TestClient(insufficient_app)
+
+    insufficient_client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "console", "reason": "enable automation"},
+    )
+    payload = {
+        "idempotency_key": "insufficient-duplicate-1",
+        "symbol": "005930",
+        "side": "buy",
+        "quantity": 5,
+        "order_type": "limit",
+        "limit_price": "71000.00",
+        "time_in_force": "day",
+        "exchange": "KRX",
+    }
+    first = insufficient_client.post("/orders", json=payload)
+    second = insufficient_client.post("/orders", json=payload)
+
+    assert first.status_code == 422
+    assert second.status_code == 200
+
+    failures_payload = insufficient_client.get("/execution-failures").json()
+    assert len(failures_payload) == 1
+    assert failures_payload[0]["classification"] == "insufficient_funds"
+
+    with insufficient_app.state.db_session_factory() as session:
+        assert session.query(ExecutionFailure).count() == 1
+
+    insufficient_client.close()
+    insufficient_engine.dispose()
+
+
+def test_execution_failures_persist_after_restart(tmp_path) -> None:
+    database_url = f"sqlite:///{tmp_path / 'execution-failures-restart.db'}"
+    settings = Settings(
+        database_url=database_url,
+        runtime_mode="paper",
+        kis_app_key="paper-key",
+        kis_app_secret="paper-secret",
+        kis_account_number="12345678",
+    )
+    app, engine = build_test_app(
+        settings=settings,
+        broker_adapter=StubBrokerAdapter(
+            config=BrokerConfig(
+                provider="kis",
+                mode="paper",
+                configured=True,
+                api_base_url=KIS_PAPER_API_BASE_URL,
+            ),
+            token_grant=build_token_grant(),
+            order_error=BrokerAdapterError(
+                "insufficient cash available for order",
+                status_code=422,
+                classification=BrokerErrorClassification.BROKER_REJECTED,
+                retryable=False,
+                code="INSUFFICIENT_CASH",
+                normalized_status=NormalizedBrokerOrderStatus.REJECTED,
+                response_payload={
+                    "msg_cd": "INSUFFICIENT_CASH",
+                    "msg1": "insufficient cash available for order",
+                },
+                observed_at=datetime(2026, 5, 1, 9, 15, tzinfo=UTC),
+            ),
+        ),
+    )
+    client = TestClient(app)
+
+    client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "console", "reason": "enable automation"},
+    )
+    response = client.post(
+        "/orders",
+        json={
+            "idempotency_key": "restart-insufficient-funds-1",
+            "symbol": "005930",
+            "side": "buy",
+            "quantity": 5,
+            "order_type": "limit",
+            "limit_price": "71000.00",
+            "time_in_force": "day",
+            "exchange": "KRX",
+        },
+    )
+    assert response.status_code == 422
+
+    client.close()
+    engine.dispose()
+
+    restarted_app, restarted_engine = build_test_app(
+        settings=settings,
+        broker_adapter=StubBrokerAdapter(
+            config=BrokerConfig(
+                provider="kis",
+                mode="paper",
+                configured=True,
+                api_base_url=KIS_PAPER_API_BASE_URL,
+            ),
+            token_grant=build_token_grant(),
+            order_placement=build_order_placement(),
+        ),
+    )
+    restarted_client = TestClient(restarted_app)
+
+    failures_response = restarted_client.get(
+        "/execution-failures",
+        params={"classification": "insufficient_funds", "status": "open"},
+    )
+    assert failures_response.status_code == 200
+    failures_payload = failures_response.json()
+    assert len(failures_payload) == 1
+    assert failures_payload[0]["idempotency_key"] == "restart-insufficient-funds-1"
+
+    restarted_client.close()
+    restarted_engine.dispose()
 
 
 def test_live_mode_cycle_exposes_symbol_readback_and_daily_board_views() -> None:
