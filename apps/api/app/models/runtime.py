@@ -194,7 +194,11 @@ class ExecutionPlanItem(TimestampMixin, Base):
     trigger_price: Mapped[Decimal | None] = mapped_column(Numeric(18, 4))
     time_in_force: Mapped[str | None] = mapped_column(String(32))
     risk_context: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    decision_agent_name: Mapped[str | None] = mapped_column(String(128))
     decision_snapshot_id: Mapped[str | None] = mapped_column(String(128))
+    decision_run_id: Mapped[str | None] = mapped_column(String(128))
+    source_plan_item_id: Mapped[str | None] = mapped_column(String(128))
+    source_market_date: Mapped[date | None] = mapped_column(Date())
 
     plan: Mapped[ExecutionPlan] = relationship(back_populates="items")
     jobs: Mapped[list["ExecutionJob"]] = relationship(back_populates="plan_item")

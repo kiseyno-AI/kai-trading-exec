@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import Settings
 from app.models.runtime import BrokerOrder, ExecutionFailure, ExecutionPlanItem
+from app.services.plan_item_identity import plan_item_decision_agent_name, raw_plan_item_payload
 
 ACTIONABLE_FAILURE_CLASSIFICATIONS = frozenset(
     {
@@ -308,6 +309,10 @@ def _decision_actor(*, plan_item: ExecutionPlanItem | None) -> str | None:
     if plan_item is None:
         return None
 
+    decision_agent_name = plan_item_decision_agent_name(plan_item)
+    if decision_agent_name is not None:
+        return decision_agent_name
+
     candidates: list[dict[str, Any]] = []
     if isinstance(plan_item.risk_context, dict):
         candidates.append(plan_item.risk_context)
@@ -329,18 +334,7 @@ def _decision_actor(*, plan_item: ExecutionPlanItem | None) -> str | None:
 
 
 def _raw_plan_item_payload(plan_item: ExecutionPlanItem) -> dict[str, Any] | None:
-    plan = plan_item.plan
-    if not isinstance(plan.raw_payload, dict):
-        return None
-    raw_items = plan.raw_payload.get("items")
-    if not isinstance(raw_items, list):
-        return None
-    if not 0 <= plan_item.plan_item_index < len(raw_items):
-        return None
-    item = raw_items[plan_item.plan_item_index]
-    if isinstance(item, dict):
-        return item
-    return None
+    return raw_plan_item_payload(plan_item)
 
 
 def _requested_notional(quantity: int, limit_price: Decimal | None) -> Decimal | None:

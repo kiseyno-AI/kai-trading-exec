@@ -7,7 +7,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
-from app.api.schemas.execution import ExecutionPlanRequest
+from app.api.schemas.execution import ExecutionPlanItemRequest, ExecutionPlanRequest
 from app.core.config import Settings
 from app.models.runtime import (
     BrokerOrder,
@@ -16,9 +16,26 @@ from app.models.runtime import (
     ExecutionPlanItem,
     ExecutionPosition,
 )
+from app.services.plan_item_identity import (
+    serialize_plan_item_source_identity,
+    serialize_symbol_source_identities,
+)
 
 MONITORED_INTENTS = frozenset({"target_sell", "stop_sell"})
 OPEN_ORDER_STATUSES = frozenset({"submitted", "open", "partially_filled"})
+SHORT_TERM_DECIDER_NAME = "short-term-decider"
+UNSUPPORTED_BUY_INTENTS = frozenset({"tactical_buy", "trigger_buy", "chase_buy"})
+CHASE_BUY_FIELDS = frozenset(
+    {
+        "chase_limit_price",
+        "chase_limit_offset",
+        "chase_limit_percent",
+        "chase_limit_ticks",
+        "max_chase_limit_price",
+        "entry_limit_price",
+    }
+)
+BUY_TRIGGER_FIELDS = frozenset({"buy_trigger_price", "entry_trigger_price", "trigger_price"})
 
 
 @dataclass(frozen=True)
@@ -48,13 +65,17 @@ def create_execution_plan(
                 symbol=item.symbol,
                 side=item.side,
                 intent=item.intent,
-                status="pending",
+                status=_initial_plan_item_status(item),
                 quantity_policy=item.quantity_policy,
                 limit_price=item.limit_price,
                 trigger_price=item.trigger_price,
                 time_in_force=item.time_in_force,
                 risk_context=item.risk_context,
+                decision_agent_name=item.decision_agent_name,
                 decision_snapshot_id=item.decision_snapshot_id,
+                decision_run_id=item.decision_run_id,
+                source_plan_item_id=item.source_plan_item_id,
+                source_market_date=item.source_market_date,
             )
             for index, item in enumerate(command.items)
         ],
@@ -127,7 +148,10 @@ def list_broker_orders(
     orders = db.scalars(
         select(BrokerOrder)
         .where(BrokerOrder.mode == settings.runtime_mode)
-        .options(selectinload(BrokerOrder.events))
+        .options(
+            selectinload(BrokerOrder.events),
+            selectinload(BrokerOrder.plan_item).selectinload(ExecutionPlanItem.plan),
+        )
         .order_by(BrokerOrder.created_at.desc(), BrokerOrder.id.desc()),
     ).all()
     return [serialize_broker_order(order) for order in orders]
@@ -142,6 +166,11 @@ def list_execution_fills(
         select(ExecutionFill)
         .join(ExecutionFill.broker_order)
         .where(BrokerOrder.mode == settings.runtime_mode)
+        .options(
+            selectinload(ExecutionFill.broker_order)
+            .selectinload(BrokerOrder.plan_item)
+            .selectinload(ExecutionPlanItem.plan),
+        )
         .order_by(ExecutionFill.filled_at.desc(), ExecutionFill.id.desc()),
     ).all()
     return [_serialize_execution_fill(fill) for fill in fills]
@@ -157,7 +186,18 @@ def list_execution_positions(
         .where(ExecutionPosition.mode == settings.runtime_mode)
         .order_by(ExecutionPosition.symbol.asc()),
     ).all()
-    return [_serialize_execution_position(position) for position in positions]
+    plan_items_by_symbol = _load_plan_items_by_symbol(
+        settings=settings,
+        db=db,
+        symbols={position.symbol for position in positions},
+    )
+    return [
+        _serialize_execution_position(
+            position,
+            related_plan_items=plan_items_by_symbol.get(position.symbol, []),
+        )
+        for position in positions
+    ]
 
 
 def list_runtime_symbols(
@@ -226,7 +266,11 @@ def get_runtime_symbol_detail(
                 if item.status.endswith("_pending_dispatch")
             ),
         },
-        "position": _serialize_execution_position(position) if position is not None else None,
+        "position": (
+            _serialize_execution_position(position, related_plan_items=plan_items)
+            if position is not None
+            else None
+        ),
         "plan_items": [
             _serialize_execution_plan_item_detail(item)
             for item in _sort_plan_items_desc(plan_items)
@@ -269,6 +313,7 @@ def _serialize_execution_plan(plan: ExecutionPlan) -> dict[str, object]:
 
 
 def _serialize_execution_plan_item(item: ExecutionPlanItem) -> dict[str, object]:
+    source_identity = serialize_plan_item_source_identity(item)
     return {
         "execution_plan_item_id": item.id,
         "symbol": item.symbol,
@@ -280,7 +325,14 @@ def _serialize_execution_plan_item(item: ExecutionPlanItem) -> dict[str, object]
         "trigger_price": _serialize_decimal(item.trigger_price),
         "time_in_force": item.time_in_force,
         "risk_context": item.risk_context,
+        "decision_agent_name": source_identity["decision_agent_name"],
+        "agent_name": source_identity["agent_name"],
         "decision_snapshot_id": item.decision_snapshot_id,
+        "decision_run_id": source_identity["decision_run_id"],
+        "source_plan_item_id": source_identity["source_plan_item_id"],
+        "core_plan_item_id": source_identity["core_plan_item_id"],
+        "source_market_date": source_identity["source_market_date"],
+        "source_identity": source_identity,
         "created_at": _serialize_datetime(item.created_at),
         "updated_at": _serialize_datetime(item.updated_at),
     }
@@ -307,6 +359,11 @@ def serialize_broker_order(
     *,
     include_events: bool = False,
 ) -> dict[str, object]:
+    source_identity = (
+        serialize_plan_item_source_identity(order.plan_item)
+        if order.plan_item is not None
+        else None
+    )
     payload = {
         "broker_order_pk": order.id,
         "execution_plan_item_id": order.execution_plan_item_id,
@@ -327,6 +384,7 @@ def serialize_broker_order(
         "last_error_message": order.last_error_message,
         "last_error_retryable": order.last_error_retryable,
         "raw_broker_payload": order.raw_broker_payload,
+        "source_identity": source_identity,
         "created_at": _serialize_datetime(order.created_at),
         "updated_at": _serialize_datetime(order.updated_at),
         "event_count": len(order.events),
@@ -366,6 +424,9 @@ def serialize_broker_order_event(event) -> dict[str, object]:
 
 
 def _serialize_execution_fill(fill: ExecutionFill) -> dict[str, object]:
+    source_identity = None
+    if fill.broker_order.plan_item is not None:
+        source_identity = serialize_plan_item_source_identity(fill.broker_order.plan_item)
     return {
         "execution_fill_id": fill.id,
         "broker_order_pk": fill.broker_order_pk,
@@ -376,12 +437,17 @@ def _serialize_execution_fill(fill: ExecutionFill) -> dict[str, object]:
         "price": _serialize_decimal(fill.price),
         "filled_at": _serialize_datetime(fill.filled_at),
         "payload": fill.payload,
+        "source_identity": source_identity,
         "created_at": _serialize_datetime(fill.created_at),
         "updated_at": _serialize_datetime(fill.updated_at),
     }
 
 
-def _serialize_execution_position(position: ExecutionPosition) -> dict[str, object]:
+def _serialize_execution_position(
+    position: ExecutionPosition,
+    *,
+    related_plan_items: list[ExecutionPlanItem] | None = None,
+) -> dict[str, object]:
     return {
         "execution_position_id": position.id,
         "symbol": position.symbol,
@@ -390,6 +456,7 @@ def _serialize_execution_position(position: ExecutionPosition) -> dict[str, obje
         "updated_from": position.updated_from,
         "last_reconciled_at": _serialize_datetime(position.last_reconciled_at),
         "raw_payload": position.raw_payload,
+        "source_identities": serialize_symbol_source_identities(related_plan_items or []),
         "created_at": _serialize_datetime(position.created_at),
         "updated_at": _serialize_datetime(position.updated_at),
     }
@@ -432,13 +499,21 @@ def _load_runtime_symbol_state(
     orders_query = (
         select(BrokerOrder)
         .where(BrokerOrder.mode == settings.runtime_mode)
-        .options(selectinload(BrokerOrder.events))
+        .options(
+            selectinload(BrokerOrder.events),
+            selectinload(BrokerOrder.plan_item).selectinload(ExecutionPlanItem.plan),
+        )
         .order_by(BrokerOrder.created_at.desc(), BrokerOrder.id.desc())
     )
     fills_query = (
         select(ExecutionFill)
         .join(ExecutionFill.broker_order)
         .where(BrokerOrder.mode == settings.runtime_mode)
+        .options(
+            selectinload(ExecutionFill.broker_order)
+            .selectinload(BrokerOrder.plan_item)
+            .selectinload(ExecutionPlanItem.plan),
+        )
         .order_by(ExecutionFill.filled_at.desc(), ExecutionFill.id.desc())
     )
     positions_query = (
@@ -560,3 +635,67 @@ def _latest_datetime(values: list[datetime | None]) -> datetime | None:
     if not concrete_values:
         return None
     return max(concrete_values)
+
+
+def _load_plan_items_by_symbol(
+    *,
+    settings: Settings,
+    db: Session,
+    symbols: set[str],
+) -> dict[str, list[ExecutionPlanItem]]:
+    if not symbols:
+        return {}
+    items = db.scalars(
+        select(ExecutionPlanItem)
+        .join(ExecutionPlanItem.plan)
+        .where(
+            ExecutionPlan.mode == settings.runtime_mode,
+            ExecutionPlanItem.symbol.in_(sorted(symbols)),
+        )
+        .options(selectinload(ExecutionPlanItem.plan))
+        .order_by(
+            ExecutionPlan.accepted_at.desc(),
+            ExecutionPlan.created_at.desc(),
+            ExecutionPlanItem.plan_item_index.asc(),
+            ExecutionPlanItem.id.asc(),
+        )
+    ).all()
+    plan_items_by_symbol: dict[str, list[ExecutionPlanItem]] = defaultdict(list)
+    for item in items:
+        plan_items_by_symbol[item.symbol].append(item)
+    return plan_items_by_symbol
+
+
+def _initial_plan_item_status(item: ExecutionPlanItemRequest) -> str:
+    if item.side != "buy":
+        return "pending"
+    if item.intent == "next_open_buy":
+        if item.trigger_price is not None or _item_has_buy_chase_or_trigger_fields(item):
+            return "pending_configuration"
+        if _decision_agent_name(item) == SHORT_TERM_DECIDER_NAME:
+            return "unsupported_semantics"
+        return "pending"
+    if item.intent in UNSUPPORTED_BUY_INTENTS:
+        return "unsupported_semantics"
+    if _decision_agent_name(item) == SHORT_TERM_DECIDER_NAME:
+        return "unsupported_semantics"
+    return "pending"
+
+
+def _item_has_buy_chase_or_trigger_fields(item: ExecutionPlanItemRequest) -> bool:
+    extras = item.model_extra or {}
+    payloads = [extras]
+    if isinstance(item.risk_context, dict):
+        payloads.append(item.risk_context)
+    for payload in payloads:
+        for key in CHASE_BUY_FIELDS | BUY_TRIGGER_FIELDS:
+            if payload.get(key) is not None:
+                return True
+    return False
+
+
+def _decision_agent_name(item: ExecutionPlanItemRequest) -> str | None:
+    value = item.decision_agent_name
+    if value is None:
+        return None
+    return value.strip().lower()

@@ -165,13 +165,21 @@ Suggested body shape:
   - `trigger_price`
   - `time_in_force`
   - `risk_context`
+  - `agent_name` or `decision_agent_name`
   - `decision_snapshot_id`
+  - `decision_run_id`
+  - `source_plan_item_id` / `core_plan_item_id`
+  - `source_market_date`
 
 Suggested response shape:
 - accepted/rejected item counts
 - validation failures
 - persisted execution item ids
 - runtime mode summary
+
+Current item behavior additionally includes:
+- canonical source identity readback (`decision_agent_name`, `decision_run_id`, `source_plan_item_id`, ...)
+- safe non-dispatch statuses for unsupported short-term buy semantics (`pending_configuration`, `unsupported_semantics`)
 
 ## Order/query APIs
 
@@ -182,6 +190,14 @@ For the current next-open slice, eligible `next_open_buy` items transition to
 `next_open_buy_scheduled` and receive a durable `execution_job` scheduled for
 the market open on `market_date`. Items without enough scheduling information
 remain persisted but do not receive a dispatchable job yet.
+
+Current plan-item readback also includes:
+- `source_identity`
+- `decision_agent_name` / `agent_name`
+- `decision_snapshot_id`
+- `decision_run_id`
+- `source_plan_item_id` / `core_plan_item_id`
+- `source_market_date`
 
 ### `GET /execution-jobs`
 List execution jobs for the active runtime mode.
@@ -232,21 +248,27 @@ Current response includes:
   - `pending_dispatch_count`
 - `position`
   - serialized current `execution_positions` row when present
+  - `source_identities[]` aggregated from related execution-plan items for that symbol
 - `plan_items[]`
   - execution-plan item plus parent-plan context (`plan_id`, `plan_source`, `plan_market_date`, `plan_status`, ...)
 - `orders[]`
   - serialized broker order plus audit events
+  - `source_identity`
 - `fills[]`
   - serialized execution fills
+  - `source_identity`
 
 ### `GET /orders`
 List stored broker orders for the active runtime mode.
+Current readback includes `source_identity` when the order is tied to an accepted execution-plan item.
 
 ### `GET /executions`
 List stored execution fills for the active runtime mode.
+Current readback includes `source_identity` when the fill is tied to a broker order created from an accepted execution-plan item.
 
 ### `GET /positions`
 List stored execution positions for the active runtime mode.
+Current readback includes `source_identities[]` aggregated from related execution-plan items for that symbol.
 
 `GET /executions` and `GET /positions` reflect durable exec-owned broker truth as fills
 and position updates arrive. Order acknowledgement alone does not create fill or
