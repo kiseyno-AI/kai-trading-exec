@@ -9,6 +9,7 @@ from sqlalchemy import select
 from app.broker.base import (
     BrokerAdapterError,
     BrokerConfig,
+    BrokerCurrentPrice,
     BrokerErrorClassification,
     BrokerOrderPlacement,
     BrokerOrderPlacementRequest,
@@ -44,9 +45,38 @@ from app.models.runtime import (
 
 
 class RecordingHttpClient:
-    def __init__(self, response: dict[str, object]) -> None:
+    def __init__(
+        self,
+        response: dict[str, object],
+        *,
+        get_response: dict[str, object] | None = None,
+    ) -> None:
         self.response = response
+        self.get_response = response if get_response is None else get_response
         self.calls: list[dict[str, object]] = []
+        self.get_calls: list[dict[str, object]] = []
+
+    def get_json(
+        self,
+        *,
+        url: str,
+        headers: dict[str, str],
+        params: dict[str, object],
+        timeout_seconds: float,
+    ) -> JsonHttpResponse:
+        self.get_calls.append(
+            {
+                "url": url,
+                "headers": headers,
+                "params": params,
+                "timeout_seconds": timeout_seconds,
+            }
+        )
+        return JsonHttpResponse(
+            status_code=200,
+            headers={"content-type": "application/json"},
+            payload=self.get_response,
+        )
 
     def post_json(
         self,
@@ -81,9 +111,11 @@ class StubBrokerAdapter:
         token_grant: BrokerTokenGrant | None = None,
         approval: BrokerRealtimeApproval | None = None,
         order_placement: BrokerOrderPlacement | None = None,
+        current_prices: dict[str, Decimal] | None = None,
         auth_error: Exception | None = None,
         approval_error: Exception | None = None,
         order_error: Exception | None = None,
+        current_price_error: Exception | None = None,
         revoke_error: Exception | None = None,
     ) -> None:
         self.config = config
@@ -93,14 +125,17 @@ class StubBrokerAdapter:
             issued_at=datetime.now(UTC),
         )
         self.order_placement = order_placement
+        self.current_prices = current_prices or {}
         self.auth_error = auth_error
         self.approval_error = approval_error
         self.order_error = order_error
+        self.current_price_error = current_price_error
         self.revoke_error = revoke_error
         self.authenticate_calls = 0
         self.approval_calls = 0
         self.revoke_calls: list[str] = []
         self.order_calls: list[BrokerOrderPlacementRequest] = []
+        self.current_price_calls: list[tuple[str, str]] = []
 
     def describe(self) -> BrokerConfig:
         return self.config
@@ -136,6 +171,28 @@ class StubBrokerAdapter:
         assert access_token
         assert self.order_placement is not None
         return self.order_placement
+
+    def get_current_price(
+        self,
+        access_token: str,
+        *,
+        symbol: str,
+        exchange: str = "KRX",
+    ) -> BrokerCurrentPrice | None:
+        self.current_price_calls.append((symbol, exchange))
+        if self.current_price_error is not None:
+            raise self.current_price_error
+        assert access_token
+        price = self.current_prices.get(symbol)
+        if price is None:
+            return None
+        return BrokerCurrentPrice(
+            symbol=symbol,
+            exchange=exchange,
+            price=price,
+            observed_at=datetime.now(UTC),
+            payload={"output": {"stck_prpr": str(price)}},
+        )
 
     def reconnect_handle(self) -> BrokerReconnectHandle:
         return BrokerReconnectHandle(
@@ -326,6 +383,44 @@ def test_kis_adapter_uses_client_credentials_token_flow() -> None:
     assert grant.access_token == "access-token-1"
     assert grant.token_type == "Bearer"
     assert grant.access_token_expires_at.isoformat() == "2026-05-30T08:10:10+09:00"
+
+
+def test_kis_adapter_fetches_current_price_quote() -> None:
+    http_client = RecordingHttpClient(
+        {},
+        get_response={
+            "rt_cd": "0",
+            "msg_cd": "0",
+            "msg1": "success",
+            "output": {
+                "stck_prpr": "125100",
+            },
+        },
+    )
+    adapter = KisBrokerAdapter(
+        settings=Settings(
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+        ),
+        http_client=http_client,
+    )
+
+    quote = adapter.get_current_price("access-token", symbol="005930")
+
+    assert http_client.get_calls[0]["url"] == (
+        f"{KIS_PAPER_API_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-price"
+    )
+    assert http_client.get_calls[0]["headers"]["authorization"] == "Bearer access-token"
+    assert http_client.get_calls[0]["headers"]["tr_id"] == "FHKST01010100"
+    assert http_client.get_calls[0]["params"] == {
+        "FID_COND_MRKT_DIV_CODE": "J",
+        "FID_INPUT_ISCD": "005930",
+    }
+    assert quote is not None
+    assert quote.symbol == "005930"
+    assert quote.exchange == "KRX"
+    assert quote.price == Decimal("125100")
 
 
 def test_runtime_status_reports_disabled_broker_summary_in_mock_mode() -> None:
@@ -3622,7 +3717,106 @@ def test_autonomous_monitoring_loop_triggers_target_sell_from_price_source() -> 
     engine.dispose()
 
 
-def test_autonomous_monitoring_loop_retries_pending_dispatch_after_restart_without_price_source(
+def test_autonomous_monitoring_loop_reports_degraded_status_when_live_source_fails() -> None:
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        current_price_error=BrokerAdapterError(
+            "quote feed unavailable",
+            status_code=503,
+            classification=BrokerErrorClassification.NETWORK,
+            retryable=True,
+        ),
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+            dispatch_loop_interval_seconds=60,
+            monitoring_loop_interval_seconds=0.05,
+        ),
+        broker_adapter=broker_adapter,
+        autonomous_runtime_enabled=True,
+    )
+    with TestClient(app) as client:
+        resume = client.post(
+            "/controls/resume",
+            json={"actor": "ops", "source": "console", "reason": "enable autonomous runtime"},
+        )
+        assert resume.status_code == 200
+
+        plan_response = client.post(
+            "/execution-plans",
+            json={
+                "plan_id": "plan-autonomous-monitoring-failure",
+                "source": "kai-trading-core",
+                "items": [
+                    {
+                        "symbol": "005930",
+                        "side": "sell",
+                        "intent": "target_sell",
+                        "quantity_policy": {"kind": "shares", "quantity": 1},
+                        "trigger_price": "125000.00",
+                        "time_in_force": "day",
+                        "risk_context": {"exchange": "KRX"},
+                    }
+                ],
+            },
+        )
+        assert plan_response.status_code == 201
+
+        with app.state.db_session_factory() as session:
+            session.add(
+                ExecutionPosition(
+                    mode="paper",
+                    symbol="005930",
+                    quantity=1,
+                    average_price=Decimal("120000.0000"),
+                    updated_from="reconciliation",
+                    raw_payload={"source": "broker"},
+                )
+            )
+            session.commit()
+
+        wait_for(
+            lambda: client.get("/runtime/status").json()["liveness"]["autonomous"]["monitoring"]["last_cycle"]
+            is not None
+        )
+
+        runtime_status = client.get("/runtime/status")
+        assert runtime_status.status_code == 200
+        payload = runtime_status.json()
+        assert payload["ready"] is False
+        assert (
+            "monitoring price source is degraded: monitoring price source request failed"
+            in payload["readiness"]["reasons"]
+        )
+        assert payload["liveness"]["monitoring"]["status"] == "degraded"
+        autonomous = payload["liveness"]["autonomous"]["monitoring"]
+        assert autonomous["status"] == "running"
+        assert autonomous["price_source_configured"] is True
+        assert autonomous["price_source"]["status"] == "degraded"
+        assert autonomous["price_source"]["last_error"] == "quote feed unavailable"
+
+        with app.state.db_session_factory() as session:
+            order = session.scalar(select(BrokerOrder))
+            checkpoint = session.scalar(select(MonitoringCheckpoint))
+            assert order is None
+            assert checkpoint is not None
+            assert checkpoint.details["price_count"] == 0
+
+    engine.dispose()
+
+
+def test_autonomous_monitoring_loop_retries_pending_dispatch_after_restart_with_no_quotes(
     tmp_path,
 ) -> None:
     database_url = f"sqlite:///{tmp_path / 'autonomous-monitoring-restart.db'}"
@@ -3748,12 +3942,24 @@ def test_autonomous_monitoring_loop_retries_pending_dispatch_after_restart_witho
 
         runtime_status = restarted_client.get("/runtime/status")
         assert runtime_status.status_code == 200
-        monitoring = runtime_status.json()["liveness"]["monitoring"]
-        autonomous = runtime_status.json()["liveness"]["autonomous"]["monitoring"]
-        assert monitoring["status"] == "running"
+        payload = runtime_status.json()
+        monitoring = payload["liveness"]["monitoring"]
+        autonomous = payload["liveness"]["autonomous"]["monitoring"]
+        assert payload["ready"] is False
+        assert (
+            "monitoring price source is degraded: price source returned no prices for monitored symbols"
+            in payload["readiness"]["reasons"]
+        )
+        assert monitoring["status"] == "degraded"
         assert autonomous["status"] == "running"
         assert autonomous["last_cycle"] is not None
         assert autonomous["last_cycle"]["price_count"] == 0
+        assert autonomous["price_source_configured"] is True
+        assert autonomous["price_source"]["status"] == "degraded"
+        assert (
+            autonomous["price_source"]["reason"]
+            == "price source returned no prices for monitored symbols"
+        )
 
         with restarted_app.state.db_session_factory() as session:
             first_item = session.get(ExecutionPlanItem, first_item_id)

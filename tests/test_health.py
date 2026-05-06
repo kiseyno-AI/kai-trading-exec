@@ -208,6 +208,26 @@ def test_runtime_status_reports_readiness_and_default_safety() -> None:
     engine.dispose()
 
 
+def test_create_app_injects_default_kis_monitoring_price_source_for_paper_runtime() -> None:
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+        )
+    )
+
+    snapshot = app.state.autonomous_runtime.snapshot()
+
+    assert snapshot["monitoring"]["price_source_configured"] is True
+    assert snapshot["monitoring"]["price_source"]["source_name"] == "kis_current_quote_rest"
+    assert snapshot["monitoring"]["price_source"]["provider"] == "kis"
+    assert snapshot["monitoring"]["price_source"]["status"] == "configured"
+
+    engine.dispose()
+
+
 def test_runtime_status_requires_complete_exec_owned_schema() -> None:
     app, engine = build_test_app(
         settings=Settings(

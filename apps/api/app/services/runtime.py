@@ -308,6 +308,7 @@ def readiness_payload(
     dependencies_ok: bool,
     safety: dict[str, object],
     counts_available: bool,
+    extra_reasons: list[str] | None = None,
 ) -> dict[str, object]:
     reasons: list[str] = []
     if not dependencies_ok:
@@ -318,6 +319,8 @@ def readiness_payload(
         reasons.append("runtime is paused")
     if not counts_available:
         reasons.append("runtime counters are unavailable")
+    if extra_reasons:
+        reasons.extend(extra_reasons)
 
     return {
         "ready": not reasons,
@@ -337,6 +340,8 @@ def build_runtime_status(
         "runtime_schema": "ok",
     }
     counts: dict[str, int] = {"open_orders": 0, "active_execution_jobs": 0}
+    autonomous = autonomous_runtime or _default_autonomous_runtime_payload(settings)
+    monitoring_price_source = _autonomous_monitoring_price_source(autonomous)
     monitoring: dict[str, object] = {
         "status": "not_started",
         "topology": MONITORING_RUNTIME_TOPOLOGY,
@@ -354,8 +359,8 @@ def build_runtime_status(
         "last_heartbeat_at": None,
         "last_success_at": None,
         "last_cycle": None,
+        "price_source": monitoring_price_source,
     }
-    autonomous = autonomous_runtime or _default_autonomous_runtime_payload(settings)
     symbols: dict[str, list[str]] = {
         "monitored": [],
         "scheduled_today": [],
@@ -440,6 +445,7 @@ def build_runtime_status(
         safety = runtime_safety_payload(state)
         counts = runtime_counts(settings=settings, db=db)
         monitoring = monitoring_payload(settings=settings, db=db)
+        monitoring["price_source"] = monitoring_price_source
         broker = build_broker_session_summary(settings=settings, db=db)
         symbols = runtime_symbol_summary(settings=settings, db=db)
     except SQLAlchemyError as exc:
@@ -451,10 +457,18 @@ def build_runtime_status(
             f"runtime state unavailable: {exc.__class__.__name__}; run migrations",
         )
 
+    monitoring_reasons = _monitoring_price_source_readiness_reasons(
+        autonomous=autonomous,
+        symbols=symbols,
+    )
+    if monitoring_reasons:
+        monitoring["status"] = "degraded"
+
     readiness = readiness_payload(
         dependencies_ok=all(value == "ok" for value in dependencies.values()),
         safety=safety,
         counts_available=counts_available,
+        extra_reasons=monitoring_reasons,
     )
     return {
         "service": settings.service_name,
@@ -536,5 +550,78 @@ def _default_autonomous_runtime_payload(settings: Settings) -> dict[str, object]
             "last_error": None,
             "last_cycle": None,
             "price_source_configured": False,
+            "price_source": {
+                "configured": False,
+                "source_name": None,
+                "provider": None,
+                "status": "disabled",
+                "reason": "no monitoring price source is configured",
+                "last_checked_at": None,
+                "last_success_at": None,
+                "last_error": None,
+                "last_error_at": None,
+                "last_symbol_count": 0,
+                "last_price_count": 0,
+            },
         },
     }
+
+
+def _autonomous_monitoring_price_source(autonomous: dict[str, object]) -> dict[str, object]:
+    monitoring = autonomous.get("monitoring")
+    if isinstance(monitoring, dict):
+        price_source = monitoring.get("price_source")
+        if isinstance(price_source, dict):
+            return price_source
+        if monitoring.get("price_source_configured") is True:
+            return {
+                "configured": True,
+                "source_name": None,
+                "provider": None,
+                "status": "configured",
+                "reason": None,
+                "last_checked_at": None,
+                "last_success_at": None,
+                "last_error": None,
+                "last_error_at": None,
+                "last_symbol_count": 0,
+                "last_price_count": 0,
+            }
+    return {
+        "configured": False,
+        "source_name": None,
+        "provider": None,
+        "status": "disabled",
+        "reason": "no monitoring price source is configured",
+        "last_checked_at": None,
+        "last_success_at": None,
+        "last_error": None,
+        "last_error_at": None,
+        "last_symbol_count": 0,
+        "last_price_count": 0,
+    }
+
+
+def _monitoring_price_source_readiness_reasons(
+    *,
+    autonomous: dict[str, object],
+    symbols: dict[str, list[str]],
+) -> list[str]:
+    if not autonomous.get("enabled"):
+        return []
+    monitored_symbols = symbols.get("monitored") or []
+    if not monitored_symbols:
+        return []
+
+    price_source = _autonomous_monitoring_price_source(autonomous)
+    if not price_source.get("configured"):
+        return ["monitoring price source is not configured while monitored symbols exist"]
+
+    status = str(price_source.get("status") or "")
+    if status in {"configured", "ready"}:
+        return []
+
+    reason = price_source.get("reason")
+    if isinstance(reason, str) and reason.strip():
+        return [f"monitoring price source is degraded: {reason}"]
+    return ["monitoring price source is degraded while monitored symbols exist"]

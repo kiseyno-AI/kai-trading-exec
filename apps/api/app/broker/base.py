@@ -70,6 +70,15 @@ class BrokerRealtimeApproval:
 
 
 @dataclass(frozen=True)
+class BrokerCurrentPrice:
+    symbol: str
+    exchange: str
+    price: Decimal
+    observed_at: datetime
+    payload: dict[str, Any]
+
+
+@dataclass(frozen=True)
 class BrokerTokenRevocation:
     message: str
 
@@ -153,6 +162,14 @@ class BrokerAdapter(Protocol):
         access_token: str,
         request: BrokerOrderPlacementRequest,
     ) -> BrokerOrderPlacement: ...
+
+    def get_current_price(
+        self,
+        access_token: str,
+        *,
+        symbol: str,
+        exchange: str = "KRX",
+    ) -> BrokerCurrentPrice | None: ...
 
     def reconnect_handle(self) -> BrokerReconnectHandle: ...
 
