@@ -672,6 +672,8 @@ def _initial_plan_item_status(item: ExecutionPlanItemRequest) -> str:
     if item.intent == "next_open_buy":
         if item.trigger_price is not None or _item_has_buy_chase_or_trigger_fields(item):
             return "pending_configuration"
+        if _decision_agent_name(item) == SHORT_TERM_DECIDER_NAME:
+            return "unsupported_semantics"
         return "pending"
     if item.intent in UNSUPPORTED_BUY_INTENTS:
         return "unsupported_semantics"

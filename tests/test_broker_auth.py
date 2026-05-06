@@ -1436,7 +1436,7 @@ def test_execution_plan_items_preserve_cross_decider_identity_without_symbol_dat
     engine.dispose()
 
 
-def test_short_term_trigger_and_chase_buy_items_are_safely_blocked() -> None:
+def test_short_term_buy_items_are_safely_blocked_from_scheduling() -> None:
     broker_adapter = StubBrokerAdapter(
         config=BrokerConfig(
             provider="kis",
@@ -1493,6 +1493,15 @@ def test_short_term_trigger_and_chase_buy_items_are_safely_blocked() -> None:
                     "decision_agent_name": "short-term-decider",
                     "source_plan_item_id": "core-trigger-chase-entry-1",
                 },
+                {
+                    "symbol": "035420",
+                    "side": "buy",
+                    "intent": "next_open_buy",
+                    "quantity_policy": {"kind": "shares", "quantity": 1},
+                    "limit_price": "210000.00",
+                    "decision_agent_name": "short-term-decider",
+                    "source_plan_item_id": "core-plain-next-open-entry-1",
+                },
             ],
         },
     )
@@ -1505,6 +1514,7 @@ def test_short_term_trigger_and_chase_buy_items_are_safely_blocked() -> None:
     }
     assert items_by_source["core-tactical-entry-1"]["status"] == "unsupported_semantics"
     assert items_by_source["core-trigger-chase-entry-1"]["status"] == "pending_configuration"
+    assert items_by_source["core-plain-next-open-entry-1"]["status"] == "unsupported_semantics"
 
     jobs_payload = client.get("/execution-jobs").json()
     assert jobs_payload == []
