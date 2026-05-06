@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 from typing import Any, Protocol
+from urllib.parse import urlencode
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -11,6 +13,7 @@ from app.broker.base import (
     BrokerAdapter,
     BrokerAdapterError,
     BrokerConfig,
+    BrokerCurrentPrice,
     BrokerErrorClassification,
     BrokerOrderPlacement,
     BrokerOrderPlacementRequest,
@@ -30,6 +33,8 @@ KIS_TOKEN_PATH = "/oauth2/tokenP"
 KIS_REVOKE_PATH = "/oauth2/revokeP"
 KIS_HASHKEY_PATH = "/uapi/hashkey"
 KIS_ORDER_CASH_PATH = "/uapi/domestic-stock/v1/trading/order-cash"
+KIS_CURRENT_PRICE_PATH = "/uapi/domestic-stock/v1/quotations/inquire-price"
+KIS_CURRENT_PRICE_TR_ID = "FHKST01010100"
 KIS_TIMEZONE = timezone(timedelta(hours=9))
 
 
@@ -41,6 +46,15 @@ class JsonHttpResponse:
 
 
 class JsonHttpClient(Protocol):
+    def get_json(
+        self,
+        *,
+        url: str,
+        headers: dict[str, str],
+        params: dict[str, object],
+        timeout_seconds: float,
+    ) -> JsonHttpResponse: ...
+
     def post_json(
         self,
         *,
@@ -52,6 +66,28 @@ class JsonHttpClient(Protocol):
 
 
 class UrllibJsonHttpClient:
+    def get_json(
+        self,
+        *,
+        url: str,
+        headers: dict[str, str],
+        params: dict[str, object],
+        timeout_seconds: float,
+    ) -> JsonHttpResponse:
+        query = urlencode(
+            {
+                key: str(value)
+                for key, value in params.items()
+                if value is not None
+            }
+        )
+        request = Request(
+            url=f"{url}?{query}" if query else url,
+            headers=headers,
+            method="GET",
+        )
+        return self._request_json(request=request, timeout_seconds=timeout_seconds)
+
     def post_json(
         self,
         *,
@@ -66,6 +102,14 @@ class UrllibJsonHttpClient:
             headers=headers,
             method="POST",
         )
+        return self._request_json(request=request, timeout_seconds=timeout_seconds)
+
+    def _request_json(
+        self,
+        *,
+        request: Request,
+        timeout_seconds: float,
+    ) -> JsonHttpResponse:
         try:
             with urlopen(request, timeout=timeout_seconds) as response:
                 raw_body = response.read().decode("utf-8")
@@ -305,6 +349,88 @@ class KisBrokerAdapter(BrokerAdapter):
             request_payload=request_payload,
             response_payload=body,
             message=_optional_string(body.get("msg1")),
+        )
+
+    def get_current_price(
+        self,
+        access_token: str,
+        *,
+        symbol: str,
+        exchange: str = "KRX",
+    ) -> BrokerCurrentPrice | None:
+        config = self._configured()
+        request_metadata = {
+            "provider": self.provider,
+            "endpoint": KIS_CURRENT_PRICE_PATH,
+            "method": "GET",
+            "tr_id": KIS_CURRENT_PRICE_TR_ID,
+            "requested_at": datetime.now(UTC).isoformat(),
+            "symbol": symbol,
+            "exchange": exchange,
+        }
+        params = {
+            "FID_COND_MRKT_DIV_CODE": _quote_market_division(exchange),
+            "FID_INPUT_ISCD": symbol,
+        }
+        try:
+            response = self.http_client.get_json(
+                url=f"{config.api_base_url}{KIS_CURRENT_PRICE_PATH}",
+                headers=self.build_headers(
+                    access_token,
+                    transaction_id=KIS_CURRENT_PRICE_TR_ID,
+                ),
+                params=params,
+                timeout_seconds=self.settings.kis_request_timeout_seconds,
+            )
+        except BrokerAdapterError as exc:
+            raise BrokerAdapterError(
+                str(exc),
+                status_code=exc.status_code or 503,
+                classification=exc.classification,
+                retryable=exc.retryable,
+                code=exc.code,
+                request_metadata=request_metadata,
+                response_metadata=exc.response_metadata,
+                response_payload=exc.response_payload,
+                observed_at=exc.observed_at,
+            ) from exc
+
+        body = response.payload
+        if _optional_string(body.get("rt_cd")) != "0":
+            raise BrokerAdapterError(
+                _error_message(body),
+                status_code=422,
+                classification=_classify_error(
+                    status_code=400,
+                    code=_optional_string(body.get("msg_cd")),
+                    message=_error_message(body),
+                ),
+                retryable=False,
+                code=_optional_string(body.get("msg_cd")),
+                request_metadata=request_metadata,
+                response_payload=body,
+                observed_at=datetime.now(UTC),
+            )
+
+        output = body.get("output")
+        if not isinstance(output, dict):
+            raise BrokerAdapterError(
+                "KIS current price response is missing output payload",
+                status_code=502,
+                classification=BrokerErrorClassification.UNKNOWN,
+                request_metadata=request_metadata,
+                response_payload=body,
+            )
+
+        price = _parse_decimal(output.get("stck_prpr"))
+        if price is None or price <= 0:
+            return None
+        return BrokerCurrentPrice(
+            symbol=symbol,
+            exchange=exchange,
+            price=price,
+            observed_at=datetime.now(UTC),
+            payload=body,
         )
 
     def reconnect_handle(self) -> BrokerReconnectHandle:
@@ -552,6 +678,25 @@ def _order_price(order_type: str, limit_price: Any) -> str:
             normalized_status=NormalizedBrokerOrderStatus.REJECTED,
         )
     return str(limit_price)
+
+
+def _quote_market_division(exchange: str) -> str:
+    if exchange != "KRX":
+        raise BrokerAdapterError(
+            f"unsupported exchange for current price quotes: {exchange}",
+            status_code=422,
+            classification=BrokerErrorClassification.VALIDATION,
+        )
+    return "J"
+
+
+def _parse_decimal(value: object) -> Decimal | None:
+    if value is None:
+        return None
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
 
 
 def _transaction_id(runtime_mode: str, side: str) -> str:

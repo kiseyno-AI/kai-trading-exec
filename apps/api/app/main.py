@@ -18,6 +18,7 @@ from app.core.config import Settings, get_settings
 from app.core.logging import configure_logging
 from app.db.session import create_db_engine, create_session_factory
 from app.services.autonomous_runtime import AutonomousRuntimeCoordinator
+from app.services.monitoring_price_source import build_default_monitoring_price_source
 from app.services.runtime import RuntimeMetadata
 
 LOGGER = logging.getLogger(__name__)
@@ -42,11 +43,18 @@ def create_app(
     resolved_broker_adapter_factory = broker_adapter_factory or (
         lambda current_settings: KisBrokerAdapter(settings=current_settings)
     )
+    resolved_monitoring_price_source = monitoring_price_source
+    if resolved_monitoring_price_source is None:
+        resolved_monitoring_price_source = build_default_monitoring_price_source(
+            settings=app_settings,
+            session_factory=db_session_factory,
+            broker_adapter_factory=resolved_broker_adapter_factory,
+        )
     autonomous_runtime = AutonomousRuntimeCoordinator(
         settings=app_settings,
         session_factory=db_session_factory,
         broker_adapter_factory=resolved_broker_adapter_factory,
-        monitoring_price_source=monitoring_price_source,
+        monitoring_price_source=resolved_monitoring_price_source,
     )
 
     @asynccontextmanager
