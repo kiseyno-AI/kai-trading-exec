@@ -598,7 +598,7 @@ def _parse_fills_from_payload(
     observed_at: datetime,
 ) -> list[dict[str, object]]:
     fills_payload = payload.get("fills")
-    if isinstance(fills_payload, list):
+    if isinstance(fills_payload, list) and fills_payload:
         result: list[dict[str, object]] = []
         for fill_item in fills_payload:
             if not isinstance(fill_item, dict):
