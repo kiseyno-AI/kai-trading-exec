@@ -659,6 +659,7 @@ def _serialize_runtime_symbol_summary(
             ]
         )
     )
+    latest_order_error = _latest_order_reconciliation_error(orders)
     return {
         "symbol": symbol,
         "mode": settings.runtime_mode,
@@ -677,7 +678,31 @@ def _serialize_runtime_symbol_summary(
             if position is not None
             else None
         ),
+        "last_reconciliation_error": latest_order_error,
         "latest_activity_at": latest_activity_at,
+    }
+
+
+def _latest_order_reconciliation_error(orders: list[BrokerOrder]) -> dict[str, object] | None:
+    errored_orders = [
+        order
+        for order in orders
+        if order.last_error_message and order.last_broker_sync_at is not None
+    ]
+    if not errored_orders:
+        return None
+    latest = max(
+        errored_orders,
+        key=lambda order: (order.last_broker_sync_at or order.updated_at, order.updated_at),
+    )
+    return {
+        "broker_order_id": latest.broker_order_id,
+        "status": latest.status,
+        "classification": latest.last_error_classification,
+        "code": latest.last_error_code,
+        "message": latest.last_error_message,
+        "retryable": latest.last_error_retryable,
+        "last_broker_sync_at": _serialize_datetime(latest.last_broker_sync_at),
     }
 
 

@@ -39,6 +39,7 @@ KIS_ORDER_CASH_PATH = "/uapi/domestic-stock/v1/trading/order-cash"
 KIS_CURRENT_PRICE_PATH = "/uapi/domestic-stock/v1/quotations/inquire-price"
 KIS_BALANCE_PATH = "/uapi/domestic-stock/v1/trading/inquire-balance"
 KIS_OPEN_ORDERS_PATH = "/uapi/domestic-stock/v1/trading/inquire-ccnl"
+KIS_DAILY_CCLD_PATH = "/uapi/domestic-stock/v1/trading/inquire-daily-ccld"
 KIS_CURRENT_PRICE_TR_ID = "FHKST01010100"
 KIS_TIMEZONE = timezone(timedelta(hours=9))
 
@@ -523,20 +524,33 @@ class KisBrokerAdapter(BrokerAdapter):
     ) -> dict[str, Any] | None:
         config = self._configured()
         observed_at = datetime.now(UTC)
-        response = self.http_client.get_json(
-            url=f"{config.api_base_url}{KIS_OPEN_ORDERS_PATH}",
-            headers=self.build_headers(
-                access_token,
-                transaction_id=_open_orders_transaction_id(self.settings.runtime_mode),
-            ),
-            params=_reconcile_order_params(
-                self.settings,
-                broker_order_id,
-                observed_at,
-            ),
-            timeout_seconds=self.settings.kis_request_timeout_seconds,
+        transaction_id = _daily_ccld_transaction_id(self.settings.runtime_mode)
+        params = _reconcile_order_params(
+            self.settings,
+            broker_order_id,
+            observed_at,
         )
-        _raise_if_business_error(response.payload)
+        request_metadata = {
+            "provider": self.provider,
+            "endpoint": KIS_DAILY_CCLD_PATH,
+            "tr_id": transaction_id,
+            "params": params,
+        }
+        try:
+            response = self.http_client.get_json(
+                url=f"{config.api_base_url}{KIS_DAILY_CCLD_PATH}",
+                headers=self.build_headers(
+                    access_token,
+                    transaction_id=transaction_id,
+                ),
+                params=params,
+                timeout_seconds=self.settings.kis_request_timeout_seconds,
+            )
+            _raise_if_business_error(response.payload)
+        except BrokerAdapterError as exc:
+            if exc.request_metadata is None:
+                exc.request_metadata = request_metadata
+            raise
         normalized_order = _normalize_reconcile_order(
             response.payload,
             broker_order_id,
@@ -549,16 +563,7 @@ class KisBrokerAdapter(BrokerAdapter):
                 "status": "unknown",
                 "broker_status": "unknown",
                 "observed_at": observed_at.isoformat(),
-                "request_metadata": {
-                    "provider": self.provider,
-                    "endpoint": KIS_OPEN_ORDERS_PATH,
-                    "tr_id": _open_orders_transaction_id(self.settings.runtime_mode),
-                    "params": _reconcile_order_params(
-                        self.settings,
-                        broker_order_id,
-                        observed_at,
-                    ),
-                },
+                "request_metadata": request_metadata,
                 "response_metadata": {
                     "status_code": response.status_code,
                     "msg_cd": _optional_string(response.payload.get("msg_cd")),
@@ -579,16 +584,7 @@ class KisBrokerAdapter(BrokerAdapter):
             "average_fill_price": normalized_order["average_fill_price"],
             "filled_at": normalized_order["filled_at"].isoformat(),
             "observed_at": normalized_order["observed_at"].isoformat(),
-            "request_metadata": {
-                "provider": self.provider,
-                "endpoint": KIS_OPEN_ORDERS_PATH,
-                "tr_id": _open_orders_transaction_id(self.settings.runtime_mode),
-                "params": _reconcile_order_params(
-                    self.settings,
-                    broker_order_id,
-                    observed_at,
-                ),
-            },
+            "request_metadata": request_metadata,
             "response_metadata": {
                 "status_code": response.status_code,
                 "msg_cd": _optional_string(response.payload.get("msg_cd")),
@@ -667,15 +663,16 @@ def _reconcile_order_params(
         "INQR_STRT_DT": inquiry_date,
         "INQR_END_DT": inquiry_date,
         "SLL_BUY_DVSN_CD": "00",
-        "INQR_DVSN": "00",
         "PDNO": "",
         "CCLD_DVSN": "00",
+        "INQR_DVSN": "00",
+        "INQR_DVSN_3": "00",
         "ORD_GNO_BRNO": "",
         "ODNO": broker_order_id,
-        "INQR_DVSN_3": "00",
         "INQR_DVSN_1": "",
         "CTX_AREA_FK100": "",
         "CTX_AREA_NK100": "",
+        "EXCG_ID_DVSN_CD": "KRX",
     }
 
 
@@ -1045,6 +1042,13 @@ def _balance_transaction_id(runtime_mode: str) -> str:
 
 def _open_orders_transaction_id(runtime_mode: str) -> str:
     return "TTTC8001R" if runtime_mode == "live" else "VTTC8001R"
+
+
+def _daily_ccld_transaction_id(runtime_mode: str, *, period_division: str = "inner") -> str:
+    before_period = period_division.strip().lower() == "before"
+    if runtime_mode == "live":
+        return "CTSC9215R" if before_period else "TTTC0081R"
+    return "VTSC9215R" if before_period else "VTTC0081R"
 
 
 def _balance_params(settings: Settings) -> dict[str, object]:

@@ -4,15 +4,18 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 from fastapi.testclient import TestClient
+import pytest
 from sqlalchemy import select
 
 from app.broker.base import (
     BrokerAccountHolding,
     BrokerAccountSnapshot,
+    BrokerAdapterError,
     BrokerConfig,
     BrokerCurrentPrice,
     BrokerOrderPlacement,
     BrokerOrderPlacementRequest,
+    BrokerErrorClassification,
     BrokerRealtimeApproval,
     BrokerReconnectHandle,
     BrokerTokenGrant,
@@ -24,7 +27,7 @@ from app.core.config import Settings
 from app.db.base import Base
 from app.db.session import create_db_engine, create_session_factory
 from app.main import create_app
-from app.models.runtime import BrokerOrder, ExecutionFill, ExecutionPosition
+from app.models.runtime import BrokerOrder, BrokerOrderEvent, ExecutionFill, ExecutionPosition
 from app.services.reconciliation import reconcile_broker_order, sync_execution_positions_from_broker_snapshot
 
 
@@ -383,3 +386,92 @@ def test_kis_reconcile_order_reports_cumulative_quantity_without_synthetic_fill(
     assert payload["filled_quantity"] == 2
     assert "fills" not in payload
     assert http_client.calls[0]["params"]["ODNO"] == "0033196600"
+
+
+@pytest.mark.parametrize(
+    ("runtime_mode", "expected_tr_id"),
+    [("live", "TTTC0081R"), ("paper", "VTTC0081R")],
+)
+def test_kis_reconcile_order_uses_daily_ccld_endpoint_and_mode_tr_id(
+    runtime_mode: str,
+    expected_tr_id: str,
+) -> None:
+    settings = Settings(
+        runtime_mode=runtime_mode,
+        kis_app_key="***",
+        kis_app_secret="***",
+        kis_account_number="12345678",
+        kis_account_product_code="01",
+    )
+    http_client = KisReconcileHttpClient(
+        {
+            "rt_cd": "0",
+            "msg_cd": "MCA00000",
+            "output1": [
+                {
+                    "odno": "0033196600",
+                    "pdno": "005930",
+                    "sll_buy_dvsn_cd": "02",
+                    "ord_qty": "1",
+                    "tot_ccld_qty": "0",
+                    "rmn_qty": "1",
+                    "avg_pric": "0",
+                    "ord_dt": "20260513",
+                    "ord_tmd": "090501",
+                    "ord_st_dvsn_cd_name": "미체결",
+                }
+            ],
+        }
+    )
+    adapter = KisBrokerAdapter(settings=settings, http_client=http_client)
+
+    payload = adapter.reconcile_order("top-secret-token", "0033196600")
+
+    assert payload is not None
+    assert payload["status"] == "open"
+    assert http_client.calls[0]["url"].endswith("/uapi/domestic-stock/v1/trading/inquire-daily-ccld")
+    assert http_client.calls[0]["headers"]["tr_id"] == expected_tr_id
+    assert http_client.calls[0]["params"]["EXCG_ID_DVSN_CD"] == "KRX"
+    assert http_client.calls[0]["params"]["ODNO"] == "0033196600"
+
+
+def test_reconcile_repeated_identical_broker_failures_are_deduped() -> None:
+    settings = Settings(database_url="sqlite:///:memory:", runtime_mode="paper")
+    engine, db = _session(settings)
+    order = _order(broker_order_id="failed-1")
+    db.add(order)
+    db.commit()
+
+    class FailingBroker(ReconciliationStubBroker):
+        def reconcile_order(self, access_token: str, broker_order_id: str) -> dict[str, object]:
+            assert access_token
+            raise BrokerAdapterError(
+                "KIS request failed",
+                status_code=422,
+                classification=BrokerErrorClassification.BROKER_REJECTED,
+                retryable=False,
+                code="404",
+                request_metadata={
+                    "provider": "kis",
+                    "endpoint": "/uapi/domestic-stock/v1/trading/inquire-daily-ccld",
+                    "tr_id": "VTTC0081R",
+                },
+                response_metadata={"status_code": 404},
+                response_payload={},
+                observed_at=OBSERVED_AT,
+            )
+
+    broker = FailingBroker()
+    first = reconcile_broker_order(settings=settings, db=db, adapter=broker, order=order)
+    second = reconcile_broker_order(settings=settings, db=db, adapter=broker, order=order)
+
+    events = db.scalars(
+        select(BrokerOrderEvent).where(BrokerOrderEvent.event_type == "reconcile_failed")
+    ).all()
+    assert first["message"] == "KIS request failed"
+    assert second["message"] == "KIS request failed"
+    assert len(events) == 1
+    assert events[0].payload is not None
+    assert events[0].payload["request_metadata"]["tr_id"] == "VTTC0081R"
+    assert order.last_error_message == "KIS request failed"
+    engine.dispose()
