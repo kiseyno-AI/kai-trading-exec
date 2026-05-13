@@ -1835,6 +1835,53 @@ def test_short_term_watcher_approved_market_buy_submits_order_and_materializes_m
     engine.dispose()
 
 
+def test_short_term_watcher_broker_rejection_does_not_materialize_monitoring() -> None:
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(provider="kis", mode="paper", configured=True, api_base_url=KIS_PAPER_API_BASE_URL),
+        token_grant=build_token_grant(),
+        order_error=BrokerAdapterError(
+            "broker rejected order",
+            status_code=422,
+            classification=BrokerErrorClassification.VALIDATION,
+            code="KIS_REJECTED",
+            normalized_status=NormalizedBrokerOrderStatus.REJECTED,
+            response_payload={"rt_cd": "1", "msg_cd": "KIS_REJECTED"},
+        ),
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="***",
+            kis_app_secret="***",
+            kis_account_number="12345678",
+        ),
+        broker_adapter=broker_adapter,
+    )
+    client = TestClient(app)
+    resume = client.post("/controls/resume", json={"actor": "ops", "source": "console", "reason": "enable short-term watcher"})
+    assert resume.status_code == 200
+    item_id = _create_short_term_watcher_candidate(client)
+
+    response = client.post(
+        "/short-term-watcher/decisions",
+        json=_short_term_decision_payload(item_id, dry_run=False),
+    )
+
+    assert response.status_code == 422
+    payload = response.json()
+    assert payload["approved"] is False
+    assert payload["reason_code"] == "submission_not_accepted"
+    assert payload["monitoring"] == []
+    assert payload["monitoring_preview"] != []
+    assert len(broker_adapter.order_calls) == 1
+
+    plan_items = client.get("/execution-plans").json()[0]["items"]
+    assert {item["intent"] for item in plan_items} == {"next_open_buy"}
+    assert plan_items[0]["status"] == "broker_order_rejected"
+    engine.dispose()
+
+
 def test_short_term_watcher_live_submission_uses_broker_account_snapshot() -> None:
     broker_adapter = StubBrokerAdapter(
         config=BrokerConfig(provider="kis", mode="paper", configured=True, api_base_url=KIS_PAPER_API_BASE_URL),

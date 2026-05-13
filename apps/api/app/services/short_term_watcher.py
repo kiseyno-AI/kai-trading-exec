@@ -144,7 +144,6 @@ def evaluate_short_term_watcher_decision(
             },
         )
 
-    _materialize_monitoring_items(db=db, item=item, command=command, quantity=quantity)
     order_result = place_broker_order(
         settings=settings,
         db=db,
@@ -154,20 +153,38 @@ def evaluate_short_term_watcher_decision(
     )
     persisted_order = _load_order(settings=settings, db=db, idempotency_key=order_preview["idempotency_key"])
     refreshed_item = db.get(ExecutionPlanItem, item.id, options=[selectinload(ExecutionPlanItem.plan)]) or item
+    submission_accepted = _order_submission_accepted(order_result=order_result, order=persisted_order)
+    materialized_monitoring = []
+    outcome = "submitted" if submission_accepted else "submission_not_accepted"
+    if submission_accepted:
+        materialized_monitoring = _materialize_monitoring_items(
+            db=db,
+            item=refreshed_item,
+            command=command,
+            quantity=quantity,
+        )
     _persist_audit(
         item=refreshed_item,
-        audit={**audit, "outcome": "submitted", "order": order_preview, "monitoring": monitoring_preview, "order_result": order_result.payload},
+        audit={
+            **audit,
+            "outcome": outcome,
+            "order": order_preview,
+            "monitoring_preview": monitoring_preview,
+            "monitoring": materialized_monitoring,
+            "order_result": order_result.payload,
+        },
     )
     db.commit()
     return ShortTermWatcherDecisionResult(
         status_code=order_result.status_code,
         payload={
-            "approved": True,
+            "approved": submission_accepted,
             "dry_run": False,
-            "reason_code": "submitted" if order_result.status_code < 300 else "submission_not_accepted",
+            "reason_code": outcome,
             "candidate": _candidate_payload(refreshed_item),
             "order": serialize_broker_order(persisted_order, include_events=True) if persisted_order else order_result.payload.get("order"),
-            "monitoring": monitoring_preview,
+            "monitoring": materialized_monitoring,
+            "monitoring_preview": monitoring_preview,
             "safety": safety,
         },
     )
@@ -300,7 +317,29 @@ def _monitoring_preview(*, item: ExecutionPlanItem, command: ShortTermWatcherDec
     ]
 
 
-def _materialize_monitoring_items(*, db: Session, item: ExecutionPlanItem, command: ShortTermWatcherDecisionRequest, quantity: int) -> None:
+ACCEPTED_ORDER_STATUSES = frozenset(
+    {
+        "submitted",
+        "open",
+        "partially_filled",
+        "filled",
+        "cancel_pending",
+        "canceled",
+        "expired",
+    }
+)
+
+
+def _order_submission_accepted(*, order_result: object, order: BrokerOrder | None) -> bool:
+    status_code = getattr(order_result, "status_code", 500)
+    if not isinstance(status_code, int) or status_code >= 300:
+        return False
+    if order is None:
+        return True
+    return order.status in ACCEPTED_ORDER_STATUSES
+
+
+def _materialize_monitoring_items(*, db: Session, item: ExecutionPlanItem, command: ShortTermWatcherDecisionRequest, quantity: int) -> list[dict[str, object]]:
     existing = db.scalars(
         select(ExecutionPlanItem).where(
             ExecutionPlanItem.execution_plan_id == item.execution_plan_id,
@@ -311,30 +350,44 @@ def _materialize_monitoring_items(*, db: Session, item: ExecutionPlanItem, comma
     ).all()
     existing_intents = {existing_item.intent for existing_item in existing}
     next_index = max((plan_item.plan_item_index for plan_item in item.plan.items), default=0) + 1
+    materialized: list[dict[str, object]] = []
     for preview in _monitoring_preview(item=item, command=command, quantity=quantity):
         if preview["intent"] in existing_intents:
             continue
-        db.add(
-            ExecutionPlanItem(
-                execution_plan_id=item.execution_plan_id,
-                plan_item_index=next_index,
-                symbol=item.symbol,
-                side="sell",
-                intent=str(preview["intent"]),
-                status=f"{preview['intent']}_monitoring",
-                quantity_policy=preview["quantity_policy"],
-                trigger_price=_decimal(preview["trigger_price"]),
-                time_in_force=item.time_in_force,
-                risk_context={"materialized_from": "short_term_watcher", "entry_plan_item_id": item.id},
-                decision_agent_name=item.decision_agent_name,
-                decision_snapshot_id=item.decision_snapshot_id,
-                decision_run_id=item.decision_run_id,
-                source_plan_item_id=item.source_plan_item_id,
-                source_market_date=item.source_market_date,
-            )
+        monitoring_item = ExecutionPlanItem(
+            execution_plan_id=item.execution_plan_id,
+            plan_item_index=next_index,
+            symbol=item.symbol,
+            side="sell",
+            intent=str(preview["intent"]),
+            status=f"{preview['intent']}_monitoring",
+            quantity_policy=preview["quantity_policy"],
+            trigger_price=_decimal(preview["trigger_price"]),
+            time_in_force=item.time_in_force,
+            risk_context={"materialized_from": "short_term_watcher", "entry_plan_item_id": item.id},
+            decision_agent_name=item.decision_agent_name,
+            decision_snapshot_id=item.decision_snapshot_id,
+            decision_run_id=item.decision_run_id,
+            source_plan_item_id=item.source_plan_item_id,
+            source_market_date=item.source_market_date,
         )
+        db.add(monitoring_item)
+        db.flush()
+        materialized.append(_monitoring_item_payload(monitoring_item))
         next_index += 1
-    db.flush()
+    return materialized
+
+
+def _monitoring_item_payload(item: ExecutionPlanItem) -> dict[str, object]:
+    return {
+        "execution_plan_item_id": item.id,
+        "symbol": item.symbol,
+        "side": item.side,
+        "intent": item.intent,
+        "status": item.status,
+        "trigger_price": str(item.trigger_price) if item.trigger_price is not None else None,
+        "quantity_policy": item.quantity_policy,
+    }
 
 
 def _persist_audit(*, item: ExecutionPlanItem, audit: dict[str, Any]) -> None:
