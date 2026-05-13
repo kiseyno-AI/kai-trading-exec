@@ -484,6 +484,7 @@ def _reconcile_adapter_error(
                 event_type="reconcile_failed",
                 event_source=BrokerEventSource.RECONCILIATION.value,
                 normalized_status=order.status,
+                error_classification="unknown",
                 message=message,
                 payload=_build_reconcile_event_payload(
                     payload={

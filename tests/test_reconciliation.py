@@ -475,3 +475,29 @@ def test_reconcile_repeated_identical_broker_failures_are_deduped() -> None:
     assert events[0].payload["request_metadata"]["tr_id"] == "VTTC0081R"
     assert order.last_error_message == "KIS request failed"
     engine.dispose()
+
+
+def test_reconcile_repeated_generic_failures_are_deduped_with_unknown_classification() -> None:
+    settings = Settings(database_url="sqlite:///:memory:", runtime_mode="paper")
+    engine, db = _session(settings)
+    order = _order(broker_order_id="generic-failed-1")
+    db.add(order)
+    db.commit()
+
+    class BuggyBroker(ReconciliationStubBroker):
+        def reconcile_order(self, access_token: str, broker_order_id: str) -> dict[str, object]:  # type: ignore[override]
+            assert access_token
+            return "not-a-dict"  # type: ignore[return-value]
+
+    broker = BuggyBroker()
+    first = reconcile_broker_order(settings=settings, db=db, adapter=broker, order=order)
+    second = reconcile_broker_order(settings=settings, db=db, adapter=broker, order=order)
+
+    events = db.scalars(
+        select(BrokerOrderEvent).where(BrokerOrderEvent.event_type == "reconcile_failed")
+    ).all()
+    assert first["message"].startswith("ValueError: reconcile_order adapter returned")
+    assert second["message"] == first["message"]
+    assert len(events) == 1
+    assert events[0].error_classification == "unknown"
+    engine.dispose()
