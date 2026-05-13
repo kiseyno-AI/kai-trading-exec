@@ -13,7 +13,7 @@ from app.broker.base import (
     NormalizedBrokerOrderStatus,
 )
 from app.core.config import Settings
-from app.models.runtime import BrokerOrder, ExecutionJob, ExecutionPlan, ExecutionPlanItem
+from app.models.runtime import BrokerOrder, ExecutionJob, ExecutionPlan, ExecutionPlanItem, new_id
 from app.services.broker_orders import place_broker_order
 from app.services.runtime_controls import (
     automated_order_submission_allowed,
@@ -68,6 +68,7 @@ def materialize_execution_jobs(plan: ExecutionPlan) -> None:
         item.status = "next_open_buy_scheduled"
         item.jobs.append(
             ExecutionJob(
+                id=new_id(),
                 job_type=NEXT_OPEN_BUY_JOB_TYPE,
                 status="scheduled",
                 scheduled_for=_next_market_open_utc(plan.market_date),
@@ -443,7 +444,7 @@ def _build_place_order_request(job: ExecutionJob) -> PlaceOrderRequest:
         raise ValueError("next_open_buy job requires quantity_policy.kind='shares' with a positive integer quantity")
     exchange = _plan_item_exchange(plan_item)
     return PlaceOrderRequest(
-        idempotency_key=f"execution-job:{job.id}",
+        idempotency_key=_place_order_idempotency_key(job),
         execution_plan_item_id=plan_item.id,
         symbol=plan_item.symbol,
         side=plan_item.side,
@@ -453,6 +454,15 @@ def _build_place_order_request(job: ExecutionJob) -> PlaceOrderRequest:
         time_in_force=plan_item.time_in_force or "day",
         exchange=exchange,
     )
+
+
+def _place_order_idempotency_key(job: ExecutionJob) -> str:
+    quantity_policy = job.plan_item.quantity_policy
+    if isinstance(quantity_policy, dict):
+        idempotency_key = quantity_policy.get("idempotency_key")
+        if isinstance(idempotency_key, str) and idempotency_key.strip():
+            return idempotency_key.strip()
+    return f"execution-job:{job.id}"
 
 
 def _next_open_buy_quantity(plan_item: ExecutionPlanItem) -> int | None:

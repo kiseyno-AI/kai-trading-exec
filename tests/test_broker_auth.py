@@ -7,6 +7,8 @@ import pytest
 from sqlalchemy import select
 
 from app.broker.base import (
+    BrokerAccountHolding,
+    BrokerAccountSnapshot,
     BrokerAdapterError,
     BrokerConfig,
     BrokerCurrentPrice,
@@ -111,6 +113,7 @@ class StubBrokerAdapter:
         token_grant: BrokerTokenGrant | None = None,
         approval: BrokerRealtimeApproval | None = None,
         order_placement: BrokerOrderPlacement | None = None,
+        account_snapshot: BrokerAccountSnapshot | None = None,
         current_prices: dict[str, Decimal] | None = None,
         auth_error: Exception | None = None,
         approval_error: Exception | None = None,
@@ -125,6 +128,7 @@ class StubBrokerAdapter:
             issued_at=datetime.now(UTC),
         )
         self.order_placement = order_placement
+        self.account_snapshot = account_snapshot
         self.current_prices = current_prices or {}
         self.auth_error = auth_error
         self.approval_error = approval_error
@@ -192,6 +196,16 @@ class StubBrokerAdapter:
             price=price,
             observed_at=datetime.now(UTC),
             payload={"output": {"stck_prpr": str(price)}},
+        )
+
+    def get_account_snapshot(self, access_token: str) -> BrokerAccountSnapshot:
+        assert access_token
+        if self.account_snapshot is not None:
+            return self.account_snapshot
+        return BrokerAccountSnapshot(
+            available_cash=Decimal("1000000.00"),
+            observed_at=datetime.now(UTC),
+            source="stub:account_snapshot",
         )
 
     def reconnect_handle(self) -> BrokerReconnectHandle:
@@ -421,6 +435,47 @@ def test_kis_adapter_fetches_current_price_quote() -> None:
     assert quote.symbol == "005930"
     assert quote.exchange == "KRX"
     assert quote.price == Decimal("125100")
+
+
+def test_kis_adapter_fetches_account_snapshot() -> None:
+    http_client = RecordingHttpClient(
+        {},
+        get_response={
+            "rt_cd": "0",
+            "msg_cd": "0",
+            "msg1": "success",
+            "output1": [
+                {
+                    "pdno": "005930",
+                    "hldg_qty": "3",
+                    "pchs_avg_pric": "70000",
+                    "ord_psbl_qty": "3",
+                }
+            ],
+            "output2": [{"ord_psbl_cash": "1000000"}],
+        },
+    )
+    adapter = KisBrokerAdapter(
+        settings=Settings(
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+        ),
+        http_client=http_client,
+    )
+
+    snapshot = adapter.get_account_snapshot("access-token")
+
+    assert [call["url"] for call in http_client.get_calls] == [
+        f"{KIS_PAPER_API_BASE_URL}/uapi/domestic-stock/v1/trading/inquire-balance",
+        f"{KIS_PAPER_API_BASE_URL}/uapi/domestic-stock/v1/trading/inquire-ccnl",
+    ]
+    assert http_client.get_calls[0]["headers"]["tr_id"] == "VTTC8434R"
+    assert http_client.get_calls[1]["headers"]["tr_id"] == "VTTC8001R"
+    assert snapshot.available_cash == Decimal("1000000")
+    assert snapshot.holdings[0].symbol == "005930"
+    assert snapshot.holdings[0].quantity == 3
 
 
 def test_runtime_status_reports_disabled_broker_summary_in_mock_mode() -> None:
@@ -1609,7 +1664,7 @@ def test_short_term_buy_items_are_safely_blocked_from_scheduling() -> None:
     }
     assert items_by_source["core-tactical-entry-1"]["status"] == "unsupported_semantics"
     assert items_by_source["core-trigger-chase-entry-1"]["status"] == "pending_configuration"
-    assert items_by_source["core-plain-next-open-entry-1"]["status"] == "unsupported_semantics"
+    assert items_by_source["core-plain-next-open-entry-1"]["status"] == "short_term_watcher_pending"
 
     jobs_payload = client.get("/execution-jobs").json()
     assert jobs_payload == []
@@ -1622,6 +1677,273 @@ def test_short_term_buy_items_are_safely_blocked_from_scheduling() -> None:
     assert broker_adapter.order_calls == []
     assert client.get("/orders").json() == []
 
+    engine.dispose()
+
+
+def _create_short_term_watcher_candidate(client: TestClient) -> str:
+    response = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": f"plan-short-term-watcher-{time.monotonic_ns()}",
+            "source": "kai-trading-core",
+            "market_date": "2024-01-03",
+            "items": [
+                {
+                    "symbol": "005930",
+                    "side": "buy",
+                    "intent": "next_open_buy",
+                    "quantity_policy": {"kind": "notional", "max_notional": "350000"},
+                    "decision_agent_name": "short-term-decider",
+                    "decision_snapshot_id": "short-term-snapshot-live-1",
+                    "decision_run_id": "short-term-run-live-1",
+                    "source_plan_item_id": "core-short-term-live-1",
+                }
+            ],
+        },
+    )
+    assert response.status_code == 201
+    item_id = response.json()["persisted_execution_item_ids"][0]
+    item = client.get("/execution-plans").json()[0]["items"][0]
+    assert item["status"] == "short_term_watcher_pending"
+    assert item["execution_plan_item_id"] == item_id
+    return item_id
+
+
+def _short_term_decision_payload(
+    item_id: str,
+    *,
+    dry_run: bool = True,
+    available_cash: str = "1000000.00",
+    holdings: dict[str, int] | None = None,
+    open_order_symbols: list[str] | None = None,
+) -> dict[str, object]:
+    return {
+        "execution_plan_item_id": item_id,
+        "dry_run": dry_run,
+        "agent_output": {
+            "decision": "approve",
+            "order_type": "market",
+            "max_notional": "350000.00",
+            "reference_price": "70000.00",
+            "target_price": "77000.00",
+            "stop_price": "66500.00",
+            "reason_code": "strict_json_approved",
+        },
+        "account_context": {
+            "available_cash": available_cash,
+            "last_price": "70000.00",
+            "holdings": holdings or {},
+            "open_order_symbols": open_order_symbols or [],
+        },
+    }
+
+
+def test_short_term_watcher_preview_rejects_insufficient_cash_existing_holding_and_duplicate_order() -> None:
+    app, engine = build_test_app(
+        settings=Settings(database_url="sqlite:///:memory:", runtime_mode="paper"),
+        broker_adapter=StubBrokerAdapter(
+            config=BrokerConfig(provider="kis", mode="paper", configured=True, api_base_url=KIS_PAPER_API_BASE_URL),
+            token_grant=build_token_grant(),
+            order_placement=build_order_placement(),
+        ),
+    )
+    client = TestClient(app)
+    item_id = _create_short_term_watcher_candidate(client)
+
+    insufficient = client.post(
+        "/short-term-watcher/decisions",
+        json=_short_term_decision_payload(item_id, available_cash="1000.00"),
+    )
+    assert insufficient.status_code == 200
+    assert insufficient.json()["reason_code"] == "insufficient_cash"
+
+    holding = client.post(
+        "/short-term-watcher/decisions",
+        json=_short_term_decision_payload(item_id, holdings={"005930": 1}),
+    )
+    assert holding.status_code == 200
+    assert holding.json()["reason_code"] == "existing_holding"
+
+    duplicate = client.post(
+        "/short-term-watcher/decisions",
+        json=_short_term_decision_payload(item_id, open_order_symbols=["005930"]),
+    )
+    assert duplicate.status_code == 200
+    assert duplicate.json()["reason_code"] == "duplicate_open_order"
+    engine.dispose()
+
+
+def test_short_term_watcher_rejects_invalid_free_form_agent_output() -> None:
+    app, engine = build_test_app(
+        settings=Settings(database_url="sqlite:///:memory:", runtime_mode="paper"),
+        broker_adapter=StubBrokerAdapter(
+            config=BrokerConfig(provider="kis", mode="paper", configured=True, api_base_url=KIS_PAPER_API_BASE_URL),
+            token_grant=build_token_grant(),
+            order_placement=build_order_placement(),
+        ),
+    )
+    client = TestClient(app)
+    item_id = _create_short_term_watcher_candidate(client)
+    payload = _short_term_decision_payload(item_id)
+    payload["agent_output"] = {"text": "buy some shares please"}
+
+    response = client.post("/short-term-watcher/decisions", json=payload)
+
+    assert response.status_code == 422
+    engine.dispose()
+
+
+def test_short_term_watcher_approved_market_buy_submits_order_and_materializes_monitoring() -> None:
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(provider="kis", mode="paper", configured=True, api_base_url=KIS_PAPER_API_BASE_URL),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(broker_order_id="kis-short-term-buy-1"),
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="***",
+            kis_app_secret="***",
+            kis_account_number="12345678",
+        ),
+        broker_adapter=broker_adapter,
+    )
+    client = TestClient(app)
+    resume = client.post("/controls/resume", json={"actor": "ops", "source": "console", "reason": "enable short-term watcher"})
+    assert resume.status_code == 200
+    item_id = _create_short_term_watcher_candidate(client)
+
+    response = client.post(
+        "/short-term-watcher/decisions",
+        json=_short_term_decision_payload(item_id, dry_run=False),
+    )
+
+    assert response.status_code == 201
+    payload = response.json()
+    assert payload["approved"] is True
+    assert payload["order"]["idempotency_key"] == f"short-term-watcher:buy:{item_id}"
+    assert broker_adapter.order_calls[0].order_type == "market"
+    assert broker_adapter.order_calls[0].quantity == 5
+
+    plan_items = client.get("/execution-plans").json()[0]["items"]
+    items_by_intent = {item["intent"]: item for item in plan_items}
+    assert items_by_intent["target_sell"]["status"] == "target_sell_monitoring"
+    assert items_by_intent["target_sell"]["trigger_price"] == "77000.0000"
+    assert items_by_intent["stop_sell"]["status"] == "stop_sell_monitoring"
+    assert items_by_intent["stop_sell"]["trigger_price"] == "66500.0000"
+    engine.dispose()
+
+
+def test_short_term_watcher_broker_rejection_does_not_materialize_monitoring() -> None:
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(provider="kis", mode="paper", configured=True, api_base_url=KIS_PAPER_API_BASE_URL),
+        token_grant=build_token_grant(),
+        order_error=BrokerAdapterError(
+            "broker rejected order",
+            status_code=422,
+            classification=BrokerErrorClassification.VALIDATION,
+            code="KIS_REJECTED",
+            normalized_status=NormalizedBrokerOrderStatus.REJECTED,
+            response_payload={"rt_cd": "1", "msg_cd": "KIS_REJECTED"},
+        ),
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="***",
+            kis_app_secret="***",
+            kis_account_number="12345678",
+        ),
+        broker_adapter=broker_adapter,
+    )
+    client = TestClient(app)
+    resume = client.post("/controls/resume", json={"actor": "ops", "source": "console", "reason": "enable short-term watcher"})
+    assert resume.status_code == 200
+    item_id = _create_short_term_watcher_candidate(client)
+
+    response = client.post(
+        "/short-term-watcher/decisions",
+        json=_short_term_decision_payload(item_id, dry_run=False),
+    )
+
+    assert response.status_code == 422
+    payload = response.json()
+    assert payload["approved"] is False
+    assert payload["reason_code"] == "submission_not_accepted"
+    assert payload["monitoring"] == []
+    assert payload["monitoring_preview"] != []
+    assert len(broker_adapter.order_calls) == 1
+
+    plan_items = client.get("/execution-plans").json()[0]["items"]
+    assert {item["intent"] for item in plan_items} == {"next_open_buy"}
+    assert plan_items[0]["status"] == "broker_order_rejected"
+    engine.dispose()
+
+
+def test_short_term_watcher_live_submission_uses_broker_account_snapshot() -> None:
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(provider="kis", mode="paper", configured=True, api_base_url=KIS_PAPER_API_BASE_URL),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(),
+        account_snapshot=BrokerAccountSnapshot(
+            available_cash=Decimal("1000000.00"),
+            observed_at=datetime.now(UTC),
+            source="stub:live-account",
+            holdings=[BrokerAccountHolding(symbol="005930", quantity=3)],
+        ),
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="***",
+            kis_app_secret="***",
+            kis_account_number="12345678",
+        ),
+        broker_adapter=broker_adapter,
+    )
+    client = TestClient(app)
+    resume = client.post("/controls/resume", json={"actor": "ops", "source": "console", "reason": "enable short-term watcher"})
+    assert resume.status_code == 200
+    item_id = _create_short_term_watcher_candidate(client)
+
+    response = client.post(
+        "/short-term-watcher/decisions",
+        json=_short_term_decision_payload(item_id, dry_run=False, holdings={}),
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["reason_code"] == "existing_holding"
+    assert payload["context"]["broker_account_source"] == "stub:live-account"
+    assert broker_adapter.order_calls == []
+    engine.dispose()
+
+
+def test_short_term_watcher_live_submission_respects_runtime_safety_guards() -> None:
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(provider="kis", mode="paper", configured=True, api_base_url=KIS_PAPER_API_BASE_URL),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(),
+    )
+    app, engine = build_test_app(
+        settings=Settings(database_url="sqlite:///:memory:", runtime_mode="paper"),
+        broker_adapter=broker_adapter,
+    )
+    client = TestClient(app)
+    item_id = _create_short_term_watcher_candidate(client)
+
+    blocked = client.post(
+        "/short-term-watcher/decisions",
+        json=_short_term_decision_payload(item_id, dry_run=False),
+    )
+
+    assert blocked.status_code == 200
+    assert blocked.json()["reason_code"] == "runtime_safety_blocked"
+    assert broker_adapter.order_calls == []
+    assert client.get("/orders").json() == []
     engine.dispose()
 
 

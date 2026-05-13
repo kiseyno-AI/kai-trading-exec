@@ -10,6 +10,7 @@ from app.api.schemas.execution import (
     ExecutionPlanRequest,
     MonitoringEvaluationRequest,
     PlaceOrderRequest,
+    ShortTermWatcherDecisionRequest,
 )
 from app.broker.base import BrokerAdapter
 from app.core.config import Settings
@@ -22,6 +23,7 @@ from app.services.execution_api import (
     list_execution_plans,
     list_execution_positions,
     list_runtime_symbols,
+    preview_execution_plan,
 )
 from app.services.execution_failures import (
     ExecutionFailureStatusUpdateCommand,
@@ -30,6 +32,7 @@ from app.services.execution_failures import (
 )
 from app.services.execution_jobs import dispatch_due_execution_jobs, list_execution_jobs
 from app.services.monitoring import evaluate_monitoring
+from app.services.short_term_watcher import evaluate_short_term_watcher_decision
 
 router = APIRouter(tags=["execution"])
 
@@ -50,12 +53,31 @@ def execution_plans(
 def create_execution_plan_handler(
     request: Request,
     db: Annotated[Session, Depends(get_db_session)],
+    adapter: Annotated[BrokerAdapter, Depends(get_broker_adapter)],
     payload: ExecutionPlanRequest = Body(...),
 ) -> JSONResponse:
     settings: Settings = get_settings(request)
     result = create_execution_plan(
         settings=settings,
         db=db,
+        adapter=adapter,
+        command=payload,
+    )
+    return JSONResponse(status_code=result.status_code, content=result.payload)
+
+
+@router.post("/execution-plans/preview")
+def preview_execution_plan_handler(
+    request: Request,
+    db: Annotated[Session, Depends(get_db_session)],
+    adapter: Annotated[BrokerAdapter, Depends(get_broker_adapter)],
+    payload: ExecutionPlanRequest = Body(...),
+) -> JSONResponse:
+    settings: Settings = get_settings(request)
+    result = preview_execution_plan(
+        settings=settings,
+        db=db,
+        adapter=adapter,
         command=payload,
     )
     return JSONResponse(status_code=result.status_code, content=result.payload)
@@ -84,6 +106,23 @@ def dispatch_execution_jobs(
         settings=settings,
         db=db,
         adapter=adapter,
+    )
+    return JSONResponse(status_code=result.status_code, content=result.payload)
+
+
+@router.post("/short-term-watcher/decisions")
+def short_term_watcher_decision(
+    request: Request,
+    db: Annotated[Session, Depends(get_db_session)],
+    adapter: Annotated[BrokerAdapter, Depends(get_broker_adapter)],
+    payload: ShortTermWatcherDecisionRequest = Body(...),
+) -> JSONResponse:
+    settings: Settings = get_settings(request)
+    result = evaluate_short_term_watcher_decision(
+        settings=settings,
+        db=db,
+        adapter=adapter,
+        command=payload,
     )
     return JSONResponse(status_code=result.status_code, content=result.payload)
 
