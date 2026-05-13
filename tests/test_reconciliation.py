@@ -19,6 +19,7 @@ from app.broker.base import (
     BrokerTokenRevocation,
     NormalizedBrokerOrderStatus,
 )
+from app.broker.kis import JsonHttpResponse, KisBrokerAdapter
 from app.core.config import Settings
 from app.db.base import Base
 from app.db.session import create_db_engine, create_session_factory
@@ -283,3 +284,102 @@ def test_monitoring_reconciles_stale_missing_position_from_broker_holdings_befor
         assert position.quantity == 1
         assert position.updated_from == "reconciliation"
     engine.dispose()
+
+
+def test_reconcile_cumulative_filled_quantity_adds_only_delta() -> None:
+    settings = Settings(database_url="sqlite:///:memory:", runtime_mode="paper")
+    engine, db = _session(settings)
+    order = _order(broker_order_id="cumulative-1")
+    db.add(order)
+    db.commit()
+    broker = ReconciliationStubBroker(
+        reconcile_payloads=[
+            {
+                "broker_order_id": "cumulative-1",
+                "status": "partially_filled",
+                "filled_quantity": 1,
+                "remaining_quantity": 1,
+                "average_fill_price": "70000",
+                "filled_at": OBSERVED_AT.isoformat(),
+                "observed_at": OBSERVED_AT.isoformat(),
+            },
+            {
+                "broker_order_id": "cumulative-1",
+                "status": "filled",
+                "filled_quantity": 2,
+                "remaining_quantity": 0,
+                "average_fill_price": "71000",
+                "filled_at": (OBSERVED_AT + timedelta(minutes=1)).isoformat(),
+                "observed_at": (OBSERVED_AT + timedelta(minutes=1)).isoformat(),
+            },
+        ]
+    )
+
+    first = reconcile_broker_order(settings=settings, db=db, adapter=broker, order=order)
+    second = reconcile_broker_order(settings=settings, db=db, adapter=broker, order=order)
+
+    fills = db.scalars(select(ExecutionFill).order_by(ExecutionFill.filled_at.asc())).all()
+    assert first["fills_added"] == 1
+    assert second["fills_added"] == 1
+    assert [fill.quantity for fill in fills] == [1, 1]
+    assert sum(fill.quantity for fill in fills) == 2
+    engine.dispose()
+
+
+class KisReconcileHttpClient:
+    def __init__(self, payload: dict[str, object]) -> None:
+        self.payload = payload
+        self.calls: list[dict[str, object]] = []
+
+    def get_json(
+        self,
+        *,
+        url: str,
+        headers: dict[str, str],
+        params: dict[str, object],
+        timeout_seconds: float,
+    ) -> JsonHttpResponse:
+        self.calls.append({"url": url, "headers": headers, "params": params, "timeout_seconds": timeout_seconds})
+        return JsonHttpResponse(status_code=200, headers={}, payload=self.payload)
+
+    def post_json(self, **_kwargs: object) -> JsonHttpResponse:
+        raise AssertionError("reconciliation must not place or post orders")
+
+
+def test_kis_reconcile_order_reports_cumulative_quantity_without_synthetic_fill() -> None:
+    settings = Settings(
+        runtime_mode="paper",
+        kis_app_key="***",
+        kis_app_secret="***",
+        kis_account_number="12345678",
+        kis_account_product_code="01",
+    )
+    http_client = KisReconcileHttpClient(
+        {
+            "rt_cd": "0",
+            "msg_cd": "MCA00000",
+            "output1": [
+                {
+                    "odno": "0033196600",
+                    "pdno": "005930",
+                    "sll_buy_dvsn_cd": "02",
+                    "ord_qty": "2",
+                    "tot_ccld_qty": "2",
+                    "rmn_qty": "0",
+                    "avg_pric": "71000",
+                    "ord_dt": "20260513",
+                    "ord_tmd": "090501",
+                    "ord_st_dvsn_cd_name": "체결",
+                }
+            ],
+        }
+    )
+    adapter = KisBrokerAdapter(settings=settings, http_client=http_client)
+
+    payload = adapter.reconcile_order("top-secret-token", "0033196600")
+
+    assert payload is not None
+    assert payload["status"] == "filled"
+    assert payload["filled_quantity"] == 2
+    assert "fills" not in payload
+    assert http_client.calls[0]["params"]["ODNO"] == "0033196600"

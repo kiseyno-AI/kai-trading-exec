@@ -578,7 +578,6 @@ class KisBrokerAdapter(BrokerAdapter):
             "filled_quantity": normalized_order["filled_quantity"],
             "average_fill_price": normalized_order["average_fill_price"],
             "filled_at": normalized_order["filled_at"].isoformat(),
-            "fills": normalized_order["fills"],
             "observed_at": normalized_order["observed_at"].isoformat(),
             "request_metadata": {
                 "provider": self.provider,
@@ -729,18 +728,6 @@ def _extract_reconcile_order_info(
         or _parse_decimal(row.get("ord_unpr"))
     )
     filled_at = _reconcile_filled_timestamp(row, observed_at=observed_at)
-    fills: list[dict[str, object]] = []
-    if filled_quantity > 0:
-        fills.append(
-            {
-                "broker_fill_id": _optional_string(row.get("ord_gno_brno")),
-                "quantity": filled_quantity,
-                "price": average_fill_price or Decimal("0"),
-                "filled_at": filled_at.isoformat(),
-                "symbol": _optional_string(row.get("pdno")) or "UNKNOWN",
-                "side": _parse_order_side(row),
-            }
-        )
     return {
         "status": status,
         "broker_status": raw_status or status,
@@ -749,7 +736,6 @@ def _extract_reconcile_order_info(
         "filled_quantity": filled_quantity,
         "average_fill_price": average_fill_price,
         "filled_at": filled_at,
-        "fills": fills,
         "raw": _safe_reconcile_payload(row),
         "observed_at": observed_at,
         "message": None,
