@@ -23,6 +23,7 @@ from app.services.execution_api import (
     list_execution_plans,
     list_execution_positions,
     list_runtime_symbols,
+    preview_execution_plan,
 )
 from app.services.execution_failures import (
     ExecutionFailureStatusUpdateCommand,
@@ -52,12 +53,31 @@ def execution_plans(
 def create_execution_plan_handler(
     request: Request,
     db: Annotated[Session, Depends(get_db_session)],
+    adapter: Annotated[BrokerAdapter, Depends(get_broker_adapter)],
     payload: ExecutionPlanRequest = Body(...),
 ) -> JSONResponse:
     settings: Settings = get_settings(request)
     result = create_execution_plan(
         settings=settings,
         db=db,
+        adapter=adapter,
+        command=payload,
+    )
+    return JSONResponse(status_code=result.status_code, content=result.payload)
+
+
+@router.post("/execution-plans/preview")
+def preview_execution_plan_handler(
+    request: Request,
+    db: Annotated[Session, Depends(get_db_session)],
+    adapter: Annotated[BrokerAdapter, Depends(get_broker_adapter)],
+    payload: ExecutionPlanRequest = Body(...),
+) -> JSONResponse:
+    settings: Settings = get_settings(request)
+    result = preview_execution_plan(
+        settings=settings,
+        db=db,
+        adapter=adapter,
         command=payload,
     )
     return JSONResponse(status_code=result.status_code, content=result.payload)
