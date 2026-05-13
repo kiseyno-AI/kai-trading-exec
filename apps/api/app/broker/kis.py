@@ -438,7 +438,21 @@ class KisBrokerAdapter(BrokerAdapter):
             payload=body,
         )
 
-    def get_account_snapshot(self, access_token: str) -> BrokerAccountSnapshot:
+    def get_account_snapshot(
+        self,
+        access_token: str,
+        *,
+        symbols: list[str] | None = None,
+        reference_prices: dict[str, Decimal] | None = None,
+        exchange: str = "KRX",
+    ) -> BrokerAccountSnapshot:
+        del symbols, reference_prices
+        if exchange != "KRX":
+            raise BrokerAdapterError(
+                f"unsupported exchange for account snapshot: {exchange}",
+                status_code=422,
+                classification=BrokerErrorClassification.VALIDATION,
+            )
         config = self._configured()
         if not self.settings.kis_account_number:
             raise BrokerAdapterError(

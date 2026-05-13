@@ -79,6 +79,14 @@ class BrokerCurrentPrice:
 
 
 @dataclass(frozen=True)
+class BrokerAccountPosition:
+    symbol: str
+    quantity: int
+    average_price: Decimal | None = None
+    payload: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class BrokerAccountHolding:
     symbol: str
     quantity: int
@@ -92,23 +100,57 @@ class BrokerAccountOpenOrder:
     symbol: str
     side: str
     quantity: int
-    remaining_quantity: int
-    status: str
+    remaining_quantity: int | None = None
+    status: str = "open"
     broker_order_id: str | None = None
     idempotency_key: str | None = None
     source_candidate_id: str | None = None
     limit_price: Decimal | None = None
     payload: dict[str, Any] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        if self.remaining_quantity is None:
+            object.__setattr__(self, "remaining_quantity", self.quantity)
+
+
+@dataclass(frozen=True)
+class BrokerSymbolBuyingPower:
+    symbol: str
+    available_cash: Decimal | None
+    buying_power: Decimal | None
+    buyable_quantity: int | None = None
+    payload: dict[str, Any] = field(default_factory=dict)
+
 
 @dataclass(frozen=True)
 class BrokerAccountSnapshot:
-    available_cash: Decimal
-    observed_at: datetime
-    source: str
+    available_cash: Decimal | None = None
+    observed_at: datetime = field(default_factory=datetime.utcnow)
+    source: str = "compat:unknown"
+    buying_power: Decimal | None = None
     holdings: list[BrokerAccountHolding] = field(default_factory=list)
+    positions: list[BrokerAccountPosition] = field(default_factory=list)
     open_orders: list[BrokerAccountOpenOrder] = field(default_factory=list)
+    symbol_buying_power: dict[str, BrokerSymbolBuyingPower] = field(default_factory=dict)
     payload: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not self.positions and self.holdings:
+            object.__setattr__(
+                self,
+                "positions",
+                [
+                    BrokerAccountPosition(
+                        symbol=holding.symbol,
+                        quantity=holding.quantity,
+                        average_price=holding.average_price,
+                        payload=holding.payload,
+                    )
+                    for holding in self.holdings
+                ],
+            )
+        if self.buying_power is None:
+            object.__setattr__(self, "buying_power", self.available_cash)
 
 
 @dataclass(frozen=True)
@@ -204,7 +246,14 @@ class BrokerAdapter(Protocol):
         exchange: str = "KRX",
     ) -> BrokerCurrentPrice | None: ...
 
-    def get_account_snapshot(self, access_token: str) -> BrokerAccountSnapshot: ...
+    def get_account_snapshot(
+        self,
+        access_token: str,
+        *,
+        symbols: list[str] | None = None,
+        reference_prices: dict[str, Decimal] | None = None,
+        exchange: str = "KRX",
+    ) -> BrokerAccountSnapshot: ...
 
     def reconnect_handle(self) -> BrokerReconnectHandle: ...
 
