@@ -123,6 +123,7 @@ Initial broker-order submission endpoint:
 
 Current execution slices:
 - `POST /execution-plans` schedules durable `execution_jobs` for eligible `next_open_buy` items
+- short-term watcher `next_open_buy` candidates from `short-term-decider` are run through deterministic exec-agent rails before scheduling; approved candidates are converted to concrete share quantities using account cash/buying power, existing exposure/open-order guards, candidate budget, confidence/conviction, and target/stop presence
 - the autonomous dispatch loop submits due jobs on its configured cadence
 - the autonomous monitoring loop retries persisted triggered/backlogged monitoring items on its configured cadence and can evaluate fresh triggers when a monitoring price source is configured
 - `POST /execution-jobs/dispatch` remains available as an operator/manual dispatch override
@@ -130,6 +131,11 @@ Current execution slices:
 - `GET /symbols` exposes symbol-level readback rows for core/web consumers
 - `GET /symbols/{symbol}` exposes per-symbol execution, monitoring, order, fill, and position history
 - `GET /runtime/daily-board` exposes a compact current-day board with runtime status plus symbol rows
+
+Short-term watcher buys fail closed when broker account state cannot be resolved,
+when cash/buying power is insufficient, when a symbol is already held or has an
+open buy order, or when target/stop monitoring context is missing. Exec-agent
+decision metadata is persisted in each plan item's `risk_context`.
 
 ## Boot target
 

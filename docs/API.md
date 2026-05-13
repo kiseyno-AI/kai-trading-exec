@@ -180,6 +180,13 @@ Suggested response shape:
 Current item behavior additionally includes:
 - canonical source identity readback (`decision_agent_name`, `decision_run_id`, `source_plan_item_id`, ...)
 - safe non-dispatch statuses for unsupported short-term buy semantics (`pending_configuration`, `unsupported_semantics`)
+- deterministic short-term exec-agent sizing for plain `short-term-decider` `next_open_buy` candidates without trigger/chase semantics
+  - accepts candidate/budget quantity policies and approved fixed-share policies
+  - requires target and stop context from sibling monitoring items or candidate risk context
+  - resolves broker account cash/buying power plus persisted/broker exposure guards before approving
+  - converts approved buys to `quantity_policy.kind = "shares"`
+  - persists approval/rejection metadata under `risk_context.exec_agent_decision`
+  - rejects fail-closed as `exec_agent_rejected` when account state, cash, target/stop, reference price, or duplicate/exposure guards fail
 
 ## Order/query APIs
 
@@ -190,6 +197,11 @@ For the current next-open slice, eligible `next_open_buy` items transition to
 `next_open_buy_scheduled` and receive a durable `execution_job` scheduled for
 the market open on `market_date`. Items without enough scheduling information
 remain persisted but do not receive a dispatchable job yet.
+
+For approved short-term watcher entries, exec may also materialize generated
+`target_sell` / `stop_sell` monitoring items from entry `risk_context` when
+core did not send sibling monitoring rows. Generated or updated monitoring rows
+include `risk_context.entry_context` linking them back to the entry candidate.
 
 Current plan-item readback also includes:
 - `source_identity`

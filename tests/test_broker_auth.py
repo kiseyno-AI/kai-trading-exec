@@ -7,6 +7,9 @@ import pytest
 from sqlalchemy import select
 
 from app.broker.base import (
+    BrokerAccountOpenOrder,
+    BrokerAccountPosition,
+    BrokerAccountSnapshot,
     BrokerAdapterError,
     BrokerConfig,
     BrokerCurrentPrice,
@@ -111,10 +114,12 @@ class StubBrokerAdapter:
         token_grant: BrokerTokenGrant | None = None,
         approval: BrokerRealtimeApproval | None = None,
         order_placement: BrokerOrderPlacement | None = None,
+        account_snapshot: BrokerAccountSnapshot | None = None,
         current_prices: dict[str, Decimal] | None = None,
         auth_error: Exception | None = None,
         approval_error: Exception | None = None,
         order_error: Exception | None = None,
+        account_snapshot_error: Exception | None = None,
         current_price_error: Exception | None = None,
         revoke_error: Exception | None = None,
     ) -> None:
@@ -125,16 +130,19 @@ class StubBrokerAdapter:
             issued_at=datetime.now(UTC),
         )
         self.order_placement = order_placement
+        self.account_snapshot = account_snapshot
         self.current_prices = current_prices or {}
         self.auth_error = auth_error
         self.approval_error = approval_error
         self.order_error = order_error
+        self.account_snapshot_error = account_snapshot_error
         self.current_price_error = current_price_error
         self.revoke_error = revoke_error
         self.authenticate_calls = 0
         self.approval_calls = 0
         self.revoke_calls: list[str] = []
         self.order_calls: list[BrokerOrderPlacementRequest] = []
+        self.account_snapshot_calls: list[dict[str, object]] = []
         self.current_price_calls: list[tuple[str, str]] = []
 
     def describe(self) -> BrokerConfig:
@@ -192,6 +200,32 @@ class StubBrokerAdapter:
             price=price,
             observed_at=datetime.now(UTC),
             payload={"output": {"stck_prpr": str(price)}},
+        )
+
+    def get_account_snapshot(
+        self,
+        access_token: str,
+        *,
+        symbols: list[str],
+        reference_prices: dict[str, Decimal],
+        exchange: str = "KRX",
+    ) -> BrokerAccountSnapshot:
+        self.account_snapshot_calls.append(
+            {
+                "symbols": list(symbols),
+                "reference_prices": dict(reference_prices),
+                "exchange": exchange,
+            }
+        )
+        if self.account_snapshot_error is not None:
+            raise self.account_snapshot_error
+        assert access_token
+        if self.account_snapshot is not None:
+            return self.account_snapshot
+        return BrokerAccountSnapshot(
+            observed_at=datetime.now(UTC),
+            available_cash=None,
+            buying_power=None,
         )
 
     def reconnect_handle(self) -> BrokerReconnectHandle:
@@ -331,6 +365,24 @@ def build_order_placement(
             },
         },
         message="accepted",
+    )
+
+
+def build_account_snapshot(
+    *,
+    available_cash: str = "1000000",
+    buying_power: str | None = None,
+    positions: list[BrokerAccountPosition] | None = None,
+    open_orders: list[BrokerAccountOpenOrder] | None = None,
+) -> BrokerAccountSnapshot:
+    cash = Decimal(available_cash)
+    power = Decimal(buying_power) if buying_power is not None else cash
+    return BrokerAccountSnapshot(
+        observed_at=datetime(2026, 5, 13, 9, 0, tzinfo=UTC),
+        available_cash=cash,
+        buying_power=power,
+        positions=positions or [],
+        open_orders=open_orders or [],
     )
 
 
@@ -1609,7 +1661,9 @@ def test_short_term_buy_items_are_safely_blocked_from_scheduling() -> None:
     }
     assert items_by_source["core-tactical-entry-1"]["status"] == "unsupported_semantics"
     assert items_by_source["core-trigger-chase-entry-1"]["status"] == "pending_configuration"
-    assert items_by_source["core-plain-next-open-entry-1"]["status"] == "unsupported_semantics"
+    plain_item = items_by_source["core-plain-next-open-entry-1"]
+    assert plain_item["status"] == "exec_agent_rejected"
+    assert plain_item["risk_context"]["exec_agent_decision"]["reason"] == "missing_target_or_stop"
 
     jobs_payload = client.get("/execution-jobs").json()
     assert jobs_payload == []
@@ -1621,6 +1675,404 @@ def test_short_term_buy_items_are_safely_blocked_from_scheduling() -> None:
     assert dispatch_payload["failed_job_count"] == 0
     assert broker_adapter.order_calls == []
     assert client.get("/orders").json() == []
+
+    engine.dispose()
+
+
+def test_short_term_exec_agent_rejects_missing_target_stop_and_insufficient_cash() -> None:
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        account_snapshot=build_account_snapshot(available_cash="50000"),
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+        ),
+        broker_adapter=broker_adapter,
+    )
+    client = TestClient(app)
+
+    response = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-short-term-rejections-1",
+            "source": "kai-trading-core",
+            "market_date": "2024-01-03",
+            "items": [
+                {
+                    "symbol": "005930",
+                    "side": "buy",
+                    "intent": "next_open_buy",
+                    "quantity_policy": {"kind": "candidate", "max_budget": "300000"},
+                    "decision_agent_name": "short-term-decider",
+                    "source_plan_item_id": "missing-risk-bracket",
+                    "risk_context": {
+                        "reference_price": "100000",
+                        "confidence": "0.90",
+                    },
+                },
+                {
+                    "symbol": "000660",
+                    "side": "buy",
+                    "intent": "next_open_buy",
+                    "quantity_policy": {"kind": "candidate", "max_budget": "300000"},
+                    "decision_agent_name": "short-term-decider",
+                    "source_plan_item_id": "insufficient-cash",
+                    "risk_context": {
+                        "reference_price": "100000",
+                        "target_price": "110000",
+                        "stop_price": "95000",
+                        "confidence": "0.90",
+                    },
+                },
+            ],
+        },
+    )
+
+    assert response.status_code == 201
+    plans_payload = client.get("/execution-plans").json()
+    items_by_source = {
+        item["source_plan_item_id"]: item
+        for item in plans_payload[0]["items"]
+    }
+    missing_bracket = items_by_source["missing-risk-bracket"]
+    insufficient_cash = items_by_source["insufficient-cash"]
+    assert missing_bracket["status"] == "exec_agent_rejected"
+    assert missing_bracket["risk_context"]["exec_agent_decision"]["reason"] == "missing_target_or_stop"
+    assert insufficient_cash["status"] == "exec_agent_rejected"
+    assert insufficient_cash["risk_context"]["exec_agent_decision"]["reason"] == "insufficient_cash"
+
+    assert len(broker_adapter.account_snapshot_calls) == 1
+    assert client.get("/execution-jobs").json() == []
+    assert broker_adapter.order_calls == []
+
+    engine.dispose()
+
+
+def test_short_term_exec_agent_rejects_existing_holding_and_open_order() -> None:
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        account_snapshot=build_account_snapshot(
+            available_cash="1000000",
+            positions=[
+                BrokerAccountPosition(
+                    symbol="005930",
+                    quantity=3,
+                    average_price=Decimal("70000"),
+                )
+            ],
+            open_orders=[
+                BrokerAccountOpenOrder(
+                    symbol="000660",
+                    side="buy",
+                    quantity=1,
+                    status="submitted",
+                    broker_order_id="open-buy-1",
+                )
+            ],
+        ),
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+        ),
+        broker_adapter=broker_adapter,
+    )
+    client = TestClient(app)
+
+    response = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-short-term-exposure-guards-1",
+            "source": "kai-trading-core",
+            "market_date": "2024-01-03",
+            "items": [
+                {
+                    "symbol": "005930",
+                    "side": "buy",
+                    "intent": "next_open_buy",
+                    "quantity_policy": {"kind": "candidate", "max_budget": "300000"},
+                    "decision_agent_name": "short-term-decider",
+                    "source_plan_item_id": "already-held",
+                    "risk_context": {
+                        "reference_price": "70000",
+                        "target_price": "76000",
+                        "stop_price": "68000",
+                        "confidence": "0.90",
+                    },
+                },
+                {
+                    "symbol": "000660",
+                    "side": "buy",
+                    "intent": "next_open_buy",
+                    "quantity_policy": {"kind": "candidate", "max_budget": "300000"},
+                    "decision_agent_name": "short-term-decider",
+                    "source_plan_item_id": "already-open-order",
+                    "risk_context": {
+                        "reference_price": "120000",
+                        "target_price": "130000",
+                        "stop_price": "115000",
+                        "confidence": "0.90",
+                    },
+                },
+            ],
+        },
+    )
+
+    assert response.status_code == 201
+    items_by_source = {
+        item["source_plan_item_id"]: item
+        for item in client.get("/execution-plans").json()[0]["items"]
+    }
+    assert items_by_source["already-held"]["status"] == "exec_agent_rejected"
+    assert items_by_source["already-held"]["risk_context"]["exec_agent_decision"]["reason"] == "existing_position"
+    assert items_by_source["already-open-order"]["status"] == "exec_agent_rejected"
+    assert (
+        items_by_source["already-open-order"]["risk_context"]["exec_agent_decision"]["reason"]
+        == "existing_open_buy_order"
+    )
+    assert client.get("/execution-jobs").json() == []
+    assert broker_adapter.order_calls == []
+
+    engine.dispose()
+
+
+def test_short_term_exec_agent_approves_candidate_schedules_job_and_monitoring_items() -> None:
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(broker_order_id="kis-short-term-100"),
+        account_snapshot=build_account_snapshot(available_cash="1000000"),
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+        ),
+        broker_adapter=broker_adapter,
+    )
+    client = TestClient(app)
+
+    plan_response = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-short-term-approved-1",
+            "source": "kai-trading-core",
+            "market_date": "2024-01-03",
+            "items": [
+                {
+                    "symbol": "005930",
+                    "side": "buy",
+                    "intent": "next_open_buy",
+                    "quantity_policy": {"kind": "candidate", "max_budget": "300000"},
+                    "time_in_force": "day",
+                    "decision_agent_name": "short-term-decider",
+                    "decision_snapshot_id": "short-snapshot-approved-1",
+                    "decision_run_id": "short-run-approved-1",
+                    "source_plan_item_id": "short-entry-approved-1",
+                    "risk_context": {
+                        "reference_price": "50000",
+                        "target_price": "55000",
+                        "stop_price": "47000",
+                        "confidence": "0.90",
+                        "exchange": "KRX",
+                    },
+                }
+            ],
+        },
+    )
+    assert plan_response.status_code == 201
+    buy_item_id = plan_response.json()["persisted_execution_item_ids"][0]
+
+    plans_payload = client.get("/execution-plans").json()
+    assert plans_payload[0]["item_count"] == 3
+    items_by_intent = {
+        item["intent"]: item
+        for item in plans_payload[0]["items"]
+    }
+    buy_item = items_by_intent["next_open_buy"]
+    assert buy_item["execution_plan_item_id"] == buy_item_id
+    assert buy_item["status"] == "next_open_buy_scheduled"
+    assert buy_item["quantity_policy"] == {
+        "kind": "shares",
+        "quantity": 6,
+        "source": "short_term_exec_agent_v1",
+    }
+    assert buy_item["risk_context"]["original_quantity_policy"] == {
+        "kind": "candidate",
+        "max_budget": "300000",
+    }
+    assert buy_item["risk_context"]["exec_agent_decision"]["decision"] == "approved"
+    assert buy_item["risk_context"]["exec_agent_decision"]["approved_quantity"] == 6
+
+    assert items_by_intent["target_sell"]["status"] == "target_sell_monitoring"
+    assert items_by_intent["target_sell"]["trigger_price"] == "55000.0000"
+    assert items_by_intent["target_sell"]["quantity_policy"]["quantity"] == 6
+    assert (
+        items_by_intent["target_sell"]["risk_context"]["entry_context"]["source_plan_item_id"]
+        == "short-entry-approved-1"
+    )
+    assert items_by_intent["stop_sell"]["status"] == "stop_sell_monitoring"
+    assert items_by_intent["stop_sell"]["trigger_price"] == "47000.0000"
+
+    jobs_payload = client.get("/execution-jobs").json()
+    assert len(jobs_payload) == 1
+    assert jobs_payload[0]["execution_plan_item_id"] == buy_item_id
+    assert jobs_payload[0]["status"] == "scheduled"
+
+    paused_dispatch = client.post("/execution-jobs/dispatch")
+    assert paused_dispatch.status_code == 200
+    assert paused_dispatch.json()["blocked"] is True
+    assert paused_dispatch.json()["block_reason"] == "paused"
+    assert broker_adapter.order_calls == []
+
+    resume = client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "console", "reason": "enable automation"},
+    )
+    assert resume.status_code == 200
+    dispatch_response = client.post("/execution-jobs/dispatch")
+    assert dispatch_response.status_code == 200
+    assert dispatch_response.json()["completed_job_count"] == 1
+    assert len(broker_adapter.order_calls) == 1
+    assert broker_adapter.order_calls[0].execution_plan_item_id == buy_item_id
+    assert broker_adapter.order_calls[0].quantity == 6
+    assert broker_adapter.order_calls[0].order_type == "market"
+
+    with app.state.db_session_factory() as session:
+        order = session.scalar(
+            select(BrokerOrder).where(BrokerOrder.execution_plan_item_id == buy_item_id)
+        )
+        assert order is not None
+        assert order.idempotency_key.startswith("source-candidate:")
+        session.add(
+            ExecutionPosition(
+                mode="paper",
+                symbol="005930",
+                quantity=6,
+                average_price=Decimal("50000.0000"),
+                updated_from="test-fill",
+                raw_payload={"source": "test"},
+            )
+        )
+        session.commit()
+
+    target_response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "short-term target check",
+            "prices": [{"symbol": "005930", "price": "55010.00"}],
+        },
+    )
+    assert target_response.status_code == 200
+    target_payload = target_response.json()
+    assert target_payload["triggered_item_count"] == 1
+    assert target_payload["submitted_order_count"] == 1
+    assert len(broker_adapter.order_calls) == 2
+    assert broker_adapter.order_calls[1].side == "sell"
+    assert broker_adapter.order_calls[1].quantity == 6
+    assert target_payload["items"][0]["intent"] == "target_sell"
+    assert target_payload["items"][0]["outcome"] == "submitted"
+
+    engine.dispose()
+
+
+def test_short_term_exec_agent_scheduled_job_is_blocked_by_kill_switch() -> None:
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(broker_order_id="kis-short-term-kill-1"),
+        account_snapshot=build_account_snapshot(available_cash="1000000"),
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+        ),
+        broker_adapter=broker_adapter,
+    )
+    client = TestClient(app)
+
+    plan_response = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-short-term-kill-switch-1",
+            "source": "kai-trading-core",
+            "market_date": "2024-01-03",
+            "items": [
+                {
+                    "symbol": "005930",
+                    "side": "buy",
+                    "intent": "next_open_buy",
+                    "quantity_policy": {"kind": "candidate", "max_budget": "100000"},
+                    "decision_agent_name": "short-term-decider",
+                    "source_plan_item_id": "short-entry-kill-switch-1",
+                    "risk_context": {
+                        "reference_price": "50000",
+                        "target_price": "55000",
+                        "stop_price": "47000",
+                        "confidence": "0.90",
+                    },
+                }
+            ],
+        },
+    )
+    assert plan_response.status_code == 201
+
+    resume = client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "console", "reason": "enable automation"},
+    )
+    assert resume.status_code == 200
+    kill_switch = client.post(
+        "/controls/kill-switch",
+        json={"actor": "ops", "source": "console", "reason": "test kill switch"},
+    )
+    assert kill_switch.status_code == 200
+
+    dispatch = client.post("/execution-jobs/dispatch")
+    assert dispatch.status_code == 200
+    assert dispatch.json()["blocked"] is True
+    assert dispatch.json()["block_reason"] == "kill_switch"
+    assert broker_adapter.order_calls == []
 
     engine.dispose()
 

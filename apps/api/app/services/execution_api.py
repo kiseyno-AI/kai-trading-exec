@@ -8,6 +8,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
 from app.api.schemas.execution import ExecutionPlanItemRequest, ExecutionPlanRequest
+from app.broker.base import BrokerAdapter
 from app.core.config import Settings
 from app.models.runtime import (
     BrokerOrder,
@@ -48,6 +49,7 @@ def create_execution_plan(
     *,
     settings: Settings,
     db: Session,
+    adapter: BrokerAdapter,
     command: ExecutionPlanRequest,
 ) -> CreateExecutionPlanResult:
     plan = ExecutionPlan(
@@ -82,7 +84,14 @@ def create_execution_plan(
     )
     from app.services.execution_jobs import materialize_execution_jobs
     from app.services.monitoring import materialize_monitoring_plan_items
+    from app.services.short_term_exec_agent import apply_short_term_exec_agent_decisions
 
+    apply_short_term_exec_agent_decisions(
+        settings=settings,
+        db=db,
+        adapter=adapter,
+        plan=plan,
+    )
     materialize_execution_jobs(plan)
     materialize_monitoring_plan_items(plan)
     db.add(plan)
@@ -672,8 +681,6 @@ def _initial_plan_item_status(item: ExecutionPlanItemRequest) -> str:
     if item.intent == "next_open_buy":
         if item.trigger_price is not None or _item_has_buy_chase_or_trigger_fields(item):
             return "pending_configuration"
-        if _decision_agent_name(item) == SHORT_TERM_DECIDER_NAME:
-            return "unsupported_semantics"
         return "pending"
     if item.intent in UNSUPPORTED_BUY_INTENTS:
         return "unsupported_semantics"

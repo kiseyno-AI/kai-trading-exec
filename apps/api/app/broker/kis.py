@@ -3,13 +3,15 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, timezone
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from typing import Any, Protocol
 from urllib.parse import urlencode
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from app.broker.base import (
+    BrokerAccountPosition,
+    BrokerAccountSnapshot,
     BrokerAdapter,
     BrokerAdapterError,
     BrokerConfig,
@@ -19,6 +21,7 @@ from app.broker.base import (
     BrokerOrderPlacementRequest,
     BrokerRealtimeApproval,
     BrokerReconnectHandle,
+    BrokerSymbolBuyingPower,
     BrokerTokenGrant,
     BrokerTokenRevocation,
     NormalizedBrokerOrderStatus,
@@ -34,6 +37,8 @@ KIS_REVOKE_PATH = "/oauth2/revokeP"
 KIS_HASHKEY_PATH = "/uapi/hashkey"
 KIS_ORDER_CASH_PATH = "/uapi/domestic-stock/v1/trading/order-cash"
 KIS_CURRENT_PRICE_PATH = "/uapi/domestic-stock/v1/quotations/inquire-price"
+KIS_INQUIRE_BALANCE_PATH = "/uapi/domestic-stock/v1/trading/inquire-balance"
+KIS_INQUIRE_PSBL_ORDER_PATH = "/uapi/domestic-stock/v1/trading/inquire-psbl-order"
 KIS_CURRENT_PRICE_TR_ID = "FHKST01010100"
 KIS_TIMEZONE = timezone(timedelta(hours=9))
 
@@ -433,6 +438,77 @@ class KisBrokerAdapter(BrokerAdapter):
             payload=body,
         )
 
+    def get_account_snapshot(
+        self,
+        access_token: str,
+        *,
+        symbols: list[str],
+        reference_prices: dict[str, Decimal],
+        exchange: str = "KRX",
+    ) -> BrokerAccountSnapshot:
+        config = self._configured()
+        if not self.settings.kis_account_number:
+            raise BrokerAdapterError(
+                "KIS account number is not configured",
+                status_code=409,
+                classification=BrokerErrorClassification.VALIDATION,
+            )
+        if exchange != "KRX":
+            raise BrokerAdapterError(
+                f"unsupported exchange for account snapshot: {exchange}",
+                status_code=422,
+                classification=BrokerErrorClassification.VALIDATION,
+            )
+
+        observed_at = datetime.now(UTC)
+        balance_payloads = self._fetch_domestic_balance(
+            config=config,
+            access_token=access_token,
+        )
+        positions = _parse_balance_positions(balance_payloads)
+        balance_cash = _parse_balance_cash(balance_payloads)
+
+        symbol_buying_power: dict[str, BrokerSymbolBuyingPower] = {}
+        buying_power_values: list[Decimal] = []
+        available_cash_values: list[Decimal] = []
+        for symbol in _unique_symbols(symbols):
+            reference_price = reference_prices.get(symbol)
+            if reference_price is None or reference_price <= 0:
+                continue
+            buying_power_payload = self._fetch_symbol_buying_power(
+                config=config,
+                access_token=access_token,
+                symbol=symbol,
+                reference_price=reference_price,
+            )
+            buying_power = _parse_symbol_buying_power(symbol, buying_power_payload)
+            symbol_buying_power[symbol] = buying_power
+            if buying_power.buying_power is not None:
+                buying_power_values.append(buying_power.buying_power)
+            if buying_power.available_cash is not None:
+                available_cash_values.append(buying_power.available_cash)
+
+        available_cash = balance_cash
+        if available_cash is None and available_cash_values:
+            available_cash = min(available_cash_values)
+        buying_power = min(buying_power_values) if buying_power_values else available_cash
+        return BrokerAccountSnapshot(
+            observed_at=observed_at,
+            available_cash=available_cash,
+            buying_power=buying_power,
+            positions=positions,
+            open_orders=[],
+            symbol_buying_power=symbol_buying_power,
+            payload={
+                "provider": self.provider,
+                "balance": balance_payloads,
+                "symbol_buying_power": {
+                    symbol: power.payload
+                    for symbol, power in symbol_buying_power.items()
+                },
+            },
+        )
+
     def reconnect_handle(self) -> BrokerReconnectHandle:
         return BrokerReconnectHandle(
             supported=True,
@@ -507,6 +583,111 @@ class KisBrokerAdapter(BrokerAdapter):
                 response_payload=response.payload,
             )
         return hashkey
+
+    def _fetch_domestic_balance(
+        self,
+        *,
+        config: BrokerConfig,
+        access_token: str,
+    ) -> list[dict[str, object]]:
+        tr_id = "TTTC8434R" if self.settings.runtime_mode == "live" else "VTTC8434R"
+        params = {
+            "CANO": self.settings.kis_account_number or "",
+            "ACNT_PRDT_CD": self.settings.kis_account_product_code,
+            "AFHR_FLPR_YN": "N",
+            "OFL_YN": "",
+            "INQR_DVSN": "02",
+            "UNPR_DVSN": "01",
+            "FUND_STTL_ICLD_YN": "N",
+            "FNCG_AMT_AUTO_RDPT_YN": "N",
+            "PRCS_DVSN": "00",
+            "CTX_AREA_FK100": "",
+            "CTX_AREA_NK100": "",
+        }
+        payloads: list[dict[str, object]] = []
+        tr_cont = ""
+        for _ in range(10):
+            headers = self.build_headers(access_token, transaction_id=tr_id)
+            headers["tr_cont"] = tr_cont
+            headers["custtype"] = self.settings.kis_customer_type
+            response = self.http_client.get_json(
+                url=f"{config.api_base_url}{KIS_INQUIRE_BALANCE_PATH}",
+                headers=headers,
+                params=params,
+                timeout_seconds=self.settings.kis_request_timeout_seconds,
+            )
+            body = response.payload
+            if _optional_string(body.get("rt_cd")) != "0":
+                raise BrokerAdapterError(
+                    _error_message(body),
+                    status_code=422,
+                    classification=_classify_error(
+                        status_code=400,
+                        code=_optional_string(body.get("msg_cd")),
+                        message=_error_message(body),
+                    ),
+                    code=_optional_string(body.get("msg_cd")),
+                    response_metadata={
+                        "status_code": response.status_code,
+                        "headers": _sanitize_headers(response.headers),
+                    },
+                    response_payload=body,
+                    observed_at=datetime.now(UTC),
+                )
+            payloads.append(body)
+
+            next_tr_cont = response.headers.get("tr_cont", "")
+            if next_tr_cont not in {"M", "F"}:
+                break
+            params["CTX_AREA_FK100"] = str(body.get("ctx_area_fk100") or "")
+            params["CTX_AREA_NK100"] = str(body.get("ctx_area_nk100") or "")
+            tr_cont = "N"
+        return payloads
+
+    def _fetch_symbol_buying_power(
+        self,
+        *,
+        config: BrokerConfig,
+        access_token: str,
+        symbol: str,
+        reference_price: Decimal,
+    ) -> dict[str, object]:
+        tr_id = "TTTC8908R" if self.settings.runtime_mode == "live" else "VTTC8908R"
+        headers = self.build_headers(access_token, transaction_id=tr_id)
+        headers["custtype"] = self.settings.kis_customer_type
+        response = self.http_client.get_json(
+            url=f"{config.api_base_url}{KIS_INQUIRE_PSBL_ORDER_PATH}",
+            headers=headers,
+            params={
+                "CANO": self.settings.kis_account_number or "",
+                "ACNT_PRDT_CD": self.settings.kis_account_product_code,
+                "PDNO": symbol,
+                "ORD_UNPR": _kis_whole_krw(reference_price),
+                "ORD_DVSN": "01",
+                "CMA_EVLU_AMT_ICLD_YN": "Y",
+                "OVRS_ICLD_YN": "N",
+            },
+            timeout_seconds=self.settings.kis_request_timeout_seconds,
+        )
+        body = response.payload
+        if _optional_string(body.get("rt_cd")) != "0":
+            raise BrokerAdapterError(
+                _error_message(body),
+                status_code=422,
+                classification=_classify_error(
+                    status_code=400,
+                    code=_optional_string(body.get("msg_cd")),
+                    message=_error_message(body),
+                ),
+                code=_optional_string(body.get("msg_cd")),
+                response_metadata={
+                    "status_code": response.status_code,
+                    "headers": _sanitize_headers(response.headers),
+                },
+                response_payload=body,
+                observed_at=datetime.now(UTC),
+            )
+        return body
 
 
 def _resolve_api_base_url(settings: Settings) -> str | None:
@@ -680,6 +861,17 @@ def _order_price(order_type: str, limit_price: Any) -> str:
     return str(limit_price)
 
 
+def _kis_whole_krw(value: Decimal) -> str:
+    whole = value.quantize(Decimal("1"), rounding=ROUND_DOWN)
+    if whole <= 0:
+        raise BrokerAdapterError(
+            "reference price must be positive for KIS buying power inquiry",
+            status_code=422,
+            classification=BrokerErrorClassification.VALIDATION,
+        )
+    return str(whole)
+
+
 def _quote_market_division(exchange: str) -> str:
     if exchange != "KRX":
         raise BrokerAdapterError(
@@ -697,6 +889,135 @@ def _parse_decimal(value: object) -> Decimal | None:
         return Decimal(str(value))
     except (InvalidOperation, ValueError):
         return None
+
+
+def _parse_int(value: object) -> int | None:
+    decimal_value = _parse_decimal(value)
+    if decimal_value is None:
+        return None
+    return int(decimal_value.quantize(Decimal("1"), rounding=ROUND_DOWN))
+
+
+def _unique_symbols(symbols: list[str]) -> list[str]:
+    seen: set[str] = set()
+    unique: list[str] = []
+    for symbol in symbols:
+        normalized = symbol.strip().upper()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        unique.append(normalized)
+    return unique
+
+
+def _payload_output_list(payload: dict[str, object], key: str) -> list[dict[str, object]]:
+    value = payload.get(key)
+    if isinstance(value, list):
+        return [item for item in value if isinstance(item, dict)]
+    if isinstance(value, dict):
+        return [value]
+    return []
+
+
+def _payload_output_object(payload: dict[str, object], key: str) -> dict[str, object] | None:
+    value = payload.get(key)
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, list):
+        for item in value:
+            if isinstance(item, dict):
+                return item
+    return None
+
+
+def _parse_balance_positions(payloads: list[dict[str, object]]) -> list[BrokerAccountPosition]:
+    positions: list[BrokerAccountPosition] = []
+    for payload in payloads:
+        for row in _payload_output_list(payload, "output1"):
+            symbol = _first_string(row, ("pdno", "PDNO", "stck_shrn_iscd"))
+            if symbol is None:
+                continue
+            quantity = _parse_int(_first_value(row, ("hldg_qty", "HLDG_QTY", "ord_psbl_qty")))
+            if quantity is None or quantity <= 0:
+                continue
+            positions.append(
+                BrokerAccountPosition(
+                    symbol=symbol.strip().upper(),
+                    quantity=quantity,
+                    average_price=_parse_decimal(
+                        _first_value(row, ("pchs_avg_pric", "avg_prvs", "pchs_avg_pric_amt"))
+                    ),
+                    payload=dict(row),
+                )
+            )
+    return positions
+
+
+def _parse_balance_cash(payloads: list[dict[str, object]]) -> Decimal | None:
+    cash_values: list[Decimal] = []
+    for payload in payloads:
+        output = _payload_output_object(payload, "output2")
+        if output is None:
+            continue
+        for key in (
+            "dnca_tot_amt",
+            "prvs_rcdl_excc_amt",
+            "ord_psbl_cash",
+            "nrcvb_buy_amt",
+            "max_buy_amt",
+        ):
+            value = _parse_decimal(output.get(key))
+            if value is not None and value >= 0:
+                cash_values.append(value)
+                break
+    if not cash_values:
+        return None
+    return min(cash_values)
+
+
+def _parse_symbol_buying_power(
+    symbol: str,
+    payload: dict[str, object],
+) -> BrokerSymbolBuyingPower:
+    output = _payload_output_object(payload, "output") or {}
+    available_cash = _first_decimal(
+        output,
+        ("ord_psbl_cash", "nrcvb_buy_amt", "max_buy_amt"),
+    )
+    buying_power = _first_decimal(output, ("nrcvb_buy_amt", "ord_psbl_cash", "max_buy_amt"))
+    buyable_quantity = _parse_int(
+        _first_value(output, ("nrcvb_buy_qty", "ord_psbl_qty", "max_buy_qty"))
+    )
+    return BrokerSymbolBuyingPower(
+        symbol=symbol,
+        available_cash=available_cash,
+        buying_power=buying_power,
+        buyable_quantity=buyable_quantity if buyable_quantity and buyable_quantity > 0 else None,
+        payload=dict(output),
+    )
+
+
+def _first_value(payload: dict[str, object], keys: tuple[str, ...]) -> object | None:
+    for key in keys:
+        value = payload.get(key)
+        if value is not None and value != "":
+            return value
+    return None
+
+
+def _first_string(payload: dict[str, object], keys: tuple[str, ...]) -> str | None:
+    value = _first_value(payload, keys)
+    if isinstance(value, str) and value.strip():
+        return value
+    return None
+
+
+def _first_decimal(payload: dict[str, object], keys: tuple[str, ...]) -> Decimal | None:
+    for key in keys:
+        value = _parse_decimal(payload.get(key))
+        if value is not None:
+            return value
+    return None
 
 
 def _transaction_id(runtime_mode: str, side: str) -> str:
