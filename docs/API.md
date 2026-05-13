@@ -302,7 +302,9 @@ position rows.
 
 KIS live/paper order reconciliation now refreshes submitted/open/partially-filled
 orders from the broker before monitoring evaluates target/stop sells. The cycle:
-- queries KIS order/체결 state for pending broker order ids without placing any orders
+- queries KIS daily order/fill history (`/uapi/domestic-stock/v1/trading/inquire-daily-ccld`,
+  `TTTC0081R` live / `VTTC0081R` paper for same-period reconciliation) for
+  pending broker order ids without placing any orders
 - normalizes broker state into `submitted`, `open`, `partially_filled`, `filled`,
   `canceled`, `rejected`, `failed`, or `expired`
 - inserts `execution_fills` idempotently using stable broker fill/order identity
@@ -312,7 +314,11 @@ orders from the broker before monitoring evaluates target/stop sells. The cycle:
   raw broker payload for audit
 
 This keeps target/stop monitoring from missing sell eligibility solely because a
-local position row is stale after a live KIS buy acknowledgement.
+local position row is stale after a live KIS buy acknowledgement. Repeated
+identical reconciliation failures are de-duplicated/backed off in order events;
+the latest error remains on the broker order and is surfaced in symbol runtime
+details so unsafe target/stop sells are clearly blocked instead of silently
+assuming there is no position.
 
 ### `POST /execution-jobs/dispatch`
 Manually dispatch due execution jobs through the broker adapter boundary.

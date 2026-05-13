@@ -15,7 +15,7 @@ from app.api.schemas.execution import (
 )
 from app.broker.base import BrokerAdapter
 from app.core.config import Settings
-from app.models.runtime import ExecutionPlan, ExecutionPlanItem, ExecutionPosition, MonitoringCheckpoint
+from app.models.runtime import BrokerOrder, ExecutionPlan, ExecutionPlanItem, ExecutionPosition, MonitoringCheckpoint
 from app.services.reconciliation import (
     reconcile_pending_broker_orders,
     sync_execution_positions_from_broker_snapshot,
@@ -247,11 +247,25 @@ def _evaluate_monitoring_cycle(
             remaining_quantity=remaining_quantities_by_symbol.get(action.item.symbol),
         )
         if quantity is None:
+            reconciliation_error = _latest_reconciliation_error_for_symbol(
+                settings=settings,
+                db=db,
+                symbol=action.item.symbol,
+            )
             result_by_item_id[action.item.id] = _monitoring_result_payload(
                 item=action.item,
                 observed_price=action.observed_price,
-                outcome="no_position",
-                message="no sellable execution position is available for this trigger",
+                outcome=(
+                    "reconciliation_blocked"
+                    if reconciliation_error is not None
+                    else "no_position"
+                ),
+                message=(
+                    "sellable position is unknown because broker reconciliation failed: "
+                    f"{reconciliation_error}"
+                    if reconciliation_error is not None
+                    else "no sellable execution position is available for this trigger"
+                ),
             )
         elif dispatch_action_count >= max_broker_actions:
             symbol_actions.appendleft(action)
@@ -462,6 +476,27 @@ def _load_remaining_quantities_by_symbol(
         for position in positions
         if position.quantity > 0
     }
+
+
+def _latest_reconciliation_error_for_symbol(
+    *,
+    settings: Settings,
+    db: Session,
+    symbol: str,
+) -> str | None:
+    order = db.scalar(
+        select(BrokerOrder)
+        .where(
+            BrokerOrder.mode == settings.runtime_mode,
+            BrokerOrder.symbol == symbol,
+            BrokerOrder.last_error_message.is_not(None),
+        )
+        .order_by(BrokerOrder.last_broker_sync_at.desc(), BrokerOrder.updated_at.desc())
+        .limit(1)
+    )
+    if order is None:
+        return None
+    return order.last_error_message
 
 
 def _reconcile_before_monitoring(

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
@@ -401,36 +401,44 @@ def _reconcile_adapter_error(
                 "message": message,
             },
         )
-        db.add(
-            BrokerOrderEvent(
-                broker_order_pk=order.id,
-                event_type="reconcile_failed",
-                event_source=BrokerEventSource.RECONCILIATION.value,
-                normalized_status=order.status,
-                broker_status=exc.code,
-                error_classification=exc.classification.value,
-                retryable=exc.retryable,
-                message=message,
-                request_payload=exc.request_payload,
-                response_payload=exc.response_payload,
-                payload=_build_reconcile_event_payload(
-                    payload={
-                        "provider": adapter.provider,
-                        "broker_order_id": requested_broker_order_id,
-                        "status": None,
-                        "broker_status": exc.code,
-                        "observed_at": _serialize_datetime(order.last_broker_sync_at),
-                        "message": message,
-                        "request_metadata": exc.request_metadata,
-                        "response_metadata": exc.response_metadata,
-                        "request_payload": exc.request_payload,
-                        "payload": exc.response_payload,
-                    },
-                    adapter=adapter,
-                ),
-                observed_at=order.last_broker_sync_at,
+        if _should_record_reconcile_failure_event(
+            db=db,
+            order=order,
+            message=message,
+            broker_status=exc.code,
+            error_classification=exc.classification.value,
+            observed_at=order.last_broker_sync_at,
+        ):
+            db.add(
+                BrokerOrderEvent(
+                    broker_order_pk=order.id,
+                    event_type="reconcile_failed",
+                    event_source=BrokerEventSource.RECONCILIATION.value,
+                    normalized_status=order.status,
+                    broker_status=exc.code,
+                    error_classification=exc.classification.value,
+                    retryable=exc.retryable,
+                    message=message,
+                    request_payload=exc.request_payload,
+                    response_payload=exc.response_payload,
+                    payload=_build_reconcile_event_payload(
+                        payload={
+                            "provider": adapter.provider,
+                            "broker_order_id": requested_broker_order_id,
+                            "status": None,
+                            "broker_status": exc.code,
+                            "observed_at": _serialize_datetime(order.last_broker_sync_at),
+                            "message": message,
+                            "request_metadata": exc.request_metadata,
+                            "response_metadata": exc.response_metadata,
+                            "request_payload": exc.request_payload,
+                            "payload": exc.response_payload,
+                        },
+                        adapter=adapter,
+                    ),
+                    observed_at=order.last_broker_sync_at,
+                )
             )
-        )
         db.commit()
         db.refresh(order)
         return {
@@ -462,27 +470,35 @@ def _reconcile_adapter_error(
             "message": message,
         },
     )
-    db.add(
-        BrokerOrderEvent(
-            broker_order_pk=order.id,
-            event_type="reconcile_failed",
-            event_source=BrokerEventSource.RECONCILIATION.value,
-            normalized_status=order.status,
-            message=message,
-            payload=_build_reconcile_event_payload(
-                payload={
-                    "provider": adapter.provider,
-                    "broker_order_id": requested_broker_order_id,
-                    "status": None,
-                    "broker_status": None,
-                    "observed_at": _serialize_datetime(observed_at),
-                    "message": message,
-                },
-                adapter=adapter,
-            ),
-            observed_at=observed_at,
+    if _should_record_reconcile_failure_event(
+        db=db,
+        order=order,
+        message=message,
+        broker_status=None,
+        error_classification="unknown",
+        observed_at=observed_at,
+    ):
+        db.add(
+            BrokerOrderEvent(
+                broker_order_pk=order.id,
+                event_type="reconcile_failed",
+                event_source=BrokerEventSource.RECONCILIATION.value,
+                normalized_status=order.status,
+                message=message,
+                payload=_build_reconcile_event_payload(
+                    payload={
+                        "provider": adapter.provider,
+                        "broker_order_id": requested_broker_order_id,
+                        "status": None,
+                        "broker_status": None,
+                        "observed_at": _serialize_datetime(observed_at),
+                        "message": message,
+                    },
+                    adapter=adapter,
+                ),
+                observed_at=observed_at,
+            )
         )
-    )
     db.commit()
     db.refresh(order)
     return {
@@ -495,6 +511,41 @@ def _reconcile_adapter_error(
         "filled_delta": 0,
         "message": message,
     }
+
+
+def _should_record_reconcile_failure_event(
+    *,
+    db: Session,
+    order: BrokerOrder,
+    message: str,
+    broker_status: str | None,
+    error_classification: str,
+    observed_at: datetime,
+) -> bool:
+    latest_failure = db.scalar(
+        select(BrokerOrderEvent)
+        .where(
+            BrokerOrderEvent.broker_order_pk == order.id,
+            BrokerOrderEvent.event_type == "reconcile_failed",
+        )
+        .order_by(BrokerOrderEvent.observed_at.desc(), BrokerOrderEvent.created_at.desc())
+        .limit(1)
+    )
+    if latest_failure is None:
+        return True
+    if (
+        latest_failure.message != message
+        or latest_failure.broker_status != broker_status
+        or latest_failure.error_classification != error_classification
+    ):
+        return True
+    return _utc_naive(observed_at) - _utc_naive(latest_failure.observed_at) >= timedelta(minutes=5)
+
+
+def _utc_naive(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value
+    return value.astimezone(UTC).replace(tzinfo=None)
 
 
 def _parse_timestamp(value: object, *, fallback: datetime) -> datetime:
