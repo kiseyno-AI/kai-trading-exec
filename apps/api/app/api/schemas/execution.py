@@ -195,6 +195,112 @@ class PlaceOrderRequest(BaseModel):
             raise ValueError("limit_price must be omitted for market orders")
 
 
+class ShortTermWatcherAgentOutput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    decision: str = Field(min_length=1, max_length=16)
+    order_type: str = Field(default="market", max_length=16)
+    quantity: int | None = Field(default=None, gt=0)
+    max_notional: Decimal | None = Field(default=None, gt=0)
+    reference_price: Decimal | None = Field(default=None, gt=0)
+    target_price: Decimal | None = Field(default=None, gt=0)
+    stop_price: Decimal | None = Field(default=None, gt=0)
+    reason_code: str | None = Field(default=None, max_length=64)
+    rationale: str | None = Field(default=None, max_length=512)
+
+    @field_validator("decision", "order_type", "reason_code")
+    @classmethod
+    def normalize_agent_text_fields(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip().lower()
+        if not normalized:
+            raise ValueError("field must not be empty")
+        return normalized
+
+    @field_validator("decision")
+    @classmethod
+    def validate_decision(cls, value: str) -> str:
+        if value not in {"approve", "reject"}:
+            raise ValueError("decision must be 'approve' or 'reject'")
+        return value
+
+    @field_validator("order_type")
+    @classmethod
+    def validate_short_term_order_type(cls, value: str) -> str:
+        if value not in {"market"}:
+            raise ValueError("order_type must be 'market'")
+        return value
+
+
+class ShortTermWatcherAccountContext(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    available_cash: Decimal = Field(gt=0)
+    last_price: Decimal = Field(gt=0)
+    holdings: dict[str, int] = Field(default_factory=dict)
+    open_order_symbols: list[str] = Field(default_factory=list)
+
+    @field_validator("holdings")
+    @classmethod
+    def normalize_holdings(cls, value: dict[str, int]) -> dict[str, int]:
+        normalized: dict[str, int] = {}
+        for symbol, quantity in value.items():
+            normalized_symbol = symbol.strip().upper()
+            if not normalized_symbol:
+                raise ValueError("holding symbol must not be empty")
+            if quantity < 0:
+                raise ValueError("holding quantity must be non-negative")
+            normalized[normalized_symbol] = quantity
+        return normalized
+
+    @field_validator("open_order_symbols")
+    @classmethod
+    def normalize_open_order_symbols(cls, value: list[str]) -> list[str]:
+        normalized: list[str] = []
+        for symbol in value:
+            normalized_symbol = symbol.strip().upper()
+            if not normalized_symbol:
+                raise ValueError("open order symbol must not be empty")
+            normalized.append(normalized_symbol)
+        return normalized
+
+
+class ShortTermWatcherDecisionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    execution_plan_item_id: str = Field(min_length=1, max_length=36)
+    dry_run: bool = True
+    agent_output: ShortTermWatcherAgentOutput
+    account_context: ShortTermWatcherAccountContext
+
+    def account_context_from_snapshot(self, snapshot: object) -> ShortTermWatcherAccountContext:
+        holdings = {
+            holding.symbol: holding.quantity
+            for holding in getattr(snapshot, "holdings", [])
+            if getattr(holding, "quantity", 0) > 0
+        }
+        open_order_symbols = [
+            order.symbol
+            for order in getattr(snapshot, "open_orders", [])
+            if getattr(order, "side", "").lower() == "buy" and getattr(order, "remaining_quantity", 0) > 0
+        ]
+        return ShortTermWatcherAccountContext(
+            available_cash=getattr(snapshot, "available_cash"),
+            last_price=self.account_context.last_price,
+            holdings=holdings,
+            open_order_symbols=open_order_symbols,
+        )
+
+    @field_validator("execution_plan_item_id")
+    @classmethod
+    def normalize_candidate_id(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("execution_plan_item_id must not be empty")
+        return normalized
+
+
 class MonitoringPriceRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

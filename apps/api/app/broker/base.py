@@ -79,6 +79,39 @@ class BrokerCurrentPrice:
 
 
 @dataclass(frozen=True)
+class BrokerAccountHolding:
+    symbol: str
+    quantity: int
+    average_price: Decimal | None = None
+    sellable_quantity: int | None = None
+    payload: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class BrokerAccountOpenOrder:
+    symbol: str
+    side: str
+    quantity: int
+    remaining_quantity: int
+    status: str
+    broker_order_id: str | None = None
+    idempotency_key: str | None = None
+    source_candidate_id: str | None = None
+    limit_price: Decimal | None = None
+    payload: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class BrokerAccountSnapshot:
+    available_cash: Decimal
+    observed_at: datetime
+    source: str
+    holdings: list[BrokerAccountHolding] = field(default_factory=list)
+    open_orders: list[BrokerAccountOpenOrder] = field(default_factory=list)
+    payload: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class BrokerTokenRevocation:
     message: str
 
@@ -170,6 +203,8 @@ class BrokerAdapter(Protocol):
         symbol: str,
         exchange: str = "KRX",
     ) -> BrokerCurrentPrice | None: ...
+
+    def get_account_snapshot(self, access_token: str) -> BrokerAccountSnapshot: ...
 
     def reconnect_handle(self) -> BrokerReconnectHandle: ...
 
