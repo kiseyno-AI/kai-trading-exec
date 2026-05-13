@@ -16,6 +16,10 @@ from app.api.schemas.execution import (
 from app.broker.base import BrokerAdapter
 from app.core.config import Settings
 from app.models.runtime import ExecutionPlan, ExecutionPlanItem, ExecutionPosition, MonitoringCheckpoint
+from app.services.reconciliation import (
+    reconcile_pending_broker_orders,
+    sync_execution_positions_from_broker_snapshot,
+)
 from app.services.broker_orders import place_broker_order
 from app.services.plan_item_identity import serialize_plan_item_source_identity
 
@@ -143,11 +147,19 @@ def _evaluate_monitoring_cycle(
     allow_persisted_triggered_without_price: bool,
     update_checkpoint_if_idle: bool,
 ) -> EvaluateMonitoringResult:
+    items = _load_monitored_items(settings=settings, db=db)
+    monitored_symbols = {item.symbol for item in items}
+    _reconcile_before_monitoring(
+        settings=settings,
+        db=db,
+        adapter=adapter,
+        symbols=monitored_symbols,
+    )
     remaining_quantities_by_symbol = _load_remaining_quantities_by_symbol(
         settings=settings,
         db=db,
+        symbols=monitored_symbols,
     )
-    items = _load_monitored_items(settings=settings, db=db)
     result_by_item_id: dict[str, dict[str, object]] = {}
     evaluated_item_ids: list[str] = []
     actions_by_symbol: dict[str, deque[PendingMonitoringAction]] = {}
@@ -435,10 +447,14 @@ def _load_remaining_quantities_by_symbol(
     *,
     settings: Settings,
     db: Session,
+    symbols: set[str] | None = None,
 ) -> dict[str, int]:
+    where = [ExecutionPosition.mode == settings.runtime_mode]
+    if symbols:
+        where.append(ExecutionPosition.symbol.in_(sorted(symbols)))
     positions = db.scalars(
         select(ExecutionPosition)
-        .where(ExecutionPosition.mode == settings.runtime_mode)
+        .where(*where)
         .order_by(ExecutionPosition.symbol.asc())
     ).all()
     return {
@@ -446,6 +462,65 @@ def _load_remaining_quantities_by_symbol(
         for position in positions
         if position.quantity > 0
     }
+
+
+def _reconcile_before_monitoring(
+    *,
+    settings: Settings,
+    db: Session,
+    adapter: BrokerAdapter,
+    symbols: set[str],
+) -> None:
+    if not symbols:
+        return
+    try:
+        reconcile_pending_broker_orders(
+            settings=settings,
+            db=db,
+            adapter=adapter,
+            symbols=symbols,
+        )
+    except Exception:
+        return
+
+    stale_symbols = _positions_with_stale_local_state(
+        settings=settings,
+        db=db,
+        symbols=symbols,
+    )
+    if not stale_symbols:
+        return
+    try:
+        sync_execution_positions_from_broker_snapshot(
+            settings=settings,
+            db=db,
+            adapter=adapter,
+            symbols=stale_symbols,
+        )
+    except Exception:
+        return
+
+
+def _positions_with_stale_local_state(
+    *,
+    settings: Settings,
+    db: Session,
+    symbols: set[str],
+) -> set[str]:
+    positions = db.scalars(
+        select(ExecutionPosition)
+        .where(
+            ExecutionPosition.mode == settings.runtime_mode,
+            ExecutionPosition.symbol.in_(sorted(symbols)),
+        )
+    ).all()
+    known = {position.symbol: position for position in positions}
+    stale: set[str] = set()
+    for symbol in symbols:
+        position = known.get(symbol)
+        if position is None or position.quantity <= 0:
+            stale.add(symbol)
+    return stale
 
 
 def _monitoring_item_is_configured(item: ExecutionPlanItem) -> bool:

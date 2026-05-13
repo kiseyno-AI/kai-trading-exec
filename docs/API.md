@@ -300,6 +300,20 @@ Current readback includes `source_identities[]` aggregated from related executio
 and position updates arrive. Order acknowledgement alone does not create fill or
 position rows.
 
+KIS live/paper order reconciliation now refreshes submitted/open/partially-filled
+orders from the broker before monitoring evaluates target/stop sells. The cycle:
+- queries KIS order/체결 state for pending broker order ids without placing any orders
+- normalizes broker state into `submitted`, `open`, `partially_filled`, `filled`,
+  `canceled`, `rejected`, `failed`, or `expired`
+- inserts `execution_fills` idempotently using stable broker fill/order identity
+  plus quantity/price/time as a duplicate guard
+- syncs stale or missing `execution_positions` from the authenticated account
+  snapshot, with `updated_from=reconciliation`, `last_reconciled_at`, and redacted
+  raw broker payload for audit
+
+This keeps target/stop monitoring from missing sell eligibility solely because a
+local position row is stale after a live KIS buy acknowledgement.
+
 ### `POST /execution-jobs/dispatch`
 Manually dispatch due execution jobs through the broker adapter boundary.
 

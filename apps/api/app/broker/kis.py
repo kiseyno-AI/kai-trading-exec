@@ -521,12 +521,84 @@ class KisBrokerAdapter(BrokerAdapter):
         access_token: str,
         broker_order_id: str,
     ) -> dict[str, Any] | None:
-        del access_token
+        config = self._configured()
+        observed_at = datetime.now(UTC)
+        response = self.http_client.get_json(
+            url=f"{config.api_base_url}{KIS_OPEN_ORDERS_PATH}",
+            headers=self.build_headers(
+                access_token,
+                transaction_id=_open_orders_transaction_id(self.settings.runtime_mode),
+            ),
+            params=_reconcile_order_params(
+                self.settings,
+                broker_order_id,
+                observed_at,
+            ),
+            timeout_seconds=self.settings.kis_request_timeout_seconds,
+        )
+        _raise_if_business_error(response.payload)
+        normalized_order = _normalize_reconcile_order(
+            response.payload,
+            broker_order_id,
+            observed_at=observed_at,
+        )
+        if normalized_order is None:
+            return {
+                "provider": self.provider,
+                "broker_order_id": broker_order_id,
+                "status": "unknown",
+                "broker_status": "unknown",
+                "observed_at": observed_at.isoformat(),
+                "request_metadata": {
+                    "provider": self.provider,
+                    "endpoint": KIS_OPEN_ORDERS_PATH,
+                    "tr_id": _open_orders_transaction_id(self.settings.runtime_mode),
+                    "params": _reconcile_order_params(
+                        self.settings,
+                        broker_order_id,
+                        observed_at,
+                    ),
+                },
+                "response_metadata": {
+                    "status_code": response.status_code,
+                    "msg_cd": _optional_string(response.payload.get("msg_cd")),
+                    "account_number_masked": _mask_account(self.settings.kis_account_number),
+                },
+                "message": "matching order was not found in broker order query",
+                "payload": {"output": _safe_reconcile_payload(response.payload)},
+            }
+
         return {
             "provider": self.provider,
             "broker_order_id": broker_order_id,
-            "status": "not_implemented",
-            "strategy": "bounded_rest_fallback",
+            "status": normalized_order["status"],
+            "broker_status": normalized_order["broker_status"],
+            "requested_quantity": normalized_order["requested_quantity"],
+            "remaining_quantity": normalized_order["remaining_quantity"],
+            "filled_quantity": normalized_order["filled_quantity"],
+            "average_fill_price": normalized_order["average_fill_price"],
+            "filled_at": normalized_order["filled_at"].isoformat(),
+            "fills": normalized_order["fills"],
+            "observed_at": normalized_order["observed_at"].isoformat(),
+            "request_metadata": {
+                "provider": self.provider,
+                "endpoint": KIS_OPEN_ORDERS_PATH,
+                "tr_id": _open_orders_transaction_id(self.settings.runtime_mode),
+                "params": _reconcile_order_params(
+                    self.settings,
+                    broker_order_id,
+                    observed_at,
+                ),
+            },
+            "response_metadata": {
+                "status_code": response.status_code,
+                "msg_cd": _optional_string(response.payload.get("msg_cd")),
+                "account_number_masked": _mask_account(self.settings.kis_account_number),
+            },
+            "payload": {
+                "order": normalized_order["raw"],
+            },
+            "message": normalized_order["message"],
         }
 
     def build_headers(
@@ -551,7 +623,10 @@ class KisBrokerAdapter(BrokerAdapter):
     def _configured(self) -> BrokerConfig:
         config = self.describe()
         if not config.configured or config.api_base_url is None:
-            raise BrokerAdapterError(config.reason or "KIS configuration is unavailable", status_code=409)
+            raise BrokerAdapterError(
+                config.reason or "KIS configuration is unavailable",
+                status_code=409,
+            )
         return config
 
     def _issue_hashkey(
@@ -580,6 +655,205 @@ class KisBrokerAdapter(BrokerAdapter):
                 response_payload=response.payload,
             )
         return hashkey
+
+def _reconcile_order_params(
+    settings: Settings,
+    broker_order_id: str,
+    observed_at: datetime,
+) -> dict[str, object]:
+    inquiry_date = observed_at.astimezone(KIS_TIMEZONE).strftime("%Y%m%d")
+    return {
+        "CANO": settings.kis_account_number or "",
+        "ACNT_PRDT_CD": settings.kis_account_product_code,
+        "INQR_STRT_DT": inquiry_date,
+        "INQR_END_DT": inquiry_date,
+        "SLL_BUY_DVSN_CD": "00",
+        "INQR_DVSN": "00",
+        "PDNO": "",
+        "CCLD_DVSN": "00",
+        "ORD_GNO_BRNO": "",
+        "ODNO": broker_order_id,
+        "INQR_DVSN_3": "00",
+        "INQR_DVSN_1": "",
+        "CTX_AREA_FK100": "",
+        "CTX_AREA_NK100": "",
+    }
+
+
+def _normalize_reconcile_order(
+    payload: dict[str, object],
+    broker_order_id: str,
+    *,
+    observed_at: datetime,
+) -> dict[str, object] | None:
+    rows = _payload_rows(payload.get("output1"))
+    for row in rows:
+        row_order_id = _optional_string(row.get("odno")) or _optional_string(
+            row.get("ord_no")
+        )
+        if row_order_id != broker_order_id:
+            continue
+        return _extract_reconcile_order_info(
+            row,
+            observed_at=observed_at,
+            raw_status=(
+                _optional_string(row.get("ord_ccld_status_name"))
+                or _optional_string(row.get("ord_st_dvsn_cd_name"))
+                or _optional_string(row.get("ord_sts_name"))
+            ),
+        )
+    return None
+
+
+def _extract_reconcile_order_info(
+    row: dict[str, object],
+    *,
+    observed_at: datetime,
+    raw_status: str | None,
+) -> dict[str, object] | None:
+    requested_quantity = _parse_int(row.get("ord_qty"))
+    if requested_quantity is None or requested_quantity <= 0:
+        return None
+    filled_quantity = _parse_int(row.get("tot_ccld_qty")) or 0
+    remaining_quantity = _remaining_order_quantity(row, requested_quantity)
+    status = _normalize_reconcile_status(
+        raw_status=raw_status,
+        requested_quantity=requested_quantity,
+        remaining_quantity=remaining_quantity,
+        filled_quantity=filled_quantity,
+    )
+    average_fill_price = (
+        _parse_decimal(row.get("avg_upr"))
+        or _parse_decimal(row.get("trd_prc"))
+        or _parse_decimal(row.get("avg_pric"))
+        or _parse_decimal(row.get("ord_unpr"))
+    )
+    filled_at = _reconcile_filled_timestamp(row, observed_at=observed_at)
+    fills: list[dict[str, object]] = []
+    if filled_quantity > 0:
+        fills.append(
+            {
+                "broker_fill_id": _optional_string(row.get("ord_gno_brno")),
+                "quantity": filled_quantity,
+                "price": average_fill_price or Decimal("0"),
+                "filled_at": filled_at.isoformat(),
+                "symbol": _optional_string(row.get("pdno")) or "UNKNOWN",
+                "side": _parse_order_side(row),
+            }
+        )
+    return {
+        "status": status,
+        "broker_status": raw_status or status,
+        "requested_quantity": requested_quantity,
+        "remaining_quantity": remaining_quantity,
+        "filled_quantity": filled_quantity,
+        "average_fill_price": average_fill_price,
+        "filled_at": filled_at,
+        "fills": fills,
+        "raw": _safe_reconcile_payload(row),
+        "observed_at": observed_at,
+        "message": None,
+    }
+
+
+def _normalize_reconcile_status(
+    *,
+    raw_status: str | None,
+    requested_quantity: int,
+    remaining_quantity: int | None,
+    filled_quantity: int,
+) -> str:
+    normalized = (raw_status or "").strip().lower().replace("-", "_").replace(" ", "_")
+    status_lookup: dict[str, str] = {
+        "미체결": "open",
+        "부분체결": "partially_filled",
+        "체결완료": "filled",
+        "체결": "filled",
+        "취소": "canceled",
+        "거부": "rejected",
+        "실패": "failed",
+        "만료": "expired",
+        "open": "open",
+        "partially_filled": "partially_filled",
+        "filled": "filled",
+        "canceled": "canceled",
+        "rejected": "rejected",
+        "failed": "failed",
+        "expired": "expired",
+        "submission_pending": "submission_pending",
+        "retry_pending": "retry_pending",
+    }
+    if normalized in status_lookup:
+        return status_lookup[normalized]
+    if remaining_quantity is not None and remaining_quantity <= 0:
+        return "filled"
+    if filled_quantity > 0:
+        return "partially_filled"
+    if requested_quantity > 0:
+        return "open"
+    return "unknown"
+
+
+def _reconcile_filled_timestamp(
+    row: dict[str, object],
+    *,
+    observed_at: datetime,
+) -> datetime:
+    for time_value, date_value in (
+        (row.get("ord_tmd"), row.get("ord_dt")),
+        (row.get("ord_time"), row.get("ord_dt")),
+        (row.get("ord_dtm"), None),
+        (row.get("trad_dt"), row.get("ord_dt")),
+    ):
+        if not isinstance(time_value, str):
+            continue
+        timestamp = _parse_reconcile_datetime(
+            time_value=time_value,
+            date_value=_optional_string(date_value),
+            observed_at=observed_at,
+        )
+        if timestamp is not None:
+            return timestamp
+    return observed_at
+
+
+def _parse_reconcile_datetime(
+    *,
+    time_value: str,
+    date_value: str | None,
+    observed_at: datetime,
+) -> datetime | None:
+    normalized_time = time_value.replace(":", "").replace("-", "").replace(" ", "")
+    if date_value is not None:
+        candidate = f"{date_value}{normalized_time}".replace(" ", "")
+        for fmt in ("%Y%m%d%H%M%S", "%Y%m%d%H%M%S%f"):
+            try:
+                return datetime.strptime(candidate, fmt).replace(tzinfo=UTC)
+            except ValueError:
+                pass
+    for fmt in ("%H%M%S", "%H%M%S%f"):
+        try:
+            parsed = datetime.strptime(normalized_time, fmt)
+            return observed_at.replace(
+                hour=parsed.hour,
+                minute=parsed.minute,
+                second=parsed.second,
+                microsecond=parsed.microsecond,
+            )
+        except ValueError:
+            pass
+    return None
+
+
+def _safe_reconcile_payload(payload: object) -> dict[str, object]:
+    if not isinstance(payload, dict):
+        return {}
+    output = dict(payload)
+    output.pop("CANO", None)
+    output.pop("ACNT_PRDT_CD", None)
+    output.pop("appkey", None)
+    output.pop("appsecret", None)
+    return output
 
 
 def _resolve_api_base_url(settings: Settings) -> str | None:
