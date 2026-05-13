@@ -16,7 +16,9 @@ from app.models.runtime import (
     ExecutionPlan,
     ExecutionPlanItem,
     ExecutionPosition,
+    new_id,
 )
+from app.services.exec_agent import apply_short_term_exec_agent_decisions
 from app.services.plan_item_identity import (
     serialize_plan_item_source_identity,
     serialize_symbol_source_identities,
@@ -49,44 +51,14 @@ def create_execution_plan(
     *,
     settings: Settings,
     db: Session,
-    adapter: BrokerAdapter,
     command: ExecutionPlanRequest,
+    adapter: BrokerAdapter | None = None,
 ) -> CreateExecutionPlanResult:
-    plan = ExecutionPlan(
-        external_plan_id=command.plan_id,
-        source=command.source,
-        market_date=command.market_date,
-        strategy_run_id=command.strategy_run_id,
-        mode=settings.runtime_mode,
-        status="accepted",
-        requested_at=command.requested_at,
-        raw_payload=command.model_dump(mode="json"),
-        items=[
-            ExecutionPlanItem(
-                plan_item_index=index,
-                symbol=item.symbol,
-                side=item.side,
-                intent=item.intent,
-                status=_initial_plan_item_status(item),
-                quantity_policy=item.quantity_policy,
-                limit_price=item.limit_price,
-                trigger_price=item.trigger_price,
-                time_in_force=item.time_in_force,
-                risk_context=item.risk_context,
-                decision_agent_name=item.decision_agent_name,
-                decision_snapshot_id=item.decision_snapshot_id,
-                decision_run_id=item.decision_run_id,
-                source_plan_item_id=item.source_plan_item_id,
-                source_market_date=item.source_market_date,
-            )
-            for index, item in enumerate(command.items)
-        ],
-    )
+    plan = _build_execution_plan(settings=settings, command=command)
     from app.services.execution_jobs import materialize_execution_jobs
     from app.services.monitoring import materialize_monitoring_plan_items
-    from app.services.short_term_exec_agent import apply_short_term_exec_agent_decisions
 
-    apply_short_term_exec_agent_decisions(
+    exec_agent_result = apply_short_term_exec_agent_decisions(
         settings=settings,
         db=db,
         adapter=adapter,
@@ -128,10 +100,93 @@ def create_execution_plan(
             "rejected_item_count": 0,
             "validation_failures": [],
             "persisted_execution_item_ids": [item.id for item in plan.items],
+            "exec_agent": exec_agent_result.payload(),
             "runtime": {
                 "mode": settings.runtime_mode,
             },
         },
+    )
+
+
+def preview_execution_plan(
+    *,
+    settings: Settings,
+    db: Session,
+    command: ExecutionPlanRequest,
+    adapter: BrokerAdapter | None = None,
+) -> CreateExecutionPlanResult:
+    plan = _build_execution_plan(settings=settings, command=command)
+    from app.services.execution_jobs import materialize_execution_jobs, serialize_execution_job
+    from app.services.monitoring import materialize_monitoring_plan_items
+
+    exec_agent_result = apply_short_term_exec_agent_decisions(
+        settings=settings,
+        db=db,
+        adapter=adapter,
+        plan=plan,
+    )
+    materialize_execution_jobs(plan)
+    materialize_monitoring_plan_items(plan)
+    return CreateExecutionPlanResult(
+        status_code=200,
+        payload={
+            "plan_id": plan.external_plan_id,
+            "execution_plan_id": plan.id,
+            "dry_run": True,
+            "accepted_item_count": len(plan.items),
+            "rejected_item_count": 0,
+            "validation_failures": [],
+            "persisted_execution_item_ids": [],
+            "items": [_serialize_execution_plan_item(item) for item in plan.items],
+            "execution_jobs": [
+                serialize_execution_job(job)
+                for item in plan.items
+                for job in item.jobs
+            ],
+            "exec_agent": exec_agent_result.payload(),
+            "runtime": {
+                "mode": settings.runtime_mode,
+            },
+        },
+    )
+
+
+def _build_execution_plan(
+    *,
+    settings: Settings,
+    command: ExecutionPlanRequest,
+) -> ExecutionPlan:
+    return ExecutionPlan(
+        id=new_id(),
+        external_plan_id=command.plan_id,
+        source=command.source,
+        market_date=command.market_date,
+        strategy_run_id=command.strategy_run_id,
+        mode=settings.runtime_mode,
+        status="accepted",
+        requested_at=command.requested_at,
+        raw_payload=command.model_dump(mode="json"),
+        items=[
+            ExecutionPlanItem(
+                id=new_id(),
+                plan_item_index=index,
+                symbol=item.symbol,
+                side=item.side,
+                intent=item.intent,
+                status=_initial_plan_item_status(item),
+                quantity_policy=item.quantity_policy,
+                limit_price=item.limit_price,
+                trigger_price=item.trigger_price,
+                time_in_force=item.time_in_force,
+                risk_context=item.risk_context,
+                decision_agent_name=item.decision_agent_name,
+                decision_snapshot_id=item.decision_snapshot_id,
+                decision_run_id=item.decision_run_id,
+                source_plan_item_id=item.source_plan_item_id,
+                source_market_date=item.source_market_date,
+            )
+            for index, item in enumerate(command.items)
+        ],
     )
 
 
@@ -681,6 +736,8 @@ def _initial_plan_item_status(item: ExecutionPlanItemRequest) -> str:
     if item.intent == "next_open_buy":
         if item.trigger_price is not None or _item_has_buy_chase_or_trigger_fields(item):
             return "pending_configuration"
+        if _decision_agent_name(item) == SHORT_TERM_DECIDER_NAME:
+            return "short_term_watcher_pending"
         return "pending"
     if item.intent in UNSUPPORTED_BUY_INTENTS:
         return "unsupported_semantics"

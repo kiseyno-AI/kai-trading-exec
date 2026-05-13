@@ -98,9 +98,13 @@ class TargetStopContext:
 
     @property
     def complete(self) -> bool:
-        return (self.target_price is not None or bool(self.target_items)) and (
-            self.stop_price is not None or bool(self.stop_items)
+        target_ready = self.target_price is not None or any(
+            item.trigger_price is not None for item in self.target_items
         )
+        stop_ready = self.stop_price is not None or any(
+            item.trigger_price is not None for item in self.stop_items
+        )
+        return target_ready and stop_ready
 
 
 @dataclass(frozen=True)
@@ -510,9 +514,10 @@ def _broker_position_quantity(
     account_snapshot: BrokerAccountSnapshot,
     symbol: str,
 ) -> int:
+    positions = account_snapshot.positions or account_snapshot.holdings
     return sum(
         position.quantity
-        for position in account_snapshot.positions
+        for position in positions
         if position.symbol == symbol and position.quantity > 0
     )
 

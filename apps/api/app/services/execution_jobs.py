@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from hashlib import sha256
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
@@ -14,7 +13,7 @@ from app.broker.base import (
     NormalizedBrokerOrderStatus,
 )
 from app.core.config import Settings
-from app.models.runtime import BrokerOrder, ExecutionJob, ExecutionPlan, ExecutionPlanItem
+from app.models.runtime import BrokerOrder, ExecutionJob, ExecutionPlan, ExecutionPlanItem, new_id
 from app.services.broker_orders import place_broker_order
 from app.services.runtime_controls import (
     automated_order_submission_allowed,
@@ -25,19 +24,9 @@ from app.services.runtime_controls import (
 
 KRX_TIMEZONE = ZoneInfo("Asia/Seoul")
 NEXT_OPEN_BUY_JOB_TYPE = "next_open_buy"
-SHORT_TERM_DECIDER_NAME = "short-term-decider"
 DISPATCHABLE_JOB_STATUSES = ("queued", "scheduled", "retrying")
 MIN_STALE_RUNNING_JOB_SECONDS = 30
 STALE_RUNNING_JOB_TIMEOUT_MULTIPLIER = 3
-OPEN_BUY_ORDER_STATUSES = frozenset(
-    {
-        NormalizedBrokerOrderStatus.SUBMISSION_PENDING.value,
-        NormalizedBrokerOrderStatus.SUBMITTED.value,
-        NormalizedBrokerOrderStatus.OPEN.value,
-        NormalizedBrokerOrderStatus.PARTIALLY_FILLED.value,
-        NormalizedBrokerOrderStatus.RETRY_PENDING.value,
-    }
-)
 COMPLETED_JOB_ORDER_STATUSES = frozenset(
     {
         NormalizedBrokerOrderStatus.SUBMITTED.value,
@@ -79,6 +68,7 @@ def materialize_execution_jobs(plan: ExecutionPlan) -> None:
         item.status = "next_open_buy_scheduled"
         item.jobs.append(
             ExecutionJob(
+                id=new_id(),
                 job_type=NEXT_OPEN_BUY_JOB_TYPE,
                 status="scheduled",
                 scheduled_for=_next_market_open_utc(plan.market_date),
@@ -281,20 +271,6 @@ def _dispatch_job(
             plan_item_status="next_open_buy_failed",
         )
 
-    if _has_conflicting_open_buy_order(
-        settings=settings,
-        db=db,
-        plan_item=job.plan_item,
-        idempotency_key=command.idempotency_key,
-    ):
-        return _finish_job(
-            db=db,
-            job_id=job_id,
-            status="failed",
-            last_error="existing open buy order for symbol",
-            plan_item_status="next_open_buy_failed",
-        )
-
     try:
         result = place_broker_order(
             settings=settings,
@@ -468,7 +444,7 @@ def _build_place_order_request(job: ExecutionJob) -> PlaceOrderRequest:
         raise ValueError("next_open_buy job requires quantity_policy.kind='shares' with a positive integer quantity")
     exchange = _plan_item_exchange(plan_item)
     return PlaceOrderRequest(
-        idempotency_key=_job_idempotency_key(job),
+        idempotency_key=_place_order_idempotency_key(job),
         execution_plan_item_id=plan_item.id,
         symbol=plan_item.symbol,
         side=plan_item.side,
@@ -478,6 +454,15 @@ def _build_place_order_request(job: ExecutionJob) -> PlaceOrderRequest:
         time_in_force=plan_item.time_in_force or "day",
         exchange=exchange,
     )
+
+
+def _place_order_idempotency_key(job: ExecutionJob) -> str:
+    quantity_policy = job.plan_item.quantity_policy
+    if isinstance(quantity_policy, dict):
+        idempotency_key = quantity_policy.get("idempotency_key")
+        if isinstance(idempotency_key, str) and idempotency_key.strip():
+            return idempotency_key.strip()
+    return f"execution-job:{job.id}"
 
 
 def _next_open_buy_quantity(plan_item: ExecutionPlanItem) -> int | None:
@@ -514,53 +499,6 @@ def _plan_item_exchange(plan_item: ExecutionPlanItem) -> str:
         return "KRX"
     normalized = value.strip().upper()
     return normalized or "KRX"
-
-
-def _job_idempotency_key(job: ExecutionJob) -> str:
-    plan_item = job.plan_item
-    if (
-        (plan_item.decision_agent_name or "").strip().lower() == SHORT_TERM_DECIDER_NAME
-        and plan_item.source_plan_item_id
-    ):
-        source_market_date = (
-            plan_item.source_market_date.isoformat()
-            if plan_item.source_market_date is not None
-            else ""
-        )
-        raw_key = "|".join(
-            [
-                SHORT_TERM_DECIDER_NAME,
-                plan_item.symbol,
-                plan_item.intent,
-                plan_item.decision_run_id or "",
-                plan_item.source_plan_item_id,
-                source_market_date,
-            ]
-        )
-        digest = sha256(raw_key.encode("utf-8")).hexdigest()[:24]
-        return f"source-candidate:{digest}"
-    return f"execution-job:{job.id}"
-
-
-def _has_conflicting_open_buy_order(
-    *,
-    settings: Settings,
-    db: Session,
-    plan_item: ExecutionPlanItem,
-    idempotency_key: str,
-) -> bool:
-    return (
-        db.scalar(
-            select(BrokerOrder.id).where(
-                BrokerOrder.mode == settings.runtime_mode,
-                BrokerOrder.symbol == plan_item.symbol,
-                BrokerOrder.side == "buy",
-                BrokerOrder.status.in_(tuple(OPEN_BUY_ORDER_STATUSES)),
-                BrokerOrder.idempotency_key != idempotency_key,
-            )
-        )
-        is not None
-    )
 
 
 def _is_due(job: ExecutionJob, triggered_at: datetime) -> bool:
