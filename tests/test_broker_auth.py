@@ -469,7 +469,7 @@ def test_kis_adapter_fetches_account_snapshot() -> None:
 
     assert [call["url"] for call in http_client.get_calls] == [
         f"{KIS_PAPER_API_BASE_URL}/uapi/domestic-stock/v1/trading/inquire-balance",
-        f"{KIS_PAPER_API_BASE_URL}/uapi/domestic-stock/v1/trading/inquire-ccnl",
+        f"{KIS_PAPER_API_BASE_URL}/uapi/domestic-stock/v1/trading/inquire-daily-ccld",
     ]
     assert http_client.get_calls[0]["headers"]["tr_id"] == "VTTC8434R"
     assert http_client.get_calls[1]["headers"]["tr_id"] == "VTTC8001R"

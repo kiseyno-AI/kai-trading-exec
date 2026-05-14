@@ -38,7 +38,7 @@ KIS_HASHKEY_PATH = "/uapi/hashkey"
 KIS_ORDER_CASH_PATH = "/uapi/domestic-stock/v1/trading/order-cash"
 KIS_CURRENT_PRICE_PATH = "/uapi/domestic-stock/v1/quotations/inquire-price"
 KIS_BALANCE_PATH = "/uapi/domestic-stock/v1/trading/inquire-balance"
-KIS_OPEN_ORDERS_PATH = "/uapi/domestic-stock/v1/trading/inquire-ccnl"
+KIS_OPEN_ORDERS_PATH = "/uapi/domestic-stock/v1/trading/inquire-daily-ccld"
 KIS_DAILY_CCLD_PATH = "/uapi/domestic-stock/v1/trading/inquire-daily-ccld"
 KIS_CURRENT_PRICE_TR_ID = "FHKST01010100"
 KIS_TIMEZONE = timezone(timedelta(hours=9))
