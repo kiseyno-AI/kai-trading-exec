@@ -26,8 +26,13 @@ class Settings(BaseModel):
     monitoring_loop_interval_seconds: float = Field(default=1.0, gt=0, le=3600)
     monitoring_max_symbols_per_cycle: int = Field(default=128, ge=1, le=10000)
     monitoring_max_broker_actions_per_cycle: int = Field(default=32, ge=1, le=10000)
+    exec_agent_enabled: bool = False
+    exec_agent_id: str = "exec-agent"
+    exec_agent_model: str = "openai-codex/gpt-5.5"
     exec_agent_max_symbol_budget: Decimal = Field(default=Decimal("1000000"), gt=0)
     exec_agent_max_total_budget: Decimal = Field(default=Decimal("3000000"), gt=0)
+    exec_agent_max_account_snapshot_age_seconds: int = Field(default=300, ge=1, le=86400)
+    exec_agent_max_holding_trading_sessions: int = Field(default=3, ge=1, le=20)
     kis_app_key: str | None = None
     kis_app_secret: str | None = None
     kis_account_number: str | None = None
@@ -64,8 +69,13 @@ _ENV_FIELDS = {
     "MONITORING_LOOP_INTERVAL_SECONDS": "monitoring_loop_interval_seconds",
     "MONITORING_MAX_SYMBOLS_PER_CYCLE": "monitoring_max_symbols_per_cycle",
     "MONITORING_MAX_BROKER_ACTIONS_PER_CYCLE": "monitoring_max_broker_actions_per_cycle",
+    "EXEC_AGENT_ENABLED": "exec_agent_enabled",
+    "EXEC_AGENT_ID": "exec_agent_id",
+    "EXEC_AGENT_MODEL": "exec_agent_model",
     "EXEC_AGENT_MAX_SYMBOL_BUDGET": "exec_agent_max_symbol_budget",
     "EXEC_AGENT_MAX_TOTAL_BUDGET": "exec_agent_max_total_budget",
+    "EXEC_AGENT_MAX_ACCOUNT_SNAPSHOT_AGE_SECONDS": "exec_agent_max_account_snapshot_age_seconds",
+    "EXEC_AGENT_MAX_HOLDING_TRADING_SESSIONS": "exec_agent_max_holding_trading_sessions",
     "KIS_APP_KEY": "kis_app_key",
     "KIS_APP_SECRET": "kis_app_secret",
     "KIS_ACCOUNT_NUMBER": "kis_account_number",

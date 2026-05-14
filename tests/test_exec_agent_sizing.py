@@ -24,7 +24,7 @@ from app.core.config import Settings
 from app.db.base import Base
 from app.db.session import create_db_engine, create_session_factory
 from app.main import create_app
-from app.models.runtime import BrokerOrder, ExecutionJob, ExecutionPlan, ExecutionPlanItem
+from app.models.runtime import BrokerOrder, ExecutionJob, ExecutionPlan, ExecutionPlanItem, ExecutionPosition
 from app.services import exec_agent as strict_exec_agent
 from app.services import short_term_exec_agent as legacy_exec_agent
 
@@ -481,7 +481,7 @@ def test_short_term_exec_agent_approves_market_open_buy_and_materializes_monitor
     payload = response.json()
     assert payload["exec_agent"]["approved_count"] == 1
     assert payload["exec_agent"]["rejected_count"] == 0
-    assert len(payload["persisted_execution_item_ids"]) == 3
+    assert len(payload["persisted_execution_item_ids"]) == 4
 
     plans = client.get("/execution-plans").json()
     items_by_intent = {item["intent"]: item for item in plans[0]["items"]}
@@ -491,6 +491,8 @@ def test_short_term_exec_agent_approves_market_open_buy_and_materializes_monitor
     assert items_by_intent["target_sell"]["trigger_price"] == "56000.0000"
     assert items_by_intent["stop_sell"]["status"] == "stop_sell_monitoring"
     assert items_by_intent["stop_sell"]["trigger_price"] == "47000.0000"
+    assert items_by_intent["max_holding_close_sell"]["status"] == "max_holding_close_sell_monitoring"
+    assert items_by_intent["max_holding_close_sell"]["risk_context"]["close_exit_date"] == "2026-05-18"
 
     dispatch = client.post("/execution-jobs/dispatch")
 
@@ -633,6 +635,7 @@ def test_short_term_exec_agent_preview_does_not_persist_or_submit() -> None:
         "next_open_buy",
         "target_sell",
         "stop_sell",
+        "max_holding_close_sell",
     }
     assert adapter.order_calls == []
 
@@ -658,5 +661,236 @@ def test_runtime_safety_controls_still_block_live_short_term_order_submission() 
     assert dispatch.json()["block_reason"] == "paused"
     assert adapter.order_calls == []
     assert client.get("/orders").json() == []
+
+    engine.dispose()
+
+
+class FakeExecAgentClient:
+    def __init__(
+        self,
+        *,
+        quantity: int = 7,
+        final_budget: Decimal = Decimal("350000"),
+        reference_price: Decimal = Decimal("50000"),
+    ) -> None:
+        self.requests = []
+        self.quantity = quantity
+        self.final_budget = final_budget
+        self.reference_price = reference_price
+
+    def size_candidate(self, request):
+        self.requests.append(request)
+        return strict_exec_agent.ExecAgentSizingResponse(
+            action="approve",
+            confidence=Decimal("0.91"),
+            quantity=self.quantity,
+            final_budget=self.final_budget,
+            reference_price=self.reference_price,
+            target_price=Decimal("57000"),
+            stop_price=Decimal("47000"),
+            reasons=["high conviction with sufficient cash"],
+            risk_flags=["normal_spread"],
+            explanation={"score": "9.1"},
+        )
+
+
+def test_openclaw_exec_agent_client_handoff_builds_context_and_sizes_without_prefilled_contract() -> None:
+    adapter = StubBrokerAdapter(available_cash=Decimal("800000"))
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="live",  # type: ignore[arg-type]
+        kis_app_key="key",
+        kis_app_secret="secret",
+        kis_account_number="12345678",
+        exec_agent_enabled=True,
+        exec_agent_max_account_snapshot_age_seconds=86400,
+        exec_agent_max_symbol_budget=Decimal("500000"),
+        exec_agent_max_total_budget=Decimal("1000000"),
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    client = FakeExecAgentClient()
+    plan = ExecutionPlan(
+        id="plan-pk-openclaw",
+        external_plan_id="plan-openclaw-handoff",
+        source="kai-trading-core",
+        market_date=datetime(2026, 5, 13, tzinfo=UTC).date(),
+        mode="live",
+        status="accepted",
+        items=[
+            ExecutionPlanItem(
+                id="item-openclaw",
+                plan_item_index=0,
+                symbol="005930",
+                side="buy",
+                intent="next_open_buy",
+                status="pending",
+                decision_agent_name="short-term-decider",
+                source_plan_item_id="candidate-openclaw",
+                risk_context={
+                    "decider_input": {"score": 6.7},
+                    "decider_output": {"action": "watch"},
+                    "market_data": {"spread_bps": "12"},
+                },
+            )
+        ],
+    )
+
+    with session_factory() as session:
+        result = strict_exec_agent.apply_short_term_exec_agent_decisions(
+            settings=settings,
+            db=session,
+            adapter=adapter,
+            plan=plan,
+            exec_agent_client=client,
+        )
+
+    assert result.approved_count == 1
+    assert len(client.requests) == 1
+    request = client.requests[0]
+    assert request.agent_id == "exec-agent"
+    assert request.model == "openai-codex/gpt-5.5"
+    assert request.decider_input == {"score": 6.7}
+    assert request.account["available_cash"] == "800000.0000"
+    audit = plan.items[0].risk_context["exec_agent_decision"]
+    assert audit["agent_contract"]["context"]["risk_flags"] == ["normal_spread"]
+    assert audit["final_budget"] == "350000.0000"
+    assert plan.items[0].quantity_policy["quantity"] == 7
+
+    engine.dispose()
+
+
+def test_openclaw_exec_agent_quantity_caps_budget_implied_quantity() -> None:
+    adapter = StubBrokerAdapter(available_cash=Decimal("2000000"))
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="live",  # type: ignore[arg-type]
+        kis_app_key="key",
+        kis_app_secret="secret",
+        kis_account_number="12345678",
+        exec_agent_enabled=True,
+        exec_agent_max_account_snapshot_age_seconds=86400,
+        exec_agent_max_symbol_budget=Decimal("1000000"),
+        exec_agent_max_total_budget=Decimal("2000000"),
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    client = FakeExecAgentClient(
+        quantity=1,
+        final_budget=Decimal("1000000"),
+        reference_price=Decimal("50000"),
+    )
+    plan = ExecutionPlan(
+        id="plan-pk-openclaw-cap",
+        external_plan_id="plan-openclaw-cap",
+        source="kai-trading-core",
+        market_date=datetime(2026, 5, 13, tzinfo=UTC).date(),
+        mode="live",
+        status="accepted",
+        items=[
+            ExecutionPlanItem(
+                id="item-openclaw-cap",
+                plan_item_index=0,
+                symbol="005930",
+                side="buy",
+                intent="next_open_buy",
+                status="pending",
+                decision_agent_name="short-term-decider",
+                source_plan_item_id="candidate-openclaw-cap",
+                risk_context={"decider_output": {"score": 9.1}},
+            )
+        ],
+    )
+
+    with session_factory() as session:
+        result = strict_exec_agent.apply_short_term_exec_agent_decisions(
+            settings=settings,
+            db=session,
+            adapter=adapter,
+            plan=plan,
+            exec_agent_client=client,
+        )
+
+    assert result.approved_count == 1
+    audit = plan.items[0].risk_context["exec_agent_decision"]
+    assert audit["quantity"] == 1
+    assert audit["agent_approved_quantity_upper_bound"] == 1
+    assert audit["agent_contract"]["max_quantity"] == 1
+    assert audit["approved_notional"] == "50000.0000"
+    assert audit["final_budget"] == "1000000.0000"
+    assert plan.items[0].quantity_policy["quantity"] == 1
+    monitoring_quantities = [
+        item.quantity_policy["quantity"]
+        for item in plan.items
+        if item.intent in {"target_sell", "stop_sell"}
+    ]
+    assert monitoring_quantities == [1, 1]
+
+    engine.dispose()
+
+
+def test_openclaw_exec_agent_unavailable_fails_closed_when_contract_missing() -> None:
+    adapter = StubBrokerAdapter(available_cash=Decimal("800000"))
+    app, engine = build_test_app(adapter)
+    settings = app.state.settings.model_copy(update={"exec_agent_enabled": True, "exec_agent_max_account_snapshot_age_seconds": 86400})
+    app.state.settings = settings
+    client = TestClient(app)
+    payload = short_term_plan_payload(exec_agent_decision={"remove": "contract"})
+    payload["items"][0]["risk_context"] = {"decider_output": {"score": 6.5}}
+
+    response = client.post("/execution-plans", json=payload)
+
+    assert response.status_code == 201
+    item = client.get("/execution-plans").json()[0]["items"][0]
+    assert item["status"] == "exec_agent_rejected"
+    assert item["risk_context"]["exec_agent_decision"]["reason_code"] == "exec_agent_unavailable"
+
+    engine.dispose()
+
+
+def test_max_holding_close_exit_is_monitored_across_days_and_submits_sell() -> None:
+    adapter = StubBrokerAdapter(available_cash=Decimal("500000"))
+    app, engine = build_test_app(adapter)
+    client = TestClient(app)
+
+    client.post("/controls/resume", json={"actor": "ops", "source": "test"})
+    response = client.post("/execution-plans", json=short_term_plan_payload())
+    assert response.status_code == 201
+
+    adapter.snapshot = BrokerAccountSnapshot(
+        available_cash=Decimal("500000"),
+        observed_at=datetime(2026, 5, 18, 14, 45, tzinfo=UTC),
+        source="stub:account_snapshot",
+        holdings=[BrokerAccountHolding(symbol="005930", quantity=5)],
+        open_orders=[],
+    )
+    with app.state.db_session_factory() as session:
+        session.add(
+            ExecutionPosition(
+                mode="live",
+                symbol="005930",
+                quantity=5,
+                average_price=Decimal("50000"),
+                updated_from="test",
+            )
+        )
+        session.commit()
+
+    monitoring = client.post(
+        "/monitoring/evaluate",
+        json={
+            "observed_at": "2026-05-18T14:50:00+09:00",
+            "prices": [{"symbol": "005930", "price": "50000"}],
+        },
+    )
+
+    assert monitoring.status_code == 200
+    payload = monitoring.json()
+    max_exit_items = [item for item in payload["items"] if item["intent"] == "max_holding_close_sell"]
+    assert max_exit_items[0]["outcome"] == "submitted"
+    assert adapter.order_calls[-1].side == "sell"
+    assert adapter.order_calls[-1].quantity == 5
 
     engine.dispose()

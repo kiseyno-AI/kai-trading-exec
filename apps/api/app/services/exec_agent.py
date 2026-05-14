@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 from sqlalchemy import select
@@ -28,6 +28,8 @@ EXEC_AGENT_CONTRACT_KEYS = (
     "short_term_exec_agent_decision",
 )
 EXEC_AGENT_DECISION_VERSION = "short-term-exec-agent-v1"
+OPENCLAW_EXEC_AGENT_ID = "exec-agent"
+OPENCLAW_EXEC_AGENT_MODEL = "openai-codex/gpt-5.5"
 OPEN_BUY_ORDER_STATUSES = frozenset(
     {
         "submission_pending",
@@ -60,6 +62,7 @@ class ShortTermExecAgentContract(BaseModel):
     max_budget: Decimal | None = Field(default=None, gt=0)
     max_symbol_budget: Decimal | None = Field(default=None, gt=0)
     max_total_budget: Decimal | None = Field(default=None, gt=0)
+    max_quantity: int | None = Field(default=None, gt=0)
     reference_price: Decimal | None = Field(default=None, gt=0)
     target_price: Decimal | None = Field(default=None, gt=0)
     stop_price: Decimal | None = Field(default=None, gt=0)
@@ -109,6 +112,83 @@ class ShortTermExecAgentContract(BaseModel):
         return self
 
 
+class ExecAgentSizingRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    agent_id: str = OPENCLAW_EXEC_AGENT_ID
+    model: str = OPENCLAW_EXEC_AGENT_MODEL
+    version: str = EXEC_AGENT_DECISION_VERSION
+    plan_id: str
+    execution_plan_item_id: str
+    symbol: str
+    side: str
+    intent: str
+    source_identity: dict[str, object]
+    candidate_context: dict[str, Any]
+    decider_input: dict[str, Any] | None = None
+    decider_output: dict[str, Any] | None = None
+    account: dict[str, Any]
+    portfolio: dict[str, Any]
+    market_data: dict[str, Any] | None = None
+    risk_caps: dict[str, Any]
+
+
+class ExecAgentSizingResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    action: Literal["approve", "reject"]
+    quantity: int | None = Field(default=None, gt=0)
+    final_budget: Decimal | None = Field(default=None, gt=0)
+    reference_price: Decimal | None = Field(default=None, gt=0)
+    target_price: Decimal | None = Field(default=None, gt=0)
+    stop_price: Decimal | None = Field(default=None, gt=0)
+    confidence: Decimal = Field(ge=Decimal("0"), le=Decimal("1"))
+    reasons: list[str] = Field(default_factory=list)
+    risk_flags: list[str] = Field(default_factory=list)
+    allow_existing_holding: bool = False
+    explanation: dict[str, Any] | None = None
+
+    @field_validator("reasons", "risk_flags")
+    @classmethod
+    def normalize_text_list(cls, values: list[str]) -> list[str]:
+        normalized: list[str] = []
+        for value in values:
+            if not isinstance(value, str):
+                raise ValueError("items must be strings")
+            stripped = value.strip()
+            if not stripped:
+                raise ValueError("items must not be empty")
+            normalized.append(stripped)
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_decision(self) -> ExecAgentSizingResponse:
+        if self.action == "approve":
+            missing = [
+                field
+                for field in ("quantity", "final_budget", "reference_price", "target_price", "stop_price")
+                if getattr(self, field) is None
+            ]
+            if missing:
+                raise ValueError("approve action requires " + ", ".join(missing))
+        return self
+
+
+class ExecAgentClient(Protocol):
+    def size_candidate(self, request: ExecAgentSizingRequest) -> ExecAgentSizingResponse:
+        """Return a schema-validated exec-agent sizing response or raise."""
+
+
+class ExecAgentUnavailable(RuntimeError):
+    pass
+
+
+class UnavailableExecAgentClient:
+    def size_candidate(self, request: ExecAgentSizingRequest) -> ExecAgentSizingResponse:
+        del request
+        raise ExecAgentUnavailable("OpenClaw exec-agent transport is not configured")
+
+
 @dataclass(frozen=True)
 class ExecAgentApplicationResult:
     evaluated_count: int
@@ -151,11 +231,13 @@ def apply_short_term_exec_agent_decisions(
     db: Session,
     adapter: BrokerAdapter | None,
     plan: ExecutionPlan,
+    exec_agent_client: ExecAgentClient | None = None,
 ) -> ExecAgentApplicationResult:
     candidates = [
         item
         for item in plan.items
         if _is_short_term_buy_candidate(item)
+        and (getattr(settings, "exec_agent_enabled", False) or _has_agent_contract(item))
     ]
     if not candidates:
         return ExecAgentApplicationResult(
@@ -186,6 +268,7 @@ def apply_short_term_exec_agent_decisions(
             account_context=account_context,
             reserved_total_budget=reserved_total_budget,
             reserved_cash_budget=reserved_cash_budget,
+            exec_agent_client=exec_agent_client,
         )
         decisions.append(decision)
         if decision["action"] == "approve":
@@ -195,6 +278,7 @@ def apply_short_term_exec_agent_decisions(
             reserved_cash_budget += approved_notional
             _apply_approved_decision(item=item, decision=decision)
             next_plan_item_index = _append_monitoring_items(
+                settings=settings,
                 plan=plan,
                 buy_item=item,
                 decision=decision,
@@ -224,6 +308,15 @@ def _is_short_term_buy_candidate(item: ExecutionPlanItem) -> bool:
         and item.intent in SUPPORTED_SHORT_TERM_BUY_INTENTS
         and item.status in {"pending", "short_term_watcher_pending"}
     )
+
+
+def _has_agent_contract(item: ExecutionPlanItem) -> bool:
+    for payload in (item.risk_context, item.quantity_policy):
+        if not isinstance(payload, dict):
+            continue
+        if any(key in payload for key in EXEC_AGENT_CONTRACT_KEYS):
+            return True
+    return False
 
 
 def _load_account_context(
@@ -344,6 +437,7 @@ def _decide_candidate(
     account_context: _AccountContext,
     reserved_total_budget: Decimal,
     reserved_cash_budget: Decimal,
+    exec_agent_client: ExecAgentClient | None,
 ) -> dict[str, object]:
     source_identity = serialize_plan_item_source_identity(item)
     idempotency_key = _candidate_idempotency_key(plan=plan, item=item)
@@ -358,14 +452,16 @@ def _decide_candidate(
     }
 
     try:
-        agent_contract = _load_agent_contract(item)
+        agent_contract = _resolve_agent_contract(
+            settings=settings,
+            plan=plan,
+            item=item,
+            account_context=account_context,
+            source_identity=source_identity,
+            exec_agent_client=exec_agent_client,
+        )
     except _MissingAgentContract as exc:
-        return {
-            **base,
-            "action": "pending",
-            "reason_code": "agent_output_missing",
-            "reason": str(exc),
-        }
+        return _reject(base, "exec_agent_unavailable", str(exc))
     except _InvalidAgentContract as exc:
         return _reject(base, "invalid_agent_output", str(exc))
 
@@ -404,6 +500,14 @@ def _decide_candidate(
             "account_snapshot_unavailable",
             "account cash, holdings, and open orders were unavailable",
             agent_contract=agent_contract,
+        )
+    if _account_snapshot_is_stale(settings=settings, observed_at=account_context.observed_at):
+        return _reject(
+            base,
+            "stale_account_snapshot",
+            "account snapshot is too old for exec-agent sizing",
+            agent_contract=agent_contract,
+            available_cash=available_cash,
         )
     remaining_cash = available_cash - reserved_cash_budget
     if remaining_cash <= 0:
@@ -475,6 +579,8 @@ def _decide_candidate(
 
     budget = sizing_budget.final_budget
     quantity = int((budget / sizing_price).quantize(Decimal("1"), rounding=ROUND_DOWN))
+    if agent_contract.max_quantity is not None:
+        quantity = min(quantity, agent_contract.max_quantity)
     if quantity <= 0:
         return _reject(
             base,
@@ -499,6 +605,7 @@ def _decide_candidate(
         "confidence": _serialize_decimal(agent_contract.confidence),
         "conviction": sizing_budget.conviction,
         "quantity": quantity,
+        "agent_approved_quantity_upper_bound": agent_contract.max_quantity,
         "order_type": "limit" if item.limit_price is not None else "market",
         "reference_price": _serialize_decimal(sizing_price),
         "sizing_price": _serialize_decimal(sizing_price),
@@ -819,6 +926,149 @@ def _first_decimal(source: object, keys: tuple[str, ...]) -> Decimal | None:
     return None
 
 
+def _resolve_agent_contract(
+    *,
+    settings: Settings,
+    plan: ExecutionPlan,
+    item: ExecutionPlanItem,
+    account_context: _AccountContext,
+    source_identity: dict[str, object],
+    exec_agent_client: ExecAgentClient | None,
+) -> ShortTermExecAgentContract:
+    try:
+        return _load_agent_contract(item)
+    except _MissingAgentContract:
+        pass
+
+    if not getattr(settings, "exec_agent_enabled", False):
+        raise _MissingAgentContract(
+            "OpenClaw exec-agent is disabled and no precomputed exec_agent_decision was supplied"
+        )
+
+    client = exec_agent_client or UnavailableExecAgentClient()
+    request = _build_agent_request(
+        settings=settings,
+        plan=plan,
+        item=item,
+        account_context=account_context,
+        source_identity=source_identity,
+    )
+    try:
+        response = client.size_candidate(request)
+    except Exception as exc:
+        raise _MissingAgentContract(f"OpenClaw exec-agent request failed: {exc}") from exc
+    if not isinstance(response, ExecAgentSizingResponse):
+        try:
+            response = ExecAgentSizingResponse.model_validate(response)
+        except ValidationError as exc:
+            raise _InvalidAgentContract(_validation_error_message(exc)) from exc
+    return _contract_from_agent_response(response)
+
+
+def _build_agent_request(
+    *,
+    settings: Settings,
+    plan: ExecutionPlan,
+    item: ExecutionPlanItem,
+    account_context: _AccountContext,
+    source_identity: dict[str, object],
+) -> ExecAgentSizingRequest:
+    risk_context = item.risk_context if isinstance(item.risk_context, dict) else {}
+    quantity_policy = item.quantity_policy if isinstance(item.quantity_policy, dict) else {}
+    candidate_context = {
+        "risk_context": risk_context,
+        "quantity_policy": quantity_policy,
+        "limit_price": _serialize_decimal(item.limit_price),
+        "trigger_price": _serialize_decimal(item.trigger_price),
+        "time_in_force": item.time_in_force,
+        "market_date": plan.market_date.isoformat() if plan.market_date else None,
+        "strategy_run_id": plan.strategy_run_id,
+    }
+    account_payload = dict(account_context.snapshot_payload or {})
+    return ExecAgentSizingRequest(
+        agent_id=getattr(settings, "exec_agent_id", OPENCLAW_EXEC_AGENT_ID),
+        model=getattr(settings, "exec_agent_model", OPENCLAW_EXEC_AGENT_MODEL),
+        plan_id=plan.external_plan_id,
+        execution_plan_item_id=item.id,
+        symbol=item.symbol,
+        side=item.side,
+        intent=item.intent,
+        source_identity=source_identity,
+        candidate_context=candidate_context,
+        decider_input=_dict_or_none(risk_context.get("decider_input")),
+        decider_output=_dict_or_none(risk_context.get("decider_output")),
+        account=account_payload,
+        portfolio={
+            "holdings_by_symbol": account_context.holdings_by_symbol,
+            "open_orders": [order.__dict__ for order in account_context.open_orders],
+        },
+        market_data=_dict_or_none(risk_context.get("market_data"))
+        or _dict_or_none(risk_context.get("quote"))
+        or _dict_or_none(risk_context.get("orderbook")),
+        risk_caps={
+            "max_symbol_budget": _serialize_decimal(
+                _settings_decimal(settings, "exec_agent_max_symbol_budget", Decimal("1000000"))
+            ),
+            "max_total_budget": _serialize_decimal(
+                _settings_decimal(settings, "exec_agent_max_total_budget", Decimal("3000000"))
+            ),
+            "max_holding_trading_sessions": getattr(settings, "exec_agent_max_holding_trading_sessions", 3),
+        },
+    )
+
+
+def _contract_from_agent_response(response: ExecAgentSizingResponse) -> ShortTermExecAgentContract:
+    if response.action == "reject":
+        reason = response.reasons[0] if response.reasons else "OpenClaw exec-agent rejected candidate"
+        return ShortTermExecAgentContract(
+            action="reject",
+            confidence=response.confidence,
+            reason_code="agent_rejected",
+            reason=reason,
+            context={
+                "openclaw_agent_id": OPENCLAW_EXEC_AGENT_ID,
+                "reasons": response.reasons,
+                "risk_flags": response.risk_flags,
+                "explanation": response.explanation,
+            },
+        )
+    assert response.final_budget is not None
+    assert response.reference_price is not None
+    assert response.target_price is not None
+    assert response.stop_price is not None
+    return ShortTermExecAgentContract(
+        action="approve",
+        confidence=response.confidence,
+        max_budget=response.final_budget,
+        max_quantity=response.quantity,
+        reference_price=response.reference_price,
+        target_price=response.target_price,
+        stop_price=response.stop_price,
+        allow_existing_holding=response.allow_existing_holding,
+        reason="; ".join(response.reasons) if response.reasons else None,
+        context={
+            "openclaw_agent_id": OPENCLAW_EXEC_AGENT_ID,
+            "requested_quantity": response.quantity,
+            "final_budget": _serialize_decimal(response.final_budget),
+            "reasons": response.reasons,
+            "risk_flags": response.risk_flags,
+            "explanation": response.explanation,
+        },
+    )
+
+
+def _dict_or_none(value: object) -> dict[str, Any] | None:
+    return value if isinstance(value, dict) else None
+
+
+def _account_snapshot_is_stale(*, settings: Settings, observed_at: datetime) -> bool:
+    if not getattr(settings, "exec_agent_enabled", False):
+        return False
+    observed = observed_at if observed_at.tzinfo else observed_at.replace(tzinfo=UTC)
+    max_age = timedelta(seconds=getattr(settings, "exec_agent_max_account_snapshot_age_seconds", 300))
+    return datetime.now(UTC) - observed.astimezone(UTC) > max_age
+
+
 def _load_agent_contract(item: ExecutionPlanItem) -> ShortTermExecAgentContract:
     for payload in (item.risk_context, item.quantity_policy):
         if not isinstance(payload, dict):
@@ -909,6 +1159,7 @@ def _apply_rejected_decision(
 
 def _append_monitoring_items(
     *,
+    settings: Settings,
     plan: ExecutionPlan,
     buy_item: ExecutionPlanItem,
     decision: dict[str, object],
@@ -921,35 +1172,88 @@ def _append_monitoring_items(
     ):
         trigger_price = Decimal(str(decision[trigger_key]))
         plan.items.append(
-            ExecutionPlanItem(
-                plan_item_index=next_plan_item_index,
-                symbol=buy_item.symbol,
-                side="sell",
+            _new_monitoring_item(
+                plan=plan,
+                buy_item=buy_item,
+                decision=decision,
                 intent=intent,
-                status="pending",
-                quantity_policy={
-                    "kind": "shares",
-                    "quantity": quantity,
-                    "source": "exec_agent_monitoring",
-                    "parent_idempotency_key": decision["idempotency_key"],
-                },
+                quantity=quantity,
+                next_plan_item_index=next_plan_item_index,
                 trigger_price=trigger_price,
-                time_in_force=buy_item.time_in_force or "day",
-                risk_context={
-                    "generated_by": EXEC_AGENT_DECISION_VERSION,
-                    "parent_source_identity": serialize_plan_item_source_identity(buy_item),
-                    "parent_idempotency_key": decision["idempotency_key"],
-                    "confidence": decision.get("confidence"),
-                },
-                decision_agent_name=buy_item.decision_agent_name,
-                decision_snapshot_id=buy_item.decision_snapshot_id,
-                decision_run_id=buy_item.decision_run_id,
-                source_plan_item_id=_monitoring_source_plan_item_id(buy_item, intent),
-                source_market_date=buy_item.source_market_date or plan.market_date,
+                max_sessions=getattr(settings, "exec_agent_max_holding_trading_sessions", 3),
             )
         )
         next_plan_item_index += 1
-    return next_plan_item_index
+
+    plan.items.append(
+        _new_monitoring_item(
+            plan=plan,
+            buy_item=buy_item,
+            decision=decision,
+            intent="max_holding_close_sell",
+            quantity=quantity,
+            next_plan_item_index=next_plan_item_index,
+            trigger_price=None,
+            max_sessions=getattr(settings, "exec_agent_max_holding_trading_sessions", 3),
+        )
+    )
+    return next_plan_item_index + 1
+
+
+def _new_monitoring_item(
+    *,
+    plan: ExecutionPlan,
+    buy_item: ExecutionPlanItem,
+    decision: dict[str, object],
+    intent: str,
+    quantity: int,
+    next_plan_item_index: int,
+    trigger_price: Decimal | None,
+    max_sessions: int,
+) -> ExecutionPlanItem:
+    buy_market_date = buy_item.source_market_date or plan.market_date
+    close_exit_date = _add_trading_sessions(buy_market_date, max_sessions) if buy_market_date else None
+    return ExecutionPlanItem(
+        plan_item_index=next_plan_item_index,
+        symbol=buy_item.symbol,
+        side="sell",
+        intent=intent,
+        status="pending",
+        quantity_policy={
+            "kind": "shares",
+            "quantity": quantity,
+            "source": "exec_agent_monitoring",
+            "parent_idempotency_key": decision["idempotency_key"],
+        },
+        trigger_price=trigger_price,
+        time_in_force=buy_item.time_in_force or "day",
+        risk_context={
+            "generated_by": EXEC_AGENT_DECISION_VERSION,
+            "parent_source_identity": serialize_plan_item_source_identity(buy_item),
+            "parent_idempotency_key": decision["idempotency_key"],
+            "confidence": decision.get("confidence"),
+            "max_holding_trading_sessions": max_sessions,
+            "close_exit_date": close_exit_date.isoformat() if close_exit_date else None,
+            "close_exit_policy": "market_on_or_after_close_exit_date",
+        },
+        decision_agent_name=buy_item.decision_agent_name,
+        decision_snapshot_id=buy_item.decision_snapshot_id,
+        decision_run_id=buy_item.decision_run_id,
+        source_plan_item_id=_monitoring_source_plan_item_id(buy_item, intent),
+        source_market_date=buy_market_date,
+    )
+
+
+def _add_trading_sessions(start: date | None, sessions: int) -> date | None:
+    if start is None:
+        return None
+    current = start
+    added = 0
+    while added < sessions:
+        current = current + timedelta(days=1)
+        if current.weekday() < 5:
+            added += 1
+    return current
 
 
 def _monitoring_source_plan_item_id(item: ExecutionPlanItem, intent: str) -> str | None:
