@@ -917,6 +917,118 @@ def test_openclaw_exec_agent_batch_client_sees_all_candidates_and_allocates_diff
     engine.dispose()
 
 
+def test_openclaw_exec_agent_batch_allocation_preserves_precomputed_contracts() -> None:
+    adapter = StubBrokerAdapter(available_cash=Decimal("800000"))
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="live",  # type: ignore[arg-type]
+        kis_app_key="key",
+        kis_app_secret="secret",
+        kis_account_number="12345678",
+        exec_agent_enabled=True,
+        exec_agent_max_account_snapshot_age_seconds=86400,
+        exec_agent_max_symbol_budget=Decimal("500000"),
+        exec_agent_max_total_budget=Decimal("1000000"),
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    precomputed_decision = strict_exec_decision(
+        "0.93",
+        max_budget="120000",
+        context={"source": "precomputed", "contract_id": "durable-contract-1"},
+        target_price="57000",
+        stop_price="47000",
+    )
+    client = FakeBatchExecAgentClient(
+        {
+            "item-openclaw-mixed-missing": {
+                "action": "approve",
+                "confidence": Decimal("0.91"),
+                "quantity": 4,
+                "final_budget": Decimal("200000"),
+                "reference_price": Decimal("50000"),
+                "target_price": Decimal("57500"),
+                "stop_price": Decimal("47000"),
+                "reasons": ["sized by live OpenClaw batch"],
+                "risk_flags": ["deep_liquidity"],
+                "explanation": {"source": "openclaw"},
+            },
+        }
+    )
+    plan = ExecutionPlan(
+        id="plan-pk-openclaw-mixed",
+        external_plan_id="plan-openclaw-mixed",
+        source="kai-trading-core",
+        market_date=datetime(2026, 5, 13, tzinfo=UTC).date(),
+        mode="live",
+        status="accepted",
+        items=[
+            ExecutionPlanItem(
+                id="item-openclaw-mixed-precomputed",
+                plan_item_index=0,
+                symbol="005930",
+                side="buy",
+                intent="next_open_buy",
+                status="pending",
+                decision_agent_name="short-term-decider",
+                source_plan_item_id="candidate-mixed-precomputed",
+                risk_context={"exec_agent_decision": precomputed_decision},
+            ),
+            ExecutionPlanItem(
+                id="item-openclaw-mixed-missing",
+                plan_item_index=1,
+                symbol="000660",
+                side="buy",
+                intent="next_open_buy",
+                status="pending",
+                decision_agent_name="short-term-decider",
+                source_plan_item_id="candidate-mixed-missing",
+                risk_context={"decider_output": {"score": 8.1}},
+            ),
+        ],
+    )
+
+    with session_factory() as session:
+        result = strict_exec_agent.apply_short_term_exec_agent_decisions(
+            settings=settings,
+            db=session,
+            adapter=adapter,
+            plan=plan,
+            exec_agent_client=client,
+        )
+
+    assert result.approved_count == 2
+    assert result.rejected_count == 0
+    assert len(client.requests) == 1
+    assert [candidate.execution_plan_item_id for candidate in client.requests[0].candidates] == [
+        "item-openclaw-mixed-missing"
+    ]
+    assert [candidate.symbol for candidate in client.requests[0].candidates] == ["000660"]
+    assert client.legacy_requests == []
+
+    buy_items = {item.symbol: item for item in plan.items if item.intent == "next_open_buy"}
+    precomputed_audit = buy_items["005930"].risk_context["exec_agent_decision"]
+    missing_audit = buy_items["000660"].risk_context["exec_agent_decision"]
+    expected_precomputed_contract = strict_exec_agent.ShortTermExecAgentContract.model_validate(
+        precomputed_decision
+    ).model_dump(mode="json")
+    assert precomputed_audit["agent_contract"] == expected_precomputed_contract
+    assert precomputed_audit["final_budget"] == "120000.0000"
+    assert precomputed_audit["target_price"] == "57000.0000"
+    assert precomputed_audit["agent_contract"]["context"] == {
+        "source": "precomputed",
+        "contract_id": "durable-contract-1",
+    }
+    assert (
+        missing_audit["agent_contract"]["context"]["openclaw_agent_id"]
+        == strict_exec_agent.OPENCLAW_EXEC_AGENT_ID
+    )
+    assert missing_audit["final_budget"] == "200000.0000"
+
+    engine.dispose()
+
+
 def test_openclaw_exec_agent_quantity_caps_budget_implied_quantity() -> None:
     adapter = StubBrokerAdapter(available_cash=Decimal("2000000"))
     settings = Settings(

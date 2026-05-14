@@ -1002,8 +1002,9 @@ def _resolve_agent_contracts(
         except _InvalidAgentContract as exc:
             results[item.id] = exc
 
+    results.update(precomputed_contracts)
+
     if not exec_agent_enabled:
-        results.update(precomputed_contracts)
         missing = _MissingAgentContract(
             "OpenClaw exec-agent is disabled and no precomputed exec_agent_decision was supplied"
         )
@@ -1011,7 +1012,7 @@ def _resolve_agent_contracts(
             results[item.id] = missing
         return results
 
-    openclaw_candidates = [item for item in candidates if item.id not in results]
+    openclaw_candidates = [item for item in missing_contract_items if item.id not in results]
     if not openclaw_candidates:
         return results
 
