@@ -23,7 +23,7 @@ from app.services.reconciliation import (
 from app.services.broker_orders import place_broker_order
 from app.services.plan_item_identity import serialize_plan_item_source_identity
 
-MONITORED_INTENTS = frozenset({"target_sell", "stop_sell"})
+MONITORED_INTENTS = frozenset({"target_sell", "stop_sell", "max_holding_close_sell"})
 BLOCKED_MONITORING_STATUSES = frozenset(
     {
         "target_sell_triggered_blocked",
@@ -188,7 +188,7 @@ def _evaluate_monitoring_cycle(
                 BLOCKED_MONITORING_STATUSES | PENDING_DISPATCH_MONITORING_STATUSES
             )
         )
-        if price is None and not retry_persisted_trigger:
+        if price is None and not retry_persisted_trigger and item.intent != "max_holding_close_sell":
             continue
 
         evaluated_item_ids.append(item.id)
@@ -203,7 +203,7 @@ def _evaluate_monitoring_cycle(
             )
             continue
 
-        if price is not None and not _is_triggered(item=item, observed_price=price.price):
+        if not retry_persisted_trigger and not _is_triggered(item=item, observed_price=price.price if price is not None else None, triggered_at=triggered_at):
             if item.status in (
                 BLOCKED_MONITORING_STATUSES | PENDING_DISPATCH_MONITORING_STATUSES
             ):
@@ -559,11 +559,13 @@ def _positions_with_stale_local_state(
 
 
 def _monitoring_item_is_configured(item: ExecutionPlanItem) -> bool:
-    return (
-        item.side == "sell"
-        and item.trigger_price is not None
-        and _quantity_policy_supported(item.quantity_policy)
-    )
+    if item.side != "sell" or not _quantity_policy_supported(item.quantity_policy):
+        return False
+    if item.intent == "max_holding_close_sell":
+        risk_context = item.risk_context if isinstance(item.risk_context, dict) else {}
+        close_exit_date = risk_context.get("close_exit_date")
+        return isinstance(close_exit_date, str) and bool(close_exit_date.strip())
+    return item.trigger_price is not None
 
 
 def _quantity_policy_supported(quantity_policy: dict[str, object] | None) -> bool:
@@ -582,16 +584,31 @@ def _quantity_policy_supported(quantity_policy: dict[str, object] | None) -> boo
 def _is_triggered(
     *,
     item: ExecutionPlanItem,
-    observed_price: Decimal,
+    observed_price: Decimal | None,
+    triggered_at: datetime,
 ) -> bool:
+    if item.intent == "max_holding_close_sell":
+        return _max_holding_exit_due(item=item, triggered_at=triggered_at)
     trigger_price = item.trigger_price
-    if trigger_price is None:
+    if trigger_price is None or observed_price is None:
         return False
     if item.intent == "target_sell":
         return observed_price >= trigger_price
     if item.intent == "stop_sell":
         return observed_price <= trigger_price
     return False
+
+
+def _max_holding_exit_due(*, item: ExecutionPlanItem, triggered_at: datetime) -> bool:
+    risk_context = item.risk_context if isinstance(item.risk_context, dict) else {}
+    raw_close_exit_date = risk_context.get("close_exit_date")
+    if not isinstance(raw_close_exit_date, str):
+        return False
+    try:
+        close_exit_date = datetime.strptime(raw_close_exit_date, "%Y-%m-%d").date()
+    except ValueError:
+        return False
+    return triggered_at.astimezone(UTC).date() >= close_exit_date
 
 
 def _resolve_sell_quantity(
