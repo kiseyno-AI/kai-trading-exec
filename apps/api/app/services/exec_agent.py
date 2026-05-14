@@ -62,6 +62,7 @@ class ShortTermExecAgentContract(BaseModel):
     max_budget: Decimal | None = Field(default=None, gt=0)
     max_symbol_budget: Decimal | None = Field(default=None, gt=0)
     max_total_budget: Decimal | None = Field(default=None, gt=0)
+    max_quantity: int | None = Field(default=None, gt=0)
     reference_price: Decimal | None = Field(default=None, gt=0)
     target_price: Decimal | None = Field(default=None, gt=0)
     stop_price: Decimal | None = Field(default=None, gt=0)
@@ -578,6 +579,8 @@ def _decide_candidate(
 
     budget = sizing_budget.final_budget
     quantity = int((budget / sizing_price).quantize(Decimal("1"), rounding=ROUND_DOWN))
+    if agent_contract.max_quantity is not None:
+        quantity = min(quantity, agent_contract.max_quantity)
     if quantity <= 0:
         return _reject(
             base,
@@ -602,6 +605,7 @@ def _decide_candidate(
         "confidence": _serialize_decimal(agent_contract.confidence),
         "conviction": sizing_budget.conviction,
         "quantity": quantity,
+        "agent_approved_quantity_upper_bound": agent_contract.max_quantity,
         "order_type": "limit" if item.limit_price is not None else "market",
         "reference_price": _serialize_decimal(sizing_price),
         "sizing_price": _serialize_decimal(sizing_price),
@@ -1036,6 +1040,7 @@ def _contract_from_agent_response(response: ExecAgentSizingResponse) -> ShortTer
         action="approve",
         confidence=response.confidence,
         max_budget=response.final_budget,
+        max_quantity=response.quantity,
         reference_price=response.reference_price,
         target_price=response.target_price,
         stop_price=response.stop_price,

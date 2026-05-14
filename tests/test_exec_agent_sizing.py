@@ -666,17 +666,26 @@ def test_runtime_safety_controls_still_block_live_short_term_order_submission() 
 
 
 class FakeExecAgentClient:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        quantity: int = 7,
+        final_budget: Decimal = Decimal("350000"),
+        reference_price: Decimal = Decimal("50000"),
+    ) -> None:
         self.requests = []
+        self.quantity = quantity
+        self.final_budget = final_budget
+        self.reference_price = reference_price
 
     def size_candidate(self, request):
         self.requests.append(request)
         return strict_exec_agent.ExecAgentSizingResponse(
             action="approve",
             confidence=Decimal("0.91"),
-            quantity=7,
-            final_budget=Decimal("350000"),
-            reference_price=Decimal("50000"),
+            quantity=self.quantity,
+            final_budget=self.final_budget,
+            reference_price=self.reference_price,
             target_price=Decimal("57000"),
             stop_price=Decimal("47000"),
             reasons=["high conviction with sufficient cash"],
@@ -748,6 +757,76 @@ def test_openclaw_exec_agent_client_handoff_builds_context_and_sizes_without_pre
     assert audit["agent_contract"]["context"]["risk_flags"] == ["normal_spread"]
     assert audit["final_budget"] == "350000.0000"
     assert plan.items[0].quantity_policy["quantity"] == 7
+
+    engine.dispose()
+
+
+def test_openclaw_exec_agent_quantity_caps_budget_implied_quantity() -> None:
+    adapter = StubBrokerAdapter(available_cash=Decimal("2000000"))
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="live",  # type: ignore[arg-type]
+        kis_app_key="key",
+        kis_app_secret="secret",
+        kis_account_number="12345678",
+        exec_agent_enabled=True,
+        exec_agent_max_account_snapshot_age_seconds=86400,
+        exec_agent_max_symbol_budget=Decimal("1000000"),
+        exec_agent_max_total_budget=Decimal("2000000"),
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    client = FakeExecAgentClient(
+        quantity=1,
+        final_budget=Decimal("1000000"),
+        reference_price=Decimal("50000"),
+    )
+    plan = ExecutionPlan(
+        id="plan-pk-openclaw-cap",
+        external_plan_id="plan-openclaw-cap",
+        source="kai-trading-core",
+        market_date=datetime(2026, 5, 13, tzinfo=UTC).date(),
+        mode="live",
+        status="accepted",
+        items=[
+            ExecutionPlanItem(
+                id="item-openclaw-cap",
+                plan_item_index=0,
+                symbol="005930",
+                side="buy",
+                intent="next_open_buy",
+                status="pending",
+                decision_agent_name="short-term-decider",
+                source_plan_item_id="candidate-openclaw-cap",
+                risk_context={"decider_output": {"score": 9.1}},
+            )
+        ],
+    )
+
+    with session_factory() as session:
+        result = strict_exec_agent.apply_short_term_exec_agent_decisions(
+            settings=settings,
+            db=session,
+            adapter=adapter,
+            plan=plan,
+            exec_agent_client=client,
+        )
+
+    assert result.approved_count == 1
+    audit = plan.items[0].risk_context["exec_agent_decision"]
+    assert audit["quantity"] == 1
+    assert audit["agent_approved_quantity_upper_bound"] == 1
+    assert audit["agent_contract"]["max_quantity"] == 1
+    assert audit["approved_notional"] == "50000.0000"
+    assert audit["final_budget"] == "1000000.0000"
+    assert plan.items[0].quantity_policy["quantity"] == 1
+    monitoring_quantities = [
+        item.quantity_policy["quantity"]
+        for item in plan.items
+        if item.intent in {"target_sell", "stop_sell"}
+    ]
+    assert monitoring_quantities == [1, 1]
 
     engine.dispose()
 
