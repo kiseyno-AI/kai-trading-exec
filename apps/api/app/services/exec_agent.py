@@ -39,6 +39,17 @@ OPEN_BUY_ORDER_STATUSES = frozenset(
     }
 )
 REJECTED_STATUS = "exec_agent_rejected"
+CONVICTION_MULTIPLIERS = {
+    "very_high": Decimal("1.00"),
+    "highest": Decimal("1.00"),
+    "high": Decimal("1.00"),
+    "strong": Decimal("1.00"),
+    "medium": Decimal("0.75"),
+    "moderate": Decimal("0.75"),
+    "normal": Decimal("0.75"),
+    "low": Decimal("0.50"),
+    "weak": Decimal("0.50"),
+}
 
 
 class ShortTermExecAgentContract(BaseModel):
@@ -430,16 +441,108 @@ def _decide_candidate(
             available_cash=available_cash,
         )
 
+    sizing_budget = _candidate_sizing_budget(
+        settings=settings,
+        item=item,
+        agent_contract=agent_contract,
+        reference_price=sizing_price,
+        available_cash=available_cash,
+        reserved_total_budget=reserved_total_budget,
+    )
+    if sizing_budget is None:
+        return _reject(
+            base,
+            "confidence_below_minimum",
+            "short-term candidate confidence is below the execution sizing minimum",
+            agent_contract=agent_contract,
+            available_cash=available_cash,
+            sizing_price=sizing_price,
+        )
+    if sizing_budget.remaining_total_budget <= 0:
+        return _reject(
+            base,
+            "total_budget_cap_reached",
+            "exec-agent total budget cap is already reserved",
+            agent_contract=agent_contract,
+            available_cash=available_cash,
+        )
+
+    budget = sizing_budget.final_budget
+    quantity = int((budget / sizing_price).quantize(Decimal("1"), rounding=ROUND_DOWN))
+    if quantity <= 0:
+        return _reject(
+            base,
+            "insufficient_cash",
+            "available cash and budget caps cannot buy one share",
+            agent_contract=agent_contract,
+            available_cash=available_cash,
+            sizing_price=sizing_price,
+        )
+
+    approved_notional = sizing_price * Decimal(quantity)
+    max_symbol_budget = agent_contract.max_symbol_budget or _settings_decimal(
+        settings,
+        "exec_agent_max_symbol_budget",
+        Decimal("1000000"),
+    )
+    return {
+        **base,
+        "action": "approve",
+        "reason_code": "approved",
+        "reason": "short-term exec agent approved candidate-aware bounded market-open buy",
+        "confidence": _serialize_decimal(agent_contract.confidence),
+        "conviction": sizing_budget.conviction,
+        "quantity": quantity,
+        "order_type": "limit" if item.limit_price is not None else "market",
+        "reference_price": _serialize_decimal(sizing_price),
+        "sizing_price": _serialize_decimal(sizing_price),
+        "approved_notional": _serialize_decimal(approved_notional),
+        "available_cash": _serialize_decimal(available_cash),
+        "budget": _serialize_decimal(budget),
+        "base_budget": _serialize_decimal(sizing_budget.base_budget),
+        "budget_multiplier": _serialize_decimal(sizing_budget.budget_multiplier),
+        "risk_adjustments": sizing_budget.risk_adjustments,
+        "final_budget": _serialize_decimal(sizing_budget.final_budget),
+        "max_budget_upper_bound": _serialize_decimal(agent_contract.max_budget),
+        "max_symbol_budget_upper_bound": _serialize_decimal(max_symbol_budget),
+        "remaining_total_budget": _serialize_decimal(sizing_budget.remaining_total_budget),
+        "target_price": _serialize_decimal(agent_contract.target_price),
+        "stop_price": _serialize_decimal(agent_contract.stop_price),
+        "allow_existing_holding": agent_contract.allow_existing_holding,
+        "feedback_ids": list(agent_contract.feedback_ids),
+        "agent_contract": agent_contract.model_dump(mode="json"),
+        "account_snapshot_observed_at": account_context.observed_at.isoformat(),
+    }
+
+
+@dataclass(frozen=True)
+class _SizingBudget:
+    base_budget: Decimal
+    budget_multiplier: Decimal
+    risk_adjustments: dict[str, object]
+    final_budget: Decimal
+    remaining_total_budget: Decimal
+    conviction: str | None
+
+
+def _candidate_sizing_budget(
+    *,
+    settings: Settings,
+    item: ExecutionPlanItem,
+    agent_contract: ShortTermExecAgentContract,
+    reference_price: Decimal,
+    available_cash: Decimal,
+    reserved_total_budget: Decimal,
+) -> _SizingBudget | None:
     max_budget = agent_contract.max_budget
     assert max_budget is not None
-    budget = min(
+    per_symbol_cap = min(
         max_budget,
         agent_contract.max_symbol_budget or _settings_decimal(
             settings,
             "exec_agent_max_symbol_budget",
             Decimal("1000000"),
         ),
-        available_cash,
     )
     total_cap = min(
         agent_contract.max_total_budget or _settings_decimal(
@@ -455,45 +558,258 @@ def _decide_candidate(
     )
     remaining_total_budget = total_cap - reserved_total_budget
     if remaining_total_budget <= 0:
-        return _reject(
-            base,
-            "total_budget_cap_reached",
-            "exec-agent total budget cap is already reserved",
-            agent_contract=agent_contract,
-            available_cash=available_cash,
-        )
-    budget = min(budget, remaining_total_budget)
-    quantity = int((budget / sizing_price).quantize(Decimal("1"), rounding=ROUND_DOWN))
-    if quantity <= 0:
-        return _reject(
-            base,
-            "insufficient_cash",
-            "available cash and budget caps cannot buy one share",
-            agent_contract=agent_contract,
-            available_cash=available_cash,
-            sizing_price=sizing_price,
+        return _SizingBudget(
+            base_budget=Decimal("0"),
+            budget_multiplier=Decimal("0"),
+            risk_adjustments={},
+            final_budget=Decimal("0"),
+            remaining_total_budget=remaining_total_budget,
+            conviction=None,
         )
 
-    approved_notional = sizing_price * Decimal(quantity)
-    return {
-        **base,
-        "action": "approve",
-        "reason_code": "approved",
-        "reason": "short-term exec agent approved bounded market-open buy",
-        "confidence": _serialize_decimal(agent_contract.confidence),
-        "quantity": quantity,
-        "order_type": "limit" if item.limit_price is not None else "market",
-        "sizing_price": _serialize_decimal(sizing_price),
-        "approved_notional": _serialize_decimal(approved_notional),
-        "available_cash": _serialize_decimal(available_cash),
-        "budget": _serialize_decimal(budget),
-        "target_price": _serialize_decimal(agent_contract.target_price),
-        "stop_price": _serialize_decimal(agent_contract.stop_price),
-        "allow_existing_holding": agent_contract.allow_existing_holding,
-        "feedback_ids": list(agent_contract.feedback_ids),
-        "agent_contract": agent_contract.model_dump(mode="json"),
-        "account_snapshot_observed_at": account_context.observed_at.isoformat(),
+    base_budget = min(per_symbol_cap, available_cash, remaining_total_budget)
+    confidence_multiplier = _confidence_budget_multiplier(agent_contract.confidence)
+    if confidence_multiplier is None:
+        return None
+    conviction = _candidate_conviction(item=item, agent_contract=agent_contract)
+    conviction_multiplier = CONVICTION_MULTIPLIERS.get(conviction or "")
+    budget_multiplier = min(
+        confidence_multiplier,
+        conviction_multiplier if conviction_multiplier is not None else confidence_multiplier,
+    )
+    risk_multiplier, risk_adjustments = _risk_budget_adjustments(
+        item=item,
+        agent_contract=agent_contract,
+        reference_price=reference_price,
+    )
+    final_budget = min(
+        base_budget,
+        (base_budget * budget_multiplier * risk_multiplier).quantize(
+            Decimal("0.0001"),
+            rounding=ROUND_DOWN,
+        ),
+    )
+    return _SizingBudget(
+        base_budget=base_budget,
+        budget_multiplier=budget_multiplier,
+        risk_adjustments=risk_adjustments,
+        final_budget=final_budget,
+        remaining_total_budget=remaining_total_budget,
+        conviction=conviction,
+    )
+
+
+def _confidence_budget_multiplier(confidence: Decimal) -> Decimal | None:
+    if confidence < Decimal("0.50"):
+        return None
+    if confidence >= Decimal("0.80"):
+        return Decimal("1.00")
+    if confidence >= Decimal("0.65"):
+        return Decimal("0.75")
+    return Decimal("0.50")
+
+
+def _candidate_conviction(
+    *,
+    item: ExecutionPlanItem,
+    agent_contract: ShortTermExecAgentContract,
+) -> str | None:
+    for source in (
+        agent_contract.context,
+        item.risk_context,
+        item.quantity_policy,
+    ):
+        if not isinstance(source, dict):
+            continue
+        value = source.get("conviction")
+        if isinstance(value, str) and value.strip():
+            return value.strip().lower()
+    return None
+
+
+def _risk_budget_adjustments(
+    *,
+    item: ExecutionPlanItem,
+    agent_contract: ShortTermExecAgentContract,
+    reference_price: Decimal,
+) -> tuple[Decimal, dict[str, object]]:
+    adjustments: dict[str, object] = {}
+    multiplier = Decimal("1.00")
+
+    target_stop_multiplier, target_stop = _target_stop_adjustment(
+        agent_contract=agent_contract,
+        reference_price=reference_price,
+    )
+    if target_stop:
+        adjustments["target_stop"] = target_stop
+        multiplier *= target_stop_multiplier
+
+    liquidity_multiplier, liquidity = _metric_adjustment(
+        item=item,
+        agent_contract=agent_contract,
+        keys=("liquidity_score", "liquidity", "volume_score", "marketability_score"),
+        thresholds=(
+            (Decimal("0.30"), Decimal("0.50")),
+            (Decimal("0.60"), Decimal("0.75")),
+            (Decimal("0.80"), Decimal("0.90")),
+        ),
+        default_multiplier=Decimal("1.00"),
+    )
+    if liquidity:
+        adjustments["liquidity"] = liquidity
+        multiplier *= liquidity_multiplier
+
+    orderbook_multiplier, orderbook = _metric_adjustment(
+        item=item,
+        agent_contract=agent_contract,
+        keys=("orderbook_quality", "order_book_quality", "book_quality"),
+        thresholds=(
+            (Decimal("0.30"), Decimal("0.60")),
+            (Decimal("0.60"), Decimal("0.80")),
+            (Decimal("0.80"), Decimal("0.90")),
+        ),
+        default_multiplier=Decimal("1.00"),
+    )
+    if orderbook:
+        adjustments["orderbook_quality"] = orderbook
+        multiplier *= orderbook_multiplier
+
+    spread_multiplier, spread = _spread_adjustment(item=item, agent_contract=agent_contract)
+    if spread:
+        adjustments["spread"] = spread
+        multiplier *= spread_multiplier
+
+    adjustments["combined_multiplier"] = _serialize_decimal(multiplier)
+    return multiplier, adjustments
+
+
+def _target_stop_adjustment(
+    *,
+    agent_contract: ShortTermExecAgentContract,
+    reference_price: Decimal,
+) -> tuple[Decimal, dict[str, object]]:
+    target_price = agent_contract.target_price
+    stop_price = agent_contract.stop_price
+    if target_price is None or stop_price is None:
+        return Decimal("1.00"), {}
+    reward_distance = (target_price - reference_price) / reference_price
+    risk_distance = (reference_price - stop_price) / reference_price
+    if reward_distance <= 0 or risk_distance <= 0:
+        return Decimal("0.50"), {
+            "multiplier": "0.5000",
+            "reason": "invalid_target_or_stop_distance",
+            "reward_distance": _serialize_decimal(reward_distance),
+            "risk_distance": _serialize_decimal(risk_distance),
+        }
+    risk_reward = reward_distance / risk_distance
+    multiplier = Decimal("1.00")
+    reason = "balanced_target_stop"
+    if risk_reward < Decimal("1.00"):
+        multiplier = Decimal("0.50")
+        reason = "risk_reward_below_one"
+    elif risk_reward < Decimal("1.50"):
+        multiplier = Decimal("0.75")
+        reason = "thin_risk_reward"
+    if risk_distance > Decimal("0.08"):
+        multiplier = min(multiplier, Decimal("0.80"))
+        reason = "wide_stop_distance"
+    elif risk_distance < Decimal("0.01"):
+        multiplier = min(multiplier, Decimal("0.85"))
+        reason = "tight_stop_distance"
+    return multiplier, {
+        "multiplier": _serialize_decimal(multiplier),
+        "reason": reason,
+        "reward_distance": _serialize_decimal(reward_distance),
+        "risk_distance": _serialize_decimal(risk_distance),
+        "risk_reward": _serialize_decimal(risk_reward),
     }
+
+
+def _metric_adjustment(
+    *,
+    item: ExecutionPlanItem,
+    agent_contract: ShortTermExecAgentContract,
+    keys: tuple[str, ...],
+    thresholds: tuple[tuple[Decimal, Decimal], ...],
+    default_multiplier: Decimal,
+) -> tuple[Decimal, dict[str, object]]:
+    value = _first_decimal_from_sources(item=item, agent_contract=agent_contract, keys=keys)
+    if value is None:
+        return default_multiplier, {}
+    normalized = value / Decimal("100") if value > 1 and value <= 100 else value
+    if normalized < 0:
+        normalized = Decimal("0")
+    multiplier = default_multiplier
+    for upper_bound, threshold_multiplier in thresholds:
+        if normalized < upper_bound:
+            multiplier = threshold_multiplier
+            break
+    return multiplier, {
+        "value": _serialize_decimal(value),
+        "normalized": _serialize_decimal(normalized),
+        "multiplier": _serialize_decimal(multiplier),
+    }
+
+
+def _spread_adjustment(
+    *,
+    item: ExecutionPlanItem,
+    agent_contract: ShortTermExecAgentContract,
+) -> tuple[Decimal, dict[str, object]]:
+    spread_bps = _first_decimal_from_sources(
+        item=item,
+        agent_contract=agent_contract,
+        keys=("spread_bps", "bid_ask_spread_bps", "orderbook_spread_bps"),
+    )
+    if spread_bps is None:
+        spread_pct = _first_decimal_from_sources(
+            item=item,
+            agent_contract=agent_contract,
+            keys=("spread_pct", "spread_percent", "bid_ask_spread_pct"),
+        )
+        if spread_pct is None:
+            return Decimal("1.00"), {}
+        spread_bps = spread_pct * (Decimal("100") if spread_pct <= 1 else Decimal("1"))
+    multiplier = Decimal("1.00")
+    if spread_bps > Decimal("100"):
+        multiplier = Decimal("0.50")
+    elif spread_bps > Decimal("50"):
+        multiplier = Decimal("0.75")
+    elif spread_bps > Decimal("20"):
+        multiplier = Decimal("0.90")
+    return multiplier, {
+        "spread_bps": _serialize_decimal(spread_bps),
+        "multiplier": _serialize_decimal(multiplier),
+    }
+
+
+def _first_decimal_from_sources(
+    *,
+    item: ExecutionPlanItem,
+    agent_contract: ShortTermExecAgentContract,
+    keys: tuple[str, ...],
+) -> Decimal | None:
+    for source in (agent_contract.context, item.risk_context, item.quantity_policy):
+        value = _first_decimal(source, keys)
+        if value is not None:
+            return value
+    return None
+
+
+def _first_decimal(source: object, keys: tuple[str, ...]) -> Decimal | None:
+    if not isinstance(source, dict):
+        return None
+    for key in keys:
+        raw = source.get(key)
+        if raw is None:
+            continue
+        try:
+            value = Decimal(str(raw))
+        except (InvalidOperation, ValueError):
+            continue
+        if value.is_finite():
+            return value
+    return None
 
 
 def _load_agent_contract(item: ExecutionPlanItem) -> ShortTermExecAgentContract:
