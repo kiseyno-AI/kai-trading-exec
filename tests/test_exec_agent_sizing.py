@@ -362,6 +362,46 @@ def test_strict_short_term_exec_agent_reserves_total_budget_across_candidates() 
     engine.dispose()
 
 
+def test_strict_short_term_exec_agent_reserves_available_cash_across_candidates_when_total_cap_is_higher() -> None:
+    adapter = StubBrokerAdapter(available_cash=Decimal("500000"))
+    app, engine = build_test_app(
+        adapter,
+        exec_agent_max_symbol_budget=Decimal("500000"),
+        exec_agent_max_total_budget=Decimal("2000000"),
+    )
+    client = TestClient(app)
+
+    response = client.post(
+        "/execution-plans/preview",
+        json=multi_short_term_plan_payload(
+            candidates=[
+                ("005930", "candidate-high-1", strict_exec_decision("0.82")),
+                ("000660", "candidate-high-2", strict_exec_decision("0.82")),
+                ("035420", "candidate-high-3", strict_exec_decision("0.82")),
+            ]
+        ),
+    )
+
+    assert response.status_code == 200
+    items = [item for item in response.json()["items"] if item["intent"] == "next_open_buy"]
+    by_symbol = {item["symbol"]: item for item in items}
+    first_audit = by_symbol["005930"]["risk_context"]["exec_agent_decision"]
+    second_audit = by_symbol["000660"]["risk_context"]["exec_agent_decision"]
+    third_audit = by_symbol["035420"]["risk_context"]["exec_agent_decision"]
+
+    assert first_audit["base_budget"] == "400000.0000"
+    assert first_audit["final_budget"] == "400000.0000"
+    assert by_symbol["005930"]["quantity_policy"]["quantity"] == 8
+    assert second_audit["base_budget"] == "100000.0000"
+    assert second_audit["final_budget"] == "100000.0000"
+    assert second_audit["remaining_available_cash"] == "100000.0000"
+    assert by_symbol["000660"]["quantity_policy"]["quantity"] == 2
+    assert by_symbol["035420"]["status"] == "exec_agent_rejected"
+    assert third_audit["reason_code"] == "insufficient_cash"
+
+    engine.dispose()
+
+
 def test_strict_short_term_exec_agent_applies_target_liquidity_and_spread_adjustments() -> None:
     adapter = StubBrokerAdapter(available_cash=Decimal("2000000"))
     app, engine = build_test_app(

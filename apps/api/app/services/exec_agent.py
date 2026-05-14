@@ -175,6 +175,7 @@ def apply_short_term_exec_agent_decisions(
     approved_count = 0
     rejected_count = 0
     reserved_total_budget = Decimal("0")
+    reserved_cash_budget = Decimal("0")
     next_plan_item_index = _next_plan_item_index(plan)
 
     for item in candidates:
@@ -184,11 +185,14 @@ def apply_short_term_exec_agent_decisions(
             item=item,
             account_context=account_context,
             reserved_total_budget=reserved_total_budget,
+            reserved_cash_budget=reserved_cash_budget,
         )
         decisions.append(decision)
         if decision["action"] == "approve":
+            approved_notional = Decimal(str(decision["approved_notional"]))
             approved_count += 1
-            reserved_total_budget += Decimal(str(decision["approved_notional"]))
+            reserved_total_budget += approved_notional
+            reserved_cash_budget += approved_notional
             _apply_approved_decision(item=item, decision=decision)
             next_plan_item_index = _append_monitoring_items(
                 plan=plan,
@@ -339,6 +343,7 @@ def _decide_candidate(
     item: ExecutionPlanItem,
     account_context: _AccountContext,
     reserved_total_budget: Decimal,
+    reserved_cash_budget: Decimal,
 ) -> dict[str, object]:
     source_identity = serialize_plan_item_source_identity(item)
     idempotency_key = _candidate_idempotency_key(plan=plan, item=item)
@@ -400,11 +405,12 @@ def _decide_candidate(
             "account cash, holdings, and open orders were unavailable",
             agent_contract=agent_contract,
         )
-    if available_cash <= 0:
+    remaining_cash = available_cash - reserved_cash_budget
+    if remaining_cash <= 0:
         return _reject(
             base,
             "insufficient_cash",
-            "available cash must be positive before approving a buy",
+            "available cash must be positive after earlier approved candidates are reserved",
             agent_contract=agent_contract,
             available_cash=available_cash,
         )
@@ -446,7 +452,7 @@ def _decide_candidate(
         item=item,
         agent_contract=agent_contract,
         reference_price=sizing_price,
-        available_cash=available_cash,
+        available_cash=remaining_cash,
         reserved_total_budget=reserved_total_budget,
     )
     if sizing_budget is None:
@@ -498,6 +504,7 @@ def _decide_candidate(
         "sizing_price": _serialize_decimal(sizing_price),
         "approved_notional": _serialize_decimal(approved_notional),
         "available_cash": _serialize_decimal(available_cash),
+        "remaining_available_cash": _serialize_decimal(remaining_cash),
         "budget": _serialize_decimal(budget),
         "base_budget": _serialize_decimal(sizing_budget.base_budget),
         "budget_multiplier": _serialize_decimal(sizing_budget.budget_multiplier),
