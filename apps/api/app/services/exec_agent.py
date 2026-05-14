@@ -133,6 +133,36 @@ class ExecAgentSizingRequest(BaseModel):
     risk_caps: dict[str, Any]
 
 
+class ExecAgentAllocationCandidate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    execution_plan_item_id: str
+    symbol: str
+    side: str
+    intent: str
+    source_identity: dict[str, object]
+    candidate_context: dict[str, Any]
+    decider_input: dict[str, Any] | None = None
+    decider_output: dict[str, Any] | None = None
+    market_data: dict[str, Any] | None = None
+
+
+class ExecAgentBatchSizingRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    agent_id: str = OPENCLAW_EXEC_AGENT_ID
+    model: str = OPENCLAW_EXEC_AGENT_MODEL
+    version: str = EXEC_AGENT_DECISION_VERSION
+    plan_id: str
+    market_date: str | None = None
+    strategy_run_id: str | None = None
+    allocation_scope: Literal["next_open_buy"] = "next_open_buy"
+    candidates: list[ExecAgentAllocationCandidate] = Field(min_length=1)
+    account: dict[str, Any]
+    portfolio: dict[str, Any]
+    risk_caps: dict[str, Any]
+
+
 class ExecAgentSizingResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -174,9 +204,22 @@ class ExecAgentSizingResponse(BaseModel):
         return self
 
 
+class ExecAgentAllocationDecision(ExecAgentSizingResponse):
+    execution_plan_item_id: str
+
+
+class ExecAgentBatchSizingResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    decisions: list[ExecAgentAllocationDecision] = Field(min_length=1)
+
+
 class ExecAgentClient(Protocol):
+    def size_candidates(self, request: ExecAgentBatchSizingRequest) -> ExecAgentBatchSizingResponse:
+        """Return one portfolio-wide allocation for all supplied candidates or raise."""
+
     def size_candidate(self, request: ExecAgentSizingRequest) -> ExecAgentSizingResponse:
-        """Return a schema-validated exec-agent sizing response or raise."""
+        """Legacy per-candidate fallback for clients not yet migrated to batch sizing."""
 
 
 class ExecAgentUnavailable(RuntimeError):
@@ -184,6 +227,10 @@ class ExecAgentUnavailable(RuntimeError):
 
 
 class UnavailableExecAgentClient:
+    def size_candidates(self, request: ExecAgentBatchSizingRequest) -> ExecAgentBatchSizingResponse:
+        del request
+        raise ExecAgentUnavailable("OpenClaw exec-agent transport is not configured")
+
     def size_candidate(self, request: ExecAgentSizingRequest) -> ExecAgentSizingResponse:
         del request
         raise ExecAgentUnavailable("OpenClaw exec-agent transport is not configured")
@@ -225,6 +272,9 @@ class _MissingAgentContract(ValueError):
     pass
 
 
+_AgentContractResolution = ShortTermExecAgentContract | _MissingAgentContract | _InvalidAgentContract
+
+
 def apply_short_term_exec_agent_decisions(
     *,
     settings: Settings,
@@ -259,6 +309,13 @@ def apply_short_term_exec_agent_decisions(
     reserved_total_budget = Decimal("0")
     reserved_cash_budget = Decimal("0")
     next_plan_item_index = _next_plan_item_index(plan)
+    agent_contracts = _resolve_agent_contracts(
+        settings=settings,
+        plan=plan,
+        candidates=candidates,
+        account_context=account_context,
+        exec_agent_client=exec_agent_client,
+    )
 
     for item in candidates:
         decision = _decide_candidate(
@@ -268,7 +325,7 @@ def apply_short_term_exec_agent_decisions(
             account_context=account_context,
             reserved_total_budget=reserved_total_budget,
             reserved_cash_budget=reserved_cash_budget,
-            exec_agent_client=exec_agent_client,
+            agent_contract_result=agent_contracts.get(item.id),
         )
         decisions.append(decision)
         if decision["action"] == "approve":
@@ -437,7 +494,7 @@ def _decide_candidate(
     account_context: _AccountContext,
     reserved_total_budget: Decimal,
     reserved_cash_budget: Decimal,
-    exec_agent_client: ExecAgentClient | None,
+    agent_contract_result: _AgentContractResolution | None,
 ) -> dict[str, object]:
     source_identity = serialize_plan_item_source_identity(item)
     idempotency_key = _candidate_idempotency_key(plan=plan, item=item)
@@ -451,19 +508,17 @@ def _decide_candidate(
         "decided_at": datetime.now(UTC).isoformat(),
     }
 
-    try:
-        agent_contract = _resolve_agent_contract(
-            settings=settings,
-            plan=plan,
-            item=item,
-            account_context=account_context,
-            source_identity=source_identity,
-            exec_agent_client=exec_agent_client,
+    if agent_contract_result is None:
+        return _reject(
+            base,
+            "exec_agent_unavailable",
+            "OpenClaw exec-agent did not return a decision for this candidate",
         )
-    except _MissingAgentContract as exc:
-        return _reject(base, "exec_agent_unavailable", str(exc))
-    except _InvalidAgentContract as exc:
-        return _reject(base, "invalid_agent_output", str(exc))
+    if isinstance(agent_contract_result, _MissingAgentContract):
+        return _reject(base, "exec_agent_unavailable", str(agent_contract_result))
+    if isinstance(agent_contract_result, _InvalidAgentContract):
+        return _reject(base, "invalid_agent_output", str(agent_contract_result))
+    agent_contract = agent_contract_result
 
     if agent_contract.action == "reject":
         return _reject(
@@ -926,43 +981,197 @@ def _first_decimal(source: object, keys: tuple[str, ...]) -> Decimal | None:
     return None
 
 
-def _resolve_agent_contract(
+def _resolve_agent_contracts(
     *,
     settings: Settings,
     plan: ExecutionPlan,
-    item: ExecutionPlanItem,
+    candidates: list[ExecutionPlanItem],
     account_context: _AccountContext,
-    source_identity: dict[str, object],
     exec_agent_client: ExecAgentClient | None,
-) -> ShortTermExecAgentContract:
-    try:
-        return _load_agent_contract(item)
-    except _MissingAgentContract:
-        pass
+) -> dict[str, _AgentContractResolution]:
+    results: dict[str, _AgentContractResolution] = {}
+    precomputed_contracts: dict[str, ShortTermExecAgentContract] = {}
+    missing_contract_items: list[ExecutionPlanItem] = []
+    exec_agent_enabled = getattr(settings, "exec_agent_enabled", False)
 
-    if not getattr(settings, "exec_agent_enabled", False):
-        raise _MissingAgentContract(
+    for item in candidates:
+        try:
+            precomputed_contracts[item.id] = _load_agent_contract(item)
+        except _MissingAgentContract:
+            missing_contract_items.append(item)
+        except _InvalidAgentContract as exc:
+            results[item.id] = exc
+
+    results.update(precomputed_contracts)
+
+    if not exec_agent_enabled:
+        missing = _MissingAgentContract(
             "OpenClaw exec-agent is disabled and no precomputed exec_agent_decision was supplied"
         )
+        for item in missing_contract_items:
+            results[item.id] = missing
+        return results
 
+    openclaw_candidates = [item for item in missing_contract_items if item.id not in results]
+    if not openclaw_candidates:
+        return results
+
+    try:
+        results.update(
+            _request_batch_agent_contracts(
+                settings=settings,
+                plan=plan,
+                candidates=openclaw_candidates,
+                account_context=account_context,
+                exec_agent_client=exec_agent_client,
+            )
+        )
+    except (_MissingAgentContract, _InvalidAgentContract) as exc:
+        for item in openclaw_candidates:
+            results[item.id] = precomputed_contracts.get(item.id, exc)
+    return results
+
+
+def _request_batch_agent_contracts(
+    *,
+    settings: Settings,
+    plan: ExecutionPlan,
+    candidates: list[ExecutionPlanItem],
+    account_context: _AccountContext,
+    exec_agent_client: ExecAgentClient | None,
+) -> dict[str, ShortTermExecAgentContract]:
     client = exec_agent_client or UnavailableExecAgentClient()
-    request = _build_agent_request(
+    request = _build_batch_agent_request(
         settings=settings,
         plan=plan,
-        item=item,
+        candidates=candidates,
         account_context=account_context,
-        source_identity=source_identity,
     )
     try:
-        response = client.size_candidate(request)
+        response = _call_batch_sizing_client(
+            client=client,
+            request=request,
+            settings=settings,
+            plan=plan,
+            candidates=candidates,
+            account_context=account_context,
+        )
+    except (_MissingAgentContract, _InvalidAgentContract):
+        raise
     except Exception as exc:
-        raise _MissingAgentContract(f"OpenClaw exec-agent request failed: {exc}") from exc
-    if not isinstance(response, ExecAgentSizingResponse):
+        raise _MissingAgentContract(f"OpenClaw exec-agent batch request failed: {exc}") from exc
+
+    if not isinstance(response, ExecAgentBatchSizingResponse):
         try:
-            response = ExecAgentSizingResponse.model_validate(response)
+            response = ExecAgentBatchSizingResponse.model_validate(response)
         except ValidationError as exc:
             raise _InvalidAgentContract(_validation_error_message(exc)) from exc
-    return _contract_from_agent_response(response)
+    return _contracts_from_batch_response(response=response, candidates=candidates)
+
+
+def _call_batch_sizing_client(
+    *,
+    client: ExecAgentClient,
+    request: ExecAgentBatchSizingRequest,
+    settings: Settings,
+    plan: ExecutionPlan,
+    candidates: list[ExecutionPlanItem],
+    account_context: _AccountContext,
+) -> ExecAgentBatchSizingResponse:
+    batch_sizer = getattr(client, "size_candidates", None)
+    if callable(batch_sizer):
+        return batch_sizer(request)
+
+    legacy_sizer = getattr(client, "size_candidate", None)
+    if not callable(legacy_sizer):
+        raise ExecAgentUnavailable("OpenClaw exec-agent client does not expose batch sizing")
+
+    decisions: list[ExecAgentAllocationDecision] = []
+    for item in candidates:
+        try:
+            response = legacy_sizer(
+                _build_agent_request(
+                    settings=settings,
+                    plan=plan,
+                    item=item,
+                    account_context=account_context,
+                    source_identity=serialize_plan_item_source_identity(item),
+                )
+            )
+        except Exception as exc:
+            raise _MissingAgentContract(f"OpenClaw exec-agent request failed: {exc}") from exc
+        if not isinstance(response, ExecAgentSizingResponse):
+            try:
+                response = ExecAgentSizingResponse.model_validate(response)
+            except ValidationError as exc:
+                raise _InvalidAgentContract(_validation_error_message(exc)) from exc
+        decisions.append(
+            ExecAgentAllocationDecision.model_validate(
+                {
+                    **response.model_dump(),
+                    "execution_plan_item_id": item.id,
+                }
+            )
+        )
+    return ExecAgentBatchSizingResponse(decisions=decisions)
+
+
+def _contracts_from_batch_response(
+    *,
+    response: ExecAgentBatchSizingResponse,
+    candidates: list[ExecutionPlanItem],
+) -> dict[str, ShortTermExecAgentContract]:
+    expected_ids = {item.id for item in candidates}
+    contracts: dict[str, ShortTermExecAgentContract] = {}
+    for decision in response.decisions:
+        item_id = decision.execution_plan_item_id
+        if item_id not in expected_ids:
+            raise _InvalidAgentContract(
+                f"batch response included unknown execution_plan_item_id {item_id}"
+            )
+        if item_id in contracts:
+            raise _InvalidAgentContract(
+                f"batch response included duplicate execution_plan_item_id {item_id}"
+            )
+        response_payload = decision.model_dump(exclude={"execution_plan_item_id"})
+        contracts[item_id] = _contract_from_agent_response(
+            ExecAgentSizingResponse.model_validate(response_payload)
+        )
+
+    missing_ids = expected_ids.difference(contracts)
+    if missing_ids:
+        missing = ", ".join(sorted(missing_ids))
+        raise _InvalidAgentContract(
+            f"batch response missing decisions for execution_plan_item_id: {missing}"
+        )
+    return contracts
+
+
+def _build_batch_agent_request(
+    *,
+    settings: Settings,
+    plan: ExecutionPlan,
+    candidates: list[ExecutionPlanItem],
+    account_context: _AccountContext,
+) -> ExecAgentBatchSizingRequest:
+    return ExecAgentBatchSizingRequest(
+        agent_id=getattr(settings, "exec_agent_id", OPENCLAW_EXEC_AGENT_ID),
+        model=getattr(settings, "exec_agent_model", OPENCLAW_EXEC_AGENT_MODEL),
+        plan_id=plan.external_plan_id,
+        market_date=plan.market_date.isoformat() if plan.market_date else None,
+        strategy_run_id=plan.strategy_run_id,
+        candidates=[
+            _build_agent_candidate(
+                plan=plan,
+                item=item,
+                source_identity=serialize_plan_item_source_identity(item),
+            )
+            for item in candidates
+        ],
+        account=_agent_account_payload(account_context),
+        portfolio=_agent_portfolio_payload(account_context),
+        risk_caps=_agent_risk_caps(settings),
+    )
 
 
 def _build_agent_request(
@@ -973,6 +1182,36 @@ def _build_agent_request(
     account_context: _AccountContext,
     source_identity: dict[str, object],
 ) -> ExecAgentSizingRequest:
+    candidate = _build_agent_candidate(
+        plan=plan,
+        item=item,
+        source_identity=source_identity,
+    )
+    return ExecAgentSizingRequest(
+        agent_id=getattr(settings, "exec_agent_id", OPENCLAW_EXEC_AGENT_ID),
+        model=getattr(settings, "exec_agent_model", OPENCLAW_EXEC_AGENT_MODEL),
+        plan_id=plan.external_plan_id,
+        execution_plan_item_id=item.id,
+        symbol=item.symbol,
+        side=item.side,
+        intent=item.intent,
+        source_identity=source_identity,
+        candidate_context=candidate.candidate_context,
+        decider_input=candidate.decider_input,
+        decider_output=candidate.decider_output,
+        account=_agent_account_payload(account_context),
+        portfolio=_agent_portfolio_payload(account_context),
+        market_data=candidate.market_data,
+        risk_caps=_agent_risk_caps(settings),
+    )
+
+
+def _build_agent_candidate(
+    *,
+    plan: ExecutionPlan,
+    item: ExecutionPlanItem,
+    source_identity: dict[str, object],
+) -> ExecAgentAllocationCandidate:
     risk_context = item.risk_context if isinstance(item.risk_context, dict) else {}
     quantity_policy = item.quantity_policy if isinstance(item.quantity_policy, dict) else {}
     candidate_context = {
@@ -984,11 +1223,7 @@ def _build_agent_request(
         "market_date": plan.market_date.isoformat() if plan.market_date else None,
         "strategy_run_id": plan.strategy_run_id,
     }
-    account_payload = dict(account_context.snapshot_payload or {})
-    return ExecAgentSizingRequest(
-        agent_id=getattr(settings, "exec_agent_id", OPENCLAW_EXEC_AGENT_ID),
-        model=getattr(settings, "exec_agent_model", OPENCLAW_EXEC_AGENT_MODEL),
-        plan_id=plan.external_plan_id,
+    return ExecAgentAllocationCandidate(
         execution_plan_item_id=item.id,
         symbol=item.symbol,
         side=item.side,
@@ -997,24 +1232,34 @@ def _build_agent_request(
         candidate_context=candidate_context,
         decider_input=_dict_or_none(risk_context.get("decider_input")),
         decider_output=_dict_or_none(risk_context.get("decider_output")),
-        account=account_payload,
-        portfolio={
-            "holdings_by_symbol": account_context.holdings_by_symbol,
-            "open_orders": [order.__dict__ for order in account_context.open_orders],
-        },
         market_data=_dict_or_none(risk_context.get("market_data"))
         or _dict_or_none(risk_context.get("quote"))
         or _dict_or_none(risk_context.get("orderbook")),
-        risk_caps={
-            "max_symbol_budget": _serialize_decimal(
-                _settings_decimal(settings, "exec_agent_max_symbol_budget", Decimal("1000000"))
-            ),
-            "max_total_budget": _serialize_decimal(
-                _settings_decimal(settings, "exec_agent_max_total_budget", Decimal("3000000"))
-            ),
-            "max_holding_trading_sessions": getattr(settings, "exec_agent_max_holding_trading_sessions", 3),
-        },
     )
+
+
+def _agent_account_payload(account_context: _AccountContext) -> dict[str, object]:
+    return dict(account_context.snapshot_payload or {})
+
+
+def _agent_portfolio_payload(account_context: _AccountContext) -> dict[str, object]:
+    return {
+        "holdings_by_symbol": dict(account_context.holdings_by_symbol),
+        "open_orders": [_serialize_open_order(order) for order in account_context.open_orders],
+    }
+
+
+def _agent_risk_caps(settings: Settings) -> dict[str, object]:
+    return {
+        "max_symbol_budget": _serialize_decimal(
+            _settings_decimal(settings, "exec_agent_max_symbol_budget", Decimal("1000000"))
+        ),
+        "max_total_budget": _serialize_decimal(
+            _settings_decimal(settings, "exec_agent_max_total_budget", Decimal("3000000"))
+        ),
+        "max_holding_trading_sessions": getattr(settings, "exec_agent_max_holding_trading_sessions", 3),
+        "max_account_snapshot_age_seconds": getattr(settings, "exec_agent_max_account_snapshot_age_seconds", 300),
+    }
 
 
 def _contract_from_agent_response(response: ExecAgentSizingResponse) -> ShortTermExecAgentContract:
@@ -1326,6 +1571,7 @@ def _serialize_account_snapshot(snapshot: BrokerAccountSnapshot) -> dict[str, ob
         "source": snapshot.source,
         "observed_at": snapshot.observed_at.isoformat(),
         "available_cash": _serialize_decimal(snapshot.available_cash),
+        "buying_power": _serialize_decimal(snapshot.buying_power),
         "holding_count": len(snapshot.holdings),
         "open_order_count": len(snapshot.open_orders),
         "holdings": [
@@ -1337,20 +1583,22 @@ def _serialize_account_snapshot(snapshot: BrokerAccountSnapshot) -> dict[str, ob
             }
             for holding in snapshot.holdings
         ],
-        "open_orders": [
-            {
-                "symbol": order.symbol,
-                "side": order.side,
-                "quantity": order.quantity,
-                "remaining_quantity": order.remaining_quantity,
-                "status": order.status,
-                "broker_order_id": order.broker_order_id,
-                "idempotency_key": order.idempotency_key,
-                "source_candidate_id": order.source_candidate_id,
-                "limit_price": _serialize_decimal(order.limit_price),
-            }
-            for order in snapshot.open_orders
-        ],
+        "open_orders": [_serialize_open_order(order) for order in snapshot.open_orders],
+    }
+
+
+def _serialize_open_order(order: BrokerAccountOpenOrder) -> dict[str, object]:
+    return {
+        "symbol": order.symbol,
+        "side": order.side,
+        "quantity": order.quantity,
+        "remaining_quantity": order.remaining_quantity,
+        "status": order.status,
+        "broker_order_id": order.broker_order_id,
+        "idempotency_key": order.idempotency_key,
+        "source_candidate_id": order.source_candidate_id,
+        "limit_price": _serialize_decimal(order.limit_price),
+        "payload": order.payload,
     }
 
 
