@@ -1118,6 +1118,29 @@ def test_openclaw_exec_agent_unavailable_fails_closed_when_contract_missing() ->
     engine.dispose()
 
 
+def test_short_term_auto_buy_fails_closed_when_automation_enabled_without_contract() -> None:
+    adapter = StubBrokerAdapter(available_cash=Decimal("800000"))
+    app, engine = build_test_app(adapter)
+    app.state.settings = app.state.settings.model_copy(update={"automation_enabled": True})
+    client = TestClient(app)
+    payload = short_term_plan_payload(exec_agent_decision={"remove": "contract"})
+    payload["items"][0]["risk_context"] = {"decider_output": {"score": 6.5}}
+
+    response = client.post("/execution-plans", json=payload)
+
+    assert response.status_code == 201
+    assert response.json()["exec_agent"]["evaluated_count"] == 1
+    assert response.json()["exec_agent"]["approved_count"] == 0
+    assert response.json()["exec_agent"]["rejected_count"] == 1
+    item = client.get("/execution-plans").json()[0]["items"][0]
+    assert item["status"] == "exec_agent_rejected"
+    assert item["risk_context"]["exec_agent_decision"]["reason_code"] == "missing_exec_agent_contract"
+    assert client.get("/execution-jobs").json() == []
+    assert adapter.order_calls == []
+
+    engine.dispose()
+
+
 def test_max_holding_close_exit_is_monitored_across_days_and_submits_sell() -> None:
     adapter = StubBrokerAdapter(available_cash=Decimal("500000"))
     app, engine = build_test_app(adapter)

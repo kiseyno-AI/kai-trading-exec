@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
@@ -21,6 +22,8 @@ from app.services.runtime_controls import (
     ensure_runtime_control_state,
     runtime_safety_payload,
 )
+
+LOGGER = logging.getLogger(__name__)
 
 KRX_TIMEZONE = ZoneInfo("Asia/Seoul")
 NEXT_OPEN_BUY_JOB_TYPE = "next_open_buy"
@@ -66,13 +69,24 @@ def materialize_execution_jobs(plan: ExecutionPlan) -> None:
             item.status = "next_open_buy_pending_configuration"
             continue
         item.status = "next_open_buy_scheduled"
+        scheduled_for = _next_market_open_utc(plan.market_date)
         item.jobs.append(
             ExecutionJob(
                 id=new_id(),
                 job_type=NEXT_OPEN_BUY_JOB_TYPE,
                 status="scheduled",
-                scheduled_for=_next_market_open_utc(plan.market_date),
+                scheduled_for=scheduled_for,
             )
+        )
+        LOGGER.info(
+            "execution_job_created",
+            extra={
+                "plan_id": plan.external_plan_id,
+                "execution_plan_item_id": item.id,
+                "symbol": item.symbol,
+                "job_type": NEXT_OPEN_BUY_JOB_TYPE,
+                "scheduled_for": scheduled_for.isoformat(),
+            },
         )
 
 

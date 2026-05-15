@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
@@ -28,6 +29,7 @@ EXEC_AGENT_CONTRACT_KEYS = (
     "short_term_exec_agent_decision",
 )
 EXEC_AGENT_DECISION_VERSION = "short-term-exec-agent-v1"
+LOGGER = logging.getLogger(__name__)
 OPENCLAW_EXEC_AGENT_ID = "exec-agent"
 OPENCLAW_EXEC_AGENT_MODEL = "openai-codex/gpt-5.5"
 OPEN_BUY_ORDER_STATUSES = frozenset(
@@ -269,7 +271,9 @@ class _InvalidAgentContract(ValueError):
 
 
 class _MissingAgentContract(ValueError):
-    pass
+    def __init__(self, message: str, *, reason_code: str = "exec_agent_unavailable") -> None:
+        super().__init__(message)
+        self.reason_code = reason_code
 
 
 _AgentContractResolution = ShortTermExecAgentContract | _MissingAgentContract | _InvalidAgentContract
@@ -287,7 +291,11 @@ def apply_short_term_exec_agent_decisions(
         item
         for item in plan.items
         if _is_short_term_buy_candidate(item)
-        and (getattr(settings, "exec_agent_enabled", False) or _has_agent_contract(item))
+        and (
+            getattr(settings, "exec_agent_enabled", False)
+            or getattr(settings, "automation_enabled", False)
+            or _has_agent_contract(item)
+        )
     ]
     if not candidates:
         return ExecAgentApplicationResult(
@@ -298,6 +306,17 @@ def apply_short_term_exec_agent_decisions(
             decisions=[],
         )
 
+    LOGGER.info(
+        "short_term_decider_candidates_loaded",
+        extra={
+            "candidate_count": len(candidates),
+            "execution_phase": "next_open",
+            "trade_date": plan.market_date.isoformat() if plan.market_date else None,
+            "plan_id": plan.external_plan_id,
+            "automation_enabled": getattr(settings, "automation_enabled", False),
+            "exec_agent_enabled": getattr(settings, "exec_agent_enabled", False),
+        },
+    )
     account_context = _load_account_context(
         settings=settings,
         db=db,
@@ -348,6 +367,16 @@ def apply_short_term_exec_agent_decisions(
         rejected_count += 1
         _apply_rejected_decision(item=item, decision=decision)
 
+    LOGGER.info(
+        "short_term_decider_auto_buy_evaluated",
+        extra={
+            "candidate_count": len(candidates),
+            "approved_count": approved_count,
+            "rejected_count": rejected_count,
+            "plan_id": plan.external_plan_id,
+            "trade_date": plan.market_date.isoformat() if plan.market_date else None,
+        },
+    )
     return ExecAgentApplicationResult(
         evaluated_count=len(candidates),
         approved_count=approved_count,
@@ -515,7 +544,7 @@ def _decide_candidate(
             "OpenClaw exec-agent did not return a decision for this candidate",
         )
     if isinstance(agent_contract_result, _MissingAgentContract):
-        return _reject(base, "exec_agent_unavailable", str(agent_contract_result))
+        return _reject(base, agent_contract_result.reason_code, str(agent_contract_result))
     if isinstance(agent_contract_result, _InvalidAgentContract):
         return _reject(base, "invalid_agent_output", str(agent_contract_result))
     agent_contract = agent_contract_result
@@ -1006,7 +1035,8 @@ def _resolve_agent_contracts(
 
     if not exec_agent_enabled:
         missing = _MissingAgentContract(
-            "OpenClaw exec-agent is disabled and no precomputed exec_agent_decision was supplied"
+            "short-term auto-buy requires a precomputed exec_agent_decision when OpenClaw exec-agent is disabled",
+            reason_code="missing_exec_agent_contract",
         )
         for item in missing_contract_items:
             results[item.id] = missing
