@@ -17,9 +17,16 @@ from app.broker.base import (
     BrokerAdapterError,
 )
 from app.core.config import Settings
-from app.models.runtime import BrokerOrder, ExecutionPlan, ExecutionPlanItem, ExecutionPosition
+from app.models.runtime import (
+    BrokerOrder,
+    ExecutionPlan,
+    ExecutionPlanItem,
+    ExecutionPosition,
+    RuntimeControlState,
+)
 from app.services.broker_auth import ensure_authenticated_broker_session
 from app.services.plan_item_identity import serialize_plan_item_source_identity
+from app.services.runtime_controls import RUNTIME_CONTROL_ID, effective_automation_enabled
 
 SHORT_TERM_DECIDER_NAME = "short-term-decider"
 SUPPORTED_SHORT_TERM_BUY_INTENTS = frozenset({"next_open_buy"})
@@ -279,6 +286,14 @@ class _MissingAgentContract(ValueError):
 _AgentContractResolution = ShortTermExecAgentContract | _MissingAgentContract | _InvalidAgentContract
 
 
+def _short_term_auto_buy_evaluation_enabled(*, settings: Settings, db: Session) -> bool:
+    if getattr(settings, "automation_enabled", False):
+        return True
+
+    state = db.get(RuntimeControlState, RUNTIME_CONTROL_ID)
+    return bool(state is not None and effective_automation_enabled(state))
+
+
 def apply_short_term_exec_agent_decisions(
     *,
     settings: Settings,
@@ -287,13 +302,14 @@ def apply_short_term_exec_agent_decisions(
     plan: ExecutionPlan,
     exec_agent_client: ExecAgentClient | None = None,
 ) -> ExecAgentApplicationResult:
+    automation_enabled = _short_term_auto_buy_evaluation_enabled(settings=settings, db=db)
     candidates = [
         item
         for item in plan.items
         if _is_short_term_buy_candidate(item)
         and (
             getattr(settings, "exec_agent_enabled", False)
-            or getattr(settings, "automation_enabled", False)
+            or (automation_enabled and _has_decider_output(item))
             or _has_agent_contract(item)
         )
     ]
@@ -313,7 +329,7 @@ def apply_short_term_exec_agent_decisions(
             "execution_phase": "next_open",
             "trade_date": plan.market_date.isoformat() if plan.market_date else None,
             "plan_id": plan.external_plan_id,
-            "automation_enabled": getattr(settings, "automation_enabled", False),
+            "automation_enabled": automation_enabled,
             "exec_agent_enabled": getattr(settings, "exec_agent_enabled", False),
         },
     )
@@ -403,6 +419,10 @@ def _has_agent_contract(item: ExecutionPlanItem) -> bool:
         if any(key in payload for key in EXEC_AGENT_CONTRACT_KEYS):
             return True
     return False
+
+
+def _has_decider_output(item: ExecutionPlanItem) -> bool:
+    return isinstance(item.risk_context, dict) and isinstance(item.risk_context.get("decider_output"), dict)
 
 
 def _load_account_context(

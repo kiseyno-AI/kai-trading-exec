@@ -1118,11 +1118,14 @@ def test_openclaw_exec_agent_unavailable_fails_closed_when_contract_missing() ->
     engine.dispose()
 
 
-def test_short_term_auto_buy_fails_closed_when_automation_enabled_without_contract() -> None:
+def test_short_term_auto_buy_fails_closed_when_runtime_resumed_without_contract() -> None:
     adapter = StubBrokerAdapter(available_cash=Decimal("800000"))
     app, engine = build_test_app(adapter)
-    app.state.settings = app.state.settings.model_copy(update={"automation_enabled": True})
     client = TestClient(app)
+    resume_response = client.post("/controls/resume", json={"actor": "ops", "source": "test"})
+    assert resume_response.status_code == 200
+    assert resume_response.json()["safety"]["automation_enabled"] is True
+    assert app.state.settings.automation_enabled is False
     payload = short_term_plan_payload(exec_agent_decision={"remove": "contract"})
     payload["items"][0]["risk_context"] = {"decider_output": {"score": 6.5}}
 
