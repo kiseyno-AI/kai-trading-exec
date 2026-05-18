@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
+from decimal import Decimal
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
@@ -483,15 +484,32 @@ def _next_open_buy_quantity(plan_item: ExecutionPlanItem) -> int | None:
     quantity_policy = plan_item.quantity_policy
     if not isinstance(quantity_policy, dict):
         return None
-    if quantity_policy.get("kind") != "shares":
+
+    kind = quantity_policy.get("kind") or quantity_policy.get("type")
+    if kind in {"shares", "fixed_quantity"}:
+        return _parse_positive_int(quantity_policy.get("quantity"))
+
+    if kind == "exec_agent_sized":
+        return _parse_positive_int(
+            quantity_policy.get("quantity")
+            or quantity_policy.get("planned_quantity")
+            or quantity_policy.get("computed_quantity")
+        )
+
+    return None
+
+
+def _parse_positive_int(value: object) -> int | None:
+    if isinstance(value, bool) or value is None:
         return None
-    quantity = quantity_policy.get("quantity")
-    if isinstance(quantity, bool):
-        return None
-    if isinstance(quantity, int) and quantity > 0:
-        return quantity
-    if isinstance(quantity, str) and quantity.isdigit() and int(quantity) > 0:
-        return int(quantity)
+    if isinstance(value, int) and value > 0:
+        return value
+    if isinstance(value, Decimal) and value == value.to_integral_value() and value > 0:
+        return int(value)
+    if isinstance(value, str):
+        normalized = value.strip()
+        if normalized.isdigit() and int(normalized) > 0:
+            return int(normalized)
     return None
 
 

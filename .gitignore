@@ -14,3 +14,4 @@ ruff_cache/
 dist/
 build/
 var/
+*.log

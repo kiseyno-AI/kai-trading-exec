@@ -33,6 +33,9 @@ class Settings(BaseModel):
     exec_agent_max_total_budget: Decimal = Field(default=Decimal("3000000"), gt=0)
     exec_agent_max_account_snapshot_age_seconds: int = Field(default=300, ge=1, le=86400)
     exec_agent_max_holding_trading_sessions: int = Field(default=3, ge=1, le=20)
+    openclaw_base_url: str | None = None
+    openclaw_gateway_token: str | None = None
+    openclaw_agent_timeout_seconds: int = Field(default=120, ge=1, le=600)
     kis_app_key: str | None = None
     kis_app_secret: str | None = None
     kis_account_number: str | None = None
@@ -76,6 +79,9 @@ _ENV_FIELDS = {
     "EXEC_AGENT_MAX_TOTAL_BUDGET": "exec_agent_max_total_budget",
     "EXEC_AGENT_MAX_ACCOUNT_SNAPSHOT_AGE_SECONDS": "exec_agent_max_account_snapshot_age_seconds",
     "EXEC_AGENT_MAX_HOLDING_TRADING_SESSIONS": "exec_agent_max_holding_trading_sessions",
+    "OPENCLAW_BASE_URL": "openclaw_base_url",
+    "OPENCLAW_GATEWAY_TOKEN": "openclaw_gateway_token",
+    "OPENCLAW_AGENT_TIMEOUT_SECONDS": "openclaw_agent_timeout_seconds",
     "KIS_APP_KEY": "kis_app_key",
     "KIS_APP_SECRET": "kis_app_secret",
     "KIS_ACCOUNT_NUMBER": "kis_account_number",

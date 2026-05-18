@@ -1680,6 +1680,118 @@ def test_short_term_buy_items_are_safely_blocked_from_scheduling() -> None:
     engine.dispose()
 
 
+def test_short_term_exec_agent_sized_without_agent_quantity_does_not_materialize() -> None:
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+        ),
+    )
+    client = TestClient(app)
+
+    response = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-short-term-exec-sized-entry-1",
+            "source": "kai-trading-core",
+            "market_date": "2024-01-03",
+            "items": [
+                {
+                    "symbol": "005930",
+                    "side": "buy",
+                    "intent": "next_open_buy",
+                    "quantity_policy": {
+                        "type": "exec_agent_sized",
+                        "budget_krw": "150000",
+                        "estimated_reference_price": 71000,
+                    },
+                    "decision_agent_name": "short-term-decider",
+                    "source_plan_item_id": "core-short-term-exec-sized-entry-1",
+                },
+            ],
+        },
+    )
+    assert response.status_code == 201
+
+    item = client.get("/execution-plans").json()[0]["items"][0]
+    assert item["status"] == "next_open_buy_pending_configuration"
+    assert client.get("/execution-jobs").json() == []
+
+    engine.dispose()
+
+
+def test_short_term_exec_agent_approved_quantity_materializes() -> None:
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(),
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="***",
+            kis_app_secret="***",
+            kis_account_number="12345678",
+        ),
+        broker_adapter=broker_adapter,
+    )
+    client = TestClient(app)
+
+    response = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-short-term-agent-approved-entry-1",
+            "source": "kai-trading-core",
+            "market_date": "2024-01-03",
+            "items": [
+                {
+                    "symbol": "005930",
+                    "side": "buy",
+                    "intent": "next_open_buy",
+                    "quantity_policy": {
+                        "type": "exec_agent_sized",
+                        "budget_krw": "0.00",
+                        "estimated_reference_price": 71000,
+                    },
+                    "risk_context": {
+                        "exec_agent_decision": {
+                            "action": "approve",
+                            "confidence": "0.80",
+                            "max_budget": "150000",
+                            "max_quantity": 2,
+                            "reference_price": "71000",
+                            "target_price": "76000",
+                            "stop_price": "69000",
+                            "reason": "agent approved exactly two shares",
+                        }
+                    },
+                    "decision_agent_name": "short-term-decider",
+                    "source_plan_item_id": "core-short-term-agent-approved-entry-1",
+                },
+            ],
+        },
+    )
+    assert response.status_code == 201
+    assert response.json()["exec_agent"]["approved_count"] == 1
+
+    item = client.get("/execution-plans").json()[0]["items"][0]
+    assert item["status"] == "next_open_buy_scheduled"
+    assert item["quantity_policy"]["kind"] == "shares"
+    assert item["quantity_policy"]["quantity"] == 2
+
+    jobs_payload = client.get("/execution-jobs").json()
+    assert len(jobs_payload) == 1
+    assert jobs_payload[0]["status"] == "scheduled"
+
+    engine.dispose()
+
+
 def _create_short_term_watcher_candidate(client: TestClient) -> str:
     response = client.post(
         "/execution-plans",

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
 import logging
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
@@ -243,6 +246,203 @@ class UnavailableExecAgentClient:
     def size_candidate(self, request: ExecAgentSizingRequest) -> ExecAgentSizingResponse:
         del request
         raise ExecAgentUnavailable("OpenClaw exec-agent transport is not configured")
+
+
+class OpenClawExecAgentClient:
+    def __init__(self, *, base_url: str, gateway_token: str | None, timeout_seconds: int) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.gateway_token = gateway_token
+        self.timeout_seconds = timeout_seconds
+
+    def size_candidates(self, request: ExecAgentBatchSizingRequest) -> ExecAgentBatchSizingResponse:
+        prompt = _openclaw_batch_sizing_prompt(request)
+        payload = {
+            "model": f"openclaw/{request.agent_id}",
+            "input": prompt,
+            "max_output_tokens": 6000,
+            "user": f"kai-trading-exec:{request.plan_id}",
+        }
+        headers = {
+            "Content-Type": "application/json",
+            "x-openclaw-agent-id": request.agent_id,
+            "x-openclaw-model": request.model,
+        }
+        if self.gateway_token:
+            headers["Authorization"] = f"Bearer {self.gateway_token}"
+        http_request = urllib.request.Request(
+            f"{self.base_url}/v1/responses",
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(http_request, timeout=self.timeout_seconds) as response:
+                response_payload = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")[:500]
+            raise ExecAgentUnavailable(f"OpenClaw responses request failed with HTTP {exc.code}: {body}") from exc
+        except Exception as exc:
+            raise ExecAgentUnavailable(f"OpenClaw responses request failed: {exc}") from exc
+        return ExecAgentBatchSizingResponse.model_validate(_extract_openclaw_json(response_payload))
+
+
+def _openclaw_exec_agent_client_from_settings(settings: Settings) -> ExecAgentClient | None:
+    base_url = getattr(settings, "openclaw_base_url", None)
+    if not isinstance(base_url, str) or not base_url.strip():
+        return None
+    token = getattr(settings, "openclaw_gateway_token", None)
+    return OpenClawExecAgentClient(
+        base_url=base_url.strip(),
+        gateway_token=token.strip() if isinstance(token, str) and token.strip() else None,
+        timeout_seconds=int(getattr(settings, "openclaw_agent_timeout_seconds", 120)),
+    )
+
+
+def _openclaw_batch_sizing_prompt(request: ExecAgentBatchSizingRequest) -> str:
+    schema = {
+        "decisions": [
+            {
+                "execution_plan_item_id": "string from input",
+                "action": "approve or reject",
+                "quantity": "positive integer when approve, omit/null when reject",
+                "final_budget": "positive KRW number/string when approve, omit/null when reject",
+                "reference_price": "positive KRW number/string when approve, omit/null when reject",
+                "target_price": "positive KRW number/string when approve, omit/null when reject",
+                "stop_price": "positive KRW number/string when approve, omit/null when reject",
+                "confidence": "0..1 number",
+                "reasons": ["brief reason strings"],
+                "risk_flags": ["risk flag strings"],
+                "allow_existing_holding": "boolean; true only when approving an add-on/averaging-down buy despite existing holdings",
+                "explanation": {"brief": "optional object"},
+            }
+        ]
+    }
+    return (
+        "You are the KAI short-term execution sizing agent. Decide whether each next_open_buy "
+        "candidate should be bought, and if approved choose the exact share quantity and budget. "
+        "Existing holdings are not an automatic reject: approve add-on or averaging-down buys only when "
+        "the fresh setup, risk/reward, cash, concentration, and exit levels justify increasing exposure; "
+        "set allow_existing_holding=true for those approvals. Reject existing holdings when adding exposure "
+        "is not clearly justified. Reject candidates that should not be bought. Do not delegate sizing back "
+        "to the caller. Return ONLY valid JSON matching this schema; no markdown, no prose.\n\n"
+        f"RESPONSE_SCHEMA:\n{json.dumps(schema, ensure_ascii=False)}\n\n"
+        f"REQUEST_JSON:\n{json.dumps(_compact_batch_sizing_request(request), ensure_ascii=False, default=str)}"
+    )
+
+
+def _compact_batch_sizing_request(request: ExecAgentBatchSizingRequest) -> dict[str, Any]:
+    return {
+        "version": request.version,
+        "plan_id": request.plan_id,
+        "market_date": request.market_date,
+        "strategy_run_id": request.strategy_run_id,
+        "account": _compact_mapping(
+            request.account,
+            keys=("available", "observed_at", "available_cash", "buying_power", "holding_count", "open_order_count"),
+        ),
+        "portfolio": {
+            "holdings_by_symbol": request.portfolio.get("holdings_by_symbol", {}),
+            "open_order_symbols": [
+                order.get("symbol")
+                for order in request.portfolio.get("open_orders", [])
+                if isinstance(order, dict) and order.get("symbol")
+            ],
+        },
+        "risk_caps": request.risk_caps,
+        "candidates": [_compact_candidate(candidate) for candidate in request.candidates],
+    }
+
+
+def _compact_candidate(candidate: ExecAgentAllocationCandidate) -> dict[str, Any]:
+    context = candidate.candidate_context if isinstance(candidate.candidate_context, dict) else {}
+    risk_context = context.get("risk_context") if isinstance(context.get("risk_context"), dict) else {}
+    quantity_policy = context.get("quantity_policy") if isinstance(context.get("quantity_policy"), dict) else {}
+    return {
+        "execution_plan_item_id": candidate.execution_plan_item_id,
+        "symbol": candidate.symbol,
+        "side": candidate.side,
+        "intent": candidate.intent,
+        "source_identity": _compact_mapping(
+            candidate.source_identity,
+            keys=("decision_agent_name", "decision_snapshot_id", "decision_run_id", "source_plan_item_id", "source_market_date"),
+        ),
+        "quantity_policy": _compact_mapping(
+            quantity_policy,
+            keys=(
+                "type",
+                "kind",
+                "budget_krw",
+                "allocation_mode",
+                "estimated_reference_price",
+                "estimated_notional_krw",
+            ),
+        ),
+        "risk_context": _compact_mapping(
+            risk_context,
+            keys=(
+                "target_price",
+                "stop_loss_price",
+                "allocation_budget_krw",
+                "confidence_score_10",
+                "conviction_score_10",
+                "expected_return_pct",
+                "suggested_holding_period",
+                "thesis_summary",
+                "supporting_evidence",
+                "decision_risks",
+                "invalidation_conditions",
+                "data_quality_warnings",
+            ),
+        ),
+        "decider_output": _compact_mapping(
+            candidate.decider_output or {},
+            keys=("target_price", "stop_loss_price", "confidence_score_10", "conviction_score_10", "summary"),
+        ),
+        "market_data": _compact_mapping(
+            candidate.market_data or {},
+            keys=("current_price", "previous_close", "as_of_market_date", "freshness_status"),
+        ),
+    }
+
+
+def _compact_mapping(value: dict[str, Any], *, keys: tuple[str, ...]) -> dict[str, Any]:
+    return {key: value[key] for key in keys if key in value and value[key] is not None}
+
+
+def _extract_openclaw_json(response_payload: dict[str, Any]) -> dict[str, Any]:
+    text = response_payload.get("output_text")
+    if not isinstance(text, str) or not text.strip():
+        fragments: list[str] = []
+        for item in response_payload.get("output", []) if isinstance(response_payload.get("output"), list) else []:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "message":
+                for part in item.get("content", []) if isinstance(item.get("content"), list) else []:
+                    if isinstance(part, dict):
+                        value = part.get("text") or part.get("output_text")
+                        if isinstance(value, str):
+                            fragments.append(value)
+            elif item.get("type") == "output_text" and isinstance(item.get("text"), str):
+                fragments.append(str(item["text"]))
+        text = "\n".join(fragments)
+    if not isinstance(text, str) or not text.strip():
+        raise ExecAgentUnavailable("OpenClaw exec-agent returned no text output")
+    raw = text.strip()
+    if raw.startswith("```"):
+        raw = raw.strip("`").strip()
+        if raw.lower().startswith("json"):
+            raw = raw[4:].strip()
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start < 0 or end <= start:
+            raise ExecAgentUnavailable("OpenClaw exec-agent returned non-JSON output") from exc
+        parsed = json.loads(raw[start : end + 1])
+    if not isinstance(parsed, dict):
+        raise ExecAgentUnavailable("OpenClaw exec-agent JSON output must be an object")
+    return parsed
 
 
 @dataclass(frozen=True)
@@ -1090,7 +1290,7 @@ def _request_batch_agent_contracts(
     account_context: _AccountContext,
     exec_agent_client: ExecAgentClient | None,
 ) -> dict[str, ShortTermExecAgentContract]:
-    client = exec_agent_client or UnavailableExecAgentClient()
+    client = exec_agent_client or _openclaw_exec_agent_client_from_settings(settings) or UnavailableExecAgentClient()
     request = _build_batch_agent_request(
         settings=settings,
         plan=plan,
