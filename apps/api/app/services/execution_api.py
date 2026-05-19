@@ -807,8 +807,15 @@ def _item_has_buy_chase_or_trigger_fields(item: ExecutionPlanItemRequest) -> boo
     payloads = [extras]
     if isinstance(item.risk_context, dict):
         payloads.append(item.risk_context)
+    if isinstance(item.quantity_policy, dict):
+        payloads.append(item.quantity_policy)
+    watch_buy_fields = (
+        CHASE_BUY_FIELDS
+        | BUY_TRIGGER_FIELDS
+        | frozenset(BUY_RECOMMENDATION_FIELDS)
+    )
     for payload in payloads:
-        for key in CHASE_BUY_FIELDS | BUY_TRIGGER_FIELDS:
+        for key in watch_buy_fields:
             if payload.get(key) is not None:
                 return True
     return False

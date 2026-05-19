@@ -1652,6 +1652,16 @@ def test_short_term_watch_buy_items_are_monitored_without_open_scheduling() -> N
                     "decision_agent_name": "short-term-decider",
                     "source_plan_item_id": "core-plain-next-open-entry-1",
                 },
+                {
+                    "symbol": "068270",
+                    "side": "buy",
+                    "intent": "next_open_buy",
+                    "quantity_policy": {"kind": "shares", "quantity": 4},
+                    "limit_price": "150000.00",
+                    "buy_recommendation_price": "149500.00",
+                    "decision_agent_name": "short-term-decider",
+                    "source_plan_item_id": "core-recommendation-only-entry-1",
+                },
             ],
         },
     )
@@ -1665,6 +1675,9 @@ def test_short_term_watch_buy_items_are_monitored_without_open_scheduling() -> N
     assert items_by_source["core-tactical-entry-1"]["status"] == "watch_monitoring_active"
     assert items_by_source["core-trigger-chase-entry-1"]["status"] == "watch_monitoring_active"
     assert items_by_source["core-plain-next-open-entry-1"]["status"] == "short_term_watcher_pending"
+    recommendation_only_item = items_by_source["core-recommendation-only-entry-1"]
+    assert recommendation_only_item["status"] == "watch_monitoring_active"
+    assert recommendation_only_item["trigger_price"] == "149500.0000"
 
     jobs_payload = client.get("/execution-jobs").json()
     assert jobs_payload == []
@@ -1896,7 +1909,7 @@ def test_watch_buy_rejects_stale_quote_without_submitting() -> None:
     engine.dispose()
 
 
-def test_watch_buy_respects_runtime_safety_pause() -> None:
+def test_watch_buy_safety_pause_keeps_trigger_retryable() -> None:
     app, engine, client, broker_adapter = _build_watch_buy_test_app(resume=False)
     item_id = _create_watch_buy_candidate(
         client,
@@ -1920,14 +1933,43 @@ def test_watch_buy_respects_runtime_safety_pause() -> None:
     assert payload["blocked_item_count"] == 1
     assert payload["items"][0]["outcome"] == "blocked"
     assert payload["items"][0]["block_reason"] == "paused"
+    assert payload["items"][0]["status"] == "watch_buy_triggered_blocked"
     assert broker_adapter.authenticate_calls == 0
     assert broker_adapter.order_calls == []
 
     with app.state.db_session_factory() as session:
         item = session.get(ExecutionPlanItem, item_id)
         assert item is not None
-        assert item.status == "watch_cancelled"
+        assert item.status == "watch_buy_triggered_blocked"
         assert item.risk_context["last_monitoring_event"]["reason"] == "paused"
+        assert (
+            item.risk_context["last_monitoring_event"]["event"]
+            == "watch_buy_triggered_blocked"
+        )
+
+    resume = client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "console", "reason": "resume automation"},
+    )
+    assert resume.status_code == 200
+
+    retry = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "resumed runtime should retry watch buy",
+            "prices": [{"symbol": "005930", "price": "71050.00"}],
+        },
+    )
+
+    assert retry.status_code == 200
+    retry_payload = retry.json()
+    assert retry_payload["triggered_item_count"] == 1
+    assert retry_payload["submitted_order_count"] == 1
+    assert retry_payload["items"][0]["outcome"] == "submitted"
+    assert retry_payload["items"][0]["status"] == "watch_buy_submitted"
+    assert len(broker_adapter.order_calls) == 1
 
     engine.dispose()
 

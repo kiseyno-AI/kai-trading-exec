@@ -35,6 +35,7 @@ WATCH_MONITORING_STATUSES = frozenset(
         "watch_buy_rejected",
         "watch_expired",
         "watch_cancelled",
+        "watch_buy_triggered_blocked",
         "watch_buy_triggered_pending_dispatch",
     }
 )
@@ -42,6 +43,7 @@ BLOCKED_MONITORING_STATUSES = frozenset(
     {
         "target_sell_triggered_blocked",
         "stop_sell_triggered_blocked",
+        "watch_buy_triggered_blocked",
         "watch_cancelled",
     }
 )
@@ -437,7 +439,7 @@ def _evaluate_monitoring_cycle(
             elif placement.status_code == 409 and "block_reason" in placement.payload:
                 blocked_item_count += 1
                 action.item.status = (
-                    "watch_cancelled"
+                    "watch_buy_triggered_blocked"
                     if is_watch_buy
                     else f"{action.item.intent}_triggered_blocked"
                 )
@@ -445,7 +447,7 @@ def _evaluate_monitoring_cycle(
                     _record_monitoring_event(
                         item=action.item,
                         event={
-                            "event": "watch_cancelled",
+                            "event": "watch_buy_triggered_blocked",
                             "reason": placement.payload.get("block_reason"),
                             "message": placement.payload.get("message"),
                             "observed_price": _serialize_decimal(action.observed_price),
