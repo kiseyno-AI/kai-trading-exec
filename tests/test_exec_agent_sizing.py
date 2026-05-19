@@ -254,6 +254,7 @@ def strict_exec_decision(
     context: dict[str, object] | None = None,
     target_price: str = "56000",
     stop_price: str = "47000",
+    reward_risk: str | None = None,
     max_total_budget: str | None = None,
 ) -> dict[str, object]:
     decision_context = {"confirmation_signal": "momentum_continuation"}
@@ -269,6 +270,8 @@ def strict_exec_decision(
         "risk_flags": ["momentum_continuation"],
         "context": decision_context,
     }
+    if reward_risk is not None:
+        decision["reward_risk"] = reward_risk
     if max_total_budget is not None:
         decision["max_total_budget"] = max_total_budget
     return decision
@@ -650,6 +653,44 @@ def test_short_term_exec_agent_rejects_poor_reward_risk() -> None:
     assert adapter.order_calls == []
 
     engine.dispose()
+
+
+def test_short_term_exec_agent_rejects_invalid_exit_prices_despite_supplied_reward_risk() -> None:
+    invalid_exit_price_cases = [
+        {"target_price": "56000", "stop_price": "50000"},
+        {"target_price": "56000", "stop_price": "51000"},
+        {"target_price": "50000", "stop_price": "47000"},
+        {"target_price": "49000", "stop_price": "47000"},
+    ]
+
+    for index, case in enumerate(invalid_exit_price_cases, start=1):
+        adapter = StubBrokerAdapter(available_cash=Decimal("500000"))
+        app, engine = build_test_app(adapter)
+        client = TestClient(app)
+
+        response = client.post(
+            "/execution-plans",
+            json=short_term_plan_payload(
+                plan_id=f"plan-invalid-exit-price-{index}",
+                source_plan_item_id=f"watcher-invalid-exit-price-{index}",
+                exec_agent_decision=strict_exec_decision(
+                    "0.82",
+                    reward_risk="9.99",
+                    **case,
+                ),
+            ),
+        )
+
+        assert response.status_code == 201
+        item = client.get("/execution-plans").json()[0]["items"][0]
+        audit = item["risk_context"]["exec_agent_decision"]
+        assert item["status"] == "exec_agent_rejected"
+        assert audit["reason_code"] == "invalid_reward_risk_prices"
+        assert audit["reward_risk"] is None
+        assert audit["agent_contract"]["reward_risk"] == "9.99"
+        assert adapter.order_calls == []
+
+        engine.dispose()
 
 
 def test_short_term_exec_agent_accepts_high_confidence_relaxed_reward_risk() -> None:

@@ -746,7 +746,7 @@ def _decide_candidate(
         reference_price=sizing_price,
         target_price=agent_contract.target_price,
         stop_price=agent_contract.stop_price,
-    ) or agent_contract.reward_risk
+    )
     if reward_risk is None:
         return _reject(
             base,
