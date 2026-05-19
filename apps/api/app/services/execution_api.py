@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from collections import defaultdict
 from datetime import date, datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -25,6 +25,18 @@ from app.services.plan_item_identity import (
 )
 
 MONITORED_INTENTS = frozenset({"target_sell", "stop_sell"})
+WATCH_BUY_INTENTS = frozenset({"watch_buy", "trigger_buy", "chase_buy", "tactical_buy"})
+WATCH_MONITORING_STATUSES = frozenset(
+    {
+        "watch_monitoring_pending",
+        "watch_monitoring_active",
+        "watch_buy_triggered",
+        "watch_buy_submitted",
+        "watch_buy_rejected",
+        "watch_expired",
+        "watch_cancelled",
+    }
+)
 OPEN_ORDER_STATUSES = frozenset({"submitted", "open", "partially_filled"})
 SHORT_TERM_DECIDER_NAME = "short-term-decider"
 UNSUPPORTED_BUY_INTENTS = frozenset({"tactical_buy", "trigger_buy", "chase_buy"})
@@ -38,7 +50,14 @@ CHASE_BUY_FIELDS = frozenset(
         "entry_limit_price",
     }
 )
-BUY_TRIGGER_FIELDS = frozenset({"buy_trigger_price", "entry_trigger_price", "trigger_price"})
+BUY_RECOMMENDATION_FIELDS = (
+    "buy_recommendation_price",
+    "recommended_entry_price",
+    "entry_recommendation_price",
+    "recommendation_price",
+    "entry_price",
+)
+BUY_TRIGGER_FIELDS = frozenset({"watch_trigger_price", "buy_trigger_price", "entry_trigger_price", "trigger_price"})
 
 
 @dataclass(frozen=True)
@@ -167,26 +186,34 @@ def _build_execution_plan(
         requested_at=command.requested_at,
         raw_payload=command.model_dump(mode="json"),
         items=[
-            ExecutionPlanItem(
-                id=new_id(),
-                plan_item_index=index,
-                symbol=item.symbol,
-                side=item.side,
-                intent=item.intent,
-                status=_initial_plan_item_status(item),
-                quantity_policy=item.quantity_policy,
-                limit_price=item.limit_price,
-                trigger_price=item.trigger_price,
-                time_in_force=item.time_in_force,
-                risk_context=item.risk_context,
-                decision_agent_name=item.decision_agent_name,
-                decision_snapshot_id=item.decision_snapshot_id,
-                decision_run_id=item.decision_run_id,
-                source_plan_item_id=item.source_plan_item_id,
-                source_market_date=item.source_market_date,
-            )
+            _build_execution_plan_item(index=index, item=item)
             for index, item in enumerate(command.items)
         ],
+    )
+
+
+def _build_execution_plan_item(
+    *,
+    index: int,
+    item: ExecutionPlanItemRequest,
+) -> ExecutionPlanItem:
+    return ExecutionPlanItem(
+        id=new_id(),
+        plan_item_index=index,
+        symbol=item.symbol,
+        side=item.side,
+        intent=item.intent,
+        status=_initial_plan_item_status(item),
+        quantity_policy=item.quantity_policy,
+        limit_price=item.limit_price,
+        trigger_price=_plan_item_trigger_price(item),
+        time_in_force=item.time_in_force,
+        risk_context=_plan_item_risk_context(item),
+        decision_agent_name=item.decision_agent_name,
+        decision_snapshot_id=item.decision_snapshot_id,
+        decision_run_id=item.decision_run_id,
+        source_plan_item_id=item.source_plan_item_id,
+        source_market_date=item.source_market_date,
     )
 
 
@@ -314,7 +341,7 @@ def get_runtime_symbol_detail(
         {
             item.status
             for item in plan_items
-            if item.intent in MONITORED_INTENTS
+            if _is_runtime_monitored_item(item)
         }
     )
     return {
@@ -322,7 +349,7 @@ def get_runtime_symbol_detail(
         "mode": settings.runtime_mode,
         "summary": summary,
         "monitoring": {
-            "monitored": any(item.intent in MONITORED_INTENTS for item in plan_items),
+            "monitored": any(_is_runtime_monitored_item(item) for item in plan_items),
             "statuses": monitoring_statuses,
             "pending_dispatch_count": sum(
                 1
@@ -637,7 +664,7 @@ def _serialize_runtime_symbol_summary(
         {
             item.status
             for item in plan_items
-            if item.intent in MONITORED_INTENTS
+            if _is_runtime_monitored_item(item)
         }
     )
     latest_plan_item = _sort_plan_items_desc(plan_items)[0] if plan_items else None
@@ -663,7 +690,7 @@ def _serialize_runtime_symbol_summary(
     return {
         "symbol": symbol,
         "mode": settings.runtime_mode,
-        "monitored": any(item.intent in MONITORED_INTENTS for item in plan_items),
+        "monitored": any(_is_runtime_monitored_item(item) for item in plan_items),
         "monitoring_statuses": monitoring_statuses,
         "intents": sorted({item.intent for item in plan_items}),
         "plan_item_count": len(plan_items),
@@ -758,6 +785,10 @@ def _load_plan_items_by_symbol(
 def _initial_plan_item_status(item: ExecutionPlanItemRequest) -> str:
     if item.side != "buy":
         return "pending"
+    if _is_watch_buy_request(item):
+        if _watch_buy_trigger_price(item) is not None:
+            return "watch_monitoring_pending"
+        return "pending_configuration"
     if item.intent == "next_open_buy":
         if item.trigger_price is not None or _item_has_buy_chase_or_trigger_fields(item):
             return "pending_configuration"
@@ -788,3 +819,120 @@ def _decision_agent_name(item: ExecutionPlanItemRequest) -> str | None:
     if value is None:
         return None
     return value.strip().lower()
+
+
+def _is_watch_buy_request(item: ExecutionPlanItemRequest) -> bool:
+    if item.side != "buy":
+        return False
+    if item.intent in WATCH_BUY_INTENTS:
+        return True
+    return item.intent == "next_open_buy" and _item_has_buy_chase_or_trigger_fields(item)
+
+
+def _plan_item_trigger_price(item: ExecutionPlanItemRequest) -> Decimal | None:
+    if not _is_watch_buy_request(item):
+        return item.trigger_price
+    return _watch_buy_trigger_price(item) or item.trigger_price
+
+
+def _plan_item_risk_context(item: ExecutionPlanItemRequest) -> dict[str, object] | None:
+    risk_context = dict(item.risk_context) if isinstance(item.risk_context, dict) else item.risk_context
+    if not _is_watch_buy_request(item):
+        return risk_context
+
+    normalized = dict(risk_context or {})
+    extras = item.model_extra or {}
+    for key in (*BUY_RECOMMENDATION_FIELDS, *BUY_TRIGGER_FIELDS, *CHASE_BUY_FIELDS):
+        value = extras.get(key)
+        if value is not None and key not in normalized:
+            normalized[key] = _json_scalar(value)
+
+    trigger_source, trigger_price = _watch_buy_trigger_source_and_price(item)
+    chase_limit_price = _watch_buy_chase_limit_price(item)
+    normalized["watch_buy_monitoring"] = {
+        "received_intent": item.intent,
+        "trigger_source": trigger_source,
+        "trigger_price": _decimal_text(trigger_price),
+        "chase_limit_price": _decimal_text(chase_limit_price),
+        "direction": _watch_buy_direction(item),
+    }
+    return normalized
+
+
+def _watch_buy_trigger_price(item: ExecutionPlanItemRequest) -> Decimal | None:
+    return _watch_buy_trigger_source_and_price(item)[1]
+
+
+def _watch_buy_trigger_source_and_price(
+    item: ExecutionPlanItemRequest,
+) -> tuple[str | None, Decimal | None]:
+    for key in BUY_RECOMMENDATION_FIELDS:
+        value = _first_decimal_from_request(item, key)
+        if value is not None:
+            return key, value
+    if item.trigger_price is not None and item.trigger_price > 0:
+        return "trigger_price", item.trigger_price
+    for key in BUY_TRIGGER_FIELDS:
+        value = _first_decimal_from_request(item, key)
+        if value is not None:
+            return key, value
+    return None, None
+
+
+def _watch_buy_chase_limit_price(item: ExecutionPlanItemRequest) -> Decimal | None:
+    for key in ("chase_limit_price", "max_chase_limit_price", "entry_limit_price"):
+        value = _first_decimal_from_request(item, key)
+        if value is not None:
+            return value
+    return None
+
+
+def _first_decimal_from_request(
+    item: ExecutionPlanItemRequest,
+    key: str,
+) -> Decimal | None:
+    sources: list[object] = [item.model_extra or {}, item.risk_context, item.quantity_policy]
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        value = _parse_positive_decimal(source.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def _parse_positive_decimal(value: object) -> Decimal | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        parsed = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _watch_buy_direction(item: ExecutionPlanItemRequest) -> str:
+    for source in (item.model_extra or {}, item.risk_context, item.quantity_policy):
+        if not isinstance(source, dict):
+            continue
+        for key in ("trigger_direction", "entry_direction", "watch_direction", "direction"):
+            value = source.get(key)
+            if isinstance(value, str) and value.strip():
+                normalized = value.strip().lower()
+                if normalized in {"down", "below", "pullback", "dip", "<=", "at_or_below"}:
+                    return "at_or_below"
+    return "at_or_above"
+
+
+def _decimal_text(value: Decimal | None) -> str | None:
+    return f"{value:.4f}" if value is not None else None
+
+
+def _json_scalar(value: object) -> object:
+    if isinstance(value, Decimal):
+        return _decimal_text(value)
+    return value
+
+
+def _is_runtime_monitored_item(item: ExecutionPlanItem) -> bool:
+    return item.intent in MONITORED_INTENTS or item.status in WATCH_MONITORING_STATUSES

@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import distinct, func, select
+from sqlalchemy import distinct, func, or_, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -137,7 +137,10 @@ def runtime_symbol_summary(
         .join(ExecutionPlanItem.plan)
         .where(
             ExecutionPlan.mode == settings.runtime_mode,
-            ExecutionPlanItem.intent.in_(MONITORED_INTENTS),
+            or_(
+                ExecutionPlanItem.intent.in_(MONITORED_INTENTS),
+                ExecutionPlanItem.status.like("watch_%"),
+            ),
         )
     ).all()
     scheduled_today = db.scalars(

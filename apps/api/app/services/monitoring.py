@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session, selectinload
 
 from app.api.schemas.execution import (
@@ -23,17 +23,33 @@ from app.services.reconciliation import (
 from app.services.broker_orders import place_broker_order
 from app.services.plan_item_identity import serialize_plan_item_source_identity
 
-MONITORED_INTENTS = frozenset({"target_sell", "stop_sell", "max_holding_close_sell"})
+SELL_MONITORED_INTENTS = frozenset({"target_sell", "stop_sell", "max_holding_close_sell"})
+WATCH_BUY_INTENTS = frozenset({"watch_buy", "trigger_buy", "chase_buy", "tactical_buy", "next_open_buy"})
+MONITORED_INTENTS = SELL_MONITORED_INTENTS | WATCH_BUY_INTENTS
+WATCH_MONITORING_STATUSES = frozenset(
+    {
+        "watch_monitoring_pending",
+        "watch_monitoring_active",
+        "watch_buy_triggered",
+        "watch_buy_submitted",
+        "watch_buy_rejected",
+        "watch_expired",
+        "watch_cancelled",
+        "watch_buy_triggered_pending_dispatch",
+    }
+)
 BLOCKED_MONITORING_STATUSES = frozenset(
     {
         "target_sell_triggered_blocked",
         "stop_sell_triggered_blocked",
+        "watch_cancelled",
     }
 )
 PENDING_DISPATCH_MONITORING_STATUSES = frozenset(
     {
         "target_sell_triggered_pending_dispatch",
         "stop_sell_triggered_pending_dispatch",
+        "watch_buy_triggered_pending_dispatch",
     }
 )
 NON_MONITORABLE_PLAN_ITEM_STATUSES = frozenset(
@@ -53,6 +69,10 @@ NON_MONITORABLE_PLAN_ITEM_STATUSES = frozenset(
         "retry_pending",
         "rejected",
         "failed",
+        "watch_buy_submitted",
+        "watch_buy_rejected",
+        "watch_expired",
+        "watch_cancelled",
     }
 )
 MONITORING_WORKER_NAME = "intraday_target_stop_monitor"
@@ -72,9 +92,24 @@ class PendingMonitoringAction:
     observed_price: Decimal | None
 
 
+@dataclass(frozen=True)
+class WatchBuyOrderApproval:
+    quantity: int | None
+    reason: str | None = None
+    message: str | None = None
+
+
 def materialize_monitoring_plan_items(plan: ExecutionPlan) -> None:
     for item in plan.items:
-        if item.intent not in MONITORED_INTENTS or item.status != "pending":
+        if _is_watch_buy_item(item):
+            if item.status not in {"pending", "watch_monitoring_pending"}:
+                continue
+            if _monitoring_item_is_configured(item):
+                item.status = "watch_monitoring_active"
+                continue
+            item.status = "watch_monitoring_pending"
+            continue
+        if item.intent not in SELL_MONITORED_INTENTS or item.status != "pending":
             continue
         if _monitoring_item_is_configured(item):
             item.status = _monitoring_status(item.intent)
@@ -149,16 +184,21 @@ def _evaluate_monitoring_cycle(
 ) -> EvaluateMonitoringResult:
     items = _load_monitored_items(settings=settings, db=db)
     monitored_symbols = {item.symbol for item in items}
+    sell_monitored_symbols = {
+        item.symbol
+        for item in items
+        if not _is_watch_buy_item(item)
+    }
     _reconcile_before_monitoring(
         settings=settings,
         db=db,
         adapter=adapter,
-        symbols=monitored_symbols,
+        symbols=sell_monitored_symbols,
     )
     remaining_quantities_by_symbol = _load_remaining_quantities_by_symbol(
         settings=settings,
         db=db,
-        symbols=monitored_symbols,
+        symbols=sell_monitored_symbols,
     )
     result_by_item_id: dict[str, dict[str, object]] = {}
     evaluated_item_ids: list[str] = []
@@ -199,9 +239,42 @@ def _evaluate_monitoring_cycle(
                 item=item,
                 observed_price=observed_price,
                 outcome="invalid_configuration",
-                message="target/stop monitoring item is missing sell-side trigger configuration",
+                message=(
+                    "watch buy monitoring item is missing buy-side trigger or quantity configuration"
+                    if _is_watch_buy_item(item)
+                    else "target/stop monitoring item is missing sell-side trigger configuration"
+                ),
             )
             continue
+
+        if _is_watch_buy_item(item) and not retry_persisted_trigger:
+            quote_stale_reason = _quote_stale_reason(
+                settings=settings,
+                price=price,
+                cycle_at=triggered_at,
+            )
+            if quote_stale_reason is not None:
+                blocked_item_count += 1
+                if item.status != "watch_monitoring_active":
+                    item.status = "watch_monitoring_active"
+                _record_monitoring_event(
+                    item=item,
+                    event={
+                        "event": "watch_buy_quote_rejected",
+                        "reason": "stale_quote",
+                        "message": quote_stale_reason,
+                        "observed_price": _serialize_decimal(observed_price),
+                        "observed_at": _serialize_datetime(_price_observed_at(price, triggered_at)),
+                        "recorded_at": triggered_at.isoformat(),
+                    },
+                )
+                result_by_item_id[item.id] = _monitoring_result_payload(
+                    item=item,
+                    observed_price=observed_price,
+                    outcome="stale_quote",
+                    message=quote_stale_reason,
+                )
+                continue
 
         if not retry_persisted_trigger and not _is_triggered(item=item, observed_price=price.price if price is not None else None, triggered_at=triggered_at):
             if item.status in (
@@ -215,6 +288,32 @@ def _evaluate_monitoring_cycle(
                 message="trigger condition not met",
             )
             continue
+
+        if _is_watch_buy_item(item) and observed_price is not None:
+            chase_limit_price = _watch_buy_chase_limit_price(item)
+            if chase_limit_price is not None and observed_price > chase_limit_price:
+                triggered_item_count += 1
+                triggered_symbols.add(item.symbol)
+                blocked_item_count += 1
+                item.status = "watch_buy_rejected"
+                _record_monitoring_event(
+                    item=item,
+                    event={
+                        "event": "watch_buy_rejected",
+                        "reason": "price_above_chase_limit",
+                        "trigger_price": _serialize_decimal(_watch_buy_trigger_price(item)),
+                        "chase_limit_price": _serialize_decimal(chase_limit_price),
+                        "observed_price": _serialize_decimal(observed_price),
+                        "recorded_at": triggered_at.isoformat(),
+                    },
+                )
+                result_by_item_id[item.id] = _monitoring_result_payload(
+                    item=item,
+                    observed_price=observed_price,
+                    outcome="rejected",
+                    message="observed price is above chase_limit_price",
+                )
+                continue
 
         if retry_persisted_trigger:
             retried_triggered_item_count += 1
@@ -242,32 +341,60 @@ def _evaluate_monitoring_cycle(
             BLOCKED_MONITORING_STATUSES | PENDING_DISPATCH_MONITORING_STATUSES
         ):
             action.item.status = _monitoring_status(action.item.intent)
-        quantity = _resolve_sell_quantity(
-            item=action.item,
-            remaining_quantity=remaining_quantities_by_symbol.get(action.item.symbol),
-        )
-        if quantity is None:
-            reconciliation_error = _latest_reconciliation_error_for_symbol(
-                settings=settings,
-                db=db,
-                symbol=action.item.symbol,
-            )
-            result_by_item_id[action.item.id] = _monitoring_result_payload(
+        is_watch_buy = _is_watch_buy_item(action.item)
+        if is_watch_buy:
+            action.item.status = "watch_buy_triggered"
+            approval = _resolve_watch_buy_order(item=action.item)
+            quantity = approval.quantity
+            if quantity is None:
+                blocked_item_count += 1
+                action.item.status = "watch_buy_rejected"
+                _record_monitoring_event(
+                    item=action.item,
+                    event={
+                        "event": "watch_buy_rejected",
+                        "reason": approval.reason or "risk_rejected",
+                        "message": approval.message,
+                        "observed_price": _serialize_decimal(action.observed_price),
+                        "recorded_at": triggered_at.isoformat(),
+                    },
+                )
+                result_by_item_id[action.item.id] = _monitoring_result_payload(
+                    item=action.item,
+                    observed_price=action.observed_price,
+                    outcome="rejected",
+                    message=approval.message,
+                )
+                continue
+        else:
+            quantity = _resolve_sell_quantity(
                 item=action.item,
-                observed_price=action.observed_price,
-                outcome=(
-                    "reconciliation_blocked"
-                    if reconciliation_error is not None
-                    else "no_position"
-                ),
-                message=(
-                    "sellable position is unknown because broker reconciliation failed: "
-                    f"{reconciliation_error}"
-                    if reconciliation_error is not None
-                    else "no sellable execution position is available for this trigger"
-                ),
+                remaining_quantity=remaining_quantities_by_symbol.get(action.item.symbol),
             )
-        elif dispatch_action_count >= max_broker_actions:
+            if quantity is None:
+                reconciliation_error = _latest_reconciliation_error_for_symbol(
+                    settings=settings,
+                    db=db,
+                    symbol=action.item.symbol,
+                )
+                result_by_item_id[action.item.id] = _monitoring_result_payload(
+                    item=action.item,
+                    observed_price=action.observed_price,
+                    outcome=(
+                        "reconciliation_blocked"
+                        if reconciliation_error is not None
+                        else "no_position"
+                    ),
+                    message=(
+                        "sellable position is unknown because broker reconciliation failed: "
+                        f"{reconciliation_error}"
+                        if reconciliation_error is not None
+                        else "no sellable execution position is available for this trigger"
+                    ),
+                )
+                continue
+
+        if dispatch_action_count >= max_broker_actions:
             symbol_actions.appendleft(action)
             pending_symbols.appendleft(symbol)
             break
@@ -279,13 +406,26 @@ def _evaluate_monitoring_cycle(
                 adapter=adapter,
                 item=action.item,
                 quantity=quantity,
+                observed_price=action.observed_price,
             )
             if placement.status_code == 201:
-                _reserve_remaining_quantity(
-                    remaining_quantities_by_symbol=remaining_quantities_by_symbol,
-                    symbol=action.item.symbol,
-                    quantity=quantity,
-                )
+                if is_watch_buy:
+                    action.item.status = "watch_buy_submitted"
+                    _record_monitoring_event(
+                        item=action.item,
+                        event={
+                            "event": "watch_buy_submitted",
+                            "observed_price": _serialize_decimal(action.observed_price),
+                            "quantity": quantity,
+                            "recorded_at": triggered_at.isoformat(),
+                        },
+                    )
+                else:
+                    _reserve_remaining_quantity(
+                        remaining_quantities_by_symbol=remaining_quantities_by_symbol,
+                        symbol=action.item.symbol,
+                        quantity=quantity,
+                    )
                 submitted_order_count += 1
                 submitted_symbols.add(action.item.symbol)
                 result_by_item_id[action.item.id] = _monitoring_result_payload(
@@ -296,7 +436,22 @@ def _evaluate_monitoring_cycle(
                 )
             elif placement.status_code == 409 and "block_reason" in placement.payload:
                 blocked_item_count += 1
-                action.item.status = f"{action.item.intent}_triggered_blocked"
+                action.item.status = (
+                    "watch_cancelled"
+                    if is_watch_buy
+                    else f"{action.item.intent}_triggered_blocked"
+                )
+                if is_watch_buy:
+                    _record_monitoring_event(
+                        item=action.item,
+                        event={
+                            "event": "watch_cancelled",
+                            "reason": placement.payload.get("block_reason"),
+                            "message": placement.payload.get("message"),
+                            "observed_price": _serialize_decimal(action.observed_price),
+                            "recorded_at": triggered_at.isoformat(),
+                        },
+                    )
                 db.commit()
                 result_by_item_id[action.item.id] = _monitoring_result_payload(
                     item=action.item,
@@ -307,7 +462,9 @@ def _evaluate_monitoring_cycle(
                 )
             elif placement.payload.get("duplicate") is True:
                 duplicate_quantity = _serialized_order_quantity(placement.payload.get("order"))
-                if duplicate_quantity is not None:
+                if is_watch_buy:
+                    action.item.status = "watch_buy_submitted"
+                elif duplicate_quantity is not None:
                     _reserve_remaining_quantity(
                         remaining_quantities_by_symbol=remaining_quantities_by_symbol,
                         symbol=action.item.symbol,
@@ -321,6 +478,18 @@ def _evaluate_monitoring_cycle(
                     message=placement.payload.get("message"),
                 )
             else:
+                if is_watch_buy:
+                    action.item.status = "watch_buy_rejected"
+                    _record_monitoring_event(
+                        item=action.item,
+                        event={
+                            "event": "watch_buy_rejected",
+                            "reason": "order_submission_failed",
+                            "message": placement.payload.get("message"),
+                            "observed_price": _serialize_decimal(action.observed_price),
+                            "recorded_at": triggered_at.isoformat(),
+                        },
+                    )
                 result_by_item_id[action.item.id] = _monitoring_result_payload(
                     item=action.item,
                     observed_price=action.observed_price,
@@ -401,6 +570,7 @@ def _load_monitored_items(
     settings: Settings,
     db: Session,
 ) -> list[ExecutionPlanItem]:
+    monitored_item_filter = _monitored_item_filter()
     symbol_candidates = (
         select(
             ExecutionPlanItem.symbol.label("symbol"),
@@ -423,7 +593,7 @@ def _load_monitored_items(
         .join(ExecutionPlanItem.plan)
         .where(
             ExecutionPlan.mode == settings.runtime_mode,
-            ExecutionPlanItem.intent.in_(tuple(MONITORED_INTENTS)),
+            monitored_item_filter,
         )
         .subquery()
     )
@@ -444,7 +614,7 @@ def _load_monitored_items(
         .join(ExecutionPlanItem.plan)
         .where(
             ExecutionPlan.mode == settings.runtime_mode,
-            ExecutionPlanItem.intent.in_(tuple(MONITORED_INTENTS)),
+            monitored_item_filter,
             ExecutionPlanItem.symbol.in_(selected_symbols),
         )
         .options(selectinload(ExecutionPlanItem.plan))
@@ -455,6 +625,20 @@ def _load_monitored_items(
             ExecutionPlanItem.id.asc(),
         )
     ).all()
+
+
+def _monitored_item_filter():
+    return and_(
+        ~ExecutionPlanItem.status.in_(tuple(NON_MONITORABLE_PLAN_ITEM_STATUSES)),
+        or_(
+            ExecutionPlanItem.intent.in_(tuple(SELL_MONITORED_INTENTS)),
+            and_(
+                ExecutionPlanItem.side == "buy",
+                ExecutionPlanItem.intent.in_(tuple(WATCH_BUY_INTENTS)),
+                ExecutionPlanItem.status.in_(tuple(WATCH_MONITORING_STATUSES)),
+            ),
+        ),
+    )
 
 
 def _load_remaining_quantities_by_symbol(
@@ -559,6 +743,12 @@ def _positions_with_stale_local_state(
 
 
 def _monitoring_item_is_configured(item: ExecutionPlanItem) -> bool:
+    if _is_watch_buy_item(item):
+        return (
+            item.side == "buy"
+            and _watch_buy_trigger_price(item) is not None
+            and _parse_buy_quantity(item.quantity_policy) is not None
+        )
     if item.side != "sell" or not _quantity_policy_supported(item.quantity_policy):
         return False
     if item.intent == "max_holding_close_sell":
@@ -589,13 +779,21 @@ def _is_triggered(
 ) -> bool:
     if item.intent == "max_holding_close_sell":
         return _max_holding_exit_due(item=item, triggered_at=triggered_at)
-    trigger_price = item.trigger_price
+    trigger_price = (
+        _watch_buy_trigger_price(item)
+        if _is_watch_buy_item(item)
+        else item.trigger_price
+    )
     if trigger_price is None or observed_price is None:
         return False
     if item.intent == "target_sell":
         return observed_price >= trigger_price
     if item.intent == "stop_sell":
         return observed_price <= trigger_price
+    if _is_watch_buy_item(item):
+        if _watch_buy_direction(item) == "at_or_below":
+            return observed_price <= trigger_price
+        return observed_price >= trigger_price
     return False
 
 
@@ -645,15 +843,56 @@ def _resolve_sell_quantity(
     return None
 
 
+def _resolve_watch_buy_order(*, item: ExecutionPlanItem) -> WatchBuyOrderApproval:
+    decision = _exec_agent_decision(item)
+    if isinstance(decision, dict):
+        decision_value = str(
+            decision.get("decision") or decision.get("action") or ""
+        ).strip().lower()
+        if decision_value == "rejected" or decision_value == "reject":
+            return WatchBuyOrderApproval(
+                quantity=None,
+                reason=str(decision.get("reason") or "exec_agent_rejected"),
+                message="exec-agent/risk policy rejected this watch buy",
+            )
+
+    quantity = _parse_buy_quantity(item.quantity_policy)
+    if quantity is None and isinstance(decision, dict):
+        quantity = _parse_positive_int(
+            decision.get("approved_quantity") or decision.get("quantity")
+        )
+    if quantity is None:
+        return WatchBuyOrderApproval(
+            quantity=None,
+            reason="missing_quantity",
+            message="watch buy requires a positive share quantity from quantity_policy or exec-agent decision",
+        )
+    return WatchBuyOrderApproval(quantity=quantity)
+
+
+def _parse_buy_quantity(quantity_policy: dict[str, object] | None) -> int | None:
+    if not isinstance(quantity_policy, dict):
+        return None
+    if quantity_policy.get("kind") != "shares":
+        return None
+    return _parse_positive_int(quantity_policy.get("quantity"))
+
+
 def _monitoring_status(intent: str) -> str:
+    if intent in WATCH_BUY_INTENTS:
+        return "watch_monitoring_active"
     return f"{intent}_monitoring"
 
 
 def _pending_dispatch_status(intent: str) -> str:
+    if intent in WATCH_BUY_INTENTS:
+        return "watch_buy_triggered_pending_dispatch"
     return f"{intent}_triggered_pending_dispatch"
 
 
 def _pending_configuration_status(intent: str) -> str:
+    if intent in WATCH_BUY_INTENTS:
+        return "watch_monitoring_pending"
     return f"{intent}_pending_config"
 
 
@@ -697,6 +936,151 @@ def _parse_fraction(value: object) -> Decimal | None:
     if fraction <= 0 or fraction > 1:
         return None
     return fraction
+
+
+def _is_watch_buy_item(item: ExecutionPlanItem) -> bool:
+    return item.side == "buy" and (
+        item.intent in WATCH_BUY_INTENTS or item.status in WATCH_MONITORING_STATUSES
+    )
+
+
+def _watch_buy_trigger_price(item: ExecutionPlanItem) -> Decimal | None:
+    if item.trigger_price is not None and item.trigger_price > 0:
+        return item.trigger_price
+    return _first_positive_decimal_from_item(
+        item,
+        (
+            "buy_recommendation_price",
+            "recommended_entry_price",
+            "entry_recommendation_price",
+            "recommendation_price",
+            "entry_price",
+            "watch_trigger_price",
+            "buy_trigger_price",
+            "entry_trigger_price",
+        ),
+    )
+
+
+def _watch_buy_chase_limit_price(item: ExecutionPlanItem) -> Decimal | None:
+    return _first_positive_decimal_from_item(
+        item,
+        ("chase_limit_price", "max_chase_limit_price", "entry_limit_price"),
+    )
+
+
+def _watch_buy_direction(item: ExecutionPlanItem) -> str:
+    for source in _item_payload_sources(item):
+        for key in ("trigger_direction", "entry_direction", "watch_direction", "direction"):
+            value = source.get(key)
+            if isinstance(value, str) and value.strip():
+                normalized = value.strip().lower()
+                if normalized in {"down", "below", "pullback", "dip", "<=", "at_or_below"}:
+                    return "at_or_below"
+    monitoring = _watch_buy_monitoring_context(item)
+    direction = monitoring.get("direction")
+    if isinstance(direction, str) and direction == "at_or_below":
+        return "at_or_below"
+    return "at_or_above"
+
+
+def _first_positive_decimal_from_item(
+    item: ExecutionPlanItem,
+    keys: tuple[str, ...],
+) -> Decimal | None:
+    monitoring = _watch_buy_monitoring_context(item)
+    for key in keys:
+        value = _parse_positive_decimal(monitoring.get(key))
+        if value is not None:
+            return value
+    for source in _item_payload_sources(item):
+        for key in keys:
+            value = _parse_positive_decimal(source.get(key))
+            if value is not None:
+                return value
+    return None
+
+
+def _watch_buy_monitoring_context(item: ExecutionPlanItem) -> dict[str, object]:
+    risk_context = item.risk_context if isinstance(item.risk_context, dict) else {}
+    monitoring = risk_context.get("watch_buy_monitoring")
+    return monitoring if isinstance(monitoring, dict) else {}
+
+
+def _item_payload_sources(item: ExecutionPlanItem) -> list[dict[str, object]]:
+    sources: list[dict[str, object]] = []
+    for source in (item.risk_context, item.quantity_policy):
+        if isinstance(source, dict):
+            sources.append(source)
+    return sources
+
+
+def _parse_positive_decimal(value: object) -> Decimal | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        parsed = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _exec_agent_decision(item: ExecutionPlanItem) -> dict[str, object] | None:
+    for source in (item.risk_context, item.quantity_policy):
+        if not isinstance(source, dict):
+            continue
+        for key in (
+            "exec_agent_decision",
+            "short_term_exec_agent",
+            "short_term_exec_agent_decision",
+        ):
+            value = source.get(key)
+            if isinstance(value, dict):
+                return value
+    return None
+
+
+def _quote_stale_reason(
+    *,
+    settings: Settings,
+    price: MonitoringPriceRequest | None,
+    cycle_at: datetime,
+) -> str | None:
+    if price is None:
+        return "quote is missing for watch buy evaluation"
+    observed_at = _price_observed_at(price, cycle_at)
+    max_age = timedelta(seconds=settings.monitoring_max_quote_age_seconds)
+    age = cycle_at - observed_at
+    if age > max_age:
+        return (
+            "quote is stale: observed_at="
+            f"{observed_at.isoformat()} exceeds max age "
+            f"{settings.monitoring_max_quote_age_seconds}s"
+        )
+    return None
+
+
+def _price_observed_at(
+    price: MonitoringPriceRequest | None,
+    fallback: datetime,
+) -> datetime:
+    if price is None or price.observed_at is None:
+        return fallback
+    return _normalize_utc(price.observed_at)
+
+
+def _record_monitoring_event(
+    *,
+    item: ExecutionPlanItem,
+    event: dict[str, object],
+) -> None:
+    risk_context = dict(item.risk_context) if isinstance(item.risk_context, dict) else {}
+    events = risk_context.get("monitoring_events")
+    if not isinstance(events, list):
+        events = []
+    risk_context["last_monitoring_event"] = event
+    risk_context["monitoring_events"] = [*events[-9:], event]
+    item.risk_context = risk_context
 
 
 def _plan_item_exchange(item: ExecutionPlanItem) -> str:
@@ -752,6 +1136,12 @@ def _serialize_decimal(value: Decimal | None) -> str | None:
     return f"{value:.4f}"
 
 
+def _serialize_datetime(value: datetime | None) -> str | None:
+    if value is None:
+        return None
+    return value.isoformat()
+
+
 def _place_monitoring_order(
     *,
     settings: Settings,
@@ -759,15 +1149,26 @@ def _place_monitoring_order(
     adapter: BrokerAdapter,
     item: ExecutionPlanItem,
     quantity: int,
+    observed_price: Decimal | None,
 ):
+    is_watch_buy = _is_watch_buy_item(item)
+    limit_price = (
+        _watch_buy_limit_price(item=item, observed_price=observed_price)
+        if is_watch_buy
+        else item.limit_price
+    )
     order_request = PlaceOrderRequest(
-        idempotency_key=f"monitoring:{item.intent}:{item.id}",
+        idempotency_key=(
+            f"monitoring:watch_buy:{item.id}"
+            if is_watch_buy
+            else f"monitoring:{item.intent}:{item.id}"
+        ),
         execution_plan_item_id=item.id,
         symbol=item.symbol,
-        side="sell",
+        side="buy" if is_watch_buy else "sell",
         quantity=quantity,
-        order_type="limit" if item.limit_price is not None else "market",
-        limit_price=item.limit_price,
+        order_type="limit" if is_watch_buy or limit_price is not None else "market",
+        limit_price=limit_price,
         time_in_force=item.time_in_force or "day",
         exchange=_plan_item_exchange(item),
     )
@@ -778,6 +1179,20 @@ def _place_monitoring_order(
         command=order_request,
         request_source=f"monitoring:{MONITORING_WORKER_NAME}",
     )
+
+
+def _watch_buy_limit_price(
+    *,
+    item: ExecutionPlanItem,
+    observed_price: Decimal | None,
+) -> Decimal:
+    reference_price = observed_price or _watch_buy_trigger_price(item) or item.limit_price
+    if reference_price is None:
+        raise ValueError("watch buy order requires an observed or trigger price")
+    chase_limit_price = _watch_buy_chase_limit_price(item)
+    if chase_limit_price is None:
+        return reference_price
+    return min(reference_price, chase_limit_price)
 
 
 def _monitoring_result_payload(
@@ -793,11 +1208,15 @@ def _monitoring_result_payload(
         "execution_plan_item_id": item.id,
         "symbol": item.symbol,
         "intent": item.intent,
+        "status": item.status,
         "trigger_price": _serialize_decimal(item.trigger_price),
         "observed_price": _serialize_decimal(observed_price),
         "outcome": outcome,
         "source_identity": serialize_plan_item_source_identity(item),
     }
+    if _is_watch_buy_item(item):
+        payload["chase_limit_price"] = _serialize_decimal(_watch_buy_chase_limit_price(item))
+        payload["direction"] = _watch_buy_direction(item)
     if message is not None:
         payload["message"] = message
     if block_reason is not None:
