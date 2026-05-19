@@ -208,8 +208,12 @@ def short_term_plan_payload(
                         "reference_price": "50000",
                         "target_price": "56000",
                         "stop_price": "47000",
+                        "risk_flags": ["momentum_continuation"],
                         "feedback_ids": ["fb-1"],
-                        "context": {"watcher_signal_id": "sig-1"},
+                        "context": {
+                            "watcher_signal_id": "sig-1",
+                            "confirmation_signal": "momentum_continuation",
+                        },
                     }
                 },
             }
@@ -250,8 +254,12 @@ def strict_exec_decision(
     context: dict[str, object] | None = None,
     target_price: str = "56000",
     stop_price: str = "47000",
+    reward_risk: str | None = None,
     max_total_budget: str | None = None,
 ) -> dict[str, object]:
+    decision_context = {"confirmation_signal": "momentum_continuation"}
+    if context is not None:
+        decision_context.update(context)
     decision: dict[str, object] = {
         "action": "approve",
         "confidence": confidence,
@@ -259,9 +267,11 @@ def strict_exec_decision(
         "reference_price": "50000",
         "target_price": target_price,
         "stop_price": stop_price,
+        "risk_flags": ["momentum_continuation"],
+        "context": decision_context,
     }
-    if context is not None:
-        decision["context"] = context
+    if reward_risk is not None:
+        decision["reward_risk"] = reward_risk
     if max_total_budget is not None:
         decision["max_total_budget"] = max_total_budget
     return decision
@@ -421,7 +431,7 @@ def test_strict_short_term_exec_agent_applies_target_liquidity_and_spread_adjust
                     "candidate-risky",
                     strict_exec_decision(
                         "0.82",
-                        target_price="52500",
+                        target_price="57000",
                         stop_price="45000",
                         context={
                             "liquidity_score": "0.45",
@@ -520,7 +530,19 @@ def test_short_term_exec_agent_approves_market_open_buy_and_materializes_monitor
         assert buy_item is not None
         audit = buy_item.risk_context["exec_agent_decision"]
         assert audit["feedback_ids"] == ["fb-1"]
-        assert audit["agent_contract"]["context"] == {"watcher_signal_id": "sig-1"}
+        assert audit["agent_contract"]["context"] == {
+            "watcher_signal_id": "sig-1",
+            "confirmation_signal": "momentum_continuation",
+        }
+        assert audit["max_quantity"] == 5
+        assert audit["max_budget"] == "260000.0000"
+        assert audit["reward_risk"] == "2.0000"
+        assert audit["exposure_after_trade"] == "250000.0000"
+        assert audit["reason_code"] == "approved"
+        assert audit["risk_flags"] == [
+            "confirmation:momentum_continuation",
+            "momentum_continuation",
+        ]
         assert audit["account_snapshot"]["available_cash"] == "500000.0000"
 
     engine.dispose()
@@ -543,7 +565,41 @@ def test_short_term_exec_agent_rejects_insufficient_cash() -> None:
     engine.dispose()
 
 
-def test_short_term_exec_agent_rejects_existing_holding_without_explicit_approval() -> None:
+def test_short_term_exec_agent_approves_existing_holding_add_on_when_guardrails_pass() -> None:
+    adapter = StubBrokerAdapter(
+        available_cash=Decimal("2000000"),
+        holdings=[BrokerAccountHolding(symbol="005930", quantity=3)],
+    )
+    app, engine = build_test_app(
+        adapter,
+        exec_agent_max_symbol_budget=Decimal("500000"),
+        exec_agent_max_total_budget=Decimal("1000000"),
+    )
+    client = TestClient(app)
+
+    response = client.post(
+        "/execution-plans/preview",
+        json=short_term_plan_payload(
+            exec_agent_decision=strict_exec_decision("0.82", max_budget="100000")
+        ),
+    )
+
+    assert response.status_code == 200
+    item = response.json()["items"][0]
+    audit = item["risk_context"]["exec_agent_decision"]
+    assert item["status"] == "next_open_buy_scheduled"
+    assert item["quantity_policy"]["quantity"] == 2
+    assert audit["reason_code"] == "approved"
+    assert audit["existing_holding"] == 3
+    assert audit["existing_symbol_exposure"] == "150000.0000"
+    assert audit["exposure_after_trade"] == "250000.0000"
+    assert audit["max_symbol_exposure"] == "400000.0000"
+    assert adapter.order_calls == []
+
+    engine.dispose()
+
+
+def test_short_term_exec_agent_rejects_existing_holding_add_on_when_exposure_cap_exceeded() -> None:
     adapter = StubBrokerAdapter(
         available_cash=Decimal("500000"),
         holdings=[BrokerAccountHolding(symbol="005930", quantity=3)],
@@ -551,13 +607,117 @@ def test_short_term_exec_agent_rejects_existing_holding_without_explicit_approva
     app, engine = build_test_app(adapter)
     client = TestClient(app)
 
-    response = client.post("/execution-plans", json=short_term_plan_payload())
+    response = client.post(
+        "/execution-plans",
+        json=short_term_plan_payload(
+            exec_agent_decision=strict_exec_decision("0.82", max_budget="50000")
+        ),
+    )
 
     assert response.status_code == 201
     item = client.get("/execution-plans").json()[0]["items"][0]
+    audit = item["risk_context"]["exec_agent_decision"]
     assert item["status"] == "exec_agent_rejected"
-    assert item["risk_context"]["exec_agent_decision"]["reason_code"] == "existing_holding"
+    assert audit["reason_code"] == "symbol_exposure_cap_exceeded"
+    assert audit["existing_holding"] == 3
+    assert audit["exposure_after_trade"] == "200000.0000"
+    assert audit["max_symbol_exposure"] == "100000.0000"
     assert adapter.order_calls == []
+
+    engine.dispose()
+
+
+def test_short_term_exec_agent_rejects_poor_reward_risk() -> None:
+    adapter = StubBrokerAdapter(available_cash=Decimal("500000"))
+    app, engine = build_test_app(adapter)
+    client = TestClient(app)
+
+    response = client.post(
+        "/execution-plans",
+        json=short_term_plan_payload(
+            exec_agent_decision=strict_exec_decision(
+                "0.82",
+                target_price="52000",
+                stop_price="47000",
+            )
+        ),
+    )
+
+    assert response.status_code == 201
+    item = client.get("/execution-plans").json()[0]["items"][0]
+    audit = item["risk_context"]["exec_agent_decision"]
+    assert item["status"] == "exec_agent_rejected"
+    assert audit["reason_code"] == "reward_risk_below_minimum"
+    assert audit["reward_risk"] == "0.6666"
+    assert audit["required_reward_risk"] == "1.0000"
+    assert adapter.order_calls == []
+
+    engine.dispose()
+
+
+def test_short_term_exec_agent_rejects_invalid_exit_prices_despite_supplied_reward_risk() -> None:
+    invalid_exit_price_cases = [
+        {"target_price": "56000", "stop_price": "50000"},
+        {"target_price": "56000", "stop_price": "51000"},
+        {"target_price": "50000", "stop_price": "47000"},
+        {"target_price": "49000", "stop_price": "47000"},
+    ]
+
+    for index, case in enumerate(invalid_exit_price_cases, start=1):
+        adapter = StubBrokerAdapter(available_cash=Decimal("500000"))
+        app, engine = build_test_app(adapter)
+        client = TestClient(app)
+
+        response = client.post(
+            "/execution-plans",
+            json=short_term_plan_payload(
+                plan_id=f"plan-invalid-exit-price-{index}",
+                source_plan_item_id=f"watcher-invalid-exit-price-{index}",
+                exec_agent_decision=strict_exec_decision(
+                    "0.82",
+                    reward_risk="9.99",
+                    **case,
+                ),
+            ),
+        )
+
+        assert response.status_code == 201
+        item = client.get("/execution-plans").json()[0]["items"][0]
+        audit = item["risk_context"]["exec_agent_decision"]
+        assert item["status"] == "exec_agent_rejected"
+        assert audit["reason_code"] == "invalid_reward_risk_prices"
+        assert audit["reward_risk"] is None
+        assert audit["agent_contract"]["reward_risk"] == "9.99"
+        assert adapter.order_calls == []
+
+        engine.dispose()
+
+
+def test_short_term_exec_agent_accepts_high_confidence_relaxed_reward_risk() -> None:
+    adapter = StubBrokerAdapter(available_cash=Decimal("500000"))
+    app, engine = build_test_app(adapter)
+    client = TestClient(app)
+
+    response = client.post(
+        "/execution-plans/preview",
+        json=short_term_plan_payload(
+            exec_agent_decision=strict_exec_decision(
+                "0.91",
+                max_budget="100000",
+                target_price="53300",
+                stop_price="47000",
+            )
+        ),
+    )
+
+    assert response.status_code == 200
+    item = response.json()["items"][0]
+    audit = item["risk_context"]["exec_agent_decision"]
+    assert item["status"] == "next_open_buy_scheduled"
+    assert item["quantity_policy"]["quantity"] == 1
+    assert audit["reason_code"] == "approved"
+    assert audit["reward_risk"] == "1.1000"
+    assert audit["required_reward_risk"] == "1.1000"
 
     engine.dispose()
 
@@ -689,7 +849,7 @@ class FakeExecAgentClient:
             target_price=Decimal("57000"),
             stop_price=Decimal("47000"),
             reasons=["high conviction with sufficient cash"],
-            risk_flags=["normal_spread"],
+            risk_flags=["normal_spread", "momentum_continuation"],
             explanation={"score": "9.1"},
         )
 
@@ -777,7 +937,10 @@ def test_openclaw_exec_agent_client_handoff_builds_context_and_sizes_without_pre
     assert request.decider_input == {"score": 6.7}
     assert request.account["available_cash"] == "800000.0000"
     audit = plan.items[0].risk_context["exec_agent_decision"]
-    assert audit["agent_contract"]["context"]["risk_flags"] == ["normal_spread"]
+    assert audit["agent_contract"]["context"]["risk_flags"] == [
+        "normal_spread",
+        "momentum_continuation",
+    ]
     assert audit["final_budget"] == "350000.0000"
     assert plan.items[0].quantity_policy["quantity"] == 7
 
@@ -822,7 +985,7 @@ def test_openclaw_exec_agent_batch_client_sees_all_candidates_and_allocates_diff
                 "target_price": Decimal("57000"),
                 "stop_price": Decimal("47000"),
                 "reasons": ["highest ranked candidate"],
-                "risk_flags": ["normal_spread"],
+                "risk_flags": ["normal_spread", "momentum_continuation"],
                 "explanation": {"rank": 1},
             },
             "item-openclaw-batch-b": {
@@ -834,7 +997,7 @@ def test_openclaw_exec_agent_batch_client_sees_all_candidates_and_allocates_diff
                 "target_price": Decimal("57500"),
                 "stop_price": Decimal("47000"),
                 "reasons": ["larger portfolio allocation"],
-                "risk_flags": ["deep_liquidity"],
+                "risk_flags": ["deep_liquidity", "momentum_continuation"],
                 "explanation": {"rank": 2},
             },
         }
@@ -951,7 +1114,7 @@ def test_openclaw_exec_agent_batch_allocation_preserves_precomputed_contracts() 
                 "target_price": Decimal("57500"),
                 "stop_price": Decimal("47000"),
                 "reasons": ["sized by live OpenClaw batch"],
-                "risk_flags": ["deep_liquidity"],
+                "risk_flags": ["deep_liquidity", "momentum_continuation"],
                 "explanation": {"source": "openclaw"},
             },
         }
@@ -1017,6 +1180,7 @@ def test_openclaw_exec_agent_batch_allocation_preserves_precomputed_contracts() 
     assert precomputed_audit["final_budget"] == "120000.0000"
     assert precomputed_audit["target_price"] == "57000.0000"
     assert precomputed_audit["agent_contract"]["context"] == {
+        "confirmation_signal": "momentum_continuation",
         "source": "precomputed",
         "contract_id": "durable-contract-1",
     }
