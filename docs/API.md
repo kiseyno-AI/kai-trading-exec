@@ -74,6 +74,11 @@ Current foundation response includes:
 - `symbols.scheduled_today`
 - `symbols.filled_today`
 - `symbols.failed_today`
+- `monthly_pnl.monthly_realized_pnl`
+- `monthly_pnl.monthly_target_krw`
+- `monthly_pnl.target_progress_pct`
+- `monthly_pnl.mode_recommendation` (`normal`, `aggressive`, `capital_preservation`)
+- `monthly_pnl.pnl_method`
 
 ### `GET /runtime/daily-board`
 Returns a compact current-KRX-day board for core/web/operator readback.
@@ -211,11 +216,12 @@ remain persisted but do not receive a dispatchable job yet.
 
 Short-term watcher `next_open_buy` candidates can omit fixed share quantity when
 they provide a strict `risk_context.exec_agent_decision` contract. Exec fetches a
-broker/account snapshot before approval, applies cash/holding/open-order/budget
-rails, writes the approved share quantity and deterministic idempotency key into
-`quantity_policy`, and materializes target/stop sell monitoring items. Invalid or
-rejected decisions persist as `exec_agent_rejected` with a machine-readable
-reason in `risk_context.exec_agent_decision`.
+broker/account snapshot before approval, applies risk-by-stop-distance sizing,
+cash/holding/open-order/budget, per-symbol, and daily new-buy rails, writes the
+approved share quantity and deterministic idempotency key into
+`quantity_policy`, and materializes partial/final target, stop, and time-stop
+monitoring items. Invalid or rejected decisions persist as `exec_agent_rejected`
+with a machine-readable reason in `risk_context.exec_agent_decision`.
 
 Current plan-item readback also includes:
 - `source_identity`

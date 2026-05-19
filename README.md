@@ -113,6 +113,21 @@ Monitoring runtime settings currently supported:
 - `KAI_EXEC_MONITORING_MAX_SYMBOLS_PER_CYCLE`
 - `KAI_EXEC_MONITORING_MAX_BROKER_ACTIONS_PER_CYCLE`
 
+Short-term exec risk settings currently supported:
+- `KAI_EXEC_EXEC_AGENT_BASE_RISK_PCT`
+- `KAI_EXEC_EXEC_AGENT_AGGRESSIVE_RISK_PCT`
+- `KAI_EXEC_EXEC_AGENT_AGGRESSIVE_CONFIDENCE_THRESHOLD`
+- `KAI_EXEC_EXEC_AGENT_MAX_POSITION_ALLOCATION_PCT`
+- `KAI_EXEC_EXEC_AGENT_MAX_SYMBOL_TOTAL_EXPOSURE_PCT`
+- `KAI_EXEC_EXEC_AGENT_MAX_DAILY_NEW_BUY_NOTIONAL`
+- `KAI_EXEC_EXEC_AGENT_STOP_LOSS_PCT`
+- `KAI_EXEC_EXEC_AGENT_FIRST_TAKE_PROFIT_PCT`
+- `KAI_EXEC_EXEC_AGENT_FINAL_TAKE_PROFIT_PCT`
+- `KAI_EXEC_EXEC_AGENT_PARTIAL_TAKE_PROFIT_FRACTION`
+- `KAI_EXEC_MONTHLY_TARGET_KRW`
+- `KAI_EXEC_MONTHLY_CAPITAL_PRESERVATION_ENABLED`
+- `KAI_EXEC_MONTHLY_AGGRESSIVE_LAG_RATIO`
+
 Operator broker-session endpoints:
 - `GET /broker/session`
 - `POST /broker/session/authenticate`
@@ -136,7 +151,10 @@ Short-term watcher buys fail closed when broker account state cannot be resolved
 when cash/buying power is insufficient, when an add-on would breach symbol
 exposure or reward/risk guardrails, when a symbol has a duplicate open buy
 order, or when target/stop monitoring context is missing. Exec-agent decision
-metadata is persisted in each plan item's `risk_context`.
+metadata is persisted in each plan item's `risk_context`. Approved short-term
+buys are sized from configured account-risk percent and stop distance first,
+then capped by allocation, symbol exposure, daily new-buy notional, cash/buying
+power, and exec-agent quantity/budget rails.
 
 ## Boot target
 

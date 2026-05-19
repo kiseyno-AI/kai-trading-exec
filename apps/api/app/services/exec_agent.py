@@ -26,6 +26,12 @@ from app.models.runtime import (
 )
 from app.services.broker_auth import ensure_authenticated_broker_session
 from app.services.plan_item_identity import serialize_plan_item_source_identity
+from app.services.risk_sizing import (
+    RiskSizingRejection,
+    RiskSizingResult,
+    effective_stop_price,
+    resolve_risk_based_buy_quantity,
+)
 from app.services.runtime_controls import RUNTIME_CONTROL_ID, effective_automation_enabled
 
 SHORT_TERM_DECIDER_NAME = "short-term-decider"
@@ -337,6 +343,7 @@ class ExecAgentApplicationResult:
 @dataclass(frozen=True)
 class _AccountContext:
     available_cash: Decimal | None
+    buying_power: Decimal | None
     observed_at: datetime
     snapshot_payload: dict[str, object] | None
     holdings_by_symbol: dict[str, int]
@@ -413,6 +420,11 @@ def apply_short_term_exec_agent_decisions(
     rejected_count = 0
     reserved_total_budget = Decimal("0")
     reserved_cash_budget = Decimal("0")
+    reserved_daily_buy_notional = _load_daily_new_buy_notional(
+        settings=settings,
+        db=db,
+        market_date=plan.market_date,
+    )
     next_plan_item_index = _next_plan_item_index(plan)
     agent_contracts = _resolve_agent_contracts(
         settings=settings,
@@ -430,6 +442,7 @@ def apply_short_term_exec_agent_decisions(
             account_context=account_context,
             reserved_total_budget=reserved_total_budget,
             reserved_cash_budget=reserved_cash_budget,
+            reserved_daily_buy_notional=reserved_daily_buy_notional,
             agent_contract_result=agent_contracts.get(item.id),
         )
         decisions.append(decision)
@@ -438,6 +451,7 @@ def apply_short_term_exec_agent_decisions(
             approved_count += 1
             reserved_total_budget += approved_notional
             reserved_cash_budget += approved_notional
+            reserved_daily_buy_notional += approved_notional
             _apply_approved_decision(item=item, decision=decision)
             next_plan_item_index = _append_monitoring_items(
                 settings=settings,
@@ -538,6 +552,7 @@ def _load_account_context(
 
     return _AccountContext(
         available_cash=snapshot.available_cash,
+        buying_power=snapshot.buying_power,
         observed_at=snapshot.observed_at,
         snapshot_payload=_serialize_account_snapshot(snapshot),
         holdings_by_symbol=holdings_by_symbol,
@@ -552,6 +567,7 @@ def _unavailable_account_context(
 ) -> _AccountContext:
     return _AccountContext(
         available_cash=None,
+        buying_power=None,
         observed_at=observed_at,
         snapshot_payload={
             "available": False,
@@ -605,6 +621,99 @@ def _load_local_open_orders(
     ]
 
 
+def _load_daily_new_buy_notional(
+    *,
+    settings: Settings,
+    db: Session,
+    market_date: date | None,
+) -> Decimal:
+    if market_date is None:
+        return Decimal("0")
+    items = db.scalars(
+        select(ExecutionPlanItem)
+        .join(ExecutionPlanItem.plan)
+        .where(
+            ExecutionPlan.mode == settings.runtime_mode,
+            ExecutionPlan.market_date == market_date,
+            ExecutionPlanItem.side == "buy",
+            ExecutionPlanItem.status.in_(
+                (
+                    "pending",
+                    "next_open_buy_scheduled",
+                    "next_open_buy_dispatching",
+                    "next_open_buy_retry_pending",
+                    "broker_order_submission_pending",
+                    "broker_order_submitted",
+                    "broker_order_retry_pending",
+                    "submitted",
+                    "open",
+                    "partially_filled",
+                    "retry_pending",
+                )
+            ),
+        )
+    ).all()
+    total = Decimal("0")
+    for item in items:
+        total += _approved_notional_from_item(item)
+    return total
+
+
+def _approved_notional_from_item(item: ExecutionPlanItem) -> Decimal:
+    for source in (item.risk_context, item.quantity_policy):
+        if not isinstance(source, dict):
+            continue
+        decision = source.get("exec_agent_decision")
+        if isinstance(decision, dict):
+            value = _parse_positive_decimal(decision.get("approved_notional"))
+            if value is not None:
+                return value
+        for key in ("approved_notional", "notional", "max_notional"):
+            value = _parse_positive_decimal(source.get(key))
+            if value is not None:
+                return value
+
+    quantity = None
+    if isinstance(item.quantity_policy, dict):
+        quantity = item.quantity_policy.get("quantity")
+    parsed_quantity = _parse_positive_int(quantity)
+    if parsed_quantity is None:
+        return Decimal("0")
+    price = item.limit_price or _first_decimal(item.risk_context, ("sizing_price", "reference_price", "entry_price"))
+    if price is None:
+        price = _first_decimal(item.quantity_policy, ("sizing_price", "reference_price", "entry_price"))
+    if price is None:
+        return Decimal("0")
+    return price * Decimal(parsed_quantity)
+
+
+def _parse_positive_decimal(value: object) -> Decimal | None:
+    try:
+        parsed = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
+    if parsed <= 0 or not parsed.is_finite():
+        return None
+    return parsed
+
+
+def _parse_positive_int(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int) and value > 0:
+        return value
+    if isinstance(value, str) and value.isdigit() and int(value) > 0:
+        return int(value)
+    return None
+
+
+def _minimum_decimal(*values: Decimal | None) -> Decimal | None:
+    concrete = [value for value in values if value is not None]
+    if not concrete:
+        return None
+    return min(concrete)
+
+
 def _decide_candidate(
     *,
     settings: Settings,
@@ -613,6 +722,7 @@ def _decide_candidate(
     account_context: _AccountContext,
     reserved_total_budget: Decimal,
     reserved_cash_budget: Decimal,
+    reserved_daily_buy_notional: Decimal,
     agent_contract_result: _AgentContractResolution | None,
 ) -> dict[str, object]:
     source_identity = serialize_plan_item_source_identity(item)
@@ -742,10 +852,15 @@ def _decide_candidate(
             },
         )
 
+    effective_stop = effective_stop_price(
+        settings=settings,
+        entry_price=sizing_price,
+        upstream_stop_price=agent_contract.stop_price,
+    )
     reward_risk = _reward_risk(
         reference_price=sizing_price,
         target_price=agent_contract.target_price,
-        stop_price=agent_contract.stop_price,
+        stop_price=effective_stop,
     )
     if reward_risk is None:
         return _reject(
@@ -760,6 +875,7 @@ def _decide_candidate(
                 agent_contract=agent_contract,
                 reward_risk=None,
                 exposure_after_trade=None,
+                extra={"effective_stop_price": _serialize_decimal(effective_stop)},
             ),
         )
     reward_risk_threshold = _reward_risk_threshold(settings=settings, agent_contract=agent_contract)
@@ -777,6 +893,7 @@ def _decide_candidate(
                 reward_risk=reward_risk,
                 exposure_after_trade=None,
                 extra={
+                    "effective_stop_price": _serialize_decimal(effective_stop),
                     "required_reward_risk": _serialize_decimal(
                         _settings_decimal(settings, "exec_agent_absolute_min_reward_risk", Decimal("1.00"))
                     )
@@ -796,7 +913,10 @@ def _decide_candidate(
                 agent_contract=agent_contract,
                 reward_risk=reward_risk,
                 exposure_after_trade=None,
-                extra={"required_reward_risk": _serialize_decimal(reward_risk_threshold)},
+                extra={
+                    "effective_stop_price": _serialize_decimal(effective_stop),
+                    "required_reward_risk": _serialize_decimal(reward_risk_threshold),
+                },
             ),
         )
     confirmation_signal = _confirmation_signal(item=item, agent_contract=agent_contract)
@@ -813,6 +933,7 @@ def _decide_candidate(
                 agent_contract=agent_contract,
                 reward_risk=reward_risk,
                 exposure_after_trade=None,
+                extra={"effective_stop_price": _serialize_decimal(effective_stop)},
             ),
         )
 
@@ -842,38 +963,30 @@ def _decide_candidate(
             available_cash=available_cash,
         )
 
-    budget = sizing_budget.final_budget
-    quantity = int((budget / sizing_price).quantize(Decimal("1"), rounding=ROUND_DOWN))
-    if agent_contract.max_quantity is not None:
-        quantity = min(quantity, agent_contract.max_quantity)
-    if quantity <= 0:
-        return _reject(
-            base,
-            "insufficient_cash",
-            "available cash and budget caps cannot buy one share",
-            agent_contract=agent_contract,
-            available_cash=available_cash,
-            sizing_price=sizing_price,
-        )
-
-    approved_notional = sizing_price * Decimal(quantity)
     max_symbol_budget = agent_contract.max_symbol_budget or _settings_decimal(
         settings,
         "exec_agent_max_symbol_budget",
         Decimal("1000000"),
     )
     existing_symbol_exposure = sizing_price * Decimal(existing_holding)
-    exposure_after_trade = existing_symbol_exposure + approved_notional
-    max_symbol_exposure = _max_symbol_exposure_budget(
+    account_basis = _minimum_decimal(account_context.available_cash, account_context.buying_power) or available_cash
+    risk_sizing = resolve_risk_based_buy_quantity(
         settings=settings,
-        available_cash=available_cash,
-        agent_contract=agent_contract,
+        account_basis=account_basis,
+        available_cash=remaining_cash,
+        entry_price=sizing_price,
+        stop_price=effective_stop,
+        confidence=agent_contract.confidence,
+        candidate_max_budget=sizing_budget.final_budget,
+        agent_max_quantity=agent_contract.max_quantity,
+        existing_symbol_exposure=existing_symbol_exposure,
+        daily_new_buy_notional_used=reserved_daily_buy_notional,
     )
-    if existing_holding > 0 and exposure_after_trade > max_symbol_exposure:
+    if isinstance(risk_sizing, RiskSizingRejection):
         return _reject(
             base,
-            "symbol_exposure_cap_exceeded",
-            "projected add-on position exceeds max symbol exposure",
+            risk_sizing.reason_code,
+            risk_sizing.message,
             agent_contract=agent_contract,
             available_cash=available_cash,
             existing_holding=existing_holding,
@@ -881,36 +994,22 @@ def _decide_candidate(
             details=_decision_contract_fields(
                 agent_contract=agent_contract,
                 reward_risk=reward_risk,
-                exposure_after_trade=exposure_after_trade,
+                exposure_after_trade=None,
                 extra={
-                    "approved_notional": _serialize_decimal(approved_notional),
                     "existing_symbol_exposure": _serialize_decimal(existing_symbol_exposure),
-                    "max_symbol_exposure": _serialize_decimal(max_symbol_exposure),
+                    "effective_stop_price": _serialize_decimal(effective_stop),
+                    **risk_sizing.details,
                 },
             ),
         )
+    assert isinstance(risk_sizing, RiskSizingResult)
 
-    position_risk = (sizing_price - agent_contract.stop_price) * Decimal(quantity)
-    max_trade_risk = _max_trade_risk_budget(settings=settings, available_cash=available_cash)
-    if position_risk > max_trade_risk:
-        return _reject(
-            base,
-            "position_risk_exceeds_cap",
-            "stop distance implies position risk above the per-trade risk cap",
-            agent_contract=agent_contract,
-            available_cash=available_cash,
-            existing_holding=existing_holding,
-            sizing_price=sizing_price,
-            details=_decision_contract_fields(
-                agent_contract=agent_contract,
-                reward_risk=reward_risk,
-                exposure_after_trade=exposure_after_trade,
-                extra={
-                    "position_risk": _serialize_decimal(position_risk),
-                    "max_trade_risk": _serialize_decimal(max_trade_risk),
-                },
-            ),
-        )
+    quantity = risk_sizing.quantity
+    approved_notional = risk_sizing.approved_notional
+    budget = sizing_budget.final_budget
+    max_symbol_exposure = risk_sizing.max_symbol_exposure
+    exposure_after_trade = risk_sizing.exposure_after_trade
+    position_risk = risk_sizing.stop_distance * Decimal(quantity)
 
     risk_flags = _decision_risk_flags(agent_contract=agent_contract, confirmation_signal=confirmation_signal)
     return {
@@ -939,16 +1038,26 @@ def _decide_candidate(
         "max_budget_upper_bound": _serialize_decimal(agent_contract.max_budget),
         "max_symbol_budget_upper_bound": _serialize_decimal(max_symbol_budget),
         "max_symbol_exposure": _serialize_decimal(max_symbol_exposure),
+        "max_position_budget": _serialize_decimal(risk_sizing.max_position_budget),
         "existing_holding": existing_holding,
         "existing_symbol_exposure": _serialize_decimal(existing_symbol_exposure),
         "exposure_after_trade": _serialize_decimal(exposure_after_trade),
         "remaining_total_budget": _serialize_decimal(sizing_budget.remaining_total_budget),
         "target_price": _serialize_decimal(agent_contract.target_price),
-        "stop_price": _serialize_decimal(agent_contract.stop_price),
+        "stop_price": _serialize_decimal(effective_stop),
+        "upstream_stop_price": _serialize_decimal(agent_contract.stop_price),
         "reward_risk": _serialize_decimal(reward_risk),
         "required_reward_risk": _serialize_decimal(reward_risk_threshold),
         "position_risk": _serialize_decimal(position_risk),
-        "max_trade_risk": _serialize_decimal(max_trade_risk),
+        "max_trade_risk": _serialize_decimal(risk_sizing.risk_budget),
+        "risk_pct": _serialize_decimal(risk_sizing.risk_pct),
+        "risk_budget": _serialize_decimal(risk_sizing.risk_budget),
+        "stop_distance": _serialize_decimal(risk_sizing.stop_distance),
+        "risk_based_quantity": risk_sizing.risk_quantity,
+        "allocation_quantity": risk_sizing.allocation_quantity,
+        "cash_quantity": risk_sizing.cash_quantity,
+        "daily_budget_remaining": _serialize_decimal(risk_sizing.daily_budget_remaining),
+        "sizing_caps": risk_sizing.cap_details,
         "confirmation_signal": confirmation_signal,
         "risk_flags": risk_flags,
         "allow_existing_holding": agent_contract.allow_existing_holding,
@@ -1447,33 +1556,6 @@ def _decision_risk_flags(
     return sorted(flags)
 
 
-def _max_symbol_exposure_budget(
-    *,
-    settings: Settings,
-    available_cash: Decimal,
-    agent_contract: ShortTermExecAgentContract,
-) -> Decimal:
-    pct_cap = available_cash * _settings_decimal(
-        settings,
-        "exec_agent_max_symbol_exposure_pct",
-        Decimal("0.20"),
-    )
-    absolute_cap = agent_contract.max_symbol_budget or _settings_decimal(
-        settings,
-        "exec_agent_max_symbol_budget",
-        Decimal("1000000"),
-    )
-    return min(pct_cap, absolute_cap)
-
-
-def _max_trade_risk_budget(*, settings: Settings, available_cash: Decimal) -> Decimal:
-    return available_cash * _settings_decimal(
-        settings,
-        "exec_agent_max_trade_risk_pct",
-        Decimal("0.05"),
-    )
-
-
 def _decision_contract_fields(
     *,
     agent_contract: ShortTermExecAgentContract,
@@ -1773,11 +1855,32 @@ def _agent_risk_caps(settings: Settings) -> dict[str, object]:
         ),
         "max_total_budget": _serialize_decimal(max_total_budget),
         "max_intraday_buy_budget": _serialize_decimal(max_total_budget),
+        "base_risk_pct": _serialize_decimal(
+            _settings_decimal(settings, "exec_agent_base_risk_pct", Decimal("0.005"))
+        ),
+        "aggressive_risk_pct": _serialize_decimal(
+            _settings_decimal(settings, "exec_agent_aggressive_risk_pct", Decimal("0.015"))
+        ),
+        "aggressive_confidence_threshold": _serialize_decimal(
+            _settings_decimal(settings, "exec_agent_aggressive_confidence_threshold", Decimal("0.90"))
+        ),
+        "max_position_allocation_pct": _serialize_decimal(
+            _settings_decimal(settings, "exec_agent_max_position_allocation_pct", Decimal("0.10"))
+        ),
         "max_symbol_exposure_pct": _serialize_decimal(
             _settings_decimal(settings, "exec_agent_max_symbol_exposure_pct", Decimal("0.20"))
         ),
+        "max_symbol_total_exposure_pct": _serialize_decimal(
+            _settings_decimal(settings, "exec_agent_max_symbol_total_exposure_pct", Decimal("0.20"))
+        ),
+        "max_daily_new_buy_notional": _serialize_decimal(
+            _settings_decimal(settings, "exec_agent_max_daily_new_buy_notional", Decimal("500000"))
+        ),
         "max_trade_risk_pct": _serialize_decimal(
-            _settings_decimal(settings, "exec_agent_max_trade_risk_pct", Decimal("0.05"))
+            _settings_decimal(settings, "exec_agent_max_trade_risk_pct", Decimal("0.01"))
+        ),
+        "stop_loss_pct": _serialize_decimal(
+            _settings_decimal(settings, "exec_agent_stop_loss_pct", Decimal("0.04"))
         ),
         "max_entry_premium_pct": _serialize_decimal(
             _settings_non_negative_decimal(settings, "exec_agent_max_entry_premium_pct", Decimal("0"))
@@ -1961,24 +2064,41 @@ def _append_monitoring_items(
     next_plan_item_index: int,
 ) -> int:
     quantity = int(decision["quantity"])
-    for intent, trigger_key in (
-        ("target_sell", "target_price"),
-        ("stop_sell", "stop_price"),
-    ):
-        trigger_price = Decimal(str(decision[trigger_key]))
+    for stage in _take_profit_stages(settings=settings, decision=decision, quantity=quantity):
         plan.items.append(
             _new_monitoring_item(
                 plan=plan,
                 buy_item=buy_item,
                 decision=decision,
-                intent=intent,
-                quantity=quantity,
+                intent="target_sell",
+                quantity=stage["quantity"],
                 next_plan_item_index=next_plan_item_index,
-                trigger_price=trigger_price,
+                trigger_price=stage["trigger_price"],
                 max_sessions=getattr(settings, "exec_agent_max_holding_trading_sessions", 3),
+                exit_rule=stage["exit_rule"],
             )
         )
         next_plan_item_index += 1
+
+    stop_price = Decimal(str(decision["stop_price"]))
+    plan.items.append(
+        _new_monitoring_item(
+            plan=plan,
+            buy_item=buy_item,
+            decision=decision,
+            intent="stop_sell",
+            quantity=quantity,
+            next_plan_item_index=next_plan_item_index,
+            trigger_price=stop_price,
+            max_sessions=getattr(settings, "exec_agent_max_holding_trading_sessions", 3),
+            exit_rule={
+                "kind": "hard_stop_loss",
+                "stop_price": _serialize_decimal(stop_price),
+                "upstream_stop_price": decision.get("upstream_stop_price"),
+            },
+        )
+    )
+    next_plan_item_index += 1
 
     plan.items.append(
         _new_monitoring_item(
@@ -1990,9 +2110,77 @@ def _append_monitoring_items(
             next_plan_item_index=next_plan_item_index,
             trigger_price=None,
             max_sessions=getattr(settings, "exec_agent_max_holding_trading_sessions", 3),
+            exit_rule={"kind": "time_stop"},
         )
     )
     return next_plan_item_index + 1
+
+
+def _take_profit_stages(
+    *,
+    settings: Settings,
+    decision: dict[str, object],
+    quantity: int,
+) -> list[dict[str, object]]:
+    entry_price = Decimal(str(decision["reference_price"]))
+    upstream_target = Decimal(str(decision["target_price"]))
+    first_pct = _settings_decimal(settings, "exec_agent_first_take_profit_pct", Decimal("0.04"))
+    final_pct = _settings_decimal(settings, "exec_agent_final_take_profit_pct", Decimal("0.08"))
+    partial_fraction = _settings_decimal(settings, "exec_agent_partial_take_profit_fraction", Decimal("0.50"))
+    first_target = min(
+        upstream_target,
+        (entry_price * (Decimal("1") + first_pct)).quantize(Decimal("0.0001"), rounding=ROUND_DOWN),
+    )
+    final_target = min(
+        upstream_target,
+        (entry_price * (Decimal("1") + final_pct)).quantize(Decimal("0.0001"), rounding=ROUND_DOWN),
+    )
+    if final_target < first_target:
+        final_target = first_target
+
+    if quantity >= 2 and first_target < final_target:
+        first_quantity = int((Decimal(quantity) * partial_fraction).quantize(Decimal("1"), rounding=ROUND_DOWN))
+        first_quantity = max(1, min(first_quantity, quantity - 1))
+        final_quantity = quantity - first_quantity
+        return [
+            {
+                "trigger_price": first_target,
+                "quantity": first_quantity,
+                "exit_rule": {
+                    "kind": "partial_take_profit",
+                    "stage": "first",
+                    "trigger_pct": _serialize_decimal(first_pct),
+                    "fraction": _serialize_decimal(partial_fraction),
+                    "entry_price": _serialize_decimal(entry_price),
+                    "upstream_target_price": _serialize_decimal(upstream_target),
+                },
+            },
+            {
+                "trigger_price": final_target,
+                "quantity": final_quantity,
+                "exit_rule": {
+                    "kind": "final_take_profit",
+                    "stage": "final",
+                    "trigger_pct": _serialize_decimal(final_pct),
+                    "entry_price": _serialize_decimal(entry_price),
+                    "upstream_target_price": _serialize_decimal(upstream_target),
+                },
+            },
+        ]
+
+    return [
+        {
+            "trigger_price": final_target,
+            "quantity": quantity,
+            "exit_rule": {
+                "kind": "final_take_profit",
+                "stage": "final",
+                "trigger_pct": _serialize_decimal(final_pct),
+                "entry_price": _serialize_decimal(entry_price),
+                "upstream_target_price": _serialize_decimal(upstream_target),
+            },
+        }
+    ]
 
 
 def _new_monitoring_item(
@@ -2005,6 +2193,7 @@ def _new_monitoring_item(
     next_plan_item_index: int,
     trigger_price: Decimal | None,
     max_sessions: int,
+    exit_rule: dict[str, object],
 ) -> ExecutionPlanItem:
     buy_market_date = buy_item.source_market_date or plan.market_date
     close_exit_date = _add_trading_sessions(buy_market_date, max_sessions) if buy_market_date else None
@@ -2026,6 +2215,7 @@ def _new_monitoring_item(
             "generated_by": EXEC_AGENT_DECISION_VERSION,
             "parent_source_identity": serialize_plan_item_source_identity(buy_item),
             "parent_idempotency_key": decision["idempotency_key"],
+            "exit_rule": exit_rule,
             "confidence": decision.get("confidence"),
             "max_holding_trading_sessions": max_sessions,
             "close_exit_date": close_exit_date.isoformat() if close_exit_date else None,
@@ -2034,7 +2224,10 @@ def _new_monitoring_item(
         decision_agent_name=buy_item.decision_agent_name,
         decision_snapshot_id=buy_item.decision_snapshot_id,
         decision_run_id=buy_item.decision_run_id,
-        source_plan_item_id=_monitoring_source_plan_item_id(buy_item, intent),
+        source_plan_item_id=_monitoring_source_plan_item_id(
+            buy_item,
+            f"{intent}:{exit_rule.get('stage') or exit_rule.get('kind') or 'default'}",
+        ),
         source_market_date=buy_market_date,
     )
 

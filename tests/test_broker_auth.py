@@ -1717,6 +1717,7 @@ def _build_watch_buy_test_app(
             kis_app_secret="paper-secret",
             kis_account_number="12345678",
             monitoring_max_quote_age_seconds=max_quote_age_seconds,
+            exec_agent_max_position_allocation_pct=Decimal("0.20"),
         ),
         broker_adapter=broker_adapter,
     )
@@ -1744,7 +1745,7 @@ def _create_watch_buy_candidate(
         "quantity_policy": {"kind": "shares", "quantity": 2},
         "buy_recommendation_price": trigger_price,
         "time_in_force": "day",
-        "risk_context": {"exchange": "KRX"},
+        "risk_context": {"exchange": "KRX", "stop_price": "70000.00"},
         "decision_agent_name": "short-term-decider",
         "source_plan_item_id": f"{plan_id}-watch",
     }

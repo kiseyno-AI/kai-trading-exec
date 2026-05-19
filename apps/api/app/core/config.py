@@ -32,8 +32,15 @@ class Settings(BaseModel):
     exec_agent_model: str = "openai-codex/gpt-5.5"
     exec_agent_max_symbol_budget: Decimal = Field(default=Decimal("1000000"), gt=0)
     exec_agent_max_total_budget: Decimal = Field(default=Decimal("3000000"), gt=0)
+    exec_agent_base_risk_pct: Decimal = Field(default=Decimal("0.005"), gt=0, le=Decimal("0.010"))
+    exec_agent_aggressive_risk_pct: Decimal = Field(default=Decimal("0.015"), gt=0, le=Decimal("0.015"))
+    exec_agent_aggressive_confidence_threshold: Decimal = Field(default=Decimal("0.90"), gt=0, le=1)
+    exec_agent_max_position_allocation_pct: Decimal = Field(default=Decimal("0.10"), gt=0, le=1)
     exec_agent_max_symbol_exposure_pct: Decimal = Field(default=Decimal("0.20"), gt=0, le=1)
-    exec_agent_max_trade_risk_pct: Decimal = Field(default=Decimal("0.05"), gt=0, le=1)
+    exec_agent_max_symbol_total_exposure_pct: Decimal = Field(default=Decimal("0.20"), gt=0, le=1)
+    exec_agent_max_daily_new_buy_notional: Decimal = Field(default=Decimal("500000"), gt=0)
+    exec_agent_max_trade_risk_pct: Decimal = Field(default=Decimal("0.01"), gt=0, le=Decimal("0.015"))
+    exec_agent_stop_loss_pct: Decimal = Field(default=Decimal("0.04"), gt=0, le=Decimal("0.10"))
     exec_agent_max_entry_premium_pct: Decimal = Field(default=Decimal("0"), ge=0, le=Decimal("0.10"))
     exec_agent_min_reward_risk: Decimal = Field(default=Decimal("1.30"), gt=0)
     exec_agent_relaxed_min_reward_risk: Decimal = Field(default=Decimal("1.10"), gt=0)
@@ -41,6 +48,12 @@ class Settings(BaseModel):
     exec_agent_tactical_scalp_max_stop_pct: Decimal = Field(default=Decimal("0.015"), gt=0, le=1)
     exec_agent_max_account_snapshot_age_seconds: int = Field(default=300, ge=1, le=86400)
     exec_agent_max_holding_trading_sessions: int = Field(default=3, ge=1, le=20)
+    exec_agent_first_take_profit_pct: Decimal = Field(default=Decimal("0.04"), gt=0, le=Decimal("0.10"))
+    exec_agent_final_take_profit_pct: Decimal = Field(default=Decimal("0.08"), gt=0, le=Decimal("0.20"))
+    exec_agent_partial_take_profit_fraction: Decimal = Field(default=Decimal("0.50"), gt=0, le=1)
+    monthly_target_krw: Decimal = Field(default=Decimal("500000"), gt=0)
+    monthly_capital_preservation_enabled: bool = True
+    monthly_aggressive_lag_ratio: Decimal = Field(default=Decimal("0.75"), gt=0, le=1)
     kis_app_key: str | None = None
     kis_app_secret: str | None = None
     kis_account_number: str | None = None
@@ -83,8 +96,15 @@ _ENV_FIELDS = {
     "EXEC_AGENT_MODEL": "exec_agent_model",
     "EXEC_AGENT_MAX_SYMBOL_BUDGET": "exec_agent_max_symbol_budget",
     "EXEC_AGENT_MAX_TOTAL_BUDGET": "exec_agent_max_total_budget",
+    "EXEC_AGENT_BASE_RISK_PCT": "exec_agent_base_risk_pct",
+    "EXEC_AGENT_AGGRESSIVE_RISK_PCT": "exec_agent_aggressive_risk_pct",
+    "EXEC_AGENT_AGGRESSIVE_CONFIDENCE_THRESHOLD": "exec_agent_aggressive_confidence_threshold",
+    "EXEC_AGENT_MAX_POSITION_ALLOCATION_PCT": "exec_agent_max_position_allocation_pct",
     "EXEC_AGENT_MAX_SYMBOL_EXPOSURE_PCT": "exec_agent_max_symbol_exposure_pct",
+    "EXEC_AGENT_MAX_SYMBOL_TOTAL_EXPOSURE_PCT": "exec_agent_max_symbol_total_exposure_pct",
+    "EXEC_AGENT_MAX_DAILY_NEW_BUY_NOTIONAL": "exec_agent_max_daily_new_buy_notional",
     "EXEC_AGENT_MAX_TRADE_RISK_PCT": "exec_agent_max_trade_risk_pct",
+    "EXEC_AGENT_STOP_LOSS_PCT": "exec_agent_stop_loss_pct",
     "EXEC_AGENT_MAX_ENTRY_PREMIUM_PCT": "exec_agent_max_entry_premium_pct",
     "EXEC_AGENT_MIN_REWARD_RISK": "exec_agent_min_reward_risk",
     "EXEC_AGENT_RELAXED_MIN_REWARD_RISK": "exec_agent_relaxed_min_reward_risk",
@@ -92,6 +112,12 @@ _ENV_FIELDS = {
     "EXEC_AGENT_TACTICAL_SCALP_MAX_STOP_PCT": "exec_agent_tactical_scalp_max_stop_pct",
     "EXEC_AGENT_MAX_ACCOUNT_SNAPSHOT_AGE_SECONDS": "exec_agent_max_account_snapshot_age_seconds",
     "EXEC_AGENT_MAX_HOLDING_TRADING_SESSIONS": "exec_agent_max_holding_trading_sessions",
+    "EXEC_AGENT_FIRST_TAKE_PROFIT_PCT": "exec_agent_first_take_profit_pct",
+    "EXEC_AGENT_FINAL_TAKE_PROFIT_PCT": "exec_agent_final_take_profit_pct",
+    "EXEC_AGENT_PARTIAL_TAKE_PROFIT_FRACTION": "exec_agent_partial_take_profit_fraction",
+    "MONTHLY_TARGET_KRW": "monthly_target_krw",
+    "MONTHLY_CAPITAL_PRESERVATION_ENABLED": "monthly_capital_preservation_enabled",
+    "MONTHLY_AGGRESSIVE_LAG_RATIO": "monthly_aggressive_lag_ratio",
     "KIS_APP_KEY": "kis_app_key",
     "KIS_APP_SECRET": "kis_app_secret",
     "KIS_ACCOUNT_NUMBER": "kis_account_number",

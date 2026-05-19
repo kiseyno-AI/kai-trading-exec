@@ -156,6 +156,8 @@ def build_test_app(
     runtime_mode: str = "live",
     exec_agent_max_symbol_budget: Decimal = Decimal("300000"),
     exec_agent_max_total_budget: Decimal = Decimal("600000"),
+    exec_agent_max_daily_new_buy_notional: Decimal = Decimal("2000000"),
+    exec_agent_stop_loss_pct: Decimal = Decimal("0.10"),
 ):
     settings = Settings(
         database_url="sqlite:///:memory:",
@@ -165,6 +167,11 @@ def build_test_app(
         kis_account_number="12345678",
         exec_agent_max_symbol_budget=exec_agent_max_symbol_budget,
         exec_agent_max_total_budget=exec_agent_max_total_budget,
+        exec_agent_base_risk_pct=Decimal("0.01"),
+        exec_agent_aggressive_confidence_threshold=Decimal("0.80"),
+        exec_agent_max_position_allocation_pct=Decimal("0.50"),
+        exec_agent_max_daily_new_buy_notional=exec_agent_max_daily_new_buy_notional,
+        exec_agent_stop_loss_pct=exec_agent_stop_loss_pct,
     )
     engine = create_db_engine(settings)
     Base.metadata.create_all(engine)
@@ -401,13 +408,14 @@ def test_strict_short_term_exec_agent_reserves_available_cash_across_candidates_
 
     assert first_audit["base_budget"] == "400000.0000"
     assert first_audit["final_budget"] == "400000.0000"
-    assert by_symbol["005930"]["quantity_policy"]["quantity"] == 8
-    assert second_audit["base_budget"] == "100000.0000"
-    assert second_audit["final_budget"] == "100000.0000"
-    assert second_audit["remaining_available_cash"] == "100000.0000"
+    assert by_symbol["005930"]["quantity_policy"]["quantity"] == 2
+    assert second_audit["base_budget"] == "400000.0000"
+    assert second_audit["final_budget"] == "400000.0000"
+    assert second_audit["remaining_available_cash"] == "400000.0000"
     assert by_symbol["000660"]["quantity_policy"]["quantity"] == 2
-    assert by_symbol["035420"]["status"] == "exec_agent_rejected"
-    assert third_audit["reason_code"] == "insufficient_cash"
+    assert by_symbol["035420"]["status"] == "next_open_buy_scheduled"
+    assert third_audit["risk_based_quantity"] == 2
+    assert by_symbol["035420"]["quantity_policy"]["quantity"] == 2
 
     engine.dispose()
 
@@ -463,6 +471,105 @@ def test_strict_short_term_exec_agent_applies_target_liquidity_and_spread_adjust
     engine.dispose()
 
 
+def test_short_term_exec_agent_quantity_is_capped_by_stop_distance_risk() -> None:
+    adapter = StubBrokerAdapter(available_cash=Decimal("2000000"))
+    app, engine = build_test_app(
+        adapter,
+        exec_agent_max_symbol_budget=Decimal("500000"),
+        exec_agent_max_total_budget=Decimal("2000000"),
+    )
+    client = TestClient(app)
+
+    response = client.post(
+        "/execution-plans/preview",
+        json=short_term_plan_payload(
+            exec_agent_decision=strict_exec_decision(
+                "0.82",
+                max_budget="500000",
+                target_price="65000",
+                stop_price="40000",
+            )
+        ),
+    )
+
+    assert response.status_code == 200
+    item = response.json()["items"][0]
+    audit = item["risk_context"]["exec_agent_decision"]
+    assert item["quantity_policy"]["quantity"] == 6
+    assert audit["risk_based_quantity"] == 6
+    assert audit["allocation_quantity"] == 8
+    assert audit["stop_distance"] == "5000.0000"
+
+    engine.dispose()
+
+
+def test_short_term_exec_agent_enforces_daily_new_buy_notional_cap() -> None:
+    adapter = StubBrokerAdapter(available_cash=Decimal("2000000"))
+    app, engine = build_test_app(
+        adapter,
+        exec_agent_max_symbol_budget=Decimal("500000"),
+        exec_agent_max_total_budget=Decimal("2000000"),
+        exec_agent_max_daily_new_buy_notional=Decimal("120000"),
+    )
+    client = TestClient(app)
+
+    response = client.post(
+        "/execution-plans/preview",
+        json=multi_short_term_plan_payload(
+            candidates=[
+                ("005930", "candidate-first", strict_exec_decision("0.82")),
+                ("000660", "candidate-second", strict_exec_decision("0.82")),
+            ]
+        ),
+    )
+
+    assert response.status_code == 200
+    items = {
+        item["symbol"]: item
+        for item in response.json()["items"]
+        if item["intent"] == "next_open_buy"
+    }
+    assert items["005930"]["quantity_policy"]["quantity"] == 2
+    assert items["000660"]["status"] == "exec_agent_rejected"
+    assert items["000660"]["risk_context"]["exec_agent_decision"]["reason_code"] == "daily_new_buy_cap_reached"
+
+    engine.dispose()
+
+
+def test_short_term_exec_agent_uses_configured_hard_stop_when_upstream_stop_is_looser() -> None:
+    adapter = StubBrokerAdapter(available_cash=Decimal("2000000"))
+    app, engine = build_test_app(
+        adapter,
+        exec_agent_max_symbol_budget=Decimal("500000"),
+        exec_agent_max_total_budget=Decimal("2000000"),
+        exec_agent_stop_loss_pct=Decimal("0.04"),
+    )
+    client = TestClient(app)
+
+    response = client.post(
+        "/execution-plans/preview",
+        json=short_term_plan_payload(
+            exec_agent_decision=strict_exec_decision(
+                "0.82",
+                max_budget="500000",
+                target_price="56000",
+                stop_price="45000",
+            )
+        ),
+    )
+
+    assert response.status_code == 200
+    items = response.json()["items"]
+    buy_item = items[0]
+    stop_item = [item for item in items if item["intent"] == "stop_sell"][0]
+    audit = buy_item["risk_context"]["exec_agent_decision"]
+    assert audit["upstream_stop_price"] == "45000.0000"
+    assert audit["stop_price"] == "48000.0000"
+    assert stop_item["trigger_price"] == "48000.0000"
+
+    engine.dispose()
+
+
 def test_strict_and_legacy_short_term_exec_agent_confidence_multipliers_stay_aligned() -> None:
     cases = [
         (Decimal("0.82"), "high"),
@@ -491,14 +598,17 @@ def test_short_term_exec_agent_approves_market_open_buy_and_materializes_monitor
     payload = response.json()
     assert payload["exec_agent"]["approved_count"] == 1
     assert payload["exec_agent"]["rejected_count"] == 0
-    assert len(payload["persisted_execution_item_ids"]) == 4
+    assert len(payload["persisted_execution_item_ids"]) == 5
 
     plans = client.get("/execution-plans").json()
-    items_by_intent = {item["intent"]: item for item in plans[0]["items"]}
+    items_by_intent = {item["intent"]: item for item in plans[0]["items"] if item["intent"] != "target_sell"}
+    target_items = [item for item in plans[0]["items"] if item["intent"] == "target_sell"]
     assert items_by_intent["next_open_buy"]["status"] == "next_open_buy_scheduled"
-    assert items_by_intent["next_open_buy"]["quantity_policy"]["quantity"] == 5
-    assert items_by_intent["target_sell"]["status"] == "target_sell_monitoring"
-    assert items_by_intent["target_sell"]["trigger_price"] == "56000.0000"
+    assert items_by_intent["next_open_buy"]["quantity_policy"]["quantity"] == 2
+    assert [item["quantity_policy"]["quantity"] for item in target_items] == [1, 1]
+    assert [item["trigger_price"] for item in target_items] == ["52000.0000", "54000.0000"]
+    assert target_items[0]["risk_context"]["exit_rule"]["kind"] == "partial_take_profit"
+    assert target_items[1]["risk_context"]["exit_rule"]["kind"] == "final_take_profit"
     assert items_by_intent["stop_sell"]["status"] == "stop_sell_monitoring"
     assert items_by_intent["stop_sell"]["trigger_price"] == "47000.0000"
     assert items_by_intent["max_holding_close_sell"]["status"] == "max_holding_close_sell_monitoring"
@@ -510,7 +620,7 @@ def test_short_term_exec_agent_approves_market_open_buy_and_materializes_monitor
     assert dispatch.json()["completed_job_count"] == 1
     assert len(adapter.order_calls) == 1
     order_call = adapter.order_calls[0]
-    assert order_call.quantity == 5
+    assert order_call.quantity == 2
     assert order_call.order_type == "market"
     assert order_call.idempotency_key == (
         "short-term-exec-agent:plan-short-term-agent-1:watcher-candidate-1"
@@ -534,10 +644,11 @@ def test_short_term_exec_agent_approves_market_open_buy_and_materializes_monitor
             "watcher_signal_id": "sig-1",
             "confirmation_signal": "momentum_continuation",
         }
-        assert audit["max_quantity"] == 5
+        assert audit["max_quantity"] == 2
         assert audit["max_budget"] == "260000.0000"
         assert audit["reward_risk"] == "2.0000"
-        assert audit["exposure_after_trade"] == "250000.0000"
+        assert audit["exposure_after_trade"] == "100000.0000"
+        assert audit["risk_based_quantity"] == 2
         assert audit["reason_code"] == "approved"
         assert audit["risk_flags"] == [
             "confirmation:momentum_continuation",
@@ -558,7 +669,7 @@ def test_short_term_exec_agent_rejects_insufficient_cash() -> None:
     assert response.status_code == 201
     item = client.get("/execution-plans").json()[0]["items"][0]
     assert item["status"] == "exec_agent_rejected"
-    assert item["risk_context"]["exec_agent_decision"]["reason_code"] == "insufficient_cash"
+    assert item["risk_context"]["exec_agent_decision"]["reason_code"] == "risk_budget_too_small"
     assert client.get("/execution-jobs").json() == []
     assert adapter.order_calls == []
 
@@ -620,7 +731,7 @@ def test_short_term_exec_agent_rejects_existing_holding_add_on_when_exposure_cap
     assert item["status"] == "exec_agent_rejected"
     assert audit["reason_code"] == "symbol_exposure_cap_exceeded"
     assert audit["existing_holding"] == 3
-    assert audit["exposure_after_trade"] == "200000.0000"
+    assert audit["exposure_after_trade"] is None
     assert audit["max_symbol_exposure"] == "100000.0000"
     assert adapter.order_calls == []
 
@@ -790,13 +901,14 @@ def test_short_term_exec_agent_preview_does_not_persist_or_submit() -> None:
     assert payload["dry_run"] is True
     assert payload["exec_agent"]["approved_count"] == 1
     assert payload["execution_jobs"][0]["job_type"] == "next_open_buy"
-    assert payload["items"][0]["quantity_policy"]["quantity"] == 5
+    assert payload["items"][0]["quantity_policy"]["quantity"] == 2
     assert {item["intent"] for item in payload["items"]} == {
         "next_open_buy",
         "target_sell",
         "stop_sell",
         "max_holding_close_sell",
     }
+    assert [item["intent"] for item in payload["items"]].count("target_sell") == 2
     assert adapter.order_calls == []
 
     with app.state.db_session_factory() as session:
@@ -942,7 +1054,9 @@ def test_openclaw_exec_agent_client_handoff_builds_context_and_sizes_without_pre
         "momentum_continuation",
     ]
     assert audit["final_budget"] == "350000.0000"
-    assert plan.items[0].quantity_policy["quantity"] == 7
+    assert plan.items[0].quantity_policy["quantity"] == 1
+    assert audit["risk_based_quantity"] == 6
+    assert audit["allocation_quantity"] == 1
 
     engine.dispose()
 
@@ -1069,12 +1183,12 @@ def test_openclaw_exec_agent_batch_client_sees_all_candidates_and_allocates_diff
     assert request.risk_caps["max_total_budget"] == "1000000.0000"
 
     buy_items = {item.symbol: item for item in plan.items if item.intent == "next_open_buy"}
-    assert buy_items["005930"].quantity_policy["quantity"] == 2
-    assert buy_items["000660"].quantity_policy["quantity"] == 4
+    assert buy_items["005930"].quantity_policy["quantity"] == 1
+    assert buy_items["000660"].quantity_policy["quantity"] == 1
     assert buy_items["005930"].risk_context["exec_agent_decision"]["final_budget"] == "100000.0000"
     assert buy_items["000660"].risk_context["exec_agent_decision"]["final_budget"] == "200000.0000"
-    assert buy_items["005930"].risk_context["exec_agent_decision"]["approved_notional"] == "100000.0000"
-    assert buy_items["000660"].risk_context["exec_agent_decision"]["approved_notional"] == "200000.0000"
+    assert buy_items["005930"].risk_context["exec_agent_decision"]["approved_notional"] == "50000.0000"
+    assert buy_items["000660"].risk_context["exec_agent_decision"]["approved_notional"] == "50000.0000"
     assert [item.intent for item in plan.items].count("max_holding_close_sell") == 2
 
     engine.dispose()
@@ -1349,6 +1463,6 @@ def test_max_holding_close_exit_is_monitored_across_days_and_submits_sell() -> N
     max_exit_items = [item for item in payload["items"] if item["intent"] == "max_holding_close_sell"]
     assert max_exit_items[0]["outcome"] == "submitted"
     assert adapter.order_calls[-1].side == "sell"
-    assert adapter.order_calls[-1].quantity == 5
+    assert adapter.order_calls[-1].quantity == 2
 
     engine.dispose()
