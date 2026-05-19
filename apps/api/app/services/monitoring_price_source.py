@@ -69,6 +69,7 @@ class KisCurrentQuoteMonitoringPriceSource:
                     MonitoringPriceRequest(
                         symbol=quote.symbol,
                         price=quote.price,
+                        observed_at=quote.observed_at,
                     )
                 )
             return prices

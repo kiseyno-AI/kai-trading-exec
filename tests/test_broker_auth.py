@@ -1586,7 +1586,7 @@ def test_execution_plan_items_preserve_cross_decider_identity_without_symbol_dat
     engine.dispose()
 
 
-def test_short_term_buy_items_are_safely_blocked_from_scheduling() -> None:
+def test_short_term_watch_buy_items_are_monitored_without_open_scheduling() -> None:
     broker_adapter = StubBrokerAdapter(
         config=BrokerConfig(
             provider="kis",
@@ -1652,6 +1652,16 @@ def test_short_term_buy_items_are_safely_blocked_from_scheduling() -> None:
                     "decision_agent_name": "short-term-decider",
                     "source_plan_item_id": "core-plain-next-open-entry-1",
                 },
+                {
+                    "symbol": "068270",
+                    "side": "buy",
+                    "intent": "next_open_buy",
+                    "quantity_policy": {"kind": "shares", "quantity": 4},
+                    "limit_price": "150000.00",
+                    "buy_recommendation_price": "149500.00",
+                    "decision_agent_name": "short-term-decider",
+                    "source_plan_item_id": "core-recommendation-only-entry-1",
+                },
             ],
         },
     )
@@ -1662,9 +1672,12 @@ def test_short_term_buy_items_are_safely_blocked_from_scheduling() -> None:
         item["source_plan_item_id"]: item
         for item in plans_payload[0]["items"]
     }
-    assert items_by_source["core-tactical-entry-1"]["status"] == "unsupported_semantics"
-    assert items_by_source["core-trigger-chase-entry-1"]["status"] == "pending_configuration"
+    assert items_by_source["core-tactical-entry-1"]["status"] == "watch_monitoring_active"
+    assert items_by_source["core-trigger-chase-entry-1"]["status"] == "watch_monitoring_active"
     assert items_by_source["core-plain-next-open-entry-1"]["status"] == "short_term_watcher_pending"
+    recommendation_only_item = items_by_source["core-recommendation-only-entry-1"]
+    assert recommendation_only_item["status"] == "watch_monitoring_active"
+    assert recommendation_only_item["trigger_price"] == "149500.0000"
 
     jobs_payload = client.get("/execution-jobs").json()
     assert jobs_payload == []
@@ -1676,6 +1689,330 @@ def test_short_term_buy_items_are_safely_blocked_from_scheduling() -> None:
     assert dispatch_payload["failed_job_count"] == 0
     assert broker_adapter.order_calls == []
     assert client.get("/orders").json() == []
+
+    engine.dispose()
+
+
+def _build_watch_buy_test_app(
+    *,
+    order_id: str = "kis-watch-buy-100",
+    resume: bool = True,
+    max_quote_age_seconds: int = 30,
+):
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(broker_order_id=order_id),
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+            monitoring_max_quote_age_seconds=max_quote_age_seconds,
+        ),
+        broker_adapter=broker_adapter,
+    )
+    client = TestClient(app)
+    if resume:
+        response = client.post(
+            "/controls/resume",
+            json={"actor": "ops", "source": "console", "reason": "enable watch buys"},
+        )
+        assert response.status_code == 200
+    return app, engine, client, broker_adapter
+
+
+def _create_watch_buy_candidate(
+    client: TestClient,
+    *,
+    plan_id: str,
+    trigger_price: str = "71000.00",
+    chase_limit_price: str | None = "71200.00",
+) -> str:
+    item = {
+        "symbol": "005930",
+        "side": "buy",
+        "intent": "next_open_buy",
+        "quantity_policy": {"kind": "shares", "quantity": 2},
+        "buy_recommendation_price": trigger_price,
+        "time_in_force": "day",
+        "risk_context": {"exchange": "KRX"},
+        "decision_agent_name": "short-term-decider",
+        "source_plan_item_id": f"{plan_id}-watch",
+    }
+    if chase_limit_price is not None:
+        item["chase_limit_price"] = chase_limit_price
+    response = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": plan_id,
+            "source": "kai-trading-core",
+            "market_date": "2024-01-03",
+            "items": [item],
+        },
+    )
+    assert response.status_code == 201
+    item_id = response.json()["persisted_execution_item_ids"][0]
+    persisted_item = client.get("/execution-plans").json()[0]["items"][0]
+    assert persisted_item["status"] == "watch_monitoring_active"
+    assert persisted_item["trigger_price"] == f"{Decimal(trigger_price):.4f}"
+    assert client.get("/execution-jobs").json() == []
+    assert client.get("/orders").json() == []
+    return item_id
+
+
+def test_watch_buy_candidate_waits_until_trigger_then_submits_limit_buy() -> None:
+    app, engine, client, broker_adapter = _build_watch_buy_test_app(
+        order_id="kis-watch-buy-trigger-1"
+    )
+    item_id = _create_watch_buy_candidate(
+        client,
+        plan_id="plan-watch-buy-trigger-1",
+    )
+
+    waiting = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "below trigger should keep monitoring",
+            "prices": [{"symbol": "005930", "price": "70900.00"}],
+        },
+    )
+    assert waiting.status_code == 200
+    assert waiting.json()["items"][0]["outcome"] == "waiting"
+    assert broker_adapter.order_calls == []
+
+    triggered = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "trigger watch buy",
+            "prices": [{"symbol": "005930", "price": "71050.00"}],
+        },
+    )
+
+    assert triggered.status_code == 200
+    payload = triggered.json()
+    assert payload["triggered_item_count"] == 1
+    assert payload["submitted_order_count"] == 1
+    assert payload["items"][0]["outcome"] == "submitted"
+    assert payload["items"][0]["status"] == "watch_buy_submitted"
+
+    assert len(broker_adapter.order_calls) == 1
+    order_call = broker_adapter.order_calls[0]
+    assert order_call.execution_plan_item_id == item_id
+    assert order_call.side == "buy"
+    assert order_call.quantity == 2
+    assert order_call.order_type == "limit"
+    assert order_call.limit_price == Decimal("71050.00")
+
+    with app.state.db_session_factory() as session:
+        item = session.get(ExecutionPlanItem, item_id)
+        assert item is not None
+        assert item.status == "watch_buy_submitted"
+        order = session.scalar(
+            select(BrokerOrder).where(BrokerOrder.execution_plan_item_id == item_id)
+        )
+        assert order is not None
+        assert order.idempotency_key == f"monitoring:watch_buy:{item_id}"
+
+    engine.dispose()
+
+
+def test_watch_buy_rejects_gap_above_chase_limit() -> None:
+    app, engine, client, broker_adapter = _build_watch_buy_test_app()
+    item_id = _create_watch_buy_candidate(
+        client,
+        plan_id="plan-watch-buy-chase-limit-1",
+        trigger_price="71000.00",
+        chase_limit_price="71100.00",
+    )
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "gap above chase limit",
+            "prices": [{"symbol": "005930", "price": "71200.00"}],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["triggered_item_count"] == 1
+    assert payload["submitted_order_count"] == 0
+    assert payload["blocked_item_count"] == 1
+    assert payload["items"][0]["outcome"] == "rejected"
+    assert payload["items"][0]["message"] == "observed price is above chase_limit_price"
+    assert broker_adapter.order_calls == []
+
+    with app.state.db_session_factory() as session:
+        item = session.get(ExecutionPlanItem, item_id)
+        assert item is not None
+        assert item.status == "watch_buy_rejected"
+        assert item.risk_context["last_monitoring_event"]["reason"] == "price_above_chase_limit"
+
+    engine.dispose()
+
+
+def test_watch_buy_rejects_stale_quote_without_submitting() -> None:
+    app, engine, client, broker_adapter = _build_watch_buy_test_app(
+        max_quote_age_seconds=10
+    )
+    item_id = _create_watch_buy_candidate(
+        client,
+        plan_id="plan-watch-buy-stale-quote-1",
+    )
+    stale_observed_at = (datetime.now(UTC) - timedelta(seconds=60)).isoformat()
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "stale quote should block watch buy",
+            "prices": [
+                {
+                    "symbol": "005930",
+                    "price": "71050.00",
+                    "observed_at": stale_observed_at,
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["submitted_order_count"] == 0
+    assert payload["blocked_item_count"] == 1
+    assert payload["items"][0]["outcome"] == "stale_quote"
+    assert "quote is stale" in payload["items"][0]["message"]
+    assert broker_adapter.order_calls == []
+
+    with app.state.db_session_factory() as session:
+        item = session.get(ExecutionPlanItem, item_id)
+        assert item is not None
+        assert item.status == "watch_monitoring_active"
+        assert item.risk_context["last_monitoring_event"]["reason"] == "stale_quote"
+
+    engine.dispose()
+
+
+def test_watch_buy_safety_pause_keeps_trigger_retryable() -> None:
+    app, engine, client, broker_adapter = _build_watch_buy_test_app(resume=False)
+    item_id = _create_watch_buy_candidate(
+        client,
+        plan_id="plan-watch-buy-paused-1",
+    )
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "paused runtime should block watch buy",
+            "prices": [{"symbol": "005930", "price": "71050.00"}],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["triggered_item_count"] == 1
+    assert payload["submitted_order_count"] == 0
+    assert payload["blocked_item_count"] == 1
+    assert payload["items"][0]["outcome"] == "blocked"
+    assert payload["items"][0]["block_reason"] == "paused"
+    assert payload["items"][0]["status"] == "watch_buy_triggered_blocked"
+    assert broker_adapter.authenticate_calls == 0
+    assert broker_adapter.order_calls == []
+
+    with app.state.db_session_factory() as session:
+        item = session.get(ExecutionPlanItem, item_id)
+        assert item is not None
+        assert item.status == "watch_buy_triggered_blocked"
+        assert item.risk_context["last_monitoring_event"]["reason"] == "paused"
+        assert (
+            item.risk_context["last_monitoring_event"]["event"]
+            == "watch_buy_triggered_blocked"
+        )
+
+    resume = client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "console", "reason": "resume automation"},
+    )
+    assert resume.status_code == 200
+
+    retry = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "resumed runtime should retry watch buy",
+            "prices": [{"symbol": "005930", "price": "71050.00"}],
+        },
+    )
+
+    assert retry.status_code == 200
+    retry_payload = retry.json()
+    assert retry_payload["triggered_item_count"] == 1
+    assert retry_payload["submitted_order_count"] == 1
+    assert retry_payload["items"][0]["outcome"] == "submitted"
+    assert retry_payload["items"][0]["status"] == "watch_buy_submitted"
+    assert len(broker_adapter.order_calls) == 1
+
+    engine.dispose()
+
+
+def test_watch_buy_duplicate_monitor_cycles_do_not_submit_duplicate_order() -> None:
+    app, engine, client, broker_adapter = _build_watch_buy_test_app(
+        order_id="kis-watch-buy-dedupe-1"
+    )
+    item_id = _create_watch_buy_candidate(
+        client,
+        plan_id="plan-watch-buy-dedupe-1",
+    )
+
+    first = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "first trigger",
+            "prices": [{"symbol": "005930", "price": "71050.00"}],
+        },
+    )
+    second = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "duplicate trigger",
+            "prices": [{"symbol": "005930", "price": "71050.00"}],
+        },
+    )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.json()["submitted_order_count"] == 1
+    assert second.json()["submitted_order_count"] == 0
+    assert len(broker_adapter.order_calls) == 1
+
+    with app.state.db_session_factory() as session:
+        orders = session.scalars(
+            select(BrokerOrder).where(BrokerOrder.execution_plan_item_id == item_id)
+        ).all()
+        assert len(orders) == 1
 
     engine.dispose()
 
