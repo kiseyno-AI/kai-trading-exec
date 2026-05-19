@@ -61,6 +61,61 @@ CONVICTION_MULTIPLIERS = {
     "low": Decimal("0.50"),
     "weak": Decimal("0.50"),
 }
+CONFIRMATION_SIGNAL_KEYS = (
+    "confirmation_signal",
+    "confirmation",
+    "confirmed_signal",
+    "entry_confirmation",
+    "breakout",
+    "vwap_recovery",
+    "vwap_reclaim",
+    "vwap_recovered",
+    "trigger_hit",
+    "trigger_price_hit",
+    "liquidity_expansion",
+    "liquidity_confirmed",
+    "volume_expansion",
+    "volume_confirmed",
+    "momentum_continuation",
+    "short_term_momentum",
+)
+CONFIRMATION_SIGNAL_VALUES = frozenset(
+    {
+        "breakout",
+        "vwap_recovery",
+        "vwap_reclaim",
+        "trigger_hit",
+        "trigger_price_hit",
+        "liquidity_expansion",
+        "liquidity_confirmed",
+        "volume_expansion",
+        "volume_confirmed",
+        "momentum_continuation",
+        "short_term_momentum",
+        "momentum_continuation_confirmed",
+        "deep_liquidity",
+    }
+)
+RELAXED_REWARD_RISK_FLAGS = frozenset(
+    {
+        "high_confidence",
+        "liquidity_confirmed",
+        "liquidity_expansion",
+        "volume_expansion",
+        "volume_confirmed",
+        "deep_liquidity",
+        "breakout",
+        "vwap_recovery",
+        "momentum_continuation",
+    }
+)
+ENTRY_LIMIT_KEYS = (
+    "chase_limit_price",
+    "max_chase_limit_price",
+    "entry_limit_price",
+    "planned_entry_price",
+    "planned_entry_limit",
+)
 
 
 class ShortTermExecAgentContract(BaseModel):
@@ -75,10 +130,14 @@ class ShortTermExecAgentContract(BaseModel):
     reference_price: Decimal | None = Field(default=None, gt=0)
     target_price: Decimal | None = Field(default=None, gt=0)
     stop_price: Decimal | None = Field(default=None, gt=0)
+    reward_risk: Decimal | None = Field(default=None, gt=0)
+    exposure_after_trade: Decimal | None = Field(default=None, ge=0)
     allow_existing_holding: bool = False
+    special_tactical_scalp: bool = False
     reason_code: str | None = Field(default=None, min_length=1, max_length=64)
     reason: str | None = Field(default=None, max_length=512)
     feedback_ids: list[str] = Field(default_factory=list)
+    risk_flags: list[str] = Field(default_factory=list)
     context: dict[str, Any] | None = None
 
     @field_validator("reason_code", "reason")
@@ -91,16 +150,16 @@ class ShortTermExecAgentContract(BaseModel):
             raise ValueError("field must not be empty")
         return normalized
 
-    @field_validator("feedback_ids")
+    @field_validator("feedback_ids", "risk_flags")
     @classmethod
-    def normalize_feedback_ids(cls, values: list[str]) -> list[str]:
+    def normalize_text_list(cls, values: list[str]) -> list[str]:
         normalized: list[str] = []
         for value in values:
             if not isinstance(value, str):
-                raise ValueError("feedback_ids must contain strings")
+                raise ValueError("items must contain strings")
             stripped = value.strip()
             if not stripped:
-                raise ValueError("feedback_ids must not contain empty strings")
+                raise ValueError("items must not contain empty strings")
             normalized.append(stripped)
         return normalized
 
@@ -177,14 +236,21 @@ class ExecAgentSizingResponse(BaseModel):
 
     action: Literal["approve", "reject"]
     quantity: int | None = Field(default=None, gt=0)
+    max_quantity: int | None = Field(default=None, gt=0)
+    max_budget: Decimal | None = Field(default=None, gt=0)
     final_budget: Decimal | None = Field(default=None, gt=0)
     reference_price: Decimal | None = Field(default=None, gt=0)
     target_price: Decimal | None = Field(default=None, gt=0)
     stop_price: Decimal | None = Field(default=None, gt=0)
+    reward_risk: Decimal | None = Field(default=None, gt=0)
+    exposure_after_trade: Decimal | None = Field(default=None, ge=0)
     confidence: Decimal = Field(ge=Decimal("0"), le=Decimal("1"))
+    reason_code: str | None = Field(default=None, min_length=1, max_length=64)
+    reason: str | None = Field(default=None, max_length=512)
     reasons: list[str] = Field(default_factory=list)
     risk_flags: list[str] = Field(default_factory=list)
     allow_existing_holding: bool = False
+    special_tactical_scalp: bool = False
     explanation: dict[str, Any] | None = None
 
     @field_validator("reasons", "risk_flags")
@@ -202,6 +268,10 @@ class ExecAgentSizingResponse(BaseModel):
 
     @model_validator(mode="after")
     def validate_decision(self) -> ExecAgentSizingResponse:
+        if self.final_budget is None and self.max_budget is not None:
+            self.final_budget = self.max_budget
+        if self.quantity is None and self.max_quantity is not None:
+            self.quantity = self.max_quantity
         if self.action == "approve":
             missing = [
                 field
@@ -593,8 +663,8 @@ def _decide_candidate(
     if item.trigger_price is not None or _has_chase_or_trigger_fields(item):
         return _reject(
             base,
-            "unsupported_entry_trigger_or_chase",
-            "short-term exec agent does not support trigger/chase buy semantics",
+            "unsupported_entry_trigger",
+            "short-term exec agent does not support trigger buy semantics",
             agent_contract=agent_contract,
         )
     available_cash = account_context.available_cash
@@ -623,15 +693,6 @@ def _decide_candidate(
             available_cash=available_cash,
         )
     existing_holding = account_context.holdings_by_symbol.get(item.symbol, 0)
-    if existing_holding > 0 and not agent_contract.allow_existing_holding:
-        return _reject(
-            base,
-            "existing_holding",
-            "existing holding blocks short-term add-on buy",
-            agent_contract=agent_contract,
-            available_cash=available_cash,
-            existing_holding=existing_holding,
-        )
     if _has_duplicate_open_buy_order(
         item=item,
         idempotency_key=idempotency_key,
@@ -653,6 +714,106 @@ def _decide_candidate(
             "market buy sizing requires a strict positive reference_price",
             agent_contract=agent_contract,
             available_cash=available_cash,
+        )
+
+    entry_limit_price = _entry_limit_price(item=item, agent_contract=agent_contract)
+    if _price_above_entry_limit(
+        settings=settings,
+        reference_price=sizing_price,
+        entry_limit_price=entry_limit_price,
+    ):
+        return _reject(
+            base,
+            "price_above_entry_limit",
+            "reference price is above the planned entry/chase limit",
+            agent_contract=agent_contract,
+            available_cash=available_cash,
+            existing_holding=existing_holding,
+            sizing_price=sizing_price,
+            details={
+                "entry_limit_price": _serialize_decimal(entry_limit_price),
+                "max_entry_premium_pct": _serialize_decimal(
+                    _settings_non_negative_decimal(
+                        settings,
+                        "exec_agent_max_entry_premium_pct",
+                        Decimal("0"),
+                    )
+                ),
+            },
+        )
+
+    reward_risk = _reward_risk(
+        reference_price=sizing_price,
+        target_price=agent_contract.target_price,
+        stop_price=agent_contract.stop_price,
+    ) or agent_contract.reward_risk
+    if reward_risk is None:
+        return _reject(
+            base,
+            "invalid_reward_risk_prices",
+            "target and stop must create positive reward and risk distances",
+            agent_contract=agent_contract,
+            available_cash=available_cash,
+            existing_holding=existing_holding,
+            sizing_price=sizing_price,
+            details=_decision_contract_fields(
+                agent_contract=agent_contract,
+                reward_risk=None,
+                exposure_after_trade=None,
+            ),
+        )
+    reward_risk_threshold = _reward_risk_threshold(settings=settings, agent_contract=agent_contract)
+    if _reward_risk_below_floor(settings=settings, agent_contract=agent_contract, reward_risk=reward_risk, reference_price=sizing_price):
+        return _reject(
+            base,
+            "reward_risk_below_minimum",
+            "reward/risk is below the absolute exec-agent floor",
+            agent_contract=agent_contract,
+            available_cash=available_cash,
+            existing_holding=existing_holding,
+            sizing_price=sizing_price,
+            details=_decision_contract_fields(
+                agent_contract=agent_contract,
+                reward_risk=reward_risk,
+                exposure_after_trade=None,
+                extra={
+                    "required_reward_risk": _serialize_decimal(
+                        _settings_decimal(settings, "exec_agent_absolute_min_reward_risk", Decimal("1.00"))
+                    )
+                },
+            ),
+        )
+    if reward_risk < reward_risk_threshold:
+        return _reject(
+            base,
+            "reward_risk_below_threshold",
+            "reward/risk is below the configured approval threshold",
+            agent_contract=agent_contract,
+            available_cash=available_cash,
+            existing_holding=existing_holding,
+            sizing_price=sizing_price,
+            details=_decision_contract_fields(
+                agent_contract=agent_contract,
+                reward_risk=reward_risk,
+                exposure_after_trade=None,
+                extra={"required_reward_risk": _serialize_decimal(reward_risk_threshold)},
+            ),
+        )
+    confirmation_signal = _confirmation_signal(item=item, agent_contract=agent_contract)
+    if confirmation_signal is None:
+        return _reject(
+            base,
+            "missing_confirmation_signal",
+            "approval requires breakout, VWAP, trigger, liquidity, volume, or momentum confirmation",
+            agent_contract=agent_contract,
+            available_cash=available_cash,
+            existing_holding=existing_holding,
+            sizing_price=sizing_price,
+            details=_decision_contract_fields(
+                agent_contract=agent_contract,
+                reward_risk=reward_risk,
+                exposure_after_trade=None,
+            ),
         )
 
     sizing_budget = _candidate_sizing_budget(
@@ -701,31 +862,95 @@ def _decide_candidate(
         "exec_agent_max_symbol_budget",
         Decimal("1000000"),
     )
+    existing_symbol_exposure = sizing_price * Decimal(existing_holding)
+    exposure_after_trade = existing_symbol_exposure + approved_notional
+    max_symbol_exposure = _max_symbol_exposure_budget(
+        settings=settings,
+        available_cash=available_cash,
+        agent_contract=agent_contract,
+    )
+    if existing_holding > 0 and exposure_after_trade > max_symbol_exposure:
+        return _reject(
+            base,
+            "symbol_exposure_cap_exceeded",
+            "projected add-on position exceeds max symbol exposure",
+            agent_contract=agent_contract,
+            available_cash=available_cash,
+            existing_holding=existing_holding,
+            sizing_price=sizing_price,
+            details=_decision_contract_fields(
+                agent_contract=agent_contract,
+                reward_risk=reward_risk,
+                exposure_after_trade=exposure_after_trade,
+                extra={
+                    "approved_notional": _serialize_decimal(approved_notional),
+                    "existing_symbol_exposure": _serialize_decimal(existing_symbol_exposure),
+                    "max_symbol_exposure": _serialize_decimal(max_symbol_exposure),
+                },
+            ),
+        )
+
+    position_risk = (sizing_price - agent_contract.stop_price) * Decimal(quantity)
+    max_trade_risk = _max_trade_risk_budget(settings=settings, available_cash=available_cash)
+    if position_risk > max_trade_risk:
+        return _reject(
+            base,
+            "position_risk_exceeds_cap",
+            "stop distance implies position risk above the per-trade risk cap",
+            agent_contract=agent_contract,
+            available_cash=available_cash,
+            existing_holding=existing_holding,
+            sizing_price=sizing_price,
+            details=_decision_contract_fields(
+                agent_contract=agent_contract,
+                reward_risk=reward_risk,
+                exposure_after_trade=exposure_after_trade,
+                extra={
+                    "position_risk": _serialize_decimal(position_risk),
+                    "max_trade_risk": _serialize_decimal(max_trade_risk),
+                },
+            ),
+        )
+
+    risk_flags = _decision_risk_flags(agent_contract=agent_contract, confirmation_signal=confirmation_signal)
     return {
         **base,
         "action": "approve",
         "reason_code": "approved",
-        "reason": "short-term exec agent approved candidate-aware bounded market-open buy",
+        "reason": "guarded exec-agent buy approved within exposure, reward/risk, and confirmation rails",
         "confidence": _serialize_decimal(agent_contract.confidence),
         "conviction": sizing_budget.conviction,
         "quantity": quantity,
+        "max_quantity": quantity,
         "agent_approved_quantity_upper_bound": agent_contract.max_quantity,
         "order_type": "limit" if item.limit_price is not None else "market",
         "reference_price": _serialize_decimal(sizing_price),
         "sizing_price": _serialize_decimal(sizing_price),
+        "entry_limit_price": _serialize_decimal(entry_limit_price),
         "approved_notional": _serialize_decimal(approved_notional),
         "available_cash": _serialize_decimal(available_cash),
         "remaining_available_cash": _serialize_decimal(remaining_cash),
         "budget": _serialize_decimal(budget),
+        "max_budget": _serialize_decimal(budget),
         "base_budget": _serialize_decimal(sizing_budget.base_budget),
         "budget_multiplier": _serialize_decimal(sizing_budget.budget_multiplier),
         "risk_adjustments": sizing_budget.risk_adjustments,
         "final_budget": _serialize_decimal(sizing_budget.final_budget),
         "max_budget_upper_bound": _serialize_decimal(agent_contract.max_budget),
         "max_symbol_budget_upper_bound": _serialize_decimal(max_symbol_budget),
+        "max_symbol_exposure": _serialize_decimal(max_symbol_exposure),
+        "existing_holding": existing_holding,
+        "existing_symbol_exposure": _serialize_decimal(existing_symbol_exposure),
+        "exposure_after_trade": _serialize_decimal(exposure_after_trade),
         "remaining_total_budget": _serialize_decimal(sizing_budget.remaining_total_budget),
         "target_price": _serialize_decimal(agent_contract.target_price),
         "stop_price": _serialize_decimal(agent_contract.stop_price),
+        "reward_risk": _serialize_decimal(reward_risk),
+        "required_reward_risk": _serialize_decimal(reward_risk_threshold),
+        "position_risk": _serialize_decimal(position_risk),
+        "max_trade_risk": _serialize_decimal(max_trade_risk),
+        "confirmation_signal": confirmation_signal,
+        "risk_flags": risk_flags,
         "allow_existing_holding": agent_contract.allow_existing_holding,
         "feedback_ids": list(agent_contract.feedback_ids),
         "agent_contract": agent_contract.model_dump(mode="json"),
@@ -1030,6 +1255,247 @@ def _first_decimal(source: object, keys: tuple[str, ...]) -> Decimal | None:
     return None
 
 
+def _entry_limit_price(
+    *,
+    item: ExecutionPlanItem,
+    agent_contract: ShortTermExecAgentContract,
+) -> Decimal | None:
+    if item.limit_price is not None and item.limit_price > 0:
+        return item.limit_price
+    return _first_decimal_from_sources(
+        item=item,
+        agent_contract=agent_contract,
+        keys=ENTRY_LIMIT_KEYS,
+    )
+
+
+def _price_above_entry_limit(
+    *,
+    settings: Settings,
+    reference_price: Decimal,
+    entry_limit_price: Decimal | None,
+) -> bool:
+    if entry_limit_price is None or entry_limit_price <= 0:
+        return False
+    max_premium = _settings_non_negative_decimal(
+        settings,
+        "exec_agent_max_entry_premium_pct",
+        Decimal("0"),
+    )
+    return reference_price > (entry_limit_price * (Decimal("1") + max_premium))
+
+
+def _reward_risk(
+    *,
+    reference_price: Decimal,
+    target_price: Decimal | None,
+    stop_price: Decimal | None,
+) -> Decimal | None:
+    if target_price is None or stop_price is None:
+        return None
+    reward = target_price - reference_price
+    risk = reference_price - stop_price
+    if reward <= 0 or risk <= 0:
+        return None
+    return (reward / risk).quantize(Decimal("0.0001"), rounding=ROUND_DOWN)
+
+
+def _reward_risk_threshold(
+    *,
+    settings: Settings,
+    agent_contract: ShortTermExecAgentContract,
+) -> Decimal:
+    normal_threshold = _settings_decimal(
+        settings,
+        "exec_agent_min_reward_risk",
+        Decimal("1.30"),
+    )
+    relaxed_threshold = _settings_decimal(
+        settings,
+        "exec_agent_relaxed_min_reward_risk",
+        Decimal("1.10"),
+    )
+    if _uses_relaxed_reward_risk_threshold(agent_contract=agent_contract):
+        return min(normal_threshold, relaxed_threshold)
+    return normal_threshold
+
+
+def _uses_relaxed_reward_risk_threshold(*, agent_contract: ShortTermExecAgentContract) -> bool:
+    if agent_contract.confidence >= Decimal("0.80"):
+        return True
+    risk_flags = _all_risk_flags(agent_contract=agent_contract)
+    return bool(risk_flags.intersection(RELAXED_REWARD_RISK_FLAGS))
+
+
+def _reward_risk_below_floor(
+    *,
+    settings: Settings,
+    agent_contract: ShortTermExecAgentContract,
+    reward_risk: Decimal,
+    reference_price: Decimal,
+) -> bool:
+    floor = _settings_decimal(settings, "exec_agent_absolute_min_reward_risk", Decimal("1.00"))
+    if reward_risk >= floor:
+        return False
+    return not _allows_special_tactical_scalp(
+        settings=settings,
+        agent_contract=agent_contract,
+        reference_price=reference_price,
+    )
+
+
+def _allows_special_tactical_scalp(
+    *,
+    settings: Settings,
+    agent_contract: ShortTermExecAgentContract,
+    reference_price: Decimal,
+) -> bool:
+    if not agent_contract.special_tactical_scalp or agent_contract.stop_price is None:
+        return False
+    stop_distance = (reference_price - agent_contract.stop_price) / reference_price
+    if stop_distance <= 0:
+        return False
+    max_stop_distance = _settings_decimal(
+        settings,
+        "exec_agent_tactical_scalp_max_stop_pct",
+        Decimal("0.015"),
+    )
+    return stop_distance <= max_stop_distance
+
+
+def _confirmation_signal(
+    *,
+    item: ExecutionPlanItem,
+    agent_contract: ShortTermExecAgentContract,
+) -> str | None:
+    for flag in _all_risk_flags(agent_contract=agent_contract):
+        normalized = _normalize_signal_text(flag)
+        if normalized in CONFIRMATION_SIGNAL_VALUES:
+            return normalized
+
+    for source in _confirmation_sources(item=item, agent_contract=agent_contract):
+        for key in CONFIRMATION_SIGNAL_KEYS:
+            signal = _signal_from_source(source, key)
+            if signal is not None:
+                return signal
+    return None
+
+
+def _confirmation_sources(
+    *,
+    item: ExecutionPlanItem,
+    agent_contract: ShortTermExecAgentContract,
+) -> list[object]:
+    sources: list[object] = [agent_contract.context, item.risk_context, item.quantity_policy]
+    for source in (agent_contract.context, item.risk_context, item.quantity_policy):
+        if not isinstance(source, dict):
+            continue
+        sources.extend(
+            source.get(key)
+            for key in ("decider_output", "market_data", "quote", "orderbook")
+            if isinstance(source.get(key), dict)
+        )
+    return sources
+
+
+def _signal_from_source(source: object, key: str) -> str | None:
+    if not isinstance(source, dict) or key not in source:
+        return None
+    value = source.get(key)
+    if value is True:
+        return key
+    if isinstance(value, str):
+        normalized = _normalize_signal_text(value)
+        if normalized in CONFIRMATION_SIGNAL_VALUES:
+            return normalized
+        if key in CONFIRMATION_SIGNAL_KEYS and normalized not in {"", "false", "none", "no"}:
+            return key
+    if isinstance(value, (list, tuple, set)):
+        for item in value:
+            if isinstance(item, str):
+                normalized = _normalize_signal_text(item)
+                if normalized in CONFIRMATION_SIGNAL_VALUES:
+                    return normalized
+    return None
+
+
+def _normalize_signal_text(value: str) -> str:
+    return value.strip().lower().replace("-", "_").replace(" ", "_")
+
+
+def _all_risk_flags(*, agent_contract: ShortTermExecAgentContract) -> set[str]:
+    flags = {_normalize_signal_text(flag) for flag in agent_contract.risk_flags}
+    context = agent_contract.context
+    if isinstance(context, dict):
+        raw_flags = context.get("risk_flags")
+        if isinstance(raw_flags, list):
+            flags.update(
+                _normalize_signal_text(flag)
+                for flag in raw_flags
+                if isinstance(flag, str) and flag.strip()
+            )
+    return flags
+
+
+def _decision_risk_flags(
+    *,
+    agent_contract: ShortTermExecAgentContract,
+    confirmation_signal: str,
+) -> list[str]:
+    flags = _all_risk_flags(agent_contract=agent_contract)
+    flags.add(f"confirmation:{confirmation_signal}")
+    return sorted(flags)
+
+
+def _max_symbol_exposure_budget(
+    *,
+    settings: Settings,
+    available_cash: Decimal,
+    agent_contract: ShortTermExecAgentContract,
+) -> Decimal:
+    pct_cap = available_cash * _settings_decimal(
+        settings,
+        "exec_agent_max_symbol_exposure_pct",
+        Decimal("0.20"),
+    )
+    absolute_cap = agent_contract.max_symbol_budget or _settings_decimal(
+        settings,
+        "exec_agent_max_symbol_budget",
+        Decimal("1000000"),
+    )
+    return min(pct_cap, absolute_cap)
+
+
+def _max_trade_risk_budget(*, settings: Settings, available_cash: Decimal) -> Decimal:
+    return available_cash * _settings_decimal(
+        settings,
+        "exec_agent_max_trade_risk_pct",
+        Decimal("0.05"),
+    )
+
+
+def _decision_contract_fields(
+    *,
+    agent_contract: ShortTermExecAgentContract,
+    reward_risk: Decimal | None,
+    exposure_after_trade: Decimal | None,
+    extra: dict[str, object] | None = None,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "max_quantity": agent_contract.max_quantity,
+        "max_budget": _serialize_decimal(agent_contract.max_budget),
+        "reference_price": _serialize_decimal(agent_contract.reference_price),
+        "target_price": _serialize_decimal(agent_contract.target_price),
+        "stop_price": _serialize_decimal(agent_contract.stop_price),
+        "reward_risk": _serialize_decimal(reward_risk),
+        "exposure_after_trade": _serialize_decimal(exposure_after_trade),
+        "risk_flags": sorted(_all_risk_flags(agent_contract=agent_contract)),
+    }
+    if extra:
+        payload.update(extra)
+    return payload
+
+
 def _resolve_agent_contracts(
     *,
     settings: Settings,
@@ -1300,13 +1766,32 @@ def _agent_portfolio_payload(account_context: _AccountContext) -> dict[str, obje
 
 
 def _agent_risk_caps(settings: Settings) -> dict[str, object]:
+    max_total_budget = _settings_decimal(settings, "exec_agent_max_total_budget", Decimal("3000000"))
     return {
         "max_symbol_budget": _serialize_decimal(
             _settings_decimal(settings, "exec_agent_max_symbol_budget", Decimal("1000000"))
         ),
-        "max_total_budget": _serialize_decimal(
-            _settings_decimal(settings, "exec_agent_max_total_budget", Decimal("3000000"))
+        "max_total_budget": _serialize_decimal(max_total_budget),
+        "max_intraday_buy_budget": _serialize_decimal(max_total_budget),
+        "max_symbol_exposure_pct": _serialize_decimal(
+            _settings_decimal(settings, "exec_agent_max_symbol_exposure_pct", Decimal("0.20"))
         ),
+        "max_trade_risk_pct": _serialize_decimal(
+            _settings_decimal(settings, "exec_agent_max_trade_risk_pct", Decimal("0.05"))
+        ),
+        "max_entry_premium_pct": _serialize_decimal(
+            _settings_non_negative_decimal(settings, "exec_agent_max_entry_premium_pct", Decimal("0"))
+        ),
+        "min_reward_risk": _serialize_decimal(
+            _settings_decimal(settings, "exec_agent_min_reward_risk", Decimal("1.30"))
+        ),
+        "relaxed_min_reward_risk": _serialize_decimal(
+            _settings_decimal(settings, "exec_agent_relaxed_min_reward_risk", Decimal("1.10"))
+        ),
+        "absolute_min_reward_risk": _serialize_decimal(
+            _settings_decimal(settings, "exec_agent_absolute_min_reward_risk", Decimal("1.00"))
+        ),
+        "add_on_requires_confirmation": True,
         "max_holding_trading_sessions": getattr(settings, "exec_agent_max_holding_trading_sessions", 3),
         "max_account_snapshot_age_seconds": getattr(settings, "exec_agent_max_account_snapshot_age_seconds", 300),
     }
@@ -1314,11 +1799,11 @@ def _agent_risk_caps(settings: Settings) -> dict[str, object]:
 
 def _contract_from_agent_response(response: ExecAgentSizingResponse) -> ShortTermExecAgentContract:
     if response.action == "reject":
-        reason = response.reasons[0] if response.reasons else "OpenClaw exec-agent rejected candidate"
+        reason = response.reason or (response.reasons[0] if response.reasons else "OpenClaw exec-agent rejected candidate")
         return ShortTermExecAgentContract(
             action="reject",
             confidence=response.confidence,
-            reason_code="agent_rejected",
+            reason_code=response.reason_code or "agent_rejected",
             reason=reason,
             context={
                 "openclaw_agent_id": OPENCLAW_EXEC_AGENT_ID,
@@ -1339,8 +1824,12 @@ def _contract_from_agent_response(response: ExecAgentSizingResponse) -> ShortTer
         reference_price=response.reference_price,
         target_price=response.target_price,
         stop_price=response.stop_price,
+        reward_risk=response.reward_risk,
+        exposure_after_trade=response.exposure_after_trade,
         allow_existing_holding=response.allow_existing_holding,
+        special_tactical_scalp=response.special_tactical_scalp,
         reason="; ".join(response.reasons) if response.reasons else None,
+        risk_flags=response.risk_flags,
         context={
             "openclaw_agent_id": OPENCLAW_EXEC_AGENT_ID,
             "requested_quantity": response.quantity,
@@ -1401,6 +1890,7 @@ def _reject(
     available_cash: Decimal | None = None,
     existing_holding: int | None = None,
     sizing_price: Decimal | None = None,
+    details: dict[str, object] | None = None,
 ) -> dict[str, object]:
     payload: dict[str, object] = {
         **base,
@@ -1412,12 +1902,22 @@ def _reject(
         payload["confidence"] = _serialize_decimal(agent_contract.confidence)
         payload["feedback_ids"] = list(agent_contract.feedback_ids)
         payload["agent_contract"] = agent_contract.model_dump(mode="json")
+        payload.update(
+            _decision_contract_fields(
+                agent_contract=agent_contract,
+                reward_risk=agent_contract.reward_risk,
+                exposure_after_trade=agent_contract.exposure_after_trade,
+            )
+        )
     if available_cash is not None:
         payload["available_cash"] = _serialize_decimal(available_cash)
     if existing_holding is not None:
         payload["existing_holding"] = existing_holding
     if sizing_price is not None:
         payload["sizing_price"] = _serialize_decimal(sizing_price)
+        payload["reference_price"] = _serialize_decimal(sizing_price)
+    if details:
+        payload.update(details)
     return payload
 
 
@@ -1615,6 +2115,17 @@ def _settings_decimal(settings: Settings, field_name: str, default: Decimal) -> 
     return parsed
 
 
+def _settings_non_negative_decimal(settings: Settings, field_name: str, default: Decimal) -> Decimal:
+    value = getattr(settings, field_name, default)
+    try:
+        parsed = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return default
+    if parsed < 0:
+        return default
+    return parsed
+
+
 def _serialize_account_snapshot(snapshot: BrokerAccountSnapshot) -> dict[str, object]:
     return {
         "available": True,
@@ -1664,12 +2175,6 @@ def _has_chase_or_trigger_fields(item: ExecutionPlanItem) -> bool:
         if not isinstance(payload, dict):
             continue
         for key in (
-            "chase_limit_price",
-            "chase_limit_offset",
-            "chase_limit_percent",
-            "chase_limit_ticks",
-            "max_chase_limit_price",
-            "entry_limit_price",
             "buy_trigger_price",
             "entry_trigger_price",
             "trigger_price",

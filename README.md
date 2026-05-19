@@ -133,9 +133,10 @@ Current execution slices:
 - `GET /runtime/daily-board` exposes a compact current-day board with runtime status plus symbol rows
 
 Short-term watcher buys fail closed when broker account state cannot be resolved,
-when cash/buying power is insufficient, when a symbol is already held or has an
-open buy order, or when target/stop monitoring context is missing. Exec-agent
-decision metadata is persisted in each plan item's `risk_context`.
+when cash/buying power is insufficient, when an add-on would breach symbol
+exposure or reward/risk guardrails, when a symbol has a duplicate open buy
+order, or when target/stop monitoring context is missing. Exec-agent decision
+metadata is persisted in each plan item's `risk_context`.
 
 ## Boot target
 
