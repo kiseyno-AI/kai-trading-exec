@@ -25,7 +25,7 @@ from app.services.plan_item_identity import (
 )
 
 MONITORED_INTENTS = frozenset({"target_sell", "stop_sell"})
-WATCH_BUY_INTENTS = frozenset({"watch_buy", "trigger_buy", "chase_buy", "tactical_buy"})
+WATCH_BUY_INTENTS = frozenset({"watch_buy", "trigger_buy", "chase_buy", "tactical_buy", "intraday_watch_buy"})
 WATCH_MONITORING_STATUSES = frozenset(
     {
         "watch_monitoring_pending",
@@ -57,7 +57,7 @@ BUY_RECOMMENDATION_FIELDS = (
     "recommendation_price",
     "entry_price",
 )
-BUY_TRIGGER_FIELDS = frozenset({"watch_trigger_price", "buy_trigger_price", "entry_trigger_price", "trigger_price"})
+BUY_TRIGGER_FIELDS = frozenset({"watch_trigger_price", "buy_trigger_price", "entry_trigger_price", "trigger_price", "original_watch_trigger_price"})
 
 
 @dataclass(frozen=True)
@@ -887,7 +887,7 @@ def _watch_buy_trigger_source_and_price(
 
 
 def _watch_buy_chase_limit_price(item: ExecutionPlanItemRequest) -> Decimal | None:
-    for key in ("chase_limit_price", "max_chase_limit_price", "entry_limit_price"):
+    for key in ("chase_limit_price", "max_chase_limit_price", "entry_limit_price", "original_watch_chase_limit_price"):
         value = _first_decimal_from_request(item, key)
         if value is not None:
             return value

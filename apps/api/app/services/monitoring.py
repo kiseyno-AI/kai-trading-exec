@@ -24,7 +24,7 @@ from app.services.broker_orders import place_broker_order
 from app.services.plan_item_identity import serialize_plan_item_source_identity
 
 SELL_MONITORED_INTENTS = frozenset({"target_sell", "stop_sell", "max_holding_close_sell"})
-WATCH_BUY_INTENTS = frozenset({"watch_buy", "trigger_buy", "chase_buy", "tactical_buy", "next_open_buy"})
+WATCH_BUY_INTENTS = frozenset({"watch_buy", "trigger_buy", "chase_buy", "tactical_buy", "intraday_watch_buy", "next_open_buy"})
 MONITORED_INTENTS = SELL_MONITORED_INTENTS | WATCH_BUY_INTENTS
 WATCH_MONITORING_STATUSES = frozenset(
     {
@@ -350,12 +350,12 @@ def _evaluate_monitoring_cycle(
             quantity = approval.quantity
             if quantity is None:
                 blocked_item_count += 1
-                action.item.status = "watch_buy_rejected"
+                action.item.status = "watch_buy_triggered_blocked"
                 _record_monitoring_event(
                     item=action.item,
                     event={
-                        "event": "watch_buy_rejected",
-                        "reason": approval.reason or "risk_rejected",
+                        "event": "watch_buy_triggered_blocked",
+                        "reason": approval.reason or "risk_blocked",
                         "message": approval.message,
                         "observed_price": _serialize_decimal(action.observed_price),
                         "recorded_at": triggered_at.isoformat(),
@@ -364,7 +364,7 @@ def _evaluate_monitoring_cycle(
                 result_by_item_id[action.item.id] = _monitoring_result_payload(
                     item=action.item,
                     observed_price=action.observed_price,
-                    outcome="rejected",
+                    outcome="blocked",
                     message=approval.message,
                 )
                 continue
@@ -746,11 +746,7 @@ def _positions_with_stale_local_state(
 
 def _monitoring_item_is_configured(item: ExecutionPlanItem) -> bool:
     if _is_watch_buy_item(item):
-        return (
-            item.side == "buy"
-            and _watch_buy_trigger_price(item) is not None
-            and _parse_buy_quantity(item.quantity_policy) is not None
-        )
+        return item.side == "buy" and _watch_buy_trigger_price(item) is not None
     if item.side != "sell" or not _quantity_policy_supported(item.quantity_policy):
         return False
     if item.intent == "max_holding_close_sell":
@@ -960,6 +956,7 @@ def _watch_buy_trigger_price(item: ExecutionPlanItem) -> Decimal | None:
             "watch_trigger_price",
             "buy_trigger_price",
             "entry_trigger_price",
+            "original_watch_trigger_price",
         ),
     )
 
@@ -967,7 +964,7 @@ def _watch_buy_trigger_price(item: ExecutionPlanItem) -> Decimal | None:
 def _watch_buy_chase_limit_price(item: ExecutionPlanItem) -> Decimal | None:
     return _first_positive_decimal_from_item(
         item,
-        ("chase_limit_price", "max_chase_limit_price", "entry_limit_price"),
+        ("chase_limit_price", "max_chase_limit_price", "entry_limit_price", "original_watch_chase_limit_price"),
     )
 
 
