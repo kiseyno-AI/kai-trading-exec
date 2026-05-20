@@ -27,6 +27,7 @@ class Settings(BaseModel):
     monitoring_max_symbols_per_cycle: int = Field(default=128, ge=1, le=10000)
     monitoring_max_broker_actions_per_cycle: int = Field(default=32, ge=1, le=10000)
     monitoring_max_quote_age_seconds: int = Field(default=30, ge=1, le=3600)
+    market_timezone: str = "Asia/Seoul"
     exec_agent_enabled: bool = False
     exec_agent_id: str = "exec-agent"
     exec_agent_model: str = "openai-codex/gpt-5.5"
@@ -41,6 +42,12 @@ class Settings(BaseModel):
     exec_agent_tactical_scalp_max_stop_pct: Decimal = Field(default=Decimal("0.015"), gt=0, le=1)
     exec_agent_max_account_snapshot_age_seconds: int = Field(default=300, ge=1, le=86400)
     exec_agent_max_holding_trading_sessions: int = Field(default=3, ge=1, le=20)
+    exec_agent_watch_sizing_enabled: bool = True
+    exec_agent_watch_sizing_loop_interval_seconds: float = Field(default=60.0, gt=0, le=3600)
+    exec_agent_watch_sizing_start_local_time: str = "08:00"
+    exec_agent_watch_sizing_end_local_time: str = "15:30"
+    exec_agent_watch_sizing_timeout_seconds: int = Field(default=600, ge=30, le=3600)
+    openclaw_cli_path: str = "openclaw"
     kis_app_key: str | None = None
     kis_app_secret: str | None = None
     kis_account_number: str | None = None
@@ -78,6 +85,7 @@ _ENV_FIELDS = {
     "MONITORING_MAX_SYMBOLS_PER_CYCLE": "monitoring_max_symbols_per_cycle",
     "MONITORING_MAX_BROKER_ACTIONS_PER_CYCLE": "monitoring_max_broker_actions_per_cycle",
     "MONITORING_MAX_QUOTE_AGE_SECONDS": "monitoring_max_quote_age_seconds",
+    "MARKET_TIMEZONE": "market_timezone",
     "EXEC_AGENT_ENABLED": "exec_agent_enabled",
     "EXEC_AGENT_ID": "exec_agent_id",
     "EXEC_AGENT_MODEL": "exec_agent_model",
@@ -92,6 +100,12 @@ _ENV_FIELDS = {
     "EXEC_AGENT_TACTICAL_SCALP_MAX_STOP_PCT": "exec_agent_tactical_scalp_max_stop_pct",
     "EXEC_AGENT_MAX_ACCOUNT_SNAPSHOT_AGE_SECONDS": "exec_agent_max_account_snapshot_age_seconds",
     "EXEC_AGENT_MAX_HOLDING_TRADING_SESSIONS": "exec_agent_max_holding_trading_sessions",
+    "EXEC_AGENT_WATCH_SIZING_ENABLED": "exec_agent_watch_sizing_enabled",
+    "EXEC_AGENT_WATCH_SIZING_LOOP_INTERVAL_SECONDS": "exec_agent_watch_sizing_loop_interval_seconds",
+    "EXEC_AGENT_WATCH_SIZING_START_LOCAL_TIME": "exec_agent_watch_sizing_start_local_time",
+    "EXEC_AGENT_WATCH_SIZING_END_LOCAL_TIME": "exec_agent_watch_sizing_end_local_time",
+    "EXEC_AGENT_WATCH_SIZING_TIMEOUT_SECONDS": "exec_agent_watch_sizing_timeout_seconds",
+    "OPENCLAW_CLI_PATH": "openclaw_cli_path",
     "KIS_APP_KEY": "kis_app_key",
     "KIS_APP_SECRET": "kis_app_secret",
     "KIS_ACCOUNT_NUMBER": "kis_account_number",

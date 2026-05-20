@@ -18,11 +18,13 @@ from app.services.monitoring import (
     list_autonomous_monitoring_symbols,
     run_autonomous_monitoring_cycle,
 )
+from app.services.watch_exec_agent_sizing import run_due_watch_exec_agent_sizing
 
 LOGGER = logging.getLogger(__name__)
 
 DISPATCH_LOOP_WORKER_NAME = "execution_job_dispatch_loop"
 MONITORING_LOOP_WORKER_NAME = "monitoring_dispatch_loop"
+WATCH_EXEC_AGENT_SIZING_WORKER_NAME = "watch_exec_agent_sizing_loop"
 
 
 @dataclass
@@ -87,9 +89,11 @@ class AutonomousRuntimeCoordinator:
     monitoring_price_source: object | None = None
     _dispatch_task: asyncio.Task[None] | None = field(default=None, init=False)
     _monitoring_task: asyncio.Task[None] | None = field(default=None, init=False)
+    _watch_exec_agent_sizing_task: asyncio.Task[None] | None = field(default=None, init=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False)
     _dispatch_state: AutonomousWorkerState = field(init=False)
     _monitoring_state: AutonomousWorkerState = field(init=False)
+    _watch_exec_agent_sizing_state: AutonomousWorkerState = field(init=False)
     _monitoring_price_source_state: MonitoringPriceSourceState = field(init=False)
 
     def __post_init__(self) -> None:
@@ -101,6 +105,11 @@ class AutonomousRuntimeCoordinator:
         self._monitoring_state = AutonomousWorkerState(
             worker_name=MONITORING_LOOP_WORKER_NAME,
             poll_interval_seconds=self.settings.monitoring_loop_interval_seconds,
+            status="disabled" if not self.settings.autonomous_runtime_enabled else "idle",
+        )
+        self._watch_exec_agent_sizing_state = AutonomousWorkerState(
+            worker_name=WATCH_EXEC_AGENT_SIZING_WORKER_NAME,
+            poll_interval_seconds=self.settings.exec_agent_watch_sizing_loop_interval_seconds,
             status="disabled" if not self.settings.autonomous_runtime_enabled else "idle",
         )
         self._monitoring_price_source_state = self._initial_monitoring_price_source_state()
@@ -122,11 +131,18 @@ class AutonomousRuntimeCoordinator:
                 cycle=self._run_monitoring_cycle,
             )
         )
+        self._watch_exec_agent_sizing_task = asyncio.create_task(
+            self._run_periodic_loop(
+                worker_key="watch_exec_agent_sizing",
+                interval_seconds=self.settings.exec_agent_watch_sizing_loop_interval_seconds,
+                cycle=self._run_watch_exec_agent_sizing_cycle,
+            )
+        )
 
     async def stop(self) -> None:
         tasks = [
             task
-            for task in (self._dispatch_task, self._monitoring_task)
+            for task in (self._dispatch_task, self._monitoring_task, self._watch_exec_agent_sizing_task)
             if task is not None
         ]
         for task in tasks:
@@ -144,6 +160,7 @@ class AutonomousRuntimeCoordinator:
                     "price_source_configured": self._monitoring_price_source_state.configured,
                     "price_source": self._monitoring_price_source_state.snapshot(),
                 },
+                "watch_exec_agent_sizing": self._watch_exec_agent_sizing_state.snapshot(),
             }
 
     async def _run_periodic_loop(
@@ -205,6 +222,23 @@ class AutonomousRuntimeCoordinator:
 
     async def _run_monitoring_cycle(self, started_at: datetime) -> dict[str, object]:
         return await asyncio.to_thread(self._monitoring_cycle_sync, started_at)
+
+    async def _run_watch_exec_agent_sizing_cycle(self, started_at: datetime) -> dict[str, object]:
+        return await asyncio.to_thread(self._watch_exec_agent_sizing_cycle_sync, started_at)
+
+    def _watch_exec_agent_sizing_cycle_sync(self, started_at: datetime) -> dict[str, object]:
+        with self.session_factory() as db:
+            result = run_due_watch_exec_agent_sizing(
+                settings=self.settings,
+                db=db,
+                now=started_at,
+            )
+            payload = {
+                "status_code": result.status_code,
+                **result.payload,
+            }
+            self._store_cycle_payload(worker_key="watch_exec_agent_sizing", payload=payload)
+            return payload
 
     def _monitoring_cycle_sync(self, started_at: datetime) -> dict[str, object]:
         with self.session_factory() as db:
@@ -357,6 +391,8 @@ class AutonomousRuntimeCoordinator:
     def _state_for(self, worker_key: str) -> AutonomousWorkerState:
         if worker_key == "dispatch":
             return self._dispatch_state
+        if worker_key == "watch_exec_agent_sizing":
+            return self._watch_exec_agent_sizing_state
         return self._monitoring_state
 
     def _initial_monitoring_price_source_state(self) -> MonitoringPriceSourceState:
