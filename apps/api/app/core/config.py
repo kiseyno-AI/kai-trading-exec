@@ -27,6 +27,7 @@ class Settings(BaseModel):
     monitoring_max_symbols_per_cycle: int = Field(default=128, ge=1, le=10000)
     monitoring_max_broker_actions_per_cycle: int = Field(default=32, ge=1, le=10000)
     monitoring_max_quote_age_seconds: int = Field(default=30, ge=1, le=3600)
+    market_timezone: str = "Asia/Seoul"
     exec_agent_enabled: bool = False
     exec_agent_id: str = "exec-agent"
     exec_agent_model: str = "openai-codex/gpt-5.5"
@@ -54,6 +55,12 @@ class Settings(BaseModel):
     monthly_target_krw: Decimal = Field(default=Decimal("500000"), gt=0)
     monthly_capital_preservation_enabled: bool = True
     monthly_aggressive_lag_ratio: Decimal = Field(default=Decimal("0.75"), gt=0, le=1)
+    exec_agent_watch_sizing_enabled: bool = True
+    exec_agent_watch_sizing_loop_interval_seconds: float = Field(default=60.0, gt=0, le=3600)
+    exec_agent_watch_sizing_start_local_time: str = "08:00"
+    exec_agent_watch_sizing_end_local_time: str = "15:30"
+    exec_agent_watch_sizing_timeout_seconds: int = Field(default=600, ge=30, le=3600)
+    openclaw_cli_path: str = "openclaw"
     kis_app_key: str | None = None
     kis_app_secret: str | None = None
     kis_account_number: str | None = None
@@ -91,6 +98,7 @@ _ENV_FIELDS = {
     "MONITORING_MAX_SYMBOLS_PER_CYCLE": "monitoring_max_symbols_per_cycle",
     "MONITORING_MAX_BROKER_ACTIONS_PER_CYCLE": "monitoring_max_broker_actions_per_cycle",
     "MONITORING_MAX_QUOTE_AGE_SECONDS": "monitoring_max_quote_age_seconds",
+    "MARKET_TIMEZONE": "market_timezone",
     "EXEC_AGENT_ENABLED": "exec_agent_enabled",
     "EXEC_AGENT_ID": "exec_agent_id",
     "EXEC_AGENT_MODEL": "exec_agent_model",
@@ -118,6 +126,12 @@ _ENV_FIELDS = {
     "MONTHLY_TARGET_KRW": "monthly_target_krw",
     "MONTHLY_CAPITAL_PRESERVATION_ENABLED": "monthly_capital_preservation_enabled",
     "MONTHLY_AGGRESSIVE_LAG_RATIO": "monthly_aggressive_lag_ratio",
+    "EXEC_AGENT_WATCH_SIZING_ENABLED": "exec_agent_watch_sizing_enabled",
+    "EXEC_AGENT_WATCH_SIZING_LOOP_INTERVAL_SECONDS": "exec_agent_watch_sizing_loop_interval_seconds",
+    "EXEC_AGENT_WATCH_SIZING_START_LOCAL_TIME": "exec_agent_watch_sizing_start_local_time",
+    "EXEC_AGENT_WATCH_SIZING_END_LOCAL_TIME": "exec_agent_watch_sizing_end_local_time",
+    "EXEC_AGENT_WATCH_SIZING_TIMEOUT_SECONDS": "exec_agent_watch_sizing_timeout_seconds",
+    "OPENCLAW_CLI_PATH": "openclaw_cli_path",
     "KIS_APP_KEY": "kis_app_key",
     "KIS_APP_SECRET": "kis_app_secret",
     "KIS_ACCOUNT_NUMBER": "kis_account_number",

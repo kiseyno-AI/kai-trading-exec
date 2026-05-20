@@ -25,7 +25,7 @@ from app.services.plan_item_identity import (
 )
 
 MONITORED_INTENTS = frozenset({"target_sell", "stop_sell"})
-WATCH_BUY_INTENTS = frozenset({"watch_buy", "trigger_buy", "chase_buy", "tactical_buy"})
+WATCH_BUY_INTENTS = frozenset({"watch_buy", "trigger_buy", "chase_buy", "tactical_buy", "intraday_watch_buy"})
 WATCH_MONITORING_STATUSES = frozenset(
     {
         "watch_monitoring_pending",
@@ -57,7 +57,7 @@ BUY_RECOMMENDATION_FIELDS = (
     "recommendation_price",
     "entry_price",
 )
-BUY_TRIGGER_FIELDS = frozenset({"watch_trigger_price", "buy_trigger_price", "entry_trigger_price", "trigger_price"})
+BUY_TRIGGER_FIELDS = frozenset({"watch_trigger_price", "buy_trigger_price", "entry_trigger_price", "trigger_price", "original_watch_trigger_price"})
 
 
 @dataclass(frozen=True)
@@ -793,6 +793,8 @@ def _initial_plan_item_status(item: ExecutionPlanItemRequest) -> str:
         if item.trigger_price is not None or _item_has_buy_chase_or_trigger_fields(item):
             return "pending_configuration"
         if _decision_agent_name(item) == SHORT_TERM_DECIDER_NAME:
+            if _short_term_exec_agent_sizing_requested(item.quantity_policy):
+                return "pending"
             return "short_term_watcher_pending"
         return "pending"
     if item.intent in UNSUPPORTED_BUY_INTENTS:
@@ -800,6 +802,12 @@ def _initial_plan_item_status(item: ExecutionPlanItemRequest) -> str:
     if _decision_agent_name(item) == SHORT_TERM_DECIDER_NAME:
         return "unsupported_semantics"
     return "pending"
+
+
+def _short_term_exec_agent_sizing_requested(quantity_policy: dict[str, object] | None) -> bool:
+    if not isinstance(quantity_policy, dict):
+        return False
+    return (quantity_policy.get("kind") or quantity_policy.get("type")) == "exec_agent_sized"
 
 
 def _item_has_buy_chase_or_trigger_fields(item: ExecutionPlanItemRequest) -> bool:
@@ -887,7 +895,7 @@ def _watch_buy_trigger_source_and_price(
 
 
 def _watch_buy_chase_limit_price(item: ExecutionPlanItemRequest) -> Decimal | None:
-    for key in ("chase_limit_price", "max_chase_limit_price", "entry_limit_price"):
+    for key in ("chase_limit_price", "max_chase_limit_price", "entry_limit_price", "original_watch_chase_limit_price"):
         value = _first_decimal_from_request(item, key)
         if value is not None:
             return value

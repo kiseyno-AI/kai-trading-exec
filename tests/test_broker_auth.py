@@ -1,4 +1,4 @@
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 import time
 
@@ -44,6 +44,7 @@ from app.models.runtime import (
     ExecutionPosition,
     MonitoringCheckpoint,
 )
+from app.services.monitoring import list_autonomous_monitoring_symbols
 
 
 class RecordingHttpClient:
@@ -1739,6 +1740,7 @@ def _create_watch_buy_candidate(
     chase_limit_price: str | None = "71200.00",
     quantity_policy: dict[str, object] | None = None,
     risk_context: dict[str, object] | None = None,
+    market_date: str = "2024-01-03",
 ) -> str:
     item = {
         "symbol": "005930",
@@ -1758,7 +1760,7 @@ def _create_watch_buy_candidate(
         json={
             "plan_id": plan_id,
             "source": "kai-trading-core",
-            "market_date": "2024-01-03",
+            "market_date": market_date,
             "items": [item],
         },
     )
@@ -1829,6 +1831,107 @@ def test_watch_buy_candidate_waits_until_trigger_then_submits_limit_buy() -> Non
         assert order is not None
         assert order.idempotency_key == f"monitoring:watch_buy:{item_id}"
 
+    engine.dispose()
+
+
+def test_autonomous_monitoring_expires_prior_day_unfilled_watch_buys() -> None:
+    app, engine, client, broker_adapter = _build_watch_buy_test_app()
+    prior_active_id = _create_watch_buy_candidate(
+        client,
+        plan_id="plan-watch-buy-expire-prior-active",
+        market_date="2024-01-03",
+    )
+    prior_blocked_id = _create_watch_buy_candidate(
+        client,
+        plan_id="plan-watch-buy-expire-prior-blocked",
+        market_date="2024-01-03",
+    )
+    current_id = _create_watch_buy_candidate(
+        client,
+        plan_id="plan-watch-buy-retain-current",
+        market_date="2024-01-04",
+    )
+
+    with app.state.db_session_factory() as session:
+        blocked_item = session.get(ExecutionPlanItem, prior_blocked_id)
+        assert blocked_item is not None
+        blocked_item.status = "watch_buy_triggered_blocked"
+        session.commit()
+
+        symbols = list_autonomous_monitoring_symbols(
+            settings=app.state.settings,
+            db=session,
+            current_market_date=date(2024, 1, 4),
+        )
+
+        assert symbols == ["005930"]
+        prior_active = session.get(ExecutionPlanItem, prior_active_id)
+        prior_blocked = session.get(ExecutionPlanItem, prior_blocked_id)
+        current = session.get(ExecutionPlanItem, current_id)
+        assert prior_active is not None
+        assert prior_blocked is not None
+        assert current is not None
+        assert prior_active.status == "watch_expired"
+        assert prior_blocked.status == "watch_expired"
+        assert current.status == "watch_monitoring_active"
+        assert (
+            prior_active.risk_context["last_monitoring_event"]["event"]
+            == "market_date_expired_unfilled"
+        )
+        assert (
+            prior_blocked.risk_context["last_monitoring_event"]["prior_status"]
+            == "watch_buy_triggered_blocked"
+        )
+
+    assert broker_adapter.order_calls == []
+    engine.dispose()
+
+
+def test_autonomous_monitoring_retains_current_day_and_terminal_watch_buys() -> None:
+    app, engine, client, broker_adapter = _build_watch_buy_test_app()
+    current_id = _create_watch_buy_candidate(
+        client,
+        plan_id="plan-watch-buy-current-retained",
+        market_date="2024-01-04",
+    )
+    submitted_id = _create_watch_buy_candidate(
+        client,
+        plan_id="plan-watch-buy-submitted-retained",
+        market_date="2024-01-03",
+    )
+    rejected_id = _create_watch_buy_candidate(
+        client,
+        plan_id="plan-watch-buy-rejected-retained",
+        market_date="2024-01-03",
+    )
+
+    with app.state.db_session_factory() as session:
+        submitted = session.get(ExecutionPlanItem, submitted_id)
+        rejected = session.get(ExecutionPlanItem, rejected_id)
+        assert submitted is not None
+        assert rejected is not None
+        submitted.status = "watch_buy_submitted"
+        rejected.status = "watch_buy_rejected"
+        session.commit()
+
+        symbols = list_autonomous_monitoring_symbols(
+            settings=app.state.settings,
+            db=session,
+            current_market_date=date(2024, 1, 4),
+        )
+
+        assert symbols == ["005930"]
+        current = session.get(ExecutionPlanItem, current_id)
+        submitted = session.get(ExecutionPlanItem, submitted_id)
+        rejected = session.get(ExecutionPlanItem, rejected_id)
+        assert current is not None
+        assert submitted is not None
+        assert rejected is not None
+        assert current.status == "watch_monitoring_active"
+        assert submitted.status == "watch_buy_submitted"
+        assert rejected.status == "watch_buy_rejected"
+
+    assert broker_adapter.order_calls == []
     engine.dispose()
 
 
@@ -2372,6 +2475,52 @@ def test_short_term_watcher_live_submission_respects_runtime_safety_guards() -> 
     assert blocked.json()["reason_code"] == "runtime_safety_blocked"
     assert broker_adapter.order_calls == []
     assert client.get("/orders").json() == []
+    engine.dispose()
+
+
+
+def test_short_term_exec_agent_sized_next_open_buy_materializes_when_budget_funds_shares() -> None:
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+        ),
+    )
+    client = TestClient(app)
+
+    response = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-short-term-exec-sized-entry-1",
+            "source": "kai-trading-core",
+            "market_date": "2024-01-03",
+            "items": [
+                {
+                    "symbol": "005930",
+                    "side": "buy",
+                    "intent": "next_open_buy",
+                    "quantity_policy": {
+                        "type": "exec_agent_sized",
+                        "budget_krw": "150000",
+                        "estimated_reference_price": 71000,
+                    },
+                    "decision_agent_name": "short-term-decider",
+                    "source_plan_item_id": "core-short-term-exec-sized-entry-1",
+                },
+            ],
+        },
+    )
+    assert response.status_code == 201
+
+    plans_payload = client.get("/execution-plans").json()
+    item = plans_payload[0]["items"][0]
+    assert item["status"] == "next_open_buy_scheduled"
+
+    jobs_payload = client.get("/execution-jobs").json()
+    assert len(jobs_payload) == 1
+    assert jobs_payload[0]["job_type"] == "next_open_buy"
+    assert jobs_payload[0]["status"] == "scheduled"
+
     engine.dispose()
 
 

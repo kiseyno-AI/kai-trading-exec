@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
+from zoneinfo import ZoneInfo
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 
 from sqlalchemy import and_, func, or_, select
@@ -36,7 +37,7 @@ from app.services.runtime_controls import (
 )
 
 SELL_MONITORED_INTENTS = frozenset({"target_sell", "stop_sell", "max_holding_close_sell"})
-WATCH_BUY_INTENTS = frozenset({"watch_buy", "trigger_buy", "chase_buy", "tactical_buy", "next_open_buy"})
+WATCH_BUY_INTENTS = frozenset({"watch_buy", "trigger_buy", "chase_buy", "tactical_buy", "intraday_watch_buy", "next_open_buy"})
 MONITORED_INTENTS = SELL_MONITORED_INTENTS | WATCH_BUY_INTENTS
 WATCH_MONITORING_STATUSES = frozenset(
     {
@@ -92,6 +93,15 @@ NON_MONITORABLE_PLAN_ITEM_STATUSES = frozenset(
 MONITORING_WORKER_NAME = "intraday_target_stop_monitor"
 MONITORING_RUNTIME_TOPOLOGY = "shared_symbol_scheduler"
 MONITORING_SELECTION_STRATEGY = "round_robin_by_symbol"
+KRX_TIMEZONE = ZoneInfo("Asia/Seoul")
+WATCH_BUY_EXPIRABLE_STATUSES = frozenset(
+    {
+        "watch_monitoring_active",
+        "watch_monitoring_pending",
+        "watch_buy_triggered_blocked",
+        "watch_buy_triggered_pending_dispatch",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -174,7 +184,16 @@ def list_autonomous_monitoring_symbols(
     *,
     settings: Settings,
     db: Session,
+    current_market_date: date | None = None,
 ) -> list[str]:
+    expired_count = expire_prior_market_date_unfilled_watch_buys(
+        settings=settings,
+        db=db,
+        current_market_date=current_market_date or datetime.now(KRX_TIMEZONE).date(),
+    )
+    if expired_count:
+        db.commit()
+
     seen: set[str] = set()
     symbols: list[str] = []
     for item in _load_monitored_items(settings=settings, db=db):
@@ -605,6 +624,57 @@ def _evaluate_monitoring_cycle(
             "items": results,
         },
     )
+
+
+def expire_prior_market_date_unfilled_watch_buys(
+    *,
+    settings: Settings,
+    db: Session,
+    current_market_date: date,
+    expired_at: datetime | None = None,
+) -> int:
+    expired_at = _normalize_utc(expired_at or datetime.now(UTC))
+    source_market_date = func.coalesce(
+        ExecutionPlanItem.source_market_date,
+        ExecutionPlan.market_date,
+    )
+    candidates = db.scalars(
+        select(ExecutionPlanItem)
+        .join(ExecutionPlanItem.plan)
+        .where(
+            ExecutionPlan.mode == settings.runtime_mode,
+            ExecutionPlanItem.side == "buy",
+            ExecutionPlanItem.intent.in_(tuple(WATCH_BUY_INTENTS)),
+            ExecutionPlanItem.status.in_(tuple(WATCH_BUY_EXPIRABLE_STATUSES)),
+            source_market_date.is_not(None),
+            source_market_date < current_market_date,
+            ~ExecutionPlanItem.broker_orders.any(),
+        )
+        .options(selectinload(ExecutionPlanItem.plan))
+        .order_by(
+            ExecutionPlan.accepted_at.asc(),
+            ExecutionPlan.id.asc(),
+            ExecutionPlanItem.plan_item_index.asc(),
+            ExecutionPlanItem.id.asc(),
+        )
+    ).all()
+
+    for item in candidates:
+        prior_status = item.status
+        item.status = "watch_expired"
+        item_source_market_date = item.source_market_date or item.plan.market_date
+        _record_monitoring_event(
+            item=item,
+            event={
+                "event": "market_date_expired_unfilled",
+                "reason": "prior_market_date_unfilled_watch_buy",
+                "prior_status": prior_status,
+                "source_market_date": _serialize_date(item_source_market_date),
+                "current_market_date": current_market_date.isoformat(),
+                "recorded_at": expired_at.isoformat(),
+            },
+        )
+    return len(candidates)
 
 
 def _load_monitored_items(
@@ -1250,6 +1320,7 @@ def _watch_buy_trigger_price(item: ExecutionPlanItem) -> Decimal | None:
             "watch_trigger_price",
             "buy_trigger_price",
             "entry_trigger_price",
+            "original_watch_trigger_price",
         ),
     )
 
@@ -1257,7 +1328,7 @@ def _watch_buy_trigger_price(item: ExecutionPlanItem) -> Decimal | None:
 def _watch_buy_chase_limit_price(item: ExecutionPlanItem) -> Decimal | None:
     return _first_positive_decimal_from_item(
         item,
-        ("chase_limit_price", "max_chase_limit_price", "entry_limit_price"),
+        ("chase_limit_price", "max_chase_limit_price", "entry_limit_price", "original_watch_chase_limit_price"),
     )
 
 
@@ -1426,6 +1497,12 @@ def _serialize_decimal(value: Decimal | None) -> str | None:
     if value is None:
         return None
     return f"{value:.4f}"
+
+
+def _serialize_date(value: date | None) -> str | None:
+    if value is None:
+        return None
+    return value.isoformat()
 
 
 def _serialize_datetime(value: datetime | None) -> str | None:
