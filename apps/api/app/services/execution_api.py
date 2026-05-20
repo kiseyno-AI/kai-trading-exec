@@ -672,7 +672,7 @@ def _initial_plan_item_status(item: ExecutionPlanItemRequest) -> str:
     if item.intent == "next_open_buy":
         if item.trigger_price is not None or _item_has_buy_chase_or_trigger_fields(item):
             return "pending_configuration"
-        if _decision_agent_name(item) == SHORT_TERM_DECIDER_NAME:
+        if _decision_agent_name(item) == SHORT_TERM_DECIDER_NAME and not _short_term_exec_agent_sizing_requested(item.quantity_policy):
             return "unsupported_semantics"
         return "pending"
     if item.intent in UNSUPPORTED_BUY_INTENTS:
@@ -680,6 +680,12 @@ def _initial_plan_item_status(item: ExecutionPlanItemRequest) -> str:
     if _decision_agent_name(item) == SHORT_TERM_DECIDER_NAME:
         return "unsupported_semantics"
     return "pending"
+
+
+def _short_term_exec_agent_sizing_requested(quantity_policy: dict[str, object] | None) -> bool:
+    if not isinstance(quantity_policy, dict):
+        return False
+    return (quantity_policy.get("kind") or quantity_policy.get("type")) == "exec_agent_sized"
 
 
 def _item_has_buy_chase_or_trigger_fields(item: ExecutionPlanItemRequest) -> bool:

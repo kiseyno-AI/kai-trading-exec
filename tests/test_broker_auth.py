@@ -1625,6 +1625,51 @@ def test_short_term_buy_items_are_safely_blocked_from_scheduling() -> None:
     engine.dispose()
 
 
+def test_short_term_exec_agent_sized_next_open_buy_materializes_when_budget_funds_shares() -> None:
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+        ),
+    )
+    client = TestClient(app)
+
+    response = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-short-term-exec-sized-entry-1",
+            "source": "kai-trading-core",
+            "market_date": "2024-01-03",
+            "items": [
+                {
+                    "symbol": "005930",
+                    "side": "buy",
+                    "intent": "next_open_buy",
+                    "quantity_policy": {
+                        "type": "exec_agent_sized",
+                        "budget_krw": "150000",
+                        "estimated_reference_price": 71000,
+                    },
+                    "decision_agent_name": "short-term-decider",
+                    "source_plan_item_id": "core-short-term-exec-sized-entry-1",
+                },
+            ],
+        },
+    )
+    assert response.status_code == 201
+
+    plans_payload = client.get("/execution-plans").json()
+    item = plans_payload[0]["items"][0]
+    assert item["status"] == "next_open_buy_scheduled"
+
+    jobs_payload = client.get("/execution-jobs").json()
+    assert len(jobs_payload) == 1
+    assert jobs_payload[0]["job_type"] == "next_open_buy"
+    assert jobs_payload[0]["status"] == "scheduled"
+
+    engine.dispose()
+
+
 def test_orders_monitoring_fills_and_positions_retain_decider_identity() -> None:
     broker_adapter = StubBrokerAdapter(
         config=BrokerConfig(
