@@ -29,7 +29,11 @@ from app.services.risk_sizing import (
     effective_stop_price,
     resolve_risk_based_buy_quantity,
 )
-from app.services.runtime_controls import automated_order_submission_allowed, ensure_runtime_control_state
+from app.services.runtime_controls import (
+    automated_order_submission_allowed,
+    automated_order_submission_block_reason,
+    ensure_runtime_control_state,
+)
 
 SELL_MONITORED_INTENTS = frozenset({"target_sell", "stop_sell", "max_holding_close_sell"})
 WATCH_BUY_INTENTS = frozenset({"watch_buy", "trigger_buy", "chase_buy", "tactical_buy", "next_open_buy"})
@@ -365,24 +369,44 @@ def _evaluate_monitoring_cycle(
             quantity = approval.quantity
             if quantity is None:
                 blocked_item_count += 1
-                action.item.status = "watch_buy_rejected"
-                _record_monitoring_event(
-                    item=action.item,
-                    event={
-                        "event": "watch_buy_rejected",
-                        "reason": approval.reason or "risk_rejected",
-                        "message": approval.message,
-                        "details": approval.details or {},
-                        "observed_price": _serialize_decimal(action.observed_price),
-                        "recorded_at": triggered_at.isoformat(),
-                    },
-                )
-                result_by_item_id[action.item.id] = _monitoring_result_payload(
-                    item=action.item,
-                    observed_price=action.observed_price,
-                    outcome="rejected",
-                    message=approval.message,
-                )
+                if approval.reason in {"paused", "kill_switch"}:
+                    action.item.status = "watch_buy_triggered_blocked"
+                    _record_monitoring_event(
+                        item=action.item,
+                        event={
+                            "event": "watch_buy_triggered_blocked",
+                            "reason": approval.reason,
+                            "message": approval.message,
+                            "observed_price": _serialize_decimal(action.observed_price),
+                            "recorded_at": triggered_at.isoformat(),
+                        },
+                    )
+                    result_by_item_id[action.item.id] = _monitoring_result_payload(
+                        item=action.item,
+                        observed_price=action.observed_price,
+                        outcome="blocked",
+                        block_reason=approval.reason,
+                        message=approval.message,
+                    )
+                else:
+                    action.item.status = "watch_buy_rejected"
+                    _record_monitoring_event(
+                        item=action.item,
+                        event={
+                            "event": "watch_buy_rejected",
+                            "reason": approval.reason or "risk_rejected",
+                            "message": approval.message,
+                            "details": approval.details or {},
+                            "observed_price": _serialize_decimal(action.observed_price),
+                            "recorded_at": triggered_at.isoformat(),
+                        },
+                    )
+                    result_by_item_id[action.item.id] = _monitoring_result_payload(
+                        item=action.item,
+                        observed_price=action.observed_price,
+                        outcome="rejected",
+                        message=approval.message,
+                    )
                 continue
         else:
             quantity = _resolve_sell_quantity(
@@ -894,6 +918,13 @@ def _resolve_watch_buy_order(
     if not automated_order_submission_allowed(control_state):
         if quantity is not None:
             return WatchBuyOrderApproval(quantity=quantity)
+        if _watch_buy_candidate_budget(item) is not None:
+            block_reason = automated_order_submission_block_reason(control_state)
+            return WatchBuyOrderApproval(
+                quantity=None,
+                reason=block_reason,
+                message="automated order submission is blocked by runtime safety controls",
+            )
         return WatchBuyOrderApproval(
             quantity=None,
             reason="missing_quantity",
