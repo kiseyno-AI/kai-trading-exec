@@ -14,15 +14,27 @@ from app.api.schemas.execution import (
     MonitoringPriceRequest,
     PlaceOrderRequest,
 )
-from app.broker.base import BrokerAdapter
+from app.broker.base import BrokerAccountSnapshot, BrokerAdapter, BrokerAdapterError
 from app.core.config import Settings
 from app.models.runtime import BrokerOrder, ExecutionPlan, ExecutionPlanItem, ExecutionPosition, MonitoringCheckpoint
+from app.services.broker_auth import ensure_authenticated_broker_session
 from app.services.reconciliation import (
     reconcile_pending_broker_orders,
     sync_execution_positions_from_broker_snapshot,
 )
 from app.services.broker_orders import place_broker_order
 from app.services.plan_item_identity import serialize_plan_item_source_identity
+from app.services.risk_sizing import (
+    RiskSizingRejection,
+    RiskSizingResult,
+    effective_stop_price,
+    resolve_risk_based_buy_quantity,
+)
+from app.services.runtime_controls import (
+    automated_order_submission_allowed,
+    automated_order_submission_block_reason,
+    ensure_runtime_control_state,
+)
 
 SELL_MONITORED_INTENTS = frozenset({"target_sell", "stop_sell", "max_holding_close_sell"})
 WATCH_BUY_INTENTS = frozenset({"watch_buy", "trigger_buy", "chase_buy", "tactical_buy", "intraday_watch_buy", "next_open_buy"})
@@ -109,6 +121,7 @@ class WatchBuyOrderApproval:
     quantity: int | None
     reason: str | None = None
     message: str | None = None
+    details: dict[str, object] | None = None
 
 
 def materialize_monitoring_plan_items(plan: ExecutionPlan) -> None:
@@ -365,27 +378,54 @@ def _evaluate_monitoring_cycle(
         is_watch_buy = _is_watch_buy_item(action.item)
         if is_watch_buy:
             action.item.status = "watch_buy_triggered"
-            approval = _resolve_watch_buy_order(item=action.item)
+            approval = _resolve_watch_buy_order(
+                settings=settings,
+                db=db,
+                adapter=adapter,
+                item=action.item,
+                observed_price=action.observed_price,
+            )
             quantity = approval.quantity
             if quantity is None:
                 blocked_item_count += 1
-                action.item.status = "watch_buy_triggered_blocked"
-                _record_monitoring_event(
-                    item=action.item,
-                    event={
-                        "event": "watch_buy_triggered_blocked",
-                        "reason": approval.reason or "risk_blocked",
-                        "message": approval.message,
-                        "observed_price": _serialize_decimal(action.observed_price),
-                        "recorded_at": triggered_at.isoformat(),
-                    },
-                )
-                result_by_item_id[action.item.id] = _monitoring_result_payload(
-                    item=action.item,
-                    observed_price=action.observed_price,
-                    outcome="blocked",
-                    message=approval.message,
-                )
+                if approval.reason in {"paused", "kill_switch"}:
+                    action.item.status = "watch_buy_triggered_blocked"
+                    _record_monitoring_event(
+                        item=action.item,
+                        event={
+                            "event": "watch_buy_triggered_blocked",
+                            "reason": approval.reason,
+                            "message": approval.message,
+                            "observed_price": _serialize_decimal(action.observed_price),
+                            "recorded_at": triggered_at.isoformat(),
+                        },
+                    )
+                    result_by_item_id[action.item.id] = _monitoring_result_payload(
+                        item=action.item,
+                        observed_price=action.observed_price,
+                        outcome="blocked",
+                        block_reason=approval.reason,
+                        message=approval.message,
+                    )
+                else:
+                    action.item.status = "watch_buy_rejected"
+                    _record_monitoring_event(
+                        item=action.item,
+                        event={
+                            "event": "watch_buy_rejected",
+                            "reason": approval.reason or "risk_rejected",
+                            "message": approval.message,
+                            "details": approval.details or {},
+                            "observed_price": _serialize_decimal(action.observed_price),
+                            "recorded_at": triggered_at.isoformat(),
+                        },
+                    )
+                    result_by_item_id[action.item.id] = _monitoring_result_payload(
+                        item=action.item,
+                        observed_price=action.observed_price,
+                        outcome="rejected",
+                        message=approval.message,
+                    )
                 continue
         else:
             quantity = _resolve_sell_quantity(
@@ -816,7 +856,14 @@ def _positions_with_stale_local_state(
 
 def _monitoring_item_is_configured(item: ExecutionPlanItem) -> bool:
     if _is_watch_buy_item(item):
-        return item.side == "buy" and _watch_buy_trigger_price(item) is not None
+        return (
+            item.side == "buy"
+            and _watch_buy_trigger_price(item) is not None
+            and (
+                _parse_buy_quantity(item.quantity_policy) is not None
+                or _watch_buy_candidate_budget(item) is not None
+            )
+        )
     if item.side != "sell" or not _quantity_policy_supported(item.quantity_policy):
         return False
     if item.intent == "max_holding_close_sell":
@@ -911,7 +958,14 @@ def _resolve_sell_quantity(
     return None
 
 
-def _resolve_watch_buy_order(*, item: ExecutionPlanItem) -> WatchBuyOrderApproval:
+def _resolve_watch_buy_order(
+    *,
+    settings: Settings,
+    db: Session,
+    adapter: BrokerAdapter,
+    item: ExecutionPlanItem,
+    observed_price: Decimal | None,
+) -> WatchBuyOrderApproval:
     decision = _exec_agent_decision(item)
     if isinstance(decision, dict):
         decision_value = str(
@@ -929,13 +983,97 @@ def _resolve_watch_buy_order(*, item: ExecutionPlanItem) -> WatchBuyOrderApprova
         quantity = _parse_positive_int(
             decision.get("approved_quantity") or decision.get("quantity")
         )
-    if quantity is None:
+
+    control_state = ensure_runtime_control_state(settings=settings, db=db)
+    if not automated_order_submission_allowed(control_state):
+        if quantity is not None:
+            return WatchBuyOrderApproval(quantity=quantity)
+        if _watch_buy_candidate_budget(item) is not None:
+            block_reason = automated_order_submission_block_reason(control_state)
+            return WatchBuyOrderApproval(
+                quantity=None,
+                reason=block_reason,
+                message="automated order submission is blocked by runtime safety controls",
+            )
         return WatchBuyOrderApproval(
             quantity=None,
             reason="missing_quantity",
-            message="watch buy requires a positive share quantity from quantity_policy or exec-agent decision",
+            message="watch buy requires a positive share quantity while runtime is blocked",
         )
-    return WatchBuyOrderApproval(quantity=quantity)
+
+    entry_price = observed_price or _watch_buy_trigger_price(item) or item.limit_price
+    stop_price = _watch_buy_stop_price(item)
+    if entry_price is None or stop_price is None:
+        return WatchBuyOrderApproval(
+            quantity=None,
+            reason="missing_stop_or_entry_price",
+            message="watch buy requires entry and stop prices for risk-based sizing",
+        )
+
+    snapshot = _load_watch_buy_account_snapshot(
+        settings=settings,
+        db=db,
+        adapter=adapter,
+    )
+    if isinstance(snapshot, str):
+        return WatchBuyOrderApproval(
+            quantity=None,
+            reason="account_snapshot_unavailable",
+            message=snapshot,
+        )
+
+    available_cash = _minimum_decimal(snapshot.available_cash, snapshot.buying_power)
+    existing_exposure = entry_price * Decimal(
+        _snapshot_symbol_quantity(snapshot=snapshot, symbol=item.symbol)
+        + _local_position_quantity(settings=settings, db=db, symbol=item.symbol)
+    )
+    effective_stop = effective_stop_price(
+        settings=settings,
+        entry_price=entry_price,
+        upstream_stop_price=stop_price,
+    )
+    risk_decision = resolve_risk_based_buy_quantity(
+        settings=settings,
+        account_basis=available_cash,
+        available_cash=available_cash,
+        entry_price=entry_price,
+        stop_price=effective_stop,
+        confidence=_watch_buy_confidence(item),
+        requested_quantity=quantity,
+        candidate_max_budget=_watch_buy_candidate_budget(item),
+        agent_max_quantity=_watch_buy_max_quantity(item),
+        existing_symbol_exposure=existing_exposure,
+        daily_new_buy_notional_used=_load_daily_new_buy_notional(
+            settings=settings,
+            db=db,
+            market_date=item.plan.market_date,
+        ),
+    )
+    if isinstance(risk_decision, RiskSizingRejection):
+        return WatchBuyOrderApproval(
+            quantity=None,
+            reason=risk_decision.reason_code,
+            message=risk_decision.message,
+            details=risk_decision.details,
+        )
+    assert isinstance(risk_decision, RiskSizingResult)
+    _record_monitoring_event(
+        item=item,
+        event={
+            "event": "watch_buy_risk_sized",
+            "quantity": risk_decision.quantity,
+            "approved_notional": _serialize_decimal(risk_decision.approved_notional),
+            "risk_pct": _serialize_decimal(risk_decision.risk_pct),
+            "risk_budget": _serialize_decimal(risk_decision.risk_budget),
+            "stop_price": _serialize_decimal(effective_stop),
+            "upstream_stop_price": _serialize_decimal(stop_price),
+            "risk_based_quantity": risk_decision.risk_quantity,
+            "allocation_quantity": risk_decision.allocation_quantity,
+            "cash_quantity": risk_decision.cash_quantity,
+            "recorded_at": datetime.now(UTC).isoformat(),
+        },
+    )
+    return WatchBuyOrderApproval(quantity=risk_decision.quantity)
 
 
 def _parse_buy_quantity(quantity_policy: dict[str, object] | None) -> int | None:
@@ -944,6 +1082,162 @@ def _parse_buy_quantity(quantity_policy: dict[str, object] | None) -> int | None
     if quantity_policy.get("kind") != "shares":
         return None
     return _parse_positive_int(quantity_policy.get("quantity"))
+
+
+def _watch_buy_candidate_budget(item: ExecutionPlanItem) -> Decimal | None:
+    for source in _item_payload_sources(item):
+        for key in (
+            "max_budget",
+            "max_budget_krw",
+            "budget",
+            "budget_krw",
+            "cash_budget",
+            "cash_budget_krw",
+            "max_notional",
+            "max_notional_krw",
+            "notional",
+        ):
+            value = _parse_positive_decimal(source.get(key))
+            if value is not None:
+                return value
+    return None
+
+
+def _watch_buy_max_quantity(item: ExecutionPlanItem) -> int | None:
+    for source in _item_payload_sources(item):
+        for key in ("max_quantity", "max_shares", "share_cap"):
+            quantity = _parse_positive_int(source.get(key))
+            if quantity is not None:
+                return quantity
+    return None
+
+
+def _watch_buy_confidence(item: ExecutionPlanItem) -> Decimal | None:
+    for source in _item_payload_sources(item):
+        for key in ("confidence", "score", "probability"):
+            value = _parse_positive_decimal(source.get(key))
+            if value is None:
+                continue
+            if value > 1 and value <= 100:
+                value = value / Decimal("100")
+            if value <= 1:
+                return value
+    decision = _exec_agent_decision(item)
+    if isinstance(decision, dict):
+        value = _parse_positive_decimal(decision.get("confidence"))
+        if value is not None:
+            return value / Decimal("100") if value > 1 and value <= 100 else value
+    return None
+
+
+def _watch_buy_stop_price(item: ExecutionPlanItem) -> Decimal | None:
+    return _first_positive_decimal_from_item(
+        item,
+        (
+            "stop_price",
+            "stop_sell_price",
+            "stop_loss_price",
+            "risk_stop_price",
+            "stop",
+        ),
+    )
+
+
+def _load_watch_buy_account_snapshot(
+    *,
+    settings: Settings,
+    db: Session,
+    adapter: BrokerAdapter,
+) -> BrokerAccountSnapshot | str:
+    try:
+        session_state = ensure_authenticated_broker_session(
+            settings=settings,
+            db=db,
+            adapter=adapter,
+            source="watch_buy_risk_sizing",
+            reason="resolve account buying power for intraday watch buy sizing",
+        )
+        return adapter.get_account_snapshot(session_state.access_token or "")
+    except (BrokerAdapterError, AttributeError, NotImplementedError, RuntimeError, ValueError) as exc:
+        return f"{exc.__class__.__name__}: {exc}"
+
+
+def _snapshot_symbol_quantity(*, snapshot: BrokerAccountSnapshot, symbol: str) -> int:
+    positions = snapshot.positions or snapshot.holdings
+    return sum(position.quantity for position in positions if position.symbol == symbol and position.quantity > 0)
+
+
+def _local_position_quantity(*, settings: Settings, db: Session, symbol: str) -> int:
+    position = db.scalar(
+        select(ExecutionPosition).where(
+            ExecutionPosition.mode == settings.runtime_mode,
+            ExecutionPosition.symbol == symbol,
+        )
+    )
+    return position.quantity if position is not None and position.quantity > 0 else 0
+
+
+def _load_daily_new_buy_notional(
+    *,
+    settings: Settings,
+    db: Session,
+    market_date,
+) -> Decimal:
+    if market_date is None:
+        return Decimal("0")
+    items = db.scalars(
+        select(ExecutionPlanItem)
+        .join(ExecutionPlanItem.plan)
+        .where(
+            ExecutionPlan.mode == settings.runtime_mode,
+            ExecutionPlan.market_date == market_date,
+            ExecutionPlanItem.side == "buy",
+            ExecutionPlanItem.status.in_(
+                (
+                    "next_open_buy_scheduled",
+                    "next_open_buy_dispatching",
+                    "next_open_buy_retry_pending",
+                    "watch_buy_submitted",
+                    "broker_order_submission_pending",
+                    "broker_order_submitted",
+                    "broker_order_retry_pending",
+                    "submitted",
+                    "open",
+                    "partially_filled",
+                    "retry_pending",
+                )
+            ),
+        )
+    ).all()
+    total = Decimal("0")
+    for item in items:
+        total += _approved_buy_notional(item)
+    return total
+
+
+def _approved_buy_notional(item: ExecutionPlanItem) -> Decimal:
+    for source in _item_payload_sources(item):
+        decision = source.get("exec_agent_decision")
+        if isinstance(decision, dict):
+            value = _parse_positive_decimal(decision.get("approved_notional"))
+            if value is not None:
+                return value
+        for key in ("approved_notional", "notional", "max_notional"):
+            value = _parse_positive_decimal(source.get(key))
+            if value is not None:
+                return value
+    quantity = _parse_buy_quantity(item.quantity_policy)
+    price = item.limit_price or _watch_buy_trigger_price(item)
+    if quantity is None or price is None:
+        return Decimal("0")
+    return price * Decimal(quantity)
+
+
+def _minimum_decimal(*values: Decimal | None) -> Decimal | None:
+    concrete = [value for value in values if value is not None]
+    if not concrete:
+        return None
+    return min(concrete)
 
 
 def _monitoring_status(intent: str) -> str:

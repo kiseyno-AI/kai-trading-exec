@@ -1718,6 +1718,7 @@ def _build_watch_buy_test_app(
             kis_app_secret="paper-secret",
             kis_account_number="12345678",
             monitoring_max_quote_age_seconds=max_quote_age_seconds,
+            exec_agent_max_position_allocation_pct=Decimal("0.20"),
         ),
         broker_adapter=broker_adapter,
     )
@@ -1737,16 +1738,18 @@ def _create_watch_buy_candidate(
     plan_id: str,
     trigger_price: str = "71000.00",
     chase_limit_price: str | None = "71200.00",
+    quantity_policy: dict[str, object] | None = None,
+    risk_context: dict[str, object] | None = None,
     market_date: str = "2024-01-03",
 ) -> str:
     item = {
         "symbol": "005930",
         "side": "buy",
         "intent": "next_open_buy",
-        "quantity_policy": {"kind": "shares", "quantity": 2},
+        "quantity_policy": quantity_policy or {"kind": "shares", "quantity": 2},
         "buy_recommendation_price": trigger_price,
         "time_in_force": "day",
-        "risk_context": {"exchange": "KRX"},
+        "risk_context": risk_context or {"exchange": "KRX", "stop_price": "70000.00"},
         "decision_agent_name": "short-term-decider",
         "source_plan_item_id": f"{plan_id}-watch",
     }
@@ -2073,6 +2076,94 @@ def test_watch_buy_safety_pause_keeps_trigger_retryable() -> None:
     assert retry_payload["items"][0]["outcome"] == "submitted"
     assert retry_payload["items"][0]["status"] == "watch_buy_submitted"
     assert len(broker_adapter.order_calls) == 1
+
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("control_action", "expected_block_reason"),
+    [
+        (None, "paused"),
+        ("/controls/kill-switch", "kill_switch"),
+    ],
+)
+def test_budget_only_watch_buy_safety_block_keeps_trigger_retryable(
+    control_action: str | None,
+    expected_block_reason: str,
+) -> None:
+    app, engine, client, broker_adapter = _build_watch_buy_test_app(resume=False)
+    if control_action is not None:
+        control = client.post(
+            control_action,
+            json={"actor": "ops", "source": "console", "reason": "block automation"},
+        )
+        assert control.status_code == 200
+    item_id = _create_watch_buy_candidate(
+        client,
+        plan_id=f"plan-budget-watch-buy-{expected_block_reason}",
+        quantity_policy={"kind": "budget", "max_budget_krw": "150000.00"},
+        risk_context={
+            "exchange": "KRX",
+            "stop_price": "70000.00",
+            "max_budget_krw": "150000.00",
+        },
+    )
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "blocked runtime should keep budget-only watch buy retryable",
+            "prices": [{"symbol": "005930", "price": "71050.00"}],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["triggered_item_count"] == 1
+    assert payload["submitted_order_count"] == 0
+    assert payload["blocked_item_count"] == 1
+    assert payload["items"][0]["outcome"] == "blocked"
+    assert payload["items"][0]["block_reason"] == expected_block_reason
+    assert payload["items"][0]["status"] == "watch_buy_triggered_blocked"
+    assert broker_adapter.authenticate_calls == 0
+    assert broker_adapter.order_calls == []
+
+    with app.state.db_session_factory() as session:
+        item = session.get(ExecutionPlanItem, item_id)
+        assert item is not None
+        assert item.status == "watch_buy_triggered_blocked"
+        assert (
+            item.risk_context["last_monitoring_event"]["event"]
+            == "watch_buy_triggered_blocked"
+        )
+        assert item.risk_context["last_monitoring_event"]["reason"] == expected_block_reason
+
+    if expected_block_reason == "paused":
+        resume = client.post(
+            "/controls/resume",
+            json={"actor": "ops", "source": "console", "reason": "resume automation"},
+        )
+        assert resume.status_code == 200
+
+        retry = client.post(
+            "/monitoring/evaluate",
+            json={
+                "actor": "ops",
+                "source": "test",
+                "reason": "resumed runtime should retry budget-only watch buy",
+                "prices": [{"symbol": "005930", "price": "71050.00"}],
+            },
+        )
+
+        assert retry.status_code == 200
+        retry_payload = retry.json()
+        assert retry_payload["triggered_item_count"] == 1
+        assert retry_payload["submitted_order_count"] == 1
+        assert retry_payload["items"][0]["outcome"] == "submitted"
+        assert retry_payload["items"][0]["status"] == "watch_buy_submitted"
+        assert len(broker_adapter.order_calls) == 1
 
     engine.dispose()
 

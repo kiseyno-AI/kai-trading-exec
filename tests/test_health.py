@@ -228,6 +228,72 @@ def test_create_app_injects_default_kis_monitoring_price_source_for_paper_runtim
     engine.dispose()
 
 
+def test_runtime_status_reports_monthly_realized_pnl_progress_and_mode() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        monthly_target_krw=Decimal("1000"),
+    )
+    app, engine = build_test_app(settings=settings)
+    client = TestClient(app)
+    now = datetime.now(UTC)
+
+    with app.state.db_session_factory() as session:
+        buy_order = BrokerOrder(
+            mode="paper",
+            idempotency_key="monthly-buy-1",
+            symbol="005930",
+            side="buy",
+            status="filled",
+            quantity=10,
+        )
+        sell_order = BrokerOrder(
+            mode="paper",
+            idempotency_key="monthly-sell-1",
+            symbol="005930",
+            side="sell",
+            status="filled",
+            quantity=5,
+        )
+        session.add_all([buy_order, sell_order])
+        session.flush()
+        session.add_all(
+            [
+                ExecutionFill(
+                    broker_order_pk=buy_order.id,
+                    broker_fill_id="monthly-buy-fill-1",
+                    symbol="005930",
+                    side="buy",
+                    quantity=10,
+                    price=Decimal("10000"),
+                    filled_at=now - timedelta(days=1),
+                ),
+                ExecutionFill(
+                    broker_order_pk=sell_order.id,
+                    broker_fill_id="monthly-sell-fill-1",
+                    symbol="005930",
+                    side="sell",
+                    quantity=5,
+                    price=Decimal("11000"),
+                    filled_at=now,
+                ),
+            ]
+        )
+        session.commit()
+
+    response = client.get("/runtime/status")
+
+    assert response.status_code == 200
+    monthly = response.json()["monthly_pnl"]
+    assert monthly["monthly_realized_pnl"] == "5000.0000"
+    assert monthly["monthly_target_krw"] == "1000.0000"
+    assert monthly["target_progress_pct"] == "500.0000"
+    assert monthly["mode_recommendation"] == "capital_preservation"
+    assert monthly["matched_sell_quantity"] == 5
+
+    engine.dispose()
+
+
 def test_runtime_status_requires_complete_exec_owned_schema() -> None:
     app, engine = build_test_app(
         settings=Settings(

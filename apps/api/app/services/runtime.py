@@ -1,6 +1,7 @@
 import os
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import distinct, func, or_, select
@@ -451,6 +452,7 @@ def build_runtime_status(
         monitoring["price_source"] = monitoring_price_source
         broker = build_broker_session_summary(settings=settings, db=db)
         symbols = runtime_symbol_summary(settings=settings, db=db)
+        monthly_pnl = monthly_pnl_payload(settings=settings, db=db)
     except SQLAlchemyError as exc:
         db.rollback()
         dependencies["runtime_schema"] = "error"
@@ -459,6 +461,7 @@ def build_runtime_status(
             settings,
             f"runtime state unavailable: {exc.__class__.__name__}; run migrations",
         )
+        monthly_pnl = _default_monthly_pnl_payload(settings=settings)
 
     monitoring_reasons = _monitoring_price_source_readiness_reasons(
         autonomous=autonomous,
@@ -489,7 +492,147 @@ def build_runtime_status(
         "broker": broker,
         "counts": counts,
         "symbols": symbols,
+        "monthly_pnl": monthly_pnl,
     }
+
+
+def monthly_pnl_payload(
+    *,
+    settings: Settings,
+    db: Session,
+    now: datetime | None = None,
+) -> dict[str, object]:
+    month_start, next_month_start = _current_krx_month_utc_bounds(now)
+    fills = db.scalars(
+        select(ExecutionFill)
+        .join(ExecutionFill.broker_order)
+        .where(
+            BrokerOrder.mode == settings.runtime_mode,
+            ExecutionFill.filled_at < next_month_start,
+        )
+        .order_by(ExecutionFill.filled_at.asc(), ExecutionFill.id.asc())
+    ).all()
+
+    lots_by_symbol: dict[str, list[dict[str, Decimal]]] = {}
+    monthly_realized = Decimal("0")
+    monthly_sell_notional = Decimal("0")
+    monthly_buy_notional = Decimal("0")
+    matched_sell_quantity = 0
+    unmatched_sell_quantity = 0
+    for fill in fills:
+        filled_at = _as_utc(fill.filled_at)
+        side = fill.side.lower()
+        symbol = fill.symbol
+        quantity = Decimal(fill.quantity)
+        notional = (fill.price * quantity).quantize(Decimal("0.0001"))
+        if side == "buy":
+            lots_by_symbol.setdefault(symbol, []).append(
+                {"quantity": quantity, "price": fill.price}
+            )
+            if filled_at >= month_start:
+                monthly_buy_notional += notional
+            continue
+        if side != "sell":
+            continue
+        if filled_at >= month_start:
+            monthly_sell_notional += notional
+        remaining = quantity
+        lots = lots_by_symbol.setdefault(symbol, [])
+        while remaining > 0 and lots:
+            lot = lots[0]
+            matched = min(remaining, lot["quantity"])
+            if filled_at >= month_start:
+                monthly_realized += ((fill.price - lot["price"]) * matched).quantize(Decimal("0.0001"))
+                matched_sell_quantity += int(matched)
+            lot["quantity"] -= matched
+            remaining -= matched
+            if lot["quantity"] <= 0:
+                lots.pop(0)
+        if remaining > 0 and filled_at >= month_start:
+            unmatched_sell_quantity += int(remaining)
+
+    target = getattr(settings, "monthly_target_krw", Decimal("500000"))
+    progress = (monthly_realized / target * Decimal("100")).quantize(Decimal("0.01")) if target > 0 else Decimal("0")
+    expected_progress = _expected_month_progress_pct(now)
+    recommendation = _monthly_mode_recommendation(
+        settings=settings,
+        progress_pct=progress,
+        expected_progress_pct=expected_progress,
+    )
+    return {
+        "month": month_start.astimezone(KRX_TIMEZONE).strftime("%Y-%m"),
+        "monthly_realized_pnl": _decimal_text(monthly_realized),
+        "monthly_target_krw": _decimal_text(target),
+        "target_progress_pct": _decimal_text(progress),
+        "expected_calendar_progress_pct": _decimal_text(expected_progress),
+        "mode_recommendation": recommendation,
+        "monthly_buy_notional": _decimal_text(monthly_buy_notional),
+        "monthly_sell_notional": _decimal_text(monthly_sell_notional),
+        "matched_sell_quantity": matched_sell_quantity,
+        "unmatched_sell_quantity": unmatched_sell_quantity,
+        "pnl_method": "fifo_internal_fills",
+    }
+
+
+def _default_monthly_pnl_payload(*, settings: Settings) -> dict[str, object]:
+    target = getattr(settings, "monthly_target_krw", Decimal("500000"))
+    return {
+        "month": datetime.now(KRX_TIMEZONE).strftime("%Y-%m"),
+        "monthly_realized_pnl": "0.0000",
+        "monthly_target_krw": _decimal_text(target),
+        "target_progress_pct": "0.00",
+        "expected_calendar_progress_pct": _decimal_text(_expected_month_progress_pct()),
+        "mode_recommendation": "normal",
+        "monthly_buy_notional": "0.0000",
+        "monthly_sell_notional": "0.0000",
+        "matched_sell_quantity": 0,
+        "unmatched_sell_quantity": 0,
+        "pnl_method": "fifo_internal_fills",
+    }
+
+
+def _current_krx_month_utc_bounds(now: datetime | None = None) -> tuple[datetime, datetime]:
+    current = (now or datetime.now(KRX_TIMEZONE)).astimezone(KRX_TIMEZONE)
+    month_start = current.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    if month_start.month == 12:
+        next_month = month_start.replace(year=month_start.year + 1, month=1)
+    else:
+        next_month = month_start.replace(month=month_start.month + 1)
+    return month_start.astimezone(UTC), next_month.astimezone(UTC)
+
+
+def _expected_month_progress_pct(now: datetime | None = None) -> Decimal:
+    current = (now or datetime.now(KRX_TIMEZONE)).astimezone(KRX_TIMEZONE)
+    if current.month == 12:
+        next_month = current.replace(year=current.year + 1, month=1, day=1)
+    else:
+        next_month = current.replace(month=current.month + 1, day=1)
+    days_in_month = (next_month.date() - current.replace(day=1).date()).days
+    return (Decimal(current.day) / Decimal(days_in_month) * Decimal("100")).quantize(Decimal("0.01"))
+
+
+def _as_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
+
+
+def _monthly_mode_recommendation(
+    *,
+    settings: Settings,
+    progress_pct: Decimal,
+    expected_progress_pct: Decimal,
+) -> str:
+    if getattr(settings, "monthly_capital_preservation_enabled", True) and progress_pct >= Decimal("100"):
+        return "capital_preservation"
+    lag_ratio = getattr(settings, "monthly_aggressive_lag_ratio", Decimal("0.75"))
+    if progress_pct < expected_progress_pct * Decimal(str(lag_ratio)):
+        return "aggressive"
+    return "normal"
+
+
+def _decimal_text(value: Decimal) -> str:
+    return f"{value:.4f}"
 
 
 def build_runtime_daily_board(
