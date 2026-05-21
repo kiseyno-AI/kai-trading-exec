@@ -426,6 +426,8 @@ def _evaluate_monitoring_cycle(
                         outcome="rejected",
                         message=approval.message,
                     )
+                if symbol_actions:
+                    pending_symbols.append(symbol)
                 continue
         else:
             quantity = _resolve_sell_quantity(
@@ -453,6 +455,8 @@ def _evaluate_monitoring_cycle(
                         else "no sellable execution position is available for this trigger"
                     ),
                 )
+                if symbol_actions:
+                    pending_symbols.append(symbol)
                 continue
 
         if dispatch_action_count >= max_broker_actions:

@@ -1874,7 +1874,7 @@ def _agent_risk_caps(settings: Settings) -> dict[str, object]:
             _settings_decimal(settings, "exec_agent_max_symbol_total_exposure_pct", Decimal("0.20"))
         ),
         "max_daily_new_buy_notional": _serialize_decimal(
-            _settings_decimal(settings, "exec_agent_max_daily_new_buy_notional", Decimal("500000"))
+            _settings_decimal(settings, "exec_agent_max_daily_new_buy_notional", Decimal("0"))
         ),
         "max_trade_risk_pct": _serialize_decimal(
             _settings_decimal(settings, "exec_agent_max_trade_risk_pct", Decimal("0.01"))

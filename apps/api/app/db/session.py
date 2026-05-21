@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, event, text
 from sqlalchemy.engine import Engine, make_url
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -22,10 +22,26 @@ def create_db_engine(settings: Settings) -> Engine:
     url = make_url(settings.database_url)
     kwargs: dict[str, object] = {"future": True, "pool_pre_ping": True}
     if url.drivername.startswith("sqlite"):
-        kwargs["connect_args"] = {"check_same_thread": False}
+        kwargs["connect_args"] = {"check_same_thread": False, "timeout": 30}
         if url.database == ":memory:":
             kwargs["poolclass"] = StaticPool
-    return create_engine(settings.database_url, **kwargs)
+    engine = create_engine(settings.database_url, **kwargs)
+    if url.drivername.startswith("sqlite"):
+        _configure_sqlite_engine(engine)
+    return engine
+
+
+def _configure_sqlite_engine(engine: Engine) -> None:
+    @event.listens_for(engine, "connect")
+    def _set_sqlite_pragmas(dbapi_connection, _connection_record) -> None:  # type: ignore[no-untyped-def]
+        cursor = dbapi_connection.cursor()
+        try:
+            cursor.execute("PRAGMA busy_timeout=30000")
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
+            cursor.execute("PRAGMA foreign_keys=ON")
+        finally:
+            cursor.close()
 
 
 def create_session_factory(engine: Engine) -> sessionmaker[Session]:

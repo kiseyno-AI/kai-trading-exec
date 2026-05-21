@@ -103,35 +103,38 @@ def resolve_risk_based_buy_quantity(
             existing_symbol_exposure=existing_symbol_exposure,
         )
 
-    daily_cap = _decimal_setting(settings, "exec_agent_max_daily_new_buy_notional", Decimal("500000"))
-    daily_budget_remaining = (daily_cap - daily_new_buy_notional_used).quantize(
-        Decimal("0.0001"),
-        rounding=ROUND_DOWN,
-    )
-    if daily_budget_remaining <= 0:
-        return _reject(
-            "daily_new_buy_cap_reached",
-            "daily new-buy notional cap is already used",
-            daily_new_buy_notional_used=daily_new_buy_notional_used,
-            daily_cap=daily_cap,
+    daily_cap = _decimal_setting(settings, "exec_agent_max_daily_new_buy_notional", Decimal("0"))
+    daily_budget_remaining: Decimal | None = None
+    if daily_cap > 0:
+        daily_budget_remaining = (daily_cap - daily_new_buy_notional_used).quantize(
+            Decimal("0.0001"),
+            rounding=ROUND_DOWN,
         )
-    if daily_budget_remaining < entry_price:
-        return _reject(
-            "daily_new_buy_cap_reached",
-            "daily new-buy notional cap cannot fund one share at the entry price",
-            daily_new_buy_notional_used=daily_new_buy_notional_used,
-            daily_cap=daily_cap,
-            daily_budget_remaining=daily_budget_remaining,
-            entry_price=entry_price,
-        )
+        if daily_budget_remaining <= 0:
+            return _reject(
+                "daily_new_buy_cap_reached",
+                "daily new-buy notional cap is already used",
+                daily_new_buy_notional_used=daily_new_buy_notional_used,
+                daily_cap=daily_cap,
+            )
+        if daily_budget_remaining < entry_price:
+            return _reject(
+                "daily_new_buy_cap_reached",
+                "daily new-buy notional cap cannot fund one share at the entry price",
+                daily_new_buy_notional_used=daily_new_buy_notional_used,
+                daily_cap=daily_cap,
+                daily_budget_remaining=daily_budget_remaining,
+                entry_price=entry_price,
+            )
 
     budget_candidates = [
         available_cash,
         max_position_budget,
         symbol_exposure_remaining,
-        daily_budget_remaining,
         _decimal_setting(settings, "exec_agent_max_symbol_budget", Decimal("1000000")),
     ]
+    if daily_budget_remaining is not None:
+        budget_candidates.append(daily_budget_remaining)
     if candidate_max_budget is not None:
         budget_candidates.append(candidate_max_budget)
     allocation_budget = min(budget_candidates).quantize(Decimal("0.0001"), rounding=ROUND_DOWN)
