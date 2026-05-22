@@ -90,6 +90,13 @@ NON_MONITORABLE_PLAN_ITEM_STATUSES = frozenset(
         "watch_cancelled",
     }
 )
+SELL_PENDING_CONFIG_STATUSES = frozenset(
+    {
+        "target_sell_pending_config",
+        "stop_sell_pending_config",
+        "max_holding_close_sell_pending_config",
+    }
+)
 MONITORING_WORKER_NAME = "intraday_target_stop_monitor"
 MONITORING_RUNTIME_TOPOLOGY = "shared_symbol_scheduler"
 MONITORING_SELECTION_STRATEGY = "round_robin_by_symbol"
@@ -196,7 +203,7 @@ def list_autonomous_monitoring_symbols(
 
     seen: set[str] = set()
     symbols: list[str] = []
-    for item in _load_monitored_items(settings=settings, db=db):
+    for item in _load_monitored_items(settings=settings, db=db, exclude_pending_config=True):
         if item.status in NON_MONITORABLE_PLAN_ITEM_STATUSES:
             continue
         if item.symbol in seen:
@@ -216,7 +223,11 @@ def _evaluate_monitoring_cycle(
     allow_persisted_triggered_without_price: bool,
     update_checkpoint_if_idle: bool,
 ) -> EvaluateMonitoringResult:
-    items = _load_monitored_items(settings=settings, db=db)
+    items = _load_monitored_items(
+        settings=settings,
+        db=db,
+        exclude_pending_config=allow_persisted_triggered_without_price,
+    )
     monitored_symbols = {item.symbol for item in items}
     sell_monitored_symbols = {
         item.symbol
@@ -685,8 +696,14 @@ def _load_monitored_items(
     *,
     settings: Settings,
     db: Session,
+    exclude_pending_config: bool = False,
 ) -> list[ExecutionPlanItem]:
     monitored_item_filter = _monitored_item_filter()
+    if exclude_pending_config:
+        monitored_item_filter = and_(
+            monitored_item_filter,
+            ~ExecutionPlanItem.status.in_(tuple(SELL_PENDING_CONFIG_STATUSES)),
+        )
     symbol_candidates = (
         select(
             ExecutionPlanItem.symbol.label("symbol"),

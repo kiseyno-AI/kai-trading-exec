@@ -21,6 +21,7 @@ from app.models.runtime import (
     RuntimeControlState,
 )
 from app.services import runtime as runtime_service, runtime_controls
+from app.services.monitoring import _load_monitored_items
 
 
 def build_test_app(
@@ -843,6 +844,13 @@ def test_monitoring_items_use_short_pending_config_status_and_stay_evaluable() -
         assert plan_item is not None
         assert plan_item.status == "target_sell_pending_config"
         assert len(plan_item.status) <= 32
+
+        autonomous_items = _load_monitored_items(
+            settings=app.state.settings,
+            db=session,
+            exclude_pending_config=True,
+        )
+        assert [item.id for item in autonomous_items] == []
 
     engine.dispose()
 
