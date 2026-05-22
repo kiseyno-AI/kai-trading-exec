@@ -244,9 +244,17 @@ def sync_execution_positions_from_broker_snapshot(
         reason="refresh execution positions from broker snapshot",
     )
     snapshot = adapter.get_account_snapshot(session_state.access_token or "")
-    tracked_symbols = normalized_symbols or {
-        holding.symbol for holding in snapshot.holdings
-    }
+    if normalized_symbols is not None:
+        tracked_symbols = normalized_symbols
+    else:
+        local_symbols = set(
+            db.scalars(
+                select(ExecutionPosition.symbol).where(
+                    ExecutionPosition.mode == settings.runtime_mode,
+                )
+            ).all()
+        )
+        tracked_symbols = local_symbols | {holding.symbol for holding in snapshot.holdings}
     if not tracked_symbols:
         return {
             "tracked_symbol_count": 0,

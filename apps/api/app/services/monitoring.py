@@ -6,7 +6,7 @@ from datetime import UTC, date, datetime, timedelta
 from zoneinfo import ZoneInfo
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, func, or_, select, tuple_
 from sqlalchemy.orm import Session, selectinload
 
 from app.api.schemas.execution import (
@@ -143,7 +143,9 @@ def materialize_monitoring_plan_items(plan: ExecutionPlan) -> None:
             continue
         if item.intent not in SELL_MONITORED_INTENTS or item.status != "pending":
             continue
-        if _monitoring_item_is_configured(item):
+        if _monitoring_item_is_configured(
+            item
+        ) and not _quantity_policy_requires_position_exit(item.quantity_policy):
             item.status = _monitoring_status(item.intent)
             continue
         item.status = _pending_configuration_status(item.intent)
@@ -700,25 +702,29 @@ def _load_monitored_items(
 ) -> list[ExecutionPlanItem]:
     monitored_item_filter = _monitored_item_filter()
     if exclude_pending_config:
+        held_symbols = select(ExecutionPosition.symbol).where(
+            ExecutionPosition.mode == settings.runtime_mode,
+            ExecutionPosition.quantity > 0,
+        )
         monitored_item_filter = and_(
             monitored_item_filter,
-            ~ExecutionPlanItem.status.in_(tuple(SELL_PENDING_CONFIG_STATUSES)),
+            or_(
+                ExecutionPlanItem.side != "sell",
+                ExecutionPlanItem.symbol.in_(held_symbols),
+            ),
         )
-    symbol_candidates = (
+    latest_plan_candidates = (
         select(
             ExecutionPlanItem.symbol.label("symbol"),
-            ExecutionPlan.accepted_at.label("accepted_at"),
             ExecutionPlan.id.label("plan_id"),
-            ExecutionPlanItem.plan_item_index.label("plan_item_index"),
-            ExecutionPlanItem.id.label("item_id"),
+            ExecutionPlan.accepted_at.label("accepted_at"),
             func.row_number()
             .over(
                 partition_by=ExecutionPlanItem.symbol,
                 order_by=(
-                    ExecutionPlan.accepted_at.asc(),
-                    ExecutionPlan.id.asc(),
-                    ExecutionPlanItem.plan_item_index.asc(),
-                    ExecutionPlanItem.id.asc(),
+                    ExecutionPlan.market_date.desc(),
+                    ExecutionPlan.accepted_at.desc(),
+                    ExecutionPlan.id.desc(),
                 ),
             )
             .label("symbol_rank"),
@@ -730,15 +736,18 @@ def _load_monitored_items(
         )
         .subquery()
     )
-    # Bound the working set by distinct symbol before loading per-symbol items.
-    selected_symbols = (
-        select(symbol_candidates.c.symbol)
-        .where(symbol_candidates.c.symbol_rank == 1)
+    # Bound the working set by distinct symbol, and only evaluate the latest
+    # monitorable plan for each symbol so stale prior-day target/stop rows do
+    # not submit duplicate exits after a newer plan supersedes them.
+    selected_symbol_plans = (
+        select(
+            latest_plan_candidates.c.symbol,
+            latest_plan_candidates.c.plan_id,
+        )
+        .where(latest_plan_candidates.c.symbol_rank == 1)
         .order_by(
-            symbol_candidates.c.accepted_at.asc(),
-            symbol_candidates.c.plan_id.asc(),
-            symbol_candidates.c.plan_item_index.asc(),
-            symbol_candidates.c.item_id.asc(),
+            latest_plan_candidates.c.accepted_at.asc(),
+            latest_plan_candidates.c.plan_id.asc(),
         )
         .limit(settings.monitoring_max_symbols_per_cycle)
     )
@@ -748,7 +757,7 @@ def _load_monitored_items(
         .where(
             ExecutionPlan.mode == settings.runtime_mode,
             monitored_item_filter,
-            ExecutionPlanItem.symbol.in_(selected_symbols),
+            tuple_(ExecutionPlanItem.symbol, ExecutionPlanItem.execution_plan_id).in_(selected_symbol_plans),
         )
         .options(selectinload(ExecutionPlanItem.plan))
         .order_by(
@@ -839,6 +848,7 @@ def _reconcile_before_monitoring(
         settings=settings,
         db=db,
         symbols=symbols,
+        max_age_seconds=settings.exec_agent_max_account_snapshot_age_seconds,
     )
     if not stale_symbols:
         return
@@ -858,6 +868,7 @@ def _positions_with_stale_local_state(
     settings: Settings,
     db: Session,
     symbols: set[str],
+    max_age_seconds: int,
 ) -> set[str]:
     positions = db.scalars(
         select(ExecutionPosition)
@@ -868,9 +879,17 @@ def _positions_with_stale_local_state(
     ).all()
     known = {position.symbol: position for position in positions}
     stale: set[str] = set()
+    stale_before = datetime.now(UTC) - timedelta(seconds=max_age_seconds)
     for symbol in symbols:
         position = known.get(symbol)
         if position is None or position.quantity <= 0:
+            stale.add(symbol)
+            continue
+        reconciled_at = position.last_reconciled_at
+        if reconciled_at is None:
+            stale.add(symbol)
+            continue
+        if _normalize_utc(reconciled_at) < stale_before:
             stale.add(symbol)
     return stale
 
@@ -897,6 +916,9 @@ def _monitoring_item_is_configured(item: ExecutionPlanItem) -> bool:
 def _quantity_policy_supported(quantity_policy: dict[str, object] | None) -> bool:
     if not isinstance(quantity_policy, dict):
         return False
+    if _quantity_policy_requires_position_exit(quantity_policy):
+        return True
+
     kind = quantity_policy.get("kind")
     if kind == "shares":
         quantity = quantity_policy.get("quantity")
@@ -905,6 +927,19 @@ def _quantity_policy_supported(quantity_policy: dict[str, object] | None) -> boo
         fraction = _parse_fraction(quantity_policy.get("fraction"))
         return fraction is not None
     return False
+
+
+def _quantity_policy_requires_position_exit(quantity_policy: dict[str, object] | None) -> bool:
+    if not isinstance(quantity_policy, dict):
+        return False
+    policy_type = quantity_policy.get("type")
+    if (
+        isinstance(policy_type, str)
+        and policy_type.strip().lower() == "position_exit_from_entry"
+    ):
+        return True
+    kind = quantity_policy.get("kind")
+    return isinstance(kind, str) and kind.strip().lower() == "position_exit_from_entry"
 
 
 def _is_triggered(
@@ -955,6 +990,8 @@ def _resolve_sell_quantity(
     quantity_policy = item.quantity_policy
     if not isinstance(quantity_policy, dict):
         return None
+    if _quantity_policy_requires_position_exit(quantity_policy):
+        return remaining_quantity
 
     kind = quantity_policy.get("kind")
     if kind == "shares":

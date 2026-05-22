@@ -22,7 +22,7 @@ from app.models.runtime import (
 )
 from app.services import runtime as runtime_service, runtime_controls
 from app.services.autonomous_runtime import _is_regular_market_session
-from app.services.monitoring import _load_monitored_items
+from app.services.monitoring import _load_monitored_items, _resolve_sell_quantity
 
 
 def build_test_app(
@@ -867,6 +867,152 @@ def test_monitoring_items_use_short_pending_config_status_and_stay_evaluable() -
             exclude_pending_config=True,
         )
         assert [item.id for item in autonomous_items] == []
+
+    engine.dispose()
+
+
+def test_position_exit_pending_sell_is_autonomous_monitored_when_position_exists() -> None:
+    app, engine = build_test_app(
+        Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+        )
+    )
+    client = TestClient(app)
+
+    response = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-position-exit-target",
+            "source": "kai-trading-core",
+            "items": [
+                {
+                    "symbol": "000660",
+                    "side": "sell",
+                    "intent": "target_sell",
+                    "trigger_price": "100.00",
+                    "quantity_policy": {
+                        "type": "position_exit_from_entry",
+                        "linked_entry_item_key": "entry-1",
+                    },
+                }
+            ],
+        },
+    )
+    assert response.status_code == 201
+    plan_item_id = response.json()["persisted_execution_item_ids"][0]
+
+    with app.state.db_session_factory() as session:
+        plan_item = session.get(ExecutionPlanItem, plan_item_id)
+        assert plan_item is not None
+        assert plan_item.status == "target_sell_pending_config"
+        session.add(
+            ExecutionPosition(
+                mode="paper",
+                symbol="000660",
+                quantity=7,
+                average_price=Decimal("95.00"),
+                updated_from="test",
+            )
+        )
+        session.commit()
+
+        autonomous_items = _load_monitored_items(
+            settings=app.state.settings,
+            db=session,
+            exclude_pending_config=True,
+        )
+        assert [item.id for item in autonomous_items] == [plan_item_id]
+
+        assert _resolve_sell_quantity(
+            item=autonomous_items[0],
+            remaining_quantity=7,
+        ) == 7
+
+    engine.dispose()
+
+
+def test_autonomous_monitoring_uses_latest_plan_per_symbol_only() -> None:
+    app, engine = build_test_app(
+        Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+        )
+    )
+    client = TestClient(app)
+
+    older = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-old-sell",
+            "source": "kai-trading-core",
+            "market_date": "2026-05-21",
+            "items": [
+                {
+                    "symbol": "000660",
+                    "side": "sell",
+                    "intent": "target_sell",
+                    "trigger_price": "100.00",
+                    "quantity_policy": {"kind": "shares", "quantity": 1},
+                }
+            ],
+        },
+    )
+    newer = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-new-sell",
+            "source": "kai-trading-core",
+            "market_date": "2026-05-22",
+            "items": [
+                {
+                    "symbol": "000660",
+                    "side": "sell",
+                    "intent": "target_sell",
+                    "trigger_price": "110.00",
+                    "quantity_policy": {
+                        "type": "position_exit_from_entry",
+                        "linked_entry_item_key": "entry-1",
+                    },
+                },
+                {
+                    "symbol": "000660",
+                    "side": "sell",
+                    "intent": "stop_sell",
+                    "trigger_price": "90.00",
+                    "quantity_policy": {
+                        "type": "position_exit_from_entry",
+                        "linked_entry_item_key": "entry-1",
+                    },
+                },
+            ],
+        },
+    )
+    assert older.status_code == 201
+    assert newer.status_code == 201
+    older_item_id = older.json()["persisted_execution_item_ids"][0]
+    newer_item_ids = set(newer.json()["persisted_execution_item_ids"])
+
+    with app.state.db_session_factory() as session:
+        session.add(
+            ExecutionPosition(
+                mode="paper",
+                symbol="000660",
+                quantity=7,
+                average_price=Decimal("95.00"),
+                updated_from="test",
+            )
+        )
+        session.commit()
+
+        autonomous_items = _load_monitored_items(
+            settings=app.state.settings,
+            db=session,
+            exclude_pending_config=True,
+        )
+        autonomous_item_ids = {item.id for item in autonomous_items}
+        assert older_item_id not in autonomous_item_ids
+        assert autonomous_item_ids == newer_item_ids
 
     engine.dispose()
 

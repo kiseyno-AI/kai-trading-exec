@@ -227,6 +227,51 @@ def test_reconcile_partial_fill_and_open_order_states() -> None:
     engine.dispose()
 
 
+def test_account_snapshot_sync_zeroes_local_positions_absent_from_broker_snapshot() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        kis_app_key="***",
+        kis_app_secret="***",
+        kis_account_number="12345678",
+    )
+    engine, db = _session(settings)
+    db.add(
+        ExecutionPosition(
+            mode="paper",
+            symbol="000660",
+            quantity=3,
+            average_price=Decimal("95000"),
+            updated_from="test",
+        )
+    )
+    db.commit()
+    broker = ReconciliationStubBroker(
+        account_snapshot=BrokerAccountSnapshot(
+            available_cash=Decimal("1000000"),
+            observed_at=OBSERVED_AT,
+            source="stub:account_snapshot",
+            holdings=[],
+        )
+    )
+
+    result = sync_execution_positions_from_broker_snapshot(
+        settings=settings,
+        db=db,
+        adapter=broker,
+        symbols=None,
+    )
+
+    position = db.scalar(select(ExecutionPosition).where(ExecutionPosition.symbol == "000660"))
+    assert result["tracked_symbol_count"] == 1
+    assert result["zeroed"] == 1
+    assert position is not None
+    assert position.quantity == 0
+    assert position.last_reconciled_at is not None
+    assert position.last_reconciled_at.replace(tzinfo=UTC) == OBSERVED_AT
+    engine.dispose()
+
+
 def test_monitoring_reconciles_stale_missing_position_from_broker_holdings_before_sell() -> None:
     settings = Settings(
         database_url="sqlite:///:memory:",
