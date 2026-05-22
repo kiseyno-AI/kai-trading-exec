@@ -893,7 +893,7 @@ def _positions_with_stale_local_state(
         if position is None or position.quantity <= 0:
             stale.add(symbol)
             continue
-        if position.updated_from == "reconciliation":
+        if _is_legacy_seeded_reconciliation_position(position):
             continue
         reconciled_at = position.last_reconciled_at
         if reconciled_at is None:
@@ -902,6 +902,13 @@ def _positions_with_stale_local_state(
         if _normalize_utc(reconciled_at) < stale_before:
             stale.add(symbol)
     return stale
+
+
+def _is_legacy_seeded_reconciliation_position(position: ExecutionPosition) -> bool:
+    if position.updated_from != "reconciliation":
+        return False
+    raw_payload = position.raw_payload
+    return isinstance(raw_payload, dict) and raw_payload == {"source": "broker"}
 
 
 def _monitoring_item_is_configured(item: ExecutionPlanItem) -> bool:

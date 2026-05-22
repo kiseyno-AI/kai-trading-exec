@@ -1,3 +1,4 @@
+from datetime import UTC, datetime
 from decimal import Decimal
 
 from fastapi.testclient import TestClient
@@ -123,6 +124,7 @@ def test_autonomous_monitoring_keeps_partial_prices_when_one_live_quote_fails() 
                         quantity=1,
                         average_price=Decimal("120000.0000"),
                         updated_from="reconciliation",
+                        last_reconciled_at=datetime.now(UTC),
                         raw_payload={"source": "broker"},
                     ),
                     ExecutionPosition(
@@ -131,6 +133,7 @@ def test_autonomous_monitoring_keeps_partial_prices_when_one_live_quote_fails() 
                         quantity=1,
                         average_price=Decimal("88000.0000"),
                         updated_from="reconciliation",
+                        last_reconciled_at=datetime.now(UTC),
                         raw_payload={"source": "broker"},
                     ),
                 ]
