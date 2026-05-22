@@ -906,6 +906,14 @@ def test_position_exit_pending_sell_is_autonomous_monitored_when_position_exists
         plan_item = session.get(ExecutionPlanItem, plan_item_id)
         assert plan_item is not None
         assert plan_item.status == "target_sell_pending_config"
+
+        stale_state_autonomous_items = _load_monitored_items(
+            settings=app.state.settings,
+            db=session,
+            exclude_pending_config=True,
+        )
+        assert [item.id for item in stale_state_autonomous_items] == [plan_item_id]
+
         session.add(
             ExecutionPosition(
                 mode="paper",

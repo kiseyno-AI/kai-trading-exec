@@ -306,7 +306,7 @@ def test_monitoring_reconciles_stale_missing_position_from_broker_holdings_befor
                     "symbol": "005930",
                     "side": "sell",
                     "intent": "target_sell",
-                    "quantity_policy": {"kind": "shares", "quantity": 1},
+                    "quantity_policy": {"type": "position_exit_from_entry", "linked_entry_item_key": "entry-1"},
                     "trigger_price": "125000",
                     "limit_price": "125000",
                     "time_in_force": "day",
