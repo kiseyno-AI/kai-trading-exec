@@ -711,6 +711,7 @@ def _load_monitored_items(
             or_(
                 ExecutionPlanItem.side != "sell",
                 ExecutionPlanItem.symbol.in_(held_symbols),
+                _position_exit_quantity_policy_filter(),
             ),
         )
     latest_plan_candidates = (
@@ -780,6 +781,13 @@ def _monitored_item_filter():
                 ExecutionPlanItem.status.in_(tuple(WATCH_MONITORING_STATUSES)),
             ),
         ),
+    )
+
+
+def _position_exit_quantity_policy_filter():
+    return or_(
+        ExecutionPlanItem.quantity_policy["type"].as_string() == "position_exit_from_entry",
+        ExecutionPlanItem.quantity_policy["kind"].as_string() == "position_exit_from_entry",
     )
 
 
