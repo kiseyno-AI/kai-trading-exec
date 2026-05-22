@@ -4,9 +4,10 @@ import asyncio
 import logging
 import threading
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, time
 from decimal import Decimal
 from typing import Callable, Iterable
+from zoneinfo import ZoneInfo
 
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -129,6 +130,10 @@ class AutonomousRuntimeCoordinator:
                 worker_key="monitoring",
                 interval_seconds=self.settings.monitoring_loop_interval_seconds,
                 cycle=self._run_monitoring_cycle,
+                run_immediately=_is_regular_market_session(
+                    now=datetime.now(UTC),
+                    market_timezone=self.settings.market_timezone,
+                ),
             )
         )
         self._watch_exec_agent_sizing_task = asyncio.create_task(
@@ -169,10 +174,16 @@ class AutonomousRuntimeCoordinator:
         worker_key: str,
         interval_seconds: float,
         cycle: Callable[[datetime], asyncio.Future | object],
+        run_immediately: bool = False,
     ) -> None:
         try:
+            first_cycle = True
             while True:
-                await asyncio.sleep(interval_seconds)
+                if first_cycle and run_immediately:
+                    first_cycle = False
+                else:
+                    await asyncio.sleep(interval_seconds)
+                    first_cycle = False
                 started_at = datetime.now(UTC)
                 self._mark_cycle_started(worker_key=worker_key, started_at=started_at)
                 try:
@@ -545,6 +556,16 @@ def _normalize_monitoring_prices(raw_prices: object) -> list[MonitoringPriceRequ
             "monitoring_price_source items must be MonitoringPriceRequest, dict, or (symbol, price) tuples"
         )
     return normalized
+
+
+def _is_regular_market_session(*, now: datetime, market_timezone: str) -> bool:
+    try:
+        local_now = now.astimezone(ZoneInfo(market_timezone))
+    except Exception:
+        local_now = now.astimezone(ZoneInfo("Asia/Seoul"))
+    if local_now.weekday() >= 5:
+        return False
+    return time(9, 0) <= local_now.time() <= time(15, 30)
 
 
 def _serialize_datetime(value: datetime | None) -> str | None:
