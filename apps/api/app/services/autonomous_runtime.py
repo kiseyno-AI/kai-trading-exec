@@ -65,9 +65,10 @@ class MonitoringPriceSourceState:
     last_error_at: datetime | None = None
     last_symbol_count: int = 0
     last_price_count: int = 0
+    diagnostics: dict[str, object] = field(default_factory=dict)
 
     def snapshot(self) -> dict[str, object]:
-        return {
+        payload = {
             "configured": self.configured,
             "source_name": self.source_name,
             "provider": self.provider,
@@ -80,6 +81,9 @@ class MonitoringPriceSourceState:
             "last_symbol_count": self.last_symbol_count,
             "last_price_count": self.last_price_count,
         }
+        if self.diagnostics:
+            payload["diagnostics"] = dict(self.diagnostics)
+        return payload
 
 
 @dataclass
@@ -328,6 +332,7 @@ class AutonomousRuntimeCoordinator:
                 source_name=source_name,
                 provider=provider,
                 error=str(exc),
+                diagnostics=_price_source_diagnostics(source),
             )
             LOGGER.warning(
                 "monitoring_price_source_failed",
@@ -346,6 +351,7 @@ class AutonomousRuntimeCoordinator:
             source_name=source_name,
             provider=provider,
             price_count=len(prices),
+            diagnostics=_price_source_diagnostics(source),
         )
         return prices
 
@@ -439,6 +445,7 @@ class AutonomousRuntimeCoordinator:
             state.last_price_count = 0
             state.last_error = None
             state.last_error_at = None
+            state.diagnostics = {}
 
     def _mark_monitoring_price_source_result(
         self,
@@ -448,6 +455,7 @@ class AutonomousRuntimeCoordinator:
         source_name: str | None,
         provider: str | None,
         price_count: int,
+        diagnostics: dict[str, object],
     ) -> None:
         with self._lock:
             state = self._monitoring_price_source_state
@@ -457,6 +465,7 @@ class AutonomousRuntimeCoordinator:
             state.last_checked_at = checked_at
             state.last_symbol_count = symbol_count
             state.last_price_count = price_count
+            state.diagnostics = diagnostics
             if price_count >= symbol_count:
                 state.status = "ready"
                 state.reason = None
@@ -469,7 +478,13 @@ class AutonomousRuntimeCoordinator:
             state.last_error = None
             state.last_error_at = None
             if price_count == 0:
-                state.reason = "price source returned no prices for monitored symbols"
+                quote_error = _first_quote_failure_error(diagnostics)
+                if quote_error is not None:
+                    state.reason = "monitoring price source request failed"
+                    state.last_error = quote_error
+                    state.last_error_at = checked_at
+                else:
+                    state.reason = "price source returned no prices for monitored symbols"
             else:
                 state.reason = (
                     f"price source returned {price_count} prices for {symbol_count} monitored symbols"
@@ -484,6 +499,7 @@ class AutonomousRuntimeCoordinator:
         source_name: str | None,
         provider: str | None,
         error: str,
+        diagnostics: dict[str, object],
     ) -> None:
         with self._lock:
             state = self._monitoring_price_source_state
@@ -497,6 +513,7 @@ class AutonomousRuntimeCoordinator:
             state.last_price_count = 0
             state.last_error = error
             state.last_error_at = checked_at
+            state.diagnostics = diagnostics
 
 
 def _call_price_source(
@@ -527,6 +544,29 @@ def _source_identity(source: object) -> tuple[str | None, str | None]:
             )
     provider = getattr(source, "provider", None)
     return source.__class__.__name__, str(provider) if provider is not None else None
+
+
+def _price_source_diagnostics(source: object) -> dict[str, object]:
+    get_last_diagnostics = getattr(source, "get_last_diagnostics", None)
+    if get_last_diagnostics is None:
+        return {}
+    diagnostics = get_last_diagnostics()
+    if not isinstance(diagnostics, dict):
+        return {}
+    return dict(diagnostics)
+
+
+def _first_quote_failure_error(diagnostics: dict[str, object]) -> str | None:
+    failures = diagnostics.get("quote_failures")
+    if not isinstance(failures, list):
+        return None
+    for failure in failures:
+        if not isinstance(failure, dict):
+            continue
+        error = failure.get("error")
+        if isinstance(error, str) and error.strip():
+            return error
+    return None
 
 
 def _normalize_monitoring_prices(raw_prices: object) -> list[MonitoringPriceRequest]:
