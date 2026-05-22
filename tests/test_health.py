@@ -21,6 +21,7 @@ from app.models.runtime import (
     RuntimeControlState,
 )
 from app.services import runtime as runtime_service, runtime_controls
+from app.services.autonomous_runtime import _is_regular_market_session
 from app.services.monitoring import _load_monitored_items
 
 
@@ -779,6 +780,21 @@ def test_execution_plan_intake_schedules_next_open_buy_jobs() -> None:
         assert jobs[0].attempts == 0
 
     engine.dispose()
+
+
+def test_regular_market_session_detection_controls_startup_monitoring_bootstrap() -> None:
+    assert _is_regular_market_session(
+        now=datetime(2026, 5, 22, 1, 30, tzinfo=UTC),
+        market_timezone="Asia/Seoul",
+    ) is True
+    assert _is_regular_market_session(
+        now=datetime(2026, 5, 22, 23, 30, tzinfo=UTC),
+        market_timezone="Asia/Seoul",
+    ) is False
+    assert _is_regular_market_session(
+        now=datetime(2026, 5, 23, 1, 0, tzinfo=UTC),
+        market_timezone="Asia/Seoul",
+    ) is False
 
 
 def test_monitoring_items_use_short_pending_config_status_and_stay_evaluable() -> None:
