@@ -893,6 +893,8 @@ def _positions_with_stale_local_state(
         if position is None or position.quantity <= 0:
             stale.add(symbol)
             continue
+        if position.updated_from == "reconciliation":
+            continue
         reconciled_at = position.last_reconciled_at
         if reconciled_at is None:
             stale.add(symbol)
