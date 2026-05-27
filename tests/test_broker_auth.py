@@ -369,6 +369,20 @@ def test_settings_load_kis_environment_fields() -> None:
     assert settings.kis_hts_id == "ops-user"
 
 
+def test_settings_load_profit_protection_environment_fields() -> None:
+    settings = load_settings(
+        {
+            "KAI_EXEC_PROFIT_PROTECTION_MIN_PEAK_PCT": "1.5",
+            "KAI_EXEC_PROFIT_PROTECTION_GIVEBACK_PCT": "0.7",
+            "KAI_EXEC_PROFIT_PROTECTION_AGED_SESSION_MIN": "3",
+        },
+    )
+
+    assert settings.profit_protection_min_peak_pct == Decimal("1.5")
+    assert settings.profit_protection_giveback_pct == Decimal("0.7")
+    assert settings.profit_protection_aged_session_min == 3
+
+
 def test_kis_adapter_uses_client_credentials_token_flow() -> None:
     http_client = RecordingHttpClient(
         {
@@ -2800,6 +2814,344 @@ def test_monitoring_evaluate_triggers_target_sell_order_from_position_and_price_
         assert checkpoint.status == "running"
         assert checkpoint.last_heartbeat_at is not None
         assert checkpoint.last_success_at is not None
+
+    engine.dispose()
+
+
+def test_monitoring_evaluate_triggers_profit_protection_after_peak_giveback() -> None:
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(broker_order_id="kis-profit-protect-100"),
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+            profit_protection_min_peak_pct=Decimal("2.0"),
+            profit_protection_giveback_pct=Decimal("1.2"),
+        ),
+        broker_adapter=broker_adapter,
+    )
+    client = TestClient(app)
+
+    resume = client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "console", "reason": "enable automation"},
+    )
+    assert resume.status_code == 200
+
+    plan_response = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-profit-protect-monitor-1",
+            "source": "kai-trading-core",
+            "market_date": "2026-05-27",
+            "items": [
+                {
+                    "symbol": "005930",
+                    "side": "sell",
+                    "intent": "target_sell",
+                    "quantity_policy": {"kind": "position_exit_from_entry"},
+                    "trigger_price": "110000.00",
+                    "time_in_force": "day",
+                    "risk_context": {"exchange": "KRX"},
+                }
+            ],
+        },
+    )
+    assert plan_response.status_code == 201
+    plan_item_id = plan_response.json()["persisted_execution_item_ids"][0]
+
+    with app.state.db_session_factory() as session:
+        session.add(
+            ExecutionPosition(
+                mode="paper",
+                symbol="005930",
+                quantity=7,
+                average_price=Decimal("100000.0000"),
+                updated_from="reconciliation",
+                raw_payload={"source": "broker"},
+            )
+        )
+        session.commit()
+
+    first = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "establish profitable peak",
+            "observed_at": "2026-05-27T01:00:00Z",
+            "prices": [{"symbol": "005930", "price": "103000.00"}],
+        },
+    )
+    assert first.status_code == 200
+    assert first.json()["items"][0]["outcome"] == "waiting"
+    assert broker_adapter.order_calls == []
+
+    second = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "protect profit after giveback",
+            "observed_at": "2026-05-27T01:05:00Z",
+            "prices": [{"symbol": "005930", "price": "101700.00"}],
+        },
+    )
+
+    assert second.status_code == 200
+    payload = second.json()
+    assert payload["triggered_item_count"] == 1
+    assert payload["submitted_order_count"] == 1
+    item_payload = payload["items"][0]
+    assert item_payload["outcome"] == "submitted"
+    assert item_payload["trigger_reason"] == "profit_protection_trailing_stop"
+    assert item_payload["trigger"]["peak_profit_pct"] == "3.0000"
+    assert item_payload["trigger"]["current_profit_pct"] == "1.7000"
+    assert item_payload["trigger"]["giveback_pct"] == "1.3000"
+
+    assert len(broker_adapter.order_calls) == 1
+    assert broker_adapter.order_calls[0].execution_plan_item_id == plan_item_id
+    assert broker_adapter.order_calls[0].side == "sell"
+    assert broker_adapter.order_calls[0].quantity == 7
+
+    with app.state.db_session_factory() as session:
+        plan_item = session.get(ExecutionPlanItem, plan_item_id)
+        assert plan_item is not None
+        assert plan_item.risk_context["profit_protection"]["peak_price"] == "103000.0000"
+        assert plan_item.risk_context["last_monitoring_event"]["reason"] == "profit_protection_trailing_stop"
+
+        order = session.scalar(
+            select(BrokerOrder).where(BrokerOrder.execution_plan_item_id == plan_item_id)
+        )
+        assert order is not None
+        assert order.idempotency_key == f"monitoring:target_sell:{plan_item_id}"
+        assert order.request_metadata["metadata"]["trigger_reason"] == "profit_protection_trailing_stop"
+        assert order.request_metadata["metadata"]["trigger"]["peak_profit_pct"] == "3.0000"
+
+    engine.dispose()
+
+
+def test_monitoring_evaluate_preserves_stop_precedence_over_profit_protection() -> None:
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(broker_order_id="kis-stop-precedence-100"),
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+            profit_protection_min_peak_pct=Decimal("2.0"),
+            profit_protection_giveback_pct=Decimal("1.2"),
+        ),
+        broker_adapter=broker_adapter,
+    )
+    client = TestClient(app)
+
+    resume = client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "console", "reason": "enable automation"},
+    )
+    assert resume.status_code == 200
+
+    plan_response = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-profit-protect-stop-precedence",
+            "source": "kai-trading-core",
+            "items": [
+                {
+                    "symbol": "005930",
+                    "side": "sell",
+                    "intent": "target_sell",
+                    "quantity_policy": {"kind": "position_exit_from_entry"},
+                    "trigger_price": "110000.00",
+                    "risk_context": {
+                        "exchange": "KRX",
+                        "profit_protection": {
+                            "peak_price": "103000.0000",
+                            "peak_profit_pct": "3.0000",
+                        },
+                    },
+                },
+                {
+                    "symbol": "005930",
+                    "side": "sell",
+                    "intent": "stop_sell",
+                    "quantity_policy": {"kind": "position_exit_from_entry"},
+                    "trigger_price": "101800.00",
+                    "risk_context": {"exchange": "KRX"},
+                },
+            ],
+        },
+    )
+    assert plan_response.status_code == 201
+    target_item_id, stop_item_id = plan_response.json()["persisted_execution_item_ids"]
+
+    with app.state.db_session_factory() as session:
+        session.add(
+            ExecutionPosition(
+                mode="paper",
+                symbol="005930",
+                quantity=7,
+                average_price=Decimal("100000.0000"),
+                updated_from="reconciliation",
+                raw_payload={"source": "broker"},
+            )
+        )
+        session.commit()
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "stop should win over protection",
+            "prices": [{"symbol": "005930", "price": "101700.00"}],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["triggered_item_count"] == 1
+    assert payload["submitted_order_count"] == 1
+    results_by_item_id = {
+        item["execution_plan_item_id"]: item
+        for item in payload["items"]
+    }
+    assert results_by_item_id[target_item_id]["outcome"] == "waiting"
+    assert results_by_item_id[stop_item_id]["outcome"] == "submitted"
+    assert results_by_item_id[stop_item_id]["trigger_reason"] == "stop_sell"
+
+    assert len(broker_adapter.order_calls) == 1
+    assert broker_adapter.order_calls[0].execution_plan_item_id == stop_item_id
+
+    with app.state.db_session_factory() as session:
+        target_item = session.get(ExecutionPlanItem, target_item_id)
+        stop_item = session.get(ExecutionPlanItem, stop_item_id)
+        assert target_item is not None
+        assert stop_item is not None
+        assert target_item.status == "target_sell_pending_config"
+        assert stop_item.status == "broker_order_submitted"
+
+    engine.dispose()
+
+
+def test_monitoring_evaluate_triggers_aged_position_profit_protection() -> None:
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(broker_order_id="kis-aged-profit-protect-100"),
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+            profit_protection_min_peak_pct=Decimal("2.0"),
+            profit_protection_giveback_pct=Decimal("1.2"),
+            profit_protection_aged_session_min=2,
+        ),
+        broker_adapter=broker_adapter,
+    )
+    client = TestClient(app)
+
+    resume = client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "console", "reason": "enable automation"},
+    )
+    assert resume.status_code == 200
+
+    plan_response = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-aged-profit-protect-monitor",
+            "source": "kai-trading-core",
+            "market_date": "2026-05-26",
+            "items": [
+                {
+                    "symbol": "005930",
+                    "side": "sell",
+                    "intent": "target_sell",
+                    "quantity_policy": {"kind": "position_exit_from_entry"},
+                    "trigger_price": "110000.00",
+                    "risk_context": {
+                        "exchange": "KRX",
+                        "profit_protection": {
+                            "peak_price": "101800.0000",
+                            "peak_profit_pct": "1.8000",
+                        },
+                    },
+                }
+            ],
+        },
+    )
+    assert plan_response.status_code == 201
+    plan_item_id = plan_response.json()["persisted_execution_item_ids"][0]
+
+    with app.state.db_session_factory() as session:
+        session.add(
+            ExecutionPosition(
+                mode="paper",
+                symbol="005930",
+                quantity=4,
+                average_price=Decimal("100000.0000"),
+                updated_from="reconciliation",
+                raw_payload={"source": "broker"},
+            )
+        )
+        session.commit()
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "protect aged positive position",
+            "observed_at": "2026-05-27T01:00:00Z",
+            "prices": [{"symbol": "005930", "price": "100500.00"}],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["triggered_item_count"] == 1
+    assert payload["submitted_order_count"] == 1
+    item_payload = payload["items"][0]
+    assert item_payload["trigger_reason"] == "aged_position_profit_protection"
+    assert item_payload["trigger"]["holding_session"] == 2
+    assert item_payload["trigger"]["current_profit_pct"] == "0.5000"
+    assert item_payload["trigger"]["giveback_pct"] == "1.3000"
+
+    assert len(broker_adapter.order_calls) == 1
+    assert broker_adapter.order_calls[0].execution_plan_item_id == plan_item_id
+    assert broker_adapter.order_calls[0].quantity == 4
 
     engine.dispose()
 
