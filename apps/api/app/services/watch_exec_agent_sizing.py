@@ -165,7 +165,7 @@ def _candidate_payload(item: ExecutionPlanItem) -> dict[str, object]:
     execution_feasibility = risk_context.get("execution_feasibility_context")
     if not isinstance(execution_feasibility, dict):
         execution_feasibility = {}
-    return {
+    payload: dict[str, object] = {
         "execution_plan_item_id": item.id,
         "symbol": item.symbol,
         "intent": item.intent,
@@ -188,6 +188,102 @@ def _candidate_payload(item: ExecutionPlanItem) -> dict[str, object]:
         "data_quality_warnings": risk_context.get("data_quality_warnings"),
         "supporting_evidence": risk_context.get("supporting_evidence"),
     }
+    decider_flow_context = _decider_flow_short_sector_context(risk_context)
+    if decider_flow_context is not None:
+        payload["decider_flow_short_sector_context"] = decider_flow_context
+    return payload
+
+
+def _decider_flow_short_sector_context(risk_context: dict[str, object]) -> dict[str, object] | None:
+    direct_flow_context = _flow_short_sector_context_from(risk_context)
+    if direct_flow_context is not None:
+        return {
+            "source": "risk_context",
+            "flow_short_sector_context": direct_flow_context,
+        }
+
+    handoff = risk_context.get("decider_handoff_context")
+    if isinstance(handoff, dict):
+        handoff_flow_context = _flow_short_sector_context_from(handoff)
+        if handoff_flow_context is not None:
+            return {
+                "source": "risk_context.decider_handoff_context",
+                "flow_short_sector_context": handoff_flow_context,
+            }
+
+    pre_decider_context, source_path = _pre_decider_enrichment_context(risk_context)
+    if pre_decider_context is None:
+        return None
+    flow_short_sector_context = _flow_short_sector_context_from(pre_decider_context)
+    if flow_short_sector_context is None:
+        return None
+    payload: dict[str, object] = {
+        "source": source_path,
+        "schema_version": pre_decider_context.get("schema_version"),
+        "status": pre_decider_context.get("status"),
+        "market_date": pre_decider_context.get("market_date"),
+        "flow_short_sector_context": flow_short_sector_context,
+    }
+    if "context_provenance" in pre_decider_context:
+        payload["context_provenance"] = pre_decider_context.get("context_provenance")
+    return payload
+
+
+def _flow_short_sector_context_from(payload: dict[str, object]) -> dict[str, object] | None:
+    flow_short_sector_context = payload.get("flow_short_sector_context")
+    if isinstance(flow_short_sector_context, dict):
+        return flow_short_sector_context
+
+    compact_context: dict[str, object] = {}
+    for source_key, output_key in (
+        ("investor_flow_context", "investor_flow"),
+        ("short_selling_context", "short_selling"),
+        ("sector_peer_context", "sector_peers"),
+        ("sector_peers_context", "sector_peers"),
+    ):
+        value = payload.get(source_key)
+        if isinstance(value, dict):
+            compact_context[output_key] = value
+    if compact_context:
+        return compact_context
+    return None
+
+
+def _pre_decider_enrichment_context(risk_context: dict[str, object]) -> tuple[dict[str, object] | None, str | None]:
+    direct = risk_context.get("pre_decider_enrichment_context")
+    if isinstance(direct, dict):
+        return direct, "risk_context.pre_decider_enrichment_context"
+
+    handoff = risk_context.get("decider_handoff_context")
+    if not isinstance(handoff, dict):
+        return None, None
+    decider_input = handoff.get("decider_input_context")
+    if not isinstance(decider_input, dict):
+        return None, None
+
+    handoff_pre_decider = decider_input.get("pre_decider_enrichment_context")
+    if isinstance(handoff_pre_decider, dict):
+        return (
+            handoff_pre_decider,
+            "risk_context.decider_handoff_context.decider_input_context.pre_decider_enrichment_context",
+        )
+
+    request_payload = decider_input.get("request_payload")
+    if not isinstance(request_payload, dict):
+        return None, None
+    symbol_day_context = request_payload.get("symbol_day_context")
+    if not isinstance(symbol_day_context, dict):
+        return None, None
+    request_pre_decider = symbol_day_context.get("pre_decider_enrichment_context")
+    if isinstance(request_pre_decider, dict):
+        return (
+            request_pre_decider,
+            (
+                "risk_context.decider_handoff_context.decider_input_context.request_payload."
+                "symbol_day_context.pre_decider_enrichment_context"
+            ),
+        )
+    return None, None
 
 
 def _request_exec_agent_decisions(*, settings: Settings, payload: dict[str, object]) -> dict[str, object]:
