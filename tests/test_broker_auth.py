@@ -44,7 +44,7 @@ from app.models.runtime import (
     ExecutionPosition,
     MonitoringCheckpoint,
 )
-from app.services.monitoring import list_autonomous_monitoring_symbols
+from app.services.monitoring import list_autonomous_monitoring_symbols, run_autonomous_monitoring_cycle
 
 
 class RecordingHttpClient:
@@ -2938,6 +2938,152 @@ def test_monitoring_evaluate_triggers_profit_protection_after_peak_giveback() ->
         assert order.idempotency_key == f"monitoring:target_sell:{plan_item_id}"
         assert order.request_metadata["metadata"]["trigger_reason"] == "profit_protection_trailing_stop"
         assert order.request_metadata["metadata"]["trigger"]["peak_profit_pct"] == "3.0000"
+
+    engine.dispose()
+
+
+def test_autonomous_retry_preserves_profit_protection_trigger_metadata() -> None:
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(broker_order_id="kis-profit-protect-retry"),
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+            monitoring_max_broker_actions_per_cycle=1,
+            profit_protection_min_peak_pct=Decimal("2.0"),
+            profit_protection_giveback_pct=Decimal("1.2"),
+        ),
+        broker_adapter=broker_adapter,
+    )
+    client = TestClient(app)
+
+    resume = client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "console", "reason": "enable automation"},
+    )
+    assert resume.status_code == 200
+
+    plan_response = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-profit-protect-retry",
+            "source": "kai-trading-core",
+            "market_date": "2026-05-27",
+            "items": [
+                {
+                    "symbol": "000660",
+                    "side": "sell",
+                    "intent": "target_sell",
+                    "quantity_policy": {"kind": "shares", "quantity": 1},
+                    "trigger_price": "151000.00",
+                    "time_in_force": "day",
+                    "risk_context": {"exchange": "KRX"},
+                },
+                {
+                    "symbol": "005930",
+                    "side": "sell",
+                    "intent": "target_sell",
+                    "quantity_policy": {"kind": "position_exit_from_entry"},
+                    "trigger_price": "110000.00",
+                    "time_in_force": "day",
+                    "risk_context": {
+                        "exchange": "KRX",
+                        "profit_protection": {
+                            "peak_price": "103000.0000",
+                            "peak_profit_pct": "3.0000",
+                        },
+                    },
+                },
+            ],
+        },
+    )
+    assert plan_response.status_code == 201
+    first_item_id, profit_item_id = plan_response.json()["persisted_execution_item_ids"]
+
+    with app.state.db_session_factory() as session:
+        session.add_all(
+            [
+                ExecutionPosition(
+                    mode="paper",
+                    symbol="000660",
+                    quantity=1,
+                    average_price=Decimal("150000.0000"),
+                    updated_from="reconciliation",
+                    raw_payload={"source": "broker"},
+                ),
+                ExecutionPosition(
+                    mode="paper",
+                    symbol="005930",
+                    quantity=7,
+                    average_price=Decimal("100000.0000"),
+                    updated_from="reconciliation",
+                    raw_payload={"source": "broker"},
+                ),
+            ]
+        )
+        session.commit()
+
+    evaluation = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "defer profit protection behind broker cap",
+            "observed_at": "2026-05-27T01:05:00Z",
+            "prices": [
+                {"symbol": "000660", "price": "151500.00"},
+                {"symbol": "005930", "price": "101700.00"},
+            ],
+        },
+    )
+    assert evaluation.status_code == 200
+    assert evaluation.json()["submitted_order_count"] == 1
+    assert evaluation.json()["deferred_item_count"] == 1
+
+    with app.state.db_session_factory() as session:
+        profit_item = session.get(ExecutionPlanItem, profit_item_id)
+        assert profit_item is not None
+        assert profit_item.status == "target_sell_triggered_pending_dispatch"
+        assert (
+            profit_item.risk_context["last_monitoring_event"]["reason"]
+            == "profit_protection_trailing_stop"
+        )
+
+        retry = run_autonomous_monitoring_cycle(
+            settings=app.state.settings,
+            db=session,
+            adapter=broker_adapter,
+            prices=[],
+            now=datetime(2026, 5, 27, 1, 6, tzinfo=UTC),
+        )
+
+        assert retry.payload["submitted_order_count"] == 1
+        assert retry.payload["triggered_item_count"] == 1
+
+        orders = session.scalars(select(BrokerOrder).order_by(BrokerOrder.created_at.asc())).all()
+        assert [order.execution_plan_item_id for order in orders] == [
+            first_item_id,
+            profit_item_id,
+        ]
+        retry_order = orders[1]
+        assert (
+            retry_order.request_metadata["metadata"]["trigger_reason"]
+            == "profit_protection_trailing_stop"
+        )
+        assert retry_order.request_metadata["metadata"]["trigger"]["peak_profit_pct"] == "3.0000"
+        assert retry_order.request_metadata["metadata"]["trigger"]["current_profit_pct"] == "1.7000"
+        assert retry_order.request_metadata["metadata"]["trigger"]["giveback_pct"] == "1.3000"
 
     engine.dispose()
 

@@ -139,6 +139,11 @@ class ProfitProtectionDecision:
     metadata: dict[str, object]
 
 
+PROFIT_PROTECTION_TRIGGER_REASONS = frozenset(
+    {"profit_protection_trailing_stop", "aged_position_profit_protection"}
+)
+
+
 def materialize_monitoring_plan_items(plan: ExecutionPlan) -> None:
     for item in plan.items:
         if _is_watch_buy_item(item):
@@ -344,7 +349,12 @@ def _evaluate_monitoring_cycle(
         trigger_reason: str | None = None
         trigger_metadata: dict[str, object] | None = None
         if retry_persisted_trigger:
-            trigger_reason = item.intent
+            persisted_profit_protection = _persisted_profit_protection_trigger(item)
+            if persisted_profit_protection is not None:
+                trigger_reason = persisted_profit_protection.reason
+                trigger_metadata = persisted_profit_protection.metadata
+            else:
+                trigger_reason = item.intent
         elif _is_triggered(
             item=item,
             observed_price=price.price if price is not None else None,
@@ -1129,6 +1139,24 @@ def _evaluate_profit_protection(
             metadata=metadata,
         )
     return None
+
+
+def _persisted_profit_protection_trigger(
+    item: ExecutionPlanItem,
+) -> ProfitProtectionDecision | None:
+    risk_context = item.risk_context if isinstance(item.risk_context, dict) else {}
+    last_event = risk_context.get("last_monitoring_event")
+    if not isinstance(last_event, dict):
+        return None
+    reason = last_event.get("reason")
+    if reason not in PROFIT_PROTECTION_TRIGGER_REASONS:
+        return None
+    metadata = {
+        key: value
+        for key, value in last_event.items()
+        if key not in {"event", "reason", "recorded_at"}
+    }
+    return ProfitProtectionDecision(reason=str(reason), metadata=metadata)
 
 
 def _update_profit_protection_state(
