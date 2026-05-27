@@ -121,6 +121,8 @@ class EvaluateMonitoringResult:
 class PendingMonitoringAction:
     item: ExecutionPlanItem
     observed_price: Decimal | None
+    trigger_reason: str | None = None
+    trigger_metadata: dict[str, object] | None = None
 
 
 @dataclass(frozen=True)
@@ -129,6 +131,17 @@ class WatchBuyOrderApproval:
     reason: str | None = None
     message: str | None = None
     details: dict[str, object] | None = None
+
+
+@dataclass(frozen=True)
+class ProfitProtectionDecision:
+    reason: str
+    metadata: dict[str, object]
+
+
+PROFIT_PROTECTION_TRIGGER_REASONS = frozenset(
+    {"profit_protection_trailing_stop", "aged_position_profit_protection"}
+)
 
 
 def materialize_monitoring_plan_items(plan: ExecutionPlan) -> None:
@@ -242,10 +255,20 @@ def _evaluate_monitoring_cycle(
         adapter=adapter,
         symbols=sell_monitored_symbols,
     )
-    remaining_quantities_by_symbol = _load_remaining_quantities_by_symbol(
+    positions_by_symbol = _load_positions_by_symbol(
         settings=settings,
         db=db,
         symbols=sell_monitored_symbols,
+    )
+    remaining_quantities_by_symbol = {
+        symbol: position.quantity
+        for symbol, position in positions_by_symbol.items()
+        if position.quantity > 0
+    }
+    primary_triggered_symbols = _primary_triggered_sell_symbols(
+        items=items,
+        prices=prices,
+        triggered_at=triggered_at,
     )
     result_by_item_id: dict[str, dict[str, object]] = {}
     evaluated_item_ids: list[str] = []
@@ -323,7 +346,34 @@ def _evaluate_monitoring_cycle(
                 )
                 continue
 
-        if not retry_persisted_trigger and not _is_triggered(item=item, observed_price=price.price if price is not None else None, triggered_at=triggered_at):
+        trigger_reason: str | None = None
+        trigger_metadata: dict[str, object] | None = None
+        if retry_persisted_trigger:
+            persisted_profit_protection = _persisted_profit_protection_trigger(item)
+            if persisted_profit_protection is not None:
+                trigger_reason = persisted_profit_protection.reason
+                trigger_metadata = persisted_profit_protection.metadata
+            else:
+                trigger_reason = item.intent
+        elif _is_triggered(
+            item=item,
+            observed_price=price.price if price is not None else None,
+            triggered_at=triggered_at,
+        ):
+            trigger_reason = item.intent
+        elif not _is_watch_buy_item(item) and item.symbol not in primary_triggered_symbols:
+            profit_protection = _evaluate_profit_protection(
+                settings=settings,
+                item=item,
+                position=positions_by_symbol.get(item.symbol),
+                observed_price=observed_price,
+                triggered_at=triggered_at,
+            )
+            if profit_protection is not None:
+                trigger_reason = profit_protection.reason
+                trigger_metadata = profit_protection.metadata
+
+        if trigger_reason is None:
             if item.status in (
                 BLOCKED_MONITORING_STATUSES | PENDING_DISPATCH_MONITORING_STATUSES
             ):
@@ -372,7 +422,12 @@ def _evaluate_monitoring_cycle(
             actions_by_symbol[item.symbol] = deque()
             symbol_order.append(item.symbol)
         actions_by_symbol[item.symbol].append(
-            PendingMonitoringAction(item=item, observed_price=observed_price)
+            PendingMonitoringAction(
+                item=item,
+                observed_price=observed_price,
+                trigger_reason=trigger_reason,
+                trigger_metadata=trigger_metadata,
+            )
         )
 
     max_broker_actions = settings.monitoring_max_broker_actions_per_cycle
@@ -485,6 +540,8 @@ def _evaluate_monitoring_cycle(
                 item=action.item,
                 quantity=quantity,
                 observed_price=action.observed_price,
+                trigger_reason=action.trigger_reason,
+                trigger_metadata=action.trigger_metadata,
             )
             if placement.status_code == 201:
                 if is_watch_buy:
@@ -511,6 +568,8 @@ def _evaluate_monitoring_cycle(
                     observed_price=action.observed_price,
                     outcome="submitted",
                     order=placement.payload.get("order"),
+                    trigger_reason=action.trigger_reason,
+                    trigger_metadata=action.trigger_metadata,
                 )
             elif placement.status_code == 409 and "block_reason" in placement.payload:
                 blocked_item_count += 1
@@ -791,12 +850,12 @@ def _position_exit_quantity_policy_filter():
     )
 
 
-def _load_remaining_quantities_by_symbol(
+def _load_positions_by_symbol(
     *,
     settings: Settings,
     db: Session,
     symbols: set[str] | None = None,
-) -> dict[str, int]:
+) -> dict[str, ExecutionPosition]:
     where = [ExecutionPosition.mode == settings.runtime_mode]
     if symbols:
         where.append(ExecutionPosition.symbol.in_(sorted(symbols)))
@@ -806,7 +865,7 @@ def _load_remaining_quantities_by_symbol(
         .order_by(ExecutionPosition.symbol.asc())
     ).all()
     return {
-        position.symbol: position.quantity
+        position.symbol: position
         for position in positions
         if position.quantity > 0
     }
@@ -983,6 +1042,173 @@ def _is_triggered(
             return observed_price <= trigger_price
         return observed_price >= trigger_price
     return False
+
+
+def _primary_triggered_sell_symbols(
+    *,
+    items: list[ExecutionPlanItem],
+    prices: dict[str, MonitoringPriceRequest],
+    triggered_at: datetime,
+) -> set[str]:
+    triggered_symbols: set[str] = set()
+    for item in items:
+        if _is_watch_buy_item(item) or item.intent not in SELL_MONITORED_INTENTS:
+            continue
+        if not _monitoring_item_is_configured(item):
+            continue
+        price = prices.get(item.symbol)
+        observed_price = price.price if price is not None else None
+        if _is_triggered(
+            item=item,
+            observed_price=observed_price,
+            triggered_at=triggered_at,
+        ):
+            triggered_symbols.add(item.symbol)
+    return triggered_symbols
+
+
+def _evaluate_profit_protection(
+    *,
+    settings: Settings,
+    item: ExecutionPlanItem,
+    position: ExecutionPosition | None,
+    observed_price: Decimal | None,
+    triggered_at: datetime,
+) -> ProfitProtectionDecision | None:
+    if item.intent != "target_sell" or observed_price is None:
+        return None
+    if position is None or position.average_price is None or position.average_price <= 0:
+        return None
+    current_profit_pct = _profit_pct(
+        current_price=observed_price,
+        average_price=position.average_price,
+    )
+    state = _update_profit_protection_state(
+        settings=settings,
+        item=item,
+        observed_price=observed_price,
+        current_profit_pct=current_profit_pct,
+        triggered_at=triggered_at,
+    )
+    peak_profit_pct = _parse_decimal(state.get("peak_profit_pct")) or current_profit_pct
+    giveback_pct = peak_profit_pct - current_profit_pct
+    holding_session = _holding_session_age(item=item, triggered_at=triggered_at)
+    metadata = {
+        **state,
+        "current_profit_pct": _serialize_decimal(current_profit_pct),
+        "giveback_pct": _serialize_decimal(giveback_pct),
+        "holding_session": holding_session,
+        "min_peak_pct": _serialize_decimal(settings.profit_protection_min_peak_pct),
+        "giveback_threshold_pct": _serialize_decimal(settings.profit_protection_giveback_pct),
+        "aged_session_min": settings.profit_protection_aged_session_min,
+    }
+    if (
+        peak_profit_pct >= settings.profit_protection_min_peak_pct
+        and giveback_pct >= settings.profit_protection_giveback_pct
+    ):
+        _record_monitoring_event(
+            item=item,
+            event={
+                "event": "profit_protection_triggered",
+                "reason": "profit_protection_trailing_stop",
+                **metadata,
+                "recorded_at": triggered_at.isoformat(),
+            },
+        )
+        return ProfitProtectionDecision(
+            reason="profit_protection_trailing_stop",
+            metadata=metadata,
+        )
+    if (
+        holding_session >= settings.profit_protection_aged_session_min
+        and current_profit_pct > 0
+        and peak_profit_pct > 0
+        and giveback_pct >= settings.profit_protection_giveback_pct
+    ):
+        _record_monitoring_event(
+            item=item,
+            event={
+                "event": "profit_protection_triggered",
+                "reason": "aged_position_profit_protection",
+                **metadata,
+                "recorded_at": triggered_at.isoformat(),
+            },
+        )
+        return ProfitProtectionDecision(
+            reason="aged_position_profit_protection",
+            metadata=metadata,
+        )
+    return None
+
+
+def _persisted_profit_protection_trigger(
+    item: ExecutionPlanItem,
+) -> ProfitProtectionDecision | None:
+    risk_context = item.risk_context if isinstance(item.risk_context, dict) else {}
+    last_event = risk_context.get("last_monitoring_event")
+    if not isinstance(last_event, dict):
+        return None
+    reason = last_event.get("reason")
+    if reason not in PROFIT_PROTECTION_TRIGGER_REASONS:
+        return None
+    metadata = {
+        key: value
+        for key, value in last_event.items()
+        if key not in {"event", "reason", "recorded_at"}
+    }
+    return ProfitProtectionDecision(reason=str(reason), metadata=metadata)
+
+
+def _update_profit_protection_state(
+    *,
+    settings: Settings,
+    item: ExecutionPlanItem,
+    observed_price: Decimal,
+    current_profit_pct: Decimal,
+    triggered_at: datetime,
+) -> dict[str, object]:
+    risk_context = dict(item.risk_context) if isinstance(item.risk_context, dict) else {}
+    raw_state = risk_context.get("profit_protection")
+    state = dict(raw_state) if isinstance(raw_state, dict) else {}
+    peak_price = _parse_decimal(state.get("peak_price"))
+    peak_profit_pct = _parse_decimal(state.get("peak_profit_pct"))
+    if peak_price is None or observed_price > peak_price:
+        peak_price = observed_price
+    if peak_profit_pct is None or current_profit_pct > peak_profit_pct:
+        peak_profit_pct = current_profit_pct
+    updated_state: dict[str, object] = {
+        "peak_price": _serialize_decimal(peak_price),
+        "peak_profit_pct": _serialize_decimal(peak_profit_pct),
+        "current_profit_pct": _serialize_decimal(current_profit_pct),
+        "last_observed_price": _serialize_decimal(observed_price),
+        "last_observed_at": triggered_at.isoformat(),
+        "min_peak_pct": _serialize_decimal(settings.profit_protection_min_peak_pct),
+        "giveback_threshold_pct": _serialize_decimal(settings.profit_protection_giveback_pct),
+    }
+    risk_context["profit_protection"] = updated_state
+    item.risk_context = risk_context
+    return updated_state
+
+
+def _profit_pct(*, current_price: Decimal, average_price: Decimal) -> Decimal:
+    return ((current_price - average_price) / average_price) * Decimal("100")
+
+
+def _holding_session_age(*, item: ExecutionPlanItem, triggered_at: datetime) -> int:
+    source_date = item.source_market_date or item.plan.market_date
+    if source_date is None:
+        return 1
+    market_date = triggered_at.astimezone(KRX_TIMEZONE).date()
+    return max(1, (market_date - source_date).days + 1)
+
+
+def _parse_decimal(value: object) -> Decimal | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
 
 
 def _max_holding_exit_due(*, item: ExecutionPlanItem, triggered_at: datetime) -> bool:
@@ -1594,6 +1820,8 @@ def _place_monitoring_order(
     item: ExecutionPlanItem,
     quantity: int,
     observed_price: Decimal | None,
+    trigger_reason: str | None,
+    trigger_metadata: dict[str, object] | None,
 ):
     is_watch_buy = _is_watch_buy_item(item)
     limit_price = (
@@ -1615,6 +1843,12 @@ def _place_monitoring_order(
         limit_price=limit_price,
         time_in_force=item.time_in_force or "day",
         exchange=_plan_item_exchange(item),
+        metadata=_monitoring_order_metadata(
+            item=item,
+            observed_price=observed_price,
+            trigger_reason=trigger_reason,
+            trigger_metadata=trigger_metadata,
+        ),
     )
     return place_broker_order(
         settings=settings,
@@ -1623,6 +1857,23 @@ def _place_monitoring_order(
         command=order_request,
         request_source=f"monitoring:{MONITORING_WORKER_NAME}",
     )
+
+
+def _monitoring_order_metadata(
+    *,
+    item: ExecutionPlanItem,
+    observed_price: Decimal | None,
+    trigger_reason: str | None,
+    trigger_metadata: dict[str, object] | None,
+) -> dict[str, object]:
+    metadata: dict[str, object] = {
+        "monitoring_worker": MONITORING_WORKER_NAME,
+        "trigger_reason": trigger_reason or item.intent,
+        "observed_price": _serialize_decimal(observed_price),
+    }
+    if trigger_metadata is not None:
+        metadata["trigger"] = trigger_metadata
+    return metadata
 
 
 def _watch_buy_limit_price(
@@ -1647,6 +1898,8 @@ def _monitoring_result_payload(
     message: str | None = None,
     block_reason: object | None = None,
     order: object | None = None,
+    trigger_reason: str | None = None,
+    trigger_metadata: dict[str, object] | None = None,
 ) -> dict[str, object]:
     payload: dict[str, object] = {
         "execution_plan_item_id": item.id,
@@ -1665,6 +1918,10 @@ def _monitoring_result_payload(
         payload["message"] = message
     if block_reason is not None:
         payload["block_reason"] = block_reason
+    if trigger_reason is not None:
+        payload["trigger_reason"] = trigger_reason
+    if trigger_metadata is not None:
+        payload["trigger"] = trigger_metadata
     if order is not None:
         payload["order"] = order
     return payload

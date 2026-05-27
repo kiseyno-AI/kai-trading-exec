@@ -103,6 +103,7 @@ def place_broker_order(
             "source": request_source,
             "requested_at": datetime.now(UTC).isoformat(),
             "time_in_force": command.time_in_force,
+            **({"metadata": command.metadata} if command.metadata is not None else {}),
         },
     )
     db.add(order)
@@ -230,7 +231,11 @@ def place_broker_order(
     order.status = placement.normalized_status.value
     order.submitted_at = placement.submitted_at
     order.last_broker_sync_at = placement.observed_at
-    order.request_metadata = placement.request_metadata
+    order.request_metadata = _merge_order_request_metadata(
+        base=placement.request_metadata,
+        command=command,
+        request_source=request_source,
+    )
     order.response_metadata = placement.response_metadata
     order.last_error_classification = None
     order.last_error_code = None
@@ -324,6 +329,20 @@ def _validate_plan_item(
 
 def _order_command_payload(command: PlaceOrderRequest) -> dict[str, object]:
     return command.model_dump(mode="json")
+
+
+def _merge_order_request_metadata(
+    *,
+    base: dict[str, object] | None,
+    command: PlaceOrderRequest,
+    request_source: str,
+) -> dict[str, object]:
+    metadata = dict(base or {})
+    metadata["source"] = request_source
+    metadata["time_in_force"] = command.time_in_force
+    if command.metadata is not None:
+        metadata["metadata"] = command.metadata
+    return metadata
 
 
 def _plan_item_status_for_order_status(order_status: str) -> str:

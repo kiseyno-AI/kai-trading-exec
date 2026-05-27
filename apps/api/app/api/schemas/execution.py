@@ -116,6 +116,7 @@ class PlaceOrderRequest(BaseModel):
     limit_price: Decimal | None = None
     time_in_force: str = Field(default="day", max_length=32)
     exchange: str = Field(default="KRX", max_length=16)
+    metadata: dict[str, Any] | None = None
 
     @field_validator("idempotency_key", "execution_plan_item_id")
     @classmethod
