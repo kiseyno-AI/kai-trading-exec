@@ -169,6 +169,9 @@ class BrokerOrderPlacementRequest:
     exchange: str
     limit_price: Decimal | None = None
     execution_plan_item_id: str | None = None
+    order_division: str | None = None
+    route_session: str | None = None
+    route_reason: str | None = None
 
 
 @dataclass(frozen=True)

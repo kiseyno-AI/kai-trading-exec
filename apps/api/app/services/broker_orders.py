@@ -18,6 +18,7 @@ from app.broker.base import (
 from app.core.config import Settings
 from app.models.runtime import BrokerOrder, BrokerOrderEvent, ExecutionPlan, ExecutionPlanItem
 from app.services.broker_auth import ensure_authenticated_broker_session
+from app.services.domestic_order_router import RouteDecision, resolve_domestic_order_route
 from app.services.execution_failures import record_actionable_execution_failure
 from app.services.execution_api import serialize_broker_order
 from app.services.runtime_controls import (
@@ -89,21 +90,47 @@ def place_broker_order(
             payload={"message": validation_error},
         )
 
+    route_decision = _resolve_route_decision(
+        settings=settings,
+        command=command,
+        plan_item=plan_item,
+    )
+    if route_decision is not None and route_decision.action != "submit":
+        return PlaceBrokerOrderResult(
+            status_code=202 if route_decision.action == "defer" else 409,
+            payload={
+                "duplicate": False,
+                "message": route_decision.reason,
+                "deferred": route_decision.action == "defer",
+                "block_reason": (
+                    route_decision.reason
+                    if route_decision.action == "block"
+                    else None
+                ),
+                "route": _route_payload(route_decision),
+            },
+        )
+    routed_command = _routed_order_command(
+        command=command,
+        route_decision=route_decision,
+    )
+
     order = BrokerOrder(
         broker_name=adapter.provider,
         execution_plan_item_id=plan_item.id if plan_item else None,
         mode=settings.runtime_mode,
-        idempotency_key=command.idempotency_key,
-        symbol=command.symbol,
-        side=command.side,
+        idempotency_key=routed_command.idempotency_key,
+        symbol=routed_command.symbol,
+        side=routed_command.side,
         status=NormalizedBrokerOrderStatus.SUBMISSION_PENDING.value,
-        quantity=command.quantity,
-        limit_price=command.limit_price,
+        quantity=routed_command.quantity,
+        limit_price=routed_command.limit_price,
         request_metadata={
             "source": request_source,
             "requested_at": datetime.now(UTC).isoformat(),
-            "time_in_force": command.time_in_force,
-            **({"metadata": command.metadata} if command.metadata is not None else {}),
+            "time_in_force": routed_command.time_in_force,
+            **({"metadata": routed_command.metadata} if routed_command.metadata is not None else {}),
+            **({"route": _route_payload(route_decision)} if route_decision is not None else {}),
         },
     )
     db.add(order)
@@ -133,7 +160,7 @@ def place_broker_order(
         event_type="submit_requested",
         event_source=BrokerEventSource.SUBMISSION.value,
         normalized_status=NormalizedBrokerOrderStatus.SUBMISSION_PENDING.value,
-        request_payload=_order_command_payload(command),
+        request_payload=_order_command_payload(routed_command),
         payload={"provider": adapter.provider},
         observed_at=request_observed_at,
     )
@@ -153,14 +180,17 @@ def place_broker_order(
             session_state.access_token or "",
             BrokerOrderPlacementRequest(
                 idempotency_key=command.idempotency_key,
-                execution_plan_item_id=command.execution_plan_item_id,
-                symbol=command.symbol,
-                side=command.side,
-                quantity=command.quantity,
-                order_type=command.order_type,
-                time_in_force=command.time_in_force,
-                exchange=command.exchange,
-                limit_price=command.limit_price,
+                execution_plan_item_id=routed_command.execution_plan_item_id,
+                symbol=routed_command.symbol,
+                side=routed_command.side,
+                quantity=routed_command.quantity,
+                order_type=routed_command.order_type,
+                time_in_force=routed_command.time_in_force,
+                exchange=routed_command.exchange,
+                limit_price=routed_command.limit_price,
+                order_division=route_decision.ord_dvsn if route_decision is not None else None,
+                route_session=route_decision.session if route_decision is not None else None,
+                route_reason=route_decision.reason if route_decision is not None else None,
             ),
         )
     except BrokerAdapterError as exc:
@@ -188,7 +218,7 @@ def place_broker_order(
                 error_classification=exc.classification.value,
                 retryable=exc.retryable,
                 message=str(exc),
-                request_payload=exc.request_payload or _order_command_payload(command),
+                request_payload=exc.request_payload or _order_command_payload(routed_command),
                 response_payload=exc.response_payload or None,
                 payload={"provider": adapter.provider},
                 observed_at=event_observed_at,
@@ -233,8 +263,9 @@ def place_broker_order(
     order.last_broker_sync_at = placement.observed_at
     order.request_metadata = _merge_order_request_metadata(
         base=placement.request_metadata,
-        command=command,
+        command=routed_command,
         request_source=request_source,
+        route_decision=route_decision,
     )
     order.response_metadata = placement.response_metadata
     order.last_error_classification = None
@@ -336,13 +367,110 @@ def _merge_order_request_metadata(
     base: dict[str, object] | None,
     command: PlaceOrderRequest,
     request_source: str,
+    route_decision: RouteDecision | None = None,
 ) -> dict[str, object]:
     metadata = dict(base or {})
     metadata["source"] = request_source
     metadata["time_in_force"] = command.time_in_force
     if command.metadata is not None:
         metadata["metadata"] = command.metadata
+    if route_decision is not None:
+        metadata["route"] = _route_payload(route_decision)
     return metadata
+
+
+def _resolve_route_decision(
+    *,
+    settings: Settings,
+    command: PlaceOrderRequest,
+    plan_item: ExecutionPlanItem | None,
+) -> RouteDecision | None:
+    if not settings.domestic_order_session_routing_enabled:
+        return None
+    metadata = dict(command.metadata or {})
+    if plan_item is not None and isinstance(plan_item.risk_context, dict):
+        for key in ("nxt_eligible", "order_purpose", "purpose"):
+            if key in plan_item.risk_context and key not in metadata:
+                metadata[key] = plan_item.risk_context[key]
+    purpose = _order_purpose(command=command, plan_item=plan_item, metadata=metadata)
+    return resolve_domestic_order_route(
+        settings=settings,
+        now=_route_now(metadata),
+        symbol=command.symbol,
+        side=command.side,
+        purpose=purpose,
+        desired_order_type=command.order_type,
+        limit_price=command.limit_price,
+        requested_exchange=command.exchange,
+        metadata=metadata,
+    )
+
+
+def _routed_order_command(
+    *,
+    command: PlaceOrderRequest,
+    route_decision: RouteDecision | None,
+) -> PlaceOrderRequest:
+    if route_decision is None:
+        return command
+    metadata = dict(command.metadata or {})
+    metadata["route"] = _route_payload(route_decision)
+    return command.model_copy(
+        update={
+            "exchange": route_decision.exchange,
+            "order_type": route_decision.effective_order_type,
+            "limit_price": command.limit_price,
+            "metadata": metadata,
+        }
+    )
+
+
+def _route_payload(route_decision: RouteDecision | None) -> dict[str, object] | None:
+    if route_decision is None:
+        return None
+    return {
+        "action": route_decision.action,
+        "exchange": route_decision.exchange,
+        "session": route_decision.session,
+        "ord_dvsn": route_decision.ord_dvsn,
+        "effective_order_type": route_decision.effective_order_type,
+        "price_source": route_decision.price_source,
+        "next_retry_at": (
+            route_decision.next_retry_at.isoformat()
+            if route_decision.next_retry_at is not None
+            else None
+        ),
+        "reason": route_decision.reason,
+    }
+
+
+def _order_purpose(
+    *,
+    command: PlaceOrderRequest,
+    plan_item: ExecutionPlanItem | None,
+    metadata: dict[str, object],
+) -> str:
+    raw_purpose = metadata.get("order_purpose") or metadata.get("purpose")
+    if isinstance(raw_purpose, str) and raw_purpose.strip():
+        return raw_purpose.strip().lower()
+    if plan_item is not None and plan_item.intent == "stop_sell":
+        return "protective_stop"
+    if plan_item is not None:
+        return plan_item.intent
+    return "manual_order"
+
+
+def _route_now(metadata: dict[str, object]) -> datetime:
+    raw_value = metadata.get("route_now") or metadata.get("observed_at")
+    if isinstance(raw_value, str) and raw_value.strip():
+        try:
+            parsed = datetime.fromisoformat(raw_value.replace("Z", "+00:00"))
+        except ValueError:
+            return datetime.now(UTC)
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=UTC)
+        return parsed
+    return datetime.now(UTC)
 
 
 def _plan_item_status_for_order_status(order_status: str) -> str:

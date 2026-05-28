@@ -636,6 +636,26 @@ def _evaluate_monitoring_cycle(
                     trigger_reason=action.trigger_reason,
                     trigger_metadata=action.trigger_metadata,
                 )
+            elif placement.status_code == 202 and placement.payload.get("deferred") is True:
+                deferred_item_count += 1
+                action.item.status = _pending_dispatch_status(action.item.intent)
+                _record_monitoring_event(
+                    item=action.item,
+                    event={
+                        "event": "monitoring_order_deferred",
+                        "reason": placement.payload.get("message"),
+                        "route": placement.payload.get("route"),
+                        "observed_price": _serialize_decimal(action.observed_price),
+                        "recorded_at": triggered_at.isoformat(),
+                    },
+                )
+                db.commit()
+                result_by_item_id[action.item.id] = _monitoring_result_payload(
+                    item=action.item,
+                    observed_price=action.observed_price,
+                    outcome="deferred",
+                    message=placement.payload.get("message"),
+                )
             elif placement.status_code == 409 and "block_reason" in placement.payload:
                 blocked_item_count += 1
                 action.item.status = (
@@ -2030,7 +2050,12 @@ def _monitoring_order_metadata(
         "monitoring_worker": MONITORING_WORKER_NAME,
         "trigger_reason": trigger_reason or item.intent,
         "observed_price": _serialize_decimal(observed_price),
+        "order_purpose": "protective_stop" if item.intent == "stop_sell" else item.intent,
     }
+    if isinstance(item.risk_context, dict):
+        for key in ("nxt_eligible", "route_now"):
+            if key in item.risk_context:
+                metadata[key] = item.risk_context[key]
     if trigger_metadata is not None:
         metadata["trigger"] = trigger_metadata
     return metadata

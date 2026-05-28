@@ -185,8 +185,8 @@ class PlaceOrderRequest(BaseModel):
     @field_validator("exchange")
     @classmethod
     def validate_exchange(cls, value: str) -> str:
-        if value not in {"KRX", "SOR"}:
-            raise ValueError("exchange must be 'KRX' or 'SOR'")
+        if value not in {"KRX", "NXT", "SOR"}:
+            raise ValueError("exchange must be 'KRX', 'NXT', or 'SOR'")
         return value
 
     def model_post_init(self, __context: Any) -> None:

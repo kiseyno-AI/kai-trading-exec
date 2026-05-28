@@ -268,9 +268,13 @@ class KisBrokerAdapter(BrokerAdapter):
             "CANO": self.settings.kis_account_number or "",
             "ACNT_PRDT_CD": self.settings.kis_account_product_code,
             "PDNO": request.symbol,
-            "ORD_DVSN": _order_division(request.order_type),
+            "ORD_DVSN": _order_division(request.order_type, request.order_division),
             "ORD_QTY": str(request.quantity),
-            "ORD_UNPR": _order_price(request.order_type, request.limit_price),
+            "ORD_UNPR": _order_price(
+                request.order_type,
+                request.limit_price,
+                request.order_division,
+            ),
             "EXCG_ID_DVSN_CD": request.exchange,
             "SLL_TYPE": "01" if request.side == "sell" else "",
             "CNDT_PRIC": "",
@@ -292,6 +296,12 @@ class KisBrokerAdapter(BrokerAdapter):
             "requested_at": datetime.now(UTC).isoformat(),
             "account_number_masked": _mask_account(self.settings.kis_account_number),
             "account_product_code": self.settings.kis_account_product_code,
+            "route": {
+                "exchange": request.exchange,
+                "session": request.route_session,
+                "ord_dvsn": request.order_division,
+                "reason": request.route_reason,
+            },
         }
 
         try:
@@ -966,6 +976,8 @@ def _classify_error(
         return BrokerErrorClassification.RATE_LIMIT
     if status_code in {408, 425, 500, 502, 503, 504}:
         return BrokerErrorClassification.TRANSIENT
+    if code == "KIOK0320" or "장운영시간" in message:
+        return BrokerErrorClassification.TRANSIENT
 
     if any(token in code_lower for token in ("auth", "token")) or any(
         token in message_lower for token in ("auth", "token", "인증")
@@ -984,7 +996,9 @@ def _classify_error(
     return BrokerErrorClassification.UNKNOWN
 
 
-def _order_division(order_type: str) -> str:
+def _order_division(order_type: str, order_division: str | None = None) -> str:
+    if order_division is not None:
+        return order_division
     if order_type == "limit":
         return "00"
     if order_type == "market":
@@ -997,7 +1011,9 @@ def _order_division(order_type: str) -> str:
     )
 
 
-def _order_price(order_type: str, limit_price: Any) -> str:
+def _order_price(order_type: str, limit_price: Any, order_division: str | None = None) -> str:
+    if order_division in {"05", "06"} and limit_price is None:
+        return "0"
     if order_type == "market":
         return "0"
     if limit_price is None:

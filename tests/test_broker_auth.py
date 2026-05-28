@@ -452,6 +452,91 @@ def test_kis_adapter_fetches_current_price_quote() -> None:
     assert quote.price == Decimal("125100")
 
 
+def test_kis_adapter_sends_nxt_exchange_and_routed_order_division() -> None:
+    http_client = RecordingHttpClient(
+        {
+            "rt_cd": "0",
+            "msg_cd": "0",
+            "msg1": "accepted",
+            "output": {
+                "ODNO": "nxt-order-1",
+                "ORD_TMD": "080001",
+            },
+        }
+    )
+    adapter = KisBrokerAdapter(
+        settings=Settings(
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+            kis_use_hashkey=False,
+        ),
+        http_client=http_client,
+    )
+
+    placement = adapter.place_order(
+        "access-token",
+        BrokerOrderPlacementRequest(
+            idempotency_key="nxt-pre-sell",
+            symbol="033530",
+            side="sell",
+            quantity=1,
+            order_type="limit",
+            limit_price=Decimal("7300"),
+            time_in_force="day",
+            exchange="NXT",
+            order_division="00",
+            route_session="nxt_pre",
+            route_reason="nxt_pre_session",
+        ),
+    )
+
+    order_call = http_client.calls[-1]
+    assert order_call["payload"]["EXCG_ID_DVSN_CD"] == "NXT"
+    assert order_call["payload"]["ORD_DVSN"] == "00"
+    assert placement.request_metadata["route"]["exchange"] == "NXT"
+    assert placement.request_metadata["route"]["session"] == "nxt_pre"
+
+
+def test_kis_session_time_rejection_is_retryable() -> None:
+    http_client = RecordingHttpClient(
+        {
+            "rt_cd": "1",
+            "msg_cd": "KIOK0320",
+            "msg1": "장운영시간이 아닙니다",
+        }
+    )
+    adapter = KisBrokerAdapter(
+        settings=Settings(
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+            kis_use_hashkey=False,
+        ),
+        http_client=http_client,
+    )
+
+    with pytest.raises(BrokerAdapterError) as exc_info:
+        adapter.place_order(
+            "access-token",
+            BrokerOrderPlacementRequest(
+                idempotency_key="session-retry",
+                symbol="033530",
+                side="sell",
+                quantity=1,
+                order_type="market",
+                time_in_force="day",
+                exchange="KRX",
+            ),
+        )
+
+    assert exc_info.value.code == "KIOK0320"
+    assert exc_info.value.retryable is True
+    assert exc_info.value.normalized_status == NormalizedBrokerOrderStatus.RETRY_PENDING
+
+
 def test_kis_adapter_fetches_account_snapshot() -> None:
     http_client = RecordingHttpClient(
         {},
@@ -1226,6 +1311,127 @@ def test_place_order_endpoint_persists_normalized_order_and_events() -> None:
         plan_item = session.get(ExecutionPlanItem, plan_item_id)
         assert plan_item is not None
         assert plan_item.status == "broker_order_submitted"
+
+    engine.dispose()
+
+
+def test_place_order_endpoint_routes_nxt_pre_when_enabled() -> None:
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(broker_order_id="kis-nxt-pre-100"),
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+            domestic_order_session_routing_enabled=True,
+            allow_nxt_pre_orders=True,
+            nxt_order_route_preference="nxt",
+        ),
+        broker_adapter=broker_adapter,
+    )
+    client = TestClient(app)
+
+    resume = client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "console", "reason": "enable automation"},
+    )
+    assert resume.status_code == 200
+
+    response = client.post(
+        "/orders",
+        json={
+            "idempotency_key": "nxt-pre-order-1",
+            "symbol": "033530",
+            "side": "sell",
+            "quantity": 1,
+            "order_type": "limit",
+            "limit_price": "7300.00",
+            "time_in_force": "day",
+            "exchange": "KRX",
+            "metadata": {
+                "order_purpose": "protective_stop",
+                "nxt_eligible": True,
+                "route_now": "2026-05-28T08:00:00+09:00",
+            },
+        },
+    )
+
+    assert response.status_code == 201
+    assert broker_adapter.order_calls[0].exchange == "NXT"
+    assert broker_adapter.order_calls[0].order_division == "00"
+    assert broker_adapter.order_calls[0].route_session == "nxt_pre"
+    assert response.json()["order"]["request_metadata"]["route"]["exchange"] == "NXT"
+
+    engine.dispose()
+
+
+def test_place_order_endpoint_defers_non_nxt_protective_sell_at_0800() -> None:
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(broker_order_id="kis-should-not-submit"),
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+            domestic_order_session_routing_enabled=True,
+            allow_nxt_pre_orders=True,
+            nxt_eligible_symbols="005930",
+        ),
+        broker_adapter=broker_adapter,
+    )
+    client = TestClient(app)
+
+    resume = client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "console", "reason": "enable automation"},
+    )
+    assert resume.status_code == 200
+
+    response = client.post(
+        "/orders",
+        json={
+            "idempotency_key": "defer-non-nxt-1",
+            "symbol": "033530",
+            "side": "sell",
+            "quantity": 1,
+            "order_type": "limit",
+            "limit_price": "7300.00",
+            "time_in_force": "day",
+            "exchange": "KRX",
+            "metadata": {
+                "order_purpose": "protective_stop",
+                "route_now": "2026-05-28T08:00:00+09:00",
+            },
+        },
+    )
+
+    assert response.status_code == 202
+    assert response.json()["deferred"] is True
+    assert response.json()["route"]["next_retry_at"] is not None
+    assert broker_adapter.order_calls == []
+
+    with app.state.db_session_factory() as session:
+        assert session.scalars(select(BrokerOrder)).all() == []
 
     engine.dispose()
 

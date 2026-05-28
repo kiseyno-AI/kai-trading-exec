@@ -75,6 +75,17 @@ class Settings(BaseModel):
     kis_customer_type: str = "P"
     kis_use_hashkey: bool = True
     kis_request_timeout_seconds: int = Field(default=10, ge=1, le=120)
+    domestic_order_session_routing_enabled: bool = False
+    allow_krx_pre_open_offhours_orders: bool = False
+    allow_krx_after_hours_closing_orders: bool = False
+    allow_krx_after_hours_single_price_orders: bool = False
+    allow_nxt_pre_orders: bool = False
+    allow_nxt_main_orders: bool = False
+    allow_nxt_after_orders: bool = False
+    nxt_order_route_preference: str = "krx_when_regular"
+    allow_after_hours_buy_orders: bool = False
+    allow_after_hours_sell_orders: bool = True
+    nxt_eligible_symbols: str = ""
 
     @field_validator("log_level")
     @classmethod
@@ -150,6 +161,17 @@ _ENV_FIELDS = {
     "KIS_CUSTOMER_TYPE": "kis_customer_type",
     "KIS_USE_HASHKEY": "kis_use_hashkey",
     "KIS_REQUEST_TIMEOUT_SECONDS": "kis_request_timeout_seconds",
+    "DOMESTIC_ORDER_SESSION_ROUTING_ENABLED": "domestic_order_session_routing_enabled",
+    "ALLOW_KRX_PRE_OPEN_OFFHOURS_ORDERS": "allow_krx_pre_open_offhours_orders",
+    "ALLOW_KRX_AFTER_HOURS_CLOSING_ORDERS": "allow_krx_after_hours_closing_orders",
+    "ALLOW_KRX_AFTER_HOURS_SINGLE_PRICE_ORDERS": "allow_krx_after_hours_single_price_orders",
+    "ALLOW_NXT_PRE_ORDERS": "allow_nxt_pre_orders",
+    "ALLOW_NXT_MAIN_ORDERS": "allow_nxt_main_orders",
+    "ALLOW_NXT_AFTER_ORDERS": "allow_nxt_after_orders",
+    "NXT_ORDER_ROUTE_PREFERENCE": "nxt_order_route_preference",
+    "ALLOW_AFTER_HOURS_BUY_ORDERS": "allow_after_hours_buy_orders",
+    "ALLOW_AFTER_HOURS_SELL_ORDERS": "allow_after_hours_sell_orders",
+    "NXT_ELIGIBLE_SYMBOLS": "nxt_eligible_symbols",
 }
 
 
