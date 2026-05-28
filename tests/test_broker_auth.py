@@ -1375,6 +1375,68 @@ def test_place_order_endpoint_routes_nxt_pre_when_enabled() -> None:
     engine.dispose()
 
 
+def test_place_order_endpoint_defers_nxt_pre_market_order_without_limit() -> None:
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(broker_order_id="kis-should-not-submit"),
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+            domestic_order_session_routing_enabled=True,
+            allow_nxt_pre_orders=True,
+            nxt_order_route_preference="nxt",
+        ),
+        broker_adapter=broker_adapter,
+    )
+    client = TestClient(app)
+
+    resume = client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "console", "reason": "enable automation"},
+    )
+    assert resume.status_code == 200
+
+    response = client.post(
+        "/orders",
+        json={
+            "idempotency_key": "nxt-pre-market-no-limit-1",
+            "symbol": "033530",
+            "side": "sell",
+            "quantity": 1,
+            "order_type": "market",
+            "time_in_force": "day",
+            "exchange": "KRX",
+            "metadata": {
+                "order_purpose": "protective_stop",
+                "nxt_eligible": True,
+                "route_now": "2026-05-28T08:00:00+09:00",
+            },
+        },
+    )
+
+    assert response.status_code == 202
+    assert response.json()["deferred"] is True
+    assert response.json()["message"] == "nxt_pre_session:limit_required"
+    assert response.json()["route"]["ord_dvsn"] is None
+    assert broker_adapter.order_calls == []
+
+    with app.state.db_session_factory() as session:
+        assert session.scalars(select(BrokerOrder)).all() == []
+
+    engine.dispose()
+
+
 def test_place_order_endpoint_defers_non_nxt_protective_sell_at_0800() -> None:
     broker_adapter = StubBrokerAdapter(
         config=BrokerConfig(

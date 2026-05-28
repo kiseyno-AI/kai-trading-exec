@@ -31,6 +31,50 @@ def test_nxt_eligible_symbol_routes_to_nxt_pre_when_enabled() -> None:
     assert decision.ord_dvsn == "00"
 
 
+def test_nxt_pre_market_order_without_limit_defers_protective_sell() -> None:
+    decision = resolve_domestic_order_route(
+        settings=Settings(
+            domestic_order_session_routing_enabled=True,
+            allow_nxt_pre_orders=True,
+            nxt_eligible_symbols="033530",
+        ),
+        now=datetime(2026, 5, 28, 8, 0, tzinfo=KST),
+        symbol="033530",
+        side="sell",
+        purpose="protective_stop",
+        desired_order_type="market",
+        limit_price=None,
+        requested_exchange="KRX",
+    )
+
+    assert decision.action == "defer"
+    assert decision.reason == "nxt_pre_session:limit_required"
+    assert decision.ord_dvsn is None
+    assert decision.next_retry_at is not None
+
+
+def test_nxt_pre_market_order_without_limit_blocks_manual_buy() -> None:
+    decision = resolve_domestic_order_route(
+        settings=Settings(
+            domestic_order_session_routing_enabled=True,
+            allow_nxt_pre_orders=True,
+            nxt_eligible_symbols="033530",
+        ),
+        now=datetime(2026, 5, 28, 8, 0, tzinfo=KST),
+        symbol="033530",
+        side="buy",
+        purpose="manual_order",
+        desired_order_type="market",
+        limit_price=None,
+        requested_exchange="KRX",
+    )
+
+    assert decision.action == "block"
+    assert decision.reason == "nxt_pre_session:limit_required"
+    assert decision.ord_dvsn is None
+    assert decision.next_retry_at is not None
+
+
 def test_non_nxt_symbol_defers_at_0800_without_regular_krx_submit() -> None:
     decision = resolve_domestic_order_route(
         settings=Settings(

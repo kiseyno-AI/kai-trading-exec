@@ -44,27 +44,36 @@ def resolve_domestic_order_route(
     if session == "krx_regular":
         if _prefer_nxt(route_preference) and nxt_eligible and settings.allow_nxt_main_orders:
             return _submit(
+                local_now=local_now,
                 exchange="NXT" if route_preference == "nxt" else "SOR",
                 session="nxt_main",
                 order_type=desired_order_type,
                 limit_price=limit_price,
+                side=side,
+                protective=protective,
                 reason="nxt_main_preferred",
             )
         return _submit(
+            local_now=local_now,
             exchange="KRX" if requested_exchange != "SOR" else "SOR",
             session="krx_regular",
             order_type=desired_order_type,
             limit_price=limit_price,
+            side=side,
+            protective=protective,
             reason="krx_regular_session",
         )
 
     if session == "nxt_pre":
         if nxt_eligible and settings.allow_nxt_pre_orders:
             return _submit(
+                local_now=local_now,
                 exchange="NXT",
                 session="nxt_pre",
                 order_type=_limit_only_order_type(desired_order_type),
                 limit_price=limit_price,
+                side=side,
+                protective=protective,
                 reason="nxt_pre_session",
             )
         return _defer_or_block(
@@ -77,10 +86,13 @@ def resolve_domestic_order_route(
     if session == "krx_preopen_close":
         if _prefer_nxt(route_preference) and nxt_eligible and settings.allow_nxt_pre_orders:
             return _submit(
+                local_now=local_now,
                 exchange="NXT",
                 session="nxt_pre",
                 order_type=_limit_only_order_type(desired_order_type),
                 limit_price=limit_price,
+                side=side,
+                protective=protective,
                 reason="nxt_pre_preferred",
             )
         if settings.allow_krx_pre_open_offhours_orders:
@@ -104,10 +116,13 @@ def resolve_domestic_order_route(
     if session in {"nxt_after_acceptance", "nxt_after"}:
         if nxt_eligible and settings.allow_nxt_after_orders and _after_hours_side_allowed(settings, side):
             return _submit(
+                local_now=local_now,
                 exchange="NXT",
                 session="nxt_after",
                 order_type=_limit_only_order_type(desired_order_type),
                 limit_price=limit_price,
+                side=side,
+                protective=protective,
                 reason="nxt_after_session",
             )
         if session == "nxt_after" and settings.allow_krx_after_hours_closing_orders and _after_hours_side_allowed(settings, side):
@@ -131,10 +146,13 @@ def resolve_domestic_order_route(
     if session == "krx_after_single_price":
         if nxt_eligible and settings.allow_nxt_after_orders and _after_hours_side_allowed(settings, side):
             return _submit(
+                local_now=local_now,
                 exchange="NXT",
                 session="nxt_after",
                 order_type=_limit_only_order_type(desired_order_type),
                 limit_price=limit_price,
+                side=side,
+                protective=protective,
                 reason="nxt_after_preferred_for_nxt_symbol",
             )
         if settings.allow_krx_after_hours_single_price_orders and _after_hours_side_allowed(settings, side):
@@ -186,13 +204,23 @@ def _session_for(now: datetime) -> str:
 
 def _submit(
     *,
+    local_now: datetime,
     exchange: str,
     session: str,
     order_type: str,
     limit_price: Decimal | None,
+    side: str,
+    protective: bool,
     reason: str,
 ) -> RouteDecision:
     effective_order_type = _limit_only_order_type(order_type) if session != "krx_regular" else order_type
+    if effective_order_type == "limit" and limit_price is None:
+        return _defer_or_block(
+            local_now=local_now,
+            side=side,
+            protective=protective,
+            reason=f"{reason}:limit_required",
+        )
     return RouteDecision(
         action="submit",
         exchange=exchange,
@@ -201,7 +229,7 @@ def _submit(
         effective_order_type=effective_order_type,
         price_source="market" if effective_order_type == "market" else "explicit_limit",
         next_retry_at=None,
-        reason=reason if effective_order_type == order_type or limit_price is not None else f"{reason}:limit_required",
+        reason=reason,
     )
 
 
