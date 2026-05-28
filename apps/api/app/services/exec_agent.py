@@ -36,6 +36,7 @@ from app.services.runtime_controls import RUNTIME_CONTROL_ID, effective_automati
 
 SHORT_TERM_DECIDER_NAME = "short-term-decider"
 SUPPORTED_SHORT_TERM_BUY_INTENTS = frozenset({"next_open_buy"})
+TargetProfile = Literal["tactical_2pct", "short_swing", "standard_breakout", "extended_momentum"]
 EXEC_AGENT_CONTRACT_KEYS = (
     "exec_agent_decision",
     "short_term_exec_agent",
@@ -140,6 +141,7 @@ class ShortTermExecAgentContract(BaseModel):
     exposure_after_trade: Decimal | None = Field(default=None, ge=0)
     allow_existing_holding: bool = False
     special_tactical_scalp: bool = False
+    target_profile: TargetProfile | None = None
     reason_code: str | None = Field(default=None, min_length=1, max_length=64)
     reason: str | None = Field(default=None, max_length=512)
     feedback_ids: list[str] = Field(default_factory=list)
@@ -257,6 +259,7 @@ class ExecAgentSizingResponse(BaseModel):
     risk_flags: list[str] = Field(default_factory=list)
     allow_existing_holding: bool = False
     special_tactical_scalp: bool = False
+    target_profile: TargetProfile | None = None
     explanation: dict[str, Any] | None = None
 
     @field_validator("reasons", "risk_flags")
@@ -878,7 +881,12 @@ def _decide_candidate(
                 extra={"effective_stop_price": _serialize_decimal(effective_stop)},
             ),
         )
-    reward_risk_threshold = _reward_risk_threshold(settings=settings, agent_contract=agent_contract)
+    reward_risk_threshold = _reward_risk_threshold(
+        settings=settings,
+        agent_contract=agent_contract,
+        reference_price=sizing_price,
+        target_price=agent_contract.target_price,
+    )
     if _reward_risk_below_floor(settings=settings, agent_contract=agent_contract, reward_risk=reward_risk, reference_price=sizing_price):
         return _reject(
             base,
@@ -1012,6 +1020,12 @@ def _decide_candidate(
     position_risk = risk_sizing.stop_distance * Decimal(quantity)
 
     risk_flags = _decision_risk_flags(agent_contract=agent_contract, confirmation_signal=confirmation_signal)
+    target_profile = _target_profile(
+        settings=settings,
+        agent_contract=agent_contract,
+        reference_price=sizing_price,
+        target_price=agent_contract.target_price,
+    )
     return {
         **base,
         "action": "approve",
@@ -1044,6 +1058,9 @@ def _decide_candidate(
         "exposure_after_trade": _serialize_decimal(exposure_after_trade),
         "remaining_total_budget": _serialize_decimal(sizing_budget.remaining_total_budget),
         "target_price": _serialize_decimal(agent_contract.target_price),
+        "target_profile": target_profile,
+        "target_tag": f"target_profile:{target_profile}",
+        "special_tactical_scalp": agent_contract.special_tactical_scalp,
         "stop_price": _serialize_decimal(effective_stop),
         "upstream_stop_price": _serialize_decimal(agent_contract.stop_price),
         "reward_risk": _serialize_decimal(reward_risk),
@@ -1413,6 +1430,8 @@ def _reward_risk_threshold(
     *,
     settings: Settings,
     agent_contract: ShortTermExecAgentContract,
+    reference_price: Decimal,
+    target_price: Decimal | None,
 ) -> Decimal:
     normal_threshold = _settings_decimal(
         settings,
@@ -1424,6 +1443,17 @@ def _reward_risk_threshold(
         "exec_agent_relaxed_min_reward_risk",
         Decimal("1.10"),
     )
+    if _allows_special_tactical_scalp(
+        settings=settings,
+        agent_contract=agent_contract,
+        reference_price=reference_price,
+        target_price=target_price,
+    ):
+        return min(
+            normal_threshold,
+            relaxed_threshold,
+            _settings_decimal(settings, "exec_agent_absolute_min_reward_risk", Decimal("1.00")),
+        )
     if _uses_relaxed_reward_risk_threshold(agent_contract=agent_contract):
         return min(normal_threshold, relaxed_threshold)
     return normal_threshold
@@ -1450,6 +1480,7 @@ def _reward_risk_below_floor(
         settings=settings,
         agent_contract=agent_contract,
         reference_price=reference_price,
+        target_price=agent_contract.target_price,
     )
 
 
@@ -1458,18 +1489,51 @@ def _allows_special_tactical_scalp(
     settings: Settings,
     agent_contract: ShortTermExecAgentContract,
     reference_price: Decimal,
+    target_price: Decimal | None,
 ) -> bool:
-    if not agent_contract.special_tactical_scalp or agent_contract.stop_price is None:
+    if not agent_contract.special_tactical_scalp or agent_contract.stop_price is None or target_price is None:
         return False
+    target_distance = (target_price - reference_price) / reference_price
     stop_distance = (reference_price - agent_contract.stop_price) / reference_price
-    if stop_distance <= 0:
+    if target_distance <= 0 or stop_distance <= 0:
         return False
+    min_target_distance = _settings_decimal(
+        settings,
+        "exec_agent_tactical_scalp_min_target_pct",
+        Decimal("0.02"),
+    )
     max_stop_distance = _settings_decimal(
         settings,
         "exec_agent_tactical_scalp_max_stop_pct",
         Decimal("0.015"),
     )
-    return stop_distance <= max_stop_distance
+    return target_distance >= min_target_distance and stop_distance <= max_stop_distance
+
+
+def _target_profile(
+    *,
+    settings: Settings,
+    agent_contract: ShortTermExecAgentContract,
+    reference_price: Decimal,
+    target_price: Decimal | None,
+) -> TargetProfile:
+    if agent_contract.target_profile is not None:
+        return agent_contract.target_profile
+    if target_price is None:
+        return "standard_breakout"
+    target_distance = (target_price - reference_price) / reference_price
+    if _allows_special_tactical_scalp(
+        settings=settings,
+        agent_contract=agent_contract,
+        reference_price=reference_price,
+        target_price=target_price,
+    ) or target_distance <= Decimal("0.025"):
+        return "tactical_2pct"
+    if target_distance <= Decimal("0.05"):
+        return "short_swing"
+    if target_distance <= Decimal("0.08"):
+        return "standard_breakout"
+    return "extended_momentum"
 
 
 def _confirmation_signal(
@@ -1894,6 +1958,18 @@ def _agent_risk_caps(settings: Settings) -> dict[str, object]:
         "absolute_min_reward_risk": _serialize_decimal(
             _settings_decimal(settings, "exec_agent_absolute_min_reward_risk", Decimal("1.00"))
         ),
+        "tactical_scalp_min_target_pct": _serialize_decimal(
+            _settings_decimal(settings, "exec_agent_tactical_scalp_min_target_pct", Decimal("0.02"))
+        ),
+        "tactical_scalp_max_stop_pct": _serialize_decimal(
+            _settings_decimal(settings, "exec_agent_tactical_scalp_max_stop_pct", Decimal("0.015"))
+        ),
+        "target_profiles": [
+            "tactical_2pct",
+            "short_swing",
+            "standard_breakout",
+            "extended_momentum",
+        ],
         "add_on_requires_confirmation": True,
         "max_holding_trading_sessions": getattr(settings, "exec_agent_max_holding_trading_sessions", 3),
         "max_account_snapshot_age_seconds": getattr(settings, "exec_agent_max_account_snapshot_age_seconds", 300),
@@ -1931,6 +2007,7 @@ def _contract_from_agent_response(response: ExecAgentSizingResponse) -> ShortTer
         exposure_after_trade=response.exposure_after_trade,
         allow_existing_holding=response.allow_existing_holding,
         special_tactical_scalp=response.special_tactical_scalp,
+        target_profile=response.target_profile,
         reason="; ".join(response.reasons) if response.reasons else None,
         risk_flags=response.risk_flags,
         context={
@@ -2124,6 +2201,7 @@ def _take_profit_stages(
 ) -> list[dict[str, object]]:
     entry_price = Decimal(str(decision["reference_price"]))
     upstream_target = Decimal(str(decision["target_price"]))
+    target_profile = str(decision.get("target_profile") or "standard_breakout")
     first_pct = _settings_decimal(settings, "exec_agent_first_take_profit_pct", Decimal("0.04"))
     final_pct = _settings_decimal(settings, "exec_agent_final_take_profit_pct", Decimal("0.08"))
     partial_fraction = _settings_decimal(settings, "exec_agent_partial_take_profit_fraction", Decimal("0.50"))
@@ -2149,7 +2227,10 @@ def _take_profit_stages(
                 "exit_rule": {
                     "kind": "partial_take_profit",
                     "stage": "first",
+                    "target_profile": target_profile,
+                    "target_tag": f"{target_profile}:first",
                     "trigger_pct": _serialize_decimal(first_pct),
+                    "actual_trigger_pct": _serialize_decimal((first_target - entry_price) / entry_price),
                     "fraction": _serialize_decimal(partial_fraction),
                     "entry_price": _serialize_decimal(entry_price),
                     "upstream_target_price": _serialize_decimal(upstream_target),
@@ -2161,7 +2242,10 @@ def _take_profit_stages(
                 "exit_rule": {
                     "kind": "final_take_profit",
                     "stage": "final",
+                    "target_profile": target_profile,
+                    "target_tag": f"{target_profile}:final",
                     "trigger_pct": _serialize_decimal(final_pct),
+                    "actual_trigger_pct": _serialize_decimal((final_target - entry_price) / entry_price),
                     "entry_price": _serialize_decimal(entry_price),
                     "upstream_target_price": _serialize_decimal(upstream_target),
                 },
@@ -2175,7 +2259,10 @@ def _take_profit_stages(
             "exit_rule": {
                 "kind": "final_take_profit",
                 "stage": "final",
+                "target_profile": target_profile,
+                "target_tag": f"{target_profile}:final",
                 "trigger_pct": _serialize_decimal(final_pct),
+                "actual_trigger_pct": _serialize_decimal((final_target - entry_price) / entry_price),
                 "entry_price": _serialize_decimal(entry_price),
                 "upstream_target_price": _serialize_decimal(upstream_target),
             },

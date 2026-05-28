@@ -3,7 +3,7 @@ from __future__ import annotations
 from decimal import Decimal
 
 from app.models.runtime import ExecutionPlanItem
-from app.services.watch_exec_agent_sizing import _candidate_payload
+from app.services.watch_exec_agent_sizing import _candidate_payload, _decision_record
 
 
 def _watch_item(*, risk_context: dict[str, object] | None) -> ExecutionPlanItem:
@@ -180,3 +180,29 @@ def test_candidate_payload_omits_decider_flow_short_sector_context_for_legacy_pa
     assert "decider_flow_short_sector_context" not in payload
     assert payload["data_quality_warnings"] == ["Investor flow data is missing."]
     assert payload["supporting_evidence"] == ["legacy evidence"]
+
+
+def test_watch_sizing_decision_record_tags_tactical_target_profile() -> None:
+    item = _watch_item(
+        risk_context={
+            "target_price": "72420",
+            "stop_loss_price": "70290",
+        }
+    )
+
+    record = _decision_record(
+        decision={
+            "action": "approve",
+            "quantity": 2,
+            "approved_notional_krw": 143000,
+            "sizing_price": "71000",
+            "confidence": 0.68,
+            "reason_code": "small_tactical_upside",
+            "reason": "2% target with tight stop",
+        },
+        item=item,
+        version="manual-exec-agent-watch-sizing-v1",
+    )
+
+    assert record["target_profile"] == "tactical_2pct"
+    assert record["target_tag"] == "target_profile:tactical_2pct"
