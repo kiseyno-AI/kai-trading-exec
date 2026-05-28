@@ -5,6 +5,18 @@ from decimal import Decimal
 from fastapi.testclient import TestClient
 from sqlalchemy import inspect, select, text
 
+from app.api.schemas.execution import MonitoringPriceRequest
+from app.broker.base import (
+    BrokerAccountSnapshot,
+    BrokerConfig,
+    BrokerOrderPlacement,
+    BrokerOrderPlacementRequest,
+    BrokerRealtimeApproval,
+    BrokerReconnectHandle,
+    BrokerTokenGrant,
+    BrokerTokenRevocation,
+    NormalizedBrokerOrderStatus,
+)
 from app.core.config import Settings, load_settings
 from app.db.base import Base
 from app.db.session import create_db_engine, create_session_factory
@@ -26,6 +38,7 @@ from app.services.monitoring import (
     _load_monitored_items,
     _resolve_sell_quantity,
     list_autonomous_monitoring_symbols,
+    run_autonomous_monitoring_cycle,
 )
 
 
@@ -49,6 +62,91 @@ def build_test_app(
         monitoring_price_source=monitoring_price_source,
     )
     return app, engine
+
+
+class StubMonitoringBrokerAdapter:
+    provider = "kis"
+
+    def __init__(self) -> None:
+        self.order_calls: list[BrokerOrderPlacementRequest] = []
+
+    def describe(self) -> BrokerConfig:
+        return BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=None,
+        )
+
+    def authenticate(self) -> BrokerTokenGrant:
+        return BrokerTokenGrant(
+            access_token="test-token",
+            token_type="Bearer",
+            access_token_expires_at=datetime(2026, 5, 29, tzinfo=UTC),
+        )
+
+    def issue_realtime_approval(self, access_token: str) -> BrokerRealtimeApproval:
+        assert access_token
+        return BrokerRealtimeApproval(
+            approval_key="test-approval",
+            issued_at=datetime(2026, 5, 28, tzinfo=UTC),
+        )
+
+    def revoke(self, access_token: str) -> BrokerTokenRevocation:
+        assert access_token
+        return BrokerTokenRevocation(message="revoked")
+
+    def place_order(
+        self,
+        access_token: str,
+        request: BrokerOrderPlacementRequest,
+    ) -> BrokerOrderPlacement:
+        assert access_token
+        self.order_calls.append(request)
+        return BrokerOrderPlacement(
+            broker_order_id=f"kis-{len(self.order_calls)}",
+            normalized_status=NormalizedBrokerOrderStatus.SUBMITTED,
+            broker_status="submitted",
+            submitted_at=datetime(2026, 5, 28, 1, 5, tzinfo=UTC),
+            observed_at=datetime(2026, 5, 28, 1, 5, tzinfo=UTC),
+            request_metadata={"source": "stub"},
+            response_metadata={"source": "stub"},
+            request_payload={"symbol": request.symbol},
+            response_payload={"broker_order_id": f"kis-{len(self.order_calls)}"},
+        )
+
+    def get_account_snapshot(
+        self,
+        access_token: str,
+        *,
+        symbols: list[str] | None = None,
+        reference_prices: dict[str, Decimal] | None = None,
+        exchange: str = "KRX",
+    ) -> BrokerAccountSnapshot:
+        assert access_token
+        return BrokerAccountSnapshot(
+            available_cash=Decimal("1000000.00"),
+            observed_at=datetime(2026, 5, 28, tzinfo=UTC),
+            source="stub",
+        )
+
+    def reconnect_handle(self) -> BrokerReconnectHandle:
+        return BrokerReconnectHandle(supported=True, strategy="stub")
+
+    def reconcile_order(self, access_token: str, broker_order_id: str) -> dict[str, object] | None:
+        assert access_token
+        assert broker_order_id
+        return None
+
+    def build_headers(
+        self,
+        access_token: str,
+        *,
+        transaction_id: str | None = None,
+        hashkey: str | None = None,
+    ) -> dict[str, str]:
+        assert access_token
+        return {}
 
 
 def build_unmigrated_runtime_safety_app(
@@ -1025,6 +1123,121 @@ def test_autonomous_monitoring_uses_latest_plan_per_symbol_only() -> None:
         autonomous_item_ids = {item.id for item in autonomous_items}
         assert older_item_id not in autonomous_item_ids
         assert autonomous_item_ids == newer_item_ids
+
+    engine.dispose()
+
+
+def test_autonomous_monitoring_falls_back_to_older_stop_when_latest_stop_rejected() -> None:
+    app, engine = build_test_app(
+        Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+        )
+    )
+    client = TestClient(app)
+    broker_adapter = StubMonitoringBrokerAdapter()
+
+    resume = client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "test", "reason": "enable monitoring sell"},
+    )
+    assert resume.status_code == 200
+
+    older = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-033530-old-stop",
+            "source": "kai-trading-core",
+            "market_date": "2026-05-26",
+            "items": [
+                {
+                    "symbol": "033530",
+                    "side": "sell",
+                    "intent": "stop_sell",
+                    "trigger_price": "8060.00",
+                    "quantity_policy": {"kind": "position_exit_from_entry"},
+                    "risk_context": {"exchange": "KRX"},
+                }
+            ],
+        },
+    )
+    newer = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-033530-new-target-rejected-stop",
+            "source": "kai-trading-core",
+            "market_date": "2026-05-27",
+            "items": [
+                {
+                    "symbol": "033530",
+                    "side": "sell",
+                    "intent": "target_sell",
+                    "trigger_price": "9250.00",
+                    "quantity_policy": {"kind": "position_exit_from_entry"},
+                    "risk_context": {"exchange": "KRX"},
+                },
+                {
+                    "symbol": "033530",
+                    "side": "sell",
+                    "intent": "stop_sell",
+                    "trigger_price": "8700.00",
+                    "quantity_policy": {"kind": "position_exit_from_entry"},
+                    "risk_context": {"exchange": "KRX"},
+                },
+            ],
+        },
+    )
+    assert older.status_code == 201
+    assert newer.status_code == 201
+    older_stop_id = older.json()["persisted_execution_item_ids"][0]
+    newer_target_id, newer_stop_id = newer.json()["persisted_execution_item_ids"]
+
+    with app.state.db_session_factory() as session:
+        newer_stop = session.get(ExecutionPlanItem, newer_stop_id)
+        assert newer_stop is not None
+        newer_stop.status = "broker_order_rejected"
+        session.add(
+            ExecutionPosition(
+                mode="paper",
+                symbol="033530",
+                quantity=58,
+                average_price=Decimal("8500.00"),
+                updated_from="reconciliation",
+                last_reconciled_at=datetime.now(UTC),
+            )
+        )
+        session.commit()
+
+        autonomous_items = _load_monitored_items(
+            settings=app.state.settings,
+            db=session,
+            exclude_pending_config=True,
+        )
+        assert {item.id for item in autonomous_items} == {older_stop_id, newer_target_id}
+
+        result = run_autonomous_monitoring_cycle(
+            settings=app.state.settings,
+            db=session,
+            adapter=broker_adapter,
+            prices=[
+                MonitoringPriceRequest(symbol="033530", price=Decimal("7300.00"))
+            ],
+            now=datetime(2026, 5, 28, 1, 5, tzinfo=UTC),
+        )
+
+        assert result.status_code == 200
+        assert result.payload["submitted_order_count"] == 1
+        assert result.payload["triggered_item_count"] == 1
+        assert broker_adapter.order_calls[0].symbol == "033530"
+        assert broker_adapter.order_calls[0].side == "sell"
+        assert broker_adapter.order_calls[0].quantity == 58
+        assert broker_adapter.order_calls[0].execution_plan_item_id == older_stop_id
+
+        orders = session.scalars(select(BrokerOrder)).all()
+        assert [order.execution_plan_item_id for order in orders] == [older_stop_id]
 
     engine.dispose()
 

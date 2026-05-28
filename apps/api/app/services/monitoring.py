@@ -876,7 +876,7 @@ def _load_monitored_items(
         )
         .limit(settings.monitoring_max_symbols_per_cycle)
     )
-    return db.scalars(
+    selected_items = db.scalars(
         select(ExecutionPlanItem)
         .join(ExecutionPlanItem.plan)
         .where(
@@ -892,6 +892,101 @@ def _load_monitored_items(
             ExecutionPlanItem.id.asc(),
         )
     ).all()
+    return _append_held_stop_sell_fallbacks(
+        settings=settings,
+        db=db,
+        monitored_item_filter=monitored_item_filter,
+        selected_items=selected_items,
+    )
+
+
+def _append_held_stop_sell_fallbacks(
+    *,
+    settings: Settings,
+    db: Session,
+    monitored_item_filter,
+    selected_items: list[ExecutionPlanItem],
+) -> list[ExecutionPlanItem]:
+    if not selected_items:
+        return selected_items
+
+    selected_symbols = {item.symbol for item in selected_items}
+    symbols_with_stop = {
+        item.symbol
+        for item in selected_items
+        if item.side == "sell" and item.intent == "stop_sell"
+    }
+    fallback_symbols = db.scalars(
+        select(ExecutionPosition.symbol)
+        .where(
+            ExecutionPosition.mode == settings.runtime_mode,
+            ExecutionPosition.quantity > 0,
+            ExecutionPosition.symbol.in_(selected_symbols - symbols_with_stop),
+        )
+    ).all()
+    if not fallback_symbols:
+        return selected_items
+
+    fallback_candidates = (
+        select(
+            ExecutionPlanItem.id.label("item_id"),
+            func.row_number()
+            .over(
+                partition_by=ExecutionPlanItem.symbol,
+                order_by=(
+                    ExecutionPlan.market_date.desc(),
+                    ExecutionPlan.accepted_at.desc(),
+                    ExecutionPlan.id.desc(),
+                    ExecutionPlanItem.plan_item_index.asc(),
+                    ExecutionPlanItem.id.asc(),
+                ),
+            )
+            .label("stop_rank"),
+        )
+        .join(ExecutionPlanItem.plan)
+        .where(
+            ExecutionPlan.mode == settings.runtime_mode,
+            monitored_item_filter,
+            ExecutionPlanItem.side == "sell",
+            ExecutionPlanItem.intent == "stop_sell",
+            ExecutionPlanItem.symbol.in_(fallback_symbols),
+        )
+        .subquery()
+    )
+    fallback_item_ids = select(fallback_candidates.c.item_id).where(
+        fallback_candidates.c.stop_rank == 1
+    )
+    selected_item_ids = {item.id for item in selected_items}
+    fallback_items = [
+        item
+        for item in db.scalars(
+            select(ExecutionPlanItem)
+            .join(ExecutionPlanItem.plan)
+            .where(
+                ExecutionPlan.mode == settings.runtime_mode,
+                ExecutionPlanItem.id.in_(fallback_item_ids),
+            )
+            .options(selectinload(ExecutionPlanItem.plan))
+            .order_by(
+                ExecutionPlan.accepted_at.asc(),
+                ExecutionPlan.id.asc(),
+                ExecutionPlanItem.plan_item_index.asc(),
+                ExecutionPlanItem.id.asc(),
+            )
+        ).all()
+        if item.id not in selected_item_ids
+    ]
+    if not fallback_items:
+        return selected_items
+    return sorted(
+        [*selected_items, *fallback_items],
+        key=lambda item: (
+            item.plan.accepted_at,
+            item.plan.id,
+            item.plan_item_index,
+            item.id,
+        ),
+    )
 
 
 def _monitored_item_filter():
