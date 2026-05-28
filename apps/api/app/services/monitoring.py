@@ -213,7 +213,11 @@ def list_autonomous_monitoring_symbols(
         db=db,
         current_market_date=current_market_date or datetime.now(KRX_TIMEZONE).date(),
     )
-    if expired_count:
+    stale_sell_count = expire_known_flat_pending_sell_monitors(
+        settings=settings,
+        db=db,
+    )
+    if expired_count or stale_sell_count:
         db.commit()
 
     seen: set[str] = set()
@@ -226,6 +230,62 @@ def list_autonomous_monitoring_symbols(
         seen.add(item.symbol)
         symbols.append(item.symbol)
     return symbols
+
+
+def expire_known_flat_pending_sell_monitors(
+    *,
+    settings: Settings,
+    db: Session,
+    expired_at: datetime | None = None,
+) -> int:
+    expired_at = _normalize_utc(expired_at or datetime.now(UTC))
+    held_symbols = select(ExecutionPosition.symbol).where(
+        ExecutionPosition.mode == settings.runtime_mode,
+        ExecutionPosition.quantity > 0,
+    )
+    known_flat_symbols = select(ExecutionPosition.symbol).where(
+        ExecutionPosition.mode == settings.runtime_mode,
+        ExecutionPosition.quantity <= 0,
+    )
+    active_watch_symbols = select(ExecutionPlanItem.symbol).where(
+        ExecutionPlanItem.side == "buy",
+        ExecutionPlanItem.intent.in_(tuple(WATCH_BUY_INTENTS)),
+        ExecutionPlanItem.status.in_(tuple(WATCH_MONITORING_STATUSES)),
+    )
+    candidates = db.scalars(
+        select(ExecutionPlanItem)
+        .join(ExecutionPlanItem.plan)
+        .where(
+            ExecutionPlan.mode == settings.runtime_mode,
+            ExecutionPlanItem.side == "sell",
+            ExecutionPlanItem.intent.in_(tuple(SELL_MONITORED_INTENTS)),
+            ExecutionPlanItem.status.in_(tuple(SELL_PENDING_CONFIG_STATUSES)),
+            ExecutionPlanItem.symbol.in_(known_flat_symbols),
+            ExecutionPlanItem.symbol.not_in(held_symbols),
+            ExecutionPlanItem.symbol.not_in(active_watch_symbols),
+        )
+        .options(selectinload(ExecutionPlanItem.plan))
+        .order_by(
+            ExecutionPlan.accepted_at.asc(),
+            ExecutionPlan.id.asc(),
+            ExecutionPlanItem.plan_item_index.asc(),
+            ExecutionPlanItem.id.asc(),
+        )
+    ).all()
+
+    for item in candidates:
+        prior_status = item.status
+        item.status = "expired"
+        _record_monitoring_event(
+            item=item,
+            event={
+                "event": "known_flat_pending_sell_monitor_expired",
+                "reason": "known_flat_position",
+                "prior_status": prior_status,
+                "recorded_at": expired_at.isoformat(),
+            },
+        )
+    return len(candidates)
 
 
 def _evaluate_monitoring_cycle(
