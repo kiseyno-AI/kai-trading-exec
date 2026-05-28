@@ -1084,8 +1084,31 @@ def test_autonomous_monitoring_expires_known_flat_pending_sell_monitors() -> Non
     held_item_id = held_sell.json()["persisted_execution_item_ids"][0]
 
     with app.state.db_session_factory() as session:
+        live_watch_plan = ExecutionPlan(
+            external_plan_id="live-cross-runtime-watch-buy",
+            source="kai-trading-core",
+            market_date=datetime(2026, 5, 22, tzinfo=UTC).date(),
+            mode="live",
+        )
+        live_watch_item = ExecutionPlanItem(
+            plan=live_watch_plan,
+            plan_item_index=0,
+            symbol="000660",
+            side="buy",
+            intent="intraday_watch_buy",
+            status="watch_monitoring_active",
+            trigger_price=Decimal("90.00"),
+            quantity_policy={"kind": "shares", "quantity": 1},
+            risk_context={
+                "watch_buy_monitoring": {
+                    "direction": "at_or_below",
+                    "trigger_price": "90.00",
+                },
+            },
+        )
         session.add_all(
             [
+                live_watch_plan,
                 ExecutionPosition(
                     mode="paper",
                     symbol="000660",
@@ -1117,6 +1140,7 @@ def test_autonomous_monitoring_expires_known_flat_pending_sell_monitors() -> Non
         assert stale_item.status == "expired"
         assert stale_item.risk_context["last_monitoring_event"]["reason"] == "known_flat_position"
         assert held_item.status == "target_sell_pending_config"
+        assert live_watch_item.status == "watch_monitoring_active"
         assert symbols == ["005930"]
 
     engine.dispose()

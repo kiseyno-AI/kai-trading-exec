@@ -247,10 +247,15 @@ def expire_known_flat_pending_sell_monitors(
         ExecutionPosition.mode == settings.runtime_mode,
         ExecutionPosition.quantity <= 0,
     )
-    active_watch_symbols = select(ExecutionPlanItem.symbol).where(
-        ExecutionPlanItem.side == "buy",
-        ExecutionPlanItem.intent.in_(tuple(WATCH_BUY_INTENTS)),
-        ExecutionPlanItem.status.in_(tuple(WATCH_MONITORING_STATUSES)),
+    active_watch_symbols = (
+        select(ExecutionPlanItem.symbol)
+        .join(ExecutionPlanItem.plan)
+        .where(
+            ExecutionPlan.mode == settings.runtime_mode,
+            ExecutionPlanItem.side == "buy",
+            ExecutionPlanItem.intent.in_(tuple(WATCH_BUY_INTENTS)),
+            ExecutionPlanItem.status.in_(tuple(WATCH_MONITORING_STATUSES)),
+        )
     )
     candidates = db.scalars(
         select(ExecutionPlanItem)
