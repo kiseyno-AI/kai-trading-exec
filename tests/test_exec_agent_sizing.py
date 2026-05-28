@@ -158,6 +158,7 @@ def build_test_app(
     exec_agent_max_total_budget: Decimal = Decimal("600000"),
     exec_agent_max_daily_new_buy_notional: Decimal = Decimal("2000000"),
     exec_agent_stop_loss_pct: Decimal = Decimal("0.10"),
+    exec_agent_tactical_scalp_max_stop_pct: Decimal = Decimal("0.015"),
 ):
     settings = Settings(
         database_url="sqlite:///:memory:",
@@ -172,6 +173,7 @@ def build_test_app(
         exec_agent_max_position_allocation_pct=Decimal("0.50"),
         exec_agent_max_daily_new_buy_notional=exec_agent_max_daily_new_buy_notional,
         exec_agent_stop_loss_pct=exec_agent_stop_loss_pct,
+        exec_agent_tactical_scalp_max_stop_pct=exec_agent_tactical_scalp_max_stop_pct,
     )
     engine = create_db_engine(settings)
     Base.metadata.create_all(engine)
@@ -263,6 +265,8 @@ def strict_exec_decision(
     stop_price: str = "47000",
     reward_risk: str | None = None,
     max_total_budget: str | None = None,
+    special_tactical_scalp: bool = False,
+    target_profile: str | None = None,
 ) -> dict[str, object]:
     decision_context = {"confirmation_signal": "momentum_continuation"}
     if context is not None:
@@ -275,8 +279,11 @@ def strict_exec_decision(
         "target_price": target_price,
         "stop_price": stop_price,
         "risk_flags": ["momentum_continuation"],
+        "special_tactical_scalp": special_tactical_scalp,
         "context": decision_context,
     }
+    if target_profile is not None:
+        decision["target_profile"] = target_profile
     if reward_risk is not None:
         decision["reward_risk"] = reward_risk
     if max_total_budget is not None:
@@ -829,6 +836,49 @@ def test_short_term_exec_agent_accepts_high_confidence_relaxed_reward_risk() -> 
     assert audit["reason_code"] == "approved"
     assert audit["reward_risk"] == "1.1000"
     assert audit["required_reward_risk"] == "1.1000"
+
+    engine.dispose()
+
+
+def test_short_term_exec_agent_accepts_tagged_tactical_two_pct_target() -> None:
+    adapter = StubBrokerAdapter(available_cash=Decimal("500000"))
+    app, engine = build_test_app(
+        adapter,
+        exec_agent_tactical_scalp_max_stop_pct=Decimal("0.02"),
+    )
+    client = TestClient(app)
+
+    response = client.post(
+        "/execution-plans/preview",
+        json=short_term_plan_payload(
+            exec_agent_decision=strict_exec_decision(
+                "0.70",
+                max_budget="150000",
+                target_price="51000",
+                stop_price="49000",
+                special_tactical_scalp=True,
+                target_profile="tactical_2pct",
+            )
+        ),
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    buy_item = payload["items"][0]
+    target_items = [item for item in payload["items"] if item["intent"] == "target_sell"]
+    audit = buy_item["risk_context"]["exec_agent_decision"]
+    assert buy_item["status"] == "next_open_buy_scheduled"
+    assert audit["reason_code"] == "approved"
+    assert audit["reward_risk"] == "1.0000"
+    assert audit["required_reward_risk"] == "1.0000"
+    assert audit["target_profile"] == "tactical_2pct"
+    assert audit["target_tag"] == "target_profile:tactical_2pct"
+    assert len(target_items) == 1
+    assert target_items[0]["trigger_price"] == "51000.0000"
+    exit_rule = target_items[0]["risk_context"]["exit_rule"]
+    assert exit_rule["target_profile"] == "tactical_2pct"
+    assert exit_rule["target_tag"] == "tactical_2pct:final"
+    assert exit_rule["actual_trigger_pct"] == "0.0200"
 
     engine.dispose()
 

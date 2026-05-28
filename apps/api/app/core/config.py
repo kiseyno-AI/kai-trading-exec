@@ -49,6 +49,7 @@ class Settings(BaseModel):
     exec_agent_min_reward_risk: Decimal = Field(default=Decimal("1.30"), gt=0)
     exec_agent_relaxed_min_reward_risk: Decimal = Field(default=Decimal("1.10"), gt=0)
     exec_agent_absolute_min_reward_risk: Decimal = Field(default=Decimal("1.00"), gt=0)
+    exec_agent_tactical_scalp_min_target_pct: Decimal = Field(default=Decimal("0.02"), gt=0, le=1)
     exec_agent_tactical_scalp_max_stop_pct: Decimal = Field(default=Decimal("0.015"), gt=0, le=1)
     exec_agent_max_account_snapshot_age_seconds: int = Field(default=300, ge=1, le=86400)
     exec_agent_max_holding_trading_sessions: int = Field(default=3, ge=1, le=20)
@@ -123,6 +124,7 @@ _ENV_FIELDS = {
     "EXEC_AGENT_MIN_REWARD_RISK": "exec_agent_min_reward_risk",
     "EXEC_AGENT_RELAXED_MIN_REWARD_RISK": "exec_agent_relaxed_min_reward_risk",
     "EXEC_AGENT_ABSOLUTE_MIN_REWARD_RISK": "exec_agent_absolute_min_reward_risk",
+    "EXEC_AGENT_TACTICAL_SCALP_MIN_TARGET_PCT": "exec_agent_tactical_scalp_min_target_pct",
     "EXEC_AGENT_TACTICAL_SCALP_MAX_STOP_PCT": "exec_agent_tactical_scalp_max_stop_pct",
     "EXEC_AGENT_MAX_ACCOUNT_SNAPSHOT_AGE_SECONDS": "exec_agent_max_account_snapshot_age_seconds",
     "EXEC_AGENT_MAX_HOLDING_TRADING_SESSIONS": "exec_agent_max_holding_trading_sessions",

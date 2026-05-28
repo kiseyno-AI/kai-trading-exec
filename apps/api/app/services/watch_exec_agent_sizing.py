@@ -75,8 +75,12 @@ def run_due_watch_exec_agent_sizing(
             "strategy_run_id": plan.strategy_run_id,
             "task": (
                 "Return exec-agent sizing decisions for intraday watch buys. "
-                "Approve only if risk/reward/liquidity/cash make sense. "
+                "Keep the normal high-upside approval logic, but also approve small tactical candidates "
+                "when about 2% upside is realistic, downside is tightly stopped near breakeven, "
+                "and upside probability is better than downside probability. "
                 "Quantity must be positive shares for approve, or reject with a reason. "
+                "Set target_profile to tactical_2pct, short_swing, standard_breakout, or extended_momentum "
+                "so later monitoring shows which target line is being traded. "
                 "These are pending trigger-limit buys; use trigger_price/reference and chase limit."
             ),
             "candidates": candidates,
@@ -295,12 +299,14 @@ def _request_exec_agent_decisions(*, settings: Settings, payload: dict[str, obje
 
 요구사항:
 - 각 candidate별 approve 또는 reject 판단.
-- approve 시 positive integer quantity, approved_notional_krw, sizing_price, confidence, reason_code, reason 포함.
+- 기본 로직은 유지하되, 2% 정도만 현실적인 candidate도 stop이 짧고 상승 확률 우위가 있으면 소액 approve 하세요.
+- approve 시 positive integer quantity, approved_notional_krw, sizing_price, confidence, target_profile, reason_code, reason 포함.
 - reject 시 quantity=0, approved_notional_krw=0, sizing_price, confidence, reason_code, reason 포함.
 - max_safe_notional_krw / max_safe_quantity / liquidity_tier / target/stop / confidence/conviction / risks를 반영하세요.
 - budget_krw가 0이어도 exec-agent sizing delegated 상태이므로 max_safe_notional과 위험도로 보수적 수량을 정하세요.
+- target_profile은 tactical_2pct, short_swing, standard_breakout, extended_momentum 중 하나입니다.
 - 결과는 반드시 JSON만 출력하세요. 스키마:
-{{"version":"manual-exec-agent-watch-sizing-v1","plan_id":"{payload['plan_id']}","decisions":[{{"execution_plan_item_id":"...","symbol":"...","action":"approve|reject","quantity":1,"approved_notional_krw":12345,"sizing_price":1234,"confidence":0.0,"reason_code":"...","reason":"..."}}]}}
+{{"version":"manual-exec-agent-watch-sizing-v1","plan_id":"{payload['plan_id']}","decisions":[{{"execution_plan_item_id":"...","symbol":"...","action":"approve|reject","quantity":1,"approved_notional_krw":12345,"sizing_price":1234,"confidence":0.0,"target_profile":"tactical_2pct","reason_code":"...","reason":"..."}}]}}
 """.strip()
     command = [
         settings.openclaw_cli_path,
@@ -389,6 +395,8 @@ def _apply_decisions(*, db: Session, plan: ExecutionPlan, decision_payload: dict
                 "sizing_price": decision.get("sizing_price"),
                 "approved_notional": decision.get("approved_notional_krw"),
                 "confidence": decision.get("confidence"),
+                "target_profile": record["target_profile"],
+                "target_tag": record["target_tag"],
                 "reason_code": decision.get("reason_code"),
                 "previous_policy": previous_policy,
             }
@@ -406,6 +414,7 @@ def _apply_decisions(*, db: Session, plan: ExecutionPlan, decision_payload: dict
 def _decision_record(*, decision: dict[str, object], item: ExecutionPlanItem, version: str) -> dict[str, object]:
     action = str(decision.get("action") or "").strip().lower()
     quantity = int(decision.get("quantity") or 0)
+    target_profile = _decision_target_profile(decision=decision, item=item)
     return {
         "version": version or "manual-exec-agent-watch-sizing-v1",
         "source": "openclaw_exec_agent_watch_sizing",
@@ -419,10 +428,42 @@ def _decision_record(*, decision: dict[str, object], item: ExecutionPlanItem, ve
         "sizing_price": decision.get("sizing_price"),
         "reference_price": decision.get("sizing_price"),
         "confidence": decision.get("confidence"),
+        "target_profile": target_profile,
+        "target_tag": f"target_profile:{target_profile}",
         "reason_code": decision.get("reason_code"),
         "reason": decision.get("reason"),
         "decided_at": datetime.now(UTC).isoformat(),
     }
+
+
+def _decision_target_profile(*, decision: dict[str, object], item: ExecutionPlanItem) -> str:
+    raw_profile = str(decision.get("target_profile") or "").strip().lower()
+    if raw_profile in {"tactical_2pct", "short_swing", "standard_breakout", "extended_momentum"}:
+        return raw_profile
+
+    risk_context = item.risk_context if isinstance(item.risk_context, dict) else {}
+    reference_price = _positive_decimal(decision.get("sizing_price")) or item.trigger_price
+    target_price = _positive_decimal(risk_context.get("target_price"))
+    if reference_price is None or target_price is None:
+        return "standard_breakout"
+    target_distance = (target_price - reference_price) / reference_price
+    if target_distance <= Decimal("0.025"):
+        return "tactical_2pct"
+    if target_distance <= Decimal("0.05"):
+        return "short_swing"
+    if target_distance <= Decimal("0.08"):
+        return "standard_breakout"
+    return "extended_momentum"
+
+
+def _positive_decimal(value: object) -> Decimal | None:
+    if value is None:
+        return None
+    try:
+        parsed = Decimal(str(value))
+    except Exception:
+        return None
+    return parsed if parsed > 0 else None
 
 
 def _positive_int(value: object) -> int | None:
