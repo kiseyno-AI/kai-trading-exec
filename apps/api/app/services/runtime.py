@@ -593,19 +593,16 @@ def build_runtime_status(
         safety = runtime_safety_payload(state)
         counts = runtime_counts(settings=settings, db=db)
         broker = build_broker_session_summary(settings=settings, db=db)
+        symbols = runtime_symbol_summary(settings=settings, db=db)
         if include_expensive_sections:
             monitoring = monitoring_payload(settings=settings, db=db)
             monitoring["price_source"] = monitoring_price_source
-            symbols = runtime_symbol_summary(settings=settings, db=db)
-            monthly_pnl = monthly_pnl_payload(settings=settings, db=db)
         else:
             symbols = {
+                **symbols,
                 "monitored": runtime_monitored_symbols(settings=settings, db=db),
-                "scheduled_today": [],
-                "filled_today": [],
-                "failed_today": [],
             }
-            monthly_pnl = _default_monthly_pnl_payload(settings=settings)
+        monthly_pnl = monthly_pnl_payload(settings=settings, db=db)
     except SQLAlchemyError as exc:
         db.rollback()
         dependencies["runtime_schema"] = "error"
@@ -881,8 +878,11 @@ def _monitoring_payload_from_autonomous(
     last_cycle = autonomous_monitoring.get("last_cycle")
     if not isinstance(last_cycle, dict):
         last_cycle = None
+    status = str(autonomous_monitoring.get("status") or "not_started")
+    if status == "disabled":
+        status = "not_started"
     return {
-        "status": str(autonomous_monitoring.get("status") or "not_started"),
+        "status": status,
         "topology": MONITORING_RUNTIME_TOPOLOGY,
         "scheduler": {
             "selection_strategy": MONITORING_SELECTION_STRATEGY,
@@ -897,7 +897,7 @@ def _monitoring_payload_from_autonomous(
         "workers": [
             {
                 "name": autonomous_monitoring.get("worker_name") or "monitoring_dispatch_loop",
-                "status": autonomous_monitoring.get("status") or "not_started",
+                "status": status,
                 "last_heartbeat_at": autonomous_monitoring.get("last_heartbeat_at"),
                 "last_success_at": autonomous_monitoring.get("last_success_at"),
             }
@@ -994,10 +994,11 @@ def _monitoring_price_source_readiness_reasons(
     if not autonomous.get("enabled"):
         return []
     monitored_symbols = symbols.get("monitored") or []
-    if not monitored_symbols:
+    price_source = _autonomous_monitoring_price_source(autonomous)
+    last_symbol_count = int(price_source.get("last_symbol_count") or 0)
+    if not monitored_symbols and last_symbol_count <= 0:
         return []
 
-    price_source = _autonomous_monitoring_price_source(autonomous)
     if not price_source.get("configured"):
         return ["monitoring price source is not configured while monitored symbols exist"]
 
