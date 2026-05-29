@@ -207,6 +207,36 @@ def runtime_symbol_summary(
     }
 
 
+def runtime_monitored_symbols(
+    *,
+    settings: Settings,
+    db: Session,
+) -> list[str]:
+    symbols = db.scalars(
+        select(distinct(ExecutionPlanItem.symbol))
+        .join(ExecutionPlanItem.plan)
+        .where(
+            ExecutionPlan.mode == settings.runtime_mode,
+            or_(
+                (
+                    ExecutionPlanItem.intent.in_(SELL_MONITORED_INTENTS)
+                    & (
+                        ExecutionPlanItem.status.endswith("_monitoring")
+                        | ExecutionPlanItem.status.endswith("_pending_dispatch")
+                        | ExecutionPlanItem.status.endswith("_triggered_blocked")
+                    )
+                ),
+                (
+                    ExecutionPlanItem.intent.in_(WATCH_BUY_INTENTS)
+                    & ExecutionPlanItem.status.in_(WATCH_BUY_STATUSES)
+                ),
+            ),
+        )
+        .order_by(ExecutionPlanItem.symbol.asc())
+    ).all()
+    return list(symbols)
+
+
 def _current_krx_day_utc_bounds(now: datetime | None = None) -> tuple[datetime, datetime]:
     current_krx = (now or datetime.now(KRX_TIMEZONE)).astimezone(KRX_TIMEZONE)
     day_start_krx = current_krx.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -465,6 +495,7 @@ def build_runtime_status(
     runtime: RuntimeMetadata,
     db: Session,
     autonomous_runtime: dict[str, object] | None = None,
+    include_expensive_sections: bool = True,
 ) -> dict[str, object]:
     dependencies = {
         "database": "ok",
@@ -473,25 +504,11 @@ def build_runtime_status(
     counts: dict[str, int] = {"open_orders": 0, "active_execution_jobs": 0}
     autonomous = autonomous_runtime or _default_autonomous_runtime_payload(settings)
     monitoring_price_source = _autonomous_monitoring_price_source(autonomous)
-    monitoring: dict[str, object] = {
-        "status": "not_started",
-        "topology": MONITORING_RUNTIME_TOPOLOGY,
-        "scheduler": {
-            "selection_strategy": MONITORING_SELECTION_STRATEGY,
-            "max_symbols_per_cycle": settings.monitoring_max_symbols_per_cycle,
-        },
-        "dispatcher": {
-            "max_broker_actions_per_cycle": settings.monitoring_max_broker_actions_per_cycle,
-            "last_cycle_action_count": 0,
-            "backlog_item_count": 0,
-            "backlog_symbols": [],
-        },
-        "workers": [],
-        "last_heartbeat_at": None,
-        "last_success_at": None,
-        "last_cycle": None,
-        "price_source": monitoring_price_source,
-    }
+    monitoring: dict[str, object] = _monitoring_payload_from_autonomous(
+        settings=settings,
+        autonomous=autonomous,
+        monitoring_price_source=monitoring_price_source,
+    )
     symbols: dict[str, list[str]] = {
         "monitored": [],
         "scheduled_today": [],
@@ -575,11 +592,20 @@ def build_runtime_status(
         state = ensure_runtime_control_state(settings=settings, db=db)
         safety = runtime_safety_payload(state)
         counts = runtime_counts(settings=settings, db=db)
-        monitoring = monitoring_payload(settings=settings, db=db)
-        monitoring["price_source"] = monitoring_price_source
         broker = build_broker_session_summary(settings=settings, db=db)
-        symbols = runtime_symbol_summary(settings=settings, db=db)
-        monthly_pnl = monthly_pnl_payload(settings=settings, db=db)
+        if include_expensive_sections:
+            monitoring = monitoring_payload(settings=settings, db=db)
+            monitoring["price_source"] = monitoring_price_source
+            symbols = runtime_symbol_summary(settings=settings, db=db)
+            monthly_pnl = monthly_pnl_payload(settings=settings, db=db)
+        else:
+            symbols = {
+                "monitored": runtime_monitored_symbols(settings=settings, db=db),
+                "scheduled_today": [],
+                "filled_today": [],
+                "failed_today": [],
+            }
+            monthly_pnl = _default_monthly_pnl_payload(settings=settings)
     except SQLAlchemyError as exc:
         db.rollback()
         dependencies["runtime_schema"] = "error"
@@ -774,11 +800,27 @@ def build_runtime_daily_board(
         runtime=runtime,
         db=db,
         autonomous_runtime=autonomous_runtime,
+        include_expensive_sections=False,
     )
     symbols: list[dict[str, object]] = []
     if runtime_status["dependencies"]["database"] == "ok" and runtime_status["dependencies"]["runtime_schema"] == "ok":
         try:
-            symbols = list_runtime_symbols(settings=settings, db=db)
+            monitored_symbols = runtime_status.get("symbols", {}).get("monitored", [])
+            if isinstance(monitored_symbols, list):
+                normalized_symbols = {str(symbol) for symbol in monitored_symbols}
+                if len(normalized_symbols) > 20:
+                    symbols = _minimal_runtime_symbol_rows(
+                        settings=settings,
+                        symbols=normalized_symbols,
+                    )
+                else:
+                    symbols = list_runtime_symbols(
+                        settings=settings,
+                        db=db,
+                        symbols=normalized_symbols,
+                    )
+            else:
+                symbols = list_runtime_symbols(settings=settings, db=db)
         except SQLAlchemyError:
             db.rollback()
             symbols = []
@@ -796,6 +838,75 @@ def build_runtime_daily_board(
             "position_symbol_count": sum(symbol["position_quantity"] > 0 for symbol in symbols),
         },
         "symbols": symbols,
+    }
+
+
+def _minimal_runtime_symbol_rows(
+    *,
+    settings: Settings,
+    symbols: set[str],
+) -> list[dict[str, object]]:
+    return [
+        {
+            "symbol": symbol,
+            "mode": settings.runtime_mode,
+            "monitored": True,
+            "monitoring_statuses": [],
+            "intents": [],
+            "plan_item_count": 0,
+            "latest_plan_item_status": None,
+            "order_count": 0,
+            "open_order_count": 0,
+            "fill_count": 0,
+            "filled_quantity": 0,
+            "position_quantity": 0,
+            "position_average_price": None,
+            "last_reconciliation_error": None,
+            "latest_activity_at": None,
+            "summary_source": "runtime_status_monitored_symbols",
+        }
+        for symbol in sorted(symbols)
+    ]
+
+
+def _monitoring_payload_from_autonomous(
+    *,
+    settings: Settings,
+    autonomous: dict[str, object],
+    monitoring_price_source: dict[str, object],
+) -> dict[str, object]:
+    autonomous_monitoring = autonomous.get("monitoring")
+    if not isinstance(autonomous_monitoring, dict):
+        autonomous_monitoring = {}
+    last_cycle = autonomous_monitoring.get("last_cycle")
+    if not isinstance(last_cycle, dict):
+        last_cycle = None
+    return {
+        "status": str(autonomous_monitoring.get("status") or "not_started"),
+        "topology": MONITORING_RUNTIME_TOPOLOGY,
+        "scheduler": {
+            "selection_strategy": MONITORING_SELECTION_STRATEGY,
+            "max_symbols_per_cycle": settings.monitoring_max_symbols_per_cycle,
+        },
+        "dispatcher": {
+            "max_broker_actions_per_cycle": settings.monitoring_max_broker_actions_per_cycle,
+            "last_cycle_action_count": int((last_cycle or {}).get("dispatch_action_count", 0) or 0),
+            "backlog_item_count": int((last_cycle or {}).get("backlog_item_count", 0) or 0),
+            "backlog_symbols": (last_cycle or {}).get("backlog_symbols", []),
+        },
+        "workers": [
+            {
+                "name": autonomous_monitoring.get("worker_name") or "monitoring_dispatch_loop",
+                "status": autonomous_monitoring.get("status") or "not_started",
+                "last_heartbeat_at": autonomous_monitoring.get("last_heartbeat_at"),
+                "last_success_at": autonomous_monitoring.get("last_success_at"),
+            }
+        ],
+        "last_heartbeat_at": autonomous_monitoring.get("last_heartbeat_at"),
+        "last_success_at": autonomous_monitoring.get("last_success_at"),
+        "last_cycle": last_cycle,
+        "price_source": monitoring_price_source,
+        "source": "autonomous_runtime_snapshot",
     }
 
 

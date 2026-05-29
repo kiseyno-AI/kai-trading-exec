@@ -225,13 +225,17 @@ def list_execution_plans(
     *,
     settings: Settings,
     db: Session,
+    external_plan_id: str | None = None,
 ) -> list[dict[str, object]]:
-    plans = db.scalars(
+    query = (
         select(ExecutionPlan)
         .where(ExecutionPlan.mode == settings.runtime_mode)
         .options(selectinload(ExecutionPlan.items))
-        .order_by(ExecutionPlan.accepted_at.desc(), ExecutionPlan.created_at.desc()),
-    ).all()
+        .order_by(ExecutionPlan.accepted_at.desc(), ExecutionPlan.created_at.desc())
+    )
+    if external_plan_id:
+        query = query.where(ExecutionPlan.external_plan_id == external_plan_id)
+    plans = db.scalars(query).all()
     return [_serialize_execution_plan(plan) for plan in plans]
 
 
@@ -256,8 +260,10 @@ def list_execution_fills(
     *,
     settings: Settings,
     db: Session,
+    external_plan_id: str | None = None,
+    symbols: set[str] | None = None,
 ) -> list[dict[str, object]]:
-    fills = db.scalars(
+    query = (
         select(ExecutionFill)
         .join(ExecutionFill.broker_order)
         .where(BrokerOrder.mode == settings.runtime_mode)
@@ -266,8 +272,17 @@ def list_execution_fills(
             .selectinload(BrokerOrder.plan_item)
             .selectinload(ExecutionPlanItem.plan),
         )
-        .order_by(ExecutionFill.filled_at.desc(), ExecutionFill.id.desc()),
-    ).all()
+        .order_by(ExecutionFill.filled_at.desc(), ExecutionFill.id.desc())
+    )
+    if symbols:
+        query = query.where(ExecutionFill.symbol.in_(symbols))
+    if external_plan_id:
+        query = (
+            query.join(BrokerOrder.plan_item)
+            .join(ExecutionPlanItem.plan)
+            .where(ExecutionPlan.external_plan_id == external_plan_id)
+        )
+    fills = db.scalars(query).all()
     return [_serialize_execution_fill(fill) for fill in fills]
 
 
@@ -275,16 +290,25 @@ def list_execution_positions(
     *,
     settings: Settings,
     db: Session,
+    symbols: set[str] | None = None,
+    include_related_plan_items: bool = True,
 ) -> list[dict[str, object]]:
-    positions = db.scalars(
+    query = (
         select(ExecutionPosition)
         .where(ExecutionPosition.mode == settings.runtime_mode)
-        .order_by(ExecutionPosition.symbol.asc()),
-    ).all()
-    plan_items_by_symbol = _load_plan_items_by_symbol(
-        settings=settings,
-        db=db,
-        symbols={position.symbol for position in positions},
+        .order_by(ExecutionPosition.symbol.asc())
+    )
+    if symbols:
+        query = query.where(ExecutionPosition.symbol.in_(symbols))
+    positions = db.scalars(query).all()
+    plan_items_by_symbol = (
+        _load_plan_items_by_symbol(
+            settings=settings,
+            db=db,
+            symbols={position.symbol for position in positions},
+        )
+        if include_related_plan_items
+        else {}
     )
     return [
         _serialize_execution_position(
@@ -299,8 +323,11 @@ def list_runtime_symbols(
     *,
     settings: Settings,
     db: Session,
+    symbols: set[str] | None = None,
 ) -> list[dict[str, object]]:
-    state = _load_runtime_symbol_state(settings=settings, db=db)
+    if symbols is not None and not symbols:
+        return []
+    state = _load_runtime_symbol_state(settings=settings, db=db, symbols=symbols)
     return [
         _serialize_runtime_symbol_summary(
             settings=settings,
@@ -588,6 +615,7 @@ def _load_runtime_symbol_state(
     settings: Settings,
     db: Session,
     symbol: str | None = None,
+    symbols: set[str] | None = None,
 ) -> dict[str, object]:
     plan_items_query = (
         select(ExecutionPlanItem)
@@ -626,11 +654,13 @@ def _load_runtime_symbol_state(
         .where(ExecutionPosition.mode == settings.runtime_mode)
         .order_by(ExecutionPosition.symbol.asc())
     )
-    if symbol is not None:
-        plan_items_query = plan_items_query.where(ExecutionPlanItem.symbol == symbol)
-        orders_query = orders_query.where(BrokerOrder.symbol == symbol)
-        fills_query = fills_query.where(ExecutionFill.symbol == symbol)
-        positions_query = positions_query.where(ExecutionPosition.symbol == symbol)
+    symbol_filter = {_normalize_symbol(symbol)} if symbol is not None else symbols
+    if symbol_filter is not None:
+        normalized_symbols = sorted(_normalize_symbol(item) for item in symbol_filter)
+        plan_items_query = plan_items_query.where(ExecutionPlanItem.symbol.in_(normalized_symbols))
+        orders_query = orders_query.where(BrokerOrder.symbol.in_(normalized_symbols))
+        fills_query = fills_query.where(ExecutionFill.symbol.in_(normalized_symbols))
+        positions_query = positions_query.where(ExecutionPosition.symbol.in_(normalized_symbols))
 
     plan_items = db.scalars(plan_items_query).all()
     orders = db.scalars(orders_query).all()

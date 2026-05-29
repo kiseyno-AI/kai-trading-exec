@@ -30,6 +30,7 @@ def runtime_status(
         runtime=runtime,
         db=db,
         autonomous_runtime=autonomous_runtime,
+        include_expensive_sections=False,
     )
 
 
