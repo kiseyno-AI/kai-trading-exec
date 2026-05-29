@@ -34,6 +34,26 @@ from app.services.runtime_controls import (
 OPEN_ORDER_STATUSES = ("submitted", "open", "partially_filled")
 ACTIVE_JOB_STATUSES = ("queued", "scheduled", "running", "retrying")
 MONITORED_INTENTS = ("target_sell", "stop_sell")
+SELL_MONITORED_INTENTS = ("target_sell", "stop_sell", "max_holding_close_sell")
+WATCH_BUY_INTENTS = ("watch_buy", "trigger_buy", "chase_buy", "tactical_buy", "intraday_watch_buy", "next_open_buy")
+WATCH_BUY_STATUSES = (
+    "watch_monitoring_pending",
+    "watch_monitoring_active",
+    "watch_buy_triggered",
+    "watch_buy_triggered_blocked",
+    "watch_buy_triggered_pending_dispatch",
+    "watch_buy_submitted",
+    "watch_buy_rejected",
+)
+SHORT_TERM_BLOCKED_STATUSES = (
+    "short_term_watch_blocked",
+    "pending_configuration",
+    "watch_buy_rejected",
+    "watch_cancelled",
+    "watch_expired",
+)
+SHORT_TERM_DECIDER_NAME = "short-term-decider"
+SIGNAL_DECIDER_NAME = "signal-decider"
 FAILED_ORDER_STATUSES = ("rejected", "failed")
 KRX_TIMEZONE = ZoneInfo("Asia/Seoul")
 
@@ -199,6 +219,7 @@ def monitoring_payload(
     settings: Settings,
     db: Session,
 ) -> dict[str, object]:
+    segments = monitoring_segments(settings=settings, db=db)
     backlog_symbols = db.scalars(
         select(distinct(ExecutionPlanItem.symbol))
         .join(ExecutionPlanItem.plan)
@@ -240,6 +261,7 @@ def monitoring_payload(
                 "backlog_item_count": backlog_item_count,
                 "backlog_symbols": backlog_symbols,
             },
+            "segments": segments,
             "workers": [],
             "last_heartbeat_at": None,
             "last_success_at": None,
@@ -284,6 +306,7 @@ def monitoring_payload(
             "backlog_item_count": backlog_item_count,
             "backlog_symbols": backlog_symbols,
         },
+        "segments": segments,
         "workers": [
             {
                 "name": checkpoint.worker_name,
@@ -305,6 +328,110 @@ def monitoring_payload(
         "last_success_at": last_success,
         "last_cycle": latest_details or None,
     }
+
+
+def monitoring_segments(
+    *,
+    settings: Settings,
+    db: Session,
+) -> dict[str, object]:
+    items = db.scalars(
+        select(ExecutionPlanItem)
+        .join(ExecutionPlanItem.plan)
+        .where(ExecutionPlan.mode == settings.runtime_mode)
+    ).all()
+    held_sell = [
+        item
+        for item in items
+        if item.side == "sell"
+        and item.intent in SELL_MONITORED_INTENTS
+        and (
+            item.status.endswith("_monitoring")
+            or item.status.endswith("_pending_dispatch")
+            or item.status.endswith("_triggered_blocked")
+        )
+    ]
+    short_term_watch = [
+        item
+        for item in items
+        if _is_short_term_decider_item(item)
+        and item.side == "buy"
+        and item.intent in WATCH_BUY_INTENTS
+        and item.status in WATCH_BUY_STATUSES
+    ]
+    signal_next_open = [
+        item
+        for item in items
+        if item.side == "buy"
+        and item.intent == "next_open_buy"
+        and _normalized_agent(item.decision_agent_name) == SIGNAL_DECIDER_NAME
+        and item.status.startswith("next_open_buy")
+    ]
+    blocked_short_term = [
+        item
+        for item in items
+        if _is_short_term_decider_item(item)
+        and item.side == "buy"
+        and item.status in SHORT_TERM_BLOCKED_STATUSES
+    ]
+    return {
+        "held_position_sell_monitoring": _segment_payload(held_sell),
+        "short_term_buy_watch_monitoring": _segment_payload(short_term_watch),
+        "signal_decider_next_open_market_buys": _segment_payload(signal_next_open),
+        "blocked_short_term_candidates": _segment_payload(blocked_short_term, include_blockers=True),
+    }
+
+
+def _segment_payload(
+    items: list[ExecutionPlanItem],
+    *,
+    include_blockers: bool = False,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "item_count": len(items),
+        "symbols": sorted({item.symbol for item in items}),
+    }
+    if include_blockers:
+        payload["items"] = [
+            {
+                "execution_plan_item_id": item.id,
+                "symbol": item.symbol,
+                "status": item.status,
+                "tactical_action": _risk_context_text(item, "tactical_action"),
+                "blocker_reason": _risk_context_text(item, "short_term_blocker_reason")
+                or _risk_context_text(item, "last_monitoring_event", nested_key="reason"),
+            }
+            for item in sorted(items, key=lambda item: (item.symbol, item.id))
+        ]
+    return payload
+
+
+def _is_short_term_decider_item(item: ExecutionPlanItem) -> bool:
+    return _normalized_agent(item.decision_agent_name) == SHORT_TERM_DECIDER_NAME
+
+
+def _normalized_agent(value: str | None) -> str | None:
+    if value is None:
+        return None
+    return value.strip().lower()
+
+
+def _risk_context_text(
+    item: ExecutionPlanItem,
+    key: str,
+    *,
+    nested_key: str | None = None,
+) -> str | None:
+    if not isinstance(item.risk_context, dict):
+        return None
+    value = item.risk_context.get(key)
+    if nested_key is not None:
+        if not isinstance(value, dict):
+            return None
+        value = value.get(nested_key)
+    if value is None:
+        return None
+    return str(value)
 
 
 def readiness_payload(

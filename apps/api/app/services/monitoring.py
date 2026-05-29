@@ -1624,6 +1624,19 @@ def _watch_buy_stop_price(item: ExecutionPlanItem) -> Decimal | None:
     )
 
 
+def _watch_buy_target_price(item: ExecutionPlanItem) -> Decimal | None:
+    return _first_positive_decimal_from_item(
+        item,
+        (
+            "target_price",
+            "take_profit_price",
+            "first_take_profit_price",
+            "profit_target_price",
+            "target",
+        ),
+    )
+
+
 def _load_watch_buy_account_snapshot(
     *,
     settings: Settings,
@@ -2098,7 +2111,16 @@ def _monitoring_result_payload(
     }
     if _is_watch_buy_item(item):
         payload["chase_limit_price"] = _serialize_decimal(_watch_buy_chase_limit_price(item))
+        payload["target_price"] = _serialize_decimal(_watch_buy_target_price(item))
+        payload["stop_loss_price"] = _serialize_decimal(_watch_buy_stop_price(item))
+        payload["current_price"] = _serialize_decimal(observed_price)
         payload["direction"] = _watch_buy_direction(item)
+        monitoring = _watch_buy_monitoring_context(item)
+        tactical_action = monitoring.get("tactical_action")
+        if tactical_action is None and isinstance(item.risk_context, dict):
+            tactical_action = item.risk_context.get("tactical_action")
+        if tactical_action is not None:
+            payload["tactical_action"] = tactical_action
     if message is not None:
         payload["message"] = message
     if block_reason is not None:

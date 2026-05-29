@@ -39,6 +39,8 @@ WATCH_MONITORING_STATUSES = frozenset(
 )
 OPEN_ORDER_STATUSES = frozenset({"submitted", "open", "partially_filled"})
 SHORT_TERM_DECIDER_NAME = "short-term-decider"
+ACTIVE_SHORT_TERM_TACTICAL_ACTIONS = frozenset({"scalp_buy_candidate", "watch_for_trigger"})
+INACTIVE_SHORT_TERM_TACTICAL_ACTIONS = frozenset({"avoid_chase", "wait", "reject"})
 UNSUPPORTED_BUY_INTENTS = frozenset({"tactical_buy", "trigger_buy", "chase_buy"})
 CHASE_BUY_FIELDS = frozenset(
     {
@@ -58,6 +60,8 @@ BUY_RECOMMENDATION_FIELDS = (
     "entry_price",
 )
 BUY_TRIGGER_FIELDS = frozenset({"watch_trigger_price", "buy_trigger_price", "entry_trigger_price", "trigger_price", "original_watch_trigger_price"})
+BUY_TARGET_FIELDS = frozenset({"target_price", "take_profit_price", "first_take_profit_price", "profit_target_price", "target"})
+BUY_STOP_FIELDS = frozenset({"stop_price", "stop_sell_price", "stop_loss_price", "risk_stop_price", "stop"})
 
 
 @dataclass(frozen=True)
@@ -405,6 +409,8 @@ def _serialize_execution_plan(plan: ExecutionPlan) -> dict[str, object]:
 
 def _serialize_execution_plan_item(item: ExecutionPlanItem) -> dict[str, object]:
     source_identity = serialize_plan_item_source_identity(item)
+    tactical_action = _risk_context_value(item, "tactical_action")
+    blocker_reason = _risk_context_value(item, "short_term_blocker_reason")
     return {
         "execution_plan_item_id": item.id,
         "symbol": item.symbol,
@@ -424,6 +430,8 @@ def _serialize_execution_plan_item(item: ExecutionPlanItem) -> dict[str, object]
         "core_plan_item_id": source_identity["core_plan_item_id"],
         "source_market_date": source_identity["source_market_date"],
         "source_identity": source_identity,
+        "tactical_action": tactical_action,
+        "blocker_reason": blocker_reason,
         "created_at": _serialize_datetime(item.created_at),
         "updated_at": _serialize_datetime(item.updated_at),
     }
@@ -563,6 +571,12 @@ def _serialize_datetime(value: datetime | None) -> str | None:
 
 def _serialize_decimal(value: Decimal | None) -> str | None:
     return str(value) if value is not None else None
+
+
+def _risk_context_value(item: ExecutionPlanItem, key: str) -> object | None:
+    if not isinstance(item.risk_context, dict):
+        return None
+    return item.risk_context.get(key)
 
 
 def _normalize_symbol(symbol: str) -> str:
@@ -785,6 +799,9 @@ def _load_plan_items_by_symbol(
 def _initial_plan_item_status(item: ExecutionPlanItemRequest) -> str:
     if item.side != "buy":
         return "pending"
+    tactical_action = _short_term_tactical_action(item)
+    if _decision_agent_name(item) == SHORT_TERM_DECIDER_NAME and tactical_action in INACTIVE_SHORT_TERM_TACTICAL_ACTIONS:
+        return "short_term_watch_blocked"
     if _is_watch_buy_request(item):
         if _watch_buy_trigger_price(item) is not None:
             return "watch_monitoring_pending"
@@ -841,6 +858,13 @@ def _is_watch_buy_request(item: ExecutionPlanItemRequest) -> bool:
         return False
     if item.intent in WATCH_BUY_INTENTS:
         return True
+    if (
+        item.intent == "next_open_buy"
+        and _decision_agent_name(item) == SHORT_TERM_DECIDER_NAME
+        and _exec_monitoring_active(item)
+        and _short_term_tactical_action(item) in ACTIVE_SHORT_TERM_TACTICAL_ACTIONS
+    ):
+        return True
     return item.intent == "next_open_buy" and _item_has_buy_chase_or_trigger_fields(item)
 
 
@@ -852,12 +876,27 @@ def _plan_item_trigger_price(item: ExecutionPlanItemRequest) -> Decimal | None:
 
 def _plan_item_risk_context(item: ExecutionPlanItemRequest) -> dict[str, object] | None:
     risk_context = dict(item.risk_context) if isinstance(item.risk_context, dict) else item.risk_context
-    if not _is_watch_buy_request(item):
-        return risk_context
-
     normalized = dict(risk_context or {})
     extras = item.model_extra or {}
-    for key in (*BUY_RECOMMENDATION_FIELDS, *BUY_TRIGGER_FIELDS, *CHASE_BUY_FIELDS):
+    tactical_action = _short_term_tactical_action(item)
+    exec_monitoring_active = _exec_monitoring_active(item)
+    if tactical_action is not None:
+        normalized.setdefault("tactical_action", tactical_action)
+    if exec_monitoring_active is not None:
+        normalized.setdefault("exec_monitoring_active", exec_monitoring_active)
+    if (
+        _decision_agent_name(item) == SHORT_TERM_DECIDER_NAME
+        and tactical_action in INACTIVE_SHORT_TERM_TACTICAL_ACTIONS
+    ):
+        normalized.setdefault(
+            "short_term_blocker_reason",
+            f"tactical_action_{tactical_action}_is_not_active_buy_monitoring",
+        )
+
+    if not _is_watch_buy_request(item):
+        return normalized or None
+
+    for key in (*BUY_RECOMMENDATION_FIELDS, *BUY_TRIGGER_FIELDS, *CHASE_BUY_FIELDS, *BUY_TARGET_FIELDS, *BUY_STOP_FIELDS):
         value = extras.get(key)
         if value is not None and key not in normalized:
             normalized[key] = _json_scalar(value)
@@ -870,8 +909,39 @@ def _plan_item_risk_context(item: ExecutionPlanItemRequest) -> dict[str, object]
         "trigger_price": _decimal_text(trigger_price),
         "chase_limit_price": _decimal_text(chase_limit_price),
         "direction": _watch_buy_direction(item),
+        "tactical_action": tactical_action,
+        "exec_monitoring_active": exec_monitoring_active,
     }
     return normalized
+
+
+def _short_term_tactical_action(item: ExecutionPlanItemRequest) -> str | None:
+    value = _first_text_from_request(item, "tactical_action")
+    if value is None:
+        return None
+    return value.strip().lower()
+
+
+def _exec_monitoring_active(item: ExecutionPlanItemRequest) -> bool | None:
+    for source in (item.model_extra or {}, item.risk_context, item.quantity_policy):
+        if not isinstance(source, dict):
+            continue
+        value = source.get("exec_monitoring_active")
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str) and value.strip().lower() in {"true", "false"}:
+            return value.strip().lower() == "true"
+    return None
+
+
+def _first_text_from_request(item: ExecutionPlanItemRequest, key: str) -> str | None:
+    for source in (item.model_extra or {}, item.risk_context, item.quantity_policy):
+        if not isinstance(source, dict):
+            continue
+        value = source.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    return None
 
 
 def _watch_buy_trigger_price(item: ExecutionPlanItemRequest) -> Decimal | None:
