@@ -1976,6 +1976,114 @@ def test_short_term_watch_buy_items_are_monitored_without_open_scheduling() -> N
     engine.dispose()
 
 
+def test_core_active_short_term_handoff_becomes_runtime_buy_watch_with_segments() -> None:
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(),
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+        ),
+        broker_adapter=broker_adapter,
+    )
+    client = TestClient(app)
+
+    response = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-short-term-core-handoff-1",
+            "source": "kai-trading-core",
+            "market_date": "2024-01-03",
+            "items": [
+                {
+                    "symbol": "005930",
+                    "side": "buy",
+                    "intent": "next_open_buy",
+                    "quantity_policy": {"kind": "shares", "quantity": 2},
+                    "trigger_price": "71000.00",
+                    "chase_limit_price": "71200.00",
+                    "target_price": "72500.00",
+                    "stop_loss_price": "70000.00",
+                    "decision_agent_name": "short-term-decider",
+                    "source_plan_item_id": "core-watch-for-trigger-1",
+                    "risk_context": {
+                        "tactical_action": "watch_for_trigger",
+                        "exec_monitoring_active": True,
+                    },
+                },
+                {
+                    "symbol": "000660",
+                    "side": "buy",
+                    "intent": "next_open_buy",
+                    "quantity_policy": {"kind": "shares", "quantity": 1},
+                    "decision_agent_name": "short-term-decider",
+                    "source_plan_item_id": "core-avoid-chase-1",
+                    "risk_context": {
+                        "tactical_action": "avoid_chase",
+                        "exec_monitoring_active": False,
+                    },
+                },
+            ],
+        },
+    )
+
+    assert response.status_code == 201
+    items_by_source = {
+        item["source_plan_item_id"]: item
+        for item in client.get("/execution-plans").json()[0]["items"]
+    }
+    watch_item = items_by_source["core-watch-for-trigger-1"]
+    assert watch_item["status"] == "watch_monitoring_active"
+    assert watch_item["tactical_action"] == "watch_for_trigger"
+    assert watch_item["risk_context"]["watch_buy_monitoring"]["exec_monitoring_active"] is True
+    assert watch_item["risk_context"]["watch_buy_monitoring"]["tactical_action"] == "watch_for_trigger"
+
+    blocked_item = items_by_source["core-avoid-chase-1"]
+    assert blocked_item["status"] == "short_term_watch_blocked"
+    assert blocked_item["tactical_action"] == "avoid_chase"
+    assert blocked_item["blocker_reason"] == "tactical_action_avoid_chase_is_not_active_buy_monitoring"
+
+    waiting = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "below trigger",
+            "prices": [{"symbol": "005930", "price": "70900.00"}],
+        },
+    )
+    assert waiting.status_code == 200
+    waiting_item = waiting.json()["items"][0]
+    assert waiting_item["outcome"] == "waiting"
+    assert waiting_item["tactical_action"] == "watch_for_trigger"
+    assert waiting_item["target_price"] == "72500.0000"
+    assert waiting_item["stop_loss_price"] == "70000.0000"
+    assert waiting_item["current_price"] == "70900.0000"
+
+    runtime_status = client.get("/runtime/status").json()
+    segments = runtime_status["liveness"]["monitoring"]["segments"]
+    assert segments["short_term_buy_watch_monitoring"]["item_count"] == 1
+    assert segments["short_term_buy_watch_monitoring"]["symbols"] == ["005930"]
+    assert segments["blocked_short_term_candidates"]["item_count"] == 1
+    assert segments["blocked_short_term_candidates"]["symbols"] == ["000660"]
+    assert segments["blocked_short_term_candidates"]["items"][0]["tactical_action"] == "avoid_chase"
+
+    assert client.get("/execution-jobs").json() == []
+    assert broker_adapter.order_calls == []
+    engine.dispose()
+
+
 def _build_watch_buy_test_app(
     *,
     order_id: str = "kis-watch-buy-100",
@@ -2250,6 +2358,41 @@ def test_watch_buy_rejects_gap_above_chase_limit() -> None:
         assert item is not None
         assert item.status == "watch_buy_rejected"
         assert item.risk_context["last_monitoring_event"]["reason"] == "price_above_chase_limit"
+
+    engine.dispose()
+
+
+def test_watch_buy_rejects_missing_stop_without_submitting() -> None:
+    app, engine, client, broker_adapter = _build_watch_buy_test_app()
+    item_id = _create_watch_buy_candidate(
+        client,
+        plan_id="plan-watch-buy-missing-stop-1",
+        risk_context={"exchange": "KRX"},
+    )
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "missing stop should block risk sizing",
+            "prices": [{"symbol": "005930", "price": "71050.00"}],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["submitted_order_count"] == 0
+    assert payload["blocked_item_count"] == 1
+    assert payload["items"][0]["outcome"] == "rejected"
+    assert payload["items"][0]["message"] == "watch buy requires entry and stop prices for risk-based sizing"
+    assert broker_adapter.order_calls == []
+
+    with app.state.db_session_factory() as session:
+        item = session.get(ExecutionPlanItem, item_id)
+        assert item is not None
+        assert item.status == "watch_buy_rejected"
+        assert item.risk_context["last_monitoring_event"]["reason"] == "missing_stop_or_entry_price"
 
     engine.dispose()
 
@@ -5452,8 +5595,8 @@ def test_autonomous_monitoring_loop_reports_degraded_status_when_live_source_fai
             session.commit()
 
         wait_for(
-            lambda: client.get("/runtime/status").json()["liveness"]["autonomous"]["monitoring"]["last_cycle"]
-            is not None
+            lambda: client.get("/runtime/status").json()["liveness"]["autonomous"]["monitoring"]["price_source"]["status"]
+            == "degraded"
         )
 
         runtime_status = client.get("/runtime/status")
