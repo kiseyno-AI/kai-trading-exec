@@ -90,6 +90,22 @@ NON_MONITORABLE_PLAN_ITEM_STATUSES = frozenset(
         "watch_cancelled",
     }
 )
+RETRYABLE_PROTECTIVE_STOP_STATUSES = frozenset(
+    {
+        "broker_order_retry_pending",
+        "broker_order_rejected",
+        "retry_pending",
+        "rejected",
+    }
+)
+FALLBACK_PROTECTIVE_STOP_STATUSES = frozenset({"broker_order_retry_pending", "retry_pending"})
+SESSION_RETRYABLE_ERROR_CODES = frozenset({"KIOK0320", "APBK0918"})
+SESSION_RETRYABLE_MESSAGE_MARKERS = (
+    "장운영시간",
+    "정규시장 시간 주문불가",
+    "market is not open",
+    "not regular market",
+)
 SELL_PENDING_CONFIG_STATUSES = frozenset(
     {
         "target_sell_pending_config",
@@ -308,6 +324,11 @@ def _evaluate_monitoring_cycle(
         db=db,
         exclude_pending_config=allow_persisted_triggered_without_price,
     )
+    _reactivate_retryable_protective_stops(
+        items=items,
+        db=db,
+        triggered_at=triggered_at,
+    )
     monitored_symbols = {item.symbol for item in items}
     sell_monitored_symbols = {
         item.symbol
@@ -330,6 +351,12 @@ def _evaluate_monitoring_cycle(
         for symbol, position in positions_by_symbol.items()
         if position.quantity > 0
     }
+    _reserve_existing_exit_orders(
+        settings=settings,
+        db=db,
+        remaining_quantities_by_symbol=remaining_quantities_by_symbol,
+        triggered_at=triggered_at,
+    )
     primary_triggered_symbols = _primary_triggered_sell_symbols(
         items=items,
         prices=prices,
@@ -607,6 +634,7 @@ def _evaluate_monitoring_cycle(
                 observed_price=action.observed_price,
                 trigger_reason=action.trigger_reason,
                 trigger_metadata=action.trigger_metadata,
+                triggered_at=triggered_at,
             )
             if placement.status_code == 201:
                 if is_watch_buy:
@@ -966,7 +994,14 @@ def _append_held_stop_sell_fallbacks(
         .join(ExecutionPlanItem.plan)
         .where(
             ExecutionPlan.mode == settings.runtime_mode,
-            monitored_item_filter,
+            or_(
+                monitored_item_filter,
+                and_(
+                    ExecutionPlanItem.status.in_(tuple(FALLBACK_PROTECTIVE_STOP_STATUSES)),
+                    ExecutionPlanItem.side == "sell",
+                    ExecutionPlanItem.intent == "stop_sell",
+                ),
+            ),
             ExecutionPlanItem.side == "sell",
             ExecutionPlanItem.intent == "stop_sell",
             ExecutionPlanItem.symbol.in_(fallback_symbols),
@@ -995,6 +1030,10 @@ def _append_held_stop_sell_fallbacks(
             )
         ).all()
         if item.id not in selected_item_ids
+        and (
+            item.status not in RETRYABLE_PROTECTIVE_STOP_STATUSES
+            or _latest_order_failure_is_retryable_session_rejection(db=db, item=item)
+        )
     ]
     if not fallback_items:
         return selected_items
@@ -1007,6 +1046,73 @@ def _append_held_stop_sell_fallbacks(
             item.id,
         ),
     )
+
+
+def _reactivate_retryable_protective_stops(
+    *,
+    items: list[ExecutionPlanItem],
+    db: Session,
+    triggered_at: datetime,
+) -> None:
+    for item in items:
+        if (
+            item.side != "sell"
+            or item.intent != "stop_sell"
+            or item.status not in RETRYABLE_PROTECTIVE_STOP_STATUSES
+        ):
+            continue
+        if not _latest_order_failure_is_retryable_session_rejection(db=db, item=item):
+            continue
+        prior_status = item.status
+        item.status = _monitoring_status(item.intent)
+        _record_monitoring_event(
+            item=item,
+            event={
+                "event": "protective_stop_rearmed",
+                "reason": "retryable_session_rejection",
+                "prior_status": prior_status,
+                "recorded_at": triggered_at.isoformat(),
+            },
+        )
+
+
+def _latest_order_failure_is_retryable_session_rejection(
+    *,
+    db: Session,
+    item: ExecutionPlanItem,
+) -> bool:
+    order = db.scalar(
+        select(BrokerOrder)
+        .where(BrokerOrder.execution_plan_item_id == item.id)
+        .order_by(
+            BrokerOrder.updated_at.desc(),
+            BrokerOrder.created_at.desc(),
+            BrokerOrder.id.desc(),
+        )
+    )
+    if order is None:
+        return item.status in {"broker_order_retry_pending", "retry_pending"}
+    if order.status in {"submitted", "open", "partially_filled", "submission_pending"}:
+        return False
+    error_code = (order.last_error_code or "").strip().upper()
+    if error_code in SESSION_RETRYABLE_ERROR_CODES:
+        return True
+    classification = (order.last_error_classification or "").strip().lower()
+    if classification in {"retryable", "session", "market_session", "market_closed"}:
+        return True
+    message = (order.last_error_message or "").strip().lower()
+    if any(marker.lower() in message for marker in SESSION_RETRYABLE_MESSAGE_MARKERS):
+        return True
+    for payload in (order.response_metadata, order.raw_broker_payload):
+        if not isinstance(payload, dict):
+            continue
+        raw_code = str(payload.get("msg_cd") or payload.get("code") or "").strip().upper()
+        if raw_code in SESSION_RETRYABLE_ERROR_CODES:
+            return True
+        raw_message = str(payload.get("msg1") or payload.get("message") or "").strip().lower()
+        if any(marker.lower() in raw_message for marker in SESSION_RETRYABLE_MESSAGE_MARKERS):
+            return True
+    return bool(order.last_error_retryable and item.status in {"broker_order_retry_pending", "retry_pending"})
 
 
 def _monitored_item_filter():
@@ -1768,6 +1874,40 @@ def _reserve_remaining_quantity(
     remaining_quantities_by_symbol.pop(symbol, None)
 
 
+def _reserve_existing_exit_orders(
+    *,
+    settings: Settings,
+    db: Session,
+    remaining_quantities_by_symbol: dict[str, int],
+    triggered_at: datetime,
+) -> None:
+    if not remaining_quantities_by_symbol:
+        return
+    day_start = triggered_at.astimezone(KRX_TIMEZONE).replace(
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0,
+    ).astimezone(UTC)
+    orders = db.scalars(
+        select(BrokerOrder)
+        .where(
+            BrokerOrder.mode == settings.runtime_mode,
+            BrokerOrder.side == "sell",
+            BrokerOrder.symbol.in_(sorted(remaining_quantities_by_symbol)),
+            BrokerOrder.status.in_(("submitted", "open", "partially_filled", "filled")),
+            BrokerOrder.updated_at >= day_start,
+        )
+        .order_by(BrokerOrder.updated_at.asc(), BrokerOrder.id.asc())
+    ).all()
+    for order in orders:
+        _reserve_remaining_quantity(
+            remaining_quantities_by_symbol=remaining_quantities_by_symbol,
+            symbol=order.symbol,
+            quantity=order.quantity,
+        )
+
+
 def _serialized_order_quantity(order_payload: object) -> int | None:
     if not isinstance(order_payload, dict):
         return None
@@ -2015,6 +2155,7 @@ def _place_monitoring_order(
     observed_price: Decimal | None,
     trigger_reason: str | None,
     trigger_metadata: dict[str, object] | None,
+    triggered_at: datetime,
 ):
     is_watch_buy = _is_watch_buy_item(item)
     limit_price = (
@@ -2023,10 +2164,11 @@ def _place_monitoring_order(
         else item.limit_price
     )
     order_request = PlaceOrderRequest(
-        idempotency_key=(
-            f"monitoring:watch_buy:{item.id}"
-            if is_watch_buy
-            else f"monitoring:{item.intent}:{item.id}"
+        idempotency_key=_monitoring_order_idempotency_key(
+            item=item,
+            is_watch_buy=is_watch_buy,
+            triggered_at=triggered_at,
+            db=db,
         ),
         execution_plan_item_id=item.id,
         symbol=item.symbol,
@@ -2050,6 +2192,25 @@ def _place_monitoring_order(
         command=order_request,
         request_source=f"monitoring:{MONITORING_WORKER_NAME}",
     )
+
+
+def _monitoring_order_idempotency_key(
+    *,
+    item: ExecutionPlanItem,
+    is_watch_buy: bool,
+    triggered_at: datetime,
+    db: Session,
+) -> str:
+    if is_watch_buy:
+        return f"monitoring:watch_buy:{item.id}"
+    base = f"monitoring:{item.intent}:{item.id}"
+    if (
+        item.intent == "stop_sell"
+        and _latest_order_failure_is_retryable_session_rejection(db=db, item=item)
+    ):
+        retry_date = triggered_at.astimezone(KRX_TIMEZONE).date().isoformat()
+        return f"{base}:{retry_date}"
+    return base
 
 
 def _monitoring_order_metadata(

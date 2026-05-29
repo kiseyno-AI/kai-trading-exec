@@ -312,6 +312,39 @@ def test_runtime_status_reports_readiness_and_default_safety() -> None:
     engine.dispose()
 
 
+def test_runtime_status_falls_back_to_autonomous_snapshot_when_database_pool_is_unavailable(
+    monkeypatch,
+) -> None:
+    app, engine = build_test_app()
+    app.state.autonomous_runtime._monitoring_state.status = "running"
+    app.state.autonomous_runtime._monitoring_state.last_heartbeat_at = datetime(2026, 5, 29, 2, 20, tzinfo=UTC)
+    app.state.autonomous_runtime._monitoring_state.last_success_at = datetime(2026, 5, 29, 2, 20, tzinfo=UTC)
+    app.state.autonomous_runtime._monitoring_state.last_cycle = {
+        "dispatch_action_count": 0,
+        "backlog_item_count": 0,
+        "backlog_symbols": [],
+        "evaluated_symbol_count": 13,
+    }
+    monkeypatch.setattr(
+        runtime_service,
+        "ping_database",
+        lambda _db: (_ for _ in ()).throw(runtime_service.SQLAlchemyError("pool exhausted")),
+    )
+    client = TestClient(app)
+
+    response = client.get("/runtime/status")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["dependencies"]["database"] == "error"
+    monitoring = payload["liveness"]["monitoring"]
+    assert monitoring["source"] == "autonomous_runtime_snapshot"
+    assert monitoring["status"] == "running"
+    assert monitoring["last_cycle"]["evaluated_symbol_count"] == 13
+
+    engine.dispose()
+
+
 def test_create_app_injects_default_kis_monitoring_price_source_for_paper_runtime() -> None:
     app, engine = build_test_app(
         settings=Settings(
@@ -1242,6 +1275,130 @@ def test_autonomous_monitoring_falls_back_to_older_stop_when_latest_stop_rejecte
     engine.dispose()
 
 
+def test_autonomous_monitoring_rearms_retry_pending_stop_after_session_rejection() -> None:
+    app, engine = build_test_app(
+        Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+        )
+    )
+    client = TestClient(app)
+    broker_adapter = StubMonitoringBrokerAdapter()
+
+    resume = client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "test", "reason": "enable monitoring sell"},
+    )
+    assert resume.status_code == 200
+
+    older = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-033530-retry-pending-stop",
+            "source": "kai-trading-core",
+            "market_date": "2026-05-26",
+            "items": [
+                {
+                    "symbol": "033530",
+                    "side": "sell",
+                    "intent": "stop_sell",
+                    "trigger_price": "8060.00",
+                    "quantity_policy": {"kind": "position_exit_from_entry"},
+                    "risk_context": {"exchange": "KRX"},
+                }
+            ],
+        },
+    )
+    newer = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-033530-latest-target-dead-stop",
+            "source": "kai-trading-core",
+            "market_date": "2026-05-27",
+            "items": [
+                {
+                    "symbol": "033530",
+                    "side": "sell",
+                    "intent": "target_sell",
+                    "trigger_price": "9250.00",
+                    "quantity_policy": {"kind": "position_exit_from_entry"},
+                    "risk_context": {"exchange": "KRX"},
+                },
+                {
+                    "symbol": "033530",
+                    "side": "sell",
+                    "intent": "stop_sell",
+                    "trigger_price": "8700.00",
+                    "quantity_policy": {"kind": "position_exit_from_entry"},
+                    "risk_context": {"exchange": "KRX"},
+                },
+            ],
+        },
+    )
+    assert older.status_code == 201
+    assert newer.status_code == 201
+    older_stop_id = older.json()["persisted_execution_item_ids"][0]
+    newer_stop_id = newer.json()["persisted_execution_item_ids"][1]
+
+    with app.state.db_session_factory() as session:
+        older_stop = session.get(ExecutionPlanItem, older_stop_id)
+        newer_stop = session.get(ExecutionPlanItem, newer_stop_id)
+        assert older_stop is not None
+        assert newer_stop is not None
+        older_stop.status = "broker_order_retry_pending"
+        newer_stop.status = "broker_order_rejected"
+        session.add(
+            BrokerOrder(
+                execution_plan_item_id=older_stop_id,
+                mode="paper",
+                idempotency_key="session-retry-stop-033530",
+                symbol="033530",
+                side="sell",
+                status="retry_pending",
+                quantity=58,
+                last_error_code="KIOK0320",
+                last_error_message="장운영시간이 아닙니다",
+                last_error_retryable=True,
+            )
+        )
+        session.add(
+            ExecutionPosition(
+                mode="paper",
+                symbol="033530",
+                quantity=58,
+                average_price=Decimal("8500.00"),
+                updated_from="reconciliation",
+                last_reconciled_at=datetime.now(UTC),
+            )
+        )
+        session.commit()
+
+        result = run_autonomous_monitoring_cycle(
+            settings=app.state.settings,
+            db=session,
+            adapter=broker_adapter,
+            prices=[MonitoringPriceRequest(symbol="033530", price=Decimal("7550.00"))],
+            now=datetime(2026, 5, 28, 1, 5, tzinfo=UTC),
+        )
+
+        assert result.status_code == 200
+        assert result.payload["submitted_order_count"] == 1
+        assert broker_adapter.order_calls[0].symbol == "033530"
+        assert broker_adapter.order_calls[0].side == "sell"
+        assert broker_adapter.order_calls[0].quantity == 58
+        assert broker_adapter.order_calls[0].execution_plan_item_id == older_stop_id
+        rearmed_stop = session.get(ExecutionPlanItem, older_stop_id)
+        assert rearmed_stop is not None
+        assert rearmed_stop.status == "broker_order_submitted"
+        events = rearmed_stop.risk_context["monitoring_events"]
+        assert any(event["event"] == "protective_stop_rearmed" for event in events)
+
+    engine.dispose()
+
+
 def test_autonomous_monitoring_expires_known_flat_pending_sell_monitors() -> None:
     app, engine = build_test_app(
         Settings(
@@ -1707,6 +1864,118 @@ def test_order_execution_and_position_reads_are_filtered_to_active_runtime_mode(
     assert positions_payload[0]["symbol"] == "005930"
     assert positions_payload[0]["quantity"] == 2
     assert positions_payload[0]["average_price"] == "70950.0000"
+
+    engine.dispose()
+
+
+def test_execution_read_endpoints_apply_plan_and_symbol_filters() -> None:
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+        )
+    )
+
+    with app.state.db_session_factory() as session:
+        first_plan = ExecutionPlan(
+            external_plan_id="first-filter-plan",
+            source="kai-trading-core",
+            mode="paper",
+            status="accepted",
+        )
+        first_item = ExecutionPlanItem(
+            symbol="005930",
+            side="buy",
+            intent="next_open_buy",
+            status="pending",
+        )
+        first_plan.items.append(first_item)
+        second_plan = ExecutionPlan(
+            external_plan_id="second-filter-plan",
+            source="kai-trading-core",
+            mode="paper",
+            status="accepted",
+        )
+        second_item = ExecutionPlanItem(
+            symbol="000660",
+            side="buy",
+            intent="next_open_buy",
+            status="pending",
+        )
+        second_plan.items.append(second_item)
+        session.add_all([first_plan, second_plan])
+        session.flush()
+
+        first_order = BrokerOrder(
+            execution_plan_item_id=first_item.id,
+            mode="paper",
+            idempotency_key="first-filter-order",
+            broker_order_id="first-filter-order",
+            symbol="005930",
+            side="buy",
+            status="filled",
+            quantity=1,
+        )
+        second_order = BrokerOrder(
+            execution_plan_item_id=second_item.id,
+            mode="paper",
+            idempotency_key="second-filter-order",
+            broker_order_id="second-filter-order",
+            symbol="000660",
+            side="buy",
+            status="filled",
+            quantity=1,
+        )
+        session.add_all([first_order, second_order])
+        session.flush()
+        session.add_all(
+            [
+                ExecutionFill(
+                    broker_order_pk=first_order.id,
+                    broker_fill_id="first-filter-fill",
+                    symbol="005930",
+                    side="buy",
+                    quantity=1,
+                    price=Decimal("70000.0000"),
+                    filled_at=datetime(2026, 4, 29, 9, 3, tzinfo=UTC),
+                ),
+                ExecutionFill(
+                    broker_order_pk=second_order.id,
+                    broker_fill_id="second-filter-fill",
+                    symbol="000660",
+                    side="buy",
+                    quantity=1,
+                    price=Decimal("180000.0000"),
+                    filled_at=datetime(2026, 4, 29, 9, 4, tzinfo=UTC),
+                ),
+                ExecutionPosition(
+                    mode="paper",
+                    symbol="005930",
+                    quantity=1,
+                    average_price=Decimal("70000.0000"),
+                    updated_from="reconciliation",
+                ),
+                ExecutionPosition(
+                    mode="paper",
+                    symbol="000660",
+                    quantity=1,
+                    average_price=Decimal("180000.0000"),
+                    updated_from="reconciliation",
+                ),
+            ]
+        )
+        session.commit()
+
+    client = TestClient(app)
+
+    assert [plan["plan_id"] for plan in client.get("/execution-plans?external_plan_id=first-filter-plan").json()] == [
+        "first-filter-plan"
+    ]
+    assert [
+        fill["broker_fill_id"]
+        for fill in client.get("/executions?external_plan_id=first-filter-plan&symbols=005930,000660").json()
+    ] == ["first-filter-fill"]
+    assert [position["symbol"] for position in client.get("/positions?symbols=000660").json()] == ["000660"]
 
     engine.dispose()
 

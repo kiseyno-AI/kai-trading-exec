@@ -20,11 +20,20 @@ def ensure_database_parent_dir(database_url: str) -> None:
 def create_db_engine(settings: Settings) -> Engine:
     ensure_database_parent_dir(settings.database_url)
     url = make_url(settings.database_url)
-    kwargs: dict[str, object] = {"future": True, "pool_pre_ping": True}
+    kwargs: dict[str, object] = {
+        "future": True,
+        "pool_pre_ping": True,
+    }
     if url.drivername.startswith("sqlite"):
-        kwargs["connect_args"] = {"check_same_thread": False, "timeout": 30}
+        kwargs["connect_args"] = {"check_same_thread": False, "timeout": 5}
         if url.database == ":memory:":
             kwargs["poolclass"] = StaticPool
+        else:
+            kwargs["pool_timeout"] = 1
+            kwargs["pool_size"] = 20
+            kwargs["max_overflow"] = 40
+    else:
+        kwargs["pool_timeout"] = 1
     engine = create_engine(settings.database_url, **kwargs)
     if url.drivername.startswith("sqlite"):
         _configure_sqlite_engine(engine)
@@ -56,4 +65,3 @@ def create_session_factory(engine: Engine) -> sessionmaker[Session]:
 
 def ping_database(db: Session) -> None:
     db.execute(text("SELECT 1"))
-

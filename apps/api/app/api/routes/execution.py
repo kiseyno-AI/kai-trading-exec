@@ -41,11 +41,13 @@ router = APIRouter(tags=["execution"])
 def execution_plans(
     request: Request,
     db: Annotated[Session, Depends(get_db_session)],
+    external_plan_id: str | None = None,
 ) -> list[dict[str, object]]:
     settings: Settings = get_settings(request)
     return list_execution_plans(
         settings=settings,
         db=db,
+        external_plan_id=external_plan_id,
     )
 
 
@@ -212,18 +214,32 @@ def update_execution_failure(
 def executions(
     request: Request,
     db: Annotated[Session, Depends(get_db_session)],
+    external_plan_id: str | None = None,
+    symbols: str | None = None,
 ) -> list[dict[str, object]]:
     settings: Settings = get_settings(request)
-    return list_execution_fills(settings=settings, db=db)
+    return list_execution_fills(
+        settings=settings,
+        db=db,
+        external_plan_id=external_plan_id,
+        symbols=_parse_symbols_filter(symbols),
+    )
 
 
 @router.get("/positions")
 def positions(
     request: Request,
     db: Annotated[Session, Depends(get_db_session)],
+    symbols: str | None = None,
 ) -> list[dict[str, object]]:
     settings: Settings = get_settings(request)
-    return list_execution_positions(settings=settings, db=db)
+    symbol_filter = _parse_symbols_filter(symbols)
+    return list_execution_positions(
+        settings=settings,
+        db=db,
+        symbols=symbol_filter,
+        include_related_plan_items=symbol_filter is None,
+    )
 
 
 @router.get("/symbols")
@@ -250,3 +266,14 @@ def symbol_detail(
     if payload is None:
         raise HTTPException(status_code=404, detail="symbol was not found")
     return payload
+
+
+def _parse_symbols_filter(value: str | None) -> set[str] | None:
+    if not value:
+        return None
+    symbols = {
+        item.strip().upper()
+        for item in value.split(",")
+        if item.strip()
+    }
+    return symbols or None
