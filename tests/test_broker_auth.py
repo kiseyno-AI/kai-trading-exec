@@ -119,6 +119,7 @@ class StubBrokerAdapter:
         auth_error: Exception | None = None,
         approval_error: Exception | None = None,
         order_error: Exception | None = None,
+        account_snapshot_error: Exception | None = None,
         current_price_error: Exception | None = None,
         revoke_error: Exception | None = None,
     ) -> None:
@@ -134,6 +135,7 @@ class StubBrokerAdapter:
         self.auth_error = auth_error
         self.approval_error = approval_error
         self.order_error = order_error
+        self.account_snapshot_error = account_snapshot_error
         self.current_price_error = current_price_error
         self.revoke_error = revoke_error
         self.authenticate_calls = 0
@@ -201,6 +203,8 @@ class StubBrokerAdapter:
 
     def get_account_snapshot(self, access_token: str) -> BrokerAccountSnapshot:
         assert access_token
+        if self.account_snapshot_error is not None:
+            raise self.account_snapshot_error
         if self.account_snapshot is not None:
             return self.account_snapshot
         return BrokerAccountSnapshot(
@@ -2490,6 +2494,69 @@ def test_watch_buy_safety_pause_keeps_trigger_retryable() -> None:
             "actor": "ops",
             "source": "test",
             "reason": "resumed runtime should retry watch buy",
+            "prices": [{"symbol": "005930", "price": "71050.00"}],
+        },
+    )
+
+    assert retry.status_code == 200
+    retry_payload = retry.json()
+    assert retry_payload["triggered_item_count"] == 1
+    assert retry_payload["submitted_order_count"] == 1
+    assert retry_payload["items"][0]["outcome"] == "submitted"
+    assert retry_payload["items"][0]["status"] == "watch_buy_submitted"
+    assert len(broker_adapter.order_calls) == 1
+
+    engine.dispose()
+
+
+def test_watch_buy_account_snapshot_failure_keeps_trigger_retryable() -> None:
+    app, engine, client, broker_adapter = _build_watch_buy_test_app()
+    broker_adapter.account_snapshot_error = BrokerAdapterError("account lookup timeout")
+    item_id = _create_watch_buy_candidate(
+        client,
+        plan_id="plan-watch-buy-account-snapshot-retry-1",
+    )
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "account snapshot failure should not terminally reject watch buy",
+            "prices": [{"symbol": "005930", "price": "71050.00"}],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["triggered_item_count"] == 1
+    assert payload["submitted_order_count"] == 0
+    assert payload["blocked_item_count"] == 1
+    assert payload["items"][0]["outcome"] == "blocked"
+    assert payload["items"][0]["block_reason"] == "account_snapshot_unavailable"
+    assert payload["items"][0]["status"] == "watch_buy_triggered_blocked"
+    assert broker_adapter.order_calls == []
+
+    with app.state.db_session_factory() as session:
+        item = session.get(ExecutionPlanItem, item_id)
+        assert item is not None
+        assert item.status == "watch_buy_triggered_blocked"
+        assert (
+            item.risk_context["last_monitoring_event"]["event"]
+            == "watch_buy_triggered_blocked"
+        )
+        assert (
+            item.risk_context["last_monitoring_event"]["reason"]
+            == "account_snapshot_unavailable"
+        )
+
+    broker_adapter.account_snapshot_error = None
+    retry = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "account snapshot recovered should submit retryable watch buy",
             "prices": [{"symbol": "005930", "price": "71050.00"}],
         },
     )

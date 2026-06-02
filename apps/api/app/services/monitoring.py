@@ -60,6 +60,11 @@ BLOCKED_MONITORING_STATUSES = frozenset(
         "watch_cancelled",
     }
 )
+RETRYABLE_WATCH_BUY_APPROVAL_REASONS = frozenset(
+    {
+        "account_snapshot_unavailable",
+    }
+)
 PENDING_DISPATCH_MONITORING_STATUSES = frozenset(
     {
         "target_sell_triggered_pending_dispatch",
@@ -548,7 +553,9 @@ def _evaluate_monitoring_cycle(
             quantity = approval.quantity
             if quantity is None:
                 blocked_item_count += 1
-                if approval.reason in {"paused", "kill_switch"}:
+                if approval.reason in (
+                    {"paused", "kill_switch"} | RETRYABLE_WATCH_BUY_APPROVAL_REASONS
+                ):
                     action.item.status = "watch_buy_triggered_blocked"
                     _record_monitoring_event(
                         item=action.item,
