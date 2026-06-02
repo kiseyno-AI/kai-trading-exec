@@ -60,6 +60,11 @@ BLOCKED_MONITORING_STATUSES = frozenset(
         "watch_cancelled",
     }
 )
+RETRYABLE_WATCH_BUY_APPROVAL_REASONS = frozenset(
+    {
+        "account_snapshot_unavailable",
+    }
+)
 PENDING_DISPATCH_MONITORING_STATUSES = frozenset(
     {
         "target_sell_triggered_pending_dispatch",
@@ -409,6 +414,24 @@ def _evaluate_monitoring_cycle(
             )
             continue
 
+        retry_blocked_until = _watch_buy_retry_blocked_until(
+            settings=settings,
+            item=item,
+        )
+        if retry_blocked_until is not None and triggered_at < retry_blocked_until:
+            blocked_item_count += 1
+            result_by_item_id[item.id] = _monitoring_result_payload(
+                item=item,
+                observed_price=observed_price,
+                outcome="blocked",
+                block_reason="retry_cooldown",
+                message=(
+                    "watch buy retry cooldown is active after "
+                    "account_snapshot_unavailable"
+                ),
+            )
+            continue
+
         if _is_watch_buy_item(item) and not retry_persisted_trigger:
             quote_stale_reason = _quote_stale_reason(
                 settings=settings,
@@ -548,17 +571,27 @@ def _evaluate_monitoring_cycle(
             quantity = approval.quantity
             if quantity is None:
                 blocked_item_count += 1
-                if approval.reason in {"paused", "kill_switch"}:
+                if approval.reason in (
+                    {"paused", "kill_switch"} | RETRYABLE_WATCH_BUY_APPROVAL_REASONS
+                ):
                     action.item.status = "watch_buy_triggered_blocked"
+                    event: dict[str, object] = {
+                        "event": "watch_buy_triggered_blocked",
+                        "reason": approval.reason,
+                        "message": approval.message,
+                        "observed_price": _serialize_decimal(action.observed_price),
+                        "recorded_at": triggered_at.isoformat(),
+                    }
+                    if approval.reason in RETRYABLE_WATCH_BUY_APPROVAL_REASONS:
+                        event["retry_after_at"] = (
+                            triggered_at
+                            + timedelta(
+                                seconds=settings.monitoring_watch_buy_retry_cooldown_seconds
+                            )
+                        ).isoformat()
                     _record_monitoring_event(
                         item=action.item,
-                        event={
-                            "event": "watch_buy_triggered_blocked",
-                            "reason": approval.reason,
-                            "message": approval.message,
-                            "observed_price": _serialize_decimal(action.observed_price),
-                            "recorded_at": triggered_at.isoformat(),
-                        },
+                        event=event,
                     )
                     result_by_item_id[action.item.id] = _monitoring_result_payload(
                         item=action.item,
@@ -1074,6 +1107,47 @@ def _reactivate_retryable_protective_stops(
                 "recorded_at": triggered_at.isoformat(),
             },
         )
+
+
+def _watch_buy_retry_blocked_until(
+    *,
+    settings: Settings,
+    item: ExecutionPlanItem,
+) -> datetime | None:
+    if item.status != "watch_buy_triggered_blocked":
+        return None
+    event = _latest_monitoring_event(item)
+    if event is None:
+        return None
+    reason = str(event.get("reason") or "")
+    if reason not in RETRYABLE_WATCH_BUY_APPROVAL_REASONS:
+        return None
+    recorded_at = _parse_event_datetime(event.get("recorded_at"))
+    if recorded_at is None:
+        return None
+    return recorded_at + timedelta(
+        seconds=settings.monitoring_watch_buy_retry_cooldown_seconds
+    )
+
+
+def _latest_monitoring_event(item: ExecutionPlanItem) -> dict[str, object] | None:
+    risk_context = item.risk_context
+    if not isinstance(risk_context, dict):
+        return None
+    event = risk_context.get("last_monitoring_event")
+    return event if isinstance(event, dict) else None
+
+
+def _parse_event_datetime(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
 
 
 def _latest_order_failure_is_retryable_session_rejection(
