@@ -133,7 +133,13 @@ class StubMonitoringBrokerAdapter:
     def reconnect_handle(self) -> BrokerReconnectHandle:
         return BrokerReconnectHandle(supported=True, strategy="stub")
 
-    def reconcile_order(self, access_token: str, broker_order_id: str) -> dict[str, object] | None:
+    def reconcile_order(
+        self,
+        access_token: str,
+        broker_order_id: str,
+        *,
+        exchange: str = "KRX",
+    ) -> dict[str, object] | None:
         assert access_token
         assert broker_order_id
         return None

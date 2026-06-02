@@ -260,7 +260,13 @@ class BrokerAdapter(Protocol):
 
     def reconnect_handle(self) -> BrokerReconnectHandle: ...
 
-    def reconcile_order(self, access_token: str, broker_order_id: str) -> dict[str, Any] | None: ...
+    def reconcile_order(
+        self,
+        access_token: str,
+        broker_order_id: str,
+        *,
+        exchange: str = "KRX",
+    ) -> dict[str, Any] | None: ...
 
     def build_headers(
         self,

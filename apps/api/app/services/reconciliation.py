@@ -75,7 +75,11 @@ def reconcile_broker_order(
             source="reconciliation",
             reason="refresh broker order state before reconciliation",
         )
-        payload = adapter.reconcile_order(session_state.access_token or "", order.broker_order_id)
+        payload = adapter.reconcile_order(
+            session_state.access_token or "",
+            order.broker_order_id,
+            exchange=_order_reconciliation_exchange(order),
+        )
         if not isinstance(payload, dict):
             raise ValueError("reconcile_order adapter returned non-dictionary payload")
     except (BrokerAdapterError, Exception) as exc:  # broad except to keep reconcile cycle durable
@@ -645,6 +649,53 @@ def _safe_payload(payload: object) -> dict[str, Any] | None:
     return None
 
 
+def _order_reconciliation_exchange(order: BrokerOrder) -> str:
+    for payload in (order.request_metadata, order.response_metadata, order.raw_broker_payload):
+        exchange = _exchange_from_payload(payload)
+        if exchange is not None:
+            return exchange
+    if order.plan_item is not None:
+        exchange = _exchange_from_payload(order.plan_item.risk_context)
+        if exchange is not None:
+            return exchange
+    return "KRX"
+
+
+def _exchange_from_payload(payload: object) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+
+    route = payload.get("route")
+    if isinstance(route, dict):
+        exchange = _normalized_exchange(route.get("exchange"))
+        if exchange is not None:
+            return exchange
+
+    params = payload.get("params")
+    if isinstance(params, dict):
+        exchange = _normalized_exchange(params.get("EXCG_ID_DVSN_CD"))
+        if exchange is not None:
+            return exchange
+
+    exchange = _normalized_exchange(payload.get("exchange"))
+    if exchange is not None:
+        return exchange
+
+    metadata = payload.get("metadata")
+    if isinstance(metadata, dict):
+        return _exchange_from_payload(metadata)
+    return None
+
+
+def _normalized_exchange(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().upper()
+    if normalized in {"KRX", "NXT", "SOR"}:
+        return normalized
+    return None
+
+
 def _dict_or_none(value: object) -> dict[str, Any] | None:
     if isinstance(value, dict):
         return _json_safe_dict(value)
@@ -833,13 +884,30 @@ def _apply_order_metadata(
     if raw_payload is None:
         raw_payload = response_payload
     if request_metadata is not None:
-        order.request_metadata = request_metadata
+        order.request_metadata = _merge_reconcile_request_metadata(
+            existing=order.request_metadata,
+            incoming=request_metadata,
+        )
     if response_metadata is not None:
         order.response_metadata = response_metadata
     if raw_payload is not None:
         order.raw_broker_payload = raw_payload
     elif response_payload is not None:
         order.raw_broker_payload = response_payload
+
+
+def _merge_reconcile_request_metadata(
+    *,
+    existing: object,
+    incoming: dict[str, Any],
+) -> dict[str, Any]:
+    merged = dict(incoming)
+    if not isinstance(existing, dict):
+        return merged
+    for key in ("source", "metadata", "route", "time_in_force"):
+        if key in existing and key not in merged:
+            merged[key] = _json_safe_value(existing[key])
+    return merged
 
 
 def _order_status_to_plan_item_status(order_status: str) -> str | None:
