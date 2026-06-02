@@ -112,9 +112,45 @@ Monitoring runtime settings currently supported:
 - `KAI_EXEC_MONITORING_LOOP_INTERVAL_SECONDS`
 - `KAI_EXEC_MONITORING_MAX_SYMBOLS_PER_CYCLE`
 - `KAI_EXEC_MONITORING_MAX_BROKER_ACTIONS_PER_CYCLE`
+- `KAI_EXEC_MONITORING_WATCH_BUY_RETRY_COOLDOWN_SECONDS`
 - `KAI_EXEC_PROFIT_PROTECTION_MIN_PEAK_PCT`
 - `KAI_EXEC_PROFIT_PROTECTION_GIVEBACK_PCT`
 - `KAI_EXEC_PROFIT_PROTECTION_AGED_SESSION_MIN`
+
+Domestic order-session routing settings currently supported:
+- `KAI_EXEC_DOMESTIC_ORDER_SESSION_ROUTING_ENABLED`
+- `KAI_EXEC_ALLOW_KRX_PRE_OPEN_OFFHOURS_ORDERS`
+- `KAI_EXEC_ALLOW_KRX_AFTER_HOURS_CLOSING_ORDERS`
+- `KAI_EXEC_ALLOW_KRX_AFTER_HOURS_SINGLE_PRICE_ORDERS`
+- `KAI_EXEC_ALLOW_NXT_PRE_ORDERS`
+- `KAI_EXEC_ALLOW_NXT_MAIN_ORDERS`
+- `KAI_EXEC_ALLOW_NXT_AFTER_ORDERS`
+- `KAI_EXEC_NXT_ORDER_ROUTE_PREFERENCE`
+- `KAI_EXEC_ALLOW_AFTER_HOURS_BUY_ORDERS`
+- `KAI_EXEC_ALLOW_AFTER_HOURS_SELL_ORDERS`
+- `KAI_EXEC_NXT_ELIGIBLE_SYMBOLS`
+
+To allow live monitoring orders through the Korean after-hours sessions, enable
+domestic order-session routing and the relevant after-hours policies in the
+runtime environment before starting the API:
+
+```bash
+export KAI_EXEC_DOMESTIC_ORDER_SESSION_ROUTING_ENABLED=true
+export KAI_EXEC_ALLOW_KRX_AFTER_HOURS_CLOSING_ORDERS=true
+export KAI_EXEC_ALLOW_KRX_AFTER_HOURS_SINGLE_PRICE_ORDERS=true
+export KAI_EXEC_ALLOW_NXT_AFTER_ORDERS=true
+export KAI_EXEC_ALLOW_AFTER_HOURS_BUY_ORDERS=true
+export KAI_EXEC_ALLOW_AFTER_HOURS_SELL_ORDERS=true
+export KAI_EXEC_NXT_ELIGIBLE_SYMBOLS=005930,034730
+```
+
+The `16:00-18:00` KST single-price session can route through KRX when
+`KAI_EXEC_ALLOW_KRX_AFTER_HOURS_SINGLE_PRICE_ORDERS=true`. The `18:00-20:00`
+KST session routes through NXT for eligible symbols, so the active monitoring
+symbols that may trade in that window must be present in
+`KAI_EXEC_NXT_ELIGIBLE_SYMBOLS` or carried as `nxt_eligible` plan metadata.
+After changing these settings, restart the exec API process and verify
+`/runtime/status` before relying on automated order submission.
 
 Short-term exec risk settings currently supported:
 - `KAI_EXEC_EXEC_AGENT_BASE_RISK_PCT`
