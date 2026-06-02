@@ -220,7 +220,13 @@ class StubBrokerAdapter:
             strategy="shared_realtime_subscription",
         )
 
-    def reconcile_order(self, access_token: str, broker_order_id: str) -> dict[str, object]:
+    def reconcile_order(
+        self,
+        access_token: str,
+        broker_order_id: str,
+        *,
+        exchange: str = "KRX",
+    ) -> dict[str, object]:
         return {
             "provider": self.provider,
             "access_token_present": bool(access_token),

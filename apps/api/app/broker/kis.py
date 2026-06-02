@@ -531,6 +531,8 @@ class KisBrokerAdapter(BrokerAdapter):
         self,
         access_token: str,
         broker_order_id: str,
+        *,
+        exchange: str = "KRX",
     ) -> dict[str, Any] | None:
         config = self._configured()
         observed_at = datetime.now(UTC)
@@ -539,6 +541,7 @@ class KisBrokerAdapter(BrokerAdapter):
             self.settings,
             broker_order_id,
             observed_at,
+            exchange=exchange,
         )
         request_metadata = {
             "provider": self.provider,
@@ -665,8 +668,11 @@ def _reconcile_order_params(
     settings: Settings,
     broker_order_id: str,
     observed_at: datetime,
+    *,
+    exchange: str = "KRX",
 ) -> dict[str, object]:
     inquiry_date = observed_at.astimezone(KIS_TIMEZONE).strftime("%Y%m%d")
+    normalized_exchange = exchange.strip().upper() or "KRX"
     return {
         "CANO": settings.kis_account_number or "",
         "ACNT_PRDT_CD": settings.kis_account_product_code,
@@ -682,7 +688,7 @@ def _reconcile_order_params(
         "INQR_DVSN_1": "",
         "CTX_AREA_FK100": "",
         "CTX_AREA_NK100": "",
-        "EXCG_ID_DVSN_CD": "KRX",
+        "EXCG_ID_DVSN_CD": normalized_exchange,
     }
 
 

@@ -61,7 +61,7 @@ class ReconciliationStubBroker:
             request_payload={},
             response_payload={"rt_cd": "0"},
         )
-        self.reconcile_calls: list[str] = []
+        self.reconcile_calls: list[tuple[str, str]] = []
         self.order_calls: list[BrokerOrderPlacementRequest] = []
         self.authenticate_calls = 0
 
@@ -100,9 +100,15 @@ class ReconciliationStubBroker:
     def reconnect_handle(self) -> BrokerReconnectHandle:
         return BrokerReconnectHandle(supported=True, strategy="shared_realtime_subscription")
 
-    def reconcile_order(self, access_token: str, broker_order_id: str) -> dict[str, object]:
+    def reconcile_order(
+        self,
+        access_token: str,
+        broker_order_id: str,
+        *,
+        exchange: str = "KRX",
+    ) -> dict[str, object]:
         assert access_token
-        self.reconcile_calls.append(broker_order_id)
+        self.reconcile_calls.append((broker_order_id, exchange))
         if not self.reconcile_payloads:
             return {"broker_order_id": broker_order_id, "status": "open", "observed_at": OBSERVED_AT.isoformat()}
         return self.reconcile_payloads[min(len(self.reconcile_calls) - 1, len(self.reconcile_payloads) - 1)]
@@ -117,7 +123,12 @@ def _session(settings: Settings):
     return engine, create_session_factory(engine)()
 
 
-def _order(*, status: str = "submitted", broker_order_id: str = "0033196600") -> BrokerOrder:
+def _order(
+    *,
+    status: str = "submitted",
+    broker_order_id: str = "0033196600",
+    request_metadata: dict[str, object] | None = None,
+) -> BrokerOrder:
     return BrokerOrder(
         broker_name="kis",
         mode="paper",
@@ -128,6 +139,7 @@ def _order(*, status: str = "submitted", broker_order_id: str = "0033196600") ->
         status=status,
         quantity=2,
         submitted_at=OBSERVED_AT,
+        request_metadata=request_metadata,
     )
 
 
@@ -480,6 +492,80 @@ def test_kis_reconcile_order_uses_daily_ccld_endpoint_and_mode_tr_id(
     assert http_client.calls[0]["params"]["ODNO"] == "0033196600"
 
 
+def test_kis_reconcile_order_uses_requested_exchange() -> None:
+    settings = Settings(
+        runtime_mode="live",
+        kis_app_key="***",
+        kis_app_secret="***",
+        kis_account_number="12345678",
+        kis_account_product_code="01",
+    )
+    http_client = KisReconcileHttpClient(
+        {
+            "rt_cd": "0",
+            "msg_cd": "MCA00000",
+            "output1": [
+                {
+                    "odno": "0042705600",
+                    "pdno": "034730",
+                    "sll_buy_dvsn_cd": "02",
+                    "ord_qty": "1",
+                    "tot_ccld_qty": "1",
+                    "rmn_qty": "0",
+                    "avg_pric": "668000",
+                    "ord_dt": "20260602",
+                    "ord_tmd": "161400",
+                    "ord_st_dvsn_cd_name": "체결",
+                }
+            ],
+        }
+    )
+    adapter = KisBrokerAdapter(settings=settings, http_client=http_client)
+
+    payload = adapter.reconcile_order(
+        "top-secret-token",
+        "0042705600",
+        exchange="NXT",
+    )
+
+    assert payload is not None
+    assert payload["status"] == "filled"
+    assert http_client.calls[0]["params"]["EXCG_ID_DVSN_CD"] == "NXT"
+
+
+def test_reconcile_order_uses_route_exchange_from_order_metadata() -> None:
+    settings = Settings(database_url="sqlite:///:memory:", runtime_mode="paper")
+    engine, db = _session(settings)
+    order = _order(
+        broker_order_id="nxt-1",
+        request_metadata={"route": {"exchange": "NXT", "session": "nxt_after"}},
+    )
+    db.add(order)
+    db.commit()
+
+    broker = ReconciliationStubBroker(
+        reconcile_payloads=[
+            {
+                "broker_order_id": "nxt-1",
+                "status": "open",
+                "observed_at": OBSERVED_AT.isoformat(),
+                "request_metadata": {
+                    "provider": "kis",
+                    "params": {"EXCG_ID_DVSN_CD": "NXT"},
+                },
+            }
+        ]
+    )
+
+    result = reconcile_broker_order(settings=settings, db=db, adapter=broker, order=order)
+
+    assert result["status"] == "open"
+    assert broker.reconcile_calls == [("nxt-1", "NXT")]
+    assert order.request_metadata["route"]["exchange"] == "NXT"
+    assert order.request_metadata["params"]["EXCG_ID_DVSN_CD"] == "NXT"
+    engine.dispose()
+
+
 def test_reconcile_repeated_identical_broker_failures_are_deduped() -> None:
     settings = Settings(database_url="sqlite:///:memory:", runtime_mode="paper")
     engine, db = _session(settings)
@@ -488,7 +574,13 @@ def test_reconcile_repeated_identical_broker_failures_are_deduped() -> None:
     db.commit()
 
     class FailingBroker(ReconciliationStubBroker):
-        def reconcile_order(self, access_token: str, broker_order_id: str) -> dict[str, object]:
+        def reconcile_order(
+            self,
+            access_token: str,
+            broker_order_id: str,
+            *,
+            exchange: str = "KRX",
+        ) -> dict[str, object]:
             assert access_token
             raise BrokerAdapterError(
                 "KIS request failed",
@@ -530,7 +622,13 @@ def test_reconcile_repeated_generic_failures_are_deduped_with_unknown_classifica
     db.commit()
 
     class BuggyBroker(ReconciliationStubBroker):
-        def reconcile_order(self, access_token: str, broker_order_id: str) -> dict[str, object]:  # type: ignore[override]
+        def reconcile_order(
+            self,
+            access_token: str,
+            broker_order_id: str,
+            *,
+            exchange: str = "KRX",
+        ) -> dict[str, object]:  # type: ignore[override]
             assert access_token
             return "not-a-dict"  # type: ignore[return-value]
 
