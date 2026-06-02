@@ -5,6 +5,7 @@ import time
 from fastapi.testclient import TestClient
 import pytest
 from sqlalchemy import select
+from sqlalchemy.orm.attributes import flag_modified
 
 from app.broker.base import (
     BrokerAccountHolding,
@@ -2093,6 +2094,7 @@ def _build_watch_buy_test_app(
     order_id: str = "kis-watch-buy-100",
     resume: bool = True,
     max_quote_age_seconds: int = 30,
+    retry_cooldown_seconds: int = 5,
 ):
     broker_adapter = StubBrokerAdapter(
         config=BrokerConfig(
@@ -2112,6 +2114,7 @@ def _build_watch_buy_test_app(
             kis_app_secret="paper-secret",
             kis_account_number="12345678",
             monitoring_max_quote_age_seconds=max_quote_age_seconds,
+            monitoring_watch_buy_retry_cooldown_seconds=retry_cooldown_seconds,
             exec_agent_max_position_allocation_pct=Decimal("0.20"),
         ),
         broker_adapter=broker_adapter,
@@ -2510,7 +2513,9 @@ def test_watch_buy_safety_pause_keeps_trigger_retryable() -> None:
 
 
 def test_watch_buy_account_snapshot_failure_keeps_trigger_retryable() -> None:
-    app, engine, client, broker_adapter = _build_watch_buy_test_app()
+    app, engine, client, broker_adapter = _build_watch_buy_test_app(
+        retry_cooldown_seconds=5
+    )
     broker_adapter.account_snapshot_error = BrokerAdapterError("account lookup timeout")
     item_id = _create_watch_buy_candidate(
         client,
@@ -2551,7 +2556,39 @@ def test_watch_buy_account_snapshot_failure_keeps_trigger_retryable() -> None:
         )
 
     broker_adapter.account_snapshot_error = None
-    retry = client.post(
+    immediate_retry = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "immediate retry should respect cooldown",
+            "prices": [{"symbol": "005930", "price": "71050.00"}],
+        },
+    )
+
+    assert immediate_retry.status_code == 200
+    immediate_payload = immediate_retry.json()
+    assert immediate_payload["submitted_order_count"] == 0
+    assert immediate_payload["blocked_item_count"] == 1
+    assert immediate_payload["items"][0]["outcome"] == "blocked"
+    assert immediate_payload["items"][0]["block_reason"] == "retry_cooldown"
+    assert broker_adapter.order_calls == []
+
+    with app.state.db_session_factory() as session:
+        item = session.get(ExecutionPlanItem, item_id)
+        assert item is not None
+        event = item.risk_context["last_monitoring_event"]
+        item.risk_context = {
+            **item.risk_context,
+            "last_monitoring_event": {
+                **event,
+                "recorded_at": (datetime.now(UTC) - timedelta(seconds=10)).isoformat(),
+            },
+        }
+        flag_modified(item, "risk_context")
+        session.commit()
+
+    cooldown_elapsed_retry = client.post(
         "/monitoring/evaluate",
         json={
             "actor": "ops",
@@ -2561,8 +2598,8 @@ def test_watch_buy_account_snapshot_failure_keeps_trigger_retryable() -> None:
         },
     )
 
-    assert retry.status_code == 200
-    retry_payload = retry.json()
+    assert cooldown_elapsed_retry.status_code == 200
+    retry_payload = cooldown_elapsed_retry.json()
     assert retry_payload["triggered_item_count"] == 1
     assert retry_payload["submitted_order_count"] == 1
     assert retry_payload["items"][0]["outcome"] == "submitted"

@@ -27,6 +27,7 @@ class Settings(BaseModel):
     monitoring_max_symbols_per_cycle: int = Field(default=128, ge=1, le=10000)
     monitoring_max_broker_actions_per_cycle: int = Field(default=32, ge=1, le=10000)
     monitoring_max_quote_age_seconds: int = Field(default=30, ge=1, le=3600)
+    monitoring_watch_buy_retry_cooldown_seconds: int = Field(default=5, ge=1, le=3600)
     profit_protection_min_peak_pct: Decimal = Field(default=Decimal("2.0"), gt=0, le=Decimal("100"))
     profit_protection_giveback_pct: Decimal = Field(default=Decimal("1.2"), gt=0, le=Decimal("100"))
     profit_protection_aged_session_min: int = Field(default=2, ge=1, le=20)
@@ -113,6 +114,7 @@ _ENV_FIELDS = {
     "MONITORING_MAX_SYMBOLS_PER_CYCLE": "monitoring_max_symbols_per_cycle",
     "MONITORING_MAX_BROKER_ACTIONS_PER_CYCLE": "monitoring_max_broker_actions_per_cycle",
     "MONITORING_MAX_QUOTE_AGE_SECONDS": "monitoring_max_quote_age_seconds",
+    "MONITORING_WATCH_BUY_RETRY_COOLDOWN_SECONDS": "monitoring_watch_buy_retry_cooldown_seconds",
     "PROFIT_PROTECTION_MIN_PEAK_PCT": "profit_protection_min_peak_pct",
     "PROFIT_PROTECTION_GIVEBACK_PCT": "profit_protection_giveback_pct",
     "PROFIT_PROTECTION_AGED_SESSION_MIN": "profit_protection_aged_session_min",
