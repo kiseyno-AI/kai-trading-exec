@@ -90,6 +90,10 @@ class Settings(BaseModel):
     allow_after_hours_buy_orders: bool = False
     allow_after_hours_sell_orders: bool = True
     nxt_eligible_symbols: str = ""
+    nxt_eligible_sync_enabled: bool = True
+    nxt_eligible_source_url: str = "https://www.nextrade.co.kr/brdinfoTime/brdinfoTimeList.do?pageIndex=1&pageUnit=1000"
+    nxt_eligible_source_timeout_seconds: int = Field(default=5, ge=1, le=60)
+    nxt_eligible_source_ttl_seconds: int = Field(default=3600, ge=60, le=86400)
 
     @field_validator("log_level")
     @classmethod
@@ -180,6 +184,10 @@ _ENV_FIELDS = {
     "ALLOW_AFTER_HOURS_BUY_ORDERS": "allow_after_hours_buy_orders",
     "ALLOW_AFTER_HOURS_SELL_ORDERS": "allow_after_hours_sell_orders",
     "NXT_ELIGIBLE_SYMBOLS": "nxt_eligible_symbols",
+    "NXT_ELIGIBLE_SYNC_ENABLED": "nxt_eligible_sync_enabled",
+    "NXT_ELIGIBLE_SOURCE_URL": "nxt_eligible_source_url",
+    "NXT_ELIGIBLE_SOURCE_TIMEOUT_SECONDS": "nxt_eligible_source_timeout_seconds",
+    "NXT_ELIGIBLE_SOURCE_TTL_SECONDS": "nxt_eligible_source_ttl_seconds",
 }
 
 

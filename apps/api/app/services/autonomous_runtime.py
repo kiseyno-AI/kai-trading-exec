@@ -19,6 +19,7 @@ from app.services.monitoring import (
     list_autonomous_monitoring_symbols,
     run_autonomous_monitoring_cycle,
 )
+from app.services.nxt_eligibility import refresh_nxt_eligible_symbols
 from app.services.watch_exec_agent_sizing import run_due_watch_exec_agent_sizing
 
 LOGGER = logging.getLogger(__name__)
@@ -26,6 +27,7 @@ LOGGER = logging.getLogger(__name__)
 DISPATCH_LOOP_WORKER_NAME = "execution_job_dispatch_loop"
 MONITORING_LOOP_WORKER_NAME = "monitoring_dispatch_loop"
 WATCH_EXEC_AGENT_SIZING_WORKER_NAME = "watch_exec_agent_sizing_loop"
+NXT_ELIGIBLE_SYNC_WORKER_NAME = "nxt_eligible_sync_loop"
 
 
 @dataclass
@@ -95,10 +97,12 @@ class AutonomousRuntimeCoordinator:
     _dispatch_task: asyncio.Task[None] | None = field(default=None, init=False)
     _monitoring_task: asyncio.Task[None] | None = field(default=None, init=False)
     _watch_exec_agent_sizing_task: asyncio.Task[None] | None = field(default=None, init=False)
+    _nxt_eligible_sync_task: asyncio.Task[None] | None = field(default=None, init=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False)
     _dispatch_state: AutonomousWorkerState = field(init=False)
     _monitoring_state: AutonomousWorkerState = field(init=False)
     _watch_exec_agent_sizing_state: AutonomousWorkerState = field(init=False)
+    _nxt_eligible_sync_state: AutonomousWorkerState = field(init=False)
     _monitoring_price_source_state: MonitoringPriceSourceState = field(init=False)
 
     def __post_init__(self) -> None:
@@ -116,6 +120,15 @@ class AutonomousRuntimeCoordinator:
             worker_name=WATCH_EXEC_AGENT_SIZING_WORKER_NAME,
             poll_interval_seconds=self.settings.exec_agent_watch_sizing_loop_interval_seconds,
             status="disabled" if not self.settings.autonomous_runtime_enabled else "idle",
+        )
+        self._nxt_eligible_sync_state = AutonomousWorkerState(
+            worker_name=NXT_ELIGIBLE_SYNC_WORKER_NAME,
+            poll_interval_seconds=self.settings.nxt_eligible_source_ttl_seconds,
+            status=(
+                "disabled"
+                if not self.settings.autonomous_runtime_enabled or not self.settings.nxt_eligible_sync_enabled
+                else "idle"
+            ),
         )
         self._monitoring_price_source_state = self._initial_monitoring_price_source_state()
 
@@ -147,11 +160,25 @@ class AutonomousRuntimeCoordinator:
                 cycle=self._run_watch_exec_agent_sizing_cycle,
             )
         )
+        if self.settings.nxt_eligible_sync_enabled:
+            self._nxt_eligible_sync_task = asyncio.create_task(
+                self._run_periodic_loop(
+                    worker_key="nxt_eligible_sync",
+                    interval_seconds=self.settings.nxt_eligible_source_ttl_seconds,
+                    cycle=self._run_nxt_eligible_sync_cycle,
+                    run_immediately=True,
+                )
+            )
 
     async def stop(self) -> None:
         tasks = [
             task
-            for task in (self._dispatch_task, self._monitoring_task, self._watch_exec_agent_sizing_task)
+            for task in (
+                self._dispatch_task,
+                self._monitoring_task,
+                self._watch_exec_agent_sizing_task,
+                self._nxt_eligible_sync_task,
+            )
             if task is not None
         ]
         for task in tasks:
@@ -170,6 +197,7 @@ class AutonomousRuntimeCoordinator:
                     "price_source": self._monitoring_price_source_state.snapshot(),
                 },
                 "watch_exec_agent_sizing": self._watch_exec_agent_sizing_state.snapshot(),
+                "nxt_eligible_sync": self._nxt_eligible_sync_state.snapshot(),
             }
 
     async def _run_periodic_loop(
@@ -241,6 +269,9 @@ class AutonomousRuntimeCoordinator:
     async def _run_watch_exec_agent_sizing_cycle(self, started_at: datetime) -> dict[str, object]:
         return await asyncio.to_thread(self._watch_exec_agent_sizing_cycle_sync, started_at)
 
+    async def _run_nxt_eligible_sync_cycle(self, started_at: datetime) -> dict[str, object]:
+        return await asyncio.to_thread(self._nxt_eligible_sync_cycle_sync, started_at)
+
     def _watch_exec_agent_sizing_cycle_sync(self, started_at: datetime) -> dict[str, object]:
         with self.session_factory() as db:
             adapter = self.broker_adapter_factory(self.settings)
@@ -256,6 +287,11 @@ class AutonomousRuntimeCoordinator:
             }
             self._store_cycle_payload(worker_key="watch_exec_agent_sizing", payload=payload)
             return payload
+
+    def _nxt_eligible_sync_cycle_sync(self, started_at: datetime) -> dict[str, object]:
+        payload = refresh_nxt_eligible_symbols(settings=self.settings, now=started_at, force=True)
+        self._store_cycle_payload(worker_key="nxt_eligible_sync", payload=payload)
+        return payload
 
     def _monitoring_cycle_sync(self, started_at: datetime) -> dict[str, object]:
         with self.session_factory() as db:
@@ -412,6 +448,8 @@ class AutonomousRuntimeCoordinator:
             return self._dispatch_state
         if worker_key == "watch_exec_agent_sizing":
             return self._watch_exec_agent_sizing_state
+        if worker_key == "nxt_eligible_sync":
+            return self._nxt_eligible_sync_state
         return self._monitoring_state
 
     def _initial_monitoring_price_source_state(self) -> MonitoringPriceSourceState:
