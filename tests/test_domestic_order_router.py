@@ -31,6 +31,33 @@ def test_nxt_eligible_symbol_routes_to_nxt_pre_when_enabled() -> None:
     assert decision.ord_dvsn == "00"
 
 
+def test_official_nxt_eligible_symbol_routes_when_env_list_is_empty(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "app.services.domestic_order_router.is_nxt_eligible_symbol",
+        lambda *, settings, symbol: symbol == "005930",
+    )
+
+    decision = resolve_domestic_order_route(
+        settings=Settings(
+            domestic_order_session_routing_enabled=True,
+            allow_nxt_pre_orders=True,
+            nxt_eligible_symbols="",
+            nxt_order_route_preference="nxt",
+        ),
+        now=datetime(2026, 5, 28, 8, 0, tzinfo=KST),
+        symbol="005930",
+        side="sell",
+        purpose="protective_stop",
+        desired_order_type="limit",
+        limit_price=Decimal("70000"),
+        requested_exchange="KRX",
+    )
+
+    assert decision.action == "submit"
+    assert decision.exchange == "NXT"
+    assert decision.session == "nxt_pre"
+
+
 def test_nxt_pre_market_order_without_limit_defers_protective_sell() -> None:
     decision = resolve_domestic_order_route(
         settings=Settings(

@@ -129,6 +129,10 @@ Domestic order-session routing settings currently supported:
 - `KAI_EXEC_ALLOW_AFTER_HOURS_BUY_ORDERS`
 - `KAI_EXEC_ALLOW_AFTER_HOURS_SELL_ORDERS`
 - `KAI_EXEC_NXT_ELIGIBLE_SYMBOLS`
+- `KAI_EXEC_NXT_ELIGIBLE_SYNC_ENABLED`
+- `KAI_EXEC_NXT_ELIGIBLE_SOURCE_URL`
+- `KAI_EXEC_NXT_ELIGIBLE_SOURCE_TIMEOUT_SECONDS`
+- `KAI_EXEC_NXT_ELIGIBLE_SOURCE_TTL_SECONDS`
 
 To allow live monitoring orders through the Korean after-hours sessions, enable
 domestic order-session routing and the relevant after-hours policies in the
@@ -141,14 +145,16 @@ export KAI_EXEC_ALLOW_KRX_AFTER_HOURS_SINGLE_PRICE_ORDERS=true
 export KAI_EXEC_ALLOW_NXT_AFTER_ORDERS=true
 export KAI_EXEC_ALLOW_AFTER_HOURS_BUY_ORDERS=true
 export KAI_EXEC_ALLOW_AFTER_HOURS_SELL_ORDERS=true
-export KAI_EXEC_NXT_ELIGIBLE_SYMBOLS=005930,034730
 ```
 
 The `16:00-18:00` KST single-price session can route through KRX when
 `KAI_EXEC_ALLOW_KRX_AFTER_HOURS_SINGLE_PRICE_ORDERS=true`. The `18:00-20:00`
-KST session routes through NXT for eligible symbols, so the active monitoring
-symbols that may trade in that window must be present in
-`KAI_EXEC_NXT_ELIGIBLE_SYMBOLS` or carried as `nxt_eligible` plan metadata.
+KST session routes through NXT for eligible symbols. Eligibility is resolved in
+this order: explicit `nxt_eligible` order/plan metadata, manual
+`KAI_EXEC_NXT_ELIGIBLE_SYMBOLS` overrides, then the cached official NXT
+`/brdinfoTime/brdinfoTimeList.do` trading-target list. The official sync is
+enabled by default and refreshes on the autonomous runtime cadence controlled
+by `KAI_EXEC_NXT_ELIGIBLE_SOURCE_TTL_SECONDS`.
 After changing these settings, restart the exec API process and verify
 `/runtime/status` before relying on automated order submission.
 

@@ -6,6 +6,7 @@ from decimal import Decimal
 from zoneinfo import ZoneInfo
 
 from app.core.config import Settings
+from app.services.nxt_eligibility import is_nxt_eligible_symbol
 
 KST = ZoneInfo("Asia/Seoul")
 
@@ -291,10 +292,4 @@ def _is_nxt_eligible(
     raw_metadata = metadata.get("nxt_eligible")
     if isinstance(raw_metadata, bool):
         return raw_metadata
-    raw_symbols = settings.nxt_eligible_symbols
-    symbols = {
-        token.strip().upper()
-        for token in raw_symbols.replace(";", ",").split(",")
-        if token.strip()
-    }
-    return symbol.upper() in symbols
+    return is_nxt_eligible_symbol(settings=settings, symbol=symbol)
