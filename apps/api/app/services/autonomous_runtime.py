@@ -243,9 +243,11 @@ class AutonomousRuntimeCoordinator:
 
     def _watch_exec_agent_sizing_cycle_sync(self, started_at: datetime) -> dict[str, object]:
         with self.session_factory() as db:
+            adapter = self.broker_adapter_factory(self.settings)
             result = run_due_watch_exec_agent_sizing(
                 settings=self.settings,
                 db=db,
+                adapter=adapter,
                 now=started_at,
             )
             payload = {

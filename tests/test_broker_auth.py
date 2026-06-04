@@ -41,11 +41,13 @@ from app.models.runtime import (
     ExecutionFailure,
     ExecutionFill,
     ExecutionJob,
+    ExecutionPlan,
     ExecutionPlanItem,
     ExecutionPosition,
     MonitoringCheckpoint,
 )
 from app.services.monitoring import list_autonomous_monitoring_symbols, run_autonomous_monitoring_cycle
+from app.services.watch_exec_agent_sizing import _apply_decisions
 
 
 class RecordingHttpClient:
@@ -2143,7 +2145,8 @@ def _create_watch_buy_candidate(
     chase_limit_price: str | None = "71200.00",
     quantity_policy: dict[str, object] | None = None,
     risk_context: dict[str, object] | None = None,
-    market_date: str = "2024-01-03",
+    market_date: str | None = "2024-01-03",
+    source_market_date: str | None = None,
 ) -> str:
     item = {
         "symbol": "005930",
@@ -2156,6 +2159,8 @@ def _create_watch_buy_candidate(
         "decision_agent_name": "short-term-decider",
         "source_plan_item_id": f"{plan_id}-watch",
     }
+    if source_market_date is not None:
+        item["source_market_date"] = source_market_date
     if chase_limit_price is not None:
         item["chase_limit_price"] = chase_limit_price
     response = client.post(
@@ -2290,6 +2295,72 @@ def test_autonomous_monitoring_expires_prior_day_unfilled_watch_buys() -> None:
     engine.dispose()
 
 
+def test_autonomous_monitoring_expires_prior_source_when_plan_date_missing() -> None:
+    app, engine, client, broker_adapter = _build_watch_buy_test_app()
+    prior_id = _create_watch_buy_candidate(
+        client,
+        plan_id="plan-watch-buy-expire-prior-source",
+        market_date=None,
+        source_market_date="2024-01-03",
+    )
+    current_id = _create_watch_buy_candidate(
+        client,
+        plan_id="plan-watch-buy-retain-current-with-plan-date",
+        market_date="2024-01-04",
+    )
+
+    with app.state.db_session_factory() as session:
+        symbols = list_autonomous_monitoring_symbols(
+            settings=app.state.settings,
+            db=session,
+            current_market_date=date(2024, 1, 4),
+        )
+
+        assert symbols == ["005930"]
+        prior = session.get(ExecutionPlanItem, prior_id)
+        current = session.get(ExecutionPlanItem, current_id)
+        assert prior is not None
+        assert current is not None
+        assert prior.status == "watch_expired"
+        assert current.status == "watch_monitoring_active"
+        assert (
+            prior.risk_context["last_monitoring_event"]["event"]
+            == "market_date_expired_unfilled"
+        )
+        assert (
+            prior.risk_context["last_monitoring_event"]["source_market_date"]
+            == "2024-01-03"
+        )
+
+    assert broker_adapter.order_calls == []
+    engine.dispose()
+
+
+def test_autonomous_monitoring_retains_watch_buy_when_source_is_prior_but_plan_is_current() -> None:
+    app, engine, client, broker_adapter = _build_watch_buy_test_app()
+    current_plan_id = _create_watch_buy_candidate(
+        client,
+        plan_id="plan-watch-buy-holiday-rollover",
+        market_date="2024-01-04",
+        source_market_date="2024-01-03",
+    )
+
+    with app.state.db_session_factory() as session:
+        symbols = list_autonomous_monitoring_symbols(
+            settings=app.state.settings,
+            db=session,
+            current_market_date=date(2024, 1, 4),
+        )
+
+        assert symbols == ["005930"]
+        item = session.get(ExecutionPlanItem, current_plan_id)
+        assert item is not None
+        assert item.status == "watch_monitoring_active"
+
+    assert broker_adapter.order_calls == []
+    engine.dispose()
+
+
 def test_autonomous_monitoring_retains_current_day_and_terminal_watch_buys() -> None:
     app, engine, client, broker_adapter = _build_watch_buy_test_app()
     current_id = _create_watch_buy_candidate(
@@ -2406,6 +2477,191 @@ def test_watch_buy_rejects_missing_stop_without_submitting() -> None:
         assert item is not None
         assert item.status == "watch_buy_rejected"
         assert item.risk_context["last_monitoring_event"]["reason"] == "missing_stop_or_entry_price"
+
+    engine.dispose()
+
+
+def test_exec_agent_sized_watch_buy_waits_for_agent_quantity_without_submitting() -> None:
+    app, engine, client, broker_adapter = _build_watch_buy_test_app()
+    item_id = _create_watch_buy_candidate(
+        client,
+        plan_id="plan-watch-buy-agent-sized-pending-1",
+        quantity_policy={
+            "type": "exec_agent_sized",
+            "budget_krw": "0",
+            "max_safe_notional_krw": "150000",
+        },
+        risk_context={"exchange": "KRX", "stop_price": "70000.00"},
+    )
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "exec-agent sized watch buy should wait for agent quantity",
+            "prices": [{"symbol": "005930", "price": "71050.00"}],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["triggered_item_count"] == 1
+    assert payload["submitted_order_count"] == 0
+    assert payload["blocked_item_count"] == 1
+    assert payload["items"][0]["outcome"] == "blocked"
+    assert payload["items"][0]["block_reason"] == "exec_agent_sizing_pending"
+    assert broker_adapter.order_calls == []
+
+    with app.state.db_session_factory() as session:
+        item = session.get(ExecutionPlanItem, item_id)
+        assert item is not None
+        assert item.status == "watch_buy_triggered_blocked"
+        assert item.risk_context["last_monitoring_event"]["reason"] == "exec_agent_sizing_pending"
+
+    engine.dispose()
+
+
+def test_exec_agent_sized_watch_buy_uses_fallback_only_after_agent_attempts_exhausted() -> None:
+    app, engine, client, broker_adapter = _build_watch_buy_test_app(
+        order_id="kis-watch-buy-agent-fallback-1"
+    )
+    item_id = _create_watch_buy_candidate(
+        client,
+        plan_id="plan-watch-buy-agent-sized-fallback-1",
+        quantity_policy={
+            "type": "exec_agent_sized",
+            "budget_krw": "0",
+            "max_safe_notional_krw": "150000",
+        },
+        risk_context={
+            "exchange": "KRX",
+            "stop_price": "70000.00",
+            "target_price": "72420.00",
+        },
+    )
+
+    first_response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "exec-agent attempts not exhausted",
+            "prices": [{"symbol": "005930", "price": "71050.00"}],
+        },
+    )
+    assert first_response.status_code == 200
+    assert first_response.json()["submitted_order_count"] == 0
+    assert broker_adapter.order_calls == []
+
+    with app.state.db_session_factory() as session:
+        item = session.get(ExecutionPlanItem, item_id)
+        assert item is not None
+        item.status = "watch_monitoring_active"
+        risk_context = dict(item.risk_context or {})
+        risk_context["exec_agent_watch_sizing_attempt_count"] = 3
+        risk_context["exec_agent_watch_sizing_max_attempts"] = 3
+        risk_context["exec_agent_watch_sizing_fallback_allowed"] = True
+        item.risk_context = risk_context
+        session.commit()
+
+    fallback_response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "exec-agent attempts exhausted",
+            "prices": [{"symbol": "005930", "price": "71050.00"}],
+        },
+    )
+
+    assert fallback_response.status_code == 200
+    payload = fallback_response.json()
+    assert payload["triggered_item_count"] == 1
+    assert payload["submitted_order_count"] == 1
+    assert payload["items"][0]["outcome"] == "submitted"
+    assert len(broker_adapter.order_calls) == 1
+    assert broker_adapter.order_calls[0].execution_plan_item_id == item_id
+    assert broker_adapter.order_calls[0].quantity > 0
+
+    with app.state.db_session_factory() as session:
+        item = session.get(ExecutionPlanItem, item_id)
+        assert item is not None
+        event = item.risk_context["monitoring_events"][-2]
+        assert event["sizing_source"] == "risk_sizing_after_exec_agent_attempts_exhausted"
+
+    engine.dispose()
+
+
+def test_exec_agent_watch_sizing_response_materializes_stub_order_path() -> None:
+    app, engine, client, broker_adapter = _build_watch_buy_test_app(
+        order_id="kis-watch-buy-agent-sized-1"
+    )
+    item_id = _create_watch_buy_candidate(
+        client,
+        plan_id="plan-watch-buy-agent-sized-approved-1",
+        quantity_policy={
+            "type": "exec_agent_sized",
+            "budget_krw": "0",
+            "max_safe_notional_krw": "150000",
+        },
+        risk_context={
+            "exchange": "KRX",
+            "stop_price": "70000.00",
+            "target_price": "72420.00",
+        },
+    )
+
+    with app.state.db_session_factory() as session:
+        plan = session.scalar(
+            select(ExecutionPlan).where(
+                ExecutionPlan.external_plan_id == "plan-watch-buy-agent-sized-approved-1"
+            )
+        )
+        assert plan is not None
+        summary = _apply_decisions(
+            db=session,
+            plan=plan,
+            expected_item_ids={item_id},
+            decision_payload={
+                "version": "manual-exec-agent-watch-sizing-v1",
+                "decisions": [
+                    {
+                        "execution_plan_item_id": item_id,
+                        "symbol": "005930",
+                        "action": "approve",
+                        "quantity": 2,
+                        "approved_notional_krw": 142100,
+                        "sizing_price": "71050.00",
+                        "confidence": 0.68,
+                        "target_profile": "tactical_2pct",
+                        "reason_code": "agent_sized_tactical_buy",
+                        "reason": "agent approved a small tactical watch quantity",
+                    }
+                ],
+            },
+        )
+        assert summary["approved"] == 1
+        session.commit()
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "agent-sized response should reach order path",
+            "prices": [{"symbol": "005930", "price": "71050.00"}],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["triggered_item_count"] == 1
+    assert payload["submitted_order_count"] == 1
+    assert payload["items"][0]["outcome"] == "submitted"
+    assert len(broker_adapter.order_calls) == 1
+    assert broker_adapter.order_calls[0].execution_plan_item_id == item_id
+    assert broker_adapter.order_calls[0].quantity == 2
 
     engine.dispose()
 
