@@ -12,12 +12,14 @@ from urllib.request import Request, urlopen
 from app.core.config import Settings
 
 LOGGER = logging.getLogger(__name__)
+FAILED_REFRESH_BACKOFF = timedelta(seconds=60)
 
 
 @dataclass
 class NxtEligibleSymbolCache:
     symbols: frozenset[str] = frozenset()
     fetched_at: datetime | None = None
+    last_refresh_attempt_at: datetime | None = None
     source_url: str | None = None
     set_time: str | None = None
     record_count: int | None = None
@@ -30,6 +32,9 @@ class NxtEligibleSymbolCache:
             return {
                 "symbol_count": len(self.symbols),
                 "fetched_at": self.fetched_at.isoformat() if self.fetched_at is not None else None,
+                "last_refresh_attempt_at": (
+                    self.last_refresh_attempt_at.isoformat() if self.last_refresh_attempt_at is not None else None
+                ),
                 "source_url": self.source_url,
                 "set_time": self.set_time,
                 "record_count": self.record_count,
@@ -69,6 +74,7 @@ def refresh_nxt_eligible_symbols(
     if not force and not _cache_is_stale(settings=settings, now=checked_at):
         return _CACHE.snapshot()
 
+    _store_refresh_attempt(settings=settings, now=checked_at)
     try:
         payload = _fetch_nxt_eligible_payload(settings=settings)
         symbols, record_count, set_time = parse_nxt_eligible_payload(payload)
@@ -153,12 +159,19 @@ def normalize_nxt_symbol(symbol: str) -> str:
 
 
 def _cache_is_stale(*, settings: Settings, now: datetime) -> bool:
-    fetched_at = _CACHE.fetched_at
-    if fetched_at is None:
-        return True
-    if fetched_at.tzinfo is None:
-        fetched_at = fetched_at.replace(tzinfo=UTC)
-    return now - fetched_at >= timedelta(seconds=settings.nxt_eligible_source_ttl_seconds)
+    with _CACHE._lock:
+        fetched_at = _ensure_aware_utc(_CACHE.fetched_at)
+        last_refresh_attempt_at = _ensure_aware_utc(_CACHE.last_refresh_attempt_at)
+
+    if fetched_at is not None:
+        ttl = timedelta(seconds=settings.nxt_eligible_source_ttl_seconds)
+        if now - fetched_at < ttl:
+            return False
+
+    if last_refresh_attempt_at is not None and now - last_refresh_attempt_at < FAILED_REFRESH_BACKOFF:
+        return False
+
+    return True
 
 
 def _fetch_nxt_eligible_payload(*, settings: Settings) -> dict[str, Any]:
@@ -182,7 +195,21 @@ def _fetch_nxt_eligible_payload(*, settings: Settings) -> dict[str, Any]:
     return payload
 
 
+def _store_refresh_attempt(*, settings: Settings, now: datetime) -> None:
+    with _CACHE._lock:
+        _CACHE.last_refresh_attempt_at = now
+        _CACHE.source_url = settings.nxt_eligible_source_url
+
+
 def _store_refresh_error(*, error: str, now: datetime) -> None:
     with _CACHE._lock:
         _CACHE.last_error = error
         _CACHE.last_error_at = now
+
+
+def _ensure_aware_utc(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
