@@ -63,6 +63,7 @@ BLOCKED_MONITORING_STATUSES = frozenset(
 RETRYABLE_WATCH_BUY_APPROVAL_REASONS = frozenset(
     {
         "account_snapshot_unavailable",
+        "exec_agent_sizing_pending",
     }
 )
 PENDING_DISPATCH_MONITORING_STATUSES = frozenset(
@@ -856,10 +857,6 @@ def expire_prior_market_date_unfilled_watch_buys(
     expired_at: datetime | None = None,
 ) -> int:
     expired_at = _normalize_utc(expired_at or datetime.now(UTC))
-    source_market_date = func.coalesce(
-        ExecutionPlanItem.source_market_date,
-        ExecutionPlan.market_date,
-    )
     candidates = db.scalars(
         select(ExecutionPlanItem)
         .join(ExecutionPlanItem.plan)
@@ -868,8 +865,8 @@ def expire_prior_market_date_unfilled_watch_buys(
             ExecutionPlanItem.side == "buy",
             ExecutionPlanItem.intent.in_(tuple(WATCH_BUY_INTENTS)),
             ExecutionPlanItem.status.in_(tuple(WATCH_BUY_EXPIRABLE_STATUSES)),
-            source_market_date.is_not(None),
-            source_market_date < current_market_date,
+            ExecutionPlan.market_date.is_not(None),
+            ExecutionPlan.market_date < current_market_date,
             ~ExecutionPlanItem.broker_orders.any(),
         )
         .options(selectinload(ExecutionPlanItem.plan))
@@ -1644,6 +1641,19 @@ def _resolve_watch_buy_order(
         quantity = _parse_positive_int(
             decision.get("approved_quantity") or decision.get("quantity")
         )
+    if (
+        quantity is None
+        and _watch_buy_requires_exec_agent_sizing(item)
+        and not _watch_buy_exec_agent_sizing_fallback_allowed(
+            settings=settings,
+            item=item,
+        )
+    ):
+        return WatchBuyOrderApproval(
+            quantity=None,
+            reason="exec_agent_sizing_pending",
+            message="watch buy requires an exec-agent share quantity before order submission",
+        )
 
     control_state = ensure_runtime_control_state(settings=settings, db=db)
     if not automated_order_submission_allowed(control_state):
@@ -1718,21 +1728,27 @@ def _resolve_watch_buy_order(
             details=risk_decision.details,
         )
     assert isinstance(risk_decision, RiskSizingResult)
+    event = {
+        "event": "watch_buy_risk_sized",
+        "quantity": risk_decision.quantity,
+        "approved_notional": _serialize_decimal(risk_decision.approved_notional),
+        "risk_pct": _serialize_decimal(risk_decision.risk_pct),
+        "risk_budget": _serialize_decimal(risk_decision.risk_budget),
+        "stop_price": _serialize_decimal(effective_stop),
+        "upstream_stop_price": _serialize_decimal(stop_price),
+        "risk_based_quantity": risk_decision.risk_quantity,
+        "allocation_quantity": risk_decision.allocation_quantity,
+        "cash_quantity": risk_decision.cash_quantity,
+        "recorded_at": datetime.now(UTC).isoformat(),
+    }
+    if _watch_buy_requires_exec_agent_sizing(item):
+        event["sizing_source"] = "risk_sizing_after_exec_agent_attempts_exhausted"
+        event["exec_agent_watch_sizing_attempt_count"] = (
+            item.risk_context or {}
+        ).get("exec_agent_watch_sizing_attempt_count") if isinstance(item.risk_context, dict) else None
     _record_monitoring_event(
         item=item,
-        event={
-            "event": "watch_buy_risk_sized",
-            "quantity": risk_decision.quantity,
-            "approved_notional": _serialize_decimal(risk_decision.approved_notional),
-            "risk_pct": _serialize_decimal(risk_decision.risk_pct),
-            "risk_budget": _serialize_decimal(risk_decision.risk_budget),
-            "stop_price": _serialize_decimal(effective_stop),
-            "upstream_stop_price": _serialize_decimal(stop_price),
-            "risk_based_quantity": risk_decision.risk_quantity,
-            "allocation_quantity": risk_decision.allocation_quantity,
-            "cash_quantity": risk_decision.cash_quantity,
-            "recorded_at": datetime.now(UTC).isoformat(),
-        },
+        event=event,
     )
     return WatchBuyOrderApproval(quantity=risk_decision.quantity)
 
@@ -1743,6 +1759,33 @@ def _parse_buy_quantity(quantity_policy: dict[str, object] | None) -> int | None
     if quantity_policy.get("kind") != "shares":
         return None
     return _parse_positive_int(quantity_policy.get("quantity"))
+
+
+def _watch_buy_requires_exec_agent_sizing(item: ExecutionPlanItem) -> bool:
+    quantity_policy = item.quantity_policy
+    if not isinstance(quantity_policy, dict):
+        return False
+    for key in ("kind", "type"):
+        value = quantity_policy.get(key)
+        if isinstance(value, str) and value.strip().lower() == "exec_agent_sized":
+            return True
+    return False
+
+
+def _watch_buy_exec_agent_sizing_fallback_allowed(
+    *,
+    settings: Settings,
+    item: ExecutionPlanItem,
+) -> bool:
+    risk_context = item.risk_context if isinstance(item.risk_context, dict) else {}
+    if risk_context.get("exec_agent_watch_sizing_fallback_allowed") is True:
+        return True
+    attempts = _parse_positive_int(risk_context.get("exec_agent_watch_sizing_attempt_count")) or 0
+    max_attempts = (
+        _parse_positive_int(risk_context.get("exec_agent_watch_sizing_max_attempts"))
+        or settings.exec_agent_watch_sizing_max_attempts
+    )
+    return attempts >= max_attempts
 
 
 def _watch_buy_candidate_budget(item: ExecutionPlanItem) -> Decimal | None:
@@ -1756,6 +1799,8 @@ def _watch_buy_candidate_budget(item: ExecutionPlanItem) -> Decimal | None:
             "cash_budget_krw",
             "max_notional",
             "max_notional_krw",
+            "max_safe_notional",
+            "max_safe_notional_krw",
             "notional",
         ):
             value = _parse_positive_decimal(source.get(key))

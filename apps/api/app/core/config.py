@@ -62,9 +62,12 @@ class Settings(BaseModel):
     monthly_aggressive_lag_ratio: Decimal = Field(default=Decimal("0.75"), gt=0, le=1)
     exec_agent_watch_sizing_enabled: bool = True
     exec_agent_watch_sizing_loop_interval_seconds: float = Field(default=60.0, gt=0, le=3600)
+    exec_agent_watch_sizing_batch_size: int = Field(default=3, ge=1, le=10)
+    exec_agent_watch_sizing_max_batches_per_cycle: int = Field(default=3, ge=1, le=100)
+    exec_agent_watch_sizing_max_attempts: int = Field(default=3, ge=1, le=10)
     exec_agent_watch_sizing_start_local_time: str = "08:00"
     exec_agent_watch_sizing_end_local_time: str = "15:30"
-    exec_agent_watch_sizing_timeout_seconds: int = Field(default=600, ge=30, le=3600)
+    exec_agent_watch_sizing_timeout_seconds: int = Field(default=180, ge=30, le=3600)
     openclaw_cli_path: str = "openclaw"
     kis_app_key: str | None = None
     kis_app_secret: str | None = None
@@ -149,6 +152,9 @@ _ENV_FIELDS = {
     "MONTHLY_AGGRESSIVE_LAG_RATIO": "monthly_aggressive_lag_ratio",
     "EXEC_AGENT_WATCH_SIZING_ENABLED": "exec_agent_watch_sizing_enabled",
     "EXEC_AGENT_WATCH_SIZING_LOOP_INTERVAL_SECONDS": "exec_agent_watch_sizing_loop_interval_seconds",
+    "EXEC_AGENT_WATCH_SIZING_BATCH_SIZE": "exec_agent_watch_sizing_batch_size",
+    "EXEC_AGENT_WATCH_SIZING_MAX_BATCHES_PER_CYCLE": "exec_agent_watch_sizing_max_batches_per_cycle",
+    "EXEC_AGENT_WATCH_SIZING_MAX_ATTEMPTS": "exec_agent_watch_sizing_max_attempts",
     "EXEC_AGENT_WATCH_SIZING_START_LOCAL_TIME": "exec_agent_watch_sizing_start_local_time",
     "EXEC_AGENT_WATCH_SIZING_END_LOCAL_TIME": "exec_agent_watch_sizing_end_local_time",
     "EXEC_AGENT_WATCH_SIZING_TIMEOUT_SECONDS": "exec_agent_watch_sizing_timeout_seconds",

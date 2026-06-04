@@ -1,16 +1,33 @@
 from __future__ import annotations
 
+from datetime import date
 from decimal import Decimal
 
-from app.models.runtime import ExecutionPlanItem
-from app.services.watch_exec_agent_sizing import _candidate_payload, _decision_record
+from app.broker.base import BrokerAccountHolding, BrokerAccountOpenOrder, BrokerAccountSnapshot
+from app.models.runtime import ExecutionPlan, ExecutionPlanItem
+from app.services.monitoring import _watch_buy_candidate_budget
+from app.services.watch_exec_agent_sizing import (
+    _apply_decisions,
+    _applicable_decision_ids,
+    _account_context_payload,
+    _candidate_payload,
+    _candidate_universe_payload,
+    _chunks,
+    _decision_record,
+    _sizing_request_payload,
+)
 
 
-def _watch_item(*, risk_context: dict[str, object] | None) -> ExecutionPlanItem:
+def _watch_item(
+    *,
+    item_id: str = "watch-item-1",
+    symbol: str = "005930",
+    risk_context: dict[str, object] | None,
+) -> ExecutionPlanItem:
     return ExecutionPlanItem(
-        id="watch-item-1",
+        id=item_id,
         plan_item_index=0,
-        symbol="005930",
+        symbol=symbol,
         side="buy",
         intent="intraday_watch_buy",
         status="watch_monitoring_pending",
@@ -19,6 +36,25 @@ def _watch_item(*, risk_context: dict[str, object] | None) -> ExecutionPlanItem:
         quantity_policy={"type": "exec_agent_sized", "budget_krw": "1500000"},
         risk_context=risk_context,
     )
+
+
+def test_chunks_splits_watch_candidates_into_small_batches() -> None:
+    items = [{"execution_plan_item_id": f"item-{index}"} for index in range(53)]
+
+    chunks = _chunks(items, 10)
+
+    assert [len(chunk) for chunk in chunks] == [10, 10, 10, 10, 10, 3]
+
+
+def test_watch_buy_candidate_budget_accepts_max_safe_notional() -> None:
+    item = _watch_item(risk_context={})
+    item.quantity_policy = {
+        "type": "exec_agent_sized",
+        "budget_krw": "0",
+        "max_safe_notional_krw": 3400457,
+    }
+
+    assert _watch_buy_candidate_budget(item) == Decimal("3400457")
 
 
 def test_candidate_payload_includes_available_decider_flow_short_sector_context() -> None:
@@ -206,3 +242,130 @@ def test_watch_sizing_decision_record_tags_tactical_target_profile() -> None:
 
     assert record["target_profile"] == "tactical_2pct"
     assert record["target_tag"] == "target_profile:tactical_2pct"
+
+
+def test_apply_decisions_applies_partial_response_and_leaves_missing_item_pending() -> None:
+    plan = ExecutionPlan(
+        id="plan-1",
+        external_plan_id="plan-partial",
+        strategy_run_id="strategy-1",
+        source="core-short-term-decider",
+        market_date=date(2026, 6, 4),
+        mode="paper",
+        items=[
+            _watch_item(item_id="watch-item-1", symbol="005930", risk_context={"target_price": "72420"}),
+            _watch_item(item_id="watch-item-2", symbol="000660", risk_context={"target_price": "128000"}),
+        ],
+    )
+
+    summary = _apply_decisions(
+        db=None,  # type: ignore[arg-type]
+        plan=plan,
+        expected_item_ids={"watch-item-1", "watch-item-2"},
+        decision_payload={
+            "version": "manual-exec-agent-watch-sizing-v1",
+            "decisions": [
+                {
+                    "execution_plan_item_id": "watch-item-1",
+                    "symbol": "005930",
+                    "action": "approve",
+                    "quantity": 2,
+                    "approved_notional_krw": 143000,
+                    "sizing_price": "71000",
+                    "confidence": 0.68,
+                    "target_profile": "tactical_2pct",
+                    "reason_code": "small_tactical_upside",
+                    "reason": "2% target with tight stop",
+                }
+            ],
+        },
+    )
+
+    assert summary == {
+        "plan_id": "plan-partial",
+        "evaluated": 1,
+        "approved": 1,
+        "rejected": 0,
+        "missing": 1,
+        "missing_item_ids": ["watch-item-2"],
+        "ignored_extra": 0,
+    }
+    assert plan.items[0].status == "watch_monitoring_active"
+    assert plan.items[0].quantity_policy["quantity"] == 2
+    assert plan.items[1].status == "watch_monitoring_pending"
+
+
+def test_applicable_decision_ids_only_counts_expected_candidates() -> None:
+    decision_ids = _applicable_decision_ids(
+        {
+            "decisions": [
+                {"execution_plan_item_id": "watch-item-1", "action": "approve"},
+                {"execution_plan_item_id": "unrelated-item", "action": "approve"},
+            ]
+        },
+        expected_item_ids={"watch-item-1", "watch-item-2"},
+    )
+
+    assert decision_ids == {"watch-item-1"}
+
+
+def test_sizing_request_payload_uses_compact_account_and_candidate_universe() -> None:
+    plan = ExecutionPlan(
+        id="plan-1",
+        external_plan_id="plan-compact",
+        strategy_run_id="strategy-1",
+        market_date=date(2026, 6, 4),
+    )
+    candidates = [
+        _candidate_payload(
+            _watch_item(
+                item_id="watch-item-1",
+                symbol="005930",
+                risk_context={
+                    "target_price": "72420",
+                    "confidence_score_10": "7.2",
+                    "decider_handoff_context": {
+                        "large_unused_blob": "x" * 1000,
+                    },
+                },
+            )
+        ),
+        _candidate_payload(
+            _watch_item(
+                item_id="watch-item-2",
+                symbol="000660",
+                risk_context={"target_price": "128000", "confidence_score_10": "6.8"},
+            )
+        ),
+    ]
+    account_context = _account_context_payload(
+        BrokerAccountSnapshot(
+            available_cash=Decimal("800000"),
+            buying_power=Decimal("700000"),
+            source="stub:account_snapshot",
+            holdings=[BrokerAccountHolding(symbol="035420", quantity=3, average_price=Decimal("180000"))],
+            open_orders=[
+                BrokerAccountOpenOrder(
+                    symbol="009150",
+                    side="buy",
+                    quantity=2,
+                    limit_price=Decimal("150000"),
+                )
+            ],
+        )
+    )
+
+    payload = _sizing_request_payload(
+        plan=plan,
+        candidates=[candidates[0]],
+        account_context=account_context,
+        candidate_universe=_candidate_universe_payload(candidates),
+    )
+
+    assert payload["account_context"]["orderable_cash_krw"] == "800000"
+    assert payload["account_context"]["buying_power_krw"] == "700000"
+    assert payload["account_context"]["holding_count"] == 1
+    assert payload["candidate_universe"]["candidate_count"] == 2
+    assert payload["candidate_universe"]["candidates"][1]["symbol"] == "000660"
+    assert payload["candidates"][0]["symbol"] == "005930"
+    assert "large_unused_blob" not in str(payload)
