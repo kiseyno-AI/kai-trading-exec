@@ -2145,7 +2145,7 @@ def _create_watch_buy_candidate(
     chase_limit_price: str | None = "71200.00",
     quantity_policy: dict[str, object] | None = None,
     risk_context: dict[str, object] | None = None,
-    market_date: str = "2024-01-03",
+    market_date: str | None = "2024-01-03",
     source_market_date: str | None = None,
 ) -> str:
     item = {
@@ -2289,6 +2289,47 @@ def test_autonomous_monitoring_expires_prior_day_unfilled_watch_buys() -> None:
         assert (
             prior_blocked.risk_context["last_monitoring_event"]["prior_status"]
             == "watch_buy_triggered_blocked"
+        )
+
+    assert broker_adapter.order_calls == []
+    engine.dispose()
+
+
+def test_autonomous_monitoring_expires_prior_source_when_plan_date_missing() -> None:
+    app, engine, client, broker_adapter = _build_watch_buy_test_app()
+    prior_id = _create_watch_buy_candidate(
+        client,
+        plan_id="plan-watch-buy-expire-prior-source",
+        market_date=None,
+        source_market_date="2024-01-03",
+    )
+    current_id = _create_watch_buy_candidate(
+        client,
+        plan_id="plan-watch-buy-retain-current-with-plan-date",
+        market_date="2024-01-04",
+    )
+
+    with app.state.db_session_factory() as session:
+        symbols = list_autonomous_monitoring_symbols(
+            settings=app.state.settings,
+            db=session,
+            current_market_date=date(2024, 1, 4),
+        )
+
+        assert symbols == ["005930"]
+        prior = session.get(ExecutionPlanItem, prior_id)
+        current = session.get(ExecutionPlanItem, current_id)
+        assert prior is not None
+        assert current is not None
+        assert prior.status == "watch_expired"
+        assert current.status == "watch_monitoring_active"
+        assert (
+            prior.risk_context["last_monitoring_event"]["event"]
+            == "market_date_expired_unfilled"
+        )
+        assert (
+            prior.risk_context["last_monitoring_event"]["source_market_date"]
+            == "2024-01-03"
         )
 
     assert broker_adapter.order_calls == []

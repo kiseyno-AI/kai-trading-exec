@@ -857,6 +857,10 @@ def expire_prior_market_date_unfilled_watch_buys(
     expired_at: datetime | None = None,
 ) -> int:
     expired_at = _normalize_utc(expired_at or datetime.now(UTC))
+    expiry_market_date = func.coalesce(
+        ExecutionPlan.market_date,
+        ExecutionPlanItem.source_market_date,
+    )
     candidates = db.scalars(
         select(ExecutionPlanItem)
         .join(ExecutionPlanItem.plan)
@@ -865,8 +869,8 @@ def expire_prior_market_date_unfilled_watch_buys(
             ExecutionPlanItem.side == "buy",
             ExecutionPlanItem.intent.in_(tuple(WATCH_BUY_INTENTS)),
             ExecutionPlanItem.status.in_(tuple(WATCH_BUY_EXPIRABLE_STATUSES)),
-            ExecutionPlan.market_date.is_not(None),
-            ExecutionPlan.market_date < current_market_date,
+            expiry_market_date.is_not(None),
+            expiry_market_date < current_market_date,
             ~ExecutionPlanItem.broker_orders.any(),
         )
         .options(selectinload(ExecutionPlanItem.plan))
@@ -881,7 +885,7 @@ def expire_prior_market_date_unfilled_watch_buys(
     for item in candidates:
         prior_status = item.status
         item.status = "watch_expired"
-        item_source_market_date = item.source_market_date or item.plan.market_date
+        item_source_market_date = item.plan.market_date or item.source_market_date
         _record_monitoring_event(
             item=item,
             event={
