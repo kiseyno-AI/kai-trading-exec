@@ -600,6 +600,7 @@ def _evaluate_monitoring_cycle(
         limit_price_override: Decimal | None = None
         if is_watch_buy:
             action.item.status = "watch_buy_triggered"
+            trigger_time_agent_quantity: int | None = None
             if trigger_time_exec_agent.trigger_time_exec_agent_enabled(
                 settings=settings,
                 item=action.item,
@@ -619,70 +620,89 @@ def _evaluate_monitoring_cycle(
                     if symbol_actions:
                         pending_symbols.append(symbol)
                     continue
-                quantity = agent_result.quantity
+                trigger_time_agent_quantity = agent_result.quantity
                 limit_price_override = agent_result.limit_price
-            else:
-                approval = _resolve_watch_buy_order(
-                    settings=settings,
-                    db=db,
-                    adapter=adapter,
-                    item=action.item,
-                    observed_price=action.observed_price,
-                )
-                quantity = approval.quantity
-                if quantity is None:
-                    blocked_item_count += 1
-                    if approval.reason in (
-                        {"paused", "kill_switch"} | RETRYABLE_WATCH_BUY_APPROVAL_REASONS
-                    ):
-                        action.item.status = "watch_buy_triggered_blocked"
-                        event: dict[str, object] = {
-                            "event": "watch_buy_triggered_blocked",
-                            "reason": approval.reason,
+            approval = _resolve_watch_buy_order(
+                settings=settings,
+                db=db,
+                adapter=adapter,
+                item=action.item,
+                observed_price=action.observed_price,
+                requested_quantity=trigger_time_agent_quantity,
+                sizing_source=(
+                    "trigger_time_exec_agent_approval"
+                    if trigger_time_agent_quantity is not None
+                    else None
+                ),
+            )
+            quantity = approval.quantity
+            if quantity is None:
+                blocked_item_count += 1
+                if approval.reason in (
+                    {"paused", "kill_switch"} | RETRYABLE_WATCH_BUY_APPROVAL_REASONS
+                ):
+                    action.item.status = "watch_buy_triggered_blocked"
+                    event: dict[str, object] = {
+                        "event": "watch_buy_triggered_blocked",
+                        "reason": approval.reason,
+                        "message": approval.message,
+                        "observed_price": _serialize_decimal(action.observed_price),
+                        "recorded_at": triggered_at.isoformat(),
+                    }
+                    if approval.reason in RETRYABLE_WATCH_BUY_APPROVAL_REASONS:
+                        event["retry_after_at"] = (
+                            triggered_at
+                            + timedelta(
+                                seconds=settings.monitoring_watch_buy_retry_cooldown_seconds
+                            )
+                        ).isoformat()
+                    _record_monitoring_event(
+                        item=action.item,
+                        event=event,
+                    )
+                    result_by_item_id[action.item.id] = _monitoring_result_payload(
+                        item=action.item,
+                        observed_price=action.observed_price,
+                        outcome="blocked",
+                        block_reason=approval.reason,
+                        message=approval.message,
+                    )
+                else:
+                    action.item.status = "watch_buy_rejected"
+                    _record_monitoring_event(
+                        item=action.item,
+                        event={
+                            "event": "watch_buy_rejected",
+                            "reason": approval.reason or "risk_rejected",
                             "message": approval.message,
+                            "details": approval.details or {},
                             "observed_price": _serialize_decimal(action.observed_price),
                             "recorded_at": triggered_at.isoformat(),
-                        }
-                        if approval.reason in RETRYABLE_WATCH_BUY_APPROVAL_REASONS:
-                            event["retry_after_at"] = (
-                                triggered_at
-                                + timedelta(
-                                    seconds=settings.monitoring_watch_buy_retry_cooldown_seconds
-                                )
-                            ).isoformat()
-                        _record_monitoring_event(
-                            item=action.item,
-                            event=event,
-                        )
-                        result_by_item_id[action.item.id] = _monitoring_result_payload(
-                            item=action.item,
-                            observed_price=action.observed_price,
-                            outcome="blocked",
-                            block_reason=approval.reason,
-                            message=approval.message,
-                        )
-                    else:
-                        action.item.status = "watch_buy_rejected"
-                        _record_monitoring_event(
-                            item=action.item,
-                            event={
-                                "event": "watch_buy_rejected",
-                                "reason": approval.reason or "risk_rejected",
-                                "message": approval.message,
-                                "details": approval.details or {},
-                                "observed_price": _serialize_decimal(action.observed_price),
-                                "recorded_at": triggered_at.isoformat(),
-                            },
-                        )
-                        result_by_item_id[action.item.id] = _monitoring_result_payload(
-                            item=action.item,
-                            observed_price=action.observed_price,
-                            outcome="rejected",
-                            message=approval.message,
-                        )
-                    if symbol_actions:
-                        pending_symbols.append(symbol)
-                    continue
+                        },
+                    )
+                    result_by_item_id[action.item.id] = _monitoring_result_payload(
+                        item=action.item,
+                        observed_price=action.observed_price,
+                        outcome="rejected",
+                        message=approval.message,
+                    )
+                if trigger_time_agent_quantity is not None:
+                    _record_trigger_time_watch_buy_sizing_result(
+                        item=action.item,
+                        approval=approval,
+                        requested_quantity=trigger_time_agent_quantity,
+                        recorded_at=triggered_at,
+                    )
+                if symbol_actions:
+                    pending_symbols.append(symbol)
+                continue
+            if trigger_time_agent_quantity is not None:
+                _record_trigger_time_watch_buy_sizing_result(
+                    item=action.item,
+                    approval=approval,
+                    requested_quantity=trigger_time_agent_quantity,
+                    recorded_at=triggered_at,
+                )
         else:
             quantity = _resolve_sell_quantity(
                 item=action.item,
@@ -1197,6 +1217,53 @@ def _apply_trigger_time_agent_adjustments(
             intent="stop_sell",
             trigger_price=decision.updated_stop_price,
         )
+    item.risk_context = risk_context
+
+
+def _record_trigger_time_watch_buy_sizing_result(
+    *,
+    item: ExecutionPlanItem,
+    approval: WatchBuyOrderApproval,
+    requested_quantity: int,
+    recorded_at: datetime,
+) -> None:
+    risk_context = dict(item.risk_context) if isinstance(item.risk_context, dict) else {}
+    interaction = risk_context.get("last_trigger_time_exec_agent_interaction")
+    if not isinstance(interaction, dict):
+        return
+
+    if approval.quantity is not None:
+        outcome = "approved"
+    elif approval.reason in ({"paused", "kill_switch"} | RETRYABLE_WATCH_BUY_APPROVAL_REASONS):
+        outcome = "blocked"
+    else:
+        outcome = "rejected"
+
+    deterministic_sizing: dict[str, object] = {
+        "source": "watch_buy_deterministic_sizing",
+        "outcome": outcome,
+        "requested_quantity": requested_quantity,
+        "approved_quantity": approval.quantity,
+        "reason": approval.reason,
+        "message": approval.message,
+        "details": approval.details or {},
+        "recorded_at": recorded_at.isoformat(),
+    }
+    if approval.quantity is not None and approval.quantity < requested_quantity:
+        deterministic_sizing["adjustment"] = "clamped_by_deterministic_risk_sizing"
+
+    updated_interaction = {
+        **interaction,
+        "deterministic_sizing": deterministic_sizing,
+        "new_monitoring_state": item.status,
+    }
+    interactions = risk_context.get("trigger_time_exec_agent_interactions")
+    if isinstance(interactions, list) and interactions:
+        interactions = [*interactions[:-1], updated_interaction]
+    else:
+        interactions = [updated_interaction]
+    risk_context["last_trigger_time_exec_agent_interaction"] = updated_interaction
+    risk_context["trigger_time_exec_agent_interactions"] = interactions[-20:]
     item.risk_context = risk_context
 
 
@@ -2009,6 +2076,8 @@ def _resolve_watch_buy_order(
     adapter: BrokerAdapter,
     item: ExecutionPlanItem,
     observed_price: Decimal | None,
+    requested_quantity: int | None = None,
+    sizing_source: str | None = None,
 ) -> WatchBuyOrderApproval:
     decision = _exec_agent_decision(item)
     if isinstance(decision, dict):
@@ -2022,7 +2091,11 @@ def _resolve_watch_buy_order(
                 message="exec-agent/risk policy rejected this watch buy",
             )
 
-    quantity = _parse_buy_quantity(item.quantity_policy)
+    quantity = (
+        _parse_positive_int(requested_quantity)
+        if requested_quantity is not None
+        else _parse_buy_quantity(item.quantity_policy)
+    )
     if quantity is None and isinstance(decision, dict):
         quantity = _parse_positive_int(
             decision.get("approved_quantity") or decision.get("quantity")
@@ -2107,11 +2180,16 @@ def _resolve_watch_buy_order(
         ),
     )
     if isinstance(risk_decision, RiskSizingRejection):
+        details = dict(risk_decision.details)
+        if requested_quantity is not None:
+            details["requested_quantity"] = requested_quantity
+        if sizing_source is not None:
+            details["sizing_source"] = sizing_source
         return WatchBuyOrderApproval(
             quantity=None,
             reason=risk_decision.reason_code,
             message=risk_decision.message,
-            details=risk_decision.details,
+            details=details,
         )
     assert isinstance(risk_decision, RiskSizingResult)
     event = {
@@ -2127,8 +2205,15 @@ def _resolve_watch_buy_order(
         "cash_quantity": risk_decision.cash_quantity,
         "recorded_at": datetime.now(UTC).isoformat(),
     }
+    if requested_quantity is not None:
+        event["requested_quantity"] = requested_quantity
+    if sizing_source is not None:
+        event["sizing_source"] = sizing_source
+        event["trigger_time_exec_agent_quantity"] = requested_quantity
+        if requested_quantity is not None and risk_decision.quantity < requested_quantity:
+            event["sizing_adjustment"] = "clamped_by_deterministic_risk_sizing"
     if _watch_buy_requires_exec_agent_sizing(item):
-        event["sizing_source"] = "risk_sizing_after_exec_agent_attempts_exhausted"
+        event["sizing_source"] = sizing_source or "risk_sizing_after_exec_agent_attempts_exhausted"
         event["exec_agent_watch_sizing_attempt_count"] = (
             item.risk_context or {}
         ).get("exec_agent_watch_sizing_attempt_count") if isinstance(item.risk_context, dict) else None

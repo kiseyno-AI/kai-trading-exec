@@ -61,6 +61,8 @@ def _build_trigger_agent_app(
             exec_agent_enabled=True,
             exec_agent_trigger_time_enabled=True,
             exec_agent_trigger_time_sell_enabled=True,
+            exec_agent_max_position_allocation_pct=Decimal("0.30"),
+            exec_agent_max_symbol_total_exposure_pct=Decimal("0.30"),
         ),
         broker_adapter=adapter,
     )
@@ -73,7 +75,12 @@ def _build_trigger_agent_app(
     return app, engine, client, adapter, captured_requests
 
 
-def _create_intraday_watch_buy(client: TestClient, *, plan_id: str) -> str:
+def _create_intraday_watch_buy(
+    client: TestClient,
+    *,
+    plan_id: str,
+    max_safe_notional_krw: str = "300000",
+) -> str:
     response = client.post(
         "/execution-plans",
         json={
@@ -88,7 +95,7 @@ def _create_intraday_watch_buy(client: TestClient, *, plan_id: str) -> str:
                     "quantity_policy": {
                         "type": "exec_agent_sized",
                         "budget_krw": "0",
-                        "max_safe_notional_krw": "300000",
+                        "max_safe_notional_krw": max_safe_notional_krw,
                     },
                     "trigger_price": "71000.00",
                     "time_in_force": "day",
@@ -168,6 +175,72 @@ def test_trigger_time_buy_agent_context_approval_quantity_drives_submission(
         interaction = item.risk_context["last_trigger_time_exec_agent_interaction"]
         assert interaction["decision"]["decision"] == "execute_now"
         assert interaction["order"]["quantity"] == 3
+
+    engine.dispose()
+
+
+def test_trigger_time_buy_agent_quantity_is_clamped_by_deterministic_sizing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, engine, client, broker_adapter, _captured = _build_trigger_agent_app(
+        monkeypatch=monkeypatch,
+        agent_responses=[
+            {
+                "decision": "execute_now",
+                "side": "buy",
+                "quantity": 10,
+                "limit_price": "71075.00",
+                "reason": "agent wants a larger tactical entry",
+                "risk_notes": ["operator should still apply deterministic caps"],
+                "confidence": "0.72",
+                "context_staleness_ok": True,
+            }
+        ],
+    )
+    item_id = _create_intraday_watch_buy(
+        client,
+        plan_id="plan-trigger-agent-buy-deterministic-clamp",
+        max_safe_notional_krw="150000",
+    )
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "oversized trigger-time agent buy should be risk clamped",
+            "prices": [{"symbol": "005930", "price": "71050.00"}],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["submitted_order_count"] == 1
+    assert payload["items"][0]["outcome"] == "submitted"
+    assert len(broker_adapter.order_calls) == 1
+    order_call = broker_adapter.order_calls[0]
+    assert order_call.execution_plan_item_id == item_id
+    assert order_call.quantity == 2
+
+    with app.state.db_session_factory() as session:
+        item = session.get(ExecutionPlanItem, item_id)
+        assert item is not None
+        assert item.status == "watch_buy_submitted"
+        interaction = item.risk_context["last_trigger_time_exec_agent_interaction"]
+        assert interaction["decision"]["quantity"] == 10
+        assert interaction["order"]["quantity"] == 2
+        deterministic_sizing = interaction["deterministic_sizing"]
+        assert deterministic_sizing["requested_quantity"] == 10
+        assert deterministic_sizing["approved_quantity"] == 2
+        assert deterministic_sizing["adjustment"] == "clamped_by_deterministic_risk_sizing"
+        sizing_events = [
+            event
+            for event in item.risk_context["monitoring_events"]
+            if event["event"] == "watch_buy_risk_sized"
+        ]
+        assert sizing_events[-1]["sizing_source"] == "trigger_time_exec_agent_approval"
+        assert sizing_events[-1]["trigger_time_exec_agent_quantity"] == 10
+        assert sizing_events[-1]["quantity"] == 2
 
     engine.dispose()
 
