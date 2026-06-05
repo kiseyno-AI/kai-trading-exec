@@ -65,6 +65,18 @@ def resolve_domestic_order_route(
             reason="krx_regular_session",
         )
 
+    if session == "krx_opening_call_auction":
+        return _submit(
+            local_now=local_now,
+            exchange="KRX",
+            session="krx_opening_call_auction",
+            order_type=_limit_only_order_type(desired_order_type),
+            limit_price=limit_price,
+            side=side,
+            protective=protective,
+            reason="krx_opening_call_auction",
+        )
+
     if session == "nxt_pre":
         if nxt_eligible and settings.allow_nxt_pre_orders:
             return _submit(
@@ -190,6 +202,8 @@ def _session_for(now: datetime) -> str:
         return "krx_preopen_close"
     if time(8, 40) <= local_time < time(8, 50):
         return "nxt_pre"
+    if time(8, 50) <= local_time < time(9, 0):
+        return "krx_opening_call_auction"
     if time(9, 0) <= local_time < time(15, 30):
         return "krx_regular"
     if time(15, 30) <= local_time < time(15, 40):
