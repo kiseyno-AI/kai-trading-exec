@@ -119,7 +119,12 @@ class AutonomousRuntimeCoordinator:
         self._watch_exec_agent_sizing_state = AutonomousWorkerState(
             worker_name=WATCH_EXEC_AGENT_SIZING_WORKER_NAME,
             poll_interval_seconds=self.settings.exec_agent_watch_sizing_loop_interval_seconds,
-            status="disabled" if not self.settings.autonomous_runtime_enabled else "idle",
+            status=(
+                "disabled"
+                if not self.settings.autonomous_runtime_enabled
+                or not self.settings.exec_agent_watch_sizing_enabled
+                else "idle"
+            ),
         )
         self._nxt_eligible_sync_state = AutonomousWorkerState(
             worker_name=NXT_ELIGIBLE_SYNC_WORKER_NAME,
@@ -153,13 +158,14 @@ class AutonomousRuntimeCoordinator:
                 ),
             )
         )
-        self._watch_exec_agent_sizing_task = asyncio.create_task(
-            self._run_periodic_loop(
-                worker_key="watch_exec_agent_sizing",
-                interval_seconds=self.settings.exec_agent_watch_sizing_loop_interval_seconds,
-                cycle=self._run_watch_exec_agent_sizing_cycle,
+        if self.settings.exec_agent_watch_sizing_enabled:
+            self._watch_exec_agent_sizing_task = asyncio.create_task(
+                self._run_periodic_loop(
+                    worker_key="watch_exec_agent_sizing",
+                    interval_seconds=self.settings.exec_agent_watch_sizing_loop_interval_seconds,
+                    cycle=self._run_watch_exec_agent_sizing_cycle,
+                )
             )
-        )
         if self.settings.nxt_eligible_sync_enabled:
             self._nxt_eligible_sync_task = asyncio.create_task(
                 self._run_periodic_loop(

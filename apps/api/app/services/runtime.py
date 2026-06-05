@@ -23,6 +23,12 @@ from app.services.monitoring import (
     MONITORING_SELECTION_STRATEGY,
     PENDING_DISPATCH_MONITORING_STATUSES,
 )
+from app.services.trigger_time_exec_agent import (
+    AGENT_APPROVED_PENDING_SUBMIT_STATUS,
+    AGENT_DELAY_STATUS,
+    AGENT_PENDING_STATUS,
+    AGENT_REJECTED_STATUS,
+)
 from app.services.broker_auth import build_broker_session_summary
 from app.services.execution_api import list_runtime_symbols
 from app.services.schema import check_runtime_schema
@@ -44,6 +50,25 @@ WATCH_BUY_STATUSES = (
     "watch_buy_triggered_pending_dispatch",
     "watch_buy_submitted",
     "watch_buy_rejected",
+    AGENT_PENDING_STATUS,
+    AGENT_DELAY_STATUS,
+    AGENT_APPROVED_PENDING_SUBMIT_STATUS,
+)
+WATCHING_AGENT_COUNT_STATUSES = (
+    "watch_monitoring_pending",
+    "watch_monitoring_active",
+    "target_sell_monitoring",
+    "stop_sell_monitoring",
+    "max_holding_close_sell_monitoring",
+)
+AGENT_APPROVED_SUBMITTED_STATUSES = (
+    AGENT_APPROVED_PENDING_SUBMIT_STATUS,
+    "watch_buy_submitted",
+    "broker_order_submission_pending",
+    "broker_order_submitted",
+    "submitted",
+    "open",
+    "partially_filled",
 )
 SHORT_TERM_BLOCKED_STATUSES = (
     "short_term_watch_blocked",
@@ -161,6 +186,13 @@ def runtime_symbol_summary(
             or_(
                 ExecutionPlanItem.intent.in_(MONITORED_INTENTS),
                 ExecutionPlanItem.status.like("watch_%"),
+                ExecutionPlanItem.status.in_(
+                    (
+                        AGENT_PENDING_STATUS,
+                        AGENT_DELAY_STATUS,
+                        AGENT_APPROVED_PENDING_SUBMIT_STATUS,
+                    )
+                ),
             ),
         )
     ).all()
@@ -224,6 +256,13 @@ def runtime_monitored_symbols(
                         ExecutionPlanItem.status.endswith("_monitoring")
                         | ExecutionPlanItem.status.endswith("_pending_dispatch")
                         | ExecutionPlanItem.status.endswith("_triggered_blocked")
+                        | ExecutionPlanItem.status.in_(
+                            (
+                                AGENT_PENDING_STATUS,
+                                AGENT_DELAY_STATUS,
+                                AGENT_APPROVED_PENDING_SUBMIT_STATUS,
+                            )
+                        )
                     )
                 ),
                 (
@@ -250,6 +289,7 @@ def monitoring_payload(
     db: Session,
 ) -> dict[str, object]:
     segments = monitoring_segments(settings=settings, db=db)
+    agent_decisions = monitoring_agent_decision_counts(settings=settings, db=db)
     backlog_symbols = db.scalars(
         select(distinct(ExecutionPlanItem.symbol))
         .join(ExecutionPlanItem.plan)
@@ -292,6 +332,7 @@ def monitoring_payload(
                 "backlog_symbols": backlog_symbols,
             },
             "segments": segments,
+            "agent_decisions": agent_decisions,
             "workers": [],
             "last_heartbeat_at": None,
             "last_success_at": None,
@@ -337,6 +378,7 @@ def monitoring_payload(
             "backlog_symbols": backlog_symbols,
         },
         "segments": segments,
+        "agent_decisions": agent_decisions,
         "workers": [
             {
                 "name": checkpoint.worker_name,
@@ -357,6 +399,35 @@ def monitoring_payload(
         "last_heartbeat_at": last_heartbeat,
         "last_success_at": last_success,
         "last_cycle": latest_details or None,
+    }
+
+
+def monitoring_agent_decision_counts(
+    *,
+    settings: Settings,
+    db: Session,
+) -> dict[str, int]:
+    rows = db.execute(
+        select(ExecutionPlanItem.status, func.count())
+        .join(ExecutionPlanItem.plan)
+        .where(ExecutionPlan.mode == settings.runtime_mode)
+        .group_by(ExecutionPlanItem.status)
+    ).all()
+    counts_by_status = {str(status): int(count or 0) for status, count in rows}
+    watching = sum(counts_by_status.get(status, 0) for status in WATCHING_AGENT_COUNT_STATUSES)
+    pending = counts_by_status.get(AGENT_PENDING_STATUS, 0)
+    delayed = counts_by_status.get(AGENT_DELAY_STATUS, 0)
+    rejected = counts_by_status.get(AGENT_REJECTED_STATUS, 0)
+    approved_submitted = sum(
+        counts_by_status.get(status, 0)
+        for status in AGENT_APPROVED_SUBMITTED_STATUSES
+    )
+    return {
+        "watching": watching,
+        "pending_agent_decision": pending,
+        "agent_delayed": delayed,
+        "agent_rejected": rejected,
+        "agent_approved_submitted": approved_submitted,
     }
 
 
@@ -893,6 +964,13 @@ def _monitoring_payload_from_autonomous(
             "last_cycle_action_count": int((last_cycle or {}).get("dispatch_action_count", 0) or 0),
             "backlog_item_count": int((last_cycle or {}).get("backlog_item_count", 0) or 0),
             "backlog_symbols": (last_cycle or {}).get("backlog_symbols", []),
+        },
+        "agent_decisions": {
+            "watching": int((last_cycle or {}).get("agent_watching_count", 0) or 0),
+            "pending_agent_decision": int((last_cycle or {}).get("agent_pending_decision_count", 0) or 0),
+            "agent_delayed": int((last_cycle or {}).get("agent_delayed_count", 0) or 0),
+            "agent_rejected": int((last_cycle or {}).get("agent_rejected_count", 0) or 0),
+            "agent_approved_submitted": int((last_cycle or {}).get("agent_approved_submitted_count", 0) or 0),
         },
         "workers": [
             {

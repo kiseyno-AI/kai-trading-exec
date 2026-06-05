@@ -57,10 +57,13 @@ class Settings(BaseModel):
     exec_agent_first_take_profit_pct: Decimal = Field(default=Decimal("0.04"), gt=0, le=Decimal("0.10"))
     exec_agent_final_take_profit_pct: Decimal = Field(default=Decimal("0.08"), gt=0, le=Decimal("0.20"))
     exec_agent_partial_take_profit_fraction: Decimal = Field(default=Decimal("0.50"), gt=0, le=1)
+    exec_agent_trigger_time_enabled: bool = True
+    exec_agent_trigger_time_sell_enabled: bool = True
+    exec_agent_trigger_time_timeout_seconds: int = Field(default=90, ge=10, le=3600)
     monthly_target_krw: Decimal = Field(default=Decimal("500000"), gt=0)
     monthly_capital_preservation_enabled: bool = True
     monthly_aggressive_lag_ratio: Decimal = Field(default=Decimal("0.75"), gt=0, le=1)
-    exec_agent_watch_sizing_enabled: bool = True
+    exec_agent_watch_sizing_enabled: bool = False
     exec_agent_watch_sizing_loop_interval_seconds: float = Field(default=60.0, gt=0, le=3600)
     exec_agent_watch_sizing_batch_size: int = Field(default=3, ge=1, le=10)
     exec_agent_watch_sizing_max_batches_per_cycle: int = Field(default=3, ge=1, le=100)
@@ -151,6 +154,9 @@ _ENV_FIELDS = {
     "EXEC_AGENT_FIRST_TAKE_PROFIT_PCT": "exec_agent_first_take_profit_pct",
     "EXEC_AGENT_FINAL_TAKE_PROFIT_PCT": "exec_agent_final_take_profit_pct",
     "EXEC_AGENT_PARTIAL_TAKE_PROFIT_FRACTION": "exec_agent_partial_take_profit_fraction",
+    "EXEC_AGENT_TRIGGER_TIME_ENABLED": "exec_agent_trigger_time_enabled",
+    "EXEC_AGENT_TRIGGER_TIME_SELL_ENABLED": "exec_agent_trigger_time_sell_enabled",
+    "EXEC_AGENT_TRIGGER_TIME_TIMEOUT_SECONDS": "exec_agent_trigger_time_timeout_seconds",
     "MONTHLY_TARGET_KRW": "monthly_target_krw",
     "MONTHLY_CAPITAL_PRESERVATION_ENABLED": "monthly_capital_preservation_enabled",
     "MONTHLY_AGGRESSIVE_LAG_RATIO": "monthly_aggressive_lag_ratio",

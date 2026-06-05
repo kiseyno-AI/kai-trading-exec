@@ -169,6 +169,9 @@ Short-term exec risk settings currently supported:
 - `KAI_EXEC_EXEC_AGENT_FIRST_TAKE_PROFIT_PCT`
 - `KAI_EXEC_EXEC_AGENT_FINAL_TAKE_PROFIT_PCT`
 - `KAI_EXEC_EXEC_AGENT_PARTIAL_TAKE_PROFIT_FRACTION`
+- `KAI_EXEC_EXEC_AGENT_TRIGGER_TIME_ENABLED`
+- `KAI_EXEC_EXEC_AGENT_TRIGGER_TIME_SELL_ENABLED`
+- `KAI_EXEC_EXEC_AGENT_TRIGGER_TIME_TIMEOUT_SECONDS`
 - `KAI_EXEC_MONTHLY_TARGET_KRW`
 - `KAI_EXEC_MONTHLY_CAPITAL_PRESERVATION_ENABLED`
 - `KAI_EXEC_MONTHLY_AGGRESSIVE_LAG_RATIO`
@@ -183,7 +186,8 @@ Initial broker-order submission endpoint:
 
 Current execution slices:
 - `POST /execution-plans` schedules durable `execution_jobs` for eligible `next_open_buy` items
-- short-term watcher `next_open_buy` candidates from `short-term-decider` are run through deterministic exec-agent rails before scheduling; approved candidates are converted to concrete share quantities using account cash/buying power, existing exposure/open-order guards, candidate budget, confidence/conviction, and target/stop presence
+- short-term watcher `next_open_buy` candidates from `short-term-decider` are run through deterministic exec-agent rails before scheduling; approved next-open candidates are converted to concrete share quantities using account cash/buying power, existing exposure/open-order guards, candidate budget, confidence/conviction, and target/stop presence
+- monitored buy/sell triggers can call exec-agent at trigger time, immediately before broker submission, with current quote/account/order context; `execute_now` decisions drive submitted quantity and optional limit/target/stop adjustments, while `keep_watching`, `delay`, and `reject` are persisted on the monitoring item without submitting
 - the autonomous dispatch loop submits due jobs on its configured cadence
 - the autonomous monitoring loop retries persisted triggered/backlogged monitoring items on its configured cadence and can evaluate fresh triggers when a monitoring price source is configured
 - `POST /execution-jobs/dispatch` remains available as an operator/manual dispatch override

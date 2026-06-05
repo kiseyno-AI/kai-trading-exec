@@ -37,6 +37,13 @@ WATCH_MONITORING_STATUSES = frozenset(
         "watch_cancelled",
     }
 )
+AGENT_RUNTIME_MONITORING_STATUSES = frozenset(
+    {
+        "triggered_pending_agent",
+        "agent_delay",
+        "agent_approved_pending_submit",
+    }
+)
 OPEN_ORDER_STATUSES = frozenset({"submitted", "open", "partially_filled"})
 SHORT_TERM_DECIDER_NAME = "short-term-decider"
 ACTIVE_SHORT_TERM_TACTICAL_ACTIONS = frozenset({"scalp_buy_candidate", "watch_for_trigger"})
@@ -1050,4 +1057,8 @@ def _json_scalar(value: object) -> object:
 
 
 def _is_runtime_monitored_item(item: ExecutionPlanItem) -> bool:
-    return item.intent in MONITORED_INTENTS or item.status in WATCH_MONITORING_STATUSES
+    return (
+        item.intent in MONITORED_INTENTS
+        or item.status in WATCH_MONITORING_STATUSES
+        or item.status in AGENT_RUNTIME_MONITORING_STATUSES
+    )
