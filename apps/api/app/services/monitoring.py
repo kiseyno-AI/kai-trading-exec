@@ -35,10 +35,16 @@ from app.services.runtime_controls import (
     automated_order_submission_block_reason,
     ensure_runtime_control_state,
 )
+from app.services import trigger_time_exec_agent
 
 SELL_MONITORED_INTENTS = frozenset({"target_sell", "stop_sell", "max_holding_close_sell"})
 WATCH_BUY_INTENTS = frozenset({"watch_buy", "trigger_buy", "chase_buy", "tactical_buy", "intraday_watch_buy", "next_open_buy"})
 MONITORED_INTENTS = SELL_MONITORED_INTENTS | WATCH_BUY_INTENTS
+AGENT_PENDING_STATUS = trigger_time_exec_agent.AGENT_PENDING_STATUS
+AGENT_DELAY_STATUS = trigger_time_exec_agent.AGENT_DELAY_STATUS
+AGENT_REJECTED_STATUS = trigger_time_exec_agent.AGENT_REJECTED_STATUS
+AGENT_APPROVED_PENDING_SUBMIT_STATUS = trigger_time_exec_agent.AGENT_APPROVED_PENDING_SUBMIT_STATUS
+AGENT_ACTIVE_STATUSES = trigger_time_exec_agent.AGENT_ACTIVE_STATUSES
 WATCH_MONITORING_STATUSES = frozenset(
     {
         "watch_monitoring_pending",
@@ -50,6 +56,9 @@ WATCH_MONITORING_STATUSES = frozenset(
         "watch_cancelled",
         "watch_buy_triggered_blocked",
         "watch_buy_triggered_pending_dispatch",
+        AGENT_PENDING_STATUS,
+        AGENT_DELAY_STATUS,
+        AGENT_APPROVED_PENDING_SUBMIT_STATUS,
     }
 )
 BLOCKED_MONITORING_STATUSES = frozenset(
@@ -80,6 +89,7 @@ NON_MONITORABLE_PLAN_ITEM_STATUSES = frozenset(
         "broker_order_retry_pending",
         "broker_order_rejected",
         "broker_order_failed",
+        AGENT_REJECTED_STATUS,
         "submitted",
         "open",
         "partially_filled",
@@ -129,6 +139,9 @@ WATCH_BUY_EXPIRABLE_STATUSES = frozenset(
         "watch_monitoring_pending",
         "watch_buy_triggered_blocked",
         "watch_buy_triggered_pending_dispatch",
+        AGENT_PENDING_STATUS,
+        AGENT_DELAY_STATUS,
+        AGENT_APPROVED_PENDING_SUBMIT_STATUS,
     }
 )
 
@@ -143,6 +156,7 @@ class EvaluateMonitoringResult:
 class PendingMonitoringAction:
     item: ExecutionPlanItem
     observed_price: Decimal | None
+    observed_at: datetime | None = None
     trigger_reason: str | None = None
     trigger_metadata: dict[str, object] | None = None
 
@@ -159,6 +173,13 @@ class WatchBuyOrderApproval:
 class ProfitProtectionDecision:
     reason: str
     metadata: dict[str, object]
+
+
+@dataclass(frozen=True)
+class TriggerTimeAgentActionResult:
+    quantity: int | None
+    limit_price: Decimal | None
+    result_payload: dict[str, object]
 
 
 PROFIT_PROTECTION_TRIGGER_REASONS = frozenset(
@@ -433,6 +454,21 @@ def _evaluate_monitoring_cycle(
             )
             continue
 
+        agent_delay_until = _trigger_time_agent_delay_until(
+            settings=settings,
+            item=item,
+        )
+        if agent_delay_until is not None and triggered_at < agent_delay_until:
+            blocked_item_count += 1
+            result_by_item_id[item.id] = _monitoring_result_payload(
+                item=item,
+                observed_price=observed_price,
+                outcome="agent_delay",
+                block_reason="trigger_time_exec_agent_delay",
+                message="trigger-time exec-agent requested delayed reevaluation",
+            )
+            continue
+
         if _is_watch_buy_item(item) and not retry_persisted_trigger:
             quote_stale_reason = _quote_stale_reason(
                 settings=settings,
@@ -492,7 +528,7 @@ def _evaluate_monitoring_cycle(
         if trigger_reason is None:
             if item.status in (
                 BLOCKED_MONITORING_STATUSES | PENDING_DISPATCH_MONITORING_STATUSES
-            ):
+            ) or item.status in AGENT_ACTIVE_STATUSES:
                 item.status = _monitoring_status(item.intent)
             result_by_item_id[item.id] = _monitoring_result_payload(
                 item=item,
@@ -541,6 +577,7 @@ def _evaluate_monitoring_cycle(
             PendingMonitoringAction(
                 item=item,
                 observed_price=observed_price,
+                observed_at=_price_observed_at(price, triggered_at) if price is not None else None,
                 trigger_reason=trigger_reason,
                 trigger_metadata=trigger_metadata,
             )
@@ -557,72 +594,95 @@ def _evaluate_monitoring_cycle(
         action = symbol_actions.popleft()
         if action.item.status in (
             BLOCKED_MONITORING_STATUSES | PENDING_DISPATCH_MONITORING_STATUSES
-        ):
+        ) or action.item.status in AGENT_ACTIVE_STATUSES:
             action.item.status = _monitoring_status(action.item.intent)
         is_watch_buy = _is_watch_buy_item(action.item)
+        limit_price_override: Decimal | None = None
         if is_watch_buy:
             action.item.status = "watch_buy_triggered"
-            approval = _resolve_watch_buy_order(
+            if trigger_time_exec_agent.trigger_time_exec_agent_enabled(
                 settings=settings,
-                db=db,
-                adapter=adapter,
                 item=action.item,
-                observed_price=action.observed_price,
-            )
-            quantity = approval.quantity
-            if quantity is None:
-                blocked_item_count += 1
-                if approval.reason in (
-                    {"paused", "kill_switch"} | RETRYABLE_WATCH_BUY_APPROVAL_REASONS
-                ):
-                    action.item.status = "watch_buy_triggered_blocked"
-                    event: dict[str, object] = {
-                        "event": "watch_buy_triggered_blocked",
-                        "reason": approval.reason,
-                        "message": approval.message,
-                        "observed_price": _serialize_decimal(action.observed_price),
-                        "recorded_at": triggered_at.isoformat(),
-                    }
-                    if approval.reason in RETRYABLE_WATCH_BUY_APPROVAL_REASONS:
-                        event["retry_after_at"] = (
-                            triggered_at
-                            + timedelta(
-                                seconds=settings.monitoring_watch_buy_retry_cooldown_seconds
-                            )
-                        ).isoformat()
-                    _record_monitoring_event(
-                        item=action.item,
-                        event=event,
-                    )
-                    result_by_item_id[action.item.id] = _monitoring_result_payload(
-                        item=action.item,
-                        observed_price=action.observed_price,
-                        outcome="blocked",
-                        block_reason=approval.reason,
-                        message=approval.message,
-                    )
-                else:
-                    action.item.status = "watch_buy_rejected"
-                    _record_monitoring_event(
-                        item=action.item,
-                        event={
-                            "event": "watch_buy_rejected",
-                            "reason": approval.reason or "risk_rejected",
+            ):
+                agent_result = _resolve_trigger_time_agent_action(
+                    settings=settings,
+                    db=db,
+                    adapter=adapter,
+                    action=action,
+                    triggered_at=triggered_at,
+                    intended_quantity=None,
+                    remaining_quantity=None,
+                )
+                if agent_result.quantity is None:
+                    blocked_item_count += 1
+                    result_by_item_id[action.item.id] = agent_result.result_payload
+                    if symbol_actions:
+                        pending_symbols.append(symbol)
+                    continue
+                quantity = agent_result.quantity
+                limit_price_override = agent_result.limit_price
+            else:
+                approval = _resolve_watch_buy_order(
+                    settings=settings,
+                    db=db,
+                    adapter=adapter,
+                    item=action.item,
+                    observed_price=action.observed_price,
+                )
+                quantity = approval.quantity
+                if quantity is None:
+                    blocked_item_count += 1
+                    if approval.reason in (
+                        {"paused", "kill_switch"} | RETRYABLE_WATCH_BUY_APPROVAL_REASONS
+                    ):
+                        action.item.status = "watch_buy_triggered_blocked"
+                        event: dict[str, object] = {
+                            "event": "watch_buy_triggered_blocked",
+                            "reason": approval.reason,
                             "message": approval.message,
-                            "details": approval.details or {},
                             "observed_price": _serialize_decimal(action.observed_price),
                             "recorded_at": triggered_at.isoformat(),
-                        },
-                    )
-                    result_by_item_id[action.item.id] = _monitoring_result_payload(
-                        item=action.item,
-                        observed_price=action.observed_price,
-                        outcome="rejected",
-                        message=approval.message,
-                    )
-                if symbol_actions:
-                    pending_symbols.append(symbol)
-                continue
+                        }
+                        if approval.reason in RETRYABLE_WATCH_BUY_APPROVAL_REASONS:
+                            event["retry_after_at"] = (
+                                triggered_at
+                                + timedelta(
+                                    seconds=settings.monitoring_watch_buy_retry_cooldown_seconds
+                                )
+                            ).isoformat()
+                        _record_monitoring_event(
+                            item=action.item,
+                            event=event,
+                        )
+                        result_by_item_id[action.item.id] = _monitoring_result_payload(
+                            item=action.item,
+                            observed_price=action.observed_price,
+                            outcome="blocked",
+                            block_reason=approval.reason,
+                            message=approval.message,
+                        )
+                    else:
+                        action.item.status = "watch_buy_rejected"
+                        _record_monitoring_event(
+                            item=action.item,
+                            event={
+                                "event": "watch_buy_rejected",
+                                "reason": approval.reason or "risk_rejected",
+                                "message": approval.message,
+                                "details": approval.details or {},
+                                "observed_price": _serialize_decimal(action.observed_price),
+                                "recorded_at": triggered_at.isoformat(),
+                            },
+                        )
+                        result_by_item_id[action.item.id] = _monitoring_result_payload(
+                            item=action.item,
+                            observed_price=action.observed_price,
+                            outcome="rejected",
+                            message=approval.message,
+                        )
+                    if symbol_actions:
+                        pending_symbols.append(symbol)
+                    continue
         else:
             quantity = _resolve_sell_quantity(
                 item=action.item,
@@ -652,6 +712,27 @@ def _evaluate_monitoring_cycle(
                 if symbol_actions:
                     pending_symbols.append(symbol)
                 continue
+            if trigger_time_exec_agent.trigger_time_exec_agent_enabled(
+                settings=settings,
+                item=action.item,
+            ):
+                agent_result = _resolve_trigger_time_agent_action(
+                    settings=settings,
+                    db=db,
+                    adapter=adapter,
+                    action=action,
+                    triggered_at=triggered_at,
+                    intended_quantity=quantity,
+                    remaining_quantity=remaining_quantities_by_symbol.get(action.item.symbol),
+                )
+                if agent_result.quantity is None:
+                    blocked_item_count += 1
+                    result_by_item_id[action.item.id] = agent_result.result_payload
+                    if symbol_actions:
+                        pending_symbols.append(symbol)
+                    continue
+                quantity = agent_result.quantity
+                limit_price_override = agent_result.limit_price
 
         if dispatch_action_count >= max_broker_actions:
             symbol_actions.appendleft(action)
@@ -669,6 +750,7 @@ def _evaluate_monitoring_cycle(
                 trigger_reason=action.trigger_reason,
                 trigger_metadata=action.trigger_metadata,
                 triggered_at=triggered_at,
+                limit_price_override=limit_price_override,
             )
             if placement.status_code == 201:
                 if is_watch_buy:
@@ -690,6 +772,12 @@ def _evaluate_monitoring_cycle(
                     )
                 submitted_order_count += 1
                 submitted_symbols.add(action.item.symbol)
+                trigger_time_exec_agent.attach_order_to_last_trigger_time_interaction(
+                    item=action.item,
+                    order=placement.payload.get("order") if isinstance(placement.payload.get("order"), dict) else None,
+                    new_status=action.item.status,
+                    recorded_at=triggered_at,
+                )
                 result_by_item_id[action.item.id] = _monitoring_result_payload(
                     item=action.item,
                     observed_price=action.observed_price,
@@ -803,6 +891,11 @@ def _evaluate_monitoring_cycle(
         for item_id in evaluated_item_ids
         if item_id in result_by_item_id
     ]
+    db.flush()
+    agent_status_counts = _trigger_time_agent_status_counts(
+        settings=settings,
+        db=db,
+    )
     checkpoint_details = {
         "topology": MONITORING_RUNTIME_TOPOLOGY,
         "selection_strategy": MONITORING_SELECTION_STRATEGY,
@@ -822,6 +915,11 @@ def _evaluate_monitoring_cycle(
         "submitted_symbols": sorted(submitted_symbols),
         "backlog_item_count": deferred_item_count,
         "backlog_symbols": sorted(backlog_symbols),
+        "agent_watching_count": agent_status_counts["watching"],
+        "agent_pending_decision_count": agent_status_counts["pending_agent_decision"],
+        "agent_delayed_count": agent_status_counts["agent_delayed"],
+        "agent_rejected_count": agent_status_counts["agent_rejected"],
+        "agent_approved_submitted_count": agent_status_counts["agent_approved_submitted"],
     }
 
     checkpoint = None
@@ -898,6 +996,225 @@ def expire_prior_market_date_unfilled_watch_buys(
             },
         )
     return len(candidates)
+
+
+def _resolve_trigger_time_agent_action(
+    *,
+    settings: Settings,
+    db: Session,
+    adapter: BrokerAdapter,
+    action: PendingMonitoringAction,
+    triggered_at: datetime,
+    intended_quantity: int | None,
+    remaining_quantity: int | None,
+) -> TriggerTimeAgentActionResult:
+    item = action.item
+    previous_status = item.status
+    item.status = AGENT_PENDING_STATUS
+    _record_monitoring_event(
+        item=item,
+        event={
+            "event": "trigger_time_exec_agent_pending",
+            "trigger_reason": action.trigger_reason or item.intent,
+            "observed_price": _serialize_decimal(action.observed_price),
+            "recorded_at": triggered_at.isoformat(),
+        },
+    )
+    db.commit()
+
+    resolution = trigger_time_exec_agent.resolve_trigger_time_exec_agent_decision(
+        settings=settings,
+        db=db,
+        adapter=adapter,
+        item=item,
+        observed_price=action.observed_price,
+        observed_at=_price_observed_at_from_action(action=action, fallback=triggered_at),
+        triggered_at=triggered_at,
+        trigger_reason=action.trigger_reason,
+        trigger_metadata=action.trigger_metadata,
+        intended_quantity=intended_quantity,
+        remaining_quantity=remaining_quantity,
+    )
+    decision = resolution.decision
+    if decision.decision == "keep_watching":
+        item.status = _monitoring_status(item.intent)
+        _record_monitoring_event(
+            item=item,
+            event={
+                "event": "trigger_time_exec_agent_keep_watching",
+                "reason": decision.reason,
+                "observed_price": _serialize_decimal(action.observed_price),
+                "valid_until": _serialize_datetime(decision.valid_until),
+                "recorded_at": triggered_at.isoformat(),
+            },
+        )
+        trigger_time_exec_agent.record_trigger_time_exec_agent_interaction(
+            item=item,
+            resolution=resolution,
+            previous_status=previous_status,
+            new_status=item.status,
+            recorded_at=triggered_at,
+        )
+        return TriggerTimeAgentActionResult(
+            quantity=None,
+            limit_price=None,
+            result_payload=_monitoring_result_payload(
+                item=item,
+                observed_price=action.observed_price,
+                outcome="waiting",
+                message=decision.reason,
+                trigger_reason=action.trigger_reason,
+                trigger_metadata=action.trigger_metadata,
+            ),
+        )
+
+    if decision.decision == "delay":
+        item.status = AGENT_DELAY_STATUS
+        _record_monitoring_event(
+            item=item,
+            event={
+                "event": "trigger_time_exec_agent_delay",
+                "reason": decision.reason,
+                "observed_price": _serialize_decimal(action.observed_price),
+                "valid_until": _serialize_datetime(decision.valid_until),
+                "recorded_at": triggered_at.isoformat(),
+            },
+        )
+        trigger_time_exec_agent.record_trigger_time_exec_agent_interaction(
+            item=item,
+            resolution=resolution,
+            previous_status=previous_status,
+            new_status=item.status,
+            recorded_at=triggered_at,
+        )
+        return TriggerTimeAgentActionResult(
+            quantity=None,
+            limit_price=None,
+            result_payload=_monitoring_result_payload(
+                item=item,
+                observed_price=action.observed_price,
+                outcome="agent_delay",
+                block_reason="trigger_time_exec_agent_delay",
+                message=decision.reason,
+                trigger_reason=action.trigger_reason,
+                trigger_metadata=action.trigger_metadata,
+            ),
+        )
+
+    if decision.decision == "reject":
+        item.status = AGENT_REJECTED_STATUS
+        _record_monitoring_event(
+            item=item,
+            event={
+                "event": "trigger_time_exec_agent_rejected",
+                "reason": decision.reason,
+                "observed_price": _serialize_decimal(action.observed_price),
+                "recorded_at": triggered_at.isoformat(),
+            },
+        )
+        trigger_time_exec_agent.record_trigger_time_exec_agent_interaction(
+            item=item,
+            resolution=resolution,
+            previous_status=previous_status,
+            new_status=item.status,
+            recorded_at=triggered_at,
+        )
+        return TriggerTimeAgentActionResult(
+            quantity=None,
+            limit_price=None,
+            result_payload=_monitoring_result_payload(
+                item=item,
+                observed_price=action.observed_price,
+                outcome="rejected",
+                message=decision.reason,
+                trigger_reason=action.trigger_reason,
+                trigger_metadata=action.trigger_metadata,
+            ),
+        )
+
+    item.status = AGENT_APPROVED_PENDING_SUBMIT_STATUS
+    _apply_trigger_time_agent_adjustments(item=item, decision=decision)
+    _record_monitoring_event(
+        item=item,
+        event={
+            "event": "trigger_time_exec_agent_approved",
+            "reason": decision.reason,
+            "quantity": decision.quantity,
+            "limit_price": _serialize_decimal(decision.limit_price),
+            "updated_target_price": _serialize_decimal(decision.updated_target_price),
+            "updated_stop_price": _serialize_decimal(decision.updated_stop_price),
+            "observed_price": _serialize_decimal(action.observed_price),
+            "recorded_at": triggered_at.isoformat(),
+        },
+    )
+    trigger_time_exec_agent.record_trigger_time_exec_agent_interaction(
+        item=item,
+        resolution=resolution,
+        previous_status=previous_status,
+        new_status=item.status,
+        recorded_at=triggered_at,
+    )
+    return TriggerTimeAgentActionResult(
+        quantity=decision.quantity,
+        limit_price=decision.limit_price,
+        result_payload={},
+    )
+
+
+def _price_observed_at_from_action(
+    *,
+    action: PendingMonitoringAction,
+    fallback: datetime,
+) -> datetime | None:
+    if action.observed_price is None:
+        return None
+    return action.observed_at or fallback
+
+
+def _apply_trigger_time_agent_adjustments(
+    *,
+    item: ExecutionPlanItem,
+    decision: trigger_time_exec_agent.TriggerTimeExecAgentDecision,
+) -> None:
+    risk_context = dict(item.risk_context) if isinstance(item.risk_context, dict) else {}
+    if decision.limit_price is not None:
+        item.limit_price = decision.limit_price
+        risk_context["trigger_time_limit_price"] = _serialize_decimal(decision.limit_price)
+    if decision.updated_target_price is not None:
+        risk_context["target_price"] = _serialize_decimal(decision.updated_target_price)
+        risk_context["updated_target_price"] = _serialize_decimal(decision.updated_target_price)
+        _update_sibling_trigger_price(
+            item=item,
+            intent="target_sell",
+            trigger_price=decision.updated_target_price,
+        )
+    if decision.updated_stop_price is not None:
+        risk_context["stop_price"] = _serialize_decimal(decision.updated_stop_price)
+        risk_context["stop_loss_price"] = _serialize_decimal(decision.updated_stop_price)
+        risk_context["updated_stop_price"] = _serialize_decimal(decision.updated_stop_price)
+        _update_sibling_trigger_price(
+            item=item,
+            intent="stop_sell",
+            trigger_price=decision.updated_stop_price,
+        )
+    item.risk_context = risk_context
+
+
+def _update_sibling_trigger_price(
+    *,
+    item: ExecutionPlanItem,
+    intent: str,
+    trigger_price: Decimal,
+) -> None:
+    plan = item.plan
+    if plan is None:
+        return
+    for sibling in plan.items:
+        if sibling.symbol != item.symbol or sibling.intent != intent:
+            continue
+        if sibling.status in NON_MONITORABLE_PLAN_ITEM_STATUSES:
+            continue
+        sibling.trigger_price = trigger_price
 
 
 def _load_monitored_items(
@@ -980,6 +1297,46 @@ def _load_monitored_items(
         monitored_item_filter=monitored_item_filter,
         selected_items=selected_items,
     )
+
+
+def _trigger_time_agent_status_counts(
+    *,
+    settings: Settings,
+    db: Session,
+) -> dict[str, int]:
+    rows = db.execute(
+        select(ExecutionPlanItem.status, func.count())
+        .join(ExecutionPlanItem.plan)
+        .where(ExecutionPlan.mode == settings.runtime_mode)
+        .group_by(ExecutionPlanItem.status)
+    ).all()
+    counts_by_status = {str(status): int(count or 0) for status, count in rows}
+    watching_statuses = (
+        "watch_monitoring_pending",
+        "watch_monitoring_active",
+        "target_sell_monitoring",
+        "stop_sell_monitoring",
+        "max_holding_close_sell_monitoring",
+    )
+    approved_submitted_statuses = (
+        AGENT_APPROVED_PENDING_SUBMIT_STATUS,
+        "watch_buy_submitted",
+        "broker_order_submission_pending",
+        "broker_order_submitted",
+        "submitted",
+        "open",
+        "partially_filled",
+    )
+    return {
+        "watching": sum(counts_by_status.get(status, 0) for status in watching_statuses),
+        "pending_agent_decision": counts_by_status.get(AGENT_PENDING_STATUS, 0),
+        "agent_delayed": counts_by_status.get(AGENT_DELAY_STATUS, 0),
+        "agent_rejected": counts_by_status.get(AGENT_REJECTED_STATUS, 0),
+        "agent_approved_submitted": sum(
+            counts_by_status.get(status, 0)
+            for status in approved_submitted_statuses
+        ),
+    }
 
 
 def _append_held_stop_sell_fallbacks(
@@ -1124,6 +1481,31 @@ def _watch_buy_retry_blocked_until(
     if reason not in RETRYABLE_WATCH_BUY_APPROVAL_REASONS:
         return None
     recorded_at = _parse_event_datetime(event.get("recorded_at"))
+    if recorded_at is None:
+        return None
+    return recorded_at + timedelta(
+        seconds=settings.monitoring_watch_buy_retry_cooldown_seconds
+    )
+
+
+def _trigger_time_agent_delay_until(
+    *,
+    settings: Settings,
+    item: ExecutionPlanItem,
+) -> datetime | None:
+    if item.status != AGENT_DELAY_STATUS:
+        return None
+    risk_context = item.risk_context if isinstance(item.risk_context, dict) else {}
+    interaction = risk_context.get("last_trigger_time_exec_agent_interaction")
+    if not isinstance(interaction, dict):
+        return None
+    decision = interaction.get("decision")
+    valid_until = None
+    if isinstance(decision, dict):
+        valid_until = _parse_event_datetime(decision.get("valid_until"))
+    if valid_until is not None:
+        return valid_until
+    recorded_at = _parse_event_datetime(interaction.get("recorded_at"))
     if recorded_at is None:
         return None
     return recorded_at + timedelta(
@@ -2279,12 +2661,14 @@ def _place_monitoring_order(
     trigger_reason: str | None,
     trigger_metadata: dict[str, object] | None,
     triggered_at: datetime,
+    limit_price_override: Decimal | None = None,
 ):
     is_watch_buy = _is_watch_buy_item(item)
     limit_price = (
-        _watch_buy_limit_price(item=item, observed_price=observed_price)
+        limit_price_override
+        or _watch_buy_limit_price(item=item, observed_price=observed_price)
         if is_watch_buy
-        else item.limit_price
+        else limit_price_override or item.limit_price
     )
     order_request = PlaceOrderRequest(
         idempotency_key=_monitoring_order_idempotency_key(

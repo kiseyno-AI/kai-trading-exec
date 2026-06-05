@@ -312,8 +312,12 @@ def build_token_grant() -> BrokerTokenGrant:
     return BrokerTokenGrant(
         access_token="top-secret-token",
         token_type="Bearer",
-        access_token_expires_at=datetime.fromisoformat("2026-05-30T08:10:10+09:00"),
+        access_token_expires_at=_future_token_expiry(),
     )
+
+
+def _future_token_expiry() -> datetime:
+    return datetime.now(UTC) + timedelta(days=7)
 
 
 def build_order_placement(
@@ -644,7 +648,7 @@ def test_broker_authenticate_endpoint_persists_session_and_audit() -> None:
     token_grant = BrokerTokenGrant(
         access_token="top-secret-token",
         token_type="Bearer",
-        access_token_expires_at=datetime.fromisoformat("2026-05-30T08:10:10+09:00"),
+        access_token_expires_at=_future_token_expiry(),
     )
     broker_adapter = StubBrokerAdapter(
         config=BrokerConfig(
@@ -703,7 +707,7 @@ def test_broker_authenticate_endpoint_reuses_active_session_without_force() -> N
     token_grant = BrokerTokenGrant(
         access_token="stable-token",
         token_type="Bearer",
-        access_token_expires_at=datetime.fromisoformat("2026-05-30T08:10:10+09:00"),
+        access_token_expires_at=_future_token_expiry(),
     )
     broker_adapter = StubBrokerAdapter(
         config=BrokerConfig(
@@ -740,7 +744,7 @@ def test_broker_revoke_endpoint_clears_session_and_records_event() -> None:
     token_grant = BrokerTokenGrant(
         access_token="revocable-token",
         token_type="Bearer",
-        access_token_expires_at=datetime.fromisoformat("2026-05-30T08:10:10+09:00"),
+        access_token_expires_at=_future_token_expiry(),
     )
     broker_adapter = StubBrokerAdapter(
         config=BrokerConfig(
