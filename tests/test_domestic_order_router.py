@@ -163,6 +163,42 @@ def test_krx_regular_keeps_regular_limit_order_division() -> None:
     assert decision.ord_dvsn == "00"
 
 
+def test_krx_opening_call_auction_routes_0850_to_krx_limit() -> None:
+    decision = resolve_domestic_order_route(
+        settings=Settings(domestic_order_session_routing_enabled=True),
+        now=datetime(2026, 5, 28, 8, 56, tzinfo=KST),
+        symbol="043260",
+        side="buy",
+        purpose="intraday_watch_buy",
+        desired_order_type="limit",
+        limit_price=Decimal("51400"),
+        requested_exchange="KRX",
+    )
+
+    assert decision.action == "submit"
+    assert decision.exchange == "KRX"
+    assert decision.session == "krx_opening_call_auction"
+    assert decision.ord_dvsn == "00"
+    assert decision.effective_order_type == "limit"
+
+
+def test_krx_opening_call_auction_market_order_without_limit_blocks_buy() -> None:
+    decision = resolve_domestic_order_route(
+        settings=Settings(domestic_order_session_routing_enabled=True),
+        now=datetime(2026, 5, 28, 8, 56, tzinfo=KST),
+        symbol="043260",
+        side="buy",
+        purpose="intraday_watch_buy",
+        desired_order_type="market",
+        limit_price=None,
+        requested_exchange="KRX",
+    )
+
+    assert decision.action == "block"
+    assert decision.reason == "krx_opening_call_auction:limit_required"
+    assert decision.ord_dvsn is None
+
+
 def test_nxt_main_can_be_preferred_during_overlap() -> None:
     decision = resolve_domestic_order_route(
         settings=Settings(
