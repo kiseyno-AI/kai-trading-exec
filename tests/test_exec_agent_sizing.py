@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
 from fastapi.testclient import TestClient
 from sqlalchemy import select
+from sqlalchemy.orm import Session
 
 from app.broker.base import (
     BrokerAccountHolding,
@@ -26,6 +27,7 @@ from app.db.session import create_db_engine, create_session_factory
 from app.main import create_app
 from app.models.runtime import BrokerOrder, ExecutionJob, ExecutionPlan, ExecutionPlanItem, ExecutionPosition
 from app.services import exec_agent as strict_exec_agent
+from app.services import monitoring as monitoring_service
 from app.services import short_term_exec_agent as legacy_exec_agent
 
 
@@ -545,6 +547,83 @@ def test_short_term_exec_agent_enforces_daily_new_buy_notional_cap() -> None:
     assert items["005930"]["quantity_policy"]["quantity"] == 2
     assert items["000660"]["status"] == "exec_agent_rejected"
     assert items["000660"]["risk_context"]["exec_agent_decision"]["reason_code"] == "daily_new_buy_cap_reached"
+
+    engine.dispose()
+
+
+def test_daily_new_buy_notional_loaders_count_filled_buy_items() -> None:
+    adapter = StubBrokerAdapter()
+    app, engine = build_test_app(adapter)
+    market_date = date(2026, 5, 13)
+
+    with Session(engine) as db:
+        plan = ExecutionPlan(
+            external_plan_id="plan-filled-daily-notional",
+            source="kai-trading-core",
+            market_date=market_date,
+            mode=app.state.settings.runtime_mode,
+            raw_payload={},
+        )
+        other_date_plan = ExecutionPlan(
+            external_plan_id="plan-filled-daily-notional-other-date",
+            source="kai-trading-core",
+            market_date=date(2026, 5, 12),
+            mode=app.state.settings.runtime_mode,
+            raw_payload={},
+        )
+        plan.items = [
+            ExecutionPlanItem(
+                plan_item_index=0,
+                symbol="005930",
+                side="buy",
+                intent="next_open_buy",
+                status="filled",
+                quantity_policy={"kind": "shares", "quantity": 2},
+                limit_price=Decimal("50000"),
+            ),
+            ExecutionPlanItem(
+                plan_item_index=1,
+                symbol="000660",
+                side="buy",
+                intent="next_open_buy",
+                status="partially_filled",
+                quantity_policy={"kind": "shares", "quantity": 1},
+                limit_price=Decimal("70000"),
+            ),
+            ExecutionPlanItem(
+                plan_item_index=2,
+                symbol="035420",
+                side="sell",
+                intent="target_sell",
+                status="filled",
+                quantity_policy={"kind": "shares", "quantity": 10},
+                limit_price=Decimal("100000"),
+            ),
+        ]
+        other_date_plan.items = [
+            ExecutionPlanItem(
+                plan_item_index=0,
+                symbol="005930",
+                side="buy",
+                intent="next_open_buy",
+                status="filled",
+                quantity_policy={"kind": "shares", "quantity": 99},
+                limit_price=Decimal("50000"),
+            )
+        ]
+        db.add_all([plan, other_date_plan])
+        db.commit()
+
+        assert strict_exec_agent._load_daily_new_buy_notional(
+            settings=app.state.settings,
+            db=db,
+            market_date=market_date,
+        ) == Decimal("170000.0000")
+        assert monitoring_service._load_daily_new_buy_notional(
+            settings=app.state.settings,
+            db=db,
+            market_date=market_date,
+        ) == Decimal("170000.0000")
 
     engine.dispose()
 

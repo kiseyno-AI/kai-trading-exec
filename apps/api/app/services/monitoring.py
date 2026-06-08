@@ -282,6 +282,32 @@ def expire_known_flat_pending_sell_monitors(
     expired_at: datetime | None = None,
 ) -> int:
     expired_at = _normalize_utc(expired_at or datetime.now(UTC))
+    latest_buy_order_at = (
+        select(func.max(BrokerOrder.created_at))
+        .where(
+            BrokerOrder.mode == settings.runtime_mode,
+            BrokerOrder.symbol == ExecutionPlanItem.symbol,
+            BrokerOrder.side == "buy",
+            BrokerOrder.status.in_(("submitted", "open", "partially_filled", "filled")),
+        )
+        .correlate(ExecutionPlanItem)
+        .scalar_subquery()
+    )
+    latest_sell_order_at = (
+        select(func.max(BrokerOrder.created_at))
+        .where(
+            BrokerOrder.mode == settings.runtime_mode,
+            BrokerOrder.symbol == ExecutionPlanItem.symbol,
+            BrokerOrder.side == "sell",
+            BrokerOrder.status.in_(("submitted", "open", "partially_filled", "filled")),
+        )
+        .correlate(ExecutionPlanItem)
+        .scalar_subquery()
+    )
+    has_unexited_buy_order = and_(
+        latest_buy_order_at.is_not(None),
+        or_(latest_sell_order_at.is_(None), latest_buy_order_at > latest_sell_order_at),
+    )
     held_symbols = select(ExecutionPosition.symbol).where(
         ExecutionPosition.mode == settings.runtime_mode,
         ExecutionPosition.quantity > 0,
@@ -311,6 +337,7 @@ def expire_known_flat_pending_sell_monitors(
             ExecutionPlanItem.symbol.in_(known_flat_symbols),
             ExecutionPlanItem.symbol.not_in(held_symbols),
             ExecutionPlanItem.symbol.not_in(active_watch_symbols),
+            ~has_unexited_buy_order,
         )
         .options(selectinload(ExecutionPlanItem.plan))
         .order_by(
@@ -1413,25 +1440,23 @@ def _append_held_stop_sell_fallbacks(
     monitored_item_filter,
     selected_items: list[ExecutionPlanItem],
 ) -> list[ExecutionPlanItem]:
-    if not selected_items:
-        return selected_items
-
-    selected_symbols = {item.symbol for item in selected_items}
     symbols_with_stop = {
         item.symbol
         for item in selected_items
         if item.side == "sell" and item.intent == "stop_sell"
     }
-    fallback_symbols = db.scalars(
-        select(ExecutionPosition.symbol)
-        .where(
-            ExecutionPosition.mode == settings.runtime_mode,
-            ExecutionPosition.quantity > 0,
-            ExecutionPosition.symbol.in_(selected_symbols - symbols_with_stop),
-        )
-    ).all()
+    held_symbols = set(
+        db.scalars(
+            select(ExecutionPosition.symbol).where(
+                ExecutionPosition.mode == settings.runtime_mode,
+                ExecutionPosition.quantity > 0,
+            )
+        ).all()
+    )
+    fallback_symbols = held_symbols - symbols_with_stop
     if not fallback_symbols:
         return selected_items
+    fallback_symbols = sorted(fallback_symbols)
 
     fallback_candidates = (
         select(
@@ -2217,11 +2242,38 @@ def _resolve_watch_buy_order(
         event["exec_agent_watch_sizing_attempt_count"] = (
             item.risk_context or {}
         ).get("exec_agent_watch_sizing_attempt_count") if isinstance(item.risk_context, dict) else None
+    if effective_stop > stop_price:
+        _apply_watch_buy_effective_stop(
+            item=item,
+            effective_stop=effective_stop,
+            upstream_stop=stop_price,
+        )
+        event["stop_monitor_adjustment"] = "raised_to_effective_risk_stop"
     _record_monitoring_event(
         item=item,
         event=event,
     )
     return WatchBuyOrderApproval(quantity=risk_decision.quantity)
+
+
+def _apply_watch_buy_effective_stop(
+    *,
+    item: ExecutionPlanItem,
+    effective_stop: Decimal,
+    upstream_stop: Decimal,
+) -> None:
+    risk_context = dict(item.risk_context) if isinstance(item.risk_context, dict) else {}
+    risk_context["effective_stop_price"] = _serialize_decimal(effective_stop)
+    risk_context["upstream_stop_price"] = _serialize_decimal(upstream_stop)
+    risk_context["stop_price"] = _serialize_decimal(effective_stop)
+    risk_context["stop_loss_price"] = _serialize_decimal(effective_stop)
+    risk_context["stop_monitor_adjustment"] = "raised_to_effective_risk_stop"
+    item.risk_context = risk_context
+    _update_sibling_trigger_price(
+        item=item,
+        intent="stop_sell",
+        trigger_price=effective_stop,
+    )
 
 
 def _parse_buy_quantity(quantity_policy: dict[str, object] | None) -> int | None:
@@ -2394,6 +2446,7 @@ def _load_daily_new_buy_notional(
                     "submitted",
                     "open",
                     "partially_filled",
+                    "filled",
                     "retry_pending",
                 )
             ),

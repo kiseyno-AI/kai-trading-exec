@@ -738,6 +738,7 @@ def _extract_reconcile_order_info(
         _parse_decimal(row.get("avg_upr"))
         or _parse_decimal(row.get("trd_prc"))
         or _parse_decimal(row.get("avg_pric"))
+        or _parse_decimal(row.get("avg_prvs"))
         or _parse_decimal(row.get("ord_unpr"))
     )
     filled_at = _reconcile_filled_timestamp(row, observed_at=observed_at)

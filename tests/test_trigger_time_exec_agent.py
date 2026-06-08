@@ -245,6 +245,98 @@ def test_trigger_time_buy_agent_quantity_is_clamped_by_deterministic_sizing(
     engine.dispose()
 
 
+def test_trigger_time_buy_effective_risk_stop_updates_stop_monitor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, engine, client, broker_adapter, _captured = _build_trigger_agent_app(
+        monkeypatch=monkeypatch,
+        agent_responses=[
+            {
+                "decision": "execute_now",
+                "side": "buy",
+                "quantity": 10,
+                "limit_price": "71075.00",
+                "updated_stop_price": "60000.00",
+                "reason": "agent stop is too wide but buy can proceed with deterministic risk stop",
+                "risk_notes": ["deterministic sizing should tighten the actual monitor stop"],
+                "confidence": "0.72",
+                "context_staleness_ok": True,
+            }
+        ],
+    )
+    response = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-trigger-agent-effective-stop-monitor",
+            "source": "kai-trading-core",
+            "market_date": "2026-06-05",
+            "items": [
+                {
+                    "symbol": "005930",
+                    "side": "buy",
+                    "intent": "intraday_watch_buy",
+                    "quantity_policy": {
+                        "type": "exec_agent_sized",
+                        "budget_krw": "0",
+                        "max_safe_notional_krw": "300000",
+                    },
+                    "trigger_price": "71000.00",
+                    "time_in_force": "day",
+                    "risk_context": {
+                        "exchange": "KRX",
+                        "target_price": "72420.00",
+                        "stop_price": "60000.00",
+                    },
+                },
+                {
+                    "symbol": "005930",
+                    "side": "sell",
+                    "intent": "stop_sell",
+                    "quantity_policy": {"kind": "position_exit_from_entry"},
+                    "trigger_price": "60000.00",
+                    "time_in_force": "day",
+                    "risk_context": {"exchange": "KRX"},
+                },
+            ],
+        },
+    )
+    assert response.status_code == 201
+    buy_item_id, stop_item_id = response.json()["persisted_execution_item_ids"]
+
+    result = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "effective stop should be propagated before broker submission",
+            "prices": [{"symbol": "005930", "price": "71050.00"}],
+        },
+    )
+
+    assert result.status_code == 200
+    assert result.json()["submitted_order_count"] == 1
+    assert len(broker_adapter.order_calls) == 1
+    assert broker_adapter.order_calls[0].execution_plan_item_id == buy_item_id
+
+    with app.state.db_session_factory() as session:
+        buy_item = session.get(ExecutionPlanItem, buy_item_id)
+        stop_item = session.get(ExecutionPlanItem, stop_item_id)
+        assert buy_item is not None
+        assert stop_item is not None
+        assert stop_item.trigger_price == Decimal("68208.0000")
+        assert buy_item.risk_context["effective_stop_price"] == "68208.0000"
+        assert buy_item.risk_context["upstream_stop_price"] == "60000.0000"
+        assert buy_item.risk_context["stop_monitor_adjustment"] == "raised_to_effective_risk_stop"
+        sizing_events = [
+            event
+            for event in buy_item.risk_context["monitoring_events"]
+            if event["event"] == "watch_buy_risk_sized"
+        ]
+        assert sizing_events[-1]["stop_monitor_adjustment"] == "raised_to_effective_risk_stop"
+
+    engine.dispose()
+
+
 @pytest.mark.parametrize(
     ("agent_response", "expected_status", "expected_outcome", "expected_count_key"),
     [

@@ -651,6 +651,7 @@ def _load_daily_new_buy_notional(
                     "submitted",
                     "open",
                     "partially_filled",
+                    "filled",
                     "retry_pending",
                 )
             ),
