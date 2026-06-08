@@ -113,6 +113,24 @@ def _create_intraday_watch_buy(
     return response.json()["persisted_execution_item_ids"][0]
 
 
+def _live_price_payload(price: str = "71050.00") -> dict[str, object]:
+    return {
+        "symbol": "005930",
+        "price": price,
+        "bid": "71045.00",
+        "ask": "71055.00",
+        "spread": "10.00",
+        "spread_bps": "1.41",
+        "orderbook_depth": "450000000",
+        "orderbook_imbalance": "0.08",
+        "volume": "1250000",
+        "turnover": "88750000000",
+        "session_type": "regular",
+        "normal_ordering_available": True,
+        "provenance": {"source": "test_live_market_quality"},
+    }
+
+
 def test_trigger_time_buy_agent_context_approval_quantity_drives_submission(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -141,7 +159,7 @@ def test_trigger_time_buy_agent_context_approval_quantity_drives_submission(
             "actor": "ops",
             "source": "test",
             "reason": "trigger buy with agent",
-            "prices": [{"symbol": "005930", "price": "71050.00"}],
+            "prices": [_live_price_payload()],
         },
     )
 
@@ -155,6 +173,13 @@ def test_trigger_time_buy_agent_context_approval_quantity_drives_submission(
     assert request["signal_context"]["execution_plan_item_id"] == item_id
     assert request["market_context"]["latest_price"] == "71050.0000"
     assert request["market_context"]["context_staleness_ok"] is True
+    assert request["market_context"]["live_execution_context_available"] is True
+    assert request["market_context"]["missing_critical_fields"] == []
+    assert request["market_context"]["bid"] == "71045.0000"
+    assert request["market_context"]["ask"] == "71055.0000"
+    assert request["market_context"]["orderbook_depth"] == "450000000.0000"
+    assert request["market_context"]["volume"] == "1250000.0000"
+    assert request["market_context"]["turnover"] == "88750000000.0000"
     assert request["account_context"]["orderable_cash_krw"] == "1000000.0000"
     assert request["execution_context"]["intended_quantity"] is None
 
@@ -172,9 +197,78 @@ def test_trigger_time_buy_agent_context_approval_quantity_drives_submission(
         assert item.limit_price == Decimal("71075.0000")
         assert item.risk_context["target_price"] == "72500.0000"
         assert item.risk_context["stop_price"] == "69950.0000"
+        approved_events = [
+            event
+            for event in item.risk_context["monitoring_events"]
+            if event["event"] == "trigger_time_exec_agent_approved"
+        ]
+        approved_event = approved_events[-1]
+        assert approved_event["event"] == "trigger_time_exec_agent_approved"
+        assert approved_event["market_quality_gate"]["available"] is True
         interaction = item.risk_context["last_trigger_time_exec_agent_interaction"]
         assert interaction["decision"]["decision"] == "execute_now"
         assert interaction["order"]["quantity"] == 3
+
+    engine.dispose()
+
+
+def test_trigger_time_buy_missing_live_market_quality_delays_without_agent_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, engine, client, broker_adapter, captured = _build_trigger_agent_app(
+        monkeypatch=monkeypatch,
+        agent_responses=[
+            {
+                "decision": "execute_now",
+                "side": "buy",
+                "quantity": 3,
+                "reason": "should not be called through missing live quality gate",
+                "context_staleness_ok": True,
+            }
+        ],
+    )
+    item_id = _create_intraday_watch_buy(client, plan_id="plan-trigger-agent-buy-missing-live-quality")
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "missing live quality should delay",
+            "prices": [{"symbol": "005930", "price": "71050.00"}],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["submitted_order_count"] == 0
+    assert payload["blocked_item_count"] == 1
+    assert payload["items"][0]["outcome"] == "agent_delay"
+    assert captured == []
+    assert broker_adapter.order_calls == []
+
+    with app.state.db_session_factory() as session:
+        item = session.get(ExecutionPlanItem, item_id)
+        assert item is not None
+        assert item.status == "agent_delay"
+        interaction = item.risk_context["last_trigger_time_exec_agent_interaction"]
+        assert interaction["source"] == "exec_runtime_market_quality_gate"
+        assert interaction["decision"]["decision"] == "delay"
+        market_context = interaction["request_payload"]["market_context"]
+        assert market_context["live_execution_context_available"] is False
+        assert set(market_context["missing_critical_fields"]) >= {
+            "bid",
+            "ask",
+            "orderbook",
+            "volume",
+        }
+        delay_events = [
+            event
+            for event in item.risk_context["monitoring_events"]
+            if event["event"] == "trigger_time_exec_agent_delay"
+        ]
+        assert delay_events[-1]["market_quality_gate"]["available"] is False
+        assert "bid" in delay_events[-1]["market_quality_gate"]["missing_fields"]
 
     engine.dispose()
 
@@ -209,7 +303,7 @@ def test_trigger_time_buy_agent_quantity_is_clamped_by_deterministic_sizing(
             "actor": "ops",
             "source": "test",
             "reason": "oversized trigger-time agent buy should be risk clamped",
-            "prices": [{"symbol": "005930", "price": "71050.00"}],
+            "prices": [_live_price_payload()],
         },
     )
 
@@ -309,7 +403,7 @@ def test_trigger_time_buy_effective_risk_stop_updates_stop_monitor(
             "actor": "ops",
             "source": "test",
             "reason": "effective stop should be propagated before broker submission",
-            "prices": [{"symbol": "005930", "price": "71050.00"}],
+            "prices": [_live_price_payload()],
         },
     )
 
@@ -388,7 +482,7 @@ def test_trigger_time_buy_delay_or_reject_does_not_submit_and_is_audited(
             "actor": "ops",
             "source": "test",
             "reason": "trigger buy agent no-submit",
-            "prices": [{"symbol": "005930", "price": "71050.00"}],
+            "prices": [_live_price_payload()],
         },
     )
 
@@ -441,7 +535,7 @@ def test_trigger_time_missing_account_context_delays_without_agent_call(
             "actor": "ops",
             "source": "test",
             "reason": "missing account should delay",
-            "prices": [{"symbol": "005930", "price": "71050.00"}],
+            "prices": [_live_price_payload()],
         },
     )
 

@@ -94,6 +94,7 @@ class KisCurrentQuoteMonitoringPriceSource:
                         symbol=quote.symbol,
                         price=quote.price,
                         observed_at=quote.observed_at,
+                        **_market_quality_from_quote_payload(quote.payload),
                     )
                 )
             priced_set = set(priced_symbols)
@@ -113,6 +114,46 @@ class KisCurrentQuoteMonitoringPriceSource:
 
     def get_last_diagnostics(self) -> dict[str, object]:
         return dict(self._last_diagnostics)
+
+
+def _market_quality_from_quote_payload(payload: dict[str, object]) -> dict[str, object]:
+    output = payload.get("output")
+    if not isinstance(output, dict):
+        output = payload
+    return {
+        "bid": _first_value(output, "bid", "bid_price", "best_bid", "bidp", "bidp1"),
+        "ask": _first_value(output, "ask", "ask_price", "best_ask", "askp", "askp1"),
+        "spread": _first_value(output, "spread", "spread_price"),
+        "spread_bps": _first_value(output, "spread_bps", "spread_bp"),
+        "orderbook_depth": _first_value(output, "orderbook_depth", "book_depth", "total_depth"),
+        "orderbook_imbalance": _first_value(output, "orderbook_imbalance", "book_imbalance"),
+        "volume": _first_value(output, "volume", "accumulated_volume", "acml_vol"),
+        "turnover": _first_value(output, "turnover", "trading_value", "acml_tr_pbmn"),
+        "session_type": _first_value(output, "session_type", "session", "market_state"),
+        "normal_ordering_available": _normal_ordering_available(output),
+        "provenance": {"source": "broker_current_price_payload"},
+    }
+
+
+def _first_value(payload: dict[str, object], *keys: str) -> object | None:
+    for key in keys:
+        value = payload.get(key)
+        if value is not None:
+            return value
+    return None
+
+
+def _normal_ordering_available(payload: dict[str, object]) -> bool | None:
+    value = _first_value(payload, "normal_ordering_available", "ordering_available")
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "y", "available", "open"}:
+            return True
+        if normalized in {"false", "0", "no", "n", "unavailable", "closed"}:
+            return False
+    return None
 
 
 def _ensure_authenticated_broker_session_with_retry(
