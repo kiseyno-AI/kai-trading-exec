@@ -709,7 +709,8 @@ def _normalize_reconcile_order(
             row,
             observed_at=observed_at,
             raw_status=(
-                _optional_string(row.get("ord_ccld_status_name"))
+                _rejection_status_from_order_kind(row)
+                or _optional_string(row.get("ord_ccld_status_name"))
                 or _optional_string(row.get("ord_st_dvsn_cd_name"))
                 or _optional_string(row.get("ord_sts_name"))
             ),
@@ -792,6 +793,28 @@ def _normalize_reconcile_status(
     if requested_quantity > 0:
         return "open"
     return "unknown"
+
+
+def _rejection_status_from_order_kind(row: dict[str, object]) -> str | None:
+    raw = " ".join(
+        str(value)
+        for value in (
+            row.get("sll_buy_dvsn_cd_name"),
+            row.get("sll_buy_dvsn_name"),
+            row.get("ord_dvsn_name"),
+        )
+        if value is not None
+    )
+    normalized = raw.strip().lower()
+    if not normalized:
+        return None
+    if "거부" in normalized or "reject" in normalized:
+        return "거부"
+    if "실패" in normalized or "fail" in normalized:
+        return "실패"
+    if "취소" in normalized or "cancel" in normalized:
+        return "취소"
+    return None
 
 
 def _reconcile_filled_timestamp(
