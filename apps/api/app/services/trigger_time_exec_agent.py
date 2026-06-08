@@ -153,6 +153,7 @@ def resolve_trigger_time_exec_agent_decision(
     trigger_reason: str | None,
     trigger_metadata: dict[str, object] | None,
     intended_quantity: int | None,
+    live_market_context: dict[str, object] | None = None,
     remaining_quantity: int | None = None,
 ) -> TriggerTimeExecAgentResolution:
     side = "buy" if item.side == "buy" else "sell"
@@ -164,6 +165,7 @@ def resolve_trigger_time_exec_agent_decision(
         triggered_at=triggered_at,
         trigger_reason=trigger_reason,
         trigger_metadata=trigger_metadata,
+        live_market_context=live_market_context,
     )
     if stale_reason is not None:
         request_payload = _request_payload(
@@ -182,6 +184,27 @@ def resolve_trigger_time_exec_agent_decision(
             decision="delay",
             reason=stale_reason,
             source="exec_runtime_context_gate",
+            context_staleness_ok=False,
+        )
+    if side == "buy" and market_context.get("live_execution_context_available") is not True:
+        missing_fields = market_context.get("missing_critical_fields")
+        missing_text = ", ".join(missing_fields) if isinstance(missing_fields, list) else "unknown"
+        request_payload = _request_payload(
+            settings=settings,
+            item=item,
+            side=side,
+            market_context=market_context,
+            account_context={"available": False, "reason": "live execution quality gate blocked before account load"},
+            peer_context=_peer_context(settings=settings, db=db, item=item),
+            intended_quantity=intended_quantity,
+            remaining_quantity=remaining_quantity,
+        )
+        return _local_resolution(
+            request_payload=request_payload,
+            side=side,
+            decision="delay",
+            reason=f"live execution quality context is incomplete for trigger-time buy: {missing_text}",
+            source="exec_runtime_market_quality_gate",
             context_staleness_ok=False,
         )
 
@@ -355,7 +378,8 @@ def _request_payload(
         "model": getattr(settings, "exec_agent_model", "openai-codex/gpt-5.5"),
         "task": (
             "Make the final trigger-time execution decision immediately before broker submission. "
-            "Return JSON only with decision execute_now, keep_watching, delay, or reject."
+            "Return JSON only with decision execute_now, keep_watching, delay, or reject. "
+            "For buys, execute_now is allowed only when market_context.live_execution_context_available is true."
         ),
         "plan": {
             "plan_id": plan.external_plan_id if plan is not None else None,
@@ -454,6 +478,7 @@ def _market_context(
     triggered_at: datetime,
     trigger_reason: str | None,
     trigger_metadata: dict[str, object] | None,
+    live_market_context: dict[str, object] | None,
 ) -> tuple[dict[str, object], str | None]:
     normalized_observed_at = _normalize_utc(observed_at) if observed_at is not None else None
     stale_reason = None
@@ -471,14 +496,67 @@ def _market_context(
             )
     risk_context = item.risk_context if isinstance(item.risk_context, dict) else {}
     market_payload = _first_dict(risk_context, keys=("market_data", "quote", "orderbook", "order_book")) or {}
+    live_payload = live_market_context or {}
+    live_orderbook_payload = _first_dict(live_payload, keys=("orderbook", "order_book")) or {}
     session_type = (
-        market_payload.get("session_type")
-        or market_payload.get("session")
-        or risk_context.get("session_type")
-        or risk_context.get("route_now")
+        _first_payload_value(
+            live_payload,
+            keys=("session_type", "session", "market_state", "route_now"),
+        )
     )
-    bid = _first_payload_value(market_payload, risk_context, keys=("bid", "bid_price", "best_bid"))
-    ask = _first_payload_value(market_payload, risk_context, keys=("ask", "ask_price", "best_ask"))
+    bid = _first_payload_value(live_payload, keys=("bid", "bid_price", "best_bid"))
+    ask = _first_payload_value(live_payload, keys=("ask", "ask_price", "best_ask"))
+    spread = _first_payload_value(
+        live_payload,
+        keys=("spread", "spread_price"),
+    )
+    spread_bps = _first_payload_value(
+        live_payload,
+        keys=("spread_bps", "spread_bp"),
+    )
+    orderbook_depth = _first_payload_value(
+        live_payload,
+        live_orderbook_payload,
+        keys=("orderbook_depth", "book_depth", "total_depth", "depth"),
+    )
+    orderbook_imbalance = _first_payload_value(
+        live_payload,
+        live_orderbook_payload,
+        keys=("orderbook_imbalance", "book_imbalance", "imbalance"),
+    )
+    volume = _first_payload_value(
+        live_payload,
+        keys=("volume", "accumulated_volume"),
+    )
+    turnover = _first_payload_value(
+        live_payload,
+        keys=("turnover", "trading_value"),
+    )
+    normal_ordering_available = _first_payload_value(
+        live_payload,
+        keys=("normal_ordering_available", "ordering_available"),
+    )
+    missing_fields = _live_execution_quality_missing_fields(
+        bid=bid,
+        ask=ask,
+        orderbook_depth=orderbook_depth,
+        orderbook_imbalance=orderbook_imbalance,
+        volume=volume,
+        turnover=turnover,
+        session_type=session_type,
+        normal_ordering_available=normal_ordering_available,
+    )
+    context_available = stale_reason is None and not missing_fields
+    field_freshness = {
+        "latest_price": {"available": observed_price is not None, "observed_at": normalized_observed_at.isoformat() if normalized_observed_at is not None else None},
+        "bid": _field_presence(bid, source="live_market_context"),
+        "ask": _field_presence(ask, source="live_market_context"),
+        "orderbook": _field_presence(orderbook_depth if orderbook_depth is not None else orderbook_imbalance, source="live_market_context"),
+        "volume": _field_presence(volume, source="live_market_context"),
+        "turnover": _field_presence(turnover, source="live_market_context"),
+        "session_type": _field_presence(session_type, source="live_market_context"),
+        "normal_ordering_available": _field_presence(normal_ordering_available, source="live_market_context"),
+    }
     return (
         {
             "symbol": item.symbol,
@@ -489,16 +567,28 @@ def _market_context(
             "max_quote_age_seconds": settings.monitoring_max_quote_age_seconds,
             "context_staleness_ok": stale_reason is None,
             "stale_reason": stale_reason,
+            "live_execution_context_available": context_available,
+            "missing_critical_fields": missing_fields,
+            "field_freshness": _json_safe(field_freshness),
+            "live_execution_quality_gate": {
+                "available": context_available,
+                "missing_fields": missing_fields,
+                "stale_reason": stale_reason,
+            },
             "bid": _json_scalar(bid),
             "ask": _json_scalar(ask),
-            "spread": _json_scalar(_first_payload_value(market_payload, risk_context, keys=("spread", "spread_price"))),
-            "spread_bps": _json_scalar(_first_payload_value(market_payload, risk_context, keys=("spread_bps", "spread_bp"))),
-            "volume": _json_scalar(_first_payload_value(market_payload, risk_context, keys=("volume", "accumulated_volume"))),
-            "turnover": _json_scalar(_first_payload_value(market_payload, risk_context, keys=("turnover", "trading_value"))),
+            "spread": _json_scalar(spread),
+            "spread_bps": _json_scalar(spread_bps),
+            "orderbook_depth": _json_scalar(orderbook_depth),
+            "orderbook_imbalance": _json_scalar(orderbook_imbalance),
+            "volume": _json_scalar(volume),
+            "turnover": _json_scalar(turnover),
             "session_type": str(session_type) if session_type is not None else None,
+            "normal_ordering_available": normal_ordering_available,
             "trigger_reason": trigger_reason or item.intent,
             "trigger_metadata": trigger_metadata,
             "raw_market_payload": _json_safe(market_payload),
+            "live_market_context": _json_safe(live_payload),
         },
         stale_reason,
     )
@@ -727,6 +817,8 @@ Use only this compact current execution context. Return JSON only:
 }}
 
 Only execute_now when quote and account context are fresh enough for broker submission.
+For buy decisions, only execute_now when market_context.live_execution_context_available is true.
+If bid/ask/orderbook/volume/turnover/session quality is missing, return delay or keep_watching.
 """.strip()
     timeout_seconds = getattr(settings, "exec_agent_trigger_time_timeout_seconds", 90)
     command = [
@@ -907,6 +999,42 @@ def _first_text(*payloads: dict[str, object], keys: tuple[str, ...]) -> str | No
                 if text:
                     return text
     return None
+
+
+def _live_execution_quality_missing_fields(
+    *,
+    bid: object | None,
+    ask: object | None,
+    orderbook_depth: object | None,
+    orderbook_imbalance: object | None,
+    volume: object | None,
+    turnover: object | None,
+    session_type: object | None,
+    normal_ordering_available: object | None,
+) -> list[str]:
+    missing: list[str] = []
+    if bid is None:
+        missing.append("bid")
+    if ask is None:
+        missing.append("ask")
+    if orderbook_depth is None and orderbook_imbalance is None:
+        missing.append("orderbook")
+    if volume is None:
+        missing.append("volume")
+    if turnover is None:
+        missing.append("turnover")
+    if session_type is None:
+        missing.append("session_type")
+    if normal_ordering_available is not True:
+        missing.append("normal_ordering_available")
+    return missing
+
+
+def _field_presence(value: object | None, *, source: str) -> dict[str, object]:
+    return {
+        "available": value is not None,
+        "source": source if value is not None else None,
+    }
 
 
 def _compact_dict(payload: dict[str, object], *, keys: tuple[str, ...]) -> dict[str, object]:

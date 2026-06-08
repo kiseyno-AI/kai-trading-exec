@@ -308,6 +308,17 @@ class MonitoringPriceRequest(BaseModel):
     symbol: str = Field(min_length=1, max_length=32)
     price: Decimal = Field(gt=0)
     observed_at: datetime | None = None
+    bid: Decimal | None = Field(default=None, gt=0)
+    ask: Decimal | None = Field(default=None, gt=0)
+    spread: Decimal | None = Field(default=None, ge=0)
+    spread_bps: Decimal | None = Field(default=None, ge=0)
+    orderbook_depth: Decimal | None = Field(default=None, ge=0)
+    orderbook_imbalance: Decimal | None = None
+    volume: Decimal | None = Field(default=None, ge=0)
+    turnover: Decimal | None = Field(default=None, ge=0)
+    session_type: str | None = Field(default=None, max_length=64)
+    normal_ordering_available: bool | None = None
+    provenance: dict[str, object] | None = None
 
     @field_validator("symbol")
     @classmethod

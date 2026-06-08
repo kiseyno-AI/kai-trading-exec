@@ -157,6 +157,7 @@ class PendingMonitoringAction:
     item: ExecutionPlanItem
     observed_price: Decimal | None
     observed_at: datetime | None = None
+    market_quality_context: dict[str, object] | None = None
     trigger_reason: str | None = None
     trigger_metadata: dict[str, object] | None = None
 
@@ -605,6 +606,7 @@ def _evaluate_monitoring_cycle(
                 item=item,
                 observed_price=observed_price,
                 observed_at=_price_observed_at(price, triggered_at) if price is not None else None,
+                market_quality_context=_market_quality_context_from_price(price),
                 trigger_reason=trigger_reason,
                 trigger_metadata=trigger_metadata,
             )
@@ -1079,6 +1081,7 @@ def _resolve_trigger_time_agent_action(
         triggered_at=triggered_at,
         trigger_reason=action.trigger_reason,
         trigger_metadata=action.trigger_metadata,
+        live_market_context=action.market_quality_context,
         intended_quantity=intended_quantity,
         remaining_quantity=remaining_quantity,
     )
@@ -1092,6 +1095,7 @@ def _resolve_trigger_time_agent_action(
                 "reason": decision.reason,
                 "observed_price": _serialize_decimal(action.observed_price),
                 "valid_until": _serialize_datetime(decision.valid_until),
+                "market_quality_gate": _trigger_time_market_quality_gate(resolution),
                 "recorded_at": triggered_at.isoformat(),
             },
         )
@@ -1124,6 +1128,7 @@ def _resolve_trigger_time_agent_action(
                 "reason": decision.reason,
                 "observed_price": _serialize_decimal(action.observed_price),
                 "valid_until": _serialize_datetime(decision.valid_until),
+                "market_quality_gate": _trigger_time_market_quality_gate(resolution),
                 "recorded_at": triggered_at.isoformat(),
             },
         )
@@ -1156,6 +1161,7 @@ def _resolve_trigger_time_agent_action(
                 "event": "trigger_time_exec_agent_rejected",
                 "reason": decision.reason,
                 "observed_price": _serialize_decimal(action.observed_price),
+                "market_quality_gate": _trigger_time_market_quality_gate(resolution),
                 "recorded_at": triggered_at.isoformat(),
             },
         )
@@ -1191,6 +1197,7 @@ def _resolve_trigger_time_agent_action(
             "updated_target_price": _serialize_decimal(decision.updated_target_price),
             "updated_stop_price": _serialize_decimal(decision.updated_stop_price),
             "observed_price": _serialize_decimal(action.observed_price),
+            "market_quality_gate": _trigger_time_market_quality_gate(resolution),
             "recorded_at": triggered_at.isoformat(),
         },
     )
@@ -1216,6 +1223,37 @@ def _price_observed_at_from_action(
     if action.observed_price is None:
         return None
     return action.observed_at or fallback
+
+
+def _market_quality_context_from_price(
+    price: MonitoringPriceRequest | None,
+) -> dict[str, object] | None:
+    if price is None:
+        return None
+    return {
+        "source": "monitoring_price_request",
+        "bid": _serialize_decimal(price.bid),
+        "ask": _serialize_decimal(price.ask),
+        "spread": _serialize_decimal(price.spread),
+        "spread_bps": _serialize_decimal(price.spread_bps),
+        "orderbook_depth": _serialize_decimal(price.orderbook_depth),
+        "orderbook_imbalance": _serialize_decimal(price.orderbook_imbalance),
+        "volume": _serialize_decimal(price.volume),
+        "turnover": _serialize_decimal(price.turnover),
+        "session_type": price.session_type,
+        "normal_ordering_available": price.normal_ordering_available,
+        "provenance": price.provenance or {},
+    }
+
+
+def _trigger_time_market_quality_gate(
+    resolution: trigger_time_exec_agent.TriggerTimeExecAgentResolution,
+) -> dict[str, object] | None:
+    market_context = resolution.request_payload.get("market_context")
+    if not isinstance(market_context, dict):
+        return None
+    gate = market_context.get("live_execution_quality_gate")
+    return gate if isinstance(gate, dict) else None
 
 
 def _apply_trigger_time_agent_adjustments(
