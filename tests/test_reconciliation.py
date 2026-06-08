@@ -27,7 +27,7 @@ from app.core.config import Settings
 from app.db.base import Base
 from app.db.session import create_db_engine, create_session_factory
 from app.main import create_app
-from app.models.runtime import BrokerOrder, BrokerOrderEvent, ExecutionFill, ExecutionPosition
+from app.models.runtime import BrokerOrder, BrokerOrderEvent, ExecutionFill, ExecutionPlan, ExecutionPlanItem, ExecutionPosition
 from app.services.reconciliation import reconcile_broker_order, sync_execution_positions_from_broker_snapshot
 
 
@@ -195,6 +195,49 @@ def test_reconcile_full_fill_is_idempotent_and_updates_position_snapshot() -> No
     assert position is not None
     assert position.quantity == 2
     assert position.average_price == Decimal("71000.0000")
+    engine.dispose()
+
+
+def test_reconcile_filled_order_marks_plan_item_filled() -> None:
+    settings = Settings(database_url="sqlite:///:memory:", runtime_mode="paper")
+    engine, db = _session(settings)
+    plan = ExecutionPlan(
+        external_plan_id="plan-reconcile-filled-item",
+        source="test",
+        mode="paper",
+    )
+    item = ExecutionPlanItem(
+        plan=plan,
+        plan_item_index=0,
+        symbol="005930",
+        side="buy",
+        intent="intraday_watch_buy",
+        status="broker_order_submitted",
+        quantity_policy={"kind": "shares", "quantity": 2},
+    )
+    order = _order()
+    order.plan_item = item
+    db.add(plan)
+    db.add(order)
+    db.commit()
+    broker = ReconciliationStubBroker(
+        reconcile_payloads=[
+            {
+                "broker_order_id": "0033196600",
+                "status": "filled",
+                "broker_status": "체결",
+                "filled_quantity": 2,
+                "remaining_quantity": 0,
+                "average_fill_price": "71000",
+                "observed_at": OBSERVED_AT.isoformat(),
+            }
+        ],
+    )
+
+    result = reconcile_broker_order(settings=settings, db=db, adapter=broker, order=order)
+
+    assert result["status"] == "filled"
+    assert item.status == "filled"
     engine.dispose()
 
 
@@ -443,6 +486,45 @@ def test_kis_reconcile_order_reports_cumulative_quantity_without_synthetic_fill(
     assert payload["filled_quantity"] == 2
     assert "fills" not in payload
     assert http_client.calls[0]["params"]["ODNO"] == "0033196600"
+
+
+def test_kis_reconcile_order_uses_avg_prvs_as_average_fill_price() -> None:
+    settings = Settings(
+        runtime_mode="live",
+        kis_app_key="***",
+        kis_app_secret="***",
+        kis_account_number="12345678",
+        kis_account_product_code="01",
+    )
+    http_client = KisReconcileHttpClient(
+        {
+            "rt_cd": "0",
+            "msg_cd": "MCA00000",
+            "output1": [
+                {
+                    "odno": "0033196600",
+                    "pdno": "005930",
+                    "sll_buy_dvsn_cd": "01",
+                    "ord_qty": "2",
+                    "tot_ccld_qty": "2",
+                    "rmn_qty": "0",
+                    "avg_prvs": "71000",
+                    "ord_unpr": "0",
+                    "ord_dt": "20260513",
+                    "ord_tmd": "090501",
+                    "ord_st_dvsn_cd_name": "체결",
+                }
+            ],
+        }
+    )
+    adapter = KisBrokerAdapter(settings=settings, http_client=http_client)
+
+    payload = adapter.reconcile_order("top-secret-token", "0033196600")
+
+    assert payload is not None
+    assert payload["status"] == "filled"
+    assert payload["filled_quantity"] == 2
+    assert payload["average_fill_price"] == Decimal("71000")
 
 
 @pytest.mark.parametrize(

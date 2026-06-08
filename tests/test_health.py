@@ -1522,6 +1522,197 @@ def test_autonomous_monitoring_expires_known_flat_pending_sell_monitors() -> Non
     engine.dispose()
 
 
+def test_autonomous_monitoring_retains_pending_sell_after_unexited_buy_order() -> None:
+    app, engine = build_test_app(
+        Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+        )
+    )
+    client = TestClient(app)
+
+    response = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-buy-filled-local-position-stale",
+            "source": "kai-trading-core",
+            "market_date": "2026-06-04",
+            "items": [
+                {
+                    "symbol": "002380",
+                    "side": "buy",
+                    "intent": "intraday_watch_buy",
+                    "trigger_price": "565000.00",
+                    "limit_price": "575000.00",
+                    "quantity_policy": {"kind": "shares", "quantity": 1},
+                },
+                {
+                    "symbol": "002380",
+                    "side": "sell",
+                    "intent": "stop_sell",
+                    "trigger_price": "548000.00",
+                    "quantity_policy": {"kind": "position_exit_from_entry"},
+                },
+            ],
+        },
+    )
+    assert response.status_code == 201
+    buy_item_id, stop_item_id = response.json()["persisted_execution_item_ids"]
+
+    with app.state.db_session_factory() as session:
+        buy_item = session.get(ExecutionPlanItem, buy_item_id)
+        stop_item = session.get(ExecutionPlanItem, stop_item_id)
+        assert buy_item is not None
+        assert stop_item is not None
+        buy_item.status = "broker_order_submitted"
+        stop_item.status = "stop_sell_pending_config"
+        session.add(
+            BrokerOrder(
+                mode="paper",
+                execution_plan_item_id=buy_item_id,
+                idempotency_key=f"monitoring:watch_buy:{buy_item_id}",
+                symbol="002380",
+                side="buy",
+                status="filled",
+                quantity=1,
+                limit_price=Decimal("567000.00"),
+                submitted_at=datetime(2026, 6, 4, 0, 55, tzinfo=UTC),
+            )
+        )
+        session.add(
+            ExecutionPosition(
+                mode="paper",
+                symbol="002380",
+                quantity=0,
+                average_price=None,
+                updated_from="reconciliation",
+                last_reconciled_at=datetime(2026, 6, 4, 0, 53, tzinfo=UTC),
+            )
+        )
+        session.commit()
+
+        symbols = list_autonomous_monitoring_symbols(
+            settings=app.state.settings,
+            db=session,
+            current_market_date=datetime(2026, 6, 4, tzinfo=UTC).date(),
+        )
+
+        retained_stop = session.get(ExecutionPlanItem, stop_item_id)
+        assert retained_stop is not None
+        assert retained_stop.status == "stop_sell_pending_config"
+        assert symbols == ["002380"]
+
+    engine.dispose()
+
+
+def test_autonomous_monitoring_includes_held_stop_sell_outside_symbol_cap() -> None:
+    app, engine = build_test_app(
+        Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            monitoring_max_symbols_per_cycle=2,
+        )
+    )
+    client = TestClient(app)
+
+    first = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-cap-first-target",
+            "source": "kai-trading-core",
+            "market_date": "2026-06-08",
+            "items": [
+                {
+                    "symbol": "005930",
+                    "side": "sell",
+                    "intent": "target_sell",
+                    "trigger_price": "80000.00",
+                    "quantity_policy": {"kind": "position_exit_from_entry"},
+                }
+            ],
+        },
+    )
+    second = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-cap-second-target",
+            "source": "kai-trading-core",
+            "market_date": "2026-06-08",
+            "items": [
+                {
+                    "symbol": "000660",
+                    "side": "sell",
+                    "intent": "target_sell",
+                    "trigger_price": "200000.00",
+                    "quantity_policy": {"kind": "position_exit_from_entry"},
+                }
+            ],
+        },
+    )
+    held_stop = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-cap-held-kcc-stop",
+            "source": "kai-trading-core",
+            "market_date": "2026-06-08",
+            "items": [
+                {
+                    "symbol": "002380",
+                    "side": "sell",
+                    "intent": "stop_sell",
+                    "trigger_price": "548000.00",
+                    "quantity_policy": {"kind": "position_exit_from_entry"},
+                }
+            ],
+        },
+    )
+    assert first.status_code == 201
+    assert second.status_code == 201
+    assert held_stop.status_code == 201
+    first_item_id = first.json()["persisted_execution_item_ids"][0]
+    second_item_id = second.json()["persisted_execution_item_ids"][0]
+    held_stop_item_id = held_stop.json()["persisted_execution_item_ids"][0]
+
+    with app.state.db_session_factory() as session:
+        first_item = session.get(ExecutionPlanItem, first_item_id)
+        second_item = session.get(ExecutionPlanItem, second_item_id)
+        held_stop_item = session.get(ExecutionPlanItem, held_stop_item_id)
+        assert first_item is not None
+        assert second_item is not None
+        assert held_stop_item is not None
+        assert first_item.plan is not None
+        assert second_item.plan is not None
+        assert held_stop_item.plan is not None
+        first_item.plan.accepted_at = datetime(2026, 6, 8, 0, 0, tzinfo=UTC)
+        second_item.plan.accepted_at = datetime(2026, 6, 8, 0, 1, tzinfo=UTC)
+        held_stop_item.plan.accepted_at = datetime(2026, 6, 8, 0, 2, tzinfo=UTC)
+        session.add(
+            ExecutionPosition(
+                mode="paper",
+                symbol="002380",
+                quantity=1,
+                average_price=Decimal("567000.00"),
+                updated_from="reconciliation",
+                last_reconciled_at=datetime(2026, 6, 8, 0, 32, tzinfo=UTC),
+            )
+        )
+        session.commit()
+
+        autonomous_items = _load_monitored_items(
+            settings=app.state.settings,
+            db=session,
+            exclude_pending_config=True,
+        )
+
+        assert [item.id for item in autonomous_items] == [
+            first_item_id,
+            second_item_id,
+            held_stop_item_id,
+        ]
+
+    engine.dispose()
+
+
 def test_duplicate_execution_plan_is_rejected() -> None:
     app, engine = build_test_app()
     client = TestClient(app)

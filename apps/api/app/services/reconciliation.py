@@ -915,21 +915,24 @@ def _order_status_to_plan_item_status(order_status: str) -> str | None:
         return "broker_order_submission_pending"
     if order_status == NormalizedBrokerOrderStatus.SUBMITTED.value:
         return "broker_order_submitted"
+    if order_status == NormalizedBrokerOrderStatus.OPEN.value:
+        return "open"
+    if order_status == NormalizedBrokerOrderStatus.PARTIALLY_FILLED.value:
+        return "partially_filled"
+    if order_status == NormalizedBrokerOrderStatus.FILLED.value:
+        return "filled"
+    if order_status == NormalizedBrokerOrderStatus.CANCEL_PENDING.value:
+        return "cancel_pending"
+    if order_status == NormalizedBrokerOrderStatus.CANCELED.value:
+        return "canceled"
+    if order_status == NormalizedBrokerOrderStatus.EXPIRED.value:
+        return "expired"
     if order_status == NormalizedBrokerOrderStatus.RETRY_PENDING.value:
         return "broker_order_retry_pending"
     if order_status == NormalizedBrokerOrderStatus.REJECTED.value:
         return "broker_order_rejected"
     if order_status == NormalizedBrokerOrderStatus.FAILED.value:
         return "broker_order_failed"
-    if order_status in (
-        NormalizedBrokerOrderStatus.OPEN.value,
-        NormalizedBrokerOrderStatus.PARTIALLY_FILLED.value,
-        NormalizedBrokerOrderStatus.FILLED.value,
-        NormalizedBrokerOrderStatus.CANCEL_PENDING.value,
-        NormalizedBrokerOrderStatus.CANCELED.value,
-        NormalizedBrokerOrderStatus.EXPIRED.value,
-    ):
-        return "broker_order_submitted"
     return None
 
 
