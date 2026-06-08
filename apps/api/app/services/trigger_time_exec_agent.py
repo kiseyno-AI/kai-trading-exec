@@ -497,64 +497,43 @@ def _market_context(
     risk_context = item.risk_context if isinstance(item.risk_context, dict) else {}
     market_payload = _first_dict(risk_context, keys=("market_data", "quote", "orderbook", "order_book")) or {}
     live_payload = live_market_context or {}
-    orderbook_payload = (
-        _first_dict(live_payload, keys=("orderbook", "order_book"))
-        or _first_dict(market_payload, keys=("orderbook", "order_book"))
-        or _first_dict(risk_context, keys=("orderbook", "order_book"))
-        or {}
-    )
+    live_orderbook_payload = _first_dict(live_payload, keys=("orderbook", "order_book")) or {}
     session_type = (
         _first_payload_value(
             live_payload,
-            market_payload,
-            risk_context,
             keys=("session_type", "session", "market_state", "route_now"),
         )
     )
-    bid = _first_payload_value(live_payload, market_payload, risk_context, keys=("bid", "bid_price", "best_bid"))
-    ask = _first_payload_value(live_payload, market_payload, risk_context, keys=("ask", "ask_price", "best_ask"))
+    bid = _first_payload_value(live_payload, keys=("bid", "bid_price", "best_bid"))
+    ask = _first_payload_value(live_payload, keys=("ask", "ask_price", "best_ask"))
     spread = _first_payload_value(
         live_payload,
-        market_payload,
-        risk_context,
         keys=("spread", "spread_price"),
     )
     spread_bps = _first_payload_value(
         live_payload,
-        market_payload,
-        risk_context,
         keys=("spread_bps", "spread_bp"),
     )
     orderbook_depth = _first_payload_value(
         live_payload,
-        orderbook_payload,
-        market_payload,
-        risk_context,
+        live_orderbook_payload,
         keys=("orderbook_depth", "book_depth", "total_depth", "depth"),
     )
     orderbook_imbalance = _first_payload_value(
         live_payload,
-        orderbook_payload,
-        market_payload,
-        risk_context,
+        live_orderbook_payload,
         keys=("orderbook_imbalance", "book_imbalance", "imbalance"),
     )
     volume = _first_payload_value(
         live_payload,
-        market_payload,
-        risk_context,
         keys=("volume", "accumulated_volume"),
     )
     turnover = _first_payload_value(
         live_payload,
-        market_payload,
-        risk_context,
         keys=("turnover", "trading_value"),
     )
     normal_ordering_available = _first_payload_value(
         live_payload,
-        market_payload,
-        risk_context,
         keys=("normal_ordering_available", "ordering_available"),
     )
     missing_fields = _live_execution_quality_missing_fields(
@@ -570,13 +549,13 @@ def _market_context(
     context_available = stale_reason is None and not missing_fields
     field_freshness = {
         "latest_price": {"available": observed_price is not None, "observed_at": normalized_observed_at.isoformat() if normalized_observed_at is not None else None},
-        "bid": _field_presence(bid, source="live_market_context/risk_context"),
-        "ask": _field_presence(ask, source="live_market_context/risk_context"),
-        "orderbook": _field_presence(orderbook_depth if orderbook_depth is not None else orderbook_imbalance, source="live_market_context/risk_context"),
-        "volume": _field_presence(volume, source="live_market_context/risk_context"),
-        "turnover": _field_presence(turnover, source="live_market_context/risk_context"),
-        "session_type": _field_presence(session_type, source="live_market_context/risk_context"),
-        "normal_ordering_available": _field_presence(normal_ordering_available, source="live_market_context/risk_context"),
+        "bid": _field_presence(bid, source="live_market_context"),
+        "ask": _field_presence(ask, source="live_market_context"),
+        "orderbook": _field_presence(orderbook_depth if orderbook_depth is not None else orderbook_imbalance, source="live_market_context"),
+        "volume": _field_presence(volume, source="live_market_context"),
+        "turnover": _field_presence(turnover, source="live_market_context"),
+        "session_type": _field_presence(session_type, source="live_market_context"),
+        "normal_ordering_available": _field_presence(normal_ordering_available, source="live_market_context"),
     }
     return (
         {

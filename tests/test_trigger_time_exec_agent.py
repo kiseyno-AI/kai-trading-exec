@@ -80,7 +80,16 @@ def _create_intraday_watch_buy(
     *,
     plan_id: str,
     max_safe_notional_krw: str = "300000",
+    risk_context_extra: dict[str, object] | None = None,
 ) -> str:
+    risk_context = {
+        "exchange": "KRX",
+        "target_price": "72420.00",
+        "stop_price": "70000.00",
+        "decider_output": {"rationale": "trigger-time test candidate"},
+    }
+    if risk_context_extra:
+        risk_context.update(risk_context_extra)
     response = client.post(
         "/execution-plans",
         json={
@@ -99,12 +108,7 @@ def _create_intraday_watch_buy(
                     },
                     "trigger_price": "71000.00",
                     "time_in_force": "day",
-                    "risk_context": {
-                        "exchange": "KRX",
-                        "target_price": "72420.00",
-                        "stop_price": "70000.00",
-                        "decider_output": {"rationale": "trigger-time test candidate"},
-                    },
+                    "risk_context": risk_context,
                 }
             ],
         },
@@ -227,7 +231,28 @@ def test_trigger_time_buy_missing_live_market_quality_delays_without_agent_call(
             }
         ],
     )
-    item_id = _create_intraday_watch_buy(client, plan_id="plan-trigger-agent-buy-missing-live-quality")
+    item_id = _create_intraday_watch_buy(
+        client,
+        plan_id="plan-trigger-agent-buy-missing-live-quality",
+        risk_context_extra={
+            "bid": "71044.00",
+            "ask": "71056.00",
+            "orderbook_depth": "999999999",
+            "volume": "987654",
+            "turnover": "70123456789",
+            "session_type": "regular",
+            "normal_ordering_available": True,
+            "market_data": {
+                "bid": "71043.00",
+                "ask": "71057.00",
+                "orderbook_depth": "888888888",
+                "volume": "876543",
+                "turnover": "61123456789",
+                "session_type": "regular",
+                "normal_ordering_available": True,
+            },
+        },
+    )
 
     response = client.post(
         "/monitoring/evaluate",
@@ -256,12 +281,22 @@ def test_trigger_time_buy_missing_live_market_quality_delays_without_agent_call(
         assert interaction["decision"]["decision"] == "delay"
         market_context = interaction["request_payload"]["market_context"]
         assert market_context["live_execution_context_available"] is False
-        assert set(market_context["missing_critical_fields"]) >= {
+        assert set(market_context["missing_critical_fields"]) == {
             "bid",
             "ask",
             "orderbook",
             "volume",
+            "turnover",
+            "session_type",
+            "normal_ordering_available",
         }
+        assert market_context["bid"] is None
+        assert market_context["ask"] is None
+        assert market_context["orderbook_depth"] is None
+        assert market_context["volume"] is None
+        assert market_context["turnover"] is None
+        assert market_context["field_freshness"]["bid"]["source"] is None
+        assert market_context["raw_market_payload"]["bid"] == "71043.00"
         delay_events = [
             event
             for event in item.risk_context["monitoring_events"]
