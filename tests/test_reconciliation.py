@@ -552,6 +552,7 @@ def test_kis_reconcile_order_treats_sell_rejection_kind_as_rejected() -> None:
                     "ord_unpr": "394000",
                     "ord_dt": "20260608",
                     "ord_tmd": "090717",
+                    "ord_st_dvsn_cd_name": "체결",
                 }
             ],
         }

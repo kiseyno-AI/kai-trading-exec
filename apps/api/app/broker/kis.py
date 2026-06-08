@@ -709,10 +709,10 @@ def _normalize_reconcile_order(
             row,
             observed_at=observed_at,
             raw_status=(
-                _optional_string(row.get("ord_ccld_status_name"))
+                _rejection_status_from_order_kind(row)
+                or _optional_string(row.get("ord_ccld_status_name"))
                 or _optional_string(row.get("ord_st_dvsn_cd_name"))
                 or _optional_string(row.get("ord_sts_name"))
-                or _rejection_status_from_order_kind(row)
             ),
         )
     return None
