@@ -527,6 +527,46 @@ def test_kis_reconcile_order_uses_avg_prvs_as_average_fill_price() -> None:
     assert payload["average_fill_price"] == Decimal("71000")
 
 
+def test_kis_reconcile_order_treats_sell_rejection_kind_as_rejected() -> None:
+    settings = Settings(
+        runtime_mode="live",
+        kis_app_key="***",
+        kis_app_secret="***",
+        kis_account_number="12345678",
+        kis_account_product_code="01",
+    )
+    http_client = KisReconcileHttpClient(
+        {
+            "rt_cd": "0",
+            "msg_cd": "MCA00000",
+            "output1": [
+                {
+                    "odno": "0007266500",
+                    "pdno": "000815",
+                    "sll_buy_dvsn_cd": "01",
+                    "sll_buy_dvsn_cd_name": "매도거부",
+                    "ord_qty": "1",
+                    "tot_ccld_qty": "0",
+                    "rmn_qty": "0",
+                    "avg_prvs": "0",
+                    "ord_unpr": "394000",
+                    "ord_dt": "20260608",
+                    "ord_tmd": "090717",
+                }
+            ],
+        }
+    )
+    adapter = KisBrokerAdapter(settings=settings, http_client=http_client)
+
+    payload = adapter.reconcile_order("top-secret-token", "0007266500")
+
+    assert payload is not None
+    assert payload["status"] == "rejected"
+    assert payload["broker_status"] == "거부"
+    assert payload["filled_quantity"] == 0
+    assert "fills" not in payload
+
+
 @pytest.mark.parametrize(
     ("runtime_mode", "expected_tr_id"),
     [("live", "TTTC0081R"), ("paper", "VTTC0081R")],
