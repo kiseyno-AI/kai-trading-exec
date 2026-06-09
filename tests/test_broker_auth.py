@@ -469,6 +469,57 @@ def test_kis_adapter_fetches_current_price_quote() -> None:
     assert quote.price == Decimal("125100")
 
 
+def test_kis_adapter_fetches_live_market_context_from_orderbook_quote() -> None:
+    http_client = RecordingHttpClient(
+        {},
+        get_response={
+            "rt_cd": "0",
+            "msg_cd": "0",
+            "msg1": "success",
+            "output": {
+                "bidp1": "1582",
+                "askp1": "1584",
+                "bidp_rsqn1": "1000",
+                "bidp_rsqn2": "500",
+                "askp_rsqn1": "700",
+                "askp_rsqn2": "300",
+            },
+        },
+    )
+    adapter = KisBrokerAdapter(
+        settings=Settings(
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+        ),
+        http_client=http_client,
+    )
+
+    context = adapter.get_live_market_context(
+        "access-token",
+        symbol="073560",
+        reference_price=Decimal("1583"),
+    )
+
+    assert http_client.get_calls[0]["url"] == (
+        f"{KIS_PAPER_API_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-asking-price-exp-ccn"
+    )
+    assert http_client.get_calls[0]["headers"]["authorization"] == "Bearer access-token"
+    assert http_client.get_calls[0]["headers"]["tr_id"] == "FHKST01010200"
+    assert http_client.get_calls[0]["params"] == {
+        "FID_COND_MRKT_DIV_CODE": "J",
+        "FID_INPUT_ISCD": "073560",
+    }
+    assert context is not None
+    assert context.symbol == "073560"
+    assert context.bid == Decimal("1582")
+    assert context.ask == Decimal("1584")
+    assert context.spread == Decimal("2")
+    assert context.orderbook_depth == Decimal("2500")
+    assert context.orderbook_imbalance == Decimal("0.2")
+    assert context.payload["endpoint"] == "/uapi/domestic-stock/v1/quotations/inquire-asking-price-exp-ccn"
+
+
 def test_kis_adapter_sends_nxt_exchange_and_routed_order_division() -> None:
     http_client = RecordingHttpClient(
         {

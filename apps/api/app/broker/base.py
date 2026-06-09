@@ -79,6 +79,22 @@ class BrokerCurrentPrice:
 
 
 @dataclass(frozen=True)
+class BrokerLiveMarketContext:
+    symbol: str
+    exchange: str
+    observed_at: datetime
+    bid: Decimal | None = None
+    ask: Decimal | None = None
+    spread: Decimal | None = None
+    spread_bps: Decimal | None = None
+    orderbook_depth: Decimal | None = None
+    orderbook_imbalance: Decimal | None = None
+    session_type: str | None = None
+    normal_ordering_available: bool | None = None
+    payload: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class BrokerAccountPosition:
     symbol: str
     quantity: int
@@ -248,6 +264,15 @@ class BrokerAdapter(Protocol):
         symbol: str,
         exchange: str = "KRX",
     ) -> BrokerCurrentPrice | None: ...
+
+    def get_live_market_context(
+        self,
+        access_token: str,
+        *,
+        symbol: str,
+        exchange: str = "KRX",
+        reference_price: Decimal | None = None,
+    ) -> BrokerLiveMarketContext | None: ...
 
     def get_account_snapshot(
         self,

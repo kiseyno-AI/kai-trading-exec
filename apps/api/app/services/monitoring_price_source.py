@@ -1,16 +1,19 @@
 from __future__ import annotations
 
+from decimal import Decimal
 from typing import Callable
 
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.api.schemas.execution import MonitoringPriceRequest
-from app.broker.base import BrokerAdapter
+from app.broker.base import BrokerAdapter, BrokerCurrentPrice, BrokerLiveMarketContext
 from app.core.config import Settings
 from app.services.broker_auth import ensure_authenticated_broker_session
+from app.services.domestic_order_router import resolve_domestic_order_route
 
 MAX_REPORTED_QUOTE_FAILURES = 10
+MAX_REPORTED_CONTEXT_FAILURES = 10
 
 
 class KisCurrentQuoteMonitoringPriceSource:
@@ -58,6 +61,9 @@ class KisCurrentQuoteMonitoringPriceSource:
             "quote_failures": [],
             "quote_failure_count": 0,
             "quote_failures_truncated": False,
+            "context_failures": [],
+            "context_failure_count": 0,
+            "context_failures_truncated": False,
         }
         if not unique_symbols:
             return []
@@ -73,7 +79,9 @@ class KisCurrentQuoteMonitoringPriceSource:
             prices: list[MonitoringPriceRequest] = []
             priced_symbols: list[str] = []
             failures: list[dict[str, str]] = []
+            context_failures: list[dict[str, object]] = []
             failure_count = 0
+            context_failure_count = 0
             for symbol in unique_symbols:
                 try:
                     quote = broker_adapter.get_current_price(
@@ -88,13 +96,30 @@ class KisCurrentQuoteMonitoringPriceSource:
                     continue
                 if quote is None:
                     continue
+                context, context_failure = _fetch_live_market_context(
+                    broker_adapter=broker_adapter,
+                    access_token=access_token,
+                    quote=quote,
+                )
+                if context_failure is not None:
+                    context_failure_count += 1
+                    if len(context_failures) < MAX_REPORTED_CONTEXT_FAILURES:
+                        context_failures.append(context_failure)
                 priced_symbols.append(quote.symbol)
+                market_quality = _market_quality_from_quote_payload(quote.payload)
+                market_quality = _merge_live_market_context(
+                    market_quality,
+                    context=context,
+                    context_failure=context_failure,
+                    quote=quote,
+                    settings=settings,
+                )
                 prices.append(
                     MonitoringPriceRequest(
                         symbol=quote.symbol,
                         price=quote.price,
                         observed_at=quote.observed_at,
-                        **_market_quality_from_quote_payload(quote.payload),
+                        **market_quality,
                     )
                 )
             priced_set = set(priced_symbols)
@@ -109,6 +134,9 @@ class KisCurrentQuoteMonitoringPriceSource:
                 "quote_failures": failures,
                 "quote_failure_count": failure_count,
                 "quote_failures_truncated": failure_count > len(failures),
+                "context_failures": context_failures,
+                "context_failure_count": context_failure_count,
+                "context_failures_truncated": context_failure_count > len(context_failures),
             }
             return prices
 
@@ -133,6 +161,156 @@ def _market_quality_from_quote_payload(payload: dict[str, object]) -> dict[str, 
         "normal_ordering_available": _normal_ordering_available(output),
         "provenance": {"source": "broker_current_price_payload"},
     }
+
+
+def _fetch_live_market_context(
+    *,
+    broker_adapter: BrokerAdapter,
+    access_token: str,
+    quote: BrokerCurrentPrice,
+) -> tuple[BrokerLiveMarketContext | None, dict[str, object] | None]:
+    context_getter = getattr(broker_adapter, "get_live_market_context", None)
+    if not callable(context_getter):
+        return None, {
+            "symbol": quote.symbol,
+            "endpoint": "broker_live_market_context",
+            "reason": "broker adapter does not expose live market context enrichment",
+        }
+    try:
+        return (
+            context_getter(
+                access_token,
+                symbol=quote.symbol,
+                exchange=quote.exchange,
+                reference_price=quote.price,
+            ),
+            None,
+        )
+    except Exception as exc:
+        return None, {
+            "symbol": quote.symbol,
+            "endpoint": "broker_live_market_context",
+            "reason": str(exc),
+        }
+
+
+def _merge_live_market_context(
+    base: dict[str, object],
+    *,
+    context: BrokerLiveMarketContext | None,
+    context_failure: dict[str, object] | None,
+    quote: BrokerCurrentPrice,
+    settings: Settings,
+) -> dict[str, object]:
+    merged = dict(base)
+    provenance = dict(merged.get("provenance") or {})
+    provenance["current_price"] = {
+        "source": "broker_current_price_payload",
+        "endpoint": _endpoint_from_payload(quote.payload),
+    }
+    if context is not None:
+        for key in (
+            "bid",
+            "ask",
+            "spread",
+            "spread_bps",
+            "orderbook_depth",
+            "orderbook_imbalance",
+            "session_type",
+            "normal_ordering_available",
+        ):
+            value = getattr(context, key)
+            if value is not None:
+                merged[key] = value
+        provenance["orderbook"] = {
+            "source": "broker_live_market_context",
+            "endpoint": _endpoint_from_payload(context.payload),
+            "observed_at": context.observed_at.isoformat(),
+        }
+    if context_failure is not None:
+        provenance["orderbook"] = {
+            "source": "broker_live_market_context",
+            "status": "failed",
+            **context_failure,
+        }
+
+    route_context = _derive_orderability_context(
+        settings=settings,
+        symbol=quote.symbol,
+        price=quote.price,
+        observed_at=quote.observed_at,
+    )
+    for key, value in route_context.items():
+        if key in {"session_type", "normal_ordering_available"} and merged.get(key) is None:
+            merged[key] = value
+    provenance["session"] = {
+        "source": "domestic_order_router",
+        "reason": route_context["orderability_reason"],
+        "action": route_context["orderability_action"],
+        "exchange": route_context["orderability_exchange"],
+        "observed_at": quote.observed_at.isoformat(),
+    }
+
+    missing_fields = _missing_market_quality_fields(merged)
+    if missing_fields:
+        provenance["missing_fields"] = missing_fields
+    merged["provenance"] = provenance
+    return merged
+
+
+def _derive_orderability_context(
+    *,
+    settings: Settings,
+    symbol: str,
+    price: Decimal,
+    observed_at,
+) -> dict[str, object]:
+    route_decision = resolve_domestic_order_route(
+        settings=settings,
+        now=observed_at,
+        symbol=symbol,
+        side="sell",
+        purpose="protective_stop",
+        desired_order_type="limit",
+        limit_price=price,
+        requested_exchange="KRX",
+    )
+    return {
+        "session_type": route_decision.session,
+        "normal_ordering_available": route_decision.action == "submit",
+        "orderability_action": route_decision.action,
+        "orderability_exchange": route_decision.exchange,
+        "orderability_reason": route_decision.reason,
+    }
+
+
+def _endpoint_from_payload(payload: dict[str, object]) -> object | None:
+    endpoint = payload.get("endpoint")
+    if endpoint is not None:
+        return endpoint
+    output = payload.get("provider")
+    if output == "kis":
+        return payload.get("tr_id")
+    return None
+
+
+def _missing_market_quality_fields(payload: dict[str, object]) -> list[str]:
+    missing: list[str] = []
+    if payload.get("bid") is None:
+        missing.append("bid")
+    if payload.get("ask") is None:
+        missing.append("ask")
+    if payload.get("orderbook_depth") is None and payload.get("orderbook_imbalance") is None:
+        missing.append("orderbook")
+    if payload.get("volume") is None:
+        missing.append("volume")
+    if payload.get("turnover") is None:
+        missing.append("turnover")
+    if payload.get("session_type") is None:
+        missing.append("session_type")
+    if payload.get("normal_ordering_available") is not True:
+        missing.append("normal_ordering_available")
+    return missing
 
 
 def _first_value(payload: dict[str, object], *keys: str) -> object | None:
