@@ -8,9 +8,11 @@ from app.broker.base import (
     BrokerConfig,
     BrokerErrorClassification,
     BrokerCurrentPrice,
+    BrokerLiveMarketContext,
 )
 from app.core.config import Settings
 from app.models.runtime import ExecutionPlanItem, ExecutionPosition
+from app.services.monitoring_price_source import KisCurrentQuoteMonitoringPriceSource
 from test_broker_auth import (
     KIS_PAPER_API_BASE_URL,
     StubBrokerAdapter,
@@ -43,6 +45,204 @@ class SymbolScopedQuoteErrorAdapter(StubBrokerAdapter):
             self.current_price_calls.append((symbol, exchange))
             raise symbol_error
         return super().get_current_price(access_token, symbol=symbol, exchange=exchange)
+
+
+class LiveMarketContextAdapter(StubBrokerAdapter):
+    def __init__(
+        self,
+        *,
+        live_contexts: dict[str, BrokerLiveMarketContext] | None = None,
+        live_context_errors: dict[str, Exception] | None = None,
+        current_price_observed_at: datetime | None = None,
+        **kwargs,
+    ) -> None:
+        super().__init__(**kwargs)
+        self.live_contexts = live_contexts or {}
+        self.live_context_errors = live_context_errors or {}
+        self.current_price_observed_at = current_price_observed_at
+        self.live_context_calls: list[tuple[str, str]] = []
+
+    def get_current_price(
+        self,
+        access_token: str,
+        *,
+        symbol: str,
+        exchange: str = "KRX",
+    ) -> BrokerCurrentPrice | None:
+        quote = super().get_current_price(access_token, symbol=symbol, exchange=exchange)
+        if quote is None or self.current_price_observed_at is None:
+            return quote
+        return BrokerCurrentPrice(
+            symbol=quote.symbol,
+            exchange=quote.exchange,
+            price=quote.price,
+            observed_at=self.current_price_observed_at,
+            payload={
+                "output": {
+                    "stck_prpr": str(quote.price),
+                    "acml_vol": "112278",
+                    "acml_tr_pbmn": "175344817",
+                }
+            },
+        )
+
+    def get_live_market_context(
+        self,
+        access_token: str,
+        *,
+        symbol: str,
+        exchange: str = "KRX",
+        reference_price: Decimal | None = None,
+    ) -> BrokerLiveMarketContext | None:
+        del reference_price
+        assert access_token
+        self.live_context_calls.append((symbol, exchange))
+        symbol_error = self.live_context_errors.get(symbol)
+        if symbol_error is not None:
+            raise symbol_error
+        return self.live_contexts.get(symbol)
+
+
+def test_kis_price_source_enriches_monitoring_price_with_live_market_context() -> None:
+    observed_at = datetime(2026, 6, 9, 1, 5, tzinfo=UTC)
+    broker_adapter = LiveMarketContextAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        current_prices={"073560": Decimal("1583.00")},
+        current_price_observed_at=observed_at,
+        live_contexts={
+            "073560": BrokerLiveMarketContext(
+                symbol="073560",
+                exchange="KRX",
+                observed_at=observed_at,
+                bid=Decimal("1582"),
+                ask=Decimal("1584"),
+                spread=Decimal("2"),
+                spread_bps=Decimal("12.63423878648136449778900821"),
+                orderbook_depth=Decimal("2500"),
+                orderbook_imbalance=Decimal("0.2"),
+                payload={
+                    "provider": "kis",
+                    "endpoint": "/uapi/domestic-stock/v1/quotations/inquire-asking-price-exp-ccn",
+                    "tr_id": "FHKST01010200",
+                },
+            )
+        },
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+            domestic_order_session_routing_enabled=True,
+        ),
+        broker_adapter=broker_adapter,
+    )
+    price_source = KisCurrentQuoteMonitoringPriceSource(
+        settings=app.state.settings,
+        session_factory=app.state.db_session_factory,
+        broker_adapter_factory=lambda _settings: broker_adapter,
+    )
+
+    prices = price_source.get_prices(
+        symbols=["073560"],
+        observed_at=observed_at,
+        settings=app.state.settings,
+    )
+
+    assert len(prices) == 1
+    price = prices[0]
+    assert price.symbol == "073560"
+    assert price.bid == Decimal("1582")
+    assert price.ask == Decimal("1584")
+    assert price.spread == Decimal("2")
+    assert price.orderbook_depth == Decimal("2500")
+    assert price.orderbook_imbalance == Decimal("0.2")
+    assert price.session_type == "krx_regular"
+    assert price.normal_ordering_available is True
+    assert price.provenance is not None
+    assert price.provenance["orderbook"]["endpoint"] == (
+        "/uapi/domestic-stock/v1/quotations/inquire-asking-price-exp-ccn"
+    )
+    assert price_source.get_last_diagnostics()["context_failure_count"] == 0
+    assert broker_adapter.live_context_calls == [("073560", "KRX")]
+    engine.dispose()
+
+
+def test_kis_price_source_keeps_quote_and_reports_context_enrichment_failure() -> None:
+    observed_at = datetime(2026, 6, 9, 1, 5, tzinfo=UTC)
+    broker_adapter = LiveMarketContextAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        current_prices={"073560": Decimal("1583.00")},
+        current_price_observed_at=observed_at,
+        live_context_errors={
+            "073560": BrokerAdapterError(
+                "KIS orderbook endpoint timed out",
+                status_code=503,
+                classification=BrokerErrorClassification.TRANSIENT,
+                retryable=True,
+            )
+        },
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+            domestic_order_session_routing_enabled=True,
+        ),
+        broker_adapter=broker_adapter,
+    )
+    price_source = KisCurrentQuoteMonitoringPriceSource(
+        settings=app.state.settings,
+        session_factory=app.state.db_session_factory,
+        broker_adapter_factory=lambda _settings: broker_adapter,
+    )
+
+    prices = price_source.get_prices(
+        symbols=["073560"],
+        observed_at=observed_at,
+        settings=app.state.settings,
+    )
+
+    assert len(prices) == 1
+    price = prices[0]
+    assert price.price == Decimal("1583.00")
+    assert price.bid is None
+    assert price.ask is None
+    assert price.orderbook_depth is None
+    assert price.session_type == "krx_regular"
+    assert price.normal_ordering_available is True
+    assert price.provenance is not None
+    assert price.provenance["orderbook"]["status"] == "failed"
+    assert price.provenance["orderbook"]["reason"] == "KIS orderbook endpoint timed out"
+    assert price.provenance["missing_fields"] == ["bid", "ask", "orderbook"]
+    diagnostics = price_source.get_last_diagnostics()
+    assert diagnostics["priced_symbol_count"] == 1
+    assert diagnostics["context_failure_count"] == 1
+    assert diagnostics["context_failures"] == [
+        {
+            "symbol": "073560",
+            "endpoint": "broker_live_market_context",
+            "reason": "KIS orderbook endpoint timed out",
+        }
+    ]
+    engine.dispose()
 
 
 def test_autonomous_monitoring_keeps_partial_prices_when_one_live_quote_fails() -> None:

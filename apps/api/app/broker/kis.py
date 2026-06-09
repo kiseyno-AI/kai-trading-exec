@@ -18,6 +18,7 @@ from app.broker.base import (
     BrokerConfig,
     BrokerCurrentPrice,
     BrokerErrorClassification,
+    BrokerLiveMarketContext,
     BrokerOrderPlacement,
     BrokerOrderPlacementRequest,
     BrokerRealtimeApproval,
@@ -40,7 +41,9 @@ KIS_CURRENT_PRICE_PATH = "/uapi/domestic-stock/v1/quotations/inquire-price"
 KIS_BALANCE_PATH = "/uapi/domestic-stock/v1/trading/inquire-balance"
 KIS_OPEN_ORDERS_PATH = "/uapi/domestic-stock/v1/trading/inquire-daily-ccld"
 KIS_DAILY_CCLD_PATH = "/uapi/domestic-stock/v1/trading/inquire-daily-ccld"
+KIS_ASKING_PRICE_PATH = "/uapi/domestic-stock/v1/quotations/inquire-asking-price-exp-ccn"
 KIS_CURRENT_PRICE_TR_ID = "FHKST01010100"
+KIS_ASKING_PRICE_TR_ID = "FHKST01010200"
 KIS_TIMEZONE = timezone(timedelta(hours=9))
 
 
@@ -447,6 +450,115 @@ class KisBrokerAdapter(BrokerAdapter):
             price=price,
             observed_at=datetime.now(UTC),
             payload=body,
+        )
+
+    def get_live_market_context(
+        self,
+        access_token: str,
+        *,
+        symbol: str,
+        exchange: str = "KRX",
+        reference_price: Decimal | None = None,
+    ) -> BrokerLiveMarketContext | None:
+        config = self._configured()
+        request_metadata = {
+            "provider": self.provider,
+            "endpoint": KIS_ASKING_PRICE_PATH,
+            "method": "GET",
+            "tr_id": KIS_ASKING_PRICE_TR_ID,
+            "requested_at": datetime.now(UTC).isoformat(),
+            "symbol": symbol,
+            "exchange": exchange,
+        }
+        params = {
+            "FID_COND_MRKT_DIV_CODE": _quote_market_division(exchange),
+            "FID_INPUT_ISCD": symbol,
+        }
+        try:
+            response = self.http_client.get_json(
+                url=f"{config.api_base_url}{KIS_ASKING_PRICE_PATH}",
+                headers=self.build_headers(
+                    access_token,
+                    transaction_id=KIS_ASKING_PRICE_TR_ID,
+                ),
+                params=params,
+                timeout_seconds=self.settings.kis_request_timeout_seconds,
+            )
+        except BrokerAdapterError as exc:
+            raise BrokerAdapterError(
+                str(exc),
+                status_code=exc.status_code or 503,
+                classification=exc.classification,
+                retryable=exc.retryable,
+                code=exc.code,
+                request_metadata=request_metadata,
+                response_metadata=exc.response_metadata,
+                response_payload=exc.response_payload,
+                observed_at=exc.observed_at,
+            ) from exc
+
+        body = response.payload
+        if _optional_string(body.get("rt_cd")) != "0":
+            raise BrokerAdapterError(
+                _error_message(body),
+                status_code=422,
+                classification=_classify_error(
+                    status_code=400,
+                    code=_optional_string(body.get("msg_cd")),
+                    message=_error_message(body),
+                ),
+                retryable=False,
+                code=_optional_string(body.get("msg_cd")),
+                request_metadata=request_metadata,
+                response_payload=body,
+                observed_at=datetime.now(UTC),
+            )
+
+        output = _first_payload_object(body, "output", "output1")
+        if output is None:
+            raise BrokerAdapterError(
+                "KIS asking price response is missing output payload",
+                status_code=502,
+                classification=BrokerErrorClassification.UNKNOWN,
+                request_metadata=request_metadata,
+                response_payload=body,
+            )
+
+        bid = _first_decimal(output, "bid", "bid_price", "best_bid", "bidp1", "bidp")
+        ask = _first_decimal(output, "ask", "ask_price", "best_ask", "askp1", "askp")
+        if bid is None and ask is None:
+            return None
+        spread = _spread(bid=bid, ask=ask)
+        mid_price = _mid_price(bid=bid, ask=ask) or reference_price
+        ask_depth = _first_decimal(output, "total_askp_rsqn", "askp_rsqn_tvol", "ask_depth")
+        bid_depth = _first_decimal(output, "total_bidp_rsqn", "bidp_rsqn_tvol", "bid_depth")
+        if ask_depth is None:
+            ask_depth = _sum_numbered_decimal(output, "askp_rsqn", 10)
+        if bid_depth is None:
+            bid_depth = _sum_numbered_decimal(output, "bidp_rsqn", 10)
+        orderbook_depth = _sum_optional_decimals(ask_depth, bid_depth)
+        return BrokerLiveMarketContext(
+            symbol=symbol,
+            exchange=exchange,
+            observed_at=datetime.now(UTC),
+            bid=bid,
+            ask=ask,
+            spread=spread,
+            spread_bps=_spread_bps(spread=spread, mid_price=mid_price),
+            orderbook_depth=orderbook_depth,
+            orderbook_imbalance=_orderbook_imbalance(bid_depth=bid_depth, ask_depth=ask_depth),
+            payload={
+                "provider": self.provider,
+                "endpoint": KIS_ASKING_PRICE_PATH,
+                "tr_id": KIS_ASKING_PRICE_TR_ID,
+                "response_metadata": {
+                    "status_code": response.status_code,
+                    "msg_cd": _optional_string(body.get("msg_cd")),
+                    "msg1": _optional_string(body.get("msg1")),
+                    "received_at": datetime.now(UTC).isoformat(),
+                },
+                "output": output,
+            },
         )
 
     def get_account_snapshot(
@@ -1064,6 +1176,78 @@ def _quote_market_division(exchange: str) -> str:
             classification=BrokerErrorClassification.VALIDATION,
         )
     return "J"
+
+
+def _first_payload_object(payload: dict[str, object], *keys: str) -> dict[str, object] | None:
+    for key in keys:
+        value = payload.get(key)
+        if isinstance(value, dict):
+            return value
+    return None
+
+
+def _first_decimal(payload: dict[str, object], *keys: str) -> Decimal | None:
+    for key in keys:
+        value = _parse_decimal(payload.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def _sum_numbered_decimal(payload: dict[str, object], prefix: str, levels: int) -> Decimal | None:
+    total = Decimal("0")
+    found = False
+    for level in range(1, levels + 1):
+        value = _parse_decimal(payload.get(f"{prefix}{level}"))
+        if value is None:
+            continue
+        total += value
+        found = True
+    return total if found else None
+
+
+def _sum_optional_decimals(*values: Decimal | None) -> Decimal | None:
+    total = Decimal("0")
+    found = False
+    for value in values:
+        if value is None:
+            continue
+        total += value
+        found = True
+    return total if found else None
+
+
+def _spread(*, bid: Decimal | None, ask: Decimal | None) -> Decimal | None:
+    if bid is None or ask is None:
+        return None
+    spread = ask - bid
+    return spread if spread >= 0 else None
+
+
+def _mid_price(*, bid: Decimal | None, ask: Decimal | None) -> Decimal | None:
+    if bid is None or ask is None:
+        return None
+    mid = (bid + ask) / Decimal("2")
+    return mid if mid > 0 else None
+
+
+def _spread_bps(*, spread: Decimal | None, mid_price: Decimal | None) -> Decimal | None:
+    if spread is None or mid_price is None or mid_price <= 0:
+        return None
+    return (spread / mid_price) * Decimal("10000")
+
+
+def _orderbook_imbalance(
+    *,
+    bid_depth: Decimal | None,
+    ask_depth: Decimal | None,
+) -> Decimal | None:
+    if bid_depth is None or ask_depth is None:
+        return None
+    total = bid_depth + ask_depth
+    if total <= 0:
+        return None
+    return (bid_depth - ask_depth) / total
 
 
 def _parse_decimal(value: object) -> Decimal | None:
