@@ -114,6 +114,7 @@ class KisCurrentQuoteMonitoringPriceSource:
                     quote=quote,
                     settings=settings,
                 )
+                market_quality = _sanitize_monitoring_market_quality(market_quality)
                 prices.append(
                     MonitoringPriceRequest(
                         symbol=quote.symbol,
@@ -256,6 +257,21 @@ def _merge_live_market_context(
         provenance["missing_fields"] = missing_fields
     merged["provenance"] = provenance
     return merged
+
+
+def _sanitize_monitoring_market_quality(payload: dict[str, object]) -> dict[str, object]:
+    sanitized = dict(payload)
+    for key in ("bid", "ask"):
+        value = sanitized.get(key)
+        if value is None:
+            continue
+        try:
+            decimal_value = Decimal(str(value))
+        except Exception:
+            continue
+        if decimal_value <= 0:
+            sanitized[key] = None
+    return sanitized
 
 
 def _derive_orderability_context(

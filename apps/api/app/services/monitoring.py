@@ -384,7 +384,6 @@ def _evaluate_monitoring_cycle(
         db=db,
         triggered_at=triggered_at,
     )
-    monitored_symbols = {item.symbol for item in items}
     sell_monitored_symbols = {
         item.symbol
         for item in items
@@ -406,6 +405,11 @@ def _evaluate_monitoring_cycle(
         for symbol, position in positions_by_symbol.items()
         if position.quantity > 0
     }
+    items = _filter_sell_items_to_held_symbols(
+        items=items,
+        positions_by_symbol=positions_by_symbol,
+    )
+    monitored_symbols = {item.symbol for item in items}
     _reserve_existing_exit_orders(
         settings=settings,
         db=db,
@@ -1429,6 +1433,18 @@ def _load_monitored_items(
         monitored_item_filter=monitored_item_filter,
         selected_items=selected_items,
     )
+
+
+def _filter_sell_items_to_held_symbols(
+    *,
+    items: list[ExecutionPlanItem],
+    positions_by_symbol: dict[str, ExecutionPosition],
+) -> list[ExecutionPlanItem]:
+    return [
+        item
+        for item in items
+        if _is_watch_buy_item(item) or item.symbol in positions_by_symbol
+    ]
 
 
 def _trigger_time_agent_status_counts(

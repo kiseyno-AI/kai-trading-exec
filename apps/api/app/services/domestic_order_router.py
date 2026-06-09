@@ -126,7 +126,7 @@ def resolve_domestic_order_route(
             reason="krx_preopen_close_disabled",
         )
 
-    if session in {"nxt_after_acceptance", "nxt_after"}:
+    if session in {"nxt_after_acceptance", "nxt_after", "nxt_after_late"}:
         if nxt_eligible and settings.allow_nxt_after_orders and _after_hours_side_allowed(settings, side):
             return _submit(
                 local_now=local_now,
@@ -213,7 +213,7 @@ def _session_for(now: datetime) -> str:
     if time(16, 0) <= local_time < time(18, 0):
         return "krx_after_single_price"
     if time(18, 0) <= local_time < time(20, 0):
-        return "nxt_after"
+        return "nxt_after_late"
     return "closed"
 
 

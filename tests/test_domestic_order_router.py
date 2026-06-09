@@ -303,3 +303,27 @@ def test_nxt_after_routes_until_2000_for_eligible_symbol() -> None:
     assert decision.action == "submit"
     assert decision.exchange == "NXT"
     assert decision.session == "nxt_after"
+
+
+def test_non_nxt_symbol_defers_during_nxt_after_late_session() -> None:
+    decision = resolve_domestic_order_route(
+        settings=Settings(
+            domestic_order_session_routing_enabled=True,
+            allow_krx_after_hours_closing_orders=True,
+            allow_nxt_after_orders=True,
+            allow_after_hours_sell_orders=True,
+            nxt_eligible_symbols="033530",
+        ),
+        now=datetime(2026, 5, 28, 19, 30, tzinfo=KST),
+        symbol="073560",
+        side="sell",
+        purpose="protective_stop",
+        desired_order_type="limit",
+        limit_price=Decimal("1583"),
+        requested_exchange="KRX",
+    )
+
+    assert decision.action == "defer"
+    assert decision.exchange == "KRX"
+    assert decision.session == "closed"
+    assert decision.reason == "after_hours_route_unavailable"
