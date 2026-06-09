@@ -4389,6 +4389,81 @@ def test_monitoring_evaluate_tracks_remaining_shares_across_triggered_items() ->
     engine.dispose()
 
 
+def test_monitoring_evaluate_ignores_triggered_sell_for_non_held_symbol() -> None:
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(broker_order_id="kis-sell-non-held"),
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+        ),
+        broker_adapter=broker_adapter,
+    )
+    client = TestClient(app)
+
+    resume = client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "console", "reason": "enable automation"},
+    )
+    assert resume.status_code == 200
+
+    plan_response = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-non-held-sell-monitor-risk-noise",
+            "source": "kai-trading-core",
+            "items": [
+                {
+                    "symbol": "005930",
+                    "side": "sell",
+                    "intent": "target_sell",
+                    "quantity_policy": {"kind": "shares", "quantity": 1},
+                    "trigger_price": "125000.00",
+                    "time_in_force": "day",
+                    "risk_context": {"exchange": "KRX"},
+                },
+            ],
+        },
+    )
+    assert plan_response.status_code == 201
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "non-held sell timing should not count as monitoring risk",
+            "prices": [
+                {
+                    "symbol": "005930",
+                    "price": "125100.00",
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["evaluated_item_count"] == 0
+    assert payload["triggered_item_count"] == 0
+    assert payload["submitted_order_count"] == 0
+    assert payload["items"] == []
+    assert broker_adapter.order_calls == []
+
+    engine.dispose()
+
+
 def test_monitoring_evaluate_round_robins_symbols_when_dispatch_capacity_is_bounded() -> None:
     broker_adapter = StubBrokerAdapter(
         config=BrokerConfig(
