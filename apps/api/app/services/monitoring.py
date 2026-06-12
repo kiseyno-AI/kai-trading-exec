@@ -587,6 +587,35 @@ def _evaluate_monitoring_cycle(
                     message="observed price is above chase_limit_price",
                 )
                 continue
+            risk_gate = _watch_buy_high_risk_gate_rejection(
+                settings=settings,
+                item=item,
+                observed_price=observed_price,
+            )
+            if risk_gate is not None:
+                triggered_item_count += 1
+                triggered_symbols.add(item.symbol)
+                blocked_item_count += 1
+                item.status = "watch_buy_rejected"
+                _record_monitoring_event(
+                    item=item,
+                    event={
+                        "event": "watch_buy_rejected",
+                        "reason": risk_gate["reason"],
+                        "message": risk_gate["message"],
+                        "details": risk_gate["details"],
+                        "observed_price": _serialize_decimal(observed_price),
+                        "recorded_at": triggered_at.isoformat(),
+                    },
+                )
+                result_by_item_id[item.id] = _monitoring_result_payload(
+                    item=item,
+                    observed_price=observed_price,
+                    outcome="rejected",
+                    block_reason=risk_gate["reason"],
+                    message=risk_gate["message"],
+                )
+                continue
 
         if retry_persisted_trigger:
             retried_triggered_item_count += 1
@@ -2688,6 +2717,113 @@ def _watch_buy_chase_limit_price(item: ExecutionPlanItem) -> Decimal | None:
     )
 
 
+def _watch_buy_high_risk_gate_rejection(
+    *,
+    settings: Settings,
+    item: ExecutionPlanItem,
+    observed_price: Decimal,
+) -> dict[str, object] | None:
+    if not settings.watch_buy_high_risk_gate_enabled:
+        return None
+    payload = {"sources": _item_payload_sources(item)}
+    signal_action = (_recursive_text_feature(payload, {"action"}, parent_key="signal_decider_crosscheck") or "").lower()
+    tactical_action = (
+        _recursive_text_feature(payload, {"tactical_action"})
+        or _recursive_text_feature(payload, {"handoff_intent"})
+        or ""
+    ).lower()
+    if signal_action == "reject":
+        return _watch_buy_gate_rejection(
+            reason="signal_decider_reject_veto",
+            message="same-day signal-decider rejected this setup",
+            details={"signal_decider_action": signal_action, "tactical_action": tactical_action},
+        )
+    if signal_action == "wait" and tactical_action in {"scalp_buy_candidate", "tactical_buy"}:
+        return _watch_buy_gate_rejection(
+            reason="signal_decider_wait_blocks_tactical_buy",
+            message="same-day signal-decider is wait, so tactical buy requires a stricter watch setup",
+            details={"signal_decider_action": signal_action, "tactical_action": tactical_action},
+        )
+
+    atr_pct = _recursive_decimal_feature(payload, {"atr_pct_14", "atr_pct", "atr14_pct", "atr_percent"})
+    ret20 = _recursive_decimal_feature(payload, {"ret20", "ret_20d", "return_20d", "pct_change_20d"})
+    ret5 = _recursive_decimal_feature(payload, {"ret5", "ret_5d", "return_5d", "pct_change_5d"})
+    trend_state = (_recursive_text_feature(payload, {"trend_state", "technical_trend", "market_regime"}) or "").lower()
+    setup_state = (_recursive_text_feature(payload, {"setup_state", "breakdown_state", "pattern_state"}) or "").lower()
+    details = {
+        "atr_pct_14": _serialize_decimal(atr_pct),
+        "ret20": _serialize_decimal(ret20),
+        "ret5": _serialize_decimal(ret5),
+        "trend_state": trend_state or None,
+        "setup_state": setup_state or None,
+    }
+    if any(marker in f"{trend_state} {setup_state}" for marker in ("downtrend", "bearish", "breakdown_20d", "breakdown")):
+        return _watch_buy_gate_rejection(
+            reason="short_term_downtrend_or_breakdown_block",
+            message="watch buy setup is downtrend/bearish/breakdown",
+            details=details,
+        )
+    if ret20 is not None and ret20 < settings.watch_buy_deep_negative_ret20_threshold_pct:
+        return _watch_buy_gate_rejection(
+            reason="short_term_ret20_deep_negative_block",
+            message="20-day return is deeply negative for a short-term watch buy",
+            details=details,
+        )
+    if (
+        atr_pct is not None
+        and atr_pct >= settings.watch_buy_high_atr_pct_threshold
+        and ret20 is not None
+        and ret20 <= settings.watch_buy_weak_ret20_threshold_pct
+    ):
+        return _watch_buy_gate_rejection(
+            reason="short_term_high_atr_weak_trend_block",
+            message="ATR is high while 20-day return is weak",
+            details=details,
+        )
+    if (
+        atr_pct is not None
+        and atr_pct > settings.watch_buy_high_atr_pct_threshold
+        and ret5 is not None
+        and ret5 > settings.watch_buy_extended_ret5_threshold_pct
+    ):
+        return _watch_buy_gate_rejection(
+            reason="short_term_high_atr_chase_block",
+            message="5-day move is extended while ATR is high",
+            details=details,
+        )
+
+    day_high = _recursive_decimal_feature(payload, {"day_high", "intraday_high", "high_price", "session_high"})
+    day_low = _recursive_decimal_feature(payload, {"day_low", "intraday_low", "low_price", "session_low"})
+    if day_high is not None and day_low is not None and day_high > day_low:
+        range_position_pct = ((observed_price - day_low) / (day_high - day_low)) * Decimal("100")
+        if range_position_pct >= settings.watch_buy_max_intraday_range_position_pct:
+            return _watch_buy_gate_rejection(
+                reason="watch_buy_intraday_range_chase_block",
+                message="triggered price is too high in the current intraday range",
+                details={
+                    **details,
+                    "day_high": _serialize_decimal(day_high),
+                    "day_low": _serialize_decimal(day_low),
+                    "range_position_pct": _serialize_decimal(range_position_pct),
+                    "max_range_position_pct": _serialize_decimal(settings.watch_buy_max_intraday_range_position_pct),
+                },
+            )
+    return None
+
+
+def _watch_buy_gate_rejection(
+    *,
+    reason: str,
+    message: str,
+    details: dict[str, object],
+) -> dict[str, object]:
+    return {
+        "reason": reason,
+        "message": message,
+        "details": details,
+    }
+
+
 def _watch_buy_direction(item: ExecutionPlanItem) -> str:
     for source in _item_payload_sources(item):
         for key in ("trigger_direction", "entry_direction", "watch_direction", "direction"):
@@ -2742,6 +2878,52 @@ def _parse_positive_decimal(value: object) -> Decimal | None:
     except (InvalidOperation, ValueError):
         return None
     return parsed if parsed > 0 else None
+
+
+def _recursive_decimal_feature(payload: object, keys: set[str], *, parent_key: str | None = None) -> Decimal | None:
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            normalized_key = str(key or "").strip().lower()
+            if parent_key is not None and normalized_key == parent_key:
+                found = _recursive_decimal_feature(value, keys)
+                if found is not None:
+                    return found
+            if parent_key is None and normalized_key in keys:
+                parsed = _parse_decimal(value)
+                if parsed is not None:
+                    return parsed
+            found = _recursive_decimal_feature(value, keys, parent_key=parent_key)
+            if found is not None:
+                return found
+    elif isinstance(payload, list):
+        for item in payload:
+            found = _recursive_decimal_feature(item, keys, parent_key=parent_key)
+            if found is not None:
+                return found
+    return None
+
+
+def _recursive_text_feature(payload: object, keys: set[str], *, parent_key: str | None = None) -> str | None:
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            normalized_key = str(key or "").strip().lower()
+            if parent_key is not None and normalized_key == parent_key:
+                found = _recursive_text_feature(value, keys)
+                if found is not None:
+                    return found
+            if parent_key is None and normalized_key in keys and value is not None:
+                text = str(value).strip()
+                if text:
+                    return text
+            found = _recursive_text_feature(value, keys, parent_key=parent_key)
+            if found is not None:
+                return found
+    elif isinstance(payload, list):
+        for item in payload:
+            found = _recursive_text_feature(item, keys, parent_key=parent_key)
+            if found is not None:
+                return found
+    return None
 
 
 def _exec_agent_decision(item: ExecutionPlanItem) -> dict[str, object] | None:
