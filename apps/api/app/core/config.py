@@ -28,6 +28,12 @@ class Settings(BaseModel):
     monitoring_max_broker_actions_per_cycle: int = Field(default=32, ge=1, le=10000)
     monitoring_max_quote_age_seconds: int = Field(default=30, ge=1, le=3600)
     monitoring_watch_buy_retry_cooldown_seconds: int = Field(default=5, ge=1, le=3600)
+    watch_buy_high_risk_gate_enabled: bool = True
+    watch_buy_high_atr_pct_threshold: Decimal = Field(default=Decimal("9.0"), ge=0, le=Decimal("100"))
+    watch_buy_weak_ret20_threshold_pct: Decimal = Field(default=Decimal("0.0"), ge=Decimal("-100"), le=Decimal("100"))
+    watch_buy_deep_negative_ret20_threshold_pct: Decimal = Field(default=Decimal("-10.0"), ge=Decimal("-100"), le=Decimal("0"))
+    watch_buy_extended_ret5_threshold_pct: Decimal = Field(default=Decimal("15.0"), ge=0, le=Decimal("100"))
+    watch_buy_max_intraday_range_position_pct: Decimal = Field(default=Decimal("75.0"), ge=0, le=Decimal("100"))
     profit_protection_min_peak_pct: Decimal = Field(default=Decimal("2.0"), gt=0, le=Decimal("100"))
     profit_protection_giveback_pct: Decimal = Field(default=Decimal("1.2"), gt=0, le=Decimal("100"))
     profit_protection_aged_session_min: int = Field(default=2, ge=1, le=20)
@@ -125,6 +131,12 @@ _ENV_FIELDS = {
     "MONITORING_MAX_BROKER_ACTIONS_PER_CYCLE": "monitoring_max_broker_actions_per_cycle",
     "MONITORING_MAX_QUOTE_AGE_SECONDS": "monitoring_max_quote_age_seconds",
     "MONITORING_WATCH_BUY_RETRY_COOLDOWN_SECONDS": "monitoring_watch_buy_retry_cooldown_seconds",
+    "WATCH_BUY_HIGH_RISK_GATE_ENABLED": "watch_buy_high_risk_gate_enabled",
+    "WATCH_BUY_HIGH_ATR_PCT_THRESHOLD": "watch_buy_high_atr_pct_threshold",
+    "WATCH_BUY_WEAK_RET20_THRESHOLD_PCT": "watch_buy_weak_ret20_threshold_pct",
+    "WATCH_BUY_DEEP_NEGATIVE_RET20_THRESHOLD_PCT": "watch_buy_deep_negative_ret20_threshold_pct",
+    "WATCH_BUY_EXTENDED_RET5_THRESHOLD_PCT": "watch_buy_extended_ret5_threshold_pct",
+    "WATCH_BUY_MAX_INTRADAY_RANGE_POSITION_PCT": "watch_buy_max_intraday_range_position_pct",
     "PROFIT_PROTECTION_MIN_PEAK_PCT": "profit_protection_min_peak_pct",
     "PROFIT_PROTECTION_GIVEBACK_PCT": "profit_protection_giveback_pct",
     "PROFIT_PROTECTION_AGED_SESSION_MIN": "profit_protection_aged_session_min",

@@ -392,12 +392,24 @@ def test_settings_load_profit_protection_environment_fields() -> None:
             "KAI_EXEC_PROFIT_PROTECTION_MIN_PEAK_PCT": "1.5",
             "KAI_EXEC_PROFIT_PROTECTION_GIVEBACK_PCT": "0.7",
             "KAI_EXEC_PROFIT_PROTECTION_AGED_SESSION_MIN": "3",
+            "KAI_EXEC_WATCH_BUY_HIGH_RISK_GATE_ENABLED": "true",
+            "KAI_EXEC_WATCH_BUY_HIGH_ATR_PCT_THRESHOLD": "8.5",
+            "KAI_EXEC_WATCH_BUY_WEAK_RET20_THRESHOLD_PCT": "-1.0",
+            "KAI_EXEC_WATCH_BUY_DEEP_NEGATIVE_RET20_THRESHOLD_PCT": "-12.0",
+            "KAI_EXEC_WATCH_BUY_EXTENDED_RET5_THRESHOLD_PCT": "14.0",
+            "KAI_EXEC_WATCH_BUY_MAX_INTRADAY_RANGE_POSITION_PCT": "70.0",
         },
     )
 
     assert settings.profit_protection_min_peak_pct == Decimal("1.5")
     assert settings.profit_protection_giveback_pct == Decimal("0.7")
     assert settings.profit_protection_aged_session_min == 3
+    assert settings.watch_buy_high_risk_gate_enabled is True
+    assert settings.watch_buy_high_atr_pct_threshold == Decimal("8.5")
+    assert settings.watch_buy_weak_ret20_threshold_pct == Decimal("-1.0")
+    assert settings.watch_buy_deep_negative_ret20_threshold_pct == Decimal("-12.0")
+    assert settings.watch_buy_extended_ret5_threshold_pct == Decimal("14.0")
+    assert settings.watch_buy_max_intraday_range_position_pct == Decimal("70.0")
 
 
 def test_kis_adapter_uses_client_credentials_token_flow() -> None:
@@ -2497,6 +2509,53 @@ def test_watch_buy_rejects_gap_above_chase_limit() -> None:
         assert item is not None
         assert item.status == "watch_buy_rejected"
         assert item.risk_context["last_monitoring_event"]["reason"] == "price_above_chase_limit"
+
+    engine.dispose()
+
+
+def test_watch_buy_rejects_high_atr_weak_trend_before_submit() -> None:
+    app, engine, client, broker_adapter = _build_watch_buy_test_app()
+    item_id = _create_watch_buy_candidate(
+        client,
+        plan_id="plan-watch-buy-high-risk-gate-1",
+        risk_context={
+            "exchange": "KRX",
+            "stop_price": "70000.00",
+            "short_term_entry_quality": {
+                "atr_pct_14": "9.4",
+                "ret20": "-2.1",
+                "ret5": "4.0",
+                "trend_state": "range/mixed",
+            },
+        },
+    )
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "high atr weak trend should block",
+            "prices": [{"symbol": "005930", "price": "71050.00"}],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["triggered_item_count"] == 1
+    assert payload["submitted_order_count"] == 0
+    assert payload["blocked_item_count"] == 1
+    assert payload["items"][0]["outcome"] == "rejected"
+    assert payload["items"][0]["block_reason"] == "short_term_high_atr_weak_trend_block"
+    assert broker_adapter.order_calls == []
+
+    with app.state.db_session_factory() as session:
+        item = session.get(ExecutionPlanItem, item_id)
+        assert item is not None
+        assert item.status == "watch_buy_rejected"
+        last_event = item.risk_context["last_monitoring_event"]
+        assert last_event["reason"] == "short_term_high_atr_weak_trend_block"
+        assert last_event["details"]["atr_pct_14"] == "9.4000"
 
     engine.dispose()
 
