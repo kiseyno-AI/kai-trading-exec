@@ -1053,7 +1053,7 @@ def test_position_exit_pending_sell_is_autonomous_monitored_when_position_exists
             db=session,
             exclude_pending_config=True,
         )
-        assert [item.id for item in stale_state_autonomous_items] == [plan_item_id]
+        assert [item.id for item in stale_state_autonomous_items] == []
 
         session.add(
             ExecutionPosition(
@@ -1704,11 +1704,75 @@ def test_autonomous_monitoring_includes_held_stop_sell_outside_symbol_cap() -> N
             exclude_pending_config=True,
         )
 
-        assert [item.id for item in autonomous_items] == [
-            first_item_id,
-            second_item_id,
-            held_stop_item_id,
-        ]
+        assert [item.id for item in autonomous_items] == [held_stop_item_id]
+
+    engine.dispose()
+
+
+def test_autonomous_monitoring_prioritizes_watch_buys_over_nonheld_stale_sell_pending() -> None:
+    app, engine = build_test_app(
+        Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            monitoring_max_symbols_per_cycle=2,
+        )
+    )
+    client = TestClient(app)
+
+    stale_sell = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-stale-nonheld-sell-pending",
+            "source": "kai-trading-core",
+            "market_date": "2026-06-01",
+            "items": [
+                {
+                    "symbol": "005930",
+                    "side": "sell",
+                    "intent": "target_sell",
+                    "trigger_price": "80000.00",
+                    "quantity_policy": {"kind": "position_exit_from_entry"},
+                },
+                {
+                    "symbol": "000660",
+                    "side": "sell",
+                    "intent": "stop_sell",
+                    "trigger_price": "180000.00",
+                    "quantity_policy": {"kind": "position_exit_from_entry"},
+                },
+            ],
+        },
+    )
+    watch_buy = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-current-watch-buy",
+            "source": "kai-trading-core",
+            "market_date": "2026-06-12",
+            "items": [
+                {
+                    "symbol": "035420",
+                    "side": "buy",
+                    "intent": "intraday_watch_buy",
+                    "trigger_price": "180000.00",
+                    "limit_price": "181000.00",
+                    "quantity_policy": {"kind": "shares", "quantity": 1},
+                }
+            ],
+        },
+    )
+    assert stale_sell.status_code == 201
+    assert watch_buy.status_code == 201
+    watch_buy_item_id = watch_buy.json()["persisted_execution_item_ids"][0]
+
+    with app.state.db_session_factory() as session:
+        autonomous_items = _load_monitored_items(
+            settings=app.state.settings,
+            db=session,
+            exclude_pending_config=True,
+        )
+
+        assert [item.id for item in autonomous_items] == [watch_buy_item_id]
 
     engine.dispose()
 
