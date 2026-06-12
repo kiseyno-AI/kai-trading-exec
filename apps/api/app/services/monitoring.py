@@ -283,32 +283,7 @@ def expire_known_flat_pending_sell_monitors(
     expired_at: datetime | None = None,
 ) -> int:
     expired_at = _normalize_utc(expired_at or datetime.now(UTC))
-    latest_buy_order_at = (
-        select(func.max(BrokerOrder.created_at))
-        .where(
-            BrokerOrder.mode == settings.runtime_mode,
-            BrokerOrder.symbol == ExecutionPlanItem.symbol,
-            BrokerOrder.side == "buy",
-            BrokerOrder.status.in_(("submitted", "open", "partially_filled", "filled")),
-        )
-        .correlate(ExecutionPlanItem)
-        .scalar_subquery()
-    )
-    latest_sell_order_at = (
-        select(func.max(BrokerOrder.created_at))
-        .where(
-            BrokerOrder.mode == settings.runtime_mode,
-            BrokerOrder.symbol == ExecutionPlanItem.symbol,
-            BrokerOrder.side == "sell",
-            BrokerOrder.status.in_(("submitted", "open", "partially_filled", "filled")),
-        )
-        .correlate(ExecutionPlanItem)
-        .scalar_subquery()
-    )
-    has_unexited_buy_order = and_(
-        latest_buy_order_at.is_not(None),
-        or_(latest_sell_order_at.is_(None), latest_buy_order_at > latest_sell_order_at),
-    )
+    has_unexited_buy_order = _has_unexited_buy_order_filter(settings=settings)
     held_symbols = select(ExecutionPosition.symbol).where(
         ExecutionPosition.mode == settings.runtime_mode,
         ExecutionPosition.quantity > 0,
@@ -405,10 +380,11 @@ def _evaluate_monitoring_cycle(
         for symbol, position in positions_by_symbol.items()
         if position.quantity > 0
     }
-    items = _filter_sell_items_to_held_symbols(
-        items=items,
-        positions_by_symbol=positions_by_symbol,
-    )
+    if allow_persisted_triggered_without_price:
+        items = _filter_sell_items_to_held_symbols(
+            items=items,
+            positions_by_symbol=positions_by_symbol,
+        )
     monitored_symbols = {item.symbol for item in items}
     _reserve_existing_exit_orders(
         settings=settings,
@@ -450,6 +426,14 @@ def _evaluate_monitoring_cycle(
             )
         )
         if price is None and not retry_persisted_trigger and item.intent != "max_holding_close_sell":
+            continue
+
+        if (
+            not allow_persisted_triggered_without_price
+            and not _is_watch_buy_item(item)
+            and item.symbol not in positions_by_symbol
+            and _monitoring_item_is_configured(item)
+        ):
             continue
 
         evaluated_item_ids.append(item.id)
@@ -1365,12 +1349,16 @@ def _load_monitored_items(
             ExecutionPosition.mode == settings.runtime_mode,
             ExecutionPosition.quantity > 0,
         )
+        has_unexited_buy_order = _has_unexited_buy_order_filter(settings=settings)
         monitored_item_filter = and_(
             monitored_item_filter,
             or_(
                 ExecutionPlanItem.side != "sell",
                 ExecutionPlanItem.symbol.in_(held_symbols),
-                _position_exit_quantity_policy_filter(),
+                and_(
+                    _position_exit_quantity_policy_filter(),
+                    has_unexited_buy_order,
+                ),
             ),
         )
     latest_plan_candidates = (
@@ -1736,6 +1724,35 @@ def _position_exit_quantity_policy_filter():
     return or_(
         ExecutionPlanItem.quantity_policy["type"].as_string() == "position_exit_from_entry",
         ExecutionPlanItem.quantity_policy["kind"].as_string() == "position_exit_from_entry",
+    )
+
+
+def _has_unexited_buy_order_filter(*, settings: Settings):
+    latest_buy_order_at = (
+        select(func.max(BrokerOrder.created_at))
+        .where(
+            BrokerOrder.mode == settings.runtime_mode,
+            BrokerOrder.symbol == ExecutionPlanItem.symbol,
+            BrokerOrder.side == "buy",
+            BrokerOrder.status.in_(("submitted", "open", "partially_filled", "filled")),
+        )
+        .correlate(ExecutionPlanItem)
+        .scalar_subquery()
+    )
+    latest_sell_order_at = (
+        select(func.max(BrokerOrder.created_at))
+        .where(
+            BrokerOrder.mode == settings.runtime_mode,
+            BrokerOrder.symbol == ExecutionPlanItem.symbol,
+            BrokerOrder.side == "sell",
+            BrokerOrder.status.in_(("submitted", "open", "partially_filled", "filled")),
+        )
+        .correlate(ExecutionPlanItem)
+        .scalar_subquery()
+    )
+    return and_(
+        latest_buy_order_at.is_not(None),
+        or_(latest_sell_order_at.is_(None), latest_buy_order_at > latest_sell_order_at),
     )
 
 
