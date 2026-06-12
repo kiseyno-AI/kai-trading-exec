@@ -129,6 +129,14 @@ SELL_PENDING_CONFIG_STATUSES = frozenset(
         "max_holding_close_sell_pending_config",
     }
 )
+SELL_ACTIVE_MONITORING_STATUSES = frozenset(
+    {
+        "target_sell_monitoring",
+        "stop_sell_monitoring",
+        "max_holding_close_sell_monitoring",
+    }
+)
+SELL_STALE_FLAT_EXPIRABLE_STATUSES = SELL_PENDING_CONFIG_STATUSES | SELL_ACTIVE_MONITORING_STATUSES
 MONITORING_WORKER_NAME = "intraday_target_stop_monitor"
 MONITORING_RUNTIME_TOPOLOGY = "shared_symbol_scheduler"
 MONITORING_SELECTION_STRATEGY = "round_robin_by_symbol"
@@ -309,7 +317,7 @@ def expire_known_flat_pending_sell_monitors(
             ExecutionPlan.mode == settings.runtime_mode,
             ExecutionPlanItem.side == "sell",
             ExecutionPlanItem.intent.in_(tuple(SELL_MONITORED_INTENTS)),
-            ExecutionPlanItem.status.in_(tuple(SELL_PENDING_CONFIG_STATUSES)),
+            ExecutionPlanItem.status.in_(tuple(SELL_STALE_FLAT_EXPIRABLE_STATUSES)),
             ExecutionPlanItem.symbol.in_(known_flat_symbols),
             ExecutionPlanItem.symbol.not_in(held_symbols),
             ExecutionPlanItem.symbol.not_in(active_watch_symbols),
@@ -330,7 +338,7 @@ def expire_known_flat_pending_sell_monitors(
         _record_monitoring_event(
             item=item,
             event={
-                "event": "known_flat_pending_sell_monitor_expired",
+                "event": "known_flat_sell_monitor_expired",
                 "reason": "known_flat_position",
                 "prior_status": prior_status,
                 "recorded_at": expired_at.isoformat(),

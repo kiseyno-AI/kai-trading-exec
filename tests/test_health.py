@@ -1514,9 +1514,106 @@ def test_autonomous_monitoring_expires_known_flat_pending_sell_monitors() -> Non
         assert stale_item is not None
         assert held_item is not None
         assert stale_item.status == "expired"
+        assert stale_item.risk_context["last_monitoring_event"]["event"] == "known_flat_sell_monitor_expired"
         assert stale_item.risk_context["last_monitoring_event"]["reason"] == "known_flat_position"
         assert held_item.status == "target_sell_pending_config"
         assert live_watch_item.status == "watch_monitoring_active"
+        assert symbols == ["005930"]
+
+    engine.dispose()
+
+
+def test_autonomous_monitoring_expires_known_flat_active_sell_monitors() -> None:
+    app, engine = build_test_app(
+        Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+        )
+    )
+    client = TestClient(app)
+
+    stale_sell = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-flat-active-sell",
+            "source": "kai-trading-core",
+            "market_date": "2026-05-22",
+            "items": [
+                {
+                    "symbol": "000660",
+                    "side": "sell",
+                    "intent": "target_sell",
+                    "trigger_price": "110.00",
+                    "quantity_policy": {
+                        "type": "position_exit_from_entry",
+                        "linked_entry_item_key": "entry-1",
+                    },
+                }
+            ],
+        },
+    )
+    held_sell = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-held-active-sell",
+            "source": "kai-trading-core",
+            "market_date": "2026-05-22",
+            "items": [
+                {
+                    "symbol": "005930",
+                    "side": "sell",
+                    "intent": "stop_sell",
+                    "trigger_price": "70000.00",
+                    "quantity_policy": {
+                        "type": "position_exit_from_entry",
+                        "linked_entry_item_key": "entry-2",
+                    },
+                }
+            ],
+        },
+    )
+    assert stale_sell.status_code == 201
+    assert held_sell.status_code == 201
+    stale_item_id = stale_sell.json()["persisted_execution_item_ids"][0]
+    held_item_id = held_sell.json()["persisted_execution_item_ids"][0]
+
+    with app.state.db_session_factory() as session:
+        stale_item = session.get(ExecutionPlanItem, stale_item_id)
+        held_item = session.get(ExecutionPlanItem, held_item_id)
+        assert stale_item is not None
+        assert held_item is not None
+        stale_item.status = "target_sell_monitoring"
+        held_item.status = "stop_sell_monitoring"
+        session.add_all(
+            [
+                ExecutionPosition(
+                    mode="paper",
+                    symbol="000660",
+                    quantity=0,
+                    average_price=Decimal("0.00"),
+                    updated_from="reconciliation",
+                ),
+                ExecutionPosition(
+                    mode="paper",
+                    symbol="005930",
+                    quantity=3,
+                    average_price=Decimal("71000.00"),
+                    updated_from="reconciliation",
+                ),
+            ]
+        )
+        session.commit()
+
+        symbols = list_autonomous_monitoring_symbols(
+            settings=app.state.settings,
+            db=session,
+            current_market_date=datetime(2026, 5, 22, tzinfo=UTC).date(),
+        )
+
+        assert stale_item.status == "expired"
+        assert stale_item.risk_context["last_monitoring_event"]["event"] == "known_flat_sell_monitor_expired"
+        assert stale_item.risk_context["last_monitoring_event"]["prior_status"] == "target_sell_monitoring"
+        assert held_item.status == "stop_sell_monitoring"
         assert symbols == ["005930"]
 
     engine.dispose()
