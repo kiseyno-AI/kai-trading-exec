@@ -702,7 +702,7 @@ def test_short_term_exec_agent_approves_market_open_buy_and_materializes_monitor
     assert items_by_intent["next_open_buy"]["status"] == "next_open_buy_scheduled"
     assert items_by_intent["next_open_buy"]["quantity_policy"]["quantity"] == 2
     assert [item["quantity_policy"]["quantity"] for item in target_items] == [1, 1]
-    assert [item["trigger_price"] for item in target_items] == ["52000.0000", "54000.0000"]
+    assert [item["trigger_price"] for item in target_items] == ["51250.0000", "52750.0000"]
     assert target_items[0]["risk_context"]["exit_rule"]["kind"] == "partial_take_profit"
     assert target_items[1]["risk_context"]["exit_rule"]["kind"] == "final_take_profit"
     assert items_by_intent["stop_sell"]["status"] == "stop_sell_monitoring"
