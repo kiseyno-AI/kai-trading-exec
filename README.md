@@ -116,6 +116,7 @@ Monitoring runtime settings currently supported:
 - `KAI_EXEC_PROFIT_PROTECTION_MIN_PEAK_PCT`
 - `KAI_EXEC_PROFIT_PROTECTION_GIVEBACK_PCT`
 - `KAI_EXEC_PROFIT_PROTECTION_AGED_SESSION_MIN`
+- `KAI_EXEC_BREAKEVEN_STOP_BUFFER_PCT`
 
 Domestic order-session routing settings currently supported:
 - `KAI_EXEC_DOMESTIC_ORDER_SESSION_ROUTING_ENABLED`
@@ -182,9 +183,11 @@ Short-term exec risk settings currently supported:
 Default short-term sizing is tuned for higher-conviction filtered candidates:
 per-symbol budget `3,000,000` KRW, total exec-agent budget `9,000,000` KRW,
 base risk `1.5%`, max position allocation `30%`, and max symbol exposure
-`30%`. Candidate-level budgets, stop-distance risk sizing, available cash,
-daily new-buy caps, and runtime pause/kill-switch controls still clamp final
-order size.
+`30%`. Default profit capture takes a first partial profit near `+2.5%`,
+a final target near `+5.5%`, and rearms the remaining stop near breakeven after
+the first partial profit is submitted. Candidate-level budgets, stop-distance
+risk sizing, available cash, daily new-buy caps, and runtime pause/kill-switch
+controls still clamp final order size.
 
 Operator broker-session endpoints:
 - `GET /broker/session`

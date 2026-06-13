@@ -844,6 +844,14 @@ def _evaluate_monitoring_cycle(
                         symbol=action.item.symbol,
                         quantity=quantity,
                     )
+                    _rearm_stop_after_partial_take_profit(
+                        settings=settings,
+                        item=action.item,
+                        position=positions_by_symbol.get(action.item.symbol),
+                        remaining_quantity=remaining_quantities_by_symbol.get(action.item.symbol),
+                        submitted_quantity=quantity,
+                        recorded_at=triggered_at,
+                    )
                 submitted_order_count += 1
                 submitted_symbols.add(action.item.symbol)
                 trigger_time_exec_agent.attach_order_to_last_trigger_time_interaction(
@@ -2657,6 +2665,89 @@ def _reserve_existing_exit_orders(
             symbol=order.symbol,
             quantity=order.quantity,
         )
+
+
+def _rearm_stop_after_partial_take_profit(
+    *,
+    settings: Settings,
+    item: ExecutionPlanItem,
+    position: ExecutionPosition | None,
+    remaining_quantity: int | None,
+    submitted_quantity: int,
+    recorded_at: datetime,
+) -> None:
+    if item.intent != "target_sell" or remaining_quantity is None or remaining_quantity <= 0:
+        return
+    exit_rule = _exit_rule(item)
+    if exit_rule.get("kind") != "partial_take_profit":
+        return
+    if position is None or position.average_price is None or position.average_price <= 0:
+        return
+
+    breakeven_stop = _breakeven_stop_price(
+        average_price=position.average_price,
+        buffer_pct=settings.breakeven_stop_buffer_pct,
+    )
+    plan = item.plan
+    if plan is None:
+        return
+
+    for sibling in plan.items:
+        if sibling.symbol != item.symbol or sibling.intent != "stop_sell":
+            continue
+        if sibling.status in NON_MONITORABLE_PLAN_ITEM_STATUSES:
+            continue
+
+        prior_trigger = sibling.trigger_price
+        prior_quantity_policy = sibling.quantity_policy
+        if prior_trigger is None or prior_trigger < breakeven_stop:
+            sibling.trigger_price = breakeven_stop
+        sibling.quantity_policy = {
+            "kind": "shares",
+            "quantity": remaining_quantity,
+            "source": "partial_take_profit_breakeven_rearm",
+            "parent_target_item_id": item.id,
+        }
+        risk_context = dict(sibling.risk_context) if isinstance(sibling.risk_context, dict) else {}
+        risk_context["breakeven_rearmed"] = {
+            "source": "partial_take_profit",
+            "target_item_id": item.id,
+            "submitted_take_profit_quantity": submitted_quantity,
+            "remaining_quantity": remaining_quantity,
+            "average_price": _serialize_decimal(position.average_price),
+            "breakeven_stop_price": _serialize_decimal(sibling.trigger_price),
+            "buffer_pct": _serialize_decimal(settings.breakeven_stop_buffer_pct),
+            "prior_trigger_price": _serialize_decimal(prior_trigger),
+            "prior_quantity_policy": prior_quantity_policy,
+            "recorded_at": recorded_at.isoformat(),
+        }
+        sibling.risk_context = risk_context
+        _record_monitoring_event(
+            item=sibling,
+            event={
+                "event": "stop_sell_rearmed_after_partial_take_profit",
+                "reason": "partial_take_profit_submitted",
+                "target_item_id": item.id,
+                "submitted_take_profit_quantity": submitted_quantity,
+                "remaining_quantity": remaining_quantity,
+                "prior_trigger_price": _serialize_decimal(prior_trigger),
+                "updated_trigger_price": _serialize_decimal(sibling.trigger_price),
+                "average_price": _serialize_decimal(position.average_price),
+                "buffer_pct": _serialize_decimal(settings.breakeven_stop_buffer_pct),
+                "recorded_at": recorded_at.isoformat(),
+            },
+        )
+
+
+def _exit_rule(item: ExecutionPlanItem) -> dict[str, object]:
+    risk_context = item.risk_context if isinstance(item.risk_context, dict) else {}
+    exit_rule = risk_context.get("exit_rule")
+    return dict(exit_rule) if isinstance(exit_rule, dict) else {}
+
+
+def _breakeven_stop_price(*, average_price: Decimal, buffer_pct: Decimal) -> Decimal:
+    multiplier = Decimal("1") + (buffer_pct / Decimal("100"))
+    return (average_price * multiplier).quantize(Decimal("0.0001"), rounding=ROUND_DOWN)
 
 
 def _serialized_order_quantity(order_payload: object) -> int | None:

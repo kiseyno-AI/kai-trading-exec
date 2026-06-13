@@ -220,7 +220,10 @@ broker/account snapshot before approval, applies risk-by-stop-distance sizing,
 cash/holding/open-order/budget, per-symbol, and daily new-buy rails, writes the
 approved share quantity and deterministic idempotency key into
 `quantity_policy`, and materializes partial/final target, stop, and time-stop
-monitoring items. Invalid or rejected decisions persist as `exec_agent_rejected`
+monitoring items. When the first partial take-profit monitor submits, exec
+rearms the sibling stop monitor to the remaining quantity near breakeven so the
+unrealized remainder is no longer protected by the original loss stop. Invalid
+or rejected decisions persist as `exec_agent_rejected`
 with a machine-readable reason in `risk_context.exec_agent_decision`.
 
 Current plan-item readback also includes:

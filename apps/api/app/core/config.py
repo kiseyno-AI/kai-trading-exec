@@ -34,9 +34,10 @@ class Settings(BaseModel):
     watch_buy_deep_negative_ret20_threshold_pct: Decimal = Field(default=Decimal("-10.0"), ge=Decimal("-100"), le=Decimal("0"))
     watch_buy_extended_ret5_threshold_pct: Decimal = Field(default=Decimal("15.0"), ge=0, le=Decimal("100"))
     watch_buy_max_intraday_range_position_pct: Decimal = Field(default=Decimal("75.0"), ge=0, le=Decimal("100"))
-    profit_protection_min_peak_pct: Decimal = Field(default=Decimal("2.0"), gt=0, le=Decimal("100"))
-    profit_protection_giveback_pct: Decimal = Field(default=Decimal("1.2"), gt=0, le=Decimal("100"))
+    profit_protection_min_peak_pct: Decimal = Field(default=Decimal("1.8"), gt=0, le=Decimal("100"))
+    profit_protection_giveback_pct: Decimal = Field(default=Decimal("0.8"), gt=0, le=Decimal("100"))
     profit_protection_aged_session_min: int = Field(default=2, ge=1, le=20)
+    breakeven_stop_buffer_pct: Decimal = Field(default=Decimal("0.2"), ge=0, le=Decimal("5"))
     market_timezone: str = "Asia/Seoul"
     exec_agent_enabled: bool = False
     exec_agent_id: str = "exec-agent"
@@ -60,8 +61,8 @@ class Settings(BaseModel):
     exec_agent_tactical_scalp_max_stop_pct: Decimal = Field(default=Decimal("0.015"), gt=0, le=1)
     exec_agent_max_account_snapshot_age_seconds: int = Field(default=300, ge=1, le=86400)
     exec_agent_max_holding_trading_sessions: int = Field(default=3, ge=1, le=20)
-    exec_agent_first_take_profit_pct: Decimal = Field(default=Decimal("0.04"), gt=0, le=Decimal("0.10"))
-    exec_agent_final_take_profit_pct: Decimal = Field(default=Decimal("0.08"), gt=0, le=Decimal("0.20"))
+    exec_agent_first_take_profit_pct: Decimal = Field(default=Decimal("0.025"), gt=0, le=Decimal("0.10"))
+    exec_agent_final_take_profit_pct: Decimal = Field(default=Decimal("0.055"), gt=0, le=Decimal("0.20"))
     exec_agent_partial_take_profit_fraction: Decimal = Field(default=Decimal("0.50"), gt=0, le=1)
     exec_agent_trigger_time_enabled: bool = True
     exec_agent_trigger_time_sell_enabled: bool = True
@@ -140,6 +141,7 @@ _ENV_FIELDS = {
     "PROFIT_PROTECTION_MIN_PEAK_PCT": "profit_protection_min_peak_pct",
     "PROFIT_PROTECTION_GIVEBACK_PCT": "profit_protection_giveback_pct",
     "PROFIT_PROTECTION_AGED_SESSION_MIN": "profit_protection_aged_session_min",
+    "BREAKEVEN_STOP_BUFFER_PCT": "breakeven_stop_buffer_pct",
     "MARKET_TIMEZONE": "market_timezone",
     "EXEC_AGENT_ENABLED": "exec_agent_enabled",
     "EXEC_AGENT_ID": "exec_agent_id",
