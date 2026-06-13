@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
-from zoneinfo import ZoneInfo
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
+from functools import partial
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import and_, func, or_, select, tuple_
 from sqlalchemy.orm import Session, selectinload
@@ -813,6 +815,18 @@ def _evaluate_monitoring_cycle(
             pending_symbols.appendleft(symbol)
             break
         else:
+            before_success_commit: Callable[[], None] | None = None
+            if not is_watch_buy:
+                before_success_commit = partial(
+                    _reserve_and_rearm_sell_after_success,
+                    settings=settings,
+                    item=action.item,
+                    position=positions_by_symbol.get(action.item.symbol),
+                    remaining_quantities_by_symbol=remaining_quantities_by_symbol,
+                    submitted_quantity=quantity,
+                    recorded_at=triggered_at,
+                )
+
             dispatch_action_count += 1
             placement = _place_monitoring_order(
                 settings=settings,
@@ -825,6 +839,7 @@ def _evaluate_monitoring_cycle(
                 trigger_metadata=action.trigger_metadata,
                 triggered_at=triggered_at,
                 limit_price_override=limit_price_override,
+                before_success_commit=before_success_commit,
             )
             if placement.status_code == 201:
                 if is_watch_buy:
@@ -837,20 +852,6 @@ def _evaluate_monitoring_cycle(
                             "quantity": quantity,
                             "recorded_at": triggered_at.isoformat(),
                         },
-                    )
-                else:
-                    _reserve_remaining_quantity(
-                        remaining_quantities_by_symbol=remaining_quantities_by_symbol,
-                        symbol=action.item.symbol,
-                        quantity=quantity,
-                    )
-                    _rearm_stop_after_partial_take_profit(
-                        settings=settings,
-                        item=action.item,
-                        position=positions_by_symbol.get(action.item.symbol),
-                        remaining_quantity=remaining_quantities_by_symbol.get(action.item.symbol),
-                        submitted_quantity=quantity,
-                        recorded_at=triggered_at,
                     )
                 submitted_order_count += 1
                 submitted_symbols.add(action.item.symbol)
@@ -2633,6 +2634,30 @@ def _reserve_remaining_quantity(
     remaining_quantities_by_symbol.pop(symbol, None)
 
 
+def _reserve_and_rearm_sell_after_success(
+    *,
+    settings: Settings,
+    item: ExecutionPlanItem,
+    position: ExecutionPosition | None,
+    remaining_quantities_by_symbol: dict[str, int],
+    submitted_quantity: int,
+    recorded_at: datetime,
+) -> None:
+    _reserve_remaining_quantity(
+        remaining_quantities_by_symbol=remaining_quantities_by_symbol,
+        symbol=item.symbol,
+        quantity=submitted_quantity,
+    )
+    _rearm_stop_after_partial_take_profit(
+        settings=settings,
+        item=item,
+        position=position,
+        remaining_quantity=remaining_quantities_by_symbol.get(item.symbol),
+        submitted_quantity=submitted_quantity,
+        recorded_at=recorded_at,
+    )
+
+
 def _reserve_existing_exit_orders(
     *,
     settings: Settings,
@@ -3152,6 +3177,7 @@ def _place_monitoring_order(
     trigger_metadata: dict[str, object] | None,
     triggered_at: datetime,
     limit_price_override: Decimal | None = None,
+    before_success_commit: Callable[[], None] | None = None,
 ):
     is_watch_buy = _is_watch_buy_item(item)
     limit_price = (
@@ -3188,6 +3214,7 @@ def _place_monitoring_order(
         adapter=adapter,
         command=order_request,
         request_source=f"monitoring:{MONITORING_WORKER_NAME}",
+        before_success_commit=before_success_commit,
     )
 
 

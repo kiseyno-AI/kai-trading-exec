@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
@@ -42,6 +43,7 @@ def place_broker_order(
     adapter: BrokerAdapter,
     command: PlaceOrderRequest,
     request_source: str = "post:/orders",
+    before_success_commit: Callable[[], None] | None = None,
 ) -> PlaceBrokerOrderResult:
     existing = _load_order_by_idempotency_key(
         settings=settings,
@@ -293,6 +295,9 @@ def place_broker_order(
     )
     if plan_item is not None:
         plan_item.status = _plan_item_status_for_order_status(order.status)
+
+    if before_success_commit is not None:
+        before_success_commit()
 
     db.commit()
     persisted = _load_order_by_idempotency_key(

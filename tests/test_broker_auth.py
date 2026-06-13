@@ -3827,6 +3827,127 @@ def test_monitoring_rearms_stop_to_breakeven_after_partial_take_profit() -> None
     engine.dispose()
 
 
+def test_monitoring_does_not_commit_partial_take_profit_without_stop_rearm(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(broker_order_id="kis-partial-profit-rollback"),
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+            breakeven_stop_buffer_pct=Decimal("0.2"),
+        ),
+        broker_adapter=broker_adapter,
+    )
+    client = TestClient(app)
+
+    resume = client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "console", "reason": "enable automation"},
+    )
+    assert resume.status_code == 200
+    auth_response = client.post(
+        "/broker/session/authenticate",
+        json={"actor": "ops", "source": "console", "reason": "prime broker session"},
+    )
+    assert auth_response.status_code == 200
+
+    plan_response = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-partial-profit-rearm-stop-failure",
+            "source": "kai-trading-core",
+            "items": [
+                {
+                    "symbol": "005930",
+                    "side": "sell",
+                    "intent": "target_sell",
+                    "quantity_policy": {"kind": "shares", "quantity": 4},
+                    "trigger_price": "102500.00",
+                    "risk_context": {
+                        "exchange": "KRX",
+                        "exit_rule": {
+                            "kind": "partial_take_profit",
+                            "stage": "first",
+                        },
+                    },
+                },
+                {
+                    "symbol": "005930",
+                    "side": "sell",
+                    "intent": "stop_sell",
+                    "quantity_policy": {"kind": "shares", "quantity": 10},
+                    "trigger_price": "97000.00",
+                    "risk_context": {"exchange": "KRX"},
+                },
+            ],
+        },
+    )
+    assert plan_response.status_code == 201
+    target_item_id, stop_item_id = plan_response.json()["persisted_execution_item_ids"]
+
+    with app.state.db_session_factory() as session:
+        session.add(
+            ExecutionPosition(
+                mode="paper",
+                symbol="005930",
+                quantity=10,
+                average_price=Decimal("100000.0000"),
+                updated_from="reconciliation",
+                raw_payload={"source": "broker"},
+            )
+        )
+        session.commit()
+
+    def fail_stop_rearm(**_: object) -> None:
+        raise RuntimeError("simulated stop rearm persistence failure")
+
+    monkeypatch.setattr(
+        "app.services.monitoring._rearm_stop_after_partial_take_profit",
+        fail_stop_rearm,
+    )
+
+    with pytest.raises(RuntimeError, match="simulated stop rearm persistence failure"):
+        client.post(
+            "/monitoring/evaluate",
+            json={
+                "actor": "ops",
+                "source": "test",
+                "reason": "first take profit should protect remainder",
+                "prices": [{"symbol": "005930", "price": "102600.00"}],
+            },
+        )
+
+    assert len(broker_adapter.order_calls) == 1
+    with app.state.db_session_factory() as session:
+        target_item = session.get(ExecutionPlanItem, target_item_id)
+        stop_item = session.get(ExecutionPlanItem, stop_item_id)
+        assert target_item is not None
+        assert stop_item is not None
+        assert target_item.status == "target_sell_monitoring"
+        assert stop_item.trigger_price == Decimal("97000.0000")
+        assert stop_item.quantity_policy == {"kind": "shares", "quantity": 10}
+        assert stop_item.risk_context == {"exchange": "KRX"}
+        order = session.scalar(
+            select(BrokerOrder).where(BrokerOrder.execution_plan_item_id == target_item_id)
+        )
+        assert order is None
+
+    engine.dispose()
+
+
 def test_monitoring_evaluate_triggers_profit_protection_after_peak_giveback() -> None:
     broker_adapter = StubBrokerAdapter(
         config=BrokerConfig(
