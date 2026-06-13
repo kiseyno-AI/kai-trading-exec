@@ -162,7 +162,10 @@ Short-term exec risk settings currently supported:
 - `KAI_EXEC_EXEC_AGENT_BASE_RISK_PCT`
 - `KAI_EXEC_EXEC_AGENT_AGGRESSIVE_RISK_PCT`
 - `KAI_EXEC_EXEC_AGENT_AGGRESSIVE_CONFIDENCE_THRESHOLD`
+- `KAI_EXEC_EXEC_AGENT_MAX_SYMBOL_BUDGET`
+- `KAI_EXEC_EXEC_AGENT_MAX_TOTAL_BUDGET`
 - `KAI_EXEC_EXEC_AGENT_MAX_POSITION_ALLOCATION_PCT`
+- `KAI_EXEC_EXEC_AGENT_MAX_SYMBOL_EXPOSURE_PCT`
 - `KAI_EXEC_EXEC_AGENT_MAX_SYMBOL_TOTAL_EXPOSURE_PCT`
 - `KAI_EXEC_EXEC_AGENT_MAX_DAILY_NEW_BUY_NOTIONAL`
 - `KAI_EXEC_EXEC_AGENT_STOP_LOSS_PCT`
@@ -175,6 +178,13 @@ Short-term exec risk settings currently supported:
 - `KAI_EXEC_MONTHLY_TARGET_KRW`
 - `KAI_EXEC_MONTHLY_CAPITAL_PRESERVATION_ENABLED`
 - `KAI_EXEC_MONTHLY_AGGRESSIVE_LAG_RATIO`
+
+Default short-term sizing is tuned for higher-conviction filtered candidates:
+per-symbol budget `3,000,000` KRW, total exec-agent budget `9,000,000` KRW,
+base risk `1.5%`, max position allocation `30%`, and max symbol exposure
+`30%`. Candidate-level budgets, stop-distance risk sizing, available cash,
+daily new-buy caps, and runtime pause/kill-switch controls still clamp final
+order size.
 
 Operator broker-session endpoints:
 - `GET /broker/session`

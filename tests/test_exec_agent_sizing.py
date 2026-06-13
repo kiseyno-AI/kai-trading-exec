@@ -165,6 +165,7 @@ def build_test_app(
     exec_agent_max_symbol_budget: Decimal = Decimal("300000"),
     exec_agent_max_total_budget: Decimal = Decimal("600000"),
     exec_agent_max_daily_new_buy_notional: Decimal = Decimal("2000000"),
+    exec_agent_max_trade_risk_pct: Decimal = Decimal("0.015"),
     exec_agent_stop_loss_pct: Decimal = Decimal("0.10"),
     exec_agent_tactical_scalp_max_stop_pct: Decimal = Decimal("0.015"),
 ):
@@ -177,8 +178,11 @@ def build_test_app(
         exec_agent_max_symbol_budget=exec_agent_max_symbol_budget,
         exec_agent_max_total_budget=exec_agent_max_total_budget,
         exec_agent_base_risk_pct=Decimal("0.01"),
+        exec_agent_max_trade_risk_pct=exec_agent_max_trade_risk_pct,
         exec_agent_aggressive_confidence_threshold=Decimal("0.80"),
         exec_agent_max_position_allocation_pct=Decimal("0.50"),
+        exec_agent_max_symbol_exposure_pct=Decimal("0.20"),
+        exec_agent_max_symbol_total_exposure_pct=Decimal("0.20"),
         exec_agent_max_daily_new_buy_notional=exec_agent_max_daily_new_buy_notional,
         exec_agent_stop_loss_pct=exec_agent_stop_loss_pct,
         exec_agent_tactical_scalp_max_stop_pct=exec_agent_tactical_scalp_max_stop_pct,
@@ -1189,9 +1193,9 @@ def test_openclaw_exec_agent_client_handoff_builds_context_and_sizes_without_pre
         "momentum_continuation",
     ]
     assert audit["final_budget"] == "350000.0000"
-    assert plan.items[0].quantity_policy["quantity"] == 1
+    assert plan.items[0].quantity_policy["quantity"] == 4
     assert audit["risk_based_quantity"] == 6
-    assert audit["allocation_quantity"] == 1
+    assert audit["allocation_quantity"] == 4
 
     engine.dispose()
 
@@ -1318,12 +1322,12 @@ def test_openclaw_exec_agent_batch_client_sees_all_candidates_and_allocates_diff
     assert request.risk_caps["max_total_budget"] == "1000000.0000"
 
     buy_items = {item.symbol: item for item in plan.items if item.intent == "next_open_buy"}
-    assert buy_items["005930"].quantity_policy["quantity"] == 1
-    assert buy_items["000660"].quantity_policy["quantity"] == 1
+    assert buy_items["005930"].quantity_policy["quantity"] == 2
+    assert buy_items["000660"].quantity_policy["quantity"] == 4
     assert buy_items["005930"].risk_context["exec_agent_decision"]["final_budget"] == "100000.0000"
     assert buy_items["000660"].risk_context["exec_agent_decision"]["final_budget"] == "200000.0000"
-    assert buy_items["005930"].risk_context["exec_agent_decision"]["approved_notional"] == "50000.0000"
-    assert buy_items["000660"].risk_context["exec_agent_decision"]["approved_notional"] == "50000.0000"
+    assert buy_items["005930"].risk_context["exec_agent_decision"]["approved_notional"] == "100000.0000"
+    assert buy_items["000660"].risk_context["exec_agent_decision"]["approved_notional"] == "200000.0000"
     assert [item.intent for item in plan.items].count("max_holding_close_sell") == 2
 
     engine.dispose()
