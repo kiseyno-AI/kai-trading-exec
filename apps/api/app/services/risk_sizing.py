@@ -216,9 +216,10 @@ def high_confidence_for_aggressive_risk(*, settings: Settings, confidence: Decim
 def _risk_pct(*, settings: Settings, confidence: Decimal | None) -> Decimal:
     base = _decimal_setting(settings, "exec_agent_base_risk_pct", Decimal("0.005"))
     aggressive = _decimal_setting(settings, "exec_agent_aggressive_risk_pct", Decimal("0.015"))
+    max_trade_risk = _decimal_setting(settings, "exec_agent_max_trade_risk_pct", Decimal("0.015"))
     if high_confidence_for_aggressive_risk(settings=settings, confidence=confidence):
-        return min(aggressive, Decimal("0.015"))
-    return min(base, Decimal("0.010"))
+        return min(aggressive, max_trade_risk)
+    return min(base, max_trade_risk)
 
 
 def _floor_quantity(value: Decimal) -> int:

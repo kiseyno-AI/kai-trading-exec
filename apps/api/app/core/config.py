@@ -41,16 +41,16 @@ class Settings(BaseModel):
     exec_agent_enabled: bool = False
     exec_agent_id: str = "exec-agent"
     exec_agent_model: str = "openai-codex/gpt-5.5"
-    exec_agent_max_symbol_budget: Decimal = Field(default=Decimal("1000000"), gt=0)
-    exec_agent_max_total_budget: Decimal = Field(default=Decimal("3000000"), gt=0)
-    exec_agent_base_risk_pct: Decimal = Field(default=Decimal("0.005"), gt=0, le=Decimal("0.010"))
+    exec_agent_max_symbol_budget: Decimal = Field(default=Decimal("3000000"), gt=0)
+    exec_agent_max_total_budget: Decimal = Field(default=Decimal("9000000"), gt=0)
+    exec_agent_base_risk_pct: Decimal = Field(default=Decimal("0.015"), gt=0, le=Decimal("0.015"))
     exec_agent_aggressive_risk_pct: Decimal = Field(default=Decimal("0.015"), gt=0, le=Decimal("0.015"))
     exec_agent_aggressive_confidence_threshold: Decimal = Field(default=Decimal("0.90"), gt=0, le=1)
-    exec_agent_max_position_allocation_pct: Decimal = Field(default=Decimal("0.10"), gt=0, le=1)
-    exec_agent_max_symbol_exposure_pct: Decimal = Field(default=Decimal("0.20"), gt=0, le=1)
-    exec_agent_max_symbol_total_exposure_pct: Decimal = Field(default=Decimal("0.20"), gt=0, le=1)
+    exec_agent_max_position_allocation_pct: Decimal = Field(default=Decimal("0.30"), gt=0, le=1)
+    exec_agent_max_symbol_exposure_pct: Decimal = Field(default=Decimal("0.30"), gt=0, le=1)
+    exec_agent_max_symbol_total_exposure_pct: Decimal = Field(default=Decimal("0.30"), gt=0, le=1)
     exec_agent_max_daily_new_buy_notional: Decimal = Field(default=Decimal("0"), ge=0)
-    exec_agent_max_trade_risk_pct: Decimal = Field(default=Decimal("0.01"), gt=0, le=Decimal("0.015"))
+    exec_agent_max_trade_risk_pct: Decimal = Field(default=Decimal("0.015"), gt=0, le=Decimal("0.015"))
     exec_agent_stop_loss_pct: Decimal = Field(default=Decimal("0.04"), gt=0, le=Decimal("0.10"))
     exec_agent_max_entry_premium_pct: Decimal = Field(default=Decimal("0"), ge=0, le=Decimal("0.10"))
     exec_agent_min_reward_risk: Decimal = Field(default=Decimal("1.30"), gt=0)
