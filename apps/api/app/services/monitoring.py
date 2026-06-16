@@ -533,6 +533,13 @@ def _evaluate_monitoring_cycle(
                 trigger_metadata = persisted_profit_protection.metadata
             else:
                 trigger_reason = item.intent
+        elif _is_watch_buy_item(item):
+            trigger_reason, trigger_metadata = _watch_buy_trigger_reason(
+                item=item,
+                price=price,
+                observed_price=observed_price,
+                triggered_at=triggered_at,
+            )
         elif _is_triggered(
             item=item,
             observed_price=price.price if price is not None else None,
@@ -1277,6 +1284,8 @@ def _market_quality_context_from_price(
         "orderbook_imbalance": _serialize_decimal(price.orderbook_imbalance),
         "volume": _serialize_decimal(price.volume),
         "turnover": _serialize_decimal(price.turnover),
+        "day_high": _serialize_decimal(price.day_high),
+        "day_low": _serialize_decimal(price.day_low),
         "session_type": price.session_type,
         "normal_ordering_available": price.normal_ordering_available,
         "provenance": price.provenance or {},
@@ -1997,6 +2006,145 @@ def _is_triggered(
             return observed_price <= trigger_price
         return observed_price >= trigger_price
     return False
+
+
+def _watch_buy_trigger_reason(
+    *,
+    item: ExecutionPlanItem,
+    price: MonitoringPriceRequest | None,
+    observed_price: Decimal | None,
+    triggered_at: datetime,
+) -> tuple[str | None, dict[str, object] | None]:
+    metadata = _watch_buy_intraday_cross_metadata(
+        item=item,
+        price=price,
+        observed_price=observed_price,
+        triggered_at=triggered_at,
+    )
+    if metadata is not None:
+        _record_watch_buy_trigger_cross(item=item, metadata=metadata)
+        return str(metadata["reason"]), metadata
+
+    if _is_triggered(
+        item=item,
+        observed_price=observed_price,
+        triggered_at=triggered_at,
+    ):
+        metadata = _watch_buy_trigger_observation_metadata(
+            item=item,
+            price=price,
+            observed_price=observed_price,
+            triggered_at=triggered_at,
+            reason=item.intent,
+        )
+        if metadata is not None:
+            _record_watch_buy_trigger_cross(item=item, metadata=metadata)
+        return item.intent, metadata
+
+    persisted = _persisted_watch_buy_trigger_cross(item)
+    if persisted is not None:
+        return str(persisted.get("reason") or "intraday_watch_buy_trigger_cross_seen"), persisted
+    return None, None
+
+
+def _watch_buy_intraday_cross_metadata(
+    *,
+    item: ExecutionPlanItem,
+    price: MonitoringPriceRequest | None,
+    observed_price: Decimal | None,
+    triggered_at: datetime,
+) -> dict[str, object] | None:
+    if price is None:
+        return None
+    trigger_price = _watch_buy_trigger_price(item)
+    if trigger_price is None:
+        return None
+    direction = _watch_buy_direction(item)
+    if direction == "at_or_below":
+        if price.day_low is None or price.day_low > trigger_price:
+            return None
+        return _watch_buy_trigger_observation_metadata(
+            item=item,
+            price=price,
+            observed_price=observed_price,
+            triggered_at=triggered_at,
+            reason="intraday_watch_buy_day_low_cross",
+            cross_price=price.day_low,
+        )
+    if price.day_high is None or price.day_high < trigger_price:
+        return None
+    return _watch_buy_trigger_observation_metadata(
+        item=item,
+        price=price,
+        observed_price=observed_price,
+        triggered_at=triggered_at,
+        reason="intraday_watch_buy_day_high_cross",
+        cross_price=price.day_high,
+    )
+
+
+def _watch_buy_trigger_observation_metadata(
+    *,
+    item: ExecutionPlanItem,
+    price: MonitoringPriceRequest | None,
+    observed_price: Decimal | None,
+    triggered_at: datetime,
+    reason: str,
+    cross_price: Decimal | None = None,
+) -> dict[str, object] | None:
+    trigger_price = _watch_buy_trigger_price(item)
+    if trigger_price is None:
+        return None
+    observed_at = _price_observed_at(price, triggered_at) if price is not None else triggered_at
+    metadata: dict[str, object] = {
+        "reason": reason,
+        "direction": _watch_buy_direction(item),
+        "trigger_price": _serialize_decimal(trigger_price),
+        "chase_limit_price": _serialize_decimal(_watch_buy_chase_limit_price(item)),
+        "observed_price": _serialize_decimal(observed_price),
+        "observed_at": observed_at.isoformat(),
+        "recorded_at": triggered_at.isoformat(),
+    }
+    if cross_price is not None:
+        metadata["cross_price"] = _serialize_decimal(cross_price)
+    if price is not None:
+        metadata["day_high"] = _serialize_decimal(price.day_high)
+        metadata["day_low"] = _serialize_decimal(price.day_low)
+        metadata["volume"] = _serialize_decimal(price.volume)
+        metadata["turnover"] = _serialize_decimal(price.turnover)
+    return metadata
+
+
+def _record_watch_buy_trigger_cross(
+    *,
+    item: ExecutionPlanItem,
+    metadata: dict[str, object],
+) -> None:
+    risk_context = dict(item.risk_context) if isinstance(item.risk_context, dict) else {}
+    previous = risk_context.get("watch_buy_trigger_cross")
+    risk_context["watch_buy_trigger_cross"] = metadata
+    risk_context["latest_live_market_context"] = {
+        key: metadata[key]
+        for key in ("day_high", "day_low", "observed_price", "observed_at", "volume", "turnover")
+        if key in metadata
+    }
+    item.risk_context = risk_context
+    if not isinstance(previous, dict):
+        _record_monitoring_event(
+            item=item,
+            event={
+                "event": "watch_buy_trigger_cross_seen",
+                **metadata,
+            },
+        )
+
+
+def _persisted_watch_buy_trigger_cross(item: ExecutionPlanItem) -> dict[str, object] | None:
+    risk_context = item.risk_context
+    if not isinstance(risk_context, dict):
+        return None
+    trigger_cross = risk_context.get("watch_buy_trigger_cross")
+    return trigger_cross if isinstance(trigger_cross, dict) else None
 
 
 def _primary_triggered_sell_symbols(

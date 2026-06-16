@@ -2321,6 +2321,115 @@ def test_watch_buy_candidate_waits_until_trigger_then_submits_limit_buy() -> Non
     engine.dispose()
 
 
+def test_watch_buy_day_high_cross_triggers_after_intraday_pullback() -> None:
+    app, engine, client, broker_adapter = _build_watch_buy_test_app(
+        order_id="kis-watch-buy-day-high-cross-1"
+    )
+    item_id = _create_watch_buy_candidate(
+        client,
+        plan_id="plan-watch-buy-day-high-cross-1",
+        trigger_price="71000.00",
+        chase_limit_price="71200.00",
+    )
+
+    triggered = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "day high crossed trigger but current pulled back",
+            "prices": [
+                {
+                    "symbol": "005930",
+                    "price": "70900.00",
+                    "day_low": "70500.00",
+                    "day_high": "71100.00",
+                }
+            ],
+        },
+    )
+
+    assert triggered.status_code == 200
+    payload = triggered.json()
+    assert payload["triggered_item_count"] == 1
+    assert payload["submitted_order_count"] == 1
+    assert payload["items"][0]["outcome"] == "submitted"
+    assert payload["items"][0]["trigger_reason"] == "intraday_watch_buy_day_high_cross"
+
+    assert len(broker_adapter.order_calls) == 1
+    order_call = broker_adapter.order_calls[0]
+    assert order_call.execution_plan_item_id == item_id
+    assert order_call.side == "buy"
+    assert order_call.limit_price == Decimal("70900.00")
+
+    with app.state.db_session_factory() as session:
+        item = session.get(ExecutionPlanItem, item_id)
+        assert item is not None
+        trigger_cross = item.risk_context["watch_buy_trigger_cross"]
+        assert trigger_cross["reason"] == "intraday_watch_buy_day_high_cross"
+        assert trigger_cross["day_high"] == "71100.0000"
+        assert trigger_cross["day_low"] == "70500.0000"
+
+    engine.dispose()
+
+
+def test_watch_buy_persisted_trigger_cross_retries_when_price_returns_inside_chase() -> None:
+    app, engine, client, broker_adapter = _build_watch_buy_test_app(
+        order_id="kis-watch-buy-persisted-cross-1"
+    )
+    item_id = _create_watch_buy_candidate(
+        client,
+        plan_id="plan-watch-buy-persisted-cross-1",
+        trigger_price="71000.00",
+        chase_limit_price="71200.00",
+    )
+
+    blocked = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "trigger crossed but price is above chase",
+            "prices": [
+                {
+                    "symbol": "005930",
+                    "price": "71300.00",
+                    "day_low": "70000.00",
+                    "day_high": "71400.00",
+                }
+            ],
+        },
+    )
+
+    assert blocked.status_code == 200
+    assert blocked.json()["submitted_order_count"] == 0
+    assert blocked.json()["items"][0]["block_reason"] == "price_above_chase_limit"
+    assert broker_adapter.order_calls == []
+
+    retry = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "price returned inside chase after persisted trigger cross",
+            "prices": [{"symbol": "005930", "price": "70900.00"}],
+        },
+    )
+
+    assert retry.status_code == 200
+    retry_payload = retry.json()
+    assert retry_payload["triggered_item_count"] == 1
+    assert retry_payload["submitted_order_count"] == 1
+    assert retry_payload["items"][0]["outcome"] == "submitted"
+    assert retry_payload["items"][0]["trigger_reason"] == "intraday_watch_buy_day_high_cross"
+
+    assert len(broker_adapter.order_calls) == 1
+    assert broker_adapter.order_calls[0].execution_plan_item_id == item_id
+    assert broker_adapter.order_calls[0].limit_price == Decimal("70900.00")
+
+    engine.dispose()
+
+
 def test_autonomous_monitoring_expires_prior_day_unfilled_watch_buys() -> None:
     app, engine, client, broker_adapter = _build_watch_buy_test_app()
     prior_active_id = _create_watch_buy_candidate(

@@ -316,6 +316,8 @@ class MonitoringPriceRequest(BaseModel):
     orderbook_imbalance: Decimal | None = None
     volume: Decimal | None = Field(default=None, ge=0)
     turnover: Decimal | None = Field(default=None, ge=0)
+    day_high: Decimal | None = Field(default=None, gt=0)
+    day_low: Decimal | None = Field(default=None, gt=0)
     session_type: str | None = Field(default=None, max_length=64)
     normal_ordering_available: bool | None = None
     provenance: dict[str, object] | None = None
