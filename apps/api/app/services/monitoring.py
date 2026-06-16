@@ -671,7 +671,7 @@ def _evaluate_monitoring_cycle(
             if trigger_time_exec_agent.trigger_time_exec_agent_enabled(
                 settings=settings,
                 item=action.item,
-            ):
+            ) and not _watch_buy_trigger_cross_pullback_bypasses_agent(action):
                 agent_result = _resolve_trigger_time_agent_action(
                     settings=settings,
                     db=db,
@@ -3450,6 +3450,24 @@ def _watch_buy_limit_price(
     if chase_limit_price is None:
         return reference_price
     return min(reference_price, chase_limit_price)
+
+
+def _watch_buy_trigger_cross_pullback_bypasses_agent(action: PendingMonitoringAction) -> bool:
+    if not _is_watch_buy_item(action.item) or action.observed_price is None:
+        return False
+    metadata = action.trigger_metadata
+    if not isinstance(metadata, dict):
+        return False
+    reason = metadata.get("reason")
+    if reason not in {"intraday_watch_buy_day_high_cross", "intraday_watch_buy_day_low_cross"}:
+        return False
+    trigger_price = _watch_buy_trigger_price(action.item)
+    if trigger_price is None:
+        return False
+    direction = _watch_buy_direction(action.item)
+    if direction == "at_or_below":
+        return action.observed_price >= trigger_price
+    return action.observed_price <= trigger_price
 
 
 def _monitoring_result_payload(
