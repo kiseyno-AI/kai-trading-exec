@@ -117,8 +117,13 @@ def _create_intraday_watch_buy(
     return response.json()["persisted_execution_item_ids"][0]
 
 
-def _live_price_payload(price: str = "71050.00") -> dict[str, object]:
-    return {
+def _live_price_payload(
+    price: str = "71050.00",
+    *,
+    day_low: str | None = None,
+    day_high: str | None = None,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
         "symbol": "005930",
         "price": price,
         "bid": "71045.00",
@@ -133,6 +138,11 @@ def _live_price_payload(price: str = "71050.00") -> dict[str, object]:
         "normal_ordering_available": True,
         "provenance": {"source": "test_live_market_quality"},
     }
+    if day_low is not None:
+        payload["day_low"] = day_low
+    if day_high is not None:
+        payload["day_high"] = day_high
+    return payload
 
 
 def test_trigger_time_buy_agent_context_approval_quantity_drives_submission(
@@ -212,6 +222,52 @@ def test_trigger_time_buy_agent_context_approval_quantity_drives_submission(
         interaction = item.risk_context["last_trigger_time_exec_agent_interaction"]
         assert interaction["decision"]["decision"] == "execute_now"
         assert interaction["order"]["quantity"] == 3
+
+    engine.dispose()
+
+
+def test_trigger_time_buy_agent_is_bypassed_for_intraday_pullback_below_trigger(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, engine, client, broker_adapter, captured = _build_trigger_agent_app(
+        monkeypatch=monkeypatch,
+        agent_responses=[],
+    )
+    item_id = _create_intraday_watch_buy(
+        client,
+        plan_id="plan-trigger-agent-pullback-bypass",
+        risk_context_extra={"exec_agent_watch_sizing_fallback_allowed": True},
+    )
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "day high crossed trigger and pulled back below target buy",
+            "prices": [
+                _live_price_payload(
+                    price="70900.00",
+                    day_low="70000.00",
+                    day_high="71400.00",
+                )
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["triggered_item_count"] == 1
+    assert payload["submitted_order_count"] == 1
+    assert payload["items"][0]["outcome"] == "submitted"
+    assert payload["items"][0]["trigger_reason"] == "intraday_watch_buy_day_high_cross"
+    assert captured == []
+
+    assert len(broker_adapter.order_calls) == 1
+    order_call = broker_adapter.order_calls[0]
+    assert order_call.execution_plan_item_id == item_id
+    assert order_call.side == "buy"
+    assert order_call.limit_price == Decimal("70900.00")
 
     engine.dispose()
 
