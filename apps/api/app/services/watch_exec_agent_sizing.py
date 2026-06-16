@@ -165,8 +165,10 @@ def run_due_watch_exec_agent_sizing(
                             applied.append(
                                 _apply_decisions(
                                     db=db,
+                                    settings=settings,
                                     plan=plan,
                                     decision_payload=retry_decision_payload,
+                                    account_context=account_context,
                                     expected_item_ids=set(retry_ids),
                                 )
                             )
@@ -856,10 +858,10 @@ def _adjust_approved_watch_quantity(
     )
     effective_target = min(target_notional, cap_notional)
     adjusted_quantity = agent_quantity
+    max_quantity = _floor_quantity(cap_notional / sizing_price)
     if effective_target > original_notional:
         adjusted_quantity = max(agent_quantity, _floor_quantity(effective_target / sizing_price))
-        max_quantity = _floor_quantity(cap_notional / sizing_price)
-        adjusted_quantity = min(adjusted_quantity, max_quantity)
+    adjusted_quantity = min(adjusted_quantity, max_quantity)
     approved_notional = sizing_price * Decimal(adjusted_quantity)
     return {
         "quantity": adjusted_quantity,
