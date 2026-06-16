@@ -1,10 +1,12 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import UTC, date, datetime
 from decimal import Decimal
 
 from app.broker.base import BrokerAccountHolding, BrokerAccountOpenOrder, BrokerAccountSnapshot
+from app.core.config import Settings
 from app.models.runtime import ExecutionPlan, ExecutionPlanItem
+from app.services import watch_exec_agent_sizing as watch_sizing
 from app.services.monitoring import _watch_buy_candidate_budget
 from app.services.watch_exec_agent_sizing import (
     _apply_decisions,
@@ -15,6 +17,7 @@ from app.services.watch_exec_agent_sizing import (
     _chunks,
     _decision_record,
     _sizing_request_payload,
+    run_due_watch_exec_agent_sizing,
 )
 
 
@@ -293,6 +296,304 @@ def test_apply_decisions_applies_partial_response_and_leaves_missing_item_pendin
     assert plan.items[0].status == "watch_monitoring_active"
     assert plan.items[0].quantity_policy["quantity"] == 2
     assert plan.items[1].status == "watch_monitoring_pending"
+
+
+def test_apply_decisions_raises_small_agent_probe_to_min_notional() -> None:
+    plan = ExecutionPlan(
+        id="plan-1",
+        external_plan_id="plan-min-notional",
+        strategy_run_id="strategy-1",
+        source="core-short-term-decider",
+        market_date=date(2026, 6, 4),
+        mode="live",
+        items=[
+            _watch_item(
+                item_id="watch-item-1",
+                symbol="005930",
+                risk_context={
+                    "target_price": "76000",
+                    "stop_price": "69000",
+                    "execution_feasibility_context": {
+                        "max_safe_notional_krw": "5000000",
+                        "liquidity_tier": "high",
+                    },
+                },
+            )
+        ],
+    )
+
+    _apply_decisions(
+        db=None,  # type: ignore[arg-type]
+        settings=Settings(runtime_mode="live"),
+        plan=plan,
+        account_context={
+            "available": True,
+            "orderable_cash_krw": "10000000",
+            "buying_power_krw": "10000000",
+        },
+        expected_item_ids={"watch-item-1"},
+        decision_payload={
+            "version": "manual-exec-agent-watch-sizing-v1",
+            "decisions": [
+                {
+                    "execution_plan_item_id": "watch-item-1",
+                    "symbol": "005930",
+                    "action": "approve",
+                    "quantity": 3,
+                    "approved_notional_krw": 214500,
+                    "sizing_price": "71500",
+                    "confidence": 0.68,
+                    "target_profile": "short_swing",
+                    "reason_code": "small_probe",
+                    "reason": "agent returned a small probe",
+                }
+            ],
+        },
+    )
+
+    policy = plan.items[0].quantity_policy
+    assert policy["quantity"] == 20
+    assert policy["approved_notional"] == "1430000.0000"
+    assert policy["sizing_adjustment"]["applied"] is True
+    assert policy["sizing_adjustment"]["target_min_notional"] == "1500000.0000"
+
+
+def test_apply_decisions_respects_max_safe_notional_when_raising_probe() -> None:
+    plan = ExecutionPlan(
+        id="plan-1",
+        external_plan_id="plan-min-notional-cap",
+        strategy_run_id="strategy-1",
+        source="core-short-term-decider",
+        market_date=date(2026, 6, 4),
+        mode="live",
+        items=[
+            _watch_item(
+                item_id="watch-item-1",
+                symbol="005930",
+                risk_context={
+                    "target_price": "76000",
+                    "stop_price": "69000",
+                    "execution_feasibility_context": {
+                        "max_safe_notional_krw": "800000",
+                        "liquidity_tier": "high",
+                    },
+                },
+            )
+        ],
+    )
+
+    _apply_decisions(
+        db=None,  # type: ignore[arg-type]
+        settings=Settings(runtime_mode="live"),
+        plan=plan,
+        account_context={
+            "available": True,
+            "orderable_cash_krw": "10000000",
+            "buying_power_krw": "10000000",
+        },
+        expected_item_ids={"watch-item-1"},
+        decision_payload={
+            "version": "manual-exec-agent-watch-sizing-v1",
+            "decisions": [
+                {
+                    "execution_plan_item_id": "watch-item-1",
+                    "symbol": "005930",
+                    "action": "approve",
+                    "quantity": 3,
+                    "approved_notional_krw": 214500,
+                    "sizing_price": "71500",
+                    "confidence": 0.68,
+                    "target_profile": "short_swing",
+                    "reason_code": "small_probe",
+                    "reason": "agent returned a small probe",
+                }
+            ],
+        },
+    )
+
+    policy = plan.items[0].quantity_policy
+    assert policy["quantity"] == 11
+    assert policy["approved_notional"] == "786500.0000"
+    assert policy["sizing_adjustment"]["cap_notional"] == "800000.0000"
+
+
+def test_apply_decisions_clamps_agent_approval_that_exceeds_cap() -> None:
+    plan = ExecutionPlan(
+        id="plan-1",
+        external_plan_id="plan-approval-cap",
+        strategy_run_id="strategy-1",
+        source="core-short-term-decider",
+        market_date=date(2026, 6, 4),
+        mode="live",
+        items=[
+            _watch_item(
+                item_id="watch-item-1",
+                symbol="005930",
+                risk_context={
+                    "target_price": "76000",
+                    "stop_price": "69000",
+                    "execution_feasibility_context": {
+                        "max_safe_notional_krw": "800000",
+                        "liquidity_tier": "high",
+                    },
+                },
+            )
+        ],
+    )
+
+    _apply_decisions(
+        db=None,  # type: ignore[arg-type]
+        settings=Settings(runtime_mode="live"),
+        plan=plan,
+        account_context={
+            "available": True,
+            "orderable_cash_krw": "10000000",
+            "buying_power_krw": "10000000",
+        },
+        expected_item_ids={"watch-item-1"},
+        decision_payload={
+            "version": "manual-exec-agent-watch-sizing-v1",
+            "decisions": [
+                {
+                    "execution_plan_item_id": "watch-item-1",
+                    "symbol": "005930",
+                    "action": "approve",
+                    "quantity": 100,
+                    "approved_notional_krw": 7150000,
+                    "sizing_price": "71500",
+                    "confidence": 0.68,
+                    "target_profile": "short_swing",
+                    "reason_code": "agent_oversized",
+                    "reason": "agent approval exceeds max safe notional",
+                }
+            ],
+        },
+    )
+
+    policy = plan.items[0].quantity_policy
+    assert policy["quantity"] == 11
+    assert policy["approved_notional"] == "786500.0000"
+    assert policy["sizing_adjustment"]["applied"] is True
+    assert policy["sizing_adjustment"]["agent_quantity"] == 100
+    assert policy["sizing_adjustment"]["cap_notional"] == "800000.0000"
+
+
+def test_run_due_retry_applies_sizing_context_to_missing_decision(monkeypatch) -> None:
+    plan = ExecutionPlan(
+        id="plan-1",
+        external_plan_id="plan-retry-context",
+        strategy_run_id="strategy-1",
+        source="core-short-term-decider",
+        market_date=date(2026, 6, 4),
+        mode="live",
+        items=[
+            _watch_item(
+                item_id="watch-item-1",
+                symbol="005930",
+                risk_context={
+                    "target_price": "76000",
+                    "stop_price": "69000",
+                    "execution_feasibility_context": {
+                        "max_safe_notional_krw": "5000000",
+                        "liquidity_tier": "high",
+                    },
+                },
+            ),
+            _watch_item(
+                item_id="watch-item-2",
+                symbol="005931",
+                risk_context={
+                    "target_price": "76000",
+                    "stop_price": "69000",
+                    "execution_feasibility_context": {
+                        "max_safe_notional_krw": "800000",
+                        "liquidity_tier": "high",
+                    },
+                },
+            ),
+        ],
+    )
+    settings = Settings(
+        runtime_mode="live",
+        exec_agent_enabled=True,
+        exec_agent_watch_sizing_enabled=True,
+        exec_agent_watch_sizing_start_local_time="00:00",
+        exec_agent_watch_sizing_end_local_time="23:59",
+    )
+    account_context = {
+        "available": True,
+        "orderable_cash_krw": "10000000",
+        "buying_power_krw": "10000000",
+    }
+    responses = [
+        {
+            "version": "manual-exec-agent-watch-sizing-v1",
+            "decisions": [
+                {
+                    "execution_plan_item_id": "watch-item-1",
+                    "symbol": "005930",
+                    "action": "approve",
+                    "quantity": 3,
+                    "approved_notional_krw": 214500,
+                    "sizing_price": "71500",
+                    "confidence": 0.68,
+                    "target_profile": "short_swing",
+                    "reason_code": "small_probe",
+                    "reason": "initial response omitted the second candidate",
+                }
+            ],
+        },
+        {
+            "version": "manual-exec-agent-watch-sizing-v1",
+            "decisions": [
+                {
+                    "execution_plan_item_id": "watch-item-2",
+                    "symbol": "005931",
+                    "action": "approve",
+                    "quantity": 3,
+                    "approved_notional_krw": 214500,
+                    "sizing_price": "71500",
+                    "confidence": 0.68,
+                    "target_profile": "short_swing",
+                    "reason_code": "small_probe_retry",
+                    "reason": "retry returns the missing candidate",
+                }
+            ],
+        },
+    ]
+
+    class FakeSession:
+        def __init__(self) -> None:
+            self.committed = False
+
+        def commit(self) -> None:
+            self.committed = True
+
+    db = FakeSession()
+
+    monkeypatch.setattr(watch_sizing, "_load_candidate_plans", lambda **_: [plan])
+    monkeypatch.setattr(watch_sizing, "_load_sizing_account_context", lambda **_: account_context)
+    monkeypatch.setattr(
+        watch_sizing,
+        "_request_exec_agent_decisions_with_retries",
+        lambda **_: responses.pop(0),
+    )
+
+    result = run_due_watch_exec_agent_sizing(
+        settings=settings,
+        db=db,  # type: ignore[arg-type]
+        now=datetime(2026, 6, 4, 0, 0, tzinfo=UTC),
+    )
+
+    assert result.payload["applied"][0]["missing_item_ids"] == ["watch-item-2"]
+    assert result.payload["applied"][1]["approved"] == 1
+    assert db.committed is True
+    retry_policy = plan.items[1].quantity_policy
+    assert retry_policy["quantity"] == 11
+    assert retry_policy["approved_notional"] == "786500.0000"
+    assert retry_policy["sizing_adjustment"]["applied"] is True
+    assert retry_policy["sizing_adjustment"]["cap_notional"] == "800000.0000"
+    assert "reason" not in retry_policy["sizing_adjustment"]
 
 
 def test_applicable_decision_ids_only_counts_expected_candidates() -> None:

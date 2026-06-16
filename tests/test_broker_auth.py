@@ -400,6 +400,10 @@ def test_settings_load_profit_protection_environment_fields() -> None:
             "KAI_EXEC_WATCH_BUY_DEEP_NEGATIVE_RET20_THRESHOLD_PCT": "-12.0",
             "KAI_EXEC_WATCH_BUY_EXTENDED_RET5_THRESHOLD_PCT": "14.0",
             "KAI_EXEC_WATCH_BUY_MAX_INTRADAY_RANGE_POSITION_PCT": "70.0",
+            "KAI_EXEC_EXEC_AGENT_WATCH_SIZING_MIN_NOTIONAL_KRW": "1200000",
+            "KAI_EXEC_EXEC_AGENT_WATCH_SIZING_HIGH_CONVICTION_MIN_NOTIONAL_KRW": "1800000",
+            "KAI_EXEC_EXEC_AGENT_WATCH_SIZING_HIGH_CONVICTION_THRESHOLD": "0.7",
+            "KAI_EXEC_EXEC_AGENT_WATCH_SIZING_FALLBACK_ACCOUNT_BASIS_KRW": "11000000",
         },
     )
 
@@ -414,6 +418,10 @@ def test_settings_load_profit_protection_environment_fields() -> None:
     assert settings.watch_buy_deep_negative_ret20_threshold_pct == Decimal("-12.0")
     assert settings.watch_buy_extended_ret5_threshold_pct == Decimal("14.0")
     assert settings.watch_buy_max_intraday_range_position_pct == Decimal("70.0")
+    assert settings.exec_agent_watch_sizing_min_notional_krw == Decimal("1200000")
+    assert settings.exec_agent_watch_sizing_high_conviction_min_notional_krw == Decimal("1800000")
+    assert settings.exec_agent_watch_sizing_high_conviction_threshold == Decimal("0.7")
+    assert settings.exec_agent_watch_sizing_fallback_account_basis_krw == Decimal("11000000")
 
 
 def test_kis_adapter_uses_client_credentials_token_flow() -> None:
