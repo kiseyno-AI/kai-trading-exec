@@ -2480,7 +2480,7 @@ def test_autonomous_monitoring_retains_current_day_and_terminal_watch_buys() -> 
     engine.dispose()
 
 
-def test_watch_buy_rejects_gap_above_chase_limit() -> None:
+def test_watch_buy_waits_for_pullback_when_gap_above_chase_limit() -> None:
     app, engine, client, broker_adapter = _build_watch_buy_test_app()
     item_id = _create_watch_buy_candidate(
         client,
@@ -2504,15 +2504,80 @@ def test_watch_buy_rejects_gap_above_chase_limit() -> None:
     assert payload["triggered_item_count"] == 1
     assert payload["submitted_order_count"] == 0
     assert payload["blocked_item_count"] == 1
-    assert payload["items"][0]["outcome"] == "rejected"
-    assert payload["items"][0]["message"] == "observed price is above chase_limit_price"
+    assert payload["items"][0]["outcome"] == "blocked"
+    assert payload["items"][0]["block_reason"] == "price_above_chase_limit"
     assert broker_adapter.order_calls == []
 
     with app.state.db_session_factory() as session:
         item = session.get(ExecutionPlanItem, item_id)
         assert item is not None
-        assert item.status == "watch_buy_rejected"
+        assert item.status == "watch_monitoring_active"
         assert item.risk_context["last_monitoring_event"]["reason"] == "price_above_chase_limit"
+        assert item.risk_context["last_monitoring_event"]["event"] == "watch_buy_pullback_wait"
+
+    retry = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "pullback into chase limit should submit",
+            "prices": [{"symbol": "005930", "price": "71080.00"}],
+        },
+    )
+
+    assert retry.status_code == 200
+    retry_payload = retry.json()
+    assert retry_payload["submitted_order_count"] == 1
+    assert retry_payload["items"][0]["outcome"] == "submitted"
+    assert retry_payload["items"][0]["status"] == "watch_buy_submitted"
+    assert len(broker_adapter.order_calls) == 1
+
+    engine.dispose()
+
+
+def test_watch_buy_intraday_range_chase_block_keeps_monitoring_active() -> None:
+    app, engine, client, broker_adapter = _build_watch_buy_test_app()
+    item_id = _create_watch_buy_candidate(
+        client,
+        plan_id="plan-watch-buy-intraday-range-chase-1",
+        trigger_price="71000.00",
+        chase_limit_price="71200.00",
+        risk_context={
+            "exchange": "KRX",
+            "stop_price": "70000.00",
+            "short_term_entry_quality": {
+                "day_low": "70000.00",
+                "day_high": "71400.00",
+            },
+        },
+    )
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "intraday range position is too extended",
+            "prices": [{"symbol": "005930", "price": "71080.00"}],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["triggered_item_count"] == 1
+    assert payload["submitted_order_count"] == 0
+    assert payload["blocked_item_count"] == 1
+    assert payload["items"][0]["outcome"] == "blocked"
+    assert payload["items"][0]["block_reason"] == "watch_buy_intraday_range_chase_block"
+    assert broker_adapter.order_calls == []
+
+    with app.state.db_session_factory() as session:
+        item = session.get(ExecutionPlanItem, item_id)
+        assert item is not None
+        assert item.status == "watch_monitoring_active"
+        last_event = item.risk_context["last_monitoring_event"]
+        assert last_event["event"] == "watch_buy_pullback_wait"
+        assert last_event["reason"] == "watch_buy_intraday_range_chase_block"
 
     engine.dispose()
 

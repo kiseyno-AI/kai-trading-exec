@@ -570,12 +570,13 @@ def _evaluate_monitoring_cycle(
                 triggered_item_count += 1
                 triggered_symbols.add(item.symbol)
                 blocked_item_count += 1
-                item.status = "watch_buy_rejected"
+                item.status = "watch_monitoring_active"
                 _record_monitoring_event(
                     item=item,
                     event={
-                        "event": "watch_buy_rejected",
+                        "event": "watch_buy_pullback_wait",
                         "reason": "price_above_chase_limit",
+                        "message": "observed price is above chase_limit_price; keep monitoring for pullback",
                         "trigger_price": _serialize_decimal(_watch_buy_trigger_price(item)),
                         "chase_limit_price": _serialize_decimal(chase_limit_price),
                         "observed_price": _serialize_decimal(observed_price),
@@ -585,8 +586,9 @@ def _evaluate_monitoring_cycle(
                 result_by_item_id[item.id] = _monitoring_result_payload(
                     item=item,
                     observed_price=observed_price,
-                    outcome="rejected",
-                    message="observed price is above chase_limit_price",
+                    outcome="blocked",
+                    block_reason="price_above_chase_limit",
+                    message="observed price is above chase_limit_price; monitoring remains active",
                 )
                 continue
             risk_gate = _watch_buy_high_risk_gate_rejection(
@@ -598,11 +600,12 @@ def _evaluate_monitoring_cycle(
                 triggered_item_count += 1
                 triggered_symbols.add(item.symbol)
                 blocked_item_count += 1
-                item.status = "watch_buy_rejected"
+                retryable_pullback_gate = _is_retryable_watch_buy_pullback_gate(risk_gate["reason"])
+                item.status = "watch_monitoring_active" if retryable_pullback_gate else "watch_buy_rejected"
                 _record_monitoring_event(
                     item=item,
                     event={
-                        "event": "watch_buy_rejected",
+                        "event": "watch_buy_pullback_wait" if retryable_pullback_gate else "watch_buy_rejected",
                         "reason": risk_gate["reason"],
                         "message": risk_gate["message"],
                         "details": risk_gate["details"],
@@ -613,7 +616,7 @@ def _evaluate_monitoring_cycle(
                 result_by_item_id[item.id] = _monitoring_result_payload(
                     item=item,
                     observed_price=observed_price,
-                    outcome="rejected",
+                    outcome="blocked" if retryable_pullback_gate else "rejected",
                     block_reason=risk_gate["reason"],
                     message=risk_gate["message"],
                 )
@@ -2940,6 +2943,12 @@ def _watch_buy_gate_rejection(
         "reason": reason,
         "message": message,
         "details": details,
+    }
+
+
+def _is_retryable_watch_buy_pullback_gate(reason: object) -> bool:
+    return reason in {
+        "watch_buy_intraday_range_chase_block",
     }
 
 
