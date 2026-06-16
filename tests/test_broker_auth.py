@@ -2430,6 +2430,102 @@ def test_watch_buy_persisted_trigger_cross_retries_when_price_returns_inside_cha
     engine.dispose()
 
 
+def test_watch_buy_pullback_below_trigger_bypasses_intraday_range_chase_block() -> None:
+    app, engine, client, broker_adapter = _build_watch_buy_test_app(
+        order_id="kis-watch-buy-pullback-below-trigger-1"
+    )
+    item_id = _create_watch_buy_candidate(
+        client,
+        plan_id="plan-watch-buy-pullback-below-trigger-1",
+        trigger_price="71000.00",
+        chase_limit_price="71200.00",
+        risk_context={
+            "exchange": "KRX",
+            "stop_price": "70000.00",
+            "short_term_entry_quality": {
+                "day_low": "70000.00",
+                "day_high": "71400.00",
+            },
+        },
+    )
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "trigger crossed but current has pulled below trigger",
+            "prices": [
+                {
+                    "symbol": "005930",
+                    "price": "70900.00",
+                    "day_low": "70000.00",
+                    "day_high": "71400.00",
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["triggered_item_count"] == 1
+    assert payload["submitted_order_count"] == 1
+    assert payload["items"][0]["outcome"] == "submitted"
+    assert payload["items"][0]["trigger_reason"] == "intraday_watch_buy_day_high_cross"
+
+    assert len(broker_adapter.order_calls) == 1
+    assert broker_adapter.order_calls[0].execution_plan_item_id == item_id
+    assert broker_adapter.order_calls[0].limit_price == Decimal("70900.00")
+
+    engine.dispose()
+
+
+def test_watch_buy_intraday_range_gate_prefers_live_day_range_over_stale_context() -> None:
+    app, engine, client, broker_adapter = _build_watch_buy_test_app(
+        order_id="kis-watch-buy-live-range-1"
+    )
+    _create_watch_buy_candidate(
+        client,
+        plan_id="plan-watch-buy-live-range-1",
+        trigger_price="71000.00",
+        chase_limit_price="71200.00",
+        risk_context={
+            "exchange": "KRX",
+            "stop_price": "70000.00",
+            "short_term_entry_quality": {
+                "day_low": "70000.00",
+                "day_high": "71400.00",
+            },
+        },
+    )
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "live intraday range should override stale risk context range",
+            "prices": [
+                {
+                    "symbol": "005930",
+                    "price": "71080.00",
+                    "day_low": "70500.00",
+                    "day_high": "71400.00",
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["triggered_item_count"] == 1
+    assert payload["submitted_order_count"] == 1
+    assert payload["items"][0]["outcome"] == "submitted"
+    assert len(broker_adapter.order_calls) == 1
+
+    engine.dispose()
+
+
 def test_autonomous_monitoring_expires_prior_day_unfilled_watch_buys() -> None:
     app, engine, client, broker_adapter = _build_watch_buy_test_app()
     prior_active_id = _create_watch_buy_candidate(
