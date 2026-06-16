@@ -2053,6 +2053,9 @@ def _evaluate_profit_protection(
         "min_peak_pct": _serialize_decimal(settings.profit_protection_min_peak_pct),
         "giveback_threshold_pct": _serialize_decimal(settings.profit_protection_giveback_pct),
         "aged_session_min": settings.profit_protection_aged_session_min,
+        "aged_min_current_profit_pct": _serialize_decimal(
+            settings.profit_protection_aged_min_current_profit_pct
+        ),
     }
     if (
         peak_profit_pct >= settings.profit_protection_min_peak_pct
@@ -2073,7 +2076,7 @@ def _evaluate_profit_protection(
         )
     if (
         holding_session >= settings.profit_protection_aged_session_min
-        and current_profit_pct > 0
+        and current_profit_pct >= settings.profit_protection_aged_min_current_profit_pct
         and peak_profit_pct > 0
         and giveback_pct >= settings.profit_protection_giveback_pct
     ):
