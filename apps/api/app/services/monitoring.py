@@ -602,6 +602,7 @@ def _evaluate_monitoring_cycle(
                 settings=settings,
                 item=item,
                 observed_price=observed_price,
+                price=price,
             )
             if risk_gate is not None:
                 triggered_item_count += 1
@@ -2992,10 +2993,16 @@ def _watch_buy_high_risk_gate_rejection(
     settings: Settings,
     item: ExecutionPlanItem,
     observed_price: Decimal,
+    price: MonitoringPriceRequest | None = None,
 ) -> dict[str, object] | None:
     if not settings.watch_buy_high_risk_gate_enabled:
         return None
-    payload = {"sources": _item_payload_sources(item)}
+    sources = []
+    live_market_context = _market_quality_context_from_price(price)
+    if live_market_context is not None:
+        sources.append(live_market_context)
+    sources.extend(_item_payload_sources(item))
+    payload = {"sources": sources}
     signal_action = (_recursive_text_feature(payload, {"action"}, parent_key="signal_decider_crosscheck") or "").lower()
     tactical_action = (
         _recursive_text_feature(payload, {"tactical_action"})
@@ -3062,11 +3069,23 @@ def _watch_buy_high_risk_gate_rejection(
             details=details,
         )
 
+    trigger_price = _watch_buy_trigger_price(item)
+    direction = _watch_buy_direction(item)
+    pullback_after_cross = (
+        trigger_price is not None
+        and (
+            (direction == "at_or_above" and observed_price < trigger_price)
+            or (direction == "at_or_below" and observed_price > trigger_price)
+        )
+    )
     day_high = _recursive_decimal_feature(payload, {"day_high", "intraday_high", "high_price", "session_high"})
     day_low = _recursive_decimal_feature(payload, {"day_low", "intraday_low", "low_price", "session_low"})
     if day_high is not None and day_low is not None and day_high > day_low:
         range_position_pct = ((observed_price - day_low) / (day_high - day_low)) * Decimal("100")
-        if range_position_pct >= settings.watch_buy_max_intraday_range_position_pct:
+        if (
+            range_position_pct >= settings.watch_buy_max_intraday_range_position_pct
+            and not pullback_after_cross
+        ):
             return _watch_buy_gate_rejection(
                 reason="watch_buy_intraday_range_chase_block",
                 message="triggered price is too high in the current intraday range",
