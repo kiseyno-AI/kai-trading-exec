@@ -116,6 +116,7 @@ Monitoring runtime settings currently supported:
 - `KAI_EXEC_PROFIT_PROTECTION_MIN_PEAK_PCT`
 - `KAI_EXEC_PROFIT_PROTECTION_GIVEBACK_PCT`
 - `KAI_EXEC_PROFIT_PROTECTION_AGED_SESSION_MIN`
+- `KAI_EXEC_PROFIT_PROTECTION_AGED_MIN_CURRENT_PROFIT_PCT`
 - `KAI_EXEC_BREAKEVEN_STOP_BUFFER_PCT`
 
 Domestic order-session routing settings currently supported:
@@ -185,9 +186,12 @@ per-symbol budget `3,000,000` KRW, total exec-agent budget `9,000,000` KRW,
 base risk `1.5%`, max position allocation `30%`, and max symbol exposure
 `30%`. Default profit capture takes a first partial profit near `+2.5%`,
 a final target near `+5.5%`, and rearms the remaining stop near breakeven after
-the first partial profit is submitted. Candidate-level budgets, stop-distance
-risk sizing, available cash, daily new-buy caps, and runtime pause/kill-switch
-controls still clamp final order size.
+the first partial profit is submitted. Intraday profit protection starts from a
+higher peak threshold by default (`+3.0%` peak and `1.5%p` giveback), while aged
+position protection also requires at least `+1.0%` current profit so ordinary
+small gains are not converted into premature exits. Candidate-level budgets,
+stop-distance risk sizing, available cash, daily new-buy caps, and runtime
+pause/kill-switch controls still clamp final order size.
 
 Operator broker-session endpoints:
 - `GET /broker/session`

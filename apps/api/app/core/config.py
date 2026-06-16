@@ -34,9 +34,10 @@ class Settings(BaseModel):
     watch_buy_deep_negative_ret20_threshold_pct: Decimal = Field(default=Decimal("-10.0"), ge=Decimal("-100"), le=Decimal("0"))
     watch_buy_extended_ret5_threshold_pct: Decimal = Field(default=Decimal("15.0"), ge=0, le=Decimal("100"))
     watch_buy_max_intraday_range_position_pct: Decimal = Field(default=Decimal("75.0"), ge=0, le=Decimal("100"))
-    profit_protection_min_peak_pct: Decimal = Field(default=Decimal("1.8"), gt=0, le=Decimal("100"))
-    profit_protection_giveback_pct: Decimal = Field(default=Decimal("0.8"), gt=0, le=Decimal("100"))
+    profit_protection_min_peak_pct: Decimal = Field(default=Decimal("3.0"), gt=0, le=Decimal("100"))
+    profit_protection_giveback_pct: Decimal = Field(default=Decimal("1.5"), gt=0, le=Decimal("100"))
     profit_protection_aged_session_min: int = Field(default=2, ge=1, le=20)
+    profit_protection_aged_min_current_profit_pct: Decimal = Field(default=Decimal("1.0"), ge=0, le=Decimal("100"))
     breakeven_stop_buffer_pct: Decimal = Field(default=Decimal("0.2"), ge=0, le=Decimal("5"))
     market_timezone: str = "Asia/Seoul"
     exec_agent_enabled: bool = False
@@ -141,6 +142,7 @@ _ENV_FIELDS = {
     "PROFIT_PROTECTION_MIN_PEAK_PCT": "profit_protection_min_peak_pct",
     "PROFIT_PROTECTION_GIVEBACK_PCT": "profit_protection_giveback_pct",
     "PROFIT_PROTECTION_AGED_SESSION_MIN": "profit_protection_aged_session_min",
+    "PROFIT_PROTECTION_AGED_MIN_CURRENT_PROFIT_PCT": "profit_protection_aged_min_current_profit_pct",
     "BREAKEVEN_STOP_BUFFER_PCT": "breakeven_stop_buffer_pct",
     "MARKET_TIMEZONE": "market_timezone",
     "EXEC_AGENT_ENABLED": "exec_agent_enabled",

@@ -392,6 +392,7 @@ def test_settings_load_profit_protection_environment_fields() -> None:
             "KAI_EXEC_PROFIT_PROTECTION_MIN_PEAK_PCT": "1.5",
             "KAI_EXEC_PROFIT_PROTECTION_GIVEBACK_PCT": "0.7",
             "KAI_EXEC_PROFIT_PROTECTION_AGED_SESSION_MIN": "3",
+            "KAI_EXEC_PROFIT_PROTECTION_AGED_MIN_CURRENT_PROFIT_PCT": "1.1",
             "KAI_EXEC_BREAKEVEN_STOP_BUFFER_PCT": "0.3",
             "KAI_EXEC_WATCH_BUY_HIGH_RISK_GATE_ENABLED": "true",
             "KAI_EXEC_WATCH_BUY_HIGH_ATR_PCT_THRESHOLD": "8.5",
@@ -405,6 +406,7 @@ def test_settings_load_profit_protection_environment_fields() -> None:
     assert settings.profit_protection_min_peak_pct == Decimal("1.5")
     assert settings.profit_protection_giveback_pct == Decimal("0.7")
     assert settings.profit_protection_aged_session_min == 3
+    assert settings.profit_protection_aged_min_current_profit_pct == Decimal("1.1")
     assert settings.breakeven_stop_buffer_pct == Decimal("0.3")
     assert settings.watch_buy_high_risk_gate_enabled is True
     assert settings.watch_buy_high_atr_pct_threshold == Decimal("8.5")
@@ -4353,6 +4355,7 @@ def test_monitoring_evaluate_triggers_aged_position_profit_protection() -> None:
             profit_protection_min_peak_pct=Decimal("2.0"),
             profit_protection_giveback_pct=Decimal("1.2"),
             profit_protection_aged_session_min=2,
+            profit_protection_aged_min_current_profit_pct=Decimal("0.5"),
         ),
         broker_adapter=broker_adapter,
     )
@@ -4428,6 +4431,99 @@ def test_monitoring_evaluate_triggers_aged_position_profit_protection() -> None:
     assert len(broker_adapter.order_calls) == 1
     assert broker_adapter.order_calls[0].execution_plan_item_id == plan_item_id
     assert broker_adapter.order_calls[0].quantity == 4
+
+    engine.dispose()
+
+
+def test_monitoring_evaluate_blocks_aged_profit_protection_for_small_current_profit() -> None:
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(broker_order_id="kis-aged-profit-protect-small"),
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+            profit_protection_min_peak_pct=Decimal("3.0"),
+            profit_protection_giveback_pct=Decimal("1.2"),
+            profit_protection_aged_session_min=2,
+            profit_protection_aged_min_current_profit_pct=Decimal("1.0"),
+        ),
+        broker_adapter=broker_adapter,
+    )
+    client = TestClient(app)
+
+    resume = client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "console", "reason": "enable automation"},
+    )
+    assert resume.status_code == 200
+
+    plan_response = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-aged-profit-protect-small-profit",
+            "source": "kai-trading-core",
+            "market_date": "2026-05-26",
+            "items": [
+                {
+                    "symbol": "005930",
+                    "side": "sell",
+                    "intent": "target_sell",
+                    "quantity_policy": {"kind": "position_exit_from_entry"},
+                    "trigger_price": "110000.00",
+                    "risk_context": {
+                        "exchange": "KRX",
+                        "profit_protection": {
+                            "peak_price": "101800.0000",
+                            "peak_profit_pct": "1.8000",
+                        },
+                    },
+                }
+            ],
+        },
+    )
+    assert plan_response.status_code == 201
+
+    with app.state.db_session_factory() as session:
+        session.add(
+            ExecutionPosition(
+                mode="paper",
+                symbol="005930",
+                quantity=4,
+                average_price=Decimal("100000.0000"),
+                updated_from="reconciliation",
+                raw_payload={"source": "broker"},
+            )
+        )
+        session.commit()
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "small aged profit should keep watching",
+            "observed_at": "2026-05-27T01:00:00Z",
+            "prices": [{"symbol": "005930", "price": "100500.00"}],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["triggered_item_count"] == 0
+    assert payload["submitted_order_count"] == 0
+    assert payload["items"][0]["outcome"] == "waiting"
+    assert broker_adapter.order_calls == []
 
     engine.dispose()
 
