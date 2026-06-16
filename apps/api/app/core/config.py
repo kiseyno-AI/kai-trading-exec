@@ -79,6 +79,10 @@ class Settings(BaseModel):
     exec_agent_watch_sizing_start_local_time: str = "08:00"
     exec_agent_watch_sizing_end_local_time: str = "15:30"
     exec_agent_watch_sizing_timeout_seconds: int = Field(default=180, ge=30, le=3600)
+    exec_agent_watch_sizing_min_notional_krw: Decimal = Field(default=Decimal("1000000"), ge=0)
+    exec_agent_watch_sizing_high_conviction_min_notional_krw: Decimal = Field(default=Decimal("1500000"), ge=0)
+    exec_agent_watch_sizing_high_conviction_threshold: Decimal = Field(default=Decimal("0.65"), ge=0, le=1)
+    exec_agent_watch_sizing_fallback_account_basis_krw: Decimal = Field(default=Decimal("10000000"), gt=0)
     openclaw_cli_path: str = "openclaw"
     kis_app_key: str | None = None
     kis_app_secret: str | None = None
@@ -184,6 +188,10 @@ _ENV_FIELDS = {
     "EXEC_AGENT_WATCH_SIZING_START_LOCAL_TIME": "exec_agent_watch_sizing_start_local_time",
     "EXEC_AGENT_WATCH_SIZING_END_LOCAL_TIME": "exec_agent_watch_sizing_end_local_time",
     "EXEC_AGENT_WATCH_SIZING_TIMEOUT_SECONDS": "exec_agent_watch_sizing_timeout_seconds",
+    "EXEC_AGENT_WATCH_SIZING_MIN_NOTIONAL_KRW": "exec_agent_watch_sizing_min_notional_krw",
+    "EXEC_AGENT_WATCH_SIZING_HIGH_CONVICTION_MIN_NOTIONAL_KRW": "exec_agent_watch_sizing_high_conviction_min_notional_krw",
+    "EXEC_AGENT_WATCH_SIZING_HIGH_CONVICTION_THRESHOLD": "exec_agent_watch_sizing_high_conviction_threshold",
+    "EXEC_AGENT_WATCH_SIZING_FALLBACK_ACCOUNT_BASIS_KRW": "exec_agent_watch_sizing_fallback_account_basis_krw",
     "OPENCLAW_CLI_PATH": "openclaw_cli_path",
     "KIS_APP_KEY": "kis_app_key",
     "KIS_APP_SECRET": "kis_app_secret",

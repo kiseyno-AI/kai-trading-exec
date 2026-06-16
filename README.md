@@ -177,9 +177,21 @@ Short-term exec risk settings currently supported:
 - `KAI_EXEC_EXEC_AGENT_TRIGGER_TIME_ENABLED`
 - `KAI_EXEC_EXEC_AGENT_TRIGGER_TIME_SELL_ENABLED`
 - `KAI_EXEC_EXEC_AGENT_TRIGGER_TIME_TIMEOUT_SECONDS`
+- `KAI_EXEC_EXEC_AGENT_WATCH_SIZING_MIN_NOTIONAL_KRW`
+- `KAI_EXEC_EXEC_AGENT_WATCH_SIZING_HIGH_CONVICTION_MIN_NOTIONAL_KRW`
+- `KAI_EXEC_EXEC_AGENT_WATCH_SIZING_HIGH_CONVICTION_THRESHOLD`
+- `KAI_EXEC_EXEC_AGENT_WATCH_SIZING_FALLBACK_ACCOUNT_BASIS_KRW`
 - `KAI_EXEC_MONTHLY_TARGET_KRW`
 - `KAI_EXEC_MONTHLY_CAPITAL_PRESERVATION_ENABLED`
 - `KAI_EXEC_MONTHLY_AGGRESSIVE_LAG_RATIO`
+
+Watch-buy sizing applies a minimum-notional floor after exec-agent approval so
+valid candidates do not become ineffective tiny probe buys. Defaults target
+`1,000,000` KRW per approved watch buy and `1,500,000` KRW for higher
+confidence or high-liquidity candidates, while still respecting available
+cash, per-symbol budget, max-safe notional, and stop-risk caps. If account
+snapshot loading is unavailable, the fallback account basis defaults to
+`10,000,000` KRW.
 
 Default short-term sizing is tuned for higher-conviction filtered candidates:
 per-symbol budget `3,000,000` KRW, total exec-agent budget `9,000,000` KRW,

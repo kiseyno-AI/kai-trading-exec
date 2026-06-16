@@ -9,7 +9,7 @@ import tempfile
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, time
-from decimal import Decimal
+from decimal import Decimal, ROUND_DOWN
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -118,8 +118,10 @@ def run_due_watch_exec_agent_sizing(
                         continue
                     summary = _apply_decisions(
                         db=db,
+                        settings=settings,
                         plan=plan,
                         decision_payload=decision_payload,
+                        account_context=account_context,
                         expected_item_ids=set(batch_ids),
                     )
                     applied.append(summary)
@@ -722,8 +724,10 @@ def _parse_json_text(text: str) -> dict[str, object]:
 def _apply_decisions(
     *,
     db: Session,
+    settings: Settings | None = None,
     plan: ExecutionPlan,
     decision_payload: dict[str, object],
+    account_context: dict[str, object] | None = None,
     expected_item_ids: set[str] | None = None,
 ) -> dict[str, object]:
     decisions_raw = decision_payload.get("decisions")
@@ -767,17 +771,26 @@ def _apply_decisions(
             quantity = _positive_int(decision.get("quantity"))
             if quantity is None:
                 raise ValueError(f"approved decision has invalid quantity for {item.symbol}")
+            sizing = _adjust_approved_watch_quantity(
+                settings=settings,
+                item=item,
+                decision=decision,
+                account_context=account_context,
+                agent_quantity=quantity,
+            )
+            quantity = sizing["quantity"]
             previous_policy = item.quantity_policy if isinstance(item.quantity_policy, dict) else None
             item.quantity_policy = {
                 "kind": "shares",
                 "quantity": quantity,
                 "source": "exec_agent_watch_sizing",
-                "sizing_price": decision.get("sizing_price"),
-                "approved_notional": decision.get("approved_notional_krw"),
+                "sizing_price": _decimal_text(sizing["sizing_price"]),
+                "approved_notional": _decimal_text(sizing["approved_notional"]),
                 "confidence": decision.get("confidence"),
                 "target_profile": record["target_profile"],
                 "target_tag": record["target_tag"],
                 "reason_code": decision.get("reason_code"),
+                "sizing_adjustment": sizing["adjustment"],
                 "previous_policy": previous_policy,
             }
             item.status = "watch_monitoring_active"
@@ -797,6 +810,196 @@ def _apply_decisions(
         "missing_item_ids": sorted(missing_ids),
         "ignored_extra": len(extra_ids),
     }
+
+
+def _adjust_approved_watch_quantity(
+    *,
+    settings: Settings | None,
+    item: ExecutionPlanItem,
+    decision: dict[str, object],
+    account_context: dict[str, object] | None,
+    agent_quantity: int,
+) -> dict[str, object]:
+    sizing_price = (
+        _decimal_value(decision.get("sizing_price"))
+        or item.limit_price
+        or item.trigger_price
+    )
+    if sizing_price is None or sizing_price <= 0:
+        return {
+            "quantity": agent_quantity,
+            "sizing_price": Decimal("0"),
+            "approved_notional": Decimal("0"),
+            "adjustment": {"applied": False, "reason": "missing_sizing_price"},
+        }
+    if settings is None:
+        approved_notional = sizing_price * Decimal(agent_quantity)
+        return {
+            "quantity": agent_quantity,
+            "sizing_price": sizing_price,
+            "approved_notional": approved_notional,
+            "adjustment": {
+                "applied": False,
+                "reason": "settings_unavailable",
+                "agent_quantity": agent_quantity,
+                "agent_notional": _decimal_text(approved_notional),
+            },
+        }
+
+    original_notional = sizing_price * Decimal(agent_quantity)
+    target_notional = _target_min_notional(settings=settings, item=item, decision=decision)
+    cap_notional = _watch_sizing_cap_notional(
+        settings=settings,
+        item=item,
+        account_context=account_context,
+        sizing_price=sizing_price,
+    )
+    effective_target = min(target_notional, cap_notional)
+    adjusted_quantity = agent_quantity
+    if effective_target > original_notional:
+        adjusted_quantity = max(agent_quantity, _floor_quantity(effective_target / sizing_price))
+        max_quantity = _floor_quantity(cap_notional / sizing_price)
+        adjusted_quantity = min(adjusted_quantity, max_quantity)
+    approved_notional = sizing_price * Decimal(adjusted_quantity)
+    return {
+        "quantity": adjusted_quantity,
+        "sizing_price": sizing_price,
+        "approved_notional": approved_notional,
+        "adjustment": {
+            "applied": adjusted_quantity != agent_quantity,
+            "agent_quantity": agent_quantity,
+            "agent_notional": _decimal_text(original_notional),
+            "target_min_notional": _decimal_text(target_notional),
+            "cap_notional": _decimal_text(cap_notional),
+            "effective_target_notional": _decimal_text(effective_target),
+            "adjusted_quantity": adjusted_quantity,
+            "adjusted_notional": _decimal_text(approved_notional),
+        },
+    }
+
+
+def _target_min_notional(
+    *,
+    settings: Settings,
+    item: ExecutionPlanItem,
+    decision: dict[str, object],
+) -> Decimal:
+    base = Decimal(str(settings.exec_agent_watch_sizing_min_notional_krw))
+    high_conviction = Decimal(str(settings.exec_agent_watch_sizing_high_conviction_min_notional_krw))
+    confidence = _decimal_value(decision.get("confidence"))
+    threshold = Decimal(str(settings.exec_agent_watch_sizing_high_conviction_threshold))
+    liquidity_tier = _liquidity_tier(item)
+    if confidence is not None and confidence >= threshold:
+        return high_conviction
+    if liquidity_tier == "high" and confidence is not None and confidence >= Decimal("0.60"):
+        return high_conviction
+    return base
+
+
+def _watch_sizing_cap_notional(
+    *,
+    settings: Settings,
+    item: ExecutionPlanItem,
+    account_context: dict[str, object] | None,
+    sizing_price: Decimal,
+) -> Decimal:
+    account_basis = _account_basis(settings=settings, account_context=account_context)
+    cap_candidates = [
+        Decimal(str(settings.exec_agent_max_symbol_budget)),
+        account_basis * Decimal(str(settings.exec_agent_max_position_allocation_pct)),
+    ]
+    available_cash = _account_available_cash(account_context)
+    if available_cash is not None and available_cash > 0:
+        cap_candidates.append(available_cash)
+    candidate_budget = _candidate_budget(item)
+    if candidate_budget is not None and candidate_budget > 0:
+        cap_candidates.append(candidate_budget)
+    max_safe_notional = _candidate_max_safe_notional(item)
+    if max_safe_notional is not None and max_safe_notional > 0:
+        cap_candidates.append(max_safe_notional)
+    risk_cap = _risk_cap_notional(settings=settings, item=item, account_basis=account_basis, sizing_price=sizing_price)
+    if risk_cap is not None and risk_cap > 0:
+        cap_candidates.append(risk_cap)
+    return min(cap_candidates).quantize(Decimal("0.0001"), rounding=ROUND_DOWN)
+
+
+def _risk_cap_notional(
+    *,
+    settings: Settings,
+    item: ExecutionPlanItem,
+    account_basis: Decimal,
+    sizing_price: Decimal,
+) -> Decimal | None:
+    stop_price = _stop_price(item)
+    if stop_price is None or stop_price <= 0 or stop_price >= sizing_price:
+        return None
+    risk_budget = account_basis * Decimal(str(settings.exec_agent_max_trade_risk_pct))
+    stop_distance = sizing_price - stop_price
+    risk_quantity = _floor_quantity(risk_budget / stop_distance)
+    if risk_quantity <= 0:
+        return Decimal("0")
+    return sizing_price * Decimal(risk_quantity)
+
+
+def _account_basis(*, settings: Settings, account_context: dict[str, object] | None) -> Decimal:
+    if isinstance(account_context, dict) and account_context.get("available") is True:
+        for key in ("buying_power_krw", "orderable_cash_krw"):
+            value = _decimal_value(account_context.get(key))
+            if value is not None and value > 0:
+                return value
+    return Decimal(str(settings.exec_agent_watch_sizing_fallback_account_basis_krw))
+
+
+def _account_available_cash(account_context: dict[str, object] | None) -> Decimal | None:
+    if not isinstance(account_context, dict) or account_context.get("available") is not True:
+        return None
+    return _decimal_value(account_context.get("orderable_cash_krw")) or _decimal_value(account_context.get("buying_power_krw"))
+
+
+def _candidate_budget(item: ExecutionPlanItem) -> Decimal | None:
+    for payload in (item.quantity_policy, item.risk_context):
+        if isinstance(payload, dict):
+            value = _decimal_value(payload.get("budget_krw") or payload.get("allocation_budget_krw"))
+            if value is not None and value > 0:
+                return value
+    return None
+
+
+def _candidate_max_safe_notional(item: ExecutionPlanItem) -> Decimal | None:
+    for payload in (item.quantity_policy, item.risk_context):
+        if isinstance(payload, dict):
+            value = _decimal_value(payload.get("max_safe_notional_krw"))
+            if value is not None and value > 0:
+                return value
+            feasibility = payload.get("execution_feasibility_context")
+            if isinstance(feasibility, dict):
+                value = _decimal_value(feasibility.get("max_safe_notional_krw"))
+                if value is not None and value > 0:
+                    return value
+    return None
+
+
+def _stop_price(item: ExecutionPlanItem) -> Decimal | None:
+    risk_context = item.risk_context if isinstance(item.risk_context, dict) else {}
+    for key in ("stop_loss_price", "stop_price", "effective_stop_price"):
+        value = _decimal_value(risk_context.get(key))
+        if value is not None and value > 0:
+            return value
+    return None
+
+
+def _liquidity_tier(item: ExecutionPlanItem) -> str | None:
+    for payload in (item.quantity_policy, item.risk_context):
+        if isinstance(payload, dict):
+            value = payload.get("liquidity_tier")
+            if isinstance(value, str) and value.strip():
+                return value.strip().lower()
+            feasibility = payload.get("execution_feasibility_context")
+            if isinstance(feasibility, dict):
+                value = feasibility.get("liquidity_tier")
+                if isinstance(value, str) and value.strip():
+                    return value.strip().lower()
+    return None
 
 
 def _decision_record(*, decision: dict[str, object], item: ExecutionPlanItem, version: str) -> dict[str, object]:
@@ -852,6 +1055,20 @@ def _positive_decimal(value: object) -> Decimal | None:
     except Exception:
         return None
     return parsed if parsed > 0 else None
+
+
+def _decimal_value(value: object) -> Decimal | None:
+    return _positive_decimal(value)
+
+
+def _floor_quantity(value: Decimal) -> int:
+    return int(value.quantize(Decimal("1"), rounding=ROUND_DOWN))
+
+
+def _decimal_text(value: Decimal | None) -> str | None:
+    if value is None:
+        return None
+    return f"{value.quantize(Decimal('0.0001'), rounding=ROUND_DOWN):.4f}"
 
 
 def _positive_int(value: object) -> int | None:
