@@ -86,6 +86,7 @@ def _create_intraday_watch_buy(
         "exchange": "KRX",
         "target_price": "72420.00",
         "stop_price": "70000.00",
+        "trigger_direction": "at_or_above",
         "decider_output": {"rationale": "trigger-time test candidate"},
     }
     if risk_context_extra:
@@ -607,6 +608,7 @@ def test_trigger_time_buy_effective_risk_stop_updates_stop_monitor(
                         "exchange": "KRX",
                         "target_price": "72420.00",
                         "stop_price": "60000.00",
+                        "trigger_direction": "at_or_above",
                     },
                 },
                 {
