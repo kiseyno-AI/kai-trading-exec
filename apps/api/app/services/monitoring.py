@@ -385,8 +385,21 @@ def _evaluate_monitoring_cycle(
     positions_by_symbol = _load_positions_by_symbol(
         settings=settings,
         db=db,
-        symbols=sell_monitored_symbols,
     )
+    post_entry_maintenance_count, post_entry_review_count = _maintain_post_entry_exit_monitors(
+        settings=settings,
+        db=db,
+        positions_by_symbol=positions_by_symbol,
+        prices=prices,
+        triggered_at=triggered_at,
+    )
+    if post_entry_maintenance_count:
+        db.flush()
+        items = _load_monitored_items(
+            settings=settings,
+            db=db,
+            exclude_pending_config=allow_persisted_triggered_without_price,
+        )
     remaining_quantities_by_symbol = {
         symbol: position.quantity
         for symbol, position in positions_by_symbol.items()
@@ -1031,6 +1044,7 @@ def _evaluate_monitoring_cycle(
         "agent_delayed_count": agent_status_counts["agent_delayed"],
         "agent_rejected_count": agent_status_counts["agent_rejected"],
         "agent_approved_submitted_count": agent_status_counts["agent_approved_submitted"],
+        "post_entry_review_count": post_entry_review_count,
     }
 
     checkpoint = None
@@ -1970,6 +1984,466 @@ def _load_positions_by_symbol(
         for position in positions
         if position.quantity > 0
     }
+
+
+def _maintain_post_entry_exit_monitors(
+    *,
+    settings: Settings,
+    db: Session,
+    positions_by_symbol: dict[str, ExecutionPosition],
+    prices: dict[str, MonitoringPriceRequest],
+    triggered_at: datetime,
+) -> tuple[int, int]:
+    maintenance_count = 0
+    review_count = 0
+    for symbol, position in positions_by_symbol.items():
+        if position.quantity <= 0:
+            continue
+        entry_order = _latest_filled_buy_order(
+            settings=settings,
+            db=db,
+            symbol=symbol,
+        )
+        if entry_order is None or entry_order.plan_item is None:
+            continue
+        entry_item = entry_order.plan_item
+        if entry_item.plan is None:
+            continue
+        entry_price = position.average_price or entry_order.limit_price
+        if entry_price is None or entry_price <= 0:
+            continue
+
+        observed_price = prices.get(symbol).price if prices.get(symbol) is not None else None
+        entry_date = _entry_market_date(entry_item=entry_item, entry_order=entry_order)
+        holding_session = _holding_session_age_from_date(
+            entry_market_date=entry_date,
+            triggered_at=triggered_at,
+        )
+        initial_stop = _post_entry_initial_stop_price(
+            settings=settings,
+            entry_item=entry_item,
+            entry_price=entry_price,
+        )
+        stop_item, stop_maintenance_count = _ensure_post_entry_stop_monitor(
+            db=db,
+            entry_item=entry_item,
+            quantity=position.quantity,
+            stop_price=initial_stop,
+            entry_price=entry_price,
+            triggered_at=triggered_at,
+        )
+        maintenance_count += stop_maintenance_count
+        _, max_holding_maintenance_count = _ensure_post_entry_max_holding_monitor(
+            db=db,
+            entry_item=entry_item,
+            quantity=position.quantity,
+            entry_market_date=entry_date,
+            triggered_at=triggered_at,
+            max_holding_sessions=settings.exec_agent_max_holding_trading_sessions,
+        )
+        maintenance_count += max_holding_maintenance_count
+
+        review = _post_entry_review_state(
+            settings=settings,
+            entry_price=entry_price,
+            observed_price=observed_price,
+            holding_session=holding_session,
+            stop_price=stop_item.trigger_price,
+            triggered_at=triggered_at,
+        )
+        maintenance_count += _apply_post_entry_review_state(
+            item=stop_item,
+            review=review,
+            triggered_at=triggered_at,
+        )
+        if review["requires_review"] is True:
+            review_count += 1
+
+    return maintenance_count, review_count
+
+
+def _latest_filled_buy_order(
+    *,
+    settings: Settings,
+    db: Session,
+    symbol: str,
+) -> BrokerOrder | None:
+    return db.scalar(
+        select(BrokerOrder)
+        .join(BrokerOrder.plan_item)
+        .join(ExecutionPlanItem.plan)
+        .where(
+            BrokerOrder.mode == settings.runtime_mode,
+            BrokerOrder.symbol == symbol,
+            BrokerOrder.side == "buy",
+            BrokerOrder.status == "filled",
+            ExecutionPlan.mode == settings.runtime_mode,
+        )
+        .options(selectinload(BrokerOrder.plan_item).selectinload(ExecutionPlanItem.plan))
+        .order_by(
+            BrokerOrder.submitted_at.desc(),
+            BrokerOrder.updated_at.desc(),
+            BrokerOrder.created_at.desc(),
+            BrokerOrder.id.desc(),
+        )
+    )
+
+
+def _entry_market_date(
+    *,
+    entry_item: ExecutionPlanItem,
+    entry_order: BrokerOrder,
+) -> date:
+    if entry_item.source_market_date is not None:
+        return entry_item.source_market_date
+    if entry_item.plan is not None and entry_item.plan.market_date is not None:
+        return entry_item.plan.market_date
+    if entry_order.submitted_at is not None:
+        return _normalize_utc(entry_order.submitted_at).astimezone(KRX_TIMEZONE).date()
+    return datetime.now(KRX_TIMEZONE).date()
+
+
+def _holding_session_age_from_date(
+    *,
+    entry_market_date: date,
+    triggered_at: datetime,
+) -> int:
+    market_date = triggered_at.astimezone(KRX_TIMEZONE).date()
+    return max(1, (market_date - entry_market_date).days + 1)
+
+
+def _post_entry_initial_stop_price(
+    *,
+    settings: Settings,
+    entry_item: ExecutionPlanItem,
+    entry_price: Decimal,
+) -> Decimal:
+    upstream_stop = _watch_buy_stop_price(entry_item)
+    hard_stop = (entry_price * (Decimal("1") - settings.exec_agent_stop_loss_pct)).quantize(
+        Decimal("0.0001"),
+        rounding=ROUND_DOWN,
+    )
+    if upstream_stop is None:
+        return hard_stop
+    return effective_stop_price(
+        settings=settings,
+        entry_price=entry_price,
+        upstream_stop_price=upstream_stop,
+    )
+
+
+def _ensure_post_entry_stop_monitor(
+    *,
+    db: Session,
+    entry_item: ExecutionPlanItem,
+    quantity: int,
+    stop_price: Decimal,
+    entry_price: Decimal,
+    triggered_at: datetime,
+) -> tuple[ExecutionPlanItem, int]:
+    plan = entry_item.plan
+    assert plan is not None
+    maintenance_count = 0
+    existing = _active_sibling_monitor(
+        entry_item=entry_item,
+        intent="stop_sell",
+    )
+    if existing is None:
+        existing = ExecutionPlanItem(
+            plan=plan,
+            plan_item_index=_next_plan_item_index(plan),
+            symbol=entry_item.symbol,
+            side="sell",
+            intent="stop_sell",
+            status="stop_sell_monitoring",
+            quantity_policy={"kind": "position_exit_from_entry"},
+            trigger_price=stop_price,
+            time_in_force=entry_item.time_in_force or "day",
+            risk_context={
+                "exchange": _plan_item_exchange(entry_item),
+                "entry_context": _post_entry_context(
+                    entry_item=entry_item,
+                    entry_price=entry_price,
+                    quantity=quantity,
+                ),
+                "deterministic_emergency_stop": True,
+                "post_entry_managed": True,
+            },
+            decision_agent_name=entry_item.decision_agent_name,
+            decision_snapshot_id=entry_item.decision_snapshot_id,
+            decision_run_id=entry_item.decision_run_id,
+            source_plan_item_id=_derived_source_plan_item_id(entry_item, "post-entry-stop"),
+            source_market_date=entry_item.source_market_date,
+        )
+        db.add(existing)
+        _record_monitoring_event(
+            item=existing,
+            event={
+                "event": "post_entry_stop_monitor_created",
+                "entry_execution_plan_item_id": entry_item.id,
+                "trigger_price": _serialize_decimal(stop_price),
+                "recorded_at": triggered_at.isoformat(),
+            },
+        )
+        return existing, 1
+
+    if existing.trigger_price is None or stop_price > existing.trigger_price:
+        prior_stop = existing.trigger_price
+        existing.trigger_price = stop_price
+        maintenance_count += 1
+        _record_monitoring_event(
+            item=existing,
+            event={
+                "event": "post_entry_stop_monitor_tightened",
+                "reason": "effective_entry_risk_stop",
+                "prior_trigger_price": _serialize_decimal(prior_stop),
+                "trigger_price": _serialize_decimal(stop_price),
+                "recorded_at": triggered_at.isoformat(),
+            },
+        )
+    risk_context = dict(existing.risk_context) if isinstance(existing.risk_context, dict) else {}
+    risk_context.setdefault("exchange", _plan_item_exchange(entry_item))
+    risk_context.setdefault("deterministic_emergency_stop", True)
+    risk_context.setdefault("post_entry_managed", True)
+    risk_context["entry_context"] = _post_entry_context(
+        entry_item=entry_item,
+        entry_price=entry_price,
+        quantity=quantity,
+    )
+    existing.risk_context = risk_context
+    return existing, maintenance_count
+
+
+def _ensure_post_entry_max_holding_monitor(
+    *,
+    db: Session,
+    entry_item: ExecutionPlanItem,
+    quantity: int,
+    entry_market_date: date,
+    triggered_at: datetime,
+    max_holding_sessions: int,
+) -> tuple[ExecutionPlanItem, int]:
+    plan = entry_item.plan
+    assert plan is not None
+    maintenance_count = 0
+    existing = _active_sibling_monitor(
+        entry_item=entry_item,
+        intent="max_holding_close_sell",
+    )
+    close_exit_date = _add_trading_sessions(entry_market_date, max_holding_sessions)
+    if existing is None:
+        existing = ExecutionPlanItem(
+            plan=plan,
+            plan_item_index=_next_plan_item_index(plan),
+            symbol=entry_item.symbol,
+            side="sell",
+            intent="max_holding_close_sell",
+            status="max_holding_close_sell_monitoring",
+            quantity_policy={"kind": "position_exit_from_entry"},
+            time_in_force=entry_item.time_in_force or "day",
+            risk_context={
+                "exchange": _plan_item_exchange(entry_item),
+                "close_exit_date": close_exit_date.isoformat(),
+                "max_holding_sessions": max_holding_sessions,
+                "entry_context": _post_entry_context(
+                    entry_item=entry_item,
+                    entry_price=None,
+                    quantity=quantity,
+                ),
+                "post_entry_managed": True,
+            },
+            decision_agent_name=entry_item.decision_agent_name,
+            decision_snapshot_id=entry_item.decision_snapshot_id,
+            decision_run_id=entry_item.decision_run_id,
+            source_plan_item_id=_derived_source_plan_item_id(entry_item, "post-entry-max-holding"),
+            source_market_date=entry_item.source_market_date,
+        )
+        db.add(existing)
+        _record_monitoring_event(
+            item=existing,
+            event={
+                "event": "post_entry_max_holding_monitor_created",
+                "entry_execution_plan_item_id": entry_item.id,
+                "close_exit_date": close_exit_date.isoformat(),
+                "recorded_at": triggered_at.isoformat(),
+            },
+        )
+        return existing, 1
+
+    risk_context = dict(existing.risk_context) if isinstance(existing.risk_context, dict) else {}
+    if risk_context.get("close_exit_date") != close_exit_date.isoformat():
+        risk_context["close_exit_date"] = close_exit_date.isoformat()
+        risk_context["max_holding_sessions"] = max_holding_sessions
+        existing.risk_context = risk_context
+        maintenance_count += 1
+        _record_monitoring_event(
+            item=existing,
+            event={
+                "event": "post_entry_max_holding_monitor_updated",
+                "close_exit_date": close_exit_date.isoformat(),
+                "recorded_at": triggered_at.isoformat(),
+            },
+        )
+        risk_context = dict(existing.risk_context) if isinstance(existing.risk_context, dict) else {}
+    risk_context.setdefault("exchange", _plan_item_exchange(entry_item))
+    risk_context.setdefault("post_entry_managed", True)
+    risk_context["entry_context"] = _post_entry_context(
+        entry_item=entry_item,
+        entry_price=None,
+        quantity=quantity,
+    )
+    existing.risk_context = risk_context
+    return existing, maintenance_count
+
+
+def _add_trading_sessions(start: date, sessions: int) -> date:
+    current = start
+    added = 0
+    while added < max(1, sessions):
+        current = current + timedelta(days=1)
+        if current.weekday() < 5:
+            added += 1
+    return current
+
+
+def _active_sibling_monitor(
+    *,
+    entry_item: ExecutionPlanItem,
+    intent: str,
+) -> ExecutionPlanItem | None:
+    plan = entry_item.plan
+    if plan is None:
+        return None
+    for sibling in plan.items:
+        if sibling.symbol != entry_item.symbol or sibling.side != "sell" or sibling.intent != intent:
+            continue
+        if sibling.status in NON_MONITORABLE_PLAN_ITEM_STATUSES:
+            continue
+        return sibling
+    return None
+
+
+def _next_plan_item_index(plan: ExecutionPlan) -> int:
+    if not plan.items:
+        return 0
+    return max(item.plan_item_index for item in plan.items) + 1
+
+
+def _post_entry_context(
+    *,
+    entry_item: ExecutionPlanItem,
+    entry_price: Decimal | None,
+    quantity: int,
+) -> dict[str, object]:
+    context: dict[str, object] = {
+        "source_plan_item_id": entry_item.source_plan_item_id,
+        "execution_plan_item_id": entry_item.id,
+        "decision_run_id": entry_item.decision_run_id,
+        "decision_snapshot_id": entry_item.decision_snapshot_id,
+        "entry_quantity": quantity,
+    }
+    if entry_price is not None:
+        context["entry_price"] = _serialize_decimal(entry_price)
+    return context
+
+
+def _derived_source_plan_item_id(entry_item: ExecutionPlanItem, suffix: str) -> str | None:
+    source = entry_item.source_plan_item_id
+    if not source:
+        return None
+    return f"{source}:{suffix}"
+
+
+def _post_entry_review_state(
+    *,
+    settings: Settings,
+    entry_price: Decimal,
+    observed_price: Decimal | None,
+    holding_session: int,
+    stop_price: Decimal | None,
+    triggered_at: datetime,
+) -> dict[str, object]:
+    current_pnl_pct = (
+        _profit_pct(current_price=observed_price, average_price=entry_price)
+        if observed_price is not None
+        else None
+    )
+    adverse_pct = (
+        ((entry_price - observed_price) / entry_price) * Decimal("100")
+        if observed_price is not None and observed_price < entry_price
+        else Decimal("0")
+    )
+    reasons: list[str] = []
+    tightened_stop = stop_price
+    if observed_price is not None:
+        risk_threshold_pct = settings.exec_agent_stop_loss_pct * Decimal("100")
+        if adverse_pct >= risk_threshold_pct:
+            reasons.append("gap_down_breached_risk_threshold")
+        if holding_session >= 2 and observed_price <= entry_price:
+            reasons.append("next_day_no_progress")
+            tightened_stop = max(
+                stop_price or Decimal("0"),
+                (entry_price * Decimal("0.99")).quantize(Decimal("0.0001"), rounding=ROUND_DOWN),
+            )
+        if holding_session >= settings.exec_agent_max_holding_trading_sessions and observed_price <= entry_price:
+            reasons.append("max_holding_without_progress")
+    return {
+        "requires_review": bool(reasons),
+        "reasons": reasons,
+        "entry_price": _serialize_decimal(entry_price),
+        "observed_price": _serialize_decimal(observed_price),
+        "current_pnl_pct": _serialize_decimal(current_pnl_pct),
+        "max_adverse_excursion_pct": _serialize_decimal(adverse_pct),
+        "holding_session": holding_session,
+        "tightened_stop_price": _serialize_decimal(tightened_stop),
+        "recorded_at": triggered_at.isoformat(),
+    }
+
+
+def _apply_post_entry_review_state(
+    *,
+    item: ExecutionPlanItem,
+    review: dict[str, object],
+    triggered_at: datetime,
+) -> int:
+    maintenance_count = 0
+    risk_context = dict(item.risk_context) if isinstance(item.risk_context, dict) else {}
+    previous = risk_context.get("post_entry_review")
+    risk_context["post_entry_review"] = review
+    tightened_stop = _parse_decimal(review.get("tightened_stop_price"))
+    if tightened_stop is not None and (item.trigger_price is None or tightened_stop > item.trigger_price):
+        prior_stop = item.trigger_price
+        item.trigger_price = tightened_stop
+        maintenance_count += 1
+        item.risk_context = risk_context
+        _record_monitoring_event(
+            item=item,
+            event={
+                "event": "post_entry_stop_monitor_tightened",
+                "reason": "post_entry_no_progress_review",
+                "prior_trigger_price": _serialize_decimal(prior_stop),
+                "trigger_price": _serialize_decimal(tightened_stop),
+                "review_reasons": review.get("reasons") or [],
+                "recorded_at": triggered_at.isoformat(),
+            },
+        )
+        risk_context = dict(item.risk_context) if isinstance(item.risk_context, dict) else {}
+    item.risk_context = risk_context
+    if review["requires_review"] is True and not (
+        isinstance(previous, dict) and previous.get("reasons") == review.get("reasons")
+    ):
+        maintenance_count += 1
+        _record_monitoring_event(
+            item=item,
+            event={
+                "event": "post_entry_review_required",
+                "reasons": review.get("reasons") or [],
+                "holding_session": review.get("holding_session"),
+                "max_adverse_excursion_pct": review.get("max_adverse_excursion_pct"),
+                "recorded_at": triggered_at.isoformat(),
+            },
+        )
+    return maintenance_count
 
 
 def _latest_reconciliation_error_for_symbol(

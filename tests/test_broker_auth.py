@@ -4270,6 +4270,380 @@ def test_monitoring_evaluate_triggers_target_sell_order_from_position_and_price_
     engine.dispose()
 
 
+def _create_filled_buy_position(
+    app,
+    client: TestClient,
+    *,
+    plan_id: str,
+    market_date: str,
+    source_plan_item_id: str,
+    entry_price: str = "100000.00",
+    quantity: int = 10,
+) -> str:
+    plan_response = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": plan_id,
+            "source": "kai-trading-core",
+            "market_date": market_date,
+            "items": [
+                {
+                    "symbol": "005930",
+                    "side": "buy",
+                    "intent": "next_open_buy",
+                    "quantity_policy": {"kind": "shares", "quantity": quantity},
+                    "limit_price": entry_price,
+                    "time_in_force": "day",
+                    "risk_context": {"exchange": "KRX", "stop_price": "95000.00"},
+                    "source_plan_item_id": source_plan_item_id,
+                    "decision_agent_name": "short-term-decider",
+                    "decision_snapshot_id": f"{plan_id}-snapshot",
+                    "decision_run_id": f"{plan_id}-run",
+                }
+            ],
+        },
+    )
+    assert plan_response.status_code == 201
+    buy_item_id = plan_response.json()["persisted_execution_item_ids"][0]
+
+    with app.state.db_session_factory() as session:
+        buy_item = session.get(ExecutionPlanItem, buy_item_id)
+        assert buy_item is not None
+        buy_item.status = "filled"
+        session.add(
+            BrokerOrder(
+                execution_plan_item_id=buy_item_id,
+                broker_name="kis",
+                mode="paper",
+                idempotency_key=f"test-filled-buy:{buy_item_id}",
+                broker_order_id=f"kis-buy-{buy_item_id}",
+                symbol="005930",
+                side="buy",
+                status="filled",
+                quantity=quantity,
+                limit_price=Decimal(entry_price),
+                submitted_at=datetime.fromisoformat(f"{market_date}T00:30:00+00:00"),
+                request_metadata={"source": "test"},
+                response_metadata={"source": "test"},
+                raw_broker_payload={"source": "test"},
+            )
+        )
+        session.add(
+            ExecutionPosition(
+                mode="paper",
+                symbol="005930",
+                quantity=quantity,
+                average_price=Decimal(entry_price),
+                updated_from="test",
+                raw_payload={"source": "test"},
+            )
+        )
+        session.commit()
+
+    return buy_item_id
+
+
+def test_monitoring_creates_post_entry_protective_monitors_after_buy_fill() -> None:
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(broker_order_id="kis-post-entry-create"),
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+            exec_agent_stop_loss_pct=Decimal("0.04"),
+            exec_agent_max_holding_trading_sessions=3,
+        ),
+        broker_adapter=broker_adapter,
+    )
+    client = TestClient(app)
+
+    _create_filled_buy_position(
+        app,
+        client,
+        plan_id="plan-post-entry-create",
+        market_date="2026-06-10",
+        source_plan_item_id="core-post-entry-create",
+    )
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "maintain post-entry protective monitors",
+            "observed_at": "2026-06-10T01:00:00Z",
+            "prices": [{"symbol": "005930", "price": "101000.00"}],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["submitted_order_count"] == 0
+    with app.state.db_session_factory() as session:
+        items = session.scalars(select(ExecutionPlanItem).where(ExecutionPlanItem.symbol == "005930")).all()
+        items_by_intent = {item.intent: item for item in items}
+        stop_item = items_by_intent["stop_sell"]
+        assert stop_item.status == "stop_sell_monitoring"
+        assert stop_item.trigger_price == Decimal("96000.0000")
+        assert stop_item.quantity_policy == {"kind": "position_exit_from_entry"}
+        assert stop_item.source_plan_item_id == "core-post-entry-create:post-entry-stop"
+        assert stop_item.risk_context["deterministic_emergency_stop"] is True
+        assert stop_item.risk_context["post_entry_managed"] is True
+        assert stop_item.risk_context["last_monitoring_event"]["event"] == "post_entry_stop_monitor_created"
+
+        max_holding_item = items_by_intent["max_holding_close_sell"]
+        assert max_holding_item.status == "max_holding_close_sell_monitoring"
+        assert max_holding_item.quantity_policy == {"kind": "position_exit_from_entry"}
+        assert max_holding_item.source_plan_item_id == "core-post-entry-create:post-entry-max-holding"
+        assert max_holding_item.risk_context["close_exit_date"] == "2026-06-15"
+        assert max_holding_item.risk_context["post_entry_managed"] is True
+
+    engine.dispose()
+
+
+def test_monitoring_tightens_post_entry_stop_after_no_progress_day() -> None:
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(broker_order_id="kis-post-entry-tighten"),
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+            exec_agent_stop_loss_pct=Decimal("0.04"),
+            exec_agent_max_holding_trading_sessions=3,
+        ),
+        broker_adapter=broker_adapter,
+    )
+    client = TestClient(app)
+
+    _create_filled_buy_position(
+        app,
+        client,
+        plan_id="plan-post-entry-tighten",
+        market_date="2026-06-10",
+        source_plan_item_id="core-post-entry-tighten",
+    )
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "tighten stop after no progress",
+            "observed_at": "2026-06-11T01:00:00Z",
+            "prices": [{"symbol": "005930", "price": "99500.00"}],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["submitted_order_count"] == 0
+    runtime_status = client.get("/runtime/status").json()
+    assert runtime_status["liveness"]["monitoring"]["last_cycle"]["post_entry_review_count"] == 1
+
+    with app.state.db_session_factory() as session:
+        stop_item = session.scalar(
+            select(ExecutionPlanItem).where(
+                ExecutionPlanItem.symbol == "005930",
+                ExecutionPlanItem.intent == "stop_sell",
+            )
+        )
+        assert stop_item is not None
+        assert stop_item.trigger_price == Decimal("99000.0000")
+        review = stop_item.risk_context["post_entry_review"]
+        assert review["requires_review"] is True
+        assert review["reasons"] == ["next_day_no_progress"]
+        assert review["max_adverse_excursion_pct"] == "0.5000"
+        assert stop_item.risk_context["last_monitoring_event"]["event"] == "post_entry_review_required"
+
+    engine.dispose()
+
+
+def test_monitoring_submits_post_entry_max_holding_close_sell() -> None:
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(broker_order_id="kis-post-entry-max-close"),
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+            exec_agent_stop_loss_pct=Decimal("0.04"),
+            exec_agent_max_holding_trading_sessions=3,
+        ),
+        broker_adapter=broker_adapter,
+    )
+    client = TestClient(app)
+    resume = client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "console", "reason": "enable automation"},
+    )
+    assert resume.status_code == 200
+
+    _create_filled_buy_position(
+        app,
+        client,
+        plan_id="plan-post-entry-max-close",
+        market_date="2026-06-10",
+        source_plan_item_id="core-post-entry-max-close",
+    )
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "max holding exit should close stale position",
+            "observed_at": "2026-06-15T01:00:00Z",
+            "prices": [{"symbol": "005930", "price": "100000.00"}],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    max_holding_items = [
+        item for item in payload["items"] if item["intent"] == "max_holding_close_sell"
+    ]
+    assert max_holding_items[0]["outcome"] == "submitted"
+    assert payload["submitted_order_count"] == 1
+    assert len(broker_adapter.order_calls) == 1
+    assert broker_adapter.order_calls[0].side == "sell"
+    assert broker_adapter.order_calls[0].quantity == 10
+    assert broker_adapter.order_calls[0].order_type == "market"
+
+    with app.state.db_session_factory() as session:
+        max_holding_item = session.scalar(
+            select(ExecutionPlanItem).where(
+                ExecutionPlanItem.symbol == "005930",
+                ExecutionPlanItem.intent == "max_holding_close_sell",
+            )
+        )
+        assert max_holding_item is not None
+        order = session.scalar(
+            select(BrokerOrder).where(BrokerOrder.execution_plan_item_id == max_holding_item.id)
+        )
+        assert order is not None
+        assert order.idempotency_key == f"monitoring:max_holding_close_sell:{max_holding_item.id}"
+        assert order.status == "submitted"
+
+    engine.dispose()
+
+
+def test_monitoring_preserves_trading_session_max_holding_close_date_over_weekend() -> None:
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(broker_order_id="kis-post-entry-weekend"),
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+            exec_agent_stop_loss_pct=Decimal("0.04"),
+            exec_agent_max_holding_trading_sessions=3,
+        ),
+        broker_adapter=broker_adapter,
+    )
+    client = TestClient(app)
+
+    _create_filled_buy_position(
+        app,
+        client,
+        plan_id="plan-post-entry-weekend",
+        market_date="2026-06-12",
+        source_plan_item_id="core-post-entry-weekend",
+    )
+
+    first_response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "create weekend max holding monitor",
+            "observed_at": "2026-06-12T01:00:00Z",
+            "prices": [{"symbol": "005930", "price": "101000.00"}],
+        },
+    )
+
+    assert first_response.status_code == 200
+    with app.state.db_session_factory() as session:
+        max_holding_item = session.scalar(
+            select(ExecutionPlanItem).where(
+                ExecutionPlanItem.symbol == "005930",
+                ExecutionPlanItem.intent == "max_holding_close_sell",
+            )
+        )
+        assert max_holding_item is not None
+        assert max_holding_item.risk_context["close_exit_date"] == "2026-06-17"
+
+    monday_response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "monday should not close friday entry early",
+            "observed_at": "2026-06-15T01:00:00Z",
+            "prices": [{"symbol": "005930", "price": "100000.00"}],
+        },
+    )
+
+    assert monday_response.status_code == 200
+    payload = monday_response.json()
+    assert payload["submitted_order_count"] == 0
+    assert broker_adapter.order_calls == []
+    with app.state.db_session_factory() as session:
+        max_holding_item = session.scalar(
+            select(ExecutionPlanItem).where(
+                ExecutionPlanItem.symbol == "005930",
+                ExecutionPlanItem.intent == "max_holding_close_sell",
+            )
+        )
+        assert max_holding_item is not None
+        assert max_holding_item.risk_context["close_exit_date"] == "2026-06-17"
+        order = session.scalar(
+            select(BrokerOrder).where(BrokerOrder.execution_plan_item_id == max_holding_item.id)
+        )
+        assert order is None
+
+    engine.dispose()
+
+
 def test_monitoring_rearms_stop_to_breakeven_after_partial_take_profit() -> None:
     broker_adapter = StubBrokerAdapter(
         config=BrokerConfig(
