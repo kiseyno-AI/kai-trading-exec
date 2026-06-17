@@ -329,6 +329,33 @@ the latest error remains on the broker order and is surfaced in symbol runtime
 details so unsafe target/stop sells are clearly blocked instead of silently
 assuming there is no position.
 
+Rejected KIS orders from reconciliation now receive an explicit retry decision
+before they become terminal. The current integrated source is KIS
+`inquire-daily-ccld` (`TTTC0081R` live / `VTTC0081R` paper), plus any structured
+reject reason or market-operation context already present in the adapter payload.
+When richer KIS feeds are connected, the retry classifier is designed to consume
+domestic execution notices (`H0STCNI0`, including accept/reject fields such as
+`RFUS_YN` / `ACPT_YN`), market-operation streams (`H0STMKO0` / `H0UNMKO0`), and
+VI/orderability REST context such as `inquire-vi-status`. Sparse daily-ccld
+payloads that only say `매도거부` without a market/orderability reason remain
+conservatively unclassified and are not retried.
+
+Retry decisions are stored on `execution_failures` and audited in
+`broker_order_events` with:
+- reject code/message/source payload
+- market/security operation state when available
+- inferred classification (`temporary_market_state`, insufficient
+  cash/holdings, permanent, or unknown)
+- retry decision (`scheduled`, `skipped`, `exhausted`, `submitted`)
+- next retry time, deadline, max attempts, retry job id, and retry lineage
+
+Temporary market/orderability rejects schedule a bounded
+`broker_order_retry` execution job. Dispatch revalidates current holdings/cash,
+buying power/orderable quantity where available, duplicate active orders, and
+active plan intent before submitting through the normal `/orders` idempotency
+path. Permanent rejects such as insufficient cash or insufficient sellable
+quantity record `skipped` and do not create retry jobs.
+
 ### `POST /execution-jobs/dispatch`
 Manually dispatch due execution jobs through the broker adapter boundary.
 
@@ -344,6 +371,8 @@ Current response includes:
 - `retrying_job_count`
 - `failed_job_count`
 - `jobs[]`
+
+`jobs[].job_type` can be `next_open_buy` or `broker_order_retry`.
 
 ## Monitoring APIs
 

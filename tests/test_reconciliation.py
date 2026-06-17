@@ -27,8 +27,22 @@ from app.core.config import Settings
 from app.db.base import Base
 from app.db.session import create_db_engine, create_session_factory
 from app.main import create_app
-from app.models.runtime import BrokerOrder, BrokerOrderEvent, ExecutionFill, ExecutionPlan, ExecutionPlanItem, ExecutionPosition
-from app.services.reconciliation import reconcile_broker_order, sync_execution_positions_from_broker_snapshot
+from app.models.runtime import (
+    BrokerOrder,
+    BrokerOrderEvent,
+    ExecutionFailure,
+    ExecutionFill,
+    ExecutionJob,
+    ExecutionPlan,
+    ExecutionPlanItem,
+    ExecutionPosition,
+)
+from app.services.execution_jobs import dispatch_due_execution_jobs
+from app.services.reconciliation import (
+    reconcile_broker_order,
+    sync_execution_positions_from_broker_snapshot,
+)
+from app.services.runtime_controls import ControlCommand, resume_runtime
 
 
 OBSERVED_AT = datetime(2026, 5, 13, 9, 5, tzinfo=UTC)
@@ -141,6 +155,62 @@ def _order(
         submitted_at=OBSERVED_AT,
         request_metadata=request_metadata,
     )
+
+
+def _plan_backed_order(
+    *,
+    plan_id: str,
+    side: str,
+    intent: str,
+    symbol: str = "005930",
+    quantity: int = 2,
+    broker_order_id: str = "reject-1",
+    status: str = "submitted",
+    risk_context: dict[str, object] | None = None,
+) -> tuple[ExecutionPlan, ExecutionPlanItem, BrokerOrder]:
+    plan = ExecutionPlan(
+        external_plan_id=plan_id,
+        source="test",
+        mode="paper",
+        market_date=OBSERVED_AT.date(),
+    )
+    item = ExecutionPlanItem(
+        plan=plan,
+        plan_item_index=0,
+        symbol=symbol,
+        side=side,
+        intent=intent,
+        status="broker_order_submitted",
+        quantity_policy={"kind": "shares", "quantity": quantity},
+        limit_price=Decimal("71000"),
+        time_in_force="day",
+        risk_context=risk_context,
+    )
+    order = BrokerOrder(
+        broker_name="kis",
+        mode="paper",
+        idempotency_key=f"test:{broker_order_id}",
+        broker_order_id=broker_order_id,
+        symbol=symbol,
+        side=side,
+        status=status,
+        quantity=quantity,
+        limit_price=Decimal("71000"),
+        submitted_at=OBSERVED_AT,
+        request_metadata={
+            "source": "test",
+            "time_in_force": "day",
+            "route": {"exchange": "KRX"},
+        },
+    )
+    order.plan_item = item
+    return plan, item, order
+
+
+def _utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
 
 
 def test_reconcile_full_fill_is_idempotent_and_updates_position_snapshot() -> None:
@@ -766,4 +836,383 @@ def test_reconcile_repeated_generic_failures_are_deduped_with_unknown_classifica
     assert second["message"] == first["message"]
     assert len(events) == 1
     assert events[0].error_classification == "unknown"
+    engine.dispose()
+
+
+def test_reconcile_kospi_circuit_breaker_sell_reject_schedules_retry() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        kis_app_key="***",
+        kis_app_secret="***",
+        kis_account_number="12345678",
+    )
+    engine, db = _session(settings)
+    plan, item, order = _plan_backed_order(
+        plan_id="plan-kospi-circuit-breaker-retry",
+        side="sell",
+        intent="stop_sell",
+        symbol="009180",
+        quantity=325,
+        broker_order_id="kospi-cb-1",
+    )
+    db.add_all([plan, order])
+    db.commit()
+    broker = ReconciliationStubBroker(
+        reconcile_payloads=[
+            {
+                "broker_order_id": "kospi-cb-1",
+                "status": "rejected",
+                "broker_status": "매도거부",
+                "message": "KOSPI circuit breaker trading halt",
+                "observed_at": OBSERVED_AT.isoformat(),
+                "market_state": {
+                    "state": "circuit_breaker",
+                    "reason": "KOSPI circuit breaker trading halt",
+                    "normal_ordering_available": False,
+                },
+                "payload": {"odno": "kospi-cb-1", "sll_buy_dvsn_cd_name": "매도거부"},
+            }
+        ]
+    )
+
+    result = reconcile_broker_order(settings=settings, db=db, adapter=broker, order=order)
+
+    failure = db.scalar(
+        select(ExecutionFailure).where(ExecutionFailure.broker_order_pk == order.id)
+    )
+    job = db.scalar(select(ExecutionJob).where(ExecutionJob.execution_plan_item_id == item.id))
+    events = db.scalars(
+        select(BrokerOrderEvent).where(BrokerOrderEvent.event_type == "retry_decision")
+    ).all()
+    assert result["status"] == "retry_pending"
+    assert order.status == "retry_pending"
+    assert item.status == "broker_order_retry_pending"
+    assert failure is not None
+    assert failure.classification == "temporary_market_state"
+    assert failure.retry_decision_status == "scheduled"
+    assert failure.retry_decision_reason == "temporary_circuit_breaker"
+    assert failure.retry_next_at is not None
+    assert _utc(failure.retry_next_at) == OBSERVED_AT + timedelta(minutes=20)
+    assert job is not None
+    assert job.job_type == "broker_order_retry"
+    assert job.status == "scheduled"
+    assert events and events[0].retryable is True
+    engine.dispose()
+
+
+def test_reconcile_kosdaq_sidecar_sell_reject_schedules_delayed_retry() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        kis_app_key="***",
+        kis_app_secret="***",
+        kis_account_number="12345678",
+    )
+    engine, db = _session(settings)
+    plan, item, order = _plan_backed_order(
+        plan_id="plan-kosdaq-sidecar-retry",
+        side="sell",
+        intent="target_sell",
+        symbol="086790",
+        quantity=4,
+        broker_order_id="kosdaq-sidecar-1",
+    )
+    db.add_all([plan, order])
+    db.commit()
+    broker = ReconciliationStubBroker(
+        reconcile_payloads=[
+            {
+                "broker_order_id": "kosdaq-sidecar-1",
+                "status": "rejected",
+                "broker_status": "매도거부",
+                "message": "KOSDAQ sell sidecar temporary orderability window",
+                "observed_at": OBSERVED_AT.isoformat(),
+                "market_operation_state": {
+                    "state": "sidecar",
+                    "reason": "KOSDAQ sidecar",
+                    "normal_ordering_available": False,
+                },
+                "payload": {"odno": "kosdaq-sidecar-1"},
+            }
+        ]
+    )
+
+    reconcile_broker_order(settings=settings, db=db, adapter=broker, order=order)
+
+    failure = db.scalar(
+        select(ExecutionFailure).where(ExecutionFailure.broker_order_pk == order.id)
+    )
+    job = db.scalar(select(ExecutionJob).where(ExecutionJob.execution_plan_item_id == item.id))
+    assert failure is not None
+    assert failure.classification == "temporary_market_state"
+    assert failure.retry_decision_status == "scheduled"
+    assert failure.retry_decision_reason == "temporary_sidecar"
+    assert failure.retry_next_at is not None
+    assert _utc(failure.retry_next_at) == OBSERVED_AT + timedelta(minutes=5)
+    assert job is not None
+    assert _utc(job.scheduled_for) == OBSERVED_AT + timedelta(minutes=5)
+    engine.dispose()
+
+
+def test_reconcile_insufficient_holdings_sell_reject_does_not_retry() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        kis_app_key="***",
+        kis_app_secret="***",
+        kis_account_number="12345678",
+    )
+    engine, db = _session(settings)
+    plan, item, order = _plan_backed_order(
+        plan_id="plan-insufficient-holdings-no-retry",
+        side="sell",
+        intent="stop_sell",
+        quantity=3,
+        broker_order_id="sell-insufficient-1",
+    )
+    db.add_all([plan, order])
+    db.commit()
+    broker = ReconciliationStubBroker(
+        reconcile_payloads=[
+            {
+                "broker_order_id": "sell-insufficient-1",
+                "status": "rejected",
+                "broker_status": "INSUFFICIENT_SELLABLE_QTY",
+                "message": "insufficient sellable quantity",
+                "observed_at": OBSERVED_AT.isoformat(),
+                "payload": {
+                    "msg_cd": "INSUFFICIENT_SELLABLE_QTY",
+                    "msg1": "insufficient sellable quantity",
+                },
+            }
+        ]
+    )
+
+    reconcile_broker_order(settings=settings, db=db, adapter=broker, order=order)
+
+    failure = db.scalar(
+        select(ExecutionFailure).where(ExecutionFailure.broker_order_pk == order.id)
+    )
+    assert failure is not None
+    assert failure.classification == "insufficient_sellable_quantity"
+    assert failure.retry_decision_status == "skipped"
+    assert failure.retry_decision_reason == "permanent_insufficient_sellable_quantity"
+    assert (
+        db.scalar(select(ExecutionJob).where(ExecutionJob.execution_plan_item_id == item.id))
+        is None
+    )
+    assert order.status == "rejected"
+    assert item.status == "broker_order_rejected"
+    engine.dispose()
+
+
+def test_reconcile_insufficient_cash_buy_reject_does_not_retry() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        kis_app_key="***",
+        kis_app_secret="***",
+        kis_account_number="12345678",
+    )
+    engine, db = _session(settings)
+    plan, item, order = _plan_backed_order(
+        plan_id="plan-insufficient-cash-no-retry",
+        side="buy",
+        intent="next_open_buy",
+        quantity=5,
+        broker_order_id="buy-insufficient-1",
+    )
+    db.add_all([plan, order])
+    db.commit()
+    broker = ReconciliationStubBroker(
+        reconcile_payloads=[
+            {
+                "broker_order_id": "buy-insufficient-1",
+                "status": "rejected",
+                "broker_status": "INSUFFICIENT_CASH",
+                "message": "insufficient cash available for order",
+                "observed_at": OBSERVED_AT.isoformat(),
+                "payload": {
+                    "msg_cd": "INSUFFICIENT_CASH",
+                    "msg1": "insufficient cash available for order",
+                },
+            }
+        ]
+    )
+
+    reconcile_broker_order(settings=settings, db=db, adapter=broker, order=order)
+
+    failure = db.scalar(
+        select(ExecutionFailure).where(ExecutionFailure.broker_order_pk == order.id)
+    )
+    assert failure is not None
+    assert failure.classification == "insufficient_funds"
+    assert failure.retry_decision_status == "skipped"
+    assert failure.retry_decision_reason == "permanent_insufficient_funds"
+    assert (
+        db.scalar(select(ExecutionJob).where(ExecutionJob.execution_plan_item_id == item.id))
+        is None
+    )
+    engine.dispose()
+
+
+def test_reconcile_expired_buy_signal_temp_reject_does_not_retry() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        kis_app_key="***",
+        kis_app_secret="***",
+        kis_account_number="12345678",
+    )
+    engine, db = _session(settings)
+    plan, item, order = _plan_backed_order(
+        plan_id="plan-expired-buy-signal-no-retry",
+        side="buy",
+        intent="next_open_buy",
+        quantity=5,
+        broker_order_id="buy-expired-temp-1",
+        risk_context={"signal_expires_at": (OBSERVED_AT - timedelta(minutes=1)).isoformat()},
+    )
+    db.add_all([plan, order])
+    db.commit()
+    broker = ReconciliationStubBroker(
+        reconcile_payloads=[
+            {
+                "broker_order_id": "buy-expired-temp-1",
+                "status": "rejected",
+                "broker_status": "MARKET_CLOSED",
+                "message": "temporary market closed orderability window",
+                "observed_at": OBSERVED_AT.isoformat(),
+                "market_state": {
+                    "normal_ordering_available": False,
+                    "reopen_at": (OBSERVED_AT + timedelta(minutes=5)).isoformat(),
+                },
+                "payload": {"msg_cd": "MARKET_CLOSED"},
+            }
+        ]
+    )
+
+    reconcile_broker_order(settings=settings, db=db, adapter=broker, order=order)
+
+    failure = db.scalar(
+        select(ExecutionFailure).where(ExecutionFailure.broker_order_pk == order.id)
+    )
+    assert failure is not None
+    assert failure.classification == "temporary_market_state"
+    assert failure.retry_decision_status == "skipped"
+    assert failure.retry_decision_reason == "expired_buy_signal"
+    assert (
+        db.scalar(select(ExecutionJob).where(ExecutionJob.execution_plan_item_id == item.id))
+        is None
+    )
+    engine.dispose()
+
+
+def test_retry_job_dispatch_and_reconciliation_rerun_do_not_duplicate_retry_order() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        kis_app_key="***",
+        kis_app_secret="***",
+        kis_account_number="12345678",
+    )
+    engine, db = _session(settings)
+    plan, item, order = _plan_backed_order(
+        plan_id="plan-retry-rerun-idempotent",
+        side="sell",
+        intent="stop_sell",
+        symbol="024110",
+        quantity=20,
+        broker_order_id="retry-rerun-source-1",
+    )
+    db.add_all([plan, order])
+    db.commit()
+    retry_at = OBSERVED_AT + timedelta(minutes=1)
+    broker = ReconciliationStubBroker(
+        reconcile_payloads=[
+            {
+                "broker_order_id": "retry-rerun-source-1",
+                "status": "rejected",
+                "broker_status": "매도거부",
+                "message": "temporary trading halt",
+                "observed_at": OBSERVED_AT.isoformat(),
+                "market_state": {
+                    "state": "halt",
+                    "reason": "trading halt",
+                    "normal_ordering_available": False,
+                    "reopen_at": retry_at.isoformat(),
+                },
+                "payload": {"odno": "retry-rerun-source-1"},
+            }
+        ],
+        account_snapshot=BrokerAccountSnapshot(
+            available_cash=Decimal("1000000"),
+            observed_at=OBSERVED_AT,
+            source="stub:account_snapshot",
+            holdings=[
+                BrokerAccountHolding(
+                    symbol="024110",
+                    quantity=20,
+                    average_price=Decimal("71000"),
+                    sellable_quantity=20,
+                )
+            ],
+        ),
+        order_placement=BrokerOrderPlacement(
+            broker_order_id="retry-child-1",
+            normalized_status=NormalizedBrokerOrderStatus.SUBMITTED,
+            broker_status="0",
+            submitted_at=retry_at,
+            observed_at=retry_at,
+            request_metadata={"provider": "kis"},
+            response_metadata={"provider": "kis"},
+            request_payload={},
+            response_payload={"rt_cd": "0"},
+            message="accepted",
+        ),
+    )
+
+    reconcile_broker_order(settings=settings, db=db, adapter=broker, order=order)
+    resume_runtime(
+        settings=settings,
+        db=db,
+        command=ControlCommand(actor="ops", source="test", reason="enable retry dispatch"),
+    )
+    first_dispatch = dispatch_due_execution_jobs(
+        settings=settings,
+        db=db,
+        adapter=broker,
+        now=retry_at + timedelta(seconds=1),
+    )
+    assert first_dispatch.payload["completed_job_count"] == 1, first_dispatch.payload
+    assert len(broker.order_calls) == 1
+
+    db.refresh(order)
+    reconcile_broker_order(settings=settings, db=db, adapter=broker, order=order)
+    second_dispatch = dispatch_due_execution_jobs(
+        settings=settings,
+        db=db,
+        adapter=broker,
+        now=retry_at + timedelta(seconds=2),
+    )
+
+    jobs = db.scalars(
+        select(ExecutionJob).where(ExecutionJob.execution_plan_item_id == item.id)
+    ).all()
+    orders = db.scalars(
+        select(BrokerOrder).where(BrokerOrder.execution_plan_item_id == item.id)
+    ).all()
+    retry_orders = [candidate for candidate in orders if candidate.id != order.id]
+    failure = db.scalar(
+        select(ExecutionFailure).where(ExecutionFailure.broker_order_pk == order.id)
+    )
+    assert second_dispatch.payload["due_job_count"] == 0
+    assert len(broker.order_calls) == 1
+    assert len(jobs) == 1
+    assert len(retry_orders) == 1
+    assert retry_orders[0].idempotency_key.startswith(f"retry:{order.id}:")
+    assert failure is not None
+    assert failure.retry_decision_status == "submitted"
+    assert item.status == "broker_order_submitted"
     engine.dispose()

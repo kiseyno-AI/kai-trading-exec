@@ -17,6 +17,12 @@ from app.broker.base import (
 from app.core.config import Settings
 from app.models.runtime import BrokerOrder, ExecutionJob, ExecutionPlan, ExecutionPlanItem, new_id
 from app.services.broker_orders import place_broker_order
+from app.services.rejected_order_retries import (
+    BROKER_ORDER_RETRY_JOB_TYPE,
+    RetryOrderGuardError,
+    build_rejected_order_retry_request,
+    record_retry_dispatch_result,
+)
 from app.services.runtime_controls import (
     automated_order_submission_allowed,
     automated_order_submission_block_reason,
@@ -221,7 +227,7 @@ def _claim_job(
     job.locked_at = triggered_at
     job.attempts += 1
     job.last_error = None
-    job.plan_item.status = "next_open_buy_dispatching"
+    job.plan_item.status = _dispatching_plan_item_status(job.job_type)
     db.commit()
 
 
@@ -254,7 +260,7 @@ def _recover_stale_running_jobs(
         job.status = "retrying"
         job.locked_at = None
         job.last_error = "recovered stale running job after interrupted dispatch"
-        job.plan_item.status = "next_open_buy_retry_pending"
+        job.plan_item.status = _retrying_plan_item_status(job.job_type)
         recovered_any = True
 
     if recovered_any:
@@ -276,7 +282,20 @@ def _dispatch_job(
     assert job is not None
 
     try:
-        command = _build_place_order_request(job)
+        command = _build_place_order_request(
+            settings=settings,
+            db=db,
+            adapter=adapter,
+            job=job,
+        )
+    except RetryOrderGuardError as exc:
+        return _finish_job(
+            db=db,
+            job_id=job_id,
+            status=exc.job_status,
+            last_error=str(exc),
+            plan_item_status=exc.plan_item_status,
+        )
     except ValueError as exc:
         return _finish_job(
             db=db,
@@ -294,13 +313,21 @@ def _dispatch_job(
             command=command,
             request_source=f"execution-job:{job.id}",
         )
+        if job.job_type == BROKER_ORDER_RETRY_JOB_TYPE:
+            record_retry_dispatch_result(
+                settings=settings,
+                db=db,
+                job=job,
+                result_payload=result.payload,
+                recorded_at=datetime.now(UTC),
+            )
     except Exception as exc:
         return _finish_job(
             db=db,
             job_id=job_id,
             status="retrying",
             last_error=f"{exc.__class__.__name__}: {exc}",
-            plan_item_status="next_open_buy_retry_pending",
+            plan_item_status=_retrying_plan_item_status(job.job_type),
         )
 
     order_payload = result.payload.get("order")
@@ -327,6 +354,7 @@ def _dispatch_job(
     finished_from_order_status = _finish_job_from_order_status(
         db=db,
         job_id=job_id,
+        job_type=job.job_type,
         payload=result.payload,
         order_status=order_status,
     )
@@ -338,14 +366,14 @@ def _dispatch_job(
             job_id=job_id,
             status="failed",
             last_error="duplicate broker order exists with an unrecognized status",
-            plan_item_status="next_open_buy_failed",
+            plan_item_status=_failed_plan_item_status(job.job_type),
         )
     return _finish_job(
         db=db,
         job_id=job_id,
         status="failed",
         last_error=str(result.payload.get("message") or "broker order submission failed"),
-        plan_item_status="next_open_buy_failed",
+        plan_item_status=_failed_plan_item_status(job.job_type),
     )
 
 
@@ -390,6 +418,7 @@ def _finish_job_from_order_status(
     *,
     db: Session,
     job_id: str,
+    job_type: str,
     payload: dict[str, object],
     order_status: str | None,
 ) -> str | None:
@@ -407,7 +436,7 @@ def _finish_job_from_order_status(
             job_id=job_id,
             status="retrying",
             last_error=_retrying_job_message(payload=payload, order_status=order_status),
-            plan_item_status="next_open_buy_retry_pending",
+            plan_item_status=_retrying_plan_item_status(job_type),
         )
     if order_status in FAILED_JOB_ORDER_STATUSES:
         return _finish_job(
@@ -415,7 +444,7 @@ def _finish_job_from_order_status(
             job_id=job_id,
             status="failed",
             last_error=_failed_job_message(payload=payload, order_status=order_status),
-            plan_item_status="next_open_buy_failed",
+            plan_item_status=_failed_plan_item_status(job_type),
         )
     return None
 
@@ -452,7 +481,24 @@ def _failed_job_message(
     return f"broker order submission ended in {order_status}"
 
 
-def _build_place_order_request(job: ExecutionJob) -> PlaceOrderRequest:
+def _build_place_order_request(
+    *,
+    settings: Settings,
+    db: Session,
+    adapter: BrokerAdapter,
+    job: ExecutionJob,
+) -> PlaceOrderRequest:
+    if job.job_type == BROKER_ORDER_RETRY_JOB_TYPE:
+        return build_rejected_order_retry_request(
+            settings=settings,
+            db=db,
+            adapter=adapter,
+            job=job,
+            triggered_at=job.locked_at or datetime.now(UTC),
+        )
+    if job.job_type != NEXT_OPEN_BUY_JOB_TYPE:
+        raise ValueError(f"unsupported execution job type: {job.job_type}")
+
     plan_item = job.plan_item
     quantity = _next_open_buy_quantity(plan_item)
     if quantity is None:
@@ -565,6 +611,24 @@ def _is_due(job: ExecutionJob, triggered_at: datetime) -> bool:
     if scheduled_for is None:
         return True
     return _normalize_utc(scheduled_for) <= triggered_at
+
+
+def _dispatching_plan_item_status(job_type: str) -> str:
+    if job_type == BROKER_ORDER_RETRY_JOB_TYPE:
+        return "broker_order_retry_dispatching"
+    return "next_open_buy_dispatching"
+
+
+def _retrying_plan_item_status(job_type: str) -> str:
+    if job_type == BROKER_ORDER_RETRY_JOB_TYPE:
+        return "broker_order_retry_pending"
+    return "next_open_buy_retry_pending"
+
+
+def _failed_plan_item_status(job_type: str) -> str:
+    if job_type == BROKER_ORDER_RETRY_JOB_TYPE:
+        return "broker_order_failed"
+    return "next_open_buy_failed"
 
 
 def _is_stale_running_job(
