@@ -75,6 +75,7 @@ RETRYABLE_WATCH_BUY_APPROVAL_REASONS = frozenset(
     {
         "account_snapshot_unavailable",
         "exec_agent_sizing_pending",
+        "invalid_stop_distance",
     }
 )
 PENDING_DISPATCH_MONITORING_STATUSES = frozenset(

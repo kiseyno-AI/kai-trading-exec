@@ -2413,6 +2413,74 @@ def test_watch_buy_candidate_default_entry_blocks_above_chase_limit() -> None:
     engine.dispose()
 
 
+def test_watch_buy_candidate_waits_when_entry_is_below_stop_then_retries() -> None:
+    app, engine, client, broker_adapter = _build_watch_buy_test_app(
+        order_id="kis-watch-buy-entry-below-stop-1"
+    )
+    item_id = _create_watch_buy_candidate(
+        client,
+        plan_id="plan-watch-buy-entry-below-stop-1",
+        trigger_price="71000.00",
+        chase_limit_price="71200.00",
+        risk_context={
+            "exchange": "KRX",
+            "stop_price": "70000.00",
+        },
+    )
+
+    blocked = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "entry below stop should wait for recovery",
+            "prices": [{"symbol": "005930", "price": "69900.00"}],
+        },
+    )
+
+    assert blocked.status_code == 200
+    blocked_payload = blocked.json()
+    assert blocked_payload["submitted_order_count"] == 0
+    assert blocked_payload["blocked_item_count"] == 1
+    assert blocked_payload["items"][0]["outcome"] == "blocked"
+    assert blocked_payload["items"][0]["block_reason"] == "invalid_stop_distance"
+    assert broker_adapter.order_calls == []
+
+    with app.state.db_session_factory() as session:
+        item = session.get(ExecutionPlanItem, item_id)
+        assert item is not None
+        assert item.status == "watch_buy_triggered_blocked"
+        event = item.risk_context["last_monitoring_event"]
+        item.risk_context = {
+            **item.risk_context,
+            "last_monitoring_event": {
+                **event,
+                "recorded_at": (datetime.now(UTC) - timedelta(seconds=10)).isoformat(),
+            },
+        }
+        flag_modified(item, "risk_context")
+        session.commit()
+
+    retry = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "entry recovered above stop should submit",
+            "prices": [{"symbol": "005930", "price": "70900.00"}],
+        },
+    )
+
+    assert retry.status_code == 200
+    retry_payload = retry.json()
+    assert retry_payload["submitted_order_count"] == 1
+    assert retry_payload["items"][0]["outcome"] == "submitted"
+    assert len(broker_adapter.order_calls) == 1
+    assert broker_adapter.order_calls[0].limit_price == Decimal("70900.00")
+
+    engine.dispose()
+
+
 def test_watch_buy_day_high_cross_waits_when_only_stale_aggregate_crossed() -> None:
     app, engine, client, broker_adapter = _build_watch_buy_test_app(
         order_id="kis-watch-buy-day-high-cross-1"
