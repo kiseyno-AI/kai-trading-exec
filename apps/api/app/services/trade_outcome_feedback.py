@@ -72,11 +72,14 @@ def load_latest_trade_outcome_feedback_snippet(settings: Settings) -> dict[str, 
         payload = json.loads(latest_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
+    if payload.get("mode") != settings.runtime_mode:
+        return None
     snippet = payload.get("prompt_snippet")
     if not isinstance(snippet, dict):
         return None
     return {
         "version": payload.get("version"),
+        "mode": payload.get("mode"),
         "generated_at": payload.get("generated_at"),
         "lookback_days": payload.get("lookback_days"),
         "closed_trade_count": payload.get("closed_trade_count"),

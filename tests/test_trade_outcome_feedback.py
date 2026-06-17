@@ -142,6 +142,7 @@ def test_exec_agent_payloads_include_latest_trade_outcome_feedback(tmp_path) -> 
         """
 {
   "version": "trade-outcome-feedback-v1",
+  "mode": "paper",
   "generated_at": "2026-06-12T00:00:00+00:00",
   "lookback_days": 20,
   "closed_trade_count": 1,
@@ -203,3 +204,28 @@ def test_exec_agent_payloads_include_latest_trade_outcome_feedback(tmp_path) -> 
 
     session.close()
     engine.dispose()
+
+
+def test_latest_trade_outcome_feedback_ignores_other_runtime_modes(tmp_path) -> None:
+    settings = Settings(runtime_mode="live", trade_outcome_feedback_dir=str(tmp_path))
+    (tmp_path / "latest.json").write_text(
+        """
+{
+  "version": "trade-outcome-feedback-v1",
+  "mode": "paper",
+  "generated_at": "2026-06-12T00:00:00+00:00",
+  "lookback_days": 20,
+  "closed_trade_count": 1,
+  "summary": {"realized_pnl_krw": "-10000.0000"},
+  "prompt_snippet": {
+    "summary": "Recent closed trades: pnl=-10000.0000 KRW",
+    "patterns_to_downsize_or_reject": ["Downsize standard_breakout"],
+    "positive_expectancy_patterns": [],
+    "required_hard_gates": ["Reject repeat worst-loss setups"]
+  }
+}
+""".strip(),
+        encoding="utf-8",
+    )
+
+    assert load_latest_trade_outcome_feedback_snippet(settings) is None
