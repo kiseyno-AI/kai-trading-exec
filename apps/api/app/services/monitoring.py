@@ -559,19 +559,6 @@ def _evaluate_monitoring_cycle(
                 trigger_reason = profit_protection.reason
                 trigger_metadata = profit_protection.metadata
 
-        if trigger_reason is None:
-            if item.status in (
-                BLOCKED_MONITORING_STATUSES | PENDING_DISPATCH_MONITORING_STATUSES
-            ) or item.status in AGENT_ACTIVE_STATUSES:
-                item.status = _monitoring_status(item.intent)
-            result_by_item_id[item.id] = _monitoring_result_payload(
-                item=item,
-                observed_price=observed_price,
-                outcome="waiting",
-                message="trigger condition not met",
-            )
-            continue
-
         if _is_watch_buy_item(item) and observed_price is not None:
             chase_limit_price = _watch_buy_chase_limit_price(item)
             if chase_limit_price is not None and observed_price > chase_limit_price:
@@ -597,8 +584,25 @@ def _evaluate_monitoring_cycle(
                     outcome="blocked",
                     block_reason="price_above_chase_limit",
                     message="observed price is above chase_limit_price; monitoring remains active",
+                    trigger_reason=trigger_reason,
+                    trigger_metadata=trigger_metadata,
                 )
                 continue
+
+        if trigger_reason is None:
+            if item.status in (
+                BLOCKED_MONITORING_STATUSES | PENDING_DISPATCH_MONITORING_STATUSES
+            ) or item.status in AGENT_ACTIVE_STATUSES:
+                item.status = _monitoring_status(item.intent)
+            result_by_item_id[item.id] = _monitoring_result_payload(
+                item=item,
+                observed_price=observed_price,
+                outcome="waiting",
+                message="trigger condition not met",
+            )
+            continue
+
+        if _is_watch_buy_item(item) and observed_price is not None:
             risk_gate = _watch_buy_high_risk_gate_rejection(
                 settings=settings,
                 item=item,

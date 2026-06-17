@@ -2373,6 +2373,46 @@ def test_watch_buy_candidate_defaults_to_entry_at_or_below_buy_line() -> None:
     engine.dispose()
 
 
+def test_watch_buy_candidate_default_entry_blocks_above_chase_limit() -> None:
+    app, engine, client, broker_adapter = _build_watch_buy_test_app(
+        order_id="kis-watch-buy-entry-line-above-chase-1"
+    )
+    item_id = _create_watch_buy_candidate(
+        client,
+        plan_id="plan-watch-buy-entry-line-above-chase-1",
+        trigger_price="71000.00",
+        chase_limit_price="71200.00",
+    )
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "default watch buy should not chase above limit",
+            "prices": [{"symbol": "005930", "price": "71300.00"}],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["triggered_item_count"] == 1
+    assert payload["submitted_order_count"] == 0
+    assert payload["blocked_item_count"] == 1
+    assert payload["items"][0]["outcome"] == "blocked"
+    assert payload["items"][0]["block_reason"] == "price_above_chase_limit"
+    assert payload["items"][0]["direction"] == "at_or_below"
+    assert broker_adapter.order_calls == []
+
+    with app.state.db_session_factory() as session:
+        item = session.get(ExecutionPlanItem, item_id)
+        assert item is not None
+        assert item.status == "watch_monitoring_active"
+        assert item.risk_context["last_monitoring_event"]["reason"] == "price_above_chase_limit"
+
+    engine.dispose()
+
+
 def test_watch_buy_day_high_cross_waits_when_only_stale_aggregate_crossed() -> None:
     app, engine, client, broker_adapter = _build_watch_buy_test_app(
         order_id="kis-watch-buy-day-high-cross-1"
