@@ -16,6 +16,7 @@ from app.broker.base import (
 from app.core.config import Settings
 from app.models.runtime import BrokerOrder, BrokerOrderEvent, ExecutionFill, ExecutionPosition
 from app.services.broker_auth import ensure_authenticated_broker_session
+from app.services.rejected_order_retries import handle_reconciled_rejected_order
 
 
 def reconcile_broker_orders(
@@ -138,7 +139,6 @@ def reconcile_broker_order(
             "message": "unrecognized broker status",
         }
 
-    status_changed = order.status != normalized_status
     order.status = normalized_status
     fills_added = _upsert_order_fills(
         db=db,
@@ -149,23 +149,14 @@ def reconcile_broker_order(
         order=order,
         payload=payload,
     )
-    order.last_error_classification = None
-    order.last_error_code = None
-    order.last_error_message = None
-    order.last_error_retryable = None
     order.last_broker_sync_at = event_time
-
-    if order.plan_item is not None:
-        plan_status = _order_status_to_plan_item_status(order.status)
-        if plan_status is not None:
-            order.plan_item.status = plan_status
 
     db.add(
         BrokerOrderEvent(
             broker_order_pk=order.id,
             event_type="reconcile_result",
             event_source=BrokerEventSource.RECONCILIATION.value,
-            normalized_status=order.status,
+            normalized_status=normalized_status,
             broker_status=_optional_str(payload.get("broker_status")),
             message=_optional_str(payload.get("message")),
             request_payload=_dict_or_none(payload.get("request_payload")),
@@ -175,6 +166,32 @@ def reconcile_broker_order(
         )
     )
 
+    retry_failure = None
+    if normalized_status == NormalizedBrokerOrderStatus.REJECTED.value:
+        retry_failure = handle_reconciled_rejected_order(
+            settings=settings,
+            db=db,
+            order=order,
+            payload=payload,
+            observed_at=event_time,
+        )
+    else:
+        order.last_error_classification = None
+        order.last_error_code = None
+        order.last_error_message = None
+        order.last_error_retryable = None
+
+    if order.plan_item is not None:
+        retry_already_submitted = (
+            retry_failure is not None
+            and retry_failure.retry_decision_status in {"submitted", "completed"}
+        )
+        if not retry_already_submitted:
+            plan_status = _order_status_to_plan_item_status(order.status)
+            if plan_status is not None:
+                order.plan_item.status = plan_status
+
+    status_changed = order.status != order_status_before
     db.commit()
     db.refresh(order)
     return {
