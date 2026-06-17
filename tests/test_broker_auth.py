@@ -2154,22 +2154,23 @@ def test_core_active_short_term_handoff_becomes_runtime_buy_watch_with_segments(
     assert blocked_item["tactical_action"] == "avoid_chase"
     assert blocked_item["blocker_reason"] == "tactical_action_avoid_chase_is_not_active_buy_monitoring"
 
-    waiting = client.post(
+    blocked = client.post(
         "/monitoring/evaluate",
         json={
             "actor": "ops",
             "source": "test",
-            "reason": "below trigger",
+            "reason": "below buy line",
             "prices": [{"symbol": "005930", "price": "70900.00"}],
         },
     )
-    assert waiting.status_code == 200
-    waiting_item = waiting.json()["items"][0]
-    assert waiting_item["outcome"] == "waiting"
-    assert waiting_item["tactical_action"] == "watch_for_trigger"
-    assert waiting_item["target_price"] == "72500.0000"
-    assert waiting_item["stop_loss_price"] == "70000.0000"
-    assert waiting_item["current_price"] == "70900.0000"
+    assert blocked.status_code == 200
+    blocked_item = blocked.json()["items"][0]
+    assert blocked_item["outcome"] == "blocked"
+    assert blocked_item["block_reason"] == "paused"
+    assert blocked_item["tactical_action"] == "watch_for_trigger"
+    assert blocked_item["target_price"] == "72500.0000"
+    assert blocked_item["stop_loss_price"] == "70000.0000"
+    assert blocked_item["current_price"] == "70900.0000"
 
     runtime_status = client.get("/runtime/status").json()
     segments = runtime_status["liveness"]["monitoring"]["segments"]
@@ -2276,6 +2277,11 @@ def test_watch_buy_candidate_waits_until_trigger_then_submits_limit_buy() -> Non
     item_id = _create_watch_buy_candidate(
         client,
         plan_id="plan-watch-buy-trigger-1",
+        risk_context={
+            "exchange": "KRX",
+            "stop_price": "70000.00",
+            "trigger_direction": "at_or_above",
+        },
     )
 
     waiting = client.post(
@@ -2329,6 +2335,44 @@ def test_watch_buy_candidate_waits_until_trigger_then_submits_limit_buy() -> Non
     engine.dispose()
 
 
+def test_watch_buy_candidate_defaults_to_entry_at_or_below_buy_line() -> None:
+    app, engine, client, broker_adapter = _build_watch_buy_test_app(
+        order_id="kis-watch-buy-entry-line-1"
+    )
+    item_id = _create_watch_buy_candidate(
+        client,
+        plan_id="plan-watch-buy-entry-line-1",
+        trigger_price="71000.00",
+        chase_limit_price="71200.00",
+    )
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "default watch buy should enter at or below the buy line",
+            "prices": [{"symbol": "005930", "price": "70900.00"}],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["triggered_item_count"] == 1
+    assert payload["submitted_order_count"] == 1
+    assert payload["items"][0]["outcome"] == "submitted"
+    assert payload["items"][0]["trigger_reason"] == "next_open_buy"
+    assert payload["items"][0]["direction"] == "at_or_below"
+
+    assert len(broker_adapter.order_calls) == 1
+    order_call = broker_adapter.order_calls[0]
+    assert order_call.execution_plan_item_id == item_id
+    assert order_call.side == "buy"
+    assert order_call.limit_price == Decimal("70900.00")
+
+    engine.dispose()
+
+
 def test_watch_buy_day_high_cross_waits_when_only_stale_aggregate_crossed() -> None:
     app, engine, client, broker_adapter = _build_watch_buy_test_app(
         order_id="kis-watch-buy-day-high-cross-1"
@@ -2338,6 +2382,11 @@ def test_watch_buy_day_high_cross_waits_when_only_stale_aggregate_crossed() -> N
         plan_id="plan-watch-buy-day-high-cross-1",
         trigger_price="71000.00",
         chase_limit_price="71200.00",
+        risk_context={
+            "exchange": "KRX",
+            "stop_price": "70000.00",
+            "trigger_direction": "at_or_above",
+        },
     )
 
     triggered = client.post(
@@ -2382,6 +2431,11 @@ def test_watch_buy_persisted_trigger_cross_retries_when_price_returns_inside_cha
         plan_id="plan-watch-buy-persisted-cross-1",
         trigger_price="71000.00",
         chase_limit_price="71200.00",
+        risk_context={
+            "exchange": "KRX",
+            "stop_price": "70000.00",
+            "trigger_direction": "at_or_above",
+        },
     )
 
     blocked = client.post(
@@ -2442,6 +2496,7 @@ def test_watch_buy_pullback_below_trigger_bypasses_intraday_range_chase_block() 
         risk_context={
             "exchange": "KRX",
             "stop_price": "70000.00",
+            "trigger_direction": "at_or_above",
             "short_term_entry_quality": {
                 "day_low": "70000.00",
                 "day_high": "71400.00",
@@ -2578,6 +2633,7 @@ def test_watch_buy_intraday_range_gate_prefers_live_day_range_over_stale_context
         risk_context={
             "exchange": "KRX",
             "stop_price": "70000.00",
+            "trigger_direction": "at_or_above",
             "short_term_entry_quality": {
                 "day_low": "70000.00",
                 "day_high": "71400.00",
@@ -2786,6 +2842,11 @@ def test_watch_buy_waits_for_pullback_when_gap_above_chase_limit() -> None:
         plan_id="plan-watch-buy-chase-limit-1",
         trigger_price="71000.00",
         chase_limit_price="71100.00",
+        risk_context={
+            "exchange": "KRX",
+            "stop_price": "70000.00",
+            "trigger_direction": "at_or_above",
+        },
     )
 
     response = client.post(
@@ -2844,6 +2905,7 @@ def test_watch_buy_intraday_range_chase_block_keeps_monitoring_active() -> None:
         risk_context={
             "exchange": "KRX",
             "stop_price": "70000.00",
+            "trigger_direction": "at_or_above",
             "short_term_entry_quality": {
                 "day_low": "70000.00",
                 "day_high": "71400.00",
@@ -2889,6 +2951,7 @@ def test_watch_buy_rejects_high_atr_weak_trend_before_submit() -> None:
         risk_context={
             "exchange": "KRX",
             "stop_price": "70000.00",
+            "trigger_direction": "at_or_above",
             "short_term_entry_quality": {
                 "atr_pct_14": "9.4",
                 "ret20": "-2.1",
@@ -2933,7 +2996,7 @@ def test_watch_buy_rejects_missing_stop_without_submitting() -> None:
     item_id = _create_watch_buy_candidate(
         client,
         plan_id="plan-watch-buy-missing-stop-1",
-        risk_context={"exchange": "KRX"},
+        risk_context={"exchange": "KRX", "trigger_direction": "at_or_above"},
     )
 
     response = client.post(
@@ -2973,7 +3036,11 @@ def test_exec_agent_sized_watch_buy_waits_for_agent_quantity_without_submitting(
             "budget_krw": "0",
             "max_safe_notional_krw": "150000",
         },
-        risk_context={"exchange": "KRX", "stop_price": "70000.00"},
+        risk_context={
+            "exchange": "KRX",
+            "stop_price": "70000.00",
+            "trigger_direction": "at_or_above",
+        },
     )
 
     response = client.post(
@@ -3020,6 +3087,7 @@ def test_exec_agent_sized_watch_buy_uses_fallback_only_after_agent_attempts_exha
             "exchange": "KRX",
             "stop_price": "70000.00",
             "target_price": "72420.00",
+            "trigger_direction": "at_or_above",
         },
     )
 
@@ -3091,6 +3159,7 @@ def test_exec_agent_watch_sizing_response_materializes_stub_order_path() -> None
             "exchange": "KRX",
             "stop_price": "70000.00",
             "target_price": "72420.00",
+            "trigger_direction": "at_or_above",
         },
     )
 
@@ -3196,6 +3265,11 @@ def test_watch_buy_safety_pause_keeps_trigger_retryable() -> None:
     item_id = _create_watch_buy_candidate(
         client,
         plan_id="plan-watch-buy-paused-1",
+        risk_context={
+            "exchange": "KRX",
+            "stop_price": "70000.00",
+            "trigger_direction": "at_or_above",
+        },
     )
 
     response = client.post(
@@ -3264,6 +3338,11 @@ def test_watch_buy_account_snapshot_failure_keeps_trigger_retryable() -> None:
     item_id = _create_watch_buy_candidate(
         client,
         plan_id="plan-watch-buy-account-snapshot-retry-1",
+        risk_context={
+            "exchange": "KRX",
+            "stop_price": "70000.00",
+            "trigger_direction": "at_or_above",
+        },
     )
 
     response = client.post(
@@ -3379,6 +3458,7 @@ def test_budget_only_watch_buy_safety_block_keeps_trigger_retryable(
             "exchange": "KRX",
             "stop_price": "70000.00",
             "max_budget_krw": "150000.00",
+            "trigger_direction": "at_or_above",
         },
     )
 
@@ -3448,6 +3528,11 @@ def test_watch_buy_duplicate_monitor_cycles_do_not_submit_duplicate_order() -> N
     item_id = _create_watch_buy_candidate(
         client,
         plan_id="plan-watch-buy-dedupe-1",
+        risk_context={
+            "exchange": "KRX",
+            "stop_price": "70000.00",
+            "trigger_direction": "at_or_above",
+        },
     )
 
     first = client.post(

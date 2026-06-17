@@ -1041,9 +1041,11 @@ def _watch_buy_direction(item: ExecutionPlanItemRequest) -> str:
             value = source.get(key)
             if isinstance(value, str) and value.strip():
                 normalized = value.strip().lower()
+                if normalized in {"up", "above", "breakout", "momentum", ">=", "at_or_above"}:
+                    return "at_or_above"
                 if normalized in {"down", "below", "pullback", "dip", "<=", "at_or_below"}:
                     return "at_or_below"
-    return "at_or_above"
+    return "at_or_below"
 
 
 def _decimal_text(value: Decimal | None) -> str | None:
