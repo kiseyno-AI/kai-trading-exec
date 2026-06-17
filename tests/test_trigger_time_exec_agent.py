@@ -227,6 +227,65 @@ def test_trigger_time_buy_agent_context_approval_quantity_drives_submission(
     engine.dispose()
 
 
+def test_trigger_time_buy_agent_is_bypassed_for_default_entry_line_buy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, engine, client, broker_adapter, captured = _build_trigger_agent_app(
+        monkeypatch=monkeypatch,
+        agent_responses=[],
+    )
+    response = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-trigger-agent-default-entry-line-bypass",
+            "source": "kai-trading-core",
+            "market_date": "2026-06-05",
+            "items": [
+                {
+                    "symbol": "005930",
+                    "side": "buy",
+                    "intent": "intraday_watch_buy",
+                    "quantity_policy": {"kind": "shares", "quantity": 2},
+                    "trigger_price": "71000.00",
+                    "chase_limit_price": "71200.00",
+                    "time_in_force": "day",
+                    "risk_context": {
+                        "exchange": "KRX",
+                        "target_price": "72420.00",
+                        "stop_price": "70000.00",
+                        "trigger_direction": "at_or_below",
+                    },
+                }
+            ],
+        },
+    )
+    assert response.status_code == 201
+    item_id = response.json()["persisted_execution_item_ids"][0]
+
+    result = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "entry line buy should not call trigger-time agent",
+            "prices": [_live_price_payload(price="70900.00")],
+        },
+    )
+
+    assert result.status_code == 200
+    payload = result.json()
+    assert payload["submitted_order_count"] == 1
+    assert payload["items"][0]["outcome"] == "submitted"
+    assert payload["items"][0]["direction"] == "at_or_below"
+    assert captured == []
+    assert len(broker_adapter.order_calls) == 1
+    assert broker_adapter.order_calls[0].execution_plan_item_id == item_id
+    assert broker_adapter.order_calls[0].quantity == 2
+    assert broker_adapter.order_calls[0].limit_price == Decimal("70900.00")
+
+    engine.dispose()
+
+
 def test_trigger_time_buy_agent_is_bypassed_for_intraday_pullback_below_trigger(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
