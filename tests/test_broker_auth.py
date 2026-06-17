@@ -2321,7 +2321,7 @@ def test_watch_buy_candidate_waits_until_trigger_then_submits_limit_buy() -> Non
     engine.dispose()
 
 
-def test_watch_buy_day_high_cross_triggers_after_intraday_pullback() -> None:
+def test_watch_buy_day_high_cross_waits_when_only_stale_aggregate_crossed() -> None:
     app, engine, client, broker_adapter = _build_watch_buy_test_app(
         order_id="kis-watch-buy-day-high-cross-1"
     )
@@ -2351,24 +2351,16 @@ def test_watch_buy_day_high_cross_triggers_after_intraday_pullback() -> None:
 
     assert triggered.status_code == 200
     payload = triggered.json()
-    assert payload["triggered_item_count"] == 1
-    assert payload["submitted_order_count"] == 1
-    assert payload["items"][0]["outcome"] == "submitted"
-    assert payload["items"][0]["trigger_reason"] == "intraday_watch_buy_day_high_cross"
+    assert payload["triggered_item_count"] == 0
+    assert payload["submitted_order_count"] == 0
+    assert payload["items"][0]["outcome"] == "waiting"
 
-    assert len(broker_adapter.order_calls) == 1
-    order_call = broker_adapter.order_calls[0]
-    assert order_call.execution_plan_item_id == item_id
-    assert order_call.side == "buy"
-    assert order_call.limit_price == Decimal("70900.00")
+    assert broker_adapter.order_calls == []
 
     with app.state.db_session_factory() as session:
         item = session.get(ExecutionPlanItem, item_id)
         assert item is not None
-        trigger_cross = item.risk_context["watch_buy_trigger_cross"]
-        assert trigger_cross["reason"] == "intraday_watch_buy_day_high_cross"
-        assert trigger_cross["day_high"] == "71100.0000"
-        assert trigger_cross["day_low"] == "70500.0000"
+        assert "watch_buy_trigger_cross" not in item.risk_context
 
     engine.dispose()
 
@@ -2449,6 +2441,26 @@ def test_watch_buy_pullback_below_trigger_bypasses_intraday_range_chase_block() 
         },
     )
 
+    crossed = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "trigger crossed live but price is above chase",
+            "prices": [
+                {
+                    "symbol": "005930",
+                    "price": "71300.00",
+                    "day_low": "70000.00",
+                    "day_high": "71400.00",
+                }
+            ],
+        },
+    )
+    assert crossed.status_code == 200
+    assert crossed.json()["submitted_order_count"] == 0
+    assert crossed.json()["items"][0]["block_reason"] == "price_above_chase_limit"
+
     response = client.post(
         "/monitoring/evaluate",
         json={
@@ -2476,6 +2488,72 @@ def test_watch_buy_pullback_below_trigger_bypasses_intraday_range_chase_block() 
     assert len(broker_adapter.order_calls) == 1
     assert broker_adapter.order_calls[0].execution_plan_item_id == item_id
     assert broker_adapter.order_calls[0].limit_price == Decimal("70900.00")
+
+    engine.dispose()
+
+
+def test_watch_buy_dip_rebound_keeps_intraday_range_gate_after_cross() -> None:
+    app, engine, client, broker_adapter = _build_watch_buy_test_app(
+        order_id="kis-watch-buy-dip-rebound-range-gate-1"
+    )
+    item_id = _create_watch_buy_candidate(
+        client,
+        plan_id="plan-watch-buy-dip-rebound-range-gate-1",
+        trigger_price="71000.00",
+        chase_limit_price="72000.00",
+        risk_context={
+            "exchange": "KRX",
+            "stop_price": "70000.00",
+            "trigger_direction": "at_or_below",
+            "short_term_entry_quality": {
+                "day_low": "70000.00",
+                "day_high": "71400.00",
+            },
+        },
+    )
+    with app.state.db_session_factory() as session:
+        item = session.get(ExecutionPlanItem, item_id)
+        assert item is not None
+        item.risk_context = {
+            **item.risk_context,
+            "watch_buy_trigger_cross": {
+                "reason": "intraday_watch_buy_day_low_cross",
+                "direction": "at_or_below",
+                "trigger_price": "71000.0000",
+                "observed_price": "70900.0000",
+                "observed_at": "2024-01-03T01:00:00+00:00",
+                "recorded_at": "2024-01-03T01:00:00+00:00",
+                "cross_price": "70900.0000",
+                "day_high": "71400.0000",
+                "day_low": "70900.0000",
+            },
+        }
+        session.commit()
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "dip trigger crossed earlier but rebound is high in range",
+            "prices": [
+                {
+                    "symbol": "005930",
+                    "price": "71080.00",
+                    "day_low": "70000.00",
+                    "day_high": "71400.00",
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["triggered_item_count"] == 1
+    assert payload["submitted_order_count"] == 0
+    assert payload["items"][0]["outcome"] == "blocked"
+    assert payload["items"][0]["block_reason"] == "watch_buy_intraday_range_chase_block"
+    assert broker_adapter.order_calls == []
 
     engine.dispose()
 
