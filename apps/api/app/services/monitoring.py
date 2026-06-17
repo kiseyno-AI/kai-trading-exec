@@ -668,27 +668,38 @@ def _evaluate_monitoring_cycle(
         if is_watch_buy:
             action.item.status = "watch_buy_triggered"
             trigger_time_agent_quantity: int | None = None
-            if trigger_time_exec_agent.trigger_time_exec_agent_enabled(
+            trigger_time_agent_enabled = trigger_time_exec_agent.trigger_time_exec_agent_enabled(
                 settings=settings,
                 item=action.item,
-            ) and not _watch_buy_trigger_cross_pullback_bypasses_agent(action):
-                agent_result = _resolve_trigger_time_agent_action(
-                    settings=settings,
-                    db=db,
-                    adapter=adapter,
-                    action=action,
-                    triggered_at=triggered_at,
-                    intended_quantity=None,
-                    remaining_quantity=None,
-                )
-                if agent_result.quantity is None:
-                    blocked_item_count += 1
-                    result_by_item_id[action.item.id] = agent_result.result_payload
-                    if symbol_actions:
-                        pending_symbols.append(symbol)
-                    continue
-                trigger_time_agent_quantity = agent_result.quantity
-                limit_price_override = agent_result.limit_price
+            )
+            if trigger_time_agent_enabled:
+                if _watch_buy_trigger_cross_pullback_bypasses_agent(action):
+                    agent_result = _resolve_trigger_time_quality_gate_delay(
+                        settings=settings,
+                        db=db,
+                        adapter=adapter,
+                        action=action,
+                        triggered_at=triggered_at,
+                    )
+                else:
+                    agent_result = _resolve_trigger_time_agent_action(
+                        settings=settings,
+                        db=db,
+                        adapter=adapter,
+                        action=action,
+                        triggered_at=triggered_at,
+                        intended_quantity=None,
+                        remaining_quantity=None,
+                    )
+                if agent_result is not None:
+                    if agent_result.quantity is None:
+                        blocked_item_count += 1
+                        result_by_item_id[action.item.id] = agent_result.result_payload
+                        if symbol_actions:
+                            pending_symbols.append(symbol)
+                        continue
+                    trigger_time_agent_quantity = agent_result.quantity
+                    limit_price_override = agent_result.limit_price
             approval = _resolve_watch_buy_order(
                 settings=settings,
                 db=db,
@@ -1257,6 +1268,37 @@ def _resolve_trigger_time_agent_action(
         quantity=decision.quantity,
         limit_price=decision.limit_price,
         result_payload={},
+    )
+
+
+def _resolve_trigger_time_quality_gate_delay(
+    *,
+    settings: Settings,
+    db: Session,
+    adapter: BrokerAdapter,
+    action: PendingMonitoringAction,
+    triggered_at: datetime,
+) -> TriggerTimeAgentActionResult | None:
+    market_context, stale_reason = trigger_time_exec_agent._market_context(
+        settings=settings,
+        item=action.item,
+        observed_price=action.observed_price,
+        observed_at=_price_observed_at_from_action(action=action, fallback=triggered_at),
+        triggered_at=triggered_at,
+        trigger_reason=action.trigger_reason,
+        trigger_metadata=action.trigger_metadata,
+        live_market_context=action.market_quality_context,
+    )
+    if stale_reason is None and market_context.get("live_execution_context_available") is True:
+        return None
+    return _resolve_trigger_time_agent_action(
+        settings=settings,
+        db=db,
+        adapter=adapter,
+        action=action,
+        triggered_at=triggered_at,
+        intended_quantity=None,
+        remaining_quantity=None,
     )
 
 
@@ -2060,6 +2102,8 @@ def _watch_buy_intraday_cross_metadata(
     trigger_price = _watch_buy_trigger_price(item)
     if trigger_price is None:
         return None
+    if not _watch_buy_observed_price_crosses_trigger(item=item, observed_price=observed_price):
+        return None
     direction = _watch_buy_direction(item)
     if direction == "at_or_below":
         if price.day_low is None or price.day_low > trigger_price:
@@ -2114,6 +2158,19 @@ def _watch_buy_trigger_observation_metadata(
         metadata["volume"] = _serialize_decimal(price.volume)
         metadata["turnover"] = _serialize_decimal(price.turnover)
     return metadata
+
+
+def _watch_buy_observed_price_crosses_trigger(
+    *,
+    item: ExecutionPlanItem,
+    observed_price: Decimal | None,
+) -> bool:
+    trigger_price = _watch_buy_trigger_price(item)
+    if trigger_price is None or observed_price is None:
+        return False
+    if _watch_buy_direction(item) == "at_or_below":
+        return observed_price <= trigger_price
+    return observed_price >= trigger_price
 
 
 def _record_watch_buy_trigger_cross(
@@ -3073,9 +3130,9 @@ def _watch_buy_high_risk_gate_rejection(
     direction = _watch_buy_direction(item)
     pullback_after_cross = (
         trigger_price is not None
+        and direction == "at_or_above"
         and (
-            (direction == "at_or_above" and observed_price < trigger_price)
-            or (direction == "at_or_below" and observed_price > trigger_price)
+            observed_price < trigger_price
         )
     )
     day_high = _recursive_decimal_feature(payload, {"day_high", "intraday_high", "high_price", "session_high"})

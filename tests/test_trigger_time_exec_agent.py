@@ -239,6 +239,28 @@ def test_trigger_time_buy_agent_is_bypassed_for_intraday_pullback_below_trigger(
         risk_context_extra={"exec_agent_watch_sizing_fallback_allowed": True},
     )
 
+    crossed = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "live trigger cross above chase persists before pullback",
+            "prices": [
+                _live_price_payload(
+                    price="71300.00",
+                    day_low="70000.00",
+                    day_high="71400.00",
+                )
+            ],
+        },
+    )
+    assert crossed.status_code == 200
+    assert crossed.json()["submitted_order_count"] == 0
+    assert crossed.json()["items"][0]["block_reason"] in {
+        "price_above_chase_limit",
+        "watch_buy_intraday_range_chase_block",
+    }
+
     response = client.post(
         "/monitoring/evaluate",
         json={
@@ -268,6 +290,72 @@ def test_trigger_time_buy_agent_is_bypassed_for_intraday_pullback_below_trigger(
     assert order_call.execution_plan_item_id == item_id
     assert order_call.side == "buy"
     assert order_call.limit_price == Decimal("70900.00")
+
+    engine.dispose()
+
+
+def test_trigger_time_pullback_bypass_still_delays_without_live_market_quality(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, engine, client, broker_adapter, captured = _build_trigger_agent_app(
+        monkeypatch=monkeypatch,
+        agent_responses=[],
+    )
+    item_id = _create_intraday_watch_buy(
+        client,
+        plan_id="plan-trigger-agent-pullback-bypass-missing-quality",
+        risk_context_extra={"exec_agent_watch_sizing_fallback_allowed": True},
+    )
+
+    crossed = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "live trigger cross above chase persists before missing-quality pullback",
+            "prices": [
+                _live_price_payload(
+                    price="71300.00",
+                    day_low="70000.00",
+                    day_high="71400.00",
+                )
+            ],
+        },
+    )
+    assert crossed.status_code == 200
+    assert crossed.json()["submitted_order_count"] == 0
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "pullback lacks live quality even though trigger cross is persisted",
+            "prices": [
+                {
+                    "symbol": "005930",
+                    "price": "70900.00",
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["submitted_order_count"] == 0
+    assert payload["blocked_item_count"] == 1
+    assert payload["items"][0]["outcome"] == "agent_delay"
+    assert captured == []
+    assert broker_adapter.order_calls == []
+
+    with app.state.db_session_factory() as session:
+        item = session.get(ExecutionPlanItem, item_id)
+        assert item is not None
+        assert item.status == "agent_delay"
+        interaction = item.risk_context["last_trigger_time_exec_agent_interaction"]
+        assert interaction["source"] == "exec_runtime_market_quality_gate"
+        assert interaction["decision"]["decision"] == "delay"
+        assert "bid" in interaction["request_payload"]["market_context"]["missing_critical_fields"]
 
     engine.dispose()
 
