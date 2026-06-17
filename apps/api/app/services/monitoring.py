@@ -677,7 +677,7 @@ def _evaluate_monitoring_cycle(
                 settings=settings,
                 item=action.item,
             )
-            if trigger_time_agent_enabled:
+            if trigger_time_agent_enabled and not _watch_buy_entry_line_bypasses_agent(action):
                 if _watch_buy_trigger_cross_pullback_bypasses_agent(action):
                     agent_result = _resolve_trigger_time_quality_gate_delay(
                         settings=settings,
@@ -3622,6 +3622,15 @@ def _watch_buy_trigger_cross_pullback_bypasses_agent(action: PendingMonitoringAc
     if direction == "at_or_below":
         return action.observed_price >= trigger_price
     return action.observed_price <= trigger_price
+
+
+def _watch_buy_entry_line_bypasses_agent(action: PendingMonitoringAction) -> bool:
+    if not _is_watch_buy_item(action.item) or action.observed_price is None:
+        return False
+    if _watch_buy_direction(action.item) != "at_or_below":
+        return False
+    trigger_price = _watch_buy_trigger_price(action.item)
+    return trigger_price is not None and action.observed_price <= trigger_price
 
 
 def _monitoring_result_payload(
