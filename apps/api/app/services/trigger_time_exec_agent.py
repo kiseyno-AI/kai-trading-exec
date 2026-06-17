@@ -27,6 +27,7 @@ from app.core.config import Settings
 from app.models.runtime import BrokerOrder, ExecutionPlan, ExecutionPlanItem, ExecutionPosition
 from app.services.broker_auth import ensure_authenticated_broker_session
 from app.services.plan_item_identity import serialize_plan_item_source_identity
+from app.services.trade_outcome_feedback import load_latest_trade_outcome_feedback_snippet
 
 TRIGGER_TIME_EXEC_AGENT_VERSION = "trigger-time-exec-agent-v1"
 OPEN_ORDER_STATUSES = frozenset(
@@ -388,6 +389,7 @@ def _request_payload(
             "source": plan.source if plan is not None else None,
         },
         "signal_context": _signal_context(item=item, side=side),
+        "trade_outcome_feedback": load_latest_trade_outcome_feedback_snippet(settings),
         "market_context": market_context,
         "account_context": account_context,
         "peer_context": peer_context,
@@ -819,6 +821,7 @@ Use only this compact current execution context. Return JSON only:
 Only execute_now when quote and account context are fresh enough for broker submission.
 For buy decisions, only execute_now when market_context.live_execution_context_available is true.
 If bid/ask/orderbook/volume/turnover/session quality is missing, return delay or keep_watching.
+If trade_outcome_feedback is present, apply recent loss lessons as hard downsize/reject pressure.
 """.strip()
     timeout_seconds = getattr(settings, "exec_agent_trigger_time_timeout_seconds", 90)
     command = [
