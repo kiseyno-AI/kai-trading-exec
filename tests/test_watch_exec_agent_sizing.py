@@ -657,6 +657,7 @@ def test_sizing_request_payload_uses_compact_account_and_candidate_universe() ->
     )
 
     payload = _sizing_request_payload(
+        settings=Settings(runtime_mode="paper"),
         plan=plan,
         candidates=[candidates[0]],
         account_context=account_context,

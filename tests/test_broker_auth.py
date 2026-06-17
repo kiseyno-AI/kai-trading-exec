@@ -404,6 +404,10 @@ def test_settings_load_profit_protection_environment_fields() -> None:
             "KAI_EXEC_EXEC_AGENT_WATCH_SIZING_HIGH_CONVICTION_MIN_NOTIONAL_KRW": "1800000",
             "KAI_EXEC_EXEC_AGENT_WATCH_SIZING_HIGH_CONVICTION_THRESHOLD": "0.7",
             "KAI_EXEC_EXEC_AGENT_WATCH_SIZING_FALLBACK_ACCOUNT_BASIS_KRW": "11000000",
+            "KAI_EXEC_TRADE_OUTCOME_FEEDBACK_ENABLED": "true",
+            "KAI_EXEC_TRADE_OUTCOME_FEEDBACK_DIR": "var/test-feedback",
+            "KAI_EXEC_TRADE_OUTCOME_FEEDBACK_LOOKBACK_DAYS": "30",
+            "KAI_EXEC_TRADE_OUTCOME_FEEDBACK_MAX_LESSONS": "4",
         },
     )
 
@@ -422,6 +426,10 @@ def test_settings_load_profit_protection_environment_fields() -> None:
     assert settings.exec_agent_watch_sizing_high_conviction_min_notional_krw == Decimal("1800000")
     assert settings.exec_agent_watch_sizing_high_conviction_threshold == Decimal("0.7")
     assert settings.exec_agent_watch_sizing_fallback_account_basis_krw == Decimal("11000000")
+    assert settings.trade_outcome_feedback_enabled is True
+    assert settings.trade_outcome_feedback_dir == "var/test-feedback"
+    assert settings.trade_outcome_feedback_lookback_days == 30
+    assert settings.trade_outcome_feedback_max_lessons == 4
 
 
 def test_kis_adapter_uses_client_credentials_token_flow() -> None:

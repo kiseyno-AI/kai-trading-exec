@@ -181,6 +181,10 @@ Short-term exec risk settings currently supported:
 - `KAI_EXEC_EXEC_AGENT_WATCH_SIZING_HIGH_CONVICTION_MIN_NOTIONAL_KRW`
 - `KAI_EXEC_EXEC_AGENT_WATCH_SIZING_HIGH_CONVICTION_THRESHOLD`
 - `KAI_EXEC_EXEC_AGENT_WATCH_SIZING_FALLBACK_ACCOUNT_BASIS_KRW`
+- `KAI_EXEC_TRADE_OUTCOME_FEEDBACK_ENABLED`
+- `KAI_EXEC_TRADE_OUTCOME_FEEDBACK_DIR`
+- `KAI_EXEC_TRADE_OUTCOME_FEEDBACK_LOOKBACK_DAYS`
+- `KAI_EXEC_TRADE_OUTCOME_FEEDBACK_MAX_LESSONS`
 - `KAI_EXEC_MONTHLY_TARGET_KRW`
 - `KAI_EXEC_MONTHLY_CAPITAL_PRESERVATION_ENABLED`
 - `KAI_EXEC_MONTHLY_AGGRESSIVE_LAG_RATIO`
@@ -192,6 +196,18 @@ confidence or high-liquidity candidates, while still respecting available
 cash, per-symbol budget, max-safe notional, and stop-risk caps. If account
 snapshot loading is unavailable, the fallback account basis defaults to
 `10,000,000` KRW.
+
+Trade outcome feedback can be generated from stored broker fills with:
+
+```bash
+PYTHONPATH=apps/api python3.11 -m app.services.trade_outcome_feedback --lookback-days 20
+```
+
+The command writes JSON/Markdown artifacts under
+`var/analytics/trade_outcome_feedback/` by default and updates `latest.json`.
+When enabled, the latest compact lesson snippet is included in watch-buy sizing
+and trigger-time exec-agent request payloads so recent loss patterns can
+downsize, delay, or reject similar setups.
 
 Default short-term sizing is tuned for higher-conviction filtered candidates:
 per-symbol budget `3,000,000` KRW, total exec-agent budget `9,000,000` KRW,

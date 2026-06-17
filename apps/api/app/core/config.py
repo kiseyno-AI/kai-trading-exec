@@ -83,6 +83,10 @@ class Settings(BaseModel):
     exec_agent_watch_sizing_high_conviction_min_notional_krw: Decimal = Field(default=Decimal("1500000"), ge=0)
     exec_agent_watch_sizing_high_conviction_threshold: Decimal = Field(default=Decimal("0.65"), ge=0, le=1)
     exec_agent_watch_sizing_fallback_account_basis_krw: Decimal = Field(default=Decimal("10000000"), gt=0)
+    trade_outcome_feedback_enabled: bool = True
+    trade_outcome_feedback_dir: str = "var/analytics/trade_outcome_feedback"
+    trade_outcome_feedback_lookback_days: int = Field(default=20, ge=1, le=365)
+    trade_outcome_feedback_max_lessons: int = Field(default=6, ge=1, le=25)
     openclaw_cli_path: str = "openclaw"
     kis_app_key: str | None = None
     kis_app_secret: str | None = None
@@ -192,6 +196,10 @@ _ENV_FIELDS = {
     "EXEC_AGENT_WATCH_SIZING_HIGH_CONVICTION_MIN_NOTIONAL_KRW": "exec_agent_watch_sizing_high_conviction_min_notional_krw",
     "EXEC_AGENT_WATCH_SIZING_HIGH_CONVICTION_THRESHOLD": "exec_agent_watch_sizing_high_conviction_threshold",
     "EXEC_AGENT_WATCH_SIZING_FALLBACK_ACCOUNT_BASIS_KRW": "exec_agent_watch_sizing_fallback_account_basis_krw",
+    "TRADE_OUTCOME_FEEDBACK_ENABLED": "trade_outcome_feedback_enabled",
+    "TRADE_OUTCOME_FEEDBACK_DIR": "trade_outcome_feedback_dir",
+    "TRADE_OUTCOME_FEEDBACK_LOOKBACK_DAYS": "trade_outcome_feedback_lookback_days",
+    "TRADE_OUTCOME_FEEDBACK_MAX_LESSONS": "trade_outcome_feedback_max_lessons",
     "OPENCLAW_CLI_PATH": "openclaw_cli_path",
     "KIS_APP_KEY": "kis_app_key",
     "KIS_APP_SECRET": "kis_app_secret",

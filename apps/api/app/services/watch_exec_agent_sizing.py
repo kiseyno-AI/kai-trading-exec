@@ -21,6 +21,7 @@ from app.broker.base import BrokerAccountSnapshot, BrokerAdapter, BrokerAdapterE
 from app.core.config import Settings
 from app.models.runtime import ExecutionPlan, ExecutionPlanItem
 from app.services.broker_auth import ensure_authenticated_broker_session
+from app.services.trade_outcome_feedback import load_latest_trade_outcome_feedback_snippet
 
 LOGGER = logging.getLogger(__name__)
 
@@ -90,6 +91,7 @@ def run_due_watch_exec_agent_sizing(
                 batches_processed += 1
                 batch_ids = [str(candidate["execution_plan_item_id"]) for candidate in request_batch]
                 request_payload = _sizing_request_payload(
+                    settings=settings,
                     plan=plan,
                     candidates=request_batch,
                     account_context=account_context,
@@ -140,6 +142,7 @@ def run_due_watch_exec_agent_sizing(
                         ):
                             retry_ids = [str(candidate["execution_plan_item_id"]) for candidate in retry_batch]
                             retry_payload = _sizing_request_payload(
+                                settings=settings,
                                 plan=plan,
                                 candidates=retry_batch,
                                 account_context=account_context,
@@ -220,6 +223,7 @@ def _sizing_request_batches(candidates: list[dict[str, object]]) -> list[list[di
 
 def _sizing_request_payload(
     *,
+    settings: Settings,
     plan: ExecutionPlan,
     candidates: list[dict[str, object]],
     account_context: dict[str, object],
@@ -245,6 +249,7 @@ def _sizing_request_payload(
         "market_date": plan.market_date.isoformat() if plan.market_date else None,
         "strategy_run_id": plan.strategy_run_id,
         "task": task,
+        "trade_outcome_feedback": load_latest_trade_outcome_feedback_snippet(settings),
         "account_context": account_context,
         "candidate_universe": candidate_universe,
         "candidates": candidates,
@@ -608,6 +613,7 @@ def _request_exec_agent_decisions(*, settings: Settings, payload: dict[str, obje
 - 각 candidate별 approve 또는 reject 판단.
 - 파일에는 정제된 candidate, account_context, candidate_universe만 있습니다. 다른 세션/긴 컨텍스트를 보지 말고 이 JSON만 기준으로 판단하세요.
 - account_context.orderable_cash_krw / buying_power_krw, 보유/미체결 주문, 같은 plan의 나머지 후보(candidate_universe)를 같이 보고 현금 배분을 보수적으로 정하세요.
+- trade_outcome_feedback이 있으면 최근 손실 패턴은 축소/거절하고 positive expectancy 패턴만 증액 근거로 사용하세요.
 - 기본 로직은 유지하되, 2% 정도만 현실적인 candidate도 stop이 짧고 상승 확률 우위가 있으면 소액 approve 하세요.
 - approve 시 positive integer quantity, approved_notional_krw, sizing_price, confidence, target_profile, reason_code, reason 포함.
 - reject 시 quantity=0, approved_notional_krw=0, sizing_price, confidence, reason_code, reason 포함.
