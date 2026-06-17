@@ -30,6 +30,7 @@ from app.services.plan_item_identity import serialize_plan_item_source_identity
 from app.services.trade_outcome_feedback import load_latest_trade_outcome_feedback_snippet
 
 TRIGGER_TIME_EXEC_AGENT_VERSION = "trigger-time-exec-agent-v1"
+TRIGGER_TIME_REASON_MAX_LENGTH = 1000
 OPEN_ORDER_STATUSES = frozenset(
     {
         "submission_pending",
@@ -242,11 +243,15 @@ def resolve_trigger_time_exec_agent_decision(
         )
         decision = TriggerTimeExecAgentDecision.model_validate(response_payload)
     except (ValidationError, ValueError, TypeError, RuntimeError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
+        safe_reason = _bounded_reason(
+            "trigger-time exec-agent unavailable or invalid",
+            detail=str(exc),
+        )
         return _local_resolution(
             request_payload=request_payload,
             side=side,
             decision="delay",
-            reason=f"trigger-time exec-agent unavailable or invalid: {exc}",
+            reason=safe_reason,
             source="exec_runtime_context_gate",
             error=str(exc),
         )
@@ -937,15 +942,26 @@ def _local_resolution(
     response_payload: dict[str, object] | None = None,
     error: str | None = None,
 ) -> TriggerTimeExecAgentResolution:
+    safe_reason = _bounded_reason(reason)
     payload = response_payload or {
         "decision": decision,
         "side": side,
         "quantity": None,
-        "reason": reason,
-        "risk_notes": [reason],
+        "reason": safe_reason,
+        "risk_notes": [safe_reason],
         "confidence": None,
         "context_staleness_ok": context_staleness_ok,
     }
+    if response_payload is not None:
+        payload = dict(response_payload)
+        payload["reason"] = _bounded_reason(str(payload.get("reason") or safe_reason))
+        risk_notes = payload.get("risk_notes")
+        if isinstance(risk_notes, list):
+            payload["risk_notes"] = [
+                _bounded_reason(str(note))
+                for note in risk_notes
+                if str(note).strip()
+            ]
     parsed = TriggerTimeExecAgentDecision.model_validate(payload)
     return TriggerTimeExecAgentResolution(
         decision=parsed,
@@ -956,6 +972,18 @@ def _local_resolution(
         source=source,
         error=error,
     )
+
+
+def _bounded_reason(prefix: str, *, detail: str | None = None) -> str:
+    value = prefix.strip()
+    if detail is not None and detail.strip():
+        value = f"{value}: {detail.strip()}"
+    if not value:
+        value = "trigger-time exec-agent fallback"
+    if len(value) <= TRIGGER_TIME_REASON_MAX_LENGTH:
+        return value
+    suffix = " ... [truncated]"
+    return value[: TRIGGER_TIME_REASON_MAX_LENGTH - len(suffix)].rstrip() + suffix
 
 
 def _payload_hash(payload: dict[str, object]) -> str:

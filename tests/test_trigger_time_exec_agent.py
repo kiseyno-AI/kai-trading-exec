@@ -452,6 +452,54 @@ def test_trigger_time_buy_missing_live_market_quality_delays_without_agent_call(
     engine.dispose()
 
 
+def test_trigger_time_buy_invalid_agent_reason_is_bounded_and_delays(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    long_reason = "agent timeout " + ("x" * 2000)
+    app, engine, client, broker_adapter, captured = _build_trigger_agent_app(
+        monkeypatch=monkeypatch,
+        agent_responses=[
+            {
+                "decision": "delay",
+                "side": "buy",
+                "reason": long_reason,
+                "context_staleness_ok": True,
+            }
+        ],
+    )
+    item_id = _create_intraday_watch_buy(client, plan_id="plan-trigger-agent-long-reason-delay")
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "agent response has overlong reason",
+            "prices": [_live_price_payload()],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["submitted_order_count"] == 0
+    assert payload["blocked_item_count"] == 1
+    assert payload["items"][0]["outcome"] == "agent_delay"
+    assert len(captured) == 1
+    assert broker_adapter.order_calls == []
+
+    with app.state.db_session_factory() as session:
+        item = session.get(ExecutionPlanItem, item_id)
+        assert item is not None
+        assert item.status == "agent_delay"
+        interaction = item.risk_context["last_trigger_time_exec_agent_interaction"]
+        assert interaction["source"] == "exec_runtime_context_gate"
+        assert interaction["decision"]["decision"] == "delay"
+        assert len(interaction["decision"]["reason"]) <= 1000
+        assert "String should have at most 1000 characters" in interaction["error"]
+
+    engine.dispose()
+
+
 def test_trigger_time_buy_agent_quantity_is_clamped_by_deterministic_sizing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
