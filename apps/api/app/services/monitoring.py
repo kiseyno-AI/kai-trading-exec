@@ -102,6 +102,7 @@ NON_MONITORABLE_PLAN_ITEM_STATUSES = frozenset(
         "retry_pending",
         "rejected",
         "failed",
+        "superseded",
         "watch_buy_submitted",
         "watch_buy_rejected",
         "watch_expired",
@@ -1516,6 +1517,11 @@ def _load_monitored_items(
             ExecutionPlanItem.id.asc(),
         )
     ).all()
+    selected_items = _append_held_active_sell_monitor_reconciliations(
+        settings=settings,
+        db=db,
+        selected_items=selected_items,
+    )
     return _append_held_stop_sell_fallbacks(
         settings=settings,
         db=db,
@@ -1574,6 +1580,89 @@ def _trigger_time_agent_status_counts(
             for status in approved_submitted_statuses
         ),
     }
+
+
+def _append_held_active_sell_monitor_reconciliations(
+    *,
+    settings: Settings,
+    db: Session,
+    selected_items: list[ExecutionPlanItem],
+) -> list[ExecutionPlanItem]:
+    held_symbols = set(
+        db.scalars(
+            select(ExecutionPosition.symbol).where(
+                ExecutionPosition.mode == settings.runtime_mode,
+                ExecutionPosition.quantity > 0,
+            )
+        ).all()
+    )
+    if not held_symbols:
+        return selected_items
+
+    selected_item_ids = {item.id for item in selected_items}
+    selected_symbols = {item.symbol for item in selected_items}
+    if not selected_symbols:
+        return selected_items
+    selected_sell_replacements = {
+        (item.symbol, item.intent): item
+        for item in selected_items
+        if item.side == "sell" and item.intent in SELL_MONITORED_INTENTS
+    }
+    eligible_symbols = held_symbols & selected_symbols
+    if not eligible_symbols:
+        return selected_items
+    active_items = db.scalars(
+        select(ExecutionPlanItem)
+        .join(ExecutionPlanItem.plan)
+        .where(
+            ExecutionPlan.mode == settings.runtime_mode,
+            ExecutionPlanItem.side == "sell",
+            ExecutionPlanItem.intent.in_(tuple(SELL_MONITORED_INTENTS)),
+            ExecutionPlanItem.status.in_(tuple(SELL_ACTIVE_MONITORING_STATUSES)),
+            ExecutionPlanItem.symbol.in_(eligible_symbols),
+        )
+        .options(selectinload(ExecutionPlanItem.plan))
+        .order_by(
+            ExecutionPlan.accepted_at.asc(),
+            ExecutionPlan.id.asc(),
+            ExecutionPlanItem.plan_item_index.asc(),
+            ExecutionPlanItem.id.asc(),
+        )
+    ).all()
+
+    append_items: list[ExecutionPlanItem] = []
+    for item in active_items:
+        if item.id in selected_item_ids:
+            continue
+        replacement = selected_sell_replacements.get((item.symbol, item.intent))
+        if replacement is not None:
+            prior_status = item.status
+            item.status = "superseded"
+            _record_monitoring_event(
+                item=item,
+                event={
+                    "event": "active_sell_monitor_superseded",
+                    "reason": "newer_same_intent_monitor_selected",
+                    "prior_status": prior_status,
+                    "superseded_by_execution_plan_item_id": replacement.id,
+                    "superseded_by_execution_plan_id": replacement.execution_plan_id,
+                    "recorded_at": datetime.now(UTC).isoformat(),
+                },
+            )
+            continue
+        append_items.append(item)
+
+    if not append_items:
+        return selected_items
+    return sorted(
+        [*selected_items, *append_items],
+        key=lambda item: (
+            item.plan.accepted_at,
+            item.plan.id,
+            item.plan_item_index,
+            item.id,
+        ),
+    )
 
 
 def _append_held_stop_sell_fallbacks(

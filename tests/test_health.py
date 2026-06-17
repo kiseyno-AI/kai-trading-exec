@@ -1162,6 +1162,85 @@ def test_autonomous_monitoring_uses_latest_plan_per_symbol_only() -> None:
         autonomous_item_ids = {item.id for item in autonomous_items}
         assert older_item_id not in autonomous_item_ids
         assert autonomous_item_ids == newer_item_ids
+        older_item = session.get(ExecutionPlanItem, older_item_id)
+        assert older_item is not None
+        assert older_item.status == "superseded"
+        assert older_item.risk_context["last_monitoring_event"]["event"] == "active_sell_monitor_superseded"
+
+    engine.dispose()
+
+
+def test_autonomous_monitoring_includes_older_active_sell_monitor_without_same_intent_replacement() -> None:
+    app, engine = build_test_app(
+        Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+        )
+    )
+    client = TestClient(app)
+
+    older = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-old-target-still-active",
+            "source": "kai-trading-core",
+            "market_date": "2026-06-11",
+            "items": [
+                {
+                    "symbol": "073560",
+                    "side": "sell",
+                    "intent": "target_sell",
+                    "trigger_price": "1583.00",
+                    "quantity_policy": {"kind": "shares", "quantity": 10},
+                }
+            ],
+        },
+    )
+    newer = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-new-stop-only",
+            "source": "kai-trading-core",
+            "market_date": "2026-06-12",
+            "items": [
+                {
+                    "symbol": "073560",
+                    "side": "sell",
+                    "intent": "stop_sell",
+                    "trigger_price": "1450.00",
+                    "quantity_policy": {"kind": "position_exit_from_entry"},
+                }
+            ],
+        },
+    )
+    assert older.status_code == 201
+    assert newer.status_code == 201
+    older_target_id = older.json()["persisted_execution_item_ids"][0]
+    newer_stop_id = newer.json()["persisted_execution_item_ids"][0]
+
+    with app.state.db_session_factory() as session:
+        session.add(
+            ExecutionPosition(
+                mode="paper",
+                symbol="073560",
+                quantity=98,
+                average_price=Decimal("1675.00"),
+                updated_from="reconciliation",
+                last_reconciled_at=datetime(2026, 6, 12, 1, 30, tzinfo=UTC),
+            )
+        )
+        session.commit()
+
+        autonomous_items = _load_monitored_items(
+            settings=app.state.settings,
+            db=session,
+            exclude_pending_config=True,
+        )
+
+        assert {item.id for item in autonomous_items} == {older_target_id, newer_stop_id}
+        older_target = session.get(ExecutionPlanItem, older_target_id)
+        assert older_target is not None
+        assert older_target.status == "target_sell_monitoring"
 
     engine.dispose()
 
