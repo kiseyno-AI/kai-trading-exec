@@ -529,10 +529,31 @@ def _apply_retry_decision(
         classification=classification,
     )
     deadline_at = observed_at + RETRY_DEADLINE
+    pending_existing_retry_job = (
+        existing_retry_job is not None
+        and existing_retry_job.status in {"queued", "scheduled", "retrying"}
+    )
     failure.retry_decision_status = "scheduled"
-    failure.retry_decision_reason = classification.reason
-    failure.retry_next_at = next_retry_at
-    failure.retry_deadline_at = deadline_at
+    if pending_existing_retry_job:
+        assert existing_retry_job is not None
+        preserved_next_retry_at = (
+            failure.retry_next_at
+            or existing_retry_job.scheduled_for
+            or next_retry_at
+        )
+        failure.retry_decision_reason = (
+            failure.retry_decision_reason or classification.reason
+        )
+        failure.retry_next_at = preserved_next_retry_at
+        failure.retry_deadline_at = failure.retry_deadline_at or deadline_at
+        if existing_retry_job.scheduled_for is None:
+            existing_retry_job.scheduled_for = preserved_next_retry_at
+        if existing_retry_job.last_error is None:
+            existing_retry_job.last_error = f"retry scheduled after {classification.reason}"
+    else:
+        failure.retry_decision_reason = classification.reason
+        failure.retry_next_at = next_retry_at
+        failure.retry_deadline_at = deadline_at
     failure.retry_exhausted_reason = None
     if failure.retry_job_id is None:
         assert plan_item is not None
@@ -547,12 +568,6 @@ def _apply_retry_decision(
         db.add(retry_job)
         db.flush()
         failure.retry_job_id = retry_job.id
-    elif (
-        existing_retry_job is not None
-        and existing_retry_job.status in {"queued", "scheduled", "retrying"}
-    ):
-        existing_retry_job.scheduled_for = next_retry_at
-        existing_retry_job.last_error = f"retry scheduled after {classification.reason}"
     order.status = NormalizedBrokerOrderStatus.RETRY_PENDING.value
     if plan_item is not None:
         plan_item.status = "broker_order_retry_pending"

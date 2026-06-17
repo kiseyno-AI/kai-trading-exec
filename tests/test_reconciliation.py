@@ -955,6 +955,96 @@ def test_reconcile_kosdaq_sidecar_sell_reject_schedules_delayed_retry() -> None:
     engine.dispose()
 
 
+def test_reconcile_repeat_temp_reject_does_not_slide_pending_retry_job() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        kis_app_key="***",
+        kis_app_secret="***",
+        kis_account_number="12345678",
+    )
+    engine, db = _session(settings)
+    plan, item, order = _plan_backed_order(
+        plan_id="plan-repeat-temp-reject-stable-retry",
+        side="sell",
+        intent="target_sell",
+        symbol="086790",
+        quantity=4,
+        broker_order_id="repeat-sidecar-1",
+    )
+    db.add_all([plan, order])
+    db.commit()
+    second_observed_at = OBSERVED_AT + timedelta(minutes=1)
+    broker = ReconciliationStubBroker(
+        reconcile_payloads=[
+            {
+                "broker_order_id": "repeat-sidecar-1",
+                "status": "rejected",
+                "broker_status": "매도거부",
+                "message": "KOSDAQ sidecar temporary orderability window",
+                "observed_at": OBSERVED_AT.isoformat(),
+                "market_operation_state": {
+                    "state": "sidecar",
+                    "reason": "KOSDAQ sidecar",
+                    "normal_ordering_available": False,
+                },
+                "payload": {"odno": "repeat-sidecar-1"},
+            },
+            {
+                "broker_order_id": "repeat-sidecar-1",
+                "status": "rejected",
+                "broker_status": "매도거부",
+                "message": "KOSDAQ sidecar temporary orderability window",
+                "observed_at": second_observed_at.isoformat(),
+                "market_operation_state": {
+                    "state": "sidecar",
+                    "reason": "KOSDAQ sidecar",
+                    "normal_ordering_available": False,
+                },
+                "payload": {"odno": "repeat-sidecar-1"},
+            },
+        ]
+    )
+
+    first = reconcile_broker_order(settings=settings, db=db, adapter=broker, order=order)
+    failure = db.scalar(
+        select(ExecutionFailure).where(ExecutionFailure.broker_order_pk == order.id)
+    )
+    job = db.scalar(
+        select(ExecutionJob).where(ExecutionJob.execution_plan_item_id == item.id)
+    )
+    assert first["status"] == "retry_pending"
+    assert failure is not None
+    assert job is not None
+    assert failure.retry_next_at is not None
+    assert failure.retry_deadline_at is not None
+    assert job.scheduled_for is not None
+    initial_retry_next_at = _utc(failure.retry_next_at)
+    initial_deadline_at = _utc(failure.retry_deadline_at)
+    initial_scheduled_for = _utc(job.scheduled_for)
+
+    second = reconcile_broker_order(settings=settings, db=db, adapter=broker, order=order)
+
+    db.refresh(failure)
+    db.refresh(job)
+    events = db.scalars(
+        select(BrokerOrderEvent).where(BrokerOrderEvent.event_type == "retry_decision")
+    ).all()
+    assert second["status"] == "retry_pending"
+    assert failure.retry_decision_status == "scheduled"
+    assert failure.retry_decision_reason == "temporary_sidecar"
+    assert failure.retry_next_at is not None
+    assert failure.retry_deadline_at is not None
+    assert job.scheduled_for is not None
+    assert _utc(failure.retry_next_at) == initial_retry_next_at
+    assert _utc(failure.retry_deadline_at) == initial_deadline_at
+    assert _utc(job.scheduled_for) == initial_scheduled_for
+    assert initial_retry_next_at == OBSERVED_AT + timedelta(minutes=5)
+    assert second_observed_at + timedelta(minutes=5) > initial_scheduled_for
+    assert len(events) == 1
+    engine.dispose()
+
+
 def test_reconcile_insufficient_holdings_sell_reject_does_not_retry() -> None:
     settings = Settings(
         database_url="sqlite:///:memory:",
