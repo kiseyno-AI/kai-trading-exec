@@ -4212,7 +4212,7 @@ def test_monitoring_creates_post_entry_protective_monitors_after_buy_fill() -> N
         assert max_holding_item.status == "max_holding_close_sell_monitoring"
         assert max_holding_item.quantity_policy == {"kind": "position_exit_from_entry"}
         assert max_holding_item.source_plan_item_id == "core-post-entry-create:post-entry-max-holding"
-        assert max_holding_item.risk_context["close_exit_date"] == "2026-06-12"
+        assert max_holding_item.risk_context["close_exit_date"] == "2026-06-15"
         assert max_holding_item.risk_context["post_entry_managed"] is True
 
     engine.dispose()
@@ -4329,7 +4329,7 @@ def test_monitoring_submits_post_entry_max_holding_close_sell() -> None:
             "actor": "ops",
             "source": "test",
             "reason": "max holding exit should close stale position",
-            "observed_at": "2026-06-12T01:00:00Z",
+            "observed_at": "2026-06-15T01:00:00Z",
             "prices": [{"symbol": "005930", "price": "100000.00"}],
         },
     )
@@ -4360,6 +4360,93 @@ def test_monitoring_submits_post_entry_max_holding_close_sell() -> None:
         assert order is not None
         assert order.idempotency_key == f"monitoring:max_holding_close_sell:{max_holding_item.id}"
         assert order.status == "submitted"
+
+    engine.dispose()
+
+
+def test_monitoring_preserves_trading_session_max_holding_close_date_over_weekend() -> None:
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(broker_order_id="kis-post-entry-weekend"),
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+            exec_agent_stop_loss_pct=Decimal("0.04"),
+            exec_agent_max_holding_trading_sessions=3,
+        ),
+        broker_adapter=broker_adapter,
+    )
+    client = TestClient(app)
+
+    _create_filled_buy_position(
+        app,
+        client,
+        plan_id="plan-post-entry-weekend",
+        market_date="2026-06-12",
+        source_plan_item_id="core-post-entry-weekend",
+    )
+
+    first_response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "create weekend max holding monitor",
+            "observed_at": "2026-06-12T01:00:00Z",
+            "prices": [{"symbol": "005930", "price": "101000.00"}],
+        },
+    )
+
+    assert first_response.status_code == 200
+    with app.state.db_session_factory() as session:
+        max_holding_item = session.scalar(
+            select(ExecutionPlanItem).where(
+                ExecutionPlanItem.symbol == "005930",
+                ExecutionPlanItem.intent == "max_holding_close_sell",
+            )
+        )
+        assert max_holding_item is not None
+        assert max_holding_item.risk_context["close_exit_date"] == "2026-06-17"
+
+    monday_response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "monday should not close friday entry early",
+            "observed_at": "2026-06-15T01:00:00Z",
+            "prices": [{"symbol": "005930", "price": "100000.00"}],
+        },
+    )
+
+    assert monday_response.status_code == 200
+    payload = monday_response.json()
+    assert payload["submitted_order_count"] == 0
+    assert broker_adapter.order_calls == []
+    with app.state.db_session_factory() as session:
+        max_holding_item = session.scalar(
+            select(ExecutionPlanItem).where(
+                ExecutionPlanItem.symbol == "005930",
+                ExecutionPlanItem.intent == "max_holding_close_sell",
+            )
+        )
+        assert max_holding_item is not None
+        assert max_holding_item.risk_context["close_exit_date"] == "2026-06-17"
+        order = session.scalar(
+            select(BrokerOrder).where(BrokerOrder.execution_plan_item_id == max_holding_item.id)
+        )
+        assert order is None
 
     engine.dispose()
 

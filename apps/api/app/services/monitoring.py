@@ -2225,7 +2225,7 @@ def _ensure_post_entry_max_holding_monitor(
         entry_item=entry_item,
         intent="max_holding_close_sell",
     )
-    close_exit_date = entry_market_date + timedelta(days=max(1, max_holding_sessions) - 1)
+    close_exit_date = _add_trading_sessions(entry_market_date, max_holding_sessions)
     if existing is None:
         existing = ExecutionPlanItem(
             plan=plan,
@@ -2289,6 +2289,16 @@ def _ensure_post_entry_max_holding_monitor(
     )
     existing.risk_context = risk_context
     return existing, maintenance_count
+
+
+def _add_trading_sessions(start: date, sessions: int) -> date:
+    current = start
+    added = 0
+    while added < max(1, sessions):
+        current = current + timedelta(days=1)
+        if current.weekday() < 5:
+            added += 1
+    return current
 
 
 def _active_sibling_monitor(
