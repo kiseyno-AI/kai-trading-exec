@@ -1283,7 +1283,10 @@ def test_restart_preserves_reconciliation_positions_for_monitoring_evaluation(
 
     runtime_after = restarted_client.get("/runtime/status")
     assert runtime_after.status_code == 200
-    assert runtime_after.json()["liveness"]["monitoring"]["status"] == "running"
+    monitoring_status = runtime_after.json()["liveness"]["monitoring"]
+    assert monitoring_status["status"] == "degraded"
+    assert monitoring_status["protective_stop_coverage"]["status"] == "degraded"
+    assert monitoring_status["protective_stop_coverage"]["missing_quantities"] == {"005930": 10}
 
     assert restarted_adapter.authenticate_calls == 1
     assert len(restarted_adapter.order_calls) == 1
@@ -1305,7 +1308,7 @@ def test_restart_preserves_reconciliation_positions_for_monitoring_evaluation(
             )
         )
         assert checkpoint is not None
-        assert checkpoint.status == "running"
+        assert checkpoint.status == "degraded"
         assert checkpoint.last_success_at is not None
 
     restarted_client.close()
@@ -4243,7 +4246,10 @@ def test_monitoring_evaluate_triggers_target_sell_order_from_position_and_price_
 
     runtime_status = client.get("/runtime/status")
     assert runtime_status.status_code == 200
-    assert runtime_status.json()["liveness"]["monitoring"]["status"] == "running"
+    monitoring_status = runtime_status.json()["liveness"]["monitoring"]
+    assert monitoring_status["status"] == "degraded"
+    assert monitoring_status["protective_stop_coverage"]["status"] == "degraded"
+    assert monitoring_status["protective_stop_coverage"]["missing_quantities"] == {"005930": 10}
 
     with app.state.db_session_factory() as session:
         plan_item = session.get(ExecutionPlanItem, plan_item_id)
@@ -4263,7 +4269,7 @@ def test_monitoring_evaluate_triggers_target_sell_order_from_position_and_price_
             )
         )
         assert checkpoint is not None
-        assert checkpoint.status == "running"
+        assert checkpoint.status == "degraded"
         assert checkpoint.last_heartbeat_at is not None
         assert checkpoint.last_success_at is not None
 
@@ -7341,7 +7347,8 @@ def test_autonomous_monitoring_loop_triggers_target_sell_from_price_source() -> 
             assert checkpoint is not None
             assert plan_item.status == "broker_order_submitted"
             assert order.broker_order_id == "kis-auto-monitor-1"
-            assert checkpoint.status == "running"
+            assert checkpoint.status == "degraded"
+            assert checkpoint.details["protective_stop_coverage"]["missing_quantities"] == {"005930": 1}
 
     engine.dispose()
 

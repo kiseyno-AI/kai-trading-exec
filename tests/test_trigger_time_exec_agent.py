@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 from fastapi.testclient import TestClient
@@ -1207,5 +1207,248 @@ def test_monitoring_counts_broker_truth_live_stop_as_protective_coverage(
         assert stop_item.status == stop_status
         assert stop_item.quantity_policy == {"kind": "shares", "quantity": 5}
         assert "monitoring_events" not in stop_item.risk_context
+
+    engine.dispose()
+
+
+def test_monitoring_reports_unprotected_position_when_stop_threshold_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, engine, client, broker_adapter, _captured = _build_trigger_agent_app(
+        monkeypatch=monkeypatch,
+        agent_responses=[],
+    )
+    with app.state.db_session_factory() as session:
+        plan = ExecutionPlan(
+            external_plan_id="plan-missing-stop-threshold-coverage",
+            source="test",
+            mode="paper",
+            market_date=datetime(2026, 6, 18, tzinfo=UTC).date(),
+            items=[
+                ExecutionPlanItem(
+                    symbol="005930",
+                    side="sell",
+                    intent="stop_sell",
+                    status="stop_sell_pending_config",
+                    quantity_policy={"kind": "shares", "quantity": 3},
+                    trigger_price=None,
+                    time_in_force="day",
+                    risk_context={"exchange": "KRX"},
+                ),
+            ],
+        )
+        session.add(plan)
+        session.add(
+            ExecutionPosition(
+                mode="paper",
+                symbol="005930",
+                quantity=3,
+                average_price=Decimal("120000.0000"),
+                updated_from="reconciliation",
+                last_reconciled_at=datetime.now(UTC),
+                raw_payload={"source": "broker"},
+            )
+        )
+        session.commit()
+        stop_item_id = plan.items[0].id
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "missing stop threshold must fail closed",
+            "prices": [{"symbol": "005930", "price": "120500.00"}],
+        },
+    )
+
+    assert response.status_code == 200
+    coverage = response.json()["protective_stop_coverage"]
+    assert coverage["status"] == "degraded"
+    assert coverage["unprotected_position_count"] == 1
+    assert coverage["affected_symbols"] == ["005930"]
+    assert coverage["missing_quantities"] == {"005930": 3}
+    assert coverage["issues"][0]["outcome"] == "unprotected_position"
+    assert coverage["issues"][0]["missing_quantity"] == 3
+    assert coverage["issues"][0]["latest_stop_item_id"] == stop_item_id
+    assert broker_adapter.order_calls == []
+
+    runtime_status = client.get("/runtime/status")
+    assert runtime_status.status_code == 200
+    runtime_coverage = runtime_status.json()["liveness"]["monitoring"]["protective_stop_coverage"]
+    assert runtime_coverage["status"] == "degraded"
+    assert runtime_coverage["missing_quantities"] == {"005930": 3}
+
+    with app.state.db_session_factory() as session:
+        checkpoint = session.scalar(select(MonitoringCheckpoint))
+        assert checkpoint is not None
+        assert checkpoint.status == "degraded"
+        stop_item = session.get(ExecutionPlanItem, stop_item_id)
+        assert stop_item is not None
+        assert stop_item.status == "stop_sell_pending_config"
+
+    engine.dispose()
+
+
+def test_monitoring_materializes_pending_config_stop_before_crossing_is_missed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, engine, client, broker_adapter, _captured = _build_trigger_agent_app(
+        monkeypatch=monkeypatch,
+        agent_responses=[],
+    )
+    with app.state.db_session_factory() as session:
+        plan = ExecutionPlan(
+            external_plan_id="plan-pending-config-stop-materialized",
+            source="test",
+            mode="paper",
+            market_date=datetime(2026, 6, 18, tzinfo=UTC).date(),
+            items=[
+                ExecutionPlanItem(
+                    symbol="005930",
+                    side="sell",
+                    intent="stop_sell",
+                    status="stop_sell_pending_config",
+                    quantity_policy={"kind": "shares", "quantity": 2},
+                    trigger_price=Decimal("118000.00"),
+                    time_in_force="day",
+                    risk_context={"exchange": "KRX", "deterministic_emergency_stop": True},
+                ),
+            ],
+        )
+        session.add(plan)
+        session.add(
+            ExecutionPosition(
+                mode="paper",
+                symbol="005930",
+                quantity=2,
+                average_price=Decimal("120000.0000"),
+                updated_from="reconciliation",
+                last_reconciled_at=datetime.now(UTC),
+                raw_payload={"source": "broker"},
+            )
+        )
+        session.commit()
+        stop_item_id = plan.items[0].id
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "cross pending-config stop",
+            "prices": [{"symbol": "005930", "price": "117900.00"}],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["protective_stop_coverage"]["status"] == "ok"
+    assert payload["protective_stop_coverage"]["repaired_stop_coverage_count"] == 1
+    assert payload["submitted_order_count"] == 1
+    assert len(broker_adapter.order_calls) == 1
+    assert broker_adapter.order_calls[0].execution_plan_item_id == stop_item_id
+    assert broker_adapter.order_calls[0].quantity == 2
+
+    with app.state.db_session_factory() as session:
+        stop_item = session.get(ExecutionPlanItem, stop_item_id)
+        assert stop_item is not None
+        assert stop_item.status == "broker_order_submitted"
+        events = stop_item.risk_context["monitoring_events"]
+        assert any(event["event"] == "unprotected_position_stop_rearmed" for event in events)
+
+    engine.dispose()
+
+
+def test_monitoring_flags_stale_flat_position_truth_with_broker_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, engine, client, broker_adapter, _captured = _build_trigger_agent_app(
+        monkeypatch=monkeypatch,
+        agent_responses=[],
+    )
+    stale_reconciled_at = datetime.now(UTC) - timedelta(hours=2)
+    with app.state.db_session_factory() as session:
+        plan = ExecutionPlan(
+            external_plan_id="plan-319660-stale-flat-position",
+            source="test",
+            mode="paper",
+            market_date=datetime(2026, 6, 18, tzinfo=UTC).date(),
+            items=[
+                ExecutionPlanItem(
+                    symbol="319660",
+                    side="sell",
+                    intent="stop_sell",
+                    status="expired",
+                    quantity_policy={"kind": "shares", "quantity": 4},
+                    trigger_price=Decimal("22100.00"),
+                    time_in_force="day",
+                    risk_context={"exchange": "KRX"},
+                ),
+            ],
+        )
+        session.add(plan)
+        session.flush()
+        session.add(
+            BrokerOrder(
+                execution_plan_item_id=None,
+                mode="paper",
+                idempotency_key="filled-buy-319660",
+                symbol="319660",
+                side="buy",
+                status="filled",
+                quantity=4,
+                limit_price=Decimal("23000.00"),
+                submitted_at=stale_reconciled_at + timedelta(minutes=5),
+            )
+        )
+        session.add(
+            ExecutionPosition(
+                mode="paper",
+                symbol="319660",
+                quantity=0,
+                average_price=None,
+                updated_from="reconciliation",
+                last_reconciled_at=stale_reconciled_at,
+                raw_payload={"source": "broker"},
+            )
+        )
+        session.commit()
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "stale flat position must not be globally healthy",
+            "prices": [{"symbol": "319660", "price": "22500.00"}],
+        },
+    )
+
+    assert response.status_code == 200
+    coverage = response.json()["protective_stop_coverage"]
+    assert coverage["status"] == "degraded"
+    assert coverage["unprotected_position_count"] == 0
+    assert coverage["position_truth_stale_count"] == 1
+    assert coverage["affected_symbols"] == ["319660"]
+    issue = coverage["issues"][0]
+    assert issue["outcome"] == "position_truth_stale"
+    assert issue["position_quantity"] == 0
+    assert issue["position_last_reconciled_at"] == stale_reconciled_at.replace(tzinfo=None).isoformat()
+    assert "broker_order:buy:filled_unexited" in issue["evidence"]
+    assert "sell_monitor:expired" in issue["evidence"]
+    assert broker_adapter.order_calls == []
+
+    runtime_status = client.get("/runtime/status")
+    assert runtime_status.status_code == 200
+    runtime_coverage = runtime_status.json()["liveness"]["monitoring"]["protective_stop_coverage"]
+    assert runtime_coverage["status"] == "degraded"
+    assert runtime_coverage["position_truth_stale_count"] == 1
+    assert runtime_coverage["affected_symbols"] == ["319660"]
+
+    with app.state.db_session_factory() as session:
+        checkpoint = session.scalar(select(MonitoringCheckpoint))
+        assert checkpoint is not None
+        assert checkpoint.status == "degraded"
 
     engine.dispose()
