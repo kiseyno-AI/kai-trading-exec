@@ -104,6 +104,45 @@ def test_upbit_paper_sell_preserves_fractional_base_quantity() -> None:
     assert order["events"][1]["request_payload"]["volume"] == "0.00123456"
 
 
+def test_upbit_paper_limit_order_preserves_limit_price_payloads() -> None:
+    app, engine = build_test_app(
+        Settings(database_url="sqlite:///:memory:", runtime_mode="paper", automation_enabled=True)
+    )
+    client = TestClient(app)
+    resume_runtime(client)
+
+    response = client.post(
+        "/orders",
+        json={
+            "idempotency_key": "upbit-limit-sell-1",
+            "provider": "upbit",
+            "asset_class": "crypto",
+            "venue": "upbit",
+            "symbol": "KRW-BTC",
+            "side": "sell",
+            "order_type": "limit",
+            "limit_price": "150000000.1234",
+            "time_in_force": "day",
+            "exchange": "UPBIT",
+            "base_quantity": "0.00123456",
+            "quantity_precision": 8,
+            "price_precision": 4,
+        },
+    )
+
+    assert response.status_code == 201
+    order = response.json()["order"]
+    assert order["limit_price"] == "150000000.1234"
+    assert order["request_metadata"]["sizing"]["limit_price"] == "150000000.1234"
+    assert order["events"][1]["request_payload"]["price"] == "150000000.1234"
+    assert order["events"][1]["response_payload"]["price"] == "150000000.1234"
+
+    with create_session_factory(engine)() as session:
+        persisted = session.query(BrokerOrder).filter_by(idempotency_key="upbit-limit-sell-1").one()
+        assert persisted.limit_price == Decimal("150000000.1234")
+        assert persisted.raw_broker_payload["price"] == "150000000.1234"
+
+
 def test_upbit_rejects_crypto_integer_quantity() -> None:
     app, _engine = build_test_app(
         Settings(database_url="sqlite:///:memory:", runtime_mode="paper", automation_enabled=True)

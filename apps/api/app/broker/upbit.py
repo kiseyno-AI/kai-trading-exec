@@ -131,7 +131,7 @@ class UpbitBrokerAdapter:
                 "ord_type": request.order_type,
                 "state": "paper_submitted",
                 "volume": str(request.base_quantity) if request.base_quantity is not None else None,
-                "price": str(request.quote_notional) if request.quote_notional is not None else None,
+                "price": _order_price(request),
             },
             message="Upbit paper/mock order accepted",
         )
@@ -241,6 +241,7 @@ class UpbitBrokerAdapter:
             "sizing": {
                 "base_quantity": str(request.base_quantity) if request.base_quantity is not None else None,
                 "quote_notional": str(request.quote_notional) if request.quote_notional is not None else None,
+                "limit_price": str(request.limit_price) if request.limit_price is not None else None,
                 "quantity_precision": request.quantity_precision,
                 "price_precision": request.price_precision,
             },
@@ -252,6 +253,12 @@ class UpbitBrokerAdapter:
             "side": request.side,
             "ord_type": request.order_type,
             "volume": str(request.base_quantity) if request.base_quantity is not None else None,
-            "price": str(request.quote_notional) if request.quote_notional is not None else None,
+            "price": _order_price(request),
             "identifier": request.idempotency_key,
         }
+
+
+def _order_price(request: BrokerOrderPlacementRequest) -> str | None:
+    if request.order_type == "limit":
+        return str(request.limit_price) if request.limit_price is not None else None
+    return str(request.quote_notional) if request.quote_notional is not None else None

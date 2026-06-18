@@ -415,7 +415,7 @@ def _resolve_route_decision(
     command: PlaceOrderRequest,
     plan_item: ExecutionPlanItem | None,
 ) -> RouteDecision | None:
-    if command.provider != "kis" or command.asset_class != "stock":
+    if command.provider != "kis":
         return None
     if not settings.domestic_order_session_routing_enabled:
         return None
@@ -481,6 +481,7 @@ def _sizing_payload(command: PlaceOrderRequest) -> dict[str, object]:
         "quantity": command.quantity,
         "base_quantity": str(command.base_quantity) if command.base_quantity is not None else None,
         "quote_notional": str(command.quote_notional) if command.quote_notional is not None else None,
+        "limit_price": str(command.limit_price) if command.limit_price is not None else None,
         "quantity_precision": command.quantity_precision,
         "price_precision": command.price_precision,
     }
