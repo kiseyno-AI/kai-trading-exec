@@ -1284,6 +1284,100 @@ def test_monitoring_requires_concrete_share_policy_for_protective_stop_coverage(
     engine.dispose()
 
 
+@pytest.mark.parametrize("stop_status", ["broker_order_submitted", "open"])
+def test_monitoring_preserves_in_flight_legacy_stop_when_repairing_coverage(
+    monkeypatch: pytest.MonkeyPatch,
+    stop_status: str,
+) -> None:
+    app, engine, client, broker_adapter, _captured = _build_trigger_agent_app(
+        monkeypatch=monkeypatch,
+        agent_responses=[],
+    )
+    legacy_policy = {"kind": "position_exit_from_entry"}
+    with app.state.db_session_factory() as session:
+        plan = ExecutionPlan(
+            external_plan_id=f"plan-in-flight-legacy-stop-coverage-{stop_status}",
+            source="test",
+            mode="paper",
+            market_date=datetime(2026, 6, 18, tzinfo=UTC).date(),
+            items=[
+                ExecutionPlanItem(
+                    symbol="005930",
+                    side="sell",
+                    intent="stop_sell",
+                    status=stop_status,
+                    quantity_policy=dict(legacy_policy),
+                    trigger_price=Decimal("118000.00"),
+                    time_in_force="day",
+                    risk_context={"exchange": "KRX"},
+                ),
+            ],
+        )
+        session.add(plan)
+        session.add(
+            ExecutionPosition(
+                mode="paper",
+                symbol="005930",
+                quantity=5,
+                average_price=Decimal("120000.0000"),
+                updated_from="reconciliation",
+                last_reconciled_at=datetime.now(UTC),
+                raw_payload={"source": "broker"},
+            )
+        )
+        session.commit()
+        stop_item_id = plan.items[0].id
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "repair legacy in-flight stop coverage",
+            "prices": [{"symbol": "005930", "price": "120500.00"}],
+        },
+    )
+
+    assert response.status_code == 200
+    coverage = response.json()["protective_stop_coverage"]
+    assert coverage["status"] == "ok"
+    assert coverage["unprotected_position_count"] == 0
+    assert coverage["repaired_stop_coverage_count"] == 1
+    assert coverage["issues"] == []
+    assert broker_adapter.order_calls == []
+
+    with app.state.db_session_factory() as session:
+        stop_item = session.get(ExecutionPlanItem, stop_item_id)
+        stop_items = session.scalars(
+            select(ExecutionPlanItem)
+            .where(
+                ExecutionPlanItem.symbol == "005930",
+                ExecutionPlanItem.intent == "stop_sell",
+            )
+            .order_by(ExecutionPlanItem.plan_item_index.asc())
+        ).all()
+        assert stop_item is not None
+        assert stop_item.status == stop_status
+        assert stop_item.quantity_policy == legacy_policy
+        assert "monitoring_events" not in stop_item.risk_context
+        assert len(stop_items) == 2
+
+        repair_item = stop_items[1]
+        assert repair_item.status == "stop_sell_monitoring"
+        assert repair_item.quantity_policy == {"kind": "shares", "quantity": 5}
+        events = repair_item.risk_context["monitoring_events"]
+        assert events[-1]["event"] == "unprotected_position_stop_rearmed"
+        assert events[-1]["active_stop_quantity"] == 0
+        assert events[-1]["missing_quantity"] == 5
+        assert events[-1]["rearmed_quantity"] == 5
+        assert events[-1]["prior_item_id"] == stop_item_id
+        assert events[-1]["prior_status"] == stop_status
+        assert events[-1]["prior_quantity_policy"] == legacy_policy
+        assert events[-1]["cloned_repair_item"] is True
+
+    engine.dispose()
+
+
 def test_monitoring_reports_unprotected_position_when_stop_threshold_missing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -227,6 +227,14 @@ PROTECTIVE_STOP_COVERAGE_STATUSES = frozenset(
         "partially_filled",
     }
 )
+IN_FLIGHT_BROKER_ORDER_ITEM_STATUSES = frozenset(
+    {
+        "broker_order_submission_pending",
+        "broker_order_submitted",
+        "open",
+        "partially_filled",
+    }
+)
 
 
 def materialize_monitoring_plan_items(plan: ExecutionPlan) -> None:
@@ -1921,7 +1929,8 @@ def _repair_unprotected_stop_coverage(
         prior_quantity_policy = latest_item.quantity_policy
         held_quantity = positions[issue.symbol].quantity
         rearm_quantity = issue.missing_quantity
-        if issue.active_stop_quantity > 0:
+        preserve_latest_item = latest_item.status in IN_FLIGHT_BROKER_ORDER_ITEM_STATUSES
+        if issue.active_stop_quantity > 0 or preserve_latest_item:
             repair_item = ExecutionPlanItem(
                 execution_plan_id=latest_item.execution_plan_id,
                 plan_item_index=max(
