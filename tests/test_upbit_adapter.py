@@ -7,7 +7,14 @@ from app.core.config import Settings
 from app.db.base import Base
 from app.db.session import create_db_engine, create_session_factory
 from app.main import create_app
-from app.models.runtime import BrokerOrder, BrokerOrderEvent, ExecutionFill, ExecutionPlanItem, ExecutionPosition
+from app.models.runtime import (
+    BrokerOrder,
+    BrokerOrderEvent,
+    ExecutionFill,
+    ExecutionJob,
+    ExecutionPlanItem,
+    ExecutionPosition,
+)
 
 
 def build_test_app(settings: Settings):
@@ -350,6 +357,108 @@ def test_crypto_paper_plan_dispatch_simulates_fill_and_position() -> None:
         assert event.payload["paper"] is True
 
 
+def test_crypto_paper_dispatch_fails_permanent_budget_guardrail() -> None:
+    app, engine = build_test_app(
+        Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            automation_enabled=True,
+            exec_agent_max_symbol_budget=Decimal("100000"),
+        )
+    )
+    client = TestClient(app)
+    resume_runtime(client)
+
+    plan_response = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "upbit-paper-budget-dispatch-1",
+            "source": "test",
+            "requested_at": datetime(2026, 6, 19, tzinfo=UTC).isoformat(),
+            "items": [
+                {
+                    "symbol": "KRW-BTC",
+                    "side": "buy",
+                    "intent": "paper_crypto_buy",
+                    "provider": "upbit",
+                    "venue": "upbit",
+                    "asset_class": "crypto",
+                    "quote_notional": "100001",
+                    "quantity_policy": {
+                        "kind": "quote_notional",
+                        "quote_notional": "100001",
+                        "idempotency_key": "upbit-paper-budget-dispatch-order-1",
+                    },
+                    "risk_context": {
+                        "provider_metadata": {"provider": "upbit", "venue": "UPBIT"},
+                        "simulated_fill_price": "120000000",
+                    },
+                }
+            ],
+        },
+    )
+
+    assert plan_response.status_code == 201
+    item_id = plan_response.json()["persisted_execution_item_ids"][0]
+
+    dispatch_response = client.post("/execution-jobs/dispatch")
+
+    assert dispatch_response.status_code == 200
+    payload = dispatch_response.json()
+    assert payload["completed_job_count"] == 0
+    assert payload["retrying_job_count"] == 0
+    assert payload["failed_job_count"] == 1
+    assert payload["jobs"][0]["status"] == "failed"
+    assert "budget" in payload["jobs"][0]["last_error"]
+    assert client.get("/orders").json() == []
+
+    with create_session_factory(engine)() as session:
+        job = session.query(ExecutionJob).one()
+        item = session.get(ExecutionPlanItem, item_id)
+        assert item is not None
+        assert job.status == "failed"
+        assert item.status == "crypto_paper_failed"
+
+
+def test_crypto_paper_position_preserves_weighted_average_cost() -> None:
+    app, engine = build_test_app(
+        Settings(database_url="sqlite:///:memory:", runtime_mode="paper", automation_enabled=True)
+    )
+    client = TestClient(app)
+    resume_runtime(client)
+
+    orders = [
+        ("upbit-cost-buy-1", "buy", "0.5", "10000"),
+        ("upbit-cost-buy-2", "buy", "0.5", "20000"),
+        ("upbit-cost-sell-1", "sell", "0.25", "30000"),
+    ]
+    for idempotency_key, side, base_quantity, limit_price in orders:
+        response = client.post(
+            "/orders",
+            json={
+                "idempotency_key": idempotency_key,
+                "provider": "upbit",
+                "asset_class": "crypto",
+                "venue": "upbit",
+                "symbol": "KRW-BTC",
+                "side": side,
+                "order_type": "limit",
+                "time_in_force": "day",
+                "exchange": "UPBIT",
+                "base_quantity": base_quantity,
+                "limit_price": limit_price,
+                "quantity_precision": 8,
+                "price_precision": 0,
+            },
+        )
+        assert response.status_code == 201
+
+    with create_session_factory(engine)() as session:
+        position = session.query(ExecutionPosition).filter_by(symbol="KRW-BTC").one()
+        assert position.base_quantity == Decimal("0.750000000000")
+        assert position.average_price == Decimal("15000.0000")
+
+
 def test_crypto_paper_dispatch_blocked_by_pause() -> None:
     app, _engine = build_test_app(
         Settings(
@@ -457,7 +566,11 @@ def test_crypto_paper_order_rejects_budget_breach() -> None:
     )
 
     assert response.status_code == 409
-    assert "budget" in response.json()["message"]
+    payload = response.json()
+    assert "budget" in payload["message"]
+    assert payload["permanent_rejection"] is True
+    assert payload["rejection_reason"] == payload["message"]
+    assert "block_reason" not in payload
 
 
 def test_kis_stock_order_preserves_integer_quantity_on_adapter_rejection() -> None:

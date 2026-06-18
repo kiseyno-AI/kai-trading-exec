@@ -108,7 +108,8 @@ def place_broker_order(
             payload={
                 "duplicate": False,
                 "message": upbit_guard_error,
-                "block_reason": upbit_guard_error,
+                "permanent_rejection": True,
+                "rejection_reason": upbit_guard_error,
             },
         )
 
@@ -656,13 +657,21 @@ def _apply_upbit_paper_position(
         )
         db.add(position)
     current = position.base_quantity or Decimal("0")
+    current_average_price = position.average_price
     if side == "buy":
         next_quantity = current + base_quantity
+        if current > 0 and current_average_price is not None:
+            next_average_price = (
+                (current * current_average_price) + (base_quantity * average_price)
+            ) / next_quantity
+        else:
+            next_average_price = average_price
     else:
         next_quantity = max(current - base_quantity, Decimal("0"))
+        next_average_price = current_average_price if next_quantity > 0 else None
     position.quantity = 0
     position.base_quantity = next_quantity
-    position.average_price = average_price if next_quantity > 0 else None
+    position.average_price = next_average_price
     position.updated_from = "upbit_paper_simulated_fill"
     position.last_reconciled_at = observed_at
     position.raw_payload = {

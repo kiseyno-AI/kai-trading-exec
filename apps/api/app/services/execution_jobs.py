@@ -377,6 +377,14 @@ def _dispatch_job(
         if isinstance(raw_status, str):
             order_status = raw_status
 
+    if result.payload.get("permanent_rejection") is True:
+        return _finish_job(
+            db=db,
+            job_id=job_id,
+            status="failed",
+            last_error=str(result.payload.get("message") or "broker order rejected permanently"),
+            plan_item_status=_failed_plan_item_status(job.job_type),
+        )
     if result.status_code == 409 and "block_reason" in result.payload:
         return _finish_job(
             db=db,
