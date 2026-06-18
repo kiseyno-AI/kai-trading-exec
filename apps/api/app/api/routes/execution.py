@@ -4,7 +4,12 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 
-from app.api.dependencies import get_broker_adapter, get_db_session, get_settings
+from app.api.dependencies import (
+    get_broker_adapter,
+    get_broker_adapter_for_provider,
+    get_db_session,
+    get_settings,
+)
 from app.api.schemas.execution import (
     ExecutionFailureStatusUpdateRequest,
     ExecutionPlanRequest,
@@ -150,10 +155,10 @@ def monitoring_evaluate(
 def place_order_handler(
     request: Request,
     db: Annotated[Session, Depends(get_db_session)],
-    adapter: Annotated[BrokerAdapter, Depends(get_broker_adapter)],
     payload: PlaceOrderRequest = Body(...),
 ) -> JSONResponse:
     settings: Settings = get_settings(request)
+    adapter = get_broker_adapter_for_provider(request, payload.provider)
     result = place_broker_order(
         settings=settings,
         db=db,

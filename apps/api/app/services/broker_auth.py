@@ -5,6 +5,7 @@ from sqlalchemy.orm import Session
 
 from app.broker.base import BrokerAdapter, BrokerAdapterError, BrokerConfig
 from app.broker.kis import KisBrokerAdapter
+from app.broker.upbit import UpbitBrokerAdapter
 from app.core.config import Settings
 from app.models.runtime import BrokerSession, BrokerSessionEvent
 
@@ -26,7 +27,10 @@ class BrokerSessionActionResult:
     payload: dict[str, object]
 
 
-def build_broker_adapter(settings: Settings) -> BrokerAdapter:
+def build_broker_adapter(settings: Settings, *, provider: str = "kis") -> BrokerAdapter:
+    normalized_provider = provider.strip().lower()
+    if normalized_provider == "upbit":
+        return UpbitBrokerAdapter(settings=settings)
     return KisBrokerAdapter(settings=settings)
 
 

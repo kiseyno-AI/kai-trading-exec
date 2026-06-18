@@ -179,11 +179,18 @@ class BrokerOrderPlacementRequest:
     idempotency_key: str
     symbol: str
     side: str
-    quantity: int
+    quantity: int | None
     order_type: str
     time_in_force: str
     exchange: str
     limit_price: Decimal | None = None
+    base_quantity: Decimal | None = None
+    quote_notional: Decimal | None = None
+    quantity_precision: int | None = None
+    price_precision: int | None = None
+    provider: str | None = None
+    venue: str | None = None
+    asset_class: str = "stock"
     execution_plan_item_id: str | None = None
     order_division: str | None = None
     route_session: str | None = None
