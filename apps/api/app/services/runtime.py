@@ -398,6 +398,15 @@ def monitoring_payload(
         ],
         "last_heartbeat_at": last_heartbeat,
         "last_success_at": last_success,
+        "protective_stop_coverage": latest_details.get("protective_stop_coverage")
+        if isinstance(latest_details.get("protective_stop_coverage"), dict)
+        else {
+            "status": "unknown",
+            "unprotected_position_count": 0,
+            "repaired_stop_coverage_count": 0,
+            "affected_symbols": [],
+            "issues": [],
+        },
         "last_cycle": latest_details or None,
     }
 
