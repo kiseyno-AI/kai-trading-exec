@@ -17,6 +17,7 @@ from app.broker.base import (
 from app.core.config import Settings
 from app.models.runtime import BrokerOrder, ExecutionJob, ExecutionPlan, ExecutionPlanItem, new_id
 from app.services.broker_orders import place_broker_order
+from app.services.broker_auth import build_broker_adapter
 from app.services.rejected_order_retries import (
     BROKER_ORDER_RETRY_JOB_TYPE,
     RetryOrderGuardError,
@@ -34,6 +35,8 @@ LOGGER = logging.getLogger(__name__)
 
 KRX_TIMEZONE = ZoneInfo("Asia/Seoul")
 NEXT_OPEN_BUY_JOB_TYPE = "next_open_buy"
+CRYPTO_PAPER_ORDER_JOB_TYPE = "crypto_paper_order"
+UPBIT_PAPER_ALLOWED_SYMBOLS = frozenset({"KRW-BTC", "KRW-ETH"})
 DISPATCHABLE_JOB_STATUSES = ("queued", "scheduled", "retrying")
 MIN_STALE_RUNNING_JOB_SECONDS = 30
 STALE_RUNNING_JOB_TIMEOUT_MULTIPLIER = 3
@@ -70,6 +73,9 @@ class DispatchExecutionJobsResult:
 
 def materialize_execution_jobs(plan: ExecutionPlan) -> None:
     for item in plan.items:
+        if _is_crypto_paper_plan_item(plan=plan, item=item):
+            _materialize_crypto_paper_job(plan=plan, item=item)
+            continue
         if item.intent != NEXT_OPEN_BUY_JOB_TYPE or item.status != "pending":
             continue
         if _next_open_buy_quantity(item) is None or plan.market_date is None or item.side != "buy":
@@ -95,6 +101,36 @@ def materialize_execution_jobs(plan: ExecutionPlan) -> None:
                 "scheduled_for": scheduled_for.isoformat(),
             },
         )
+
+
+def _materialize_crypto_paper_job(*, plan: ExecutionPlan, item: ExecutionPlanItem) -> None:
+    validation_error = _validate_crypto_paper_plan_item(plan=plan, item=item)
+    if validation_error is not None:
+        item.status = "crypto_paper_rejected"
+        item.risk_context = {
+            **(item.risk_context if isinstance(item.risk_context, dict) else {}),
+            "crypto_paper_block_reason": validation_error,
+        }
+        return
+    item.status = "crypto_paper_queued"
+    item.jobs.append(
+        ExecutionJob(
+            id=new_id(),
+            job_type=CRYPTO_PAPER_ORDER_JOB_TYPE,
+            status="queued",
+            scheduled_for=None,
+        )
+    )
+    LOGGER.info(
+        "crypto_paper_execution_job_created",
+        extra={
+            "plan_id": plan.external_plan_id,
+            "execution_plan_item_id": item.id,
+            "symbol": item.symbol,
+            "provider": item.provider,
+            "job_type": CRYPTO_PAPER_ORDER_JOB_TYPE,
+        },
+    )
 
 
 def list_execution_jobs(
@@ -212,6 +248,9 @@ def serialize_execution_job(job: ExecutionJob) -> dict[str, object]:
         "symbol": plan_item.symbol,
         "side": plan_item.side,
         "intent": plan_item.intent,
+        "provider": plan_item.provider,
+        "asset_class": plan_item.asset_class,
+        "venue": plan_item.venue,
         "created_at": _serialize_datetime(job.created_at),
         "updated_at": _serialize_datetime(job.updated_at),
     }
@@ -281,11 +320,12 @@ def _dispatch_job(
     )
     assert job is not None
 
+    effective_adapter = _adapter_for_job(settings=settings, adapter=adapter, job=job)
     try:
         command = _build_place_order_request(
             settings=settings,
             db=db,
-            adapter=adapter,
+            adapter=effective_adapter,
             job=job,
         )
     except RetryOrderGuardError as exc:
@@ -309,7 +349,7 @@ def _dispatch_job(
         result = place_broker_order(
             settings=settings,
             db=db,
-            adapter=adapter,
+            adapter=effective_adapter,
             command=command,
             request_source=f"execution-job:{job.id}",
         )
@@ -496,6 +536,8 @@ def _build_place_order_request(
             job=job,
             triggered_at=job.locked_at or datetime.now(UTC),
         )
+    if job.job_type == CRYPTO_PAPER_ORDER_JOB_TYPE:
+        return _build_crypto_paper_order_request(job)
     if job.job_type != NEXT_OPEN_BUY_JOB_TYPE:
         raise ValueError(f"unsupported execution job type: {job.job_type}")
 
@@ -515,6 +557,43 @@ def _build_place_order_request(
         time_in_force=plan_item.time_in_force or "day",
         exchange=exchange,
     )
+
+
+def _build_crypto_paper_order_request(job: ExecutionJob) -> PlaceOrderRequest:
+    plan_item = job.plan_item
+    if plan_item.provider != "upbit" or plan_item.asset_class != "crypto" or plan_item.venue != "upbit":
+        raise ValueError("crypto paper job requires explicit Upbit crypto provider metadata")
+    return PlaceOrderRequest(
+        idempotency_key=_place_order_idempotency_key(job),
+        execution_plan_item_id=plan_item.id,
+        provider="upbit",
+        asset_class="crypto",
+        venue="upbit",
+        symbol=plan_item.symbol,
+        side=plan_item.side,
+        quantity=None,
+        base_quantity=plan_item.base_quantity,
+        quote_notional=plan_item.quote_notional,
+        quantity_precision=plan_item.quantity_precision,
+        price_precision=plan_item.price_precision,
+        order_type="limit" if plan_item.limit_price is not None else "market",
+        limit_price=plan_item.limit_price,
+        time_in_force=plan_item.time_in_force or "day",
+        exchange="UPBIT",
+        metadata={"paper": True, "simulated": True},
+    )
+
+
+def _adapter_for_job(
+    *,
+    settings: Settings,
+    adapter: BrokerAdapter,
+    job: ExecutionJob,
+) -> BrokerAdapter:
+    provider = job.plan_item.provider
+    if provider and provider != adapter.provider:
+        return build_broker_adapter(settings, provider=provider)
+    return adapter
 
 
 def _place_order_idempotency_key(job: ExecutionJob) -> str:
@@ -586,6 +665,62 @@ def _parse_positive_decimal(value: object) -> Decimal | None:
     return parsed
 
 
+def _is_crypto_paper_plan_item(*, plan: ExecutionPlan, item: ExecutionPlanItem) -> bool:
+    del plan
+    return item.provider == "upbit" or item.asset_class == "crypto" or item.venue == "upbit"
+
+
+def _validate_crypto_paper_plan_item(*, plan: ExecutionPlan, item: ExecutionPlanItem) -> str | None:
+    if plan.mode != "paper":
+        return "crypto execution plans are paper-only"
+    if item.provider != "upbit":
+        return "crypto paper execution requires provider='upbit'"
+    if item.asset_class != "crypto":
+        return "crypto paper execution requires asset_class='crypto'"
+    if item.venue != "upbit":
+        return "crypto paper execution requires venue='upbit'"
+    if item.symbol not in UPBIT_PAPER_ALLOWED_SYMBOLS:
+        return "crypto paper execution is limited to KRW-BTC and KRW-ETH"
+    if item.side not in {"buy", "sell"}:
+        return "crypto paper execution side must be buy or sell"
+    sizing_count = sum(
+        value is not None
+        for value in (item.base_quantity, item.quote_notional)
+    )
+    if sizing_count != 1:
+        return "crypto paper execution requires exactly one of base_quantity or quote_notional"
+    if item.quote_notional is not None and item.side != "buy":
+        return "quote_notional is only supported for crypto paper buys"
+    if item.quote_notional is not None and _crypto_paper_fill_price(item) is None:
+        return "quote_notional crypto paper buys require simulated_fill_price or reference_price"
+    if (
+        item.base_quantity is not None
+        and item.side == "buy"
+        and item.limit_price is None
+        and _crypto_paper_fill_price(item) is None
+    ):
+        return "base_quantity crypto paper buys require limit_price or simulated_fill_price"
+    return None
+
+
+def _crypto_paper_fill_price(item: ExecutionPlanItem) -> Decimal | None:
+    if item.limit_price is not None:
+        return item.limit_price
+    if not isinstance(item.risk_context, dict):
+        return None
+    for key in ("simulated_fill_price", "paper_fill_price", "reference_price", "estimated_reference_price"):
+        parsed = _parse_positive_decimal(item.risk_context.get(key))
+        if parsed is not None:
+            return parsed
+    provider_metadata = item.risk_context.get("provider_metadata")
+    if isinstance(provider_metadata, dict):
+        for key in ("simulated_fill_price", "paper_fill_price", "reference_price"):
+            parsed = _parse_positive_decimal(provider_metadata.get(key))
+            if parsed is not None:
+                return parsed
+    return None
+
+
 def _next_market_open_utc(market_date: date) -> datetime:
     local_open = datetime.combine(
         market_date,
@@ -616,18 +751,24 @@ def _is_due(job: ExecutionJob, triggered_at: datetime) -> bool:
 def _dispatching_plan_item_status(job_type: str) -> str:
     if job_type == BROKER_ORDER_RETRY_JOB_TYPE:
         return "broker_order_retry_dispatching"
+    if job_type == CRYPTO_PAPER_ORDER_JOB_TYPE:
+        return "crypto_paper_dispatching"
     return "next_open_buy_dispatching"
 
 
 def _retrying_plan_item_status(job_type: str) -> str:
     if job_type == BROKER_ORDER_RETRY_JOB_TYPE:
         return "broker_order_retry_pending"
+    if job_type == CRYPTO_PAPER_ORDER_JOB_TYPE:
+        return "crypto_paper_retry_pending"
     return "next_open_buy_retry_pending"
 
 
 def _failed_plan_item_status(job_type: str) -> str:
     if job_type == BROKER_ORDER_RETRY_JOB_TYPE:
         return "broker_order_failed"
+    if job_type == CRYPTO_PAPER_ORDER_JOB_TYPE:
+        return "crypto_paper_failed"
     return "next_open_buy_failed"
 
 

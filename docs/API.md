@@ -33,6 +33,10 @@ Current foundation response includes:
 - `broker.shared_realtime_subscriptions_supported`
 - `broker.reconnect_supported`
 - `broker.bounded_rest_reconciliation_supported`
+- `broker_providers.kis`
+- `broker_providers.upbit`
+  - provider-specific readiness/session summaries so KIS and Upbit can be
+    inspected independently
 - `safety.paused`
 - `safety.kill_switch_enabled`
 - `safety.automation_enabled`
@@ -108,7 +112,11 @@ Current response includes:
   - `fill_count`
   - `filled_quantity`
   - `position_quantity`
+  - `position_base_quantity`
   - `position_average_price`
+  - `providers[]`
+  - `asset_classes[]`
+  - `venues[]`
   - `latest_activity_at`
 
 ### `GET /runtime/safety`
@@ -189,6 +197,14 @@ Current item behavior additionally includes:
 - safe non-dispatch statuses for unsupported or incomplete short-term buy semantics
   (`pending_configuration`, `unsupported_semantics`, `short_term_watcher_pending`,
   `exec_agent_rejected`)
+- paper-only Upbit crypto items when every item explicitly declares
+  `asset_class=crypto`, `provider=upbit`, and `venue=upbit`; eligible symbols are
+  limited to `KRW-BTC` and `KRW-ETH`
+- crypto paper buys use decimal `base_quantity` or KRW `quote_notional`, never
+  stock integer `quantity`; `quote_notional` paper buys must include a deterministic
+  simulated fill price in `risk_context.simulated_fill_price`,
+  `risk_context.paper_fill_price`, `risk_context.reference_price`, or
+  `risk_context.provider_metadata`
 
 ### `POST /execution-plans/preview`
 Runs execution-plan intake, exec-agent decision/sizing, job materialization, and
@@ -249,6 +265,13 @@ Current response includes:
 - `symbol`
 - `side`
 - `intent`
+- `provider`
+- `asset_class`
+- `venue`
+
+Upbit crypto paper execution plans materialize as `crypto_paper_order` jobs.
+Dispatch uses the normal execution-job lifecycle and broker-order audit trail,
+but routes to the Upbit provider adapter for `provider=upbit` plan items.
 
 ### `GET /symbols`
 List symbol-level execution readback rows for the active runtime mode.
@@ -256,8 +279,14 @@ List symbol-level execution readback rows for the active runtime mode.
 Current response includes:
 - `symbol`
 - `mode`
+- `providers[]`
+- `asset_classes[]`
+- `venues[]`
 - `monitored`
 - `monitoring_statuses[]`
+- `filled_base_quantity`
+- `filled_quote_notional`
+- `position_base_quantity`
 - `intents[]`
 - `plan_item_count`
 - `latest_plan_item_status`
@@ -360,6 +389,17 @@ quantity record `skipped` and do not create retry jobs.
 Manually dispatch due execution jobs through the broker adapter boundary.
 
 The autonomous runtime now dispatches due jobs on its configured cadence.
+
+Crypto paper dispatch is blocked by the same durable pause, kill-switch, and
+automation gates as stock execution. It also fails closed unless the Upbit
+provider reports configured readiness, runtime mode is `paper`, the symbol is
+whitelisted (`KRW-BTC` or `KRW-ETH`), and buy notional is within the configured
+per-symbol execution budget.
+
+Successful Upbit paper dispatch records a simulated placement followed by a
+clearly marked `paper_fill_simulated` broker-order event, a decimal crypto fill,
+and a decimal crypto position update. Live Upbit placement remains disabled by
+default and is not implemented by this API.
 This endpoint remains as an operator/manual override.
 
 Current response includes:

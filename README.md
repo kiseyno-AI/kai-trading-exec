@@ -106,6 +106,17 @@ KIS auth/session settings currently supported:
 - `KAI_EXEC_KIS_USE_HASHKEY`
 - `KAI_EXEC_KIS_REQUEST_TIMEOUT_SECONDS`
 
+Upbit crypto paper settings currently supported:
+- `KAI_EXEC_UPBIT_ACCESS_KEY`
+- `KAI_EXEC_UPBIT_SECRET_KEY`
+- `KAI_EXEC_UPBIT_BASE_URL`
+- `KAI_EXEC_UPBIT_LIVE_TRADING_ENABLED` (defaults to `false`)
+- `KAI_EXEC_UPBIT_REQUEST_TIMEOUT_SECONDS`
+
+In `paper` mode, Upbit is considered configured without live keys so BTC/ETH
+paper dry runs can exercise the exec lifecycle. Live Upbit order submission is
+disabled by default and is not implemented in this runtime slice.
+
 Monitoring runtime settings currently supported:
 - `KAI_EXEC_AUTONOMOUS_RUNTIME_ENABLED`
 - `KAI_EXEC_DISPATCH_LOOP_INTERVAL_SECONDS`
@@ -231,6 +242,11 @@ Initial broker-order submission endpoint:
 
 Current execution slices:
 - `POST /execution-plans` schedules durable `execution_jobs` for eligible `next_open_buy` items
+- paper-mode Upbit crypto plans with explicit `asset_class=crypto`,
+  `provider=upbit`, and `venue=upbit` can queue `crypto_paper_order` jobs for
+  whitelisted `KRW-BTC` and `KRW-ETH`; dispatch records simulated paper
+  placement/fill audit events and decimal fill/position readback without live
+  Upbit placement
 - short-term watcher `next_open_buy` candidates from `short-term-decider` are run through deterministic exec-agent rails before scheduling; approved next-open candidates are converted to concrete share quantities using account cash/buying power, existing exposure/open-order guards, candidate budget, confidence/conviction, and target/stop presence
 - monitored buy/sell triggers can call exec-agent at trigger time, immediately before broker submission, with current quote/account/order context; `execute_now` decisions drive submitted quantity and optional limit/target/stop adjustments, while `keep_watching`, `delay`, and `reject` are persisted on the monitoring item without submitting
 - the autonomous dispatch loop submits due jobs on its configured cadence

@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal, ROUND_DOWN
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -18,6 +19,7 @@ from app.broker.base import (
 )
 from app.core.config import Settings
 from app.models.runtime import BrokerOrder, BrokerOrderEvent, ExecutionPlan, ExecutionPlanItem
+from app.models.runtime import ExecutionFill, ExecutionPosition, new_id
 from app.services.broker_auth import ensure_authenticated_broker_session
 from app.services.domestic_order_router import RouteDecision, resolve_domestic_order_route
 from app.services.execution_failures import record_actionable_execution_failure
@@ -28,6 +30,8 @@ from app.services.runtime_controls import (
     ensure_runtime_control_state,
     runtime_safety_payload,
 )
+
+UPBIT_PAPER_ALLOWED_SYMBOLS = frozenset({"KRW-BTC", "KRW-ETH"})
 
 
 @dataclass(frozen=True)
@@ -90,6 +94,22 @@ def place_broker_order(
         return PlaceBrokerOrderResult(
             status_code=422,
             payload={"message": validation_error},
+        )
+
+    upbit_guard_error = _validate_upbit_paper_guardrails(
+        settings=settings,
+        adapter=adapter,
+        command=command,
+        plan_item=plan_item,
+    )
+    if upbit_guard_error is not None:
+        return PlaceBrokerOrderResult(
+            status_code=409,
+            payload={
+                "duplicate": False,
+                "message": upbit_guard_error,
+                "block_reason": upbit_guard_error,
+            },
         )
 
     route_decision = _resolve_route_decision(
@@ -313,6 +333,15 @@ def place_broker_order(
     if plan_item is not None:
         plan_item.status = _plan_item_status_for_order_status(order.status)
 
+    _record_upbit_paper_simulated_fill(
+        settings=settings,
+        db=db,
+        order=order,
+        command=routed_command,
+        plan_item=plan_item,
+        observed_at=event_observed_at + timedelta(microseconds=1),
+    )
+
     if before_success_commit is not None:
         before_success_commit()
 
@@ -381,6 +410,43 @@ def _validate_plan_item(
         return "execution plan item provider does not match order provider"
     if plan_item.asset_class and plan_item.asset_class != command.asset_class:
         return "execution plan item asset_class does not match order asset_class"
+    if plan_item.venue and command.venue and plan_item.venue != command.venue:
+        return "execution plan item venue does not match order venue"
+    return None
+
+
+def _validate_upbit_paper_guardrails(
+    *,
+    settings: Settings,
+    adapter: BrokerAdapter,
+    command: PlaceOrderRequest,
+    plan_item: ExecutionPlanItem | None,
+) -> str | None:
+    if command.provider != "upbit" and adapter.provider != "upbit":
+        return None
+    if command.provider != "upbit" or adapter.provider != "upbit":
+        return "Upbit crypto paper execution requires provider='upbit'"
+    if command.asset_class != "crypto":
+        return "Upbit crypto paper execution requires asset_class='crypto'"
+    if (command.venue or "").lower() != "upbit":
+        return "Upbit crypto paper execution requires venue='upbit'"
+    if command.exchange != "UPBIT":
+        return "Upbit crypto paper execution requires exchange='UPBIT'"
+    if command.symbol not in UPBIT_PAPER_ALLOWED_SYMBOLS:
+        return "Upbit crypto paper execution is limited to KRW-BTC and KRW-ETH"
+    if settings.runtime_mode != "paper":
+        return "Upbit execution is paper-only in this runtime"
+    config = adapter.describe()
+    if config.provider != "upbit" or not config.configured:
+        return config.reason or "Upbit provider readiness is uncertain"
+    if plan_item is not None:
+        if plan_item.provider != "upbit" or plan_item.asset_class != "crypto" or plan_item.venue != "upbit":
+            return "execution plan item must explicitly declare Upbit crypto provider metadata"
+    notional = _order_notional(command=command, plan_item=plan_item)
+    if command.side == "buy" and notional is None:
+        return "Upbit crypto paper buy requires deterministic quote_notional or limit-price notional"
+    if notional is not None and notional > settings.exec_agent_max_symbol_budget:
+        return "Upbit crypto paper order exceeds per-symbol execution budget"
     return None
 
 
@@ -485,6 +551,187 @@ def _sizing_payload(command: PlaceOrderRequest) -> dict[str, object]:
         "quantity_precision": command.quantity_precision,
         "price_precision": command.price_precision,
     }
+
+
+def _record_upbit_paper_simulated_fill(
+    *,
+    settings: Settings,
+    db: Session,
+    order: BrokerOrder,
+    command: PlaceOrderRequest,
+    plan_item: ExecutionPlanItem | None,
+    observed_at: datetime,
+) -> None:
+    if command.provider != "upbit" or settings.runtime_mode != "paper":
+        return
+    fill_price = _simulated_fill_price(command=command, plan_item=plan_item)
+    if fill_price is None:
+        return
+    base_quantity = _simulated_base_quantity(command=command, fill_price=fill_price)
+    quote_notional = _order_notional(command=command, plan_item=plan_item)
+    if base_quantity is None or base_quantity <= 0:
+        return
+
+    order.status = NormalizedBrokerOrderStatus.FILLED.value
+    order.last_broker_sync_at = observed_at
+    if plan_item is not None:
+        plan_item.status = "filled"
+
+    fill = ExecutionFill(
+        broker_order_pk=order.id,
+        broker_fill_id=f"paper-fill:{order.idempotency_key}",
+        symbol=order.symbol,
+        side=order.side,
+        quantity=0,
+        base_quantity=base_quantity,
+        quote_notional=quote_notional,
+        price=fill_price,
+        filled_at=observed_at,
+        payload={
+            "provider": "upbit",
+            "mode": "paper",
+            "simulated": True,
+            "asset_class": "crypto",
+            "venue": "upbit",
+            "base_quantity": str(base_quantity),
+            "quote_notional": str(quote_notional) if quote_notional is not None else None,
+            "price": str(fill_price),
+        },
+    )
+    db.add(fill)
+    db.add(
+        BrokerOrderEvent(
+            broker_order_pk=order.id,
+            event_type="paper_fill_simulated",
+            event_source=BrokerEventSource.SYSTEM.value,
+            normalized_status=NormalizedBrokerOrderStatus.FILLED.value,
+            broker_status="paper_filled",
+            message="Upbit paper fill simulated",
+            request_payload=_order_command_payload(command),
+            response_payload=fill.payload,
+            payload={"provider": "upbit", "paper": True, "simulated": True},
+            observed_at=observed_at,
+        )
+    )
+    _apply_upbit_paper_position(
+        settings=settings,
+        db=db,
+        symbol=order.symbol,
+        side=order.side,
+        base_quantity=base_quantity,
+        average_price=fill_price,
+        observed_at=observed_at,
+        fill_payload=fill.payload,
+    )
+
+
+def _apply_upbit_paper_position(
+    *,
+    settings: Settings,
+    db: Session,
+    symbol: str,
+    side: str,
+    base_quantity: Decimal,
+    average_price: Decimal,
+    observed_at: datetime,
+    fill_payload: dict[str, object],
+) -> None:
+    position = db.scalar(
+        select(ExecutionPosition).where(
+            ExecutionPosition.mode == settings.runtime_mode,
+            ExecutionPosition.symbol == symbol,
+        )
+    )
+    if position is None:
+        position = ExecutionPosition(
+            id=new_id(),
+            mode=settings.runtime_mode,
+            symbol=symbol,
+            quantity=0,
+            base_quantity=Decimal("0"),
+            average_price=None,
+            updated_from="upbit_paper_simulated_fill",
+            last_reconciled_at=observed_at,
+            raw_payload={"provider": "upbit", "paper": True, "simulated": True},
+        )
+        db.add(position)
+    current = position.base_quantity or Decimal("0")
+    if side == "buy":
+        next_quantity = current + base_quantity
+    else:
+        next_quantity = max(current - base_quantity, Decimal("0"))
+    position.quantity = 0
+    position.base_quantity = next_quantity
+    position.average_price = average_price if next_quantity > 0 else None
+    position.updated_from = "upbit_paper_simulated_fill"
+    position.last_reconciled_at = observed_at
+    position.raw_payload = {
+        "provider": "upbit",
+        "paper": True,
+        "simulated": True,
+        "last_fill": fill_payload,
+    }
+
+
+def _simulated_fill_price(
+    *,
+    command: PlaceOrderRequest,
+    plan_item: ExecutionPlanItem | None,
+) -> Decimal | None:
+    if command.limit_price is not None:
+        return command.limit_price
+    risk_context = plan_item.risk_context if plan_item is not None else None
+    if not isinstance(risk_context, dict):
+        return None
+    for key in ("simulated_fill_price", "paper_fill_price", "reference_price", "estimated_reference_price"):
+        value = risk_context.get(key)
+        parsed = _positive_decimal(value)
+        if parsed is not None:
+            return parsed
+    provider_metadata = risk_context.get("provider_metadata")
+    if isinstance(provider_metadata, dict):
+        for key in ("simulated_fill_price", "paper_fill_price", "reference_price"):
+            parsed = _positive_decimal(provider_metadata.get(key))
+            if parsed is not None:
+                return parsed
+    return None
+
+
+def _simulated_base_quantity(
+    *,
+    command: PlaceOrderRequest,
+    fill_price: Decimal,
+) -> Decimal | None:
+    if command.base_quantity is not None:
+        return command.base_quantity
+    if command.quote_notional is None:
+        return None
+    return (command.quote_notional / fill_price).quantize(Decimal("0.000000000001"), rounding=ROUND_DOWN)
+
+
+def _order_notional(
+    *,
+    command: PlaceOrderRequest,
+    plan_item: ExecutionPlanItem | None,
+) -> Decimal | None:
+    if command.quote_notional is not None:
+        return command.quote_notional
+    price = command.limit_price or _simulated_fill_price(command=command, plan_item=plan_item)
+    if command.base_quantity is None or price is None:
+        return None
+    return (command.base_quantity * price).quantize(Decimal("0.0001"), rounding=ROUND_DOWN)
+
+
+def _positive_decimal(value: object) -> Decimal | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        parsed = Decimal(str(value).strip())
+    except Exception:
+        return None
+    if parsed <= 0:
+        return None
+    return parsed
 
 
 def _order_purpose(
