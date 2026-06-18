@@ -9,7 +9,7 @@ from sqlalchemy import select
 
 from app.broker.base import BrokerAdapterError, BrokerConfig
 from app.core.config import Settings
-from app.models.runtime import BrokerOrder, ExecutionPlan, ExecutionPlanItem, ExecutionPosition
+from app.models.runtime import BrokerOrder, ExecutionPlan, ExecutionPlanItem, ExecutionPosition, MonitoringCheckpoint
 from app.services import trigger_time_exec_agent
 from test_broker_auth import (
     KIS_PAPER_API_BASE_URL,
@@ -1038,5 +1038,174 @@ def test_runtime_status_exposes_trigger_time_agent_state_counts(
 
     with app.state.db_session_factory() as session:
         assert session.scalar(select(BrokerOrder)) is None
+
+    engine.dispose()
+
+
+def test_monitoring_rearms_partial_protective_stop_coverage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, engine, client, _broker_adapter, _captured = _build_trigger_agent_app(
+        monkeypatch=monkeypatch,
+        agent_responses=[],
+    )
+    with app.state.db_session_factory() as session:
+        plan = ExecutionPlan(
+            external_plan_id="plan-partial-protective-stop-coverage",
+            source="test",
+            mode="paper",
+            market_date=datetime(2026, 6, 18, tzinfo=UTC).date(),
+            items=[
+                ExecutionPlanItem(
+                    symbol="005930",
+                    side="sell",
+                    intent="stop_sell",
+                    status="broker_order_submitted",
+                    quantity_policy={"kind": "shares", "quantity": 1},
+                    trigger_price=Decimal("118000.00"),
+                    time_in_force="day",
+                    risk_context={"exchange": "KRX"},
+                ),
+            ],
+        )
+        session.add(plan)
+        session.add(
+            ExecutionPosition(
+                mode="paper",
+                symbol="005930",
+                quantity=5,
+                average_price=Decimal("120000.0000"),
+                updated_from="reconciliation",
+                last_reconciled_at=datetime.now(UTC),
+                raw_payload={"source": "broker"},
+            )
+        )
+        session.commit()
+        stop_item_id = plan.items[0].id
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "repair partial protective stop coverage",
+            "prices": [{"symbol": "005930", "price": "120500.00"}],
+        },
+    )
+
+    assert response.status_code == 200
+    coverage = response.json()["protective_stop_coverage"]
+    assert coverage["status"] == "ok"
+    assert coverage["unprotected_position_count"] == 0
+    assert coverage["repaired_stop_coverage_count"] == 1
+    assert coverage["affected_symbols"] == []
+    assert coverage["issues"] == []
+
+    runtime_status = client.get("/runtime/status")
+    assert runtime_status.status_code == 200
+    runtime_coverage = runtime_status.json()["liveness"]["monitoring"]["protective_stop_coverage"]
+    assert runtime_coverage["status"] == "ok"
+    assert runtime_coverage["repaired_stop_coverage_count"] == 1
+
+    with app.state.db_session_factory() as session:
+        stop_item = session.get(ExecutionPlanItem, stop_item_id)
+        stop_items = session.scalars(
+            select(ExecutionPlanItem)
+            .where(
+                ExecutionPlanItem.symbol == "005930",
+                ExecutionPlanItem.intent == "stop_sell",
+            )
+            .order_by(ExecutionPlanItem.plan_item_index.asc())
+        ).all()
+        checkpoint = session.scalar(select(MonitoringCheckpoint))
+        assert stop_item is not None
+        assert checkpoint is not None
+        assert stop_item.status == "broker_order_submitted"
+        assert stop_item.quantity_policy == {"kind": "shares", "quantity": 1}
+        assert len(stop_items) == 2
+        repair_item = stop_items[1]
+        assert repair_item.status == "stop_sell_monitoring"
+        assert repair_item.quantity_policy == {"kind": "shares", "quantity": 4}
+        events = repair_item.risk_context["monitoring_events"]
+        assert events[-1]["event"] == "unprotected_position_stop_rearmed"
+        assert events[-1]["held_quantity"] == 5
+        assert events[-1]["active_stop_quantity"] == 1
+        assert events[-1]["missing_quantity"] == 4
+        assert events[-1]["rearmed_quantity"] == 4
+        assert events[-1]["prior_item_id"] == stop_item_id
+        assert checkpoint.status == "running"
+        assert checkpoint.details["protective_stop_coverage"]["repaired_stop_coverage_count"] == 1
+
+    engine.dispose()
+
+
+@pytest.mark.parametrize("stop_status", ["open", "partially_filled"])
+def test_monitoring_counts_broker_truth_live_stop_as_protective_coverage(
+    monkeypatch: pytest.MonkeyPatch,
+    stop_status: str,
+) -> None:
+    app, engine, client, broker_adapter, _captured = _build_trigger_agent_app(
+        monkeypatch=monkeypatch,
+        agent_responses=[],
+    )
+    with app.state.db_session_factory() as session:
+        plan = ExecutionPlan(
+            external_plan_id=f"plan-live-stop-coverage-{stop_status}",
+            source="test",
+            mode="paper",
+            market_date=datetime(2026, 6, 18, tzinfo=UTC).date(),
+            items=[
+                ExecutionPlanItem(
+                    symbol="005930",
+                    side="sell",
+                    intent="stop_sell",
+                    status=stop_status,
+                    quantity_policy={"kind": "shares", "quantity": 5},
+                    trigger_price=Decimal("118000.00"),
+                    time_in_force="day",
+                    risk_context={"exchange": "KRX"},
+                ),
+            ],
+        )
+        session.add(plan)
+        session.add(
+            ExecutionPosition(
+                mode="paper",
+                symbol="005930",
+                quantity=5,
+                average_price=Decimal("120000.0000"),
+                updated_from="reconciliation",
+                last_reconciled_at=datetime.now(UTC),
+                raw_payload={"source": "broker"},
+            )
+        )
+        session.commit()
+        stop_item_id = plan.items[0].id
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "verify broker truth protective stop coverage",
+            "prices": [{"symbol": "005930", "price": "120500.00"}],
+        },
+    )
+
+    assert response.status_code == 200
+    coverage = response.json()["protective_stop_coverage"]
+    assert coverage["status"] == "ok"
+    assert coverage["unprotected_position_count"] == 0
+    assert coverage["repaired_stop_coverage_count"] == 0
+    assert coverage["affected_symbols"] == []
+    assert coverage["issues"] == []
+    assert broker_adapter.order_calls == []
+
+    with app.state.db_session_factory() as session:
+        stop_item = session.get(ExecutionPlanItem, stop_item_id)
+        assert stop_item is not None
+        assert stop_item.status == stop_status
+        assert stop_item.quantity_policy == {"kind": "shares", "quantity": 5}
+        assert "monitoring_events" not in stop_item.risk_context
 
     engine.dispose()

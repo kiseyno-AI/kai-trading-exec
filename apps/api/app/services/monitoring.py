@@ -195,8 +195,33 @@ class TriggerTimeAgentActionResult:
     result_payload: dict[str, object]
 
 
+@dataclass(frozen=True)
+class ProtectiveStopCoverageIssue:
+    symbol: str
+    held_quantity: int
+    active_stop_quantity: int
+    missing_quantity: int
+    latest_stop_item_id: str | None
+    latest_stop_status: str | None
+    latest_stop_trigger_price: Decimal | None
+    outcome: str
+
+
 PROFIT_PROTECTION_TRIGGER_REASONS = frozenset(
     {"profit_protection_trailing_stop", "aged_position_profit_protection"}
+)
+PROTECTIVE_STOP_COVERAGE_STATUSES = frozenset(
+    {
+        "stop_sell_monitoring",
+        "stop_sell_triggered_pending_dispatch",
+        AGENT_PENDING_STATUS,
+        AGENT_APPROVED_PENDING_SUBMIT_STATUS,
+        "broker_order_submission_pending",
+        "broker_order_submitted",
+        "broker_order_retry_pending",
+        "open",
+        "partially_filled",
+    }
 )
 
 
@@ -394,6 +419,19 @@ def _evaluate_monitoring_cycle(
         triggered_at=triggered_at,
     )
     if post_entry_maintenance_count:
+        db.flush()
+        items = _load_monitored_items(
+            settings=settings,
+            db=db,
+            exclude_pending_config=allow_persisted_triggered_without_price,
+        )
+    coverage_issues, repaired_stop_coverage_count = _repair_unprotected_stop_coverage(
+        settings=settings,
+        db=db,
+        positions_by_symbol=positions_by_symbol,
+        triggered_at=triggered_at,
+    )
+    if repaired_stop_coverage_count:
         db.flush()
         items = _load_monitored_items(
             settings=settings,
@@ -1045,16 +1083,21 @@ def _evaluate_monitoring_cycle(
         "agent_rejected_count": agent_status_counts["agent_rejected"],
         "agent_approved_submitted_count": agent_status_counts["agent_approved_submitted"],
         "post_entry_review_count": post_entry_review_count,
+        "protective_stop_coverage": _protective_stop_coverage_payload(
+            issues=coverage_issues,
+            repaired_count=repaired_stop_coverage_count,
+        ),
     }
 
     checkpoint = None
     if items or update_checkpoint_if_idle:
+        unprotected_count = sum(1 for issue in coverage_issues if issue.outcome == "unprotected_position")
         checkpoint = _update_monitoring_checkpoint(
             settings=settings,
             db=db,
             worker_name=MONITORING_WORKER_NAME,
             triggered_at=triggered_at,
-            status="degraded" if deferred_item_count > 0 else "running",
+            status="degraded" if deferred_item_count > 0 or unprotected_count > 0 else "running",
             details=checkpoint_details,
         )
     return EvaluateMonitoringResult(
@@ -1067,6 +1110,7 @@ def _evaluate_monitoring_cycle(
             "submitted_order_count": submitted_order_count,
             "blocked_item_count": blocked_item_count,
             "deferred_item_count": deferred_item_count,
+            "protective_stop_coverage": checkpoint_details["protective_stop_coverage"],
             "items": results,
         },
     )
@@ -1808,6 +1852,218 @@ def _reactivate_retryable_protective_stops(
                 "recorded_at": triggered_at.isoformat(),
             },
         )
+
+
+def _repair_unprotected_stop_coverage(
+    *,
+    settings: Settings,
+    db: Session,
+    positions_by_symbol: dict[str, ExecutionPosition],
+    triggered_at: datetime,
+) -> tuple[list[ProtectiveStopCoverageIssue], int]:
+    positions = {
+        symbol: position
+        for symbol, position in positions_by_symbol.items()
+        if position.quantity > 0
+    }
+    if not positions:
+        return [], 0
+
+    stop_items = db.scalars(
+        select(ExecutionPlanItem)
+        .join(ExecutionPlanItem.plan)
+        .where(
+            ExecutionPlan.mode == settings.runtime_mode,
+            ExecutionPlanItem.symbol.in_(sorted(positions)),
+            ExecutionPlanItem.side == "sell",
+            ExecutionPlanItem.intent == "stop_sell",
+        )
+        .options(selectinload(ExecutionPlanItem.plan))
+        .order_by(
+            ExecutionPlan.market_date.desc(),
+            ExecutionPlan.accepted_at.desc(),
+            ExecutionPlan.id.desc(),
+            ExecutionPlanItem.plan_item_index.asc(),
+            ExecutionPlanItem.id.asc(),
+        )
+    ).all()
+    items_by_symbol: dict[str, list[ExecutionPlanItem]] = {symbol: [] for symbol in positions}
+    for item in stop_items:
+        items_by_symbol.setdefault(item.symbol, []).append(item)
+
+    repaired_count = 0
+    issues = _protective_stop_coverage_issues(
+        positions=positions,
+        items_by_symbol=items_by_symbol,
+        repaired_symbols=set(),
+    )
+    for issue in issues:
+        if issue.outcome != "unprotected_position":
+            continue
+        latest_item = _latest_rearmable_stop_item(items_by_symbol.get(issue.symbol, []))
+        if latest_item is None or latest_item.trigger_price is None:
+            continue
+        prior_status = latest_item.status
+        prior_quantity_policy = latest_item.quantity_policy
+        held_quantity = positions[issue.symbol].quantity
+        rearm_quantity = issue.missing_quantity
+        if issue.active_stop_quantity > 0:
+            repair_item = ExecutionPlanItem(
+                execution_plan_id=latest_item.execution_plan_id,
+                plan_item_index=max(
+                    (item.plan_item_index for item in items_by_symbol.get(issue.symbol, [])),
+                    default=0,
+                )
+                + 1,
+                symbol=latest_item.symbol,
+                side="sell",
+                intent="stop_sell",
+                status="stop_sell_monitoring",
+                quantity_policy={"kind": "shares", "quantity": rearm_quantity},
+                limit_price=latest_item.limit_price,
+                trigger_price=latest_item.trigger_price,
+                time_in_force=latest_item.time_in_force,
+                risk_context=dict(latest_item.risk_context or {}),
+                decision_agent_name=latest_item.decision_agent_name,
+                decision_snapshot_id=latest_item.decision_snapshot_id,
+                decision_run_id=latest_item.decision_run_id,
+                source_plan_item_id=latest_item.source_plan_item_id,
+                source_market_date=latest_item.source_market_date,
+            )
+            db.add(repair_item)
+            items_by_symbol.setdefault(issue.symbol, []).append(repair_item)
+            rearmed_item = repair_item
+        else:
+            latest_item.status = "stop_sell_monitoring"
+            latest_item.quantity_policy = {"kind": "shares", "quantity": rearm_quantity}
+            rearmed_item = latest_item
+        _record_monitoring_event(
+            item=rearmed_item,
+            event={
+                "event": "unprotected_position_stop_rearmed",
+                "reason": "active_stop_coverage_below_held_quantity",
+                "held_quantity": held_quantity,
+                "active_stop_quantity": issue.active_stop_quantity,
+                "missing_quantity": issue.missing_quantity,
+                "rearmed_quantity": rearm_quantity,
+                "prior_item_id": latest_item.id,
+                "prior_status": prior_status,
+                "prior_quantity_policy": prior_quantity_policy,
+                "recorded_at": triggered_at.isoformat(),
+            },
+        )
+        repaired_count += 1
+
+    if repaired_count:
+        issues = _protective_stop_coverage_issues(
+            positions=positions,
+            items_by_symbol=items_by_symbol,
+            repaired_symbols={
+                issue.symbol
+                for issue in issues
+                if _latest_rearmable_stop_item(items_by_symbol.get(issue.symbol, [])) is not None
+            },
+        )
+    return issues, repaired_count
+
+
+def _protective_stop_coverage_issues(
+    *,
+    positions: dict[str, ExecutionPosition],
+    items_by_symbol: dict[str, list[ExecutionPlanItem]],
+    repaired_symbols: set[str],
+) -> list[ProtectiveStopCoverageIssue]:
+    issues: list[ProtectiveStopCoverageIssue] = []
+    for symbol in sorted(positions):
+        held_quantity = positions[symbol].quantity
+        items = items_by_symbol.get(symbol, [])
+        active_quantity = sum(
+            quantity
+            for item in items
+            if item.status in PROTECTIVE_STOP_COVERAGE_STATUSES
+            for quantity in [
+                _protective_stop_coverage_quantity(
+                    item.quantity_policy,
+                    held_quantity=held_quantity,
+                )
+            ]
+            if quantity is not None
+        )
+        if active_quantity >= held_quantity:
+            continue
+        latest_item = _latest_stop_item(items)
+        missing_quantity = held_quantity - active_quantity
+        issues.append(
+            ProtectiveStopCoverageIssue(
+                symbol=symbol,
+                held_quantity=held_quantity,
+                active_stop_quantity=active_quantity,
+                missing_quantity=missing_quantity,
+                latest_stop_item_id=latest_item.id if latest_item is not None else None,
+                latest_stop_status=latest_item.status if latest_item is not None else None,
+                latest_stop_trigger_price=latest_item.trigger_price if latest_item is not None else None,
+                outcome=(
+                    "rearmed"
+                    if symbol in repaired_symbols and latest_item is not None and latest_item.trigger_price is not None
+                    else "unprotected_position"
+                ),
+            )
+        )
+    return issues
+
+
+def _latest_stop_item(items: list[ExecutionPlanItem]) -> ExecutionPlanItem | None:
+    return items[0] if items else None
+
+
+def _latest_rearmable_stop_item(items: list[ExecutionPlanItem]) -> ExecutionPlanItem | None:
+    for item in items:
+        if item.trigger_price is not None:
+            return item
+    return None
+
+
+def _shares_quantity(quantity_policy: dict[str, object] | None) -> int | None:
+    if not isinstance(quantity_policy, dict) or quantity_policy.get("kind") != "shares":
+        return None
+    return _parse_positive_int(quantity_policy.get("quantity"))
+
+
+def _protective_stop_coverage_quantity(
+    quantity_policy: dict[str, object] | None,
+    *,
+    held_quantity: int,
+) -> int | None:
+    if _quantity_policy_requires_position_exit(quantity_policy):
+        return held_quantity
+    return _shares_quantity(quantity_policy)
+
+
+def _protective_stop_coverage_payload(
+    *,
+    issues: list[ProtectiveStopCoverageIssue],
+    repaired_count: int,
+) -> dict[str, object]:
+    unprotected = [issue for issue in issues if issue.outcome == "unprotected_position"]
+    return {
+        "status": "degraded" if unprotected else "ok",
+        "unprotected_position_count": len(unprotected),
+        "repaired_stop_coverage_count": repaired_count,
+        "affected_symbols": [issue.symbol for issue in unprotected],
+        "issues": [
+            {
+                "symbol": issue.symbol,
+                "held_quantity": issue.held_quantity,
+                "active_stop_quantity": issue.active_stop_quantity,
+                "missing_quantity": issue.missing_quantity,
+                "latest_stop_item_id": issue.latest_stop_item_id,
+                "latest_stop_status": issue.latest_stop_status,
+                "latest_stop_trigger_price": _serialize_decimal(issue.latest_stop_trigger_price),
+                "outcome": issue.outcome,
+            }
+            for issue in issues
+        ],
+    }
 
 
 def _watch_buy_retry_blocked_until(
