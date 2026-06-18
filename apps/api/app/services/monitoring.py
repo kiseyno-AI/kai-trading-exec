@@ -2006,12 +2006,7 @@ def _protective_stop_coverage_issues(
             quantity
             for item in items
             if item.status in PROTECTIVE_STOP_COVERAGE_STATUSES
-            for quantity in [
-                _protective_stop_coverage_quantity(
-                    item.quantity_policy,
-                    held_quantity=held_quantity,
-                )
-            ]
+            for quantity in [_shares_quantity(item.quantity_policy)]
             if quantity is not None
         )
         if active_quantity >= held_quantity:
@@ -2219,16 +2214,6 @@ def _shares_quantity(quantity_policy: dict[str, object] | None) -> int | None:
     if not isinstance(quantity_policy, dict) or quantity_policy.get("kind") != "shares":
         return None
     return _parse_positive_int(quantity_policy.get("quantity"))
-
-
-def _protective_stop_coverage_quantity(
-    quantity_policy: dict[str, object] | None,
-    *,
-    held_quantity: int,
-) -> int | None:
-    if _quantity_policy_requires_position_exit(quantity_policy):
-        return held_quantity
-    return _shares_quantity(quantity_policy)
 
 
 def _protective_stop_coverage_payload(
@@ -2631,7 +2616,7 @@ def _ensure_post_entry_stop_monitor(
             side="sell",
             intent="stop_sell",
             status="stop_sell_monitoring",
-            quantity_policy={"kind": "position_exit_from_entry"},
+            quantity_policy={"kind": "shares", "quantity": quantity},
             trigger_price=stop_price,
             time_in_force=entry_item.time_in_force or "day",
             risk_context={

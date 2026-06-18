@@ -4401,7 +4401,7 @@ def test_monitoring_creates_post_entry_protective_monitors_after_buy_fill() -> N
         stop_item = items_by_intent["stop_sell"]
         assert stop_item.status == "stop_sell_monitoring"
         assert stop_item.trigger_price == Decimal("96000.0000")
-        assert stop_item.quantity_policy == {"kind": "position_exit_from_entry"}
+        assert stop_item.quantity_policy == {"kind": "shares", "quantity": 10}
         assert stop_item.source_plan_item_id == "core-post-entry-create:post-entry-stop"
         assert stop_item.risk_context["deterministic_emergency_stop"] is True
         assert stop_item.risk_context["post_entry_managed"] is True
