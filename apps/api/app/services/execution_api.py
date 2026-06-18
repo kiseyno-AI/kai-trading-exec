@@ -587,6 +587,8 @@ def _serialize_execution_fill(fill: ExecutionFill) -> dict[str, object]:
         "symbol": fill.symbol,
         "side": fill.side,
         "quantity": fill.quantity,
+        "base_quantity": _serialize_decimal(fill.base_quantity),
+        "quote_notional": _serialize_decimal(fill.quote_notional),
         "price": _serialize_decimal(fill.price),
         "filled_at": _serialize_datetime(fill.filled_at),
         "payload": fill.payload,
@@ -605,6 +607,7 @@ def _serialize_execution_position(
         "execution_position_id": position.id,
         "symbol": position.symbol,
         "quantity": position.quantity,
+        "base_quantity": _serialize_decimal(position.base_quantity),
         "average_price": _serialize_decimal(position.average_price),
         "updated_from": position.updated_from,
         "last_reconciled_at": _serialize_datetime(position.last_reconciled_at),
@@ -761,6 +764,19 @@ def _serialize_runtime_symbol_summary(
     return {
         "symbol": symbol,
         "mode": settings.runtime_mode,
+        "asset_classes": sorted(
+            {item.asset_class or "stock" for item in plan_items}
+            | {order.asset_class or "stock" for order in orders}
+        ),
+        "providers": sorted(
+            {item.provider or "kis" for item in plan_items}
+            | {order.broker_name for order in orders}
+        ),
+        "venues": sorted(
+            value
+            for value in ({item.venue for item in plan_items} | {order.venue for order in orders})
+            if value is not None
+        ),
         "monitored": any(_is_runtime_monitored_item(item) for item in plan_items),
         "monitoring_statuses": monitoring_statuses,
         "intents": sorted({item.intent for item in plan_items}),
@@ -770,7 +786,18 @@ def _serialize_runtime_symbol_summary(
         "open_order_count": sum(order.status in OPEN_ORDER_STATUSES for order in orders),
         "fill_count": len(fills),
         "filled_quantity": sum(fill.quantity for fill in fills),
+        "filled_base_quantity": _serialize_decimal(
+            sum((fill.base_quantity or Decimal("0")) for fill in fills)
+        ),
+        "filled_quote_notional": _serialize_decimal(
+            sum((fill.quote_notional or Decimal("0")) for fill in fills)
+        ),
         "position_quantity": position.quantity if position is not None else 0,
+        "position_base_quantity": (
+            _serialize_decimal(position.base_quantity)
+            if position is not None
+            else None
+        ),
         "position_average_price": (
             _serialize_decimal(position.average_price)
             if position is not None

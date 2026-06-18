@@ -906,8 +906,13 @@ def build_runtime_daily_board(
     if runtime_status["dependencies"]["database"] == "ok" and runtime_status["dependencies"]["runtime_schema"] == "ok":
         try:
             monitored_symbols = runtime_status.get("symbols", {}).get("monitored", [])
-            if isinstance(monitored_symbols, list):
-                normalized_symbols = {str(symbol) for symbol in monitored_symbols}
+            status_symbols = runtime_status.get("symbols", {})
+            if isinstance(monitored_symbols, list) and isinstance(status_symbols, dict):
+                normalized_symbols = set()
+                for key in ("monitored", "scheduled_today", "filled_today", "failed_today"):
+                    values = status_symbols.get(key, [])
+                    if isinstance(values, list):
+                        normalized_symbols.update(str(symbol) for symbol in values)
                 if len(normalized_symbols) > 20:
                     symbols = _minimal_runtime_symbol_rows(
                         settings=settings,
@@ -935,7 +940,11 @@ def build_runtime_daily_board(
             "monitored_symbol_count": sum(symbol["monitored"] for symbol in symbols),
             "open_order_symbol_count": sum(symbol["open_order_count"] > 0 for symbol in symbols),
             "filled_symbol_count": sum(symbol["fill_count"] > 0 for symbol in symbols),
-            "position_symbol_count": sum(symbol["position_quantity"] > 0 for symbol in symbols),
+            "position_symbol_count": sum(
+                symbol["position_quantity"] > 0
+                or _positive_decimal_value(symbol.get("position_base_quantity"))
+                for symbol in symbols
+            ),
         },
         "symbols": symbols,
     }
@@ -950,6 +959,9 @@ def _minimal_runtime_symbol_rows(
         {
             "symbol": symbol,
             "mode": settings.runtime_mode,
+            "asset_classes": [],
+            "providers": [],
+            "venues": [],
             "monitored": True,
             "monitoring_statuses": [],
             "intents": [],
@@ -959,7 +971,10 @@ def _minimal_runtime_symbol_rows(
             "open_order_count": 0,
             "fill_count": 0,
             "filled_quantity": 0,
+            "filled_base_quantity": "0",
+            "filled_quote_notional": "0",
             "position_quantity": 0,
+            "position_base_quantity": None,
             "position_average_price": None,
             "last_reconciliation_error": None,
             "latest_activity_at": None,
@@ -967,6 +982,15 @@ def _minimal_runtime_symbol_rows(
         }
         for symbol in sorted(symbols)
     ]
+
+
+def _positive_decimal_value(value: object) -> bool:
+    if value is None:
+        return False
+    try:
+        return Decimal(str(value)) > 0
+    except Exception:
+        return False
 
 
 def _monitoring_payload_from_autonomous(
