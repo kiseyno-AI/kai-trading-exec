@@ -403,8 +403,10 @@ def monitoring_payload(
         else {
             "status": "unknown",
             "unprotected_position_count": 0,
+            "position_truth_stale_count": 0,
             "repaired_stop_coverage_count": 0,
             "affected_symbols": [],
+            "missing_quantities": {},
             "issues": [],
         },
         "last_cycle": latest_details or None,

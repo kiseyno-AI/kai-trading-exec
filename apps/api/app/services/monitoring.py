@@ -198,13 +198,17 @@ class TriggerTimeAgentActionResult:
 @dataclass(frozen=True)
 class ProtectiveStopCoverageIssue:
     symbol: str
-    held_quantity: int
+    held_quantity: int | None
     active_stop_quantity: int
-    missing_quantity: int
+    missing_quantity: int | None
     latest_stop_item_id: str | None
     latest_stop_status: str | None
     latest_stop_trigger_price: Decimal | None
     outcome: str
+    reason: str | None = None
+    position_quantity: int | None = None
+    position_last_reconciled_at: datetime | None = None
+    evidence: list[str] | None = None
 
 
 PROFIT_PROTECTION_TRIGGER_REASONS = frozenset(
@@ -219,6 +223,14 @@ PROTECTIVE_STOP_COVERAGE_STATUSES = frozenset(
         "broker_order_submission_pending",
         "broker_order_submitted",
         "broker_order_retry_pending",
+        "open",
+        "partially_filled",
+    }
+)
+IN_FLIGHT_BROKER_ORDER_ITEM_STATUSES = frozenset(
+    {
+        "broker_order_submission_pending",
+        "broker_order_submitted",
         "open",
         "partially_filled",
     }
@@ -438,6 +450,11 @@ def _evaluate_monitoring_cycle(
             db=db,
             exclude_pending_config=allow_persisted_triggered_without_price,
         )
+        items = [
+            item
+            for item in items
+            if not _is_same_cycle_cloned_stop_repair(item=item, triggered_at=triggered_at)
+        ]
     remaining_quantities_by_symbol = {
         symbol: position.quantity
         for symbol, position in positions_by_symbol.items()
@@ -1091,13 +1108,13 @@ def _evaluate_monitoring_cycle(
 
     checkpoint = None
     if items or update_checkpoint_if_idle:
-        unprotected_count = sum(1 for issue in coverage_issues if issue.outcome == "unprotected_position")
+        degraded_coverage_count = sum(1 for issue in coverage_issues if issue.outcome != "rearmed")
         checkpoint = _update_monitoring_checkpoint(
             settings=settings,
             db=db,
             worker_name=MONITORING_WORKER_NAME,
             triggered_at=triggered_at,
-            status="degraded" if deferred_item_count > 0 or unprotected_count > 0 else "running",
+            status="degraded" if deferred_item_count > 0 or degraded_coverage_count > 0 else "running",
             details=checkpoint_details,
         )
     return EvaluateMonitoringResult(
@@ -1867,7 +1884,12 @@ def _repair_unprotected_stop_coverage(
         if position.quantity > 0
     }
     if not positions:
-        return [], 0
+        return _stale_position_truth_issues(
+            settings=settings,
+            db=db,
+            trusted_position_symbols=set(),
+            triggered_at=triggered_at,
+        ), 0
 
     stop_items = db.scalars(
         select(ExecutionPlanItem)
@@ -1907,7 +1929,8 @@ def _repair_unprotected_stop_coverage(
         prior_quantity_policy = latest_item.quantity_policy
         held_quantity = positions[issue.symbol].quantity
         rearm_quantity = issue.missing_quantity
-        if issue.active_stop_quantity > 0:
+        preserve_latest_item = latest_item.status in IN_FLIGHT_BROKER_ORDER_ITEM_STATUSES
+        if issue.active_stop_quantity > 0 or preserve_latest_item:
             repair_item = ExecutionPlanItem(
                 execution_plan_id=latest_item.execution_plan_id,
                 plan_item_index=max(
@@ -1933,10 +1956,12 @@ def _repair_unprotected_stop_coverage(
             db.add(repair_item)
             items_by_symbol.setdefault(issue.symbol, []).append(repair_item)
             rearmed_item = repair_item
+            cloned_repair = True
         else:
             latest_item.status = "stop_sell_monitoring"
             latest_item.quantity_policy = {"kind": "shares", "quantity": rearm_quantity}
             rearmed_item = latest_item
+            cloned_repair = False
         _record_monitoring_event(
             item=rearmed_item,
             event={
@@ -1949,6 +1974,7 @@ def _repair_unprotected_stop_coverage(
                 "prior_item_id": latest_item.id,
                 "prior_status": prior_status,
                 "prior_quantity_policy": prior_quantity_policy,
+                "cloned_repair_item": cloned_repair,
                 "recorded_at": triggered_at.isoformat(),
             },
         )
@@ -1964,6 +1990,14 @@ def _repair_unprotected_stop_coverage(
                 if _latest_rearmable_stop_item(items_by_symbol.get(issue.symbol, [])) is not None
             },
         )
+    issues.extend(
+        _stale_position_truth_issues(
+            settings=settings,
+            db=db,
+            trusted_position_symbols=set(positions),
+            triggered_at=triggered_at,
+        )
+    )
     return issues, repaired_count
 
 
@@ -1981,12 +2015,7 @@ def _protective_stop_coverage_issues(
             quantity
             for item in items
             if item.status in PROTECTIVE_STOP_COVERAGE_STATUSES
-            for quantity in [
-                _protective_stop_coverage_quantity(
-                    item.quantity_policy,
-                    held_quantity=held_quantity,
-                )
-            ]
+            for quantity in [_shares_quantity(item.quantity_policy)]
             if quantity is not None
         )
         if active_quantity >= held_quantity:
@@ -2012,13 +2041,180 @@ def _protective_stop_coverage_issues(
     return issues
 
 
+def _stale_position_truth_issues(
+    *,
+    settings: Settings,
+    db: Session,
+    trusted_position_symbols: set[str],
+    triggered_at: datetime,
+) -> list[ProtectiveStopCoverageIssue]:
+    evidence_by_symbol = _position_truth_evidence_by_symbol(settings=settings, db=db)
+    if not evidence_by_symbol:
+        return []
+
+    candidate_symbols = sorted(set(evidence_by_symbol) - trusted_position_symbols)
+    if not candidate_symbols:
+        return []
+
+    positions = db.scalars(
+        select(ExecutionPosition).where(
+            ExecutionPosition.mode == settings.runtime_mode,
+            ExecutionPosition.symbol.in_(candidate_symbols),
+        )
+    ).all()
+    positions_by_symbol = {position.symbol: position for position in positions}
+    stale_before = triggered_at - timedelta(seconds=settings.exec_agent_max_account_snapshot_age_seconds)
+    issues: list[ProtectiveStopCoverageIssue] = []
+    for symbol in candidate_symbols:
+        position = positions_by_symbol.get(symbol)
+        if position is not None and position.quantity > 0:
+            continue
+        last_reconciled_at = position.last_reconciled_at if position is not None else None
+        if last_reconciled_at is not None and _normalize_utc(last_reconciled_at) >= stale_before:
+            continue
+
+        stop_items = _stop_items_for_symbol(settings=settings, db=db, symbol=symbol)
+        latest_item = _latest_stop_item(stop_items)
+        active_quantity = sum(
+            quantity
+            for item in stop_items
+            if item.status in PROTECTIVE_STOP_COVERAGE_STATUSES
+            for quantity in [_shares_quantity(item.quantity_policy)]
+            if quantity is not None
+        )
+        issues.append(
+            ProtectiveStopCoverageIssue(
+                symbol=symbol,
+                held_quantity=None,
+                active_stop_quantity=active_quantity,
+                missing_quantity=None,
+                latest_stop_item_id=latest_item.id if latest_item is not None else None,
+                latest_stop_status=latest_item.status if latest_item is not None else None,
+                latest_stop_trigger_price=latest_item.trigger_price if latest_item is not None else None,
+                outcome="position_truth_stale",
+                reason="stale_or_missing_execution_position_with_live_evidence",
+                position_quantity=position.quantity if position is not None else None,
+                position_last_reconciled_at=last_reconciled_at,
+                evidence=evidence_by_symbol[symbol],
+            )
+        )
+    return issues
+
+
+def _position_truth_evidence_by_symbol(
+    *,
+    settings: Settings,
+    db: Session,
+) -> dict[str, list[str]]:
+    evidence_by_symbol: dict[str, set[str]] = {}
+
+    active_order_rows = db.execute(
+        select(BrokerOrder.symbol, BrokerOrder.side, BrokerOrder.status)
+        .where(
+            BrokerOrder.mode == settings.runtime_mode,
+            BrokerOrder.status.in_(("submitted", "open", "partially_filled")),
+        )
+    ).all()
+    for symbol, side, status in active_order_rows:
+        evidence_by_symbol.setdefault(str(symbol), set()).add(f"broker_order:{side}:{status}")
+
+    filled_buy_symbols = set(
+        db.scalars(
+            select(BrokerOrder.symbol)
+            .where(
+                BrokerOrder.mode == settings.runtime_mode,
+                BrokerOrder.side == "buy",
+                BrokerOrder.status == "filled",
+            )
+            .distinct()
+        ).all()
+    )
+    for symbol in filled_buy_symbols:
+        if _has_unexited_buy_order_for_symbol(settings=settings, db=db, symbol=str(symbol)):
+            evidence_by_symbol.setdefault(str(symbol), set()).add("broker_order:buy:filled_unexited")
+
+    sell_rows = db.execute(
+        select(ExecutionPlanItem.symbol, ExecutionPlanItem.status)
+        .join(ExecutionPlanItem.plan)
+        .where(
+            ExecutionPlan.mode == settings.runtime_mode,
+            ExecutionPlanItem.side == "sell",
+            ExecutionPlanItem.intent.in_(tuple(SELL_MONITORED_INTENTS)),
+            ExecutionPlanItem.status.in_(tuple(SELL_STALE_FLAT_EXPIRABLE_STATUSES | {"expired"})),
+        )
+    ).all()
+    for symbol, status in sell_rows:
+        evidence_by_symbol.setdefault(str(symbol), set()).add(f"sell_monitor:{status}")
+
+    return {
+        symbol: sorted(evidence)
+        for symbol, evidence in evidence_by_symbol.items()
+        if evidence
+    }
+
+
+def _has_unexited_buy_order_for_symbol(
+    *,
+    settings: Settings,
+    db: Session,
+    symbol: str,
+) -> bool:
+    latest_buy_order_at = db.scalar(
+        select(func.max(BrokerOrder.created_at)).where(
+            BrokerOrder.mode == settings.runtime_mode,
+            BrokerOrder.symbol == symbol,
+            BrokerOrder.side == "buy",
+            BrokerOrder.status.in_(("submitted", "open", "partially_filled", "filled")),
+        )
+    )
+    if latest_buy_order_at is None:
+        return False
+    latest_sell_order_at = db.scalar(
+        select(func.max(BrokerOrder.created_at)).where(
+            BrokerOrder.mode == settings.runtime_mode,
+            BrokerOrder.symbol == symbol,
+            BrokerOrder.side == "sell",
+            BrokerOrder.status.in_(("submitted", "open", "partially_filled", "filled")),
+        )
+    )
+    return latest_sell_order_at is None or latest_buy_order_at > latest_sell_order_at
+
+
+def _stop_items_for_symbol(
+    *,
+    settings: Settings,
+    db: Session,
+    symbol: str,
+) -> list[ExecutionPlanItem]:
+    return db.scalars(
+        select(ExecutionPlanItem)
+        .join(ExecutionPlanItem.plan)
+        .where(
+            ExecutionPlan.mode == settings.runtime_mode,
+            ExecutionPlanItem.symbol == symbol,
+            ExecutionPlanItem.side == "sell",
+            ExecutionPlanItem.intent == "stop_sell",
+        )
+        .order_by(
+            ExecutionPlan.market_date.desc(),
+            ExecutionPlan.accepted_at.desc(),
+            ExecutionPlan.id.desc(),
+            ExecutionPlanItem.plan_item_index.asc(),
+            ExecutionPlanItem.id.asc(),
+        )
+    ).all()
+
+
 def _latest_stop_item(items: list[ExecutionPlanItem]) -> ExecutionPlanItem | None:
     return items[0] if items else None
 
 
 def _latest_rearmable_stop_item(items: list[ExecutionPlanItem]) -> ExecutionPlanItem | None:
     for item in items:
-        if item.trigger_price is not None:
+        if item.trigger_price is not None and (
+            item.status in PROTECTIVE_STOP_COVERAGE_STATUSES
+            or item.status not in NON_MONITORABLE_PLAN_ITEM_STATUSES
+        ):
             return item
     return None
 
@@ -2029,27 +2225,24 @@ def _shares_quantity(quantity_policy: dict[str, object] | None) -> int | None:
     return _parse_positive_int(quantity_policy.get("quantity"))
 
 
-def _protective_stop_coverage_quantity(
-    quantity_policy: dict[str, object] | None,
-    *,
-    held_quantity: int,
-) -> int | None:
-    if _quantity_policy_requires_position_exit(quantity_policy):
-        return held_quantity
-    return _shares_quantity(quantity_policy)
-
-
 def _protective_stop_coverage_payload(
     *,
     issues: list[ProtectiveStopCoverageIssue],
     repaired_count: int,
 ) -> dict[str, object]:
     unprotected = [issue for issue in issues if issue.outcome == "unprotected_position"]
+    degraded = [issue for issue in issues if issue.outcome != "rearmed"]
     return {
-        "status": "degraded" if unprotected else "ok",
+        "status": "degraded" if degraded else "ok",
         "unprotected_position_count": len(unprotected),
+        "position_truth_stale_count": sum(1 for issue in issues if issue.outcome == "position_truth_stale"),
         "repaired_stop_coverage_count": repaired_count,
-        "affected_symbols": [issue.symbol for issue in unprotected],
+        "affected_symbols": [issue.symbol for issue in degraded],
+        "missing_quantities": {
+            issue.symbol: issue.missing_quantity
+            for issue in degraded
+            if issue.missing_quantity is not None
+        },
         "issues": [
             {
                 "symbol": issue.symbol,
@@ -2060,6 +2253,10 @@ def _protective_stop_coverage_payload(
                 "latest_stop_status": issue.latest_stop_status,
                 "latest_stop_trigger_price": _serialize_decimal(issue.latest_stop_trigger_price),
                 "outcome": issue.outcome,
+                "reason": issue.reason,
+                "position_quantity": issue.position_quantity,
+                "position_last_reconciled_at": _serialize_datetime(issue.position_last_reconciled_at),
+                "evidence": issue.evidence or [],
             }
             for issue in issues
         ],
@@ -2118,6 +2315,22 @@ def _latest_monitoring_event(item: ExecutionPlanItem) -> dict[str, object] | Non
         return None
     event = risk_context.get("last_monitoring_event")
     return event if isinstance(event, dict) else None
+
+
+def _is_same_cycle_cloned_stop_repair(
+    *,
+    item: ExecutionPlanItem,
+    triggered_at: datetime,
+) -> bool:
+    event = _latest_monitoring_event(item)
+    if event is None:
+        return False
+    if event.get("event") != "unprotected_position_stop_rearmed":
+        return False
+    if event.get("cloned_repair_item") is not True:
+        return False
+    recorded_at = _parse_event_datetime(event.get("recorded_at"))
+    return recorded_at == triggered_at
 
 
 def _parse_event_datetime(value: object) -> datetime | None:
@@ -2412,7 +2625,7 @@ def _ensure_post_entry_stop_monitor(
             side="sell",
             intent="stop_sell",
             status="stop_sell_monitoring",
-            quantity_policy={"kind": "position_exit_from_entry"},
+            quantity_policy={"kind": "shares", "quantity": quantity},
             trigger_price=stop_price,
             time_in_force=entry_item.time_in_force or "day",
             risk_context={
