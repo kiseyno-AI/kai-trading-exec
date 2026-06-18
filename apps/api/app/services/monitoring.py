@@ -219,6 +219,8 @@ PROTECTIVE_STOP_COVERAGE_STATUSES = frozenset(
         "broker_order_submission_pending",
         "broker_order_submitted",
         "broker_order_retry_pending",
+        "open",
+        "partially_filled",
     }
 )
 
@@ -1904,16 +1906,39 @@ def _repair_unprotected_stop_coverage(
         prior_status = latest_item.status
         prior_quantity_policy = latest_item.quantity_policy
         held_quantity = positions[issue.symbol].quantity
-        rearm_quantity = (
-            held_quantity
-            if _shares_quantity(prior_quantity_policy) is not None
-            and latest_item.status in PROTECTIVE_STOP_COVERAGE_STATUSES
-            else issue.missing_quantity
-        )
-        latest_item.status = "stop_sell_monitoring"
-        latest_item.quantity_policy = {"kind": "shares", "quantity": rearm_quantity}
+        rearm_quantity = issue.missing_quantity
+        if issue.active_stop_quantity > 0:
+            repair_item = ExecutionPlanItem(
+                execution_plan_id=latest_item.execution_plan_id,
+                plan_item_index=max(
+                    (item.plan_item_index for item in items_by_symbol.get(issue.symbol, [])),
+                    default=0,
+                )
+                + 1,
+                symbol=latest_item.symbol,
+                side="sell",
+                intent="stop_sell",
+                status="stop_sell_monitoring",
+                quantity_policy={"kind": "shares", "quantity": rearm_quantity},
+                limit_price=latest_item.limit_price,
+                trigger_price=latest_item.trigger_price,
+                time_in_force=latest_item.time_in_force,
+                risk_context=dict(latest_item.risk_context or {}),
+                decision_agent_name=latest_item.decision_agent_name,
+                decision_snapshot_id=latest_item.decision_snapshot_id,
+                decision_run_id=latest_item.decision_run_id,
+                source_plan_item_id=latest_item.source_plan_item_id,
+                source_market_date=latest_item.source_market_date,
+            )
+            db.add(repair_item)
+            items_by_symbol.setdefault(issue.symbol, []).append(repair_item)
+            rearmed_item = repair_item
+        else:
+            latest_item.status = "stop_sell_monitoring"
+            latest_item.quantity_policy = {"kind": "shares", "quantity": rearm_quantity}
+            rearmed_item = latest_item
         _record_monitoring_event(
-            item=latest_item,
+            item=rearmed_item,
             event={
                 "event": "unprotected_position_stop_rearmed",
                 "reason": "active_stop_coverage_below_held_quantity",
@@ -1921,6 +1946,7 @@ def _repair_unprotected_stop_coverage(
                 "active_stop_quantity": issue.active_stop_quantity,
                 "missing_quantity": issue.missing_quantity,
                 "rearmed_quantity": rearm_quantity,
+                "prior_item_id": latest_item.id,
                 "prior_status": prior_status,
                 "prior_quantity_policy": prior_quantity_policy,
                 "recorded_at": triggered_at.isoformat(),
@@ -1955,7 +1981,12 @@ def _protective_stop_coverage_issues(
             quantity
             for item in items
             if item.status in PROTECTIVE_STOP_COVERAGE_STATUSES
-            for quantity in [_shares_quantity(item.quantity_policy)]
+            for quantity in [
+                _protective_stop_coverage_quantity(
+                    item.quantity_policy,
+                    held_quantity=held_quantity,
+                )
+            ]
             if quantity is not None
         )
         if active_quantity >= held_quantity:
@@ -1996,6 +2027,16 @@ def _shares_quantity(quantity_policy: dict[str, object] | None) -> int | None:
     if not isinstance(quantity_policy, dict) or quantity_policy.get("kind") != "shares":
         return None
     return _parse_positive_int(quantity_policy.get("quantity"))
+
+
+def _protective_stop_coverage_quantity(
+    quantity_policy: dict[str, object] | None,
+    *,
+    held_quantity: int,
+) -> int | None:
+    if _quantity_policy_requires_position_exit(quantity_policy):
+        return held_quantity
+    return _shares_quantity(quantity_policy)
 
 
 def _protective_stop_coverage_payload(
