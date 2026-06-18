@@ -12,6 +12,13 @@ class ExecutionPlanItemRequest(BaseModel):
     side: str = Field(min_length=1, max_length=16)
     intent: str = Field(min_length=1, max_length=64)
     quantity_policy: dict[str, Any] | None = None
+    provider: str | None = Field(default=None, max_length=32)
+    venue: str | None = Field(default=None, max_length=32)
+    asset_class: str | None = Field(default=None, max_length=32)
+    base_quantity: Decimal | None = Field(default=None, gt=0)
+    quote_notional: Decimal | None = Field(default=None, gt=0)
+    quantity_precision: int | None = Field(default=None, ge=0, le=18)
+    price_precision: int | None = Field(default=None, ge=0, le=18)
     limit_price: Decimal | None = None
     trigger_price: Decimal | None = None
     time_in_force: str | None = Field(default=None, max_length=32)
@@ -58,7 +65,7 @@ class ExecutionPlanItemRequest(BaseModel):
             raise ValueError("symbol must not be empty")
         return normalized
 
-    @field_validator("side", "intent", "time_in_force")
+    @field_validator("side", "intent", "time_in_force", "provider", "venue", "asset_class")
     @classmethod
     def normalize_text_fields(cls, value: str | None) -> str | None:
         if value is None:
@@ -109,16 +116,23 @@ class PlaceOrderRequest(BaseModel):
 
     idempotency_key: str = Field(min_length=1, max_length=128)
     execution_plan_item_id: str | None = Field(default=None, max_length=36)
+    provider: str = Field(default="kis", max_length=32)
+    asset_class: str = Field(default="stock", max_length=32)
+    venue: str | None = Field(default=None, max_length=32)
     symbol: str = Field(min_length=1, max_length=32)
     side: str = Field(min_length=1, max_length=16)
-    quantity: int = Field(gt=0)
+    quantity: int | None = Field(default=None, gt=0)
+    base_quantity: Decimal | None = Field(default=None, gt=0)
+    quote_notional: Decimal | None = Field(default=None, gt=0)
+    quantity_precision: int | None = Field(default=None, ge=0, le=18)
+    price_precision: int | None = Field(default=None, ge=0, le=18)
     order_type: str = Field(default="limit", max_length=16)
     limit_price: Decimal | None = None
     time_in_force: str = Field(default="day", max_length=32)
     exchange: str = Field(default="KRX", max_length=16)
     metadata: dict[str, Any] | None = None
 
-    @field_validator("idempotency_key", "execution_plan_item_id")
+    @field_validator("idempotency_key", "execution_plan_item_id", "venue")
     @classmethod
     def normalize_identifiers(cls, value: str | None) -> str | None:
         if value is None:
@@ -136,7 +150,7 @@ class PlaceOrderRequest(BaseModel):
             raise ValueError("symbol must not be empty")
         return normalized
 
-    @field_validator("side", "order_type", "time_in_force")
+    @field_validator("provider", "asset_class", "side", "order_type", "time_in_force")
     @classmethod
     def normalize_order_text_fields(cls, value: str) -> str:
         normalized = value.strip().lower()
@@ -185,15 +199,42 @@ class PlaceOrderRequest(BaseModel):
     @field_validator("exchange")
     @classmethod
     def validate_exchange(cls, value: str) -> str:
-        if value not in {"KRX", "NXT", "SOR"}:
-            raise ValueError("exchange must be 'KRX', 'NXT', or 'SOR'")
+        if value not in {"KRX", "NXT", "SOR", "UPBIT"}:
+            raise ValueError("exchange must be 'KRX', 'NXT', 'SOR', or 'UPBIT'")
         return value
 
-    def model_post_init(self, __context: Any) -> None:
+    @model_validator(mode="after")
+    def validate_sizing(self) -> "PlaceOrderRequest":
         if self.order_type == "limit" and self.limit_price is None:
             raise ValueError("limit_price is required for limit orders")
         if self.order_type == "market" and self.limit_price is not None:
             raise ValueError("limit_price must be omitted for market orders")
+        if self.asset_class == "crypto" or self.provider == "upbit":
+            if self.provider != "upbit":
+                raise ValueError("crypto orders currently require provider='upbit'")
+            if self.asset_class != "crypto":
+                raise ValueError("Upbit orders require asset_class='crypto'")
+            sizing_fields = [
+                self.quantity is not None,
+                self.base_quantity is not None,
+                self.quote_notional is not None,
+            ]
+            if sum(sizing_fields) != 1:
+                raise ValueError(
+                    "crypto orders require exactly one of quantity, base_quantity, or quote_notional"
+                )
+            if self.quantity is not None:
+                raise ValueError("crypto orders must use base_quantity or quote_notional, not integer quantity")
+            if self.quote_notional is not None and not (self.side == "buy" and self.order_type == "market"):
+                raise ValueError("quote_notional is only supported for crypto market buys")
+            return self
+        if self.provider != "kis":
+            raise ValueError("provider must be 'kis' or 'upbit'")
+        if self.quantity is None:
+            raise ValueError("stock orders require quantity")
+        if self.base_quantity is not None or self.quote_notional is not None:
+            raise ValueError("stock orders must not include base_quantity or quote_notional")
+        return self
 
 
 class ShortTermWatcherAgentOutput(BaseModel):

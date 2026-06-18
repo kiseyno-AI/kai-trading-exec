@@ -126,11 +126,21 @@ def place_broker_order(
         side=routed_command.side,
         status=NormalizedBrokerOrderStatus.SUBMISSION_PENDING.value,
         quantity=routed_command.quantity,
+        base_quantity=routed_command.base_quantity,
+        quote_notional=routed_command.quote_notional,
+        quantity_precision=routed_command.quantity_precision,
+        price_precision=routed_command.price_precision,
+        venue=routed_command.venue,
+        asset_class=routed_command.asset_class,
         limit_price=routed_command.limit_price,
         request_metadata={
             "source": request_source,
             "requested_at": datetime.now(UTC).isoformat(),
             "time_in_force": routed_command.time_in_force,
+            "provider": routed_command.provider,
+            "asset_class": routed_command.asset_class,
+            "venue": routed_command.venue,
+            "sizing": _sizing_payload(routed_command),
             **({"metadata": routed_command.metadata} if routed_command.metadata is not None else {}),
             **({"route": _route_payload(route_decision)} if route_decision is not None else {}),
         },
@@ -186,6 +196,13 @@ def place_broker_order(
                 symbol=routed_command.symbol,
                 side=routed_command.side,
                 quantity=routed_command.quantity,
+                base_quantity=routed_command.base_quantity,
+                quote_notional=routed_command.quote_notional,
+                quantity_precision=routed_command.quantity_precision,
+                price_precision=routed_command.price_precision,
+                provider=routed_command.provider,
+                venue=routed_command.venue,
+                asset_class=routed_command.asset_class,
                 order_type=routed_command.order_type,
                 time_in_force=routed_command.time_in_force,
                 exchange=routed_command.exchange,
@@ -360,6 +377,10 @@ def _validate_plan_item(
         return "execution plan item symbol does not match order symbol"
     if plan_item.side != command.side:
         return "execution plan item side does not match order side"
+    if plan_item.provider and plan_item.provider != command.provider:
+        return "execution plan item provider does not match order provider"
+    if plan_item.asset_class and plan_item.asset_class != command.asset_class:
+        return "execution plan item asset_class does not match order asset_class"
     return None
 
 
@@ -377,6 +398,10 @@ def _merge_order_request_metadata(
     metadata = dict(base or {})
     metadata["source"] = request_source
     metadata["time_in_force"] = command.time_in_force
+    metadata["provider"] = command.provider
+    metadata["asset_class"] = command.asset_class
+    metadata["venue"] = command.venue
+    metadata["sizing"] = _sizing_payload(command)
     if command.metadata is not None:
         metadata["metadata"] = command.metadata
     if route_decision is not None:
@@ -390,6 +415,8 @@ def _resolve_route_decision(
     command: PlaceOrderRequest,
     plan_item: ExecutionPlanItem | None,
 ) -> RouteDecision | None:
+    if command.provider != "kis":
+        return None
     if not settings.domestic_order_session_routing_enabled:
         return None
     metadata = dict(command.metadata or {})
@@ -446,6 +473,17 @@ def _route_payload(route_decision: RouteDecision | None) -> dict[str, object] | 
             else None
         ),
         "reason": route_decision.reason,
+    }
+
+
+def _sizing_payload(command: PlaceOrderRequest) -> dict[str, object]:
+    return {
+        "quantity": command.quantity,
+        "base_quantity": str(command.base_quantity) if command.base_quantity is not None else None,
+        "quote_notional": str(command.quote_notional) if command.quote_notional is not None else None,
+        "limit_price": str(command.limit_price) if command.limit_price is not None else None,
+        "quantity_precision": command.quantity_precision,
+        "price_precision": command.price_precision,
     }
 
 

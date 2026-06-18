@@ -21,6 +21,7 @@ from app.broker.kis import (
     KIS_WEBSOCKET_APPROVAL_PATH,
     KisBrokerAdapter,
 )
+from app.broker.upbit import UpbitBrokerAdapter
 
 __all__ = [
     "BrokerAdapter",
@@ -42,4 +43,5 @@ __all__ = [
     "KIS_WEBSOCKET_APPROVAL_PATH",
     "KisBrokerAdapter",
     "NormalizedBrokerOrderStatus",
+    "UpbitBrokerAdapter",
 ]

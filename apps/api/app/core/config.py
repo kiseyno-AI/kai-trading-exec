@@ -98,6 +98,11 @@ class Settings(BaseModel):
     kis_customer_type: str = "P"
     kis_use_hashkey: bool = True
     kis_request_timeout_seconds: int = Field(default=10, ge=1, le=120)
+    upbit_access_key: str | None = None
+    upbit_secret_key: str | None = None
+    upbit_base_url: str = "https://api.upbit.com"
+    upbit_live_trading_enabled: bool = False
+    upbit_request_timeout_seconds: int = Field(default=10, ge=1, le=120)
     domestic_order_session_routing_enabled: bool = False
     allow_krx_pre_open_offhours_orders: bool = False
     allow_krx_after_hours_closing_orders: bool = False
@@ -211,6 +216,11 @@ _ENV_FIELDS = {
     "KIS_CUSTOMER_TYPE": "kis_customer_type",
     "KIS_USE_HASHKEY": "kis_use_hashkey",
     "KIS_REQUEST_TIMEOUT_SECONDS": "kis_request_timeout_seconds",
+    "UPBIT_ACCESS_KEY": "upbit_access_key",
+    "UPBIT_SECRET_KEY": "upbit_secret_key",
+    "UPBIT_BASE_URL": "upbit_base_url",
+    "UPBIT_LIVE_TRADING_ENABLED": "upbit_live_trading_enabled",
+    "UPBIT_REQUEST_TIMEOUT_SECONDS": "upbit_request_timeout_seconds",
     "DOMESTIC_ORDER_SESSION_ROUTING_ENABLED": "domestic_order_session_routing_enabled",
     "ALLOW_KRX_PRE_OPEN_OFFHOURS_ORDERS": "allow_krx_pre_open_offhours_orders",
     "ALLOW_KRX_AFTER_HOURS_CLOSING_ORDERS": "allow_krx_after_hours_closing_orders",

@@ -216,6 +216,13 @@ def _build_execution_plan_item(
         intent=item.intent,
         status=_initial_plan_item_status(item),
         quantity_policy=item.quantity_policy,
+        provider=_plan_item_text(item=item, key="provider"),
+        venue=_plan_item_text(item=item, key="venue"),
+        asset_class=_plan_item_text(item=item, key="asset_class"),
+        base_quantity=item.base_quantity,
+        quote_notional=item.quote_notional,
+        quantity_precision=item.quantity_precision,
+        price_precision=item.price_precision,
         limit_price=item.limit_price,
         trigger_price=_plan_item_trigger_price(item),
         time_in_force=item.time_in_force,
@@ -452,6 +459,13 @@ def _serialize_execution_plan_item(item: ExecutionPlanItem) -> dict[str, object]
         "intent": item.intent,
         "status": item.status,
         "quantity_policy": item.quantity_policy,
+        "provider": item.provider,
+        "venue": item.venue,
+        "asset_class": item.asset_class,
+        "base_quantity": _serialize_decimal(item.base_quantity),
+        "quote_notional": _serialize_decimal(item.quote_notional),
+        "quantity_precision": item.quantity_precision,
+        "price_precision": item.price_precision,
         "limit_price": _serialize_decimal(item.limit_price),
         "trigger_price": _serialize_decimal(item.trigger_price),
         "time_in_force": item.time_in_force,
@@ -507,6 +521,12 @@ def serialize_broker_order(
         "side": order.side,
         "status": order.status,
         "quantity": order.quantity,
+        "base_quantity": _serialize_decimal(order.base_quantity),
+        "quote_notional": _serialize_decimal(order.quote_notional),
+        "quantity_precision": order.quantity_precision,
+        "price_precision": order.price_precision,
+        "venue": order.venue,
+        "asset_class": order.asset_class,
         "limit_price": _serialize_decimal(order.limit_price),
         "submitted_at": _serialize_datetime(order.submitted_at),
         "last_broker_sync_at": _serialize_datetime(order.last_broker_sync_at),
@@ -909,6 +929,19 @@ def _plan_item_trigger_price(item: ExecutionPlanItemRequest) -> Decimal | None:
     if not _is_watch_buy_request(item):
         return item.trigger_price
     return _watch_buy_trigger_price(item) or item.trigger_price
+
+
+def _plan_item_text(*, item: ExecutionPlanItemRequest, key: str) -> str | None:
+    value = getattr(item, key, None)
+    if isinstance(value, str) and value.strip():
+        return value.strip().lower()
+    for source in (item.model_extra or {}, item.risk_context, item.quantity_policy):
+        if not isinstance(source, dict):
+            continue
+        raw_value = source.get(key)
+        if isinstance(raw_value, str) and raw_value.strip():
+            return raw_value.strip().lower()
+    return None
 
 
 def _plan_item_risk_context(item: ExecutionPlanItemRequest) -> dict[str, object] | None:

@@ -29,7 +29,7 @@ from app.services.trigger_time_exec_agent import (
     AGENT_PENDING_STATUS,
     AGENT_REJECTED_STATUS,
 )
-from app.services.broker_auth import build_broker_session_summary
+from app.services.broker_auth import build_broker_adapter, build_broker_session_summary
 from app.services.execution_api import list_runtime_symbols
 from app.services.schema import check_runtime_schema
 from app.services.runtime_controls import (
@@ -598,6 +598,7 @@ def build_runtime_status(
         "failed_today": [],
     }
     broker = build_broker_session_summary(settings=settings, db=None)
+    broker_providers = broker_provider_readiness(settings=settings, db=None)
     counts_available = True
 
     try:
@@ -630,6 +631,7 @@ def build_runtime_status(
                 "monitoring": monitoring,
             },
             "broker": broker,
+            "broker_providers": broker_providers,
             "counts": counts,
             "symbols": symbols,
         }
@@ -666,6 +668,7 @@ def build_runtime_status(
                 "monitoring": monitoring,
             },
             "broker": broker,
+            "broker_providers": broker_providers,
             "counts": counts,
             "symbols": symbols,
         }
@@ -675,6 +678,7 @@ def build_runtime_status(
         safety = runtime_safety_payload(state)
         counts = runtime_counts(settings=settings, db=db)
         broker = build_broker_session_summary(settings=settings, db=db)
+        broker_providers = broker_provider_readiness(settings=settings, db=db)
         symbols = runtime_symbol_summary(settings=settings, db=db)
         if include_expensive_sections:
             monitoring = monitoring_payload(settings=settings, db=db)
@@ -722,10 +726,27 @@ def build_runtime_status(
             "monitoring": monitoring,
         },
         "broker": broker,
+        "broker_providers": broker_providers,
         "counts": counts,
         "symbols": symbols,
         "monthly_pnl": monthly_pnl,
     }
+
+
+def broker_provider_readiness(
+    *,
+    settings: Settings,
+    db: Session | None,
+) -> dict[str, object]:
+    providers: dict[str, object] = {}
+    for provider in ("kis", "upbit"):
+        adapter = build_broker_adapter(settings, provider=provider)
+        providers[provider] = build_broker_session_summary(
+            settings=settings,
+            db=db,
+            adapter=adapter,
+        )
+    return providers
 
 
 def monthly_pnl_payload(
