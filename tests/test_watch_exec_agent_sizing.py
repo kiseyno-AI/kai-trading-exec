@@ -188,9 +188,9 @@ def test_short_transaction_batches_candidates_across_single_item_plans(tmp_path,
         }
 
     assert statuses == {
-        "watch-item-1": "watch_monitoring_active",
-        "watch-item-2": "watch_monitoring_active",
-        "watch-item-3": "watch_monitoring_active",
+        "watch-item-1": "watch_buy_triggered_blocked",
+        "watch-item-2": "watch_buy_triggered_blocked",
+        "watch-item-3": "watch_buy_triggered_blocked",
     }
 
 
@@ -441,6 +441,52 @@ def test_apply_decisions_applies_partial_response_and_leaves_missing_item_pendin
     assert plan.items[0].status == "watch_monitoring_active"
     assert plan.items[0].quantity_policy["quantity"] == 2
     assert plan.items[1].status == "watch_monitoring_pending"
+
+
+def test_apply_decisions_preserves_triggered_blocked_watch_buy_for_retry() -> None:
+    plan = ExecutionPlan(
+        id="plan-1",
+        external_plan_id="plan-blocked-approved",
+        strategy_run_id="strategy-1",
+        source="core-short-term-decider",
+        market_date=date(2026, 6, 4),
+        mode="paper",
+        items=[
+            _watch_item(
+                item_id="watch-item-blocked",
+                symbol="005930",
+                risk_context={"target_price": "72420", "stop_price": "69000"},
+            ),
+        ],
+    )
+    plan.items[0].status = "watch_buy_triggered_blocked"
+
+    summary = _apply_decisions(
+        db=None,  # type: ignore[arg-type]
+        plan=plan,
+        expected_item_ids={"watch-item-blocked"},
+        decision_payload={
+            "version": "manual-exec-agent-watch-sizing-v1",
+            "decisions": [
+                {
+                    "execution_plan_item_id": "watch-item-blocked",
+                    "symbol": "005930",
+                    "action": "approve",
+                    "quantity": 2,
+                    "approved_notional_krw": 143000,
+                    "sizing_price": "71000",
+                    "confidence": 0.68,
+                    "target_profile": "tactical_2pct",
+                    "reason_code": "small_tactical_upside",
+                    "reason": "2% target with tight stop",
+                }
+            ],
+        },
+    )
+
+    assert summary["approved"] == 1
+    assert plan.items[0].status == "watch_buy_triggered_blocked"
+    assert plan.items[0].quantity_policy["quantity"] == 2
 
 
 def test_apply_decisions_raises_small_agent_probe_to_min_notional() -> None:

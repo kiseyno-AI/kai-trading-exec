@@ -994,6 +994,7 @@ def _apply_decisions(
             payload=record,
         )
         if action == "approve":
+            was_triggered_blocked = item.status == "watch_buy_triggered_blocked"
             quantity = _positive_int(decision.get("quantity"))
             if quantity is None:
                 raise ValueError(f"approved decision has invalid quantity for {item.symbol}")
@@ -1025,7 +1026,7 @@ def _apply_decisions(
                 "sizing_adjustment": sizing["adjustment"],
                 "previous_policy": previous_policy,
             }
-            item.status = "watch_monitoring_active"
+            item.status = "watch_buy_triggered_blocked" if was_triggered_blocked else "watch_monitoring_active"
             approved += 1
         elif action == "reject":
             previous_policy = item.quantity_policy if isinstance(item.quantity_policy, dict) else None
