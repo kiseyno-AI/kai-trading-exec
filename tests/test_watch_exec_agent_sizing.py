@@ -56,6 +56,144 @@ def test_chunks_splits_watch_candidates_into_small_batches() -> None:
     assert [len(chunk) for chunk in chunks] == [10, 10, 10, 10, 10, 3]
 
 
+def test_default_watch_sizing_window_covers_nxt_after_session() -> None:
+    settings = Settings()
+
+    assert watch_sizing._inside_sizing_window(
+        settings=settings,
+        now=datetime(2026, 6, 4, 10, 59, tzinfo=UTC),
+    )
+    assert not watch_sizing._inside_sizing_window(
+        settings=settings,
+        now=datetime(2026, 6, 4, 11, 1, tzinfo=UTC),
+    )
+
+
+def test_blocked_watch_buy_still_loads_for_exec_agent_sizing(tmp_path) -> None:
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'watch-sizing-blocked.db'}",
+        runtime_mode="paper",
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+
+    with session_factory() as session:
+        plan = ExecutionPlan(
+            external_plan_id="plan-blocked-only",
+            strategy_run_id="strategy-1",
+            source="core-short-term-decider",
+            market_date=date(2026, 6, 4),
+            mode="paper",
+            items=[
+                _watch_item(
+                    item_id="watch-item-blocked",
+                    symbol="005930",
+                    risk_context={"target_price": "76000", "stop_price": "69000"},
+                )
+            ],
+        )
+        plan.items[0].status = "watch_buy_triggered_blocked"
+        session.add(plan)
+        session.commit()
+
+    with session_factory() as session:
+        plans = watch_sizing._load_candidate_plans(
+            settings=settings,
+            db=session,
+            market_date=date(2026, 6, 4),
+        )
+
+    assert [plan.external_plan_id for plan in plans] == ["plan-blocked-only"]
+
+
+def test_short_transaction_batches_candidates_across_single_item_plans(tmp_path, monkeypatch) -> None:
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'watch-sizing-multi-plan.db'}",
+        runtime_mode="paper",
+        exec_agent_enabled=True,
+        exec_agent_watch_sizing_enabled=True,
+        exec_agent_watch_sizing_start_local_time="00:00",
+        exec_agent_watch_sizing_end_local_time="23:59",
+        exec_agent_watch_sizing_batch_size=3,
+        exec_agent_watch_sizing_max_batches_per_cycle=1,
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+
+    with session_factory() as session:
+        for index, symbol in enumerate(("005930", "000660", "035420"), start=1):
+            item = _watch_item(
+                item_id=f"watch-item-{index}",
+                symbol=symbol,
+                risk_context={
+                    "target_price": "76000",
+                    "stop_price": "69000",
+                    "execution_feasibility_context": {"max_safe_notional_krw": "800000"},
+                },
+            )
+            item.status = "watch_buy_triggered_blocked"
+            session.add(
+                ExecutionPlan(
+                    external_plan_id=f"plan-{symbol}",
+                    strategy_run_id="strategy-1",
+                    source="core-short-term-decider",
+                    market_date=date(2026, 6, 4),
+                    mode="paper",
+                    items=[item],
+                )
+            )
+        session.commit()
+
+    calls: list[list[str]] = []
+
+    def fake_decisions(*, payload, **_) -> dict[str, object]:
+        calls.append([str(candidate["execution_plan_item_id"]) for candidate in payload["candidates"]])
+        return {
+            "version": "manual-exec-agent-watch-sizing-v1",
+            "decisions": [
+                {
+                    "execution_plan_item_id": candidate["execution_plan_item_id"],
+                    "symbol": candidate["symbol"],
+                    "action": "approve",
+                    "quantity": 1,
+                    "approved_notional_krw": 71500,
+                    "sizing_price": candidate["chase_limit_price"] or candidate["trigger_price"],
+                    "confidence": 0.5,
+                    "target_profile": "tactical_2pct",
+                    "reason_code": "test_approve",
+                    "reason": "fixture approval",
+                }
+                for candidate in payload["candidates"]
+            ],
+        }
+
+    monkeypatch.setattr(watch_sizing, "_request_exec_agent_decisions", fake_decisions)
+
+    result = run_due_watch_exec_agent_sizing(
+        settings=settings,
+        session_factory=session_factory,
+        now=datetime(2026, 6, 4, 0, 0, tzinfo=UTC),
+    )
+
+    assert calls == [["watch-item-1", "watch-item-2", "watch-item-3"]]
+    assert result.payload["batches_processed"] == 1
+    assert sum(summary["approved"] for summary in result.payload["applied"]) == 3
+
+    with session_factory() as session:
+        statuses = {
+            item.id: item.status
+            for item in session.query(ExecutionPlanItem).order_by(ExecutionPlanItem.id).all()
+        }
+
+    assert statuses == {
+        "watch-item-1": "watch_monitoring_active",
+        "watch-item-2": "watch_monitoring_active",
+        "watch-item-3": "watch_monitoring_active",
+    }
+
+
 def test_watch_buy_candidate_budget_accepts_max_safe_notional() -> None:
     item = _watch_item(risk_context={})
     item.quantity_policy = {

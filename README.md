@@ -188,6 +188,8 @@ Short-term exec risk settings currently supported:
 - `KAI_EXEC_EXEC_AGENT_TRIGGER_TIME_ENABLED`
 - `KAI_EXEC_EXEC_AGENT_TRIGGER_TIME_SELL_ENABLED`
 - `KAI_EXEC_EXEC_AGENT_TRIGGER_TIME_TIMEOUT_SECONDS`
+- `KAI_EXEC_EXEC_AGENT_WATCH_SIZING_START_LOCAL_TIME`
+- `KAI_EXEC_EXEC_AGENT_WATCH_SIZING_END_LOCAL_TIME`
 - `KAI_EXEC_EXEC_AGENT_WATCH_SIZING_MIN_NOTIONAL_KRW`
 - `KAI_EXEC_EXEC_AGENT_WATCH_SIZING_HIGH_CONVICTION_MIN_NOTIONAL_KRW`
 - `KAI_EXEC_EXEC_AGENT_WATCH_SIZING_HIGH_CONVICTION_THRESHOLD`
@@ -206,7 +208,9 @@ valid candidates do not become ineffective tiny probe buys. Defaults target
 confidence or high-liquidity candidates, while still respecting available
 cash, per-symbol budget, max-safe notional, and stop-risk caps. If account
 snapshot loading is unavailable, the fallback account basis defaults to
-`10,000,000` KRW.
+`10,000,000` KRW. The default sizing window runs until `20:00` KST so
+triggered NXT after-hours watch buys can still receive share quantities before
+submission.
 
 Trade outcome feedback can be generated from stored broker fills with:
 

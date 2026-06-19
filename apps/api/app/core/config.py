@@ -77,7 +77,7 @@ class Settings(BaseModel):
     exec_agent_watch_sizing_max_batches_per_cycle: int = Field(default=3, ge=1, le=100)
     exec_agent_watch_sizing_max_attempts: int = Field(default=3, ge=1, le=10)
     exec_agent_watch_sizing_start_local_time: str = "08:00"
-    exec_agent_watch_sizing_end_local_time: str = "15:30"
+    exec_agent_watch_sizing_end_local_time: str = "20:00"
     exec_agent_watch_sizing_timeout_seconds: int = Field(default=180, ge=30, le=3600)
     exec_agent_watch_sizing_min_notional_krw: Decimal = Field(default=Decimal("1000000"), ge=0)
     exec_agent_watch_sizing_high_conviction_min_notional_krw: Decimal = Field(default=Decimal("1500000"), ge=0)

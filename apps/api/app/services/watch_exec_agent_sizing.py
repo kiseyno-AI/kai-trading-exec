@@ -27,7 +27,12 @@ from app.services.trade_outcome_feedback import load_latest_trade_outcome_feedba
 LOGGER = logging.getLogger(__name__)
 
 WATCH_BUY_INTENTS = frozenset({"intraday_watch_buy", "next_open_buy"})
-SIZED_WATCH_STATUSES = frozenset({"watch_monitoring_pending", "watch_monitoring_active", "unsupported_semantics"})
+SIZED_WATCH_STATUSES = frozenset({
+    "watch_monitoring_pending",
+    "watch_monitoring_active",
+    "watch_buy_triggered_blocked",
+    "unsupported_semantics",
+})
 WATCH_EXEC_AGENT_BATCH_SIZE = 10
 WATCH_EXEC_AGENT_RETRY_BATCH_SIZE = 1
 TERMINAL_WATCH_STATUSES = frozenset({
@@ -237,82 +242,114 @@ def _run_due_watch_exec_agent_sizing_short_transactions(
     errors: list[dict[str, object]] = []
     batches_processed = 0
     max_batches_per_cycle = int(getattr(settings, "exec_agent_watch_sizing_max_batches_per_cycle", 3))
+    plans_by_id = {plan.id: plan for plan in plans}
+    candidate_work: list[tuple[str, dict[str, object]]] = []
     for plan in plans:
-        candidates = [_candidate_payload(item) for item in _unsized_watch_items(plan)]
+        candidates = []
+        for item in _unsized_watch_items(plan):
+            candidate = _candidate_payload(item)
+            candidate["source_plan_id"] = plan.external_plan_id
+            candidates.append(candidate)
         if not candidates:
             continue
-        candidate_universe = _candidate_universe_payload(candidates)
-        batch_size = int(getattr(settings, "exec_agent_watch_sizing_batch_size", WATCH_EXEC_AGENT_BATCH_SIZE))
-        for batch in _chunks(candidates, batch_size):
+        candidate_work.extend((plan.id, candidate) for candidate in candidates)
+        plan_payloads.append({"plan_id": plan.external_plan_id, "candidate_count": len(candidates)})
+
+    candidate_universe = _candidate_universe_payload([candidate for _, candidate in candidate_work])
+    batch_size = int(getattr(settings, "exec_agent_watch_sizing_batch_size", WATCH_EXEC_AGENT_BATCH_SIZE))
+    for batch in _chunks(candidate_work, batch_size):
+        if batches_processed >= max_batches_per_cycle:
+            break
+        for request_batch in _sizing_request_batches([candidate for _, candidate in batch]):
             if batches_processed >= max_batches_per_cycle:
                 break
-            for request_batch in _sizing_request_batches(batch):
-                if batches_processed >= max_batches_per_cycle:
-                    break
-                batches_processed += 1
-                batch_ids = [str(candidate["execution_plan_item_id"]) for candidate in request_batch]
-                request_payload = _sizing_request_payload(
+            batches_processed += 1
+            request_plan = plans_by_id[batch[0][0]]
+            batch_ids = [str(candidate["execution_plan_item_id"]) for candidate in request_batch]
+            request_payload = _sizing_request_payload(
+                settings=settings,
+                plan=request_plan,
+                candidates=request_batch,
+                account_context=account_context,
+                candidate_universe=candidate_universe,
+            )
+            plan_expected_ids: dict[str, set[str]] = {}
+            for plan_id, candidate in batch:
+                candidate_id = str(candidate["execution_plan_item_id"])
+                if candidate_id in batch_ids:
+                    plan_expected_ids.setdefault(plan_id, set()).add(candidate_id)
+            try:
+                decision_payload = _request_exec_agent_decisions_with_retries(
                     settings=settings,
-                    plan=plan,
-                    candidates=request_batch,
-                    account_context=account_context,
-                    candidate_universe=candidate_universe,
+                    db=None,
+                    plan=request_plan,
+                    payload=request_payload,
+                    expected_item_ids=set(batch_ids),
                 )
-                try:
-                    decision_payload = _request_exec_agent_decisions_with_retries(
-                        settings=settings,
-                        db=None,
-                        plan=plan,
-                        payload=request_payload,
-                        expected_item_ids=set(batch_ids),
-                    )
-                    if decision_payload is None:
-                        max_attempts = int(getattr(settings, "exec_agent_watch_sizing_max_attempts", 3))
-                        with session_factory() as write_db:
-                            with sqlite_write_lock(write_db):
-                                write_plan = _load_plan_for_update(db=write_db, plan_id=plan.id)
+                if decision_payload is None:
+                    max_attempts = int(getattr(settings, "exec_agent_watch_sizing_max_attempts", 3))
+                    with session_factory() as write_db:
+                        with sqlite_write_lock(write_db):
+                            for plan_id, expected_ids in plan_expected_ids.items():
+                                write_plan = _load_plan_for_update(db=write_db, plan_id=plan_id)
                                 _record_sizing_attempt(
                                     plan=write_plan,
-                                    expected_item_ids=set(batch_ids),
+                                    expected_item_ids=expected_ids,
                                     attempt=max_attempts,
                                     max_attempts=max_attempts,
                                     error="exec-agent did not return applicable decisions after max attempts",
                                 )
-                                write_db.commit()
+                            write_db.commit()
+                    for plan_id, expected_ids in plan_expected_ids.items():
                         errors.append(
                             {
-                                "plan_id": plan.external_plan_id,
-                                "item_ids": batch_ids,
+                                "plan_id": plans_by_id[plan_id].external_plan_id,
+                                "item_ids": sorted(expected_ids),
                                 "error": "exec-agent did not return applicable decisions after max attempts",
                             }
                         )
-                        continue
-                    with session_factory() as write_db:
-                        with sqlite_write_lock(write_db):
-                            write_plan = _load_plan_for_update(db=write_db, plan_id=plan.id)
+                    continue
+                with session_factory() as write_db:
+                    with sqlite_write_lock(write_db):
+                        for plan_id, expected_ids in plan_expected_ids.items():
+                            write_plan = _load_plan_for_update(db=write_db, plan_id=plan_id)
+                            filtered_payload = _decision_payload_for_expected_ids(
+                                decision_payload,
+                                expected_item_ids=expected_ids,
+                            )
+                            if not filtered_payload["decisions"]:
+                                applied.append(
+                                    {
+                                        "plan_id": write_plan.external_plan_id,
+                                        "evaluated": 0,
+                                        "approved": 0,
+                                        "rejected": 0,
+                                        "missing": len(expected_ids),
+                                        "missing_item_ids": sorted(expected_ids),
+                                        "ignored_extra": 0,
+                                    }
+                                )
+                                continue
                             summary = _apply_decisions(
                                 db=write_db,
                                 settings=settings,
                                 plan=write_plan,
-                                decision_payload=decision_payload,
+                                decision_payload=filtered_payload,
                                 account_context=account_context,
-                                expected_item_ids=set(batch_ids),
+                                expected_item_ids=expected_ids,
                             )
-                            write_db.commit()
-                    applied.append(summary)
-                except Exception as exc:  # pragma: no cover - defensive runtime guard
-                    LOGGER.exception(
-                        "watch_exec_agent_sizing_failed",
-                        extra={
-                            "plan_id": plan.external_plan_id,
-                            "runtime_mode": settings.runtime_mode,
-                            "batch_item_ids": batch_ids,
-                        },
-                    )
-                    errors.append({"plan_id": plan.external_plan_id, "item_ids": batch_ids, "error": str(exc)})
-        plan_payloads.append({"plan_id": plan.external_plan_id, "candidate_count": len(candidates)})
-        if batches_processed >= max_batches_per_cycle:
-            break
+                            applied.append(summary)
+                        write_db.commit()
+            except Exception as exc:  # pragma: no cover - defensive runtime guard
+                LOGGER.exception(
+                    "watch_exec_agent_sizing_failed",
+                    extra={
+                        "plan_id": "multi-plan-watch-sizing",
+                        "runtime_mode": settings.runtime_mode,
+                        "batch_item_ids": batch_ids,
+                    },
+                )
+                errors.append({"plan_id": "multi-plan-watch-sizing", "item_ids": batch_ids, "error": str(exc)})
 
     return _result(
         idle=not applied and not errors,
@@ -331,6 +368,24 @@ def _load_plan_for_update(*, db: Session, plan_id: str) -> ExecutionPlan:
         .options(selectinload(ExecutionPlan.items))
     ).one()
     return plan
+
+
+def _decision_payload_for_expected_ids(
+    decision_payload: dict[str, object],
+    *,
+    expected_item_ids: set[str],
+) -> dict[str, object]:
+    filtered = dict(decision_payload)
+    decisions_raw = decision_payload.get("decisions")
+    if not isinstance(decisions_raw, list):
+        filtered["decisions"] = []
+        return filtered
+    filtered["decisions"] = [
+        decision
+        for decision in decisions_raw
+        if isinstance(decision, dict) and str(decision.get("execution_plan_item_id")) in expected_item_ids
+    ]
+    return filtered
 
 
 def _inside_sizing_window(*, settings: Settings, now: datetime) -> bool:
