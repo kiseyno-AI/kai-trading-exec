@@ -10,7 +10,11 @@ from app.db.base import Base
 from app.db.session import create_db_engine, create_session_factory
 from app.models.runtime import ExecutionPlan, ExecutionPlanItem
 from app.services import watch_exec_agent_sizing as watch_sizing
-from app.services.monitoring import _watch_buy_candidate_budget, list_autonomous_monitoring_symbols
+from app.services.monitoring import (
+    _watch_buy_candidate_budget,
+    _watch_buy_exec_agent_sizing_fallback_allowed,
+    list_autonomous_monitoring_symbols,
+)
 from app.services.watch_exec_agent_sizing import (
     _apply_decisions,
     _applicable_decision_ids,
@@ -747,6 +751,74 @@ def test_apply_decisions_persists_audit_without_rewriting_large_risk_context(tmp
         assert item.quantity_policy["exec_agent_decision"]["reason_code"] == "small_probe"
         audit_count = session.query(watch_sizing.ExecutionPlanItemAudit).count()
         assert audit_count == 1
+
+
+def test_short_transaction_no_decision_attempts_persist_for_monitoring_fallback(tmp_path, monkeypatch) -> None:
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'watch-sizing-no-decision.db'}",
+        runtime_mode="paper",
+        exec_agent_enabled=True,
+        exec_agent_watch_sizing_enabled=True,
+        exec_agent_watch_sizing_start_local_time="00:00",
+        exec_agent_watch_sizing_end_local_time="23:59",
+        exec_agent_watch_sizing_max_attempts=2,
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    large_context = {
+        "target_price": "76000",
+        "stop_price": "69000",
+        "large_exec_agent_input": "x" * 600_000,
+    }
+
+    with session_factory() as session:
+        plan = ExecutionPlan(
+            external_plan_id="plan-no-decision",
+            strategy_run_id="strategy-1",
+            source="core-short-term-decider",
+            market_date=date(2026, 6, 4),
+            mode="paper",
+            items=[
+                _watch_item(
+                    item_id="watch-item-no-decision",
+                    symbol="005930",
+                    risk_context=large_context,
+                )
+            ],
+        )
+        session.add(plan)
+        session.commit()
+
+    monkeypatch.setattr(
+        watch_sizing,
+        "_request_exec_agent_decisions",
+        lambda **_: {"version": "manual-exec-agent-watch-sizing-v1", "decisions": []},
+    )
+
+    result = run_due_watch_exec_agent_sizing(
+        settings=settings,
+        session_factory=session_factory,
+        now=datetime(2026, 6, 4, 0, 0, tzinfo=UTC),
+    )
+
+    assert result.payload["errors"] == [
+        {
+            "plan_id": "plan-no-decision",
+            "item_ids": ["watch-item-no-decision"],
+            "error": "exec-agent did not return applicable decisions after max attempts",
+        }
+    ]
+
+    with session_factory() as session:
+        item = session.get(ExecutionPlanItem, "watch-item-no-decision")
+        assert item is not None
+        assert item.risk_context == large_context
+        assert item.quantity_policy["exec_agent_watch_sizing_attempt_count"] == 2
+        assert item.quantity_policy["exec_agent_watch_sizing_max_attempts"] == 2
+        assert item.quantity_policy["exec_agent_watch_sizing_fallback_allowed"] is True
+        assert item.quantity_policy["exec_agent_watch_sizing_attempts"][-1]["success"] is False
+        assert _watch_buy_exec_agent_sizing_fallback_allowed(settings=settings, item=item) is True
 
 
 def test_concurrent_watch_sizing_cycles_with_large_risk_contexts_do_not_lock(tmp_path, monkeypatch) -> None:

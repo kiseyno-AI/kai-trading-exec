@@ -267,6 +267,18 @@ def _run_due_watch_exec_agent_sizing_short_transactions(
                         expected_item_ids=set(batch_ids),
                     )
                     if decision_payload is None:
+                        max_attempts = int(getattr(settings, "exec_agent_watch_sizing_max_attempts", 3))
+                        with session_factory() as write_db:
+                            with sqlite_write_lock(write_db):
+                                write_plan = _load_plan_for_update(db=write_db, plan_id=plan.id)
+                                _record_sizing_attempt(
+                                    plan=write_plan,
+                                    expected_item_ids=set(batch_ids),
+                                    attempt=max_attempts,
+                                    max_attempts=max_attempts,
+                                    error="exec-agent did not return applicable decisions after max attempts",
+                                )
+                                write_db.commit()
                         errors.append(
                             {
                                 "plan_id": plan.external_plan_id,
