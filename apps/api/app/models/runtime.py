@@ -212,6 +212,28 @@ class ExecutionPlanItem(TimestampMixin, Base):
     broker_orders: Mapped[list["BrokerOrder"]] = relationship(back_populates="plan_item")
 
 
+class ExecutionPlanItemAudit(TimestampMixin, Base):
+    __tablename__ = "execution_plan_item_audits"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    execution_plan_item_id: Mapped[str] = mapped_column(
+        ForeignKey("execution_plan_items.id"),
+        nullable=False,
+        index=True,
+    )
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    source: Mapped[str] = mapped_column(String(64), nullable=False)
+    summary: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    payload: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    error_message: Mapped[str | None] = mapped_column(Text)
+    occurred_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        index=True,
+    )
+
+
 class ExecutionJob(TimestampMixin, Base):
     __tablename__ = "execution_jobs"
 

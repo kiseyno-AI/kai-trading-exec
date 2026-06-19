@@ -9,6 +9,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings
+from app.db.sqlite_diagnostics import sqlite_diagnostics_payload
 from app.db.session import ping_database
 from app.models.runtime import (
     BrokerOrder,
@@ -583,6 +584,9 @@ def build_runtime_status(
         "database": "ok",
         "runtime_schema": "ok",
     }
+    diagnostics = {
+        "sqlite": sqlite_diagnostics_payload(),
+    }
     counts: dict[str, int] = {"open_orders": 0, "active_execution_jobs": 0}
     autonomous = autonomous_runtime or _default_autonomous_runtime_payload(settings)
     monitoring_price_source = _autonomous_monitoring_price_source(autonomous)
@@ -625,6 +629,7 @@ def build_runtime_status(
             "readiness": readiness,
             "safety": safety,
             "dependencies": dependencies,
+            "diagnostics": diagnostics,
             "liveness": {
                 **liveness_payload(runtime),
                 "autonomous": autonomous,
@@ -662,6 +667,7 @@ def build_runtime_status(
             "readiness": readiness,
             "safety": safety,
             "dependencies": dependencies,
+            "diagnostics": diagnostics,
             "liveness": {
                 **liveness_payload(runtime),
                 "autonomous": autonomous,
@@ -720,6 +726,7 @@ def build_runtime_status(
         "readiness": readiness,
         "safety": safety,
         "dependencies": dependencies,
+        "diagnostics": diagnostics,
         "liveness": {
             **liveness_payload(runtime),
             "autonomous": autonomous,

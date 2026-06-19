@@ -3605,9 +3605,10 @@ def _resolve_watch_buy_order(
             event["sizing_adjustment"] = "clamped_by_deterministic_risk_sizing"
     if _watch_buy_requires_exec_agent_sizing(item):
         event["sizing_source"] = sizing_source or "risk_sizing_after_exec_agent_attempts_exhausted"
-        event["exec_agent_watch_sizing_attempt_count"] = (
-            item.risk_context or {}
-        ).get("exec_agent_watch_sizing_attempt_count") if isinstance(item.risk_context, dict) else None
+        event["exec_agent_watch_sizing_attempt_count"] = _first_payload_value(
+            item,
+            "exec_agent_watch_sizing_attempt_count",
+        )
     if effective_stop > stop_price:
         _apply_watch_buy_effective_stop(
             item=item,
@@ -3667,14 +3668,31 @@ def _watch_buy_exec_agent_sizing_fallback_allowed(
     item: ExecutionPlanItem,
 ) -> bool:
     risk_context = item.risk_context if isinstance(item.risk_context, dict) else {}
-    if risk_context.get("exec_agent_watch_sizing_fallback_allowed") is True:
+    quantity_policy = item.quantity_policy if isinstance(item.quantity_policy, dict) else {}
+    if (
+        quantity_policy.get("exec_agent_watch_sizing_fallback_allowed") is True
+        or risk_context.get("exec_agent_watch_sizing_fallback_allowed") is True
+    ):
         return True
-    attempts = _parse_positive_int(risk_context.get("exec_agent_watch_sizing_attempt_count")) or 0
+    attempts = _parse_positive_int(
+        quantity_policy.get("exec_agent_watch_sizing_attempt_count")
+        or risk_context.get("exec_agent_watch_sizing_attempt_count")
+    ) or 0
     max_attempts = (
-        _parse_positive_int(risk_context.get("exec_agent_watch_sizing_max_attempts"))
+        _parse_positive_int(
+            quantity_policy.get("exec_agent_watch_sizing_max_attempts")
+            or risk_context.get("exec_agent_watch_sizing_max_attempts")
+        )
         or settings.exec_agent_watch_sizing_max_attempts
     )
     return attempts >= max_attempts
+
+
+def _first_payload_value(item: ExecutionPlanItem, key: str) -> object | None:
+    for payload in (item.quantity_policy, item.risk_context):
+        if isinstance(payload, dict) and key in payload:
+            return payload.get(key)
+    return None
 
 
 def _watch_buy_candidate_budget(item: ExecutionPlanItem) -> Decimal | None:

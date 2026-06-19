@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import threading
 from datetime import UTC, date, datetime
 from decimal import Decimal
 
 from app.broker.base import BrokerAccountHolding, BrokerAccountOpenOrder, BrokerAccountSnapshot
 from app.core.config import Settings
+from app.db.base import Base
+from app.db.session import create_db_engine, create_session_factory
 from app.models.runtime import ExecutionPlan, ExecutionPlanItem
 from app.services import watch_exec_agent_sizing as watch_sizing
-from app.services.monitoring import _watch_buy_candidate_budget
+from app.services.monitoring import _watch_buy_candidate_budget, list_autonomous_monitoring_symbols
 from app.services.watch_exec_agent_sizing import (
     _apply_decisions,
     _applicable_decision_ids,
@@ -671,3 +674,189 @@ def test_sizing_request_payload_uses_compact_account_and_candidate_universe() ->
     assert payload["candidate_universe"]["candidates"][1]["symbol"] == "000660"
     assert payload["candidates"][0]["symbol"] == "005930"
     assert "large_unused_blob" not in str(payload)
+
+
+def test_apply_decisions_persists_audit_without_rewriting_large_risk_context(tmp_path) -> None:
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'watch-sizing-large-risk.db'}",
+        runtime_mode="paper",
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    large_context = {
+        "target_price": "76000",
+        "stop_price": "69000",
+        "large_exec_agent_input": "x" * 600_000,
+    }
+
+    with session_factory() as session:
+        plan = ExecutionPlan(
+            external_plan_id="plan-large-risk",
+            strategy_run_id="strategy-1",
+            source="core-short-term-decider",
+            market_date=date(2026, 6, 4),
+            mode="paper",
+            items=[
+                _watch_item(
+                    item_id="watch-item-large-risk",
+                    symbol="005930",
+                    risk_context=large_context,
+                )
+            ],
+        )
+        session.add(plan)
+        session.commit()
+
+    with session_factory() as session:
+        plan = watch_sizing._load_plan_for_update(db=session, plan_id=plan.id)
+        _apply_decisions(
+            db=session,
+            settings=settings,
+            plan=plan,
+            account_context={
+                "available": True,
+                "orderable_cash_krw": "10000000",
+                "buying_power_krw": "10000000",
+            },
+            expected_item_ids={"watch-item-large-risk"},
+            decision_payload={
+                "version": "manual-exec-agent-watch-sizing-v1",
+                "decisions": [
+                    {
+                        "execution_plan_item_id": "watch-item-large-risk",
+                        "symbol": "005930",
+                        "action": "approve",
+                        "quantity": 3,
+                        "approved_notional_krw": 214500,
+                        "sizing_price": "71500",
+                        "confidence": 0.68,
+                        "target_profile": "short_swing",
+                        "reason_code": "small_probe",
+                        "reason": "agent returned a small probe",
+                    }
+                ],
+            },
+        )
+        session.commit()
+
+    with session_factory() as session:
+        item = session.get(ExecutionPlanItem, "watch-item-large-risk")
+        assert item is not None
+        assert item.risk_context == large_context
+        assert item.quantity_policy["exec_agent_decision"]["reason_code"] == "small_probe"
+        audit_count = session.query(watch_sizing.ExecutionPlanItemAudit).count()
+        assert audit_count == 1
+
+
+def test_concurrent_watch_sizing_cycles_with_large_risk_contexts_do_not_lock(tmp_path, monkeypatch) -> None:
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'watch-sizing-contention.db'}",
+        runtime_mode="paper",
+        exec_agent_enabled=True,
+        exec_agent_watch_sizing_enabled=True,
+        exec_agent_watch_sizing_start_local_time="00:00",
+        exec_agent_watch_sizing_end_local_time="23:59",
+        exec_agent_watch_sizing_batch_size=4,
+        exec_agent_watch_sizing_max_batches_per_cycle=10,
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    large_blob = "x" * 550_000
+
+    with session_factory() as session:
+        plan = ExecutionPlan(
+            external_plan_id="plan-contention",
+            strategy_run_id="strategy-1",
+            source="core-short-term-decider",
+            market_date=date(2026, 6, 4),
+            mode="paper",
+            items=[
+                _watch_item(
+                    item_id=f"watch-item-{index}",
+                    symbol=f"0059{index:02d}",
+                    risk_context={
+                        "target_price": "76000",
+                        "stop_price": "69000",
+                        "large_exec_agent_input": large_blob,
+                    },
+                )
+                for index in range(12)
+            ],
+        )
+        session.add(plan)
+        session.commit()
+
+    def fake_decisions(*, payload, **_) -> dict[str, object]:
+        return {
+            "version": "manual-exec-agent-watch-sizing-v1",
+            "decisions": [
+                {
+                    "execution_plan_item_id": candidate["execution_plan_item_id"],
+                    "symbol": candidate["symbol"],
+                    "action": "reject",
+                    "quantity": 0,
+                    "approved_notional_krw": 0,
+                    "sizing_price": candidate["chase_limit_price"] or candidate["trigger_price"],
+                    "confidence": 0.2,
+                    "target_profile": "tactical_2pct",
+                    "reason_code": "test_reject",
+                    "reason": "fixture rejection",
+                }
+                for candidate in payload["candidates"]
+            ],
+        }
+
+    monkeypatch.setattr(watch_sizing, "_request_exec_agent_decisions", fake_decisions)
+
+    results: list[object] = []
+    errors: list[BaseException] = []
+
+    stop_monitoring = threading.Event()
+    monitoring_symbols: list[list[str]] = []
+
+    def run_monitoring_reads() -> None:
+        try:
+            while not stop_monitoring.is_set():
+                with session_factory() as session:
+                    monitoring_symbols.append(
+                        list_autonomous_monitoring_symbols(
+                            settings=settings,
+                            db=session,
+                            current_market_date=date(2026, 6, 4),
+                        )
+                    )
+        except BaseException as exc:  # pragma: no cover - assertion reports thread failures
+            errors.append(exc)
+
+    def run_cycle() -> None:
+        try:
+            results.append(
+                run_due_watch_exec_agent_sizing(
+                    settings=settings,
+                    session_factory=session_factory,
+                    now=datetime(2026, 6, 4, 0, 0, tzinfo=UTC),
+                )
+            )
+        except BaseException as exc:  # pragma: no cover - assertion reports thread failures
+            errors.append(exc)
+
+    monitoring_thread = threading.Thread(target=run_monitoring_reads)
+    monitoring_thread.start()
+    threads = [threading.Thread(target=run_cycle) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    stop_monitoring.set()
+    monitoring_thread.join(timeout=2)
+
+    assert errors == []
+    assert len(results) == 2
+    assert monitoring_symbols
+    with session_factory() as session:
+        rejected_count = session.query(ExecutionPlanItem).filter(ExecutionPlanItem.status == "exec_agent_rejected").count()
+        assert rejected_count == 12
+        audit_count = session.query(watch_sizing.ExecutionPlanItemAudit).count()
+        assert audit_count == 12

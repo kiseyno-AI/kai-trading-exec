@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.core.config import Settings
+from app.db.sqlite_diagnostics import record_sqlite_lock_error
 
 
 def ensure_database_parent_dir(database_url: str) -> None:
@@ -30,8 +31,8 @@ def create_db_engine(settings: Settings) -> Engine:
             kwargs["poolclass"] = StaticPool
         else:
             kwargs["pool_timeout"] = 1
-            kwargs["pool_size"] = 20
-            kwargs["max_overflow"] = 40
+            kwargs["pool_size"] = 5
+            kwargs["max_overflow"] = 0
     else:
         kwargs["pool_timeout"] = 1
     engine = create_engine(settings.database_url, **kwargs)
@@ -51,6 +52,13 @@ def _configure_sqlite_engine(engine: Engine) -> None:
             cursor.execute("PRAGMA foreign_keys=ON")
         finally:
             cursor.close()
+
+    @event.listens_for(engine, "handle_error")
+    def _record_sqlite_lock_errors(exception_context) -> None:  # type: ignore[no-untyped-def]
+        original = exception_context.original_exception
+        message = str(original)
+        if "database is locked" in message.lower():
+            record_sqlite_lock_error(message)
 
 
 def create_session_factory(engine: Engine) -> sessionmaker[Session]:
