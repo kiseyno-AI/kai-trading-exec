@@ -279,20 +279,19 @@ class AutonomousRuntimeCoordinator:
         return await asyncio.to_thread(self._nxt_eligible_sync_cycle_sync, started_at)
 
     def _watch_exec_agent_sizing_cycle_sync(self, started_at: datetime) -> dict[str, object]:
-        with self.session_factory() as db:
-            adapter = self.broker_adapter_factory(self.settings)
-            result = run_due_watch_exec_agent_sizing(
-                settings=self.settings,
-                db=db,
-                adapter=adapter,
-                now=started_at,
-            )
-            payload = {
-                "status_code": result.status_code,
-                **result.payload,
-            }
-            self._store_cycle_payload(worker_key="watch_exec_agent_sizing", payload=payload)
-            return payload
+        adapter = self.broker_adapter_factory(self.settings)
+        result = run_due_watch_exec_agent_sizing(
+            settings=self.settings,
+            session_factory=self.session_factory,
+            adapter=adapter,
+            now=started_at,
+        )
+        payload = {
+            "status_code": result.status_code,
+            **result.payload,
+        }
+        self._store_cycle_payload(worker_key="watch_exec_agent_sizing", payload=payload)
+        return payload
 
     def _nxt_eligible_sync_cycle_sync(self, started_at: datetime) -> dict[str, object]:
         payload = refresh_nxt_eligible_symbols(settings=self.settings, now=started_at, force=True)

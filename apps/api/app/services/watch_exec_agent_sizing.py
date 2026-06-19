@@ -15,11 +15,12 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
-from sqlalchemy.orm import Session, selectinload
+from sqlalchemy.orm import Session, selectinload, sessionmaker
 
 from app.broker.base import BrokerAccountSnapshot, BrokerAdapter, BrokerAdapterError
 from app.core.config import Settings
-from app.models.runtime import ExecutionPlan, ExecutionPlanItem
+from app.db.sqlite_diagnostics import sqlite_write_lock
+from app.models.runtime import ExecutionPlan, ExecutionPlanItem, ExecutionPlanItemAudit
 from app.services.broker_auth import ensure_authenticated_broker_session
 from app.services.trade_outcome_feedback import load_latest_trade_outcome_feedback_snippet
 
@@ -51,7 +52,8 @@ class WatchExecAgentSizingResult:
 def run_due_watch_exec_agent_sizing(
     *,
     settings: Settings,
-    db: Session,
+    db: Session | None = None,
+    session_factory: sessionmaker[Session] | None = None,
     adapter: BrokerAdapter | None = None,
     now: datetime | None = None,
 ) -> WatchExecAgentSizingResult:
@@ -66,6 +68,16 @@ def run_due_watch_exec_agent_sizing(
         return _result(idle=True, reason="outside_sizing_window")
 
     local_today = cycle_at.astimezone(ZoneInfo(settings.market_timezone)).date()
+    if session_factory is not None:
+        return _run_due_watch_exec_agent_sizing_short_transactions(
+            settings=settings,
+            session_factory=session_factory,
+            adapter=adapter,
+            cycle_at=cycle_at,
+            market_date=local_today,
+        )
+    if db is None:
+        raise ValueError("db or session_factory is required")
     plans = _load_candidate_plans(settings=settings, db=db, market_date=local_today)
     if not plans:
         return _result(idle=True, reason="no_unsized_watch_candidates")
@@ -189,7 +201,8 @@ def run_due_watch_exec_agent_sizing(
         if batches_processed >= max_batches_per_cycle:
             break
 
-    db.commit()
+    with sqlite_write_lock(db):
+        db.commit()
     return _result(
         idle=not applied and not errors,
         plans=plan_payloads,
@@ -198,6 +211,126 @@ def run_due_watch_exec_agent_sizing(
         batches_processed=batches_processed,
         max_batches_per_cycle=max_batches_per_cycle,
     )
+
+
+def _run_due_watch_exec_agent_sizing_short_transactions(
+    *,
+    settings: Settings,
+    session_factory: sessionmaker[Session],
+    adapter: BrokerAdapter | None,
+    cycle_at: datetime,
+    market_date,
+) -> WatchExecAgentSizingResult:
+    with session_factory() as db:
+        plans = _load_candidate_plans(settings=settings, db=db, market_date=market_date)
+        db.expunge_all()
+    if not plans:
+        return _result(idle=True, reason="no_unsized_watch_candidates")
+
+    account_context = _load_sizing_account_context_short_transaction(
+        settings=settings,
+        session_factory=session_factory,
+        adapter=adapter,
+    )
+    plan_payloads: list[dict[str, object]] = []
+    applied: list[dict[str, object]] = []
+    errors: list[dict[str, object]] = []
+    batches_processed = 0
+    max_batches_per_cycle = int(getattr(settings, "exec_agent_watch_sizing_max_batches_per_cycle", 3))
+    for plan in plans:
+        candidates = [_candidate_payload(item) for item in _unsized_watch_items(plan)]
+        if not candidates:
+            continue
+        candidate_universe = _candidate_universe_payload(candidates)
+        batch_size = int(getattr(settings, "exec_agent_watch_sizing_batch_size", WATCH_EXEC_AGENT_BATCH_SIZE))
+        for batch in _chunks(candidates, batch_size):
+            if batches_processed >= max_batches_per_cycle:
+                break
+            for request_batch in _sizing_request_batches(batch):
+                if batches_processed >= max_batches_per_cycle:
+                    break
+                batches_processed += 1
+                batch_ids = [str(candidate["execution_plan_item_id"]) for candidate in request_batch]
+                request_payload = _sizing_request_payload(
+                    settings=settings,
+                    plan=plan,
+                    candidates=request_batch,
+                    account_context=account_context,
+                    candidate_universe=candidate_universe,
+                )
+                try:
+                    decision_payload = _request_exec_agent_decisions_with_retries(
+                        settings=settings,
+                        db=None,
+                        plan=plan,
+                        payload=request_payload,
+                        expected_item_ids=set(batch_ids),
+                    )
+                    if decision_payload is None:
+                        max_attempts = int(getattr(settings, "exec_agent_watch_sizing_max_attempts", 3))
+                        with session_factory() as write_db:
+                            with sqlite_write_lock(write_db):
+                                write_plan = _load_plan_for_update(db=write_db, plan_id=plan.id)
+                                _record_sizing_attempt(
+                                    plan=write_plan,
+                                    expected_item_ids=set(batch_ids),
+                                    attempt=max_attempts,
+                                    max_attempts=max_attempts,
+                                    error="exec-agent did not return applicable decisions after max attempts",
+                                )
+                                write_db.commit()
+                        errors.append(
+                            {
+                                "plan_id": plan.external_plan_id,
+                                "item_ids": batch_ids,
+                                "error": "exec-agent did not return applicable decisions after max attempts",
+                            }
+                        )
+                        continue
+                    with session_factory() as write_db:
+                        with sqlite_write_lock(write_db):
+                            write_plan = _load_plan_for_update(db=write_db, plan_id=plan.id)
+                            summary = _apply_decisions(
+                                db=write_db,
+                                settings=settings,
+                                plan=write_plan,
+                                decision_payload=decision_payload,
+                                account_context=account_context,
+                                expected_item_ids=set(batch_ids),
+                            )
+                            write_db.commit()
+                    applied.append(summary)
+                except Exception as exc:  # pragma: no cover - defensive runtime guard
+                    LOGGER.exception(
+                        "watch_exec_agent_sizing_failed",
+                        extra={
+                            "plan_id": plan.external_plan_id,
+                            "runtime_mode": settings.runtime_mode,
+                            "batch_item_ids": batch_ids,
+                        },
+                    )
+                    errors.append({"plan_id": plan.external_plan_id, "item_ids": batch_ids, "error": str(exc)})
+        plan_payloads.append({"plan_id": plan.external_plan_id, "candidate_count": len(candidates)})
+        if batches_processed >= max_batches_per_cycle:
+            break
+
+    return _result(
+        idle=not applied and not errors,
+        plans=plan_payloads,
+        applied=applied,
+        errors=errors,
+        batches_processed=batches_processed,
+        max_batches_per_cycle=max_batches_per_cycle,
+    )
+
+
+def _load_plan_for_update(*, db: Session, plan_id: str) -> ExecutionPlan:
+    plan = db.scalars(
+        select(ExecutionPlan)
+        .where(ExecutionPlan.id == plan_id)
+        .options(selectinload(ExecutionPlan.items))
+    ).one()
+    return plan
 
 
 def _inside_sizing_window(*, settings: Settings, now: datetime) -> bool:
@@ -467,6 +600,31 @@ def _load_sizing_account_context(
     return _account_context_payload(snapshot)
 
 
+def _load_sizing_account_context_short_transaction(
+    *,
+    settings: Settings,
+    session_factory: sessionmaker[Session],
+    adapter: BrokerAdapter | None,
+) -> dict[str, object]:
+    if adapter is None:
+        return {"available": False, "reason": "broker_adapter_unavailable"}
+    try:
+        with session_factory() as db:
+            session_state = ensure_authenticated_broker_session(
+                settings=settings,
+                db=db,
+                adapter=adapter,
+                source="watch_exec_agent_sizing",
+                reason="load account cash, holdings, and open orders for exec-agent watch sizing",
+            )
+            access_token = session_state.access_token or ""
+            db.commit()
+        snapshot = adapter.get_account_snapshot(access_token)
+    except (BrokerAdapterError, AttributeError, NotImplementedError, RuntimeError, ValueError) as exc:
+        return {"available": False, "reason": f"{exc.__class__.__name__}: {exc}"}
+    return _account_context_payload(snapshot)
+
+
 def _account_context_payload(snapshot: BrokerAccountSnapshot) -> dict[str, object]:
     positions = snapshot.positions or snapshot.holdings
     holdings = [
@@ -529,7 +687,7 @@ def _candidate_universe_payload(candidates: list[dict[str, object]]) -> dict[str
 def _request_exec_agent_decisions_with_retries(
     *,
     settings: Settings,
-    db: Session,
+    db: Session | None,
     plan: ExecutionPlan,
     payload: dict[str, object],
     expected_item_ids: set[str],
@@ -566,7 +724,8 @@ def _request_exec_agent_decisions_with_retries(
             max_attempts=max_attempts,
             error=last_error,
         )
-    db.flush()
+    if db is not None:
+        db.flush()
     return None
 
 
@@ -583,8 +742,8 @@ def _record_sizing_attempt(
     for item in plan.items:
         if item.id not in expected_item_ids:
             continue
-        risk_context = dict(item.risk_context or {})
-        events = risk_context.get("exec_agent_watch_sizing_attempts")
+        quantity_policy = dict(item.quantity_policy or {})
+        events = quantity_policy.get("exec_agent_watch_sizing_attempts")
         if not isinstance(events, list):
             events = []
         event: dict[str, object] = {
@@ -595,11 +754,11 @@ def _record_sizing_attempt(
         }
         if error is not None:
             event["error"] = error[-500:]
-        risk_context["exec_agent_watch_sizing_attempt_count"] = attempt
-        risk_context["exec_agent_watch_sizing_max_attempts"] = max_attempts
-        risk_context["exec_agent_watch_sizing_fallback_allowed"] = bool(not success and attempt >= max_attempts)
-        risk_context["exec_agent_watch_sizing_attempts"] = [*events[-9:], event]
-        item.risk_context = risk_context
+        quantity_policy["exec_agent_watch_sizing_attempt_count"] = attempt
+        quantity_policy["exec_agent_watch_sizing_max_attempts"] = max_attempts
+        quantity_policy["exec_agent_watch_sizing_fallback_allowed"] = bool(not success and attempt >= max_attempts)
+        quantity_policy["exec_agent_watch_sizing_attempts"] = [*events[-9:], event]
+        item.quantity_policy = quantity_policy
 
 
 def _request_exec_agent_decisions(*, settings: Settings, payload: dict[str, object]) -> dict[str, object]:
@@ -772,9 +931,13 @@ def _apply_decisions(
         decision = decisions[item.id]
         action = str(decision.get("action") or "").strip().lower()
         record = _decision_record(decision=decision, item=item, version=str(decision_payload.get("version") or ""))
-        risk_context = dict(item.risk_context or {})
-        risk_context["exec_agent_decision"] = record
-        risk_context["short_term_exec_agent_decision"] = record
+        _add_plan_item_audit(
+            db=db,
+            item=item,
+            event_type="watch_exec_agent_sizing_decision",
+            summary=_decision_summary(record),
+            payload=record,
+        )
         if action == "approve":
             quantity = _positive_int(decision.get("quantity"))
             if quantity is None:
@@ -798,17 +961,34 @@ def _apply_decisions(
                 "target_profile": record["target_profile"],
                 "target_tag": record["target_tag"],
                 "reason_code": decision.get("reason_code"),
+                "exec_agent_decision": _decision_summary(record),
+                "short_term_exec_agent_decision": _decision_summary(record),
+                "exec_agent_decision_audit": {
+                    "event_type": "watch_exec_agent_sizing_decision",
+                    "storage": "execution_plan_item_audits",
+                },
                 "sizing_adjustment": sizing["adjustment"],
                 "previous_policy": previous_policy,
             }
             item.status = "watch_monitoring_active"
             approved += 1
         elif action == "reject":
+            previous_policy = item.quantity_policy if isinstance(item.quantity_policy, dict) else None
+            item.quantity_policy = {
+                "kind": "exec_agent_rejected",
+                "source": "exec_agent_watch_sizing",
+                "exec_agent_decision": _decision_summary(record),
+                "short_term_exec_agent_decision": _decision_summary(record),
+                "exec_agent_decision_audit": {
+                    "event_type": "watch_exec_agent_sizing_decision",
+                    "storage": "execution_plan_item_audits",
+                },
+                "previous_policy": previous_policy,
+            }
             item.status = "exec_agent_rejected"
             rejected += 1
         else:
             raise ValueError(f"unknown exec-agent decision action for {item.symbol}: {action}")
-        item.risk_context = risk_context
     return {
         "plan_id": plan.external_plan_id,
         "evaluated": len(items),
@@ -818,6 +998,50 @@ def _apply_decisions(
         "missing_item_ids": sorted(missing_ids),
         "ignored_extra": len(extra_ids),
     }
+
+
+def _decision_summary(record: dict[str, object]) -> dict[str, object]:
+    return {
+        "source": record.get("source"),
+        "action": record.get("action"),
+        "decision": record.get("decision"),
+        "execution_plan_item_id": record.get("execution_plan_item_id"),
+        "symbol": record.get("symbol"),
+        "quantity": record.get("quantity"),
+        "approved_quantity": record.get("approved_quantity"),
+        "approved_notional_krw": record.get("approved_notional_krw"),
+        "sizing_price": record.get("sizing_price"),
+        "confidence": record.get("confidence"),
+        "target_profile": record.get("target_profile"),
+        "target_tag": record.get("target_tag"),
+        "reason_code": record.get("reason_code"),
+        "reason": record.get("reason"),
+        "decided_at": record.get("decided_at"),
+    }
+
+
+def _add_plan_item_audit(
+    *,
+    db: Session | None,
+    item: ExecutionPlanItem,
+    event_type: str,
+    summary: dict[str, object],
+    payload: dict[str, object],
+    error_message: str | None = None,
+) -> None:
+    if db is None or not hasattr(db, "add"):
+        return
+    db.add(
+        ExecutionPlanItemAudit(
+            execution_plan_item_id=item.id,
+            event_type=event_type,
+            source="watch_exec_agent_sizing",
+            summary=summary,
+            payload=payload,
+            error_message=error_message,
+            occurred_at=datetime.now(UTC),
+        )
+    )
 
 
 def _adjust_approved_watch_quantity(

@@ -233,6 +233,17 @@ def test_settings_load_from_environment() -> None:
     assert settings.log_level == "DEBUG"
 
 
+def test_runtime_status_exposes_sqlite_contention_diagnostics() -> None:
+    app, _engine = build_test_app()
+    client = TestClient(app)
+
+    payload = client.get("/runtime/status").json()
+
+    assert payload["diagnostics"]["sqlite"]["lock_error_count"] >= 0
+    assert payload["diagnostics"]["sqlite"]["write_retry_count"] >= 0
+    assert "last_lock_error" in payload["diagnostics"]["sqlite"]
+
+
 def test_autonomous_runtime_stays_opt_in_by_default() -> None:
     default_settings = load_settings({})
     assert default_settings.autonomous_runtime_enabled is False
