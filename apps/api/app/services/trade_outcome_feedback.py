@@ -8,7 +8,7 @@ from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session, selectinload
 
 from app.core.config import Settings, load_settings
@@ -247,6 +247,8 @@ def _portfolio_risk(
         {
             "symbol": position.symbol,
             "quantity": position.quantity,
+            "base_quantity": _position_base_quantity_text(position),
+            "effective_quantity": _position_effective_quantity_text(position),
             "last_reconciled_at": _normalize_utc(position.last_reconciled_at).isoformat()
             if position.last_reconciled_at is not None
             else None,
@@ -299,7 +301,13 @@ def _load_positions(*, settings: Settings, db: Session) -> list[ExecutionPositio
     return list(
         db.scalars(
             select(ExecutionPosition)
-            .where(ExecutionPosition.mode == settings.runtime_mode, ExecutionPosition.quantity > 0)
+            .where(
+                ExecutionPosition.mode == settings.runtime_mode,
+                or_(
+                    ExecutionPosition.quantity > 0,
+                    ExecutionPosition.base_quantity > 0,
+                ),
+            )
             .order_by(ExecutionPosition.symbol.asc())
         )
     )
@@ -327,12 +335,15 @@ def _load_open_orders(*, settings: Settings, db: Session) -> list[BrokerOrder]:
 
 
 def _position_risk_row(*, position: ExecutionPosition, sector: str | None) -> dict[str, object]:
+    effective_quantity = _position_effective_quantity(position)
     market_value = None
-    if position.average_price is not None and position.quantity > 0:
-        market_value = Decimal(position.average_price) * Decimal(position.quantity)
+    if position.average_price is not None and effective_quantity > 0:
+        market_value = Decimal(position.average_price) * effective_quantity
     return {
         "symbol": position.symbol,
         "quantity": position.quantity,
+        "base_quantity": _position_base_quantity_text(position),
+        "effective_quantity": _position_effective_quantity_text(position),
         "average_price": _decimal_text(Decimal(position.average_price)) if position.average_price is not None else None,
         "market_value_krw": _decimal_text(market_value),
         "last_reconciled_at": _normalize_utc(position.last_reconciled_at).isoformat()
@@ -341,6 +352,25 @@ def _position_risk_row(*, position: ExecutionPosition, sector: str | None) -> di
         "updated_from": position.updated_from,
         "sector": sector,
     }
+
+
+def _position_effective_quantity(position: ExecutionPosition) -> Decimal:
+    if position.quantity > 0:
+        return Decimal(position.quantity)
+    base_quantity = Decimal(position.base_quantity) if position.base_quantity is not None else Decimal("0")
+    return base_quantity if base_quantity > 0 else Decimal("0")
+
+
+def _position_base_quantity_text(position: ExecutionPosition) -> str | None:
+    if position.base_quantity is None:
+        return None
+    return _quantity_text(Decimal(position.base_quantity))
+
+
+def _position_effective_quantity_text(position: ExecutionPosition) -> str:
+    if position.quantity > 0:
+        return _decimal_text(Decimal(position.quantity)) or "0.0000"
+    return _quantity_text(_position_effective_quantity(position))
 
 
 def _open_order_risk_row(*, order: BrokerOrder, as_of: datetime, stale_before: datetime) -> dict[str, object]:
@@ -507,6 +537,8 @@ def _monday_pre_market_checks(
                     "type": "stale_local_position",
                     "symbol": position.get("symbol"),
                     "quantity": position.get("quantity"),
+                    "base_quantity": position.get("base_quantity"),
+                    "effective_quantity": position.get("effective_quantity"),
                     "reason": "refresh local position against broker truth before Monday pre-market",
                 }
             )
@@ -516,6 +548,8 @@ def _monday_pre_market_checks(
                     "type": "open_position",
                     "symbol": position.get("symbol"),
                     "quantity": position.get("quantity"),
+                    "base_quantity": position.get("base_quantity"),
+                    "effective_quantity": position.get("effective_quantity"),
                     "market_value_krw": position.get("market_value_krw"),
                     "reason": "review concentration and exit monitors before Monday pre-market",
                 }
@@ -866,6 +900,10 @@ def _decimal_text(value: Decimal | None) -> str | None:
     if value is None:
         return None
     return str(value.quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP))
+
+
+def _quantity_text(value: Decimal) -> str:
+    return str(value.quantize(Decimal("0.000000000001"), rounding=ROUND_HALF_UP))
 
 
 def _normalize_utc(value: datetime) -> datetime:

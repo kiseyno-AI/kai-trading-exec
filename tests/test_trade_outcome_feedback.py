@@ -415,6 +415,65 @@ def test_trade_outcome_feedback_portfolio_risk_and_sell_reason_contributions(tmp
     engine.dispose()
 
 
+def test_trade_outcome_feedback_portfolio_risk_uses_upbit_base_quantity(tmp_path) -> None:
+    engine, session = _session()
+    settings = Settings(
+        runtime_mode="paper",
+        trade_outcome_feedback_dir=str(tmp_path),
+        exec_agent_max_account_snapshot_age_seconds=300,
+    )
+    session.add_all(
+        [
+            ExecutionPosition(
+                id="pos-paper-btc",
+                mode="paper",
+                symbol="KRW-BTC",
+                quantity=0,
+                base_quantity=Decimal("0.010000000000"),
+                average_price=Decimal("150000000"),
+                updated_from="upbit_paper_simulated_fill",
+                last_reconciled_at=datetime(2026, 6, 20, 0, 9, tzinfo=UTC),
+                raw_payload={"provider": "upbit", "paper": True, "simulated": True},
+            ),
+            ExecutionPosition(
+                id="pos-live-btc",
+                mode="live",
+                symbol="KRW-BTC",
+                quantity=0,
+                base_quantity=Decimal("1.000000000000"),
+                average_price=Decimal("150000000"),
+                updated_from="upbit_paper_simulated_fill",
+                last_reconciled_at=datetime(2026, 6, 20, 0, 9, tzinfo=UTC),
+            ),
+        ]
+    )
+    session.commit()
+
+    report = generate_trade_outcome_feedback(
+        settings=settings,
+        db=session,
+        as_of=datetime(2026, 6, 20, 0, 10, tzinfo=UTC),
+    )
+
+    risk = report["portfolio_risk"]
+    assert risk["available"] is True
+    assert risk["open_holding_count"] == 1
+    assert risk["total_market_value_krw"] == "1500000.0000"
+    assert risk["positions_missing_market_value_count"] == 0
+    concentration = risk["top_position_concentration"][0]
+    assert concentration["symbol"] == "KRW-BTC"
+    assert concentration["quantity"] == 0
+    assert concentration["base_quantity"] == "0.010000000000"
+    assert concentration["effective_quantity"] == "0.010000000000"
+    assert concentration["market_value_krw"] == "1500000.0000"
+    assert concentration["portfolio_weight_pct"] == "100.0000"
+    assert risk["monday_pre_market_checks"][0]["base_quantity"] == "0.010000000000"
+    assert any("KRW-BTC" in line and "1500000.0000" in line for line in report["prompt_snippet"]["top_portfolio_risks"])
+
+    session.close()
+    engine.dispose()
+
+
 def test_exec_agent_payloads_include_latest_trade_outcome_feedback(tmp_path) -> None:
     engine, session = _session()
     settings = Settings(runtime_mode="paper", trade_outcome_feedback_dir=str(tmp_path))
