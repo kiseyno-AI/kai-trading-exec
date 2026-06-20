@@ -78,6 +78,13 @@ RETRYABLE_WATCH_BUY_APPROVAL_REASONS = frozenset(
         "invalid_stop_distance",
     }
 )
+BLOCKED_WATCH_BUY_APPROVAL_REASONS = frozenset(
+    {
+        "paused",
+        "kill_switch",
+        "stale_trigger_reclaim_required",
+    }
+)
 PENDING_DISPATCH_MONITORING_STATUSES = frozenset(
     {
         "target_sell_triggered_pending_dispatch",
@@ -781,6 +788,7 @@ def _evaluate_monitoring_cycle(
                 item=action.item,
                 observed_price=action.observed_price,
                 requested_quantity=trigger_time_agent_quantity,
+                trigger_time_agent_approved=trigger_time_agent_quantity is not None,
                 sizing_source=(
                     "trigger_time_exec_agent_approval"
                     if trigger_time_agent_quantity is not None
@@ -791,7 +799,7 @@ def _evaluate_monitoring_cycle(
             if quantity is None:
                 blocked_item_count += 1
                 if approval.reason in (
-                    {"paused", "kill_switch"} | RETRYABLE_WATCH_BUY_APPROVAL_REASONS
+                    BLOCKED_WATCH_BUY_APPROVAL_REASONS | RETRYABLE_WATCH_BUY_APPROVAL_REASONS
                 ):
                     action.item.status = "watch_buy_triggered_blocked"
                     event: dict[str, object] = {
@@ -801,6 +809,8 @@ def _evaluate_monitoring_cycle(
                         "observed_price": _serialize_decimal(action.observed_price),
                         "recorded_at": triggered_at.isoformat(),
                     }
+                    if approval.details:
+                        event["details"] = approval.details
                     if approval.reason in RETRYABLE_WATCH_BUY_APPROVAL_REASONS:
                         event["retry_after_at"] = (
                             triggered_at
@@ -818,6 +828,7 @@ def _evaluate_monitoring_cycle(
                         outcome="blocked",
                         block_reason=approval.reason,
                         message=approval.message,
+                        trigger_metadata=approval.details,
                     )
                 else:
                     action.item.status = "watch_buy_rejected"
@@ -3468,6 +3479,7 @@ def _resolve_watch_buy_order(
     item: ExecutionPlanItem,
     observed_price: Decimal | None,
     requested_quantity: int | None = None,
+    trigger_time_agent_approved: bool = False,
     sizing_source: str | None = None,
 ) -> WatchBuyOrderApproval:
     decision = _exec_agent_decision(item)
@@ -3523,6 +3535,15 @@ def _resolve_watch_buy_order(
         )
 
     entry_price = observed_price or _watch_buy_trigger_price(item) or item.limit_price
+    stale_reclaim_veto = _watch_buy_stale_trigger_reclaim_veto(
+        settings=settings,
+        item=item,
+        current_reference_price=entry_price,
+        trigger_time_agent_approved=trigger_time_agent_approved,
+    )
+    if stale_reclaim_veto is not None:
+        return stale_reclaim_veto
+
     stop_price = _watch_buy_stop_price(item)
     if entry_price is None or stop_price is None:
         return WatchBuyOrderApproval(
@@ -3621,6 +3642,121 @@ def _resolve_watch_buy_order(
         event=event,
     )
     return WatchBuyOrderApproval(quantity=risk_decision.quantity)
+
+
+def _watch_buy_stale_trigger_reclaim_veto(
+    *,
+    settings: Settings,
+    item: ExecutionPlanItem,
+    current_reference_price: Decimal | None,
+    trigger_time_agent_approved: bool,
+) -> WatchBuyOrderApproval | None:
+    if current_reference_price is None:
+        return None
+    trigger_price = _watch_buy_trigger_price(item)
+    if trigger_price is None:
+        return None
+    if _watch_buy_direction(item) != "at_or_above":
+        return None
+    threshold_pct = settings.watch_buy_stale_trigger_reclaim_threshold_pct
+    if threshold_pct <= 0:
+        return None
+    stale_reference_price = (trigger_price * (Decimal("1") - (threshold_pct / Decimal("100")))).quantize(
+        Decimal("0.0001"),
+        rounding=ROUND_DOWN,
+    )
+    if current_reference_price > stale_reference_price:
+        return None
+    details = {
+        "reason": "stale_trigger_reclaim_required",
+        "trigger_price": _serialize_decimal(trigger_price),
+        "current_reference_price": _serialize_decimal(current_reference_price),
+        "reference_price": _serialize_decimal(current_reference_price),
+        "stale_reference_price": _serialize_decimal(stale_reference_price),
+        "threshold_pct": _serialize_decimal(threshold_pct),
+        "direction": _watch_buy_direction(item),
+    }
+    if _watch_buy_is_pullback_strategy(item):
+        _record_watch_buy_stale_trigger_reclaim_bypass(
+            item=item,
+            details={**details, "bypass_reason": "pullback_strategy_profile"},
+        )
+        return None
+    if (
+        trigger_time_agent_approved
+        and _trigger_time_decision_confirms_fresh_pullback_reclaim(item)
+    ):
+        _record_watch_buy_stale_trigger_reclaim_bypass(
+            item=item,
+            details={**details, "bypass_reason": "trigger_time_pullback_reclaim_confirmation"},
+        )
+        return None
+    return WatchBuyOrderApproval(
+        quantity=None,
+        reason="stale_trigger_reclaim_required",
+        message="current reference price is materially below the original breakout/reclaim trigger",
+        details=details,
+    )
+
+
+def _record_watch_buy_stale_trigger_reclaim_bypass(
+    *,
+    item: ExecutionPlanItem,
+    details: dict[str, object],
+) -> None:
+    risk_context = dict(item.risk_context) if isinstance(item.risk_context, dict) else {}
+    risk_context["last_stale_trigger_reclaim_check"] = details
+    item.risk_context = risk_context
+
+
+def _watch_buy_is_pullback_strategy(item: ExecutionPlanItem) -> bool:
+    for source in _item_payload_sources(item):
+        for key in (
+            "strategy_profile",
+            "strategy_type",
+            "setup_profile",
+            "setup_type",
+            "entry_profile",
+            "tactical_action",
+            "handoff_intent",
+        ):
+            value = source.get(key)
+            if isinstance(value, str) and "pullback" in value.strip().lower():
+                return True
+        strategy = source.get("strategy")
+        if isinstance(strategy, dict):
+            for key in ("profile", "type", "name"):
+                value = strategy.get(key)
+                if isinstance(value, str) and "pullback" in value.strip().lower():
+                    return True
+        if source.get("pullback_strategy") is True:
+            return True
+    return False
+
+
+def _trigger_time_decision_confirms_fresh_pullback_reclaim(item: ExecutionPlanItem) -> bool:
+    risk_context = item.risk_context if isinstance(item.risk_context, dict) else {}
+    interaction = risk_context.get("last_trigger_time_exec_agent_interaction")
+    if not isinstance(interaction, dict):
+        return False
+    decision = interaction.get("decision")
+    response = interaction.get("response_payload")
+    if not isinstance(decision, dict):
+        return False
+    if decision.get("decision") != "execute_now":
+        return False
+    has_updated_stop = _parse_positive_decimal(decision.get("updated_stop_price")) is not None
+    has_updated_target = _parse_positive_decimal(decision.get("updated_target_price")) is not None
+    has_updated_trigger = any(
+        _parse_positive_decimal(payload.get(key)) is not None
+        for payload in (decision, response if isinstance(response, dict) else {})
+        for key in ("updated_trigger_price", "new_trigger_price", "reclaim_trigger_price")
+        if isinstance(payload, dict)
+    )
+    if not (has_updated_stop and has_updated_target and has_updated_trigger):
+        return False
+    text = str({"decision": decision, "response_payload": response}).lower()
+    return "pullback" in text or "reclaim" in text
 
 
 def _apply_watch_buy_effective_stop(

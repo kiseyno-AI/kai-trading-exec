@@ -81,6 +81,7 @@ def _create_intraday_watch_buy(
     plan_id: str,
     max_safe_notional_krw: str = "300000",
     risk_context_extra: dict[str, object] | None = None,
+    decision_agent_name: str | None = None,
 ) -> str:
     risk_context = {
         "exchange": "KRX",
@@ -91,27 +92,28 @@ def _create_intraday_watch_buy(
     }
     if risk_context_extra:
         risk_context.update(risk_context_extra)
+    item: dict[str, object] = {
+        "symbol": "005930",
+        "side": "buy",
+        "intent": "intraday_watch_buy",
+        "quantity_policy": {
+            "type": "exec_agent_sized",
+            "budget_krw": "0",
+            "max_safe_notional_krw": max_safe_notional_krw,
+        },
+        "trigger_price": "71000.00",
+        "time_in_force": "day",
+        "risk_context": risk_context,
+    }
+    if decision_agent_name is not None:
+        item["decision_agent_name"] = decision_agent_name
     response = client.post(
         "/execution-plans",
         json={
             "plan_id": plan_id,
             "source": "kai-trading-core",
             "market_date": "2026-06-05",
-            "items": [
-                {
-                    "symbol": "005930",
-                    "side": "buy",
-                    "intent": "intraday_watch_buy",
-                    "quantity_policy": {
-                        "type": "exec_agent_sized",
-                        "budget_krw": "0",
-                        "max_safe_notional_krw": max_safe_notional_krw,
-                    },
-                    "trigger_price": "71000.00",
-                    "time_in_force": "day",
-                    "risk_context": risk_context,
-                }
-            ],
+            "items": [item],
         },
     )
     assert response.status_code == 201
@@ -350,6 +352,280 @@ def test_trigger_time_buy_agent_is_bypassed_for_intraday_pullback_below_trigger(
     assert order_call.execution_plan_item_id == item_id
     assert order_call.side == "buy"
     assert order_call.limit_price == Decimal("70900.00")
+
+    engine.dispose()
+
+
+def test_stale_trigger_reclaim_blocks_cross_pullback_buy_below_threshold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, engine, client, broker_adapter, captured = _build_trigger_agent_app(
+        monkeypatch=monkeypatch,
+        agent_responses=[],
+    )
+    item_id = _create_intraday_watch_buy(
+        client,
+        plan_id="plan-stale-trigger-reclaim-blocked",
+        risk_context_extra={"exec_agent_watch_sizing_fallback_allowed": True},
+        decision_agent_name="short-term-decider",
+    )
+
+    crossed = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "live trigger cross persists before stale pullback",
+            "prices": [
+                _live_price_payload(
+                    price="71300.00",
+                    day_low="68000.00",
+                    day_high="71400.00",
+                )
+            ],
+        },
+    )
+    assert crossed.status_code == 200
+    assert crossed.json()["submitted_order_count"] == 0
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "day high crossed trigger but pulled back too far",
+            "prices": [
+                _live_price_payload(
+                    price="68870.00",
+                    day_low="68000.00",
+                    day_high="71400.00",
+                )
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["submitted_order_count"] == 0
+    assert payload["blocked_item_count"] == 1
+    assert payload["items"][0]["outcome"] == "blocked"
+    assert payload["items"][0]["block_reason"] == "stale_trigger_reclaim_required"
+    assert captured == []
+    assert broker_adapter.order_calls == []
+
+    with app.state.db_session_factory() as session:
+        item = session.get(ExecutionPlanItem, item_id)
+        assert item is not None
+        assert item.status == "watch_buy_triggered_blocked"
+        event = item.risk_context["last_monitoring_event"]
+        assert event["event"] == "watch_buy_triggered_blocked"
+        assert event["reason"] == "stale_trigger_reclaim_required"
+        assert event["details"]["trigger_price"] == "71000.0000"
+        assert event["details"]["current_reference_price"] == "68870.0000"
+        assert event["details"]["reference_price"] == "68870.0000"
+        assert event["details"]["stale_reference_price"] == "68870.0000"
+        assert event["details"]["threshold_pct"] == "3.0000"
+
+    board = client.get("/runtime/status")
+    assert board.status_code == 200
+    blocked_candidates = board.json()["liveness"]["monitoring"]["segments"]["blocked_short_term_candidates"]["items"]
+    blocked_item = next(candidate for candidate in blocked_candidates if candidate["symbol"] == "005930")
+    assert blocked_item["execution_plan_item_id"] == item_id
+    assert blocked_item["blocker_reason"] == "stale_trigger_reclaim_required"
+
+    engine.dispose()
+
+
+def test_stale_trigger_reclaim_allows_cross_pullback_buy_within_threshold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, engine, client, broker_adapter, captured = _build_trigger_agent_app(
+        monkeypatch=monkeypatch,
+        agent_responses=[],
+    )
+    item_id = _create_intraday_watch_buy(
+        client,
+        plan_id="plan-stale-trigger-reclaim-within-threshold",
+        risk_context_extra={
+            "exec_agent_watch_sizing_fallback_allowed": True,
+            "stop_price": "68000.00",
+        },
+    )
+
+    crossed = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "live trigger cross persists before within-threshold pullback",
+            "prices": [
+                _live_price_payload(
+                    price="71300.00",
+                    day_low="68000.00",
+                    day_high="71400.00",
+                )
+            ],
+        },
+    )
+    assert crossed.status_code == 200
+    assert crossed.json()["submitted_order_count"] == 0
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "day high crossed trigger and stayed inside stale threshold",
+            "prices": [
+                _live_price_payload(
+                    price="68900.00",
+                    day_low="68000.00",
+                    day_high="71400.00",
+                )
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["submitted_order_count"] == 1
+    assert payload["items"][0]["outcome"] == "submitted"
+    assert captured == []
+    assert len(broker_adapter.order_calls) == 1
+    assert broker_adapter.order_calls[0].execution_plan_item_id == item_id
+    assert broker_adapter.order_calls[0].limit_price == Decimal("68900.00")
+
+    engine.dispose()
+
+
+def test_stale_trigger_reclaim_allows_explicit_pullback_strategy_profile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, engine, client, broker_adapter, captured = _build_trigger_agent_app(
+        monkeypatch=monkeypatch,
+        agent_responses=[],
+    )
+    item_id = _create_intraday_watch_buy(
+        client,
+        plan_id="plan-stale-trigger-reclaim-pullback-profile",
+        risk_context_extra={
+            "exec_agent_watch_sizing_fallback_allowed": True,
+            "strategy_profile": "pullback_reclaim",
+            "stop_price": "68000.00",
+        },
+    )
+
+    crossed = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "live trigger cross persists before pullback-profile entry",
+            "prices": [
+                _live_price_payload(
+                    price="71300.00",
+                    day_low="68000.00",
+                    day_high="71400.00",
+                )
+            ],
+        },
+    )
+    assert crossed.status_code == 200
+    assert crossed.json()["submitted_order_count"] == 0
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "pullback strategy is allowed to buy below old breakout line",
+            "prices": [
+                _live_price_payload(
+                    price="68870.00",
+                    day_low="68000.00",
+                    day_high="71400.00",
+                )
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["submitted_order_count"] == 1
+    assert captured == []
+    assert len(broker_adapter.order_calls) == 1
+    assert broker_adapter.order_calls[0].execution_plan_item_id == item_id
+
+    with app.state.db_session_factory() as session:
+        item = session.get(ExecutionPlanItem, item_id)
+        assert item is not None
+        check = item.risk_context["last_stale_trigger_reclaim_check"]
+        assert check["bypass_reason"] == "pullback_strategy_profile"
+        assert check["current_reference_price"] == "68870.0000"
+
+    engine.dispose()
+
+
+def test_stale_trigger_reclaim_allows_fresh_agent_pullback_reclaim_confirmation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, engine, client, broker_adapter, captured = _build_trigger_agent_app(
+        monkeypatch=monkeypatch,
+        agent_responses=[
+            {
+                "decision": "execute_now",
+                "side": "buy",
+                "quantity": 3,
+                "limit_price": "68870.00",
+                "updated_trigger_price": "68870.00",
+                "updated_target_price": "70400.00",
+                "updated_stop_price": "68100.00",
+                "reason": "fresh pullback reclaim setup confirmed with updated levels",
+                "risk_notes": ["new reclaim line is current pullback area"],
+                "confidence": "0.72",
+                "context_staleness_ok": True,
+            }
+        ],
+    )
+    item_id = _create_intraday_watch_buy(
+        client,
+        plan_id="plan-stale-trigger-reclaim-agent-override",
+        risk_context_extra={
+            "watch_buy_trigger_cross": {
+                "reason": "manual_reclaim_cross_seen",
+                "direction": "at_or_above",
+                "trigger_price": "71000.0000",
+                "observed_price": "71200.0000",
+                "observed_at": "2026-06-05T00:30:00+00:00",
+                "recorded_at": "2026-06-05T00:30:00+00:00",
+            }
+        },
+    )
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "agent confirms fresh reclaim after stale trigger",
+            "prices": [_live_price_payload(price="68870.00")],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["submitted_order_count"] == 1
+    assert len(captured) == 1
+    assert captured[0]["market_context"]["latest_price"] == "68870.0000"
+    assert len(broker_adapter.order_calls) == 1
+    assert broker_adapter.order_calls[0].execution_plan_item_id == item_id
+
+    with app.state.db_session_factory() as session:
+        item = session.get(ExecutionPlanItem, item_id)
+        assert item is not None
+        assert item.status == "watch_buy_submitted"
+        check = item.risk_context["last_stale_trigger_reclaim_check"]
+        assert check["bypass_reason"] == "trigger_time_pullback_reclaim_confirmation"
+        interaction = item.risk_context["last_trigger_time_exec_agent_interaction"]
+        assert interaction["decision"]["updated_trigger_price"] == "68870.00"
 
     engine.dispose()
 
