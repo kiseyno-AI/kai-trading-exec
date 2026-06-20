@@ -168,6 +168,7 @@ def build_test_app(
     exec_agent_max_trade_risk_pct: Decimal = Decimal("0.015"),
     exec_agent_stop_loss_pct: Decimal = Decimal("0.10"),
     exec_agent_tactical_scalp_max_stop_pct: Decimal = Decimal("0.015"),
+    vol_corr_sizing_enabled: bool = False,
 ):
     settings = Settings(
         database_url="sqlite:///:memory:",
@@ -186,6 +187,7 @@ def build_test_app(
         exec_agent_max_daily_new_buy_notional=exec_agent_max_daily_new_buy_notional,
         exec_agent_stop_loss_pct=exec_agent_stop_loss_pct,
         exec_agent_tactical_scalp_max_stop_pct=exec_agent_tactical_scalp_max_stop_pct,
+        vol_corr_sizing_enabled=vol_corr_sizing_enabled,
     )
     engine = create_db_engine(settings)
     Base.metadata.create_all(engine)
@@ -518,6 +520,54 @@ def test_short_term_exec_agent_quantity_is_capped_by_stop_distance_risk() -> Non
     assert audit["risk_based_quantity"] == 6
     assert audit["allocation_quantity"] == 8
     assert audit["stop_distance"] == "5000.0000"
+
+    engine.dispose()
+
+
+def test_short_term_exec_agent_applies_vol_corr_cap_when_enabled() -> None:
+    adapter = StubBrokerAdapter(
+        available_cash=Decimal("2000000"),
+        holdings=[BrokerAccountHolding(symbol="000660", quantity=3)],
+    )
+    app, engine = build_test_app(
+        adapter,
+        exec_agent_max_symbol_budget=Decimal("500000"),
+        exec_agent_max_total_budget=Decimal("2000000"),
+        vol_corr_sizing_enabled=True,
+    )
+    client = TestClient(app)
+
+    payload = short_term_plan_payload(
+        exec_agent_decision=strict_exec_decision("0.82", max_budget="500000")
+    )
+    item = payload["items"][0]
+    assert isinstance(item, dict)
+    risk_context = item["risk_context"]
+    assert isinstance(risk_context, dict)
+    risk_context.update(
+        {
+            "realized_volatility_pct": "5.0",
+            "max_holding_correlation": "0.82",
+            "correlation_symbol": "000660",
+        }
+    )
+
+    response = client.post("/execution-plans/preview", json=payload)
+
+    assert response.status_code == 200
+    buy_item = response.json()["items"][0]
+    audit = buy_item["risk_context"]["exec_agent_decision"]
+    assert buy_item["quantity_policy"]["quantity"] == 4
+    assert audit["quantity"] == 4
+    assert audit["risk_based_quantity"] == 10
+    assert audit["allocation_quantity"] == 8
+    sizing_caps = audit["sizing_caps"]
+    assert sizing_caps["baseline_quantity"] == 8
+    assert sizing_caps["capped_quantity"] == 4
+    assert sizing_caps["volatility_multiplier"] == "0.7500"
+    assert sizing_caps["correlation_multiplier"] == "0.8000"
+    assert sizing_caps["vol_corr_multiplier"] == "0.6000"
+    assert sizing_caps["vol_corr_cap_reason"] == "high_volatility+high_correlation"
 
     engine.dispose()
 

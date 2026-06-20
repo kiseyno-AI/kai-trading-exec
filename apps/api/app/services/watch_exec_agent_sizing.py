@@ -22,6 +22,7 @@ from app.core.config import Settings
 from app.db.sqlite_diagnostics import sqlite_write_lock
 from app.models.runtime import ExecutionPlan, ExecutionPlanItem, ExecutionPlanItemAudit
 from app.services.broker_auth import ensure_authenticated_broker_session
+from app.services.risk_sizing import apply_vol_corr_quantity_cap
 from app.services.trade_outcome_feedback import load_latest_trade_outcome_feedback_snippet
 
 LOGGER = logging.getLogger(__name__)
@@ -1188,22 +1189,32 @@ def _adjust_approved_watch_quantity(
     if effective_target > original_notional:
         adjusted_quantity = max(agent_quantity, _floor_quantity(effective_target / sizing_price))
     adjusted_quantity = min(adjusted_quantity, max_quantity)
+    vol_corr_cap = apply_vol_corr_quantity_cap(
+        settings=settings,
+        baseline_quantity=adjusted_quantity,
+        context=_vol_corr_context(item=item, account_context=account_context),
+    )
+    if vol_corr_cap is not None:
+        adjusted_quantity = int(vol_corr_cap["capped_quantity"])
     approved_notional = sizing_price * Decimal(adjusted_quantity)
+    adjustment: dict[str, object] = {
+        "applied": adjusted_quantity != agent_quantity,
+        "agent_quantity": agent_quantity,
+        "agent_notional": _decimal_text(original_notional),
+        "target_min_notional": _decimal_text(target_notional),
+        "cap_notional": _decimal_text(cap_notional),
+        "allowed_action_envelope_max_quantity": envelope_max_quantity,
+        "effective_target_notional": _decimal_text(effective_target),
+        "adjusted_quantity": adjusted_quantity,
+        "adjusted_notional": _decimal_text(approved_notional),
+    }
+    if vol_corr_cap is not None:
+        adjustment["vol_corr_cap"] = vol_corr_cap
     return {
         "quantity": adjusted_quantity,
         "sizing_price": sizing_price,
         "approved_notional": approved_notional,
-        "adjustment": {
-            "applied": adjusted_quantity != agent_quantity,
-            "agent_quantity": agent_quantity,
-            "agent_notional": _decimal_text(original_notional),
-            "target_min_notional": _decimal_text(target_notional),
-            "cap_notional": _decimal_text(cap_notional),
-            "allowed_action_envelope_max_quantity": envelope_max_quantity,
-            "effective_target_notional": _decimal_text(effective_target),
-            "adjusted_quantity": adjusted_quantity,
-            "adjusted_notional": _decimal_text(approved_notional),
-        },
+        "adjustment": adjustment,
     }
 
 
@@ -1427,6 +1438,56 @@ def _risk_cap_notional(
     if risk_quantity <= 0:
         return Decimal("0")
     return sizing_price * Decimal(risk_quantity)
+
+
+def _vol_corr_context(
+    *,
+    item: ExecutionPlanItem,
+    account_context: dict[str, object] | None,
+) -> dict[str, object]:
+    risk_context = item.risk_context if isinstance(item.risk_context, dict) else {}
+    context: dict[str, object] = {}
+    for key in (
+        "realized_volatility_pct",
+        "volatility_pct",
+        "atr_pct",
+        "recent_realized_volatility_pct",
+        "daily_return_pcts",
+        "return_pcts",
+        "candidate_return_pcts",
+        "daily_returns",
+        "returns",
+        "candidate_returns",
+        "max_holding_correlation",
+        "holding_correlation",
+        "correlation",
+        "correlation_symbol",
+        "holding_return_pcts_by_symbol",
+        "holding_returns_by_symbol",
+    ):
+        if key in risk_context:
+            context[key] = risk_context[key]
+
+    holding_symbols = _account_holding_symbols(account_context)
+    if holding_symbols:
+        context["holding_symbols"] = holding_symbols
+    return context
+
+
+def _account_holding_symbols(account_context: dict[str, object] | None) -> list[str]:
+    if not isinstance(account_context, dict) or account_context.get("available") is not True:
+        return []
+    holdings = account_context.get("holdings")
+    if not isinstance(holdings, list):
+        return []
+    symbols: list[str] = []
+    for holding in holdings:
+        if not isinstance(holding, dict):
+            continue
+        symbol = str(holding.get("symbol") or "").strip().upper()
+        if symbol and symbol not in symbols:
+            symbols.append(symbol)
+    return symbols
 
 
 def _account_basis(*, settings: Settings, account_context: dict[str, object] | None) -> Decimal:

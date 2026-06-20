@@ -668,6 +668,74 @@ def test_apply_decisions_respects_max_safe_notional_when_raising_probe() -> None
     assert policy["sizing_adjustment"]["cap_notional"] == "800000.0000"
 
 
+def test_apply_decisions_records_vol_corr_cap_details_when_enabled() -> None:
+    plan = ExecutionPlan(
+        id="plan-1",
+        external_plan_id="plan-vol-corr-cap",
+        strategy_run_id="strategy-1",
+        source="core-short-term-decider",
+        market_date=date(2026, 6, 4),
+        mode="live",
+        items=[
+            _watch_item(
+                item_id="watch-item-1",
+                symbol="005930",
+                risk_context={
+                    "target_price": "76000",
+                    "stop_price": "69000",
+                    "realized_volatility_pct": "5.0",
+                    "max_holding_correlation": "0.82",
+                    "correlation_symbol": "000660",
+                    "execution_feasibility_context": {
+                        "max_safe_notional_krw": "5000000",
+                        "liquidity_tier": "high",
+                    },
+                },
+            )
+        ],
+    )
+
+    _apply_decisions(
+        db=None,  # type: ignore[arg-type]
+        settings=Settings(runtime_mode="live", vol_corr_sizing_enabled=True),
+        plan=plan,
+        account_context={
+            "available": True,
+            "orderable_cash_krw": "10000000",
+            "buying_power_krw": "10000000",
+            "holdings": [{"symbol": "000660", "quantity": 3}],
+        },
+        expected_item_ids={"watch-item-1"},
+        decision_payload={
+            "version": "manual-exec-agent-watch-sizing-v1",
+            "decisions": [
+                {
+                    "execution_plan_item_id": "watch-item-1",
+                    "symbol": "005930",
+                    "action": "approve",
+                    "quantity": 3,
+                    "approved_notional_krw": 214500,
+                    "sizing_price": "71500",
+                    "confidence": 0.68,
+                    "target_profile": "short_swing",
+                    "reason_code": "small_probe",
+                    "reason": "agent returned a small probe",
+                }
+            ],
+        },
+    )
+
+    policy = plan.items[0].quantity_policy
+    assert policy["quantity"] == 12
+    assert policy["approved_notional"] == "858000.0000"
+    vol_corr_cap = policy["sizing_adjustment"]["vol_corr_cap"]
+    assert vol_corr_cap["baseline_quantity"] == 20
+    assert vol_corr_cap["volatility_multiplier"] == "0.7500"
+    assert vol_corr_cap["correlation_multiplier"] == "0.8000"
+    assert vol_corr_cap["vol_corr_multiplier"] == "0.6000"
+    assert vol_corr_cap["vol_corr_cap_reason"] == "high_volatility+high_correlation"
+
+
 def test_apply_decisions_clamps_agent_approval_that_exceeds_cap() -> None:
     plan = ExecutionPlan(
         id="plan-1",
