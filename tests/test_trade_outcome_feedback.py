@@ -23,6 +23,82 @@ def _session():
     return engine, sessionmaker(bind=engine, future=True, expire_on_commit=False)()
 
 
+def _add_closed_trade(
+    session,
+    *,
+    plan: ExecutionPlan,
+    suffix: str,
+    symbol: str,
+    buy_price: str,
+    sell_price: str,
+    quantity: int = 10,
+    trigger_price: str | None = None,
+    risk_context: dict[str, object] | None = None,
+    filled_day: int = 10,
+) -> None:
+    item = ExecutionPlanItem(
+        id=f"item-buy-{suffix}",
+        plan=plan,
+        symbol=symbol,
+        side="buy",
+        intent="next_open_buy",
+        status="filled",
+        trigger_price=Decimal(trigger_price) if trigger_price is not None else None,
+        quantity_policy={"kind": "shares", "quantity": quantity},
+        risk_context=risk_context or {},
+        decision_agent_name="short-term-decider",
+        decision_run_id=f"decision-{suffix}",
+        source_plan_item_id=f"core-{suffix}",
+    )
+    buy_order = BrokerOrder(
+        id=f"order-buy-{suffix}",
+        plan_item=item,
+        broker_name="kis",
+        mode=plan.mode,
+        idempotency_key=f"buy-{suffix}",
+        broker_order_id=f"kis-buy-{suffix}",
+        symbol=symbol,
+        side="buy",
+        status="filled",
+        quantity=quantity,
+    )
+    sell_order = BrokerOrder(
+        id=f"order-sell-{suffix}",
+        broker_name="kis",
+        mode=plan.mode,
+        idempotency_key=f"sell-{suffix}",
+        broker_order_id=f"kis-sell-{suffix}",
+        symbol=symbol,
+        side="sell",
+        status="filled",
+        quantity=quantity,
+    )
+    session.add_all(
+        [
+            buy_order,
+            sell_order,
+            ExecutionFill(
+                broker_order=buy_order,
+                broker_fill_id=f"fill-buy-{suffix}",
+                symbol=symbol,
+                side="buy",
+                quantity=quantity,
+                price=Decimal(buy_price),
+                filled_at=datetime(2026, 6, filled_day, 0, 30, tzinfo=UTC),
+            ),
+            ExecutionFill(
+                broker_order=sell_order,
+                broker_fill_id=f"fill-sell-{suffix}",
+                symbol=symbol,
+                side="sell",
+                quantity=quantity,
+                price=Decimal(sell_price),
+                filled_at=datetime(2026, 6, filled_day + 1, 1, 0, tzinfo=UTC),
+            ),
+        ]
+    )
+
+
 def test_generate_trade_outcome_feedback_writes_fifo_report_and_snippet(tmp_path) -> None:
     engine, session = _session()
     settings = Settings(
@@ -469,6 +545,182 @@ def test_trade_outcome_feedback_portfolio_risk_uses_upbit_base_quantity(tmp_path
     assert concentration["portfolio_weight_pct"] == "100.0000"
     assert risk["monday_pre_market_checks"][0]["base_quantity"] == "0.010000000000"
     assert any("KRW-BTC" in line and "1500000.0000" in line for line in report["prompt_snippet"]["top_portfolio_risks"])
+
+    session.close()
+    engine.dispose()
+
+
+def test_candidate_rule_replay_improves_pnl_by_avoiding_stale_trigger_loser(tmp_path) -> None:
+    engine, session = _session()
+    settings = Settings(runtime_mode="paper", trade_outcome_feedback_dir=str(tmp_path))
+    plan = ExecutionPlan(id="plan-replay-improve", external_plan_id="plan-replay-improve", source="kai-trading-core", mode="paper")
+    session.add(plan)
+    for index in range(3):
+        _add_closed_trade(
+            session,
+            plan=plan,
+            suffix=f"stale-loss-{index}",
+            symbol=f"STL{index}",
+            trigger_price="100",
+            buy_price="104",
+            sell_price="94",
+            filled_day=10 + index,
+            risk_context={"exec_agent_decision": {"confidence": "0.70"}},
+        )
+    _add_closed_trade(
+        session,
+        plan=plan,
+        suffix="clean-win",
+        symbol="CLN",
+        trigger_price="100",
+        buy_price="101",
+        sell_price="106",
+        filled_day=13,
+        risk_context={"exec_agent_decision": {"confidence": "0.70"}},
+    )
+    session.commit()
+
+    report = generate_trade_outcome_feedback(settings=settings, db=session, as_of=datetime(2026, 6, 20, tzinfo=UTC))
+
+    rules = {row["rule_id"]: row for row in report["candidate_rule_replay"]["rules"]}
+    stale = rules["stale_trigger_drift_veto"]
+    assert stale["recommendation"] == "promote_to_issue"
+    assert stale["avoided_losers"] == 3
+    assert stale["skipped_winners"] == 0
+    assert stale["gross_pnl_delta_krw"] == "300.0000"
+    assert len(stale["top_avoided_losers"]) == 3
+    assert any("stale_trigger_drift_veto" in line for line in report["prompt_snippet"]["candidate_rule_replay"])
+
+    session.close()
+    engine.dispose()
+
+
+def test_candidate_rule_replay_rejects_rule_that_skips_winners(tmp_path) -> None:
+    engine, session = _session()
+    settings = Settings(runtime_mode="paper", trade_outcome_feedback_dir=str(tmp_path))
+    plan = ExecutionPlan(id="plan-replay-hurts", external_plan_id="plan-replay-hurts", source="kai-trading-core", mode="paper")
+    session.add(plan)
+    for index in range(3):
+        _add_closed_trade(
+            session,
+            plan=plan,
+            suffix=f"weak-win-{index}",
+            symbol=f"WIN{index}",
+            buy_price="100",
+            sell_price="108",
+            filled_day=10 + index,
+            risk_context={"confidence": "0.42"},
+        )
+    session.commit()
+
+    report = generate_trade_outcome_feedback(settings=settings, db=session, as_of=datetime(2026, 6, 20, tzinfo=UTC))
+
+    rules = {row["rule_id"]: row for row in report["candidate_rule_replay"]["rules"]}
+    weak = rules["weak_confidence_reject"]
+    assert weak["recommendation"] == "reject_candidate"
+    assert weak["skipped_entries"] == 3
+    assert weak["skipped_winners"] == 3
+    assert weak["gross_pnl_delta_krw"] == "-240.0000"
+    assert len(weak["top_skipped_winners"]) == 3
+
+    session.close()
+    engine.dispose()
+
+
+def test_candidate_rule_replay_flags_low_sample_size(tmp_path) -> None:
+    engine, session = _session()
+    settings = Settings(runtime_mode="paper", trade_outcome_feedback_dir=str(tmp_path))
+    plan = ExecutionPlan(id="plan-replay-low-sample", external_plan_id="plan-replay-low-sample", source="kai-trading-core", mode="paper")
+    session.add(plan)
+    _add_closed_trade(
+        session,
+        plan=plan,
+        suffix="volatile-loss",
+        symbol="VOL",
+        buy_price="100",
+        sell_price="90",
+        risk_context={"atr_pct": "12.5"},
+    )
+    session.commit()
+
+    report = generate_trade_outcome_feedback(settings=settings, db=session, as_of=datetime(2026, 6, 20, tzinfo=UTC))
+
+    rules = {row["rule_id"]: row for row in report["candidate_rule_replay"]["rules"]}
+    high_volatility = rules["high_volatility_downsize"]
+    assert high_volatility["matched_trade_count"] == 1
+    assert high_volatility["recommendation"] == "needs_more_data"
+    assert high_volatility["gross_pnl_delta_krw"] == "50.0000"
+
+    session.close()
+    engine.dispose()
+
+
+def test_high_volatility_replay_matches_watch_buy_atr_aliases(tmp_path) -> None:
+    engine, session = _session()
+    settings = Settings(runtime_mode="paper", trade_outcome_feedback_dir=str(tmp_path))
+    plan = ExecutionPlan(id="plan-replay-atr-aliases", external_plan_id="plan-replay-atr-aliases", source="kai-trading-core", mode="paper")
+    session.add(plan)
+    for index, alias in enumerate(("atr_pct_14", "atr14_pct")):
+        _add_closed_trade(
+            session,
+            plan=plan,
+            suffix=f"volatile-alias-{index}",
+            symbol=f"ATR{index}",
+            buy_price="100",
+            sell_price="90",
+            filled_day=10 + index,
+            risk_context={alias: "12.5"},
+        )
+    session.commit()
+
+    report = generate_trade_outcome_feedback(settings=settings, db=session, as_of=datetime(2026, 6, 20, tzinfo=UTC))
+
+    closed_by_symbol = {row["symbol"]: row for row in report["closed_trades"]}
+    assert closed_by_symbol["ATR0"]["candidate_rule_context"]["atr_pct_14"] == "12.5"
+    assert closed_by_symbol["ATR1"]["candidate_rule_context"]["atr14_pct"] == "12.5"
+    rules = {row["rule_id"]: row for row in report["candidate_rule_replay"]["rules"]}
+    high_volatility = rules["high_volatility_downsize"]
+    assert high_volatility["matched_trade_count"] == 2
+    assert high_volatility["gross_pnl_delta_krw"] == "100.0000"
+    evidence_fields = {row["evidence"]["field"] for row in high_volatility["top_avoided_losers"]}
+    assert evidence_fields == {"atr_pct_14", "atr14_pct"}
+
+    session.close()
+    engine.dispose()
+
+
+def test_candidate_rule_replay_metrics_include_win_rate_and_drawdown_proxy(tmp_path) -> None:
+    engine, session = _session()
+    settings = Settings(runtime_mode="paper", trade_outcome_feedback_dir=str(tmp_path))
+    plan = ExecutionPlan(id="plan-replay-metrics", external_plan_id="plan-replay-metrics", source="kai-trading-core", mode="paper")
+    session.add(plan)
+    for index, sell_price in enumerate(("90", "112", "88")):
+        _add_closed_trade(
+            session,
+            plan=plan,
+            suffix=f"corr-{index}",
+            symbol=f"COR{index}",
+            buy_price="100",
+            sell_price=sell_price,
+            filled_day=10 + index,
+            risk_context={"portfolio_correlation": "0.82", "fee_slippage_bps": "15"},
+        )
+    session.commit()
+
+    report = generate_trade_outcome_feedback(settings=settings, db=session, as_of=datetime(2026, 6, 20, tzinfo=UTC))
+
+    replay = report["candidate_rule_replay"]
+    rules = {row["rule_id"]: row for row in replay["rules"]}
+    high_correlation = rules["high_correlation_downsize"]
+    assert replay["fee_slippage_assumption_bps"] == "15.0000"
+    assert "win_rate_delta_pct" in high_correlation
+    assert "max_drawdown_proxy_krw" in high_correlation
+    assert high_correlation["average_return_delta_pct"] == "1.6667"
+    assert high_correlation["max_drawdown_proxy_krw"] == "-60.0000"
+    assert high_correlation["estimated_net_pnl_delta_krw"] is not None
+    markdown = (tmp_path / "latest.md").read_text(encoding="utf-8")
+    assert "### Candidate Rule Replay" in markdown
+    assert "recommendation=" in markdown
 
     session.close()
     engine.dispose()
