@@ -13,10 +13,12 @@ from app.db.sqlite_diagnostics import sqlite_diagnostics_payload
 from app.db.session import ping_database
 from app.models.runtime import (
     BrokerOrder,
+    BrokerOrderEvent,
     ExecutionFill,
     ExecutionJob,
     ExecutionPlan,
     ExecutionPlanItem,
+    ExecutionPosition,
     MonitoringCheckpoint,
 )
 from app.services.monitoring import (
@@ -167,6 +169,157 @@ def runtime_counts(
         "open_orders": int(open_orders or 0),
         "active_execution_jobs": int(active_jobs or 0),
     }
+
+
+def runtime_freshness_payload(
+    *,
+    settings: Settings,
+    db: Session,
+    monitoring: dict[str, object],
+    now: datetime | None = None,
+) -> dict[str, object]:
+    observed_at = now or datetime.now(UTC)
+    position_truth = position_truth_freshness_payload(
+        settings=settings,
+        db=db,
+        now=observed_at,
+    )
+    latest_order_sync_at = db.scalar(
+        select(func.max(BrokerOrder.last_broker_sync_at)).where(
+            BrokerOrder.mode == settings.runtime_mode,
+            BrokerOrder.last_broker_sync_at.is_not(None),
+        )
+    )
+    latest_reconcile_event_at = db.scalar(
+        select(func.max(BrokerOrderEvent.observed_at))
+        .select_from(BrokerOrderEvent)
+        .join(BrokerOrderEvent.broker_order)
+        .where(
+            BrokerOrder.mode == settings.runtime_mode,
+            BrokerOrderEvent.event_source == "reconciliation",
+        )
+    )
+    return {
+        "generated_at": observed_at.isoformat(),
+        "monitoring": {
+            "status": monitoring.get("status"),
+            "last_heartbeat_at": monitoring.get("last_heartbeat_at"),
+            "last_success_at": monitoring.get("last_success_at"),
+            "source": monitoring.get("source") or "database",
+        },
+        "position_truth": position_truth,
+        "broker_orders": {
+            "latest_broker_sync_at": _serialize_datetime(latest_order_sync_at),
+            "latest_reconciliation_event_at": _serialize_datetime(latest_reconcile_event_at),
+        },
+    }
+
+
+def position_truth_freshness_payload(
+    *,
+    settings: Settings,
+    db: Session,
+    now: datetime | None = None,
+) -> dict[str, object]:
+    observed_at = now or datetime.now(UTC)
+    stale_before = observed_at - timedelta(seconds=settings.exec_agent_max_account_snapshot_age_seconds)
+    evidence_symbols = _position_truth_evidence_symbols(settings=settings, db=db)
+    positions = db.scalars(
+        select(ExecutionPosition).where(
+            ExecutionPosition.mode == settings.runtime_mode,
+        )
+    ).all()
+    positions_by_symbol = {position.symbol: position for position in positions}
+    candidate_symbols = set(positions_by_symbol) | evidence_symbols
+    stale_symbols: list[str] = []
+    oldest_age_seconds: float | None = None
+    latest_reconciled_at: datetime | None = None
+    oldest_reconciled_at: datetime | None = None
+    for symbol in sorted(candidate_symbols):
+        position = positions_by_symbol.get(symbol)
+        reconciled_at = position.last_reconciled_at if position is not None else None
+        if reconciled_at is not None:
+            normalized_reconciled_at = _as_utc(reconciled_at)
+            if latest_reconciled_at is None or normalized_reconciled_at > latest_reconciled_at:
+                latest_reconciled_at = normalized_reconciled_at
+            if oldest_reconciled_at is None or normalized_reconciled_at < oldest_reconciled_at:
+                oldest_reconciled_at = normalized_reconciled_at
+        if reconciled_at is None or _as_utc(reconciled_at) < stale_before:
+            stale_symbols.append(symbol)
+            if reconciled_at is None:
+                continue
+            age_seconds = (observed_at - _as_utc(reconciled_at)).total_seconds()
+            if oldest_age_seconds is None or age_seconds > oldest_age_seconds:
+                oldest_age_seconds = age_seconds
+
+    broker_truth_reachable = latest_reconciled_at is not None and latest_reconciled_at >= stale_before
+    return {
+        "stale_count": len(stale_symbols),
+        "oldest_age_seconds": round(oldest_age_seconds, 3) if oldest_age_seconds is not None else None,
+        "oldest_age": _duration_text(oldest_age_seconds),
+        "last_reconciled_at": _serialize_datetime(latest_reconciled_at),
+        "oldest_reconciled_at": _serialize_datetime(oldest_reconciled_at),
+        "broker_truth_reachable": broker_truth_reachable,
+        "stale_symbols": stale_symbols,
+        "max_age_seconds": settings.exec_agent_max_account_snapshot_age_seconds,
+    }
+
+
+def _position_truth_evidence_symbols(
+    *,
+    settings: Settings,
+    db: Session,
+) -> set[str]:
+    symbols = set(
+        db.scalars(
+            select(BrokerOrder.symbol)
+            .where(
+                BrokerOrder.mode == settings.runtime_mode,
+                BrokerOrder.status.in_(OPEN_ORDER_STATUSES),
+            )
+            .distinct()
+        ).all()
+    )
+    filled_buy_symbols = set(
+        db.scalars(
+            select(BrokerOrder.symbol)
+            .where(
+                BrokerOrder.mode == settings.runtime_mode,
+                BrokerOrder.side == "buy",
+                BrokerOrder.status == "filled",
+            )
+            .distinct()
+        ).all()
+    )
+    exited_symbols = set(
+        db.scalars(
+            select(BrokerOrder.symbol)
+            .where(
+                BrokerOrder.mode == settings.runtime_mode,
+                BrokerOrder.side == "sell",
+                BrokerOrder.status == "filled",
+            )
+            .distinct()
+        ).all()
+    )
+    symbols.update(filled_buy_symbols - exited_symbols)
+    return {str(symbol) for symbol in symbols}
+
+
+def _duration_text(seconds: float | None) -> str | None:
+    if seconds is None:
+        return None
+    whole_seconds = max(int(seconds), 0)
+    days, remainder = divmod(whole_seconds, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if days:
+        return f"{days}d{hours}h{minutes}m"
+    if hours:
+        return f"{hours}h{minutes}m"
+    if minutes:
+        return f"{minutes}m{seconds}s"
+    return f"{seconds}s"
 
 
 def runtime_symbol_summary(
@@ -604,6 +757,29 @@ def build_runtime_status(
     }
     broker = build_broker_session_summary(settings=settings, db=None)
     broker_providers = broker_provider_readiness(settings=settings, db=None)
+    freshness: dict[str, object] = {
+        "generated_at": datetime.now(UTC).isoformat(),
+        "monitoring": {
+            "status": monitoring.get("status"),
+            "last_heartbeat_at": monitoring.get("last_heartbeat_at"),
+            "last_success_at": monitoring.get("last_success_at"),
+            "source": monitoring.get("source") or "autonomous_runtime_snapshot",
+        },
+        "position_truth": {
+            "stale_count": 0,
+            "oldest_age_seconds": None,
+            "oldest_age": None,
+            "last_reconciled_at": None,
+            "oldest_reconciled_at": None,
+            "broker_truth_reachable": False,
+            "stale_symbols": [],
+            "max_age_seconds": settings.exec_agent_max_account_snapshot_age_seconds,
+        },
+        "broker_orders": {
+            "latest_broker_sync_at": None,
+            "latest_reconciliation_event_at": None,
+        },
+    }
     counts_available = True
 
     try:
@@ -640,6 +816,7 @@ def build_runtime_status(
             "broker_providers": broker_providers,
             "counts": counts,
             "symbols": symbols,
+            "freshness": freshness,
         }
 
     schema = check_runtime_schema(db)
@@ -678,6 +855,7 @@ def build_runtime_status(
             "broker_providers": broker_providers,
             "counts": counts,
             "symbols": symbols,
+            "freshness": freshness,
         }
 
     try:
@@ -695,6 +873,11 @@ def build_runtime_status(
                 **symbols,
                 "monitored": runtime_monitored_symbols(settings=settings, db=db),
             }
+        freshness = runtime_freshness_payload(
+            settings=settings,
+            db=db,
+            monitoring=monitoring,
+        )
         monthly_pnl = monthly_pnl_payload(settings=settings, db=db)
     except SQLAlchemyError as exc:
         db.rollback()
@@ -737,6 +920,7 @@ def build_runtime_status(
         "broker_providers": broker_providers,
         "counts": counts,
         "symbols": symbols,
+        "freshness": freshness,
         "monthly_pnl": monthly_pnl,
     }
 
@@ -876,6 +1060,12 @@ def _as_utc(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=UTC)
     return value.astimezone(UTC)
+
+
+def _serialize_datetime(value: datetime | None) -> str | None:
+    if value is None:
+        return None
+    return value.isoformat()
 
 
 def _monthly_mode_recommendation(

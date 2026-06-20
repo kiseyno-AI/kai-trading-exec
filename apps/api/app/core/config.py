@@ -28,6 +28,7 @@ class Settings(BaseModel):
     monitoring_max_broker_actions_per_cycle: int = Field(default=32, ge=1, le=10000)
     monitoring_max_quote_age_seconds: int = Field(default=30, ge=1, le=3600)
     monitoring_watch_buy_retry_cooldown_seconds: int = Field(default=5, ge=1, le=3600)
+    stale_broker_order_reconciliation_threshold_seconds: int = Field(default=86400, ge=60, le=31536000)
     watch_buy_high_risk_gate_enabled: bool = True
     watch_buy_high_atr_pct_threshold: Decimal = Field(default=Decimal("9.0"), ge=0, le=Decimal("100"))
     watch_buy_weak_ret20_threshold_pct: Decimal = Field(default=Decimal("0.0"), ge=Decimal("-100"), le=Decimal("100"))
@@ -147,6 +148,7 @@ _ENV_FIELDS = {
     "MONITORING_MAX_BROKER_ACTIONS_PER_CYCLE": "monitoring_max_broker_actions_per_cycle",
     "MONITORING_MAX_QUOTE_AGE_SECONDS": "monitoring_max_quote_age_seconds",
     "MONITORING_WATCH_BUY_RETRY_COOLDOWN_SECONDS": "monitoring_watch_buy_retry_cooldown_seconds",
+    "STALE_BROKER_ORDER_RECONCILIATION_THRESHOLD_SECONDS": "stale_broker_order_reconciliation_threshold_seconds",
     "WATCH_BUY_HIGH_RISK_GATE_ENABLED": "watch_buy_high_risk_gate_enabled",
     "WATCH_BUY_HIGH_ATR_PCT_THRESHOLD": "watch_buy_high_atr_pct_threshold",
     "WATCH_BUY_WEAK_RET20_THRESHOLD_PCT": "watch_buy_weak_ret20_threshold_pct",

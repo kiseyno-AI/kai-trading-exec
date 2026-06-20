@@ -343,6 +343,26 @@ class ShortTermWatcherDecisionRequest(BaseModel):
         return normalized
 
 
+class StaleBrokerOrderReconciliationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    older_than_seconds: int | None = Field(default=None, ge=60, le=31536000)
+    symbols: list[str] | None = None
+
+    @field_validator("symbols")
+    @classmethod
+    def normalize_symbols(cls, value: list[str] | None) -> list[str] | None:
+        if value is None:
+            return None
+        normalized: list[str] = []
+        for symbol in value:
+            normalized_symbol = symbol.strip().upper()
+            if not normalized_symbol:
+                raise ValueError("symbol must not be empty")
+            normalized.append(normalized_symbol)
+        return normalized
+
+
 class MonitoringPriceRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

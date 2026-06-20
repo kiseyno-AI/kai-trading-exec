@@ -16,6 +16,7 @@ from app.api.schemas.execution import (
     MonitoringEvaluationRequest,
     PlaceOrderRequest,
     ShortTermWatcherDecisionRequest,
+    StaleBrokerOrderReconciliationRequest,
 )
 from app.broker.base import BrokerAdapter
 from app.core.config import Settings
@@ -37,6 +38,7 @@ from app.services.execution_failures import (
 )
 from app.services.execution_jobs import dispatch_due_execution_jobs, list_execution_jobs
 from app.services.monitoring import evaluate_monitoring
+from app.services.reconciliation import reconcile_stale_nonterminal_broker_orders
 from app.services.short_term_watcher import evaluate_short_term_watcher_decision
 
 router = APIRouter(tags=["execution"])
@@ -175,6 +177,24 @@ def orders(
 ) -> list[dict[str, object]]:
     settings: Settings = get_settings(request)
     return list_broker_orders(settings=settings, db=db)
+
+
+@router.post("/orders/reconcile-stale")
+def reconcile_stale_orders(
+    request: Request,
+    db: Annotated[Session, Depends(get_db_session)],
+    adapter: Annotated[BrokerAdapter, Depends(get_broker_adapter)],
+    payload: StaleBrokerOrderReconciliationRequest | None = Body(default=None),
+) -> dict[str, object]:
+    settings: Settings = get_settings(request)
+    command = payload or StaleBrokerOrderReconciliationRequest()
+    return reconcile_stale_nonterminal_broker_orders(
+        settings=settings,
+        db=db,
+        adapter=adapter,
+        older_than_seconds=command.older_than_seconds,
+        symbols=set(command.symbols) if command.symbols is not None else None,
+    )
 
 
 @router.get("/execution-failures")
