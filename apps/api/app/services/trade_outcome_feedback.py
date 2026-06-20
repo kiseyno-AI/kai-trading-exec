@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
@@ -16,6 +17,17 @@ from app.db.session import create_db_engine, create_session_factory
 from app.models.runtime import BrokerOrder, ExecutionFill, ExecutionPlanItem, ExecutionPosition
 
 REPORT_VERSION = "trade-outcome-feedback-v1"
+MIN_CANDIDATE_RULE_SAMPLE_SIZE = 3
+
+
+@dataclass(frozen=True)
+class CandidateRule:
+    rule_id: str
+    name: str
+    action: str
+    size_multiplier: Decimal
+    threshold: Decimal
+    evaluator: Callable[[dict[str, object], "CandidateRule"], tuple[bool, dict[str, object]]]
 
 
 @dataclass
@@ -51,7 +63,13 @@ def generate_trade_outcome_feedback(
         closed_trades=closed_trades,
         as_of=now,
     )
-    snippet = _snippet(summary=summary, lessons=lessons, portfolio_risk=portfolio_risk)
+    candidate_rule_replay = _candidate_rule_replay(settings=settings, closed_trades=closed_trades)
+    snippet = _snippet(
+        summary=summary,
+        lessons=lessons,
+        portfolio_risk=portfolio_risk,
+        candidate_rule_replay=candidate_rule_replay,
+    )
     report_date = now.astimezone(UTC).date()
     report: dict[str, object] = {
         "version": REPORT_VERSION,
@@ -64,6 +82,7 @@ def generate_trade_outcome_feedback(
         "portfolio_risk": portfolio_risk,
         "closed_trades": closed_trades,
         "lessons": lessons,
+        "candidate_rule_replay": candidate_rule_replay,
         "prompt_snippet": snippet,
     }
     target_dir = output_dir or Path(settings.trade_outcome_feedback_dir)
@@ -171,6 +190,7 @@ def _closed_trade(*, lot: OpenLot, sell_fill: ExecutionFill, quantity: int) -> d
         "risk_sizing": _risk_sizing_context(source_item),
         "trigger_time": _trigger_time_context(source_item),
         "market_enrichment": _market_enrichment_context(source_item),
+        "candidate_rule_context": _candidate_rule_context(item=source_item, buy_fill=lot.fill),
         "outcome_bucket": _outcome_bucket(pnl),
     }
 
@@ -579,11 +599,357 @@ def _lessons(closed_trades: list[dict[str, object]], *, max_lessons: int) -> dic
     }
 
 
+def _candidate_rules(settings: Settings) -> list[CandidateRule]:
+    return [
+        CandidateRule(
+            rule_id="stale_trigger_drift_veto",
+            name="Stale trigger drift veto",
+            action="veto",
+            size_multiplier=Decimal("0"),
+            threshold=Decimal(settings.watch_buy_stale_trigger_reclaim_threshold_pct),
+            evaluator=_rule_stale_trigger_drift,
+        ),
+        CandidateRule(
+            rule_id="high_volatility_downsize",
+            name="High volatility downsize",
+            action="downsize",
+            size_multiplier=Decimal("0.50"),
+            threshold=Decimal(settings.watch_buy_high_atr_pct_threshold),
+            evaluator=_rule_high_volatility,
+        ),
+        CandidateRule(
+            rule_id="high_correlation_downsize",
+            name="High correlation downsize",
+            action="downsize",
+            size_multiplier=Decimal("0.50"),
+            threshold=Decimal("0.75"),
+            evaluator=_rule_high_correlation,
+        ),
+        CandidateRule(
+            rule_id="weak_confidence_reject",
+            name="Weak confidence reject",
+            action="reject",
+            size_multiplier=Decimal("0"),
+            threshold=Decimal("0.50"),
+            evaluator=_rule_weak_confidence,
+        ),
+    ]
+
+
+def _candidate_rule_replay(*, settings: Settings, closed_trades: list[dict[str, object]]) -> dict[str, object]:
+    baseline_pnls = [_decimal_value(row.get("realized_pnl_krw")) or Decimal("0") for row in closed_trades]
+    baseline_returns = [_decimal_value(row.get("return_pct")) or Decimal("0") for row in closed_trades]
+    baseline_gross = sum(baseline_pnls, Decimal("0"))
+    baseline_win_rate = _win_rate_pct(baseline_pnls)
+    baseline_avg_return = _average_decimal(baseline_returns)
+    fee_slippage_bps = _fee_slippage_bps(closed_trades)
+    return {
+        "source": "execution_fills+broker_orders+execution_plan_items.risk_context",
+        "baseline_closed_trade_count": len(closed_trades),
+        "baseline_gross_pnl_krw": _decimal_text(baseline_gross),
+        "baseline_win_rate_pct": _decimal_text(baseline_win_rate),
+        "baseline_average_return_pct": _decimal_text(baseline_avg_return),
+        "fee_slippage_assumption_bps": _decimal_text(fee_slippage_bps),
+        "rules": [
+            _candidate_rule_result(
+                rule=rule,
+                closed_trades=closed_trades,
+                baseline_pnls=baseline_pnls,
+                baseline_returns=baseline_returns,
+                baseline_gross=baseline_gross,
+                baseline_win_rate=baseline_win_rate,
+                baseline_avg_return=baseline_avg_return,
+                fee_slippage_bps=fee_slippage_bps,
+            )
+            for rule in _candidate_rules(settings)
+        ],
+    }
+
+
+def _candidate_rule_result(
+    *,
+    rule: CandidateRule,
+    closed_trades: list[dict[str, object]],
+    baseline_pnls: list[Decimal],
+    baseline_returns: list[Decimal],
+    baseline_gross: Decimal,
+    baseline_win_rate: Decimal,
+    baseline_avg_return: Decimal,
+    fee_slippage_bps: Decimal | None,
+) -> dict[str, object]:
+    examples: list[dict[str, object]] = []
+    candidate_pnls: list[Decimal] = []
+    candidate_returns: list[Decimal] = []
+    skipped_entries = 0
+    skipped_winners = 0
+    avoided_losers = 0
+    affected_count = 0
+    estimated_cost_savings = Decimal("0")
+    for trade, baseline_pnl, baseline_return in zip(closed_trades, baseline_pnls, baseline_returns, strict=False):
+        matched, evidence = rule.evaluator(trade, rule)
+        multiplier = rule.size_multiplier if matched else Decimal("1")
+        if matched:
+            affected_count += 1
+            if multiplier <= 0:
+                skipped_entries += 1
+                if baseline_pnl > 0:
+                    skipped_winners += 1
+            if baseline_pnl < 0:
+                avoided_losers += 1
+            examples.append(_candidate_rule_example(trade=trade, baseline_pnl=baseline_pnl, evidence=evidence))
+            if fee_slippage_bps is not None:
+                estimated_cost_savings += _trade_round_trip_cost(trade=trade, fee_slippage_bps=fee_slippage_bps) * (Decimal("1") - multiplier)
+        candidate_pnls.append(baseline_pnl * multiplier)
+        candidate_returns.append(baseline_return * multiplier)
+    candidate_gross = sum(candidate_pnls, Decimal("0"))
+    gross_delta = candidate_gross - baseline_gross
+    win_rate_delta = _win_rate_pct(candidate_pnls) - baseline_win_rate
+    avg_return_delta = _average_decimal(candidate_returns) - baseline_avg_return
+    max_drawdown_proxy = _max_drawdown_proxy(candidate_pnls)
+    net_delta = gross_delta + estimated_cost_savings if fee_slippage_bps is not None else None
+    return {
+        "rule_id": rule.rule_id,
+        "rule_name": rule.name,
+        "action": rule.action,
+        "threshold": _decimal_text(rule.threshold),
+        "size_multiplier": _decimal_text(rule.size_multiplier),
+        "baseline_closed_trade_count": len(closed_trades),
+        "candidate_closed_trade_count": len(candidate_pnls) - skipped_entries,
+        "matched_trade_count": affected_count,
+        "skipped_entries": skipped_entries,
+        "skipped_winners": skipped_winners,
+        "avoided_losers": avoided_losers,
+        "gross_pnl_delta_krw": _decimal_text(gross_delta),
+        "estimated_net_pnl_delta_krw": _decimal_text(net_delta),
+        "win_rate_delta_pct": _decimal_text(win_rate_delta),
+        "average_return_delta_pct": _decimal_text(avg_return_delta),
+        "max_drawdown_proxy_krw": _decimal_text(max_drawdown_proxy),
+        "recommendation": _candidate_rule_recommendation(
+            matched_trade_count=affected_count,
+            gross_delta=gross_delta,
+            skipped_winners=skipped_winners,
+        ),
+        "top_skipped_winners": _top_candidate_examples(examples, outcome="win")[:5],
+        "top_avoided_losers": _top_candidate_examples(examples, outcome="loss")[:5],
+    }
+
+
+def _candidate_rule_recommendation(*, matched_trade_count: int, gross_delta: Decimal, skipped_winners: int) -> str:
+    if matched_trade_count < MIN_CANDIDATE_RULE_SAMPLE_SIZE:
+        return "needs_more_data"
+    if gross_delta > 0 and skipped_winners == 0:
+        return "promote_to_issue"
+    if gross_delta < 0:
+        return "reject_candidate"
+    return "needs_more_data"
+
+
+def _candidate_rule_example(
+    *,
+    trade: dict[str, object],
+    baseline_pnl: Decimal,
+    evidence: dict[str, object],
+) -> dict[str, object]:
+    buy = trade.get("buy") if isinstance(trade.get("buy"), dict) else {}
+    return {
+        "symbol": trade.get("symbol"),
+        "realized_pnl_krw": _decimal_text(baseline_pnl),
+        "return_pct": trade.get("return_pct"),
+        "buy_filled_at": buy.get("filled_at"),
+        "execution_plan_item_id": buy.get("execution_plan_item_id") or trade.get("source_execution_plan_item_id"),
+        "decision_run_id": trade.get("decision_run_id"),
+        "evidence": _json_safe(evidence),
+    }
+
+
+def _top_candidate_examples(examples: list[dict[str, object]], *, outcome: str) -> list[dict[str, object]]:
+    if outcome == "win":
+        winners = [row for row in examples if (_decimal_value(row.get("realized_pnl_krw")) or Decimal("0")) > 0]
+        return sorted(winners, key=lambda row: _decimal_value(row.get("realized_pnl_krw")) or Decimal("0"), reverse=True)
+    losers = [row for row in examples if (_decimal_value(row.get("realized_pnl_krw")) or Decimal("0")) < 0]
+    return sorted(losers, key=lambda row: _decimal_value(row.get("realized_pnl_krw")) or Decimal("0"))
+
+
+def _rule_stale_trigger_drift(trade: dict[str, object], rule: CandidateRule) -> tuple[bool, dict[str, object]]:
+    trigger_price = _candidate_context_decimal(trade, keys=("trigger_price", "watch_trigger_price", "buy_trigger_price", "entry_trigger_price"))
+    buy_price = _nested_decimal(trade, ("buy", "price"))
+    if trigger_price is None or trigger_price <= 0 or buy_price is None:
+        return False, {"reason": "missing_trigger_or_buy_price"}
+    drift_pct = (buy_price - trigger_price) / trigger_price * Decimal("100")
+    return drift_pct >= rule.threshold, {"trigger_price": _decimal_text(trigger_price), "buy_price": _decimal_text(buy_price), "drift_pct": _decimal_text(drift_pct)}
+
+
+def _rule_high_volatility(trade: dict[str, object], rule: CandidateRule) -> tuple[bool, dict[str, object]]:
+    value, key = _candidate_context_first_decimal(
+        trade,
+        keys=(
+            "atr_pct",
+            "atr_percent",
+            "volatility_pct",
+            "realized_volatility_pct",
+            "intraday_range_pct",
+            "daily_range_pct",
+        ),
+    )
+    if value is None:
+        return False, {"reason": "missing_volatility_context"}
+    return value >= rule.threshold, {"field": key, "value_pct": _decimal_text(value)}
+
+
+def _rule_high_correlation(trade: dict[str, object], rule: CandidateRule) -> tuple[bool, dict[str, object]]:
+    value, key = _candidate_context_first_decimal(
+        trade,
+        keys=(
+            "portfolio_correlation",
+            "max_correlation",
+            "correlation",
+            "sector_correlation",
+            "market_correlation",
+        ),
+    )
+    if value is None:
+        return False, {"reason": "missing_correlation_context"}
+    return value >= rule.threshold, {"field": key, "value": _decimal_text(value)}
+
+
+def _rule_weak_confidence(trade: dict[str, object], rule: CandidateRule) -> tuple[bool, dict[str, object]]:
+    value, key = _candidate_context_first_decimal(
+        trade,
+        keys=(
+            "confidence",
+            "confidence_score",
+            "confidence_score_10",
+            "probability",
+            "score",
+        ),
+    )
+    if value is None:
+        return False, {"reason": "missing_confidence_context"}
+    normalized = value / Decimal("10") if key == "confidence_score_10" or value > 1 else value
+    return normalized < rule.threshold, {"field": key, "confidence": _decimal_text(normalized)}
+
+
+def _candidate_context_decimal(trade: dict[str, object], *, keys: tuple[str, ...]) -> Decimal | None:
+    return _candidate_context_first_decimal(trade, keys=keys)[0]
+
+
+def _candidate_context_first_decimal(trade: dict[str, object], *, keys: tuple[str, ...]) -> tuple[Decimal | None, str | None]:
+    contexts = [
+        trade.get("candidate_rule_context"),
+        trade.get("exec_agent_decision"),
+        trade.get("risk_sizing"),
+        trade.get("trigger_time"),
+        trade.get("market_enrichment"),
+    ]
+    buy = trade.get("buy") if isinstance(trade.get("buy"), dict) else {}
+    contexts.append(buy)
+    for context in contexts:
+        value, key = _first_decimal_deep(context, keys=keys)
+        if value is not None:
+            return value, key
+    return None, None
+
+
+def _first_decimal_deep(value: object, *, keys: tuple[str, ...]) -> tuple[Decimal | None, str | None]:
+    if isinstance(value, dict):
+        for key in keys:
+            parsed = _decimal_value(value.get(key))
+            if parsed is not None:
+                return parsed, key
+        for nested in value.values():
+            parsed, key = _first_decimal_deep(nested, keys=keys)
+            if parsed is not None:
+                return parsed, key
+    if isinstance(value, list):
+        for nested in value:
+            parsed, key = _first_decimal_deep(nested, keys=keys)
+            if parsed is not None:
+                return parsed, key
+    return None, None
+
+
+def _nested_decimal(value: dict[str, object], path: tuple[str, ...]) -> Decimal | None:
+    current: object = value
+    for key in path:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+    return _decimal_value(current)
+
+
+def _fee_slippage_bps(closed_trades: list[dict[str, object]]) -> Decimal | None:
+    values: list[Decimal] = []
+    for trade in closed_trades:
+        value, _key = _candidate_context_first_decimal(
+            trade,
+            keys=(
+                "fee_slippage_bps",
+                "round_trip_cost_bps",
+                "estimated_round_trip_cost_bps",
+                "fee_bps",
+                "slippage_bps",
+            ),
+        )
+        if value is not None and value >= 0:
+            values.append(value)
+    if not values:
+        return None
+    return sum(values, Decimal("0")) / Decimal(len(values))
+
+
+def _trade_round_trip_cost(*, trade: dict[str, object], fee_slippage_bps: Decimal) -> Decimal:
+    buy_notional = (_nested_decimal(trade, ("buy", "price")) or Decimal("0")) * (_nested_decimal(trade, ("buy", "quantity")) or Decimal("0"))
+    sell_notional = (_nested_decimal(trade, ("sell", "price")) or Decimal("0")) * (_nested_decimal(trade, ("sell", "quantity")) or Decimal("0"))
+    return (buy_notional + sell_notional) * fee_slippage_bps / Decimal("10000")
+
+
+def _win_rate_pct(values: list[Decimal]) -> Decimal:
+    if not values:
+        return Decimal("0")
+    return Decimal(len([value for value in values if value > 0])) / Decimal(len(values)) * Decimal("100")
+
+
+def _average_decimal(values: list[Decimal]) -> Decimal:
+    if not values:
+        return Decimal("0")
+    return sum(values, Decimal("0")) / Decimal(len(values))
+
+
+def _max_drawdown_proxy(values: list[Decimal]) -> Decimal:
+    peak = Decimal("0")
+    equity = Decimal("0")
+    max_drawdown = Decimal("0")
+    for value in values:
+        equity += value
+        if equity > peak:
+            peak = equity
+        drawdown = equity - peak
+        if drawdown < max_drawdown:
+            max_drawdown = drawdown
+    return max_drawdown
+
+
+def _candidate_rule_replay_snippet_lines(candidate_rule_replay: dict[str, object]) -> list[str]:
+    rows = candidate_rule_replay.get("rules")
+    if not isinstance(rows, list):
+        return []
+    lines = []
+    for row in rows[:6]:
+        if isinstance(row, dict):
+            lines.append(
+                f"{row.get('rule_id')}: recommendation={row.get('recommendation')}, "
+                f"gross_delta={row.get('gross_pnl_delta_krw')} KRW, "
+                f"skipped_winners={row.get('skipped_winners')}, avoided_losers={row.get('avoided_losers')}."
+            )
+    return lines
+
+
 def _snippet(
     *,
     summary: dict[str, object],
     lessons: dict[str, object],
     portfolio_risk: dict[str, object],
+    candidate_rule_replay: dict[str, object],
 ) -> dict[str, object]:
     hard_gates = []
     for row in lessons.get("patterns_to_downsize_or_reject", []):
@@ -605,6 +971,7 @@ def _snippet(
         "positive_expectancy_patterns": lessons.get("positive_expectancy_patterns", []),
         "top_portfolio_risks": _portfolio_risk_snippet_lines(portfolio_risk),
         "monday_pre_market_checks": _monday_check_snippet_lines(portfolio_risk),
+        "candidate_rule_replay": _candidate_rule_replay_snippet_lines(candidate_rule_replay),
         "required_hard_gates": [
             "Do not increase size for profiles/reason_codes listed as negative without fresh superior live quality.",
             "Prefer delay/reject over execute_now when recent worst-loss conditions resemble the current candidate.",
@@ -666,6 +1033,7 @@ def _markdown_report(report: dict[str, object]) -> str:
     summary = report.get("summary") if isinstance(report.get("summary"), dict) else {}
     snippet = report.get("prompt_snippet") if isinstance(report.get("prompt_snippet"), dict) else {}
     portfolio_risk = report.get("portfolio_risk") if isinstance(report.get("portfolio_risk"), dict) else {}
+    candidate_rule_replay = report.get("candidate_rule_replay") if isinstance(report.get("candidate_rule_replay"), dict) else {}
     lines = [
         f"# Trade Outcome Feedback {str(report.get('generated_at'))[:10]}",
         "",
@@ -721,6 +1089,48 @@ def _markdown_report(report: dict[str, object]) -> str:
     lines.extend(
         [
             "",
+            "### Candidate Rule Replay",
+            "",
+            f"- Baseline closed trades: {candidate_rule_replay.get('baseline_closed_trade_count')}",
+            f"- Baseline gross P/L: {candidate_rule_replay.get('baseline_gross_pnl_krw')} KRW",
+        ]
+    )
+    replay_rules = candidate_rule_replay.get("rules")
+    if isinstance(replay_rules, list) and replay_rules:
+        for row in replay_rules:
+            if not isinstance(row, dict):
+                continue
+            lines.append(
+                f"- {row.get('rule_id')} ({row.get('rule_name')}): "
+                f"recommendation={row.get('recommendation')}, "
+                f"gross_delta={row.get('gross_pnl_delta_krw')} KRW, "
+                f"net_delta={row.get('estimated_net_pnl_delta_krw')} KRW, "
+                f"win_rate_delta={row.get('win_rate_delta_pct')}%, "
+                f"avg_return_delta={row.get('average_return_delta_pct')}%, "
+                f"drawdown_proxy={row.get('max_drawdown_proxy_krw')} KRW, "
+                f"skipped={row.get('skipped_entries')}, skipped_winners={row.get('skipped_winners')}, avoided_losers={row.get('avoided_losers')}"
+            )
+            avoided = row.get("top_avoided_losers")
+            if isinstance(avoided, list) and avoided:
+                lines.append("  - Top avoided losers:")
+                for example in avoided[:5]:
+                    if isinstance(example, dict):
+                        lines.append(
+                            f"    - {example.get('symbol')}: {example.get('realized_pnl_krw')} KRW ({example.get('return_pct')}%)"
+                        )
+            skipped = row.get("top_skipped_winners")
+            if isinstance(skipped, list) and skipped:
+                lines.append("  - Top skipped winners:")
+                for example in skipped[:5]:
+                    if isinstance(example, dict):
+                        lines.append(
+                            f"    - {example.get('symbol')}: {example.get('realized_pnl_krw')} KRW ({example.get('return_pct')}%)"
+                        )
+    else:
+        lines.append("- No configured candidate rules produced replay output.")
+    lines.extend(
+        [
+            "",
             "## 개선 사항",
             "",
             "- 최근 손실 패턴은 아래 Gates에 반영됩니다.",
@@ -761,6 +1171,14 @@ def _markdown_report(report: dict[str, object]) -> str:
         ]
     )
     for item in snippet.get("monday_pre_market_checks", []):
+        lines.append(f"- {item}")
+    lines.extend(
+        [
+            "",
+            "## Candidate Rule Replay",
+        ]
+    )
+    for item in snippet.get("candidate_rule_replay", []):
         lines.append(f"- {item}")
     lines.extend(
         [
@@ -877,6 +1295,69 @@ def _market_enrichment_context(item: ExecutionPlanItem | None) -> dict[str, obje
         if key in item.risk_context:
             payload[key] = item.risk_context[key]
     return _json_safe(payload)
+
+
+def _candidate_rule_context(*, item: ExecutionPlanItem | None, buy_fill: ExecutionFill) -> dict[str, object]:
+    if item is None:
+        return {}
+    payload: dict[str, object] = {
+        "execution_plan_item_id": item.id,
+        "trigger_price": _decimal_text(Decimal(item.trigger_price)) if item.trigger_price is not None else None,
+        "limit_price": _decimal_text(Decimal(item.limit_price)) if item.limit_price is not None else None,
+        "buy_fill_price": _decimal_text(Decimal(buy_fill.price)),
+        "intent": item.intent,
+    }
+    for source in (item.quantity_policy, item.risk_context):
+        if not isinstance(source, dict):
+            continue
+        for key in (
+            "trigger_price",
+            "watch_trigger_price",
+            "buy_trigger_price",
+            "entry_trigger_price",
+            "confidence",
+            "confidence_score",
+            "confidence_score_10",
+            "probability",
+            "score",
+            "atr_pct",
+            "atr_percent",
+            "volatility_pct",
+            "realized_volatility_pct",
+            "intraday_range_pct",
+            "daily_range_pct",
+            "portfolio_correlation",
+            "max_correlation",
+            "correlation",
+            "sector_correlation",
+            "market_correlation",
+            "fee_slippage_bps",
+            "round_trip_cost_bps",
+            "estimated_round_trip_cost_bps",
+            "fee_bps",
+            "slippage_bps",
+        ):
+            if key in source and key not in payload:
+                payload[key] = source[key]
+        for nested_key in ("exec_agent_decision", "short_term_exec_agent_decision", "market_data", "quote", "decider_output"):
+            nested = source.get(nested_key)
+            if isinstance(nested, dict):
+                for key in (
+                    "confidence",
+                    "confidence_score",
+                    "confidence_score_10",
+                    "atr_pct",
+                    "volatility_pct",
+                    "portfolio_correlation",
+                    "max_correlation",
+                    "correlation",
+                    "fee_slippage_bps",
+                    "round_trip_cost_bps",
+                    "estimated_round_trip_cost_bps",
+                ):
+                    if key in nested and key not in payload:
+                        payload[key] = nested[key]
+    return _json_safe({key: value for key, value in payload.items() if value is not None})
 
 
 def _outcome_bucket(pnl: Decimal) -> str:
