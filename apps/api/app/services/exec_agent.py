@@ -990,6 +990,11 @@ def _decide_candidate(
         agent_max_quantity=agent_contract.max_quantity,
         existing_symbol_exposure=existing_symbol_exposure,
         daily_new_buy_notional_used=reserved_daily_buy_notional,
+        vol_corr_context=_vol_corr_context(
+            item=item,
+            agent_contract=agent_contract,
+            account_context=account_context,
+        ),
     )
     if isinstance(risk_sizing, RiskSizingRejection):
         return _reject(
@@ -1364,6 +1369,43 @@ def _first_decimal_from_sources(
         if value is not None:
             return value
     return None
+
+
+def _vol_corr_context(
+    *,
+    item: ExecutionPlanItem,
+    agent_contract: ShortTermExecAgentContract,
+    account_context: _AccountContext,
+) -> dict[str, object]:
+    context: dict[str, object] = {}
+    for source in (agent_contract.context, item.risk_context, item.quantity_policy):
+        if not isinstance(source, dict):
+            continue
+        for key in (
+            "realized_volatility_pct",
+            "volatility_pct",
+            "atr_pct",
+            "recent_realized_volatility_pct",
+            "daily_return_pcts",
+            "return_pcts",
+            "candidate_return_pcts",
+            "daily_returns",
+            "returns",
+            "candidate_returns",
+            "max_holding_correlation",
+            "holding_correlation",
+            "correlation",
+            "correlation_symbol",
+            "holding_return_pcts_by_symbol",
+            "holding_returns_by_symbol",
+        ):
+            if key in source:
+                context[key] = source[key]
+
+    holding_symbols = sorted(account_context.holdings_by_symbol)
+    if holding_symbols:
+        context["holding_symbols"] = holding_symbols
+    return context
 
 
 def _first_decimal(source: object, keys: tuple[str, ...]) -> Decimal | None:
