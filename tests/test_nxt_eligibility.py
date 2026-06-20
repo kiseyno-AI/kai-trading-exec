@@ -1,3 +1,4 @@
+import logging
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -94,7 +95,7 @@ def test_is_nxt_eligible_symbol_uses_official_cache_when_env_list_is_empty(monke
     )
 
 
-def test_refresh_keeps_stale_cache_when_official_source_fails(monkeypatch) -> None:
+def test_refresh_keeps_stale_cache_when_official_source_fails(monkeypatch, caplog) -> None:
     settings = Settings(nxt_eligible_sync_enabled=True)
 
     monkeypatch.setattr(
@@ -115,11 +116,12 @@ def test_refresh_keeps_stale_cache_when_official_source_fails(monkeypatch) -> No
         raise RuntimeError("source unavailable")
 
     monkeypatch.setattr(nxt_eligibility, "_fetch_nxt_eligible_payload", fail_fetch)
-    refresh_nxt_eligible_symbols(
-        settings=settings,
-        now=datetime(2026, 6, 5, 2, 0, tzinfo=UTC),
-        force=True,
-    )
+    with caplog.at_level(logging.WARNING, logger=nxt_eligibility.LOGGER.name):
+        refresh_nxt_eligible_symbols(
+            settings=settings,
+            now=datetime(2026, 6, 5, 2, 0, tzinfo=UTC),
+            force=True,
+        )
 
     assert is_nxt_eligible_symbol(
         settings=settings,
@@ -127,6 +129,15 @@ def test_refresh_keeps_stale_cache_when_official_source_fails(monkeypatch) -> No
         now=datetime(2026, 6, 5, 2, 0, tzinfo=UTC) + timedelta(seconds=1),
     )
     assert nxt_eligibility.get_nxt_eligible_cache_snapshot()["last_error"] == "source unavailable"
+    failure_record = next(
+        record for record in caplog.records if record.message == "nxt_eligible_symbol_refresh_failed"
+    )
+    assert failure_record.error_class == "RuntimeError"
+    assert failure_record.error_message == "source unavailable"
+    assert failure_record.cached_symbol_count == 1
+    assert failure_record.fallback_used is True
+    assert failure_record.last_success_at == "2026-06-05T00:00:00+00:00"
+    assert failure_record.last_error_at == "2026-06-05T02:00:00+00:00"
 
 
 def test_failed_cold_cache_refresh_backs_off_immediate_lookups(monkeypatch) -> None:

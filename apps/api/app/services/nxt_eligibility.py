@@ -79,12 +79,22 @@ def refresh_nxt_eligible_symbols(
         payload = _fetch_nxt_eligible_payload(settings=settings)
         symbols, record_count, set_time = parse_nxt_eligible_payload(payload)
     except Exception as exc:
-        _store_refresh_error(error=str(exc), now=checked_at)
+        error_message = str(exc)
+        _store_refresh_error(error=error_message, now=checked_at)
+        snapshot = _CACHE.snapshot()
         LOGGER.warning(
             "nxt_eligible_symbol_refresh_failed",
-            extra={"source_url": settings.nxt_eligible_source_url},
+            extra={
+                "source_url": settings.nxt_eligible_source_url,
+                "error_class": type(exc).__name__,
+                "error_message": error_message,
+                "cached_symbol_count": snapshot["symbol_count"],
+                "last_success_at": snapshot["fetched_at"],
+                "last_error_at": snapshot["last_error_at"],
+                "fallback_used": bool(snapshot["symbol_count"]),
+            },
         )
-        return _CACHE.snapshot()
+        return snapshot
 
     with _CACHE._lock:
         _CACHE.symbols = frozenset(symbols)
