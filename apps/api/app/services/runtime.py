@@ -74,6 +74,7 @@ AGENT_APPROVED_SUBMITTED_STATUSES = (
 SHORT_TERM_BLOCKED_STATUSES = (
     "short_term_watch_blocked",
     "pending_configuration",
+    "watch_buy_triggered_blocked",
     "watch_buy_rejected",
     "watch_cancelled",
     "watch_expired",
