@@ -243,6 +243,7 @@ def reconcile_stale_nonterminal_broker_orders(
     orders = _load_stale_nonterminal_orders_for_reconciliation(
         db=db,
         settings=settings,
+        broker_name=adapter.provider,
         stale_before=cutoff,
         symbols=_normalize_symbols(symbols),
     )
@@ -331,6 +332,7 @@ def _load_stale_nonterminal_orders_for_reconciliation(
     *,
     db: Session,
     settings: Settings,
+    broker_name: str,
     stale_before: datetime,
     symbols: set[str] | None,
 ) -> list[BrokerOrder]:
@@ -342,6 +344,7 @@ def _load_stale_nonterminal_orders_for_reconciliation(
     )
     where = [
         BrokerOrder.mode == settings.runtime_mode,
+        BrokerOrder.broker_name == broker_name,
         BrokerOrder.status.in_(_reconcilable_order_statuses()),
         observed_at < stale_before,
     ]

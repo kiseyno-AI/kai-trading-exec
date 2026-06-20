@@ -548,6 +548,69 @@ def test_reconcile_stale_nonterminal_order_marks_closed_against_broker_truth() -
     engine.dispose()
 
 
+def test_reconcile_stale_nonterminal_orders_skips_wrong_broker_provider() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        stale_broker_order_reconciliation_threshold_seconds=3600,
+    )
+    engine, db = _session(settings)
+    stale_submitted_at = datetime.now(UTC) - timedelta(days=7)
+    kis_order = _order(broker_order_id="stale-kis-filled-1")
+    kis_order.submitted_at = stale_submitted_at
+    kis_order.last_broker_sync_at = stale_submitted_at
+    upbit_order = BrokerOrder(
+        broker_name="upbit",
+        mode="paper",
+        idempotency_key="upbit:stale-submitted-1",
+        broker_order_id="upbit-stale-submitted-1",
+        symbol="KRW-BTC",
+        side="buy",
+        status="submitted",
+        quantity=0,
+        base_quantity=Decimal("0.001"),
+        quote_notional=Decimal("100000"),
+        submitted_at=stale_submitted_at,
+        last_broker_sync_at=stale_submitted_at,
+        request_metadata={"provider": "upbit", "venue": "upbit", "asset_class": "crypto"},
+    )
+    db.add_all([kis_order, upbit_order])
+    db.commit()
+    broker = ReconciliationStubBroker(
+        reconcile_payloads=[
+            {
+                "broker_order_id": "stale-kis-filled-1",
+                "status": "filled",
+                "filled_quantity": 2,
+                "remaining_quantity": 0,
+                "average_fill_price": "71000",
+                "observed_at": OBSERVED_AT.isoformat(),
+            }
+        ]
+    )
+
+    result = reconcile_stale_nonterminal_broker_orders(
+        settings=settings,
+        db=db,
+        adapter=broker,
+    )
+
+    upbit_events = db.scalars(
+        select(BrokerOrderEvent).where(BrokerOrderEvent.broker_order_pk == upbit_order.id)
+    ).all()
+    assert result["candidate_order_count"] == 1
+    assert result["counts"]["closed"] == 1
+    assert result["items"][0]["broker_order_id"] == "stale-kis-filled-1"
+    assert broker.reconcile_calls == [("stale-kis-filled-1", "KRX")]
+    assert kis_order.status == "filled"
+    assert upbit_order.status == "submitted"
+    assert upbit_order.last_error_classification is None
+    assert upbit_order.last_error_message is None
+    assert upbit_order.last_broker_sync_at == stale_submitted_at
+    assert upbit_events == []
+    engine.dispose()
+
+
 def test_reconcile_stale_retry_pending_without_broker_id_is_failed_to_reconcile() -> None:
     settings = Settings(
         database_url="sqlite:///:memory:",
