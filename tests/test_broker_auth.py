@@ -3836,6 +3836,31 @@ def test_short_term_watcher_preview_rejects_insufficient_cash_existing_holding_a
     engine.dispose()
 
 
+def test_short_term_watcher_rejects_quantity_above_allowed_action_envelope() -> None:
+    app, engine = build_test_app(
+        settings=Settings(database_url="sqlite:///:memory:", runtime_mode="paper"),
+        broker_adapter=StubBrokerAdapter(
+            config=BrokerConfig(provider="kis", mode="paper", configured=True, api_base_url=KIS_PAPER_API_BASE_URL),
+            token_grant=build_token_grant(),
+            order_placement=build_order_placement(),
+        ),
+    )
+    client = TestClient(app)
+    item_id = _create_short_term_watcher_candidate(client)
+    payload = _short_term_decision_payload(item_id, available_cash="1000000.00")
+    payload["agent_output"]["quantity"] = 10
+    payload["agent_output"]["max_notional"] = "350000.00"
+
+    response = client.post("/short-term-watcher/decisions", json=payload)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["approved"] is False
+    assert body["reason_code"] == "allowed_action_envelope_exceeded"
+    assert body["context"]["allowed_action_envelope"]["max_quantity"] == 5
+    engine.dispose()
+
+
 def test_short_term_watcher_rejects_invalid_free_form_agent_output() -> None:
     app, engine = build_test_app(
         settings=Settings(database_url="sqlite:///:memory:", runtime_mode="paper"),
