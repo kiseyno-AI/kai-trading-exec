@@ -8,7 +8,7 @@ from sqlalchemy.orm import sessionmaker
 
 from app.core.config import Settings
 from app.db.base import Base
-from app.models.runtime import BrokerOrder, ExecutionFill, ExecutionPlan, ExecutionPlanItem
+from app.models.runtime import BrokerOrder, ExecutionFill, ExecutionPlan, ExecutionPlanItem, ExecutionPosition
 from app.services.trade_outcome_feedback import (
     generate_trade_outcome_feedback,
     load_latest_trade_outcome_feedback_snippet,
@@ -126,10 +126,290 @@ def test_generate_trade_outcome_feedback_writes_fifo_report_and_snippet(tmp_path
     assert trade["realized_pnl_krw"] == "-10000.0000"
     assert trade["return_pct"] == "-1.4085"
     assert trade["decision_run_id"] == "decision-run-1"
+    assert report["portfolio_risk"]["available"] is False
+    assert report["portfolio_risk"]["source_failed"] == (
+        "execution_positions returned no positive local positions for mode=paper; "
+        "broker account snapshots are not persisted by trade_outcome_feedback"
+    )
     assert report["prompt_snippet"]["patterns_to_downsize_or_reject"]
+    assert report["prompt_snippet"]["top_portfolio_risks"][0].startswith("Portfolio risk unavailable:")
     assert (tmp_path / "latest.json").exists()
     assert (tmp_path / "latest.md").exists()
+    markdown = (tmp_path / "latest.md").read_text(encoding="utf-8")
+    for heading in ("이번주 분석 결과", "포트폴리오 리스크", "개선 사항", "검증", "월요일 전 우선순위"):
+        assert heading in markdown
     assert load_latest_trade_outcome_feedback_snippet(settings)["closed_trade_count"] == 1
+
+    session.close()
+    engine.dispose()
+
+
+def test_trade_outcome_feedback_portfolio_risk_and_sell_reason_contributions(tmp_path) -> None:
+    engine, session = _session()
+    settings = Settings(
+        runtime_mode="paper",
+        trade_outcome_feedback_dir=str(tmp_path),
+        exec_agent_max_account_snapshot_age_seconds=300,
+    )
+    plan = ExecutionPlan(
+        id="plan-risk-1",
+        external_plan_id="plan-risk-1",
+        source="kai-trading-core",
+        strategy_run_id="run-risk-1",
+        mode="paper",
+    )
+    buy_a = ExecutionPlanItem(
+        id="item-buy-a",
+        plan=plan,
+        symbol="005930",
+        side="buy",
+        intent="next_open_buy",
+        status="filled",
+        risk_context={"sector": "Semiconductors"},
+    )
+    stop_sell = ExecutionPlanItem(
+        id="item-stop-sell",
+        plan=plan,
+        symbol="005930",
+        side="sell",
+        intent="stop_sell",
+        status="filled",
+        risk_context={"trigger_reason": "stop_sell"},
+    )
+    buy_b = ExecutionPlanItem(
+        id="item-buy-b",
+        plan=plan,
+        symbol="000660",
+        side="buy",
+        intent="next_open_buy",
+        status="filled",
+        risk_context={"sector": "Semiconductors"},
+    )
+    target_sell = ExecutionPlanItem(
+        id="item-target-sell",
+        plan=plan,
+        symbol="000660",
+        side="sell",
+        intent="target_sell",
+        status="filled",
+    )
+    buy_c = ExecutionPlanItem(
+        id="item-buy-c",
+        plan=plan,
+        symbol="035420",
+        side="buy",
+        intent="next_open_buy",
+        status="filled",
+        risk_context={"sector": "Internet"},
+    )
+    max_holding_sell = ExecutionPlanItem(
+        id="item-max-holding-sell",
+        plan=plan,
+        symbol="035420",
+        side="sell",
+        intent="max_holding_close_sell",
+        status="filled",
+    )
+    open_item = ExecutionPlanItem(
+        id="item-open-order",
+        plan=plan,
+        symbol="068270",
+        side="sell",
+        intent="target_sell",
+        status="broker_order_submitted",
+    )
+    orders = [
+        BrokerOrder(
+            id="order-buy-a",
+            plan_item=buy_a,
+            broker_name="kis",
+            mode="paper",
+            idempotency_key="risk-buy-a",
+            broker_order_id="risk-buy-a",
+            symbol="005930",
+            side="buy",
+            status="filled",
+            quantity=10,
+        ),
+        BrokerOrder(
+            id="order-stop-sell",
+            plan_item=stop_sell,
+            broker_name="kis",
+            mode="paper",
+            idempotency_key="risk-stop-sell",
+            broker_order_id="risk-stop-sell",
+            symbol="005930",
+            side="sell",
+            status="filled",
+            quantity=10,
+        ),
+        BrokerOrder(
+            id="order-buy-b",
+            plan_item=buy_b,
+            broker_name="kis",
+            mode="paper",
+            idempotency_key="risk-buy-b",
+            broker_order_id="risk-buy-b",
+            symbol="000660",
+            side="buy",
+            status="filled",
+            quantity=5,
+        ),
+        BrokerOrder(
+            id="order-target-sell",
+            plan_item=target_sell,
+            broker_name="kis",
+            mode="paper",
+            idempotency_key="risk-target-sell",
+            broker_order_id="risk-target-sell",
+            symbol="000660",
+            side="sell",
+            status="filled",
+            quantity=5,
+        ),
+        BrokerOrder(
+            id="order-buy-c",
+            plan_item=buy_c,
+            broker_name="kis",
+            mode="paper",
+            idempotency_key="risk-buy-c",
+            broker_order_id="risk-buy-c",
+            symbol="035420",
+            side="buy",
+            status="filled",
+            quantity=2,
+        ),
+        BrokerOrder(
+            id="order-max-holding-sell",
+            plan_item=max_holding_sell,
+            broker_name="kis",
+            mode="paper",
+            idempotency_key="risk-max-holding-sell",
+            broker_order_id="risk-max-holding-sell",
+            symbol="035420",
+            side="sell",
+            status="filled",
+            quantity=2,
+        ),
+        BrokerOrder(
+            id="order-open-stale",
+            plan_item=open_item,
+            broker_name="kis",
+            mode="paper",
+            idempotency_key="risk-open-stale",
+            broker_order_id="risk-open-stale",
+            symbol="068270",
+            side="sell",
+            status="broker_order_submitted",
+            quantity=3,
+            limit_price=Decimal("220000"),
+            submitted_at=datetime(2026, 6, 19, 0, 0, tzinfo=UTC),
+            last_broker_sync_at=datetime(2026, 6, 19, 0, 1, tzinfo=UTC),
+        ),
+    ]
+    session.add_all(
+        [
+            plan,
+            *orders,
+            ExecutionPosition(
+                id="pos-005930",
+                mode="paper",
+                symbol="005930",
+                quantity=10,
+                average_price=Decimal("100000"),
+                updated_from="broker_reconciliation",
+                last_reconciled_at=datetime(2026, 6, 19, 0, 0, tzinfo=UTC),
+            ),
+            ExecutionPosition(
+                id="pos-000660",
+                mode="paper",
+                symbol="000660",
+                quantity=5,
+                average_price=Decimal("200000"),
+                updated_from="broker_reconciliation",
+                last_reconciled_at=datetime(2026, 6, 20, 0, 9, tzinfo=UTC),
+            ),
+            ExecutionFill(
+                broker_order=orders[0],
+                broker_fill_id="risk-fill-buy-a",
+                symbol="005930",
+                side="buy",
+                quantity=10,
+                price=Decimal("100000"),
+                filled_at=datetime(2026, 6, 15, 0, 0, tzinfo=UTC),
+            ),
+            ExecutionFill(
+                broker_order=orders[1],
+                broker_fill_id="risk-fill-stop-sell",
+                symbol="005930",
+                side="sell",
+                quantity=10,
+                price=Decimal("99000"),
+                filled_at=datetime(2026, 6, 16, 0, 0, tzinfo=UTC),
+            ),
+            ExecutionFill(
+                broker_order=orders[2],
+                broker_fill_id="risk-fill-buy-b",
+                symbol="000660",
+                side="buy",
+                quantity=5,
+                price=Decimal("100000"),
+                filled_at=datetime(2026, 6, 15, 0, 0, tzinfo=UTC),
+            ),
+            ExecutionFill(
+                broker_order=orders[3],
+                broker_fill_id="risk-fill-target-sell",
+                symbol="000660",
+                side="sell",
+                quantity=5,
+                price=Decimal("130000"),
+                filled_at=datetime(2026, 6, 17, 0, 0, tzinfo=UTC),
+            ),
+            ExecutionFill(
+                broker_order=orders[4],
+                broker_fill_id="risk-fill-buy-c",
+                symbol="035420",
+                side="buy",
+                quantity=2,
+                price=Decimal("100000"),
+                filled_at=datetime(2026, 6, 15, 0, 0, tzinfo=UTC),
+            ),
+            ExecutionFill(
+                broker_order=orders[5],
+                broker_fill_id="risk-fill-max-holding-sell",
+                symbol="035420",
+                side="sell",
+                quantity=2,
+                price=Decimal("95000"),
+                filled_at=datetime(2026, 6, 18, 0, 0, tzinfo=UTC),
+            ),
+        ]
+    )
+    session.commit()
+
+    report = generate_trade_outcome_feedback(
+        settings=settings,
+        db=session,
+        as_of=datetime(2026, 6, 20, 0, 10, tzinfo=UTC),
+    )
+
+    risk = report["portfolio_risk"]
+    assert risk["available"] is True
+    assert risk["open_holding_count"] == 2
+    assert risk["total_market_value_krw"] == "2000000.0000"
+    assert [row["symbol"] for row in risk["top_position_concentration"]] == ["000660", "005930"]
+    assert risk["top_position_concentration"][0]["portfolio_weight_pct"] == "50.0000"
+    assert risk["sector_concentration"][0]["sector"] == "Semiconductors"
+    assert risk["stale_open_order_warnings"][0]["symbol"] == "068270"
+    assert {row["type"] for row in risk["monday_pre_market_checks"]} >= {"open_order", "stale_local_position", "open_position"}
+    by_reason = {row["name"]: row for row in risk["sell_reason_contributions"]}
+    assert by_reason["stop_sell"]["realized_pnl_krw"] == "-10000.0000"
+    assert by_reason["target_sell"]["realized_pnl_krw"] == "150000.0000"
+    assert by_reason["max_holding_close_sell"]["realized_pnl_krw"] == "-10000.0000"
+    assert risk["stop_sell_loss_contribution"]["realized_pnl_krw"] == "-10000.0000"
+    assert risk["target_sell_profit_contribution"]["realized_pnl_krw"] == "150000.0000"
+    assert risk["max_holding_close_contribution"]["realized_pnl_krw"] == "-10000.0000"
+    assert any("Top concentration" in line for line in report["prompt_snippet"]["top_portfolio_risks"])
 
     session.close()
     engine.dispose()
