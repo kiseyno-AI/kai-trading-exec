@@ -366,6 +366,66 @@ def test_candidate_payload_omits_decider_flow_short_sector_context_for_legacy_pa
     assert payload["supporting_evidence"] == ["legacy evidence"]
 
 
+def test_sizing_request_payload_includes_allowed_action_envelope() -> None:
+    settings = Settings(runtime_mode="live")
+    item = _watch_item(
+        risk_context={
+            "target_price": "76000",
+            "stop_price": "69000",
+            "execution_feasibility_context": {"max_safe_notional_krw": "800000"},
+        }
+    )
+    candidate = _candidate_payload(item)
+
+    payload = _sizing_request_payload(
+        settings=settings,
+        plan=ExecutionPlan(
+            external_plan_id="plan-envelope",
+            strategy_run_id="strategy-1",
+            market_date=date(2026, 6, 4),
+        ),
+        candidates=[candidate],
+        account_context={
+            "available": True,
+            "orderable_cash_krw": "10000000",
+            "buying_power_krw": "10000000",
+            "holdings": [],
+            "open_orders": [],
+        },
+        candidate_universe=_candidate_universe_payload([candidate]),
+    )
+
+    envelope = payload["candidates"][0]["allowed_action_envelope"]  # type: ignore[index]
+    assert envelope["schema_version"] == "allowed_action_envelope_v1"
+    assert "buy" in envelope["allowed_actions"]
+    assert envelope["max_quantity"] == 11
+    assert envelope["max_notional_krw"] == "800000.0000"
+
+
+def test_sizing_request_payload_blocks_existing_holding_in_allowed_action_envelope() -> None:
+    settings = Settings(runtime_mode="live")
+    item = _watch_item(risk_context={"target_price": "76000", "stop_price": "69000"})
+    candidate = _candidate_payload(item)
+
+    payload = _sizing_request_payload(
+        settings=settings,
+        plan=ExecutionPlan(external_plan_id="plan-envelope-holding", market_date=date(2026, 6, 4)),
+        candidates=[candidate],
+        account_context={
+            "available": True,
+            "orderable_cash_krw": "10000000",
+            "buying_power_krw": "10000000",
+            "holdings": [{"symbol": "005930", "quantity": 3}],
+            "open_orders": [],
+        },
+        candidate_universe=_candidate_universe_payload([candidate]),
+    )
+
+    envelope = payload["candidates"][0]["allowed_action_envelope"]  # type: ignore[index]
+    assert envelope["allowed_actions"] == ["hold", "reject"]
+    assert "existing_holding" in envelope["hard_reject_reasons"]
+
+
 def test_watch_sizing_decision_record_tags_tactical_target_profile() -> None:
     item = _watch_item(
         risk_context={
@@ -667,6 +727,61 @@ def test_apply_decisions_clamps_agent_approval_that_exceeds_cap() -> None:
     assert policy["sizing_adjustment"]["applied"] is True
     assert policy["sizing_adjustment"]["agent_quantity"] == 100
     assert policy["sizing_adjustment"]["cap_notional"] == "800000.0000"
+    assert policy["allowed_action_envelope"]["max_quantity"] == 11
+
+
+def test_apply_decisions_rejects_when_allowed_action_envelope_has_no_quantity() -> None:
+    plan = ExecutionPlan(
+        id="plan-1",
+        external_plan_id="plan-envelope-blocked",
+        strategy_run_id="strategy-1",
+        source="core-short-term-decider",
+        market_date=date(2026, 6, 4),
+        mode="live",
+        items=[
+            _watch_item(
+                item_id="watch-item-1",
+                symbol="005930",
+                risk_context={"target_price": "76000", "stop_price": "69000"},
+            )
+        ],
+    )
+
+    summary = _apply_decisions(
+        db=None,  # type: ignore[arg-type]
+        settings=Settings(runtime_mode="live"),
+        plan=plan,
+        account_context={
+            "available": True,
+            "orderable_cash_krw": "1000",
+            "buying_power_krw": "1000",
+            "holdings": [],
+            "open_orders": [],
+        },
+        expected_item_ids={"watch-item-1"},
+        decision_payload={
+            "version": "manual-exec-agent-watch-sizing-v1",
+            "decisions": [
+                {
+                    "execution_plan_item_id": "watch-item-1",
+                    "symbol": "005930",
+                    "action": "approve",
+                    "quantity": 1,
+                    "approved_notional_krw": 71500,
+                    "sizing_price": "71500",
+                    "confidence": 0.68,
+                    "target_profile": "short_swing",
+                    "reason_code": "agent_approval",
+                    "reason": "agent approval despite insufficient cash",
+                }
+            ],
+        },
+    )
+
+    assert summary["approved"] == 0
+    assert summary["rejected"] == 1
+    assert plan.items[0].status == "exec_agent_rejected"
+    assert plan.items[0].quantity_policy["allowed_action_envelope"]["max_quantity"] == 0
 
 
 def test_run_due_retry_applies_sizing_context_to_missing_decision(monkeypatch) -> None:

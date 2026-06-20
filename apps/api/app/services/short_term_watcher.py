@@ -83,6 +83,7 @@ def evaluate_short_term_watcher_decision(
         account_context=account_context,
         broker_account_snapshot=broker_account_snapshot,
     )
+    context["allowed_action_envelope"] = _allowed_action_envelope(context=context, command=command)
 
     rejection = _validate_candidate(item=item)
     if rejection is None:
@@ -238,6 +239,18 @@ def _validate_risk_rails(*, command: ShortTermWatcherDecisionRequest, context: d
     requested_notional = Decimal(str(context["requested_notional"]))
     if requested_notional <= 0:
         return "invalid_sizing", "requested notional must be positive"
+    envelope = context.get("allowed_action_envelope")
+    if isinstance(envelope, dict):
+        hard_reject_reasons = envelope.get("hard_reject_reasons")
+        if isinstance(hard_reject_reasons, list) and hard_reject_reasons:
+            return "allowed_action_envelope_blocked", "allowed action envelope does not permit a buy"
+        max_quantity = int(envelope.get("max_quantity") or 0)
+        resolved_quantity = int(context.get("resolved_quantity") or 0)
+        if resolved_quantity > max_quantity:
+            return "allowed_action_envelope_exceeded", "requested quantity exceeds allowed action envelope"
+        max_notional = Decimal(str(envelope.get("max_notional_krw") or "0"))
+        if requested_notional > max_notional:
+            return "allowed_action_envelope_exceeded", "requested notional exceeds allowed action envelope"
     max_notional = command.agent_output.max_notional or MAX_APPROVED_NOTIONAL
     if max_notional > MAX_APPROVED_NOTIONAL:
         return "risk_notional_too_large", "max_notional exceeds hard short-term watcher rail"
@@ -280,6 +293,45 @@ def _candidate_context(
         "open_buy_order_count": len(open_orders) + account_context.open_order_symbols.count(item.symbol),
         "broker_account_source": broker_account_snapshot.source if broker_account_snapshot is not None else "request",
         "open_order_ids": [order.id for order in open_orders],
+    }
+
+
+def _allowed_action_envelope(*, context: dict[str, Any], command: ShortTermWatcherDecisionRequest) -> dict[str, Any]:
+    reference_price = Decimal(str(context["reference_price"]))
+    available_cash = Decimal(str(context["available_cash"]))
+    resolved_quantity = int(context["resolved_quantity"] or 0)
+    requested_notional = Decimal(str(context["requested_notional"]))
+    hard_reject_reasons: list[str] = []
+    soft_warnings: list[str] = []
+    if context["runtime_position_quantity"] > 0 or context["account_holding_quantity"] > 0:
+        hard_reject_reasons.append("existing_holding")
+    if context["open_buy_order_count"] > 0:
+        hard_reject_reasons.append("duplicate_open_buy_order")
+    if reference_price <= 0:
+        hard_reject_reasons.append("missing_reference_price")
+    cash_limited_quantity = int((available_cash / reference_price).quantize(Decimal("1"), rounding=ROUND_DOWN)) if reference_price > 0 else 0
+    max_notional = min(available_cash, command.agent_output.max_notional or MAX_APPROVED_NOTIONAL, MAX_APPROVED_NOTIONAL)
+    max_quantity = int((max_notional / reference_price).quantize(Decimal("1"), rounding=ROUND_DOWN)) if reference_price > 0 else 0
+    if max_quantity <= 0:
+        hard_reject_reasons.append("no_buyable_quantity")
+    if requested_notional > max_notional or resolved_quantity > max_quantity:
+        soft_warnings.append("agent_requested_above_envelope")
+    allowed_actions = ["hold", "reject"]
+    if not hard_reject_reasons and max_quantity > 0:
+        allowed_actions.extend(["buy", "downsize"])
+    return {
+        "schema_version": "allowed_action_envelope_v1",
+        "allowed_actions": allowed_actions,
+        "max_quantity": max(0, max_quantity),
+        "max_notional_krw": f"{max_notional.quantize(Decimal('0.0001'), rounding=ROUND_DOWN):.4f}",
+        "cash_limited_quantity": cash_limited_quantity,
+        "requested_quantity": resolved_quantity,
+        "requested_notional_krw": str(requested_notional),
+        "existing_position_quantity": context["runtime_position_quantity"] + context["account_holding_quantity"],
+        "open_buy_order_count": context["open_buy_order_count"],
+        "hard_reject_reasons": hard_reject_reasons,
+        "soft_warnings": soft_warnings,
+        "computed_at": datetime.now(UTC).isoformat(),
     }
 
 

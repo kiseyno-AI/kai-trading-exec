@@ -431,6 +431,11 @@ def _sizing_request_payload(
     )
     if retry:
         task += " This is a retry for candidates missing from a previous response; do not omit any candidate."
+    candidates = _candidates_with_allowed_action_envelopes(
+        settings=settings,
+        candidates=candidates,
+        account_context=account_context,
+    )
     return {
         "version": "watch-exec-agent-sizing-request-v1",
         "plan_id": plan.external_plan_id,
@@ -998,14 +1003,42 @@ def _apply_decisions(
             quantity = _positive_int(decision.get("quantity"))
             if quantity is None:
                 raise ValueError(f"approved decision has invalid quantity for {item.symbol}")
+            envelope = _allowed_action_envelope_for_item(
+                settings=settings,
+                item=item,
+                account_context=account_context,
+                decision=decision,
+            )
             sizing = _adjust_approved_watch_quantity(
                 settings=settings,
                 item=item,
                 decision=decision,
                 account_context=account_context,
                 agent_quantity=quantity,
+                allowed_action_envelope=envelope,
             )
             quantity = sizing["quantity"]
+            if quantity <= 0:
+                decision["action"] = "reject"
+                decision["reason_code"] = "allowed_action_envelope_blocked"
+                decision["reason"] = "allowed action envelope left no buyable quantity"
+                record = _decision_record(decision=decision, item=item, version=str(decision_payload.get("version") or ""))
+                previous_policy = item.quantity_policy if isinstance(item.quantity_policy, dict) else None
+                item.quantity_policy = {
+                    "kind": "exec_agent_rejected",
+                    "source": "exec_agent_watch_sizing",
+                    "exec_agent_decision": _decision_summary(record),
+                    "short_term_exec_agent_decision": _decision_summary(record),
+                    "exec_agent_decision_audit": {
+                        "event_type": "watch_exec_agent_sizing_decision",
+                        "storage": "execution_plan_item_audits",
+                    },
+                    "allowed_action_envelope": envelope,
+                    "previous_policy": previous_policy,
+                }
+                item.status = "exec_agent_rejected"
+                rejected += 1
+                continue
             previous_policy = item.quantity_policy if isinstance(item.quantity_policy, dict) else None
             item.quantity_policy = {
                 "kind": "shares",
@@ -1024,6 +1057,7 @@ def _apply_decisions(
                     "storage": "execution_plan_item_audits",
                 },
                 "sizing_adjustment": sizing["adjustment"],
+                "allowed_action_envelope": envelope,
                 "previous_policy": previous_policy,
             }
             item.status = "watch_buy_triggered_blocked" if was_triggered_blocked else "watch_monitoring_active"
@@ -1107,6 +1141,7 @@ def _adjust_approved_watch_quantity(
     decision: dict[str, object],
     account_context: dict[str, object] | None,
     agent_quantity: int,
+    allowed_action_envelope: dict[str, object] | None = None,
 ) -> dict[str, object]:
     sizing_price = (
         _decimal_value(decision.get("sizing_price"))
@@ -1145,6 +1180,11 @@ def _adjust_approved_watch_quantity(
     effective_target = min(target_notional, cap_notional)
     adjusted_quantity = agent_quantity
     max_quantity = _floor_quantity(cap_notional / sizing_price)
+    envelope_max_quantity = _positive_int(
+        allowed_action_envelope.get("max_quantity") if isinstance(allowed_action_envelope, dict) else None
+    )
+    if envelope_max_quantity is not None:
+        max_quantity = min(max_quantity, envelope_max_quantity)
     if effective_target > original_notional:
         adjusted_quantity = max(agent_quantity, _floor_quantity(effective_target / sizing_price))
     adjusted_quantity = min(adjusted_quantity, max_quantity)
@@ -1159,11 +1199,171 @@ def _adjust_approved_watch_quantity(
             "agent_notional": _decimal_text(original_notional),
             "target_min_notional": _decimal_text(target_notional),
             "cap_notional": _decimal_text(cap_notional),
+            "allowed_action_envelope_max_quantity": envelope_max_quantity,
             "effective_target_notional": _decimal_text(effective_target),
             "adjusted_quantity": adjusted_quantity,
             "adjusted_notional": _decimal_text(approved_notional),
         },
     }
+
+
+def _candidates_with_allowed_action_envelopes(
+    *,
+    settings: Settings,
+    candidates: list[dict[str, object]],
+    account_context: dict[str, object],
+) -> list[dict[str, object]]:
+    enriched: list[dict[str, object]] = []
+    for candidate in candidates:
+        payload = dict(candidate)
+        payload["allowed_action_envelope"] = _allowed_action_envelope_for_candidate(
+            settings=settings,
+            candidate=payload,
+            account_context=account_context,
+        )
+        enriched.append(payload)
+    return enriched
+
+
+def _allowed_action_envelope_for_item(
+    *,
+    settings: Settings | None,
+    item: ExecutionPlanItem,
+    account_context: dict[str, object] | None,
+    decision: dict[str, object] | None = None,
+) -> dict[str, object]:
+    if settings is None:
+        return {
+            "schema_version": "allowed_action_envelope_v1",
+            "allowed_actions": ["hold", "reject"],
+            "max_quantity": 0,
+            "max_notional_krw": "0.0000",
+            "hard_reject_reasons": ["settings_unavailable"],
+            "soft_warnings": [],
+        }
+    candidate = _candidate_payload(item)
+    if decision is not None and decision.get("sizing_price") is not None:
+        candidate["chase_limit_price"] = decision.get("sizing_price")
+    return _allowed_action_envelope_for_candidate(
+        settings=settings,
+        candidate=candidate,
+        account_context=account_context,
+    )
+
+
+def _allowed_action_envelope_for_candidate(
+    *,
+    settings: Settings,
+    candidate: dict[str, object],
+    account_context: dict[str, object] | None,
+) -> dict[str, object]:
+    symbol = str(candidate.get("symbol") or "").strip().upper()
+    sizing_price = (
+        _decimal_value(candidate.get("chase_limit_price"))
+        or _decimal_value(candidate.get("trigger_price"))
+    )
+    hard_reject_reasons: list[str] = []
+    soft_warnings: list[str] = []
+    if sizing_price is None or sizing_price <= 0:
+        hard_reject_reasons.append("missing_reference_price")
+        sizing_price = Decimal("0")
+
+    available_cash = _account_available_cash(account_context)
+    if available_cash is None:
+        soft_warnings.append("account_cash_unavailable")
+        available_cash = Decimal(str(settings.exec_agent_watch_sizing_fallback_account_basis_krw))
+
+    holding_quantity = _account_holding_quantity(account_context=account_context, symbol=symbol)
+    open_buy_order_count = _account_open_buy_order_count(account_context=account_context, symbol=symbol)
+    if holding_quantity > 0:
+        hard_reject_reasons.append("existing_holding")
+    if open_buy_order_count > 0:
+        hard_reject_reasons.append("duplicate_open_buy_order")
+
+    account_basis = _account_basis(settings=settings, account_context=account_context)
+    cap_candidates: list[Decimal] = [
+        available_cash,
+        Decimal(str(settings.exec_agent_max_symbol_budget)),
+        account_basis * Decimal(str(settings.exec_agent_max_position_allocation_pct)),
+    ]
+    for key in ("budget_krw", "max_safe_notional_krw"):
+        value = _decimal_value(candidate.get(key))
+        if value is not None and value > 0:
+            cap_candidates.append(value)
+
+    stop_price = _decimal_value(candidate.get("stop_loss_price"))
+    stop_distance_pct: str | None = None
+    risk_cap: Decimal | None = None
+    if stop_price is not None and sizing_price > 0 and stop_price < sizing_price:
+        stop_distance = sizing_price - stop_price
+        stop_distance_pct = _decimal_text((stop_distance / sizing_price) * Decimal("100"))
+        risk_budget = account_basis * Decimal(str(settings.exec_agent_max_trade_risk_pct))
+        risk_quantity = _floor_quantity(risk_budget / stop_distance)
+        risk_cap = sizing_price * Decimal(max(0, risk_quantity))
+        cap_candidates.append(risk_cap)
+    elif stop_price is None:
+        soft_warnings.append("missing_stop_price")
+    else:
+        hard_reject_reasons.append("invalid_stop_distance")
+
+    max_notional = min(cap_candidates).quantize(Decimal("0.0001"), rounding=ROUND_DOWN)
+    max_quantity = _floor_quantity(max_notional / sizing_price) if sizing_price > 0 else 0
+    if max_quantity <= 0:
+        hard_reject_reasons.append("no_buyable_quantity")
+    allowed_actions = ["hold", "reject"]
+    if not hard_reject_reasons and max_quantity > 0:
+        allowed_actions.extend(["buy", "downsize"])
+
+    return {
+        "schema_version": "allowed_action_envelope_v1",
+        "allowed_actions": allowed_actions,
+        "max_quantity": max(0, max_quantity),
+        "max_notional_krw": _decimal_text(max_notional),
+        "cash_limited_quantity": _floor_quantity(available_cash / sizing_price) if sizing_price > 0 else 0,
+        "risk_limited_notional_krw": _decimal_text(risk_cap),
+        "reference_price": _decimal_text(sizing_price),
+        "stop_distance_pct": stop_distance_pct,
+        "existing_position_quantity": holding_quantity,
+        "open_buy_order_count": open_buy_order_count,
+        "hard_reject_reasons": hard_reject_reasons,
+        "soft_warnings": soft_warnings,
+        "computed_at": datetime.now(UTC).isoformat(),
+    }
+
+
+def _account_holding_quantity(*, account_context: dict[str, object] | None, symbol: str) -> int:
+    if not isinstance(account_context, dict) or account_context.get("available") is not True:
+        return 0
+    holdings = account_context.get("holdings")
+    if not isinstance(holdings, list):
+        return 0
+    total = 0
+    for holding in holdings:
+        if not isinstance(holding, dict):
+            continue
+        if str(holding.get("symbol") or "").strip().upper() != symbol:
+            continue
+        quantity = _positive_int(holding.get("quantity"))
+        if quantity is not None:
+            total += quantity
+    return total
+
+
+def _account_open_buy_order_count(*, account_context: dict[str, object] | None, symbol: str) -> int:
+    if not isinstance(account_context, dict) or account_context.get("available") is not True:
+        return 0
+    open_orders = account_context.get("open_orders")
+    if not isinstance(open_orders, list):
+        return 0
+    count = 0
+    for order in open_orders:
+        if not isinstance(order, dict):
+            continue
+        if str(order.get("symbol") or "").strip().upper() != symbol:
+            continue
+        if str(order.get("side") or "").strip().lower() == "buy":
+            count += 1
+    return count
 
 
 def _target_min_notional(
