@@ -367,12 +367,17 @@ def _merge_open_orders(
     local_orders: list[OpenOrderRiskRow],
 ) -> list[OpenOrderRiskRow]:
     merged: list[OpenOrderRiskRow] = []
-    seen: set[tuple[str | None, str | None, str, str]] = set()
+    seen_broker_order_ids: set[str] = set()
+    seen_idempotency_keys_without_broker_id: set[str] = set()
     for order in [*snapshot_orders, *local_orders]:
-        key = (order.broker_order_id, order.idempotency_key, order.symbol, order.side)
-        if key in seen:
-            continue
-        seen.add(key)
+        if order.broker_order_id:
+            if order.broker_order_id in seen_broker_order_ids:
+                continue
+            seen_broker_order_ids.add(order.broker_order_id)
+        elif order.idempotency_key:
+            if order.idempotency_key in seen_idempotency_keys_without_broker_id:
+                continue
+            seen_idempotency_keys_without_broker_id.add(order.idempotency_key)
         merged.append(order)
     return merged
 

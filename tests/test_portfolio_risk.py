@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 from app.broker.base import (
     BrokerAccountPosition,
     BrokerAccountSnapshot,
+    BrokerAccountOpenOrder,
     BrokerConfig,
     BrokerOrderPlacement,
     BrokerOrderPlacementRequest,
@@ -212,6 +213,73 @@ def test_portfolio_risk_snapshot_combines_holdings_and_open_buy_order_exposure()
     assert exposure["total_exposure"] == "1220000.0000"
     warning_codes = {warning["code"] for warning in payload["warnings"]["concentration"]}
     assert "holding_plus_open_buy_order" in warning_codes
+    engine.dispose()
+
+
+def test_portfolio_risk_snapshot_deduplicates_snapshot_and_local_open_order_by_broker_order_id() -> None:
+    settings = Settings(database_url="sqlite:///:memory:", runtime_mode="paper")
+    engine, _factory, db = _session(settings)
+    now = datetime(2026, 6, 20, 3, 0, tzinfo=UTC)
+    _add_broker_session(db, expires_at=datetime.now(UTC) + timedelta(hours=1))
+    db.add(
+        BrokerOrder(
+            broker_name="kis",
+            mode="paper",
+            idempotency_key="local-idempotency-key",
+            broker_order_id="kis-open-order-1",
+            symbol="005930",
+            side="buy",
+            status="open",
+            quantity=2,
+            limit_price=Decimal("70000.00"),
+            last_broker_sync_at=now,
+        )
+    )
+    db.commit()
+    snapshot = BrokerAccountSnapshot(
+        observed_at=now,
+        source="stub:account_snapshot",
+        open_orders=[
+            BrokerAccountOpenOrder(
+                symbol="005930",
+                side="buy",
+                quantity=2,
+                remaining_quantity=2,
+                status="open",
+                broker_order_id="kis-open-order-1",
+                idempotency_key=None,
+                limit_price=Decimal("70000.00"),
+            )
+        ],
+    )
+
+    payload = build_portfolio_risk_snapshot(
+        settings=settings,
+        db=db,
+        adapter=PortfolioRiskStubAdapter(snapshot=snapshot),
+        now=now,
+    )
+
+    assert payload["source_status"] == "ok"
+    assert payload["open_orders"]["open_count"] == 1
+    assert payload["open_orders"]["top_by_notional"] == [
+        {
+            "symbol": "005930",
+            "side": "buy",
+            "quantity": 2,
+            "base_quantity": None,
+            "remaining_quantity": "2.0000",
+            "limit_price": "70000.0000",
+            "notional": "140000.0000",
+            "status": "open",
+            "broker_order_id": "kis-open-order-1",
+            "idempotency_key": None,
+            "source": "stub:account_snapshot",
+        }
+    ]
+    exposure = payload["exposures"]["by_symbol"][0]
+    assert exposure["symbol"] == "005930"
+    assert exposure["open_buy_notional"] == "140000.0000"
     engine.dispose()
 
 
