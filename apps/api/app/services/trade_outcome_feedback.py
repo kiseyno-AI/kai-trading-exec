@@ -8,12 +8,12 @@ from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session, selectinload
 
 from app.core.config import Settings, load_settings
 from app.db.session import create_db_engine, create_session_factory
-from app.models.runtime import BrokerOrder, ExecutionFill, ExecutionPlanItem
+from app.models.runtime import BrokerOrder, ExecutionFill, ExecutionPlanItem, ExecutionPosition
 
 REPORT_VERSION = "trade-outcome-feedback-v1"
 
@@ -45,7 +45,13 @@ def generate_trade_outcome_feedback(
     ]
     summary = _summary(closed_trades)
     lessons = _lessons(closed_trades, max_lessons=settings.trade_outcome_feedback_max_lessons)
-    snippet = _snippet(summary=summary, lessons=lessons)
+    portfolio_risk = _portfolio_risk(
+        settings=settings,
+        db=db,
+        closed_trades=closed_trades,
+        as_of=now,
+    )
+    snippet = _snippet(summary=summary, lessons=lessons, portfolio_risk=portfolio_risk)
     report_date = now.astimezone(UTC).date()
     report: dict[str, object] = {
         "version": REPORT_VERSION,
@@ -55,6 +61,7 @@ def generate_trade_outcome_feedback(
         "started_at": started_at.isoformat(),
         "closed_trade_count": len(closed_trades),
         "summary": summary,
+        "portfolio_risk": portfolio_risk,
         "closed_trades": closed_trades,
         "lessons": lessons,
         "prompt_snippet": snippet,
@@ -203,6 +210,353 @@ def _summary(closed_trades: list[dict[str, object]]) -> dict[str, object]:
     }
 
 
+def _portfolio_risk(
+    *,
+    settings: Settings,
+    db: Session,
+    closed_trades: list[dict[str, object]],
+    as_of: datetime,
+) -> dict[str, object]:
+    positions = _load_positions(settings=settings, db=db)
+    open_orders = _load_open_orders(settings=settings, db=db)
+    stale_before = as_of - timedelta(seconds=settings.exec_agent_max_account_snapshot_age_seconds)
+    position_rows = [
+        _position_risk_row(position=position, sector=_sector_for_symbol(settings=settings, db=db, symbol=position.symbol))
+        for position in positions
+    ]
+    rows_with_value = [
+        row
+        for row in position_rows
+        if _decimal_value(row.get("market_value_krw")) is not None
+    ]
+    total_market_value = sum(
+        (_decimal_value(row.get("market_value_krw")) or Decimal("0"))
+        for row in rows_with_value
+    )
+    top_concentration = sorted(
+        rows_with_value,
+        key=lambda row: _decimal_value(row.get("market_value_krw")) or Decimal("0"),
+        reverse=True,
+    )[:5]
+    for row in top_concentration:
+        value = _decimal_value(row.get("market_value_krw")) or Decimal("0")
+        row["portfolio_weight_pct"] = _decimal_text(
+            (value / total_market_value * Decimal("100")) if total_market_value > 0 else Decimal("0")
+        )
+    stale_positions = [
+        {
+            "symbol": position.symbol,
+            "quantity": position.quantity,
+            "base_quantity": _position_base_quantity_text(position),
+            "effective_quantity": _position_effective_quantity_text(position),
+            "last_reconciled_at": _normalize_utc(position.last_reconciled_at).isoformat()
+            if position.last_reconciled_at is not None
+            else None,
+            "reason": "missing_last_reconciled_at"
+            if position.last_reconciled_at is None
+            else "last_reconciled_at_older_than_max_age",
+        }
+        for position in positions
+        if position.last_reconciled_at is None or _normalize_utc(position.last_reconciled_at) < stale_before
+    ]
+    open_order_rows = [_open_order_risk_row(order=order, as_of=as_of, stale_before=stale_before) for order in open_orders]
+    stale_orders = [row for row in open_order_rows if row.get("stale") is True]
+    account_source_failed = None
+    if not position_rows:
+        account_source_failed = (
+            f"execution_positions returned no positive local positions for mode={settings.runtime_mode}; "
+            "broker account snapshots are not persisted by trade_outcome_feedback"
+        )
+    contributions = _realized_contributions(closed_trades)
+    sector_concentration = _sector_concentration(position_rows) if any(row.get("sector") for row in position_rows) else []
+    monday_checks = _monday_pre_market_checks(
+        positions=position_rows,
+        stale_positions=stale_positions,
+        open_orders=open_order_rows,
+    )
+    return {
+        "available": bool(position_rows),
+        "source": "execution_positions",
+        "source_failed": account_source_failed,
+        "as_of": as_of.isoformat(),
+        "stale_threshold_seconds": settings.exec_agent_max_account_snapshot_age_seconds,
+        "open_holding_count": len(position_rows) if position_rows else None,
+        "total_market_value_krw": _decimal_text(total_market_value) if position_rows and len(rows_with_value) == len(position_rows) else None,
+        "positions_missing_market_value_count": len(position_rows) - len(rows_with_value),
+        "top_position_concentration": _json_safe(top_concentration),
+        "sector_concentration": _json_safe(sector_concentration),
+        "realized_pnl_by_symbol": contributions["by_symbol"],
+        "sell_reason_contributions": contributions["by_sell_reason"],
+        "stop_sell_loss_contribution": contributions["stop_sell_loss"],
+        "target_sell_profit_contribution": contributions["target_sell_profit"],
+        "max_holding_close_contribution": contributions["max_holding_close"],
+        "open_orders": _json_safe(open_order_rows),
+        "stale_open_order_warnings": _json_safe(stale_orders),
+        "stale_local_position_warnings": _json_safe(stale_positions),
+        "monday_pre_market_checks": _json_safe(monday_checks),
+    }
+
+
+def _load_positions(*, settings: Settings, db: Session) -> list[ExecutionPosition]:
+    return list(
+        db.scalars(
+            select(ExecutionPosition)
+            .where(
+                ExecutionPosition.mode == settings.runtime_mode,
+                or_(
+                    ExecutionPosition.quantity > 0,
+                    ExecutionPosition.base_quantity > 0,
+                ),
+            )
+            .order_by(ExecutionPosition.symbol.asc())
+        )
+    )
+
+
+def _load_open_orders(*, settings: Settings, db: Session) -> list[BrokerOrder]:
+    terminal_statuses = {
+        "filled",
+        "canceled",
+        "cancelled",
+        "rejected",
+        "expired",
+        "failed",
+        "closed",
+    }
+    return list(
+        db.scalars(
+            select(BrokerOrder)
+            .where(BrokerOrder.mode == settings.runtime_mode)
+            .where(BrokerOrder.status.not_in(terminal_statuses))
+            .options(selectinload(BrokerOrder.plan_item), selectinload(BrokerOrder.fills))
+            .order_by(BrokerOrder.symbol.asc(), BrokerOrder.submitted_at.asc().nulls_last(), BrokerOrder.id.asc())
+        )
+    )
+
+
+def _position_risk_row(*, position: ExecutionPosition, sector: str | None) -> dict[str, object]:
+    effective_quantity = _position_effective_quantity(position)
+    market_value = None
+    if position.average_price is not None and effective_quantity > 0:
+        market_value = Decimal(position.average_price) * effective_quantity
+    return {
+        "symbol": position.symbol,
+        "quantity": position.quantity,
+        "base_quantity": _position_base_quantity_text(position),
+        "effective_quantity": _position_effective_quantity_text(position),
+        "average_price": _decimal_text(Decimal(position.average_price)) if position.average_price is not None else None,
+        "market_value_krw": _decimal_text(market_value),
+        "last_reconciled_at": _normalize_utc(position.last_reconciled_at).isoformat()
+        if position.last_reconciled_at is not None
+        else None,
+        "updated_from": position.updated_from,
+        "sector": sector,
+    }
+
+
+def _position_effective_quantity(position: ExecutionPosition) -> Decimal:
+    if position.quantity > 0:
+        return Decimal(position.quantity)
+    base_quantity = Decimal(position.base_quantity) if position.base_quantity is not None else Decimal("0")
+    return base_quantity if base_quantity > 0 else Decimal("0")
+
+
+def _position_base_quantity_text(position: ExecutionPosition) -> str | None:
+    if position.base_quantity is None:
+        return None
+    return _quantity_text(Decimal(position.base_quantity))
+
+
+def _position_effective_quantity_text(position: ExecutionPosition) -> str:
+    if position.quantity > 0:
+        return _decimal_text(Decimal(position.quantity)) or "0.0000"
+    return _quantity_text(_position_effective_quantity(position))
+
+
+def _open_order_risk_row(*, order: BrokerOrder, as_of: datetime, stale_before: datetime) -> dict[str, object]:
+    reference_at = order.last_broker_sync_at or order.submitted_at or order.updated_at or order.created_at
+    normalized_reference = _normalize_utc(reference_at) if reference_at is not None else None
+    remaining_quantity = _remaining_order_quantity(order)
+    is_stale = normalized_reference is None or normalized_reference < stale_before
+    return {
+        "broker_order_pk": order.id,
+        "broker_order_id": order.broker_order_id,
+        "execution_plan_item_id": order.execution_plan_item_id,
+        "symbol": order.symbol,
+        "side": order.side,
+        "intent": order.plan_item.intent if order.plan_item is not None else None,
+        "status": order.status,
+        "quantity": order.quantity,
+        "remaining_quantity": remaining_quantity,
+        "limit_price": _decimal_text(Decimal(order.limit_price)) if order.limit_price is not None else None,
+        "submitted_at": _normalize_utc(order.submitted_at).isoformat() if order.submitted_at is not None else None,
+        "last_broker_sync_at": _normalize_utc(order.last_broker_sync_at).isoformat()
+        if order.last_broker_sync_at is not None
+        else None,
+        "age_seconds": int((as_of - normalized_reference).total_seconds()) if normalized_reference is not None else None,
+        "stale": is_stale,
+        "stale_reason": "missing_order_timestamp" if normalized_reference is None else ("older_than_max_age" if is_stale else None),
+    }
+
+
+def _remaining_order_quantity(order: BrokerOrder) -> int | None:
+    if order.quantity is None:
+        return None
+    filled_quantity = sum(int(fill.quantity) for fill in order.fills)
+    return max(0, int(order.quantity) - filled_quantity)
+
+
+def _realized_contributions(closed_trades: list[dict[str, object]]) -> dict[str, object]:
+    by_symbol: dict[str, list[Decimal]] = {}
+    by_reason: dict[str, list[Decimal]] = {}
+    for trade in closed_trades:
+        symbol = str(trade.get("symbol") or "unknown")
+        pnl = _decimal_value(trade.get("realized_pnl_krw")) or Decimal("0")
+        reason = _sell_reason(trade)
+        by_symbol.setdefault(symbol, []).append(pnl)
+        by_reason.setdefault(reason, []).append(pnl)
+    return {
+        "by_symbol": _contribution_rows(by_symbol),
+        "by_sell_reason": _contribution_rows(by_reason),
+        "stop_sell_loss": _reason_filtered_contribution(closed_trades, reason="stop_sell", pnl_filter="loss"),
+        "target_sell_profit": _reason_filtered_contribution(closed_trades, reason="target_sell", pnl_filter="profit"),
+        "max_holding_close": _reason_filtered_contribution(closed_trades, reason="max_holding_close_sell", pnl_filter=None),
+    }
+
+
+def _contribution_rows(stats: dict[str, list[Decimal]]) -> list[dict[str, object]]:
+    rows = []
+    for name, values in stats.items():
+        total = sum(values, Decimal("0"))
+        rows.append(
+            {
+                "name": name,
+                "trade_count": len(values),
+                "realized_pnl_krw": _decimal_text(total),
+            }
+        )
+    return sorted(rows, key=lambda row: Decimal(str(row["realized_pnl_krw"])))
+
+
+def _reason_filtered_contribution(
+    closed_trades: list[dict[str, object]],
+    *,
+    reason: str,
+    pnl_filter: str | None,
+) -> dict[str, object]:
+    values = []
+    symbols: dict[str, list[Decimal]] = {}
+    for trade in closed_trades:
+        pnl = _decimal_value(trade.get("realized_pnl_krw")) or Decimal("0")
+        if _sell_reason(trade) != reason:
+            continue
+        if pnl_filter == "loss" and pnl >= 0:
+            continue
+        if pnl_filter == "profit" and pnl <= 0:
+            continue
+        values.append(pnl)
+        symbols.setdefault(str(trade.get("symbol") or "unknown"), []).append(pnl)
+    return {
+        "trade_count": len(values),
+        "realized_pnl_krw": _decimal_text(sum(values, Decimal("0"))),
+        "by_symbol": _contribution_rows(symbols),
+    }
+
+
+def _sell_reason(trade: dict[str, object]) -> str:
+    sell = trade.get("sell") if isinstance(trade.get("sell"), dict) else {}
+    intent = str(sell.get("intent") or "").strip()
+    if intent:
+        return intent
+    decision = trade.get("exec_agent_decision") if isinstance(trade.get("exec_agent_decision"), dict) else {}
+    reason = str(decision.get("reason_code") or "").strip()
+    return reason or "unknown"
+
+
+def _sector_for_symbol(*, settings: Settings, db: Session, symbol: str) -> str | None:
+    items = db.scalars(
+        select(ExecutionPlanItem)
+        .where(ExecutionPlanItem.symbol == symbol, ExecutionPlanItem.plan.has(mode=settings.runtime_mode))
+        .order_by(ExecutionPlanItem.updated_at.desc().nulls_last(), ExecutionPlanItem.created_at.desc())
+        .limit(20)
+    )
+    for item in items:
+        if not isinstance(item.risk_context, dict):
+            continue
+        for key in ("sector", "sector_name", "industry", "theme"):
+            value = item.risk_context.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return None
+
+
+def _sector_concentration(position_rows: list[dict[str, object]]) -> list[dict[str, object]]:
+    stats: dict[str, list[Decimal]] = {}
+    for row in position_rows:
+        sector = str(row.get("sector") or "").strip()
+        value = _decimal_value(row.get("market_value_krw"))
+        if sector and value is not None:
+            stats.setdefault(sector, []).append(value)
+    total = sum((sum(values, Decimal("0")) for values in stats.values()), Decimal("0"))
+    rows = []
+    for sector, values in stats.items():
+        value = sum(values, Decimal("0"))
+        rows.append(
+            {
+                "sector": sector,
+                "position_count": len(values),
+                "market_value_krw": _decimal_text(value),
+                "portfolio_weight_pct": _decimal_text((value / total * Decimal("100")) if total > 0 else Decimal("0")),
+            }
+        )
+    return sorted(rows, key=lambda row: Decimal(str(row["market_value_krw"])), reverse=True)
+
+
+def _monday_pre_market_checks(
+    *,
+    positions: list[dict[str, object]],
+    stale_positions: list[dict[str, object]],
+    open_orders: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    checks = []
+    for order in open_orders:
+        checks.append(
+            {
+                "type": "open_order",
+                "symbol": order.get("symbol"),
+                "side": order.get("side"),
+                "status": order.get("status"),
+                "reason": "confirm broker open-order truth before Monday pre-market",
+            }
+        )
+    stale_symbols = {str(row.get("symbol")) for row in stale_positions}
+    for position in positions:
+        if str(position.get("symbol")) in stale_symbols:
+            checks.append(
+                {
+                    "type": "stale_local_position",
+                    "symbol": position.get("symbol"),
+                    "quantity": position.get("quantity"),
+                    "base_quantity": position.get("base_quantity"),
+                    "effective_quantity": position.get("effective_quantity"),
+                    "reason": "refresh local position against broker truth before Monday pre-market",
+                }
+            )
+        else:
+            checks.append(
+                {
+                    "type": "open_position",
+                    "symbol": position.get("symbol"),
+                    "quantity": position.get("quantity"),
+                    "base_quantity": position.get("base_quantity"),
+                    "effective_quantity": position.get("effective_quantity"),
+                    "market_value_krw": position.get("market_value_krw"),
+                    "reason": "review concentration and exit monitors before Monday pre-market",
+                }
+            )
+    return checks
+
+
 def _lessons(closed_trades: list[dict[str, object]], *, max_lessons: int) -> dict[str, object]:
     worst_losses = sorted(
         closed_trades,
@@ -225,7 +579,12 @@ def _lessons(closed_trades: list[dict[str, object]], *, max_lessons: int) -> dic
     }
 
 
-def _snippet(*, summary: dict[str, object], lessons: dict[str, object]) -> dict[str, object]:
+def _snippet(
+    *,
+    summary: dict[str, object],
+    lessons: dict[str, object],
+    portfolio_risk: dict[str, object],
+) -> dict[str, object]:
     hard_gates = []
     for row in lessons.get("patterns_to_downsize_or_reject", []):
         if isinstance(row, dict):
@@ -244,11 +603,51 @@ def _snippet(*, summary: dict[str, object], lessons: dict[str, object]) -> dict[
         ),
         "patterns_to_downsize_or_reject": hard_gates[:6],
         "positive_expectancy_patterns": lessons.get("positive_expectancy_patterns", []),
+        "top_portfolio_risks": _portfolio_risk_snippet_lines(portfolio_risk),
+        "monday_pre_market_checks": _monday_check_snippet_lines(portfolio_risk),
         "required_hard_gates": [
             "Do not increase size for profiles/reason_codes listed as negative without fresh superior live quality.",
             "Prefer delay/reject over execute_now when recent worst-loss conditions resemble the current candidate.",
         ],
     }
+
+
+def _portfolio_risk_snippet_lines(portfolio_risk: dict[str, object]) -> list[str]:
+    if not portfolio_risk.get("available"):
+        return [f"Portfolio risk unavailable: {portfolio_risk.get('source_failed')}"]
+    lines = [
+        (
+            f"Open holdings={portfolio_risk.get('open_holding_count')}, "
+            f"market_value={portfolio_risk.get('total_market_value_krw')} KRW."
+        )
+    ]
+    top_positions = portfolio_risk.get("top_position_concentration")
+    if isinstance(top_positions, list):
+        for row in top_positions[:3]:
+            if isinstance(row, dict):
+                lines.append(
+                    f"Top concentration {row.get('symbol')}: {row.get('market_value_krw')} KRW ({row.get('portfolio_weight_pct')}%)."
+                )
+    stale_orders = portfolio_risk.get("stale_open_order_warnings")
+    stale_positions = portfolio_risk.get("stale_local_position_warnings")
+    if isinstance(stale_orders, list) and stale_orders:
+        lines.append(f"Stale open orders need review: {len(stale_orders)}.")
+    if isinstance(stale_positions, list) and stale_positions:
+        lines.append(f"Stale local positions need broker-truth refresh: {len(stale_positions)}.")
+    return lines[:6]
+
+
+def _monday_check_snippet_lines(portfolio_risk: dict[str, object]) -> list[str]:
+    checks = portfolio_risk.get("monday_pre_market_checks")
+    if not isinstance(checks, list) or not checks:
+        if portfolio_risk.get("source_failed"):
+            return [f"Confirm missing account/position source before Monday: {portfolio_risk.get('source_failed')}"]
+        return []
+    lines = []
+    for row in checks[:8]:
+        if isinstance(row, dict):
+            lines.append(f"{row.get('type')} {row.get('symbol')}: {row.get('reason')}")
+    return lines
 
 
 def _write_artifacts(*, report: dict[str, object], report_date: date, output_dir: Path) -> None:
@@ -266,6 +665,7 @@ def _write_artifacts(*, report: dict[str, object], report_date: date, output_dir
 def _markdown_report(report: dict[str, object]) -> str:
     summary = report.get("summary") if isinstance(report.get("summary"), dict) else {}
     snippet = report.get("prompt_snippet") if isinstance(report.get("prompt_snippet"), dict) else {}
+    portfolio_risk = report.get("portfolio_risk") if isinstance(report.get("portfolio_risk"), dict) else {}
     lines = [
         f"# Trade Outcome Feedback {str(report.get('generated_at'))[:10]}",
         "",
@@ -275,12 +675,99 @@ def _markdown_report(report: dict[str, object]) -> str:
         f"- Win rate: {summary.get('win_rate_pct')}%",
         f"- Worst loss: {summary.get('worst_loss_krw')} KRW",
         "",
-        "## Prompt Snippet",
+        "## 이번주 분석 결과",
         "",
-        str(snippet.get("summary") or ""),
+        f"- 주간 실현손익: {summary.get('realized_pnl_krw')} KRW",
+        f"- 승/패: {summary.get('win_count')}승 / {summary.get('loss_count')}패",
+        "- 근거: execution_fills, broker_orders, execution_positions",
         "",
-        "## Gates",
+        "### 포트폴리오 리스크",
+        "",
     ]
+    if portfolio_risk.get("available"):
+        lines.extend(
+            [
+                f"- 보유 종목 수: {portfolio_risk.get('open_holding_count')}",
+                f"- 총 평가 금액: {portfolio_risk.get('total_market_value_krw')} KRW",
+                f"- 평가 금액 누락 포지션: {portfolio_risk.get('positions_missing_market_value_count')}",
+            ]
+        )
+        top_positions = portfolio_risk.get("top_position_concentration")
+        if isinstance(top_positions, list) and top_positions:
+            lines.append("- 상위 집중:")
+            for row in top_positions[:5]:
+                if isinstance(row, dict):
+                    lines.append(
+                        f"  - {row.get('symbol')}: {row.get('market_value_krw')} KRW ({row.get('portfolio_weight_pct')}%)"
+                    )
+    else:
+        lines.append(f"- 사용 불가: {portfolio_risk.get('source_failed')}")
+    for label, key in (
+        ("종목별 실현손익", "realized_pnl_by_symbol"),
+        ("매도 사유별 실현손익", "sell_reason_contributions"),
+    ):
+        rows = portfolio_risk.get(key)
+        if isinstance(rows, list) and rows:
+            lines.append(f"- {label}:")
+            for row in rows:
+                if isinstance(row, dict):
+                    lines.append(f"  - {row.get('name')}: {row.get('realized_pnl_krw')} KRW ({row.get('trade_count')}건)")
+    stale_orders = portfolio_risk.get("stale_open_order_warnings")
+    stale_positions = portfolio_risk.get("stale_local_position_warnings")
+    if isinstance(stale_orders, list) and stale_orders:
+        lines.append(f"- 오래된 미체결 주문 경고: {len(stale_orders)}건")
+    if isinstance(stale_positions, list) and stale_positions:
+        lines.append(f"- 오래된 로컬 포지션 경고: {len(stale_positions)}건")
+    lines.extend(
+        [
+            "",
+            "## 개선 사항",
+            "",
+            "- 최근 손실 패턴은 아래 Gates에 반영됩니다.",
+            "",
+            "## 검증",
+            "",
+            "- 생성 JSON에는 portfolio_risk가 별도 machine-readable 객체로 포함됩니다.",
+            "",
+            "## 월요일 전 우선순위",
+            "",
+        ]
+    )
+    monday_checks = portfolio_risk.get("monday_pre_market_checks")
+    if isinstance(monday_checks, list) and monday_checks:
+        for row in monday_checks[:8]:
+            if isinstance(row, dict):
+                lines.append(f"- {row.get('symbol')}: {row.get('reason')}")
+    elif portfolio_risk.get("source_failed"):
+        lines.append(f"- 계좌/포지션 소스 확인: {portfolio_risk.get('source_failed')}")
+    else:
+        lines.append("- 특이 미체결/포지션 점검 항목 없음")
+    lines.extend(
+        [
+            "",
+            "## Prompt Snippet",
+            "",
+            str(snippet.get("summary") or ""),
+            "",
+            "## Portfolio Risk Summary",
+        ]
+    )
+    for item in snippet.get("top_portfolio_risks", []):
+        lines.append(f"- {item}")
+    lines.extend(
+        [
+            "",
+            "## Monday Pre-Market Checks",
+        ]
+    )
+    for item in snippet.get("monday_pre_market_checks", []):
+        lines.append(f"- {item}")
+    lines.extend(
+        [
+            "",
+            "## Gates",
+        ]
+    )
     for item in snippet.get("patterns_to_downsize_or_reject", []):
         lines.append(f"- {item}")
     for item in snippet.get("required_hard_gates", []):
@@ -413,6 +900,10 @@ def _decimal_text(value: Decimal | None) -> str | None:
     if value is None:
         return None
     return str(value.quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP))
+
+
+def _quantity_text(value: Decimal) -> str:
+    return str(value.quantize(Decimal("0.000000000001"), rounding=ROUND_HALF_UP))
 
 
 def _normalize_utc(value: datetime) -> datetime:
