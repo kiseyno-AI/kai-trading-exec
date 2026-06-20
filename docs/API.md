@@ -119,6 +119,70 @@ Current response includes:
   - `venues[]`
   - `latest_activity_at`
 
+### `GET /runtime/portfolio-risk`
+Returns a compact live portfolio risk snapshot for agents and dashboards.
+
+This endpoint is advisory risk visibility only. It must not be treated as an
+autonomous buy/sell trigger, and the endpoint does not place, amend, cancel, or
+reconcile broker orders. If broker/account data is unavailable, expected
+provider/session/account gaps are reported as `source_status=partial` or
+`source_status=unavailable` with `source_reason` instead of an HTTP 500.
+
+Current response includes:
+- `generated_at`
+- `mode`
+- `source_status` (`ok`, `partial`, `unavailable`)
+- `source_reason`
+- `account`
+  - `source`
+  - `observed_at`
+  - `available_cash`
+  - `buying_power`
+  - `total_market_value`
+  - `total_securities_value`
+- `holdings`
+  - `open_count`
+  - `top_by_market_value[]`
+    - `symbol`
+    - `quantity`
+    - `base_quantity`
+    - `average_price`
+    - `market_value`
+    - `allocation_pct`
+    - `source`
+- `open_orders`
+  - `open_count`
+  - `top_by_notional[]`
+    - `symbol`
+    - `side`
+    - `remaining_quantity`
+    - `limit_price`
+    - `notional`
+    - `status`
+    - `broker_order_id`
+    - `idempotency_key`
+- `exposures.by_symbol[]`
+  - `symbol`
+  - `holding_value`
+  - `open_buy_notional`
+  - `total_exposure`
+  - `allocation_pct`
+- `estimated_stop_risk`
+  - `positions[]`
+    - `symbol`
+    - `stop_price`
+    - `estimated_risk`
+    - `metadata_status`
+    - `plan_item_id`
+  - `total_estimated_risk`
+- `warnings`
+  - `concentration[]`
+    - warnings such as top-symbol concentration, top-three concentration,
+      holding plus duplicate open buy order, missing stop metadata, stale
+      position truth, stale open order, and symbol total exposure concentration
+  - `stale_positions`
+  - `stale_orders[]`
+
 ### `GET /runtime/safety`
 Returns safety controls and operator override state.
 

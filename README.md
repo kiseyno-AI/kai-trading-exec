@@ -71,6 +71,7 @@ Useful checks:
 curl http://127.0.0.1:8010/health
 curl http://127.0.0.1:8010/runtime/status
 curl http://127.0.0.1:8010/runtime/daily-board
+curl http://127.0.0.1:8010/runtime/portfolio-risk
 curl http://127.0.0.1:8010/broker/session
 curl http://127.0.0.1:8010/execution-jobs
 curl -X POST http://127.0.0.1:8010/execution-jobs/dispatch
@@ -261,6 +262,12 @@ Current execution slices:
 - `GET /symbols` exposes symbol-level readback rows for core/web consumers
 - `GET /symbols/{symbol}` exposes per-symbol execution, monitoring, order, fill, and position history
 - `GET /runtime/daily-board` exposes a compact current-day board with runtime status plus symbol rows
+- `GET /runtime/portfolio-risk` exposes a compact advisory live portfolio risk
+  snapshot for agents and dashboards. It reports cash/buying power when a broker
+  account snapshot is already available, otherwise falls back to exec-owned
+  positions and open orders with `source_status=partial` or `unavailable`. This
+  endpoint is risk visibility only; it is not an autonomous buy/sell trigger and
+  does not place, amend, cancel, or reconcile orders.
 
 Short-term watcher buys fail closed when broker account state cannot be resolved,
 when cash/buying power is insufficient, when an add-on would breach symbol

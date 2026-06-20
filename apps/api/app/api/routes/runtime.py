@@ -3,8 +3,10 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, Request
 from sqlalchemy.orm import Session
 
-from app.api.dependencies import get_db_session, get_runtime_metadata, get_settings
+from app.api.dependencies import get_broker_adapter, get_db_session, get_runtime_metadata, get_settings
+from app.broker.base import BrokerAdapter
 from app.core.config import Settings
+from app.services.portfolio_risk import build_portfolio_risk_snapshot
 from app.services.runtime import (
     RuntimeMetadata,
     build_runtime_daily_board,
@@ -58,4 +60,18 @@ def runtime_daily_board(
         runtime=runtime,
         db=db,
         autonomous_runtime=autonomous_runtime,
+    )
+
+
+@router.get("/portfolio-risk")
+def runtime_portfolio_risk(
+    request: Request,
+    db: Annotated[Session, Depends(get_db_session)],
+    adapter: Annotated[BrokerAdapter, Depends(get_broker_adapter)],
+) -> dict[str, object]:
+    settings: Settings = get_settings(request)
+    return build_portfolio_risk_snapshot(
+        settings=settings,
+        db=db,
+        adapter=adapter,
     )
