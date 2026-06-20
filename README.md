@@ -196,6 +196,17 @@ Short-term exec risk settings currently supported:
 - `KAI_EXEC_EXEC_AGENT_WATCH_SIZING_HIGH_CONVICTION_MIN_NOTIONAL_KRW`
 - `KAI_EXEC_EXEC_AGENT_WATCH_SIZING_HIGH_CONVICTION_THRESHOLD`
 - `KAI_EXEC_EXEC_AGENT_WATCH_SIZING_FALLBACK_ACCOUNT_BASIS_KRW`
+- `KAI_EXEC_VOL_CORR_SIZING_ENABLED`
+- `KAI_EXEC_VOL_CORR_VOLATILITY_LOOKBACK_DAYS`
+- `KAI_EXEC_VOL_CORR_MIN_RETURN_OBSERVATIONS`
+- `KAI_EXEC_VOL_CORR_HIGH_VOLATILITY_THRESHOLD_PCT`
+- `KAI_EXEC_VOL_CORR_VERY_HIGH_VOLATILITY_THRESHOLD_PCT`
+- `KAI_EXEC_VOL_CORR_HIGH_VOLATILITY_MULTIPLIER`
+- `KAI_EXEC_VOL_CORR_VERY_HIGH_VOLATILITY_MULTIPLIER`
+- `KAI_EXEC_VOL_CORR_HIGH_CORRELATION_THRESHOLD`
+- `KAI_EXEC_VOL_CORR_HIGH_CORRELATION_MULTIPLIER`
+- `KAI_EXEC_VOL_CORR_MISSING_DATA_BEHAVIOR`
+- `KAI_EXEC_VOL_CORR_MISSING_DATA_MULTIPLIER`
 - `KAI_EXEC_TRADE_OUTCOME_FEEDBACK_ENABLED`
 - `KAI_EXEC_TRADE_OUTCOME_FEEDBACK_DIR`
 - `KAI_EXEC_TRADE_OUTCOME_FEEDBACK_LOOKBACK_DAYS`
@@ -213,6 +224,11 @@ snapshot loading is unavailable, the fallback account basis defaults to
 `10,000,000` KRW. The default sizing window runs until `20:00` KST so
 triggered NXT after-hours watch buys can still receive share quantities before
 submission.
+
+Volatility/correlation buy sizing caps are disabled by default. When enabled,
+they can reduce but never increase the existing buy quantity using supplied
+recent return, realized-volatility, and holding-correlation context; missing
+data is neutral unless `KAI_EXEC_VOL_CORR_MISSING_DATA_BEHAVIOR=conservative`.
 
 Trade outcome feedback can be generated from stored broker fills with:
 

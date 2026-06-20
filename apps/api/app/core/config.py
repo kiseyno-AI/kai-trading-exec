@@ -85,6 +85,17 @@ class Settings(BaseModel):
     exec_agent_watch_sizing_high_conviction_min_notional_krw: Decimal = Field(default=Decimal("1500000"), ge=0)
     exec_agent_watch_sizing_high_conviction_threshold: Decimal = Field(default=Decimal("0.65"), ge=0, le=1)
     exec_agent_watch_sizing_fallback_account_basis_krw: Decimal = Field(default=Decimal("10000000"), gt=0)
+    vol_corr_sizing_enabled: bool = False
+    vol_corr_volatility_lookback_days: int = Field(default=20, ge=2, le=252)
+    vol_corr_min_return_observations: int = Field(default=10, ge=2, le=252)
+    vol_corr_high_volatility_threshold_pct: Decimal = Field(default=Decimal("4.0"), gt=0, le=Decimal("100"))
+    vol_corr_very_high_volatility_threshold_pct: Decimal = Field(default=Decimal("7.0"), gt=0, le=Decimal("100"))
+    vol_corr_high_volatility_multiplier: Decimal = Field(default=Decimal("0.75"), gt=0, le=1)
+    vol_corr_very_high_volatility_multiplier: Decimal = Field(default=Decimal("0.50"), gt=0, le=1)
+    vol_corr_high_correlation_threshold: Decimal = Field(default=Decimal("0.75"), gt=0, le=1)
+    vol_corr_high_correlation_multiplier: Decimal = Field(default=Decimal("0.80"), gt=0, le=1)
+    vol_corr_missing_data_behavior: str = "neutral"
+    vol_corr_missing_data_multiplier: Decimal = Field(default=Decimal("0.75"), gt=0, le=1)
     trade_outcome_feedback_enabled: bool = True
     trade_outcome_feedback_dir: str = "var/analytics/trade_outcome_feedback"
     trade_outcome_feedback_lookback_days: int = Field(default=20, ge=1, le=365)
@@ -128,6 +139,15 @@ class Settings(BaseModel):
         allowed = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
         if normalized not in allowed:
             raise ValueError(f"log_level must be one of {sorted(allowed)}")
+        return normalized
+
+    @field_validator("vol_corr_missing_data_behavior")
+    @classmethod
+    def normalize_vol_corr_missing_data_behavior(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        allowed = {"neutral", "conservative"}
+        if normalized not in allowed:
+            raise ValueError(f"vol_corr_missing_data_behavior must be one of {sorted(allowed)}")
         return normalized
 
 
@@ -205,6 +225,17 @@ _ENV_FIELDS = {
     "EXEC_AGENT_WATCH_SIZING_HIGH_CONVICTION_MIN_NOTIONAL_KRW": "exec_agent_watch_sizing_high_conviction_min_notional_krw",
     "EXEC_AGENT_WATCH_SIZING_HIGH_CONVICTION_THRESHOLD": "exec_agent_watch_sizing_high_conviction_threshold",
     "EXEC_AGENT_WATCH_SIZING_FALLBACK_ACCOUNT_BASIS_KRW": "exec_agent_watch_sizing_fallback_account_basis_krw",
+    "VOL_CORR_SIZING_ENABLED": "vol_corr_sizing_enabled",
+    "VOL_CORR_VOLATILITY_LOOKBACK_DAYS": "vol_corr_volatility_lookback_days",
+    "VOL_CORR_MIN_RETURN_OBSERVATIONS": "vol_corr_min_return_observations",
+    "VOL_CORR_HIGH_VOLATILITY_THRESHOLD_PCT": "vol_corr_high_volatility_threshold_pct",
+    "VOL_CORR_VERY_HIGH_VOLATILITY_THRESHOLD_PCT": "vol_corr_very_high_volatility_threshold_pct",
+    "VOL_CORR_HIGH_VOLATILITY_MULTIPLIER": "vol_corr_high_volatility_multiplier",
+    "VOL_CORR_VERY_HIGH_VOLATILITY_MULTIPLIER": "vol_corr_very_high_volatility_multiplier",
+    "VOL_CORR_HIGH_CORRELATION_THRESHOLD": "vol_corr_high_correlation_threshold",
+    "VOL_CORR_HIGH_CORRELATION_MULTIPLIER": "vol_corr_high_correlation_multiplier",
+    "VOL_CORR_MISSING_DATA_BEHAVIOR": "vol_corr_missing_data_behavior",
+    "VOL_CORR_MISSING_DATA_MULTIPLIER": "vol_corr_missing_data_multiplier",
     "TRADE_OUTCOME_FEEDBACK_ENABLED": "trade_outcome_feedback_enabled",
     "TRADE_OUTCOME_FEEDBACK_DIR": "trade_outcome_feedback_dir",
     "TRADE_OUTCOME_FEEDBACK_LOOKBACK_DAYS": "trade_outcome_feedback_lookback_days",
