@@ -40,8 +40,10 @@ from app.models.runtime import (
 from app.services.execution_jobs import dispatch_due_execution_jobs
 from app.services.reconciliation import (
     reconcile_broker_order,
+    reconcile_stale_nonterminal_broker_orders,
     sync_execution_positions_from_broker_snapshot,
 )
+from app.services.runtime import RuntimeMetadata, build_runtime_status
 from app.services.runtime_controls import ControlCommand, resume_runtime
 
 
@@ -496,6 +498,158 @@ def test_reconcile_cumulative_filled_quantity_adds_only_delta() -> None:
     assert second["fills_added"] == 1
     assert [fill.quantity for fill in fills] == [1, 1]
     assert sum(fill.quantity for fill in fills) == 2
+    engine.dispose()
+
+
+def test_reconcile_stale_nonterminal_order_marks_closed_against_broker_truth() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        stale_broker_order_reconciliation_threshold_seconds=3600,
+    )
+    engine, db = _session(settings)
+    stale_submitted_at = datetime.now(UTC) - timedelta(days=7)
+    order = _order(broker_order_id="stale-filled-1")
+    order.submitted_at = stale_submitted_at
+    order.last_broker_sync_at = stale_submitted_at
+    db.add(order)
+    db.commit()
+    broker = ReconciliationStubBroker(
+        reconcile_payloads=[
+            {
+                "broker_order_id": "stale-filled-1",
+                "status": "filled",
+                "filled_quantity": 2,
+                "remaining_quantity": 0,
+                "average_fill_price": "71000",
+                "observed_at": OBSERVED_AT.isoformat(),
+            }
+        ]
+    )
+
+    result = reconcile_stale_nonterminal_broker_orders(
+        settings=settings,
+        db=db,
+        adapter=broker,
+    )
+
+    events = db.scalars(
+        select(BrokerOrderEvent).where(
+            BrokerOrderEvent.event_type == "stale_order_reconcile_classification"
+        )
+    ).all()
+    assert result["candidate_order_count"] == 1
+    assert result["counts"]["closed"] == 1
+    assert result["items"][0]["classification"] == "closed"
+    assert order.status == "filled"
+    assert broker.reconcile_calls == [("stale-filled-1", "KRX")]
+    assert len(events) == 1
+    assert events[0].error_classification == "closed"
+    engine.dispose()
+
+
+def test_reconcile_stale_retry_pending_without_broker_id_is_failed_to_reconcile() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        stale_broker_order_reconciliation_threshold_seconds=3600,
+    )
+    engine, db = _session(settings)
+    stale_submitted_at = datetime.now(UTC) - timedelta(days=5)
+    plan, item, live_order = _plan_backed_order(
+        plan_id="plan-stale-duplicate-retry",
+        side="buy",
+        intent="intraday_watch_buy",
+        broker_order_id="live-open-1",
+        status="open",
+    )
+    live_order.submitted_at = datetime.now(UTC)
+    live_order.last_broker_sync_at = datetime.now(UTC)
+    retry_order = BrokerOrder(
+        broker_name="kis",
+        mode="paper",
+        idempotency_key="retry:duplicate-local",
+        broker_order_id=None,
+        symbol=item.symbol,
+        side="buy",
+        status="retry_pending",
+        quantity=2,
+        submitted_at=stale_submitted_at,
+        last_broker_sync_at=stale_submitted_at,
+    )
+    retry_order.plan_item = item
+    db.add_all([plan, retry_order])
+    db.commit()
+    broker = ReconciliationStubBroker()
+
+    result = reconcile_stale_nonterminal_broker_orders(
+        settings=settings,
+        db=db,
+        adapter=broker,
+    )
+
+    events = db.scalars(
+        select(BrokerOrderEvent).where(
+            BrokerOrderEvent.event_type == "stale_order_reconcile_classification"
+        )
+    ).all()
+    assert result["candidate_order_count"] == 1
+    assert result["counts"]["failed-to-reconcile"] == 1
+    assert result["items"][0]["classification"] == "failed-to-reconcile"
+    assert result["items"][0]["reason"] == "missing_broker_order_id"
+    assert retry_order.status == "retry_pending"
+    assert retry_order.last_error_classification == "missing_broker_order_id"
+    assert broker.reconcile_calls == []
+    assert len(events) == 1
+    assert events[0].error_classification == "failed_to_reconcile"
+    engine.dispose()
+
+
+def test_runtime_status_reports_position_truth_freshness_details() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        exec_agent_max_account_snapshot_age_seconds=300,
+    )
+    engine, db = _session(settings)
+    stale_reconciled_at = datetime.now(UTC) - timedelta(hours=2)
+    db.add(
+        BrokerOrder(
+            broker_name="kis",
+            mode="paper",
+            idempotency_key="filled-buy-freshness",
+            broker_order_id="filled-buy-freshness",
+            symbol="319660",
+            side="buy",
+            status="filled",
+            quantity=4,
+            submitted_at=stale_reconciled_at + timedelta(minutes=5),
+        )
+    )
+    db.add(
+        ExecutionPosition(
+            mode="paper",
+            symbol="319660",
+            quantity=0,
+            average_price=None,
+            updated_from="reconciliation",
+            last_reconciled_at=stale_reconciled_at,
+        )
+    )
+    db.commit()
+
+    payload = build_runtime_status(
+        settings=settings,
+        runtime=RuntimeMetadata(started_at=datetime.now(UTC)),
+        db=db,
+    )
+
+    freshness = payload["freshness"]["position_truth"]
+    assert freshness["stale_count"] == 1
+    assert freshness["stale_symbols"] == ["319660"]
+    assert freshness["oldest_age_seconds"] is not None
+    assert freshness["last_reconciled_at"] == stale_reconciled_at.astimezone(UTC).isoformat()
+    assert freshness["broker_truth_reachable"] is False
     engine.dispose()
 
 

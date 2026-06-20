@@ -4,7 +4,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session, selectinload
 
 from app.broker.base import (
@@ -222,6 +222,203 @@ def reconcile_pending_broker_orders(
         db=db,
         adapter=adapter,
         orders=orders,
+    )
+
+
+def reconcile_stale_nonterminal_broker_orders(
+    *,
+    settings: Settings,
+    db: Session,
+    adapter: BrokerAdapter,
+    older_than_seconds: int | None = None,
+    symbols: set[str] | None = None,
+) -> dict[str, object]:
+    threshold_seconds = (
+        older_than_seconds
+        if older_than_seconds is not None
+        else settings.stale_broker_order_reconciliation_threshold_seconds
+    )
+    observed_at = _observation_time()
+    cutoff = observed_at - timedelta(seconds=threshold_seconds)
+    orders = _load_stale_nonterminal_orders_for_reconciliation(
+        db=db,
+        settings=settings,
+        stale_before=cutoff,
+        symbols=_normalize_symbols(symbols),
+    )
+
+    counts = {
+        "live": 0,
+        "closed": 0,
+        "cancelled": 0,
+        "unknown": 0,
+        "failed_to_reconcile": 0,
+    }
+    items: list[dict[str, object]] = []
+    for order in orders:
+        classification_observed_at = _observation_time()
+        reason: str | None = None
+        result: dict[str, object] | None = None
+        if not order.broker_order_id:
+            classification = "failed_to_reconcile"
+            reason = "missing_broker_order_id"
+            order.last_error_classification = "missing_broker_order_id"
+            order.last_error_message = "stale nonterminal order has no broker_order_id"
+            order.last_error_retryable = False
+            order.last_broker_sync_at = classification_observed_at
+            _record_stale_order_classification_event(
+                db=db,
+                order=order,
+                classification=classification,
+                reason=reason,
+                observed_at=classification_observed_at,
+                result=None,
+            )
+        else:
+            result = reconcile_broker_order(
+                settings=settings,
+                db=db,
+                adapter=adapter,
+                order=order,
+            )
+            classification, reason = _stale_order_reconciliation_classification(
+                status=str(result.get("status") or order.status),
+                status_code=int(result.get("status_code") or 200),
+                message=result.get("message"),
+            )
+            _record_stale_order_classification_event(
+                db=db,
+                order=order,
+                classification=classification,
+                reason=reason,
+                observed_at=_observation_time(),
+                result=result,
+            )
+
+        counts[classification] += 1
+        items.append(
+            {
+                "broker_order_pk": order.id,
+                "broker_order_id": order.broker_order_id,
+                "idempotency_key": order.idempotency_key,
+                "symbol": order.symbol,
+                "side": order.side,
+                "status": order.status,
+                "classification": classification.replace("_", "-"),
+                "reason": reason,
+                "last_broker_sync_at": _serialize_datetime(order.last_broker_sync_at),
+                "result": result,
+            }
+        )
+
+    db.commit()
+    return {
+        "candidate_order_count": len(orders),
+        "threshold_seconds": threshold_seconds,
+        "stale_before": cutoff.isoformat(),
+        "counts": {
+            "live": counts["live"],
+            "closed": counts["closed"],
+            "cancelled": counts["cancelled"],
+            "unknown": counts["unknown"],
+            "failed-to-reconcile": counts["failed_to_reconcile"],
+        },
+        "items": items,
+    }
+
+
+def _load_stale_nonterminal_orders_for_reconciliation(
+    *,
+    db: Session,
+    settings: Settings,
+    stale_before: datetime,
+    symbols: set[str] | None,
+) -> list[BrokerOrder]:
+    observed_at = func.coalesce(
+        BrokerOrder.last_broker_sync_at,
+        BrokerOrder.submitted_at,
+        BrokerOrder.updated_at,
+        BrokerOrder.created_at,
+    )
+    where = [
+        BrokerOrder.mode == settings.runtime_mode,
+        BrokerOrder.status.in_(_reconcilable_order_statuses()),
+        observed_at < stale_before,
+    ]
+    if symbols is not None:
+        where.append(BrokerOrder.symbol.in_(sorted(symbols)))
+    return db.scalars(
+        select(BrokerOrder)
+        .options(
+            selectinload(BrokerOrder.fills),
+            selectinload(BrokerOrder.plan_item),
+        )
+        .where(*where)
+        .order_by(observed_at.asc(), BrokerOrder.created_at.asc())
+    ).all()
+
+
+def _stale_order_reconciliation_classification(
+    *,
+    status: str,
+    status_code: int,
+    message: object,
+) -> tuple[str, str | None]:
+    normalized = _normalize_status(status) or status
+    if status_code >= 400:
+        return "failed_to_reconcile", _optional_str(message) or "broker_truth_unreachable"
+    if normalized in {
+        NormalizedBrokerOrderStatus.SUBMISSION_PENDING.value,
+        NormalizedBrokerOrderStatus.SUBMITTED.value,
+        NormalizedBrokerOrderStatus.OPEN.value,
+        NormalizedBrokerOrderStatus.PARTIALLY_FILLED.value,
+        NormalizedBrokerOrderStatus.CANCEL_PENDING.value,
+    }:
+        return "live", None
+    if normalized == NormalizedBrokerOrderStatus.CANCELED.value:
+        return "cancelled", None
+    if normalized in {
+        NormalizedBrokerOrderStatus.FILLED.value,
+        NormalizedBrokerOrderStatus.REJECTED.value,
+        NormalizedBrokerOrderStatus.FAILED.value,
+        NormalizedBrokerOrderStatus.EXPIRED.value,
+    }:
+        return "closed", None
+    if normalized == NormalizedBrokerOrderStatus.RETRY_PENDING.value:
+        return "failed_to_reconcile", "local_retry_pending_not_broker_live_state"
+    return "unknown", _optional_str(message)
+
+
+def _record_stale_order_classification_event(
+    *,
+    db: Session,
+    order: BrokerOrder,
+    classification: str,
+    reason: str | None,
+    observed_at: datetime,
+    result: dict[str, object] | None,
+) -> None:
+    db.add(
+        BrokerOrderEvent(
+            broker_order_pk=order.id,
+            event_type="stale_order_reconcile_classification",
+            event_source=BrokerEventSource.RECONCILIATION.value,
+            normalized_status=order.status,
+            broker_status=order.last_error_code,
+            error_classification=classification,
+            retryable=order.last_error_retryable,
+            message=reason,
+            payload={
+                "classification": classification.replace("_", "-"),
+                "reason": reason,
+                "status": order.status,
+                "broker_order_id": order.broker_order_id,
+                "idempotency_key": order.idempotency_key,
+                "last_broker_sync_at": _serialize_datetime(order.last_broker_sync_at),
+                "result": _json_safe_value(result) if result is not None else None,
+            },
+            observed_at=observed_at,
+        )
     )
 
 
