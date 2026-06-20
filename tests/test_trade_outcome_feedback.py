@@ -655,6 +655,40 @@ def test_candidate_rule_replay_flags_low_sample_size(tmp_path) -> None:
     engine.dispose()
 
 
+def test_high_volatility_replay_matches_watch_buy_atr_aliases(tmp_path) -> None:
+    engine, session = _session()
+    settings = Settings(runtime_mode="paper", trade_outcome_feedback_dir=str(tmp_path))
+    plan = ExecutionPlan(id="plan-replay-atr-aliases", external_plan_id="plan-replay-atr-aliases", source="kai-trading-core", mode="paper")
+    session.add(plan)
+    for index, alias in enumerate(("atr_pct_14", "atr14_pct")):
+        _add_closed_trade(
+            session,
+            plan=plan,
+            suffix=f"volatile-alias-{index}",
+            symbol=f"ATR{index}",
+            buy_price="100",
+            sell_price="90",
+            filled_day=10 + index,
+            risk_context={alias: "12.5"},
+        )
+    session.commit()
+
+    report = generate_trade_outcome_feedback(settings=settings, db=session, as_of=datetime(2026, 6, 20, tzinfo=UTC))
+
+    closed_by_symbol = {row["symbol"]: row for row in report["closed_trades"]}
+    assert closed_by_symbol["ATR0"]["candidate_rule_context"]["atr_pct_14"] == "12.5"
+    assert closed_by_symbol["ATR1"]["candidate_rule_context"]["atr14_pct"] == "12.5"
+    rules = {row["rule_id"]: row for row in report["candidate_rule_replay"]["rules"]}
+    high_volatility = rules["high_volatility_downsize"]
+    assert high_volatility["matched_trade_count"] == 2
+    assert high_volatility["gross_pnl_delta_krw"] == "100.0000"
+    evidence_fields = {row["evidence"]["field"] for row in high_volatility["top_avoided_losers"]}
+    assert evidence_fields == {"atr_pct_14", "atr14_pct"}
+
+    session.close()
+    engine.dispose()
+
+
 def test_candidate_rule_replay_metrics_include_win_rate_and_drawdown_proxy(tmp_path) -> None:
     engine, session = _session()
     settings = Settings(runtime_mode="paper", trade_outcome_feedback_dir=str(tmp_path))
