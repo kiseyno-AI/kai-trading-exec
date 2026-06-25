@@ -32,6 +32,7 @@ from app.services.risk_sizing import (
     effective_stop_price,
     resolve_risk_based_buy_quantity,
 )
+from app.services.market_regime_guardrails import market_regime_context_from_item_payloads
 from app.services.runtime_controls import (
     automated_order_submission_allowed,
     automated_order_submission_block_reason,
@@ -3590,6 +3591,8 @@ def _resolve_watch_buy_order(
             db=db,
             market_date=item.plan.market_date,
         ),
+        market_regime_context=market_regime_context_from_item_payloads(item.risk_context, item.quantity_policy),
+        market_date=item.plan.market_date,
     )
     if isinstance(risk_decision, RiskSizingRejection):
         details = dict(risk_decision.details)
@@ -3617,6 +3620,9 @@ def _resolve_watch_buy_order(
         "cash_quantity": risk_decision.cash_quantity,
         "recorded_at": datetime.now(UTC).isoformat(),
     }
+    market_regime_guardrail = risk_decision.cap_details.get("market_regime_guardrail")
+    if isinstance(market_regime_guardrail, dict):
+        event["market_regime_guardrail"] = market_regime_guardrail
     if requested_quantity is not None:
         event["requested_quantity"] = requested_quantity
     if sizing_source is not None:

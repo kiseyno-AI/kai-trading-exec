@@ -207,6 +207,23 @@ Short-term exec risk settings currently supported:
 - `KAI_EXEC_VOL_CORR_HIGH_CORRELATION_MULTIPLIER`
 - `KAI_EXEC_VOL_CORR_MISSING_DATA_BEHAVIOR`
 - `KAI_EXEC_VOL_CORR_MISSING_DATA_MULTIPLIER`
+- `KAI_EXEC_MARKET_REGIME_GUARD_ENABLED`
+- `KAI_EXEC_MARKET_REGIME_CAUTION_UP_RATIO_THRESHOLD`
+- `KAI_EXEC_MARKET_REGIME_NORMAL_UP_RATIO_THRESHOLD`
+- `KAI_EXEC_MARKET_REGIME_RISK_OFF_UP_RATIO_THRESHOLD`
+- `KAI_EXEC_MARKET_REGIME_CAUTION_ADVANCE_DECLINE_THRESHOLD`
+- `KAI_EXEC_MARKET_REGIME_RISK_OFF_ADVANCE_DECLINE_THRESHOLD`
+- `KAI_EXEC_MARKET_REGIME_BREADTH_MAX_AGE_SECONDS`
+- `KAI_EXEC_MARKET_REGIME_MISSING_BREADTH_BEHAVIOR`
+- `KAI_EXEC_MARKET_REGIME_LIVE_MISSING_BREADTH_BEHAVIOR`
+- `KAI_EXEC_MARKET_REGIME_STALE_BREADTH_BEHAVIOR`
+- `KAI_EXEC_MARKET_REGIME_CAUTION_SIZING_MULTIPLIER`
+- `KAI_EXEC_MARKET_REGIME_CAUTION_MAX_NOTIONAL_KRW`
+- `KAI_EXEC_MARKET_REGIME_SECTOR_WEAK_BEHAVIOR`
+- `KAI_EXEC_MARKET_REGIME_SECTOR_WEAK_MULTIPLIER`
+- `KAI_EXEC_MARKET_REGIME_SECTOR_WEAK_MAX_NOTIONAL_KRW`
+- `KAI_EXEC_MARKET_REGIME_SECTOR_WEAK_PERCENTILE_THRESHOLD`
+- `KAI_EXEC_MARKET_REGIME_SECTOR_WEAK_RELATIVE_RETURN_PCT`
 - `KAI_EXEC_TRADE_OUTCOME_FEEDBACK_ENABLED`
 - `KAI_EXEC_TRADE_OUTCOME_FEEDBACK_DIR`
 - `KAI_EXEC_TRADE_OUTCOME_FEEDBACK_LOOKBACK_DAYS`
@@ -229,6 +246,18 @@ Volatility/correlation buy sizing caps are disabled by default. When enabled,
 they can reduce but never increase the existing buy quantity using supplied
 recent return, realized-volatility, and holding-correlation context; missing
 data is neutral unless `KAI_EXEC_VOL_CORR_MISSING_DATA_BEHAVIOR=conservative`.
+
+Market-regime guardrails are enabled by default for automated Korean-equity
+buy sizing and approval paths. Normal breadth keeps baseline sizing, caution
+breadth downsizes with the configured multiplier/cap, and risk-off breadth
+rejects new automated buys with an auditable reason code. Missing market
+breadth is neutral with a warning in mock/paper by default, but becomes caution
+for live automation; stale breadth also becomes caution by default. Missing
+sector context warns and prevents elevated sizing, while configured weak sector
+signals or same-sector crowding downsize by default and can be set to reject.
+Every affected decision records a `market_regime_guardrail` audit payload with
+the posture, reason, breadth/sector inputs, freshness/source fields, action,
+and original versus adjusted sizing.
 
 Trade outcome feedback can be generated from stored broker fills with:
 
