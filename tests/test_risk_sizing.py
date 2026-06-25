@@ -231,6 +231,34 @@ def test_risk_sizing_caution_market_breadth_downsizes_quantity() -> None:
     assert guardrail["multiplier"] == "0.5000"
 
 
+def test_risk_sizing_below_normal_market_breadth_downsizes_quantity() -> None:
+    decision = resolve_risk_based_buy_quantity(
+        settings=Settings(),
+        account_basis=Decimal("10000000"),
+        available_cash=Decimal("10000000"),
+        entry_price=Decimal("100000"),
+        stop_price=Decimal("95000"),
+        confidence=Decimal("0.70"),
+        market_regime_context={
+            "market_breadth": {
+                "market": "KOSPI",
+                "market_date": "2026-06-25",
+                "up_ratio": "0.42",
+                "advance_decline_ratio": "1.10",
+            }
+        },
+        market_date="2026-06-25",
+    )
+
+    assert isinstance(decision, RiskSizingResult)
+    assert decision.quantity == 15
+    guardrail = decision.cap_details["market_regime_guardrail"]
+    assert guardrail["market_regime_posture"] == "caution"
+    assert guardrail["market_regime_reason_code"] == "market_breadth_below_normal"
+    assert guardrail["action"] == "downsize"
+    assert guardrail["multiplier"] == "0.5000"
+
+
 def test_risk_sizing_risk_off_market_breadth_rejects_buy() -> None:
     decision = resolve_risk_based_buy_quantity(
         settings=Settings(),
@@ -280,6 +308,33 @@ def test_risk_sizing_missing_market_breadth_in_live_automation_downsizes() -> No
     assert guardrail["market_regime_posture"] == "caution"
     assert guardrail["market_regime_reason_code"] == "market_breadth_missing_caution"
     assert "market_breadth_missing" in guardrail["warnings"]
+
+
+def test_risk_sizing_stale_market_breadth_neutral_behavior_preserves_quantity() -> None:
+    decision = resolve_risk_based_buy_quantity(
+        settings=Settings(market_regime_stale_breadth_behavior="neutral_with_warning"),
+        account_basis=Decimal("10000000"),
+        available_cash=Decimal("10000000"),
+        entry_price=Decimal("100000"),
+        stop_price=Decimal("95000"),
+        confidence=Decimal("0.70"),
+        market_regime_context={
+            "market_breadth": {
+                "market": "KOSPI",
+                "market_date": "2026-06-24",
+                "up_ratio": "0.25",
+            }
+        },
+        market_date="2026-06-25",
+    )
+
+    assert isinstance(decision, RiskSizingResult)
+    assert decision.quantity == 30
+    guardrail = decision.cap_details["market_regime_guardrail"]
+    assert guardrail["market_regime_posture"] == "unavailable"
+    assert guardrail["market_regime_reason_code"] == "market_breadth_stale_neutral"
+    assert guardrail["action"] == "allow"
+    assert "market_breadth_stale" in guardrail["warnings"]
 
 
 def test_risk_sizing_sector_weakness_downsizes_buy() -> None:

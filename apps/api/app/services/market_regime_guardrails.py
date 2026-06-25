@@ -108,7 +108,11 @@ def evaluate_market_regime_guardrail(
             cap_notional,
             _positive_decimal(settings.market_regime_sector_weak_max_notional_krw),
         )
-        if reason_code in {"market_breadth_normal", "market_breadth_missing_neutral"}:
+        if reason_code in {
+            "market_breadth_normal",
+            "market_breadth_missing_neutral",
+            "market_breadth_stale_neutral",
+        }:
             reason_code = sector_reason
     adjusted_notional = _adjusted_notional(
         original_notional=original_notional,
@@ -186,9 +190,13 @@ def _market_posture(
     if _breadth_stale(settings=settings, breadth=breadth, market_date=market_date, evaluated_at=evaluated_at):
         warnings.append("market_breadth_stale")
         behavior = str(settings.market_regime_stale_breadth_behavior).lower()
+        if behavior == "neutral_with_warning":
+            return "unavailable", "market_breadth_stale_neutral"
+        if behavior == "caution":
+            return "caution", "market_breadth_stale_caution"
         if behavior == "risk_off":
             return "risk_off", "market_breadth_stale_risk_off"
-        return "stale", "market_breadth_stale_caution"
+        return "caution", "market_breadth_stale_caution"
 
     up_ratio = _ratio_value(_first_present(breadth, ("up_ratio", "advance_ratio", "advancing_ratio")))
     ad_ratio = _decimal_value(
@@ -225,6 +233,11 @@ def _market_posture(
         and ad_ratio < Decimal(str(settings.market_regime_caution_advance_decline_threshold))
     ):
         return "caution", "market_breadth_caution"
+    if (
+        up_ratio is not None
+        and up_ratio < Decimal(str(settings.market_regime_normal_up_ratio_threshold))
+    ):
+        return "caution", "market_breadth_below_normal"
     return "normal", "market_breadth_normal"
 
 
