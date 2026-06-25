@@ -640,6 +640,10 @@ def monitoring_segments(
         if _is_short_term_decider_item(item)
         and item.side == "buy"
         and item.status in SHORT_TERM_BLOCKED_STATUSES
+        and not (
+            item.status == "watch_buy_triggered_blocked"
+            and _risk_context_text(item, "last_monitoring_event", nested_key="reason") == "paused"
+        )
     ]
     return {
         "held_position_sell_monitoring": _segment_payload(held_sell),

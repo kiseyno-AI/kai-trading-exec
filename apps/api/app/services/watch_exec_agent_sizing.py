@@ -22,6 +22,7 @@ from app.core.config import Settings
 from app.db.sqlite_diagnostics import sqlite_write_lock
 from app.models.runtime import ExecutionPlan, ExecutionPlanItem, ExecutionPlanItemAudit
 from app.services.broker_auth import ensure_authenticated_broker_session
+from app.services.market_regime_guardrails import evaluate_market_regime_guardrail
 from app.services.risk_sizing import apply_vol_corr_quantity_cap
 from app.services.trade_outcome_feedback import load_latest_trade_outcome_feedback_snippet
 
@@ -541,9 +542,45 @@ def _candidate_payload(item: ExecutionPlanItem) -> dict[str, object]:
         "data_quality_warnings": risk_context.get("data_quality_warnings"),
         "supporting_evidence": risk_context.get("supporting_evidence"),
     }
+    payload.update(_market_regime_guardrail_context(risk_context))
     decider_flow_context = _decider_flow_short_sector_context(risk_context)
     if decider_flow_context is not None:
         payload["decider_flow_short_sector_context"] = decider_flow_context
+    return payload
+
+
+def _market_regime_guardrail_context(risk_context: dict[str, object]) -> dict[str, object]:
+    payload: dict[str, object] = {}
+    for key in (
+        "market",
+        "exchange",
+        "market_breadth",
+        "market_context",
+        "sector_context",
+        "sector_peer_context",
+        "sector_peers_context",
+        "market_relative_context",
+    ):
+        if key in risk_context:
+            payload[key] = risk_context[key]
+    pre_decider, _ = _pre_decider_enrichment_context(risk_context)
+    if isinstance(pre_decider, dict):
+        compact_pre_decider = {
+            key: pre_decider[key]
+            for key in ("market_breadth", "sector_peer_context", "sector_peers_context", "market_context")
+            if key in pre_decider
+        }
+        if compact_pre_decider:
+            payload["pre_decider_enrichment_context"] = compact_pre_decider
+    handoff = risk_context.get("decider_handoff_context")
+    if isinstance(handoff, dict):
+        compact_handoff = {
+            key: handoff[key]
+            for key in ("market_breadth", "sector_peer_context", "sector_peers_context", "market_context")
+            if key in handoff
+        }
+        if compact_handoff:
+            payload["decider_handoff_context"] = compact_handoff
     return payload
 
 
@@ -1035,6 +1072,7 @@ def _apply_decisions(
                         "storage": "execution_plan_item_audits",
                     },
                     "allowed_action_envelope": envelope,
+                    "market_regime_guardrail": envelope.get("market_regime_guardrail"),
                     "previous_policy": previous_policy,
                 }
                 item.status = "exec_agent_rejected"
@@ -1059,6 +1097,7 @@ def _apply_decisions(
                 },
                 "sizing_adjustment": sizing["adjustment"],
                 "allowed_action_envelope": envelope,
+                "market_regime_guardrail": envelope.get("market_regime_guardrail"),
                 "previous_policy": previous_policy,
             }
             item.status = "watch_buy_triggered_blocked" if was_triggered_blocked else "watch_monitoring_active"
@@ -1318,6 +1357,23 @@ def _allowed_action_envelope_for_candidate(
         hard_reject_reasons.append("invalid_stop_distance")
 
     max_notional = min(cap_candidates).quantize(Decimal("0.0001"), rounding=ROUND_DOWN)
+    market_guardrail = evaluate_market_regime_guardrail(
+        settings=settings,
+        context=candidate,
+        market_date=candidate.get("market_date"),
+        original_notional=max_notional,
+        reference_price=sizing_price if sizing_price > 0 else None,
+        original_quantity=_floor_quantity(max_notional / sizing_price) if sizing_price > 0 else None,
+        account_context=account_context,
+    )
+    if market_guardrail.rejected:
+        hard_reject_reasons.append(market_guardrail.reason_code)
+        max_notional = Decimal("0")
+    elif market_guardrail.action == "downsize":
+        adjusted = _decimal_value(market_guardrail.audit.get("adjusted_notional_krw"))
+        if adjusted is not None:
+            max_notional = min(max_notional, adjusted).quantize(Decimal("0.0001"), rounding=ROUND_DOWN)
+        soft_warnings.append(market_guardrail.reason_code)
     max_quantity = _floor_quantity(max_notional / sizing_price) if sizing_price > 0 else 0
     if max_quantity <= 0:
         hard_reject_reasons.append("no_buyable_quantity")
@@ -1338,6 +1394,7 @@ def _allowed_action_envelope_for_candidate(
         "open_buy_order_count": open_buy_order_count,
         "hard_reject_reasons": hard_reject_reasons,
         "soft_warnings": soft_warnings,
+        "market_regime_guardrail": market_guardrail.audit,
         "computed_at": datetime.now(UTC).isoformat(),
     }
 

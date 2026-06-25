@@ -96,6 +96,23 @@ class Settings(BaseModel):
     vol_corr_high_correlation_multiplier: Decimal = Field(default=Decimal("0.80"), gt=0, le=1)
     vol_corr_missing_data_behavior: str = "neutral"
     vol_corr_missing_data_multiplier: Decimal = Field(default=Decimal("0.75"), gt=0, le=1)
+    market_regime_guard_enabled: bool = True
+    market_regime_caution_up_ratio_threshold: Decimal = Field(default=Decimal("0.40"), ge=0, le=1)
+    market_regime_normal_up_ratio_threshold: Decimal = Field(default=Decimal("0.45"), ge=0, le=1)
+    market_regime_risk_off_up_ratio_threshold: Decimal = Field(default=Decimal("0.30"), ge=0, le=1)
+    market_regime_caution_advance_decline_threshold: Decimal = Field(default=Decimal("0.80"), ge=0)
+    market_regime_risk_off_advance_decline_threshold: Decimal = Field(default=Decimal("0.50"), ge=0)
+    market_regime_breadth_max_age_seconds: int = Field(default=86400, ge=60, le=604800)
+    market_regime_missing_breadth_behavior: str = "neutral_with_warning"
+    market_regime_live_missing_breadth_behavior: str = "caution"
+    market_regime_stale_breadth_behavior: str = "caution"
+    market_regime_caution_sizing_multiplier: Decimal = Field(default=Decimal("0.50"), gt=0, le=1)
+    market_regime_caution_max_notional_krw: Decimal = Field(default=Decimal("1500000"), ge=0)
+    market_regime_sector_weak_behavior: str = "downsize"
+    market_regime_sector_weak_multiplier: Decimal = Field(default=Decimal("0.50"), ge=0, le=1)
+    market_regime_sector_weak_max_notional_krw: Decimal = Field(default=Decimal("1000000"), ge=0)
+    market_regime_sector_weak_percentile_threshold: Decimal = Field(default=Decimal("0.30"), ge=0, le=1)
+    market_regime_sector_weak_relative_return_pct: Decimal = Field(default=Decimal("-2.0"), ge=Decimal("-100"), le=Decimal("100"))
     trade_outcome_feedback_enabled: bool = True
     trade_outcome_feedback_dir: str = "var/analytics/trade_outcome_feedback"
     trade_outcome_feedback_lookback_days: int = Field(default=20, ge=1, le=365)
@@ -148,6 +165,28 @@ class Settings(BaseModel):
         allowed = {"neutral", "conservative"}
         if normalized not in allowed:
             raise ValueError(f"vol_corr_missing_data_behavior must be one of {sorted(allowed)}")
+        return normalized
+
+    @field_validator(
+        "market_regime_missing_breadth_behavior",
+        "market_regime_live_missing_breadth_behavior",
+        "market_regime_stale_breadth_behavior",
+    )
+    @classmethod
+    def normalize_market_regime_missing_behavior(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        allowed = {"neutral_with_warning", "caution", "risk_off"}
+        if normalized not in allowed:
+            raise ValueError(f"market regime missing/stale behavior must be one of {sorted(allowed)}")
+        return normalized
+
+    @field_validator("market_regime_sector_weak_behavior")
+    @classmethod
+    def normalize_market_regime_sector_weak_behavior(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        allowed = {"downsize", "reject"}
+        if normalized not in allowed:
+            raise ValueError(f"market_regime_sector_weak_behavior must be one of {sorted(allowed)}")
         return normalized
 
 
@@ -236,6 +275,23 @@ _ENV_FIELDS = {
     "VOL_CORR_HIGH_CORRELATION_MULTIPLIER": "vol_corr_high_correlation_multiplier",
     "VOL_CORR_MISSING_DATA_BEHAVIOR": "vol_corr_missing_data_behavior",
     "VOL_CORR_MISSING_DATA_MULTIPLIER": "vol_corr_missing_data_multiplier",
+    "MARKET_REGIME_GUARD_ENABLED": "market_regime_guard_enabled",
+    "MARKET_REGIME_CAUTION_UP_RATIO_THRESHOLD": "market_regime_caution_up_ratio_threshold",
+    "MARKET_REGIME_NORMAL_UP_RATIO_THRESHOLD": "market_regime_normal_up_ratio_threshold",
+    "MARKET_REGIME_RISK_OFF_UP_RATIO_THRESHOLD": "market_regime_risk_off_up_ratio_threshold",
+    "MARKET_REGIME_CAUTION_ADVANCE_DECLINE_THRESHOLD": "market_regime_caution_advance_decline_threshold",
+    "MARKET_REGIME_RISK_OFF_ADVANCE_DECLINE_THRESHOLD": "market_regime_risk_off_advance_decline_threshold",
+    "MARKET_REGIME_BREADTH_MAX_AGE_SECONDS": "market_regime_breadth_max_age_seconds",
+    "MARKET_REGIME_MISSING_BREADTH_BEHAVIOR": "market_regime_missing_breadth_behavior",
+    "MARKET_REGIME_LIVE_MISSING_BREADTH_BEHAVIOR": "market_regime_live_missing_breadth_behavior",
+    "MARKET_REGIME_STALE_BREADTH_BEHAVIOR": "market_regime_stale_breadth_behavior",
+    "MARKET_REGIME_CAUTION_SIZING_MULTIPLIER": "market_regime_caution_sizing_multiplier",
+    "MARKET_REGIME_CAUTION_MAX_NOTIONAL_KRW": "market_regime_caution_max_notional_krw",
+    "MARKET_REGIME_SECTOR_WEAK_BEHAVIOR": "market_regime_sector_weak_behavior",
+    "MARKET_REGIME_SECTOR_WEAK_MULTIPLIER": "market_regime_sector_weak_multiplier",
+    "MARKET_REGIME_SECTOR_WEAK_MAX_NOTIONAL_KRW": "market_regime_sector_weak_max_notional_krw",
+    "MARKET_REGIME_SECTOR_WEAK_PERCENTILE_THRESHOLD": "market_regime_sector_weak_percentile_threshold",
+    "MARKET_REGIME_SECTOR_WEAK_RELATIVE_RETURN_PCT": "market_regime_sector_weak_relative_return_pct",
     "TRADE_OUTCOME_FEEDBACK_ENABLED": "trade_outcome_feedback_enabled",
     "TRADE_OUTCOME_FEEDBACK_DIR": "trade_outcome_feedback_dir",
     "TRADE_OUTCOME_FEEDBACK_LOOKBACK_DAYS": "trade_outcome_feedback_lookback_days",

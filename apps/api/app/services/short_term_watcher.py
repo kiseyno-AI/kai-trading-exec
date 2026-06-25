@@ -15,6 +15,7 @@ from app.models.runtime import BrokerOrder, ExecutionPlan, ExecutionPlanItem, Ex
 from app.services.broker_auth import ensure_authenticated_broker_session
 from app.services.broker_orders import place_broker_order
 from app.services.execution_api import serialize_broker_order
+from app.services.market_regime_guardrails import evaluate_market_regime_guardrail, market_regime_context_from_item_payloads
 from app.services.runtime_controls import (
     automated_order_submission_allowed,
     automated_order_submission_block_reason,
@@ -83,7 +84,7 @@ def evaluate_short_term_watcher_decision(
         account_context=account_context,
         broker_account_snapshot=broker_account_snapshot,
     )
-    context["allowed_action_envelope"] = _allowed_action_envelope(context=context, command=command)
+    context["allowed_action_envelope"] = _allowed_action_envelope(settings=settings, context=context, command=command)
 
     rejection = _validate_candidate(item=item)
     if rejection is None:
@@ -124,6 +125,9 @@ def evaluate_short_term_watcher_decision(
         )
 
     quantity = _resolve_quantity(command=command, reference_price=Decimal(str(context["reference_price"])))
+    envelope = context.get("allowed_action_envelope")
+    if isinstance(envelope, dict):
+        quantity = min(int(quantity or 0), int(envelope.get("max_quantity") or 0))
     assert quantity is not None
     order_preview = _order_preview(item=item, command=command, quantity=quantity)
     monitoring_preview = _monitoring_preview(item=item, command=command, quantity=quantity)
@@ -245,11 +249,14 @@ def _validate_risk_rails(*, command: ShortTermWatcherDecisionRequest, context: d
         if isinstance(hard_reject_reasons, list) and hard_reject_reasons:
             return "allowed_action_envelope_blocked", "allowed action envelope does not permit a buy"
         max_quantity = int(envelope.get("max_quantity") or 0)
-        resolved_quantity = int(context.get("resolved_quantity") or 0)
-        if resolved_quantity > max_quantity:
-            return "allowed_action_envelope_exceeded", "requested quantity exceeds allowed action envelope"
         max_notional = Decimal(str(envelope.get("max_notional_krw") or "0"))
-        if requested_notional > max_notional:
+        if max_quantity <= 0 or max_notional <= 0:
+            return "allowed_action_envelope_blocked", "allowed action envelope left no buyable quantity"
+        market_limited = bool(envelope.get("market_regime_limited"))
+        resolved_quantity = int(context.get("resolved_quantity") or 0)
+        if not market_limited and resolved_quantity > max_quantity:
+            return "allowed_action_envelope_exceeded", "requested quantity exceeds allowed action envelope"
+        if not market_limited and requested_notional > max_notional:
             return "allowed_action_envelope_exceeded", "requested notional exceeds allowed action envelope"
     max_notional = command.agent_output.max_notional or MAX_APPROVED_NOTIONAL
     if max_notional > MAX_APPROVED_NOTIONAL:
@@ -293,10 +300,12 @@ def _candidate_context(
         "open_buy_order_count": len(open_orders) + account_context.open_order_symbols.count(item.symbol),
         "broker_account_source": broker_account_snapshot.source if broker_account_snapshot is not None else "request",
         "open_order_ids": [order.id for order in open_orders],
+        "market_regime_context": market_regime_context_from_item_payloads(item.risk_context, item.quantity_policy),
+        "market_date": item.plan.market_date.isoformat() if item.plan is not None and item.plan.market_date else None,
     }
 
 
-def _allowed_action_envelope(*, context: dict[str, Any], command: ShortTermWatcherDecisionRequest) -> dict[str, Any]:
+def _allowed_action_envelope(*, settings: Settings, context: dict[str, Any], command: ShortTermWatcherDecisionRequest) -> dict[str, Any]:
     reference_price = Decimal(str(context["reference_price"]))
     available_cash = Decimal(str(context["available_cash"]))
     resolved_quantity = int(context["resolved_quantity"] or 0)
@@ -311,6 +320,21 @@ def _allowed_action_envelope(*, context: dict[str, Any], command: ShortTermWatch
         hard_reject_reasons.append("missing_reference_price")
     cash_limited_quantity = int((available_cash / reference_price).quantize(Decimal("1"), rounding=ROUND_DOWN)) if reference_price > 0 else 0
     max_notional = min(available_cash, command.agent_output.max_notional or MAX_APPROVED_NOTIONAL, MAX_APPROVED_NOTIONAL)
+    market_guardrail = evaluate_market_regime_guardrail(
+        settings=settings,
+        context=context.get("market_regime_context") if isinstance(context.get("market_regime_context"), dict) else None,
+        market_date=context.get("market_date"),
+        original_notional=max_notional,
+        reference_price=reference_price,
+        account_context=None,
+    )
+    if market_guardrail.rejected:
+        hard_reject_reasons.append(market_guardrail.reason_code)
+        max_notional = Decimal("0")
+    elif market_guardrail.action == "downsize":
+        adjusted = _decimal(market_guardrail.audit.get("adjusted_notional_krw") or "0")
+        max_notional = min(max_notional, adjusted).quantize(Decimal("0.0001"), rounding=ROUND_DOWN)
+        soft_warnings.append(market_guardrail.reason_code)
     max_quantity = int((max_notional / reference_price).quantize(Decimal("1"), rounding=ROUND_DOWN)) if reference_price > 0 else 0
     if max_quantity <= 0:
         hard_reject_reasons.append("no_buyable_quantity")
@@ -331,6 +355,8 @@ def _allowed_action_envelope(*, context: dict[str, Any], command: ShortTermWatch
         "open_buy_order_count": context["open_buy_order_count"],
         "hard_reject_reasons": hard_reject_reasons,
         "soft_warnings": soft_warnings,
+        "market_regime_guardrail": market_guardrail.audit,
+        "market_regime_limited": market_guardrail.action == "downsize",
         "computed_at": datetime.now(UTC).isoformat(),
     }
 

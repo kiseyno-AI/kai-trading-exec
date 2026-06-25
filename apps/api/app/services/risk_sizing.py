@@ -6,6 +6,7 @@ from math import sqrt
 from typing import Any
 
 from app.core.config import Settings
+from app.services.market_regime_guardrails import evaluate_market_regime_guardrail
 
 
 @dataclass(frozen=True)
@@ -24,14 +25,14 @@ class RiskSizingResult:
     existing_symbol_exposure: Decimal
     exposure_after_trade: Decimal
     daily_budget_remaining: Decimal
-    cap_details: dict[str, str | int | None]
+    cap_details: dict[str, object]
 
 
 @dataclass(frozen=True)
 class RiskSizingRejection:
     reason_code: str
     message: str
-    details: dict[str, str | int | None]
+    details: dict[str, object]
 
 
 RiskSizingDecision = RiskSizingResult | RiskSizingRejection
@@ -65,6 +66,8 @@ def resolve_risk_based_buy_quantity(
     existing_symbol_exposure: Decimal = Decimal("0"),
     daily_new_buy_notional_used: Decimal = Decimal("0"),
     vol_corr_context: dict[str, object] | None = None,
+    market_regime_context: dict[str, object] | None = None,
+    market_date: object | None = None,
 ) -> RiskSizingDecision:
     if account_basis is None or account_basis <= 0:
         return _reject("account_basis_unavailable", "account equity/cash basis is unavailable")
@@ -174,6 +177,24 @@ def resolve_risk_based_buy_quantity(
     )
     if vol_corr_cap_details is not None:
         quantity = int(vol_corr_cap_details["capped_quantity"])
+    market_regime_guardrail = evaluate_market_regime_guardrail(
+        settings=settings,
+        context=market_regime_context,
+        market_date=market_date,
+        original_quantity=quantity,
+        original_notional=entry_price * Decimal(quantity),
+        reference_price=entry_price,
+    )
+    if market_regime_guardrail.rejected:
+        return _reject(
+            market_regime_guardrail.reason_code,
+            "market-regime guardrail rejected this automated buy",
+            market_regime_guardrail=market_regime_guardrail.audit,
+        )
+    if market_regime_guardrail.action == "downsize":
+        adjusted_notional = market_regime_guardrail.audit.get("adjusted_notional_krw")
+        adjusted_quantity = _floor_quantity(Decimal(str(adjusted_notional)) / entry_price) if adjusted_notional else 0
+        quantity = min(quantity, adjusted_quantity)
     if quantity <= 0:
         return _reject(
             "insufficient_cash",
@@ -214,6 +235,7 @@ def resolve_risk_based_buy_quantity(
             "daily_new_buy_notional_used": _text(daily_new_buy_notional_used),
             "baseline_quantity": baseline_quantity,
             **(vol_corr_cap_details or {}),
+            "market_regime_guardrail": market_regime_guardrail.audit,
         },
     )
 
@@ -559,12 +581,12 @@ def _text_value(value: object) -> str | None:
 def _reject(
     reason_code: str,
     message: str,
-    **details: Decimal | int | None,
+    **details: Any,
 ) -> RiskSizingRejection:
     return RiskSizingRejection(
         reason_code=reason_code,
         message=message,
-        details={key: _text(value) for key, value in details.items()},
+        details={key: _text(value) if isinstance(value, Decimal) or isinstance(value, int) or value is None else value for key, value in details.items()},
     )
 
 

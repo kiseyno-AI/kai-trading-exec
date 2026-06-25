@@ -32,6 +32,7 @@ from app.services.risk_sizing import (
     effective_stop_price,
     resolve_risk_based_buy_quantity,
 )
+from app.services.market_regime_guardrails import market_regime_context_from_item_payloads
 from app.services.runtime_controls import RUNTIME_CONTROL_ID, effective_automation_enabled
 
 SHORT_TERM_DECIDER_NAME = "short-term-decider"
@@ -995,6 +996,12 @@ def _decide_candidate(
             agent_contract=agent_contract,
             account_context=account_context,
         ),
+        market_regime_context=market_regime_context_from_item_payloads(
+            agent_contract.context,
+            item.risk_context,
+            item.quantity_policy,
+        ),
+        market_date=item.plan.market_date if item.plan is not None else None,
     )
     if isinstance(risk_sizing, RiskSizingRejection):
         return _reject(
