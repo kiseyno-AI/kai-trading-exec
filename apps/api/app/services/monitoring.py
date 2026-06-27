@@ -4064,7 +4064,11 @@ def _load_watch_buy_cash_reservation(
     if orderable_cash is None:
         return "account snapshot did not include orderable cash"
     already_reserved = _snapshot_open_buy_order_notional(snapshot.open_orders)
-    already_reserved += _local_open_buy_order_notional(settings=settings, db=db)
+    already_reserved += _local_open_buy_order_notional(
+        settings=settings,
+        db=db,
+        snapshot_open_orders=snapshot.open_orders,
+    )
     return WatchBuyCashReservation(
         orderable_cash=orderable_cash,
         already_reserved_notional=already_reserved,
@@ -4084,7 +4088,22 @@ def _snapshot_open_buy_order_notional(open_orders: list[BrokerAccountOpenOrder])
     return total
 
 
-def _local_open_buy_order_notional(*, settings: Settings, db: Session) -> Decimal:
+def _local_open_buy_order_notional(
+    *,
+    settings: Settings,
+    db: Session,
+    snapshot_open_orders: list[BrokerAccountOpenOrder],
+) -> Decimal:
+    snapshot_broker_order_ids = {
+        order.broker_order_id
+        for order in snapshot_open_orders
+        if order.side == "buy" and order.broker_order_id
+    }
+    snapshot_idempotency_keys_without_broker_id = {
+        order.idempotency_key
+        for order in snapshot_open_orders
+        if order.side == "buy" and not order.broker_order_id and order.idempotency_key
+    }
     orders = db.scalars(
         select(BrokerOrder).where(
             BrokerOrder.mode == settings.runtime_mode,
@@ -4094,6 +4113,14 @@ def _local_open_buy_order_notional(*, settings: Settings, db: Session) -> Decima
     ).all()
     total = Decimal("0")
     for order in orders:
+        if order.broker_order_id and order.broker_order_id in snapshot_broker_order_ids:
+            continue
+        if (
+            not order.broker_order_id
+            and order.idempotency_key
+            and order.idempotency_key in snapshot_idempotency_keys_without_broker_id
+        ):
+            continue
         total += _open_buy_order_notional(
             quantity=order.quantity,
             limit_price=order.limit_price,

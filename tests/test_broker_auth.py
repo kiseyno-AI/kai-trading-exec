@@ -3762,6 +3762,7 @@ def test_watch_buy_cycle_reserves_orderable_cash_before_broker_submission() -> N
                 quantity=10,
                 remaining_quantity=10,
                 limit_price=Decimal("75000.00"),
+                broker_order_id="kis-existing-open-buy-1",
             )
         ],
     )
@@ -3785,6 +3786,21 @@ def test_watch_buy_cycle_reserves_orderable_cash_before_broker_submission() -> N
             "trigger_direction": "at_or_above",
         },
     )
+    with app.state.db_session_factory() as session:
+        session.add(
+            BrokerOrder(
+                broker_name="kis",
+                mode="paper",
+                idempotency_key="local-existing-open-buy-1",
+                broker_order_id="kis-existing-open-buy-1",
+                symbol="066570",
+                side="buy",
+                status="open",
+                quantity=10,
+                limit_price=Decimal("75000.00"),
+            )
+        )
+        session.commit()
 
     response = client.post(
         "/monitoring/evaluate",
