@@ -332,7 +332,10 @@ def place_broker_order(
         request_source=request_source,
         route_decision=route_decision,
     )
-    order.response_metadata = placement.response_metadata
+    response_metadata = dict(placement.response_metadata or {})
+    if account_gate_decision is not None:
+        response_metadata["account_drawdown_gate"] = account_gate_decision.summary
+    order.response_metadata = response_metadata
     order.last_error_classification = None
     order.last_error_code = None
     order.last_error_message = None

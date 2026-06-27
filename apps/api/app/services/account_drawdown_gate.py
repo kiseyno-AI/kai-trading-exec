@@ -199,9 +199,12 @@ def latest_account_drawdown_gate_state(
     )
     if audit is None and order is None:
         return {"gated": False, "latest_decision": None}
+    order_occurred_at = (
+        (order.last_broker_sync_at or order.created_at) if order is not None else None
+    )
     if audit is not None and (
-        order is None
-        or audit.occurred_at >= (order.last_broker_sync_at or order.created_at)
+        order_occurred_at is None
+        or _timestamp_for_ordering(audit.occurred_at) >= _timestamp_for_ordering(order_occurred_at)
     ):
         return {
             "gated": True,
@@ -214,7 +217,10 @@ def latest_account_drawdown_gate_state(
             },
         }
     return {
-        "gated": True,
+        "gated": _account_drawdown_decision_is_blocked(
+            summary=(order.response_metadata or {}).get("account_drawdown_gate") or {},
+            payload=order.raw_broker_payload or {},
+        ),
         "latest_decision": {
             "source": "broker_order",
             "occurred_at": (order.last_broker_sync_at or order.created_at).isoformat(),
@@ -253,6 +259,30 @@ def account_drawdown_gate_prompt_summary(gate_state: dict[str, object]) -> str:
         f"metric={summary.get('current_metric')} threshold={summary.get('threshold')} "
         f"baseline={summary.get('baseline_value')}; sells and risk-reduction remain allowed."
     )
+
+
+def _account_drawdown_decision_is_blocked(
+    *,
+    summary: object,
+    payload: object,
+) -> bool:
+    if isinstance(summary, dict) and isinstance(summary.get("blocked"), bool):
+        return bool(summary["blocked"])
+    if isinstance(payload, dict) and isinstance(payload.get("blocked"), bool):
+        return bool(payload["blocked"])
+    if isinstance(payload, dict):
+        decision = payload.get("decision")
+        if isinstance(decision, dict) and isinstance(decision.get("blocked"), bool):
+            return bool(decision["blocked"])
+    if isinstance(summary, dict) and summary.get("gate_name"):
+        return True
+    return True
+
+
+def _timestamp_for_ordering(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value
+    return value.astimezone(UTC).replace(tzinfo=None)
 
 
 def _field_or_payload_decimal(
@@ -436,12 +466,12 @@ def _severe_holding_gate(
 def _holding_loss_pct(holding: BrokerAccountHolding) -> Decimal | None:
     if holding.unrealized_pnl_pct is not None:
         value = holding.unrealized_pnl_pct
-        return -value if value < 0 else value
+        return -value if value < 0 else None
     raw = holding.payload
     for key in ("evlu_pfls_rt", "evlu_erng_rt", "profit_loss_pct"):
         parsed = _parse_decimal(raw.get(key))
         if parsed is not None:
-            return -parsed if parsed < 0 else parsed
+            return -parsed if parsed < 0 else None
     return None
 
 

@@ -1714,6 +1714,117 @@ def test_new_buy_blocked_by_severe_unrealized_holding_loss_but_sell_allowed() ->
     engine.dispose()
 
 
+def test_profitable_holding_unrealized_percent_does_not_block_new_kis_buy() -> None:
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(broker_order_id="kis-profitable-holding-buy-1"),
+        account_snapshot=BrokerAccountSnapshot(
+            available_cash=Decimal("5000000"),
+            observed_at=datetime(2026, 6, 20, 0, 30, tzinfo=UTC),
+            source="stub:account_snapshot",
+            total_asset_value=Decimal("10000000"),
+            previous_total_asset_value=Decimal("10000000"),
+            asset_change_amount=Decimal("0"),
+            unrealized_pnl=Decimal("80000"),
+            holdings=[
+                BrokerAccountHolding(
+                    symbol="005930",
+                    quantity=10,
+                    average_price=Decimal("100000"),
+                    unrealized_pnl=Decimal("80000"),
+                    unrealized_pnl_pct=Decimal("8.0"),
+                    payload={"evlu_pfls_amt": "80000", "evlu_pfls_rt": "8.0"},
+                )
+            ],
+            payload={
+                "balance": {
+                    "output1": [
+                        {"pdno": "005930", "evlu_pfls_amt": "80000", "evlu_pfls_rt": "8.0"}
+                    ],
+                    "output2": [
+                        {
+                            "tot_evlu_amt": "10000000",
+                            "bfdy_tot_asst_evlu_amt": "10000000",
+                            "asst_icdc_amt": "0",
+                            "evlu_pfls_smtl_amt": "80000",
+                        }
+                    ],
+                }
+            },
+        ),
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+        ),
+        broker_adapter=broker_adapter,
+    )
+    client = TestClient(app)
+    assert client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "console", "reason": "enable automation"},
+    ).status_code == 200
+    plan_response = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-profitable-holding-1",
+            "source": "kai-trading-core",
+            "items": [
+                {
+                    "symbol": "000660",
+                    "side": "buy",
+                    "intent": "watch_buy",
+                    "limit_price": "100000.00",
+                }
+            ],
+        },
+    )
+    plan_item_id = plan_response.json()["persisted_execution_item_ids"][0]
+
+    response = client.post(
+        "/orders",
+        json={
+            "idempotency_key": "profitable-holding-buy-1",
+            "execution_plan_item_id": plan_item_id,
+            "symbol": "000660",
+            "side": "buy",
+            "quantity": 1,
+            "order_type": "limit",
+            "limit_price": "100000.00",
+            "time_in_force": "day",
+            "exchange": "KRX",
+        },
+    )
+
+    assert response.status_code == 201
+    assert len(broker_adapter.order_calls) == 1
+    gate_summary = response.json()["order"]["response_metadata"]["account_drawdown_gate"]
+    assert gate_summary["blocked"] is False
+
+    with app.state.db_session_factory() as session:
+        assert (
+            session.scalar(
+                select(ExecutionPlanItemAudit).where(
+                    ExecutionPlanItemAudit.execution_plan_item_id == plan_item_id,
+                    ExecutionPlanItemAudit.event_type == "account_drawdown_new_buy_blocked",
+                )
+            )
+            is None
+        )
+
+    engine.dispose()
+
+
 def test_place_order_endpoint_routes_nxt_pre_when_enabled() -> None:
     broker_adapter = StubBrokerAdapter(
         config=BrokerConfig(
