@@ -206,7 +206,7 @@ class StubBrokerAdapter:
             payload={"output": {"stck_prpr": str(price)}},
         )
 
-    def get_account_snapshot(self, access_token: str) -> BrokerAccountSnapshot:
+    def get_account_snapshot(self, access_token: str, **_kwargs: object) -> BrokerAccountSnapshot:
         assert access_token
         if self.account_snapshot_error is not None:
             raise self.account_snapshot_error
@@ -216,6 +216,10 @@ class StubBrokerAdapter:
             available_cash=Decimal("1000000.00"),
             observed_at=datetime.now(UTC),
             source="stub:account_snapshot",
+            total_asset_value=Decimal("10000000"),
+            previous_total_asset_value=Decimal("10000000"),
+            asset_change_amount=Decimal("0"),
+            unrealized_pnl=Decimal("0"),
         )
 
     def reconnect_handle(self) -> BrokerReconnectHandle:
@@ -654,7 +658,15 @@ def test_kis_adapter_fetches_account_snapshot() -> None:
                     "ord_psbl_qty": "3",
                 }
             ],
-            "output2": [{"ord_psbl_cash": "1000000"}],
+            "output2": [
+                {
+                    "ord_psbl_cash": "1000000",
+                    "tot_evlu_amt": "9900000",
+                    "bfdy_tot_asst_evlu_amt": "10000000",
+                    "asst_icdc_amt": "-100000",
+                    "evlu_pfls_smtl_amt": "-50000",
+                }
+            ],
         },
     )
     adapter = KisBrokerAdapter(
@@ -676,6 +688,10 @@ def test_kis_adapter_fetches_account_snapshot() -> None:
     assert http_client.get_calls[0]["headers"]["tr_id"] == "VTTC8434R"
     assert http_client.get_calls[1]["headers"]["tr_id"] == "VTTC8001R"
     assert snapshot.available_cash == Decimal("1000000")
+    assert snapshot.total_asset_value == Decimal("9900000")
+    assert snapshot.previous_total_asset_value == Decimal("10000000")
+    assert snapshot.asset_change_amount == Decimal("-100000")
+    assert snapshot.unrealized_pnl == Decimal("-50000")
     assert snapshot.holdings[0].symbol == "005930"
     assert snapshot.holdings[0].quantity == 3
 
@@ -1417,6 +1433,284 @@ def test_place_order_endpoint_persists_normalized_order_and_events() -> None:
         assert plan_item is not None
         assert plan_item.status == "broker_order_submitted"
 
+    engine.dispose()
+
+
+def test_new_buy_blocked_by_large_total_asset_drawdown_despite_small_fifo_loss() -> None:
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(),
+        account_snapshot=BrokerAccountSnapshot(
+            available_cash=Decimal("5000000"),
+            observed_at=datetime(2026, 6, 20, 0, 30, tzinfo=UTC),
+            source="stub:account_snapshot",
+            total_asset_value=Decimal("9800000"),
+            previous_total_asset_value=Decimal("10000000"),
+            asset_change_amount=Decimal("-200000"),
+            unrealized_pnl=Decimal("-50000"),
+            payload={
+                "balance": {
+                    "output2": [
+                        {
+                            "tot_evlu_amt": "9800000",
+                            "bfdy_tot_asst_evlu_amt": "10000000",
+                            "asst_icdc_amt": "-200000",
+                            "evlu_pfls_smtl_amt": "-50000",
+                        }
+                    ]
+                }
+            },
+        ),
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+        ),
+        broker_adapter=broker_adapter,
+    )
+    client = TestClient(app)
+    assert client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "console", "reason": "enable automation"},
+    ).status_code == 200
+
+    plan_response = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-drawdown-block-1",
+            "source": "kai-trading-core",
+            "items": [
+                {
+                    "symbol": "005930",
+                    "side": "buy",
+                    "intent": "next_open_buy",
+                    "limit_price": "71000.00",
+                    "time_in_force": "day",
+                }
+            ],
+        },
+    )
+    plan_item_id = plan_response.json()["persisted_execution_item_ids"][0]
+    with app.state.db_session_factory() as session:
+        order = BrokerOrder(
+            broker_name="kis",
+            execution_plan_item_id=plan_item_id,
+            mode="paper",
+            idempotency_key="prior-small-loss-buy",
+            symbol="005930",
+            side="buy",
+            status="filled",
+            quantity=1,
+            limit_price=Decimal("71000"),
+        )
+        session.add(order)
+        session.flush()
+        session.add_all(
+            [
+                ExecutionFill(
+                    broker_order_pk=order.id,
+                    broker_fill_id="small-loss-buy-fill",
+                    symbol="005930",
+                    side="buy",
+                    quantity=1,
+                    price=Decimal("71000"),
+                    filled_at=datetime(2026, 6, 20, 0, 0, tzinfo=UTC),
+                ),
+                ExecutionFill(
+                    broker_order_pk=order.id,
+                    broker_fill_id="small-loss-sell-fill",
+                    symbol="005930",
+                    side="sell",
+                    quantity=1,
+                    price=Decimal("70900"),
+                    filled_at=datetime(2026, 6, 20, 0, 5, tzinfo=UTC),
+                ),
+            ]
+        )
+        session.commit()
+
+    response = client.post(
+        "/orders",
+        json={
+            "idempotency_key": "drawdown-blocked-buy-1",
+            "execution_plan_item_id": plan_item_id,
+            "symbol": "005930",
+            "side": "buy",
+            "quantity": 5,
+            "order_type": "limit",
+            "limit_price": "71000.00",
+            "time_in_force": "day",
+            "exchange": "KRX",
+        },
+    )
+
+    assert response.status_code == 409
+    payload = response.json()
+    assert payload["blocked"] is True
+    assert payload["block_reason"] == "daily_total_asset_drawdown_pct"
+    assert payload["account_drawdown_gate"]["current_metric"] == "2.0000"
+    assert payload["account_drawdown_gate"]["threshold"] == "1.0000"
+    assert payload["sells_risk_reduction_allowed"] is True
+    assert broker_adapter.order_calls == []
+
+    with app.state.db_session_factory() as session:
+        audit = session.scalar(
+            select(ExecutionPlanItemAudit).where(
+                ExecutionPlanItemAudit.execution_plan_item_id == plan_item_id,
+                ExecutionPlanItemAudit.event_type == "account_drawdown_new_buy_blocked",
+            )
+        )
+        assert audit is not None
+        assert audit.summary["gate_name"] == "daily_total_asset_drawdown_pct"
+        order = session.scalar(
+            select(BrokerOrder).where(BrokerOrder.idempotency_key == "drawdown-blocked-buy-1")
+        )
+        assert order is not None
+        assert order.status == "rejected"
+
+    board = client.get("/runtime/daily-board").json()
+    assert board["account_drawdown_gate"]["gated"] is True
+    assert (
+        board["account_drawdown_gate"]["latest_decision"]["summary"]["gate_name"]
+        == "daily_total_asset_drawdown_pct"
+    )
+    runtime_status = client.get("/runtime/status").json()
+    assert runtime_status["account_drawdown_gate"]["gated"] is True
+    assert (
+        runtime_status["account_drawdown_gate"]["latest_decision"]["summary"]["gate_name"]
+        == "daily_total_asset_drawdown_pct"
+    )
+    engine.dispose()
+
+
+def test_new_buy_blocked_by_severe_unrealized_holding_loss_but_sell_allowed() -> None:
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(broker_order_id="kis-sell-allowed-1"),
+        account_snapshot=BrokerAccountSnapshot(
+            available_cash=Decimal("5000000"),
+            observed_at=datetime(2026, 6, 20, 0, 30, tzinfo=UTC),
+            source="stub:account_snapshot",
+            total_asset_value=Decimal("10000000"),
+            previous_total_asset_value=Decimal("10000000"),
+            asset_change_amount=Decimal("0"),
+            unrealized_pnl=Decimal("-50000"),
+            holdings=[
+                BrokerAccountHolding(
+                    symbol="005930",
+                    quantity=10,
+                    average_price=Decimal("100000"),
+                    unrealized_pnl=Decimal("-80000"),
+                    unrealized_pnl_pct=Decimal("-8.0"),
+                    payload={"evlu_pfls_amt": "-80000", "evlu_pfls_rt": "-8.0"},
+                )
+            ],
+            payload={
+                "balance": {
+                    "output1": [{"pdno": "005930", "evlu_pfls_amt": "-80000", "evlu_pfls_rt": "-8.0"}],
+                    "output2": [
+                        {
+                            "tot_evlu_amt": "10000000",
+                            "bfdy_tot_asst_evlu_amt": "10000000",
+                            "asst_icdc_amt": "0",
+                            "evlu_pfls_smtl_amt": "-50000",
+                        }
+                    ],
+                }
+            },
+        ),
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+        ),
+        broker_adapter=broker_adapter,
+    )
+    client = TestClient(app)
+    assert client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "console", "reason": "enable automation"},
+    ).status_code == 200
+    plan_response = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-severe-holding-loss-1",
+            "source": "kai-trading-core",
+            "items": [
+                {"symbol": "000660", "side": "buy", "intent": "watch_buy", "limit_price": "100000.00"},
+                {"symbol": "005930", "side": "sell", "intent": "stop_sell", "limit_price": "90000.00"},
+            ],
+        },
+    )
+    buy_item_id, sell_item_id = plan_response.json()["persisted_execution_item_ids"]
+
+    buy_response = client.post(
+        "/orders",
+        json={
+            "idempotency_key": "severe-holding-blocked-buy-1",
+            "execution_plan_item_id": buy_item_id,
+            "symbol": "000660",
+            "side": "buy",
+            "quantity": 1,
+            "order_type": "limit",
+            "limit_price": "100000.00",
+            "time_in_force": "day",
+            "exchange": "KRX",
+        },
+    )
+    assert buy_response.status_code == 409
+    assert buy_response.json()["block_reason"] == "severe_holding_unrealized_loss_pct"
+    assert broker_adapter.order_calls == []
+
+    sell_response = client.post(
+        "/orders",
+        json={
+            "idempotency_key": "severe-holding-sell-allowed-1",
+            "execution_plan_item_id": sell_item_id,
+            "symbol": "005930",
+            "side": "sell",
+            "quantity": 1,
+            "order_type": "limit",
+            "limit_price": "90000.00",
+            "time_in_force": "day",
+            "exchange": "KRX",
+            "metadata": {"order_purpose": "risk_reduction"},
+        },
+    )
+    assert sell_response.status_code == 201
+    assert len(broker_adapter.order_calls) == 1
+    assert broker_adapter.order_calls[0].side == "sell"
+
+    with app.state.db_session_factory() as session:
+        audit = session.scalar(
+            select(ExecutionPlanItemAudit).where(
+                ExecutionPlanItemAudit.execution_plan_item_id == buy_item_id,
+                ExecutionPlanItemAudit.event_type == "account_drawdown_new_buy_blocked",
+            )
+        )
+        assert audit is not None
+        assert audit.summary["gate_name"] == "severe_holding_unrealized_loss_pct"
+        assert audit.payload["all_blockers"][0]["holding_symbol"] == "005930"
     engine.dispose()
 
 

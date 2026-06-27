@@ -85,6 +85,16 @@ class Settings(BaseModel):
     exec_agent_watch_sizing_high_conviction_min_notional_krw: Decimal = Field(default=Decimal("1500000"), ge=0)
     exec_agent_watch_sizing_high_conviction_threshold: Decimal = Field(default=Decimal("0.65"), ge=0, le=1)
     exec_agent_watch_sizing_fallback_account_basis_krw: Decimal = Field(default=Decimal("10000000"), gt=0)
+    account_drawdown_gate_enabled: bool = True
+    account_daily_total_asset_drawdown_pct: Decimal = Field(default=Decimal("1.0"), ge=0, le=Decimal("100"))
+    account_daily_total_asset_drawdown_krw: Decimal = Field(default=Decimal("100000"), ge=0)
+    account_weekly_total_asset_drawdown_pct: Decimal = Field(default=Decimal("2.0"), ge=0, le=Decimal("100"))
+    account_weekly_total_asset_baseline_krw: Decimal = Field(default=Decimal("0"), ge=0)
+    account_weekly_total_asset_baseline_at: str | None = None
+    account_unrealized_loss_abs_krw: Decimal = Field(default=Decimal("100000"), ge=0)
+    account_unrealized_loss_pct: Decimal = Field(default=Decimal("1.0"), ge=0, le=Decimal("100"))
+    account_severe_holding_loss_pct: Decimal = Field(default=Decimal("7.0"), ge=0, le=Decimal("100"))
+    account_severe_holding_loss_abs_krw: Decimal = Field(default=Decimal("0"), ge=0)
     vol_corr_sizing_enabled: bool = False
     vol_corr_volatility_lookback_days: int = Field(default=20, ge=2, le=252)
     vol_corr_min_return_observations: int = Field(default=10, ge=2, le=252)
@@ -264,6 +274,16 @@ _ENV_FIELDS = {
     "EXEC_AGENT_WATCH_SIZING_HIGH_CONVICTION_MIN_NOTIONAL_KRW": "exec_agent_watch_sizing_high_conviction_min_notional_krw",
     "EXEC_AGENT_WATCH_SIZING_HIGH_CONVICTION_THRESHOLD": "exec_agent_watch_sizing_high_conviction_threshold",
     "EXEC_AGENT_WATCH_SIZING_FALLBACK_ACCOUNT_BASIS_KRW": "exec_agent_watch_sizing_fallback_account_basis_krw",
+    "ACCOUNT_DRAWDOWN_GATE_ENABLED": "account_drawdown_gate_enabled",
+    "ACCOUNT_DAILY_TOTAL_ASSET_DRAWDOWN_PCT": "account_daily_total_asset_drawdown_pct",
+    "ACCOUNT_DAILY_TOTAL_ASSET_DRAWDOWN_KRW": "account_daily_total_asset_drawdown_krw",
+    "ACCOUNT_WEEKLY_TOTAL_ASSET_DRAWDOWN_PCT": "account_weekly_total_asset_drawdown_pct",
+    "ACCOUNT_WEEKLY_TOTAL_ASSET_BASELINE_KRW": "account_weekly_total_asset_baseline_krw",
+    "ACCOUNT_WEEKLY_TOTAL_ASSET_BASELINE_AT": "account_weekly_total_asset_baseline_at",
+    "ACCOUNT_UNREALIZED_LOSS_ABS_KRW": "account_unrealized_loss_abs_krw",
+    "ACCOUNT_UNREALIZED_LOSS_PCT": "account_unrealized_loss_pct",
+    "ACCOUNT_SEVERE_HOLDING_LOSS_PCT": "account_severe_holding_loss_pct",
+    "ACCOUNT_SEVERE_HOLDING_LOSS_ABS_KRW": "account_severe_holding_loss_abs_krw",
     "VOL_CORR_SIZING_ENABLED": "vol_corr_sizing_enabled",
     "VOL_CORR_VOLATILITY_LOOKBACK_DAYS": "vol_corr_volatility_lookback_days",
     "VOL_CORR_MIN_RETURN_OBSERVATIONS": "vol_corr_min_return_observations",

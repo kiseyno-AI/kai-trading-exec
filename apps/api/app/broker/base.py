@@ -108,6 +108,8 @@ class BrokerAccountHolding:
     quantity: int
     average_price: Decimal | None = None
     sellable_quantity: int | None = None
+    unrealized_pnl: Decimal | None = None
+    unrealized_pnl_pct: Decimal | None = None
     payload: dict[str, Any] = field(default_factory=dict)
 
 
@@ -144,6 +146,10 @@ class BrokerAccountSnapshot:
     observed_at: datetime = field(default_factory=datetime.utcnow)
     source: str = "compat:unknown"
     buying_power: Decimal | None = None
+    total_asset_value: Decimal | None = None
+    previous_total_asset_value: Decimal | None = None
+    asset_change_amount: Decimal | None = None
+    unrealized_pnl: Decimal | None = None
     holdings: list[BrokerAccountHolding] = field(default_factory=list)
     positions: list[BrokerAccountPosition] = field(default_factory=list)
     open_orders: list[BrokerAccountOpenOrder] = field(default_factory=list)

@@ -15,6 +15,11 @@ from sqlalchemy.orm import Session, selectinload
 from app.core.config import Settings, load_settings
 from app.db.session import create_db_engine, create_session_factory
 from app.models.runtime import BrokerOrder, ExecutionFill, ExecutionPlanItem, ExecutionPosition
+from app.services.account_drawdown_gate import (
+    account_drawdown_gate_prompt_summary,
+    account_drawdown_gate_report_lines,
+    latest_account_drawdown_gate_state,
+)
 
 REPORT_VERSION = "trade-outcome-feedback-v1"
 MIN_CANDIDATE_RULE_SAMPLE_SIZE = 3
@@ -88,6 +93,7 @@ def generate_trade_outcome_feedback(
         closed_trades=closed_trades,
         as_of=now,
     )
+    account_drawdown_gate = latest_account_drawdown_gate_state(settings=settings, db=db)
     candidate_rule_replay = _candidate_rule_replay(settings=settings, closed_trades=closed_trades)
     snippet = _snippet(
         summary=summary,
@@ -95,6 +101,7 @@ def generate_trade_outcome_feedback(
         portfolio_risk=portfolio_risk,
         candidate_rule_replay=candidate_rule_replay,
         broker_asset_performance=broker_asset_performance,
+        account_drawdown_gate=account_drawdown_gate,
     )
     report_date = now.astimezone(UTC).date()
     report: dict[str, object] = {
@@ -107,6 +114,7 @@ def generate_trade_outcome_feedback(
         "summary": summary,
         "broker_asset_performance": broker_asset_performance,
         "portfolio_risk": portfolio_risk,
+        "account_drawdown_gate": account_drawdown_gate,
         "closed_trades": closed_trades,
         "lessons": lessons,
         "candidate_rule_replay": candidate_rule_replay,
@@ -1289,6 +1297,7 @@ def _snippet(
     portfolio_risk: dict[str, object],
     candidate_rule_replay: dict[str, object],
     broker_asset_performance: dict[str, object],
+    account_drawdown_gate: dict[str, object],
 ) -> dict[str, object]:
     hard_gates = []
     for row in lessons.get("patterns_to_downsize_or_reject", []):
@@ -1317,6 +1326,7 @@ def _snippet(
         )
     return {
         "summary": snippet_summary,
+        "account_drawdown_gate": account_drawdown_gate_prompt_summary(account_drawdown_gate),
         "patterns_to_downsize_or_reject": hard_gates[:6],
         "positive_expectancy_patterns": lessons.get("positive_expectancy_patterns", []),
         "broker_asset_warnings": _broker_asset_warning_lines(broker_asset_performance),
@@ -1413,6 +1423,7 @@ def _markdown_report(report: dict[str, object]) -> str:
     snippet = report.get("prompt_snippet") if isinstance(report.get("prompt_snippet"), dict) else {}
     broker_asset = report.get("broker_asset_performance") if isinstance(report.get("broker_asset_performance"), dict) else {}
     portfolio_risk = report.get("portfolio_risk") if isinstance(report.get("portfolio_risk"), dict) else {}
+    account_drawdown_gate = report.get("account_drawdown_gate") if isinstance(report.get("account_drawdown_gate"), dict) else {}
     candidate_rule_replay = report.get("candidate_rule_replay") if isinstance(report.get("candidate_rule_replay"), dict) else {}
     lines = [
         f"# Trade Outcome Feedback {str(report.get('generated_at'))[:10]}",
@@ -1435,6 +1446,10 @@ def _markdown_report(report: dict[str, object]) -> str:
         f"- FIFO 실현손익(보조 지표): {summary.get('realized_pnl_krw')} KRW",
         f"- 승/패: {summary.get('win_count')}승 / {summary.get('loss_count')}패",
         "- 근거: execution_positions.raw_payload.balance.output2, execution_positions.raw_payload.balance.output1, execution_fills, broker_orders",
+        "",
+        "### Account Drawdown Gate",
+        "",
+        *[f"- {line}" for line in account_drawdown_gate_report_lines(account_drawdown_gate)],
         "",
         "### Broker Total Asset Performance",
         "",

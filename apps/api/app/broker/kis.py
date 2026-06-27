@@ -616,10 +616,15 @@ class KisBrokerAdapter(BrokerAdapter):
                 observed_at=observed_at,
             )
 
+        balance_summary = _parse_balance_summary(balance_response.payload)
         return BrokerAccountSnapshot(
             available_cash=available_cash,
             observed_at=observed_at,
             source=f"{self.provider}:account_snapshot",
+            total_asset_value=balance_summary.get("total_asset_value"),
+            previous_total_asset_value=balance_summary.get("previous_total_asset_value"),
+            asset_change_amount=balance_summary.get("asset_change_amount"),
+            unrealized_pnl=balance_summary.get("unrealized_pnl"),
             holdings=_parse_holdings(balance_response.payload),
             open_orders=_parse_open_orders(open_orders_response.payload),
             payload={
@@ -1351,6 +1356,30 @@ def _parse_available_cash(payload: dict[str, object]) -> Decimal | None:
     return None
 
 
+def _parse_balance_summary(payload: dict[str, object]) -> dict[str, Decimal | None]:
+    for row in _payload_rows(payload.get("output2")):
+        return {
+            "total_asset_value": _first_decimal(row, "tot_evlu_amt", "nass_amt"),
+            "previous_total_asset_value": _parse_decimal(row.get("bfdy_tot_asst_evlu_amt")),
+            "asset_change_amount": _parse_decimal(row.get("asst_icdc_amt")),
+            "unrealized_pnl": _parse_decimal(row.get("evlu_pfls_smtl_amt")),
+        }
+    return {
+        "total_asset_value": None,
+        "previous_total_asset_value": None,
+        "asset_change_amount": None,
+        "unrealized_pnl": None,
+    }
+
+
+def _first_decimal(row: dict[str, object], *keys: str) -> Decimal | None:
+    for key in keys:
+        parsed = _parse_decimal(row.get(key))
+        if parsed is not None:
+            return parsed
+    return None
+
+
 def _parse_holdings(payload: dict[str, object]) -> list[BrokerAccountHolding]:
     holdings: list[BrokerAccountHolding] = []
     for row in _payload_rows(payload.get("output1")):
@@ -1364,6 +1393,8 @@ def _parse_holdings(payload: dict[str, object]) -> list[BrokerAccountHolding]:
                 quantity=quantity,
                 average_price=_parse_decimal(row.get("pchs_avg_pric")),
                 sellable_quantity=_parse_int(row.get("ord_psbl_qty")),
+                unrealized_pnl=_parse_decimal(row.get("evlu_pfls_amt")),
+                unrealized_pnl_pct=_parse_decimal(row.get("evlu_pfls_rt")),
                 payload=dict(row),
             )
         )
