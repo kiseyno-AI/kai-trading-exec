@@ -225,7 +225,7 @@ def test_trade_outcome_feedback_headlines_broker_total_asset_change_with_unreali
     settings = Settings(
         runtime_mode="paper",
         trade_outcome_feedback_dir=str(tmp_path),
-        trade_outcome_feedback_lookback_days=5,
+        trade_outcome_feedback_lookback_days=1,
     )
     plan = ExecutionPlan(
         id="plan-asset-drawdown",
@@ -243,7 +243,7 @@ def test_trade_outcome_feedback_headlines_broker_total_asset_change_with_unreali
         buy_price="100000",
         sell_price="95632.5",
         quantity=10,
-        filled_day=22,
+        filled_day=25,
     )
     session.add(
         ExecutionPosition(
@@ -311,6 +311,135 @@ def test_trade_outcome_feedback_headlines_broker_total_asset_change_with_unreali
     assert report["prompt_snippet"]["broker_asset_warnings"][0].startswith("Divergence warning:")
     markdown = (tmp_path / "latest.md").read_text(encoding="utf-8")
     assert markdown.index("Broker total asset change: -406201.0000 KRW") < markdown.index("FIFO realized P/L: -43675.0000 KRW")
+
+    session.close()
+    engine.dispose()
+
+
+def test_trade_outcome_feedback_multi_day_does_not_headline_previous_day_broker_asset_change(tmp_path) -> None:
+    engine, session = _session()
+    settings = Settings(
+        runtime_mode="paper",
+        trade_outcome_feedback_dir=str(tmp_path),
+        trade_outcome_feedback_lookback_days=5,
+    )
+    plan = ExecutionPlan(
+        id="plan-multiday-asset",
+        external_plan_id="plan-multiday-asset",
+        source="kai-trading-core",
+        strategy_run_id="run-multiday-asset",
+        mode="paper",
+    )
+    session.add(plan)
+    _add_closed_trade(
+        session,
+        plan=plan,
+        suffix="multiday-fifo-win",
+        symbol="005930",
+        buy_price="100000",
+        sell_price="101000",
+        quantity=10,
+        filled_day=22,
+    )
+    session.add(
+        ExecutionPosition(
+            id="pos-multiday-latest-only",
+            mode="paper",
+            symbol="000660",
+            quantity=10,
+            average_price=Decimal("200000"),
+            updated_from="reconciliation",
+            last_reconciled_at=datetime(2026, 6, 26, 6, 0, tzinfo=UTC),
+            raw_payload={
+                "balance": {
+                    "output2": [
+                        {
+                            "tot_evlu_amt": "9593799",
+                            "nass_amt": "9593799",
+                            "bfdy_tot_asst_evlu_amt": "10000000",
+                            "asst_icdc_amt": "-406201",
+                        }
+                    ],
+                }
+            },
+        )
+    )
+    session.commit()
+
+    report = generate_trade_outcome_feedback(
+        settings=settings,
+        db=session,
+        as_of=datetime(2026, 6, 26, 9, 0, tzinfo=UTC),
+    )
+
+    assert report["summary"]["primary_performance_metric"] == "fifo_realized_pnl"
+    assert report["summary"]["realized_pnl_krw"] == "10000.0000"
+    assert "broker_total_asset_change_krw" not in report["summary"]
+    broker_asset = report["broker_asset_performance"]
+    assert broker_asset["available"] is False
+    assert "previous-day fields bfdy_tot_asst_evlu_amt/asst_icdc_amt do not cover the report lookback" in broker_asset["source_failed"]
+    assert report["prompt_snippet"]["summary"].startswith("Recent closed trades: pnl=10000.0000 KRW")
+    assert report["prompt_snippet"]["broker_asset_warnings"][0].startswith("Broker asset performance unavailable:")
+
+    session.close()
+    engine.dispose()
+
+
+def test_trade_outcome_feedback_output2_without_asset_fields_is_unavailable(tmp_path) -> None:
+    engine, session = _session()
+    settings = Settings(
+        runtime_mode="paper",
+        trade_outcome_feedback_dir=str(tmp_path),
+        trade_outcome_feedback_lookback_days=1,
+    )
+    plan = ExecutionPlan(
+        id="plan-missing-asset-fields",
+        external_plan_id="plan-missing-asset-fields",
+        source="kai-trading-core",
+        strategy_run_id="run-missing-asset-fields",
+        mode="paper",
+    )
+    session.add(plan)
+    _add_closed_trade(
+        session,
+        plan=plan,
+        suffix="missing-asset-fields",
+        symbol="005930",
+        buy_price="100000",
+        sell_price="101000",
+        quantity=10,
+        filled_day=25,
+    )
+    session.add(
+        ExecutionPosition(
+            id="pos-missing-asset-fields",
+            mode="paper",
+            symbol="000660",
+            quantity=10,
+            average_price=Decimal("200000"),
+            updated_from="reconciliation",
+            last_reconciled_at=datetime(2026, 6, 26, 6, 0, tzinfo=UTC),
+            raw_payload={"balance": {"output2": [{"ord_psbl_cash": "123456"}]}},
+        )
+    )
+    session.commit()
+
+    report = generate_trade_outcome_feedback(
+        settings=settings,
+        db=session,
+        as_of=datetime(2026, 6, 26, 9, 0, tzinfo=UTC),
+    )
+
+    assert report["summary"]["primary_performance_metric"] == "fifo_realized_pnl"
+    assert report["summary"]["realized_pnl_krw"] == "10000.0000"
+    assert "broker_total_asset_change_krw" not in report["summary"]
+    broker_asset = report["broker_asset_performance"]
+    assert broker_asset["available"] is False
+    assert broker_asset["source_failed"] == (
+        "broker balance output2 missing parseable total/baseline/change asset fields; "
+        "cannot headline broker total asset change"
+    )
+    assert report["prompt_snippet"]["summary"].startswith("Recent closed trades: pnl=10000.0000 KRW")
 
     session.close()
     engine.dispose()

@@ -48,6 +48,14 @@ class OpenLot:
     fill: ExecutionFill
 
 
+@dataclass(frozen=True)
+class BrokerBalanceSnapshot:
+    position: ExecutionPosition
+    balance: dict[str, object]
+    output2: dict[str, object]
+    observed_at: datetime | None
+
+
 def generate_trade_outcome_feedback(
     *,
     settings: Settings,
@@ -69,6 +77,8 @@ def generate_trade_outcome_feedback(
         settings=settings,
         db=db,
         closed_trades=closed_trades,
+        lookback_days=days,
+        started_at=started_at,
     )
     summary = _summary(closed_trades, broker_asset_performance=broker_asset_performance)
     lessons = _lessons(closed_trades, max_lessons=settings.trade_outcome_feedback_max_lessons)
@@ -271,36 +281,50 @@ def _broker_asset_performance(
     settings: Settings,
     db: Session,
     closed_trades: list[dict[str, object]],
+    lookback_days: int,
+    started_at: datetime,
 ) -> dict[str, object]:
     positions = _load_all_positions(settings=settings, db=db)
-    snapshot = _latest_broker_balance_snapshot(positions)
-    if snapshot is None:
-        return {
-            "available": False,
-            "source": "execution_positions.raw_payload.balance.output2",
-            "source_failed": (
-                f"execution_positions raw broker balance payload unavailable for mode={settings.runtime_mode}; "
-                "cannot headline broker total asset change"
-            ),
-        }
-    position, balance = snapshot
-    output2 = _first_payload_row(balance.get("output2"))
-    if output2 is None:
-        return {
-            "available": False,
-            "source": "execution_positions.raw_payload.balance.output2",
-            "source_failed": "broker balance payload missing output2 asset summary",
-        }
+    snapshots = _broker_balance_snapshots(positions)
+    if not snapshots:
+        return _broker_asset_unavailable(
+            f"execution_positions raw broker balance payload unavailable for mode={settings.runtime_mode}; "
+            "cannot headline broker total asset change"
+        )
 
+    if lookback_days <= 1:
+        snapshot = snapshots[0]
+        latest_total_asset, latest_net_asset, baseline_total_asset, asset_change = _previous_day_asset_metrics(snapshot.output2)
+        baseline_observed_at = None
+        source_window = "previous_day"
+    else:
+        snapshot, baseline_snapshot, reason = _multi_day_broker_asset_snapshots(
+            snapshots=snapshots,
+            started_at=started_at,
+        )
+        if snapshot is None or baseline_snapshot is None:
+            return _broker_asset_unavailable(reason)
+        latest_total_asset = _decimal_value(snapshot.output2.get("tot_evlu_amt"))
+        latest_net_asset = _decimal_value(snapshot.output2.get("nass_amt"))
+        baseline_total_asset = _decimal_value(baseline_snapshot.output2.get("tot_evlu_amt"))
+        asset_change = (
+            latest_total_asset - baseline_total_asset
+            if latest_total_asset is not None and baseline_total_asset is not None
+            else None
+        )
+        baseline_observed_at = baseline_snapshot.observed_at
+        source_window = "report_lookback_snapshots"
+
+    if asset_change is None or latest_total_asset is None or baseline_total_asset is None:
+        return _broker_asset_unavailable(
+            "broker balance output2 missing parseable total/baseline/change asset fields; "
+            "cannot headline broker total asset change"
+        )
+
+    position = snapshot.position
+    balance = snapshot.balance
+    output2 = snapshot.output2
     raw_fields = {key: output2.get(key) for key in BROKER_BALANCE_OUTPUT2_FIELDS if key in output2}
-    latest_total_asset = _decimal_value(output2.get("tot_evlu_amt"))
-    latest_net_asset = _decimal_value(output2.get("nass_amt"))
-    baseline_total_asset = _decimal_value(output2.get("bfdy_tot_asst_evlu_amt"))
-    asset_change = _decimal_value(output2.get("asst_icdc_amt"))
-    if asset_change is None and latest_total_asset is not None and baseline_total_asset is not None:
-        asset_change = latest_total_asset - baseline_total_asset
-    if baseline_total_asset is None and latest_total_asset is not None and asset_change is not None:
-        baseline_total_asset = latest_total_asset - asset_change
     asset_change_pct = (
         asset_change / baseline_total_asset * Decimal("100")
         if asset_change is not None and baseline_total_asset is not None and baseline_total_asset != 0
@@ -317,12 +341,14 @@ def _broker_asset_performance(
     return {
         "available": True,
         "source": "execution_positions.raw_payload.balance.output2",
+        "source_window": source_window,
         "holdings_source": "execution_positions.raw_payload.balance.output1"
         if _payload_rows(balance.get("output1"))
         else "execution_positions",
         "observed_at": _normalize_utc(position.last_reconciled_at).isoformat()
         if position.last_reconciled_at is not None
         else None,
+        "baseline_observed_at": baseline_observed_at.isoformat() if baseline_observed_at is not None else None,
         "source_position_symbol": position.symbol,
         "baseline_total_asset_krw": _decimal_text(baseline_total_asset),
         "latest_total_asset_krw": _decimal_text(latest_total_asset),
@@ -350,15 +376,98 @@ def _load_all_positions(*, settings: Settings, db: Session) -> list[ExecutionPos
     )
 
 
-def _latest_broker_balance_snapshot(positions: list[ExecutionPosition]) -> tuple[ExecutionPosition, dict[str, object]] | None:
+def _broker_asset_unavailable(reason: str | None) -> dict[str, object]:
+    return {
+        "available": False,
+        "source": "execution_positions.raw_payload.balance.output2",
+        "source_failed": reason or "broker asset performance unavailable",
+    }
+
+
+def _broker_balance_snapshots(positions: list[ExecutionPosition]) -> list[BrokerBalanceSnapshot]:
+    snapshots = []
     for position in positions:
         payload = position.raw_payload if isinstance(position.raw_payload, dict) else None
         if payload is None:
             continue
         balance = payload.get("balance")
-        if isinstance(balance, dict) and _first_payload_row(balance.get("output2")) is not None:
-            return position, balance
-    return None
+        if not isinstance(balance, dict):
+            continue
+        output2 = _first_payload_row(balance.get("output2"))
+        if output2 is None:
+            continue
+        observed_at = _normalize_utc(position.last_reconciled_at) if position.last_reconciled_at is not None else None
+        snapshots.append(
+            BrokerBalanceSnapshot(
+                position=position,
+                balance=balance,
+                output2=output2,
+                observed_at=observed_at,
+            )
+        )
+    return sorted(
+        snapshots,
+        key=lambda row: (
+            row.observed_at or datetime.min.replace(tzinfo=UTC),
+            _normalize_utc(row.position.updated_at) if row.position.updated_at is not None else datetime.min.replace(tzinfo=UTC),
+        ),
+        reverse=True,
+    )
+
+
+def _previous_day_asset_metrics(output2: dict[str, object]) -> tuple[Decimal | None, Decimal | None, Decimal | None, Decimal | None]:
+    latest_total_asset = _decimal_value(output2.get("tot_evlu_amt"))
+    latest_net_asset = _decimal_value(output2.get("nass_amt"))
+    baseline_total_asset = _decimal_value(output2.get("bfdy_tot_asst_evlu_amt"))
+    asset_change = _decimal_value(output2.get("asst_icdc_amt"))
+    if asset_change is None and latest_total_asset is not None and baseline_total_asset is not None:
+        asset_change = latest_total_asset - baseline_total_asset
+    if baseline_total_asset is None and latest_total_asset is not None and asset_change is not None:
+        baseline_total_asset = latest_total_asset - asset_change
+    return latest_total_asset, latest_net_asset, baseline_total_asset, asset_change
+
+
+def _multi_day_broker_asset_snapshots(
+    *,
+    snapshots: list[BrokerBalanceSnapshot],
+    started_at: datetime,
+) -> tuple[BrokerBalanceSnapshot | None, BrokerBalanceSnapshot | None, str | None]:
+    started_at = _normalize_utc(started_at)
+    latest_snapshot = next(
+        (
+            snapshot
+            for snapshot in snapshots
+            if snapshot.observed_at is not None
+            and snapshot.observed_at >= started_at
+            and _decimal_value(snapshot.output2.get("tot_evlu_amt")) is not None
+        ),
+        None,
+    )
+    baseline_snapshot = next(
+        (
+            snapshot
+            for snapshot in snapshots
+            if snapshot.observed_at is not None
+            and snapshot.observed_at <= started_at
+            and _decimal_value(snapshot.output2.get("tot_evlu_amt")) is not None
+        ),
+        None,
+    )
+    if (
+        latest_snapshot is None
+        or baseline_snapshot is None
+        or latest_snapshot.observed_at is None
+        or baseline_snapshot.observed_at is None
+        or latest_snapshot.observed_at <= baseline_snapshot.observed_at
+    ):
+        return (
+            None,
+            None,
+            "multi-day broker asset performance unavailable: need execution_positions raw balance snapshots "
+            f"spanning started_at={started_at.isoformat()}; latest broker output2 previous-day fields "
+            "bfdy_tot_asst_evlu_amt/asst_icdc_amt do not cover the report lookback",
+        )
+    return latest_snapshot, baseline_snapshot, None
 
 
 def _first_payload_row(value: object) -> dict[str, object] | None:
