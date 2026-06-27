@@ -477,6 +477,9 @@ def test_trade_outcome_feedback_portfolio_risk_and_sell_reason_contributions(tmp
     assert risk["top_position_concentration"][0]["portfolio_weight_pct"] == "50.0000"
     assert risk["sector_concentration"][0]["sector"] == "Semiconductors"
     assert risk["stale_open_order_warnings"][0]["symbol"] == "068270"
+    assert risk["stale_state_blockers"][0]["symbol"] == "068270"
+    assert risk["stale_state_blockers"][0]["type"] == "stale_open_order_broker_truth"
+    assert risk["normal_open_orders"] == []
     assert {row["type"] for row in risk["monday_pre_market_checks"]} >= {"open_order", "stale_local_position", "open_position"}
     by_reason = {row["name"]: row for row in risk["sell_reason_contributions"]}
     assert by_reason["stop_sell"]["realized_pnl_krw"] == "-10000.0000"
@@ -486,6 +489,7 @@ def test_trade_outcome_feedback_portfolio_risk_and_sell_reason_contributions(tmp
     assert risk["target_sell_profit_contribution"]["realized_pnl_krw"] == "150000.0000"
     assert risk["max_holding_close_contribution"]["realized_pnl_krw"] == "-10000.0000"
     assert any("Top concentration" in line for line in report["prompt_snippet"]["top_portfolio_risks"])
+    assert any("Stale-state blockers" in line for line in report["prompt_snippet"]["top_portfolio_risks"])
 
     session.close()
     engine.dispose()

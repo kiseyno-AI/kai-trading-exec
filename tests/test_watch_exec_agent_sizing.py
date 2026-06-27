@@ -4,11 +4,27 @@ import threading
 from datetime import UTC, date, datetime
 from decimal import Decimal
 
-from app.broker.base import BrokerAccountHolding, BrokerAccountOpenOrder, BrokerAccountSnapshot
+from sqlalchemy import select
+
+from app.broker.base import (
+    BrokerAdapterError,
+    BrokerAccountHolding,
+    BrokerAccountOpenOrder,
+    BrokerAccountSnapshot,
+    BrokerConfig,
+    BrokerCurrentPrice,
+    BrokerOrderPlacement,
+    BrokerOrderPlacementRequest,
+    BrokerRealtimeApproval,
+    BrokerReconnectHandle,
+    BrokerTokenGrant,
+    BrokerTokenRevocation,
+    NormalizedBrokerOrderStatus,
+)
 from app.core.config import Settings
 from app.db.base import Base
 from app.db.session import create_db_engine, create_session_factory
-from app.models.runtime import ExecutionPlan, ExecutionPlanItem
+from app.models.runtime import BrokerOrder, BrokerOrderEvent, ExecutionPlan, ExecutionPlanItem, ExecutionPlanItemAudit
 from app.services import watch_exec_agent_sizing as watch_sizing
 from app.services.monitoring import (
     _watch_buy_candidate_budget,
@@ -28,6 +44,66 @@ from app.services.watch_exec_agent_sizing import (
 )
 
 
+class WatchSizingBrokerStub:
+    provider = "kis"
+
+    def __init__(
+        self,
+        *,
+        reconcile_payloads: list[dict[str, object]],
+        snapshot_error: Exception | None = None,
+    ) -> None:
+        self.reconcile_payloads = reconcile_payloads
+        self.snapshot_error = snapshot_error
+        self.events: list[str] = []
+        self.reconcile_calls: list[str] = []
+
+    def describe(self) -> BrokerConfig:
+        return BrokerConfig(provider="kis", mode="paper", configured=True, api_base_url="https://stub.kis.local")
+
+    def authenticate(self) -> BrokerTokenGrant:
+        self.events.append("authenticate")
+        return BrokerTokenGrant(
+            access_token="token",
+            token_type="Bearer",
+            access_token_expires_at=datetime(2026, 6, 4, 1, 0, tzinfo=UTC),
+        )
+
+    def issue_realtime_approval(self, access_token: str) -> BrokerRealtimeApproval:
+        return BrokerRealtimeApproval(approval_key="approval", issued_at=datetime(2026, 6, 4, tzinfo=UTC))
+
+    def revoke(self, access_token: str) -> BrokerTokenRevocation:
+        return BrokerTokenRevocation(message="revoked")
+
+    def place_order(self, access_token: str, request: BrokerOrderPlacementRequest) -> BrokerOrderPlacement:
+        raise NotImplementedError
+
+    def get_current_price(self, access_token: str, *, symbol: str, exchange: str = "KRX") -> BrokerCurrentPrice | None:
+        return None
+
+    def get_account_snapshot(self, access_token: str) -> BrokerAccountSnapshot:
+        self.events.append("snapshot")
+        if self.snapshot_error is not None:
+            raise self.snapshot_error
+        return BrokerAccountSnapshot(
+            available_cash=Decimal("10000000"),
+            buying_power=Decimal("10000000"),
+            observed_at=datetime(2026, 6, 4, 0, 1, tzinfo=UTC),
+            source="stub:account_snapshot",
+        )
+
+    def reconnect_handle(self) -> BrokerReconnectHandle:
+        return BrokerReconnectHandle(supported=True, strategy="stub")
+
+    def reconcile_order(self, access_token: str, broker_order_id: str, *, exchange: str = "KRX") -> dict[str, object]:
+        self.events.append("reconcile")
+        self.reconcile_calls.append(broker_order_id)
+        return self.reconcile_payloads[min(len(self.reconcile_calls) - 1, len(self.reconcile_payloads) - 1)]
+
+    def build_headers(self, access_token: str, *, transaction_id: str | None = None, hashkey: str | None = None) -> dict[str, str]:
+        return {"authorization": f"Bearer {access_token}"}
+
+
 def _watch_item(
     *,
     item_id: str = "watch-item-1",
@@ -45,6 +121,21 @@ def _watch_item(
         limit_price=Decimal("71500"),
         quantity_policy={"type": "exec_agent_sized", "budget_krw": "1500000"},
         risk_context=risk_context,
+    )
+
+
+def _stale_local_order(*, symbol: str = "005930", broker_order_id: str = "stale-open-1") -> BrokerOrder:
+    return BrokerOrder(
+        broker_name="kis",
+        mode="paper",
+        idempotency_key=f"stale:{broker_order_id}",
+        broker_order_id=broker_order_id,
+        symbol=symbol,
+        side="buy",
+        status=NormalizedBrokerOrderStatus.OPEN.value,
+        quantity=2,
+        submitted_at=datetime(2026, 6, 3, 0, 0, tzinfo=UTC),
+        last_broker_sync_at=datetime(2026, 6, 3, 0, 0, tzinfo=UTC),
     )
 
 
@@ -192,6 +283,256 @@ def test_short_transaction_batches_candidates_across_single_item_plans(tmp_path,
         "watch-item-2": "watch_buy_triggered_blocked",
         "watch-item-3": "watch_buy_triggered_blocked",
     }
+
+
+def test_stale_open_order_unknown_broker_status_blocks_watch_sizing_before_agent(tmp_path, monkeypatch) -> None:
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'watch-sizing-stale-unknown.db'}",
+        runtime_mode="paper",
+        exec_agent_enabled=True,
+        exec_agent_watch_sizing_enabled=True,
+        exec_agent_watch_sizing_start_local_time="00:00",
+        exec_agent_watch_sizing_end_local_time="23:59",
+        stale_broker_order_reconciliation_threshold_seconds=60,
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    with session_factory() as session:
+        session.add(
+            ExecutionPlan(
+                external_plan_id="plan-stale-unknown",
+                strategy_run_id="strategy-1",
+                source="core-short-term-decider",
+                market_date=date(2026, 6, 4),
+                mode="paper",
+                items=[
+                    _watch_item(
+                        item_id="watch-item-stale",
+                        symbol="005930",
+                        risk_context={"target_price": "76000", "stop_price": "69000"},
+                    )
+                ],
+            )
+        )
+        session.add(_stale_local_order(symbol="005930", broker_order_id="stale-unknown-1"))
+        session.commit()
+
+    def fail_agent(**_) -> dict[str, object]:
+        raise AssertionError("exec-agent should not be called for stale-state blocked symbols")
+
+    monkeypatch.setattr(watch_sizing, "_request_exec_agent_decisions", fail_agent)
+    broker = WatchSizingBrokerStub(
+        reconcile_payloads=[
+            {
+                "broker_order_id": "stale-unknown-1",
+                "status": "mystery_status",
+                "broker_status": "ZZ99",
+                "message": "new broker status",
+                "observed_at": datetime(2026, 6, 4, 0, 0, tzinfo=UTC).isoformat(),
+                "payload": {"ord_stat": "ZZ99"},
+            }
+        ]
+    )
+
+    result = run_due_watch_exec_agent_sizing(
+        settings=settings,
+        session_factory=session_factory,
+        adapter=broker,
+        now=datetime(2026, 6, 4, 0, 0, tzinfo=UTC),
+    )
+
+    with session_factory() as session:
+        item = session.get(ExecutionPlanItem, "watch-item-stale")
+        order = session.scalar(select(BrokerOrder).where(BrokerOrder.broker_order_id == "stale-unknown-1"))
+        unknown_event = session.scalar(
+            select(BrokerOrderEvent).where(BrokerOrderEvent.event_type == "reconcile_result_unrecognized_status")
+        )
+        audit = session.scalar(
+            select(ExecutionPlanItemAudit).where(
+                ExecutionPlanItemAudit.event_type == "watch_exec_agent_sizing_stale_state_blocked"
+            )
+        )
+
+    assert broker.events.index("reconcile") < broker.events.index("snapshot")
+    assert result.payload["applied"][0]["stale_state_blocked_item_ids"] == ["watch-item-stale"]
+    assert item.status == "exec_agent_rejected"
+    assert item.quantity_policy["exec_agent_decision"]["reason_code"] == "stale_order_broker_truth_unconfirmed"
+    assert item.quantity_policy["stale_state_blockers"][0]["classification"] == "unknown"
+    assert order.last_error_classification == "unknown_status"
+    assert unknown_event.payload["raw_status_details"] == {
+        "status": "mystery_status",
+        "broker_status": "ZZ99",
+        "message": "new broker status",
+        "observed_at": "2026-06-04T00:00:00+00:00",
+    }
+    assert audit is not None
+    engine.dispose()
+
+
+def test_stale_open_order_block_survives_account_snapshot_failure(tmp_path, monkeypatch) -> None:
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'watch-sizing-stale-snapshot-fail.db'}",
+        runtime_mode="paper",
+        exec_agent_enabled=True,
+        exec_agent_watch_sizing_enabled=True,
+        exec_agent_watch_sizing_start_local_time="00:00",
+        exec_agent_watch_sizing_end_local_time="23:59",
+        stale_broker_order_reconciliation_threshold_seconds=60,
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    with session_factory() as session:
+        session.add(
+            ExecutionPlan(
+                external_plan_id="plan-stale-snapshot-fail",
+                strategy_run_id="strategy-1",
+                source="core-short-term-decider",
+                market_date=date(2026, 6, 4),
+                mode="paper",
+                items=[
+                    _watch_item(
+                        item_id="watch-item-snapshot-fail",
+                        symbol="005930",
+                        risk_context={"target_price": "76000", "stop_price": "69000"},
+                    )
+                ],
+            )
+        )
+        session.add(_stale_local_order(symbol="005930", broker_order_id="stale-snapshot-fail-1"))
+        session.commit()
+
+    def fail_agent(**_) -> dict[str, object]:
+        raise AssertionError("exec-agent should not be called when stale blockers survive snapshot failure")
+
+    monkeypatch.setattr(watch_sizing, "_request_exec_agent_decisions", fail_agent)
+    broker = WatchSizingBrokerStub(
+        reconcile_payloads=[
+            {
+                "broker_order_id": "stale-snapshot-fail-1",
+                "status": "mystery_status",
+                "broker_status": "ZZ99",
+                "message": "new broker status",
+                "observed_at": datetime(2026, 6, 4, 0, 0, tzinfo=UTC).isoformat(),
+                "payload": {"ord_stat": "ZZ99"},
+            }
+        ],
+        snapshot_error=BrokerAdapterError("account snapshot timeout"),
+    )
+
+    result = run_due_watch_exec_agent_sizing(
+        settings=settings,
+        session_factory=session_factory,
+        adapter=broker,
+        now=datetime(2026, 6, 4, 0, 0, tzinfo=UTC),
+    )
+
+    with session_factory() as session:
+        item = session.get(ExecutionPlanItem, "watch-item-snapshot-fail")
+        audit = session.scalar(
+            select(ExecutionPlanItemAudit).where(
+                ExecutionPlanItemAudit.event_type == "watch_exec_agent_sizing_stale_state_blocked"
+            )
+        )
+
+    assert broker.events.index("reconcile") < broker.events.index("snapshot")
+    assert result.payload["applied"][0]["stale_state_blocked_item_ids"] == ["watch-item-snapshot-fail"]
+    assert item.status == "exec_agent_rejected"
+    assert item.quantity_policy["stale_state_blockers"][0]["classification"] == "unknown"
+    assert audit is not None
+    engine.dispose()
+
+
+def test_stale_open_order_successful_refresh_allows_watch_sizing(tmp_path, monkeypatch) -> None:
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'watch-sizing-stale-filled.db'}",
+        runtime_mode="paper",
+        exec_agent_enabled=True,
+        exec_agent_watch_sizing_enabled=True,
+        exec_agent_watch_sizing_start_local_time="00:00",
+        exec_agent_watch_sizing_end_local_time="23:59",
+        stale_broker_order_reconciliation_threshold_seconds=60,
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    with session_factory() as session:
+        session.add(
+            ExecutionPlan(
+                external_plan_id="plan-stale-filled",
+                strategy_run_id="strategy-1",
+                source="core-short-term-decider",
+                market_date=date(2026, 6, 4),
+                mode="paper",
+                items=[
+                    _watch_item(
+                        item_id="watch-item-refreshed",
+                        symbol="005930",
+                        risk_context={"target_price": "76000", "stop_price": "69000"},
+                    )
+                ],
+            )
+        )
+        session.add(_stale_local_order(symbol="005930", broker_order_id="stale-filled-1"))
+        session.commit()
+
+    calls: list[list[str]] = []
+
+    def approve_agent(*, payload, **_) -> dict[str, object]:
+        calls.append([str(candidate["execution_plan_item_id"]) for candidate in payload["candidates"]])
+        return {
+            "version": "manual-exec-agent-watch-sizing-v1",
+            "decisions": [
+                {
+                    "execution_plan_item_id": "watch-item-refreshed",
+                    "symbol": "005930",
+                    "action": "approve",
+                    "quantity": 1,
+                    "approved_notional_krw": 71500,
+                    "sizing_price": "71500",
+                    "confidence": 0.68,
+                    "target_profile": "short_swing",
+                    "reason_code": "refreshed_truth",
+                    "reason": "stale local order refreshed to terminal broker state",
+                }
+            ],
+        }
+
+    monkeypatch.setattr(watch_sizing, "_request_exec_agent_decisions", approve_agent)
+    broker = WatchSizingBrokerStub(
+        reconcile_payloads=[
+            {
+                "broker_order_id": "stale-filled-1",
+                "status": "filled",
+                "broker_status": "체결",
+                "filled_quantity": 2,
+                "remaining_quantity": 0,
+                "average_fill_price": "71000",
+                "observed_at": datetime(2026, 6, 4, 0, 0, tzinfo=UTC).isoformat(),
+            }
+        ]
+    )
+
+    result = run_due_watch_exec_agent_sizing(
+        settings=settings,
+        session_factory=session_factory,
+        adapter=broker,
+        now=datetime(2026, 6, 4, 0, 0, tzinfo=UTC),
+    )
+
+    with session_factory() as session:
+        item = session.get(ExecutionPlanItem, "watch-item-refreshed")
+        order = session.scalar(select(BrokerOrder).where(BrokerOrder.broker_order_id == "stale-filled-1"))
+
+    assert broker.events.index("reconcile") < broker.events.index("snapshot")
+    assert calls == [["watch-item-refreshed"]]
+    assert result.payload["applied"][0]["approved"] == 1
+    assert item.status == "watch_monitoring_active"
+    assert item.quantity_policy["quantity"] == 1
+    assert order.status == "filled"
+    assert order.last_error_classification is None
+    engine.dispose()
 
 
 def test_watch_buy_candidate_budget_accepts_max_safe_notional() -> None:
