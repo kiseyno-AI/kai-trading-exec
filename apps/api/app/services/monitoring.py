@@ -3695,6 +3695,25 @@ def _resolve_watch_buy_order(
         entry_price=entry_price,
         upstream_stop_price=stop_price,
     )
+    candidate_budget = _watch_buy_candidate_budget(item)
+    exec_agent_notional_cap = _watch_buy_exec_agent_notional_cap(item)
+    candidate_max_budget = _minimum_decimal(candidate_budget, exec_agent_notional_cap)
+    if exec_agent_notional_cap is not None:
+        cap_quantity = _floor_quantity(exec_agent_notional_cap / entry_price)
+        if cap_quantity <= 0:
+            details = {
+                "entry_price": _serialize_decimal(entry_price),
+                "observed_price": _serialize_decimal(observed_price),
+                "exec_agent_approved_notional_cap": _serialize_decimal(exec_agent_notional_cap),
+                "stored_quantity": quantity,
+                "max_quantity_within_cap": cap_quantity,
+            }
+            return WatchBuyOrderApproval(
+                quantity=None,
+                reason="exec_agent_approved_notional_exhausted",
+                message="exec-agent approved notional cannot buy one share at the current entry price",
+                details=details,
+            )
     risk_decision = resolve_risk_based_buy_quantity(
         settings=settings,
         account_basis=available_cash,
@@ -3703,7 +3722,7 @@ def _resolve_watch_buy_order(
         stop_price=effective_stop,
         confidence=_watch_buy_confidence(item),
         requested_quantity=quantity,
-        candidate_max_budget=_watch_buy_candidate_budget(item),
+        candidate_max_budget=candidate_max_budget,
         agent_max_quantity=_watch_buy_max_quantity(item),
         existing_symbol_exposure=existing_exposure,
         daily_new_buy_notional_used=_load_daily_new_buy_notional(
@@ -3727,10 +3746,31 @@ def _resolve_watch_buy_order(
             details=details,
         )
     assert isinstance(risk_decision, RiskSizingResult)
+    approved_quantity = risk_decision.quantity
+    approved_notional = risk_decision.approved_notional
+    exec_agent_cap_adjustment: dict[str, object] | None = None
+    if exec_agent_notional_cap is not None:
+        cap_quantity = _floor_quantity(exec_agent_notional_cap / entry_price)
+        if approved_quantity > cap_quantity:
+            approved_quantity = cap_quantity
+            approved_notional = (entry_price * Decimal(approved_quantity)).quantize(
+                Decimal("0.0001"),
+                rounding=ROUND_DOWN,
+            )
+            exec_agent_cap_adjustment = {
+                "reason": "exec_agent_approved_notional_cap",
+                "entry_price": _serialize_decimal(entry_price),
+                "observed_price": _serialize_decimal(observed_price),
+                "exec_agent_approved_notional_cap": _serialize_decimal(exec_agent_notional_cap),
+                "original_quantity": risk_decision.quantity,
+                "adjusted_quantity": approved_quantity,
+                "original_notional": _serialize_decimal(risk_decision.approved_notional),
+                "adjusted_notional": _serialize_decimal(approved_notional),
+            }
     event = {
         "event": "watch_buy_risk_sized",
-        "quantity": risk_decision.quantity,
-        "approved_notional": _serialize_decimal(risk_decision.approved_notional),
+        "quantity": approved_quantity,
+        "approved_notional": _serialize_decimal(approved_notional),
         "risk_pct": _serialize_decimal(risk_decision.risk_pct),
         "risk_budget": _serialize_decimal(risk_decision.risk_budget),
         "stop_price": _serialize_decimal(effective_stop),
@@ -3748,8 +3788,12 @@ def _resolve_watch_buy_order(
     if sizing_source is not None:
         event["sizing_source"] = sizing_source
         event["trigger_time_exec_agent_quantity"] = requested_quantity
-        if requested_quantity is not None and risk_decision.quantity < requested_quantity:
+        if requested_quantity is not None and approved_quantity < requested_quantity:
             event["sizing_adjustment"] = "clamped_by_deterministic_risk_sizing"
+    if exec_agent_notional_cap is not None:
+        event["exec_agent_approved_notional_cap"] = _serialize_decimal(exec_agent_notional_cap)
+    if exec_agent_cap_adjustment is not None:
+        event["submission_cap_adjustment"] = exec_agent_cap_adjustment
     if _watch_buy_requires_exec_agent_sizing(item):
         event["sizing_source"] = sizing_source or "risk_sizing_after_exec_agent_attempts_exhausted"
         event["exec_agent_watch_sizing_attempt_count"] = _first_payload_value(
@@ -3767,7 +3811,7 @@ def _resolve_watch_buy_order(
         item=item,
         event=event,
     )
-    return WatchBuyOrderApproval(quantity=risk_decision.quantity)
+    return WatchBuyOrderApproval(quantity=approved_quantity)
 
 
 def _watch_buy_stale_trigger_reclaim_veto(
@@ -3976,6 +4020,30 @@ def _watch_buy_candidate_budget(item: ExecutionPlanItem) -> Decimal | None:
             if value is not None:
                 return value
     return None
+
+
+def _watch_buy_exec_agent_notional_cap(item: ExecutionPlanItem) -> Decimal | None:
+    caps: list[Decimal] = []
+    for source in _item_payload_sources(item):
+        source_name = str(source.get("source") or "").strip().lower()
+        if source_name == "exec_agent_watch_sizing":
+            for key in ("approved_notional", "approved_notional_krw"):
+                value = _parse_positive_decimal(source.get(key))
+                if value is not None:
+                    caps.append(value)
+        sizing_adjustment = source.get("sizing_adjustment")
+        if isinstance(sizing_adjustment, dict):
+            for key in (
+                "final_notional",
+                "adjusted_notional",
+                "approved_notional",
+                "cap_notional",
+                "agent_approved_notional",
+            ):
+                value = _parse_positive_decimal(sizing_adjustment.get(key))
+                if value is not None:
+                    caps.append(value)
+    return min(caps) if caps else None
 
 
 def _watch_buy_max_quantity(item: ExecutionPlanItem) -> int | None:
@@ -4276,6 +4344,10 @@ def _minimum_decimal(*values: Decimal | None) -> Decimal | None:
     if not concrete:
         return None
     return min(concrete)
+
+
+def _floor_quantity(value: Decimal) -> int:
+    return int(value.quantize(Decimal("1"), rounding=ROUND_DOWN))
 
 
 def _monitoring_status(intent: str) -> str:
