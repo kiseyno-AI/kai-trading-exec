@@ -467,3 +467,98 @@ def test_portfolio_risk_snapshot_uses_broker_positions_when_holdings_are_empty()
     assert holding["base_quantity"] == "0.5000"
     assert holding["market_value"] == "2000000.0000"
     engine.dispose()
+
+
+def test_portfolio_risk_snapshot_uses_fresh_broker_raw_holdings_and_surfaces_drift() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        exec_agent_max_account_snapshot_age_seconds=300,
+    )
+    engine, _factory, db = _session(settings)
+    now = datetime(2026, 6, 27, 4, 2, tzinfo=UTC)
+    _add_broker_session(db, expires_at=datetime.now(UTC) + timedelta(hours=1))
+    db.add(
+        ExecutionPosition(
+            mode="paper",
+            symbol="088910",
+            quantity=74,
+            average_price=Decimal("3000.00"),
+            updated_from="reconciliation",
+            last_reconciled_at=now,
+        )
+    )
+    db.commit()
+    snapshot = BrokerAccountSnapshot(
+        available_cash=Decimal("1000000"),
+        observed_at=now,
+        source="stub:account_snapshot",
+        holdings=[],
+        payload={
+            "balance": {
+                "rt_cd": "0",
+                "output1": [
+                    {
+                        "pdno": "002380",
+                        "prdt_name": "KCC",
+                        "hldg_qty": "1",
+                        "ord_psbl_qty": "1",
+                        "pchs_avg_pric": "350000",
+                        "prpr": "333500",
+                        "evlu_amt": "333,500",
+                        "evlu_pfls_amt": "-16500",
+                        "evlu_pfls_rt": "-4.7143",
+                    },
+                    {
+                        "pdno": "031330",
+                        "prdt_name": "SAMT",
+                        "hldg_qty": "35",
+                        "ord_psbl_qty": "35",
+                        "pchs_avg_pric": "6000",
+                        "prpr": "1830",
+                        "evlu_amt": "64050",
+                        "evlu_pfls_amt": "-145950",
+                        "evlu_pfls_rt": "-69.5000",
+                    },
+                    {
+                        "pdno": "088910",
+                        "prdt_name": "Dongwoo Farm To Table",
+                        "hldg_qty": "74",
+                        "ord_psbl_qty": "74",
+                        "pchs_avg_pric": "3000",
+                        "prpr": "2585",
+                        "evlu_amt": "191290",
+                        "evlu_pfls_amt": "-30710",
+                        "evlu_pfls_rt": "-13.8333",
+                    },
+                ],
+            }
+        },
+    )
+
+    payload = build_portfolio_risk_snapshot(
+        settings=settings,
+        db=db,
+        adapter=PortfolioRiskStubAdapter(snapshot=snapshot),
+        now=now,
+    )
+
+    assert payload["source_status"] == "ok"
+    assert payload["account"]["total_market_value"] == "588840.0000"
+    assert payload["holdings"]["open_count"] == 3
+    by_symbol = {row["symbol"]: row for row in payload["exposures"]["by_symbol"]}
+    assert by_symbol["002380"]["holding_value"] == "333500.0000"
+    assert by_symbol["031330"]["holding_value"] == "64050.0000"
+    broker_raw = payload["holdings"]["broker_raw"]
+    assert broker_raw["available"] is True
+    assert broker_raw["valid"] is True
+    assert broker_raw["fresh"] is True
+    assert broker_raw["normalized_drift_count"] == 2
+    drift_by_symbol = {row["symbol"]: row for row in broker_raw["normalized_drift"]}
+    assert drift_by_symbol["002380"]["reason"] == "broker_raw_open_missing_from_normalized"
+    assert drift_by_symbol["002380"]["raw_current_price"] == "333500.0000"
+    assert drift_by_symbol["002380"]["raw_unrealized_pnl_krw"] == "-16500.0000"
+    assert drift_by_symbol["031330"]["raw_unrealized_pnl_krw"] == "-145950.0000"
+    warning_codes = {warning["code"] for warning in payload["warnings"]["concentration"]}
+    assert "broker_raw_normalized_position_drift" in warning_codes
+    engine.dispose()

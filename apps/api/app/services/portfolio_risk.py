@@ -12,6 +12,14 @@ from sqlalchemy.orm import Session
 from app.broker.base import BrokerAccountHolding, BrokerAccountPosition, BrokerAccountSnapshot, BrokerAdapter
 from app.core.config import Settings
 from app.models.runtime import BrokerOrder, BrokerSession, ExecutionPlan, ExecutionPlanItem, ExecutionPosition
+from app.services.broker_raw_holdings import (
+    broker_raw_balance_is_fresh,
+    broker_raw_balance_is_valid,
+    broker_raw_holding_payload,
+    broker_raw_holdings_from_payload,
+    raw_vs_normalized_position_drift,
+    snapshot_with_raw_balance_holdings,
+)
 from app.services.runtime import OPEN_ORDER_STATUSES, position_truth_freshness_payload
 
 TOP_SYMBOL_ALLOCATION_WARNING_PCT = Decimal("0.30")
@@ -64,6 +72,7 @@ def build_portfolio_risk_snapshot(
     now: datetime | None = None,
 ) -> dict[str, object]:
     generated_at = now or datetime.now(UTC)
+    all_positions = _load_positions(settings=settings, db=db)
     local_positions = _load_local_holdings(settings=settings, db=db)
     local_open_orders = _load_local_open_orders(settings=settings, db=db)
     snapshot, account_status = _load_account_snapshot_if_available(
@@ -71,6 +80,31 @@ def build_portfolio_risk_snapshot(
         db=db,
         adapter=adapter,
         symbols=sorted({row.symbol for row in [*local_positions, *local_open_orders]}),
+    )
+    raw_balance_valid = broker_raw_balance_is_valid(snapshot.payload if snapshot is not None else None)
+    raw_balance_fresh = (
+        broker_raw_balance_is_fresh(
+            observed_at=snapshot.observed_at,
+            as_of=generated_at,
+            max_age_seconds=settings.exec_agent_max_account_snapshot_age_seconds,
+        )
+        if snapshot is not None
+        else False
+    )
+    raw_holdings = (
+        broker_raw_holdings_from_payload(snapshot.payload)
+        if snapshot is not None and raw_balance_valid and raw_balance_fresh
+        else []
+    )
+    if snapshot is not None and raw_holdings:
+        snapshot = snapshot_with_raw_balance_holdings(
+            snapshot,
+            as_of=generated_at,
+            max_age_seconds=settings.exec_agent_max_account_snapshot_age_seconds,
+        )
+    raw_drift = raw_vs_normalized_position_drift(
+        raw_holdings=raw_holdings,
+        positions=all_positions,
     )
 
     holdings = _holdings_from_snapshot(snapshot) if snapshot is not None else local_positions
@@ -101,6 +135,7 @@ def build_portfolio_risk_snapshot(
         stop_risk_payload=stop_risk_payload,
         freshness=freshness,
         stale_order_warnings=stale_order_warnings,
+        raw_drift=raw_drift,
     )
 
     source_status = _source_status(
@@ -124,6 +159,16 @@ def build_portfolio_risk_snapshot(
         "holdings": {
             "open_count": len(holdings),
             "top_by_market_value": holdings_payload,
+            "broker_raw": {
+                "available": bool(raw_holdings),
+                "valid": raw_balance_valid,
+                "fresh": raw_balance_fresh,
+                "freshness_threshold_seconds": settings.exec_agent_max_account_snapshot_age_seconds,
+                "source": "broker_raw.balance.output1" if raw_holdings else None,
+                "holdings": [broker_raw_holding_payload(holding) for holding in raw_holdings],
+                "normalized_drift_count": len(raw_drift),
+                "normalized_drift": raw_drift,
+            },
         },
         "open_orders": {
             "open_count": len(open_orders),
@@ -209,14 +254,7 @@ def _source_status(
 
 
 def _load_local_holdings(*, settings: Settings, db: Session) -> list[HoldingRiskRow]:
-    positions = db.scalars(
-        select(ExecutionPosition)
-        .where(
-            ExecutionPosition.mode == settings.runtime_mode,
-            or_(ExecutionPosition.quantity > 0, ExecutionPosition.base_quantity > 0),
-        )
-        .order_by(ExecutionPosition.symbol.asc())
-    ).all()
+    positions = _load_positions(settings=settings, db=db)
     return [
         HoldingRiskRow(
             symbol=position.symbol,
@@ -227,8 +265,18 @@ def _load_local_holdings(*, settings: Settings, db: Session) -> list[HoldingRisk
             source="local_execution_positions",
         )
         for position in positions
+        if position.quantity > 0 or (position.base_quantity is not None and position.base_quantity > 0)
     ]
 
+
+def _load_positions(*, settings: Settings, db: Session) -> list[ExecutionPosition]:
+    return list(
+        db.scalars(
+            select(ExecutionPosition)
+            .where(ExecutionPosition.mode == settings.runtime_mode)
+            .order_by(ExecutionPosition.symbol.asc())
+        )
+    )
 
 def _position_market_value(position: ExecutionPosition) -> Decimal | None:
     payload_value = _decimal_from_payload(position.raw_payload, ("market_value", "valuation", "evaluated_amount"))
@@ -283,14 +331,23 @@ def _positions_from_snapshot(snapshot: BrokerAccountSnapshot) -> list[HoldingRis
 
 
 def _holding_market_value(holding: BrokerAccountHolding, *, base_quantity: Decimal | None) -> Decimal | None:
-    payload_value = _decimal_from_payload(holding.payload, ("market_value", "valuation", "evaluated_amount"))
+    payload_value = _decimal_from_payload(
+        holding.payload,
+        ("market_value", "valuation", "evaluated_amount", "evlu_amt"),
+    )
     if payload_value is not None:
         return payload_value
+    current_price = _decimal_from_payload(holding.payload, ("current_price", "prpr", "now_pric", "cur_prc"))
     if holding.average_price is None:
-        return None
+        if current_price is None:
+            return None
+        units = base_quantity if base_quantity and base_quantity > 0 else Decimal(holding.quantity)
+        return units * current_price if units > 0 else None
     units = base_quantity if base_quantity and base_quantity > 0 else Decimal(holding.quantity)
     if units <= 0:
         return None
+    if current_price is not None:
+        return units * current_price
     return units * holding.average_price
 
 
@@ -561,6 +618,7 @@ def _concentration_warnings(
     stop_risk_payload: list[dict[str, object]],
     freshness: dict[str, object],
     stale_order_warnings: list[dict[str, object]],
+    raw_drift: list[dict[str, object]],
 ) -> list[dict[str, object]]:
     warnings: list[dict[str, object]] = []
     if holdings_payload:
@@ -582,6 +640,14 @@ def _concentration_warnings(
         warnings.append({"code": "stale_position_truth", "symbol": symbol})
     for order in stale_order_warnings:
         warnings.append({"code": "stale_open_order", "symbol": order["symbol"], "idempotency_key": order["idempotency_key"], "reason": order["reason"]})
+    for row in raw_drift:
+        warnings.append(
+            {
+                "code": "broker_raw_normalized_position_drift",
+                "symbol": row.get("symbol"),
+                "reason": row.get("reason"),
+            }
+        )
     for row in exposures_payload:
         exposure_pct = _decimal_or_none(row.get("allocation_pct"))
         if exposure_pct is not None and exposure_pct >= TOP_SYMBOL_ALLOCATION_WARNING_PCT * Decimal("100"):
@@ -607,7 +673,7 @@ def _decimal_or_none(value: object) -> Decimal | None:
     if isinstance(value, Decimal):
         return value
     try:
-        return Decimal(str(value))
+        return Decimal(str(value).replace(",", "").strip())
     except (InvalidOperation, ValueError):
         return None
 

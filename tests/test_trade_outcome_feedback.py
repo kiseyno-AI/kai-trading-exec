@@ -233,6 +233,7 @@ def test_trade_outcome_feedback_headlines_broker_total_asset_change_with_unreali
         runtime_mode="paper",
         trade_outcome_feedback_dir=str(tmp_path),
         trade_outcome_feedback_lookback_days=1,
+        exec_agent_max_account_snapshot_age_seconds=20000,
     )
     plan = ExecutionPlan(
         id="plan-asset-drawdown",
@@ -263,6 +264,7 @@ def test_trade_outcome_feedback_headlines_broker_total_asset_change_with_unreali
             last_reconciled_at=datetime(2026, 6, 26, 6, 0, tzinfo=UTC),
             raw_payload={
                 "balance": {
+                    "rt_cd": "0",
                     "output1": [
                         {
                             "pdno": "000660",
@@ -318,6 +320,111 @@ def test_trade_outcome_feedback_headlines_broker_total_asset_change_with_unreali
     assert report["prompt_snippet"]["broker_asset_warnings"][0].startswith("Divergence warning:")
     markdown = (tmp_path / "latest.md").read_text(encoding="utf-8")
     assert markdown.index("Broker total asset change: -406201.0000 KRW") < markdown.index("FIFO realized P/L: -43675.0000 KRW")
+
+    session.close()
+    engine.dispose()
+
+
+def test_trade_outcome_feedback_surfaces_broker_raw_normalized_drift(tmp_path) -> None:
+    engine, session = _session()
+    settings = Settings(
+        runtime_mode="paper",
+        trade_outcome_feedback_dir=str(tmp_path),
+        trade_outcome_feedback_lookback_days=1,
+        exec_agent_max_account_snapshot_age_seconds=300,
+    )
+    plan = ExecutionPlan(
+        id="plan-raw-drift",
+        external_plan_id="plan-raw-drift",
+        source="kai-trading-core",
+        strategy_run_id="run-raw-drift",
+        mode="paper",
+    )
+    session.add(plan)
+    _add_closed_trade(
+        session,
+        plan=plan,
+        suffix="raw-drift",
+        symbol="005930",
+        buy_price="100000",
+        sell_price="101000",
+        quantity=1,
+        filled_day=26,
+    )
+    session.add(
+        ExecutionPosition(
+            id="pos-raw-drift-carrier",
+            mode="paper",
+            symbol="005930",
+            quantity=0,
+            average_price=None,
+            updated_from="reconciliation",
+            last_reconciled_at=datetime(2026, 6, 27, 4, 0, tzinfo=UTC),
+            raw_payload={
+                "balance": {
+                    "rt_cd": "0",
+                    "output1": [
+                        {
+                            "pdno": "002380",
+                            "prdt_name": "KCC",
+                            "hldg_qty": "3",
+                            "ord_psbl_qty": "3",
+                            "pchs_avg_pric": "350000",
+                            "prpr": "331000",
+                            "evlu_amt": "993000",
+                            "evlu_pfls_amt": "-57000",
+                            "evlu_pfls_rt": "-5.4286",
+                        },
+                        {
+                            "pdno": "031330",
+                            "prdt_name": "EG",
+                            "hldg_qty": "7",
+                            "ord_psbl_qty": "7",
+                            "pchs_avg_pric": "9500",
+                            "prpr": "8900",
+                            "evlu_amt": "62300",
+                            "evlu_pfls_amt": "-4200",
+                            "evlu_pfls_rt": "-6.3158",
+                        },
+                    ],
+                    "output2": [
+                        {
+                            "tot_evlu_amt": "9000000",
+                            "nass_amt": "9000000",
+                            "bfdy_tot_asst_evlu_amt": "9010000",
+                            "asst_icdc_amt": "-10000",
+                            "evlu_pfls_smtl_amt": "-61200",
+                        }
+                    ],
+                }
+            },
+        )
+    )
+    session.commit()
+
+    report = generate_trade_outcome_feedback(
+        settings=settings,
+        db=session,
+        as_of=datetime(2026, 6, 27, 4, 2, tzinfo=UTC),
+    )
+
+    broker_asset = report["broker_asset_performance"]
+    assert broker_asset["raw_balance_valid"] is True
+    assert broker_asset["raw_balance_fresh"] is True
+    assert broker_asset["raw_normalized_position_drift_count"] == 2
+    drift_by_symbol = {
+        row["symbol"]: row
+        for row in broker_asset["raw_normalized_position_drift"]
+    }
+    assert drift_by_symbol["002380"]["reason"] == "broker_raw_open_missing_from_normalized"
+    assert drift_by_symbol["002380"]["raw_quantity"] == "3.0000"
+    assert drift_by_symbol["002380"]["normalized_quantity"] == "0.0000"
+    assert drift_by_symbol["002380"]["raw_current_price"] == "331000.0000"
+    assert drift_by_symbol["002380"]["raw_unrealized_pnl_krw"] == "-57000.0000"
+    assert drift_by_symbol["031330"]["raw_quantity"] == "7.0000"
+    markdown = (tmp_path / "latest.md").read_text(encoding="utf-8")
+    assert "Broker raw vs normalized position drift" in markdown
+    assert "002380: raw_qty=3.0000, normalized_qty=0.0000" in markdown
 
     session.close()
     engine.dispose()
