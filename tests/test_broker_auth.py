@@ -9,6 +9,7 @@ from sqlalchemy.orm.attributes import flag_modified
 
 from app.broker.base import (
     BrokerAccountHolding,
+    BrokerAccountOpenOrder,
     BrokerAccountSnapshot,
     BrokerAdapterError,
     BrokerConfig,
@@ -42,6 +43,7 @@ from app.models.runtime import (
     ExecutionFill,
     ExecutionJob,
     ExecutionPlan,
+    ExecutionPlanItemAudit,
     ExecutionPlanItem,
     ExecutionPosition,
     MonitoringCheckpoint,
@@ -2295,6 +2297,7 @@ def _create_watch_buy_candidate(
     client: TestClient,
     *,
     plan_id: str,
+    symbol: str = "005930",
     trigger_price: str = "71000.00",
     chase_limit_price: str | None = "71200.00",
     quantity_policy: dict[str, object] | None = None,
@@ -2303,7 +2306,7 @@ def _create_watch_buy_candidate(
     source_market_date: str | None = None,
 ) -> str:
     item = {
-        "symbol": "005930",
+        "symbol": symbol,
         "side": "buy",
         "intent": "next_open_buy",
         "quantity_policy": quantity_policy or {"kind": "shares", "quantity": 2},
@@ -3739,6 +3742,135 @@ def test_watch_buy_duplicate_monitor_cycles_do_not_submit_duplicate_order() -> N
             select(BrokerOrder).where(BrokerOrder.execution_plan_item_id == item_id)
         ).all()
         assert len(orders) == 1
+
+    engine.dispose()
+
+
+def test_watch_buy_cycle_reserves_orderable_cash_before_broker_submission() -> None:
+    app, engine, client, broker_adapter = _build_watch_buy_test_app(
+        order_id="kis-watch-buy-reserved-cash-1"
+    )
+    broker_adapter.account_snapshot = BrokerAccountSnapshot(
+        available_cash=Decimal("1000000.00"),
+        buying_power=Decimal("1000000.00"),
+        observed_at=datetime.now(UTC),
+        source="stub:account_snapshot",
+        open_orders=[
+            BrokerAccountOpenOrder(
+                symbol="066570",
+                side="buy",
+                quantity=10,
+                remaining_quantity=10,
+                limit_price=Decimal("75000.00"),
+                broker_order_id="kis-existing-open-buy-1",
+            )
+        ],
+    )
+    first_item_id = _create_watch_buy_candidate(
+        client,
+        plan_id="plan-watch-buy-reserved-cash-1",
+        symbol="000660",
+        risk_context={
+            "exchange": "KRX",
+            "stop_price": "70000.00",
+            "trigger_direction": "at_or_above",
+        },
+    )
+    second_item_id = _create_watch_buy_candidate(
+        client,
+        plan_id="plan-watch-buy-reserved-cash-2",
+        symbol="005930",
+        risk_context={
+            "exchange": "KRX",
+            "stop_price": "70000.00",
+            "trigger_direction": "at_or_above",
+        },
+    )
+    with app.state.db_session_factory() as session:
+        session.add(
+            BrokerOrder(
+                broker_name="kis",
+                mode="paper",
+                idempotency_key="local-existing-open-buy-1",
+                broker_order_id="kis-existing-open-buy-1",
+                symbol="066570",
+                side="buy",
+                status="open",
+                quantity=10,
+                limit_price=Decimal("75000.00"),
+            )
+        )
+        session.commit()
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "trigger watch buys under shared cash cap",
+            "prices": [
+                {"symbol": "000660", "price": "71050.00"},
+                {"symbol": "005930", "price": "71050.00"},
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["triggered_item_count"] == 2
+    assert payload["submitted_order_count"] == 1
+    assert payload["blocked_item_count"] == 1
+    results = {item["execution_plan_item_id"]: item for item in payload["items"]}
+    assert len(broker_adapter.order_calls) == 1
+    submitted_item_id = broker_adapter.order_calls[0].execution_plan_item_id
+    assert submitted_item_id in {first_item_id, second_item_id}
+    rejected_item_id = second_item_id if submitted_item_id == first_item_id else first_item_id
+    assert results[submitted_item_id]["outcome"] == "submitted"
+    assert results[rejected_item_id]["outcome"] == "rejected"
+    assert results[rejected_item_id]["block_reason"] == "reserved_cash_exhausted"
+
+    with app.state.db_session_factory() as session:
+        first_item = session.get(ExecutionPlanItem, first_item_id)
+        second_item = session.get(ExecutionPlanItem, second_item_id)
+        submitted_item = session.get(ExecutionPlanItem, submitted_item_id)
+        rejected_item = session.get(ExecutionPlanItem, rejected_item_id)
+        assert first_item is not None
+        assert second_item is not None
+        assert submitted_item is not None
+        assert rejected_item is not None
+        assert submitted_item.status == "watch_buy_submitted"
+        assert rejected_item.status == "watch_buy_rejected"
+        last_event = rejected_item.risk_context["last_monitoring_event"]
+        assert last_event["reason"] == "reserved_cash_exhausted"
+        details = last_event["details"]
+        assert details["orderable_cash"] == "1000000.0000"
+        assert details["already_reserved_notional"] == "892100.0000"
+        assert details["candidate_notional"] == "142100.0000"
+        audit = session.scalar(
+            select(ExecutionPlanItemAudit).where(
+                ExecutionPlanItemAudit.execution_plan_item_id == rejected_item_id,
+                ExecutionPlanItemAudit.event_type == "reserved_cash_exhausted",
+            )
+        )
+        assert audit is not None
+        assert audit.payload["reason"] == "reserved_cash_exhausted"
+
+    retry = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "same cash condition should not retry local rejection",
+            "prices": [
+                {"symbol": "000660", "price": "71050.00"},
+                {"symbol": "005930", "price": "71050.00"},
+            ],
+        },
+    )
+
+    assert retry.status_code == 200
+    assert retry.json()["submitted_order_count"] == 0
+    assert len(broker_adapter.order_calls) == 1
 
     engine.dispose()
 

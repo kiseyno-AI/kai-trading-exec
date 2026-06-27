@@ -16,9 +16,16 @@ from app.api.schemas.execution import (
     MonitoringPriceRequest,
     PlaceOrderRequest,
 )
-from app.broker.base import BrokerAccountSnapshot, BrokerAdapter, BrokerAdapterError
+from app.broker.base import BrokerAccountOpenOrder, BrokerAccountSnapshot, BrokerAdapter, BrokerAdapterError
 from app.core.config import Settings
-from app.models.runtime import BrokerOrder, ExecutionPlan, ExecutionPlanItem, ExecutionPosition, MonitoringCheckpoint
+from app.models.runtime import (
+    BrokerOrder,
+    ExecutionPlan,
+    ExecutionPlanItem,
+    ExecutionPlanItemAudit,
+    ExecutionPosition,
+    MonitoringCheckpoint,
+)
 from app.services.broker_auth import ensure_authenticated_broker_session
 from app.services.reconciliation import (
     reconcile_pending_broker_orders,
@@ -164,6 +171,10 @@ WATCH_BUY_EXPIRABLE_STATUSES = frozenset(
         AGENT_APPROVED_PENDING_SUBMIT_STATUS,
     }
 )
+OPEN_BUY_ORDER_STATUSES = frozenset(
+    {"submitted", "open", "partially_filled", "submission_pending", "retry_pending"}
+)
+RESERVED_CASH_EXHAUSTED_REASON = "reserved_cash_exhausted"
 
 
 @dataclass(frozen=True)
@@ -188,6 +199,18 @@ class WatchBuyOrderApproval:
     reason: str | None = None
     message: str | None = None
     details: dict[str, object] | None = None
+
+
+@dataclass
+class WatchBuyCashReservation:
+    orderable_cash: Decimal
+    already_reserved_notional: Decimal
+    batch_id: str
+
+    @property
+    def remaining_cash(self) -> Decimal:
+        remaining = self.orderable_cash - self.already_reserved_notional
+        return remaining if remaining > 0 else Decimal("0")
 
 
 @dataclass(frozen=True)
@@ -499,6 +522,7 @@ def _evaluate_monitoring_cycle(
     deferred_item_count = 0
     dispatch_action_count = 0
     retried_triggered_item_count = 0
+    watch_buy_cash_reservation: WatchBuyCashReservation | str | None = None
 
     for item in items:
         if item.status in NON_MONITORABLE_PLAN_ITEM_STATUSES:
@@ -934,6 +958,102 @@ def _evaluate_monitoring_cycle(
                     submitted_quantity=quantity,
                     recorded_at=triggered_at,
                 )
+            else:
+                control_state = ensure_runtime_control_state(settings=settings, db=db)
+                if automated_order_submission_allowed(control_state):
+                    if watch_buy_cash_reservation is None:
+                        watch_buy_cash_reservation = _load_watch_buy_cash_reservation(
+                            settings=settings,
+                            db=db,
+                            adapter=adapter,
+                            triggered_at=triggered_at,
+                        )
+                    if isinstance(watch_buy_cash_reservation, str):
+                        blocked_item_count += 1
+                        action.item.status = "watch_buy_triggered_blocked"
+                        _record_monitoring_event(
+                            item=action.item,
+                            event={
+                                "event": "watch_buy_triggered_blocked",
+                                "reason": "account_snapshot_unavailable",
+                                "message": watch_buy_cash_reservation,
+                                "observed_price": _serialize_decimal(action.observed_price),
+                                "recorded_at": triggered_at.isoformat(),
+                                "retry_after_at": (
+                                    triggered_at
+                                    + timedelta(seconds=settings.monitoring_watch_buy_retry_cooldown_seconds)
+                                ).isoformat(),
+                            },
+                        )
+                        result_by_item_id[action.item.id] = _monitoring_result_payload(
+                            item=action.item,
+                            observed_price=action.observed_price,
+                            outcome="blocked",
+                            block_reason="account_snapshot_unavailable",
+                            message=watch_buy_cash_reservation,
+                        )
+                        if symbol_actions:
+                            pending_symbols.append(symbol)
+                        continue
+                    limit_price = limit_price_override or _watch_buy_limit_price(
+                        item=action.item,
+                        observed_price=action.observed_price,
+                    )
+                    candidate_notional = _watch_buy_order_notional(
+                        quantity=quantity,
+                        limit_price=limit_price,
+                    )
+                    if candidate_notional is None:
+                        blocked_item_count += 1
+                        action.item.status = "watch_buy_rejected"
+                        _record_monitoring_event(
+                            item=action.item,
+                            event={
+                                "event": "watch_buy_rejected",
+                                "reason": RESERVED_CASH_EXHAUSTED_REASON,
+                                "message": "watch buy requires limit-price notional for reserved cash guard",
+                                "recorded_at": triggered_at.isoformat(),
+                            },
+                        )
+                        result_by_item_id[action.item.id] = _monitoring_result_payload(
+                            item=action.item,
+                            observed_price=action.observed_price,
+                            outcome="rejected",
+                            block_reason=RESERVED_CASH_EXHAUSTED_REASON,
+                            message="watch buy requires limit-price notional for reserved cash guard",
+                        )
+                        if symbol_actions:
+                            pending_symbols.append(symbol)
+                        continue
+                    reservation_payload = _watch_buy_cash_reservation_payload(
+                        reservation=watch_buy_cash_reservation,
+                        candidate_notional=candidate_notional,
+                        item=action.item,
+                        quantity=quantity,
+                        limit_price=limit_price,
+                        triggered_at=triggered_at,
+                    )
+                    if candidate_notional > watch_buy_cash_reservation.remaining_cash:
+                        blocked_item_count += 1
+                        action.item.status = "watch_buy_rejected"
+                        _record_reserved_cash_exhausted(
+                            db=db,
+                            item=action.item,
+                            payload=reservation_payload,
+                            triggered_at=triggered_at,
+                        )
+                        result_by_item_id[action.item.id] = _monitoring_result_payload(
+                            item=action.item,
+                            observed_price=action.observed_price,
+                            outcome="rejected",
+                            block_reason=RESERVED_CASH_EXHAUSTED_REASON,
+                            message="watch buy reserved cash budget exhausted before broker submission",
+                            trigger_metadata=reservation_payload,
+                        )
+                        if symbol_actions:
+                            pending_symbols.append(symbol)
+                        continue
+                    watch_buy_cash_reservation.already_reserved_notional += candidate_notional
 
             dispatch_action_count += 1
             placement = _place_monitoring_order(
@@ -3928,6 +4048,155 @@ def _load_watch_buy_account_snapshot(
         return adapter.get_account_snapshot(session_state.access_token or "")
     except (BrokerAdapterError, AttributeError, NotImplementedError, RuntimeError, ValueError) as exc:
         return f"{exc.__class__.__name__}: {exc}"
+
+
+def _load_watch_buy_cash_reservation(
+    *,
+    settings: Settings,
+    db: Session,
+    adapter: BrokerAdapter,
+    triggered_at: datetime,
+) -> WatchBuyCashReservation | str:
+    snapshot = _load_watch_buy_account_snapshot(settings=settings, db=db, adapter=adapter)
+    if isinstance(snapshot, str):
+        return snapshot
+    orderable_cash = _minimum_decimal(snapshot.available_cash, snapshot.buying_power)
+    if orderable_cash is None:
+        return "account snapshot did not include orderable cash"
+    already_reserved = _snapshot_open_buy_order_notional(snapshot.open_orders)
+    already_reserved += _local_open_buy_order_notional(
+        settings=settings,
+        db=db,
+        snapshot_open_orders=snapshot.open_orders,
+    )
+    return WatchBuyCashReservation(
+        orderable_cash=orderable_cash,
+        already_reserved_notional=already_reserved,
+        batch_id=f"monitoring:{MONITORING_WORKER_NAME}:{triggered_at.isoformat()}",
+    )
+
+
+def _snapshot_open_buy_order_notional(open_orders: list[BrokerAccountOpenOrder]) -> Decimal:
+    total = Decimal("0")
+    for order in open_orders:
+        if order.side != "buy":
+            continue
+        total += _open_buy_order_notional(
+            quantity=order.remaining_quantity or order.quantity,
+            limit_price=order.limit_price,
+        )
+    return total
+
+
+def _local_open_buy_order_notional(
+    *,
+    settings: Settings,
+    db: Session,
+    snapshot_open_orders: list[BrokerAccountOpenOrder],
+) -> Decimal:
+    snapshot_broker_order_ids = {
+        order.broker_order_id
+        for order in snapshot_open_orders
+        if order.side == "buy" and order.broker_order_id
+    }
+    snapshot_idempotency_keys_without_broker_id = {
+        order.idempotency_key
+        for order in snapshot_open_orders
+        if order.side == "buy" and not order.broker_order_id and order.idempotency_key
+    }
+    orders = db.scalars(
+        select(BrokerOrder).where(
+            BrokerOrder.mode == settings.runtime_mode,
+            BrokerOrder.side == "buy",
+            BrokerOrder.status.in_(tuple(OPEN_BUY_ORDER_STATUSES)),
+        )
+    ).all()
+    total = Decimal("0")
+    for order in orders:
+        if order.broker_order_id and order.broker_order_id in snapshot_broker_order_ids:
+            continue
+        if (
+            not order.broker_order_id
+            and order.idempotency_key
+            and order.idempotency_key in snapshot_idempotency_keys_without_broker_id
+        ):
+            continue
+        total += _open_buy_order_notional(
+            quantity=order.quantity,
+            limit_price=order.limit_price,
+        )
+    return total
+
+
+def _open_buy_order_notional(*, quantity: int | None, limit_price: Decimal | None) -> Decimal:
+    if quantity is None or quantity <= 0 or limit_price is None:
+        return Decimal("0")
+    return Decimal(quantity) * limit_price
+
+
+def _watch_buy_order_notional(*, quantity: int, limit_price: Decimal | None) -> Decimal | None:
+    if quantity <= 0 or limit_price is None:
+        return None
+    return Decimal(quantity) * limit_price
+
+
+def _watch_buy_cash_reservation_payload(
+    *,
+    reservation: WatchBuyCashReservation,
+    candidate_notional: Decimal,
+    item: ExecutionPlanItem,
+    quantity: int,
+    limit_price: Decimal,
+    triggered_at: datetime,
+) -> dict[str, object]:
+    return {
+        "reason": RESERVED_CASH_EXHAUSTED_REASON,
+        "batch_id": reservation.batch_id,
+        "cycle_id": reservation.batch_id,
+        "orderable_cash": _serialize_decimal(reservation.orderable_cash),
+        "available_cash": _serialize_decimal(reservation.remaining_cash),
+        "already_reserved_notional": _serialize_decimal(reservation.already_reserved_notional),
+        "candidate_notional": _serialize_decimal(candidate_notional),
+        "quantity": quantity,
+        "limit_price": _serialize_decimal(limit_price),
+        "symbol": item.symbol,
+        "execution_plan_item_id": item.id,
+        "recorded_at": triggered_at.isoformat(),
+    }
+
+
+def _record_reserved_cash_exhausted(
+    *,
+    db: Session,
+    item: ExecutionPlanItem,
+    payload: dict[str, object],
+    triggered_at: datetime,
+) -> None:
+    _record_monitoring_event(
+        item=item,
+        event={
+            "event": "watch_buy_rejected",
+            "reason": RESERVED_CASH_EXHAUSTED_REASON,
+            "message": "watch buy reserved cash budget exhausted before broker submission",
+            "details": payload,
+            "recorded_at": triggered_at.isoformat(),
+        },
+    )
+    db.add(
+        ExecutionPlanItemAudit(
+            execution_plan_item_id=item.id,
+            event_type=RESERVED_CASH_EXHAUSTED_REASON,
+            source=MONITORING_WORKER_NAME,
+            summary={
+                "reason": RESERVED_CASH_EXHAUSTED_REASON,
+                "batch_id": payload.get("batch_id"),
+                "symbol": item.symbol,
+            },
+            payload=payload,
+            error_message="watch buy reserved cash budget exhausted before broker submission",
+            occurred_at=triggered_at,
+        )
+    )
 
 
 def _snapshot_symbol_quantity(*, snapshot: BrokerAccountSnapshot, symbol: str) -> int:
