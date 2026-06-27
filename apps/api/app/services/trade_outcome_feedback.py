@@ -20,6 +20,13 @@ from app.services.account_drawdown_gate import (
     account_drawdown_gate_report_lines,
     latest_account_drawdown_gate_state,
 )
+from app.services.broker_raw_holdings import (
+    broker_raw_balance_is_fresh,
+    broker_raw_balance_is_valid,
+    broker_raw_holding_payload,
+    broker_raw_holdings_from_payload,
+    raw_vs_normalized_position_drift,
+)
 
 REPORT_VERSION = "trade-outcome-feedback-v1"
 MIN_CANDIDATE_RULE_SAMPLE_SIZE = 3
@@ -84,6 +91,7 @@ def generate_trade_outcome_feedback(
         closed_trades=closed_trades,
         lookback_days=days,
         started_at=started_at,
+        as_of=now,
     )
     summary = _summary(closed_trades, broker_asset_performance=broker_asset_performance)
     lessons = _lessons(closed_trades, max_lessons=settings.trade_outcome_feedback_max_lessons)
@@ -291,6 +299,7 @@ def _broker_asset_performance(
     closed_trades: list[dict[str, object]],
     lookback_days: int,
     started_at: datetime,
+    as_of: datetime,
 ) -> dict[str, object]:
     positions = _load_all_positions(settings=settings, db=db)
     snapshots = _broker_balance_snapshots(positions)
@@ -332,6 +341,18 @@ def _broker_asset_performance(
     position = snapshot.position
     balance = snapshot.balance
     output2 = snapshot.output2
+    raw_balance_valid = broker_raw_balance_is_valid(position.raw_payload)
+    raw_balance_fresh = broker_raw_balance_is_fresh(
+        observed_at=snapshot.observed_at,
+        as_of=as_of,
+        max_age_seconds=settings.exec_agent_max_account_snapshot_age_seconds,
+    )
+    raw_holdings = (
+        broker_raw_holdings_from_payload(position.raw_payload)
+        if raw_balance_valid and raw_balance_fresh
+        else []
+    )
+    raw_drift = raw_vs_normalized_position_drift(raw_holdings=raw_holdings, positions=positions)
     raw_fields = {key: output2.get(key) for key in BROKER_BALANCE_OUTPUT2_FIELDS if key in output2}
     asset_change_pct = (
         asset_change / baseline_total_asset * Decimal("100")
@@ -343,7 +364,7 @@ def _broker_asset_performance(
         for row in closed_trades
     )
     divergence = _asset_fifo_divergence(asset_change=asset_change, realized_pnl=realized_pnl)
-    holdings = _broker_holdings_from_output1(balance.get("output1"))
+    holdings = [broker_raw_holding_payload(holding) for holding in raw_holdings]
     if not holdings:
         holdings = [_position_holding_fallback(position=row) for row in positions if _position_effective_quantity(row) > 0]
     return {
@@ -351,8 +372,11 @@ def _broker_asset_performance(
         "source": "execution_positions.raw_payload.balance.output2",
         "source_window": source_window,
         "holdings_source": "execution_positions.raw_payload.balance.output1"
-        if _payload_rows(balance.get("output1"))
+        if raw_holdings
         else "execution_positions",
+        "raw_balance_valid": raw_balance_valid,
+        "raw_balance_fresh": raw_balance_fresh,
+        "raw_balance_freshness_threshold_seconds": settings.exec_agent_max_account_snapshot_age_seconds,
         "observed_at": _normalize_utc(position.last_reconciled_at).isoformat()
         if position.last_reconciled_at is not None
         else None,
@@ -370,6 +394,8 @@ def _broker_asset_performance(
         "fifo_realized_pnl_krw": _decimal_text(realized_pnl),
         "divergence_warning": divergence,
         "holdings": _json_safe(holdings),
+        "raw_normalized_position_drift": _json_safe(raw_drift),
+        "raw_normalized_position_drift_count": len(raw_drift),
         "raw_output2_fields": _json_safe(raw_fields),
     }
 
@@ -1482,6 +1508,17 @@ def _markdown_report(report: dict[str, object]) -> str:
                     lines.append(
                         f"  - {row.get('symbol')}: qty={row.get('quantity')}, "
                         f"value={row.get('market_value_krw')} KRW, unrealized={row.get('unrealized_pnl_krw')} KRW"
+                    )
+        drift = broker_asset.get("raw_normalized_position_drift")
+        if isinstance(drift, list) and drift:
+            lines.append("- Broker raw vs normalized position drift:")
+            for row in drift[:10]:
+                if isinstance(row, dict):
+                    lines.append(
+                        f"  - {row.get('symbol')}: raw_qty={row.get('raw_quantity')}, "
+                        f"normalized_qty={row.get('normalized_quantity')}, "
+                        f"raw_avg={row.get('raw_average_price')}, normalized_avg={row.get('normalized_average_price')}, "
+                        f"raw_price={row.get('raw_current_price')}, raw_unrealized={row.get('raw_unrealized_pnl_krw')} KRW"
                     )
     else:
         lines.append(f"- 사용 불가: {broker_asset.get('source_failed')}")

@@ -26,6 +26,7 @@ from app.services.account_drawdown_gate import (
     evaluate_account_drawdown_gate,
     record_account_drawdown_block,
 )
+from app.services.broker_raw_holdings import snapshot_with_raw_balance_holdings
 from app.services.broker_auth import ensure_authenticated_broker_session
 from app.services.domestic_order_router import RouteDecision, resolve_domestic_order_route
 from app.services.execution_failures import record_actionable_execution_failure
@@ -517,11 +518,17 @@ def _evaluate_new_buy_account_gate(
             reason=f"broker account snapshot unavailable before new buy: {exc.__class__.__name__}: {exc}",
         )
 
+    observed_at = datetime.now(UTC)
     return evaluate_account_drawdown_gate(
         settings=settings,
-        snapshot=snapshot,
+        snapshot=snapshot_with_raw_balance_holdings(
+            snapshot,
+            as_of=observed_at,
+            max_age_seconds=settings.exec_agent_max_account_snapshot_age_seconds,
+        ),
         order_idempotency_key=command.idempotency_key,
         execution_plan_item_id=plan_item.id if plan_item is not None else command.execution_plan_item_id,
+        now=observed_at,
     )
 
 

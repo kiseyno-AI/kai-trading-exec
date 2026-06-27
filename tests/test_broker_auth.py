@@ -1714,6 +1714,129 @@ def test_new_buy_blocked_by_severe_unrealized_holding_loss_but_sell_allowed() ->
     engine.dispose()
 
 
+def test_new_buy_blocked_by_broker_raw_holding_loss_missing_from_normalized_positions() -> None:
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(broker_order_id="kis-raw-drift-buy-1"),
+        account_snapshot=BrokerAccountSnapshot(
+            available_cash=Decimal("5000000"),
+            observed_at=datetime.now(UTC),
+            source="stub:account_snapshot",
+            total_asset_value=Decimal("10000000"),
+            previous_total_asset_value=Decimal("10000000"),
+            asset_change_amount=Decimal("0"),
+            unrealized_pnl=Decimal("-57000"),
+            holdings=[],
+            payload={
+                "balance": {
+                    "rt_cd": "0",
+                    "output1": [
+                        {
+                            "pdno": "002380",
+                            "hldg_qty": "3",
+                            "ord_psbl_qty": "3",
+                            "pchs_avg_pric": "350000",
+                            "prpr": "331000",
+                            "evlu_amt": "993000",
+                            "evlu_pfls_amt": "-57000",
+                            "evlu_pfls_rt": "-5.4286",
+                        },
+                        {
+                            "pdno": "031330",
+                            "hldg_qty": "7",
+                            "ord_psbl_qty": "7",
+                            "pchs_avg_pric": "9500",
+                            "prpr": "8900",
+                            "evlu_amt": "62300",
+                            "evlu_pfls_amt": "-4200",
+                            "evlu_pfls_rt": "-6.3158",
+                        },
+                    ],
+                    "output2": [
+                        {
+                            "tot_evlu_amt": "10000000",
+                            "bfdy_tot_asst_evlu_amt": "10000000",
+                            "asst_icdc_amt": "0",
+                            "evlu_pfls_smtl_amt": "-61200",
+                        }
+                    ],
+                }
+            },
+        ),
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+            account_daily_total_asset_drawdown_krw=Decimal("0"),
+            account_unrealized_loss_abs_krw=Decimal("0"),
+            account_unrealized_loss_pct=Decimal("0"),
+            account_severe_holding_loss_pct=Decimal("5.0"),
+        ),
+        broker_adapter=broker_adapter,
+    )
+    client = TestClient(app)
+    assert client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "console", "reason": "enable automation"},
+    ).status_code == 200
+    plan_response = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-raw-holding-loss-block-1",
+            "source": "kai-trading-core",
+            "items": [
+                {"symbol": "000660", "side": "buy", "intent": "watch_buy", "limit_price": "100000.00"},
+            ],
+        },
+    )
+    buy_item_id = plan_response.json()["persisted_execution_item_ids"][0]
+
+    buy_response = client.post(
+        "/orders",
+        json={
+            "idempotency_key": "raw-holding-loss-blocked-buy-1",
+            "execution_plan_item_id": buy_item_id,
+            "symbol": "000660",
+            "side": "buy",
+            "quantity": 1,
+            "order_type": "limit",
+            "limit_price": "100000.00",
+            "time_in_force": "day",
+            "exchange": "KRX",
+        },
+    )
+
+    assert buy_response.status_code == 409
+    payload = buy_response.json()
+    assert payload["block_reason"] == "severe_holding_unrealized_loss_pct"
+    assert broker_adapter.order_calls == []
+    with app.state.db_session_factory() as session:
+        audit = session.scalar(
+            select(ExecutionPlanItemAudit).where(
+                ExecutionPlanItemAudit.execution_plan_item_id == buy_item_id,
+                ExecutionPlanItemAudit.event_type == "account_drawdown_new_buy_blocked",
+            )
+        )
+        assert audit is not None
+        assert audit.payload["holdings"][0]["symbol"] == "002380"
+        assert audit.payload["holdings"][0]["unrealized_pnl_pct"] == "-5.4286"
+        normalized_position = session.scalar(
+            select(ExecutionPosition).where(ExecutionPosition.symbol == "002380")
+        )
+        assert normalized_position is None
+    engine.dispose()
+
+
 def test_profitable_holding_unrealized_percent_does_not_block_new_kis_buy() -> None:
     broker_adapter = StubBrokerAdapter(
         config=BrokerConfig(
