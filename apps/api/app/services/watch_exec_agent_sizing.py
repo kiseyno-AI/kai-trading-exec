@@ -715,6 +715,7 @@ def _load_sizing_account_context(
 ) -> dict[str, object]:
     if adapter is None:
         return {"available": False, "reason": "broker_adapter_unavailable"}
+    stale_reconciliation: dict[str, object] | None = None
     try:
         stale_reconciliation = _reconcile_stale_sizing_orders(
             settings=settings,
@@ -731,7 +732,10 @@ def _load_sizing_account_context(
         )
         snapshot = adapter.get_account_snapshot(session_state.access_token or "")
     except (BrokerAdapterError, AttributeError, NotImplementedError, RuntimeError, ValueError) as exc:
-        return {"available": False, "reason": f"{exc.__class__.__name__}: {exc}"}
+        return _unavailable_account_context(
+            reason=f"{exc.__class__.__name__}: {exc}",
+            stale_reconciliation=stale_reconciliation,
+        )
     return _account_context_payload(snapshot, stale_reconciliation=stale_reconciliation)
 
 
@@ -744,6 +748,7 @@ def _load_sizing_account_context_short_transaction(
 ) -> dict[str, object]:
     if adapter is None:
         return {"available": False, "reason": "broker_adapter_unavailable"}
+    stale_reconciliation: dict[str, object] | None = None
     try:
         with session_factory() as db:
             stale_reconciliation = _reconcile_stale_sizing_orders(
@@ -763,7 +768,10 @@ def _load_sizing_account_context_short_transaction(
             db.commit()
         snapshot = adapter.get_account_snapshot(access_token)
     except (BrokerAdapterError, AttributeError, NotImplementedError, RuntimeError, ValueError) as exc:
-        return {"available": False, "reason": f"{exc.__class__.__name__}: {exc}"}
+        return _unavailable_account_context(
+            reason=f"{exc.__class__.__name__}: {exc}",
+            stale_reconciliation=stale_reconciliation,
+        )
     return _account_context_payload(snapshot, stale_reconciliation=stale_reconciliation)
 
 
@@ -820,6 +828,21 @@ def _account_context_payload(
         "holdings": holdings,
         "open_orders": open_orders,
     }
+    if stale_reconciliation is not None:
+        blockers = _stale_state_blockers_from_reconciliation(stale_reconciliation)
+        payload["stale_order_reconciliation"] = _json_safe(stale_reconciliation)
+        payload["stale_state_blocker_count"] = len(blockers)
+        payload["stale_state_blocked_symbols"] = sorted({str(row["symbol"]) for row in blockers})
+        payload["stale_state_blockers"] = blockers
+    return payload
+
+
+def _unavailable_account_context(
+    *,
+    reason: str,
+    stale_reconciliation: dict[str, object] | None,
+) -> dict[str, object]:
+    payload: dict[str, object] = {"available": False, "reason": reason}
     if stale_reconciliation is not None:
         blockers = _stale_state_blockers_from_reconciliation(stale_reconciliation)
         payload["stale_order_reconciliation"] = _json_safe(stale_reconciliation)

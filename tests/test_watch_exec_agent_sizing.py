@@ -7,6 +7,7 @@ from decimal import Decimal
 from sqlalchemy import select
 
 from app.broker.base import (
+    BrokerAdapterError,
     BrokerAccountHolding,
     BrokerAccountOpenOrder,
     BrokerAccountSnapshot,
@@ -46,8 +47,14 @@ from app.services.watch_exec_agent_sizing import (
 class WatchSizingBrokerStub:
     provider = "kis"
 
-    def __init__(self, *, reconcile_payloads: list[dict[str, object]]) -> None:
+    def __init__(
+        self,
+        *,
+        reconcile_payloads: list[dict[str, object]],
+        snapshot_error: Exception | None = None,
+    ) -> None:
         self.reconcile_payloads = reconcile_payloads
+        self.snapshot_error = snapshot_error
         self.events: list[str] = []
         self.reconcile_calls: list[str] = []
 
@@ -76,6 +83,8 @@ class WatchSizingBrokerStub:
 
     def get_account_snapshot(self, access_token: str) -> BrokerAccountSnapshot:
         self.events.append("snapshot")
+        if self.snapshot_error is not None:
+            raise self.snapshot_error
         return BrokerAccountSnapshot(
             available_cash=Decimal("10000000"),
             buying_power=Decimal("10000000"),
@@ -357,6 +366,80 @@ def test_stale_open_order_unknown_broker_status_blocks_watch_sizing_before_agent
         "message": "new broker status",
         "observed_at": "2026-06-04T00:00:00+00:00",
     }
+    assert audit is not None
+    engine.dispose()
+
+
+def test_stale_open_order_block_survives_account_snapshot_failure(tmp_path, monkeypatch) -> None:
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'watch-sizing-stale-snapshot-fail.db'}",
+        runtime_mode="paper",
+        exec_agent_enabled=True,
+        exec_agent_watch_sizing_enabled=True,
+        exec_agent_watch_sizing_start_local_time="00:00",
+        exec_agent_watch_sizing_end_local_time="23:59",
+        stale_broker_order_reconciliation_threshold_seconds=60,
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    with session_factory() as session:
+        session.add(
+            ExecutionPlan(
+                external_plan_id="plan-stale-snapshot-fail",
+                strategy_run_id="strategy-1",
+                source="core-short-term-decider",
+                market_date=date(2026, 6, 4),
+                mode="paper",
+                items=[
+                    _watch_item(
+                        item_id="watch-item-snapshot-fail",
+                        symbol="005930",
+                        risk_context={"target_price": "76000", "stop_price": "69000"},
+                    )
+                ],
+            )
+        )
+        session.add(_stale_local_order(symbol="005930", broker_order_id="stale-snapshot-fail-1"))
+        session.commit()
+
+    def fail_agent(**_) -> dict[str, object]:
+        raise AssertionError("exec-agent should not be called when stale blockers survive snapshot failure")
+
+    monkeypatch.setattr(watch_sizing, "_request_exec_agent_decisions", fail_agent)
+    broker = WatchSizingBrokerStub(
+        reconcile_payloads=[
+            {
+                "broker_order_id": "stale-snapshot-fail-1",
+                "status": "mystery_status",
+                "broker_status": "ZZ99",
+                "message": "new broker status",
+                "observed_at": datetime(2026, 6, 4, 0, 0, tzinfo=UTC).isoformat(),
+                "payload": {"ord_stat": "ZZ99"},
+            }
+        ],
+        snapshot_error=BrokerAdapterError("account snapshot timeout"),
+    )
+
+    result = run_due_watch_exec_agent_sizing(
+        settings=settings,
+        session_factory=session_factory,
+        adapter=broker,
+        now=datetime(2026, 6, 4, 0, 0, tzinfo=UTC),
+    )
+
+    with session_factory() as session:
+        item = session.get(ExecutionPlanItem, "watch-item-snapshot-fail")
+        audit = session.scalar(
+            select(ExecutionPlanItemAudit).where(
+                ExecutionPlanItemAudit.event_type == "watch_exec_agent_sizing_stale_state_blocked"
+            )
+        )
+
+    assert broker.events.index("reconcile") < broker.events.index("snapshot")
+    assert result.payload["applied"][0]["stale_state_blocked_item_ids"] == ["watch-item-snapshot-fail"]
+    assert item.status == "exec_agent_rejected"
+    assert item.quantity_policy["stale_state_blockers"][0]["classification"] == "unknown"
     assert audit is not None
     engine.dispose()
 
