@@ -81,11 +81,12 @@ def build_portfolio_risk_snapshot(
         adapter=adapter,
         symbols=sorted({row.symbol for row in [*local_positions, *local_open_orders]}),
     )
+    raw_balance_freshness_as_of = now or datetime.now(UTC)
     raw_balance_valid = broker_raw_balance_is_valid(snapshot.payload if snapshot is not None else None)
     raw_balance_fresh = (
         broker_raw_balance_is_fresh(
             observed_at=snapshot.observed_at,
-            as_of=generated_at,
+            as_of=raw_balance_freshness_as_of,
             max_age_seconds=settings.exec_agent_max_account_snapshot_age_seconds,
         )
         if snapshot is not None
@@ -99,7 +100,7 @@ def build_portfolio_risk_snapshot(
     if snapshot is not None and raw_holdings:
         snapshot = snapshot_with_raw_balance_holdings(
             snapshot,
-            as_of=generated_at,
+            as_of=raw_balance_freshness_as_of,
             max_age_seconds=settings.exec_agent_max_account_snapshot_age_seconds,
         )
     raw_drift = raw_vs_normalized_position_drift(

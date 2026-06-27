@@ -562,3 +562,58 @@ def test_portfolio_risk_snapshot_uses_fresh_broker_raw_holdings_and_surfaces_dri
     warning_codes = {warning["code"] for warning in payload["warnings"]["concentration"]}
     assert "broker_raw_normalized_position_drift" in warning_codes
     engine.dispose()
+
+
+def test_portfolio_risk_snapshot_accepts_raw_balance_observed_milliseconds_after_generated_at() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        exec_agent_max_account_snapshot_age_seconds=300,
+    )
+    engine, _factory, db = _session(settings)
+    _add_broker_session(db, expires_at=datetime.now(UTC) + timedelta(hours=1))
+    db.commit()
+
+    class FutureObservedAdapter(PortfolioRiskStubAdapter):
+        def get_account_snapshot(self, access_token: str, **_kwargs: object) -> BrokerAccountSnapshot:
+            assert access_token == "stored-token"
+            self.snapshot_calls += 1
+            return BrokerAccountSnapshot(
+                observed_at=datetime.now(UTC),
+                source="stub:account_snapshot",
+                holdings=[],
+                payload={
+                    "balance": {
+                        "rt_cd": "0",
+                        "output1": [
+                            {
+                                "pdno": "005930",
+                                "prdt_name": "Samsung Electronics",
+                                "hldg_qty": "2",
+                                "ord_psbl_qty": "2",
+                                "pchs_avg_pric": "70000",
+                                "prpr": "71000",
+                                "evlu_amt": "142000",
+                            }
+                        ],
+                    }
+                },
+            )
+
+    adapter = FutureObservedAdapter()
+
+    payload = build_portfolio_risk_snapshot(
+        settings=settings,
+        db=db,
+        adapter=adapter,
+    )
+
+    assert payload["generated_at"] < payload["account"]["observed_at"]
+    broker_raw = payload["holdings"]["broker_raw"]
+    assert broker_raw["valid"] is True
+    assert broker_raw["fresh"] is True
+    assert broker_raw["available"] is True
+    assert payload["holdings"]["open_count"] == 1
+    assert payload["holdings"]["top_by_market_value"][0]["symbol"] == "005930"
+    assert adapter.snapshot_calls == 1
+    engine.dispose()
