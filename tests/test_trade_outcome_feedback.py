@@ -220,6 +220,102 @@ def test_generate_trade_outcome_feedback_writes_fifo_report_and_snippet(tmp_path
     engine.dispose()
 
 
+def test_trade_outcome_feedback_headlines_broker_total_asset_change_with_unrealized_drawdown(tmp_path) -> None:
+    engine, session = _session()
+    settings = Settings(
+        runtime_mode="paper",
+        trade_outcome_feedback_dir=str(tmp_path),
+        trade_outcome_feedback_lookback_days=5,
+    )
+    plan = ExecutionPlan(
+        id="plan-asset-drawdown",
+        external_plan_id="plan-asset-drawdown",
+        source="kai-trading-core",
+        strategy_run_id="run-asset-drawdown",
+        mode="paper",
+    )
+    session.add(plan)
+    _add_closed_trade(
+        session,
+        plan=plan,
+        suffix="small-fifo-loss",
+        symbol="005930",
+        buy_price="100000",
+        sell_price="95632.5",
+        quantity=10,
+        filled_day=22,
+    )
+    session.add(
+        ExecutionPosition(
+            id="pos-asset-drawdown",
+            mode="paper",
+            symbol="000660",
+            quantity=10,
+            average_price=Decimal("200000"),
+            updated_from="reconciliation",
+            last_reconciled_at=datetime(2026, 6, 26, 6, 0, tzinfo=UTC),
+            raw_payload={
+                "balance": {
+                    "output1": [
+                        {
+                            "pdno": "000660",
+                            "prdt_name": "SK hynix",
+                            "hldg_qty": "10",
+                            "ord_psbl_qty": "10",
+                            "pchs_avg_pric": "200000",
+                            "pchs_amt": "2000000",
+                            "evlu_amt": "1637474",
+                            "evlu_pfls_amt": "-362526",
+                            "evlu_pfls_rt": "-18.1263",
+                        }
+                    ],
+                    "output2": [
+                        {
+                            "tot_evlu_amt": "9593799",
+                            "nass_amt": "9593799",
+                            "bfdy_tot_asst_evlu_amt": "10000000",
+                            "asst_icdc_amt": "-406201",
+                            "evlu_pfls_smtl_amt": "-362526",
+                            "pchs_amt_smtl_amt": "2000000",
+                            "evlu_amt_smtl_amt": "1637474",
+                            "dnca_tot_amt": "7956325",
+                        }
+                    ],
+                }
+            },
+        )
+    )
+    session.commit()
+
+    report = generate_trade_outcome_feedback(
+        settings=settings,
+        db=session,
+        as_of=datetime(2026, 6, 26, 9, 0, tzinfo=UTC),
+    )
+
+    assert report["summary"]["primary_performance_metric"] == "broker_total_asset_change"
+    assert report["summary"]["broker_total_asset_change_krw"] == "-406201.0000"
+    assert report["summary"]["realized_pnl_krw"] == "-43675.0000"
+    broker_asset = report["broker_asset_performance"]
+    assert broker_asset["baseline_total_asset_krw"] == "10000000.0000"
+    assert broker_asset["latest_total_asset_krw"] == "9593799.0000"
+    assert broker_asset["latest_net_asset_krw"] == "9593799.0000"
+    assert broker_asset["asset_change_pct"] == "-4.0620"
+    assert broker_asset["broker_unrealized_pnl_krw"] == "-362526.0000"
+    assert broker_asset["holdings_source"] == "execution_positions.raw_payload.balance.output1"
+    assert broker_asset["holdings"][0]["symbol"] == "000660"
+    assert broker_asset["holdings"][0]["market_value_krw"] == "1637474.0000"
+    assert broker_asset["holdings"][0]["unrealized_pnl_krw"] == "-362526.0000"
+    assert broker_asset["divergence_warning"]["difference_krw"] == "-362526.0000"
+    assert report["prompt_snippet"]["summary"].startswith("Broker total asset change: -406201.0000 KRW")
+    assert report["prompt_snippet"]["broker_asset_warnings"][0].startswith("Divergence warning:")
+    markdown = (tmp_path / "latest.md").read_text(encoding="utf-8")
+    assert markdown.index("Broker total asset change: -406201.0000 KRW") < markdown.index("FIFO realized P/L: -43675.0000 KRW")
+
+    session.close()
+    engine.dispose()
+
+
 def test_trade_outcome_feedback_portfolio_risk_and_sell_reason_contributions(tmp_path) -> None:
     engine, session = _session()
     settings = Settings(

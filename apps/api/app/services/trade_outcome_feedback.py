@@ -18,6 +18,16 @@ from app.models.runtime import BrokerOrder, ExecutionFill, ExecutionPlanItem, Ex
 
 REPORT_VERSION = "trade-outcome-feedback-v1"
 MIN_CANDIDATE_RULE_SAMPLE_SIZE = 3
+BROKER_BALANCE_OUTPUT2_FIELDS = (
+    "tot_evlu_amt",
+    "nass_amt",
+    "bfdy_tot_asst_evlu_amt",
+    "asst_icdc_amt",
+    "evlu_pfls_smtl_amt",
+    "pchs_amt_smtl_amt",
+    "evlu_amt_smtl_amt",
+    "dnca_tot_amt",
+)
 
 
 @dataclass(frozen=True)
@@ -55,7 +65,12 @@ def generate_trade_outcome_feedback(
         for trade in _fifo_closed_trades(fills)
         if _parse_datetime(str((trade.get("sell") or {}).get("filled_at"))) >= started_at
     ]
-    summary = _summary(closed_trades)
+    broker_asset_performance = _broker_asset_performance(
+        settings=settings,
+        db=db,
+        closed_trades=closed_trades,
+    )
+    summary = _summary(closed_trades, broker_asset_performance=broker_asset_performance)
     lessons = _lessons(closed_trades, max_lessons=settings.trade_outcome_feedback_max_lessons)
     portfolio_risk = _portfolio_risk(
         settings=settings,
@@ -69,6 +84,7 @@ def generate_trade_outcome_feedback(
         lessons=lessons,
         portfolio_risk=portfolio_risk,
         candidate_rule_replay=candidate_rule_replay,
+        broker_asset_performance=broker_asset_performance,
     )
     report_date = now.astimezone(UTC).date()
     report: dict[str, object] = {
@@ -79,6 +95,7 @@ def generate_trade_outcome_feedback(
         "started_at": started_at.isoformat(),
         "closed_trade_count": len(closed_trades),
         "summary": summary,
+        "broker_asset_performance": broker_asset_performance,
         "portfolio_risk": portfolio_risk,
         "closed_trades": closed_trades,
         "lessons": lessons,
@@ -214,12 +231,19 @@ def _fill_payload(
     }
 
 
-def _summary(closed_trades: list[dict[str, object]]) -> dict[str, object]:
+def _summary(
+    closed_trades: list[dict[str, object]],
+    *,
+    broker_asset_performance: dict[str, object] | None = None,
+) -> dict[str, object]:
     pnl_values = [_decimal_value(row.get("realized_pnl_krw")) or Decimal("0") for row in closed_trades]
     winners = [value for value in pnl_values if value > 0]
     losers = [value for value in pnl_values if value < 0]
     total = sum(pnl_values, Decimal("0"))
-    return {
+    summary: dict[str, object] = {
+        "primary_performance_metric": "broker_total_asset_change"
+        if broker_asset_performance and broker_asset_performance.get("available")
+        else "fifo_realized_pnl",
         "realized_pnl_krw": _decimal_text(total),
         "win_count": len(winners),
         "loss_count": len(losers),
@@ -227,6 +251,184 @@ def _summary(closed_trades: list[dict[str, object]]) -> dict[str, object]:
         "average_win_krw": _decimal_text(sum(winners, Decimal("0")) / Decimal(len(winners)) if winners else Decimal("0")),
         "average_loss_krw": _decimal_text(sum(losers, Decimal("0")) / Decimal(len(losers)) if losers else Decimal("0")),
         "worst_loss_krw": _decimal_text(min(pnl_values) if pnl_values else Decimal("0")),
+    }
+    if broker_asset_performance and broker_asset_performance.get("available"):
+        summary.update(
+            {
+                "broker_total_asset_baseline_krw": broker_asset_performance.get("baseline_total_asset_krw"),
+                "broker_latest_total_asset_krw": broker_asset_performance.get("latest_total_asset_krw"),
+                "broker_latest_net_asset_krw": broker_asset_performance.get("latest_net_asset_krw"),
+                "broker_total_asset_change_krw": broker_asset_performance.get("asset_change_krw"),
+                "broker_total_asset_change_pct": broker_asset_performance.get("asset_change_pct"),
+                "broker_unrealized_pnl_krw": broker_asset_performance.get("broker_unrealized_pnl_krw"),
+            }
+        )
+    return summary
+
+
+def _broker_asset_performance(
+    *,
+    settings: Settings,
+    db: Session,
+    closed_trades: list[dict[str, object]],
+) -> dict[str, object]:
+    positions = _load_all_positions(settings=settings, db=db)
+    snapshot = _latest_broker_balance_snapshot(positions)
+    if snapshot is None:
+        return {
+            "available": False,
+            "source": "execution_positions.raw_payload.balance.output2",
+            "source_failed": (
+                f"execution_positions raw broker balance payload unavailable for mode={settings.runtime_mode}; "
+                "cannot headline broker total asset change"
+            ),
+        }
+    position, balance = snapshot
+    output2 = _first_payload_row(balance.get("output2"))
+    if output2 is None:
+        return {
+            "available": False,
+            "source": "execution_positions.raw_payload.balance.output2",
+            "source_failed": "broker balance payload missing output2 asset summary",
+        }
+
+    raw_fields = {key: output2.get(key) for key in BROKER_BALANCE_OUTPUT2_FIELDS if key in output2}
+    latest_total_asset = _decimal_value(output2.get("tot_evlu_amt"))
+    latest_net_asset = _decimal_value(output2.get("nass_amt"))
+    baseline_total_asset = _decimal_value(output2.get("bfdy_tot_asst_evlu_amt"))
+    asset_change = _decimal_value(output2.get("asst_icdc_amt"))
+    if asset_change is None and latest_total_asset is not None and baseline_total_asset is not None:
+        asset_change = latest_total_asset - baseline_total_asset
+    if baseline_total_asset is None and latest_total_asset is not None and asset_change is not None:
+        baseline_total_asset = latest_total_asset - asset_change
+    asset_change_pct = (
+        asset_change / baseline_total_asset * Decimal("100")
+        if asset_change is not None and baseline_total_asset is not None and baseline_total_asset != 0
+        else None
+    )
+    realized_pnl = sum(
+        (_decimal_value(row.get("realized_pnl_krw")) or Decimal("0"))
+        for row in closed_trades
+    )
+    divergence = _asset_fifo_divergence(asset_change=asset_change, realized_pnl=realized_pnl)
+    holdings = _broker_holdings_from_output1(balance.get("output1"))
+    if not holdings:
+        holdings = [_position_holding_fallback(position=row) for row in positions if _position_effective_quantity(row) > 0]
+    return {
+        "available": True,
+        "source": "execution_positions.raw_payload.balance.output2",
+        "holdings_source": "execution_positions.raw_payload.balance.output1"
+        if _payload_rows(balance.get("output1"))
+        else "execution_positions",
+        "observed_at": _normalize_utc(position.last_reconciled_at).isoformat()
+        if position.last_reconciled_at is not None
+        else None,
+        "source_position_symbol": position.symbol,
+        "baseline_total_asset_krw": _decimal_text(baseline_total_asset),
+        "latest_total_asset_krw": _decimal_text(latest_total_asset),
+        "latest_net_asset_krw": _decimal_text(latest_net_asset),
+        "asset_change_krw": _decimal_text(asset_change),
+        "asset_change_pct": _decimal_text(asset_change_pct),
+        "broker_unrealized_pnl_krw": _decimal_text(_decimal_value(output2.get("evlu_pfls_smtl_amt"))),
+        "broker_purchase_amount_krw": _decimal_text(_decimal_value(output2.get("pchs_amt_smtl_amt"))),
+        "broker_securities_value_krw": _decimal_text(_decimal_value(output2.get("evlu_amt_smtl_amt"))),
+        "broker_cash_krw": _decimal_text(_decimal_value(output2.get("dnca_tot_amt"))),
+        "fifo_realized_pnl_krw": _decimal_text(realized_pnl),
+        "divergence_warning": divergence,
+        "holdings": _json_safe(holdings),
+        "raw_output2_fields": _json_safe(raw_fields),
+    }
+
+
+def _load_all_positions(*, settings: Settings, db: Session) -> list[ExecutionPosition]:
+    return list(
+        db.scalars(
+            select(ExecutionPosition)
+            .where(ExecutionPosition.mode == settings.runtime_mode)
+            .order_by(ExecutionPosition.last_reconciled_at.desc().nulls_last(), ExecutionPosition.updated_at.desc())
+        )
+    )
+
+
+def _latest_broker_balance_snapshot(positions: list[ExecutionPosition]) -> tuple[ExecutionPosition, dict[str, object]] | None:
+    for position in positions:
+        payload = position.raw_payload if isinstance(position.raw_payload, dict) else None
+        if payload is None:
+            continue
+        balance = payload.get("balance")
+        if isinstance(balance, dict) and _first_payload_row(balance.get("output2")) is not None:
+            return position, balance
+    return None
+
+
+def _first_payload_row(value: object) -> dict[str, object] | None:
+    rows = _payload_rows(value)
+    return rows[0] if rows else None
+
+
+def _payload_rows(value: object) -> list[dict[str, object]]:
+    if isinstance(value, dict):
+        return [value]
+    if isinstance(value, list):
+        return [row for row in value if isinstance(row, dict)]
+    return []
+
+
+def _broker_holdings_from_output1(value: object) -> list[dict[str, object]]:
+    holdings = []
+    for row in _payload_rows(value):
+        symbol = str(row.get("pdno") or row.get("symbol") or "").strip().upper()
+        quantity = _decimal_value(row.get("hldg_qty"))
+        if not symbol or quantity is None or quantity <= 0:
+            continue
+        holdings.append(
+            {
+                "symbol": symbol,
+                "name": row.get("prdt_name") or row.get("prdt_name120"),
+                "quantity": _decimal_text(quantity),
+                "average_price": _decimal_text(_decimal_value(row.get("pchs_avg_pric"))),
+                "purchase_amount_krw": _decimal_text(_decimal_value(row.get("pchs_amt"))),
+                "market_value_krw": _decimal_text(_decimal_value(row.get("evlu_amt"))),
+                "unrealized_pnl_krw": _decimal_text(_decimal_value(row.get("evlu_pfls_amt"))),
+                "unrealized_pnl_pct": _decimal_text(_decimal_value(row.get("evlu_pfls_rt"))),
+                "sellable_quantity": _decimal_text(_decimal_value(row.get("ord_psbl_qty"))),
+                "raw_payload": _json_safe(row),
+            }
+        )
+    return sorted(holdings, key=lambda row: _decimal_value(row.get("market_value_krw")) or Decimal("0"), reverse=True)
+
+
+def _position_holding_fallback(*, position: ExecutionPosition) -> dict[str, object]:
+    effective_quantity = _position_effective_quantity(position)
+    market_value = Decimal(position.average_price) * effective_quantity if position.average_price is not None else None
+    return {
+        "symbol": position.symbol,
+        "name": None,
+        "quantity": _quantity_text(effective_quantity),
+        "average_price": _decimal_text(Decimal(position.average_price)) if position.average_price is not None else None,
+        "purchase_amount_krw": None,
+        "market_value_krw": _decimal_text(market_value),
+        "unrealized_pnl_krw": None,
+        "unrealized_pnl_pct": None,
+        "sellable_quantity": None,
+        "raw_payload": None,
+    }
+
+
+def _asset_fifo_divergence(*, asset_change: Decimal | None, realized_pnl: Decimal) -> dict[str, object] | None:
+    if asset_change is None:
+        return None
+    difference = asset_change - realized_pnl
+    threshold = max(Decimal("50000"), abs(asset_change) * Decimal("0.10"))
+    if abs(difference) < threshold:
+        return None
+    return {
+        "type": "broker_asset_change_fifo_realized_pnl_divergence",
+        "asset_change_krw": _decimal_text(asset_change),
+        "fifo_realized_pnl_krw": _decimal_text(realized_pnl),
+        "difference_krw": _decimal_text(difference),
+        "threshold_krw": _decimal_text(threshold),
+        "reason": "broker total asset movement includes open-position unrealized PnL, cash, fees, and broker reconciliation effects; FIFO realized PnL is closed-trade detail only",
     }
 
 
@@ -977,6 +1179,7 @@ def _snippet(
     lessons: dict[str, object],
     portfolio_risk: dict[str, object],
     candidate_rule_replay: dict[str, object],
+    broker_asset_performance: dict[str, object],
 ) -> dict[str, object]:
     hard_gates = []
     for row in lessons.get("patterns_to_downsize_or_reject", []):
@@ -989,13 +1192,25 @@ def _snippet(
             hard_gates.append(
                 f"Recent worst loss {row.get('symbol')} {row.get('return_pct')}% ({row.get('realized_pnl_krw')} KRW), profile={row.get('target_profile')}, reason={row.get('reason_code')}."
             )
-    return {
-        "summary": (
+    if broker_asset_performance.get("available"):
+        snippet_summary = (
+            f"Broker total asset change: {broker_asset_performance.get('asset_change_krw')} KRW "
+            f"({broker_asset_performance.get('asset_change_pct')}%), "
+            f"baseline={broker_asset_performance.get('baseline_total_asset_krw')} KRW, "
+            f"latest_total={broker_asset_performance.get('latest_total_asset_krw')} KRW, "
+            f"net_asset={broker_asset_performance.get('latest_net_asset_krw')} KRW. "
+            f"FIFO closed-trade realized PnL: {summary.get('realized_pnl_krw')} KRW."
+        )
+    else:
+        snippet_summary = (
             f"Recent closed trades: pnl={summary.get('realized_pnl_krw')} KRW, "
             f"win_rate={summary.get('win_rate_pct')}%, worst_loss={summary.get('worst_loss_krw')} KRW."
-        ),
+        )
+    return {
+        "summary": snippet_summary,
         "patterns_to_downsize_or_reject": hard_gates[:6],
         "positive_expectancy_patterns": lessons.get("positive_expectancy_patterns", []),
+        "broker_asset_warnings": _broker_asset_warning_lines(broker_asset_performance),
         "top_portfolio_risks": _portfolio_risk_snippet_lines(portfolio_risk),
         "monday_pre_market_checks": _monday_check_snippet_lines(portfolio_risk),
         "candidate_rule_replay": _candidate_rule_replay_snippet_lines(candidate_rule_replay),
@@ -1004,6 +1219,31 @@ def _snippet(
             "Prefer delay/reject over execute_now when recent worst-loss conditions resemble the current candidate.",
         ],
     }
+
+
+def _broker_asset_warning_lines(broker_asset_performance: dict[str, object]) -> list[str]:
+    if not broker_asset_performance.get("available"):
+        return [f"Broker asset performance unavailable: {broker_asset_performance.get('source_failed')}"]
+    lines = []
+    divergence = broker_asset_performance.get("divergence_warning")
+    if isinstance(divergence, dict):
+        lines.append(
+            f"Divergence warning: broker asset change={divergence.get('asset_change_krw')} KRW, "
+            f"FIFO realized={divergence.get('fifo_realized_pnl_krw')} KRW, "
+            f"difference={divergence.get('difference_krw')} KRW."
+        )
+    unrealized = broker_asset_performance.get("broker_unrealized_pnl_krw")
+    if unrealized is not None:
+        lines.append(f"Broker unrealized PnL summary={unrealized} KRW.")
+    holdings = broker_asset_performance.get("holdings")
+    if isinstance(holdings, list):
+        for row in holdings[:3]:
+            if isinstance(row, dict):
+                lines.append(
+                    f"Holding {row.get('symbol')}: unrealized={row.get('unrealized_pnl_krw')} KRW, "
+                    f"market_value={row.get('market_value_krw')} KRW."
+                )
+    return lines[:6]
 
 
 def _portfolio_risk_snippet_lines(portfolio_risk: dict[str, object]) -> list[str]:
@@ -1062,6 +1302,7 @@ def _write_artifacts(*, report: dict[str, object], report_date: date, output_dir
 def _markdown_report(report: dict[str, object]) -> str:
     summary = report.get("summary") if isinstance(report.get("summary"), dict) else {}
     snippet = report.get("prompt_snippet") if isinstance(report.get("prompt_snippet"), dict) else {}
+    broker_asset = report.get("broker_asset_performance") if isinstance(report.get("broker_asset_performance"), dict) else {}
     portfolio_risk = report.get("portfolio_risk") if isinstance(report.get("portfolio_risk"), dict) else {}
     candidate_rule_replay = report.get("candidate_rule_replay") if isinstance(report.get("candidate_rule_replay"), dict) else {}
     lines = [
@@ -1069,19 +1310,64 @@ def _markdown_report(report: dict[str, object]) -> str:
         "",
         f"- Mode: {report.get('mode')}",
         f"- Closed trades: {report.get('closed_trade_count')}",
-        f"- Realized P/L: {summary.get('realized_pnl_krw')} KRW",
+        f"- Primary performance metric: {summary.get('primary_performance_metric')}",
+        f"- Broker total asset change: {summary.get('broker_total_asset_change_krw')} KRW ({summary.get('broker_total_asset_change_pct')}%)"
+        if broker_asset.get("available")
+        else f"- Broker total asset change: unavailable ({broker_asset.get('source_failed')})",
+        f"- FIFO realized P/L: {summary.get('realized_pnl_krw')} KRW",
         f"- Win rate: {summary.get('win_rate_pct')}%",
         f"- Worst loss: {summary.get('worst_loss_krw')} KRW",
         "",
         "## 이번주 분석 결과",
         "",
-        f"- 주간 실현손익: {summary.get('realized_pnl_krw')} KRW",
+        f"- 브로커 총자산 변화: {summary.get('broker_total_asset_change_krw')} KRW ({summary.get('broker_total_asset_change_pct')}%)"
+        if broker_asset.get("available")
+        else f"- 브로커 총자산 변화: 사용 불가 ({broker_asset.get('source_failed')})",
+        f"- FIFO 실현손익(보조 지표): {summary.get('realized_pnl_krw')} KRW",
         f"- 승/패: {summary.get('win_count')}승 / {summary.get('loss_count')}패",
-        "- 근거: execution_fills, broker_orders, execution_positions",
+        "- 근거: execution_positions.raw_payload.balance.output2, execution_positions.raw_payload.balance.output1, execution_fills, broker_orders",
         "",
-        "### 포트폴리오 리스크",
+        "### Broker Total Asset Performance",
         "",
     ]
+    if broker_asset.get("available"):
+        lines.extend(
+            [
+                f"- Baseline total asset: {broker_asset.get('baseline_total_asset_krw')} KRW",
+                f"- Latest total asset: {broker_asset.get('latest_total_asset_krw')} KRW",
+                f"- Latest net asset: {broker_asset.get('latest_net_asset_krw')} KRW",
+                f"- Asset change: {broker_asset.get('asset_change_krw')} KRW ({broker_asset.get('asset_change_pct')}%)",
+                f"- Broker unrealized P/L: {broker_asset.get('broker_unrealized_pnl_krw')} KRW",
+                f"- Securities value: {broker_asset.get('broker_securities_value_krw')} KRW",
+                f"- Cash: {broker_asset.get('broker_cash_krw')} KRW",
+                f"- FIFO realized P/L detail: {broker_asset.get('fifo_realized_pnl_krw')} KRW",
+            ]
+        )
+        divergence = broker_asset.get("divergence_warning")
+        if isinstance(divergence, dict):
+            lines.append(
+                f"- Divergence warning: asset change {divergence.get('asset_change_krw')} KRW vs "
+                f"FIFO realized {divergence.get('fifo_realized_pnl_krw')} KRW "
+                f"(difference {divergence.get('difference_krw')} KRW)"
+            )
+        holdings = broker_asset.get("holdings")
+        if isinstance(holdings, list) and holdings:
+            lines.append("- Current holdings from broker output1:")
+            for row in holdings[:10]:
+                if isinstance(row, dict):
+                    lines.append(
+                        f"  - {row.get('symbol')}: qty={row.get('quantity')}, "
+                        f"value={row.get('market_value_krw')} KRW, unrealized={row.get('unrealized_pnl_krw')} KRW"
+                    )
+    else:
+        lines.append(f"- 사용 불가: {broker_asset.get('source_failed')}")
+    lines.extend(
+        [
+            "",
+            "### 포트폴리오 리스크",
+            "",
+        ]
+    )
     if portfolio_risk.get("available"):
         lines.extend(
             [
@@ -1195,6 +1481,8 @@ def _markdown_report(report: dict[str, object]) -> str:
             "## Portfolio Risk Summary",
         ]
     )
+    for item in snippet.get("broker_asset_warnings", []):
+        lines.append(f"- {item}")
     for item in snippet.get("top_portfolio_risks", []):
         lines.append(f"- {item}")
     lines.extend(
