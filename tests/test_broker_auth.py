@@ -2932,6 +2932,125 @@ def test_watch_buy_candidate_waits_until_trigger_then_submits_limit_buy() -> Non
     engine.dispose()
 
 
+def test_watch_buy_exec_agent_notional_cap_downsizes_price_drift() -> None:
+    app, engine, client, broker_adapter = _build_watch_buy_test_app(
+        order_id="kis-watch-buy-agent-cap-drift-1"
+    )
+    item_id = _create_watch_buy_candidate(
+        client,
+        plan_id="plan-watch-buy-agent-cap-drift-1",
+        trigger_price="100.00",
+        quantity_policy={
+            "kind": "shares",
+            "quantity": 10,
+            "source": "exec_agent_watch_sizing",
+            "sizing_price": "100.0000",
+            "approved_notional": "1000.0000",
+            "sizing_adjustment": {
+                "final_quantity": 10,
+                "final_notional": "1000.0000",
+                "cap_notional": "1000.0000",
+            },
+        },
+        risk_context={
+            "exchange": "KRX",
+            "stop_price": "90.00",
+            "trigger_direction": "at_or_above",
+        },
+    )
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "trigger watch buy after price drift above sizing price",
+            "prices": [{"symbol": "005930", "price": "120.00"}],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["triggered_item_count"] == 1
+    assert payload["submitted_order_count"] == 1
+    assert payload["items"][0]["outcome"] == "submitted"
+    assert len(broker_adapter.order_calls) == 1
+    order_call = broker_adapter.order_calls[0]
+    assert order_call.execution_plan_item_id == item_id
+    assert order_call.quantity == 8
+    assert order_call.limit_price == Decimal("120.00")
+
+    with app.state.db_session_factory() as session:
+        item = session.get(ExecutionPlanItem, item_id)
+        assert item is not None
+        event = next(
+            event
+            for event in item.risk_context["monitoring_events"]
+            if event["event"] == "watch_buy_risk_sized"
+        )
+        assert event["quantity"] == 8
+        assert event["approved_notional"] == "960.0000"
+        assert event["exec_agent_approved_notional_cap"] == "1000.0000"
+
+    engine.dispose()
+
+
+def test_watch_buy_exec_agent_notional_cap_rejects_when_price_exceeds_cap() -> None:
+    app, engine, client, broker_adapter = _build_watch_buy_test_app(
+        order_id="kis-watch-buy-agent-cap-drift-2"
+    )
+    item_id = _create_watch_buy_candidate(
+        client,
+        plan_id="plan-watch-buy-agent-cap-drift-2",
+        trigger_price="100.00",
+        quantity_policy={
+            "kind": "shares",
+            "quantity": 10,
+            "source": "exec_agent_watch_sizing",
+            "sizing_price": "100.0000",
+            "approved_notional": "1000.0000",
+            "sizing_adjustment": {
+                "final_quantity": 10,
+                "final_notional": "1000.0000",
+                "cap_notional": "1000.0000",
+            },
+        },
+        risk_context={
+            "exchange": "KRX",
+            "stop_price": "90.00",
+            "trigger_direction": "at_or_above",
+        },
+    )
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "trigger watch buy after price drift above approved cap",
+            "prices": [{"symbol": "005930", "price": "1200.00"}],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["triggered_item_count"] == 1
+    assert payload["submitted_order_count"] == 0
+    assert payload["items"][0]["outcome"] == "rejected"
+    assert broker_adapter.order_calls == []
+
+    with app.state.db_session_factory() as session:
+        item = session.get(ExecutionPlanItem, item_id)
+        assert item is not None
+        assert item.status == "watch_buy_rejected"
+        event = item.risk_context["last_monitoring_event"]
+        assert event["reason"] == "exec_agent_approved_notional_exhausted"
+        assert event["details"]["exec_agent_approved_notional_cap"] == "1000.0000"
+        assert event["details"]["max_quantity_within_cap"] == 0
+
+    engine.dispose()
+
+
 def test_watch_buy_candidate_defaults_to_entry_at_or_below_buy_line() -> None:
     app, engine, client, broker_adapter = _build_watch_buy_test_app(
         order_id="kis-watch-buy-entry-line-1"

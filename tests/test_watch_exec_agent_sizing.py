@@ -208,6 +208,8 @@ def test_short_transaction_batches_candidates_across_single_item_plans(tmp_path,
         exec_agent_watch_sizing_end_local_time="23:59",
         exec_agent_watch_sizing_batch_size=3,
         exec_agent_watch_sizing_max_batches_per_cycle=1,
+        exec_agent_watch_sizing_min_notional_krw=Decimal("50000"),
+        exec_agent_watch_sizing_high_conviction_min_notional_krw=Decimal("50000"),
     )
     engine = create_db_engine(settings)
     Base.metadata.create_all(engine)
@@ -453,6 +455,7 @@ def test_stale_open_order_successful_refresh_allows_watch_sizing(tmp_path, monke
         exec_agent_watch_sizing_start_local_time="00:00",
         exec_agent_watch_sizing_end_local_time="23:59",
         stale_broker_order_reconciliation_threshold_seconds=60,
+        exec_agent_watch_sizing_high_conviction_min_notional_krw=Decimal("1400000"),
     )
     engine = create_db_engine(settings)
     Base.metadata.create_all(engine)
@@ -488,8 +491,8 @@ def test_stale_open_order_successful_refresh_allows_watch_sizing(tmp_path, monke
                     "execution_plan_item_id": "watch-item-refreshed",
                     "symbol": "005930",
                     "action": "approve",
-                    "quantity": 1,
-                    "approved_notional_krw": 71500,
+                    "quantity": 21,
+                    "approved_notional_krw": 1501500,
                     "sizing_price": "71500",
                     "confidence": 0.68,
                     "target_profile": "short_swing",
@@ -529,7 +532,7 @@ def test_stale_open_order_successful_refresh_allows_watch_sizing(tmp_path, monke
     assert calls == [["watch-item-refreshed"]]
     assert result.payload["applied"][0]["approved"] == 1
     assert item.status == "watch_monitoring_active"
-    assert item.quantity_policy["quantity"] == 1
+    assert item.quantity_policy["quantity"] == 20
     assert order.status == "filled"
     assert order.last_error_classification is None
     engine.dispose()
@@ -890,7 +893,7 @@ def test_apply_decisions_preserves_triggered_blocked_watch_buy_for_retry() -> No
     assert plan.items[0].quantity_policy["quantity"] == 2
 
 
-def test_apply_decisions_preserves_small_agent_probe_below_min_notional() -> None:
+def test_apply_decisions_skips_small_agent_probe_below_min_notional() -> None:
     plan = ExecutionPlan(
         id="plan-1",
         external_plan_id="plan-min-notional",
@@ -914,7 +917,7 @@ def test_apply_decisions_preserves_small_agent_probe_below_min_notional() -> Non
         ],
     )
 
-    _apply_decisions(
+    summary = _apply_decisions(
         db=None,  # type: ignore[arg-type]
         settings=Settings(runtime_mode="live"),
         plan=plan,
@@ -932,8 +935,8 @@ def test_apply_decisions_preserves_small_agent_probe_below_min_notional() -> Non
                     "symbol": "005930",
                     "action": "approve",
                     "quantity": 3,
-                    "approved_notional_krw": 214500,
-                    "sizing_price": "71500",
+                    "approved_notional_krw": 151500,
+                    "sizing_price": "50500",
                     "confidence": 0.68,
                     "target_profile": "short_swing",
                     "reason_code": "small_probe",
@@ -943,15 +946,24 @@ def test_apply_decisions_preserves_small_agent_probe_below_min_notional() -> Non
         },
     )
 
+    assert summary["approved"] == 0
+    assert summary["rejected"] == 1
+    assert plan.items[0].status == "exec_agent_rejected"
     policy = plan.items[0].quantity_policy
-    assert policy["quantity"] == 3
-    assert policy["approved_notional"] == "214500.0000"
+    assert policy["kind"] == "exec_agent_rejected"
+    assert policy["reason_code"] == "below_min_notional_within_agent_cap"
     assert policy["sizing_adjustment"]["applied"] is False
-    assert policy["sizing_adjustment"]["target_min_notional"] == "1500000.0000"
+    assert policy["sizing_adjustment"]["agent_approved_quantity"] == 3
+    assert policy["sizing_adjustment"]["agent_approved_notional"] == "151500.0000"
+    assert policy["sizing_adjustment"]["minimum_required_notional"] == "1500000.0000"
+    assert policy["sizing_adjustment"]["cap_notional"] == "151500.0000"
+    assert policy["sizing_adjustment"]["final_quantity"] == 3
+    assert policy["sizing_adjustment"]["final_notional"] == "151500.0000"
+    assert policy["sizing_adjustment"]["decision"] == "skip"
     assert policy["sizing_adjustment"]["min_notional_upsize_suppressed"] is True
 
 
-def test_apply_decisions_records_cap_when_preserving_small_probe() -> None:
+def test_apply_decisions_skips_when_order_lot_minimum_exceeds_agent_cap() -> None:
     plan = ExecutionPlan(
         id="plan-1",
         external_plan_id="plan-min-notional-cap",
@@ -974,7 +986,6 @@ def test_apply_decisions_records_cap_when_preserving_small_probe() -> None:
             )
         ],
     )
-
     _apply_decisions(
         db=None,  # type: ignore[arg-type]
         settings=Settings(runtime_mode="live"),
@@ -990,11 +1001,11 @@ def test_apply_decisions_records_cap_when_preserving_small_probe() -> None:
             "decisions": [
                 {
                     "execution_plan_item_id": "watch-item-1",
-                    "symbol": "005930",
+                    "symbol": "003550",
                     "action": "approve",
-                    "quantity": 3,
-                    "approved_notional_krw": 214500,
-                    "sizing_price": "71500",
+                    "quantity": 200,
+                    "approved_notional_krw": 406000,
+                    "sizing_price": "2030",
                     "confidence": 0.68,
                     "target_profile": "short_swing",
                     "reason_code": "small_probe",
@@ -1005,10 +1016,17 @@ def test_apply_decisions_records_cap_when_preserving_small_probe() -> None:
     )
 
     policy = plan.items[0].quantity_policy
-    assert policy["quantity"] == 3
-    assert policy["approved_notional"] == "214500.0000"
+    assert plan.items[0].status == "exec_agent_rejected"
+    assert policy["kind"] == "exec_agent_rejected"
+    assert policy["reason_code"] == "below_min_notional_within_agent_cap"
     assert policy["sizing_adjustment"]["applied"] is False
-    assert policy["sizing_adjustment"]["cap_notional"] == "800000.0000"
+    assert policy["sizing_adjustment"]["agent_approved_quantity"] == 200
+    assert policy["sizing_adjustment"]["agent_approved_notional"] == "406000.0000"
+    assert policy["sizing_adjustment"]["minimum_required_notional"] == "1500000.0000"
+    assert policy["sizing_adjustment"]["cap_notional"] == "406000.0000"
+    assert policy["sizing_adjustment"]["final_quantity"] == 200
+    assert policy["sizing_adjustment"]["final_notional"] == "406000.0000"
+    assert policy["sizing_adjustment"]["decision"] == "skip"
     assert policy["sizing_adjustment"]["min_notional_upsize_suppressed"] is True
 
 
@@ -1038,6 +1056,7 @@ def test_apply_decisions_records_vol_corr_cap_details_when_enabled() -> None:
             )
         ],
     )
+    plan.items[0].quantity_policy = {"type": "exec_agent_sized", "budget_krw": "5000000"}
 
     _apply_decisions(
         db=None,  # type: ignore[arg-type]
@@ -1057,8 +1076,8 @@ def test_apply_decisions_records_vol_corr_cap_details_when_enabled() -> None:
                     "execution_plan_item_id": "watch-item-1",
                     "symbol": "005930",
                     "action": "approve",
-                    "quantity": 3,
-                    "approved_notional_krw": 214500,
+                    "quantity": 40,
+                    "approved_notional_krw": 2860000,
                     "sizing_price": "71500",
                     "confidence": 0.68,
                     "target_profile": "short_swing",
@@ -1070,15 +1089,15 @@ def test_apply_decisions_records_vol_corr_cap_details_when_enabled() -> None:
     )
 
     policy = plan.items[0].quantity_policy
-    assert policy["quantity"] == 1
-    assert policy["approved_notional"] == "71500.0000"
+    assert policy["quantity"] == 24
+    assert policy["approved_notional"] == "1716000.0000"
     vol_corr_cap = policy["sizing_adjustment"]["vol_corr_cap"]
-    assert vol_corr_cap["baseline_quantity"] == 3
+    assert vol_corr_cap["baseline_quantity"] == 40
     assert vol_corr_cap["volatility_multiplier"] == "0.7500"
     assert vol_corr_cap["correlation_multiplier"] == "0.8000"
     assert vol_corr_cap["vol_corr_multiplier"] == "0.6000"
     assert vol_corr_cap["vol_corr_cap_reason"] == "high_volatility+high_correlation"
-    assert policy["sizing_adjustment"]["min_notional_upsize_suppressed"] is True
+    assert policy["sizing_adjustment"]["min_notional_upsize_suppressed"] is False
 
 
 def test_apply_decisions_clamps_agent_approval_that_exceeds_cap() -> None:
@@ -1135,9 +1154,12 @@ def test_apply_decisions_clamps_agent_approval_that_exceeds_cap() -> None:
     )
 
     policy = plan.items[0].quantity_policy
-    assert policy["quantity"] == 11
-    assert policy["approved_notional"] == "786500.0000"
-    assert policy["sizing_adjustment"]["applied"] is True
+    assert plan.items[0].status == "exec_agent_rejected"
+    assert policy["kind"] == "exec_agent_rejected"
+    assert policy["reason_code"] == "below_min_notional_within_agent_cap"
+    assert policy["sizing_adjustment"]["final_quantity"] == 11
+    assert policy["sizing_adjustment"]["final_notional"] == "786500.0000"
+    assert policy["sizing_adjustment"]["decision"] == "skip"
     assert policy["sizing_adjustment"]["agent_quantity"] == 100
     assert policy["sizing_adjustment"]["cap_notional"] == "800000.0000"
     assert policy["allowed_action_envelope"]["max_quantity"] == 11
@@ -1238,6 +1260,8 @@ def test_run_due_retry_applies_sizing_context_to_missing_decision(monkeypatch) -
         exec_agent_watch_sizing_enabled=True,
         exec_agent_watch_sizing_start_local_time="00:00",
         exec_agent_watch_sizing_end_local_time="23:59",
+        exec_agent_watch_sizing_min_notional_krw=Decimal("100000"),
+        exec_agent_watch_sizing_high_conviction_min_notional_krw=Decimal("100000"),
     )
     account_context = {
         "available": True,
@@ -1311,9 +1335,10 @@ def test_run_due_retry_applies_sizing_context_to_missing_decision(monkeypatch) -
     assert retry_policy["quantity"] == 3
     assert retry_policy["approved_notional"] == "214500.0000"
     assert retry_policy["sizing_adjustment"]["applied"] is False
-    assert retry_policy["sizing_adjustment"]["cap_notional"] == "800000.0000"
-    assert retry_policy["sizing_adjustment"]["min_notional_upsize_suppressed"] is True
-    assert "reason" not in retry_policy["sizing_adjustment"]
+    assert retry_policy["sizing_adjustment"]["cap_notional"] == "214500.0000"
+    assert retry_policy["sizing_adjustment"]["runtime_cap_notional"] == "800000.0000"
+    assert retry_policy["sizing_adjustment"]["min_notional_upsize_suppressed"] is False
+    assert retry_policy["sizing_adjustment"]["reason"] is None
 
 
 def test_applicable_decision_ids_only_counts_expected_candidates() -> None:
@@ -1461,9 +1486,20 @@ def test_apply_decisions_persists_audit_without_rewriting_large_risk_context(tmp
         item = session.get(ExecutionPlanItem, "watch-item-large-risk")
         assert item is not None
         assert item.risk_context == large_context
-        assert item.quantity_policy["exec_agent_decision"]["reason_code"] == "small_probe"
+        assert item.quantity_policy["exec_agent_decision"]["reason_code"] == "below_min_notional_within_agent_cap"
         audit_count = session.query(watch_sizing.ExecutionPlanItemAudit).count()
-        assert audit_count == 1
+        assert audit_count == 2
+        cap_audit = session.scalar(
+            select(ExecutionPlanItemAudit).where(
+                ExecutionPlanItemAudit.event_type == "watch_exec_agent_sizing_cap_decision"
+            )
+        )
+        assert cap_audit is not None
+        assert cap_audit.summary["decision"] == "skip"
+        assert cap_audit.summary["reason_code"] == "below_min_notional_within_agent_cap"
+        assert cap_audit.payload["agent_approved_quantity"] == 3
+        assert cap_audit.payload["minimum_required_notional"] == "1500000.0000"
+        assert cap_audit.payload["final_notional"] == "214500.0000"
 
 
 def test_short_transaction_no_decision_attempts_persist_for_monitoring_fallback(tmp_path, monkeypatch) -> None:
