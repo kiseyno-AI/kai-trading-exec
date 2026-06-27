@@ -1298,6 +1298,47 @@ def _apply_decisions(
                 allowed_action_envelope=envelope,
             )
             quantity = sizing["quantity"]
+            if sizing["decision"] == "skip":
+                decision["action"] = "reject"
+                decision["reason_code"] = sizing["reason_code"]
+                decision["reason"] = sizing["reason"]
+                record = _decision_record(decision=decision, item=item, version=str(decision_payload.get("version") or ""))
+                previous_policy = item.quantity_policy if isinstance(item.quantity_policy, dict) else None
+                item.quantity_policy = {
+                    "kind": "exec_agent_rejected",
+                    "source": "exec_agent_watch_sizing",
+                    "reason_code": sizing["reason_code"],
+                    "reason": sizing["reason"],
+                    "exec_agent_decision": _decision_summary(record),
+                    "short_term_exec_agent_decision": _decision_summary(record),
+                    "exec_agent_decision_audit": {
+                        "event_type": "watch_exec_agent_sizing_decision",
+                        "storage": "execution_plan_item_audits",
+                    },
+                    "sizing_adjustment": sizing["adjustment"],
+                    "allowed_action_envelope": envelope,
+                    "market_regime_guardrail": envelope.get("market_regime_guardrail"),
+                    "previous_policy": previous_policy,
+                }
+                _add_plan_item_audit(
+                    db=db,
+                    item=item,
+                    event_type="watch_exec_agent_sizing_cap_decision",
+                    summary={
+                        "decision": "skip",
+                        "reason_code": sizing["reason_code"],
+                        "agent_approved_quantity": sizing["adjustment"].get("agent_approved_quantity"),
+                        "agent_approved_notional": sizing["adjustment"].get("agent_approved_notional"),
+                        "minimum_required_notional": sizing["adjustment"].get("minimum_required_notional"),
+                        "cap_notional": sizing["adjustment"].get("cap_notional"),
+                        "final_quantity": sizing["adjustment"].get("final_quantity"),
+                        "final_notional": sizing["adjustment"].get("final_notional"),
+                    },
+                    payload=sizing["adjustment"],
+                )
+                item.status = "exec_agent_rejected"
+                rejected += 1
+                continue
             if quantity <= 0:
                 decision["action"] = "reject"
                 decision["reason_code"] = "allowed_action_envelope_blocked"
@@ -1435,6 +1476,9 @@ def _adjust_approved_watch_quantity(
             "quantity": agent_quantity,
             "sizing_price": Decimal("0"),
             "approved_notional": Decimal("0"),
+            "decision": "submit",
+            "reason_code": None,
+            "reason": None,
             "adjustment": {"applied": False, "reason": "missing_sizing_price"},
         }
     if settings is None:
@@ -1443,22 +1487,37 @@ def _adjust_approved_watch_quantity(
             "quantity": agent_quantity,
             "sizing_price": sizing_price,
             "approved_notional": approved_notional,
+            "decision": "submit",
+            "reason_code": None,
+            "reason": None,
             "adjustment": {
                 "applied": False,
                 "reason": "settings_unavailable",
                 "agent_quantity": agent_quantity,
+                "agent_approved_quantity": agent_quantity,
                 "agent_notional": _decimal_text(approved_notional),
+                "agent_approved_notional": _decimal_text(approved_notional),
+                "minimum_required_notional": None,
+                "cap_notional": _decimal_text(approved_notional),
+                "final_quantity": agent_quantity,
+                "final_notional": _decimal_text(approved_notional),
+                "decision": "submit",
             },
         }
 
     original_notional = sizing_price * Decimal(agent_quantity)
+    agent_reported_notional = _decimal_value(decision.get("approved_notional_krw"))
+    agent_cap_notional = original_notional
+    if agent_reported_notional is not None and agent_reported_notional > 0:
+        agent_cap_notional = min(agent_cap_notional, agent_reported_notional)
     target_notional = _target_min_notional(settings=settings, item=item, decision=decision)
-    cap_notional = _watch_sizing_cap_notional(
+    runtime_cap_notional = _watch_sizing_cap_notional(
         settings=settings,
         item=item,
         account_context=account_context,
         sizing_price=sizing_price,
     )
+    cap_notional = min(runtime_cap_notional, agent_cap_notional).quantize(Decimal("0.0001"), rounding=ROUND_DOWN)
     effective_target = min(target_notional, cap_notional)
     adjusted_quantity = agent_quantity
     max_quantity = _floor_quantity(cap_notional / sizing_price)
@@ -1467,7 +1526,7 @@ def _adjust_approved_watch_quantity(
     )
     if envelope_max_quantity is not None:
         max_quantity = min(max_quantity, envelope_max_quantity)
-    min_notional_upsize_suppressed = effective_target > original_notional
+    min_notional_upsize_suppressed = target_notional > original_notional
     adjusted_quantity = min(adjusted_quantity, max_quantity)
     vol_corr_cap = apply_vol_corr_quantity_cap(
         settings=settings,
@@ -1477,17 +1536,34 @@ def _adjust_approved_watch_quantity(
     if vol_corr_cap is not None:
         adjusted_quantity = int(vol_corr_cap["capped_quantity"])
     approved_notional = sizing_price * Decimal(adjusted_quantity)
+    decision_name = "submit"
+    reason_code = None
+    reason = None
+    if target_notional > approved_notional:
+        decision_name = "skip"
+        reason_code = "below_min_notional_within_agent_cap"
+        reason = "minimum watch-buy notional cannot be met without exceeding agent-approved exposure"
     adjustment: dict[str, object] = {
         "applied": adjusted_quantity != agent_quantity,
         "agent_quantity": agent_quantity,
+        "agent_approved_quantity": agent_quantity,
         "agent_notional": _decimal_text(original_notional),
+        "agent_approved_notional": _decimal_text(agent_cap_notional),
         "target_min_notional": _decimal_text(target_notional),
+        "minimum_required_notional": _decimal_text(target_notional),
         "cap_notional": _decimal_text(cap_notional),
+        "runtime_cap_notional": _decimal_text(runtime_cap_notional),
+        "agent_cap_notional": _decimal_text(agent_cap_notional),
         "allowed_action_envelope_max_quantity": envelope_max_quantity,
         "effective_target_notional": _decimal_text(effective_target),
         "min_notional_upsize_suppressed": min_notional_upsize_suppressed,
         "adjusted_quantity": adjusted_quantity,
         "adjusted_notional": _decimal_text(approved_notional),
+        "final_quantity": adjusted_quantity,
+        "final_notional": _decimal_text(approved_notional),
+        "decision": decision_name,
+        "reason_code": reason_code,
+        "reason": reason,
     }
     if vol_corr_cap is not None:
         adjustment["vol_corr_cap"] = vol_corr_cap
@@ -1495,6 +1571,9 @@ def _adjust_approved_watch_quantity(
         "quantity": adjusted_quantity,
         "sizing_price": sizing_price,
         "approved_notional": approved_notional,
+        "decision": decision_name,
+        "reason_code": reason_code,
+        "reason": reason,
         "adjustment": adjustment,
     }
 
