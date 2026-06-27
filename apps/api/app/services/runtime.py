@@ -33,6 +33,7 @@ from app.services.trigger_time_exec_agent import (
     AGENT_REJECTED_STATUS,
 )
 from app.services.broker_auth import build_broker_adapter, build_broker_session_summary
+from app.services.account_drawdown_gate import latest_account_drawdown_gate_state
 from app.services.execution_api import list_runtime_symbols
 from app.services.schema import check_runtime_schema
 from app.services.runtime_controls import (
@@ -746,6 +747,7 @@ def build_runtime_status(
         "sqlite": sqlite_diagnostics_payload(),
     }
     counts: dict[str, int] = {"open_orders": 0, "active_execution_jobs": 0}
+    account_drawdown_gate: dict[str, object] = {"gated": False, "latest_decision": None}
     autonomous = autonomous_runtime or _default_autonomous_runtime_payload(settings)
     monitoring_price_source = _autonomous_monitoring_price_source(autonomous)
     monitoring: dict[str, object] = _monitoring_payload_from_autonomous(
@@ -821,6 +823,7 @@ def build_runtime_status(
             "counts": counts,
             "symbols": symbols,
             "freshness": freshness,
+            "account_drawdown_gate": account_drawdown_gate,
         }
 
     schema = check_runtime_schema(db)
@@ -860,6 +863,7 @@ def build_runtime_status(
             "counts": counts,
             "symbols": symbols,
             "freshness": freshness,
+            "account_drawdown_gate": account_drawdown_gate,
         }
 
     try:
@@ -868,6 +872,7 @@ def build_runtime_status(
         counts = runtime_counts(settings=settings, db=db)
         broker = build_broker_session_summary(settings=settings, db=db)
         broker_providers = broker_provider_readiness(settings=settings, db=db)
+        account_drawdown_gate = latest_account_drawdown_gate_state(settings=settings, db=db)
         symbols = runtime_symbol_summary(settings=settings, db=db)
         if include_expensive_sections:
             monitoring = monitoring_payload(settings=settings, db=db)
@@ -926,6 +931,7 @@ def build_runtime_status(
         "symbols": symbols,
         "freshness": freshness,
         "monthly_pnl": monthly_pnl,
+        "account_drawdown_gate": account_drawdown_gate,
     }
 
 
@@ -1137,6 +1143,7 @@ def build_runtime_daily_board(
         "market_date": datetime.now(KRX_TIMEZONE).date().isoformat(),
         "mode": settings.runtime_mode,
         "runtime": runtime_status,
+        "account_drawdown_gate": latest_account_drawdown_gate_state(settings=settings, db=db),
         "totals": {
             "symbol_count": len(symbols),
             "monitored_symbol_count": sum(symbol["monitored"] for symbol in symbols),

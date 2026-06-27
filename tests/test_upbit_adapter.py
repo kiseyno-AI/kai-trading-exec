@@ -579,6 +579,7 @@ def test_kis_stock_order_preserves_integer_quantity_on_adapter_rejection() -> No
             database_url="sqlite:///:memory:",
             runtime_mode="paper",
             automation_enabled=True,
+            account_drawdown_gate_enabled=False,
             kis_app_key="paper-key",
             kis_app_secret="paper-secret",
             kis_account_number="12345678",

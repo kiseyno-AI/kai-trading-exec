@@ -8,7 +8,14 @@ from sqlalchemy.orm import sessionmaker
 
 from app.core.config import Settings
 from app.db.base import Base
-from app.models.runtime import BrokerOrder, ExecutionFill, ExecutionPlan, ExecutionPlanItem, ExecutionPosition
+from app.models.runtime import (
+    BrokerOrder,
+    ExecutionFill,
+    ExecutionPlan,
+    ExecutionPlanItem,
+    ExecutionPlanItemAudit,
+    ExecutionPosition,
+)
 from app.services.trade_outcome_feedback import (
     generate_trade_outcome_feedback,
     load_latest_trade_outcome_feedback_snippet,
@@ -311,6 +318,154 @@ def test_trade_outcome_feedback_headlines_broker_total_asset_change_with_unreali
     assert report["prompt_snippet"]["broker_asset_warnings"][0].startswith("Divergence warning:")
     markdown = (tmp_path / "latest.md").read_text(encoding="utf-8")
     assert markdown.index("Broker total asset change: -406201.0000 KRW") < markdown.index("FIFO realized P/L: -43675.0000 KRW")
+
+    session.close()
+    engine.dispose()
+
+
+def test_trade_outcome_feedback_reports_account_drawdown_gate_state(tmp_path) -> None:
+    engine, session = _session()
+    settings = Settings(runtime_mode="paper", trade_outcome_feedback_dir=str(tmp_path))
+    plan = ExecutionPlan(
+        id="plan-drawdown-gate-report",
+        external_plan_id="plan-drawdown-gate-report",
+        source="kai-trading-core",
+        mode="paper",
+    )
+    item = ExecutionPlanItem(
+        id="item-drawdown-gate-report",
+        plan=plan,
+        symbol="005930",
+        side="buy",
+        intent="next_open_buy",
+        status="new_buy_blocked",
+    )
+    summary = {
+        "gate_name": "daily_total_asset_drawdown_pct",
+        "current_metric": "2.0000",
+        "threshold": "1.0000",
+        "baseline_value": "10000000.0000",
+        "order_idempotency_key": "drawdown-report-order",
+        "execution_plan_item_id": item.id,
+        "sells_risk_reduction_allowed": True,
+    }
+    session.add_all(
+        [
+            plan,
+            ExecutionPlanItemAudit(
+                execution_plan_item_id=item.id,
+                event_type="account_drawdown_new_buy_blocked",
+                source="broker_order_service",
+                summary=summary,
+                payload={"decision": summary},
+                error_message="daily total asset drawdown percent threshold reached",
+                occurred_at=datetime(2026, 6, 20, 0, 30, tzinfo=UTC),
+            ),
+        ]
+    )
+    session.commit()
+
+    report = generate_trade_outcome_feedback(
+        settings=settings,
+        db=session,
+        as_of=datetime(2026, 6, 20, tzinfo=UTC),
+    )
+
+    assert report["account_drawdown_gate"]["gated"] is True
+    assert (
+        report["account_drawdown_gate"]["latest_decision"]["summary"]["gate_name"]
+        == "daily_total_asset_drawdown_pct"
+    )
+    assert "Account drawdown gate active: daily_total_asset_drawdown_pct" in report["prompt_snippet"]["account_drawdown_gate"]
+    markdown = (tmp_path / "latest.md").read_text(encoding="utf-8")
+    assert "### Account Drawdown Gate" in markdown
+    assert "gate=daily_total_asset_drawdown_pct" in markdown
+    assert "sells/risk-reduction allowed=True" in markdown
+
+    session.close()
+    engine.dispose()
+
+
+def test_trade_outcome_feedback_latest_allowed_order_clears_account_drawdown_gate(tmp_path) -> None:
+    engine, session = _session()
+    settings = Settings(runtime_mode="paper", trade_outcome_feedback_dir=str(tmp_path))
+    plan = ExecutionPlan(
+        id="plan-drawdown-gate-cleared",
+        external_plan_id="plan-drawdown-gate-cleared",
+        source="kai-trading-core",
+        mode="paper",
+    )
+    item = ExecutionPlanItem(
+        id="item-drawdown-gate-cleared",
+        plan=plan,
+        symbol="005930",
+        side="buy",
+        intent="next_open_buy",
+        status="new_buy_blocked",
+    )
+    blocked_summary = {
+        "gate_name": "daily_total_asset_drawdown_pct",
+        "current_metric": "2.0000",
+        "threshold": "1.0000",
+        "baseline_value": "10000000.0000",
+        "order_idempotency_key": "older-blocked-order",
+        "execution_plan_item_id": item.id,
+        "sells_risk_reduction_allowed": True,
+    }
+    allowed_summary = {
+        "blocked": False,
+        "order_idempotency_key": "newer-allowed-order",
+        "execution_plan_item_id": item.id,
+    }
+    session.add_all(
+        [
+            plan,
+            ExecutionPlanItemAudit(
+                execution_plan_item_id=item.id,
+                event_type="account_drawdown_new_buy_blocked",
+                source="broker_order_service",
+                summary=blocked_summary,
+                payload={"blocked": True, "decision": blocked_summary},
+                error_message="daily total asset drawdown percent threshold reached",
+                occurred_at=datetime(2026, 6, 20, 0, 30, tzinfo=UTC),
+            ),
+            BrokerOrder(
+                id="order-newer-allowed-drawdown-gate",
+                plan_item=item,
+                broker_name="kis",
+                mode="paper",
+                idempotency_key="newer-allowed-order",
+                broker_order_id="kis-newer-allowed-order",
+                symbol="005930",
+                side="buy",
+                status="submitted",
+                quantity=1,
+                response_metadata={"account_drawdown_gate": allowed_summary},
+                raw_broker_payload={"blocked": False},
+                last_broker_sync_at=datetime(2026, 6, 20, 1, 0, tzinfo=UTC),
+            ),
+        ]
+    )
+    session.commit()
+
+    report = generate_trade_outcome_feedback(
+        settings=settings,
+        db=session,
+        as_of=datetime(2026, 6, 20, tzinfo=UTC),
+    )
+
+    assert report["account_drawdown_gate"]["gated"] is False
+    assert report["account_drawdown_gate"]["latest_decision"]["source"] == "broker_order"
+    assert (
+        report["account_drawdown_gate"]["latest_decision"]["summary"]["order_idempotency_key"]
+        == "newer-allowed-order"
+    )
+    assert (
+        report["prompt_snippet"]["account_drawdown_gate"]
+        == "Account drawdown gate is not active in the latest audited decision."
+    )
+    markdown = (tmp_path / "latest.md").read_text(encoding="utf-8")
+    assert "Account drawdown gate: not currently gated by the latest audited decision." in markdown
 
     session.close()
     engine.dispose()

@@ -20,6 +20,12 @@ from app.broker.base import (
 from app.core.config import Settings
 from app.models.runtime import BrokerOrder, BrokerOrderEvent, ExecutionPlan, ExecutionPlanItem
 from app.models.runtime import ExecutionFill, ExecutionPosition, new_id
+from app.services.account_drawdown_gate import (
+    AccountDrawdownDecision,
+    account_drawdown_uncertain_decision,
+    evaluate_account_drawdown_gate,
+    record_account_drawdown_block,
+)
 from app.services.broker_auth import ensure_authenticated_broker_session
 from app.services.domestic_order_router import RouteDecision, resolve_domestic_order_route
 from app.services.execution_failures import record_actionable_execution_failure
@@ -137,6 +143,25 @@ def place_broker_order(
         command=command,
         route_decision=route_decision,
     )
+
+    account_gate_decision = _evaluate_new_buy_account_gate(
+        settings=settings,
+        db=db,
+        adapter=adapter,
+        command=routed_command,
+        plan_item=plan_item,
+    )
+    if account_gate_decision is not None and not account_gate_decision.allowed:
+        return _persist_account_gate_block(
+            settings=settings,
+            db=db,
+            adapter=adapter,
+            command=routed_command,
+            request_source=request_source,
+            plan_item=plan_item,
+            route_decision=route_decision,
+            decision=account_gate_decision,
+        )
 
     order = BrokerOrder(
         broker_name=adapter.provider,
@@ -307,7 +332,10 @@ def place_broker_order(
         request_source=request_source,
         route_decision=route_decision,
     )
-    order.response_metadata = placement.response_metadata
+    response_metadata = dict(placement.response_metadata or {})
+    if account_gate_decision is not None:
+        response_metadata["account_drawdown_gate"] = account_gate_decision.summary
+    order.response_metadata = response_metadata
     order.last_error_classification = None
     order.last_error_code = None
     order.last_error_message = None
@@ -449,6 +477,191 @@ def _validate_upbit_paper_guardrails(
     if notional is not None and notional > settings.exec_agent_max_symbol_budget:
         return "Upbit crypto paper order exceeds per-symbol execution budget"
     return None
+
+
+def _evaluate_new_buy_account_gate(
+    *,
+    settings: Settings,
+    db: Session,
+    adapter: BrokerAdapter,
+    command: PlaceOrderRequest,
+    plan_item: ExecutionPlanItem | None,
+) -> AccountDrawdownDecision | None:
+    if not settings.account_drawdown_gate_enabled:
+        return None
+    if not _is_new_buy_order(command=command, plan_item=plan_item):
+        return None
+    if command.provider != "kis" and adapter.provider != "kis":
+        return None
+
+    try:
+        session_state = ensure_authenticated_broker_session(
+            settings=settings,
+            db=db,
+            adapter=adapter,
+            source="account_drawdown_gate",
+            reason=f"load broker account snapshot before new buy {command.idempotency_key}",
+        )
+        try:
+            snapshot = adapter.get_account_snapshot(
+                session_state.access_token or "",
+                symbols=[command.symbol],
+                exchange=command.exchange or "KRX",
+            )
+        except TypeError:
+            snapshot = adapter.get_account_snapshot(session_state.access_token or "")
+    except Exception as exc:
+        return account_drawdown_uncertain_decision(
+            order_idempotency_key=command.idempotency_key,
+            execution_plan_item_id=plan_item.id if plan_item is not None else command.execution_plan_item_id,
+            reason=f"broker account snapshot unavailable before new buy: {exc.__class__.__name__}: {exc}",
+        )
+
+    return evaluate_account_drawdown_gate(
+        settings=settings,
+        snapshot=snapshot,
+        order_idempotency_key=command.idempotency_key,
+        execution_plan_item_id=plan_item.id if plan_item is not None else command.execution_plan_item_id,
+    )
+
+
+def _is_new_buy_order(
+    *,
+    command: PlaceOrderRequest,
+    plan_item: ExecutionPlanItem | None,
+) -> bool:
+    if command.side != "buy":
+        return False
+    purpose = _order_purpose(
+        command=command,
+        plan_item=plan_item,
+        metadata=dict(command.metadata or {}),
+    )
+    if purpose in {"risk_reduction", "reduce_risk", "risk_reducing", "protective_hedge"}:
+        return False
+    if plan_item is not None and plan_item.intent in {
+        "risk_reduction",
+        "reduce_risk",
+        "risk_reducing",
+        "protective_hedge",
+    }:
+        return False
+    return True
+
+
+def _persist_account_gate_block(
+    *,
+    settings: Settings,
+    db: Session,
+    adapter: BrokerAdapter,
+    command: PlaceOrderRequest,
+    request_source: str,
+    plan_item: ExecutionPlanItem | None,
+    route_decision: RouteDecision | None,
+    decision: AccountDrawdownDecision,
+) -> PlaceBrokerOrderResult:
+    observed_at = datetime.now(UTC)
+    order = BrokerOrder(
+        broker_name=adapter.provider,
+        execution_plan_item_id=plan_item.id if plan_item else None,
+        mode=settings.runtime_mode,
+        idempotency_key=command.idempotency_key,
+        symbol=command.symbol,
+        side=command.side,
+        status=NormalizedBrokerOrderStatus.REJECTED.value,
+        quantity=command.quantity,
+        base_quantity=command.base_quantity,
+        quote_notional=command.quote_notional,
+        quantity_precision=command.quantity_precision,
+        price_precision=command.price_precision,
+        venue=command.venue,
+        asset_class=command.asset_class,
+        limit_price=command.limit_price,
+        request_metadata={
+            "source": request_source,
+            "requested_at": observed_at.isoformat(),
+            "time_in_force": command.time_in_force,
+            "provider": command.provider,
+            "asset_class": command.asset_class,
+            "venue": command.venue,
+            "sizing": _sizing_payload(command),
+            "account_drawdown_gate": decision.summary,
+            **({"metadata": command.metadata} if command.metadata is not None else {}),
+            **({"route": _route_payload(route_decision)} if route_decision is not None else {}),
+        },
+        response_metadata={"account_drawdown_gate": decision.summary},
+        last_error_classification="validation",
+        last_error_code=decision.gate_name,
+        last_error_message=decision.reason,
+        last_error_retryable=False,
+        raw_broker_payload=decision.payload,
+        last_broker_sync_at=observed_at,
+    )
+    db.add(order)
+    try:
+        db.flush()
+    except IntegrityError:
+        db.rollback()
+        duplicate = _load_order_by_idempotency_key(
+            settings=settings,
+            db=db,
+            idempotency_key=command.idempotency_key,
+        )
+        if duplicate is None:
+            raise
+        return PlaceBrokerOrderResult(
+            status_code=200,
+            payload={
+                "duplicate": True,
+                "message": "order with this idempotency_key already exists",
+                "order": serialize_broker_order(duplicate, include_events=True),
+            },
+        )
+
+    db.add(
+        BrokerOrderEvent(
+            broker_order_pk=order.id,
+            event_type="submission_blocked",
+            event_source=BrokerEventSource.SYSTEM.value,
+            normalized_status=NormalizedBrokerOrderStatus.REJECTED.value,
+            broker_status=decision.gate_name,
+            message=decision.reason,
+            request_payload=_order_command_payload(command),
+            response_payload=decision.payload,
+            payload={
+                "provider": adapter.provider,
+                "account_drawdown_gate": decision.summary,
+                "sells_risk_reduction_allowed": decision.sells_risk_reduction_allowed,
+            },
+            observed_at=observed_at,
+        )
+    )
+    if plan_item is not None:
+        plan_item.status = "watch_buy_triggered_blocked" if plan_item.status.startswith("watch_") else "new_buy_blocked"
+    record_account_drawdown_block(
+        db=db,
+        execution_plan_item_id=plan_item.id if plan_item is not None else command.execution_plan_item_id,
+        decision=decision,
+        occurred_at=observed_at,
+    )
+    db.commit()
+    persisted = _load_order_by_idempotency_key(
+        settings=settings,
+        db=db,
+        idempotency_key=command.idempotency_key,
+    )
+    return PlaceBrokerOrderResult(
+        status_code=409,
+        payload={
+            "duplicate": False,
+            "message": "new buy order blocked by account drawdown gate",
+            "blocked": True,
+            "block_reason": decision.gate_name,
+            "account_drawdown_gate": decision.summary,
+            "sells_risk_reduction_allowed": decision.sells_risk_reduction_allowed,
+            "order": serialize_broker_order(persisted or order, include_events=True),
+        },
+    )
 
 
 def _order_command_payload(command: PlaceOrderRequest) -> dict[str, object]:

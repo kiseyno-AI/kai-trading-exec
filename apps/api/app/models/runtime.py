@@ -233,6 +233,8 @@ class ExecutionPlanItemAudit(TimestampMixin, Base):
         index=True,
     )
 
+    plan_item: Mapped[ExecutionPlanItem] = relationship()
+
 
 class ExecutionJob(TimestampMixin, Base):
     __tablename__ = "execution_jobs"
