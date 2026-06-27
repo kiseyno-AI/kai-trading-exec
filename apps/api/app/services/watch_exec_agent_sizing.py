@@ -23,6 +23,7 @@ from app.db.sqlite_diagnostics import sqlite_write_lock
 from app.models.runtime import ExecutionPlan, ExecutionPlanItem, ExecutionPlanItemAudit
 from app.services.broker_auth import ensure_authenticated_broker_session
 from app.services.market_regime_guardrails import evaluate_market_regime_guardrail
+from app.services.reconciliation import reconcile_stale_nonterminal_broker_orders
 from app.services.risk_sizing import apply_vol_corr_quantity_cap
 from app.services.trade_outcome_feedback import load_latest_trade_outcome_feedback_snippet
 
@@ -89,13 +90,25 @@ def run_due_watch_exec_agent_sizing(
     if not plans:
         return _result(idle=True, reason="no_unsized_watch_candidates")
 
-    account_context = _load_sizing_account_context(settings=settings, db=db, adapter=adapter)
+    account_context = _load_sizing_account_context(
+        settings=settings,
+        db=db,
+        adapter=adapter,
+        symbols=_candidate_symbols(plans),
+    )
     plan_payloads: list[dict[str, object]] = []
     applied: list[dict[str, object]] = []
     errors: list[dict[str, object]] = []
     batches_processed = 0
     max_batches_per_cycle = int(getattr(settings, "exec_agent_watch_sizing_max_batches_per_cycle", 3))
     for plan in plans:
+        stale_block_summary = _reject_stale_state_blocked_items(
+            db=db,
+            plan=plan,
+            account_context=account_context,
+        )
+        if stale_block_summary["rejected"]:
+            applied.append(stale_block_summary)
         candidates = [_candidate_payload(item) for item in _unsized_watch_items(plan)]
         if not candidates:
             continue
@@ -238,9 +251,15 @@ def _run_due_watch_exec_agent_sizing_short_transactions(
         settings=settings,
         session_factory=session_factory,
         adapter=adapter,
+        symbols=_candidate_symbols(plans),
+    )
+    stale_blocked_ids, stale_block_summaries = _reject_stale_state_blocked_items_short_transaction(
+        session_factory=session_factory,
+        plans=plans,
+        account_context=account_context,
     )
     plan_payloads: list[dict[str, object]] = []
-    applied: list[dict[str, object]] = []
+    applied: list[dict[str, object]] = [*stale_block_summaries]
     errors: list[dict[str, object]] = []
     batches_processed = 0
     max_batches_per_cycle = int(getattr(settings, "exec_agent_watch_sizing_max_batches_per_cycle", 3))
@@ -249,6 +268,8 @@ def _run_due_watch_exec_agent_sizing_short_transactions(
     for plan in plans:
         candidates = []
         for item in _unsized_watch_items(plan):
+            if item.id in stale_blocked_ids:
+                continue
             candidate = _candidate_payload(item)
             candidate["source_plan_id"] = plan.external_plan_id
             candidates.append(candidate)
@@ -500,6 +521,15 @@ def _unsized_watch_items(plan: ExecutionPlan) -> list[ExecutionPlanItem]:
     return sorted(items, key=lambda item: (item.symbol, item.plan_item_index, item.id))
 
 
+def _candidate_symbols(plans: list[ExecutionPlan]) -> set[str]:
+    return {
+        item.symbol.strip().upper()
+        for plan in plans
+        for item in _unsized_watch_items(plan)
+        if item.symbol and item.symbol.strip()
+    }
+
+
 def _has_exec_agent_decision(item: ExecutionPlanItem) -> bool:
     for payload in (item.risk_context, item.quantity_policy):
         if isinstance(payload, dict) and isinstance(payload.get("exec_agent_decision"), dict):
@@ -681,10 +711,17 @@ def _load_sizing_account_context(
     settings: Settings,
     db: Session,
     adapter: BrokerAdapter | None,
+    symbols: set[str] | None = None,
 ) -> dict[str, object]:
     if adapter is None:
         return {"available": False, "reason": "broker_adapter_unavailable"}
     try:
+        stale_reconciliation = _reconcile_stale_sizing_orders(
+            settings=settings,
+            db=db,
+            adapter=adapter,
+            symbols=symbols,
+        )
         session_state = ensure_authenticated_broker_session(
             settings=settings,
             db=db,
@@ -695,7 +732,7 @@ def _load_sizing_account_context(
         snapshot = adapter.get_account_snapshot(session_state.access_token or "")
     except (BrokerAdapterError, AttributeError, NotImplementedError, RuntimeError, ValueError) as exc:
         return {"available": False, "reason": f"{exc.__class__.__name__}: {exc}"}
-    return _account_context_payload(snapshot)
+    return _account_context_payload(snapshot, stale_reconciliation=stale_reconciliation)
 
 
 def _load_sizing_account_context_short_transaction(
@@ -703,11 +740,18 @@ def _load_sizing_account_context_short_transaction(
     settings: Settings,
     session_factory: sessionmaker[Session],
     adapter: BrokerAdapter | None,
+    symbols: set[str] | None = None,
 ) -> dict[str, object]:
     if adapter is None:
         return {"available": False, "reason": "broker_adapter_unavailable"}
     try:
         with session_factory() as db:
+            stale_reconciliation = _reconcile_stale_sizing_orders(
+                settings=settings,
+                db=db,
+                adapter=adapter,
+                symbols=symbols,
+            )
             session_state = ensure_authenticated_broker_session(
                 settings=settings,
                 db=db,
@@ -720,10 +764,28 @@ def _load_sizing_account_context_short_transaction(
         snapshot = adapter.get_account_snapshot(access_token)
     except (BrokerAdapterError, AttributeError, NotImplementedError, RuntimeError, ValueError) as exc:
         return {"available": False, "reason": f"{exc.__class__.__name__}: {exc}"}
-    return _account_context_payload(snapshot)
+    return _account_context_payload(snapshot, stale_reconciliation=stale_reconciliation)
 
 
-def _account_context_payload(snapshot: BrokerAccountSnapshot) -> dict[str, object]:
+def _reconcile_stale_sizing_orders(
+    *,
+    settings: Settings,
+    db: Session,
+    adapter: BrokerAdapter,
+    symbols: set[str] | None,
+) -> dict[str, object]:
+    return reconcile_stale_nonterminal_broker_orders(
+        settings=settings,
+        db=db,
+        adapter=adapter,
+        symbols=symbols if symbols else None,
+    )
+
+
+def _account_context_payload(
+    snapshot: BrokerAccountSnapshot,
+    stale_reconciliation: dict[str, object] | None = None,
+) -> dict[str, object]:
     positions = snapshot.positions or snapshot.holdings
     holdings = [
         {
@@ -747,7 +809,7 @@ def _account_context_payload(snapshot: BrokerAccountSnapshot) -> dict[str, objec
         }
         for order in snapshot.open_orders
     ]
-    return {
+    payload: dict[str, object] = {
         "available": True,
         "source": snapshot.source,
         "observed_at": snapshot.observed_at.isoformat(),
@@ -758,6 +820,163 @@ def _account_context_payload(snapshot: BrokerAccountSnapshot) -> dict[str, objec
         "holdings": holdings,
         "open_orders": open_orders,
     }
+    if stale_reconciliation is not None:
+        blockers = _stale_state_blockers_from_reconciliation(stale_reconciliation)
+        payload["stale_order_reconciliation"] = _json_safe(stale_reconciliation)
+        payload["stale_state_blocker_count"] = len(blockers)
+        payload["stale_state_blocked_symbols"] = sorted({str(row["symbol"]) for row in blockers})
+        payload["stale_state_blockers"] = blockers
+    return payload
+
+
+def _stale_state_blockers_from_reconciliation(reconciliation: dict[str, object]) -> list[dict[str, object]]:
+    items = reconciliation.get("items")
+    if not isinstance(items, list):
+        return []
+    blockers: list[dict[str, object]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        classification = str(item.get("classification") or "").strip().lower()
+        if classification not in {"unknown", "failed-to-reconcile"}:
+            continue
+        symbol = str(item.get("symbol") or "").strip().upper()
+        if not symbol:
+            continue
+        result = item.get("result") if isinstance(item.get("result"), dict) else {}
+        blockers.append(
+            {
+                "symbol": symbol,
+                "reason": "stale_order_broker_truth_unconfirmed",
+                "classification": classification,
+                "broker_order_pk": item.get("broker_order_pk"),
+                "broker_order_id": item.get("broker_order_id"),
+                "idempotency_key": item.get("idempotency_key"),
+                "side": item.get("side"),
+                "status": item.get("status"),
+                "message": item.get("reason") or result.get("message"),
+                "last_broker_sync_at": item.get("last_broker_sync_at"),
+            }
+        )
+    return blockers
+
+
+def _stale_state_blockers_by_symbol(account_context: dict[str, object] | None) -> dict[str, list[dict[str, object]]]:
+    if not isinstance(account_context, dict):
+        return {}
+    blockers = account_context.get("stale_state_blockers")
+    if not isinstance(blockers, list):
+        return {}
+    by_symbol: dict[str, list[dict[str, object]]] = {}
+    for blocker in blockers:
+        if not isinstance(blocker, dict):
+            continue
+        symbol = str(blocker.get("symbol") or "").strip().upper()
+        if symbol:
+            by_symbol.setdefault(symbol, []).append(blocker)
+    return by_symbol
+
+
+def _reject_stale_state_blocked_items(
+    *,
+    db: Session | None,
+    plan: ExecutionPlan,
+    account_context: dict[str, object] | None,
+) -> dict[str, object]:
+    blockers_by_symbol = _stale_state_blockers_by_symbol(account_context)
+    rejected_ids: list[str] = []
+    for item in _unsized_watch_items(plan):
+        blockers = blockers_by_symbol.get(item.symbol.strip().upper())
+        if not blockers:
+            continue
+        _reject_stale_state_blocked_item(db=db, item=item, blockers=blockers)
+        rejected_ids.append(item.id)
+    return {
+        "plan_id": plan.external_plan_id,
+        "evaluated": len(rejected_ids),
+        "approved": 0,
+        "rejected": len(rejected_ids),
+        "missing": 0,
+        "missing_item_ids": [],
+        "ignored_extra": 0,
+        "stale_state_blocked_item_ids": rejected_ids,
+    }
+
+
+def _reject_stale_state_blocked_items_short_transaction(
+    *,
+    session_factory: sessionmaker[Session],
+    plans: list[ExecutionPlan],
+    account_context: dict[str, object] | None,
+) -> tuple[set[str], list[dict[str, object]]]:
+    if not _stale_state_blockers_by_symbol(account_context):
+        return set(), []
+    blocked_ids: set[str] = set()
+    summaries: list[dict[str, object]] = []
+    with session_factory() as db:
+        with sqlite_write_lock(db):
+            for plan in plans:
+                write_plan = _load_plan_for_update(db=db, plan_id=plan.id)
+                summary = _reject_stale_state_blocked_items(
+                    db=db,
+                    plan=write_plan,
+                    account_context=account_context,
+                )
+                ids = {str(item_id) for item_id in summary["stale_state_blocked_item_ids"]}
+                blocked_ids.update(ids)
+                if summary["rejected"]:
+                    summaries.append(summary)
+            db.commit()
+    return blocked_ids, summaries
+
+
+def _reject_stale_state_blocked_item(
+    *,
+    db: Session | None,
+    item: ExecutionPlanItem,
+    blockers: list[dict[str, object]],
+) -> None:
+    summary = {
+        "source": "watch_exec_agent_sizing",
+        "action": "reject",
+        "decision": "rejected",
+        "execution_plan_item_id": item.id,
+        "symbol": item.symbol,
+        "quantity": 0,
+        "approved_quantity": 0,
+        "approved_notional_krw": "0.0000",
+        "sizing_price": _json_decimal(item.limit_price or item.trigger_price),
+        "confidence": None,
+        "target_profile": None,
+        "target_tag": None,
+        "reason_code": "stale_order_broker_truth_unconfirmed",
+        "reason": "stale local open order could not be confirmed against broker truth",
+        "decided_at": datetime.now(UTC).isoformat(),
+    }
+    previous_policy = item.quantity_policy if isinstance(item.quantity_policy, dict) else None
+    item.quantity_policy = {
+        "kind": "exec_agent_rejected",
+        "source": "watch_exec_agent_sizing",
+        "exec_agent_decision": summary,
+        "short_term_exec_agent_decision": summary,
+        "exec_agent_decision_audit": {
+            "event_type": "watch_exec_agent_sizing_stale_state_blocked",
+            "storage": "execution_plan_item_audits",
+        },
+        "stale_state_blockers": _json_safe(blockers),
+        "previous_policy": previous_policy,
+    }
+    item.status = "exec_agent_rejected"
+    _add_plan_item_audit(
+        db=db,
+        item=item,
+        event_type="watch_exec_agent_sizing_stale_state_blocked",
+        summary=summary,
+        payload={
+            "summary": summary,
+            "stale_state_blockers": _json_safe(blockers),
+        },
+    )
 
 
 def _candidate_universe_payload(candidates: list[dict[str, object]]) -> dict[str, object]:

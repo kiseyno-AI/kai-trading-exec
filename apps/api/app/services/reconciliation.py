@@ -113,7 +113,10 @@ def reconcile_broker_order(
                 message="reconcile payload has unrecognized status",
                 request_payload=_dict_or_none(payload.get("request_payload")),
                 response_payload=_safe_payload(payload),
-                payload=_build_reconcile_event_payload(payload=payload, adapter=adapter),
+                payload={
+                    **_build_reconcile_event_payload(payload=payload, adapter=adapter),
+                    "raw_status_details": _raw_status_details(payload),
+                },
                 observed_at=event_time,
             )
         )
@@ -131,7 +134,7 @@ def reconcile_broker_order(
         return {
             "status_code": 200,
             "broker_order_id": order.broker_order_id,
-            "status": order.status,
+            "status": "unknown",
             "status_before": order_status_before,
             "status_changed": False,
             "fills_added": 0,
@@ -853,10 +856,21 @@ def _build_reconcile_event_payload(
         "provider": adapter.provider,
         "event_source": BrokerEventSource.RECONCILIATION.value,
         "observed_at": payload.get("observed_at"),
+        "status": payload.get("status"),
+        "broker_status": payload.get("broker_status"),
         "normalized_payload": _safe_payload(payload.get("payload")),
         "response_metadata": _dict_or_none(payload.get("response_metadata"))
         or _dict_or_none(payload.get("response_payload")),
         "request_metadata": _dict_or_none(payload.get("request_metadata")),
+    }
+
+
+def _raw_status_details(payload: dict[str, Any]) -> dict[str, object]:
+    return {
+        "status": _optional_str(payload.get("status")),
+        "broker_status": _optional_str(payload.get("broker_status")),
+        "message": _optional_str(payload.get("message")),
+        "observed_at": _optional_str(payload.get("observed_at")),
     }
 
 

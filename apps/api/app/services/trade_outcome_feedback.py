@@ -281,6 +281,8 @@ def _portfolio_risk(
     ]
     open_order_rows = [_open_order_risk_row(order=order, as_of=as_of, stale_before=stale_before) for order in open_orders]
     stale_orders = [row for row in open_order_rows if row.get("stale") is True]
+    normal_open_orders = [row for row in open_order_rows if row.get("stale") is not True]
+    stale_state_blockers = [_stale_state_blocker_row(row) for row in stale_orders]
     account_source_failed = None
     if not position_rows:
         account_source_failed = (
@@ -311,6 +313,8 @@ def _portfolio_risk(
         "target_sell_profit_contribution": contributions["target_sell_profit"],
         "max_holding_close_contribution": contributions["max_holding_close"],
         "open_orders": _json_safe(open_order_rows),
+        "normal_open_orders": _json_safe(normal_open_orders),
+        "stale_state_blockers": _json_safe(stale_state_blockers),
         "stale_open_order_warnings": _json_safe(stale_orders),
         "stale_local_position_warnings": _json_safe(stale_positions),
         "monday_pre_market_checks": _json_safe(monday_checks),
@@ -416,6 +420,27 @@ def _open_order_risk_row(*, order: BrokerOrder, as_of: datetime, stale_before: d
         "age_seconds": int((as_of - normalized_reference).total_seconds()) if normalized_reference is not None else None,
         "stale": is_stale,
         "stale_reason": "missing_order_timestamp" if normalized_reference is None else ("older_than_max_age" if is_stale else None),
+        "last_error_classification": order.last_error_classification,
+        "last_error_code": order.last_error_code,
+        "last_error_message": order.last_error_message,
+    }
+
+
+def _stale_state_blocker_row(row: dict[str, object]) -> dict[str, object]:
+    return {
+        "type": "stale_open_order_broker_truth",
+        "symbol": row.get("symbol"),
+        "side": row.get("side"),
+        "status": row.get("status"),
+        "broker_order_id": row.get("broker_order_id"),
+        "broker_order_pk": row.get("broker_order_pk"),
+        "stale_reason": row.get("stale_reason"),
+        "last_broker_sync_at": row.get("last_broker_sync_at"),
+        "age_seconds": row.get("age_seconds"),
+        "last_error_classification": row.get("last_error_classification"),
+        "last_error_code": row.get("last_error_code"),
+        "last_error_message": row.get("last_error_message"),
+        "reason": "refresh or resolve broker truth before new automation for this symbol/account",
     }
 
 
@@ -998,7 +1023,10 @@ def _portfolio_risk_snippet_lines(portfolio_risk: dict[str, object]) -> list[str
                     f"Top concentration {row.get('symbol')}: {row.get('market_value_krw')} KRW ({row.get('portfolio_weight_pct')}%)."
                 )
     stale_orders = portfolio_risk.get("stale_open_order_warnings")
+    stale_blockers = portfolio_risk.get("stale_state_blockers")
     stale_positions = portfolio_risk.get("stale_local_position_warnings")
+    if isinstance(stale_blockers, list) and stale_blockers:
+        lines.append(f"Stale-state blockers need broker-truth refresh: {len(stale_blockers)}.")
     if isinstance(stale_orders, list) and stale_orders:
         lines.append(f"Stale open orders need review: {len(stale_orders)}.")
     if isinstance(stale_positions, list) and stale_positions:
@@ -1083,7 +1111,10 @@ def _markdown_report(report: dict[str, object]) -> str:
                 if isinstance(row, dict):
                     lines.append(f"  - {row.get('name')}: {row.get('realized_pnl_krw')} KRW ({row.get('trade_count')}건)")
     stale_orders = portfolio_risk.get("stale_open_order_warnings")
+    stale_blockers = portfolio_risk.get("stale_state_blockers")
     stale_positions = portfolio_risk.get("stale_local_position_warnings")
+    if isinstance(stale_blockers, list) and stale_blockers:
+        lines.append(f"- 오래된 주문 상태 차단: {len(stale_blockers)}건")
     if isinstance(stale_orders, list) and stale_orders:
         lines.append(f"- 오래된 미체결 주문 경고: {len(stale_orders)}건")
     if isinstance(stale_positions, list) and stale_positions:
