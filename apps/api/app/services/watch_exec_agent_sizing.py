@@ -1225,8 +1225,7 @@ def _adjust_approved_watch_quantity(
     )
     if envelope_max_quantity is not None:
         max_quantity = min(max_quantity, envelope_max_quantity)
-    if effective_target > original_notional:
-        adjusted_quantity = max(agent_quantity, _floor_quantity(effective_target / sizing_price))
+    min_notional_upsize_suppressed = effective_target > original_notional
     adjusted_quantity = min(adjusted_quantity, max_quantity)
     vol_corr_cap = apply_vol_corr_quantity_cap(
         settings=settings,
@@ -1244,6 +1243,7 @@ def _adjust_approved_watch_quantity(
         "cap_notional": _decimal_text(cap_notional),
         "allowed_action_envelope_max_quantity": envelope_max_quantity,
         "effective_target_notional": _decimal_text(effective_target),
+        "min_notional_upsize_suppressed": min_notional_upsize_suppressed,
         "adjusted_quantity": adjusted_quantity,
         "adjusted_notional": _decimal_text(approved_notional),
     }

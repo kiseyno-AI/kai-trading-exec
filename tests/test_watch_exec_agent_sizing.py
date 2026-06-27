@@ -549,7 +549,7 @@ def test_apply_decisions_preserves_triggered_blocked_watch_buy_for_retry() -> No
     assert plan.items[0].quantity_policy["quantity"] == 2
 
 
-def test_apply_decisions_raises_small_agent_probe_to_min_notional() -> None:
+def test_apply_decisions_preserves_small_agent_probe_below_min_notional() -> None:
     plan = ExecutionPlan(
         id="plan-1",
         external_plan_id="plan-min-notional",
@@ -603,13 +603,14 @@ def test_apply_decisions_raises_small_agent_probe_to_min_notional() -> None:
     )
 
     policy = plan.items[0].quantity_policy
-    assert policy["quantity"] == 20
-    assert policy["approved_notional"] == "1430000.0000"
-    assert policy["sizing_adjustment"]["applied"] is True
+    assert policy["quantity"] == 3
+    assert policy["approved_notional"] == "214500.0000"
+    assert policy["sizing_adjustment"]["applied"] is False
     assert policy["sizing_adjustment"]["target_min_notional"] == "1500000.0000"
+    assert policy["sizing_adjustment"]["min_notional_upsize_suppressed"] is True
 
 
-def test_apply_decisions_respects_max_safe_notional_when_raising_probe() -> None:
+def test_apply_decisions_records_cap_when_preserving_small_probe() -> None:
     plan = ExecutionPlan(
         id="plan-1",
         external_plan_id="plan-min-notional-cap",
@@ -663,9 +664,11 @@ def test_apply_decisions_respects_max_safe_notional_when_raising_probe() -> None
     )
 
     policy = plan.items[0].quantity_policy
-    assert policy["quantity"] == 11
-    assert policy["approved_notional"] == "786500.0000"
+    assert policy["quantity"] == 3
+    assert policy["approved_notional"] == "214500.0000"
+    assert policy["sizing_adjustment"]["applied"] is False
     assert policy["sizing_adjustment"]["cap_notional"] == "800000.0000"
+    assert policy["sizing_adjustment"]["min_notional_upsize_suppressed"] is True
 
 
 def test_apply_decisions_records_vol_corr_cap_details_when_enabled() -> None:
@@ -726,14 +729,15 @@ def test_apply_decisions_records_vol_corr_cap_details_when_enabled() -> None:
     )
 
     policy = plan.items[0].quantity_policy
-    assert policy["quantity"] == 12
-    assert policy["approved_notional"] == "858000.0000"
+    assert policy["quantity"] == 1
+    assert policy["approved_notional"] == "71500.0000"
     vol_corr_cap = policy["sizing_adjustment"]["vol_corr_cap"]
-    assert vol_corr_cap["baseline_quantity"] == 20
+    assert vol_corr_cap["baseline_quantity"] == 3
     assert vol_corr_cap["volatility_multiplier"] == "0.7500"
     assert vol_corr_cap["correlation_multiplier"] == "0.8000"
     assert vol_corr_cap["vol_corr_multiplier"] == "0.6000"
     assert vol_corr_cap["vol_corr_cap_reason"] == "high_volatility+high_correlation"
+    assert policy["sizing_adjustment"]["min_notional_upsize_suppressed"] is True
 
 
 def test_apply_decisions_clamps_agent_approval_that_exceeds_cap() -> None:
@@ -963,10 +967,11 @@ def test_run_due_retry_applies_sizing_context_to_missing_decision(monkeypatch) -
     assert result.payload["applied"][1]["approved"] == 1
     assert db.committed is True
     retry_policy = plan.items[1].quantity_policy
-    assert retry_policy["quantity"] == 11
-    assert retry_policy["approved_notional"] == "786500.0000"
-    assert retry_policy["sizing_adjustment"]["applied"] is True
+    assert retry_policy["quantity"] == 3
+    assert retry_policy["approved_notional"] == "214500.0000"
+    assert retry_policy["sizing_adjustment"]["applied"] is False
     assert retry_policy["sizing_adjustment"]["cap_notional"] == "800000.0000"
+    assert retry_policy["sizing_adjustment"]["min_notional_upsize_suppressed"] is True
     assert "reason" not in retry_policy["sizing_adjustment"]
 
 
