@@ -245,6 +245,81 @@ def test_kis_price_source_keeps_quote_and_reports_context_enrichment_failure() -
     engine.dispose()
 
 
+def test_kis_price_source_ignores_zero_intraday_high_low_from_quote_payload() -> None:
+    observed_at = datetime(2026, 6, 29, 0, 1, tzinfo=UTC)
+    broker_adapter = LiveMarketContextAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        current_prices={"088910": Decimal("2520.00")},
+        current_price_observed_at=observed_at,
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+            domestic_order_session_routing_enabled=True,
+        ),
+        broker_adapter=broker_adapter,
+    )
+    original_get_current_price = broker_adapter.get_current_price
+
+    def get_current_price_with_zero_high_low(
+        access_token: str,
+        *,
+        symbol: str,
+        exchange: str = "KRX",
+    ) -> BrokerCurrentPrice | None:
+        quote = original_get_current_price(access_token, symbol=symbol, exchange=exchange)
+        assert quote is not None
+        return BrokerCurrentPrice(
+            symbol=quote.symbol,
+            exchange=quote.exchange,
+            price=quote.price,
+            observed_at=quote.observed_at,
+            payload={
+                "output": {
+                    "stck_prpr": str(quote.price),
+                    "stck_hgpr": "0",
+                    "stck_lwpr": "0",
+                    "acml_vol": "0",
+                    "acml_tr_pbmn": "0",
+                }
+            },
+        )
+
+    broker_adapter.get_current_price = get_current_price_with_zero_high_low  # type: ignore[method-assign]
+    price_source = KisCurrentQuoteMonitoringPriceSource(
+        settings=app.state.settings,
+        session_factory=app.state.db_session_factory,
+        broker_adapter_factory=lambda _settings: broker_adapter,
+    )
+
+    prices = price_source.get_prices(
+        symbols=["088910"],
+        observed_at=observed_at,
+        settings=app.state.settings,
+    )
+
+    assert len(prices) == 1
+    price = prices[0]
+    assert price.symbol == "088910"
+    assert price.price == Decimal("2520.00")
+    assert price.day_high is None
+    assert price.day_low is None
+    diagnostics = price_source.get_last_diagnostics()
+    assert diagnostics["priced_symbol_count"] == 1
+    assert diagnostics["missing_symbol_count"] == 0
+    engine.dispose()
+
+
 def test_autonomous_monitoring_keeps_partial_prices_when_one_live_quote_fails() -> None:
     broker_adapter = SymbolScopedQuoteErrorAdapter(
         config=BrokerConfig(
