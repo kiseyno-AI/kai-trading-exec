@@ -257,16 +257,27 @@ def list_broker_orders(
     *,
     settings: Settings,
     db: Session,
+    external_plan_id: str | None = None,
+    symbols: set[str] | None = None,
 ) -> list[dict[str, object]]:
-    orders = db.scalars(
+    query = (
         select(BrokerOrder)
         .where(BrokerOrder.mode == settings.runtime_mode)
         .options(
             selectinload(BrokerOrder.events),
             selectinload(BrokerOrder.plan_item).selectinload(ExecutionPlanItem.plan),
         )
-        .order_by(BrokerOrder.created_at.desc(), BrokerOrder.id.desc()),
-    ).all()
+        .order_by(BrokerOrder.created_at.desc(), BrokerOrder.id.desc())
+    )
+    if symbols:
+        query = query.where(BrokerOrder.symbol.in_(symbols))
+    if external_plan_id:
+        query = (
+            query.join(BrokerOrder.plan_item)
+            .join(ExecutionPlanItem.plan)
+            .where(ExecutionPlan.external_plan_id == external_plan_id)
+        )
+    orders = db.scalars(query).all()
     return [serialize_broker_order(order) for order in orders]
 
 

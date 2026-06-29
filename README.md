@@ -232,15 +232,12 @@ Short-term exec risk settings currently supported:
 - `KAI_EXEC_MONTHLY_CAPITAL_PRESERVATION_ENABLED`
 - `KAI_EXEC_MONTHLY_AGGRESSIVE_LAG_RATIO`
 
-Watch-buy sizing applies a minimum-notional floor after exec-agent approval so
-valid candidates do not become ineffective tiny probe buys. Defaults target
-`1,000,000` KRW per approved watch buy and `1,500,000` KRW for higher
-confidence or high-liquidity candidates, while still respecting available
-cash, per-symbol budget, max-safe notional, and stop-risk caps. If account
-snapshot loading is unavailable, the fallback account basis defaults to
-`10,000,000` KRW. The default sizing window runs until `20:00` KST so
-triggered NXT after-hours watch buys can still receive share quantities before
-submission.
+Watch-buy sizing preserves exec-agent-approved small probe quantities instead
+of enforcing a minimum-notional floor. Sizing still respects available cash,
+per-symbol budget, max-safe notional, and stop-risk caps. If account snapshot
+loading is unavailable, the fallback account basis defaults to `10,000,000`
+KRW. The default sizing window runs until `20:00` KST so triggered NXT
+after-hours watch buys can still receive share quantities before submission.
 
 Volatility/correlation buy sizing caps are disabled by default. When enabled,
 they can reduce but never increase the existing buy quantity using supplied

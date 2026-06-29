@@ -55,6 +55,7 @@ AGENT_DELAY_STATUS = trigger_time_exec_agent.AGENT_DELAY_STATUS
 AGENT_REJECTED_STATUS = trigger_time_exec_agent.AGENT_REJECTED_STATUS
 AGENT_APPROVED_PENDING_SUBMIT_STATUS = trigger_time_exec_agent.AGENT_APPROVED_PENDING_SUBMIT_STATUS
 AGENT_ACTIVE_STATUSES = trigger_time_exec_agent.AGENT_ACTIVE_STATUSES
+MAX_PROTECTIVE_STOP_COVERAGE_DETAILS = 20
 WATCH_MONITORING_STATUSES = frozenset(
     {
         "watch_monitoring_pending",
@@ -2364,34 +2365,40 @@ def _protective_stop_coverage_payload(
 ) -> dict[str, object]:
     unprotected = [issue for issue in issues if issue.outcome == "unprotected_position"]
     degraded = [issue for issue in issues if issue.outcome != "rearmed"]
+    affected_symbols = [issue.symbol for issue in degraded]
+    serialized_issues = [
+        {
+            "symbol": issue.symbol,
+            "held_quantity": issue.held_quantity,
+            "active_stop_quantity": issue.active_stop_quantity,
+            "missing_quantity": issue.missing_quantity,
+            "latest_stop_item_id": issue.latest_stop_item_id,
+            "latest_stop_status": issue.latest_stop_status,
+            "latest_stop_trigger_price": _serialize_decimal(issue.latest_stop_trigger_price),
+            "outcome": issue.outcome,
+            "reason": issue.reason,
+            "position_quantity": issue.position_quantity,
+            "position_last_reconciled_at": _serialize_datetime(issue.position_last_reconciled_at),
+            "evidence": issue.evidence or [],
+        }
+        for issue in issues
+    ]
     return {
         "status": "degraded" if degraded else "ok",
         "unprotected_position_count": len(unprotected),
         "position_truth_stale_count": sum(1 for issue in issues if issue.outcome == "position_truth_stale"),
         "repaired_stop_coverage_count": repaired_count,
-        "affected_symbols": [issue.symbol for issue in degraded],
+        "affected_symbols": affected_symbols[:MAX_PROTECTIVE_STOP_COVERAGE_DETAILS],
+        "affected_symbols_count": len(affected_symbols),
+        "affected_symbols_truncated": len(affected_symbols) > MAX_PROTECTIVE_STOP_COVERAGE_DETAILS,
         "missing_quantities": {
             issue.symbol: issue.missing_quantity
             for issue in degraded
             if issue.missing_quantity is not None
         },
-        "issues": [
-            {
-                "symbol": issue.symbol,
-                "held_quantity": issue.held_quantity,
-                "active_stop_quantity": issue.active_stop_quantity,
-                "missing_quantity": issue.missing_quantity,
-                "latest_stop_item_id": issue.latest_stop_item_id,
-                "latest_stop_status": issue.latest_stop_status,
-                "latest_stop_trigger_price": _serialize_decimal(issue.latest_stop_trigger_price),
-                "outcome": issue.outcome,
-                "reason": issue.reason,
-                "position_quantity": issue.position_quantity,
-                "position_last_reconciled_at": _serialize_datetime(issue.position_last_reconciled_at),
-                "evidence": issue.evidence or [],
-            }
-            for issue in issues
-        ],
+        "issues": serialized_issues[:MAX_PROTECTIVE_STOP_COVERAGE_DETAILS],
+        "issues_count": len(serialized_issues),
+        "issues_truncated": len(serialized_issues) > MAX_PROTECTIVE_STOP_COVERAGE_DETAILS,
     }
 
 
