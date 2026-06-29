@@ -86,6 +86,7 @@ SHORT_TERM_DECIDER_NAME = "short-term-decider"
 SIGNAL_DECIDER_NAME = "signal-decider"
 FAILED_ORDER_STATUSES = ("rejected", "failed")
 KRX_TIMEZONE = ZoneInfo("Asia/Seoul")
+MAX_STATUS_DETAIL_ITEMS = 20
 
 
 @dataclass(frozen=True)
@@ -513,7 +514,10 @@ def monitoring_payload(
             checkpoint.last_heartbeat_at or checkpoint.last_success_at or datetime.min.replace(tzinfo=UTC)
         ),
     )
-    latest_details = latest_checkpoint.details or {}
+    latest_details = _compact_monitoring_cycle_payload(latest_checkpoint.details or {})
+    protective_stop_coverage = latest_details.get("protective_stop_coverage")
+    if not isinstance(protective_stop_coverage, dict):
+        protective_stop_coverage = _unknown_protective_stop_coverage_payload()
     if backlog_item_count > 0 or any(checkpoint.status == "degraded" for checkpoint in checkpoints):
         status = "degraded"
     elif last_heartbeat:
@@ -554,17 +558,7 @@ def monitoring_payload(
         ],
         "last_heartbeat_at": last_heartbeat,
         "last_success_at": last_success,
-        "protective_stop_coverage": latest_details.get("protective_stop_coverage")
-        if isinstance(latest_details.get("protective_stop_coverage"), dict)
-        else {
-            "status": "unknown",
-            "unprotected_position_count": 0,
-            "position_truth_stale_count": 0,
-            "repaired_stop_coverage_count": 0,
-            "affected_symbols": [],
-            "missing_quantities": {},
-            "issues": [],
-        },
+        "protective_stop_coverage": protective_stop_coverage,
         "last_cycle": latest_details or None,
     }
 
@@ -1214,6 +1208,8 @@ def _monitoring_payload_from_autonomous(
     last_cycle = autonomous_monitoring.get("last_cycle")
     if not isinstance(last_cycle, dict):
         last_cycle = None
+    else:
+        last_cycle = _compact_monitoring_cycle_payload(last_cycle)
     status = str(autonomous_monitoring.get("status") or "not_started")
     if status == "disabled":
         status = "not_started"
@@ -1250,6 +1246,43 @@ def _monitoring_payload_from_autonomous(
         "last_cycle": last_cycle,
         "price_source": monitoring_price_source,
         "source": "autonomous_runtime_snapshot",
+    }
+
+
+def _compact_monitoring_cycle_payload(payload: dict[str, object]) -> dict[str, object]:
+    compacted = dict(payload)
+    coverage = compacted.get("protective_stop_coverage")
+    if isinstance(coverage, dict):
+        compacted["protective_stop_coverage"] = _compact_status_detail_lists(coverage)
+    for key in ("items", "jobs"):
+        value = compacted.get(key)
+        if isinstance(value, list) and len(value) > MAX_STATUS_DETAIL_ITEMS:
+            compacted[f"{key}_count"] = len(value)
+            compacted[f"{key}_truncated"] = True
+            compacted[key] = value[:MAX_STATUS_DETAIL_ITEMS]
+    return compacted
+
+
+def _compact_status_detail_lists(payload: dict[str, object]) -> dict[str, object]:
+    compacted = dict(payload)
+    for key in ("affected_symbols", "issues"):
+        value = compacted.get(key)
+        if isinstance(value, list) and len(value) > MAX_STATUS_DETAIL_ITEMS:
+            compacted[f"{key}_count"] = len(value)
+            compacted[f"{key}_truncated"] = True
+            compacted[key] = value[:MAX_STATUS_DETAIL_ITEMS]
+    return compacted
+
+
+def _unknown_protective_stop_coverage_payload() -> dict[str, object]:
+    return {
+        "status": "unknown",
+        "unprotected_position_count": 0,
+        "position_truth_stale_count": 0,
+        "repaired_stop_coverage_count": 0,
+        "affected_symbols": [],
+        "missing_quantities": {},
+        "issues": [],
     }
 
 

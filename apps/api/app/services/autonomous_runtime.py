@@ -28,6 +28,7 @@ DISPATCH_LOOP_WORKER_NAME = "execution_job_dispatch_loop"
 MONITORING_LOOP_WORKER_NAME = "monitoring_dispatch_loop"
 WATCH_EXEC_AGENT_SIZING_WORKER_NAME = "watch_exec_agent_sizing_loop"
 NXT_ELIGIBLE_SYNC_WORKER_NAME = "nxt_eligible_sync_loop"
+MAX_STATUS_DETAIL_ITEMS = 20
 
 
 @dataclass
@@ -50,7 +51,7 @@ class AutonomousWorkerState:
             "last_heartbeat_at": _serialize_datetime(self.last_heartbeat_at),
             "last_success_at": _serialize_datetime(self.last_success_at),
             "last_error": self.last_error,
-            "last_cycle": self.last_cycle,
+            "last_cycle": _compact_cycle_payload(self.last_cycle),
         }
 
 
@@ -657,3 +658,30 @@ def _serialize_datetime(value: datetime | None) -> str | None:
     if value is None:
         return None
     return value.isoformat()
+
+
+def _compact_cycle_payload(payload: dict[str, object] | None) -> dict[str, object] | None:
+    if payload is None:
+        return None
+    compacted = dict(payload)
+    coverage = compacted.get("protective_stop_coverage")
+    if isinstance(coverage, dict):
+        compacted["protective_stop_coverage"] = _compact_detail_lists(coverage)
+    for key in ("items", "jobs"):
+        value = compacted.get(key)
+        if isinstance(value, list) and len(value) > MAX_STATUS_DETAIL_ITEMS:
+            compacted[f"{key}_count"] = len(value)
+            compacted[f"{key}_truncated"] = True
+            compacted[key] = value[:MAX_STATUS_DETAIL_ITEMS]
+    return compacted
+
+
+def _compact_detail_lists(payload: dict[str, object]) -> dict[str, object]:
+    compacted = dict(payload)
+    for key in ("affected_symbols", "issues"):
+        value = compacted.get(key)
+        if isinstance(value, list) and len(value) > MAX_STATUS_DETAIL_ITEMS:
+            compacted[f"{key}_count"] = len(value)
+            compacted[f"{key}_truncated"] = True
+            compacted[key] = value[:MAX_STATUS_DETAIL_ITEMS]
+    return compacted
