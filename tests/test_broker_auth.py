@@ -1475,6 +1475,7 @@ def test_new_buy_blocked_by_large_total_asset_drawdown_despite_small_fifo_loss()
             kis_app_key="paper-key",
             kis_app_secret="paper-secret",
             kis_account_number="12345678",
+            account_drawdown_gate_enabled=True,
         ),
         broker_adapter=broker_adapter,
     )
@@ -1643,6 +1644,7 @@ def test_new_buy_blocked_by_severe_unrealized_holding_loss_but_sell_allowed() ->
             kis_app_key="paper-key",
             kis_app_secret="paper-secret",
             kis_account_number="12345678",
+            account_drawdown_gate_enabled=True,
         ),
         broker_adapter=broker_adapter,
     )
@@ -1777,6 +1779,7 @@ def test_new_buy_blocked_by_broker_raw_holding_loss_missing_from_normalized_posi
             kis_app_key="paper-key",
             kis_app_secret="paper-secret",
             kis_account_number="12345678",
+            account_drawdown_gate_enabled=True,
             account_daily_total_asset_drawdown_krw=Decimal("0"),
             account_unrealized_loss_abs_krw=Decimal("0"),
             account_unrealized_loss_pct=Decimal("0"),
@@ -1889,6 +1892,7 @@ def test_profitable_holding_unrealized_percent_does_not_block_new_kis_buy() -> N
             kis_app_key="paper-key",
             kis_app_secret="paper-secret",
             kis_account_number="12345678",
+            account_drawdown_gate_enabled=True,
         ),
         broker_adapter=broker_adapter,
     )
@@ -3996,6 +4000,7 @@ def test_exec_agent_watch_sizing_response_materializes_stub_order_path() -> None
         assert plan is not None
         summary = _apply_decisions(
             db=session,
+            settings=app.state.settings,
             plan=plan,
             expected_item_ids={item_id},
             decision_payload={

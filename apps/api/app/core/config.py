@@ -85,7 +85,7 @@ class Settings(BaseModel):
     exec_agent_watch_sizing_high_conviction_min_notional_krw: Decimal = Field(default=Decimal("1500000"), ge=0)
     exec_agent_watch_sizing_high_conviction_threshold: Decimal = Field(default=Decimal("0.65"), ge=0, le=1)
     exec_agent_watch_sizing_fallback_account_basis_krw: Decimal = Field(default=Decimal("10000000"), gt=0)
-    account_drawdown_gate_enabled: bool = True
+    account_drawdown_gate_enabled: bool = False
     account_daily_total_asset_drawdown_pct: Decimal = Field(default=Decimal("1.0"), ge=0, le=Decimal("100"))
     account_daily_total_asset_drawdown_krw: Decimal = Field(default=Decimal("100000"), ge=0)
     account_weekly_total_asset_drawdown_pct: Decimal = Field(default=Decimal("2.0"), ge=0, le=Decimal("100"))

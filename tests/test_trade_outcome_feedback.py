@@ -432,7 +432,11 @@ def test_trade_outcome_feedback_surfaces_broker_raw_normalized_drift(tmp_path) -
 
 def test_trade_outcome_feedback_reports_account_drawdown_gate_state(tmp_path) -> None:
     engine, session = _session()
-    settings = Settings(runtime_mode="paper", trade_outcome_feedback_dir=str(tmp_path))
+    settings = Settings(
+        runtime_mode="paper",
+        trade_outcome_feedback_dir=str(tmp_path),
+        account_drawdown_gate_enabled=True,
+    )
     plan = ExecutionPlan(
         id="plan-drawdown-gate-report",
         external_plan_id="plan-drawdown-gate-report",
@@ -495,7 +499,11 @@ def test_trade_outcome_feedback_reports_account_drawdown_gate_state(tmp_path) ->
 
 def test_trade_outcome_feedback_latest_allowed_order_clears_account_drawdown_gate(tmp_path) -> None:
     engine, session = _session()
-    settings = Settings(runtime_mode="paper", trade_outcome_feedback_dir=str(tmp_path))
+    settings = Settings(
+        runtime_mode="paper",
+        trade_outcome_feedback_dir=str(tmp_path),
+        account_drawdown_gate_enabled=True,
+    )
     plan = ExecutionPlan(
         id="plan-drawdown-gate-cleared",
         external_plan_id="plan-drawdown-gate-cleared",
