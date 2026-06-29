@@ -174,9 +174,16 @@ def place_order_handler(
 def orders(
     request: Request,
     db: Annotated[Session, Depends(get_db_session)],
+    external_plan_id: str | None = None,
+    symbols: str | None = None,
 ) -> list[dict[str, object]]:
     settings: Settings = get_settings(request)
-    return list_broker_orders(settings=settings, db=db)
+    return list_broker_orders(
+        settings=settings,
+        db=db,
+        external_plan_id=external_plan_id,
+        symbols=_parse_symbols_filter(symbols),
+    )
 
 
 @router.post("/orders/reconcile-stale")

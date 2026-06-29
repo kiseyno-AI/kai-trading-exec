@@ -2423,6 +2423,10 @@ def test_execution_read_endpoints_apply_plan_and_symbol_filters() -> None:
         fill["broker_fill_id"]
         for fill in client.get("/executions?external_plan_id=first-filter-plan&symbols=005930,000660").json()
     ] == ["first-filter-fill"]
+    assert [
+        order["broker_order_id"]
+        for order in client.get("/orders?external_plan_id=first-filter-plan&symbols=005930,000660").json()
+    ] == ["first-filter-order"]
     assert [position["symbol"] for position in client.get("/positions?symbols=000660").json()] == ["000660"]
 
     engine.dispose()
