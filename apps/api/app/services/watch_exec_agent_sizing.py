@@ -1289,6 +1289,31 @@ def _apply_decisions(
                 account_context=account_context,
                 decision=decision,
             )
+            envelope_block_reason = _allowed_action_envelope_approval_block_reason(envelope)
+            if envelope_block_reason is not None:
+                decision["action"] = "reject"
+                decision["reason_code"] = "allowed_action_envelope_blocked"
+                decision["reason"] = envelope_block_reason
+                record = _decision_record(decision=decision, item=item, version=str(decision_payload.get("version") or ""))
+                previous_policy = item.quantity_policy if isinstance(item.quantity_policy, dict) else None
+                item.quantity_policy = {
+                    "kind": "exec_agent_rejected",
+                    "source": "exec_agent_watch_sizing",
+                    "reason_code": "allowed_action_envelope_blocked",
+                    "reason": envelope_block_reason,
+                    "exec_agent_decision": _decision_summary(record),
+                    "short_term_exec_agent_decision": _decision_summary(record),
+                    "exec_agent_decision_audit": {
+                        "event_type": "watch_exec_agent_sizing_decision",
+                        "storage": "execution_plan_item_audits",
+                    },
+                    "allowed_action_envelope": envelope,
+                    "market_regime_guardrail": envelope.get("market_regime_guardrail"),
+                    "previous_policy": previous_policy,
+                }
+                item.status = "exec_agent_rejected"
+                rejected += 1
+                continue
             sizing = _adjust_approved_watch_quantity(
                 settings=settings,
                 item=item,
@@ -1411,6 +1436,24 @@ def _apply_decisions(
         "missing_item_ids": sorted(missing_ids),
         "ignored_extra": len(extra_ids),
     }
+
+
+def _allowed_action_envelope_approval_block_reason(envelope: dict[str, object]) -> str | None:
+    hard_reject_reasons = envelope.get("hard_reject_reasons")
+    if isinstance(hard_reject_reasons, list) and hard_reject_reasons:
+        reasons = ", ".join(str(reason) for reason in hard_reject_reasons)
+        return f"allowed action envelope hard-rejected approval: {reasons}"
+
+    allowed_actions_raw = envelope.get("allowed_actions")
+    allowed_actions = {
+        str(action).strip().lower()
+        for action in allowed_actions_raw
+        if str(action).strip()
+    } if isinstance(allowed_actions_raw, list) else set()
+    if not allowed_actions.intersection({"buy", "downsize"}):
+        return "allowed action envelope disallows buy/downsize approval"
+
+    return None
 
 
 def _decision_summary(record: dict[str, object]) -> dict[str, object]:

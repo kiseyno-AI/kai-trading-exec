@@ -812,7 +812,15 @@ def test_apply_decisions_applies_partial_response_and_leaves_missing_item_pendin
 
     summary = _apply_decisions(
         db=None,  # type: ignore[arg-type]
+        settings=Settings(runtime_mode="paper"),
         plan=plan,
+        account_context={
+            "available": True,
+            "orderable_cash_krw": "10000000",
+            "buying_power_krw": "10000000",
+            "holdings": [],
+            "open_orders": [],
+        },
         expected_item_ids={"watch-item-1", "watch-item-2"},
         decision_payload={
             "version": "manual-exec-agent-watch-sizing-v1",
@@ -867,7 +875,15 @@ def test_apply_decisions_preserves_triggered_blocked_watch_buy_for_retry() -> No
 
     summary = _apply_decisions(
         db=None,  # type: ignore[arg-type]
+        settings=Settings(runtime_mode="paper"),
         plan=plan,
+        account_context={
+            "available": True,
+            "orderable_cash_krw": "10000000",
+            "buying_power_krw": "10000000",
+            "holdings": [],
+            "open_orders": [],
+        },
         expected_item_ids={"watch-item-blocked"},
         decision_payload={
             "version": "manual-exec-agent-watch-sizing-v1",
@@ -1217,6 +1233,132 @@ def test_apply_decisions_rejects_when_allowed_action_envelope_has_no_quantity() 
     assert summary["rejected"] == 1
     assert plan.items[0].status == "exec_agent_rejected"
     assert plan.items[0].quantity_policy["allowed_action_envelope"]["max_quantity"] == 0
+
+
+def test_apply_decisions_rejects_when_allowed_action_envelope_has_hard_reject_reason() -> None:
+    plan = ExecutionPlan(
+        id="plan-1",
+        external_plan_id="plan-envelope-hard-reject",
+        strategy_run_id="strategy-1",
+        source="core-short-term-decider",
+        market_date=date(2026, 6, 4),
+        mode="live",
+        items=[
+            _watch_item(
+                item_id="watch-item-1",
+                symbol="005930",
+                risk_context={"target_price": "76000", "stop_price": "69000"},
+            )
+        ],
+    )
+
+    summary = _apply_decisions(
+        db=None,  # type: ignore[arg-type]
+        settings=Settings(runtime_mode="live"),
+        plan=plan,
+        account_context={
+            "available": True,
+            "orderable_cash_krw": "10000000",
+            "buying_power_krw": "10000000",
+            "holdings": [{"symbol": "005930", "quantity": 1}],
+            "open_orders": [],
+        },
+        expected_item_ids={"watch-item-1"},
+        decision_payload={
+            "version": "manual-exec-agent-watch-sizing-v1",
+            "decisions": [
+                {
+                    "execution_plan_item_id": "watch-item-1",
+                    "symbol": "005930",
+                    "action": "approve",
+                    "quantity": 1,
+                    "approved_notional_krw": 71500,
+                    "sizing_price": "71500",
+                    "confidence": 0.68,
+                    "target_profile": "short_swing",
+                    "reason_code": "agent_approval",
+                    "reason": "agent approval despite existing holding",
+                }
+            ],
+        },
+    )
+
+    policy = plan.items[0].quantity_policy
+    assert summary["approved"] == 0
+    assert summary["rejected"] == 1
+    assert plan.items[0].status == "exec_agent_rejected"
+    assert policy["reason_code"] == "allowed_action_envelope_blocked"
+    assert "existing_holding" in policy["allowed_action_envelope"]["hard_reject_reasons"]
+    assert "existing_holding" in policy["reason"]
+
+
+def test_apply_decisions_rejects_when_allowed_action_envelope_disallows_buy_downsize(monkeypatch) -> None:
+    plan = ExecutionPlan(
+        id="plan-1",
+        external_plan_id="plan-envelope-disallows-buy",
+        strategy_run_id="strategy-1",
+        source="core-short-term-decider",
+        market_date=date(2026, 6, 4),
+        mode="live",
+        items=[
+            _watch_item(
+                item_id="watch-item-1",
+                symbol="005930",
+                risk_context={"target_price": "76000", "stop_price": "69000"},
+            )
+        ],
+    )
+
+    def _blocked_envelope(**_: object) -> dict[str, object]:
+        return {
+            "schema_version": "allowed_action_envelope_v1",
+            "allowed_actions": ["hold", "reject"],
+            "max_quantity": 5,
+            "max_notional_krw": "357500.0000",
+            "hard_reject_reasons": [],
+            "soft_warnings": [],
+        }
+
+    monkeypatch.setattr(watch_sizing, "_allowed_action_envelope_for_item", _blocked_envelope)
+
+    summary = _apply_decisions(
+        db=None,  # type: ignore[arg-type]
+        settings=Settings(runtime_mode="live"),
+        plan=plan,
+        account_context={
+            "available": True,
+            "orderable_cash_krw": "10000000",
+            "buying_power_krw": "10000000",
+            "holdings": [],
+            "open_orders": [],
+        },
+        expected_item_ids={"watch-item-1"},
+        decision_payload={
+            "version": "manual-exec-agent-watch-sizing-v1",
+            "decisions": [
+                {
+                    "execution_plan_item_id": "watch-item-1",
+                    "symbol": "005930",
+                    "action": "approve",
+                    "quantity": 1,
+                    "approved_notional_krw": 71500,
+                    "sizing_price": "71500",
+                    "confidence": 0.68,
+                    "target_profile": "short_swing",
+                    "reason_code": "agent_approval",
+                    "reason": "agent approval despite disallowed actions",
+                }
+            ],
+        },
+    )
+
+    policy = plan.items[0].quantity_policy
+    assert summary["approved"] == 0
+    assert summary["rejected"] == 1
+    assert plan.items[0].status == "exec_agent_rejected"
+    assert policy["reason_code"] == "allowed_action_envelope_blocked"
+    assert policy["allowed_action_envelope"]["max_quantity"] == 5
+    assert policy["reason"] == "allowed action envelope disallows buy/downsize approval"
 
 
 def test_run_due_retry_applies_sizing_context_to_missing_decision(monkeypatch) -> None:
