@@ -1539,10 +1539,6 @@ def _adjust_approved_watch_quantity(
     decision_name = "submit"
     reason_code = None
     reason = None
-    if target_notional > approved_notional:
-        decision_name = "skip"
-        reason_code = "below_min_notional_within_agent_cap"
-        reason = "minimum watch-buy notional cannot be met without exceeding agent-approved exposure"
     adjustment: dict[str, object] = {
         "applied": adjusted_quantity != agent_quantity,
         "agent_quantity": agent_quantity,
