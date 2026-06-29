@@ -263,7 +263,7 @@ def _merge_live_market_context(
 
 def _sanitize_monitoring_market_quality(payload: dict[str, object]) -> dict[str, object]:
     sanitized = dict(payload)
-    for key in ("bid", "ask"):
+    for key in ("bid", "ask", "day_high", "day_low"):
         value = sanitized.get(key)
         if value is None:
             continue
