@@ -177,6 +177,12 @@ def latest_account_drawdown_gate_state(
     settings: Settings,
     db: Session,
 ) -> dict[str, object]:
+    if not settings.account_drawdown_gate_enabled:
+        return {
+            "gated": False,
+            "enabled": False,
+            "latest_decision": None,
+        }
     audit = db.scalar(
         select(ExecutionPlanItemAudit)
         .join(ExecutionPlanItemAudit.plan_item)
@@ -276,7 +282,7 @@ def _account_drawdown_decision_is_blocked(
             return bool(decision["blocked"])
     if isinstance(summary, dict) and summary.get("gate_name"):
         return True
-    return True
+    return False
 
 
 def _timestamp_for_ordering(value: datetime) -> datetime:

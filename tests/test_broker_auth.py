@@ -1475,6 +1475,7 @@ def test_new_buy_blocked_by_large_total_asset_drawdown_despite_small_fifo_loss()
             kis_app_key="paper-key",
             kis_app_secret="paper-secret",
             kis_account_number="12345678",
+            account_drawdown_gate_enabled=True,
         ),
         broker_adapter=broker_adapter,
     )
@@ -1643,6 +1644,7 @@ def test_new_buy_blocked_by_severe_unrealized_holding_loss_but_sell_allowed() ->
             kis_app_key="paper-key",
             kis_app_secret="paper-secret",
             kis_account_number="12345678",
+            account_drawdown_gate_enabled=True,
         ),
         broker_adapter=broker_adapter,
     )
@@ -1777,6 +1779,7 @@ def test_new_buy_blocked_by_broker_raw_holding_loss_missing_from_normalized_posi
             kis_app_key="paper-key",
             kis_app_secret="paper-secret",
             kis_account_number="12345678",
+            account_drawdown_gate_enabled=True,
             account_daily_total_asset_drawdown_krw=Decimal("0"),
             account_unrealized_loss_abs_krw=Decimal("0"),
             account_unrealized_loss_pct=Decimal("0"),
@@ -1889,6 +1892,7 @@ def test_profitable_holding_unrealized_percent_does_not_block_new_kis_buy() -> N
             kis_app_key="paper-key",
             kis_app_secret="paper-secret",
             kis_account_number="12345678",
+            account_drawdown_gate_enabled=True,
         ),
         broker_adapter=broker_adapter,
     )
@@ -2928,6 +2932,94 @@ def test_watch_buy_candidate_waits_until_trigger_then_submits_limit_buy() -> Non
         )
         assert order is not None
         assert order.idempotency_key == f"monitoring:watch_buy:{item_id}"
+
+    engine.dispose()
+
+
+def test_watch_buy_drawdown_gate_disabled_releases_prior_block_and_submits() -> None:
+    app, engine, client, broker_adapter = _build_watch_buy_test_app(
+        order_id="kis-watch-buy-drawdown-release-1"
+    )
+    item_id = _create_watch_buy_candidate(
+        client,
+        plan_id="plan-watch-buy-drawdown-release-1",
+        risk_context={
+            "exchange": "KRX",
+            "stop_price": "70000.00",
+            "trigger_direction": "at_or_above",
+        },
+    )
+    original_key = f"monitoring:watch_buy:{item_id}"
+
+    with app.state.db_session_factory() as session:
+        item = session.get(ExecutionPlanItem, item_id)
+        assert item is not None
+        item.status = "watch_buy_triggered_blocked"
+        session.add(
+            BrokerOrder(
+                broker_name="kis",
+                execution_plan_item_id=item_id,
+                mode=app.state.settings.runtime_mode,
+                idempotency_key=original_key,
+                symbol="005930",
+                side="buy",
+                status="rejected",
+                quantity=2,
+                limit_price=Decimal("71050.00"),
+                last_error_classification="validation",
+                last_error_code="unrealized_portfolio_loss_krw",
+                last_error_message="unrealized portfolio loss amount threshold reached",
+                response_metadata={
+                    "account_drawdown_gate": {
+                        "gate_name": "unrealized_portfolio_loss_krw",
+                        "reason": "unrealized portfolio loss amount threshold reached",
+                    }
+                },
+            )
+        )
+        session.commit()
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "drawdown gate disabled should release prior block",
+            "prices": [{"symbol": "005930", "price": "71050.00"}],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["submitted_order_count"] == 1
+    assert len(broker_adapter.order_calls) == 1
+    assert broker_adapter.order_calls[0].execution_plan_item_id == item_id
+
+    with app.state.db_session_factory() as session:
+        old_order = session.scalar(
+            select(BrokerOrder).where(
+                BrokerOrder.execution_plan_item_id == item_id,
+                BrokerOrder.status == "rejected",
+            )
+        )
+        assert old_order is not None
+        assert old_order.idempotency_key.startswith(original_key)
+        assert old_order.idempotency_key != original_key
+        new_order = session.scalar(
+            select(BrokerOrder).where(
+                BrokerOrder.execution_plan_item_id == item_id,
+                BrokerOrder.idempotency_key == original_key,
+            )
+        )
+        assert new_order is not None
+        assert new_order.status == "submitted"
+        audit = session.scalar(
+            select(ExecutionPlanItemAudit).where(
+                ExecutionPlanItemAudit.execution_plan_item_id == item_id,
+                ExecutionPlanItemAudit.event_type == "account_drawdown_gate_disabled_release",
+            )
+        )
+        assert audit is not None
 
     engine.dispose()
 
@@ -3996,6 +4088,7 @@ def test_exec_agent_watch_sizing_response_materializes_stub_order_path() -> None
         assert plan is not None
         summary = _apply_decisions(
             db=session,
+            settings=app.state.settings,
             plan=plan,
             expected_item_ids={item_id},
             decision_payload={

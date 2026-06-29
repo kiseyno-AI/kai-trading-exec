@@ -176,6 +176,7 @@ OPEN_BUY_ORDER_STATUSES = frozenset(
     {"submitted", "open", "partially_filled", "submission_pending", "retry_pending"}
 )
 RESERVED_CASH_EXHAUSTED_REASON = "reserved_cash_exhausted"
+ACCOUNT_DRAWDOWN_GATE_RELEASE_SUFFIX = ":account-drawdown-gate-disabled"
 
 
 @dataclass(frozen=True)
@@ -420,6 +421,85 @@ def expire_known_flat_pending_sell_monitors(
     return len(candidates)
 
 
+def release_disabled_account_drawdown_watch_buy_blocks(
+    *,
+    settings: Settings,
+    db: Session,
+    released_at: datetime | None = None,
+) -> int:
+    if settings.account_drawdown_gate_enabled:
+        return 0
+    released_at = _normalize_utc(released_at or datetime.now(UTC))
+    orders = db.scalars(
+        select(BrokerOrder)
+        .join(BrokerOrder.plan_item)
+        .join(ExecutionPlanItem.plan)
+        .where(
+            ExecutionPlan.mode == settings.runtime_mode,
+            BrokerOrder.side == "buy",
+            BrokerOrder.status == "rejected",
+            BrokerOrder.broker_order_id.is_(None),
+            BrokerOrder.last_error_classification == "validation",
+            BrokerOrder.response_metadata["account_drawdown_gate"].is_not(None),
+            ExecutionPlanItem.side == "buy",
+            ExecutionPlanItem.intent.in_(tuple(WATCH_BUY_INTENTS)),
+            ExecutionPlanItem.status.in_(("watch_buy_triggered_blocked", "new_buy_blocked")),
+        )
+        .options(selectinload(BrokerOrder.plan_item))
+        .order_by(BrokerOrder.created_at.asc(), BrokerOrder.id.asc())
+    ).all()
+
+    released = 0
+    for order in orders:
+        item = order.plan_item
+        if item is None:
+            continue
+        if order.idempotency_key.endswith(ACCOUNT_DRAWDOWN_GATE_RELEASE_SUFFIX):
+            continue
+        prior_status = item.status
+        prior_idempotency_key = order.idempotency_key
+        order.idempotency_key = f"{order.idempotency_key}{ACCOUNT_DRAWDOWN_GATE_RELEASE_SUFFIX}"
+        item.status = "watch_monitoring_active"
+        _record_monitoring_event(
+            item=item,
+            event={
+                "event": "account_drawdown_gate_disabled_release",
+                "reason": "account_drawdown_gate_disabled",
+                "prior_status": prior_status,
+                "prior_order_id": order.id,
+                "prior_order_idempotency_key": prior_idempotency_key,
+                "released_order_idempotency_key": order.idempotency_key,
+                "recorded_at": released_at.isoformat(),
+            },
+        )
+        db.add(
+            ExecutionPlanItemAudit(
+                execution_plan_item_id=item.id,
+                event_type="account_drawdown_gate_disabled_release",
+                source=MONITORING_WORKER_NAME,
+                summary={
+                    "reason": "account_drawdown_gate_disabled",
+                    "prior_status": prior_status,
+                    "prior_order_id": order.id,
+                    "prior_order_idempotency_key": prior_idempotency_key,
+                    "released_order_idempotency_key": order.idempotency_key,
+                },
+                payload={
+                    "account_drawdown_gate": (order.response_metadata or {}).get("account_drawdown_gate"),
+                    "prior_order": {
+                        "id": order.id,
+                        "status": order.status,
+                        "last_error_code": order.last_error_code,
+                        "last_error_message": order.last_error_message,
+                    },
+                },
+                occurred_at=released_at,
+            )
+        )
+        released += 1
+    return released
+
+
 def _evaluate_monitoring_cycle(
     *,
     settings: Settings,
@@ -430,6 +510,13 @@ def _evaluate_monitoring_cycle(
     allow_persisted_triggered_without_price: bool,
     update_checkpoint_if_idle: bool,
 ) -> EvaluateMonitoringResult:
+    released_drawdown_blocks = release_disabled_account_drawdown_watch_buy_blocks(
+        settings=settings,
+        db=db,
+        released_at=triggered_at,
+    )
+    if released_drawdown_blocks:
+        db.flush()
     items = _load_monitored_items(
         settings=settings,
         db=db,
