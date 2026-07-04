@@ -2820,6 +2820,8 @@ def _post_entry_initial_stop_price(
     )
     if upstream_stop is None:
         return hard_stop
+    if upstream_stop >= entry_price:
+        return hard_stop
     return effective_stop_price(
         settings=settings,
         entry_price=entry_price,
@@ -2882,7 +2884,22 @@ def _ensure_post_entry_stop_monitor(
         )
         return existing, 1
 
-    if existing.trigger_price is None or stop_price > existing.trigger_price:
+    if existing.trigger_price is not None and existing.trigger_price >= entry_price:
+        prior_stop = existing.trigger_price
+        existing.trigger_price = stop_price
+        maintenance_count += 1
+        _record_monitoring_event(
+            item=existing,
+            event={
+                "event": "post_entry_stop_monitor_rebased",
+                "reason": "upstream_stop_at_or_above_entry",
+                "prior_trigger_price": _serialize_decimal(prior_stop),
+                "trigger_price": _serialize_decimal(stop_price),
+                "entry_price": _serialize_decimal(entry_price),
+                "recorded_at": triggered_at.isoformat(),
+            },
+        )
+    elif existing.trigger_price is None or stop_price > existing.trigger_price:
         prior_stop = existing.trigger_price
         existing.trigger_price = stop_price
         maintenance_count += 1
