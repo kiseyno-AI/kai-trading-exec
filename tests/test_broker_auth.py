@@ -5486,6 +5486,129 @@ def test_monitoring_rebases_invalid_post_entry_stop_above_entry() -> None:
     engine.dispose()
 
 
+def test_monitoring_preserves_breakeven_rearmed_post_entry_stop() -> None:
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(broker_order_id="kis-post-entry-breakeven"),
+        account_snapshot=BrokerAccountSnapshot(
+            available_cash=Decimal("1000000.00"),
+            observed_at=datetime(2026, 7, 2, 1, 0, tzinfo=UTC),
+            source="stub:account_snapshot",
+            holdings=[
+                BrokerAccountHolding(
+                    symbol="005930",
+                    quantity=6,
+                    average_price=Decimal("100000.0000"),
+                    payload={"source": "test"},
+                )
+            ],
+        ),
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+            exec_agent_stop_loss_pct=Decimal("0.04"),
+            exec_agent_max_holding_trading_sessions=3,
+        ),
+        broker_adapter=broker_adapter,
+    )
+    client = TestClient(app)
+
+    buy_item_id = _create_filled_buy_position(
+        app,
+        client,
+        plan_id="plan-post-entry-breakeven",
+        market_date="2026-07-02",
+        source_plan_item_id="core-post-entry-breakeven",
+        entry_price="100000.00",
+        stop_price="104000.00",
+        quantity=10,
+    )
+    with app.state.db_session_factory() as session:
+        buy_item = session.get(ExecutionPlanItem, buy_item_id)
+        assert buy_item is not None
+        assert buy_item.plan is not None
+        session.add(
+            ExecutionPlanItem(
+                plan=buy_item.plan,
+                plan_item_index=1,
+                symbol="005930",
+                side="sell",
+                intent="stop_sell",
+                status="stop_sell_monitoring",
+                quantity_policy={
+                    "kind": "shares",
+                    "quantity": 6,
+                    "source": "partial_take_profit_breakeven_rearm",
+                    "parent_target_item_id": 999,
+                },
+                trigger_price=Decimal("100200.0000"),
+                time_in_force="day",
+                risk_context={
+                    "exchange": "KRX",
+                    "deterministic_emergency_stop": True,
+                    "post_entry_managed": True,
+                    "breakeven_rearmed": {
+                        "source": "partial_take_profit",
+                        "target_item_id": 999,
+                        "remaining_quantity": 6,
+                        "average_price": "100000.0000",
+                        "breakeven_stop_price": "100200.0000",
+                    },
+                },
+                decision_agent_name=buy_item.decision_agent_name,
+                decision_snapshot_id=buy_item.decision_snapshot_id,
+                decision_run_id=buy_item.decision_run_id,
+                source_plan_item_id="core-post-entry-breakeven:post-entry-stop",
+                source_market_date=buy_item.source_market_date,
+            )
+        )
+        session.commit()
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "preserve breakeven rearmed stop",
+            "observed_at": "2026-07-02T01:00:00Z",
+            "prices": [{"symbol": "005930", "price": "101000.00"}],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["submitted_order_count"] == 0
+    with app.state.db_session_factory() as session:
+        stop_item = session.scalar(
+            select(ExecutionPlanItem).where(
+                ExecutionPlanItem.symbol == "005930",
+                ExecutionPlanItem.intent == "stop_sell",
+            )
+        )
+        assert stop_item is not None
+        assert stop_item.trigger_price == Decimal("100200.0000")
+        assert stop_item.quantity_policy == {
+            "kind": "shares",
+            "quantity": 6,
+            "source": "partial_take_profit_breakeven_rearm",
+            "parent_target_item_id": 999,
+        }
+        assert stop_item.risk_context["breakeven_rearmed"]["source"] == "partial_take_profit"
+        assert "last_monitoring_event" not in stop_item.risk_context
+
+    engine.dispose()
+
+
 def test_monitoring_tightens_post_entry_stop_after_no_progress_day() -> None:
     broker_adapter = StubBrokerAdapter(
         config=BrokerConfig(

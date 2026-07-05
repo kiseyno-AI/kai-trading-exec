@@ -2884,7 +2884,11 @@ def _ensure_post_entry_stop_monitor(
         )
         return existing, 1
 
-    if existing.trigger_price is not None and existing.trigger_price >= entry_price:
+    if (
+        existing.trigger_price is not None
+        and existing.trigger_price >= entry_price
+        and not _is_breakeven_rearmed_stop(existing)
+    ):
         prior_stop = existing.trigger_price
         existing.trigger_price = stop_price
         maintenance_count += 1
@@ -3033,6 +3037,18 @@ def _active_sibling_monitor(
             continue
         return sibling
     return None
+
+
+def _is_breakeven_rearmed_stop(item: ExecutionPlanItem) -> bool:
+    risk_context = item.risk_context if isinstance(item.risk_context, dict) else {}
+    breakeven_rearmed = risk_context.get("breakeven_rearmed")
+    if (
+        isinstance(breakeven_rearmed, dict)
+        and breakeven_rearmed.get("source") == "partial_take_profit"
+    ):
+        return True
+    quantity_policy = item.quantity_policy if isinstance(item.quantity_policy, dict) else {}
+    return quantity_policy.get("source") == "partial_take_profit_breakeven_rearm"
 
 
 def _next_plan_item_index(plan: ExecutionPlan) -> int:
