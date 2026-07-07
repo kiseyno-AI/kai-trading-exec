@@ -1116,6 +1116,8 @@ def _watch_buy_direction(item: ExecutionPlanItemRequest) -> str:
                     return "at_or_above"
                 if normalized in {"down", "below", "pullback", "dip", "<=", "at_or_below"}:
                     return "at_or_below"
+    if _short_term_tactical_action(item) == "watch_for_trigger":
+        return "at_or_above"
     return "at_or_below"
 
 

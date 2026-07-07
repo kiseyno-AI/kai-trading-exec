@@ -3498,7 +3498,13 @@ def _persisted_watch_buy_trigger_cross(item: ExecutionPlanItem) -> dict[str, obj
     if not isinstance(risk_context, dict):
         return None
     trigger_cross = risk_context.get("watch_buy_trigger_cross")
-    return trigger_cross if isinstance(trigger_cross, dict) else None
+    if not isinstance(trigger_cross, dict):
+        return None
+    persisted_direction = trigger_cross.get("direction")
+    current_direction = _watch_buy_direction(item)
+    if isinstance(persisted_direction, str) and persisted_direction != current_direction:
+        return None
+    return trigger_cross
 
 
 def _primary_triggered_sell_symbols(
@@ -4851,6 +4857,8 @@ def _watch_buy_direction(item: ExecutionPlanItem) -> str:
                     return "at_or_above"
                 if normalized in {"down", "below", "pullback", "dip", "<=", "at_or_below"}:
                     return "at_or_below"
+    if _watch_buy_tactical_action(item) == "watch_for_trigger":
+        return "at_or_above"
     monitoring = _watch_buy_monitoring_context(item)
     direction = monitoring.get("direction")
     if isinstance(direction, str) and direction == "at_or_above":
@@ -4858,6 +4866,18 @@ def _watch_buy_direction(item: ExecutionPlanItem) -> str:
     if isinstance(direction, str) and direction == "at_or_below":
         return "at_or_below"
     return "at_or_below"
+
+
+def _watch_buy_tactical_action(item: ExecutionPlanItem) -> str | None:
+    for source in _item_payload_sources(item):
+        value = source.get("tactical_action")
+        if isinstance(value, str) and value.strip():
+            return value.strip().lower()
+    monitoring = _watch_buy_monitoring_context(item)
+    value = monitoring.get("tactical_action")
+    if isinstance(value, str) and value.strip():
+        return value.strip().lower()
+    return None
 
 
 def _first_positive_decimal_from_item(

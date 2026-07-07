@@ -3221,6 +3221,103 @@ def test_watch_buy_candidate_default_entry_blocks_above_chase_limit() -> None:
     engine.dispose()
 
 
+def test_short_term_watch_for_trigger_defaults_to_breakout_direction() -> None:
+    app, engine, client, broker_adapter = _build_watch_buy_test_app(
+        order_id="kis-watch-buy-breakout-direction-1"
+    )
+    _create_watch_buy_candidate(
+        client,
+        plan_id="plan-watch-buy-breakout-direction-1",
+        trigger_price="71000.00",
+        chase_limit_price="71200.00",
+        risk_context={
+            "exchange": "KRX",
+            "stop_price": "70000.00",
+            "tactical_action": "watch_for_trigger",
+        },
+    )
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "watch_for_trigger should wait for breakout instead of treating pullback as triggered",
+            "prices": [{"symbol": "005930", "price": "70900.00"}],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["triggered_item_count"] == 0
+    assert payload["submitted_order_count"] == 0
+    assert payload["items"][0]["outcome"] == "waiting"
+    assert payload["items"][0]["direction"] == "at_or_above"
+    assert broker_adapter.order_calls == []
+
+    engine.dispose()
+
+
+def test_short_term_watch_for_trigger_overrides_stale_persisted_default_direction() -> None:
+    app, engine, client, broker_adapter = _build_watch_buy_test_app(
+        order_id="kis-watch-buy-breakout-direction-stale-1"
+    )
+    item_id = _create_watch_buy_candidate(
+        client,
+        plan_id="plan-watch-buy-breakout-direction-stale-1",
+        trigger_price="71000.00",
+        chase_limit_price="71200.00",
+        risk_context={
+            "exchange": "KRX",
+            "stop_price": "70000.00",
+            "tactical_action": "watch_for_trigger",
+        },
+    )
+
+    with app.state.db_session_factory() as session:
+        item = session.get(ExecutionPlanItem, item_id)
+        assert item is not None
+        item.risk_context = {
+            **item.risk_context,
+            "watch_buy_monitoring": {
+                **item.risk_context["watch_buy_monitoring"],
+                "direction": "at_or_below",
+            },
+            "watch_buy_trigger_cross": {
+                "reason": "intraday_watch_buy_day_low_cross",
+                "direction": "at_or_below",
+                "trigger_price": "71000.0000",
+                "observed_price": "70900.0000",
+                "observed_at": "2024-01-03T01:00:00+00:00",
+                "recorded_at": "2024-01-03T01:00:00+00:00",
+                "cross_price": "70900.0000",
+                "day_high": "71100.0000",
+                "day_low": "70900.0000",
+            },
+        }
+        session.commit()
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "stale stored default direction should not turn breakout setup into dip buy",
+            "prices": [{"symbol": "005930", "price": "70900.00"}],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["triggered_item_count"] == 0
+    assert payload["submitted_order_count"] == 0
+    assert payload["items"][0]["outcome"] == "waiting"
+    assert payload["items"][0]["direction"] == "at_or_above"
+    assert broker_adapter.order_calls == []
+
+    engine.dispose()
+
+
 def test_watch_buy_candidate_waits_when_entry_is_below_stop_then_retries() -> None:
     app, engine, client, broker_adapter = _build_watch_buy_test_app(
         order_id="kis-watch-buy-entry-below-stop-1"
