@@ -48,6 +48,7 @@ from app.models.runtime import (
     ExecutionPosition,
     MonitoringCheckpoint,
 )
+from app.services import runtime as runtime_service
 from app.services.monitoring import list_autonomous_monitoring_symbols, run_autonomous_monitoring_cycle
 from app.services.watch_exec_agent_sizing import _apply_decisions
 
@@ -8469,6 +8470,51 @@ def test_live_mode_cycle_exposes_symbol_readback_and_daily_board_views() -> None
     assert missing_symbol_response.status_code == 404
 
     engine.dispose()
+
+
+def test_daily_board_large_symbol_fallback_preserves_unmonitored_positions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    status_symbols = {
+        "monitored": ["005930"],
+        "scheduled_today": [f"10{i:04d}" for i in range(20)],
+        "filled_today": [],
+        "failed_today": [],
+        "positions": ["000660"],
+    }
+
+    monkeypatch.setattr(
+        runtime_service,
+        "build_runtime_status",
+        lambda **_: {
+            "mode": "live",
+            "dependencies": {"database": "ok", "runtime_schema": "ok"},
+            "symbols": status_symbols,
+        },
+    )
+    monkeypatch.setattr(
+        runtime_service,
+        "latest_account_drawdown_gate_state",
+        lambda **_: None,
+    )
+
+    payload = runtime_service.build_runtime_daily_board(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="live",
+            kis_app_key="live-key",
+            kis_app_secret="live-secret",
+            kis_account_number="12345678",
+        ),
+        runtime=runtime_service.RuntimeMetadata(started_at=datetime.now(UTC)),
+        db=object(),
+    )
+
+    symbols = {row["symbol"]: row for row in payload["symbols"]}
+    assert payload["totals"]["symbol_count"] == 22
+    assert payload["totals"]["monitored_symbol_count"] == 1
+    assert symbols["005930"]["monitored"] is True
+    assert symbols["000660"]["monitored"] is False
 
 
 def test_autonomous_dispatch_loop_progresses_due_plan_without_manual_dispatch() -> None:

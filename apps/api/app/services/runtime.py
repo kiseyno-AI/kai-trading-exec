@@ -1252,6 +1252,7 @@ def build_runtime_daily_board(
             monitored_symbols = runtime_status.get("symbols", {}).get("monitored", [])
             status_symbols = runtime_status.get("symbols", {})
             if isinstance(monitored_symbols, list) and isinstance(status_symbols, dict):
+                monitored_symbol_set = {str(symbol) for symbol in monitored_symbols}
                 normalized_symbols = set()
                 for key in ("monitored", "scheduled_today", "filled_today", "failed_today", "positions"):
                     values = status_symbols.get(key, [])
@@ -1261,6 +1262,7 @@ def build_runtime_daily_board(
                     symbols = _minimal_runtime_symbol_rows(
                         settings=settings,
                         symbols=normalized_symbols,
+                        monitored_symbols=monitored_symbol_set,
                     )
                 else:
                     symbols = list_runtime_symbols(
@@ -1299,6 +1301,7 @@ def _minimal_runtime_symbol_rows(
     *,
     settings: Settings,
     symbols: set[str],
+    monitored_symbols: set[str],
 ) -> list[dict[str, object]]:
     return [
         {
@@ -1307,7 +1310,7 @@ def _minimal_runtime_symbol_rows(
             "asset_classes": [],
             "providers": [],
             "venues": [],
-            "monitored": True,
+            "monitored": symbol in monitored_symbols,
             "monitoring_statuses": [],
             "intents": [],
             "plan_item_count": 0,
