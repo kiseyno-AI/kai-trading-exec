@@ -42,6 +42,14 @@ from app.services.runtime_controls import (
 )
 
 OPEN_ORDER_STATUSES = ("submitted", "open", "partially_filled")
+NONTERMINAL_ORDER_STATUSES = (
+    "submission_pending",
+    "submitted",
+    "open",
+    "partially_filled",
+    "cancel_pending",
+    "retry_pending",
+)
 ACTIVE_JOB_STATUSES = ("queued", "scheduled", "running", "retrying")
 MONITORED_INTENTS = ("target_sell", "stop_sell")
 SELL_MONITORED_INTENTS = ("target_sell", "stop_sell", "max_holding_close_sell")
@@ -213,6 +221,11 @@ def runtime_freshness_payload(
         "broker_orders": {
             "latest_broker_sync_at": _serialize_datetime(latest_order_sync_at),
             "latest_reconciliation_event_at": _serialize_datetime(latest_reconcile_event_at),
+            "stale_nonterminal": stale_nonterminal_order_freshness_payload(
+                settings=settings,
+                db=db,
+                now=observed_at,
+            ),
         },
     }
 
@@ -232,20 +245,34 @@ def position_truth_freshness_payload(
         )
     ).all()
     positions_by_symbol = {position.symbol: position for position in positions}
-    candidate_symbols = set(positions_by_symbol) | evidence_symbols
+    nonzero_position_symbols = {
+        position.symbol
+        for position in positions
+        if _position_has_quantity(position)
+    }
+    candidate_symbols = nonzero_position_symbols | evidence_symbols
+    trusted_flat_count = sum(
+        1
+        for symbol, position in positions_by_symbol.items()
+        if symbol not in evidence_symbols and not _position_has_quantity(position)
+    )
     stale_symbols: list[str] = []
     oldest_age_seconds: float | None = None
     latest_reconciled_at: datetime | None = None
     oldest_reconciled_at: datetime | None = None
+    for position in positions:
+        reconciled_at = position.last_reconciled_at
+        if reconciled_at is None:
+            continue
+        normalized_reconciled_at = _as_utc(reconciled_at)
+        if latest_reconciled_at is None or normalized_reconciled_at > latest_reconciled_at:
+            latest_reconciled_at = normalized_reconciled_at
+        if oldest_reconciled_at is None or normalized_reconciled_at < oldest_reconciled_at:
+            oldest_reconciled_at = normalized_reconciled_at
+
     for symbol in sorted(candidate_symbols):
         position = positions_by_symbol.get(symbol)
         reconciled_at = position.last_reconciled_at if position is not None else None
-        if reconciled_at is not None:
-            normalized_reconciled_at = _as_utc(reconciled_at)
-            if latest_reconciled_at is None or normalized_reconciled_at > latest_reconciled_at:
-                latest_reconciled_at = normalized_reconciled_at
-            if oldest_reconciled_at is None or normalized_reconciled_at < oldest_reconciled_at:
-                oldest_reconciled_at = normalized_reconciled_at
         if reconciled_at is None or _as_utc(reconciled_at) < stale_before:
             stale_symbols.append(symbol)
             if reconciled_at is None:
@@ -264,7 +291,96 @@ def position_truth_freshness_payload(
         "broker_truth_reachable": broker_truth_reachable,
         "stale_symbols": stale_symbols,
         "max_age_seconds": settings.exec_agent_max_account_snapshot_age_seconds,
+        "tracked_symbol_count": len(candidate_symbols),
+        "evidence_symbol_count": len(evidence_symbols),
+        "nonzero_position_count": len(nonzero_position_symbols),
+        "trusted_flat_count": trusted_flat_count,
     }
+
+
+def stale_nonterminal_order_freshness_payload(
+    *,
+    settings: Settings,
+    db: Session,
+    now: datetime | None = None,
+) -> dict[str, object]:
+    observed_at = now or datetime.now(UTC)
+    threshold_seconds = settings.stale_broker_order_reconciliation_threshold_seconds
+    stale_before = observed_at - timedelta(seconds=threshold_seconds)
+    order_observed_at = func.coalesce(
+        BrokerOrder.last_broker_sync_at,
+        BrokerOrder.submitted_at,
+        BrokerOrder.updated_at,
+        BrokerOrder.created_at,
+    )
+    orders = db.scalars(
+        select(BrokerOrder)
+        .where(
+            BrokerOrder.mode == settings.runtime_mode,
+            BrokerOrder.status.in_(NONTERMINAL_ORDER_STATUSES),
+            order_observed_at < stale_before,
+        )
+        .order_by(order_observed_at.asc(), BrokerOrder.created_at.asc())
+    ).all()
+    items = [
+        _stale_nonterminal_order_item(order=order)
+        for order in orders[:MAX_STATUS_DETAIL_ITEMS]
+    ]
+    manual_review_count = sum(
+        1
+        for order in orders
+        if _stale_nonterminal_order_action(order) == "manual_review"
+    )
+    return {
+        "count": len(orders),
+        "threshold_seconds": threshold_seconds,
+        "stale_before": stale_before.isoformat(),
+        "symbols": sorted({order.symbol for order in orders}),
+        "needs_reconciliation_count": len(orders) - manual_review_count,
+        "manual_review_count": manual_review_count,
+        "missing_broker_order_id_count": sum(1 for order in orders if not order.broker_order_id),
+        "items": items,
+        "truncated": len(orders) > len(items),
+    }
+
+
+def _stale_nonterminal_order_item(*, order: BrokerOrder) -> dict[str, object]:
+    return {
+        "broker_order_pk": order.id,
+        "broker_order_id": order.broker_order_id,
+        "idempotency_key": order.idempotency_key,
+        "symbol": order.symbol,
+        "side": order.side,
+        "status": order.status,
+        "last_broker_sync_at": _serialize_datetime(order.last_broker_sync_at),
+        "submitted_at": _serialize_datetime(order.submitted_at),
+        "action": _stale_nonterminal_order_action(order),
+        "reason": _stale_nonterminal_order_reason(order),
+    }
+
+
+def _stale_nonterminal_order_action(order: BrokerOrder) -> str:
+    if not order.broker_order_id or order.status == "retry_pending":
+        return "manual_review"
+    return "reconcile_broker_truth"
+
+
+def _stale_nonterminal_order_reason(order: BrokerOrder) -> str:
+    if not order.broker_order_id:
+        return "missing_broker_order_id"
+    if order.status == "retry_pending":
+        return "local_retry_pending_not_broker_live_state"
+    if order.last_broker_sync_at is None:
+        return "missing_broker_sync"
+    return "stale_broker_sync"
+
+
+def _position_has_quantity(position: ExecutionPosition) -> bool:
+    if position.quantity > 0:
+        return True
+    if position.base_quantity is None:
+        return False
+    return Decimal(position.base_quantity) > 0
 
 
 def _position_truth_evidence_symbols(
@@ -387,12 +503,22 @@ def runtime_symbol_summary(
             failed_observed_at < tomorrow_start_utc,
         )
     ).all()
+    position_symbols = db.scalars(
+        select(distinct(ExecutionPosition.symbol)).where(
+            ExecutionPosition.mode == settings.runtime_mode,
+            or_(
+                ExecutionPosition.quantity > 0,
+                ExecutionPosition.base_quantity > 0,
+            ),
+        )
+    ).all()
 
     return {
         "monitored": sorted(monitored_symbols),
         "scheduled_today": sorted(scheduled_today),
         "filled_today": sorted(filled_today),
         "failed_today": sorted(failed_today),
+        "positions": sorted(position_symbols),
     }
 
 
@@ -754,6 +880,7 @@ def build_runtime_status(
         "scheduled_today": [],
         "filled_today": [],
         "failed_today": [],
+        "positions": [],
     }
     broker = build_broker_session_summary(settings=settings, db=None)
     broker_providers = broker_provider_readiness(settings=settings, db=None)
@@ -774,10 +901,25 @@ def build_runtime_status(
             "broker_truth_reachable": False,
             "stale_symbols": [],
             "max_age_seconds": settings.exec_agent_max_account_snapshot_age_seconds,
+            "tracked_symbol_count": 0,
+            "evidence_symbol_count": 0,
+            "nonzero_position_count": 0,
+            "trusted_flat_count": 0,
         },
         "broker_orders": {
             "latest_broker_sync_at": None,
             "latest_reconciliation_event_at": None,
+            "stale_nonterminal": {
+                "count": 0,
+                "threshold_seconds": settings.stale_broker_order_reconciliation_threshold_seconds,
+                "stale_before": None,
+                "symbols": [],
+                "needs_reconciliation_count": 0,
+                "manual_review_count": 0,
+                "missing_broker_order_id_count": 0,
+                "items": [],
+                "truncated": False,
+            },
         },
     }
     counts_available = True
@@ -1110,8 +1252,9 @@ def build_runtime_daily_board(
             monitored_symbols = runtime_status.get("symbols", {}).get("monitored", [])
             status_symbols = runtime_status.get("symbols", {})
             if isinstance(monitored_symbols, list) and isinstance(status_symbols, dict):
+                monitored_symbol_set = {str(symbol) for symbol in monitored_symbols}
                 normalized_symbols = set()
-                for key in ("monitored", "scheduled_today", "filled_today", "failed_today"):
+                for key in ("monitored", "scheduled_today", "filled_today", "failed_today", "positions"):
                     values = status_symbols.get(key, [])
                     if isinstance(values, list):
                         normalized_symbols.update(str(symbol) for symbol in values)
@@ -1119,6 +1262,7 @@ def build_runtime_daily_board(
                     symbols = _minimal_runtime_symbol_rows(
                         settings=settings,
                         symbols=normalized_symbols,
+                        monitored_symbols=monitored_symbol_set,
                     )
                 else:
                     symbols = list_runtime_symbols(
@@ -1157,6 +1301,7 @@ def _minimal_runtime_symbol_rows(
     *,
     settings: Settings,
     symbols: set[str],
+    monitored_symbols: set[str],
 ) -> list[dict[str, object]]:
     return [
         {
@@ -1165,7 +1310,7 @@ def _minimal_runtime_symbol_rows(
             "asset_classes": [],
             "providers": [],
             "venues": [],
-            "monitored": True,
+            "monitored": symbol in monitored_symbols,
             "monitoring_statuses": [],
             "intents": [],
             "plan_item_count": 0,

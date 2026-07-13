@@ -48,6 +48,7 @@ from app.models.runtime import (
     ExecutionPosition,
     MonitoringCheckpoint,
 )
+from app.services import runtime as runtime_service
 from app.services.monitoring import list_autonomous_monitoring_symbols, run_autonomous_monitoring_cycle
 from app.services.watch_exec_agent_sizing import _apply_decisions
 
@@ -2759,8 +2760,8 @@ def test_core_active_short_term_handoff_becomes_runtime_buy_watch_with_segments(
         json={
             "actor": "ops",
             "source": "test",
-            "reason": "below buy line",
-            "prices": [{"symbol": "005930", "price": "70900.00"}],
+            "reason": "triggered while paused",
+            "prices": [{"symbol": "005930", "price": "71100.00"}],
         },
     )
     assert blocked.status_code == 200
@@ -2770,7 +2771,7 @@ def test_core_active_short_term_handoff_becomes_runtime_buy_watch_with_segments(
     assert blocked_item["tactical_action"] == "watch_for_trigger"
     assert blocked_item["target_price"] == "72500.0000"
     assert blocked_item["stop_loss_price"] == "70000.0000"
-    assert blocked_item["current_price"] == "70900.0000"
+    assert blocked_item["current_price"] == "71100.0000"
 
     runtime_status = client.get("/runtime/status").json()
     segments = runtime_status["liveness"]["monitoring"]["segments"]
@@ -8471,6 +8472,51 @@ def test_live_mode_cycle_exposes_symbol_readback_and_daily_board_views() -> None
     engine.dispose()
 
 
+def test_daily_board_large_symbol_fallback_preserves_unmonitored_positions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    status_symbols = {
+        "monitored": ["005930"],
+        "scheduled_today": [f"10{i:04d}" for i in range(20)],
+        "filled_today": [],
+        "failed_today": [],
+        "positions": ["000660"],
+    }
+
+    monkeypatch.setattr(
+        runtime_service,
+        "build_runtime_status",
+        lambda **_: {
+            "mode": "live",
+            "dependencies": {"database": "ok", "runtime_schema": "ok"},
+            "symbols": status_symbols,
+        },
+    )
+    monkeypatch.setattr(
+        runtime_service,
+        "latest_account_drawdown_gate_state",
+        lambda **_: None,
+    )
+
+    payload = runtime_service.build_runtime_daily_board(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="live",
+            kis_app_key="live-key",
+            kis_app_secret="live-secret",
+            kis_account_number="12345678",
+        ),
+        runtime=runtime_service.RuntimeMetadata(started_at=datetime.now(UTC)),
+        db=object(),
+    )
+
+    symbols = {row["symbol"]: row for row in payload["symbols"]}
+    assert payload["totals"]["symbol_count"] == 22
+    assert payload["totals"]["monitored_symbol_count"] == 1
+    assert symbols["005930"]["monitored"] is True
+    assert symbols["000660"]["monitored"] is False
+
+
 def test_autonomous_dispatch_loop_progresses_due_plan_without_manual_dispatch() -> None:
     broker_adapter = StubBrokerAdapter(
         config=BrokerConfig(
@@ -8863,7 +8909,11 @@ def test_autonomous_monitoring_loop_retries_pending_dispatch_after_restart_with_
         autonomous_runtime_enabled=True,
     )
     with TestClient(restarted_app) as restarted_client:
-        wait_for(lambda: len(restarted_adapter.order_calls) == 1)
+        wait_for(
+            lambda: len(restarted_adapter.order_calls) == 1
+            and restarted_app.state.autonomous_runtime.snapshot()["monitoring"]["last_cycle"]
+            is not None
+        )
 
         runtime_status = restarted_client.get("/runtime/status")
         assert runtime_status.status_code == 200
