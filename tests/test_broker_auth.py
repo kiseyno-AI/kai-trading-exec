@@ -2759,8 +2759,8 @@ def test_core_active_short_term_handoff_becomes_runtime_buy_watch_with_segments(
         json={
             "actor": "ops",
             "source": "test",
-            "reason": "below buy line",
-            "prices": [{"symbol": "005930", "price": "70900.00"}],
+            "reason": "triggered while paused",
+            "prices": [{"symbol": "005930", "price": "71100.00"}],
         },
     )
     assert blocked.status_code == 200
@@ -2770,7 +2770,7 @@ def test_core_active_short_term_handoff_becomes_runtime_buy_watch_with_segments(
     assert blocked_item["tactical_action"] == "watch_for_trigger"
     assert blocked_item["target_price"] == "72500.0000"
     assert blocked_item["stop_loss_price"] == "70000.0000"
-    assert blocked_item["current_price"] == "70900.0000"
+    assert blocked_item["current_price"] == "71100.0000"
 
     runtime_status = client.get("/runtime/status").json()
     segments = runtime_status["liveness"]["monitoring"]["segments"]
@@ -8863,7 +8863,11 @@ def test_autonomous_monitoring_loop_retries_pending_dispatch_after_restart_with_
         autonomous_runtime_enabled=True,
     )
     with TestClient(restarted_app) as restarted_client:
-        wait_for(lambda: len(restarted_adapter.order_calls) == 1)
+        wait_for(
+            lambda: len(restarted_adapter.order_calls) == 1
+            and restarted_app.state.autonomous_runtime.snapshot()["monitoring"]["last_cycle"]
+            is not None
+        )
 
         runtime_status = restarted_client.get("/runtime/status")
         assert runtime_status.status_code == 200

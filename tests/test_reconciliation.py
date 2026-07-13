@@ -258,6 +258,11 @@ def test_reconcile_full_fill_is_idempotent_and_updates_position_snapshot() -> No
 
     fills = db.scalars(select(ExecutionFill)).all()
     position = db.scalar(select(ExecutionPosition).where(ExecutionPosition.symbol == "005930"))
+    runtime_payload = build_runtime_status(
+        settings=settings,
+        runtime=RuntimeMetadata(started_at=datetime.now(UTC)),
+        db=db,
+    )
     assert first["status"] == "filled"
     assert first["fills_added"] == 1
     assert second["fills_added"] == 0
@@ -267,6 +272,7 @@ def test_reconcile_full_fill_is_idempotent_and_updates_position_snapshot() -> No
     assert position is not None
     assert position.quantity == 2
     assert position.average_price == Decimal("71000.0000")
+    assert runtime_payload["symbols"]["positions"] == ["005930"]
     engine.dispose()
 
 
@@ -713,6 +719,123 @@ def test_runtime_status_reports_position_truth_freshness_details() -> None:
     assert freshness["oldest_age_seconds"] is not None
     assert freshness["last_reconciled_at"] == stale_reconciled_at.astimezone(UTC).isoformat()
     assert freshness["broker_truth_reachable"] is False
+    engine.dispose()
+
+
+def test_runtime_status_does_not_count_historical_flat_positions_as_stale() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        exec_agent_max_account_snapshot_age_seconds=300,
+    )
+    engine, db = _session(settings)
+    stale_reconciled_at = datetime.now(UTC) - timedelta(days=30)
+    db.add(
+        ExecutionPosition(
+            mode="paper",
+            symbol="000660",
+            quantity=0,
+            average_price=None,
+            updated_from="reconciliation",
+            last_reconciled_at=stale_reconciled_at,
+            raw_payload={"source": "broker"},
+        )
+    )
+    db.commit()
+
+    payload = build_runtime_status(
+        settings=settings,
+        runtime=RuntimeMetadata(started_at=datetime.now(UTC)),
+        db=db,
+    )
+
+    freshness = payload["freshness"]["position_truth"]
+    assert freshness["stale_count"] == 0
+    assert freshness["stale_symbols"] == []
+    assert freshness["trusted_flat_count"] == 1
+    assert freshness["tracked_symbol_count"] == 0
+    engine.dispose()
+
+
+def test_runtime_status_reports_actionable_stale_nonterminal_orders() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        stale_broker_order_reconciliation_threshold_seconds=3600,
+    )
+    engine, db = _session(settings)
+    stale_observed_at = datetime.now(UTC) - timedelta(days=3)
+    recent_observed_at = datetime.now(UTC)
+    db.add_all(
+        [
+            BrokerOrder(
+                broker_name="kis",
+                mode="paper",
+                idempotency_key="stale-submitted-with-broker-id",
+                broker_order_id="stale-submitted-1",
+                symbol="005930",
+                side="buy",
+                status="submitted",
+                quantity=1,
+                submitted_at=stale_observed_at,
+                last_broker_sync_at=stale_observed_at,
+            ),
+            BrokerOrder(
+                broker_name="kis",
+                mode="paper",
+                idempotency_key="stale-retry-missing-broker-id",
+                broker_order_id=None,
+                symbol="031330",
+                side="sell",
+                status="retry_pending",
+                quantity=2,
+                submitted_at=stale_observed_at,
+                last_broker_sync_at=stale_observed_at,
+            ),
+            BrokerOrder(
+                broker_name="kis",
+                mode="paper",
+                idempotency_key="recent-submitted-order",
+                broker_order_id="recent-submitted-1",
+                symbol="035420",
+                side="buy",
+                status="submitted",
+                quantity=1,
+                submitted_at=recent_observed_at,
+                last_broker_sync_at=recent_observed_at,
+            ),
+            BrokerOrder(
+                broker_name="kis",
+                mode="live",
+                idempotency_key="live-stale-submitted-order",
+                broker_order_id="live-stale-1",
+                symbol="000660",
+                side="buy",
+                status="submitted",
+                quantity=1,
+                submitted_at=stale_observed_at,
+                last_broker_sync_at=stale_observed_at,
+            ),
+        ]
+    )
+    db.commit()
+
+    payload = build_runtime_status(
+        settings=settings,
+        runtime=RuntimeMetadata(started_at=datetime.now(UTC)),
+        db=db,
+    )
+
+    stale_orders = payload["freshness"]["broker_orders"]["stale_nonterminal"]
+    assert stale_orders["count"] == 2
+    assert stale_orders["symbols"] == ["005930", "031330"]
+    assert stale_orders["needs_reconciliation_count"] == 1
+    assert stale_orders["manual_review_count"] == 1
+    assert stale_orders["missing_broker_order_id_count"] == 1
+    items_by_key = {item["idempotency_key"]: item for item in stale_orders["items"]}
+    assert items_by_key["stale-submitted-with-broker-id"]["action"] == "reconcile_broker_truth"
+    assert items_by_key["stale-retry-missing-broker-id"]["action"] == "manual_review"
+    assert items_by_key["stale-retry-missing-broker-id"]["reason"] == "missing_broker_order_id"
     engine.dispose()
 
 

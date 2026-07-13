@@ -306,6 +306,7 @@ def test_runtime_status_reports_readiness_and_default_safety() -> None:
         "scheduled_today": [],
         "filled_today": [],
         "failed_today": [],
+        "positions": [],
     }
     monitoring = payload["liveness"]["monitoring"]
     autonomous = payload["liveness"]["autonomous"]
@@ -2645,6 +2646,7 @@ def test_runtime_status_exposes_core_facing_symbol_summary() -> None:
         "scheduled_today": ["000660"],
         "filled_today": ["000660"],
         "failed_today": ["035420"],
+        "positions": [],
     }
 
     engine.dispose()
