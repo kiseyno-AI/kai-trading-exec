@@ -55,7 +55,7 @@ class Settings(BaseModel):
     exec_agent_max_symbol_total_exposure_pct: Decimal = Field(default=Decimal("0.30"), gt=0, le=1)
     exec_agent_max_daily_new_buy_notional: Decimal = Field(default=Decimal("0"), ge=0)
     exec_agent_max_trade_risk_pct: Decimal = Field(default=Decimal("0.015"), gt=0, le=Decimal("0.015"))
-    exec_agent_stop_loss_pct: Decimal = Field(default=Decimal("0.04"), gt=0, le=Decimal("0.10"))
+    exec_agent_stop_loss_pct: Decimal = Field(default=Decimal("0.025"), gt=0, le=Decimal("0.10"))
     exec_agent_max_entry_premium_pct: Decimal = Field(default=Decimal("0"), ge=0, le=Decimal("0.10"))
     exec_agent_min_reward_risk: Decimal = Field(default=Decimal("1.30"), gt=0)
     exec_agent_relaxed_min_reward_risk: Decimal = Field(default=Decimal("1.10"), gt=0)
@@ -63,13 +63,13 @@ class Settings(BaseModel):
     exec_agent_tactical_scalp_min_target_pct: Decimal = Field(default=Decimal("0.02"), gt=0, le=1)
     exec_agent_tactical_scalp_max_stop_pct: Decimal = Field(default=Decimal("0.015"), gt=0, le=1)
     exec_agent_max_account_snapshot_age_seconds: int = Field(default=300, ge=1, le=86400)
-    exec_agent_max_holding_trading_sessions: int = Field(default=3, ge=1, le=20)
+    exec_agent_max_holding_trading_sessions: int = Field(default=2, ge=1, le=20)
     exec_agent_first_take_profit_pct: Decimal = Field(default=Decimal("0.025"), gt=0, le=Decimal("0.10"))
     exec_agent_final_take_profit_pct: Decimal = Field(default=Decimal("0.055"), gt=0, le=Decimal("0.20"))
     exec_agent_partial_take_profit_fraction: Decimal = Field(default=Decimal("0.50"), gt=0, le=1)
     exec_agent_trigger_time_enabled: bool = True
     exec_agent_trigger_time_sell_enabled: bool = True
-    exec_agent_trigger_time_timeout_seconds: int = Field(default=90, ge=10, le=3600)
+    exec_agent_trigger_time_timeout_seconds: int = Field(default=900, ge=10, le=3600)
     monthly_target_krw: Decimal = Field(default=Decimal("500000"), gt=0)
     monthly_capital_preservation_enabled: bool = True
     monthly_aggressive_lag_ratio: Decimal = Field(default=Decimal("0.75"), gt=0, le=1)
@@ -80,12 +80,12 @@ class Settings(BaseModel):
     exec_agent_watch_sizing_max_attempts: int = Field(default=3, ge=1, le=10)
     exec_agent_watch_sizing_start_local_time: str = "08:00"
     exec_agent_watch_sizing_end_local_time: str = "20:00"
-    exec_agent_watch_sizing_timeout_seconds: int = Field(default=180, ge=30, le=3600)
+    exec_agent_watch_sizing_timeout_seconds: int = Field(default=900, ge=30, le=3600)
     exec_agent_watch_sizing_min_notional_krw: Decimal = Field(default=Decimal("1000000"), ge=0)
     exec_agent_watch_sizing_high_conviction_min_notional_krw: Decimal = Field(default=Decimal("1500000"), ge=0)
     exec_agent_watch_sizing_high_conviction_threshold: Decimal = Field(default=Decimal("0.65"), ge=0, le=1)
     exec_agent_watch_sizing_fallback_account_basis_krw: Decimal = Field(default=Decimal("10000000"), gt=0)
-    account_drawdown_gate_enabled: bool = False
+    account_drawdown_gate_enabled: bool = True
     account_daily_total_asset_drawdown_pct: Decimal = Field(default=Decimal("1.0"), ge=0, le=Decimal("100"))
     account_daily_total_asset_drawdown_krw: Decimal = Field(default=Decimal("100000"), ge=0)
     account_weekly_total_asset_drawdown_pct: Decimal = Field(default=Decimal("2.0"), ge=0, le=Decimal("100"))
@@ -107,20 +107,20 @@ class Settings(BaseModel):
     vol_corr_missing_data_behavior: str = "neutral"
     vol_corr_missing_data_multiplier: Decimal = Field(default=Decimal("0.75"), gt=0, le=1)
     market_regime_guard_enabled: bool = True
-    market_regime_caution_up_ratio_threshold: Decimal = Field(default=Decimal("0.40"), ge=0, le=1)
-    market_regime_normal_up_ratio_threshold: Decimal = Field(default=Decimal("0.45"), ge=0, le=1)
-    market_regime_risk_off_up_ratio_threshold: Decimal = Field(default=Decimal("0.30"), ge=0, le=1)
-    market_regime_caution_advance_decline_threshold: Decimal = Field(default=Decimal("0.80"), ge=0)
-    market_regime_risk_off_advance_decline_threshold: Decimal = Field(default=Decimal("0.50"), ge=0)
+    market_regime_caution_up_ratio_threshold: Decimal = Field(default=Decimal("0.45"), ge=0, le=1)
+    market_regime_normal_up_ratio_threshold: Decimal = Field(default=Decimal("0.50"), ge=0, le=1)
+    market_regime_risk_off_up_ratio_threshold: Decimal = Field(default=Decimal("0.35"), ge=0, le=1)
+    market_regime_caution_advance_decline_threshold: Decimal = Field(default=Decimal("1.00"), ge=0)
+    market_regime_risk_off_advance_decline_threshold: Decimal = Field(default=Decimal("0.70"), ge=0)
     market_regime_breadth_max_age_seconds: int = Field(default=86400, ge=60, le=604800)
     market_regime_missing_breadth_behavior: str = "neutral_with_warning"
     market_regime_live_missing_breadth_behavior: str = "caution"
     market_regime_stale_breadth_behavior: str = "caution"
-    market_regime_caution_sizing_multiplier: Decimal = Field(default=Decimal("0.50"), gt=0, le=1)
-    market_regime_caution_max_notional_krw: Decimal = Field(default=Decimal("1500000"), ge=0)
+    market_regime_caution_sizing_multiplier: Decimal = Field(default=Decimal("0.33"), gt=0, le=1)
+    market_regime_caution_max_notional_krw: Decimal = Field(default=Decimal("1000000"), ge=0)
     market_regime_sector_weak_behavior: str = "downsize"
-    market_regime_sector_weak_multiplier: Decimal = Field(default=Decimal("0.50"), ge=0, le=1)
-    market_regime_sector_weak_max_notional_krw: Decimal = Field(default=Decimal("1000000"), ge=0)
+    market_regime_sector_weak_multiplier: Decimal = Field(default=Decimal("0.33"), ge=0, le=1)
+    market_regime_sector_weak_max_notional_krw: Decimal = Field(default=Decimal("750000"), ge=0)
     market_regime_sector_weak_percentile_threshold: Decimal = Field(default=Decimal("0.30"), ge=0, le=1)
     market_regime_sector_weak_relative_return_pct: Decimal = Field(default=Decimal("-2.0"), ge=Decimal("-100"), le=Decimal("100"))
     trade_outcome_feedback_enabled: bool = True

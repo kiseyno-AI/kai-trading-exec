@@ -339,23 +339,40 @@ def list_autonomous_monitoring_symbols(
         db=db,
         current_market_date=current_market_date or datetime.now(KRX_TIMEZONE).date(),
     )
-    stale_sell_count = expire_known_flat_pending_sell_monitors(
-        settings=settings,
-        db=db,
-    )
-    if expired_count or stale_sell_count:
+    if expired_count:
         db.commit()
 
-    seen: set[str] = set()
-    symbols: list[str] = []
-    for item in _load_monitored_items(settings=settings, db=db, exclude_pending_config=True):
-        if item.status in NON_MONITORABLE_PLAN_ITEM_STATUSES:
-            continue
-        if item.symbol in seen:
-            continue
-        seen.add(item.symbol)
-        symbols.append(item.symbol)
-    return symbols
+    monitored_item_filter = _monitored_item_filter()
+    held_symbols = select(ExecutionPosition.symbol).where(
+        ExecutionPosition.mode == settings.runtime_mode,
+        ExecutionPosition.quantity > 0,
+    )
+    has_unexited_buy_order = _has_unexited_buy_order_filter(settings=settings)
+    monitored_item_filter = and_(
+        monitored_item_filter,
+        or_(
+            ExecutionPlanItem.side != "sell",
+            ExecutionPlanItem.symbol.in_(held_symbols),
+            and_(
+                _position_exit_quantity_policy_filter(),
+                has_unexited_buy_order,
+            ),
+        ),
+    )
+    return list(
+        db.scalars(
+            select(ExecutionPlanItem.symbol)
+            .join(ExecutionPlanItem.plan)
+            .where(
+                ExecutionPlan.mode == settings.runtime_mode,
+                monitored_item_filter,
+                ~ExecutionPlanItem.status.in_(tuple(NON_MONITORABLE_PLAN_ITEM_STATUSES)),
+            )
+            .group_by(ExecutionPlanItem.symbol)
+            .order_by(func.min(ExecutionPlan.accepted_at).asc(), ExecutionPlanItem.symbol.asc())
+            .limit(settings.monitoring_max_symbols_per_cycle)
+        ).all()
+    )
 
 
 def expire_known_flat_pending_sell_monitors(
@@ -537,6 +554,11 @@ def _evaluate_monitoring_cycle(
         db=db,
         adapter=adapter,
         symbols=sell_monitored_symbols,
+    )
+    _refresh_position_truth_if_stale(
+        settings=settings,
+        db=db,
+        adapter=adapter,
     )
     positions_by_symbol = _load_positions_by_symbol(
         settings=settings,
@@ -1347,6 +1369,9 @@ def _evaluate_monitoring_cycle(
             "submitted_order_count": submitted_order_count,
             "blocked_item_count": blocked_item_count,
             "deferred_item_count": deferred_item_count,
+            "evaluated_symbol_count": checkpoint_details["evaluated_symbol_count"],
+            "triggered_symbol_count": checkpoint_details["triggered_symbol_count"],
+            "submitted_symbols": checkpoint_details["submitted_symbols"],
             "protective_stop_coverage": checkpoint_details["protective_stop_coverage"],
             "items": results,
         },
@@ -3204,6 +3229,8 @@ def _reconcile_before_monitoring(
 ) -> None:
     if not symbols:
         return
+    if settings.runtime_mode != "live":
+        return
     try:
         reconcile_pending_broker_orders(
             settings=settings,
@@ -3264,6 +3291,36 @@ def _positions_with_stale_local_state(
         if _normalize_utc(reconciled_at) < stale_before:
             stale.add(symbol)
     return stale
+
+
+def _refresh_position_truth_if_stale(
+    *,
+    settings: Settings,
+    db: Session,
+    adapter: BrokerAdapter,
+) -> None:
+    if settings.runtime_mode != "live":
+        return
+    latest_reconciled_at = db.scalar(
+        select(func.max(ExecutionPosition.last_reconciled_at)).where(
+            ExecutionPosition.mode == settings.runtime_mode,
+            ExecutionPosition.quantity > 0,
+        )
+    )
+    stale_before = datetime.now(UTC) - timedelta(
+        seconds=settings.exec_agent_max_account_snapshot_age_seconds
+    )
+    if latest_reconciled_at is not None and _normalize_utc(latest_reconciled_at) >= stale_before:
+        return
+    try:
+        sync_execution_positions_from_broker_snapshot(
+            settings=settings,
+            db=db,
+            adapter=adapter,
+            symbols=None,
+        )
+    except Exception:
+        return
 
 
 def _is_legacy_seeded_reconciliation_position(position: ExecutionPosition) -> bool:

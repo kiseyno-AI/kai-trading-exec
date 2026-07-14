@@ -1006,24 +1006,30 @@ def build_runtime_status(
         state = ensure_runtime_control_state(settings=settings, db=db)
         safety = runtime_safety_payload(state)
         counts = runtime_counts(settings=settings, db=db)
-        broker = build_broker_session_summary(settings=settings, db=db)
-        broker_providers = broker_provider_readiness(settings=settings, db=db)
-        account_drawdown_gate = latest_account_drawdown_gate_state(settings=settings, db=db)
-        symbols = runtime_symbol_summary(settings=settings, db=db)
+        if include_expensive_sections:
+            broker = build_broker_session_summary(settings=settings, db=db)
+            broker_providers = broker_provider_readiness(settings=settings, db=db)
+            account_drawdown_gate = latest_account_drawdown_gate_state(settings=settings, db=db)
+            symbols = runtime_symbol_summary(settings=settings, db=db)
         if include_expensive_sections:
             monitoring = monitoring_payload(settings=settings, db=db)
             monitoring["price_source"] = monitoring_price_source
-        else:
+            freshness = runtime_freshness_payload(
+                settings=settings,
+                db=db,
+                monitoring=monitoring,
+            )
+            monthly_pnl = monthly_pnl_payload(settings=settings, db=db)
+        elif settings.autonomous_runtime_enabled:
             symbols = {
                 **symbols,
-                "monitored": runtime_monitored_symbols(settings=settings, db=db),
+                "monitored": _autonomous_monitoring_symbols(autonomous=autonomous),
             }
-        freshness = runtime_freshness_payload(
-            settings=settings,
-            db=db,
-            monitoring=monitoring,
-        )
-        monthly_pnl = monthly_pnl_payload(settings=settings, db=db)
+            freshness["summary_source"] = "fast_autonomous_runtime_snapshot"
+            monthly_pnl = _default_monthly_pnl_payload(settings=settings)
+        else:
+            freshness["summary_source"] = "fast_runtime_status"
+            monthly_pnl = _default_monthly_pnl_payload(settings=settings)
     except SQLAlchemyError as exc:
         db.rollback()
         dependencies["runtime_schema"] = "error"
@@ -1470,6 +1476,19 @@ def _default_autonomous_runtime_payload(settings: Settings) -> dict[str, object]
             },
         },
     }
+
+
+def _autonomous_monitoring_symbols(*, autonomous: dict[str, object]) -> list[str]:
+    monitoring = autonomous.get("monitoring")
+    if not isinstance(monitoring, dict):
+        return []
+    last_cycle = monitoring.get("last_cycle")
+    if not isinstance(last_cycle, dict):
+        return []
+    symbols = last_cycle.get("monitored_symbols")
+    if not isinstance(symbols, list):
+        return []
+    return sorted({str(symbol) for symbol in symbols if str(symbol).strip()})
 
 
 def _autonomous_monitoring_price_source(autonomous: dict[str, object]) -> dict[str, object]:
