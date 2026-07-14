@@ -2792,6 +2792,7 @@ def _build_watch_buy_test_app(
     resume: bool = True,
     max_quote_age_seconds: int = 30,
     retry_cooldown_seconds: int = 5,
+    account_drawdown_gate_enabled: bool = False,
 ):
     broker_adapter = StubBrokerAdapter(
         config=BrokerConfig(
@@ -2813,6 +2814,7 @@ def _build_watch_buy_test_app(
             monitoring_max_quote_age_seconds=max_quote_age_seconds,
             monitoring_watch_buy_retry_cooldown_seconds=retry_cooldown_seconds,
             exec_agent_max_position_allocation_pct=Decimal("0.20"),
+            account_drawdown_gate_enabled=account_drawdown_gate_enabled,
         ),
         broker_adapter=broker_adapter,
     )
@@ -5428,6 +5430,7 @@ def test_monitoring_creates_post_entry_protective_monitors_after_buy_fill() -> N
             kis_account_number="12345678",
             exec_agent_stop_loss_pct=Decimal("0.04"),
             exec_agent_max_holding_trading_sessions=3,
+            account_drawdown_gate_enabled=False,
         ),
         broker_adapter=broker_adapter,
     )
@@ -5509,6 +5512,7 @@ def test_monitoring_rebases_invalid_post_entry_stop_above_entry() -> None:
             kis_account_number="12345678",
             exec_agent_stop_loss_pct=Decimal("0.04"),
             exec_agent_max_holding_trading_sessions=3,
+            account_drawdown_gate_enabled=False,
         ),
         broker_adapter=broker_adapter,
     )
@@ -5617,6 +5621,7 @@ def test_monitoring_preserves_breakeven_rearmed_post_entry_stop() -> None:
             kis_account_number="12345678",
             exec_agent_stop_loss_pct=Decimal("0.04"),
             exec_agent_max_holding_trading_sessions=3,
+            account_drawdown_gate_enabled=False,
         ),
         broker_adapter=broker_adapter,
     )
@@ -5727,6 +5732,7 @@ def test_monitoring_tightens_post_entry_stop_after_no_progress_day() -> None:
             kis_account_number="12345678",
             exec_agent_stop_loss_pct=Decimal("0.04"),
             exec_agent_max_holding_trading_sessions=3,
+            account_drawdown_gate_enabled=False,
         ),
         broker_adapter=broker_adapter,
     )
@@ -5794,6 +5800,7 @@ def test_monitoring_submits_post_entry_max_holding_close_sell() -> None:
             kis_account_number="12345678",
             exec_agent_stop_loss_pct=Decimal("0.04"),
             exec_agent_max_holding_trading_sessions=3,
+            account_drawdown_gate_enabled=False,
         ),
         broker_adapter=broker_adapter,
     )
@@ -5873,6 +5880,7 @@ def test_monitoring_preserves_trading_session_max_holding_close_date_over_weeken
             kis_account_number="12345678",
             exec_agent_stop_loss_pct=Decimal("0.04"),
             exec_agent_max_holding_trading_sessions=3,
+            account_drawdown_gate_enabled=False,
         ),
         broker_adapter=broker_adapter,
     )
@@ -8684,6 +8692,179 @@ def test_autonomous_monitoring_loop_triggers_target_sell_from_price_source() -> 
             assert order.broker_order_id == "kis-auto-monitor-1"
             assert checkpoint.status == "degraded"
             assert checkpoint.details["protective_stop_coverage"]["missing_quantities"] == {"005930": 1}
+
+    engine.dispose()
+
+
+def test_autonomous_monitoring_prices_same_symbols_selected_for_evaluation() -> None:
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(broker_order_id="kis-auto-monitor-cap"),
+    )
+    price_source = StaticMonitoringPriceSource(
+        {
+            "035420": Decimal("180100.00"),
+            "005930": Decimal("125100.00"),
+        }
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+            monitoring_max_symbols_per_cycle=2,
+            monitoring_max_broker_actions_per_cycle=8,
+        ),
+        broker_adapter=broker_adapter,
+        monitoring_price_source=price_source,
+    )
+    with TestClient(app) as client:
+        resume = client.post(
+            "/controls/resume",
+            json={"actor": "ops", "source": "console", "reason": "enable autonomous runtime"},
+        )
+        assert resume.status_code == 200
+
+        responses = [
+            client.post(
+                "/execution-plans",
+                json={
+                    "plan_id": "plan-price-cap-naver",
+                    "source": "kai-trading-core",
+                    "market_date": "2026-06-08",
+                    "items": [
+                        {
+                            "symbol": "035420",
+                            "side": "sell",
+                            "intent": "target_sell",
+                            "quantity_policy": {"kind": "shares", "quantity": 1},
+                            "trigger_price": "180000.00",
+                            "time_in_force": "day",
+                            "risk_context": {"exchange": "KRX"},
+                        }
+                    ],
+                },
+            ),
+            client.post(
+                "/execution-plans",
+                json={
+                    "plan_id": "plan-price-cap-samsung",
+                    "source": "kai-trading-core",
+                    "market_date": "2026-06-08",
+                    "items": [
+                        {
+                            "symbol": "005930",
+                            "side": "sell",
+                            "intent": "target_sell",
+                            "quantity_policy": {"kind": "shares", "quantity": 1},
+                            "trigger_price": "125000.00",
+                            "time_in_force": "day",
+                            "risk_context": {"exchange": "KRX"},
+                        }
+                    ],
+                },
+            ),
+            client.post(
+                "/execution-plans",
+                json={
+                    "plan_id": "plan-price-cap-hynix",
+                    "source": "kai-trading-core",
+                    "market_date": "2026-06-08",
+                    "items": [
+                        {
+                            "symbol": "000660",
+                            "side": "sell",
+                            "intent": "target_sell",
+                            "quantity_policy": {"kind": "shares", "quantity": 1},
+                            "trigger_price": "90000.00",
+                            "time_in_force": "day",
+                            "risk_context": {"exchange": "KRX"},
+                        }
+                    ],
+                },
+            ),
+        ]
+        assert [response.status_code for response in responses] == [201, 201, 201]
+        first_item_id = responses[0].json()["persisted_execution_item_ids"][0]
+        second_item_id = responses[1].json()["persisted_execution_item_ids"][0]
+        third_item_id = responses[2].json()["persisted_execution_item_ids"][0]
+
+        with app.state.db_session_factory() as session:
+            first_item = session.get(ExecutionPlanItem, first_item_id)
+            second_item = session.get(ExecutionPlanItem, second_item_id)
+            third_item = session.get(ExecutionPlanItem, third_item_id)
+            assert first_item is not None
+            assert second_item is not None
+            assert third_item is not None
+            assert first_item.plan is not None
+            assert second_item.plan is not None
+            assert third_item.plan is not None
+            first_item.plan.accepted_at = datetime(2026, 6, 8, 0, 0, tzinfo=UTC)
+            second_item.plan.accepted_at = datetime(2026, 6, 8, 0, 1, tzinfo=UTC)
+            third_item.plan.accepted_at = datetime(2026, 6, 8, 0, 2, tzinfo=UTC)
+            session.add_all(
+                [
+                    ExecutionPosition(
+                        mode="paper",
+                        symbol="035420",
+                        quantity=1,
+                        average_price=Decimal("175000.0000"),
+                        updated_from="reconciliation",
+                        raw_payload={"source": "broker"},
+                    ),
+                    ExecutionPosition(
+                        mode="paper",
+                        symbol="005930",
+                        quantity=1,
+                        average_price=Decimal("120000.0000"),
+                        updated_from="reconciliation",
+                        raw_payload={"source": "broker"},
+                    ),
+                    ExecutionPosition(
+                        mode="paper",
+                        symbol="000660",
+                        quantity=1,
+                        average_price=Decimal("88000.0000"),
+                        updated_from="reconciliation",
+                        raw_payload={"source": "broker"},
+                    ),
+                ]
+            )
+            session.commit()
+
+            symbols = list_autonomous_monitoring_symbols(
+                settings=app.state.settings,
+                db=session,
+                current_market_date=datetime(2026, 6, 8, tzinfo=UTC).date(),
+            )
+            assert symbols == ["035420", "005930"]
+
+        payload = app.state.autonomous_runtime._monitoring_cycle_sync(
+            datetime(2026, 6, 8, 0, 3, tzinfo=UTC)
+        )
+
+        assert price_source.calls == [["035420", "005930"]]
+        assert payload["monitored_symbols"] == ["035420", "005930"]
+        assert payload["price_count"] == 2
+        assert payload["evaluated_symbol_count"] == 2
+        assert payload["submitted_order_count"] == 2
+        assert [call.execution_plan_item_id for call in broker_adapter.order_calls] == [
+            first_item_id,
+            second_item_id,
+        ]
+
+        with app.state.db_session_factory() as session:
+            third_item = session.get(ExecutionPlanItem, third_item_id)
+            assert third_item is not None
+            assert third_item.status == "target_sell_monitoring"
 
     engine.dispose()
 

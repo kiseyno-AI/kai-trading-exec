@@ -1730,7 +1730,7 @@ def test_monitoring_refreshes_stale_flat_position_before_sell_symbol_selection()
     app, engine = build_test_app(
         Settings(
             database_url="sqlite:///:memory:",
-            runtime_mode="paper",
+            runtime_mode="live",
             exec_agent_max_account_snapshot_age_seconds=60,
         )
     )
@@ -1764,7 +1764,7 @@ def test_monitoring_refreshes_stale_flat_position_before_sell_symbol_selection()
         item.status = "stop_sell_monitoring"
         session.add(
             ExecutionPosition(
-                mode="paper",
+                mode="live",
                 symbol="005930",
                 quantity=0,
                 average_price=Decimal("0.00"),
@@ -1784,7 +1784,7 @@ def test_monitoring_refreshes_stale_flat_position_before_sell_symbol_selection()
 
         position = session.scalar(
             select(ExecutionPosition).where(
-                ExecutionPosition.mode == "paper",
+                ExecutionPosition.mode == "live",
                 ExecutionPosition.symbol == "005930",
             )
         )

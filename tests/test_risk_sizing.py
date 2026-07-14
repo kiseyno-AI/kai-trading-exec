@@ -223,12 +223,9 @@ def test_risk_sizing_caution_market_breadth_downsizes_quantity() -> None:
         market_date="2026-06-25",
     )
 
-    assert isinstance(decision, RiskSizingResult)
-    assert decision.quantity == 15
-    guardrail = decision.cap_details["market_regime_guardrail"]
-    assert guardrail["market_regime_posture"] == "caution"
-    assert guardrail["action"] == "downsize"
-    assert guardrail["multiplier"] == "0.5000"
+    assert isinstance(decision, RiskSizingRejection)
+    assert decision.reason_code == "market_breadth_risk_off"
+    assert decision.details["market_regime_guardrail"]["action"] == "reject"
 
 
 def test_risk_sizing_below_normal_market_breadth_downsizes_quantity() -> None:
@@ -251,12 +248,12 @@ def test_risk_sizing_below_normal_market_breadth_downsizes_quantity() -> None:
     )
 
     assert isinstance(decision, RiskSizingResult)
-    assert decision.quantity == 15
+    assert decision.quantity == 9
     guardrail = decision.cap_details["market_regime_guardrail"]
     assert guardrail["market_regime_posture"] == "caution"
-    assert guardrail["market_regime_reason_code"] == "market_breadth_below_normal"
+    assert guardrail["market_regime_reason_code"] == "market_breadth_caution"
     assert guardrail["action"] == "downsize"
-    assert guardrail["multiplier"] == "0.5000"
+    assert guardrail["multiplier"] == "0.3300"
 
 
 def test_risk_sizing_risk_off_market_breadth_rejects_buy() -> None:
@@ -303,7 +300,7 @@ def test_risk_sizing_missing_market_breadth_in_live_automation_downsizes() -> No
     )
 
     assert isinstance(decision, RiskSizingResult)
-    assert decision.quantity == 15
+    assert decision.quantity == 10
     guardrail = decision.cap_details["market_regime_guardrail"]
     assert guardrail["market_regime_posture"] == "caution"
     assert guardrail["market_regime_reason_code"] == "market_breadth_missing_caution"

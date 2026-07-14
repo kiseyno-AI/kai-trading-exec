@@ -368,8 +368,8 @@ def list_autonomous_monitoring_symbols(
                 monitored_item_filter,
                 ~ExecutionPlanItem.status.in_(tuple(NON_MONITORABLE_PLAN_ITEM_STATUSES)),
             )
-            .distinct()
-            .order_by(ExecutionPlanItem.symbol.asc())
+            .group_by(ExecutionPlanItem.symbol)
+            .order_by(func.min(ExecutionPlan.accepted_at).asc(), ExecutionPlanItem.symbol.asc())
             .limit(settings.monitoring_max_symbols_per_cycle)
         ).all()
     )
@@ -1369,6 +1369,9 @@ def _evaluate_monitoring_cycle(
             "submitted_order_count": submitted_order_count,
             "blocked_item_count": blocked_item_count,
             "deferred_item_count": deferred_item_count,
+            "evaluated_symbol_count": checkpoint_details["evaluated_symbol_count"],
+            "triggered_symbol_count": checkpoint_details["triggered_symbol_count"],
+            "submitted_symbols": checkpoint_details["submitted_symbols"],
             "protective_stop_coverage": checkpoint_details["protective_stop_coverage"],
             "items": results,
         },
@@ -3226,6 +3229,8 @@ def _reconcile_before_monitoring(
 ) -> None:
     if not symbols:
         return
+    if settings.runtime_mode != "live":
+        return
     try:
         reconcile_pending_broker_orders(
             settings=settings,
@@ -3294,6 +3299,8 @@ def _refresh_position_truth_if_stale(
     db: Session,
     adapter: BrokerAdapter,
 ) -> None:
+    if settings.runtime_mode != "live":
+        return
     latest_reconciled_at = db.scalar(
         select(func.max(ExecutionPosition.last_reconciled_at)).where(
             ExecutionPosition.mode == settings.runtime_mode,

@@ -1994,7 +1994,7 @@ def _agent_risk_caps(settings: Settings) -> dict[str, object]:
             _settings_decimal(settings, "exec_agent_max_trade_risk_pct", Decimal("0.01"))
         ),
         "stop_loss_pct": _serialize_decimal(
-            _settings_decimal(settings, "exec_agent_stop_loss_pct", Decimal("0.04"))
+            _settings_decimal(settings, "exec_agent_stop_loss_pct", Decimal("0.025"))
         ),
         "max_entry_premium_pct": _serialize_decimal(
             _settings_non_negative_decimal(settings, "exec_agent_max_entry_premium_pct", Decimal("0"))
@@ -2021,7 +2021,7 @@ def _agent_risk_caps(settings: Settings) -> dict[str, object]:
             "extended_momentum",
         ],
         "add_on_requires_confirmation": True,
-        "max_holding_trading_sessions": getattr(settings, "exec_agent_max_holding_trading_sessions", 3),
+        "max_holding_trading_sessions": getattr(settings, "exec_agent_max_holding_trading_sessions", 2),
         "max_account_snapshot_age_seconds": getattr(settings, "exec_agent_max_account_snapshot_age_seconds", 300),
     }
 
@@ -2201,7 +2201,7 @@ def _append_monitoring_items(
                 quantity=stage["quantity"],
                 next_plan_item_index=next_plan_item_index,
                 trigger_price=stage["trigger_price"],
-                max_sessions=getattr(settings, "exec_agent_max_holding_trading_sessions", 3),
+                max_sessions=getattr(settings, "exec_agent_max_holding_trading_sessions", 2),
                 exit_rule=stage["exit_rule"],
             )
         )
@@ -2217,7 +2217,7 @@ def _append_monitoring_items(
             quantity=quantity,
             next_plan_item_index=next_plan_item_index,
             trigger_price=stop_price,
-            max_sessions=getattr(settings, "exec_agent_max_holding_trading_sessions", 3),
+            max_sessions=getattr(settings, "exec_agent_max_holding_trading_sessions", 2),
             exit_rule={
                 "kind": "hard_stop_loss",
                 "stop_price": _serialize_decimal(stop_price),
@@ -2236,7 +2236,7 @@ def _append_monitoring_items(
             quantity=quantity,
             next_plan_item_index=next_plan_item_index,
             trigger_price=None,
-            max_sessions=getattr(settings, "exec_agent_max_holding_trading_sessions", 3),
+            max_sessions=getattr(settings, "exec_agent_max_holding_trading_sessions", 2),
             exit_rule={"kind": "time_stop"},
         )
     )
