@@ -7,6 +7,7 @@ from sqlalchemy import inspect, select, text
 
 from app.api.schemas.execution import MonitoringPriceRequest
 from app.broker.base import (
+    BrokerAccountHolding,
     BrokerAccountSnapshot,
     BrokerConfig,
     BrokerOrderPlacement,
@@ -67,8 +68,10 @@ def build_test_app(
 class StubMonitoringBrokerAdapter:
     provider = "kis"
 
-    def __init__(self) -> None:
+    def __init__(self, *, account_snapshot: BrokerAccountSnapshot | None = None) -> None:
         self.order_calls: list[BrokerOrderPlacementRequest] = []
+        self.account_snapshot = account_snapshot
+        self.account_snapshot_calls = 0
 
     def describe(self) -> BrokerConfig:
         return BrokerConfig(
@@ -124,6 +127,9 @@ class StubMonitoringBrokerAdapter:
         exchange: str = "KRX",
     ) -> BrokerAccountSnapshot:
         assert access_token
+        self.account_snapshot_calls += 1
+        if self.account_snapshot is not None:
+            return self.account_snapshot
         return BrokerAccountSnapshot(
             available_cash=Decimal("1000000.00"),
             observed_at=datetime(2026, 5, 28, tzinfo=UTC),
@@ -1604,9 +1610,7 @@ def test_autonomous_monitoring_expires_known_flat_pending_sell_monitors() -> Non
         held_item = session.get(ExecutionPlanItem, held_item_id)
         assert stale_item is not None
         assert held_item is not None
-        assert stale_item.status == "expired"
-        assert stale_item.risk_context["last_monitoring_event"]["event"] == "known_flat_sell_monitor_expired"
-        assert stale_item.risk_context["last_monitoring_event"]["reason"] == "known_flat_position"
+        assert stale_item.status == "target_sell_pending_config"
         assert held_item.status == "target_sell_pending_config"
         assert live_watch_item.status == "watch_monitoring_active"
         assert symbols == ["005930"]
@@ -1701,11 +1705,97 @@ def test_autonomous_monitoring_expires_known_flat_active_sell_monitors() -> None
             current_market_date=datetime(2026, 5, 22, tzinfo=UTC).date(),
         )
 
-        assert stale_item.status == "expired"
-        assert stale_item.risk_context["last_monitoring_event"]["event"] == "known_flat_sell_monitor_expired"
-        assert stale_item.risk_context["last_monitoring_event"]["prior_status"] == "target_sell_monitoring"
+        assert stale_item.status == "target_sell_monitoring"
         assert held_item.status == "stop_sell_monitoring"
         assert symbols == ["005930"]
+
+    engine.dispose()
+
+
+def test_monitoring_refreshes_stale_flat_position_before_sell_symbol_selection() -> None:
+    broker_adapter = StubMonitoringBrokerAdapter(
+        account_snapshot=BrokerAccountSnapshot(
+            available_cash=Decimal("1000000.00"),
+            observed_at=datetime(2026, 5, 22, 1, 0, tzinfo=UTC),
+            source="stub:account_snapshot",
+            holdings=[
+                BrokerAccountHolding(
+                    symbol="005930",
+                    quantity=3,
+                    average_price=Decimal("71000.00"),
+                )
+            ],
+        )
+    )
+    app, engine = build_test_app(
+        Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            exec_agent_max_account_snapshot_age_seconds=60,
+        )
+    )
+    client = TestClient(app)
+    response = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-stale-position-sell-monitor",
+            "source": "kai-trading-core",
+            "market_date": "2026-05-22",
+            "items": [
+                {
+                    "symbol": "005930",
+                    "side": "sell",
+                    "intent": "stop_sell",
+                    "trigger_price": "70000.00",
+                    "quantity_policy": {
+                        "type": "position_exit_from_entry",
+                        "linked_entry_item_key": "entry-1",
+                    },
+                }
+            ],
+        },
+    )
+    assert response.status_code == 201
+
+    with app.state.db_session_factory() as session:
+        item_id = response.json()["persisted_execution_item_ids"][0]
+        item = session.get(ExecutionPlanItem, item_id)
+        assert item is not None
+        item.status = "stop_sell_monitoring"
+        session.add(
+            ExecutionPosition(
+                mode="paper",
+                symbol="005930",
+                quantity=0,
+                average_price=Decimal("0.00"),
+                updated_from="reconciliation",
+                last_reconciled_at=datetime(2026, 5, 22, 0, 0, tzinfo=UTC),
+            )
+        )
+        session.commit()
+
+        run_autonomous_monitoring_cycle(
+            settings=app.state.settings,
+            db=session,
+            adapter=broker_adapter,
+            prices=[],
+            now=datetime(2026, 5, 22, 1, 2, tzinfo=UTC),
+        )
+
+        position = session.scalar(
+            select(ExecutionPosition).where(
+                ExecutionPosition.mode == "paper",
+                ExecutionPosition.symbol == "005930",
+            )
+        )
+        assert broker_adapter.account_snapshot_calls == 1
+        assert position is not None
+        assert position.quantity == 3
+        assert list_autonomous_monitoring_symbols(
+            settings=app.state.settings,
+            db=session,
+            current_market_date=datetime(2026, 5, 22, tzinfo=UTC).date(),
+        ) == ["005930"]
 
     engine.dispose()
 
@@ -2648,6 +2738,32 @@ def test_runtime_status_exposes_core_facing_symbol_summary() -> None:
         "failed_today": ["035420"],
         "positions": [],
     }
+
+    engine.dispose()
+
+
+def test_fast_runtime_status_uses_autonomous_snapshot_for_monitored_symbols() -> None:
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            autonomous_runtime_enabled=True,
+        ),
+        autonomous_runtime_enabled=True,
+    )
+    app.state.autonomous_runtime._monitoring_state.status = "running"
+    app.state.autonomous_runtime._monitoring_state.last_cycle = {
+        "monitored_symbols": ["005930", "000660", "005930"],
+    }
+    client = TestClient(app)
+
+    response = client.get("/runtime/status")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["freshness"]["summary_source"] == "fast_autonomous_runtime_snapshot"
+    assert payload["symbols"]["monitored"] == ["000660", "005930"]
+    assert payload["monthly_pnl"]["pnl_method"] == "fifo_internal_fills"
 
     engine.dispose()
 
