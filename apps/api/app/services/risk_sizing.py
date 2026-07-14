@@ -177,6 +177,7 @@ def resolve_risk_based_buy_quantity(
     )
     if vol_corr_cap_details is not None:
         quantity = int(vol_corr_cap_details["capped_quantity"])
+    quantity_before_market_regime = quantity
     market_regime_guardrail = evaluate_market_regime_guardrail(
         settings=settings,
         context=market_regime_context,
@@ -196,6 +197,33 @@ def resolve_risk_based_buy_quantity(
         adjusted_quantity = _floor_quantity(Decimal(str(adjusted_notional)) / entry_price) if adjusted_notional else 0
         quantity = min(quantity, adjusted_quantity)
     if quantity <= 0:
+        if baseline_quantity > 0 and quantity_before_market_regime > 0 and market_regime_guardrail.action == "downsize":
+            return _reject(
+                "market_regime_min_lot_rejected",
+                "market-regime guardrail downsized this buy below one share",
+                risk_quantity=risk_quantity,
+                allocation_quantity=allocation_quantity,
+                cash_quantity=cash_quantity,
+                requested_quantity=requested_quantity,
+                agent_max_quantity=agent_max_quantity,
+                symbol_buyable_quantity=symbol_buyable_quantity,
+                baseline_quantity=baseline_quantity,
+                quantity_before_market_regime=quantity_before_market_regime,
+                market_regime_guardrail=market_regime_guardrail.audit,
+            )
+        if baseline_quantity > 0 and vol_corr_cap_details is not None:
+            return _reject(
+                "vol_corr_min_lot_rejected",
+                "volatility/correlation sizing cap downsized this buy below one share",
+                risk_quantity=risk_quantity,
+                allocation_quantity=allocation_quantity,
+                cash_quantity=cash_quantity,
+                requested_quantity=requested_quantity,
+                agent_max_quantity=agent_max_quantity,
+                symbol_buyable_quantity=symbol_buyable_quantity,
+                baseline_quantity=baseline_quantity,
+                vol_corr_cap_details=vol_corr_cap_details,
+            )
         return _reject(
             "insufficient_cash",
             "risk, allocation, cash, or quantity caps cannot buy one share",
