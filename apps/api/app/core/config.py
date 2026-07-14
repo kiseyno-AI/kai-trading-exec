@@ -69,7 +69,7 @@ class Settings(BaseModel):
     exec_agent_partial_take_profit_fraction: Decimal = Field(default=Decimal("0.50"), gt=0, le=1)
     exec_agent_trigger_time_enabled: bool = True
     exec_agent_trigger_time_sell_enabled: bool = True
-    exec_agent_trigger_time_timeout_seconds: int = Field(default=90, ge=10, le=3600)
+    exec_agent_trigger_time_timeout_seconds: int = Field(default=900, ge=10, le=3600)
     monthly_target_krw: Decimal = Field(default=Decimal("500000"), gt=0)
     monthly_capital_preservation_enabled: bool = True
     monthly_aggressive_lag_ratio: Decimal = Field(default=Decimal("0.75"), gt=0, le=1)
@@ -80,7 +80,7 @@ class Settings(BaseModel):
     exec_agent_watch_sizing_max_attempts: int = Field(default=3, ge=1, le=10)
     exec_agent_watch_sizing_start_local_time: str = "08:00"
     exec_agent_watch_sizing_end_local_time: str = "20:00"
-    exec_agent_watch_sizing_timeout_seconds: int = Field(default=180, ge=30, le=3600)
+    exec_agent_watch_sizing_timeout_seconds: int = Field(default=900, ge=30, le=3600)
     exec_agent_watch_sizing_min_notional_krw: Decimal = Field(default=Decimal("1000000"), ge=0)
     exec_agent_watch_sizing_high_conviction_min_notional_krw: Decimal = Field(default=Decimal("1500000"), ge=0)
     exec_agent_watch_sizing_high_conviction_threshold: Decimal = Field(default=Decimal("0.65"), ge=0, le=1)

@@ -14,6 +14,16 @@ def test_default_exec_sizing_uses_three_x_short_term_budget_caps() -> None:
     assert settings.exec_agent_max_symbol_total_exposure_pct == Decimal("0.30")
 
 
+def test_default_downside_guardrails_are_conservative_after_loss_week() -> None:
+    settings = Settings()
+
+    assert settings.exec_agent_stop_loss_pct == Decimal("0.025")
+    assert settings.exec_agent_max_holding_trading_sessions == 2
+    assert settings.account_drawdown_gate_enabled is True
+    assert settings.exec_agent_trigger_time_timeout_seconds == 900
+    assert settings.exec_agent_watch_sizing_timeout_seconds == 900
+
+
 def test_risk_sizing_allows_three_x_notional_when_stop_risk_and_caps_allow() -> None:
     settings = Settings()
 
