@@ -317,6 +317,76 @@ def test_risk_sizing_missing_market_breadth_in_live_automation_downsizes() -> No
     assert "market_breadth_missing" in guardrail["warnings"]
 
 
+def test_risk_sizing_nested_decider_handoff_market_regime_rejects_risk_off() -> None:
+    decision = resolve_risk_based_buy_quantity(
+        settings=Settings(runtime_mode="live", automation_enabled=True),
+        account_basis=Decimal("8517680"),
+        available_cash=Decimal("8517680"),
+        entry_price=Decimal("140700"),
+        stop_price=Decimal("137182.5"),
+        confidence=Decimal("0.52"),
+        requested_quantity=1,
+        candidate_max_budget=Decimal("144700"),
+        agent_max_quantity=2,
+        market_regime_context={
+            "decider_handoff_context": {
+                "market_regime_context": {
+                    "market": "KOSDAQ",
+                    "market_breadth": {
+                        "market": "KOSDAQ",
+                        "market_date": "2026-07-14",
+                        "up_count": 213,
+                        "down_count": 1423,
+                        "flat_count": 134,
+                        "up_ratio": "0.1203",
+                        "advance_decline_ratio": "0.149684",
+                    },
+                    "sector_context": {
+                        "sector_name": "기계·장비",
+                        "relative_state": "weak",
+                    },
+                },
+            },
+        },
+        market_date="2026-07-14",
+    )
+
+    assert isinstance(decision, RiskSizingRejection)
+    assert decision.reason_code == "market_breadth_risk_off"
+    guardrail = decision.details["market_regime_guardrail"]
+    assert guardrail["breadth"]["up_count"] == 213
+    assert guardrail["market_regime_posture"] == "risk_off"
+    assert guardrail["action"] == "reject"
+
+
+def test_risk_sizing_market_regime_downsize_below_one_share_has_precise_reason() -> None:
+    decision = resolve_risk_based_buy_quantity(
+        settings=Settings(
+            runtime_mode="live",
+            automation_enabled=True,
+            market_regime_caution_sizing_multiplier=Decimal("0.33"),
+        ),
+        account_basis=Decimal("8517680"),
+        available_cash=Decimal("8517680"),
+        entry_price=Decimal("140700"),
+        stop_price=Decimal("137182.5"),
+        confidence=Decimal("0.52"),
+        requested_quantity=1,
+        candidate_max_budget=Decimal("144700"),
+        agent_max_quantity=2,
+        market_regime_context={},
+        market_date="2026-07-14",
+    )
+
+    assert isinstance(decision, RiskSizingRejection)
+    assert decision.reason_code == "market_regime_min_lot_rejected"
+    assert decision.details["cash_quantity"] == 60
+    assert decision.details["baseline_quantity"] == 1
+    guardrail = decision.details["market_regime_guardrail"]
+    assert guardrail["market_regime_reason_code"] == "market_breadth_missing_caution"
+    assert guardrail["adjusted_quantity"] == 0
+
+
 def test_risk_sizing_stale_market_breadth_neutral_behavior_preserves_quantity() -> None:
     decision = resolve_risk_based_buy_quantity(
         settings=Settings(market_regime_stale_breadth_behavior="neutral_with_warning"),
