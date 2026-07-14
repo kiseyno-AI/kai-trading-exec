@@ -1883,7 +1883,90 @@ def test_autonomous_monitoring_retains_pending_sell_after_unexited_buy_order() -
     engine.dispose()
 
 
-def test_live_autonomous_monitoring_drops_pending_sell_after_flat_position_truth() -> None:
+def test_live_autonomous_monitoring_preserves_pending_sell_before_fresh_position_truth() -> None:
+    app, engine = build_test_app(
+        Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="live",
+        )
+    )
+    client = TestClient(app)
+
+    response = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-live-buy-filled-position-stale-flat",
+            "source": "kai-trading-core",
+            "market_date": "2026-06-04",
+            "items": [
+                {
+                    "symbol": "002380",
+                    "side": "buy",
+                    "intent": "intraday_watch_buy",
+                    "trigger_price": "565000.00",
+                    "limit_price": "575000.00",
+                    "quantity_policy": {"kind": "shares", "quantity": 1},
+                },
+                {
+                    "symbol": "002380",
+                    "side": "sell",
+                    "intent": "stop_sell",
+                    "trigger_price": "548000.00",
+                    "quantity_policy": {"kind": "position_exit_from_entry"},
+                },
+            ],
+        },
+    )
+    assert response.status_code == 201
+    buy_item_id, stop_item_id = response.json()["persisted_execution_item_ids"]
+
+    with app.state.db_session_factory() as session:
+        buy_item = session.get(ExecutionPlanItem, buy_item_id)
+        stop_item = session.get(ExecutionPlanItem, stop_item_id)
+        assert buy_item is not None
+        assert stop_item is not None
+        buy_item.status = "broker_order_submitted"
+        stop_item.status = "stop_sell_pending_config"
+        session.add(
+            BrokerOrder(
+                mode="live",
+                execution_plan_item_id=buy_item_id,
+                idempotency_key=f"monitoring:watch_buy:{buy_item_id}",
+                symbol="002380",
+                side="buy",
+                status="filled",
+                quantity=1,
+                limit_price=Decimal("567000.00"),
+                submitted_at=datetime(2026, 6, 4, 0, 55, tzinfo=UTC),
+            )
+        )
+        session.add(
+            ExecutionPosition(
+                mode="live",
+                symbol="002380",
+                quantity=0,
+                average_price=None,
+                updated_from="reconciliation",
+                last_reconciled_at=datetime(2026, 6, 4, 0, 53, tzinfo=UTC),
+            )
+        )
+        session.commit()
+
+        symbols = list_autonomous_monitoring_symbols(
+            settings=app.state.settings,
+            db=session,
+            current_market_date=datetime(2026, 6, 4, tzinfo=UTC).date(),
+        )
+
+        retained_stop = session.get(ExecutionPlanItem, stop_item_id)
+        assert retained_stop is not None
+        assert retained_stop.status == "stop_sell_pending_config"
+        assert symbols == ["002380"]
+
+    engine.dispose()
+
+
+def test_live_autonomous_monitoring_drops_pending_sell_after_fresh_flat_position_truth() -> None:
     app, engine = build_test_app(
         Settings(
             database_url="sqlite:///:memory:",
@@ -1947,7 +2030,7 @@ def test_live_autonomous_monitoring_drops_pending_sell_after_flat_position_truth
                 quantity=0,
                 average_price=None,
                 updated_from="reconciliation",
-                last_reconciled_at=datetime(2026, 6, 4, 0, 53, tzinfo=UTC),
+                last_reconciled_at=datetime.now(UTC),
             )
         )
         session.commit()

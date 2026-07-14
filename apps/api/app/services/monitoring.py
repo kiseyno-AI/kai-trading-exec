@@ -347,17 +347,10 @@ def list_autonomous_monitoring_symbols(
         ExecutionPosition.mode == settings.runtime_mode,
         ExecutionPosition.quantity > 0,
     )
-    has_unexited_buy_order = _has_unexited_buy_order_filter(settings=settings)
     sell_symbol_conditions = [
         ExecutionPlanItem.symbol.in_(held_symbols),
+        _unexited_buy_sell_monitor_fallback_filter(settings=settings),
     ]
-    if _allow_unexited_buy_sell_monitor_fallback(settings):
-        sell_symbol_conditions.append(
-            and_(
-                _position_exit_quantity_policy_filter(),
-                has_unexited_buy_order,
-            )
-        )
     monitored_item_filter = and_(
         monitored_item_filter,
         or_(
@@ -388,7 +381,6 @@ def expire_known_flat_pending_sell_monitors(
     expired_at: datetime | None = None,
 ) -> int:
     expired_at = _normalize_utc(expired_at or datetime.now(UTC))
-    has_unexited_buy_order = _has_unexited_buy_order_filter(settings=settings)
     held_symbols = select(ExecutionPosition.symbol).where(
         ExecutionPosition.mode == settings.runtime_mode,
         ExecutionPosition.quantity > 0,
@@ -416,8 +408,7 @@ def expire_known_flat_pending_sell_monitors(
             ExecutionPlanItem.symbol.not_in(held_symbols),
             ExecutionPlanItem.symbol.not_in(active_watch_symbols),
     ]
-    if _allow_unexited_buy_sell_monitor_fallback(settings):
-        where.append(~has_unexited_buy_order)
+    where.append(~_unexited_buy_sell_monitor_fallback_filter(settings=settings))
     candidates = db.scalars(
         select(ExecutionPlanItem)
         .join(ExecutionPlanItem.plan)
@@ -1784,17 +1775,10 @@ def _load_monitored_items(
             ExecutionPosition.mode == settings.runtime_mode,
             ExecutionPosition.quantity > 0,
         )
-        has_unexited_buy_order = _has_unexited_buy_order_filter(settings=settings)
         sell_symbol_conditions = [
             ExecutionPlanItem.symbol.in_(held_symbols),
+            _unexited_buy_sell_monitor_fallback_filter(settings=settings),
         ]
-        if _allow_unexited_buy_sell_monitor_fallback(settings):
-            sell_symbol_conditions.append(
-                and_(
-                    _position_exit_quantity_policy_filter(),
-                    has_unexited_buy_order,
-                )
-            )
         monitored_item_filter = and_(
             monitored_item_filter,
             or_(
@@ -2699,8 +2683,35 @@ def _has_unexited_buy_order_filter(*, settings: Settings):
     )
 
 
-def _allow_unexited_buy_sell_monitor_fallback(settings: Settings) -> bool:
-    return settings.runtime_mode != "live"
+def _unexited_buy_sell_monitor_fallback_filter(*, settings: Settings):
+    fallback = and_(
+        _position_exit_quantity_policy_filter(),
+        _has_unexited_buy_order_filter(settings=settings),
+    )
+    if settings.runtime_mode != "live":
+        return fallback
+    return and_(
+        fallback,
+        ~_has_recent_flat_position_truth_filter(settings=settings),
+    )
+
+
+def _has_recent_flat_position_truth_filter(*, settings: Settings):
+    stale_before = datetime.now(UTC) - timedelta(
+        seconds=settings.exec_agent_max_account_snapshot_age_seconds
+    )
+    return (
+        select(ExecutionPosition.id)
+        .where(
+            ExecutionPosition.mode == settings.runtime_mode,
+            ExecutionPosition.symbol == ExecutionPlanItem.symbol,
+            ExecutionPosition.quantity <= 0,
+            ExecutionPosition.last_reconciled_at.is_not(None),
+            ExecutionPosition.last_reconciled_at >= stale_before,
+        )
+        .correlate(ExecutionPlanItem)
+        .exists()
+    )
 
 
 def _load_positions_by_symbol(
