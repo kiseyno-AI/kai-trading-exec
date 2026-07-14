@@ -348,15 +348,21 @@ def list_autonomous_monitoring_symbols(
         ExecutionPosition.quantity > 0,
     )
     has_unexited_buy_order = _has_unexited_buy_order_filter(settings=settings)
+    sell_symbol_conditions = [
+        ExecutionPlanItem.symbol.in_(held_symbols),
+    ]
+    if _allow_unexited_buy_sell_monitor_fallback(settings):
+        sell_symbol_conditions.append(
+            and_(
+                _position_exit_quantity_policy_filter(),
+                has_unexited_buy_order,
+            )
+        )
     monitored_item_filter = and_(
         monitored_item_filter,
         or_(
             ExecutionPlanItem.side != "sell",
-            ExecutionPlanItem.symbol.in_(held_symbols),
-            and_(
-                _position_exit_quantity_policy_filter(),
-                has_unexited_buy_order,
-            ),
+            or_(*sell_symbol_conditions),
         ),
     )
     return list(
@@ -401,10 +407,7 @@ def expire_known_flat_pending_sell_monitors(
             ExecutionPlanItem.status.in_(tuple(WATCH_MONITORING_STATUSES)),
         )
     )
-    candidates = db.scalars(
-        select(ExecutionPlanItem)
-        .join(ExecutionPlanItem.plan)
-        .where(
+    where = [
             ExecutionPlan.mode == settings.runtime_mode,
             ExecutionPlanItem.side == "sell",
             ExecutionPlanItem.intent.in_(tuple(SELL_MONITORED_INTENTS)),
@@ -412,8 +415,13 @@ def expire_known_flat_pending_sell_monitors(
             ExecutionPlanItem.symbol.in_(known_flat_symbols),
             ExecutionPlanItem.symbol.not_in(held_symbols),
             ExecutionPlanItem.symbol.not_in(active_watch_symbols),
-            ~has_unexited_buy_order,
-        )
+    ]
+    if _allow_unexited_buy_sell_monitor_fallback(settings):
+        where.append(~has_unexited_buy_order)
+    candidates = db.scalars(
+        select(ExecutionPlanItem)
+        .join(ExecutionPlanItem.plan)
+        .where(*where)
         .options(selectinload(ExecutionPlanItem.plan))
         .order_by(
             ExecutionPlan.accepted_at.asc(),
@@ -1777,15 +1785,21 @@ def _load_monitored_items(
             ExecutionPosition.quantity > 0,
         )
         has_unexited_buy_order = _has_unexited_buy_order_filter(settings=settings)
+        sell_symbol_conditions = [
+            ExecutionPlanItem.symbol.in_(held_symbols),
+        ]
+        if _allow_unexited_buy_sell_monitor_fallback(settings):
+            sell_symbol_conditions.append(
+                and_(
+                    _position_exit_quantity_policy_filter(),
+                    has_unexited_buy_order,
+                )
+            )
         monitored_item_filter = and_(
             monitored_item_filter,
             or_(
                 ExecutionPlanItem.side != "sell",
-                ExecutionPlanItem.symbol.in_(held_symbols),
-                and_(
-                    _position_exit_quantity_policy_filter(),
-                    has_unexited_buy_order,
-                ),
+                or_(*sell_symbol_conditions),
             ),
         )
     latest_plan_candidates = (
@@ -2683,6 +2697,10 @@ def _has_unexited_buy_order_filter(*, settings: Settings):
         latest_buy_order_at.is_not(None),
         or_(latest_sell_order_at.is_(None), latest_buy_order_at > latest_sell_order_at),
     )
+
+
+def _allow_unexited_buy_sell_monitor_fallback(settings: Settings) -> bool:
+    return settings.runtime_mode != "live"
 
 
 def _load_positions_by_symbol(
