@@ -342,18 +342,19 @@ def _update_existing_sell_monitors_from_replanned_items(
             ExecutionPlanItem.id.desc(),
         )
     ).all()
-    existing_by_source: dict[str, ExecutionPlanItem] = {}
+    existing_by_source: dict[tuple[str, str, str], ExecutionPlanItem] = {}
     for existing in existing_items:
-        if existing.source_plan_item_id and existing.source_plan_item_id not in existing_by_source:
-            existing_by_source[existing.source_plan_item_id] = existing
+        if not existing.source_plan_item_id:
+            continue
+        key = (existing.source_plan_item_id, existing.symbol, existing.intent)
+        if key not in existing_by_source:
+            existing_by_source[key] = existing
 
     for replanned in replanned_items:
         if not replanned.source_plan_item_id:
             continue
-        existing = existing_by_source.get(replanned.source_plan_item_id)
+        existing = existing_by_source.get((replanned.source_plan_item_id, replanned.symbol, replanned.intent))
         if existing is None or existing.id == replanned.id:
-            continue
-        if existing.symbol != replanned.symbol or existing.intent != replanned.intent:
             continue
 
         prior_status = existing.status
