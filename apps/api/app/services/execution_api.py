@@ -95,7 +95,7 @@ def create_execution_plan(
         plan=plan,
     )
     materialize_execution_jobs(plan)
-    materialize_monitoring_plan_items(plan)
+    materialize_monitoring_plan_items(plan, db=db)
     db.add(plan)
 
     try:

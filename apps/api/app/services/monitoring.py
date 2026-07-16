@@ -270,8 +270,23 @@ IN_FLIGHT_BROKER_ORDER_ITEM_STATUSES = frozenset(
 )
 
 
-def materialize_monitoring_plan_items(plan: ExecutionPlan) -> None:
+SELL_REPLAN_UPDATE_STATUSES = (
+    SELL_PENDING_CONFIG_STATUSES
+    | SELL_ACTIVE_MONITORING_STATUSES
+    | BLOCKED_MONITORING_STATUSES
+)
+
+
+def materialize_monitoring_plan_items(
+    plan: ExecutionPlan,
+    *,
+    db: Session | None = None,
+) -> None:
+    if db is not None:
+        _update_existing_sell_monitors_from_replanned_items(plan=plan, db=db)
     for item in plan.items:
+        if item.status == "superseded":
+            continue
         if _is_watch_buy_item(item):
             if item.status not in {"pending", "watch_monitoring_pending"}:
                 continue
@@ -288,6 +303,117 @@ def materialize_monitoring_plan_items(plan: ExecutionPlan) -> None:
             item.status = _monitoring_status(item.intent)
             continue
         item.status = _pending_configuration_status(item.intent)
+
+
+def _update_existing_sell_monitors_from_replanned_items(
+    *,
+    plan: ExecutionPlan,
+    db: Session,
+) -> None:
+    replanned_items = [
+        item
+        for item in plan.items
+        if (
+            item.side == "sell"
+            and item.intent in SELL_MONITORED_INTENTS
+            and item.source_plan_item_id
+        )
+    ]
+    if not replanned_items:
+        return
+
+    existing_items = db.scalars(
+        select(ExecutionPlanItem)
+        .join(ExecutionPlanItem.plan)
+        .where(
+            ExecutionPlan.mode == plan.mode,
+            ExecutionPlanItem.side == "sell",
+            ExecutionPlanItem.intent.in_(tuple(SELL_MONITORED_INTENTS)),
+            ExecutionPlanItem.source_plan_item_id.in_(
+                [item.source_plan_item_id for item in replanned_items if item.source_plan_item_id]
+            ),
+            ExecutionPlanItem.status.in_(tuple(SELL_REPLAN_UPDATE_STATUSES)),
+        )
+        .options(selectinload(ExecutionPlanItem.plan))
+        .order_by(
+            ExecutionPlan.accepted_at.desc(),
+            ExecutionPlan.created_at.desc(),
+            ExecutionPlanItem.updated_at.desc(),
+            ExecutionPlanItem.id.desc(),
+        )
+    ).all()
+    existing_by_source: dict[tuple[str, str, str], ExecutionPlanItem] = {}
+    for existing in existing_items:
+        if not existing.source_plan_item_id:
+            continue
+        key = (existing.source_plan_item_id, existing.symbol, existing.intent)
+        if key not in existing_by_source:
+            existing_by_source[key] = existing
+
+    for replanned in replanned_items:
+        if not replanned.source_plan_item_id:
+            continue
+        existing = existing_by_source.get((replanned.source_plan_item_id, replanned.symbol, replanned.intent))
+        if existing is None or existing.id == replanned.id:
+            continue
+
+        prior_status = existing.status
+        prior_trigger_price = existing.trigger_price
+        prior_limit_price = existing.limit_price
+        prior_quantity_policy = existing.quantity_policy
+        prior_decision_snapshot_id = existing.decision_snapshot_id
+
+        existing.trigger_price = replanned.trigger_price
+        existing.limit_price = replanned.limit_price
+        existing.quantity_policy = replanned.quantity_policy
+        existing.time_in_force = replanned.time_in_force
+        existing.decision_agent_name = replanned.decision_agent_name
+        existing.decision_snapshot_id = replanned.decision_snapshot_id
+        existing.decision_run_id = replanned.decision_run_id
+        existing.source_market_date = replanned.source_market_date
+        existing.provider = replanned.provider
+        existing.venue = replanned.venue
+        existing.asset_class = replanned.asset_class
+        existing.base_quantity = replanned.base_quantity
+        existing.quote_notional = replanned.quote_notional
+        existing.quantity_precision = replanned.quantity_precision
+        existing.price_precision = replanned.price_precision
+        existing.status = (
+            _monitoring_status(existing.intent)
+            if _monitoring_item_is_configured(existing)
+            else _pending_configuration_status(existing.intent)
+        )
+        _record_monitoring_event(
+            item=existing,
+            event={
+                "event": "sell_monitor_replanned_in_place",
+                "reason": "same_source_plan_item_replanned",
+                "prior_status": prior_status,
+                "updated_status": existing.status,
+                "prior_trigger_price": _serialize_decimal(prior_trigger_price),
+                "updated_trigger_price": _serialize_decimal(existing.trigger_price),
+                "prior_limit_price": _serialize_decimal(prior_limit_price),
+                "updated_limit_price": _serialize_decimal(existing.limit_price),
+                "prior_quantity_policy": prior_quantity_policy,
+                "updated_quantity_policy": replanned.quantity_policy,
+                "prior_decision_snapshot_id": prior_decision_snapshot_id,
+                "updated_decision_snapshot_id": existing.decision_snapshot_id,
+                "replanned_execution_plan_id": plan.id,
+                "recorded_at": datetime.now(UTC).isoformat(),
+            },
+        )
+
+        replanned.status = "superseded"
+        _record_monitoring_event(
+            item=replanned,
+            event={
+                "event": "replanned_sell_monitor_deduplicated",
+                "reason": "existing_monitor_updated_in_place",
+                "updated_existing_execution_plan_item_id": existing.id,
+                "updated_existing_execution_plan_id": existing.execution_plan_id,
+                "recorded_at": datetime.now(UTC).isoformat(),
+            },
+        )
 
 
 def evaluate_monitoring(
