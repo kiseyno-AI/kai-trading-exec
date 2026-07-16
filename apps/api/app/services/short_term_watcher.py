@@ -24,6 +24,7 @@ from app.services.runtime_controls import (
 )
 
 OPEN_ORDER_STATUSES = frozenset({"submission_pending", "submitted", "open", "partially_filled", "retry_pending"})
+SUPPORTED_SHORT_TERM_BUY_INTENTS = frozenset({"next_open_buy", "intraday_watch_buy"})
 SHORT_TERM_DECIDER_NAME = "short-term-decider"
 MAX_APPROVED_NOTIONAL = Decimal("10000000")
 
@@ -205,8 +206,11 @@ def _load_candidate(*, settings: Settings, db: Session, execution_plan_item_id: 
 
 
 def _validate_candidate(*, item: ExecutionPlanItem) -> tuple[str, str] | None:
-    if item.side != "buy" or item.intent != "next_open_buy":
-        return "unsupported_candidate", "short-term watcher can only approve buy next_open_buy candidates"
+    if item.side != "buy" or item.intent not in SUPPORTED_SHORT_TERM_BUY_INTENTS:
+        return (
+            "unsupported_candidate",
+            "short-term watcher can only approve supported short-term buy candidates",
+        )
     if (item.decision_agent_name or "").strip().lower() != SHORT_TERM_DECIDER_NAME:
         return "unsupported_decider", "candidate is not owned by short-term-decider"
     return None
