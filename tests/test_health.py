@@ -1188,6 +1188,120 @@ def test_autonomous_monitoring_uses_latest_plan_per_symbol_only() -> None:
     engine.dispose()
 
 
+def test_replanned_sell_monitor_updates_existing_source_row_in_place() -> None:
+    app, engine = build_test_app(
+        Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+        )
+    )
+    client = TestClient(app)
+
+    older = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-old-replanned-sell",
+            "source": "kai-trading-core",
+            "market_date": "2026-05-21",
+            "items": [
+                {
+                    "symbol": "000660",
+                    "side": "sell",
+                    "intent": "target_sell",
+                    "core_plan_item_id": "core-plan-row-1:target_sell",
+                    "trigger_price": "100.00",
+                    "quantity_policy": {"kind": "shares", "quantity": 1},
+                    "decision_snapshot_id": "snapshot-old",
+                },
+                {
+                    "symbol": "000660",
+                    "side": "sell",
+                    "intent": "stop_sell",
+                    "core_plan_item_id": "core-plan-row-1:stop_sell",
+                    "trigger_price": "90.00",
+                    "quantity_policy": {"kind": "shares", "quantity": 1},
+                    "decision_snapshot_id": "snapshot-old",
+                },
+            ],
+        },
+    )
+    assert older.status_code == 201
+    target_item_id, stop_item_id = older.json()["persisted_execution_item_ids"]
+
+    newer = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-new-replanned-sell",
+            "source": "kai-trading-core",
+            "market_date": "2026-05-21",
+            "items": [
+                {
+                    "symbol": "000660",
+                    "side": "sell",
+                    "intent": "target_sell",
+                    "core_plan_item_id": "core-plan-row-1:target_sell",
+                    "trigger_price": "112.00",
+                    "quantity_policy": {"kind": "shares", "quantity": 3},
+                    "decision_snapshot_id": "snapshot-new",
+                },
+                {
+                    "symbol": "000660",
+                    "side": "sell",
+                    "intent": "stop_sell",
+                    "core_plan_item_id": "core-plan-row-1:stop_sell",
+                    "trigger_price": "94.00",
+                    "quantity_policy": {"kind": "shares", "quantity": 3},
+                    "decision_snapshot_id": "snapshot-new",
+                },
+            ],
+        },
+    )
+    assert newer.status_code == 201
+    new_item_ids = newer.json()["persisted_execution_item_ids"]
+
+    with app.state.db_session_factory() as session:
+        session.add(
+            ExecutionPosition(
+                mode="paper",
+                symbol="000660",
+                quantity=3,
+                average_price=Decimal("95.00"),
+                updated_from="test",
+            )
+        )
+        session.commit()
+
+        target_item = session.get(ExecutionPlanItem, target_item_id)
+        stop_item = session.get(ExecutionPlanItem, stop_item_id)
+        assert target_item is not None
+        assert stop_item is not None
+        assert target_item.status == "target_sell_monitoring"
+        assert stop_item.status == "stop_sell_monitoring"
+        assert target_item.trigger_price == Decimal("112.0000")
+        assert stop_item.trigger_price == Decimal("94.0000")
+        assert target_item.quantity_policy == {"kind": "shares", "quantity": 3}
+        assert stop_item.quantity_policy == {"kind": "shares", "quantity": 3}
+        assert target_item.decision_snapshot_id == "snapshot-new"
+        assert stop_item.decision_snapshot_id == "snapshot-new"
+        assert target_item.risk_context["last_monitoring_event"]["event"] == "sell_monitor_replanned_in_place"
+        assert stop_item.risk_context["last_monitoring_event"]["event"] == "sell_monitor_replanned_in_place"
+
+        new_items = [session.get(ExecutionPlanItem, item_id) for item_id in new_item_ids]
+        assert [item.status for item in new_items if item is not None] == ["superseded", "superseded"]
+
+        autonomous_items = _load_monitored_items(
+            settings=app.state.settings,
+            db=session,
+            exclude_pending_config=True,
+        )
+        autonomous_item_ids = {item.id for item in autonomous_items}
+        assert target_item_id in autonomous_item_ids
+        assert stop_item_id in autonomous_item_ids
+        assert not (autonomous_item_ids & set(new_item_ids))
+
+    engine.dispose()
+
+
 def test_autonomous_monitoring_includes_older_active_sell_monitor_without_same_intent_replacement() -> None:
     app, engine = build_test_app(
         Settings(
