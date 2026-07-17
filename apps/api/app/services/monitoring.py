@@ -469,7 +469,7 @@ def run_autonomous_monitoring_cycle(
     symbols: list[str] | set[str] | None = None,
     now: datetime | None = None,
 ) -> EvaluateMonitoringResult:
-    symbol_scope = {symbol for symbol in (symbols or []) if symbol}
+    symbol_scope = _ordered_symbol_scope(symbols)
     return _evaluate_monitoring_cycle(
         settings=settings,
         db=db,
@@ -480,6 +480,20 @@ def run_autonomous_monitoring_cycle(
         allow_persisted_triggered_without_price=True,
         update_checkpoint_if_idle=False,
     )
+
+
+def _ordered_symbol_scope(symbols: list[str] | set[str] | None) -> list[str]:
+    if not symbols:
+        return []
+    source = sorted(symbols) if isinstance(symbols, set) else symbols
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for symbol in source:
+        if not symbol or symbol in seen:
+            continue
+        ordered.append(symbol)
+        seen.add(symbol)
+    return ordered
 
 
 def list_autonomous_monitoring_symbols(
@@ -518,28 +532,37 @@ def list_autonomous_monitoring_symbols(
                 return
 
     if held_symbols:
-        append_candidates(
-            list(
-                db.scalars(
-                    select(distinct(ExecutionPlanItem.symbol))
-                    .where(
-                        ExecutionPlanItem.execution_plan_id.in_(mode_plan_ids),
-                        ExecutionPlanItem.symbol.in_(sorted(held_symbols)),
-                        ExecutionPlanItem.side == "sell",
-                        ExecutionPlanItem.intent.in_(tuple(SELL_MONITORED_INTENTS)),
-                        ExecutionPlanItem.status.in_(
-                            tuple(
-                                SELL_ACTIVE_MONITORING_STATUSES
-                                | SELL_PENDING_CONFIG_STATUSES
-                                | BLOCKED_MONITORING_STATUSES
-                                | PENDING_DISPATCH_MONITORING_STATUSES
-                            )
-                        ),
-                    )
-                    .order_by(ExecutionPlanItem.symbol.asc())
-                    .limit(settings.monitoring_max_symbols_per_cycle)
-                ).all()
+        held_symbol_rows = db.execute(
+            select(
+                ExecutionPlanItem.symbol,
+                func.min(ExecutionPlan.accepted_at).label("first_accepted_at"),
+                func.min(ExecutionPlan.id).label("first_plan_id"),
             )
+            .join(ExecutionPlanItem.plan)
+            .where(
+                ExecutionPlan.mode == settings.runtime_mode,
+                ExecutionPlanItem.symbol.in_(sorted(held_symbols)),
+                ExecutionPlanItem.side == "sell",
+                ExecutionPlanItem.intent.in_(tuple(SELL_MONITORED_INTENTS)),
+                ExecutionPlanItem.status.in_(
+                    tuple(
+                        SELL_ACTIVE_MONITORING_STATUSES
+                        | SELL_PENDING_CONFIG_STATUSES
+                        | BLOCKED_MONITORING_STATUSES
+                        | PENDING_DISPATCH_MONITORING_STATUSES
+                    )
+                ),
+            )
+            .group_by(ExecutionPlanItem.symbol)
+            .order_by(
+                func.min(ExecutionPlan.accepted_at).asc(),
+                func.min(ExecutionPlan.id).asc(),
+                ExecutionPlanItem.symbol.asc(),
+            )
+            .limit(settings.monitoring_max_symbols_per_cycle)
+        ).all()
+        append_candidates(
+            [str(row.symbol) for row in held_symbol_rows]
         )
 
     if len(symbol_candidates) < settings.monitoring_max_symbols_per_cycle:
@@ -664,7 +687,7 @@ def release_disabled_account_drawdown_watch_buy_blocks(
     settings: Settings,
     db: Session,
     released_at: datetime | None = None,
-    symbols: set[str] | None = None,
+    symbols: list[str] | set[str] | None = None,
 ) -> int:
     if settings.account_drawdown_gate_enabled:
         return 0
@@ -681,7 +704,7 @@ def release_disabled_account_drawdown_watch_buy_blocks(
         ExecutionPlanItem.status.in_(("watch_buy_triggered_blocked", "new_buy_blocked")),
     ]
     if symbols:
-        where.append(ExecutionPlanItem.symbol.in_(sorted(symbols)))
+        where.append(ExecutionPlanItem.symbol.in_(_ordered_symbol_scope(symbols)))
     orders = db.scalars(
         select(BrokerOrder)
         .join(BrokerOrder.plan_item)
@@ -770,7 +793,7 @@ def _evaluate_monitoring_cycle(
     db: Session,
     adapter: BrokerAdapter,
     prices: dict[str, MonitoringPriceRequest],
-    symbols: set[str] | None = None,
+    symbols: list[str] | set[str] | None = None,
     triggered_at: datetime,
     allow_persisted_triggered_without_price: bool,
     update_checkpoint_if_idle: bool,
@@ -783,6 +806,15 @@ def _evaluate_monitoring_cycle(
     )
     if released_drawdown_blocks:
         db.flush()
+    position_truth_refreshed_before_selection = False
+    if settings.runtime_mode == "live":
+        _refresh_position_truth_if_stale(
+            settings=settings,
+            db=db,
+            adapter=adapter,
+            symbols=symbols,
+        )
+        position_truth_refreshed_before_selection = True
     items = _load_monitored_items(
         settings=settings,
         db=db,
@@ -804,13 +836,15 @@ def _evaluate_monitoring_cycle(
         db=db,
         adapter=adapter,
         symbols=sell_monitored_symbols,
+        refresh_positions=not position_truth_refreshed_before_selection,
     )
-    _refresh_position_truth_if_stale(
-        settings=settings,
-        db=db,
-        adapter=adapter,
-        symbols=symbols,
-    )
+    if not position_truth_refreshed_before_selection:
+        _refresh_position_truth_if_stale(
+            settings=settings,
+            db=db,
+            adapter=adapter,
+            symbols=sell_monitored_symbols,
+        )
     positions_by_symbol = _load_positions_by_symbol(
         settings=settings,
         db=db,
@@ -2042,7 +2076,7 @@ def _load_monitored_items(
     settings: Settings,
     db: Session,
     exclude_pending_config: bool = False,
-    symbols: set[str] | None = None,
+    symbols: list[str] | set[str] | None = None,
 ) -> list[ExecutionPlanItem]:
     monitored_item_filter = _monitored_item_filter()
     if symbols:
@@ -2069,7 +2103,7 @@ def _load_monitored_items(
             ),
         )
     if symbols:
-        symbol_list = sorted(symbols)
+        symbol_list = _ordered_symbol_scope(symbols)
         sell_fast_statuses = (
             SELL_ACTIVE_MONITORING_STATUSES
             | BLOCKED_MONITORING_STATUSES
@@ -2152,10 +2186,11 @@ def _load_monitored_items(
             )
             .limit(settings.monitoring_max_symbols_per_cycle * 16)
         ).all()
+        symbol_order = {symbol: index for index, symbol in enumerate(symbol_list)}
         selected_items = sorted(
             [*sell_items, *buy_items],
             key=lambda item: (
-                item.symbol,
+                symbol_order.get(item.symbol, len(symbol_order)),
                 item.plan_item_index,
                 item.id,
             ),
@@ -3254,11 +3289,11 @@ def _load_positions_by_symbol(
     *,
     settings: Settings,
     db: Session,
-    symbols: set[str] | None = None,
+    symbols: list[str] | set[str] | None = None,
 ) -> dict[str, ExecutionPosition]:
     where = [ExecutionPosition.mode == settings.runtime_mode]
     if symbols:
-        where.append(ExecutionPosition.symbol.in_(sorted(symbols)))
+        where.append(ExecutionPosition.symbol.in_(_ordered_symbol_scope(symbols)))
     positions = db.scalars(
         select(ExecutionPosition)
         .where(*where)
@@ -3833,6 +3868,7 @@ def _reconcile_before_monitoring(
     db: Session,
     adapter: BrokerAdapter,
     symbols: set[str],
+    refresh_positions: bool = True,
 ) -> None:
     if not symbols:
         return
@@ -3846,6 +3882,9 @@ def _reconcile_before_monitoring(
             symbols=symbols,
         )
     except Exception:
+        return
+
+    if not refresh_positions:
         return
 
     stale_symbols = _positions_with_stale_local_state(
@@ -3905,9 +3944,35 @@ def _refresh_position_truth_if_stale(
     settings: Settings,
     db: Session,
     adapter: BrokerAdapter,
-    symbols: set[str] | None = None,
+    symbols: list[str] | set[str] | None = None,
 ) -> None:
-    symbol_list = sorted(symbols) if symbols else None
+    if symbols is not None and not symbols:
+        return
+    symbol_list = _ordered_symbol_scope(symbols)
+    if settings.runtime_mode != "live":
+        if not symbol_list:
+            return
+        existing_symbols = set(
+            db.scalars(
+                select(ExecutionPosition.symbol).where(
+                    ExecutionPosition.mode == settings.runtime_mode,
+                    ExecutionPosition.symbol.in_(symbol_list),
+                )
+            ).all()
+        )
+        missing_symbols = set(symbol_list) - existing_symbols
+        if not missing_symbols:
+            return
+        try:
+            sync_execution_positions_from_broker_snapshot(
+                settings=settings,
+                db=db,
+                adapter=adapter,
+                symbols=missing_symbols,
+            )
+        except Exception:
+            return
+        return
     where = [
         ExecutionPosition.mode == settings.runtime_mode,
         ExecutionPosition.quantity > 0,
