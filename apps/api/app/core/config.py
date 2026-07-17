@@ -25,7 +25,7 @@ class Settings(BaseModel):
     dispatch_loop_interval_seconds: float = Field(default=1.0, gt=0, le=3600)
     monitoring_loop_interval_seconds: float = Field(default=1.0, gt=0, le=3600)
     monitoring_cycle_timeout_seconds: float = Field(default=20.0, gt=0, le=3600)
-    monitoring_expire_prior_market_watch_buys_enabled: bool = False
+    monitoring_expire_prior_market_watch_buys_enabled: bool = True
     monitoring_max_symbols_per_cycle: int = Field(default=128, ge=1, le=10000)
     monitoring_max_broker_actions_per_cycle: int = Field(default=32, ge=1, le=10000)
     monitoring_max_quote_age_seconds: int = Field(default=30, ge=1, le=3600)
