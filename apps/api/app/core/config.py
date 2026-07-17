@@ -24,6 +24,8 @@ class Settings(BaseModel):
     autonomous_runtime_enabled: bool = False
     dispatch_loop_interval_seconds: float = Field(default=1.0, gt=0, le=3600)
     monitoring_loop_interval_seconds: float = Field(default=1.0, gt=0, le=3600)
+    monitoring_cycle_timeout_seconds: float = Field(default=20.0, gt=0, le=3600)
+    monitoring_expire_prior_market_watch_buys_enabled: bool = False
     monitoring_max_symbols_per_cycle: int = Field(default=128, ge=1, le=10000)
     monitoring_max_broker_actions_per_cycle: int = Field(default=32, ge=1, le=10000)
     monitoring_max_quote_age_seconds: int = Field(default=30, ge=1, le=3600)
@@ -213,6 +215,8 @@ _ENV_FIELDS = {
     "AUTONOMOUS_RUNTIME_ENABLED": "autonomous_runtime_enabled",
     "DISPATCH_LOOP_INTERVAL_SECONDS": "dispatch_loop_interval_seconds",
     "MONITORING_LOOP_INTERVAL_SECONDS": "monitoring_loop_interval_seconds",
+    "MONITORING_CYCLE_TIMEOUT_SECONDS": "monitoring_cycle_timeout_seconds",
+    "MONITORING_EXPIRE_PRIOR_MARKET_WATCH_BUYS_ENABLED": "monitoring_expire_prior_market_watch_buys_enabled",
     "MONITORING_MAX_SYMBOLS_PER_CYCLE": "monitoring_max_symbols_per_cycle",
     "MONITORING_MAX_BROKER_ACTIONS_PER_CYCLE": "monitoring_max_broker_actions_per_cycle",
     "MONITORING_MAX_QUOTE_AGE_SECONDS": "monitoring_max_quote_age_seconds",
