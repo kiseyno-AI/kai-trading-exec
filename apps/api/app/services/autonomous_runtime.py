@@ -226,9 +226,33 @@ class AutonomousRuntimeCoordinator:
                 started_at = datetime.now(UTC)
                 self._mark_cycle_started(worker_key=worker_key, started_at=started_at)
                 try:
-                    payload = await cycle(started_at)
+                    awaitable = cycle(started_at)
+                    if worker_key == "monitoring":
+                        payload = await asyncio.wait_for(
+                            awaitable,
+                            timeout=self.settings.monitoring_cycle_timeout_seconds,
+                        )
+                    else:
+                        payload = await awaitable
                 except asyncio.CancelledError:
                     raise
+                except TimeoutError:
+                    LOGGER.exception(
+                        "autonomous_runtime_cycle_timed_out",
+                        extra={
+                            "worker_name": self._state_for(worker_key).worker_name,
+                            "runtime_mode": self.settings.runtime_mode,
+                            "timeout_seconds": self.settings.monitoring_cycle_timeout_seconds,
+                        },
+                    )
+                    self._mark_cycle_failed(
+                        worker_key=worker_key,
+                        heartbeat_at=datetime.now(UTC),
+                        error=(
+                            "cycle timed out after "
+                            f"{self.settings.monitoring_cycle_timeout_seconds:g}s"
+                        ),
+                    )
                 except Exception as exc:
                     LOGGER.exception(
                         "autonomous_runtime_cycle_failed",
@@ -325,6 +349,7 @@ class AutonomousRuntimeCoordinator:
                 db=db,
                 adapter=adapter,
                 prices=prices,
+                symbols=symbols,
                 now=started_at,
             )
             payload = {
@@ -409,6 +434,7 @@ class AutonomousRuntimeCoordinator:
             state = self._state_for(worker_key)
             state.status = "running"
             state.last_started_at = started_at
+            state.last_heartbeat_at = started_at
             state.last_error = None
 
     def _mark_cycle_succeeded(

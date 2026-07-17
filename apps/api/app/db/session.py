@@ -26,13 +26,13 @@ def create_db_engine(settings: Settings) -> Engine:
         "pool_pre_ping": True,
     }
     if url.drivername.startswith("sqlite"):
-        kwargs["connect_args"] = {"check_same_thread": False, "timeout": 5}
+        kwargs["connect_args"] = {"check_same_thread": False, "timeout": 30}
         if url.database == ":memory:":
             kwargs["poolclass"] = StaticPool
         else:
-            kwargs["pool_timeout"] = 1
-            kwargs["pool_size"] = 5
-            kwargs["max_overflow"] = 0
+            kwargs["pool_timeout"] = 10
+            kwargs["pool_size"] = 20
+            kwargs["max_overflow"] = 20
     else:
         kwargs["pool_timeout"] = 1
     engine = create_engine(settings.database_url, **kwargs)

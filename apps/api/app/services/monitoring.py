@@ -8,8 +8,8 @@ from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from functools import partial
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import and_, func, or_, select, tuple_
-from sqlalchemy.orm import Session, selectinload
+from sqlalchemy import and_, distinct, func, or_, select, tuple_
+from sqlalchemy.orm import Session, load_only, selectinload
 
 from app.api.schemas.execution import (
     MonitoringEvaluationRequest,
@@ -334,7 +334,32 @@ def _update_existing_sell_monitors_from_replanned_items(
             ),
             ExecutionPlanItem.status.in_(tuple(SELL_REPLAN_UPDATE_STATUSES)),
         )
-        .options(selectinload(ExecutionPlanItem.plan))
+        .options(
+            load_only(
+                ExecutionPlanItem.id,
+                ExecutionPlanItem.execution_plan_id,
+                ExecutionPlanItem.plan_item_index,
+                ExecutionPlanItem.symbol,
+                ExecutionPlanItem.side,
+                ExecutionPlanItem.intent,
+                ExecutionPlanItem.status,
+                ExecutionPlanItem.quantity_policy,
+                ExecutionPlanItem.limit_price,
+                ExecutionPlanItem.trigger_price,
+                ExecutionPlanItem.time_in_force,
+                ExecutionPlanItem.risk_context,
+                ExecutionPlanItem.source_plan_item_id,
+                ExecutionPlanItem.source_market_date,
+                ExecutionPlanItem.updated_at,
+            ),
+            selectinload(ExecutionPlanItem.plan).load_only(
+                ExecutionPlan.id,
+                ExecutionPlan.mode,
+                ExecutionPlan.market_date,
+                ExecutionPlan.accepted_at,
+                ExecutionPlan.created_at,
+            ),
+        )
         .order_by(
             ExecutionPlan.accepted_at.desc(),
             ExecutionPlan.created_at.desc(),
@@ -441,13 +466,16 @@ def run_autonomous_monitoring_cycle(
     db: Session,
     adapter: BrokerAdapter,
     prices: list[MonitoringPriceRequest] | None = None,
+    symbols: list[str] | set[str] | None = None,
     now: datetime | None = None,
 ) -> EvaluateMonitoringResult:
+    symbol_scope = {symbol for symbol in (symbols or []) if symbol}
     return _evaluate_monitoring_cycle(
         settings=settings,
         db=db,
         adapter=adapter,
         prices={price.symbol: price for price in (prices or [])},
+        symbols=symbol_scope or None,
         triggered_at=_normalize_utc(now or datetime.now(UTC)),
         allow_persisted_triggered_without_price=True,
         update_checkpoint_if_idle=False,
@@ -460,44 +488,112 @@ def list_autonomous_monitoring_symbols(
     db: Session,
     current_market_date: date | None = None,
 ) -> list[str]:
-    expired_count = expire_prior_market_date_unfilled_watch_buys(
-        settings=settings,
-        db=db,
-        current_market_date=current_market_date or datetime.now(KRX_TIMEZONE).date(),
-    )
-    if expired_count:
-        db.commit()
+    if settings.monitoring_expire_prior_market_watch_buys_enabled:
+        expired_count = expire_prior_market_date_unfilled_watch_buys(
+            settings=settings,
+            db=db,
+            current_market_date=current_market_date or datetime.now(KRX_TIMEZONE).date(),
+        )
+        if expired_count:
+            db.commit()
 
-    monitored_item_filter = _monitored_item_filter()
-    held_symbols = select(ExecutionPosition.symbol).where(
-        ExecutionPosition.mode == settings.runtime_mode,
-        ExecutionPosition.quantity > 0,
-    )
-    sell_symbol_conditions = [
-        ExecutionPlanItem.symbol.in_(held_symbols),
-        _unexited_buy_sell_monitor_fallback_filter(settings=settings),
-    ]
-    monitored_item_filter = and_(
-        monitored_item_filter,
-        or_(
-            ExecutionPlanItem.side != "sell",
-            or_(*sell_symbol_conditions),
-        ),
-    )
-    return list(
+    held_symbols = set(
         db.scalars(
-            select(ExecutionPlanItem.symbol)
-            .join(ExecutionPlanItem.plan)
+            select(ExecutionPosition.symbol)
             .where(
-                ExecutionPlan.mode == settings.runtime_mode,
-                monitored_item_filter,
-                ~ExecutionPlanItem.status.in_(tuple(NON_MONITORABLE_PLAN_ITEM_STATUSES)),
+                ExecutionPosition.mode == settings.runtime_mode,
+                ExecutionPosition.quantity > 0,
             )
-            .group_by(ExecutionPlanItem.symbol)
-            .order_by(func.min(ExecutionPlan.accepted_at).asc(), ExecutionPlanItem.symbol.asc())
-            .limit(settings.monitoring_max_symbols_per_cycle)
+            .order_by(ExecutionPosition.symbol.asc())
         ).all()
     )
+    mode_plan_ids = select(ExecutionPlan.id).where(ExecutionPlan.mode == settings.runtime_mode)
+    symbol_candidates: list[str] = []
+
+    def append_candidates(rows: list[str]) -> None:
+        for symbol in rows:
+            if symbol and symbol not in symbol_candidates:
+                symbol_candidates.append(symbol)
+            if len(symbol_candidates) >= settings.monitoring_max_symbols_per_cycle:
+                return
+
+    if held_symbols:
+        append_candidates(
+            list(
+                db.scalars(
+                    select(distinct(ExecutionPlanItem.symbol))
+                    .where(
+                        ExecutionPlanItem.execution_plan_id.in_(mode_plan_ids),
+                        ExecutionPlanItem.symbol.in_(sorted(held_symbols)),
+                        ExecutionPlanItem.side == "sell",
+                        ExecutionPlanItem.intent.in_(tuple(SELL_MONITORED_INTENTS)),
+                        ExecutionPlanItem.status.in_(
+                            tuple(
+                                SELL_ACTIVE_MONITORING_STATUSES
+                                | SELL_PENDING_CONFIG_STATUSES
+                                | BLOCKED_MONITORING_STATUSES
+                                | PENDING_DISPATCH_MONITORING_STATUSES
+                            )
+                        ),
+                    )
+                    .order_by(ExecutionPlanItem.symbol.asc())
+                    .limit(settings.monitoring_max_symbols_per_cycle)
+                ).all()
+            )
+        )
+
+    if len(symbol_candidates) < settings.monitoring_max_symbols_per_cycle:
+        pending_sell_symbols = list(
+            db.scalars(
+                select(distinct(ExecutionPlanItem.symbol))
+                .where(
+                    ExecutionPlanItem.execution_plan_id.in_(mode_plan_ids),
+                    ExecutionPlanItem.side == "sell",
+                    ExecutionPlanItem.intent.in_(tuple(SELL_MONITORED_INTENTS)),
+                    ExecutionPlanItem.status.in_(tuple(SELL_PENDING_CONFIG_STATUSES)),
+                )
+                .order_by(ExecutionPlanItem.symbol.asc())
+                .limit(settings.monitoring_max_symbols_per_cycle * 4)
+            ).all()
+        )
+        fallback_symbols: list[str] = []
+        for symbol in pending_sell_symbols:
+            if symbol in symbol_candidates:
+                continue
+            if settings.runtime_mode == "live" and _has_recent_flat_position_truth_for_symbol(
+                settings=settings,
+                db=db,
+                symbol=symbol,
+            ):
+                continue
+            if _has_unexited_buy_order_for_symbol(
+                settings=settings,
+                db=db,
+                symbol=symbol,
+            ):
+                fallback_symbols.append(symbol)
+            if len(symbol_candidates) + len(fallback_symbols) >= settings.monitoring_max_symbols_per_cycle:
+                break
+        append_candidates(fallback_symbols)
+
+    if len(symbol_candidates) < settings.monitoring_max_symbols_per_cycle:
+        append_candidates(
+            list(
+                db.scalars(
+                    select(distinct(ExecutionPlanItem.symbol))
+                    .where(
+                        ExecutionPlanItem.execution_plan_id.in_(mode_plan_ids),
+                        ExecutionPlanItem.side == "buy",
+                        ExecutionPlanItem.intent.in_(tuple(WATCH_BUY_INTENTS)),
+                        ExecutionPlanItem.status.in_(tuple(WATCH_MONITORING_STATUSES)),
+                    )
+                    .order_by(ExecutionPlanItem.symbol.asc())
+                    .limit(settings.monitoring_max_symbols_per_cycle - len(symbol_candidates))
+                ).all()
+            )
+        )
+
+    return symbol_candidates
 
 
 def expire_known_flat_pending_sell_monitors(
@@ -568,26 +664,52 @@ def release_disabled_account_drawdown_watch_buy_blocks(
     settings: Settings,
     db: Session,
     released_at: datetime | None = None,
+    symbols: set[str] | None = None,
 ) -> int:
     if settings.account_drawdown_gate_enabled:
         return 0
     released_at = _normalize_utc(released_at or datetime.now(UTC))
+    where = [
+        ExecutionPlan.mode == settings.runtime_mode,
+        BrokerOrder.side == "buy",
+        BrokerOrder.status == "rejected",
+        BrokerOrder.broker_order_id.is_(None),
+        BrokerOrder.last_error_classification == "validation",
+        BrokerOrder.response_metadata["account_drawdown_gate"].is_not(None),
+        ExecutionPlanItem.side == "buy",
+        ExecutionPlanItem.intent.in_(tuple(WATCH_BUY_INTENTS)),
+        ExecutionPlanItem.status.in_(("watch_buy_triggered_blocked", "new_buy_blocked")),
+    ]
+    if symbols:
+        where.append(ExecutionPlanItem.symbol.in_(sorted(symbols)))
     orders = db.scalars(
         select(BrokerOrder)
         .join(BrokerOrder.plan_item)
         .join(ExecutionPlanItem.plan)
-        .where(
-            ExecutionPlan.mode == settings.runtime_mode,
-            BrokerOrder.side == "buy",
-            BrokerOrder.status == "rejected",
-            BrokerOrder.broker_order_id.is_(None),
-            BrokerOrder.last_error_classification == "validation",
-            BrokerOrder.response_metadata["account_drawdown_gate"].is_not(None),
-            ExecutionPlanItem.side == "buy",
-            ExecutionPlanItem.intent.in_(tuple(WATCH_BUY_INTENTS)),
-            ExecutionPlanItem.status.in_(("watch_buy_triggered_blocked", "new_buy_blocked")),
+        .where(*where)
+        .options(
+            load_only(
+                BrokerOrder.id,
+                BrokerOrder.execution_plan_item_id,
+                BrokerOrder.idempotency_key,
+                BrokerOrder.broker_order_id,
+                BrokerOrder.symbol,
+                BrokerOrder.side,
+                BrokerOrder.status,
+                BrokerOrder.last_error_classification,
+                BrokerOrder.response_metadata,
+                BrokerOrder.created_at,
+            ),
+            selectinload(BrokerOrder.plan_item).load_only(
+                ExecutionPlanItem.id,
+                ExecutionPlanItem.execution_plan_id,
+                ExecutionPlanItem.symbol,
+                ExecutionPlanItem.side,
+                ExecutionPlanItem.intent,
+                ExecutionPlanItem.status,
+                ExecutionPlanItem.risk_context,
+            ),
         )
-        .options(selectinload(BrokerOrder.plan_item))
         .order_by(BrokerOrder.created_at.asc(), BrokerOrder.id.asc())
     ).all()
 
@@ -648,6 +770,7 @@ def _evaluate_monitoring_cycle(
     db: Session,
     adapter: BrokerAdapter,
     prices: dict[str, MonitoringPriceRequest],
+    symbols: set[str] | None = None,
     triggered_at: datetime,
     allow_persisted_triggered_without_price: bool,
     update_checkpoint_if_idle: bool,
@@ -656,6 +779,7 @@ def _evaluate_monitoring_cycle(
         settings=settings,
         db=db,
         released_at=triggered_at,
+        symbols=symbols,
     )
     if released_drawdown_blocks:
         db.flush()
@@ -663,6 +787,7 @@ def _evaluate_monitoring_cycle(
         settings=settings,
         db=db,
         exclude_pending_config=allow_persisted_triggered_without_price,
+        symbols=symbols,
     )
     _reactivate_retryable_protective_stops(
         items=items,
@@ -684,10 +809,12 @@ def _evaluate_monitoring_cycle(
         settings=settings,
         db=db,
         adapter=adapter,
+        symbols=symbols,
     )
     positions_by_symbol = _load_positions_by_symbol(
         settings=settings,
         db=db,
+        symbols=symbols,
     )
     post_entry_maintenance_count, post_entry_review_count = _maintain_post_entry_exit_monitors(
         settings=settings,
@@ -702,11 +829,13 @@ def _evaluate_monitoring_cycle(
             settings=settings,
             db=db,
             exclude_pending_config=allow_persisted_triggered_without_price,
+            symbols=symbols,
         )
     coverage_issues, repaired_stop_coverage_count = _repair_unprotected_stop_coverage(
         settings=settings,
         db=db,
         positions_by_symbol=positions_by_symbol,
+        symbols=symbols,
         triggered_at=triggered_at,
     )
     if repaired_stop_coverage_count:
@@ -715,6 +844,7 @@ def _evaluate_monitoring_cycle(
             settings=settings,
             db=db,
             exclude_pending_config=allow_persisted_triggered_without_price,
+            symbols=symbols,
         )
         items = [
             item
@@ -1527,7 +1657,25 @@ def expire_prior_market_date_unfilled_watch_buys(
             expiry_market_date < current_market_date,
             ~ExecutionPlanItem.broker_orders.any(),
         )
-        .options(selectinload(ExecutionPlanItem.plan))
+        .options(
+            load_only(
+                ExecutionPlanItem.id,
+                ExecutionPlanItem.execution_plan_id,
+                ExecutionPlanItem.plan_item_index,
+                ExecutionPlanItem.symbol,
+                ExecutionPlanItem.side,
+                ExecutionPlanItem.intent,
+                ExecutionPlanItem.status,
+                ExecutionPlanItem.risk_context,
+                ExecutionPlanItem.source_market_date,
+            ),
+            selectinload(ExecutionPlanItem.plan).load_only(
+                ExecutionPlan.id,
+                ExecutionPlan.mode,
+                ExecutionPlan.market_date,
+                ExecutionPlan.accepted_at,
+            ),
+        )
         .order_by(
             ExecutionPlan.accepted_at.asc(),
             ExecutionPlan.id.asc(),
@@ -1894,13 +2042,21 @@ def _load_monitored_items(
     settings: Settings,
     db: Session,
     exclude_pending_config: bool = False,
+    symbols: set[str] | None = None,
 ) -> list[ExecutionPlanItem]:
     monitored_item_filter = _monitored_item_filter()
+    if symbols:
+        monitored_item_filter = and_(
+            monitored_item_filter,
+            ExecutionPlanItem.symbol.in_(sorted(symbols)),
+        )
     if exclude_pending_config:
         held_symbols = select(ExecutionPosition.symbol).where(
             ExecutionPosition.mode == settings.runtime_mode,
             ExecutionPosition.quantity > 0,
         )
+        if symbols:
+            held_symbols = held_symbols.where(ExecutionPosition.symbol.in_(sorted(symbols)))
         sell_symbol_conditions = [
             ExecutionPlanItem.symbol.in_(held_symbols),
             _unexited_buy_sell_monitor_fallback_filter(settings=settings),
@@ -1912,6 +2068,99 @@ def _load_monitored_items(
                 or_(*sell_symbol_conditions),
             ),
         )
+    if symbols:
+        symbol_list = sorted(symbols)
+        sell_fast_statuses = (
+            SELL_ACTIVE_MONITORING_STATUSES
+            | BLOCKED_MONITORING_STATUSES
+            | PENDING_DISPATCH_MONITORING_STATUSES
+            | AGENT_ACTIVE_STATUSES
+        )
+        if not exclude_pending_config:
+            sell_fast_statuses = sell_fast_statuses | SELL_PENDING_CONFIG_STATUSES
+        sell_items = db.scalars(
+            select(ExecutionPlanItem)
+            .where(
+                ExecutionPlanItem.symbol.in_(symbol_list),
+                ExecutionPlanItem.side == "sell",
+                ExecutionPlanItem.intent.in_(tuple(SELL_MONITORED_INTENTS)),
+                ExecutionPlanItem.status.in_(tuple(sell_fast_statuses)),
+            )
+            .options(
+                load_only(
+                    ExecutionPlanItem.id,
+                    ExecutionPlanItem.execution_plan_id,
+                    ExecutionPlanItem.plan_item_index,
+                    ExecutionPlanItem.symbol,
+                    ExecutionPlanItem.side,
+                    ExecutionPlanItem.intent,
+                    ExecutionPlanItem.status,
+                    ExecutionPlanItem.quantity_policy,
+                    ExecutionPlanItem.limit_price,
+                    ExecutionPlanItem.trigger_price,
+                    ExecutionPlanItem.time_in_force,
+                    ExecutionPlanItem.source_market_date,
+                ),
+                selectinload(ExecutionPlanItem.plan).load_only(
+                    ExecutionPlan.id,
+                    ExecutionPlan.mode,
+                    ExecutionPlan.market_date,
+                    ExecutionPlan.accepted_at,
+                )
+            )
+            .order_by(
+                ExecutionPlanItem.symbol.asc(),
+                ExecutionPlanItem.plan_item_index.asc(),
+                ExecutionPlanItem.id.asc(),
+            )
+            .limit(settings.monitoring_max_symbols_per_cycle * 16)
+        ).all()
+        buy_items = db.scalars(
+            select(ExecutionPlanItem)
+            .where(
+                ExecutionPlanItem.symbol.in_(symbol_list),
+                ExecutionPlanItem.side == "buy",
+                ExecutionPlanItem.intent.in_(tuple(WATCH_BUY_INTENTS)),
+                ExecutionPlanItem.status.in_(tuple(WATCH_MONITORING_STATUSES)),
+            )
+            .options(
+                load_only(
+                    ExecutionPlanItem.id,
+                    ExecutionPlanItem.execution_plan_id,
+                    ExecutionPlanItem.plan_item_index,
+                    ExecutionPlanItem.symbol,
+                    ExecutionPlanItem.side,
+                    ExecutionPlanItem.intent,
+                    ExecutionPlanItem.status,
+                    ExecutionPlanItem.quantity_policy,
+                    ExecutionPlanItem.limit_price,
+                    ExecutionPlanItem.trigger_price,
+                    ExecutionPlanItem.time_in_force,
+                    ExecutionPlanItem.source_market_date,
+                ),
+                selectinload(ExecutionPlanItem.plan).load_only(
+                    ExecutionPlan.id,
+                    ExecutionPlan.mode,
+                    ExecutionPlan.market_date,
+                    ExecutionPlan.accepted_at,
+                )
+            )
+            .order_by(
+                ExecutionPlanItem.symbol.asc(),
+                ExecutionPlanItem.plan_item_index.asc(),
+                ExecutionPlanItem.id.asc(),
+            )
+            .limit(settings.monitoring_max_symbols_per_cycle * 16)
+        ).all()
+        selected_items = sorted(
+            [*sell_items, *buy_items],
+            key=lambda item: (
+                item.symbol,
+                item.plan_item_index,
+                item.id,
+            ),
+        )
+        return selected_items
     latest_plan_candidates = (
         select(
             ExecutionPlanItem.symbol.label("symbol"),
@@ -1958,7 +2207,28 @@ def _load_monitored_items(
             monitored_item_filter,
             tuple_(ExecutionPlanItem.symbol, ExecutionPlanItem.execution_plan_id).in_(selected_symbol_plans),
         )
-        .options(selectinload(ExecutionPlanItem.plan))
+        .options(
+            load_only(
+                ExecutionPlanItem.id,
+                ExecutionPlanItem.execution_plan_id,
+                ExecutionPlanItem.plan_item_index,
+                ExecutionPlanItem.symbol,
+                ExecutionPlanItem.side,
+                ExecutionPlanItem.intent,
+                ExecutionPlanItem.status,
+                ExecutionPlanItem.quantity_policy,
+                ExecutionPlanItem.limit_price,
+                ExecutionPlanItem.trigger_price,
+                ExecutionPlanItem.time_in_force,
+                ExecutionPlanItem.source_market_date,
+            ),
+            selectinload(ExecutionPlanItem.plan).load_only(
+                ExecutionPlan.id,
+                ExecutionPlan.mode,
+                ExecutionPlan.market_date,
+                ExecutionPlan.accepted_at,
+            ),
+        )
         .order_by(
             ExecutionPlan.accepted_at.asc(),
             ExecutionPlan.id.asc(),
@@ -1970,12 +2240,14 @@ def _load_monitored_items(
         settings=settings,
         db=db,
         selected_items=selected_items,
+        symbols=symbols,
     )
     return _append_held_stop_sell_fallbacks(
         settings=settings,
         db=db,
         monitored_item_filter=monitored_item_filter,
         selected_items=selected_items,
+        symbols=symbols,
     )
 
 
@@ -2036,13 +2308,17 @@ def _append_held_active_sell_monitor_reconciliations(
     settings: Settings,
     db: Session,
     selected_items: list[ExecutionPlanItem],
+    symbols: set[str] | None = None,
 ) -> list[ExecutionPlanItem]:
+    held_where = [
+        ExecutionPosition.mode == settings.runtime_mode,
+        ExecutionPosition.quantity > 0,
+    ]
+    if symbols:
+        held_where.append(ExecutionPosition.symbol.in_(sorted(symbols)))
     held_symbols = set(
         db.scalars(
-            select(ExecutionPosition.symbol).where(
-                ExecutionPosition.mode == settings.runtime_mode,
-                ExecutionPosition.quantity > 0,
-            )
+            select(ExecutionPosition.symbol).where(*held_where)
         ).all()
     )
     if not held_symbols:
@@ -2070,7 +2346,24 @@ def _append_held_active_sell_monitor_reconciliations(
             ExecutionPlanItem.status.in_(tuple(SELL_ACTIVE_MONITORING_STATUSES)),
             ExecutionPlanItem.symbol.in_(eligible_symbols),
         )
-        .options(selectinload(ExecutionPlanItem.plan))
+        .options(
+            load_only(
+                ExecutionPlanItem.id,
+                ExecutionPlanItem.execution_plan_id,
+                ExecutionPlanItem.plan_item_index,
+                ExecutionPlanItem.symbol,
+                ExecutionPlanItem.side,
+                ExecutionPlanItem.intent,
+                ExecutionPlanItem.status,
+                ExecutionPlanItem.risk_context,
+            ),
+            selectinload(ExecutionPlanItem.plan).load_only(
+                ExecutionPlan.id,
+                ExecutionPlan.mode,
+                ExecutionPlan.market_date,
+                ExecutionPlan.accepted_at,
+            ),
+        )
         .order_by(
             ExecutionPlan.accepted_at.asc(),
             ExecutionPlan.id.asc(),
@@ -2120,18 +2413,22 @@ def _append_held_stop_sell_fallbacks(
     db: Session,
     monitored_item_filter,
     selected_items: list[ExecutionPlanItem],
+    symbols: set[str] | None = None,
 ) -> list[ExecutionPlanItem]:
     symbols_with_stop = {
         item.symbol
         for item in selected_items
         if item.side == "sell" and item.intent == "stop_sell"
     }
+    held_where = [
+        ExecutionPosition.mode == settings.runtime_mode,
+        ExecutionPosition.quantity > 0,
+    ]
+    if symbols:
+        held_where.append(ExecutionPosition.symbol.in_(sorted(symbols)))
     held_symbols = set(
         db.scalars(
-            select(ExecutionPosition.symbol).where(
-                ExecutionPosition.mode == settings.runtime_mode,
-                ExecutionPosition.quantity > 0,
-            )
+            select(ExecutionPosition.symbol).where(*held_where)
         ).all()
     )
     fallback_symbols = held_symbols - symbols_with_stop
@@ -2185,7 +2482,24 @@ def _append_held_stop_sell_fallbacks(
                 ExecutionPlan.mode == settings.runtime_mode,
                 ExecutionPlanItem.id.in_(fallback_item_ids),
             )
-            .options(selectinload(ExecutionPlanItem.plan))
+            .options(
+                load_only(
+                    ExecutionPlanItem.id,
+                    ExecutionPlanItem.execution_plan_id,
+                    ExecutionPlanItem.plan_item_index,
+                    ExecutionPlanItem.symbol,
+                    ExecutionPlanItem.side,
+                    ExecutionPlanItem.intent,
+                    ExecutionPlanItem.status,
+                    ExecutionPlanItem.risk_context,
+                ),
+                selectinload(ExecutionPlanItem.plan).load_only(
+                    ExecutionPlan.id,
+                    ExecutionPlan.mode,
+                    ExecutionPlan.market_date,
+                    ExecutionPlan.accepted_at,
+                ),
+            )
             .order_by(
                 ExecutionPlan.accepted_at.asc(),
                 ExecutionPlan.id.asc(),
@@ -2245,6 +2559,7 @@ def _repair_unprotected_stop_coverage(
     settings: Settings,
     db: Session,
     positions_by_symbol: dict[str, ExecutionPosition],
+    symbols: set[str] | None = None,
     triggered_at: datetime,
 ) -> tuple[list[ProtectiveStopCoverageIssue], int]:
     positions = {
@@ -2257,6 +2572,7 @@ def _repair_unprotected_stop_coverage(
             settings=settings,
             db=db,
             trusted_position_symbols=set(),
+            symbols=symbols or set(positions_by_symbol) or None,
             triggered_at=triggered_at,
         ), 0
 
@@ -2269,7 +2585,33 @@ def _repair_unprotected_stop_coverage(
             ExecutionPlanItem.side == "sell",
             ExecutionPlanItem.intent == "stop_sell",
         )
-        .options(selectinload(ExecutionPlanItem.plan))
+        .options(
+            load_only(
+                ExecutionPlanItem.id,
+                ExecutionPlanItem.execution_plan_id,
+                ExecutionPlanItem.plan_item_index,
+                ExecutionPlanItem.symbol,
+                ExecutionPlanItem.side,
+                ExecutionPlanItem.intent,
+                ExecutionPlanItem.status,
+                ExecutionPlanItem.quantity_policy,
+                ExecutionPlanItem.limit_price,
+                ExecutionPlanItem.trigger_price,
+                ExecutionPlanItem.time_in_force,
+                ExecutionPlanItem.risk_context,
+                ExecutionPlanItem.decision_agent_name,
+                ExecutionPlanItem.decision_snapshot_id,
+                ExecutionPlanItem.decision_run_id,
+                ExecutionPlanItem.source_plan_item_id,
+                ExecutionPlanItem.source_market_date,
+            ),
+            selectinload(ExecutionPlanItem.plan).load_only(
+                ExecutionPlan.id,
+                ExecutionPlan.mode,
+                ExecutionPlan.market_date,
+                ExecutionPlan.accepted_at,
+            ),
+        )
         .order_by(
             ExecutionPlan.market_date.desc(),
             ExecutionPlan.accepted_at.desc(),
@@ -2364,6 +2706,7 @@ def _repair_unprotected_stop_coverage(
             settings=settings,
             db=db,
             trusted_position_symbols=set(positions),
+            symbols=symbols or set(positions_by_symbol) or None,
             triggered_at=triggered_at,
         )
     )
@@ -2415,9 +2758,14 @@ def _stale_position_truth_issues(
     settings: Settings,
     db: Session,
     trusted_position_symbols: set[str],
+    symbols: set[str] | None = None,
     triggered_at: datetime,
 ) -> list[ProtectiveStopCoverageIssue]:
-    evidence_by_symbol = _position_truth_evidence_by_symbol(settings=settings, db=db)
+    evidence_by_symbol = _position_truth_evidence_by_symbol(
+        settings=settings,
+        db=db,
+        symbols=symbols,
+    )
     if not evidence_by_symbol:
         return []
 
@@ -2474,27 +2822,35 @@ def _position_truth_evidence_by_symbol(
     *,
     settings: Settings,
     db: Session,
+    symbols: set[str] | None = None,
 ) -> dict[str, list[str]]:
     evidence_by_symbol: dict[str, set[str]] = {}
+    symbol_list = sorted(symbols) if symbols else None
 
+    active_order_where = [
+        BrokerOrder.mode == settings.runtime_mode,
+        BrokerOrder.status.in_(("submitted", "open", "partially_filled")),
+    ]
+    if symbol_list:
+        active_order_where.append(BrokerOrder.symbol.in_(symbol_list))
     active_order_rows = db.execute(
         select(BrokerOrder.symbol, BrokerOrder.side, BrokerOrder.status)
-        .where(
-            BrokerOrder.mode == settings.runtime_mode,
-            BrokerOrder.status.in_(("submitted", "open", "partially_filled")),
-        )
+        .where(*active_order_where)
     ).all()
     for symbol, side, status in active_order_rows:
         evidence_by_symbol.setdefault(str(symbol), set()).add(f"broker_order:{side}:{status}")
 
+    filled_buy_where = [
+        BrokerOrder.mode == settings.runtime_mode,
+        BrokerOrder.side == "buy",
+        BrokerOrder.status == "filled",
+    ]
+    if symbol_list:
+        filled_buy_where.append(BrokerOrder.symbol.in_(symbol_list))
     filled_buy_symbols = set(
         db.scalars(
             select(BrokerOrder.symbol)
-            .where(
-                BrokerOrder.mode == settings.runtime_mode,
-                BrokerOrder.side == "buy",
-                BrokerOrder.status == "filled",
-            )
+            .where(*filled_buy_where)
             .distinct()
         ).all()
     )
@@ -2502,15 +2858,18 @@ def _position_truth_evidence_by_symbol(
         if _has_unexited_buy_order_for_symbol(settings=settings, db=db, symbol=str(symbol)):
             evidence_by_symbol.setdefault(str(symbol), set()).add("broker_order:buy:filled_unexited")
 
+    sell_where = [
+        ExecutionPlan.mode == settings.runtime_mode,
+        ExecutionPlanItem.side == "sell",
+        ExecutionPlanItem.intent.in_(tuple(SELL_MONITORED_INTENTS)),
+        ExecutionPlanItem.status.in_(tuple(SELL_STALE_FLAT_EXPIRABLE_STATUSES | {"expired"})),
+    ]
+    if symbol_list:
+        sell_where.append(ExecutionPlanItem.symbol.in_(symbol_list))
     sell_rows = db.execute(
         select(ExecutionPlanItem.symbol, ExecutionPlanItem.status)
         .join(ExecutionPlanItem.plan)
-        .where(
-            ExecutionPlan.mode == settings.runtime_mode,
-            ExecutionPlanItem.side == "sell",
-            ExecutionPlanItem.intent.in_(tuple(SELL_MONITORED_INTENTS)),
-            ExecutionPlanItem.status.in_(tuple(SELL_STALE_FLAT_EXPIRABLE_STATUSES | {"expired"})),
-        )
+        .where(*sell_where)
     ).all()
     for symbol, status in sell_rows:
         evidence_by_symbol.setdefault(str(symbol), set()).add(f"sell_monitor:{status}")
@@ -2563,6 +2922,23 @@ def _stop_items_for_symbol(
             ExecutionPlanItem.symbol == symbol,
             ExecutionPlanItem.side == "sell",
             ExecutionPlanItem.intent == "stop_sell",
+        )
+        .options(
+            load_only(
+                ExecutionPlanItem.id,
+                ExecutionPlanItem.execution_plan_id,
+                ExecutionPlanItem.plan_item_index,
+                ExecutionPlanItem.symbol,
+                ExecutionPlanItem.side,
+                ExecutionPlanItem.intent,
+                ExecutionPlanItem.status,
+                ExecutionPlanItem.quantity_policy,
+                ExecutionPlanItem.limit_price,
+                ExecutionPlanItem.trigger_price,
+                ExecutionPlanItem.time_in_force,
+                ExecutionPlanItem.risk_context,
+                ExecutionPlanItem.source_market_date,
+            )
         )
         .order_by(
             ExecutionPlan.market_date.desc(),
@@ -2728,6 +3104,18 @@ def _latest_order_failure_is_retryable_session_rejection(
     order = db.scalar(
         select(BrokerOrder)
         .where(BrokerOrder.execution_plan_item_id == item.id)
+        .options(
+            load_only(
+                BrokerOrder.id,
+                BrokerOrder.execution_plan_item_id,
+                BrokerOrder.status,
+                BrokerOrder.last_error_code,
+                BrokerOrder.last_error_classification,
+                BrokerOrder.last_error_message,
+                BrokerOrder.updated_at,
+                BrokerOrder.created_at,
+            )
+        )
         .order_by(
             BrokerOrder.updated_at.desc(),
             BrokerOrder.created_at.desc(),
@@ -2838,6 +3226,28 @@ def _has_recent_flat_position_truth_filter(*, settings: Settings):
         .correlate(ExecutionPlanItem)
         .exists()
     )
+
+
+def _has_recent_flat_position_truth_for_symbol(
+    *,
+    settings: Settings,
+    db: Session,
+    symbol: str,
+) -> bool:
+    stale_before = datetime.now(UTC) - timedelta(
+        seconds=settings.exec_agent_max_account_snapshot_age_seconds
+    )
+    return db.scalar(
+        select(ExecutionPosition.id)
+        .where(
+            ExecutionPosition.mode == settings.runtime_mode,
+            ExecutionPosition.symbol == symbol,
+            ExecutionPosition.quantity <= 0,
+            ExecutionPosition.last_reconciled_at.is_not(None),
+            ExecutionPosition.last_reconciled_at >= stale_before,
+        )
+        .limit(1)
+    ) is not None
 
 
 def _load_positions_by_symbol(
@@ -2954,7 +3364,40 @@ def _latest_filled_buy_order(
             BrokerOrder.status == "filled",
             ExecutionPlan.mode == settings.runtime_mode,
         )
-        .options(selectinload(BrokerOrder.plan_item).selectinload(ExecutionPlanItem.plan))
+        .options(
+            load_only(
+                BrokerOrder.id,
+                BrokerOrder.execution_plan_item_id,
+                BrokerOrder.symbol,
+                BrokerOrder.side,
+                BrokerOrder.status,
+                BrokerOrder.quantity,
+                BrokerOrder.limit_price,
+                BrokerOrder.submitted_at,
+                BrokerOrder.updated_at,
+                BrokerOrder.created_at,
+            ),
+            selectinload(BrokerOrder.plan_item).load_only(
+                ExecutionPlanItem.id,
+                ExecutionPlanItem.execution_plan_id,
+                ExecutionPlanItem.plan_item_index,
+                ExecutionPlanItem.symbol,
+                ExecutionPlanItem.side,
+                ExecutionPlanItem.intent,
+                ExecutionPlanItem.status,
+                ExecutionPlanItem.quantity_policy,
+                ExecutionPlanItem.limit_price,
+                ExecutionPlanItem.trigger_price,
+                ExecutionPlanItem.time_in_force,
+                ExecutionPlanItem.risk_context,
+                ExecutionPlanItem.source_market_date,
+            ).selectinload(ExecutionPlanItem.plan).load_only(
+                ExecutionPlan.id,
+                ExecutionPlan.mode,
+                ExecutionPlan.market_date,
+                ExecutionPlan.accepted_at,
+            ),
+        )
         .order_by(
             BrokerOrder.submitted_at.desc(),
             BrokerOrder.updated_at.desc(),
@@ -3367,6 +3810,15 @@ def _latest_reconciliation_error_for_symbol(
             BrokerOrder.symbol == symbol,
             BrokerOrder.last_error_message.is_not(None),
         )
+        .options(
+            load_only(
+                BrokerOrder.id,
+                BrokerOrder.symbol,
+                BrokerOrder.last_error_message,
+                BrokerOrder.last_broker_sync_at,
+                BrokerOrder.updated_at,
+            )
+        )
         .order_by(BrokerOrder.last_broker_sync_at.desc(), BrokerOrder.updated_at.desc())
         .limit(1)
     )
@@ -3453,14 +3905,17 @@ def _refresh_position_truth_if_stale(
     settings: Settings,
     db: Session,
     adapter: BrokerAdapter,
+    symbols: set[str] | None = None,
 ) -> None:
-    if settings.runtime_mode != "live":
-        return
+    symbol_list = sorted(symbols) if symbols else None
+    where = [
+        ExecutionPosition.mode == settings.runtime_mode,
+        ExecutionPosition.quantity > 0,
+    ]
+    if symbol_list:
+        where.append(ExecutionPosition.symbol.in_(symbol_list))
     latest_reconciled_at = db.scalar(
-        select(func.max(ExecutionPosition.last_reconciled_at)).where(
-            ExecutionPosition.mode == settings.runtime_mode,
-            ExecutionPosition.quantity > 0,
-        )
+        select(func.max(ExecutionPosition.last_reconciled_at)).where(*where)
     )
     stale_before = datetime.now(UTC) - timedelta(
         seconds=settings.exec_agent_max_account_snapshot_age_seconds
@@ -3472,7 +3927,7 @@ def _refresh_position_truth_if_stale(
             settings=settings,
             db=db,
             adapter=adapter,
-            symbols=None,
+            symbols=set(symbol_list) if symbol_list else None,
         )
     except Exception:
         return
@@ -4523,6 +4978,17 @@ def _local_open_buy_order_notional(
             BrokerOrder.side == "buy",
             BrokerOrder.status.in_(tuple(OPEN_BUY_ORDER_STATUSES)),
         )
+        .options(
+            load_only(
+                BrokerOrder.id,
+                BrokerOrder.idempotency_key,
+                BrokerOrder.broker_order_id,
+                BrokerOrder.side,
+                BrokerOrder.status,
+                BrokerOrder.quantity,
+                BrokerOrder.limit_price,
+            )
+        )
     ).all()
     total = Decimal("0")
     for order in orders:
@@ -4659,6 +5125,19 @@ def _load_daily_new_buy_notional(
                 )
             ),
         )
+        .options(
+            load_only(
+                ExecutionPlanItem.id,
+                ExecutionPlanItem.execution_plan_id,
+                ExecutionPlanItem.symbol,
+                ExecutionPlanItem.side,
+                ExecutionPlanItem.status,
+                ExecutionPlanItem.quantity_policy,
+                ExecutionPlanItem.limit_price,
+                ExecutionPlanItem.trigger_price,
+                ExecutionPlanItem.risk_context,
+            )
+        )
     ).all()
     total = Decimal("0")
     for item in items:
@@ -4776,6 +5255,16 @@ def _reserve_existing_exit_orders(
             BrokerOrder.symbol.in_(sorted(remaining_quantities_by_symbol)),
             BrokerOrder.status.in_(("submitted", "open", "partially_filled", "filled")),
             BrokerOrder.updated_at >= day_start,
+        )
+        .options(
+            load_only(
+                BrokerOrder.id,
+                BrokerOrder.symbol,
+                BrokerOrder.side,
+                BrokerOrder.status,
+                BrokerOrder.quantity,
+                BrokerOrder.updated_at,
+            )
         )
         .order_by(BrokerOrder.updated_at.asc(), BrokerOrder.id.asc())
     ).all()
