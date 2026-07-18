@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from sqlalchemy import or_, select
-from sqlalchemy.orm import Session, selectinload
+from sqlalchemy.orm import Session, load_only, selectinload
 
 from app.core.config import Settings, load_settings
 from app.db.session import create_db_engine, create_session_factory
@@ -41,6 +41,8 @@ BROKER_BALANCE_OUTPUT2_FIELDS = (
     "evlu_amt_smtl_amt",
     "dnca_tot_amt",
 )
+BROKER_BALANCE_SNAPSHOT_CANDIDATE_LIMIT = 16
+SECTOR_LOOKBACK_PER_SYMBOL = 20
 
 
 @dataclass(frozen=True)
@@ -167,9 +169,36 @@ def _load_fills(*, settings: Settings, db: Session) -> list[ExecutionFill]:
                 BrokerOrder.mode == settings.runtime_mode,
             )
             .options(
+                load_only(
+                    ExecutionFill.id,
+                    ExecutionFill.broker_order_pk,
+                    ExecutionFill.broker_fill_id,
+                    ExecutionFill.idempotency_key,
+                    ExecutionFill.symbol,
+                    ExecutionFill.side,
+                    ExecutionFill.quantity,
+                    ExecutionFill.price,
+                    ExecutionFill.filled_at,
+                ),
+                selectinload(ExecutionFill.broker_order).load_only(
+                    BrokerOrder.id,
+                    BrokerOrder.execution_plan_item_id,
+                    BrokerOrder.broker_order_id,
+                    BrokerOrder.symbol,
+                    BrokerOrder.side,
+                    BrokerOrder.mode,
+                ),
                 selectinload(ExecutionFill.broker_order)
                 .selectinload(BrokerOrder.plan_item)
-                .selectinload(ExecutionPlanItem.plan)
+                .load_only(
+                    ExecutionPlanItem.id,
+                    ExecutionPlanItem.intent,
+                    ExecutionPlanItem.source_plan_item_id,
+                    ExecutionPlanItem.decision_run_id,
+                    ExecutionPlanItem.decision_agent_name,
+                    ExecutionPlanItem.risk_context,
+                    ExecutionPlanItem.quantity_policy,
+                ),
             )
             .order_by(ExecutionFill.symbol.asc(), ExecutionFill.filled_at.asc(), ExecutionFill.id.asc())
         )
@@ -302,8 +331,13 @@ def _broker_asset_performance(
     started_at: datetime,
     as_of: datetime,
 ) -> dict[str, object]:
-    positions = _load_all_positions(settings=settings, db=db)
-    snapshots = _broker_balance_snapshots(positions)
+    snapshot_positions = _load_broker_balance_snapshot_positions(
+        settings=settings,
+        db=db,
+        started_at=started_at,
+        lookback_days=lookback_days,
+    )
+    snapshots = _broker_balance_snapshots(snapshot_positions)
     if not snapshots:
         return _broker_asset_unavailable(
             f"execution_positions raw broker balance payload unavailable for mode={settings.runtime_mode}; "
@@ -340,6 +374,7 @@ def _broker_asset_performance(
         )
 
     position = snapshot.position
+    positions = _load_positions(settings=settings, db=db)
     balance = snapshot.balance
     output2 = snapshot.output2
     raw_balance_valid = broker_raw_balance_is_valid(position.raw_payload)
@@ -401,14 +436,57 @@ def _broker_asset_performance(
     }
 
 
-def _load_all_positions(*, settings: Settings, db: Session) -> list[ExecutionPosition]:
-    return list(
-        db.scalars(
-            select(ExecutionPosition)
-            .where(ExecutionPosition.mode == settings.runtime_mode)
-            .order_by(ExecutionPosition.last_reconciled_at.desc().nulls_last(), ExecutionPosition.updated_at.desc())
+def _load_broker_balance_snapshot_positions(
+    *,
+    settings: Settings,
+    db: Session,
+    started_at: datetime,
+    lookback_days: int,
+) -> list[ExecutionPosition]:
+    base_query = (
+        select(ExecutionPosition)
+        .where(
+            ExecutionPosition.mode == settings.runtime_mode,
+            ExecutionPosition.raw_payload.is_not(None),
+        )
+        .options(
+            load_only(
+                ExecutionPosition.id,
+                ExecutionPosition.symbol,
+                ExecutionPosition.quantity,
+                ExecutionPosition.base_quantity,
+                ExecutionPosition.average_price,
+                ExecutionPosition.last_reconciled_at,
+                ExecutionPosition.updated_at,
+                ExecutionPosition.raw_payload,
+            )
         )
     )
+    latest_query = (
+        base_query.order_by(
+            ExecutionPosition.last_reconciled_at.desc().nulls_last(),
+            ExecutionPosition.updated_at.desc(),
+            ExecutionPosition.id.desc(),
+        )
+        .limit(BROKER_BALANCE_SNAPSHOT_CANDIDATE_LIMIT)
+    )
+    if lookback_days <= 1:
+        return list(db.scalars(latest_query))
+
+    started_at = _normalize_utc(started_at)
+    baseline_query = (
+        base_query.where(ExecutionPosition.last_reconciled_at <= started_at)
+        .order_by(
+            ExecutionPosition.last_reconciled_at.desc().nulls_last(),
+            ExecutionPosition.updated_at.desc(),
+            ExecutionPosition.id.desc(),
+        )
+        .limit(BROKER_BALANCE_SNAPSHOT_CANDIDATE_LIMIT)
+    )
+    positions_by_id = {position.id: position for position in db.scalars(latest_query)}
+    for position in db.scalars(baseline_query):
+        positions_by_id.setdefault(position.id, position)
+    return list(positions_by_id.values())
 
 
 def _broker_asset_unavailable(reason: str | None) -> dict[str, object]:
@@ -586,8 +664,13 @@ def _portfolio_risk(
     positions = _load_positions(settings=settings, db=db)
     open_orders = _load_open_orders(settings=settings, db=db)
     stale_before = as_of - timedelta(seconds=settings.exec_agent_max_account_snapshot_age_seconds)
+    sectors = _sectors_for_symbols(
+        settings=settings,
+        db=db,
+        symbols={position.symbol for position in positions},
+    )
     position_rows = [
-        _position_risk_row(position=position, sector=_sector_for_symbol(settings=settings, db=db, symbol=position.symbol))
+        _position_risk_row(position=position, sector=sectors.get(position.symbol))
         for position in positions
     ]
     rows_with_value = [
@@ -677,6 +760,17 @@ def _load_positions(*, settings: Settings, db: Session) -> list[ExecutionPositio
                     ExecutionPosition.quantity > 0,
                     ExecutionPosition.base_quantity > 0,
                 ),
+            )
+            .options(
+                load_only(
+                    ExecutionPosition.id,
+                    ExecutionPosition.symbol,
+                    ExecutionPosition.quantity,
+                    ExecutionPosition.base_quantity,
+                    ExecutionPosition.average_price,
+                    ExecutionPosition.last_reconciled_at,
+                    ExecutionPosition.updated_from,
+                )
             )
             .order_by(ExecutionPosition.symbol.asc())
         )
@@ -864,21 +958,45 @@ def _sell_reason(trade: dict[str, object]) -> str:
     return reason or "unknown"
 
 
-def _sector_for_symbol(*, settings: Settings, db: Session, symbol: str) -> str | None:
+def _sectors_for_symbols(*, settings: Settings, db: Session, symbols: set[str]) -> dict[str, str]:
+    if not symbols:
+        return {}
+    normalized_symbols = sorted(symbol.strip().upper() for symbol in symbols if symbol.strip())
+    if not normalized_symbols:
+        return {}
     items = db.scalars(
         select(ExecutionPlanItem)
-        .where(ExecutionPlanItem.symbol == symbol, ExecutionPlanItem.plan.has(mode=settings.runtime_mode))
-        .order_by(ExecutionPlanItem.updated_at.desc().nulls_last(), ExecutionPlanItem.created_at.desc())
-        .limit(20)
+        .where(
+            ExecutionPlanItem.symbol.in_(normalized_symbols),
+            ExecutionPlanItem.plan.has(mode=settings.runtime_mode),
+        )
+        .options(
+            load_only(
+                ExecutionPlanItem.symbol,
+                ExecutionPlanItem.risk_context,
+                ExecutionPlanItem.updated_at,
+                ExecutionPlanItem.created_at,
+            )
+        )
+        .order_by(
+            ExecutionPlanItem.symbol.asc(),
+            ExecutionPlanItem.updated_at.desc().nulls_last(),
+            ExecutionPlanItem.created_at.desc(),
+        )
+        .limit(max(SECTOR_LOOKBACK_PER_SYMBOL, len(normalized_symbols) * SECTOR_LOOKBACK_PER_SYMBOL))
     )
+    sectors: dict[str, str] = {}
     for item in items:
+        if item.symbol in sectors:
+            continue
         if not isinstance(item.risk_context, dict):
             continue
         for key in ("sector", "sector_name", "industry", "theme"):
             value = item.risk_context.get(key)
             if isinstance(value, str) and value.strip():
-                return value.strip()
-    return None
+                sectors[item.symbol] = value.strip()
+                break
+    return sectors
 
 
 def _sector_concentration(position_rows: list[dict[str, object]]) -> list[dict[str, object]]:
