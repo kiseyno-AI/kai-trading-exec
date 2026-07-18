@@ -9,7 +9,7 @@ from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session, load_only, selectinload
 
 from app.core.config import Settings, load_settings
@@ -964,12 +964,31 @@ def _sectors_for_symbols(*, settings: Settings, db: Session, symbols: set[str]) 
     normalized_symbols = sorted(symbol.strip().upper() for symbol in symbols if symbol.strip())
     if not normalized_symbols:
         return {}
-    items = db.scalars(
+    ranked_item_ids = (
         select(ExecutionPlanItem)
+        .with_only_columns(
+            ExecutionPlanItem.id.label("item_id"),
+            func.row_number()
+            .over(
+                partition_by=ExecutionPlanItem.symbol,
+                order_by=(
+                    ExecutionPlanItem.updated_at.desc().nulls_last(),
+                    ExecutionPlanItem.created_at.desc(),
+                    ExecutionPlanItem.id.desc(),
+                ),
+            )
+            .label("symbol_rank"),
+        )
         .where(
             ExecutionPlanItem.symbol.in_(normalized_symbols),
             ExecutionPlanItem.plan.has(mode=settings.runtime_mode),
         )
+        .subquery()
+    )
+    items = db.scalars(
+        select(ExecutionPlanItem)
+        .join(ranked_item_ids, ExecutionPlanItem.id == ranked_item_ids.c.item_id)
+        .where(ranked_item_ids.c.symbol_rank <= SECTOR_LOOKBACK_PER_SYMBOL)
         .options(
             load_only(
                 ExecutionPlanItem.symbol,
@@ -982,8 +1001,8 @@ def _sectors_for_symbols(*, settings: Settings, db: Session, symbols: set[str]) 
             ExecutionPlanItem.symbol.asc(),
             ExecutionPlanItem.updated_at.desc().nulls_last(),
             ExecutionPlanItem.created_at.desc(),
+            ExecutionPlanItem.id.desc(),
         )
-        .limit(max(SECTOR_LOOKBACK_PER_SYMBOL, len(normalized_symbols) * SECTOR_LOOKBACK_PER_SYMBOL))
     )
     sectors: dict[str, str] = {}
     for item in items:

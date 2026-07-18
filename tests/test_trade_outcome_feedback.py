@@ -1083,6 +1083,84 @@ def test_trade_outcome_feedback_portfolio_risk_and_sell_reason_contributions(tmp
     engine.dispose()
 
 
+def test_trade_outcome_feedback_sector_lookup_caps_each_symbol(tmp_path) -> None:
+    engine, session = _session()
+    settings = Settings(
+        runtime_mode="paper",
+        trade_outcome_feedback_dir=str(tmp_path),
+        exec_agent_max_account_snapshot_age_seconds=300,
+    )
+    plan = ExecutionPlan(
+        id="plan-sector-cap",
+        external_plan_id="plan-sector-cap",
+        source="kai-trading-core",
+        strategy_run_id="run-sector-cap",
+        mode="paper",
+    )
+    session.add(plan)
+    for index in range(45):
+        session.add(
+            ExecutionPlanItem(
+                id=f"item-sector-cap-early-{index}",
+                plan=plan,
+                plan_item_index=index,
+                symbol="000001",
+                side="buy",
+                intent="next_open_buy",
+                status="filled",
+                risk_context={"sector": "Crowded Early Sector"},
+            )
+        )
+    session.add(
+        ExecutionPlanItem(
+            id="item-sector-cap-late",
+            plan=plan,
+            plan_item_index=99,
+            symbol="999999",
+            side="buy",
+            intent="next_open_buy",
+            status="filled",
+            risk_context={"sector": "Late Active Sector"},
+        )
+    )
+    session.add_all(
+        [
+            ExecutionPosition(
+                id="pos-sector-cap-early",
+                mode="paper",
+                symbol="000001",
+                quantity=1,
+                average_price=Decimal("100000"),
+                updated_from="broker_reconciliation",
+                last_reconciled_at=datetime(2026, 6, 20, 0, 9, tzinfo=UTC),
+            ),
+            ExecutionPosition(
+                id="pos-sector-cap-late",
+                mode="paper",
+                symbol="999999",
+                quantity=1,
+                average_price=Decimal("100000"),
+                updated_from="broker_reconciliation",
+                last_reconciled_at=datetime(2026, 6, 20, 0, 9, tzinfo=UTC),
+            ),
+        ]
+    )
+    session.commit()
+
+    report = generate_trade_outcome_feedback(
+        settings=settings,
+        db=session,
+        as_of=datetime(2026, 6, 20, 0, 10, tzinfo=UTC),
+    )
+
+    sectors = {row["sector"] for row in report["portfolio_risk"]["sector_concentration"]}
+    assert "Crowded Early Sector" in sectors
+    assert "Late Active Sector" in sectors
+
+    session.close()
+    engine.dispose()
+
+
 def test_trade_outcome_feedback_portfolio_risk_uses_upbit_base_quantity(tmp_path) -> None:
     engine, session = _session()
     settings = Settings(
