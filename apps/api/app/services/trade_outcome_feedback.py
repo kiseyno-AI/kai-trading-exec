@@ -22,6 +22,7 @@ from app.services.account_drawdown_gate import (
     latest_account_drawdown_gate_state,
 )
 from app.services.broker_raw_holdings import (
+    BrokerRawHolding,
     broker_raw_balance_is_fresh,
     broker_raw_balance_is_valid,
     broker_raw_holding_payload,
@@ -64,6 +65,14 @@ class OpenLot:
 
 
 @dataclass(frozen=True)
+class LegacySellCostBasis:
+    symbol: str
+    average_price: Decimal
+    source: str
+    observed_at: datetime | None
+
+
+@dataclass(frozen=True)
 class BrokerBalanceSnapshot:
     position: ExecutionPosition
     balance: dict[str, object]
@@ -83,9 +92,19 @@ def generate_trade_outcome_feedback(
     days = max(1, int(lookback_days or settings.trade_outcome_feedback_lookback_days))
     started_at = now - timedelta(days=days)
     fills = _load_fills(settings=settings, db=db)
+    sell_symbols = {
+        fill.symbol
+        for fill in fills
+        if str(fill.side or "").lower() == "sell"
+    }
+    legacy_sell_cost_basis = _load_legacy_sell_cost_basis(
+        settings=settings,
+        db=db,
+        symbols=sell_symbols,
+    )
     closed_trades = [
         trade
-        for trade in _fifo_closed_trades(fills)
+        for trade in _fifo_closed_trades(fills, legacy_sell_cost_basis=legacy_sell_cost_basis)
         if _parse_datetime(str((trade.get("sell") or {}).get("filled_at"))) >= started_at
     ]
     broker_asset_performance = _broker_asset_performance(
@@ -205,9 +224,82 @@ def _load_fills(*, settings: Settings, db: Session) -> list[ExecutionFill]:
     ))
 
 
-def _fifo_closed_trades(fills: list[ExecutionFill]) -> list[dict[str, object]]:
+def _load_legacy_sell_cost_basis(
+    *,
+    settings: Settings,
+    db: Session,
+    symbols: set[str],
+) -> dict[str, LegacySellCostBasis]:
+    normalized_symbols = sorted(symbol.strip().upper() for symbol in symbols if symbol.strip())
+    if not normalized_symbols:
+        return {}
+    positions = db.scalars(
+        select(ExecutionPosition)
+        .where(
+            ExecutionPosition.mode == settings.runtime_mode,
+            ExecutionPosition.symbol.in_(normalized_symbols),
+        )
+        .options(
+            load_only(
+                ExecutionPosition.symbol,
+                ExecutionPosition.average_price,
+                ExecutionPosition.last_reconciled_at,
+                ExecutionPosition.updated_at,
+                ExecutionPosition.raw_payload,
+            )
+        )
+        .order_by(
+            ExecutionPosition.symbol.asc(),
+            ExecutionPosition.last_reconciled_at.desc().nulls_last(),
+            ExecutionPosition.updated_at.desc(),
+        )
+        .limit(len(normalized_symbols))
+    )
+    costs: dict[str, LegacySellCostBasis] = {}
+    for position in positions:
+        symbol = position.symbol.strip().upper()
+        if symbol in costs:
+            continue
+        position_average = _decimal_value(position.average_price)
+        if position_average is not None and position_average > 0:
+            costs[symbol] = LegacySellCostBasis(
+                symbol=symbol,
+                average_price=position_average,
+                source="reconciled_average_cost_estimate",
+                observed_at=_normalize_utc(position.last_reconciled_at)
+                if position.last_reconciled_at is not None
+                else None,
+            )
+            continue
+        raw_holding = _raw_holding_for_symbol(payload=position.raw_payload, symbol=symbol)
+        if raw_holding is not None and raw_holding.average_price is not None and raw_holding.average_price > 0:
+            costs[symbol] = LegacySellCostBasis(
+                symbol=symbol,
+                average_price=raw_holding.average_price,
+                source="broker_raw_holding_average_cost_estimate",
+                observed_at=_normalize_utc(position.last_reconciled_at)
+                if position.last_reconciled_at is not None
+                else None,
+            )
+    return costs
+
+
+def _raw_holding_for_symbol(*, payload: dict[str, Any] | None, symbol: str) -> BrokerRawHolding | None:
+    normalized = symbol.strip().upper()
+    for holding in broker_raw_holdings_from_payload(payload):
+        if holding.symbol == normalized:
+            return holding
+    return None
+
+
+def _fifo_closed_trades(
+    fills: list[ExecutionFill],
+    *,
+    legacy_sell_cost_basis: dict[str, LegacySellCostBasis] | None = None,
+) -> list[dict[str, object]]:
     lots_by_symbol: dict[str, list[OpenLot]] = {}
     closed: list[dict[str, object]] = []
+    cost_basis = legacy_sell_cost_basis or {}
     for fill in sorted(fills, key=lambda row: (row.symbol, _normalize_utc(row.filled_at), row.id)):
         side = str(fill.side or "").lower()
         if side == "buy":
@@ -232,6 +324,14 @@ def _fifo_closed_trades(fills: list[ExecutionFill]) -> list[dict[str, object]]:
             remaining -= matched
             if lot.quantity <= 0:
                 lots.pop(0)
+        if remaining > 0:
+            closed.append(
+                _legacy_sell_estimate_trade(
+                    sell_fill=fill,
+                    quantity=remaining,
+                    cost_basis=cost_basis.get(fill.symbol),
+                )
+            )
     return closed
 
 
@@ -264,7 +364,68 @@ def _closed_trade(*, lot: OpenLot, sell_fill: ExecutionFill, quantity: int) -> d
         "trigger_time": _trigger_time_context(source_item),
         "market_enrichment": _market_enrichment_context(source_item),
         "candidate_rule_context": _candidate_rule_context(item=source_item, buy_fill=lot.fill),
+        "outcome_source": "fifo_exact",
+        "outcome_quality_flags": [],
         "outcome_bucket": _outcome_bucket(pnl),
+    }
+
+
+def _legacy_sell_estimate_trade(
+    *,
+    sell_fill: ExecutionFill,
+    quantity: int,
+    cost_basis: LegacySellCostBasis | None,
+) -> dict[str, object]:
+    sell_order = sell_fill.broker_order
+    sell_item = sell_order.plan_item if sell_order is not None else None
+    sell_price = Decimal(sell_fill.price)
+    source_item = sell_item
+    if cost_basis is None:
+        pnl = None
+        return_pct = None
+        buy_price = None
+        outcome_source = "unavailable"
+        quality_flags = ["missing_fifo_buy_lot", "missing_average_cost_basis"]
+    else:
+        buy_price = cost_basis.average_price
+        buy_notional = buy_price * Decimal(quantity)
+        sell_notional = sell_price * Decimal(quantity)
+        pnl = sell_notional - buy_notional
+        return_pct = (pnl / buy_notional * Decimal("100")) if buy_notional > 0 else Decimal("0")
+        outcome_source = cost_basis.source
+        quality_flags = ["missing_fifo_buy_lot", f"estimated_from_{cost_basis.source}"]
+    return {
+        "symbol": sell_fill.symbol,
+        "quantity": quantity,
+        "buy": {
+            "filled_at": cost_basis.observed_at.isoformat()
+            if cost_basis is not None and cost_basis.observed_at is not None
+            else None,
+            "quantity": quantity,
+            "price": _decimal_text(buy_price),
+            "broker_fill_id": None,
+            "broker_order_id": None,
+            "execution_plan_item_id": None,
+            "intent": None,
+            "source_plan_item_id": None,
+            "cost_basis_source": outcome_source,
+        },
+        "sell": _fill_payload(fill=sell_fill, order=sell_order, item=sell_item, quantity=quantity),
+        "realized_pnl_krw": _decimal_text(pnl),
+        "return_pct": _decimal_text(return_pct),
+        "hold_minutes": None,
+        "hold_hours": None,
+        "source_execution_plan_item_id": source_item.id if source_item is not None else None,
+        "decision_run_id": source_item.decision_run_id if source_item is not None else None,
+        "decision_agent_name": source_item.decision_agent_name if source_item is not None else None,
+        "exec_agent_decision": _exec_agent_decision(source_item),
+        "risk_sizing": _risk_sizing_context(source_item),
+        "trigger_time": _trigger_time_context(source_item),
+        "market_enrichment": _market_enrichment_context(source_item),
+        "candidate_rule_context": {},
+        "outcome_source": outcome_source,
+        "outcome_quality_flags": quality_flags,
+        "outcome_bucket": _outcome_bucket(pnl) if pnl is not None else "unavailable",
     }
 
 
@@ -292,10 +453,29 @@ def _summary(
     *,
     broker_asset_performance: dict[str, object] | None = None,
 ) -> dict[str, object]:
-    pnl_values = [_decimal_value(row.get("realized_pnl_krw")) or Decimal("0") for row in closed_trades]
+    pnl_values = [
+        value
+        for row in closed_trades
+        for value in [_decimal_value(row.get("realized_pnl_krw"))]
+        if value is not None
+    ]
     winners = [value for value in pnl_values if value > 0]
     losers = [value for value in pnl_values if value < 0]
     total = sum(pnl_values, Decimal("0"))
+    estimated_count = sum(
+        1
+        for row in closed_trades
+        if str(row.get("outcome_source") or "") not in {"", "fifo_exact", "unavailable"}
+    )
+    unavailable_count = sum(1 for row in closed_trades if row.get("outcome_source") == "unavailable")
+    quality_flags = sorted(
+        {
+            str(flag)
+            for row in closed_trades
+            for flag in (row.get("outcome_quality_flags") or [])
+            if str(flag)
+        }
+    )
     summary: dict[str, object] = {
         "primary_performance_metric": "broker_total_asset_change"
         if broker_asset_performance and broker_asset_performance.get("available")
@@ -307,6 +487,9 @@ def _summary(
         "average_win_krw": _decimal_text(sum(winners, Decimal("0")) / Decimal(len(winners)) if winners else Decimal("0")),
         "average_loss_krw": _decimal_text(sum(losers, Decimal("0")) / Decimal(len(losers)) if losers else Decimal("0")),
         "worst_loss_krw": _decimal_text(min(pnl_values) if pnl_values else Decimal("0")),
+        "estimated_trade_count": estimated_count,
+        "unavailable_trade_count": unavailable_count,
+        "realized_pnl_quality_flags": quality_flags,
     }
     if broker_asset_performance and broker_asset_performance.get("available"):
         summary.update(
