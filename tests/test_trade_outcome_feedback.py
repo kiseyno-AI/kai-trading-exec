@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from decimal import Decimal
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 
 from app.core.config import Settings
@@ -425,6 +425,99 @@ def test_trade_outcome_feedback_surfaces_broker_raw_normalized_drift(tmp_path) -
     markdown = (tmp_path / "latest.md").read_text(encoding="utf-8")
     assert "Broker raw vs normalized position drift" in markdown
     assert "002380: raw_qty=3.0000, normalized_qty=0.0000" in markdown
+
+    session.close()
+    engine.dispose()
+
+
+def test_trade_outcome_feedback_bounds_execution_position_raw_payload_reads(tmp_path) -> None:
+    engine, session = _session()
+    settings = Settings(
+        runtime_mode="paper",
+        trade_outcome_feedback_dir=str(tmp_path),
+        trade_outcome_feedback_lookback_days=1,
+        exec_agent_max_account_snapshot_age_seconds=20000,
+    )
+    plan = ExecutionPlan(
+        id="plan-bounded-raw-payload",
+        external_plan_id="plan-bounded-raw-payload",
+        source="kai-trading-core",
+        strategy_run_id="run-bounded-raw-payload",
+        mode="paper",
+    )
+    session.add(plan)
+    _add_closed_trade(
+        session,
+        plan=plan,
+        suffix="bounded-raw-payload",
+        symbol="005930",
+        buy_price="100000",
+        sell_price="101000",
+        quantity=1,
+        filled_day=25,
+    )
+    for index in range(40):
+        session.add(
+            ExecutionPosition(
+                id=f"pos-large-raw-{index}",
+                mode="paper",
+                symbol=f"9{index:05d}",
+                quantity=0,
+                average_price=None,
+                updated_from="historical-reconciliation",
+                last_reconciled_at=datetime(2026, 5, 1, 6, index % 60, tzinfo=UTC),
+                raw_payload={"balance": {"output2": [{"tot_evlu_amt": str(1000000 + index)}]}, "blob": "x" * 1000},
+            )
+        )
+    session.add(
+        ExecutionPosition(
+            id="pos-latest-balance",
+            mode="paper",
+            symbol="005930",
+            quantity=1,
+            average_price=Decimal("100000"),
+            updated_from="reconciliation",
+            last_reconciled_at=datetime(2026, 6, 26, 6, 0, tzinfo=UTC),
+            raw_payload={
+                "balance": {
+                    "output1": [{"pdno": "005930", "hldg_qty": "1", "evlu_amt": "101000"}],
+                    "output2": [
+                        {
+                            "tot_evlu_amt": "1001000",
+                            "nass_amt": "1001000",
+                            "bfdy_tot_asst_evlu_amt": "1000000",
+                            "asst_icdc_amt": "1000",
+                        }
+                    ],
+                }
+            },
+        )
+    )
+    session.commit()
+    statements: list[str] = []
+
+    def capture_sql(_conn, _cursor, statement, _parameters, _context, _executemany) -> None:
+        statements.append(statement)
+
+    event.listen(engine, "before_cursor_execute", capture_sql)
+    try:
+        report = generate_trade_outcome_feedback(
+            settings=settings,
+            db=session,
+            as_of=datetime(2026, 6, 26, 9, 0, tzinfo=UTC),
+        )
+    finally:
+        event.remove(engine, "before_cursor_execute", capture_sql)
+
+    raw_payload_reads = [
+        statement
+        for statement in statements
+        if "execution_positions.raw_payload" in statement
+        and "FROM execution_positions" in statement
+    ]
+    assert report["broker_asset_performance"]["available"] is True
+    assert raw_payload_reads
+    assert all("LIMIT" in statement.upper() for statement in raw_payload_reads)
 
     session.close()
     engine.dispose()
@@ -985,6 +1078,84 @@ def test_trade_outcome_feedback_portfolio_risk_and_sell_reason_contributions(tmp
     assert risk["max_holding_close_contribution"]["realized_pnl_krw"] == "-10000.0000"
     assert any("Top concentration" in line for line in report["prompt_snippet"]["top_portfolio_risks"])
     assert any("Stale-state blockers" in line for line in report["prompt_snippet"]["top_portfolio_risks"])
+
+    session.close()
+    engine.dispose()
+
+
+def test_trade_outcome_feedback_sector_lookup_caps_each_symbol(tmp_path) -> None:
+    engine, session = _session()
+    settings = Settings(
+        runtime_mode="paper",
+        trade_outcome_feedback_dir=str(tmp_path),
+        exec_agent_max_account_snapshot_age_seconds=300,
+    )
+    plan = ExecutionPlan(
+        id="plan-sector-cap",
+        external_plan_id="plan-sector-cap",
+        source="kai-trading-core",
+        strategy_run_id="run-sector-cap",
+        mode="paper",
+    )
+    session.add(plan)
+    for index in range(45):
+        session.add(
+            ExecutionPlanItem(
+                id=f"item-sector-cap-early-{index}",
+                plan=plan,
+                plan_item_index=index,
+                symbol="000001",
+                side="buy",
+                intent="next_open_buy",
+                status="filled",
+                risk_context={"sector": "Crowded Early Sector"},
+            )
+        )
+    session.add(
+        ExecutionPlanItem(
+            id="item-sector-cap-late",
+            plan=plan,
+            plan_item_index=99,
+            symbol="999999",
+            side="buy",
+            intent="next_open_buy",
+            status="filled",
+            risk_context={"sector": "Late Active Sector"},
+        )
+    )
+    session.add_all(
+        [
+            ExecutionPosition(
+                id="pos-sector-cap-early",
+                mode="paper",
+                symbol="000001",
+                quantity=1,
+                average_price=Decimal("100000"),
+                updated_from="broker_reconciliation",
+                last_reconciled_at=datetime(2026, 6, 20, 0, 9, tzinfo=UTC),
+            ),
+            ExecutionPosition(
+                id="pos-sector-cap-late",
+                mode="paper",
+                symbol="999999",
+                quantity=1,
+                average_price=Decimal("100000"),
+                updated_from="broker_reconciliation",
+                last_reconciled_at=datetime(2026, 6, 20, 0, 9, tzinfo=UTC),
+            ),
+        ]
+    )
+    session.commit()
+
+    report = generate_trade_outcome_feedback(
+        settings=settings,
+        db=session,
+        as_of=datetime(2026, 6, 20, 0, 10, tzinfo=UTC),
+    )
+
+    sectors = {row["sector"] for row in report["portfolio_risk"]["sector_concentration"]}
+    assert "Crowded Early Sector" in sectors
+    assert "Late Active Sector" in sectors
 
     session.close()
     engine.dispose()
