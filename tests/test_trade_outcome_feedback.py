@@ -227,6 +227,144 @@ def test_generate_trade_outcome_feedback_writes_fifo_report_and_snippet(tmp_path
     engine.dispose()
 
 
+def test_trade_outcome_feedback_estimates_legacy_sell_without_fifo_buy_lot(tmp_path) -> None:
+    engine, session = _session()
+    settings = Settings(
+        runtime_mode="paper",
+        trade_outcome_feedback_dir=str(tmp_path),
+        trade_outcome_feedback_lookback_days=7,
+    )
+    plan = ExecutionPlan(
+        id="plan-legacy-sell-estimate",
+        external_plan_id="plan-legacy-sell-estimate",
+        source="kai-trading-core",
+        strategy_run_id="run-legacy-sell-estimate",
+        mode="paper",
+    )
+    sell_item = ExecutionPlanItem(
+        id="item-legacy-sell-estimate",
+        plan=plan,
+        symbol="002380",
+        side="sell",
+        intent="max_holding_close_sell",
+        status="filled",
+        quantity_policy={"kind": "shares", "quantity": 1},
+    )
+    sell_order = BrokerOrder(
+        id="order-legacy-sell-estimate",
+        plan_item=sell_item,
+        broker_name="kis",
+        mode="paper",
+        idempotency_key="legacy-sell-estimate",
+        broker_order_id="legacy-sell-estimate",
+        symbol="002380",
+        side="sell",
+        status="filled",
+        quantity=1,
+    )
+    position = ExecutionPosition(
+        id="pos-legacy-sell-estimate",
+        mode="paper",
+        symbol="002380",
+        quantity=0,
+        average_price=Decimal("511000"),
+        updated_from="reconciliation",
+        last_reconciled_at=datetime(2026, 7, 14, 12, 20, tzinfo=UTC),
+    )
+    session.add_all(
+        [
+            plan,
+            sell_order,
+            position,
+            ExecutionFill(
+                broker_order=sell_order,
+                broker_fill_id="fill-legacy-sell-estimate",
+                symbol="002380",
+                side="sell",
+                quantity=1,
+                price=Decimal("413500"),
+                filled_at=datetime(2026, 7, 14, 12, 14, 3, tzinfo=UTC),
+            ),
+        ]
+    )
+    session.commit()
+
+    report = generate_trade_outcome_feedback(
+        settings=settings,
+        db=session,
+        as_of=datetime(2026, 7, 18, tzinfo=UTC),
+    )
+
+    trade = report["closed_trades"][0]
+    assert trade["symbol"] == "002380"
+    assert trade["realized_pnl_krw"] == "-97500.0000"
+    assert trade["return_pct"] == "-19.0802"
+    assert trade["outcome_source"] == "reconciled_average_cost_estimate"
+    assert trade["buy"]["price"] == "511000.0000"
+    assert "missing_fifo_buy_lot" in trade["outcome_quality_flags"]
+    assert report["summary"]["realized_pnl_krw"] == "-97500.0000"
+    assert report["summary"]["estimated_trade_count"] == 1
+    assert report["summary"]["unavailable_trade_count"] == 0
+    session.refresh(position)
+    assert position.quantity == 0
+    assert position.average_price == Decimal("511000.0000")
+
+    session.close()
+    engine.dispose()
+
+
+def test_trade_outcome_feedback_marks_legacy_sell_unavailable_without_cost_basis(tmp_path) -> None:
+    engine, session = _session()
+    settings = Settings(
+        runtime_mode="paper",
+        trade_outcome_feedback_dir=str(tmp_path),
+        trade_outcome_feedback_lookback_days=7,
+    )
+    sell_order = BrokerOrder(
+        id="order-legacy-sell-unavailable",
+        broker_name="kis",
+        mode="paper",
+        idempotency_key="legacy-sell-unavailable",
+        broker_order_id="legacy-sell-unavailable",
+        symbol="031330",
+        side="sell",
+        status="filled",
+        quantity=35,
+    )
+    session.add_all(
+        [
+            sell_order,
+            ExecutionFill(
+                broker_order=sell_order,
+                broker_fill_id="fill-legacy-sell-unavailable",
+                symbol="031330",
+                side="sell",
+                quantity=35,
+                price=Decimal("9970"),
+                filled_at=datetime(2026, 7, 14, 12, 14, 32, tzinfo=UTC),
+            ),
+        ]
+    )
+    session.commit()
+
+    report = generate_trade_outcome_feedback(
+        settings=settings,
+        db=session,
+        as_of=datetime(2026, 7, 18, tzinfo=UTC),
+    )
+
+    trade = report["closed_trades"][0]
+    assert trade["outcome_source"] == "unavailable"
+    assert trade["realized_pnl_krw"] is None
+    assert "missing_average_cost_basis" in trade["outcome_quality_flags"]
+    assert report["summary"]["realized_pnl_krw"] == "0.0000"
+    assert report["summary"]["estimated_trade_count"] == 0
+    assert report["summary"]["unavailable_trade_count"] == 1
+
+    session.close()
+    engine.dispose()
+
+
 def test_trade_outcome_feedback_headlines_broker_total_asset_change_with_unrealized_drawdown(tmp_path) -> None:
     engine, session = _session()
     settings = Settings(
