@@ -16,6 +16,7 @@ from app.broker.base import (
 from app.core.config import Settings
 from app.models.runtime import BrokerOrder, BrokerOrderEvent, ExecutionFill, ExecutionPosition
 from app.services.broker_auth import ensure_authenticated_broker_session
+from app.services.fill_idempotency import execution_fill_dedupe_key, execution_fill_idempotency_key
 from app.services.rejected_order_retries import handle_reconciled_rejected_order
 
 
@@ -1023,18 +1024,19 @@ def _upsert_order_fills(
         select(ExecutionFill).where(ExecutionFill.broker_order_pk == order.id)
     ).all()
     existing_fill_keys = {
-        _fill_signature(fill)
+        execution_fill_dedupe_key(fill)
         for fill in existing_fill_rows
     }
 
     added = 0
     for fill in fills:
-        fill_signature = _fill_signature_candidate(fill)
+        fill_signature = _fill_signature_candidate(order=order, fill=fill)
         if fill_signature is None or fill_signature in existing_fill_keys:
             continue
 
         db.add(
             ExecutionFill(
+                idempotency_key=fill_signature,
                 broker_order_pk=order.id,
                 broker_fill_id=_optional_str(fill.get("broker_fill_id")),
                 symbol=str(fill["symbol"]),
@@ -1053,20 +1055,11 @@ def _upsert_order_fills(
     return added
 
 
-def _fill_signature(fill: ExecutionFill) -> tuple[str | None, int, Decimal, str, str, str]:
-    return (
-        fill.broker_fill_id,
-        fill.quantity,
-        _coerce_decimal(fill.price),
-        fill.symbol,
-        fill.side,
-        _normalized_timestamp_signature(fill.filled_at),
-    )
-
-
 def _fill_signature_candidate(
+    *,
+    order: BrokerOrder,
     fill: dict[str, object],
-) -> tuple[str | None, int, Decimal, str, str, str] | None:
+) -> str | None:
     broker_fill_id = _optional_str(fill.get("broker_fill_id"))
     quantity = _parse_int(fill.get("quantity"))
     price = _parse_decimal(fill.get("price"))
@@ -1081,13 +1074,14 @@ def _fill_signature_candidate(
     ):
         return None
     filled_at = _parse_timestamp(fill.get("filled_at"), fallback=_observation_time())
-    return (
-        broker_fill_id,
-        quantity,
-        price,
-        symbol,
-        side,
-        _normalized_timestamp_signature(filled_at),
+    return execution_fill_idempotency_key(
+        broker_order_pk=order.id,
+        broker_fill_id=broker_fill_id,
+        symbol=symbol,
+        side=side,
+        filled_at=filled_at,
+        price=price,
+        quantity=quantity,
     )
 
 

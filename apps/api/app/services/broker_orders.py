@@ -31,6 +31,7 @@ from app.services.broker_auth import ensure_authenticated_broker_session
 from app.services.domestic_order_router import RouteDecision, resolve_domestic_order_route
 from app.services.execution_failures import record_actionable_execution_failure
 from app.services.execution_api import serialize_broker_order
+from app.services.fill_idempotency import execution_fill_idempotency_key
 from app.services.runtime_controls import (
     automated_order_submission_allowed,
     automated_order_submission_block_reason,
@@ -799,6 +800,15 @@ def _record_upbit_paper_simulated_fill(
         plan_item.status = "filled"
 
     fill = ExecutionFill(
+        idempotency_key=execution_fill_idempotency_key(
+            broker_order_pk=order.id,
+            broker_fill_id=f"paper-fill:{order.idempotency_key}",
+            symbol=order.symbol,
+            side=order.side,
+            filled_at=observed_at,
+            price=fill_price,
+            quantity=0,
+        ),
         broker_order_pk=order.id,
         broker_fill_id=f"paper-fill:{order.idempotency_key}",
         symbol=order.symbol,

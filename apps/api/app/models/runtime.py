@@ -395,6 +395,7 @@ class ExecutionFill(TimestampMixin, Base):
     __tablename__ = "execution_fills"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    idempotency_key: Mapped[str | None] = mapped_column(String(80), unique=True, index=True)
     broker_order_pk: Mapped[str] = mapped_column(
         ForeignKey("broker_orders.id"),
         nullable=False,

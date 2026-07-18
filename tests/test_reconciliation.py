@@ -276,6 +276,94 @@ def test_reconcile_full_fill_is_idempotent_and_updates_position_snapshot() -> No
     engine.dispose()
 
 
+def test_reconcile_repeated_fallback_fill_payload_is_idempotent() -> None:
+    settings = Settings(database_url="sqlite:///:memory:", runtime_mode="paper")
+    engine, db = _session(settings)
+    order = _order()
+    db.add(order)
+    db.commit()
+    broker = ReconciliationStubBroker(
+        reconcile_payloads=[
+            {
+                "broker_order_id": "0033196600",
+                "status": "filled",
+                "broker_status": "체결",
+                "filled_quantity": 2,
+                "remaining_quantity": 0,
+                "average_fill_price": "71000",
+                "fills": [
+                    {
+                        "symbol": "005930",
+                        "side": "buy",
+                        "quantity": 2,
+                        "price": "71000.0000",
+                        "filled_at": OBSERVED_AT.isoformat(),
+                    }
+                ],
+                "observed_at": OBSERVED_AT.isoformat(),
+            }
+        ],
+    )
+
+    first = reconcile_broker_order(settings=settings, db=db, adapter=broker, order=order)
+    second = reconcile_broker_order(settings=settings, db=db, adapter=broker, order=order)
+
+    fills = db.scalars(select(ExecutionFill)).all()
+    assert first["fills_added"] == 1
+    assert second["fills_added"] == 0
+    assert len(fills) == 1
+    assert fills[0].idempotency_key is not None
+    engine.dispose()
+
+
+def test_reconcile_does_not_duplicate_legacy_fill_without_idempotency_key() -> None:
+    settings = Settings(database_url="sqlite:///:memory:", runtime_mode="paper")
+    engine, db = _session(settings)
+    order = _order()
+    order.fills.append(
+        ExecutionFill(
+            broker_order_pk=order.id,
+            broker_fill_id=None,
+            symbol="005930",
+            side="buy",
+            quantity=2,
+            price=Decimal("71000.0000"),
+            filled_at=OBSERVED_AT,
+            payload={"source": "legacy"},
+        )
+    )
+    db.add(order)
+    db.commit()
+    broker = ReconciliationStubBroker(
+        reconcile_payloads=[
+            {
+                "broker_order_id": "0033196600",
+                "status": "filled",
+                "broker_status": "체결",
+                "filled_quantity": 2,
+                "remaining_quantity": 0,
+                "average_fill_price": "71000",
+                "fills": [
+                    {
+                        "symbol": "005930",
+                        "side": "buy",
+                        "quantity": 2,
+                        "price": "71000",
+                        "filled_at": OBSERVED_AT.isoformat(),
+                    }
+                ],
+                "observed_at": OBSERVED_AT.isoformat(),
+            }
+        ],
+    )
+
+    result = reconcile_broker_order(settings=settings, db=db, adapter=broker, order=order)
+
+    assert result["fills_added"] == 0
+    assert len(db.scalars(select(ExecutionFill)).all()) == 1
+    engine.dispose()
+
+
 def test_reconcile_filled_order_marks_plan_item_filled() -> None:
     settings = Settings(database_url="sqlite:///:memory:", runtime_mode="paper")
     engine, db = _session(settings)

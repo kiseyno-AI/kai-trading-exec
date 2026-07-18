@@ -18,6 +18,7 @@ from app.models.runtime import (
     ExecutionPosition,
     new_id,
 )
+from app.services.fill_idempotency import dedupe_execution_fills
 from app.services.exec_agent import apply_short_term_exec_agent_decisions
 from app.services.plan_item_identity import (
     serialize_plan_item_source_identity,
@@ -705,7 +706,7 @@ def _load_runtime_symbol_state(
 
     plan_items = db.scalars(plan_items_query).all()
     orders = db.scalars(orders_query).all()
-    fills = db.scalars(fills_query).all()
+    fills = dedupe_execution_fills(db.scalars(fills_query).all())
     positions = db.scalars(positions_query).all()
 
     plan_items_by_symbol: dict[str, list[ExecutionPlanItem]] = defaultdict(list)
