@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session, selectinload
 from app.core.config import Settings, load_settings
 from app.db.session import create_db_engine, create_session_factory
 from app.models.runtime import BrokerOrder, ExecutionFill, ExecutionPlanItem, ExecutionPosition
+from app.services.fill_idempotency import dedupe_execution_fills
 from app.services.account_drawdown_gate import (
     account_drawdown_gate_prompt_summary,
     account_drawdown_gate_report_lines,
@@ -158,7 +159,7 @@ def load_latest_trade_outcome_feedback_snippet(settings: Settings) -> dict[str, 
 
 
 def _load_fills(*, settings: Settings, db: Session) -> list[ExecutionFill]:
-    return list(
+    return dedupe_execution_fills(list(
         db.scalars(
             select(ExecutionFill)
             .join(ExecutionFill.broker_order)
@@ -172,7 +173,7 @@ def _load_fills(*, settings: Settings, db: Session) -> list[ExecutionFill]:
             )
             .order_by(ExecutionFill.symbol.asc(), ExecutionFill.filled_at.asc(), ExecutionFill.id.asc())
         )
-    )
+    ))
 
 
 def _fifo_closed_trades(fills: list[ExecutionFill]) -> list[dict[str, object]]:

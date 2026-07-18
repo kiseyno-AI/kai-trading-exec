@@ -21,6 +21,7 @@ from app.models.runtime import (
     ExecutionPosition,
     MonitoringCheckpoint,
 )
+from app.services.fill_idempotency import dedupe_execution_fills
 from app.services.monitoring import (
     MONITORING_RUNTIME_TOPOLOGY,
     MONITORING_SELECTION_STRATEGY,
@@ -1100,7 +1101,7 @@ def monthly_pnl_payload(
     now: datetime | None = None,
 ) -> dict[str, object]:
     month_start, next_month_start = _current_krx_month_utc_bounds(now)
-    fills = db.scalars(
+    fills = dedupe_execution_fills(db.scalars(
         select(ExecutionFill)
         .join(ExecutionFill.broker_order)
         .where(
@@ -1108,7 +1109,7 @@ def monthly_pnl_payload(
             ExecutionFill.filled_at < next_month_start,
         )
         .order_by(ExecutionFill.filled_at.asc(), ExecutionFill.id.asc())
-    ).all()
+    ).all())
 
     lots_by_symbol: dict[str, list[dict[str, Decimal]]] = {}
     monthly_realized = Decimal("0")
