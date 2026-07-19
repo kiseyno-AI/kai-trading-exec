@@ -27,6 +27,7 @@ from app.models.runtime import (
 )
 from app.services.broker_auth import ensure_authenticated_broker_session
 from app.services.execution_failures import classify_actionable_failure
+from app.services.runtime_transitions import apply_broker_order_status, set_plan_item_status
 
 BROKER_ORDER_RETRY_JOB_TYPE = "broker_order_retry"
 TEMPORARY_MARKET_REJECT_CLASSIFICATION = "temporary_market_state"
@@ -568,9 +569,22 @@ def _apply_retry_decision(
         db.add(retry_job)
         db.flush()
         failure.retry_job_id = retry_job.id
-    order.status = NormalizedBrokerOrderStatus.RETRY_PENDING.value
+    apply_broker_order_status(order=order, status=NormalizedBrokerOrderStatus.RETRY_PENDING.value)
     if plan_item is not None:
-        plan_item.status = "broker_order_retry_pending"
+        set_plan_item_status(
+            db=db,
+            plan_item=plan_item,
+            status="broker_order_retry_pending",
+            source="rejected_order_retry",
+            reason=classification.reason,
+            payload={
+                "broker_order_pk": order.id,
+                "idempotency_key": order.idempotency_key,
+                "retry_job_id": failure.retry_job_id,
+                "retry_next_at": _serialize_datetime(failure.retry_next_at),
+            },
+            occurred_at=observed_at,
+        )
 
 
 def _upsert_rejected_order_failure(

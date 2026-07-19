@@ -38,6 +38,11 @@ from app.services.runtime_controls import (
     ensure_runtime_control_state,
     runtime_safety_payload,
 )
+from app.services.runtime_transitions import (
+    apply_broker_order_status,
+    plan_item_status_for_broker_order_status,
+    set_plan_item_status,
+)
 
 UPBIT_PAPER_ALLOWED_SYMBOLS = frozenset({"KRW-BTC", "KRW-ETH"})
 
@@ -226,7 +231,14 @@ def place_broker_order(
     )
     db.add(request_event)
     if plan_item is not None:
-        plan_item.status = "broker_order_submission_pending"
+        set_plan_item_status(
+            db=db,
+            plan_item=plan_item,
+            status="broker_order_submission_pending",
+            source="broker_order_service",
+            reason=f"broker order submission requested for {routed_command.idempotency_key}",
+            payload={"broker_order_pk": order.id, "idempotency_key": order.idempotency_key},
+        )
 
     try:
         session_state = ensure_authenticated_broker_session(
@@ -266,7 +278,7 @@ def place_broker_order(
             observed_at=observed_at,
             request_observed_at=request_observed_at,
         )
-        order.status = exc.normalized_status.value
+        apply_broker_order_status(order=order, status=exc.normalized_status.value)
         order.last_broker_sync_at = observed_at
         order.request_metadata = exc.request_metadata or order.request_metadata
         order.response_metadata = exc.response_metadata or None
@@ -292,7 +304,19 @@ def place_broker_order(
             )
         )
         if plan_item is not None:
-            plan_item.status = _plan_item_status_for_order_status(order.status)
+            set_plan_item_status(
+                db=db,
+                plan_item=plan_item,
+                status=_plan_item_status_for_order_status(order.status),
+                source="broker_order_service",
+                reason=str(exc),
+                payload={
+                    "broker_order_pk": order.id,
+                    "idempotency_key": order.idempotency_key,
+                    "broker_status": exc.code,
+                    "event_type": "submit_failed",
+                },
+            )
         record_actionable_execution_failure(
             settings=settings,
             db=db,
@@ -325,7 +349,7 @@ def place_broker_order(
         )
 
     order.broker_order_id = placement.broker_order_id
-    order.status = placement.normalized_status.value
+    apply_broker_order_status(order=order, status=placement.normalized_status.value)
     order.submitted_at = placement.submitted_at
     order.last_broker_sync_at = placement.observed_at
     order.request_metadata = _merge_order_request_metadata(
@@ -362,7 +386,19 @@ def place_broker_order(
         )
     )
     if plan_item is not None:
-        plan_item.status = _plan_item_status_for_order_status(order.status)
+        set_plan_item_status(
+            db=db,
+            plan_item=plan_item,
+            status=_plan_item_status_for_order_status(order.status),
+            source="broker_order_service",
+            reason=placement.message,
+            payload={
+                "broker_order_pk": order.id,
+                "broker_order_id": placement.broker_order_id,
+                "idempotency_key": order.idempotency_key,
+                "event_type": "submit_acknowledged",
+            },
+        )
 
     _record_upbit_paper_simulated_fill(
         settings=settings,
@@ -645,7 +681,18 @@ def _persist_account_gate_block(
         )
     )
     if plan_item is not None:
-        plan_item.status = "watch_buy_triggered_blocked" if plan_item.status.startswith("watch_") else "new_buy_blocked"
+        set_plan_item_status(
+            db=db,
+            plan_item=plan_item,
+            status="watch_buy_triggered_blocked" if plan_item.status.startswith("watch_") else "new_buy_blocked",
+            source="account_drawdown_gate",
+            reason=decision.reason,
+            payload={
+                "broker_order_pk": order.id,
+                "idempotency_key": order.idempotency_key,
+                "gate": decision.summary,
+            },
+        )
     record_account_drawdown_block(
         db=db,
         execution_plan_item_id=plan_item.id if plan_item is not None else command.execution_plan_item_id,
@@ -794,10 +841,18 @@ def _record_upbit_paper_simulated_fill(
     if base_quantity is None or base_quantity <= 0:
         return
 
-    order.status = NormalizedBrokerOrderStatus.FILLED.value
+    apply_broker_order_status(order=order, status=NormalizedBrokerOrderStatus.FILLED.value)
     order.last_broker_sync_at = observed_at
     if plan_item is not None:
-        plan_item.status = "filled"
+        set_plan_item_status(
+            db=db,
+            plan_item=plan_item,
+            status="filled",
+            source="broker_order_service",
+            reason="Upbit paper order filled by local simulator",
+            payload={"broker_order_pk": order.id, "idempotency_key": order.idempotency_key},
+            occurred_at=observed_at,
+        )
 
     fill = ExecutionFill(
         idempotency_key=execution_fill_idempotency_key(
@@ -1003,15 +1058,7 @@ def _route_now(metadata: dict[str, object]) -> datetime:
 
 
 def _plan_item_status_for_order_status(order_status: str) -> str:
-    if order_status == NormalizedBrokerOrderStatus.SUBMITTED.value:
-        return "broker_order_submitted"
-    if order_status == NormalizedBrokerOrderStatus.RETRY_PENDING.value:
-        return "broker_order_retry_pending"
-    if order_status == NormalizedBrokerOrderStatus.REJECTED.value:
-        return "broker_order_rejected"
-    if order_status == NormalizedBrokerOrderStatus.FAILED.value:
-        return "broker_order_failed"
-    return order_status
+    return plan_item_status_for_broker_order_status(order_status) or order_status
 
 
 def _response_event_observed_at(

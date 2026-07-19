@@ -18,6 +18,7 @@ from app.models.runtime import BrokerOrder, BrokerOrderEvent, ExecutionFill, Exe
 from app.services.broker_auth import ensure_authenticated_broker_session
 from app.services.fill_idempotency import execution_fill_dedupe_key, execution_fill_idempotency_key
 from app.services.rejected_order_retries import handle_reconciled_rejected_order
+from app.services.runtime_transitions import apply_broker_order_status, set_plan_item_status
 
 
 def reconcile_broker_orders(
@@ -143,7 +144,7 @@ def reconcile_broker_order(
             "message": "unrecognized broker status",
         }
 
-    order.status = normalized_status
+    apply_broker_order_status(order=order, status=normalized_status)
     fills_added = _upsert_order_fills(
         db=db,
         order=order,
@@ -193,7 +194,21 @@ def reconcile_broker_order(
         if not retry_already_submitted:
             plan_status = _order_status_to_plan_item_status(order.status)
             if plan_status is not None:
-                order.plan_item.status = plan_status
+                set_plan_item_status(
+                    db=db,
+                    plan_item=order.plan_item,
+                    status=plan_status,
+                    source="reconciliation",
+                    reason="broker truth reconciliation updated plan item status",
+                    payload={
+                        "broker_order_pk": order.id,
+                        "broker_order_id": order.broker_order_id,
+                        "idempotency_key": order.idempotency_key,
+                        "status_before": order_status_before,
+                        "status": order.status,
+                    },
+                    occurred_at=event_time,
+                )
 
     status_changed = order.status != order_status_before
     db.commit()

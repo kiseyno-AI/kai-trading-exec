@@ -95,6 +95,12 @@ KAI_EXEC_KIS_ACCOUNT_NUMBER=12345678 \
 PYTHONPATH=apps/api uvicorn app.main:app --host 127.0.0.1 --port 8010
 ```
 
+Local runtime artifacts such as `var/`, `logs/`, `.omx/`, Python caches,
+pytest/coverage caches, and virtual environments are intentionally ignored.
+They are not execution-runtime source changes; inspect them only when debugging
+a local run, and keep durable schema or state-transition changes in migrations,
+services, tests, and docs.
+
 KIS auth/session settings currently supported:
 - `KAI_EXEC_KIS_APP_KEY`
 - `KAI_EXEC_KIS_APP_SECRET`

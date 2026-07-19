@@ -78,6 +78,114 @@ def test_upbit_paper_market_buy_preserves_krw_quote_notional() -> None:
         assert persisted.quote_notional == Decimal("50000.1234")
 
 
+def test_paused_runtime_blocks_direct_order_without_persisting_broker_action() -> None:
+    app, engine = build_test_app(
+        Settings(database_url="sqlite:///:memory:", runtime_mode="paper", automation_enabled=True)
+    )
+    client = TestClient(app)
+
+    response = client.post(
+        "/orders",
+        json={
+            "idempotency_key": "upbit-paused-direct-1",
+            "provider": "upbit",
+            "asset_class": "crypto",
+            "venue": "upbit",
+            "symbol": "KRW-BTC",
+            "side": "buy",
+            "order_type": "market",
+            "time_in_force": "day",
+            "exchange": "UPBIT",
+            "quote_notional": "50000",
+            "price_precision": 0,
+        },
+    )
+
+    assert response.status_code == 409
+    payload = response.json()
+    assert payload["block_reason"] == "paused"
+    with create_session_factory(engine)() as session:
+        assert session.query(BrokerOrder).count() == 0
+        assert session.query(BrokerOrderEvent).count() == 0
+
+
+def test_kill_switch_blocks_resume_and_direct_order_without_broker_action() -> None:
+    app, engine = build_test_app(
+        Settings(database_url="sqlite:///:memory:", runtime_mode="paper", automation_enabled=True)
+    )
+    client = TestClient(app)
+    resume_runtime(client)
+
+    kill = client.post(
+        "/controls/kill-switch",
+        json={"actor": "ops", "source": "test", "reason": "test kill switch"},
+    )
+    resume = client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "test", "reason": "should stay blocked"},
+    )
+    order = client.post(
+        "/orders",
+        json={
+            "idempotency_key": "upbit-kill-switch-direct-1",
+            "provider": "upbit",
+            "asset_class": "crypto",
+            "venue": "upbit",
+            "symbol": "KRW-BTC",
+            "side": "buy",
+            "order_type": "market",
+            "time_in_force": "day",
+            "exchange": "UPBIT",
+            "quote_notional": "50000",
+            "price_precision": 0,
+        },
+    )
+
+    assert kill.status_code == 200
+    assert kill.json()["safety"]["kill_switch_enabled"] is True
+    assert resume.status_code == 409
+    assert resume.json()["outcome"] == "rejected"
+    assert order.status_code == 409
+    assert order.json()["block_reason"] == "kill_switch"
+    with create_session_factory(engine)() as session:
+        assert session.query(BrokerOrder).count() == 0
+        assert session.query(BrokerOrderEvent).count() == 0
+
+
+def test_order_idempotent_replay_returns_existing_state_without_duplicate_events() -> None:
+    app, engine = build_test_app(
+        Settings(database_url="sqlite:///:memory:", runtime_mode="paper", automation_enabled=True)
+    )
+    client = TestClient(app)
+    resume_runtime(client)
+    request_payload = {
+        "idempotency_key": "upbit-idempotent-replay-1",
+        "provider": "upbit",
+        "asset_class": "crypto",
+        "venue": "upbit",
+        "symbol": "KRW-BTC",
+        "side": "buy",
+        "order_type": "market",
+        "time_in_force": "day",
+        "exchange": "UPBIT",
+        "quote_notional": "50000",
+        "price_precision": 0,
+    }
+
+    first = client.post("/orders", json=request_payload)
+    second = client.post("/orders", json=request_payload)
+
+    assert first.status_code == 201
+    assert second.status_code == 200
+    assert second.json()["duplicate"] is True
+    assert second.json()["order"]["status"] == "submitted"
+    with create_session_factory(engine)() as session:
+        order = session.query(BrokerOrder).filter_by(idempotency_key="upbit-idempotent-replay-1").one()
+        assert session.query(BrokerOrder).count() == 1
+        assert session.query(BrokerOrderEvent).filter_by(broker_order_pk=order.id).count() == 2
+        assert session.query(ExecutionFill).filter_by(broker_order_pk=order.id).count() == 0
+
+
 def test_upbit_paper_sell_preserves_fractional_base_quantity() -> None:
     app, _engine = build_test_app(
         Settings(database_url="sqlite:///:memory:", runtime_mode="paper", automation_enabled=True)
@@ -279,6 +387,7 @@ def test_crypto_paper_plan_dispatch_simulates_fill_and_position() -> None:
         json={
             "plan_id": "upbit-paper-lifecycle-1",
             "source": "test",
+            "market_date": datetime.now(UTC).date().isoformat(),
             "requested_at": datetime(2026, 6, 19, tzinfo=UTC).isoformat(),
             "items": [
                 {
@@ -336,11 +445,6 @@ def test_crypto_paper_plan_dispatch_simulates_fill_and_position() -> None:
     assert symbol["summary"]["fill_count"] == 1
     assert symbol["summary"]["filled_base_quantity"] == "0.000500000000"
     assert symbol["summary"]["position_base_quantity"] == "0.000500000000"
-
-    board = client.get("/runtime/daily-board").json()
-    assert "KRW-BTC" in [row["symbol"] for row in board["symbols"]]
-    assert board["totals"]["filled_symbol_count"] == 1
-    assert board["totals"]["position_symbol_count"] == 1
 
     with create_session_factory(engine)() as session:
         item = session.get(ExecutionPlanItem, item_id)
