@@ -15,7 +15,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
-from sqlalchemy.orm import Session, selectinload, sessionmaker
+from sqlalchemy.orm import Session, selectinload, sessionmaker, undefer
 
 from app.broker.base import BrokerAccountSnapshot, BrokerAdapter, BrokerAdapterError
 from app.core.config import Settings
@@ -501,7 +501,12 @@ def _load_candidate_plans(*, settings: Settings, db: Session, market_date) -> li
                 & (ExecutionPlanItem.status.in_(tuple(SIZED_WATCH_STATUSES)))
             ),
         )
-        .options(selectinload(ExecutionPlan.items))
+        .options(
+            selectinload(ExecutionPlan.items).options(
+                undefer(ExecutionPlanItem.quantity_policy),
+                undefer(ExecutionPlanItem.risk_context),
+            )
+        )
         .order_by(ExecutionPlan.accepted_at.asc(), ExecutionPlan.created_at.asc())
     ).all()
 

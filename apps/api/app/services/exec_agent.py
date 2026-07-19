@@ -2333,7 +2333,7 @@ def _new_monitoring_item(
     exit_rule: dict[str, object],
 ) -> ExecutionPlanItem:
     buy_market_date = buy_item.source_market_date or plan.market_date
-    close_exit_date = _add_trading_sessions(buy_market_date, max_sessions) if buy_market_date else None
+    close_exit_date = _add_trading_sessions(buy_market_date, max_sessions + 1) if buy_market_date else None
     return ExecutionPlanItem(
         plan_item_index=next_plan_item_index,
         symbol=buy_item.symbol,

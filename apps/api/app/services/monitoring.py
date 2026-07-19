@@ -5828,7 +5828,6 @@ def _update_monitoring_checkpoint(
     checkpoint.last_success_at = triggered_at
     checkpoint.details = details
     db.commit()
-    db.refresh(checkpoint)
     return checkpoint
 
 
