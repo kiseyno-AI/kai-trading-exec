@@ -35,6 +35,7 @@ from app.models.runtime import (
     ExecutionJob,
     ExecutionPlan,
     ExecutionPlanItem,
+    ExecutionPlanItemAudit,
     ExecutionPosition,
 )
 from app.services.execution_jobs import dispatch_due_execution_jobs
@@ -257,6 +258,14 @@ def test_reconcile_full_fill_is_idempotent_and_updates_position_snapshot() -> No
     position_result = sync_execution_positions_from_broker_snapshot(settings=settings, db=db, adapter=broker, symbols={"005930"})
 
     fills = db.scalars(select(ExecutionFill)).all()
+    events = db.scalars(
+        select(BrokerOrderEvent)
+        .where(
+            BrokerOrderEvent.broker_order_pk == order.id,
+            BrokerOrderEvent.event_type == "reconcile_result",
+        )
+        .order_by(BrokerOrderEvent.observed_at.asc())
+    ).all()
     position = db.scalar(select(ExecutionPosition).where(ExecutionPosition.symbol == "005930"))
     runtime_payload = build_runtime_status(
         settings=settings,
@@ -267,6 +276,12 @@ def test_reconcile_full_fill_is_idempotent_and_updates_position_snapshot() -> No
     assert first["fills_added"] == 1
     assert second["fills_added"] == 0
     assert len(fills) == 1
+    assert len(events) == 2
+    assert [event.normalized_status for event in events] == ["filled", "filled"]
+    assert [event.payload["provider"] for event in events] == ["kis", "kis"]
+    assert [event.payload["status"] for event in events] == ["filled", "filled"]
+    assert events[0].payload["normalized_payload"] == {"odno": "0033196600"}
+    assert events[1].payload["normalized_payload"] == {"odno": "0033196600"}
     assert fills[0].quantity == 2
     assert position_result["created"] == 1
     assert position is not None
@@ -402,8 +417,18 @@ def test_reconcile_filled_order_marks_plan_item_filled() -> None:
 
     result = reconcile_broker_order(settings=settings, db=db, adapter=broker, order=order)
 
+    audit = db.scalar(
+        select(ExecutionPlanItemAudit).where(
+            ExecutionPlanItemAudit.execution_plan_item_id == item.id,
+            ExecutionPlanItemAudit.event_type == "execution_plan_item_status_transition",
+        )
+    )
     assert result["status"] == "filled"
     assert item.status == "filled"
+    assert audit is not None
+    assert audit.source == "reconciliation"
+    assert audit.summary["previous_status"] == "broker_order_submitted"
+    assert audit.summary["status"] == "filled"
     engine.dispose()
 
 
@@ -1313,6 +1338,14 @@ def test_reconcile_kospi_circuit_breaker_sell_reject_schedules_retry() -> None:
     events = db.scalars(
         select(BrokerOrderEvent).where(BrokerOrderEvent.event_type == "retry_decision")
     ).all()
+    audits = db.scalars(
+        select(ExecutionPlanItemAudit)
+        .where(
+            ExecutionPlanItemAudit.execution_plan_item_id == item.id,
+            ExecutionPlanItemAudit.event_type == "execution_plan_item_status_transition",
+        )
+        .order_by(ExecutionPlanItemAudit.occurred_at.asc())
+    ).all()
     assert result["status"] == "retry_pending"
     assert order.status == "retry_pending"
     assert item.status == "broker_order_retry_pending"
@@ -1326,6 +1359,9 @@ def test_reconcile_kospi_circuit_breaker_sell_reject_schedules_retry() -> None:
     assert job.job_type == "broker_order_retry"
     assert job.status == "scheduled"
     assert events and events[0].retryable is True
+    assert audits
+    assert audits[-1].source == "rejected_order_retry"
+    assert audits[-1].summary["status"] == "broker_order_retry_pending"
     engine.dispose()
 
 
@@ -1512,6 +1548,12 @@ def test_reconcile_insufficient_holdings_sell_reject_does_not_retry() -> None:
     failure = db.scalar(
         select(ExecutionFailure).where(ExecutionFailure.broker_order_pk == order.id)
     )
+    audit = db.scalar(
+        select(ExecutionPlanItemAudit).where(
+            ExecutionPlanItemAudit.execution_plan_item_id == item.id,
+            ExecutionPlanItemAudit.event_type == "execution_plan_item_status_transition",
+        )
+    )
     assert failure is not None
     assert failure.classification == "insufficient_sellable_quantity"
     assert failure.retry_decision_status == "skipped"
@@ -1522,6 +1564,9 @@ def test_reconcile_insufficient_holdings_sell_reject_does_not_retry() -> None:
     )
     assert order.status == "rejected"
     assert item.status == "broker_order_rejected"
+    assert audit is not None
+    assert audit.source == "reconciliation"
+    assert audit.summary["status"] == "broker_order_rejected"
     engine.dispose()
 
 

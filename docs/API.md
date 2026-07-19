@@ -218,6 +218,26 @@ The initial migration creates the exec-owned runtime tables only:
 These tables are owned by `kai-trading-exec`; strategy generation and dashboard
 read models remain outside this repository boundary.
 
+## Runtime State Transitions
+
+Execution lifecycle status changes are centralized in
+`apps/api/app/services/runtime_transitions.py`. API handlers should stay thin
+and call services such as broker order placement, job dispatch, runtime
+controls, and reconciliation; those services should use the transition helpers
+when changing broker order, execution job, or execution plan item status.
+
+High-risk transitions also append durable evidence:
+- runtime pause/resume/kill-switch changes write `runtime_control_events`
+- broker submissions and reconciliation write `broker_order_events`
+- plan item status changes made through the transition service write
+  `execution_plan_item_audits`
+- retry decisions for rejected orders update `execution_failures` and write
+  broker order retry decision events
+
+This keeps allowed status names and plan-item status mapping discoverable
+without reading every API route, while preserving existing public response
+payloads.
+
 Safety control and broker auth actions are additionally audited in:
 - `runtime_control_events`
 - `broker_session_events`

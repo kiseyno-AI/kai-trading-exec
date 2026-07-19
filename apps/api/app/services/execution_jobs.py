@@ -30,6 +30,7 @@ from app.services.runtime_controls import (
     ensure_runtime_control_state,
     runtime_safety_payload,
 )
+from app.services.runtime_transitions import set_execution_job_status
 
 LOGGER = logging.getLogger(__name__)
 
@@ -262,11 +263,17 @@ def _claim_job(
     job: ExecutionJob,
     triggered_at: datetime,
 ) -> None:
-    job.status = "running"
-    job.locked_at = triggered_at
-    job.attempts += 1
-    job.last_error = None
-    job.plan_item.status = _dispatching_plan_item_status(job.job_type)
+    set_execution_job_status(
+        db=db,
+        job=job,
+        status="running",
+        source="execution_job_dispatch",
+        locked_at=triggered_at,
+        increment_attempts=True,
+        plan_item_status=_dispatching_plan_item_status(job.job_type),
+        reason="execution job claimed for dispatch",
+        occurred_at=triggered_at,
+    )
     db.commit()
 
 
@@ -296,10 +303,16 @@ def _recover_stale_running_jobs(
             triggered_at=triggered_at,
         ):
             continue
-        job.status = "retrying"
-        job.locked_at = None
-        job.last_error = "recovered stale running job after interrupted dispatch"
-        job.plan_item.status = _retrying_plan_item_status(job.job_type)
+        set_execution_job_status(
+            db=db,
+            job=job,
+            status="retrying",
+            source="execution_job_dispatch",
+            last_error="recovered stale running job after interrupted dispatch",
+            plan_item_status=_retrying_plan_item_status(job.job_type),
+            reason="recovered stale running job after interrupted dispatch",
+            occurred_at=triggered_at,
+        )
         recovered_any = True
 
     if recovered_any:
@@ -439,11 +452,16 @@ def _finish_job(
         options=[selectinload(ExecutionJob.plan_item)],
     )
     assert job is not None
-    job.status = status
-    job.locked_at = None
-    job.last_error = last_error
-    if plan_item_status is not None:
-        job.plan_item.status = plan_item_status
+    set_execution_job_status(
+        db=db,
+        job=job,
+        status=status,
+        source="execution_job_dispatch",
+        last_error=last_error,
+        plan_item_status=plan_item_status,
+        reason=last_error,
+        payload={"execution_job_id": job.id},
+    )
     db.commit()
     return status
 

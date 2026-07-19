@@ -10,7 +10,12 @@ __pycache__/
 .coverage
 htmlcov/
 .mypy_cache/
+.ruff_cache/
 ruff_cache/
 dist/
 build/
+var
 var/
+logs/
+*.log
+.omx/
