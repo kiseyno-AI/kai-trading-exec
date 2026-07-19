@@ -274,7 +274,7 @@ def effective_stop_price(
     entry_price: Decimal,
     upstream_stop_price: Decimal,
 ) -> Decimal:
-    hard_stop_pct = _decimal_setting(settings, "exec_agent_stop_loss_pct", Decimal("0.04"))
+    hard_stop_pct = max(_decimal_setting(settings, "exec_agent_stop_loss_pct", Decimal("0.04")), Decimal("0.04"))
     hard_stop_price = (entry_price * (Decimal("1") - hard_stop_pct)).quantize(
         Decimal("0.0001"),
         rounding=ROUND_DOWN,

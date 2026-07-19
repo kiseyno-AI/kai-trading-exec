@@ -1251,7 +1251,7 @@ def build_runtime_daily_board(
         runtime=runtime,
         db=db,
         autonomous_runtime=autonomous_runtime,
-        include_expensive_sections=False,
+        include_expensive_sections=True,
     )
     symbols: list[dict[str, object]] = []
     if runtime_status["dependencies"]["database"] == "ok" and runtime_status["dependencies"]["runtime_schema"] == "ok":

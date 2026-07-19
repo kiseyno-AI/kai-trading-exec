@@ -189,7 +189,7 @@ class ExecutionPlanItem(TimestampMixin, Base):
     side: Mapped[str] = mapped_column(String(16), nullable=False)
     intent: Mapped[str] = mapped_column(String(64), nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
-    quantity_policy: Mapped[dict[str, Any] | None] = mapped_column(JSON, deferred=True)
+    quantity_policy: Mapped[dict[str, Any] | None] = mapped_column(JSON)
     limit_price: Mapped[Decimal | None] = mapped_column(Numeric(18, 4))
     trigger_price: Mapped[Decimal | None] = mapped_column(Numeric(18, 4))
     time_in_force: Mapped[str | None] = mapped_column(String(32))
@@ -322,7 +322,7 @@ class BrokerOrderEvent(TimestampMixin, Base):
     message: Mapped[str | None] = mapped_column(Text, deferred=True)
     request_payload: Mapped[dict[str, Any] | None] = mapped_column(JSON, deferred=True)
     response_payload: Mapped[dict[str, Any] | None] = mapped_column(JSON, deferred=True)
-    payload: Mapped[dict[str, Any] | None] = mapped_column(JSON, deferred=True)
+    payload: Mapped[dict[str, Any] | None] = mapped_column(JSON)
     observed_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
