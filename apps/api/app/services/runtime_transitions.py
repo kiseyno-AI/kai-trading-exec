@@ -65,8 +65,8 @@ PLAN_ITEM_STATUSES = frozenset(
 BROKER_ORDER_TO_PLAN_ITEM_STATUS = {
     NormalizedBrokerOrderStatus.SUBMISSION_PENDING.value: "broker_order_submission_pending",
     NormalizedBrokerOrderStatus.SUBMITTED.value: "broker_order_submitted",
-    NormalizedBrokerOrderStatus.OPEN.value: "broker_order_open",
-    NormalizedBrokerOrderStatus.PARTIALLY_FILLED.value: "broker_order_partially_filled",
+    NormalizedBrokerOrderStatus.OPEN.value: "open",
+    NormalizedBrokerOrderStatus.PARTIALLY_FILLED.value: "partially_filled",
     NormalizedBrokerOrderStatus.FILLED.value: "filled",
     NormalizedBrokerOrderStatus.REJECTED.value: "broker_order_rejected",
     NormalizedBrokerOrderStatus.RETRY_PENDING.value: "broker_order_retry_pending",
