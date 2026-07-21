@@ -25,6 +25,7 @@ from app.models.runtime import (
     RuntimeControlState,
 )
 from app.services.broker_auth import ensure_authenticated_broker_session
+from app.services.live_market_context import load_live_market_regime_context, merge_live_market_regime_context
 from app.services.plan_item_identity import serialize_plan_item_source_identity
 from app.services.risk_sizing import (
     RiskSizingRejection,
@@ -980,6 +981,15 @@ def _decide_candidate(
     )
     existing_symbol_exposure = sizing_price * Decimal(existing_holding)
     account_basis = _minimum_decimal(account_context.available_cash, account_context.buying_power) or available_cash
+    market_regime_context = market_regime_context_from_item_payloads(
+        agent_contract.context,
+        item.risk_context,
+        item.quantity_policy,
+    )
+    market_regime_context = merge_live_market_regime_context(
+        market_regime_context,
+        load_live_market_regime_context(settings=settings),
+    )
     risk_sizing = resolve_risk_based_buy_quantity(
         settings=settings,
         account_basis=account_basis,
@@ -996,11 +1006,7 @@ def _decide_candidate(
             agent_contract=agent_contract,
             account_context=account_context,
         ),
-        market_regime_context=market_regime_context_from_item_payloads(
-            agent_contract.context,
-            item.risk_context,
-            item.quantity_policy,
-        ),
+        market_regime_context=market_regime_context,
         market_date=item.plan.market_date if item.plan is not None else None,
     )
     if isinstance(risk_sizing, RiskSizingRejection):

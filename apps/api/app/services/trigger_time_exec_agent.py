@@ -26,6 +26,7 @@ from app.broker.base import (
 from app.core.config import Settings
 from app.models.runtime import BrokerOrder, ExecutionPlan, ExecutionPlanItem, ExecutionPosition
 from app.services.broker_auth import ensure_authenticated_broker_session
+from app.services.live_market_context import load_live_market_regime_context, merge_live_market_regime_context
 from app.services.plan_item_identity import serialize_plan_item_source_identity
 from app.services.trade_outcome_feedback import load_latest_trade_outcome_feedback_snippet
 
@@ -503,7 +504,10 @@ def _market_context(
             )
     risk_context = item.risk_context if isinstance(item.risk_context, dict) else {}
     market_payload = _first_dict(risk_context, keys=("market_data", "quote", "orderbook", "order_book")) or {}
-    live_payload = live_market_context or {}
+    live_payload = merge_live_market_regime_context(
+        live_market_context or {},
+        load_live_market_regime_context(settings=settings),
+    )
     live_orderbook_payload = _first_dict(live_payload, keys=("orderbook", "order_book")) or {}
     session_type = (
         _first_payload_value(

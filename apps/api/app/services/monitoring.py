@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from functools import partial
+import logging
+import time
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import and_, distinct, func, or_, select, tuple_
@@ -40,12 +42,15 @@ from app.services.risk_sizing import (
     resolve_risk_based_buy_quantity,
 )
 from app.services.market_regime_guardrails import market_regime_context_from_item_payloads
+from app.services.live_market_context import load_live_market_regime_context, merge_live_market_regime_context
 from app.services.runtime_controls import (
     automated_order_submission_allowed,
     automated_order_submission_block_reason,
     ensure_runtime_control_state,
 )
 from app.services import trigger_time_exec_agent
+
+logger = logging.getLogger(__name__)
 
 SELL_MONITORED_INTENTS = frozenset({"target_sell", "stop_sell", "max_holding_close_sell"})
 WATCH_BUY_INTENTS = frozenset({"watch_buy", "trigger_buy", "chase_buy", "tactical_buy", "intraday_watch_buy", "next_open_buy"})
@@ -532,38 +537,7 @@ def list_autonomous_monitoring_symbols(
                 return
 
     if held_symbols:
-        held_symbol_rows = db.execute(
-            select(
-                ExecutionPlanItem.symbol,
-                func.min(ExecutionPlan.accepted_at).label("first_accepted_at"),
-                func.min(ExecutionPlan.id).label("first_plan_id"),
-            )
-            .join(ExecutionPlanItem.plan)
-            .where(
-                ExecutionPlan.mode == settings.runtime_mode,
-                ExecutionPlanItem.symbol.in_(sorted(held_symbols)),
-                ExecutionPlanItem.side == "sell",
-                ExecutionPlanItem.intent.in_(tuple(SELL_MONITORED_INTENTS)),
-                ExecutionPlanItem.status.in_(
-                    tuple(
-                        SELL_ACTIVE_MONITORING_STATUSES
-                        | SELL_PENDING_CONFIG_STATUSES
-                        | BLOCKED_MONITORING_STATUSES
-                        | PENDING_DISPATCH_MONITORING_STATUSES
-                    )
-                ),
-            )
-            .group_by(ExecutionPlanItem.symbol)
-            .order_by(
-                func.min(ExecutionPlan.accepted_at).asc(),
-                func.min(ExecutionPlan.id).asc(),
-                ExecutionPlanItem.symbol.asc(),
-            )
-            .limit(settings.monitoring_max_symbols_per_cycle)
-        ).all()
-        append_candidates(
-            [str(row.symbol) for row in held_symbol_rows]
-        )
+        return sorted(held_symbols)
 
     if len(symbol_candidates) < settings.monitoring_max_symbols_per_cycle:
         pending_sell_symbols = list(
@@ -798,6 +772,18 @@ def _evaluate_monitoring_cycle(
     allow_persisted_triggered_without_price: bool,
     update_checkpoint_if_idle: bool,
 ) -> EvaluateMonitoringResult:
+    cycle_started = time.monotonic()
+
+    def _log_cycle_step(step: str, **extra: object) -> None:
+        logger.info(
+            "monitoring_cycle_step",
+            extra={
+                "step": step,
+                "elapsed_ms": round((time.monotonic() - cycle_started) * 1000, 2),
+                **extra,
+            },
+        )
+
     released_drawdown_blocks = release_disabled_account_drawdown_watch_buy_blocks(
         settings=settings,
         db=db,
@@ -806,8 +792,16 @@ def _evaluate_monitoring_cycle(
     )
     if released_drawdown_blocks:
         db.flush()
+    skip_pre_cycle_broker_reconciliation = allow_persisted_triggered_without_price and bool(symbols)
+    _log_cycle_step(
+        "drawdown_release",
+        released_drawdown_blocks=released_drawdown_blocks,
+        skip_pre_cycle_broker_reconciliation=skip_pre_cycle_broker_reconciliation,
+        symbol_count=len(symbols or []),
+        price_count=len(prices),
+    )
     position_truth_refreshed_before_selection = False
-    if settings.runtime_mode == "live":
+    if settings.runtime_mode == "live" and not skip_pre_cycle_broker_reconciliation:
         _refresh_position_truth_if_stale(
             settings=settings,
             db=db,
@@ -815,12 +809,14 @@ def _evaluate_monitoring_cycle(
             symbols=symbols,
         )
         position_truth_refreshed_before_selection = True
+    _log_cycle_step("position_truth_before_selection")
     items = _load_monitored_items(
         settings=settings,
         db=db,
         exclude_pending_config=allow_persisted_triggered_without_price,
         symbols=symbols,
     )
+    _log_cycle_step("load_monitored_items", item_count=len(items))
     _reactivate_retryable_protective_stops(
         items=items,
         db=db,
@@ -831,31 +827,44 @@ def _evaluate_monitoring_cycle(
         for item in items
         if not _is_watch_buy_item(item)
     }
-    _reconcile_before_monitoring(
-        settings=settings,
-        db=db,
-        adapter=adapter,
-        symbols=sell_monitored_symbols,
-        refresh_positions=not position_truth_refreshed_before_selection,
-    )
-    if not position_truth_refreshed_before_selection:
+    if not skip_pre_cycle_broker_reconciliation:
+        _reconcile_before_monitoring(
+            settings=settings,
+            db=db,
+            adapter=adapter,
+            symbols=sell_monitored_symbols,
+            refresh_positions=not position_truth_refreshed_before_selection,
+        )
+    _log_cycle_step("reconcile_before_monitoring", sell_symbol_count=len(sell_monitored_symbols))
+    if not position_truth_refreshed_before_selection and not skip_pre_cycle_broker_reconciliation:
         _refresh_position_truth_if_stale(
             settings=settings,
             db=db,
             adapter=adapter,
             symbols=sell_monitored_symbols,
         )
+    _log_cycle_step("position_truth_after_selection")
     positions_by_symbol = _load_positions_by_symbol(
         settings=settings,
         db=db,
         symbols=symbols,
     )
-    post_entry_maintenance_count, post_entry_review_count = _maintain_post_entry_exit_monitors(
-        settings=settings,
-        db=db,
-        positions_by_symbol=positions_by_symbol,
-        prices=prices,
-        triggered_at=triggered_at,
+    _log_cycle_step("load_positions", position_count=len(positions_by_symbol))
+    if skip_pre_cycle_broker_reconciliation:
+        post_entry_maintenance_count = 0
+        post_entry_review_count = 0
+    else:
+        post_entry_maintenance_count, post_entry_review_count = _maintain_post_entry_exit_monitors(
+            settings=settings,
+            db=db,
+            positions_by_symbol=positions_by_symbol,
+            prices=prices,
+            triggered_at=triggered_at,
+        )
+    _log_cycle_step(
+        "post_entry_maintenance",
+        post_entry_maintenance_count=post_entry_maintenance_count,
+        post_entry_review_count=post_entry_review_count,
     )
     if post_entry_maintenance_count:
         db.flush()
@@ -865,12 +874,21 @@ def _evaluate_monitoring_cycle(
             exclude_pending_config=allow_persisted_triggered_without_price,
             symbols=symbols,
         )
-    coverage_issues, repaired_stop_coverage_count = _repair_unprotected_stop_coverage(
-        settings=settings,
-        db=db,
-        positions_by_symbol=positions_by_symbol,
-        symbols=symbols,
-        triggered_at=triggered_at,
+    if skip_pre_cycle_broker_reconciliation:
+        coverage_issues = []
+        repaired_stop_coverage_count = 0
+    else:
+        coverage_issues, repaired_stop_coverage_count = _repair_unprotected_stop_coverage(
+            settings=settings,
+            db=db,
+            positions_by_symbol=positions_by_symbol,
+            symbols=symbols,
+            triggered_at=triggered_at,
+        )
+    _log_cycle_step(
+        "stop_coverage",
+        coverage_issue_count=len(coverage_issues),
+        repaired_stop_coverage_count=repaired_stop_coverage_count,
     )
     if repaired_stop_coverage_count:
         db.flush()
@@ -1138,6 +1156,32 @@ def _evaluate_monitoring_cycle(
         if retry_persisted_trigger:
             retried_triggered_item_count += 1
             retried_triggered_symbols.add(item.symbol)
+
+        if item.status in AGENT_ACTIVE_STATUSES:
+            blocked_item_count += 1
+            result_by_item_id[item.id] = _monitoring_result_payload(
+                item=item,
+                observed_price=observed_price,
+                outcome="agent_pending",
+                block_reason="trigger_time_exec_agent_active",
+                message="trigger-time exec-agent decision is already pending for this item",
+                trigger_reason=trigger_reason,
+                trigger_metadata=trigger_metadata,
+            )
+            continue
+
+        if allow_persisted_triggered_without_price and item.intent == "max_holding_close_sell":
+            deferred_item_count += 1
+            result_by_item_id[item.id] = _monitoring_result_payload(
+                item=item,
+                observed_price=observed_price,
+                outcome="deferred",
+                block_reason="max_holding_close_deferred_from_autonomous_cycle",
+                message="max-holding close condition is monitored but not submitted inside the autonomous heartbeat cycle",
+                trigger_reason=trigger_reason,
+                trigger_metadata=trigger_metadata,
+            )
+            continue
 
         triggered_item_count += 1
         triggered_symbols.add(item.symbol)
@@ -1582,6 +1626,12 @@ def _evaluate_monitoring_cycle(
         if symbol_actions:
             pending_symbols.append(symbol)
 
+    _log_cycle_step(
+        "evaluate_items",
+        evaluated_item_count=len(evaluated_item_ids),
+        triggered_item_count=triggered_item_count,
+        dispatch_action_count=dispatch_action_count,
+    )
     backlog_symbols: set[str] = set()
     for symbol, symbol_actions in actions_by_symbol.items():
         while symbol_actions:
@@ -1602,10 +1652,21 @@ def _evaluate_monitoring_cycle(
         if item_id in result_by_item_id
     ]
     db.flush()
-    agent_status_counts = _trigger_time_agent_status_counts(
-        settings=settings,
-        db=db,
-    )
+    _log_cycle_step("flush_results", result_count=len(results))
+    if skip_pre_cycle_broker_reconciliation:
+        agent_status_counts = {
+            "watching": 0,
+            "pending_agent_decision": 0,
+            "agent_delayed": 0,
+            "agent_rejected": 0,
+            "agent_approved_submitted": 0,
+        }
+    else:
+        agent_status_counts = _trigger_time_agent_status_counts(
+            settings=settings,
+            db=db,
+        )
+    _log_cycle_step("agent_status_counts")
     checkpoint_details = {
         "topology": MONITORING_RUNTIME_TOPOLOGY,
         "selection_strategy": MONITORING_SELECTION_STRATEGY,
@@ -1648,6 +1709,7 @@ def _evaluate_monitoring_cycle(
             status="degraded" if deferred_item_count > 0 or degraded_coverage_count > 0 else "running",
             details=checkpoint_details,
         )
+    _log_cycle_step("checkpoint_update")
     return EvaluateMonitoringResult(
         status_code=200,
         payload={
@@ -2112,6 +2174,55 @@ def _load_monitored_items(
         )
         if not exclude_pending_config:
             sell_fast_statuses = sell_fast_statuses | SELL_PENDING_CONFIG_STATUSES
+        sell_load_options = (
+            load_only(
+                ExecutionPlanItem.id,
+                ExecutionPlanItem.execution_plan_id,
+                ExecutionPlanItem.plan_item_index,
+                ExecutionPlanItem.symbol,
+                ExecutionPlanItem.side,
+                ExecutionPlanItem.intent,
+                ExecutionPlanItem.status,
+                ExecutionPlanItem.quantity_policy,
+                ExecutionPlanItem.limit_price,
+                ExecutionPlanItem.trigger_price,
+                ExecutionPlanItem.time_in_force,
+                ExecutionPlanItem.risk_context,
+                ExecutionPlanItem.decision_agent_name,
+                ExecutionPlanItem.decision_snapshot_id,
+                ExecutionPlanItem.decision_run_id,
+                ExecutionPlanItem.source_plan_item_id,
+                ExecutionPlanItem.source_market_date,
+            ),
+        )
+        if exclude_pending_config:
+            sell_items = []
+            for symbol in symbol_list:
+                sell_items.extend(
+                    db.scalars(
+                        select(ExecutionPlanItem)
+                        .where(
+                            ExecutionPlanItem.symbol == symbol,
+                            ExecutionPlanItem.side == "sell",
+                            ExecutionPlanItem.intent.in_(tuple(SELL_MONITORED_INTENTS)),
+                            ExecutionPlanItem.status.in_(tuple(sell_fast_statuses)),
+                        )
+                        .options(*sell_load_options)
+                        .order_by(
+                            ExecutionPlanItem.plan_item_index.asc(),
+                            ExecutionPlanItem.id.asc(),
+                        )
+                    ).all()
+                )
+            symbol_order = {symbol: index for index, symbol in enumerate(symbol_list)}
+            return sorted(
+                sell_items,
+                key=lambda item: (
+                    symbol_order.get(item.symbol, len(symbol_order)),
+                    item.plan_item_index,
+                    item.id,
+                ),
+            )
         sell_items = db.scalars(
             select(ExecutionPlanItem)
             .where(
@@ -2121,20 +2232,7 @@ def _load_monitored_items(
                 ExecutionPlanItem.status.in_(tuple(sell_fast_statuses)),
             )
             .options(
-                load_only(
-                    ExecutionPlanItem.id,
-                    ExecutionPlanItem.execution_plan_id,
-                    ExecutionPlanItem.plan_item_index,
-                    ExecutionPlanItem.symbol,
-                    ExecutionPlanItem.side,
-                    ExecutionPlanItem.intent,
-                    ExecutionPlanItem.status,
-                    ExecutionPlanItem.quantity_policy,
-                    ExecutionPlanItem.limit_price,
-                    ExecutionPlanItem.trigger_price,
-                    ExecutionPlanItem.time_in_force,
-                    ExecutionPlanItem.source_market_date,
-                ),
+                *sell_load_options,
                 selectinload(ExecutionPlanItem.plan).load_only(
                     ExecutionPlan.id,
                     ExecutionPlan.mode,
@@ -4579,6 +4677,11 @@ def _resolve_watch_buy_order(
                 message="exec-agent approved notional cannot buy one share at the current entry price",
                 details=details,
             )
+    market_regime_context = market_regime_context_from_item_payloads(item.risk_context, item.quantity_policy)
+    market_regime_context = merge_live_market_regime_context(
+        market_regime_context,
+        load_live_market_regime_context(settings=settings),
+    )
     risk_decision = resolve_risk_based_buy_quantity(
         settings=settings,
         account_basis=available_cash,
@@ -4595,7 +4698,7 @@ def _resolve_watch_buy_order(
             db=db,
             market_date=item.plan.market_date,
         ),
-        market_regime_context=market_regime_context_from_item_payloads(item.risk_context, item.quantity_policy),
+        market_regime_context=market_regime_context,
         market_date=item.plan.market_date,
     )
     if isinstance(risk_decision, RiskSizingRejection):

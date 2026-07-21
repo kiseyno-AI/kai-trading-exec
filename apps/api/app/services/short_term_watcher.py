@@ -15,6 +15,7 @@ from app.models.runtime import BrokerOrder, ExecutionPlan, ExecutionPlanItem, Ex
 from app.services.broker_auth import ensure_authenticated_broker_session
 from app.services.broker_orders import place_broker_order
 from app.services.execution_api import serialize_broker_order
+from app.services.live_market_context import load_live_market_regime_context, merge_live_market_regime_context
 from app.services.market_regime_guardrails import evaluate_market_regime_guardrail, market_regime_context_from_item_payloads
 from app.services.runtime_controls import (
     automated_order_submission_allowed,
@@ -304,7 +305,10 @@ def _candidate_context(
         "open_buy_order_count": len(open_orders) + account_context.open_order_symbols.count(item.symbol),
         "broker_account_source": broker_account_snapshot.source if broker_account_snapshot is not None else "request",
         "open_order_ids": [order.id for order in open_orders],
-        "market_regime_context": market_regime_context_from_item_payloads(item.risk_context, item.quantity_policy),
+        "market_regime_context": merge_live_market_regime_context(
+            market_regime_context_from_item_payloads(item.risk_context, item.quantity_policy),
+            load_live_market_regime_context(settings=settings),
+        ),
         "market_date": item.plan.market_date.isoformat() if item.plan is not None and item.plan.market_date else None,
     }
 

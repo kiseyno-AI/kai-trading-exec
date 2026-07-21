@@ -22,6 +22,7 @@ from app.core.config import Settings
 from app.db.sqlite_diagnostics import sqlite_write_lock
 from app.models.runtime import ExecutionPlan, ExecutionPlanItem, ExecutionPlanItemAudit
 from app.services.broker_auth import ensure_authenticated_broker_session
+from app.services.live_market_context import load_live_market_regime_context, merge_live_market_regime_context
 from app.services.market_regime_guardrails import evaluate_market_regime_guardrail
 from app.services.reconciliation import reconcile_stale_nonterminal_broker_orders
 from app.services.risk_sizing import apply_vol_corr_quantity_cap
@@ -1722,9 +1723,13 @@ def _allowed_action_envelope_for_candidate(
         hard_reject_reasons.append("invalid_stop_distance")
 
     max_notional = min(cap_candidates).quantize(Decimal("0.0001"), rounding=ROUND_DOWN)
+    market_context = merge_live_market_regime_context(
+        candidate if isinstance(candidate, dict) else {},
+        load_live_market_regime_context(settings=settings),
+    )
     market_guardrail = evaluate_market_regime_guardrail(
         settings=settings,
-        context=candidate,
+        context=market_context,
         market_date=candidate.get("market_date"),
         original_notional=max_notional,
         reference_price=sizing_price if sizing_price > 0 else None,

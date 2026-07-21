@@ -92,7 +92,9 @@ def evaluate_market_regime_guardrail(
     multiplier = Decimal("1")
     cap_notional = None
     if posture == "risk_off":
-        action = "reject"
+        action = "downsize"
+        multiplier = min(multiplier, Decimal(str(settings.market_regime_risk_off_sizing_multiplier)))
+        cap_notional = _positive_decimal(settings.market_regime_risk_off_max_notional_krw)
     elif posture in {"caution", "stale"}:
         action = "downsize"
         multiplier = min(multiplier, Decimal(str(settings.market_regime_caution_sizing_multiplier)))
@@ -409,6 +411,8 @@ def _audit_payload(
             "missing_breadth_behavior": settings.market_regime_missing_breadth_behavior,
             "live_missing_breadth_behavior": settings.market_regime_live_missing_breadth_behavior,
             "stale_breadth_behavior": settings.market_regime_stale_breadth_behavior,
+            "risk_off_multiplier": _decimal_text(settings.market_regime_risk_off_sizing_multiplier),
+            "risk_off_max_notional_krw": _decimal_text(settings.market_regime_risk_off_max_notional_krw),
             "caution_multiplier": _decimal_text(settings.market_regime_caution_sizing_multiplier),
             "sector_weak_behavior": settings.market_regime_sector_weak_behavior,
             "sector_weak_multiplier": _decimal_text(settings.market_regime_sector_weak_multiplier),

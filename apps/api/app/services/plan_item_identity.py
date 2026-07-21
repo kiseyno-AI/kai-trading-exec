@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import date
 from typing import Any
 
+from sqlalchemy import inspect as sa_inspect
+
 from app.models.runtime import ExecutionPlanItem
 
 _DECISION_AGENT_KEYS = (
@@ -27,7 +29,11 @@ _SOURCE_IDENTITY_SORT_KEYS = (
 
 
 def raw_plan_item_payload(plan_item: ExecutionPlanItem) -> dict[str, Any] | None:
+    if "plan" in sa_inspect(plan_item).unloaded:
+        return None
     plan = plan_item.plan
+    if "raw_payload" in sa_inspect(plan).unloaded:
+        return None
     if not isinstance(plan.raw_payload, dict):
         return None
     raw_items = plan.raw_payload.get("items")
@@ -65,12 +71,15 @@ def plan_item_source_market_date(plan_item: ExecutionPlanItem) -> date | None:
     parsed = _first_date_value(plan_item=plan_item, keys=_SOURCE_MARKET_DATE_KEYS)
     if parsed is not None:
         return parsed
+    if "plan" in sa_inspect(plan_item).unloaded:
+        return None
     return plan_item.plan.market_date
 
 
 def serialize_plan_item_source_identity(plan_item: ExecutionPlanItem) -> dict[str, object | None]:
     decision_agent_name = plan_item_decision_agent_name(plan_item)
     source_plan_item_id = plan_item_source_plan_item_id(plan_item)
+    plan = None if "plan" in sa_inspect(plan_item).unloaded else plan_item.plan
     return {
         "decision_agent_name": decision_agent_name,
         "agent_name": decision_agent_name,
@@ -78,10 +87,10 @@ def serialize_plan_item_source_identity(plan_item: ExecutionPlanItem) -> dict[st
         "decision_run_id": plan_item_decision_run_id(plan_item),
         "source_plan_item_id": source_plan_item_id,
         "core_plan_item_id": source_plan_item_id,
-        "source_plan_id": plan_item.plan.external_plan_id,
-        "core_plan_id": plan_item.plan.external_plan_id,
-        "plan_source": plan_item.plan.source,
-        "strategy_run_id": plan_item.plan.strategy_run_id,
+        "source_plan_id": plan.external_plan_id if plan is not None else None,
+        "core_plan_id": plan.external_plan_id if plan is not None else None,
+        "plan_source": plan.source if plan is not None else None,
+        "strategy_run_id": plan.strategy_run_id if plan is not None else None,
         "source_market_date": _serialize_date(plan_item_source_market_date(plan_item)),
     }
 
@@ -137,7 +146,11 @@ def _candidate_payloads(plan_item: ExecutionPlanItem) -> list[dict[str, Any]]:
         payloads.append(raw_item)
     if isinstance(plan_item.risk_context, dict):
         payloads.append(plan_item.risk_context)
+    if "plan" in sa_inspect(plan_item).unloaded:
+        return payloads
     plan = plan_item.plan
+    if "raw_payload" in sa_inspect(plan).unloaded:
+        return payloads
     if isinstance(plan.raw_payload, dict):
         payloads.append(plan.raw_payload)
     return payloads

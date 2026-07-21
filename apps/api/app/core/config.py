@@ -118,6 +118,8 @@ class Settings(BaseModel):
     market_regime_missing_breadth_behavior: str = "neutral_with_warning"
     market_regime_live_missing_breadth_behavior: str = "caution"
     market_regime_stale_breadth_behavior: str = "caution"
+    market_regime_risk_off_sizing_multiplier: Decimal = Field(default=Decimal("0.15"), gt=0, le=1)
+    market_regime_risk_off_max_notional_krw: Decimal = Field(default=Decimal("500000"), ge=0)
     market_regime_caution_sizing_multiplier: Decimal = Field(default=Decimal("0.33"), gt=0, le=1)
     market_regime_caution_max_notional_krw: Decimal = Field(default=Decimal("1000000"), ge=0)
     market_regime_sector_weak_behavior: str = "downsize"
@@ -125,6 +127,11 @@ class Settings(BaseModel):
     market_regime_sector_weak_max_notional_krw: Decimal = Field(default=Decimal("750000"), ge=0)
     market_regime_sector_weak_percentile_threshold: Decimal = Field(default=Decimal("0.30"), ge=0, le=1)
     market_regime_sector_weak_relative_return_pct: Decimal = Field(default=Decimal("-2.0"), ge=Decimal("-100"), le=Decimal("100"))
+    market_context_enabled: bool = False
+    market_context_base_url: str | None = None
+    market_context_bearer_token: str | None = None
+    market_context_timeout_seconds: float = Field(default=5.0, gt=0, le=120)
+    market_context_cache_ttl_seconds: int = Field(default=60, ge=1, le=3600)
     trade_outcome_feedback_enabled: bool = True
     trade_outcome_feedback_dir: str = "var/analytics/trade_outcome_feedback"
     trade_outcome_feedback_lookback_days: int = Field(default=20, ge=1, le=365)
@@ -309,6 +316,8 @@ _ENV_FIELDS = {
     "MARKET_REGIME_MISSING_BREADTH_BEHAVIOR": "market_regime_missing_breadth_behavior",
     "MARKET_REGIME_LIVE_MISSING_BREADTH_BEHAVIOR": "market_regime_live_missing_breadth_behavior",
     "MARKET_REGIME_STALE_BREADTH_BEHAVIOR": "market_regime_stale_breadth_behavior",
+    "MARKET_REGIME_RISK_OFF_SIZING_MULTIPLIER": "market_regime_risk_off_sizing_multiplier",
+    "MARKET_REGIME_RISK_OFF_MAX_NOTIONAL_KRW": "market_regime_risk_off_max_notional_krw",
     "MARKET_REGIME_CAUTION_SIZING_MULTIPLIER": "market_regime_caution_sizing_multiplier",
     "MARKET_REGIME_CAUTION_MAX_NOTIONAL_KRW": "market_regime_caution_max_notional_krw",
     "MARKET_REGIME_SECTOR_WEAK_BEHAVIOR": "market_regime_sector_weak_behavior",
@@ -316,6 +325,11 @@ _ENV_FIELDS = {
     "MARKET_REGIME_SECTOR_WEAK_MAX_NOTIONAL_KRW": "market_regime_sector_weak_max_notional_krw",
     "MARKET_REGIME_SECTOR_WEAK_PERCENTILE_THRESHOLD": "market_regime_sector_weak_percentile_threshold",
     "MARKET_REGIME_SECTOR_WEAK_RELATIVE_RETURN_PCT": "market_regime_sector_weak_relative_return_pct",
+    "MARKET_CONTEXT_ENABLED": "market_context_enabled",
+    "MARKET_CONTEXT_BASE_URL": "market_context_base_url",
+    "MARKET_CONTEXT_BEARER_TOKEN": "market_context_bearer_token",
+    "MARKET_CONTEXT_TIMEOUT_SECONDS": "market_context_timeout_seconds",
+    "MARKET_CONTEXT_CACHE_TTL_SECONDS": "market_context_cache_ttl_seconds",
     "TRADE_OUTCOME_FEEDBACK_ENABLED": "trade_outcome_feedback_enabled",
     "TRADE_OUTCOME_FEEDBACK_DIR": "trade_outcome_feedback_dir",
     "TRADE_OUTCOME_FEEDBACK_LOOKBACK_DAYS": "trade_outcome_feedback_lookback_days",

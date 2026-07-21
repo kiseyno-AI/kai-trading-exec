@@ -1,6 +1,6 @@
 from decimal import Decimal
 
-from app.core.config import Settings
+from app.core.config import Settings, load_settings
 from app.services.risk_sizing import RiskSizingRejection, RiskSizingResult, resolve_risk_based_buy_quantity
 
 
@@ -12,6 +12,24 @@ def test_default_exec_sizing_uses_three_x_short_term_budget_caps() -> None:
     assert settings.exec_agent_base_risk_pct == Decimal("0.015")
     assert settings.exec_agent_max_position_allocation_pct == Decimal("0.30")
     assert settings.exec_agent_max_symbol_total_exposure_pct == Decimal("0.30")
+
+
+def test_settings_loads_market_context_controls() -> None:
+    settings = load_settings(
+        {
+            "KAI_EXEC_MARKET_CONTEXT_ENABLED": "true",
+            "KAI_EXEC_MARKET_CONTEXT_BASE_URL": "http://127.0.0.1:8000",
+            "KAI_EXEC_MARKET_CONTEXT_BEARER_TOKEN": "token",
+            "KAI_EXEC_MARKET_CONTEXT_TIMEOUT_SECONDS": "7",
+            "KAI_EXEC_MARKET_CONTEXT_CACHE_TTL_SECONDS": "45",
+        }
+    )
+
+    assert settings.market_context_enabled is True
+    assert settings.market_context_base_url == "http://127.0.0.1:8000"
+    assert settings.market_context_bearer_token == "token"
+    assert settings.market_context_timeout_seconds == 7
+    assert settings.market_context_cache_ttl_seconds == 45
 
 
 def test_default_downside_guardrails_are_conservative_after_loss_week() -> None:
@@ -212,9 +230,9 @@ def test_risk_sizing_normal_market_breadth_preserves_baseline_quantity() -> None
     assert guardrail["action"] == "allow"
 
 
-def test_risk_sizing_caution_market_breadth_downsizes_quantity() -> None:
+def test_risk_sizing_risk_off_market_breadth_downsizes_quantity() -> None:
     decision = resolve_risk_based_buy_quantity(
-        settings=Settings(market_regime_caution_sizing_multiplier=Decimal("0.50")),
+        settings=Settings(market_regime_risk_off_sizing_multiplier=Decimal("0.20")),
         account_basis=Decimal("10000000"),
         available_cash=Decimal("10000000"),
         entry_price=Decimal("100000"),
@@ -233,9 +251,13 @@ def test_risk_sizing_caution_market_breadth_downsizes_quantity() -> None:
         market_date="2026-06-25",
     )
 
-    assert isinstance(decision, RiskSizingRejection)
-    assert decision.reason_code == "market_breadth_risk_off"
-    assert decision.details["market_regime_guardrail"]["action"] == "reject"
+    assert isinstance(decision, RiskSizingResult)
+    assert decision.quantity == 5
+    guardrail = decision.cap_details["market_regime_guardrail"]
+    assert guardrail["market_regime_posture"] == "risk_off"
+    assert guardrail["market_regime_reason_code"] == "market_breadth_risk_off"
+    assert guardrail["action"] == "downsize"
+    assert guardrail["multiplier"] == "0.2000"
 
 
 def test_risk_sizing_below_normal_market_breadth_downsizes_quantity() -> None:
@@ -266,7 +288,7 @@ def test_risk_sizing_below_normal_market_breadth_downsizes_quantity() -> None:
     assert guardrail["multiplier"] == "0.3300"
 
 
-def test_risk_sizing_risk_off_market_breadth_rejects_buy() -> None:
+def test_risk_sizing_risk_off_market_breadth_downsizes_buy() -> None:
     decision = resolve_risk_based_buy_quantity(
         settings=Settings(),
         account_basis=Decimal("10000000"),
@@ -287,9 +309,12 @@ def test_risk_sizing_risk_off_market_breadth_rejects_buy() -> None:
         market_date="2026-06-25",
     )
 
-    assert isinstance(decision, RiskSizingRejection)
-    assert decision.reason_code == "market_breadth_risk_off"
-    assert decision.details["market_regime_guardrail"]["action"] == "reject"
+    assert isinstance(decision, RiskSizingResult)
+    assert decision.quantity == 4
+    guardrail = decision.cap_details["market_regime_guardrail"]
+    assert guardrail["market_regime_posture"] == "risk_off"
+    assert guardrail["market_regime_reason_code"] == "market_breadth_risk_off"
+    assert guardrail["action"] == "downsize"
 
 
 def test_risk_sizing_missing_market_breadth_in_live_automation_downsizes() -> None:
@@ -317,7 +342,7 @@ def test_risk_sizing_missing_market_breadth_in_live_automation_downsizes() -> No
     assert "market_breadth_missing" in guardrail["warnings"]
 
 
-def test_risk_sizing_nested_decider_handoff_market_regime_rejects_risk_off() -> None:
+def test_risk_sizing_nested_decider_handoff_market_regime_rejects_when_downsized_below_one_share() -> None:
     decision = resolve_risk_based_buy_quantity(
         settings=Settings(runtime_mode="live", automation_enabled=True),
         account_basis=Decimal("8517680"),
@@ -352,11 +377,11 @@ def test_risk_sizing_nested_decider_handoff_market_regime_rejects_risk_off() -> 
     )
 
     assert isinstance(decision, RiskSizingRejection)
-    assert decision.reason_code == "market_breadth_risk_off"
+    assert decision.reason_code == "market_regime_min_lot_rejected"
     guardrail = decision.details["market_regime_guardrail"]
     assert guardrail["breadth"]["up_count"] == 213
     assert guardrail["market_regime_posture"] == "risk_off"
-    assert guardrail["action"] == "reject"
+    assert guardrail["action"] == "downsize"
 
 
 def test_risk_sizing_market_regime_downsize_below_one_share_has_precise_reason() -> None:
