@@ -3,17 +3,19 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, time
 from decimal import Decimal
 from typing import Callable, Iterable
 from zoneinfo import ZoneInfo
 
+from sqlalchemy import distinct, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.api.schemas.execution import MonitoringPriceRequest
 from app.broker.base import BrokerAdapter
 from app.core.config import Settings
+from app.models.runtime import BrokerOrder, ExecutionFill
 from app.services.execution_jobs import dispatch_due_execution_jobs
 from app.services.monitoring import (
     WATCH_BUY_INTENTS,
@@ -33,6 +35,7 @@ MONITORING_LOOP_WORKER_NAME = "monitoring_dispatch_loop"
 WATCH_EXEC_AGENT_SIZING_WORKER_NAME = "watch_exec_agent_sizing_loop"
 NXT_ELIGIBLE_SYNC_WORKER_NAME = "nxt_eligible_sync_loop"
 MAX_STATUS_DETAIL_ITEMS = 20
+KRX_TIMEZONE = ZoneInfo("Asia/Seoul")
 
 
 @dataclass
@@ -115,6 +118,7 @@ class MonitoringRuntimeSnapshot:
     symbols: list[str]
     positions_by_symbol: dict[str, CachedMonitoringPosition]
     items: list[CachedMonitoringItem]
+    filled_today_symbols: list[str]
 
     def snapshot(self) -> dict[str, object]:
         return {
@@ -122,6 +126,7 @@ class MonitoringRuntimeSnapshot:
             "symbol_count": len(self.symbols),
             "item_count": len(self.items),
             "position_count": len(self.positions_by_symbol),
+            "filled_today_symbols": list(self.filled_today_symbols),
         }
 
 
@@ -375,6 +380,7 @@ class AutonomousRuntimeCoordinator:
     def _monitoring_cycle_sync(self, started_at: datetime) -> dict[str, object]:
         runtime_snapshot = self._ensure_monitoring_runtime_snapshot(started_at)
         self._reconcile_and_refresh_monitoring_snapshot_if_due(started_at)
+        self._refresh_monitoring_snapshot_filled_today(started_at)
         runtime_snapshot = self._ensure_monitoring_runtime_snapshot(started_at)
         symbols = runtime_snapshot.symbols
         if not symbols:
@@ -511,6 +517,26 @@ class AutonomousRuntimeCoordinator:
             reconcile_broker=True,
         )
 
+    def _refresh_monitoring_snapshot_filled_today(self, now: datetime) -> None:
+        with self._lock:
+            snapshot = self._monitoring_runtime_snapshot
+        if snapshot is None:
+            return
+        with self.session_factory() as db:
+            filled_today_symbols = _load_filled_today_symbols(
+                settings=self.settings,
+                db=db,
+                now=now,
+            )
+        if filled_today_symbols == snapshot.filled_today_symbols:
+            return
+        with self._lock:
+            if self._monitoring_runtime_snapshot is snapshot:
+                self._monitoring_runtime_snapshot = replace(
+                    snapshot,
+                    filled_today_symbols=filled_today_symbols,
+                )
+
     def _load_monitoring_runtime_snapshot(self, loaded_at: datetime) -> MonitoringRuntimeSnapshot:
         with self.session_factory() as db:
             symbols = list_autonomous_monitoring_symbols(
@@ -527,6 +553,11 @@ class AutonomousRuntimeCoordinator:
                 db=db,
                 exclude_pending_config=True,
                 symbols=symbols,
+            )
+            filled_today_symbols = _load_filled_today_symbols(
+                settings=self.settings,
+                db=db,
+                now=loaded_at,
             )
         return MonitoringRuntimeSnapshot(
             loaded_at=loaded_at,
@@ -549,6 +580,7 @@ class AutonomousRuntimeCoordinator:
                 )
                 for item in items
             ],
+            filled_today_symbols=filled_today_symbols,
         )
 
     def _evaluate_cached_monitoring_cycle(
@@ -1037,6 +1069,33 @@ def _is_regular_market_session(*, now: datetime, market_timezone: str) -> bool:
     if local_now.weekday() >= 5:
         return False
     return time(9, 0) <= local_now.time() <= time(15, 30)
+
+
+def _load_filled_today_symbols(
+    *,
+    settings: Settings,
+    db: Session,
+    now: datetime,
+) -> list[str]:
+    today_start_utc, tomorrow_start_utc = _current_krx_day_utc_bounds(now)
+    symbols = db.scalars(
+        select(distinct(ExecutionFill.symbol))
+        .select_from(ExecutionFill)
+        .join(ExecutionFill.broker_order)
+        .where(
+            BrokerOrder.mode == settings.runtime_mode,
+            ExecutionFill.filled_at >= today_start_utc,
+            ExecutionFill.filled_at < tomorrow_start_utc,
+        )
+    ).all()
+    return sorted(str(symbol) for symbol in symbols)
+
+
+def _current_krx_day_utc_bounds(now: datetime | None = None) -> tuple[datetime, datetime]:
+    current_krx = (now or datetime.now(KRX_TIMEZONE)).astimezone(KRX_TIMEZONE)
+    start_krx = datetime.combine(current_krx.date(), time.min, tzinfo=KRX_TIMEZONE)
+    end_krx = datetime.combine(current_krx.date(), time.max, tzinfo=KRX_TIMEZONE)
+    return start_krx.astimezone(UTC), end_krx.astimezone(UTC)
 
 
 def _serialize_datetime(value: datetime | None) -> str | None:

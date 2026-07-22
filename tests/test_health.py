@@ -3193,6 +3193,40 @@ def test_fast_runtime_status_uses_autonomous_snapshot_for_monitored_symbols() ->
     engine.dispose()
 
 
+def test_fast_runtime_status_uses_cached_filled_symbols() -> None:
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            autonomous_runtime_enabled=True,
+        ),
+        autonomous_runtime_enabled=True,
+    )
+    client = TestClient(app)
+
+    payload = client.get("/runtime/status").json()
+    assert payload["symbols"]["filled_today"] == []
+
+    app.state.autonomous_runtime._monitoring_runtime_snapshot = (
+        app.state.autonomous_runtime._load_monitoring_runtime_snapshot(datetime.now(UTC))
+    )
+    app.state.autonomous_runtime._monitoring_runtime_snapshot = (
+        app.state.autonomous_runtime._monitoring_runtime_snapshot.__class__(
+            loaded_at=datetime.now(UTC),
+            symbols=[],
+            positions_by_symbol={},
+            items=[],
+            filled_today_symbols=["003280", "282330", "003280"],
+        )
+    )
+
+    payload = client.get("/runtime/status").json()
+    assert payload["freshness"]["summary_source"] == "fast_autonomous_runtime_snapshot"
+    assert payload["symbols"]["filled_today"] == ["003280", "282330"]
+
+    engine.dispose()
+
+
 def test_runtime_status_counts_are_filtered_to_active_runtime_mode() -> None:
     app, engine = build_test_app(
         settings=Settings(
