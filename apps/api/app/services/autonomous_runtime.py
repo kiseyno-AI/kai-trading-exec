@@ -16,6 +16,7 @@ from app.broker.base import BrokerAdapter
 from app.core.config import Settings
 from app.services.execution_jobs import dispatch_due_execution_jobs
 from app.services.monitoring import (
+    WATCH_BUY_INTENTS,
     _load_monitored_items,
     _load_positions_by_symbol,
     list_autonomous_monitoring_symbols,
@@ -566,7 +567,10 @@ class AutonomousRuntimeCoordinator:
         triggered_symbols: set[str] = set()
         results: list[dict[str, object]] = []
         for item in runtime_snapshot.items:
-            if item.symbol not in runtime_snapshot.positions_by_symbol:
+            if (
+                item.intent not in WATCH_BUY_INTENTS
+                and item.symbol not in runtime_snapshot.positions_by_symbol
+            ):
                 continue
             price = prices_by_symbol.get(item.symbol)
             observed_price = price.price if price is not None else None
@@ -964,6 +968,13 @@ def _cached_monitoring_item_triggered(
         except ValueError:
             return False
         return triggered_at.astimezone(UTC).date() >= due_date
+    if item.intent in WATCH_BUY_INTENTS:
+        trigger_price = _cached_watch_buy_trigger_price(item)
+        if trigger_price is None or observed_price is None:
+            return False
+        if _cached_watch_buy_direction(item) == "at_or_below":
+            return observed_price <= trigger_price
+        return observed_price >= trigger_price
     if item.trigger_price is None or observed_price is None:
         return False
     if item.intent == "target_sell":
@@ -971,6 +982,51 @@ def _cached_monitoring_item_triggered(
     if item.intent == "stop_sell":
         return observed_price <= item.trigger_price
     return False
+
+
+def _cached_watch_buy_trigger_price(item: CachedMonitoringItem) -> Decimal | None:
+    if item.trigger_price is not None:
+        return item.trigger_price
+    risk_context = item.risk_context or {}
+    monitoring = risk_context.get("watch_buy_monitoring")
+    if isinstance(monitoring, dict):
+        for key in ("trigger_price", "buy_recommendation_price", "entry_trigger_price"):
+            parsed = _parse_decimal(monitoring.get(key))
+            if parsed is not None:
+                return parsed
+    for key in (
+        "watch_trigger_price",
+        "buy_trigger_price",
+        "entry_trigger_price",
+        "trigger_price",
+        "buy_recommendation_price",
+    ):
+        parsed = _parse_decimal(risk_context.get(key))
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _cached_watch_buy_direction(item: CachedMonitoringItem) -> str:
+    risk_context = item.risk_context or {}
+    monitoring = risk_context.get("watch_buy_monitoring")
+    if isinstance(monitoring, dict):
+        direction = monitoring.get("direction")
+        if isinstance(direction, str) and direction.strip():
+            return direction.strip()
+    direction = risk_context.get("trigger_direction")
+    if isinstance(direction, str) and direction.strip():
+        return direction.strip()
+    return "at_or_below"
+
+
+def _parse_decimal(value: object) -> Decimal | None:
+    if value is None:
+        return None
+    try:
+        return Decimal(str(value))
+    except Exception:
+        return None
 
 
 def _is_regular_market_session(*, now: datetime, market_timezone: str) -> bool:

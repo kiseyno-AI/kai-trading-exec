@@ -2939,6 +2939,62 @@ def test_watch_buy_candidate_waits_until_trigger_then_submits_limit_buy() -> Non
     engine.dispose()
 
 
+def test_autonomous_monitoring_cycle_evaluates_watch_buy_without_position() -> None:
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(broker_order_id="kis-auto-watch-buy"),
+    )
+    price_source = StaticMonitoringPriceSource({"005930": Decimal("71050.00")})
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+            monitoring_max_broker_actions_per_cycle=8,
+        ),
+        broker_adapter=broker_adapter,
+        monitoring_price_source=price_source,
+        autonomous_runtime_enabled=True,
+    )
+    client = TestClient(app)
+    response = client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "console", "reason": "enable watch buys"},
+    )
+    assert response.status_code == 200
+    item_id = _create_watch_buy_candidate(
+        client,
+        plan_id="plan-autonomous-watch-buy-no-position",
+        market_date=None,
+        risk_context={
+            "exchange": "KRX",
+            "stop_price": "70000.00",
+            "trigger_direction": "at_or_above",
+        },
+    )
+
+    payload = app.state.autonomous_runtime._monitoring_cycle_sync(
+        datetime(2026, 6, 8, 0, 3, tzinfo=UTC)
+    )
+
+    assert price_source.calls == [["005930"]]
+    assert payload["evaluated_symbol_count"] == 1
+    assert payload["triggered_item_count"] == 1
+    assert payload["submitted_order_count"] == 1
+    assert [call.execution_plan_item_id for call in broker_adapter.order_calls] == [item_id]
+    assert broker_adapter.order_calls[0].side == "buy"
+
+    engine.dispose()
+
+
 def test_watch_buy_drawdown_gate_disabled_releases_prior_block_and_submits() -> None:
     app, engine, client, broker_adapter = _build_watch_buy_test_app(
         order_id="kis-watch-buy-drawdown-release-1"
