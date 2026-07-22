@@ -3119,6 +3119,49 @@ def test_fast_runtime_status_uses_autonomous_snapshot_for_monitored_symbols() ->
     app.state.autonomous_runtime._monitoring_state.last_cycle = {
         "monitored_symbols": ["005930", "000660", "005930"],
     }
+    now = datetime.now(UTC)
+    with app.state.db_session_factory() as session:
+        buy_order = BrokerOrder(
+            mode="paper",
+            idempotency_key="fast-runtime-buy",
+            symbol="282330",
+            side="buy",
+            status="filled",
+            quantity=3,
+        )
+        sell_order = BrokerOrder(
+            mode="paper",
+            idempotency_key="fast-runtime-sell",
+            symbol="282330",
+            side="sell",
+            status="filled",
+            quantity=3,
+        )
+        session.add_all([buy_order, sell_order])
+        session.flush()
+        session.add_all(
+            [
+                ExecutionFill(
+                    broker_order_pk=buy_order.id,
+                    broker_fill_id="fast-runtime-buy-fill",
+                    symbol="282330",
+                    side="buy",
+                    quantity=3,
+                    price=Decimal("125000.0000"),
+                    filled_at=now - timedelta(hours=1),
+                ),
+                ExecutionFill(
+                    broker_order_pk=sell_order.id,
+                    broker_fill_id="fast-runtime-sell-fill",
+                    symbol="282330",
+                    side="sell",
+                    quantity=3,
+                    price=Decimal("121100.0000"),
+                    filled_at=now,
+                ),
+            ]
+        )
+        session.commit()
     client = TestClient(app)
 
     response = client.get("/runtime/status")
@@ -3127,6 +3170,7 @@ def test_fast_runtime_status_uses_autonomous_snapshot_for_monitored_symbols() ->
     payload = response.json()
     assert payload["freshness"]["summary_source"] == "fast_autonomous_runtime_snapshot"
     assert payload["symbols"]["monitored"] == ["000660", "005930"]
+    assert payload["symbols"]["filled_today"] == ["282330"]
     assert payload["monthly_pnl"]["pnl_method"] == "fifo_internal_fills"
 
     engine.dispose()
