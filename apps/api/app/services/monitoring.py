@@ -77,6 +77,18 @@ WATCH_MONITORING_STATUSES = frozenset(
         AGENT_APPROVED_PENDING_SUBMIT_STATUS,
     }
 )
+ACTIVE_WATCH_MONITORING_STATUSES = frozenset(
+    {
+        "watch_monitoring_pending",
+        "watch_monitoring_active",
+        "watch_buy_triggered",
+        "watch_buy_triggered_blocked",
+        "watch_buy_triggered_pending_dispatch",
+        AGENT_PENDING_STATUS,
+        AGENT_DELAY_STATUS,
+        AGENT_APPROVED_PENDING_SUBMIT_STATUS,
+    }
+)
 BLOCKED_MONITORING_STATUSES = frozenset(
     {
         "target_sell_triggered_blocked",
@@ -580,7 +592,7 @@ def list_autonomous_monitoring_symbols(
                         ExecutionPlanItem.execution_plan_id.in_(mode_plan_ids),
                         ExecutionPlanItem.side == "buy",
                         ExecutionPlanItem.intent.in_(tuple(WATCH_BUY_INTENTS)),
-                        ExecutionPlanItem.status.in_(tuple(WATCH_MONITORING_STATUSES)),
+                        ExecutionPlanItem.status.in_(tuple(ACTIVE_WATCH_MONITORING_STATUSES)),
                     )
                     .order_by(ExecutionPlanItem.symbol.asc())
                     .limit(settings.monitoring_max_symbols_per_cycle - len(symbol_candidates))
