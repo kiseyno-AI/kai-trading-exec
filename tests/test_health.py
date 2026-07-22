@@ -2335,6 +2335,90 @@ def test_autonomous_monitoring_prioritizes_watch_buys_over_nonheld_stale_sell_pe
     engine.dispose()
 
 
+def test_autonomous_monitoring_includes_watch_buys_when_positions_are_held() -> None:
+    app, engine = build_test_app(
+        Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            monitoring_max_symbols_per_cycle=10,
+        )
+    )
+    client = TestClient(app)
+
+    held_stop = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-held-stop-and-watch-buy",
+            "source": "kai-trading-core",
+            "market_date": "2026-06-12",
+            "items": [
+                {
+                    "symbol": "005930",
+                    "side": "sell",
+                    "intent": "stop_sell",
+                    "trigger_price": "70000.00",
+                    "quantity_policy": {"kind": "position_exit_from_entry"},
+                }
+            ],
+        },
+    )
+    watch_buy = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-live-watch-buy-with-held-position",
+            "source": "kai-trading-core",
+            "market_date": "2026-06-12",
+            "items": [
+                {
+                    "symbol": "035420",
+                    "side": "buy",
+                    "intent": "intraday_watch_buy",
+                    "trigger_price": "180000.00",
+                    "limit_price": "181000.00",
+                    "quantity_policy": {"kind": "shares", "quantity": 1},
+                }
+            ],
+        },
+    )
+    assert held_stop.status_code == 201
+    assert watch_buy.status_code == 201
+    held_stop_item_id = held_stop.json()["persisted_execution_item_ids"][0]
+    watch_buy_item_id = watch_buy.json()["persisted_execution_item_ids"][0]
+
+    with app.state.db_session_factory() as session:
+        session.add(
+            ExecutionPosition(
+                mode="paper",
+                symbol="005930",
+                quantity=1,
+                average_price=Decimal("72000.00"),
+                updated_from="reconciliation",
+                last_reconciled_at=datetime(2026, 6, 12, 0, 0, tzinfo=UTC),
+            )
+        )
+        held_stop_item = session.get(ExecutionPlanItem, held_stop_item_id)
+        assert held_stop_item is not None
+        held_stop_item.status = "stop_sell_monitoring"
+        session.commit()
+
+        symbols = list_autonomous_monitoring_symbols(
+            settings=app.state.settings,
+            db=session,
+            current_market_date=datetime(2026, 6, 12, tzinfo=UTC).date(),
+        )
+        autonomous_items = _load_monitored_items(
+            settings=app.state.settings,
+            db=session,
+            exclude_pending_config=True,
+            symbols=symbols,
+        )
+
+        assert symbols == ["005930", "035420"]
+        assert [item.id for item in autonomous_items] == [held_stop_item_id, watch_buy_item_id]
+
+    engine.dispose()
+
+
 def test_duplicate_execution_plan_is_rejected() -> None:
     app, engine = build_test_app()
     client = TestClient(app)

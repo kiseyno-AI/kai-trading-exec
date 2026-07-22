@@ -72,6 +72,10 @@ def create_execution_plan_handler(
         adapter=adapter,
         command=payload,
     )
+    if result.status_code == 201 and result.payload.get("accepted_item_count"):
+        runtime = getattr(request.app.state, "autonomous_runtime", None)
+        if runtime is not None:
+            runtime.invalidate_monitoring_runtime_snapshot(reason="execution_plan_created")
     return JSONResponse(status_code=result.status_code, content=result.payload)
 
 

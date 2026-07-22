@@ -446,6 +446,17 @@ class AutonomousRuntimeCoordinator:
         assert self._monitoring_runtime_snapshot is not None
         return self._monitoring_runtime_snapshot
 
+    def invalidate_monitoring_runtime_snapshot(self, *, reason: str) -> None:
+        with self._lock:
+            self._monitoring_runtime_snapshot = None
+        LOGGER.info(
+            "monitoring_runtime_snapshot_invalidated",
+            extra={
+                "reason": reason,
+                "runtime_mode": self.settings.runtime_mode,
+            },
+        )
+
     def _refresh_monitoring_runtime_snapshot(
         self,
         *,

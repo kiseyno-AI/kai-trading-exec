@@ -531,13 +531,45 @@ def list_autonomous_monitoring_symbols(
 
     def append_candidates(rows: list[str]) -> None:
         for symbol in rows:
+            if len(symbol_candidates) >= settings.monitoring_max_symbols_per_cycle:
+                return
             if symbol and symbol not in symbol_candidates:
                 symbol_candidates.append(symbol)
             if len(symbol_candidates) >= settings.monitoring_max_symbols_per_cycle:
                 return
 
     if held_symbols:
-        return sorted(held_symbols)
+        held_symbol_rows = db.execute(
+            select(
+                ExecutionPlanItem.symbol,
+                func.min(ExecutionPlan.accepted_at).label("first_accepted_at"),
+                func.min(ExecutionPlan.id).label("first_plan_id"),
+            )
+            .join(ExecutionPlanItem.plan)
+            .where(
+                ExecutionPlan.mode == settings.runtime_mode,
+                ExecutionPlanItem.symbol.in_(sorted(held_symbols)),
+                ExecutionPlanItem.side == "sell",
+                ExecutionPlanItem.intent.in_(tuple(SELL_MONITORED_INTENTS)),
+                ExecutionPlanItem.status.in_(
+                    tuple(
+                        SELL_ACTIVE_MONITORING_STATUSES
+                        | SELL_PENDING_CONFIG_STATUSES
+                        | BLOCKED_MONITORING_STATUSES
+                        | PENDING_DISPATCH_MONITORING_STATUSES
+                    )
+                ),
+            )
+            .group_by(ExecutionPlanItem.symbol)
+            .order_by(
+                func.min(ExecutionPlan.accepted_at).asc(),
+                func.min(ExecutionPlan.id).asc(),
+                ExecutionPlanItem.symbol.asc(),
+            )
+            .limit(settings.monitoring_max_symbols_per_cycle)
+        ).all()
+        append_candidates([str(row.symbol) for row in held_symbol_rows])
+        append_candidates(sorted(symbol for symbol in held_symbols if symbol not in symbol_candidates))
 
     if len(symbol_candidates) < settings.monitoring_max_symbols_per_cycle:
         pending_sell_symbols = list(
@@ -2214,9 +2246,45 @@ def _load_monitored_items(
                         )
                     ).all()
                 )
+            buy_items = db.scalars(
+                select(ExecutionPlanItem)
+                .where(
+                    ExecutionPlanItem.symbol.in_(symbol_list),
+                    ExecutionPlanItem.side == "buy",
+                    ExecutionPlanItem.intent.in_(tuple(WATCH_BUY_INTENTS)),
+                    ExecutionPlanItem.status.in_(tuple(WATCH_MONITORING_STATUSES)),
+                )
+                .options(
+                    load_only(
+                        ExecutionPlanItem.id,
+                        ExecutionPlanItem.execution_plan_id,
+                        ExecutionPlanItem.plan_item_index,
+                        ExecutionPlanItem.symbol,
+                        ExecutionPlanItem.side,
+                        ExecutionPlanItem.intent,
+                        ExecutionPlanItem.status,
+                        ExecutionPlanItem.quantity_policy,
+                        ExecutionPlanItem.limit_price,
+                        ExecutionPlanItem.trigger_price,
+                        ExecutionPlanItem.time_in_force,
+                        ExecutionPlanItem.risk_context,
+                        ExecutionPlanItem.decision_agent_name,
+                        ExecutionPlanItem.decision_snapshot_id,
+                        ExecutionPlanItem.decision_run_id,
+                        ExecutionPlanItem.source_plan_item_id,
+                        ExecutionPlanItem.source_market_date,
+                    )
+                )
+                .order_by(
+                    ExecutionPlanItem.symbol.asc(),
+                    ExecutionPlanItem.plan_item_index.asc(),
+                    ExecutionPlanItem.id.asc(),
+                )
+                .limit(settings.monitoring_max_symbols_per_cycle * 16)
+            ).all()
             symbol_order = {symbol: index for index, symbol in enumerate(symbol_list)}
             return sorted(
-                sell_items,
+                [*sell_items, *buy_items],
                 key=lambda item: (
                     symbol_order.get(item.symbol, len(symbol_order)),
                     item.plan_item_index,
