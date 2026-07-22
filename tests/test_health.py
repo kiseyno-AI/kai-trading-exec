@@ -487,6 +487,23 @@ def test_metadata_matches_exec_owned_table_boundary() -> None:
     app.state.db_engine.dispose()
 
 
+def test_execution_fills_has_filled_today_lookup_index() -> None:
+    app, engine = build_test_app()
+    inspector = inspect(engine)
+
+    execution_fill_indexes = {
+        index["name"]: index["column_names"]
+        for index in inspector.get_indexes("execution_fills")
+    }
+
+    assert execution_fill_indexes["ix_execution_fills_filled_at_broker_order_pk"] == [
+        "filled_at",
+        "broker_order_pk",
+    ]
+
+    app.state.db_engine.dispose()
+
+
 def test_runtime_safety_endpoint_reports_bootstrap_metadata() -> None:
     app, engine = build_test_app()
     client = TestClient(app)

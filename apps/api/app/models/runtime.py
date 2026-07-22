@@ -8,6 +8,7 @@ from sqlalchemy import (
     Date,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     JSON,
     Numeric,
@@ -393,6 +394,13 @@ class ExecutionFailure(TimestampMixin, Base):
 
 class ExecutionFill(TimestampMixin, Base):
     __tablename__ = "execution_fills"
+    __table_args__ = (
+        Index(
+            "ix_execution_fills_filled_at_broker_order_pk",
+            "filled_at",
+            "broker_order_pk",
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     idempotency_key: Mapped[str | None] = mapped_column(String(80), unique=True, index=True)
