@@ -487,6 +487,23 @@ def test_metadata_matches_exec_owned_table_boundary() -> None:
     app.state.db_engine.dispose()
 
 
+def test_execution_fills_has_filled_today_lookup_index() -> None:
+    app, engine = build_test_app()
+    inspector = inspect(engine)
+
+    execution_fill_indexes = {
+        index["name"]: index["column_names"]
+        for index in inspector.get_indexes("execution_fills")
+    }
+
+    assert execution_fill_indexes["ix_execution_fills_filled_at_broker_order_pk"] == [
+        "filled_at",
+        "broker_order_pk",
+    ]
+
+    app.state.db_engine.dispose()
+
+
 def test_runtime_safety_endpoint_reports_bootstrap_metadata() -> None:
     app, engine = build_test_app()
     client = TestClient(app)
@@ -3119,49 +3136,47 @@ def test_fast_runtime_status_uses_autonomous_snapshot_for_monitored_symbols() ->
     app.state.autonomous_runtime._monitoring_state.last_cycle = {
         "monitored_symbols": ["005930", "000660", "005930"],
     }
-    today_start_utc, _ = runtime_service._current_krx_day_utc_bounds()
-    filled_at = (today_start_utc + timedelta(hours=6)).replace(tzinfo=None)
+    now = datetime.now(UTC)
     with app.state.db_session_factory() as session:
-        plan = ExecutionPlan(
-            external_plan_id="paper-fast-runtime-fills",
-            source="kai-trading-core",
+        buy_order = BrokerOrder(
             mode="paper",
-            status="accepted",
-        )
-        item = ExecutionPlanItem(
-            symbol="003280",
-            side="buy",
-            intent="intraday_watch_buy",
-            status="filled",
-        )
-        plan.items.append(item)
-        session.add(plan)
-        session.flush()
-        order = BrokerOrder(
-            execution_plan_item_id=item.id,
-            mode="paper",
-            idempotency_key="paper-fast-runtime-filled-buy",
-            broker_order_id="kis-filled-buy",
-            symbol="003280",
+            idempotency_key="fast-runtime-buy",
+            symbol="282330",
             side="buy",
             status="filled",
-            quantity=150,
-            submitted_at=filled_at,
-            last_broker_sync_at=filled_at,
+            quantity=3,
         )
-        session.add(order)
+        sell_order = BrokerOrder(
+            mode="paper",
+            idempotency_key="fast-runtime-sell",
+            symbol="282330",
+            side="sell",
+            status="filled",
+            quantity=3,
+        )
+        session.add_all([buy_order, sell_order])
         session.flush()
-        session.add(
-            ExecutionFill(
-                broker_order_pk=order.id,
-                broker_fill_id="fill-fast-runtime-buy",
-                symbol="003280",
-                side="buy",
-                quantity=150,
-                price=Decimal("1988.0000"),
-                filled_at=filled_at,
-                payload={"source": "broker"},
-            )
+        session.add_all(
+            [
+                ExecutionFill(
+                    broker_order_pk=buy_order.id,
+                    broker_fill_id="fast-runtime-buy-fill",
+                    symbol="282330",
+                    side="buy",
+                    quantity=3,
+                    price=Decimal("125000.0000"),
+                    filled_at=now - timedelta(hours=1),
+                ),
+                ExecutionFill(
+                    broker_order_pk=sell_order.id,
+                    broker_fill_id="fast-runtime-sell-fill",
+                    symbol="282330",
+                    side="sell",
+                    quantity=3,
+                    price=Decimal("121100.0000"),
+                    filled_at=now,
+                ),
+            ]
         )
         session.commit()
     client = TestClient(app)
@@ -3172,7 +3187,7 @@ def test_fast_runtime_status_uses_autonomous_snapshot_for_monitored_symbols() ->
     payload = response.json()
     assert payload["freshness"]["summary_source"] == "fast_autonomous_runtime_snapshot"
     assert payload["symbols"]["monitored"] == ["000660", "005930"]
-    assert payload["symbols"]["filled_today"] == ["003280"]
+    assert payload["symbols"]["filled_today"] == ["282330"]
     assert payload["monthly_pnl"]["pnl_method"] == "fifo_internal_fills"
 
     engine.dispose()

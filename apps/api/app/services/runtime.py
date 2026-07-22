@@ -523,6 +523,25 @@ def runtime_symbol_summary(
     }
 
 
+def runtime_filled_today_symbols(
+    *,
+    settings: Settings,
+    db: Session,
+) -> list[str]:
+    today_start_utc, tomorrow_start_utc = _current_krx_day_utc_bounds()
+    filled_today = db.scalars(
+        select(distinct(ExecutionFill.symbol))
+        .select_from(ExecutionFill)
+        .join(ExecutionFill.broker_order)
+        .where(
+            BrokerOrder.mode == settings.runtime_mode,
+            ExecutionFill.filled_at >= today_start_utc,
+            ExecutionFill.filled_at < tomorrow_start_utc,
+        )
+    ).all()
+    return sorted(filled_today)
+
+
 def runtime_monitored_symbols(
     *,
     settings: Settings,
@@ -1023,8 +1042,11 @@ def build_runtime_status(
             monthly_pnl = monthly_pnl_payload(settings=settings, db=db)
         elif settings.autonomous_runtime_enabled:
             cached_symbols = _autonomous_runtime_snapshot_symbol_summary(autonomous=autonomous)
-            if not cached_symbols:
-                cached_symbols = runtime_symbol_summary(settings=settings, db=db)
+            if "filled_today" not in cached_symbols:
+                cached_symbols["filled_today"] = runtime_filled_today_symbols(
+                    settings=settings,
+                    db=db,
+                )
             symbols = {
                 **symbols,
                 **cached_symbols,
