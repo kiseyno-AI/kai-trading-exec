@@ -523,6 +523,25 @@ def runtime_symbol_summary(
     }
 
 
+def runtime_filled_today_symbols(
+    *,
+    settings: Settings,
+    db: Session,
+) -> list[str]:
+    today_start_utc, tomorrow_start_utc = _current_krx_day_utc_bounds()
+    filled_today = db.scalars(
+        select(distinct(ExecutionFill.symbol))
+        .select_from(ExecutionFill)
+        .join(ExecutionFill.broker_order)
+        .where(
+            BrokerOrder.mode == settings.runtime_mode,
+            ExecutionFill.filled_at >= today_start_utc,
+            ExecutionFill.filled_at < tomorrow_start_utc,
+        )
+    ).all()
+    return sorted(filled_today)
+
+
 def runtime_monitored_symbols(
     *,
     settings: Settings,
@@ -1025,6 +1044,7 @@ def build_runtime_status(
             symbols = {
                 **symbols,
                 "monitored": _autonomous_monitoring_symbols(autonomous=autonomous),
+                "filled_today": runtime_filled_today_symbols(settings=settings, db=db),
             }
             freshness["summary_source"] = "fast_autonomous_runtime_snapshot"
             monthly_pnl = _default_monthly_pnl_payload(settings=settings)
