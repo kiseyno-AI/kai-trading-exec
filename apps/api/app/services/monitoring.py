@@ -572,6 +572,23 @@ def list_autonomous_monitoring_symbols(
         append_candidates(sorted(symbol for symbol in held_symbols if symbol not in symbol_candidates))
 
     if len(symbol_candidates) < settings.monitoring_max_symbols_per_cycle:
+        append_candidates(
+            list(
+                db.scalars(
+                    select(distinct(ExecutionPlanItem.symbol))
+                    .where(
+                        ExecutionPlanItem.execution_plan_id.in_(mode_plan_ids),
+                        ExecutionPlanItem.side == "buy",
+                        ExecutionPlanItem.intent.in_(tuple(WATCH_BUY_INTENTS)),
+                        ExecutionPlanItem.status.in_(tuple(WATCH_MONITORING_STATUSES)),
+                    )
+                    .order_by(ExecutionPlanItem.symbol.asc())
+                    .limit(settings.monitoring_max_symbols_per_cycle - len(symbol_candidates))
+                ).all()
+            )
+        )
+
+    if len(symbol_candidates) < settings.monitoring_max_symbols_per_cycle:
         pending_sell_symbols = list(
             db.scalars(
                 select(distinct(ExecutionPlanItem.symbol))
@@ -604,23 +621,6 @@ def list_autonomous_monitoring_symbols(
             if len(symbol_candidates) + len(fallback_symbols) >= settings.monitoring_max_symbols_per_cycle:
                 break
         append_candidates(fallback_symbols)
-
-    if len(symbol_candidates) < settings.monitoring_max_symbols_per_cycle:
-        append_candidates(
-            list(
-                db.scalars(
-                    select(distinct(ExecutionPlanItem.symbol))
-                    .where(
-                        ExecutionPlanItem.execution_plan_id.in_(mode_plan_ids),
-                        ExecutionPlanItem.side == "buy",
-                        ExecutionPlanItem.intent.in_(tuple(WATCH_BUY_INTENTS)),
-                        ExecutionPlanItem.status.in_(tuple(WATCH_MONITORING_STATUSES)),
-                    )
-                    .order_by(ExecutionPlanItem.symbol.asc())
-                    .limit(settings.monitoring_max_symbols_per_cycle - len(symbol_candidates))
-                ).all()
-            )
-        )
 
     return symbol_candidates
 
