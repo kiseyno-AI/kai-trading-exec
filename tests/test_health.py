@@ -3119,6 +3119,51 @@ def test_fast_runtime_status_uses_autonomous_snapshot_for_monitored_symbols() ->
     app.state.autonomous_runtime._monitoring_state.last_cycle = {
         "monitored_symbols": ["005930", "000660", "005930"],
     }
+    today_start_utc, _ = runtime_service._current_krx_day_utc_bounds()
+    filled_at = (today_start_utc + timedelta(hours=6)).replace(tzinfo=None)
+    with app.state.db_session_factory() as session:
+        plan = ExecutionPlan(
+            external_plan_id="paper-fast-runtime-fills",
+            source="kai-trading-core",
+            mode="paper",
+            status="accepted",
+        )
+        item = ExecutionPlanItem(
+            symbol="003280",
+            side="buy",
+            intent="intraday_watch_buy",
+            status="filled",
+        )
+        plan.items.append(item)
+        session.add(plan)
+        session.flush()
+        order = BrokerOrder(
+            execution_plan_item_id=item.id,
+            mode="paper",
+            idempotency_key="paper-fast-runtime-filled-buy",
+            broker_order_id="kis-filled-buy",
+            symbol="003280",
+            side="buy",
+            status="filled",
+            quantity=150,
+            submitted_at=filled_at,
+            last_broker_sync_at=filled_at,
+        )
+        session.add(order)
+        session.flush()
+        session.add(
+            ExecutionFill(
+                broker_order_pk=order.id,
+                broker_fill_id="fill-fast-runtime-buy",
+                symbol="003280",
+                side="buy",
+                quantity=150,
+                price=Decimal("1988.0000"),
+                filled_at=filled_at,
+                payload={"source": "broker"},
+            )
+        )
+        session.commit()
     client = TestClient(app)
 
     response = client.get("/runtime/status")
@@ -3127,7 +3172,42 @@ def test_fast_runtime_status_uses_autonomous_snapshot_for_monitored_symbols() ->
     payload = response.json()
     assert payload["freshness"]["summary_source"] == "fast_autonomous_runtime_snapshot"
     assert payload["symbols"]["monitored"] == ["000660", "005930"]
+    assert payload["symbols"]["filled_today"] == ["003280"]
     assert payload["monthly_pnl"]["pnl_method"] == "fifo_internal_fills"
+
+    engine.dispose()
+
+
+def test_fast_runtime_status_uses_cached_filled_symbols() -> None:
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            autonomous_runtime_enabled=True,
+        ),
+        autonomous_runtime_enabled=True,
+    )
+    client = TestClient(app)
+
+    payload = client.get("/runtime/status").json()
+    assert payload["symbols"]["filled_today"] == []
+
+    app.state.autonomous_runtime._monitoring_runtime_snapshot = (
+        app.state.autonomous_runtime._load_monitoring_runtime_snapshot(datetime.now(UTC))
+    )
+    app.state.autonomous_runtime._monitoring_runtime_snapshot = (
+        app.state.autonomous_runtime._monitoring_runtime_snapshot.__class__(
+            loaded_at=datetime.now(UTC),
+            symbols=[],
+            positions_by_symbol={},
+            items=[],
+            filled_today_symbols=["003280", "282330", "003280"],
+        )
+    )
+
+    payload = client.get("/runtime/status").json()
+    assert payload["freshness"]["summary_source"] == "fast_autonomous_runtime_snapshot"
+    assert payload["symbols"]["filled_today"] == ["003280", "282330"]
 
     engine.dispose()
 

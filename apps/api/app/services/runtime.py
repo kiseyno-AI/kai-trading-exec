@@ -1022,8 +1022,12 @@ def build_runtime_status(
             )
             monthly_pnl = monthly_pnl_payload(settings=settings, db=db)
         elif settings.autonomous_runtime_enabled:
+            cached_symbols = _autonomous_runtime_snapshot_symbol_summary(autonomous=autonomous)
+            if not cached_symbols:
+                cached_symbols = runtime_symbol_summary(settings=settings, db=db)
             symbols = {
                 **symbols,
+                **cached_symbols,
                 "monitored": _autonomous_monitoring_symbols(autonomous=autonomous),
             }
             freshness["summary_source"] = "fast_autonomous_runtime_snapshot"
@@ -1490,6 +1494,21 @@ def _autonomous_monitoring_symbols(*, autonomous: dict[str, object]) -> list[str
     if not isinstance(symbols, list):
         return []
     return sorted({str(symbol) for symbol in symbols if str(symbol).strip()})
+
+
+def _autonomous_runtime_snapshot_symbol_summary(*, autonomous: dict[str, object]) -> dict[str, list[str]]:
+    monitoring = autonomous.get("monitoring")
+    if not isinstance(monitoring, dict):
+        return {}
+    runtime_snapshot = monitoring.get("runtime_snapshot")
+    if not isinstance(runtime_snapshot, dict):
+        return {}
+    filled_today = runtime_snapshot.get("filled_today_symbols")
+    if not isinstance(filled_today, list):
+        return {}
+    return {
+        "filled_today": sorted({str(symbol) for symbol in filled_today if str(symbol).strip()}),
+    }
 
 
 def _autonomous_monitoring_price_source(autonomous: dict[str, object]) -> dict[str, object]:
