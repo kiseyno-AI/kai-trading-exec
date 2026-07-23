@@ -1426,6 +1426,7 @@ def daily_pnl_payload(
     matched_sell_quantity = 0
     unmatched_sell_quantity = 0
     closed_symbols: set[str] = set()
+    sold_symbols: set[str] = set()
     unmatched_sell_symbols: set[str] = set()
     for fill in fills:
         filled_at = _as_utc(fill.filled_at)
@@ -1444,6 +1445,7 @@ def daily_pnl_payload(
             continue
         if filled_at >= day_start:
             sell_notional += notional
+            sold_symbols.add(symbol)
         remaining = quantity
         lots = lots_by_symbol.setdefault(symbol, [])
         while remaining > 0 and lots:
@@ -1468,9 +1470,12 @@ def daily_pnl_payload(
         "daily_sell_notional": _decimal_text(sell_notional),
         "matched_sell_quantity": matched_sell_quantity,
         "unmatched_sell_quantity": unmatched_sell_quantity,
+        "sold_symbols": sorted(sold_symbols),
+        "sold_symbol_count": len(sold_symbols),
         "closed_symbols": sorted(closed_symbols),
         "closed_symbol_count": len(closed_symbols),
         "unmatched_sell_symbols": sorted(unmatched_sell_symbols),
+        "unmatched_sell_symbol_count": len(unmatched_sell_symbols),
         "pnl_method": "fifo_internal_fills",
     }
 
@@ -1512,9 +1517,12 @@ def _default_daily_pnl_payload() -> dict[str, object]:
         "daily_sell_notional": "0.0000",
         "matched_sell_quantity": 0,
         "unmatched_sell_quantity": 0,
+        "sold_symbols": [],
+        "sold_symbol_count": 0,
         "closed_symbols": [],
         "closed_symbol_count": 0,
         "unmatched_sell_symbols": [],
+        "unmatched_sell_symbol_count": 0,
         "pnl_method": "fifo_internal_fills",
     }
 
