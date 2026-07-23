@@ -2382,6 +2382,238 @@ def test_post_entry_maintenance_creates_missing_target_sell_monitor() -> None:
     engine.dispose()
 
 
+def test_post_entry_maintenance_promotes_pending_target_sell_monitor() -> None:
+    app, engine = build_test_app(
+        Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+        )
+    )
+    client = TestClient(app)
+
+    response = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-held-entry-target-pending-repair",
+            "source": "kai-trading-core",
+            "market_date": "2026-06-08",
+            "items": [
+                {
+                    "symbol": "002380",
+                    "side": "buy",
+                    "intent": "intraday_watch_buy",
+                    "trigger_price": "100.00",
+                    "limit_price": "100.00",
+                    "quantity_policy": {"kind": "shares", "quantity": 3},
+                    "risk_context": {
+                        "exchange": "KRX",
+                        "target_price": "110.00",
+                        "stop_loss_price": "95.00",
+                    },
+                },
+                {
+                    "symbol": "002380",
+                    "side": "sell",
+                    "intent": "target_sell",
+                    "trigger_price": "110.00",
+                    "quantity_policy": {
+                        "type": "position_exit_from_entry",
+                        "linked_entry_item_key": "entry-1",
+                    },
+                },
+            ],
+        },
+    )
+    assert response.status_code == 201
+    buy_item_id, target_item_id = response.json()["persisted_execution_item_ids"]
+
+    with app.state.db_session_factory() as session:
+        buy_item = session.get(ExecutionPlanItem, buy_item_id)
+        target_item = session.get(ExecutionPlanItem, target_item_id)
+        assert buy_item is not None
+        assert target_item is not None
+        assert target_item.status == "target_sell_pending_config"
+        buy_item.status = "broker_order_submitted"
+        session.add(
+            BrokerOrder(
+                mode="paper",
+                execution_plan_item_id=buy_item_id,
+                idempotency_key=f"monitoring:watch_buy:{buy_item_id}",
+                symbol="002380",
+                side="buy",
+                status="filled",
+                quantity=3,
+                limit_price=Decimal("100.00"),
+                submitted_at=datetime(2026, 6, 8, 0, 55, tzinfo=UTC),
+            )
+        )
+        position = ExecutionPosition(
+            mode="paper",
+            symbol="002380",
+            quantity=3,
+            average_price=Decimal("100.00"),
+            updated_from="reconciliation",
+            last_reconciled_at=datetime(2026, 6, 8, 1, 0, tzinfo=UTC),
+        )
+        session.add(position)
+        session.commit()
+
+        maintenance_count, review_count = _maintain_post_entry_exit_monitors(
+            settings=app.state.settings,
+            db=session,
+            positions_by_symbol={"002380": position},
+            prices={"002380": MonitoringPriceRequest(symbol="002380", price=Decimal("105.00"))},
+            triggered_at=datetime(2026, 6, 8, 1, 5, tzinfo=UTC),
+        )
+        session.commit()
+
+        target_item = session.get(ExecutionPlanItem, target_item_id)
+        assert target_item is not None
+        assert target_item.status == "target_sell_monitoring"
+        assert target_item.risk_context["last_monitoring_event"]["event"] == (
+            "post_entry_target_monitor_activated"
+        )
+        assert target_item.risk_context["last_monitoring_event"]["prior_status"] == (
+            "target_sell_pending_config"
+        )
+        assert maintenance_count >= 1
+        assert review_count == 0
+
+        autonomous_items = _load_monitored_items(
+            settings=app.state.settings,
+            db=session,
+            exclude_pending_config=True,
+        )
+        assert target_item_id in {item.id for item in autonomous_items}
+
+    engine.dispose()
+
+
+def test_cached_autonomous_monitoring_repairs_targets_before_idle_exit() -> None:
+    class StaticMonitoringPriceSource:
+        provider = "test"
+
+        def __init__(self, prices: dict[str, Decimal]) -> None:
+            self.prices = prices
+            self.calls: list[list[str]] = []
+
+        def __call__(
+            self,
+            *,
+            symbols: list[str],
+            observed_at: datetime,
+            settings: Settings,
+        ) -> list[MonitoringPriceRequest]:
+            assert settings
+            self.calls.append(list(symbols))
+            return [
+                MonitoringPriceRequest(
+                    symbol=symbol,
+                    price=self.prices[symbol],
+                    observed_at=observed_at,
+                )
+                for symbol in symbols
+                if symbol in self.prices
+            ]
+
+    price_source = StaticMonitoringPriceSource({"002380": Decimal("105.00")})
+    app, engine = build_test_app(
+        Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            autonomous_runtime_enabled=True,
+        ),
+        autonomous_runtime_enabled=True,
+        monitoring_price_source=price_source,
+    )
+    client = TestClient(app)
+
+    response = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-cached-target-repair-before-idle",
+            "source": "kai-trading-core",
+            "market_date": "2026-06-08",
+            "items": [
+                {
+                    "symbol": "002380",
+                    "side": "buy",
+                    "intent": "intraday_watch_buy",
+                    "trigger_price": "100.00",
+                    "limit_price": "100.00",
+                    "quantity_policy": {"kind": "shares", "quantity": 3},
+                    "risk_context": {
+                        "exchange": "KRX",
+                        "target_price": "110.00",
+                        "stop_loss_price": "95.00",
+                    },
+                },
+                {
+                    "symbol": "002380",
+                    "side": "sell",
+                    "intent": "target_sell",
+                    "trigger_price": "110.00",
+                    "quantity_policy": {
+                        "type": "position_exit_from_entry",
+                        "linked_entry_item_key": "entry-1",
+                    },
+                },
+            ],
+        },
+    )
+    assert response.status_code == 201
+    buy_item_id, target_item_id = response.json()["persisted_execution_item_ids"]
+
+    with app.state.db_session_factory() as session:
+        buy_item = session.get(ExecutionPlanItem, buy_item_id)
+        target_item = session.get(ExecutionPlanItem, target_item_id)
+        assert buy_item is not None
+        assert target_item is not None
+        assert target_item.status == "target_sell_pending_config"
+        buy_item.status = "broker_order_submitted"
+        session.add(
+            BrokerOrder(
+                mode="paper",
+                execution_plan_item_id=buy_item_id,
+                idempotency_key=f"monitoring:watch_buy:{buy_item_id}",
+                symbol="002380",
+                side="buy",
+                status="filled",
+                quantity=3,
+                limit_price=Decimal("100.00"),
+                submitted_at=datetime(2026, 6, 8, 0, 55, tzinfo=UTC),
+            )
+        )
+        session.add(
+            ExecutionPosition(
+                mode="paper",
+                symbol="002380",
+                quantity=3,
+                average_price=Decimal("100.00"),
+                updated_from="reconciliation",
+                last_reconciled_at=datetime(2026, 6, 8, 1, 0, tzinfo=UTC),
+            )
+        )
+        session.commit()
+
+    payload = app.state.autonomous_runtime._monitoring_cycle_sync(
+        datetime(2026, 6, 8, 1, 5, tzinfo=UTC)
+    )
+
+    assert price_source.calls == [["002380"]]
+    assert payload["cached_evaluation"] is True
+    assert payload["triggered_item_count"] == 0
+    assert payload["post_entry_maintenance_count"] >= 1
+    assert target_item_id in {item["execution_plan_item_id"] for item in payload["items"]}
+
+    with app.state.db_session_factory() as session:
+        target_item = session.get(ExecutionPlanItem, target_item_id)
+        assert target_item is not None
+        assert target_item.status == "target_sell_monitoring"
+
+    engine.dispose()
+
+
 def test_autonomous_monitoring_prioritizes_watch_buys_over_nonheld_stale_sell_pending() -> None:
     app, engine = build_test_app(
         Settings(

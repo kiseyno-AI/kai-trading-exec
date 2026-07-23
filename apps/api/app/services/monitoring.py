@@ -3846,6 +3846,20 @@ def _ensure_post_entry_target_monitor(
     if not _quantity_policy_supported(existing.quantity_policy):
         existing.quantity_policy = {"kind": "shares", "quantity": quantity}
         maintenance_count += 1
+    if existing.status != "target_sell_monitoring" and _monitoring_item_is_configured(existing):
+        prior_status = existing.status
+        existing.status = "target_sell_monitoring"
+        maintenance_count += 1
+        _record_monitoring_event(
+            item=existing,
+            event={
+                "event": "post_entry_target_monitor_activated",
+                "reason": "repaired_pending_target_configuration",
+                "prior_status": prior_status,
+                "updated_status": existing.status,
+                "recorded_at": triggered_at.isoformat(),
+            },
+        )
 
     risk_context = dict(existing.risk_context) if isinstance(existing.risk_context, dict) else {}
     risk_context.setdefault("exchange", _plan_item_exchange(entry_item))
