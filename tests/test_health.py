@@ -459,6 +459,98 @@ def test_runtime_status_reports_monthly_realized_pnl_progress_and_mode() -> None
     assert monthly["target_progress_pct"] == "500.0000"
     assert monthly["mode_recommendation"] == "capital_preservation"
     assert monthly["matched_sell_quantity"] == 5
+    daily = response.json()["daily_pnl"]
+    assert daily["daily_realized_pnl"] == "5000.0000"
+    assert daily["daily_buy_notional"] == "0.0000"
+    assert daily["daily_sell_notional"] == "55000.0000"
+    assert daily["matched_sell_quantity"] == 5
+    assert daily["unmatched_sell_quantity"] == 0
+    assert daily["closed_symbols"] == ["005930"]
+    assert daily["closed_symbol_count"] == 1
+    assert daily["pnl_method"] == "fifo_internal_fills"
+
+    engine.dispose()
+
+
+def test_runtime_status_daily_pnl_uses_crypto_base_quantity_and_quote_notional() -> None:
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            automation_enabled=True,
+        )
+    )
+    client = TestClient(app)
+    now = datetime.now(UTC)
+    buy_filled_at = now - timedelta(seconds=1)
+
+    with create_session_factory(engine)() as session:
+        buy_order = BrokerOrder(
+            broker_name="upbit",
+            mode="paper",
+            idempotency_key="daily-crypto-buy-1",
+            symbol="KRW-BTC",
+            side="buy",
+            status="filled",
+            quantity=0,
+            base_quantity=Decimal("0.001000000000"),
+            quote_notional=Decimal("100000.0000"),
+            asset_class="crypto",
+            venue="upbit",
+        )
+        sell_order = BrokerOrder(
+            broker_name="upbit",
+            mode="paper",
+            idempotency_key="daily-crypto-sell-1",
+            symbol="KRW-BTC",
+            side="sell",
+            status="filled",
+            quantity=0,
+            base_quantity=Decimal("0.000400000000"),
+            asset_class="crypto",
+            venue="upbit",
+        )
+        session.add_all([buy_order, sell_order])
+        session.flush()
+        session.add_all(
+            [
+                ExecutionFill(
+                    broker_order_pk=buy_order.id,
+                    broker_fill_id="daily-crypto-buy-fill-1",
+                    symbol="KRW-BTC",
+                    side="buy",
+                    quantity=0,
+                    base_quantity=Decimal("0.001000000000"),
+                    quote_notional=Decimal("100000.0000"),
+                    price=Decimal("100000000.0000"),
+                    filled_at=buy_filled_at,
+                ),
+                ExecutionFill(
+                    broker_order_pk=sell_order.id,
+                    broker_fill_id="daily-crypto-sell-fill-1",
+                    symbol="KRW-BTC",
+                    side="sell",
+                    quantity=0,
+                    base_quantity=Decimal("0.000400000000"),
+                    quote_notional=Decimal("44000.0000"),
+                    price=Decimal("110000000.0000"),
+                    filled_at=now,
+                ),
+            ]
+        )
+        session.commit()
+
+    response = client.get("/runtime/status")
+
+    assert response.status_code == 200
+    daily = response.json()["daily_pnl"]
+    assert daily["daily_realized_pnl"] == "4000.0000"
+    assert daily["daily_buy_notional"] == "100000.0000"
+    assert daily["daily_sell_notional"] == "44000.0000"
+    assert daily["unmatched_sell_quantity"] == 0
+    assert daily["closed_symbols"] == ["KRW-BTC"]
+    assert daily["closed_symbol_count"] == 1
+    assert daily["pnl_method"] == "fifo_internal_fills"
 
     engine.dispose()
 
@@ -3735,6 +3827,12 @@ def test_fast_runtime_status_uses_autonomous_snapshot_for_monitored_symbols() ->
     assert payload["monthly_pnl"]["pnl_method"] == "fifo_internal_fills"
     assert payload["monthly_pnl"]["monthly_realized_pnl"] == "-11700.0000"
     assert payload["monthly_pnl"]["matched_sell_quantity"] == 3
+    assert payload["daily_pnl"]["pnl_method"] == "fifo_internal_fills"
+    assert payload["daily_pnl"]["daily_realized_pnl"] == "-11700.0000"
+    assert payload["daily_pnl"]["daily_buy_notional"] == "375000.0000"
+    assert payload["daily_pnl"]["daily_sell_notional"] == "363300.0000"
+    assert payload["daily_pnl"]["matched_sell_quantity"] == 3
+    assert payload["daily_pnl"]["closed_symbols"] == ["282330"]
 
     engine.dispose()
 
