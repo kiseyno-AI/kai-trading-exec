@@ -565,7 +565,7 @@ def runtime_symbol_summary(
     *,
     settings: Settings,
     db: Session,
-) -> dict[str, list[str]]:
+) -> dict[str, object]:
     today_start_utc, tomorrow_start_utc = _current_krx_day_utc_bounds()
     failed_observed_at = func.coalesce(
         BrokerOrder.last_broker_sync_at,
@@ -613,6 +613,12 @@ def runtime_symbol_summary(
             ExecutionFill.filled_at < tomorrow_start_utc,
         )
     ).all()
+    filled_summary = runtime_filled_today_summary(
+        settings=settings,
+        db=db,
+        today_start_utc=today_start_utc,
+        tomorrow_start_utc=tomorrow_start_utc,
+    )
     failed_today = db.scalars(
         select(distinct(BrokerOrder.symbol))
         .select_from(BrokerOrder)
@@ -638,9 +644,64 @@ def runtime_symbol_summary(
         "monitored": sorted(monitored_symbols),
         "scheduled_today": sorted(scheduled_today),
         "filled_today": sorted(filled_today),
+        "filled_today_by_side": filled_summary["by_side"],
+        "filled_today_counts": filled_summary["counts"],
         "failed_today": sorted(failed_today),
         "positions": sorted(position_symbols),
     }
+
+
+def runtime_filled_today_summary(
+    *,
+    settings: Settings,
+    db: Session,
+    today_start_utc: datetime | None = None,
+    tomorrow_start_utc: datetime | None = None,
+) -> dict[str, object]:
+    if today_start_utc is None or tomorrow_start_utc is None:
+        today_start_utc, tomorrow_start_utc = _current_krx_day_utc_bounds()
+    rows = db.execute(
+        select(
+            ExecutionFill.side,
+            ExecutionFill.symbol,
+            func.count(ExecutionFill.id),
+            func.coalesce(func.sum(ExecutionFill.quantity), 0),
+        )
+        .select_from(ExecutionFill)
+        .join(ExecutionFill.broker_order)
+        .where(
+            BrokerOrder.mode == settings.runtime_mode,
+            ExecutionFill.filled_at >= today_start_utc,
+            ExecutionFill.filled_at < tomorrow_start_utc,
+        )
+        .group_by(ExecutionFill.side, ExecutionFill.symbol)
+    ).all()
+    by_side: dict[str, list[str]] = {"buy": [], "sell": []}
+    counts: dict[str, dict[str, int]] = {
+        "all": {"symbols": 0, "fills": 0, "quantity": 0},
+        "buy": {"symbols": 0, "fills": 0, "quantity": 0},
+        "sell": {"symbols": 0, "fills": 0, "quantity": 0},
+    }
+    all_symbols: set[str] = set()
+    side_symbols: dict[str, set[str]] = {"buy": set(), "sell": set()}
+    for side_raw, symbol_raw, fill_count_raw, quantity_raw in rows:
+        side = str(side_raw or "").strip().lower()
+        symbol = str(symbol_raw or "").strip().upper()
+        if side not in {"buy", "sell"} or not symbol:
+            continue
+        fill_count = int(fill_count_raw or 0)
+        quantity = int(quantity_raw or 0)
+        all_symbols.add(symbol)
+        side_symbols[side].add(symbol)
+        counts["all"]["fills"] += fill_count
+        counts["all"]["quantity"] += quantity
+        counts[side]["fills"] += fill_count
+        counts[side]["quantity"] += quantity
+    for side, symbols in side_symbols.items():
+        by_side[side] = sorted(symbols)
+        counts[side]["symbols"] = len(symbols)
+    counts["all"]["symbols"] = len(all_symbols)
+    return {"by_side": by_side, "counts": counts}
 
 
 def runtime_filled_today_symbols(
@@ -1019,10 +1080,16 @@ def build_runtime_status(
         autonomous=autonomous,
         monitoring_price_source=monitoring_price_source,
     )
-    symbols: dict[str, list[str]] = {
+    symbols: dict[str, object] = {
         "monitored": [],
         "scheduled_today": [],
         "filled_today": [],
+        "filled_today_by_side": {"buy": [], "sell": []},
+        "filled_today_counts": {
+            "all": {"symbols": 0, "fills": 0, "quantity": 0},
+            "buy": {"symbols": 0, "fills": 0, "quantity": 0},
+            "sell": {"symbols": 0, "fills": 0, "quantity": 0},
+        },
         "failed_today": [],
         "positions": [],
     }
@@ -1172,6 +1239,10 @@ def build_runtime_status(
                     settings=settings,
                     db=db,
                 )
+            if "filled_today_by_side" not in cached_symbols or "filled_today_counts" not in cached_symbols:
+                filled_summary = runtime_filled_today_summary(settings=settings, db=db)
+                cached_symbols["filled_today_by_side"] = filled_summary["by_side"]
+                cached_symbols["filled_today_counts"] = filled_summary["counts"]
             symbols = {
                 **symbols,
                 **cached_symbols,
@@ -1662,7 +1733,7 @@ def _autonomous_monitoring_symbols(*, autonomous: dict[str, object]) -> list[str
     return sorted({str(symbol) for symbol in symbols if str(symbol).strip()})
 
 
-def _autonomous_runtime_snapshot_symbol_summary(*, autonomous: dict[str, object]) -> dict[str, list[str]]:
+def _autonomous_runtime_snapshot_symbol_summary(*, autonomous: dict[str, object]) -> dict[str, object]:
     monitoring = autonomous.get("monitoring")
     if not isinstance(monitoring, dict):
         return {}
