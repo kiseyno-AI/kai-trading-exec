@@ -345,6 +345,126 @@ def stale_nonterminal_order_freshness_payload(
     }
 
 
+def runtime_actionable_alerts_payload(
+    *,
+    monitoring: dict[str, object],
+    freshness: dict[str, object],
+) -> dict[str, object]:
+    alerts: list[dict[str, object]] = []
+    broker_orders = freshness.get("broker_orders")
+    stale_nonterminal = (
+        broker_orders.get("stale_nonterminal")
+        if isinstance(broker_orders, dict)
+        else None
+    )
+    if isinstance(stale_nonterminal, dict):
+        needs_reconciliation_count = int(stale_nonterminal.get("needs_reconciliation_count") or 0)
+        manual_review_count = int(stale_nonterminal.get("manual_review_count") or 0)
+        if needs_reconciliation_count > 0:
+            alerts.append(
+                {
+                    "kind": "stale_broker_orders_need_reconciliation",
+                    "severity": "warning",
+                    "count": needs_reconciliation_count,
+                    "symbols": stale_nonterminal.get("symbols") or [],
+                    "message": "nonterminal broker orders have stale broker sync and should be reconciled",
+                }
+            )
+        if manual_review_count > 0:
+            alerts.append(
+                {
+                    "kind": "stale_broker_orders_need_manual_review",
+                    "severity": "critical",
+                    "count": manual_review_count,
+                    "symbols": stale_nonterminal.get("symbols") or [],
+                    "message": "nonterminal broker orders cannot be reconciled automatically",
+                }
+            )
+
+    position_truth = freshness.get("position_truth")
+    if isinstance(position_truth, dict):
+        stale_count = int(position_truth.get("stale_count") or 0)
+        if stale_count > 0:
+            alerts.append(
+                {
+                    "kind": "position_truth_stale",
+                    "severity": "warning",
+                    "count": stale_count,
+                    "symbols": position_truth.get("stale_symbols") or [],
+                    "message": "execution position truth is stale or missing for symbols with live evidence",
+                }
+            )
+
+    last_cycle = monitoring.get("last_cycle")
+    if not isinstance(last_cycle, dict):
+        last_cycle = {}
+
+    protective_stop_coverage = monitoring.get("protective_stop_coverage")
+    if not isinstance(protective_stop_coverage, dict):
+        protective_stop_coverage = last_cycle.get("protective_stop_coverage")
+    if isinstance(protective_stop_coverage, dict) and protective_stop_coverage.get("status") == "degraded":
+        alerts.append(
+            {
+                "kind": "protective_stop_coverage_degraded",
+                "severity": "critical",
+                "count": int(protective_stop_coverage.get("unprotected_position_count") or 0),
+                "symbols": protective_stop_coverage.get("affected_symbols") or [],
+                "message": "held positions are missing full protective stop coverage",
+            }
+        )
+
+    profit_target_coverage = monitoring.get("profit_target_coverage")
+    if not isinstance(profit_target_coverage, dict):
+        profit_target_coverage = last_cycle.get("profit_target_coverage")
+    if isinstance(profit_target_coverage, dict) and profit_target_coverage.get("status") == "degraded":
+        alerts.append(
+            {
+                "kind": "profit_target_coverage_degraded",
+                "severity": "warning",
+                "count": int(profit_target_coverage.get("missing_target_coverage_count") or 0),
+                "symbols": profit_target_coverage.get("affected_symbols") or [],
+                "message": "held positions are missing full profit target coverage",
+            }
+        )
+
+    severity_order = {"critical": 3, "warning": 2, "info": 1}
+    max_severity = max(
+        (severity_order.get(str(alert.get("severity")), 0) for alert in alerts),
+        default=0,
+    )
+    return {
+        "status": "needs_attention" if alerts else "ok",
+        "count": len(alerts),
+        "critical_count": sum(1 for alert in alerts if alert.get("severity") == "critical"),
+        "warning_count": sum(1 for alert in alerts if alert.get("severity") == "warning"),
+        "max_severity": (
+            "critical"
+            if max_severity >= 3
+            else "warning"
+            if max_severity == 2
+            else "info"
+            if max_severity == 1
+            else None
+        ),
+        "alerts": alerts[:MAX_STATUS_DETAIL_ITEMS],
+        "alerts_count": len(alerts),
+        "alerts_truncated": len(alerts) > MAX_STATUS_DETAIL_ITEMS,
+    }
+
+
+def _default_actionable_alerts_payload() -> dict[str, object]:
+    return {
+        "status": "unknown",
+        "count": 0,
+        "critical_count": 0,
+        "warning_count": 0,
+        "max_severity": None,
+        "alerts": [],
+        "alerts_count": 0,
+        "alerts_truncated": False,
+    }
+
+
 def _stale_nonterminal_order_item(*, order: BrokerOrder) -> dict[str, object]:
     return {
         "broker_order_pk": order.id,
@@ -983,6 +1103,7 @@ def build_runtime_status(
             "counts": counts,
             "symbols": symbols,
             "freshness": freshness,
+            "actionable_alerts": _default_actionable_alerts_payload(),
             "account_drawdown_gate": account_drawdown_gate,
         }
 
@@ -1057,10 +1178,14 @@ def build_runtime_status(
                 "monitored": _autonomous_monitoring_symbols(autonomous=autonomous),
             }
             freshness["summary_source"] = "fast_autonomous_runtime_snapshot"
-            monthly_pnl = _default_monthly_pnl_payload(settings=settings)
+            monthly_pnl = monthly_pnl_payload(settings=settings, db=db)
         else:
             freshness["summary_source"] = "fast_runtime_status"
-            monthly_pnl = _default_monthly_pnl_payload(settings=settings)
+            monthly_pnl = monthly_pnl_payload(settings=settings, db=db)
+        actionable_alerts = runtime_actionable_alerts_payload(
+            monitoring=monitoring,
+            freshness=freshness,
+        )
     except SQLAlchemyError as exc:
         db.rollback()
         dependencies["runtime_schema"] = "error"
@@ -1070,6 +1195,7 @@ def build_runtime_status(
             f"runtime state unavailable: {exc.__class__.__name__}; run migrations",
         )
         monthly_pnl = _default_monthly_pnl_payload(settings=settings)
+        actionable_alerts = _default_actionable_alerts_payload()
 
     monitoring_reasons = _monitoring_price_source_readiness_reasons(
         autonomous=autonomous,
@@ -1103,6 +1229,7 @@ def build_runtime_status(
         "counts": counts,
         "symbols": symbols,
         "freshness": freshness,
+        "actionable_alerts": actionable_alerts,
         "monthly_pnl": monthly_pnl,
         "account_drawdown_gate": account_drawdown_gate,
     }

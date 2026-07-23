@@ -1013,6 +1013,13 @@ def test_runtime_status_reports_actionable_stale_nonterminal_orders() -> None:
     assert items_by_key["stale-submitted-with-broker-id"]["action"] == "reconcile_broker_truth"
     assert items_by_key["stale-retry-missing-broker-id"]["action"] == "manual_review"
     assert items_by_key["stale-retry-missing-broker-id"]["reason"] == "missing_broker_order_id"
+    alerts = payload["actionable_alerts"]
+    assert alerts["status"] == "needs_attention"
+    assert alerts["critical_count"] == 1
+    assert alerts["warning_count"] >= 1
+    alert_kinds = {alert["kind"] for alert in alerts["alerts"]}
+    assert "stale_broker_orders_need_reconciliation" in alert_kinds
+    assert "stale_broker_orders_need_manual_review" in alert_kinds
     engine.dispose()
 
 
