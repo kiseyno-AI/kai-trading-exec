@@ -465,8 +465,12 @@ def test_runtime_status_reports_monthly_realized_pnl_progress_and_mode() -> None
     assert daily["daily_sell_notional"] == "55000.0000"
     assert daily["matched_sell_quantity"] == 5
     assert daily["unmatched_sell_quantity"] == 0
+    assert daily["sold_symbols"] == ["005930"]
+    assert daily["sold_symbol_count"] == 1
     assert daily["closed_symbols"] == ["005930"]
     assert daily["closed_symbol_count"] == 1
+    assert daily["unmatched_sell_symbols"] == []
+    assert daily["unmatched_sell_symbol_count"] == 0
     assert daily["pnl_method"] == "fifo_internal_fills"
 
     engine.dispose()
@@ -548,9 +552,102 @@ def test_runtime_status_daily_pnl_uses_crypto_base_quantity_and_quote_notional()
     assert daily["daily_buy_notional"] == "100000.0000"
     assert daily["daily_sell_notional"] == "44000.0000"
     assert daily["unmatched_sell_quantity"] == 0
+    assert daily["sold_symbols"] == ["KRW-BTC"]
+    assert daily["sold_symbol_count"] == 1
     assert daily["closed_symbols"] == ["KRW-BTC"]
     assert daily["closed_symbol_count"] == 1
+    assert daily["unmatched_sell_symbols"] == []
+    assert daily["unmatched_sell_symbol_count"] == 0
     assert daily["pnl_method"] == "fifo_internal_fills"
+
+    engine.dispose()
+
+
+def test_runtime_status_daily_pnl_surfaces_unmatched_sell_coverage() -> None:
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            automation_enabled=True,
+        )
+    )
+    client = TestClient(app)
+    now = datetime.now(UTC)
+
+    with app.state.db_session_factory() as session:
+        buy_order = BrokerOrder(
+            mode="paper",
+            idempotency_key="daily-coverage-buy-1",
+            symbol="005930",
+            side="buy",
+            status="filled",
+            quantity=2,
+        )
+        matched_sell_order = BrokerOrder(
+            mode="paper",
+            idempotency_key="daily-coverage-sell-matched-1",
+            symbol="005930",
+            side="sell",
+            status="filled",
+            quantity=1,
+        )
+        unmatched_sell_order = BrokerOrder(
+            mode="paper",
+            idempotency_key="daily-coverage-sell-unmatched-1",
+            symbol="003280",
+            side="sell",
+            status="filled",
+            quantity=150,
+        )
+        session.add_all([buy_order, matched_sell_order, unmatched_sell_order])
+        session.flush()
+        session.add_all(
+            [
+                ExecutionFill(
+                    broker_order_pk=buy_order.id,
+                    broker_fill_id="daily-coverage-buy-fill-1",
+                    symbol="005930",
+                    side="buy",
+                    quantity=2,
+                    price=Decimal("10000"),
+                    filled_at=now - timedelta(days=1),
+                ),
+                ExecutionFill(
+                    broker_order_pk=matched_sell_order.id,
+                    broker_fill_id="daily-coverage-sell-fill-1",
+                    symbol="005930",
+                    side="sell",
+                    quantity=1,
+                    price=Decimal("11000"),
+                    filled_at=now,
+                ),
+                ExecutionFill(
+                    broker_order_pk=unmatched_sell_order.id,
+                    broker_fill_id="daily-coverage-unmatched-sell-fill-1",
+                    symbol="003280",
+                    side="sell",
+                    quantity=150,
+                    price=Decimal("2020"),
+                    filled_at=now,
+                ),
+            ]
+        )
+        session.commit()
+
+    response = client.get("/runtime/status")
+
+    assert response.status_code == 200
+    daily = response.json()["daily_pnl"]
+    assert daily["daily_realized_pnl"] == "1000.0000"
+    assert daily["daily_sell_notional"] == "314000.0000"
+    assert daily["matched_sell_quantity"] == 1
+    assert daily["unmatched_sell_quantity"] == 150
+    assert daily["sold_symbols"] == ["003280", "005930"]
+    assert daily["sold_symbol_count"] == 2
+    assert daily["closed_symbols"] == ["005930"]
+    assert daily["closed_symbol_count"] == 1
+    assert daily["unmatched_sell_symbols"] == ["003280"]
+    assert daily["unmatched_sell_symbol_count"] == 1
 
     engine.dispose()
 
