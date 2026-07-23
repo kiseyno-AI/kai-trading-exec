@@ -3531,6 +3531,14 @@ def _maintain_post_entry_exit_monitors(
             triggered_at=triggered_at,
         )
         maintenance_count += stop_maintenance_count
+        _, target_maintenance_count = _ensure_post_entry_target_monitor(
+            db=db,
+            entry_item=entry_item,
+            quantity=position.quantity,
+            entry_price=entry_price,
+            triggered_at=triggered_at,
+        )
+        maintenance_count += target_maintenance_count
         _, max_holding_maintenance_count = _ensure_post_entry_max_holding_monitor(
             db=db,
             entry_item=entry_item,
@@ -3756,6 +3764,91 @@ def _ensure_post_entry_stop_monitor(
     risk_context = dict(existing.risk_context) if isinstance(existing.risk_context, dict) else {}
     risk_context.setdefault("exchange", _plan_item_exchange(entry_item))
     risk_context.setdefault("deterministic_emergency_stop", True)
+    risk_context.setdefault("post_entry_managed", True)
+    risk_context["entry_context"] = _post_entry_context(
+        entry_item=entry_item,
+        entry_price=entry_price,
+        quantity=quantity,
+    )
+    existing.risk_context = risk_context
+    return existing, maintenance_count
+
+
+def _ensure_post_entry_target_monitor(
+    *,
+    db: Session,
+    entry_item: ExecutionPlanItem,
+    quantity: int,
+    entry_price: Decimal,
+    triggered_at: datetime,
+) -> tuple[ExecutionPlanItem | None, int]:
+    target_price = _watch_buy_target_price(entry_item)
+    if target_price is None or target_price <= entry_price:
+        return None, 0
+    plan = entry_item.plan
+    assert plan is not None
+    maintenance_count = 0
+    existing = _active_sibling_monitor(
+        entry_item=entry_item,
+        intent="target_sell",
+    )
+    if existing is None:
+        existing = ExecutionPlanItem(
+            plan=plan,
+            plan_item_index=_next_plan_item_index(plan),
+            symbol=entry_item.symbol,
+            side="sell",
+            intent="target_sell",
+            status="target_sell_monitoring",
+            quantity_policy={"kind": "shares", "quantity": quantity},
+            trigger_price=target_price,
+            time_in_force=entry_item.time_in_force or "day",
+            risk_context={
+                "exchange": _plan_item_exchange(entry_item),
+                "entry_context": _post_entry_context(
+                    entry_item=entry_item,
+                    entry_price=entry_price,
+                    quantity=quantity,
+                ),
+                "post_entry_managed": True,
+            },
+            decision_agent_name=entry_item.decision_agent_name,
+            decision_snapshot_id=entry_item.decision_snapshot_id,
+            decision_run_id=entry_item.decision_run_id,
+            source_plan_item_id=_derived_source_plan_item_id(entry_item, "post-entry-target"),
+            source_market_date=entry_item.source_market_date,
+        )
+        db.add(existing)
+        _record_monitoring_event(
+            item=existing,
+            event={
+                "event": "post_entry_target_monitor_created",
+                "entry_execution_plan_item_id": entry_item.id,
+                "trigger_price": _serialize_decimal(target_price),
+                "recorded_at": triggered_at.isoformat(),
+            },
+        )
+        return existing, 1
+
+    if existing.trigger_price != target_price:
+        prior_target = existing.trigger_price
+        existing.trigger_price = target_price
+        maintenance_count += 1
+        _record_monitoring_event(
+            item=existing,
+            event={
+                "event": "post_entry_target_monitor_updated",
+                "prior_trigger_price": _serialize_decimal(prior_target),
+                "trigger_price": _serialize_decimal(target_price),
+                "recorded_at": triggered_at.isoformat(),
+            },
+        )
+    if not _quantity_policy_supported(existing.quantity_policy):
+        existing.quantity_policy = {"kind": "shares", "quantity": quantity}
+        maintenance_count += 1
+
+    risk_context = dict(existing.risk_context) if isinstance(existing.risk_context, dict) else {}
+    risk_context.setdefault("exchange", _plan_item_exchange(entry_item))
     risk_context.setdefault("post_entry_managed", True)
     risk_context["entry_context"] = _post_entry_context(
         entry_item=entry_item,

@@ -36,6 +36,7 @@ from app.models.runtime import (
 from app.services import runtime as runtime_service, runtime_controls
 from app.services.autonomous_runtime import _is_regular_market_session
 from app.services.monitoring import (
+    _maintain_post_entry_exit_monitors,
     _load_monitored_items,
     _resolve_sell_quantity,
     list_autonomous_monitoring_symbols,
@@ -2280,6 +2281,103 @@ def test_autonomous_monitoring_includes_held_stop_sell_outside_symbol_cap() -> N
         )
 
         assert [item.id for item in autonomous_items] == [held_stop_item_id]
+
+    engine.dispose()
+
+
+def test_post_entry_maintenance_creates_missing_target_sell_monitor() -> None:
+    app, engine = build_test_app(
+        Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+        )
+    )
+    client = TestClient(app)
+
+    response = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-held-entry-target-repair",
+            "source": "kai-trading-core",
+            "market_date": "2026-06-08",
+            "items": [
+                {
+                    "symbol": "002380",
+                    "side": "buy",
+                    "intent": "intraday_watch_buy",
+                    "trigger_price": "100.00",
+                    "limit_price": "100.00",
+                    "quantity_policy": {"kind": "shares", "quantity": 3},
+                    "risk_context": {
+                        "exchange": "KRX",
+                        "target_price": "110.00",
+                        "stop_loss_price": "95.00",
+                    },
+                },
+                {
+                    "symbol": "002380",
+                    "side": "sell",
+                    "intent": "stop_sell",
+                    "trigger_price": "95.00",
+                    "quantity_policy": {"kind": "position_exit_from_entry"},
+                },
+            ],
+        },
+    )
+    assert response.status_code == 201
+    buy_item_id, _ = response.json()["persisted_execution_item_ids"]
+
+    with app.state.db_session_factory() as session:
+        buy_item = session.get(ExecutionPlanItem, buy_item_id)
+        assert buy_item is not None
+        buy_item.status = "broker_order_submitted"
+        session.add(
+            BrokerOrder(
+                mode="paper",
+                execution_plan_item_id=buy_item_id,
+                idempotency_key=f"monitoring:watch_buy:{buy_item_id}",
+                symbol="002380",
+                side="buy",
+                status="filled",
+                quantity=3,
+                limit_price=Decimal("100.00"),
+                submitted_at=datetime(2026, 6, 8, 0, 55, tzinfo=UTC),
+            )
+        )
+        position = ExecutionPosition(
+            mode="paper",
+            symbol="002380",
+            quantity=3,
+            average_price=Decimal("100.00"),
+            updated_from="reconciliation",
+            last_reconciled_at=datetime(2026, 6, 8, 1, 0, tzinfo=UTC),
+        )
+        session.add(position)
+        session.commit()
+
+        maintenance_count, review_count = _maintain_post_entry_exit_monitors(
+            settings=app.state.settings,
+            db=session,
+            positions_by_symbol={"002380": position},
+            prices={"002380": MonitoringPriceRequest(symbol="002380", price=Decimal("105.00"))},
+            triggered_at=datetime(2026, 6, 8, 1, 5, tzinfo=UTC),
+        )
+        session.commit()
+
+        target = session.scalar(
+            select(ExecutionPlanItem).where(
+                ExecutionPlanItem.symbol == "002380",
+                ExecutionPlanItem.intent == "target_sell",
+                ExecutionPlanItem.status == "target_sell_monitoring",
+            )
+        )
+        assert target is not None
+        assert target.trigger_price == Decimal("110.0000")
+        assert target.quantity_policy == {"kind": "shares", "quantity": 3}
+        assert target.risk_context["post_entry_managed"] is True
+        assert target.risk_context["entry_context"]["entry_price"] == "100.0000"
+        assert maintenance_count >= 1
+        assert review_count == 0
 
     engine.dispose()
 
