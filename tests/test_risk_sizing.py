@@ -228,6 +228,21 @@ def test_risk_sizing_normal_market_breadth_preserves_baseline_quantity() -> None
     guardrail = decision.cap_details["market_regime_guardrail"]
     assert guardrail["market_regime_posture"] == "normal"
     assert guardrail["action"] == "allow"
+    assert guardrail["summary"] == {
+        "enabled": True,
+        "market": "KOSPI",
+        "posture": "normal",
+        "action": "allow",
+        "reason_code": "market_breadth_normal",
+        "multiplier": "1.0000",
+        "cap_notional_krw": None,
+        "up_ratio": "0.5200",
+        "advance_decline_ratio": "1.2100",
+        "breadth_market_date": "2026-06-25",
+        "sector_name": None,
+        "sector_relative_state": None,
+        "warnings": ["sector_context_missing"],
+    }
 
 
 def test_risk_sizing_risk_off_market_breadth_downsizes_quantity() -> None:
@@ -258,6 +273,10 @@ def test_risk_sizing_risk_off_market_breadth_downsizes_quantity() -> None:
     assert guardrail["market_regime_reason_code"] == "market_breadth_risk_off"
     assert guardrail["action"] == "downsize"
     assert guardrail["multiplier"] == "0.2000"
+    assert guardrail["summary"]["posture"] == "risk_off"
+    assert guardrail["summary"]["action"] == "downsize"
+    assert guardrail["summary"]["reason_code"] == "market_breadth_risk_off"
+    assert guardrail["summary"]["up_ratio"] == "0.3500"
 
 
 def test_risk_sizing_below_normal_market_breadth_downsizes_quantity() -> None:
@@ -286,6 +305,10 @@ def test_risk_sizing_below_normal_market_breadth_downsizes_quantity() -> None:
     assert guardrail["market_regime_reason_code"] == "market_breadth_caution"
     assert guardrail["action"] == "downsize"
     assert guardrail["multiplier"] == "0.3300"
+    assert guardrail["summary"]["posture"] == "caution"
+    assert guardrail["summary"]["action"] == "downsize"
+    assert guardrail["summary"]["reason_code"] == "market_breadth_caution"
+    assert guardrail["summary"]["advance_decline_ratio"] == "1.1000"
 
 
 def test_risk_sizing_risk_off_market_breadth_downsizes_buy() -> None:
