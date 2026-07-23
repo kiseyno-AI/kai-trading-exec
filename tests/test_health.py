@@ -459,6 +459,18 @@ def test_runtime_status_reports_monthly_realized_pnl_progress_and_mode() -> None
     assert monthly["target_progress_pct"] == "500.0000"
     assert monthly["mode_recommendation"] == "capital_preservation"
     assert monthly["matched_sell_quantity"] == 5
+    weekly = response.json()["weekly_pnl"]
+    assert weekly["weekly_realized_pnl"] == "5000.0000"
+    assert weekly["weekly_buy_notional"] == "100000.0000"
+    assert weekly["weekly_sell_notional"] == "55000.0000"
+    assert weekly["matched_sell_quantity"] == 5
+    assert weekly["unmatched_sell_quantity"] == 0
+    assert weekly["closed_trade_count"] == 1
+    assert weekly["closed_symbols"] == ["005930"]
+    assert weekly["closed_symbol_count"] == 1
+    assert weekly["win_count"] == 1
+    assert weekly["loss_count"] == 0
+    assert weekly["pnl_method"] == "fifo_internal_fills"
     daily = response.json()["daily_pnl"]
     assert daily["daily_realized_pnl"] == "5000.0000"
     assert daily["daily_buy_notional"] == "0.0000"
@@ -3924,6 +3936,12 @@ def test_fast_runtime_status_uses_autonomous_snapshot_for_monitored_symbols() ->
     assert payload["monthly_pnl"]["pnl_method"] == "fifo_internal_fills"
     assert payload["monthly_pnl"]["monthly_realized_pnl"] == "-11700.0000"
     assert payload["monthly_pnl"]["matched_sell_quantity"] == 3
+    assert payload["weekly_pnl"]["pnl_method"] == "fifo_internal_fills"
+    assert payload["weekly_pnl"]["weekly_realized_pnl"] == "-11700.0000"
+    assert payload["weekly_pnl"]["weekly_buy_notional"] == "375000.0000"
+    assert payload["weekly_pnl"]["weekly_sell_notional"] == "363300.0000"
+    assert payload["weekly_pnl"]["matched_sell_quantity"] == 3
+    assert payload["weekly_pnl"]["closed_symbols"] == ["282330"]
     assert payload["daily_pnl"]["pnl_method"] == "fifo_internal_fills"
     assert payload["daily_pnl"]["daily_realized_pnl"] == "-11700.0000"
     assert payload["daily_pnl"]["daily_buy_notional"] == "375000.0000"
