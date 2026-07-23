@@ -4266,6 +4266,17 @@ def test_exec_agent_watch_sizing_response_materializes_stub_order_path() -> None
             },
         )
         assert summary["approved"] == 1
+        item = session.get(ExecutionPlanItem, item_id)
+        assert item is not None
+        explanation = item.quantity_policy["sizing_explanation"]
+        assert explanation["schema_version"] == "watch_sizing_explanation_v1"
+        assert explanation["agent_approved_quantity"] == 2
+        assert explanation["final_quantity"] == 2
+        assert explanation["sizing_price"] == "71050.0000"
+        assert explanation["final_notional"] == "142100.0000"
+        assert explanation["cap_notional"] == "142100.0000"
+        assert explanation["reason_code"] == "agent_sized_tactical_buy"
+        assert explanation["cash_limited_quantity"] is not None
         session.commit()
 
     response = client.post(
@@ -4286,6 +4297,74 @@ def test_exec_agent_watch_sizing_response_materializes_stub_order_path() -> None
     assert len(broker_adapter.order_calls) == 1
     assert broker_adapter.order_calls[0].execution_plan_item_id == item_id
     assert broker_adapter.order_calls[0].quantity == 2
+
+    engine.dispose()
+
+
+def test_exec_agent_watch_sizing_explains_runtime_downsize() -> None:
+    app, engine, client, _broker_adapter = _build_watch_buy_test_app(
+        order_id="kis-watch-buy-agent-sized-explanation-1"
+    )
+    item_id = _create_watch_buy_candidate(
+        client,
+        plan_id="plan-watch-buy-agent-sized-explanation-1",
+        quantity_policy={
+            "type": "exec_agent_sized",
+            "budget_krw": "0",
+            "max_safe_notional_krw": "150000",
+        },
+        risk_context={
+            "exchange": "KRX",
+            "stop_price": "70000.00",
+            "target_price": "72420.00",
+            "trigger_direction": "at_or_above",
+        },
+    )
+
+    with app.state.db_session_factory() as session:
+        plan = session.scalar(
+            select(ExecutionPlan).where(
+                ExecutionPlan.external_plan_id == "plan-watch-buy-agent-sized-explanation-1"
+            )
+        )
+        assert plan is not None
+        summary = _apply_decisions(
+            db=session,
+            settings=app.state.settings,
+            plan=plan,
+            expected_item_ids={item_id},
+            decision_payload={
+                "version": "manual-exec-agent-watch-sizing-v1",
+                "decisions": [
+                    {
+                        "execution_plan_item_id": item_id,
+                        "symbol": "005930",
+                        "action": "approve",
+                        "quantity": 10,
+                        "approved_notional_krw": 710500,
+                        "sizing_price": "71050.00",
+                        "confidence": 0.68,
+                        "target_profile": "tactical_2pct",
+                        "reason_code": "agent_sized_tactical_buy",
+                        "reason": "agent approved a tactical watch quantity",
+                    }
+                ],
+            },
+        )
+        assert summary["approved"] == 1
+        item = session.get(ExecutionPlanItem, item_id)
+        assert item is not None
+        policy = item.quantity_policy
+        assert policy["quantity"] == 2
+        explanation = policy["sizing_explanation"]
+        assert explanation["agent_approved_quantity"] == 10
+        assert explanation["agent_approved_notional"] == "710500.0000"
+        assert explanation["final_quantity"] == 2
+        assert explanation["final_notional"] == "142100.0000"
+        assert explanation["cap_notional"] == "150000.0000"
+        assert explanation["runtime_cap_notional"] == "150000.0000"
+        assert explanation["adjustment_applied"] is True
+        assert explanation["minimum_required_notional"] is not None
 
     engine.dispose()
 

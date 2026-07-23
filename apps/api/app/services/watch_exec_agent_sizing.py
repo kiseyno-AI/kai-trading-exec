@@ -1347,6 +1347,12 @@ def _apply_decisions(
                         "storage": "execution_plan_item_audits",
                     },
                     "sizing_adjustment": sizing["adjustment"],
+                    "sizing_explanation": _sizing_explanation(
+                        decision=decision,
+                        record=record,
+                        sizing=sizing,
+                        allowed_action_envelope=envelope,
+                    ),
                     "allowed_action_envelope": envelope,
                     "market_regime_guardrail": envelope.get("market_regime_guardrail"),
                     "previous_policy": previous_policy,
@@ -1410,6 +1416,12 @@ def _apply_decisions(
                     "storage": "execution_plan_item_audits",
                 },
                 "sizing_adjustment": sizing["adjustment"],
+                "sizing_explanation": _sizing_explanation(
+                    decision=decision,
+                    record=record,
+                    sizing=sizing,
+                    allowed_action_envelope=envelope,
+                ),
                 "allowed_action_envelope": envelope,
                 "market_regime_guardrail": envelope.get("market_regime_guardrail"),
                 "previous_policy": previous_policy,
@@ -1479,6 +1491,60 @@ def _decision_summary(record: dict[str, object]) -> dict[str, object]:
         "reason_code": record.get("reason_code"),
         "reason": record.get("reason"),
         "decided_at": record.get("decided_at"),
+    }
+
+
+def _sizing_explanation(
+    *,
+    decision: dict[str, object],
+    record: dict[str, object],
+    sizing: dict[str, object],
+    allowed_action_envelope: dict[str, object] | None,
+) -> dict[str, object]:
+    adjustment = sizing.get("adjustment")
+    if not isinstance(adjustment, dict):
+        adjustment = {}
+    envelope = allowed_action_envelope if isinstance(allowed_action_envelope, dict) else {}
+    final_quantity = _positive_int(adjustment.get("final_quantity"))
+    if final_quantity is None:
+        final_quantity = _positive_int(sizing.get("quantity"))
+    agent_quantity = _positive_int(adjustment.get("agent_approved_quantity"))
+    if agent_quantity is None:
+        agent_quantity = _positive_int(decision.get("quantity"))
+    sizing_price = sizing.get("sizing_price")
+    if not isinstance(sizing_price, Decimal):
+        sizing_price = _decimal_value(sizing_price)
+    approved_notional = sizing.get("approved_notional")
+    if not isinstance(approved_notional, Decimal):
+        approved_notional = _decimal_value(approved_notional)
+    return {
+        "schema_version": "watch_sizing_explanation_v1",
+        "source": "exec_agent_watch_sizing",
+        "decision": sizing.get("decision"),
+        "reason_code": sizing.get("reason_code") or decision.get("reason_code"),
+        "reason": sizing.get("reason") or decision.get("reason"),
+        "confidence": decision.get("confidence"),
+        "target_profile": record.get("target_profile"),
+        "target_tag": record.get("target_tag"),
+        "agent_approved_quantity": agent_quantity,
+        "agent_approved_notional": adjustment.get("agent_approved_notional"),
+        "agent_reported_notional": decision.get("approved_notional_krw"),
+        "sizing_price": _decimal_text(sizing_price),
+        "final_quantity": final_quantity,
+        "final_notional": adjustment.get("final_notional") or _decimal_text(approved_notional),
+        "cap_notional": adjustment.get("cap_notional"),
+        "runtime_cap_notional": adjustment.get("runtime_cap_notional"),
+        "agent_cap_notional": adjustment.get("agent_cap_notional"),
+        "minimum_required_notional": adjustment.get("minimum_required_notional"),
+        "effective_target_notional": adjustment.get("effective_target_notional"),
+        "cash_limited_quantity": envelope.get("cash_limited_quantity"),
+        "risk_limited_notional_krw": envelope.get("risk_limited_notional_krw"),
+        "allowed_action_envelope_max_quantity": adjustment.get("allowed_action_envelope_max_quantity"),
+        "adjustment_applied": adjustment.get("applied"),
+        "min_notional_upsize_suppressed": adjustment.get("min_notional_upsize_suppressed"),
+        "vol_corr_cap": adjustment.get("vol_corr_cap"),
+        "hard_reject_reasons": envelope.get("hard_reject_reasons"),
+        "soft_warnings": envelope.get("soft_warnings"),
     }
 
 
