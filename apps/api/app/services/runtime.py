@@ -1361,8 +1361,8 @@ def monthly_pnl_payload(
         filled_at = _as_utc(fill.filled_at)
         side = fill.side.lower()
         symbol = fill.symbol
-        quantity = Decimal(fill.quantity)
-        notional = (fill.price * quantity).quantize(Decimal("0.0001"))
+        quantity = _pnl_fill_quantity(fill)
+        notional = _pnl_fill_notional(fill=fill, quantity=quantity)
         if side == "buy":
             lots_by_symbol.setdefault(symbol, []).append(
                 {"quantity": quantity, "price": fill.price}
