@@ -2687,6 +2687,13 @@ def test_monitoring_reports_missing_profit_target_coverage() -> None:
     runtime_coverage = runtime_status.json()["liveness"]["monitoring"]["profit_target_coverage"]
     assert runtime_coverage["status"] == "degraded"
     assert runtime_coverage["missing_quantities"] == {"002380": 2}
+    runtime_alerts = runtime_status.json()["actionable_alerts"]
+    assert runtime_alerts["status"] == "needs_attention"
+    assert runtime_alerts["warning_count"] >= 1
+    assert {
+        alert["kind"]
+        for alert in runtime_alerts["alerts"]
+    } >= {"profit_target_coverage_degraded"}
 
     engine.dispose()
 
@@ -3637,6 +3644,8 @@ def test_fast_runtime_status_uses_autonomous_snapshot_for_monitored_symbols() ->
     assert payload["symbols"]["monitored"] == ["000660", "005930"]
     assert payload["symbols"]["filled_today"] == ["282330"]
     assert payload["monthly_pnl"]["pnl_method"] == "fifo_internal_fills"
+    assert payload["monthly_pnl"]["monthly_realized_pnl"] == "-11700.0000"
+    assert payload["monthly_pnl"]["matched_sell_quantity"] == 3
 
     engine.dispose()
 
