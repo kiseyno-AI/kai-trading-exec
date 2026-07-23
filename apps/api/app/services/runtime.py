@@ -1355,8 +1355,8 @@ def monthly_pnl_payload(
     monthly_realized = Decimal("0")
     monthly_sell_notional = Decimal("0")
     monthly_buy_notional = Decimal("0")
-    matched_sell_quantity = 0
-    unmatched_sell_quantity = 0
+    matched_sell_quantity = Decimal("0")
+    unmatched_sell_quantity = Decimal("0")
     for fill in fills:
         filled_at = _as_utc(fill.filled_at)
         side = fill.side.lower()
@@ -1381,13 +1381,13 @@ def monthly_pnl_payload(
             matched = min(remaining, lot["quantity"])
             if filled_at >= month_start:
                 monthly_realized += ((fill.price - lot["price"]) * matched).quantize(Decimal("0.0001"))
-                matched_sell_quantity += int(matched)
+                matched_sell_quantity += matched
             lot["quantity"] -= matched
             remaining -= matched
             if lot["quantity"] <= 0:
                 lots.pop(0)
         if remaining > 0 and filled_at >= month_start:
-            unmatched_sell_quantity += int(remaining)
+            unmatched_sell_quantity += remaining
 
     target = getattr(settings, "monthly_target_krw", Decimal("500000"))
     progress = (monthly_realized / target * Decimal("100")).quantize(Decimal("0.01")) if target > 0 else Decimal("0")
@@ -1406,8 +1406,8 @@ def monthly_pnl_payload(
         "mode_recommendation": recommendation,
         "monthly_buy_notional": _decimal_text(monthly_buy_notional),
         "monthly_sell_notional": _decimal_text(monthly_sell_notional),
-        "matched_sell_quantity": matched_sell_quantity,
-        "unmatched_sell_quantity": unmatched_sell_quantity,
+        "matched_sell_quantity": _quantity_value(matched_sell_quantity),
+        "unmatched_sell_quantity": _quantity_value(unmatched_sell_quantity),
         "pnl_method": "fifo_internal_fills",
     }
 
@@ -1433,8 +1433,8 @@ def daily_pnl_payload(
     realized = Decimal("0")
     sell_notional = Decimal("0")
     buy_notional = Decimal("0")
-    matched_sell_quantity = 0
-    unmatched_sell_quantity = 0
+    matched_sell_quantity = Decimal("0")
+    unmatched_sell_quantity = Decimal("0")
     closed_symbols: set[str] = set()
     sold_symbols: set[str] = set()
     unmatched_sell_symbols: set[str] = set()
@@ -1463,14 +1463,14 @@ def daily_pnl_payload(
             matched = min(remaining, lot["quantity"])
             if filled_at >= day_start:
                 realized += ((fill.price - lot["price"]) * matched).quantize(Decimal("0.0001"))
-                matched_sell_quantity += int(matched)
+                matched_sell_quantity += matched
                 closed_symbols.add(symbol)
             lot["quantity"] -= matched
             remaining -= matched
             if lot["quantity"] <= 0:
                 lots.pop(0)
         if remaining > 0 and filled_at >= day_start:
-            unmatched_sell_quantity += int(remaining)
+            unmatched_sell_quantity += remaining
             unmatched_sell_symbols.add(symbol)
 
     return {
@@ -1478,8 +1478,8 @@ def daily_pnl_payload(
         "daily_realized_pnl": _decimal_text(realized),
         "daily_buy_notional": _decimal_text(buy_notional),
         "daily_sell_notional": _decimal_text(sell_notional),
-        "matched_sell_quantity": matched_sell_quantity,
-        "unmatched_sell_quantity": unmatched_sell_quantity,
+        "matched_sell_quantity": _quantity_value(matched_sell_quantity),
+        "unmatched_sell_quantity": _quantity_value(unmatched_sell_quantity),
         "sold_symbols": sorted(sold_symbols),
         "sold_symbol_count": len(sold_symbols),
         "closed_symbols": sorted(closed_symbols),
@@ -1511,8 +1511,8 @@ def weekly_pnl_payload(
     realized = Decimal("0")
     sell_notional = Decimal("0")
     buy_notional = Decimal("0")
-    matched_sell_quantity = 0
-    unmatched_sell_quantity = 0
+    matched_sell_quantity = Decimal("0")
+    unmatched_sell_quantity = Decimal("0")
     closed_symbols: set[str] = set()
     unmatched_sell_symbols: set[str] = set()
     win_count = 0
@@ -1543,7 +1543,7 @@ def weekly_pnl_payload(
             pnl = ((fill.price - lot["price"]) * matched).quantize(Decimal("0.0001"))
             if filled_at >= week_start:
                 realized += pnl
-                matched_sell_quantity += int(matched)
+                matched_sell_quantity += matched
                 closed_symbols.add(symbol)
                 if pnl > 0:
                     win_count += 1
@@ -1556,7 +1556,7 @@ def weekly_pnl_payload(
             if lot["quantity"] <= 0:
                 lots.pop(0)
         if remaining > 0 and filled_at >= week_start:
-            unmatched_sell_quantity += int(remaining)
+            unmatched_sell_quantity += remaining
             unmatched_sell_symbols.add(symbol)
 
     return {
@@ -1565,8 +1565,8 @@ def weekly_pnl_payload(
         "weekly_realized_pnl": _decimal_text(realized),
         "weekly_buy_notional": _decimal_text(buy_notional),
         "weekly_sell_notional": _decimal_text(sell_notional),
-        "matched_sell_quantity": matched_sell_quantity,
-        "unmatched_sell_quantity": unmatched_sell_quantity,
+        "matched_sell_quantity": _quantity_value(matched_sell_quantity),
+        "unmatched_sell_quantity": _quantity_value(unmatched_sell_quantity),
         "closed_trade_count": win_count + loss_count + breakeven_count,
         "closed_symbols": sorted(closed_symbols),
         "closed_symbol_count": len(closed_symbols),
@@ -1703,6 +1703,12 @@ def _monthly_mode_recommendation(
 
 def _decimal_text(value: Decimal) -> str:
     return f"{value:.4f}"
+
+
+def _quantity_value(value: Decimal) -> int | str:
+    if value == value.to_integral_value():
+        return int(value)
+    return format(value.normalize(), "f")
 
 
 def build_runtime_daily_board(

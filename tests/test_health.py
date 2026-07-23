@@ -563,12 +563,14 @@ def test_runtime_status_daily_pnl_uses_crypto_base_quantity_and_quote_notional()
     assert monthly["monthly_realized_pnl"] == "4000.0000"
     assert monthly["monthly_buy_notional"] == "100000.0000"
     assert monthly["monthly_sell_notional"] == "44000.0000"
+    assert monthly["matched_sell_quantity"] == "0.0004"
     assert monthly["unmatched_sell_quantity"] == 0
     assert monthly["pnl_method"] == "fifo_internal_fills"
     weekly = response.json()["weekly_pnl"]
     assert weekly["weekly_realized_pnl"] == "4000.0000"
     assert weekly["weekly_buy_notional"] == "100000.0000"
     assert weekly["weekly_sell_notional"] == "44000.0000"
+    assert weekly["matched_sell_quantity"] == "0.0004"
     assert weekly["unmatched_sell_quantity"] == 0
     assert weekly["closed_symbols"] == ["KRW-BTC"]
     assert weekly["closed_symbol_count"] == 1
@@ -577,6 +579,7 @@ def test_runtime_status_daily_pnl_uses_crypto_base_quantity_and_quote_notional()
     assert daily["daily_realized_pnl"] == "4000.0000"
     assert daily["daily_buy_notional"] == "100000.0000"
     assert daily["daily_sell_notional"] == "44000.0000"
+    assert daily["matched_sell_quantity"] == "0.0004"
     assert daily["unmatched_sell_quantity"] == 0
     assert daily["sold_symbols"] == ["KRW-BTC"]
     assert daily["sold_symbol_count"] == 1
