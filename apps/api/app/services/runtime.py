@@ -664,6 +664,9 @@ def monitoring_payload(
     protective_stop_coverage = latest_details.get("protective_stop_coverage")
     if not isinstance(protective_stop_coverage, dict):
         protective_stop_coverage = _unknown_protective_stop_coverage_payload()
+    profit_target_coverage = latest_details.get("profit_target_coverage")
+    if not isinstance(profit_target_coverage, dict):
+        profit_target_coverage = _unknown_profit_target_coverage_payload()
     if backlog_item_count > 0 or any(checkpoint.status == "degraded" for checkpoint in checkpoints):
         status = "degraded"
     elif last_heartbeat:
@@ -705,6 +708,7 @@ def monitoring_payload(
         "last_heartbeat_at": last_heartbeat,
         "last_success_at": last_success,
         "protective_stop_coverage": protective_stop_coverage,
+        "profit_target_coverage": profit_target_coverage,
         "last_cycle": latest_details or None,
     }
 
@@ -1432,6 +1436,9 @@ def _compact_monitoring_cycle_payload(payload: dict[str, object]) -> dict[str, o
     coverage = compacted.get("protective_stop_coverage")
     if isinstance(coverage, dict):
         compacted["protective_stop_coverage"] = _compact_status_detail_lists(coverage)
+    target_coverage = compacted.get("profit_target_coverage")
+    if isinstance(target_coverage, dict):
+        compacted["profit_target_coverage"] = _compact_status_detail_lists(target_coverage)
     for key in ("items", "jobs"):
         value = compacted.get(key)
         if isinstance(value, list) and len(value) > MAX_STATUS_DETAIL_ITEMS:
@@ -1458,6 +1465,16 @@ def _unknown_protective_stop_coverage_payload() -> dict[str, object]:
         "unprotected_position_count": 0,
         "position_truth_stale_count": 0,
         "repaired_stop_coverage_count": 0,
+        "affected_symbols": [],
+        "missing_quantities": {},
+        "issues": [],
+    }
+
+
+def _unknown_profit_target_coverage_payload() -> dict[str, object]:
+    return {
+        "status": "unknown",
+        "missing_target_coverage_count": 0,
         "affected_symbols": [],
         "missing_quantities": {},
         "issues": [],

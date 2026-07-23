@@ -144,6 +144,7 @@ def _order(
     *,
     status: str = "submitted",
     broker_order_id: str = "0033196600",
+    side: str = "buy",
     request_metadata: dict[str, object] | None = None,
 ) -> BrokerOrder:
     return BrokerOrder(
@@ -152,7 +153,7 @@ def _order(
         idempotency_key=f"test:{broker_order_id}",
         broker_order_id=broker_order_id,
         symbol="005930",
-        side="buy",
+        side=side,
         status=status,
         quantity=2,
         submitted_at=OBSERVED_AT,
@@ -664,6 +665,69 @@ def test_reconcile_stale_nonterminal_order_marks_closed_against_broker_truth() -
     assert broker.reconcile_calls == [("stale-filled-1", "KRX")]
     assert len(events) == 1
     assert events[0].error_classification == "closed"
+    engine.dispose()
+
+
+def test_reconcile_stale_filled_order_syncs_execution_positions() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        stale_broker_order_reconciliation_threshold_seconds=3600,
+    )
+    engine, db = _session(settings)
+    stale_submitted_at = datetime.now(UTC) - timedelta(days=7)
+    order = _order(broker_order_id="stale-sell-filled-1", side="sell")
+    order.submitted_at = stale_submitted_at
+    order.last_broker_sync_at = stale_submitted_at
+    db.add(order)
+    db.add(
+        ExecutionPosition(
+            mode="paper",
+            symbol="005930",
+            quantity=2,
+            average_price=Decimal("70000"),
+            updated_from="reconciliation",
+            last_reconciled_at=stale_submitted_at,
+        )
+    )
+    db.commit()
+    broker = ReconciliationStubBroker(
+        reconcile_payloads=[
+            {
+                "broker_order_id": "stale-sell-filled-1",
+                "status": "filled",
+                "filled_quantity": 2,
+                "remaining_quantity": 0,
+                "average_fill_price": "71000",
+                "observed_at": OBSERVED_AT.isoformat(),
+            }
+        ],
+        account_snapshot=BrokerAccountSnapshot(
+            available_cash=Decimal("1000000"),
+            observed_at=OBSERVED_AT,
+            source="stub:account_snapshot",
+            holdings=[],
+        ),
+    )
+
+    result = reconcile_stale_nonterminal_broker_orders(
+        settings=settings,
+        db=db,
+        adapter=broker,
+    )
+
+    position = db.scalar(
+        select(ExecutionPosition).where(
+            ExecutionPosition.mode == "paper",
+            ExecutionPosition.symbol == "005930",
+        )
+    )
+    assert result["counts"]["closed"] == 1
+    assert result["position_sync"]["tracked_symbol_count"] == 1
+    assert result["position_sync"]["zeroed"] == 1
+    assert position is not None
+    assert position.quantity == 0
+    assert position.last_reconciled_at == OBSERVED_AT.replace(tzinfo=None)
     engine.dispose()
 
 

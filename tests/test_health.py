@@ -38,6 +38,7 @@ from app.services.autonomous_runtime import _is_regular_market_session
 from app.services.monitoring import (
     _maintain_post_entry_exit_monitors,
     _load_monitored_items,
+    _pending_broker_order_symbols,
     _resolve_sell_quantity,
     list_autonomous_monitoring_symbols,
     run_autonomous_monitoring_cycle,
@@ -2610,6 +2611,123 @@ def test_cached_autonomous_monitoring_repairs_targets_before_idle_exit() -> None
         target_item = session.get(ExecutionPlanItem, target_item_id)
         assert target_item is not None
         assert target_item.status == "target_sell_monitoring"
+
+    engine.dispose()
+
+
+def test_monitoring_reports_missing_profit_target_coverage() -> None:
+    app, engine = build_test_app(
+        Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+        )
+    )
+    client = TestClient(app)
+
+    response = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-held-target-coverage-gap",
+            "source": "kai-trading-core",
+            "market_date": "2026-06-08",
+            "items": [
+                {
+                    "symbol": "002380",
+                    "side": "sell",
+                    "intent": "target_sell",
+                    "trigger_price": "110.00",
+                    "quantity_policy": {"kind": "shares", "quantity": 1},
+                    "risk_context": {"exchange": "KRX"},
+                },
+                {
+                    "symbol": "002380",
+                    "side": "sell",
+                    "intent": "stop_sell",
+                    "trigger_price": "95.00",
+                    "quantity_policy": {"kind": "shares", "quantity": 3},
+                    "risk_context": {"exchange": "KRX"},
+                },
+            ],
+        },
+    )
+    assert response.status_code == 201
+
+    with app.state.db_session_factory() as session:
+        session.add(
+            ExecutionPosition(
+                mode="paper",
+                symbol="002380",
+                quantity=3,
+                average_price=Decimal("100.00"),
+                updated_from="reconciliation",
+                last_reconciled_at=datetime(2026, 6, 8, 1, 0, tzinfo=UTC),
+            )
+        )
+        session.commit()
+
+    evaluation = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "target coverage audit",
+            "prices": [{"symbol": "002380", "price": "105.00"}],
+        },
+    )
+
+    assert evaluation.status_code == 200
+    target_coverage = evaluation.json()["profit_target_coverage"]
+    assert target_coverage["status"] == "degraded"
+    assert target_coverage["missing_target_coverage_count"] == 1
+    assert target_coverage["missing_quantities"] == {"002380": 2}
+    assert target_coverage["issues"][0]["latest_target_trigger_price"] == "110.0000"
+
+    runtime_status = client.get("/runtime/status")
+    assert runtime_status.status_code == 200
+    runtime_coverage = runtime_status.json()["liveness"]["monitoring"]["profit_target_coverage"]
+    assert runtime_coverage["status"] == "degraded"
+    assert runtime_coverage["missing_quantities"] == {"002380": 2}
+
+    engine.dispose()
+
+
+def test_pending_broker_order_symbols_include_flat_submitted_sell() -> None:
+    app, engine = build_test_app(
+        Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+        )
+    )
+
+    with app.state.db_session_factory() as session:
+        session.add(
+            BrokerOrder(
+                mode="paper",
+                idempotency_key="monitoring:target_sell:flat-submitted",
+                broker_order_id="flat-submitted-sell-1",
+                symbol="003280",
+                side="sell",
+                status="submitted",
+                quantity=150,
+            )
+        )
+        session.add(
+            ExecutionPosition(
+                mode="paper",
+                symbol="003280",
+                quantity=0,
+                average_price=Decimal("1988.00"),
+                updated_from="reconciliation",
+                last_reconciled_at=datetime(2026, 6, 8, 1, 0, tzinfo=UTC),
+            )
+        )
+        session.commit()
+
+        assert _pending_broker_order_symbols(
+            settings=app.state.settings,
+            db=session,
+            symbols=None,
+        ) == {"003280"}
 
     engine.dispose()
 
