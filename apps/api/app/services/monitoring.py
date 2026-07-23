@@ -261,6 +261,19 @@ class ProtectiveStopCoverageIssue:
     evidence: list[str] | None = None
 
 
+@dataclass(frozen=True)
+class ProfitTargetCoverageIssue:
+    symbol: str
+    held_quantity: int
+    active_target_quantity: int
+    missing_quantity: int
+    latest_target_item_id: str | None
+    latest_target_status: str | None
+    latest_target_trigger_price: Decimal | None
+    outcome: str
+    reason: str | None = None
+
+
 PROFIT_PROTECTION_TRIGGER_REASONS = frozenset(
     {"profit_protection_trailing_stop", "aged_position_profit_protection"}
 )
@@ -268,6 +281,19 @@ PROTECTIVE_STOP_COVERAGE_STATUSES = frozenset(
     {
         "stop_sell_monitoring",
         "stop_sell_triggered_pending_dispatch",
+        AGENT_PENDING_STATUS,
+        AGENT_APPROVED_PENDING_SUBMIT_STATUS,
+        "broker_order_submission_pending",
+        "broker_order_submitted",
+        "broker_order_retry_pending",
+        "open",
+        "partially_filled",
+    }
+)
+PROFIT_TARGET_COVERAGE_STATUSES = frozenset(
+    {
+        "target_sell_monitoring",
+        "target_sell_triggered_pending_dispatch",
         AGENT_PENDING_STATUS,
         AGENT_APPROVED_PENDING_SUBMIT_STATUS,
         "broker_order_submission_pending",
@@ -871,21 +897,32 @@ def _evaluate_monitoring_cycle(
         for item in items
         if not _is_watch_buy_item(item)
     }
+    pending_broker_order_symbols = _pending_broker_order_symbols(
+        settings=settings,
+        db=db,
+        symbols=symbols,
+    )
+    broker_reconciliation_symbols = sell_monitored_symbols | pending_broker_order_symbols
     if not skip_pre_cycle_broker_reconciliation:
         _reconcile_before_monitoring(
             settings=settings,
             db=db,
             adapter=adapter,
-            symbols=sell_monitored_symbols,
+            symbols=broker_reconciliation_symbols,
             refresh_positions=not position_truth_refreshed_before_selection,
         )
-    _log_cycle_step("reconcile_before_monitoring", sell_symbol_count=len(sell_monitored_symbols))
+    _log_cycle_step(
+        "reconcile_before_monitoring",
+        sell_symbol_count=len(sell_monitored_symbols),
+        pending_broker_order_symbol_count=len(pending_broker_order_symbols),
+        broker_reconciliation_symbol_count=len(broker_reconciliation_symbols),
+    )
     if not position_truth_refreshed_before_selection and not skip_pre_cycle_broker_reconciliation:
         _refresh_position_truth_if_stale(
             settings=settings,
             db=db,
             adapter=adapter,
-            symbols=sell_monitored_symbols,
+            symbols=broker_reconciliation_symbols,
         )
     _log_cycle_step("position_truth_after_selection")
     positions_by_symbol = _load_positions_by_symbol(
@@ -929,10 +966,19 @@ def _evaluate_monitoring_cycle(
             symbols=symbols,
             triggered_at=triggered_at,
         )
+    profit_target_coverage_issues = _profit_target_coverage_issues(
+        settings=settings,
+        db=db,
+        positions_by_symbol=positions_by_symbol,
+    )
     _log_cycle_step(
         "stop_coverage",
         coverage_issue_count=len(coverage_issues),
         repaired_stop_coverage_count=repaired_stop_coverage_count,
+    )
+    _log_cycle_step(
+        "profit_target_coverage",
+        coverage_issue_count=len(profit_target_coverage_issues),
     )
     if repaired_stop_coverage_count:
         db.flush()
@@ -1740,17 +1786,27 @@ def _evaluate_monitoring_cycle(
             issues=coverage_issues,
             repaired_count=repaired_stop_coverage_count,
         ),
+        "profit_target_coverage": _profit_target_coverage_payload(
+            issues=profit_target_coverage_issues,
+        ),
     }
 
     checkpoint = None
     if items or update_checkpoint_if_idle:
         degraded_coverage_count = sum(1 for issue in coverage_issues if issue.outcome != "rearmed")
+        degraded_target_coverage_count = len(profit_target_coverage_issues)
         checkpoint = _update_monitoring_checkpoint(
             settings=settings,
             db=db,
             worker_name=MONITORING_WORKER_NAME,
             triggered_at=triggered_at,
-            status="degraded" if deferred_item_count > 0 or degraded_coverage_count > 0 else "running",
+            status=(
+                "degraded"
+                if deferred_item_count > 0
+                or degraded_coverage_count > 0
+                or degraded_target_coverage_count > 0
+                else "running"
+            ),
             details=checkpoint_details,
         )
     _log_cycle_step("checkpoint_update")
@@ -1768,6 +1824,7 @@ def _evaluate_monitoring_cycle(
             "triggered_symbol_count": checkpoint_details["triggered_symbol_count"],
             "submitted_symbols": checkpoint_details["submitted_symbols"],
             "protective_stop_coverage": checkpoint_details["protective_stop_coverage"],
+            "profit_target_coverage": checkpoint_details["profit_target_coverage"],
             "items": results,
         },
     )
@@ -3163,7 +3220,103 @@ def _stop_items_for_symbol(
     ).all()
 
 
+def _profit_target_coverage_issues(
+    *,
+    settings: Settings,
+    db: Session,
+    positions_by_symbol: dict[str, ExecutionPosition],
+) -> list[ProfitTargetCoverageIssue]:
+    positions = {
+        symbol: position
+        for symbol, position in positions_by_symbol.items()
+        if position.quantity > 0
+    }
+    if not positions:
+        return []
+
+    target_items = db.scalars(
+        select(ExecutionPlanItem)
+        .join(ExecutionPlanItem.plan)
+        .where(
+            ExecutionPlan.mode == settings.runtime_mode,
+            ExecutionPlanItem.symbol.in_(sorted(positions)),
+            ExecutionPlanItem.side == "sell",
+            ExecutionPlanItem.intent == "target_sell",
+        )
+        .options(
+            load_only(
+                ExecutionPlanItem.id,
+                ExecutionPlanItem.execution_plan_id,
+                ExecutionPlanItem.plan_item_index,
+                ExecutionPlanItem.symbol,
+                ExecutionPlanItem.side,
+                ExecutionPlanItem.intent,
+                ExecutionPlanItem.status,
+                ExecutionPlanItem.quantity_policy,
+                ExecutionPlanItem.trigger_price,
+            )
+        )
+        .order_by(
+            ExecutionPlan.market_date.desc(),
+            ExecutionPlan.accepted_at.desc(),
+            ExecutionPlan.id.desc(),
+            ExecutionPlanItem.plan_item_index.asc(),
+            ExecutionPlanItem.id.asc(),
+        )
+    ).all()
+    items_by_symbol: dict[str, list[ExecutionPlanItem]] = {symbol: [] for symbol in positions}
+    for item in target_items:
+        items_by_symbol.setdefault(item.symbol, []).append(item)
+
+    issues: list[ProfitTargetCoverageIssue] = []
+    for symbol in sorted(positions):
+        held_quantity = positions[symbol].quantity
+        items = items_by_symbol.get(symbol, [])
+        active_quantity = sum(
+            quantity
+            for item in items
+            if item.status in PROFIT_TARGET_COVERAGE_STATUSES
+            for quantity in [_coverage_quantity(item.quantity_policy, held_quantity=held_quantity)]
+            if quantity is not None
+        )
+        if active_quantity >= held_quantity:
+            continue
+        latest_item = _latest_target_item(items)
+        entry_order = _latest_filled_buy_order(
+            settings=settings,
+            db=db,
+            symbol=symbol,
+        )
+        entry_target_price = (
+            _watch_buy_target_price(entry_order.plan_item)
+            if entry_order is not None and entry_order.plan_item is not None
+            else None
+        )
+        if latest_item is None and entry_target_price is None:
+            continue
+        issues.append(
+            ProfitTargetCoverageIssue(
+                symbol=symbol,
+                held_quantity=held_quantity,
+                active_target_quantity=active_quantity,
+                missing_quantity=held_quantity - active_quantity,
+                latest_target_item_id=latest_item.id if latest_item is not None else None,
+                latest_target_status=latest_item.status if latest_item is not None else None,
+                latest_target_trigger_price=(
+                    latest_item.trigger_price if latest_item is not None else entry_target_price
+                ),
+                outcome="missing_profit_target_coverage",
+                reason="active_target_sell_coverage_below_held_quantity",
+            )
+        )
+    return issues
+
+
 def _latest_stop_item(items: list[ExecutionPlanItem]) -> ExecutionPlanItem | None:
+    return items[0] if items else None
+
+
+def _latest_target_item(items: list[ExecutionPlanItem]) -> ExecutionPlanItem | None:
     return items[0] if items else None
 
 
@@ -3181,6 +3334,16 @@ def _shares_quantity(quantity_policy: dict[str, object] | None) -> int | None:
     if not isinstance(quantity_policy, dict) or quantity_policy.get("kind") != "shares":
         return None
     return _parse_positive_int(quantity_policy.get("quantity"))
+
+
+def _coverage_quantity(
+    quantity_policy: dict[str, object] | None,
+    *,
+    held_quantity: int,
+) -> int | None:
+    if _quantity_policy_requires_position_exit(quantity_policy):
+        return held_quantity
+    return _shares_quantity(quantity_policy)
 
 
 def _protective_stop_coverage_payload(
@@ -3220,6 +3383,41 @@ def _protective_stop_coverage_payload(
             issue.symbol: issue.missing_quantity
             for issue in degraded
             if issue.missing_quantity is not None
+        },
+        "issues": serialized_issues[:MAX_PROTECTIVE_STOP_COVERAGE_DETAILS],
+        "issues_count": len(serialized_issues),
+        "issues_truncated": len(serialized_issues) > MAX_PROTECTIVE_STOP_COVERAGE_DETAILS,
+    }
+
+
+def _profit_target_coverage_payload(
+    *,
+    issues: list[ProfitTargetCoverageIssue],
+) -> dict[str, object]:
+    affected_symbols = [issue.symbol for issue in issues]
+    serialized_issues = [
+        {
+            "symbol": issue.symbol,
+            "held_quantity": issue.held_quantity,
+            "active_target_quantity": issue.active_target_quantity,
+            "missing_quantity": issue.missing_quantity,
+            "latest_target_item_id": issue.latest_target_item_id,
+            "latest_target_status": issue.latest_target_status,
+            "latest_target_trigger_price": _serialize_decimal(issue.latest_target_trigger_price),
+            "outcome": issue.outcome,
+            "reason": issue.reason,
+        }
+        for issue in issues
+    ]
+    return {
+        "status": "degraded" if issues else "ok",
+        "missing_target_coverage_count": len(issues),
+        "affected_symbols": affected_symbols[:MAX_PROTECTIVE_STOP_COVERAGE_DETAILS],
+        "affected_symbols_count": len(affected_symbols),
+        "affected_symbols_truncated": len(affected_symbols) > MAX_PROTECTIVE_STOP_COVERAGE_DETAILS,
+        "missing_quantities": {
+            issue.symbol: issue.missing_quantity
+            for issue in issues
         },
         "issues": serialized_issues[:MAX_PROTECTIVE_STOP_COVERAGE_DETAILS],
         "issues_count": len(serialized_issues),
@@ -4189,6 +4387,37 @@ def _reconcile_before_monitoring(
         )
     except Exception:
         return
+
+
+def _pending_broker_order_symbols(
+    *,
+    settings: Settings,
+    db: Session,
+    symbols: set[str] | None = None,
+) -> set[str]:
+    where = [
+        BrokerOrder.mode == settings.runtime_mode,
+        BrokerOrder.broker_order_id.is_not(None),
+        BrokerOrder.status.in_(
+            (
+                "submission_pending",
+                "submitted",
+                "open",
+                "partially_filled",
+                "cancel_pending",
+                "retry_pending",
+            )
+        ),
+    ]
+    if symbols:
+        where.append(BrokerOrder.symbol.in_(sorted(symbols)))
+    return {
+        str(symbol)
+        for symbol in db.scalars(
+            select(distinct(BrokerOrder.symbol)).where(*where)
+        ).all()
+        if str(symbol).strip()
+    }
 
 
 def _positions_with_stale_local_state(

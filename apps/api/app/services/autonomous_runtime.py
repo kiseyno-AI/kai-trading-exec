@@ -1155,6 +1155,9 @@ def _compact_cycle_payload(payload: dict[str, object] | None) -> dict[str, objec
     coverage = compacted.get("protective_stop_coverage")
     if isinstance(coverage, dict):
         compacted["protective_stop_coverage"] = _compact_detail_lists(coverage)
+    target_coverage = compacted.get("profit_target_coverage")
+    if isinstance(target_coverage, dict):
+        compacted["profit_target_coverage"] = _compact_detail_lists(target_coverage)
     for key in ("items", "jobs"):
         value = compacted.get(key)
         if isinstance(value, list) and len(value) > MAX_STATUS_DETAIL_ITEMS:

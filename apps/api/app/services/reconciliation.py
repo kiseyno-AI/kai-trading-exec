@@ -275,6 +275,7 @@ def reconcile_stale_nonterminal_broker_orders(
         "failed_to_reconcile": 0,
     }
     items: list[dict[str, object]] = []
+    position_sync_symbols: set[str] = set()
     for order in orders:
         classification_observed_at = _observation_time()
         reason: str | None = None
@@ -314,6 +315,8 @@ def reconcile_stale_nonterminal_broker_orders(
                 observed_at=_observation_time(),
                 result=result,
             )
+            if int(result.get("fills_added") or 0) > 0 or str(result.get("status") or "") == "filled":
+                position_sync_symbols.add(order.symbol)
 
         counts[classification] += 1
         items.append(
@@ -331,7 +334,16 @@ def reconcile_stale_nonterminal_broker_orders(
             }
         )
 
-    db.commit()
+    position_sync_result = None
+    if position_sync_symbols:
+        position_sync_result = sync_execution_positions_from_broker_snapshot(
+            settings=settings,
+            db=db,
+            adapter=adapter,
+            symbols=position_sync_symbols,
+        )
+    else:
+        db.commit()
     return {
         "candidate_order_count": len(orders),
         "threshold_seconds": threshold_seconds,
@@ -342,6 +354,13 @@ def reconcile_stale_nonterminal_broker_orders(
             "cancelled": counts["cancelled"],
             "unknown": counts["unknown"],
             "failed-to-reconcile": counts["failed_to_reconcile"],
+        },
+        "position_sync": position_sync_result
+        or {
+            "tracked_symbol_count": 0,
+            "created": 0,
+            "updated": 0,
+            "zeroed": 0,
         },
         "items": items,
     }
