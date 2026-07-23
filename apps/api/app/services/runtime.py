@@ -1431,8 +1431,8 @@ def daily_pnl_payload(
         filled_at = _as_utc(fill.filled_at)
         side = fill.side.lower()
         symbol = fill.symbol
-        quantity = Decimal(fill.quantity)
-        notional = (fill.price * quantity).quantize(Decimal("0.0001"))
+        quantity = _pnl_fill_quantity(fill)
+        notional = _pnl_fill_notional(fill=fill, quantity=quantity)
         if side == "buy":
             lots_by_symbol.setdefault(symbol, []).append(
                 {"quantity": quantity, "price": fill.price}
@@ -1473,6 +1473,18 @@ def daily_pnl_payload(
         "unmatched_sell_symbols": sorted(unmatched_sell_symbols),
         "pnl_method": "fifo_internal_fills",
     }
+
+
+def _pnl_fill_quantity(fill: ExecutionFill) -> Decimal:
+    if fill.base_quantity is not None and fill.base_quantity > 0:
+        return Decimal(fill.base_quantity)
+    return Decimal(fill.quantity)
+
+
+def _pnl_fill_notional(*, fill: ExecutionFill, quantity: Decimal) -> Decimal:
+    if fill.quote_notional is not None and fill.quote_notional > 0:
+        return Decimal(fill.quote_notional).quantize(Decimal("0.0001"))
+    return (fill.price * quantity).quantize(Decimal("0.0001"))
 
 
 def _default_monthly_pnl_payload(*, settings: Settings) -> dict[str, object]:

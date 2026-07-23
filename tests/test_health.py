@@ -472,6 +472,89 @@ def test_runtime_status_reports_monthly_realized_pnl_progress_and_mode() -> None
     engine.dispose()
 
 
+def test_runtime_status_daily_pnl_uses_crypto_base_quantity_and_quote_notional() -> None:
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            automation_enabled=True,
+        )
+    )
+    client = TestClient(app)
+    now = datetime.now(UTC)
+    buy_filled_at = now - timedelta(seconds=1)
+
+    with create_session_factory(engine)() as session:
+        buy_order = BrokerOrder(
+            broker_name="upbit",
+            mode="paper",
+            idempotency_key="daily-crypto-buy-1",
+            symbol="KRW-BTC",
+            side="buy",
+            status="filled",
+            quantity=0,
+            base_quantity=Decimal("0.001000000000"),
+            quote_notional=Decimal("100000.0000"),
+            asset_class="crypto",
+            venue="upbit",
+        )
+        sell_order = BrokerOrder(
+            broker_name="upbit",
+            mode="paper",
+            idempotency_key="daily-crypto-sell-1",
+            symbol="KRW-BTC",
+            side="sell",
+            status="filled",
+            quantity=0,
+            base_quantity=Decimal("0.000400000000"),
+            asset_class="crypto",
+            venue="upbit",
+        )
+        session.add_all([buy_order, sell_order])
+        session.flush()
+        session.add_all(
+            [
+                ExecutionFill(
+                    broker_order_pk=buy_order.id,
+                    broker_fill_id="daily-crypto-buy-fill-1",
+                    symbol="KRW-BTC",
+                    side="buy",
+                    quantity=0,
+                    base_quantity=Decimal("0.001000000000"),
+                    quote_notional=Decimal("100000.0000"),
+                    price=Decimal("100000000.0000"),
+                    filled_at=buy_filled_at,
+                ),
+                ExecutionFill(
+                    broker_order_pk=sell_order.id,
+                    broker_fill_id="daily-crypto-sell-fill-1",
+                    symbol="KRW-BTC",
+                    side="sell",
+                    quantity=0,
+                    base_quantity=Decimal("0.000400000000"),
+                    quote_notional=Decimal("44000.0000"),
+                    price=Decimal("110000000.0000"),
+                    filled_at=now,
+                ),
+            ]
+        )
+        session.commit()
+
+    response = client.get("/runtime/status")
+
+    assert response.status_code == 200
+    daily = response.json()["daily_pnl"]
+    assert daily["daily_realized_pnl"] == "4000.0000"
+    assert daily["daily_buy_notional"] == "100000.0000"
+    assert daily["daily_sell_notional"] == "44000.0000"
+    assert daily["unmatched_sell_quantity"] == 0
+    assert daily["closed_symbols"] == ["KRW-BTC"]
+    assert daily["closed_symbol_count"] == 1
+    assert daily["pnl_method"] == "fifo_internal_fills"
+
+    engine.dispose()
+
+
 def test_runtime_status_requires_complete_exec_owned_schema() -> None:
     app, engine = build_test_app(
         settings=Settings(
