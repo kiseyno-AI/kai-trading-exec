@@ -1089,6 +1089,7 @@ def build_runtime_status(
         "failed_today": [],
         "positions": [],
     }
+    daily_pnl = _default_daily_pnl_payload()
     broker = build_broker_session_summary(settings=settings, db=None)
     broker_providers = broker_provider_readiness(settings=settings, db=None)
     freshness: dict[str, object] = {
@@ -1228,6 +1229,7 @@ def build_runtime_status(
                 monitoring=monitoring,
             )
             monthly_pnl = monthly_pnl_payload(settings=settings, db=db)
+            daily_pnl = daily_pnl_payload(settings=settings, db=db)
         elif settings.autonomous_runtime_enabled:
             cached_symbols = _autonomous_runtime_snapshot_symbol_summary(autonomous=autonomous)
             if "filled_today" not in cached_symbols:
@@ -1246,9 +1248,11 @@ def build_runtime_status(
             }
             freshness["summary_source"] = "fast_autonomous_runtime_snapshot"
             monthly_pnl = monthly_pnl_payload(settings=settings, db=db)
+            daily_pnl = daily_pnl_payload(settings=settings, db=db)
         else:
             freshness["summary_source"] = "fast_runtime_status"
             monthly_pnl = monthly_pnl_payload(settings=settings, db=db)
+            daily_pnl = daily_pnl_payload(settings=settings, db=db)
         actionable_alerts = runtime_actionable_alerts_payload(
             monitoring=monitoring,
             freshness=freshness,
@@ -1262,6 +1266,7 @@ def build_runtime_status(
             f"runtime state unavailable: {exc.__class__.__name__}; run migrations",
         )
         monthly_pnl = _default_monthly_pnl_payload(settings=settings)
+        daily_pnl = _default_daily_pnl_payload()
         actionable_alerts = _default_actionable_alerts_payload()
 
     monitoring_reasons = _monitoring_price_source_readiness_reasons(
@@ -1298,6 +1303,7 @@ def build_runtime_status(
         "freshness": freshness,
         "actionable_alerts": actionable_alerts,
         "monthly_pnl": monthly_pnl,
+        "daily_pnl": daily_pnl,
         "account_drawdown_gate": account_drawdown_gate,
     }
 
@@ -1396,6 +1402,79 @@ def monthly_pnl_payload(
     }
 
 
+def daily_pnl_payload(
+    *,
+    settings: Settings,
+    db: Session,
+    now: datetime | None = None,
+) -> dict[str, object]:
+    day_start, next_day_start = _current_krx_day_utc_bounds(now)
+    fills = dedupe_execution_fills(db.scalars(
+        select(ExecutionFill)
+        .join(ExecutionFill.broker_order)
+        .where(
+            BrokerOrder.mode == settings.runtime_mode,
+            ExecutionFill.filled_at < next_day_start,
+        )
+        .order_by(ExecutionFill.filled_at.asc(), ExecutionFill.id.asc())
+    ).all())
+
+    lots_by_symbol: dict[str, list[dict[str, Decimal]]] = {}
+    realized = Decimal("0")
+    sell_notional = Decimal("0")
+    buy_notional = Decimal("0")
+    matched_sell_quantity = 0
+    unmatched_sell_quantity = 0
+    closed_symbols: set[str] = set()
+    unmatched_sell_symbols: set[str] = set()
+    for fill in fills:
+        filled_at = _as_utc(fill.filled_at)
+        side = fill.side.lower()
+        symbol = fill.symbol
+        quantity = Decimal(fill.quantity)
+        notional = (fill.price * quantity).quantize(Decimal("0.0001"))
+        if side == "buy":
+            lots_by_symbol.setdefault(symbol, []).append(
+                {"quantity": quantity, "price": fill.price}
+            )
+            if filled_at >= day_start:
+                buy_notional += notional
+            continue
+        if side != "sell":
+            continue
+        if filled_at >= day_start:
+            sell_notional += notional
+        remaining = quantity
+        lots = lots_by_symbol.setdefault(symbol, [])
+        while remaining > 0 and lots:
+            lot = lots[0]
+            matched = min(remaining, lot["quantity"])
+            if filled_at >= day_start:
+                realized += ((fill.price - lot["price"]) * matched).quantize(Decimal("0.0001"))
+                matched_sell_quantity += int(matched)
+                closed_symbols.add(symbol)
+            lot["quantity"] -= matched
+            remaining -= matched
+            if lot["quantity"] <= 0:
+                lots.pop(0)
+        if remaining > 0 and filled_at >= day_start:
+            unmatched_sell_quantity += int(remaining)
+            unmatched_sell_symbols.add(symbol)
+
+    return {
+        "date": day_start.astimezone(KRX_TIMEZONE).strftime("%Y-%m-%d"),
+        "daily_realized_pnl": _decimal_text(realized),
+        "daily_buy_notional": _decimal_text(buy_notional),
+        "daily_sell_notional": _decimal_text(sell_notional),
+        "matched_sell_quantity": matched_sell_quantity,
+        "unmatched_sell_quantity": unmatched_sell_quantity,
+        "closed_symbols": sorted(closed_symbols),
+        "closed_symbol_count": len(closed_symbols),
+        "unmatched_sell_symbols": sorted(unmatched_sell_symbols),
+        "pnl_method": "fifo_internal_fills",
+    }
+
+
 def _default_monthly_pnl_payload(*, settings: Settings) -> dict[str, object]:
     target = getattr(settings, "monthly_target_krw", Decimal("500000"))
     return {
@@ -1409,6 +1488,21 @@ def _default_monthly_pnl_payload(*, settings: Settings) -> dict[str, object]:
         "monthly_sell_notional": "0.0000",
         "matched_sell_quantity": 0,
         "unmatched_sell_quantity": 0,
+        "pnl_method": "fifo_internal_fills",
+    }
+
+
+def _default_daily_pnl_payload() -> dict[str, object]:
+    return {
+        "date": datetime.now(KRX_TIMEZONE).strftime("%Y-%m-%d"),
+        "daily_realized_pnl": "0.0000",
+        "daily_buy_notional": "0.0000",
+        "daily_sell_notional": "0.0000",
+        "matched_sell_quantity": 0,
+        "unmatched_sell_quantity": 0,
+        "closed_symbols": [],
+        "closed_symbol_count": 0,
+        "unmatched_sell_symbols": [],
         "pnl_method": "fifo_internal_fills",
     }
 
