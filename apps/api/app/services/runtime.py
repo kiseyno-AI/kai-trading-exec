@@ -660,22 +660,19 @@ def runtime_filled_today_summary(
 ) -> dict[str, object]:
     if today_start_utc is None or tomorrow_start_utc is None:
         today_start_utc, tomorrow_start_utc = _current_krx_day_utc_bounds()
-    rows = db.execute(
-        select(
-            ExecutionFill.side,
-            ExecutionFill.symbol,
-            func.count(ExecutionFill.id),
-            func.coalesce(func.sum(ExecutionFill.quantity), 0),
-        )
-        .select_from(ExecutionFill)
-        .join(ExecutionFill.broker_order)
-        .where(
-            BrokerOrder.mode == settings.runtime_mode,
-            ExecutionFill.filled_at >= today_start_utc,
-            ExecutionFill.filled_at < tomorrow_start_utc,
-        )
-        .group_by(ExecutionFill.side, ExecutionFill.symbol)
-    ).all()
+    fills = dedupe_execution_fills(
+        db.scalars(
+            select(ExecutionFill)
+            .select_from(ExecutionFill)
+            .join(ExecutionFill.broker_order)
+            .where(
+                BrokerOrder.mode == settings.runtime_mode,
+                ExecutionFill.filled_at >= today_start_utc,
+                ExecutionFill.filled_at < tomorrow_start_utc,
+            )
+            .order_by(ExecutionFill.filled_at.asc(), ExecutionFill.id.asc())
+        ).all()
+    )
     by_side: dict[str, list[str]] = {"buy": [], "sell": []}
     counts: dict[str, dict[str, int]] = {
         "all": {"symbols": 0, "fills": 0, "quantity": 0},
@@ -684,18 +681,17 @@ def runtime_filled_today_summary(
     }
     all_symbols: set[str] = set()
     side_symbols: dict[str, set[str]] = {"buy": set(), "sell": set()}
-    for side_raw, symbol_raw, fill_count_raw, quantity_raw in rows:
-        side = str(side_raw or "").strip().lower()
-        symbol = str(symbol_raw or "").strip().upper()
+    for fill in fills:
+        side = str(fill.side or "").strip().lower()
+        symbol = str(fill.symbol or "").strip().upper()
         if side not in {"buy", "sell"} or not symbol:
             continue
-        fill_count = int(fill_count_raw or 0)
-        quantity = int(quantity_raw or 0)
+        quantity = int(fill.quantity or 0)
         all_symbols.add(symbol)
         side_symbols[side].add(symbol)
-        counts["all"]["fills"] += fill_count
+        counts["all"]["fills"] += 1
         counts["all"]["quantity"] += quantity
-        counts[side]["fills"] += fill_count
+        counts[side]["fills"] += 1
         counts[side]["quantity"] += quantity
     for side, symbols in side_symbols.items():
         by_side[side] = sorted(symbols)

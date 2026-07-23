@@ -3590,6 +3590,77 @@ def test_runtime_status_exposes_core_facing_symbol_summary() -> None:
     engine.dispose()
 
 
+def test_runtime_status_deduplicates_legacy_fills_before_daily_counts() -> None:
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+        )
+    )
+
+    now = datetime.now(UTC)
+    with app.state.db_session_factory() as session:
+        buy_order = BrokerOrder(
+            mode="paper",
+            idempotency_key="legacy-duplicate-fill-buy",
+            symbol="282330",
+            side="buy",
+            status="filled",
+            quantity=6,
+        )
+        sell_order = BrokerOrder(
+            mode="paper",
+            idempotency_key="legacy-duplicate-fill-sell",
+            symbol="282330",
+            side="sell",
+            status="filled",
+            quantity=2,
+        )
+        session.add_all([buy_order, sell_order])
+        session.flush()
+        session.add_all(
+            [
+                ExecutionFill(
+                    broker_order_pk=buy_order.id,
+                    symbol="282330",
+                    side="buy",
+                    quantity=3,
+                    price=Decimal("125000.0000"),
+                    filled_at=now,
+                ),
+                ExecutionFill(
+                    broker_order_pk=buy_order.id,
+                    symbol="282330",
+                    side="buy",
+                    quantity=3,
+                    price=Decimal("125000.0000"),
+                    filled_at=now,
+                ),
+                ExecutionFill(
+                    broker_order_pk=sell_order.id,
+                    broker_fill_id="legacy-dedup-distinct-sell",
+                    symbol="282330",
+                    side="sell",
+                    quantity=2,
+                    price=Decimal("126000.0000"),
+                    filled_at=now,
+                ),
+            ]
+        )
+        session.commit()
+
+    client = TestClient(app)
+    payload = client.get("/runtime/status").json()
+
+    assert payload["symbols"]["filled_today_counts"] == {
+        "all": {"symbols": 1, "fills": 2, "quantity": 5},
+        "buy": {"symbols": 1, "fills": 1, "quantity": 3},
+        "sell": {"symbols": 1, "fills": 1, "quantity": 2},
+    }
+
+    engine.dispose()
+
+
 def test_fast_runtime_status_uses_autonomous_snapshot_for_monitored_symbols() -> None:
     app, engine = build_test_app(
         settings=Settings(
