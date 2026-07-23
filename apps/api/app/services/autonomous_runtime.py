@@ -21,6 +21,7 @@ from app.services.monitoring import (
     WATCH_BUY_INTENTS,
     _load_monitored_items,
     _load_positions_by_symbol,
+    _maintain_post_entry_exit_monitors,
     list_autonomous_monitoring_symbols,
     run_autonomous_monitoring_cycle,
 )
@@ -398,6 +399,18 @@ class AutonomousRuntimeCoordinator:
             symbols=symbols,
             observed_at=started_at,
         )
+        post_entry_maintenance_count = self._repair_post_entry_exit_monitors_for_cached_cycle(
+            runtime_snapshot=runtime_snapshot,
+            prices=prices,
+            started_at=started_at,
+        )
+        if post_entry_maintenance_count:
+            runtime_snapshot = self._refresh_monitoring_runtime_snapshot(
+                loaded_at=started_at,
+                reason="cached_monitoring_post_entry_maintenance",
+                reconcile_broker=False,
+            )
+            symbols = runtime_snapshot.symbols
         cached_payload = self._evaluate_cached_monitoring_cycle(
             runtime_snapshot=runtime_snapshot,
             prices=prices,
@@ -413,6 +426,8 @@ class AutonomousRuntimeCoordinator:
                 "runtime_snapshot": runtime_snapshot.snapshot(),
                 **cached_payload,
             }
+            if post_entry_maintenance_count:
+                payload["post_entry_maintenance_count"] = post_entry_maintenance_count
             self._store_cycle_payload(worker_key="monitoring", payload=payload)
             return payload
 
@@ -435,6 +450,8 @@ class AutonomousRuntimeCoordinator:
                 "runtime_snapshot": runtime_snapshot.snapshot(),
                 **result.payload,
             }
+            if post_entry_maintenance_count:
+                payload["pre_cached_post_entry_maintenance_count"] = post_entry_maintenance_count
             self._store_cycle_payload(worker_key="monitoring", payload=payload)
             self._refresh_monitoring_runtime_snapshot(
                 loaded_at=started_at,
@@ -536,6 +553,33 @@ class AutonomousRuntimeCoordinator:
                     snapshot,
                     filled_today_symbols=filled_today_symbols,
                 )
+
+    def _repair_post_entry_exit_monitors_for_cached_cycle(
+        self,
+        *,
+        runtime_snapshot: MonitoringRuntimeSnapshot,
+        prices: list[MonitoringPriceRequest],
+        started_at: datetime,
+    ) -> int:
+        if not runtime_snapshot.positions_by_symbol:
+            return 0
+        prices_by_symbol = {price.symbol: price for price in prices}
+        with self.session_factory() as db:
+            positions_by_symbol = _load_positions_by_symbol(
+                settings=self.settings,
+                db=db,
+                symbols=set(runtime_snapshot.positions_by_symbol),
+            )
+            maintenance_count, _review_count = _maintain_post_entry_exit_monitors(
+                settings=self.settings,
+                db=db,
+                positions_by_symbol=positions_by_symbol,
+                prices=prices_by_symbol,
+                triggered_at=started_at,
+            )
+            if maintenance_count:
+                db.commit()
+            return maintenance_count
 
     def _load_monitoring_runtime_snapshot(self, loaded_at: datetime) -> MonitoringRuntimeSnapshot:
         with self.session_factory() as db:
