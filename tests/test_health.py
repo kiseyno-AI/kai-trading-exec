@@ -313,6 +313,12 @@ def test_runtime_status_reports_readiness_and_default_safety() -> None:
         "monitored": [],
         "scheduled_today": [],
         "filled_today": [],
+        "filled_today_by_side": {"buy": [], "sell": []},
+        "filled_today_counts": {
+            "all": {"symbols": 0, "fills": 0, "quantity": 0},
+            "buy": {"symbols": 0, "fills": 0, "quantity": 0},
+            "sell": {"symbols": 0, "fills": 0, "quantity": 0},
+        },
         "failed_today": [],
         "positions": [],
     }
@@ -3571,8 +3577,85 @@ def test_runtime_status_exposes_core_facing_symbol_summary() -> None:
         "monitored": ["005930"],
         "scheduled_today": ["000660"],
         "filled_today": ["000660"],
+        "filled_today_by_side": {"buy": ["000660"], "sell": []},
+        "filled_today_counts": {
+            "all": {"symbols": 1, "fills": 2, "quantity": 3},
+            "buy": {"symbols": 1, "fills": 2, "quantity": 3},
+            "sell": {"symbols": 0, "fills": 0, "quantity": 0},
+        },
         "failed_today": ["035420"],
         "positions": [],
+    }
+
+    engine.dispose()
+
+
+def test_runtime_status_deduplicates_legacy_fills_before_daily_counts() -> None:
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+        )
+    )
+
+    now = datetime.now(UTC)
+    with app.state.db_session_factory() as session:
+        buy_order = BrokerOrder(
+            mode="paper",
+            idempotency_key="legacy-duplicate-fill-buy",
+            symbol="282330",
+            side="buy",
+            status="filled",
+            quantity=6,
+        )
+        sell_order = BrokerOrder(
+            mode="paper",
+            idempotency_key="legacy-duplicate-fill-sell",
+            symbol="282330",
+            side="sell",
+            status="filled",
+            quantity=2,
+        )
+        session.add_all([buy_order, sell_order])
+        session.flush()
+        session.add_all(
+            [
+                ExecutionFill(
+                    broker_order_pk=buy_order.id,
+                    symbol="282330",
+                    side="buy",
+                    quantity=3,
+                    price=Decimal("125000.0000"),
+                    filled_at=now,
+                ),
+                ExecutionFill(
+                    broker_order_pk=buy_order.id,
+                    symbol="282330",
+                    side="buy",
+                    quantity=3,
+                    price=Decimal("125000.0000"),
+                    filled_at=now,
+                ),
+                ExecutionFill(
+                    broker_order_pk=sell_order.id,
+                    broker_fill_id="legacy-dedup-distinct-sell",
+                    symbol="282330",
+                    side="sell",
+                    quantity=2,
+                    price=Decimal("126000.0000"),
+                    filled_at=now,
+                ),
+            ]
+        )
+        session.commit()
+
+    client = TestClient(app)
+    payload = client.get("/runtime/status").json()
+
+    assert payload["symbols"]["filled_today_counts"] == {
+        "all": {"symbols": 1, "fills": 2, "quantity": 5},
+        "buy": {"symbols": 1, "fills": 1, "quantity": 3},
+        "sell": {"symbols": 1, "fills": 1, "quantity": 2},
     }
 
     engine.dispose()
@@ -3643,6 +3726,12 @@ def test_fast_runtime_status_uses_autonomous_snapshot_for_monitored_symbols() ->
     assert payload["freshness"]["summary_source"] == "fast_autonomous_runtime_snapshot"
     assert payload["symbols"]["monitored"] == ["000660", "005930"]
     assert payload["symbols"]["filled_today"] == ["282330"]
+    assert payload["symbols"]["filled_today_by_side"] == {"buy": ["282330"], "sell": ["282330"]}
+    assert payload["symbols"]["filled_today_counts"] == {
+        "all": {"symbols": 1, "fills": 2, "quantity": 6},
+        "buy": {"symbols": 1, "fills": 1, "quantity": 3},
+        "sell": {"symbols": 1, "fills": 1, "quantity": 3},
+    }
     assert payload["monthly_pnl"]["pnl_method"] == "fifo_internal_fills"
     assert payload["monthly_pnl"]["monthly_realized_pnl"] == "-11700.0000"
     assert payload["monthly_pnl"]["matched_sell_quantity"] == 3
@@ -3663,6 +3752,12 @@ def test_fast_runtime_status_uses_cached_filled_symbols() -> None:
 
     payload = client.get("/runtime/status").json()
     assert payload["symbols"]["filled_today"] == []
+    assert payload["symbols"]["filled_today_by_side"] == {"buy": [], "sell": []}
+    assert payload["symbols"]["filled_today_counts"] == {
+        "all": {"symbols": 0, "fills": 0, "quantity": 0},
+        "buy": {"symbols": 0, "fills": 0, "quantity": 0},
+        "sell": {"symbols": 0, "fills": 0, "quantity": 0},
+    }
 
     app.state.autonomous_runtime._monitoring_runtime_snapshot = (
         app.state.autonomous_runtime._load_monitoring_runtime_snapshot(datetime.now(UTC))
@@ -3680,6 +3775,12 @@ def test_fast_runtime_status_uses_cached_filled_symbols() -> None:
     payload = client.get("/runtime/status").json()
     assert payload["freshness"]["summary_source"] == "fast_autonomous_runtime_snapshot"
     assert payload["symbols"]["filled_today"] == ["003280", "282330"]
+    assert payload["symbols"]["filled_today_by_side"] == {"buy": [], "sell": []}
+    assert payload["symbols"]["filled_today_counts"] == {
+        "all": {"symbols": 0, "fills": 0, "quantity": 0},
+        "buy": {"symbols": 0, "fills": 0, "quantity": 0},
+        "sell": {"symbols": 0, "fills": 0, "quantity": 0},
+    }
 
     engine.dispose()
 
