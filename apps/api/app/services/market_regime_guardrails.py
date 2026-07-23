@@ -387,6 +387,9 @@ def _audit_payload(
     market_date: date | str | None,
     account_context: dict[str, object] | None,
 ) -> dict[str, object]:
+    breadth_audit = _breadth_audit(breadth)
+    sector_audit = _sector_audit(sector, account_context=account_context)
+    freshness_audit = _freshness_audit(breadth)
     return {
         "schema_version": "market_regime_guardrail_v1",
         "enabled": enabled,
@@ -401,11 +404,24 @@ def _audit_payload(
         "adjusted_notional_krw": _decimal_text(adjusted_notional),
         "original_quantity": original_quantity,
         "adjusted_quantity": adjusted_quantity,
-        "breadth": _breadth_audit(breadth),
+        "breadth": breadth_audit,
         "breadth_source": breadth_source,
-        "breadth_freshness": _freshness_audit(breadth),
-        "sector": _sector_audit(sector, account_context=account_context),
+        "breadth_freshness": freshness_audit,
+        "sector": sector_audit,
         "sector_source": sector_source,
+        "summary": _summary_audit(
+            enabled=enabled,
+            action=action,
+            posture=posture,
+            reason_code=reason_code,
+            market=market,
+            breadth=breadth_audit,
+            breadth_freshness=freshness_audit,
+            sector=sector_audit,
+            warnings=warnings,
+            multiplier=multiplier,
+            cap_notional=cap_notional,
+        ),
         "warnings": warnings,
         "settings": {
             "missing_breadth_behavior": settings.market_regime_missing_breadth_behavior,
@@ -418,6 +434,37 @@ def _audit_payload(
             "sector_weak_multiplier": _decimal_text(settings.market_regime_sector_weak_multiplier),
         },
         "evaluated_at": evaluated_at.isoformat(),
+    }
+
+
+def _summary_audit(
+    *,
+    enabled: bool,
+    action: str,
+    posture: str,
+    reason_code: str,
+    market: str,
+    breadth: dict[str, object] | None,
+    breadth_freshness: dict[str, object] | None,
+    sector: dict[str, object] | None,
+    warnings: list[str],
+    multiplier: Decimal,
+    cap_notional: Decimal | None,
+) -> dict[str, object]:
+    return {
+        "enabled": enabled,
+        "market": market,
+        "posture": posture,
+        "action": action,
+        "reason_code": reason_code,
+        "multiplier": _decimal_text(multiplier),
+        "cap_notional_krw": _decimal_text(cap_notional),
+        "up_ratio": breadth.get("up_ratio") if isinstance(breadth, dict) else None,
+        "advance_decline_ratio": breadth.get("advance_decline_ratio") if isinstance(breadth, dict) else None,
+        "breadth_market_date": breadth_freshness.get("market_date") if isinstance(breadth_freshness, dict) else None,
+        "sector_name": sector.get("sector_name") if isinstance(sector, dict) else None,
+        "sector_relative_state": sector.get("relative_state") if isinstance(sector, dict) else None,
+        "warnings": list(warnings),
     }
 
 
