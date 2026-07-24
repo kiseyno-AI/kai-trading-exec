@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
+from inspect import signature
 from typing import Any
 
 from sqlalchemy import func, select
@@ -78,10 +79,10 @@ def reconcile_broker_order(
             source="reconciliation",
             reason="refresh broker order state before reconciliation",
         )
-        payload = adapter.reconcile_order(
-            session_state.access_token or "",
-            order.broker_order_id,
-            exchange=_order_reconciliation_exchange(order),
+        payload = _call_reconcile_order(
+            adapter=adapter,
+            access_token=session_state.access_token or "",
+            order=order,
         )
         if not isinstance(payload, dict):
             raise ValueError("reconcile_order adapter returned non-dictionary payload")
@@ -222,6 +223,26 @@ def reconcile_broker_order(
         "fills_added": fills_added,
         "filled_delta": fills_added,
     }
+
+
+def _call_reconcile_order(
+    *,
+    adapter: BrokerAdapter,
+    access_token: str,
+    order: BrokerOrder,
+) -> dict[str, Any] | None:
+    kwargs: dict[str, object] = {"exchange": _order_reconciliation_exchange(order)}
+    try:
+        parameters = signature(adapter.reconcile_order).parameters
+    except (TypeError, ValueError):
+        parameters = {}
+    if "submitted_at" in parameters:
+        kwargs["submitted_at"] = order.submitted_at
+    return adapter.reconcile_order(
+        access_token,
+        order.broker_order_id or "",
+        **kwargs,
+    )
 
 
 def reconcile_pending_broker_orders(

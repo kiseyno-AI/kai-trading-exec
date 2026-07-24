@@ -492,11 +492,16 @@ def evaluate_monitoring(
     command: MonitoringEvaluationRequest,
     now: datetime | None = None,
 ) -> EvaluateMonitoringResult:
+    prices_by_symbol = {price.symbol: price for price in command.prices}
+    symbol_scope = _ordered_symbol_scope(list(prices_by_symbol))[
+        : settings.monitoring_max_symbols_per_cycle
+    ]
     return _evaluate_monitoring_cycle(
         settings=settings,
         db=db,
         adapter=adapter,
-        prices={price.symbol: price for price in command.prices},
+        prices=prices_by_symbol,
+        symbols=symbol_scope,
         triggered_at=_normalize_utc(now or command.observed_at or datetime.now(UTC)),
         allow_persisted_triggered_without_price=False,
         update_checkpoint_if_idle=True,
@@ -774,7 +779,6 @@ def release_disabled_account_drawdown_watch_buy_blocks(
                 ExecutionPlanItem.side,
                 ExecutionPlanItem.intent,
                 ExecutionPlanItem.status,
-                ExecutionPlanItem.risk_context,
             ),
         )
         .order_by(BrokerOrder.created_at.asc(), BrokerOrder.id.asc())
@@ -2288,7 +2292,6 @@ def _load_monitored_items(
                 ExecutionPlanItem.limit_price,
                 ExecutionPlanItem.trigger_price,
                 ExecutionPlanItem.time_in_force,
-                ExecutionPlanItem.risk_context,
                 ExecutionPlanItem.decision_agent_name,
                 ExecutionPlanItem.decision_snapshot_id,
                 ExecutionPlanItem.decision_run_id,
@@ -2336,7 +2339,6 @@ def _load_monitored_items(
                         ExecutionPlanItem.limit_price,
                         ExecutionPlanItem.trigger_price,
                         ExecutionPlanItem.time_in_force,
-                        ExecutionPlanItem.risk_context,
                         ExecutionPlanItem.decision_agent_name,
                         ExecutionPlanItem.decision_snapshot_id,
                         ExecutionPlanItem.decision_run_id,
@@ -2761,7 +2763,6 @@ def _append_held_stop_sell_fallbacks(
                     ExecutionPlanItem.side,
                     ExecutionPlanItem.intent,
                     ExecutionPlanItem.status,
-                    ExecutionPlanItem.risk_context,
                 ),
                 selectinload(ExecutionPlanItem.plan).load_only(
                     ExecutionPlan.id,
@@ -2868,7 +2869,6 @@ def _repair_unprotected_stop_coverage(
                 ExecutionPlanItem.limit_price,
                 ExecutionPlanItem.trigger_price,
                 ExecutionPlanItem.time_in_force,
-                ExecutionPlanItem.risk_context,
                 ExecutionPlanItem.decision_agent_name,
                 ExecutionPlanItem.decision_snapshot_id,
                 ExecutionPlanItem.decision_run_id,
@@ -4326,6 +4326,8 @@ def _latest_reconciliation_error_for_symbol(
         .where(
             BrokerOrder.mode == settings.runtime_mode,
             BrokerOrder.symbol == symbol,
+            BrokerOrder.side == "sell",
+            BrokerOrder.status.in_(("submitted", "open", "partially_filled")),
             BrokerOrder.last_error_message.is_not(None),
         )
         .options(
@@ -4951,7 +4953,11 @@ def _resolve_sell_quantity(
     kind = quantity_policy.get("kind")
     if kind == "shares":
         quantity = _parse_positive_int(quantity_policy.get("quantity"))
-        if quantity is None or quantity > remaining_quantity:
+        if quantity is None:
+            return None
+        if quantity > remaining_quantity:
+            if item.intent in {"stop_sell", "max_holding_close_sell"}:
+                return remaining_quantity
             return None
         return quantity
     if kind == "percent":

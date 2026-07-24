@@ -110,7 +110,6 @@ class CachedMonitoringItem:
     intent: str
     status: str
     trigger_price: Decimal | None
-    risk_context: dict[str, object] | None
 
 
 @dataclass(frozen=True)
@@ -149,6 +148,7 @@ class AutonomousRuntimeCoordinator:
     _monitoring_price_source_state: MonitoringPriceSourceState = field(init=False)
     _monitoring_runtime_snapshot: MonitoringRuntimeSnapshot | None = field(default=None, init=False)
     _monitoring_snapshot_last_reconciled_at: datetime | None = field(default=None, init=False)
+    _monitoring_cycle_mutex: threading.Lock = field(default_factory=threading.Lock, init=False)
 
     def __post_init__(self) -> None:
         self._dispatch_state = AutonomousWorkerState(
@@ -316,6 +316,13 @@ class AutonomousRuntimeCoordinator:
                         error=str(exc),
                     )
                 else:
+                    if isinstance(payload, dict) and payload.get("skipped") is True:
+                        self._mark_cycle_busy(
+                            worker_key=worker_key,
+                            heartbeat_at=datetime.now(UTC),
+                            payload=payload,
+                        )
+                        continue
                     self._mark_cycle_succeeded(
                         worker_key=worker_key,
                         heartbeat_at=datetime.now(UTC),
@@ -350,7 +357,23 @@ class AutonomousRuntimeCoordinator:
             return payload
 
     async def _run_monitoring_cycle(self, started_at: datetime) -> dict[str, object]:
-        return await asyncio.to_thread(self._monitoring_cycle_sync, started_at)
+        return await asyncio.to_thread(self._monitoring_cycle_sync_guarded, started_at)
+
+    def _monitoring_cycle_sync_guarded(self, started_at: datetime) -> dict[str, object]:
+        if not self._monitoring_cycle_mutex.acquire(blocking=False):
+            payload = {
+                "status_code": 202,
+                "skipped": True,
+                "reason": "previous_monitoring_cycle_still_running",
+                "price_source_configured": self._monitoring_price_source_state.configured,
+                "price_source": self._monitoring_price_source_state.snapshot(),
+            }
+            self._store_cycle_payload(worker_key="monitoring", payload=payload)
+            return payload
+        try:
+            return self._monitoring_cycle_sync(started_at)
+        finally:
+            self._monitoring_cycle_mutex.release()
 
     async def _run_watch_exec_agent_sizing_cycle(self, started_at: datetime) -> dict[str, object]:
         return await asyncio.to_thread(self._watch_exec_agent_sizing_cycle_sync, started_at)
@@ -603,6 +626,16 @@ class AutonomousRuntimeCoordinator:
                 db=db,
                 now=loaded_at,
             )
+            cached_items = [
+                CachedMonitoringItem(
+                    id=item.id,
+                    symbol=item.symbol,
+                    intent=item.intent,
+                    status=item.status,
+                    trigger_price=item.trigger_price,
+                )
+                for item in items
+            ]
         return MonitoringRuntimeSnapshot(
             loaded_at=loaded_at,
             symbols=symbols,
@@ -611,19 +644,7 @@ class AutonomousRuntimeCoordinator:
                 for symbol, position in positions.items()
                 if position.quantity > 0
             },
-            items=[
-                CachedMonitoringItem(
-                    id=item.id,
-                    symbol=item.symbol,
-                    intent=item.intent,
-                    status=item.status,
-                    trigger_price=item.trigger_price,
-                    risk_context=dict(item.risk_context)
-                    if isinstance(item.risk_context, dict)
-                    else None,
-                )
-                for item in items
-            ],
+            items=cached_items,
             filled_today_symbols=filled_today_symbols,
         )
 
@@ -799,6 +820,20 @@ class AutonomousRuntimeCoordinator:
             state.last_heartbeat_at = heartbeat_at
             state.last_success_at = heartbeat_at
             state.last_error = None
+            state.last_cycle = payload
+
+    def _mark_cycle_busy(
+        self,
+        *,
+        worker_key: str,
+        heartbeat_at: datetime,
+        payload: dict[str, object],
+    ) -> None:
+        with self._lock:
+            state = self._state_for(worker_key)
+            state.status = "running"
+            state.last_heartbeat_at = heartbeat_at
+            state.last_error = str(payload.get("reason") or "cycle skipped")
             state.last_cycle = payload
 
     def _mark_cycle_failed(
@@ -1035,15 +1070,7 @@ def _cached_monitoring_item_triggered(
     triggered_at: datetime,
 ) -> bool:
     if item.intent == "max_holding_close_sell":
-        risk_context = item.risk_context or {}
-        close_exit_date = risk_context.get("close_exit_date")
-        if not isinstance(close_exit_date, str) or not close_exit_date.strip():
-            return False
-        try:
-            due_date = date.fromisoformat(close_exit_date.strip())
-        except ValueError:
-            return False
-        return triggered_at.astimezone(UTC).date() >= due_date
+        return True
     if item.intent in WATCH_BUY_INTENTS:
         trigger_price = _cached_watch_buy_trigger_price(item)
         if trigger_price is None or observed_price is None:
@@ -1061,39 +1088,11 @@ def _cached_monitoring_item_triggered(
 
 
 def _cached_watch_buy_trigger_price(item: CachedMonitoringItem) -> Decimal | None:
-    if item.trigger_price is not None:
-        return item.trigger_price
-    risk_context = item.risk_context or {}
-    monitoring = risk_context.get("watch_buy_monitoring")
-    if isinstance(monitoring, dict):
-        for key in ("trigger_price", "buy_recommendation_price", "entry_trigger_price"):
-            parsed = _parse_decimal(monitoring.get(key))
-            if parsed is not None:
-                return parsed
-    for key in (
-        "watch_trigger_price",
-        "buy_trigger_price",
-        "entry_trigger_price",
-        "trigger_price",
-        "buy_recommendation_price",
-    ):
-        parsed = _parse_decimal(risk_context.get(key))
-        if parsed is not None:
-            return parsed
-    return None
+    return item.trigger_price
 
 
 def _cached_watch_buy_direction(item: CachedMonitoringItem) -> str:
-    risk_context = item.risk_context or {}
-    monitoring = risk_context.get("watch_buy_monitoring")
-    if isinstance(monitoring, dict):
-        direction = monitoring.get("direction")
-        if isinstance(direction, str) and direction.strip():
-            return direction.strip()
-    direction = risk_context.get("trigger_direction")
-    if isinstance(direction, str) and direction.strip():
-        return direction.strip()
-    return "at_or_below"
+    return "at_or_above"
 
 
 def _parse_decimal(value: object) -> Decimal | None:

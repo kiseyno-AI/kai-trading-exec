@@ -78,7 +78,7 @@ class ReconciliationStubBroker:
             request_payload={},
             response_payload={"rt_cd": "0"},
         )
-        self.reconcile_calls: list[tuple[str, str]] = []
+        self.reconcile_calls: list[tuple[str, str, datetime | None]] = []
         self.order_calls: list[BrokerOrderPlacementRequest] = []
         self.authenticate_calls = 0
 
@@ -123,9 +123,10 @@ class ReconciliationStubBroker:
         broker_order_id: str,
         *,
         exchange: str = "KRX",
+        submitted_at: datetime | None = None,
     ) -> dict[str, object]:
         assert access_token
-        self.reconcile_calls.append((broker_order_id, exchange))
+        self.reconcile_calls.append((broker_order_id, exchange, submitted_at))
         if not self.reconcile_payloads:
             return {"broker_order_id": broker_order_id, "status": "open", "observed_at": OBSERVED_AT.isoformat()}
         return self.reconcile_payloads[min(len(self.reconcile_calls) - 1, len(self.reconcile_payloads) - 1)]
@@ -662,7 +663,7 @@ def test_reconcile_stale_nonterminal_order_marks_closed_against_broker_truth() -
     assert result["counts"]["closed"] == 1
     assert result["items"][0]["classification"] == "closed"
     assert order.status == "filled"
-    assert broker.reconcile_calls == [("stale-filled-1", "KRX")]
+    assert broker.reconcile_calls == [("stale-filled-1", "KRX", stale_submitted_at)]
     assert len(events) == 1
     assert events[0].error_classification == "closed"
     engine.dispose()
@@ -784,7 +785,7 @@ def test_reconcile_stale_nonterminal_orders_skips_wrong_broker_provider() -> Non
     assert result["candidate_order_count"] == 1
     assert result["counts"]["closed"] == 1
     assert result["items"][0]["broker_order_id"] == "stale-kis-filled-1"
-    assert broker.reconcile_calls == [("stale-kis-filled-1", "KRX")]
+    assert broker.reconcile_calls == [("stale-kis-filled-1", "KRX", stale_submitted_at)]
     assert kis_order.status == "filled"
     assert upbit_order.status == "submitted"
     assert upbit_order.last_error_classification is None
@@ -1250,6 +1251,48 @@ def test_kis_reconcile_order_uses_requested_exchange() -> None:
     assert http_client.calls[0]["params"]["EXCG_ID_DVSN_CD"] == "NXT"
 
 
+def test_kis_reconcile_order_uses_submitted_date_as_inquiry_start() -> None:
+    settings = Settings(
+        runtime_mode="live",
+        kis_app_key="***",
+        kis_app_secret="***",
+        kis_account_number="12345678",
+        kis_account_product_code="01",
+    )
+    http_client = KisReconcileHttpClient(
+        {
+            "rt_cd": "0",
+            "msg_cd": "MCA00000",
+            "output1": [
+                {
+                    "odno": "0002761000",
+                    "pdno": "105560",
+                    "sll_buy_dvsn_cd": "02",
+                    "ord_qty": "1",
+                    "tot_ccld_qty": "1",
+                    "rmn_qty": "0",
+                    "avg_pric": "175000",
+                    "ord_dt": "20260723",
+                    "ord_tmd": "090320",
+                    "ord_st_dvsn_cd_name": "체결",
+                }
+            ],
+        }
+    )
+    adapter = KisBrokerAdapter(settings=settings, http_client=http_client)
+
+    payload = adapter.reconcile_order(
+        "top-secret-token",
+        "0002761000",
+        submitted_at=datetime(2026, 7, 23, 9, 3, 20, tzinfo=UTC),
+    )
+
+    assert payload is not None
+    assert payload["status"] == "filled"
+    assert http_client.calls[0]["params"]["INQR_STRT_DT"] == "20260723"
+    assert http_client.calls[0]["params"]["INQR_END_DT"] >= "20260723"
+
+
 def test_reconcile_order_uses_route_exchange_from_order_metadata() -> None:
     settings = Settings(database_url="sqlite:///:memory:", runtime_mode="paper")
     engine, db = _session(settings)
@@ -1277,9 +1320,40 @@ def test_reconcile_order_uses_route_exchange_from_order_metadata() -> None:
     result = reconcile_broker_order(settings=settings, db=db, adapter=broker, order=order)
 
     assert result["status"] == "open"
-    assert broker.reconcile_calls == [("nxt-1", "NXT")]
+    assert broker.reconcile_calls == [("nxt-1", "NXT", OBSERVED_AT)]
     assert order.request_metadata["route"]["exchange"] == "NXT"
     assert order.request_metadata["params"]["EXCG_ID_DVSN_CD"] == "NXT"
+    engine.dispose()
+
+
+def test_reconcile_order_passes_order_submitted_at_to_adapter() -> None:
+    settings = Settings(database_url="sqlite:///:memory:", runtime_mode="paper")
+    engine, db = _session(settings)
+    submitted_at = datetime(2026, 7, 23, 9, 3, 20, tzinfo=UTC)
+    order = _order(
+        broker_order_id="0002761000",
+        request_metadata={"route": {"exchange": "KRX"}},
+    )
+    order.submitted_at = submitted_at
+    db.add(order)
+    db.commit()
+
+    broker = ReconciliationStubBroker(
+        reconcile_payloads=[
+            {
+                "broker_order_id": "0002761000",
+                "status": "filled",
+                "filled_quantity": 1,
+                "average_fill_price": "175000",
+                "observed_at": OBSERVED_AT.isoformat(),
+            }
+        ]
+    )
+
+    result = reconcile_broker_order(settings=settings, db=db, adapter=broker, order=order)
+
+    assert result["status"] == "filled"
+    assert broker.reconcile_calls == [("0002761000", "KRX", submitted_at)]
     engine.dispose()
 
 

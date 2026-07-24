@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import ssl
+import threading
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
@@ -45,6 +47,18 @@ KIS_ASKING_PRICE_PATH = "/uapi/domestic-stock/v1/quotations/inquire-asking-price
 KIS_CURRENT_PRICE_TR_ID = "FHKST01010100"
 KIS_ASKING_PRICE_TR_ID = "FHKST01010200"
 KIS_TIMEZONE = timezone(timedelta(hours=9))
+_DEFAULT_SSL_CONTEXT: ssl.SSLContext | None = None
+_DEFAULT_SSL_CONTEXT_LOCK = threading.Lock()
+
+
+def _default_ssl_context() -> ssl.SSLContext:
+    global _DEFAULT_SSL_CONTEXT
+    if _DEFAULT_SSL_CONTEXT is not None:
+        return _DEFAULT_SSL_CONTEXT
+    with _DEFAULT_SSL_CONTEXT_LOCK:
+        if _DEFAULT_SSL_CONTEXT is None:
+            _DEFAULT_SSL_CONTEXT = ssl.create_default_context()
+        return _DEFAULT_SSL_CONTEXT
 
 
 @dataclass(frozen=True)
@@ -75,6 +89,9 @@ class JsonHttpClient(Protocol):
 
 
 class UrllibJsonHttpClient:
+    def __init__(self, *, ssl_context: ssl.SSLContext | None = None) -> None:
+        self._ssl_context = ssl_context or _default_ssl_context()
+
     def get_json(
         self,
         *,
@@ -120,7 +137,11 @@ class UrllibJsonHttpClient:
         timeout_seconds: float,
     ) -> JsonHttpResponse:
         try:
-            with urlopen(request, timeout=timeout_seconds) as response:
+            with urlopen(
+                request,
+                timeout=timeout_seconds,
+                context=self._ssl_context,
+            ) as response:
                 raw_body = response.read().decode("utf-8")
                 return JsonHttpResponse(
                     status_code=response.status,
@@ -650,6 +671,7 @@ class KisBrokerAdapter(BrokerAdapter):
         broker_order_id: str,
         *,
         exchange: str = "KRX",
+        submitted_at: datetime | None = None,
     ) -> dict[str, Any] | None:
         config = self._configured()
         observed_at = datetime.now(UTC)
@@ -659,6 +681,7 @@ class KisBrokerAdapter(BrokerAdapter):
             broker_order_id,
             observed_at,
             exchange=exchange,
+            submitted_at=submitted_at,
         )
         request_metadata = {
             "provider": self.provider,
@@ -787,14 +810,22 @@ def _reconcile_order_params(
     observed_at: datetime,
     *,
     exchange: str = "KRX",
+    submitted_at: datetime | None = None,
 ) -> dict[str, object]:
-    inquiry_date = observed_at.astimezone(KIS_TIMEZONE).strftime("%Y%m%d")
+    inquiry_end_date = observed_at.astimezone(KIS_TIMEZONE).date()
+    inquiry_start_date = (
+        submitted_at.astimezone(KIS_TIMEZONE).date()
+        if submitted_at is not None
+        else inquiry_end_date
+    )
+    if inquiry_start_date > inquiry_end_date:
+        inquiry_start_date = inquiry_end_date
     normalized_exchange = exchange.strip().upper() or "KRX"
     return {
         "CANO": settings.kis_account_number or "",
         "ACNT_PRDT_CD": settings.kis_account_product_code,
-        "INQR_STRT_DT": inquiry_date,
-        "INQR_END_DT": inquiry_date,
+        "INQR_STRT_DT": inquiry_start_date.strftime("%Y%m%d"),
+        "INQR_END_DT": inquiry_end_date.strftime("%Y%m%d"),
         "SLL_BUY_DVSN_CD": "00",
         "PDNO": "",
         "CCLD_DVSN": "00",
