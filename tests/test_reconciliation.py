@@ -984,6 +984,21 @@ def test_runtime_status_reports_actionable_stale_nonterminal_orders() -> None:
             ),
             BrokerOrder(
                 broker_name="kis",
+                mode="paper",
+                idempotency_key="recent-unknown-status-order",
+                broker_order_id="recent-unknown-1",
+                symbol="005380",
+                side="buy",
+                status="submitted",
+                quantity=1,
+                submitted_at=recent_observed_at,
+                last_broker_sync_at=recent_observed_at,
+                last_error_classification="unknown_status",
+                last_error_code="unknown",
+                last_error_message="unrecognized broker status",
+            ),
+            BrokerOrder(
+                broker_name="kis",
                 mode="live",
                 idempotency_key="live-stale-submitted-order",
                 broker_order_id="live-stale-1",
@@ -1005,15 +1020,18 @@ def test_runtime_status_reports_actionable_stale_nonterminal_orders() -> None:
     )
 
     stale_orders = payload["freshness"]["broker_orders"]["stale_nonterminal"]
-    assert stale_orders["count"] == 2
-    assert stale_orders["symbols"] == ["005930", "031330"]
-    assert stale_orders["needs_reconciliation_count"] == 1
+    assert stale_orders["count"] == 3
+    assert stale_orders["symbols"] == ["005380", "005930", "031330"]
+    assert stale_orders["needs_reconciliation_count"] == 2
     assert stale_orders["manual_review_count"] == 1
     assert stale_orders["missing_broker_order_id_count"] == 1
+    assert payload["counts"]["open_orders"] == 1
     items_by_key = {item["idempotency_key"]: item for item in stale_orders["items"]}
     assert items_by_key["stale-submitted-with-broker-id"]["action"] == "reconcile_broker_truth"
     assert items_by_key["stale-retry-missing-broker-id"]["action"] == "manual_review"
     assert items_by_key["stale-retry-missing-broker-id"]["reason"] == "missing_broker_order_id"
+    assert items_by_key["recent-unknown-status-order"]["action"] == "reconcile_broker_truth"
+    assert items_by_key["recent-unknown-status-order"]["reason"] == "unknown_status"
     alerts = payload["actionable_alerts"]
     assert alerts["status"] == "needs_attention"
     assert alerts["critical_count"] == 1

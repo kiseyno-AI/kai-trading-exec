@@ -28,6 +28,7 @@ from app.models.runtime import BrokerOrder, ExecutionPlan, ExecutionPlanItem, Ex
 from app.services.broker_auth import ensure_authenticated_broker_session
 from app.services.live_market_context import load_live_market_regime_context, merge_live_market_regime_context
 from app.services.plan_item_identity import serialize_plan_item_source_identity
+from app.services.broker_order_state import active_local_broker_order_filters
 from app.services.trade_outcome_feedback import load_latest_trade_outcome_feedback_snippet
 
 TRIGGER_TIME_EXEC_AGENT_VERSION = "trigger-time-exec-agent-v1"
@@ -701,8 +702,10 @@ def _account_context_payload(
 def _local_open_orders(*, settings: Settings, db: Session) -> list[BrokerAccountOpenOrder]:
     orders = db.scalars(
         select(BrokerOrder).where(
-            BrokerOrder.mode == settings.runtime_mode,
-            BrokerOrder.status.in_(tuple(OPEN_ORDER_STATUSES)),
+            *active_local_broker_order_filters(
+                settings=settings,
+                statuses=OPEN_ORDER_STATUSES,
+            )
         )
     ).all()
     return [

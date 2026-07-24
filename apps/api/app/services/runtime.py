@@ -35,6 +35,11 @@ from app.services.trigger_time_exec_agent import (
 )
 from app.services.broker_auth import build_broker_adapter, build_broker_session_summary
 from app.services.account_drawdown_gate import latest_account_drawdown_gate_state
+from app.services.broker_order_state import (
+    UNTRUSTED_ACTIVE_ORDER_ERROR_CLASSIFICATIONS,
+    active_local_broker_order_filters,
+    broker_order_observed_at_expr,
+)
 from app.services.execution_api import list_runtime_symbols
 from app.services.schema import check_runtime_schema
 from app.services.runtime_controls import (
@@ -161,10 +166,7 @@ def runtime_counts(
     open_orders = db.scalar(
         select(func.count())
         .select_from(BrokerOrder)
-        .where(
-            BrokerOrder.mode == settings.runtime_mode,
-            BrokerOrder.status.in_(OPEN_ORDER_STATUSES),
-        ),
+        .where(*active_local_broker_order_filters(settings=settings, statuses=OPEN_ORDER_STATUSES)),
     )
     active_jobs = db.scalar(
         select(func.count())
@@ -210,6 +212,13 @@ def runtime_freshness_payload(
             BrokerOrderEvent.event_source == "reconciliation",
         )
     )
+    broker_orders = broker_order_freshness_payload(
+        settings=settings,
+        db=db,
+        now=observed_at,
+        latest_order_sync_at=latest_order_sync_at,
+        latest_reconcile_event_at=latest_reconcile_event_at,
+    )
     return {
         "generated_at": observed_at.isoformat(),
         "monitoring": {
@@ -219,15 +228,44 @@ def runtime_freshness_payload(
             "source": monitoring.get("source") or "database",
         },
         "position_truth": position_truth,
-        "broker_orders": {
-            "latest_broker_sync_at": _serialize_datetime(latest_order_sync_at),
-            "latest_reconciliation_event_at": _serialize_datetime(latest_reconcile_event_at),
-            "stale_nonterminal": stale_nonterminal_order_freshness_payload(
-                settings=settings,
-                db=db,
-                now=observed_at,
-            ),
-        },
+        "broker_orders": broker_orders,
+    }
+
+
+def broker_order_freshness_payload(
+    *,
+    settings: Settings,
+    db: Session,
+    now: datetime | None = None,
+    latest_order_sync_at: datetime | None = None,
+    latest_reconcile_event_at: datetime | None = None,
+) -> dict[str, object]:
+    observed_at = now or datetime.now(UTC)
+    if latest_order_sync_at is None:
+        latest_order_sync_at = db.scalar(
+            select(func.max(BrokerOrder.last_broker_sync_at)).where(
+                BrokerOrder.mode == settings.runtime_mode,
+                BrokerOrder.last_broker_sync_at.is_not(None),
+            )
+        )
+    if latest_reconcile_event_at is None:
+        latest_reconcile_event_at = db.scalar(
+            select(func.max(BrokerOrderEvent.observed_at))
+            .select_from(BrokerOrderEvent)
+            .join(BrokerOrderEvent.broker_order)
+            .where(
+                BrokerOrder.mode == settings.runtime_mode,
+                BrokerOrderEvent.event_source == "reconciliation",
+            )
+        )
+    return {
+        "latest_broker_sync_at": _serialize_datetime(latest_order_sync_at),
+        "latest_reconciliation_event_at": _serialize_datetime(latest_reconcile_event_at),
+        "stale_nonterminal": stale_nonterminal_order_freshness_payload(
+            settings=settings,
+            db=db,
+            now=observed_at,
+        ),
     }
 
 
@@ -308,18 +346,18 @@ def stale_nonterminal_order_freshness_payload(
     observed_at = now or datetime.now(UTC)
     threshold_seconds = settings.stale_broker_order_reconciliation_threshold_seconds
     stale_before = observed_at - timedelta(seconds=threshold_seconds)
-    order_observed_at = func.coalesce(
-        BrokerOrder.last_broker_sync_at,
-        BrokerOrder.submitted_at,
-        BrokerOrder.updated_at,
-        BrokerOrder.created_at,
-    )
+    order_observed_at = broker_order_observed_at_expr()
     orders = db.scalars(
         select(BrokerOrder)
         .where(
             BrokerOrder.mode == settings.runtime_mode,
             BrokerOrder.status.in_(NONTERMINAL_ORDER_STATUSES),
-            order_observed_at < stale_before,
+            or_(
+                order_observed_at < stale_before,
+                BrokerOrder.last_error_classification.in_(
+                    tuple(UNTRUSTED_ACTIVE_ORDER_ERROR_CLASSIFICATIONS)
+                ),
+            ),
         )
         .order_by(order_observed_at.asc(), BrokerOrder.created_at.asc())
     ).all()
@@ -487,6 +525,8 @@ def _stale_nonterminal_order_action(order: BrokerOrder) -> str:
 
 
 def _stale_nonterminal_order_reason(order: BrokerOrder) -> str:
+    if order.last_error_classification in UNTRUSTED_ACTIVE_ORDER_ERROR_CLASSIFICATIONS:
+        return str(order.last_error_classification)
     if not order.broker_order_id:
         return "missing_broker_order_id"
     if order.status == "retry_pending":
@@ -512,10 +552,7 @@ def _position_truth_evidence_symbols(
     symbols = set(
         db.scalars(
             select(BrokerOrder.symbol)
-            .where(
-                BrokerOrder.mode == settings.runtime_mode,
-                BrokerOrder.status.in_(OPEN_ORDER_STATUSES),
-            )
+            .where(*active_local_broker_order_filters(settings=settings, statuses=OPEN_ORDER_STATUSES))
             .distinct()
         ).all()
     )

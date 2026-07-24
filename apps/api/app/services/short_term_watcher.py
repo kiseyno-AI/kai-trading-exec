@@ -17,6 +17,7 @@ from app.services.broker_orders import place_broker_order
 from app.services.execution_api import serialize_broker_order
 from app.services.live_market_context import load_live_market_regime_context, merge_live_market_regime_context
 from app.services.market_regime_guardrails import evaluate_market_regime_guardrail, market_regime_context_from_item_payloads
+from app.services.broker_order_state import active_local_broker_order_filters
 from app.services.runtime_controls import (
     automated_order_submission_allowed,
     automated_order_submission_block_reason,
@@ -288,10 +289,12 @@ def _candidate_context(
     position = db.scalar(select(ExecutionPosition).where(ExecutionPosition.mode == settings.runtime_mode, ExecutionPosition.symbol == item.symbol))
     open_orders = db.scalars(
         select(BrokerOrder).where(
-            BrokerOrder.mode == settings.runtime_mode,
+            *active_local_broker_order_filters(
+                settings=settings,
+                statuses=OPEN_ORDER_STATUSES,
+            ),
             BrokerOrder.symbol == item.symbol,
             BrokerOrder.side == "buy",
-            BrokerOrder.status.in_(tuple(OPEN_ORDER_STATUSES)),
         )
     ).all()
     return {
