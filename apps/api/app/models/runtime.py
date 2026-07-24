@@ -178,6 +178,16 @@ class ExecutionPlan(TimestampMixin, Base):
 
 class ExecutionPlanItem(TimestampMixin, Base):
     __tablename__ = "execution_plan_items"
+    __table_args__ = (
+        Index(
+            "ix_execution_plan_items_side_status_intent_plan_symbol",
+            "side",
+            "status",
+            "intent",
+            "execution_plan_id",
+            "symbol",
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     execution_plan_id: Mapped[str] = mapped_column(

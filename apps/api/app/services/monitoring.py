@@ -645,21 +645,23 @@ def list_autonomous_monitoring_symbols(
                 .limit(settings.monitoring_max_symbols_per_cycle * 4)
             ).all()
         )
+        flat_symbols = _symbols_with_recent_flat_position_truth(
+            settings=settings,
+            db=db,
+            symbols=pending_sell_symbols,
+        ) if settings.runtime_mode == "live" else set()
+        unexited_buy_order_symbols = _symbols_with_unexited_buy_orders(
+            settings=settings,
+            db=db,
+            symbols=pending_sell_symbols,
+        )
         fallback_symbols: list[str] = []
         for symbol in pending_sell_symbols:
             if symbol in symbol_candidates:
                 continue
-            if settings.runtime_mode == "live" and _has_recent_flat_position_truth_for_symbol(
-                settings=settings,
-                db=db,
-                symbol=symbol,
-            ):
+            if symbol in flat_symbols:
                 continue
-            if _has_unexited_buy_order_for_symbol(
-                settings=settings,
-                db=db,
-                symbol=symbol,
-            ):
+            if symbol in unexited_buy_order_symbols:
                 fallback_symbols.append(symbol)
             if len(symbol_candidates) + len(fallback_symbols) >= settings.monitoring_max_symbols_per_cycle:
                 break
@@ -3178,6 +3180,46 @@ def _has_unexited_buy_order_for_symbol(
     return latest_sell_order_at is None or latest_buy_order_at > latest_sell_order_at
 
 
+def _symbols_with_unexited_buy_orders(
+    *,
+    settings: Settings,
+    db: Session,
+    symbols: list[str],
+) -> set[str]:
+    if not symbols:
+        return set()
+    ordered_symbols = _ordered_symbol_scope(symbols)
+    active_statuses = ("submitted", "open", "partially_filled", "filled")
+    rows = db.execute(
+        select(
+            BrokerOrder.symbol,
+            BrokerOrder.side,
+            func.max(BrokerOrder.created_at),
+        )
+        .where(
+            BrokerOrder.mode == settings.runtime_mode,
+            BrokerOrder.symbol.in_(ordered_symbols),
+            BrokerOrder.side.in_(("buy", "sell")),
+            BrokerOrder.status.in_(active_statuses),
+        )
+        .group_by(BrokerOrder.symbol, BrokerOrder.side)
+    ).all()
+    latest_buy_by_symbol: dict[str, datetime] = {}
+    latest_sell_by_symbol: dict[str, datetime] = {}
+    for symbol, side, latest_created_at in rows:
+        if latest_created_at is None:
+            continue
+        if side == "buy":
+            latest_buy_by_symbol[str(symbol)] = latest_created_at
+        elif side == "sell":
+            latest_sell_by_symbol[str(symbol)] = latest_created_at
+    return {
+        symbol
+        for symbol, latest_buy_at in latest_buy_by_symbol.items()
+        if (latest_sell_by_symbol.get(symbol) is None or latest_buy_at > latest_sell_by_symbol[symbol])
+    }
+
+
 def _stop_items_for_symbol(
     *,
     settings: Settings,
@@ -3659,6 +3701,32 @@ def _has_recent_flat_position_truth_for_symbol(
         )
         .limit(1)
     ) is not None
+
+
+def _symbols_with_recent_flat_position_truth(
+    *,
+    settings: Settings,
+    db: Session,
+    symbols: list[str],
+) -> set[str]:
+    if not symbols:
+        return set()
+    stale_before = datetime.now(UTC) - timedelta(
+        seconds=settings.exec_agent_max_account_snapshot_age_seconds
+    )
+    return {
+        str(symbol)
+        for symbol in db.scalars(
+            select(ExecutionPosition.symbol)
+            .where(
+                ExecutionPosition.mode == settings.runtime_mode,
+                ExecutionPosition.symbol.in_(_ordered_symbol_scope(symbols)),
+                ExecutionPosition.quantity <= 0,
+                ExecutionPosition.last_reconciled_at.is_not(None),
+                ExecutionPosition.last_reconciled_at >= stale_before,
+            )
+        ).all()
+    }
 
 
 def _load_positions_by_symbol(
