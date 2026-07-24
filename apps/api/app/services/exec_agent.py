@@ -34,6 +34,7 @@ from app.services.risk_sizing import (
     resolve_risk_based_buy_quantity,
 )
 from app.services.market_regime_guardrails import market_regime_context_from_item_payloads
+from app.services.broker_order_state import active_local_broker_order_filters
 from app.services.runtime_controls import RUNTIME_CONTROL_ID, effective_automation_enabled
 
 SHORT_TERM_DECIDER_NAME = "short-term-decider"
@@ -601,8 +602,10 @@ def _load_local_open_orders(
 ) -> list[BrokerAccountOpenOrder]:
     orders = db.scalars(
         select(BrokerOrder).where(
-            BrokerOrder.mode == settings.runtime_mode,
-            BrokerOrder.status.in_(OPEN_BUY_ORDER_STATUSES),
+            *active_local_broker_order_filters(
+                settings=settings,
+                statuses=OPEN_BUY_ORDER_STATUSES,
+            ),
             BrokerOrder.side == "buy",
         )
     ).all()

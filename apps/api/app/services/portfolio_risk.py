@@ -20,7 +20,11 @@ from app.services.broker_raw_holdings import (
     raw_vs_normalized_position_drift,
     snapshot_with_raw_balance_holdings,
 )
-from app.services.runtime import OPEN_ORDER_STATUSES, position_truth_freshness_payload
+from app.services.broker_order_state import active_local_broker_order_filters
+from app.services.runtime import (
+    OPEN_ORDER_STATUSES,
+    position_truth_freshness_payload,
+)
 
 TOP_SYMBOL_ALLOCATION_WARNING_PCT = Decimal("0.30")
 TOP_THREE_ALLOCATION_WARNING_PCT = Decimal("0.60")
@@ -74,7 +78,7 @@ def build_portfolio_risk_snapshot(
     generated_at = now or datetime.now(UTC)
     all_positions = _load_positions(settings=settings, db=db)
     local_positions = _load_local_holdings(settings=settings, db=db)
-    local_open_orders = _load_local_open_orders(settings=settings, db=db)
+    local_open_orders = _load_local_open_orders(settings=settings, db=db, now=generated_at)
     snapshot, account_status = _load_account_snapshot_if_available(
         settings=settings,
         db=db,
@@ -364,12 +368,15 @@ def _position_snapshot_market_value(position: BrokerAccountPosition, *, base_qua
     return units * position.average_price
 
 
-def _load_local_open_orders(*, settings: Settings, db: Session) -> list[OpenOrderRiskRow]:
+def _load_local_open_orders(*, settings: Settings, db: Session, now: datetime | None = None) -> list[OpenOrderRiskRow]:
     orders = db.scalars(
         select(BrokerOrder)
         .where(
-            BrokerOrder.mode == settings.runtime_mode,
-            BrokerOrder.status.in_(tuple(OPEN_ORDER_STATUSES)),
+            *active_local_broker_order_filters(
+                settings=settings,
+                statuses=OPEN_ORDER_STATUSES,
+                now=now,
+            ),
         )
         .order_by(BrokerOrder.symbol.asc(), BrokerOrder.updated_at.desc())
     ).all()
