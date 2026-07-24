@@ -96,15 +96,15 @@ class KisCurrentQuoteMonitoringPriceSource:
                     continue
                 if quote is None:
                     continue
-                context, context_failure = _fetch_live_market_context(
-                    broker_adapter=broker_adapter,
-                    access_token=access_token,
-                    quote=quote,
-                )
-                if context_failure is not None:
-                    context_failure_count += 1
-                    if len(context_failures) < MAX_REPORTED_CONTEXT_FAILURES:
-                        context_failures.append(context_failure)
+                context = None
+                context_failure = {
+                    "symbol": quote.symbol,
+                    "endpoint": "broker_live_market_context",
+                    "reason": "skipped_noncritical_enrichment",
+                }
+                context_failure_count += 1
+                if len(context_failures) < MAX_REPORTED_CONTEXT_FAILURES:
+                    context_failures.append(context_failure)
                 priced_symbols.append(quote.symbol)
                 market_quality = _market_quality_from_quote_payload(quote.payload)
                 market_quality = _merge_live_market_context(

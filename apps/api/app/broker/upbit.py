@@ -177,7 +177,9 @@ class UpbitBrokerAdapter:
         broker_order_id: str,
         *,
         exchange: str = "UPBIT",
+        submitted_at: datetime | None = None,
     ) -> dict[str, Any] | None:
+        del submitted_at
         return None
 
     def build_headers(

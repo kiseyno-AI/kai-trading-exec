@@ -304,6 +304,7 @@ class BrokerAdapter(Protocol):
         broker_order_id: str,
         *,
         exchange: str = "KRX",
+        submitted_at: datetime | None = None,
     ) -> dict[str, Any] | None: ...
 
     def build_headers(
