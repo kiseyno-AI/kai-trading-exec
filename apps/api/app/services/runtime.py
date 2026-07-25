@@ -266,6 +266,106 @@ def broker_order_freshness_payload(
             db=db,
             now=observed_at,
         ),
+        "fill_quality": broker_order_fill_quality_payload(
+            settings=settings,
+            db=db,
+        ),
+    }
+
+
+def broker_order_fill_quality_payload(
+    *,
+    settings: Settings,
+    db: Session,
+) -> dict[str, object]:
+    missing_fill_query = (
+        select(
+            BrokerOrder.id,
+            BrokerOrder.symbol,
+            BrokerOrder.side,
+            BrokerOrder.quantity,
+            BrokerOrder.submitted_at,
+            BrokerOrder.idempotency_key,
+            func.count(ExecutionFill.id).label("fill_count"),
+        )
+        .outerjoin(ExecutionFill, ExecutionFill.broker_order_pk == BrokerOrder.id)
+        .where(
+            BrokerOrder.mode == settings.runtime_mode,
+            BrokerOrder.status == "filled",
+        )
+        .group_by(BrokerOrder.id)
+        .having(func.count(ExecutionFill.id) == 0)
+    )
+    missing_fill_count = int(
+        db.scalar(select(func.count()).select_from(missing_fill_query.subquery())) or 0
+    )
+    missing_fill_rows = db.execute(
+        missing_fill_query
+        .order_by(BrokerOrder.submitted_at.desc(), BrokerOrder.created_at.desc())
+        .limit(MAX_STATUS_DETAIL_ITEMS)
+    ).all()
+    missing_fill_items = [
+        {
+            "broker_order_pk": row.id,
+            "symbol": row.symbol,
+            "side": row.side,
+            "quantity": row.quantity,
+            "submitted_at": _serialize_datetime(row.submitted_at),
+            "idempotency_key": row.idempotency_key,
+        }
+        for row in missing_fill_rows[:MAX_STATUS_DETAIL_ITEMS]
+    ]
+
+    duplicate_fill_query = (
+        select(
+            ExecutionFill.broker_order_pk,
+            ExecutionFill.symbol,
+            ExecutionFill.side,
+            ExecutionFill.quantity,
+            ExecutionFill.price,
+            ExecutionFill.filled_at,
+            func.count(ExecutionFill.id).label("duplicate_count"),
+        )
+        .join(ExecutionFill.broker_order)
+        .where(BrokerOrder.mode == settings.runtime_mode)
+        .group_by(
+            ExecutionFill.broker_order_pk,
+            ExecutionFill.symbol,
+            ExecutionFill.side,
+            ExecutionFill.quantity,
+            ExecutionFill.price,
+            ExecutionFill.filled_at,
+        )
+        .having(func.count(ExecutionFill.id) > 1)
+    )
+    duplicate_fill_count = int(
+        db.scalar(select(func.count()).select_from(duplicate_fill_query.subquery())) or 0
+    )
+    duplicate_fill_rows = db.execute(
+        duplicate_fill_query
+        .order_by(ExecutionFill.filled_at.desc())
+        .limit(MAX_STATUS_DETAIL_ITEMS)
+    ).all()
+    duplicate_fill_items = [
+        {
+            "broker_order_pk": row.broker_order_pk,
+            "symbol": row.symbol,
+            "side": row.side,
+            "quantity": row.quantity,
+            "price": _decimal_text(row.price),
+            "filled_at": _serialize_datetime(row.filled_at),
+            "duplicate_count": int(row.duplicate_count),
+        }
+        for row in duplicate_fill_rows[:MAX_STATUS_DETAIL_ITEMS]
+    ]
+
+    return {
+        "missing_filled_order_fill_count": missing_fill_count,
+        "missing_filled_order_fill_items": missing_fill_items,
+        "missing_filled_order_fill_truncated": missing_fill_count > len(missing_fill_items),
+        "duplicate_fill_group_count": duplicate_fill_count,
+        "duplicate_fill_groups": duplicate_fill_items,
+        "duplicate_fill_groups_truncated": duplicate_fill_count > len(duplicate_fill_items),
     }
 
 
@@ -416,6 +516,49 @@ def runtime_actionable_alerts_payload(
                     "count": manual_review_count,
                     "symbols": stale_nonterminal.get("symbols") or [],
                     "message": "nonterminal broker orders cannot be reconciled automatically",
+                }
+            )
+
+    fill_quality = (
+        broker_orders.get("fill_quality")
+        if isinstance(broker_orders, dict)
+        else None
+    )
+    if isinstance(fill_quality, dict):
+        missing_fill_count = int(fill_quality.get("missing_filled_order_fill_count") or 0)
+        if missing_fill_count > 0:
+            alerts.append(
+                {
+                    "kind": "filled_broker_orders_missing_execution_fills",
+                    "severity": "critical",
+                    "count": missing_fill_count,
+                    "symbols": sorted({
+                        str(item.get("symbol"))
+                        for item in fill_quality.get("missing_filled_order_fill_items") or []
+                        if isinstance(item, dict) and item.get("symbol")
+                    }),
+                    "message": (
+                        "filled broker orders are missing execution_fills rows, "
+                        "so FIFO realized P/L is incomplete"
+                    ),
+                }
+            )
+        duplicate_fill_count = int(fill_quality.get("duplicate_fill_group_count") or 0)
+        if duplicate_fill_count > 0:
+            alerts.append(
+                {
+                    "kind": "duplicate_execution_fill_groups",
+                    "severity": "warning",
+                    "count": duplicate_fill_count,
+                    "symbols": sorted({
+                        str(item.get("symbol"))
+                        for item in fill_quality.get("duplicate_fill_groups") or []
+                        if isinstance(item, dict) and item.get("symbol")
+                    }),
+                    "message": (
+                        "duplicate execution_fills groups exist and should be repaired "
+                        "before relying on raw fill exports"
+                    ),
                 }
             )
 

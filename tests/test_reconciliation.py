@@ -1042,6 +1042,81 @@ def test_runtime_status_reports_actionable_stale_nonterminal_orders() -> None:
     engine.dispose()
 
 
+def test_runtime_status_reports_pnl_fill_quality_alerts() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+    )
+    engine, db = _session(settings)
+    filled_at = datetime.now(UTC)
+    missing_fill_order = BrokerOrder(
+        broker_name="kis",
+        mode="paper",
+        idempotency_key="filled-order-missing-fill",
+        broker_order_id="missing-fill-1",
+        symbol="105560",
+        side="buy",
+        status="filled",
+        quantity=1,
+        submitted_at=filled_at,
+    )
+    duplicate_fill_order = BrokerOrder(
+        broker_name="kis",
+        mode="paper",
+        idempotency_key="filled-order-duplicate-fill",
+        broker_order_id="duplicate-fill-1",
+        symbol="282330",
+        side="buy",
+        status="filled",
+        quantity=2,
+        submitted_at=filled_at,
+    )
+    db.add_all([missing_fill_order, duplicate_fill_order])
+    db.flush()
+    db.add_all(
+        [
+            ExecutionFill(
+                broker_order_pk=duplicate_fill_order.id,
+                symbol="282330",
+                side="buy",
+                quantity=2,
+                price=Decimal("125400.0000"),
+                filled_at=filled_at,
+            ),
+            ExecutionFill(
+                broker_order_pk=duplicate_fill_order.id,
+                symbol="282330",
+                side="buy",
+                quantity=2,
+                price=Decimal("125400.0000"),
+                filled_at=filled_at,
+            ),
+        ]
+    )
+    db.commit()
+
+    payload = build_runtime_status(
+        settings=settings,
+        runtime=RuntimeMetadata(started_at=datetime.now(UTC)),
+        db=db,
+    )
+
+    fill_quality = payload["freshness"]["broker_orders"]["fill_quality"]
+    assert fill_quality["missing_filled_order_fill_count"] == 1
+    assert fill_quality["missing_filled_order_fill_items"][0]["symbol"] == "105560"
+    assert fill_quality["duplicate_fill_group_count"] == 1
+    assert fill_quality["duplicate_fill_groups"][0]["symbol"] == "282330"
+
+    alerts = payload["actionable_alerts"]
+    assert alerts["status"] == "needs_attention"
+    assert alerts["critical_count"] == 1
+    assert alerts["warning_count"] >= 1
+    alerts_by_kind = {alert["kind"]: alert for alert in alerts["alerts"]}
+    assert alerts_by_kind["filled_broker_orders_missing_execution_fills"]["symbols"] == ["105560"]
+    assert alerts_by_kind["duplicate_execution_fill_groups"]["symbols"] == ["282330"]
+    engine.dispose()
+
+
 class KisReconcileHttpClient:
     def __init__(self, payload: dict[str, object]) -> None:
         self.payload = payload

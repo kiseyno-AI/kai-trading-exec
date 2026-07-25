@@ -83,6 +83,15 @@ Current foundation response includes:
 - `monthly_pnl.target_progress_pct`
 - `monthly_pnl.mode_recommendation` (`normal`, `aggressive`, `capital_preservation`)
 - `monthly_pnl.pnl_method`
+- `freshness.broker_orders.fill_quality`
+  - `missing_filled_order_fill_count` and sample items for filled
+    `broker_orders` that have no `execution_fills` rows, because FIFO P/L is
+    incomplete until those fills are repaired
+  - `duplicate_fill_group_count` and sample groups for duplicate
+    `execution_fills` rows that should be repaired before using raw fill
+    exports
+- `actionable_alerts` includes critical/warning P/L quality alerts when these
+  fill-quality checks find missing or duplicate fill evidence
 
 ### `GET /runtime/daily-board`
 Returns a compact current-KRX-day board for core/web/operator readback.
