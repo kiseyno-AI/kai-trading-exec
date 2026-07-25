@@ -363,7 +363,7 @@ def _closed_trade(*, lot: OpenLot, sell_fill: ExecutionFill, quantity: int) -> d
         "risk_sizing": _risk_sizing_context(source_item),
         "trigger_time": _trigger_time_context(source_item),
         "market_enrichment": _market_enrichment_context(source_item),
-        "candidate_rule_context": _candidate_rule_context(item=source_item, buy_fill=lot.fill),
+        "candidate_rule_context": _merged_candidate_rule_context(buy_item=buy_item, sell_item=sell_item, buy_fill=lot.fill),
         "outcome_source": "fifo_exact",
         "outcome_quality_flags": [],
         "outcome_bucket": _outcome_bucket(pnl),
@@ -422,7 +422,7 @@ def _legacy_sell_estimate_trade(
         "risk_sizing": _risk_sizing_context(source_item),
         "trigger_time": _trigger_time_context(source_item),
         "market_enrichment": _market_enrichment_context(source_item),
-        "candidate_rule_context": {},
+        "candidate_rule_context": _candidate_rule_context(item=source_item, buy_fill=sell_fill),
         "outcome_source": outcome_source,
         "outcome_quality_flags": quality_flags,
         "outcome_bucket": _outcome_bucket(pnl) if pnl is not None else "unavailable",
@@ -1324,6 +1324,14 @@ def _candidate_rules(settings: Settings) -> list[CandidateRule]:
             threshold=Decimal("0.50"),
             evaluator=_rule_weak_confidence,
         ),
+        CandidateRule(
+            rule_id="post_entry_no_progress_exit_tighten",
+            name="Post-entry no-progress exit tighten",
+            action="exit_tighten",
+            size_multiplier=Decimal("0"),
+            threshold=Decimal("2"),
+            evaluator=_rule_post_entry_no_progress_exit_tighten,
+        ),
     ]
 
 
@@ -1520,6 +1528,28 @@ def _rule_weak_confidence(trade: dict[str, object], rule: CandidateRule) -> tupl
         return False, {"reason": "missing_confidence_context"}
     normalized = value / Decimal("10") if key == "confidence_score_10" or value > 1 else value
     return normalized < rule.threshold, {"field": key, "confidence": _decimal_text(normalized)}
+
+
+def _rule_post_entry_no_progress_exit_tighten(
+    trade: dict[str, object],
+    rule: CandidateRule,
+) -> tuple[bool, dict[str, object]]:
+    context = trade.get("candidate_rule_context")
+    if not isinstance(context, dict):
+        return False, {"reason": "missing_candidate_rule_context"}
+    reasons = _post_entry_review_reasons(context)
+    matched_reasons = [
+        reason
+        for reason in reasons
+        if reason
+        in {
+            "gap_down_breached_risk_threshold",
+            "next_day_no_progress",
+            "max_holding_without_progress",
+        }
+    ]
+    matched = len(set(matched_reasons)) >= int(rule.threshold)
+    return matched, {"matched_reasons": sorted(set(matched_reasons)), "threshold": int(rule.threshold)}
 
 
 def _candidate_context_decimal(trade: dict[str, object], *, keys: tuple[str, ...]) -> Decimal | None:
@@ -2165,7 +2195,45 @@ def _candidate_rule_context(*, item: ExecutionPlanItem | None, buy_fill: Executi
                 ):
                     if key in nested and key not in payload:
                         payload[key] = nested[key]
+        for nested_key in ("entry_context", "last_monitoring_event"):
+            nested = source.get(nested_key)
+            if isinstance(nested, dict) and nested_key not in payload:
+                payload[nested_key] = nested
+        for key in ("post_entry_managed", "deterministic_emergency_stop"):
+            if key in source and key not in payload:
+                payload[key] = source[key]
     return _json_safe({key: value for key, value in payload.items() if value is not None})
+
+
+def _merged_candidate_rule_context(
+    *,
+    buy_item: ExecutionPlanItem | None,
+    sell_item: ExecutionPlanItem | None,
+    buy_fill: ExecutionFill,
+) -> dict[str, object]:
+    payload = _candidate_rule_context(item=buy_item or sell_item, buy_fill=buy_fill)
+    if sell_item is not None and sell_item is not buy_item:
+        sell_payload = _candidate_rule_context(item=sell_item, buy_fill=buy_fill)
+        for key, value in sell_payload.items():
+            if key not in payload or payload[key] in (None, "", [], {}):
+                payload[key] = value
+        if sell_payload:
+            payload["sell_candidate_rule_context"] = sell_payload
+    return _json_safe(payload)
+
+
+def _post_entry_review_reasons(value: object) -> list[str]:
+    reasons: list[str] = []
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if key == "reasons" and isinstance(item, list):
+                reasons.extend(str(reason) for reason in item if str(reason))
+            else:
+                reasons.extend(_post_entry_review_reasons(item))
+    elif isinstance(value, list):
+        for item in value:
+            reasons.extend(_post_entry_review_reasons(item))
+    return reasons
 
 
 def _outcome_bucket(pnl: Decimal) -> str:
