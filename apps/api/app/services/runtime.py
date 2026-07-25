@@ -4,7 +4,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import distinct, func, or_, select
+from sqlalchemy import String, case, cast, distinct, func, literal, or_, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -316,25 +316,45 @@ def broker_order_fill_quality_payload(
         for row in missing_fill_rows[:MAX_STATUS_DETAIL_ITEMS]
     ]
 
+    duplicate_fill_identity = case(
+        (
+            ExecutionFill.broker_fill_id.is_not(None),
+            literal("broker:")
+            + ExecutionFill.broker_order_pk
+            + literal(":")
+            + ExecutionFill.broker_fill_id,
+        ),
+        else_=(
+            literal("fallback:")
+            + ExecutionFill.broker_order_pk
+            + literal(":")
+            + func.upper(ExecutionFill.symbol)
+            + literal(":")
+            + func.lower(ExecutionFill.side)
+            + literal(":")
+            + cast(ExecutionFill.filled_at, String)
+            + literal(":")
+            + cast(ExecutionFill.price, String)
+            + literal(":")
+            + cast(ExecutionFill.quantity, String)
+        ),
+    ).label("duplicate_fill_identity")
     duplicate_fill_query = (
         select(
             ExecutionFill.broker_order_pk,
-            ExecutionFill.symbol,
-            ExecutionFill.side,
-            ExecutionFill.quantity,
-            ExecutionFill.price,
-            ExecutionFill.filled_at,
+            func.max(ExecutionFill.broker_fill_id).label("broker_fill_id"),
+            func.min(ExecutionFill.symbol).label("symbol"),
+            func.min(ExecutionFill.side).label("side"),
+            func.min(ExecutionFill.quantity).label("quantity"),
+            func.min(ExecutionFill.price).label("price"),
+            func.min(ExecutionFill.filled_at).label("filled_at"),
             func.count(ExecutionFill.id).label("duplicate_count"),
         )
         .join(ExecutionFill.broker_order)
         .where(BrokerOrder.mode == settings.runtime_mode)
         .group_by(
             ExecutionFill.broker_order_pk,
-            ExecutionFill.symbol,
-            ExecutionFill.side,
-            ExecutionFill.quantity,
-            ExecutionFill.price,
-            ExecutionFill.filled_at,
+            duplicate_fill_identity,
         )
         .having(func.count(ExecutionFill.id) > 1)
     )
@@ -354,6 +374,7 @@ def broker_order_fill_quality_payload(
             "quantity": row.quantity,
             "price": _decimal_text(row.price),
             "filled_at": _serialize_datetime(row.filled_at),
+            "broker_fill_id": row.broker_fill_id,
             "duplicate_count": int(row.duplicate_count),
         }
         for row in duplicate_fill_rows[:MAX_STATUS_DETAIL_ITEMS]
@@ -1433,6 +1454,10 @@ def build_runtime_status(
                 "monitored": _autonomous_monitoring_symbols(autonomous=autonomous),
             }
             freshness["summary_source"] = "fast_autonomous_runtime_snapshot"
+            freshness["broker_orders"]["fill_quality"] = broker_order_fill_quality_payload(
+                settings=settings,
+                db=db,
+            )
             monthly_pnl = monthly_pnl_payload(settings=settings, db=db)
             weekly_pnl = weekly_pnl_payload(settings=settings, db=db)
             daily_pnl = daily_pnl_payload(settings=settings, db=db)

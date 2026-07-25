@@ -1071,13 +1071,42 @@ def test_runtime_status_reports_pnl_fill_quality_alerts() -> None:
         quantity=2,
         submitted_at=filled_at,
     )
-    db.add_all([missing_fill_order, duplicate_fill_order])
+    distinct_broker_fill_order = BrokerOrder(
+        broker_name="kis",
+        mode="paper",
+        idempotency_key="filled-order-distinct-broker-fills",
+        broker_order_id="distinct-broker-fills-1",
+        symbol="000660",
+        side="buy",
+        status="filled",
+        quantity=2,
+        submitted_at=filled_at,
+    )
+    db.add_all([missing_fill_order, duplicate_fill_order, distinct_broker_fill_order])
     db.flush()
     db.add_all(
         [
             ExecutionFill(
                 broker_order_pk=duplicate_fill_order.id,
                 symbol="282330",
+                side="buy",
+                quantity=2,
+                price=Decimal("125400.0000"),
+                filled_at=filled_at,
+            ),
+            ExecutionFill(
+                broker_order_pk=distinct_broker_fill_order.id,
+                broker_fill_id="distinct-fill-1",
+                symbol="000660",
+                side="buy",
+                quantity=2,
+                price=Decimal("125400.0000"),
+                filled_at=filled_at,
+            ),
+            ExecutionFill(
+                broker_order_pk=distinct_broker_fill_order.id,
+                broker_fill_id="distinct-fill-2",
+                symbol="000660",
                 side="buy",
                 quantity=2,
                 price=Decimal("125400.0000"),
@@ -1114,6 +1143,43 @@ def test_runtime_status_reports_pnl_fill_quality_alerts() -> None:
     alerts_by_kind = {alert["kind"]: alert for alert in alerts["alerts"]}
     assert alerts_by_kind["filled_broker_orders_missing_execution_fills"]["symbols"] == ["105560"]
     assert alerts_by_kind["duplicate_execution_fill_groups"]["symbols"] == ["282330"]
+    engine.dispose()
+
+
+def test_fast_autonomous_runtime_status_reports_fill_quality_alerts() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        autonomous_runtime_enabled=True,
+    )
+    engine, db = _session(settings)
+    filled_at = datetime.now(UTC)
+    db.add(
+        BrokerOrder(
+            broker_name="kis",
+            mode="paper",
+            idempotency_key="fast-filled-order-missing-fill",
+            broker_order_id="fast-missing-fill-1",
+            symbol="105560",
+            side="buy",
+            status="filled",
+            quantity=1,
+            submitted_at=filled_at,
+        )
+    )
+    db.commit()
+
+    payload = build_runtime_status(
+        settings=settings,
+        runtime=RuntimeMetadata(started_at=datetime.now(UTC)),
+        db=db,
+        include_expensive_sections=False,
+    )
+
+    fill_quality = payload["freshness"]["broker_orders"]["fill_quality"]
+    assert fill_quality["missing_filled_order_fill_count"] == 1
+    alerts_by_kind = {alert["kind"]: alert for alert in payload["actionable_alerts"]["alerts"]}
+    assert alerts_by_kind["filled_broker_orders_missing_execution_fills"]["symbols"] == ["105560"]
     engine.dispose()
 
 
