@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
@@ -54,6 +54,17 @@ class CandidateRule:
     size_multiplier: Decimal
     threshold: Decimal
     evaluator: Callable[[dict[str, object], "CandidateRule"], tuple[bool, dict[str, object]]]
+
+
+@dataclass(frozen=True)
+class CandidateTradeReplay:
+    pnl: Decimal
+    return_pct: Decimal
+    skipped_entry: bool
+    skipped_winner: bool
+    avoided_loser: bool
+    cost_savings_multiplier: Decimal
+    evidence: dict[str, object]
 
 
 @dataclass
@@ -1328,7 +1339,7 @@ def _candidate_rules(settings: Settings) -> list[CandidateRule]:
             rule_id="post_entry_no_progress_exit_tighten",
             name="Post-entry no-progress exit tighten",
             action="exit_tighten",
-            size_multiplier=Decimal("0"),
+            size_multiplier=Decimal("1"),
             threshold=Decimal("2"),
             evaluator=_rule_post_entry_no_progress_exit_tighten,
         ),
@@ -1386,20 +1397,39 @@ def _candidate_rule_result(
     estimated_cost_savings = Decimal("0")
     for trade, baseline_pnl, baseline_return in zip(closed_trades, baseline_pnls, baseline_returns, strict=False):
         matched, evidence = rule.evaluator(trade, rule)
-        multiplier = rule.size_multiplier if matched else Decimal("1")
         if matched:
             affected_count += 1
-            if multiplier <= 0:
+            replay = _candidate_trade_replay(
+                trade=trade,
+                rule=rule,
+                baseline_pnl=baseline_pnl,
+                baseline_return=baseline_return,
+                evidence=evidence,
+            )
+            if replay.skipped_entry:
                 skipped_entries += 1
-                if baseline_pnl > 0:
-                    skipped_winners += 1
-            if baseline_pnl < 0:
+            if replay.skipped_winner:
+                skipped_winners += 1
+            if replay.avoided_loser:
                 avoided_losers += 1
-            examples.append(_candidate_rule_example(trade=trade, baseline_pnl=baseline_pnl, evidence=evidence))
+            examples.append(
+                _candidate_rule_example(
+                    trade=trade,
+                    baseline_pnl=baseline_pnl,
+                    candidate_pnl=replay.pnl,
+                    evidence=replay.evidence,
+                )
+            )
             if fee_slippage_bps is not None:
-                estimated_cost_savings += _trade_round_trip_cost(trade=trade, fee_slippage_bps=fee_slippage_bps) * (Decimal("1") - multiplier)
-        candidate_pnls.append(baseline_pnl * multiplier)
-        candidate_returns.append(baseline_return * multiplier)
+                estimated_cost_savings += (
+                    _trade_round_trip_cost(trade=trade, fee_slippage_bps=fee_slippage_bps)
+                    * replay.cost_savings_multiplier
+                )
+            candidate_pnls.append(replay.pnl)
+            candidate_returns.append(replay.return_pct)
+        else:
+            candidate_pnls.append(baseline_pnl)
+            candidate_returns.append(baseline_return)
     candidate_gross = sum(candidate_pnls, Decimal("0"))
     gross_delta = candidate_gross - baseline_gross
     win_rate_delta = _win_rate_pct(candidate_pnls) - baseline_win_rate
@@ -1428,9 +1458,132 @@ def _candidate_rule_result(
             gross_delta=gross_delta,
             skipped_winners=skipped_winners,
         ),
-        "top_skipped_winners": _top_candidate_examples(examples, outcome="win")[:5],
-        "top_avoided_losers": _top_candidate_examples(examples, outcome="loss")[:5],
+        "top_matched_examples": _top_candidate_examples(examples, outcome="matched")[:5],
+        "top_skipped_winners": _top_candidate_examples(examples, outcome="skipped_win")[:5],
+        "top_avoided_losers": _top_candidate_examples(examples, outcome="avoided_loss")[:5],
     }
+
+
+def _candidate_trade_replay(
+    *,
+    trade: dict[str, object],
+    rule: CandidateRule,
+    baseline_pnl: Decimal,
+    baseline_return: Decimal,
+    evidence: dict[str, object],
+) -> CandidateTradeReplay:
+    if rule.action == "exit_tighten":
+        return _exit_tighten_trade_replay(
+            trade=trade,
+            baseline_pnl=baseline_pnl,
+            baseline_return=baseline_return,
+            evidence=evidence,
+        )
+    multiplier = rule.size_multiplier
+    skipped_entry = multiplier <= 0
+    return CandidateTradeReplay(
+        pnl=baseline_pnl * multiplier,
+        return_pct=baseline_return * multiplier,
+        skipped_entry=skipped_entry,
+        skipped_winner=skipped_entry and baseline_pnl > 0,
+        avoided_loser=baseline_pnl < 0,
+        cost_savings_multiplier=max(Decimal("0"), Decimal("1") - multiplier),
+        evidence={
+            **evidence,
+            "replay_model": "entry_size_multiplier",
+            "counts_as_skipped_winner": skipped_entry and baseline_pnl > 0,
+            "counts_as_avoided_loser": baseline_pnl < 0,
+        },
+    )
+
+
+def _exit_tighten_trade_replay(
+    *,
+    trade: dict[str, object],
+    baseline_pnl: Decimal,
+    baseline_return: Decimal,
+    evidence: dict[str, object],
+) -> CandidateTradeReplay:
+    buy_price = _nested_decimal(trade, ("buy", "price"))
+    sell_price = _nested_decimal(trade, ("sell", "price"))
+    quantity = (
+        _decimal_value(trade.get("quantity"))
+        or _nested_decimal(trade, ("sell", "quantity"))
+        or _nested_decimal(trade, ("buy", "quantity"))
+    )
+    tighten_context = _post_entry_tighten_replay_context(trade)
+    replay_evidence = {**evidence, **tighten_context, "replay_model": "post_entry_tightened_exit"}
+    if buy_price is None or sell_price is None or quantity is None or buy_price <= 0 or quantity <= 0:
+        return CandidateTradeReplay(
+            pnl=baseline_pnl,
+            return_pct=baseline_return,
+            skipped_entry=False,
+            skipped_winner=False,
+            avoided_loser=False,
+            cost_savings_multiplier=Decimal("0"),
+            evidence={
+                **replay_evidence,
+                "counts_as_skipped_winner": False,
+                "counts_as_avoided_loser": False,
+                "replay_status": "missing_trade_price_or_quantity",
+            },
+        )
+    tightened_stop = _decimal_value(tighten_context.get("tightened_exit_price"))
+    if tightened_stop is None or tightened_stop <= 0:
+        return CandidateTradeReplay(
+            pnl=baseline_pnl,
+            return_pct=baseline_return,
+            skipped_entry=False,
+            skipped_winner=False,
+            avoided_loser=False,
+            cost_savings_multiplier=Decimal("0"),
+            evidence={
+                **replay_evidence,
+                "counts_as_skipped_winner": False,
+                "counts_as_avoided_loser": False,
+                "replay_status": "missing_tightened_exit_price",
+            },
+        )
+    observed_price = _decimal_value(tighten_context.get("observed_price"))
+    plausible_exit = min(tightened_stop, observed_price) if observed_price is not None and observed_price > 0 else tightened_stop
+    replay_exit_price = max(sell_price, plausible_exit)
+    if replay_exit_price <= sell_price:
+        return CandidateTradeReplay(
+            pnl=baseline_pnl,
+            return_pct=baseline_return,
+            skipped_entry=False,
+            skipped_winner=False,
+            avoided_loser=False,
+            cost_savings_multiplier=Decimal("0"),
+            evidence={
+                **replay_evidence,
+                "baseline_sell_price": _decimal_text(sell_price),
+                "replay_exit_price": _decimal_text(replay_exit_price),
+                "counts_as_skipped_winner": False,
+                "counts_as_avoided_loser": False,
+                "replay_status": "actual_exit_at_or_above_tightened_exit",
+            },
+        )
+    replay_pnl = (replay_exit_price - buy_price) * quantity
+    buy_notional = buy_price * quantity
+    replay_return = replay_pnl / buy_notional * Decimal("100")
+    return CandidateTradeReplay(
+        pnl=replay_pnl,
+        return_pct=replay_return,
+        skipped_entry=False,
+        skipped_winner=False,
+        avoided_loser=baseline_pnl < 0 and replay_pnl >= 0,
+        cost_savings_multiplier=Decimal("0"),
+        evidence={
+            **replay_evidence,
+            "baseline_sell_price": _decimal_text(sell_price),
+            "replay_exit_price": _decimal_text(replay_exit_price),
+            "replay_pnl_krw": _decimal_text(replay_pnl),
+            "counts_as_skipped_winner": False,
+            "counts_as_avoided_loser": baseline_pnl < 0 and replay_pnl >= 0,
+            "replay_status": "replayed_tightened_exit_price",
+        },
+    )
 
 
 def _candidate_rule_recommendation(*, matched_trade_count: int, gross_delta: Decimal, skipped_winners: int) -> str:
@@ -1447,12 +1600,14 @@ def _candidate_rule_example(
     *,
     trade: dict[str, object],
     baseline_pnl: Decimal,
+    candidate_pnl: Decimal,
     evidence: dict[str, object],
 ) -> dict[str, object]:
     buy = trade.get("buy") if isinstance(trade.get("buy"), dict) else {}
     return {
         "symbol": trade.get("symbol"),
         "realized_pnl_krw": _decimal_text(baseline_pnl),
+        "candidate_pnl_krw": _decimal_text(candidate_pnl),
         "return_pct": trade.get("return_pct"),
         "buy_filled_at": buy.get("filled_at"),
         "execution_plan_item_id": buy.get("execution_plan_item_id") or trade.get("source_execution_plan_item_id"),
@@ -1462,10 +1617,31 @@ def _candidate_rule_example(
 
 
 def _top_candidate_examples(examples: list[dict[str, object]], *, outcome: str) -> list[dict[str, object]]:
-    if outcome == "win":
-        winners = [row for row in examples if (_decimal_value(row.get("realized_pnl_krw")) or Decimal("0")) > 0]
+    if outcome == "matched":
+        return sorted(
+            examples,
+            key=lambda row: abs(
+                (_decimal_value(row.get("candidate_pnl_krw")) or Decimal("0"))
+                - (_decimal_value(row.get("realized_pnl_krw")) or Decimal("0"))
+            ),
+            reverse=True,
+        )
+    if outcome == "skipped_win":
+        winners = [
+            row
+            for row in examples
+            if (_decimal_value(row.get("realized_pnl_krw")) or Decimal("0")) > 0
+            and isinstance(row.get("evidence"), dict)
+            and row["evidence"].get("counts_as_skipped_winner") is True
+        ]
         return sorted(winners, key=lambda row: _decimal_value(row.get("realized_pnl_krw")) or Decimal("0"), reverse=True)
-    losers = [row for row in examples if (_decimal_value(row.get("realized_pnl_krw")) or Decimal("0")) < 0]
+    losers = [
+        row
+        for row in examples
+        if (_decimal_value(row.get("realized_pnl_krw")) or Decimal("0")) < 0
+        and isinstance(row.get("evidence"), dict)
+        and row["evidence"].get("counts_as_avoided_loser") is True
+    ]
     return sorted(losers, key=lambda row: _decimal_value(row.get("realized_pnl_krw")) or Decimal("0"))
 
 
@@ -1550,6 +1726,45 @@ def _rule_post_entry_no_progress_exit_tighten(
     ]
     matched = len(set(matched_reasons)) >= int(rule.threshold)
     return matched, {"matched_reasons": sorted(set(matched_reasons)), "threshold": int(rule.threshold)}
+
+
+def _post_entry_tighten_replay_context(trade: dict[str, object]) -> dict[str, object]:
+    context = trade.get("candidate_rule_context")
+    for node in _iter_dict_nodes(context):
+        tightened_stop = _decimal_value(node.get("tightened_stop_price"))
+        if tightened_stop is not None:
+            return _json_safe(
+                {
+                    "tightened_exit_price": _decimal_text(tightened_stop),
+                    "observed_price": _decimal_text(_decimal_value(node.get("observed_price"))),
+                    "tighten_recorded_at": node.get("recorded_at") or node.get("observed_at") or node.get("triggered_at"),
+                    "tightened_exit_source": "post_entry_review.tightened_stop_price",
+                }
+            )
+    for node in _iter_dict_nodes(context):
+        if node.get("event") != "post_entry_stop_monitor_tightened":
+            continue
+        trigger_price = _decimal_value(node.get("trigger_price"))
+        if trigger_price is not None:
+            return _json_safe(
+                {
+                    "tightened_exit_price": _decimal_text(trigger_price),
+                    "observed_price": _decimal_text(_decimal_value(node.get("observed_price"))),
+                    "tighten_recorded_at": node.get("recorded_at") or node.get("observed_at") or node.get("triggered_at"),
+                    "tightened_exit_source": "post_entry_stop_monitor_tightened.trigger_price",
+                }
+            )
+    return {}
+
+
+def _iter_dict_nodes(value: object) -> Iterator[dict[str, object]]:
+    if isinstance(value, dict):
+        yield value
+        for item in value.values():
+            yield from _iter_dict_nodes(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _iter_dict_nodes(item)
 
 
 def _candidate_context_decimal(trade: dict[str, object], *, keys: tuple[str, ...]) -> Decimal | None:
@@ -2195,7 +2410,7 @@ def _candidate_rule_context(*, item: ExecutionPlanItem | None, buy_fill: Executi
                 ):
                     if key in nested and key not in payload:
                         payload[key] = nested[key]
-        for nested_key in ("entry_context", "last_monitoring_event"):
+        for nested_key in ("entry_context", "last_monitoring_event", "post_entry_review"):
             nested = source.get(nested_key)
             if isinstance(nested, dict) and nested_key not in payload:
                 payload[nested_key] = nested
