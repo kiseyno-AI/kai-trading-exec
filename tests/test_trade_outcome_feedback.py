@@ -1534,6 +1534,212 @@ def test_candidate_rule_replay_metrics_include_win_rate_and_drawdown_proxy(tmp_p
     engine.dispose()
 
 
+def test_candidate_rule_replay_does_not_promote_post_entry_tighten_without_exit_context(tmp_path) -> None:
+    engine, session = _session()
+    settings = Settings(runtime_mode="paper", trade_outcome_feedback_dir=str(tmp_path))
+    plan = ExecutionPlan(id="plan-replay-no-progress", external_plan_id="plan-replay-no-progress", source="kai-trading-core", mode="paper")
+    session.add(plan)
+    for index in range(3):
+        _add_closed_trade(
+            session,
+            plan=plan,
+            suffix=f"no-progress-loss-{index}",
+            symbol=f"NPG{index}",
+            buy_price="100",
+            sell_price="92",
+            filled_day=10 + index,
+            risk_context={
+                "post_entry_managed": True,
+                "last_monitoring_event": {
+                    "event": "post_entry_review_required",
+                    "reasons": [
+                        "gap_down_breached_risk_threshold",
+                        "next_day_no_progress",
+                        "max_holding_without_progress",
+                    ],
+                    "holding_session": 3,
+                },
+            },
+        )
+    session.commit()
+
+    report = generate_trade_outcome_feedback(settings=settings, db=session, as_of=datetime(2026, 6, 20, tzinfo=UTC))
+
+    rules = {row["rule_id"]: row for row in report["candidate_rule_replay"]["rules"]}
+    tightened = rules["post_entry_no_progress_exit_tighten"]
+    assert tightened["recommendation"] == "needs_more_data"
+    assert tightened["matched_trade_count"] == 3
+    assert tightened["skipped_entries"] == 0
+    assert tightened["avoided_losers"] == 0
+    assert tightened["skipped_winners"] == 0
+    assert tightened["size_multiplier"] == "1.0000"
+    assert tightened["gross_pnl_delta_krw"] == "0.0000"
+    assert tightened["top_avoided_losers"] == []
+    evidence = tightened["top_matched_examples"][0]["evidence"]
+    assert evidence["matched_reasons"] == [
+        "gap_down_breached_risk_threshold",
+        "max_holding_without_progress",
+        "next_day_no_progress",
+    ]
+    assert evidence["replay_status"] == "missing_tightened_exit_price"
+
+    session.close()
+    engine.dispose()
+
+
+def test_candidate_rule_replay_replays_post_entry_tightened_exit_price(tmp_path) -> None:
+    engine, session = _session()
+    settings = Settings(runtime_mode="paper", trade_outcome_feedback_dir=str(tmp_path))
+    plan = ExecutionPlan(id="plan-replay-tightened-exit", external_plan_id="plan-replay-tightened-exit", source="kai-trading-core", mode="paper")
+    session.add(plan)
+    for index in range(3):
+        _add_closed_trade(
+            session,
+            plan=plan,
+            suffix=f"tightened-exit-loss-{index}",
+            symbol=f"TEX{index}",
+            buy_price="100",
+            sell_price="92",
+            filled_day=10 + index,
+            risk_context={
+                "post_entry_managed": True,
+                "post_entry_review": {
+                    "requires_review": True,
+                    "reasons": [
+                        "gap_down_breached_risk_threshold",
+                        "next_day_no_progress",
+                        "max_holding_without_progress",
+                    ],
+                    "observed_price": "99.50",
+                    "tightened_stop_price": "99.00",
+                    "recorded_at": f"2026-06-{10 + index:02d}T04:00:00+00:00",
+                },
+                "last_monitoring_event": {
+                    "event": "post_entry_review_required",
+                    "reasons": [
+                        "gap_down_breached_risk_threshold",
+                        "next_day_no_progress",
+                        "max_holding_without_progress",
+                    ],
+                },
+            },
+        )
+    session.commit()
+
+    report = generate_trade_outcome_feedback(settings=settings, db=session, as_of=datetime(2026, 6, 20, tzinfo=UTC))
+
+    rules = {row["rule_id"]: row for row in report["candidate_rule_replay"]["rules"]}
+    tightened = rules["post_entry_no_progress_exit_tighten"]
+    assert tightened["recommendation"] == "promote_to_issue"
+    assert tightened["matched_trade_count"] == 3
+    assert tightened["skipped_entries"] == 0
+    assert tightened["avoided_losers"] == 0
+    assert tightened["estimated_net_pnl_delta_krw"] is None
+    assert tightened["gross_pnl_delta_krw"] == "210.0000"
+    assert tightened["top_avoided_losers"] == []
+    evidence = tightened["top_matched_examples"][0]["evidence"]
+    assert evidence["replay_status"] == "replayed_tightened_exit_price"
+    assert evidence["baseline_sell_price"] == "92.0000"
+    assert evidence["replay_exit_price"] == "99.0000"
+    assert evidence["replay_pnl_krw"] == "-10.0000"
+
+    session.close()
+    engine.dispose()
+
+
+def test_candidate_rule_replay_uses_sell_post_entry_context(tmp_path) -> None:
+    engine, session = _session()
+    settings = Settings(runtime_mode="paper", trade_outcome_feedback_dir=str(tmp_path))
+    plan = ExecutionPlan(id="plan-replay-sell-context", external_plan_id="plan-replay-sell-context", source="kai-trading-core", mode="paper")
+    buy_item = ExecutionPlanItem(
+        id="item-buy-sell-context",
+        plan=plan,
+        symbol="SCTX",
+        side="buy",
+        intent="intraday_watch_buy",
+        status="filled",
+        quantity_policy={"kind": "shares", "quantity": 10},
+        risk_context={},
+    )
+    sell_item = ExecutionPlanItem(
+        id="item-sell-sell-context",
+        plan=plan,
+        symbol="SCTX",
+        side="sell",
+        intent="stop_sell",
+        status="filled",
+        quantity_policy={"kind": "shares", "quantity": 10},
+        risk_context={
+            "last_monitoring_event": {
+                "event": "post_entry_review_required",
+                "reasons": ["gap_down_breached_risk_threshold", "next_day_no_progress"],
+            }
+        },
+    )
+    buy_order = BrokerOrder(
+        id="order-buy-sell-context",
+        plan_item=buy_item,
+        broker_name="kis",
+        mode=plan.mode,
+        idempotency_key="buy-sell-context",
+        broker_order_id="kis-buy-sell-context",
+        symbol="SCTX",
+        side="buy",
+        status="filled",
+        quantity=10,
+    )
+    sell_order = BrokerOrder(
+        id="order-sell-sell-context",
+        plan_item=sell_item,
+        broker_name="kis",
+        mode=plan.mode,
+        idempotency_key="sell-sell-context",
+        broker_order_id="kis-sell-sell-context",
+        symbol="SCTX",
+        side="sell",
+        status="filled",
+        quantity=10,
+    )
+    session.add_all(
+        [
+            buy_order,
+            sell_order,
+            ExecutionFill(
+                broker_order=buy_order,
+                broker_fill_id="fill-buy-sell-context",
+                symbol="SCTX",
+                side="buy",
+                quantity=10,
+                price=Decimal("100"),
+                filled_at=datetime(2026, 6, 10, 0, 30, tzinfo=UTC),
+            ),
+            ExecutionFill(
+                broker_order=sell_order,
+                broker_fill_id="fill-sell-sell-context",
+                symbol="SCTX",
+                side="sell",
+                quantity=10,
+                price=Decimal("92"),
+                filled_at=datetime(2026, 6, 11, 1, 0, tzinfo=UTC),
+            ),
+        ]
+    )
+    session.commit()
+
+    report = generate_trade_outcome_feedback(settings=settings, db=session, as_of=datetime(2026, 6, 20, tzinfo=UTC))
+
+    trade = report["closed_trades"][0]
+    assert trade["candidate_rule_context"]["sell_candidate_rule_context"]["last_monitoring_event"]["reasons"] == [
+        "gap_down_breached_risk_threshold",
+        "next_day_no_progress",
+    ]
+    rules = {row["rule_id"]: row for row in report["candidate_rule_replay"]["rules"]}
+    assert rules["post_entry_no_progress_exit_tighten"]["matched_trade_count"] == 1
+
+    session.close()
+    engine.dispose()
+
+
 def test_exec_agent_payloads_include_latest_trade_outcome_feedback(tmp_path) -> None:
     engine, session = _session()
     settings = Settings(runtime_mode="paper", trade_outcome_feedback_dir=str(tmp_path))
