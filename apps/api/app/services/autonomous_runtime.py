@@ -276,32 +276,12 @@ class AutonomousRuntimeCoordinator:
                 self._mark_cycle_started(worker_key=worker_key, started_at=started_at)
                 try:
                     awaitable = cycle(started_at)
-                    if worker_key == "monitoring":
-                        payload = await asyncio.wait_for(
-                            awaitable,
-                            timeout=self.settings.monitoring_cycle_timeout_seconds,
-                        )
-                    else:
-                        payload = await awaitable
+                    payload = await self._await_cycle_payload(
+                        worker_key=worker_key,
+                        awaitable=awaitable,
+                    )
                 except asyncio.CancelledError:
                     raise
-                except TimeoutError:
-                    LOGGER.exception(
-                        "autonomous_runtime_cycle_timed_out",
-                        extra={
-                            "worker_name": self._state_for(worker_key).worker_name,
-                            "runtime_mode": self.settings.runtime_mode,
-                            "timeout_seconds": self.settings.monitoring_cycle_timeout_seconds,
-                        },
-                    )
-                    self._mark_cycle_failed(
-                        worker_key=worker_key,
-                        heartbeat_at=datetime.now(UTC),
-                        error=(
-                            "cycle timed out after "
-                            f"{self.settings.monitoring_cycle_timeout_seconds:g}s"
-                        ),
-                    )
                 except Exception as exc:
                     LOGGER.exception(
                         "autonomous_runtime_cycle_failed",
@@ -316,6 +296,8 @@ class AutonomousRuntimeCoordinator:
                         error=str(exc),
                     )
                 else:
+                    if payload is None:
+                        continue
                     if isinstance(payload, dict) and payload.get("skipped") is True:
                         self._mark_cycle_busy(
                             worker_key=worker_key,
@@ -330,6 +312,69 @@ class AutonomousRuntimeCoordinator:
                     )
         except asyncio.CancelledError:
             return
+
+    async def _await_cycle_payload(
+        self,
+        *,
+        worker_key: str,
+        awaitable: asyncio.Future | object,
+    ) -> dict[str, object] | None:
+        if worker_key != "monitoring":
+            return await awaitable
+
+        task = asyncio.ensure_future(awaitable)
+        done, _ = await asyncio.wait(
+            {task},
+            timeout=self.settings.monitoring_cycle_timeout_seconds,
+        )
+        if done:
+            return task.result()
+
+        timeout_seconds = self.settings.monitoring_cycle_timeout_seconds
+        timeout_error = f"cycle timed out after {timeout_seconds:g}s"
+        timeout_payload: dict[str, object] = {
+            "status_code": 504,
+            "timeout": True,
+            "reason": "monitoring_cycle_timed_out",
+            "timeout_seconds": timeout_seconds,
+            "price_source_configured": self._monitoring_price_source_state.configured,
+            "price_source": self._monitoring_price_source_state.snapshot(),
+        }
+        LOGGER.error(
+            "autonomous_runtime_cycle_timed_out",
+            extra={
+                "worker_name": self._state_for(worker_key).worker_name,
+                "runtime_mode": self.settings.runtime_mode,
+                "timeout_seconds": timeout_seconds,
+            },
+        )
+        self._store_cycle_payload(worker_key=worker_key, payload=timeout_payload)
+        self._mark_cycle_failed(
+            worker_key=worker_key,
+            heartbeat_at=datetime.now(UTC),
+            error=timeout_error,
+        )
+
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            task.cancel()
+            raise
+        except Exception as exc:
+            LOGGER.exception(
+                "autonomous_runtime_cycle_failed_after_timeout",
+                extra={
+                    "worker_name": self._state_for(worker_key).worker_name,
+                    "runtime_mode": self.settings.runtime_mode,
+                    "timeout_seconds": timeout_seconds,
+                },
+            )
+            self._mark_cycle_failed(
+                worker_key=worker_key,
+                heartbeat_at=datetime.now(UTC),
+                error=str(exc),
+            )
+        return None
 
     async def _run_dispatch_cycle(self, started_at: datetime) -> dict[str, object]:
         return await asyncio.to_thread(self._dispatch_cycle_sync, started_at)
