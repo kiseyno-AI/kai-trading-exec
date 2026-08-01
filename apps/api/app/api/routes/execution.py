@@ -205,6 +205,7 @@ def reconcile_stale_orders(
         adapter=adapter,
         older_than_seconds=command.older_than_seconds,
         symbols=set(command.symbols) if command.symbols is not None else None,
+        dry_run=command.dry_run,
     )
 
 

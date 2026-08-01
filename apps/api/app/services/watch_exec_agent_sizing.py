@@ -867,7 +867,13 @@ def _stale_state_blockers_from_reconciliation(reconciliation: dict[str, object])
         if not isinstance(item, dict):
             continue
         classification = str(item.get("classification") or "").strip().lower()
-        if classification not in {"unknown", "failed-to-reconcile"}:
+        if classification not in {
+            "unknown",
+            "failed-to-reconcile",
+            "manual-review-required",
+            "reconcile-window-expired",
+            "stale-terminal-unknown",
+        }:
             continue
         symbol = str(item.get("symbol") or "").strip().upper()
         if not symbol:

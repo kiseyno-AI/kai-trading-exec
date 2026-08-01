@@ -39,6 +39,9 @@ class NormalizedBrokerOrderStatus(StrEnum):
     RETRY_PENDING = "retry_pending"
     FAILED = "failed"
     EXPIRED = "expired"
+    RECONCILE_WINDOW_EXPIRED = "reconcile_window_expired"
+    STALE_TERMINAL_UNKNOWN = "stale_terminal_unknown"
+    MANUAL_REVIEW_REQUIRED = "manual_review_required"
 
 
 @dataclass(frozen=True)

@@ -44,7 +44,7 @@ from app.services.reconciliation import (
     reconcile_stale_nonterminal_broker_orders,
     sync_execution_positions_from_broker_snapshot,
 )
-from app.services.runtime import RuntimeMetadata, build_runtime_status
+from app.services.runtime import RuntimeMetadata, build_runtime_daily_board, build_runtime_status
 from app.services.runtime_controls import ControlCommand, resume_runtime
 
 
@@ -666,6 +666,141 @@ def test_reconcile_stale_nonterminal_order_marks_closed_against_broker_truth() -
     assert broker.reconcile_calls == [("stale-filled-1", "KRX", stale_submitted_at)]
     assert len(events) == 1
     assert events[0].error_classification == "closed"
+    repair = db.scalar(
+        select(BrokerOrderEvent).where(BrokerOrderEvent.event_type == "stale_order_repair")
+    )
+    assert repair is not None
+    assert repair.payload["status_before"] == "submitted"
+    assert repair.payload["status_after"] == "filled"
+    engine.dispose()
+
+
+def test_reconcile_stale_submitted_kier_lookup_window_response_repairs_to_window_expired() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        stale_broker_order_reconciliation_threshold_seconds=3600,
+    )
+    engine, db = _session(settings)
+    stale_submitted_at = datetime.now(UTC) - timedelta(days=10)
+    order = _order(broker_order_id="kier2570-old-1")
+    order.submitted_at = stale_submitted_at
+    order.last_broker_sync_at = stale_submitted_at
+    db.add(order)
+    db.commit()
+
+    class LookupWindowBroker(ReconciliationStubBroker):
+        def reconcile_order(
+            self,
+            access_token: str,
+            broker_order_id: str,
+            *,
+            exchange: str = "KRX",
+            submitted_at: datetime | None = None,
+        ) -> dict[str, object]:
+            assert access_token
+            self.reconcile_calls.append((broker_order_id, exchange, submitted_at))
+            raise BrokerAdapterError(
+                "조회일자를 확인하십시오",
+                status_code=422,
+                classification=BrokerErrorClassification.BROKER_REJECTED,
+                retryable=False,
+                code="KIER2570",
+                request_metadata={
+                    "provider": "kis",
+                    "endpoint": "/uapi/domestic-stock/v1/trading/inquire-daily-ccld",
+                    "tr_id": "VTTC0081R",
+                },
+                response_payload={"msg_cd": "KIER2570", "msg1": "조회일자를 확인하십시오"},
+                observed_at=OBSERVED_AT,
+            )
+
+    broker = LookupWindowBroker()
+
+    result = reconcile_stale_nonterminal_broker_orders(
+        settings=settings,
+        db=db,
+        adapter=broker,
+    )
+
+    repair = db.scalar(
+        select(BrokerOrderEvent).where(BrokerOrderEvent.event_type == "stale_order_repair")
+    )
+    assert result["candidate_order_count"] == 1
+    assert result["repaired_order_count"] == 1
+    assert result["counts"]["reconcile-window-expired"] == 1
+    assert result["items"][0]["classification"] == "reconcile-window-expired"
+    assert result["items"][0]["observed_broker_code"] == "KIER2570"
+    assert order.status == "reconcile_window_expired"
+    assert order.last_error_classification == "broker_rejected"
+    assert order.last_error_code == "KIER2570"
+    assert broker.reconcile_calls == [("kier2570-old-1", "KRX", stale_submitted_at)]
+    assert broker.order_calls == []
+    assert repair is not None
+    assert repair.broker_status == "KIER2570"
+    assert repair.error_classification == "reconcile_window_expired"
+    assert repair.payload["status_before"] == "submitted"
+    assert repair.payload["status_after"] == "reconcile_window_expired"
+    assert repair.payload["observed_broker_code"] == "KIER2570"
+    assert repair.payload["classification"] == "reconcile_window_expired"
+    assert repair.payload["reason"] == "broker_lookup_window_expired"
+    engine.dispose()
+
+
+def test_reconcile_repeated_unknown_status_after_stale_threshold_repairs_to_unknown_terminal() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        stale_broker_order_reconciliation_threshold_seconds=3600,
+    )
+    engine, db = _session(settings)
+    stale_observed_at = datetime.now(UTC) - timedelta(days=5)
+    order = _order(status="open", broker_order_id="stale-unknown-repeat-1")
+    order.submitted_at = stale_observed_at
+    order.last_broker_sync_at = stale_observed_at
+    order.last_error_classification = "unknown_status"
+    order.last_error_code = "unknown"
+    order.last_error_message = "unrecognized broker status"
+    db.add(order)
+    db.commit()
+    broker = ReconciliationStubBroker(
+        reconcile_payloads=[
+            {
+                "broker_order_id": "stale-unknown-repeat-1",
+                "status": "not-in-open-order-window",
+                "broker_status": "unknown",
+                "message": "matching order was not found in broker order query",
+                "observed_at": OBSERVED_AT.isoformat(),
+            }
+        ]
+    )
+
+    result = reconcile_stale_nonterminal_broker_orders(
+        settings=settings,
+        db=db,
+        adapter=broker,
+    )
+
+    repair = db.scalar(
+        select(BrokerOrderEvent).where(BrokerOrderEvent.event_type == "stale_order_repair")
+    )
+    unrecognized = db.scalar(
+        select(BrokerOrderEvent).where(
+            BrokerOrderEvent.event_type == "reconcile_result_unrecognized_status"
+        )
+    )
+    assert result["candidate_order_count"] == 1
+    assert result["repaired_order_count"] == 1
+    assert result["counts"]["stale-terminal-unknown"] == 1
+    assert result["items"][0]["classification"] == "stale-terminal-unknown"
+    assert result["items"][0]["reason"] == "repeated_unknown_status_after_stale_threshold"
+    assert order.status == "stale_terminal_unknown"
+    assert order.last_error_classification == "unknown_status"
+    assert repair is not None
+    assert repair.payload["status_before"] == "open"
+    assert repair.payload["status_after"] == "stale_terminal_unknown"
+    assert repair.payload["observed_broker_code"] == "not-in-open-order-window"
+    assert unrecognized is not None
     engine.dispose()
 
 
@@ -841,14 +976,145 @@ def test_reconcile_stale_retry_pending_without_broker_id_is_failed_to_reconcile(
         )
     ).all()
     assert result["candidate_order_count"] == 1
-    assert result["counts"]["failed-to-reconcile"] == 1
-    assert result["items"][0]["classification"] == "failed-to-reconcile"
+    assert result["repaired_order_count"] == 1
+    assert result["counts"]["manual-review-required"] == 1
+    assert result["items"][0]["classification"] == "manual-review-required"
     assert result["items"][0]["reason"] == "missing_broker_order_id"
-    assert retry_order.status == "retry_pending"
+    assert retry_order.status == "manual_review_required"
     assert retry_order.last_error_classification == "missing_broker_order_id"
     assert broker.reconcile_calls == []
     assert len(events) == 1
-    assert events[0].error_classification == "failed_to_reconcile"
+    assert events[0].error_classification == "manual_review_required"
+    repair = db.scalar(
+        select(BrokerOrderEvent).where(BrokerOrderEvent.event_type == "stale_order_repair")
+    )
+    assert repair is not None
+    assert repair.payload["status_before"] == "retry_pending"
+    assert repair.payload["status_after"] == "manual_review_required"
+    engine.dispose()
+
+
+def test_reconcile_stale_orders_dry_run_summarizes_repairs_without_mutating() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        stale_broker_order_reconciliation_threshold_seconds=3600,
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    stale_submitted_at = datetime.now(UTC) - timedelta(days=5)
+    order = BrokerOrder(
+        broker_name="kis",
+        mode="paper",
+        idempotency_key="dry-run-retry-missing-id",
+        broker_order_id=None,
+        symbol="031330",
+        side="sell",
+        status="retry_pending",
+        quantity=2,
+        submitted_at=stale_submitted_at,
+        last_broker_sync_at=stale_submitted_at,
+    )
+    with session_factory() as db:
+        db.add(order)
+        db.commit()
+        order_pk = order.id
+    broker = ReconciliationStubBroker()
+    app = create_app(
+        settings=settings,
+        engine=engine,
+        session_factory=session_factory,
+        broker_adapter_factory=lambda _settings: broker,
+    )
+    client = TestClient(app)
+
+    response = client.post("/orders/reconcile-stale", json={"dry_run": True})
+
+    assert response.status_code == 200
+    result = response.json()
+    with session_factory() as db:
+        persisted = db.get(BrokerOrder, order_pk)
+        events = db.scalars(select(BrokerOrderEvent)).all()
+        assert persisted is not None
+        assert persisted.status == "retry_pending"
+        assert persisted.last_error_classification is None
+    assert result["dry_run"] is True
+    assert result["candidate_order_count"] == 1
+    assert result["would_repair_order_count"] == 1
+    assert result["repaired_order_count"] == 0
+    assert result["items"][0]["repair_action"] == "would_repair"
+    assert result["items"][0]["status_before"] == "retry_pending"
+    assert result["items"][0]["status_after"] == "manual_review_required"
+    assert broker.reconcile_calls == []
+    assert events == []
+    engine.dispose()
+
+
+def test_runtime_and_daily_board_open_order_counts_exclude_repaired_stale_states() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        stale_broker_order_reconciliation_threshold_seconds=3600,
+    )
+    engine, db = _session(settings)
+    observed_at = datetime.now(UTC)
+    plan = ExecutionPlan(
+        external_plan_id="plan-repaired-open-counts",
+        source="test",
+        mode="paper",
+        market_date=observed_at.date(),
+    )
+    statuses_by_symbol = {
+        "005930": "submitted",
+        "078930": "reconcile_window_expired",
+        "031330": "stale_terminal_unknown",
+        "001450": "manual_review_required",
+    }
+    for index, (symbol, status) in enumerate(statuses_by_symbol.items()):
+        item = ExecutionPlanItem(
+            plan=plan,
+            plan_item_index=index,
+            symbol=symbol,
+            side="buy",
+            intent="intraday_watch_buy",
+            status="watch_monitoring_active",
+            quantity_policy={"kind": "shares", "quantity": 1},
+        )
+        order = BrokerOrder(
+            broker_name="kis",
+            mode="paper",
+            idempotency_key=f"open-count:{symbol}",
+            broker_order_id=f"order-{symbol}",
+            symbol=symbol,
+            side="buy",
+            status=status,
+            quantity=1,
+            submitted_at=observed_at,
+            last_broker_sync_at=observed_at,
+        )
+        order.plan_item = item
+    db.add(plan)
+    db.commit()
+
+    runtime_payload = build_runtime_status(
+        settings=settings,
+        runtime=RuntimeMetadata(started_at=datetime.now(UTC)),
+        db=db,
+    )
+    board = build_runtime_daily_board(
+        settings=settings,
+        runtime=RuntimeMetadata(started_at=datetime.now(UTC)),
+        db=db,
+    )
+
+    symbols = {row["symbol"]: row for row in board["symbols"]}
+    assert runtime_payload["counts"]["open_orders"] == 1
+    assert board["totals"]["open_order_symbol_count"] == 1
+    assert symbols["005930"]["open_order_count"] == 1
+    assert symbols["078930"]["open_order_count"] == 0
+    assert symbols["031330"]["open_order_count"] == 0
+    assert symbols["001450"]["open_order_count"] == 0
     engine.dispose()
 
 

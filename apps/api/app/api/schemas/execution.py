@@ -348,6 +348,7 @@ class StaleBrokerOrderReconciliationRequest(BaseModel):
 
     older_than_seconds: int | None = Field(default=None, ge=60, le=31536000)
     symbols: list[str] | None = None
+    dry_run: bool = False
 
     @field_validator("symbols")
     @classmethod

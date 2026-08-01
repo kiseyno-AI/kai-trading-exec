@@ -451,6 +451,26 @@ the latest error remains on the broker order and is surfaced in symbol runtime
 details so unsafe target/stop sells are clearly blocked instead of silently
 assuming there is no position.
 
+### `POST /orders/reconcile-stale`
+Summarize or apply repair for stale nonterminal broker-order rows. This endpoint
+only performs broker truth lookups; it does not place, cancel, or amend orders.
+
+Request body:
+- `older_than_seconds` (optional): override the stale threshold for this run
+- `symbols[]` (optional): limit repair candidates to specific symbols
+- `dry_run` (default `false`): return candidate and planned-repair summary
+  without mutating `broker_orders` or writing `broker_order_events`
+
+Applied repair writes `broker_order_events` with event type
+`stale_order_repair`, including previous status, repaired status, observed
+broker code, classification, and reason. Repaired non-actionable statuses are:
+- `reconcile_window_expired`: broker lookup-window evidence such as KIS
+  `KIER2570` means the stale order can no longer be reconciled as actionable
+- `stale_terminal_unknown`: repeated stale unknown broker status after the
+  configured threshold
+- `manual_review_required`: local retry-pending rows that are missing
+  `broker_order_id` and cannot be safely retried automatically
+
 Rejected KIS orders from reconciliation now receive an explicit retry decision
 before they become terminal. The current integrated source is KIS
 `inquire-daily-ccld` (`TTTC0081R` live / `VTTC0081R` paper), plus any structured
@@ -600,6 +620,9 @@ Current normalized broker-order lifecycle states include:
 - `retry_pending`
 - `failed`
 - `expired`
+- `reconcile_window_expired`
+- `stale_terminal_unknown`
+- `manual_review_required`
 
 ### `GET /executions`
 List fills / actual execution outcomes.
