@@ -411,7 +411,7 @@ class AutonomousRuntimeCoordinator:
                 stale_age_seconds = (started_at - self._monitoring_cycle_mutex_started_at).total_seconds()
             if stale_age_seconds is not None and stale_age_seconds > self.settings.monitoring_cycle_timeout_seconds:
                 LOGGER.error(
-                    "monitoring_cycle_stale_mutex_abandoned",
+                    "monitoring_cycle_still_running_after_timeout",
                     extra={
                         "worker_name": MONITORING_LOOP_WORKER_NAME,
                         "runtime_mode": self.settings.runtime_mode,
@@ -419,33 +419,16 @@ class AutonomousRuntimeCoordinator:
                         "timeout_seconds": self.settings.monitoring_cycle_timeout_seconds,
                     },
                 )
-                with self._lock:
-                    if self._monitoring_cycle_mutex is acquired_lock:
-                        self._monitoring_cycle_mutex = threading.Lock()
-                        self._monitoring_cycle_mutex_started_at = None
-                    acquired_lock = self._monitoring_cycle_mutex
-                if not acquired_lock.acquire(blocking=False):
-                    payload = {
-                        "status_code": 202,
-                        "skipped": True,
-                        "reason": "previous_monitoring_cycle_still_running",
-                        "stale_age_seconds": stale_age_seconds,
-                        "price_source_configured": self._monitoring_price_source_state.configured,
-                        "price_source": self._monitoring_price_source_state.snapshot(),
-                    }
-                    self._store_cycle_payload(worker_key="monitoring", payload=payload)
-                    return payload
-            else:
-                payload = {
-                    "status_code": 202,
-                    "skipped": True,
-                    "reason": "previous_monitoring_cycle_still_running",
-                    "stale_age_seconds": stale_age_seconds,
-                    "price_source_configured": self._monitoring_price_source_state.configured,
-                    "price_source": self._monitoring_price_source_state.snapshot(),
-                }
-                self._store_cycle_payload(worker_key="monitoring", payload=payload)
-                return payload
+            payload = {
+                "status_code": 202,
+                "skipped": True,
+                "reason": "previous_monitoring_cycle_still_running",
+                "stale_age_seconds": stale_age_seconds,
+                "price_source_configured": self._monitoring_price_source_state.configured,
+                "price_source": self._monitoring_price_source_state.snapshot(),
+            }
+            self._store_cycle_payload(worker_key="monitoring", payload=payload)
+            return payload
         self._monitoring_cycle_mutex_started_at = started_at
         try:
             return self._monitoring_cycle_sync(started_at)

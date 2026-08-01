@@ -4013,6 +4013,70 @@ def test_fast_runtime_status_uses_autonomous_snapshot_for_monitored_symbols() ->
     engine.dispose()
 
 
+def test_fast_runtime_status_honors_durable_paused_state() -> None:
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            automation_enabled=True,
+            autonomous_runtime_enabled=True,
+        ),
+        autonomous_runtime_enabled=True,
+    )
+    client = TestClient(app)
+
+    response = client.get("/runtime/status")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["freshness"]["summary_source"] == "fast_autonomous_runtime_snapshot"
+    assert payload["ready"] is False
+    assert "runtime is paused" in payload["readiness"]["reasons"]
+    assert payload["safety"]["paused"] is True
+    assert payload["safety"]["kill_switch_enabled"] is False
+    assert payload["safety"]["automated_order_submission_allowed"] is False
+    assert payload["safety"]["automated_order_submission_block_reason"] == "paused"
+
+    engine.dispose()
+
+
+def test_fast_runtime_status_honors_durable_kill_switch_state() -> None:
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            automation_enabled=True,
+            autonomous_runtime_enabled=True,
+        ),
+        autonomous_runtime_enabled=True,
+    )
+    client = TestClient(app)
+
+    kill_switch_response = client.post(
+        "/controls/kill-switch",
+        json={
+            "actor": "ops",
+            "source": "console",
+            "reason": "operator kill switch",
+        },
+    )
+    assert kill_switch_response.status_code == 200
+
+    response = client.get("/runtime/status")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["freshness"]["summary_source"] == "fast_autonomous_runtime_snapshot"
+    assert payload["ready"] is False
+    assert "kill switch is enabled" in payload["readiness"]["reasons"]
+    assert payload["safety"]["paused"] is True
+    assert payload["safety"]["kill_switch_enabled"] is True
+    assert payload["safety"]["automated_order_submission_allowed"] is False
+    assert payload["safety"]["automated_order_submission_block_reason"] == "kill_switch"
+
+    engine.dispose()
+
+
 def test_fast_runtime_status_uses_cached_filled_symbols() -> None:
     app, engine = build_test_app(
         settings=Settings(

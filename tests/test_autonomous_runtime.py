@@ -1,4 +1,6 @@
 import asyncio
+import threading
+from datetime import UTC, datetime, timedelta
 
 from app.core.config import Settings
 from app.services.autonomous_runtime import AutonomousRuntimeCoordinator
@@ -58,3 +60,74 @@ def test_monitoring_timeout_does_not_block_next_scheduler_tick() -> None:
             await asyncio.gather(task, return_exceptions=True)
 
     asyncio.run(scenario())
+
+
+def test_monitoring_stale_mutex_skips_until_original_cycle_finishes() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        autonomous_runtime_enabled=True,
+        monitoring_cycle_timeout_seconds=0.05,
+    )
+    coordinator = AutonomousRuntimeCoordinator(
+        settings=settings,
+        session_factory=None,  # type: ignore[arg-type]
+        broker_adapter_factory=lambda settings: None,  # type: ignore[arg-type,return-value]
+    )
+    first_cycle_entered = threading.Event()
+    release_first_cycle = threading.Event()
+    calls = 0
+    active_cycles = 0
+    max_active_cycles = 0
+    first_payloads: list[dict[str, object]] = []
+    started_at = datetime(2026, 8, 1, 1, 0, tzinfo=UTC)
+
+    def blocking_monitoring_cycle(started_at):  # noqa: ANN001
+        nonlocal active_cycles, calls, max_active_cycles
+        calls += 1
+        active_cycles += 1
+        max_active_cycles = max(max_active_cycles, active_cycles)
+        try:
+            if calls == 1:
+                first_cycle_entered.set()
+                assert release_first_cycle.wait(timeout=1)
+            return {"status_code": 200, "call": calls}
+        finally:
+            active_cycles -= 1
+
+    coordinator._monitoring_cycle_sync = blocking_monitoring_cycle  # type: ignore[method-assign]
+
+    first_thread = threading.Thread(
+        target=lambda: first_payloads.append(
+            coordinator._monitoring_cycle_sync_guarded(started_at)
+        )
+    )
+    first_thread.start()
+    try:
+        assert first_cycle_entered.wait(timeout=1)
+
+        stale_payload = coordinator._monitoring_cycle_sync_guarded(
+            started_at + timedelta(seconds=1)
+        )
+
+        assert stale_payload["status_code"] == 202
+        assert stale_payload["skipped"] is True
+        assert stale_payload["reason"] == "previous_monitoring_cycle_still_running"
+        assert stale_payload["stale_age_seconds"] == 1
+        assert calls == 1
+        assert max_active_cycles == 1
+
+        release_first_cycle.set()
+        first_thread.join(timeout=1)
+        assert not first_thread.is_alive()
+        assert first_payloads == [{"status_code": 200, "call": 1}]
+
+        recovered_payload = coordinator._monitoring_cycle_sync_guarded(
+            started_at + timedelta(seconds=2)
+        )
+
+        assert recovered_payload == {"status_code": 200, "call": 2}
+        assert calls == 2
+        assert max_active_cycles == 1
+    finally:
+        release_first_cycle.set()
+        first_thread.join(timeout=1)

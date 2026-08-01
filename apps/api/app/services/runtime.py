@@ -144,19 +144,20 @@ def default_safety(settings: Settings, reason: str) -> dict[str, object]:
     }
 
 
-def fast_autonomous_safety(settings: Settings) -> dict[str, object]:
-    automation_enabled = bool(settings.automation_enabled)
-    return {
-        "mode": settings.runtime_mode,
-        "paused": False,
-        "kill_switch_enabled": False,
-        "automation_enabled": automation_enabled,
-        "automated_order_submission_allowed": automation_enabled,
-        "automated_order_submission_block_reason": None if automation_enabled else "automation_disabled",
-        "readiness_reason": None,
-        "updated_at": None,
-        "last_change": None,
-    }
+def fast_autonomous_safety(
+    *,
+    settings: Settings,
+    db: Session,
+) -> dict[str, object]:
+    try:
+        state = ensure_runtime_control_state(settings=settings, db=db)
+    except SQLAlchemyError as exc:
+        db.rollback()
+        return default_safety(
+            settings,
+            f"runtime state unavailable: {exc.__class__.__name__}; run migrations",
+        )
+    return runtime_safety_payload(state)
 
 
 def build_runtime_safety(
@@ -1364,7 +1365,7 @@ def build_runtime_status(
         )
         if monitoring_reasons:
             monitoring["status"] = "degraded"
-        safety = fast_autonomous_safety(settings)
+        safety = fast_autonomous_safety(settings=settings, db=db)
         readiness = readiness_payload(
             dependencies_ok=True,
             safety=safety,
