@@ -36,6 +36,7 @@ from app.services.trigger_time_exec_agent import (
 from app.services.broker_auth import build_broker_adapter, build_broker_session_summary
 from app.services.account_drawdown_gate import latest_account_drawdown_gate_state
 from app.services.broker_order_state import (
+    NONTERMINAL_ORDER_STATUSES,
     UNTRUSTED_ACTIVE_ORDER_ERROR_CLASSIFICATIONS,
     active_local_broker_order_filters,
     broker_order_observed_at_expr,
@@ -48,14 +49,6 @@ from app.services.runtime_controls import (
 )
 
 OPEN_ORDER_STATUSES = ("submitted", "open", "partially_filled")
-NONTERMINAL_ORDER_STATUSES = (
-    "submission_pending",
-    "submitted",
-    "open",
-    "partially_filled",
-    "cancel_pending",
-    "retry_pending",
-)
 ACTIVE_JOB_STATUSES = ("queued", "scheduled", "running", "retrying")
 MONITORED_INTENTS = ("target_sell", "stop_sell")
 SELL_MONITORED_INTENTS = ("target_sell", "stop_sell", "max_holding_close_sell")

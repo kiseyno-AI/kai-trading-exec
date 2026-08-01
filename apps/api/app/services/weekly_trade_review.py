@@ -22,14 +22,8 @@ from app.models.runtime import (
     ExecutionPlanItem,
     MonitoringCheckpoint,
 )
-
-NONTERMINAL_ORDER_STATUSES = (
-    "created",
-    "pending",
-    "submitted",
-    "accepted",
-    "partially_filled",
-    "open",
+from app.services.broker_order_state import (
+    NONTERMINAL_ORDER_STATUSES,
 )
 WATCH_REVIEW_STATUSES = (
     "watch_monitoring_pending",

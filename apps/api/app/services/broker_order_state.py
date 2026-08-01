@@ -5,9 +5,18 @@ from typing import Iterable
 
 from sqlalchemy import func, or_
 
+from app.broker.base import NormalizedBrokerOrderStatus
 from app.core.config import Settings
 from app.models.runtime import BrokerOrder
 
+NONTERMINAL_ORDER_STATUSES = (
+    NormalizedBrokerOrderStatus.SUBMISSION_PENDING.value,
+    NormalizedBrokerOrderStatus.SUBMITTED.value,
+    NormalizedBrokerOrderStatus.OPEN.value,
+    NormalizedBrokerOrderStatus.PARTIALLY_FILLED.value,
+    NormalizedBrokerOrderStatus.CANCEL_PENDING.value,
+    NormalizedBrokerOrderStatus.RETRY_PENDING.value,
+)
 UNTRUSTED_ACTIVE_ORDER_ERROR_CLASSIFICATIONS = frozenset(
     {
         "missing_broker_order_id",

@@ -79,7 +79,30 @@ def test_weekly_trade_review_exports_bounded_read_only_artifact(tmp_path) -> Non
             "status": "filled",
         }
     ]
-    assert report["active_broker_order_summary"]["missing_submitted_at_nonterminal_count"] == 1
+    active_order_summary = report["active_broker_order_summary"]
+    assert active_order_summary["missing_submitted_at_nonterminal_count"] == 1
+    assert {
+        row["status"]: row["count"]
+        for row in active_order_summary["nonterminal_status_counts"]
+    } == {
+        "cancel_pending": 1,
+        "open": 1,
+        "partially_filled": 1,
+        "retry_pending": 1,
+        "submission_pending": 1,
+        "submitted": 2,
+    }
+    assert {
+        row["status"]
+        for row in active_order_summary["stale_nonterminal_samples"]
+    } == {
+        "cancel_pending",
+        "open",
+        "partially_filled",
+        "retry_pending",
+        "submission_pending",
+        "submitted",
+    }
     assert report["execution_plan_item_summary"]["active_watch_status_counts"][0]["status"] == "watch_monitoring_active"
     assert report["monitoring_checkpoints"][0]["worker_name"] == "monitoring"
 
@@ -286,6 +309,34 @@ def _seed_weekly_review_fixture(*, db, start_at: datetime) -> None:
         created_at=start_at + timedelta(days=2),
         updated_at=start_at + timedelta(days=2),
     )
+    active_nonterminal_orders = [
+        BrokerOrder(
+            id=f"stale-{status.replace('_', '-')}-order",
+            execution_plan_item_id="weekly-item",
+            broker_name="kis",
+            mode="paper",
+            idempotency_key=f"stale-{status.replace('_', '-')}-key",
+            broker_order_id=f"kis-stale-{status.replace('_', '-')}",
+            symbol=f"ACTIVE{index}",
+            side="buy",
+            status=status,
+            quantity=1,
+            limit_price=Decimal("70000"),
+            submitted_at=start_at - timedelta(days=1) + timedelta(minutes=index),
+            created_at=start_at - timedelta(days=1) + timedelta(minutes=index),
+            updated_at=start_at - timedelta(days=1) + timedelta(minutes=index),
+        )
+        for index, status in enumerate(
+            [
+                "submission_pending",
+                "submitted",
+                "open",
+                "partially_filled",
+                "cancel_pending",
+                "retry_pending",
+            ]
+        )
+    ]
     weekly_fill = ExecutionFill(
         id="weekly-fill",
         broker_order_pk="weekly-order",
@@ -369,6 +420,7 @@ def _seed_weekly_review_fixture(*, db, start_at: datetime) -> None:
             weekly_order,
             old_order,
             missing_submitted_order,
+            *active_nonterminal_orders,
             weekly_fill,
             old_fill,
             event,
