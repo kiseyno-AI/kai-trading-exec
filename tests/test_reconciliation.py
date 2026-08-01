@@ -975,16 +975,29 @@ def test_reconcile_stale_retry_pending_without_broker_id_is_failed_to_reconcile(
             BrokerOrderEvent.event_type == "stale_order_reconcile_classification"
         )
     ).all()
+    audit = db.scalar(
+        select(ExecutionPlanItemAudit).where(
+            ExecutionPlanItemAudit.execution_plan_item_id == item.id,
+            ExecutionPlanItemAudit.event_type == "execution_plan_item_status_transition",
+        )
+    )
     assert result["candidate_order_count"] == 1
     assert result["repaired_order_count"] == 1
     assert result["counts"]["manual-review-required"] == 1
     assert result["items"][0]["classification"] == "manual-review-required"
     assert result["items"][0]["reason"] == "missing_broker_order_id"
     assert retry_order.status == "manual_review_required"
+    assert item.status == "broker_order_failed"
     assert retry_order.last_error_classification == "missing_broker_order_id"
     assert broker.reconcile_calls == []
     assert len(events) == 1
     assert events[0].error_classification == "manual_review_required"
+    assert audit is not None
+    assert audit.source == "reconciliation"
+    assert audit.summary["previous_status"] == "broker_order_submitted"
+    assert audit.summary["status"] == "broker_order_failed"
+    assert audit.payload["status"] == "manual_review_required"
+    assert audit.payload["classification"] == "manual_review_required"
     repair = db.scalar(
         select(BrokerOrderEvent).where(BrokerOrderEvent.event_type == "stale_order_repair")
     )

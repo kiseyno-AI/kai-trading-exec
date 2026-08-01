@@ -19,7 +19,11 @@ from app.models.runtime import BrokerOrder, BrokerOrderEvent, ExecutionFill, Exe
 from app.services.broker_auth import ensure_authenticated_broker_session
 from app.services.fill_idempotency import execution_fill_dedupe_key, execution_fill_idempotency_key
 from app.services.rejected_order_retries import handle_reconciled_rejected_order
-from app.services.runtime_transitions import apply_broker_order_status, set_plan_item_status
+from app.services.runtime_transitions import (
+    apply_broker_order_status,
+    plan_item_status_for_broker_order_status,
+    set_plan_item_status,
+)
 
 
 def reconcile_broker_orders(
@@ -1392,29 +1396,16 @@ def _merge_reconcile_request_metadata(
 
 
 def _order_status_to_plan_item_status(order_status: str) -> str | None:
-    if order_status == NormalizedBrokerOrderStatus.SUBMISSION_PENDING.value:
-        return "broker_order_submission_pending"
-    if order_status == NormalizedBrokerOrderStatus.SUBMITTED.value:
-        return "broker_order_submitted"
-    if order_status == NormalizedBrokerOrderStatus.OPEN.value:
-        return "open"
-    if order_status == NormalizedBrokerOrderStatus.PARTIALLY_FILLED.value:
-        return "partially_filled"
-    if order_status == NormalizedBrokerOrderStatus.FILLED.value:
-        return "filled"
     if order_status == NormalizedBrokerOrderStatus.CANCEL_PENDING.value:
         return "cancel_pending"
     if order_status == NormalizedBrokerOrderStatus.CANCELED.value:
         return "canceled"
     if order_status == NormalizedBrokerOrderStatus.EXPIRED.value:
         return "expired"
-    if order_status == NormalizedBrokerOrderStatus.RETRY_PENDING.value:
-        return "broker_order_retry_pending"
-    if order_status == NormalizedBrokerOrderStatus.REJECTED.value:
-        return "broker_order_rejected"
-    if order_status == NormalizedBrokerOrderStatus.FAILED.value:
-        return "broker_order_failed"
-    return None
+    try:
+        return plan_item_status_for_broker_order_status(order_status)
+    except ValueError:
+        return None
 
 
 def _parse_decimal(value: object) -> Decimal | None:
