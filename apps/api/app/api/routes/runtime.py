@@ -1,12 +1,13 @@
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Body, Depends, Request
 from sqlalchemy.orm import Session
 
 from app.api.dependencies import get_broker_adapter, get_db_session, get_runtime_metadata, get_settings
 from app.broker.base import BrokerAdapter
 from app.core.config import Settings
 from app.services.portfolio_risk import build_portfolio_risk_snapshot
+from app.services.plan_judgment_actions import apply_hourly_plan_judgment_action
 from app.services.runtime import (
     RuntimeMetadata,
     build_runtime_daily_board,
@@ -74,4 +75,23 @@ def runtime_portfolio_risk(
         settings=settings,
         db=db,
         adapter=adapter,
+    )
+
+
+@router.post("/plan-judgment/action")
+async def runtime_plan_judgment_action(
+    request: Request,
+    payload: dict[str, object] = Body(...),
+) -> dict[str, object]:
+    settings: Settings = get_settings(request)
+    risk_reasons_payload = payload.get("risk_reasons")
+    risk_reasons = (
+        [str(item) for item in risk_reasons_payload if str(item).strip()]
+        if isinstance(risk_reasons_payload, list)
+        else []
+    )
+    return apply_hourly_plan_judgment_action(
+        settings=settings,
+        risk_flags=max(0, int(payload.get("risk_flags") or 0)),
+        risk_reasons=risk_reasons,
     )

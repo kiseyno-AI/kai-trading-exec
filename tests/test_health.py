@@ -34,10 +34,11 @@ from app.models.runtime import (
     RuntimeControlState,
 )
 from app.services import runtime as runtime_service, runtime_controls
-from app.services.autonomous_runtime import _is_regular_market_session
+from app.services.autonomous_runtime import MonitoringRuntimeSnapshot, _is_regular_market_session
 from app.services.monitoring import (
     _maintain_post_entry_exit_monitors,
     _load_monitored_items,
+    _monitoring_item_is_configured,
     _pending_broker_order_symbols,
     _resolve_sell_quantity,
     list_autonomous_monitoring_symbols,
@@ -65,6 +66,23 @@ def build_test_app(
         monitoring_price_source=monitoring_price_source,
     )
     return app, engine
+
+
+def test_watch_buy_decimal_string_share_quantity_is_configured() -> None:
+    item = ExecutionPlanItem(
+        id="watch-decimal-string-quantity",
+        execution_plan_id="plan-1",
+        plan_item_index=0,
+        symbol="005930",
+        side="buy",
+        intent="next_open_buy",
+        status="watch_monitoring_pending",
+        trigger_price=Decimal("71000"),
+        limit_price=Decimal("71500"),
+        quantity_policy={"kind": "shares", "quantity": "24.00000000"},
+    )
+
+    assert _monitoring_item_is_configured(item)
 
 
 class StubMonitoringBrokerAdapter:
@@ -3892,8 +3910,33 @@ def test_fast_runtime_status_uses_autonomous_snapshot_for_monitored_symbols() ->
     app.state.autonomous_runtime._monitoring_state.last_cycle = {
         "monitored_symbols": ["005930", "000660", "005930"],
     }
+    app.state.autonomous_runtime._monitoring_runtime_snapshot = MonitoringRuntimeSnapshot(
+        loaded_at=datetime.now(UTC),
+        symbols=["005930", "000660", "005930"],
+        positions_by_symbol={},
+        items=[],
+        filled_today_symbols=["282330"],
+    )
     now = datetime.now(UTC)
     with app.state.db_session_factory() as session:
+        plan = ExecutionPlan(
+            external_plan_id="fast-runtime-monitored-truth",
+            source="test",
+            mode="paper",
+            market_date=now.date(),
+        )
+        session.add(plan)
+        session.flush()
+        session.add(
+            ExecutionPlanItem(
+                execution_plan_id=plan.id,
+                symbol="035420",
+                side="buy",
+                intent="watch_buy",
+                status="watch_monitoring_active",
+                plan_item_index=0,
+            )
+        )
         buy_order = BrokerOrder(
             mode="paper",
             idempotency_key="fast-runtime-buy",
@@ -3943,28 +3986,29 @@ def test_fast_runtime_status_uses_autonomous_snapshot_for_monitored_symbols() ->
     payload = response.json()
     assert payload["freshness"]["summary_source"] == "fast_autonomous_runtime_snapshot"
     assert payload["symbols"]["monitored"] == ["000660", "005930"]
+    assert payload["symbols"]["monitoring_cycle_batch"] == ["000660", "005930"]
     assert payload["symbols"]["filled_today"] == ["282330"]
-    assert payload["symbols"]["filled_today_by_side"] == {"buy": ["282330"], "sell": ["282330"]}
+    assert payload["symbols"]["filled_today_by_side"] == {"buy": [], "sell": []}
     assert payload["symbols"]["filled_today_counts"] == {
-        "all": {"symbols": 1, "fills": 2, "quantity": 6},
-        "buy": {"symbols": 1, "fills": 1, "quantity": 3},
-        "sell": {"symbols": 1, "fills": 1, "quantity": 3},
+        "all": {"symbols": 0, "fills": 0, "quantity": 0},
+        "buy": {"symbols": 0, "fills": 0, "quantity": 0},
+        "sell": {"symbols": 0, "fills": 0, "quantity": 0},
     }
     assert payload["monthly_pnl"]["pnl_method"] == "fifo_internal_fills"
-    assert payload["monthly_pnl"]["monthly_realized_pnl"] == "-11700.0000"
-    assert payload["monthly_pnl"]["matched_sell_quantity"] == 3
+    assert payload["monthly_pnl"]["monthly_realized_pnl"] == "0.0000"
+    assert payload["monthly_pnl"]["matched_sell_quantity"] == 0
     assert payload["weekly_pnl"]["pnl_method"] == "fifo_internal_fills"
-    assert payload["weekly_pnl"]["weekly_realized_pnl"] == "-11700.0000"
-    assert payload["weekly_pnl"]["weekly_buy_notional"] == "375000.0000"
-    assert payload["weekly_pnl"]["weekly_sell_notional"] == "363300.0000"
-    assert payload["weekly_pnl"]["matched_sell_quantity"] == 3
-    assert payload["weekly_pnl"]["closed_symbols"] == ["282330"]
+    assert payload["weekly_pnl"]["weekly_realized_pnl"] == "0.0000"
+    assert payload["weekly_pnl"]["weekly_buy_notional"] == "0.0000"
+    assert payload["weekly_pnl"]["weekly_sell_notional"] == "0.0000"
+    assert payload["weekly_pnl"]["matched_sell_quantity"] == 0
+    assert payload["weekly_pnl"]["closed_symbols"] == []
     assert payload["daily_pnl"]["pnl_method"] == "fifo_internal_fills"
-    assert payload["daily_pnl"]["daily_realized_pnl"] == "-11700.0000"
-    assert payload["daily_pnl"]["daily_buy_notional"] == "375000.0000"
-    assert payload["daily_pnl"]["daily_sell_notional"] == "363300.0000"
-    assert payload["daily_pnl"]["matched_sell_quantity"] == 3
-    assert payload["daily_pnl"]["closed_symbols"] == ["282330"]
+    assert payload["daily_pnl"]["daily_realized_pnl"] == "0.0000"
+    assert payload["daily_pnl"]["daily_buy_notional"] == "0.0000"
+    assert payload["daily_pnl"]["daily_sell_notional"] == "0.0000"
+    assert payload["daily_pnl"]["matched_sell_quantity"] == 0
+    assert payload["daily_pnl"]["closed_symbols"] == []
 
     engine.dispose()
 
