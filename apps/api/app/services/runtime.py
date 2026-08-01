@@ -4,7 +4,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import String, case, cast, distinct, func, literal, or_, select
+from sqlalchemy import String, and_, case, cast, distinct, func, literal, or_, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -23,9 +23,13 @@ from app.models.runtime import (
 )
 from app.services.fill_idempotency import dedupe_execution_fills
 from app.services.monitoring import (
+    ACTIVE_WATCH_MONITORING_STATUSES,
+    BLOCKED_MONITORING_STATUSES,
     MONITORING_RUNTIME_TOPOLOGY,
     MONITORING_SELECTION_STRATEGY,
     PENDING_DISPATCH_MONITORING_STATUSES,
+    SELL_ACTIVE_MONITORING_STATUSES,
+    SELL_PENDING_CONFIG_STATUSES,
 )
 from app.services.trigger_time_exec_agent import (
     AGENT_APPROVED_PENDING_SUBMIT_STATUS,
@@ -59,8 +63,6 @@ WATCH_BUY_STATUSES = (
     "watch_buy_triggered",
     "watch_buy_triggered_blocked",
     "watch_buy_triggered_pending_dispatch",
-    "watch_buy_submitted",
-    "watch_buy_rejected",
     AGENT_PENDING_STATUS,
     AGENT_DELAY_STATUS,
     AGENT_APPROVED_PENDING_SUBMIT_STATUS,
@@ -133,6 +135,22 @@ def default_safety(settings: Settings, reason: str) -> dict[str, object]:
             "event_id": None,
         },
     }
+
+
+def fast_autonomous_safety(
+    *,
+    settings: Settings,
+    db: Session,
+) -> dict[str, object]:
+    try:
+        state = ensure_runtime_control_state(settings=settings, db=db)
+    except SQLAlchemyError as exc:
+        db.rollback()
+        return default_safety(
+            settings,
+            f"runtime state unavailable: {exc.__class__.__name__}; run migrations",
+        )
+    return runtime_safety_payload(state)
 
 
 def build_runtime_safety(
@@ -766,24 +784,11 @@ def runtime_symbol_summary(
         BrokerOrder.submitted_at,
         BrokerOrder.updated_at,
     )
-    monitored_symbols = db.scalars(
-        select(distinct(ExecutionPlanItem.symbol))
-        .join(ExecutionPlanItem.plan)
-        .where(
-            ExecutionPlan.mode == settings.runtime_mode,
-            or_(
-                ExecutionPlanItem.intent.in_(MONITORED_INTENTS),
-                ExecutionPlanItem.status.like("watch_%"),
-                ExecutionPlanItem.status.in_(
-                    (
-                        AGENT_PENDING_STATUS,
-                        AGENT_DELAY_STATUS,
-                        AGENT_APPROVED_PENDING_SUBMIT_STATUS,
-                    )
-                ),
-            ),
-        )
-    ).all()
+    monitored_symbols = runtime_monitored_symbols(
+        settings=settings,
+        db=db,
+        today_start_utc=today_start_utc,
+    )
     scheduled_today = db.scalars(
         select(distinct(ExecutionPlanItem.symbol))
         .select_from(ExecutionJob)
@@ -835,7 +840,7 @@ def runtime_symbol_summary(
     ).all()
 
     return {
-        "monitored": sorted(monitored_symbols),
+        "monitored": monitored_symbols,
         "scheduled_today": sorted(scheduled_today),
         "filled_today": sorted(filled_today),
         "filled_today_by_side": filled_summary["by_side"],
@@ -843,6 +848,51 @@ def runtime_symbol_summary(
         "failed_today": sorted(failed_today),
         "positions": sorted(position_symbols),
     }
+
+
+def runtime_monitored_symbols(
+    *,
+    settings: Settings,
+    db: Session,
+    today_start_utc: datetime | None = None,
+) -> list[str]:
+    if today_start_utc is None:
+        today_start_utc, _ = _current_krx_day_utc_bounds()
+    held_position_symbols = select(ExecutionPosition.symbol).where(
+        ExecutionPosition.mode == settings.runtime_mode,
+        ExecutionPosition.quantity > 0,
+    )
+    sell_monitoring_conditions = [
+        ExecutionPlanItem.side == "sell",
+        ExecutionPlanItem.intent.in_(SELL_MONITORED_INTENTS),
+        ExecutionPlanItem.status.in_(
+            tuple(
+                SELL_ACTIVE_MONITORING_STATUSES
+                | SELL_PENDING_CONFIG_STATUSES
+                | BLOCKED_MONITORING_STATUSES
+                | PENDING_DISPATCH_MONITORING_STATUSES
+            )
+        ),
+    ]
+    if settings.runtime_mode == "live":
+        sell_monitoring_conditions.append(ExecutionPlanItem.symbol.in_(held_position_symbols))
+    monitored_symbols = db.scalars(
+        select(distinct(ExecutionPlanItem.symbol))
+        .join(ExecutionPlanItem.plan)
+        .where(
+            ExecutionPlan.mode == settings.runtime_mode,
+            or_(
+                and_(*sell_monitoring_conditions),
+                and_(
+                    ExecutionPlanItem.side == "buy",
+                    ExecutionPlanItem.intent.in_(WATCH_BUY_INTENTS),
+                    ExecutionPlanItem.status.in_(tuple(ACTIVE_WATCH_MONITORING_STATUSES)),
+                    ExecutionPlan.accepted_at >= today_start_utc,
+                ),
+            ),
+        )
+    ).all()
+    return sorted(monitored_symbols)
 
 
 def runtime_filled_today_summary(
@@ -911,43 +961,6 @@ def runtime_filled_today_symbols(
         )
     ).all()
     return sorted(filled_today)
-
-
-def runtime_monitored_symbols(
-    *,
-    settings: Settings,
-    db: Session,
-) -> list[str]:
-    symbols = db.scalars(
-        select(distinct(ExecutionPlanItem.symbol))
-        .join(ExecutionPlanItem.plan)
-        .where(
-            ExecutionPlan.mode == settings.runtime_mode,
-            or_(
-                (
-                    ExecutionPlanItem.intent.in_(SELL_MONITORED_INTENTS)
-                    & (
-                        ExecutionPlanItem.status.endswith("_monitoring")
-                        | ExecutionPlanItem.status.endswith("_pending_dispatch")
-                        | ExecutionPlanItem.status.endswith("_triggered_blocked")
-                        | ExecutionPlanItem.status.in_(
-                            (
-                                AGENT_PENDING_STATUS,
-                                AGENT_DELAY_STATUS,
-                                AGENT_APPROVED_PENDING_SUBMIT_STATUS,
-                            )
-                        )
-                    )
-                ),
-                (
-                    ExecutionPlanItem.intent.in_(WATCH_BUY_INTENTS)
-                    & ExecutionPlanItem.status.in_(WATCH_BUY_STATUSES)
-                ),
-            ),
-        )
-        .order_by(ExecutionPlanItem.symbol.asc())
-    ).all()
-    return list(symbols)
 
 
 def _current_krx_day_utc_bounds(now: datetime | None = None) -> tuple[datetime, datetime]:
@@ -1327,6 +1340,60 @@ def build_runtime_status(
     }
     counts_available = True
 
+    if settings.autonomous_runtime_enabled and not include_expensive_sections:
+        cached_symbols = _autonomous_runtime_snapshot_symbol_summary(autonomous=autonomous)
+        cycle_symbols = _autonomous_runtime_snapshot_symbols(autonomous=autonomous) or _autonomous_monitoring_symbols(
+            autonomous=autonomous
+        )
+        symbols = {
+            **symbols,
+            **cached_symbols,
+            "monitored": cycle_symbols,
+            "monitoring_cycle_batch": cycle_symbols,
+        }
+        freshness["summary_source"] = "fast_autonomous_runtime_snapshot"
+        monitoring_reasons = _monitoring_price_source_readiness_reasons(
+            autonomous=autonomous,
+            symbols=symbols,
+        )
+        if monitoring_reasons:
+            monitoring["status"] = "degraded"
+        safety = fast_autonomous_safety(settings=settings, db=db)
+        readiness = readiness_payload(
+            dependencies_ok=True,
+            safety=safety,
+            counts_available=counts_available,
+            extra_reasons=monitoring_reasons,
+        )
+        return {
+            "service": settings.service_name,
+            "environment": settings.environment,
+            "mode": safety["mode"],
+            "ready": readiness["ready"],
+            "readiness": readiness,
+            "safety": safety,
+            "dependencies": dependencies,
+            "diagnostics": diagnostics,
+            "liveness": {
+                **liveness_payload(runtime),
+                "autonomous": autonomous,
+                "monitoring": monitoring,
+            },
+            "broker": broker,
+            "broker_providers": broker_providers,
+            "counts": counts,
+            "symbols": symbols,
+            "freshness": freshness,
+            "actionable_alerts": runtime_actionable_alerts_payload(
+                monitoring=monitoring,
+                freshness=freshness,
+            ),
+            "monthly_pnl": _default_monthly_pnl_payload(settings=settings),
+            "weekly_pnl": _default_weekly_pnl_payload(),
+            "daily_pnl": _default_daily_pnl_payload(),
+            "account_drawdown_gate": account_drawdown_gate,
+        }
+
     try:
         ping_database(db)
     except SQLAlchemyError as exc:
@@ -1444,16 +1511,13 @@ def build_runtime_status(
             symbols = {
                 **symbols,
                 **cached_symbols,
-                "monitored": _autonomous_monitoring_symbols(autonomous=autonomous),
+                "monitored": runtime_monitored_symbols(settings=settings, db=db),
+                "monitoring_cycle_batch": _autonomous_monitoring_symbols(autonomous=autonomous),
             }
             freshness["summary_source"] = "fast_autonomous_runtime_snapshot"
-            freshness["broker_orders"]["fill_quality"] = broker_order_fill_quality_payload(
-                settings=settings,
-                db=db,
-            )
-            monthly_pnl = monthly_pnl_payload(settings=settings, db=db)
-            weekly_pnl = weekly_pnl_payload(settings=settings, db=db)
-            daily_pnl = daily_pnl_payload(settings=settings, db=db)
+            monthly_pnl = _default_monthly_pnl_payload(settings=settings)
+            weekly_pnl = _default_weekly_pnl_payload()
+            daily_pnl = _default_daily_pnl_payload()
         else:
             freshness["summary_source"] = "fast_runtime_status"
             monthly_pnl = monthly_pnl_payload(settings=settings, db=db)
@@ -2170,6 +2234,19 @@ def _autonomous_monitoring_symbols(*, autonomous: dict[str, object]) -> list[str
     if not isinstance(last_cycle, dict):
         return []
     symbols = last_cycle.get("monitored_symbols")
+    if not isinstance(symbols, list):
+        return []
+    return sorted({str(symbol) for symbol in symbols if str(symbol).strip()})
+
+
+def _autonomous_runtime_snapshot_symbols(*, autonomous: dict[str, object]) -> list[str]:
+    monitoring = autonomous.get("monitoring")
+    if not isinstance(monitoring, dict):
+        return []
+    runtime_snapshot = monitoring.get("runtime_snapshot")
+    if not isinstance(runtime_snapshot, dict):
+        return []
+    symbols = runtime_snapshot.get("symbols")
     if not isinstance(symbols, list):
         return []
     return sorted({str(symbol) for symbol in symbols if str(symbol).strip()})

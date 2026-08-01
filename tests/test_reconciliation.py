@@ -1425,7 +1425,7 @@ def test_runtime_status_reports_pnl_fill_quality_alerts() -> None:
     engine.dispose()
 
 
-def test_fast_autonomous_runtime_status_reports_fill_quality_alerts() -> None:
+def test_fast_autonomous_runtime_status_skips_fill_quality_alerts() -> None:
     settings = Settings(
         database_url="sqlite:///:memory:",
         runtime_mode="paper",
@@ -1455,10 +1455,9 @@ def test_fast_autonomous_runtime_status_reports_fill_quality_alerts() -> None:
         include_expensive_sections=False,
     )
 
-    fill_quality = payload["freshness"]["broker_orders"]["fill_quality"]
-    assert fill_quality["missing_filled_order_fill_count"] == 1
+    assert "fill_quality" not in payload["freshness"]["broker_orders"]
     alerts_by_kind = {alert["kind"]: alert for alert in payload["actionable_alerts"]["alerts"]}
-    assert alerts_by_kind["filled_broker_orders_missing_execution_fills"]["symbols"] == ["105560"]
+    assert "filled_broker_orders_missing_execution_fills" not in alerts_by_kind
     engine.dispose()
 
 

@@ -9,7 +9,7 @@ import tempfile
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, time
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -2123,9 +2123,12 @@ def _positive_int(value: object) -> int | None:
     if isinstance(value, bool):
         return None
     try:
-        parsed = int(value)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
+        decimal_value = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
         return None
+    if decimal_value <= 0 or decimal_value != decimal_value.to_integral_value():
+        return None
+    parsed = int(decimal_value)
     return parsed if parsed > 0 else None
 
 

@@ -39,6 +39,7 @@ from app.services.watch_exec_agent_sizing import (
     _candidate_universe_payload,
     _chunks,
     _decision_record,
+    _quantity_is_shares,
     _sizing_request_payload,
     run_due_watch_exec_agent_sizing,
 )
@@ -122,6 +123,10 @@ def _watch_item(
         quantity_policy={"type": "exec_agent_sized", "budget_krw": "1500000"},
         risk_context=risk_context,
     )
+
+
+def test_watch_sizing_treats_decimal_string_share_quantity_as_sized() -> None:
+    assert _quantity_is_shares({"kind": "shares", "quantity": "24.00000000"})
 
 
 def _stale_local_order(*, symbol: str = "005930", broker_order_id: str = "stale-open-1") -> BrokerOrder:

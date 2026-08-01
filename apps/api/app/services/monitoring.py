@@ -550,11 +550,12 @@ def list_autonomous_monitoring_symbols(
     db: Session,
     current_market_date: date | None = None,
 ) -> list[str]:
+    resolved_market_date = current_market_date or datetime.now(KRX_TIMEZONE).date()
     if settings.monitoring_expire_prior_market_watch_buys_enabled:
         expired_count = expire_prior_market_date_unfilled_watch_buys(
             settings=settings,
             db=db,
-            current_market_date=current_market_date or datetime.now(KRX_TIMEZONE).date(),
+            current_market_date=resolved_market_date,
         )
         if expired_count:
             db.commit()
@@ -570,6 +571,15 @@ def list_autonomous_monitoring_symbols(
         ).all()
     )
     mode_plan_ids = select(ExecutionPlan.id).where(ExecutionPlan.mode == settings.runtime_mode)
+    fresh_position_truth_after = datetime.now(UTC) - timedelta(
+        seconds=settings.exec_agent_max_account_snapshot_age_seconds
+    )
+    fresh_known_flat_symbols = select(ExecutionPosition.symbol).where(
+        ExecutionPosition.mode == settings.runtime_mode,
+        ExecutionPosition.quantity <= 0,
+        ExecutionPosition.last_reconciled_at.is_not(None),
+        ExecutionPosition.last_reconciled_at >= fresh_position_truth_after,
+    )
     symbol_candidates: list[str] = []
 
     def append_candidates(rows: list[str]) -> None:
@@ -619,11 +629,17 @@ def list_autonomous_monitoring_symbols(
             list(
                 db.scalars(
                     select(distinct(ExecutionPlanItem.symbol))
+                    .join(ExecutionPlanItem.plan)
                     .where(
-                        ExecutionPlanItem.execution_plan_id.in_(mode_plan_ids),
+                        ExecutionPlan.mode == settings.runtime_mode,
                         ExecutionPlanItem.side == "buy",
                         ExecutionPlanItem.intent.in_(tuple(WATCH_BUY_INTENTS)),
                         ExecutionPlanItem.status.in_(tuple(ACTIVE_WATCH_MONITORING_STATUSES)),
+                        ExecutionPlan.accepted_at >= datetime.combine(
+                            resolved_market_date,
+                            datetime.min.time(),
+                            tzinfo=KRX_TIMEZONE,
+                        ),
                     )
                     .order_by(ExecutionPlanItem.symbol.asc())
                     .limit(settings.monitoring_max_symbols_per_cycle - len(symbol_candidates))
@@ -635,12 +651,13 @@ def list_autonomous_monitoring_symbols(
         pending_sell_symbols = list(
             db.scalars(
                 select(distinct(ExecutionPlanItem.symbol))
-                .where(
-                    ExecutionPlanItem.execution_plan_id.in_(mode_plan_ids),
-                    ExecutionPlanItem.side == "sell",
-                    ExecutionPlanItem.intent.in_(tuple(SELL_MONITORED_INTENTS)),
-                    ExecutionPlanItem.status.in_(tuple(SELL_PENDING_CONFIG_STATUSES)),
-                )
+                    .where(
+                        ExecutionPlanItem.execution_plan_id.in_(mode_plan_ids),
+                        ExecutionPlanItem.side == "sell",
+                        ExecutionPlanItem.intent.in_(tuple(SELL_MONITORED_INTENTS)),
+                        ExecutionPlanItem.status.in_(tuple(SELL_PENDING_CONFIG_STATUSES)),
+                        ExecutionPlanItem.symbol.not_in(fresh_known_flat_symbols),
+                    )
                 .order_by(ExecutionPlanItem.symbol.asc())
                 .limit(settings.monitoring_max_symbols_per_cycle * 4)
             ).all()
@@ -1252,6 +1269,22 @@ def _evaluate_monitoring_cycle(
         if retry_persisted_trigger:
             retried_triggered_item_count += 1
             retried_triggered_symbols.add(item.symbol)
+
+        if item.status == AGENT_PENDING_STATUS and _trigger_time_agent_pending_is_stale(
+            settings=settings,
+            item=item,
+            now=triggered_at,
+        ):
+            item.status = _monitoring_status(item.intent)
+            _record_monitoring_event(
+                item=item,
+                event={
+                    "event": "trigger_time_exec_agent_pending_recovered",
+                    "reason": "trigger_time_exec_agent_pending_timeout",
+                    "message": "stale trigger-time exec-agent pending state was returned to monitoring",
+                    "recorded_at": triggered_at.isoformat(),
+                },
+            )
 
         if item.status in AGENT_ACTIVE_STATUSES:
             blocked_item_count += 1
@@ -1917,7 +1950,6 @@ def _resolve_trigger_time_agent_action(
 ) -> TriggerTimeAgentActionResult:
     item = action.item
     previous_status = item.status
-    item.status = AGENT_PENDING_STATUS
     _record_monitoring_event(
         item=item,
         event={
@@ -1927,7 +1959,6 @@ def _resolve_trigger_time_agent_action(
             "recorded_at": triggered_at.isoformat(),
         },
     )
-    db.commit()
 
     resolution = trigger_time_exec_agent.resolve_trigger_time_exec_agent_decision(
         settings=settings,
@@ -3511,6 +3542,29 @@ def _trigger_time_agent_delay_until(
     return recorded_at + timedelta(
         seconds=settings.monitoring_watch_buy_retry_cooldown_seconds
     )
+
+
+def _trigger_time_agent_pending_is_stale(
+    *,
+    settings: Settings,
+    item: ExecutionPlanItem,
+    now: datetime,
+) -> bool:
+    if item.status != AGENT_PENDING_STATUS:
+        return False
+    risk_context = item.risk_context if isinstance(item.risk_context, dict) else {}
+    latest_event = risk_context.get("last_monitoring_event")
+    recorded_at = None
+    if isinstance(latest_event, dict) and latest_event.get("event") == "trigger_time_exec_agent_pending":
+        recorded_at = _parse_event_datetime(latest_event.get("recorded_at"))
+    if recorded_at is None:
+        interaction = risk_context.get("last_trigger_time_exec_agent_interaction")
+        if isinstance(interaction, dict):
+            recorded_at = _parse_event_datetime(interaction.get("recorded_at"))
+    if recorded_at is None:
+        return True
+    timeout_seconds = int(getattr(settings, "exec_agent_trigger_time_timeout_seconds", 90))
+    return now >= recorded_at + timedelta(seconds=timeout_seconds)
 
 
 def _latest_monitoring_event(item: ExecutionPlanItem) -> dict[str, object] | None:
@@ -6028,9 +6082,13 @@ def _parse_positive_int(value: object) -> int | None:
         return None
     if isinstance(value, int) and value > 0:
         return value
-    if isinstance(value, str) and value.isdigit() and int(value) > 0:
-        return int(value)
-    return None
+    try:
+        parsed = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
+    if parsed <= 0 or parsed != parsed.to_integral_value():
+        return None
+    return int(parsed)
 
 
 def _parse_fraction(value: object) -> Decimal | None:

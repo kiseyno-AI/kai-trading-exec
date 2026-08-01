@@ -123,6 +123,7 @@ class MonitoringRuntimeSnapshot:
     def snapshot(self) -> dict[str, object]:
         return {
             "loaded_at": _serialize_datetime(self.loaded_at),
+            "symbols": list(self.symbols),
             "symbol_count": len(self.symbols),
             "item_count": len(self.items),
             "position_count": len(self.positions_by_symbol),
@@ -149,6 +150,7 @@ class AutonomousRuntimeCoordinator:
     _monitoring_runtime_snapshot: MonitoringRuntimeSnapshot | None = field(default=None, init=False)
     _monitoring_snapshot_last_reconciled_at: datetime | None = field(default=None, init=False)
     _monitoring_cycle_mutex: threading.Lock = field(default_factory=threading.Lock, init=False)
+    _monitoring_cycle_mutex_started_at: datetime | None = field(default=None, init=False)
 
     def __post_init__(self) -> None:
         self._dispatch_state = AutonomousWorkerState(
@@ -355,25 +357,22 @@ class AutonomousRuntimeCoordinator:
             error=timeout_error,
         )
 
-        try:
-            await asyncio.shield(task)
-        except asyncio.CancelledError:
-            task.cancel()
-            raise
-        except Exception as exc:
-            LOGGER.exception(
-                "autonomous_runtime_cycle_failed_after_timeout",
-                extra={
-                    "worker_name": self._state_for(worker_key).worker_name,
-                    "runtime_mode": self.settings.runtime_mode,
-                    "timeout_seconds": timeout_seconds,
-                },
-            )
-            self._mark_cycle_failed(
-                worker_key=worker_key,
-                heartbeat_at=datetime.now(UTC),
-                error=str(exc),
-            )
+        def _log_late_failure(done_task: asyncio.Future) -> None:
+            try:
+                done_task.result()
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                LOGGER.exception(
+                    "autonomous_runtime_cycle_failed_after_timeout",
+                    extra={
+                        "worker_name": self._state_for(worker_key).worker_name,
+                        "runtime_mode": self.settings.runtime_mode,
+                        "timeout_seconds": timeout_seconds,
+                    },
+                )
+
+        task.add_done_callback(_log_late_failure)
         return None
 
     async def _run_dispatch_cycle(self, started_at: datetime) -> dict[str, object]:
@@ -405,20 +404,37 @@ class AutonomousRuntimeCoordinator:
         return await asyncio.to_thread(self._monitoring_cycle_sync_guarded, started_at)
 
     def _monitoring_cycle_sync_guarded(self, started_at: datetime) -> dict[str, object]:
-        if not self._monitoring_cycle_mutex.acquire(blocking=False):
+        acquired_lock = self._monitoring_cycle_mutex
+        if not acquired_lock.acquire(blocking=False):
+            stale_age_seconds: float | None = None
+            if self._monitoring_cycle_mutex_started_at is not None:
+                stale_age_seconds = (started_at - self._monitoring_cycle_mutex_started_at).total_seconds()
+            if stale_age_seconds is not None and stale_age_seconds > self.settings.monitoring_cycle_timeout_seconds:
+                LOGGER.error(
+                    "monitoring_cycle_still_running_after_timeout",
+                    extra={
+                        "worker_name": MONITORING_LOOP_WORKER_NAME,
+                        "runtime_mode": self.settings.runtime_mode,
+                        "stale_age_seconds": stale_age_seconds,
+                        "timeout_seconds": self.settings.monitoring_cycle_timeout_seconds,
+                    },
+                )
             payload = {
                 "status_code": 202,
                 "skipped": True,
                 "reason": "previous_monitoring_cycle_still_running",
+                "stale_age_seconds": stale_age_seconds,
                 "price_source_configured": self._monitoring_price_source_state.configured,
                 "price_source": self._monitoring_price_source_state.snapshot(),
             }
             self._store_cycle_payload(worker_key="monitoring", payload=payload)
             return payload
+        self._monitoring_cycle_mutex_started_at = started_at
         try:
             return self._monitoring_cycle_sync(started_at)
         finally:
-            self._monitoring_cycle_mutex.release()
+            self._monitoring_cycle_mutex_started_at = None
+            acquired_lock.release()
 
     async def _run_watch_exec_agent_sizing_cycle(self, started_at: datetime) -> dict[str, object]:
         return await asyncio.to_thread(self._watch_exec_agent_sizing_cycle_sync, started_at)
