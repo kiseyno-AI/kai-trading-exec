@@ -360,7 +360,8 @@ def test_stale_open_order_unknown_broker_status_blocks_watch_sizing_before_agent
     assert result.payload["applied"][0]["stale_state_blocked_item_ids"] == ["watch-item-stale"]
     assert item.status == "exec_agent_rejected"
     assert item.quantity_policy["exec_agent_decision"]["reason_code"] == "stale_order_broker_truth_unconfirmed"
-    assert item.quantity_policy["stale_state_blockers"][0]["classification"] == "unknown"
+    assert item.quantity_policy["stale_state_blockers"][0]["classification"] == "stale-terminal-unknown"
+    assert order.status == "stale_terminal_unknown"
     assert order.last_error_classification == "unknown_status"
     assert unknown_event.payload["raw_status_details"] == {
         "status": "mystery_status",
@@ -441,7 +442,7 @@ def test_stale_open_order_block_survives_account_snapshot_failure(tmp_path, monk
     assert broker.events.index("reconcile") < broker.events.index("snapshot")
     assert result.payload["applied"][0]["stale_state_blocked_item_ids"] == ["watch-item-snapshot-fail"]
     assert item.status == "exec_agent_rejected"
-    assert item.quantity_policy["stale_state_blockers"][0]["classification"] == "unknown"
+    assert item.quantity_policy["stale_state_blockers"][0]["classification"] == "stale-terminal-unknown"
     assert audit is not None
     engine.dispose()
 

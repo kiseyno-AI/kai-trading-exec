@@ -19,7 +19,11 @@ from app.models.runtime import BrokerOrder, BrokerOrderEvent, ExecutionFill, Exe
 from app.services.broker_auth import ensure_authenticated_broker_session
 from app.services.fill_idempotency import execution_fill_dedupe_key, execution_fill_idempotency_key
 from app.services.rejected_order_retries import handle_reconciled_rejected_order
-from app.services.runtime_transitions import apply_broker_order_status, set_plan_item_status
+from app.services.runtime_transitions import (
+    apply_broker_order_status,
+    plan_item_status_for_broker_order_status,
+    set_plan_item_status,
+)
 
 
 def reconcile_broker_orders(
@@ -272,6 +276,7 @@ def reconcile_stale_nonterminal_broker_orders(
     adapter: BrokerAdapter,
     older_than_seconds: int | None = None,
     symbols: set[str] | None = None,
+    dry_run: bool = False,
 ) -> dict[str, object]:
     threshold_seconds = (
         older_than_seconds
@@ -294,40 +299,110 @@ def reconcile_stale_nonterminal_broker_orders(
         "cancelled": 0,
         "unknown": 0,
         "failed_to_reconcile": 0,
+        "manual_review_required": 0,
+        "reconcile_window_expired": 0,
+        "stale_terminal_unknown": 0,
     }
+    repaired_count = 0
     items: list[dict[str, object]] = []
     position_sync_symbols: set[str] = set()
     for order in orders:
         classification_observed_at = _observation_time()
+        status_before = order.status
+        error_code_before = order.last_error_code
+        error_classification_before = order.last_error_classification
         reason: str | None = None
         result: dict[str, object] | None = None
         if not order.broker_order_id:
             classification = "failed_to_reconcile"
             reason = "missing_broker_order_id"
-            order.last_error_classification = "missing_broker_order_id"
-            order.last_error_message = "stale nonterminal order has no broker_order_id"
-            order.last_error_retryable = False
-            order.last_broker_sync_at = classification_observed_at
-            _record_stale_order_classification_event(
-                db=db,
-                order=order,
-                classification=classification,
-                reason=reason,
-                observed_at=classification_observed_at,
-                result=None,
-            )
+            if not dry_run:
+                order.last_error_classification = "missing_broker_order_id"
+                order.last_error_message = "stale nonterminal order has no broker_order_id"
+                order.last_error_retryable = False
+                order.last_broker_sync_at = classification_observed_at
         else:
-            result = reconcile_broker_order(
-                settings=settings,
-                db=db,
-                adapter=adapter,
-                order=order,
-            )
+            if dry_run:
+                result = _stale_order_dry_run_result(order=order)
+            else:
+                result = reconcile_broker_order(
+                    settings=settings,
+                    db=db,
+                    adapter=adapter,
+                    order=order,
+                )
             classification, reason = _stale_order_reconciliation_classification(
                 status=str(result.get("status") or order.status),
                 status_code=int(result.get("status_code") or 200),
                 message=result.get("message"),
             )
+            if int(result.get("fills_added") or 0) > 0 or str(result.get("status") or "") == "filled":
+                position_sync_symbols.add(order.symbol)
+
+        repair = _stale_order_repair_decision(
+            order=order,
+            status_before=status_before,
+            classification=classification,
+            reason=reason,
+            result=result,
+            error_code_before=error_code_before,
+            error_classification_before=error_classification_before,
+        )
+        if repair is not None:
+            repaired_count += 1
+            classification, reason = repair["classification"], repair["reason"]
+            if not dry_run:
+                apply_broker_order_status(order=order, status=repair["status_after"])
+                order.last_error_retryable = False
+                if repair["status_after"] == NormalizedBrokerOrderStatus.MANUAL_REVIEW_REQUIRED.value:
+                    order.last_error_classification = "missing_broker_order_id"
+                    order.last_error_message = "stale nonterminal order has no broker_order_id"
+                if order.plan_item is not None:
+                    plan_status = _order_status_to_plan_item_status(order.status)
+                    if plan_status is not None:
+                        set_plan_item_status(
+                            db=db,
+                            plan_item=order.plan_item,
+                            status=plan_status,
+                            source="reconciliation",
+                            reason=repair["reason"],
+                            payload={
+                                "broker_order_pk": order.id,
+                                "broker_order_id": order.broker_order_id,
+                                "idempotency_key": order.idempotency_key,
+                                "status_before": status_before,
+                                "status": order.status,
+                                "classification": repair["classification"],
+                            },
+                            occurred_at=classification_observed_at,
+                        )
+                _record_stale_order_repair_event(
+                    db=db,
+                    order=order,
+                    status_before=status_before,
+                    status_after=repair["status_after"],
+                    classification=repair["classification"],
+                    reason=repair["reason"],
+                    observed_broker_code=repair["observed_broker_code"],
+                    observed_at=classification_observed_at,
+                    result=result,
+                )
+        elif not dry_run and _is_nonactionable_stale_result(order.status):
+            if order.status != status_before:
+                repaired_count += 1
+            _record_stale_order_repair_event(
+                db=db,
+                order=order,
+                status_before=status_before,
+                status_after=order.status,
+                classification=classification,
+                reason=reason or "terminal_broker_status",
+                observed_broker_code=order.last_error_code,
+                observed_at=classification_observed_at,
+                result=result,
+            )
+
+        if not dry_run:
             _record_stale_order_classification_event(
                 db=db,
                 order=order,
@@ -336,9 +411,6 @@ def reconcile_stale_nonterminal_broker_orders(
                 observed_at=_observation_time(),
                 result=result,
             )
-            if int(result.get("fills_added") or 0) > 0 or str(result.get("status") or "") == "filled":
-                position_sync_symbols.add(order.symbol)
-
         counts[classification] += 1
         items.append(
             {
@@ -347,34 +419,48 @@ def reconcile_stale_nonterminal_broker_orders(
                 "idempotency_key": order.idempotency_key,
                 "symbol": order.symbol,
                 "side": order.side,
-                "status": order.status,
+                "status": status_before if dry_run else order.status,
+                "status_before": status_before,
+                "status_after": repair["status_after"] if repair is not None else order.status,
                 "classification": classification.replace("_", "-"),
                 "reason": reason,
+                "repair_action": "would_repair" if dry_run and repair is not None else "repaired" if repair is not None else "none",
+                "observed_broker_code": (
+                    repair["observed_broker_code"]
+                    if repair is not None
+                    else order.last_error_code
+                ),
                 "last_broker_sync_at": _serialize_datetime(order.last_broker_sync_at),
                 "result": result,
             }
         )
 
     position_sync_result = None
-    if position_sync_symbols:
+    if position_sync_symbols and not dry_run:
         position_sync_result = sync_execution_positions_from_broker_snapshot(
             settings=settings,
             db=db,
             adapter=adapter,
             symbols=position_sync_symbols,
         )
-    else:
+    elif not dry_run:
         db.commit()
     return {
+        "dry_run": dry_run,
         "candidate_order_count": len(orders),
         "threshold_seconds": threshold_seconds,
         "stale_before": cutoff.isoformat(),
+        "repaired_order_count": 0 if dry_run else repaired_count,
+        "would_repair_order_count": repaired_count if dry_run else 0,
         "counts": {
             "live": counts["live"],
             "closed": counts["closed"],
             "cancelled": counts["cancelled"],
             "unknown": counts["unknown"],
             "failed-to-reconcile": counts["failed_to_reconcile"],
+            "manual-review-required": counts.get("manual_review_required", 0),
+            "reconcile-window-expired": counts.get("reconcile_window_expired", 0),
+            "stale-terminal-unknown": counts.get("stale_terminal_unknown", 0),
         },
         "position_sync": position_sync_result
         or {
@@ -448,7 +534,126 @@ def _stale_order_reconciliation_classification(
         return "closed", None
     if normalized == NormalizedBrokerOrderStatus.RETRY_PENDING.value:
         return "failed_to_reconcile", "local_retry_pending_not_broker_live_state"
+    if normalized == NormalizedBrokerOrderStatus.MANUAL_REVIEW_REQUIRED.value:
+        return "manual_review_required", "manual_review_required"
+    if normalized == NormalizedBrokerOrderStatus.RECONCILE_WINDOW_EXPIRED.value:
+        return "reconcile_window_expired", "broker_lookup_window_expired"
+    if normalized == NormalizedBrokerOrderStatus.STALE_TERMINAL_UNKNOWN.value:
+        return "stale_terminal_unknown", "repeated_unknown_status_after_stale_threshold"
     return "unknown", _optional_str(message)
+
+
+def _stale_order_dry_run_result(*, order: BrokerOrder) -> dict[str, object]:
+    return {
+        "status_code": 200,
+        "broker_order_id": order.broker_order_id,
+        "status": order.status,
+        "status_before": order.status,
+        "status_changed": False,
+        "fills_added": 0,
+        "filled_delta": 0,
+        "message": order.last_error_message,
+    }
+
+
+def _stale_order_repair_decision(
+    *,
+    order: BrokerOrder,
+    status_before: str,
+    classification: str,
+    reason: str | None,
+    result: dict[str, object] | None,
+    error_code_before: str | None,
+    error_classification_before: str | None,
+) -> dict[str, str] | None:
+    if status_before not in _reconcilable_order_statuses():
+        return None
+    observed_broker_code = order.last_error_code or error_code_before
+    observed_classification = order.last_error_classification or error_classification_before
+    if not order.broker_order_id:
+        return {
+            "status_after": NormalizedBrokerOrderStatus.MANUAL_REVIEW_REQUIRED.value,
+            "classification": "manual_review_required",
+            "reason": "missing_broker_order_id",
+            "observed_broker_code": observed_broker_code or "missing_broker_order_id",
+        }
+    if _is_lookup_window_expired_evidence(
+        code=observed_broker_code,
+        message=order.last_error_message or _optional_str((result or {}).get("message")),
+    ):
+        return {
+            "status_after": NormalizedBrokerOrderStatus.RECONCILE_WINDOW_EXPIRED.value,
+            "classification": "reconcile_window_expired",
+            "reason": "broker_lookup_window_expired",
+            "observed_broker_code": observed_broker_code or "lookup_window_expired",
+        }
+    if (
+        observed_classification == "unknown_status"
+        or str((result or {}).get("status") or "").strip().lower() == "unknown"
+        or classification == "unknown"
+    ):
+        return {
+            "status_after": NormalizedBrokerOrderStatus.STALE_TERMINAL_UNKNOWN.value,
+            "classification": "stale_terminal_unknown",
+            "reason": "repeated_unknown_status_after_stale_threshold",
+            "observed_broker_code": observed_broker_code or "unknown",
+        }
+    return None
+
+
+def _is_lookup_window_expired_evidence(*, code: str | None, message: str | None) -> bool:
+    normalized_code = (code or "").strip().upper()
+    if normalized_code == "KIER2570":
+        return True
+    normalized_message = (message or "").strip()
+    return "조회일자를 확인하십시오" in normalized_message
+
+
+def _is_nonactionable_stale_result(status: str) -> bool:
+    return status in {
+        NormalizedBrokerOrderStatus.CANCELED.value,
+        NormalizedBrokerOrderStatus.FILLED.value,
+        NormalizedBrokerOrderStatus.REJECTED.value,
+        NormalizedBrokerOrderStatus.FAILED.value,
+        NormalizedBrokerOrderStatus.EXPIRED.value,
+    }
+
+
+def _record_stale_order_repair_event(
+    *,
+    db: Session,
+    order: BrokerOrder,
+    status_before: str,
+    status_after: str,
+    classification: str,
+    reason: str | None,
+    observed_broker_code: str | None,
+    observed_at: datetime,
+    result: dict[str, object] | None,
+) -> None:
+    db.add(
+        BrokerOrderEvent(
+            broker_order_pk=order.id,
+            event_type="stale_order_repair",
+            event_source=BrokerEventSource.RECONCILIATION.value,
+            normalized_status=status_after,
+            broker_status=observed_broker_code,
+            error_classification=classification,
+            retryable=False,
+            message=reason,
+            payload={
+                "status_before": status_before,
+                "status_after": status_after,
+                "observed_broker_code": observed_broker_code,
+                "classification": classification,
+                "reason": reason,
+                "broker_order_id": order.broker_order_id,
+                "idempotency_key": order.idempotency_key,
+                "result": _json_safe_value(result) if result is not None else None,
+            },
+            observed_at=observed_at,
+        )
+    )
 
 
 def _record_stale_order_classification_event(
@@ -1191,29 +1396,16 @@ def _merge_reconcile_request_metadata(
 
 
 def _order_status_to_plan_item_status(order_status: str) -> str | None:
-    if order_status == NormalizedBrokerOrderStatus.SUBMISSION_PENDING.value:
-        return "broker_order_submission_pending"
-    if order_status == NormalizedBrokerOrderStatus.SUBMITTED.value:
-        return "broker_order_submitted"
-    if order_status == NormalizedBrokerOrderStatus.OPEN.value:
-        return "open"
-    if order_status == NormalizedBrokerOrderStatus.PARTIALLY_FILLED.value:
-        return "partially_filled"
-    if order_status == NormalizedBrokerOrderStatus.FILLED.value:
-        return "filled"
     if order_status == NormalizedBrokerOrderStatus.CANCEL_PENDING.value:
         return "cancel_pending"
     if order_status == NormalizedBrokerOrderStatus.CANCELED.value:
         return "canceled"
     if order_status == NormalizedBrokerOrderStatus.EXPIRED.value:
         return "expired"
-    if order_status == NormalizedBrokerOrderStatus.RETRY_PENDING.value:
-        return "broker_order_retry_pending"
-    if order_status == NormalizedBrokerOrderStatus.REJECTED.value:
-        return "broker_order_rejected"
-    if order_status == NormalizedBrokerOrderStatus.FAILED.value:
-        return "broker_order_failed"
-    return None
+    try:
+        return plan_item_status_for_broker_order_status(order_status)
+    except ValueError:
+        return None
 
 
 def _parse_decimal(value: object) -> Decimal | None:

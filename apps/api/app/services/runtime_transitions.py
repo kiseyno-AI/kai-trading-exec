@@ -72,6 +72,9 @@ BROKER_ORDER_TO_PLAN_ITEM_STATUS = {
     NormalizedBrokerOrderStatus.RETRY_PENDING.value: "broker_order_retry_pending",
     NormalizedBrokerOrderStatus.FAILED.value: "broker_order_failed",
     NormalizedBrokerOrderStatus.EXPIRED.value: "broker_order_failed",
+    NormalizedBrokerOrderStatus.RECONCILE_WINDOW_EXPIRED.value: "broker_order_failed",
+    NormalizedBrokerOrderStatus.STALE_TERMINAL_UNKNOWN.value: "broker_order_failed",
+    NormalizedBrokerOrderStatus.MANUAL_REVIEW_REQUIRED.value: "broker_order_failed",
 }
 
 
