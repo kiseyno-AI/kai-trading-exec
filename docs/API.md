@@ -227,6 +227,31 @@ The initial migration creates the exec-owned runtime tables only:
 These tables are owned by `kai-trading-exec`; strategy generation and dashboard
 read models remain outside this repository boundary.
 
+## Weekly Review Evidence
+
+Saturday/weekly review cron should export bounded local evidence with:
+
+```bash
+python3 scripts/export_weekly_trade_review.py \
+  --runtime-mode paper \
+  --start-at 2026-07-25T00:00:00Z \
+  --end-at 2026-08-01T00:00:00Z
+```
+
+This path is read-only: it does not place, cancel, amend, reconcile, or call
+broker APIs. It writes JSON artifacts under
+`var/analytics/weekly_trade_review/` by default and updates `latest.json`.
+The default query shape starts with `execution_fills.filled_at` for the bounded
+date range, then loads linked `broker_orders` and `broker_order_events` by the
+weekly fill `broker_order_pk` set. It also includes weekly
+`execution_failures`, active/stale broker-order summaries, plan-item
+status aggregates, and monitoring checkpoint state. Deferred JSON payload
+columns are omitted unless `--include-json-payloads` is explicitly supplied.
+
+This keeps weekly evidence generation separate from
+`trade_outcome_feedback`, which performs broader analytics and may load
+historical state that is inappropriate for a large SQLite cron review.
+
 ## Runtime State Transitions
 
 Execution lifecycle status changes are centralized in

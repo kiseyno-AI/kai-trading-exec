@@ -274,6 +274,25 @@ When enabled, the latest compact lesson snippet is included in watch-buy sizing
 and trigger-time exec-agent request payloads so recent loss patterns can
 downsize, delay, or reject similar setups.
 
+Weekly trade-review evidence should use the lightweight bounded exporter, not
+the broader trade outcome feedback generator. The exporter reads indexed date
+ranges from exec-owned runtime tables, starts from weekly fills before loading
+linked broker orders/events, omits deferred JSON payload columns by default,
+and does not call broker APIs or mutate order state:
+
+```bash
+python3 scripts/export_weekly_trade_review.py \
+  --runtime-mode paper \
+  --start-at 2026-07-25T00:00:00Z \
+  --end-at 2026-08-01T00:00:00Z
+```
+
+The command writes JSON artifacts under
+`var/analytics/weekly_trade_review/` by default and updates `latest.json`.
+Use `KAI_EXEC_WEEKLY_TRADE_REVIEW_DIR` or `--output-dir` to change the target.
+Only add `--include-json-payloads` for a manual deep-dive where loading stored
+broker/request payload JSON is intentional.
+
 Default short-term sizing is tuned for higher-conviction filtered candidates:
 per-symbol budget `3,000,000` KRW, total exec-agent budget `9,000,000` KRW,
 base risk `1.5%`, max position allocation `30%`, and max symbol exposure

@@ -136,6 +136,7 @@ class Settings(BaseModel):
     trade_outcome_feedback_dir: str = "var/analytics/trade_outcome_feedback"
     trade_outcome_feedback_lookback_days: int = Field(default=20, ge=1, le=365)
     trade_outcome_feedback_max_lessons: int = Field(default=6, ge=1, le=25)
+    weekly_trade_review_dir: str = "var/analytics/weekly_trade_review"
     openclaw_cli_path: str = "openclaw"
     kis_app_key: str | None = None
     kis_app_secret: str | None = None
@@ -334,6 +335,7 @@ _ENV_FIELDS = {
     "TRADE_OUTCOME_FEEDBACK_DIR": "trade_outcome_feedback_dir",
     "TRADE_OUTCOME_FEEDBACK_LOOKBACK_DAYS": "trade_outcome_feedback_lookback_days",
     "TRADE_OUTCOME_FEEDBACK_MAX_LESSONS": "trade_outcome_feedback_max_lessons",
+    "WEEKLY_TRADE_REVIEW_DIR": "weekly_trade_review_dir",
     "OPENCLAW_CLI_PATH": "openclaw_cli_path",
     "KIS_APP_KEY": "kis_app_key",
     "KIS_APP_SECRET": "kis_app_secret",

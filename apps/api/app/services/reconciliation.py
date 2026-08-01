@@ -17,6 +17,7 @@ from app.broker.base import (
 from app.core.config import Settings
 from app.models.runtime import BrokerOrder, BrokerOrderEvent, ExecutionFill, ExecutionPosition
 from app.services.broker_auth import ensure_authenticated_broker_session
+from app.services.broker_order_state import NONTERMINAL_ORDER_STATUSES
 from app.services.fill_idempotency import execution_fill_dedupe_key, execution_fill_idempotency_key
 from app.services.rejected_order_retries import handle_reconciled_rejected_order
 from app.services.runtime_transitions import (
@@ -845,14 +846,7 @@ def _snapshot_payload(payload: dict[str, Any] | None) -> dict[str, Any] | None:
 
 
 def _reconcilable_order_statuses() -> tuple[str, ...]:
-    return (
-        NormalizedBrokerOrderStatus.SUBMISSION_PENDING.value,
-        NormalizedBrokerOrderStatus.SUBMITTED.value,
-        NormalizedBrokerOrderStatus.OPEN.value,
-        NormalizedBrokerOrderStatus.PARTIALLY_FILLED.value,
-        NormalizedBrokerOrderStatus.CANCEL_PENDING.value,
-        NormalizedBrokerOrderStatus.RETRY_PENDING.value,
-    )
+    return NONTERMINAL_ORDER_STATUSES
 
 
 def _normalize_symbols(symbols: set[str] | None) -> set[str] | None:
