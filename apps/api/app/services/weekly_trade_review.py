@@ -1,0 +1,719 @@
+from __future__ import annotations
+
+import argparse
+import json
+from collections.abc import Iterable, Sequence
+from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
+from pathlib import Path
+from typing import Any
+
+from sqlalchemy import func, select
+from sqlalchemy.orm import Session
+
+from app.core.config import Settings, load_settings
+from app.db.session import create_db_engine, create_session_factory
+from app.models.runtime import (
+    BrokerOrder,
+    BrokerOrderEvent,
+    ExecutionFailure,
+    ExecutionFill,
+    ExecutionPlan,
+    ExecutionPlanItem,
+    MonitoringCheckpoint,
+)
+
+NONTERMINAL_ORDER_STATUSES = (
+    "created",
+    "pending",
+    "submitted",
+    "accepted",
+    "partially_filled",
+    "open",
+)
+WATCH_REVIEW_STATUSES = (
+    "watch_monitoring_pending",
+    "watch_monitoring_active",
+    "watch_buy_triggered",
+    "watch_buy_triggered_blocked",
+    "watch_buy_triggered_pending_dispatch",
+    "watch_buy_submitted",
+    "watch_buy_rejected",
+    "watch_expired",
+    "watch_cancelled",
+    "short_term_watcher_pending",
+    "short_term_watch_blocked",
+    "new_buy_blocked",
+)
+
+
+def generate_weekly_trade_review(
+    *,
+    settings: Settings,
+    db: Session,
+    start_at: datetime,
+    end_at: datetime,
+    output_dir: Path | None = None,
+    include_json_payloads: bool = False,
+    max_range_days: int = 14,
+    max_fills: int = 5000,
+    max_weekly_orders: int = 1000,
+    max_execution_failures: int = 1000,
+    max_linked_events: int = 2000,
+    max_stale_order_samples: int = 100,
+) -> dict[str, object]:
+    """Write a bounded, read-only weekly review artifact from exec-owned tables."""
+
+    start_at = _normalize_utc(start_at)
+    end_at = _normalize_utc(end_at)
+    if end_at <= start_at:
+        raise ValueError("end_at must be after start_at")
+    range_days = (end_at - start_at).total_seconds() / 86400
+    if range_days > max_range_days:
+        raise ValueError(f"review range is {range_days:.2f} days; max_range_days is {max_range_days}")
+
+    target_dir = output_dir or Path(settings.weekly_trade_review_dir)
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    fills, fills_truncated = _weekly_fills(
+        db=db,
+        mode=settings.runtime_mode,
+        start_at=start_at,
+        end_at=end_at,
+        include_json_payloads=include_json_payloads,
+        max_rows=max_fills,
+    )
+    broker_order_pks = sorted(
+        {
+            str(row["broker_order_pk"])
+            for row in fills
+            if row.get("broker_order_pk") is not None
+        }
+    )
+    linked_orders = _linked_broker_orders(
+        db=db,
+        mode=settings.runtime_mode,
+        broker_order_pks=broker_order_pks,
+        include_json_payloads=include_json_payloads,
+    )
+    linked_events, linked_events_truncated = _linked_broker_order_events(
+        db=db,
+        broker_order_pks=broker_order_pks,
+        include_json_payloads=include_json_payloads,
+        max_rows=max_linked_events,
+    )
+    weekly_order_counts = _weekly_order_status_counts(
+        db=db,
+        mode=settings.runtime_mode,
+        start_at=start_at,
+        end_at=end_at,
+    )
+    weekly_orders, weekly_orders_truncated = _weekly_order_samples(
+        db=db,
+        mode=settings.runtime_mode,
+        start_at=start_at,
+        end_at=end_at,
+        include_json_payloads=include_json_payloads,
+        max_rows=max_weekly_orders,
+    )
+    failures, failures_truncated = _weekly_execution_failures(
+        db=db,
+        mode=settings.runtime_mode,
+        start_at=start_at,
+        end_at=end_at,
+        include_json_payloads=include_json_payloads,
+        max_rows=max_execution_failures,
+    )
+    active_order_summary = _active_broker_order_summary(
+        db=db,
+        mode=settings.runtime_mode,
+        reference_at=end_at,
+        stale_threshold_seconds=settings.stale_broker_order_reconciliation_threshold_seconds,
+        max_stale_order_samples=max_stale_order_samples,
+    )
+    plan_item_summary = _plan_item_review_summary(
+        db=db,
+        mode=settings.runtime_mode,
+        start_at=start_at,
+        end_at=end_at,
+    )
+    monitoring_checkpoints = _monitoring_checkpoints(
+        db=db,
+        mode=settings.runtime_mode,
+        include_json_payloads=include_json_payloads,
+    )
+
+    report: dict[str, object] = {
+        "generated_at": datetime.now(UTC),
+        "runtime_mode": settings.runtime_mode,
+        "range": {
+            "start_at": start_at,
+            "end_at": end_at,
+            "end_exclusive": True,
+        },
+        "bounds": {
+            "max_range_days": max_range_days,
+            "max_fills": max_fills,
+            "max_weekly_orders": max_weekly_orders,
+            "max_execution_failures": max_execution_failures,
+            "max_linked_events": max_linked_events,
+            "max_stale_order_samples": max_stale_order_samples,
+            "include_json_payloads": include_json_payloads,
+        },
+        "query_shape": {
+            "fills": "execution_fills.filled_at range joined to broker_orders.mode",
+            "linked_orders": "broker_orders.id IN weekly fill broker_order_pk",
+            "linked_events": "broker_order_events.broker_order_pk IN weekly fill broker_order_pk",
+            "weekly_orders": "broker_orders.mode/submitted_at range",
+            "stale_orders": "broker_orders.mode/status/submitted_at",
+            "plan_items": "execution_plan_items status/created_at/updated_at aggregates",
+            "deferred_json_payloads": "omitted unless include_json_payloads=true",
+            "broker_mutations": False,
+        },
+        "counts": {
+            "fill_count": len(fills),
+            "linked_broker_order_count": len(linked_orders),
+            "linked_broker_order_event_count": len(linked_events),
+            "weekly_order_sample_count": len(weekly_orders),
+            "execution_failure_count": len(failures),
+            "monitoring_checkpoint_count": len(monitoring_checkpoints),
+        },
+        "truncated": {
+            "fills": fills_truncated,
+            "linked_broker_order_events": linked_events_truncated,
+            "weekly_orders": weekly_orders_truncated,
+            "execution_failures": failures_truncated,
+        },
+        "fills": fills,
+        "linked_broker_orders": linked_orders,
+        "linked_broker_order_events": linked_events,
+        "weekly_order_status_counts": weekly_order_counts,
+        "weekly_order_samples": weekly_orders,
+        "execution_failures": failures,
+        "active_broker_order_summary": active_order_summary,
+        "execution_plan_item_summary": plan_item_summary,
+        "monitoring_checkpoints": monitoring_checkpoints,
+    }
+
+    artifact_path = target_dir / _artifact_filename(start_at=start_at, end_at=end_at)
+    report["artifact_path"] = str(artifact_path)
+    payload = _json_safe(report)
+    text = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
+    artifact_path.write_text(text + "\n", encoding="utf-8")
+    (target_dir / "latest.json").write_text(text + "\n", encoding="utf-8")
+    return payload
+
+
+def _weekly_fills(
+    *,
+    db: Session,
+    mode: str,
+    start_at: datetime,
+    end_at: datetime,
+    include_json_payloads: bool,
+    max_rows: int,
+) -> tuple[list[dict[str, object]], bool]:
+    columns = [
+        ExecutionFill.id,
+        ExecutionFill.broker_order_pk,
+        ExecutionFill.broker_fill_id,
+        ExecutionFill.symbol,
+        ExecutionFill.side,
+        ExecutionFill.quantity,
+        ExecutionFill.base_quantity,
+        ExecutionFill.quote_notional,
+        ExecutionFill.price,
+        ExecutionFill.filled_at,
+        BrokerOrder.broker_name,
+        BrokerOrder.mode,
+        BrokerOrder.broker_order_id,
+        BrokerOrder.status.label("broker_order_status"),
+        BrokerOrder.submitted_at.label("broker_order_submitted_at"),
+        BrokerOrder.idempotency_key,
+    ]
+    if include_json_payloads:
+        columns.append(ExecutionFill.payload)
+    rows = db.execute(
+        select(*columns)
+        .join(BrokerOrder, ExecutionFill.broker_order_pk == BrokerOrder.id)
+        .where(
+            BrokerOrder.mode == mode,
+            ExecutionFill.filled_at >= start_at,
+            ExecutionFill.filled_at < end_at,
+        )
+        .order_by(ExecutionFill.filled_at.asc(), ExecutionFill.id.asc())
+        .limit(max_rows + 1)
+    ).all()
+    return _bounded_rows(rows, max_rows)
+
+
+def _linked_broker_orders(
+    *,
+    db: Session,
+    mode: str,
+    broker_order_pks: Sequence[str],
+    include_json_payloads: bool,
+) -> list[dict[str, object]]:
+    if not broker_order_pks:
+        return []
+    columns = [
+        BrokerOrder.id,
+        BrokerOrder.execution_plan_item_id,
+        BrokerOrder.broker_name,
+        BrokerOrder.mode,
+        BrokerOrder.idempotency_key,
+        BrokerOrder.broker_order_id,
+        BrokerOrder.symbol,
+        BrokerOrder.side,
+        BrokerOrder.status,
+        BrokerOrder.quantity,
+        BrokerOrder.base_quantity,
+        BrokerOrder.quote_notional,
+        BrokerOrder.limit_price,
+        BrokerOrder.submitted_at,
+        BrokerOrder.last_broker_sync_at,
+        BrokerOrder.last_error_classification,
+        BrokerOrder.last_error_code,
+        BrokerOrder.last_error_retryable,
+        BrokerOrder.created_at,
+        BrokerOrder.updated_at,
+    ]
+    if include_json_payloads:
+        columns.extend(
+            [
+                BrokerOrder.request_metadata,
+                BrokerOrder.response_metadata,
+                BrokerOrder.last_error_message,
+                BrokerOrder.raw_broker_payload,
+            ]
+        )
+    rows = db.execute(
+        select(*columns)
+        .where(BrokerOrder.mode == mode, BrokerOrder.id.in_(broker_order_pks))
+        .order_by(BrokerOrder.submitted_at.asc(), BrokerOrder.id.asc())
+    ).all()
+    return _rows_to_dicts(rows)
+
+
+def _linked_broker_order_events(
+    *,
+    db: Session,
+    broker_order_pks: Sequence[str],
+    include_json_payloads: bool,
+    max_rows: int,
+) -> tuple[list[dict[str, object]], bool]:
+    if not broker_order_pks:
+        return [], False
+    columns = [
+        BrokerOrderEvent.id,
+        BrokerOrderEvent.broker_order_pk,
+        BrokerOrderEvent.event_type,
+        BrokerOrderEvent.event_source,
+        BrokerOrderEvent.normalized_status,
+        BrokerOrderEvent.broker_status,
+        BrokerOrderEvent.error_classification,
+        BrokerOrderEvent.retryable,
+        BrokerOrderEvent.observed_at,
+        BrokerOrderEvent.created_at,
+    ]
+    if include_json_payloads:
+        columns.extend(
+            [
+                BrokerOrderEvent.message,
+                BrokerOrderEvent.request_payload,
+                BrokerOrderEvent.response_payload,
+                BrokerOrderEvent.payload,
+            ]
+        )
+    rows = db.execute(
+        select(*columns)
+        .where(BrokerOrderEvent.broker_order_pk.in_(broker_order_pks))
+        .order_by(
+            BrokerOrderEvent.broker_order_pk.asc(),
+            BrokerOrderEvent.observed_at.asc(),
+            BrokerOrderEvent.id.asc(),
+        )
+        .limit(max_rows + 1)
+    ).all()
+    return _bounded_rows(rows, max_rows)
+
+
+def _weekly_order_status_counts(
+    *,
+    db: Session,
+    mode: str,
+    start_at: datetime,
+    end_at: datetime,
+) -> list[dict[str, object]]:
+    rows = db.execute(
+        select(
+            BrokerOrder.status,
+            BrokerOrder.side,
+            func.count(BrokerOrder.id).label("count"),
+            func.min(BrokerOrder.submitted_at).label("first_submitted_at"),
+            func.max(BrokerOrder.submitted_at).label("last_submitted_at"),
+        )
+        .where(
+            BrokerOrder.mode == mode,
+            BrokerOrder.submitted_at >= start_at,
+            BrokerOrder.submitted_at < end_at,
+        )
+        .group_by(BrokerOrder.status, BrokerOrder.side)
+        .order_by(BrokerOrder.status.asc(), BrokerOrder.side.asc())
+    ).all()
+    return _rows_to_dicts(rows)
+
+
+def _weekly_order_samples(
+    *,
+    db: Session,
+    mode: str,
+    start_at: datetime,
+    end_at: datetime,
+    include_json_payloads: bool,
+    max_rows: int,
+) -> tuple[list[dict[str, object]], bool]:
+    columns = [
+        BrokerOrder.id,
+        BrokerOrder.execution_plan_item_id,
+        BrokerOrder.broker_name,
+        BrokerOrder.idempotency_key,
+        BrokerOrder.broker_order_id,
+        BrokerOrder.symbol,
+        BrokerOrder.side,
+        BrokerOrder.status,
+        BrokerOrder.quantity,
+        BrokerOrder.base_quantity,
+        BrokerOrder.quote_notional,
+        BrokerOrder.limit_price,
+        BrokerOrder.submitted_at,
+        BrokerOrder.last_broker_sync_at,
+        BrokerOrder.last_error_classification,
+        BrokerOrder.last_error_code,
+        BrokerOrder.last_error_retryable,
+    ]
+    if include_json_payloads:
+        columns.extend(
+            [
+                BrokerOrder.request_metadata,
+                BrokerOrder.response_metadata,
+                BrokerOrder.last_error_message,
+                BrokerOrder.raw_broker_payload,
+            ]
+        )
+    rows = db.execute(
+        select(*columns)
+        .where(
+            BrokerOrder.mode == mode,
+            BrokerOrder.submitted_at >= start_at,
+            BrokerOrder.submitted_at < end_at,
+        )
+        .order_by(BrokerOrder.submitted_at.asc(), BrokerOrder.id.asc())
+        .limit(max_rows + 1)
+    ).all()
+    return _bounded_rows(rows, max_rows)
+
+
+def _weekly_execution_failures(
+    *,
+    db: Session,
+    mode: str,
+    start_at: datetime,
+    end_at: datetime,
+    include_json_payloads: bool,
+    max_rows: int,
+) -> tuple[list[dict[str, object]], bool]:
+    columns = [
+        ExecutionFailure.id,
+        ExecutionFailure.broker_order_pk,
+        ExecutionFailure.execution_plan_id,
+        ExecutionFailure.execution_plan_item_id,
+        ExecutionFailure.plan_id,
+        ExecutionFailure.plan_source,
+        ExecutionFailure.strategy_run_id,
+        ExecutionFailure.decision_actor,
+        ExecutionFailure.broker_name,
+        ExecutionFailure.idempotency_key,
+        ExecutionFailure.symbol,
+        ExecutionFailure.side,
+        ExecutionFailure.intent,
+        ExecutionFailure.requested_quantity,
+        ExecutionFailure.requested_limit_price,
+        ExecutionFailure.requested_notional,
+        ExecutionFailure.classification,
+        ExecutionFailure.broker_error_classification,
+        ExecutionFailure.broker_error_code,
+        ExecutionFailure.retryable,
+        ExecutionFailure.status,
+        ExecutionFailure.first_failed_at,
+        ExecutionFailure.latest_failed_at,
+        ExecutionFailure.status_updated_at,
+        ExecutionFailure.retry_decision_status,
+        ExecutionFailure.retry_next_at,
+        ExecutionFailure.retry_attempt_count,
+    ]
+    if include_json_payloads:
+        columns.extend(
+            [
+                ExecutionFailure.broker_error_message,
+                ExecutionFailure.retry_decision_reason,
+                ExecutionFailure.retry_exhausted_reason,
+                ExecutionFailure.raw_context,
+            ]
+        )
+    rows = db.execute(
+        select(*columns)
+        .where(
+            ExecutionFailure.mode == mode,
+            ExecutionFailure.latest_failed_at >= start_at,
+            ExecutionFailure.latest_failed_at < end_at,
+        )
+        .order_by(ExecutionFailure.latest_failed_at.asc(), ExecutionFailure.id.asc())
+        .limit(max_rows + 1)
+    ).all()
+    return _bounded_rows(rows, max_rows)
+
+
+def _active_broker_order_summary(
+    *,
+    db: Session,
+    mode: str,
+    reference_at: datetime,
+    stale_threshold_seconds: int,
+    max_stale_order_samples: int,
+) -> dict[str, object]:
+    stale_before = reference_at - timedelta(seconds=stale_threshold_seconds)
+    nonterminal_counts = db.execute(
+        select(
+            BrokerOrder.status,
+            func.count(BrokerOrder.id).label("count"),
+            func.min(BrokerOrder.submitted_at).label("oldest_submitted_at"),
+            func.max(BrokerOrder.submitted_at).label("newest_submitted_at"),
+        )
+        .where(
+            BrokerOrder.mode == mode,
+            BrokerOrder.status.in_(NONTERMINAL_ORDER_STATUSES),
+        )
+        .group_by(BrokerOrder.status)
+        .order_by(BrokerOrder.status.asc())
+    ).all()
+    stale_rows = db.execute(
+        select(
+            BrokerOrder.id,
+            BrokerOrder.broker_order_id,
+            BrokerOrder.symbol,
+            BrokerOrder.side,
+            BrokerOrder.status,
+            BrokerOrder.quantity,
+            BrokerOrder.limit_price,
+            BrokerOrder.submitted_at,
+            BrokerOrder.last_broker_sync_at,
+        )
+        .where(
+            BrokerOrder.mode == mode,
+            BrokerOrder.status.in_(NONTERMINAL_ORDER_STATUSES),
+            BrokerOrder.submitted_at.is_not(None),
+            BrokerOrder.submitted_at < stale_before,
+        )
+        .order_by(BrokerOrder.submitted_at.asc(), BrokerOrder.id.asc())
+        .limit(max_stale_order_samples + 1)
+    ).all()
+    stale_samples, stale_truncated = _bounded_rows(stale_rows, max_stale_order_samples)
+    missing_submitted_at_count = db.scalar(
+        select(func.count(BrokerOrder.id)).where(
+            BrokerOrder.mode == mode,
+            BrokerOrder.status.in_(NONTERMINAL_ORDER_STATUSES),
+            BrokerOrder.submitted_at.is_(None),
+        )
+    )
+    return {
+        "stale_before": stale_before,
+        "nonterminal_status_counts": _rows_to_dicts(nonterminal_counts),
+        "stale_nonterminal_samples": stale_samples,
+        "stale_nonterminal_samples_truncated": stale_truncated,
+        "missing_submitted_at_nonterminal_count": int(missing_submitted_at_count or 0),
+    }
+
+
+def _plan_item_review_summary(
+    *,
+    db: Session,
+    mode: str,
+    start_at: datetime,
+    end_at: datetime,
+) -> dict[str, object]:
+    active_watch_counts = db.execute(
+        select(
+            ExecutionPlanItem.status,
+            ExecutionPlanItem.intent,
+            func.count(ExecutionPlanItem.id).label("count"),
+            func.min(ExecutionPlanItem.updated_at).label("oldest_updated_at"),
+            func.max(ExecutionPlanItem.updated_at).label("newest_updated_at"),
+        )
+        .join(ExecutionPlan, ExecutionPlanItem.execution_plan_id == ExecutionPlan.id)
+        .where(
+            ExecutionPlan.mode == mode,
+            ExecutionPlanItem.status.in_(WATCH_REVIEW_STATUSES),
+        )
+        .group_by(ExecutionPlanItem.status, ExecutionPlanItem.intent)
+        .order_by(ExecutionPlanItem.status.asc(), ExecutionPlanItem.intent.asc())
+    ).all()
+    created_counts = db.execute(
+        select(
+            ExecutionPlanItem.status,
+            ExecutionPlanItem.intent,
+            func.count(ExecutionPlanItem.id).label("count"),
+        )
+        .join(ExecutionPlan, ExecutionPlanItem.execution_plan_id == ExecutionPlan.id)
+        .where(
+            ExecutionPlan.mode == mode,
+            ExecutionPlanItem.created_at >= start_at,
+            ExecutionPlanItem.created_at < end_at,
+        )
+        .group_by(ExecutionPlanItem.status, ExecutionPlanItem.intent)
+        .order_by(ExecutionPlanItem.status.asc(), ExecutionPlanItem.intent.asc())
+    ).all()
+    updated_counts = db.execute(
+        select(
+            ExecutionPlanItem.status,
+            ExecutionPlanItem.intent,
+            func.count(ExecutionPlanItem.id).label("count"),
+        )
+        .join(ExecutionPlan, ExecutionPlanItem.execution_plan_id == ExecutionPlan.id)
+        .where(
+            ExecutionPlan.mode == mode,
+            ExecutionPlanItem.updated_at >= start_at,
+            ExecutionPlanItem.updated_at < end_at,
+        )
+        .group_by(ExecutionPlanItem.status, ExecutionPlanItem.intent)
+        .order_by(ExecutionPlanItem.status.asc(), ExecutionPlanItem.intent.asc())
+    ).all()
+    return {
+        "active_watch_status_counts": _rows_to_dicts(active_watch_counts),
+        "weekly_created_status_counts": _rows_to_dicts(created_counts),
+        "weekly_updated_status_counts": _rows_to_dicts(updated_counts),
+    }
+
+
+def _monitoring_checkpoints(
+    *,
+    db: Session,
+    mode: str,
+    include_json_payloads: bool,
+) -> list[dict[str, object]]:
+    columns = [
+        MonitoringCheckpoint.id,
+        MonitoringCheckpoint.worker_name,
+        MonitoringCheckpoint.mode,
+        MonitoringCheckpoint.status,
+        MonitoringCheckpoint.last_heartbeat_at,
+        MonitoringCheckpoint.last_success_at,
+        MonitoringCheckpoint.created_at,
+        MonitoringCheckpoint.updated_at,
+    ]
+    if include_json_payloads:
+        columns.append(MonitoringCheckpoint.details)
+    rows = db.execute(
+        select(*columns)
+        .where(MonitoringCheckpoint.mode == mode)
+        .order_by(MonitoringCheckpoint.worker_name.asc())
+    ).all()
+    return _rows_to_dicts(rows)
+
+
+def _bounded_rows(rows: Sequence[object], max_rows: int) -> tuple[list[dict[str, object]], bool]:
+    truncated = len(rows) > max_rows
+    return _rows_to_dicts(rows[:max_rows]), truncated
+
+
+def _rows_to_dicts(rows: Iterable[object]) -> list[dict[str, object]]:
+    return [dict(row._mapping) for row in rows]  # type: ignore[attr-defined]
+
+
+def _artifact_filename(*, start_at: datetime, end_at: datetime) -> str:
+    return (
+        f"{start_at.date().isoformat()}_to_"
+        f"{end_at.date().isoformat()}_weekly_trade_review.json"
+    )
+
+
+def _normalize_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
+
+
+def _parse_datetime(value: str) -> datetime:
+    text = value.strip()
+    parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    return _normalize_utc(parsed)
+
+
+def _json_safe(value: object) -> Any:
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, datetime):
+        return _normalize_utc(value).isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_json_safe(item) for item in value]
+    return value
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Export bounded weekly trade-review evidence from the local exec "
+            "runtime database. This command is read-only and does not call broker APIs."
+        ),
+    )
+    parser.add_argument("--start-at", required=True, help="Inclusive UTC start timestamp or date.")
+    parser.add_argument("--end-at", required=True, help="Exclusive UTC end timestamp or date.")
+    parser.add_argument("--output-dir", type=Path, default=None)
+    parser.add_argument("--runtime-mode", choices=("mock", "paper", "live"), default=None)
+    parser.add_argument("--database-url", default=None)
+    parser.add_argument("--include-json-payloads", action="store_true")
+    parser.add_argument("--max-range-days", type=int, default=14)
+    args = parser.parse_args()
+
+    settings_kwargs: dict[str, object] = {}
+    if args.database_url:
+        settings_kwargs["database_url"] = args.database_url
+    if args.runtime_mode:
+        settings_kwargs["runtime_mode"] = args.runtime_mode
+    settings = load_settings().model_copy(update=settings_kwargs)
+
+    engine = create_db_engine(settings)
+    session_factory = create_session_factory(engine)
+    try:
+        with session_factory() as db:
+            report = generate_weekly_trade_review(
+                settings=settings,
+                db=db,
+                start_at=_parse_datetime(args.start_at),
+                end_at=_parse_datetime(args.end_at),
+                output_dir=args.output_dir,
+                include_json_payloads=args.include_json_payloads,
+                max_range_days=args.max_range_days,
+            )
+        print(
+            json.dumps(
+                {
+                    "status": "ok",
+                    "artifact_path": report["artifact_path"],
+                    "fill_count": report["counts"]["fill_count"],  # type: ignore[index]
+                    "execution_failure_count": report["counts"]["execution_failure_count"],  # type: ignore[index]
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+    finally:
+        engine.dispose()
+
+
+if __name__ == "__main__":
+    main()

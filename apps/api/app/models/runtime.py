@@ -180,6 +180,15 @@ class ExecutionPlanItem(TimestampMixin, Base):
     __tablename__ = "execution_plan_items"
     __table_args__ = (
         Index(
+            "ix_execution_plan_items_status_updated_at",
+            "status",
+            "updated_at",
+        ),
+        Index(
+            "ix_execution_plan_items_created_at",
+            "created_at",
+        ),
+        Index(
             "ix_execution_plan_items_side_status_intent_plan_symbol",
             "side",
             "status",
@@ -269,6 +278,17 @@ class ExecutionJob(TimestampMixin, Base):
 class BrokerOrder(TimestampMixin, Base):
     __tablename__ = "broker_orders"
     __table_args__ = (
+        Index(
+            "ix_broker_orders_mode_submitted_at",
+            "mode",
+            "submitted_at",
+        ),
+        Index(
+            "ix_broker_orders_mode_status_submitted_at",
+            "mode",
+            "status",
+            "submitted_at",
+        ),
         UniqueConstraint(
             "idempotency_key",
             "mode",
@@ -346,6 +366,11 @@ class BrokerOrderEvent(TimestampMixin, Base):
 class ExecutionFailure(TimestampMixin, Base):
     __tablename__ = "execution_failures"
     __table_args__ = (
+        Index(
+            "ix_execution_failures_mode_latest_failed_at",
+            "mode",
+            "latest_failed_at",
+        ),
         UniqueConstraint(
             "broker_order_pk",
             name="uq_execution_failures_broker_order_pk",
