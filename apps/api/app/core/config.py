@@ -26,7 +26,8 @@ class Settings(BaseModel):
     monitoring_loop_interval_seconds: float = Field(default=1.0, gt=0, le=3600)
     monitoring_cycle_timeout_seconds: float = Field(default=20.0, gt=0, le=3600)
     monitoring_expire_prior_market_watch_buys_enabled: bool = True
-    monitoring_max_symbols_per_cycle: int = Field(default=128, ge=1, le=10000)
+    monitoring_max_symbols_per_cycle: int = Field(default=128, ge=0, le=10000)
+    monitoring_auto_symbol_batch_target_seconds: float = Field(default=12.0, gt=0, le=300)
     monitoring_max_broker_actions_per_cycle: int = Field(default=32, ge=1, le=10000)
     monitoring_max_quote_age_seconds: int = Field(default=30, ge=1, le=3600)
     monitoring_watch_buy_retry_cooldown_seconds: int = Field(default=5, ge=1, le=3600)
@@ -226,6 +227,7 @@ _ENV_FIELDS = {
     "MONITORING_CYCLE_TIMEOUT_SECONDS": "monitoring_cycle_timeout_seconds",
     "MONITORING_EXPIRE_PRIOR_MARKET_WATCH_BUYS_ENABLED": "monitoring_expire_prior_market_watch_buys_enabled",
     "MONITORING_MAX_SYMBOLS_PER_CYCLE": "monitoring_max_symbols_per_cycle",
+    "MONITORING_AUTO_SYMBOL_BATCH_TARGET_SECONDS": "monitoring_auto_symbol_batch_target_seconds",
     "MONITORING_MAX_BROKER_ACTIONS_PER_CYCLE": "monitoring_max_broker_actions_per_cycle",
     "MONITORING_MAX_QUOTE_AGE_SECONDS": "monitoring_max_quote_age_seconds",
     "MONITORING_WATCH_BUY_RETRY_COOLDOWN_SECONDS": "monitoring_watch_buy_retry_cooldown_seconds",
@@ -380,7 +382,21 @@ def load_settings(
     for env_key, field_name in _ENV_FIELDS.items():
         full_key = f"{prefix}{env_key}"
         if full_key in source:
-            values[field_name] = source[full_key]
+            value = source[full_key]
+            if field_name == "monitoring_max_symbols_per_cycle" and value.strip().lower() == "auto":
+                request_timeout = float(
+                    source.get(f"{prefix}KIS_REQUEST_TIMEOUT_SECONDS", Settings().kis_request_timeout_seconds)
+                )
+                target_seconds = float(
+                    source.get(
+                        f"{prefix}MONITORING_AUTO_SYMBOL_BATCH_TARGET_SECONDS",
+                        Settings().monitoring_auto_symbol_batch_target_seconds,
+                    )
+                )
+                quote_workers = 3
+                estimated_limit = int((max(target_seconds, request_timeout) / max(request_timeout, 1.0)) * quote_workers)
+                value = str(max(3, min(20, estimated_limit)))
+            values[field_name] = value
     return Settings(**values)
 
 

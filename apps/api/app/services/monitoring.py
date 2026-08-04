@@ -6,8 +6,12 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from functools import partial
+import json
 import logging
+import os
 import time
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import and_, distinct, func, or_, select, tuple_
@@ -178,6 +182,7 @@ MONITORING_WORKER_NAME = "intraday_target_stop_monitor"
 MONITORING_RUNTIME_TOPOLOGY = "shared_symbol_scheduler"
 MONITORING_SELECTION_STRATEGY = "round_robin_by_symbol"
 KRX_TIMEZONE = ZoneInfo("Asia/Seoul")
+WATCH_BUY_HANDOFF_LOOKBACK_DAYS = 3
 WATCH_BUY_EXPIRABLE_STATUSES = frozenset(
     {
         "watch_monitoring_active",
@@ -551,6 +556,7 @@ def list_autonomous_monitoring_symbols(
     current_market_date: date | None = None,
 ) -> list[str]:
     resolved_market_date = current_market_date or datetime.now(KRX_TIMEZONE).date()
+    symbol_cycle_limit = resolve_monitoring_symbol_cycle_limit(settings=settings)
     if settings.monitoring_expire_prior_market_watch_buys_enabled:
         expired_count = expire_prior_market_date_unfilled_watch_buys(
             settings=settings,
@@ -584,11 +590,11 @@ def list_autonomous_monitoring_symbols(
 
     def append_candidates(rows: list[str]) -> None:
         for symbol in rows:
-            if len(symbol_candidates) >= settings.monitoring_max_symbols_per_cycle:
+            if len(symbol_candidates) >= symbol_cycle_limit:
                 return
             if symbol and symbol not in symbol_candidates:
                 symbol_candidates.append(symbol)
-            if len(symbol_candidates) >= settings.monitoring_max_symbols_per_cycle:
+            if len(symbol_candidates) >= symbol_cycle_limit:
                 return
 
     if held_symbols:
@@ -619,35 +625,41 @@ def list_autonomous_monitoring_symbols(
                 func.min(ExecutionPlan.id).asc(),
                 ExecutionPlanItem.symbol.asc(),
             )
-            .limit(settings.monitoring_max_symbols_per_cycle)
+            .limit(symbol_cycle_limit)
         ).all()
         append_candidates([str(row.symbol) for row in held_symbol_rows])
         append_candidates(sorted(symbol for symbol in held_symbols if symbol not in symbol_candidates))
 
-    if len(symbol_candidates) < settings.monitoring_max_symbols_per_cycle:
-        append_candidates(
-            list(
-                db.scalars(
-                    select(distinct(ExecutionPlanItem.symbol))
-                    .join(ExecutionPlanItem.plan)
-                    .where(
-                        ExecutionPlan.mode == settings.runtime_mode,
-                        ExecutionPlanItem.side == "buy",
-                        ExecutionPlanItem.intent.in_(tuple(WATCH_BUY_INTENTS)),
-                        ExecutionPlanItem.status.in_(tuple(ACTIVE_WATCH_MONITORING_STATUSES)),
-                        ExecutionPlan.accepted_at >= datetime.combine(
-                            resolved_market_date,
-                            datetime.min.time(),
-                            tzinfo=KRX_TIMEZONE,
-                        ),
-                    )
-                    .order_by(ExecutionPlanItem.symbol.asc())
-                    .limit(settings.monitoring_max_symbols_per_cycle - len(symbol_candidates))
-                ).all()
-            )
+    if len(symbol_candidates) < symbol_cycle_limit:
+        buy_symbol_rows = list(
+            db.scalars(
+                select(distinct(ExecutionPlanItem.symbol))
+                .where(
+                    ExecutionPlanItem.execution_plan_id.in_(mode_plan_ids),
+                    ExecutionPlanItem.side == "buy",
+                    ExecutionPlanItem.intent.in_(tuple(WATCH_BUY_INTENTS)),
+                    ExecutionPlanItem.status.in_(tuple(ACTIVE_WATCH_MONITORING_STATUSES)),
+                )
+                .order_by(ExecutionPlanItem.symbol.asc())
+                .limit(symbol_cycle_limit * 8)
+            ).all()
         )
+        desired_symbols = _load_core_desired_monitoring_symbols(settings=settings)
+        if desired_symbols:
+            desired_rank = {symbol: index for index, symbol in enumerate(desired_symbols)}
+            desired_set = set(desired_symbols)
+            buy_symbol_rows = [
+                symbol for symbol in buy_symbol_rows if str(symbol) in desired_set
+            ]
+            buy_symbol_rows.sort(
+                key=lambda symbol: (
+                    desired_rank.get(str(symbol), len(desired_rank)),
+                    str(symbol),
+                )
+            )
+        append_candidates(buy_symbol_rows)
 
-    if len(symbol_candidates) < settings.monitoring_max_symbols_per_cycle:
+    if len(symbol_candidates) < symbol_cycle_limit:
         pending_sell_symbols = list(
             db.scalars(
                 select(distinct(ExecutionPlanItem.symbol))
@@ -659,7 +671,7 @@ def list_autonomous_monitoring_symbols(
                         ExecutionPlanItem.symbol.not_in(fresh_known_flat_symbols),
                     )
                 .order_by(ExecutionPlanItem.symbol.asc())
-                .limit(settings.monitoring_max_symbols_per_cycle * 4)
+                .limit(symbol_cycle_limit * 4)
             ).all()
         )
         flat_symbols = _symbols_with_recent_flat_position_truth(
@@ -680,11 +692,58 @@ def list_autonomous_monitoring_symbols(
                 continue
             if symbol in unexited_buy_order_symbols:
                 fallback_symbols.append(symbol)
-            if len(symbol_candidates) + len(fallback_symbols) >= settings.monitoring_max_symbols_per_cycle:
+            if len(symbol_candidates) + len(fallback_symbols) >= symbol_cycle_limit:
                 break
         append_candidates(fallback_symbols)
 
     return symbol_candidates
+
+
+def resolve_monitoring_symbol_cycle_limit(*, settings: Settings) -> int:
+    configured_limit = int(settings.monitoring_max_symbols_per_cycle or 0)
+    if configured_limit > 0:
+        return configured_limit
+    request_timeout = max(float(settings.kis_request_timeout_seconds), 1.0)
+    target_seconds = max(float(settings.monitoring_auto_symbol_batch_target_seconds), request_timeout)
+    quote_workers = 3
+    estimated_limit = int((target_seconds / request_timeout) * quote_workers)
+    return max(3, min(20, estimated_limit))
+
+
+def _load_core_desired_monitoring_symbols(*, settings: Settings) -> list[str]:
+    env_priority = os.getenv("KAI_EXEC_MONITORING_SYMBOL_PRIORITY", "")
+    if env_priority.strip():
+        return _parse_symbol_priority(env_priority)
+    if not settings.market_context_enabled or not settings.market_context_base_url:
+        return []
+    base_url = str(settings.market_context_base_url).rstrip("/")
+    request = Request(f"{base_url}/execution/runtime/monitored-symbols")
+    if settings.market_context_bearer_token:
+        request.add_header("Authorization", f"Bearer {settings.market_context_bearer_token}")
+    try:
+        with urlopen(request, timeout=min(float(settings.market_context_timeout_seconds), 3.0)) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (HTTPError, URLError, TimeoutError, ValueError, OSError):
+        return []
+    realtime_subscription = payload.get("realtime_subscription")
+    if not isinstance(realtime_subscription, dict):
+        return []
+    desired_symbols = realtime_subscription.get("desired_symbols")
+    if not isinstance(desired_symbols, list):
+        return []
+    return _parse_symbol_priority(",".join(str(symbol) for symbol in desired_symbols))
+
+
+def _parse_symbol_priority(value: str) -> list[str]:
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for symbol in value.split(","):
+        normalized = str(symbol).strip()
+        if not normalized or normalized in seen:
+            continue
+        ordered.append(normalized)
+        seen.add(normalized)
+    return ordered
 
 
 def expire_known_flat_pending_sell_monitors(
@@ -885,7 +944,9 @@ def _evaluate_monitoring_cycle(
     )
     if released_drawdown_blocks:
         db.flush()
-    skip_pre_cycle_broker_reconciliation = allow_persisted_triggered_without_price and bool(symbols)
+    skip_pre_cycle_broker_reconciliation = (
+        allow_persisted_triggered_without_price and bool(symbols) and not prices
+    )
     _log_cycle_step(
         "drawdown_release",
         released_drawdown_blocks=released_drawdown_blocks,
@@ -1842,6 +1903,7 @@ def _evaluate_monitoring_cycle(
             status=(
                 "degraded"
                 if deferred_item_count > 0
+                or submitted_order_count > 0
                 or degraded_coverage_count > 0
                 or degraded_target_coverage_count > 0
                 else "running"

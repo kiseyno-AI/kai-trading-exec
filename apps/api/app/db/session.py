@@ -48,6 +48,7 @@ def _configure_sqlite_engine(engine: Engine) -> None:
         try:
             cursor.execute("PRAGMA busy_timeout=30000")
             cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA wal_autocheckpoint=0")
             cursor.execute("PRAGMA synchronous=NORMAL")
             cursor.execute("PRAGMA foreign_keys=ON")
         finally:

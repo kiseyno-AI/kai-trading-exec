@@ -876,23 +876,24 @@ def runtime_monitored_symbols(
     ]
     if settings.runtime_mode == "live":
         sell_monitoring_conditions.append(ExecutionPlanItem.symbol.in_(held_position_symbols))
-    monitored_symbols = db.scalars(
+    sell_symbols = db.scalars(
         select(distinct(ExecutionPlanItem.symbol))
         .join(ExecutionPlanItem.plan)
         .where(
             ExecutionPlan.mode == settings.runtime_mode,
-            or_(
-                and_(*sell_monitoring_conditions),
-                and_(
-                    ExecutionPlanItem.side == "buy",
-                    ExecutionPlanItem.intent.in_(WATCH_BUY_INTENTS),
-                    ExecutionPlanItem.status.in_(tuple(ACTIVE_WATCH_MONITORING_STATUSES)),
-                    ExecutionPlan.accepted_at >= today_start_utc,
-                ),
-            ),
+            and_(*sell_monitoring_conditions),
         )
     ).all()
-    return sorted(monitored_symbols)
+    mode_plan_ids = select(ExecutionPlan.id).where(ExecutionPlan.mode == settings.runtime_mode)
+    buy_symbols = db.scalars(
+        select(distinct(ExecutionPlanItem.symbol)).where(
+            ExecutionPlanItem.execution_plan_id.in_(mode_plan_ids),
+            ExecutionPlanItem.side == "buy",
+            ExecutionPlanItem.intent.in_(WATCH_BUY_INTENTS),
+            ExecutionPlanItem.status.in_(tuple(ACTIVE_WATCH_MONITORING_STATUSES)),
+        )
+    ).all()
+    return sorted({*sell_symbols, *buy_symbols})
 
 
 def runtime_filled_today_summary(
