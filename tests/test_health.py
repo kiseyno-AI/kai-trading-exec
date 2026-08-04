@@ -68,6 +68,18 @@ def build_test_app(
     return app, engine
 
 
+def test_monitoring_symbol_cycle_limit_auto_uses_timeout_budget() -> None:
+    settings = load_settings(
+        {
+            "KAI_EXEC_MONITORING_MAX_SYMBOLS_PER_CYCLE": "auto",
+            "KAI_EXEC_KIS_REQUEST_TIMEOUT_SECONDS": "3",
+            "KAI_EXEC_MONITORING_AUTO_SYMBOL_BATCH_TARGET_SECONDS": "12",
+        }
+    )
+
+    assert settings.monitoring_max_symbols_per_cycle == 12
+
+
 def test_watch_buy_decimal_string_share_quantity_is_configured() -> None:
     item = ExecutionPlanItem(
         id="watch-decimal-string-quantity",
@@ -1356,6 +1368,55 @@ def test_position_exit_pending_sell_is_autonomous_monitored_when_position_exists
             item=autonomous_items[0],
             remaining_quantity=7,
         ) == 7
+
+    engine.dispose()
+
+
+def test_weekend_handoff_watch_buy_is_monitored_on_target_market_date() -> None:
+    app, engine = build_test_app(
+        Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+        )
+    )
+    friday_accepted_at = datetime(2026, 7, 31, 23, 30, tzinfo=UTC)
+    monday_market_date = datetime(2026, 8, 3).date()
+
+    with app.state.db_session_factory() as session:
+        plan = ExecutionPlan(
+            id="weekend-handoff-plan",
+            external_plan_id="weekend-handoff-plan",
+            source="kai-trading-core",
+            market_date=monday_market_date,
+            mode="paper",
+            status="accepted",
+            accepted_at=friday_accepted_at,
+        )
+        item = ExecutionPlanItem(
+            id="weekend-handoff-buy",
+            execution_plan_id=plan.id,
+            plan_item_index=0,
+            symbol="011300",
+            side="buy",
+            intent="next_open_buy",
+            status="watch_monitoring_pending",
+            trigger_price=Decimal("1000"),
+            quantity_policy={"kind": "shares", "quantity": 1},
+        )
+        session.add(plan)
+        session.add(item)
+        session.commit()
+
+        assert list_autonomous_monitoring_symbols(
+            settings=app.state.settings,
+            db=session,
+            current_market_date=monday_market_date,
+        ) == ["011300"]
+        assert runtime_service.runtime_monitored_symbols(
+            settings=app.state.settings,
+            db=session,
+            today_start_utc=datetime(2026, 8, 2, 15, tzinfo=UTC),
+        ) == ["011300"]
 
     engine.dispose()
 

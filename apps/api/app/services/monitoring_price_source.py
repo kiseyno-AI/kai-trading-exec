@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from decimal import Decimal
+import time
 from typing import Callable
 
 from sqlalchemy.exc import SQLAlchemyError
@@ -14,6 +16,9 @@ from app.services.domestic_order_router import resolve_domestic_order_route
 
 MAX_REPORTED_QUOTE_FAILURES = 10
 MAX_REPORTED_CONTEXT_FAILURES = 10
+MAX_QUOTE_WORKERS = 3
+QUOTE_RETRY_ATTEMPTS = 2
+QUOTE_RETRY_DELAY_SECONDS = 0.2
 
 
 class KisCurrentQuoteMonitoringPriceSource:
@@ -82,17 +87,56 @@ class KisCurrentQuoteMonitoringPriceSource:
             context_failures: list[dict[str, object]] = []
             failure_count = 0
             context_failure_count = 0
-            for symbol in unique_symbols:
+            def fetch_quote(symbol: str) -> tuple[str, BrokerCurrentPrice | None, Exception | None]:
+                worker_adapter = self.broker_adapter_factory(settings)
                 try:
-                    quote = broker_adapter.get_current_price(
-                        access_token,
-                        symbol=symbol,
-                        exchange="KRX",
+                    return (
+                        symbol,
+                        worker_adapter.get_current_price(
+                            access_token,
+                            symbol=symbol,
+                            exchange="KRX",
+                        ),
+                        None,
                     )
                 except Exception as exc:
+                    return symbol, None, exc
+
+            quote_results: dict[str, tuple[BrokerCurrentPrice | None, Exception | None]] = {}
+            worker_count = min(MAX_QUOTE_WORKERS, len(unique_symbols))
+            with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                futures = {
+                    executor.submit(fetch_quote, symbol): symbol
+                    for symbol in unique_symbols
+                }
+                for future in as_completed(futures):
+                    symbol, quote, error = future.result()
+                    quote_results[symbol] = (quote, error)
+
+            retry_symbols = [
+                symbol
+                for symbol, (quote, error) in quote_results.items()
+                if quote is None and error is not None
+            ]
+            for _attempt in range(QUOTE_RETRY_ATTEMPTS):
+                if not retry_symbols:
+                    break
+                next_retry_symbols: list[str] = []
+                for symbol in retry_symbols:
+                    if QUOTE_RETRY_DELAY_SECONDS > 0:
+                        time.sleep(QUOTE_RETRY_DELAY_SECONDS)
+                    _retry_symbol, quote, error = fetch_quote(symbol)
+                    quote_results[symbol] = (quote, error)
+                    if quote is None and error is not None:
+                        next_retry_symbols.append(symbol)
+                retry_symbols = next_retry_symbols
+
+            for symbol in unique_symbols:
+                quote, error = quote_results.get(symbol, (None, None))
+                if error is not None:
                     failure_count += 1
                     if len(failures) < MAX_REPORTED_QUOTE_FAILURES:
-                        failures.append({"symbol": symbol, "error": str(exc)})
+                        failures.append({"symbol": symbol, "error": str(error)})
                     continue
                 if quote is None:
                     continue

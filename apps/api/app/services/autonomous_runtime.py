@@ -16,10 +16,15 @@ from app.api.schemas.execution import MonitoringPriceRequest
 from app.broker.base import BrokerAdapter
 from app.core.config import Settings
 from app.models.runtime import BrokerOrder, ExecutionFill
+from app.models.runtime import ExecutionPlanItem, ExecutionPosition
 from app.services.execution_jobs import dispatch_due_execution_jobs
 from app.services.monitoring import (
+    BLOCKED_MONITORING_STATUSES,
+    PENDING_DISPATCH_MONITORING_STATUSES,
+    SELL_ACTIVE_MONITORING_STATUSES,
+    SELL_MONITORED_INTENTS,
     WATCH_BUY_INTENTS,
-    _load_monitored_items,
+    WATCH_MONITORING_STATUSES,
     _load_positions_by_symbol,
     _maintain_post_entry_exit_monitors,
     list_autonomous_monitoring_symbols,
@@ -463,8 +468,11 @@ class AutonomousRuntimeCoordinator:
         return payload
 
     def _monitoring_cycle_sync(self, started_at: datetime) -> dict[str, object]:
-        runtime_snapshot = self._ensure_monitoring_runtime_snapshot(started_at)
-        self._reconcile_and_refresh_monitoring_snapshot_if_due(started_at)
+        runtime_snapshot = self._refresh_monitoring_runtime_snapshot(
+            loaded_at=started_at,
+            reason="monitoring_cycle_refresh",
+            reconcile_broker=False,
+        )
         self._refresh_monitoring_snapshot_filled_today(started_at)
         runtime_snapshot = self._ensure_monitoring_runtime_snapshot(started_at)
         symbols = runtime_snapshot.symbols
@@ -483,24 +491,30 @@ class AutonomousRuntimeCoordinator:
             symbols=symbols,
             observed_at=started_at,
         )
-        post_entry_maintenance_count = self._repair_post_entry_exit_monitors_for_cached_cycle(
-            runtime_snapshot=runtime_snapshot,
-            prices=prices,
-            started_at=started_at,
-        )
-        if post_entry_maintenance_count:
-            runtime_snapshot = self._refresh_monitoring_runtime_snapshot(
-                loaded_at=started_at,
-                reason="cached_monitoring_post_entry_maintenance",
-                reconcile_broker=False,
-            )
-            symbols = runtime_snapshot.symbols
         cached_payload = self._evaluate_cached_monitoring_cycle(
             runtime_snapshot=runtime_snapshot,
             prices=prices,
             started_at=started_at,
         )
-        if cached_payload["triggered_item_count"] == 0:
+        post_entry_maintenance_count = 0
+        if cached_payload["triggered_item_count"] == 0 and prices:
+            post_entry_maintenance_count = self._repair_post_entry_exit_monitors_for_cached_cycle(
+                runtime_snapshot=runtime_snapshot,
+                prices=prices,
+                started_at=started_at,
+            )
+            if post_entry_maintenance_count:
+                runtime_snapshot = self._refresh_monitoring_runtime_snapshot(
+                    loaded_at=started_at,
+                    reason="cached_monitoring_post_entry_maintenance",
+                    reconcile_broker=False,
+                )
+                symbols = runtime_snapshot.symbols
+                cached_payload = self._evaluate_cached_monitoring_cycle(
+                    runtime_snapshot=runtime_snapshot,
+                    prices=prices,
+                    started_at=started_at,
+                )
             payload = {
                 "status_code": 200,
                 "monitored_symbols": symbols,
@@ -515,6 +529,10 @@ class AutonomousRuntimeCoordinator:
             self._store_cycle_payload(worker_key="monitoring", payload=payload)
             return payload
 
+        triggered_symbols = _triggered_symbols_from_cached_payload(cached_payload)
+        if triggered_symbols:
+            symbols = [symbol for symbol in symbols if symbol in triggered_symbols]
+            prices = [price for price in prices if price.symbol in triggered_symbols]
         with self.session_factory() as db:
             adapter = self.broker_adapter_factory(self.settings)
             result = run_autonomous_monitoring_cycle(
@@ -671,17 +689,40 @@ class AutonomousRuntimeCoordinator:
                 settings=self.settings,
                 db=db,
             )
-            positions = _load_positions_by_symbol(
-                settings=self.settings,
-                db=db,
-                symbols=symbols,
-            )
-            items = _load_monitored_items(
-                settings=self.settings,
-                db=db,
-                exclude_pending_config=True,
-                symbols=symbols,
-            )
+            position_rows = db.execute(
+                select(ExecutionPosition.symbol, ExecutionPosition.quantity).where(
+                    ExecutionPosition.mode == self.settings.runtime_mode,
+                    ExecutionPosition.quantity > 0,
+                    ExecutionPosition.symbol.in_(symbols or [""]),
+                )
+            ).all()
+            item_rows = db.execute(
+                select(
+                    ExecutionPlanItem.id,
+                    ExecutionPlanItem.symbol,
+                    ExecutionPlanItem.intent,
+                    ExecutionPlanItem.status,
+                    ExecutionPlanItem.trigger_price,
+                ).where(
+                    ExecutionPlanItem.symbol.in_(symbols or [""]),
+                    (
+                        (ExecutionPlanItem.side == "buy")
+                        & ExecutionPlanItem.intent.in_(tuple(WATCH_BUY_INTENTS))
+                        & ExecutionPlanItem.status.in_(tuple(WATCH_MONITORING_STATUSES))
+                    )
+                    | (
+                        (ExecutionPlanItem.side == "sell")
+                        & ExecutionPlanItem.intent.in_(tuple(SELL_MONITORED_INTENTS))
+                        & ExecutionPlanItem.status.in_(
+                            tuple(
+                                SELL_ACTIVE_MONITORING_STATUSES
+                                | BLOCKED_MONITORING_STATUSES
+                                | PENDING_DISPATCH_MONITORING_STATUSES
+                            )
+                        )
+                    ),
+                )
+            ).all()
             filled_today_symbols = _load_filled_today_symbols(
                 settings=self.settings,
                 db=db,
@@ -689,21 +730,21 @@ class AutonomousRuntimeCoordinator:
             )
             cached_items = [
                 CachedMonitoringItem(
-                    id=item.id,
-                    symbol=item.symbol,
-                    intent=item.intent,
-                    status=item.status,
+                    id=str(item.id),
+                    symbol=str(item.symbol),
+                    intent=str(item.intent),
+                    status=str(item.status),
                     trigger_price=item.trigger_price,
                 )
-                for item in items
+                for item in item_rows
             ]
         return MonitoringRuntimeSnapshot(
             loaded_at=loaded_at,
             symbols=symbols,
             positions_by_symbol={
-                symbol: CachedMonitoringPosition(symbol=symbol, quantity=position.quantity)
-                for symbol, position in positions.items()
-                if position.quantity > 0
+                str(row.symbol): CachedMonitoringPosition(symbol=str(row.symbol), quantity=int(row.quantity))
+                for row in position_rows
+                if row.quantity > 0
             },
             items=cached_items,
             filled_today_symbols=filled_today_symbols,
@@ -1154,6 +1195,22 @@ def _cached_watch_buy_trigger_price(item: CachedMonitoringItem) -> Decimal | Non
 
 def _cached_watch_buy_direction(item: CachedMonitoringItem) -> str:
     return "at_or_above"
+
+
+def _triggered_symbols_from_cached_payload(payload: dict[str, object]) -> set[str]:
+    items = payload.get("items")
+    if not isinstance(items, list):
+        return set()
+    symbols: set[str] = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if item.get("outcome") != "triggered":
+            continue
+        symbol = item.get("symbol")
+        if isinstance(symbol, str) and symbol:
+            symbols.add(symbol)
+    return symbols
 
 
 def _parse_decimal(value: object) -> Decimal | None:
