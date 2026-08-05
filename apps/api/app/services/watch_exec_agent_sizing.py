@@ -22,6 +22,7 @@ from app.core.config import Settings
 from app.db.sqlite_diagnostics import sqlite_write_lock
 from app.models.runtime import ExecutionPlan, ExecutionPlanItem, ExecutionPlanItemAudit
 from app.services.broker_auth import ensure_authenticated_broker_session
+from app.services.json_compaction import compact_json_object
 from app.services.live_market_context import load_live_market_regime_context, merge_live_market_regime_context
 from app.services.market_regime_guardrails import evaluate_market_regime_guardrail
 from app.services.reconciliation import reconcile_stale_nonterminal_broker_orders
@@ -989,7 +990,7 @@ def _reject_stale_state_blocked_item(
         "decided_at": datetime.now(UTC).isoformat(),
     }
     previous_policy = item.quantity_policy if isinstance(item.quantity_policy, dict) else None
-    item.quantity_policy = {
+    item.quantity_policy = compact_json_object({
         "kind": "exec_agent_rejected",
         "source": "watch_exec_agent_sizing",
         "exec_agent_decision": summary,
@@ -1000,7 +1001,7 @@ def _reject_stale_state_blocked_item(
         },
         "stale_state_blockers": _json_safe(blockers),
         "previous_policy": previous_policy,
-    }
+    })
     item.status = "exec_agent_rejected"
     _add_plan_item_audit(
         db=db,
@@ -1109,8 +1110,8 @@ def _record_sizing_attempt(
         quantity_policy["exec_agent_watch_sizing_attempt_count"] = attempt
         quantity_policy["exec_agent_watch_sizing_max_attempts"] = max_attempts
         quantity_policy["exec_agent_watch_sizing_fallback_allowed"] = bool(not success and attempt >= max_attempts)
-        quantity_policy["exec_agent_watch_sizing_attempts"] = [*events[-9:], event]
-        item.quantity_policy = quantity_policy
+        quantity_policy["exec_agent_watch_sizing_attempts"] = [*events[-2:], event]
+        item.quantity_policy = compact_json_object(quantity_policy)
 
 
 def _request_exec_agent_decisions(*, settings: Settings, payload: dict[str, object]) -> dict[str, object]:
@@ -1308,7 +1309,7 @@ def _apply_decisions(
                 decision["reason"] = envelope_block_reason
                 record = _decision_record(decision=decision, item=item, version=str(decision_payload.get("version") or ""))
                 previous_policy = item.quantity_policy if isinstance(item.quantity_policy, dict) else None
-                item.quantity_policy = {
+                item.quantity_policy = compact_json_object({
                     "kind": "exec_agent_rejected",
                     "source": "exec_agent_watch_sizing",
                     "reason_code": "allowed_action_envelope_blocked",
@@ -1322,7 +1323,7 @@ def _apply_decisions(
                     "allowed_action_envelope": envelope,
                     "market_regime_guardrail": envelope.get("market_regime_guardrail"),
                     "previous_policy": previous_policy,
-                }
+                })
                 item.status = "exec_agent_rejected"
                 rejected += 1
                 continue
@@ -1341,7 +1342,7 @@ def _apply_decisions(
                 decision["reason"] = sizing["reason"]
                 record = _decision_record(decision=decision, item=item, version=str(decision_payload.get("version") or ""))
                 previous_policy = item.quantity_policy if isinstance(item.quantity_policy, dict) else None
-                item.quantity_policy = {
+                item.quantity_policy = compact_json_object({
                     "kind": "exec_agent_rejected",
                     "source": "exec_agent_watch_sizing",
                     "reason_code": sizing["reason_code"],
@@ -1362,7 +1363,7 @@ def _apply_decisions(
                     "allowed_action_envelope": envelope,
                     "market_regime_guardrail": envelope.get("market_regime_guardrail"),
                     "previous_policy": previous_policy,
-                }
+                })
                 _add_plan_item_audit(
                     db=db,
                     item=item,
@@ -1388,7 +1389,7 @@ def _apply_decisions(
                 decision["reason"] = "allowed action envelope left no buyable quantity"
                 record = _decision_record(decision=decision, item=item, version=str(decision_payload.get("version") or ""))
                 previous_policy = item.quantity_policy if isinstance(item.quantity_policy, dict) else None
-                item.quantity_policy = {
+                item.quantity_policy = compact_json_object({
                     "kind": "exec_agent_rejected",
                     "source": "exec_agent_watch_sizing",
                     "exec_agent_decision": _decision_summary(record),
@@ -1400,12 +1401,12 @@ def _apply_decisions(
                     "allowed_action_envelope": envelope,
                     "market_regime_guardrail": envelope.get("market_regime_guardrail"),
                     "previous_policy": previous_policy,
-                }
+                })
                 item.status = "exec_agent_rejected"
                 rejected += 1
                 continue
             previous_policy = item.quantity_policy if isinstance(item.quantity_policy, dict) else None
-            item.quantity_policy = {
+            item.quantity_policy = compact_json_object({
                 "kind": "shares",
                 "quantity": quantity,
                 "source": "exec_agent_watch_sizing",
@@ -1431,12 +1432,12 @@ def _apply_decisions(
                 "allowed_action_envelope": envelope,
                 "market_regime_guardrail": envelope.get("market_regime_guardrail"),
                 "previous_policy": previous_policy,
-            }
+            })
             item.status = "watch_buy_triggered_blocked" if was_triggered_blocked else "watch_monitoring_active"
             approved += 1
         elif action == "reject":
             previous_policy = item.quantity_policy if isinstance(item.quantity_policy, dict) else None
-            item.quantity_policy = {
+            item.quantity_policy = compact_json_object({
                 "kind": "exec_agent_rejected",
                 "source": "exec_agent_watch_sizing",
                 "exec_agent_decision": _decision_summary(record),
@@ -1446,7 +1447,7 @@ def _apply_decisions(
                     "storage": "execution_plan_item_audits",
                 },
                 "previous_policy": previous_policy,
-            }
+            })
             item.status = "exec_agent_rejected"
             rejected += 1
         else:

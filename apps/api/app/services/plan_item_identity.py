@@ -50,24 +50,34 @@ def raw_plan_item_payload(plan_item: ExecutionPlanItem) -> dict[str, Any] | None
 def plan_item_decision_agent_name(plan_item: ExecutionPlanItem) -> str | None:
     if plan_item.decision_agent_name:
         return plan_item.decision_agent_name
+    if "risk_context" in sa_inspect(plan_item).unloaded:
+        return None
     return _first_string_value(plan_item=plan_item, keys=_DECISION_AGENT_KEYS)
 
 
 def plan_item_decision_run_id(plan_item: ExecutionPlanItem) -> str | None:
     if plan_item.decision_run_id:
         return plan_item.decision_run_id
+    if "risk_context" in sa_inspect(plan_item).unloaded:
+        return None
     return _first_string_value(plan_item=plan_item, keys=_DECISION_RUN_ID_KEYS)
 
 
 def plan_item_source_plan_item_id(plan_item: ExecutionPlanItem) -> str | None:
     if plan_item.source_plan_item_id:
         return plan_item.source_plan_item_id
+    if "risk_context" in sa_inspect(plan_item).unloaded:
+        return None
     return _first_string_value(plan_item=plan_item, keys=_SOURCE_PLAN_ITEM_ID_KEYS)
 
 
 def plan_item_source_market_date(plan_item: ExecutionPlanItem) -> date | None:
     if plan_item.source_market_date is not None:
         return plan_item.source_market_date
+    if "risk_context" in sa_inspect(plan_item).unloaded:
+        if "plan" in sa_inspect(plan_item).unloaded:
+            return None
+        return plan_item.plan.market_date
     parsed = _first_date_value(plan_item=plan_item, keys=_SOURCE_MARKET_DATE_KEYS)
     if parsed is not None:
         return parsed
@@ -144,7 +154,7 @@ def _candidate_payloads(plan_item: ExecutionPlanItem) -> list[dict[str, Any]]:
     raw_item = raw_plan_item_payload(plan_item)
     if raw_item is not None:
         payloads.append(raw_item)
-    if isinstance(plan_item.risk_context, dict):
+    if "risk_context" not in sa_inspect(plan_item).unloaded and isinstance(plan_item.risk_context, dict):
         payloads.append(plan_item.risk_context)
     if "plan" in sa_inspect(plan_item).unloaded:
         return payloads

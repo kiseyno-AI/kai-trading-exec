@@ -1,4 +1,5 @@
 import asyncio
+import os
 import threading
 from datetime import UTC, datetime, timedelta
 
@@ -131,3 +132,31 @@ def test_monitoring_stale_mutex_skips_until_original_cycle_finishes() -> None:
     finally:
         release_first_cycle.set()
         first_thread.join(timeout=1)
+
+
+def test_monitoring_stale_mutex_exits_when_guard_enabled(monkeypatch) -> None:  # noqa: ANN001
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        autonomous_runtime_enabled=True,
+        monitoring_cycle_timeout_seconds=10,
+        monitoring_exit_on_stale_cycle_enabled=True,
+        monitoring_stale_cycle_exit_grace_multiplier=2,
+    )
+    coordinator = AutonomousRuntimeCoordinator(
+        settings=settings,
+        session_factory=None,  # type: ignore[arg-type]
+        broker_adapter_factory=lambda settings: None,  # type: ignore[arg-type,return-value]
+    )
+    exit_codes: list[int] = []
+    monkeypatch.setattr(os, "_exit", lambda code: exit_codes.append(code))
+    coordinator._monitoring_cycle_mutex_started_at = datetime(2026, 8, 1, 1, 0, tzinfo=UTC)
+    assert coordinator._monitoring_cycle_mutex.acquire(blocking=False)
+    try:
+        payload = coordinator._monitoring_cycle_sync_guarded(
+            datetime(2026, 8, 1, 1, 0, 20, tzinfo=UTC)
+        )
+    finally:
+        coordinator._monitoring_cycle_mutex.release()
+
+    assert payload["reason"] == "previous_monitoring_cycle_still_running"
+    assert exit_codes == [75]

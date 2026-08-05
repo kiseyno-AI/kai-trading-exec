@@ -28,9 +28,11 @@ class Settings(BaseModel):
     monitoring_expire_prior_market_watch_buys_enabled: bool = True
     monitoring_max_symbols_per_cycle: int = Field(default=128, ge=0, le=10000)
     monitoring_auto_symbol_batch_target_seconds: float = Field(default=12.0, gt=0, le=300)
-    monitoring_max_broker_actions_per_cycle: int = Field(default=32, ge=1, le=10000)
+    monitoring_max_broker_actions_per_cycle: int = Field(default=32, ge=0, le=10000)
     monitoring_max_quote_age_seconds: int = Field(default=30, ge=1, le=3600)
     monitoring_watch_buy_retry_cooldown_seconds: int = Field(default=5, ge=1, le=3600)
+    monitoring_exit_on_stale_cycle_enabled: bool = False
+    monitoring_stale_cycle_exit_grace_multiplier: float = Field(default=2.0, ge=1.0, le=20.0)
     stale_broker_order_reconciliation_threshold_seconds: int = Field(default=86400, ge=60, le=31536000)
     watch_buy_high_risk_gate_enabled: bool = True
     watch_buy_high_atr_pct_threshold: Decimal = Field(default=Decimal("9.0"), ge=0, le=Decimal("100"))
@@ -231,6 +233,8 @@ _ENV_FIELDS = {
     "MONITORING_MAX_BROKER_ACTIONS_PER_CYCLE": "monitoring_max_broker_actions_per_cycle",
     "MONITORING_MAX_QUOTE_AGE_SECONDS": "monitoring_max_quote_age_seconds",
     "MONITORING_WATCH_BUY_RETRY_COOLDOWN_SECONDS": "monitoring_watch_buy_retry_cooldown_seconds",
+    "MONITORING_EXIT_ON_STALE_CYCLE_ENABLED": "monitoring_exit_on_stale_cycle_enabled",
+    "MONITORING_STALE_CYCLE_EXIT_GRACE_MULTIPLIER": "monitoring_stale_cycle_exit_grace_multiplier",
     "STALE_BROKER_ORDER_RECONCILIATION_THRESHOLD_SECONDS": "stale_broker_order_reconciliation_threshold_seconds",
     "WATCH_BUY_HIGH_RISK_GATE_ENABLED": "watch_buy_high_risk_gate_enabled",
     "WATCH_BUY_HIGH_ATR_PCT_THRESHOLD": "watch_buy_high_atr_pct_threshold",

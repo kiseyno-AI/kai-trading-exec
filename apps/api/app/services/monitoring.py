@@ -15,6 +15,7 @@ from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import and_, distinct, func, or_, select, tuple_
+from sqlalchemy import inspect as sa_inspect
 from sqlalchemy.orm import Session, load_only, selectinload
 
 from app.api.schemas.execution import (
@@ -38,6 +39,7 @@ from app.services.reconciliation import (
     sync_execution_positions_from_broker_snapshot,
 )
 from app.services.broker_orders import place_broker_order
+from app.services.json_compaction import compact_json_object
 from app.services.plan_item_identity import serialize_plan_item_source_identity
 from app.services.risk_sizing import (
     RiskSizingRejection,
@@ -945,7 +947,7 @@ def _evaluate_monitoring_cycle(
     if released_drawdown_blocks:
         db.flush()
     skip_pre_cycle_broker_reconciliation = (
-        allow_persisted_triggered_without_price and bool(symbols) and not prices
+        allow_persisted_triggered_without_price and bool(symbols)
     )
     _log_cycle_step(
         "drawdown_release",
@@ -1391,6 +1393,97 @@ def _evaluate_monitoring_cycle(
 
     max_broker_actions = settings.monitoring_max_broker_actions_per_cycle
     pending_symbols = deque(symbol_order)
+    if max_broker_actions <= 0:
+        backlog_symbols: set[str] = set()
+        for symbol, symbol_actions in actions_by_symbol.items():
+            while symbol_actions:
+                action = symbol_actions.popleft()
+                backlog_symbols.add(symbol)
+                deferred_item_count += 1
+                action.item.status = _pending_dispatch_status(action.item.intent)
+                result_by_item_id[action.item.id] = _monitoring_result_payload(
+                    item=action.item,
+                    observed_price=action.observed_price,
+                    outcome="deferred",
+                    message="broker action capacity is disabled for this monitoring cycle",
+                )
+        results = [
+            result_by_item_id[item_id]
+            for item_id in evaluated_item_ids
+            if item_id in result_by_item_id
+        ]
+        db.flush()
+        agent_status_counts = (
+            {
+                "watching": 0,
+                "pending_agent_decision": 0,
+                "agent_delayed": 0,
+                "agent_rejected": 0,
+                "agent_approved_submitted": 0,
+            }
+            if skip_pre_cycle_broker_reconciliation
+            else _trigger_time_agent_status_counts(settings=settings, db=db)
+        )
+        checkpoint_details = {
+            "topology": MONITORING_RUNTIME_TOPOLOGY,
+            "selection_strategy": MONITORING_SELECTION_STRATEGY,
+            "max_symbols_per_cycle": settings.monitoring_max_symbols_per_cycle,
+            "max_broker_actions_per_cycle": max_broker_actions,
+            "dispatch_action_count": 0,
+            "evaluated_item_count": len(results),
+            "triggered_item_count": triggered_item_count,
+            "submitted_order_count": 0,
+            "blocked_item_count": blocked_item_count,
+            "deferred_item_count": deferred_item_count,
+            "price_count": len(prices),
+            "evaluated_symbol_count": len(evaluated_symbols),
+            "triggered_symbol_count": len(triggered_symbols),
+            "retried_triggered_item_count": retried_triggered_item_count,
+            "retried_triggered_symbols": sorted(retried_triggered_symbols),
+            "submitted_symbols": [],
+            "backlog_item_count": deferred_item_count,
+            "backlog_symbols": sorted(backlog_symbols),
+            "agent_watching_count": agent_status_counts["watching"],
+            "agent_pending_decision_count": agent_status_counts["pending_agent_decision"],
+            "agent_delayed_count": agent_status_counts["agent_delayed"],
+            "agent_rejected_count": agent_status_counts["agent_rejected"],
+            "agent_approved_submitted_count": agent_status_counts["agent_approved_submitted"],
+            "post_entry_review_count": post_entry_review_count,
+            "protective_stop_coverage": _protective_stop_coverage_payload(
+                issues=coverage_issues,
+                repaired_count=repaired_stop_coverage_count,
+            ),
+            "profit_target_coverage": _profit_target_coverage_payload(
+                issues=profit_target_coverage_issues,
+            ),
+        }
+        checkpoint = _update_monitoring_checkpoint(
+            settings=settings,
+            db=db,
+            worker_name=MONITORING_WORKER_NAME,
+            triggered_at=triggered_at,
+            status="degraded" if deferred_item_count > 0 else "running",
+            details=checkpoint_details,
+        )
+        _log_cycle_step("broker_actions_disabled", deferred_item_count=deferred_item_count)
+        return EvaluateMonitoringResult(
+            status_code=200,
+            payload={
+                "triggered_at": triggered_at.isoformat(),
+                "worker_name": checkpoint.worker_name,
+                "evaluated_item_count": len(results),
+                "triggered_item_count": triggered_item_count,
+                "submitted_order_count": 0,
+                "blocked_item_count": blocked_item_count,
+                "deferred_item_count": deferred_item_count,
+                "evaluated_symbol_count": checkpoint_details["evaluated_symbol_count"],
+                "triggered_symbol_count": checkpoint_details["triggered_symbol_count"],
+                "submitted_symbols": [],
+                "protective_stop_coverage": checkpoint_details["protective_stop_coverage"],
+                "profit_target_coverage": checkpoint_details["profit_target_coverage"],
+                "items": results,
+            },
+        )
     while pending_symbols:
         symbol = pending_symbols.popleft()
         symbol_actions = actions_by_symbol.get(symbol)
@@ -2266,7 +2359,7 @@ def _apply_trigger_time_agent_adjustments(
             intent="stop_sell",
             trigger_price=decision.updated_stop_price,
         )
-    item.risk_context = risk_context
+    item.risk_context = compact_json_object(risk_context)
 
 
 def _record_trigger_time_watch_buy_sizing_result(
@@ -2311,9 +2404,12 @@ def _record_trigger_time_watch_buy_sizing_result(
         interactions = [*interactions[:-1], updated_interaction]
     else:
         interactions = [updated_interaction]
-    risk_context["last_trigger_time_exec_agent_interaction"] = updated_interaction
-    risk_context["trigger_time_exec_agent_interactions"] = interactions[-20:]
-    item.risk_context = risk_context
+    risk_context["last_trigger_time_exec_agent_interaction"] = compact_json_object(updated_interaction)
+    risk_context["trigger_time_exec_agent_interactions"] = [
+        compact_json_object(interaction, max_depth=3, max_list_items=5)
+        for interaction in interactions[-3:]
+    ]
+    item.risk_context = compact_json_object(risk_context)
 
 
 def _update_sibling_trigger_price(
@@ -4468,7 +4564,7 @@ def _apply_post_entry_review_state(
         prior_stop = item.trigger_price
         item.trigger_price = tightened_stop
         maintenance_count += 1
-        item.risk_context = risk_context
+        item.risk_context = compact_json_object(risk_context)
         _record_monitoring_event(
             item=item,
             event={
@@ -4481,7 +4577,7 @@ def _apply_post_entry_review_state(
             },
         )
         risk_context = dict(item.risk_context) if isinstance(item.risk_context, dict) else {}
-    item.risk_context = risk_context
+    item.risk_context = compact_json_object(risk_context)
     if review["requires_review"] is True and not (
         isinstance(previous, dict) and previous.get("reasons") == review.get("reasons")
     ):
@@ -4906,7 +5002,7 @@ def _record_watch_buy_trigger_cross(
     item: ExecutionPlanItem,
     metadata: dict[str, object],
 ) -> None:
-    risk_context = dict(item.risk_context) if isinstance(item.risk_context, dict) else {}
+    risk_context = dict(_loaded_risk_context(item))
     previous = risk_context.get("watch_buy_trigger_cross")
     risk_context["watch_buy_trigger_cross"] = metadata
     risk_context["latest_live_market_context"] = {
@@ -4914,7 +5010,7 @@ def _record_watch_buy_trigger_cross(
         for key in ("day_high", "day_low", "observed_price", "observed_at", "volume", "turnover")
         if key in metadata
     }
-    item.risk_context = risk_context
+    item.risk_context = compact_json_object(risk_context)
     if not isinstance(previous, dict):
         _record_monitoring_event(
             item=item,
@@ -4926,9 +5022,7 @@ def _record_watch_buy_trigger_cross(
 
 
 def _persisted_watch_buy_trigger_cross(item: ExecutionPlanItem) -> dict[str, object] | None:
-    risk_context = item.risk_context
-    if not isinstance(risk_context, dict):
-        return None
+    risk_context = _loaded_risk_context(item)
     trigger_cross = risk_context.get("watch_buy_trigger_cross")
     if not isinstance(trigger_cross, dict):
         return None
@@ -5084,7 +5178,7 @@ def _update_profit_protection_state(
         "giveback_threshold_pct": _serialize_decimal(settings.profit_protection_giveback_pct),
     }
     risk_context["profit_protection"] = updated_state
-    item.risk_context = risk_context
+    item.risk_context = compact_json_object(risk_context)
     return updated_state
 
 
@@ -5450,7 +5544,7 @@ def _record_watch_buy_stale_trigger_reclaim_bypass(
 ) -> None:
     risk_context = dict(item.risk_context) if isinstance(item.risk_context, dict) else {}
     risk_context["last_stale_trigger_reclaim_check"] = details
-    item.risk_context = risk_context
+    item.risk_context = compact_json_object(risk_context)
 
 
 def _watch_buy_is_pullback_strategy(item: ExecutionPlanItem) -> bool:
@@ -5515,7 +5609,7 @@ def _apply_watch_buy_effective_stop(
     risk_context["stop_price"] = _serialize_decimal(effective_stop)
     risk_context["stop_loss_price"] = _serialize_decimal(effective_stop)
     risk_context["stop_monitor_adjustment"] = "raised_to_effective_risk_stop"
-    item.risk_context = risk_context
+    item.risk_context = compact_json_object(risk_context)
     _update_sibling_trigger_price(
         item=item,
         intent="stop_sell",
@@ -5547,7 +5641,7 @@ def _watch_buy_exec_agent_sizing_fallback_allowed(
     settings: Settings,
     item: ExecutionPlanItem,
 ) -> bool:
-    risk_context = item.risk_context if isinstance(item.risk_context, dict) else {}
+    risk_context = _loaded_risk_context(item)
     quantity_policy = item.quantity_policy if isinstance(item.quantity_policy, dict) else {}
     if (
         quantity_policy.get("exec_agent_watch_sizing_fallback_allowed") is True
@@ -5569,7 +5663,7 @@ def _watch_buy_exec_agent_sizing_fallback_allowed(
 
 
 def _first_payload_value(item: ExecutionPlanItem, key: str) -> object | None:
-    for payload in (item.quantity_policy, item.risk_context):
+    for payload in (item.quantity_policy, _loaded_risk_context(item)):
         if isinstance(payload, dict) and key in payload:
             return payload.get(key)
     return None
@@ -6377,17 +6471,30 @@ def _first_positive_decimal_from_item(
 
 
 def _watch_buy_monitoring_context(item: ExecutionPlanItem) -> dict[str, object]:
-    risk_context = item.risk_context if isinstance(item.risk_context, dict) else {}
+    risk_context = _loaded_risk_context(item)
     monitoring = risk_context.get("watch_buy_monitoring")
     return monitoring if isinstance(monitoring, dict) else {}
 
 
 def _item_payload_sources(item: ExecutionPlanItem) -> list[dict[str, object]]:
     sources: list[dict[str, object]] = []
-    for source in (item.risk_context, item.quantity_policy):
+    for source in (item.quantity_policy, _loaded_risk_context(item)):
         if isinstance(source, dict):
             sources.append(source)
     return sources
+
+
+def _loaded_risk_context(item: ExecutionPlanItem) -> dict[str, object]:
+    if "risk_context" in sa_inspect(item).unloaded:
+        session = sa_inspect(item).session
+        bind = session.get_bind() if session is not None else None
+        database = getattr(getattr(bind, "url", None), "database", None)
+        if database in {None, "", ":memory:"}:
+            risk_context = item.risk_context
+            return risk_context if isinstance(risk_context, dict) else {}
+        return {}
+    risk_context = item.risk_context
+    return risk_context if isinstance(risk_context, dict) else {}
 
 
 def _parse_positive_decimal(value: object) -> Decimal | None:
@@ -6495,13 +6602,13 @@ def _record_monitoring_event(
     item: ExecutionPlanItem,
     event: dict[str, object],
 ) -> None:
-    risk_context = dict(item.risk_context) if isinstance(item.risk_context, dict) else {}
-    events = risk_context.get("monitoring_events")
-    if not isinstance(events, list):
-        events = []
+    risk_context = dict(_loaded_risk_context(item))
+    monitoring_events = risk_context.get("monitoring_events")
+    if not isinstance(monitoring_events, list):
+        monitoring_events = []
+    risk_context["monitoring_events"] = [*monitoring_events[-2:], event]
     risk_context["last_monitoring_event"] = event
-    risk_context["monitoring_events"] = [*events[-9:], event]
-    item.risk_context = risk_context
+    item.risk_context = compact_json_object(risk_context)
 
 
 def _plan_item_exchange(item: ExecutionPlanItem) -> str:
@@ -6732,8 +6839,8 @@ def _monitoring_result_payload(
         payload["direction"] = _watch_buy_direction(item)
         monitoring = _watch_buy_monitoring_context(item)
         tactical_action = monitoring.get("tactical_action")
-        if tactical_action is None and isinstance(item.risk_context, dict):
-            tactical_action = item.risk_context.get("tactical_action")
+        if tactical_action is None:
+            tactical_action = _loaded_risk_context(item).get("tactical_action")
         if tactical_action is not None:
             payload["tactical_action"] = tactical_action
     if message is not None:
