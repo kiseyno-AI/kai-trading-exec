@@ -641,6 +641,19 @@ class AutonomousRuntimeCoordinator:
             return payload
 
         triggered_symbols = _triggered_symbols_from_cached_payload(cached_payload)
+        if cached_payload["triggered_item_count"] > 0 and not triggered_symbols:
+            payload = {
+                "status_code": 200,
+                "monitored_symbols": symbols,
+                "price_count": len(prices),
+                "price_source_configured": self._monitoring_price_source_state.configured,
+                "price_source": self._monitoring_price_source_state.snapshot(),
+                "runtime_snapshot": runtime_snapshot.snapshot(),
+                "reason": "cached_triggered_symbols_empty",
+                **cached_payload,
+            }
+            self._store_cycle_payload(worker_key="monitoring", payload=payload)
+            return payload
         if triggered_symbols and self.settings.monitoring_max_broker_actions_per_cycle <= 0:
             payload = {
                 "status_code": 200,
@@ -1153,6 +1166,7 @@ class AutonomousRuntimeCoordinator:
             "deferred_item_count": deferred_item_count,
             "evaluated_symbol_count": len(evaluated_symbols),
             "triggered_symbol_count": len(triggered_symbols),
+            "triggered_symbols": sorted(triggered_symbols),
             "submitted_symbols": [],
             "protective_stop_coverage": {
                 "status": "cached",
@@ -1586,6 +1600,13 @@ def _decode_cached_risk_context(raw_context: object) -> dict[str, object] | None
 
 
 def _triggered_symbols_from_cached_payload(payload: dict[str, object]) -> set[str]:
+    raw_symbols = payload.get("triggered_symbols")
+    if isinstance(raw_symbols, list):
+        return {
+            symbol
+            for symbol in raw_symbols
+            if isinstance(symbol, str) and symbol
+        }
     items = payload.get("items")
     if not isinstance(items, list):
         return set()
