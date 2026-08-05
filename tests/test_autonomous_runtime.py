@@ -8,6 +8,7 @@ from app.core.config import Settings
 from app.services.autonomous_runtime import (
     AutonomousRuntimeCoordinator,
     CachedMonitoringItem,
+    MonitoringRuntimeSnapshot,
     _cached_monitoring_item_triggered,
     _cached_trigger_direction_from_risk_context,
 )
@@ -75,6 +76,50 @@ def test_cached_trigger_direction_treats_chase_block_as_pullback_wait() -> None:
     )
 
     assert _cached_trigger_direction_from_risk_context(raw_context) == "at_or_below"
+
+
+def test_cached_monitoring_cycle_ignores_terminal_watch_rows() -> None:
+    settings = Settings(database_url="sqlite:///:memory:")
+    coordinator = AutonomousRuntimeCoordinator(
+        settings=settings,
+        session_factory=None,  # type: ignore[arg-type]
+        broker_adapter_factory=lambda settings: None,  # type: ignore[arg-type,return-value]
+    )
+    observed_at = datetime(2026, 8, 5, tzinfo=UTC)
+    snapshot = MonitoringRuntimeSnapshot(
+        loaded_at=observed_at,
+        symbols=["005930"],
+        positions_by_symbol={},
+        filled_today_symbols=[],
+        items=[
+            CachedMonitoringItem(
+                id="expired-watch",
+                symbol="005930",
+                intent="intraday_watch_buy",
+                status="watch_expired",
+                trigger_price=Decimal("100"),
+                trigger_direction="at_or_above",
+            ),
+            CachedMonitoringItem(
+                id="active-watch",
+                symbol="005930",
+                intent="intraday_watch_buy",
+                status="watch_monitoring_active",
+                trigger_price=Decimal("100"),
+                trigger_direction="at_or_above",
+            ),
+        ],
+    )
+
+    payload = coordinator._evaluate_cached_monitoring_cycle(
+        runtime_snapshot=snapshot,
+        prices=[type("Price", (), {"symbol": "005930", "price": Decimal("101")})()],
+        started_at=observed_at,
+    )
+
+    assert payload["evaluated_item_count"] == 1
+    assert payload["triggered_item_count"] == 1
+    assert payload["items"][0]["execution_plan_item_id"] == "active-watch"
 
 
 def test_monitoring_timeout_does_not_block_next_scheduler_tick() -> None:

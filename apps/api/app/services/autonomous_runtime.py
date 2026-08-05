@@ -46,6 +46,16 @@ MONITORING_LOOP_WORKER_NAME = "monitoring_dispatch_loop"
 WATCH_EXEC_AGENT_SIZING_WORKER_NAME = "watch_exec_agent_sizing_loop"
 NXT_ELIGIBLE_SYNC_WORKER_NAME = "nxt_eligible_sync_loop"
 MAX_STATUS_DETAIL_ITEMS = 20
+ACTIONABLE_CACHED_WATCH_STATUSES = frozenset(
+    {
+        "watch_monitoring_active",
+        "watch_monitoring_pending",
+        "agent_delay",
+        "triggered_pending_agent",
+        "watch_buy_triggered_pending_dispatch",
+        "watch_buy_triggered_blocked",
+    }
+)
 KRX_TIMEZONE = ZoneInfo("Asia/Seoul")
 
 
@@ -1089,6 +1099,8 @@ class AutonomousRuntimeCoordinator:
                 item.intent not in WATCH_BUY_INTENTS
                 and item.symbol not in runtime_snapshot.positions_by_symbol
             ):
+                continue
+            if item.intent in WATCH_BUY_INTENTS and item.status not in ACTIONABLE_CACHED_WATCH_STATUSES:
                 continue
             price = prices_by_symbol.get(item.symbol)
             observed_price = price.price if price is not None else None
