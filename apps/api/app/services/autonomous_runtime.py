@@ -49,11 +49,8 @@ MAX_STATUS_DETAIL_ITEMS = 20
 ACTIONABLE_CACHED_WATCH_STATUSES = frozenset(
     {
         "watch_monitoring_active",
-        "watch_monitoring_pending",
         "agent_delay",
-        "triggered_pending_agent",
         "watch_buy_triggered_pending_dispatch",
-        "watch_buy_triggered_blocked",
     }
 )
 KRX_TIMEZONE = ZoneInfo("Asia/Seoul")
