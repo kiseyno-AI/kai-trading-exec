@@ -19,7 +19,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.api.schemas.execution import MonitoringPriceRequest
 from app.broker.base import BrokerAdapter
 from app.core.config import Settings
-from app.models.runtime import BrokerOrder, ExecutionFill
+from app.models.runtime import BrokerOrder, ExecutionFill, MonitoringCheckpoint
 from app.models.runtime import ExecutionPlanItem, ExecutionPosition
 from app.services.execution_jobs import dispatch_due_execution_jobs
 from app.services.monitoring import (
@@ -43,6 +43,7 @@ LOGGER = logging.getLogger(__name__)
 
 DISPATCH_LOOP_WORKER_NAME = "execution_job_dispatch_loop"
 MONITORING_LOOP_WORKER_NAME = "monitoring_dispatch_loop"
+LEGACY_MONITORING_CHECKPOINT_WORKER_NAME = "intraday_target_stop_monitor"
 WATCH_EXEC_AGENT_SIZING_WORKER_NAME = "watch_exec_agent_sizing_loop"
 NXT_ELIGIBLE_SYNC_WORKER_NAME = "nxt_eligible_sync_loop"
 MAX_STATUS_DETAIL_ITEMS = 20
@@ -1324,6 +1325,46 @@ class AutonomousRuntimeCoordinator:
         with self._lock:
             state = self._state_for(worker_key)
             state.last_cycle = payload
+        if worker_key == "monitoring":
+            self._store_monitoring_checkpoint_payload(payload=payload)
+
+    def _store_monitoring_checkpoint_payload(self, *, payload: dict[str, object]) -> None:
+        triggered_at = _parse_payload_datetime(payload.get("triggered_at")) or datetime.now(UTC)
+        status = "running"
+        if payload.get("timeout") is True or int(payload.get("status_code") or 200) >= 500:
+            status = "error"
+        elif any(
+            int(payload.get(key) or 0) > 0
+            for key in ("submitted_order_count", "blocked_item_count", "deferred_item_count")
+        ):
+            status = "degraded"
+        details = dict(payload)
+        details["source"] = MONITORING_LOOP_WORKER_NAME
+        try:
+            with self.session_factory() as db:
+                checkpoint = db.scalar(
+                    select(MonitoringCheckpoint).where(
+                        MonitoringCheckpoint.worker_name == LEGACY_MONITORING_CHECKPOINT_WORKER_NAME,
+                        MonitoringCheckpoint.mode == self.settings.runtime_mode,
+                    )
+                )
+                if checkpoint is None:
+                    checkpoint = MonitoringCheckpoint(
+                        worker_name=LEGACY_MONITORING_CHECKPOINT_WORKER_NAME,
+                        mode=self.settings.runtime_mode,
+                    )
+                    db.add(checkpoint)
+                checkpoint.status = status
+                checkpoint.last_heartbeat_at = triggered_at
+                if status != "error":
+                    checkpoint.last_success_at = triggered_at
+                checkpoint.details = details
+                db.commit()
+        except Exception:
+            LOGGER.exception(
+                "monitoring_checkpoint_fast_path_update_failed",
+                extra={"runtime_mode": self.settings.runtime_mode},
+            )
 
     def _state_for(self, worker_key: str) -> AutonomousWorkerState:
         if worker_key == "dispatch":
@@ -1724,6 +1765,18 @@ def _serialize_datetime(value: datetime | None) -> str | None:
     if value is None:
         return None
     return value.isoformat()
+
+
+def _parse_payload_datetime(value: object) -> datetime | None:
+    if isinstance(value, datetime):
+        return value.astimezone(UTC) if value.tzinfo is not None else value.replace(tzinfo=UTC)
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed.astimezone(UTC) if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
 
 
 def _compact_cycle_payload(payload: dict[str, object] | None) -> dict[str, object] | None:
