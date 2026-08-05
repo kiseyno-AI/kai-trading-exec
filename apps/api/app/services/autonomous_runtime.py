@@ -389,9 +389,10 @@ class AutonomousRuntimeCoordinator:
                         "runtime_mode": self.settings.runtime_mode,
                         "timeout_seconds": timeout_seconds,
                     },
-                )
+        )
 
         task.add_done_callback(_log_late_failure)
+        self._exit_if_monitoring_cycle_is_stale(stale_age_seconds=timeout_seconds)
         return None
 
     async def _run_dispatch_cycle(self, started_at: datetime) -> dict[str, object]:

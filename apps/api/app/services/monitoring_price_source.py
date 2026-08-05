@@ -104,7 +104,10 @@ class KisCurrentQuoteMonitoringPriceSource:
 
             quote_results: dict[str, tuple[BrokerCurrentPrice | None, Exception | None]] = {}
             worker_count = min(MAX_QUOTE_WORKERS, len(unique_symbols))
-            quote_batch_timeout = max(float(settings.kis_request_timeout_seconds), 1.0) * worker_count + 1.0
+            quote_batch_timeout = min(
+                max(float(settings.kis_request_timeout_seconds), 1.0) * worker_count + 1.0,
+                max(float(settings.monitoring_cycle_timeout_seconds) * 0.45, 3.0),
+            )
             executor = ThreadPoolExecutor(max_workers=worker_count)
             futures = {
                 executor.submit(fetch_quote, symbol): symbol
