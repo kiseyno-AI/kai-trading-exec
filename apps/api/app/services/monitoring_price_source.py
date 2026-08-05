@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import TimeoutError, ThreadPoolExecutor, as_completed
 from decimal import Decimal
 import time
 from typing import Callable
@@ -104,19 +104,34 @@ class KisCurrentQuoteMonitoringPriceSource:
 
             quote_results: dict[str, tuple[BrokerCurrentPrice | None, Exception | None]] = {}
             worker_count = min(MAX_QUOTE_WORKERS, len(unique_symbols))
-            with ThreadPoolExecutor(max_workers=worker_count) as executor:
-                futures = {
-                    executor.submit(fetch_quote, symbol): symbol
-                    for symbol in unique_symbols
-                }
-                for future in as_completed(futures):
-                    symbol, quote, error = future.result()
-                    quote_results[symbol] = (quote, error)
+            quote_batch_timeout = max(float(settings.kis_request_timeout_seconds), 1.0) * worker_count + 1.0
+            executor = ThreadPoolExecutor(max_workers=worker_count)
+            futures = {
+                executor.submit(fetch_quote, symbol): symbol
+                for symbol in unique_symbols
+            }
+            try:
+                try:
+                    completed_futures = as_completed(futures, timeout=quote_batch_timeout)
+                    for future in completed_futures:
+                        symbol, quote, error = future.result()
+                        quote_results[symbol] = (quote, error)
+                except TimeoutError:
+                    for future, symbol in futures.items():
+                        if symbol in quote_results:
+                            continue
+                        future.cancel()
+                        quote_results[symbol] = (
+                            None,
+                            TimeoutError(f"quote batch timed out after {quote_batch_timeout:g}s"),
+                        )
+            finally:
+                executor.shutdown(wait=False, cancel_futures=True)
 
             retry_symbols = [
                 symbol
                 for symbol, (quote, error) in quote_results.items()
-                if quote is None and error is not None
+                if quote is None and error is not None and not isinstance(error, TimeoutError)
             ]
             for _attempt in range(QUOTE_RETRY_ATTEMPTS):
                 if not retry_symbols:
