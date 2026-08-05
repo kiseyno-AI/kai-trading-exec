@@ -518,6 +518,10 @@ class AutonomousRuntimeCoordinator:
                     items=[],
                     filled_today_symbols=[],
                 )
+                with self._lock:
+                    self._monitoring_runtime_snapshot = runtime_snapshot
+                self._refresh_monitoring_snapshot_filled_today(started_at)
+                runtime_snapshot = self._ensure_monitoring_runtime_snapshot(started_at)
                 payload = {
                     "status_code": 200,
                     "monitored_symbols": symbols,
@@ -564,8 +568,6 @@ class AutonomousRuntimeCoordinator:
                     "core_desired_symbols_fast_path": True,
                 }
                 self._store_cycle_payload(worker_key="monitoring", payload=payload)
-                with self._lock:
-                    self._monitoring_runtime_snapshot = runtime_snapshot
                 return payload
             runtime_snapshot = self._load_monitoring_runtime_snapshot_for_symbols(
                 loaded_at=started_at,
@@ -573,6 +575,8 @@ class AutonomousRuntimeCoordinator:
             )
             with self._lock:
                 self._monitoring_runtime_snapshot = runtime_snapshot
+            self._refresh_monitoring_snapshot_filled_today(started_at)
+            runtime_snapshot = self._ensure_monitoring_runtime_snapshot(started_at)
         else:
             runtime_snapshot = self._refresh_monitoring_runtime_snapshot(
                 loaded_at=started_at,
@@ -810,12 +814,19 @@ class AutonomousRuntimeCoordinator:
         adapter = self.broker_adapter_factory(self.settings)
         with self.session_factory() as db:
             try:
-                reconcile_pending_broker_orders(
+                result = reconcile_pending_broker_orders(
                     settings=self.settings,
                     db=db,
                     adapter=adapter,
                     symbols=symbols,
                 )
+                if int(result.get("fills_added") or 0) > 0:
+                    sync_execution_positions_from_broker_snapshot(
+                        settings=self.settings,
+                        db=db,
+                        adapter=adapter,
+                        symbols=symbols,
+                    )
                 db.commit()
             except Exception:
                 LOGGER.exception(

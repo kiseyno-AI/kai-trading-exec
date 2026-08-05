@@ -51,6 +51,7 @@ def build_test_app(
     *,
     autonomous_runtime_enabled: bool = False,
     monitoring_price_source: object | None = None,
+    broker_adapter_factory: object | None = None,
 ):
     app_settings = settings or Settings(database_url="sqlite:///:memory:")
     app_settings = app_settings.model_copy(
@@ -63,6 +64,7 @@ def build_test_app(
         settings=app_settings,
         engine=engine,
         session_factory=session_factory,
+        broker_adapter_factory=broker_adapter_factory,
         monitoring_price_source=monitoring_price_source,
     )
     return app, engine
@@ -2914,6 +2916,200 @@ def test_cached_autonomous_monitoring_repairs_targets_before_idle_exit() -> None
         target_item = session.get(ExecutionPlanItem, target_item_id)
         assert target_item is not None
         assert target_item.status == "target_sell_monitoring"
+
+    engine.dispose()
+
+
+def test_live_desired_symbol_reconcile_syncs_positions_and_filled_today(tmp_path, monkeypatch) -> None:
+    class StaticMonitoringPriceSource:
+        provider = "test"
+
+        def __init__(self, prices: dict[str, Decimal]) -> None:
+            self.prices = prices
+            self.calls: list[list[str]] = []
+
+        def __call__(
+            self,
+            *,
+            symbols: list[str],
+            observed_at: datetime,
+            settings: Settings,
+        ) -> list[MonitoringPriceRequest]:
+            assert settings
+            self.calls.append(list(symbols))
+            return [
+                MonitoringPriceRequest(
+                    symbol=symbol,
+                    price=self.prices[symbol],
+                    observed_at=observed_at,
+                )
+                for symbol in symbols
+                if symbol in self.prices
+            ]
+
+    class LiveFastPathBroker:
+        provider = "kis"
+
+        def __init__(self, observed_at: datetime) -> None:
+            self.observed_at = observed_at
+            self.reconcile_calls: list[tuple[str, str, datetime | None]] = []
+            self.account_snapshot_calls = 0
+
+        def describe(self) -> BrokerConfig:
+            return BrokerConfig(
+                provider="kis",
+                mode="live",
+                configured=True,
+                api_base_url="https://stub.kis.local",
+            )
+
+        def authenticate(self) -> BrokerTokenGrant:
+            return BrokerTokenGrant(
+                access_token="live-token",
+                token_type="Bearer",
+                access_token_expires_at=self.observed_at + timedelta(hours=1),
+            )
+
+        def issue_realtime_approval(self, access_token: str) -> BrokerRealtimeApproval:
+            assert access_token
+            return BrokerRealtimeApproval(approval_key="approval", issued_at=self.observed_at)
+
+        def revoke(self, access_token: str) -> BrokerTokenRevocation:
+            assert access_token
+            return BrokerTokenRevocation(message="revoked")
+
+        def reconnect_handle(self) -> BrokerReconnectHandle:
+            return BrokerReconnectHandle(supported=True, strategy="stub")
+
+        def reconcile_order(
+            self,
+            access_token: str,
+            broker_order_id: str,
+            *,
+            exchange: str = "KRX",
+            submitted_at: datetime | None = None,
+        ) -> dict[str, object]:
+            assert access_token
+            self.reconcile_calls.append((broker_order_id, exchange, submitted_at))
+            return {
+                "broker_order_id": broker_order_id,
+                "status": "filled",
+                "filled_quantity": 3,
+                "remaining_quantity": 0,
+                "average_fill_price": "100.00",
+                "filled_at": self.observed_at.isoformat(),
+                "observed_at": self.observed_at.isoformat(),
+            }
+
+        def get_account_snapshot(self, access_token: str) -> BrokerAccountSnapshot:
+            assert access_token
+            self.account_snapshot_calls += 1
+            return BrokerAccountSnapshot(
+                available_cash=Decimal("1000000"),
+                observed_at=self.observed_at,
+                source="stub:account_snapshot",
+                holdings=[
+                    BrokerAccountHolding(
+                        symbol="002380",
+                        quantity=3,
+                        average_price=Decimal("100.00"),
+                        sellable_quantity=3,
+                    )
+                ],
+            )
+
+    started_at = datetime(2026, 6, 8, 1, 5, tzinfo=UTC)
+    monkeypatch.setenv("KAI_EXEC_MONITORING_SYMBOL_PRIORITY", "002380")
+    price_source = StaticMonitoringPriceSource({"002380": Decimal("105.00")})
+    broker = LiveFastPathBroker(started_at)
+    app, engine = build_test_app(
+        Settings(
+            database_url=f"sqlite:///{tmp_path / 'live-fast-path-reconcile.db'}",
+            runtime_mode="live",
+            autonomous_runtime_enabled=True,
+            kis_app_key="live-key",
+            kis_app_secret="live-secret",
+            kis_account_number="12345678",
+        ),
+        autonomous_runtime_enabled=True,
+        monitoring_price_source=price_source,
+        broker_adapter_factory=lambda _settings: broker,
+    )
+
+    with app.state.db_session_factory() as session:
+        plan = ExecutionPlan(
+            external_plan_id="live-fast-path-reconcile",
+            source="test",
+            mode="live",
+            market_date=started_at.date(),
+        )
+        buy_item = ExecutionPlanItem(
+            execution_plan_id=plan.id,
+            plan_item_index=0,
+            symbol="002380",
+            side="buy",
+            intent="intraday_watch_buy",
+            status="broker_order_submitted",
+            trigger_price=Decimal("100.00"),
+            limit_price=Decimal("100.00"),
+            quantity_policy={"kind": "shares", "quantity": 3},
+        )
+        target_item = ExecutionPlanItem(
+            execution_plan_id=plan.id,
+            plan_item_index=1,
+            symbol="002380",
+            side="sell",
+            intent="target_sell",
+            status="target_sell_monitoring",
+            trigger_price=Decimal("110.00"),
+            limit_price=Decimal("110.00"),
+            quantity_policy={"kind": "shares", "quantity": 3},
+        )
+        plan.items.extend([buy_item, target_item])
+        session.add(plan)
+        session.flush()
+        session.add(
+            BrokerOrder(
+                broker_name="kis",
+                mode="live",
+                execution_plan_item_id=buy_item.id,
+                idempotency_key=f"monitoring:watch_buy:{buy_item.id}",
+                broker_order_id="fast-path-buy-1",
+                symbol="002380",
+                side="buy",
+                status="submitted",
+                quantity=3,
+                limit_price=Decimal("100.00"),
+                submitted_at=started_at - timedelta(minutes=1),
+            )
+        )
+        session.commit()
+
+    payload = app.state.autonomous_runtime._monitoring_cycle_sync(started_at)
+
+    assert broker.reconcile_calls == [
+        ("fast-path-buy-1", "KRX", (started_at - timedelta(minutes=1)).replace(tzinfo=None))
+    ]
+    assert broker.account_snapshot_calls == 1
+    assert price_source.calls == [["002380"]]
+    assert payload["cached_evaluation"] is True
+    assert payload["evaluated_item_count"] == 1
+    assert target_item.id in {item["execution_plan_item_id"] for item in payload["items"]}
+    assert payload["runtime_snapshot"]["position_count"] == 1
+    assert payload["runtime_snapshot"]["filled_today_symbols"] == ["002380"]
+
+    with app.state.db_session_factory() as session:
+        position = session.scalar(
+            select(ExecutionPosition).where(
+                ExecutionPosition.mode == "live",
+                ExecutionPosition.symbol == "002380",
+            )
+        )
+        fills = session.scalars(select(ExecutionFill).where(ExecutionFill.symbol == "002380")).all()
+        assert position is not None
+        assert position.quantity == 3
+        assert position.updated_from == "reconciliation"
+        assert len(fills) == 1
 
     engine.dispose()
 
