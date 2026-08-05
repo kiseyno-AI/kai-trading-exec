@@ -494,6 +494,8 @@ class AutonomousRuntimeCoordinator:
 
     def _monitoring_cycle_sync(self, started_at: datetime) -> dict[str, object]:
         desired_symbols = _load_core_desired_monitoring_symbols(settings=self.settings)
+        if not desired_symbols:
+            desired_symbols = self._load_local_desired_monitoring_symbols_from_sqlite()
         if desired_symbols:
             symbols = desired_symbols[: self.settings.monitoring_max_symbols_per_cycle or len(desired_symbols)]
             if self.settings.monitoring_max_broker_actions_per_cycle <= 0:
@@ -923,6 +925,72 @@ class AutonomousRuntimeCoordinator:
             items=cached_items,
             filled_today_symbols=[],
         )
+
+    def _load_local_desired_monitoring_symbols_from_sqlite(self) -> list[str]:
+        try:
+            url = make_url(self.settings.database_url)
+        except Exception:
+            return []
+        if not url.drivername.startswith("sqlite") or not url.database or url.database == ":memory:":
+            return []
+        limit = self.settings.monitoring_max_symbols_per_cycle or 128
+        buy_statuses = tuple(WATCH_MONITORING_STATUSES)
+        sell_statuses = tuple(
+            SELL_ACTIVE_MONITORING_STATUSES
+            | BLOCKED_MONITORING_STATUSES
+            | PENDING_DISPATCH_MONITORING_STATUSES
+        )
+        buy_status_placeholders = ",".join("?" for _ in buy_statuses)
+        sell_status_placeholders = ",".join("?" for _ in sell_statuses)
+        buy_intent_placeholders = ",".join("?" for _ in WATCH_BUY_INTENTS)
+        sell_intent_placeholders = ",".join("?" for _ in SELL_MONITORED_INTENTS)
+        try:
+            with sqlite3.connect(f"file:{url.database}?mode=ro", uri=True, timeout=5) as conn:
+                position_rows = conn.execute(
+                    """
+                    select symbol
+                    from execution_positions
+                    where mode = ? and quantity > 0
+                    order by symbol asc
+                    limit ?
+                    """,
+                    [self.settings.runtime_mode, limit],
+                ).fetchall()
+                item_rows = conn.execute(
+                    f"""
+                    select distinct symbol
+                    from execution_plan_items
+                    where (
+                        side = 'buy'
+                        and status in ({buy_status_placeholders})
+                        and intent in ({buy_intent_placeholders})
+                    ) or (
+                        side = 'sell'
+                        and status in ({sell_status_placeholders})
+                        and intent in ({sell_intent_placeholders})
+                    )
+                    order by symbol asc
+                    limit ?
+                    """,
+                    [*buy_statuses, *WATCH_BUY_INTENTS, *sell_statuses, *SELL_MONITORED_INTENTS, limit * 2],
+                ).fetchall()
+        except sqlite3.Error:
+            LOGGER.exception(
+                "monitoring_sqlite_local_symbol_fallback_failed",
+                extra={"runtime_mode": self.settings.runtime_mode},
+            )
+            return []
+        ordered: list[str] = []
+        seen: set[str] = set()
+        for row in [*position_rows, *item_rows]:
+            symbol = str(row[0] or "").strip()
+            if not symbol or symbol in seen:
+                continue
+            ordered.append(symbol)
+            seen.add(symbol)
+            if len(ordered) >= limit:
+                break
+        return ordered
 
     def _load_monitoring_runtime_snapshot_for_symbols_with_session(
         self,

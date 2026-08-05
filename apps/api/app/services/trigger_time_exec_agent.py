@@ -29,6 +29,7 @@ from app.services.broker_auth import ensure_authenticated_broker_session
 from app.services.live_market_context import load_live_market_regime_context, merge_live_market_regime_context
 from app.services.plan_item_identity import serialize_plan_item_source_identity
 from app.services.broker_order_state import active_local_broker_order_filters
+from app.services.json_compaction import compact_json_object, compact_json_payload, json_payload_hash
 from app.services.trade_outcome_feedback import load_latest_trade_outcome_feedback_snippet
 
 TRIGGER_TIME_EXEC_AGENT_VERSION = "trigger-time-exec-agent-v1"
@@ -315,12 +316,17 @@ def record_trigger_time_exec_agent_interaction(
     interactions = risk_context.get("trigger_time_exec_agent_interactions")
     if not isinstance(interactions, list):
         interactions = []
+    compact_request_payload = compact_json_object(
+        resolution.request_payload,
+        max_depth=8,
+        drop_keys=frozenset({"decider_handoff_context", "decider_input_context", "decider_input", "decider_output"}),
+    )
     interaction = {
         "version": TRIGGER_TIME_EXEC_AGENT_VERSION,
         "source": resolution.source,
         "request_payload_hash": resolution.request_payload_hash,
-        "request_payload": _json_safe(resolution.request_payload),
-        "response_payload": _json_safe(resolution.response_payload),
+        "request_payload": compact_request_payload,
+        "response_payload": compact_json_object(resolution.response_payload),
         "decision": resolution.decision.model_dump(mode="json"),
         "model": resolution.request_payload.get("model"),
         "agent_id": resolution.request_payload.get("agent_id"),
@@ -335,8 +341,11 @@ def record_trigger_time_exec_agent_interaction(
     if order is not None:
         interaction["order"] = order
     risk_context["last_trigger_time_exec_agent_interaction"] = interaction
-    risk_context["trigger_time_exec_agent_interactions"] = [*interactions[-19:], interaction]
-    item.risk_context = risk_context
+    risk_context["trigger_time_exec_agent_interactions"] = [
+        compact_json_object(prior, max_depth=3, max_list_items=5)
+        for prior in [*interactions[-2:], interaction]
+    ]
+    item.risk_context = compact_json_object(risk_context, max_depth=8)
 
 
 def attach_order_to_last_trigger_time_interaction(
@@ -363,9 +372,12 @@ def attach_order_to_last_trigger_time_interaction(
         interactions = [*interactions[:-1], updated]
     else:
         interactions = [updated]
-    risk_context["last_trigger_time_exec_agent_interaction"] = updated
-    risk_context["trigger_time_exec_agent_interactions"] = interactions[-20:]
-    item.risk_context = risk_context
+    risk_context["last_trigger_time_exec_agent_interaction"] = compact_json_object(updated, max_depth=8)
+    risk_context["trigger_time_exec_agent_interactions"] = [
+        compact_json_object(interaction, max_depth=3, max_list_items=5)
+        for interaction in interactions[-3:]
+    ]
+    item.risk_context = compact_json_object(risk_context, max_depth=8)
 
 
 def _request_payload(
@@ -434,7 +446,7 @@ def _signal_context(*, item: ExecutionPlanItem, side: Literal["buy", "sell"]) ->
         "source_identity": serialize_plan_item_source_identity(item),
         "trigger_price": _decimal_text(item.trigger_price),
         "limit_price": _decimal_text(item.limit_price),
-        "quantity_policy": quantity_policy,
+        "quantity_policy": compact_json_object(quantity_policy, max_depth=3, max_list_items=5),
         "original_target_price": _first_text(
             risk_context,
             quantity_policy,
@@ -451,7 +463,7 @@ def _signal_context(*, item: ExecutionPlanItem, side: Literal["buy", "sell"]) ->
             keys=("confidence", "confidence_score_10", "score", "probability"),
         ),
         "conviction": _first_text(risk_context, quantity_policy, keys=("conviction", "conviction_score_10")),
-        "scoring_summary": _compact_dict(
+        "scoring_summary": compact_json_payload(_compact_dict(
             risk_context,
             keys=(
                 "score",
@@ -461,7 +473,7 @@ def _signal_context(*, item: ExecutionPlanItem, side: Literal["buy", "sell"]) ->
                 "target_tag",
                 "supporting_evidence",
             ),
-        ),
+        ), max_depth=3, max_list_items=5),
         "market_regime_context": _first_dict(
             risk_context,
             keys=("market_regime", "market_context", "market_regime_context"),
@@ -472,10 +484,16 @@ def _signal_context(*, item: ExecutionPlanItem, side: Literal["buy", "sell"]) ->
             keys=("rationale", "reason", "thesis_summary", "decision_rationale"),
         ),
         "risks": risk_context.get("decision_risks") or risk_context.get("risk_flags"),
-        "decider_input": _dict_or_none(risk_context.get("decider_input")),
-        "decider_output": _dict_or_none(risk_context.get("decider_output")),
-        "decider_handoff_context": _dict_or_none(risk_context.get("decider_handoff_context")),
+        "decider_input_hash": _payload_hash_or_none(risk_context.get("decider_input")),
+        "decider_output_hash": _payload_hash_or_none(risk_context.get("decider_output")),
+        "decider_handoff_context_hash": _payload_hash_or_none(risk_context.get("decider_handoff_context")),
     }
+
+
+def _payload_hash_or_none(value: object) -> str | None:
+    if value is None:
+        return None
+    return json_payload_hash(value)
 
 
 def _market_context(

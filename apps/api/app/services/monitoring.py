@@ -39,6 +39,7 @@ from app.services.reconciliation import (
     sync_execution_positions_from_broker_snapshot,
 )
 from app.services.broker_orders import place_broker_order
+from app.services.json_compaction import compact_json_object
 from app.services.plan_item_identity import serialize_plan_item_source_identity
 from app.services.risk_sizing import (
     RiskSizingRejection,
@@ -2358,7 +2359,7 @@ def _apply_trigger_time_agent_adjustments(
             intent="stop_sell",
             trigger_price=decision.updated_stop_price,
         )
-    item.risk_context = risk_context
+    item.risk_context = compact_json_object(risk_context)
 
 
 def _record_trigger_time_watch_buy_sizing_result(
@@ -2403,9 +2404,12 @@ def _record_trigger_time_watch_buy_sizing_result(
         interactions = [*interactions[:-1], updated_interaction]
     else:
         interactions = [updated_interaction]
-    risk_context["last_trigger_time_exec_agent_interaction"] = updated_interaction
-    risk_context["trigger_time_exec_agent_interactions"] = interactions[-20:]
-    item.risk_context = risk_context
+    risk_context["last_trigger_time_exec_agent_interaction"] = compact_json_object(updated_interaction)
+    risk_context["trigger_time_exec_agent_interactions"] = [
+        compact_json_object(interaction, max_depth=3, max_list_items=5)
+        for interaction in interactions[-3:]
+    ]
+    item.risk_context = compact_json_object(risk_context)
 
 
 def _update_sibling_trigger_price(
@@ -4560,7 +4564,7 @@ def _apply_post_entry_review_state(
         prior_stop = item.trigger_price
         item.trigger_price = tightened_stop
         maintenance_count += 1
-        item.risk_context = risk_context
+        item.risk_context = compact_json_object(risk_context)
         _record_monitoring_event(
             item=item,
             event={
@@ -4573,7 +4577,7 @@ def _apply_post_entry_review_state(
             },
         )
         risk_context = dict(item.risk_context) if isinstance(item.risk_context, dict) else {}
-    item.risk_context = risk_context
+    item.risk_context = compact_json_object(risk_context)
     if review["requires_review"] is True and not (
         isinstance(previous, dict) and previous.get("reasons") == review.get("reasons")
     ):
@@ -5006,7 +5010,7 @@ def _record_watch_buy_trigger_cross(
         for key in ("day_high", "day_low", "observed_price", "observed_at", "volume", "turnover")
         if key in metadata
     }
-    item.risk_context = risk_context
+    item.risk_context = compact_json_object(risk_context)
     if not isinstance(previous, dict):
         _record_monitoring_event(
             item=item,
@@ -5174,7 +5178,7 @@ def _update_profit_protection_state(
         "giveback_threshold_pct": _serialize_decimal(settings.profit_protection_giveback_pct),
     }
     risk_context["profit_protection"] = updated_state
-    item.risk_context = risk_context
+    item.risk_context = compact_json_object(risk_context)
     return updated_state
 
 
@@ -5540,7 +5544,7 @@ def _record_watch_buy_stale_trigger_reclaim_bypass(
 ) -> None:
     risk_context = dict(item.risk_context) if isinstance(item.risk_context, dict) else {}
     risk_context["last_stale_trigger_reclaim_check"] = details
-    item.risk_context = risk_context
+    item.risk_context = compact_json_object(risk_context)
 
 
 def _watch_buy_is_pullback_strategy(item: ExecutionPlanItem) -> bool:
@@ -5605,7 +5609,7 @@ def _apply_watch_buy_effective_stop(
     risk_context["stop_price"] = _serialize_decimal(effective_stop)
     risk_context["stop_loss_price"] = _serialize_decimal(effective_stop)
     risk_context["stop_monitor_adjustment"] = "raised_to_effective_risk_stop"
-    item.risk_context = risk_context
+    item.risk_context = compact_json_object(risk_context)
     _update_sibling_trigger_price(
         item=item,
         intent="stop_sell",
@@ -6599,8 +6603,12 @@ def _record_monitoring_event(
     event: dict[str, object],
 ) -> None:
     risk_context = dict(_loaded_risk_context(item))
+    monitoring_events = risk_context.get("monitoring_events")
+    if not isinstance(monitoring_events, list):
+        monitoring_events = []
+    risk_context["monitoring_events"] = [*monitoring_events[-2:], event]
     risk_context["last_monitoring_event"] = event
-    item.risk_context = risk_context
+    item.risk_context = compact_json_object(risk_context)
 
 
 def _plan_item_exchange(item: ExecutionPlanItem) -> str:

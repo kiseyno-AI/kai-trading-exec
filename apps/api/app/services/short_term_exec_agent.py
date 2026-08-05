@@ -16,6 +16,7 @@ from app.broker.base import (
 from app.core.config import Settings
 from app.models.runtime import BrokerOrder, ExecutionPlan, ExecutionPlanItem, ExecutionPosition
 from app.services.broker_auth import ensure_authenticated_broker_session
+from app.services.json_compaction import compact_json_object
 
 SHORT_TERM_DECIDER_NAME = "short-term-decider"
 NEXT_OPEN_BUY_INTENT = "next_open_buy"
@@ -558,7 +559,7 @@ def _approve(
         quantity=quantity,
         notional=notional,
     )
-    item.risk_context = risk_context
+    item.risk_context = compact_json_object(risk_context)
 
 
 def _reject(
@@ -586,7 +587,7 @@ def _record_decision(
         "reason": reason,
         "details": _json_safe(details or {}),
     }
-    item.risk_context = risk_context
+    item.risk_context = compact_json_object(risk_context)
 
 
 def _decision_payload(
@@ -725,7 +726,7 @@ def _link_monitoring_item(
         "entry_quantity": quantity,
         "linked_by": EXEC_AGENT_NAME,
     }
-    monitor_item.risk_context = risk_context
+    monitor_item.risk_context = compact_json_object(risk_context)
 
 
 def _monitor_quantity_supported(quantity_policy: dict[str, object] | None) -> bool:
