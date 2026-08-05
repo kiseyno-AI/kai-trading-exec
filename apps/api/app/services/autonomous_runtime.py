@@ -1522,6 +1522,12 @@ def _cached_trigger_direction_from_risk_context(raw_context: object) -> str | No
     context = _decode_cached_risk_context(raw_context)
     if not isinstance(context, dict):
         return None
+    last_event = context.get("last_monitoring_event")
+    if isinstance(last_event, dict) and (
+        last_event.get("event") == "watch_buy_pullback_wait"
+        or last_event.get("reason") == "price_above_chase_limit"
+    ):
+        return "at_or_below"
     sources: list[dict[str, object]] = [context]
     for key in (
         "traceability",

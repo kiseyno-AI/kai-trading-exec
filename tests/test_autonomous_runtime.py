@@ -68,6 +68,15 @@ def test_cached_trigger_direction_reads_nested_risk_context_json() -> None:
     )
 
 
+def test_cached_trigger_direction_treats_chase_block_as_pullback_wait() -> None:
+    raw_context = (
+        '{"watch_buy_monitoring":{"direction":"at_or_above"},'
+        '"last_monitoring_event":{"event":"watch_buy_pullback_wait","reason":"price_above_chase_limit"}}'
+    )
+
+    assert _cached_trigger_direction_from_risk_context(raw_context) == "at_or_below"
+
+
 def test_monitoring_timeout_does_not_block_next_scheduler_tick() -> None:
     async def scenario() -> None:
         settings = Settings(
