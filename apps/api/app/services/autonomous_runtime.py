@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import sqlite3
@@ -119,6 +120,7 @@ class CachedMonitoringItem:
     intent: str
     status: str
     trigger_price: Decimal | None
+    trigger_direction: str | None = None
 
 
 @dataclass(frozen=True)
@@ -878,7 +880,7 @@ class AutonomousRuntimeCoordinator:
                 ).fetchall()
                 buy_item_rows = conn.execute(
                     f"""
-                    select id, symbol, intent, status, trigger_price
+                    select id, symbol, intent, status, trigger_price, risk_context
                     from execution_plan_items
                     where side = 'buy'
                       and status in ({watch_status_placeholders})
@@ -889,7 +891,7 @@ class AutonomousRuntimeCoordinator:
                 ).fetchall()
                 sell_item_rows = conn.execute(
                     f"""
-                    select id, symbol, intent, status, trigger_price
+                    select id, symbol, intent, status, trigger_price, risk_context
                     from execution_plan_items
                     where side = 'sell'
                       and status in ({sell_status_placeholders})
@@ -911,6 +913,7 @@ class AutonomousRuntimeCoordinator:
                 intent=str(row[2]),
                 status=str(row[3]),
                 trigger_price=Decimal(str(row[4])) if row[4] is not None else None,
+                trigger_direction=_cached_trigger_direction_from_risk_context(row[5]),
             )
             for row in [*buy_item_rows, *sell_item_rows]
         ]
@@ -1013,6 +1016,7 @@ class AutonomousRuntimeCoordinator:
                     ExecutionPlanItem.intent,
                     ExecutionPlanItem.status,
                     ExecutionPlanItem.trigger_price,
+                    ExecutionPlanItem.risk_context,
                 ).where(
                     ExecutionPlanItem.side == "buy",
                     ExecutionPlanItem.status.in_(tuple(WATCH_MONITORING_STATUSES)),
@@ -1027,6 +1031,7 @@ class AutonomousRuntimeCoordinator:
                     ExecutionPlanItem.intent,
                     ExecutionPlanItem.status,
                     ExecutionPlanItem.trigger_price,
+                    ExecutionPlanItem.risk_context,
                 ).where(
                     ExecutionPlanItem.side == "sell",
                     ExecutionPlanItem.status.in_(
@@ -1048,6 +1053,7 @@ class AutonomousRuntimeCoordinator:
                     intent=str(item.intent),
                     status=str(item.status),
                     trigger_price=item.trigger_price,
+                    trigger_direction=_cached_trigger_direction_from_risk_context(item.risk_context),
                 )
                 for item in item_rows
             ]
@@ -1507,7 +1513,51 @@ def _cached_watch_buy_trigger_price(item: CachedMonitoringItem) -> Decimal | Non
 
 
 def _cached_watch_buy_direction(item: CachedMonitoringItem) -> str:
-    return "at_or_above"
+    if item.trigger_direction in {"at_or_above", "at_or_below"}:
+        return item.trigger_direction
+    return "at_or_below"
+
+
+def _cached_trigger_direction_from_risk_context(raw_context: object) -> str | None:
+    context = _decode_cached_risk_context(raw_context)
+    if not isinstance(context, dict):
+        return None
+    sources: list[dict[str, object]] = [context]
+    for key in (
+        "traceability",
+        "short_term",
+        "handoff",
+        "entry_context",
+        "monitoring",
+        "watch_buy_monitoring",
+        "trigger_cross",
+    ):
+        value = context.get(key)
+        if isinstance(value, dict):
+            sources.append(value)
+    for source in sources:
+        for key in ("trigger_direction", "entry_direction", "watch_direction", "direction"):
+            value = source.get(key)
+            if not isinstance(value, str):
+                continue
+            normalized = value.strip().lower()
+            if normalized in {"up", "above", "breakout", "momentum", ">=", "at_or_above"}:
+                return "at_or_above"
+            if normalized in {"down", "below", "pullback", "dip", "<=", "at_or_below"}:
+                return "at_or_below"
+    return None
+
+
+def _decode_cached_risk_context(raw_context: object) -> dict[str, object] | None:
+    if isinstance(raw_context, dict):
+        return raw_context
+    if isinstance(raw_context, str) and raw_context.strip():
+        try:
+            decoded = json.loads(raw_context)
+        except json.JSONDecodeError:
+            return None
+        return decoded if isinstance(decoded, dict) else None
+    return None
 
 
 def _triggered_symbols_from_cached_payload(payload: dict[str, object]) -> set[str]:

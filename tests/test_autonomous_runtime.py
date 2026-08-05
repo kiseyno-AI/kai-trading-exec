@@ -2,9 +2,70 @@ import asyncio
 import os
 import threading
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 
 from app.core.config import Settings
-from app.services.autonomous_runtime import AutonomousRuntimeCoordinator
+from app.services.autonomous_runtime import (
+    AutonomousRuntimeCoordinator,
+    CachedMonitoringItem,
+    _cached_monitoring_item_triggered,
+    _cached_trigger_direction_from_risk_context,
+)
+
+
+def test_cached_watch_buy_trigger_uses_pullback_direction() -> None:
+    item = CachedMonitoringItem(
+        id="watch-1",
+        symbol="005930",
+        intent="intraday_watch_buy",
+        status="watch_monitoring_active",
+        trigger_price=Decimal("100"),
+        trigger_direction="at_or_below",
+    )
+
+    assert _cached_monitoring_item_triggered(
+        item=item,
+        observed_price=Decimal("99"),
+        triggered_at=datetime(2026, 8, 5, tzinfo=UTC),
+    )
+    assert not _cached_monitoring_item_triggered(
+        item=item,
+        observed_price=Decimal("101"),
+        triggered_at=datetime(2026, 8, 5, tzinfo=UTC),
+    )
+
+
+def test_cached_watch_buy_trigger_preserves_breakout_direction() -> None:
+    item = CachedMonitoringItem(
+        id="watch-1",
+        symbol="005930",
+        intent="intraday_watch_buy",
+        status="watch_monitoring_active",
+        trigger_price=Decimal("100"),
+        trigger_direction="at_or_above",
+    )
+
+    assert _cached_monitoring_item_triggered(
+        item=item,
+        observed_price=Decimal("101"),
+        triggered_at=datetime(2026, 8, 5, tzinfo=UTC),
+    )
+    assert not _cached_monitoring_item_triggered(
+        item=item,
+        observed_price=Decimal("99"),
+        triggered_at=datetime(2026, 8, 5, tzinfo=UTC),
+    )
+
+
+def test_cached_trigger_direction_reads_nested_risk_context_json() -> None:
+    assert (
+        _cached_trigger_direction_from_risk_context('{"watch_buy_monitoring":{"direction":"at_or_below"}}')
+        == "at_or_below"
+    )
+    assert (
+        _cached_trigger_direction_from_risk_context('{"entry_context":{"trigger_direction":"breakout"}}')
+        == "at_or_above"
+    )
 
 
 def test_monitoring_timeout_does_not_block_next_scheduler_tick() -> None:
