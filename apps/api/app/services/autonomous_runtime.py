@@ -35,7 +35,10 @@ from app.services.monitoring import (
     _load_core_desired_monitoring_symbols,
 )
 from app.services.nxt_eligibility import refresh_nxt_eligible_symbols
-from app.services.reconciliation import sync_execution_positions_from_broker_snapshot
+from app.services.reconciliation import (
+    reconcile_pending_broker_orders,
+    sync_execution_positions_from_broker_snapshot,
+)
 from app.services.watch_exec_agent_sizing import run_due_watch_exec_agent_sizing
 
 LOGGER = logging.getLogger(__name__)
@@ -158,6 +161,7 @@ class AutonomousRuntimeCoordinator:
     _monitoring_price_source_state: MonitoringPriceSourceState = field(init=False)
     _monitoring_runtime_snapshot: MonitoringRuntimeSnapshot | None = field(default=None, init=False)
     _monitoring_snapshot_last_reconciled_at: datetime | None = field(default=None, init=False)
+    _monitoring_order_reconcile_last_at: datetime | None = field(default=None, init=False)
     _monitoring_cycle_mutex: threading.Lock = field(default_factory=threading.Lock, init=False)
     _monitoring_cycle_mutex_started_at: datetime | None = field(default=None, init=False)
 
@@ -498,6 +502,10 @@ class AutonomousRuntimeCoordinator:
             desired_symbols = self._load_local_desired_monitoring_symbols_from_sqlite()
         if desired_symbols:
             symbols = desired_symbols[: self.settings.monitoring_max_symbols_per_cycle or len(desired_symbols)]
+            self._reconcile_monitoring_orders_if_due(
+                now=started_at,
+                symbols=set(symbols),
+            )
             if self.settings.monitoring_max_broker_actions_per_cycle <= 0:
                 prices = self._load_monitoring_prices(
                     symbols=symbols,
@@ -510,6 +518,10 @@ class AutonomousRuntimeCoordinator:
                     items=[],
                     filled_today_symbols=[],
                 )
+                with self._lock:
+                    self._monitoring_runtime_snapshot = runtime_snapshot
+                self._refresh_monitoring_snapshot_filled_today(started_at)
+                runtime_snapshot = self._ensure_monitoring_runtime_snapshot(started_at)
                 payload = {
                     "status_code": 200,
                     "monitored_symbols": symbols,
@@ -556,8 +568,6 @@ class AutonomousRuntimeCoordinator:
                     "core_desired_symbols_fast_path": True,
                 }
                 self._store_cycle_payload(worker_key="monitoring", payload=payload)
-                with self._lock:
-                    self._monitoring_runtime_snapshot = runtime_snapshot
                 return payload
             runtime_snapshot = self._load_monitoring_runtime_snapshot_for_symbols(
                 loaded_at=started_at,
@@ -565,6 +575,8 @@ class AutonomousRuntimeCoordinator:
             )
             with self._lock:
                 self._monitoring_runtime_snapshot = runtime_snapshot
+            self._refresh_monitoring_snapshot_filled_today(started_at)
+            runtime_snapshot = self._ensure_monitoring_runtime_snapshot(started_at)
         else:
             runtime_snapshot = self._refresh_monitoring_runtime_snapshot(
                 loaded_at=started_at,
@@ -676,6 +688,12 @@ class AutonomousRuntimeCoordinator:
             if post_entry_maintenance_count:
                 payload["pre_cached_post_entry_maintenance_count"] = post_entry_maintenance_count
             self._store_cycle_payload(worker_key="monitoring", payload=payload)
+            if int(result.payload.get("submitted_order_count") or 0) > 0:
+                self._reconcile_monitoring_orders_if_due(
+                    now=datetime.now(UTC),
+                    symbols=set(symbols),
+                    force=True,
+                )
             if not desired_symbols:
                 self._refresh_monitoring_runtime_snapshot(
                     loaded_at=started_at,
@@ -777,6 +795,51 @@ class AutonomousRuntimeCoordinator:
                     snapshot,
                     filled_today_symbols=filled_today_symbols,
                 )
+
+    def _reconcile_monitoring_orders_if_due(
+        self,
+        *,
+        now: datetime,
+        symbols: set[str],
+        force: bool = False,
+    ) -> None:
+        if self.settings.runtime_mode != "live":
+            return
+        if not symbols:
+            return
+        if not force and self._monitoring_order_reconcile_last_at is not None:
+            elapsed = (now - self._monitoring_order_reconcile_last_at).total_seconds()
+            if elapsed < max(60, self.settings.monitoring_loop_interval_seconds):
+                return
+        adapter = self.broker_adapter_factory(self.settings)
+        with self.session_factory() as db:
+            try:
+                result = reconcile_pending_broker_orders(
+                    settings=self.settings,
+                    db=db,
+                    adapter=adapter,
+                    symbols=symbols,
+                )
+                if int(result.get("fills_added") or 0) > 0:
+                    sync_execution_positions_from_broker_snapshot(
+                        settings=self.settings,
+                        db=db,
+                        adapter=adapter,
+                        symbols=symbols,
+                    )
+                db.commit()
+            except Exception:
+                LOGGER.exception(
+                    "monitoring_order_reconcile_failed",
+                    extra={
+                        "runtime_mode": self.settings.runtime_mode,
+                        "symbol_count": len(symbols),
+                        "force": force,
+                    },
+                )
+                return
+        self._monitoring_order_reconcile_last_at = now
+        self._refresh_monitoring_snapshot_filled_today(now)
 
     def _repair_post_entry_exit_monitors_for_cached_cycle(
         self,
