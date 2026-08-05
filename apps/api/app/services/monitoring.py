@@ -2530,6 +2530,7 @@ def _load_monitored_items(
                         ExecutionPlanItem.limit_price,
                         ExecutionPlanItem.trigger_price,
                         ExecutionPlanItem.time_in_force,
+                        ExecutionPlanItem.risk_context,
                         ExecutionPlanItem.decision_agent_name,
                         ExecutionPlanItem.decision_snapshot_id,
                         ExecutionPlanItem.decision_run_id,
@@ -2598,6 +2599,7 @@ def _load_monitored_items(
                     ExecutionPlanItem.limit_price,
                     ExecutionPlanItem.trigger_price,
                     ExecutionPlanItem.time_in_force,
+                    ExecutionPlanItem.risk_context,
                     ExecutionPlanItem.source_market_date,
                 ),
                 selectinload(ExecutionPlanItem.plan).load_only(
