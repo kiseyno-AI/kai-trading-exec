@@ -660,7 +660,17 @@ class AutonomousRuntimeCoordinator:
                 symbol for symbol in symbols if symbol in triggered_symbols
             ][:broker_action_limit]
             symbols = ordered_triggered_symbols
-            prices = [price for price in prices if price.symbol in set(ordered_triggered_symbols)]
+            selected_prices = [
+                price for price in prices if price.symbol in set(ordered_triggered_symbols)
+            ]
+            if len(prices) > len(ordered_triggered_symbols):
+                fresh_action_prices = self._load_monitoring_prices(
+                    symbols=ordered_triggered_symbols,
+                    observed_at=datetime.now(UTC),
+                )
+                prices = fresh_action_prices or selected_prices
+            else:
+                prices = selected_prices
             with self.session_factory() as db:
                 adapter = self.broker_adapter_factory(self.settings)
                 result = run_autonomous_monitoring_cycle(
