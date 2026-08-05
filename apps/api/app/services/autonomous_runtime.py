@@ -128,6 +128,7 @@ class CachedMonitoringItem:
     status: str
     trigger_price: Decimal | None
     trigger_direction: str | None = None
+    chase_limit_price: Decimal | None = None
 
 
 @dataclass(frozen=True)
@@ -944,6 +945,7 @@ class AutonomousRuntimeCoordinator:
                 status=str(row[3]),
                 trigger_price=Decimal(str(row[4])) if row[4] is not None else None,
                 trigger_direction=_cached_trigger_direction_from_risk_context(row[5]),
+                chase_limit_price=_cached_chase_limit_price_from_risk_context(row[5]),
             )
             for row in [*buy_item_rows, *sell_item_rows]
         ]
@@ -1084,6 +1086,7 @@ class AutonomousRuntimeCoordinator:
                     status=str(item.status),
                     trigger_price=item.trigger_price,
                     trigger_direction=_cached_trigger_direction_from_risk_context(item.risk_context),
+                    chase_limit_price=_cached_chase_limit_price_from_risk_context(item.risk_context),
                 )
                 for item in item_rows
             ]
@@ -1139,6 +1142,9 @@ class AutonomousRuntimeCoordinator:
             elif triggered and item.intent == "max_holding_close_sell":
                 deferred_item_count += 1
                 outcome = "deferred"
+            elif triggered and _cached_watch_buy_chase_blocked(item=item, observed_price=observed_price):
+                blocked_item_count += 1
+                outcome = "blocked"
             elif triggered:
                 triggered_item_count += 1
                 triggered_symbols.add(item.symbol)
@@ -1154,6 +1160,11 @@ class AutonomousRuntimeCoordinator:
                     "trigger_price": str(item.trigger_price) if item.trigger_price is not None else None,
                     "observed_price": str(observed_price) if observed_price is not None else None,
                     "outcome": outcome,
+                    "block_reason": (
+                        "price_above_chase_limit"
+                        if outcome == "blocked" and item.intent in WATCH_BUY_INTENTS
+                        else None
+                    ),
                 }
             )
         return {
@@ -1549,6 +1560,46 @@ def _cached_watch_buy_direction(item: CachedMonitoringItem) -> str:
     if item.trigger_direction in {"at_or_above", "at_or_below"}:
         return item.trigger_direction
     return "at_or_below"
+
+
+def _cached_watch_buy_chase_blocked(
+    *,
+    item: CachedMonitoringItem,
+    observed_price: Decimal | None,
+) -> bool:
+    if item.intent not in WATCH_BUY_INTENTS or observed_price is None:
+        return False
+    chase_limit_price = item.chase_limit_price
+    if chase_limit_price is None:
+        return False
+    if _cached_watch_buy_direction(item) == "at_or_above":
+        return observed_price > chase_limit_price
+    return observed_price < chase_limit_price
+
+
+def _cached_chase_limit_price_from_risk_context(raw_context: object) -> Decimal | None:
+    context = _decode_cached_risk_context(raw_context)
+    if not isinstance(context, dict):
+        return None
+    sources: list[dict[str, object]] = [context]
+    for key in (
+        "watch_buy_monitoring",
+        "last_monitoring_event",
+        "watch_buy_trigger_cross",
+        "trigger_cross",
+        "monitoring",
+    ):
+        value = context.get(key)
+        if isinstance(value, dict):
+            sources.append(value)
+    for source in sources:
+        value = source.get("chase_limit_price")
+        if value is None:
+            value = source.get("original_watch_chase_limit_price")
+        parsed = _parse_decimal(value)
+        if parsed is not None:
+            return parsed
+    return None
 
 
 def _cached_trigger_direction_from_risk_context(raw_context: object) -> str | None:
