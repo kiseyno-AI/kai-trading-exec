@@ -5789,6 +5789,132 @@ def test_monitoring_creates_default_exit_monitors_for_existing_position_without_
     engine.dispose()
 
 
+@pytest.mark.parametrize(
+    "active_status",
+    [
+        "broker_order_submission_pending",
+        "broker_order_submitted",
+        "open",
+        "partially_filled",
+    ],
+)
+def test_monitoring_treats_in_flight_existing_position_exit_orders_as_active(active_status: str) -> None:
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(broker_order_id="kis-existing-position-in-flight"),
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+            exec_agent_stop_loss_pct=Decimal("0.04"),
+            exec_agent_first_take_profit_pct=Decimal("0.05"),
+            account_drawdown_gate_enabled=False,
+        ),
+        broker_adapter=broker_adapter,
+    )
+    client = TestClient(app)
+
+    with app.state.db_session_factory() as session:
+        plan = ExecutionPlan(
+            id=f"plan-existing-position-in-flight-{active_status}",
+            external_plan_id=f"core-existing-position-in-flight-{active_status}",
+            source="test",
+            mode="paper",
+            market_date=date(2026, 6, 10),
+            accepted_at=datetime(2026, 6, 10, 0, 30, tzinfo=UTC),
+            status="accepted",
+            raw_payload={"source": "test"},
+        )
+        session.add(plan)
+        session.add(
+            ExecutionPosition(
+                mode="paper",
+                symbol="005930",
+                quantity=7,
+                average_price=Decimal("100000.0000"),
+                updated_from="test",
+                raw_payload={"source": "test"},
+            )
+        )
+        session.add_all(
+            [
+                ExecutionPlanItem(
+                    plan=plan,
+                    plan_item_index=0,
+                    symbol="005930",
+                    side="sell",
+                    intent="stop_sell",
+                    status=active_status,
+                    quantity_policy={"kind": "shares", "quantity": 7},
+                    trigger_price=Decimal("96000.0000"),
+                    time_in_force="day",
+                    source_plan_item_id="core-existing-position-in-flight:stop",
+                ),
+                ExecutionPlanItem(
+                    plan=plan,
+                    plan_item_index=1,
+                    symbol="005930",
+                    side="sell",
+                    intent="target_sell",
+                    status=active_status,
+                    quantity_policy={"kind": "shares", "quantity": 7},
+                    trigger_price=Decimal("105000.0000"),
+                    time_in_force="day",
+                    source_plan_item_id="core-existing-position-in-flight:target",
+                ),
+            ]
+        )
+        session.commit()
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "repair existing position monitors",
+            "observed_at": "2026-06-10T01:00:00Z",
+            "prices": [{"symbol": "005930", "price": "101000.00"}],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["submitted_order_count"] == 0
+    with app.state.db_session_factory() as session:
+        sell_items = session.scalars(
+            select(ExecutionPlanItem)
+            .where(
+                ExecutionPlanItem.symbol == "005930",
+                ExecutionPlanItem.side == "sell",
+            )
+            .order_by(ExecutionPlanItem.intent)
+        ).all()
+
+        assert [(item.intent, item.status) for item in sell_items] == [
+            ("stop_sell", active_status),
+            ("target_sell", active_status),
+        ]
+        assert all(
+            item.quantity_policy is None
+            or item.quantity_policy.get("source") not in {
+                "post_entry_missing_order_stop_repair",
+                "post_entry_missing_order_target_repair",
+            }
+            for item in sell_items
+        )
+
+    engine.dispose()
+
+
 def test_monitoring_rebases_invalid_post_entry_stop_above_entry() -> None:
     broker_adapter = StubBrokerAdapter(
         config=BrokerConfig(

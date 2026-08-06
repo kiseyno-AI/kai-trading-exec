@@ -4213,6 +4213,7 @@ def _has_active_sell_monitor(
                     SELL_ACTIVE_MONITORING_STATUSES
                     | BLOCKED_MONITORING_STATUSES
                     | PENDING_DISPATCH_MONITORING_STATUSES
+                    | IN_FLIGHT_BROKER_ORDER_ITEM_STATUSES
                 )
             ),
         )
