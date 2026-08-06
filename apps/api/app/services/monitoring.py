@@ -32,6 +32,7 @@ from app.models.runtime import (
     ExecutionPlanItemAudit,
     ExecutionPosition,
     MonitoringCheckpoint,
+    new_id,
 )
 from app.services.broker_auth import ensure_authenticated_broker_session
 from app.services.reconciliation import (
@@ -338,7 +339,12 @@ def materialize_monitoring_plan_items(
         if item.status == "superseded":
             continue
         if _is_watch_buy_item(item):
-            if item.status not in {"pending", "watch_monitoring_pending"}:
+            if item.status not in {
+                "pending",
+                "pending_configuration",
+                "next_open_buy_pending_configuration",
+                "watch_monitoring_pending",
+            }:
                 continue
             if _monitoring_item_is_configured(item):
                 item.status = "watch_monitoring_active"
@@ -3981,6 +3987,12 @@ def _maintain_post_entry_exit_monitors(
             symbol=symbol,
         )
         if entry_order is None or entry_order.plan_item is None:
+            maintenance_count += _ensure_existing_position_default_exit_monitors(
+                settings=settings,
+                db=db,
+                position=position,
+                triggered_at=triggered_at,
+            )
             continue
         entry_item = entry_order.plan_item
         if entry_item.plan is None:
@@ -4104,6 +4116,160 @@ def _latest_filled_buy_order(
             BrokerOrder.id.desc(),
         )
     )
+
+
+def _ensure_existing_position_default_exit_monitors(
+    *,
+    settings: Settings,
+    db: Session,
+    position: ExecutionPosition,
+    triggered_at: datetime,
+) -> int:
+    if position.quantity <= 0 or position.average_price is None or position.average_price <= 0:
+        return 0
+    plan = _latest_runtime_plan(settings=settings, db=db)
+    if plan is None:
+        return 0
+
+    maintenance_count = 0
+    if not _has_active_sell_monitor(
+        db=db,
+        settings=settings,
+        symbol=position.symbol,
+        intent="stop_sell",
+    ):
+        stop_price = (position.average_price * (Decimal("1") - settings.exec_agent_stop_loss_pct)).quantize(
+            Decimal("0.0001"),
+            rounding=ROUND_DOWN,
+        )
+        db.add(
+            _new_existing_position_exit_monitor(
+                plan=plan,
+                position=position,
+                intent="stop_sell",
+                trigger_price=stop_price,
+                source="post_entry_missing_order_stop_repair",
+                triggered_at=triggered_at,
+            )
+        )
+        maintenance_count += 1
+
+    if not _has_active_sell_monitor(
+        db=db,
+        settings=settings,
+        symbol=position.symbol,
+        intent="target_sell",
+    ):
+        target_price = (position.average_price * (Decimal("1") + settings.exec_agent_first_take_profit_pct)).quantize(
+            Decimal("0.0001"),
+            rounding=ROUND_DOWN,
+        )
+        db.add(
+            _new_existing_position_exit_monitor(
+                plan=plan,
+                position=position,
+                intent="target_sell",
+                trigger_price=target_price,
+                source="post_entry_missing_order_target_repair",
+                triggered_at=triggered_at,
+            )
+        )
+        maintenance_count += 1
+
+    return maintenance_count
+
+
+def _latest_runtime_plan(*, settings: Settings, db: Session) -> ExecutionPlan | None:
+    return db.scalar(
+        select(ExecutionPlan)
+        .where(ExecutionPlan.mode == settings.runtime_mode)
+        .order_by(
+            ExecutionPlan.market_date.desc(),
+            ExecutionPlan.accepted_at.desc(),
+            ExecutionPlan.created_at.desc(),
+            ExecutionPlan.id.desc(),
+        )
+        .limit(1)
+    )
+
+
+def _has_active_sell_monitor(
+    *,
+    db: Session,
+    settings: Settings,
+    symbol: str,
+    intent: str,
+) -> bool:
+    return db.scalar(
+        select(ExecutionPlanItem.id)
+        .join(ExecutionPlanItem.plan)
+        .where(
+            ExecutionPlan.mode == settings.runtime_mode,
+            ExecutionPlanItem.symbol == symbol,
+            ExecutionPlanItem.side == "sell",
+            ExecutionPlanItem.intent == intent,
+            ExecutionPlanItem.status.in_(
+                tuple(
+                    SELL_ACTIVE_MONITORING_STATUSES
+                    | BLOCKED_MONITORING_STATUSES
+                    | PENDING_DISPATCH_MONITORING_STATUSES
+                    | IN_FLIGHT_BROKER_ORDER_ITEM_STATUSES
+                )
+            ),
+        )
+        .limit(1)
+    ) is not None
+
+
+def _new_existing_position_exit_monitor(
+    *,
+    plan: ExecutionPlan,
+    position: ExecutionPosition,
+    intent: str,
+    trigger_price: Decimal,
+    source: str,
+    triggered_at: datetime,
+) -> ExecutionPlanItem:
+    item = ExecutionPlanItem(
+        id=new_id(),
+        plan=plan,
+        plan_item_index=_next_plan_item_index(plan),
+        symbol=position.symbol,
+        side="sell",
+        intent=intent,
+        status=_monitoring_status(intent),
+        quantity_policy={
+            "kind": "shares",
+            "quantity": position.quantity,
+            "source": source,
+        },
+        trigger_price=trigger_price,
+        time_in_force="day",
+        risk_context={
+            "exchange": "KRX",
+            "post_entry_managed": True,
+            "entry_context": {
+                "entry_price": _serialize_decimal(position.average_price),
+                "entry_quantity": position.quantity,
+            },
+        },
+        decision_agent_name="post-entry-monitor-repair",
+        source_plan_item_id=f"existing-position-{position.symbol}-{intent}",
+        source_market_date=triggered_at.astimezone(KRX_TIMEZONE).date(),
+        provider="kis",
+        venue="krx",
+        asset_class="stock",
+    )
+    _record_monitoring_event(
+        item=item,
+        event={
+            "event": "existing_position_exit_monitor_created",
+            "reason": source,
+            "trigger_price": _serialize_decimal(trigger_price),
+            "recorded_at": triggered_at.isoformat(),
+        },
+    )
+    return item
 
 
 def _entry_market_date(
@@ -4249,6 +4415,31 @@ def _ensure_post_entry_stop_monitor(
         quantity=quantity,
     )
     existing.risk_context = risk_context
+    if not _quantity_policy_supported(existing.quantity_policy):
+        existing.quantity_policy = {"kind": "shares", "quantity": quantity}
+        maintenance_count += 1
+    elif _quantity_policy_requires_position_exit(existing.quantity_policy):
+        existing.quantity_policy = {
+            **dict(existing.quantity_policy or {}),
+            "kind": "shares",
+            "quantity": quantity,
+            "source": "post_entry_position_sync",
+        }
+        maintenance_count += 1
+    if existing.status != "stop_sell_monitoring" and _monitoring_item_is_configured(existing):
+        prior_status = existing.status
+        existing.status = "stop_sell_monitoring"
+        maintenance_count += 1
+        _record_monitoring_event(
+            item=existing,
+            event={
+                "event": "post_entry_stop_monitor_activated",
+                "reason": "repaired_pending_stop_configuration",
+                "prior_status": prior_status,
+                "updated_status": existing.status,
+                "recorded_at": triggered_at.isoformat(),
+            },
+        )
     return existing, maintenance_count
 
 
@@ -4323,6 +4514,14 @@ def _ensure_post_entry_target_monitor(
         )
     if not _quantity_policy_supported(existing.quantity_policy):
         existing.quantity_policy = {"kind": "shares", "quantity": quantity}
+        maintenance_count += 1
+    elif _quantity_policy_requires_position_exit(existing.quantity_policy):
+        existing.quantity_policy = {
+            **dict(existing.quantity_policy or {}),
+            "kind": "shares",
+            "quantity": quantity,
+            "source": "post_entry_position_sync",
+        }
         maintenance_count += 1
     if existing.status != "target_sell_monitoring" and _monitoring_item_is_configured(existing):
         prior_status = existing.status
@@ -4457,6 +4656,24 @@ def _active_sibling_monitor(
         if sibling.status in NON_MONITORABLE_PLAN_ITEM_STATUSES:
             continue
         return sibling
+    session = sa_inspect(entry_item).session
+    if session is None:
+        return None
+    return session.scalar(
+        select(ExecutionPlanItem)
+        .where(
+            ExecutionPlanItem.execution_plan_id == entry_item.execution_plan_id,
+            ExecutionPlanItem.symbol == entry_item.symbol,
+            ExecutionPlanItem.side == "sell",
+            ExecutionPlanItem.intent == intent,
+            ~ExecutionPlanItem.status.in_(tuple(NON_MONITORABLE_PLAN_ITEM_STATUSES)),
+        )
+        .order_by(
+            ExecutionPlanItem.plan_item_index.asc(),
+            ExecutionPlanItem.id.asc(),
+        )
+        .limit(1)
+    )
     return None
 
 

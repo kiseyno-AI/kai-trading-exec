@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from collections import defaultdict
 from datetime import date, datetime
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_DOWN
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -187,7 +187,7 @@ def _build_execution_plan(
     settings: Settings,
     command: ExecutionPlanRequest,
 ) -> ExecutionPlan:
-    return ExecutionPlan(
+    plan = ExecutionPlan(
         id=new_id(),
         external_plan_id=command.plan_id,
         source=command.source,
@@ -202,6 +202,8 @@ def _build_execution_plan(
             for index, item in enumerate(command.items)
         ],
     )
+    _normalize_watch_buy_handoff_items(plan)
+    return plan
 
 
 def _build_execution_plan_item(
@@ -915,6 +917,137 @@ def _initial_plan_item_status(item: ExecutionPlanItemRequest) -> str:
     if _decision_agent_name(item) == SHORT_TERM_DECIDER_NAME:
         return "unsupported_semantics"
     return "pending"
+
+
+def _normalize_watch_buy_handoff_items(plan: ExecutionPlan) -> None:
+    plan_items_by_symbol: dict[str, list[ExecutionPlanItem]] = defaultdict(list)
+    for item in plan.items:
+        plan_items_by_symbol[item.symbol].append(item)
+
+    for item in plan.items:
+        if not _is_watch_buy_plan_item(item):
+            continue
+
+        quantity_policy = dict(item.quantity_policy or {})
+        quantity = _watch_buy_handoff_quantity(quantity_policy)
+        if quantity is not None:
+            original_kind = quantity_policy.get("kind") or quantity_policy.get("type")
+            quantity_policy["kind"] = "shares"
+            quantity_policy["quantity"] = quantity
+            quantity_policy.setdefault("source", "watch_buy_handoff_normalizer")
+            if original_kind is not None and original_kind != "shares":
+                quantity_policy.setdefault("original_policy_type", original_kind)
+
+        entry_price = _first_decimal_from_payloads(
+            (quantity_policy, item.risk_context),
+            ("entry_price", "recommended_entry_price", "reference_price", "estimated_reference_price"),
+        ) or item.trigger_price or item.limit_price
+        if entry_price is not None:
+            quantity_policy.setdefault("entry_price", _decimal_text(entry_price))
+            quantity_policy.setdefault("recommended_entry_price", _decimal_text(entry_price))
+
+        target_price = _first_decimal_from_payloads(
+            (quantity_policy, item.risk_context),
+            tuple(BUY_TARGET_FIELDS),
+        ) or _sibling_trigger_price(plan_items_by_symbol[item.symbol], "target_sell")
+        if target_price is not None:
+            quantity_policy.setdefault("target_price", _decimal_text(target_price))
+
+        stop_price = _first_decimal_from_payloads(
+            (quantity_policy, item.risk_context),
+            tuple(BUY_STOP_FIELDS),
+        ) or _sibling_trigger_price(plan_items_by_symbol[item.symbol], "stop_sell")
+        if stop_price is not None:
+            quantity_policy.setdefault("stop_price", _decimal_text(stop_price))
+            quantity_policy.setdefault("stop_loss_price", _decimal_text(stop_price))
+
+        item.quantity_policy = quantity_policy or item.quantity_policy
+        if (
+            item.status in {"pending", "pending_configuration", "next_open_buy_pending_configuration"}
+            and item.side == "buy"
+            and item.trigger_price is not None
+            and _watch_buy_handoff_quantity(item.quantity_policy) is not None
+        ):
+            item.status = "watch_monitoring_pending"
+
+
+def _is_watch_buy_plan_item(item: ExecutionPlanItem) -> bool:
+    return item.side == "buy" and (
+        item.intent in WATCH_BUY_INTENTS
+        or item.intent == "next_open_buy"
+        or item.status in WATCH_MONITORING_STATUSES
+    )
+
+
+def _watch_buy_handoff_quantity(quantity_policy: dict[str, object] | None) -> int | None:
+    if not isinstance(quantity_policy, dict):
+        return None
+    kind = quantity_policy.get("kind") or quantity_policy.get("type")
+    if kind in {"shares", "fixed_quantity"}:
+        return _parse_positive_int(
+            quantity_policy.get("quantity")
+            or quantity_policy.get("planned_quantity")
+            or quantity_policy.get("computed_quantity")
+        )
+    if kind == "exec_agent_sized":
+        explicit_quantity = _parse_positive_int(
+            quantity_policy.get("quantity")
+            or quantity_policy.get("planned_quantity")
+            or quantity_policy.get("computed_quantity")
+        )
+        if explicit_quantity is not None:
+            return explicit_quantity
+        budget = _first_decimal_from_payloads((quantity_policy,), ("budget_krw", "max_budget", "allocation_budget_krw"))
+        reference_price = _first_decimal_from_payloads(
+            (quantity_policy,),
+            ("estimated_reference_price", "reference_price", "entry_reference_price", "entry_price"),
+        )
+        if budget is None or reference_price is None:
+            return None
+        quantity = int((budget / reference_price).to_integral_value(rounding=ROUND_DOWN))
+        return quantity if quantity > 0 else None
+    return None
+
+
+def _sibling_trigger_price(items: list[ExecutionPlanItem], intent: str) -> Decimal | None:
+    for item in items:
+        if item.intent == intent and item.trigger_price is not None and item.trigger_price > 0:
+            return item.trigger_price
+    return None
+
+
+def _first_decimal_from_payloads(
+    payloads: tuple[object, ...],
+    keys: tuple[str, ...],
+) -> Decimal | None:
+    for payload in payloads:
+        if not isinstance(payload, dict):
+            continue
+        for key in keys:
+            value = _parse_positive_decimal(payload.get(key))
+            if value is not None:
+                return value
+    return None
+
+
+def _parse_positive_int(value: object) -> int | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int) and value > 0:
+        return value
+    if isinstance(value, Decimal) and value == value.to_integral_value() and value > 0:
+        return int(value)
+    if isinstance(value, str):
+        normalized = value.strip()
+        if normalized.isdigit() and int(normalized) > 0:
+            return int(normalized)
+        try:
+            parsed = Decimal(normalized)
+        except (InvalidOperation, ValueError):
+            return None
+        if parsed == parsed.to_integral_value() and parsed > 0:
+            return int(parsed)
+    return None
 
 
 def _short_term_exec_agent_sizing_requested(quantity_policy: dict[str, object] | None) -> bool:
