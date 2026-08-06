@@ -2677,6 +2677,83 @@ def test_short_term_watch_buy_items_are_monitored_without_open_scheduling() -> N
     engine.dispose()
 
 
+def test_next_open_watch_handoff_normalizes_fixed_quantity_and_sibling_exits() -> None:
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+        ),
+    )
+    client = TestClient(app)
+
+    response = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-next-open-watch-handoff-normalized",
+            "source": "kai-trading-core-manual-recovery",
+            "market_date": "2024-01-03",
+            "items": [
+                {
+                    "symbol": "017650",
+                    "side": "buy",
+                    "intent": "next_open_buy",
+                    "quantity_policy": {
+                        "type": "fixed_quantity",
+                        "quantity": "99",
+                    },
+                    "trigger_price": "10151.00",
+                    "limit_price": "10151.00",
+                    "decision_agent_name": "manual-recovery",
+                    "source_plan_item_id": "core-plan-11050",
+                    "source_market_date": "2024-01-02",
+                },
+                {
+                    "symbol": "017650",
+                    "side": "sell",
+                    "intent": "target_sell",
+                    "quantity_policy": {
+                        "type": "position_exit_from_entry",
+                        "linked_entry_item_key": "core-plan-11050:next_open_buy",
+                        "quantity": "99",
+                    },
+                    "trigger_price": "10280.00",
+                    "decision_agent_name": "manual-recovery",
+                    "source_plan_item_id": "core-plan-11050",
+                    "source_market_date": "2024-01-02",
+                },
+                {
+                    "symbol": "017650",
+                    "side": "sell",
+                    "intent": "stop_sell",
+                    "quantity_policy": {
+                        "type": "position_exit_from_entry",
+                        "linked_entry_item_key": "core-plan-11050:next_open_buy",
+                        "quantity": "99",
+                    },
+                    "trigger_price": "9587.00",
+                    "decision_agent_name": "manual-recovery",
+                    "source_plan_item_id": "core-plan-11050",
+                    "source_market_date": "2024-01-02",
+                },
+            ],
+        },
+    )
+    assert response.status_code == 201
+
+    plan_payload = client.get("/execution-plans").json()[0]
+    buy_item = next(item for item in plan_payload["items"] if item["side"] == "buy")
+    assert buy_item["status"] == "watch_monitoring_active"
+    assert buy_item["quantity_policy"]["kind"] == "shares"
+    assert buy_item["quantity_policy"]["quantity"] == 99
+    assert buy_item["quantity_policy"]["original_policy_type"] == "fixed_quantity"
+    assert buy_item["quantity_policy"]["entry_price"] == "10151.0000"
+    assert buy_item["quantity_policy"]["stop_loss_price"] == "9587.0000"
+    assert buy_item["quantity_policy"]["target_price"] == "10280.0000"
+    assert client.get("/execution-jobs").json() == []
+
+    engine.dispose()
+
+
 def test_core_active_short_term_handoff_becomes_runtime_buy_watch_with_segments() -> None:
     broker_adapter = StubBrokerAdapter(
         config=BrokerConfig(
@@ -5610,6 +5687,104 @@ def test_monitoring_creates_post_entry_protective_monitors_after_buy_fill() -> N
         assert max_holding_item.source_plan_item_id == "core-post-entry-create:post-entry-max-holding"
         assert max_holding_item.risk_context["close_exit_date"] == "2026-06-15"
         assert max_holding_item.risk_context["post_entry_managed"] is True
+
+    engine.dispose()
+
+
+def test_monitoring_creates_default_exit_monitors_for_existing_position_without_buy_order() -> None:
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(broker_order_id="kis-existing-position-monitor"),
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+            exec_agent_stop_loss_pct=Decimal("0.04"),
+            exec_agent_first_take_profit_pct=Decimal("0.05"),
+            account_drawdown_gate_enabled=False,
+        ),
+        broker_adapter=broker_adapter,
+    )
+    client = TestClient(app)
+
+    with app.state.db_session_factory() as session:
+        session.add(
+            ExecutionPlan(
+                id="plan-existing-position-monitor",
+                external_plan_id="core-existing-position-monitor",
+                source="test",
+                mode="paper",
+                market_date=date(2026, 6, 10),
+                accepted_at=datetime(2026, 6, 10, 0, 30, tzinfo=UTC),
+                status="accepted",
+                raw_payload={"source": "test"},
+            )
+        )
+        session.add(
+            ExecutionPosition(
+                mode="paper",
+                symbol="005930",
+                quantity=7,
+                average_price=Decimal("100000.0000"),
+                updated_from="test",
+                raw_payload={"source": "test"},
+            )
+        )
+        session.commit()
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "repair existing position monitors",
+            "observed_at": "2026-06-10T01:00:00Z",
+            "prices": [{"symbol": "005930", "price": "101000.00"}],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["submitted_order_count"] == 0
+    with app.state.db_session_factory() as session:
+        sell_items = session.scalars(
+            select(ExecutionPlanItem)
+            .where(
+                ExecutionPlanItem.symbol == "005930",
+                ExecutionPlanItem.side == "sell",
+            )
+            .order_by(ExecutionPlanItem.intent)
+        ).all()
+        items_by_intent = {item.intent: item for item in sell_items}
+        stop_item = items_by_intent["stop_sell"]
+        target_item = items_by_intent["target_sell"]
+
+        assert stop_item.status == "stop_sell_monitoring"
+        assert stop_item.trigger_price == Decimal("96000.0000")
+        assert stop_item.quantity_policy == {
+            "kind": "shares",
+            "quantity": 7,
+            "source": "post_entry_missing_order_stop_repair",
+        }
+        assert stop_item.risk_context["post_entry_managed"] is True
+
+        assert target_item.status == "target_sell_monitoring"
+        assert target_item.trigger_price == Decimal("105000.0000")
+        assert target_item.quantity_policy == {
+            "kind": "shares",
+            "quantity": 7,
+            "source": "post_entry_missing_order_target_repair",
+        }
+        assert target_item.risk_context["post_entry_managed"] is True
 
     engine.dispose()
 
