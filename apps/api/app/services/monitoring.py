@@ -6716,12 +6716,17 @@ def _item_payload_sources(item: ExecutionPlanItem) -> list[dict[str, object]]:
     return sources
 
 
-def _loaded_risk_context(item: ExecutionPlanItem) -> dict[str, object]:
-    if "risk_context" in sa_inspect(item).unloaded:
-        session = sa_inspect(item).session
+def _loaded_risk_context(
+    item: ExecutionPlanItem,
+    *,
+    allow_file_backed_load: bool = False,
+) -> dict[str, object]:
+    item_state = sa_inspect(item)
+    if "risk_context" in item_state.unloaded:
+        session = item_state.session
         bind = session.get_bind() if session is not None else None
         database = getattr(getattr(bind, "url", None), "database", None)
-        if database in {None, "", ":memory:"}:
+        if database in {None, "", ":memory:"} or allow_file_backed_load:
             risk_context = item.risk_context
             return risk_context if isinstance(risk_context, dict) else {}
         return {}
@@ -6844,7 +6849,7 @@ def _record_monitoring_event(
 
 
 def _plan_item_exchange(item: ExecutionPlanItem) -> str:
-    risk_context = _loaded_risk_context(item)
+    risk_context = _loaded_risk_context(item, allow_file_backed_load=True)
     if not isinstance(risk_context, dict):
         return "KRX"
     exchange = risk_context.get("exchange")

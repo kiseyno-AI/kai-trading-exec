@@ -498,10 +498,16 @@ class AutonomousRuntimeCoordinator:
 
     def _monitoring_cycle_sync(self, started_at: datetime) -> dict[str, object]:
         desired_symbols = _load_core_desired_monitoring_symbols(settings=self.settings)
+        desired_symbols_preserve_all = False
         if not desired_symbols:
             desired_symbols = self._load_local_desired_monitoring_symbols_from_sqlite()
+            desired_symbols_preserve_all = True
         if desired_symbols:
-            symbols = desired_symbols[: self.settings.monitoring_max_symbols_per_cycle or len(desired_symbols)]
+            symbols = (
+                desired_symbols
+                if desired_symbols_preserve_all
+                else desired_symbols[: self.settings.monitoring_max_symbols_per_cycle or len(desired_symbols)]
+            )
             self._reconcile_monitoring_orders_if_due(
                 now=started_at,
                 symbols=set(symbols),
@@ -1051,12 +1057,14 @@ class AutonomousRuntimeCoordinator:
             ordered.append(symbol)
             seen.add(symbol)
         for row in item_rows:
+            if len(ordered) >= limit:
+                break
             symbol = str(row[0] or "").strip()
             if not symbol or symbol in seen:
                 continue
             ordered.append(symbol)
             seen.add(symbol)
-            if len(ordered) >= max(limit, len(position_rows)):
+            if len(ordered) >= limit:
                 break
         return ordered
 
