@@ -1015,9 +1015,8 @@ class AutonomousRuntimeCoordinator:
                     from execution_positions
                     where mode = ? and quantity > 0
                     order by symbol asc
-                    limit ?
                     """,
-                    [self.settings.runtime_mode, limit],
+                    [self.settings.runtime_mode],
                 ).fetchall()
                 item_rows = conn.execute(
                     f"""
@@ -1045,13 +1044,19 @@ class AutonomousRuntimeCoordinator:
             return []
         ordered: list[str] = []
         seen: set[str] = set()
-        for row in [*position_rows, *item_rows]:
+        for row in position_rows:
             symbol = str(row[0] or "").strip()
             if not symbol or symbol in seen:
                 continue
             ordered.append(symbol)
             seen.add(symbol)
-            if len(ordered) >= limit:
+        for row in item_rows:
+            symbol = str(row[0] or "").strip()
+            if not symbol or symbol in seen:
+                continue
+            ordered.append(symbol)
+            seen.add(symbol)
+            if len(ordered) >= max(limit, len(position_rows)):
                 break
         return ordered
 

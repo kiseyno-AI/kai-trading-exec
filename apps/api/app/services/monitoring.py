@@ -596,13 +596,13 @@ def list_autonomous_monitoring_symbols(
     )
     symbol_candidates: list[str] = []
 
-    def append_candidates(rows: list[str]) -> None:
+    def append_candidates(rows: list[str], *, enforce_limit: bool = True) -> None:
         for symbol in rows:
-            if len(symbol_candidates) >= symbol_cycle_limit:
+            if enforce_limit and len(symbol_candidates) >= symbol_cycle_limit:
                 return
             if symbol and symbol not in symbol_candidates:
                 symbol_candidates.append(symbol)
-            if len(symbol_candidates) >= symbol_cycle_limit:
+            if enforce_limit and len(symbol_candidates) >= symbol_cycle_limit:
                 return
 
     if held_symbols:
@@ -633,10 +633,12 @@ def list_autonomous_monitoring_symbols(
                 func.min(ExecutionPlan.id).asc(),
                 ExecutionPlanItem.symbol.asc(),
             )
-            .limit(symbol_cycle_limit)
         ).all()
-        append_candidates([str(row.symbol) for row in held_symbol_rows])
-        append_candidates(sorted(symbol for symbol in held_symbols if symbol not in symbol_candidates))
+        append_candidates([str(row.symbol) for row in held_symbol_rows], enforce_limit=False)
+        append_candidates(
+            sorted(symbol for symbol in held_symbols if symbol not in symbol_candidates),
+            enforce_limit=False,
+        )
 
     if len(symbol_candidates) < symbol_cycle_limit:
         buy_symbol_rows = list(
@@ -2824,7 +2826,6 @@ def _append_held_active_sell_monitor_reconciliations(
                 ExecutionPlanItem.side,
                 ExecutionPlanItem.intent,
                 ExecutionPlanItem.status,
-                ExecutionPlanItem.risk_context,
             ),
             selectinload(ExecutionPlanItem.plan).load_only(
                 ExecutionPlan.id,
@@ -3052,6 +3053,13 @@ def _repair_unprotected_stop_coverage(
             ExecutionPlanItem.symbol.in_(sorted(positions)),
             ExecutionPlanItem.side == "sell",
             ExecutionPlanItem.intent == "stop_sell",
+            ExecutionPlanItem.status.in_(
+                tuple(
+                    PROTECTIVE_STOP_COVERAGE_STATUSES
+                    | RETRYABLE_PROTECTIVE_STOP_STATUSES
+                    | FALLBACK_PROTECTIVE_STOP_STATUSES
+                )
+            ),
         )
         .options(
             load_only(
@@ -3429,6 +3437,13 @@ def _stop_items_for_symbol(
             ExecutionPlanItem.symbol == symbol,
             ExecutionPlanItem.side == "sell",
             ExecutionPlanItem.intent == "stop_sell",
+            ExecutionPlanItem.status.in_(
+                tuple(
+                    PROTECTIVE_STOP_COVERAGE_STATUSES
+                    | RETRYABLE_PROTECTIVE_STOP_STATUSES
+                    | FALLBACK_PROTECTIVE_STOP_STATUSES
+                )
+            ),
         )
         .options(
             load_only(
@@ -3443,7 +3458,6 @@ def _stop_items_for_symbol(
                 ExecutionPlanItem.limit_price,
                 ExecutionPlanItem.trigger_price,
                 ExecutionPlanItem.time_in_force,
-                ExecutionPlanItem.risk_context,
                 ExecutionPlanItem.source_market_date,
             )
         )
@@ -3479,6 +3493,7 @@ def _profit_target_coverage_issues(
             ExecutionPlanItem.symbol.in_(sorted(positions)),
             ExecutionPlanItem.side == "sell",
             ExecutionPlanItem.intent == "target_sell",
+            ExecutionPlanItem.status.in_(tuple(PROFIT_TARGET_COVERAGE_STATUSES)),
         )
         .options(
             load_only(
@@ -3690,7 +3705,7 @@ def _trigger_time_agent_delay_until(
 ) -> datetime | None:
     if item.status != AGENT_DELAY_STATUS:
         return None
-    risk_context = item.risk_context if isinstance(item.risk_context, dict) else {}
+    risk_context = _loaded_risk_context(item)
     interaction = risk_context.get("last_trigger_time_exec_agent_interaction")
     if not isinstance(interaction, dict):
         return None
@@ -3716,7 +3731,7 @@ def _trigger_time_agent_pending_is_stale(
 ) -> bool:
     if item.status != AGENT_PENDING_STATUS:
         return False
-    risk_context = item.risk_context if isinstance(item.risk_context, dict) else {}
+    risk_context = _loaded_risk_context(item)
     latest_event = risk_context.get("last_monitoring_event")
     recorded_at = None
     if isinstance(latest_event, dict) and latest_event.get("event") == "trigger_time_exec_agent_pending":
@@ -3732,7 +3747,7 @@ def _trigger_time_agent_pending_is_stale(
 
 
 def _latest_monitoring_event(item: ExecutionPlanItem) -> dict[str, object] | None:
-    risk_context = item.risk_context
+    risk_context = _loaded_risk_context(item)
     if not isinstance(risk_context, dict):
         return None
     event = risk_context.get("last_monitoring_event")
@@ -4100,7 +4115,6 @@ def _latest_filled_buy_order(
                 ExecutionPlanItem.limit_price,
                 ExecutionPlanItem.trigger_price,
                 ExecutionPlanItem.time_in_force,
-                ExecutionPlanItem.risk_context,
                 ExecutionPlanItem.source_market_date,
             ).selectinload(ExecutionPlanItem.plan).load_only(
                 ExecutionPlan.id,
@@ -4678,7 +4692,7 @@ def _active_sibling_monitor(
 
 
 def _is_breakeven_rearmed_stop(item: ExecutionPlanItem) -> bool:
-    risk_context = item.risk_context if isinstance(item.risk_context, dict) else {}
+    risk_context = _loaded_risk_context(item)
     breakeven_rearmed = risk_context.get("breakeven_rearmed")
     if (
         isinstance(breakeven_rearmed, dict)
@@ -5031,7 +5045,7 @@ def _monitoring_item_is_configured(item: ExecutionPlanItem) -> bool:
     if item.side != "sell" or not _quantity_policy_supported(item.quantity_policy):
         return False
     if item.intent == "max_holding_close_sell":
-        risk_context = item.risk_context if isinstance(item.risk_context, dict) else {}
+        risk_context = _loaded_risk_context(item)
         close_exit_date = risk_context.get("close_exit_date")
         return isinstance(close_exit_date, str) and bool(close_exit_date.strip())
     return item.trigger_price is not None
@@ -5353,7 +5367,7 @@ def _evaluate_profit_protection(
 def _persisted_profit_protection_trigger(
     item: ExecutionPlanItem,
 ) -> ProfitProtectionDecision | None:
-    risk_context = item.risk_context if isinstance(item.risk_context, dict) else {}
+    risk_context = _loaded_risk_context(item)
     last_event = risk_context.get("last_monitoring_event")
     if not isinstance(last_event, dict):
         return None
@@ -5421,7 +5435,7 @@ def _parse_decimal(value: object) -> Decimal | None:
 
 
 def _max_holding_exit_due(*, item: ExecutionPlanItem, triggered_at: datetime) -> bool:
-    risk_context = item.risk_context if isinstance(item.risk_context, dict) else {}
+    risk_context = _loaded_risk_context(item)
     raw_close_exit_date = risk_context.get("close_exit_date")
     if not isinstance(raw_close_exit_date, str):
         return False
@@ -5594,7 +5608,7 @@ def _resolve_watch_buy_order(
                 message="exec-agent approved notional cannot buy one share at the current entry price",
                 details=details,
             )
-    market_regime_context = market_regime_context_from_item_payloads(item.risk_context, item.quantity_policy)
+    market_regime_context = market_regime_context_from_item_payloads(_loaded_risk_context(item), item.quantity_policy)
     market_regime_context = merge_live_market_regime_context(
         market_regime_context,
         load_live_market_regime_context(settings=settings),
@@ -5790,7 +5804,7 @@ def _watch_buy_is_pullback_strategy(item: ExecutionPlanItem) -> bool:
 
 
 def _trigger_time_decision_confirms_fresh_pullback_reclaim(item: ExecutionPlanItem) -> bool:
-    risk_context = item.risk_context if isinstance(item.risk_context, dict) else {}
+    risk_context = _loaded_risk_context(item)
     interaction = risk_context.get("last_trigger_time_exec_agent_interaction")
     if not isinstance(interaction, dict):
         return False
@@ -6220,7 +6234,6 @@ def _load_daily_new_buy_notional(
                 ExecutionPlanItem.quantity_policy,
                 ExecutionPlanItem.limit_price,
                 ExecutionPlanItem.trigger_price,
-                ExecutionPlanItem.risk_context,
             )
         )
     ).all()
@@ -6231,7 +6244,9 @@ def _load_daily_new_buy_notional(
 
 
 def _approved_buy_notional(item: ExecutionPlanItem) -> Decimal:
-    for source in _item_payload_sources(item):
+    for source in (item.quantity_policy,):
+        if not isinstance(source, dict):
+            continue
         decision = source.get("exec_agent_decision")
         if isinstance(decision, dict):
             value = _parse_positive_decimal(decision.get("approved_notional"))
@@ -6434,7 +6449,7 @@ def _rearm_stop_after_partial_take_profit(
 
 
 def _exit_rule(item: ExecutionPlanItem) -> dict[str, object]:
-    risk_context = item.risk_context if isinstance(item.risk_context, dict) else {}
+    risk_context = _loaded_risk_context(item)
     exit_rule = risk_context.get("exit_rule")
     return dict(exit_rule) if isinstance(exit_rule, dict) else {}
 
@@ -6601,7 +6616,7 @@ def _watch_buy_high_risk_gate_rejection(
     if day_high is not None and day_low is not None and day_high > day_low:
         range_position_pct = ((observed_price - day_low) / (day_high - day_low)) * Decimal("100")
         if (
-            range_position_pct >= settings.watch_buy_max_intraday_range_position_pct
+            range_position_pct > settings.watch_buy_max_intraday_range_position_pct
             and not pullback_after_cross
         ):
             return _watch_buy_gate_rejection(
@@ -6771,7 +6786,7 @@ def _recursive_text_feature(payload: object, keys: set[str], *, parent_key: str 
 
 
 def _exec_agent_decision(item: ExecutionPlanItem) -> dict[str, object] | None:
-    for source in (item.risk_context, item.quantity_policy):
+    for source in (_loaded_risk_context(item), item.quantity_policy):
         if not isinstance(source, dict):
             continue
         for key in (
@@ -6829,7 +6844,7 @@ def _record_monitoring_event(
 
 
 def _plan_item_exchange(item: ExecutionPlanItem) -> str:
-    risk_context = item.risk_context
+    risk_context = _loaded_risk_context(item)
     if not isinstance(risk_context, dict):
         return "KRX"
     exchange = risk_context.get("exchange")
@@ -6977,10 +6992,11 @@ def _monitoring_order_metadata(
         "observed_price": _serialize_decimal(observed_price),
         "order_purpose": "protective_stop" if item.intent == "stop_sell" else item.intent,
     }
-    if isinstance(item.risk_context, dict):
+    risk_context = _loaded_risk_context(item)
+    if isinstance(risk_context, dict):
         for key in ("nxt_eligible", "route_now"):
-            if key in item.risk_context:
-                metadata[key] = item.risk_context[key]
+            if key in risk_context:
+                metadata[key] = risk_context[key]
     if trigger_metadata is not None:
         metadata["trigger"] = trigger_metadata
     return metadata
