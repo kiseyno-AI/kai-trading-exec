@@ -4,6 +4,7 @@ from decimal import Decimal
 
 from fastapi.testclient import TestClient
 from sqlalchemy import inspect, select, text
+from sqlalchemy.orm import load_only
 
 from app.api.schemas.execution import MonitoringPriceRequest
 from app.broker.base import (
@@ -40,6 +41,7 @@ from app.services.monitoring import (
     _load_monitored_items,
     _monitoring_item_is_configured,
     _pending_broker_order_symbols,
+    _plan_item_exchange,
     _resolve_sell_quantity,
     list_autonomous_monitoring_symbols,
     run_autonomous_monitoring_cycle,
@@ -2587,6 +2589,133 @@ def test_autonomous_monitoring_includes_held_stop_sell_outside_symbol_cap() -> N
         )
 
         assert [item.id for item in autonomous_items] == [held_stop_item_id]
+
+    engine.dispose()
+
+
+def test_plan_item_exchange_loads_deferred_risk_context_from_file_db(tmp_path) -> None:
+    app, engine = build_test_app(
+        Settings(
+            database_url=f"sqlite:///{tmp_path / 'deferred-risk-context.db'}",
+            runtime_mode="paper",
+        )
+    )
+
+    with app.state.db_session_factory() as session:
+        plan = ExecutionPlan(
+            external_plan_id="plan-deferred-risk-context-exchange",
+            source="kai-trading-core",
+            mode="paper",
+            status="accepted",
+            accepted_at=datetime(2026, 6, 8, 0, 0, tzinfo=UTC),
+        )
+        item = ExecutionPlanItem(
+            plan=plan,
+            plan_item_index=0,
+            symbol="ETH",
+            side="sell",
+            intent="target_sell",
+            status="target_sell_monitoring",
+            quantity_policy={"kind": "shares", "quantity": 1},
+            risk_context={"exchange": "NXT"},
+        )
+        session.add(item)
+        session.commit()
+        item_id = item.id
+
+    with app.state.db_session_factory() as session:
+        item = session.scalars(
+            select(ExecutionPlanItem)
+            .options(load_only(ExecutionPlanItem.id))
+            .where(ExecutionPlanItem.id == item_id)
+        ).one()
+        assert "risk_context" in inspect(item).unloaded
+
+        assert _plan_item_exchange(item) == "NXT"
+
+    engine.dispose()
+
+
+def test_monitoring_cycle_preserves_all_held_symbols_past_fast_path_cap(tmp_path) -> None:
+    class StaticMonitoringPriceSource:
+        provider = "test"
+
+        def __init__(self) -> None:
+            self.calls: list[list[str]] = []
+
+        def __call__(
+            self,
+            *,
+            symbols: list[str],
+            observed_at: datetime,
+            settings: Settings,
+        ) -> list[MonitoringPriceRequest]:
+            assert observed_at
+            assert settings
+            self.calls.append(list(symbols))
+            return [
+                MonitoringPriceRequest(
+                    symbol=symbol,
+                    price=Decimal("100.00"),
+                    observed_at=observed_at,
+                )
+                for symbol in symbols
+            ]
+
+    price_source = StaticMonitoringPriceSource()
+    app, engine = build_test_app(
+        Settings(
+            database_url=f"sqlite:///{tmp_path / 'held-fast-path-cap.db'}",
+            runtime_mode="paper",
+            autonomous_runtime_enabled=True,
+            monitoring_max_symbols_per_cycle=2,
+            monitoring_max_broker_actions_per_cycle=0,
+        ),
+        autonomous_runtime_enabled=True,
+        monitoring_price_source=price_source,
+    )
+
+    with app.state.db_session_factory() as session:
+        plan = ExecutionPlan(
+            external_plan_id="plan-held-fast-path-cap",
+            source="kai-trading-core",
+            mode="paper",
+            status="accepted",
+            accepted_at=datetime(2026, 6, 8, 0, 0, tzinfo=UTC),
+        )
+        session.add(plan)
+        for symbol in ("000001", "000002", "000003", "999999"):
+            session.add(
+                ExecutionPlanItem(
+                    plan=plan,
+                    plan_item_index=0,
+                    symbol=symbol,
+                    side="sell",
+                    intent="target_sell",
+                    status="target_sell_monitoring",
+                    quantity_policy={"kind": "position_exit_from_entry"},
+                    trigger_price=Decimal("90.00"),
+                )
+            )
+        for symbol in ("000001", "000002", "000003"):
+            session.add(
+                ExecutionPosition(
+                    mode="paper",
+                    symbol=symbol,
+                    quantity=1,
+                    average_price=Decimal("100.00"),
+                    updated_from="reconciliation",
+                    last_reconciled_at=datetime(2026, 6, 8, 1, 0, tzinfo=UTC),
+                )
+            )
+        session.commit()
+
+    payload = app.state.autonomous_runtime._monitoring_cycle_sync(
+        datetime(2026, 6, 8, 1, 5, tzinfo=UTC)
+    )
+
+    assert payload["monitored_symbols"] == ["000001", "000002", "000003"]
+    assert price_source.calls == [["000001", "000002", "000003"]]
 
     engine.dispose()
 
