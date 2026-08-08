@@ -3764,7 +3764,7 @@ def _protective_stop_result_has_actionable_outcome(result: dict[str, object]) ->
         return True
     if outcome == "deferred" and status.endswith("_pending_dispatch"):
         return True
-    if outcome in {"blocked", "agent_delay", "rejected"}:
+    if outcome in {"blocked", "agent_delay", "agent_pending", "rejected"}:
         return (
             status.endswith("_triggered_blocked")
             or status in AGENT_ACTIVE_STATUSES
