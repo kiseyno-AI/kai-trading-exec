@@ -238,9 +238,38 @@ python3 scripts/export_weekly_trade_review.py \
   --end-at 2026-08-01T00:00:00Z
 ```
 
+Live cron should load the same `.env` as the exec service and require the
+resolved runtime mode before the exporter can connect to a database or write an
+artifact:
+
+```bash
+cd /Users/shawn/kai-trading-exec
+set -a
+. /Users/shawn/kai-trading-exec/.env
+set +a
+python3 scripts/export_weekly_trade_review.py \
+  --require-runtime-mode live \
+  --start-at 2026-08-03T00:00:00+09:00 \
+  --end-at 2026-08-08T00:00:00+09:00
+```
+
+If the cron environment cannot source `.env`, provide both runtime and database
+settings explicitly and keep the guard:
+
+```bash
+KAI_EXEC_RUNTIME_MODE=live \
+KAI_EXEC_DATABASE_URL='postgresql+psycopg://user:pass@host/kai_exec' \
+python3 scripts/export_weekly_trade_review.py \
+  --require-runtime-mode live \
+  --start-at 2026-08-03T00:00:00+09:00 \
+  --end-at 2026-08-08T00:00:00+09:00
+```
+
 This path is read-only: it does not place, cancel, amend, reconcile, or call
 broker APIs. It writes JSON artifacts under
 `var/analytics/weekly_trade_review/` by default and updates `latest.json`.
+Naive timestamps are interpreted as UTC; use explicit `+09:00` offsets for KRX
+trading-date bounds.
 The default query shape starts with `execution_fills.filled_at` for the bounded
 date range, then loads linked `broker_orders` and `broker_order_events` by the
 weekly fill `broker_order_pk` set. It also includes weekly

@@ -664,10 +664,33 @@ def main() -> None:
             "runtime database. This command is read-only and does not call broker APIs."
         ),
     )
-    parser.add_argument("--start-at", required=True, help="Inclusive UTC start timestamp or date.")
-    parser.add_argument("--end-at", required=True, help="Exclusive UTC end timestamp or date.")
+    parser.add_argument(
+        "--start-at",
+        required=True,
+        help=(
+            "Inclusive start timestamp or date. Naive values are interpreted as UTC; "
+            "use an explicit offset such as +09:00 for KST trading-date bounds."
+        ),
+    )
+    parser.add_argument(
+        "--end-at",
+        required=True,
+        help=(
+            "Exclusive end timestamp or date. Naive values are interpreted as UTC; "
+            "use an explicit offset such as +09:00 for KST trading-date bounds."
+        ),
+    )
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--runtime-mode", choices=("mock", "paper", "live"), default=None)
+    parser.add_argument(
+        "--require-runtime-mode",
+        choices=("mock", "paper", "live"),
+        default=None,
+        help=(
+            "Fail before connecting to the database unless loaded settings resolve "
+            "to this runtime mode. Use this for live cron exports."
+        ),
+    )
     parser.add_argument("--database-url", default=None)
     parser.add_argument("--include-json-payloads", action="store_true")
     parser.add_argument("--max-range-days", type=int, default=14)
@@ -679,6 +702,13 @@ def main() -> None:
     if args.runtime_mode:
         settings_kwargs["runtime_mode"] = args.runtime_mode
     settings = load_settings().model_copy(update=settings_kwargs)
+    if args.require_runtime_mode and settings.runtime_mode != args.require_runtime_mode:
+        parser.error(
+            "resolved runtime_mode="
+            f"{settings.runtime_mode!r} does not match --require-runtime-mode "
+            f"{args.require_runtime_mode!r}; source the service .env or pass "
+            "explicit --runtime-mode and --database-url values"
+        )
 
     engine = create_db_engine(settings)
     session_factory = create_session_factory(engine)

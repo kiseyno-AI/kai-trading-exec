@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
@@ -132,6 +135,41 @@ def test_weekly_trade_review_exports_bounded_read_only_artifact(tmp_path) -> Non
 
     db.close()
     engine.dispose()
+
+
+def test_weekly_trade_review_cli_fails_before_artifact_when_required_mode_mismatches(tmp_path) -> None:
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("KAI_EXEC_")
+    }
+    env["KAI_EXEC_RUNTIME_MODE"] = "paper"
+    env["KAI_EXEC_DATABASE_URL"] = f"sqlite:///{tmp_path / 'unexpected.db'}"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "scripts/export_weekly_trade_review.py",
+            "--require-runtime-mode",
+            "live",
+            "--start-at",
+            "2026-07-25T00:00:00Z",
+            "--end-at",
+            "2026-08-01T00:00:00Z",
+            "--output-dir",
+            str(tmp_path),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert "resolved runtime_mode='paper' does not match --require-runtime-mode 'live'" in result.stderr
+    assert not (tmp_path / "2026-07-25_to_2026-08-01_weekly_trade_review.json").exists()
+    assert not (tmp_path / "latest.json").exists()
 
 
 def test_weekly_trade_review_queries_have_sqlite_index_paths() -> None:
