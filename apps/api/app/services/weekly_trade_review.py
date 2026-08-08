@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from collections.abc import Iterable, Sequence
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
@@ -708,6 +709,15 @@ def main() -> None:
             f"{settings.runtime_mode!r} does not match --require-runtime-mode "
             f"{args.require_runtime_mode!r}; source the service .env or pass "
             "explicit --runtime-mode and --database-url values"
+        )
+    explicit_database_url = bool(args.database_url) or bool(
+        os.environ.get("KAI_EXEC_DATABASE_URL", "").strip()
+    )
+    if args.require_runtime_mode == "live" and settings.runtime_mode == "live" and not explicit_database_url:
+        parser.error(
+            "live weekly export requires an explicit database URL via "
+            "--database-url or KAI_EXEC_DATABASE_URL when --require-runtime-mode "
+            "is 'live'; source the service .env or pass --database-url"
         )
 
     engine = create_db_engine(settings)

@@ -6,6 +6,7 @@ import subprocess
 import sys
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
 
 from sqlalchemy import event, inspect, text
 
@@ -22,6 +23,10 @@ from app.models.runtime import (
     MonitoringCheckpoint,
 )
 from app.services.weekly_trade_review import generate_weekly_trade_review
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+WEEKLY_REVIEW_SCRIPT = REPO_ROOT / "scripts" / "export_weekly_trade_review.py"
 
 
 def _build_db(settings: Settings):
@@ -138,18 +143,14 @@ def test_weekly_trade_review_exports_bounded_read_only_artifact(tmp_path) -> Non
 
 
 def test_weekly_trade_review_cli_fails_before_artifact_when_required_mode_mismatches(tmp_path) -> None:
-    env = {
-        key: value
-        for key, value in os.environ.items()
-        if not key.startswith("KAI_EXEC_")
-    }
+    env = _clean_kai_exec_env()
     env["KAI_EXEC_RUNTIME_MODE"] = "paper"
     env["KAI_EXEC_DATABASE_URL"] = f"sqlite:///{tmp_path / 'unexpected.db'}"
 
     result = subprocess.run(
         [
             sys.executable,
-            "scripts/export_weekly_trade_review.py",
+            str(WEEKLY_REVIEW_SCRIPT),
             "--require-runtime-mode",
             "live",
             "--start-at",
@@ -170,6 +171,85 @@ def test_weekly_trade_review_cli_fails_before_artifact_when_required_mode_mismat
     assert "resolved runtime_mode='paper' does not match --require-runtime-mode 'live'" in result.stderr
     assert not (tmp_path / "2026-07-25_to_2026-08-01_weekly_trade_review.json").exists()
     assert not (tmp_path / "latest.json").exists()
+
+
+def test_weekly_trade_review_cli_requires_explicit_live_database_url_before_opening_default_sqlite(tmp_path) -> None:
+    env = _clean_kai_exec_env()
+    work_dir = tmp_path / "work"
+    output_dir = tmp_path / "artifacts"
+    default_sqlite_dir = work_dir / "var"
+    default_sqlite_path = default_sqlite_dir / "kai_trading_exec.db"
+    default_sqlite_dir.mkdir(parents=True)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(WEEKLY_REVIEW_SCRIPT),
+            "--runtime-mode",
+            "live",
+            "--require-runtime-mode",
+            "live",
+            "--start-at",
+            "2026-07-25T00:00:00Z",
+            "--end-at",
+            "2026-08-01T00:00:00Z",
+            "--output-dir",
+            str(output_dir),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=work_dir,
+    )
+
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert "live weekly export requires an explicit database URL" in result.stderr
+    assert "--database-url or KAI_EXEC_DATABASE_URL" in result.stderr
+    assert not default_sqlite_path.exists()
+    assert not (output_dir / "2026-07-25_to_2026-08-01_weekly_trade_review.json").exists()
+    assert not (output_dir / "latest.json").exists()
+
+
+def test_weekly_trade_review_cli_allows_required_live_with_explicit_database_url(tmp_path) -> None:
+    env = _clean_kai_exec_env()
+    db_path = tmp_path / "live-review.db"
+    database_url = f"sqlite:///{db_path}"
+    settings = Settings(database_url=database_url, runtime_mode="live")
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    engine.dispose()
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(WEEKLY_REVIEW_SCRIPT),
+            "--runtime-mode",
+            "live",
+            "--require-runtime-mode",
+            "live",
+            "--database-url",
+            database_url,
+            "--start-at",
+            "2026-07-25T00:00:00Z",
+            "--end-at",
+            "2026-08-01T00:00:00Z",
+            "--output-dir",
+            str(tmp_path / "artifacts"),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+    assert result.returncode == 0
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "ok"
+    assert payload["fill_count"] == 0
+    assert (tmp_path / "artifacts" / "2026-07-25_to_2026-08-01_weekly_trade_review.json").exists()
+    assert (tmp_path / "artifacts" / "latest.json").exists()
 
 
 def test_weekly_trade_review_queries_have_sqlite_index_paths() -> None:
@@ -476,3 +556,11 @@ def _index_columns(inspector, table_name: str) -> dict[str, list[str]]:
 def _query_plan(db, sql: str, params: dict[str, object]) -> str:
     rows = db.execute(text(f"EXPLAIN QUERY PLAN {sql}"), params).all()
     return "\n".join(str(row) for row in rows)
+
+
+def _clean_kai_exec_env() -> dict[str, str]:
+    return {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("KAI_EXEC_")
+    }
