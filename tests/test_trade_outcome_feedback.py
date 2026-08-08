@@ -1551,6 +1551,49 @@ def test_candidate_rule_replay_covers_high_volatility_chase_over_several_weeks(t
     engine.dispose()
 
 
+def test_high_volatility_chase_replay_uses_configured_return_threshold(tmp_path) -> None:
+    engine, session = _session()
+    settings = Settings(
+        runtime_mode="paper",
+        trade_outcome_feedback_dir=str(tmp_path),
+        trade_outcome_feedback_lookback_days=30,
+        watch_buy_high_volatility_chase_atr_pct_threshold=Decimal("15.0"),
+        watch_buy_high_volatility_chase_ret5_threshold_pct=Decimal("40.0"),
+    )
+    plan = ExecutionPlan(
+        id="plan-replay-high-vol-chase-configured-ret5",
+        external_plan_id="plan-replay-high-vol-chase-configured-ret5",
+        source="kai-trading-core",
+        mode="paper",
+    )
+    session.add(plan)
+    _add_closed_trade(
+        session,
+        plan=plan,
+        suffix="configured-ret5-below-threshold",
+        symbol="HVCRET5",
+        buy_price="100",
+        sell_price="87",
+        filled_day=12,
+        risk_context={
+            "short_term_entry_quality": {"atr_pct_14": "17.2160", "return_5d": "35.0000"},
+            "last_monitoring_event": {"reason": "intraday_watch_buy_day_high_cross"},
+        },
+    )
+    session.commit()
+
+    report = generate_trade_outcome_feedback(settings=settings, db=session, as_of=datetime(2026, 6, 30, tzinfo=UTC))
+
+    rules = {row["rule_id"]: row for row in report["candidate_rule_replay"]["rules"]}
+    chase = rules["high_volatility_chase_veto"]
+    assert chase["matched_trade_count"] == 0
+    assert chase["skipped_entries"] == 0
+    assert chase["gross_pnl_delta_krw"] == "0.0000"
+
+    session.close()
+    engine.dispose()
+
+
 def test_candidate_rule_replay_metrics_include_win_rate_and_drawdown_proxy(tmp_path) -> None:
     engine, session = _session()
     settings = Settings(runtime_mode="paper", trade_outcome_feedback_dir=str(tmp_path))

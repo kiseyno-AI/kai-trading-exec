@@ -54,6 +54,7 @@ class CandidateRule:
     size_multiplier: Decimal
     threshold: Decimal
     evaluator: Callable[[dict[str, object], "CandidateRule"], tuple[bool, dict[str, object]]]
+    return_5d_threshold: Decimal | None = None
 
 
 @dataclass(frozen=True)
@@ -1326,6 +1327,7 @@ def _candidate_rules(settings: Settings) -> list[CandidateRule]:
             size_multiplier=Decimal("0"),
             threshold=Decimal(settings.watch_buy_high_volatility_chase_atr_pct_threshold),
             evaluator=_rule_high_volatility_chase,
+            return_5d_threshold=Decimal(settings.watch_buy_high_volatility_chase_ret5_threshold_pct),
         ),
         CandidateRule(
             rule_id="high_correlation_downsize",
@@ -1694,7 +1696,9 @@ def _rule_high_volatility_chase(trade: dict[str, object], rule: CandidateRule) -
     )
     if atr is None or ret5 is None:
         return False, {"reason": "missing_atr_or_return_5d_context", "atr_field": atr_key, "return_5d_field": ret5_key}
-    ret5_threshold = Decimal(Settings().watch_buy_high_volatility_chase_ret5_threshold_pct)
+    ret5_threshold = rule.return_5d_threshold
+    if ret5_threshold is None:
+        return False, {"reason": "missing_return_5d_threshold"}
     matched = atr > rule.threshold and ret5 > ret5_threshold
     return matched, {
         "atr_field": atr_key,

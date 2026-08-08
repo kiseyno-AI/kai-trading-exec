@@ -1325,6 +1325,7 @@ def _evaluate_monitoring_cycle(
                 price=price,
                 trigger_reason=trigger_reason,
                 trigger_metadata=trigger_metadata,
+                triggered_at=triggered_at,
             )
             if risk_gate is not None:
                 triggered_item_count += 1
@@ -2384,27 +2385,70 @@ def _apply_trigger_time_agent_adjustments(
     decision: trigger_time_exec_agent.TriggerTimeExecAgentDecision,
 ) -> None:
     risk_context = dict(item.risk_context) if isinstance(item.risk_context, dict) else {}
+    quantity_policy = dict(item.quantity_policy) if isinstance(item.quantity_policy, dict) else None
+    enforced_stop = _high_volatility_chase_override_stop_to_enforce(item=item, decision=decision)
+    agent_updated_stop = decision.updated_stop_price
+    if enforced_stop is not None:
+        decision.updated_stop_price = enforced_stop
     if decision.limit_price is not None:
         item.limit_price = decision.limit_price
         risk_context["trigger_time_limit_price"] = _serialize_decimal(decision.limit_price)
     if decision.updated_target_price is not None:
         risk_context["target_price"] = _serialize_decimal(decision.updated_target_price)
         risk_context["updated_target_price"] = _serialize_decimal(decision.updated_target_price)
+        if quantity_policy is not None:
+            quantity_policy["target_price"] = _serialize_decimal(decision.updated_target_price)
+            quantity_policy["updated_target_price"] = _serialize_decimal(decision.updated_target_price)
         _update_sibling_trigger_price(
             item=item,
             intent="target_sell",
             trigger_price=decision.updated_target_price,
         )
-    if decision.updated_stop_price is not None:
-        risk_context["stop_price"] = _serialize_decimal(decision.updated_stop_price)
-        risk_context["stop_loss_price"] = _serialize_decimal(decision.updated_stop_price)
-        risk_context["updated_stop_price"] = _serialize_decimal(decision.updated_stop_price)
+    stop_price = enforced_stop or decision.updated_stop_price
+    if stop_price is not None:
+        risk_context["stop_price"] = _serialize_decimal(stop_price)
+        risk_context["stop_loss_price"] = _serialize_decimal(stop_price)
+        risk_context["updated_stop_price"] = _serialize_decimal(stop_price)
+        if quantity_policy is not None:
+            quantity_policy["stop_price"] = _serialize_decimal(stop_price)
+            quantity_policy["stop_loss_price"] = _serialize_decimal(stop_price)
+            quantity_policy["updated_stop_price"] = _serialize_decimal(stop_price)
+        if enforced_stop is not None:
+            risk_context["trigger_time_override_stop_enforcement"] = {
+                "reason": "high_volatility_chase_override_stop_preserved",
+                "agent_updated_stop_price": _serialize_decimal(agent_updated_stop),
+                "enforced_stop_price": _serialize_decimal(enforced_stop),
+            }
         _update_sibling_trigger_price(
             item=item,
             intent="stop_sell",
-            trigger_price=decision.updated_stop_price,
+            trigger_price=stop_price,
         )
     item.risk_context = compact_json_object(risk_context)
+    if quantity_policy is not None:
+        item.quantity_policy = compact_json_object(quantity_policy)
+
+
+def _high_volatility_chase_override_stop_to_enforce(
+    *,
+    item: ExecutionPlanItem,
+    decision: trigger_time_exec_agent.TriggerTimeExecAgentDecision,
+) -> Decimal | None:
+    if item.side != "buy" or decision.decision != "execute_now":
+        return None
+    risk_context = item.risk_context if isinstance(item.risk_context, dict) else {}
+    high_volatility_decision = risk_context.get("last_high_volatility_chase_decision")
+    if not isinstance(high_volatility_decision, dict) or high_volatility_decision.get("outcome") != "override":
+        return None
+    override = high_volatility_decision.get("override")
+    if not isinstance(override, dict):
+        return None
+    override_stop = _parse_positive_decimal(override.get("tighter_stop_price"))
+    if override_stop is None:
+        return None
+    if decision.updated_stop_price is None or decision.updated_stop_price >= override_stop:
+        return None
+    return override_stop
 
 
 def _record_trigger_time_watch_buy_sizing_result(
@@ -6698,6 +6742,7 @@ def _watch_buy_high_risk_gate_rejection(
     price: MonitoringPriceRequest | None = None,
     trigger_reason: str | None = None,
     trigger_metadata: dict[str, object] | None = None,
+    triggered_at: datetime | None = None,
 ) -> dict[str, object] | None:
     if not settings.watch_buy_high_risk_gate_enabled:
         return None
@@ -6747,8 +6792,9 @@ def _watch_buy_high_risk_gate_rejection(
         payload=payload,
         atr_pct=atr_pct,
         ret5=ret5,
+        triggered_at=triggered_at,
     )
-    if chase_decision is not None and chase_decision["outcome"] == "veto":
+    if chase_decision is not None and chase_decision["outcome"] in {"veto", "legacy_veto"}:
         return _watch_buy_gate_rejection(
             reason=str(chase_decision["reason"]),
             message=str(chase_decision["message"]),
@@ -6818,6 +6864,7 @@ def _watch_buy_high_volatility_chase_decision(
     payload: dict[str, object],
     atr_pct: Decimal | None,
     ret5: Decimal | None,
+    triggered_at: datetime | None = None,
 ) -> dict[str, object] | None:
     if not _watch_buy_is_chase_trigger(
         item=item,
@@ -6829,6 +6876,13 @@ def _watch_buy_high_volatility_chase_decision(
         settings=settings,
         item=item,
         payload=payload,
+        triggered_at=triggered_at,
+    )
+    legacy_matched = (
+        atr_pct is not None
+        and atr_pct >= settings.watch_buy_high_atr_pct_threshold
+        and ret5 is not None
+        and ret5 >= settings.watch_buy_extended_ret5_threshold_pct
     )
     details: dict[str, object] = {
         "rule_id": "high_volatility_chase_veto",
@@ -6837,6 +6891,8 @@ def _watch_buy_high_volatility_chase_decision(
         "return_5d": _serialize_decimal(ret5),
         "atr_threshold_pct": _serialize_decimal(settings.watch_buy_high_volatility_chase_atr_pct_threshold),
         "return_5d_threshold_pct": _serialize_decimal(settings.watch_buy_high_volatility_chase_ret5_threshold_pct),
+        "legacy_atr_threshold_pct": _serialize_decimal(settings.watch_buy_high_atr_pct_threshold),
+        "legacy_return_5d_threshold_pct": _serialize_decimal(settings.watch_buy_extended_ret5_threshold_pct),
         "technical_context": context_state,
         "observed_price": _serialize_decimal(observed_price),
         "live_veto_enabled": settings.watch_buy_high_volatility_chase_veto_enabled,
@@ -6848,7 +6904,27 @@ def _watch_buy_high_volatility_chase_decision(
         and ret5 is not None
         and ret5 > settings.watch_buy_high_volatility_chase_ret5_threshold_pct
     )
-    if not matched and not (settings.watch_buy_high_volatility_chase_veto_enabled and missing_or_stale):
+    if not settings.watch_buy_high_volatility_chase_veto_enabled:
+        if legacy_matched:
+            decision = {
+                **details,
+                "outcome": "legacy_veto",
+                "reason": "short_term_high_atr_extended_ret5_block",
+                "message": "5-day move is extended while ATR is high for a chase buy",
+            }
+            _persist_watch_buy_high_volatility_chase_decision(item=item, decision=decision)
+            return decision
+        if matched:
+            decision = {
+                **details,
+                "outcome": "shadow_veto",
+                "reason": "short_term_high_volatility_chase_block",
+                "message": "5-day move is extended while ATR is extreme for a chase buy",
+            }
+            _persist_watch_buy_high_volatility_chase_decision(item=item, decision=decision)
+        return None
+
+    if not matched and not missing_or_stale:
         return None
 
     override = _watch_buy_high_volatility_chase_override(
@@ -6915,6 +6991,7 @@ def _watch_buy_technical_context_state(
     settings: Settings,
     item: ExecutionPlanItem,
     payload: dict[str, object],
+    triggered_at: datetime | None = None,
 ) -> dict[str, object]:
     as_of = _recursive_text_feature(
         payload,
@@ -6925,8 +7002,11 @@ def _watch_buy_technical_context_state(
     parsed = _parse_date_or_datetime(as_of)
     if parsed is None:
         return {"status": "missing", "as_of": as_of, "max_age_days": settings.watch_buy_high_volatility_chase_max_context_age_days}
-    market_date = item.plan.market_date if item.plan is not None and item.plan.market_date is not None else None
-    reference_date = market_date or datetime.now(UTC).astimezone(KRX_TIMEZONE).date()
+    reference_date = (
+        triggered_at.astimezone(KRX_TIMEZONE).date()
+        if triggered_at is not None
+        else datetime.now(UTC).astimezone(KRX_TIMEZONE).date()
+    )
     age_days = (reference_date - parsed).days
     status = "fresh" if age_days <= settings.watch_buy_high_volatility_chase_max_context_age_days else "stale"
     return {
@@ -6979,6 +7059,11 @@ def _watch_buy_high_volatility_chase_override(
     updated_context["stop_price"] = _serialize_decimal(tighter_stop)
     updated_context["stop_loss_price"] = _serialize_decimal(tighter_stop)
     item.risk_context = compact_json_object(updated_context)
+    if isinstance(item.quantity_policy, dict):
+        updated_policy = dict(item.quantity_policy)
+        updated_policy["stop_price"] = _serialize_decimal(tighter_stop)
+        updated_policy["stop_loss_price"] = _serialize_decimal(tighter_stop)
+        item.quantity_policy = compact_json_object(updated_policy)
     return {
         "reason": _bounded_text(reason, max_length=240),
         "prior_stop_price": _serialize_decimal(current_stop),

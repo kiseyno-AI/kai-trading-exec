@@ -272,6 +272,7 @@ def test_trigger_time_chase_buy_high_atr_extended_return_vetoes_before_agent(
             "actor": "ops",
             "source": "test",
             "reason": "day high chase with extreme extension",
+            "observed_at": "2026-06-05T00:30:00Z",
             "prices": [_live_price_payload(day_low="70000.00", day_high="72500.00")],
         },
     )
@@ -299,6 +300,46 @@ def test_trigger_time_chase_buy_high_atr_extended_return_vetoes_before_agent(
     engine.dispose()
 
 
+def test_trigger_time_chase_buy_legacy_high_atr_extended_return_blocks_when_new_veto_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, engine, client, broker_adapter, captured = _build_trigger_agent_app(
+        monkeypatch=monkeypatch,
+        agent_responses=[],
+        settings_overrides={"watch_buy_high_volatility_chase_veto_enabled": False},
+    )
+    _create_intraday_watch_buy(
+        client,
+        plan_id="plan-trigger-agent-legacy-high-atr-ret5-block",
+        risk_context_extra=_high_volatility_context(),
+    )
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "legacy high ATR extended ret5 block remains active",
+            "observed_at": "2026-06-05T00:30:00Z",
+            "prices": [_live_price_payload(day_low="70000.00", day_high="72500.00")],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["submitted_order_count"] == 0
+    assert payload["blocked_item_count"] == 1
+    item_payload = payload["items"][0]
+    assert item_payload["outcome"] == "rejected"
+    assert item_payload["block_reason"] == "short_term_high_atr_extended_ret5_block"
+    assert item_payload["risk_decision"]["outcome"] == "legacy_veto"
+    assert item_payload["risk_decision"]["live_veto_enabled"] is False
+    assert captured == []
+    assert broker_adapter.order_calls == []
+
+    engine.dispose()
+
+
 @pytest.mark.parametrize("technical_context_as_of", [None, "2026-06-01"])
 def test_trigger_time_chase_buy_stale_or_missing_technical_context_fails_closed(
     monkeypatch: pytest.MonkeyPatch,
@@ -321,6 +362,7 @@ def test_trigger_time_chase_buy_stale_or_missing_technical_context_fails_closed(
             "actor": "ops",
             "source": "test",
             "reason": "stale technical context should fail closed",
+            "observed_at": "2026-06-05T00:30:00Z",
             "prices": [_live_price_payload(day_low="70000.00", day_high="71100.00")],
         },
     )
@@ -330,6 +372,48 @@ def test_trigger_time_chase_buy_stale_or_missing_technical_context_fails_closed(
     assert item_payload["outcome"] == "rejected"
     assert item_payload["block_reason"] == "stale_or_missing_technical_context_for_chase"
     assert item_payload["risk_decision"]["technical_context"]["status"] in {"missing", "stale"}
+    assert captured == []
+    assert broker_adapter.order_calls == []
+
+    engine.dispose()
+
+
+def test_trigger_time_chase_buy_technical_context_age_uses_execution_date(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, engine, client, broker_adapter, captured = _build_trigger_agent_app(
+        monkeypatch=monkeypatch,
+        agent_responses=[],
+        settings_overrides={
+            "watch_buy_high_volatility_chase_veto_enabled": True,
+            "watch_buy_high_volatility_chase_max_context_age_days": 1,
+        },
+    )
+    _create_intraday_watch_buy(
+        client,
+        plan_id="plan-trigger-agent-stale-current-session-tech",
+        risk_context_extra=_high_volatility_context(technical_context_as_of="2026-06-05"),
+    )
+    price = _live_price_payload(day_low="70000.00", day_high="72500.00")
+    price["observed_at"] = "2026-06-09T00:30:00Z"
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "watch item survived into later execution session",
+            "observed_at": "2026-06-09T00:30:00Z",
+            "prices": [price],
+        },
+    )
+
+    assert response.status_code == 200
+    item_payload = response.json()["items"][0]
+    assert item_payload["outcome"] == "rejected"
+    assert item_payload["block_reason"] == "stale_or_missing_technical_context_for_chase"
+    assert item_payload["risk_decision"]["technical_context"]["status"] == "stale"
+    assert item_payload["risk_decision"]["technical_context"]["age_days"] == 4
     assert captured == []
     assert broker_adapter.order_calls == []
 
@@ -375,6 +459,7 @@ def test_trigger_time_chase_buy_override_requires_documented_tighter_stop(
             "actor": "ops",
             "source": "test",
             "reason": "documented override can proceed through trigger-time agent",
+            "observed_at": "2026-06-05T00:30:00Z",
             "prices": [_live_price_payload(day_low="70000.00", day_high="72500.00")],
         },
     )
@@ -393,6 +478,73 @@ def test_trigger_time_chase_buy_override_requires_documented_tighter_stop(
         assert decision["outcome"] == "override"
         assert decision["override"]["tighter_stop_price"] == "70500.0000"
         assert item.risk_context["stop_price"] == "70550.0000"
+
+    engine.dispose()
+
+
+def test_trigger_time_chase_buy_override_stop_is_enforced_after_agent_looser_stop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, engine, client, broker_adapter, captured = _build_trigger_agent_app(
+        monkeypatch=monkeypatch,
+        agent_responses=[
+            {
+                "decision": "execute_now",
+                "side": "buy",
+                "quantity": 2,
+                "limit_price": "71060.00",
+                "updated_target_price": "72400.00",
+                "updated_stop_price": "70000.00",
+                "reason": "agent attempts to keep original looser stop",
+                "risk_notes": ["looser stop should be clamped by runtime"],
+                "confidence": "0.74",
+                "context_staleness_ok": True,
+            }
+        ],
+        settings_overrides={"watch_buy_high_volatility_chase_veto_enabled": True},
+    )
+    item_id = _create_intraday_watch_buy(
+        client,
+        plan_id="plan-trigger-agent-high-volatility-chase-override-stop-clamp",
+        risk_context_extra=_high_volatility_context(
+            override={
+                "enabled": True,
+                "reason": "stronger strategy signal: live absorption confirms continuation despite extension",
+                "tighter_stop_price": "70500.00",
+            },
+        ),
+    )
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "override stop must survive trigger-time agent",
+            "observed_at": "2026-06-05T00:30:00Z",
+            "prices": [_live_price_payload(day_low="70000.00", day_high="72500.00")],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["submitted_order_count"] == 1
+    assert payload["items"][0]["outcome"] == "submitted"
+    assert len(captured) == 1
+    assert broker_adapter.order_calls[0].quantity == 2
+
+    with app.state.db_session_factory() as session:
+        item = session.get(ExecutionPlanItem, item_id)
+        assert item is not None
+        assert item.risk_context["stop_price"] == "70500.0000"
+        assert item.risk_context["updated_stop_price"] == "70500.0000"
+        assert item.risk_context["trigger_time_override_stop_enforcement"] == {
+            "reason": "high_volatility_chase_override_stop_preserved",
+            "agent_updated_stop_price": "70000.0000",
+            "enforced_stop_price": "70500.0000",
+        }
+        interaction = item.risk_context["last_trigger_time_exec_agent_interaction"]
+        assert interaction["decision"]["updated_stop_price"] == "70500.0000"
 
     engine.dispose()
 
@@ -840,6 +992,7 @@ def test_stale_trigger_reclaim_allows_fresh_agent_pullback_reclaim_confirmation(
             "actor": "ops",
             "source": "test",
             "reason": "agent confirms fresh reclaim after stale trigger",
+            "observed_at": "2026-06-05T00:30:00Z",
             "prices": [_live_price_payload(price="68870.00")],
         },
     )
