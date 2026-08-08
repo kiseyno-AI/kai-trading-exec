@@ -282,6 +282,19 @@ class ProfitTargetCoverageIssue:
     reason: str | None = None
 
 
+@dataclass(frozen=True)
+class ProtectiveStopActionabilityWarning:
+    symbol: str
+    execution_plan_item_id: str
+    status: str
+    observed_price: Decimal
+    stop_trigger: Decimal
+    outcome: str
+    reason: str
+    message: str | None = None
+    block_reason: object | None = None
+
+
 PROFIT_PROTECTION_TRIGGER_REASONS = frozenset(
     {"profit_protection_trailing_stop", "aged_position_profit_protection"}
 )
@@ -1420,6 +1433,11 @@ def _evaluate_monitoring_cycle(
             for item_id in evaluated_item_ids
             if item_id in result_by_item_id
         ]
+        stop_actionability_warnings = _protective_stop_actionability_warnings(
+            items=items,
+            prices=prices,
+            results=results,
+        )
         db.flush()
         agent_status_counts = (
             {
@@ -1460,6 +1478,10 @@ def _evaluate_monitoring_cycle(
             "protective_stop_coverage": _protective_stop_coverage_payload(
                 issues=coverage_issues,
                 repaired_count=repaired_stop_coverage_count,
+                actionability_warnings=stop_actionability_warnings,
+            ),
+            "protective_stop_actionability": _protective_stop_actionability_payload(
+                warnings=stop_actionability_warnings,
             ),
             "profit_target_coverage": _profit_target_coverage_payload(
                 issues=profit_target_coverage_issues,
@@ -1488,6 +1510,7 @@ def _evaluate_monitoring_cycle(
                 "triggered_symbol_count": checkpoint_details["triggered_symbol_count"],
                 "submitted_symbols": [],
                 "protective_stop_coverage": checkpoint_details["protective_stop_coverage"],
+                "protective_stop_actionability": checkpoint_details["protective_stop_actionability"],
                 "profit_target_coverage": checkpoint_details["profit_target_coverage"],
                 "items": results,
             },
@@ -1942,6 +1965,11 @@ def _evaluate_monitoring_cycle(
         for item_id in evaluated_item_ids
         if item_id in result_by_item_id
     ]
+    stop_actionability_warnings = _protective_stop_actionability_warnings(
+        items=items,
+        prices=prices,
+        results=results,
+    )
     db.flush()
     _log_cycle_step("flush_results", result_count=len(results))
     if skip_pre_cycle_broker_reconciliation:
@@ -1986,6 +2014,10 @@ def _evaluate_monitoring_cycle(
         "protective_stop_coverage": _protective_stop_coverage_payload(
             issues=coverage_issues,
             repaired_count=repaired_stop_coverage_count,
+            actionability_warnings=stop_actionability_warnings,
+        ),
+        "protective_stop_actionability": _protective_stop_actionability_payload(
+            warnings=stop_actionability_warnings,
         ),
         "profit_target_coverage": _profit_target_coverage_payload(
             issues=profit_target_coverage_issues,
@@ -2006,6 +2038,7 @@ def _evaluate_monitoring_cycle(
                 if deferred_item_count > 0
                 or submitted_order_count > 0
                 or degraded_coverage_count > 0
+                or stop_actionability_warnings
                 or degraded_target_coverage_count > 0
                 else "running"
             ),
@@ -2026,6 +2059,7 @@ def _evaluate_monitoring_cycle(
             "triggered_symbol_count": checkpoint_details["triggered_symbol_count"],
             "submitted_symbols": checkpoint_details["submitted_symbols"],
             "protective_stop_coverage": checkpoint_details["protective_stop_coverage"],
+            "protective_stop_actionability": checkpoint_details["protective_stop_actionability"],
             "profit_target_coverage": checkpoint_details["profit_target_coverage"],
             "items": results,
         },
@@ -3602,10 +3636,17 @@ def _protective_stop_coverage_payload(
     *,
     issues: list[ProtectiveStopCoverageIssue],
     repaired_count: int,
+    actionability_warnings: list[ProtectiveStopActionabilityWarning] | None = None,
 ) -> dict[str, object]:
+    actionability_warnings = actionability_warnings or []
     unprotected = [issue for issue in issues if issue.outcome == "unprotected_position"]
     degraded = [issue for issue in issues if issue.outcome != "rearmed"]
-    affected_symbols = [issue.symbol for issue in degraded]
+    degraded_symbols = {issue.symbol for issue in degraded}
+    affected_symbols = [issue.symbol for issue in degraded] + [
+        warning.symbol
+        for warning in actionability_warnings
+        if warning.symbol not in degraded_symbols
+    ]
     serialized_issues = [
         {
             "symbol": issue.symbol,
@@ -3624,10 +3665,11 @@ def _protective_stop_coverage_payload(
         for issue in issues
     ]
     return {
-        "status": "degraded" if degraded else "ok",
+        "status": "degraded" if degraded or actionability_warnings else "ok",
         "unprotected_position_count": len(unprotected),
         "position_truth_stale_count": sum(1 for issue in issues if issue.outcome == "position_truth_stale"),
         "repaired_stop_coverage_count": repaired_count,
+        "actionability_warning_count": len(actionability_warnings),
         "affected_symbols": affected_symbols[:MAX_PROTECTIVE_STOP_COVERAGE_DETAILS],
         "affected_symbols_count": len(affected_symbols),
         "affected_symbols_truncated": len(affected_symbols) > MAX_PROTECTIVE_STOP_COVERAGE_DETAILS,
@@ -3639,6 +3681,130 @@ def _protective_stop_coverage_payload(
         "issues": serialized_issues[:MAX_PROTECTIVE_STOP_COVERAGE_DETAILS],
         "issues_count": len(serialized_issues),
         "issues_truncated": len(serialized_issues) > MAX_PROTECTIVE_STOP_COVERAGE_DETAILS,
+    }
+
+
+def _protective_stop_actionability_warnings(
+    *,
+    items: list[ExecutionPlanItem],
+    prices: dict[str, MonitoringPriceRequest],
+    results: list[dict[str, object]],
+) -> list[ProtectiveStopActionabilityWarning]:
+    warnings: list[ProtectiveStopActionabilityWarning] = []
+    results_by_item_id = {
+        str(result.get("execution_plan_item_id")): result
+        for result in results
+        if result.get("execution_plan_item_id") is not None
+    }
+    seen: set[str] = set()
+    for item in items:
+        if item.side != "sell" or item.intent != "stop_sell":
+            continue
+        price = prices.get(item.symbol)
+        observed_price = price.price if price is not None else None
+        if observed_price is None or item.trigger_price is None or observed_price > item.trigger_price:
+            continue
+        result = results_by_item_id.get(item.id)
+        if result is not None and _protective_stop_result_has_actionable_outcome(result):
+            continue
+        seen.add(item.id)
+        warnings.append(
+            ProtectiveStopActionabilityWarning(
+                symbol=item.symbol,
+                execution_plan_item_id=item.id,
+                status=str(result.get("status") if result is not None else item.status),
+                observed_price=observed_price,
+                stop_trigger=item.trigger_price,
+                outcome=str(result.get("outcome") if result is not None else "not_evaluated"),
+                reason="crossed_stop_without_actionable_outcome",
+                message=(
+                    str(result["message"])
+                    if result is not None and result.get("message") is not None
+                    else "stop trigger was crossed but no monitor result was recorded"
+                ),
+                block_reason=result.get("block_reason") if result is not None else None,
+            )
+        )
+    for result in results:
+        if result.get("intent") != "stop_sell":
+            continue
+        item_id = str(result.get("execution_plan_item_id") or "")
+        if item_id in seen:
+            continue
+        observed_price = _parse_decimal(result.get("observed_price"))
+        stop_trigger = _parse_decimal(result.get("trigger_price"))
+        if observed_price is None or stop_trigger is None or observed_price > stop_trigger:
+            continue
+        if _protective_stop_result_has_actionable_outcome(result):
+            continue
+        warnings.append(
+            ProtectiveStopActionabilityWarning(
+                symbol=str(result.get("symbol") or ""),
+                execution_plan_item_id=item_id,
+                status=str(result.get("status") or ""),
+                observed_price=observed_price,
+                stop_trigger=stop_trigger,
+                outcome=str(result.get("outcome") or "unknown"),
+                reason="crossed_stop_without_actionable_outcome",
+                message=str(result["message"]) if result.get("message") is not None else None,
+                block_reason=result.get("block_reason"),
+            )
+        )
+    return warnings
+
+
+def _protective_stop_result_has_actionable_outcome(result: dict[str, object]) -> bool:
+    outcome = str(result.get("outcome") or "")
+    status = str(result.get("status") or "")
+    explicit_failure_statuses = RETRYABLE_PROTECTIVE_STOP_STATUSES | {
+        "broker_order_failed",
+        "failed",
+    }
+    if outcome in {"submitted", "duplicate"}:
+        return True
+    if outcome == "deferred" and status.endswith("_pending_dispatch"):
+        return True
+    if outcome in {"blocked", "agent_delay", "agent_pending", "rejected"}:
+        return (
+            status.endswith("_triggered_blocked")
+            or status in AGENT_ACTIVE_STATUSES
+            or status == AGENT_REJECTED_STATUS
+            or status in explicit_failure_statuses
+        )
+    if outcome == "error":
+        return status in explicit_failure_statuses
+    return False
+
+
+def _protective_stop_actionability_payload(
+    *,
+    warnings: list[ProtectiveStopActionabilityWarning],
+) -> dict[str, object]:
+    serialized_warnings = [
+        {
+            "symbol": warning.symbol,
+            "execution_plan_item_id": warning.execution_plan_item_id,
+            "status": warning.status,
+            "observed_price": _serialize_decimal(warning.observed_price),
+            "stop_trigger": _serialize_decimal(warning.stop_trigger),
+            "outcome": warning.outcome,
+            "reason": warning.reason,
+            "message": warning.message,
+            "block_reason": warning.block_reason,
+        }
+        for warning in warnings
+    ]
+    return {
+        "status": "degraded" if warnings else "ok",
+        "warning_count": len(warnings),
+        "affected_symbols": [
+            warning.symbol for warning in warnings[:MAX_PROTECTIVE_STOP_COVERAGE_DETAILS]
+        ],
+        "affected_symbols_count": len(warnings),
+        "affected_symbols_truncated": len(warnings) > MAX_PROTECTIVE_STOP_COVERAGE_DETAILS,
+        "warnings": serialized_warnings[:MAX_PROTECTIVE_STOP_COVERAGE_DETAILS],
+        "warnings_count": len(serialized_warnings),
+        "warnings_truncated": len(serialized_warnings) > MAX_PROTECTIVE_STOP_COVERAGE_DETAILS,
     }
 
 

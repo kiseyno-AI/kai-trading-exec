@@ -7310,6 +7310,342 @@ def test_monitoring_evaluate_reports_blocked_stop_sell_trigger_when_runtime_is_p
     engine.dispose()
 
 
+def test_monitoring_recovery_stop_crossing_deferred_when_broker_capacity_unavailable() -> None:
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(broker_order_id="kis-recovery-stop"),
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+            monitoring_max_broker_actions_per_cycle=0,
+        ),
+        broker_adapter=broker_adapter,
+    )
+    client = TestClient(app)
+
+    with app.state.db_session_factory() as session:
+        plan = ExecutionPlan(
+            id="plan-recovered-stop-actionable",
+            external_plan_id="plan-recovered-stop-actionable",
+            source="test",
+            mode="paper",
+            status="accepted",
+            accepted_at=datetime(2026, 8, 7, 1, 0, tzinfo=UTC),
+        )
+        session.add(plan)
+        session.add(
+            ExecutionPosition(
+                mode="paper",
+                symbol="459550",
+                quantity=200,
+                average_price=Decimal("1920.0000"),
+                updated_from="reconciliation",
+                last_reconciled_at=datetime(2026, 8, 7, 1, 0, tzinfo=UTC),
+                raw_payload={"source": "test"},
+            )
+        )
+        session.add_all(
+            [
+                ExecutionPlanItem(
+                    id="original-expired-stop",
+                    plan=plan,
+                    plan_item_index=0,
+                    symbol="459550",
+                    side="sell",
+                    intent="stop_sell",
+                    status="stop_sell_expired",
+                    quantity_policy={"kind": "shares", "quantity": 200},
+                    trigger_price=Decimal("1843.2000"),
+                    time_in_force="day",
+                ),
+                ExecutionPlanItem(
+                    id="recovery-monitoring-stop",
+                    plan=plan,
+                    plan_item_index=1,
+                    symbol="459550",
+                    side="sell",
+                    intent="stop_sell",
+                    status="stop_sell_monitoring",
+                    quantity_policy={"kind": "shares", "quantity": 200},
+                    trigger_price=Decimal("1872.0000"),
+                    time_in_force="day",
+                ),
+            ]
+        )
+        session.commit()
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "recovered stop crossed",
+            "observed_at": "2026-08-07T02:00:00Z",
+            "prices": [{"symbol": "459550", "price": "1660.00"}],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["submitted_order_count"] == 0
+    assert payload["deferred_item_count"] == 1
+    assert payload["protective_stop_coverage"]["status"] == "ok"
+    assert payload["protective_stop_actionability"]["status"] == "ok"
+    assert payload["items"][0]["execution_plan_item_id"] == "recovery-monitoring-stop"
+    assert payload["items"][0]["outcome"] == "deferred"
+
+    with app.state.db_session_factory() as session:
+        recovery = session.get(ExecutionPlanItem, "recovery-monitoring-stop")
+        assert recovery is not None
+        assert recovery.status == "stop_sell_triggered_pending_dispatch"
+        checkpoint = session.scalar(
+            select(MonitoringCheckpoint).where(
+                MonitoringCheckpoint.worker_name == "intraday_target_stop_monitor"
+            )
+        )
+        assert checkpoint is not None
+        assert checkpoint.details["protective_stop_actionability"]["status"] == "ok"
+
+    assert broker_adapter.order_calls == []
+    engine.dispose()
+
+
+def test_monitoring_warns_when_crossed_stop_has_no_actionable_outcome() -> None:
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(broker_order_id="kis-invalid-recovery-stop"),
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+        ),
+        broker_adapter=broker_adapter,
+    )
+    client = TestClient(app)
+
+    with app.state.db_session_factory() as session:
+        plan = ExecutionPlan(
+            id="plan-crossed-stop-warning",
+            external_plan_id="plan-crossed-stop-warning",
+            source="test",
+            mode="paper",
+            status="accepted",
+            accepted_at=datetime(2026, 8, 7, 1, 0, tzinfo=UTC),
+        )
+        session.add(plan)
+        session.add_all(
+            [
+                ExecutionPlanItem(
+                    id="warning-original-expired-stop",
+                    plan=plan,
+                    plan_item_index=0,
+                    symbol="496120",
+                    side="sell",
+                    intent="stop_sell",
+                    status="stop_sell_expired",
+                    quantity_policy={"kind": "shares", "quantity": 10},
+                    trigger_price=Decimal("31584.0000"),
+                    time_in_force="day",
+                ),
+                ExecutionPlanItem(
+                    id="warning-recovery-stop",
+                    plan=plan,
+                    plan_item_index=1,
+                    symbol="496120",
+                    side="sell",
+                    intent="stop_sell",
+                    status="stop_sell_monitoring",
+                    quantity_policy={"kind": "shares", "quantity": 10},
+                    trigger_price=Decimal("32077.5000"),
+                    time_in_force="day",
+                ),
+            ]
+        )
+        session.commit()
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "crossed stop warning",
+            "observed_at": "2026-08-07T02:00:00Z",
+            "prices": [{"symbol": "496120", "price": "31330.00"}],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["submitted_order_count"] == 0
+    assert payload["protective_stop_coverage"]["status"] == "degraded"
+    assert payload["protective_stop_coverage"]["actionability_warning_count"] == 1
+    actionability = payload["protective_stop_actionability"]
+    assert actionability["status"] == "degraded"
+    assert actionability["warnings"][0]["execution_plan_item_id"] == "warning-recovery-stop"
+    assert actionability["warnings"][0]["reason"] == "crossed_stop_without_actionable_outcome"
+    assert actionability["warnings"][0]["outcome"] == "not_evaluated"
+
+    runtime_status = client.get("/runtime/status")
+    assert runtime_status.status_code == 200
+    monitoring = runtime_status.json()["liveness"]["monitoring"]
+    assert monitoring["status"] == "degraded"
+    assert monitoring["last_cycle"]["protective_stop_actionability"]["warning_count"] == 1
+
+    with app.state.db_session_factory() as session:
+        recovery = session.get(ExecutionPlanItem, "warning-recovery-stop")
+        assert recovery is not None
+        assert recovery.status == "stop_sell_monitoring"
+        checkpoint = session.scalar(
+            select(MonitoringCheckpoint).where(
+                MonitoringCheckpoint.worker_name == "intraday_target_stop_monitor"
+            )
+        )
+        assert checkpoint is not None
+        assert checkpoint.status == "degraded"
+        assert checkpoint.details["protective_stop_actionability"]["warning_count"] == 1
+
+    assert broker_adapter.order_calls == []
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("agent_status", "item_id"),
+    [
+        ("triggered_pending_agent", "agent-pending-stop"),
+        ("agent_approved_pending_submit", "agent-approved-stop"),
+    ],
+)
+def test_monitoring_treats_agent_pending_crossed_stop_as_actionable(
+    agent_status: str,
+    item_id: str,
+) -> None:
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(broker_order_id="kis-agent-pending-stop"),
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+        ),
+        broker_adapter=broker_adapter,
+    )
+    client = TestClient(app)
+
+    with app.state.db_session_factory() as session:
+        plan = ExecutionPlan(
+            id=f"plan-{item_id}",
+            external_plan_id=f"plan-{item_id}",
+            source="test",
+            mode="paper",
+            status="accepted",
+            accepted_at=datetime(2026, 8, 7, 1, 0, tzinfo=UTC),
+        )
+        session.add(plan)
+        session.add(
+            ExecutionPosition(
+                mode="paper",
+                symbol="496120",
+                quantity=10,
+                average_price=Decimal("33000.00"),
+                updated_from="test",
+                last_reconciled_at=datetime(2026, 8, 7, 1, 55, tzinfo=UTC),
+            )
+        )
+        session.add(
+            ExecutionPlanItem(
+                id=item_id,
+                plan=plan,
+                plan_item_index=0,
+                symbol="496120",
+                side="sell",
+                intent="stop_sell",
+                status=agent_status,
+                quantity_policy={"kind": "shares", "quantity": 10},
+                trigger_price=Decimal("32077.5000"),
+                time_in_force="day",
+                risk_context={
+                    "last_monitoring_event": {
+                        "event": "trigger_time_exec_agent_pending",
+                        "recorded_at": "2026-08-07T02:00:00Z",
+                    }
+                },
+            )
+        )
+        session.commit()
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "crossed stop pending agent",
+            "observed_at": "2026-08-07T02:00:00Z",
+            "prices": [{"symbol": "496120", "price": "31330.00"}],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["submitted_order_count"] == 0
+    assert payload["protective_stop_coverage"]["actionability_warning_count"] == 0
+    assert payload["protective_stop_actionability"]["status"] == "ok"
+    assert payload["protective_stop_actionability"]["warning_count"] == 0
+    assert payload["protective_stop_actionability"]["warnings"] == []
+    assert payload["items"][0]["execution_plan_item_id"] == item_id
+    assert payload["items"][0]["status"] == agent_status
+    assert payload["items"][0]["outcome"] == "agent_pending"
+
+    runtime_status = client.get("/runtime/status")
+    assert runtime_status.status_code == 200
+    monitoring = runtime_status.json()["liveness"]["monitoring"]
+    assert monitoring["last_cycle"]["protective_stop_actionability"]["warning_count"] == 0
+    assert monitoring["last_cycle"]["protective_stop_actionability"]["warnings"] == []
+
+    with app.state.db_session_factory() as session:
+        checkpoint = session.scalar(
+            select(MonitoringCheckpoint).where(
+                MonitoringCheckpoint.worker_name == "intraday_target_stop_monitor"
+            )
+        )
+        assert checkpoint is not None
+        assert checkpoint.details["protective_stop_actionability"]["warning_count"] == 0
+        assert checkpoint.details["protective_stop_actionability"]["warnings"] == []
+
+    assert broker_adapter.order_calls == []
+    engine.dispose()
+
+
 def test_monitoring_evaluate_tracks_remaining_shares_across_triggered_items() -> None:
     broker_adapter = StubBrokerAdapter(
         config=BrokerConfig(

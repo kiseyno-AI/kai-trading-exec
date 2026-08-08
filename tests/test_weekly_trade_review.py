@@ -70,6 +70,7 @@ def test_weekly_trade_review_exports_bounded_read_only_artifact(tmp_path) -> Non
     assert report["counts"]["linked_broker_order_count"] == 1
     assert report["counts"]["linked_broker_order_event_count"] == 1
     assert report["counts"]["execution_failure_count"] == 1
+    assert report["counts"]["protective_stop_actionability_warning_count"] == 1
     assert report["truncated"] == {
         "execution_failures": False,
         "fills": False,
@@ -113,6 +114,27 @@ def test_weekly_trade_review_exports_bounded_read_only_artifact(tmp_path) -> Non
     }
     assert report["execution_plan_item_summary"]["active_watch_status_counts"][0]["status"] == "watch_monitoring_active"
     assert report["monitoring_checkpoints"][0]["worker_name"] == "monitoring"
+    assert report["protective_stop_actionability"] == {
+        "affected_symbols": ["459550"],
+        "status": "degraded",
+        "warning_count": 1,
+        "warnings": [
+            {
+                "block_reason": None,
+                "checkpoint_status": "degraded",
+                "execution_plan_item_id": "recovery-stop",
+                "last_heartbeat_at": "2026-07-31T00:00:00+00:00",
+                "message": "no sellable execution position is available for this trigger",
+                "observed_price": "1660.0000",
+                "outcome": "no_position",
+                "reason": "crossed_stop_without_actionable_outcome",
+                "status": "stop_sell_monitoring",
+                "stop_trigger": "1872.0000",
+                "symbol": "459550",
+                "worker_name": "monitoring",
+            }
+        ],
+    }
 
     assert "payload" not in report["fills"][0]
     assert "raw_broker_payload" not in report["linked_broker_orders"][0]
@@ -130,6 +152,7 @@ def test_weekly_trade_review_exports_bounded_read_only_artifact(tmp_path) -> Non
     assert "request_metadata" not in selected_sql
     assert "response_metadata" not in selected_sql
     assert "raw_context" not in selected_sql
+    assert "risk_context" not in selected_sql
 
     artifact_path = tmp_path / "2026-07-25_to_2026-08-01_weekly_trade_review.json"
     latest_path = tmp_path / "latest.json"
@@ -523,10 +546,29 @@ def _seed_weekly_review_fixture(*, db, start_at: datetime) -> None:
         id="monitoring-checkpoint",
         worker_name="monitoring",
         mode="paper",
-        status="running",
+        status="degraded",
         last_heartbeat_at=start_at + timedelta(days=6),
         last_success_at=start_at + timedelta(days=6),
-        details={"large": "checkpoint"},
+        details={
+            "protective_stop_actionability": {
+                "status": "degraded",
+                "warning_count": 1,
+                "warnings": [
+                    {
+                        "symbol": "459550",
+                        "execution_plan_item_id": "recovery-stop",
+                        "status": "stop_sell_monitoring",
+                        "observed_price": "1660.0000",
+                        "stop_trigger": "1872.0000",
+                        "outcome": "no_position",
+                        "reason": "crossed_stop_without_actionable_outcome",
+                        "message": "no sellable execution position is available for this trigger",
+                        "block_reason": None,
+                    }
+                ],
+            },
+            "large": "checkpoint",
+        },
         created_at=start_at,
         updated_at=start_at + timedelta(days=6),
     )

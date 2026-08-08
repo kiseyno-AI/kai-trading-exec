@@ -137,6 +137,10 @@ def generate_weekly_trade_review(
         mode=settings.runtime_mode,
         include_json_payloads=include_json_payloads,
     )
+    protective_stop_actionability = _monitoring_protective_stop_actionability(
+        db=db,
+        mode=settings.runtime_mode,
+    )
 
     report: dict[str, object] = {
         "generated_at": datetime.now(UTC),
@@ -172,6 +176,7 @@ def generate_weekly_trade_review(
             "weekly_order_sample_count": len(weekly_orders),
             "execution_failure_count": len(failures),
             "monitoring_checkpoint_count": len(monitoring_checkpoints),
+            "protective_stop_actionability_warning_count": protective_stop_actionability["warning_count"],
         },
         "truncated": {
             "fills": fills_truncated,
@@ -188,6 +193,7 @@ def generate_weekly_trade_review(
         "active_broker_order_summary": active_order_summary,
         "execution_plan_item_summary": plan_item_summary,
         "monitoring_checkpoints": monitoring_checkpoints,
+        "protective_stop_actionability": protective_stop_actionability,
     }
 
     artifact_path = target_dir / _artifact_filename(start_at=start_at, end_at=end_at)
@@ -614,6 +620,63 @@ def _monitoring_checkpoints(
         .order_by(MonitoringCheckpoint.worker_name.asc())
     ).all()
     return _rows_to_dicts(rows)
+
+
+def _monitoring_protective_stop_actionability(
+    *,
+    db: Session,
+    mode: str,
+) -> dict[str, object]:
+    rows = db.execute(
+        select(
+            MonitoringCheckpoint.worker_name,
+            MonitoringCheckpoint.status,
+            MonitoringCheckpoint.last_heartbeat_at,
+            MonitoringCheckpoint.details,
+        )
+        .where(MonitoringCheckpoint.mode == mode)
+        .order_by(MonitoringCheckpoint.worker_name.asc())
+    ).all()
+    warnings: list[dict[str, object]] = []
+    for row in rows:
+        details = row.details if isinstance(row.details, dict) else {}
+        actionability = details.get("protective_stop_actionability")
+        if not isinstance(actionability, dict):
+            continue
+        checkpoint_warnings = actionability.get("warnings")
+        if not isinstance(checkpoint_warnings, list):
+            continue
+        for warning in checkpoint_warnings:
+            if not isinstance(warning, dict):
+                continue
+            warnings.append(
+                {
+                    "worker_name": row.worker_name,
+                    "checkpoint_status": row.status,
+                    "last_heartbeat_at": row.last_heartbeat_at,
+                    "symbol": warning.get("symbol"),
+                    "execution_plan_item_id": warning.get("execution_plan_item_id"),
+                    "status": warning.get("status"),
+                    "observed_price": warning.get("observed_price"),
+                    "stop_trigger": warning.get("stop_trigger"),
+                    "outcome": warning.get("outcome"),
+                    "reason": warning.get("reason"),
+                    "message": warning.get("message"),
+                    "block_reason": warning.get("block_reason"),
+                }
+            )
+    return {
+        "status": "degraded" if warnings else "ok",
+        "warning_count": len(warnings),
+        "affected_symbols": sorted(
+            {
+                str(warning["symbol"])
+                for warning in warnings
+                if warning.get("symbol") is not None
+            }
+        ),
+        "warnings": warnings,
+    }
 
 
 def _bounded_rows(rows: Sequence[object], max_rows: int) -> tuple[list[dict[str, object]], bool]:
