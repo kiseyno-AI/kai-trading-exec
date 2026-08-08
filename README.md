@@ -287,9 +287,37 @@ python3 scripts/export_weekly_trade_review.py \
   --end-at 2026-08-01T00:00:00Z
 ```
 
+Live weekly cron must fail closed when the service environment was not loaded.
+Source the same `.env` used by the exec service, then require the resolved mode
+before any database connection or artifact write:
+
+```bash
+cd /Users/shawn/kai-trading-exec
+set -a
+. /Users/shawn/kai-trading-exec/.env
+set +a
+python3 scripts/export_weekly_trade_review.py \
+  --require-runtime-mode live \
+  --start-at 2026-08-03T00:00:00+09:00 \
+  --end-at 2026-08-08T00:00:00+09:00
+```
+
+If cron cannot source `.env`, pass both settings explicitly and keep the guard:
+
+```bash
+KAI_EXEC_RUNTIME_MODE=live \
+KAI_EXEC_DATABASE_URL='postgresql+psycopg://user:pass@host/kai_exec' \
+python3 scripts/export_weekly_trade_review.py \
+  --require-runtime-mode live \
+  --start-at 2026-08-03T00:00:00+09:00 \
+  --end-at 2026-08-08T00:00:00+09:00
+```
+
 The command writes JSON artifacts under
 `var/analytics/weekly_trade_review/` by default and updates `latest.json`.
 Use `KAI_EXEC_WEEKLY_TRADE_REVIEW_DIR` or `--output-dir` to change the target.
+Naive timestamps are interpreted as UTC; use explicit `+09:00` offsets for KRX
+trading-date bounds.
 Only add `--include-json-payloads` for a manual deep-dive where loading stored
 broker/request payload JSON is intentional.
 
