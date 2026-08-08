@@ -25,6 +25,7 @@ def _build_trigger_agent_app(
     monkeypatch: pytest.MonkeyPatch,
     agent_responses: list[dict[str, object]] | None = None,
     broker_adapter: StubBrokerAdapter | None = None,
+    settings_overrides: dict[str, object] | None = None,
 ):
     captured_requests: list[dict[str, object]] = []
     responses = list(agent_responses or [])
@@ -51,19 +52,21 @@ def _build_trigger_agent_app(
         token_grant=build_token_grant(),
         order_placement=build_order_placement(broker_order_id="kis-trigger-agent-1"),
     )
+    settings_payload: dict[str, object] = {
+        "database_url": "sqlite:///:memory:",
+        "runtime_mode": "paper",
+        "kis_app_key": "paper-key",
+        "kis_app_secret": "paper-secret",
+        "kis_account_number": "12345678",
+        "exec_agent_enabled": True,
+        "exec_agent_trigger_time_enabled": True,
+        "exec_agent_trigger_time_sell_enabled": True,
+        "exec_agent_max_position_allocation_pct": Decimal("0.30"),
+        "exec_agent_max_symbol_total_exposure_pct": Decimal("0.30"),
+    }
+    settings_payload.update(settings_overrides or {})
     app, engine = build_test_app(
-        settings=Settings(
-            database_url="sqlite:///:memory:",
-            runtime_mode="paper",
-            kis_app_key="paper-key",
-            kis_app_secret="paper-secret",
-            kis_account_number="12345678",
-            exec_agent_enabled=True,
-            exec_agent_trigger_time_enabled=True,
-            exec_agent_trigger_time_sell_enabled=True,
-            exec_agent_max_position_allocation_pct=Decimal("0.30"),
-            exec_agent_max_symbol_total_exposure_pct=Decimal("0.30"),
-        ),
+        settings=Settings(**settings_payload),
         broker_adapter=adapter,
     )
     client = TestClient(app)
@@ -73,6 +76,26 @@ def _build_trigger_agent_app(
     )
     assert resume.status_code == 200
     return app, engine, client, adapter, captured_requests
+
+
+def _high_volatility_context(
+    *,
+    technical_context_as_of: str | None = "2026-06-05",
+    override: dict[str, object] | None = None,
+) -> dict[str, object]:
+    context: dict[str, object] = {
+        "short_term_entry_quality": {
+            "atr_pct_14": "17.2160",
+            "return_5d": "44.5993",
+            "trend_state": "range",
+        },
+        "technical_context_as_of": technical_context_as_of,
+    }
+    if technical_context_as_of is None:
+        context.pop("technical_context_as_of")
+    if override is not None:
+        context["high_volatility_chase_override"] = override
+    return context
 
 
 def _create_intraday_watch_buy(
@@ -225,6 +248,216 @@ def test_trigger_time_buy_agent_context_approval_quantity_drives_submission(
         interaction = item.risk_context["last_trigger_time_exec_agent_interaction"]
         assert interaction["decision"]["decision"] == "execute_now"
         assert interaction["order"]["quantity"] == 3
+
+    engine.dispose()
+
+
+def test_trigger_time_chase_buy_high_atr_extended_return_vetoes_before_agent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, engine, client, broker_adapter, captured = _build_trigger_agent_app(
+        monkeypatch=monkeypatch,
+        agent_responses=[],
+        settings_overrides={"watch_buy_high_volatility_chase_veto_enabled": True},
+    )
+    item_id = _create_intraday_watch_buy(
+        client,
+        plan_id="plan-trigger-agent-high-volatility-chase-veto",
+        risk_context_extra=_high_volatility_context(),
+    )
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "day high chase with extreme extension",
+            "prices": [_live_price_payload(day_low="70000.00", day_high="72500.00")],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["submitted_order_count"] == 0
+    assert payload["blocked_item_count"] == 1
+    item_payload = payload["items"][0]
+    assert item_payload["outcome"] == "rejected"
+    assert item_payload["block_reason"] == "short_term_high_volatility_chase_block"
+    assert item_payload["risk_decision"]["rule_id"] == "high_volatility_chase_veto"
+    assert item_payload["risk_decision"]["return_5d"] == "44.5993"
+    assert captured == []
+    assert broker_adapter.order_calls == []
+
+    with app.state.db_session_factory() as session:
+        item = session.get(ExecutionPlanItem, item_id)
+        assert item is not None
+        decision = item.risk_context["last_high_volatility_chase_decision"]
+        assert decision["outcome"] == "veto"
+        assert decision["technical_context"]["status"] == "fresh"
+        assert item.risk_context["last_monitoring_event"]["reason"] == "short_term_high_volatility_chase_block"
+
+    engine.dispose()
+
+
+@pytest.mark.parametrize("technical_context_as_of", [None, "2026-06-01"])
+def test_trigger_time_chase_buy_stale_or_missing_technical_context_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    technical_context_as_of: str | None,
+) -> None:
+    app, engine, client, broker_adapter, captured = _build_trigger_agent_app(
+        monkeypatch=monkeypatch,
+        agent_responses=[],
+        settings_overrides={"watch_buy_high_volatility_chase_veto_enabled": True},
+    )
+    _create_intraday_watch_buy(
+        client,
+        plan_id=f"plan-trigger-agent-stale-tech-{technical_context_as_of or 'missing'}",
+        risk_context_extra=_high_volatility_context(technical_context_as_of=technical_context_as_of),
+    )
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "stale technical context should fail closed",
+            "prices": [_live_price_payload(day_low="70000.00", day_high="71100.00")],
+        },
+    )
+
+    assert response.status_code == 200
+    item_payload = response.json()["items"][0]
+    assert item_payload["outcome"] == "rejected"
+    assert item_payload["block_reason"] == "stale_or_missing_technical_context_for_chase"
+    assert item_payload["risk_decision"]["technical_context"]["status"] in {"missing", "stale"}
+    assert captured == []
+    assert broker_adapter.order_calls == []
+
+    engine.dispose()
+
+
+def test_trigger_time_chase_buy_override_requires_documented_tighter_stop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, engine, client, broker_adapter, captured = _build_trigger_agent_app(
+        monkeypatch=monkeypatch,
+        agent_responses=[
+            {
+                "decision": "execute_now",
+                "side": "buy",
+                "quantity": 2,
+                "limit_price": "71060.00",
+                "updated_target_price": "72400.00",
+                "updated_stop_price": "70550.00",
+                "reason": "override remains acceptable because live tape confirms absorption above the breakout",
+                "risk_notes": ["override includes tighter stop"],
+                "confidence": "0.74",
+                "context_staleness_ok": True,
+            }
+        ],
+        settings_overrides={"watch_buy_high_volatility_chase_veto_enabled": True},
+    )
+    item_id = _create_intraday_watch_buy(
+        client,
+        plan_id="plan-trigger-agent-high-volatility-chase-override",
+        risk_context_extra=_high_volatility_context(
+            override={
+                "enabled": True,
+                "reason": "stronger strategy signal: live absorption confirms continuation despite extension",
+                "tighter_stop_price": "70500.00",
+            },
+        ),
+    )
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "documented override can proceed through trigger-time agent",
+            "prices": [_live_price_payload(day_low="70000.00", day_high="72500.00")],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["submitted_order_count"] == 1
+    assert payload["items"][0]["outcome"] == "submitted"
+    assert len(captured) == 1
+    assert broker_adapter.order_calls[0].quantity == 2
+
+    with app.state.db_session_factory() as session:
+        item = session.get(ExecutionPlanItem, item_id)
+        assert item is not None
+        decision = item.risk_context["last_high_volatility_chase_decision"]
+        assert decision["outcome"] == "override"
+        assert decision["override"]["tighter_stop_price"] == "70500.0000"
+        assert item.risk_context["stop_price"] == "70550.0000"
+
+    engine.dispose()
+
+
+def test_high_volatility_chase_rule_does_not_affect_sell_side_stop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, engine, client, broker_adapter, captured = _build_trigger_agent_app(
+        monkeypatch=monkeypatch,
+        agent_responses=[],
+        settings_overrides={
+            "watch_buy_high_volatility_chase_veto_enabled": True,
+            "exec_agent_trigger_time_sell_enabled": False,
+        },
+    )
+    plan_response = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-sell-stop-high-volatility-context",
+            "source": "kai-trading-core",
+            "market_date": "2026-06-05",
+            "items": [
+                {
+                    "symbol": "005930",
+                    "side": "sell",
+                    "intent": "stop_sell",
+                    "quantity_policy": {"kind": "shares", "quantity": 2},
+                    "trigger_price": "70000.00",
+                    "time_in_force": "day",
+                    "risk_context": _high_volatility_context(),
+                }
+            ],
+        },
+    )
+    assert plan_response.status_code == 201
+    stop_item_id = plan_response.json()["persisted_execution_item_ids"][0]
+    with app.state.db_session_factory() as session:
+        session.add(
+            ExecutionPosition(
+                mode="paper",
+                symbol="005930",
+                quantity=2,
+                average_price=Decimal("71000"),
+                updated_from="test",
+            )
+        )
+        session.commit()
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "sell stop should remain deterministic",
+            "prices": [_live_price_payload(price="69900.00")],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["submitted_order_count"] == 1
+    assert payload["items"][0]["outcome"] == "submitted"
+    assert broker_adapter.order_calls[0].execution_plan_item_id == stop_item_id
+    assert broker_adapter.order_calls[0].side == "sell"
+    assert captured == []
 
     engine.dispose()
 

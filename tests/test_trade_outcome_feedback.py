@@ -1497,6 +1497,60 @@ def test_high_volatility_replay_matches_watch_buy_atr_aliases(tmp_path) -> None:
     engine.dispose()
 
 
+def test_candidate_rule_replay_covers_high_volatility_chase_over_several_weeks(tmp_path) -> None:
+    engine, session = _session()
+    settings = Settings(runtime_mode="paper", trade_outcome_feedback_dir=str(tmp_path), trade_outcome_feedback_lookback_days=30)
+    plan = ExecutionPlan(id="plan-replay-high-vol-chase", external_plan_id="plan-replay-high-vol-chase", source="kai-trading-core", mode="paper")
+    session.add(plan)
+    for index, filled_day in enumerate((2, 9, 16), start=1):
+        _add_closed_trade(
+            session,
+            plan=plan,
+            suffix=f"high-vol-chase-loss-{index}",
+            symbol=f"HVC{index}",
+            buy_price="100",
+            sell_price="87",
+            filled_day=filled_day,
+            risk_context={
+                "short_term_entry_quality": {"atr_pct_14": "17.2160", "return_5d": "44.5993"},
+                "last_monitoring_event": {"reason": "intraday_watch_buy_day_high_cross"},
+            },
+        )
+    for index, filled_day in enumerate((23, 24), start=1):
+        _add_closed_trade(
+            session,
+            plan=plan,
+            suffix=f"non-chase-win-{index}",
+            symbol=f"NCW{index}",
+            buy_price="100",
+            sell_price="108",
+            filled_day=filled_day,
+            risk_context={
+                "short_term_entry_quality": {"atr_pct_14": "17.2160", "return_5d": "44.5993"},
+                "last_monitoring_event": {"reason": "intraday_watch_buy_day_low_cross"},
+            },
+        )
+    session.commit()
+
+    report = generate_trade_outcome_feedback(settings=settings, db=session, as_of=datetime(2026, 6, 30, tzinfo=UTC))
+
+    replay = report["candidate_rule_replay"]
+    rules = {row["rule_id"]: row for row in replay["rules"]}
+    chase = rules["high_volatility_chase_veto"]
+    assert replay["baseline_closed_trade_count"] == 5
+    assert chase["matched_trade_count"] == 3
+    assert chase["skipped_entries"] == 3
+    assert chase["avoided_losers"] == 3
+    assert chase["skipped_winners"] == 0
+    assert chase["recommendation"] == "promote_to_issue"
+    assert chase["gross_pnl_delta_krw"] == "390.0000"
+    assert len(chase["top_avoided_losers"]) == 3
+    assert "high_volatility_chase_veto" in (tmp_path / "latest.md").read_text(encoding="utf-8")
+
+    session.close()
+    engine.dispose()
+
+
 def test_candidate_rule_replay_metrics_include_win_rate_and_drawdown_proxy(tmp_path) -> None:
     engine, session = _session()
     settings = Settings(runtime_mode="paper", trade_outcome_feedback_dir=str(tmp_path))

@@ -1323,6 +1323,8 @@ def _evaluate_monitoring_cycle(
                 item=item,
                 observed_price=observed_price,
                 price=price,
+                trigger_reason=trigger_reason,
+                trigger_metadata=trigger_metadata,
             )
             if risk_gate is not None:
                 triggered_item_count += 1
@@ -1347,6 +1349,7 @@ def _evaluate_monitoring_cycle(
                     outcome="blocked" if retryable_pullback_gate else "rejected",
                     block_reason=risk_gate["reason"],
                     message=risk_gate["message"],
+                    risk_decision=risk_gate["details"],
                 )
                 continue
 
@@ -6693,6 +6696,8 @@ def _watch_buy_high_risk_gate_rejection(
     item: ExecutionPlanItem,
     observed_price: Decimal,
     price: MonitoringPriceRequest | None = None,
+    trigger_reason: str | None = None,
+    trigger_metadata: dict[str, object] | None = None,
 ) -> dict[str, object] | None:
     if not settings.watch_buy_high_risk_gate_enabled:
         return None
@@ -6733,6 +6738,22 @@ def _watch_buy_high_risk_gate_rejection(
         "trend_state": trend_state or None,
         "setup_state": setup_state or None,
     }
+    chase_decision = _watch_buy_high_volatility_chase_decision(
+        settings=settings,
+        item=item,
+        observed_price=observed_price,
+        trigger_reason=trigger_reason,
+        trigger_metadata=trigger_metadata,
+        payload=payload,
+        atr_pct=atr_pct,
+        ret5=ret5,
+    )
+    if chase_decision is not None and chase_decision["outcome"] == "veto":
+        return _watch_buy_gate_rejection(
+            reason=str(chase_decision["reason"]),
+            message=str(chase_decision["message"]),
+            details=chase_decision,
+        )
     if any(marker in f"{trend_state} {setup_state}" for marker in ("downtrend", "bearish", "breakdown_20d", "breakdown")):
         return _watch_buy_gate_rejection(
             reason="short_term_downtrend_or_breakdown_block",
@@ -6756,18 +6777,6 @@ def _watch_buy_high_risk_gate_rejection(
             message="ATR is high while 20-day return is weak",
             details=details,
         )
-    if (
-        atr_pct is not None
-        and atr_pct > settings.watch_buy_high_atr_pct_threshold
-        and ret5 is not None
-        and ret5 > settings.watch_buy_extended_ret5_threshold_pct
-    ):
-        return _watch_buy_gate_rejection(
-            reason="short_term_high_atr_chase_block",
-            message="5-day move is extended while ATR is high",
-            details=details,
-        )
-
     trigger_price = _watch_buy_trigger_price(item)
     direction = _watch_buy_direction(item)
     pullback_after_cross = (
@@ -6797,6 +6806,201 @@ def _watch_buy_high_risk_gate_rejection(
                 },
             )
     return None
+
+
+def _watch_buy_high_volatility_chase_decision(
+    *,
+    settings: Settings,
+    item: ExecutionPlanItem,
+    observed_price: Decimal,
+    trigger_reason: str | None,
+    trigger_metadata: dict[str, object] | None,
+    payload: dict[str, object],
+    atr_pct: Decimal | None,
+    ret5: Decimal | None,
+) -> dict[str, object] | None:
+    if not _watch_buy_is_chase_trigger(
+        item=item,
+        trigger_reason=trigger_reason,
+        trigger_metadata=trigger_metadata,
+    ):
+        return None
+    context_state = _watch_buy_technical_context_state(
+        settings=settings,
+        item=item,
+        payload=payload,
+    )
+    details: dict[str, object] = {
+        "rule_id": "high_volatility_chase_veto",
+        "trigger_reason": trigger_reason,
+        "atr_pct_14": _serialize_decimal(atr_pct),
+        "return_5d": _serialize_decimal(ret5),
+        "atr_threshold_pct": _serialize_decimal(settings.watch_buy_high_volatility_chase_atr_pct_threshold),
+        "return_5d_threshold_pct": _serialize_decimal(settings.watch_buy_high_volatility_chase_ret5_threshold_pct),
+        "technical_context": context_state,
+        "observed_price": _serialize_decimal(observed_price),
+        "live_veto_enabled": settings.watch_buy_high_volatility_chase_veto_enabled,
+    }
+    missing_or_stale = context_state["status"] != "fresh"
+    matched = (
+        atr_pct is not None
+        and atr_pct > settings.watch_buy_high_volatility_chase_atr_pct_threshold
+        and ret5 is not None
+        and ret5 > settings.watch_buy_high_volatility_chase_ret5_threshold_pct
+    )
+    if not matched and not (settings.watch_buy_high_volatility_chase_veto_enabled and missing_or_stale):
+        return None
+
+    override = _watch_buy_high_volatility_chase_override(
+        item=item,
+        observed_price=observed_price,
+    )
+    if override is not None:
+        decision = {
+            **details,
+            "outcome": "override",
+            "reason": "high_volatility_chase_override",
+            "message": "explicit stronger-signal override accepted with tighter stop",
+            "override": override,
+        }
+        _persist_watch_buy_high_volatility_chase_decision(item=item, decision=decision)
+        return decision
+
+    reason = (
+        "stale_or_missing_technical_context_for_chase"
+        if missing_or_stale
+        else "short_term_high_volatility_chase_block"
+    )
+    message = (
+        "fresh technical context is required before allowing a chase buy"
+        if missing_or_stale
+        else "5-day move is extended while ATR is extreme for a chase buy"
+    )
+    decision = {
+        **details,
+        "outcome": "veto" if settings.watch_buy_high_volatility_chase_veto_enabled else "shadow_veto",
+        "reason": reason,
+        "message": message,
+    }
+    _persist_watch_buy_high_volatility_chase_decision(item=item, decision=decision)
+    return decision if settings.watch_buy_high_volatility_chase_veto_enabled else None
+
+
+def _watch_buy_is_chase_trigger(
+    *,
+    item: ExecutionPlanItem,
+    trigger_reason: str | None,
+    trigger_metadata: dict[str, object] | None,
+) -> bool:
+    reasons = {
+        str(trigger_reason or "").strip().lower(),
+        str((trigger_metadata or {}).get("reason") or "").strip().lower(),
+    }
+    if reasons & {
+        "intraday_watch_buy_day_high_cross",
+        "intraday_watch_buy_breakout_cross",
+        "intraday_watch_buy_momentum_cross",
+    }:
+        return True
+    return _watch_buy_direction(item) == "at_or_above" and _watch_buy_tactical_action(item) in {
+        "watch_for_trigger",
+        "breakout_buy",
+        "momentum_buy",
+        "tactical_buy",
+    }
+
+
+def _watch_buy_technical_context_state(
+    *,
+    settings: Settings,
+    item: ExecutionPlanItem,
+    payload: dict[str, object],
+) -> dict[str, object]:
+    as_of = _recursive_text_feature(
+        payload,
+        {"technical_context_as_of", "core_technical_as_of", "snapshot_at", "as_of", "market_date"},
+    )
+    if as_of is None and item.source_market_date is not None:
+        as_of = item.source_market_date.isoformat()
+    parsed = _parse_date_or_datetime(as_of)
+    if parsed is None:
+        return {"status": "missing", "as_of": as_of, "max_age_days": settings.watch_buy_high_volatility_chase_max_context_age_days}
+    market_date = item.plan.market_date if item.plan is not None and item.plan.market_date is not None else None
+    reference_date = market_date or datetime.now(UTC).astimezone(KRX_TIMEZONE).date()
+    age_days = (reference_date - parsed).days
+    status = "fresh" if age_days <= settings.watch_buy_high_volatility_chase_max_context_age_days else "stale"
+    return {
+        "status": status,
+        "as_of": parsed.isoformat(),
+        "age_days": age_days,
+        "max_age_days": settings.watch_buy_high_volatility_chase_max_context_age_days,
+    }
+
+
+def _parse_date_or_datetime(value: object) -> date | None:
+    if isinstance(value, datetime):
+        return value.astimezone(KRX_TIMEZONE).date() if value.tzinfo is not None else value.date()
+    if isinstance(value, date):
+        return value
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip().replace("Z", "+00:00")
+    try:
+        return datetime.fromisoformat(text).astimezone(KRX_TIMEZONE).date()
+    except ValueError:
+        pass
+    try:
+        return date.fromisoformat(text[:10])
+    except ValueError:
+        return None
+
+
+def _watch_buy_high_volatility_chase_override(
+    *,
+    item: ExecutionPlanItem,
+    observed_price: Decimal,
+) -> dict[str, object] | None:
+    risk_context = _loaded_risk_context(item)
+    override = risk_context.get("high_volatility_chase_override")
+    if not isinstance(override, dict) or override.get("enabled") is not True:
+        return None
+    reason = str(override.get("reason") or override.get("rationale") or "").strip()
+    tighter_stop = _parse_positive_decimal(
+        override.get("tighter_stop_price")
+        or override.get("updated_stop_price")
+        or override.get("stop_price")
+    )
+    current_stop = _watch_buy_stop_price(item)
+    if len(reason) < 20 or tighter_stop is None or current_stop is None:
+        return None
+    if not (current_stop < tighter_stop < observed_price):
+        return None
+    updated_context = dict(risk_context)
+    updated_context["stop_price"] = _serialize_decimal(tighter_stop)
+    updated_context["stop_loss_price"] = _serialize_decimal(tighter_stop)
+    item.risk_context = compact_json_object(updated_context)
+    return {
+        "reason": _bounded_text(reason, max_length=240),
+        "prior_stop_price": _serialize_decimal(current_stop),
+        "tighter_stop_price": _serialize_decimal(tighter_stop),
+    }
+
+
+def _persist_watch_buy_high_volatility_chase_decision(
+    *,
+    item: ExecutionPlanItem,
+    decision: dict[str, object],
+) -> None:
+    risk_context = dict(_loaded_risk_context(item))
+    compact_decision = compact_json_object(decision, max_depth=5, max_list_items=5)
+    risk_context["last_high_volatility_chase_decision"] = compact_decision
+    item.risk_context = compact_json_object(risk_context)
+
+
+def _bounded_text(value: str, *, max_length: int) -> str:
+    if len(value) <= max_length:
+        return value
+    return value[: max_length - 3].rstrip() + "..."
 
 
 def _watch_buy_gate_rejection(
@@ -7221,6 +7425,7 @@ def _monitoring_result_payload(
     outcome: str,
     message: str | None = None,
     block_reason: object | None = None,
+    risk_decision: object | None = None,
     order: object | None = None,
     trigger_reason: str | None = None,
     trigger_metadata: dict[str, object] | None = None,
@@ -7251,6 +7456,8 @@ def _monitoring_result_payload(
         payload["message"] = message
     if block_reason is not None:
         payload["block_reason"] = block_reason
+    if risk_decision is not None:
+        payload["risk_decision"] = risk_decision
     if trigger_reason is not None:
         payload["trigger_reason"] = trigger_reason
     if trigger_metadata is not None:
