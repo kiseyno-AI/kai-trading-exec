@@ -54,6 +54,7 @@ class CandidateRule:
     size_multiplier: Decimal
     threshold: Decimal
     evaluator: Callable[[dict[str, object], "CandidateRule"], tuple[bool, dict[str, object]]]
+    return_5d_threshold: Decimal | None = None
 
 
 @dataclass(frozen=True)
@@ -1320,6 +1321,15 @@ def _candidate_rules(settings: Settings) -> list[CandidateRule]:
             evaluator=_rule_high_volatility,
         ),
         CandidateRule(
+            rule_id="high_volatility_chase_veto",
+            name="High-volatility chase veto",
+            action="veto",
+            size_multiplier=Decimal("0"),
+            threshold=Decimal(settings.watch_buy_high_volatility_chase_atr_pct_threshold),
+            evaluator=_rule_high_volatility_chase,
+            return_5d_threshold=Decimal(settings.watch_buy_high_volatility_chase_ret5_threshold_pct),
+        ),
+        CandidateRule(
             rule_id="high_correlation_downsize",
             name="High correlation downsize",
             action="downsize",
@@ -1671,6 +1681,65 @@ def _rule_high_volatility(trade: dict[str, object], rule: CandidateRule) -> tupl
     if value is None:
         return False, {"reason": "missing_volatility_context"}
     return value >= rule.threshold, {"field": key, "value_pct": _decimal_text(value)}
+
+
+def _rule_high_volatility_chase(trade: dict[str, object], rule: CandidateRule) -> tuple[bool, dict[str, object]]:
+    if not _candidate_trade_is_chase_entry(trade):
+        return False, {"reason": "not_chase_entry"}
+    atr, atr_key = _candidate_context_first_decimal(
+        trade,
+        keys=("atr_pct_14", "atr_pct", "atr14_pct", "atr_percent"),
+    )
+    ret5, ret5_key = _candidate_context_first_decimal(
+        trade,
+        keys=("return_5d", "ret5", "ret_5d", "pct_change_5d"),
+    )
+    if atr is None or ret5 is None:
+        return False, {"reason": "missing_atr_or_return_5d_context", "atr_field": atr_key, "return_5d_field": ret5_key}
+    ret5_threshold = rule.return_5d_threshold
+    if ret5_threshold is None:
+        return False, {"reason": "missing_return_5d_threshold"}
+    matched = atr > rule.threshold and ret5 > ret5_threshold
+    return matched, {
+        "atr_field": atr_key,
+        "atr_pct_14": _decimal_text(atr),
+        "atr_threshold_pct": _decimal_text(rule.threshold),
+        "return_5d_field": ret5_key,
+        "return_5d": _decimal_text(ret5),
+        "return_5d_threshold_pct": _decimal_text(ret5_threshold),
+        "trigger_reason": _candidate_trade_trigger_reason(trade),
+    }
+
+
+def _candidate_trade_is_chase_entry(trade: dict[str, object]) -> bool:
+    trigger_reason = _candidate_trade_trigger_reason(trade)
+    if trigger_reason in {
+        "intraday_watch_buy_day_high_cross",
+        "intraday_watch_buy_breakout_cross",
+        "intraday_watch_buy_momentum_cross",
+    }:
+        return True
+    context = trade.get("candidate_rule_context")
+    if not isinstance(context, dict):
+        return False
+    intent = str(context.get("intent") or (trade.get("buy") or {}).get("intent") or "").strip().lower()
+    direction = str(context.get("trigger_direction") or context.get("direction") or "").strip().lower()
+    return intent in {"intraday_watch_buy", "chase_buy", "tactical_buy"} and direction in {
+        "at_or_above",
+        "above",
+        "breakout",
+        "momentum",
+        "up",
+    }
+
+
+def _candidate_trade_trigger_reason(trade: dict[str, object]) -> str | None:
+    for node in _iter_dict_nodes(trade.get("candidate_rule_context")):
+        for key in ("trigger_reason", "reason"):
+            value = node.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip().lower()
+    return None
 
 
 def _rule_high_correlation(trade: dict[str, object], rule: CandidateRule) -> tuple[bool, dict[str, object]]:
@@ -2372,10 +2441,17 @@ def _candidate_rule_context(*, item: ExecutionPlanItem | None, buy_fill: Executi
             "atr_pct_14",
             "atr14_pct",
             "atr_percent",
+            "ret5",
+            "ret_5d",
+            "return_5d",
+            "pct_change_5d",
             "volatility_pct",
             "realized_volatility_pct",
             "intraday_range_pct",
             "daily_range_pct",
+            "trigger_direction",
+            "direction",
+            "trigger_reason",
             "portfolio_correlation",
             "max_correlation",
             "correlation",
@@ -2389,7 +2465,14 @@ def _candidate_rule_context(*, item: ExecutionPlanItem | None, buy_fill: Executi
         ):
             if key in source and key not in payload:
                 payload[key] = source[key]
-        for nested_key in ("exec_agent_decision", "short_term_exec_agent_decision", "market_data", "quote", "decider_output"):
+        for nested_key in (
+            "exec_agent_decision",
+            "short_term_exec_agent_decision",
+            "market_data",
+            "quote",
+            "decider_output",
+            "short_term_entry_quality",
+        ):
             nested = source.get(nested_key)
             if isinstance(nested, dict):
                 for key in (
@@ -2400,6 +2483,10 @@ def _candidate_rule_context(*, item: ExecutionPlanItem | None, buy_fill: Executi
                     "atr_pct_14",
                     "atr14_pct",
                     "atr_percent",
+                    "ret5",
+                    "ret_5d",
+                    "return_5d",
+                    "pct_change_5d",
                     "volatility_pct",
                     "portfolio_correlation",
                     "max_correlation",
@@ -2410,7 +2497,7 @@ def _candidate_rule_context(*, item: ExecutionPlanItem | None, buy_fill: Executi
                 ):
                     if key in nested and key not in payload:
                         payload[key] = nested[key]
-        for nested_key in ("entry_context", "last_monitoring_event", "post_entry_review"):
+        for nested_key in ("entry_context", "last_monitoring_event", "post_entry_review", "last_high_volatility_chase_decision"):
             nested = source.get(nested_key)
             if isinstance(nested, dict) and nested_key not in payload:
                 payload[nested_key] = nested

@@ -39,6 +39,10 @@ class Settings(BaseModel):
     watch_buy_weak_ret20_threshold_pct: Decimal = Field(default=Decimal("0.0"), ge=Decimal("-100"), le=Decimal("100"))
     watch_buy_deep_negative_ret20_threshold_pct: Decimal = Field(default=Decimal("-10.0"), ge=Decimal("-100"), le=Decimal("0"))
     watch_buy_extended_ret5_threshold_pct: Decimal = Field(default=Decimal("15.0"), ge=0, le=Decimal("100"))
+    watch_buy_high_volatility_chase_veto_enabled: bool = False
+    watch_buy_high_volatility_chase_atr_pct_threshold: Decimal = Field(default=Decimal("15.0"), ge=0, le=Decimal("100"))
+    watch_buy_high_volatility_chase_ret5_threshold_pct: Decimal = Field(default=Decimal("30.0"), ge=0, le=Decimal("100"))
+    watch_buy_high_volatility_chase_max_context_age_days: int = Field(default=1, ge=0, le=30)
     watch_buy_max_intraday_range_position_pct: Decimal = Field(default=Decimal("75.0"), ge=0, le=Decimal("100"))
     watch_buy_stale_trigger_reclaim_threshold_pct: Decimal = Field(default=Decimal("3.0"), ge=0, le=Decimal("100"))
     profit_protection_min_peak_pct: Decimal = Field(default=Decimal("3.0"), gt=0, le=Decimal("100"))
@@ -241,6 +245,10 @@ _ENV_FIELDS = {
     "WATCH_BUY_WEAK_RET20_THRESHOLD_PCT": "watch_buy_weak_ret20_threshold_pct",
     "WATCH_BUY_DEEP_NEGATIVE_RET20_THRESHOLD_PCT": "watch_buy_deep_negative_ret20_threshold_pct",
     "WATCH_BUY_EXTENDED_RET5_THRESHOLD_PCT": "watch_buy_extended_ret5_threshold_pct",
+    "WATCH_BUY_HIGH_VOLATILITY_CHASE_VETO_ENABLED": "watch_buy_high_volatility_chase_veto_enabled",
+    "WATCH_BUY_HIGH_VOLATILITY_CHASE_ATR_PCT_THRESHOLD": "watch_buy_high_volatility_chase_atr_pct_threshold",
+    "WATCH_BUY_HIGH_VOLATILITY_CHASE_RET5_THRESHOLD_PCT": "watch_buy_high_volatility_chase_ret5_threshold_pct",
+    "WATCH_BUY_HIGH_VOLATILITY_CHASE_MAX_CONTEXT_AGE_DAYS": "watch_buy_high_volatility_chase_max_context_age_days",
     "WATCH_BUY_MAX_INTRADAY_RANGE_POSITION_PCT": "watch_buy_max_intraday_range_position_pct",
     "WATCH_BUY_STALE_TRIGGER_RECLAIM_THRESHOLD_PCT": "watch_buy_stale_trigger_reclaim_threshold_pct",
     "PROFIT_PROTECTION_MIN_PEAK_PCT": "profit_protection_min_peak_pct",

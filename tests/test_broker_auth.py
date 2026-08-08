@@ -406,6 +406,10 @@ def test_settings_load_profit_protection_environment_fields() -> None:
             "KAI_EXEC_WATCH_BUY_WEAK_RET20_THRESHOLD_PCT": "-1.0",
             "KAI_EXEC_WATCH_BUY_DEEP_NEGATIVE_RET20_THRESHOLD_PCT": "-12.0",
             "KAI_EXEC_WATCH_BUY_EXTENDED_RET5_THRESHOLD_PCT": "14.0",
+            "KAI_EXEC_WATCH_BUY_HIGH_VOLATILITY_CHASE_VETO_ENABLED": "true",
+            "KAI_EXEC_WATCH_BUY_HIGH_VOLATILITY_CHASE_ATR_PCT_THRESHOLD": "16.0",
+            "KAI_EXEC_WATCH_BUY_HIGH_VOLATILITY_CHASE_RET5_THRESHOLD_PCT": "31.0",
+            "KAI_EXEC_WATCH_BUY_HIGH_VOLATILITY_CHASE_MAX_CONTEXT_AGE_DAYS": "2",
             "KAI_EXEC_WATCH_BUY_MAX_INTRADAY_RANGE_POSITION_PCT": "70.0",
             "KAI_EXEC_EXEC_AGENT_WATCH_SIZING_MIN_NOTIONAL_KRW": "1200000",
             "KAI_EXEC_EXEC_AGENT_WATCH_SIZING_HIGH_CONVICTION_MIN_NOTIONAL_KRW": "1800000",
@@ -428,6 +432,10 @@ def test_settings_load_profit_protection_environment_fields() -> None:
     assert settings.watch_buy_weak_ret20_threshold_pct == Decimal("-1.0")
     assert settings.watch_buy_deep_negative_ret20_threshold_pct == Decimal("-12.0")
     assert settings.watch_buy_extended_ret5_threshold_pct == Decimal("14.0")
+    assert settings.watch_buy_high_volatility_chase_veto_enabled is True
+    assert settings.watch_buy_high_volatility_chase_atr_pct_threshold == Decimal("16.0")
+    assert settings.watch_buy_high_volatility_chase_ret5_threshold_pct == Decimal("31.0")
+    assert settings.watch_buy_high_volatility_chase_max_context_age_days == 2
     assert settings.watch_buy_max_intraday_range_position_pct == Decimal("70.0")
     assert settings.exec_agent_watch_sizing_min_notional_krw == Decimal("1200000")
     assert settings.exec_agent_watch_sizing_high_conviction_min_notional_krw == Decimal("1800000")
