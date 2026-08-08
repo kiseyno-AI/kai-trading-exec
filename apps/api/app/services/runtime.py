@@ -2144,6 +2144,9 @@ def _compact_monitoring_cycle_payload(payload: dict[str, object]) -> dict[str, o
     target_coverage = compacted.get("profit_target_coverage")
     if isinstance(target_coverage, dict):
         compacted["profit_target_coverage"] = _compact_status_detail_lists(target_coverage)
+    stop_actionability = compacted.get("protective_stop_actionability")
+    if isinstance(stop_actionability, dict):
+        compacted["protective_stop_actionability"] = _compact_status_detail_lists(stop_actionability)
     for key in ("items", "jobs"):
         value = compacted.get(key)
         if isinstance(value, list) and len(value) > MAX_STATUS_DETAIL_ITEMS:
@@ -2155,7 +2158,7 @@ def _compact_monitoring_cycle_payload(payload: dict[str, object]) -> dict[str, o
 
 def _compact_status_detail_lists(payload: dict[str, object]) -> dict[str, object]:
     compacted = dict(payload)
-    for key in ("affected_symbols", "issues"):
+    for key in ("affected_symbols", "issues", "warnings"):
         value = compacted.get(key)
         if isinstance(value, list) and len(value) > MAX_STATUS_DETAIL_ITEMS:
             compacted[f"{key}_count"] = len(value)

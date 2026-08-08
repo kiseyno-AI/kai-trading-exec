@@ -43,6 +43,7 @@ from app.services.monitoring import (
     _pending_broker_order_symbols,
     _plan_item_exchange,
     _resolve_sell_quantity,
+    expire_known_flat_pending_sell_monitors,
     list_autonomous_monitoring_symbols,
     run_autonomous_monitoring_cycle,
 )
@@ -2148,6 +2149,102 @@ def test_autonomous_monitoring_expires_known_flat_active_sell_monitors() -> None
         assert stale_item.status == "target_sell_monitoring"
         assert held_item.status == "stop_sell_monitoring"
         assert symbols == ["005930"]
+
+    engine.dispose()
+
+
+def test_stale_sell_monitor_expiry_preserves_only_active_protection_for_held_position() -> None:
+    app, engine = build_test_app(
+        Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+        )
+    )
+
+    with app.state.db_session_factory() as session:
+        plan = ExecutionPlan(
+            id="plan-held-protection-expiry-guard",
+            external_plan_id="plan-held-protection-expiry-guard",
+            source="test",
+            mode="paper",
+            status="accepted",
+            accepted_at=datetime(2026, 8, 7, 1, 0, tzinfo=UTC),
+        )
+        session.add(plan)
+        session.add(
+            ExecutionPosition(
+                mode="paper",
+                symbol="459550",
+                quantity=200,
+                average_price=Decimal("1920.0000"),
+                updated_from="reconciliation",
+                last_reconciled_at=datetime(2026, 8, 7, 1, 0, tzinfo=UTC),
+                raw_payload={"source": "test"},
+            )
+        )
+        session.add_all(
+            [
+                ExecutionPlanItem(
+                    id="held-original-stop-expired",
+                    plan=plan,
+                    plan_item_index=0,
+                    symbol="459550",
+                    side="sell",
+                    intent="stop_sell",
+                    status="stop_sell_expired",
+                    quantity_policy={"kind": "shares", "quantity": 200},
+                    trigger_price=Decimal("1843.2000"),
+                    time_in_force="day",
+                ),
+                ExecutionPlanItem(
+                    id="held-recovery-stop-active",
+                    plan=plan,
+                    plan_item_index=1,
+                    symbol="459550",
+                    side="sell",
+                    intent="stop_sell",
+                    status="stop_sell_monitoring",
+                    quantity_policy={"kind": "shares", "quantity": 200},
+                    trigger_price=Decimal("1872.0000"),
+                    time_in_force="day",
+                ),
+                ExecutionPlanItem(
+                    id="held-recovery-target-active",
+                    plan=plan,
+                    plan_item_index=2,
+                    symbol="459550",
+                    side="sell",
+                    intent="target_sell",
+                    status="target_sell_monitoring",
+                    quantity_policy={"kind": "shares", "quantity": 200},
+                    trigger_price=Decimal("2100.0000"),
+                    time_in_force="day",
+                ),
+            ]
+        )
+        session.commit()
+
+        expired_count = expire_known_flat_pending_sell_monitors(
+            settings=app.state.settings,
+            db=session,
+            expired_at=datetime(2026, 8, 7, 2, 0, tzinfo=UTC),
+        )
+
+        assert expired_count == 0
+        statuses = {
+            item.id: item.status
+            for item in session.scalars(
+                select(ExecutionPlanItem).where(
+                    ExecutionPlanItem.symbol == "459550",
+                    ExecutionPlanItem.side == "sell",
+                )
+            )
+        }
+        assert statuses == {
+            "held-original-stop-expired": "stop_sell_expired",
+            "held-recovery-stop-active": "stop_sell_monitoring",
+            "held-recovery-target-active": "target_sell_monitoring",
+        }
 
     engine.dispose()
 
