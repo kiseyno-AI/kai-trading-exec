@@ -35,7 +35,7 @@ from app.models.runtime import (
     RuntimeControlState,
 )
 from app.services import runtime as runtime_service, runtime_controls
-from app.services.autonomous_runtime import MonitoringRuntimeSnapshot, _is_regular_market_session
+from app.services.autonomous_runtime import MonitoringRuntimeSnapshot, _is_regular_market_session, _merge_symbol_priority
 from app.services.monitoring import (
     _maintain_post_entry_exit_monitors,
     _load_monitored_items,
@@ -1373,6 +1373,82 @@ def test_position_exit_pending_sell_is_autonomous_monitored_when_position_exists
             item=autonomous_items[0],
             remaining_quantity=7,
         ) == 7
+
+    engine.dispose()
+
+
+def test_autonomous_runtime_prefers_local_latest_watch_symbols_over_stale_core_desired(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    app, engine = build_test_app(
+        Settings(
+            database_url=f"sqlite:///{tmp_path / 'monitoring-symbol-union.db'}",
+            runtime_mode="live",
+            monitoring_max_symbols_per_cycle=4,
+            market_context_enabled=True,
+            market_context_base_url="http://core.test",
+        )
+    )
+    older_date = datetime(2026, 8, 7).date()
+    current_date = datetime(2026, 8, 10).date()
+
+    with app.state.db_session_factory() as session:
+        older_plan = ExecutionPlan(
+            id="older-core-plan",
+            external_plan_id="older-core-plan",
+            source="kai-trading-core",
+            market_date=older_date,
+            mode="live",
+            status="accepted",
+            accepted_at=datetime(2026, 8, 7, 1, tzinfo=UTC),
+        )
+        current_plan = ExecutionPlan(
+            id="current-core-plan",
+            external_plan_id="current-core-plan",
+            source="kai-trading-core",
+            market_date=current_date,
+            mode="live",
+            status="accepted",
+            accepted_at=datetime(2026, 8, 10, 5, tzinfo=UTC),
+        )
+        older_plan.items.append(
+            ExecutionPlanItem(
+                id="older-watch",
+                plan_item_index=0,
+                symbol="OLD001",
+                side="buy",
+                intent="intraday_watch_buy",
+                status="watch_monitoring_active",
+                trigger_price=Decimal("100"),
+                quantity_policy={"kind": "shares", "quantity": 1},
+            )
+        )
+        for index, symbol in enumerate(["004370", "027040", "028670", "049430"]):
+            current_plan.items.append(
+                ExecutionPlanItem(
+                    id=f"current-watch-{symbol}",
+                    plan_item_index=index,
+                    symbol=symbol,
+                    side="buy",
+                    intent="intraday_watch_buy",
+                    status="watch_monitoring_active",
+                    trigger_price=Decimal("100"),
+                    quantity_policy={"kind": "shares", "quantity": 1},
+                )
+            )
+        session.add_all([older_plan, current_plan])
+        session.commit()
+
+    local_symbols = app.state.autonomous_runtime._load_local_desired_monitoring_symbols_from_sqlite()
+    assert local_symbols[:4] == ["004370", "027040", "028670", "049430"]
+    stale_core_symbols = ["OLD001", "OLD002", "OLD003", "OLD004"]
+    assert _merge_symbol_priority(local_symbols, stale_core_symbols)[:4] == [
+        "004370",
+        "027040",
+        "028670",
+        "049430",
+    ]
 
     engine.dispose()
 
