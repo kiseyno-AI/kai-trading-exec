@@ -1,9 +1,13 @@
 import asyncio
 import os
 import threading
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
 
 from app.core.config import Settings
+from app.db.base import Base
+from app.db.session import create_db_engine, create_session_factory
+from app.models.runtime import ExecutionPlan, ExecutionPlanItem
 from app.services.autonomous_runtime import AutonomousRuntimeCoordinator
 
 
@@ -160,3 +164,96 @@ def test_monitoring_stale_mutex_exits_when_guard_enabled(monkeypatch) -> None:  
 
     assert payload["reason"] == "previous_monitoring_cycle_still_running"
     assert exit_codes == [75]
+
+
+def test_sqlite_local_desired_symbols_include_older_active_watch_when_newer_plans_are_non_monitorable(
+    tmp_path,
+) -> None:
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'monitoring-symbols.db'}",
+        runtime_mode="paper",
+        monitoring_max_symbols_per_cycle=2,
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    coordinator = AutonomousRuntimeCoordinator(
+        settings=settings,
+        session_factory=session_factory,
+        broker_adapter_factory=lambda settings: None,  # type: ignore[arg-type,return-value]
+    )
+    accepted_at = datetime(2026, 8, 10, 1, 0, tzinfo=UTC)
+
+    try:
+        with session_factory() as session:
+            for index in range(70):
+                session.add(
+                    ExecutionPlan(
+                        id=f"newer-plan-{index}",
+                        external_plan_id=f"newer-plan-{index}",
+                        source="kai-trading-core",
+                        market_date=date(2026, 8, 10),
+                        mode="paper",
+                        status="accepted",
+                        accepted_at=accepted_at + timedelta(minutes=index),
+                        items=[
+                            ExecutionPlanItem(
+                                id=f"newer-item-{index}",
+                                plan_item_index=index,
+                                symbol=f"{index:06d}",
+                                side="buy",
+                                intent="intraday_watch_buy",
+                                status="broker_order_submitted",
+                                quantity_policy={"kind": "shares", "quantity": 1},
+                                trigger_price=Decimal("1000.0000"),
+                                time_in_force="day",
+                                updated_at=accepted_at + timedelta(minutes=index),
+                            )
+                        ],
+                    )
+                )
+            session.add(
+                ExecutionPlan(
+                    id="older-watch-plan",
+                    external_plan_id="older-watch-plan",
+                    source="kai-trading-core",
+                    market_date=date(2026, 8, 9),
+                    mode="paper",
+                    status="accepted",
+                    accepted_at=accepted_at - timedelta(days=1),
+                    items=[
+                        ExecutionPlanItem(
+                            id="older-watch-item-1",
+                            plan_item_index=0,
+                            symbol="111111",
+                            side="buy",
+                            intent="intraday_watch_buy",
+                            status="watch_monitoring_active",
+                            quantity_policy={"kind": "shares", "quantity": 1},
+                            trigger_price=Decimal("1000.0000"),
+                            time_in_force="day",
+                            updated_at=accepted_at - timedelta(days=1),
+                        ),
+                        ExecutionPlanItem(
+                            id="older-watch-item-2",
+                            plan_item_index=1,
+                            symbol="222222",
+                            side="buy",
+                            intent="intraday_watch_buy",
+                            status="watch_monitoring_active",
+                            quantity_policy={"kind": "shares", "quantity": 1},
+                            trigger_price=Decimal("2000.0000"),
+                            time_in_force="day",
+                            updated_at=accepted_at - timedelta(days=1),
+                        ),
+                    ],
+                )
+            )
+            session.commit()
+
+        assert coordinator._load_local_desired_monitoring_symbols_from_sqlite()[:2] == [
+            "111111",
+            "222222",
+        ]
+    finally:
+        engine.dispose()

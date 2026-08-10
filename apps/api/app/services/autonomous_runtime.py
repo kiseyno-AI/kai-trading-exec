@@ -1027,54 +1027,39 @@ class AutonomousRuntimeCoordinator:
                     """,
                     [self.settings.runtime_mode],
                 ).fetchall()
-                plan_rows = conn.execute(
-                    """
-                    select id
-                    from execution_plans
-                    where mode = ?
-                    order by market_date desc, accepted_at desc, id desc
+                item_rows = conn.execute(
+                    f"""
+                    select
+                        i.symbol,
+                        max(p.market_date) as latest_market_date,
+                        max(p.accepted_at) as latest_accepted_at,
+                        max(i.updated_at) as latest_updated_at
+                    from execution_plan_items i
+                    join execution_plans p on p.id = i.execution_plan_id
+                    where p.mode = ? and (
+                        (
+                            i.side = 'buy'
+                            and i.status in ({buy_status_placeholders})
+                            and i.intent in ({buy_intent_placeholders})
+                        ) or (
+                            i.side = 'sell'
+                            and i.status in ({sell_status_placeholders})
+                            and i.intent in ({sell_intent_placeholders})
+                        )
+                    )
+                    group by i.symbol
+                    order by latest_market_date desc, latest_accepted_at desc, latest_updated_at desc, i.symbol asc
                     limit ?
                     """,
-                    [self.settings.runtime_mode, max(8, min(limit, 64))],
+                    [
+                        self.settings.runtime_mode,
+                        *buy_statuses,
+                        *WATCH_BUY_INTENTS,
+                        *sell_statuses,
+                        *SELL_MONITORED_INTENTS,
+                        limit,
+                    ],
                 ).fetchall()
-                plan_ids = [str(row[0]) for row in plan_rows if row[0]]
-                if not plan_ids:
-                    item_rows = []
-                else:
-                    plan_placeholders = ",".join("?" for _ in plan_ids)
-                    rows = conn.execute(
-                        f"""
-                        select
-                            i.symbol,
-                            p.market_date,
-                            p.accepted_at,
-                            i.updated_at
-                        from execution_plan_items i
-                        join execution_plans p on p.id = i.execution_plan_id
-                        where i.execution_plan_id in ({plan_placeholders}) and (
-                            (
-                                i.side = 'buy'
-                                and i.status in ({buy_status_placeholders})
-                                and i.intent in ({buy_intent_placeholders})
-                            ) or (
-                                i.side = 'sell'
-                                and i.status in ({sell_status_placeholders})
-                                and i.intent in ({sell_intent_placeholders})
-                            )
-                        )
-                        order by p.market_date desc, p.accepted_at desc, i.updated_at desc, i.symbol asc
-                        limit ?
-                        """,
-                        [
-                            *plan_ids,
-                            *buy_statuses,
-                            *WATCH_BUY_INTENTS,
-                            *sell_statuses,
-                            *SELL_MONITORED_INTENTS,
-                            limit,
-                        ],
-                    ).fetchall()
-                    item_rows = [(row[0],) for row in rows]
         except sqlite3.Error:
             LOGGER.exception(
                 "monitoring_sqlite_local_symbol_fallback_failed",
