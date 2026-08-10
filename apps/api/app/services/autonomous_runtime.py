@@ -497,10 +497,12 @@ class AutonomousRuntimeCoordinator:
         return payload
 
     def _monitoring_cycle_sync(self, started_at: datetime) -> dict[str, object]:
-        desired_symbols = _load_core_desired_monitoring_symbols(settings=self.settings)
+        core_desired_symbols = _load_core_desired_monitoring_symbols(settings=self.settings)
+        local_desired_symbols = self._load_local_desired_monitoring_symbols_from_sqlite()
+        desired_symbols = _merge_symbol_priority(local_desired_symbols, core_desired_symbols)
         desired_symbols_preserve_all = False
         if not desired_symbols:
-            desired_symbols = self._load_local_desired_monitoring_symbols_from_sqlite()
+            desired_symbols = local_desired_symbols
             desired_symbols_preserve_all = True
         if desired_symbols:
             symbols = (
@@ -1002,7 +1004,8 @@ class AutonomousRuntimeCoordinator:
             return []
         if not url.drivername.startswith("sqlite") or not url.database or url.database == ":memory:":
             return []
-        limit = self.settings.monitoring_max_symbols_per_cycle or 128
+        configured_limit = int(self.settings.monitoring_max_symbols_per_cycle or 0)
+        limit = max(configured_limit * 4, 128) if configured_limit > 0 else 128
         buy_statuses = tuple(WATCH_MONITORING_STATUSES)
         sell_statuses = tuple(
             SELL_ACTIVE_MONITORING_STATUSES
@@ -1026,21 +1029,36 @@ class AutonomousRuntimeCoordinator:
                 ).fetchall()
                 item_rows = conn.execute(
                     f"""
-                    select distinct symbol
-                    from execution_plan_items
-                    where (
-                        side = 'buy'
-                        and status in ({buy_status_placeholders})
-                        and intent in ({buy_intent_placeholders})
-                    ) or (
-                        side = 'sell'
-                        and status in ({sell_status_placeholders})
-                        and intent in ({sell_intent_placeholders})
+                    select
+                        i.symbol,
+                        max(p.market_date) as latest_market_date,
+                        max(p.accepted_at) as latest_accepted_at,
+                        max(i.updated_at) as latest_updated_at
+                    from execution_plan_items i
+                    join execution_plans p on p.id = i.execution_plan_id
+                    where p.mode = ? and (
+                        (
+                            i.side = 'buy'
+                            and i.status in ({buy_status_placeholders})
+                            and i.intent in ({buy_intent_placeholders})
+                        ) or (
+                            i.side = 'sell'
+                            and i.status in ({sell_status_placeholders})
+                            and i.intent in ({sell_intent_placeholders})
+                        )
                     )
-                    order by symbol asc
+                    group by i.symbol
+                    order by latest_market_date desc, latest_accepted_at desc, latest_updated_at desc, i.symbol asc
                     limit ?
                     """,
-                    [*buy_statuses, *WATCH_BUY_INTENTS, *sell_statuses, *SELL_MONITORED_INTENTS, limit * 2],
+                    [
+                        self.settings.runtime_mode,
+                        *buy_statuses,
+                        *WATCH_BUY_INTENTS,
+                        *sell_statuses,
+                        *SELL_MONITORED_INTENTS,
+                        limit,
+                    ],
                 ).fetchall()
         except sqlite3.Error:
             LOGGER.exception(
@@ -1652,6 +1670,19 @@ def _serialize_datetime(value: datetime | None) -> str | None:
     if value is None:
         return None
     return value.isoformat()
+
+
+def _merge_symbol_priority(*symbol_groups: Iterable[str]) -> list[str]:
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for symbols in symbol_groups:
+        for raw_symbol in symbols:
+            symbol = str(raw_symbol or "").strip()
+            if not symbol or symbol in seen:
+                continue
+            ordered.append(symbol)
+            seen.add(symbol)
+    return ordered
 
 
 def _compact_cycle_payload(payload: dict[str, object] | None) -> dict[str, object] | None:
