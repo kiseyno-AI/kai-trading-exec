@@ -999,6 +999,7 @@ def _evaluate_monitoring_cycle(
         db=db,
         triggered_at=triggered_at,
     )
+    db.flush()
     sell_monitored_symbols = {
         item.symbol
         for item in items
@@ -4427,25 +4428,45 @@ def _has_active_sell_monitor(
     symbol: str,
     intent: str,
 ) -> bool:
-    return db.scalar(
-        select(ExecutionPlanItem.id)
+    candidate_statuses = (
+        SELL_ACTIVE_MONITORING_STATUSES
+        | BLOCKED_MONITORING_STATUSES
+        | PENDING_DISPATCH_MONITORING_STATUSES
+        | IN_FLIGHT_BROKER_ORDER_ITEM_STATUSES
+        | SELL_PENDING_CONFIG_STATUSES
+    )
+    candidates = db.scalars(
+        select(ExecutionPlanItem)
         .join(ExecutionPlanItem.plan)
         .where(
             ExecutionPlan.mode == settings.runtime_mode,
             ExecutionPlanItem.symbol == symbol,
             ExecutionPlanItem.side == "sell",
             ExecutionPlanItem.intent == intent,
-            ExecutionPlanItem.status.in_(
-                tuple(
-                    SELL_ACTIVE_MONITORING_STATUSES
-                    | BLOCKED_MONITORING_STATUSES
-                    | PENDING_DISPATCH_MONITORING_STATUSES
-                    | IN_FLIGHT_BROKER_ORDER_ITEM_STATUSES
-                )
-            ),
+            ExecutionPlanItem.status.in_(tuple(candidate_statuses)),
         )
-        .limit(1)
-    ) is not None
+        .options(
+            load_only(
+                ExecutionPlanItem.id,
+                ExecutionPlanItem.side,
+                ExecutionPlanItem.intent,
+                ExecutionPlanItem.status,
+                ExecutionPlanItem.quantity_policy,
+                ExecutionPlanItem.trigger_price,
+            )
+        )
+        .order_by(
+            ExecutionPlanItem.updated_at.desc(),
+            ExecutionPlanItem.id.desc(),
+        )
+    ).all()
+    for item in candidates:
+        if item.status in SELL_PENDING_CONFIG_STATUSES:
+            if _monitoring_item_is_configured(item):
+                return True
+            continue
+        return True
+    return False
 
 
 def _new_existing_position_exit_monitor(
