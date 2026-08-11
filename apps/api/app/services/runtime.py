@@ -2325,6 +2325,9 @@ def _monitoring_price_source_readiness_reasons(
     status = str(price_source.get("status") or "")
     if status in {"configured", "ready"}:
         return []
+    last_price_count = int(price_source.get("last_price_count") or 0)
+    if status == "degraded" and last_price_count > 0:
+        return []
 
     reason = price_source.get("reason")
     if isinstance(reason, str) and reason.strip():

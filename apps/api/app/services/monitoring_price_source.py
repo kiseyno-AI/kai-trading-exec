@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed
 from decimal import Decimal
 import time
 from typing import Callable
@@ -17,8 +17,9 @@ from app.services.domestic_order_router import resolve_domestic_order_route
 MAX_REPORTED_QUOTE_FAILURES = 10
 MAX_REPORTED_CONTEXT_FAILURES = 10
 MAX_QUOTE_WORKERS = 3
-QUOTE_RETRY_ATTEMPTS = 2
+QUOTE_RETRY_ATTEMPTS = 0
 QUOTE_RETRY_DELAY_SECONDS = 0.2
+QUOTE_BATCH_TIMEOUT_BUFFER_SECONDS = 2.0
 
 
 class KisCurrentQuoteMonitoringPriceSource:
@@ -104,14 +105,32 @@ class KisCurrentQuoteMonitoringPriceSource:
 
             quote_results: dict[str, tuple[BrokerCurrentPrice | None, Exception | None]] = {}
             worker_count = min(MAX_QUOTE_WORKERS, len(unique_symbols))
-            with ThreadPoolExecutor(max_workers=worker_count) as executor:
-                futures = {
-                    executor.submit(fetch_quote, symbol): symbol
-                    for symbol in unique_symbols
-                }
-                for future in as_completed(futures):
-                    symbol, quote, error = future.result()
-                    quote_results[symbol] = (quote, error)
+            request_timeout = max(float(settings.kis_request_timeout_seconds), 1.0)
+            wave_count = (len(unique_symbols) + worker_count - 1) // worker_count
+            batch_timeout = (request_timeout * wave_count) + QUOTE_BATCH_TIMEOUT_BUFFER_SECONDS
+            executor = ThreadPoolExecutor(max_workers=worker_count)
+            futures = {
+                executor.submit(fetch_quote, symbol): symbol
+                for symbol in unique_symbols
+            }
+            try:
+                try:
+                    completed_futures = as_completed(futures, timeout=batch_timeout)
+                    for future in completed_futures:
+                        symbol, quote, error = future.result()
+                        quote_results[symbol] = (quote, error)
+                except FuturesTimeoutError:
+                    for future, symbol in futures.items():
+                        if symbol not in quote_results:
+                            future.cancel()
+                            quote_results[symbol] = (
+                                None,
+                                TimeoutError(
+                                    f"KIS current quote batch timed out after {batch_timeout:g}s"
+                                ),
+                            )
+            finally:
+                executor.shutdown(wait=False, cancel_futures=True)
 
             retry_symbols = [
                 symbol

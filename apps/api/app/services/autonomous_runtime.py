@@ -505,11 +505,26 @@ class AutonomousRuntimeCoordinator:
             desired_symbols = local_desired_symbols
             desired_symbols_preserve_all = True
         if desired_symbols:
+            symbol_limit = self.settings.monitoring_max_symbols_per_cycle or len(desired_symbols)
             symbols = (
                 desired_symbols
                 if desired_symbols_preserve_all
-                else desired_symbols[: self.settings.monitoring_max_symbols_per_cycle or len(desired_symbols)]
+                else desired_symbols[:symbol_limit]
             )
+            if local_desired_symbols and not core_desired_symbols:
+                local_position_symbols = self._load_local_position_symbols_from_sqlite()
+                if local_position_symbols:
+                    position_symbol_set = set(local_position_symbols)
+                    selected_symbols: list[str] = []
+                    for symbol in desired_symbols:
+                        if symbol in position_symbol_set and symbol not in selected_symbols:
+                            selected_symbols.append(symbol)
+                    for symbol in desired_symbols:
+                        if len(selected_symbols) >= max(symbol_limit, len(position_symbol_set)):
+                            break
+                        if symbol not in selected_symbols:
+                            selected_symbols.append(symbol)
+                    symbols = selected_symbols
             self._reconcile_monitoring_orders_if_due(
                 now=started_at,
                 symbols=set(symbols),
@@ -651,7 +666,17 @@ class AutonomousRuntimeCoordinator:
             self._store_cycle_payload(worker_key="monitoring", payload=payload)
             return payload
 
-        triggered_symbols = _triggered_symbols_from_cached_payload(cached_payload)
+        triggered_sell_symbols = _triggered_symbols_from_cached_payload(
+            cached_payload,
+            include_watch_buys=False,
+            include_sells=True,
+        )
+        triggered_buy_symbols = _triggered_symbols_from_cached_payload(
+            cached_payload,
+            include_watch_buys=True,
+            include_sells=False,
+        )
+        triggered_symbols = triggered_sell_symbols | triggered_buy_symbols
         if triggered_symbols and self.settings.monitoring_max_broker_actions_per_cycle <= 0:
             payload = {
                 "status_code": 200,
@@ -667,9 +692,20 @@ class AutonomousRuntimeCoordinator:
             return payload
         if triggered_symbols:
             broker_action_limit = max(int(self.settings.monitoring_max_broker_actions_per_cycle), 1)
-            ordered_triggered_symbols = [
-                symbol for symbol in symbols if symbol in triggered_symbols
+            ordered_triggered_sell_symbols = [
+                symbol for symbol in symbols if symbol in triggered_sell_symbols
+            ]
+            ordered_triggered_buy_symbols = [
+                symbol for symbol in symbols if symbol in triggered_buy_symbols
             ][:broker_action_limit]
+            ordered_triggered_symbols = [
+                *ordered_triggered_sell_symbols,
+                *[
+                    symbol
+                    for symbol in ordered_triggered_buy_symbols
+                    if symbol not in triggered_sell_symbols
+                ],
+            ]
             symbols = ordered_triggered_symbols
             prices = [price for price in prices if price.symbol in set(ordered_triggered_symbols)]
             with self.session_factory() as db:
@@ -1086,6 +1122,32 @@ class AutonomousRuntimeCoordinator:
                 break
         return ordered
 
+    def _load_local_position_symbols_from_sqlite(self) -> list[str]:
+        try:
+            url = make_url(self.settings.database_url)
+        except Exception:
+            return []
+        if not url.drivername.startswith("sqlite") or not url.database or url.database == ":memory:":
+            return []
+        try:
+            with sqlite3.connect(f"file:{url.database}?mode=ro", uri=True, timeout=5) as conn:
+                rows = conn.execute(
+                    """
+                    select symbol
+                    from execution_positions
+                    where mode = ? and quantity > 0
+                    order by symbol asc
+                    """,
+                    [self.settings.runtime_mode],
+                ).fetchall()
+        except sqlite3.Error:
+            LOGGER.exception(
+                "monitoring_sqlite_position_symbol_fallback_failed",
+                extra={"runtime_mode": self.settings.runtime_mode},
+            )
+            return []
+        return [str(row[0]).strip() for row in rows if str(row[0] or "").strip()]
+
     def _load_monitoring_runtime_snapshot_for_symbols_with_session(
         self,
         *,
@@ -1171,6 +1233,8 @@ class AutonomousRuntimeCoordinator:
         deferred_item_count = 0
         evaluated_symbols: set[str] = set()
         triggered_symbols: set[str] = set()
+        triggered_sell_symbols: set[str] = set()
+        triggered_buy_symbols: set[str] = set()
         results: list[dict[str, object]] = []
         for item in runtime_snapshot.items:
             if (
@@ -1198,6 +1262,10 @@ class AutonomousRuntimeCoordinator:
             elif triggered:
                 triggered_item_count += 1
                 triggered_symbols.add(item.symbol)
+                if item.intent in WATCH_BUY_INTENTS:
+                    triggered_buy_symbols.add(item.symbol)
+                else:
+                    triggered_sell_symbols.add(item.symbol)
                 outcome = "triggered"
             else:
                 outcome = "waiting"
@@ -1222,6 +1290,9 @@ class AutonomousRuntimeCoordinator:
             "deferred_item_count": deferred_item_count,
             "evaluated_symbol_count": len(evaluated_symbols),
             "triggered_symbol_count": len(triggered_symbols),
+            "triggered_symbols": sorted(triggered_symbols),
+            "triggered_sell_symbols": sorted(triggered_sell_symbols),
+            "triggered_buy_symbols": sorted(triggered_buy_symbols),
             "submitted_symbols": [],
             "protective_stop_coverage": {
                 "status": "cached",
@@ -1604,7 +1675,24 @@ def _cached_watch_buy_direction(item: CachedMonitoringItem) -> str:
     return "at_or_above"
 
 
-def _triggered_symbols_from_cached_payload(payload: dict[str, object]) -> set[str]:
+def _triggered_symbols_from_cached_payload(
+    payload: dict[str, object],
+    *,
+    include_watch_buys: bool = True,
+    include_sells: bool = True,
+) -> set[str]:
+    field_name = None
+    if include_watch_buys and not include_sells:
+        field_name = "triggered_buy_symbols"
+    elif include_sells and not include_watch_buys:
+        field_name = "triggered_sell_symbols"
+    elif include_sells and include_watch_buys:
+        field_name = "triggered_symbols"
+    if field_name is not None:
+        raw_symbols = payload.get(field_name)
+        if isinstance(raw_symbols, list):
+            return {symbol for symbol in raw_symbols if isinstance(symbol, str) and symbol}
+
     items = payload.get("items")
     if not isinstance(items, list):
         return set()
@@ -1613,6 +1701,12 @@ def _triggered_symbols_from_cached_payload(payload: dict[str, object]) -> set[st
         if not isinstance(item, dict):
             continue
         if item.get("outcome") != "triggered":
+            continue
+        intent = item.get("intent")
+        is_watch_buy = isinstance(intent, str) and intent in WATCH_BUY_INTENTS
+        if is_watch_buy and not include_watch_buys:
+            continue
+        if not is_watch_buy and not include_sells:
             continue
         symbol = item.get("symbol")
         if isinstance(symbol, str) and symbol:
