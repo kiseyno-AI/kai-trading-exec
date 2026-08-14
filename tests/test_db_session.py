@@ -77,3 +77,7 @@ def test_database_health_checks_do_not_stack_connection_attempts() -> None:
 
     assert result["status"] == "error"
     assert result["error"] == "HealthCheckInProgress"
+
+
+def test_high_volatility_chase_veto_is_enabled_by_default() -> None:
+    assert Settings().watch_buy_high_volatility_chase_veto_enabled is True

@@ -47,7 +47,7 @@ class Settings(BaseModel):
     watch_buy_weak_ret20_threshold_pct: Decimal = Field(default=Decimal("0.0"), ge=Decimal("-100"), le=Decimal("100"))
     watch_buy_deep_negative_ret20_threshold_pct: Decimal = Field(default=Decimal("-10.0"), ge=Decimal("-100"), le=Decimal("0"))
     watch_buy_extended_ret5_threshold_pct: Decimal = Field(default=Decimal("15.0"), ge=0, le=Decimal("100"))
-    watch_buy_high_volatility_chase_veto_enabled: bool = False
+    watch_buy_high_volatility_chase_veto_enabled: bool = True
     watch_buy_high_volatility_chase_atr_pct_threshold: Decimal = Field(default=Decimal("15.0"), ge=0, le=Decimal("100"))
     watch_buy_high_volatility_chase_ret5_threshold_pct: Decimal = Field(default=Decimal("30.0"), ge=0, le=Decimal("100"))
     watch_buy_high_volatility_chase_max_context_age_days: int = Field(default=1, ge=0, le=30)
