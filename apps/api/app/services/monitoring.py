@@ -314,6 +314,12 @@ PROTECTIVE_STOP_COVERAGE_STATUSES = frozenset(
         "partially_filled",
     }
 )
+PROTECTIVE_STOP_REPAIR_CANDIDATE_STATUSES = (
+    PROTECTIVE_STOP_COVERAGE_STATUSES
+    | RETRYABLE_PROTECTIVE_STOP_STATUSES
+    | FALLBACK_PROTECTIVE_STOP_STATUSES
+    | {"stop_sell_pending_config"}
+)
 PROFIT_TARGET_COVERAGE_STATUSES = frozenset(
     {
         "target_sell_monitoring",
@@ -3199,13 +3205,7 @@ def _repair_unprotected_stop_coverage(
             ExecutionPlanItem.symbol.in_(sorted(positions)),
             ExecutionPlanItem.side == "sell",
             ExecutionPlanItem.intent == "stop_sell",
-            ExecutionPlanItem.status.in_(
-                tuple(
-                    PROTECTIVE_STOP_COVERAGE_STATUSES
-                    | RETRYABLE_PROTECTIVE_STOP_STATUSES
-                    | FALLBACK_PROTECTIVE_STOP_STATUSES
-                )
-            ),
+            ExecutionPlanItem.status.in_(tuple(PROTECTIVE_STOP_REPAIR_CANDIDATE_STATUSES)),
         )
         .options(
             load_only(
@@ -3583,13 +3583,7 @@ def _stop_items_for_symbol(
             ExecutionPlanItem.symbol == symbol,
             ExecutionPlanItem.side == "sell",
             ExecutionPlanItem.intent == "stop_sell",
-            ExecutionPlanItem.status.in_(
-                tuple(
-                    PROTECTIVE_STOP_COVERAGE_STATUSES
-                    | RETRYABLE_PROTECTIVE_STOP_STATUSES
-                    | FALLBACK_PROTECTIVE_STOP_STATUSES
-                )
-            ),
+            ExecutionPlanItem.status.in_(tuple(PROTECTIVE_STOP_REPAIR_CANDIDATE_STATUSES)),
         )
         .options(
             load_only(
@@ -4499,6 +4493,8 @@ def _has_active_sell_monitor(
         | IN_FLIGHT_BROKER_ORDER_ITEM_STATUSES
         | SELL_PENDING_CONFIG_STATUSES
     )
+    if intent == "stop_sell":
+        candidate_statuses = candidate_statuses | FALLBACK_PROTECTIVE_STOP_STATUSES
     candidates = db.scalars(
         select(ExecutionPlanItem)
         .join(ExecutionPlanItem.plan)
