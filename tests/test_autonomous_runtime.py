@@ -285,3 +285,55 @@ def test_sqlite_local_desired_symbols_include_older_active_watch_when_newer_plan
         ]
     finally:
         engine.dispose()
+
+
+def test_local_desired_symbols_fall_back_to_orm_when_sqlite_fast_path_is_unavailable(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'monitoring-symbol-fallback.db'}",
+        runtime_mode="paper",
+        monitoring_max_symbols_per_cycle=4,
+        monitoring_expire_prior_market_watch_buys_enabled=False,
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    coordinator = AutonomousRuntimeCoordinator(
+        settings=settings,
+        session_factory=session_factory,
+        broker_adapter_factory=lambda settings: None,  # type: ignore[arg-type,return-value]
+    )
+
+    try:
+        with session_factory() as session:
+            session.add(
+                ExecutionPlan(
+                    external_plan_id="orm-monitoring-symbol-fallback",
+                    source="kai-trading-core",
+                    market_date=date(2026, 8, 14),
+                    mode="paper",
+                    status="accepted",
+                    items=[
+                        ExecutionPlanItem(
+                            plan_item_index=0,
+                            symbol="005930",
+                            side="buy",
+                            intent="intraday_watch_buy",
+                            status="watch_monitoring_active",
+                        )
+                    ],
+                )
+            )
+            session.commit()
+
+        monkeypatch.setattr(
+            coordinator,
+            "_load_local_desired_monitoring_symbols_from_sqlite",
+            lambda: [],
+        )
+
+        assert coordinator._load_local_desired_monitoring_symbols() == ["005930"]
+    finally:
+        engine.dispose()
