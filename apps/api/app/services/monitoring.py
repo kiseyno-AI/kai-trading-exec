@@ -59,6 +59,9 @@ from app.services import trigger_time_exec_agent
 
 logger = logging.getLogger(__name__)
 
+_CORE_DESIRED_MONITORING_SYMBOL_CACHE: dict[str, tuple[float, tuple[str, ...]]] = {}
+_CORE_DESIRED_MONITORING_SYMBOL_WARNING_AT: dict[str, float] = {}
+
 SELL_MONITORED_INTENTS = frozenset({"target_sell", "stop_sell", "max_holding_close_sell"})
 WATCH_BUY_INTENTS = frozenset({"watch_buy", "trigger_buy", "chase_buy", "tactical_buy", "intraday_watch_buy", "next_open_buy"})
 MONITORED_INTENTS = SELL_MONITORED_INTENTS | WATCH_BUY_INTENTS
@@ -670,10 +673,6 @@ def list_autonomous_monitoring_symbols(
         desired_symbols = _load_core_desired_monitoring_symbols(settings=settings)
         if desired_symbols:
             desired_rank = {symbol: index for index, symbol in enumerate(desired_symbols)}
-            desired_set = set(desired_symbols)
-            buy_symbol_rows = [
-                symbol for symbol in buy_symbol_rows if str(symbol) in desired_set
-            ]
             buy_symbol_rows.sort(
                 key=lambda symbol: (
                     desired_rank.get(str(symbol), len(desired_rank)),
@@ -740,21 +739,68 @@ def _load_core_desired_monitoring_symbols(*, settings: Settings) -> list[str]:
     if not settings.market_context_enabled or not settings.market_context_base_url:
         return []
     base_url = str(settings.market_context_base_url).rstrip("/")
-    request = Request(f"{base_url}/execution/runtime/monitored-symbols")
+    request = Request(f"{base_url}/execution/runtime/monitored-symbols?refresh=true")
     if settings.market_context_bearer_token:
         request.add_header("Authorization", f"Bearer {settings.market_context_bearer_token}")
     try:
         with urlopen(request, timeout=min(float(settings.market_context_timeout_seconds), 3.0)) as response:
             payload = json.loads(response.read().decode("utf-8"))
-    except (HTTPError, URLError, TimeoutError, ValueError, OSError):
+        if not isinstance(payload, dict):
+            raise ValueError("Core monitored-symbol response must be a JSON object")
+        realtime_subscription = payload.get("realtime_subscription")
+        if not isinstance(realtime_subscription, dict):
+            raise ValueError("Core monitored-symbol response is missing realtime_subscription")
+        desired_symbols = realtime_subscription.get("desired_symbols")
+        if not isinstance(desired_symbols, list):
+            raise ValueError("Core monitored-symbol response is missing desired_symbols")
+        symbols = _parse_symbol_priority(",".join(str(symbol) for symbol in desired_symbols))
+    except (HTTPError, URLError, TimeoutError, ValueError, OSError) as exc:
+        cached = _cached_core_desired_monitoring_symbols(settings=settings, cache_key=base_url)
+        _log_core_desired_monitoring_symbol_failure(
+            settings=settings,
+            cache_key=base_url,
+            error=exc,
+            fallback_symbols=cached,
+        )
+        return cached
+    _CORE_DESIRED_MONITORING_SYMBOL_CACHE[base_url] = (time.monotonic(), tuple(symbols))
+    return symbols
+
+
+def _cached_core_desired_monitoring_symbols(*, settings: Settings, cache_key: str) -> list[str]:
+    cached = _CORE_DESIRED_MONITORING_SYMBOL_CACHE.get(cache_key)
+    if cached is None:
         return []
-    realtime_subscription = payload.get("realtime_subscription")
-    if not isinstance(realtime_subscription, dict):
+    cached_at, symbols = cached
+    ttl_seconds = max(float(settings.market_context_cache_ttl_seconds), 1.0)
+    if time.monotonic() - cached_at > ttl_seconds:
+        _CORE_DESIRED_MONITORING_SYMBOL_CACHE.pop(cache_key, None)
         return []
-    desired_symbols = realtime_subscription.get("desired_symbols")
-    if not isinstance(desired_symbols, list):
-        return []
-    return _parse_symbol_priority(",".join(str(symbol) for symbol in desired_symbols))
+    return list(symbols)
+
+
+def _log_core_desired_monitoring_symbol_failure(
+    *,
+    settings: Settings,
+    cache_key: str,
+    error: Exception,
+    fallback_symbols: list[str],
+) -> None:
+    now = time.monotonic()
+    warning_interval = max(float(settings.market_context_cache_ttl_seconds), 30.0)
+    last_warning_at = _CORE_DESIRED_MONITORING_SYMBOL_WARNING_AT.get(cache_key)
+    if last_warning_at is not None and now - last_warning_at < warning_interval:
+        return
+    _CORE_DESIRED_MONITORING_SYMBOL_WARNING_AT[cache_key] = now
+    logger.warning(
+        "core_desired_monitoring_symbols_unavailable",
+        extra={
+            "core_base_url": cache_key,
+            "error_type": error.__class__.__name__,
+            "fallback_symbol_count": len(fallback_symbols),
+            "fallback_cache_hit": bool(fallback_symbols),
+        },
+    )
 
 
 def _parse_symbol_priority(value: str) -> list[str]:

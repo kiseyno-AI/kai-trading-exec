@@ -126,6 +126,10 @@ disabled by default and is not implemented in this runtime slice.
 
 Monitoring runtime settings currently supported:
 - `KAI_EXEC_AUTONOMOUS_RUNTIME_ENABLED`
+- `KAI_EXEC_MARKET_CONTEXT_ENABLED`
+- `KAI_EXEC_MARKET_CONTEXT_BASE_URL`
+- `KAI_EXEC_MARKET_CONTEXT_BEARER_TOKEN`
+- `KAI_EXEC_MARKET_CONTEXT_CACHE_TTL_SECONDS`
 - `KAI_EXEC_DISPATCH_LOOP_INTERVAL_SECONDS`
 - `KAI_EXEC_MONITORING_LOOP_INTERVAL_SECONDS`
 - `KAI_EXEC_MONITORING_MAX_SYMBOLS_PER_CYCLE`
@@ -137,6 +141,12 @@ Monitoring runtime settings currently supported:
 - `KAI_EXEC_PROFIT_PROTECTION_AGED_SESSION_MIN`
 - `KAI_EXEC_PROFIT_PROTECTION_AGED_MIN_CURRENT_PROFIT_PCT`
 - `KAI_EXEC_BREAKEVEN_STOP_BUFFER_PCT`
+
+When Core market context is enabled, Exec requests a refreshed
+`/execution/runtime/monitored-symbols` read model each cycle. A transient Core
+failure retains the last successful priority list for the configured cache TTL;
+the Exec-local execution plan remains the durable monitoring source of truth.
+Core symbols affect ordering only and never filter active local watch plans.
 
 Domestic order-session routing settings currently supported:
 - `KAI_EXEC_DOMESTIC_ORDER_SESSION_ROUTING_ENABLED`
