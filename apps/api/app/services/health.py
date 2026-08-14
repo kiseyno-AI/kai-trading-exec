@@ -1,4 +1,5 @@
 from datetime import UTC, datetime
+import threading
 from time import perf_counter
 
 from sqlalchemy.exc import SQLAlchemyError
@@ -10,8 +11,18 @@ from app.services.schema import check_runtime_schema
 from app.services.runtime import RuntimeMetadata, liveness_payload
 
 
+_database_healthcheck_lock = threading.Lock()
+
+
 def check_database(db: Session) -> dict[str, object]:
     started = perf_counter()
+    if not _database_healthcheck_lock.acquire(blocking=False):
+        return {
+            "status": "error",
+            "checked_at": datetime.now(UTC).isoformat(),
+            "latency_ms": round((perf_counter() - started) * 1000, 3),
+            "error": "HealthCheckInProgress",
+        }
     try:
         ping_database(db)
     except SQLAlchemyError as exc:
@@ -21,6 +32,8 @@ def check_database(db: Session) -> dict[str, object]:
             "latency_ms": round((perf_counter() - started) * 1000, 3),
             "error": exc.__class__.__name__,
         }
+    finally:
+        _database_healthcheck_lock.release()
     return {
         "status": "ok",
         "checked_at": datetime.now(UTC).isoformat(),
