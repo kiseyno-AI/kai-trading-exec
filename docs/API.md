@@ -9,6 +9,7 @@ Current response includes:
 - service name, environment, runtime mode, version
 - process liveness metadata (`process_id`, `started_at`, `uptime_seconds`)
 - dependency statuses for database connectivity and the exec-owned runtime schema
+- database pool checked-in, checked-out, overflow, and size diagnostics
 - `status: ok` only when required dependencies are reachable and migrated
 
 ### `GET /runtime/status`
