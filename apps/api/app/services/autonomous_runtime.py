@@ -501,33 +501,16 @@ class AutonomousRuntimeCoordinator:
 
     def _monitoring_cycle_sync(self, started_at: datetime) -> dict[str, object]:
         core_desired_symbols = _load_core_desired_monitoring_symbols(settings=self.settings)
-        local_desired_symbols = self._load_local_desired_monitoring_symbols_from_sqlite()
+        local_desired_symbols = self._load_local_desired_monitoring_symbols()
         desired_symbols = _merge_symbol_priority(local_desired_symbols, core_desired_symbols)
-        desired_symbols_preserve_all = False
-        if not desired_symbols:
-            desired_symbols = local_desired_symbols
-            desired_symbols_preserve_all = True
         if desired_symbols:
-            symbol_limit = self.settings.monitoring_max_symbols_per_cycle or len(desired_symbols)
-            symbols = (
-                desired_symbols
-                if desired_symbols_preserve_all
-                else desired_symbols[:symbol_limit]
+            configured_limit = int(self.settings.monitoring_max_symbols_per_cycle or 0)
+            effective_limit = (
+                max(configured_limit, len(local_desired_symbols))
+                if configured_limit > 0
+                else len(desired_symbols)
             )
-            if local_desired_symbols and not core_desired_symbols:
-                local_position_symbols = self._load_local_position_symbols_from_sqlite()
-                if local_position_symbols:
-                    position_symbol_set = set(local_position_symbols)
-                    selected_symbols: list[str] = []
-                    for symbol in desired_symbols:
-                        if symbol in position_symbol_set and symbol not in selected_symbols:
-                            selected_symbols.append(symbol)
-                    for symbol in desired_symbols:
-                        if len(selected_symbols) >= max(symbol_limit, len(position_symbol_set)):
-                            break
-                        if symbol not in selected_symbols:
-                            selected_symbols.append(symbol)
-                    symbols = selected_symbols
+            symbols = desired_symbols[:effective_limit]
             self._reconcile_monitoring_orders_if_due(
                 now=started_at,
                 symbols=set(symbols),
@@ -1113,15 +1096,20 @@ class AutonomousRuntimeCoordinator:
                 continue
             ordered.append(symbol)
             seen.add(symbol)
+        local_limit = (
+            max(configured_limit, len(ordered))
+            if configured_limit > 0
+            else limit
+        )
         for row in item_rows:
-            if len(ordered) >= limit:
+            if len(ordered) >= local_limit:
                 break
             symbol = str(row[0] or "").strip()
             if not symbol or symbol in seen:
                 continue
             ordered.append(symbol)
             seen.add(symbol)
-            if len(ordered) >= limit:
+            if len(ordered) >= local_limit:
                 break
         return ordered
 
@@ -1150,6 +1138,16 @@ class AutonomousRuntimeCoordinator:
             )
             return []
         return [str(row[0]).strip() for row in rows if str(row[0] or "").strip()]
+
+    def _load_local_desired_monitoring_symbols(self) -> list[str]:
+        sqlite_symbols = self._load_local_desired_monitoring_symbols_from_sqlite()
+        if sqlite_symbols:
+            return sqlite_symbols
+        with self.session_factory() as db:
+            return list_autonomous_monitoring_symbols(
+                settings=self.settings,
+                db=db,
+            )
 
     def _load_monitoring_runtime_snapshot_for_symbols_with_session(
         self,
