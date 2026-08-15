@@ -1,4 +1,6 @@
 import logging
+import faulthandler
+import signal
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from typing import Callable
@@ -34,6 +36,10 @@ def create_app(
 ) -> FastAPI:
     app_settings = settings or get_settings()
     configure_logging(app_settings)
+    try:
+        faulthandler.register(signal.SIGUSR1, all_threads=True, chain=False)
+    except Exception:
+        LOGGER.exception("faulthandler_signal_registration_failed")
 
     db_engine = engine or create_db_engine(app_settings)
     db_session_factory = session_factory or create_session_factory(db_engine)

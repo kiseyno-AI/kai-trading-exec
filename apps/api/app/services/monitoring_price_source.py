@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed
 from decimal import Decimal
+import threading
 import time
 from typing import Callable
 
@@ -17,8 +18,9 @@ from app.services.domestic_order_router import resolve_domestic_order_route
 MAX_REPORTED_QUOTE_FAILURES = 10
 MAX_REPORTED_CONTEXT_FAILURES = 10
 MAX_QUOTE_WORKERS = 3
-QUOTE_RETRY_ATTEMPTS = 2
+QUOTE_RETRY_ATTEMPTS = 0
 QUOTE_RETRY_DELAY_SECONDS = 0.2
+QUOTE_BATCH_TIMEOUT_BUFFER_SECONDS = 2.0
 
 
 class KisCurrentQuoteMonitoringPriceSource:
@@ -35,6 +37,15 @@ class KisCurrentQuoteMonitoringPriceSource:
         self.session_factory = session_factory
         self.broker_adapter_factory = broker_adapter_factory
         self._last_diagnostics: dict[str, object] = {}
+        self._quote_batch_lock = threading.Lock()
+        self._quote_batch_state_lock = threading.Lock()
+        self._quote_batch_futures: set[
+            Future[tuple[str, BrokerCurrentPrice | None, Exception | None]]
+        ] = set()
+        self._quote_executor = ThreadPoolExecutor(
+            max_workers=MAX_QUOTE_WORKERS,
+            thread_name_prefix="kis-monitoring-quote",
+        )
 
     def describe(self) -> dict[str, object]:
         adapter = self.broker_adapter_factory(self.settings)
@@ -72,118 +83,200 @@ class KisCurrentQuoteMonitoringPriceSource:
         }
         if not unique_symbols:
             return []
-
-        broker_adapter = self.broker_adapter_factory(settings)
-        with self.session_factory() as db:
-            session_state = _ensure_authenticated_broker_session_with_retry(
-                settings=settings,
-                db=db,
-                adapter=broker_adapter,
-            )
-            access_token = session_state.access_token or ""
-            prices: list[MonitoringPriceRequest] = []
-            priced_symbols: list[str] = []
-            failures: list[dict[str, str]] = []
-            context_failures: list[dict[str, object]] = []
-            failure_count = 0
-            context_failure_count = 0
-            def fetch_quote(symbol: str) -> tuple[str, BrokerCurrentPrice | None, Exception | None]:
-                worker_adapter = self.broker_adapter_factory(settings)
-                try:
-                    return (
-                        symbol,
-                        worker_adapter.get_current_price(
-                            access_token,
-                            symbol=symbol,
-                            exchange="KRX",
-                        ),
-                        None,
-                    )
-                except Exception as exc:
-                    return symbol, None, exc
-
-            quote_results: dict[str, tuple[BrokerCurrentPrice | None, Exception | None]] = {}
-            worker_count = min(MAX_QUOTE_WORKERS, len(unique_symbols))
-            with ThreadPoolExecutor(max_workers=worker_count) as executor:
-                futures = {
-                    executor.submit(fetch_quote, symbol): symbol
-                    for symbol in unique_symbols
-                }
-                for future in as_completed(futures):
-                    symbol, quote, error = future.result()
-                    quote_results[symbol] = (quote, error)
-
-            retry_symbols = [
-                symbol
-                for symbol, (quote, error) in quote_results.items()
-                if quote is None and error is not None
-            ]
-            for _attempt in range(QUOTE_RETRY_ATTEMPTS):
-                if not retry_symbols:
-                    break
-                next_retry_symbols: list[str] = []
-                for symbol in retry_symbols:
-                    if QUOTE_RETRY_DELAY_SECONDS > 0:
-                        time.sleep(QUOTE_RETRY_DELAY_SECONDS)
-                    _retry_symbol, quote, error = fetch_quote(symbol)
-                    quote_results[symbol] = (quote, error)
-                    if quote is None and error is not None:
-                        next_retry_symbols.append(symbol)
-                retry_symbols = next_retry_symbols
-
-            for symbol in unique_symbols:
-                quote, error = quote_results.get(symbol, (None, None))
-                if error is not None:
-                    failure_count += 1
-                    if len(failures) < MAX_REPORTED_QUOTE_FAILURES:
-                        failures.append({"symbol": symbol, "error": str(error)})
-                    continue
-                if quote is None:
-                    continue
-                context = None
-                context_failure = {
-                    "symbol": quote.symbol,
-                    "endpoint": "broker_live_market_context",
-                    "reason": "skipped_noncritical_enrichment",
-                }
-                context_failure_count += 1
-                if len(context_failures) < MAX_REPORTED_CONTEXT_FAILURES:
-                    context_failures.append(context_failure)
-                priced_symbols.append(quote.symbol)
-                market_quality = _market_quality_from_quote_payload(quote.payload)
-                market_quality = _merge_live_market_context(
-                    market_quality,
-                    context=context,
-                    context_failure=context_failure,
-                    quote=quote,
-                    settings=settings,
-                )
-                market_quality = _sanitize_monitoring_market_quality(market_quality)
-                prices.append(
-                    MonitoringPriceRequest(
-                        symbol=quote.symbol,
-                        price=quote.price,
-                        observed_at=quote.observed_at,
-                        **market_quality,
-                    )
-                )
-            priced_set = set(priced_symbols)
-            missing_symbols = [symbol for symbol in unique_symbols if symbol not in priced_set]
+        if not self._quote_batch_lock.acquire(blocking=False):
             self._last_diagnostics = {
                 "requested_symbol_count": len(unique_symbols),
                 "requested_symbols": unique_symbols,
-                "priced_symbol_count": len(prices),
-                "priced_symbols": priced_symbols,
-                "missing_symbol_count": len(missing_symbols),
-                "missing_symbols": missing_symbols,
-                "quote_failures": failures,
-                "quote_failure_count": failure_count,
-                "quote_failures_truncated": failure_count > len(failures),
-                "context_failures": context_failures,
-                "context_failure_count": context_failure_count,
-                "context_failures_truncated": context_failure_count > len(context_failures),
+                "priced_symbol_count": 0,
+                "priced_symbols": [],
+                "missing_symbol_count": len(unique_symbols),
+                "missing_symbols": unique_symbols,
+                "quote_failures": [
+                    {
+                        "symbol": symbol,
+                        "error": "previous KIS current quote batch is still running",
+                    }
+                    for symbol in unique_symbols[:MAX_REPORTED_QUOTE_FAILURES]
+                ],
+                "quote_failure_count": len(unique_symbols),
+                "quote_failures_truncated": len(unique_symbols) > MAX_REPORTED_QUOTE_FAILURES,
+                "context_failures": [],
+                "context_failure_count": 0,
+                "context_failures_truncated": False,
+                "quote_batch_in_flight": True,
             }
-            return prices
+            return []
+
+        broker_adapter = self.broker_adapter_factory(settings)
+        release_quote_batch_lock = True
+        try:
+            with self.session_factory() as db:
+                session_state = _ensure_authenticated_broker_session_with_retry(
+                    settings=settings,
+                    db=db,
+                    adapter=broker_adapter,
+                )
+                access_token = session_state.access_token or ""
+                prices: list[MonitoringPriceRequest] = []
+                priced_symbols: list[str] = []
+                failures: list[dict[str, str]] = []
+                context_failures: list[dict[str, object]] = []
+                failure_count = 0
+                context_failure_count = 0
+
+                def fetch_quote(symbol: str) -> tuple[str, BrokerCurrentPrice | None, Exception | None]:
+                    worker_adapter = self.broker_adapter_factory(settings)
+                    try:
+                        return (
+                            symbol,
+                            worker_adapter.get_current_price(
+                                access_token,
+                                symbol=symbol,
+                                exchange="KRX",
+                            ),
+                            None,
+                        )
+                    except Exception as exc:
+                        return symbol, None, exc
+
+                quote_results: dict[str, tuple[BrokerCurrentPrice | None, Exception | None]] = {}
+                worker_count = min(MAX_QUOTE_WORKERS, len(unique_symbols))
+                request_timeout = max(float(settings.kis_request_timeout_seconds), 1.0)
+                wave_count = (len(unique_symbols) + worker_count - 1) // worker_count
+                batch_timeout = (request_timeout * wave_count) + QUOTE_BATCH_TIMEOUT_BUFFER_SECONDS
+                futures = {
+                    self._quote_executor.submit(fetch_quote, symbol): symbol
+                    for symbol in unique_symbols
+                }
+                with self._quote_batch_state_lock:
+                    self._quote_batch_futures.update(futures)
+                batch_timed_out = False
+                try:
+                    try:
+                        completed_futures = as_completed(futures, timeout=batch_timeout)
+                        for future in completed_futures:
+                            symbol, quote, error = future.result()
+                            quote_results[symbol] = (quote, error)
+                    except FuturesTimeoutError:
+                        batch_timed_out = True
+                        for future, symbol in futures.items():
+                            if symbol not in quote_results:
+                                future.cancel()
+                                quote_results[symbol] = (
+                                    None,
+                                    TimeoutError(
+                                        f"KIS current quote batch timed out after {batch_timeout:g}s"
+                                    ),
+                                )
+                finally:
+                    if batch_timed_out:
+                        release_quote_batch_lock = False
+                        self._release_quote_batch_when_complete(set(futures))
+                    else:
+                        with self._quote_batch_state_lock:
+                            self._quote_batch_futures.difference_update(futures)
+
+                retry_symbols = [
+                    symbol
+                    for symbol, (quote, error) in quote_results.items()
+                    if quote is None and error is not None
+                ]
+                for _attempt in range(QUOTE_RETRY_ATTEMPTS):
+                    if not retry_symbols:
+                        break
+                    next_retry_symbols: list[str] = []
+                    for symbol in retry_symbols:
+                        if QUOTE_RETRY_DELAY_SECONDS > 0:
+                            time.sleep(QUOTE_RETRY_DELAY_SECONDS)
+                        _retry_symbol, quote, error = fetch_quote(symbol)
+                        quote_results[symbol] = (quote, error)
+                        if quote is None and error is not None:
+                            next_retry_symbols.append(symbol)
+                    retry_symbols = next_retry_symbols
+
+                for symbol in unique_symbols:
+                    quote, error = quote_results.get(symbol, (None, None))
+                    if error is not None:
+                        failure_count += 1
+                        if len(failures) < MAX_REPORTED_QUOTE_FAILURES:
+                            failures.append({"symbol": symbol, "error": str(error)})
+                        continue
+                    if quote is None:
+                        continue
+                    context = None
+                    context_failure = {
+                        "symbol": quote.symbol,
+                        "endpoint": "broker_live_market_context",
+                        "reason": "skipped_noncritical_enrichment",
+                    }
+                    context_failure_count += 1
+                    if len(context_failures) < MAX_REPORTED_CONTEXT_FAILURES:
+                        context_failures.append(context_failure)
+                    priced_symbols.append(quote.symbol)
+                    market_quality = _market_quality_from_quote_payload(quote.payload)
+                    market_quality = _merge_live_market_context(
+                        market_quality,
+                        context=context,
+                        context_failure=context_failure,
+                        quote=quote,
+                        settings=settings,
+                    )
+                    market_quality = _sanitize_monitoring_market_quality(market_quality)
+                    prices.append(
+                        MonitoringPriceRequest(
+                            symbol=quote.symbol,
+                            price=quote.price,
+                            observed_at=quote.observed_at,
+                            **market_quality,
+                        )
+                    )
+                priced_set = set(priced_symbols)
+                missing_symbols = [symbol for symbol in unique_symbols if symbol not in priced_set]
+                self._last_diagnostics = {
+                    "requested_symbol_count": len(unique_symbols),
+                    "requested_symbols": unique_symbols,
+                    "priced_symbol_count": len(prices),
+                    "priced_symbols": priced_symbols,
+                    "missing_symbol_count": len(missing_symbols),
+                    "missing_symbols": missing_symbols,
+                    "quote_failures": failures,
+                    "quote_failure_count": failure_count,
+                    "quote_failures_truncated": failure_count > len(failures),
+                    "context_failures": context_failures,
+                    "context_failure_count": context_failure_count,
+                    "context_failures_truncated": context_failure_count > len(context_failures),
+                    "quote_batch_timed_out": batch_timed_out,
+                }
+                return prices
+        finally:
+            if release_quote_batch_lock:
+                self._quote_batch_lock.release()
+
+    def close(self) -> None:
+        self._quote_executor.shutdown(wait=False, cancel_futures=True)
+
+    def _release_quote_batch_when_complete(
+        self,
+        futures: set[Future[tuple[str, BrokerCurrentPrice | None, Exception | None]]],
+    ) -> None:
+        def release_if_complete(
+            _future: Future[
+                tuple[str, BrokerCurrentPrice | None, Exception | None]
+            ] | None = None,
+        ) -> None:
+            del _future
+            if any(not future.done() for future in futures):
+                return
+            with self._quote_batch_state_lock:
+                self._quote_batch_futures.difference_update(futures)
+            try:
+                self._quote_batch_lock.release()
+            except RuntimeError:
+                return
+
+        for future in futures:
+            future.add_done_callback(release_if_complete)
+        release_if_complete()
 
     def get_last_diagnostics(self) -> dict[str, object]:
         return dict(self._last_diagnostics)

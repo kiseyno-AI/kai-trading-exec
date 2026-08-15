@@ -2019,6 +2019,111 @@ def test_autonomous_monitoring_rearms_retry_pending_stop_after_session_rejection
     engine.dispose()
 
 
+def test_autonomous_monitoring_submits_same_symbol_sell_before_watch_buy_when_capacity_is_limited() -> None:
+    app, engine = build_test_app(
+        Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+            monitoring_max_broker_actions_per_cycle=1,
+            account_drawdown_gate_enabled=False,
+        )
+    )
+    client = TestClient(app)
+    broker_adapter = StubMonitoringBrokerAdapter()
+
+    resume = client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "test", "reason": "enable monitoring sell priority"},
+    )
+    assert resume.status_code == 200
+
+    with app.state.db_session_factory() as session:
+        plan = ExecutionPlan(
+            id="plan-same-symbol-buy-before-sell",
+            external_plan_id="plan-same-symbol-buy-before-sell",
+            source="kai-trading-core",
+            market_date=datetime(2026, 8, 10, tzinfo=UTC).date(),
+            mode="paper",
+            status="accepted",
+            accepted_at=datetime(2026, 8, 10, 1, 0, tzinfo=UTC),
+            raw_payload={"source": "test"},
+        )
+        session.add(plan)
+        session.add(
+            ExecutionPosition(
+                mode="paper",
+                symbol="033530",
+                quantity=1,
+                average_price=Decimal("8500.0000"),
+                updated_from="reconciliation",
+                last_reconciled_at=datetime(2026, 8, 10, 1, 0, tzinfo=UTC),
+            )
+        )
+        session.add_all(
+            [
+                ExecutionPlanItem(
+                    id="same-symbol-watch-buy-first",
+                    plan=plan,
+                    plan_item_index=0,
+                    symbol="033530",
+                    side="buy",
+                    intent="intraday_watch_buy",
+                    status="watch_monitoring_active",
+                    quantity_policy={
+                        "kind": "shares",
+                        "quantity": 1,
+                        "stop_price": "7200.0000",
+                        "max_budget": "10000.0000",
+                    },
+                    trigger_price=Decimal("7300.0000"),
+                    limit_price=Decimal("7300.0000"),
+                    time_in_force="day",
+                ),
+                ExecutionPlanItem(
+                    id="same-symbol-protective-stop-second",
+                    plan=plan,
+                    plan_item_index=1,
+                    symbol="033530",
+                    side="sell",
+                    intent="stop_sell",
+                    status="stop_sell_monitoring",
+                    quantity_policy={"kind": "position_exit_from_entry"},
+                    trigger_price=Decimal("7600.0000"),
+                    time_in_force="day",
+                    risk_context={"exchange": "KRX"},
+                ),
+            ]
+        )
+        session.commit()
+
+        result = run_autonomous_monitoring_cycle(
+            settings=app.state.settings,
+            db=session,
+            adapter=broker_adapter,
+            prices=[MonitoringPriceRequest(symbol="033530", price=Decimal("7300.0000"))],
+            symbols=["033530"],
+            now=datetime(2026, 8, 10, 1, 5, tzinfo=UTC),
+        )
+
+        assert result.status_code == 200
+        assert result.payload["submitted_order_count"] == 1
+        assert result.payload["deferred_item_count"] == 1
+        assert [request.side for request in broker_adapter.order_calls] == ["sell"]
+        assert broker_adapter.order_calls[0].execution_plan_item_id == "same-symbol-protective-stop-second"
+
+        items_by_id = {
+            item["execution_plan_item_id"]: item
+            for item in result.payload["items"]
+        }
+        assert items_by_id["same-symbol-protective-stop-second"]["outcome"] == "submitted"
+        assert items_by_id["same-symbol-watch-buy-first"]["outcome"] == "deferred"
+
+    engine.dispose()
+
+
 def test_autonomous_monitoring_expires_known_flat_pending_sell_monitors() -> None:
     app, engine = build_test_app(
         Settings(

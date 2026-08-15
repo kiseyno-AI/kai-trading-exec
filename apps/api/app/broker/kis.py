@@ -934,6 +934,8 @@ def _normalize_reconcile_status(
     }
     if normalized in status_lookup:
         return status_lookup[normalized]
+    if remaining_quantity is not None and remaining_quantity <= 0 and filled_quantity <= 0:
+        return "canceled"
     if remaining_quantity is not None and remaining_quantity <= 0:
         return "filled"
     if filled_quantity > 0:
