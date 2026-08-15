@@ -95,6 +95,28 @@ KAI_EXEC_KIS_ACCOUNT_NUMBER=12345678 \
 PYTHONPATH=apps/api uvicorn app.main:app --host 127.0.0.1 --port 8010
 ```
 
+Database pool settings are configurable per process:
+
+- `KAI_EXEC_DB_POOL_SIZE` (default `10`)
+- `KAI_EXEC_DB_MAX_OVERFLOW` (default `10`)
+- `KAI_EXEC_DB_POOL_TIMEOUT_SECONDS` (default `5`)
+- `KAI_EXEC_DB_POOL_RECYCLE_SECONDS` (default `900`)
+- `KAI_EXEC_DB_POOL_USE_LIFO` (default `true`)
+- `KAI_EXEC_DB_CONNECT_TIMEOUT_SECONDS` (default `5`, PostgreSQL)
+- `KAI_EXEC_DB_LONG_CHECKOUT_WARNING_SECONDS` (default `10`)
+- `KAI_EXEC_SQLITE_BUSY_TIMEOUT_SECONDS` (default `30`)
+
+Each API or worker process owns a separate pool. Keep the sum of configured
+pool capacity across all processes below the PostgreSQL connection budget.
+Database health checks are single-flight per process so overlapping probes do
+not stack additional checkout attempts while the database is degraded.
+
+High-volatility chase vetoes are enabled by default. A chase buy is rejected
+when fresh ATR and five-day return inputs exceed the configured thresholds;
+stale or missing technical context fails closed only after that high-volatility
+condition is observed. Confirmed pullbacks below the breakout trigger continue
+through the existing pullback and live-market-quality checks.
+
 Local runtime artifacts such as `var/`, `logs/`, `.omx/`, Python caches,
 pytest/coverage caches, and virtual environments are intentionally ignored.
 They are not execution-runtime source changes; inspect them only when debugging

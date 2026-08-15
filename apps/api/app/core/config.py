@@ -16,6 +16,14 @@ class Settings(BaseModel):
     environment: str = "local"
     runtime_mode: RuntimeMode = "mock"
     database_url: str = "sqlite:///./var/kai_trading_exec.db"
+    db_pool_size: int = Field(default=10, ge=1, le=200)
+    db_max_overflow: int = Field(default=10, ge=0, le=200)
+    db_pool_timeout_seconds: float = Field(default=5.0, gt=0, le=120)
+    db_pool_recycle_seconds: int = Field(default=900, ge=0, le=86_400)
+    db_pool_use_lifo: bool = True
+    db_connect_timeout_seconds: int = Field(default=5, ge=1, le=120)
+    db_long_checkout_warning_seconds: float = Field(default=10.0, gt=0, le=3600)
+    sqlite_busy_timeout_seconds: int = Field(default=30, ge=1, le=300)
     log_level: str = "INFO"
     log_format: LogFormat = "json"
     api_host: str = "127.0.0.1"
@@ -39,7 +47,7 @@ class Settings(BaseModel):
     watch_buy_weak_ret20_threshold_pct: Decimal = Field(default=Decimal("0.0"), ge=Decimal("-100"), le=Decimal("100"))
     watch_buy_deep_negative_ret20_threshold_pct: Decimal = Field(default=Decimal("-10.0"), ge=Decimal("-100"), le=Decimal("0"))
     watch_buy_extended_ret5_threshold_pct: Decimal = Field(default=Decimal("15.0"), ge=0, le=Decimal("100"))
-    watch_buy_high_volatility_chase_veto_enabled: bool = False
+    watch_buy_high_volatility_chase_veto_enabled: bool = True
     watch_buy_high_volatility_chase_atr_pct_threshold: Decimal = Field(default=Decimal("15.0"), ge=0, le=Decimal("100"))
     watch_buy_high_volatility_chase_ret5_threshold_pct: Decimal = Field(default=Decimal("30.0"), ge=0, le=Decimal("100"))
     watch_buy_high_volatility_chase_max_context_age_days: int = Field(default=1, ge=0, le=30)
@@ -222,6 +230,14 @@ _ENV_FIELDS = {
     "ENVIRONMENT": "environment",
     "RUNTIME_MODE": "runtime_mode",
     "DATABASE_URL": "database_url",
+    "DB_POOL_SIZE": "db_pool_size",
+    "DB_MAX_OVERFLOW": "db_max_overflow",
+    "DB_POOL_TIMEOUT_SECONDS": "db_pool_timeout_seconds",
+    "DB_POOL_RECYCLE_SECONDS": "db_pool_recycle_seconds",
+    "DB_POOL_USE_LIFO": "db_pool_use_lifo",
+    "DB_CONNECT_TIMEOUT_SECONDS": "db_connect_timeout_seconds",
+    "DB_LONG_CHECKOUT_WARNING_SECONDS": "db_long_checkout_warning_seconds",
+    "SQLITE_BUSY_TIMEOUT_SECONDS": "sqlite_busy_timeout_seconds",
     "LOG_LEVEL": "log_level",
     "LOG_FORMAT": "log_format",
     "API_HOST": "api_host",

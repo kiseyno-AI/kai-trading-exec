@@ -314,6 +314,12 @@ PROTECTIVE_STOP_COVERAGE_STATUSES = frozenset(
         "partially_filled",
     }
 )
+PROTECTIVE_STOP_REPAIR_CANDIDATE_STATUSES = (
+    PROTECTIVE_STOP_COVERAGE_STATUSES
+    | RETRYABLE_PROTECTIVE_STOP_STATUSES
+    | FALLBACK_PROTECTIVE_STOP_STATUSES
+    | {"stop_sell_pending_config"}
+)
 PROFIT_TARGET_COVERAGE_STATUSES = frozenset(
     {
         "target_sell_monitoring",
@@ -3199,13 +3205,7 @@ def _repair_unprotected_stop_coverage(
             ExecutionPlanItem.symbol.in_(sorted(positions)),
             ExecutionPlanItem.side == "sell",
             ExecutionPlanItem.intent == "stop_sell",
-            ExecutionPlanItem.status.in_(
-                tuple(
-                    PROTECTIVE_STOP_COVERAGE_STATUSES
-                    | RETRYABLE_PROTECTIVE_STOP_STATUSES
-                    | FALLBACK_PROTECTIVE_STOP_STATUSES
-                )
-            ),
+            ExecutionPlanItem.status.in_(tuple(PROTECTIVE_STOP_REPAIR_CANDIDATE_STATUSES)),
         )
         .options(
             load_only(
@@ -3583,13 +3583,7 @@ def _stop_items_for_symbol(
             ExecutionPlanItem.symbol == symbol,
             ExecutionPlanItem.side == "sell",
             ExecutionPlanItem.intent == "stop_sell",
-            ExecutionPlanItem.status.in_(
-                tuple(
-                    PROTECTIVE_STOP_COVERAGE_STATUSES
-                    | RETRYABLE_PROTECTIVE_STOP_STATUSES
-                    | FALLBACK_PROTECTIVE_STOP_STATUSES
-                )
-            ),
+            ExecutionPlanItem.status.in_(tuple(PROTECTIVE_STOP_REPAIR_CANDIDATE_STATUSES)),
         )
         .options(
             load_only(
@@ -4499,6 +4493,8 @@ def _has_active_sell_monitor(
         | IN_FLIGHT_BROKER_ORDER_ITEM_STATUSES
         | SELL_PENDING_CONFIG_STATUSES
     )
+    if intent == "stop_sell":
+        candidate_statuses = candidate_statuses | FALLBACK_PROTECTIVE_STOP_STATUSES
     candidates = db.scalars(
         select(ExecutionPlanItem)
         .join(ExecutionPlanItem.plan)
@@ -6868,17 +6864,26 @@ def _watch_buy_high_risk_gate_rejection(
         "trend_state": trend_state or None,
         "setup_state": setup_state or None,
     }
-    chase_decision = _watch_buy_high_volatility_chase_decision(
-        settings=settings,
-        item=item,
-        observed_price=observed_price,
-        trigger_reason=trigger_reason,
-        trigger_metadata=trigger_metadata,
-        payload=payload,
-        atr_pct=atr_pct,
-        ret5=ret5,
-        triggered_at=triggered_at,
+    trigger_price = _watch_buy_trigger_price(item)
+    direction = _watch_buy_direction(item)
+    pullback_after_cross = (
+        trigger_price is not None
+        and direction == "at_or_above"
+        and observed_price < trigger_price
     )
+    chase_decision = None
+    if not pullback_after_cross:
+        chase_decision = _watch_buy_high_volatility_chase_decision(
+            settings=settings,
+            item=item,
+            observed_price=observed_price,
+            trigger_reason=trigger_reason,
+            trigger_metadata=trigger_metadata,
+            payload=payload,
+            atr_pct=atr_pct,
+            ret5=ret5,
+            triggered_at=triggered_at,
+        )
     if chase_decision is not None and chase_decision["outcome"] in {"veto", "legacy_veto"}:
         return _watch_buy_gate_rejection(
             reason=str(chase_decision["reason"]),
@@ -6908,15 +6913,6 @@ def _watch_buy_high_risk_gate_rejection(
             message="ATR is high while 20-day return is weak",
             details=details,
         )
-    trigger_price = _watch_buy_trigger_price(item)
-    direction = _watch_buy_direction(item)
-    pullback_after_cross = (
-        trigger_price is not None
-        and direction == "at_or_above"
-        and (
-            observed_price < trigger_price
-        )
-    )
     day_high = _recursive_decimal_feature(payload, {"day_high", "intraday_high", "high_price", "session_high"})
     day_low = _recursive_decimal_feature(payload, {"day_low", "intraday_low", "low_price", "session_low"})
     if day_high is not None and day_low is not None and day_high > day_low:
@@ -7009,7 +7005,7 @@ def _watch_buy_high_volatility_chase_decision(
             _persist_watch_buy_high_volatility_chase_decision(item=item, decision=decision)
         return None
 
-    if not matched and not missing_or_stale:
+    if not matched:
         return None
 
     override = _watch_buy_high_volatility_chase_override(
