@@ -1418,6 +1418,7 @@ def _evaluate_monitoring_cycle(
         )
 
     max_broker_actions = settings.monitoring_max_broker_actions_per_cycle
+    _prioritize_sell_actions_by_symbol(actions_by_symbol)
     pending_symbols = deque(symbol_order)
     if max_broker_actions <= 0:
         backlog_symbols: set[str] = set()
@@ -2069,6 +2070,23 @@ def _evaluate_monitoring_cycle(
             "items": results,
         },
     )
+
+
+def _prioritize_sell_actions_by_symbol(
+    actions_by_symbol: dict[str, deque[PendingMonitoringAction]],
+) -> None:
+    for symbol, actions in actions_by_symbol.items():
+        if len(actions) <= 1:
+            continue
+        ordered_actions = sorted(
+            actions,
+            key=lambda action: (
+                1 if _is_watch_buy_item(action.item) else 0,
+                action.item.plan_item_index,
+                action.item.id,
+            ),
+        )
+        actions_by_symbol[symbol] = deque(ordered_actions)
 
 
 def expire_prior_market_date_unfilled_watch_buys(

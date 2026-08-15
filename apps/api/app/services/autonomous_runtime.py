@@ -251,6 +251,9 @@ class AutonomousRuntimeCoordinator:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        close_price_source = getattr(self.monitoring_price_source, "close", None)
+        if callable(close_price_source):
+            close_price_source()
 
     def snapshot(self) -> dict[str, object]:
         with self._lock:

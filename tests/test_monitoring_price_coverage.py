@@ -1,5 +1,6 @@
 from datetime import UTC, datetime
 from decimal import Decimal
+import threading
 
 from fastapi.testclient import TestClient
 
@@ -12,6 +13,7 @@ from app.broker.base import (
 )
 from app.core.config import Settings
 from app.models.runtime import ExecutionPlanItem, ExecutionPosition
+from app.services import monitoring_price_source as monitoring_price_source_module
 from app.services.monitoring_price_source import KisCurrentQuoteMonitoringPriceSource
 from test_broker_auth import (
     KIS_PAPER_API_BASE_URL,
@@ -453,3 +455,91 @@ def test_autonomous_monitoring_keeps_partial_prices_when_one_live_quote_fails() 
             assert second_item.status == "target_sell_monitoring"
 
     engine.dispose()
+
+
+def test_kis_price_source_skips_new_quote_batch_while_timed_out_workers_are_still_running(
+    monkeypatch,
+) -> None:
+    entered_quote = threading.Event()
+    release_quote = threading.Event()
+    quote_attempts = 0
+
+    class BlockingQuoteAdapter(LiveMarketContextAdapter):
+        def get_current_price(
+            self,
+            access_token: str,
+            *,
+            symbol: str,
+            exchange: str = "KRX",
+        ) -> BrokerCurrentPrice | None:
+            nonlocal quote_attempts
+            quote_attempts += 1
+            entered_quote.set()
+            assert release_quote.wait(timeout=5)
+            return super().get_current_price(access_token, symbol=symbol, exchange=exchange)
+
+    monkeypatch.setattr(
+        monitoring_price_source_module,
+        "QUOTE_BATCH_TIMEOUT_BUFFER_SECONDS",
+        0.01,
+    )
+    broker_adapter = BlockingQuoteAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        current_prices={"005930": Decimal("125100.00")},
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+            kis_request_timeout_seconds=1,
+        ),
+        broker_adapter=broker_adapter,
+    )
+    price_source = KisCurrentQuoteMonitoringPriceSource(
+        settings=app.state.settings,
+        session_factory=app.state.db_session_factory,
+        broker_adapter_factory=lambda _settings: broker_adapter,
+    )
+    first_prices: list[MonitoringPriceRequest] = []
+    first_thread = threading.Thread(
+        target=lambda: first_prices.extend(
+            price_source.get_prices(
+                symbols=["005930"],
+                observed_at=datetime(2026, 8, 10, 1, 5, tzinfo=UTC),
+                settings=app.state.settings,
+            )
+        )
+    )
+    first_thread.start()
+    try:
+        assert entered_quote.wait(timeout=1)
+        first_thread.join(timeout=2)
+        assert not first_thread.is_alive()
+        assert first_prices == []
+        assert price_source.get_last_diagnostics()["quote_batch_timed_out"] is True
+
+        second_prices = price_source.get_prices(
+            symbols=["005930"],
+            observed_at=datetime(2026, 8, 10, 1, 6, tzinfo=UTC),
+            settings=app.state.settings,
+        )
+
+        assert second_prices == []
+        diagnostics = price_source.get_last_diagnostics()
+        assert diagnostics["quote_batch_in_flight"] is True
+        assert diagnostics["quote_failure_count"] == 1
+        assert quote_attempts == 1
+    finally:
+        release_quote.set()
+        first_thread.join(timeout=1)
+        price_source.close()
+        engine.dispose()

@@ -138,6 +138,34 @@ def test_monitoring_stale_mutex_skips_until_original_cycle_finishes() -> None:
         first_thread.join(timeout=1)
 
 
+def test_stop_closes_monitoring_price_source_lifecycle() -> None:
+    class ClosablePriceSource:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    async def scenario() -> None:
+        price_source = ClosablePriceSource()
+        settings = Settings(
+            database_url="sqlite:///:memory:",
+            autonomous_runtime_enabled=True,
+        )
+        coordinator = AutonomousRuntimeCoordinator(
+            settings=settings,
+            session_factory=None,  # type: ignore[arg-type]
+            broker_adapter_factory=lambda settings: None,  # type: ignore[arg-type,return-value]
+            monitoring_price_source=price_source,
+        )
+
+        await coordinator.stop()
+
+        assert price_source.closed is True
+
+    asyncio.run(scenario())
+
+
 def test_monitoring_stale_mutex_exits_when_guard_enabled(monkeypatch) -> None:  # noqa: ANN001
     settings = Settings(
         database_url="sqlite:///:memory:",
