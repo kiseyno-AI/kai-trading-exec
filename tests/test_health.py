@@ -3501,7 +3501,7 @@ def test_live_desired_symbol_reconcile_syncs_positions_and_filled_today(tmp_path
     assert price_source.calls == [["002380"]]
     assert payload["cached_evaluation"] is True
     assert payload["evaluated_item_count"] == 3
-    assert payload["post_entry_maintenance_count"] == 2
+    assert payload["post_entry_maintenance_count"] == 3
     assert target_item.id in {item["execution_plan_item_id"] for item in payload["items"]}
     assert payload["runtime_snapshot"]["position_count"] == 1
     assert payload["runtime_snapshot"]["filled_today_symbols"] == ["002380"]

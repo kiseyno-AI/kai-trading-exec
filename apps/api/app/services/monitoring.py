@@ -4309,6 +4309,7 @@ def _maintain_post_entry_exit_monitors(
         )
         maintenance_count += stop_maintenance_count
         _, target_maintenance_count = _ensure_post_entry_target_monitor(
+            settings=settings,
             db=db,
             entry_item=entry_item,
             quantity=position.quantity,
@@ -4753,6 +4754,7 @@ def _ensure_post_entry_stop_monitor(
 
 def _ensure_post_entry_target_monitor(
     *,
+    settings: Settings,
     db: Session,
     entry_item: ExecutionPlanItem,
     quantity: int,
@@ -4761,7 +4763,12 @@ def _ensure_post_entry_target_monitor(
 ) -> tuple[ExecutionPlanItem | None, int]:
     target_price = _watch_buy_target_price(entry_item)
     if target_price is None or target_price <= entry_price:
-        return None, 0
+        target_price = (
+            entry_price * (Decimal("1") + settings.exec_agent_first_take_profit_pct)
+        ).quantize(
+            Decimal("0.0001"),
+            rounding=ROUND_DOWN,
+        )
     plan = entry_item.plan
     assert plan is not None
     maintenance_count = 0
