@@ -619,7 +619,7 @@ class AutonomousRuntimeCoordinator:
             started_at=started_at,
         )
         post_entry_maintenance_count = 0
-        if cached_payload["triggered_item_count"] == 0 and prices:
+        if prices:
             post_entry_maintenance_count = self._repair_post_entry_exit_monitors_for_cached_cycle(
                 runtime_snapshot=runtime_snapshot,
                 prices=prices,
@@ -639,6 +639,7 @@ class AutonomousRuntimeCoordinator:
                     prices=prices,
                     started_at=started_at,
                 )
+        if cached_payload["triggered_item_count"] == 0 and prices:
             payload = {
                 "status_code": 200,
                 "monitored_symbols": symbols,

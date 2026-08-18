@@ -3427,7 +3427,7 @@ def test_live_desired_symbol_reconcile_syncs_positions_and_filled_today(tmp_path
 
     started_at = datetime(2026, 6, 8, 1, 5, tzinfo=UTC)
     monkeypatch.setenv("KAI_EXEC_MONITORING_SYMBOL_PRIORITY", "002380")
-    price_source = StaticMonitoringPriceSource({"002380": Decimal("105.00")})
+    price_source = StaticMonitoringPriceSource({"002380": Decimal("101.00")})
     broker = LiveFastPathBroker(started_at)
     app, engine = build_test_app(
         Settings(
