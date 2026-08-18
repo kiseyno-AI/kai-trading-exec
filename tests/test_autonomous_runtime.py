@@ -4,11 +4,16 @@ import threading
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
+from app.api.schemas.execution import MonitoringPriceRequest
 from app.core.config import Settings
 from app.db.base import Base
 from app.db.session import create_db_engine, create_session_factory
 from app.models.runtime import ExecutionPlan, ExecutionPlanItem
-from app.services.autonomous_runtime import AutonomousRuntimeCoordinator
+from app.services.autonomous_runtime import (
+    AutonomousRuntimeCoordinator,
+    CachedMonitoringPosition,
+    MonitoringRuntimeSnapshot,
+)
 
 
 def test_monitoring_timeout_does_not_block_next_scheduler_tick() -> None:
@@ -285,6 +290,107 @@ def test_sqlite_local_desired_symbols_include_older_active_watch_when_newer_plan
         ]
     finally:
         engine.dispose()
+
+
+def test_sqlite_monitoring_snapshot_excludes_terminal_watch_items(tmp_path) -> None:
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'monitoring-terminal-items.db'}",
+        runtime_mode="paper",
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    coordinator = AutonomousRuntimeCoordinator(
+        settings=settings,
+        session_factory=session_factory,
+        broker_adapter_factory=lambda settings: None,  # type: ignore[arg-type,return-value]
+    )
+
+    try:
+        with session_factory() as session:
+            plan = ExecutionPlan(
+                external_plan_id="terminal-watch-items",
+                source="kai-trading-core",
+                market_date=date(2026, 8, 18),
+                mode="paper",
+                status="accepted",
+                items=[
+                    ExecutionPlanItem(
+                        plan_item_index=index,
+                        symbol=symbol,
+                        side="buy",
+                        intent="intraday_watch_buy",
+                        status=status,
+                        trigger_price=Decimal("1000"),
+                    )
+                    for index, (symbol, status) in enumerate(
+                        [
+                            ("111111", "watch_monitoring_active"),
+                            ("222222", "watch_expired"),
+                            ("333333", "watch_cancelled"),
+                            ("444444", "watch_buy_rejected"),
+                            ("555555", "watch_buy_submitted"),
+                        ]
+                    )
+                ],
+            )
+            session.add(plan)
+            session.commit()
+
+        assert coordinator._load_local_desired_monitoring_symbols_from_sqlite() == ["111111"]
+        snapshot = coordinator._load_monitoring_runtime_snapshot_for_symbols_from_sqlite(
+            loaded_at=datetime(2026, 8, 18, 0, 10, tzinfo=UTC),
+            symbols=["111111", "222222", "333333", "444444", "555555"],
+        )
+        assert snapshot is not None
+        assert [item.symbol for item in snapshot.items] == ["111111"]
+    finally:
+        engine.dispose()
+
+
+def test_cached_cycle_repairs_held_position_monitors_with_desired_symbols(monkeypatch) -> None:
+    settings = Settings(database_url="sqlite:///:memory:", runtime_mode="paper")
+    coordinator = AutonomousRuntimeCoordinator(
+        settings=settings,
+        session_factory=None,  # type: ignore[arg-type]
+        broker_adapter_factory=lambda settings: None,  # type: ignore[arg-type,return-value]
+    )
+    started_at = datetime(2026, 8, 18, 0, 10, tzinfo=UTC)
+    snapshot = MonitoringRuntimeSnapshot(
+        loaded_at=started_at,
+        symbols=["005930"],
+        positions_by_symbol={
+            "005930": CachedMonitoringPosition(symbol="005930", quantity=1)
+        },
+        items=[],
+        filled_today_symbols=[],
+    )
+    prices = [MonitoringPriceRequest(symbol="005930", price=Decimal("70000"))]
+    maintenance_calls: list[str] = []
+
+    monkeypatch.setattr(
+        "app.services.autonomous_runtime._load_core_desired_monitoring_symbols",
+        lambda settings: [],
+    )
+    monkeypatch.setattr(coordinator, "_load_local_desired_monitoring_symbols", lambda: ["005930"])
+    monkeypatch.setattr(coordinator, "_reconcile_monitoring_orders_if_due", lambda **kwargs: None)
+    monkeypatch.setattr(
+        coordinator,
+        "_load_monitoring_runtime_snapshot_for_symbols",
+        lambda **kwargs: snapshot,
+    )
+    monkeypatch.setattr(coordinator, "_refresh_monitoring_snapshot_filled_today", lambda now: None)
+    monkeypatch.setattr(coordinator, "_load_monitoring_prices", lambda **kwargs: prices)
+    monkeypatch.setattr(
+        coordinator,
+        "_repair_post_entry_exit_monitors_for_cached_cycle",
+        lambda **kwargs: maintenance_calls.append("called") or 0,
+    )
+
+    payload = coordinator._monitoring_cycle_sync(started_at)
+
+    assert payload["status_code"] == 200
+    assert maintenance_calls == ["called"]
 
 
 def test_local_desired_symbols_fall_back_to_orm_when_sqlite_fast_path_is_unavailable(

@@ -22,12 +22,12 @@ from app.models.runtime import BrokerOrder, ExecutionFill
 from app.models.runtime import ExecutionPlanItem, ExecutionPosition
 from app.services.execution_jobs import dispatch_due_execution_jobs
 from app.services.monitoring import (
+    ACTIVE_WATCH_MONITORING_STATUSES,
     BLOCKED_MONITORING_STATUSES,
     PENDING_DISPATCH_MONITORING_STATUSES,
     SELL_ACTIVE_MONITORING_STATUSES,
     SELL_MONITORED_INTENTS,
     WATCH_BUY_INTENTS,
-    WATCH_MONITORING_STATUSES,
     _load_positions_by_symbol,
     _maintain_post_entry_exit_monitors,
     list_autonomous_monitoring_symbols,
@@ -620,24 +620,25 @@ class AutonomousRuntimeCoordinator:
         )
         post_entry_maintenance_count = 0
         if cached_payload["triggered_item_count"] == 0 and prices:
-            if not desired_symbols:
-                post_entry_maintenance_count = self._repair_post_entry_exit_monitors_for_cached_cycle(
+            post_entry_maintenance_count = self._repair_post_entry_exit_monitors_for_cached_cycle(
+                runtime_snapshot=runtime_snapshot,
+                prices=prices,
+                started_at=started_at,
+            )
+            if post_entry_maintenance_count:
+                runtime_snapshot = self._refresh_monitoring_runtime_snapshot(
+                    loaded_at=started_at,
+                    reason="cached_monitoring_post_entry_maintenance",
+                    reconcile_broker=False,
+                )
+                self._refresh_monitoring_snapshot_filled_today(started_at)
+                runtime_snapshot = self._ensure_monitoring_runtime_snapshot(started_at)
+                symbols = runtime_snapshot.symbols
+                cached_payload = self._evaluate_cached_monitoring_cycle(
                     runtime_snapshot=runtime_snapshot,
                     prices=prices,
                     started_at=started_at,
                 )
-                if post_entry_maintenance_count:
-                    runtime_snapshot = self._refresh_monitoring_runtime_snapshot(
-                        loaded_at=started_at,
-                        reason="cached_monitoring_post_entry_maintenance",
-                        reconcile_broker=False,
-                    )
-                    symbols = runtime_snapshot.symbols
-                    cached_payload = self._evaluate_cached_monitoring_cycle(
-                        runtime_snapshot=runtime_snapshot,
-                        prices=prices,
-                        started_at=started_at,
-                    )
             payload = {
                 "status_code": 200,
                 "monitored_symbols": symbols,
@@ -950,7 +951,7 @@ class AutonomousRuntimeCoordinator:
                 filled_today_symbols=[],
             )
         symbol_placeholders = ",".join("?" for _ in symbols)
-        watch_status_placeholders = ",".join("?" for _ in WATCH_MONITORING_STATUSES)
+        watch_status_placeholders = ",".join("?" for _ in ACTIVE_WATCH_MONITORING_STATUSES)
         watch_intent_placeholders = ",".join("?" for _ in WATCH_BUY_INTENTS)
         sell_statuses = (
             SELL_ACTIVE_MONITORING_STATUSES
@@ -978,7 +979,7 @@ class AutonomousRuntimeCoordinator:
                       and intent in ({watch_intent_placeholders})
                       and symbol in ({symbol_placeholders})
                     """,
-                    [*WATCH_MONITORING_STATUSES, *WATCH_BUY_INTENTS, *symbols],
+                    [*ACTIVE_WATCH_MONITORING_STATUSES, *WATCH_BUY_INTENTS, *symbols],
                 ).fetchall()
                 sell_item_rows = conn.execute(
                     f"""
@@ -1028,16 +1029,9 @@ class AutonomousRuntimeCoordinator:
             return []
         configured_limit = int(self.settings.monitoring_max_symbols_per_cycle or 0)
         limit = max(configured_limit * 4, 128) if configured_limit > 0 else 128
-        buy_statuses = tuple(WATCH_MONITORING_STATUSES)
-        sell_statuses = tuple(
-            SELL_ACTIVE_MONITORING_STATUSES
-            | BLOCKED_MONITORING_STATUSES
-            | PENDING_DISPATCH_MONITORING_STATUSES
-        )
+        buy_statuses = tuple(ACTIVE_WATCH_MONITORING_STATUSES)
         buy_status_placeholders = ",".join("?" for _ in buy_statuses)
-        sell_status_placeholders = ",".join("?" for _ in sell_statuses)
         buy_intent_placeholders = ",".join("?" for _ in WATCH_BUY_INTENTS)
-        sell_intent_placeholders = ",".join("?" for _ in SELL_MONITORED_INTENTS)
         try:
             with sqlite3.connect(f"file:{url.database}?mode=ro", uri=True, timeout=5) as conn:
                 position_rows = conn.execute(
@@ -1058,17 +1052,10 @@ class AutonomousRuntimeCoordinator:
                         max(i.updated_at) as latest_updated_at
                     from execution_plan_items i
                     join execution_plans p on p.id = i.execution_plan_id
-                    where p.mode = ? and (
-                        (
-                            i.side = 'buy'
-                            and i.status in ({buy_status_placeholders})
-                            and i.intent in ({buy_intent_placeholders})
-                        ) or (
-                            i.side = 'sell'
-                            and i.status in ({sell_status_placeholders})
-                            and i.intent in ({sell_intent_placeholders})
-                        )
-                    )
+                    where p.mode = ?
+                      and i.side = 'buy'
+                      and i.status in ({buy_status_placeholders})
+                      and i.intent in ({buy_intent_placeholders})
                     group by i.symbol
                     order by latest_market_date desc, latest_accepted_at desc, latest_updated_at desc, i.symbol asc
                     limit ?
@@ -1077,8 +1064,6 @@ class AutonomousRuntimeCoordinator:
                         self.settings.runtime_mode,
                         *buy_statuses,
                         *WATCH_BUY_INTENTS,
-                        *sell_statuses,
-                        *SELL_MONITORED_INTENTS,
                         limit,
                     ],
                 ).fetchall()
@@ -1172,7 +1157,7 @@ class AutonomousRuntimeCoordinator:
                     ExecutionPlanItem.trigger_price,
                 ).where(
                     ExecutionPlanItem.side == "buy",
-                    ExecutionPlanItem.status.in_(tuple(WATCH_MONITORING_STATUSES)),
+                    ExecutionPlanItem.status.in_(tuple(ACTIVE_WATCH_MONITORING_STATUSES)),
                     ExecutionPlanItem.intent.in_(tuple(WATCH_BUY_INTENTS)),
                     ExecutionPlanItem.symbol.in_(symbols or [""]),
                 )
