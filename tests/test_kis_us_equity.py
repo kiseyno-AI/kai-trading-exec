@@ -10,7 +10,12 @@ import pytest
 from pydantic import ValidationError
 
 from app.api.schemas.execution import ExecutionPlanRequest, PlaceOrderRequest
-from app.broker.base import BrokerAccountHolding, BrokerAccountSnapshot, BrokerOrderPlacementRequest
+from app.broker.base import (
+    BrokerAccountHolding,
+    BrokerAccountOpenOrder,
+    BrokerAccountSnapshot,
+    BrokerOrderPlacementRequest,
+)
 from app.broker.kis import (
     KIS_OVERSEAS_BALANCE_PATH,
     KIS_OVERSEAS_BUYING_POWER_PATH,
@@ -32,7 +37,11 @@ from app.services.broker_orders import (
     _validate_kis_us_equity_guardrails,
 )
 from app.services.execution_api import _build_execution_plan
-from app.services.execution_jobs import _build_place_order_request, materialize_execution_jobs
+from app.services.execution_jobs import (
+    _build_place_order_request,
+    _defer_us_next_open_job_outside_session,
+    materialize_execution_jobs,
+)
 from app.services.monitoring import materialize_monitoring_plan_items
 
 
@@ -359,6 +368,14 @@ def test_kis_us_equity_guard_is_disabled_by_default_and_caps_usd_notional() -> N
         plan_item=plan_item,
     ) or "")
 
+    sell = command.model_copy(update={"side": "sell", "quantity": 10})
+    assert _validate_kis_us_equity_guardrails(
+        settings=_settings(kis_us_trading_enabled=True, kis_us_max_order_notional_usd=Decimal("100")),
+        adapter=adapter,
+        command=sell,
+        plan_item=plan_item,
+    ) is None
+
 
 def test_kis_us_equity_account_gate_blocks_projected_usd_exposure() -> None:
     settings = _settings(
@@ -395,6 +412,47 @@ def test_kis_us_equity_account_gate_blocks_projected_usd_exposure() -> None:
     assert decision.allowed is False
     assert decision.gate_name == "us_total_exposure_usd"
     assert decision.summary["currency"] == "USD"
+    db.close()
+    engine.dispose()
+
+
+def test_kis_us_equity_account_gate_reserves_open_buy_notional() -> None:
+    settings = _settings(
+        database_url="sqlite:///:memory:",
+        kis_us_max_total_exposure_usd=Decimal("1000"),
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    db = create_session_factory(engine)()
+    snapshot = BrokerAccountSnapshot(
+        available_cash=Decimal("2000"),
+        observed_at=datetime(2026, 8, 19, 14, 0, tzinfo=UTC),
+        source="test",
+        open_orders=[
+            BrokerAccountOpenOrder(
+                symbol="AAPL",
+                side="buy",
+                quantity=3,
+                remaining_quantity=3,
+                limit_price=Decimal("200"),
+            )
+        ],
+    )
+
+    decision = evaluate_us_equity_account_gate(
+        settings=settings,
+        db=db,
+        snapshot=snapshot,
+        order_notional=Decimal("600"),
+        order_idempotency_key="us-open-buy-exposure-test",
+        execution_plan_item_id="item-2",
+        now=datetime(2026, 8, 19, 14, 0, tzinfo=UTC),
+    )
+
+    assert decision.allowed is False
+    assert decision.gate_name == "us_total_exposure_usd"
+    assert decision.payload["metrics"]["open_buy_notional_usd"] == "600.0000"
+    assert decision.payload["metrics"]["projected_exposure_usd"] == "1200.0000"
     db.close()
     engine.dispose()
 
@@ -496,6 +554,56 @@ def test_us_execution_handoff_preserves_route_and_schedules_new_york_open() -> N
     assert request.asset_class == "us_equity"
     assert request.venue == "kis"
     assert request.exchange == "NASD"
+
+
+def test_us_execution_job_is_deferred_when_dispatch_occurs_after_new_york_close() -> None:
+    settings = _settings(database_url="sqlite:///:memory:", kis_us_trading_enabled=True)
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    db = create_session_factory(engine)()
+    plan = _build_execution_plan(
+        settings=settings,
+        command=ExecutionPlanRequest(
+            plan_id="core-us-session-recheck-20260819",
+            source="kai-trading-core",
+            market_date=date(2026, 8, 19),
+            items=[
+                {
+                    "symbol": "AAPL",
+                    "source_plan_item_id": "core-us-session-recheck-20260819:AAPL:entry",
+                    "side": "buy",
+                    "intent": "next_open_buy",
+                    "quantity_policy": {"kind": "shares", "quantity": 1},
+                    "provider": "kis",
+                    "venue": "kis",
+                    "asset_class": "us_equity",
+                    "market": "US",
+                    "exchange": "NASD",
+                    "currency": "USD",
+                    "limit_price": "201.25",
+                    "time_in_force": "day",
+                }
+            ],
+        ),
+    )
+    materialize_execution_jobs(plan)
+    db.add(plan)
+    db.commit()
+    job = plan.items[0].jobs[0]
+
+    deferred = _defer_us_next_open_job_outside_session(
+        db=db,
+        job=job,
+        triggered_at=datetime(2026, 8, 19, 20, 30, tzinfo=UTC),
+    )
+
+    assert deferred is True
+    assert job.status == "scheduled"
+    assert job.attempts == 0
+    assert job.scheduled_for == datetime(2026, 8, 20, 13, 30, tzinfo=UTC)
+    assert "outside New York regular session" in (job.last_error or "")
+    db.close()
+    engine.dispose()
 
 
 def test_us_execution_handoff_backfills_provider_venue_and_identity_from_core_aliases() -> None:

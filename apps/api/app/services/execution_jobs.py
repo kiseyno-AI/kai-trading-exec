@@ -18,6 +18,7 @@ from app.core.config import Settings
 from app.models.runtime import BrokerOrder, ExecutionJob, ExecutionPlan, ExecutionPlanItem, new_id
 from app.services.broker_orders import place_broker_order
 from app.services.broker_auth import build_broker_adapter
+from app.services.monitoring_price_source import is_us_regular_session, next_us_regular_open
 from app.services.rejected_order_retries import (
     BROKER_ORDER_RETRY_JOB_TYPE,
     RetryOrderGuardError,
@@ -208,6 +209,13 @@ def dispatch_due_execution_jobs(
     serialized_jobs: list[dict[str, object]] = []
 
     for job in due_jobs:
+        if _defer_us_next_open_job_outside_session(
+            db=db,
+            job=job,
+            triggered_at=triggered_at,
+        ):
+            serialized_jobs.append(serialize_execution_job(job))
+            continue
         _claim_job(db=db, job=job, triggered_at=triggered_at)
         result = _dispatch_job(
             settings=settings,
@@ -792,6 +800,41 @@ def _is_due(job: ExecutionJob, triggered_at: datetime) -> bool:
     if scheduled_for is None:
         return True
     return _normalize_utc(scheduled_for) <= triggered_at
+
+
+def _defer_us_next_open_job_outside_session(
+    *,
+    db: Session,
+    job: ExecutionJob,
+    triggered_at: datetime,
+) -> bool:
+    if (
+        job.job_type not in {NEXT_OPEN_BUY_JOB_TYPE, BROKER_ORDER_RETRY_JOB_TYPE}
+        or job.plan_item.asset_class != "us_equity"
+    ):
+        return False
+    local = triggered_at.astimezone(US_EASTERN_TIMEZONE)
+    if is_us_regular_session(local):
+        return False
+    next_open = next_us_regular_open(triggered_at)
+    reason = f"deferred KIS US-equity order outside New York regular session until {next_open.isoformat()}"
+    job.scheduled_for = next_open
+    set_execution_job_status(
+        db=db,
+        job=job,
+        status="scheduled",
+        source="execution_job_dispatch",
+        last_error=reason,
+        plan_item_status=(
+            "next_open_buy_scheduled"
+            if job.job_type == NEXT_OPEN_BUY_JOB_TYPE
+            else _retrying_plan_item_status(job.job_type)
+        ),
+        reason=reason,
+        occurred_at=triggered_at,
+    )
+    db.commit()
+    return True
 
 
 def _dispatching_plan_item_status(job_type: str) -> str:

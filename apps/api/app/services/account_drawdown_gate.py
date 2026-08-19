@@ -130,7 +130,8 @@ def evaluate_us_equity_account_gate(
 ) -> AccountDrawdownDecision:
     observed_at = now or datetime.now(UTC)
     exposure = sum((_holding_market_value(holding) for holding in snapshot.holdings), Decimal("0"))
-    projected_exposure = exposure + order_notional
+    open_buy_notional, unknown_open_buy_count = _open_buy_notional(snapshot)
+    projected_exposure = exposure + open_buy_notional + order_notional
     daily_realized, weekly_realized = _us_realized_pnl(settings=settings, db=db, now=observed_at)
     unrealized = snapshot.unrealized_pnl or sum(
         (holding.unrealized_pnl or Decimal("0") for holding in snapshot.holdings),
@@ -150,6 +151,8 @@ def evaluate_us_equity_account_gate(
     metrics = {
         "currency": "USD",
         "current_exposure_usd": exposure,
+        "open_buy_notional_usd": open_buy_notional,
+        "open_buy_notional_unknown_count": unknown_open_buy_count,
         "projected_exposure_usd": projected_exposure,
         "daily_realized_pnl_usd": daily_realized,
         "weekly_realized_pnl_usd": weekly_realized,
@@ -158,6 +161,13 @@ def evaluate_us_equity_account_gate(
         "worst_holding_loss_pct": worst_holding_loss_pct,
     }
     gates = [
+        (
+            "us_open_buy_notional_unknown",
+            Decimal(unknown_open_buy_count),
+            Decimal("0"),
+            unknown_open_buy_count > 0,
+            "KIS US-equity open buy notional could not be determined",
+        ),
         (
             "us_total_exposure_usd",
             projected_exposure,
@@ -266,6 +276,20 @@ def _holding_market_value(holding: BrokerAccountHolding) -> Decimal:
     if holding.average_price is not None:
         return holding.average_price * Decimal(holding.quantity)
     return Decimal("0")
+
+
+def _open_buy_notional(snapshot: BrokerAccountSnapshot) -> tuple[Decimal, int]:
+    total = Decimal("0")
+    unknown_count = 0
+    for order in snapshot.open_orders:
+        remaining = order.remaining_quantity or 0
+        if order.side.lower() != "buy" or remaining <= 0:
+            continue
+        if order.limit_price is None or order.limit_price <= 0:
+            unknown_count += 1
+            continue
+        total += Decimal(remaining) * order.limit_price
+    return total, unknown_count
 
 
 def _us_realized_pnl(*, settings: Settings, db: Session, now: datetime) -> tuple[Decimal, Decimal]:

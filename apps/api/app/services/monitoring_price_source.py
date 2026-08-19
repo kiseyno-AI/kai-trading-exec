@@ -470,7 +470,7 @@ def _derive_orderability_context(
         if observed.tzinfo is None:
             observed = observed.replace(tzinfo=UTC)
         local = observed.astimezone(ZoneInfo("America/New_York"))
-        is_regular = _is_us_regular_session(local)
+        is_regular = is_us_regular_session(local)
         return {
             "session_type": "us_regular" if is_regular else "us_closed",
             "normal_ordering_available": is_regular,
@@ -500,11 +500,26 @@ def _derive_orderability_context(
     }
 
 
-def _is_us_regular_session(local: datetime) -> bool:
+def is_us_regular_session(local: datetime) -> bool:
     market_date = local.date()
     if market_date.weekday() >= 5 or market_date in _us_market_holidays(market_date.year):
         return False
     return datetime_time(9, 30) <= local.timetz().replace(tzinfo=None) < datetime_time(16, 0)
+
+
+def next_us_regular_open(observed_at: datetime) -> datetime:
+    observed = observed_at if observed_at.tzinfo is not None else observed_at.replace(tzinfo=UTC)
+    local = observed.astimezone(ZoneInfo("America/New_York"))
+    candidate_date = local.date()
+    local_open = datetime.combine(candidate_date, datetime_time(9, 30), tzinfo=local.tzinfo)
+    if is_us_regular_session(local_open) and local < local_open:
+        return local_open.astimezone(UTC)
+    candidate_date += timedelta(days=1)
+    while True:
+        local_open = datetime.combine(candidate_date, datetime_time(9, 30), tzinfo=local.tzinfo)
+        if is_us_regular_session(local_open):
+            return local_open.astimezone(UTC)
+        candidate_date += timedelta(days=1)
 
 
 def _us_market_holidays(year: int) -> set[date]:

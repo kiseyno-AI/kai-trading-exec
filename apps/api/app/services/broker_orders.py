@@ -674,7 +674,9 @@ def _validate_kis_us_equity_guardrails(
     if plan_item.provider != "kis" or plan_item.asset_class != "us_equity" or plan_item.venue != "kis":
         return "execution plan item must explicitly declare KIS US-equity provider metadata"
     notional = _order_notional(command=command, plan_item=plan_item)
-    if notional is None or notional > settings.kis_us_max_order_notional_usd:
+    if command.side == "buy" and (
+        notional is None or notional > settings.kis_us_max_order_notional_usd
+    ):
         return "KIS US-equity order exceeds its configured maximum USD notional"
     if settings.runtime_mode == "live":
         if not settings.kis_us_live_trading_enabled:
