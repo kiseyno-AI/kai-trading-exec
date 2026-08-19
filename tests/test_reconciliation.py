@@ -618,7 +618,101 @@ def test_reconcile_cumulative_filled_quantity_adds_only_delta() -> None:
     assert first["fills_added"] == 1
     assert second["fills_added"] == 1
     assert [fill.quantity for fill in fills] == [1, 1]
+    assert [fill.price for fill in fills] == [Decimal("70000"), Decimal("72000")]
+    assert [fill.quote_notional for fill in fills] == [Decimal("70000"), Decimal("72000")]
     assert sum(fill.quantity for fill in fills) == 2
+    engine.dispose()
+
+
+def test_reconcile_cumulative_base_fill_derives_incremental_price_from_notional_delta() -> None:
+    settings = Settings(database_url="sqlite:///:memory:", runtime_mode="paper")
+    engine, db = _session(settings)
+    order = _order(broker_order_id="alpaca-cumulative-base-1")
+    order.symbol = "BTC/USD"
+    db.add(order)
+    db.commit()
+    broker = ReconciliationStubBroker(
+        reconcile_payloads=[
+            {
+                "broker_order_id": "alpaca-cumulative-base-1",
+                "status": "partially_filled",
+                "filled_base_quantity": "1",
+                "average_fill_price": "100",
+                "filled_at": OBSERVED_AT.isoformat(),
+                "observed_at": OBSERVED_AT.isoformat(),
+            },
+            {
+                "broker_order_id": "alpaca-cumulative-base-1",
+                "status": "filled",
+                "filled_base_quantity": "2",
+                "average_fill_price": "150",
+                "filled_at": (OBSERVED_AT + timedelta(minutes=1)).isoformat(),
+                "observed_at": (OBSERVED_AT + timedelta(minutes=1)).isoformat(),
+            },
+        ]
+    )
+
+    first = reconcile_broker_order(settings=settings, db=db, adapter=broker, order=order)
+    second = reconcile_broker_order(settings=settings, db=db, adapter=broker, order=order)
+    repeated = reconcile_broker_order(settings=settings, db=db, adapter=broker, order=order)
+
+    fills = db.scalars(select(ExecutionFill).order_by(ExecutionFill.filled_at.asc())).all()
+    assert first["fills_added"] == 1
+    assert second["fills_added"] == 1
+    assert repeated["fills_added"] == 0
+    assert [fill.quantity for fill in fills] == [0, 0]
+    assert [fill.base_quantity for fill in fills] == [Decimal("1"), Decimal("1")]
+    assert [fill.quote_notional for fill in fills] == [Decimal("100"), Decimal("200")]
+    assert [fill.price for fill in fills] == [Decimal("100"), Decimal("200")]
+    assert fills[1].payload["price_derivation"] == "cumulative_notional_delta"
+    assert fills[1].payload["previous_quote_notional"] == "100.0000"
+    engine.dispose()
+
+
+def test_reconcile_cumulative_base_fill_skips_non_positive_incremental_notional_with_audit() -> None:
+    settings = Settings(database_url="sqlite:///:memory:", runtime_mode="paper")
+    engine, db = _session(settings)
+    order = _order(broker_order_id="alpaca-cumulative-anomaly-1")
+    order.symbol = "BTC/USD"
+    db.add(order)
+    db.commit()
+    broker = ReconciliationStubBroker(
+        reconcile_payloads=[
+            {
+                "broker_order_id": "alpaca-cumulative-anomaly-1",
+                "status": "partially_filled",
+                "filled_base_quantity": "1",
+                "average_fill_price": "100",
+                "filled_at": OBSERVED_AT.isoformat(),
+                "observed_at": OBSERVED_AT.isoformat(),
+            },
+            {
+                "broker_order_id": "alpaca-cumulative-anomaly-1",
+                "status": "partially_filled",
+                "filled_base_quantity": "2",
+                "average_fill_price": "40",
+                "filled_at": (OBSERVED_AT + timedelta(minutes=1)).isoformat(),
+                "observed_at": (OBSERVED_AT + timedelta(minutes=1)).isoformat(),
+            },
+        ]
+    )
+
+    first = reconcile_broker_order(settings=settings, db=db, adapter=broker, order=order)
+    second = reconcile_broker_order(settings=settings, db=db, adapter=broker, order=order)
+
+    fills = db.scalars(select(ExecutionFill).order_by(ExecutionFill.filled_at.asc())).all()
+    events = db.scalars(
+        select(BrokerOrderEvent)
+        .where(BrokerOrderEvent.event_type == "reconcile_result")
+        .order_by(BrokerOrderEvent.observed_at.asc(), BrokerOrderEvent.created_at.asc())
+    ).all()
+    assert first["fills_added"] == 1
+    assert second["fills_added"] == 0
+    assert len(fills) == 1
+    anomalies = events[-1].payload["fill_delta_anomalies"]
+    assert anomalies[0]["reason"] == "non_positive_incremental_notional"
+    assert anomalies[0]["quantity_basis"] == "base_quantity"
+    assert anomalies[0]["broker_order_id"] == "alpaca-cumulative-anomaly-1"
     engine.dispose()
 
 

@@ -473,7 +473,7 @@ def test_fractional_fill_is_persisted_without_integer_rounding() -> None:
         )
         db.add(order)
         db.flush()
-        fills = _parse_fills_from_payload(
+        fills, anomalies = _parse_fills_from_payload(
             payload={
                 "filled_base_quantity": "0.00037925",
                 "average_fill_price": "67234.12",
@@ -483,6 +483,7 @@ def test_fractional_fill_is_persisted_without_integer_rounding() -> None:
             observed_at=observed_at,
         )
 
+        assert anomalies == []
         assert _upsert_order_fills(db=db, order=order, fills=fills) == 1
         db.commit()
         db.refresh(order)
