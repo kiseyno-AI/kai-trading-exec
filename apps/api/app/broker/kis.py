@@ -875,7 +875,8 @@ class KisBrokerAdapter(BrokerAdapter):
                 classification=BrokerErrorClassification.VALIDATION,
             )
         observed_at = datetime.now(UTC)
-        balance_response = self.http_client.get_json(
+        balance_response = _get_overseas_paginated_json(
+            http_client=self.http_client,
             url=f"{config.api_base_url}{KIS_OVERSEAS_BALANCE_PATH}",
             headers=self.build_headers(
                 access_token,
@@ -883,15 +884,18 @@ class KisBrokerAdapter(BrokerAdapter):
             ),
             params=_overseas_balance_params(self.settings, exchange),
             timeout_seconds=self.settings.kis_request_timeout_seconds,
+            row_key="output1",
         )
-        open_orders_response = self.http_client.get_json(
+        open_orders_response = _get_overseas_paginated_json(
+            http_client=self.http_client,
             url=f"{config.api_base_url}{KIS_OVERSEAS_OPEN_ORDERS_PATH}",
             headers=self.build_headers(
                 access_token,
-                transaction_id="TTTS3018R",
+                transaction_id=_overseas_open_orders_transaction_id(self.settings.runtime_mode),
             ),
             params=_overseas_open_orders_params(self.settings, exchange),
             timeout_seconds=self.settings.kis_request_timeout_seconds,
+            row_key="output",
         )
         _raise_if_business_error(balance_response.payload)
         _raise_if_business_error(open_orders_response.payload)
@@ -1085,11 +1089,13 @@ class KisBrokerAdapter(BrokerAdapter):
             "tr_id": transaction_id,
             "params": params,
         }
-        response = self.http_client.get_json(
+        response = _get_overseas_paginated_json(
+            http_client=self.http_client,
             url=f"{config.api_base_url}{KIS_OVERSEAS_CCLD_PATH}",
             headers=self.build_headers(access_token, transaction_id=transaction_id),
             params=params,
             timeout_seconds=self.settings.kis_request_timeout_seconds,
+            row_key="output",
         )
         _raise_if_business_error(response.payload)
         normalized_order = _normalize_overseas_reconcile_order(
@@ -1780,6 +1786,94 @@ def _overseas_buying_power_transaction_id(runtime_mode: str) -> str:
 
 def _overseas_ccld_transaction_id(runtime_mode: str) -> str:
     return "TTTS3035R" if runtime_mode == "live" else "VTTS3035R"
+
+
+def _overseas_open_orders_transaction_id(runtime_mode: str) -> str:
+    return "TTTS3018R" if runtime_mode == "live" else "VTTS3018R"
+
+
+def _get_overseas_paginated_json(
+    *,
+    http_client: JsonHttpClient,
+    url: str,
+    headers: dict[str, str],
+    params: dict[str, object],
+    timeout_seconds: int,
+    row_key: str,
+    max_pages: int = 20,
+) -> JsonHttpResponse:
+    request_params = dict(params)
+    request_headers = dict(headers)
+    aggregate: dict[str, object] | None = None
+    last_response: JsonHttpResponse | None = None
+    for page_index in range(max_pages):
+        response = http_client.get_json(
+            url=url,
+            headers=request_headers,
+            params=request_params,
+            timeout_seconds=timeout_seconds,
+        )
+        _raise_if_business_error(response.payload)
+        last_response = response
+        if aggregate is None:
+            aggregate = dict(response.payload)
+        elif isinstance(response.payload.get(row_key), list):
+            existing = aggregate.get(row_key)
+            if not isinstance(existing, list):
+                existing = []
+                aggregate[row_key] = existing
+            existing.extend(response.payload[row_key])
+
+        continuation = str(
+            response.headers.get("tr_cont")
+            or response.headers.get("TR_CONT")
+            or ""
+        ).strip().upper()
+        if continuation not in {"F", "M"}:
+            return JsonHttpResponse(
+                status_code=response.status_code,
+                headers=response.headers,
+                payload=aggregate,
+            )
+        cursor = _overseas_cursor(response.payload)
+        if cursor is None:
+            raise BrokerAdapterError(
+                "KIS overseas response requested continuation without cursor fields",
+                status_code=502,
+                classification=BrokerErrorClassification.UNKNOWN,
+                response_payload=response.payload,
+            )
+        request_params["CTX_AREA_FK200"], request_params["CTX_AREA_NK200"] = cursor
+        request_headers["tr_cont"] = "N"
+        if page_index == max_pages - 1:
+            raise BrokerAdapterError(
+                f"KIS overseas pagination exceeded {max_pages} pages",
+                status_code=502,
+                classification=BrokerErrorClassification.UNKNOWN,
+            )
+    if aggregate is None or last_response is None:
+        raise BrokerAdapterError(
+            "KIS overseas pagination returned no response",
+            status_code=502,
+            classification=BrokerErrorClassification.UNKNOWN,
+        )
+    return JsonHttpResponse(last_response.status_code, last_response.headers, aggregate)
+
+
+def _overseas_cursor(payload: dict[str, object]) -> tuple[str, str] | None:
+    candidates: list[dict[str, object]] = [payload]
+    for value in payload.values():
+        if isinstance(value, dict):
+            candidates.append(value)
+        elif isinstance(value, list):
+            candidates.extend(row for row in value if isinstance(row, dict))
+    for candidate in candidates:
+        lowered = {str(key).lower(): value for key, value in candidate.items()}
+        fk = str(lowered.get("ctx_area_fk200") or "").strip()
+        nk = str(lowered.get("ctx_area_nk200") or "").strip()
+        if fk or nk:
+            return fk, nk
+    return None
 
 
 def _overseas_balance_params(settings: Settings, exchange: str) -> dict[str, object]:

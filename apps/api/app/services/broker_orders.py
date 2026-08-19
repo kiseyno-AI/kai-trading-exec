@@ -24,6 +24,7 @@ from app.services.account_drawdown_gate import (
     AccountDrawdownDecision,
     account_drawdown_uncertain_decision,
     evaluate_account_drawdown_gate,
+    evaluate_us_equity_account_gate,
     record_account_drawdown_block,
 )
 from app.services.broker_raw_holdings import snapshot_with_raw_balance_holdings
@@ -728,11 +729,6 @@ def _evaluate_new_buy_account_gate(
         return None
     if command.provider != "kis" and adapter.provider != "kis":
         return None
-    if command.asset_class == "us_equity":
-        # The domestic gate is KRW-denominated. US execution has its own USD
-        # notional and account controls and must not compare USD balances to KRW thresholds.
-        return None
-
     try:
         session_state = ensure_authenticated_broker_session(
             settings=settings,
@@ -757,6 +753,23 @@ def _evaluate_new_buy_account_gate(
         )
 
     observed_at = datetime.now(UTC)
+    if command.asset_class == "us_equity":
+        notional = _order_notional(command=command, plan_item=plan_item)
+        if notional is None:
+            return account_drawdown_uncertain_decision(
+                order_idempotency_key=command.idempotency_key,
+                execution_plan_item_id=plan_item.id if plan_item is not None else command.execution_plan_item_id,
+                reason="KIS US-equity account gate requires deterministic USD order notional",
+            )
+        return evaluate_us_equity_account_gate(
+            settings=settings,
+            db=db,
+            snapshot=snapshot,
+            order_notional=notional,
+            order_idempotency_key=command.idempotency_key,
+            execution_plan_item_id=plan_item.id if plan_item is not None else command.execution_plan_item_id,
+            now=observed_at,
+        )
     return evaluate_account_drawdown_gate(
         settings=settings,
         snapshot=snapshot_with_raw_balance_holdings(
@@ -1219,7 +1232,11 @@ def _order_notional(
     if command.quote_notional is not None:
         return command.quote_notional
     price = command.limit_price or _simulated_fill_price(command=command, plan_item=plan_item)
-    if command.base_quantity is None or price is None:
+    if price is None:
+        return None
+    if command.quantity is not None:
+        return Decimal(command.quantity) * price
+    if command.base_quantity is None:
         return None
     return (command.base_quantity * price).quantize(Decimal("0.0001"), rounding=ROUND_DOWN)
 

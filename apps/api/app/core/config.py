@@ -169,6 +169,12 @@ class Settings(BaseModel):
     kis_us_live_confirmation_token: str | None = None
     kis_us_account_allowlist: str = ""
     kis_us_max_order_notional_usd: Decimal = Field(default=Decimal("100"), gt=0)
+    kis_us_max_total_exposure_usd: Decimal = Field(default=Decimal("1000"), gt=0)
+    kis_us_daily_realized_loss_limit_usd: Decimal = Field(default=Decimal("25"), gt=0)
+    kis_us_weekly_realized_loss_limit_usd: Decimal = Field(default=Decimal("50"), gt=0)
+    kis_us_unrealized_loss_limit_usd: Decimal = Field(default=Decimal("50"), gt=0)
+    kis_us_unrealized_loss_pct: Decimal = Field(default=Decimal("5"), gt=0, le=Decimal("100"))
+    kis_us_severe_holding_loss_pct: Decimal = Field(default=Decimal("10"), gt=0, le=Decimal("100"))
     kis_us_preflight_buying_power_enabled: bool = True
     upbit_access_key: str | None = None
     upbit_secret_key: str | None = None
@@ -462,6 +468,12 @@ _ENV_FIELDS = {
     "KIS_US_LIVE_CONFIRMATION_TOKEN": "kis_us_live_confirmation_token",
     "KIS_US_ACCOUNT_ALLOWLIST": "kis_us_account_allowlist",
     "KIS_US_MAX_ORDER_NOTIONAL_USD": "kis_us_max_order_notional_usd",
+    "KIS_US_MAX_TOTAL_EXPOSURE_USD": "kis_us_max_total_exposure_usd",
+    "KIS_US_DAILY_REALIZED_LOSS_LIMIT_USD": "kis_us_daily_realized_loss_limit_usd",
+    "KIS_US_WEEKLY_REALIZED_LOSS_LIMIT_USD": "kis_us_weekly_realized_loss_limit_usd",
+    "KIS_US_UNREALIZED_LOSS_LIMIT_USD": "kis_us_unrealized_loss_limit_usd",
+    "KIS_US_UNREALIZED_LOSS_PCT": "kis_us_unrealized_loss_pct",
+    "KIS_US_SEVERE_HOLDING_LOSS_PCT": "kis_us_severe_holding_loss_pct",
     "KIS_US_PREFLIGHT_BUYING_POWER_ENABLED": "kis_us_preflight_buying_power_enabled",
     "UPBIT_ACCESS_KEY": "upbit_access_key",
     "UPBIT_SECRET_KEY": "upbit_secret_key",

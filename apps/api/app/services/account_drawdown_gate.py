@@ -1,19 +1,27 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, time, timedelta
 from decimal import Decimal
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.broker.base import BrokerAccountHolding, BrokerAccountSnapshot
 from app.core.config import Settings
-from app.models.runtime import BrokerOrder, ExecutionPlan, ExecutionPlanItem, ExecutionPlanItemAudit
+from app.models.runtime import (
+    BrokerOrder,
+    ExecutionFill,
+    ExecutionPlan,
+    ExecutionPlanItem,
+    ExecutionPlanItemAudit,
+)
 
 
 BLOCK_EVENT_TYPE = "account_drawdown_new_buy_blocked"
+US_EASTERN = ZoneInfo("America/New_York")
 
 
 @dataclass(frozen=True)
@@ -108,6 +116,205 @@ def evaluate_account_drawdown_gate(
             "metrics": _json_safe(metrics),
         },
     )
+
+
+def evaluate_us_equity_account_gate(
+    *,
+    settings: Settings,
+    db: Session,
+    snapshot: BrokerAccountSnapshot,
+    order_notional: Decimal,
+    order_idempotency_key: str,
+    execution_plan_item_id: str | None,
+    now: datetime | None = None,
+) -> AccountDrawdownDecision:
+    observed_at = now or datetime.now(UTC)
+    exposure = sum((_holding_market_value(holding) for holding in snapshot.holdings), Decimal("0"))
+    projected_exposure = exposure + order_notional
+    daily_realized, weekly_realized = _us_realized_pnl(settings=settings, db=db, now=observed_at)
+    unrealized = snapshot.unrealized_pnl or sum(
+        (holding.unrealized_pnl or Decimal("0") for holding in snapshot.holdings),
+        Decimal("0"),
+    )
+    unrealized_loss_pct = (
+        (-unrealized / exposure * Decimal("100")) if exposure > 0 and unrealized < 0 else Decimal("0")
+    )
+    worst_holding_loss_pct = max(
+        (
+            -(holding.unrealized_pnl_pct or Decimal("0"))
+            for holding in snapshot.holdings
+            if (holding.unrealized_pnl_pct or Decimal("0")) < 0
+        ),
+        default=Decimal("0"),
+    )
+    metrics = {
+        "currency": "USD",
+        "current_exposure_usd": exposure,
+        "projected_exposure_usd": projected_exposure,
+        "daily_realized_pnl_usd": daily_realized,
+        "weekly_realized_pnl_usd": weekly_realized,
+        "unrealized_pnl_usd": unrealized,
+        "unrealized_loss_pct": unrealized_loss_pct,
+        "worst_holding_loss_pct": worst_holding_loss_pct,
+    }
+    gates = [
+        (
+            "us_total_exposure_usd",
+            projected_exposure,
+            settings.kis_us_max_total_exposure_usd,
+            projected_exposure > settings.kis_us_max_total_exposure_usd,
+            "projected KIS US-equity exposure exceeds the USD cap",
+        ),
+        (
+            "us_daily_realized_loss_usd",
+            -daily_realized,
+            settings.kis_us_daily_realized_loss_limit_usd,
+            daily_realized <= -settings.kis_us_daily_realized_loss_limit_usd,
+            "KIS US-equity daily realized loss limit reached",
+        ),
+        (
+            "us_weekly_realized_loss_usd",
+            -weekly_realized,
+            settings.kis_us_weekly_realized_loss_limit_usd,
+            weekly_realized <= -settings.kis_us_weekly_realized_loss_limit_usd,
+            "KIS US-equity weekly realized loss limit reached",
+        ),
+        (
+            "us_unrealized_loss_usd",
+            -unrealized,
+            settings.kis_us_unrealized_loss_limit_usd,
+            unrealized <= -settings.kis_us_unrealized_loss_limit_usd,
+            "KIS US-equity unrealized loss limit reached",
+        ),
+        (
+            "us_unrealized_loss_pct",
+            unrealized_loss_pct,
+            settings.kis_us_unrealized_loss_pct,
+            unrealized_loss_pct >= settings.kis_us_unrealized_loss_pct,
+            "KIS US-equity unrealized loss percent limit reached",
+        ),
+        (
+            "us_severe_holding_loss_pct",
+            worst_holding_loss_pct,
+            settings.kis_us_severe_holding_loss_pct,
+            worst_holding_loss_pct >= settings.kis_us_severe_holding_loss_pct,
+            "KIS US-equity severe holding loss limit reached",
+        ),
+    ]
+    blocker = next((gate for gate in gates if gate[3]), None)
+    if blocker is None:
+        return AccountDrawdownDecision(
+            allowed=True,
+            gate_name=None,
+            reason=None,
+            current_metric=None,
+            threshold=None,
+            baseline_value=exposure,
+            baseline_timestamp=snapshot.observed_at.astimezone(UTC).isoformat(),
+            sells_risk_reduction_allowed=True,
+            summary={
+                "blocked": False,
+                "currency": "USD",
+                "order_idempotency_key": order_idempotency_key,
+                "execution_plan_item_id": execution_plan_item_id,
+            },
+            payload={
+                "blocked": False,
+                "evaluated_at": observed_at.isoformat(),
+                "metrics": _json_safe(metrics),
+            },
+        )
+    gate_name, current_metric, threshold, _, reason = blocker
+    summary = {
+        "gate_name": gate_name,
+        "reason": reason,
+        "currency": "USD",
+        "current_metric": _decimal_text(current_metric),
+        "threshold": _decimal_text(threshold),
+        "baseline_value": _decimal_text(exposure),
+        "baseline_timestamp": snapshot.observed_at.astimezone(UTC).isoformat(),
+        "order_idempotency_key": order_idempotency_key,
+        "execution_plan_item_id": execution_plan_item_id,
+        "sells_risk_reduction_allowed": True,
+    }
+    return AccountDrawdownDecision(
+        allowed=False,
+        gate_name=gate_name,
+        reason=reason,
+        current_metric=current_metric,
+        threshold=threshold,
+        baseline_value=exposure,
+        baseline_timestamp=summary["baseline_timestamp"],
+        sells_risk_reduction_allowed=True,
+        summary=summary,
+        payload={
+            "blocked": True,
+            "evaluated_at": observed_at.isoformat(),
+            "decision": summary,
+            "metrics": _json_safe(metrics),
+            "holdings": [_holding_payload(holding) for holding in snapshot.holdings],
+        },
+    )
+
+
+def _holding_market_value(holding: BrokerAccountHolding) -> Decimal:
+    payload = holding.payload if isinstance(holding.payload, dict) else {}
+    for key in ("ovrs_stck_evlu_amt", "market_value", "evaluation_amount"):
+        parsed = _decimal_or_none(payload.get(key))
+        if parsed is not None and parsed >= 0:
+            return parsed
+    if holding.average_price is not None:
+        return holding.average_price * Decimal(holding.quantity)
+    return Decimal("0")
+
+
+def _us_realized_pnl(*, settings: Settings, db: Session, now: datetime) -> tuple[Decimal, Decimal]:
+    local_now = now.astimezone(US_EASTERN)
+    day_start = datetime.combine(local_now.date(), time.min, tzinfo=US_EASTERN).astimezone(UTC)
+    week_start = datetime.combine(
+        local_now.date() - timedelta(days=local_now.weekday()),
+        time.min,
+        tzinfo=US_EASTERN,
+    ).astimezone(UTC)
+    fills = db.scalars(
+        select(ExecutionFill)
+        .join(BrokerOrder)
+        .where(
+            BrokerOrder.mode == settings.runtime_mode,
+            BrokerOrder.broker_name == "kis",
+            BrokerOrder.asset_class == "us_equity",
+            ExecutionFill.filled_at <= now,
+        )
+        .order_by(ExecutionFill.filled_at.asc(), ExecutionFill.id.asc())
+    ).all()
+    lots: dict[str, list[list[Decimal]]] = {}
+    daily = Decimal("0")
+    weekly = Decimal("0")
+    for fill in fills:
+        quantity = Decimal(fill.base_quantity) if fill.base_quantity is not None else Decimal(fill.quantity)
+        if fill.side.lower() == "buy":
+            lots.setdefault(fill.symbol, []).append([quantity, Decimal(fill.price)])
+            continue
+        if fill.side.lower() != "sell":
+            continue
+        remaining = quantity
+        symbol_lots = lots.setdefault(fill.symbol, [])
+        while remaining > 0 and symbol_lots:
+            lot = symbol_lots[0]
+            matched = min(remaining, lot[0])
+            pnl = (Decimal(fill.price) - lot[1]) * matched
+            filled_at = fill.filled_at
+            if filled_at.tzinfo is None:
+                filled_at = filled_at.replace(tzinfo=UTC)
+            if filled_at >= day_start:
+                daily += pnl
+            if filled_at >= week_start:
+                weekly += pnl
+            lot[0] -= matched
+            remaining -= matched
+            if lot[0] <= 0:
+                symbol_lots.pop(0)
+    return daily, weekly
 
 
 def record_account_drawdown_block(

@@ -1,14 +1,16 @@
 from __future__ import annotations
 
+import json
 from datetime import UTC, date, datetime
 from decimal import Decimal
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 from pydantic import ValidationError
 
 from app.api.schemas.execution import ExecutionPlanRequest, PlaceOrderRequest
-from app.broker.base import BrokerOrderPlacementRequest
+from app.broker.base import BrokerAccountHolding, BrokerAccountSnapshot, BrokerOrderPlacementRequest
 from app.broker.kis import (
     KIS_OVERSEAS_BALANCE_PATH,
     KIS_OVERSEAS_BUYING_POWER_PATH,
@@ -20,7 +22,15 @@ from app.broker.kis import (
     KisBrokerAdapter,
 )
 from app.core.config import Settings
-from app.services.broker_orders import _validate_kis_us_equity_guardrails
+from app.db.base import Base
+from app.db.session import create_db_engine, create_session_factory
+from app.services import broker_orders as broker_orders_module
+from app.services.account_drawdown_gate import evaluate_us_equity_account_gate
+from app.services.broker_orders import (
+    _evaluate_new_buy_account_gate,
+    _order_notional,
+    _validate_kis_us_equity_guardrails,
+)
 from app.services.execution_api import _build_execution_plan
 from app.services.execution_jobs import _build_place_order_request, materialize_execution_jobs
 from app.services.monitoring import materialize_monitoring_plan_items
@@ -30,7 +40,7 @@ class QueueHttpClient:
     def __init__(
         self,
         *,
-        get_payloads: list[dict[str, object]] | None = None,
+        get_payloads: list[dict[str, object] | JsonHttpResponse] | None = None,
         post_payload: dict[str, object] | None = None,
     ) -> None:
         self.get_payloads = list(get_payloads or [])
@@ -40,7 +50,10 @@ class QueueHttpClient:
 
     def get_json(self, **kwargs: object) -> JsonHttpResponse:
         self.get_calls.append(dict(kwargs))
-        return JsonHttpResponse(status_code=200, headers={}, payload=self.get_payloads.pop(0))
+        queued = self.get_payloads.pop(0)
+        if isinstance(queued, JsonHttpResponse):
+            return queued
+        return JsonHttpResponse(status_code=200, headers={}, payload=queued)
 
     def post_json(self, **kwargs: object) -> JsonHttpResponse:
         self.post_calls.append(dict(kwargs))
@@ -48,13 +61,16 @@ class QueueHttpClient:
 
 
 def _settings(**overrides: object) -> Settings:
+    values: dict[str, object] = {
+        "runtime_mode": "paper",
+        "kis_app_key": "app-key",
+        "kis_app_secret": "app-secret",
+        "kis_account_number": "12345678",
+        "kis_use_hashkey": False,
+    }
+    values.update(overrides)
     return Settings(
-        runtime_mode="paper",
-        kis_app_key="app-key",
-        kis_app_secret="app-secret",
-        kis_account_number="12345678",
-        kis_use_hashkey=False,
-        **overrides,
+        **values,
     )
 
 
@@ -183,10 +199,63 @@ def test_kis_us_equity_account_snapshot_combines_balance_orders_and_buying_power
         KIS_OVERSEAS_BUYING_POWER_PATH.rsplit("/", 1)[-1],
     ]
     assert snapshot.available_cash == Decimal("5000.50")
+    assert http.get_calls[1]["headers"]["tr_id"] == "VTTS3018R"
     assert snapshot.total_asset_value == Decimal("5403.20")
     assert snapshot.holdings[0].symbol == "AAPL"
     assert snapshot.open_orders[0].remaining_quantity == 2
     assert snapshot.symbol_buying_power["AAPL"].buyable_quantity == 24
+
+
+def test_kis_us_equity_live_open_orders_uses_live_transaction_id() -> None:
+    http = QueueHttpClient(
+        get_payloads=[
+            {"rt_cd": "0", "output1": [], "output2": {}},
+            {"rt_cd": "0", "output": []},
+        ]
+    )
+    adapter = KisBrokerAdapter(settings=_settings(runtime_mode="live"), http_client=http)
+
+    adapter.get_account_snapshot("token", exchange="NASD")
+
+    assert http.get_calls[1]["headers"]["tr_id"] == "TTTS3018R"
+
+
+def test_kis_us_equity_balance_follows_official_continuation_cursor() -> None:
+    http = QueueHttpClient(
+        get_payloads=[
+            JsonHttpResponse(
+                status_code=200,
+                headers={"tr_cont": "F"},
+                payload={
+                    "rt_cd": "0",
+                    "output1": [{"ovrs_pdno": "AAPL", "ovrs_cblc_qty": "1"}],
+                    "output2": {
+                        "frcr_dncl_amt_2": "500",
+                        "ctx_area_fk200": "cursor-fk",
+                        "ctx_area_nk200": "cursor-nk",
+                    },
+                },
+            ),
+            JsonHttpResponse(
+                status_code=200,
+                headers={"tr_cont": ""},
+                payload={
+                    "rt_cd": "0",
+                    "output1": [{"ovrs_pdno": "MSFT", "ovrs_cblc_qty": "2"}],
+                    "output2": {},
+                },
+            ),
+            {"rt_cd": "0", "output": []},
+        ]
+    )
+    adapter = KisBrokerAdapter(settings=_settings(), http_client=http)
+
+    snapshot = adapter.get_account_snapshot("token", exchange="NASD")
+
+    assert [holding.symbol for holding in snapshot.holdings] == ["AAPL", "MSFT"]
+    assert http.get_calls[1]["params"]["CTX_AREA_FK200"] == "cursor-fk"
+    assert http.get_calls[1]["params"]["CTX_AREA_NK200"] == "cursor-nk"
+    assert http.get_calls[1]["headers"]["tr_cont"] == "N"
 
 
 def test_kis_us_equity_reconciliation_normalizes_cumulative_fill() -> None:
@@ -276,12 +345,107 @@ def test_kis_us_equity_guard_is_disabled_by_default_and_caps_usd_notional() -> N
     assert "disabled" in (_validate_kis_us_equity_guardrails(
         settings=_settings(), adapter=adapter, command=command, plan_item=plan_item
     ) or "")
+    assert _order_notional(command=command, plan_item=plan_item) == Decimal("120.0000")
+    assert _validate_kis_us_equity_guardrails(
+        settings=_settings(kis_us_trading_enabled=True, kis_us_max_order_notional_usd=Decimal("120")),
+        adapter=adapter,
+        command=command,
+        plan_item=plan_item,
+    ) is None
     assert "maximum USD notional" in (_validate_kis_us_equity_guardrails(
         settings=_settings(kis_us_trading_enabled=True, kis_us_max_order_notional_usd=Decimal("100")),
         adapter=adapter,
         command=command,
         plan_item=plan_item,
     ) or "")
+
+
+def test_kis_us_equity_account_gate_blocks_projected_usd_exposure() -> None:
+    settings = _settings(
+        database_url="sqlite:///:memory:",
+        kis_us_max_total_exposure_usd=Decimal("500"),
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    db = create_session_factory(engine)()
+    snapshot = BrokerAccountSnapshot(
+        available_cash=Decimal("1000"),
+        observed_at=datetime(2026, 8, 19, 14, 0, tzinfo=UTC),
+        source="test",
+        holdings=[
+            BrokerAccountHolding(
+                symbol="AAPL",
+                quantity=2,
+                average_price=Decimal("200"),
+                payload={"ovrs_stck_evlu_amt": "450"},
+            )
+        ],
+    )
+
+    decision = evaluate_us_equity_account_gate(
+        settings=settings,
+        db=db,
+        snapshot=snapshot,
+        order_notional=Decimal("100"),
+        order_idempotency_key="us-exposure-test",
+        execution_plan_item_id="item-1",
+        now=datetime(2026, 8, 19, 14, 0, tzinfo=UTC),
+    )
+
+    assert decision.allowed is False
+    assert decision.gate_name == "us_total_exposure_usd"
+    assert decision.summary["currency"] == "USD"
+    db.close()
+    engine.dispose()
+
+
+def test_kis_us_equity_account_gate_uses_whole_share_notional(monkeypatch) -> None:
+    settings = _settings(
+        database_url="sqlite:///:memory:",
+        kis_us_max_total_exposure_usd=Decimal("150"),
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    db = create_session_factory(engine)()
+    snapshot = BrokerAccountSnapshot(
+        available_cash=Decimal("1000"),
+        observed_at=datetime(2026, 8, 19, 14, 0, tzinfo=UTC),
+        source="test",
+    )
+    adapter = SimpleNamespace(
+        provider="kis",
+        get_account_snapshot=lambda *_args, **_kwargs: snapshot,
+    )
+    monkeypatch.setattr(
+        broker_orders_module,
+        "ensure_authenticated_broker_session",
+        lambda **_kwargs: SimpleNamespace(access_token="token"),
+    )
+    command = PlaceOrderRequest(
+        idempotency_key="us-account-gate-quantity",
+        provider="kis",
+        asset_class="us_equity",
+        venue="kis",
+        symbol="AAPL",
+        side="buy",
+        quantity=2,
+        order_type="limit",
+        limit_price=Decimal("60"),
+        exchange="NASD",
+    )
+
+    decision = _evaluate_new_buy_account_gate(
+        settings=settings,
+        db=db,
+        adapter=adapter,
+        command=command,
+        plan_item=None,
+    )
+
+    assert decision is not None and decision.allowed is True
+    assert decision.payload["metrics"]["projected_exposure_usd"] == "120.0000"
+    db.close()
+    engine.dispose()
 
 
 def test_us_execution_handoff_preserves_route_and_schedules_new_york_open() -> None:
@@ -294,6 +458,7 @@ def test_us_execution_handoff_preserves_route_and_schedules_new_york_open() -> N
             items=[
                 {
                     "symbol": "AAPL",
+                    "core_item_key": "core-us-20260819:AAPL:entry",
                     "side": "buy",
                     "intent": "next_open_buy",
                     "quantity_policy": {"kind": "shares", "quantity": 1},
@@ -319,6 +484,7 @@ def test_us_execution_handoff_preserves_route_and_schedules_new_york_open() -> N
     item = plan.items[0]
     assert item.risk_context["exchange"] == "NASD"
     assert item.risk_context["currency"] == "USD"
+    assert item.source_plan_item_id == "core-us-20260819:AAPL:entry"
     assert item.jobs[0].scheduled_for == datetime(2026, 8, 19, 13, 30, tzinfo=UTC)
     request = _build_place_order_request(
         settings=_settings(kis_us_trading_enabled=True),
@@ -330,6 +496,32 @@ def test_us_execution_handoff_preserves_route_and_schedules_new_york_open() -> N
     assert request.asset_class == "us_equity"
     assert request.venue == "kis"
     assert request.exchange == "NASD"
+
+
+def test_us_execution_handoff_backfills_provider_venue_and_identity_from_core_aliases() -> None:
+    command = ExecutionPlanRequest(
+        plan_id="core-us-aliases-20260819",
+        source="kai-trading-core",
+        items=[
+            {
+                "symbol": "AAPL",
+                "core_item_key": "core-us-aliases:AAPL:entry",
+                "side": "buy",
+                "intent": "next_open_buy",
+                "quantity_policy": {"kind": "shares", "quantity": 1},
+                "broker": "kis",
+                "asset_class": "us_equity",
+                "market": "US",
+                "exchange": "NASD",
+                "currency": "USD",
+            }
+        ],
+    )
+
+    item = command.items[0]
+    assert item.provider == "kis"
+    assert item.venue == "kis"
+    assert item.source_plan_item_id == "core-us-aliases:AAPL:entry"
 
 
 def test_us_execution_plan_materializes_target_and_stop_monitoring() -> None:
@@ -395,3 +587,26 @@ def test_us_execution_plan_materializes_target_and_stop_monitoring() -> None:
     assert items["target_sell"].status == "target_sell_pending_config"
     assert items["stop_sell"].status == "stop_sell_pending_config"
     assert items["target_sell"].risk_context["exchange"] == "NASD"
+
+
+def test_real_core_v3_fixture_materializes_kis_us_job_and_protective_monitors() -> None:
+    payload = json.loads(
+        (Path(__file__).parent / "fixtures" / "core_us_execution_plan_v3.json").read_text()
+    )
+    plan = _build_execution_plan(
+        settings=_settings(kis_us_trading_enabled=True),
+        command=ExecutionPlanRequest.model_validate(payload),
+    )
+
+    materialize_execution_jobs(plan)
+    materialize_monitoring_plan_items(plan)
+
+    items = {item.intent: item for item in plan.items}
+    assert items["next_open_buy"].provider == "kis"
+    assert items["next_open_buy"].venue == "kis"
+    assert items["next_open_buy"].source_plan_item_id == "us:2026-08-19:AAPL:next_open_buy"
+    assert items["next_open_buy"].jobs[0].scheduled_for == datetime(2026, 8, 20, 13, 30, tzinfo=UTC)
+    assert items["target_sell"].status == "target_sell_pending_config"
+    assert items["stop_sell"].status == "stop_sell_pending_config"
+    assert items["target_sell"].risk_context["exchange"] == "NASD"
+    assert items["stop_sell"].risk_context["exchange"] == "NASD"

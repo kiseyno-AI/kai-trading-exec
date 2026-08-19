@@ -5193,7 +5193,7 @@ def _reconcile_before_monitoring(
     if not stale_symbols:
         return
     try:
-        sync_execution_positions_from_broker_snapshot(
+        _sync_positions_for_monitoring_routes(
             settings=settings,
             db=db,
             adapter=adapter,
@@ -5292,7 +5292,7 @@ def _refresh_position_truth_if_stale(
         if not missing_symbols:
             return
         try:
-            sync_execution_positions_from_broker_snapshot(
+            _sync_positions_for_monitoring_routes(
                 settings=settings,
                 db=db,
                 adapter=adapter,
@@ -5316,7 +5316,7 @@ def _refresh_position_truth_if_stale(
     if latest_reconciled_at is not None and _normalize_utc(latest_reconciled_at) >= stale_before:
         return
     try:
-        sync_execution_positions_from_broker_snapshot(
+        _sync_positions_for_monitoring_routes(
             settings=settings,
             db=db,
             adapter=adapter,
@@ -5324,6 +5324,75 @@ def _refresh_position_truth_if_stale(
         )
     except Exception:
         return
+
+
+def _sync_positions_for_monitoring_routes(
+    *,
+    settings: Settings,
+    db: Session,
+    adapter: BrokerAdapter,
+    symbols: set[str] | None,
+) -> None:
+    if str(getattr(adapter, "provider", "")).strip().lower() != "kis":
+        sync_execution_positions_from_broker_snapshot(
+            settings=settings,
+            db=db,
+            adapter=adapter,
+            symbols=symbols,
+        )
+        return
+
+    tracked_symbols = set(symbols or ())
+    if not tracked_symbols:
+        tracked_symbols.update(
+            str(symbol)
+            for symbol in db.scalars(
+                select(ExecutionPosition.symbol).where(
+                    ExecutionPosition.mode == settings.runtime_mode,
+                )
+            ).all()
+            if str(symbol).strip()
+        )
+    if not tracked_symbols:
+        return
+
+    latest_items: dict[str, ExecutionPlanItem] = {}
+    rows = db.scalars(
+        select(ExecutionPlanItem)
+        .join(ExecutionPlan)
+        .where(
+            ExecutionPlan.mode == settings.runtime_mode,
+            ExecutionPlanItem.symbol.in_(sorted(tracked_symbols)),
+            ExecutionPlanItem.provider == "kis",
+        )
+        .order_by(ExecutionPlanItem.created_at.desc(), ExecutionPlanItem.plan_item_index.desc())
+    ).all()
+    for item in rows:
+        latest_items.setdefault(item.symbol, item)
+
+    symbols_by_exchange: dict[str, set[str]] = {}
+    for symbol in sorted(tracked_symbols):
+        item = latest_items.get(symbol)
+        if item is None:
+            exchange = "KRX"
+        elif item.asset_class == "us_equity":
+            exchange = _plan_item_exchange(item)
+            if exchange not in {"NASD", "NYSE", "AMEX"}:
+                raise ValueError(
+                    f"KIS US-equity position sync requires an explicit overseas exchange for {symbol}"
+                )
+        else:
+            exchange = "KRX"
+        symbols_by_exchange.setdefault(exchange, set()).add(symbol)
+
+    for exchange, routed_symbols in sorted(symbols_by_exchange.items()):
+        sync_execution_positions_from_broker_snapshot(
+            settings=settings,
+            db=db,
+            adapter=adapter,
+            symbols=routed_symbols,
+            exchange=exchange,
+        )
 
 
 def _is_legacy_seeded_reconciliation_position(position: ExecutionPosition) -> bool:

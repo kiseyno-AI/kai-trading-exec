@@ -37,6 +37,16 @@ class ExecutionPlanItemRequest(BaseModel):
         normalized = dict(value)
         _copy_alias_value(
             normalized,
+            destination="provider",
+            aliases=("provider", "broker"),
+        )
+        _copy_alias_value(
+            normalized,
+            destination="venue",
+            aliases=("venue", "broker"),
+        )
+        _copy_alias_value(
+            normalized,
             destination="decision_agent_name",
             aliases=("decision_agent_name", "agent_name"),
         )
@@ -48,7 +58,7 @@ class ExecutionPlanItemRequest(BaseModel):
         _copy_alias_value(
             normalized,
             destination="source_plan_item_id",
-            aliases=("source_plan_item_id", "core_plan_item_id", "plan_item_id"),
+            aliases=("source_plan_item_id", "core_item_key", "core_plan_item_id", "plan_item_id"),
         )
         _copy_alias_value(
             normalized,
@@ -109,6 +119,29 @@ class ExecutionPlanRequest(BaseModel):
         if not normalized:
             raise ValueError("field must not be empty")
         return normalized
+
+    @model_validator(mode="after")
+    def require_us_kis_routing(self) -> "ExecutionPlanRequest":
+        for item in self.items:
+            extras = item.model_extra or {}
+            risk_context = item.risk_context if isinstance(item.risk_context, dict) else {}
+            market = str(extras.get("market") or risk_context.get("market") or "").strip().upper()
+            currency = str(extras.get("currency") or risk_context.get("currency") or "").strip().upper()
+            is_us_equity = item.asset_class == "us_equity" or market == "US" or currency == "USD"
+            if not is_us_equity:
+                continue
+            if item.provider is None:
+                raise ValueError("US equity execution requires an explicit provider")
+            if item.provider != "kis":
+                continue
+            if item.venue != "kis":
+                raise ValueError("US equity execution requires provider=kis and venue=kis")
+            if item.source_plan_item_id is None:
+                raise ValueError("US equity execution requires source_plan_item_id")
+            exchange = str(extras.get("exchange") or risk_context.get("exchange") or "").strip().upper()
+            if exchange not in {"NASD", "NYSE", "AMEX"}:
+                raise ValueError("US equity execution requires NASD, NYSE, or AMEX exchange")
+        return self
 
 
 class PlaceOrderRequest(BaseModel):
