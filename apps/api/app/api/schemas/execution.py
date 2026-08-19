@@ -199,8 +199,10 @@ class PlaceOrderRequest(BaseModel):
     @field_validator("exchange")
     @classmethod
     def validate_exchange(cls, value: str) -> str:
-        if value not in {"KRX", "NXT", "SOR", "UPBIT", "ALPACA", "US"}:
-            raise ValueError("exchange must be 'KRX', 'NXT', 'SOR', 'UPBIT', 'ALPACA', or 'US'")
+        if value not in {"KRX", "NXT", "SOR", "UPBIT", "ALPACA", "US", "NASD", "NYSE", "AMEX"}:
+            raise ValueError(
+                "exchange must be 'KRX', 'NXT', 'SOR', 'UPBIT', 'ALPACA', 'US', 'NASD', 'NYSE', or 'AMEX'"
+            )
         return value
 
     @model_validator(mode="after")
@@ -210,8 +212,18 @@ class PlaceOrderRequest(BaseModel):
         if self.order_type == "market" and self.limit_price is not None:
             raise ValueError("limit_price must be omitted for market orders")
         if self.asset_class == "us_equity":
-            if self.provider != "alpaca":
-                raise ValueError("US-equity orders require provider='alpaca'")
+            if self.provider not in {"alpaca", "kis"}:
+                raise ValueError("US-equity orders require provider='alpaca' or provider='kis'")
+            if self.provider == "kis":
+                if self.quantity is None or self.base_quantity is not None or self.quote_notional is not None:
+                    raise ValueError("KIS US-equity orders require integer quantity only")
+                if self.order_type != "limit":
+                    raise ValueError("KIS US-equity orders support limit orders only")
+                if self.exchange not in {"NASD", "NYSE", "AMEX"}:
+                    raise ValueError("KIS US-equity orders require exchange='NASD', 'NYSE', or 'AMEX'")
+                if self.time_in_force != "day":
+                    raise ValueError("KIS US-equity orders require time_in_force='day'")
+                return self
             sizing_fields = [
                 self.quantity is not None,
                 self.base_quantity is not None,

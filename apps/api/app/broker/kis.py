@@ -10,12 +10,14 @@ from typing import Any, Protocol
 from urllib.parse import urlencode
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+from zoneinfo import ZoneInfo
 
 from app.broker.base import (
     BrokerAdapter,
     BrokerAccountHolding,
     BrokerAccountOpenOrder,
     BrokerAccountSnapshot,
+    BrokerSymbolBuyingPower,
     BrokerAdapterError,
     BrokerConfig,
     BrokerCurrentPrice,
@@ -44,9 +46,17 @@ KIS_BALANCE_PATH = "/uapi/domestic-stock/v1/trading/inquire-balance"
 KIS_OPEN_ORDERS_PATH = "/uapi/domestic-stock/v1/trading/inquire-daily-ccld"
 KIS_DAILY_CCLD_PATH = "/uapi/domestic-stock/v1/trading/inquire-daily-ccld"
 KIS_ASKING_PRICE_PATH = "/uapi/domestic-stock/v1/quotations/inquire-asking-price-exp-ccn"
+KIS_OVERSEAS_ORDER_PATH = "/uapi/overseas-stock/v1/trading/order"
+KIS_OVERSEAS_CURRENT_PRICE_PATH = "/uapi/overseas-price/v1/quotations/price"
+KIS_OVERSEAS_BALANCE_PATH = "/uapi/overseas-stock/v1/trading/inquire-balance"
+KIS_OVERSEAS_OPEN_ORDERS_PATH = "/uapi/overseas-stock/v1/trading/inquire-nccs"
+KIS_OVERSEAS_CCLD_PATH = "/uapi/overseas-stock/v1/trading/inquire-ccnl"
+KIS_OVERSEAS_BUYING_POWER_PATH = "/uapi/overseas-stock/v1/trading/inquire-psamount"
 KIS_CURRENT_PRICE_TR_ID = "FHKST01010100"
 KIS_ASKING_PRICE_TR_ID = "FHKST01010200"
+KIS_OVERSEAS_CURRENT_PRICE_TR_ID = "HHDFS00000300"
 KIS_TIMEZONE = timezone(timedelta(hours=9))
+US_EASTERN_TIMEZONE = ZoneInfo("America/New_York")
 _DEFAULT_SSL_CONTEXT: ssl.SSLContext | None = None
 _DEFAULT_SSL_CONTEXT_LOCK = threading.Lock()
 
@@ -287,6 +297,8 @@ class KisBrokerAdapter(BrokerAdapter):
                 classification=BrokerErrorClassification.VALIDATION,
                 normalized_status=NormalizedBrokerOrderStatus.REJECTED,
             )
+        if request.asset_class == "us_equity":
+            return self._place_us_equity_order(access_token, request)
         tr_id = _transaction_id(self.settings.runtime_mode, request.side)
         request_payload = {
             "CANO": self.settings.kis_account_number or "",
@@ -391,6 +403,148 @@ class KisBrokerAdapter(BrokerAdapter):
             message=_optional_string(body.get("msg1")),
         )
 
+    def _place_us_equity_order(
+        self,
+        access_token: str,
+        request: BrokerOrderPlacementRequest,
+    ) -> BrokerOrderPlacement:
+        config = self._configured()
+        _validate_us_equity_order_request(request)
+        if request.side == "buy" and self.settings.kis_us_preflight_buying_power_enabled:
+            self._validate_us_equity_buying_power(access_token, request)
+        tr_id = _overseas_order_transaction_id(self.settings.runtime_mode, request.side)
+        request_payload = {
+            "CANO": self.settings.kis_account_number or "",
+            "ACNT_PRDT_CD": self.settings.kis_account_product_code,
+            "OVRS_EXCG_CD": request.exchange,
+            "PDNO": request.symbol,
+            "ORD_QTY": str(request.quantity),
+            "OVRS_ORD_UNPR": str(request.limit_price),
+            "CTAC_TLNO": "",
+            "MGCO_APTM_ODNO": "",
+            "SLL_TYPE": "00" if request.side == "sell" else "",
+            "ORD_SVR_DVSN_CD": "0",
+            "ORD_DVSN": "00",
+        }
+        hashkey = self._issue_hashkey(access_token, request_payload)
+        headers = self.build_headers(access_token, transaction_id=tr_id, hashkey=hashkey)
+        headers["tr_cont"] = ""
+        headers["custtype"] = self.settings.kis_customer_type
+        request_metadata = {
+            "provider": self.provider,
+            "endpoint": KIS_OVERSEAS_ORDER_PATH,
+            "method": "POST",
+            "tr_id": tr_id,
+            "requested_at": datetime.now(UTC).isoformat(),
+            "account_number_masked": _mask_account(self.settings.kis_account_number),
+            "account_product_code": self.settings.kis_account_product_code,
+            "asset_class": "us_equity",
+            "currency": "USD",
+            "route": {
+                "exchange": request.exchange,
+                "session": request.route_session or "regular",
+                "ord_dvsn": "00",
+                "reason": request.route_reason,
+            },
+        }
+        try:
+            response = self.http_client.post_json(
+                url=f"{config.api_base_url}{KIS_OVERSEAS_ORDER_PATH}",
+                headers=headers,
+                payload=request_payload,
+                timeout_seconds=self.settings.kis_request_timeout_seconds,
+            )
+        except BrokerAdapterError as exc:
+            raise BrokerAdapterError(
+                str(exc),
+                status_code=exc.status_code or 503,
+                classification=exc.classification,
+                retryable=exc.retryable,
+                code=exc.code,
+                normalized_status=exc.normalized_status,
+                request_metadata=request_metadata,
+                response_metadata=exc.response_metadata,
+                request_payload=request_payload,
+                response_payload=exc.response_payload,
+                observed_at=exc.observed_at,
+            ) from exc
+        body = response.payload
+        if _optional_string(body.get("rt_cd")) != "0":
+            raise _business_error(
+                payload=body,
+                request_metadata=request_metadata,
+                request_payload=request_payload,
+            )
+        output = body.get("output")
+        if not isinstance(output, dict):
+            raise BrokerAdapterError(
+                "KIS overseas order response is missing output payload",
+                status_code=502,
+                request_metadata=request_metadata,
+                request_payload=request_payload,
+                response_payload=body,
+            )
+        observed_at = datetime.now(UTC)
+        return BrokerOrderPlacement(
+            broker_order_id=_optional_string(output.get("ODNO")),
+            normalized_status=NormalizedBrokerOrderStatus.SUBMITTED,
+            broker_status=_optional_string(body.get("msg_cd")),
+            submitted_at=_submitted_at(output.get("ORD_TMD"), observed_at),
+            observed_at=observed_at,
+            request_metadata=request_metadata,
+            response_metadata={
+                "status_code": response.status_code,
+                "headers": _sanitize_headers(response.headers),
+                "rt_cd": body.get("rt_cd"),
+                "msg_cd": body.get("msg_cd"),
+                "msg1": body.get("msg1"),
+                "received_at": observed_at.isoformat(),
+            },
+            request_payload=request_payload,
+            response_payload=body,
+            message=_optional_string(body.get("msg1")),
+        )
+
+    def _validate_us_equity_buying_power(
+        self,
+        access_token: str,
+        request: BrokerOrderPlacementRequest,
+    ) -> None:
+        assert request.limit_price is not None and request.quantity is not None
+        config = self._configured()
+        response = self.http_client.get_json(
+            url=f"{config.api_base_url}{KIS_OVERSEAS_BUYING_POWER_PATH}",
+            headers=self.build_headers(
+                access_token,
+                transaction_id=_overseas_buying_power_transaction_id(self.settings.runtime_mode),
+            ),
+            params=_overseas_buying_power_params(
+                self.settings,
+                exchange=request.exchange,
+                symbol=request.symbol,
+                price=request.limit_price,
+            ),
+            timeout_seconds=self.settings.kis_request_timeout_seconds,
+        )
+        _raise_if_business_error(response.payload)
+        buying_power = _parse_overseas_buying_power(request.symbol, response.payload)
+        if buying_power is None or buying_power.buyable_quantity is None:
+            raise BrokerAdapterError(
+                "KIS overseas buying-power response is incomplete; buy blocked fail-closed",
+                status_code=502,
+                classification=BrokerErrorClassification.UNKNOWN,
+                normalized_status=NormalizedBrokerOrderStatus.REJECTED,
+                response_payload=response.payload,
+            )
+        if request.quantity > buying_power.buyable_quantity:
+            raise BrokerAdapterError(
+                "KIS US-equity buy quantity exceeds broker-reported buying power",
+                status_code=422,
+                classification=BrokerErrorClassification.BROKER_REJECTED,
+                normalized_status=NormalizedBrokerOrderStatus.REJECTED,
+                response_payload=response.payload,
+            )
+
     def get_current_price(
         self,
         access_token: str,
@@ -398,6 +552,12 @@ class KisBrokerAdapter(BrokerAdapter):
         symbol: str,
         exchange: str = "KRX",
     ) -> BrokerCurrentPrice | None:
+        if exchange in {"NASD", "NYSE", "AMEX"}:
+            return self._get_us_equity_current_price(
+                access_token,
+                symbol=symbol,
+                exchange=exchange,
+            )
         config = self._configured()
         request_metadata = {
             "provider": self.provider,
@@ -471,6 +631,43 @@ class KisBrokerAdapter(BrokerAdapter):
             price=price,
             observed_at=datetime.now(UTC),
             payload=body,
+        )
+
+    def _get_us_equity_current_price(
+        self,
+        access_token: str,
+        *,
+        symbol: str,
+        exchange: str,
+    ) -> BrokerCurrentPrice | None:
+        config = self._configured()
+        params = {"AUTH": "", "EXCD": _overseas_quote_exchange(exchange), "SYMB": symbol}
+        response = self.http_client.get_json(
+            url=f"{config.api_base_url}{KIS_OVERSEAS_CURRENT_PRICE_PATH}",
+            headers=self.build_headers(
+                access_token,
+                transaction_id=KIS_OVERSEAS_CURRENT_PRICE_TR_ID,
+            ),
+            params=params,
+            timeout_seconds=self.settings.kis_request_timeout_seconds,
+        )
+        _raise_if_business_error(response.payload)
+        output = _first_payload_object(response.payload, "output", "output1")
+        if output is None:
+            raise BrokerAdapterError(
+                "KIS overseas price response is missing output payload",
+                status_code=502,
+                response_payload=response.payload,
+            )
+        price = _first_decimal(output, "last", "stck_prpr", "clos")
+        if price is None or price <= 0:
+            return None
+        return BrokerCurrentPrice(
+            symbol=symbol,
+            exchange=exchange,
+            price=price,
+            observed_at=datetime.now(UTC),
+            payload=response.payload,
         )
 
     def get_live_market_context(
@@ -590,6 +787,13 @@ class KisBrokerAdapter(BrokerAdapter):
         reference_prices: dict[str, Decimal] | None = None,
         exchange: str = "KRX",
     ) -> BrokerAccountSnapshot:
+        if exchange in {"NASD", "NYSE", "AMEX"}:
+            return self._get_us_equity_account_snapshot(
+                access_token,
+                symbols=symbols,
+                reference_prices=reference_prices,
+                exchange=exchange,
+            )
         del symbols, reference_prices
         if exchange != "KRX":
             raise BrokerAdapterError(
@@ -655,6 +859,108 @@ class KisBrokerAdapter(BrokerAdapter):
             },
         )
 
+    def _get_us_equity_account_snapshot(
+        self,
+        access_token: str,
+        *,
+        symbols: list[str] | None,
+        reference_prices: dict[str, Decimal] | None,
+        exchange: str,
+    ) -> BrokerAccountSnapshot:
+        config = self._configured()
+        if not self.settings.kis_account_number:
+            raise BrokerAdapterError(
+                "KIS account number is not configured",
+                status_code=409,
+                classification=BrokerErrorClassification.VALIDATION,
+            )
+        observed_at = datetime.now(UTC)
+        balance_response = self.http_client.get_json(
+            url=f"{config.api_base_url}{KIS_OVERSEAS_BALANCE_PATH}",
+            headers=self.build_headers(
+                access_token,
+                transaction_id=_overseas_balance_transaction_id(self.settings.runtime_mode),
+            ),
+            params=_overseas_balance_params(self.settings, exchange),
+            timeout_seconds=self.settings.kis_request_timeout_seconds,
+        )
+        open_orders_response = self.http_client.get_json(
+            url=f"{config.api_base_url}{KIS_OVERSEAS_OPEN_ORDERS_PATH}",
+            headers=self.build_headers(
+                access_token,
+                transaction_id="TTTS3018R",
+            ),
+            params=_overseas_open_orders_params(self.settings, exchange),
+            timeout_seconds=self.settings.kis_request_timeout_seconds,
+        )
+        _raise_if_business_error(balance_response.payload)
+        _raise_if_business_error(open_orders_response.payload)
+
+        symbol_buying_power = {}
+        prices = reference_prices or {}
+        for symbol in list(dict.fromkeys(symbols or []))[:20]:
+            reference_price = prices.get(symbol)
+            if reference_price is None or reference_price <= 0:
+                continue
+            buying_power_response = self.http_client.get_json(
+                url=f"{config.api_base_url}{KIS_OVERSEAS_BUYING_POWER_PATH}",
+                headers=self.build_headers(
+                    access_token,
+                    transaction_id=_overseas_buying_power_transaction_id(self.settings.runtime_mode),
+                ),
+                params=_overseas_buying_power_params(
+                    self.settings,
+                    exchange=exchange,
+                    symbol=symbol,
+                    price=reference_price,
+                ),
+                timeout_seconds=self.settings.kis_request_timeout_seconds,
+            )
+            _raise_if_business_error(buying_power_response.payload)
+            buying_power = _parse_overseas_buying_power(symbol, buying_power_response.payload)
+            if buying_power is not None:
+                symbol_buying_power[symbol] = buying_power
+
+        available_cash = next(
+            (
+                value.available_cash
+                for value in symbol_buying_power.values()
+                if value.available_cash is not None
+            ),
+            _parse_overseas_available_cash(balance_response.payload),
+        )
+        holdings = _parse_overseas_holdings(balance_response.payload)
+        unrealized_pnl = sum(
+            (holding.unrealized_pnl or Decimal("0") for holding in holdings),
+            Decimal("0"),
+        )
+        securities_value = sum(
+            (
+                _parse_decimal(holding.payload.get("ovrs_stck_evlu_amt")) or Decimal("0")
+                for holding in holdings
+            ),
+            Decimal("0"),
+        )
+        total_asset_value = securities_value + available_cash if available_cash is not None else None
+        return BrokerAccountSnapshot(
+            available_cash=available_cash,
+            buying_power=available_cash,
+            total_asset_value=total_asset_value,
+            unrealized_pnl=unrealized_pnl,
+            observed_at=observed_at,
+            source=f"{self.provider}:us_equity_account_snapshot",
+            holdings=holdings,
+            open_orders=_parse_overseas_open_orders(open_orders_response.payload),
+            symbol_buying_power=symbol_buying_power,
+            payload={
+                "currency": "USD",
+                "exchange": exchange,
+                "balance": balance_response.payload,
+                "open_orders": open_orders_response.payload,
+                "account_number_masked": _mask_account(self.settings.kis_account_number),
+            },
+        )
+
     def reconnect_handle(self) -> BrokerReconnectHandle:
         return BrokerReconnectHandle(
             supported=True,
@@ -673,6 +979,13 @@ class KisBrokerAdapter(BrokerAdapter):
         exchange: str = "KRX",
         submitted_at: datetime | None = None,
     ) -> dict[str, Any] | None:
+        if exchange in {"NASD", "NYSE", "AMEX"}:
+            return self._reconcile_us_equity_order(
+                access_token,
+                broker_order_id,
+                exchange=exchange,
+                submitted_at=submitted_at,
+            )
         config = self._configured()
         observed_at = datetime.now(UTC)
         transaction_id = _daily_ccld_transaction_id(self.settings.runtime_mode)
@@ -746,6 +1059,70 @@ class KisBrokerAdapter(BrokerAdapter):
             "payload": {
                 "order": normalized_order["raw"],
             },
+            "message": normalized_order["message"],
+        }
+
+    def _reconcile_us_equity_order(
+        self,
+        access_token: str,
+        broker_order_id: str,
+        *,
+        exchange: str,
+        submitted_at: datetime | None,
+    ) -> dict[str, Any]:
+        config = self._configured()
+        observed_at = datetime.now(UTC)
+        params = _overseas_reconcile_params(
+            self.settings,
+            exchange=exchange,
+            submitted_at=submitted_at,
+            observed_at=observed_at,
+        )
+        transaction_id = _overseas_ccld_transaction_id(self.settings.runtime_mode)
+        request_metadata = {
+            "provider": self.provider,
+            "endpoint": KIS_OVERSEAS_CCLD_PATH,
+            "tr_id": transaction_id,
+            "params": params,
+        }
+        response = self.http_client.get_json(
+            url=f"{config.api_base_url}{KIS_OVERSEAS_CCLD_PATH}",
+            headers=self.build_headers(access_token, transaction_id=transaction_id),
+            params=params,
+            timeout_seconds=self.settings.kis_request_timeout_seconds,
+        )
+        _raise_if_business_error(response.payload)
+        normalized_order = _normalize_overseas_reconcile_order(
+            response.payload,
+            broker_order_id,
+            observed_at=observed_at,
+        )
+        if normalized_order is None:
+            return {
+                "provider": self.provider,
+                "broker_order_id": broker_order_id,
+                "status": "unknown",
+                "broker_status": "unknown",
+                "observed_at": observed_at.isoformat(),
+                "request_metadata": request_metadata,
+                "response_metadata": {"status_code": response.status_code},
+                "message": "matching overseas order was not found in broker order query",
+                "payload": {"output": _safe_reconcile_payload(response.payload)},
+            }
+        return {
+            "provider": self.provider,
+            "broker_order_id": broker_order_id,
+            "status": normalized_order["status"],
+            "broker_status": normalized_order["broker_status"],
+            "requested_quantity": normalized_order["requested_quantity"],
+            "remaining_quantity": normalized_order["remaining_quantity"],
+            "filled_quantity": normalized_order["filled_quantity"],
+            "average_fill_price": normalized_order["average_fill_price"],
+            "filled_at": normalized_order["filled_at"].isoformat(),
+            "observed_at": observed_at.isoformat(),
+            "request_metadata": request_metadata,
+            "response_metadata": {"status_code": response.status_code},
+            "payload": {"order": normalized_order["raw"]},
             "message": normalized_order["message"],
         }
 
@@ -863,6 +1240,54 @@ def _normalize_reconcile_order(
                 or _optional_string(row.get("ord_sts_name"))
             ),
         )
+    return None
+
+
+def _normalize_overseas_reconcile_order(
+    payload: dict[str, object],
+    broker_order_id: str,
+    *,
+    observed_at: datetime,
+) -> dict[str, object] | None:
+    for row in _payload_rows(payload.get("output")):
+        row_order_id = _optional_string(row.get("odno")) or _optional_string(row.get("ord_no"))
+        if row_order_id != broker_order_id:
+            continue
+        requested_quantity = _parse_int(row.get("ft_ord_qty")) or _parse_int(row.get("ord_qty"))
+        if requested_quantity is None or requested_quantity <= 0:
+            return None
+        filled_quantity = _parse_int(row.get("ft_ccld_qty")) or 0
+        remaining_quantity = _parse_int(row.get("nccs_qty"))
+        if remaining_quantity is None:
+            remaining_quantity = max(requested_quantity - filled_quantity, 0)
+        raw_status = (
+            _rejection_status_from_order_kind(row)
+            or _optional_string(row.get("prcs_stat_name"))
+            or _optional_string(row.get("rvse_cncl_dvsn_name"))
+        )
+        status = _normalize_reconcile_status(
+            raw_status=raw_status,
+            requested_quantity=requested_quantity,
+            remaining_quantity=remaining_quantity,
+            filled_quantity=filled_quantity,
+        )
+        return {
+            "status": status,
+            "broker_status": raw_status or status,
+            "requested_quantity": requested_quantity,
+            "remaining_quantity": remaining_quantity,
+            "filled_quantity": filled_quantity,
+            "average_fill_price": _first_decimal(
+                row,
+                "ft_ccld_unpr3",
+                "avg_pric",
+                "ft_ord_unpr3",
+            ),
+            "filled_at": _reconcile_filled_timestamp(row, observed_at=observed_at),
+            "raw": _safe_reconcile_payload(row),
+            "observed_at": observed_at,
+            "message": None,
+        }
     return None
 
 
@@ -1304,6 +1729,127 @@ def _transaction_id(runtime_mode: str, side: str) -> str:
     return "TTTC0012U" if live else "VTTC0012U"
 
 
+def _validate_us_equity_order_request(request: BrokerOrderPlacementRequest) -> None:
+    if request.exchange not in {"NASD", "NYSE", "AMEX"}:
+        raise BrokerAdapterError(
+            "KIS US-equity order requires NASD, NYSE, or AMEX exchange code",
+            status_code=422,
+            classification=BrokerErrorClassification.VALIDATION,
+            normalized_status=NormalizedBrokerOrderStatus.REJECTED,
+        )
+    if request.order_type != "limit" or request.time_in_force != "day":
+        raise BrokerAdapterError(
+            "KIS US-equity order supports day limit orders only",
+            status_code=422,
+            classification=BrokerErrorClassification.VALIDATION,
+            normalized_status=NormalizedBrokerOrderStatus.REJECTED,
+        )
+    if request.quantity is None or request.quantity <= 0 or request.limit_price is None:
+        raise BrokerAdapterError(
+            "KIS US-equity order requires whole-share quantity and limit price",
+            status_code=422,
+            classification=BrokerErrorClassification.VALIDATION,
+            normalized_status=NormalizedBrokerOrderStatus.REJECTED,
+        )
+
+
+def _overseas_order_transaction_id(runtime_mode: str, side: str) -> str:
+    if runtime_mode == "live":
+        return "TTTT1006U" if side == "sell" else "TTTT1002U"
+    return "VTTT1001U" if side == "sell" else "VTTT1002U"
+
+
+def _overseas_quote_exchange(exchange: str) -> str:
+    try:
+        return {"NASD": "NAS", "NYSE": "NYS", "AMEX": "AMS"}[exchange]
+    except KeyError as exc:
+        raise BrokerAdapterError(
+            f"unsupported KIS overseas quote exchange: {exchange}",
+            status_code=422,
+            classification=BrokerErrorClassification.VALIDATION,
+        ) from exc
+
+
+def _overseas_balance_transaction_id(runtime_mode: str) -> str:
+    return "TTTS3012R" if runtime_mode == "live" else "VTTS3012R"
+
+
+def _overseas_buying_power_transaction_id(runtime_mode: str) -> str:
+    return "TTTS3007R" if runtime_mode == "live" else "VTTS3007R"
+
+
+def _overseas_ccld_transaction_id(runtime_mode: str) -> str:
+    return "TTTS3035R" if runtime_mode == "live" else "VTTS3035R"
+
+
+def _overseas_balance_params(settings: Settings, exchange: str) -> dict[str, object]:
+    return {
+        "CANO": settings.kis_account_number or "",
+        "ACNT_PRDT_CD": settings.kis_account_product_code,
+        "OVRS_EXCG_CD": exchange,
+        "TR_CRCY_CD": "USD",
+        "CTX_AREA_FK200": "",
+        "CTX_AREA_NK200": "",
+    }
+
+
+def _overseas_open_orders_params(settings: Settings, exchange: str) -> dict[str, object]:
+    return {
+        "CANO": settings.kis_account_number or "",
+        "ACNT_PRDT_CD": settings.kis_account_product_code,
+        "OVRS_EXCG_CD": exchange,
+        "SORT_SQN": "DS",
+        "CTX_AREA_FK200": "",
+        "CTX_AREA_NK200": "",
+    }
+
+
+def _overseas_buying_power_params(
+    settings: Settings,
+    *,
+    exchange: str,
+    symbol: str,
+    price: Decimal,
+) -> dict[str, object]:
+    return {
+        "CANO": settings.kis_account_number or "",
+        "ACNT_PRDT_CD": settings.kis_account_product_code,
+        "OVRS_EXCG_CD": exchange,
+        "OVRS_ORD_UNPR": str(price),
+        "ITEM_CD": symbol,
+    }
+
+
+def _overseas_reconcile_params(
+    settings: Settings,
+    *,
+    exchange: str,
+    submitted_at: datetime | None,
+    observed_at: datetime,
+) -> dict[str, object]:
+    end_date = observed_at.astimezone(US_EASTERN_TIMEZONE).date()
+    start_date = submitted_at.astimezone(US_EASTERN_TIMEZONE).date() if submitted_at else end_date
+    if start_date > end_date:
+        start_date = end_date
+    is_paper = settings.runtime_mode != "live"
+    return {
+        "CANO": settings.kis_account_number or "",
+        "ACNT_PRDT_CD": settings.kis_account_product_code,
+        "PDNO": "" if is_paper else "%",
+        "ORD_STRT_DT": start_date.strftime("%Y%m%d"),
+        "ORD_END_DT": end_date.strftime("%Y%m%d"),
+        "SLL_BUY_DVSN": "00",
+        "CCLD_NCCS_DVSN": "00",
+        "OVRS_EXCG_CD": "" if is_paper else exchange,
+        "SORT_SQN": "DS",
+        "ORD_DT": "",
+        "ORD_GNO_BRNO": "",
+        "ODNO": "",
+        "CTX_AREA_NK200": "",
+        "CTX_AREA_FK200": "",
+    }
+
+
 def _balance_transaction_id(runtime_mode: str) -> str:
     return "TTTC8434R" if runtime_mode == "live" else "VTTC8434R"
 
@@ -1455,6 +2001,94 @@ def _parse_open_orders(payload: dict[str, object]) -> list[BrokerAccountOpenOrde
             )
         )
     return open_orders
+
+
+def _parse_overseas_holdings(payload: dict[str, object]) -> list[BrokerAccountHolding]:
+    holdings: list[BrokerAccountHolding] = []
+    for row in _payload_rows(payload.get("output1")):
+        symbol = _optional_string(row.get("ovrs_pdno")) or _optional_string(row.get("pdno"))
+        quantity = _parse_int(row.get("ovrs_cblc_qty"))
+        if symbol is None or quantity is None or quantity <= 0:
+            continue
+        holdings.append(
+            BrokerAccountHolding(
+                symbol=symbol.strip().upper(),
+                quantity=quantity,
+                average_price=_parse_decimal(row.get("pchs_avg_pric")),
+                sellable_quantity=_parse_int(row.get("ord_psbl_qty")),
+                unrealized_pnl=_parse_decimal(row.get("frcr_evlu_pfls_amt")),
+                unrealized_pnl_pct=_parse_decimal(row.get("evlu_pfls_rt")),
+                payload=dict(row),
+            )
+        )
+    return holdings
+
+
+def _parse_overseas_open_orders(payload: dict[str, object]) -> list[BrokerAccountOpenOrder]:
+    open_orders: list[BrokerAccountOpenOrder] = []
+    for row in _payload_rows(payload.get("output")):
+        symbol = _optional_string(row.get("pdno"))
+        quantity = _parse_int(row.get("ft_ord_qty")) or _parse_int(row.get("ord_qty"))
+        remaining_quantity = _parse_int(row.get("nccs_qty"))
+        if symbol is None or quantity is None or quantity <= 0:
+            continue
+        if remaining_quantity is None:
+            remaining_quantity = max(quantity - (_parse_int(row.get("ft_ccld_qty")) or 0), 0)
+        if remaining_quantity <= 0:
+            continue
+        open_orders.append(
+            BrokerAccountOpenOrder(
+                symbol=symbol.strip().upper(),
+                side=_parse_order_side(row),
+                quantity=quantity,
+                remaining_quantity=remaining_quantity,
+                status=_optional_string(row.get("prcs_stat_name")) or "open",
+                broker_order_id=_optional_string(row.get("odno")),
+                limit_price=_first_decimal(row, "ft_ord_unpr3", "ovrs_ord_unpr"),
+                payload=dict(row),
+            )
+        )
+    return open_orders
+
+
+def _parse_overseas_available_cash(payload: dict[str, object]) -> Decimal | None:
+    for row in _payload_rows(payload.get("output2")):
+        value = _first_decimal(
+            row,
+            "ord_psbl_frcr_amt",
+            "frcr_ord_psbl_amt1",
+            "frcr_dncl_amt_2",
+            "frcr_dncl_amt",
+        )
+        if value is not None and value >= 0:
+            return value
+    return None
+
+
+def _parse_overseas_buying_power(
+    symbol: str,
+    payload: dict[str, object],
+) -> BrokerSymbolBuyingPower | None:
+    output = _first_payload_object(payload, "output", "output1")
+    if output is None:
+        return None
+    available_cash = _first_decimal(
+        output,
+        "ord_psbl_frcr_amt",
+        "frcr_ord_psbl_amt1",
+        "ovrs_ord_psbl_amt",
+    )
+    buying_power = _first_decimal(output, "ovrs_ord_psbl_amt", "ord_psbl_frcr_amt")
+    buyable_quantity = _parse_int(output.get("max_ord_psbl_qty")) or _parse_int(
+        output.get("ovrs_max_ord_psbl_qty")
+    )
+    return BrokerSymbolBuyingPower(
+        symbol=symbol,
+        available_cash=available_cash,
+        buying_power=buying_power,
+        buyable_quantity=buyable_quantity,
+        payload=dict(output),
+    )
 
 
 def _payload_rows(value: object) -> list[dict[str, object]]:

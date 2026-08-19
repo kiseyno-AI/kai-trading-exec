@@ -35,6 +35,7 @@ from app.services.runtime_transitions import set_execution_job_status
 LOGGER = logging.getLogger(__name__)
 
 KRX_TIMEZONE = ZoneInfo("Asia/Seoul")
+US_EASTERN_TIMEZONE = ZoneInfo("America/New_York")
 NEXT_OPEN_BUY_JOB_TYPE = "next_open_buy"
 CRYPTO_PAPER_ORDER_JOB_TYPE = "crypto_paper_order"
 UPBIT_PAPER_ALLOWED_SYMBOLS = frozenset({"KRW-BTC", "KRW-ETH"})
@@ -79,11 +80,16 @@ def materialize_execution_jobs(plan: ExecutionPlan) -> None:
             continue
         if item.intent != NEXT_OPEN_BUY_JOB_TYPE or item.status != "pending":
             continue
-        if _next_open_buy_quantity(item) is None or plan.market_date is None or item.side != "buy":
+        if (
+            _next_open_buy_quantity(item) is None
+            or plan.market_date is None
+            or item.side != "buy"
+            or (item.asset_class == "us_equity" and item.limit_price is None)
+        ):
             item.status = "next_open_buy_pending_configuration"
             continue
         item.status = "next_open_buy_scheduled"
-        scheduled_for = _next_market_open_utc(plan.market_date)
+        scheduled_for = _next_market_open_utc(plan.market_date, plan_item=item)
         item.jobs.append(
             ExecutionJob(
                 id=new_id(),
@@ -575,6 +581,9 @@ def _build_place_order_request(
     return PlaceOrderRequest(
         idempotency_key=_place_order_idempotency_key(job),
         execution_plan_item_id=plan_item.id,
+        provider=plan_item.provider or "kis",
+        asset_class=plan_item.asset_class or "stock",
+        venue=plan_item.venue,
         symbol=plan_item.symbol,
         side=plan_item.side,
         quantity=quantity,
@@ -747,7 +756,18 @@ def _crypto_paper_fill_price(item: ExecutionPlanItem) -> Decimal | None:
     return None
 
 
-def _next_market_open_utc(market_date: date) -> datetime:
+def _next_market_open_utc(
+    market_date: date,
+    *,
+    plan_item: ExecutionPlanItem | None = None,
+) -> datetime:
+    if plan_item is not None and plan_item.asset_class == "us_equity":
+        local_open = datetime.combine(
+            market_date,
+            time(hour=9, minute=30),
+            tzinfo=US_EASTERN_TIMEZONE,
+        )
+        return local_open.astimezone(UTC)
     local_open = datetime.combine(
         market_date,
         time(hour=9, minute=0),

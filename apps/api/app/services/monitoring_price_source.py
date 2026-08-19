@@ -6,12 +6,14 @@ import threading
 import time
 from typing import Callable
 
+from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.api.schemas.execution import MonitoringPriceRequest
 from app.broker.base import BrokerAdapter, BrokerCurrentPrice, BrokerLiveMarketContext
 from app.core.config import Settings
+from app.models.runtime import ExecutionPlan, ExecutionPlanItem
 from app.services.broker_auth import ensure_authenticated_broker_session
 from app.services.domestic_order_router import resolve_domestic_order_route
 
@@ -117,6 +119,11 @@ class KisCurrentQuoteMonitoringPriceSource:
                     adapter=broker_adapter,
                 )
                 access_token = session_state.access_token or ""
+                exchange_by_symbol = _load_monitoring_exchange_by_symbol(
+                    db=db,
+                    mode=settings.runtime_mode,
+                    symbols=unique_symbols,
+                )
                 prices: list[MonitoringPriceRequest] = []
                 priced_symbols: list[str] = []
                 failures: list[dict[str, str]] = []
@@ -132,7 +139,7 @@ class KisCurrentQuoteMonitoringPriceSource:
                             worker_adapter.get_current_price(
                                 access_token,
                                 symbol=symbol,
-                                exchange="KRX",
+                                exchange=exchange_by_symbol.get(symbol, "KRX"),
                             ),
                             None,
                         )
@@ -246,6 +253,7 @@ class KisCurrentQuoteMonitoringPriceSource:
                     "context_failure_count": context_failure_count,
                     "context_failures_truncated": context_failure_count > len(context_failures),
                     "quote_batch_timed_out": batch_timed_out,
+                    "exchange_by_symbol": exchange_by_symbol,
                 }
                 return prices
         finally:
@@ -293,14 +301,44 @@ def _market_quality_from_quote_payload(payload: dict[str, object]) -> dict[str, 
         "spread_bps": _first_value(output, "spread_bps", "spread_bp"),
         "orderbook_depth": _first_value(output, "orderbook_depth", "book_depth", "total_depth"),
         "orderbook_imbalance": _first_value(output, "orderbook_imbalance", "book_imbalance"),
-        "volume": _first_value(output, "volume", "accumulated_volume", "acml_vol"),
+        "volume": _first_value(output, "volume", "accumulated_volume", "acml_vol", "tvol"),
         "turnover": _first_value(output, "turnover", "trading_value", "acml_tr_pbmn"),
-        "day_high": _first_value(output, "day_high", "intraday_high", "high_price", "stck_hgpr"),
-        "day_low": _first_value(output, "day_low", "intraday_low", "low_price", "stck_lwpr"),
+        "day_high": _first_value(output, "day_high", "intraday_high", "high_price", "stck_hgpr", "high"),
+        "day_low": _first_value(output, "day_low", "intraday_low", "low_price", "stck_lwpr", "low"),
         "session_type": _first_value(output, "session_type", "session", "market_state"),
         "normal_ordering_available": _normal_ordering_available(output),
         "provenance": {"source": "broker_current_price_payload"},
     }
+
+
+def _load_monitoring_exchange_by_symbol(
+    *,
+    db: Session,
+    mode: str,
+    symbols: list[str],
+) -> dict[str, str]:
+    if not symbols:
+        return {}
+    rows = db.scalars(
+        select(ExecutionPlanItem)
+        .join(ExecutionPlanItem.plan)
+        .where(
+            ExecutionPlan.mode == mode,
+            ExecutionPlanItem.symbol.in_(symbols),
+        )
+        .order_by(ExecutionPlanItem.updated_at.desc())
+    ).all()
+    exchanges: dict[str, str] = {}
+    for item in rows:
+        if item.symbol in exchanges:
+            continue
+        risk_context = item.risk_context if isinstance(item.risk_context, dict) else {}
+        exchange = str(risk_context.get("exchange") or "").strip().upper()
+        if item.asset_class == "us_equity" and exchange in {"NASD", "NYSE", "AMEX"}:
+            exchanges[item.symbol] = exchange
+        elif item.asset_class != "us_equity":
+            exchanges[item.symbol] = "KRX"
+    return exchanges
 
 
 def _fetch_live_market_context(

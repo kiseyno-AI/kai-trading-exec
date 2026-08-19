@@ -7476,6 +7476,8 @@ def _place_monitoring_order(
         if is_watch_buy
         else limit_price_override or item.limit_price
     )
+    if item.asset_class == "us_equity" and limit_price is None:
+        limit_price = observed_price
     order_request = PlaceOrderRequest(
         idempotency_key=_monitoring_order_idempotency_key(
             item=item,
@@ -7484,6 +7486,9 @@ def _place_monitoring_order(
             db=db,
         ),
         execution_plan_item_id=item.id,
+        provider=item.provider or "kis",
+        asset_class=item.asset_class or "stock",
+        venue=item.venue,
         symbol=item.symbol,
         side="buy" if is_watch_buy else "sell",
         quantity=quantity,

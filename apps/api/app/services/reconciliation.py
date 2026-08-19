@@ -316,7 +316,7 @@ def reconcile_stale_nonterminal_broker_orders(
     }
     repaired_count = 0
     items: list[dict[str, object]] = []
-    position_sync_symbols: set[str] = set()
+    position_sync_symbols: dict[str, set[str]] = {}
     for order in orders:
         classification_observed_at = _observation_time()
         status_before = order.status
@@ -348,7 +348,8 @@ def reconcile_stale_nonterminal_broker_orders(
                 message=result.get("message"),
             )
             if int(result.get("fills_added") or 0) > 0 or str(result.get("status") or "") == "filled":
-                position_sync_symbols.add(order.symbol)
+                exchange = _order_reconciliation_exchange(order)
+                position_sync_symbols.setdefault(exchange, set()).add(order.symbol)
 
         repair = _stale_order_repair_decision(
             order=order,
@@ -448,12 +449,20 @@ def reconcile_stale_nonterminal_broker_orders(
 
     position_sync_result = None
     if position_sync_symbols and not dry_run:
-        position_sync_result = sync_execution_positions_from_broker_snapshot(
-            settings=settings,
-            db=db,
-            adapter=adapter,
-            symbols=position_sync_symbols,
-        )
+        results = [
+            sync_execution_positions_from_broker_snapshot(
+                settings=settings,
+                db=db,
+                adapter=adapter,
+                symbols=scoped_symbols,
+                exchange=exchange,
+            )
+            for exchange, scoped_symbols in sorted(position_sync_symbols.items())
+        ]
+        position_sync_result = {
+            key: sum(int(result.get(key, 0)) for result in results)
+            for key in ("tracked_symbol_count", "created", "updated", "zeroed")
+        }
     elif not dry_run:
         db.commit()
     return {
@@ -732,6 +741,7 @@ def sync_execution_positions_from_broker_snapshot(
     db: Session,
     adapter: BrokerAdapter,
     symbols: set[str] | None = None,
+    exchange: str = "KRX",
 ) -> dict[str, int]:
     normalized_symbols = _normalize_symbols(symbols)
     session_state = ensure_authenticated_broker_session(
@@ -741,7 +751,14 @@ def sync_execution_positions_from_broker_snapshot(
         source="reconciliation",
         reason="refresh execution positions from broker snapshot",
     )
-    snapshot = adapter.get_account_snapshot(session_state.access_token or "")
+    try:
+        snapshot = adapter.get_account_snapshot(
+            session_state.access_token or "",
+            symbols=sorted(normalized_symbols) if normalized_symbols is not None else None,
+            exchange=exchange,
+        )
+    except TypeError:
+        snapshot = adapter.get_account_snapshot(session_state.access_token or "")
     if normalized_symbols is not None:
         tracked_symbols = normalized_symbols
     else:
