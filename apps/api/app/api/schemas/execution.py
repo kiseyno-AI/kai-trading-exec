@@ -37,6 +37,16 @@ class ExecutionPlanItemRequest(BaseModel):
         normalized = dict(value)
         _copy_alias_value(
             normalized,
+            destination="provider",
+            aliases=("provider", "broker"),
+        )
+        _copy_alias_value(
+            normalized,
+            destination="venue",
+            aliases=("venue", "broker"),
+        )
+        _copy_alias_value(
+            normalized,
             destination="decision_agent_name",
             aliases=("decision_agent_name", "agent_name"),
         )
@@ -48,7 +58,7 @@ class ExecutionPlanItemRequest(BaseModel):
         _copy_alias_value(
             normalized,
             destination="source_plan_item_id",
-            aliases=("source_plan_item_id", "core_plan_item_id", "plan_item_id"),
+            aliases=("source_plan_item_id", "core_item_key", "core_plan_item_id", "plan_item_id"),
         )
         _copy_alias_value(
             normalized,
@@ -109,6 +119,29 @@ class ExecutionPlanRequest(BaseModel):
         if not normalized:
             raise ValueError("field must not be empty")
         return normalized
+
+    @model_validator(mode="after")
+    def require_us_kis_routing(self) -> "ExecutionPlanRequest":
+        for item in self.items:
+            extras = item.model_extra or {}
+            risk_context = item.risk_context if isinstance(item.risk_context, dict) else {}
+            market = str(extras.get("market") or risk_context.get("market") or "").strip().upper()
+            currency = str(extras.get("currency") or risk_context.get("currency") or "").strip().upper()
+            is_us_equity = item.asset_class == "us_equity" or market == "US" or currency == "USD"
+            if not is_us_equity:
+                continue
+            if item.provider is None:
+                raise ValueError("US equity execution requires an explicit provider")
+            if item.provider != "kis":
+                continue
+            if item.venue != "kis":
+                raise ValueError("US equity execution requires provider=kis and venue=kis")
+            if item.source_plan_item_id is None:
+                raise ValueError("US equity execution requires source_plan_item_id")
+            exchange = str(extras.get("exchange") or risk_context.get("exchange") or "").strip().upper()
+            if exchange not in {"NASD", "NYSE", "AMEX"}:
+                raise ValueError("US equity execution requires NASD, NYSE, or AMEX exchange")
+        return self
 
 
 class PlaceOrderRequest(BaseModel):
@@ -199,8 +232,10 @@ class PlaceOrderRequest(BaseModel):
     @field_validator("exchange")
     @classmethod
     def validate_exchange(cls, value: str) -> str:
-        if value not in {"KRX", "NXT", "SOR", "UPBIT", "ALPACA", "US"}:
-            raise ValueError("exchange must be 'KRX', 'NXT', 'SOR', 'UPBIT', 'ALPACA', or 'US'")
+        if value not in {"KRX", "NXT", "SOR", "UPBIT", "ALPACA", "US", "NASD", "NYSE", "AMEX"}:
+            raise ValueError(
+                "exchange must be 'KRX', 'NXT', 'SOR', 'UPBIT', 'ALPACA', 'US', 'NASD', 'NYSE', or 'AMEX'"
+            )
         return value
 
     @model_validator(mode="after")
@@ -210,8 +245,18 @@ class PlaceOrderRequest(BaseModel):
         if self.order_type == "market" and self.limit_price is not None:
             raise ValueError("limit_price must be omitted for market orders")
         if self.asset_class == "us_equity":
-            if self.provider != "alpaca":
-                raise ValueError("US-equity orders require provider='alpaca'")
+            if self.provider not in {"alpaca", "kis"}:
+                raise ValueError("US-equity orders require provider='alpaca' or provider='kis'")
+            if self.provider == "kis":
+                if self.quantity is None or self.base_quantity is not None or self.quote_notional is not None:
+                    raise ValueError("KIS US-equity orders require integer quantity only")
+                if self.order_type != "limit":
+                    raise ValueError("KIS US-equity orders support limit orders only")
+                if self.exchange not in {"NASD", "NYSE", "AMEX"}:
+                    raise ValueError("KIS US-equity orders require exchange='NASD', 'NYSE', or 'AMEX'")
+                if self.time_in_force != "day":
+                    raise ValueError("KIS US-equity orders require time_in_force='day'")
+                return self
             sizing_fields = [
                 self.quantity is not None,
                 self.base_quantity is not None,

@@ -18,6 +18,7 @@ from app.core.config import Settings
 from app.models.runtime import BrokerOrder, ExecutionJob, ExecutionPlan, ExecutionPlanItem, new_id
 from app.services.broker_orders import place_broker_order
 from app.services.broker_auth import build_broker_adapter
+from app.services.monitoring_price_source import is_us_regular_session, next_us_regular_open
 from app.services.rejected_order_retries import (
     BROKER_ORDER_RETRY_JOB_TYPE,
     RetryOrderGuardError,
@@ -35,6 +36,7 @@ from app.services.runtime_transitions import set_execution_job_status
 LOGGER = logging.getLogger(__name__)
 
 KRX_TIMEZONE = ZoneInfo("Asia/Seoul")
+US_EASTERN_TIMEZONE = ZoneInfo("America/New_York")
 NEXT_OPEN_BUY_JOB_TYPE = "next_open_buy"
 CRYPTO_PAPER_ORDER_JOB_TYPE = "crypto_paper_order"
 UPBIT_PAPER_ALLOWED_SYMBOLS = frozenset({"KRW-BTC", "KRW-ETH"})
@@ -79,11 +81,16 @@ def materialize_execution_jobs(plan: ExecutionPlan) -> None:
             continue
         if item.intent != NEXT_OPEN_BUY_JOB_TYPE or item.status != "pending":
             continue
-        if _next_open_buy_quantity(item) is None or plan.market_date is None or item.side != "buy":
+        if (
+            _next_open_buy_quantity(item) is None
+            or plan.market_date is None
+            or item.side != "buy"
+            or (item.asset_class == "us_equity" and item.limit_price is None)
+        ):
             item.status = "next_open_buy_pending_configuration"
             continue
         item.status = "next_open_buy_scheduled"
-        scheduled_for = _next_market_open_utc(plan.market_date)
+        scheduled_for = _next_market_open_utc(plan.market_date, plan_item=item)
         item.jobs.append(
             ExecutionJob(
                 id=new_id(),
@@ -202,6 +209,13 @@ def dispatch_due_execution_jobs(
     serialized_jobs: list[dict[str, object]] = []
 
     for job in due_jobs:
+        if _defer_us_next_open_job_outside_session(
+            db=db,
+            job=job,
+            triggered_at=triggered_at,
+        ):
+            serialized_jobs.append(serialize_execution_job(job))
+            continue
         _claim_job(db=db, job=job, triggered_at=triggered_at)
         result = _dispatch_job(
             settings=settings,
@@ -575,6 +589,9 @@ def _build_place_order_request(
     return PlaceOrderRequest(
         idempotency_key=_place_order_idempotency_key(job),
         execution_plan_item_id=plan_item.id,
+        provider=plan_item.provider or "kis",
+        asset_class=plan_item.asset_class or "stock",
+        venue=plan_item.venue,
         symbol=plan_item.symbol,
         side=plan_item.side,
         quantity=quantity,
@@ -747,7 +764,18 @@ def _crypto_paper_fill_price(item: ExecutionPlanItem) -> Decimal | None:
     return None
 
 
-def _next_market_open_utc(market_date: date) -> datetime:
+def _next_market_open_utc(
+    market_date: date,
+    *,
+    plan_item: ExecutionPlanItem | None = None,
+) -> datetime:
+    if plan_item is not None and plan_item.asset_class == "us_equity":
+        local_open = datetime.combine(
+            market_date,
+            time(hour=9, minute=30),
+            tzinfo=US_EASTERN_TIMEZONE,
+        )
+        return local_open.astimezone(UTC)
     local_open = datetime.combine(
         market_date,
         time(hour=9, minute=0),
@@ -772,6 +800,41 @@ def _is_due(job: ExecutionJob, triggered_at: datetime) -> bool:
     if scheduled_for is None:
         return True
     return _normalize_utc(scheduled_for) <= triggered_at
+
+
+def _defer_us_next_open_job_outside_session(
+    *,
+    db: Session,
+    job: ExecutionJob,
+    triggered_at: datetime,
+) -> bool:
+    if (
+        job.job_type not in {NEXT_OPEN_BUY_JOB_TYPE, BROKER_ORDER_RETRY_JOB_TYPE}
+        or job.plan_item.asset_class != "us_equity"
+    ):
+        return False
+    local = triggered_at.astimezone(US_EASTERN_TIMEZONE)
+    if is_us_regular_session(local):
+        return False
+    next_open = next_us_regular_open(triggered_at)
+    reason = f"deferred KIS US-equity order outside New York regular session until {next_open.isoformat()}"
+    job.scheduled_for = next_open
+    set_execution_job_status(
+        db=db,
+        job=job,
+        status="scheduled",
+        source="execution_job_dispatch",
+        last_error=reason,
+        plan_item_status=(
+            "next_open_buy_scheduled"
+            if job.job_type == NEXT_OPEN_BUY_JOB_TYPE
+            else _retrying_plan_item_status(job.job_type)
+        ),
+        reason=reason,
+        occurred_at=triggered_at,
+    )
+    db.commit()
+    return True
 
 
 def _dispatching_plan_item_status(job_type: str) -> str:

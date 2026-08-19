@@ -1,17 +1,21 @@
 from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed
+from datetime import UTC, date, datetime, time as datetime_time, timedelta
 from decimal import Decimal
 import threading
 import time
 from typing import Callable
+from zoneinfo import ZoneInfo
 
+from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.api.schemas.execution import MonitoringPriceRequest
 from app.broker.base import BrokerAdapter, BrokerCurrentPrice, BrokerLiveMarketContext
 from app.core.config import Settings
+from app.models.runtime import ExecutionPlan, ExecutionPlanItem
 from app.services.broker_auth import ensure_authenticated_broker_session
 from app.services.domestic_order_router import resolve_domestic_order_route
 
@@ -117,6 +121,11 @@ class KisCurrentQuoteMonitoringPriceSource:
                     adapter=broker_adapter,
                 )
                 access_token = session_state.access_token or ""
+                exchange_by_symbol = _load_monitoring_exchange_by_symbol(
+                    db=db,
+                    mode=settings.runtime_mode,
+                    symbols=unique_symbols,
+                )
                 prices: list[MonitoringPriceRequest] = []
                 priced_symbols: list[str] = []
                 failures: list[dict[str, str]] = []
@@ -132,7 +141,7 @@ class KisCurrentQuoteMonitoringPriceSource:
                             worker_adapter.get_current_price(
                                 access_token,
                                 symbol=symbol,
-                                exchange="KRX",
+                                exchange=exchange_by_symbol.get(symbol, "KRX"),
                             ),
                             None,
                         )
@@ -203,15 +212,15 @@ class KisCurrentQuoteMonitoringPriceSource:
                         continue
                     if quote is None:
                         continue
-                    context = None
-                    context_failure = {
-                        "symbol": quote.symbol,
-                        "endpoint": "broker_live_market_context",
-                        "reason": "skipped_noncritical_enrichment",
-                    }
-                    context_failure_count += 1
-                    if len(context_failures) < MAX_REPORTED_CONTEXT_FAILURES:
-                        context_failures.append(context_failure)
+                    context, context_failure = _fetch_live_market_context(
+                        broker_adapter=broker_adapter,
+                        access_token=access_token,
+                        quote=quote,
+                    )
+                    if context_failure is not None:
+                        context_failure_count += 1
+                        if len(context_failures) < MAX_REPORTED_CONTEXT_FAILURES:
+                            context_failures.append(context_failure)
                     priced_symbols.append(quote.symbol)
                     market_quality = _market_quality_from_quote_payload(quote.payload)
                     market_quality = _merge_live_market_context(
@@ -246,6 +255,7 @@ class KisCurrentQuoteMonitoringPriceSource:
                     "context_failure_count": context_failure_count,
                     "context_failures_truncated": context_failure_count > len(context_failures),
                     "quote_batch_timed_out": batch_timed_out,
+                    "exchange_by_symbol": exchange_by_symbol,
                 }
                 return prices
         finally:
@@ -293,14 +303,44 @@ def _market_quality_from_quote_payload(payload: dict[str, object]) -> dict[str, 
         "spread_bps": _first_value(output, "spread_bps", "spread_bp"),
         "orderbook_depth": _first_value(output, "orderbook_depth", "book_depth", "total_depth"),
         "orderbook_imbalance": _first_value(output, "orderbook_imbalance", "book_imbalance"),
-        "volume": _first_value(output, "volume", "accumulated_volume", "acml_vol"),
+        "volume": _first_value(output, "volume", "accumulated_volume", "acml_vol", "tvol"),
         "turnover": _first_value(output, "turnover", "trading_value", "acml_tr_pbmn"),
-        "day_high": _first_value(output, "day_high", "intraday_high", "high_price", "stck_hgpr"),
-        "day_low": _first_value(output, "day_low", "intraday_low", "low_price", "stck_lwpr"),
+        "day_high": _first_value(output, "day_high", "intraday_high", "high_price", "stck_hgpr", "high"),
+        "day_low": _first_value(output, "day_low", "intraday_low", "low_price", "stck_lwpr", "low"),
         "session_type": _first_value(output, "session_type", "session", "market_state"),
         "normal_ordering_available": _normal_ordering_available(output),
         "provenance": {"source": "broker_current_price_payload"},
     }
+
+
+def _load_monitoring_exchange_by_symbol(
+    *,
+    db: Session,
+    mode: str,
+    symbols: list[str],
+) -> dict[str, str]:
+    if not symbols:
+        return {}
+    rows = db.scalars(
+        select(ExecutionPlanItem)
+        .join(ExecutionPlanItem.plan)
+        .where(
+            ExecutionPlan.mode == mode,
+            ExecutionPlanItem.symbol.in_(symbols),
+        )
+        .order_by(ExecutionPlanItem.updated_at.desc())
+    ).all()
+    exchanges: dict[str, str] = {}
+    for item in rows:
+        if item.symbol in exchanges:
+            continue
+        risk_context = item.risk_context if isinstance(item.risk_context, dict) else {}
+        exchange = str(risk_context.get("exchange") or "").strip().upper()
+        if item.asset_class == "us_equity" and exchange in {"NASD", "NYSE", "AMEX"}:
+            exchanges[item.symbol] = exchange
+        elif item.asset_class != "us_equity":
+            exchanges[item.symbol] = "KRX"
+    return exchanges
 
 
 def _fetch_live_market_context(
@@ -379,12 +419,13 @@ def _merge_live_market_context(
         symbol=quote.symbol,
         price=quote.price,
         observed_at=quote.observed_at,
+        exchange=quote.exchange,
     )
     for key, value in route_context.items():
         if key in {"session_type", "normal_ordering_available"} and merged.get(key) is None:
             merged[key] = value
     provenance["session"] = {
-        "source": "domestic_order_router",
+        "source": route_context["orderability_source"],
         "reason": route_context["orderability_reason"],
         "action": route_context["orderability_action"],
         "exchange": route_context["orderability_exchange"],
@@ -419,7 +460,26 @@ def _derive_orderability_context(
     symbol: str,
     price: Decimal,
     observed_at,
+    exchange: str = "KRX",
 ) -> dict[str, object]:
+    normalized_exchange = str(exchange or "KRX").strip().upper()
+    if normalized_exchange in {"NASD", "NYSE", "AMEX"}:
+        observed = observed_at
+        if not isinstance(observed, datetime):
+            raise ValueError("US orderability requires a datetime observation")
+        if observed.tzinfo is None:
+            observed = observed.replace(tzinfo=UTC)
+        local = observed.astimezone(ZoneInfo("America/New_York"))
+        is_regular = is_us_regular_session(local)
+        return {
+            "session_type": "us_regular" if is_regular else "us_closed",
+            "normal_ordering_available": is_regular,
+            "orderability_action": "submit" if is_regular else "hold",
+            "orderability_exchange": normalized_exchange,
+            "orderability_reason": "us_regular_session" if is_regular else "outside_us_regular_session",
+            "orderability_source": "us_regular_session_clock",
+        }
+
     route_decision = resolve_domestic_order_route(
         settings=settings,
         now=observed_at,
@@ -436,7 +496,88 @@ def _derive_orderability_context(
         "orderability_action": route_decision.action,
         "orderability_exchange": route_decision.exchange,
         "orderability_reason": route_decision.reason,
+        "orderability_source": "domestic_order_router",
     }
+
+
+def is_us_regular_session(local: datetime) -> bool:
+    market_date = local.date()
+    if market_date.weekday() >= 5 or market_date in _us_market_holidays(market_date.year):
+        return False
+    return datetime_time(9, 30) <= local.timetz().replace(tzinfo=None) < datetime_time(16, 0)
+
+
+def next_us_regular_open(observed_at: datetime) -> datetime:
+    observed = observed_at if observed_at.tzinfo is not None else observed_at.replace(tzinfo=UTC)
+    local = observed.astimezone(ZoneInfo("America/New_York"))
+    candidate_date = local.date()
+    local_open = datetime.combine(candidate_date, datetime_time(9, 30), tzinfo=local.tzinfo)
+    if is_us_regular_session(local_open) and local < local_open:
+        return local_open.astimezone(UTC)
+    candidate_date += timedelta(days=1)
+    while True:
+        local_open = datetime.combine(candidate_date, datetime_time(9, 30), tzinfo=local.tzinfo)
+        if is_us_regular_session(local_open):
+            return local_open.astimezone(UTC)
+        candidate_date += timedelta(days=1)
+
+
+def _us_market_holidays(year: int) -> set[date]:
+    holidays = {
+        _observed_fixed_holiday(date(year, 1, 1)),
+        _nth_weekday(year, 1, 0, 3),
+        _nth_weekday(year, 2, 0, 3),
+        _easter_sunday(year) - timedelta(days=2),
+        _last_weekday(year, 5, 0),
+        _observed_fixed_holiday(date(year, 7, 4)),
+        _nth_weekday(year, 9, 0, 1),
+        _nth_weekday(year, 11, 3, 4),
+        _observed_fixed_holiday(date(year, 12, 25)),
+    }
+    if year >= 2022:
+        holidays.add(_observed_fixed_holiday(date(year, 6, 19)))
+    next_new_year = _observed_fixed_holiday(date(year + 1, 1, 1))
+    if next_new_year.year == year:
+        holidays.add(next_new_year)
+    return holidays
+
+
+def _observed_fixed_holiday(value: date) -> date:
+    if value.weekday() == 5:
+        return value - timedelta(days=1)
+    if value.weekday() == 6:
+        return value + timedelta(days=1)
+    return value
+
+
+def _nth_weekday(year: int, month: int, weekday: int, occurrence: int) -> date:
+    first = date(year, month, 1)
+    offset = (weekday - first.weekday()) % 7
+    return first + timedelta(days=offset + 7 * (occurrence - 1))
+
+
+def _last_weekday(year: int, month: int, weekday: int) -> date:
+    next_month = date(year + (month == 12), 1 if month == 12 else month + 1, 1)
+    candidate = next_month - timedelta(days=1)
+    return candidate - timedelta(days=(candidate.weekday() - weekday) % 7)
+
+
+def _easter_sunday(year: int) -> date:
+    a = year % 19
+    b = year // 100
+    c = year % 100
+    d = b // 4
+    e = b % 4
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i = c // 4
+    k = c % 4
+    l = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * l) // 451
+    month = (h + l - 7 * m + 114) // 31
+    day = ((h + l - 7 * m + 114) % 31) + 1
+    return date(year, month, day)
 
 
 def _endpoint_from_payload(payload: dict[str, object]) -> object | None:

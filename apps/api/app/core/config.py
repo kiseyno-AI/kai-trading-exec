@@ -164,6 +164,18 @@ class Settings(BaseModel):
     kis_customer_type: str = "P"
     kis_use_hashkey: bool = True
     kis_request_timeout_seconds: int = Field(default=10, ge=1, le=120)
+    kis_us_trading_enabled: bool = False
+    kis_us_live_trading_enabled: bool = False
+    kis_us_live_confirmation_token: str | None = None
+    kis_us_account_allowlist: str = ""
+    kis_us_max_order_notional_usd: Decimal = Field(default=Decimal("100"), gt=0)
+    kis_us_max_total_exposure_usd: Decimal = Field(default=Decimal("1000"), gt=0)
+    kis_us_daily_realized_loss_limit_usd: Decimal = Field(default=Decimal("25"), gt=0)
+    kis_us_weekly_realized_loss_limit_usd: Decimal = Field(default=Decimal("50"), gt=0)
+    kis_us_unrealized_loss_limit_usd: Decimal = Field(default=Decimal("50"), gt=0)
+    kis_us_unrealized_loss_pct: Decimal = Field(default=Decimal("5"), gt=0, le=Decimal("100"))
+    kis_us_severe_holding_loss_pct: Decimal = Field(default=Decimal("10"), gt=0, le=Decimal("100"))
+    kis_us_preflight_buying_power_enabled: bool = True
     upbit_access_key: str | None = None
     upbit_secret_key: str | None = None
     upbit_base_url: str = "https://api.upbit.com"
@@ -451,6 +463,18 @@ _ENV_FIELDS = {
     "KIS_CUSTOMER_TYPE": "kis_customer_type",
     "KIS_USE_HASHKEY": "kis_use_hashkey",
     "KIS_REQUEST_TIMEOUT_SECONDS": "kis_request_timeout_seconds",
+    "KIS_US_TRADING_ENABLED": "kis_us_trading_enabled",
+    "KIS_US_LIVE_TRADING_ENABLED": "kis_us_live_trading_enabled",
+    "KIS_US_LIVE_CONFIRMATION_TOKEN": "kis_us_live_confirmation_token",
+    "KIS_US_ACCOUNT_ALLOWLIST": "kis_us_account_allowlist",
+    "KIS_US_MAX_ORDER_NOTIONAL_USD": "kis_us_max_order_notional_usd",
+    "KIS_US_MAX_TOTAL_EXPOSURE_USD": "kis_us_max_total_exposure_usd",
+    "KIS_US_DAILY_REALIZED_LOSS_LIMIT_USD": "kis_us_daily_realized_loss_limit_usd",
+    "KIS_US_WEEKLY_REALIZED_LOSS_LIMIT_USD": "kis_us_weekly_realized_loss_limit_usd",
+    "KIS_US_UNREALIZED_LOSS_LIMIT_USD": "kis_us_unrealized_loss_limit_usd",
+    "KIS_US_UNREALIZED_LOSS_PCT": "kis_us_unrealized_loss_pct",
+    "KIS_US_SEVERE_HOLDING_LOSS_PCT": "kis_us_severe_holding_loss_pct",
+    "KIS_US_PREFLIGHT_BUYING_POWER_ENABLED": "kis_us_preflight_buying_power_enabled",
     "UPBIT_ACCESS_KEY": "upbit_access_key",
     "UPBIT_SECRET_KEY": "upbit_secret_key",
     "UPBIT_BASE_URL": "upbit_base_url",

@@ -139,6 +139,20 @@ KIS auth/session settings currently supported:
 - `KAI_EXEC_KIS_USE_HASHKEY`
 - `KAI_EXEC_KIS_REQUEST_TIMEOUT_SECONDS`
 
+KIS US-equity execution is separately gated and defaults to disabled:
+- `KAI_EXEC_KIS_US_TRADING_ENABLED` (paper/readiness gate, default `false`)
+- `KAI_EXEC_KIS_US_LIVE_TRADING_ENABLED` (live gate, default `false`)
+- `KAI_EXEC_KIS_US_LIVE_CONFIRMATION_TOKEN` (live requires the exact value `ENABLE_KIS_US_LIVE`)
+- `KAI_EXEC_KIS_US_ACCOUNT_ALLOWLIST` (comma-separated live account numbers)
+- `KAI_EXEC_KIS_US_MAX_ORDER_NOTIONAL_USD` (default `100`)
+- `KAI_EXEC_KIS_US_PREFLIGHT_BUYING_POWER_ENABLED` (default `true`)
+
+The KIS US path accepts approved-plan, whole-share, regular-session day limit
+orders only. `NASD`, `NYSE`, and `AMEX` order exchanges are translated to the
+KIS quote codes `NAS`, `NYS`, and `AMS`. Before every buy, the adapter checks
+KIS-reported USD buying power and orderable quantity. Live submission remains
+closed unless the live flag, confirmation token, and account allowlist all match.
+
 Upbit crypto paper settings currently supported:
 - `KAI_EXEC_UPBIT_ACCESS_KEY`
 - `KAI_EXEC_UPBIT_SECRET_KEY`

@@ -24,6 +24,7 @@ from app.services.account_drawdown_gate import (
     AccountDrawdownDecision,
     account_drawdown_uncertain_decision,
     evaluate_account_drawdown_gate,
+    evaluate_us_equity_account_gate,
     record_account_drawdown_block,
 )
 from app.services.broker_raw_holdings import snapshot_with_raw_balance_holdings
@@ -153,6 +154,23 @@ def place_broker_order(
                 "message": alpaca_guard_error,
                 "permanent_rejection": True,
                 "rejection_reason": alpaca_guard_error,
+            },
+        )
+
+    kis_us_guard_error = _validate_kis_us_equity_guardrails(
+        settings=settings,
+        adapter=adapter,
+        command=command,
+        plan_item=plan_item,
+    )
+    if kis_us_guard_error is not None:
+        return PlaceBrokerOrderResult(
+            status_code=409,
+            payload={
+                "duplicate": False,
+                "message": kis_us_guard_error,
+                "permanent_rejection": True,
+                "rejection_reason": kis_us_guard_error,
             },
         )
 
@@ -630,6 +648,51 @@ def _validate_alpaca_crypto_guardrails(
     return None
 
 
+def _validate_kis_us_equity_guardrails(
+    *,
+    settings: Settings,
+    adapter: BrokerAdapter,
+    command: PlaceOrderRequest,
+    plan_item: ExecutionPlanItem | None,
+) -> str | None:
+    if command.provider != "kis" or command.asset_class != "us_equity":
+        return None
+    if adapter.provider != "kis":
+        return "KIS US-equity execution requires provider='kis'"
+    if not settings.kis_us_trading_enabled:
+        return "KIS US-equity trading is disabled by configuration"
+    if (command.venue or "").lower() != "kis":
+        return "KIS US-equity execution requires venue='kis'"
+    if command.exchange not in {"NASD", "NYSE", "AMEX"}:
+        return "KIS US-equity execution requires NASD, NYSE, or AMEX exchange code"
+    if command.order_type != "limit" or command.time_in_force != "day":
+        return "KIS US-equity execution is limited to day limit orders"
+    if command.quantity is None or command.limit_price is None:
+        return "KIS US-equity execution requires whole-share quantity and limit_price"
+    if plan_item is None:
+        return "KIS US-equity execution requires an approved execution plan item"
+    if plan_item.provider != "kis" or plan_item.asset_class != "us_equity" or plan_item.venue != "kis":
+        return "execution plan item must explicitly declare KIS US-equity provider metadata"
+    notional = _order_notional(command=command, plan_item=plan_item)
+    if command.side == "buy" and (
+        notional is None or notional > settings.kis_us_max_order_notional_usd
+    ):
+        return "KIS US-equity order exceeds its configured maximum USD notional"
+    if settings.runtime_mode == "live":
+        if not settings.kis_us_live_trading_enabled:
+            return "KIS US-equity live trading is disabled by configuration"
+        if settings.kis_us_live_confirmation_token != "ENABLE_KIS_US_LIVE":
+            return "KIS US-equity live confirmation token is missing"
+        allowed_accounts = {
+            value.strip()
+            for value in settings.kis_us_account_allowlist.split(",")
+            if value.strip()
+        }
+        if not settings.kis_account_number or settings.kis_account_number not in allowed_accounts:
+            return "KIS US-equity live account is not in the configured allowlist"
+    return None
+
+
 def _validate_trusted_order_origin(*, command: PlaceOrderRequest, request_source: str) -> str | None:
     if not request_source.startswith("alpaca_"):
         return None
@@ -668,7 +731,6 @@ def _evaluate_new_buy_account_gate(
         return None
     if command.provider != "kis" and adapter.provider != "kis":
         return None
-
     try:
         session_state = ensure_authenticated_broker_session(
             settings=settings,
@@ -693,6 +755,23 @@ def _evaluate_new_buy_account_gate(
         )
 
     observed_at = datetime.now(UTC)
+    if command.asset_class == "us_equity":
+        notional = _order_notional(command=command, plan_item=plan_item)
+        if notional is None:
+            return account_drawdown_uncertain_decision(
+                order_idempotency_key=command.idempotency_key,
+                execution_plan_item_id=plan_item.id if plan_item is not None else command.execution_plan_item_id,
+                reason="KIS US-equity account gate requires deterministic USD order notional",
+            )
+        return evaluate_us_equity_account_gate(
+            settings=settings,
+            db=db,
+            snapshot=snapshot,
+            order_notional=notional,
+            order_idempotency_key=command.idempotency_key,
+            execution_plan_item_id=plan_item.id if plan_item is not None else command.execution_plan_item_id,
+            now=observed_at,
+        )
     return evaluate_account_drawdown_gate(
         settings=settings,
         snapshot=snapshot_with_raw_balance_holdings(
@@ -893,6 +972,8 @@ def _resolve_route_decision(
     plan_item: ExecutionPlanItem | None,
 ) -> RouteDecision | None:
     if command.provider != "kis":
+        return None
+    if command.asset_class == "us_equity":
         return None
     if not settings.domestic_order_session_routing_enabled:
         return None
@@ -1153,7 +1234,11 @@ def _order_notional(
     if command.quote_notional is not None:
         return command.quote_notional
     price = command.limit_price or _simulated_fill_price(command=command, plan_item=plan_item)
-    if command.base_quantity is None or price is None:
+    if price is None:
+        return None
+    if command.quantity is not None:
+        return Decimal(command.quantity) * price
+    if command.base_quantity is None:
         return None
     return (command.base_quantity * price).quantize(Decimal("0.0001"), rounding=ROUND_DOWN)
 

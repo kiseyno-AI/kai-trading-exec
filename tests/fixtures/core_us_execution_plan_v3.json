@@ -1,0 +1,103 @@
+{
+  "plan_id": "core-us-signal-decider-20260820-kis",
+  "source": "kai-trading-core",
+  "mode": "paper",
+  "market_date": "2026-08-20",
+  "strategy_run_id": "us-symbol-run-2026-08-19-contract",
+  "requested_at": "2026-08-19T22:00:00+00:00",
+  "items": [
+    {
+      "core_item_key": "us:2026-08-19:AAPL:next_open_buy",
+      "source_plan_item_id": "us:2026-08-19:AAPL:next_open_buy",
+      "agent_name": "signal-decider",
+      "decision_agent_name": "signal-decider",
+      "symbol": "AAPL",
+      "asset_class": "us_equity",
+      "market": "US",
+      "exchange": "NASD",
+      "currency": "USD",
+      "broker": "kis",
+      "provider": "kis",
+      "venue": "kis",
+      "session_policy": {
+        "session": "regular",
+        "timezone": "America/New_York",
+        "allow_extended_hours": false,
+        "whole_shares_only": true
+      },
+      "side": "buy",
+      "intent": "next_open_buy",
+      "quantity_policy": {"kind": "shares", "quantity": 1},
+      "limit_price": "201.25",
+      "trigger_price": null,
+      "time_in_force": "day",
+      "risk_context": {
+        "schema_version": "signal_decider_exec_plan_v3",
+        "source_market_date": "2026-08-19",
+        "canonical_symbol": "AAPL",
+        "currency": "USD",
+        "exchange": "NASD"
+      },
+      "decision_snapshot_id": "101"
+    },
+    {
+      "core_item_key": "us:2026-08-19:AAPL:target_sell",
+      "source_plan_item_id": "us:2026-08-19:AAPL:target_sell",
+      "agent_name": "signal-decider",
+      "decision_agent_name": "signal-decider",
+      "symbol": "AAPL",
+      "asset_class": "us_equity",
+      "market": "US",
+      "exchange": "NASD",
+      "currency": "USD",
+      "broker": "kis",
+      "provider": "kis",
+      "venue": "kis",
+      "session_policy": {"session": "regular", "timezone": "America/New_York"},
+      "side": "sell",
+      "intent": "target_sell",
+      "quantity_policy": {
+        "type": "position_exit_from_entry",
+        "linked_entry_item_key": "us:2026-08-19:AAPL:next_open_buy"
+      },
+      "limit_price": null,
+      "trigger_price": "220.00",
+      "time_in_force": "day",
+      "risk_context": {"exchange": "NASD", "currency": "USD"},
+      "decision_snapshot_id": "101"
+    },
+    {
+      "core_item_key": "us:2026-08-19:AAPL:stop_sell",
+      "source_plan_item_id": "us:2026-08-19:AAPL:stop_sell",
+      "agent_name": "signal-decider",
+      "decision_agent_name": "signal-decider",
+      "symbol": "AAPL",
+      "asset_class": "us_equity",
+      "market": "US",
+      "exchange": "NASD",
+      "currency": "USD",
+      "broker": "kis",
+      "provider": "kis",
+      "venue": "kis",
+      "session_policy": {"session": "regular", "timezone": "America/New_York"},
+      "side": "sell",
+      "intent": "stop_sell",
+      "quantity_policy": {
+        "type": "position_exit_from_entry",
+        "linked_entry_item_key": "us:2026-08-19:AAPL:next_open_buy"
+      },
+      "limit_price": null,
+      "trigger_price": "190.00",
+      "time_in_force": "day",
+      "risk_context": {"exchange": "NASD", "currency": "USD"},
+      "decision_snapshot_id": "101"
+    }
+  ],
+  "metadata": {
+    "schema_version": "signal_decider_exec_plan_v3",
+    "market": "US",
+    "currency": "USD",
+    "source_market_date": "2026-08-19",
+    "agent_run_id": "us-symbol-run-2026-08-19-contract"
+  }
+}

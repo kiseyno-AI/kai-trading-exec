@@ -15,6 +15,7 @@ from app.core.config import Settings
 from app.models.runtime import ExecutionPlanItem, ExecutionPosition
 from app.services import monitoring_price_source as monitoring_price_source_module
 from app.services.monitoring_price_source import KisCurrentQuoteMonitoringPriceSource
+from app.services.monitoring_price_source import _derive_orderability_context
 from test_broker_auth import (
     KIS_PAPER_API_BASE_URL,
     StubBrokerAdapter,
@@ -103,6 +104,33 @@ class LiveMarketContextAdapter(StubBrokerAdapter):
         if symbol_error is not None:
             raise symbol_error
         return self.live_contexts.get(symbol)
+
+
+def test_us_orderability_uses_new_york_regular_session_while_krx_is_closed() -> None:
+    context = _derive_orderability_context(
+        settings=Settings(domestic_order_session_routing_enabled=True),
+        symbol="AAPL",
+        price=Decimal("201.25"),
+        observed_at=datetime(2026, 8, 19, 14, 0, tzinfo=UTC),
+        exchange="NASD",
+    )
+
+    assert context["session_type"] == "us_regular"
+    assert context["normal_ordering_available"] is True
+    assert context["orderability_source"] == "us_regular_session_clock"
+
+
+def test_us_orderability_closes_on_nyse_holiday() -> None:
+    context = _derive_orderability_context(
+        settings=Settings(),
+        symbol="AAPL",
+        price=Decimal("201.25"),
+        observed_at=datetime(2026, 7, 3, 15, 0, tzinfo=UTC),
+        exchange="NASD",
+    )
+
+    assert context["session_type"] == "us_closed"
+    assert context["normal_ordering_available"] is False
 
 
 def test_kis_price_source_enriches_monitoring_price_with_live_market_context() -> None:

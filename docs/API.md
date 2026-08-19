@@ -331,6 +331,10 @@ Suggested body shape:
   - `side`
   - `intent` (`next_open_buy`, `target_sell`, `stop_sell`, `manual_exit`, ...)
   - `quantity_policy`
+  - `provider` (`kis` for KIS US equities)
+  - `venue` (`kis`)
+  - `asset_class` (`stock` or `us_equity`)
+  - `market`, `exchange`, `currency`, `broker`, `session_policy`
   - `limit_price`
   - `trigger_price`
   - `time_in_force`
@@ -362,6 +366,10 @@ Current item behavior additionally includes:
   simulated fill price in `risk_context.simulated_fill_price`,
   `risk_context.paper_fill_price`, `risk_context.reference_price`, or
   `risk_context.provider_metadata`
+- KIS US-equity items require `asset_class=us_equity`, `provider=kis`,
+  `venue=kis`, `market=US`, `currency=USD`, and an order exchange of `NASD`,
+  `NYSE`, or `AMEX`. Routing fields are preserved in `risk_context`; jobs are
+  scheduled for 09:30 `America/New_York` and require an explicit limit price.
 
 ### `POST /execution-plans/preview`
 Runs execution-plan intake, exec-agent decision/sizing, job materialization, and
@@ -653,7 +661,17 @@ Suggested body shape:
 - `order_type` (`limit`, `market`)
 - `limit_price` (required for `limit`, omitted for `market`)
 - `time_in_force` (`day`)
-- `exchange` (`KRX`, `SOR`)
+- `provider` (`kis`)
+- `asset_class` (`stock` or `us_equity`)
+- `venue` (`kis` for US equities)
+- `exchange` (`KRX`, `SOR`, `NASD`, `NYSE`, `AMEX`)
+
+For KIS US equities, `/orders` rejects requests that are not linked to an
+approved execution-plan item. Only integer-share `day` limit orders are
+accepted. The service checks configured USD notional caps and the adapter
+performs a broker buying-power preflight before buy submission. Reconciliation
+uses KIS overseas order/fill history and preserves cumulative partial-fill
+quantities; account sync uses overseas balance and unfilled-order endpoints.
 
 Current response includes:
 - `duplicate`

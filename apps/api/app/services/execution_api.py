@@ -1120,6 +1120,10 @@ def _plan_item_risk_context(item: ExecutionPlanItemRequest) -> dict[str, object]
     risk_context = dict(item.risk_context) if isinstance(item.risk_context, dict) else item.risk_context
     normalized = dict(risk_context or {})
     extras = item.model_extra or {}
+    for key in ("market", "exchange", "currency", "broker", "session_policy"):
+        value = extras.get(key)
+        if value is not None and key not in normalized:
+            normalized[key] = _json_scalar(value)
     tactical_action = _short_term_tactical_action(item)
     exec_monitoring_active = _exec_monitoring_active(item)
     if tactical_action is not None:
