@@ -4,6 +4,7 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy.orm import Session
 
 from app.broker.base import BrokerAdapter, BrokerAdapterError, BrokerConfig
+from app.broker.alpaca import AlpacaBrokerAdapter
 from app.broker.kis import KisBrokerAdapter
 from app.broker.upbit import UpbitBrokerAdapter
 from app.core.config import Settings
@@ -29,9 +30,16 @@ class BrokerSessionActionResult:
 
 def build_broker_adapter(settings: Settings, *, provider: str = "kis") -> BrokerAdapter:
     normalized_provider = provider.strip().lower()
+    if normalized_provider == "kis":
+        return KisBrokerAdapter(settings=settings)
     if normalized_provider == "upbit":
         return UpbitBrokerAdapter(settings=settings)
-    return KisBrokerAdapter(settings=settings)
+    if normalized_provider == "alpaca":
+        return AlpacaBrokerAdapter(settings=settings)
+    raise BrokerAdapterError(
+        f"unsupported broker provider: {normalized_provider or '<empty>'}",
+        status_code=422,
+    )
 
 
 def build_broker_session_summary(

@@ -35,11 +35,13 @@ def test_sqlite_busy_timeout_and_pool_capacity_are_configurable(tmp_path) -> Non
         db_max_overflow=2,
         db_pool_timeout_seconds=2,
         sqlite_busy_timeout_seconds=7,
+        sqlite_wal_autocheckpoint_pages=1000,
     )
     engine = create_db_engine(settings)
     try:
         with engine.connect() as connection:
             assert connection.exec_driver_sql("PRAGMA busy_timeout").scalar_one() == 7000
+            assert connection.exec_driver_sql("PRAGMA wal_autocheckpoint").scalar_one() == 1000
         status = pool_status(engine)
         assert status["pool_size"] == 3
         assert status["checked_out"] == 0
@@ -57,6 +59,7 @@ def test_database_pool_environment_fields_are_loaded() -> None:
             "KAI_EXEC_DB_POOL_USE_LIFO": "false",
             "KAI_EXEC_DB_CONNECT_TIMEOUT_SECONDS": "9",
             "KAI_EXEC_SQLITE_BUSY_TIMEOUT_SECONDS": "12",
+            "KAI_EXEC_SQLITE_WAL_AUTOCHECKPOINT_PAGES": "2000",
         }
     )
 
@@ -67,6 +70,7 @@ def test_database_pool_environment_fields_are_loaded() -> None:
     assert settings.db_pool_use_lifo is False
     assert settings.db_connect_timeout_seconds == 9
     assert settings.sqlite_busy_timeout_seconds == 12
+    assert settings.sqlite_wal_autocheckpoint_pages == 2000
 def test_database_health_checks_do_not_stack_connection_attempts() -> None:
     lock = health_service._database_healthcheck_lock
     assert lock.acquire(blocking=False) is True

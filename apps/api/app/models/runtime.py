@@ -478,6 +478,157 @@ class ExecutionPosition(TimestampMixin, Base):
     raw_payload: Mapped[dict[str, Any] | None] = mapped_column(JSON, deferred=True)
 
 
+class CryptoDailyBar(TimestampMixin, Base):
+    __tablename__ = "crypto_daily_bars"
+    __table_args__ = (
+        Index(
+            "ix_crypto_daily_bars_provider_symbol_close",
+            "provider",
+            "symbol",
+            "bar_close_at",
+        ),
+        UniqueConstraint(
+            "provider",
+            "symbol",
+            "timeframe",
+            "bar_open_at",
+            name="uq_crypto_daily_bars_provider_symbol_timeframe_bar_open",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    provider: Mapped[str] = mapped_column(String(32), nullable=False)
+    symbol: Mapped[str] = mapped_column(String(32), nullable=False)
+    timeframe: Mapped[str] = mapped_column(String(16), nullable=False, default="1Day")
+    bar_open_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    bar_close_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    open_price: Mapped[Decimal] = mapped_column(Numeric(28, 12), nullable=False)
+    high_price: Mapped[Decimal] = mapped_column(Numeric(28, 12), nullable=False)
+    low_price: Mapped[Decimal] = mapped_column(Numeric(28, 12), nullable=False)
+    close_price: Mapped[Decimal] = mapped_column(Numeric(28, 12), nullable=False)
+    volume: Mapped[Decimal] = mapped_column(Numeric(38, 12), nullable=False)
+    trade_count: Mapped[int | None] = mapped_column(Integer)
+    vwap: Mapped[Decimal | None] = mapped_column(Numeric(28, 12))
+    source: Mapped[str] = mapped_column(String(64), nullable=False, default="alpaca")
+    raw_payload: Mapped[dict[str, Any] | None] = mapped_column(JSON, deferred=True)
+
+
+class CryptoStrategyState(TimestampMixin, Base):
+    __tablename__ = "crypto_strategy_states"
+    __table_args__ = (
+        UniqueConstraint(
+            "mode",
+            "provider",
+            "strategy_version",
+            "symbol",
+            name="uq_crypto_strategy_states_mode_provider_version_symbol",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    mode: Mapped[str] = mapped_column(String(16), nullable=False)
+    provider: Mapped[str] = mapped_column(String(32), nullable=False)
+    strategy_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    symbol: Mapped[str] = mapped_column(String(32), nullable=False)
+    last_processed_bar_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    eligible: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    target_fraction: Mapped[Decimal] = mapped_column(
+        Numeric(12, 8),
+        nullable=False,
+        default=Decimal("0"),
+    )
+    strategy_owned_base_quantity: Mapped[Decimal] = mapped_column(
+        Numeric(28, 12),
+        nullable=False,
+        default=Decimal("0"),
+    )
+    high_water_price: Mapped[Decimal | None] = mapped_column(Numeric(28, 12))
+    protective_stop_price: Mapped[Decimal | None] = mapped_column(Numeric(28, 12))
+    last_action: Mapped[str | None] = mapped_column(String(32))
+    last_action_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    metrics: Mapped[dict[str, Any] | None] = mapped_column(JSON, deferred=True)
+
+
+class CryptoStrategyRiskState(TimestampMixin, Base):
+    __tablename__ = "crypto_strategy_risk_states"
+    __table_args__ = (
+        UniqueConstraint(
+            "mode",
+            "provider",
+            "strategy_version",
+            name="uq_crypto_strategy_risk_states_mode_provider_version",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    mode: Mapped[str] = mapped_column(String(16), nullable=False)
+    provider: Mapped[str] = mapped_column(String(32), nullable=False)
+    strategy_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    daily_baseline_equity: Mapped[Decimal | None] = mapped_column(Numeric(28, 4))
+    daily_baseline_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    weekly_baseline_equity: Mapped[Decimal | None] = mapped_column(Numeric(28, 4))
+    weekly_baseline_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    peak_equity: Mapped[Decimal | None] = mapped_column(Numeric(28, 4))
+    peak_equity_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    current_equity: Mapped[Decimal | None] = mapped_column(Numeric(28, 4))
+    current_equity_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    risk_status: Mapped[str] = mapped_column(String(32), nullable=False, default="healthy")
+    risk_reasons: Mapped[list[str] | None] = mapped_column(JSON, deferred=True)
+    metrics: Mapped[dict[str, Any] | None] = mapped_column(JSON, deferred=True)
+
+
+class CryptoStrategyDecision(Base):
+    """Append-only record of one strategy decision for a closed decision bar."""
+
+    __tablename__ = "crypto_strategy_decisions"
+    __table_args__ = (
+        Index(
+            "ix_crypto_strategy_decisions_mode_decided_at",
+            "mode",
+            "decided_at",
+        ),
+        UniqueConstraint(
+            "mode",
+            "provider",
+            "strategy_version",
+            "symbol",
+            "decision_bar_at",
+            name="uq_crypto_strategy_decisions_scope_bar",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    mode: Mapped[str] = mapped_column(String(16), nullable=False)
+    provider: Mapped[str] = mapped_column(String(32), nullable=False)
+    strategy_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    symbol: Mapped[str] = mapped_column(String(32), nullable=False)
+    decision_bar_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    decided_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+    action: Mapped[str] = mapped_column(String(32), nullable=False)
+    decision_status: Mapped[str] = mapped_column(String(32), nullable=False, default="planned")
+    eligible: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    target_fraction: Mapped[Decimal] = mapped_column(Numeric(12, 8), nullable=False)
+    reference_price: Mapped[Decimal | None] = mapped_column(Numeric(28, 12))
+    requested_base_quantity: Mapped[Decimal | None] = mapped_column(Numeric(28, 12))
+    requested_quote_notional: Mapped[Decimal | None] = mapped_column(Numeric(28, 4))
+    high_water_price: Mapped[Decimal | None] = mapped_column(Numeric(28, 12))
+    protective_stop_price: Mapped[Decimal | None] = mapped_column(Numeric(28, 12))
+    idempotency_key: Mapped[str | None] = mapped_column(String(128), index=True)
+    reasons: Mapped[list[str] | None] = mapped_column(JSON, deferred=True)
+    metrics: Mapped[dict[str, Any] | None] = mapped_column(JSON, deferred=True)
+    risk_context: Mapped[dict[str, Any] | None] = mapped_column(JSON, deferred=True)
+    payload: Mapped[dict[str, Any] | None] = mapped_column(JSON, deferred=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+
+
 class MonitoringCheckpoint(TimestampMixin, Base):
     __tablename__ = "monitoring_checkpoints"
     __table_args__ = (

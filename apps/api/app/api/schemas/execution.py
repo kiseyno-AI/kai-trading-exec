@@ -192,15 +192,15 @@ class PlaceOrderRequest(BaseModel):
     @field_validator("time_in_force")
     @classmethod
     def validate_time_in_force(cls, value: str) -> str:
-        if value not in {"day"}:
-            raise ValueError("time_in_force must be 'day'")
+        if value not in {"day", "gtc", "ioc"}:
+            raise ValueError("time_in_force must be 'day', 'gtc', or 'ioc'")
         return value
 
     @field_validator("exchange")
     @classmethod
     def validate_exchange(cls, value: str) -> str:
-        if value not in {"KRX", "NXT", "SOR", "UPBIT"}:
-            raise ValueError("exchange must be 'KRX', 'NXT', 'SOR', or 'UPBIT'")
+        if value not in {"KRX", "NXT", "SOR", "UPBIT", "ALPACA", "US"}:
+            raise ValueError("exchange must be 'KRX', 'NXT', 'SOR', 'UPBIT', 'ALPACA', or 'US'")
         return value
 
     @model_validator(mode="after")
@@ -209,11 +209,36 @@ class PlaceOrderRequest(BaseModel):
             raise ValueError("limit_price is required for limit orders")
         if self.order_type == "market" and self.limit_price is not None:
             raise ValueError("limit_price must be omitted for market orders")
-        if self.asset_class == "crypto" or self.provider == "upbit":
-            if self.provider != "upbit":
-                raise ValueError("crypto orders currently require provider='upbit'")
+        if self.asset_class == "us_equity":
+            if self.provider != "alpaca":
+                raise ValueError("US-equity orders require provider='alpaca'")
+            sizing_fields = [
+                self.quantity is not None,
+                self.base_quantity is not None,
+                self.quote_notional is not None,
+            ]
+            if sum(sizing_fields) != 1:
+                raise ValueError(
+                    "Alpaca US-equity orders require exactly one of base_quantity or quote_notional"
+                )
+            if self.quantity is not None:
+                raise ValueError(
+                    "Alpaca US-equity orders must use base_quantity or quote_notional, not integer quantity"
+                )
+            if self.quote_notional is not None and not (
+                self.side == "buy" and self.order_type == "market"
+            ):
+                raise ValueError("quote_notional is only supported for Alpaca US-equity market buys")
+            if self.exchange != "US":
+                raise ValueError("Alpaca US-equity orders require exchange='US'")
+            if self.time_in_force != "day":
+                raise ValueError("Alpaca US-equity orders require time_in_force='day'")
+            return self
+        if self.asset_class == "crypto" or self.provider in {"upbit", "alpaca"}:
+            if self.provider not in {"upbit", "alpaca"}:
+                raise ValueError("crypto orders require provider='upbit' or provider='alpaca'")
             if self.asset_class != "crypto":
-                raise ValueError("Upbit orders require asset_class='crypto'")
+                raise ValueError("crypto providers require asset_class='crypto'")
             sizing_fields = [
                 self.quantity is not None,
                 self.base_quantity is not None,
@@ -227,9 +252,19 @@ class PlaceOrderRequest(BaseModel):
                 raise ValueError("crypto orders must use base_quantity or quote_notional, not integer quantity")
             if self.quote_notional is not None and not (self.side == "buy" and self.order_type == "market"):
                 raise ValueError("quote_notional is only supported for crypto market buys")
+            if self.provider == "upbit":
+                if self.exchange != "UPBIT" or self.time_in_force != "day":
+                    raise ValueError("Upbit crypto orders require exchange='UPBIT' and time_in_force='day'")
+            if self.provider == "alpaca":
+                if self.exchange != "ALPACA":
+                    raise ValueError("Alpaca crypto orders require exchange='ALPACA'")
+                if self.time_in_force not in {"gtc", "ioc"}:
+                    raise ValueError("Alpaca crypto orders require time_in_force='gtc' or 'ioc'")
             return self
         if self.provider != "kis":
-            raise ValueError("provider must be 'kis' or 'upbit'")
+            raise ValueError("provider must be 'kis', 'upbit', or 'alpaca'")
+        if self.time_in_force != "day":
+            raise ValueError("KIS stock orders require time_in_force='day'")
         if self.quantity is None:
             raise ValueError("stock orders require quantity")
         if self.base_quantity is not None or self.quote_notional is not None:

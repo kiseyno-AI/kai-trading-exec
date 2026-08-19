@@ -104,7 +104,7 @@ def reconcile_broker_order(
 
     event_time = _parse_timestamp(payload.get("observed_at"), fallback=event_time)
     normalized_status = _normalize_status(payload.get("status"))
-    fills = _parse_fills_from_payload(
+    fills, fill_delta_anomalies = _parse_fills_from_payload(
         payload=payload,
         order=order,
         observed_at=event_time,
@@ -124,6 +124,11 @@ def reconcile_broker_order(
                 payload={
                     **_build_reconcile_event_payload(payload=payload, adapter=adapter),
                     "raw_status_details": _raw_status_details(payload),
+                    **(
+                        {"fill_delta_anomalies": _json_safe_value(fill_delta_anomalies)}
+                        if fill_delta_anomalies
+                        else {}
+                    ),
                 },
                 observed_at=event_time,
             )
@@ -162,6 +167,10 @@ def reconcile_broker_order(
     )
     order.last_broker_sync_at = event_time
 
+    reconcile_event_payload = _build_reconcile_event_payload(payload=payload, adapter=adapter)
+    if fill_delta_anomalies:
+        reconcile_event_payload["fill_delta_anomalies"] = _json_safe_value(fill_delta_anomalies)
+
     db.add(
         BrokerOrderEvent(
             broker_order_pk=order.id,
@@ -172,7 +181,7 @@ def reconcile_broker_order(
             message=_optional_str(payload.get("message")),
             request_payload=_dict_or_none(payload.get("request_payload")),
             response_payload=_safe_payload(payload.get("payload")),
-            payload=_build_reconcile_event_payload(payload=payload, adapter=adapter),
+            payload=reconcile_event_payload,
             observed_at=event_time,
         )
     )
@@ -256,10 +265,11 @@ def reconcile_pending_broker_orders(
     db: Session,
     adapter: BrokerAdapter,
     symbols: set[str] | None = None,
-    ) -> dict[str, int]:
+) -> dict[str, int]:
     orders = _load_pending_orders_for_reconciliation(
         db=db,
         settings=settings,
+        broker_name=adapter.provider,
         symbols=_normalize_symbols(symbols),
     )
     return reconcile_broker_orders(
@@ -694,10 +704,12 @@ def _load_pending_orders_for_reconciliation(
     *,
     db: Session,
     settings: Settings,
+    broker_name: str,
     symbols: set[str] | None,
 ) -> list[BrokerOrder]:
     where = [
         BrokerOrder.mode == settings.runtime_mode,
+        BrokerOrder.broker_name == broker_name,
         BrokerOrder.status.in_(_reconcilable_order_statuses()),
         BrokerOrder.broker_order_id.is_not(None),
     ]
@@ -778,6 +790,7 @@ def sync_execution_positions_from_broker_snapshot(
                         mode=settings.runtime_mode,
                         symbol=symbol,
                         quantity=0,
+                        base_quantity=Decimal("0"),
                         average_price=None,
                         updated_from="reconciliation",
                         last_reconciled_at=observed_at,
@@ -787,23 +800,28 @@ def sync_execution_positions_from_broker_snapshot(
                 created += 1
                 continue
 
+            changed = False
             if position.quantity != 0:
                 position.quantity = 0
+                changed = True
+            if position.base_quantity is not None and position.base_quantity != 0:
+                position.base_quantity = Decimal("0")
+                changed = True
+            if changed:
                 zeroed += 1
             position.updated_from = "reconciliation"
             position.last_reconciled_at = observed_at
             position.raw_payload = _snapshot_payload(snapshot.payload)
-            if position.quantity == 0:
-                continue
-            updated += 1
             continue
 
+        holding_base_quantity = _holding_base_quantity(holding.payload)
         if position is None:
             db.add(
                 ExecutionPosition(
                     mode=settings.runtime_mode,
                     symbol=symbol,
-                    quantity=holding.quantity,
+                    quantity=0 if holding_base_quantity is not None else holding.quantity,
+                    base_quantity=holding_base_quantity,
                     average_price=holding.average_price,
                     updated_from="reconciliation",
                     last_reconciled_at=observed_at,
@@ -814,8 +832,15 @@ def sync_execution_positions_from_broker_snapshot(
             continue
 
         changed = False
-        if position.quantity != holding.quantity:
-            position.quantity = holding.quantity
+        expected_quantity = 0 if holding_base_quantity is not None else holding.quantity
+        if position.quantity != expected_quantity:
+            position.quantity = expected_quantity
+            changed = True
+        if holding_base_quantity is not None and position.base_quantity != holding_base_quantity:
+            position.base_quantity = holding_base_quantity
+            changed = True
+        if holding_base_quantity is None and position.base_quantity not in {None, Decimal("0")}:
+            position.base_quantity = None
             changed = True
         if position.average_price != holding.average_price:
             position.average_price = holding.average_price
@@ -835,6 +860,16 @@ def sync_execution_positions_from_broker_snapshot(
         "updated": updated,
         "zeroed": zeroed,
     }
+
+
+def _holding_base_quantity(payload: object) -> Decimal | None:
+    if not isinstance(payload, dict):
+        return None
+    value = payload.get("base_quantity")
+    parsed = _parse_decimal(value)
+    if parsed is None or parsed < 0:
+        return None
+    return parsed
 
 
 def _snapshot_payload(payload: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -1177,7 +1212,7 @@ def _normalized_exchange(value: object) -> str | None:
     if not isinstance(value, str):
         return None
     normalized = value.strip().upper()
-    if normalized in {"KRX", "NXT", "SOR"}:
+    if normalized in {"KRX", "NXT", "SOR", "UPBIT", "ALPACA", "US"}:
         return normalized
     return None
 
@@ -1193,7 +1228,7 @@ def _parse_fills_from_payload(
     payload: dict[str, object],
     order: BrokerOrder,
     observed_at: datetime,
-) -> list[dict[str, object]]:
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
     fills_payload = payload.get("fills")
     if isinstance(fills_payload, list) and fills_payload:
         result: list[dict[str, object]] = []
@@ -1208,19 +1243,65 @@ def _parse_fills_from_payload(
             if parsed_fill is None:
                 continue
             result.append(parsed_fill)
-        return result
+        return result, []
+
+    total_filled_base = _parse_decimal(payload.get("filled_base_quantity"))
+    if total_filled_base is not None and total_filled_base > 0:
+        existing_total_base = sum(
+            Decimal(fill.base_quantity or 0)
+            for fill in order.fills
+        )
+        average_fill_price = _parse_decimal(payload.get("average_fill_price"))
+        delta_result = _cumulative_fill_delta(
+            order=order,
+            total_filled=total_filled_base,
+            existing_total=existing_total_base,
+            average_fill_price=average_fill_price,
+            quantity_basis="base_quantity",
+        )
+        if delta_result["status"] != "ok":
+            anomalies = delta_result["anomalies"]
+            return [], anomalies if isinstance(anomalies, list) else []
+        delta = _coerce_decimal(delta_result["delta"])
+        incremental_notional = _coerce_decimal(delta_result["incremental_notional"])
+        incremental_price = _coerce_decimal(delta_result["incremental_price"])
+        filled_at = _parse_timestamp(payload.get("filled_at"), fallback=observed_at)
+        broker_fill_id = _optional_str(payload.get("broker_fill_id")) or (
+            f"{order.broker_order_id}:cumulative:{format(total_filled_base.normalize(), 'f')}"
+        )
+        return [{
+            "broker_fill_id": broker_fill_id,
+            "quantity": 0,
+            "base_quantity": delta,
+            "quote_notional": incremental_notional,
+            "price": incremental_price,
+            "filled_at": filled_at.isoformat(),
+            "symbol": order.symbol,
+            "side": order.side,
+            "price_derivation": "cumulative_notional_delta",
+            "cumulative_base_quantity": total_filled_base,
+            "cumulative_average_fill_price": average_fill_price,
+            "cumulative_quote_notional": delta_result["current_cumulative_notional"],
+            "previous_base_quantity": existing_total_base,
+            "previous_quote_notional": delta_result["previous_cumulative_notional"],
+        }], []
 
     total_filled = _parse_int(payload.get("filled_quantity"))
     if total_filled is None or total_filled <= 0:
-        return []
+        return [], []
 
     existing_total = _sum_fill_quantities(order.fills)
-    if total_filled <= existing_total:
-        return []
-
     average_fill_price = _parse_decimal(payload.get("average_fill_price"))
-    if average_fill_price is None and payload.get("fills") is None:
-        return []
+    delta_result = _cumulative_fill_delta(
+        order=order,
+        total_filled=Decimal(total_filled),
+        existing_total=Decimal(existing_total),
+        average_fill_price=average_fill_price,
+        quantity_basis="quantity",
+    )
+    if delta_result["status"] != "ok":
+        anomalies = delta_result["anomalies"]
+        return [], anomalies if isinstance(anomalies, list) else []
 
     filled_at = _parse_timestamp(
         payload.get("filled_at"),
@@ -1230,16 +1311,143 @@ def _parse_fills_from_payload(
         {
             "broker_fill_id": _optional_str(payload.get("broker_fill_id")),
             "quantity": total_filled - existing_total,
-            "price": average_fill_price or Decimal("0"),
+            "quote_notional": delta_result["incremental_notional"],
+            "price": delta_result["incremental_price"],
             "filled_at": filled_at.isoformat(),
             "symbol": order.symbol,
             "side": order.side,
+            "price_derivation": "cumulative_notional_delta",
+            "cumulative_quantity": total_filled,
+            "cumulative_average_fill_price": average_fill_price,
+            "cumulative_quote_notional": delta_result["current_cumulative_notional"],
+            "previous_quantity": existing_total,
+            "previous_quote_notional": delta_result["previous_cumulative_notional"],
         }
-    ]
+    ], []
 
 
 def _sum_fill_quantities(fills: list[ExecutionFill]) -> int:
     return sum(fill.quantity for fill in fills)
+
+
+def _cumulative_fill_delta(
+    *,
+    order: BrokerOrder,
+    total_filled: Decimal,
+    existing_total: Decimal,
+    average_fill_price: Decimal | None,
+    quantity_basis: str,
+) -> dict[str, object]:
+    if total_filled < existing_total:
+        return _cumulative_fill_delta_anomaly(
+            reason="cumulative_quantity_regressed",
+            total_filled=total_filled,
+            existing_total=existing_total,
+            average_fill_price=average_fill_price,
+            quantity_basis=quantity_basis,
+            order=order,
+        )
+    if total_filled == existing_total:
+        return {"status": "noop", "anomalies": []}
+    if average_fill_price is None:
+        return _cumulative_fill_delta_anomaly(
+            reason="missing_average_fill_price",
+            total_filled=total_filled,
+            existing_total=existing_total,
+            average_fill_price=average_fill_price,
+            quantity_basis=quantity_basis,
+            order=order,
+        )
+    if average_fill_price <= 0:
+        return _cumulative_fill_delta_anomaly(
+            reason="non_positive_average_fill_price",
+            total_filled=total_filled,
+            existing_total=existing_total,
+            average_fill_price=average_fill_price,
+            quantity_basis=quantity_basis,
+            order=order,
+        )
+
+    delta = total_filled - existing_total
+    previous_cumulative_notional = _sum_existing_fill_notional(
+        fills=order.fills,
+        quantity_basis=quantity_basis,
+    )
+    current_cumulative_notional = total_filled * average_fill_price
+    incremental_notional = current_cumulative_notional - previous_cumulative_notional
+    if incremental_notional <= 0:
+        return _cumulative_fill_delta_anomaly(
+            reason="non_positive_incremental_notional",
+            total_filled=total_filled,
+            existing_total=existing_total,
+            average_fill_price=average_fill_price,
+            quantity_basis=quantity_basis,
+            order=order,
+            current_cumulative_notional=current_cumulative_notional,
+            previous_cumulative_notional=previous_cumulative_notional,
+            incremental_notional=incremental_notional,
+        )
+
+    return {
+        "status": "ok",
+        "anomalies": [],
+        "delta": delta,
+        "current_cumulative_notional": current_cumulative_notional,
+        "previous_cumulative_notional": previous_cumulative_notional,
+        "incremental_notional": incremental_notional,
+        "incremental_price": incremental_notional / delta,
+    }
+
+
+def _cumulative_fill_delta_anomaly(
+    *,
+    reason: str,
+    total_filled: Decimal,
+    existing_total: Decimal,
+    average_fill_price: Decimal | None,
+    quantity_basis: str,
+    order: BrokerOrder,
+    current_cumulative_notional: Decimal | None = None,
+    previous_cumulative_notional: Decimal | None = None,
+    incremental_notional: Decimal | None = None,
+) -> dict[str, object]:
+    anomaly = {
+        "reason": reason,
+        "broker_order_id": order.broker_order_id,
+        "symbol": order.symbol,
+        "side": order.side,
+        "quantity_basis": quantity_basis,
+        "total_filled": total_filled,
+        "existing_total": existing_total,
+        "average_fill_price": average_fill_price,
+        "current_cumulative_notional": current_cumulative_notional,
+        "previous_cumulative_notional": previous_cumulative_notional,
+        "incremental_notional": incremental_notional,
+    }
+    return {"status": "anomaly", "anomalies": [anomaly]}
+
+
+def _sum_existing_fill_notional(
+    *,
+    fills: list[ExecutionFill],
+    quantity_basis: str,
+) -> Decimal:
+    total = Decimal("0")
+    for fill in fills:
+        if fill.quote_notional is not None and fill.quote_notional >= 0:
+            total += Decimal(fill.quote_notional)
+            continue
+        quantity = _fill_notional_quantity(fill=fill, quantity_basis=quantity_basis)
+        if quantity <= 0:
+            continue
+        total += quantity * Decimal(fill.price)
+    return total
+
+
+def _fill_notional_quantity(*, fill: ExecutionFill, quantity_basis: str) -> Decimal:
+    if quantity_basis == "base_quantity":
+        return Decimal(fill.base_quantity or 0)
+    return Decimal(fill.quantity)
 
 
 def _normalize_fill_payload(
@@ -1248,8 +1456,9 @@ def _normalize_fill_payload(
     observed_at: datetime,
     order: BrokerOrder,
 ) -> dict[str, object] | None:
-    quantity = _parse_int(fill_item.get("quantity"))
-    if quantity is None or quantity <= 0:
+    quantity = _parse_int(fill_item.get("quantity")) or 0
+    base_quantity = _parse_decimal(fill_item.get("base_quantity"))
+    if quantity <= 0 and (base_quantity is None or base_quantity <= 0):
         return None
     price = _parse_decimal(fill_item.get("price"))
     if price is None:
@@ -1261,6 +1470,8 @@ def _normalize_fill_payload(
     return {
         "broker_fill_id": _optional_str(fill_item.get("broker_fill_id")),
         "quantity": quantity,
+        "base_quantity": base_quantity,
+        "quote_notional": _parse_decimal(fill_item.get("quote_notional")),
         "price": price,
         "filled_at": filled_at.isoformat(),
         "symbol": _optional_str(fill_item.get("symbol")) or order.symbol,
@@ -1296,6 +1507,8 @@ def _upsert_order_fills(
                 symbol=str(fill["symbol"]),
                 side=str(fill["side"]),
                 quantity=int(fill["quantity"]),
+                base_quantity=_parse_decimal(fill.get("base_quantity")),
+                quote_notional=_parse_decimal(fill.get("quote_notional")),
                 price=_coerce_decimal(fill["price"]),
                 filled_at=_parse_timestamp(
                     fill["filled_at"],
@@ -1315,13 +1528,13 @@ def _fill_signature_candidate(
     fill: dict[str, object],
 ) -> str | None:
     broker_fill_id = _optional_str(fill.get("broker_fill_id"))
-    quantity = _parse_int(fill.get("quantity"))
+    quantity = _parse_int(fill.get("quantity")) or 0
+    base_quantity = _parse_decimal(fill.get("base_quantity"))
     price = _parse_decimal(fill.get("price"))
     symbol = _optional_str(fill.get("symbol"))
     side = _optional_str(fill.get("side"))
     if (
-        quantity is None
-        or quantity <= 0
+        (quantity <= 0 and (base_quantity is None or base_quantity <= 0))
         or price is None
         or not symbol
         or not side
@@ -1336,6 +1549,8 @@ def _fill_signature_candidate(
         filled_at=filled_at,
         price=price,
         quantity=quantity,
+        base_quantity=base_quantity,
+        quote_notional=_parse_decimal(fill.get("quote_notional")),
     )
 
 

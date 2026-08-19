@@ -18,6 +18,16 @@ from app.services.runtime import (
 router = APIRouter(prefix="/runtime", tags=["runtime"])
 
 
+@router.get("/alpaca-crypto")
+def alpaca_crypto_runtime_status(request: Request) -> dict[str, object]:
+    return request.app.state.alpaca_crypto_runtime.snapshot()
+
+
+@router.get("/alpaca-us-equity")
+def alpaca_us_equity_runtime_status(request: Request) -> dict[str, object]:
+    return request.app.state.alpaca_us_equity_runtime.snapshot()
+
+
 @router.get("/status")
 def runtime_status(
     request: Request,

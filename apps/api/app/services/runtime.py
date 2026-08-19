@@ -1587,7 +1587,7 @@ def broker_provider_readiness(
     db: Session | None,
 ) -> dict[str, object]:
     providers: dict[str, object] = {}
-    for provider in ("kis", "upbit"):
+    for provider in ("kis", "upbit", "alpaca"):
         adapter = build_broker_adapter(settings, provider=provider)
         providers[provider] = build_broker_session_summary(
             settings=settings,
