@@ -24,6 +24,7 @@ class Settings(BaseModel):
     db_connect_timeout_seconds: int = Field(default=5, ge=1, le=120)
     db_long_checkout_warning_seconds: float = Field(default=10.0, gt=0, le=3600)
     sqlite_busy_timeout_seconds: int = Field(default=30, ge=1, le=300)
+    sqlite_wal_autocheckpoint_pages: int = Field(default=0, ge=0, le=1_000_000)
     log_level: str = "INFO"
     log_format: LogFormat = "json"
     api_host: str = "127.0.0.1"
@@ -168,6 +169,78 @@ class Settings(BaseModel):
     upbit_base_url: str = "https://api.upbit.com"
     upbit_live_trading_enabled: bool = False
     upbit_request_timeout_seconds: int = Field(default=10, ge=1, le=120)
+    alpaca_api_key: str | None = None
+    alpaca_api_secret: str | None = None
+    alpaca_live_base_url: str = "https://api.alpaca.markets"
+    alpaca_paper_base_url: str = "https://paper-api.alpaca.markets"
+    alpaca_data_base_url: str = "https://data.alpaca.markets"
+    alpaca_live_trading_enabled: bool = False
+    alpaca_request_timeout_seconds: int = Field(default=10, ge=1, le=120)
+    alpaca_crypto_monitoring_enabled: bool = False
+    alpaca_crypto_monitoring_interval_seconds: float = Field(default=15.0, ge=3.0, le=3600)
+    alpaca_crypto_reconcile_interval_seconds: float = Field(default=30.0, ge=5.0, le=3600)
+    alpaca_crypto_allowed_symbols: str = "BTC/USD,ETH/USD"
+    alpaca_crypto_max_order_notional_usd: Decimal = Field(default=Decimal("1000"), gt=0)
+    alpaca_crypto_strategy_enabled: bool = False
+    alpaca_crypto_strategy_live_enabled: bool = False
+    alpaca_crypto_strategy_version: str = "crypto_trend_v1"
+    alpaca_crypto_strategy_decision_hour_utc: int = Field(default=0, ge=0, le=23)
+    alpaca_crypto_strategy_decision_minute_utc: int = Field(default=10, ge=0, le=59)
+    alpaca_crypto_strategy_history_days: int = Field(default=500, ge=260, le=3650)
+    alpaca_crypto_strategy_sleeve_usd: Decimal = Field(default=Decimal("1000"), gt=0)
+    alpaca_crypto_strategy_max_invested_fraction: Decimal = Field(
+        default=Decimal("0.60"),
+        gt=0,
+        le=1,
+    )
+    alpaca_crypto_strategy_target_volatility: Decimal = Field(
+        default=Decimal("0.10"),
+        gt=0,
+        le=1,
+    )
+    alpaca_crypto_strategy_max_position_risk_fraction: Decimal = Field(
+        default=Decimal("0.0025"),
+        gt=0,
+        le=Decimal("0.02"),
+    )
+    alpaca_crypto_strategy_min_order_notional_usd: Decimal = Field(default=Decimal("25"), gt=0)
+    alpaca_crypto_strategy_min_rebalance_fraction: Decimal = Field(
+        default=Decimal("0.05"),
+        ge=0,
+        le=1,
+    )
+    alpaca_crypto_strategy_quote_max_age_seconds: int = Field(default=60, ge=5, le=3600)
+    alpaca_crypto_strategy_max_spread_bps: Decimal = Field(default=Decimal("100"), gt=0)
+    alpaca_crypto_strategy_stop_atr_multiple: Decimal = Field(default=Decimal("3"), gt=0, le=10)
+    alpaca_crypto_strategy_max_stop_distance_fraction: Decimal = Field(
+        default=Decimal("0.12"),
+        gt=0,
+        le=Decimal("0.50"),
+    )
+    alpaca_crypto_strategy_daily_drawdown_fraction: Decimal = Field(
+        default=Decimal("0.01"),
+        gt=0,
+        le=Decimal("0.50"),
+    )
+    alpaca_crypto_strategy_weekly_drawdown_fraction: Decimal = Field(
+        default=Decimal("0.03"),
+        gt=0,
+        le=Decimal("0.50"),
+    )
+    alpaca_crypto_strategy_peak_drawdown_fraction: Decimal = Field(
+        default=Decimal("0.08"),
+        gt=0,
+        le=Decimal("0.90"),
+    )
+    alpaca_us_equity_monitoring_enabled: bool = False
+    alpaca_us_equity_monitoring_interval_seconds: float = Field(default=15.0, ge=3.0, le=3600)
+    alpaca_us_equity_reconcile_interval_seconds: float = Field(default=30.0, ge=5.0, le=3600)
+    alpaca_us_equity_allowed_symbols: str = "SPY,QQQ"
+    alpaca_us_equity_max_order_notional_usd: Decimal = Field(default=Decimal("100"), gt=0)
+    alpaca_us_equity_strategy_enabled: bool = False
+    alpaca_us_equity_strategy_live_enabled: bool = False
+    alpaca_us_equity_strategy_version: str = "us_equity_trend_v1"
+    alpaca_us_equity_strategy_sleeve_usd: Decimal = Field(default=Decimal("1000"), gt=0)
     domestic_order_session_routing_enabled: bool = False
     allow_krx_pre_open_offhours_orders: bool = False
     allow_krx_after_hours_closing_orders: bool = False
@@ -238,6 +311,7 @@ _ENV_FIELDS = {
     "DB_CONNECT_TIMEOUT_SECONDS": "db_connect_timeout_seconds",
     "DB_LONG_CHECKOUT_WARNING_SECONDS": "db_long_checkout_warning_seconds",
     "SQLITE_BUSY_TIMEOUT_SECONDS": "sqlite_busy_timeout_seconds",
+    "SQLITE_WAL_AUTOCHECKPOINT_PAGES": "sqlite_wal_autocheckpoint_pages",
     "LOG_LEVEL": "log_level",
     "LOG_FORMAT": "log_format",
     "API_HOST": "api_host",
@@ -382,6 +456,46 @@ _ENV_FIELDS = {
     "UPBIT_BASE_URL": "upbit_base_url",
     "UPBIT_LIVE_TRADING_ENABLED": "upbit_live_trading_enabled",
     "UPBIT_REQUEST_TIMEOUT_SECONDS": "upbit_request_timeout_seconds",
+    "ALPACA_API_KEY": "alpaca_api_key",
+    "ALPACA_API_SECRET": "alpaca_api_secret",
+    "ALPACA_LIVE_BASE_URL": "alpaca_live_base_url",
+    "ALPACA_PAPER_BASE_URL": "alpaca_paper_base_url",
+    "ALPACA_DATA_BASE_URL": "alpaca_data_base_url",
+    "ALPACA_LIVE_TRADING_ENABLED": "alpaca_live_trading_enabled",
+    "ALPACA_REQUEST_TIMEOUT_SECONDS": "alpaca_request_timeout_seconds",
+    "ALPACA_CRYPTO_MONITORING_ENABLED": "alpaca_crypto_monitoring_enabled",
+    "ALPACA_CRYPTO_MONITORING_INTERVAL_SECONDS": "alpaca_crypto_monitoring_interval_seconds",
+    "ALPACA_CRYPTO_RECONCILE_INTERVAL_SECONDS": "alpaca_crypto_reconcile_interval_seconds",
+    "ALPACA_CRYPTO_ALLOWED_SYMBOLS": "alpaca_crypto_allowed_symbols",
+    "ALPACA_CRYPTO_MAX_ORDER_NOTIONAL_USD": "alpaca_crypto_max_order_notional_usd",
+    "ALPACA_CRYPTO_STRATEGY_ENABLED": "alpaca_crypto_strategy_enabled",
+    "ALPACA_CRYPTO_STRATEGY_LIVE_ENABLED": "alpaca_crypto_strategy_live_enabled",
+    "ALPACA_CRYPTO_STRATEGY_VERSION": "alpaca_crypto_strategy_version",
+    "ALPACA_CRYPTO_STRATEGY_DECISION_HOUR_UTC": "alpaca_crypto_strategy_decision_hour_utc",
+    "ALPACA_CRYPTO_STRATEGY_DECISION_MINUTE_UTC": "alpaca_crypto_strategy_decision_minute_utc",
+    "ALPACA_CRYPTO_STRATEGY_HISTORY_DAYS": "alpaca_crypto_strategy_history_days",
+    "ALPACA_CRYPTO_STRATEGY_SLEEVE_USD": "alpaca_crypto_strategy_sleeve_usd",
+    "ALPACA_CRYPTO_STRATEGY_MAX_INVESTED_FRACTION": "alpaca_crypto_strategy_max_invested_fraction",
+    "ALPACA_CRYPTO_STRATEGY_TARGET_VOLATILITY": "alpaca_crypto_strategy_target_volatility",
+    "ALPACA_CRYPTO_STRATEGY_MAX_POSITION_RISK_FRACTION": "alpaca_crypto_strategy_max_position_risk_fraction",
+    "ALPACA_CRYPTO_STRATEGY_MIN_ORDER_NOTIONAL_USD": "alpaca_crypto_strategy_min_order_notional_usd",
+    "ALPACA_CRYPTO_STRATEGY_MIN_REBALANCE_FRACTION": "alpaca_crypto_strategy_min_rebalance_fraction",
+    "ALPACA_CRYPTO_STRATEGY_QUOTE_MAX_AGE_SECONDS": "alpaca_crypto_strategy_quote_max_age_seconds",
+    "ALPACA_CRYPTO_STRATEGY_MAX_SPREAD_BPS": "alpaca_crypto_strategy_max_spread_bps",
+    "ALPACA_CRYPTO_STRATEGY_STOP_ATR_MULTIPLE": "alpaca_crypto_strategy_stop_atr_multiple",
+    "ALPACA_CRYPTO_STRATEGY_MAX_STOP_DISTANCE_FRACTION": "alpaca_crypto_strategy_max_stop_distance_fraction",
+    "ALPACA_CRYPTO_STRATEGY_DAILY_DRAWDOWN_FRACTION": "alpaca_crypto_strategy_daily_drawdown_fraction",
+    "ALPACA_CRYPTO_STRATEGY_WEEKLY_DRAWDOWN_FRACTION": "alpaca_crypto_strategy_weekly_drawdown_fraction",
+    "ALPACA_CRYPTO_STRATEGY_PEAK_DRAWDOWN_FRACTION": "alpaca_crypto_strategy_peak_drawdown_fraction",
+    "ALPACA_US_EQUITY_MONITORING_ENABLED": "alpaca_us_equity_monitoring_enabled",
+    "ALPACA_US_EQUITY_MONITORING_INTERVAL_SECONDS": "alpaca_us_equity_monitoring_interval_seconds",
+    "ALPACA_US_EQUITY_RECONCILE_INTERVAL_SECONDS": "alpaca_us_equity_reconcile_interval_seconds",
+    "ALPACA_US_EQUITY_ALLOWED_SYMBOLS": "alpaca_us_equity_allowed_symbols",
+    "ALPACA_US_EQUITY_MAX_ORDER_NOTIONAL_USD": "alpaca_us_equity_max_order_notional_usd",
+    "ALPACA_US_EQUITY_STRATEGY_ENABLED": "alpaca_us_equity_strategy_enabled",
+    "ALPACA_US_EQUITY_STRATEGY_LIVE_ENABLED": "alpaca_us_equity_strategy_live_enabled",
+    "ALPACA_US_EQUITY_STRATEGY_VERSION": "alpaca_us_equity_strategy_version",
+    "ALPACA_US_EQUITY_STRATEGY_SLEEVE_USD": "alpaca_us_equity_strategy_sleeve_usd",
     "DOMESTIC_ORDER_SESSION_ROUTING_ENABLED": "domestic_order_session_routing_enabled",
     "ALLOW_KRX_PRE_OPEN_OFFHOURS_ORDERS": "allow_krx_pre_open_offhours_orders",
     "ALLOW_KRX_AFTER_HOURS_CLOSING_ORDERS": "allow_krx_after_hours_closing_orders",

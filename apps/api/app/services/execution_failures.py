@@ -109,7 +109,16 @@ def record_actionable_execution_failure(
         )
     )
     plan = plan_item.plan if plan_item is not None else None
-    requested_notional = _requested_notional(order.quantity, order.limit_price)
+    requested_quantity = order.quantity or 0
+    requested_notional = (
+        order.quote_notional
+        or (
+            order.base_quantity * order.limit_price
+            if order.base_quantity is not None and order.limit_price is not None
+            else None
+        )
+        or _requested_notional(requested_quantity, order.limit_price)
+    )
     account = _account_identifier(settings=settings, order=order)
     decision_actor = _decision_actor(plan_item=plan_item)
     raw_context = {
@@ -135,7 +144,7 @@ def record_actionable_execution_failure(
             symbol=order.symbol,
             side=order.side,
             intent=plan_item.intent if plan_item is not None else None,
-            requested_quantity=order.quantity,
+            requested_quantity=requested_quantity,
             requested_limit_price=order.limit_price,
             requested_notional=requested_notional,
             classification=classification,
@@ -161,7 +170,7 @@ def record_actionable_execution_failure(
     failure.decision_actor = decision_actor or failure.decision_actor
     failure.account = account or failure.account
     failure.intent = plan_item.intent if plan_item is not None else failure.intent
-    failure.requested_quantity = order.quantity
+    failure.requested_quantity = requested_quantity
     failure.requested_limit_price = order.limit_price
     failure.requested_notional = requested_notional
     failure.classification = classification

@@ -116,6 +116,7 @@ def _configure_pool_diagnostics(engine: Engine, *, settings: Settings) -> None:
 
 def _configure_sqlite_engine(engine: Engine, *, settings: Settings) -> None:
     busy_timeout_ms = settings.sqlite_busy_timeout_seconds * 1000
+    wal_autocheckpoint_pages = settings.sqlite_wal_autocheckpoint_pages
 
     @event.listens_for(engine, "connect")
     def _set_sqlite_pragmas(dbapi_connection, _connection_record) -> None:  # type: ignore[no-untyped-def]
@@ -123,7 +124,7 @@ def _configure_sqlite_engine(engine: Engine, *, settings: Settings) -> None:
         try:
             cursor.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
             cursor.execute("PRAGMA journal_mode=WAL")
-            cursor.execute("PRAGMA wal_autocheckpoint=0")
+            cursor.execute(f"PRAGMA wal_autocheckpoint={wal_autocheckpoint_pages}")
             cursor.execute("PRAGMA synchronous=NORMAL")
             cursor.execute("PRAGMA foreign_keys=ON")
         finally:

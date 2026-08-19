@@ -88,6 +88,18 @@ def place_broker_order(
             },
         )
 
+    provider_error = _validate_provider_capability(adapter=adapter, command=command)
+    if provider_error is not None:
+        return PlaceBrokerOrderResult(
+            status_code=422,
+            payload={
+                "duplicate": False,
+                "message": provider_error,
+                "permanent_rejection": True,
+                "rejection_reason": provider_error,
+            },
+        )
+
     plan_item = _load_plan_item(
         settings=settings,
         db=db,
@@ -123,6 +135,23 @@ def place_broker_order(
                 "message": upbit_guard_error,
                 "permanent_rejection": True,
                 "rejection_reason": upbit_guard_error,
+            },
+        )
+
+    alpaca_guard_error = _validate_alpaca_crypto_guardrails(
+        settings=settings,
+        adapter=adapter,
+        command=command,
+        plan_item=plan_item,
+    )
+    if alpaca_guard_error is not None:
+        return PlaceBrokerOrderResult(
+            status_code=409,
+            payload={
+                "duplicate": False,
+                "message": alpaca_guard_error,
+                "permanent_rejection": True,
+                "rejection_reason": alpaca_guard_error,
             },
         )
 
@@ -482,6 +511,23 @@ def _validate_plan_item(
     return None
 
 
+def _validate_provider_capability(
+    *,
+    adapter: BrokerAdapter,
+    command: PlaceOrderRequest,
+) -> str | None:
+    if command.provider != adapter.provider:
+        return (
+            f"order provider '{command.provider}' does not match adapter "
+            f"provider '{adapter.provider}'"
+        )
+    if command.provider == "upbit" and command.asset_class != "crypto":
+        return "upbit adapter accepts crypto orders only"
+    if command.provider == "alpaca" and command.asset_class not in {"crypto", "us_equity"}:
+        return "alpaca adapter accepts crypto and US-equity orders only"
+    return None
+
+
 def _validate_upbit_paper_guardrails(
     *,
     settings: Settings,
@@ -514,6 +560,66 @@ def _validate_upbit_paper_guardrails(
         return "Upbit crypto paper buy requires deterministic quote_notional or limit-price notional"
     if notional is not None and notional > settings.exec_agent_max_symbol_budget:
         return "Upbit crypto paper order exceeds per-symbol execution budget"
+    return None
+
+
+def _validate_alpaca_crypto_guardrails(
+    *,
+    settings: Settings,
+    adapter: BrokerAdapter,
+    command: PlaceOrderRequest,
+    plan_item: ExecutionPlanItem | None,
+) -> str | None:
+    if command.provider != "alpaca" and adapter.provider != "alpaca":
+        return None
+    if command.provider != "alpaca" or adapter.provider != "alpaca":
+        return "Alpaca crypto execution requires provider='alpaca'"
+    if command.asset_class not in {"crypto", "us_equity"}:
+        return "Alpaca execution requires asset_class='crypto' or 'us_equity'"
+    expected_exchange = "ALPACA" if command.asset_class == "crypto" else "US"
+    if (command.venue or "").lower() != "alpaca" or command.exchange != expected_exchange:
+        return f"Alpaca {command.asset_class} execution requires venue='alpaca' and exchange='{expected_exchange}'"
+    configured_symbols = (
+        settings.alpaca_crypto_allowed_symbols
+        if command.asset_class == "crypto"
+        else settings.alpaca_us_equity_allowed_symbols
+    )
+    allowed_symbols = {
+        value.strip().upper().replace("-", "/")
+        for value in configured_symbols.split(",")
+        if value.strip()
+    }
+    if command.symbol not in allowed_symbols:
+        return f"Alpaca {command.asset_class} symbol is not in its configured allowlist"
+    if settings.runtime_mode == "mock":
+        return "Alpaca execution requires paper or live runtime mode"
+    if settings.runtime_mode == "live" and not settings.alpaca_live_trading_enabled:
+        return "Alpaca live trading is disabled by configuration"
+    if (
+        command.asset_class == "us_equity"
+        and settings.runtime_mode == "live"
+        and not settings.alpaca_us_equity_strategy_live_enabled
+    ):
+        return "Alpaca US-equity strategy live trading is disabled by configuration"
+    config = adapter.describe()
+    if not config.configured:
+        return config.reason or "Alpaca provider readiness is uncertain"
+    if plan_item is not None and (
+        plan_item.provider != "alpaca"
+        or plan_item.asset_class != command.asset_class
+        or plan_item.venue != "alpaca"
+    ):
+        return "execution plan item must explicitly declare matching Alpaca provider metadata"
+    notional = _order_notional(command=command, plan_item=plan_item)
+    if command.side == "buy" and notional is None:
+        return f"Alpaca {command.asset_class} buys require quote_notional or base_quantity with limit_price"
+    max_notional = (
+        settings.alpaca_crypto_max_order_notional_usd
+        if command.asset_class == "crypto"
+        else settings.alpaca_us_equity_max_order_notional_usd
+    )
+    if notional is not None and notional > max_notional:
+        return f"Alpaca {command.asset_class} order exceeds its configured maximum notional"
     return None
 
 

@@ -83,6 +83,10 @@ curl http://127.0.0.1:8010/symbols
 curl http://127.0.0.1:8010/symbols/005930
 ```
 
+When the primary port 8010 process is a live KIS runtime, the Alpaca paper
+runtime can run independently on port 8011 via `start-alpaca-paper.sh`. It uses
+a separate SQLite database and forces Alpaca live submission off.
+
 The default database is `sqlite:///./var/kai_trading_exec.db`. Override settings
 with `KAI_EXEC_` environment variables, for example:
 
@@ -145,6 +149,50 @@ Upbit crypto paper settings currently supported:
 In `paper` mode, Upbit is considered configured without live keys so BTC/ETH
 paper dry runs can exercise the exec lifecycle. Live Upbit order submission is
 disabled by default and is not implemented in this runtime slice.
+
+Alpaca crypto settings currently supported:
+- `KAI_EXEC_ALPACA_API_KEY`
+- `KAI_EXEC_ALPACA_API_SECRET`
+- `KAI_EXEC_ALPACA_LIVE_BASE_URL`
+- `KAI_EXEC_ALPACA_PAPER_BASE_URL`
+- `KAI_EXEC_ALPACA_DATA_BASE_URL`
+- `KAI_EXEC_ALPACA_LIVE_TRADING_ENABLED` (defaults to `false`)
+- `KAI_EXEC_ALPACA_REQUEST_TIMEOUT_SECONDS`
+- `KAI_EXEC_ALPACA_CRYPTO_MONITORING_ENABLED`
+- `KAI_EXEC_ALPACA_CRYPTO_MONITORING_INTERVAL_SECONDS`
+- `KAI_EXEC_ALPACA_CRYPTO_RECONCILE_INTERVAL_SECONDS`
+- `KAI_EXEC_ALPACA_CRYPTO_ALLOWED_SYMBOLS`
+- `KAI_EXEC_ALPACA_CRYPTO_MAX_ORDER_NOTIONAL_USD`
+- `KAI_EXEC_ALPACA_CRYPTO_STRATEGY_ENABLED` (defaults to `false`; the isolated
+  paper launcher defaults it to `true`)
+- `KAI_EXEC_ALPACA_CRYPTO_STRATEGY_LIVE_ENABLED` (second live gate; defaults to
+  `false`)
+- `KAI_EXEC_ALPACA_CRYPTO_STRATEGY_SLEEVE_USD` (default `1000`)
+- `KAI_EXEC_ALPACA_CRYPTO_STRATEGY_MAX_INVESTED_FRACTION` (default `0.60`)
+- `KAI_EXEC_ALPACA_CRYPTO_STRATEGY_TARGET_VOLATILITY` (default `0.10`)
+- `KAI_EXEC_ALPACA_CRYPTO_STRATEGY_MAX_POSITION_RISK_FRACTION` (default
+  `0.0025` of account equity)
+- `KAI_EXEC_ALPACA_US_EQUITY_MONITORING_ENABLED`
+- `KAI_EXEC_ALPACA_US_EQUITY_ALLOWED_SYMBOLS` (default `SPY,QQQ`)
+- `KAI_EXEC_ALPACA_US_EQUITY_MAX_ORDER_NOTIONAL_USD` (default `100`)
+- `KAI_EXEC_ALPACA_US_EQUITY_STRATEGY_ENABLED`
+- `KAI_EXEC_ALPACA_US_EQUITY_STRATEGY_LIVE_ENABLED` (separate live gate,
+  default `false`)
+- `KAI_EXEC_ALPACA_US_EQUITY_STRATEGY_SLEEVE_USD` (default `1000`)
+
+The dedicated Alpaca worker polls quotes every 15 seconds, reconciles every 30
+seconds, checks protective exits continuously, and makes normal trend decisions
+once per closed UTC daily bar. Orders still pass through the shared runtime
+pause/kill switch, provider validation, notional cap, and idempotency rails.
+See [the account, funding, paper-test, strategy, and live activation
+runbook](docs/ALPACA_CRYPTO_SETUP.md) before configuring credentials or funds.
+
+The isolated Alpaca paper process also runs a concurrent U.S.-equity lane for
+SPY and QQQ. It uses Alpaca's market clock, IEX quotes/daily bars, the same
+closed-bar trend/risk engine, separate durable decisions and deterministic
+order keys, and `day` orders only while the U.S. market is open. Its status is
+available at `GET /runtime/alpaca-us-equity`. This paper lane does not alter or
+restart the independently running live KIS Korean-stock process.
 
 Monitoring runtime settings currently supported:
 - `KAI_EXEC_AUTONOMOUS_RUNTIME_ENABLED`

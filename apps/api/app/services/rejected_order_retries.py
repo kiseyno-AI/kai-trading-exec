@@ -631,9 +631,17 @@ def _upsert_rejected_order_failure(
             symbol=order.symbol,
             side=order.side,
             intent=plan_item.intent if plan_item is not None else None,
-            requested_quantity=order.quantity,
+            requested_quantity=order.quantity or 0,
             requested_limit_price=order.limit_price,
-            requested_notional=_requested_notional(order.quantity, order.limit_price),
+            requested_notional=(
+                order.quote_notional
+                or (
+                    order.base_quantity * order.limit_price
+                    if order.base_quantity is not None and order.limit_price is not None
+                    else None
+                )
+                or _requested_notional(order.quantity, order.limit_price)
+            ),
             classification=classification.classification,
             broker_error_classification=classification.classification,
             broker_error_code=classification.code,
@@ -661,9 +669,17 @@ def _upsert_rejected_order_failure(
     )
     failure.account = _account_identifier(settings=settings, order=order) or failure.account
     failure.intent = plan_item.intent if plan_item is not None else failure.intent
-    failure.requested_quantity = order.quantity
+    failure.requested_quantity = order.quantity or 0
     failure.requested_limit_price = order.limit_price
-    failure.requested_notional = _requested_notional(order.quantity, order.limit_price)
+    failure.requested_notional = (
+        order.quote_notional
+        or (
+            order.base_quantity * order.limit_price
+            if order.base_quantity is not None and order.limit_price is not None
+            else None
+        )
+        or _requested_notional(order.quantity, order.limit_price)
+    )
     failure.classification = classification.classification
     failure.broker_error_classification = classification.classification
     failure.broker_error_code = classification.code
@@ -1276,8 +1292,8 @@ def _account_identifier(*, settings: Settings, order: BrokerOrder) -> str | None
     return f"{'*' * (len(account) - 4)}{account[-4:]}"
 
 
-def _requested_notional(quantity: int, limit_price: Decimal | None) -> Decimal | None:
-    if limit_price is None:
+def _requested_notional(quantity: int | None, limit_price: Decimal | None) -> Decimal | None:
+    if quantity is None or limit_price is None:
         return None
     return Decimal(quantity) * limit_price
 

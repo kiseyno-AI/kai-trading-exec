@@ -256,10 +256,11 @@ def reconcile_pending_broker_orders(
     db: Session,
     adapter: BrokerAdapter,
     symbols: set[str] | None = None,
-    ) -> dict[str, int]:
+) -> dict[str, int]:
     orders = _load_pending_orders_for_reconciliation(
         db=db,
         settings=settings,
+        broker_name=adapter.provider,
         symbols=_normalize_symbols(symbols),
     )
     return reconcile_broker_orders(
@@ -694,10 +695,12 @@ def _load_pending_orders_for_reconciliation(
     *,
     db: Session,
     settings: Settings,
+    broker_name: str,
     symbols: set[str] | None,
 ) -> list[BrokerOrder]:
     where = [
         BrokerOrder.mode == settings.runtime_mode,
+        BrokerOrder.broker_name == broker_name,
         BrokerOrder.status.in_(_reconcilable_order_statuses()),
         BrokerOrder.broker_order_id.is_not(None),
     ]
@@ -778,6 +781,7 @@ def sync_execution_positions_from_broker_snapshot(
                         mode=settings.runtime_mode,
                         symbol=symbol,
                         quantity=0,
+                        base_quantity=Decimal("0"),
                         average_price=None,
                         updated_from="reconciliation",
                         last_reconciled_at=observed_at,
@@ -787,23 +791,28 @@ def sync_execution_positions_from_broker_snapshot(
                 created += 1
                 continue
 
+            changed = False
             if position.quantity != 0:
                 position.quantity = 0
+                changed = True
+            if position.base_quantity is not None and position.base_quantity != 0:
+                position.base_quantity = Decimal("0")
+                changed = True
+            if changed:
                 zeroed += 1
             position.updated_from = "reconciliation"
             position.last_reconciled_at = observed_at
             position.raw_payload = _snapshot_payload(snapshot.payload)
-            if position.quantity == 0:
-                continue
-            updated += 1
             continue
 
+        holding_base_quantity = _holding_base_quantity(holding.payload)
         if position is None:
             db.add(
                 ExecutionPosition(
                     mode=settings.runtime_mode,
                     symbol=symbol,
-                    quantity=holding.quantity,
+                    quantity=0 if holding_base_quantity is not None else holding.quantity,
+                    base_quantity=holding_base_quantity,
                     average_price=holding.average_price,
                     updated_from="reconciliation",
                     last_reconciled_at=observed_at,
@@ -814,8 +823,15 @@ def sync_execution_positions_from_broker_snapshot(
             continue
 
         changed = False
-        if position.quantity != holding.quantity:
-            position.quantity = holding.quantity
+        expected_quantity = 0 if holding_base_quantity is not None else holding.quantity
+        if position.quantity != expected_quantity:
+            position.quantity = expected_quantity
+            changed = True
+        if holding_base_quantity is not None and position.base_quantity != holding_base_quantity:
+            position.base_quantity = holding_base_quantity
+            changed = True
+        if holding_base_quantity is None and position.base_quantity not in {None, Decimal("0")}:
+            position.base_quantity = None
             changed = True
         if position.average_price != holding.average_price:
             position.average_price = holding.average_price
@@ -835,6 +851,16 @@ def sync_execution_positions_from_broker_snapshot(
         "updated": updated,
         "zeroed": zeroed,
     }
+
+
+def _holding_base_quantity(payload: object) -> Decimal | None:
+    if not isinstance(payload, dict):
+        return None
+    value = payload.get("base_quantity")
+    parsed = _parse_decimal(value)
+    if parsed is None or parsed < 0:
+        return None
+    return parsed
 
 
 def _snapshot_payload(payload: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -1177,7 +1203,7 @@ def _normalized_exchange(value: object) -> str | None:
     if not isinstance(value, str):
         return None
     normalized = value.strip().upper()
-    if normalized in {"KRX", "NXT", "SOR"}:
+    if normalized in {"KRX", "NXT", "SOR", "UPBIT", "ALPACA", "US"}:
         return normalized
     return None
 
@@ -1209,6 +1235,33 @@ def _parse_fills_from_payload(
                 continue
             result.append(parsed_fill)
         return result
+
+    total_filled_base = _parse_decimal(payload.get("filled_base_quantity"))
+    if total_filled_base is not None and total_filled_base > 0:
+        existing_total_base = sum(
+            Decimal(fill.base_quantity or 0)
+            for fill in order.fills
+        )
+        if total_filled_base <= existing_total_base:
+            return []
+        average_fill_price = _parse_decimal(payload.get("average_fill_price"))
+        if average_fill_price is None:
+            return []
+        delta = total_filled_base - existing_total_base
+        filled_at = _parse_timestamp(payload.get("filled_at"), fallback=observed_at)
+        broker_fill_id = _optional_str(payload.get("broker_fill_id")) or (
+            f"{order.broker_order_id}:cumulative:{format(total_filled_base.normalize(), 'f')}"
+        )
+        return [{
+            "broker_fill_id": broker_fill_id,
+            "quantity": 0,
+            "base_quantity": delta,
+            "quote_notional": delta * average_fill_price,
+            "price": average_fill_price,
+            "filled_at": filled_at.isoformat(),
+            "symbol": order.symbol,
+            "side": order.side,
+        }]
 
     total_filled = _parse_int(payload.get("filled_quantity"))
     if total_filled is None or total_filled <= 0:
@@ -1248,8 +1301,9 @@ def _normalize_fill_payload(
     observed_at: datetime,
     order: BrokerOrder,
 ) -> dict[str, object] | None:
-    quantity = _parse_int(fill_item.get("quantity"))
-    if quantity is None or quantity <= 0:
+    quantity = _parse_int(fill_item.get("quantity")) or 0
+    base_quantity = _parse_decimal(fill_item.get("base_quantity"))
+    if quantity <= 0 and (base_quantity is None or base_quantity <= 0):
         return None
     price = _parse_decimal(fill_item.get("price"))
     if price is None:
@@ -1261,6 +1315,8 @@ def _normalize_fill_payload(
     return {
         "broker_fill_id": _optional_str(fill_item.get("broker_fill_id")),
         "quantity": quantity,
+        "base_quantity": base_quantity,
+        "quote_notional": _parse_decimal(fill_item.get("quote_notional")),
         "price": price,
         "filled_at": filled_at.isoformat(),
         "symbol": _optional_str(fill_item.get("symbol")) or order.symbol,
@@ -1296,6 +1352,8 @@ def _upsert_order_fills(
                 symbol=str(fill["symbol"]),
                 side=str(fill["side"]),
                 quantity=int(fill["quantity"]),
+                base_quantity=_parse_decimal(fill.get("base_quantity")),
+                quote_notional=_parse_decimal(fill.get("quote_notional")),
                 price=_coerce_decimal(fill["price"]),
                 filled_at=_parse_timestamp(
                     fill["filled_at"],
@@ -1315,13 +1373,13 @@ def _fill_signature_candidate(
     fill: dict[str, object],
 ) -> str | None:
     broker_fill_id = _optional_str(fill.get("broker_fill_id"))
-    quantity = _parse_int(fill.get("quantity"))
+    quantity = _parse_int(fill.get("quantity")) or 0
+    base_quantity = _parse_decimal(fill.get("base_quantity"))
     price = _parse_decimal(fill.get("price"))
     symbol = _optional_str(fill.get("symbol"))
     side = _optional_str(fill.get("side"))
     if (
-        quantity is None
-        or quantity <= 0
+        (quantity <= 0 and (base_quantity is None or base_quantity <= 0))
         or price is None
         or not symbol
         or not side
@@ -1336,6 +1394,8 @@ def _fill_signature_candidate(
         filled_at=filled_at,
         price=price,
         quantity=quantity,
+        base_quantity=base_quantity,
+        quote_notional=_parse_decimal(fill.get("quote_notional")),
     )
 
 

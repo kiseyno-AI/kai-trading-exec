@@ -20,6 +20,8 @@ from app.core.config import Settings, get_settings
 from app.core.logging import configure_logging
 from app.db.session import create_db_engine, create_session_factory
 from app.services.autonomous_runtime import AutonomousRuntimeCoordinator
+from app.services.alpaca_crypto_runtime import AlpacaCryptoRuntimeCoordinator
+from app.services.alpaca_us_equity_runtime import AlpacaUsEquityRuntimeCoordinator
 from app.services.monitoring_price_source import build_default_monitoring_price_source
 from app.services.runtime import RuntimeMetadata
 
@@ -62,6 +64,14 @@ def create_app(
         broker_adapter_factory=resolved_broker_adapter_factory,
         monitoring_price_source=resolved_monitoring_price_source,
     )
+    alpaca_crypto_runtime = AlpacaCryptoRuntimeCoordinator(
+        settings=app_settings,
+        session_factory=db_session_factory,
+    )
+    alpaca_us_equity_runtime = AlpacaUsEquityRuntimeCoordinator(
+        settings=app_settings,
+        session_factory=db_session_factory,
+    )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -74,7 +84,11 @@ def create_app(
             },
         )
         await autonomous_runtime.start()
+        await alpaca_crypto_runtime.start()
+        await alpaca_us_equity_runtime.start()
         yield
+        await alpaca_us_equity_runtime.stop()
+        await alpaca_crypto_runtime.stop()
         await autonomous_runtime.stop()
         LOGGER.info("service_stopping", extra={"service": app_settings.service_name})
 
@@ -89,6 +103,8 @@ def create_app(
     app.state.runtime_metadata = runtime_metadata
     app.state.broker_adapter_factory = resolved_broker_adapter_factory
     app.state.autonomous_runtime = autonomous_runtime
+    app.state.alpaca_crypto_runtime = alpaca_crypto_runtime
+    app.state.alpaca_us_equity_runtime = alpaca_us_equity_runtime
 
     app.include_router(health_router)
     app.include_router(runtime_router)

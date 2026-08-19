@@ -36,8 +36,17 @@ Current foundation response includes:
 - `broker.bounded_rest_reconciliation_supported`
 - `broker_providers.kis`
 - `broker_providers.upbit`
-  - provider-specific readiness/session summaries so KIS and Upbit can be
+  - provider-specific readiness/session summaries so KIS, Upbit, and Alpaca can be
     inspected independently
+- `broker_providers.alpaca`
+
+### `GET /runtime/alpaca-crypto`
+
+Returns the dedicated 24/7 Alpaca crypto worker state, including configured
+symbols, latest observed prices, heartbeat/success timestamps, order and
+position reconciliation counts, last error, and whether live order submission
+is explicitly enabled. The worker has no stock-session or weekday gate and
+does not create trading decisions.
 - `safety.paused`
 - `safety.kill_switch_enabled`
 - `safety.automation_enabled`
