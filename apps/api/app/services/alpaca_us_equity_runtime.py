@@ -43,7 +43,7 @@ class AlpacaUsEquityAdapterFacade:
         return self.adapter.describe()
 
     def authenticate(self):  # noqa: ANN201
-        return self.adapter.authenticate()
+        return self.adapter.authenticate_us_equity()
 
     def place_order(self, *args, **kwargs):  # noqa: ANN002, ANN003, ANN201
         return self.adapter.place_order(*args, **kwargs)
@@ -99,6 +99,7 @@ class AlpacaUsEquityRuntimeCoordinator:
             exchange="US",
             time_in_force="day",
             bar_source="alpaca_stock_bars_v2_iex",
+            order_origin="alpaca_us_equity_strategy",
         )
         if self.settings.alpaca_us_equity_monitoring_enabled:
             self._status = "idle"

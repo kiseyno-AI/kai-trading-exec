@@ -88,6 +88,11 @@ UTC daily bars:
   least 40% cash.
 - Position value is further capped so the configured protective-stop loss is
   at most 0.25% of account equity.
+- Strategy-owned base quantity is persisted per symbol, recomputed from
+  strategy-attributed fills, and capped down by current broker truth during
+  reconciliation. Manual Alpaca buys or fills from other order origins do not
+  increase the sleeve, and automated rebalance, protective, and force-exit
+  sells are capped to the strategy-owned quantity.
 - Normal allocation runs after 00:10 UTC once per closed bar. Rebalances below
   the greater of $25 or 5% of the sleeve are skipped.
 - A 3x ATR protective threshold, capped at 12% distance, trails upward. Fresh

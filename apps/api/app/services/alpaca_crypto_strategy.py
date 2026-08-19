@@ -6,13 +6,14 @@ from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from typing import Any
 
 from sqlalchemy import select
-from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.orm import Session, sessionmaker, selectinload
 
 from app.api.schemas.execution import PlaceOrderRequest
 from app.broker.alpaca import AlpacaBrokerAdapter
 from app.broker.base import BrokerAccountHolding, BrokerAccountSnapshot, BrokerLiveMarketContext
 from app.core.config import Settings
 from app.models.runtime import (
+    BrokerOrder,
     CryptoDailyBar,
     CryptoStrategyDecision,
     CryptoStrategyRiskState,
@@ -47,6 +48,7 @@ class AlpacaCryptoStrategyService:
         exchange: str = EXCHANGE,
         time_in_force: str = "gtc",
         bar_source: str = "alpaca_crypto_bars_v1beta3",
+        order_origin: str = "alpaca_crypto_strategy",
     ) -> None:
         self.settings = settings
         self.session_factory = session_factory
@@ -54,6 +56,7 @@ class AlpacaCryptoStrategyService:
         self.exchange = exchange
         self.time_in_force = time_in_force
         self.bar_source = bar_source
+        self.order_origin = order_origin
         self._last_result: dict[str, object] = {
             "enabled": settings.alpaca_crypto_strategy_enabled,
             "status": "not_started" if settings.alpaca_crypto_strategy_enabled else "disabled",
@@ -109,6 +112,14 @@ class AlpacaCryptoStrategyService:
                 observed_at=observed_at,
             )
             states = _load_strategy_states(settings=self.settings, db=db, symbols=symbols)
+            _refresh_strategy_owned_quantities(
+                settings=self.settings,
+                db=db,
+                states=states,
+                snapshot=snapshot,
+                asset_class=self.asset_class,
+                order_origin=self.order_origin,
+            )
             protective_actions = self._run_protective_exits(
                 db=db,
                 adapter=adapter,
@@ -171,11 +182,14 @@ class AlpacaCryptoStrategyService:
         for symbol, state in states.items():
             quote = quotes.get(symbol)
             holding = holdings.get(symbol)
-            base_quantity = _holding_base_quantity(holding)
+            broker_base_quantity = _holding_base_quantity(holding)
+            owned_base_quantity = _strategy_owned_base_quantity(state)
+            base_quantity = min(broker_base_quantity, owned_base_quantity)
             stop = _decimal_or_none(state.protective_stop_price)
             bid = quote.bid if quote is not None else None
             if (
-                base_quantity <= 0
+                broker_base_quantity <= 0
+                or owned_base_quantity <= 0
                 or stop is None
                 or bid is None
                 or bid > stop
@@ -207,16 +221,20 @@ class AlpacaCryptoStrategyService:
                     idempotency_key=idempotency_key,
                     metadata={
                         "strategy_version": self.settings.alpaca_crypto_strategy_version,
+                        "order_origin": self.order_origin,
+                        "autonomous_strategy_order": True,
                         "decision_type": "protective_exit",
                         "protective_stop_price": _decimal_text(stop),
                         "trigger_bid": _decimal_text(bid),
                         "risk_reduction": True,
+                        "strategy_owned_base_quantity": _decimal_text(owned_base_quantity),
+                        "broker_base_quantity": _decimal_text(broker_base_quantity),
                     },
                     asset_class=self.asset_class,
                     exchange=self.exchange,
                     time_in_force=self.time_in_force,
                 ),
-                request_source="alpaca_crypto_strategy:protective_exit",
+                request_source=f"{self.order_origin}:protective_exit",
             )
             outcome = _order_outcome(result.status_code, result.payload)
             state.last_action = "protective_sell"
@@ -324,7 +342,9 @@ class AlpacaCryptoStrategyService:
             quote = quotes[symbol]
             target_weight = target_weights.get(symbol, Decimal("0"))
             holding = holdings.get(symbol)
-            base_quantity = _holding_base_quantity(holding)
+            broker_base_quantity = _holding_base_quantity(holding)
+            owned_base_quantity = _strategy_owned_base_quantity(states[symbol])
+            base_quantity = min(broker_base_quantity, owned_base_quantity)
             current_value = base_quantity * (quote.bid or Decimal("0"))
             target_value = strategy_capital * target_weight
             delta = target_value - current_value
@@ -345,10 +365,10 @@ class AlpacaCryptoStrategyService:
                 settings=self.settings,
                 state=state,
                 feature=feature,
-                has_position=base_quantity > 0 or (feature.eligible and target_weight > 0),
+                has_position=owned_base_quantity > 0 or (feature.eligible and target_weight > 0),
                 entry_reference_price=(
                     quote.ask
-                    if base_quantity <= 0 and feature.eligible and target_weight > 0
+                    if owned_base_quantity <= 0 and feature.eligible and target_weight > 0
                     else None
                 ),
             )
@@ -366,7 +386,7 @@ class AlpacaCryptoStrategyService:
                 actions.append({"symbol": symbol, "status": "waiting", "reason": "unresolved_open_order"})
                 continue
 
-            force_exit = not feature.eligible and base_quantity > 0
+            force_exit = not feature.eligible and owned_base_quantity > 0
             if (delta <= -minimum_delta or force_exit) and base_quantity > 0:
                 requested_base = _floor_to_increment(
                     base_quantity if force_exit else min(base_quantity, (-delta) / quote.bid),
@@ -393,12 +413,16 @@ class AlpacaCryptoStrategyService:
                                 feature,
                                 target_weight,
                                 decision_bar_at,
+                                order_origin=self.order_origin,
+                                owned_base_quantity=owned_base_quantity,
+                                broker_base_quantity=broker_base_quantity,
+                                force_exit=force_exit,
                             ),
                             asset_class=self.asset_class,
                             exchange=self.exchange,
                             time_in_force=self.time_in_force,
                         ),
-                        request_source="alpaca_crypto_strategy:daily_rebalance",
+                        request_source=f"{self.order_origin}:daily_rebalance",
                     )
                     order_payload = _order_outcome(result.status_code, result.payload)
                     status = _decision_status(result.status_code, result.payload)
@@ -434,12 +458,15 @@ class AlpacaCryptoStrategyService:
                                     feature,
                                     target_weight,
                                     decision_bar_at,
+                                    order_origin=self.order_origin,
+                                    owned_base_quantity=owned_base_quantity,
+                                    broker_base_quantity=broker_base_quantity,
                                 ),
                                 asset_class=self.asset_class,
                                 exchange=self.exchange,
                                 time_in_force=self.time_in_force,
                             ),
-                            request_source="alpaca_crypto_strategy:daily_rebalance",
+                            request_source=f"{self.order_origin}:daily_rebalance",
                         )
                         order_payload = _order_outcome(result.status_code, result.payload)
                         status = _decision_status(result.status_code, result.payload)
@@ -479,6 +506,8 @@ class AlpacaCryptoStrategyService:
                 "target_fraction": _decimal_text(target_weight),
                 "current_value": _decimal_text(current_value),
                 "target_value": _decimal_text(target_value),
+                "strategy_owned_base_quantity": _decimal_text(owned_base_quantity),
+                "broker_base_quantity": _decimal_text(broker_base_quantity),
                 "requested_base_quantity": _decimal_text(requested_base),
                 "requested_quote_notional": _decimal_text(requested_notional),
                 "order": order_payload,
@@ -595,6 +624,58 @@ def _load_strategy_states(
             existing[symbol] = state
     db.flush()
     return {symbol: existing[symbol] for symbol in symbols}
+
+
+def _refresh_strategy_owned_quantities(
+    *,
+    settings: Settings,
+    db: Session,
+    states: dict[str, CryptoStrategyState],
+    snapshot: BrokerAccountSnapshot,
+    asset_class: str,
+    order_origin: str,
+) -> None:
+    symbols = tuple(states)
+    if not symbols:
+        return
+    orders = db.scalars(
+        select(BrokerOrder)
+        .options(selectinload(BrokerOrder.fills))
+        .where(
+            BrokerOrder.mode == settings.runtime_mode,
+            BrokerOrder.broker_name == PROVIDER,
+            BrokerOrder.asset_class == asset_class,
+            BrokerOrder.symbol.in_(symbols),
+        )
+    ).all()
+    totals = {symbol: Decimal("0") for symbol in symbols}
+    for order in orders:
+        if not _is_strategy_attributable_order(order=order, order_origin=order_origin):
+            continue
+        if order.side == "buy":
+            direction = Decimal("1")
+        elif order.side == "sell":
+            direction = Decimal("-1")
+        else:
+            direction = Decimal("0")
+        if direction == 0:
+            continue
+        for fill in order.fills:
+            base_quantity = Decimal(fill.base_quantity or 0)
+            if base_quantity <= 0:
+                continue
+            totals[order.symbol] += direction * base_quantity
+    holdings = _holdings_by_symbol(snapshot)
+    for symbol, state in states.items():
+        ledger_quantity = max(totals.get(symbol, Decimal("0")), Decimal("0"))
+        broker_quantity = _holding_base_quantity(holdings.get(symbol))
+        state.strategy_owned_base_quantity = min(ledger_quantity, broker_quantity)
+
+
+def _is_strategy_attributable_order(*, order: BrokerOrder, order_origin: str) -> bool:
+    request_metadata = order.request_metadata if isinstance(order.request_metadata, dict) else {}
+    source = str(request_metadata.get("source") or "")
+    return source == order_origin or source.startswith(f"{order_origin}:")
 
 
 def _update_risk_state(
@@ -824,12 +905,22 @@ def _daily_order_metadata(
     feature: TrendFeatures,
     target_weight: Decimal,
     decision_bar_at: datetime,
+    *,
+    order_origin: str,
+    owned_base_quantity: Decimal,
+    broker_base_quantity: Decimal,
+    force_exit: bool = False,
 ) -> dict[str, object]:
     return {
         "strategy_version": strategy_version,
+        "order_origin": order_origin,
+        "autonomous_strategy_order": True,
         "decision_type": "daily_target_rebalance",
         "decision_bar_at": decision_bar_at.isoformat(),
         "target_fraction": _decimal_text(target_weight),
+        "strategy_owned_base_quantity": _decimal_text(owned_base_quantity),
+        "broker_base_quantity": _decimal_text(broker_base_quantity),
+        "force_exit": force_exit,
         "signal": _feature_payload(feature),
     }
 
@@ -904,6 +995,10 @@ def _holding_base_quantity(holding: BrokerAccountHolding | None) -> Decimal:
     if holding is None or not isinstance(holding.payload, dict):
         return Decimal("0")
     return _decimal_or_none(holding.payload.get("base_quantity")) or Decimal("0")
+
+
+def _strategy_owned_base_quantity(state: CryptoStrategyState) -> Decimal:
+    return max(Decimal(state.strategy_owned_base_quantity or 0), Decimal("0"))
 
 
 def _floor_to_increment(value: Decimal, increment: Decimal) -> Decimal:

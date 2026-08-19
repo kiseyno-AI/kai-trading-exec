@@ -162,6 +162,19 @@ class AlpacaBrokerAdapter:
         )
         account = _dict_payload(response.payload, context="Alpaca account")
         _validate_account_ready(account)
+        return self._token_grant()
+
+    def authenticate_us_equity(self) -> BrokerTokenGrant:
+        config = self._configured()
+        response = self._request(
+            method="GET",
+            url=f"{config.api_base_url}{ALPACA_ACCOUNT_PATH}",
+        )
+        account = _dict_payload(response.payload, context="Alpaca account")
+        _validate_account_ready(account, require_crypto=False)
+        return self._token_grant()
+
+    def _token_grant(self) -> BrokerTokenGrant:
         return BrokerTokenGrant(
             access_token=f"alpaca:{self.settings.runtime_mode}:validated",
             token_type="ApiKey",

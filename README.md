@@ -184,6 +184,10 @@ The dedicated Alpaca worker polls quotes every 15 seconds, reconciles every 30
 seconds, checks protective exits continuously, and makes normal trend decisions
 once per closed UTC daily bar. Orders still pass through the shared runtime
 pause/kill switch, provider validation, notional cap, and idempotency rails.
+The Alpaca trend strategies maintain durable per-symbol owned base quantity
+from strategy-attributed broker-order fills only, capped down by current broker
+truth during reconciliation; autonomous sells are capped by that owned quantity,
+so manual or other-strategy inventory is not liquidated by the sleeve.
 See [the account, funding, paper-test, strategy, and live activation
 runbook](docs/ALPACA_CRYPTO_SETUP.md) before configuring credentials or funds.
 

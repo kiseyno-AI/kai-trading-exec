@@ -64,6 +64,7 @@ def test_crypto_strategy_tables_are_exec_owned_and_persist_decimal_state() -> No
                     last_processed_bar_at=bar_close_at,
                     eligible=True,
                     target_fraction=Decimal("0.40000000"),
+                    strategy_owned_base_quantity=Decimal("0.12345678"),
                     high_water_price=Decimal("64500.5"),
                     protective_stop_price=Decimal("58050.45"),
                     last_action="buy",
@@ -111,6 +112,7 @@ def test_crypto_strategy_tables_are_exec_owned_and_persist_decimal_state() -> No
         state = db.query(CryptoStrategyState).one()
         decision = db.query(CryptoStrategyDecision).one()
         assert state.target_fraction == Decimal("0.40000000")
+        assert state.strategy_owned_base_quantity == Decimal("0.123456780000")
         assert state.metrics == {"ema_200": "60000"}
         assert decision.requested_quote_notional == Decimal("25.0000")
         assert decision.reasons == ["trend_eligible"]

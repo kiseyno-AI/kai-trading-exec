@@ -537,6 +537,11 @@ class CryptoStrategyState(TimestampMixin, Base):
         nullable=False,
         default=Decimal("0"),
     )
+    strategy_owned_base_quantity: Mapped[Decimal] = mapped_column(
+        Numeric(28, 12),
+        nullable=False,
+        default=Decimal("0"),
+    )
     high_water_price: Mapped[Decimal | None] = mapped_column(Numeric(28, 12))
     protective_stop_price: Mapped[Decimal | None] = mapped_column(Numeric(28, 12))
     last_action: Mapped[str | None] = mapped_column(String(32))

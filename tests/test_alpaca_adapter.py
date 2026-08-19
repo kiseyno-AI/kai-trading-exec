@@ -23,7 +23,10 @@ from app.main import create_app
 from app.models.runtime import BrokerOrder, MonitoringCheckpoint
 from app.services.alpaca_crypto_runtime import AlpacaCryptoRuntimeCoordinator
 from app.services.alpaca_us_equity_runtime import AlpacaUsEquityRuntimeCoordinator
-from app.services.broker_orders import _validate_provider_capability
+from app.services.broker_orders import (
+    _validate_alpaca_crypto_guardrails,
+    _validate_provider_capability,
+)
 from app.services.reconciliation import _parse_fills_from_payload, _upsert_order_fills
 
 
@@ -92,6 +95,28 @@ def test_authentication_uses_paper_endpoint_and_validates_crypto_status() -> Non
     assert grant.token_type == "ApiKey"
     assert client.calls[0]["url"] == "https://paper-api.alpaca.markets/v2/account"
     assert client.calls[0]["headers"]["APCA-API-KEY-ID"] == "paper-key"  # type: ignore[index]
+
+
+def test_us_equity_authentication_does_not_require_active_crypto_status() -> None:
+    client = StubAlpacaHttpClient([
+        AlpacaHttpResponse(
+            status_code=200,
+            headers={},
+            payload={
+                "status": "ACTIVE",
+                "crypto_status": "INACTIVE",
+                "account_blocked": False,
+                "trading_blocked": False,
+                "trade_suspended_by_user": False,
+            },
+        )
+    ])
+    adapter = AlpacaBrokerAdapter(settings=_settings(), http_client=client)
+
+    grant = adapter.authenticate_us_equity()
+
+    assert grant.token_type == "ApiKey"
+    assert grant.access_token == "alpaca:paper:validated"
 
 
 def test_market_buy_submits_decimal_notional_and_client_order_id() -> None:
@@ -195,6 +220,97 @@ def test_alpaca_provider_capability_accepts_us_equity_orders() -> None:
     )
 
     assert _validate_provider_capability(adapter=adapter, command=command) is None
+
+
+def test_live_us_equity_strategy_gate_does_not_block_manual_order() -> None:
+    settings = _settings(
+        runtime_mode="live",
+        alpaca_live_trading_enabled=True,
+        alpaca_us_equity_strategy_live_enabled=False,
+    )
+    adapter = AlpacaBrokerAdapter(settings=settings)
+    command = PlaceOrderRequest(
+        idempotency_key="alpaca-us-equity-manual-smoke-test",
+        provider="alpaca",
+        asset_class="us_equity",
+        venue="alpaca",
+        exchange="US",
+        symbol="SPY",
+        side="buy",
+        order_type="market",
+        quote_notional=Decimal("1"),
+        time_in_force="day",
+    )
+
+    assert _validate_alpaca_crypto_guardrails(
+        settings=settings,
+        adapter=adapter,
+        command=command,
+        plan_item=None,
+        request_source="post:/orders",
+    ) is None
+
+
+def test_live_us_equity_strategy_gate_blocks_trusted_strategy_order() -> None:
+    settings = _settings(
+        runtime_mode="live",
+        alpaca_live_trading_enabled=True,
+        alpaca_us_equity_strategy_live_enabled=False,
+    )
+    adapter = AlpacaBrokerAdapter(settings=settings)
+    command = PlaceOrderRequest(
+        idempotency_key="alpaca-us-equity-strategy-test",
+        provider="alpaca",
+        asset_class="us_equity",
+        venue="alpaca",
+        exchange="US",
+        symbol="SPY",
+        side="buy",
+        order_type="market",
+        quote_notional=Decimal("1"),
+        time_in_force="day",
+        metadata={
+            "order_origin": "alpaca_us_equity_strategy",
+            "autonomous_strategy_order": True,
+        },
+    )
+
+    assert _validate_alpaca_crypto_guardrails(
+        settings=settings,
+        adapter=adapter,
+        command=command,
+        plan_item=None,
+        request_source="alpaca_us_equity_strategy:daily_rebalance",
+    ) == "Alpaca US-equity strategy live trading is disabled by configuration"
+
+
+def test_alpaca_strategy_order_fails_closed_without_trusted_origin_metadata() -> None:
+    settings = _settings(
+        runtime_mode="live",
+        alpaca_live_trading_enabled=True,
+        alpaca_us_equity_strategy_live_enabled=True,
+    )
+    adapter = AlpacaBrokerAdapter(settings=settings)
+    command = PlaceOrderRequest(
+        idempotency_key="alpaca-us-equity-strategy-missing-origin",
+        provider="alpaca",
+        asset_class="us_equity",
+        venue="alpaca",
+        exchange="US",
+        symbol="SPY",
+        side="buy",
+        order_type="market",
+        quote_notional=Decimal("1"),
+        time_in_force="day",
+    )
+
+    assert _validate_alpaca_crypto_guardrails(
+        settings=settings,
+        adapter=adapter,
+        command=command,
+        plan_item=None,
+        request_source="alpaca_us_equity_strategy:daily_rebalance",
+    ) == "Alpaca autonomous strategy orders must carry explicit strategy origin metadata"
 
 
 def test_duplicate_client_id_response_recovers_existing_order() -> None:
@@ -560,7 +676,7 @@ def test_us_equity_runtime_monitors_while_market_closed_without_trading(
     )
     responses = [
         AlpacaHttpResponse(200, {}, {
-            "status": "ACTIVE", "crypto_status": "ACTIVE", "account_blocked": False,
+            "status": "ACTIVE", "crypto_status": "INACTIVE", "account_blocked": False,
             "trading_blocked": False, "trade_suspended_by_user": False,
         }),
         AlpacaHttpResponse(200, {}, {

@@ -143,6 +143,7 @@ def place_broker_order(
         adapter=adapter,
         command=command,
         plan_item=plan_item,
+        request_source=request_source,
     )
     if alpaca_guard_error is not None:
         return PlaceBrokerOrderResult(
@@ -217,6 +218,7 @@ def place_broker_order(
         limit_price=routed_command.limit_price,
         request_metadata={
             "source": request_source,
+            "trusted_order_origin": _trusted_order_origin(request_source),
             "requested_at": datetime.now(UTC).isoformat(),
             "time_in_force": routed_command.time_in_force,
             "provider": routed_command.provider,
@@ -569,6 +571,7 @@ def _validate_alpaca_crypto_guardrails(
     adapter: BrokerAdapter,
     command: PlaceOrderRequest,
     plan_item: ExecutionPlanItem | None,
+    request_source: str,
 ) -> str | None:
     if command.provider != "alpaca" and adapter.provider != "alpaca":
         return None
@@ -595,9 +598,13 @@ def _validate_alpaca_crypto_guardrails(
         return "Alpaca execution requires paper or live runtime mode"
     if settings.runtime_mode == "live" and not settings.alpaca_live_trading_enabled:
         return "Alpaca live trading is disabled by configuration"
+    order_origin_error = _validate_trusted_order_origin(command=command, request_source=request_source)
+    if order_origin_error is not None:
+        return order_origin_error
     if (
         command.asset_class == "us_equity"
         and settings.runtime_mode == "live"
+        and _is_alpaca_us_equity_strategy_order(request_source)
         and not settings.alpaca_us_equity_strategy_live_enabled
     ):
         return "Alpaca US-equity strategy live trading is disabled by configuration"
@@ -621,6 +628,30 @@ def _validate_alpaca_crypto_guardrails(
     if notional is not None and notional > max_notional:
         return f"Alpaca {command.asset_class} order exceeds its configured maximum notional"
     return None
+
+
+def _validate_trusted_order_origin(*, command: PlaceOrderRequest, request_source: str) -> str | None:
+    if not request_source.startswith("alpaca_"):
+        return None
+    metadata = command.metadata if isinstance(command.metadata, dict) else {}
+    expected_origin = request_source.split(":", 1)[0]
+    if expected_origin not in {"alpaca_crypto_strategy", "alpaca_us_equity_strategy"}:
+        return f"unrecognized Alpaca autonomous order source: {expected_origin}"
+    if metadata.get("autonomous_strategy_order") is not True:
+        return "Alpaca autonomous strategy orders must carry explicit strategy origin metadata"
+    if metadata.get("order_origin") != expected_origin:
+        return "Alpaca autonomous strategy order origin metadata does not match request source"
+    if command.asset_class == "us_equity" and expected_origin != "alpaca_us_equity_strategy":
+        return "Alpaca US-equity strategy orders must use the US-equity strategy origin"
+    if command.asset_class == "crypto" and expected_origin != "alpaca_crypto_strategy":
+        return "Alpaca crypto strategy orders must use the crypto strategy origin"
+    return None
+
+
+def _is_alpaca_us_equity_strategy_order(request_source: str) -> bool:
+    return request_source == "alpaca_us_equity_strategy" or request_source.startswith(
+        "alpaca_us_equity_strategy:"
+    )
 
 
 def _evaluate_new_buy_account_gate(
@@ -838,6 +869,7 @@ def _merge_order_request_metadata(
 ) -> dict[str, object]:
     metadata = dict(base or {})
     metadata["source"] = request_source
+    metadata["trusted_order_origin"] = _trusted_order_origin(request_source)
     metadata["time_in_force"] = command.time_in_force
     metadata["provider"] = command.provider
     metadata["asset_class"] = command.asset_class
@@ -848,6 +880,10 @@ def _merge_order_request_metadata(
     if route_decision is not None:
         metadata["route"] = _route_payload(route_decision)
     return metadata
+
+
+def _trusted_order_origin(request_source: str) -> str:
+    return request_source.split(":", 1)[0] if request_source else "unknown"
 
 
 def _resolve_route_decision(
