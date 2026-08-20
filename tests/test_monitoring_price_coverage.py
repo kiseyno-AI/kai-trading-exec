@@ -16,6 +16,7 @@ from app.models.runtime import ExecutionPlanItem, ExecutionPosition
 from app.services import monitoring_price_source as monitoring_price_source_module
 from app.services.monitoring_price_source import KisCurrentQuoteMonitoringPriceSource
 from app.services.monitoring_price_source import _derive_orderability_context
+from app.services.monitoring_price_source import next_us_regular_open
 from test_broker_auth import (
     KIS_PAPER_API_BASE_URL,
     StubBrokerAdapter,
@@ -126,6 +127,47 @@ def test_us_orderability_closes_on_nyse_holiday() -> None:
         symbol="AAPL",
         price=Decimal("201.25"),
         observed_at=datetime(2026, 7, 3, 15, 0, tzinfo=UTC),
+        exchange="NASD",
+    )
+
+    assert context["session_type"] == "us_closed"
+    assert context["normal_ordering_available"] is False
+
+
+def test_us_orderability_closes_after_black_friday_early_close() -> None:
+    observed_at = datetime(2026, 11, 27, 18, 30, tzinfo=UTC)
+    context = _derive_orderability_context(
+        settings=Settings(),
+        symbol="AAPL",
+        price=Decimal("201.25"),
+        observed_at=observed_at,
+        exchange="NASD",
+    )
+
+    assert context["session_type"] == "us_closed"
+    assert context["normal_ordering_available"] is False
+    assert next_us_regular_open(observed_at) == datetime(2026, 11, 30, 14, 30, tzinfo=UTC)
+
+
+def test_us_orderability_applies_independence_day_eve_early_close_when_open() -> None:
+    context = _derive_orderability_context(
+        settings=Settings(),
+        symbol="AAPL",
+        price=Decimal("201.25"),
+        observed_at=datetime(2028, 7, 3, 17, 30, tzinfo=UTC),
+        exchange="NASD",
+    )
+
+    assert context["session_type"] == "us_closed"
+    assert context["normal_ordering_available"] is False
+
+
+def test_us_orderability_closes_after_christmas_eve_early_close() -> None:
+    context = _derive_orderability_context(
+        settings=Settings(),
+        symbol="AAPL",
+        price=Decimal("201.25"),
+        observed_at=datetime(2026, 12, 24, 18, 30, tzinfo=UTC),
         exchange="NASD",
     )
 
@@ -460,7 +502,9 @@ def test_autonomous_monitoring_keeps_partial_prices_when_one_live_quote_fails() 
         diagnostics = price_source["diagnostics"]
 
         assert autonomous["last_cycle"]["price_count"] == 1
-        assert autonomous["last_cycle"]["evaluated_item_count"] == 1
+        # The missing-quote item is still evaluated into a safe no-action result;
+        # partial price failure must not make it disappear from cycle coverage.
+        assert autonomous["last_cycle"]["evaluated_item_count"] == 2
         assert price_source["status"] == "degraded"
         assert price_source["last_symbol_count"] == 2
         assert price_source["last_price_count"] == 1

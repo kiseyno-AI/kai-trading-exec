@@ -293,6 +293,84 @@ def test_reconcile_full_fill_is_idempotent_and_updates_position_snapshot() -> No
     engine.dispose()
 
 
+def test_us_holding_discovery_preserves_position_truth_across_exchange_queries() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        kis_app_key="***",
+        kis_app_secret="***",
+        kis_account_number="12345678",
+    )
+    engine, db = _session(settings)
+
+    class RoutedSnapshotBroker(ReconciliationStubBroker):
+        def __init__(self) -> None:
+            super().__init__()
+            self.snapshot_calls: list[tuple[list[str] | None, str]] = []
+
+        def get_account_snapshot(
+            self,
+            access_token: str,
+            *,
+            symbols: list[str] | None = None,
+            exchange: str = "KRX",
+        ) -> BrokerAccountSnapshot:
+            assert access_token
+            self.snapshot_calls.append((symbols, exchange))
+            holdings = (
+                [
+                    BrokerAccountHolding(
+                        symbol="AAPL",
+                        quantity=2,
+                        average_price=Decimal("200"),
+                        sellable_quantity=2,
+                        payload={"ovrs_excg_cd": "NASD"},
+                    )
+                ]
+                if exchange == "NASD"
+                else []
+            )
+            return BrokerAccountSnapshot(
+                available_cash=Decimal("1000"),
+                observed_at=OBSERVED_AT,
+                source=f"stub:{exchange}",
+                holdings=holdings,
+                payload={"currency": "USD", "exchange": exchange},
+            )
+
+    broker = RoutedSnapshotBroker()
+    nasd_result = sync_execution_positions_from_broker_snapshot(
+        settings=settings,
+        db=db,
+        adapter=broker,
+        symbols=None,
+        exchange="NASD",
+        discover_holdings_only=True,
+    )
+    nyse_result = sync_execution_positions_from_broker_snapshot(
+        settings=settings,
+        db=db,
+        adapter=broker,
+        symbols=None,
+        exchange="NYSE",
+        discover_holdings_only=True,
+    )
+
+    position = db.scalar(select(ExecutionPosition).where(ExecutionPosition.symbol == "AAPL"))
+    assert broker.snapshot_calls == [(None, "NASD"), (None, "NYSE")]
+    assert nasd_result["created"] == 1
+    assert nyse_result["zeroed"] == 0
+    assert position is not None
+    assert position.quantity == 2
+    assert position.average_price == Decimal("200.0000")
+    assert position.raw_payload["_position_sync"] == {
+        "asset_class": "us_equity",
+        "exchange": "NASD",
+        "monitoring_eligible": True,
+    }
+    engine.dispose()
+
+
 def test_reconcile_repeated_fallback_fill_payload_is_idempotent() -> None:
     settings = Settings(database_url="sqlite:///:memory:", runtime_mode="paper")
     engine, db = _session(settings)

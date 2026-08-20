@@ -156,11 +156,28 @@ def evaluate_us_equity_account_gate(
         "projected_exposure_usd": projected_exposure,
         "daily_realized_pnl_usd": daily_realized,
         "weekly_realized_pnl_usd": weekly_realized,
+        "realized_pnl_source": "local_execution_fills_fifo",
+        "realized_pnl_coverage": (
+            snapshot.payload.get("realized_pnl_coverage")
+            if isinstance(snapshot.payload, dict)
+            else "degraded_local_execution_fills_only"
+        ) or "degraded_local_execution_fills_only",
         "unrealized_pnl_usd": unrealized,
         "unrealized_loss_pct": unrealized_loss_pct,
         "worst_holding_loss_pct": worst_holding_loss_pct,
     }
+    realized_pnl_coverage = str(metrics["realized_pnl_coverage"])
     gates = [
+        (
+            "us_realized_pnl_coverage_unconfirmed",
+            Decimal("1"),
+            Decimal("0"),
+            (
+                realized_pnl_coverage != "broker_confirmed"
+                and not settings.kis_us_allow_degraded_realized_pnl_coverage
+            ),
+            "KIS US-equity realized PnL coverage is not broker-confirmed",
+        ),
         (
             "us_open_buy_notional_unknown",
             Decimal(unknown_open_buy_count),

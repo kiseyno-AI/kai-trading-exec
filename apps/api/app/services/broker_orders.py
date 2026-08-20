@@ -4,6 +4,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, ROUND_DOWN
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -11,6 +12,9 @@ from sqlalchemy.orm import Session, selectinload
 
 from app.api.schemas.execution import PlaceOrderRequest
 from app.broker.base import (
+    BrokerAccountHolding,
+    BrokerAccountOpenOrder,
+    BrokerAccountSnapshot,
     BrokerAdapter,
     BrokerAdapterError,
     BrokerEventSource,
@@ -33,6 +37,7 @@ from app.services.domestic_order_router import RouteDecision, resolve_domestic_o
 from app.services.execution_failures import record_actionable_execution_failure
 from app.services.execution_api import serialize_broker_order
 from app.services.fill_idempotency import execution_fill_idempotency_key
+from app.services.monitoring_price_source import is_us_regular_session, next_us_regular_open
 from app.services.runtime_controls import (
     automated_order_submission_allowed,
     automated_order_submission_block_reason,
@@ -171,6 +176,19 @@ def place_broker_order(
                 "message": kis_us_guard_error,
                 "permanent_rejection": True,
                 "rejection_reason": kis_us_guard_error,
+            },
+        )
+
+    kis_us_session_route = _kis_us_session_route(command)
+    if kis_us_session_route is not None:
+        return PlaceBrokerOrderResult(
+            status_code=202,
+            payload={
+                "duplicate": False,
+                "message": str(kis_us_session_route["reason"]),
+                "deferred": True,
+                "block_reason": None,
+                "route": kis_us_session_route,
             },
         )
 
@@ -693,6 +711,30 @@ def _validate_kis_us_equity_guardrails(
     return None
 
 
+def _kis_us_session_route(command: PlaceOrderRequest) -> dict[str, object] | None:
+    if command.provider != "kis" or command.asset_class != "us_equity":
+        return None
+    metadata = command.metadata if isinstance(command.metadata, dict) else {}
+    observed_at = _route_now(metadata)
+    local = observed_at.astimezone(ZoneInfo("America/New_York"))
+    if is_us_regular_session(local):
+        return None
+    next_open = next_us_regular_open(observed_at)
+    return {
+        "action": "defer",
+        "exchange": command.exchange,
+        "session": "us_closed",
+        "ord_dvsn": None,
+        "effective_order_type": command.order_type,
+        "price_source": "command_limit_price",
+        "next_retry_at": next_open.isoformat(),
+        "reason": (
+            "deferred KIS US-equity order outside New York regular session "
+            f"until {next_open.isoformat()}"
+        ),
+    }
+
+
 def _validate_trusted_order_origin(*, command: PlaceOrderRequest, request_source: str) -> str | None:
     if not request_source.startswith("alpaca_"):
         return None
@@ -739,14 +781,28 @@ def _evaluate_new_buy_account_gate(
             source="account_drawdown_gate",
             reason=f"load broker account snapshot before new buy {command.idempotency_key}",
         )
-        try:
-            snapshot = adapter.get_account_snapshot(
-                session_state.access_token or "",
-                symbols=[command.symbol],
-                exchange=command.exchange or "KRX",
-            )
-        except TypeError:
-            snapshot = adapter.get_account_snapshot(session_state.access_token or "")
+        if command.asset_class == "us_equity":
+            snapshots = [
+                (
+                    exchange,
+                    adapter.get_account_snapshot(
+                        session_state.access_token or "",
+                        symbols=[command.symbol],
+                        exchange=exchange,
+                    ),
+                )
+                for exchange in sorted(("NASD", "NYSE", "AMEX"))
+            ]
+            snapshot = _merge_us_account_gate_snapshots(snapshots)
+        else:
+            try:
+                snapshot = adapter.get_account_snapshot(
+                    session_state.access_token or "",
+                    symbols=[command.symbol],
+                    exchange=command.exchange or "KRX",
+                )
+            except TypeError:
+                snapshot = adapter.get_account_snapshot(session_state.access_token or "")
     except Exception as exc:
         return account_drawdown_uncertain_decision(
             order_idempotency_key=command.idempotency_key,
@@ -783,6 +839,89 @@ def _evaluate_new_buy_account_gate(
         execution_plan_item_id=plan_item.id if plan_item is not None else command.execution_plan_item_id,
         now=observed_at,
     )
+
+
+def _merge_us_account_gate_snapshots(
+    routed_snapshots: list[tuple[str, BrokerAccountSnapshot]],
+) -> BrokerAccountSnapshot:
+    if len(routed_snapshots) != 3:
+        raise ValueError("KIS US-equity account gate requires all three exchange snapshots")
+    snapshots = [snapshot for _exchange, snapshot in routed_snapshots]
+    observed_at = min(snapshot.observed_at for snapshot in snapshots)
+    cash_values = [snapshot.available_cash for snapshot in snapshots if snapshot.available_cash is not None]
+    holdings_by_key: dict[tuple[str, str], BrokerAccountHolding] = {}
+    for requested_exchange, snapshot in routed_snapshots:
+        for holding in snapshot.holdings:
+            holding_exchange = _us_holding_exchange(holding.payload) or requested_exchange
+            key = (holding_exchange, holding.symbol)
+            existing = holdings_by_key.get(key)
+            if existing is None:
+                holdings_by_key[key] = holding
+                continue
+            if (
+                existing.quantity != holding.quantity
+                or existing.average_price != holding.average_price
+                or existing.sellable_quantity != holding.sellable_quantity
+            ):
+                raise ValueError(
+                    "conflicting duplicate KIS US holding for "
+                    f"{holding_exchange}:{holding.symbol}"
+                )
+    open_orders_by_key: dict[tuple[str, str], BrokerAccountOpenOrder] = {}
+    for requested_exchange, snapshot in routed_snapshots:
+        for order in snapshot.open_orders:
+            order_exchange = _us_holding_exchange(order.payload) or requested_exchange
+            identity = order.broker_order_id or (
+                f"{order.symbol}:{order.side}:{order.quantity}:{order.limit_price}"
+            )
+            key = (order_exchange, identity)
+            existing = open_orders_by_key.get(key)
+            if existing is None:
+                open_orders_by_key[key] = order
+                continue
+            if existing.remaining_quantity != order.remaining_quantity:
+                raise ValueError(
+                    "conflicting duplicate KIS US open order for "
+                    f"{order_exchange}:{identity}"
+                )
+    return BrokerAccountSnapshot(
+        available_cash=min(cash_values) if cash_values else None,
+        observed_at=observed_at,
+        source="kis:us_equity_account_gate_aggregate",
+        unrealized_pnl=sum(
+            (holding.unrealized_pnl or Decimal("0") for holding in holdings_by_key.values()),
+            Decimal("0"),
+        ),
+        holdings=list(holdings_by_key.values()),
+        open_orders=list(open_orders_by_key.values()),
+        symbol_buying_power={
+            symbol: buying_power
+            for snapshot in snapshots
+            for symbol, buying_power in snapshot.symbol_buying_power.items()
+        },
+        payload={
+            "currency": "USD",
+            "account_gate_exchange_coverage": ["AMEX", "NASD", "NYSE"],
+            "realized_pnl_coverage": "degraded_local_execution_fills_only",
+            "snapshot_sources": [snapshot.source for snapshot in snapshots],
+        },
+    )
+
+
+def _us_holding_exchange(payload: object) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+    for key in ("ovrs_excg_cd", "OVRS_EXCG_CD", "exchange", "excg_cd"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            normalized = value.strip().upper()
+            return {
+                "NAS": "NASD",
+                "NASDAQ": "NASD",
+                "NYS": "NYSE",
+                "AMS": "AMEX",
+            }.get(normalized, normalized)
+    return None
 
 
 def _is_new_buy_order(
