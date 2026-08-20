@@ -4523,8 +4523,9 @@ def _has_active_sell_monitor(
     ).all()
     for item in candidates:
         if item.status in SELL_PENDING_CONFIG_STATUSES:
-            if _monitoring_item_is_configured(item):
-                return True
+            # A pending exit is only a template tied to a future/entry item.
+            # Once broker truth says the symbol is already held it must not
+            # suppress creation of an actionable share-sized exit monitor.
             continue
         return True
     return False
