@@ -83,9 +83,14 @@ curl http://127.0.0.1:8010/symbols
 curl http://127.0.0.1:8010/symbols/005930
 ```
 
-When the primary port 8010 process is a live KIS runtime, the Alpaca paper
-runtime can run independently on port 8011 via `start-alpaca-paper.sh`. It uses
-a separate SQLite database and forces Alpaca live submission off.
+When the primary port 8010 process is a live KIS runtime, paper runtimes must
+stay isolated by provider. The Alpaca paper runtime can run independently on
+port 8011 via `start-alpaca-paper.sh`; it uses
+`var/alpaca_paper_exec.db`, keeps the global KIS autonomous coordinator off,
+and forces Alpaca live submission off. KIS US paper automation uses a separate
+port 8012 process via `start-kis-us-paper.sh` with
+`var/kis_us_paper_exec.db`; it enables the KIS autonomous coordinator only in
+that KIS-owned paper database and keeps KIS US live submission off.
 
 The default database is `sqlite:///./var/kai_trading_exec.db`. Override settings
 with `KAI_EXEC_` environment variables, for example:
@@ -205,12 +210,13 @@ so manual or other-strategy inventory is not liquidated by the sleeve.
 See [the account, funding, paper-test, strategy, and live activation
 runbook](docs/ALPACA_CRYPTO_SETUP.md) before configuring credentials or funds.
 
-The isolated Alpaca paper process also runs a concurrent U.S.-equity lane for
-SPY and QQQ. It uses Alpaca's market clock, IEX quotes/daily bars, the same
-closed-bar trend/risk engine, separate durable decisions and deterministic
+The isolated Alpaca paper process also runs a concurrent Alpaca U.S.-equity
+lane for SPY and QQQ. It uses Alpaca's market clock, IEX quotes/daily bars, the
+same closed-bar trend/risk engine, separate durable decisions and deterministic
 order keys, and `day` orders only while the U.S. market is open. Its status is
 available at `GET /runtime/alpaca-us-equity`. This paper lane does not alter or
-restart the independently running live KIS Korean-stock process.
+restart the independently running live KIS Korean-stock process, and it does
+not run KIS monitoring against Alpaca paper position state.
 
 Monitoring runtime settings currently supported:
 - `KAI_EXEC_AUTONOMOUS_RUNTIME_ENABLED`
