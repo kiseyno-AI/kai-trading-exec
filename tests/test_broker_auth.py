@@ -5842,6 +5842,73 @@ def test_monitoring_creates_default_exit_monitors_for_existing_position_without_
     engine.dispose()
 
 
+def test_monitoring_does_not_treat_pending_exit_templates_as_held_position_protection() -> None:
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(broker_order_id="kis-pending-template-repair"),
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:", runtime_mode="paper",
+            kis_app_key="paper-key", kis_app_secret="paper-secret",
+            kis_account_number="12345678", account_drawdown_gate_enabled=False,
+        ),
+        broker_adapter=broker_adapter,
+    )
+    client = TestClient(app)
+
+    with app.state.db_session_factory() as session:
+        plan = ExecutionPlan(
+            id="plan-pending-template-repair", external_plan_id="core-pending-template-repair",
+            source="test", mode="paper", market_date=date(2026, 6, 10),
+            accepted_at=datetime(2026, 6, 10, 0, 30, tzinfo=UTC), status="accepted",
+            raw_payload={"source": "test"},
+        )
+        session.add(plan)
+        session.add(ExecutionPosition(
+            mode="paper", symbol="005930", quantity=7,
+            average_price=Decimal("100000.0000"), updated_from="test",
+            raw_payload={"source": "test"},
+        ))
+        session.add_all([
+            ExecutionPlanItem(
+                plan=plan, plan_item_index=index, symbol="005930", side="sell",
+                intent=intent, status=f"{intent}_pending_config",
+                quantity_policy={"type": "position_exit_from_entry", "linked_entry_item_key": "future-entry"},
+                trigger_price=trigger_price, time_in_force="day",
+                source_plan_item_id=f"pending-template:{intent}",
+            )
+            for index, intent, trigger_price in (
+                (0, "stop_sell", Decimal("96000.0000")),
+                (1, "target_sell", Decimal("105000.0000")),
+            )
+        ])
+        session.commit()
+
+    response = client.post("/monitoring/evaluate", json={
+        "actor": "ops", "source": "test", "reason": "repair held protection",
+        "observed_at": "2026-06-10T01:00:00Z",
+        "prices": [{"symbol": "005930", "price": "101000.00"}],
+    })
+
+    assert response.status_code == 200
+    with app.state.db_session_factory() as session:
+        active_items = session.scalars(select(ExecutionPlanItem).where(
+            ExecutionPlanItem.symbol == "005930",
+            ExecutionPlanItem.status.in_(("stop_sell_monitoring", "target_sell_monitoring")),
+        )).all()
+        assert {item.intent for item in active_items} == {"stop_sell", "target_sell"}
+        assert all(item.quantity_policy["quantity"] == 7 for item in active_items)
+
+    engine.dispose()
+
+
 @pytest.mark.parametrize(
     "active_status",
     [
