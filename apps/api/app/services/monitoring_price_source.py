@@ -504,7 +504,19 @@ def is_us_regular_session(local: datetime) -> bool:
     market_date = local.date()
     if market_date.weekday() >= 5 or market_date in _us_market_holidays(market_date.year):
         return False
-    return datetime_time(9, 30) <= local.timetz().replace(tzinfo=None) < datetime_time(16, 0)
+    close_time = datetime_time(13, 0) if _is_us_early_close(market_date) else datetime_time(16, 0)
+    return datetime_time(9, 30) <= local.timetz().replace(tzinfo=None) < close_time
+
+
+def _is_us_early_close(market_date: date) -> bool:
+    if market_date.weekday() >= 5 or market_date in _us_market_holidays(market_date.year):
+        return False
+    thanksgiving = _nth_weekday(market_date.year, 11, 3, 4)
+    if market_date == thanksgiving + timedelta(days=1):
+        return True
+    if market_date.month == 12 and market_date.day == 24:
+        return True
+    return market_date.month == 7 and market_date.day == 3
 
 
 def next_us_regular_open(observed_at: datetime) -> datetime:

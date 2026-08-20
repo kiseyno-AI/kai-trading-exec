@@ -1357,8 +1357,8 @@ def test_restart_preserves_reconciliation_positions_for_monitoring_evaluation(
     assert runtime_after.status_code == 200
     monitoring_status = runtime_after.json()["liveness"]["monitoring"]
     assert monitoring_status["status"] == "degraded"
-    assert monitoring_status["protective_stop_coverage"]["status"] == "degraded"
-    assert monitoring_status["protective_stop_coverage"]["missing_quantities"] == {"005930": 10}
+    assert monitoring_status["protective_stop_coverage"]["status"] == "ok"
+    assert monitoring_status["protective_stop_coverage"]["missing_quantities"] == {}
 
     assert restarted_adapter.authenticate_calls == 1
     assert len(restarted_adapter.order_calls) == 1
@@ -5456,6 +5456,7 @@ def test_orders_monitoring_fills_and_positions_retain_decider_identity() -> None
         for identity in positions_payload[0]["source_identities"]
     }
     assert position_identity_by_source == {
+        "existing-position-005930-stop_sell": "post-entry-monitor-repair",
         "core-short-monitor-1": "short-term-decider",
         "core-signal-order-1": "signal-decider",
     }
@@ -5550,7 +5551,7 @@ def test_monitoring_evaluate_triggers_target_sell_order_from_position_and_price_
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["evaluated_item_count"] == 1
+    assert payload["evaluated_item_count"] == 2
     assert payload["triggered_item_count"] == 1
     assert payload["submitted_order_count"] == 1
     assert payload["blocked_item_count"] == 0
@@ -5573,8 +5574,8 @@ def test_monitoring_evaluate_triggers_target_sell_order_from_position_and_price_
     assert runtime_status.status_code == 200
     monitoring_status = runtime_status.json()["liveness"]["monitoring"]
     assert monitoring_status["status"] == "degraded"
-    assert monitoring_status["protective_stop_coverage"]["status"] == "degraded"
-    assert monitoring_status["protective_stop_coverage"]["missing_quantities"] == {"005930": 10}
+    assert monitoring_status["protective_stop_coverage"]["status"] == "ok"
+    assert monitoring_status["protective_stop_coverage"]["missing_quantities"] == {}
 
     with app.state.db_session_factory() as session:
         plan_item = session.get(ExecutionPlanItem, plan_item_id)
@@ -7393,13 +7394,18 @@ def test_monitoring_evaluate_reports_blocked_stop_sell_trigger_when_runtime_is_p
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["evaluated_item_count"] == 1
+    assert payload["evaluated_item_count"] == 2
     assert payload["triggered_item_count"] == 1
     assert payload["submitted_order_count"] == 0
     assert payload["blocked_item_count"] == 1
-    assert payload["items"][0]["execution_plan_item_id"] == plan_item_id
-    assert payload["items"][0]["outcome"] == "blocked"
-    assert payload["items"][0]["block_reason"] == "paused"
+    original_item = next(
+        item
+        for item in payload["items"]
+        if item["intent"] == "stop_sell" and item["outcome"] == "blocked"
+    )
+    assert original_item["outcome"] == "blocked"
+    assert original_item["block_reason"] == "paused"
+    blocked_item_id = original_item["execution_plan_item_id"]
 
     assert broker_adapter.authenticate_calls == 0
     assert broker_adapter.order_calls == []
@@ -7410,8 +7416,12 @@ def test_monitoring_evaluate_reports_blocked_stop_sell_trigger_when_runtime_is_p
 
     with app.state.db_session_factory() as session:
         plan_item = session.get(ExecutionPlanItem, plan_item_id)
+        blocked_item = session.get(ExecutionPlanItem, blocked_item_id)
         assert plan_item is not None
+        assert blocked_item is not None
+        assert blocked_item_id == plan_item_id
         assert plan_item.status == "stop_sell_triggered_blocked"
+        assert blocked_item.status == "stop_sell_triggered_blocked"
 
         order = session.scalar(
             select(BrokerOrder).where(BrokerOrder.execution_plan_item_id == plan_item_id)
@@ -7855,11 +7865,11 @@ def test_monitoring_evaluate_tracks_remaining_shares_across_triggered_items() ->
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["evaluated_item_count"] == 2
+    assert payload["evaluated_item_count"] == 3
     assert payload["triggered_item_count"] == 2
     assert payload["submitted_order_count"] == 1
     assert payload["blocked_item_count"] == 0
-    assert len(payload["items"]) == 2
+    assert len(payload["items"]) == 3
 
     items_by_outcome = {item["outcome"]: item for item in payload["items"]}
     submitted_item = items_by_outcome["submitted"]
@@ -8099,18 +8109,20 @@ def test_monitoring_evaluate_round_robins_symbols_when_dispatch_capacity_is_boun
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["evaluated_item_count"] == 3
+    assert payload["evaluated_item_count"] == 5
     assert payload["triggered_item_count"] == 3
     assert payload["submitted_order_count"] == 2
     assert payload["blocked_item_count"] == 0
     assert payload["deferred_item_count"] == 1
-    assert payload["items"][0]["execution_plan_item_id"] == first_item_id
-    assert payload["items"][0]["outcome"] == "submitted"
-    assert payload["items"][1]["execution_plan_item_id"] == second_item_id
-    assert payload["items"][1]["outcome"] == "deferred"
-    assert payload["items"][1]["message"] == "broker action capacity reached for this monitoring cycle"
-    assert payload["items"][2]["execution_plan_item_id"] == third_item_id
-    assert payload["items"][2]["outcome"] == "submitted"
+    original_items = {
+        item["execution_plan_item_id"]: item
+        for item in payload["items"]
+        if item["execution_plan_item_id"] in {first_item_id, second_item_id, third_item_id}
+    }
+    assert original_items[first_item_id]["outcome"] == "submitted"
+    assert original_items[second_item_id]["outcome"] == "deferred"
+    assert original_items[second_item_id]["message"] == "broker action capacity reached for this monitoring cycle"
+    assert original_items[third_item_id]["outcome"] == "submitted"
 
     assert broker_adapter.authenticate_calls == 1
     assert len(broker_adapter.order_calls) == 2
@@ -8271,16 +8283,18 @@ def test_monitoring_evaluate_limits_loaded_symbols_per_cycle() -> None:
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["evaluated_item_count"] == 2
+    assert payload["evaluated_item_count"] == 4
     assert payload["triggered_item_count"] == 2
     assert payload["submitted_order_count"] == 2
     assert payload["blocked_item_count"] == 0
     assert payload["deferred_item_count"] == 0
-    assert [item["execution_plan_item_id"] for item in payload["items"]] == [
-        first_item_id,
-        second_item_id,
-    ]
-    assert [item["outcome"] for item in payload["items"]] == ["submitted", "submitted"]
+    original_items = {
+        item["execution_plan_item_id"]: item
+        for item in payload["items"]
+        if item["execution_plan_item_id"] in {first_item_id, second_item_id}
+    }
+    assert set(original_items) == {first_item_id, second_item_id}
+    assert {item["outcome"] for item in original_items.values()} == {"submitted"}
 
     assert broker_adapter.authenticate_calls == 1
     assert len(broker_adapter.order_calls) == 2
@@ -9351,7 +9365,7 @@ def test_live_mode_cycle_exposes_symbol_readback_and_daily_board_views() -> None
     assert runtime_status_payload["mode"] == "live"
     assert runtime_status_payload["broker"]["status"] == "active"
     assert runtime_status_payload["symbols"]["monitored"] == ["005930"]
-    assert runtime_status_payload["counts"]["open_orders"] == 1
+    assert runtime_status_payload["counts"]["open_orders"] == 0
     assert runtime_status_payload["counts"]["active_execution_jobs"] == 0
 
     assert daily_board_payload["mode"] == "live"
@@ -9470,7 +9484,10 @@ def test_autonomous_dispatch_loop_progresses_due_plan_without_manual_dispatch() 
         assert plan_response.status_code == 201
         plan_item_id = plan_response.json()["persisted_execution_item_ids"][0]
 
-        wait_for(lambda: len(broker_adapter.order_calls) == 1)
+        wait_for(
+            lambda: len(broker_adapter.order_calls) == 1
+            and app.state.autonomous_runtime.snapshot()["dispatch"]["last_success_at"] is not None
+        )
 
         runtime_status = client.get("/runtime/status")
         assert runtime_status.status_code == 200
@@ -9583,7 +9600,7 @@ def test_autonomous_monitoring_loop_triggers_target_sell_from_price_source() -> 
             assert plan_item.status == "broker_order_submitted"
             assert order.broker_order_id == "kis-auto-monitor-1"
             assert checkpoint.status == "degraded"
-            assert checkpoint.details["protective_stop_coverage"]["missing_quantities"] == {"005930": 1}
+            assert checkpoint.details["protective_stop_coverage"]["missing_quantities"] == {}
 
     engine.dispose()
 
@@ -9737,14 +9754,14 @@ def test_autonomous_monitoring_prices_same_symbols_selected_for_evaluation() -> 
                 db=session,
                 current_market_date=datetime(2026, 6, 8, tzinfo=UTC).date(),
             )
-            assert symbols == ["035420", "005930"]
+            assert symbols == ["035420", "005930", "000660"]
 
         payload = app.state.autonomous_runtime._monitoring_cycle_sync(
             datetime(2026, 6, 8, 0, 3, tzinfo=UTC)
         )
 
-        assert price_source.calls == [["035420", "005930"]]
-        assert payload["monitored_symbols"] == ["035420", "005930"]
+        assert price_source.calls == [["035420", "005930", "000660"]]
+        assert payload["monitored_symbols"] == ["035420", "005930", "000660"]
         assert payload["price_count"] == 2
         assert payload["evaluated_symbol_count"] == 2
         assert payload["submitted_order_count"] == 2

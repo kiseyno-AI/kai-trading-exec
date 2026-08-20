@@ -30,15 +30,13 @@ from app.services.monitoring import (
     WATCH_BUY_INTENTS,
     _load_positions_by_symbol,
     _maintain_post_entry_exit_monitors,
+    _sync_positions_for_monitoring_routes,
     list_autonomous_monitoring_symbols,
     run_autonomous_monitoring_cycle,
     _load_core_desired_monitoring_symbols,
 )
 from app.services.nxt_eligibility import refresh_nxt_eligible_symbols
-from app.services.reconciliation import (
-    reconcile_pending_broker_orders,
-    sync_execution_positions_from_broker_snapshot,
-)
+from app.services.reconciliation import reconcile_pending_broker_orders
 from app.services.watch_exec_agent_sizing import run_due_watch_exec_agent_sizing
 
 LOGGER = logging.getLogger(__name__)
@@ -654,6 +652,34 @@ class AutonomousRuntimeCoordinator:
             self._store_cycle_payload(worker_key="monitoring", payload=payload)
             return payload
 
+        if not prices:
+            # Empty/failed quote cycles still have work to do: persist a
+            # checkpoint, surface coverage degradation, and retry previously
+            # latched pending-dispatch exits that no longer require a quote.
+            with self.session_factory() as db:
+                adapter = self.broker_adapter_factory(self.settings)
+                result = run_autonomous_monitoring_cycle(
+                    settings=self.settings,
+                    db=db,
+                    adapter=adapter,
+                    prices=[],
+                    symbols=symbols,
+                    now=started_at,
+                )
+            payload = {
+                "status_code": result.status_code,
+                "price_source_configured": self._monitoring_price_source_state.configured,
+                "price_source": self._monitoring_price_source_state.snapshot(),
+                "runtime_snapshot": runtime_snapshot.snapshot(),
+                **result.payload,
+                "monitored_symbols": monitored_symbols,
+                "price_count": 0,
+                "broker_action_symbols": symbols,
+                "broker_action_price_count": 0,
+            }
+            self._store_cycle_payload(worker_key="monitoring", payload=payload)
+            return payload
+
         triggered_sell_symbols = _triggered_symbols_from_cached_payload(
             cached_payload,
             include_watch_buys=False,
@@ -766,11 +792,12 @@ class AutonomousRuntimeCoordinator:
             adapter = self.broker_adapter_factory(self.settings)
             with self.session_factory() as db:
                 try:
-                    sync_execution_positions_from_broker_snapshot(
+                    _sync_positions_for_monitoring_routes(
                         settings=self.settings,
                         db=db,
                         adapter=adapter,
                         symbols=None,
+                        discover_us_holdings=True,
                     )
                     db.commit()
                 except Exception:
@@ -853,7 +880,7 @@ class AutonomousRuntimeCoordinator:
                     symbols=symbols,
                 )
                 if int(result.get("fills_added") or 0) > 0:
-                    sync_execution_positions_from_broker_snapshot(
+                    _sync_positions_for_monitoring_routes(
                         settings=self.settings,
                         db=db,
                         adapter=adapter,

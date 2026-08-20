@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 from pydantic import ValidationError
+from sqlalchemy import select
 
 from app.api.schemas.execution import ExecutionPlanRequest, PlaceOrderRequest
 from app.broker.base import (
@@ -31,12 +32,15 @@ from app.broker.kis import (
 from app.core.config import Settings
 from app.db.base import Base
 from app.db.session import create_db_engine, create_session_factory
+from app.models.runtime import BrokerOrder
 from app.services import broker_orders as broker_orders_module
 from app.services.account_drawdown_gate import evaluate_us_equity_account_gate
 from app.services.broker_orders import (
     _evaluate_new_buy_account_gate,
+    _merge_us_account_gate_snapshots,
     _order_notional,
     _validate_kis_us_equity_guardrails,
+    place_broker_order,
 )
 from app.services.execution_api import _build_execution_plan
 from app.services.execution_jobs import (
@@ -45,6 +49,7 @@ from app.services.execution_jobs import (
     materialize_execution_jobs,
 )
 from app.services.monitoring import materialize_monitoring_plan_items
+from app.services.runtime_controls import ControlCommand, resume_runtime
 
 
 class QueueHttpClient:
@@ -89,6 +94,7 @@ def _settings(**overrides: object) -> Settings:
         "kis_app_secret": "app-secret",
         "kis_account_number": "12345678",
         "kis_use_hashkey": False,
+        "kis_us_allow_degraded_realized_pnl_coverage": True,
     }
     values.update(overrides)
     return Settings(
@@ -519,6 +525,231 @@ def test_kis_us_equity_account_gate_uses_whole_share_notional(monkeypatch) -> No
     engine.dispose()
 
 
+def test_kis_us_equity_new_buy_gate_aggregates_all_supported_exchange_snapshots(
+    monkeypatch,
+) -> None:
+    settings = _settings(
+        database_url="sqlite:///:memory:",
+        kis_us_max_total_exposure_usd=Decimal("500"),
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    db = create_session_factory(engine)()
+    snapshots = {
+        "NASD": BrokerAccountSnapshot(
+            observed_at=datetime(2026, 8, 19, 14, 0, tzinfo=UTC),
+            source="test:NASD",
+            holdings=[
+                BrokerAccountHolding(
+                    symbol="AAPL",
+                    quantity=1,
+                    average_price=Decimal("300"),
+                    payload={"ovrs_stck_evlu_amt": "300"},
+                )
+            ],
+        ),
+        "NYSE": BrokerAccountSnapshot(
+            observed_at=datetime(2026, 8, 19, 14, 0, tzinfo=UTC),
+            source="test:NYSE",
+            holdings=[
+                BrokerAccountHolding(
+                    symbol="IBM",
+                    quantity=1,
+                    average_price=Decimal("250"),
+                    payload={"ovrs_stck_evlu_amt": "250"},
+                )
+            ],
+        ),
+        "AMEX": BrokerAccountSnapshot(
+            observed_at=datetime(2026, 8, 19, 14, 0, tzinfo=UTC),
+            source="test:AMEX",
+        ),
+    }
+    calls: list[tuple[list[str] | None, str]] = []
+
+    def get_account_snapshot(_token, *, symbols=None, exchange="KRX"):
+        calls.append((symbols, exchange))
+        return snapshots[exchange]
+
+    adapter = SimpleNamespace(provider="kis", get_account_snapshot=get_account_snapshot)
+    monkeypatch.setattr(
+        broker_orders_module,
+        "ensure_authenticated_broker_session",
+        lambda **_kwargs: SimpleNamespace(access_token="token"),
+    )
+    command = PlaceOrderRequest(
+        idempotency_key="us-account-gate-all-exchanges",
+        provider="kis",
+        asset_class="us_equity",
+        venue="kis",
+        symbol="MSFT",
+        side="buy",
+        quantity=1,
+        order_type="limit",
+        limit_price=Decimal("100"),
+        exchange="NASD",
+    )
+
+    decision = _evaluate_new_buy_account_gate(
+        settings=settings,
+        db=db,
+        adapter=adapter,
+        command=command,
+        plan_item=None,
+    )
+
+    assert calls == [
+        (["MSFT"], "AMEX"),
+        (["MSFT"], "NASD"),
+        (["MSFT"], "NYSE"),
+    ]
+    assert decision is not None and decision.allowed is False
+    assert decision.gate_name == "us_total_exposure_usd"
+    assert decision.payload["metrics"]["current_exposure_usd"] == "550.0000"
+    assert decision.payload["metrics"]["projected_exposure_usd"] == "650.0000"
+    db.close()
+    engine.dispose()
+
+
+def test_kis_us_equity_new_buy_gate_blocks_unconfirmed_broker_realized_pnl_coverage(
+    monkeypatch,
+) -> None:
+    settings = _settings(
+        database_url="sqlite:///:memory:",
+        kis_us_allow_degraded_realized_pnl_coverage=False,
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    db = create_session_factory(engine)()
+    snapshot = BrokerAccountSnapshot(
+        observed_at=datetime(2026, 8, 19, 14, 0, tzinfo=UTC),
+        source="test",
+    )
+    adapter = SimpleNamespace(
+        provider="kis",
+        get_account_snapshot=lambda *_args, **_kwargs: snapshot,
+    )
+    monkeypatch.setattr(
+        broker_orders_module,
+        "ensure_authenticated_broker_session",
+        lambda **_kwargs: SimpleNamespace(access_token="token"),
+    )
+    command = PlaceOrderRequest(
+        idempotency_key="us-account-gate-realized-coverage",
+        provider="kis",
+        asset_class="us_equity",
+        venue="kis",
+        symbol="AAPL",
+        side="buy",
+        quantity=1,
+        order_type="limit",
+        limit_price=Decimal("100"),
+        exchange="NASD",
+    )
+
+    decision = _evaluate_new_buy_account_gate(
+        settings=settings,
+        db=db,
+        adapter=adapter,
+        command=command,
+        plan_item=None,
+    )
+
+    assert decision is not None and decision.allowed is False
+    assert decision.gate_name == "us_realized_pnl_coverage_unconfirmed"
+    assert decision.payload["metrics"]["realized_pnl_coverage"] == (
+        "degraded_local_execution_fills_only"
+    )
+    db.close()
+    engine.dispose()
+
+
+def test_kis_us_equity_new_buy_gate_fails_closed_on_conflicting_duplicate_holding(
+    monkeypatch,
+) -> None:
+    settings = _settings(database_url="sqlite:///:memory:")
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    db = create_session_factory(engine)()
+
+    def get_account_snapshot(_token, *, symbols=None, exchange="KRX"):
+        del symbols
+        quantity = 1 if exchange == "NASD" else 2
+        holdings = [] if exchange == "AMEX" else [
+            BrokerAccountHolding(
+                symbol="AAPL",
+                quantity=quantity,
+                average_price=Decimal("100"),
+                payload={"ovrs_excg_cd": "NASD", "ovrs_stck_evlu_amt": str(100 * quantity)},
+            )
+        ]
+        return BrokerAccountSnapshot(
+            observed_at=datetime(2026, 8, 19, 14, 0, tzinfo=UTC),
+            source=f"test:{exchange}",
+            holdings=holdings,
+            payload={"exchange": exchange},
+        )
+
+    adapter = SimpleNamespace(provider="kis", get_account_snapshot=get_account_snapshot)
+    monkeypatch.setattr(
+        broker_orders_module,
+        "ensure_authenticated_broker_session",
+        lambda **_kwargs: SimpleNamespace(access_token="token"),
+    )
+    command = PlaceOrderRequest(
+        idempotency_key="us-account-gate-conflicting-holding",
+        provider="kis",
+        asset_class="us_equity",
+        venue="kis",
+        symbol="MSFT",
+        side="buy",
+        quantity=1,
+        order_type="limit",
+        limit_price=Decimal("100"),
+        exchange="NASD",
+    )
+
+    decision = _evaluate_new_buy_account_gate(
+        settings=settings,
+        db=db,
+        adapter=adapter,
+        command=command,
+        plan_item=None,
+    )
+
+    assert decision is not None and decision.allowed is False
+    assert decision.gate_name == "account_drawdown_snapshot_unavailable"
+    assert "conflicting duplicate KIS US holding" in (decision.reason or "")
+    db.close()
+    engine.dispose()
+
+
+def test_us_account_gate_deduplicates_identical_holdings_without_double_counting_pnl() -> None:
+    holding = BrokerAccountHolding(
+        symbol="AAPL",
+        quantity=2,
+        average_price=Decimal("100"),
+        unrealized_pnl=Decimal("15"),
+        payload={"ovrs_excg_cd": "NASD", "ovrs_stck_evlu_amt": "215"},
+    )
+    snapshots = [
+        (
+            exchange,
+            BrokerAccountSnapshot(
+                observed_at=datetime(2026, 8, 19, 14, 0, tzinfo=UTC),
+                source=f"test:{exchange}",
+                holdings=[holding] if exchange in {"NASD", "NYSE"} else [],
+            ),
+        )
+        for exchange in ("AMEX", "NASD", "NYSE")
+    ]
+
+    merged = _merge_us_account_gate_snapshots(snapshots)
+
+    assert len(merged.holdings) == 1
+    assert merged.unrealized_pnl == Decimal("15")
+
+
 def test_us_execution_handoff_preserves_route_and_schedules_new_york_open() -> None:
     plan = _build_execution_plan(
         settings=_settings(kis_us_trading_enabled=True),
@@ -615,6 +846,83 @@ def test_us_execution_job_is_deferred_when_dispatch_occurs_after_new_york_close(
     assert job.attempts == 0
     assert job.scheduled_for == datetime(2026, 8, 20, 13, 30, tzinfo=UTC)
     assert "outside New York regular session" in (job.last_error or "")
+    db.close()
+    engine.dispose()
+
+
+def test_us_target_sell_order_is_deferred_outside_new_york_regular_session() -> None:
+    settings = _settings(
+        database_url="sqlite:///:memory:",
+        kis_us_trading_enabled=True,
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    db = create_session_factory(engine)()
+    plan = _build_execution_plan(
+        settings=settings,
+        command=ExecutionPlanRequest(
+            plan_id="core-us-target-session-gate-20260819",
+            source="kai-trading-core",
+            market_date=date(2026, 8, 19),
+            items=[
+                {
+                    "symbol": "AAPL",
+                    "source_plan_item_id": "core-us-target-session-gate:AAPL:target",
+                    "side": "sell",
+                    "intent": "target_sell",
+                    "quantity_policy": {"kind": "shares", "quantity": 1},
+                    "provider": "kis",
+                    "venue": "kis",
+                    "asset_class": "us_equity",
+                    "market": "US",
+                    "exchange": "NASD",
+                    "currency": "USD",
+                    "trigger_price": "210.00",
+                    "limit_price": "210.00",
+                    "time_in_force": "day",
+                }
+            ],
+        ),
+    )
+    item = plan.items[0]
+    db.add(plan)
+    db.commit()
+    resume_runtime(
+        settings=settings,
+        db=db,
+        command=ControlCommand(actor="test", source="test", reason="session gate test"),
+    )
+    command = PlaceOrderRequest(
+        idempotency_key="monitoring:us-target-session-gate",
+        execution_plan_item_id=item.id,
+        provider="kis",
+        asset_class="us_equity",
+        venue="kis",
+        symbol="AAPL",
+        side="sell",
+        quantity=1,
+        order_type="limit",
+        limit_price=Decimal("210"),
+        exchange="NASD",
+        metadata={
+            "order_purpose": "target_sell",
+            "route_now": "2026-08-19T20:30:00+00:00",
+        },
+    )
+
+    result = place_broker_order(
+        settings=settings,
+        db=db,
+        adapter=SimpleNamespace(provider="kis"),
+        command=command,
+        request_source="monitoring:autonomous_monitoring",
+    )
+
+    assert result.status_code == 202
+    assert result.payload["deferred"] is True
+    assert result.payload["route"]["session"] == "us_closed"
+    assert result.payload["route"]["next_retry_at"] == "2026-08-20T13:30:00+00:00"
+    assert db.scalars(select(BrokerOrder)).all() == []
     db.close()
     engine.dispose()
 

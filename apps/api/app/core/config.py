@@ -175,6 +175,7 @@ class Settings(BaseModel):
     kis_us_unrealized_loss_limit_usd: Decimal = Field(default=Decimal("50"), gt=0)
     kis_us_unrealized_loss_pct: Decimal = Field(default=Decimal("5"), gt=0, le=Decimal("100"))
     kis_us_severe_holding_loss_pct: Decimal = Field(default=Decimal("10"), gt=0, le=Decimal("100"))
+    kis_us_allow_degraded_realized_pnl_coverage: bool = False
     kis_us_preflight_buying_power_enabled: bool = True
     upbit_access_key: str | None = None
     upbit_secret_key: str | None = None
@@ -474,6 +475,7 @@ _ENV_FIELDS = {
     "KIS_US_UNREALIZED_LOSS_LIMIT_USD": "kis_us_unrealized_loss_limit_usd",
     "KIS_US_UNREALIZED_LOSS_PCT": "kis_us_unrealized_loss_pct",
     "KIS_US_SEVERE_HOLDING_LOSS_PCT": "kis_us_severe_holding_loss_pct",
+    "KIS_US_ALLOW_DEGRADED_REALIZED_PNL_COVERAGE": "kis_us_allow_degraded_realized_pnl_coverage",
     "KIS_US_PREFLIGHT_BUYING_POWER_ENABLED": "kis_us_preflight_buying_power_enabled",
     "UPBIT_ACCESS_KEY": "upbit_access_key",
     "UPBIT_SECRET_KEY": "upbit_secret_key",

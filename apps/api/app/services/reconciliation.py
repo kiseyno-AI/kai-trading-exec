@@ -9,6 +9,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session, selectinload
 
 from app.broker.base import (
+    BrokerAccountHolding,
     BrokerAdapter,
     BrokerAdapterError,
     BrokerEventSource,
@@ -742,6 +743,7 @@ def sync_execution_positions_from_broker_snapshot(
     adapter: BrokerAdapter,
     symbols: set[str] | None = None,
     exchange: str = "KRX",
+    discover_holdings_only: bool = False,
 ) -> dict[str, int]:
     normalized_symbols = _normalize_symbols(symbols)
     session_state = ensure_authenticated_broker_session(
@@ -759,7 +761,11 @@ def sync_execution_positions_from_broker_snapshot(
         )
     except TypeError:
         snapshot = adapter.get_account_snapshot(session_state.access_token or "")
-    if normalized_symbols is not None:
+    if discover_holdings_only:
+        if normalized_symbols is not None:
+            raise ValueError("holdings-only discovery requires symbols=None")
+        tracked_symbols = {holding.symbol for holding in snapshot.holdings}
+    elif normalized_symbols is not None:
         tracked_symbols = normalized_symbols
     else:
         local_symbols = set(
@@ -811,7 +817,11 @@ def sync_execution_positions_from_broker_snapshot(
                         average_price=None,
                         updated_from="reconciliation",
                         last_reconciled_at=observed_at,
-                        raw_payload=_snapshot_payload(snapshot.payload),
+                        raw_payload=_position_snapshot_payload(
+                            snapshot_payload=snapshot.payload,
+                            holding=None,
+                            exchange=exchange,
+                        ),
                     )
                 )
                 created += 1
@@ -828,7 +838,11 @@ def sync_execution_positions_from_broker_snapshot(
                 zeroed += 1
             position.updated_from = "reconciliation"
             position.last_reconciled_at = observed_at
-            position.raw_payload = _snapshot_payload(snapshot.payload)
+            position.raw_payload = _position_snapshot_payload(
+                snapshot_payload=snapshot.payload,
+                holding=None,
+                exchange=exchange,
+            )
             continue
 
         holding_base_quantity = _holding_base_quantity(holding.payload)
@@ -842,7 +856,11 @@ def sync_execution_positions_from_broker_snapshot(
                     average_price=holding.average_price,
                     updated_from="reconciliation",
                     last_reconciled_at=observed_at,
-                    raw_payload=_snapshot_payload(snapshot.payload),
+                    raw_payload=_position_snapshot_payload(
+                        snapshot_payload=snapshot.payload,
+                        holding=holding,
+                        exchange=exchange,
+                    ),
                 )
             )
             created += 1
@@ -866,7 +884,11 @@ def sync_execution_positions_from_broker_snapshot(
             position.updated_from = "reconciliation"
             changed = True
         position.last_reconciled_at = observed_at
-        position.raw_payload = _snapshot_payload(snapshot.payload)
+        position.raw_payload = _position_snapshot_payload(
+            snapshot_payload=snapshot.payload,
+            holding=holding,
+            exchange=exchange,
+        )
         if changed:
             updated += 1
 
@@ -895,6 +917,60 @@ def _snapshot_payload(payload: dict[str, Any] | None) -> dict[str, Any] | None:
     if not isinstance(payload, dict):
         return None
     return payload
+
+
+def _position_snapshot_payload(
+    *,
+    snapshot_payload: dict[str, Any] | None,
+    holding: BrokerAccountHolding | None,
+    exchange: str,
+) -> dict[str, Any] | None:
+    payload = _snapshot_payload(snapshot_payload)
+    if payload is None:
+        payload = {}
+    else:
+        payload = dict(payload)
+    normalized_exchange = str(exchange or "").strip().upper()
+    if holding is None or normalized_exchange not in {"NASD", "NYSE", "AMEX"}:
+        return payload or None
+
+    reported_exchange = _holding_reported_exchange(holding.payload) or normalized_exchange
+    monitoring_eligible = (
+        reported_exchange in {"NASD", "NYSE", "AMEX"}
+        and reported_exchange == normalized_exchange
+        and holding.average_price is not None
+        and holding.average_price > 0
+    )
+    position_sync: dict[str, Any] = {
+        "asset_class": "us_equity",
+        "exchange": reported_exchange,
+        "monitoring_eligible": monitoring_eligible,
+    }
+    if not monitoring_eligible:
+        position_sync["manual_review_reason"] = (
+            "unpriced_overseas_holding"
+            if reported_exchange in {"NASD", "NYSE", "AMEX"}
+            else "unsupported_overseas_exchange"
+        )
+    payload["_position_sync"] = position_sync
+    return payload
+
+
+def _holding_reported_exchange(payload: object) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+    for key in ("ovrs_excg_cd", "OVRS_EXCG_CD", "exchange", "excg_cd"):
+        value = payload.get(key)
+        if not isinstance(value, str) or not value.strip():
+            continue
+        normalized = value.strip().upper()
+        return {
+            "NAS": "NASD",
+            "NASDAQ": "NASD",
+            "NYS": "NYSE",
+            "AMS": "AMEX",
+        }.get(normalized, normalized)
+    return None
 
 
 def _reconcilable_order_statuses() -> tuple[str, ...]:
