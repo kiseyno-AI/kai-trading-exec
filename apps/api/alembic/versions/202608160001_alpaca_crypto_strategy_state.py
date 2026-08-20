@@ -53,12 +53,14 @@ def upgrade() -> None:
             "bar_open_at",
             name="uq_crypto_daily_bars_provider_symbol_timeframe_bar_open",
         ),
+        if_not_exists=True,
     )
     op.create_index(
         "ix_crypto_daily_bars_provider_symbol_close",
         "crypto_daily_bars",
         ["provider", "symbol", "bar_close_at"],
         unique=False,
+        if_not_exists=True,
     )
 
     op.create_table(
@@ -96,6 +98,7 @@ def upgrade() -> None:
             "symbol",
             name="uq_crypto_strategy_states_mode_provider_version_symbol",
         ),
+        if_not_exists=True,
     )
 
     op.create_table(
@@ -134,6 +137,7 @@ def upgrade() -> None:
             "strategy_version",
             name="uq_crypto_strategy_risk_states_mode_provider_version",
         ),
+        if_not_exists=True,
     )
 
     op.create_table(
@@ -179,18 +183,21 @@ def upgrade() -> None:
             "decision_bar_at",
             name="uq_crypto_strategy_decisions_scope_bar",
         ),
+        if_not_exists=True,
     )
     op.create_index(
         "ix_crypto_strategy_decisions_mode_decided_at",
         "crypto_strategy_decisions",
         ["mode", "decided_at"],
         unique=False,
+        if_not_exists=True,
     )
     op.create_index(
         op.f("ix_crypto_strategy_decisions_idempotency_key"),
         "crypto_strategy_decisions",
         ["idempotency_key"],
         unique=False,
+        if_not_exists=True,
     )
 
 
@@ -198,16 +205,19 @@ def downgrade() -> None:
     op.drop_index(
         op.f("ix_crypto_strategy_decisions_idempotency_key"),
         table_name="crypto_strategy_decisions",
+        if_exists=True,
     )
     op.drop_index(
         "ix_crypto_strategy_decisions_mode_decided_at",
         table_name="crypto_strategy_decisions",
+        if_exists=True,
     )
-    op.drop_table("crypto_strategy_decisions")
-    op.drop_table("crypto_strategy_risk_states")
-    op.drop_table("crypto_strategy_states")
+    op.drop_table("crypto_strategy_decisions", if_exists=True)
+    op.drop_table("crypto_strategy_risk_states", if_exists=True)
+    op.drop_table("crypto_strategy_states", if_exists=True)
     op.drop_index(
         "ix_crypto_daily_bars_provider_symbol_close",
         table_name="crypto_daily_bars",
+        if_exists=True,
     )
-    op.drop_table("crypto_daily_bars")
+    op.drop_table("crypto_daily_bars", if_exists=True)
