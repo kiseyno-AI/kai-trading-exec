@@ -1780,7 +1780,7 @@ def test_autonomous_monitoring_includes_older_active_sell_monitor_without_same_i
     engine.dispose()
 
 
-def test_autonomous_monitoring_falls_back_to_older_stop_when_latest_stop_rejected() -> None:
+def test_autonomous_monitoring_repairs_rejected_latest_stop_before_dispatch() -> None:
     app, engine = build_test_app(
         Settings(
             database_url="sqlite:///:memory:",
@@ -1887,10 +1887,16 @@ def test_autonomous_monitoring_falls_back_to_older_stop_when_latest_stop_rejecte
         assert broker_adapter.order_calls[0].symbol == "033530"
         assert broker_adapter.order_calls[0].side == "sell"
         assert broker_adapter.order_calls[0].quantity == 58
-        assert broker_adapter.order_calls[0].execution_plan_item_id == older_stop_id
+        repaired_stop_id = broker_adapter.order_calls[0].execution_plan_item_id
+        assert repaired_stop_id not in {older_stop_id, newer_target_id, newer_stop_id}
+        repaired_stop = session.get(ExecutionPlanItem, repaired_stop_id)
+        assert repaired_stop is not None
+        assert repaired_stop.intent == "stop_sell"
+        assert repaired_stop.decision_agent_name == "post-entry-monitor-repair"
+        assert repaired_stop.trigger_price == Decimal("8287.5000")
 
         orders = session.scalars(select(BrokerOrder)).all()
-        assert [order.execution_plan_item_id for order in orders] == [older_stop_id]
+        assert [order.execution_plan_item_id for order in orders] == [repaired_stop_id]
 
     engine.dispose()
 

@@ -1600,6 +1600,12 @@ def _classify_error(
     message_lower = message.lower()
     code_lower = (code or "").lower()
 
+    # KIS reports an app-key/runtime-mode mismatch as HTTP 500 even though the
+    # request cannot succeed until credentials are changed.  Treat it as a
+    # permanent configuration validation error before the generic 5xx rule so
+    # autonomous dispatch does not hammer the broker with identical retries.
+    if code == "EGW02007":
+        return BrokerErrorClassification.VALIDATION
     if status_code in {401, 403}:
         return BrokerErrorClassification.AUTH
     if status_code == 429:
