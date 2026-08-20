@@ -71,9 +71,10 @@ The Alpaca endpoint should become `healthy`, return fresh prices, and show
 
 If the existing KIS process runs in live mode, do not change its global runtime
 mode to test Alpaca paper keys. Use `start-alpaca-paper.sh` on port 8011 with
-the separate `var/alpaca_paper_exec.db` database. The installed launch agent
-`com.kiseyno.kai-trading-exec-alpaca-paper` keeps that isolated paper monitor
-running across terminal sessions and login restarts.
+the separate `var/alpaca_paper_exec.db` database. The launcher keeps the global
+KIS autonomous coordinator disabled so KIS monitoring cannot read or mutate
+Alpaca paper positions. Run KIS US paper testing separately with
+`start-kis-us-paper.sh` on port 8012 and `var/kis_us_paper_exec.db`.
 
 ## 4. Automated paper strategy
 
@@ -190,10 +191,13 @@ The launch-managed layout keeps the markets isolated by broker and mode:
 - U.S. equities: Alpaca paper SPY/QQQ worker on port 8011. It monitors and
   reconciles continuously, but ordinary decisions and `day` orders run only
   when Alpaca's U.S. market clock reports open.
+- KIS U.S. equities: KIS paper worker on port 8012 with its own
+  `var/kis_us_paper_exec.db` database and KIS US live submission disabled.
 - Crypto: Alpaca paper BTC/USD and ETH/USD worker on port 8011, with continuous
   risk monitoring and one normal decision per closed UTC daily bar.
 
 U.S.-equity and crypto strategies have different versions, allowlists,
 idempotency keys, decisions, positions, and live-enable gates. A slow or closed
 U.S. market does not pause crypto, and the isolated Alpaca paper process does
-not change the live KIS runtime configuration.
+not change the live KIS runtime configuration or run KIS monitoring over
+Alpaca-owned paper state.

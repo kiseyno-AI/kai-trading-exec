@@ -14,6 +14,7 @@ from app.broker.base import (
     BrokerAccountHolding,
     BrokerAccountOpenOrder,
     BrokerAccountSnapshot,
+    BrokerErrorClassification,
     BrokerOrderPlacementRequest,
 )
 from app.broker.kis import (
@@ -25,6 +26,7 @@ from app.broker.kis import (
     KIS_OVERSEAS_ORDER_PATH,
     JsonHttpResponse,
     KisBrokerAdapter,
+    _classify_error,
 )
 from app.core.config import Settings
 from app.db.base import Base
@@ -67,6 +69,17 @@ class QueueHttpClient:
     def post_json(self, **kwargs: object) -> JsonHttpResponse:
         self.post_calls.append(dict(kwargs))
         return JsonHttpResponse(status_code=200, headers={}, payload=self.post_payload)
+
+
+def test_kis_paper_key_mismatch_is_not_retryable_transient_error() -> None:
+    assert (
+        _classify_error(
+            status_code=500,
+            code="EGW02007",
+            message="해당 앱키는 모의투자용 앱키가 아닙니다.",
+        )
+        == BrokerErrorClassification.VALIDATION
+    )
 
 
 def _settings(**overrides: object) -> Settings:

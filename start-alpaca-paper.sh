@@ -10,6 +10,14 @@ if [ -f .env ]; then
   set +a
 fi
 
+# Paper-only credentials override the shared live settings without changing the
+# 8010 runtime.  This file is git-ignored and should contain KAI_EXEC_* values.
+if [ -f .env.paper ]; then
+  set -a
+  source ./.env.paper
+  set +a
+fi
+
 PYTHON_BIN="${PYTHON_BIN:-/opt/homebrew/bin/python3.11}"
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-8011}"
@@ -19,11 +27,15 @@ export PYTHONPATH="apps/api${PYTHONPATH:+:$PYTHONPATH}"
 export KAI_EXEC_API_HOST="$HOST"
 export KAI_EXEC_API_PORT="$PORT"
 
-# Keep Alpaca paper execution isolated from the existing live KIS runtime.
+# Keep Alpaca paper execution isolated from the existing live KIS runtime and
+# the separate KIS US paper lane.  The global autonomous coordinator is KIS
+# oriented and is not provider-scoped, so it must not run in the Alpaca DB.
 export KAI_EXEC_RUNTIME_MODE="paper"
 export KAI_EXEC_DATABASE_URL="sqlite:///$ROOT_DIR/var/alpaca_paper_exec.db"
 export KAI_EXEC_SQLITE_WAL_AUTOCHECKPOINT_PAGES="1000"
 export KAI_EXEC_AUTONOMOUS_RUNTIME_ENABLED="false"
+export KAI_EXEC_KIS_US_TRADING_ENABLED="false"
+export KAI_EXEC_KIS_US_LIVE_TRADING_ENABLED="false"
 export KAI_EXEC_ALPACA_CRYPTO_MONITORING_ENABLED="true"
 export KAI_EXEC_ALPACA_LIVE_TRADING_ENABLED="false"
 export KAI_EXEC_ALPACA_CRYPTO_STRATEGY_ENABLED="${KAI_EXEC_ALPACA_CRYPTO_STRATEGY_ENABLED:-true}"
