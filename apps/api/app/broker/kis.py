@@ -830,7 +830,21 @@ class KisBrokerAdapter(BrokerAdapter):
         )
 
         _raise_if_business_error(balance_response.payload)
-        _raise_if_business_error(open_orders_response.payload)
+        open_orders_error = None
+        try:
+            _raise_if_business_error(open_orders_response.payload)
+        except BrokerAdapterError as exc:
+            # KIS can reject the same-day open-order lookup with KIER2570 even
+            # while the balance endpoint is healthy. Holdings and sellable
+            # quantities remain authoritative and must still refresh so a
+            # protective sell is not blocked by stale local position truth.
+            if exc.code != "KIER2570":
+                raise
+            open_orders_error = {
+                "code": exc.code,
+                "message": str(exc),
+                "degraded": True,
+            }
         available_cash = _parse_available_cash(balance_response.payload)
         if available_cash is None:
             raise BrokerAdapterError(
@@ -851,10 +865,15 @@ class KisBrokerAdapter(BrokerAdapter):
             asset_change_amount=balance_summary.get("asset_change_amount"),
             unrealized_pnl=balance_summary.get("unrealized_pnl"),
             holdings=_parse_holdings(balance_response.payload),
-            open_orders=_parse_open_orders(open_orders_response.payload),
+            open_orders=(
+                []
+                if open_orders_error is not None
+                else _parse_open_orders(open_orders_response.payload)
+            ),
             payload={
                 "balance": balance_response.payload,
                 "open_orders": open_orders_response.payload,
+                "open_orders_error": open_orders_error,
                 "account_number_masked": _mask_account(self.settings.kis_account_number),
             },
         )
