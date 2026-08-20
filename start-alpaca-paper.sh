@@ -10,6 +10,14 @@ if [ -f .env ]; then
   set +a
 fi
 
+# Paper-only credentials override the shared live settings without changing the
+# 8010 runtime.  This file is git-ignored and should contain KAI_EXEC_* values.
+if [ -f .env.paper ]; then
+  set -a
+  source ./.env.paper
+  set +a
+fi
+
 PYTHON_BIN="${PYTHON_BIN:-/opt/homebrew/bin/python3.11}"
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-8011}"
