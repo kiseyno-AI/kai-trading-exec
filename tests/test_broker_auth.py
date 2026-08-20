@@ -705,6 +705,51 @@ def test_kis_adapter_fetches_account_snapshot() -> None:
     assert snapshot.holdings[0].quantity == 3
 
 
+def test_kis_account_snapshot_keeps_balance_when_open_order_date_is_rejected() -> None:
+    balance_payload = {
+        "rt_cd": "0",
+        "output1": [{
+            "pdno": "049430",
+            "hldg_qty": "6",
+            "pchs_avg_pric": "21200",
+            "ord_psbl_qty": "6",
+        }],
+        "output2": [{"ord_psbl_cash": "1000000"}],
+    }
+    open_orders_payload = {
+        "rt_cd": "1",
+        "msg_cd": "KIER2570",
+        "msg1": "조회일자를 확인하십시오",
+    }
+    http_client = RecordingHttpClient({})
+    payloads = iter((balance_payload, open_orders_payload))
+    http_client.get_json = lambda **_kwargs: JsonHttpResponse(
+        status_code=200,
+        headers={"content-type": "application/json"},
+        payload=next(payloads),
+    )
+    adapter = KisBrokerAdapter(
+        settings=Settings(
+            runtime_mode="live",
+            kis_app_key="live-key",
+            kis_app_secret="live-secret",
+            kis_account_number="12345678",
+        ),
+        http_client=http_client,
+    )
+
+    snapshot = adapter.get_account_snapshot("access-token")
+
+    assert snapshot.holdings[0].symbol == "049430"
+    assert snapshot.holdings[0].quantity == 6
+    assert snapshot.open_orders == []
+    assert snapshot.payload["open_orders_error"] == {
+        "code": "KIER2570",
+        "message": "조회일자를 확인하십시오",
+        "degraded": True,
+    }
+
+
 def test_runtime_status_reports_disabled_broker_summary_in_mock_mode() -> None:
     app, engine = build_test_app(
         settings=Settings(
