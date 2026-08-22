@@ -916,6 +916,14 @@ def test_reconcile_stale_submitted_kier_lookup_window_response_repairs_to_window
     assert repair.payload["observed_broker_code"] == "KIER2570"
     assert repair.payload["classification"] == "reconcile_window_expired"
     assert repair.payload["reason"] == "broker_lookup_window_expired"
+    failure = db.scalar(
+        select(ExecutionFailure).where(ExecutionFailure.broker_order_pk == order.id)
+    )
+    assert failure is not None
+    assert failure.classification == "broker_rejected"
+    assert failure.broker_error_classification == "broker_rejected"
+    assert failure.broker_error_code == "KIER2570"
+    assert failure.latest_failed_at is not None
     engine.dispose()
 
 

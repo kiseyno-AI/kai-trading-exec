@@ -20,6 +20,7 @@ from app.models.runtime import BrokerOrder, BrokerOrderEvent, ExecutionFill, Exe
 from app.services.broker_auth import ensure_authenticated_broker_session
 from app.services.broker_order_state import NONTERMINAL_ORDER_STATUSES
 from app.services.fill_idempotency import execution_fill_dedupe_key, execution_fill_idempotency_key
+from app.services.execution_failures import record_actionable_execution_failure
 from app.services.rejected_order_retries import handle_reconciled_rejected_order
 from app.services.runtime_transitions import (
     apply_broker_order_status,
@@ -400,6 +401,21 @@ def reconcile_stale_nonterminal_broker_orders(
                     observed_at=classification_observed_at,
                     result=result,
                 )
+                if order.last_error_classification == "broker_rejected":
+                    record_actionable_execution_failure(
+                        settings=settings,
+                        db=db,
+                        order=order,
+                        plan_item=order.plan_item,
+                        broker_error_classification=order.last_error_classification,
+                        broker_error_code=order.last_error_code,
+                        broker_error_message=order.last_error_message
+                        or repair["reason"]
+                        or "broker rejected stale order",
+                        retryable=False,
+                        observed_at=classification_observed_at,
+                        request_source="stale_order_reconciliation",
+                    )
         elif not dry_run and _is_nonactionable_stale_result(order.status):
             if order.status != status_before:
                 repaired_count += 1

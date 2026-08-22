@@ -20,9 +20,10 @@ from app.models.runtime import (
     ExecutionFill,
     ExecutionPlan,
     ExecutionPlanItem,
+    ExecutionPosition,
     MonitoringCheckpoint,
 )
-from app.services.weekly_trade_review import generate_weekly_trade_review
+from app.services.weekly_trade_review import WeeklyTradeReviewTimeoutError, generate_weekly_trade_review
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -66,10 +67,12 @@ def test_weekly_trade_review_exports_bounded_read_only_artifact(tmp_path) -> Non
     finally:
         event.remove(engine, "before_cursor_execute", _capture_sql)
 
-    assert report["counts"]["fill_count"] == 1
-    assert report["counts"]["linked_broker_order_count"] == 1
+    assert report["counts"]["fill_count"] == 2
+    assert report["counts"]["linked_broker_order_count"] == 2
     assert report["counts"]["linked_broker_order_event_count"] == 1
     assert report["counts"]["execution_failure_count"] == 1
+    assert report["counts"]["closed_trade_count"] == 1
+    assert report["counts"]["stale_fifo_inventory_alert_count"] == 1
     assert report["counts"]["protective_stop_actionability_warning_count"] == 1
     assert report["truncated"] == {
         "execution_failures": False,
@@ -78,6 +81,11 @@ def test_weekly_trade_review_exports_bounded_read_only_artifact(tmp_path) -> Non
         "weekly_orders": False,
     }
     assert report["fills"][0]["symbol"] == "005930"
+    assert report["closed_trades"][0]["symbol"] == "049430"
+    assert report["closed_trades"][0]["cost_basis_source"] == "broker_reconciliation"
+    assert report["closed_trades"][0]["realized_pnl"] == "-1800.0000"
+    assert report["stale_fifo_inventory_alerts"][0]["symbol"] == "049430"
+    assert report["stale_fifo_inventory_alerts"][0]["fifo_open_quantity"] == 39
     assert report["linked_broker_orders"][0]["id"] == "weekly-order"
     assert report["weekly_order_status_counts"] == [
         {
@@ -85,6 +93,13 @@ def test_weekly_trade_review_exports_bounded_read_only_artifact(tmp_path) -> Non
             "first_submitted_at": "2026-07-26T01:30:00+00:00",
             "last_submitted_at": "2026-07-26T01:30:00+00:00",
             "side": "buy",
+            "status": "filled",
+        },
+        {
+            "count": 1,
+            "first_submitted_at": "2026-07-27T01:00:00+00:00",
+            "last_submitted_at": "2026-07-27T01:00:00+00:00",
+            "side": "sell",
             "status": "filled",
         }
     ]
@@ -158,7 +173,7 @@ def test_weekly_trade_review_exports_bounded_read_only_artifact(tmp_path) -> Non
     latest_path = tmp_path / "latest.json"
     assert artifact_path.exists()
     assert latest_path.exists()
-    assert json.loads(artifact_path.read_text(encoding="utf-8"))["counts"]["fill_count"] == 1
+    assert json.loads(artifact_path.read_text(encoding="utf-8"))["counts"]["fill_count"] == 2
     assert json.loads(latest_path.read_text(encoding="utf-8"))["artifact_path"] == str(artifact_path)
 
     db.close()
@@ -273,6 +288,42 @@ def test_weekly_trade_review_cli_allows_required_live_with_explicit_database_url
     assert payload["fill_count"] == 0
     assert (tmp_path / "artifacts" / "2026-07-25_to_2026-08-01_weekly_trade_review.json").exists()
     assert (tmp_path / "artifacts" / "latest.json").exists()
+
+
+def test_weekly_trade_review_timeout_reports_progress_before_artifact(tmp_path) -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        weekly_trade_review_dir=str(tmp_path),
+    )
+    engine, db = _build_db(settings)
+    start_at = datetime(2026, 7, 25, tzinfo=UTC)
+    end_at = datetime(2026, 8, 1, tzinfo=UTC)
+    _seed_weekly_review_fixture(db=db, start_at=start_at)
+    progress: list[dict[str, object]] = []
+
+    try:
+        try:
+            generate_weekly_trade_review(
+                settings=settings,
+                db=db,
+                start_at=start_at,
+                end_at=end_at,
+                output_dir=tmp_path,
+                timeout_seconds=-0.001,
+                progress_callback=progress.append,
+            )
+        except WeeklyTradeReviewTimeoutError as exc:
+            assert "timeout_seconds=-0.001" in str(exc)
+            assert "weekly_fills" in str(exc)
+        else:
+            raise AssertionError("expected weekly review timeout")
+    finally:
+        db.close()
+        engine.dispose()
+
+    assert progress == []
+    assert not (tmp_path / "2026-07-25_to_2026-08-01_weekly_trade_review.json").exists()
 
 
 def test_weekly_trade_review_queries_have_sqlite_index_paths() -> None:
@@ -436,6 +487,38 @@ def _seed_weekly_review_fixture(*, db, start_at: datetime) -> None:
         created_at=start_at - timedelta(days=8),
         updated_at=start_at - timedelta(days=8),
     )
+    legacy_buy_order = BrokerOrder(
+        id="legacy-buy-order",
+        execution_plan_item_id="old-item",
+        broker_name="kis",
+        mode="paper",
+        idempotency_key="legacy-buy-order-key",
+        broker_order_id="kis-legacy-buy-order",
+        symbol="049430",
+        side="buy",
+        status="filled",
+        quantity=45,
+        limit_price=Decimal("2000"),
+        submitted_at=start_at - timedelta(days=10),
+        created_at=start_at - timedelta(days=10),
+        updated_at=start_at - timedelta(days=10),
+    )
+    legacy_sell_order = BrokerOrder(
+        id="legacy-sell-order",
+        execution_plan_item_id="weekly-item",
+        broker_name="kis",
+        mode="paper",
+        idempotency_key="legacy-sell-order-key",
+        broker_order_id="kis-legacy-sell-order",
+        symbol="049430",
+        side="sell",
+        status="filled",
+        quantity=6,
+        limit_price=Decimal("1500"),
+        submitted_at=start_at + timedelta(days=2, hours=1),
+        created_at=start_at + timedelta(days=2, hours=1),
+        updated_at=start_at + timedelta(days=2, hours=1),
+    )
     missing_submitted_order = BrokerOrder(
         id="missing-submitted-order",
         execution_plan_item_id="weekly-item",
@@ -503,6 +586,41 @@ def _seed_weekly_review_fixture(*, db, start_at: datetime) -> None:
         payload={"large": "old-fill-payload"},
         created_at=start_at - timedelta(days=8),
         updated_at=start_at - timedelta(days=8),
+    )
+    legacy_buy_fill = ExecutionFill(
+        id="legacy-buy-fill",
+        broker_order_pk="legacy-buy-order",
+        broker_fill_id="legacy-buy-fill",
+        symbol="049430",
+        side="buy",
+        quantity=45,
+        price=Decimal("2000"),
+        filled_at=start_at - timedelta(days=10),
+        created_at=start_at - timedelta(days=10),
+        updated_at=start_at - timedelta(days=10),
+    )
+    legacy_sell_fill = ExecutionFill(
+        id="legacy-sell-fill",
+        broker_order_pk="legacy-sell-order",
+        broker_fill_id="legacy-sell-fill",
+        symbol="049430",
+        side="sell",
+        quantity=6,
+        price=Decimal("1500"),
+        filled_at=start_at + timedelta(days=2, hours=1, minutes=5),
+        created_at=start_at + timedelta(days=2, hours=1, minutes=5),
+        updated_at=start_at + timedelta(days=2, hours=1, minutes=5),
+    )
+    flat_position = ExecutionPosition(
+        id="flat-legacy-position",
+        mode="paper",
+        symbol="049430",
+        quantity=0,
+        average_price=Decimal("1800"),
+        updated_from="reconciliation",
+        last_reconciled_at=start_at + timedelta(days=2, hours=1, minutes=10),
+        created_at=start_at + timedelta(days=2, hours=1, minutes=10),
+        updated_at=start_at + timedelta(days=2, hours=1, minutes=10),
     )
     event = BrokerOrderEvent(
         id="weekly-event",
@@ -579,10 +697,15 @@ def _seed_weekly_review_fixture(*, db, start_at: datetime) -> None:
             old_item,
             weekly_order,
             old_order,
+            legacy_buy_order,
+            legacy_sell_order,
             missing_submitted_order,
             *active_nonterminal_orders,
             weekly_fill,
             old_fill,
+            legacy_buy_fill,
+            legacy_sell_fill,
+            flat_position,
             event,
             failure,
             checkpoint,

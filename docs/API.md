@@ -93,6 +93,13 @@ does not create trading decisions.
 - `monthly_pnl.target_progress_pct`
 - `monthly_pnl.mode_recommendation` (`normal`, `aggressive`, `capital_preservation`)
 - `monthly_pnl.pnl_method`
+- `monthly_pnl.cost_basis_sources` and `weekly_pnl.cost_basis_sources`
+  count closed-trade matches by `fill_fifo`, `broker_reconciliation`, and
+  `unknown`. Broker reconciliation average cost is used for legacy or unmatched
+  sell fills when local FIFO evidence is incomplete or stale.
+- `weekly_pnl.stale_fifo_inventory_alerts[]` reports symbols where local fill
+  FIFO leaves open inventory but the latest broker reconciliation says the
+  position is flat.
 - `freshness.broker_orders.fill_quality`
   - `missing_filled_order_fill_count` and sample items for filled
     `broker_orders` that have no `execution_fills` rows, because FIFO P/L is
@@ -259,6 +266,8 @@ set -a
 set +a
 python3 scripts/export_weekly_trade_review.py \
   --require-runtime-mode live \
+  --timeout-seconds 30 \
+  --progress \
   --start-at 2026-08-03T00:00:00+09:00 \
   --end-at 2026-08-08T00:00:00+09:00
 ```
@@ -284,8 +293,12 @@ The default query shape starts with `execution_fills.filled_at` for the bounded
 date range, then loads linked `broker_orders` and `broker_order_events` by the
 weekly fill `broker_order_pk` set. It also includes weekly
 `execution_failures`, active/stale broker-order summaries, plan-item
-status aggregates, and monitoring checkpoint state. Deferred JSON payload
-columns are omitted unless `--include-json-payloads` is explicitly supplied.
+status aggregates, closed-trade cost-basis summaries, stale FIFO inventory
+alerts, and monitoring checkpoint state. Deferred JSON payload columns are
+omitted unless `--include-json-payloads` is explicitly supplied. `--progress`
+writes JSON step events to stderr; `--timeout-seconds` exits with code `124`
+and a specific timeout payload if the bounded export exceeds its query-step
+deadline before writing an artifact.
 
 This keeps weekly evidence generation separate from
 `trade_outcome_feedback`, which performs broader analytics and may load
