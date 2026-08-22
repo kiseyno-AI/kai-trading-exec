@@ -595,6 +595,81 @@ def test_runtime_status_weekly_pnl_uses_broker_reconciliation_cost_for_legacy_fl
     engine.dispose()
 
 
+def test_runtime_status_weekly_pnl_keeps_later_repurchase_basis_unknown() -> None:
+    settings = Settings(database_url="sqlite:///:memory:", runtime_mode="paper")
+    app, engine = build_test_app(settings=settings)
+    client = TestClient(app)
+    now = datetime.now(UTC)
+    sell_at = now - timedelta(days=2)
+    buy_at = now - timedelta(days=1)
+
+    with app.state.db_session_factory() as session:
+        sell_order = BrokerOrder(
+            mode="paper",
+            idempotency_key="weekly-unmatched-sell",
+            symbol="LATER",
+            side="sell",
+            status="filled",
+            quantity=5,
+        )
+        buy_order = BrokerOrder(
+            mode="paper",
+            idempotency_key="weekly-later-buy",
+            symbol="LATER",
+            side="buy",
+            status="filled",
+            quantity=3,
+        )
+        session.add_all([sell_order, buy_order])
+        session.flush()
+        session.add_all(
+            [
+                ExecutionFill(
+                    broker_order_pk=sell_order.id,
+                    broker_fill_id="weekly-unmatched-sell-fill",
+                    symbol="LATER",
+                    side="sell",
+                    quantity=5,
+                    price=Decimal("1000"),
+                    filled_at=sell_at,
+                ),
+                ExecutionFill(
+                    broker_order_pk=buy_order.id,
+                    broker_fill_id="weekly-later-buy-fill",
+                    symbol="LATER",
+                    side="buy",
+                    quantity=3,
+                    price=Decimal("700"),
+                    filled_at=buy_at,
+                ),
+                ExecutionPosition(
+                    mode="paper",
+                    symbol="LATER",
+                    quantity=3,
+                    average_price=Decimal("700"),
+                    updated_from="reconciliation",
+                    last_reconciled_at=buy_at + timedelta(minutes=5),
+                ),
+            ]
+        )
+        session.commit()
+
+    response = client.get("/runtime/status")
+
+    assert response.status_code == 200
+    weekly = response.json()["weekly_pnl"]
+    assert weekly["weekly_realized_pnl"] == "0.0000"
+    assert weekly["matched_sell_quantity"] == 0
+    assert weekly["unmatched_sell_quantity"] == 5
+    assert weekly["unknown_cost_basis_sell_quantity"] == 5
+    assert weekly["closed_trade_count"] == 0
+    assert weekly["closed_symbols"] == []
+    assert weekly["unmatched_sell_symbols"] == ["LATER"]
+    assert weekly["cost_basis_sources"] == {"broker_reconciliation": 0, "fill_fifo": 0, "unknown": 1}
+
+    engine.dispose()
+
+
 def test_runtime_status_daily_pnl_uses_crypto_base_quantity_and_quote_notional() -> None:
     app, engine = build_test_app(
         settings=Settings(

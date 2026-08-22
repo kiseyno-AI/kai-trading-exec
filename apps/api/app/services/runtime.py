@@ -1805,6 +1805,7 @@ def _period_realized_pnl_summary(
         if side != "sell":
             continue
         in_period = filled_at >= start_at
+        next_buy_after_sell = _pnl_next_buy_after(fills=fills, symbol=symbol, after=filled_at)
         if in_period:
             sell_notional += notional
         remaining = quantity
@@ -1816,16 +1817,13 @@ def _period_realized_pnl_summary(
             cost_price = Decimal(str(lot["price"]))
             cost_source = "fill_fifo"
             position = positions_by_symbol.get(symbol)
-            if (
-                in_period
-                and _as_utc(lot["filled_at"]) < start_at
-                and position is not None
-                and position.last_reconciled_at is not None
-                and _position_effective_quantity(position) <= 0
-                and position.average_price is not None
-                and position.average_price > 0
-            ):
-                cost_price = Decimal(position.average_price)
+            broker_cost_basis = _pnl_broker_reconciliation_cost_basis(
+                position=position,
+                sold_at=filled_at,
+                next_buy_after_sell=next_buy_after_sell,
+            )
+            if in_period and _as_utc(lot["filled_at"]) < start_at and broker_cost_basis is not None:
+                cost_price = broker_cost_basis
                 cost_source = "broker_reconciliation"
             pnl = ((fill.price - cost_price) * matched).quantize(Decimal("0.0001"))
             if in_period:
@@ -1845,12 +1843,13 @@ def _period_realized_pnl_summary(
                 lots.pop(0)
         if remaining > 0 and in_period:
             position = positions_by_symbol.get(symbol)
-            if (
-                position is not None
-                and position.average_price is not None
-                and position.average_price > 0
-            ):
-                pnl = ((fill.price - Decimal(position.average_price)) * remaining).quantize(Decimal("0.0001"))
+            broker_cost_basis = _pnl_broker_reconciliation_cost_basis(
+                position=position,
+                sold_at=filled_at,
+                next_buy_after_sell=next_buy_after_sell,
+            )
+            if broker_cost_basis is not None:
+                pnl = ((fill.price - broker_cost_basis) * remaining).quantize(Decimal("0.0001"))
                 realized += pnl
                 matched_sell_quantity += remaining
                 closed_symbols.add(symbol)
@@ -1886,6 +1885,43 @@ def _period_realized_pnl_summary(
             positions_by_symbol=positions_by_symbol,
         ),
     }
+
+
+def _pnl_broker_reconciliation_cost_basis(
+    *,
+    position: ExecutionPosition | None,
+    sold_at: datetime,
+    next_buy_after_sell: datetime | None,
+) -> Decimal | None:
+    if (
+        position is not None
+        and position.average_price is not None
+        and position.average_price > 0
+        and position.last_reconciled_at is not None
+        and "reconciliation" in str(position.updated_from or "")
+        and _position_effective_quantity(position) <= 0
+    ):
+        reconciled_at = _as_utc(position.last_reconciled_at)
+        sold_at = _as_utc(sold_at)
+        if reconciled_at >= sold_at and (next_buy_after_sell is None or reconciled_at < next_buy_after_sell):
+            return Decimal(position.average_price)
+    return None
+
+
+def _pnl_next_buy_after(
+    *,
+    fills: list[ExecutionFill],
+    symbol: str,
+    after: datetime,
+) -> datetime | None:
+    later_buys = [
+        _as_utc(fill.filled_at)
+        for fill in fills
+        if fill.symbol == symbol
+        and str(fill.side or "").lower() == "buy"
+        and _as_utc(fill.filled_at) > after
+    ]
+    return min(later_buys) if later_buys else None
 
 
 def _pnl_positions_by_symbol(

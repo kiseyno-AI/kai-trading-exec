@@ -153,19 +153,25 @@ def generate_weekly_trade_review(
         max_rows=max_execution_failures,
     )
     progress("weekly_execution_failures", row_count=len(failures), truncated=failures_truncated)
-    closed_trades = _weekly_closed_trades(
+    closed_trades, closed_trades_truncated = _weekly_closed_trades(
         db=db,
         mode=settings.runtime_mode,
         start_at=start_at,
         end_at=end_at,
+        max_rows=max_fills,
     )
-    progress("weekly_closed_trades", row_count=len(closed_trades))
-    stale_fifo_inventory_alerts = _stale_fifo_inventory_alerts(
+    progress("weekly_closed_trades", row_count=len(closed_trades), truncated=closed_trades_truncated)
+    stale_fifo_inventory_alerts, stale_fifo_inventory_alerts_truncated = _stale_fifo_inventory_alerts(
         db=db,
         mode=settings.runtime_mode,
         end_at=end_at,
+        max_rows=max_fills,
     )
-    progress("stale_fifo_inventory_alerts", row_count=len(stale_fifo_inventory_alerts))
+    progress(
+        "stale_fifo_inventory_alerts",
+        row_count=len(stale_fifo_inventory_alerts),
+        truncated=stale_fifo_inventory_alerts_truncated,
+    )
     active_order_summary = _active_broker_order_summary(
         db=db,
         mode=settings.runtime_mode,
@@ -234,6 +240,8 @@ def generate_weekly_trade_review(
             "linked_broker_order_events": linked_events_truncated,
             "weekly_orders": weekly_orders_truncated,
             "execution_failures": failures_truncated,
+            "closed_trades": closed_trades_truncated,
+            "stale_fifo_inventory_alerts": stale_fifo_inventory_alerts_truncated,
         },
         "fills": fills,
         "linked_broker_orders": linked_orders,
@@ -682,16 +690,20 @@ def _weekly_closed_trades(
     mode: str,
     start_at: datetime,
     end_at: datetime,
-) -> list[dict[str, object]]:
-    fills = db.scalars(
+    max_rows: int,
+) -> tuple[list[dict[str, object]], bool]:
+    newest_fills = db.scalars(
         select(ExecutionFill)
         .join(BrokerOrder, ExecutionFill.broker_order_pk == BrokerOrder.id)
         .where(
             BrokerOrder.mode == mode,
             ExecutionFill.filled_at < end_at,
         )
-        .order_by(ExecutionFill.filled_at.asc(), ExecutionFill.id.asc())
+        .order_by(ExecutionFill.filled_at.desc(), ExecutionFill.id.desc())
+        .limit(max_rows + 1)
     ).all()
+    truncated = len(newest_fills) > max_rows
+    fills = list(reversed(newest_fills[:max_rows]))
     sell_symbols = {
         fill.symbol
         for fill in fills
@@ -718,6 +730,7 @@ def _weekly_closed_trades(
             continue
         filled_at = _normalize_utc(fill.filled_at)
         in_period = start_at <= filled_at < end_at
+        next_buy_after_sell = _next_buy_after(fills=fills, symbol=fill.symbol, after=filled_at)
         remaining = quantity
         lots = lots_by_symbol.setdefault(fill.symbol, [])
         while remaining > 0 and lots:
@@ -728,17 +741,17 @@ def _weekly_closed_trades(
                 buy_price = Decimal(str(lot["price"]))
                 cost_basis_source = "fill_fifo"
                 position = positions_by_symbol.get(fill.symbol)
-                if (
-                    _normalize_utc(lot["filled_at"]) < start_at
-                    and position is not None
-                    and position.last_reconciled_at is not None
-                    and _position_quantity(position) <= 0
-                    and position.average_price is not None
-                    and position.average_price > 0
-                ):
-                    buy_price = Decimal(position.average_price)
+                broker_cost_basis = _broker_reconciliation_cost_basis(
+                    position=position,
+                    sold_at=filled_at,
+                    next_buy_after_sell=next_buy_after_sell,
+                )
+                if _normalize_utc(lot["filled_at"]) < start_at and broker_cost_basis is not None:
+                    buy_price = broker_cost_basis
                     cost_basis_source = "broker_reconciliation"
-                    cost_basis_observed_at = position.last_reconciled_at
+                    cost_basis_observed_at = (
+                        position.last_reconciled_at if position is not None else None
+                    )
                 else:
                     cost_basis_observed_at = lot["filled_at"]
                 closed.append(
@@ -756,18 +769,19 @@ def _weekly_closed_trades(
                 lots.pop(0)
         if remaining > 0 and in_period:
             position = positions_by_symbol.get(fill.symbol)
-            if (
-                position is not None
-                and position.average_price is not None
-                and position.average_price > 0
-            ):
+            broker_cost_basis = _broker_reconciliation_cost_basis(
+                position=position,
+                sold_at=filled_at,
+                next_buy_after_sell=next_buy_after_sell,
+            )
+            if broker_cost_basis is not None:
                 closed.append(
                     _closed_trade_row(
                         fill=fill,
                         quantity=remaining,
-                        buy_price=Decimal(position.average_price),
+                        buy_price=broker_cost_basis,
                         cost_basis_source="broker_reconciliation",
-                        cost_basis_observed_at=position.last_reconciled_at,
+                        cost_basis_observed_at=position.last_reconciled_at if position is not None else None,
                     )
                 )
             else:
@@ -780,7 +794,44 @@ def _weekly_closed_trades(
                         cost_basis_observed_at=None,
                     )
                 )
-    return closed
+    return closed, truncated
+
+
+def _broker_reconciliation_cost_basis(
+    *,
+    position: ExecutionPosition | None,
+    sold_at: datetime,
+    next_buy_after_sell: datetime | None,
+) -> Decimal | None:
+    if (
+        position is not None
+        and position.average_price is not None
+        and position.average_price > 0
+        and position.last_reconciled_at is not None
+        and "reconciliation" in str(position.updated_from or "")
+        and _position_quantity(position) <= 0
+    ):
+        reconciled_at = _normalize_utc(position.last_reconciled_at)
+        sold_at = _normalize_utc(sold_at)
+        if reconciled_at >= sold_at and (next_buy_after_sell is None or reconciled_at < next_buy_after_sell):
+            return Decimal(position.average_price)
+    return None
+
+
+def _next_buy_after(
+    *,
+    fills: Sequence[ExecutionFill],
+    symbol: str,
+    after: datetime,
+) -> datetime | None:
+    later_buys = [
+        _normalize_utc(fill.filled_at)
+        for fill in fills
+        if fill.symbol == symbol
+        and str(fill.side or "").lower() == "buy"
+        and _normalize_utc(fill.filled_at) > after
+    ]
+    return min(later_buys) if later_buys else None
 
 
 def _closed_trade_row(
@@ -812,16 +863,20 @@ def _stale_fifo_inventory_alerts(
     db: Session,
     mode: str,
     end_at: datetime,
-) -> list[dict[str, object]]:
-    fills = db.scalars(
+    max_rows: int,
+) -> tuple[list[dict[str, object]], bool]:
+    newest_fills = db.scalars(
         select(ExecutionFill)
         .join(BrokerOrder, ExecutionFill.broker_order_pk == BrokerOrder.id)
         .where(
             BrokerOrder.mode == mode,
             ExecutionFill.filled_at < end_at,
         )
-        .order_by(ExecutionFill.filled_at.asc(), ExecutionFill.id.asc())
+        .order_by(ExecutionFill.filled_at.desc(), ExecutionFill.id.desc())
+        .limit(max_rows + 1)
     ).all()
+    truncated = len(newest_fills) > max_rows
+    fills = list(reversed(newest_fills[:max_rows]))
     quantities: dict[str, Decimal] = {}
     for fill in fills:
         quantity = _fill_quantity(fill)
@@ -849,7 +904,7 @@ def _stale_fifo_inventory_alerts(
                 "message": "fill FIFO leaves open quantity but latest broker reconciliation reports flat",
             }
         )
-    return alerts
+    return alerts, truncated
 
 
 def _positions_by_symbol(
