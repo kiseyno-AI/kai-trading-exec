@@ -48,7 +48,7 @@ from app.services.risk_sizing import (
     effective_stop_price,
     resolve_risk_based_buy_quantity,
 )
-from app.services.market_regime_guardrails import market_regime_context_from_item_payloads
+from app.services.market_regime_guardrails import evaluate_market_regime_guardrail, market_regime_context_from_item_payloads
 from app.services.live_market_context import load_live_market_regime_context, merge_live_market_regime_context
 from app.services.runtime_controls import (
     automated_order_submission_allowed,
@@ -204,6 +204,7 @@ OPEN_BUY_ORDER_STATUSES = frozenset(
     {"submitted", "open", "partially_filled", "submission_pending", "retry_pending"}
 )
 RESERVED_CASH_EXHAUSTED_REASON = "reserved_cash_exhausted"
+LIVE_WATCH_BUY_VETO_EVENT_TYPE = "live_watch_buy_submission_veto"
 ACCOUNT_DRAWDOWN_GATE_RELEASE_SUFFIX = ":account-drawdown-gate-disabled"
 
 
@@ -1626,6 +1627,7 @@ def _evaluate_monitoring_cycle(
                 adapter=adapter,
                 item=action.item,
                 observed_price=action.observed_price,
+                price=prices.get(action.item.symbol),
                 requested_quantity=trigger_time_agent_quantity,
                 trigger_time_agent_approved=trigger_time_agent_quantity is not None,
                 sizing_source=(
@@ -6136,6 +6138,7 @@ def _resolve_watch_buy_order(
     adapter: BrokerAdapter,
     item: ExecutionPlanItem,
     observed_price: Decimal | None,
+    price: MonitoringPriceRequest | None = None,
     requested_quantity: int | None = None,
     trigger_time_agent_approved: bool = False,
     sizing_source: str | None = None,
@@ -6175,6 +6178,34 @@ def _resolve_watch_buy_order(
             message="watch buy requires an exec-agent share quantity before order submission",
         )
 
+    entry_price = observed_price or _watch_buy_trigger_price(item) or item.limit_price
+    stale_reclaim_veto = _watch_buy_stale_trigger_reclaim_veto(
+        settings=settings,
+        item=item,
+        current_reference_price=entry_price,
+        trigger_time_agent_approved=trigger_time_agent_approved,
+    )
+    if stale_reclaim_veto is not None:
+        return stale_reclaim_veto
+
+    live_veto_recorded_at = _price_observed_at(price, datetime.now(UTC)) if price is not None else datetime.now(UTC)
+    live_veto = _live_watch_buy_submission_veto(
+        settings=settings,
+        item=item,
+        observed_price=entry_price,
+        price=price,
+        quantity=quantity,
+        recorded_at=live_veto_recorded_at,
+    )
+    if live_veto is not None:
+        _record_live_watch_buy_submission_veto(
+            db=db,
+            item=item,
+            approval=live_veto,
+            recorded_at=live_veto_recorded_at,
+        )
+        return live_veto
+
     control_state = ensure_runtime_control_state(settings=settings, db=db)
     if not automated_order_submission_allowed(control_state):
         if quantity is not None:
@@ -6191,16 +6222,6 @@ def _resolve_watch_buy_order(
             reason="missing_quantity",
             message="watch buy requires a positive share quantity while runtime is blocked",
         )
-
-    entry_price = observed_price or _watch_buy_trigger_price(item) or item.limit_price
-    stale_reclaim_veto = _watch_buy_stale_trigger_reclaim_veto(
-        settings=settings,
-        item=item,
-        current_reference_price=entry_price,
-        trigger_time_agent_approved=trigger_time_agent_approved,
-    )
-    if stale_reclaim_veto is not None:
-        return stale_reclaim_veto
 
     stop_price = _watch_buy_stop_price(item)
     if entry_price is None or stop_price is None:
@@ -6354,6 +6375,186 @@ def _resolve_watch_buy_order(
         event=event,
     )
     return WatchBuyOrderApproval(quantity=approved_quantity)
+
+
+def _live_watch_buy_submission_veto(
+    *,
+    settings: Settings,
+    item: ExecutionPlanItem,
+    observed_price: Decimal | None,
+    price: MonitoringPriceRequest | None,
+    quantity: int | None,
+    recorded_at: datetime,
+) -> WatchBuyOrderApproval | None:
+    if not _live_watch_buy_veto_applies(settings=settings, item=item):
+        return None
+    market_context = market_regime_context_from_item_payloads(_loaded_risk_context(item), item.quantity_policy)
+    market_context = merge_live_market_regime_context(
+        market_context,
+        load_live_market_regime_context(settings=settings),
+    )
+    skipped_notional = observed_price * Decimal(quantity) if observed_price is not None and quantity is not None else None
+    market_guardrail = evaluate_market_regime_guardrail(
+        settings=settings,
+        context=market_context,
+        market_date=item.plan.market_date,
+        original_notional=skipped_notional,
+        original_quantity=quantity,
+        reference_price=observed_price,
+        now=recorded_at,
+    )
+    reasons: list[str] = []
+    if market_guardrail.reason_code == "market_breadth_risk_off":
+        reasons.append("market_breadth_risk_off")
+    elif (
+        market_guardrail.reason_code.startswith("market_breadth_stale")
+        or "market_breadth_stale" in market_guardrail.audit.get("warnings", [])
+    ):
+        if _live_watch_buy_breadth_override(item=item) is None:
+            reasons.append("market_breadth_stale")
+    elif market_guardrail.posture == "risk_off":
+        reasons.append(market_guardrail.reason_code or "market_breadth_risk_off")
+    elif (
+        market_guardrail.action == "downsize"
+        and not settings.watch_buy_live_market_regime_downsize_allowed
+        and _live_watch_buy_breadth_override(item=item) is None
+        and market_guardrail.reason_code in {"market_breadth_stale_caution", "market_breadth_stale_risk_off"}
+    ):
+        reasons.append(market_guardrail.reason_code)
+
+    if settings.watch_buy_live_market_quality_veto_enabled:
+        trigger_quality = _live_watch_buy_trigger_quality(price=price)
+        if trigger_quality["volume"] is not None and trigger_quality["volume"] <= 0:
+            reasons.append("zero_trigger_volume")
+        if trigger_quality["turnover"] is not None and trigger_quality["turnover"] <= 0:
+            reasons.append("zero_trigger_turnover")
+        if trigger_quality["day_high"] is None or trigger_quality["day_low"] is None:
+            reasons.append("missing_day_high_low")
+        turnover = trigger_quality["turnover"]
+        min_turnover = settings.watch_buy_live_min_trigger_turnover_krw
+        if turnover is not None and turnover > 0 and min_turnover > 0 and turnover < min_turnover:
+            reasons.append("low_trigger_turnover")
+    else:
+        trigger_quality = _live_watch_buy_trigger_quality(price=price)
+
+    if not reasons:
+        return None
+    deduped_reasons = list(dict.fromkeys(reasons))
+    payload = {
+        "event": LIVE_WATCH_BUY_VETO_EVENT_TYPE,
+        "schema_version": "live_watch_buy_submission_veto_v1",
+        "symbol": item.symbol,
+        "execution_plan_item_id": item.id,
+        "reasons": deduped_reasons,
+        "primary_reason": deduped_reasons[0],
+        "runtime_mode": settings.runtime_mode,
+        "provider": item.provider or "kis",
+        "asset_class": item.asset_class or "stock",
+        "venue": item.venue or _plan_item_exchange(item),
+        "skipped_quantity": quantity,
+        "skipped_notional_krw": _serialize_decimal(skipped_notional),
+        "observed_price": _serialize_decimal(observed_price),
+        "trigger_quality": {
+            "volume": _serialize_decimal(trigger_quality["volume"]),
+            "turnover": _serialize_decimal(trigger_quality["turnover"]),
+            "day_high": _serialize_decimal(trigger_quality["day_high"]),
+            "day_low": _serialize_decimal(trigger_quality["day_low"]),
+            "min_turnover_krw": _serialize_decimal(settings.watch_buy_live_min_trigger_turnover_krw),
+            "price_observed_at": _serialize_datetime(_price_observed_at(price, recorded_at) if price is not None else None),
+            "provenance": price.provenance if price is not None else {},
+        },
+        "market_regime_guardrail": market_guardrail.audit,
+        "market_regime_reason_code": market_guardrail.reason_code,
+        "market_regime_posture": market_guardrail.posture,
+        "market_regime_action": market_guardrail.action,
+        "override": _live_watch_buy_breadth_override(item=item),
+        "recorded_at": recorded_at.isoformat(),
+    }
+    return WatchBuyOrderApproval(
+        quantity=None,
+        reason=deduped_reasons[0],
+        message="live automated watch buy vetoed before broker submission",
+        details=compact_json_object(payload),
+    )
+
+
+def _live_watch_buy_veto_applies(*, settings: Settings, item: ExecutionPlanItem) -> bool:
+    if settings.runtime_mode != "live" or not settings.automation_enabled:
+        return False
+    provider = str(item.provider or "kis").strip().lower()
+    if provider not in {"kis", "korea_investment", "korea-investment"}:
+        return False
+    asset_class = str(item.asset_class or "stock").strip().lower()
+    if asset_class not in {"stock", "equity", "korean_equity", "kr_equity"}:
+        return False
+    venue = str(item.venue or _plan_item_exchange(item) or "KRX").strip().upper()
+    return venue in {"KRX", "NXT", "KOSPI", "KOSDAQ"}
+
+
+def _live_watch_buy_trigger_quality(*, price: MonitoringPriceRequest | None) -> dict[str, Decimal | None]:
+    if price is None:
+        return {"volume": None, "turnover": None, "day_high": None, "day_low": None}
+    return {
+        "volume": price.volume,
+        "turnover": price.turnover,
+        "day_high": price.day_high,
+        "day_low": price.day_low,
+    }
+
+
+def _live_watch_buy_breadth_override(*, item: ExecutionPlanItem) -> dict[str, object] | None:
+    for source in _item_payload_sources(item):
+        override = source.get("live_watch_buy_breadth_override") or source.get("market_breadth_override")
+        if not isinstance(override, dict) or override.get("enabled") is not True:
+            continue
+        actor = str(override.get("actor") or override.get("operator") or "").strip()
+        reason = str(override.get("reason") or override.get("rationale") or "").strip()
+        if len(actor) < 2 or len(reason) < 20:
+            continue
+        return {
+            "enabled": True,
+            "actor": _bounded_text(actor, max_length=120),
+            "reason": _bounded_text(reason, max_length=240),
+            "recorded_at": str(override.get("recorded_at") or override.get("approved_at") or ""),
+        }
+    return None
+
+
+def _record_live_watch_buy_submission_veto(
+    *,
+    db: Session,
+    item: ExecutionPlanItem,
+    approval: WatchBuyOrderApproval,
+    recorded_at: datetime,
+) -> None:
+    payload = approval.details or {}
+    _record_monitoring_event(
+        item=item,
+        event={
+            "event": "watch_buy_rejected",
+            "reason": approval.reason or "live_watch_buy_submission_veto",
+            "message": approval.message,
+            "details": payload,
+            "recorded_at": recorded_at.isoformat(),
+        },
+    )
+    db.add(
+        ExecutionPlanItemAudit(
+            execution_plan_item_id=item.id,
+            event_type=LIVE_WATCH_BUY_VETO_EVENT_TYPE,
+            source=MONITORING_WORKER_NAME,
+            summary={
+                "status": "watch_buy_rejected",
+                "reason": approval.reason,
+                "symbol": item.symbol,
+                "skipped_quantity": payload.get("skipped_quantity"),
+                "skipped_notional_krw": payload.get("skipped_notional_krw"),
+            },
+            payload=payload,
+            error_message=approval.message,
+            occurred_at=recorded_at,
+        )
+    )
 
 
 def _watch_buy_stale_trigger_reclaim_veto(

@@ -18,6 +18,7 @@ from app.models.runtime import (
     ExecutionJob,
     ExecutionPlan,
     ExecutionPlanItem,
+    ExecutionPlanItemAudit,
     ExecutionPosition,
     MonitoringCheckpoint,
 )
@@ -25,6 +26,7 @@ from app.services.fill_idempotency import dedupe_execution_fills
 from app.services.monitoring import (
     ACTIVE_WATCH_MONITORING_STATUSES,
     BLOCKED_MONITORING_STATUSES,
+    LIVE_WATCH_BUY_VETO_EVENT_TYPE,
     MONITORING_RUNTIME_TOPOLOGY,
     MONITORING_SELECTION_STRATEGY,
     PENDING_DISPATCH_MONITORING_STATUSES,
@@ -192,6 +194,32 @@ def runtime_counts(
     return {
         "open_orders": int(open_orders or 0),
         "active_execution_jobs": int(active_jobs or 0),
+    }
+
+
+def runtime_watch_buy_veto_summary(
+    *,
+    settings: Settings,
+    db: Session,
+) -> dict[str, object]:
+    today_start_utc, tomorrow_start_utc = _current_krx_day_utc_bounds()
+    rows = db.execute(
+        select(ExecutionPlanItem.symbol, func.count())
+        .select_from(ExecutionPlanItemAudit)
+        .join(ExecutionPlanItemAudit.plan_item)
+        .join(ExecutionPlanItem.plan)
+        .where(
+            ExecutionPlan.mode == settings.runtime_mode,
+            ExecutionPlanItemAudit.event_type == LIVE_WATCH_BUY_VETO_EVENT_TYPE,
+            ExecutionPlanItemAudit.occurred_at >= today_start_utc,
+            ExecutionPlanItemAudit.occurred_at < tomorrow_start_utc,
+        )
+        .group_by(ExecutionPlanItem.symbol)
+    ).all()
+    symbols = sorted(str(symbol) for symbol, count in rows if int(count or 0) > 0)
+    return {
+        "today_count": sum(int(count or 0) for _, count in rows),
+        "today_symbols": symbols,
     }
 
 
@@ -838,7 +866,6 @@ def runtime_symbol_summary(
             ),
         )
     ).all()
-
     return {
         "monitored": monitored_symbols,
         "scheduled_today": sorted(scheduled_today),
@@ -1276,6 +1303,7 @@ def build_runtime_status(
         "sqlite": sqlite_diagnostics_payload(),
     }
     counts: dict[str, int] = {"open_orders": 0, "active_execution_jobs": 0}
+    watch_buy_vetoes: dict[str, object] = {"today_count": 0, "today_symbols": []}
     account_drawdown_gate: dict[str, object] = {"gated": False, "latest_decision": None}
     autonomous = autonomous_runtime or _default_autonomous_runtime_payload(settings)
     monitoring_price_source = _autonomous_monitoring_price_source(autonomous)
@@ -1383,6 +1411,7 @@ def build_runtime_status(
             "broker": broker,
             "broker_providers": broker_providers,
             "counts": counts,
+            "watch_buy_vetoes": watch_buy_vetoes,
             "symbols": symbols,
             "freshness": freshness,
             "actionable_alerts": runtime_actionable_alerts_payload(
@@ -1428,6 +1457,7 @@ def build_runtime_status(
             "broker": broker,
             "broker_providers": broker_providers,
             "counts": counts,
+            "watch_buy_vetoes": watch_buy_vetoes,
             "symbols": symbols,
             "freshness": freshness,
             "actionable_alerts": _default_actionable_alerts_payload(),
@@ -1471,6 +1501,7 @@ def build_runtime_status(
             "broker": broker,
             "broker_providers": broker_providers,
             "counts": counts,
+            "watch_buy_vetoes": watch_buy_vetoes,
             "symbols": symbols,
             "freshness": freshness,
             "weekly_pnl": weekly_pnl,
@@ -1482,6 +1513,7 @@ def build_runtime_status(
         state = ensure_runtime_control_state(settings=settings, db=db)
         safety = runtime_safety_payload(state)
         counts = runtime_counts(settings=settings, db=db)
+        watch_buy_vetoes = runtime_watch_buy_veto_summary(settings=settings, db=db)
         if include_expensive_sections:
             broker = build_broker_session_summary(settings=settings, db=db)
             broker_providers = broker_provider_readiness(settings=settings, db=db)
@@ -1571,6 +1603,7 @@ def build_runtime_status(
         "broker": broker,
         "broker_providers": broker_providers,
         "counts": counts,
+        "watch_buy_vetoes": watch_buy_vetoes,
         "symbols": symbols,
         "freshness": freshness,
         "actionable_alerts": actionable_alerts,
@@ -2142,6 +2175,9 @@ def build_runtime_daily_board(
                     values = status_symbols.get(key, [])
                     if isinstance(values, list):
                         normalized_symbols.update(str(symbol) for symbol in values)
+                vetoes = runtime_status.get("watch_buy_vetoes", {})
+                if isinstance(vetoes, dict) and isinstance(vetoes.get("today_symbols"), list):
+                    normalized_symbols.update(str(symbol) for symbol in vetoes["today_symbols"])
                 if len(normalized_symbols) > 20:
                     symbols = _minimal_runtime_symbol_rows(
                         settings=settings,
@@ -2166,6 +2202,7 @@ def build_runtime_daily_board(
         "mode": settings.runtime_mode,
         "runtime": runtime_status,
         "account_drawdown_gate": latest_account_drawdown_gate_state(settings=settings, db=db),
+        "watch_buy_vetoes": runtime_status.get("watch_buy_vetoes", {"today_count": 0, "today_symbols": []}),
         "totals": {
             "symbol_count": len(symbols),
             "monitored_symbol_count": sum(symbol["monitored"] for symbol in symbols),

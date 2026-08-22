@@ -6,6 +6,7 @@ from decimal import Decimal
 
 from sqlalchemy import select
 
+from app.api.schemas.execution import MonitoringEvaluationRequest, MonitoringPriceRequest
 from app.broker.base import (
     BrokerAdapterError,
     BrokerAccountHolding,
@@ -27,10 +28,14 @@ from app.db.session import create_db_engine, create_session_factory
 from app.models.runtime import BrokerOrder, BrokerOrderEvent, ExecutionPlan, ExecutionPlanItem, ExecutionPlanItemAudit
 from app.services import watch_exec_agent_sizing as watch_sizing
 from app.services.monitoring import (
+    LIVE_WATCH_BUY_VETO_EVENT_TYPE,
+    _resolve_watch_buy_order,
     _watch_buy_candidate_budget,
     _watch_buy_exec_agent_sizing_fallback_allowed,
+    evaluate_monitoring,
     list_autonomous_monitoring_symbols,
 )
+from app.services.runtime import RuntimeMetadata, build_runtime_daily_board, build_runtime_status
 from app.services.watch_exec_agent_sizing import (
     _apply_decisions,
     _applicable_decision_ids,
@@ -125,8 +130,335 @@ def _watch_item(
     )
 
 
+def _watch_veto_settings(**overrides) -> Settings:
+    return Settings(
+        runtime_mode="live",
+        automation_enabled=True,
+        market_regime_breadth_max_age_seconds=300,
+        **overrides,
+    )
+
+
+def _watch_veto_plan(
+    *,
+    settings: Settings,
+    risk_context: dict[str, object],
+    quantity_policy: dict[str, object] | None = None,
+    symbol: str = "005930",
+) -> tuple[object, object, str]:
+    engine = create_db_engine(Settings(database_url="sqlite:///:memory:", runtime_mode=settings.runtime_mode))
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    session = session_factory()
+    plan = ExecutionPlan(
+        external_plan_id=f"plan-live-veto-{symbol}",
+        strategy_run_id="strategy-1",
+        source="core-short-term-decider",
+        market_date=date(2026, 8, 18),
+        mode=settings.runtime_mode,
+        items=[
+            _watch_item(
+                item_id=f"watch-veto-{symbol}",
+                symbol=symbol,
+                risk_context={
+                    "exchange": "KRX",
+                    "target_price": "76000",
+                    "stop_price": "69000",
+                    **risk_context,
+                },
+            )
+        ],
+    )
+    item = plan.items[0]
+    item.status = "watch_monitoring_active"
+    item.quantity_policy = quantity_policy or {"kind": "shares", "quantity": 10}
+    session.add(plan)
+    session.commit()
+    return engine, session, item.id
+
+
+def _fresh_breadth(**overrides) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "market": "KRX",
+        "market_date": "2026-08-18",
+        "observed_at": "2026-08-18T01:00:00+00:00",
+        "up_ratio": "0.60",
+        "advance_decline_ratio": "1.20",
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _price(
+    *,
+    turnover: Decimal | None = Decimal("150000000"),
+    volume: Decimal | None = Decimal("10000"),
+    day_high: Decimal | None = Decimal("72000"),
+    day_low: Decimal | None = Decimal("70000"),
+) -> MonitoringPriceRequest:
+    return MonitoringPriceRequest(
+        symbol="005930",
+        price=Decimal("71000"),
+        observed_at=datetime(2026, 8, 18, 1, 5, tzinfo=UTC),
+        turnover=turnover,
+        volume=volume,
+        day_high=day_high,
+        day_low=day_low,
+    )
+
+
+def _resolve_live_watch_veto(
+    *,
+    settings: Settings,
+    risk_context: dict[str, object],
+    price: MonitoringPriceRequest,
+    quantity_policy: dict[str, object] | None = None,
+) -> tuple[object, dict[str, object] | None, dict[str, object] | None]:
+    engine, session, item_id = _watch_veto_plan(
+        settings=settings,
+        risk_context=risk_context,
+        quantity_policy=quantity_policy,
+    )
+    try:
+        item = session.get(ExecutionPlanItem, item_id)
+        assert item is not None
+        approval = _resolve_watch_buy_order(
+            settings=settings,
+            db=session,
+            adapter=WatchSizingBrokerStub(reconcile_payloads=[]),
+            item=item,
+            observed_price=price.price,
+            price=price,
+        )
+        session.flush()
+        audit = session.scalar(
+            select(ExecutionPlanItemAudit).where(
+                ExecutionPlanItemAudit.execution_plan_item_id == item_id,
+                ExecutionPlanItemAudit.event_type == LIVE_WATCH_BUY_VETO_EVENT_TYPE,
+            )
+        )
+        return (
+            approval,
+            audit.summary if audit is not None else None,
+            audit.payload if audit is not None else None,
+        )
+    finally:
+        session.close()
+        engine.dispose()
+
+
 def test_watch_sizing_treats_decimal_string_share_quantity_as_sized() -> None:
     assert _quantity_is_shares({"kind": "shares", "quantity": "24.00000000"})
+
+
+def test_live_watch_buy_vetoes_risk_off_breadth_before_submission() -> None:
+    approval, summary, payload = _resolve_live_watch_veto(
+        settings=_watch_veto_settings(),
+        risk_context={"market_breadth": _fresh_breadth(up_ratio="0.20", advance_decline_ratio="0.45")},
+        price=_price(),
+    )
+
+    assert approval.quantity is None
+    assert approval.reason == "market_breadth_risk_off"
+    assert summary is not None
+    assert summary["status"] == "watch_buy_rejected"
+    assert payload is not None
+    assert payload["skipped_quantity"] == 10
+    assert payload["skipped_notional_krw"] == "710000.0000"
+    assert payload["market_regime_reason_code"] == "market_breadth_risk_off"
+
+
+def test_live_watch_buy_stale_breadth_fails_closed_without_override() -> None:
+    approval, _, payload = _resolve_live_watch_veto(
+        settings=_watch_veto_settings(),
+        risk_context={
+            "market_breadth": _fresh_breadth(
+                market_date="2026-08-17",
+                observed_at="2026-08-17T01:00:00+00:00",
+            )
+        },
+        price=_price(),
+    )
+
+    assert approval.quantity is None
+    assert approval.reason == "market_breadth_stale"
+    assert payload is not None
+    assert payload["market_regime_reason_code"] == "market_breadth_stale_caution"
+    assert payload["override"] is None
+
+
+def test_live_watch_buy_vetoes_zero_volume_and_turnover() -> None:
+    approval, _, payload = _resolve_live_watch_veto(
+        settings=_watch_veto_settings(),
+        risk_context={"market_breadth": _fresh_breadth()},
+        price=_price(volume=Decimal("0"), turnover=Decimal("0")),
+    )
+
+    assert approval.quantity is None
+    assert approval.reason == "zero_trigger_volume"
+    assert payload is not None
+    assert payload["reasons"] == ["zero_trigger_volume", "zero_trigger_turnover"]
+    assert payload["trigger_quality"]["turnover"] == "0.0000"
+
+
+def test_live_watch_buy_vetoes_missing_day_high_low() -> None:
+    approval, _, payload = _resolve_live_watch_veto(
+        settings=_watch_veto_settings(),
+        risk_context={"market_breadth": _fresh_breadth()},
+        price=_price(day_high=None, day_low=None),
+    )
+
+    assert approval.quantity is None
+    assert approval.reason == "missing_day_high_low"
+    assert payload is not None
+    assert payload["trigger_quality"]["day_high"] is None
+    assert payload["trigger_quality"]["day_low"] is None
+
+
+def test_live_watch_buy_vetoes_low_turnover_below_configured_default() -> None:
+    approval, _, payload = _resolve_live_watch_veto(
+        settings=_watch_veto_settings(),
+        risk_context={"market_breadth": _fresh_breadth()},
+        price=_price(turnover=Decimal("14989100")),
+    )
+
+    assert approval.quantity is None
+    assert approval.reason == "low_trigger_turnover"
+    assert payload is not None
+    assert payload["trigger_quality"]["min_turnover_krw"] == "100000000.0000"
+
+
+def test_stale_breadth_override_and_paper_keep_existing_downsize_path() -> None:
+    stale_context = {
+        "market_breadth": _fresh_breadth(
+            market_date="2026-08-17",
+            observed_at="2026-08-17T01:00:00+00:00",
+        ),
+        "live_watch_buy_breadth_override": {
+            "enabled": True,
+            "actor": "ops",
+            "reason": "manual breadth feed outage review accepted this symbol for live submission",
+            "recorded_at": "2026-08-18T01:04:00+00:00",
+        },
+    }
+    live_approval, _, live_payload = _resolve_live_watch_veto(
+        settings=_watch_veto_settings(),
+        risk_context=stale_context,
+        price=_price(),
+    )
+    assert live_approval.quantity is not None
+    assert live_payload is None
+
+    paper_approval, _, paper_payload = _resolve_live_watch_veto(
+        settings=Settings(runtime_mode="paper", automation_enabled=True, market_regime_breadth_max_age_seconds=300),
+        risk_context={"market_breadth": stale_context["market_breadth"]},
+        price=_price(),
+    )
+    assert paper_approval.quantity is not None
+    assert paper_payload is None
+
+
+def test_monitoring_cycle_persists_live_veto_status_and_operator_summaries() -> None:
+    settings = _watch_veto_settings(database_url="sqlite:///:memory:")
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    try:
+        with session_factory() as session:
+            plan = ExecutionPlan(
+                external_plan_id="plan-live-veto-cycle",
+                strategy_run_id="strategy-1",
+                source="core-short-term-decider",
+                market_date=date(2026, 8, 18),
+                mode="live",
+                items=[
+                    _watch_item(
+                        item_id="watch-live-cycle-veto",
+                        symbol="005930",
+                        risk_context={
+                            "exchange": "KRX",
+                            "target_price": "76000",
+                            "stop_price": "69000",
+                            "market_breadth": _fresh_breadth(up_ratio="0.20", advance_decline_ratio="0.45"),
+                        },
+                    )
+                ],
+            )
+            item = plan.items[0]
+            item.status = "watch_monitoring_active"
+            item.quantity_policy = {"kind": "shares", "quantity": 10}
+            session.add(plan)
+            session.commit()
+
+            result = evaluate_monitoring(
+                settings=settings,
+                db=session,
+                adapter=WatchSizingBrokerStub(reconcile_payloads=[]),
+                command=MonitoringEvaluationRequest(prices=[_price()]),
+                now=datetime(2026, 8, 18, 1, 5, tzinfo=UTC),
+            )
+            session.commit()
+
+            assert result.status_code == 200
+            item = session.get(ExecutionPlanItem, "watch-live-cycle-veto")
+            assert item is not None
+            assert item.status == "watch_buy_rejected"
+            audit = session.scalar(
+                select(ExecutionPlanItemAudit).where(
+                    ExecutionPlanItemAudit.execution_plan_item_id == item.id,
+                    ExecutionPlanItemAudit.event_type == LIVE_WATCH_BUY_VETO_EVENT_TYPE,
+                )
+            )
+            assert audit is not None
+            assert audit.payload["market_regime_guardrail"]["breadth"]["up_ratio"] == "0.2000"
+            audit.occurred_at = datetime.now(UTC)
+            session.commit()
+
+            status = build_runtime_status(
+                settings=settings,
+                runtime=RuntimeMetadata(started_at=datetime(2026, 8, 18, 0, 0, tzinfo=UTC)),
+                db=session,
+            )
+            board = build_runtime_daily_board(
+                settings=settings,
+                runtime=RuntimeMetadata(started_at=datetime(2026, 8, 18, 0, 0, tzinfo=UTC)),
+                db=session,
+            )
+            assert status["watch_buy_vetoes"] == {"today_count": 1, "today_symbols": ["005930"]}
+            assert board["watch_buy_vetoes"] == {"today_count": 1, "today_symbols": ["005930"]}
+            assert board["symbols"][0]["latest_plan_item_status"] == "watch_buy_rejected"
+    finally:
+        engine.dispose()
+
+
+def test_issue_231_weekly_candidate_replay_fixture_demonstrates_veto_impact() -> None:
+    candidates = [
+        {"symbol": "012160", "reason": "market_breadth_risk_off", "turnover": Decimal("32061344"), "closed_pnl": Decimal("-2950")},
+        {"symbol": "049430", "reason": "market_breadth_risk_off", "turnover": Decimal("169866250"), "closed_pnl": Decimal("-6900")},
+        {"symbol": "010170", "reason": "market_breadth_risk_off", "turnover": Decimal("37723485225"), "closed_pnl": Decimal("-4980")},
+        {"symbol": "024840", "reason": "market_breadth_risk_off", "turnover": Decimal("8968735145"), "closed_pnl": Decimal("-1000")},
+        {"symbol": "200230", "reason": "market_breadth_risk_off", "turnover": Decimal("24935945"), "closed_pnl": Decimal("-2320")},
+        {"symbol": "020120", "reason": "market_breadth_stale_caution", "turnover": Decimal("0"), "closed_pnl": Decimal("0")},
+        {"symbol": "000950", "reason": "market_breadth_normal", "turnover": Decimal("14989100"), "closed_pnl": Decimal("-44415")},
+    ]
+
+    rule_a_symbols = {
+        row["symbol"]
+        for row in candidates
+        if row["reason"] in {"market_breadth_risk_off", "market_breadth_stale_caution"}
+    }
+    rule_b_symbols = {
+        row["symbol"]
+        for row in candidates
+        if row["symbol"] in rule_a_symbols or row["turnover"] < Decimal("100000000")
+    }
+    rule_a_observed_closed_pnl_improvement = -sum(row["closed_pnl"] for row in candidates if row["symbol"] in rule_a_symbols)
+    rule_b_observed_closed_pnl_improvement = -sum(row["closed_pnl"] for row in candidates if row["symbol"] in rule_b_symbols)
+
+    assert sorted(rule_a_symbols) == ["010170", "012160", "020120", "024840", "049430", "200230"]
+    assert "000950" in rule_b_symbols
+    assert rule_a_observed_closed_pnl_improvement == Decimal("18150")
+    assert rule_b_observed_closed_pnl_improvement == Decimal("62565")
 
 
 def _stale_local_order(*, symbol: str = "005930", broker_order_id: str = "stale-open-1") -> BrokerOrder:
