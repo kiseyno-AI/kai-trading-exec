@@ -20,9 +20,10 @@ from app.models.runtime import (
     ExecutionFill,
     ExecutionPlan,
     ExecutionPlanItem,
+    ExecutionPosition,
     MonitoringCheckpoint,
 )
-from app.services.weekly_trade_review import generate_weekly_trade_review
+from app.services.weekly_trade_review import WeeklyTradeReviewTimeoutError, generate_weekly_trade_review
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -66,18 +67,27 @@ def test_weekly_trade_review_exports_bounded_read_only_artifact(tmp_path) -> Non
     finally:
         event.remove(engine, "before_cursor_execute", _capture_sql)
 
-    assert report["counts"]["fill_count"] == 1
-    assert report["counts"]["linked_broker_order_count"] == 1
+    assert report["counts"]["fill_count"] == 2
+    assert report["counts"]["linked_broker_order_count"] == 2
     assert report["counts"]["linked_broker_order_event_count"] == 1
     assert report["counts"]["execution_failure_count"] == 1
+    assert report["counts"]["closed_trade_count"] == 1
+    assert report["counts"]["stale_fifo_inventory_alert_count"] == 1
     assert report["counts"]["protective_stop_actionability_warning_count"] == 1
     assert report["truncated"] == {
+        "closed_trades": False,
         "execution_failures": False,
         "fills": False,
         "linked_broker_order_events": False,
+        "stale_fifo_inventory_alerts": False,
         "weekly_orders": False,
     }
     assert report["fills"][0]["symbol"] == "005930"
+    assert report["closed_trades"][0]["symbol"] == "049430"
+    assert report["closed_trades"][0]["cost_basis_source"] == "broker_reconciliation"
+    assert report["closed_trades"][0]["realized_pnl"] == "-1800.0000"
+    assert report["stale_fifo_inventory_alerts"][0]["symbol"] == "049430"
+    assert report["stale_fifo_inventory_alerts"][0]["fifo_open_quantity"] == 39
     assert report["linked_broker_orders"][0]["id"] == "weekly-order"
     assert report["weekly_order_status_counts"] == [
         {
@@ -85,6 +95,13 @@ def test_weekly_trade_review_exports_bounded_read_only_artifact(tmp_path) -> Non
             "first_submitted_at": "2026-07-26T01:30:00+00:00",
             "last_submitted_at": "2026-07-26T01:30:00+00:00",
             "side": "buy",
+            "status": "filled",
+        },
+        {
+            "count": 1,
+            "first_submitted_at": "2026-07-27T01:00:00+00:00",
+            "last_submitted_at": "2026-07-27T01:00:00+00:00",
+            "side": "sell",
             "status": "filled",
         }
     ]
@@ -158,11 +175,195 @@ def test_weekly_trade_review_exports_bounded_read_only_artifact(tmp_path) -> Non
     latest_path = tmp_path / "latest.json"
     assert artifact_path.exists()
     assert latest_path.exists()
-    assert json.loads(artifact_path.read_text(encoding="utf-8"))["counts"]["fill_count"] == 1
+    assert json.loads(artifact_path.read_text(encoding="utf-8"))["counts"]["fill_count"] == 2
     assert json.loads(latest_path.read_text(encoding="utf-8"))["artifact_path"] == str(artifact_path)
 
     db.close()
     engine.dispose()
+
+
+def test_weekly_trade_review_bounds_historical_fifo_scans(tmp_path) -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        weekly_trade_review_dir=str(tmp_path),
+    )
+    engine, db = _build_db(settings)
+    start_at = datetime(2026, 7, 25, tzinfo=UTC)
+    end_at = datetime(2026, 8, 1, tzinfo=UTC)
+
+    orders: list[BrokerOrder] = []
+    fills: list[ExecutionFill] = []
+    for index in range(5):
+        order = BrokerOrder(
+            id=f"history-order-{index}",
+            broker_name="kis",
+            mode="paper",
+            idempotency_key=f"history-order-key-{index}",
+            symbol=f"HIST{index}",
+            side="buy",
+            status="filled",
+            quantity=1,
+            submitted_at=start_at - timedelta(days=10 - index),
+        )
+        orders.append(order)
+        fills.append(
+            ExecutionFill(
+                id=f"history-fill-{index}",
+                broker_order_pk=order.id,
+                broker_fill_id=f"history-fill-{index}",
+                symbol=f"HIST{index}",
+                side="buy",
+                quantity=1,
+                price=Decimal("1000"),
+                filled_at=start_at - timedelta(days=10 - index),
+            )
+        )
+    db.add_all(orders)
+    db.flush()
+    db.add_all(fills)
+    db.commit()
+
+    statements: list[str] = []
+    progress: list[dict[str, object]] = []
+
+    @event.listens_for(engine, "before_cursor_execute")
+    def _capture_sql(_conn, _cursor, statement, _parameters, _context, _executemany) -> None:  # type: ignore[no-untyped-def]
+        statements.append(statement)
+
+    try:
+        report = generate_weekly_trade_review(
+            settings=settings,
+            db=db,
+            start_at=start_at,
+            end_at=end_at,
+            max_fills=2,
+            progress_callback=progress.append,
+        )
+    finally:
+        event.remove(engine, "before_cursor_execute", _capture_sql)
+        db.close()
+        engine.dispose()
+
+    assert report["truncated"]["closed_trades"] is True
+    assert report["truncated"]["stale_fifo_inventory_alerts"] is True
+    assert [event["step"] for event in progress if event["step"] in {"weekly_closed_trades", "stale_fifo_inventory_alerts"}] == [
+        "weekly_closed_trades",
+        "stale_fifo_inventory_alerts",
+    ]
+    assert all(
+        event["truncated"] is True
+        for event in progress
+        if event["step"] in {"weekly_closed_trades", "stale_fifo_inventory_alerts"}
+    )
+    history_queries = [
+        statement
+        for statement in statements
+        if "FROM execution_fills" in statement
+        and "execution_fills.filled_at <" in statement
+        and "execution_fills.filled_at >=" not in statement
+    ]
+    assert len(history_queries) == 2
+    assert all("ORDER BY execution_fills.filled_at DESC" in statement for statement in history_queries)
+    assert all("LIMIT" in statement for statement in history_queries)
+
+
+def test_weekly_trade_review_keeps_later_repurchase_basis_unknown(tmp_path) -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        weekly_trade_review_dir=str(tmp_path),
+    )
+    engine, db = _build_db(settings)
+    start_at = datetime(2026, 7, 25, tzinfo=UTC)
+    sell_at = start_at + timedelta(days=1)
+    buy_at = start_at + timedelta(days=2)
+    end_at = datetime(2026, 8, 1, tzinfo=UTC)
+    sell_order = BrokerOrder(
+        id="unmatched-sell-order",
+        broker_name="kis",
+        mode="paper",
+        idempotency_key="unmatched-sell-order-key",
+        symbol="LATER",
+        side="sell",
+        status="filled",
+        quantity=5,
+        submitted_at=sell_at,
+    )
+    buy_order = BrokerOrder(
+        id="later-buy-order",
+        broker_name="kis",
+        mode="paper",
+        idempotency_key="later-buy-order-key",
+        symbol="LATER",
+        side="buy",
+        status="filled",
+        quantity=3,
+        submitted_at=buy_at,
+    )
+    db.add_all([sell_order, buy_order])
+    db.flush()
+    db.add_all(
+        [
+            ExecutionFill(
+                id="unmatched-sell-fill",
+                broker_order_pk=sell_order.id,
+                broker_fill_id="unmatched-sell-fill",
+                symbol="LATER",
+                side="sell",
+                quantity=5,
+                price=Decimal("1000"),
+                filled_at=sell_at,
+            ),
+            ExecutionFill(
+                id="later-buy-fill",
+                broker_order_pk=buy_order.id,
+                broker_fill_id="later-buy-fill",
+                symbol="LATER",
+                side="buy",
+                quantity=3,
+                price=Decimal("700"),
+                filled_at=buy_at,
+            ),
+            ExecutionPosition(
+                id="later-current-position",
+                mode="paper",
+                symbol="LATER",
+                quantity=3,
+                average_price=Decimal("700"),
+                updated_from="reconciliation",
+                last_reconciled_at=buy_at + timedelta(minutes=5),
+            ),
+        ]
+    )
+    db.commit()
+
+    try:
+        report = generate_weekly_trade_review(
+            settings=settings,
+            db=db,
+            start_at=start_at,
+            end_at=end_at,
+            max_fills=10,
+        )
+    finally:
+        db.close()
+        engine.dispose()
+
+    assert report["closed_trades"] == [
+        {
+            "cost_basis_observed_at": None,
+            "cost_basis_price": None,
+            "cost_basis_source": "unknown",
+            "quantity": 5,
+            "realized_pnl": None,
+            "sell_broker_order_pk": "unmatched-sell-order",
+            "sell_fill_id": "unmatched-sell-fill",
+            "sell_filled_at": "2026-07-26T00:00:00+00:00",
+            "sell_price": "1000.0000",
+            "symbol": "LATER",
+        }
+    ]
 
 
 def test_weekly_trade_review_cli_fails_before_artifact_when_required_mode_mismatches(tmp_path) -> None:
@@ -273,6 +474,42 @@ def test_weekly_trade_review_cli_allows_required_live_with_explicit_database_url
     assert payload["fill_count"] == 0
     assert (tmp_path / "artifacts" / "2026-07-25_to_2026-08-01_weekly_trade_review.json").exists()
     assert (tmp_path / "artifacts" / "latest.json").exists()
+
+
+def test_weekly_trade_review_timeout_reports_progress_before_artifact(tmp_path) -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        weekly_trade_review_dir=str(tmp_path),
+    )
+    engine, db = _build_db(settings)
+    start_at = datetime(2026, 7, 25, tzinfo=UTC)
+    end_at = datetime(2026, 8, 1, tzinfo=UTC)
+    _seed_weekly_review_fixture(db=db, start_at=start_at)
+    progress: list[dict[str, object]] = []
+
+    try:
+        try:
+            generate_weekly_trade_review(
+                settings=settings,
+                db=db,
+                start_at=start_at,
+                end_at=end_at,
+                output_dir=tmp_path,
+                timeout_seconds=-0.001,
+                progress_callback=progress.append,
+            )
+        except WeeklyTradeReviewTimeoutError as exc:
+            assert "timeout_seconds=-0.001" in str(exc)
+            assert "weekly_fills" in str(exc)
+        else:
+            raise AssertionError("expected weekly review timeout")
+    finally:
+        db.close()
+        engine.dispose()
+
+    assert progress == []
+    assert not (tmp_path / "2026-07-25_to_2026-08-01_weekly_trade_review.json").exists()
 
 
 def test_weekly_trade_review_queries_have_sqlite_index_paths() -> None:
@@ -436,6 +673,38 @@ def _seed_weekly_review_fixture(*, db, start_at: datetime) -> None:
         created_at=start_at - timedelta(days=8),
         updated_at=start_at - timedelta(days=8),
     )
+    legacy_buy_order = BrokerOrder(
+        id="legacy-buy-order",
+        execution_plan_item_id="old-item",
+        broker_name="kis",
+        mode="paper",
+        idempotency_key="legacy-buy-order-key",
+        broker_order_id="kis-legacy-buy-order",
+        symbol="049430",
+        side="buy",
+        status="filled",
+        quantity=45,
+        limit_price=Decimal("2000"),
+        submitted_at=start_at - timedelta(days=10),
+        created_at=start_at - timedelta(days=10),
+        updated_at=start_at - timedelta(days=10),
+    )
+    legacy_sell_order = BrokerOrder(
+        id="legacy-sell-order",
+        execution_plan_item_id="weekly-item",
+        broker_name="kis",
+        mode="paper",
+        idempotency_key="legacy-sell-order-key",
+        broker_order_id="kis-legacy-sell-order",
+        symbol="049430",
+        side="sell",
+        status="filled",
+        quantity=6,
+        limit_price=Decimal("1500"),
+        submitted_at=start_at + timedelta(days=2, hours=1),
+        created_at=start_at + timedelta(days=2, hours=1),
+        updated_at=start_at + timedelta(days=2, hours=1),
+    )
     missing_submitted_order = BrokerOrder(
         id="missing-submitted-order",
         execution_plan_item_id="weekly-item",
@@ -503,6 +772,41 @@ def _seed_weekly_review_fixture(*, db, start_at: datetime) -> None:
         payload={"large": "old-fill-payload"},
         created_at=start_at - timedelta(days=8),
         updated_at=start_at - timedelta(days=8),
+    )
+    legacy_buy_fill = ExecutionFill(
+        id="legacy-buy-fill",
+        broker_order_pk="legacy-buy-order",
+        broker_fill_id="legacy-buy-fill",
+        symbol="049430",
+        side="buy",
+        quantity=45,
+        price=Decimal("2000"),
+        filled_at=start_at - timedelta(days=10),
+        created_at=start_at - timedelta(days=10),
+        updated_at=start_at - timedelta(days=10),
+    )
+    legacy_sell_fill = ExecutionFill(
+        id="legacy-sell-fill",
+        broker_order_pk="legacy-sell-order",
+        broker_fill_id="legacy-sell-fill",
+        symbol="049430",
+        side="sell",
+        quantity=6,
+        price=Decimal("1500"),
+        filled_at=start_at + timedelta(days=2, hours=1, minutes=5),
+        created_at=start_at + timedelta(days=2, hours=1, minutes=5),
+        updated_at=start_at + timedelta(days=2, hours=1, minutes=5),
+    )
+    flat_position = ExecutionPosition(
+        id="flat-legacy-position",
+        mode="paper",
+        symbol="049430",
+        quantity=0,
+        average_price=Decimal("1800"),
+        updated_from="reconciliation",
+        last_reconciled_at=start_at + timedelta(days=2, hours=1, minutes=10),
+        created_at=start_at + timedelta(days=2, hours=1, minutes=10),
+        updated_at=start_at + timedelta(days=2, hours=1, minutes=10),
     )
     event = BrokerOrderEvent(
         id="weekly-event",
@@ -579,10 +883,15 @@ def _seed_weekly_review_fixture(*, db, start_at: datetime) -> None:
             old_item,
             weekly_order,
             old_order,
+            legacy_buy_order,
+            legacy_sell_order,
             missing_submitted_order,
             *active_nonterminal_orders,
             weekly_fill,
             old_fill,
+            legacy_buy_fill,
+            legacy_sell_fill,
+            flat_position,
             event,
             failure,
             checkpoint,

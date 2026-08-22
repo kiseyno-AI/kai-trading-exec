@@ -99,6 +99,8 @@ def record_actionable_execution_failure(
         broker_error_code=broker_error_code,
         broker_error_message=broker_error_message,
     )
+    if classification is None and broker_error_classification == "broker_rejected":
+        classification = "broker_rejected"
     if classification is None or retryable:
         return None
 

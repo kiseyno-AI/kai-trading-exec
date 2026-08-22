@@ -1604,55 +1604,15 @@ def monthly_pnl_payload(
     now: datetime | None = None,
 ) -> dict[str, object]:
     month_start, next_month_start = _current_krx_month_utc_bounds(now)
-    fills = dedupe_execution_fills(db.scalars(
-        select(ExecutionFill)
-        .join(ExecutionFill.broker_order)
-        .where(
-            BrokerOrder.mode == settings.runtime_mode,
-            ExecutionFill.filled_at < next_month_start,
-        )
-        .order_by(ExecutionFill.filled_at.asc(), ExecutionFill.id.asc())
-    ).all())
-
-    lots_by_symbol: dict[str, list[dict[str, Decimal]]] = {}
-    monthly_realized = Decimal("0")
-    monthly_sell_notional = Decimal("0")
-    monthly_buy_notional = Decimal("0")
-    matched_sell_quantity = Decimal("0")
-    unmatched_sell_quantity = Decimal("0")
-    for fill in fills:
-        filled_at = _as_utc(fill.filled_at)
-        side = fill.side.lower()
-        symbol = fill.symbol
-        quantity = _pnl_fill_quantity(fill)
-        notional = _pnl_fill_notional(fill=fill, quantity=quantity)
-        if side == "buy":
-            lots_by_symbol.setdefault(symbol, []).append(
-                {"quantity": quantity, "price": fill.price}
-            )
-            if filled_at >= month_start:
-                monthly_buy_notional += notional
-            continue
-        if side != "sell":
-            continue
-        if filled_at >= month_start:
-            monthly_sell_notional += notional
-        remaining = quantity
-        lots = lots_by_symbol.setdefault(symbol, [])
-        while remaining > 0 and lots:
-            lot = lots[0]
-            matched = min(remaining, lot["quantity"])
-            if filled_at >= month_start:
-                monthly_realized += ((fill.price - lot["price"]) * matched).quantize(Decimal("0.0001"))
-                matched_sell_quantity += matched
-            lot["quantity"] -= matched
-            remaining -= matched
-            if lot["quantity"] <= 0:
-                lots.pop(0)
-        if remaining > 0 and filled_at >= month_start:
-            unmatched_sell_quantity += remaining
+    summary = _period_realized_pnl_summary(
+        settings=settings,
+        db=db,
+        start_at=month_start,
+        end_at=next_month_start,
+    )
 
     target = getattr(settings, "monthly_target_krw", Decimal("500000"))
+    monthly_realized = summary["realized"]
     progress = (monthly_realized / target * Decimal("100")).quantize(Decimal("0.01")) if target > 0 else Decimal("0")
     expected_progress = _expected_month_progress_pct(now)
     recommendation = _monthly_mode_recommendation(
@@ -1667,11 +1627,14 @@ def monthly_pnl_payload(
         "target_progress_pct": _decimal_text(progress),
         "expected_calendar_progress_pct": _decimal_text(expected_progress),
         "mode_recommendation": recommendation,
-        "monthly_buy_notional": _decimal_text(monthly_buy_notional),
-        "monthly_sell_notional": _decimal_text(monthly_sell_notional),
-        "matched_sell_quantity": _quantity_value(matched_sell_quantity),
-        "unmatched_sell_quantity": _quantity_value(unmatched_sell_quantity),
-        "pnl_method": "fifo_internal_fills",
+        "monthly_buy_notional": _decimal_text(summary["buy_notional"]),
+        "monthly_sell_notional": _decimal_text(summary["sell_notional"]),
+        "matched_sell_quantity": _quantity_value(summary["matched_sell_quantity"]),
+        "unmatched_sell_quantity": _quantity_value(summary["unmatched_sell_quantity"]),
+        "cost_basis_sources": summary["cost_basis_sources"],
+        "unknown_cost_basis_sell_quantity": _quantity_value(summary["unknown_cost_basis_sell_quantity"]),
+        "stale_fifo_inventory_alerts": summary["stale_fifo_inventory_alerts"],
+        "pnl_method": "fifo_internal_fills_with_broker_reconciliation_fallback",
     }
 
 
@@ -1692,7 +1655,7 @@ def daily_pnl_payload(
         .order_by(ExecutionFill.filled_at.asc(), ExecutionFill.id.asc())
     ).all())
 
-    lots_by_symbol: dict[str, list[dict[str, Decimal]]] = {}
+    lots_by_symbol: dict[str, list[dict[str, object]]] = {}
     realized = Decimal("0")
     sell_notional = Decimal("0")
     buy_notional = Decimal("0")
@@ -1709,7 +1672,7 @@ def daily_pnl_payload(
         notional = _pnl_fill_notional(fill=fill, quantity=quantity)
         if side == "buy":
             lots_by_symbol.setdefault(symbol, []).append(
-                {"quantity": quantity, "price": fill.price}
+                {"quantity": quantity, "price": fill.price, "filled_at": filled_at}
             )
             if filled_at >= day_start:
                 buy_notional += notional
@@ -1760,17 +1723,60 @@ def weekly_pnl_payload(
     now: datetime | None = None,
 ) -> dict[str, object]:
     week_start, next_week_start = _current_krx_week_utc_bounds(now)
+    summary = _period_realized_pnl_summary(
+        settings=settings,
+        db=db,
+        start_at=week_start,
+        end_at=next_week_start,
+    )
+
+    return {
+        "week_start": week_start.astimezone(KRX_TIMEZONE).strftime("%Y-%m-%d"),
+        "week_end_exclusive": next_week_start.astimezone(KRX_TIMEZONE).strftime("%Y-%m-%d"),
+        "weekly_realized_pnl": _decimal_text(summary["realized"]),
+        "weekly_buy_notional": _decimal_text(summary["buy_notional"]),
+        "weekly_sell_notional": _decimal_text(summary["sell_notional"]),
+        "matched_sell_quantity": _quantity_value(summary["matched_sell_quantity"]),
+        "unmatched_sell_quantity": _quantity_value(summary["unmatched_sell_quantity"]),
+        "closed_trade_count": summary["closed_trade_count"],
+        "closed_symbols": summary["closed_symbols"],
+        "closed_symbol_count": len(summary["closed_symbols"]),
+        "unmatched_sell_symbols": summary["unmatched_sell_symbols"],
+        "unmatched_sell_symbol_count": len(summary["unmatched_sell_symbols"]),
+        "win_count": summary["win_count"],
+        "loss_count": summary["loss_count"],
+        "breakeven_count": summary["breakeven_count"],
+        "cost_basis_sources": summary["cost_basis_sources"],
+        "unknown_cost_basis_sell_quantity": _quantity_value(summary["unknown_cost_basis_sell_quantity"]),
+        "stale_fifo_inventory_alerts": summary["stale_fifo_inventory_alerts"],
+        "pnl_method": "fifo_internal_fills_with_broker_reconciliation_fallback",
+    }
+
+
+def _period_realized_pnl_summary(
+    *,
+    settings: Settings,
+    db: Session,
+    start_at: datetime,
+    end_at: datetime,
+) -> dict[str, object]:
     fills = dedupe_execution_fills(db.scalars(
         select(ExecutionFill)
         .join(ExecutionFill.broker_order)
         .where(
             BrokerOrder.mode == settings.runtime_mode,
-            ExecutionFill.filled_at < next_week_start,
+            ExecutionFill.filled_at < end_at,
         )
         .order_by(ExecutionFill.filled_at.asc(), ExecutionFill.id.asc())
     ).all())
+    sell_symbols = {
+        fill.symbol
+        for fill in fills
+        if str(fill.side or "").lower() == "sell" and start_at <= _as_utc(fill.filled_at) < end_at
+    }
+    positions_by_symbol = _pnl_positions_by_symbol(settings=settings, db=db, symbols=sell_symbols)
 
-    lots_by_symbol: dict[str, list[dict[str, Decimal]]] = {}
+    lots_by_symbol: dict[str, list[dict[str, object]]] = {}
     realized = Decimal("0")
     sell_notional = Decimal("0")
     buy_notional = Decimal("0")
@@ -1781,6 +1787,8 @@ def weekly_pnl_payload(
     win_count = 0
     loss_count = 0
     breakeven_count = 0
+    cost_basis_sources = {"fill_fifo": 0, "broker_reconciliation": 0, "unknown": 0}
+    unknown_cost_basis_sell_quantity = Decimal("0")
     for fill in fills:
         filled_at = _as_utc(fill.filled_at)
         side = fill.side.lower()
@@ -1789,57 +1797,185 @@ def weekly_pnl_payload(
         notional = _pnl_fill_notional(fill=fill, quantity=quantity)
         if side == "buy":
             lots_by_symbol.setdefault(symbol, []).append(
-                {"quantity": quantity, "price": fill.price}
+                {"quantity": quantity, "price": fill.price, "filled_at": filled_at}
             )
-            if filled_at >= week_start:
+            if filled_at >= start_at:
                 buy_notional += notional
             continue
         if side != "sell":
             continue
-        if filled_at >= week_start:
+        in_period = filled_at >= start_at
+        next_buy_after_sell = _pnl_next_buy_after(fills=fills, symbol=symbol, after=filled_at)
+        if in_period:
             sell_notional += notional
         remaining = quantity
         lots = lots_by_symbol.setdefault(symbol, [])
         while remaining > 0 and lots:
             lot = lots[0]
-            matched = min(remaining, lot["quantity"])
-            pnl = ((fill.price - lot["price"]) * matched).quantize(Decimal("0.0001"))
-            if filled_at >= week_start:
+            lot_quantity = Decimal(str(lot["quantity"]))
+            matched = min(remaining, lot_quantity)
+            cost_price = Decimal(str(lot["price"]))
+            cost_source = "fill_fifo"
+            position = positions_by_symbol.get(symbol)
+            broker_cost_basis = _pnl_broker_reconciliation_cost_basis(
+                position=position,
+                sold_at=filled_at,
+                next_buy_after_sell=next_buy_after_sell,
+            )
+            if in_period and _as_utc(lot["filled_at"]) < start_at and broker_cost_basis is not None:
+                cost_price = broker_cost_basis
+                cost_source = "broker_reconciliation"
+            pnl = ((fill.price - cost_price) * matched).quantize(Decimal("0.0001"))
+            if in_period:
                 realized += pnl
                 matched_sell_quantity += matched
                 closed_symbols.add(symbol)
+                cost_basis_sources[cost_source] += 1
                 if pnl > 0:
                     win_count += 1
                 elif pnl < 0:
                     loss_count += 1
                 else:
                     breakeven_count += 1
-            lot["quantity"] -= matched
+            lot["quantity"] = lot_quantity - matched
             remaining -= matched
-            if lot["quantity"] <= 0:
+            if Decimal(str(lot["quantity"])) <= 0:
                 lots.pop(0)
-        if remaining > 0 and filled_at >= week_start:
-            unmatched_sell_quantity += remaining
-            unmatched_sell_symbols.add(symbol)
+        if remaining > 0 and in_period:
+            position = positions_by_symbol.get(symbol)
+            broker_cost_basis = _pnl_broker_reconciliation_cost_basis(
+                position=position,
+                sold_at=filled_at,
+                next_buy_after_sell=next_buy_after_sell,
+            )
+            if broker_cost_basis is not None:
+                pnl = ((fill.price - broker_cost_basis) * remaining).quantize(Decimal("0.0001"))
+                realized += pnl
+                matched_sell_quantity += remaining
+                closed_symbols.add(symbol)
+                cost_basis_sources["broker_reconciliation"] += 1
+                if pnl > 0:
+                    win_count += 1
+                elif pnl < 0:
+                    loss_count += 1
+                else:
+                    breakeven_count += 1
+            else:
+                unmatched_sell_quantity += remaining
+                unknown_cost_basis_sell_quantity += remaining
+                unmatched_sell_symbols.add(symbol)
+                cost_basis_sources["unknown"] += 1
 
     return {
-        "week_start": week_start.astimezone(KRX_TIMEZONE).strftime("%Y-%m-%d"),
-        "week_end_exclusive": next_week_start.astimezone(KRX_TIMEZONE).strftime("%Y-%m-%d"),
-        "weekly_realized_pnl": _decimal_text(realized),
-        "weekly_buy_notional": _decimal_text(buy_notional),
-        "weekly_sell_notional": _decimal_text(sell_notional),
-        "matched_sell_quantity": _quantity_value(matched_sell_quantity),
-        "unmatched_sell_quantity": _quantity_value(unmatched_sell_quantity),
+        "realized": realized,
+        "buy_notional": buy_notional,
+        "sell_notional": sell_notional,
+        "matched_sell_quantity": matched_sell_quantity,
+        "unmatched_sell_quantity": unmatched_sell_quantity,
+        "unknown_cost_basis_sell_quantity": unknown_cost_basis_sell_quantity,
         "closed_trade_count": win_count + loss_count + breakeven_count,
         "closed_symbols": sorted(closed_symbols),
-        "closed_symbol_count": len(closed_symbols),
         "unmatched_sell_symbols": sorted(unmatched_sell_symbols),
-        "unmatched_sell_symbol_count": len(unmatched_sell_symbols),
         "win_count": win_count,
         "loss_count": loss_count,
         "breakeven_count": breakeven_count,
-        "pnl_method": "fifo_internal_fills",
+        "cost_basis_sources": cost_basis_sources,
+        "stale_fifo_inventory_alerts": _stale_fifo_inventory_alerts(
+            lots_by_symbol=lots_by_symbol,
+            positions_by_symbol=positions_by_symbol,
+        ),
     }
+
+
+def _pnl_broker_reconciliation_cost_basis(
+    *,
+    position: ExecutionPosition | None,
+    sold_at: datetime,
+    next_buy_after_sell: datetime | None,
+) -> Decimal | None:
+    if (
+        position is not None
+        and position.average_price is not None
+        and position.average_price > 0
+        and position.last_reconciled_at is not None
+        and "reconciliation" in str(position.updated_from or "")
+        and _position_effective_quantity(position) <= 0
+    ):
+        reconciled_at = _as_utc(position.last_reconciled_at)
+        sold_at = _as_utc(sold_at)
+        if reconciled_at >= sold_at and (next_buy_after_sell is None or reconciled_at < next_buy_after_sell):
+            return Decimal(position.average_price)
+    return None
+
+
+def _pnl_next_buy_after(
+    *,
+    fills: list[ExecutionFill],
+    symbol: str,
+    after: datetime,
+) -> datetime | None:
+    later_buys = [
+        _as_utc(fill.filled_at)
+        for fill in fills
+        if fill.symbol == symbol
+        and str(fill.side or "").lower() == "buy"
+        and _as_utc(fill.filled_at) > after
+    ]
+    return min(later_buys) if later_buys else None
+
+
+def _pnl_positions_by_symbol(
+    *,
+    settings: Settings,
+    db: Session,
+    symbols: set[str],
+) -> dict[str, ExecutionPosition]:
+    if not symbols:
+        return {}
+    return {
+        position.symbol: position
+        for position in db.scalars(
+            select(ExecutionPosition).where(
+                ExecutionPosition.mode == settings.runtime_mode,
+                ExecutionPosition.symbol.in_(sorted(symbols)),
+            )
+        ).all()
+    }
+
+
+def _stale_fifo_inventory_alerts(
+    *,
+    lots_by_symbol: dict[str, list[dict[str, object]]],
+    positions_by_symbol: dict[str, ExecutionPosition],
+) -> list[dict[str, object]]:
+    alerts: list[dict[str, object]] = []
+    for symbol, lots in sorted(lots_by_symbol.items()):
+        fifo_quantity = sum((Decimal(str(lot["quantity"])) for lot in lots), Decimal("0"))
+        if fifo_quantity <= 0:
+            continue
+        position = positions_by_symbol.get(symbol)
+        if position is None or position.last_reconciled_at is None:
+            continue
+        position_quantity = _position_effective_quantity(position)
+        if position_quantity > 0:
+            continue
+        alerts.append(
+            {
+                "kind": "stale_fill_fifo_inventory_flat_broker_position",
+                "symbol": symbol,
+                "fifo_open_quantity": _quantity_value(fifo_quantity),
+                "broker_position_quantity": _quantity_value(position_quantity),
+                "position_last_reconciled_at": _serialize_datetime(position.last_reconciled_at),
+                "message": "fill FIFO leaves open quantity but latest broker reconciliation reports flat",
+            }
+        )
+    return alerts
+
+
+def _position_effective_quantity(position: ExecutionPosition) -> Decimal:
+    if position.base_quantity is not None:
+        return Decimal(position.base_quantity)
+    return Decimal(position.quantity)
 
 
 def _pnl_fill_quantity(fill: ExecutionFill) -> Decimal:
@@ -1867,7 +2003,10 @@ def _default_monthly_pnl_payload(*, settings: Settings) -> dict[str, object]:
         "monthly_sell_notional": "0.0000",
         "matched_sell_quantity": 0,
         "unmatched_sell_quantity": 0,
-        "pnl_method": "fifo_internal_fills",
+        "cost_basis_sources": {"fill_fifo": 0, "broker_reconciliation": 0, "unknown": 0},
+        "unknown_cost_basis_sell_quantity": 0,
+        "stale_fifo_inventory_alerts": [],
+        "pnl_method": "fifo_internal_fills_with_broker_reconciliation_fallback",
     }
 
 
@@ -1907,7 +2046,10 @@ def _default_weekly_pnl_payload() -> dict[str, object]:
         "win_count": 0,
         "loss_count": 0,
         "breakeven_count": 0,
-        "pnl_method": "fifo_internal_fills",
+        "cost_basis_sources": {"fill_fifo": 0, "broker_reconciliation": 0, "unknown": 0},
+        "unknown_cost_basis_sell_quantity": 0,
+        "stale_fifo_inventory_alerts": [],
+        "pnl_method": "fifo_internal_fills_with_broker_reconciliation_fallback",
     }
 
 

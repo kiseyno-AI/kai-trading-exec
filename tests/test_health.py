@@ -505,7 +505,8 @@ def test_runtime_status_reports_monthly_realized_pnl_progress_and_mode() -> None
     assert weekly["closed_symbol_count"] == 1
     assert weekly["win_count"] == 1
     assert weekly["loss_count"] == 0
-    assert weekly["pnl_method"] == "fifo_internal_fills"
+    assert weekly["cost_basis_sources"] == {"broker_reconciliation": 0, "fill_fifo": 1, "unknown": 0}
+    assert weekly["pnl_method"] == "fifo_internal_fills_with_broker_reconciliation_fallback"
     daily = response.json()["daily_pnl"]
     assert daily["daily_realized_pnl"] == "5000.0000"
     assert daily["daily_buy_notional"] == "0.0000"
@@ -519,6 +520,152 @@ def test_runtime_status_reports_monthly_realized_pnl_progress_and_mode() -> None
     assert daily["unmatched_sell_symbols"] == []
     assert daily["unmatched_sell_symbol_count"] == 0
     assert daily["pnl_method"] == "fifo_internal_fills"
+
+    engine.dispose()
+
+
+def test_runtime_status_weekly_pnl_uses_broker_reconciliation_cost_for_legacy_flat_position() -> None:
+    settings = Settings(database_url="sqlite:///:memory:", runtime_mode="paper")
+    app, engine = build_test_app(settings=settings)
+    client = TestClient(app)
+    now = datetime.now(UTC)
+    legacy_buy_at = now - timedelta(days=14)
+
+    with app.state.db_session_factory() as session:
+        buy_order = BrokerOrder(
+            mode="paper",
+            idempotency_key="weekly-legacy-buy",
+            symbol="049430",
+            side="buy",
+            status="filled",
+            quantity=45,
+        )
+        sell_order = BrokerOrder(
+            mode="paper",
+            idempotency_key="weekly-legacy-sell",
+            symbol="049430",
+            side="sell",
+            status="filled",
+            quantity=6,
+        )
+        session.add_all([buy_order, sell_order])
+        session.flush()
+        session.add_all(
+            [
+                ExecutionFill(
+                    broker_order_pk=buy_order.id,
+                    broker_fill_id="weekly-legacy-buy-fill",
+                    symbol="049430",
+                    side="buy",
+                    quantity=45,
+                    price=Decimal("2000"),
+                    filled_at=legacy_buy_at,
+                ),
+                ExecutionFill(
+                    broker_order_pk=sell_order.id,
+                    broker_fill_id="weekly-legacy-sell-fill",
+                    symbol="049430",
+                    side="sell",
+                    quantity=6,
+                    price=Decimal("1500"),
+                    filled_at=now,
+                ),
+                ExecutionPosition(
+                    mode="paper",
+                    symbol="049430",
+                    quantity=0,
+                    average_price=Decimal("1800"),
+                    updated_from="reconciliation",
+                    last_reconciled_at=now,
+                ),
+            ]
+        )
+        session.commit()
+
+    response = client.get("/runtime/status")
+
+    assert response.status_code == 200
+    weekly = response.json()["weekly_pnl"]
+    assert weekly["weekly_realized_pnl"] == "-1800.0000"
+    assert weekly["matched_sell_quantity"] == 6
+    assert weekly["cost_basis_sources"] == {"broker_reconciliation": 1, "fill_fifo": 0, "unknown": 0}
+    assert weekly["stale_fifo_inventory_alerts"][0]["symbol"] == "049430"
+    assert weekly["stale_fifo_inventory_alerts"][0]["fifo_open_quantity"] == 39
+
+    engine.dispose()
+
+
+def test_runtime_status_weekly_pnl_keeps_later_repurchase_basis_unknown() -> None:
+    settings = Settings(database_url="sqlite:///:memory:", runtime_mode="paper")
+    app, engine = build_test_app(settings=settings)
+    client = TestClient(app)
+    now = datetime.now(UTC)
+    sell_at = now - timedelta(days=2)
+    buy_at = now - timedelta(days=1)
+
+    with app.state.db_session_factory() as session:
+        sell_order = BrokerOrder(
+            mode="paper",
+            idempotency_key="weekly-unmatched-sell",
+            symbol="LATER",
+            side="sell",
+            status="filled",
+            quantity=5,
+        )
+        buy_order = BrokerOrder(
+            mode="paper",
+            idempotency_key="weekly-later-buy",
+            symbol="LATER",
+            side="buy",
+            status="filled",
+            quantity=3,
+        )
+        session.add_all([sell_order, buy_order])
+        session.flush()
+        session.add_all(
+            [
+                ExecutionFill(
+                    broker_order_pk=sell_order.id,
+                    broker_fill_id="weekly-unmatched-sell-fill",
+                    symbol="LATER",
+                    side="sell",
+                    quantity=5,
+                    price=Decimal("1000"),
+                    filled_at=sell_at,
+                ),
+                ExecutionFill(
+                    broker_order_pk=buy_order.id,
+                    broker_fill_id="weekly-later-buy-fill",
+                    symbol="LATER",
+                    side="buy",
+                    quantity=3,
+                    price=Decimal("700"),
+                    filled_at=buy_at,
+                ),
+                ExecutionPosition(
+                    mode="paper",
+                    symbol="LATER",
+                    quantity=3,
+                    average_price=Decimal("700"),
+                    updated_from="reconciliation",
+                    last_reconciled_at=buy_at + timedelta(minutes=5),
+                ),
+            ]
+        )
+        session.commit()
+
+    response = client.get("/runtime/status")
+
+    assert response.status_code == 200
+    weekly = response.json()["weekly_pnl"]
+    assert weekly["weekly_realized_pnl"] == "0.0000"
+    assert weekly["matched_sell_quantity"] == 0
+    assert weekly["unmatched_sell_quantity"] == 5
+    assert weekly["unknown_cost_basis_sell_quantity"] == 5
+    assert weekly["closed_trade_count"] == 0
+    assert weekly["closed_symbols"] == []
+    assert weekly["unmatched_sell_symbols"] == ["LATER"]
+    assert weekly["cost_basis_sources"] == {"broker_reconciliation": 0, "fill_fifo": 0, "unknown": 1}
 
     engine.dispose()
 
@@ -600,7 +747,7 @@ def test_runtime_status_daily_pnl_uses_crypto_base_quantity_and_quote_notional()
     assert monthly["monthly_sell_notional"] == "44000.0000"
     assert monthly["matched_sell_quantity"] == "0.0004"
     assert monthly["unmatched_sell_quantity"] == 0
-    assert monthly["pnl_method"] == "fifo_internal_fills"
+    assert monthly["pnl_method"] == "fifo_internal_fills_with_broker_reconciliation_fallback"
     weekly = response.json()["weekly_pnl"]
     assert weekly["weekly_realized_pnl"] == "4000.0000"
     assert weekly["weekly_buy_notional"] == "100000.0000"
@@ -609,7 +756,8 @@ def test_runtime_status_daily_pnl_uses_crypto_base_quantity_and_quote_notional()
     assert weekly["unmatched_sell_quantity"] == 0
     assert weekly["closed_symbols"] == ["KRW-BTC"]
     assert weekly["closed_symbol_count"] == 1
-    assert weekly["pnl_method"] == "fifo_internal_fills"
+    assert weekly["cost_basis_sources"] == {"broker_reconciliation": 0, "fill_fifo": 1, "unknown": 0}
+    assert weekly["pnl_method"] == "fifo_internal_fills_with_broker_reconciliation_fallback"
     daily = response.json()["daily_pnl"]
     assert daily["daily_realized_pnl"] == "4000.0000"
     assert daily["daily_buy_notional"] == "100000.0000"
@@ -4665,10 +4813,10 @@ def test_fast_runtime_status_uses_autonomous_snapshot_for_monitored_symbols() ->
         "buy": {"symbols": 0, "fills": 0, "quantity": 0},
         "sell": {"symbols": 0, "fills": 0, "quantity": 0},
     }
-    assert payload["monthly_pnl"]["pnl_method"] == "fifo_internal_fills"
+    assert payload["monthly_pnl"]["pnl_method"] == "fifo_internal_fills_with_broker_reconciliation_fallback"
     assert payload["monthly_pnl"]["monthly_realized_pnl"] == "0.0000"
     assert payload["monthly_pnl"]["matched_sell_quantity"] == 0
-    assert payload["weekly_pnl"]["pnl_method"] == "fifo_internal_fills"
+    assert payload["weekly_pnl"]["pnl_method"] == "fifo_internal_fills_with_broker_reconciliation_fallback"
     assert payload["weekly_pnl"]["weekly_realized_pnl"] == "0.0000"
     assert payload["weekly_pnl"]["weekly_buy_notional"] == "0.0000"
     assert payload["weekly_pnl"]["weekly_sell_notional"] == "0.0000"

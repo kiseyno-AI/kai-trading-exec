@@ -3,7 +3,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from collections.abc import Iterable, Sequence
+import sys
+import time
+from collections.abc import Callable, Iterable, Sequence
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -21,11 +23,18 @@ from app.models.runtime import (
     ExecutionFill,
     ExecutionPlan,
     ExecutionPlanItem,
+    ExecutionPosition,
     MonitoringCheckpoint,
 )
 from app.services.broker_order_state import (
     NONTERMINAL_ORDER_STATUSES,
 )
+
+
+class WeeklyTradeReviewTimeoutError(TimeoutError):
+    """Raised when a bounded weekly export exceeds its configured deadline."""
+
+
 WATCH_REVIEW_STATUSES = (
     "watch_monitoring_pending",
     "watch_monitoring_active",
@@ -56,6 +65,8 @@ def generate_weekly_trade_review(
     max_execution_failures: int = 1000,
     max_linked_events: int = 2000,
     max_stale_order_samples: int = 100,
+    timeout_seconds: float | None = None,
+    progress_callback: Callable[[dict[str, object]], None] | None = None,
 ) -> dict[str, object]:
     """Write a bounded, read-only weekly review artifact from exec-owned tables."""
 
@@ -69,6 +80,23 @@ def generate_weekly_trade_review(
 
     target_dir = output_dir or Path(settings.weekly_trade_review_dir)
     target_dir.mkdir(parents=True, exist_ok=True)
+    started_monotonic = time.monotonic()
+
+    def progress(step: str, **fields: object) -> None:
+        elapsed = time.monotonic() - started_monotonic
+        if timeout_seconds is not None and elapsed > timeout_seconds:
+            raise WeeklyTradeReviewTimeoutError(
+                f"weekly trade review export exceeded timeout_seconds={timeout_seconds:.3f} "
+                f"after step={step!r} elapsed_seconds={elapsed:.3f}"
+            )
+        if progress_callback is not None:
+            progress_callback(
+                {
+                    "step": step,
+                    "elapsed_seconds": round(elapsed, 3),
+                    **fields,
+                }
+            )
 
     fills, fills_truncated = _weekly_fills(
         db=db,
@@ -78,6 +106,7 @@ def generate_weekly_trade_review(
         include_json_payloads=include_json_payloads,
         max_rows=max_fills,
     )
+    progress("weekly_fills", row_count=len(fills), truncated=fills_truncated)
     broker_order_pks = sorted(
         {
             str(row["broker_order_pk"])
@@ -91,18 +120,21 @@ def generate_weekly_trade_review(
         broker_order_pks=broker_order_pks,
         include_json_payloads=include_json_payloads,
     )
+    progress("linked_broker_orders", row_count=len(linked_orders))
     linked_events, linked_events_truncated = _linked_broker_order_events(
         db=db,
         broker_order_pks=broker_order_pks,
         include_json_payloads=include_json_payloads,
         max_rows=max_linked_events,
     )
+    progress("linked_broker_order_events", row_count=len(linked_events), truncated=linked_events_truncated)
     weekly_order_counts = _weekly_order_status_counts(
         db=db,
         mode=settings.runtime_mode,
         start_at=start_at,
         end_at=end_at,
     )
+    progress("weekly_order_status_counts", row_count=len(weekly_order_counts))
     weekly_orders, weekly_orders_truncated = _weekly_order_samples(
         db=db,
         mode=settings.runtime_mode,
@@ -111,6 +143,7 @@ def generate_weekly_trade_review(
         include_json_payloads=include_json_payloads,
         max_rows=max_weekly_orders,
     )
+    progress("weekly_order_samples", row_count=len(weekly_orders), truncated=weekly_orders_truncated)
     failures, failures_truncated = _weekly_execution_failures(
         db=db,
         mode=settings.runtime_mode,
@@ -119,6 +152,26 @@ def generate_weekly_trade_review(
         include_json_payloads=include_json_payloads,
         max_rows=max_execution_failures,
     )
+    progress("weekly_execution_failures", row_count=len(failures), truncated=failures_truncated)
+    closed_trades, closed_trades_truncated = _weekly_closed_trades(
+        db=db,
+        mode=settings.runtime_mode,
+        start_at=start_at,
+        end_at=end_at,
+        max_rows=max_fills,
+    )
+    progress("weekly_closed_trades", row_count=len(closed_trades), truncated=closed_trades_truncated)
+    stale_fifo_inventory_alerts, stale_fifo_inventory_alerts_truncated = _stale_fifo_inventory_alerts(
+        db=db,
+        mode=settings.runtime_mode,
+        end_at=end_at,
+        max_rows=max_fills,
+    )
+    progress(
+        "stale_fifo_inventory_alerts",
+        row_count=len(stale_fifo_inventory_alerts),
+        truncated=stale_fifo_inventory_alerts_truncated,
+    )
     active_order_summary = _active_broker_order_summary(
         db=db,
         mode=settings.runtime_mode,
@@ -126,6 +179,7 @@ def generate_weekly_trade_review(
         stale_threshold_seconds=settings.stale_broker_order_reconciliation_threshold_seconds,
         max_stale_order_samples=max_stale_order_samples,
     )
+    progress("active_broker_order_summary")
     plan_item_summary = _plan_item_review_summary(
         db=db,
         mode=settings.runtime_mode,
@@ -141,6 +195,7 @@ def generate_weekly_trade_review(
         db=db,
         mode=settings.runtime_mode,
     )
+    progress("monitoring_sections", checkpoint_count=len(monitoring_checkpoints))
 
     report: dict[str, object] = {
         "generated_at": datetime.now(UTC),
@@ -177,12 +232,16 @@ def generate_weekly_trade_review(
             "execution_failure_count": len(failures),
             "monitoring_checkpoint_count": len(monitoring_checkpoints),
             "protective_stop_actionability_warning_count": protective_stop_actionability["warning_count"],
+            "closed_trade_count": len(closed_trades),
+            "stale_fifo_inventory_alert_count": len(stale_fifo_inventory_alerts),
         },
         "truncated": {
             "fills": fills_truncated,
             "linked_broker_order_events": linked_events_truncated,
             "weekly_orders": weekly_orders_truncated,
             "execution_failures": failures_truncated,
+            "closed_trades": closed_trades_truncated,
+            "stale_fifo_inventory_alerts": stale_fifo_inventory_alerts_truncated,
         },
         "fills": fills,
         "linked_broker_orders": linked_orders,
@@ -190,6 +249,8 @@ def generate_weekly_trade_review(
         "weekly_order_status_counts": weekly_order_counts,
         "weekly_order_samples": weekly_orders,
         "execution_failures": failures,
+        "closed_trades": closed_trades,
+        "stale_fifo_inventory_alerts": stale_fifo_inventory_alerts,
         "active_broker_order_summary": active_order_summary,
         "execution_plan_item_summary": plan_item_summary,
         "monitoring_checkpoints": monitoring_checkpoints,
@@ -202,6 +263,7 @@ def generate_weekly_trade_review(
     text = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
     artifact_path.write_text(text + "\n", encoding="utf-8")
     (target_dir / "latest.json").write_text(text + "\n", encoding="utf-8")
+    progress("write_artifact", artifact_path=str(artifact_path))
     return payload
 
 
@@ -622,6 +684,266 @@ def _monitoring_checkpoints(
     return _rows_to_dicts(rows)
 
 
+def _weekly_closed_trades(
+    *,
+    db: Session,
+    mode: str,
+    start_at: datetime,
+    end_at: datetime,
+    max_rows: int,
+) -> tuple[list[dict[str, object]], bool]:
+    newest_fills = db.scalars(
+        select(ExecutionFill)
+        .join(BrokerOrder, ExecutionFill.broker_order_pk == BrokerOrder.id)
+        .where(
+            BrokerOrder.mode == mode,
+            ExecutionFill.filled_at < end_at,
+        )
+        .order_by(ExecutionFill.filled_at.desc(), ExecutionFill.id.desc())
+        .limit(max_rows + 1)
+    ).all()
+    truncated = len(newest_fills) > max_rows
+    fills = list(reversed(newest_fills[:max_rows]))
+    sell_symbols = {
+        fill.symbol
+        for fill in fills
+        if str(fill.side or "").lower() == "sell" and start_at <= _normalize_utc(fill.filled_at) < end_at
+    }
+    positions_by_symbol = _positions_by_symbol(db=db, mode=mode, symbols=sell_symbols)
+
+    lots_by_symbol: dict[str, list[dict[str, object]]] = {}
+    closed: list[dict[str, object]] = []
+    for fill in fills:
+        side = str(fill.side or "").lower()
+        quantity = _fill_quantity(fill)
+        if side == "buy":
+            lots_by_symbol.setdefault(fill.symbol, []).append(
+                {
+                    "quantity": quantity,
+                    "price": Decimal(fill.price),
+                    "filled_at": _normalize_utc(fill.filled_at),
+                    "fill_id": fill.id,
+                }
+            )
+            continue
+        if side != "sell":
+            continue
+        filled_at = _normalize_utc(fill.filled_at)
+        in_period = start_at <= filled_at < end_at
+        next_buy_after_sell = _next_buy_after(fills=fills, symbol=fill.symbol, after=filled_at)
+        remaining = quantity
+        lots = lots_by_symbol.setdefault(fill.symbol, [])
+        while remaining > 0 and lots:
+            lot = lots[0]
+            lot_quantity = Decimal(str(lot["quantity"]))
+            matched = min(remaining, lot_quantity)
+            if in_period:
+                buy_price = Decimal(str(lot["price"]))
+                cost_basis_source = "fill_fifo"
+                position = positions_by_symbol.get(fill.symbol)
+                broker_cost_basis = _broker_reconciliation_cost_basis(
+                    position=position,
+                    sold_at=filled_at,
+                    next_buy_after_sell=next_buy_after_sell,
+                )
+                if _normalize_utc(lot["filled_at"]) < start_at and broker_cost_basis is not None:
+                    buy_price = broker_cost_basis
+                    cost_basis_source = "broker_reconciliation"
+                    cost_basis_observed_at = (
+                        position.last_reconciled_at if position is not None else None
+                    )
+                else:
+                    cost_basis_observed_at = lot["filled_at"]
+                closed.append(
+                    _closed_trade_row(
+                        fill=fill,
+                        quantity=matched,
+                        buy_price=buy_price,
+                        cost_basis_source=cost_basis_source,
+                        cost_basis_observed_at=cost_basis_observed_at,
+                    )
+                )
+            lot["quantity"] = lot_quantity - matched
+            remaining -= matched
+            if Decimal(str(lot["quantity"])) <= 0:
+                lots.pop(0)
+        if remaining > 0 and in_period:
+            position = positions_by_symbol.get(fill.symbol)
+            broker_cost_basis = _broker_reconciliation_cost_basis(
+                position=position,
+                sold_at=filled_at,
+                next_buy_after_sell=next_buy_after_sell,
+            )
+            if broker_cost_basis is not None:
+                closed.append(
+                    _closed_trade_row(
+                        fill=fill,
+                        quantity=remaining,
+                        buy_price=broker_cost_basis,
+                        cost_basis_source="broker_reconciliation",
+                        cost_basis_observed_at=position.last_reconciled_at if position is not None else None,
+                    )
+                )
+            else:
+                closed.append(
+                    _closed_trade_row(
+                        fill=fill,
+                        quantity=remaining,
+                        buy_price=None,
+                        cost_basis_source="unknown",
+                        cost_basis_observed_at=None,
+                    )
+                )
+    return closed, truncated
+
+
+def _broker_reconciliation_cost_basis(
+    *,
+    position: ExecutionPosition | None,
+    sold_at: datetime,
+    next_buy_after_sell: datetime | None,
+) -> Decimal | None:
+    if (
+        position is not None
+        and position.average_price is not None
+        and position.average_price > 0
+        and position.last_reconciled_at is not None
+        and "reconciliation" in str(position.updated_from or "")
+        and _position_quantity(position) <= 0
+    ):
+        reconciled_at = _normalize_utc(position.last_reconciled_at)
+        sold_at = _normalize_utc(sold_at)
+        if reconciled_at >= sold_at and (next_buy_after_sell is None or reconciled_at < next_buy_after_sell):
+            return Decimal(position.average_price)
+    return None
+
+
+def _next_buy_after(
+    *,
+    fills: Sequence[ExecutionFill],
+    symbol: str,
+    after: datetime,
+) -> datetime | None:
+    later_buys = [
+        _normalize_utc(fill.filled_at)
+        for fill in fills
+        if fill.symbol == symbol
+        and str(fill.side or "").lower() == "buy"
+        and _normalize_utc(fill.filled_at) > after
+    ]
+    return min(later_buys) if later_buys else None
+
+
+def _closed_trade_row(
+    *,
+    fill: ExecutionFill,
+    quantity: Decimal,
+    buy_price: Decimal | None,
+    cost_basis_source: str,
+    cost_basis_observed_at: object,
+) -> dict[str, object]:
+    sell_price = Decimal(fill.price)
+    pnl = ((sell_price - buy_price) * quantity).quantize(Decimal("0.0001")) if buy_price is not None else None
+    return {
+        "symbol": fill.symbol,
+        "sell_fill_id": fill.id,
+        "sell_broker_order_pk": fill.broker_order_pk,
+        "sell_filled_at": _normalize_utc(fill.filled_at),
+        "quantity": _quantity_value(quantity),
+        "sell_price": sell_price,
+        "cost_basis_price": buy_price,
+        "cost_basis_source": cost_basis_source,
+        "cost_basis_observed_at": cost_basis_observed_at,
+        "realized_pnl": pnl,
+    }
+
+
+def _stale_fifo_inventory_alerts(
+    *,
+    db: Session,
+    mode: str,
+    end_at: datetime,
+    max_rows: int,
+) -> tuple[list[dict[str, object]], bool]:
+    newest_fills = db.scalars(
+        select(ExecutionFill)
+        .join(BrokerOrder, ExecutionFill.broker_order_pk == BrokerOrder.id)
+        .where(
+            BrokerOrder.mode == mode,
+            ExecutionFill.filled_at < end_at,
+        )
+        .order_by(ExecutionFill.filled_at.desc(), ExecutionFill.id.desc())
+        .limit(max_rows + 1)
+    ).all()
+    truncated = len(newest_fills) > max_rows
+    fills = list(reversed(newest_fills[:max_rows]))
+    quantities: dict[str, Decimal] = {}
+    for fill in fills:
+        quantity = _fill_quantity(fill)
+        if str(fill.side or "").lower() == "buy":
+            quantities[fill.symbol] = quantities.get(fill.symbol, Decimal("0")) + quantity
+        elif str(fill.side or "").lower() == "sell":
+            quantities[fill.symbol] = quantities.get(fill.symbol, Decimal("0")) - quantity
+    candidate_symbols = {symbol for symbol, quantity in quantities.items() if quantity > 0}
+    positions_by_symbol = _positions_by_symbol(db=db, mode=mode, symbols=candidate_symbols)
+    alerts: list[dict[str, object]] = []
+    for symbol in sorted(candidate_symbols):
+        position = positions_by_symbol.get(symbol)
+        if position is None or position.last_reconciled_at is None:
+            continue
+        broker_quantity = _position_quantity(position)
+        if broker_quantity > 0:
+            continue
+        alerts.append(
+            {
+                "kind": "stale_fill_fifo_inventory_flat_broker_position",
+                "symbol": symbol,
+                "fifo_open_quantity": _quantity_value(quantities[symbol]),
+                "broker_position_quantity": _quantity_value(broker_quantity),
+                "position_last_reconciled_at": position.last_reconciled_at,
+                "message": "fill FIFO leaves open quantity but latest broker reconciliation reports flat",
+            }
+        )
+    return alerts, truncated
+
+
+def _positions_by_symbol(
+    *,
+    db: Session,
+    mode: str,
+    symbols: set[str],
+) -> dict[str, ExecutionPosition]:
+    if not symbols:
+        return {}
+    return {
+        position.symbol: position
+        for position in db.scalars(
+            select(ExecutionPosition).where(
+                ExecutionPosition.mode == mode,
+                ExecutionPosition.symbol.in_(sorted(symbols)),
+            )
+        ).all()
+    }
+
+
+def _fill_quantity(fill: ExecutionFill) -> Decimal:
+    if fill.base_quantity is not None and fill.base_quantity > 0:
+        return Decimal(fill.base_quantity)
+    return Decimal(fill.quantity)
+
+
+def _position_quantity(position: ExecutionPosition) -> Decimal:
+    if position.base_quantity is not None:
+        return Decimal(position.base_quantity)
+    return Decimal(position.quantity)
+
+
+def _quantity_value(value: Decimal) -> int | str:
+    if value == value.to_integral_value():
+        return int(value)
+    return str(value.normalize())
+
+
 def _monitoring_protective_stop_actionability(
     *,
     db: Session,
@@ -758,6 +1080,17 @@ def main() -> None:
     parser.add_argument("--database-url", default=None)
     parser.add_argument("--include-json-payloads", action="store_true")
     parser.add_argument("--max-range-days", type=int, default=14)
+    parser.add_argument(
+        "--timeout-seconds",
+        type=float,
+        default=30.0,
+        help="Fail with a specific timeout once query-step progress exceeds this deadline.",
+    )
+    parser.add_argument(
+        "--progress",
+        action="store_true",
+        help="Write JSON progress events to stderr as each bounded query step completes.",
+    )
     args = parser.parse_args()
 
     settings_kwargs: dict[str, object] = {}
@@ -787,15 +1120,32 @@ def main() -> None:
     session_factory = create_session_factory(engine)
     try:
         with session_factory() as db:
-            report = generate_weekly_trade_review(
-                settings=settings,
-                db=db,
-                start_at=_parse_datetime(args.start_at),
-                end_at=_parse_datetime(args.end_at),
-                output_dir=args.output_dir,
-                include_json_payloads=args.include_json_payloads,
-                max_range_days=args.max_range_days,
-            )
+            try:
+                report = generate_weekly_trade_review(
+                    settings=settings,
+                    db=db,
+                    start_at=_parse_datetime(args.start_at),
+                    end_at=_parse_datetime(args.end_at),
+                    output_dir=args.output_dir,
+                    include_json_payloads=args.include_json_payloads,
+                    max_range_days=args.max_range_days,
+                    timeout_seconds=args.timeout_seconds,
+                    progress_callback=_stderr_progress if args.progress else None,
+                )
+            except WeeklyTradeReviewTimeoutError as exc:
+                print(
+                    json.dumps(
+                        {
+                            "status": "timeout",
+                            "error": str(exc),
+                            "timeout_seconds": args.timeout_seconds,
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                    file=sys.stderr,
+                )
+                raise SystemExit(124) from exc
         print(
             json.dumps(
                 {
@@ -810,6 +1160,10 @@ def main() -> None:
         )
     finally:
         engine.dispose()
+
+
+def _stderr_progress(event: dict[str, object]) -> None:
+    print(json.dumps({"status": "progress", **event}, ensure_ascii=False, sort_keys=True), file=sys.stderr)
 
 
 if __name__ == "__main__":
