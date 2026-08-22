@@ -41,6 +41,7 @@ PLAN_ITEM_STATUSES = frozenset(
         "crypto_paper_retry_pending",
         "crypto_paper_rejected",
         "expired",
+        "exec_agent_rejected",
         "filled",
         "new_buy_blocked",
         "open",

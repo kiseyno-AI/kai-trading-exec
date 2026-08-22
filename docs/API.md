@@ -84,6 +84,8 @@ does not create trading decisions.
   - `last_cycle`
 - `counts.open_orders`
 - `counts.active_execution_jobs`
+- `watch_buy_vetoes.today_count`
+- `watch_buy_vetoes.today_symbols[]`
 - `symbols.monitored`
 - `symbols.scheduled_today`
 - `symbols.filled_today`
@@ -125,6 +127,9 @@ Current response includes:
   - `open_order_symbol_count`
   - `filled_symbol_count`
   - `position_symbol_count`
+- `watch_buy_vetoes`
+  - `today_count`
+  - `today_symbols[]`
 - `symbols[]`
   - `symbol`
   - `mode`
