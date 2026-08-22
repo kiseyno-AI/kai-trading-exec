@@ -6405,20 +6405,23 @@ def _live_watch_buy_submission_veto(
     )
     reasons: list[str] = []
     if market_guardrail.reason_code == "market_breadth_risk_off":
-        reasons.append("market_breadth_risk_off")
+        if _live_watch_buy_market_regime_downsize_veto_applies(settings=settings, action=market_guardrail.action):
+            reasons.append("market_breadth_risk_off")
     elif (
         market_guardrail.reason_code.startswith("market_breadth_stale")
         or "market_breadth_stale" in market_guardrail.audit.get("warnings", [])
     ):
-        if _live_watch_buy_breadth_override(item=item) is None:
+        if (
+            not settings.watch_buy_live_market_regime_downsize_allowed
+            and _live_watch_buy_breadth_override(item=item) is None
+        ):
             reasons.append("market_breadth_stale")
     elif market_guardrail.posture == "risk_off":
-        reasons.append(market_guardrail.reason_code or "market_breadth_risk_off")
-    elif (
-        market_guardrail.action == "downsize"
-        and not settings.watch_buy_live_market_regime_downsize_allowed
-        and _live_watch_buy_breadth_override(item=item) is None
-        and market_guardrail.reason_code in {"market_breadth_stale_caution", "market_breadth_stale_risk_off"}
+        if _live_watch_buy_market_regime_downsize_veto_applies(settings=settings, action=market_guardrail.action):
+            reasons.append(market_guardrail.reason_code or "market_breadth_risk_off")
+    elif _live_watch_buy_market_regime_downsize_veto_applies(
+        settings=settings,
+        action=market_guardrail.action,
     ):
         reasons.append(market_guardrail.reason_code)
 
@@ -6500,6 +6503,16 @@ def _live_watch_buy_trigger_quality(*, price: MonitoringPriceRequest | None) -> 
         "day_high": price.day_high,
         "day_low": price.day_low,
     }
+
+
+def _live_watch_buy_market_regime_downsize_veto_applies(
+    *,
+    settings: Settings,
+    action: str,
+) -> bool:
+    if settings.watch_buy_live_market_regime_downsize_allowed:
+        return False
+    return action in {"downsize", "caution"}
 
 
 def _live_watch_buy_breadth_override(*, item: ExecutionPlanItem) -> dict[str, object] | None:

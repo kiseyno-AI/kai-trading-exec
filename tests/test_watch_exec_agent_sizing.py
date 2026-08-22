@@ -287,6 +287,77 @@ def test_live_watch_buy_stale_breadth_fails_closed_without_override() -> None:
     assert payload["override"] is None
 
 
+def test_live_watch_buy_downsize_flag_false_blocks_market_guardrail_downsize_reasons() -> None:
+    stale_breadth = _fresh_breadth(
+        market_date="2026-08-17",
+        observed_at="2026-08-17T01:00:00+00:00",
+    )
+    cases = [
+        (
+            "market_breadth_risk_off",
+            {"market_breadth": _fresh_breadth(up_ratio="0.20", advance_decline_ratio="0.45")},
+            "market_breadth_risk_off",
+        ),
+        (
+            "market_breadth_caution",
+            {"market_breadth": _fresh_breadth(up_ratio="0.42", advance_decline_ratio="1.10")},
+            "market_breadth_caution",
+        ),
+        (
+            "market_breadth_below_normal",
+            {"market_breadth": _fresh_breadth(up_ratio="0.48", advance_decline_ratio="1.20")},
+            "market_breadth_below_normal",
+        ),
+        (
+            "market_breadth_missing_caution",
+            {},
+            "market_breadth_missing_caution",
+        ),
+        (
+            "market_breadth_stale_caution",
+            {"market_breadth": stale_breadth},
+            "market_breadth_stale",
+        ),
+    ]
+
+    for expected_reason_code, risk_context, expected_approval_reason in cases:
+        approval, _, payload = _resolve_live_watch_veto(
+            settings=_watch_veto_settings(watch_buy_live_market_regime_downsize_allowed=False),
+            risk_context=risk_context,
+            price=_price(),
+        )
+
+        assert approval.quantity is None, expected_reason_code
+        assert approval.reason == expected_approval_reason
+        assert payload is not None
+        assert payload["market_regime_reason_code"] == expected_reason_code
+        assert payload["market_regime_action"] == "downsize"
+
+
+def test_live_watch_buy_downsize_flag_true_permits_market_guardrail_downsizing_including_stale() -> None:
+    stale_breadth = _fresh_breadth(
+        market_date="2026-08-17",
+        observed_at="2026-08-17T01:00:00+00:00",
+    )
+    contexts = [
+        {"market_breadth": _fresh_breadth(up_ratio="0.20", advance_decline_ratio="0.45")},
+        {"market_breadth": _fresh_breadth(up_ratio="0.42", advance_decline_ratio="1.10")},
+        {"market_breadth": _fresh_breadth(up_ratio="0.48", advance_decline_ratio="1.20")},
+        {},
+        {"market_breadth": stale_breadth},
+    ]
+
+    for risk_context in contexts:
+        approval, _, payload = _resolve_live_watch_veto(
+            settings=_watch_veto_settings(watch_buy_live_market_regime_downsize_allowed=True),
+            risk_context=risk_context,
+            price=_price(),
+        )
+
+        assert approval.quantity is not None
+        assert payload is None
+
+
 def test_live_watch_buy_vetoes_zero_volume_and_turnover() -> None:
     approval, _, payload = _resolve_live_watch_veto(
         settings=_watch_veto_settings(),
