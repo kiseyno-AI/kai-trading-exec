@@ -848,7 +848,10 @@ class AutonomousRuntimeCoordinator:
             if _is_regular_market_session(
                 now=now,
                 market_timezone=self.settings.market_timezone,
-            ) and not self._broker_positions_reconciled_on_market_date(now):
+            ) and (
+                self._monitoring_state.last_success_at is not None
+                and not self._broker_positions_reconciled_on_market_date(now)
+            ):
                 await asyncio.to_thread(
                     self._reconcile_and_refresh_monitoring_snapshot_if_due,
                     now,
