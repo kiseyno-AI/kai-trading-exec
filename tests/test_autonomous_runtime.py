@@ -421,7 +421,6 @@ def test_live_cycle_monitors_local_holdings_without_waiting_for_broker_discovery
         lambda settings: [],
     )
     monkeypatch.setattr(coordinator, "_load_local_desired_monitoring_symbols", load_local_symbols)
-    monkeypatch.setattr(coordinator, "_load_local_position_symbols", load_local_symbols)
     monkeypatch.setattr(coordinator, "_reconcile_monitoring_orders_if_due", lambda **kwargs: None)
     monkeypatch.setattr(
         coordinator,
