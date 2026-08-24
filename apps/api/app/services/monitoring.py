@@ -5571,8 +5571,12 @@ def _sync_positions_for_monitoring_routes(
         )
         return
 
+    discovered_exchanges: set[str] = set()
     if discover_us_holdings:
-        for exchange in sorted(("NASD", "NYSE", "AMEX")):
+        # A plan-independent protection pass must discover KRX holdings too;
+        # otherwise a position absent from Exec's local DB cannot enter the
+        # monitoring universe until some unrelated plan mentions its symbol.
+        for exchange in sorted(("KRX", "NASD", "NYSE", "AMEX")):
             sync_execution_positions_from_broker_snapshot(
                 settings=settings,
                 db=db,
@@ -5581,6 +5585,7 @@ def _sync_positions_for_monitoring_routes(
                 exchange=exchange,
                 discover_holdings_only=True,
             )
+            discovered_exchanges.add(exchange)
 
     tracked_symbols = set(symbols or ())
     if not tracked_symbols:
@@ -5648,6 +5653,8 @@ def _sync_positions_for_monitoring_routes(
         symbols_by_exchange.setdefault(exchange, set()).add(symbol)
 
     for exchange, routed_symbols in sorted(symbols_by_exchange.items()):
+        if exchange in discovered_exchanges:
+            continue
         sync_execution_positions_from_broker_snapshot(
             settings=settings,
             db=db,
