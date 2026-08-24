@@ -393,7 +393,7 @@ def test_cached_cycle_repairs_held_position_monitors_with_desired_symbols(monkey
     assert maintenance_calls == ["called"]
 
 
-def test_live_cycle_reconciles_broker_holdings_before_selecting_monitoring_symbols(
+def test_live_cycle_monitors_local_holdings_without_waiting_for_broker_discovery(
     monkeypatch,
 ) -> None:
     settings = Settings(database_url="sqlite:///:memory:", runtime_mode="live")
@@ -403,7 +403,6 @@ def test_live_cycle_reconciles_broker_holdings_before_selecting_monitoring_symbo
         broker_adapter_factory=lambda settings: None,  # type: ignore[arg-type,return-value]
     )
     started_at = datetime(2026, 8, 24, 0, 0, tzinfo=UTC)
-    broker_truth_refreshed = False
     snapshot = MonitoringRuntimeSnapshot(
         loaded_at=started_at,
         symbols=["005930"],
@@ -414,20 +413,9 @@ def test_live_cycle_reconciles_broker_holdings_before_selecting_monitoring_symbo
         filled_today_symbols=[],
     )
 
-    def reconcile_before_selection(now: datetime) -> None:
-        nonlocal broker_truth_refreshed
-        assert now == started_at
-        broker_truth_refreshed = True
-
     def load_local_symbols() -> list[str]:
-        assert broker_truth_refreshed is True
         return ["005930"]
 
-    monkeypatch.setattr(
-        coordinator,
-        "_reconcile_and_refresh_monitoring_snapshot_if_due",
-        reconcile_before_selection,
-    )
     monkeypatch.setattr(
         "app.services.autonomous_runtime._load_core_desired_monitoring_symbols",
         lambda settings: [],
@@ -458,7 +446,6 @@ def test_live_cycle_reconciles_broker_holdings_before_selecting_monitoring_symbo
 
     payload = coordinator._monitoring_cycle_sync(started_at)
 
-    assert broker_truth_refreshed is True
     assert payload["monitored_symbols"] == ["005930"]
     assert payload["runtime_snapshot"]["position_count"] == 1
 

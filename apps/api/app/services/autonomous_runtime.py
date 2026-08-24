@@ -149,6 +149,7 @@ class AutonomousRuntimeCoordinator:
     monitoring_price_source: object | None = None
     _dispatch_task: asyncio.Task[None] | None = field(default=None, init=False)
     _monitoring_task: asyncio.Task[None] | None = field(default=None, init=False)
+    _daily_krx_position_discovery_task: asyncio.Task[None] | None = field(default=None, init=False)
     _watch_exec_agent_sizing_task: asyncio.Task[None] | None = field(default=None, init=False)
     _nxt_eligible_sync_task: asyncio.Task[None] | None = field(default=None, init=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False)
@@ -217,6 +218,10 @@ class AutonomousRuntimeCoordinator:
                 run_immediately=regular_market_session,
             )
         )
+        if self.settings.runtime_mode == "live":
+            self._daily_krx_position_discovery_task = asyncio.create_task(
+                self._run_daily_krx_position_discovery_loop()
+            )
         if self.settings.exec_agent_watch_sizing_enabled:
             self._watch_exec_agent_sizing_task = asyncio.create_task(
                 self._run_periodic_loop(
@@ -241,6 +246,7 @@ class AutonomousRuntimeCoordinator:
             for task in (
                 self._dispatch_task,
                 self._monitoring_task,
+                self._daily_krx_position_discovery_task,
                 self._watch_exec_agent_sizing_task,
                 self._nxt_eligible_sync_task,
             )
@@ -499,12 +505,6 @@ class AutonomousRuntimeCoordinator:
         return payload
 
     def _monitoring_cycle_sync(self, started_at: datetime) -> dict[str, object]:
-        # Broker holdings are the source of truth for protective sell monitoring.
-        # Refresh them before building the symbol universe so a missing/stale
-        # daily Core plan can never hide an already-held position from the
-        # autonomous monitoring loop. Watch-buy symbols remain additive below.
-        if self.settings.runtime_mode == "live":
-            self._reconcile_and_refresh_monitoring_snapshot_if_due(started_at)
         core_desired_symbols = _load_core_desired_monitoring_symbols(settings=self.settings)
         local_desired_symbols = self._load_local_desired_monitoring_symbols()
         desired_symbols = _merge_symbol_priority(local_desired_symbols, core_desired_symbols)
@@ -841,6 +841,28 @@ class AutonomousRuntimeCoordinator:
             reason="periodic_broker_truth_refresh",
             reconcile_broker=True,
         )
+
+    async def _run_daily_krx_position_discovery_loop(self) -> None:
+        while True:
+            now = datetime.now(UTC)
+            if _is_regular_market_session(
+                now=now,
+                market_timezone=self.settings.market_timezone,
+            ) and not self._broker_positions_reconciled_on_market_date(now):
+                await asyncio.to_thread(
+                    self._reconcile_and_refresh_monitoring_snapshot_if_due,
+                    now,
+                )
+            await asyncio.sleep(30)
+
+    def _broker_positions_reconciled_on_market_date(self, now: datetime) -> bool:
+        reconciled_at = self._monitoring_snapshot_last_reconciled_at
+        if reconciled_at is None:
+            return False
+        market_timezone = ZoneInfo(self.settings.market_timezone)
+        return reconciled_at.astimezone(market_timezone).date() == now.astimezone(
+            market_timezone
+        ).date()
 
     def _refresh_monitoring_snapshot_filled_today(self, now: datetime) -> None:
         with self._lock:
