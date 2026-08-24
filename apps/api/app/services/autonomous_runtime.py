@@ -202,14 +202,6 @@ class AutonomousRuntimeCoordinator:
             now=datetime.now(UTC),
             market_timezone=self.settings.market_timezone,
         )
-        if regular_market_session and self.settings.runtime_mode == "live":
-            # Complete broker-truth discovery before the background loop is
-            # exposed. This avoids a startup window where daily-plan buys are
-            # monitored while held-position sells are still unknown locally.
-            await asyncio.to_thread(
-                self._reconcile_and_refresh_monitoring_snapshot_if_due,
-                datetime.now(UTC),
-            )
         self._dispatch_task = asyncio.create_task(
             self._run_periodic_loop(
                 worker_key="dispatch",
@@ -812,7 +804,7 @@ class AutonomousRuntimeCoordinator:
                         db=db,
                         adapter=adapter,
                         symbols=None,
-                        discover_us_holdings=True,
+                        discover_krx_holdings=True,
                     )
                     db.commit()
                 except Exception:
