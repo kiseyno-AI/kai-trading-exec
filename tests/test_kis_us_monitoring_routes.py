@@ -91,7 +91,7 @@ def test_kis_monitoring_position_sync_fails_closed_without_us_exchange(monkeypat
     engine.dispose()
 
 
-def test_kis_monitoring_position_discovery_queries_krx_and_supported_us_exchanges(
+def test_kis_monitoring_position_discovery_queries_supported_us_exchanges(
     monkeypatch,
 ) -> None:
     settings, engine, db = _session()
@@ -118,10 +118,37 @@ def test_kis_monitoring_position_discovery_queries_krx_and_supported_us_exchange
 
     assert calls == [
         ("AMEX", None, True),
-        ("KRX", None, True),
         ("NASD", None, True),
         ("NYSE", None, True),
     ]
+    db.close()
+    engine.dispose()
+
+
+def test_kis_monitoring_position_discovery_can_scope_to_krx(monkeypatch) -> None:
+    settings, engine, db = _session()
+    calls: list[tuple[str, set[str] | None, bool]] = []
+
+    def fake_sync(**kwargs):
+        calls.append(
+            (
+                kwargs["exchange"],
+                kwargs["symbols"],
+                kwargs.get("discover_holdings_only", False),
+            )
+        )
+
+    monkeypatch.setattr(monitoring, "sync_execution_positions_from_broker_snapshot", fake_sync)
+
+    monitoring._sync_positions_for_monitoring_routes(
+        settings=settings,
+        db=db,
+        adapter=type("Adapter", (), {"provider": "kis"})(),
+        symbols=None,
+        discover_krx_holdings=True,
+    )
+
+    assert calls == [("KRX", None, True)]
     db.close()
     engine.dispose()
 

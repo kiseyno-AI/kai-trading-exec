@@ -5561,6 +5561,7 @@ def _sync_positions_for_monitoring_routes(
     adapter: BrokerAdapter,
     symbols: set[str] | None,
     discover_us_holdings: bool = False,
+    discover_krx_holdings: bool = False,
 ) -> None:
     if str(getattr(adapter, "provider", "")).strip().lower() != "kis":
         sync_execution_positions_from_broker_snapshot(
@@ -5572,11 +5573,13 @@ def _sync_positions_for_monitoring_routes(
         return
 
     discovered_exchanges: set[str] = set()
+    discovery_exchanges = set()
+    if discover_krx_holdings:
+        discovery_exchanges.add("KRX")
     if discover_us_holdings:
-        # A plan-independent protection pass must discover KRX holdings too;
-        # otherwise a position absent from Exec's local DB cannot enter the
-        # monitoring universe until some unrelated plan mentions its symbol.
-        for exchange in sorted(("KRX", "NASD", "NYSE", "AMEX")):
+        discovery_exchanges.update(("NASD", "NYSE", "AMEX"))
+    if discovery_exchanges:
+        for exchange in sorted(discovery_exchanges):
             sync_execution_positions_from_broker_snapshot(
                 settings=settings,
                 db=db,

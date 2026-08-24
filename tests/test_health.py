@@ -3651,9 +3651,9 @@ def test_live_desired_symbol_reconcile_syncs_positions_and_filled_today(tmp_path
     assert broker.reconcile_calls == [
         ("fast-path-buy-1", "KRX", (started_at - timedelta(minutes=1)).replace(tzinfo=None))
     ]
-    # Startup broker-truth discovery covers KRX plus the three supported US
-    # exchanges before the symbol-scoped order reconciliation refresh.
-    assert broker.account_snapshot_calls == 5
+    # KRX holdings discovery runs before the symbol-scoped order reconciliation
+    # refresh, without serially querying unrelated overseas exchanges.
+    assert broker.account_snapshot_calls == 2
     assert price_source.calls == [["002380"]]
     assert payload["cached_evaluation"] is True
     assert payload["evaluated_item_count"] == 3
