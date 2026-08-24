@@ -508,6 +508,13 @@ class AutonomousRuntimeCoordinator:
         core_desired_symbols = _load_core_desired_monitoring_symbols(settings=self.settings)
         local_desired_symbols = self._load_local_desired_monitoring_symbols()
         desired_symbols = _merge_symbol_priority(local_desired_symbols, core_desired_symbols)
+        if (
+            self.settings.runtime_mode == "live"
+            and not self._broker_positions_reconciled_on_market_date(started_at)
+        ):
+            held_symbols = self._load_local_position_symbols()
+            desired_symbols = held_symbols
+            local_desired_symbols = held_symbols
         if desired_symbols:
             configured_limit = int(self.settings.monitoring_max_symbols_per_cycle or 0)
             effective_limit = (
@@ -1183,6 +1190,24 @@ class AutonomousRuntimeCoordinator:
             )
             return []
         return [str(row[0]).strip() for row in rows if str(row[0] or "").strip()]
+
+    def _load_local_position_symbols(self) -> list[str]:
+        sqlite_symbols = self._load_local_position_symbols_from_sqlite()
+        if sqlite_symbols:
+            return sqlite_symbols
+        with self.session_factory() as db:
+            return [
+                str(symbol)
+                for symbol in db.scalars(
+                    select(ExecutionPosition.symbol)
+                    .where(
+                        ExecutionPosition.mode == self.settings.runtime_mode,
+                        ExecutionPosition.quantity > 0,
+                    )
+                    .order_by(ExecutionPosition.symbol.asc())
+                ).all()
+                if str(symbol).strip()
+            ]
 
     def _load_local_desired_monitoring_symbols(self) -> list[str]:
         sqlite_symbols = self._load_local_desired_monitoring_symbols_from_sqlite()
