@@ -91,7 +91,7 @@ def test_kis_monitoring_position_sync_fails_closed_without_us_exchange(monkeypat
     engine.dispose()
 
 
-def test_kis_monitoring_position_discovery_queries_supported_us_exchanges_without_krx(
+def test_kis_monitoring_position_discovery_queries_krx_and_supported_us_exchanges(
     monkeypatch,
 ) -> None:
     settings, engine, db = _session()
@@ -118,10 +118,10 @@ def test_kis_monitoring_position_discovery_queries_supported_us_exchanges_withou
 
     assert calls == [
         ("AMEX", None, True),
+        ("KRX", None, True),
         ("NASD", None, True),
         ("NYSE", None, True),
     ]
-    assert all(exchange != "KRX" for exchange, _symbols, _discover in calls)
     db.close()
     engine.dispose()
 

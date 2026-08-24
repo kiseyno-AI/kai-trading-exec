@@ -198,6 +198,18 @@ class AutonomousRuntimeCoordinator:
     async def start(self) -> None:
         if not self.settings.autonomous_runtime_enabled:
             return
+        regular_market_session = _is_regular_market_session(
+            now=datetime.now(UTC),
+            market_timezone=self.settings.market_timezone,
+        )
+        if regular_market_session and self.settings.runtime_mode == "live":
+            # Complete broker-truth discovery before the background loop is
+            # exposed. This avoids a startup window where daily-plan buys are
+            # monitored while held-position sells are still unknown locally.
+            await asyncio.to_thread(
+                self._reconcile_and_refresh_monitoring_snapshot_if_due,
+                datetime.now(UTC),
+            )
         self._dispatch_task = asyncio.create_task(
             self._run_periodic_loop(
                 worker_key="dispatch",
@@ -210,10 +222,7 @@ class AutonomousRuntimeCoordinator:
                 worker_key="monitoring",
                 interval_seconds=self.settings.monitoring_loop_interval_seconds,
                 cycle=self._run_monitoring_cycle,
-                run_immediately=_is_regular_market_session(
-                    now=datetime.now(UTC),
-                    market_timezone=self.settings.market_timezone,
-                ),
+                run_immediately=regular_market_session,
             )
         )
         if self.settings.exec_agent_watch_sizing_enabled:
@@ -498,6 +507,12 @@ class AutonomousRuntimeCoordinator:
         return payload
 
     def _monitoring_cycle_sync(self, started_at: datetime) -> dict[str, object]:
+        # Broker holdings are the source of truth for protective sell monitoring.
+        # Refresh them before building the symbol universe so a missing/stale
+        # daily Core plan can never hide an already-held position from the
+        # autonomous monitoring loop. Watch-buy symbols remain additive below.
+        if self.settings.runtime_mode == "live":
+            self._reconcile_and_refresh_monitoring_snapshot_if_due(started_at)
         core_desired_symbols = _load_core_desired_monitoring_symbols(settings=self.settings)
         local_desired_symbols = self._load_local_desired_monitoring_symbols()
         desired_symbols = _merge_symbol_priority(local_desired_symbols, core_desired_symbols)
@@ -808,7 +823,7 @@ class AutonomousRuntimeCoordinator:
         snapshot = self._load_monitoring_runtime_snapshot(loaded_at)
         with self._lock:
             self._monitoring_runtime_snapshot = snapshot
-            if reconcile_broker or self._monitoring_snapshot_last_reconciled_at is None:
+            if reconcile_broker:
                 self._monitoring_snapshot_last_reconciled_at = loaded_at
         LOGGER.info(
             "monitoring_runtime_snapshot_refreshed",
