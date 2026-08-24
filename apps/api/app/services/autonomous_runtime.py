@@ -523,10 +523,11 @@ class AutonomousRuntimeCoordinator:
                 else len(desired_symbols)
             )
             symbols = desired_symbols[:effective_limit]
-            self._reconcile_monitoring_orders_if_due(
-                now=started_at,
-                symbols=set(symbols),
-            )
+            if self._monitoring_state.last_success_at is not None:
+                self._reconcile_monitoring_orders_if_due(
+                    now=started_at,
+                    symbols=set(symbols),
+                )
             if self.settings.monitoring_max_broker_actions_per_cycle <= 0:
                 prices = self._load_monitoring_prices(
                     symbols=symbols,
