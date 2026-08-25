@@ -30,6 +30,7 @@ def create_db_engine(settings: Settings) -> Engine:
     _configure_pool_diagnostics(engine, settings=settings)
     if url.drivername.startswith("sqlite"):
         _configure_sqlite_engine(engine, settings=settings)
+        _initialize_sqlite_journal_mode(engine, database=url.database)
     return engine
 
 
@@ -123,7 +124,6 @@ def _configure_sqlite_engine(engine: Engine, *, settings: Settings) -> None:
         cursor = dbapi_connection.cursor()
         try:
             cursor.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
-            cursor.execute("PRAGMA journal_mode=WAL")
             cursor.execute(f"PRAGMA wal_autocheckpoint={wal_autocheckpoint_pages}")
             cursor.execute("PRAGMA synchronous=NORMAL")
             cursor.execute("PRAGMA foreign_keys=ON")
@@ -136,6 +136,28 @@ def _configure_sqlite_engine(engine: Engine, *, settings: Settings) -> None:
         message = str(original)
         if "database is locked" in message.lower():
             record_sqlite_lock_error(message)
+
+
+def _initialize_sqlite_journal_mode(engine: Engine, *, database: str | None) -> None:
+    """Enable WAL once during engine startup, never on pooled connection churn.
+
+    ``PRAGMA journal_mode=WAL`` needs a database write lock even when WAL is
+    already the desired mode. Running it from the ``connect`` event therefore
+    made an unrelated new pooled connection fail whenever another worker held
+    a write transaction. WAL is persistent for file-backed SQLite databases,
+    so it belongs in startup initialization rather than the per-connection
+    pragma hook.
+    """
+    if not database or database == ":memory:":
+        return
+    with engine.connect() as connection:
+        current_mode = connection.exec_driver_sql("PRAGMA journal_mode").scalar_one()
+        if str(current_mode).lower() != "wal":
+            configured_mode = connection.exec_driver_sql("PRAGMA journal_mode=WAL").scalar_one()
+            if str(configured_mode).lower() != "wal":
+                raise RuntimeError(
+                    f"failed to enable SQLite WAL journal mode: {configured_mode}"
+                )
 
 
 def create_session_factory(engine: Engine) -> sessionmaker[Session]:

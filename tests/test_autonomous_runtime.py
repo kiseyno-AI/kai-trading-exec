@@ -13,7 +13,34 @@ from app.services.autonomous_runtime import (
     AutonomousRuntimeCoordinator,
     CachedMonitoringPosition,
     MonitoringRuntimeSnapshot,
+    _is_krx_symbol,
+    _select_monitoring_symbol_batch,
 )
+
+
+def test_krx_symbol_filter_excludes_alpaca_symbols() -> None:
+    assert _is_krx_symbol("005930") is True
+    assert _is_krx_symbol("AFIB") is False
+    assert _is_krx_symbol("FRTX/CVR1") is False
+
+
+def test_monitoring_symbol_batches_keep_positions_and_rotate_all_candidates() -> None:
+    desired = ["030000", "001450", "002990", "003300", "003550", "003650", "005830"]
+    cursor = 0
+    covered: set[str] = set()
+
+    for _ in range(2):
+        batch, cursor = _select_monitoring_symbol_batch(
+            desired_symbols=desired,
+            priority_symbols={"030000"},
+            batch_size=4,
+            cursor=cursor,
+        )
+        assert batch[0] == "030000"
+        assert len(batch) == 4
+        covered.update(batch)
+
+    assert covered == set(desired)
 
 
 def test_monitoring_timeout_does_not_block_next_scheduler_tick() -> None:

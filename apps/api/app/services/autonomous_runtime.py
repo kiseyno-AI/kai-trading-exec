@@ -163,6 +163,7 @@ class AutonomousRuntimeCoordinator:
     _monitoring_order_reconcile_last_at: datetime | None = field(default=None, init=False)
     _monitoring_cycle_mutex: threading.Lock = field(default_factory=threading.Lock, init=False)
     _monitoring_cycle_mutex_started_at: datetime | None = field(default=None, init=False)
+    _monitoring_symbol_cursor: int = field(default=0, init=False)
 
     def __post_init__(self) -> None:
         self._dispatch_state = AutonomousWorkerState(
@@ -507,15 +508,23 @@ class AutonomousRuntimeCoordinator:
     def _monitoring_cycle_sync(self, started_at: datetime) -> dict[str, object]:
         core_desired_symbols = _load_core_desired_monitoring_symbols(settings=self.settings)
         local_desired_symbols = self._load_local_desired_monitoring_symbols()
-        desired_symbols = _merge_symbol_priority(local_desired_symbols, core_desired_symbols)
+        desired_symbols = [
+            symbol
+            for symbol in _merge_symbol_priority(local_desired_symbols, core_desired_symbols)
+            if _is_krx_symbol(symbol)
+        ]
         if desired_symbols:
-            configured_limit = int(self.settings.monitoring_max_symbols_per_cycle or 0)
-            effective_limit = (
-                max(configured_limit, len(local_desired_symbols))
-                if configured_limit > 0
-                else len(desired_symbols)
+            position_symbols = {
+                symbol
+                for symbol in self._load_local_position_symbols_from_sqlite()
+                if _is_krx_symbol(symbol)
+            }
+            symbols, self._monitoring_symbol_cursor = _select_monitoring_symbol_batch(
+                desired_symbols=desired_symbols,
+                priority_symbols=position_symbols,
+                batch_size=max(int(self.settings.monitoring_max_symbols_per_cycle or 0), 1),
+                cursor=self._monitoring_symbol_cursor,
             )
-            symbols = desired_symbols[:effective_limit]
             if self._monitoring_state.last_success_at is not None:
                 self._reconcile_monitoring_orders_if_due(
                     now=started_at,
@@ -1824,6 +1833,31 @@ def _merge_symbol_priority(*symbol_groups: Iterable[str]) -> list[str]:
             ordered.append(symbol)
             seen.add(symbol)
     return ordered
+
+
+def _is_krx_symbol(symbol: str) -> bool:
+    normalized = str(symbol or "").strip()
+    return len(normalized) == 6 and normalized.isdigit()
+
+
+def _select_monitoring_symbol_batch(
+    *,
+    desired_symbols: list[str],
+    priority_symbols: set[str],
+    batch_size: int,
+    cursor: int,
+) -> tuple[list[str], int]:
+    limit = max(int(batch_size), 1)
+    priority = [symbol for symbol in desired_symbols if symbol in priority_symbols]
+    rotating = [symbol for symbol in desired_symbols if symbol not in priority_symbols]
+    selected = priority[:limit]
+    remaining = limit - len(selected)
+    if remaining <= 0 or not rotating:
+        return selected, cursor % max(len(rotating), 1)
+    start = cursor % len(rotating)
+    take = min(remaining, len(rotating))
+    selected.extend(rotating[(start + offset) % len(rotating)] for offset in range(take))
+    return selected, (start + take) % len(rotating)
 
 
 def _compact_cycle_payload(payload: dict[str, object] | None) -> dict[str, object] | None:
