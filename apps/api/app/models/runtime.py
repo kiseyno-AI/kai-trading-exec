@@ -208,7 +208,7 @@ class ExecutionPlanItem(TimestampMixin, Base):
     symbol: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
     side: Mapped[str] = mapped_column(String(16), nullable=False)
     intent: Mapped[str] = mapped_column(String(64), nullable=False)
-    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    status: Mapped[str] = mapped_column(String(64), nullable=False, default="pending")
     quantity_policy: Mapped[dict[str, Any] | None] = mapped_column(JSON)
     limit_price: Mapped[Decimal | None] = mapped_column(Numeric(18, 4))
     trigger_price: Mapped[Decimal | None] = mapped_column(Numeric(18, 4))
