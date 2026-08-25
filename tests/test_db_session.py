@@ -49,6 +49,35 @@ def test_sqlite_busy_timeout_and_pool_capacity_are_configurable(tmp_path) -> Non
         engine.dispose()
 
 
+def test_sqlite_new_pool_connection_does_not_reapply_wal_under_writer_lock(tmp_path) -> None:
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'writer-lock.db'}",
+        db_pool_size=2,
+        db_max_overflow=0,
+        sqlite_busy_timeout_seconds=1,
+    )
+    engine = create_db_engine(settings)
+    try:
+        with engine.connect() as setup_connection:
+            setup_connection.exec_driver_sql("CREATE TABLE lock_probe (id INTEGER PRIMARY KEY)")
+            setup_connection.commit()
+
+        with engine.connect() as writer_connection:
+            writer_connection.exec_driver_sql("BEGIN IMMEDIATE")
+            writer_connection.exec_driver_sql("INSERT INTO lock_probe (id) VALUES (1)")
+
+            # This forces creation of the pool's second DB-API connection while
+            # the first connection owns SQLite's write lock. Connection setup
+            # must remain read-only and must not execute journal_mode=WAL.
+            with engine.connect() as reader_connection:
+                assert reader_connection.exec_driver_sql("PRAGMA journal_mode").scalar_one() == "wal"
+                assert reader_connection.exec_driver_sql("PRAGMA busy_timeout").scalar_one() == 1000
+
+            writer_connection.rollback()
+    finally:
+        engine.dispose()
+
+
 def test_database_pool_environment_fields_are_loaded() -> None:
     settings = load_settings(
         {
