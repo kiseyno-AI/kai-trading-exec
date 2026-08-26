@@ -16,6 +16,7 @@ from app.services.autonomous_runtime import (
     _is_krx_symbol,
     _select_monitoring_symbol_batch,
 )
+from app.services.monitoring import list_autonomous_monitoring_symbols
 
 
 def test_krx_symbol_filter_excludes_alpaca_symbols() -> None:
@@ -592,5 +593,50 @@ def test_local_position_symbols_fall_back_to_orm_when_sqlite_fast_path_is_unavai
         )
 
         assert coordinator._load_local_position_symbols() == ["030000"]
+    finally:
+        engine.dispose()
+
+
+def test_krx_monitoring_symbols_exclude_us_positions(tmp_path) -> None:
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'krx-market-isolation.db'}",
+        runtime_mode="live",
+        monitoring_max_symbols_per_cycle=6,
+        monitoring_expire_prior_market_watch_buys_enabled=False,
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+
+    try:
+        with session_factory() as session:
+            session.add_all(
+                [
+                    ExecutionPosition(mode="live", symbol="030000", quantity=24),
+                    ExecutionPosition(mode="live", symbol="AFIB", quantity=64),
+                    ExecutionPosition(mode="live", symbol="FRTX/CVR1", quantity=45),
+                    ExecutionPlan(
+                        external_plan_id="krx-market-isolation",
+                        source="kai-trading-core",
+                        market_date=date(2026, 8, 26),
+                        mode="live",
+                        status="accepted",
+                        items=[
+                            ExecutionPlanItem(
+                                plan_item_index=0,
+                                symbol="005930",
+                                side="buy",
+                                intent="intraday_watch_buy",
+                                status="watch_monitoring_active",
+                            )
+                        ],
+                    ),
+                ]
+            )
+            session.commit()
+
+            symbols = list_autonomous_monitoring_symbols(settings=settings, db=session)
+
+        assert symbols == ["030000", "005930"]
     finally:
         engine.dispose()

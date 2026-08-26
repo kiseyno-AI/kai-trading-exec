@@ -580,6 +580,11 @@ def _ordered_symbol_scope(symbols: list[str] | set[str] | None) -> list[str]:
     return ordered
 
 
+def _is_krx_equity_symbol(symbol: object) -> bool:
+    normalized = str(symbol or "").strip()
+    return len(normalized) == 6 and normalized.isdigit()
+
+
 def list_autonomous_monitoring_symbols(
     *,
     settings: Settings,
@@ -598,7 +603,8 @@ def list_autonomous_monitoring_symbols(
             db.commit()
 
     held_symbols = set(
-        db.scalars(
+        symbol
+        for symbol in db.scalars(
             select(ExecutionPosition.symbol)
             .where(
                 ExecutionPosition.mode == settings.runtime_mode,
@@ -606,6 +612,7 @@ def list_autonomous_monitoring_symbols(
             )
             .order_by(ExecutionPosition.symbol.asc())
         ).all()
+        if _is_krx_equity_symbol(symbol)
     )
     mode_plan_ids = select(ExecutionPlan.id).where(ExecutionPlan.mode == settings.runtime_mode)
     fresh_position_truth_after = datetime.now(UTC) - timedelta(
@@ -621,6 +628,8 @@ def list_autonomous_monitoring_symbols(
 
     def append_candidates(rows: list[str], *, enforce_limit: bool = True) -> None:
         for symbol in rows:
+            if not _is_krx_equity_symbol(symbol):
+                continue
             if enforce_limit and len(symbol_candidates) >= symbol_cycle_limit:
                 return
             if symbol and symbol not in symbol_candidates:
