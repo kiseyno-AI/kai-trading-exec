@@ -508,9 +508,10 @@ class AutonomousRuntimeCoordinator:
     def _monitoring_cycle_sync(self, started_at: datetime) -> dict[str, object]:
         core_desired_symbols = _load_core_desired_monitoring_symbols(settings=self.settings)
         local_desired_symbols = self._load_local_desired_monitoring_symbols()
+        monitoring_candidates = local_desired_symbols or core_desired_symbols
         desired_symbols = [
             symbol
-            for symbol in _merge_symbol_priority(local_desired_symbols, core_desired_symbols)
+            for symbol in monitoring_candidates
             if _is_krx_symbol(symbol)
         ]
         if desired_symbols:

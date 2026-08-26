@@ -695,7 +695,10 @@ def list_autonomous_monitoring_symbols(
                     str(symbol),
                 )
             )
-        append_candidates(buy_symbol_rows)
+        # Every persisted active watch item is executable work. Keep the full
+        # bounded set here and let the runtime round-robin scheduler batch it;
+        # truncating to one quote batch starves the remaining active items.
+        append_candidates(buy_symbol_rows, enforce_limit=False)
 
     if len(symbol_candidates) < symbol_cycle_limit:
         pending_sell_symbols = list(
