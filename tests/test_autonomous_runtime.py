@@ -44,6 +44,43 @@ def test_monitoring_symbol_batches_keep_positions_and_rotate_all_candidates() ->
     assert covered == set(desired)
 
 
+def test_monitoring_cycle_does_not_mix_core_universe_into_active_local_work(
+    monkeypatch,
+) -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="live",
+        monitoring_max_symbols_per_cycle=6,
+        monitoring_max_broker_actions_per_cycle=0,
+    )
+    coordinator = AutonomousRuntimeCoordinator(
+        settings=settings,
+        session_factory=None,  # type: ignore[arg-type]
+        broker_adapter_factory=lambda settings: None,  # type: ignore[arg-type,return-value]
+    )
+    requested: list[str] = []
+    monkeypatch.setattr(
+        "app.services.autonomous_runtime._load_core_desired_monitoring_symbols",
+        lambda settings: ["100001", "100002", "100003"],
+    )
+    monkeypatch.setattr(
+        coordinator,
+        "_load_local_desired_monitoring_symbols",
+        lambda: ["005930", "000660"],
+    )
+    monkeypatch.setattr(coordinator, "_load_local_position_symbols", lambda: [])
+    monkeypatch.setattr(
+        coordinator,
+        "_load_monitoring_prices",
+        lambda **kwargs: requested.extend(kwargs["symbols"]) or [],
+    )
+    monkeypatch.setattr(coordinator, "_refresh_monitoring_snapshot_filled_today", lambda now: None)
+
+    coordinator._monitoring_cycle_sync(datetime(2026, 8, 26, 1, 0, tzinfo=UTC))
+
+    assert requested == ["005930", "000660"]
+
+
 def test_monitoring_timeout_does_not_block_next_scheduler_tick() -> None:
     async def scenario() -> None:
         settings = Settings(
