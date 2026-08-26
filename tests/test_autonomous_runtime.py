@@ -8,7 +8,7 @@ from app.api.schemas.execution import MonitoringPriceRequest
 from app.core.config import Settings
 from app.db.base import Base
 from app.db.session import create_db_engine, create_session_factory
-from app.models.runtime import ExecutionPlan, ExecutionPlanItem
+from app.models.runtime import ExecutionPlan, ExecutionPlanItem, ExecutionPosition
 from app.services.autonomous_runtime import (
     AutonomousRuntimeCoordinator,
     CachedMonitoringPosition,
@@ -553,5 +553,44 @@ def test_local_desired_symbols_fall_back_to_orm_when_sqlite_fast_path_is_unavail
         )
 
         assert coordinator._load_local_desired_monitoring_symbols() == ["005930"]
+    finally:
+        engine.dispose()
+
+
+def test_local_position_symbols_fall_back_to_orm_when_sqlite_fast_path_is_unavailable(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'monitoring-position-fallback.db'}",
+        runtime_mode="live",
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    coordinator = AutonomousRuntimeCoordinator(
+        settings=settings,
+        session_factory=session_factory,
+        broker_adapter_factory=lambda settings: None,  # type: ignore[arg-type,return-value]
+    )
+
+    try:
+        with session_factory() as session:
+            session.add_all(
+                [
+                    ExecutionPosition(mode="live", symbol="030000", quantity=24),
+                    ExecutionPosition(mode="live", symbol="005930", quantity=0),
+                    ExecutionPosition(mode="paper", symbol="000660", quantity=3),
+                ]
+            )
+            session.commit()
+
+        monkeypatch.setattr(
+            coordinator,
+            "_load_local_position_symbols_from_sqlite",
+            lambda: [],
+        )
+
+        assert coordinator._load_local_position_symbols() == ["030000"]
     finally:
         engine.dispose()

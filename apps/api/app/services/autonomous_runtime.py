@@ -516,7 +516,7 @@ class AutonomousRuntimeCoordinator:
         if desired_symbols:
             position_symbols = {
                 symbol
-                for symbol in self._load_local_position_symbols_from_sqlite()
+                for symbol in self._load_local_position_symbols()
                 if _is_krx_symbol(symbol)
             }
             symbols, self._monitoring_symbol_cursor = _select_monitoring_symbol_batch(
@@ -1193,6 +1193,21 @@ class AutonomousRuntimeCoordinator:
             )
             return []
         return [str(row[0]).strip() for row in rows if str(row[0] or "").strip()]
+
+    def _load_local_position_symbols(self) -> list[str]:
+        sqlite_symbols = self._load_local_position_symbols_from_sqlite()
+        if sqlite_symbols:
+            return sqlite_symbols
+        if self.session_factory is None:
+            return []
+        with self.session_factory() as db:
+            rows = db.execute(
+                select(ExecutionPosition.symbol).where(
+                    ExecutionPosition.mode == self.settings.runtime_mode,
+                    ExecutionPosition.quantity > 0,
+                ).order_by(ExecutionPosition.symbol.asc())
+            ).scalars()
+            return [str(symbol).strip() for symbol in rows if str(symbol or "").strip()]
 
     def _load_local_desired_monitoring_symbols(self) -> list[str]:
         sqlite_symbols = self._load_local_desired_monitoring_symbols_from_sqlite()
