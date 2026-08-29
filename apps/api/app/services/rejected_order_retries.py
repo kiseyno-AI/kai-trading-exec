@@ -23,6 +23,7 @@ from app.models.runtime import (
     ExecutionFailure,
     ExecutionJob,
     ExecutionPlanItem,
+    ExecutionPlanItemAudit,
     new_id,
 )
 from app.services.broker_auth import ensure_authenticated_broker_session
@@ -217,6 +218,34 @@ def handle_reconciled_rejected_order(
             payload=payload,
             observed_at=observed_at,
         )
+    if not classification.retryable and order.plan_item is not None and order.plan_item.intent == "target_sell":
+        existing_audit = db.scalar(
+            select(ExecutionPlanItemAudit.id).where(
+                ExecutionPlanItemAudit.execution_plan_item_id == order.plan_item.id,
+                ExecutionPlanItemAudit.event_type == "nonretryable_sell_monitor_suppressed",
+            )
+        )
+        if existing_audit is None:
+            db.add(
+                ExecutionPlanItemAudit(
+                    execution_plan_item_id=order.plan_item.id,
+                    event_type="nonretryable_sell_monitor_suppressed",
+                    source="rejected_order_retry",
+                    summary={
+                        "status": "manual_review_required",
+                        "reason": "nonretryable_broker_rejection",
+                        "symbol": order.symbol,
+                        "intent": order.plan_item.intent,
+                    },
+                    payload={
+                        "broker_code": classification.code,
+                        "broker_message": classification.message,
+                        "trigger_price": str(order.plan_item.trigger_price) if order.plan_item.trigger_price else None,
+                    },
+                    error_message=classification.message,
+                    occurred_at=observed_at,
+                )
+            )
     return failure
 
 

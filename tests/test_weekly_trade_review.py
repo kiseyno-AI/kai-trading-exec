@@ -72,6 +72,9 @@ def test_weekly_trade_review_exports_bounded_read_only_artifact(tmp_path) -> Non
     assert report["counts"]["linked_broker_order_event_count"] == 1
     assert report["counts"]["execution_failure_count"] == 1
     assert report["counts"]["closed_trade_count"] == 1
+    assert report["counts"]["total_sell_rows"] == 1
+    assert report["counts"]["pnl_covered_sell_rows"] == 1
+    assert report["counts"]["pnl_uncovered_sell_rows"] == 0
     assert report["counts"]["stale_fifo_inventory_alert_count"] == 1
     assert report["counts"]["protective_stop_actionability_warning_count"] == 1
     assert report["truncated"] == {
@@ -86,6 +89,8 @@ def test_weekly_trade_review_exports_bounded_read_only_artifact(tmp_path) -> Non
     assert report["closed_trades"][0]["symbol"] == "049430"
     assert report["closed_trades"][0]["cost_basis_source"] == "broker_reconciliation"
     assert report["closed_trades"][0]["realized_pnl"] == "-1800.0000"
+    assert report["realized_pnl_coverage"]["status"] == "complete"
+    assert report["realized_pnl_coverage"]["truncated"] is False
     assert report["stale_fifo_inventory_alerts"][0]["symbol"] == "049430"
     assert report["stale_fifo_inventory_alerts"][0]["fifo_open_quantity"] == 39
     assert report["linked_broker_orders"][0]["id"] == "weekly-order"
@@ -246,6 +251,8 @@ def test_weekly_trade_review_bounds_historical_fifo_scans(tmp_path) -> None:
         engine.dispose()
 
     assert report["truncated"]["closed_trades"] is True
+    assert report["realized_pnl_coverage"]["status"] == "truncated"
+    assert report["realized_pnl_coverage"]["truncated"] is True
     assert report["truncated"]["stale_fifo_inventory_alerts"] is True
     assert [event["step"] for event in progress if event["step"] in {"weekly_closed_trades", "stale_fifo_inventory_alerts"}] == [
         "weekly_closed_trades",
@@ -364,6 +371,16 @@ def test_weekly_trade_review_keeps_later_repurchase_basis_unknown(tmp_path) -> N
             "symbol": "LATER",
         }
     ]
+    assert report["realized_pnl_coverage"] == {
+        "status": "incomplete",
+        "truncated": False,
+        "total_sell_rows": 1,
+        "covered_sell_rows": 0,
+        "uncovered_sell_rows": 1,
+        "uncovered_gross_proceeds": "5000.0000",
+        "symbols_requiring_repair": ["LATER"],
+        "uncovered_sell_fill_ids": ["unmatched-sell-fill"],
+    }
 
 
 def test_weekly_trade_review_cli_fails_before_artifact_when_required_mode_mismatches(tmp_path) -> None:

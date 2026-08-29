@@ -161,6 +161,7 @@ def generate_weekly_trade_review(
         max_rows=max_fills,
     )
     progress("weekly_closed_trades", row_count=len(closed_trades), truncated=closed_trades_truncated)
+    pnl_coverage = _weekly_pnl_coverage(closed_trades, truncated=closed_trades_truncated)
     stale_fifo_inventory_alerts, stale_fifo_inventory_alerts_truncated = _stale_fifo_inventory_alerts(
         db=db,
         mode=settings.runtime_mode,
@@ -233,6 +234,9 @@ def generate_weekly_trade_review(
             "monitoring_checkpoint_count": len(monitoring_checkpoints),
             "protective_stop_actionability_warning_count": protective_stop_actionability["warning_count"],
             "closed_trade_count": len(closed_trades),
+            "total_sell_rows": pnl_coverage["total_sell_rows"],
+            "pnl_covered_sell_rows": pnl_coverage["covered_sell_rows"],
+            "pnl_uncovered_sell_rows": pnl_coverage["uncovered_sell_rows"],
             "stale_fifo_inventory_alert_count": len(stale_fifo_inventory_alerts),
         },
         "truncated": {
@@ -250,6 +254,7 @@ def generate_weekly_trade_review(
         "weekly_order_samples": weekly_orders,
         "execution_failures": failures,
         "closed_trades": closed_trades,
+        "realized_pnl_coverage": pnl_coverage,
         "stale_fifo_inventory_alerts": stale_fifo_inventory_alerts,
         "active_broker_order_summary": active_order_summary,
         "execution_plan_item_summary": plan_item_summary,
@@ -818,6 +823,38 @@ def _broker_reconciliation_cost_basis(
     return None
 
 
+def _weekly_pnl_coverage(
+    closed_trades: Sequence[dict[str, object]],
+    *,
+    truncated: bool,
+) -> dict[str, object]:
+    sell_fill_ids = {str(row["sell_fill_id"]) for row in closed_trades}
+    covered_fill_ids = {
+        str(row["sell_fill_id"])
+        for row in closed_trades
+        if row.get("cost_basis_source") != "unknown"
+    }
+    uncovered_rows = [row for row in closed_trades if row.get("cost_basis_source") == "unknown"]
+    uncovered_fill_ids = {str(row["sell_fill_id"]) for row in uncovered_rows}
+    uncovered_proceeds = sum(
+        (
+            Decimal(str(row["sell_price"])) * Decimal(str(row["quantity"]))
+            for row in uncovered_rows
+        ),
+        Decimal("0"),
+    ).quantize(Decimal("0.0001"))
+    return {
+        "status": "truncated" if truncated else ("complete" if not uncovered_fill_ids else "incomplete"),
+        "truncated": truncated,
+        "total_sell_rows": len(sell_fill_ids),
+        "covered_sell_rows": len(covered_fill_ids),
+        "uncovered_sell_rows": len(uncovered_fill_ids),
+        "uncovered_gross_proceeds": uncovered_proceeds,
+        "symbols_requiring_repair": sorted({str(row["symbol"]) for row in uncovered_rows}),
+        "uncovered_sell_fill_ids": sorted(uncovered_fill_ids),
+    }
+
+
 def _next_buy_after(
     *,
     fills: Sequence[ExecutionFill],
@@ -878,7 +915,12 @@ def _stale_fifo_inventory_alerts(
     truncated = len(newest_fills) > max_rows
     fills = list(reversed(newest_fills[:max_rows]))
     quantities: dict[str, Decimal] = {}
+    first_fill_at: dict[str, datetime] = {}
+    last_fill_at: dict[str, datetime] = {}
     for fill in fills:
+        observed_at = _normalize_utc(fill.filled_at)
+        first_fill_at[fill.symbol] = min(first_fill_at.get(fill.symbol, observed_at), observed_at)
+        last_fill_at[fill.symbol] = max(last_fill_at.get(fill.symbol, observed_at), observed_at)
         quantity = _fill_quantity(fill)
         if str(fill.side or "").lower() == "buy":
             quantities[fill.symbol] = quantities.get(fill.symbol, Decimal("0")) + quantity
@@ -901,6 +943,9 @@ def _stale_fifo_inventory_alerts(
                 "fifo_open_quantity": _quantity_value(quantities[symbol]),
                 "broker_position_quantity": _quantity_value(broker_quantity),
                 "position_last_reconciled_at": position.last_reconciled_at,
+                "fifo_scan_first_fill_at": first_fill_at.get(symbol),
+                "fifo_scan_last_fill_at": last_fill_at.get(symbol),
+                "repair_action": "reconcile broker execution history before retiring local FIFO lots",
                 "message": "fill FIFO leaves open quantity but latest broker reconciliation reports flat",
             }
         )
