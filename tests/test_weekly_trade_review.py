@@ -72,6 +72,9 @@ def test_weekly_trade_review_exports_bounded_read_only_artifact(tmp_path) -> Non
     assert report["counts"]["linked_broker_order_event_count"] == 1
     assert report["counts"]["execution_failure_count"] == 1
     assert report["counts"]["closed_trade_count"] == 1
+    assert report["counts"]["total_sell_rows"] == 1
+    assert report["counts"]["pnl_covered_sell_rows"] == 1
+    assert report["counts"]["pnl_uncovered_sell_rows"] == 0
     assert report["counts"]["stale_fifo_inventory_alert_count"] == 1
     assert report["counts"]["protective_stop_actionability_warning_count"] == 1
     assert report["truncated"] == {
@@ -86,6 +89,8 @@ def test_weekly_trade_review_exports_bounded_read_only_artifact(tmp_path) -> Non
     assert report["closed_trades"][0]["symbol"] == "049430"
     assert report["closed_trades"][0]["cost_basis_source"] == "broker_reconciliation"
     assert report["closed_trades"][0]["realized_pnl"] == "-1800.0000"
+    assert report["realized_pnl_coverage"]["status"] == "complete"
+    assert report["realized_pnl_coverage"]["truncated"] is False
     assert report["stale_fifo_inventory_alerts"][0]["symbol"] == "049430"
     assert report["stale_fifo_inventory_alerts"][0]["fifo_open_quantity"] == 39
     assert report["linked_broker_orders"][0]["id"] == "weekly-order"
@@ -246,6 +251,8 @@ def test_weekly_trade_review_bounds_historical_fifo_scans(tmp_path) -> None:
         engine.dispose()
 
     assert report["truncated"]["closed_trades"] is True
+    assert report["realized_pnl_coverage"]["status"] == "truncated"
+    assert report["realized_pnl_coverage"]["truncated"] is True
     assert report["truncated"]["stale_fifo_inventory_alerts"] is True
     assert [event["step"] for event in progress if event["step"] in {"weekly_closed_trades", "stale_fifo_inventory_alerts"}] == [
         "weekly_closed_trades",
@@ -364,6 +371,169 @@ def test_weekly_trade_review_keeps_later_repurchase_basis_unknown(tmp_path) -> N
             "symbol": "LATER",
         }
     ]
+    assert report["realized_pnl_coverage"] == {
+        "status": "incomplete",
+        "truncated": False,
+        "total_sell_rows": 1,
+        "covered_sell_rows": 0,
+        "uncovered_sell_rows": 1,
+        "uncovered_gross_proceeds": "5000.0000",
+        "symbols_requiring_repair": ["LATER"],
+        "uncovered_sell_fill_ids": ["unmatched-sell-fill"],
+    }
+
+
+def test_weekly_trade_review_pnl_coverage_classifies_each_sell_fill_once(tmp_path) -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        weekly_trade_review_dir=str(tmp_path),
+    )
+    engine, db = _build_db(settings)
+    start_at = datetime(2026, 7, 25, tzinfo=UTC)
+    end_at = datetime(2026, 8, 1, tzinfo=UTC)
+
+    orders = [
+        BrokerOrder(
+            id="split-buy-order-1",
+            broker_name="kis",
+            mode="paper",
+            idempotency_key="split-buy-order-1-key",
+            symbol="SPLIT",
+            side="buy",
+            status="filled",
+            quantity=2,
+            submitted_at=start_at + timedelta(hours=1),
+        ),
+        BrokerOrder(
+            id="split-buy-order-2",
+            broker_name="kis",
+            mode="paper",
+            idempotency_key="split-buy-order-2-key",
+            symbol="SPLIT",
+            side="buy",
+            status="filled",
+            quantity=3,
+            submitted_at=start_at + timedelta(hours=2),
+        ),
+        BrokerOrder(
+            id="split-sell-order",
+            broker_name="kis",
+            mode="paper",
+            idempotency_key="split-sell-order-key",
+            symbol="SPLIT",
+            side="sell",
+            status="filled",
+            quantity=5,
+            submitted_at=start_at + timedelta(hours=3),
+        ),
+        BrokerOrder(
+            id="partial-buy-order",
+            broker_name="kis",
+            mode="paper",
+            idempotency_key="partial-buy-order-key",
+            symbol="PART",
+            side="buy",
+            status="filled",
+            quantity=2,
+            submitted_at=start_at + timedelta(hours=4),
+        ),
+        BrokerOrder(
+            id="partial-sell-order",
+            broker_name="kis",
+            mode="paper",
+            idempotency_key="partial-sell-order-key",
+            symbol="PART",
+            side="sell",
+            status="filled",
+            quantity=5,
+            submitted_at=start_at + timedelta(hours=5),
+        ),
+    ]
+    db.add_all(orders)
+    db.flush()
+    db.add_all(
+        [
+            ExecutionFill(
+                id="split-buy-fill-1",
+                broker_order_pk="split-buy-order-1",
+                broker_fill_id="split-buy-fill-1",
+                symbol="SPLIT",
+                side="buy",
+                quantity=2,
+                price=Decimal("100"),
+                filled_at=start_at + timedelta(hours=1),
+            ),
+            ExecutionFill(
+                id="split-buy-fill-2",
+                broker_order_pk="split-buy-order-2",
+                broker_fill_id="split-buy-fill-2",
+                symbol="SPLIT",
+                side="buy",
+                quantity=3,
+                price=Decimal("110"),
+                filled_at=start_at + timedelta(hours=2),
+            ),
+            ExecutionFill(
+                id="split-sell-fill",
+                broker_order_pk="split-sell-order",
+                broker_fill_id="split-sell-fill",
+                symbol="SPLIT",
+                side="sell",
+                quantity=5,
+                price=Decimal("150"),
+                filled_at=start_at + timedelta(hours=3),
+            ),
+            ExecutionFill(
+                id="partial-buy-fill",
+                broker_order_pk="partial-buy-order",
+                broker_fill_id="partial-buy-fill",
+                symbol="PART",
+                side="buy",
+                quantity=2,
+                price=Decimal("200"),
+                filled_at=start_at + timedelta(hours=4),
+            ),
+            ExecutionFill(
+                id="partial-sell-fill",
+                broker_order_pk="partial-sell-order",
+                broker_fill_id="partial-sell-fill",
+                symbol="PART",
+                side="sell",
+                quantity=5,
+                price=Decimal("250"),
+                filled_at=start_at + timedelta(hours=5),
+            ),
+        ]
+    )
+    db.commit()
+
+    try:
+        report = generate_weekly_trade_review(
+            settings=settings,
+            db=db,
+            start_at=start_at,
+            end_at=end_at,
+            max_fills=10,
+        )
+    finally:
+        db.close()
+        engine.dispose()
+
+    assert report["counts"]["closed_trade_count"] == 4
+    assert report["counts"]["total_sell_rows"] == 2
+    assert report["counts"]["pnl_covered_sell_rows"] == 1
+    assert report["counts"]["pnl_uncovered_sell_rows"] == 1
+    assert report["realized_pnl_coverage"] == {
+        "status": "incomplete",
+        "truncated": False,
+        "total_sell_rows": 2,
+        "covered_sell_rows": 1,
+        "uncovered_sell_rows": 1,
+        "uncovered_gross_proceeds": "750.0000",
+        "symbols_requiring_repair": ["PART"],
+        "uncovered_sell_fill_ids": ["partial-sell-fill"],
+    }
 
 
 def test_weekly_trade_review_cli_fails_before_artifact_when_required_mode_mismatches(tmp_path) -> None:

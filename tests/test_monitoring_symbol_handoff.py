@@ -1,6 +1,9 @@
 import json
 from datetime import date
+from decimal import Decimal
 from urllib.error import URLError
+
+from sqlalchemy import inspect
 
 from app.core.config import Settings
 from app.db.base import Base
@@ -132,5 +135,64 @@ def test_core_symbols_prioritize_without_filtering_exec_local_watch_plans(monkey
             )
 
         assert symbols == ["000660", "005930", "035420"]
+    finally:
+        engine.dispose()
+
+
+def test_file_backed_monitoring_loaders_include_watch_buy_risk_context_for_safe_cap(tmp_path) -> None:
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'monitoring-safe-cap.db'}",
+        runtime_mode="paper",
+        monitoring_max_symbols_per_cycle=3,
+        monitoring_expire_prior_market_watch_buys_enabled=False,
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+
+    try:
+        with session_factory() as session:
+            session.add(
+                ExecutionPlan(
+                    external_plan_id="safe-cap-plan",
+                    source="kai-trading-core",
+                    market_date=date(2026, 8, 14),
+                    mode="paper",
+                    status="accepted",
+                    items=[
+                        ExecutionPlanItem(
+                            id="safe-cap-watch-buy",
+                            plan_item_index=0,
+                            symbol="005930",
+                            side="buy",
+                            intent="intraday_watch_buy",
+                            status="watch_monitoring_active",
+                            quantity_policy={"kind": "shares", "quantity": 10},
+                            trigger_price=Decimal("100.0000"),
+                            risk_context={
+                                "execution_feasibility_context": {
+                                    "budget_exceeds_safe_notional": True,
+                                    "max_safe_quantity": 3,
+                                }
+                            },
+                        )
+                    ],
+                )
+            )
+            session.commit()
+
+        loader_cases = (
+            {},
+            {"symbols": {"005930"}},
+            {"symbols": {"005930"}, "exclude_pending_config": True},
+        )
+        for kwargs in loader_cases:
+            with session_factory() as session:
+                items = monitoring._load_monitored_items(settings=settings, db=session, **kwargs)
+
+                assert [item.id for item in items] == ["safe-cap-watch-buy"]
+                item = items[0]
+                assert "risk_context" not in inspect(item).unloaded
+                assert monitoring._watch_buy_safe_quantity_cap(item) == 3
     finally:
         engine.dispose()

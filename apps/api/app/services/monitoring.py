@@ -2703,6 +2703,7 @@ def _load_monitored_items(
                         ExecutionPlanItem.limit_price,
                         ExecutionPlanItem.trigger_price,
                         ExecutionPlanItem.time_in_force,
+                        ExecutionPlanItem.risk_context,
                         ExecutionPlanItem.decision_agent_name,
                         ExecutionPlanItem.decision_snapshot_id,
                         ExecutionPlanItem.decision_run_id,
@@ -2771,6 +2772,7 @@ def _load_monitored_items(
                     ExecutionPlanItem.limit_price,
                     ExecutionPlanItem.trigger_price,
                     ExecutionPlanItem.time_in_force,
+                    ExecutionPlanItem.risk_context,
                     ExecutionPlanItem.source_market_date,
                 ),
                 selectinload(ExecutionPlanItem.plan).load_only(
@@ -2856,6 +2858,7 @@ def _load_monitored_items(
                 ExecutionPlanItem.limit_price,
                 ExecutionPlanItem.trigger_price,
                 ExecutionPlanItem.time_in_force,
+                ExecutionPlanItem.risk_context,
                 ExecutionPlanItem.source_market_date,
             ),
             selectinload(ExecutionPlanItem.plan).load_only(
@@ -5017,6 +5020,12 @@ def _ensure_post_entry_target_monitor(
         intent="target_sell",
     )
     if existing is None:
+        if _nonretryable_sibling_monitor_suppresses_recreation(
+            entry_item=entry_item,
+            intent="target_sell",
+            trigger_price=target_price,
+        ):
+            return None, 0
         existing = ExecutionPlanItem(
             plan=plan,
             plan_item_index=_next_plan_item_index(plan),
@@ -5103,6 +5112,30 @@ def _ensure_post_entry_target_monitor(
     )
     existing.risk_context = risk_context
     return existing, maintenance_count
+
+
+def _nonretryable_sibling_monitor_suppresses_recreation(
+    *,
+    entry_item: ExecutionPlanItem,
+    intent: str,
+    trigger_price: Decimal,
+) -> bool:
+    plan = entry_item.plan
+    if plan is None:
+        return False
+    expected_source = _derived_source_plan_item_id(entry_item, "post-entry-target")
+    for sibling in plan.items:
+        if (
+            sibling.symbol != entry_item.symbol
+            or sibling.side != "sell"
+            or sibling.intent != intent
+            or sibling.source_plan_item_id != expected_source
+            or sibling.trigger_price != trigger_price
+        ):
+            continue
+        if any(order.last_error_retryable is False for order in sibling.broker_orders):
+            return True
+    return False
 
 
 def _ensure_post_entry_max_holding_monitor(
@@ -6165,6 +6198,21 @@ def _resolve_watch_buy_order(
     trigger_time_agent_approved: bool = False,
     sizing_source: str | None = None,
 ) -> WatchBuyOrderApproval:
+    liquidity_tier = _watch_buy_liquidity_tier(item)
+    if liquidity_tier == "very_weak" and _watch_buy_liquidity_override(item) is None:
+        approval = WatchBuyOrderApproval(
+            quantity=None,
+            reason="watch_buy_very_weak_liquidity",
+            message="very-weak liquidity watch buys require an explicit operator override",
+            details={"liquidity_tier": liquidity_tier},
+        )
+        _record_live_watch_buy_submission_veto(
+            db=db,
+            item=item,
+            approval=approval,
+            recorded_at=datetime.now(UTC),
+        )
+        return approval
     decision = _exec_agent_decision(item)
     if isinstance(decision, dict):
         decision_value = str(
@@ -6334,6 +6382,24 @@ def _resolve_watch_buy_order(
     approved_quantity = risk_decision.quantity
     approved_notional = risk_decision.approved_notional
     exec_agent_cap_adjustment: dict[str, object] | None = None
+    safe_quantity_cap = _watch_buy_safe_quantity_cap(item)
+    safe_quantity_adjustment: dict[str, object] | None = None
+    if safe_quantity_cap is not None and approved_quantity > safe_quantity_cap:
+        original_quantity = approved_quantity
+        original_notional = approved_notional
+        approved_quantity = safe_quantity_cap
+        approved_notional = (entry_price * Decimal(approved_quantity)).quantize(
+            Decimal("0.0001"),
+            rounding=ROUND_DOWN,
+        )
+        safe_quantity_adjustment = {
+            "reason": "max_safe_quantity_cap",
+            "original_quantity": original_quantity,
+            "adjusted_quantity": approved_quantity,
+            "max_safe_quantity": safe_quantity_cap,
+            "original_notional": _serialize_decimal(original_notional),
+            "adjusted_notional": _serialize_decimal(approved_notional),
+        }
     if exec_agent_notional_cap is not None:
         cap_quantity = _floor_quantity(exec_agent_notional_cap / entry_price)
         if approved_quantity > cap_quantity:
@@ -6379,6 +6445,24 @@ def _resolve_watch_buy_order(
         event["exec_agent_approved_notional_cap"] = _serialize_decimal(exec_agent_notional_cap)
     if exec_agent_cap_adjustment is not None:
         event["submission_cap_adjustment"] = exec_agent_cap_adjustment
+    if safe_quantity_adjustment is not None:
+        event["safe_quantity_cap_adjustment"] = safe_quantity_adjustment
+        policy = dict(item.quantity_policy or {})
+        explanation = dict(policy.get("sizing_explanation") or {})
+        explanation["runtime_safe_quantity_cap"] = safe_quantity_adjustment
+        policy["sizing_explanation"] = explanation
+        policy["quantity"] = approved_quantity
+        item.quantity_policy = compact_json_object(policy)
+        db.add(
+            ExecutionPlanItemAudit(
+                execution_plan_item_id=item.id,
+                event_type="watch_buy_safe_quantity_capped",
+                source=MONITORING_WORKER_NAME,
+                summary={"status": "capped", "reason": "max_safe_quantity_cap", "symbol": item.symbol},
+                payload={"safe_quantity_cap_adjustment": safe_quantity_adjustment},
+                occurred_at=datetime.now(UTC),
+            )
+        )
     if _watch_buy_requires_exec_agent_sizing(item):
         event["sizing_source"] = sizing_source or "risk_sizing_after_exec_agent_attempts_exhausted"
         event["exec_agent_watch_sizing_attempt_count"] = _first_payload_value(
@@ -6830,6 +6914,46 @@ def _watch_buy_max_quantity(item: ExecutionPlanItem) -> int | None:
             quantity = _parse_positive_int(source.get(key))
             if quantity is not None:
                 return quantity
+    return None
+
+
+def _watch_buy_safe_quantity_cap(item: ExecutionPlanItem) -> int | None:
+    for source in _item_payload_sources(item):
+        candidates = [source]
+        feasibility = source.get("execution_feasibility_context")
+        if isinstance(feasibility, dict):
+            candidates.append(feasibility)
+        for candidate in candidates:
+            if candidate.get("budget_exceeds_safe_notional") is not True:
+                continue
+            quantity = _parse_positive_int(candidate.get("max_safe_quantity"))
+            if quantity is not None:
+                return quantity
+    return None
+
+
+def _watch_buy_liquidity_tier(item: ExecutionPlanItem) -> str | None:
+    for source in _item_payload_sources(item):
+        candidates = [source]
+        feasibility = source.get("execution_feasibility_context")
+        if isinstance(feasibility, dict):
+            candidates.append(feasibility)
+        for candidate in candidates:
+            value = str(candidate.get("liquidity_tier") or "").strip().lower()
+            if value:
+                return value
+    return None
+
+
+def _watch_buy_liquidity_override(item: ExecutionPlanItem) -> dict[str, object] | None:
+    for source in _item_payload_sources(item):
+        override = source.get("watch_buy_liquidity_override")
+        if not isinstance(override, dict) or override.get("enabled") is not True:
+            continue
+        actor = str(override.get("actor") or override.get("operator") or "").strip()
+        reason = str(override.get("reason") or override.get("rationale") or "").strip()
+        if actor and reason:
+            return {"enabled": True, "actor": actor, "reason": reason}
     return None
 
 

@@ -49,7 +49,12 @@ from app.models.runtime import (
     MonitoringCheckpoint,
 )
 from app.services import runtime as runtime_service
-from app.services.monitoring import list_autonomous_monitoring_symbols, run_autonomous_monitoring_cycle
+from app.services.monitoring import (
+    _derived_source_plan_item_id,
+    _nonretryable_sibling_monitor_suppresses_recreation,
+    list_autonomous_monitoring_symbols,
+    run_autonomous_monitoring_cycle,
+)
 from app.services.watch_exec_agent_sizing import _apply_decisions
 
 
@@ -1442,7 +1447,7 @@ def test_place_order_endpoint_persists_normalized_order_and_events() -> None:
             "execution_plan_item_id": plan_item_id,
             "symbol": "005930",
             "side": "buy",
-            "quantity": 5,
+            "quantity": 2,
             "order_type": "limit",
             "limit_price": "71000.00",
             "time_in_force": "day",
@@ -3067,6 +3072,124 @@ def test_watch_buy_candidate_waits_until_trigger_then_submits_limit_buy() -> Non
         assert order.idempotency_key == f"monitoring:watch_buy:{item_id}"
 
     engine.dispose()
+
+
+def test_watch_buy_rejects_very_weak_liquidity_before_broker_submission() -> None:
+    app, engine, client, broker_adapter = _build_watch_buy_test_app()
+    _create_watch_buy_candidate(
+        client,
+        plan_id="plan-watch-buy-very-weak-liquidity",
+        quantity_policy={"kind": "shares", "quantity": 2},
+        risk_context={
+            "exchange": "KRX",
+            "stop_price": "70000.00",
+            "trigger_direction": "at_or_above",
+            "execution_feasibility_context": {"liquidity_tier": "very_weak"},
+        },
+    )
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={"actor": "ops", "source": "test", "prices": [{"symbol": "005930", "price": "71050.00"}]},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["items"][0]["outcome"] == "rejected"
+    assert payload["items"][0]["message"] == "very-weak liquidity watch buys require an explicit operator override"
+    assert broker_adapter.order_calls == []
+    with app.state.db_session_factory() as session:
+        audit = session.scalar(
+            select(ExecutionPlanItemAudit).where(
+                ExecutionPlanItemAudit.event_type == "live_watch_buy_submission_veto"
+            )
+        )
+        assert audit.summary["reason"] == "watch_buy_very_weak_liquidity"
+    engine.dispose()
+
+
+def test_watch_buy_clamps_budget_excess_to_max_safe_quantity() -> None:
+    app, engine, client, broker_adapter = _build_watch_buy_test_app()
+    item_id = _create_watch_buy_candidate(
+        client,
+        plan_id="plan-watch-buy-safe-quantity-cap",
+        quantity_policy={
+            "kind": "shares",
+            "quantity": 5,
+            "budget_exceeds_safe_notional": True,
+            "max_safe_quantity": 1,
+        },
+        risk_context={"exchange": "KRX", "stop_price": "70000.00", "trigger_direction": "at_or_above"},
+    )
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={"actor": "ops", "source": "test", "prices": [{"symbol": "005930", "price": "71050.00"}]},
+    )
+
+    assert response.status_code == 200
+    assert broker_adapter.order_calls[0].quantity == 1
+    with app.state.db_session_factory() as session:
+        item = session.get(ExecutionPlanItem, item_id)
+        events = session.scalars(
+            select(ExecutionPlanItemAudit).where(ExecutionPlanItemAudit.execution_plan_item_id == item_id)
+        ).all()
+        adjustment_events = [event for event in events if event.payload.get("safe_quantity_cap_adjustment")]
+        assert adjustment_events
+        adjustment = adjustment_events[-1].payload["safe_quantity_cap_adjustment"]
+        assert adjustment["reason"] == "max_safe_quantity_cap"
+        assert adjustment["original_quantity"] == 2
+        assert adjustment["adjusted_quantity"] == 1
+    engine.dispose()
+
+
+def test_nonretryable_target_rejection_suppresses_only_equivalent_target_recreation() -> None:
+    plan = ExecutionPlan(external_plan_id="target-suppression-plan", source="test", mode="paper")
+    entry = ExecutionPlanItem(
+        plan=plan,
+        plan_item_index=0,
+        symbol="003550",
+        side="buy",
+        intent="next_open_buy",
+        status="filled",
+        quantity_policy={"kind": "shares", "quantity": 2},
+    )
+    target = ExecutionPlanItem(
+        plan=plan,
+        plan_item_index=1,
+        symbol="003550",
+        side="sell",
+        intent="target_sell",
+        status="broker_order_rejected",
+        quantity_policy={"kind": "shares", "quantity": 2},
+        trigger_price=Decimal("116132.5000"),
+        source_plan_item_id=_derived_source_plan_item_id(entry, "post-entry-target"),
+    )
+    target.broker_orders.append(
+        BrokerOrder(
+            broker_name="kis",
+            mode="paper",
+            idempotency_key="target-suppression-order",
+            symbol="003550",
+            side="sell",
+            status="rejected",
+            quantity=2,
+            last_error_code="KIER2570",
+            last_error_message="order date differs from market date",
+            last_error_retryable=False,
+        )
+    )
+
+    assert _nonretryable_sibling_monitor_suppresses_recreation(
+        entry_item=entry,
+        intent="target_sell",
+        trigger_price=Decimal("116132.5000"),
+    )
+    assert not _nonretryable_sibling_monitor_suppresses_recreation(
+        entry_item=entry,
+        intent="stop_sell",
+        trigger_price=Decimal("100000.0000"),
+    )
 
 
 def test_autonomous_monitoring_cycle_evaluates_watch_buy_without_position() -> None:
