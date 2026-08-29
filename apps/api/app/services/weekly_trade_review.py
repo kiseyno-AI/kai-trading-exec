@@ -828,14 +828,16 @@ def _weekly_pnl_coverage(
     *,
     truncated: bool,
 ) -> dict[str, object]:
-    sell_fill_ids = {str(row["sell_fill_id"]) for row in closed_trades}
-    covered_fill_ids = {
-        str(row["sell_fill_id"])
-        for row in closed_trades
-        if row.get("cost_basis_source") != "unknown"
-    }
+    rows_by_fill_id: dict[str, list[dict[str, object]]] = {}
+    for row in closed_trades:
+        rows_by_fill_id.setdefault(str(row["sell_fill_id"]), []).append(row)
     uncovered_rows = [row for row in closed_trades if row.get("cost_basis_source") == "unknown"]
-    uncovered_fill_ids = {str(row["sell_fill_id"]) for row in uncovered_rows}
+    uncovered_fill_ids = {
+        fill_id
+        for fill_id, rows in rows_by_fill_id.items()
+        if any(row.get("cost_basis_source") == "unknown" for row in rows)
+    }
+    covered_fill_ids = set(rows_by_fill_id) - uncovered_fill_ids
     uncovered_proceeds = sum(
         (
             Decimal(str(row["sell_price"])) * Decimal(str(row["quantity"]))
@@ -846,7 +848,7 @@ def _weekly_pnl_coverage(
     return {
         "status": "truncated" if truncated else ("complete" if not uncovered_fill_ids else "incomplete"),
         "truncated": truncated,
-        "total_sell_rows": len(sell_fill_ids),
+        "total_sell_rows": len(rows_by_fill_id),
         "covered_sell_rows": len(covered_fill_ids),
         "uncovered_sell_rows": len(uncovered_fill_ids),
         "uncovered_gross_proceeds": uncovered_proceeds,
