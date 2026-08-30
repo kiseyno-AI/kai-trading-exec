@@ -67,6 +67,7 @@ def place_broker_order(
     command: PlaceOrderRequest,
     request_source: str = "post:/orders",
     before_success_commit: Callable[[], None] | None = None,
+    now: datetime | None = None,
 ) -> PlaceBrokerOrderResult:
     existing = _load_order_by_idempotency_key(
         settings=settings,
@@ -189,6 +190,24 @@ def place_broker_order(
                 "deferred": True,
                 "block_reason": None,
                 "route": kis_us_session_route,
+            },
+        )
+
+    domestic_market_date_block = _domestic_equity_market_date_block(
+        settings=settings,
+        adapter=adapter,
+        command=command,
+        now=now,
+    )
+    if domestic_market_date_block is not None:
+        return PlaceBrokerOrderResult(
+            status_code=202,
+            payload={
+                "duplicate": False,
+                "message": domestic_market_date_block["message"],
+                "deferred": True,
+                "block_reason": domestic_market_date_block["reason"],
+                "market": domestic_market_date_block,
             },
         )
 
@@ -564,6 +583,35 @@ def _validate_provider_capability(
     if command.provider == "alpaca" and command.asset_class not in {"crypto", "us_equity"}:
         return "alpaca adapter accepts crypto and US-equity orders only"
     return None
+
+
+def _domestic_equity_market_date_block(
+    *,
+    settings: Settings,
+    adapter: BrokerAdapter,
+    command: PlaceOrderRequest,
+    now: datetime | None = None,
+) -> dict[str, object] | None:
+    if settings.runtime_mode != "live":
+        return None
+    if adapter.provider != "kis" or command.asset_class != "stock":
+        return None
+    if command.exchange not in {"KRX", "KOSPI", "KOSDAQ", "NXT", "SOR"}:
+        return None
+
+    local_now = (now or datetime.now(UTC)).astimezone(ZoneInfo(settings.market_timezone))
+    if local_now.weekday() < 5:
+        return None
+
+    return {
+        "reason": "domestic_equity_market_closed_weekend",
+        "message": "domestic equity order deferred because the market date is a weekend",
+        "market_date": local_now.date().isoformat(),
+        "weekday": local_now.strftime("%A").lower(),
+        "timezone": settings.market_timezone,
+        "provider": adapter.provider,
+        "exchange": command.exchange,
+    }
 
 
 def _validate_upbit_paper_guardrails(

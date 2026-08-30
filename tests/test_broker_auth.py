@@ -48,6 +48,7 @@ from app.models.runtime import (
     ExecutionPosition,
     MonitoringCheckpoint,
 )
+from app.services import broker_orders as broker_orders_service
 from app.services import runtime as runtime_service
 from app.services.monitoring import (
     _derived_source_plan_item_id,
@@ -8508,7 +8509,12 @@ def test_place_order_endpoint_is_idempotent() -> None:
     engine.dispose()
 
 
-def test_place_order_idempotency_keys_are_scoped_to_runtime_mode(tmp_path) -> None:
+def test_place_order_idempotency_keys_are_scoped_to_runtime_mode(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(
+        broker_orders_service,
+        "_domestic_equity_market_date_block",
+        lambda **_kwargs: None,
+    )
     database_url = f"sqlite:///{tmp_path / 'cross-mode-idempotency.db'}"
     paper_app, paper_engine = build_test_app(
         settings=Settings(
@@ -9347,7 +9353,12 @@ def test_execution_failures_persist_after_restart(tmp_path) -> None:
     restarted_engine.dispose()
 
 
-def test_live_mode_cycle_exposes_symbol_readback_and_daily_board_views() -> None:
+def test_live_mode_cycle_exposes_symbol_readback_and_daily_board_views(monkeypatch) -> None:
+    monkeypatch.setattr(
+        broker_orders_service,
+        "_domestic_equity_market_date_block",
+        lambda **_kwargs: None,
+    )
     broker_adapter = StubBrokerAdapter(
         config=BrokerConfig(
             provider="kis",
