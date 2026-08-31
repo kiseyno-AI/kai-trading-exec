@@ -1451,18 +1451,23 @@ def _parse_reconcile_datetime(
         candidate = f"{date_value}{normalized_time}".replace(" ", "")
         for fmt in ("%Y%m%d%H%M%S", "%Y%m%d%H%M%S%f"):
             try:
-                return datetime.strptime(candidate, fmt).replace(tzinfo=UTC)
+                return (
+                    datetime.strptime(candidate, fmt)
+                    .replace(tzinfo=KIS_TIMEZONE)
+                    .astimezone(UTC)
+                )
             except ValueError:
                 pass
     for fmt in ("%H%M%S", "%H%M%S%f"):
         try:
             parsed = datetime.strptime(normalized_time, fmt)
-            return observed_at.replace(
+            observed_local = observed_at.astimezone(KIS_TIMEZONE)
+            return observed_local.replace(
                 hour=parsed.hour,
                 minute=parsed.minute,
                 second=parsed.second,
                 microsecond=parsed.microsecond,
-            )
+            ).astimezone(UTC)
         except ValueError:
             pass
     return None
@@ -2263,12 +2268,13 @@ def _submitted_at(order_time: object, fallback: datetime) -> datetime:
     if not isinstance(order_time, str) or len(order_time) != 6:
         return fallback
     try:
-        return fallback.replace(
+        fallback_local = fallback.astimezone(KIS_TIMEZONE)
+        return fallback_local.replace(
             hour=int(order_time[0:2]),
             minute=int(order_time[2:4]),
             second=int(order_time[4:6]),
             microsecond=0,
-        )
+        ).astimezone(UTC)
     except ValueError:
         return fallback
 
