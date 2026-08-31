@@ -1374,9 +1374,13 @@ def build_runtime_status(
         cycle_symbols = _autonomous_runtime_snapshot_symbols(autonomous=autonomous) or _autonomous_monitoring_symbols(
             autonomous=autonomous
         )
+        filled_summary = runtime_filled_today_summary(settings=settings, db=db)
         symbols = {
             **symbols,
             **cached_symbols,
+            "filled_today": runtime_filled_today_symbols(settings=settings, db=db),
+            "filled_today_by_side": filled_summary["by_side"],
+            "filled_today_counts": filled_summary["counts"],
             "monitored": cycle_symbols,
             "monitoring_cycle_batch": cycle_symbols,
         }
@@ -1420,7 +1424,7 @@ def build_runtime_status(
             ),
             "monthly_pnl": _default_monthly_pnl_payload(settings=settings),
             "weekly_pnl": _default_weekly_pnl_payload(),
-            "daily_pnl": _default_daily_pnl_payload(),
+            "daily_pnl": daily_pnl_payload(settings=settings, db=db),
             "account_drawdown_gate": account_drawdown_gate,
         }
 
