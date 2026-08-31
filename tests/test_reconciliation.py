@@ -1696,6 +1696,7 @@ def test_kis_reconcile_order_reports_cumulative_quantity_without_synthetic_fill(
     assert payload is not None
     assert payload["status"] == "filled"
     assert payload["filled_quantity"] == 2
+    assert payload["filled_at"] == "2026-05-13T00:05:01+00:00"
     assert "fills" not in payload
     assert http_client.calls[0]["params"]["ODNO"] == "0033196600"
 

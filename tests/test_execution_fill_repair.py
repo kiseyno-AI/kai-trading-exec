@@ -56,7 +56,7 @@ def _filled_order_missing_fill() -> BrokerOrder:
                 "rmn_qty": "0",
                 "avg_pric": "71000",
                 "ord_dt": "20260724",
-                "ord_tmd": "000501",
+                "ord_tmd": "090501",
             }
         },
     )

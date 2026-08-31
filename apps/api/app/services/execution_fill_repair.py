@@ -459,12 +459,14 @@ def _kis_order_timestamp(payload: dict[str, object]) -> str | None:
     time_value = _optional_str(payload.get("ord_tmd"))
     if not date_value or not time_value:
         return None
-    return f"{date_value}{time_value}"
+    # KIS domestic order inquiry fields are Korea-local wall-clock values.
+    # Include the offset so repair fills do not reinterpret them as UTC.
+    return f"{date_value}{time_value}+0900"
 
 
 def _parse_timestamp(value: object, *, fallback: datetime) -> datetime:
     if isinstance(value, datetime):
-        return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+        return value.astimezone(UTC) if value.tzinfo is not None else value.replace(tzinfo=UTC)
     if isinstance(value, str):
         text = value.strip()
         for candidate in (text, text.replace(" ", "T"), text.replace("Z", "+00:00")):
@@ -478,12 +480,20 @@ def _parse_timestamp(value: object, *, fallback: datetime) -> datetime:
             ):
                 try:
                     parsed = datetime.strptime(candidate, fmt)
-                    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+                    return (
+                        parsed.astimezone(UTC)
+                        if parsed.tzinfo is not None
+                        else parsed.replace(tzinfo=UTC)
+                    )
                 except (TypeError, ValueError):
                     pass
         try:
             parsed = datetime.fromisoformat(text)
-            return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+            return (
+                parsed.astimezone(UTC)
+                if parsed.tzinfo is not None
+                else parsed.replace(tzinfo=UTC)
+            )
         except ValueError:
             pass
     return fallback
