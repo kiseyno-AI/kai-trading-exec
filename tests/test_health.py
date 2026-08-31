@@ -4809,11 +4809,11 @@ def test_fast_runtime_status_uses_autonomous_snapshot_for_monitored_symbols() ->
     assert payload["symbols"]["monitored"] == ["000660", "005930"]
     assert payload["symbols"]["monitoring_cycle_batch"] == ["000660", "005930"]
     assert payload["symbols"]["filled_today"] == ["282330"]
-    assert payload["symbols"]["filled_today_by_side"] == {"buy": [], "sell": []}
+    assert payload["symbols"]["filled_today_by_side"] == {"buy": ["282330"], "sell": ["282330"]}
     assert payload["symbols"]["filled_today_counts"] == {
-        "all": {"symbols": 0, "fills": 0, "quantity": 0},
-        "buy": {"symbols": 0, "fills": 0, "quantity": 0},
-        "sell": {"symbols": 0, "fills": 0, "quantity": 0},
+        "all": {"symbols": 1, "fills": 2, "quantity": 6},
+        "buy": {"symbols": 1, "fills": 1, "quantity": 3},
+        "sell": {"symbols": 1, "fills": 1, "quantity": 3},
     }
     assert payload["monthly_pnl"]["pnl_method"] == "fifo_internal_fills_with_broker_reconciliation_fallback"
     assert payload["monthly_pnl"]["monthly_realized_pnl"] == "0.0000"
@@ -4825,11 +4825,11 @@ def test_fast_runtime_status_uses_autonomous_snapshot_for_monitored_symbols() ->
     assert payload["weekly_pnl"]["matched_sell_quantity"] == 0
     assert payload["weekly_pnl"]["closed_symbols"] == []
     assert payload["daily_pnl"]["pnl_method"] == "fifo_internal_fills"
-    assert payload["daily_pnl"]["daily_realized_pnl"] == "0.0000"
-    assert payload["daily_pnl"]["daily_buy_notional"] == "0.0000"
-    assert payload["daily_pnl"]["daily_sell_notional"] == "0.0000"
-    assert payload["daily_pnl"]["matched_sell_quantity"] == 0
-    assert payload["daily_pnl"]["closed_symbols"] == []
+    assert payload["daily_pnl"]["daily_realized_pnl"] == "-11700.0000"
+    assert payload["daily_pnl"]["daily_buy_notional"] == "375000.0000"
+    assert payload["daily_pnl"]["daily_sell_notional"] == "363300.0000"
+    assert payload["daily_pnl"]["matched_sell_quantity"] == 3
+    assert payload["daily_pnl"]["closed_symbols"] == ["282330"]
 
     engine.dispose()
 
@@ -4898,7 +4898,7 @@ def test_fast_runtime_status_honors_durable_kill_switch_state() -> None:
     engine.dispose()
 
 
-def test_fast_runtime_status_uses_cached_filled_symbols() -> None:
+def test_fast_runtime_status_prefers_database_fill_truth_over_cached_symbols() -> None:
     app, engine = build_test_app(
         settings=Settings(
             database_url="sqlite:///:memory:",
@@ -4933,7 +4933,7 @@ def test_fast_runtime_status_uses_cached_filled_symbols() -> None:
 
     payload = client.get("/runtime/status").json()
     assert payload["freshness"]["summary_source"] == "fast_autonomous_runtime_snapshot"
-    assert payload["symbols"]["filled_today"] == ["003280", "282330"]
+    assert payload["symbols"]["filled_today"] == []
     assert payload["symbols"]["filled_today_by_side"] == {"buy": [], "sell": []}
     assert payload["symbols"]["filled_today_counts"] == {
         "all": {"symbols": 0, "fills": 0, "quantity": 0},
