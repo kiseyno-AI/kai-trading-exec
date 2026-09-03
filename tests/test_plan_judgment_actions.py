@@ -1,6 +1,11 @@
 import sqlite3
 
+from sqlalchemy import create_engine, select
+from sqlalchemy.orm import Session
+
 from app.core.config import Settings
+from app.db.base import Base
+from app.models.runtime import ExecutionPlan, ExecutionPlanItem, ExecutionPlanItemAudit
 from app.services.plan_judgment_actions import apply_hourly_plan_judgment_action
 
 
@@ -65,3 +70,39 @@ def test_normal_plan_judgment_does_not_resume_rejected_buy_candidates(tmp_path) 
         "select count(*) from execution_plan_item_audits where event_type = 'hourly_plan_judgment_buy_watch_resumed'"
     ).fetchone()[0]
     assert audit_count == 0
+
+
+def test_plan_judgment_supports_non_sqlite_session() -> None:
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    settings = Settings(runtime_mode="live", database_url="postgresql+psycopg://unused/test")
+    with Session(engine) as db:
+        plan = ExecutionPlan(external_plan_id="plan-pg", source="test", mode="live")
+        item = ExecutionPlanItem(
+            plan=plan,
+            plan_item_index=0,
+            symbol="005930",
+            side="buy",
+            intent="intraday_watch_buy",
+            status="watch_monitoring_active",
+            trigger_price=100,
+            limit_price=101,
+            risk_context={},
+        )
+        db.add_all([plan, item])
+        db.commit()
+
+        result = apply_hourly_plan_judgment_action(
+            settings=settings,
+            db=db,
+            risk_flags=1,
+            risk_reasons=["test caution"],
+        )
+
+        db.refresh(item)
+        assert result["status"] == "applied"
+        assert result["changed_count"] == 1
+        assert str(item.trigger_price) == "99.0000"
+        assert str(item.limit_price) == "99.9900"
+        assert db.scalar(select(ExecutionPlanItemAudit).where(ExecutionPlanItemAudit.execution_plan_item_id == item.id))
+    engine.dispose()

@@ -91,6 +91,7 @@ def runtime_portfolio_risk(
 @router.post("/plan-judgment/action")
 async def runtime_plan_judgment_action(
     request: Request,
+    db: Annotated[Session, Depends(get_db_session)],
     payload: dict[str, object] = Body(...),
 ) -> dict[str, object]:
     settings: Settings = get_settings(request)
@@ -102,6 +103,7 @@ async def runtime_plan_judgment_action(
     )
     return apply_hourly_plan_judgment_action(
         settings=settings,
+        db=db,
         risk_flags=max(0, int(payload.get("risk_flags") or 0)),
         risk_reasons=risk_reasons,
     )

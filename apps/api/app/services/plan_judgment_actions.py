@@ -9,7 +9,11 @@ from typing import Any
 from urllib.parse import unquote, urlparse
 from uuid import uuid4
 
+from sqlalchemy import select
+from sqlalchemy.orm import Session, undefer
+
 from app.core.config import Settings
+from app.models.runtime import ExecutionPlan, ExecutionPlanItem, ExecutionPlanItemAudit
 
 BUY_WATCH_INTENTS = ("intraday_watch_buy", "next_open_buy")
 BUY_MUTABLE_STATUSES = (
@@ -136,9 +140,19 @@ def _insert_audit(
 def apply_hourly_plan_judgment_action(
     *,
     settings: Settings,
+    db: Session | None = None,
     risk_flags: int,
     risk_reasons: list[str],
 ) -> dict[str, object]:
+    if urlparse(settings.database_url).scheme not in {"sqlite", "sqlite+pysqlite"}:
+        if db is None:
+            raise ValueError("a database session is required for non-sqlite plan judgment actions")
+        return _apply_hourly_plan_judgment_action_session(
+            db=db,
+            settings=settings,
+            risk_flags=risk_flags,
+            risk_reasons=risk_reasons,
+        )
     try:
         with _connect(settings) as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -161,6 +175,164 @@ def apply_hourly_plan_judgment_action(
         if "locked" in str(exc).lower() or "busy" in str(exc).lower():
             return {"status": "skipped", "action": "db_busy", "message": "skip(db_busy)", "changed_count": 0}
         raise
+
+
+def _load_mutable_buy_items_session(db: Session, settings: Settings) -> list[ExecutionPlanItem]:
+    return list(
+        db.scalars(
+            select(ExecutionPlanItem)
+            .join(ExecutionPlan, ExecutionPlan.id == ExecutionPlanItem.execution_plan_id)
+            .options(undefer(ExecutionPlanItem.risk_context))
+            .where(
+                ExecutionPlan.mode == settings.runtime_mode,
+                ExecutionPlanItem.side == "buy",
+                ExecutionPlanItem.intent.in_(BUY_WATCH_INTENTS),
+                ExecutionPlanItem.status.in_(BUY_MUTABLE_STATUSES),
+            )
+            .order_by(ExecutionPlanItem.symbol, ExecutionPlanItem.created_at, ExecutionPlanItem.id)
+            .limit(MAX_MUTATIONS_PER_RUN)
+        ).all()
+    )
+
+
+def _insert_audit_session(
+    db: Session,
+    *,
+    item: ExecutionPlanItem,
+    event_type: str,
+    summary: dict[str, object],
+    payload: dict[str, object],
+    now: datetime,
+) -> None:
+    db.add(
+        ExecutionPlanItemAudit(
+            execution_plan_item_id=item.id,
+            event_type=event_type,
+            source=SOURCE,
+            summary=summary,
+            payload=payload,
+            occurred_at=now,
+            created_at=now,
+            updated_at=now,
+        )
+    )
+
+
+def _apply_hourly_plan_judgment_action_session(
+    *,
+    db: Session,
+    settings: Settings,
+    risk_flags: int,
+    risk_reasons: list[str],
+) -> dict[str, object]:
+    changed = 0
+    now = datetime.now(UTC)
+    items = _load_mutable_buy_items_session(db, settings)
+    if risk_flags >= 3:
+        action = "risk_off_expire"
+        event_type = "hourly_plan_judgment_buy_watch_expired"
+        for item in items:
+            previous = {
+                "status": item.status,
+                "trigger_price": str(item.trigger_price) if item.trigger_price is not None else None,
+                "limit_price": str(item.limit_price) if item.limit_price is not None else None,
+            }
+            risk_context = _json_object(item.risk_context)
+            risk_context[ADJUSTMENT_KEY] = {
+                "action": action,
+                "source": SOURCE,
+                "risk_flags": risk_flags,
+                "risk_reasons": risk_reasons,
+                "previous": previous,
+                "applied_at": now.isoformat(),
+            }
+            item.status = "watch_expired"
+            item.risk_context = risk_context
+            item.updated_at = now
+            _insert_audit_session(
+                db,
+                item=item,
+                event_type=event_type,
+                summary={"symbol": item.symbol, "action": action, "risk_flags": risk_flags},
+                payload={"risk_reasons": risk_reasons, "previous": previous},
+                now=now,
+            )
+            changed += 1
+        message = f"risk_off: 신규/추가매수 watch {changed}건 중단"
+    elif risk_flags >= 1:
+        action = "conservative_price_adjust"
+        for item in items:
+            risk_context = _json_object(item.risk_context)
+            existing = risk_context.get(ADJUSTMENT_KEY)
+            if isinstance(existing, dict) and existing.get("action") == action:
+                continue
+            trigger_price = _decimal_or_none(item.trigger_price)
+            limit_price = _decimal_or_none(item.limit_price)
+            if trigger_price is None and limit_price is None:
+                continue
+            original = {
+                "trigger_price": str(item.trigger_price) if item.trigger_price is not None else None,
+                "limit_price": str(item.limit_price) if item.limit_price is not None else None,
+            }
+            adjusted_trigger = _decimal_or_none(_price_text(trigger_price * Decimal("0.99"))) if trigger_price else None
+            adjusted_limit = _decimal_or_none(_price_text(limit_price * Decimal("0.99"))) if limit_price else None
+            risk_context[ADJUSTMENT_KEY] = {
+                "action": action,
+                "source": SOURCE,
+                "risk_flags": risk_flags,
+                "risk_reasons": risk_reasons,
+                "original": original,
+                "adjusted": {
+                    "trigger_price": _price_text(adjusted_trigger),
+                    "limit_price": _price_text(adjusted_limit),
+                },
+                "applied_at": now.isoformat(),
+            }
+            if adjusted_trigger is not None:
+                item.trigger_price = adjusted_trigger
+            if adjusted_limit is not None:
+                item.limit_price = adjusted_limit
+            item.risk_context = risk_context
+            item.updated_at = now
+            _insert_audit_session(
+                db,
+                item=item,
+                event_type="hourly_plan_judgment_buy_watch_price_adjusted",
+                summary={"symbol": item.symbol, "action": action, "risk_flags": risk_flags},
+                payload={"risk_reasons": risk_reasons, "original": original, "adjusted": risk_context[ADJUSTMENT_KEY]["adjusted"]},
+                now=now,
+            )
+            changed += 1
+        message = f"caution: 신규/추가매수 trigger/limit 1% 보수화 {changed}건"
+    else:
+        action = "restore_conservative_price_adjust"
+        for item in items:
+            risk_context = _json_object(item.risk_context)
+            adjustment = risk_context.get(ADJUSTMENT_KEY)
+            if not isinstance(adjustment, dict) or adjustment.get("action") != "conservative_price_adjust":
+                continue
+            original = adjustment.get("original") if isinstance(adjustment.get("original"), dict) else {}
+            trigger_price = _decimal_or_none(original.get("trigger_price"))
+            limit_price = _decimal_or_none(original.get("limit_price"))
+            if trigger_price is not None:
+                item.trigger_price = trigger_price
+            if limit_price is not None:
+                item.limit_price = limit_price
+            risk_context.pop(ADJUSTMENT_KEY, None)
+            item.risk_context = risk_context
+            item.updated_at = now
+            _insert_audit_session(
+                db,
+                item=item,
+                event_type="hourly_plan_judgment_buy_watch_price_restored",
+                summary={"symbol": item.symbol, "action": action},
+                payload={"restored": original},
+                now=now,
+            )
+            changed += 1
+        message = f"normal: 보수화 가격선 원복 {changed}건"
+    db.commit()
+    return {"status": "applied", "action": action, "message": message, "changed_count": changed}
 
 
 def _expire_buy_watches(
