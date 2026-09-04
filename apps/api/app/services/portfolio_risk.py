@@ -158,6 +158,7 @@ def build_portfolio_risk_snapshot(
             "observed_at": snapshot.observed_at.astimezone(UTC).isoformat() if snapshot is not None else None,
             "available_cash": _decimal_text(snapshot.available_cash) if snapshot is not None else None,
             "buying_power": _decimal_text(snapshot.buying_power) if snapshot is not None else None,
+            "total_asset_value": _decimal_text(snapshot.total_asset_value) if snapshot is not None else None,
             "total_market_value": _decimal_text(total_market_value),
             "total_securities_value": _decimal_text(total_securities_value),
         },

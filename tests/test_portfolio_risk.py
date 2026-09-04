@@ -413,6 +413,7 @@ def test_portfolio_risk_endpoint_uses_stored_token_for_cash_snapshot() -> None:
         snapshot=BrokerAccountSnapshot(
             available_cash=Decimal("123456.78"),
             buying_power=Decimal("234567.89"),
+            total_asset_value=Decimal("987654.32"),
             observed_at=datetime(2026, 6, 20, tzinfo=UTC),
             source="stub:account_snapshot",
         )
@@ -431,6 +432,7 @@ def test_portfolio_risk_endpoint_uses_stored_token_for_cash_snapshot() -> None:
     assert payload["source_status"] == "ok"
     assert payload["account"]["available_cash"] == "123456.7800"
     assert payload["account"]["buying_power"] == "234567.8900"
+    assert payload["account"]["total_asset_value"] == "987654.3200"
     assert adapter.snapshot_calls == 1
     engine.dispose()
 
