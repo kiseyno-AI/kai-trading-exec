@@ -860,6 +860,26 @@ def test_reconcile_stale_submitted_kier_lookup_window_response_repairs_to_window
     order.last_broker_sync_at = stale_submitted_at
     db.add(order)
     db.commit()
+    db.add(
+        ExecutionFailure(
+            mode=settings.runtime_mode,
+            broker_order_pk=order.id,
+            broker_name="kis",
+            idempotency_key=order.idempotency_key,
+            symbol=order.symbol,
+            side=order.side,
+            requested_quantity=order.quantity or 0,
+            classification="broker_rejected",
+            broker_error_classification="broker_rejected",
+            broker_error_code="KIER2570",
+            broker_error_message="조회일자를 확인하십시오",
+            retryable=False,
+            status="open",
+            first_failed_at=stale_submitted_at,
+            latest_failed_at=stale_submitted_at,
+        )
+    )
+    db.commit()
 
     class LookupWindowBroker(ReconciliationStubBroker):
         def reconcile_order(
@@ -924,6 +944,154 @@ def test_reconcile_stale_submitted_kier_lookup_window_response_repairs_to_window
     assert failure.broker_error_classification == "broker_rejected"
     assert failure.broker_error_code == "KIER2570"
     assert failure.latest_failed_at is not None
+    assert failure.status == "resolved"
+    assert failure.status_updated_by == "system"
+    assert failure.status_updated_source == "stale_order_reconciliation"
+    assert failure.status_updated_reason == "broker_lookup_window_expired"
+    engine.dispose()
+
+
+def test_reconcile_resolves_preexisting_open_failure_for_already_expired_order() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        stale_broker_order_reconciliation_threshold_seconds=3600,
+    )
+    engine, db = _session(settings)
+    expired_at = datetime.now(UTC) - timedelta(days=2)
+    order = _order(status="reconcile_window_expired", broker_order_id="kier2570-expired-1")
+    order.submitted_at = expired_at
+    order.last_broker_sync_at = expired_at
+    order.last_error_classification = "broker_rejected"
+    order.last_error_code = "KIER2570"
+    order.last_error_message = "조회일자를 확인하십시오"
+    db.add(order)
+    db.commit()
+    failure = ExecutionFailure(
+        mode=settings.runtime_mode,
+        broker_order_pk=order.id,
+        broker_name="kis",
+        idempotency_key=order.idempotency_key,
+        symbol=order.symbol,
+        side=order.side,
+        requested_quantity=order.quantity or 0,
+        classification="broker_rejected",
+        broker_error_classification="broker_rejected",
+        broker_error_code="KIER2570",
+        broker_error_message="조회일자를 확인하십시오",
+        retryable=False,
+        status="open",
+        first_failed_at=expired_at,
+        latest_failed_at=expired_at,
+    )
+    db.add(failure)
+    db.commit()
+    broker = ReconciliationStubBroker()
+
+    result = reconcile_stale_nonterminal_broker_orders(
+        settings=settings,
+        db=db,
+        adapter=broker,
+    )
+
+    db.refresh(failure)
+    events = db.scalars(
+        select(BrokerOrderEvent).where(
+            BrokerOrderEvent.event_type == "expired_reconciliation_failure_resolved"
+        )
+    ).all()
+    assert result["candidate_order_count"] == 0
+    assert result["expired_failure_cleanup"]["candidate_failure_count"] == 1
+    assert result["expired_failure_cleanup"]["resolved_failure_count"] == 1
+    assert result["expired_failure_cleanup"]["items"][0]["action"] == "resolved"
+    assert broker.reconcile_calls == []
+    assert order.status == "reconcile_window_expired"
+    assert failure.status == "resolved"
+    assert failure.status_updated_by == "system"
+    assert failure.status_updated_source == "stale_order_reconciliation_expired_order_cleanup"
+    assert failure.status_updated_reason == "broker_lookup_window_expired"
+    assert len(events) == 1
+    assert events[0].broker_order_pk == order.id
+    assert events[0].payload["execution_failure_id"] == failure.id
+    assert events[0].payload["failure_status_before"] == "open"
+    assert events[0].payload["failure_status_after"] == "resolved"
+
+    second = reconcile_stale_nonterminal_broker_orders(
+        settings=settings,
+        db=db,
+        adapter=broker,
+    )
+
+    events_after_second_run = db.scalars(
+        select(BrokerOrderEvent).where(
+            BrokerOrderEvent.event_type == "expired_reconciliation_failure_resolved"
+        )
+    ).all()
+    assert second["expired_failure_cleanup"]["candidate_failure_count"] == 0
+    assert len(events_after_second_run) == 1
+    assert broker.reconcile_calls == []
+    engine.dispose()
+
+
+def test_reconcile_does_not_resolve_unrelated_open_failure_for_expired_order() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        stale_broker_order_reconciliation_threshold_seconds=3600,
+    )
+    engine, db = _session(settings)
+    failed_at = datetime.now(UTC) - timedelta(days=2)
+    order = _order(status="reconcile_window_expired", broker_order_id="unrelated-expired-1")
+    order.submitted_at = failed_at
+    order.last_broker_sync_at = failed_at
+    order.last_error_classification = "broker_rejected"
+    order.last_error_code = "INSUFFICIENT_CASH"
+    order.last_error_message = "insufficient cash available for order"
+    db.add(order)
+    db.commit()
+    failure = ExecutionFailure(
+        mode=settings.runtime_mode,
+        broker_order_pk=order.id,
+        broker_name="kis",
+        idempotency_key=order.idempotency_key,
+        symbol=order.symbol,
+        side=order.side,
+        requested_quantity=order.quantity or 0,
+        classification="insufficient_funds",
+        broker_error_classification="broker_rejected",
+        broker_error_code="INSUFFICIENT_CASH",
+        broker_error_message="insufficient cash available for order",
+        retryable=False,
+        status="open",
+        first_failed_at=failed_at,
+        latest_failed_at=failed_at,
+    )
+    db.add(failure)
+    db.commit()
+    broker = ReconciliationStubBroker()
+
+    result = reconcile_stale_nonterminal_broker_orders(
+        settings=settings,
+        db=db,
+        adapter=broker,
+    )
+
+    db.refresh(failure)
+    cleanup = result["expired_failure_cleanup"]
+    events = db.scalars(
+        select(BrokerOrderEvent).where(
+            BrokerOrderEvent.event_type == "expired_reconciliation_failure_resolved"
+        )
+    ).all()
+    assert result["candidate_order_count"] == 0
+    assert cleanup["candidate_failure_count"] == 1
+    assert cleanup["resolved_failure_count"] == 0
+    assert cleanup["items"][0]["action"] == "skipped"
+    assert cleanup["items"][0]["reason"] == "missing_lookup_window_expired_evidence"
+    assert broker.reconcile_calls == []
+    assert failure.status == "open"
+    assert failure.status_updated_at is None
+    assert events == []
     engine.dispose()
 
 

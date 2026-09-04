@@ -203,6 +203,31 @@ def list_execution_failures(
     return [serialize_execution_failure(failure) for failure in failures]
 
 
+def resolve_execution_failure_for_order(
+    *,
+    db: Session,
+    order: BrokerOrder,
+    observed_at: datetime,
+    source: str,
+    reason: str,
+) -> ExecutionFailure | None:
+    failure = db.scalar(
+        select(ExecutionFailure).where(
+            ExecutionFailure.mode == order.mode,
+            ExecutionFailure.broker_order_pk == order.id,
+        )
+    )
+    if failure is None:
+        return None
+
+    failure.status = "resolved"
+    failure.status_updated_at = observed_at
+    failure.status_updated_by = "system"
+    failure.status_updated_source = source
+    failure.status_updated_reason = reason
+    return failure
+
+
 def update_execution_failure_status(
     *,
     settings: Settings,
