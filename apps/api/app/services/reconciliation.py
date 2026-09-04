@@ -16,7 +16,13 @@ from app.broker.base import (
     NormalizedBrokerOrderStatus,
 )
 from app.core.config import Settings
-from app.models.runtime import BrokerOrder, BrokerOrderEvent, ExecutionFill, ExecutionPosition
+from app.models.runtime import (
+    BrokerOrder,
+    BrokerOrderEvent,
+    ExecutionFailure,
+    ExecutionFill,
+    ExecutionPosition,
+)
 from app.services.broker_auth import ensure_authenticated_broker_session
 from app.services.broker_order_state import NONTERMINAL_ORDER_STATUSES
 from app.services.fill_idempotency import execution_fill_dedupe_key, execution_fill_idempotency_key
@@ -475,6 +481,15 @@ def reconcile_stale_nonterminal_broker_orders(
             }
         )
 
+    expired_failure_cleanup = _resolve_open_failures_for_expired_reconciliation_orders(
+        settings=settings,
+        db=db,
+        broker_name=adapter.provider,
+        symbols=_normalize_symbols(symbols),
+        observed_at=observed_at,
+        dry_run=dry_run,
+    )
+
     position_sync_result = None
     if position_sync_symbols and not dry_run:
         results = [
@@ -517,7 +532,160 @@ def reconcile_stale_nonterminal_broker_orders(
             "updated": 0,
             "zeroed": 0,
         },
+        "expired_failure_cleanup": expired_failure_cleanup,
         "items": items,
+    }
+
+
+def _resolve_open_failures_for_expired_reconciliation_orders(
+    *,
+    settings: Settings,
+    db: Session,
+    broker_name: str,
+    symbols: set[str] | None,
+    observed_at: datetime,
+    dry_run: bool,
+) -> dict[str, object]:
+    failures = _load_open_failures_for_expired_reconciliation_orders(
+        settings=settings,
+        db=db,
+        broker_name=broker_name,
+        symbols=symbols,
+    )
+    items: list[dict[str, object]] = []
+    resolved_count = 0
+    for failure in failures:
+        order = failure.broker_order
+        if not _is_lookup_window_expired_evidence(
+            code=order.last_error_code or failure.broker_error_code,
+            message=order.last_error_message or failure.broker_error_message,
+        ):
+            items.append(
+                _expired_failure_cleanup_item(
+                    failure=failure,
+                    order=order,
+                    action="skipped",
+                    reason="missing_lookup_window_expired_evidence",
+                )
+            )
+            continue
+
+        resolved_count += 1
+        reason = "broker_lookup_window_expired"
+        if not dry_run:
+            status_before = failure.status
+            resolve_execution_failure_for_order(
+                db=db,
+                order=order,
+                observed_at=observed_at,
+                source="stale_order_reconciliation_expired_order_cleanup",
+                reason=reason,
+            )
+            _record_expired_order_failure_cleanup_event(
+                db=db,
+                order=order,
+                failure=failure,
+                status_before=status_before,
+                observed_at=observed_at,
+                reason=reason,
+            )
+        items.append(
+            _expired_failure_cleanup_item(
+                failure=failure,
+                order=order,
+                action="would_resolve" if dry_run else "resolved",
+                reason=reason,
+            )
+        )
+
+    return {
+        "candidate_failure_count": len(failures),
+        "resolved_failure_count": 0 if dry_run else resolved_count,
+        "would_resolve_failure_count": resolved_count if dry_run else 0,
+        "items": items,
+    }
+
+
+def _load_open_failures_for_expired_reconciliation_orders(
+    *,
+    settings: Settings,
+    db: Session,
+    broker_name: str,
+    symbols: set[str] | None,
+) -> list[ExecutionFailure]:
+    where = [
+        ExecutionFailure.mode == settings.runtime_mode,
+        ExecutionFailure.broker_name == broker_name,
+        ExecutionFailure.status == "open",
+        BrokerOrder.mode == settings.runtime_mode,
+        BrokerOrder.broker_name == broker_name,
+        BrokerOrder.status == NormalizedBrokerOrderStatus.RECONCILE_WINDOW_EXPIRED.value,
+    ]
+    if symbols is not None:
+        where.append(BrokerOrder.symbol.in_(sorted(symbols)))
+    return db.scalars(
+        select(ExecutionFailure)
+        .join(ExecutionFailure.broker_order)
+        .options(selectinload(ExecutionFailure.broker_order))
+        .where(*where)
+        .order_by(ExecutionFailure.latest_failed_at.asc(), ExecutionFailure.created_at.asc())
+    ).all()
+
+
+def _record_expired_order_failure_cleanup_event(
+    *,
+    db: Session,
+    order: BrokerOrder,
+    failure: ExecutionFailure,
+    status_before: str,
+    observed_at: datetime,
+    reason: str,
+) -> None:
+    db.add(
+        BrokerOrderEvent(
+            broker_order_pk=order.id,
+            event_type="expired_reconciliation_failure_resolved",
+            event_source=BrokerEventSource.RECONCILIATION.value,
+            normalized_status=order.status,
+            broker_status=order.last_error_code or failure.broker_error_code,
+            error_classification="reconcile_window_expired",
+            retryable=False,
+            message=reason,
+            payload={
+                "execution_failure_id": failure.id,
+                "failure_status_before": status_before,
+                "failure_status_after": failure.status,
+                "status_updated_source": failure.status_updated_source,
+                "status_updated_reason": failure.status_updated_reason,
+                "broker_order_id": order.broker_order_id,
+                "idempotency_key": order.idempotency_key,
+                "broker_error_code": failure.broker_error_code,
+                "broker_error_classification": failure.broker_error_classification,
+            },
+            observed_at=observed_at,
+        )
+    )
+
+
+def _expired_failure_cleanup_item(
+    *,
+    failure: ExecutionFailure,
+    order: BrokerOrder,
+    action: str,
+    reason: str,
+) -> dict[str, object]:
+    return {
+        "execution_failure_id": failure.id,
+        "broker_order_pk": order.id,
+        "broker_order_id": order.broker_order_id,
+        "idempotency_key": order.idempotency_key,
+        "symbol": order.symbol,
+        "side": order.side,
+        "failure_status": failure.status,
+        "order_status": order.status,
+        "action": action,
+        "reason": reason,
+        "broker_error_code": failure.broker_error_code,
     }
 
 
