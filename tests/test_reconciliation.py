@@ -860,6 +860,26 @@ def test_reconcile_stale_submitted_kier_lookup_window_response_repairs_to_window
     order.last_broker_sync_at = stale_submitted_at
     db.add(order)
     db.commit()
+    db.add(
+        ExecutionFailure(
+            mode=settings.runtime_mode,
+            broker_order_pk=order.id,
+            broker_name="kis",
+            idempotency_key=order.idempotency_key,
+            symbol=order.symbol,
+            side=order.side,
+            requested_quantity=order.quantity or 0,
+            classification="broker_rejected",
+            broker_error_classification="broker_rejected",
+            broker_error_code="KIER2570",
+            broker_error_message="조회일자를 확인하십시오",
+            retryable=False,
+            status="open",
+            first_failed_at=stale_submitted_at,
+            latest_failed_at=stale_submitted_at,
+        )
+    )
+    db.commit()
 
     class LookupWindowBroker(ReconciliationStubBroker):
         def reconcile_order(
@@ -924,6 +944,10 @@ def test_reconcile_stale_submitted_kier_lookup_window_response_repairs_to_window
     assert failure.broker_error_classification == "broker_rejected"
     assert failure.broker_error_code == "KIER2570"
     assert failure.latest_failed_at is not None
+    assert failure.status == "resolved"
+    assert failure.status_updated_by == "system"
+    assert failure.status_updated_source == "stale_order_reconciliation"
+    assert failure.status_updated_reason == "broker_lookup_window_expired"
     engine.dispose()
 
 

@@ -20,7 +20,10 @@ from app.models.runtime import BrokerOrder, BrokerOrderEvent, ExecutionFill, Exe
 from app.services.broker_auth import ensure_authenticated_broker_session
 from app.services.broker_order_state import NONTERMINAL_ORDER_STATUSES
 from app.services.fill_idempotency import execution_fill_dedupe_key, execution_fill_idempotency_key
-from app.services.execution_failures import record_actionable_execution_failure
+from app.services.execution_failures import (
+    record_actionable_execution_failure,
+    resolve_execution_failure_for_order,
+)
 from app.services.rejected_order_retries import handle_reconciled_rejected_order
 from app.services.runtime_transitions import (
     apply_broker_order_status,
@@ -401,7 +404,15 @@ def reconcile_stale_nonterminal_broker_orders(
                     observed_at=classification_observed_at,
                     result=result,
                 )
-                if order.last_error_classification == "broker_rejected":
+                if repair["status_after"] == NormalizedBrokerOrderStatus.RECONCILE_WINDOW_EXPIRED.value:
+                    resolve_execution_failure_for_order(
+                        db=db,
+                        order=order,
+                        observed_at=classification_observed_at,
+                        source="stale_order_reconciliation",
+                        reason=repair["reason"] or "broker_lookup_window_expired",
+                    )
+                elif order.last_error_classification == "broker_rejected":
                     record_actionable_execution_failure(
                         settings=settings,
                         db=db,
