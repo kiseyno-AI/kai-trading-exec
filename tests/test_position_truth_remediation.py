@@ -9,13 +9,21 @@ from decimal import Decimal
 import pytest
 from sqlalchemy import select
 
-from app.broker.base import BrokerAccountHolding, BrokerAccountSnapshot
+from app.broker.base import (
+    BrokerAccountHolding,
+    BrokerAccountSnapshot,
+    BrokerConfig,
+    BrokerReconnectHandle,
+    BrokerTokenGrant,
+)
 from app.core.config import Settings
 from app.db.base import Base
 from app.db.session import create_db_engine, create_session_factory
 from app.models.runtime import (
     BrokerOrder,
     BrokerOrderEvent,
+    BrokerSession,
+    BrokerSessionEvent,
     ExecutionFill,
     ExecutionPosition,
     RuntimeRemediationEvent,
@@ -35,6 +43,26 @@ class PositionInquiryAdapter:
     def __init__(self, *, fail_exchange: str | None = None) -> None:
         self.exchanges: list[str] = []
         self.fail_exchange = fail_exchange
+        self.authenticate_calls = 0
+
+    def describe(self) -> BrokerConfig:
+        return BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url="https://broker.test",
+        )
+
+    def reconnect_handle(self) -> BrokerReconnectHandle:
+        return BrokerReconnectHandle(supported=True, strategy="test")
+
+    def authenticate(self) -> BrokerTokenGrant:
+        self.authenticate_calls += 1
+        return BrokerTokenGrant(
+            access_token="renewed-token",
+            token_type="Bearer",
+            access_token_expires_at=NOW + timedelta(days=1),
+        )
 
     def get_account_snapshot(self, access_token: str, *, symbols=None, exchange="KRX"):
         self.exchanges.append(exchange)
@@ -82,6 +110,47 @@ def _session():
     engine = create_db_engine(settings)
     Base.metadata.create_all(engine)
     return settings, engine, create_session_factory(engine)()
+
+
+def _add_filled_us_buy_order_event(
+    db,
+    *,
+    symbol: str,
+    exchange: str,
+    suffix: str,
+) -> BrokerOrder:
+    order = BrokerOrder(
+        broker_name="kis",
+        mode="paper",
+        idempotency_key=f"{suffix}-{symbol.lower()}-position",
+        broker_order_id=f"{suffix}-{symbol.lower()}-buy",
+        symbol=symbol,
+        side="buy",
+        status="filled",
+        quantity=2,
+        venue="kis",
+        asset_class="us_equity",
+        submitted_at=NOW - timedelta(minutes=10),
+    )
+    db.add(order)
+    db.flush()
+    db.add(
+        BrokerOrderEvent(
+            broker_order_pk=order.id,
+            event_type="submit_requested",
+            event_source="submission",
+            request_payload={
+                "provider": "kis",
+                "venue": "kis",
+                "asset_class": "us_equity",
+                "symbol": symbol,
+                "side": "buy",
+                "exchange": exchange,
+            },
+            observed_at=NOW - timedelta(minutes=10),
+        )
+    )
+    return order
 
 
 def test_position_truth_remediation_routes_supported_and_blocks_unknown(monkeypatch) -> None:
@@ -235,6 +304,107 @@ def test_missing_us_position_recovers_exchange_from_filled_order_event(
     engine.dispose()
 
 
+def test_existing_us_position_without_exchange_recovers_unique_filled_order_exchange(
+    monkeypatch,
+) -> None:
+    settings, engine, db = _session()
+    db.add(
+        ExecutionPosition(
+            mode="paper",
+            symbol="AAPL",
+            quantity=0,
+            average_price=None,
+            updated_from="reconciliation",
+            last_reconciled_at=NOW - timedelta(days=1),
+            raw_payload={"rt_cd": "0"},
+        )
+    )
+    _add_filled_us_buy_order_event(
+        db,
+        symbol="AAPL",
+        exchange="NASD",
+        suffix="existing",
+    )
+    db.commit()
+    adapter = PositionInquiryAdapter()
+    monkeypatch.setattr(
+        "app.services.reconciliation.ensure_authenticated_broker_session",
+        lambda **kwargs: type("SessionState", (), {"access_token": "test-token"})(),
+    )
+
+    dry_run = analyze_position_truth_remediation(settings=settings, db=db, now=NOW)
+    applied = apply_position_truth_remediation(
+        settings=settings,
+        db=db,
+        adapter=adapter,
+        actor="Peter",
+        reason="recover existing U.S. position route from unique order evidence",
+        now=NOW,
+    )
+
+    assert dry_run["items"][0]["exchange"] == "NASD"
+    assert dry_run["items"][0]["eligible"] is True
+    assert adapter.exchanges == ["NASD"]
+    assert applied["summary"]["refreshed_count"] == 1
+    position = db.scalar(select(ExecutionPosition).where(ExecutionPosition.symbol == "AAPL"))
+    assert position is not None
+    assert position.quantity == 2
+    assert position.raw_payload["_position_sync"]["exchange"] == "NASD"
+    engine.dispose()
+
+
+def test_existing_us_position_with_ambiguous_order_exchanges_fails_closed() -> None:
+    settings, engine, db = _session()
+    old = NOW - timedelta(days=1)
+    db.add(
+        ExecutionPosition(
+            mode="paper",
+            symbol="AAPL",
+            quantity=0,
+            average_price=None,
+            updated_from="reconciliation",
+            last_reconciled_at=old,
+            raw_payload={"rt_cd": "0"},
+        )
+    )
+    _add_filled_us_buy_order_event(
+        db,
+        symbol="AAPL",
+        exchange="NASD",
+        suffix="ambiguous-nasd",
+    )
+    _add_filled_us_buy_order_event(
+        db,
+        symbol="AAPL",
+        exchange="NYSE",
+        suffix="ambiguous-nyse",
+    )
+    db.commit()
+    adapter = PositionInquiryAdapter()
+
+    dry_run = analyze_position_truth_remediation(settings=settings, db=db, now=NOW)
+    applied = apply_position_truth_remediation(
+        settings=settings,
+        db=db,
+        adapter=adapter,
+        actor="Peter",
+        reason="ambiguous exchange evidence requires manual review",
+        now=NOW,
+    )
+
+    assert dry_run["items"][0]["exchange"] is None
+    assert dry_run["items"][0]["eligible"] is False
+    assert adapter.exchanges == []
+    assert applied["summary"]["manual_review_count"] == 1
+    position = db.scalar(select(ExecutionPosition).where(ExecutionPosition.symbol == "AAPL"))
+    assert position is not None
+    assert position.last_reconciled_at == old.replace(tzinfo=None)
+    review = db.scalar(select(RuntimeRemediationEvent))
+    assert review is not None
+    assert review.outcome == "manual_review_required"
+    engine.dispose()
+
+
 def test_position_truth_remediation_rolls_back_prior_exchange_when_later_inquiry_fails(
     monkeypatch,
 ) -> None:
@@ -287,6 +457,75 @@ def test_position_truth_remediation_rolls_back_prior_exchange_when_later_inquiry
     assert position.average_price == Decimal("200000.0000")
     assert position.last_reconciled_at == old.replace(tzinfo=None)
     assert events == []
+    engine.dispose()
+
+
+def test_position_truth_remediation_rolls_back_auth_refresh_with_prior_exchange(
+    monkeypatch,
+) -> None:
+    settings, engine, db = _session()
+    old = NOW - timedelta(days=1)
+    db.add_all(
+        [
+            BrokerSession(
+                id="kis:paper",
+                provider="kis",
+                mode="paper",
+                api_base_url="https://broker.test",
+                access_token="original-token",
+                token_type="Bearer",
+                access_token_expires_at=NOW + timedelta(hours=1),
+            ),
+            ExecutionPosition(
+                mode="paper",
+                symbol="003550",
+                quantity=5,
+                average_price=Decimal("200000"),
+                updated_from="test",
+                last_reconciled_at=old,
+            ),
+            ExecutionPosition(
+                mode="paper",
+                symbol="APTX",
+                quantity=3,
+                average_price=Decimal("1"),
+                updated_from="test",
+                last_reconciled_at=old,
+                raw_payload={"_position_sync": {"exchange": "NASD"}},
+            ),
+        ]
+    )
+    db.commit()
+    reusable_results = iter((True, False))
+    monkeypatch.setattr(
+        "app.services.broker_auth._session_token_reusable",
+        lambda _state: next(reusable_results),
+    )
+    adapter = PositionInquiryAdapter(fail_exchange="NASD")
+
+    with pytest.raises(RuntimeError, match="NASD inquiry failed"):
+        apply_position_truth_remediation(
+            settings=settings,
+            db=db,
+            adapter=adapter,
+            actor="Peter",
+            reason="all exchanges and authentication must remain atomic",
+            now=NOW,
+        )
+
+    db.expire_all()
+    position = db.scalar(select(ExecutionPosition).where(ExecutionPosition.symbol == "003550"))
+    broker_session = db.get(BrokerSession, "kis:paper")
+    assert adapter.exchanges == ["KRX", "NASD"]
+    assert adapter.authenticate_calls == 1
+    assert position is not None
+    assert position.quantity == 5
+    assert position.average_price == Decimal("200000.0000")
+    assert position.last_reconciled_at == old.replace(tzinfo=None)
+    assert broker_session is not None
+    assert broker_session.access_token == "original-token"
+    assert db.scalars(select(BrokerSessionEvent)).all() == []
+    assert db.scalars(select(RuntimeRemediationEvent)).all() == []
     engine.dispose()
 
 

@@ -43,7 +43,7 @@ def analyze_position_truth_remediation(
     order_exchanges = _missing_position_order_exchanges(
         settings=settings,
         db=db,
-        symbols={symbol for symbol in stale_symbols if symbol not in positions},
+        symbols=set(stale_symbols),
     )
     items: list[dict[str, object]] = []
     for symbol in sorted(stale_symbols):
@@ -240,7 +240,7 @@ def _position_exchange(
             exchange = str(sync_context.get("exchange") or "").strip().upper()
             if exchange:
                 return exchange
-    if position is None and order_exchange is not None:
+    if order_exchange is not None:
         return order_exchange
     if symbol.isdigit() and len(symbol) == 6:
         return "KRX"

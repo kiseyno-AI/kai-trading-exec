@@ -359,10 +359,14 @@ def broker_order_fill_quality_payload(
         .order_by(BrokerOrder.submitted_at.desc(), BrokerOrder.created_at.desc())
         .limit(MAX_STATUS_DETAIL_ITEMS)
     ).all()
-    missing_order_ids = [
-        str(order_id)
-        for order_id in db.scalars(select(missing_fill_subquery.c.id)).all()
-    ]
+    missing_order_rows = db.execute(
+        select(missing_fill_subquery.c.id, missing_fill_subquery.c.symbol)
+    ).all()
+    missing_order_symbols = {
+        str(order_id): str(symbol)
+        for order_id, symbol in missing_order_rows
+    }
+    missing_order_ids = list(missing_order_symbols)
     missing_reviews = db.scalars(
         select(RuntimeRemediationEvent).where(
             RuntimeRemediationEvent.mode == settings.runtime_mode,
@@ -390,6 +394,16 @@ def broker_order_fill_quality_payload(
     missing_manual_review_count = sum(
         1 for order_id in missing_order_ids if order_id in missing_review_by_subject
     )
+    missing_unreviewed_symbols = sorted({
+        symbol
+        for order_id, symbol in missing_order_symbols.items()
+        if order_id not in missing_review_by_subject
+    })
+    missing_manual_review_symbols = sorted({
+        symbol
+        for order_id, symbol in missing_order_symbols.items()
+        if order_id in missing_review_by_subject
+    })
 
     duplicate_fill_identity = case(
         (
@@ -460,6 +474,8 @@ def broker_order_fill_quality_payload(
         "missing_filled_order_fill_count": missing_fill_count,
         "missing_filled_order_fill_unreviewed_count": missing_fill_count - missing_manual_review_count,
         "missing_filled_order_fill_manual_review_count": missing_manual_review_count,
+        "missing_filled_order_fill_unreviewed_symbols": missing_unreviewed_symbols,
+        "missing_filled_order_fill_manual_review_symbols": missing_manual_review_symbols,
         "missing_filled_order_fill_items": missing_fill_items,
         "missing_filled_order_fill_truncated": missing_fill_count > len(missing_fill_items),
         "duplicate_fill_group_count": duplicate_fill_count,
@@ -630,16 +646,24 @@ def runtime_actionable_alerts_payload(
             else fill_quality.get("missing_filled_order_fill_count") or 0
         )
         if missing_fill_count > 0:
+            if "missing_filled_order_fill_unreviewed_symbols" in fill_quality:
+                missing_fill_symbols = (
+                    fill_quality.get("missing_filled_order_fill_unreviewed_symbols") or []
+                )
+            else:
+                missing_fill_symbols = sorted({
+                    str(item.get("symbol"))
+                    for item in fill_quality.get("missing_filled_order_fill_items") or []
+                    if isinstance(item, dict)
+                    and item.get("symbol")
+                    and item.get("review_outcome") != "manual_review_required"
+                })
             alerts.append(
                 {
                     "kind": "filled_broker_orders_missing_execution_fills",
                     "severity": "critical",
                     "count": missing_fill_count,
-                    "symbols": sorted({
-                        str(item.get("symbol"))
-                        for item in fill_quality.get("missing_filled_order_fill_items") or []
-                        if isinstance(item, dict) and item.get("symbol")
-                    }),
+                    "symbols": missing_fill_symbols,
                     "message": (
                         "filled broker orders are missing execution_fills rows, "
                         "so FIFO realized P/L is incomplete"
@@ -650,18 +674,24 @@ def runtime_actionable_alerts_payload(
             fill_quality.get("missing_filled_order_fill_manual_review_count") or 0
         )
         if manual_review_fill_count > 0:
+            if "missing_filled_order_fill_manual_review_symbols" in fill_quality:
+                manual_review_fill_symbols = (
+                    fill_quality.get("missing_filled_order_fill_manual_review_symbols") or []
+                )
+            else:
+                manual_review_fill_symbols = sorted({
+                    str(item.get("symbol"))
+                    for item in fill_quality.get("missing_filled_order_fill_items") or []
+                    if isinstance(item, dict)
+                    and item.get("symbol")
+                    and item.get("review_outcome") == "manual_review_required"
+                })
             alerts.append(
                 {
                     "kind": "filled_broker_orders_missing_fills_manual_review",
                     "severity": "critical",
                     "count": manual_review_fill_count,
-                    "symbols": sorted({
-                        str(item.get("symbol"))
-                        for item in fill_quality.get("missing_filled_order_fill_items") or []
-                        if isinstance(item, dict)
-                        and item.get("symbol")
-                        and item.get("review_outcome") == "manual_review_required"
-                    }),
+                    "symbols": manual_review_fill_symbols,
                     "message": (
                         "missing execution_fills lack authoritative broker evidence and "
                         "have durable manual-review blockers"

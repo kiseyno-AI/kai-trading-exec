@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
+import pytest
 from sqlalchemy import select
 
 from app.core.config import Settings
@@ -225,6 +226,89 @@ def test_live_fill_repair_requires_database_url_argument(tmp_path: Path) -> None
     assert result.returncode != 0
     assert "requires --database-url explicitly" in result.stderr
     assert not (tmp_path / "must-not-open.db").exists()
+
+
+@pytest.mark.parametrize(
+    ("actor", "reason"),
+    [("   ", "valid reason"), ("Peter", "\t  ")],
+)
+def test_fill_remediation_rejects_blank_audit_metadata_before_opening_database(
+    tmp_path: Path,
+    actor: str,
+    reason: str,
+) -> None:
+    database_path = tmp_path / "must-not-open.db"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "scripts/repair_execution_fill_evidence.py",
+            "--database-url",
+            f"sqlite:///{database_path}",
+            "--runtime-mode",
+            "paper",
+            "--apply",
+            "--actor",
+            actor,
+            "--reason",
+            reason,
+        ],
+        capture_output=True,
+        text=True,
+        env=os.environ,
+    )
+
+    assert result.returncode != 0
+    assert "--apply requires --actor and --reason" in result.stderr
+    assert not database_path.exists()
+
+
+def test_fill_remediation_cli_trims_applied_audit_metadata(tmp_path: Path) -> None:
+    database_url = f"sqlite:///{tmp_path / 'fill-remediation.db'}"
+    settings = _settings(database_url)
+    engine, db = _session(settings)
+    order = BrokerOrder(
+        broker_name="kis",
+        mode="paper",
+        idempotency_key="trim-audit-metadata",
+        broker_order_id="trim-audit-metadata-1",
+        symbol="001800",
+        side="buy",
+        status="filled",
+        quantity=5,
+        submitted_at=FILLED_AT,
+    )
+    db.add(order)
+    db.commit()
+    db.close()
+    engine.dispose()
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "scripts/repair_execution_fill_evidence.py",
+            "--database-url",
+            database_url,
+            "--runtime-mode",
+            "paper",
+            "--apply",
+            "--actor",
+            "  Peter  ",
+            "--reason",
+            "  authoritative fill evidence unavailable  ",
+        ],
+        capture_output=True,
+        text=True,
+        env=os.environ,
+    )
+
+    assert result.returncode == 0, result.stderr
+    engine = create_db_engine(settings)
+    with create_session_factory(engine)() as db:
+        event = db.scalar(select(RuntimeRemediationEvent))
+        assert event is not None
+        assert event.actor == "Peter"
+        assert event.reason == "authoritative fill evidence unavailable"
+    engine.dispose()
 
 
 def test_legacy_duplicate_fill_apply_is_disabled(tmp_path: Path) -> None:

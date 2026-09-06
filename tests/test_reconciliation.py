@@ -39,6 +39,7 @@ from app.models.runtime import (
     ExecutionPlanItem,
     ExecutionPlanItemAudit,
     ExecutionPosition,
+    RuntimeRemediationEvent,
 )
 from app.services.execution_jobs import dispatch_due_execution_jobs
 from app.services.reconciliation import (
@@ -1948,6 +1949,88 @@ def test_runtime_status_reports_pnl_fill_quality_alerts() -> None:
     alerts_by_kind = {alert["kind"]: alert for alert in alerts["alerts"]}
     assert alerts_by_kind["filled_broker_orders_missing_execution_fills"]["symbols"] == ["105560"]
     assert alerts_by_kind["duplicate_execution_fill_groups"]["symbols"] == ["282330"]
+    engine.dispose()
+
+
+def test_missing_fill_alert_symbols_exclude_reviewed_and_ignore_sample_limit() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+    )
+    engine, db = _session(settings)
+    submitted_at = datetime.now(UTC)
+    reviewed_orders = [
+        BrokerOrder(
+            broker_name="kis",
+            mode="paper",
+            idempotency_key=f"reviewed-missing-fill-{index}",
+            broker_order_id=f"reviewed-missing-fill-{index}",
+            symbol=f"REVIEWED{index:02d}",
+            side="buy",
+            status="filled",
+            quantity=1,
+            submitted_at=submitted_at + timedelta(minutes=index),
+        )
+        for index in range(20)
+    ]
+    unreviewed_order = BrokerOrder(
+        broker_name="kis",
+        mode="paper",
+        idempotency_key="older-actionable-missing-fill",
+        broker_order_id="older-actionable-missing-fill",
+        symbol="ACTIONABLE",
+        side="buy",
+        status="filled",
+        quantity=1,
+        submitted_at=submitted_at - timedelta(days=1),
+    )
+    db.add_all([*reviewed_orders, unreviewed_order])
+    db.flush()
+    db.add_all([
+        RuntimeRemediationEvent(
+            mode="paper",
+            candidate_type="missing_execution_fill",
+            candidate_key=f"{order.id}:missing",
+            subject_id=order.id,
+            outcome="manual_review_required",
+            actor="Peter",
+            reason="authoritative fill evidence unavailable",
+            evidence_summary={"fills_fabricated": 0},
+            occurred_at=submitted_at,
+        )
+        for order in reviewed_orders
+    ])
+    db.commit()
+
+    payload = build_runtime_status(
+        settings=settings,
+        runtime=RuntimeMetadata(started_at=datetime.now(UTC)),
+        db=db,
+    )
+
+    fill_quality = payload["freshness"]["broker_orders"]["fill_quality"]
+    assert fill_quality["missing_filled_order_fill_count"] == 21
+    assert fill_quality["missing_filled_order_fill_unreviewed_count"] == 1
+    assert fill_quality["missing_filled_order_fill_manual_review_count"] == 20
+    assert fill_quality["missing_filled_order_fill_truncated"] is True
+    assert all(
+        item["review_outcome"] == "manual_review_required"
+        for item in fill_quality["missing_filled_order_fill_items"]
+    )
+    assert fill_quality["missing_filled_order_fill_unreviewed_symbols"] == ["ACTIONABLE"]
+    alerts_by_kind = {
+        alert["kind"]: alert for alert in payload["actionable_alerts"]["alerts"]
+    }
+    assert alerts_by_kind["filled_broker_orders_missing_execution_fills"] == {
+        "kind": "filled_broker_orders_missing_execution_fills",
+        "severity": "critical",
+        "count": 1,
+        "symbols": ["ACTIONABLE"],
+        "message": (
+            "filled broker orders are missing execution_fills rows, "
+            "so FIFO realized P/L is incomplete"
+        ),
+    }
     engine.dispose()
 
 

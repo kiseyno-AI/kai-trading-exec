@@ -67,7 +67,9 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    if args.apply and (not args.actor or not args.reason):
+    actor = (args.actor or "").strip()
+    reason = (args.reason or "").strip()
+    if args.apply and (not actor or not reason):
         raise SystemExit("--apply requires --actor and --reason for auditability")
 
     runtime_mode = args.runtime_mode or os.getenv("KAI_EXEC_RUNTIME_MODE") or "mock"
@@ -89,8 +91,8 @@ def main() -> int:
                 payload = apply_fifo_inventory_repairs(
                     db=db,
                     runtime_mode=settings.runtime_mode,
-                    actor=args.actor or "",
-                    reason=args.reason or "",
+                    actor=actor,
+                    reason=reason,
                 )
             elif args.scope == "fifo-residuals":
                 payload = analyze_fifo_inventory_repairs(
@@ -101,8 +103,8 @@ def main() -> int:
                 payload = apply_execution_fill_repairs(
                     db=db,
                     runtime_mode=settings.runtime_mode,
-                    actor=args.actor or "",
-                    reason=args.reason or "",
+                    actor=actor,
+                    reason=reason,
                 )
             else:
                 payload = analyze_execution_fill_repairs(

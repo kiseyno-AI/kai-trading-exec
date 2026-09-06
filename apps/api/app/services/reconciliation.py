@@ -1050,6 +1050,7 @@ def sync_execution_positions_from_broker_snapshot(
         adapter=adapter,
         source="reconciliation",
         reason="refresh execution positions from broker snapshot",
+        commit=commit,
     )
     try:
         snapshot = adapter.get_account_snapshot(
