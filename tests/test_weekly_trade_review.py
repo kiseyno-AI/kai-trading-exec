@@ -602,6 +602,197 @@ def test_weekly_trade_review_pnl_coverage_classifies_each_sell_fill_once(tmp_pat
     }
 
 
+def test_weekly_trade_review_realized_summary_dedupes_duplicate_broker_sell_fills(tmp_path) -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        weekly_trade_review_dir=str(tmp_path),
+    )
+    engine, db = _build_db(settings)
+    start_at = datetime(2026, 7, 25, tzinfo=UTC)
+    end_at = datetime(2026, 8, 1, tzinfo=UTC)
+
+    db.add_all(
+        [
+            BrokerOrder(
+                id="dedupe-broker-buy-order",
+                broker_name="kis",
+                mode="paper",
+                idempotency_key="dedupe-broker-buy-order-key",
+                symbol="DEDUP",
+                side="buy",
+                status="filled",
+                quantity=2,
+                submitted_at=start_at + timedelta(hours=1),
+            ),
+            BrokerOrder(
+                id="dedupe-broker-sell-order",
+                broker_name="kis",
+                mode="paper",
+                idempotency_key="dedupe-broker-sell-order-key",
+                symbol="DEDUP",
+                side="sell",
+                status="filled",
+                quantity=1,
+                submitted_at=start_at + timedelta(hours=2),
+            ),
+        ]
+    )
+    db.flush()
+    db.add_all(
+        [
+            ExecutionFill(
+                id="dedupe-broker-buy-fill",
+                broker_order_pk="dedupe-broker-buy-order",
+                broker_fill_id="dedupe-broker-buy-fill",
+                symbol="DEDUP",
+                side="buy",
+                quantity=2,
+                price=Decimal("100"),
+                filled_at=start_at + timedelta(hours=1),
+            ),
+            ExecutionFill(
+                id="dedupe-broker-sell-fill-a",
+                broker_order_pk="dedupe-broker-sell-order",
+                broker_fill_id="broker-sell-identity",
+                symbol="DEDUP",
+                side="sell",
+                quantity=1,
+                price=Decimal("150"),
+                filled_at=start_at + timedelta(hours=2),
+            ),
+            ExecutionFill(
+                id="dedupe-broker-sell-fill-b",
+                broker_order_pk="dedupe-broker-sell-order",
+                broker_fill_id="broker-sell-identity",
+                symbol="DEDUP",
+                side="sell",
+                quantity=1,
+                price=Decimal("150"),
+                filled_at=start_at + timedelta(hours=2),
+            ),
+        ]
+    )
+    db.commit()
+
+    try:
+        report = generate_weekly_trade_review(
+            settings=settings,
+            db=db,
+            start_at=start_at,
+            end_at=end_at,
+            max_fills=10,
+        )
+    finally:
+        db.close()
+        engine.dispose()
+
+    assert report["counts"]["closed_trade_count"] == 1
+    assert report["counts"]["closed_sell_fill_count"] == 1
+    assert report["realized_pnl_summary"]["status"] == "complete"
+    assert report["realized_pnl_summary"]["sell_fill_count"] == 1
+    assert report["realized_pnl_summary"]["win_count"] == 1
+    assert report["realized_pnl_summary"]["loss_count"] == 0
+    assert report["realized_pnl_summary"]["realized_pnl"] == "50.0000"
+    assert report["realized_pnl_summary"]["best_trade"]["sell_fill_id"] == "dedupe-broker-sell-fill-a"
+
+
+def test_weekly_trade_review_realized_summary_dedupes_fallback_sell_fill_identity(tmp_path) -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        weekly_trade_review_dir=str(tmp_path),
+    )
+    engine, db = _build_db(settings)
+    start_at = datetime(2026, 7, 25, tzinfo=UTC)
+    end_at = datetime(2026, 8, 1, tzinfo=UTC)
+
+    db.add_all(
+        [
+            BrokerOrder(
+                id="dedupe-fallback-buy-order",
+                broker_name="kis",
+                mode="paper",
+                idempotency_key="dedupe-fallback-buy-order-key",
+                symbol="FALLBK",
+                side="buy",
+                status="filled",
+                quantity=1,
+                submitted_at=start_at + timedelta(hours=1),
+            ),
+            BrokerOrder(
+                id="dedupe-fallback-sell-order",
+                broker_name="kis",
+                mode="paper",
+                idempotency_key="dedupe-fallback-sell-order-key",
+                symbol="FALLBK",
+                side="sell",
+                status="filled",
+                quantity=1,
+                submitted_at=start_at + timedelta(hours=2),
+            ),
+        ]
+    )
+    db.flush()
+    sell_at = start_at + timedelta(hours=2)
+    db.add_all(
+        [
+            ExecutionFill(
+                id="dedupe-fallback-buy-fill",
+                broker_order_pk="dedupe-fallback-buy-order",
+                broker_fill_id=None,
+                symbol="FALLBK",
+                side="buy",
+                quantity=1,
+                price=Decimal("100"),
+                filled_at=start_at + timedelta(hours=1),
+            ),
+            ExecutionFill(
+                id="dedupe-fallback-sell-fill-a",
+                broker_order_pk="dedupe-fallback-sell-order",
+                broker_fill_id=None,
+                symbol="FALLBK",
+                side="sell",
+                quantity=1,
+                price=Decimal("75"),
+                filled_at=sell_at,
+            ),
+            ExecutionFill(
+                id="dedupe-fallback-sell-fill-b",
+                broker_order_pk="dedupe-fallback-sell-order",
+                broker_fill_id=None,
+                symbol="FALLBK",
+                side="sell",
+                quantity=1,
+                price=Decimal("75.0000"),
+                filled_at=sell_at,
+            ),
+        ]
+    )
+    db.commit()
+
+    try:
+        report = generate_weekly_trade_review(
+            settings=settings,
+            db=db,
+            start_at=start_at,
+            end_at=end_at,
+            max_fills=10,
+        )
+    finally:
+        db.close()
+        engine.dispose()
+
+    assert report["counts"]["closed_trade_count"] == 1
+    assert report["counts"]["closed_sell_fill_count"] == 1
+    assert report["realized_pnl_summary"]["status"] == "complete"
+    assert report["realized_pnl_summary"]["sell_fill_count"] == 1
+    assert report["realized_pnl_summary"]["win_count"] == 0
+    assert report["realized_pnl_summary"]["loss_count"] == 1
+    assert report["realized_pnl_summary"]["realized_pnl"] == "-25.0000"
+    assert report["realized_pnl_summary"]["worst_trade"]["sell_fill_id"] == "dedupe-fallback-sell-fill-a"
+
+
 def test_weekly_trade_review_cli_fails_before_artifact_when_required_mode_mismatches(tmp_path) -> None:
     env = _clean_kai_exec_env()
     env["KAI_EXEC_RUNTIME_MODE"] = "paper"

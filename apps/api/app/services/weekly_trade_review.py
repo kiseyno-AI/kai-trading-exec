@@ -29,6 +29,7 @@ from app.models.runtime import (
 from app.services.broker_order_state import (
     NONTERMINAL_ORDER_STATUSES,
 )
+from app.services.fill_idempotency import dedupe_execution_fills
 
 
 class WeeklyTradeReviewTimeoutError(TimeoutError):
@@ -714,7 +715,7 @@ def _weekly_closed_trades(
         .limit(max_rows + 1)
     ).all()
     truncated = len(newest_fills) > max_rows
-    fills = list(reversed(newest_fills[:max_rows]))
+    fills = dedupe_execution_fills(list(reversed(newest_fills[:max_rows])))
     sell_symbols = {
         fill.symbol
         for fill in fills
