@@ -305,6 +305,12 @@ writes JSON step events to stderr; `--timeout-seconds` exits with code `124`
 and a specific timeout payload if the bounded export exceeds its query-step
 deadline before writing an artifact.
 
+`realized_pnl_summary` groups the lot-level `closed_trades` rows by sell fill.
+When every sell fill has complete cost-basis coverage, it reports total realized
+P/L, win/loss/flat counts, average and median return, and best/worst trades. If
+coverage is incomplete or the historical scan is truncated, `realized_pnl` is
+null while covered-only metrics remain available with an explicit status.
+
 This keeps weekly evidence generation separate from
 `trade_outcome_feedback`, which performs broader analytics and may load
 historical state that is inappropriate for a large SQLite cron review.

@@ -423,6 +423,10 @@ python3 scripts/export_weekly_trade_review.py \
 
 The command writes JSON artifacts under
 `var/analytics/weekly_trade_review/` by default and updates `latest.json`.
+Each artifact includes `realized_pnl_summary`, which aggregates FIFO lot rows
+into one outcome per sell fill and reports realized P/L, win/loss/flat counts,
+average/median return, and best/worst closed trades when cost-basis coverage is
+complete. `closed_trades` remains the lot-level audit evidence.
 Use `KAI_EXEC_WEEKLY_TRADE_REVIEW_DIR` or `--output-dir` to change the target.
 Naive timestamps are interpreted as UTC; use explicit `+09:00` offsets for KRX
 trading-date bounds.
