@@ -230,6 +230,10 @@ Monitoring runtime settings currently supported:
 - `KAI_EXEC_MONITORING_MAX_BROKER_ACTIONS_PER_CYCLE`
 - `KAI_EXEC_MONITORING_WATCH_BUY_RETRY_COOLDOWN_SECONDS`
 - `KAI_EXEC_WATCH_BUY_STALE_TRIGGER_RECLAIM_THRESHOLD_PCT`
+- `KAI_EXEC_WATCH_BUY_LATE_ENTRY_MODE` (`disabled`, `shadow`, or `block`; default
+  `shadow`)
+- `KAI_EXEC_WATCH_BUY_LATE_ENTRY_CUTOFF_KRX` (KRX-local `HH:MM`; default
+  `10:30`)
 - `KAI_EXEC_WATCH_BUY_LIVE_MARKET_QUALITY_VETO_ENABLED` (default `true`)
 - `KAI_EXEC_WATCH_BUY_LIVE_MARKET_REGIME_DOWNSIZE_ALLOWED` (default `false`;
   live risk-off breadth remains a hard veto)

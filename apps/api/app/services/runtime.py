@@ -25,6 +25,7 @@ from app.models.runtime import (
 from app.services.fill_idempotency import dedupe_execution_fills
 from app.services.fifo_inventory import load_fifo_isolation_cursor
 from app.services.max_holding_actionability import max_holding_actionability_summary
+from app.services.late_entry_actionability import late_entry_actionability_summary
 from app.services.monitoring import (
     ACTIVE_WATCH_MONITORING_STATUSES,
     BLOCKED_MONITORING_STATUSES,
@@ -224,6 +225,16 @@ def runtime_watch_buy_veto_summary(
         "today_count": sum(int(count or 0) for _, count in rows),
         "today_symbols": symbols,
     }
+
+
+def runtime_late_entry_summary(*, settings: Settings, db: Session) -> dict[str, object]:
+    today_start_utc, tomorrow_start_utc = _current_krx_day_utc_bounds()
+    return late_entry_actionability_summary(
+        db=db,
+        mode=settings.runtime_mode,
+        start_at=today_start_utc,
+        end_at=tomorrow_start_utc,
+    )
 
 
 def runtime_freshness_payload(
@@ -1313,6 +1324,12 @@ def build_runtime_status(
     }
     counts: dict[str, int] = {"open_orders": 0, "active_execution_jobs": 0}
     watch_buy_vetoes: dict[str, object] = {"today_count": 0, "today_symbols": []}
+    late_entry_gate: dict[str, object] = {
+        "event_count": 0,
+        "shadow_count": 0,
+        "block_count": 0,
+        "symbols": [],
+    }
     account_drawdown_gate: dict[str, object] = {"gated": False, "latest_decision": None}
     autonomous = autonomous_runtime or _default_autonomous_runtime_payload(settings)
     monitoring_price_source = _autonomous_monitoring_price_source(autonomous)
@@ -1379,6 +1396,7 @@ def build_runtime_status(
     counts_available = True
 
     if settings.autonomous_runtime_enabled and not include_expensive_sections:
+        late_entry_gate = runtime_late_entry_summary(settings=settings, db=db)
         cached_symbols = _autonomous_runtime_snapshot_symbol_summary(autonomous=autonomous)
         cycle_symbols = _autonomous_runtime_snapshot_symbols(autonomous=autonomous) or _autonomous_monitoring_symbols(
             autonomous=autonomous
@@ -1425,6 +1443,7 @@ def build_runtime_status(
             "broker_providers": broker_providers,
             "counts": counts,
             "watch_buy_vetoes": watch_buy_vetoes,
+            "late_entry_gate": late_entry_gate,
             "symbols": symbols,
             "freshness": freshness,
             "actionable_alerts": runtime_actionable_alerts_payload(
@@ -1471,6 +1490,7 @@ def build_runtime_status(
             "broker_providers": broker_providers,
             "counts": counts,
             "watch_buy_vetoes": watch_buy_vetoes,
+            "late_entry_gate": late_entry_gate,
             "symbols": symbols,
             "freshness": freshness,
             "actionable_alerts": _default_actionable_alerts_payload(),
@@ -1515,6 +1535,7 @@ def build_runtime_status(
             "broker_providers": broker_providers,
             "counts": counts,
             "watch_buy_vetoes": watch_buy_vetoes,
+            "late_entry_gate": late_entry_gate,
             "symbols": symbols,
             "freshness": freshness,
             "weekly_pnl": weekly_pnl,
@@ -1527,6 +1548,7 @@ def build_runtime_status(
         safety = runtime_safety_payload(state)
         counts = runtime_counts(settings=settings, db=db)
         watch_buy_vetoes = runtime_watch_buy_veto_summary(settings=settings, db=db)
+        late_entry_gate = runtime_late_entry_summary(settings=settings, db=db)
         if include_expensive_sections:
             broker = build_broker_session_summary(settings=settings, db=db)
             broker_providers = broker_provider_readiness(settings=settings, db=db)
@@ -1617,6 +1639,7 @@ def build_runtime_status(
         "broker_providers": broker_providers,
         "counts": counts,
         "watch_buy_vetoes": watch_buy_vetoes,
+        "late_entry_gate": late_entry_gate,
         "symbols": symbols,
         "freshness": freshness,
         "actionable_alerts": actionable_alerts,

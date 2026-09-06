@@ -119,6 +119,7 @@ BLOCKED_WATCH_BUY_APPROVAL_REASONS = frozenset(
         "paused",
         "kill_switch",
         "stale_trigger_reclaim_required",
+        "late_entry_cutoff",
     }
 )
 PENDING_DISPATCH_MONITORING_STATUSES = frozenset(
@@ -205,6 +206,7 @@ OPEN_BUY_ORDER_STATUSES = frozenset(
 )
 RESERVED_CASH_EXHAUSTED_REASON = "reserved_cash_exhausted"
 LIVE_WATCH_BUY_VETO_EVENT_TYPE = "live_watch_buy_submission_veto"
+LATE_ENTRY_GATE_EVENT_TYPE = "watch_buy_late_entry_gate"
 ACCOUNT_DRAWDOWN_GATE_RELEASE_SUFFIX = ":account-drawdown-gate-disabled"
 
 
@@ -2238,7 +2240,6 @@ def _resolve_trigger_time_agent_action(
             "recorded_at": triggered_at.isoformat(),
         },
     )
-
     resolution = trigger_time_exec_agent.resolve_trigger_time_exec_agent_decision(
         settings=settings,
         db=db,
@@ -6400,6 +6401,15 @@ def _resolve_watch_buy_order(
     if stale_reclaim_veto is not None:
         return stale_reclaim_veto
 
+    late_entry_veto = _watch_buy_late_entry_gate(
+        settings=settings,
+        db=db,
+        item=item,
+        price=price,
+    )
+    if late_entry_veto is not None:
+        return late_entry_veto
+
     live_veto_recorded_at = _price_observed_at(price, datetime.now(UTC)) if price is not None else datetime.now(UTC)
     live_veto = _live_watch_buy_submission_veto(
         settings=settings,
@@ -6815,6 +6825,90 @@ def _record_live_watch_buy_submission_veto(
             error_message=approval.message,
             occurred_at=recorded_at,
         )
+    )
+
+
+def _watch_buy_late_entry_gate(
+    *,
+    settings: Settings,
+    db: Session,
+    item: ExecutionPlanItem,
+    price: MonitoringPriceRequest | None,
+) -> WatchBuyOrderApproval | None:
+    mode = settings.watch_buy_late_entry_mode
+    if mode == "disabled":
+        return None
+    observed_at = _price_observed_at(price, datetime.now(UTC))
+    observed_krx = observed_at.astimezone(KRX_TIMEZONE)
+    cutoff = datetime.strptime(settings.watch_buy_late_entry_cutoff_krx, "%H:%M").time()
+    if observed_krx.time().replace(tzinfo=None) <= cutoff:
+        return None
+
+    evidence = {
+        "mode": mode,
+        "reason": "late_entry_cutoff",
+        "cutoff_krx": settings.watch_buy_late_entry_cutoff_krx,
+        "observed_at": observed_at.isoformat(),
+        "observed_at_krx": observed_krx.isoformat(),
+        "market_date_krx": observed_krx.date().isoformat(),
+        "symbol": item.symbol,
+        "broker_mutations": False,
+    }
+    previous = _loaded_risk_context(item).get("last_monitoring_event")
+    duplicate = (
+        isinstance(previous, dict)
+        and previous.get("event") == LATE_ENTRY_GATE_EVENT_TYPE
+        and previous.get("mode") == mode
+        and previous.get("market_date_krx") == evidence["market_date_krx"]
+        and previous.get("cutoff_krx") == evidence["cutoff_krx"]
+    )
+    if not duplicate:
+        day_start_krx = observed_krx.replace(hour=0, minute=0, second=0, microsecond=0)
+        day_end_krx = day_start_krx + timedelta(days=1)
+        prior_audits = db.scalars(
+            select(ExecutionPlanItemAudit).where(
+                ExecutionPlanItemAudit.execution_plan_item_id == item.id,
+                ExecutionPlanItemAudit.event_type == LATE_ENTRY_GATE_EVENT_TYPE,
+                ExecutionPlanItemAudit.occurred_at >= day_start_krx.astimezone(UTC),
+                ExecutionPlanItemAudit.occurred_at < day_end_krx.astimezone(UTC),
+            )
+        ).all()
+        duplicate = any(
+            isinstance(audit.summary, dict)
+            and audit.summary.get("mode") == mode
+            and audit.summary.get("market_date_krx") == evidence["market_date_krx"]
+            for audit in prior_audits
+        )
+    if not duplicate:
+        _record_monitoring_event(
+            item=item,
+            event={"event": LATE_ENTRY_GATE_EVENT_TYPE, **evidence},
+        )
+        db.add(
+            ExecutionPlanItemAudit(
+                execution_plan_item_id=item.id,
+                event_type=LATE_ENTRY_GATE_EVENT_TYPE,
+                source=MONITORING_WORKER_NAME,
+                summary={
+                    "mode": mode,
+                    "reason": "late_entry_cutoff",
+                    "symbol": item.symbol,
+                    "market_date_krx": evidence["market_date_krx"],
+                },
+                payload=evidence,
+                occurred_at=observed_at,
+            )
+        )
+    if mode == "shadow":
+        return None
+    return WatchBuyOrderApproval(
+        quantity=None,
+        reason="late_entry_cutoff",
+        message=(
+            "watch buy is after the configured KRX entry cutoff "
+            f"{settings.watch_buy_late_entry_cutoff_krx}"
+        ),
+        details=evidence,
     )
 
 
