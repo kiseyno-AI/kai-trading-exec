@@ -27,8 +27,11 @@ from app.models.runtime import (
     MonitoringCheckpoint,
 )
 from app.services.broker_order_state import (
+    ACTIONABLE_OPEN_ORDER_STATUSES,
     NONTERMINAL_ORDER_STATUSES,
+    active_local_broker_order_filters,
 )
+from app.services.fifo_inventory import load_fifo_isolation_cursor
 from app.services.fill_idempotency import dedupe_execution_fills
 
 
@@ -78,6 +81,7 @@ def generate_weekly_trade_review(
     range_days = (end_at - start_at).total_seconds() / 86400
     if range_days > max_range_days:
         raise ValueError(f"review range is {range_days:.2f} days; max_range_days is {max_range_days}")
+    generated_at = datetime.now(UTC)
 
     target_dir = output_dir or Path(settings.weekly_trade_review_dir)
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -180,9 +184,8 @@ def generate_weekly_trade_review(
     )
     active_order_summary = _active_broker_order_summary(
         db=db,
-        mode=settings.runtime_mode,
-        reference_at=end_at,
-        stale_threshold_seconds=settings.stale_broker_order_reconciliation_threshold_seconds,
+        settings=settings,
+        reference_at=generated_at,
         max_stale_order_samples=max_stale_order_samples,
     )
     progress("active_broker_order_summary")
@@ -204,7 +207,7 @@ def generate_weekly_trade_review(
     progress("monitoring_sections", checkpoint_count=len(monitoring_checkpoints))
 
     report: dict[str, object] = {
-        "generated_at": datetime.now(UTC),
+        "generated_at": generated_at,
         "runtime_mode": settings.runtime_mode,
         "range": {
             "start_at": start_at,
@@ -552,23 +555,25 @@ def _weekly_execution_failures(
 def _active_broker_order_summary(
     *,
     db: Session,
-    mode: str,
+    settings: Settings,
     reference_at: datetime,
-    stale_threshold_seconds: int,
     max_stale_order_samples: int,
 ) -> dict[str, object]:
-    stale_before = reference_at - timedelta(seconds=stale_threshold_seconds)
-    nonterminal_counts = db.execute(
+    stale_before = reference_at - timedelta(
+        seconds=settings.stale_broker_order_reconciliation_threshold_seconds
+    )
+    actionable_counts = db.execute(
         select(
             BrokerOrder.status,
             func.count(BrokerOrder.id).label("count"),
             func.min(BrokerOrder.submitted_at).label("oldest_submitted_at"),
             func.max(BrokerOrder.submitted_at).label("newest_submitted_at"),
         )
-        .where(
-            BrokerOrder.mode == mode,
-            BrokerOrder.status.in_(NONTERMINAL_ORDER_STATUSES),
-        )
+        .where(*active_local_broker_order_filters(
+            settings=settings,
+            statuses=ACTIONABLE_OPEN_ORDER_STATUSES,
+            now=reference_at,
+        ))
         .group_by(BrokerOrder.status)
         .order_by(BrokerOrder.status.asc())
     ).all()
@@ -585,7 +590,7 @@ def _active_broker_order_summary(
             BrokerOrder.last_broker_sync_at,
         )
         .where(
-            BrokerOrder.mode == mode,
+            BrokerOrder.mode == settings.runtime_mode,
             BrokerOrder.status.in_(NONTERMINAL_ORDER_STATUSES),
             BrokerOrder.submitted_at.is_not(None),
             BrokerOrder.submitted_at < stale_before,
@@ -596,14 +601,18 @@ def _active_broker_order_summary(
     stale_samples, stale_truncated = _bounded_rows(stale_rows, max_stale_order_samples)
     missing_submitted_at_count = db.scalar(
         select(func.count(BrokerOrder.id)).where(
-            BrokerOrder.mode == mode,
+            BrokerOrder.mode == settings.runtime_mode,
             BrokerOrder.status.in_(NONTERMINAL_ORDER_STATUSES),
             BrokerOrder.submitted_at.is_(None),
         )
     )
     return {
         "stale_before": stale_before,
-        "nonterminal_status_counts": _rows_to_dicts(nonterminal_counts),
+        "actionable_status_counts": _rows_to_dicts(actionable_counts),
+        # Kept for existing artifact consumers; this now intentionally has the
+        # same actionable semantics as runtime counts.
+        "nonterminal_status_counts": _rows_to_dicts(actionable_counts),
+        "actionable_order_count": sum(int(row.count) for row in actionable_counts),
         "stale_nonterminal_samples": stale_samples,
         "stale_nonterminal_samples_truncated": stale_truncated,
         "missing_submitted_at_nonterminal_count": int(missing_submitted_at_count or 0),
@@ -722,29 +731,36 @@ def _weekly_closed_trades(
         if str(fill.side or "").lower() == "sell" and start_at <= _normalize_utc(fill.filled_at) < end_at
     }
     positions_by_symbol = _positions_by_symbol(db=db, mode=mode, symbols=sell_symbols)
+    isolation_cursor = load_fifo_isolation_cursor(db=db, runtime_mode=mode, through=end_at)
 
     lots_by_symbol: dict[str, list[dict[str, object]]] = {}
     closed: list[dict[str, object]] = []
     for fill in fills:
         side = str(fill.side or "").lower()
         quantity = _fill_quantity(fill)
+        fill_time = _normalize_utc(fill.filled_at)
+        lots = lots_by_symbol.setdefault(fill.symbol, [])
+        isolation_cursor.apply_before(
+            symbol=fill.symbol,
+            observed_at=fill_time,
+            lots=lots,
+        )
         if side == "buy":
-            lots_by_symbol.setdefault(fill.symbol, []).append(
+            lots.append(
                 {
                     "quantity": quantity,
                     "price": Decimal(fill.price),
-                    "filled_at": _normalize_utc(fill.filled_at),
+                    "filled_at": fill_time,
                     "fill_id": fill.id,
                 }
             )
             continue
         if side != "sell":
             continue
-        filled_at = _normalize_utc(fill.filled_at)
+        filled_at = fill_time
         in_period = start_at <= filled_at < end_at
         next_buy_after_sell = _next_buy_after(fills=fills, symbol=fill.symbol, after=filled_at)
         remaining = quantity
-        lots = lots_by_symbol.setdefault(fill.symbol, [])
         while remaining > 0 and lots:
             lot = lots[0]
             lot_quantity = Decimal(str(lot["quantity"]))
@@ -1014,8 +1030,9 @@ def _stale_fifo_inventory_alerts(
         .limit(max_rows + 1)
     ).all()
     truncated = len(newest_fills) > max_rows
-    fills = list(reversed(newest_fills[:max_rows]))
-    quantities: dict[str, Decimal] = {}
+    fills = dedupe_execution_fills(list(reversed(newest_fills[:max_rows])))
+    isolation_cursor = load_fifo_isolation_cursor(db=db, runtime_mode=mode, through=end_at)
+    lots_by_symbol: dict[str, list[Decimal]] = {}
     first_fill_at: dict[str, datetime] = {}
     last_fill_at: dict[str, datetime] = {}
     for fill in fills:
@@ -1023,10 +1040,22 @@ def _stale_fifo_inventory_alerts(
         first_fill_at[fill.symbol] = min(first_fill_at.get(fill.symbol, observed_at), observed_at)
         last_fill_at[fill.symbol] = max(last_fill_at.get(fill.symbol, observed_at), observed_at)
         quantity = _fill_quantity(fill)
+        lots = lots_by_symbol.setdefault(fill.symbol, [])
+        isolation_cursor.apply_before(symbol=fill.symbol, observed_at=observed_at, lots=lots)
         if str(fill.side or "").lower() == "buy":
-            quantities[fill.symbol] = quantities.get(fill.symbol, Decimal("0")) + quantity
+            lots.append(quantity)
         elif str(fill.side or "").lower() == "sell":
-            quantities[fill.symbol] = quantities.get(fill.symbol, Decimal("0")) - quantity
+            remaining = quantity
+            while remaining > 0 and lots:
+                matched = min(remaining, lots[0])
+                lots[0] -= matched
+                remaining -= matched
+                if lots[0] <= 0:
+                    lots.pop(0)
+    quantities: dict[str, Decimal] = {}
+    for symbol, lots in lots_by_symbol.items():
+        isolation_cursor.apply_through(symbol=symbol, observed_at=end_at, lots=lots)
+        quantities[symbol] = sum(lots, Decimal("0"))
     candidate_symbols = {symbol for symbol, quantity in quantities.items() if quantity > 0}
     positions_by_symbol = _positions_by_symbol(db=db, mode=mode, symbols=candidate_symbols)
     alerts: list[dict[str, object]] = []

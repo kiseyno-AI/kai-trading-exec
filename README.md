@@ -433,6 +433,20 @@ trading-date bounds.
 Only add `--include-json-payloads` for a manual deep-dive where loading stored
 broker/request payload JSON is intentional.
 
+To inspect broker-flat symbols whose local fill FIFO still has residual lots,
+run the fill repair tool in dry-run mode first:
+
+```bash
+python3 scripts/repair_execution_fill_evidence.py \
+  --runtime-mode live \
+  --scope fifo-residuals
+```
+
+The apply form requires `--actor` and `--reason`. It records a durable FIFO
+isolation boundary only when the broker-flat reconciliation is newer than the
+last local fill. Original fills remain unchanged, and repurchases after the
+flat boundary remain available to FIFO cost-basis calculations.
+
 Default short-term sizing is tuned for higher-conviction filtered candidates:
 per-symbol budget `3,000,000` KRW, total exec-agent budget `9,000,000` KRW,
 base risk `1.5%`, max position allocation `30%`, and max symbol exposure

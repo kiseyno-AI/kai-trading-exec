@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -12,11 +12,19 @@ from sqlalchemy import select
 from app.core.config import Settings
 from app.db.base import Base
 from app.db.session import create_db_engine, create_session_factory
-from app.models.runtime import BrokerOrder, BrokerOrderEvent, ExecutionFill
+from app.models.runtime import (
+    BrokerOrder,
+    BrokerOrderEvent,
+    ExecutionFill,
+    ExecutionPosition,
+    FifoInventoryIsolation,
+)
 from app.services.execution_fill_repair import (
     DUPLICATE_FILL_REPAIR_EVENT,
     MISSING_FILL_REPAIR_EVENT,
+    analyze_fifo_inventory_repairs,
     analyze_execution_fill_repairs,
+    apply_fifo_inventory_repairs,
     apply_execution_fill_repairs,
 )
 from app.services.runtime import daily_pnl_payload
@@ -282,4 +290,267 @@ def test_apply_is_idempotent_auditable_and_repairs_fifo_pair() -> None:
         MISSING_FILL_REPAIR_EVENT,
     ]
     assert len(db.scalars(select(ExecutionFill)).all()) == 3
+    engine.dispose()
+
+
+def _add_fill(
+    db,
+    *,
+    symbol: str,
+    side: str,
+    quantity: int,
+    price: str,
+    filled_at: datetime,
+    suffix: str,
+) -> ExecutionFill:
+    order = BrokerOrder(
+        broker_name="kis",
+        mode="paper",
+        idempotency_key=f"fifo-{symbol}-{side}-{suffix}",
+        broker_order_id=f"fifo-order-{suffix}",
+        symbol=symbol,
+        side=side,
+        status="filled",
+        quantity=quantity,
+        submitted_at=filled_at,
+    )
+    db.add(order)
+    db.flush()
+    fill = ExecutionFill(
+        broker_order_pk=order.id,
+        symbol=symbol,
+        side=side,
+        quantity=quantity,
+        price=Decimal(price),
+        filled_at=filled_at,
+    )
+    db.add(fill)
+    return fill
+
+
+def test_fifo_residual_dry_run_reports_required_broker_flat_evidence() -> None:
+    settings = _settings()
+    engine, db = _session(settings)
+    fill_at = datetime(2026, 8, 20, 1, 0, tzinfo=UTC)
+    reconciled_at = fill_at + timedelta(days=1)
+    _add_fill(
+        db,
+        symbol="049430",
+        side="buy",
+        quantity=45,
+        price="1000",
+        filled_at=fill_at,
+        suffix="dry-run-buy",
+    )
+    db.add(
+        ExecutionPosition(
+            mode="paper",
+            symbol="049430",
+            quantity=0,
+            average_price=None,
+            updated_from="reconciliation",
+            last_reconciled_at=reconciled_at,
+        )
+    )
+    db.commit()
+
+    payload = analyze_fifo_inventory_repairs(db=db, runtime_mode="paper")
+
+    assert payload["mode"] == "dry-run"
+    assert payload["summary"] == {
+        "broker_flat_residual_count": 1,
+        "eligible_isolation_count": 1,
+        "recency_blocked_count": 0,
+        "applied_isolation_count": 0,
+    }
+    assert payload["broker_flat_fifo_residuals"][0] == {
+        "symbol": "049430",
+        "residual_quantity": "45.0000",
+        "last_local_fill": fill_at.isoformat(),
+        "broker_reconciliation_timestamp": reconciled_at.isoformat(),
+        "broker_position_id": db.scalar(select(ExecutionPosition.id)),
+        "broker_position_quantity": "0.0000",
+        "eligible": True,
+        "repair_action": "isolate",
+        "reason": "broker_flat_evidence_newer_than_last_local_fill",
+    }
+    assert db.scalars(select(FifoInventoryIsolation)).all() == []
+    engine.dispose()
+
+
+def test_fifo_residual_command_defaults_to_dry_run(tmp_path: Path) -> None:
+    db_path = tmp_path / "fifo-repair.db"
+    settings = _settings(f"sqlite:///{db_path}")
+    engine, db = _session(settings)
+    fill_at = datetime(2026, 8, 20, 1, 0, tzinfo=UTC)
+    _add_fill(
+        db,
+        symbol="049430",
+        side="buy",
+        quantity=45,
+        price="1000",
+        filled_at=fill_at,
+        suffix="command-buy",
+    )
+    db.add(
+        ExecutionPosition(
+            mode="paper",
+            symbol="049430",
+            quantity=0,
+            updated_from="reconciliation",
+            last_reconciled_at=fill_at + timedelta(hours=1),
+        )
+    )
+    db.commit()
+    db.close()
+    engine.dispose()
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "scripts/repair_execution_fill_evidence.py",
+            "--database-url",
+            f"sqlite:///{db_path}",
+            "--runtime-mode",
+            "paper",
+            "--scope",
+            "fifo-residuals",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    payload = json.loads(result.stdout)
+
+    assert payload["mode"] == "dry-run"
+    assert payload["summary"]["eligible_isolation_count"] == 1
+    assert payload["broker_flat_fifo_residuals"][0]["symbol"] == "049430"
+
+
+def test_fifo_isolation_preserves_repurchase_after_verified_flat_boundary() -> None:
+    settings = _settings()
+    engine, db = _session(settings)
+    old_buy_at = datetime(2026, 8, 20, 1, 0, tzinfo=UTC)
+    flat_at = old_buy_at + timedelta(hours=1)
+    _add_fill(
+        db,
+        symbol="001450",
+        side="buy",
+        quantity=11,
+        price="100",
+        filled_at=old_buy_at,
+        suffix="old-buy",
+    )
+    db.add(
+        ExecutionPosition(
+            mode="paper",
+            symbol="001450",
+            quantity=0,
+            updated_from="reconciliation",
+            last_reconciled_at=flat_at,
+        )
+    )
+    db.commit()
+
+    applied = apply_fifo_inventory_repairs(
+        db=db,
+        runtime_mode="paper",
+        actor="test-operator",
+        reason="verified broker flat",
+        now=flat_at,
+    )
+    repeated = apply_fifo_inventory_repairs(
+        db=db,
+        runtime_mode="paper",
+        actor="test-operator",
+        reason="verified broker flat",
+        now=flat_at,
+    )
+    repurchase_at = flat_at + timedelta(hours=1)
+    sell_at = repurchase_at + timedelta(minutes=30)
+    _add_fill(
+        db,
+        symbol="001450",
+        side="buy",
+        quantity=1,
+        price="200",
+        filled_at=repurchase_at,
+        suffix="repurchase",
+    )
+    _add_fill(
+        db,
+        symbol="001450",
+        side="sell",
+        quantity=1,
+        price="250",
+        filled_at=sell_at,
+        suffix="repurchase-sell",
+    )
+    db.commit()
+
+    pnl = daily_pnl_payload(settings=settings, db=db, now=sell_at)
+    isolation = db.scalar(select(FifoInventoryIsolation))
+
+    assert applied["summary"]["applied_isolation_count"] == 1
+    assert repeated["summary"]["applied_isolation_count"] == 0
+    assert isolation is not None
+    assert isolation.residual_quantity == Decimal("11")
+    assert isolation.audit_payload["fills_deleted"] == 0
+    assert isolation.audit_payload["fills_fabricated"] == 0
+    assert pnl["matched_sell_quantity"] == 1
+    assert pnl["daily_realized_pnl"] == "50.0000"
+    assert len(db.scalars(select(ExecutionFill)).all()) == 3
+    engine.dispose()
+
+
+def test_fifo_isolation_recency_gate_blocks_flat_evidence_older_than_repurchase() -> None:
+    settings = _settings()
+    engine, db = _session(settings)
+    old_buy_at = datetime(2026, 8, 20, 1, 0, tzinfo=UTC)
+    flat_at = old_buy_at + timedelta(hours=1)
+    repurchase_at = flat_at + timedelta(hours=1)
+    _add_fill(
+        db,
+        symbol="055550",
+        side="buy",
+        quantity=7,
+        price="100",
+        filled_at=old_buy_at,
+        suffix="pre-flat-buy",
+    )
+    _add_fill(
+        db,
+        symbol="055550",
+        side="buy",
+        quantity=2,
+        price="110",
+        filled_at=repurchase_at,
+        suffix="post-flat-repurchase",
+    )
+    db.add(
+        ExecutionPosition(
+            mode="paper",
+            symbol="055550",
+            quantity=0,
+            updated_from="reconciliation",
+            last_reconciled_at=flat_at,
+        )
+    )
+    db.commit()
+
+    dry_run = analyze_fifo_inventory_repairs(db=db, runtime_mode="paper")
+    applied = apply_fifo_inventory_repairs(
+        db=db,
+        runtime_mode="paper",
+        actor="test-operator",
+        reason="must not isolate repurchase",
+    )
+
+    item = dry_run["broker_flat_fifo_residuals"][0]
+    assert item["residual_quantity"] == "9.0000"
+    assert item["last_local_fill"] == repurchase_at.isoformat()
+    assert item["eligible"] is False
+    assert item["reason"] == "broker_flat_evidence_not_newer_than_last_local_fill"
+    assert applied["summary"]["applied_isolation_count"] == 0
+    assert db.scalars(select(FifoInventoryIsolation)).all() == []
     engine.dispose()

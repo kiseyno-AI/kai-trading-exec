@@ -24,6 +24,7 @@ from app.models.runtime import (
     MonitoringCheckpoint,
 )
 from app.services.weekly_trade_review import WeeklyTradeReviewTimeoutError, generate_weekly_trade_review
+from app.services.runtime import runtime_counts
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -145,17 +146,11 @@ def test_weekly_trade_review_exports_bounded_read_only_artifact(tmp_path) -> Non
     ]
     active_order_summary = report["active_broker_order_summary"]
     assert active_order_summary["missing_submitted_at_nonterminal_count"] == 1
+    assert active_order_summary["actionable_order_count"] == 0
     assert {
         row["status"]: row["count"]
         for row in active_order_summary["nonterminal_status_counts"]
-    } == {
-        "cancel_pending": 1,
-        "open": 1,
-        "partially_filled": 1,
-        "retry_pending": 1,
-        "submission_pending": 1,
-        "submitted": 2,
-    }
+    } == {}
     assert {
         row["status"]
         for row in active_order_summary["stale_nonterminal_samples"]
@@ -217,6 +212,82 @@ def test_weekly_trade_review_exports_bounded_read_only_artifact(tmp_path) -> Non
     assert json.loads(latest_path.read_text(encoding="utf-8"))["artifact_path"] == str(artifact_path)
 
     db.close()
+    engine.dispose()
+
+
+def test_weekly_active_order_summary_matches_runtime_actionable_semantics() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        stale_broker_order_reconciliation_threshold_seconds=3600,
+    )
+    engine, db = _build_db(settings)
+    reference_at = datetime.now(UTC)
+    recent_at = reference_at - timedelta(minutes=5)
+    stale_at = reference_at - timedelta(hours=2)
+    db.add_all(
+        [
+            BrokerOrder(
+                broker_name="kis",
+                mode="paper",
+                idempotency_key="weekly-actionable-recent",
+                broker_order_id="recent-1",
+                symbol="005930",
+                side="buy",
+                status="submitted",
+                quantity=1,
+                submitted_at=recent_at,
+                last_broker_sync_at=recent_at,
+            ),
+            BrokerOrder(
+                broker_name="kis",
+                mode="paper",
+                idempotency_key="weekly-nonactionable-stale",
+                broker_order_id="stale-1",
+                symbol="035810",
+                side="buy",
+                status="open",
+                quantity=1,
+                submitted_at=stale_at,
+                last_broker_sync_at=reference_at,
+            ),
+            BrokerOrder(
+                broker_name="kis",
+                mode="paper",
+                idempotency_key="weekly-nonactionable-attention",
+                broker_order_id="attention-1",
+                symbol="004690",
+                side="buy",
+                status="stale_terminal_unknown",
+                quantity=1,
+                submitted_at=stale_at,
+                last_broker_sync_at=reference_at,
+            ),
+        ]
+    )
+    db.commit()
+
+    report = generate_weekly_trade_review(
+        settings=settings,
+        db=db,
+        start_at=reference_at - timedelta(days=1),
+        end_at=reference_at,
+    )
+    summary = report["active_broker_order_summary"]
+
+    assert runtime_counts(settings=settings, db=db)["open_orders"] == 1
+    assert summary["actionable_order_count"] == 1
+    assert summary["actionable_status_counts"] == [
+        {
+            "status": "submitted",
+            "count": 1,
+            "oldest_submitted_at": recent_at.isoformat(),
+            "newest_submitted_at": recent_at.isoformat(),
+        }
+    ]
+    assert [row["broker_order_id"] for row in summary["stale_nonterminal_samples"]] == [
+        "stale-1"
+    ]
     engine.dispose()
 
 

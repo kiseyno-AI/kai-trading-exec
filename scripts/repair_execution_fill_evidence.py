@@ -15,7 +15,9 @@ if str(API_ROOT) not in sys.path:
 from app.core.config import Settings  # noqa: E402
 from app.db.session import create_db_engine, create_session_factory  # noqa: E402
 from app.services.execution_fill_repair import (  # noqa: E402
+    analyze_fifo_inventory_repairs,
     analyze_execution_fill_repairs,
+    apply_fifo_inventory_repairs,
     apply_execution_fill_repairs,
 )
 
@@ -23,9 +25,10 @@ from app.services.execution_fill_repair import (  # noqa: E402
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Dry-run or apply operator-triggered repairs for missing and duplicate "
-            "execution_fills evidence. This script only reads/writes local runtime "
-            "database tables; it does not call broker APIs or place/cancel/alter orders."
+            "Dry-run or apply operator-triggered repairs for missing/duplicate fill "
+            "evidence or broker-flat FIFO residuals. This script only reads/writes "
+            "local runtime database tables; it does not call broker APIs or "
+            "place/cancel/alter orders."
         ),
     )
     parser.add_argument(
@@ -37,6 +40,15 @@ def main() -> int:
         choices=("mock", "paper", "live"),
         default=None,
         help="Runtime mode scope. Defaults to KAI_EXEC_RUNTIME_MODE or Settings default.",
+    )
+    parser.add_argument(
+        "--scope",
+        choices=("fill-evidence", "fifo-residuals"),
+        default="fill-evidence",
+        help=(
+            "Repair scope. fifo-residuals reports or isolates local FIFO inventory "
+            "only when newer broker reconciliation proves the symbol flat."
+        ),
     )
     parser.add_argument(
         "--apply",
@@ -67,7 +79,19 @@ def main() -> int:
     session_factory = create_session_factory(engine)
     try:
         with session_factory() as db:
-            if args.apply:
+            if args.scope == "fifo-residuals" and args.apply:
+                payload = apply_fifo_inventory_repairs(
+                    db=db,
+                    runtime_mode=settings.runtime_mode,
+                    actor=args.actor or "",
+                    reason=args.reason or "",
+                )
+            elif args.scope == "fifo-residuals":
+                payload = analyze_fifo_inventory_repairs(
+                    db=db,
+                    runtime_mode=settings.runtime_mode,
+                )
+            elif args.apply:
                 payload = apply_execution_fill_repairs(
                     db=db,
                     runtime_mode=settings.runtime_mode,
