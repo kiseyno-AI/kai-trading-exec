@@ -392,6 +392,7 @@ def broker_order_fill_quality_payload(
             + cast(ExecutionFill.quantity, String)
         ),
     ).label("duplicate_fill_identity")
+    duplicate_fill_first_filled_at = func.min(ExecutionFill.filled_at).label("filled_at")
     duplicate_fill_query = (
         select(
             ExecutionFill.broker_order_pk,
@@ -400,7 +401,7 @@ def broker_order_fill_quality_payload(
             func.min(ExecutionFill.side).label("side"),
             func.min(ExecutionFill.quantity).label("quantity"),
             func.min(ExecutionFill.price).label("price"),
-            func.min(ExecutionFill.filled_at).label("filled_at"),
+            duplicate_fill_first_filled_at,
             func.count(ExecutionFill.id).label("duplicate_count"),
         )
         .join(ExecutionFill.broker_order)
@@ -416,7 +417,7 @@ def broker_order_fill_quality_payload(
     )
     duplicate_fill_rows = db.execute(
         duplicate_fill_query
-        .order_by(ExecutionFill.filled_at.desc())
+        .order_by(duplicate_fill_first_filled_at.desc())
         .limit(MAX_STATUS_DETAIL_ITEMS)
     ).all()
     duplicate_fill_items = [
