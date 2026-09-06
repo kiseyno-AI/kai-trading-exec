@@ -3,7 +3,6 @@ from __future__ import annotations
 from collections import defaultdict
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
-from hashlib import sha256
 from typing import Any
 
 from sqlalchemy import func, select
@@ -21,6 +20,7 @@ from app.services.fifo_inventory import load_fifo_isolation_cursor
 from app.services.fill_idempotency import (
     dedupe_execution_fills,
     duplicate_fill_economic_conflict,
+    duplicate_fill_group_candidate_key,
     execution_fill_dedupe_key,
     execution_fill_idempotency_key,
 )
@@ -978,15 +978,13 @@ def _annotate_remediation_reviews(
 
 
 def _duplicate_group_candidate_key(item: dict[str, object]) -> str:
-    return ":".join(
-        (
-            str(item["duplicate_group_key"]),
-            _duplicate_group_membership_version(item),
-        )
+    return duplicate_fill_group_candidate_key(
+        group_key=str(item["duplicate_group_key"]),
+        fill_ids=_duplicate_group_member_ids(item),
     )
 
 
-def _duplicate_group_membership_version(item: dict[str, object]) -> str:
+def _duplicate_group_member_ids(item: dict[str, object]) -> list[str]:
     member_ids: list[str] = []
     retained = item.get("retained_fill")
     if isinstance(retained, dict) and retained.get("id") is not None:
@@ -998,8 +996,15 @@ def _duplicate_group_membership_version(item: dict[str, object]) -> str:
             for fill in duplicate_fills
             if isinstance(fill, dict) and fill.get("id") is not None
         )
-    membership = "\0".join(sorted(member_ids))
-    return sha256(membership.encode("utf-8")).hexdigest()[:32]
+    return member_ids
+
+
+def _duplicate_group_membership_version(item: dict[str, object]) -> str:
+    candidate_key = duplicate_fill_group_candidate_key(
+        group_key=str(item["duplicate_group_key"]),
+        fill_ids=_duplicate_group_member_ids(item),
+    )
+    return candidate_key.rsplit(":", 1)[-1]
 
 
 def _duplicate_group_conflicting_fields(group: list[ExecutionFill]) -> list[str]:

@@ -43,12 +43,20 @@ from app.models.runtime import (
 )
 from app.services import reconciliation as reconciliation_service
 from app.services.execution_jobs import dispatch_due_execution_jobs
+from app.services.fill_idempotency import (
+    duplicate_fill_group_candidate_key,
+    execution_fill_dedupe_key,
+)
 from app.services.reconciliation import (
     reconcile_broker_order,
     reconcile_stale_nonterminal_broker_orders,
     sync_execution_positions_from_broker_snapshot,
 )
-from app.services.runtime import RuntimeMetadata, build_runtime_daily_board, build_runtime_status
+from app.services.runtime import (
+    RuntimeMetadata,
+    build_runtime_daily_board,
+    build_runtime_status,
+)
 from app.services.runtime_controls import ControlCommand, resume_runtime
 
 
@@ -2210,6 +2218,152 @@ def test_runtime_status_reports_pnl_fill_quality_alerts() -> None:
     alerts_by_kind = {alert["kind"]: alert for alert in alerts["alerts"]}
     assert alerts_by_kind["filled_broker_orders_missing_execution_fills"]["symbols"] == ["105560"]
     assert alerts_by_kind["duplicate_execution_fill_groups"]["symbols"] == ["282330"]
+    engine.dispose()
+
+
+def test_runtime_status_matches_duplicate_fill_reviews_by_candidate_key() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+    )
+    engine, db = _session(settings)
+    filled_at = datetime.now(UTC)
+    order = BrokerOrder(
+        broker_name="kis",
+        mode="paper",
+        idempotency_key="filled-order-two-duplicate-fill-groups",
+        broker_order_id="duplicate-fill-shared-order",
+        symbol="282330",
+        side="buy",
+        status="filled",
+        quantity=4,
+        submitted_at=filled_at,
+    )
+    db.add(order)
+    db.flush()
+    first_group = [
+        ExecutionFill(
+            id="a-shared-order-duplicate-fill-one",
+            broker_order_pk=order.id,
+            broker_fill_id="shared-fill-one",
+            symbol="282330",
+            side="buy",
+            quantity=1,
+            price=Decimal("125400.0000"),
+            filled_at=filled_at,
+        ),
+        ExecutionFill(
+            id="b-shared-order-duplicate-fill-one",
+            broker_order_pk=order.id,
+            broker_fill_id="shared-fill-one",
+            symbol="282330",
+            side="buy",
+            quantity=1,
+            price=Decimal("125400.0000"),
+            filled_at=filled_at,
+        ),
+    ]
+    second_group = [
+        ExecutionFill(
+            id="a-shared-order-duplicate-fill-two",
+            broker_order_pk=order.id,
+            broker_fill_id="shared-fill-two",
+            symbol="282330",
+            side="buy",
+            quantity=1,
+            price=Decimal("125500.0000"),
+            filled_at=filled_at + timedelta(seconds=1),
+        ),
+        ExecutionFill(
+            id="b-shared-order-duplicate-fill-two",
+            broker_order_pk=order.id,
+            broker_fill_id="shared-fill-two",
+            symbol="282330",
+            side="buy",
+            quantity=1,
+            price=Decimal("125500.0000"),
+            filled_at=filled_at + timedelta(seconds=1),
+        ),
+    ]
+    db.add_all([*first_group, *second_group])
+    db.flush()
+    db.add_all(
+        [
+            RuntimeRemediationEvent(
+                mode="paper",
+                candidate_type="duplicate_fill_group",
+                candidate_key=duplicate_fill_group_candidate_key(
+                    group_key=execution_fill_dedupe_key(first_group[0]),
+                    fill_ids=[fill.id for fill in first_group],
+                ),
+                subject_id=order.id,
+                outcome="non_destructive_isolation",
+                actor="first-reviewer",
+                reason="first group isolated",
+                evidence_summary={"fills_deleted": 0},
+                occurred_at=filled_at,
+            ),
+            RuntimeRemediationEvent(
+                mode="paper",
+                candidate_type="duplicate_fill_group",
+                candidate_key=duplicate_fill_group_candidate_key(
+                    group_key=execution_fill_dedupe_key(second_group[0]),
+                    fill_ids=[fill.id for fill in second_group],
+                ),
+                subject_id=order.id,
+                outcome="manual_review_required",
+                actor="second-reviewer",
+                reason="second group needs review",
+                evidence_summary={"fills_deleted": 0},
+                occurred_at=filled_at,
+            ),
+            RuntimeRemediationEvent(
+                mode="paper",
+                candidate_type="duplicate_fill_group",
+                candidate_key=duplicate_fill_group_candidate_key(
+                    group_key="execution_fill:stale-order-level-key",
+                    fill_ids=[fill.id for fill in first_group],
+                ),
+                subject_id=order.id,
+                outcome="manual_review_required",
+                actor="wrong-actor",
+                reason="wrong group review must not leak",
+                evidence_summary={"fills_deleted": 0},
+                occurred_at=filled_at + timedelta(minutes=1),
+            ),
+            RuntimeRemediationEvent(
+                mode="paper",
+                candidate_type="duplicate_fill_group",
+                candidate_key=duplicate_fill_group_candidate_key(
+                    group_key="execution_fill:stale-order-level-key",
+                    fill_ids=[fill.id for fill in second_group],
+                ),
+                subject_id=order.id,
+                outcome="manual_review_required",
+                actor="also-wrong",
+                reason="another wrong group review must not leak",
+                evidence_summary={"fills_deleted": 0},
+                occurred_at=filled_at + timedelta(minutes=2),
+            ),
+        ]
+    )
+    db.commit()
+
+    payload = build_runtime_status(
+        settings=settings,
+        runtime=RuntimeMetadata(started_at=datetime.now(UTC)),
+        db=db,
+    )
+
+    groups = payload["freshness"]["broker_orders"]["fill_quality"]["duplicate_fill_groups"]
+    assert len(groups) == 2
+    groups_by_fill_id = {group["broker_fill_id"]: group for group in groups}
+    assert groups_by_fill_id["shared-fill-one"]["review_outcome"] == "non_destructive_isolation"
+    assert groups_by_fill_id["shared-fill-one"]["review_actor"] == "first-reviewer"
+    assert groups_by_fill_id["shared-fill-one"]["review_reason"] == "first group isolated"
+    assert groups_by_fill_id["shared-fill-two"]["review_outcome"] == "manual_review_required"
+    assert groups_by_fill_id["shared-fill-two"]["review_actor"] == "second-reviewer"
+    assert groups_by_fill_id["shared-fill-two"]["review_reason"] == "second group needs review"
     engine.dispose()
 
 

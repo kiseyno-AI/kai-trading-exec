@@ -55,6 +55,12 @@ def execution_fill_dedupe_key(fill: ExecutionFill) -> str:
     )
 
 
+def duplicate_fill_group_candidate_key(*, group_key: str, fill_ids: list[str]) -> str:
+    membership = "\0".join(sorted(fill_ids))
+    membership_version = sha256(membership.encode("utf-8")).hexdigest()[:32]
+    return f"{group_key}:{membership_version}"
+
+
 def dedupe_execution_fills(fills: list[ExecutionFill]) -> list[ExecutionFill]:
     groups: dict[str, list[ExecutionFill]] = {}
     for fill in fills:

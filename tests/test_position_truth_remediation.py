@@ -421,7 +421,7 @@ def test_missing_us_position_recovers_exchange_from_active_order_event(
         ("SPY", "AMEX", "open"),
     ],
 )
-def test_missing_us_position_recovers_exchange_from_active_sell_order_event(
+def test_missing_us_position_recovers_exchange_from_sell_order_event(
     monkeypatch,
     symbol: str,
     exchange: str,
@@ -450,7 +450,7 @@ def test_missing_us_position_recovers_exchange_from_active_sell_order_event(
         auth_session_factory=session_factory,
         adapter=adapter,
         actor="Peter",
-        reason="recover active U.S. sell order exchange through account inquiry only",
+        reason="recover U.S. sell order exchange through account inquiry only",
         now=NOW,
     )
 
@@ -464,8 +464,72 @@ def test_missing_us_position_recovers_exchange_from_active_sell_order_event(
     engine.dispose()
 
 
+def test_stale_us_position_recovers_exchange_from_filled_sell_order_event(
+    monkeypatch,
+) -> None:
+    settings, engine, session_factory, db = _session()
+    old = NOW - timedelta(days=1)
+    db.add(
+        ExecutionPosition(
+            mode="paper",
+            symbol="AAPL",
+            quantity=1,
+            average_price=Decimal("200"),
+            updated_from="reconciliation",
+            last_reconciled_at=old,
+            raw_payload={"rt_cd": "0"},
+        )
+    )
+    order = _add_filled_us_buy_order_event(
+        db,
+        symbol="AAPL",
+        exchange="NASD",
+        suffix="filled-sell",
+        side="sell",
+        status="filled",
+    )
+    db.commit()
+    adapter = PositionInquiryAdapter()
+    monkeypatch.setattr(
+        "app.services.position_truth_remediation.ensure_authenticated_broker_session",
+        lambda **kwargs: type("SessionState", (), {"access_token": "test-token"})(),
+    )
+
+    dry_run = analyze_position_truth_remediation(settings=settings, db=db, now=NOW)
+    applied = apply_position_truth_remediation(
+        settings=settings,
+        db=db,
+        auth_session_factory=session_factory,
+        adapter=adapter,
+        actor="Peter",
+        reason="recover stale U.S. position exchange from filled sell evidence",
+        now=NOW,
+    )
+
+    assert dry_run["items"][0]["symbol"] == "AAPL"
+    assert dry_run["items"][0]["exchange"] == "NASD"
+    assert dry_run["items"][0]["eligible"] is True
+    assert adapter.exchanges == ["NASD"]
+    assert applied["summary"]["refreshed_count"] == 1
+    assert db.scalars(select(BrokerOrder)).all() == [order]
+    assert db.scalars(select(ExecutionFill)).all() == []
+    engine.dispose()
+
+
 def test_missing_us_position_with_ambiguous_buy_and_sell_exchanges_fails_closed() -> None:
     settings, engine, session_factory, db = _session()
+    old = NOW - timedelta(days=1)
+    db.add(
+        ExecutionPosition(
+            mode="paper",
+            symbol="AAPL",
+            quantity=1,
+            average_price=Decimal("200"),
+            updated_from="reconciliation",
+            last_reconciled_at=old,
+            raw_payload={"rt_cd": "0"},
+        )
+    )
     _add_filled_us_buy_order_event(
         db,
         symbol="AAPL",
@@ -480,7 +544,7 @@ def test_missing_us_position_with_ambiguous_buy_and_sell_exchanges_fails_closed(
         exchange="NYSE",
         suffix="ambiguous-sell",
         side="sell",
-        status="open",
+        status="filled",
     )
     db.commit()
     adapter = PositionInquiryAdapter()

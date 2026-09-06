@@ -317,7 +317,7 @@ def _missing_position_order_exchanges(
                 ),
                 and_(
                     BrokerOrder.side == "sell",
-                    BrokerOrder.status.in_(ACTIONABLE_OPEN_ORDER_STATUSES),
+                    BrokerOrder.status.in_(POSITION_EVIDENCE_ORDER_STATUSES),
                 ),
             ),
             BrokerOrder.symbol.in_(sorted(symbols)),
