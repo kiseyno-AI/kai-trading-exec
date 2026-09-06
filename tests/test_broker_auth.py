@@ -50,6 +50,7 @@ from app.models.runtime import (
 )
 from app.services import broker_orders as broker_orders_service
 from app.services import runtime as runtime_service
+from app.services.late_entry_actionability import late_entry_actionability_summary
 from app.services.monitoring import (
     _derived_source_plan_item_id,
     _nonretryable_sibling_monitor_suppresses_recreation,
@@ -2930,6 +2931,7 @@ def _build_watch_buy_test_app(
     max_quote_age_seconds: int = 30,
     retry_cooldown_seconds: int = 5,
     account_drawdown_gate_enabled: bool = False,
+    late_entry_mode: str = "shadow",
 ):
     broker_adapter = StubBrokerAdapter(
         config=BrokerConfig(
@@ -2952,6 +2954,7 @@ def _build_watch_buy_test_app(
             monitoring_watch_buy_retry_cooldown_seconds=retry_cooldown_seconds,
             exec_agent_max_position_allocation_pct=Decimal("0.20"),
             account_drawdown_gate_enabled=account_drawdown_gate_enabled,
+            watch_buy_late_entry_mode=late_entry_mode,
         ),
         broker_adapter=broker_adapter,
     )
@@ -3073,6 +3076,123 @@ def test_watch_buy_candidate_waits_until_trigger_then_submits_limit_buy() -> Non
         assert order is not None
         assert order.idempotency_key == f"monitoring:watch_buy:{item_id}"
 
+    engine.dispose()
+
+
+@pytest.mark.parametrize("observed_at", ["2026-06-08T01:29:59Z", "2026-06-08T01:30:00Z"])
+def test_watch_buy_late_entry_cutoff_boundary_allows_submission(observed_at: str) -> None:
+    app, engine, client, broker_adapter = _build_watch_buy_test_app(late_entry_mode="block")
+    _create_watch_buy_candidate(
+        client,
+        plan_id=f"plan-cutoff-{observed_at}",
+        risk_context={"exchange": "KRX", "stop_price": "70000.00", "trigger_direction": "at_or_above"},
+    )
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "observed_at": observed_at,
+            "prices": [{"symbol": "005930", "price": "71050.00", "observed_at": observed_at}],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["submitted_order_count"] == 1, response.json()["items"]
+    assert len(broker_adapter.order_calls) == 1
+    engine.dispose()
+
+
+def test_watch_buy_late_entry_shadow_records_but_allows_submission() -> None:
+    app, engine, client, broker_adapter = _build_watch_buy_test_app(late_entry_mode="shadow")
+    item_id = _create_watch_buy_candidate(
+        client,
+        plan_id="plan-late-entry-shadow",
+        risk_context={"exchange": "KRX", "stop_price": "70000.00", "trigger_direction": "at_or_above"},
+    )
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "observed_at": "2026-06-08T01:31:00Z",
+            "prices": [
+                {"symbol": "005930", "price": "71050.00", "observed_at": "2026-06-08T01:31:00Z"}
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["submitted_order_count"] == 1
+    assert len(broker_adapter.order_calls) == 1
+    with app.state.db_session_factory() as session:
+        audit = session.scalar(
+            select(ExecutionPlanItemAudit).where(
+                ExecutionPlanItemAudit.execution_plan_item_id == item_id,
+                ExecutionPlanItemAudit.event_type == "watch_buy_late_entry_gate",
+            )
+        )
+        assert audit is not None
+        assert audit.summary["mode"] == "shadow"
+        summary = late_entry_actionability_summary(
+            db=session,
+            mode="paper",
+            start_at=datetime(2026, 6, 8, 0, 0, tzinfo=UTC),
+            end_at=datetime(2026, 6, 9, 0, 0, tzinfo=UTC),
+        )
+        assert summary["shadow_count"] == 1
+        assert summary["block_count"] == 0
+    engine.dispose()
+
+
+def test_watch_buy_late_entry_block_rejects_without_broker_submission() -> None:
+    app, engine, client, broker_adapter = _build_watch_buy_test_app(late_entry_mode="block")
+    item_id = _create_watch_buy_candidate(
+        client,
+        plan_id="plan-late-entry-block",
+        risk_context={"exchange": "KRX", "stop_price": "70000.00", "trigger_direction": "at_or_above"},
+    )
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "observed_at": "2026-06-08T01:31:00Z",
+            "prices": [
+                {"symbol": "005930", "price": "71050.00", "observed_at": "2026-06-08T01:31:00Z"}
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["submitted_order_count"] == 0
+    assert response.json()["items"][0]["block_reason"] == "late_entry_cutoff"
+    assert broker_adapter.order_calls == []
+    repeated = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "observed_at": "2026-06-08T01:31:00Z",
+            "prices": [
+                {"symbol": "005930", "price": "71050.00", "observed_at": "2026-06-08T01:31:00Z"}
+            ],
+        },
+    )
+    assert repeated.status_code == 200
+    assert repeated.json()["submitted_order_count"] == 0
+    with app.state.db_session_factory() as session:
+        audits = session.scalars(
+            select(ExecutionPlanItemAudit).where(
+                ExecutionPlanItemAudit.execution_plan_item_id == item_id,
+                ExecutionPlanItemAudit.event_type == "watch_buy_late_entry_gate",
+            )
+        ).all()
+        assert len(audits) == 1
+        assert audits[0].summary["mode"] == "block"
     engine.dispose()
 
 

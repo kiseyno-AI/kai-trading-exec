@@ -1,4 +1,5 @@
 import os
+from datetime import time as wall_time
 from decimal import Decimal
 from functools import lru_cache
 from typing import Literal, Mapping
@@ -54,6 +55,8 @@ class Settings(BaseModel):
     watch_buy_high_volatility_chase_max_context_age_days: int = Field(default=1, ge=0, le=30)
     watch_buy_max_intraday_range_position_pct: Decimal = Field(default=Decimal("75.0"), ge=0, le=Decimal("100"))
     watch_buy_stale_trigger_reclaim_threshold_pct: Decimal = Field(default=Decimal("3.0"), ge=0, le=Decimal("100"))
+    watch_buy_late_entry_mode: str = "shadow"
+    watch_buy_late_entry_cutoff_krx: str = "10:30"
     watch_buy_live_market_quality_veto_enabled: bool = True
     watch_buy_live_market_regime_downsize_allowed: bool = False
     watch_buy_live_min_trigger_turnover_krw: Decimal = Field(default=Decimal("100000000"), ge=0)
@@ -313,6 +316,29 @@ class Settings(BaseModel):
             raise ValueError(f"market_regime_sector_weak_behavior must be one of {sorted(allowed)}")
         return normalized
 
+    @field_validator("watch_buy_late_entry_mode")
+    @classmethod
+    def normalize_watch_buy_late_entry_mode(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        allowed = {"disabled", "shadow", "block"}
+        if normalized not in allowed:
+            raise ValueError(f"watch_buy_late_entry_mode must be one of {sorted(allowed)}")
+        return normalized
+
+    @field_validator("watch_buy_late_entry_cutoff_krx")
+    @classmethod
+    def validate_watch_buy_late_entry_cutoff_krx(cls, value: str) -> str:
+        normalized = value.strip()
+        if len(normalized) != 5:
+            raise ValueError("watch_buy_late_entry_cutoff_krx must use HH:MM")
+        try:
+            parsed = wall_time.fromisoformat(normalized)
+        except ValueError as exc:
+            raise ValueError("watch_buy_late_entry_cutoff_krx must use HH:MM") from exc
+        if parsed.second or parsed.microsecond:
+            raise ValueError("watch_buy_late_entry_cutoff_krx must use HH:MM")
+        return parsed.strftime("%H:%M")
+
 
 _ENV_FIELDS = {
     "SERVICE_NAME": "service_name",
@@ -357,6 +383,8 @@ _ENV_FIELDS = {
     "WATCH_BUY_HIGH_VOLATILITY_CHASE_MAX_CONTEXT_AGE_DAYS": "watch_buy_high_volatility_chase_max_context_age_days",
     "WATCH_BUY_MAX_INTRADAY_RANGE_POSITION_PCT": "watch_buy_max_intraday_range_position_pct",
     "WATCH_BUY_STALE_TRIGGER_RECLAIM_THRESHOLD_PCT": "watch_buy_stale_trigger_reclaim_threshold_pct",
+    "WATCH_BUY_LATE_ENTRY_MODE": "watch_buy_late_entry_mode",
+    "WATCH_BUY_LATE_ENTRY_CUTOFF_KRX": "watch_buy_late_entry_cutoff_krx",
     "WATCH_BUY_LIVE_MARKET_QUALITY_VETO_ENABLED": "watch_buy_live_market_quality_veto_enabled",
     "WATCH_BUY_LIVE_MARKET_REGIME_DOWNSIZE_ALLOWED": "watch_buy_live_market_regime_downsize_allowed",
     "WATCH_BUY_LIVE_MIN_TRIGGER_TURNOVER_KRW": "watch_buy_live_min_trigger_turnover_krw",
