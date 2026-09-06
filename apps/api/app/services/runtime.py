@@ -24,6 +24,7 @@ from app.models.runtime import (
 )
 from app.services.fill_idempotency import dedupe_execution_fills
 from app.services.fifo_inventory import load_fifo_isolation_cursor
+from app.services.max_holding_actionability import max_holding_actionability_summary
 from app.services.monitoring import (
     ACTIVE_WATCH_MONITORING_STATUSES,
     BLOCKED_MONITORING_STATUSES,
@@ -1007,6 +1008,10 @@ def monitoring_payload(
 ) -> dict[str, object]:
     segments = monitoring_segments(settings=settings, db=db)
     agent_decisions = monitoring_agent_decision_counts(settings=settings, db=db)
+    max_holding_actionability = max_holding_actionability_summary(
+        db=db,
+        mode=settings.runtime_mode,
+    )
     backlog_symbols = db.scalars(
         select(distinct(ExecutionPlanItem.symbol))
         .join(ExecutionPlanItem.plan)
@@ -1050,6 +1055,7 @@ def monitoring_payload(
             },
             "segments": segments,
             "agent_decisions": agent_decisions,
+            "max_holding_actionability": max_holding_actionability,
             "workers": [],
             "last_heartbeat_at": None,
             "last_success_at": None,
@@ -1102,6 +1108,7 @@ def monitoring_payload(
         },
         "segments": segments,
         "agent_decisions": agent_decisions,
+        "max_holding_actionability": max_holding_actionability,
         "workers": [
             {
                 "name": checkpoint.worker_name,

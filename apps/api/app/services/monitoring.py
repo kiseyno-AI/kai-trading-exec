@@ -1171,6 +1171,13 @@ def _evaluate_monitoring_cycle(
         if position.quantity > 0
     }
     if allow_persisted_triggered_without_price:
+        items = _prepare_due_max_holding_items(
+            settings=settings,
+            db=db,
+            items=items,
+            positions_by_symbol=positions_by_symbol,
+            triggered_at=triggered_at,
+        )
         items = _filter_sell_items_to_held_symbols(
             items=items,
             positions_by_symbol=positions_by_symbol,
@@ -1447,19 +1454,6 @@ def _evaluate_monitoring_cycle(
                 outcome="agent_pending",
                 block_reason="trigger_time_exec_agent_active",
                 message="trigger-time exec-agent decision is already pending for this item",
-                trigger_reason=trigger_reason,
-                trigger_metadata=trigger_metadata,
-            )
-            continue
-
-        if allow_persisted_triggered_without_price and item.intent == "max_holding_close_sell":
-            deferred_item_count += 1
-            result_by_item_id[item.id] = _monitoring_result_payload(
-                item=item,
-                observed_price=observed_price,
-                outcome="deferred",
-                block_reason="max_holding_close_deferred_from_autonomous_cycle",
-                message="max-holding close condition is monitored but not submitted inside the autonomous heartbeat cycle",
                 trigger_reason=trigger_reason,
                 trigger_metadata=trigger_metadata,
             )
@@ -2641,6 +2635,10 @@ def _load_monitored_items(
             | PENDING_DISPATCH_MONITORING_STATUSES
             | AGENT_ACTIVE_STATUSES
         )
+        if exclude_pending_config:
+            sell_fast_statuses = sell_fast_statuses | {
+                "max_holding_close_sell_pending_config"
+            }
         if not exclude_pending_config:
             sell_fast_statuses = sell_fast_statuses | SELL_PENDING_CONFIG_STATUSES
         sell_load_options = (
@@ -2900,6 +2898,150 @@ def _filter_sell_items_to_held_symbols(
         for item in items
         if _is_watch_buy_item(item) or item.symbol in positions_by_symbol
     ]
+
+
+def _prepare_due_max_holding_items(
+    *,
+    settings: Settings,
+    db: Session,
+    items: list[ExecutionPlanItem],
+    positions_by_symbol: dict[str, ExecutionPosition],
+    triggered_at: datetime,
+) -> list[ExecutionPlanItem]:
+    """Promote one safe due max-holding exit per held symbol."""
+    candidates_by_symbol: dict[str, list[ExecutionPlanItem]] = {}
+    passthrough: list[ExecutionPlanItem] = []
+    candidate_statuses = {
+        "max_holding_close_sell_pending_config",
+        "max_holding_close_sell_monitoring",
+    }
+    for item in items:
+        if (
+            item.intent == "max_holding_close_sell"
+            and item.status in candidate_statuses
+            and _monitoring_item_is_configured(item)
+            and _max_holding_exit_due(item=item, triggered_at=triggered_at)
+        ):
+            candidates_by_symbol.setdefault(item.symbol, []).append(item)
+        else:
+            passthrough.append(item)
+
+    stale_before = triggered_at - timedelta(
+        seconds=settings.exec_agent_max_account_snapshot_age_seconds
+    )
+    for symbol, candidates in sorted(candidates_by_symbol.items()):
+        position = positions_by_symbol.get(symbol)
+        position_reconciled_at = (
+            _normalize_utc(position.last_reconciled_at)
+            if position is not None and position.last_reconciled_at is not None
+            else None
+        )
+        fresh = (
+            position is not None
+            and position.quantity > 0
+            and (
+                settings.runtime_mode != "live"
+                or (
+                    position_reconciled_at is not None
+                    and position_reconciled_at >= stale_before
+                )
+            )
+        )
+        if not fresh:
+            for item in candidates:
+                _record_max_holding_state_event(
+                    db=db,
+                    item=item,
+                    event="max_holding_close_blocked",
+                    reason="stale_or_missing_position_truth",
+                    triggered_at=triggered_at,
+                    position=position,
+                )
+            continue
+
+        candidates.sort(key=_max_holding_canonical_rank, reverse=True)
+        canonical = candidates[0]
+        if canonical.status != "max_holding_close_sell_monitoring":
+            canonical.status = "max_holding_close_sell_monitoring"
+            _record_max_holding_state_event(
+                db=db,
+                item=canonical,
+                event="max_holding_close_promoted",
+                reason="due_with_fresh_sellable_position",
+                triggered_at=triggered_at,
+                position=position,
+            )
+        passthrough.append(canonical)
+        for duplicate in candidates[1:]:
+            duplicate.status = "superseded"
+            _record_max_holding_state_event(
+                db=db,
+                item=duplicate,
+                event="max_holding_close_superseded",
+                reason="newer_canonical_due_exit_selected",
+                triggered_at=triggered_at,
+                position=position,
+                canonical_item_id=canonical.id,
+            )
+    return passthrough
+
+
+def _max_holding_canonical_rank(item: ExecutionPlanItem) -> tuple[str, str, str]:
+    market_date = item.source_market_date or (item.plan.market_date if item.plan else None)
+    accepted_at = item.plan.accepted_at if item.plan else None
+    return (
+        market_date.isoformat() if market_date is not None else "",
+        _normalize_utc(accepted_at).isoformat() if accepted_at is not None else "",
+        item.id,
+    )
+
+
+def _record_max_holding_state_event(
+    *,
+    db: Session,
+    item: ExecutionPlanItem,
+    event: str,
+    reason: str,
+    triggered_at: datetime,
+    position: ExecutionPosition | None,
+    canonical_item_id: str | None = None,
+) -> None:
+    previous = _loaded_risk_context(item).get("last_monitoring_event")
+    position_reconciled_at = (
+        _serialize_datetime(position.last_reconciled_at) if position is not None else None
+    )
+    if (
+        isinstance(previous, dict)
+        and previous.get("event") == event
+        and previous.get("reason") == reason
+        and previous.get("position_last_reconciled_at") == position_reconciled_at
+        and previous.get("canonical_item_id") == canonical_item_id
+    ):
+        return
+    payload = {
+        "event": event,
+        "reason": reason,
+        "symbol": item.symbol,
+        "position_quantity": position.quantity if position is not None else None,
+        "position_last_reconciled_at": position_reconciled_at,
+        "canonical_item_id": canonical_item_id,
+        "recorded_at": triggered_at.isoformat(),
+    }
+    _record_monitoring_event(item=item, event=payload)
+    db.add(
+        ExecutionPlanItemAudit(
+            execution_plan_item_id=item.id,
+            event_type=event,
+            source=MONITORING_WORKER_NAME,
+            summary={
+                "reason": reason,
+                "symbol": item.symbol,
+                "canonical_item_id": canonical_item_id,
+            },
+            payload=payload,
+            occurred_at=triggered_at,
+        )
+    )
 
 
 def _trigger_time_agent_status_counts(

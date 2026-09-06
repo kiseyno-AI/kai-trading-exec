@@ -33,6 +33,7 @@ from app.services.broker_order_state import (
 )
 from app.services.fifo_inventory import load_fifo_isolation_cursor
 from app.services.fill_idempotency import dedupe_execution_fills
+from app.services.max_holding_actionability import max_holding_actionability_summary
 
 
 class WeeklyTradeReviewTimeoutError(TimeoutError):
@@ -204,6 +205,11 @@ def generate_weekly_trade_review(
         db=db,
         mode=settings.runtime_mode,
     )
+    max_holding_actionability = max_holding_actionability_summary(
+        db=db,
+        mode=settings.runtime_mode,
+        reference_at=end_at,
+    )
     progress("monitoring_sections", checkpoint_count=len(monitoring_checkpoints))
 
     report: dict[str, object] = {
@@ -241,6 +247,7 @@ def generate_weekly_trade_review(
             "execution_failure_count": len(failures),
             "monitoring_checkpoint_count": len(monitoring_checkpoints),
             "protective_stop_actionability_warning_count": protective_stop_actionability["warning_count"],
+            "due_max_holding_item_count": max_holding_actionability["due_item_count"],
             "closed_trade_count": len(closed_trades),
             "closed_sell_fill_count": realized_pnl_summary["sell_fill_count"],
             "total_sell_rows": pnl_coverage["total_sell_rows"],
@@ -270,6 +277,7 @@ def generate_weekly_trade_review(
         "execution_plan_item_summary": plan_item_summary,
         "monitoring_checkpoints": monitoring_checkpoints,
         "protective_stop_actionability": protective_stop_actionability,
+        "max_holding_actionability": max_holding_actionability,
     }
 
     artifact_path = target_dir / _artifact_filename(start_at=start_at, end_at=end_at)
