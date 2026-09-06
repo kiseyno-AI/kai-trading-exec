@@ -38,11 +38,13 @@ def main() -> int:
 
     runtime_mode = args.runtime_mode or os.getenv("KAI_EXEC_RUNTIME_MODE") or "mock"
     database_url = args.database_url or os.getenv("KAI_EXEC_DATABASE_URL")
+    actor = (args.actor or "").strip()
+    reason = (args.reason or "").strip()
     if runtime_mode == "live" and not args.database_url:
         raise SystemExit("live position remediation requires --database-url explicitly")
     if not database_url:
         raise SystemExit("--database-url or KAI_EXEC_DATABASE_URL is required")
-    if args.apply and (not args.actor or not args.reason):
+    if args.apply and (not actor or not reason):
         raise SystemExit("--apply requires --actor and --reason for auditability")
 
     settings = load_settings().model_copy(
@@ -57,8 +59,8 @@ def main() -> int:
                     settings=settings,
                     db=db,
                     adapter=KisBrokerAdapter(settings=settings),
-                    actor=args.actor or "",
-                    reason=args.reason or "",
+                    actor=actor,
+                    reason=reason,
                 )
             else:
                 payload = analyze_position_truth_remediation(settings=settings, db=db)

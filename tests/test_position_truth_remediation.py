@@ -13,7 +13,13 @@ from app.broker.base import BrokerAccountHolding, BrokerAccountSnapshot
 from app.core.config import Settings
 from app.db.base import Base
 from app.db.session import create_db_engine, create_session_factory
-from app.models.runtime import ExecutionPosition, RuntimeRemediationEvent
+from app.models.runtime import (
+    BrokerOrder,
+    BrokerOrderEvent,
+    ExecutionFill,
+    ExecutionPosition,
+    RuntimeRemediationEvent,
+)
 from app.services.position_truth_remediation import (
     analyze_position_truth_remediation,
     apply_position_truth_remediation,
@@ -43,6 +49,17 @@ class PositionInquiryAdapter:
                     average_price=Decimal("250000"),
                     payload={},
                 )
+            ]
+        elif symbols:
+            holdings = [
+                BrokerAccountHolding(
+                    symbol=symbol,
+                    quantity=2,
+                    average_price=Decimal("200"),
+                    payload={"exchange": exchange},
+                )
+                for symbol in symbols
+                if {"AAPL": "NASD", "IBM": "NYSE", "SPY": "AMEX"}.get(symbol) == exchange
             ]
         return BrokerAccountSnapshot(
             observed_at=NOW,
@@ -139,6 +156,85 @@ def test_position_truth_remediation_routes_supported_and_blocks_unknown(monkeypa
     engine.dispose()
 
 
+@pytest.mark.parametrize(
+    ("symbol", "exchange"),
+    [("AAPL", "NASD"), ("IBM", "NYSE"), ("SPY", "AMEX")],
+)
+def test_missing_us_position_recovers_exchange_from_filled_order_event(
+    monkeypatch,
+    symbol: str,
+    exchange: str,
+) -> None:
+    settings, engine, db = _session()
+    order = BrokerOrder(
+        broker_name="kis",
+        mode="paper",
+        idempotency_key=f"missing-{symbol.lower()}-position",
+        broker_order_id=f"broker-{symbol.lower()}-buy",
+        symbol=symbol,
+        side="buy",
+        status="filled",
+        quantity=2,
+        venue="kis",
+        asset_class="us_equity",
+        submitted_at=NOW - timedelta(minutes=10),
+    )
+    db.add(order)
+    db.flush()
+    db.add(
+        BrokerOrderEvent(
+            broker_order_pk=order.id,
+            event_type="submit_requested",
+            event_source="submission",
+            request_payload={
+                "provider": "kis",
+                "venue": "kis",
+                "asset_class": "us_equity",
+                "symbol": symbol,
+                "side": "buy",
+                "exchange": exchange,
+            },
+            observed_at=NOW - timedelta(minutes=10),
+        )
+    )
+    db.commit()
+    adapter = PositionInquiryAdapter()
+    monkeypatch.setattr(
+        "app.services.reconciliation.ensure_authenticated_broker_session",
+        lambda **kwargs: type("SessionState", (), {"access_token": "test-token"})(),
+    )
+
+    dry_run = analyze_position_truth_remediation(settings=settings, db=db, now=NOW)
+    applied = apply_position_truth_remediation(
+        settings=settings,
+        db=db,
+        adapter=adapter,
+        actor="Peter",
+        reason="refresh missing U.S. position through account inquiry only",
+        now=NOW,
+    )
+
+    assert dry_run["items"] == [
+        {
+            "symbol": symbol,
+            "position_id": None,
+            "last_reconciled_at": None,
+            "exchange": exchange,
+            "eligible": True,
+            "repair_action": "refresh_from_broker_account_inquiry",
+            "reason": "supported_read_only_account_inquiry_route",
+        }
+    ]
+    assert adapter.exchanges == [exchange]
+    assert applied["summary"]["refreshed_count"] == 1
+    position = db.scalar(select(ExecutionPosition).where(ExecutionPosition.symbol == symbol))
+    assert position is not None
+    assert position.raw_payload["_position_sync"]["exchange"] == exchange
+    assert db.scalars(select(ExecutionFill)).all() == []
+    assert db.scalars(select(BrokerOrder)).all() == [order]
+    engine.dispose()
+
+
 def test_position_truth_remediation_rolls_back_prior_exchange_when_later_inquiry_fails(
     monkeypatch,
 ) -> None:
@@ -213,3 +309,87 @@ def test_live_position_remediation_requires_database_url_argument(tmp_path) -> N
     assert result.returncode != 0
     assert "requires --database-url explicitly" in result.stderr
     assert not (tmp_path / "must-not-open.db").exists()
+
+
+@pytest.mark.parametrize(
+    ("actor", "reason"),
+    [("   ", "valid reason"), ("Peter", "\t  ")],
+)
+def test_position_remediation_rejects_blank_audit_metadata_before_opening_database(
+    tmp_path,
+    actor: str,
+    reason: str,
+) -> None:
+    database_path = tmp_path / "must-not-open.db"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "scripts/refresh_execution_position_truth.py",
+            "--database-url",
+            f"sqlite:///{database_path}",
+            "--runtime-mode",
+            "paper",
+            "--apply",
+            "--actor",
+            actor,
+            "--reason",
+            reason,
+        ],
+        capture_output=True,
+        text=True,
+        env=os.environ,
+    )
+
+    assert result.returncode != 0
+    assert "--apply requires --actor and --reason" in result.stderr
+    assert not database_path.exists()
+
+
+def test_position_remediation_trims_applied_audit_metadata(tmp_path) -> None:
+    database_url = f"sqlite:///{tmp_path / 'position-remediation.db'}"
+    settings = Settings(database_url=database_url, runtime_mode="paper")
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    with session_factory() as db:
+        db.add(
+            ExecutionPosition(
+                mode="paper",
+                symbol="AFIB",
+                quantity=4,
+                average_price=Decimal("1"),
+                updated_from="test",
+                last_reconciled_at=NOW - timedelta(days=1),
+                raw_payload={"_position_sync": {"exchange": "OTCB"}},
+            )
+        )
+        db.commit()
+    engine.dispose()
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "scripts/refresh_execution_position_truth.py",
+            "--database-url",
+            database_url,
+            "--runtime-mode",
+            "paper",
+            "--apply",
+            "--actor",
+            "  Peter  ",
+            "--reason",
+            "  inspect unsupported route  ",
+        ],
+        capture_output=True,
+        text=True,
+        env=os.environ,
+    )
+
+    assert result.returncode == 0, result.stderr
+    engine = create_db_engine(settings)
+    with create_session_factory(engine)() as db:
+        event = db.scalar(select(RuntimeRemediationEvent))
+        assert event is not None
+        assert event.actor == "Peter"
+        assert event.reason == "inspect unsupported route"
+    engine.dispose()

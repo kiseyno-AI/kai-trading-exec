@@ -8,7 +8,12 @@ from sqlalchemy.orm import Session
 
 from app.broker.base import BrokerAdapter
 from app.core.config import Settings
-from app.models.runtime import ExecutionPosition, RuntimeRemediationEvent
+from app.models.runtime import (
+    BrokerOrder,
+    BrokerOrderEvent,
+    ExecutionPosition,
+    RuntimeRemediationEvent,
+)
 from app.services.reconciliation import sync_execution_positions_from_broker_snapshot
 from app.services.runtime import position_truth_freshness_payload
 
@@ -35,10 +40,19 @@ def analyze_position_truth_remediation(
             )
         ).all()
     }
+    order_exchanges = _missing_position_order_exchanges(
+        settings=settings,
+        db=db,
+        symbols={symbol for symbol in stale_symbols if symbol not in positions},
+    )
     items: list[dict[str, object]] = []
     for symbol in sorted(stale_symbols):
         position = positions.get(symbol)
-        exchange = _position_exchange(symbol=symbol, position=position)
+        exchange = _position_exchange(
+            symbol=symbol,
+            position=position,
+            order_exchange=order_exchanges.get(symbol),
+        )
         eligible = exchange in SUPPORTED_POSITION_EXCHANGES
         last_reconciled_at = position.last_reconciled_at if position is not None else None
         items.append(
@@ -177,13 +191,57 @@ def _candidate_key(item: dict[str, object]) -> str:
     return f"{item['symbol']}:{item.get('last_reconciled_at') or 'missing'}"
 
 
-def _position_exchange(*, symbol: str, position: ExecutionPosition | None) -> str | None:
+def _missing_position_order_exchanges(
+    *,
+    settings: Settings,
+    db: Session,
+    symbols: set[str],
+) -> dict[str, str]:
+    if not symbols:
+        return {}
+    rows = db.execute(
+        select(BrokerOrder.symbol, BrokerOrderEvent.request_payload)
+        .join(BrokerOrderEvent, BrokerOrderEvent.broker_order_pk == BrokerOrder.id)
+        .where(
+            BrokerOrder.mode == settings.runtime_mode,
+            BrokerOrder.broker_name == "kis",
+            BrokerOrder.asset_class == "us_equity",
+            BrokerOrder.venue == "kis",
+            BrokerOrder.side == "buy",
+            BrokerOrder.status == "filled",
+            BrokerOrder.symbol.in_(sorted(symbols)),
+            BrokerOrderEvent.event_type == "submit_requested",
+        )
+    ).all()
+    exchanges_by_symbol: dict[str, set[str]] = {}
+    for symbol, request_payload in rows:
+        if not isinstance(request_payload, dict):
+            continue
+        exchange = str(request_payload.get("exchange") or "").strip().upper()
+        if exchange not in SUPPORTED_POSITION_EXCHANGES - {"KRX"}:
+            continue
+        exchanges_by_symbol.setdefault(str(symbol), set()).add(exchange)
+    return {
+        symbol: next(iter(exchanges))
+        for symbol, exchanges in exchanges_by_symbol.items()
+        if len(exchanges) == 1
+    }
+
+
+def _position_exchange(
+    *,
+    symbol: str,
+    position: ExecutionPosition | None,
+    order_exchange: str | None,
+) -> str | None:
     if position is not None and isinstance(position.raw_payload, dict):
         sync_context = position.raw_payload.get("_position_sync")
         if isinstance(sync_context, dict):
             exchange = str(sync_context.get("exchange") or "").strip().upper()
             if exchange:
                 return exchange
+    if position is None and order_exchange is not None:
+        return order_exchange
     if symbol.isdigit() and len(symbol) == 6:
         return "KRX"
     return None
