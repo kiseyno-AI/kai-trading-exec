@@ -557,6 +557,74 @@ def test_apply_records_manual_review_when_authoritative_fill_evidence_is_absent(
     engine.dispose()
 
 
+def test_apply_rejects_colliding_no_id_partial_fills_atomically() -> None:
+    settings = _settings()
+    engine, db = _session(settings)
+    order = BrokerOrder(
+        broker_name="kis",
+        mode="paper",
+        idempotency_key="repair-colliding-no-id-partials",
+        broker_order_id="colliding-no-id-partials-1",
+        symbol="105560",
+        side="buy",
+        status="filled",
+        quantity=2,
+        submitted_at=FILLED_AT,
+        raw_broker_payload={
+            "fills": [
+                {
+                    "symbol": "105560",
+                    "side": "buy",
+                    "quantity": 1,
+                    "price": "71000",
+                    "filled_at": FILLED_AT.isoformat(),
+                },
+                {
+                    "symbol": "105560",
+                    "side": "buy",
+                    "quantity": 1,
+                    "price": "71000",
+                    "filled_at": FILLED_AT.isoformat(),
+                },
+            ]
+        },
+    )
+    db.add(order)
+    db.commit()
+
+    result = apply_execution_fill_repairs(
+        db=db,
+        runtime_mode="paper",
+        actor="Peter",
+        reason="colliding no-ID fills require manual review",
+        now=SOLD_AT,
+    )
+
+    assert result["summary"]["inserted_fill_count"] == 0
+    assert result["summary"]["applied_manual_review_count"] == 1
+    assert db.scalars(select(ExecutionFill)).all() == []
+    assert db.scalars(select(BrokerOrderEvent)).all() == []
+    review = db.scalar(
+        select(RuntimeRemediationEvent).where(
+            RuntimeRemediationEvent.candidate_type == "missing_execution_fill"
+        )
+    )
+    assert review is not None
+    assert review.outcome == "manual_review_required"
+    assert review.evidence_summary["blocker"] == (
+        "proposed_fill_set_not_insertable_atomically"
+    )
+    validation = review.evidence_summary["validation"]
+    assert validation["expected_quantity"] == 2
+    assert validation["proposed_quantity"] == 2
+    assert validation["retained_quantity"] == 1
+    assert len(validation["duplicate_signatures"]) == 1
+    assert validation["existing_signature_collisions"] == []
+    assert review.evidence_summary["fills_fabricated"] == 0
+    assert review.evidence_summary["orders_submitted"] == 0
+    engine.dispose()
+
+
 def _add_fill(
     db,
     *,

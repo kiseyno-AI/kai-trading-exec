@@ -388,13 +388,39 @@ def apply_execution_fill_repairs(
                 applied_manual_review_count += 1
                 audit_event_count += 1
             continue
+        validated_fills, validation_blocker = _validated_repair_fill_proposals(
+            order=order,
+            proposed_fills=proposed_fills,
+            existing_keys=existing_keys,
+        )
+        if validation_blocker is not None:
+            if _record_remediation_event(
+                db=db,
+                runtime_mode=runtime_mode,
+                candidate_type=MISSING_FILL_CANDIDATE_TYPE,
+                candidate_key=str(order.id),
+                subject_id=order.id,
+                outcome="manual_review_required",
+                actor=actor,
+                reason=reason,
+                occurred_at=repaired_at,
+                evidence_summary={
+                    "symbol": order.symbol,
+                    "side": order.side,
+                    "broker_order_id": order.broker_order_id,
+                    "idempotency_key": order.idempotency_key,
+                    "blocker": validation_blocker["code"],
+                    "validation": validation_blocker,
+                    "fills_deleted": 0,
+                    "fills_fabricated": 0,
+                    "orders_submitted": 0,
+                },
+            ):
+                applied_manual_review_count += 1
+                audit_event_count += 1
+            continue
         inserted_for_order: list[dict[str, object]] = []
-        for proposed in proposed_fills:
-            if not isinstance(proposed, dict):
-                continue
-            signature = _fill_signature(order=order, fill=proposed)
-            if signature is None or signature in existing_keys:
-                continue
+        for proposed, signature in validated_fills:
             fill = ExecutionFill(
                 idempotency_key=signature,
                 broker_order_pk=order.id,
@@ -797,6 +823,65 @@ def _fill_signature(*, order: BrokerOrder, fill: dict[str, object]) -> str | Non
         price=price,
         quantity=quantity,
     )
+
+
+def _validated_repair_fill_proposals(
+    *,
+    order: BrokerOrder,
+    proposed_fills: list[object],
+    existing_keys: set[str],
+) -> tuple[list[tuple[dict[str, object], str]], dict[str, object] | None]:
+    """Preflight every fill so one order is repaired completely or not at all."""
+    validated: list[tuple[dict[str, object], str]] = []
+    signatures: list[str] = []
+    proposed_quantity = 0
+    for index, proposed in enumerate(proposed_fills):
+        if not isinstance(proposed, dict):
+            return [], {
+                "code": "invalid_proposed_fill",
+                "invalid_fill_index": index,
+            }
+        signature = _fill_signature(order=order, fill=proposed)
+        quantity = _parse_int(proposed.get("quantity"))
+        if signature is None or quantity is None or quantity <= 0:
+            return [], {
+                "code": "invalid_proposed_fill",
+                "invalid_fill_index": index,
+            }
+        validated.append((proposed, signature))
+        signatures.append(signature)
+        proposed_quantity += quantity
+
+    signature_counts: dict[str, int] = defaultdict(int)
+    for signature in signatures:
+        signature_counts[signature] += 1
+    duplicate_signatures = sorted(
+        signature for signature, count in signature_counts.items() if count > 1
+    )
+    existing_signature_collisions = sorted(set(signatures) & existing_keys)
+    retained_quantity = 0
+    retained_signatures: set[str] = set()
+    for proposed, signature in validated:
+        if signature in existing_signature_collisions or signature in retained_signatures:
+            continue
+        retained_signatures.add(signature)
+        retained_quantity += _parse_int(proposed.get("quantity")) or 0
+    expected_quantity = int(order.quantity or 0)
+    if (
+        duplicate_signatures
+        or existing_signature_collisions
+        or proposed_quantity != expected_quantity
+        or retained_quantity != expected_quantity
+    ):
+        return [], {
+            "code": "proposed_fill_set_not_insertable_atomically",
+            "expected_quantity": expected_quantity,
+            "proposed_quantity": proposed_quantity,
+            "retained_quantity": retained_quantity,
+            "duplicate_signatures": duplicate_signatures,
+            "existing_signature_collisions": existing_signature_collisions,
+        }
+    return validated, None
 
 
 def _annotate_remediation_reviews(

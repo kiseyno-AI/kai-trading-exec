@@ -16,12 +16,14 @@ from app.models.runtime import (
     RuntimeRemediationEvent,
 )
 from app.services.broker_auth import ensure_authenticated_broker_session
+from app.services.broker_order_state import ACTIONABLE_OPEN_ORDER_STATUSES
 from app.services.reconciliation import sync_execution_positions_from_broker_snapshot
 from app.services.runtime import position_truth_freshness_payload
 
 
 POSITION_CANDIDATE_TYPE = "stale_position_truth"
 SUPPORTED_POSITION_EXCHANGES = {"KRX", "NASD", "NYSE", "AMEX"}
+POSITION_EVIDENCE_ORDER_STATUSES = (*ACTIONABLE_OPEN_ORDER_STATUSES, "filled")
 
 
 def analyze_position_truth_remediation(
@@ -309,7 +311,7 @@ def _missing_position_order_exchanges(
             BrokerOrder.asset_class == "us_equity",
             BrokerOrder.venue == "kis",
             BrokerOrder.side == "buy",
-            BrokerOrder.status == "filled",
+            BrokerOrder.status.in_(POSITION_EVIDENCE_ORDER_STATUSES),
             BrokerOrder.symbol.in_(sorted(symbols)),
             BrokerOrderEvent.event_type == "submit_requested",
         )

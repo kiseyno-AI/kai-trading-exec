@@ -337,6 +337,80 @@ def test_missing_us_position_recovers_exchange_from_filled_order_event(
     engine.dispose()
 
 
+@pytest.mark.parametrize(
+    ("symbol", "exchange", "status"),
+    [
+        ("AAPL", "NASD", "submitted"),
+        ("IBM", "NYSE", "partially_filled"),
+        ("SPY", "AMEX", "open"),
+    ],
+)
+def test_missing_us_position_recovers_exchange_from_active_order_event(
+    monkeypatch,
+    symbol: str,
+    exchange: str,
+    status: str,
+) -> None:
+    settings, engine, session_factory, db = _session()
+    order = BrokerOrder(
+        broker_name="kis",
+        mode="paper",
+        idempotency_key=f"active-{status}-{symbol.lower()}-position",
+        broker_order_id=f"active-{status}-{symbol.lower()}-buy",
+        symbol=symbol,
+        side="buy",
+        status=status,
+        quantity=2,
+        venue="kis",
+        asset_class="us_equity",
+        submitted_at=NOW - timedelta(minutes=10),
+    )
+    db.add(order)
+    db.flush()
+    db.add(
+        BrokerOrderEvent(
+            broker_order_pk=order.id,
+            event_type="submit_requested",
+            event_source="submission",
+            request_payload={
+                "provider": "kis",
+                "venue": "kis",
+                "asset_class": "us_equity",
+                "symbol": symbol,
+                "side": "buy",
+                "exchange": exchange,
+            },
+            observed_at=NOW - timedelta(minutes=10),
+        )
+    )
+    db.commit()
+    adapter = PositionInquiryAdapter()
+    monkeypatch.setattr(
+        "app.services.position_truth_remediation.ensure_authenticated_broker_session",
+        lambda **kwargs: type("SessionState", (), {"access_token": "test-token"})(),
+    )
+
+    dry_run = analyze_position_truth_remediation(settings=settings, db=db, now=NOW)
+    applied = apply_position_truth_remediation(
+        settings=settings,
+        db=db,
+        auth_session_factory=session_factory,
+        adapter=adapter,
+        actor="Peter",
+        reason="recover active U.S. order exchange through account inquiry only",
+        now=NOW,
+    )
+
+    assert dry_run["items"][0]["symbol"] == symbol
+    assert dry_run["items"][0]["exchange"] == exchange
+    assert dry_run["items"][0]["eligible"] is True
+    assert adapter.exchanges == [exchange]
+    assert applied["summary"]["refreshed_count"] == 1
+    assert db.scalars(select(BrokerOrder)).all() == [order]
+    assert db.scalars(select(ExecutionFill)).all() == []
+    engine.dispose()
+
+
 def test_existing_us_position_without_exchange_recovers_unique_filled_order_exchange(
     monkeypatch,
 ) -> None:
