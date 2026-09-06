@@ -437,6 +437,16 @@ def broker_order_fill_quality_payload(
             func.min(ExecutionFill.side).label("side"),
             func.min(ExecutionFill.quantity).label("quantity"),
             func.min(ExecutionFill.price).label("price"),
+            func.count(distinct(ExecutionFill.quantity)).label("quantity_variants"),
+            func.count(
+                distinct(
+                    func.coalesce(
+                        cast(ExecutionFill.base_quantity, String),
+                        literal("__NULL__"),
+                    )
+                )
+            ).label("base_quantity_variants"),
+            func.count(distinct(ExecutionFill.price)).label("price_variants"),
             duplicate_fill_first_filled_at,
             func.count(ExecutionFill.id).label("duplicate_count"),
         )
@@ -456,6 +466,25 @@ def broker_order_fill_quality_payload(
         .order_by(duplicate_fill_first_filled_at.desc())
         .limit(MAX_STATUS_DETAIL_ITEMS)
     ).all()
+    duplicate_order_ids = [str(row.broker_order_pk) for row in duplicate_fill_rows]
+    duplicate_reviews = db.scalars(
+        select(RuntimeRemediationEvent).where(
+            RuntimeRemediationEvent.mode == settings.runtime_mode,
+            RuntimeRemediationEvent.candidate_type == "duplicate_fill_group",
+            RuntimeRemediationEvent.outcome.in_(
+                ["manual_review_required", "non_destructive_isolation"]
+            ),
+            RuntimeRemediationEvent.subject_id.in_(duplicate_order_ids or [""]),
+        )
+    ).all()
+    duplicate_review_by_subject: dict[str, RuntimeRemediationEvent] = {}
+    for review in duplicate_reviews:
+        subject_id = str(review.subject_id)
+        if (
+            subject_id not in duplicate_review_by_subject
+            or review.occurred_at > duplicate_review_by_subject[subject_id].occurred_at
+        ):
+            duplicate_review_by_subject[subject_id] = review
     duplicate_fill_items = [
         {
             "broker_order_pk": row.broker_order_pk,
@@ -466,6 +495,35 @@ def broker_order_fill_quality_payload(
             "filled_at": _serialize_datetime(row.filled_at),
             "broker_fill_id": row.broker_fill_id,
             "duplicate_count": int(row.duplicate_count),
+            "economic_conflict": (
+                int(row.quantity_variants or 0) > 1
+                or int(row.base_quantity_variants or 0) > 1
+                or int(row.price_variants or 0) > 1
+            ),
+            "conflicting_fields": [
+                field
+                for field, count in (
+                    ("quantity", row.quantity_variants),
+                    ("base_quantity", row.base_quantity_variants),
+                    ("price", row.price_variants),
+                )
+                if int(count or 0) > 1
+            ],
+            "review_outcome": (
+                duplicate_review_by_subject[str(row.broker_order_pk)].outcome
+                if str(row.broker_order_pk) in duplicate_review_by_subject
+                else None
+            ),
+            "review_actor": (
+                duplicate_review_by_subject[str(row.broker_order_pk)].actor
+                if str(row.broker_order_pk) in duplicate_review_by_subject
+                else None
+            ),
+            "review_reason": (
+                duplicate_review_by_subject[str(row.broker_order_pk)].reason
+                if str(row.broker_order_pk) in duplicate_review_by_subject
+                else None
+            ),
         }
         for row in duplicate_fill_rows[:MAX_STATUS_DETAIL_ITEMS]
     ]

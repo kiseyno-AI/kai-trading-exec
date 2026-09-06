@@ -56,15 +56,40 @@ def execution_fill_dedupe_key(fill: ExecutionFill) -> str:
 
 
 def dedupe_execution_fills(fills: list[ExecutionFill]) -> list[ExecutionFill]:
+    groups: dict[str, list[ExecutionFill]] = {}
+    for fill in fills:
+        groups.setdefault(execution_fill_dedupe_key(fill), []).append(fill)
+
+    conflicting_keys = {
+        key for key, group in groups.items() if duplicate_fill_economic_conflict(group)
+    }
+
     seen: set[str] = set()
     unique: list[ExecutionFill] = []
     for fill in fills:
         key = execution_fill_dedupe_key(fill)
+        if key in conflicting_keys:
+            unique.append(fill)
+            continue
         if key in seen:
             continue
         seen.add(key)
         unique.append(fill)
     return unique
+
+
+def duplicate_fill_economic_conflict(fills: list[ExecutionFill]) -> bool:
+    signatures = {
+        (
+            int(fill.quantity),
+            _optional_decimal_key(
+                Decimal(fill.base_quantity) if fill.base_quantity is not None else None
+            ),
+            _decimal_key(Decimal(fill.price)),
+        )
+        for fill in fills
+    }
+    return len(signatures) > 1
 
 
 def _timestamp_key(value: datetime) -> str:

@@ -20,6 +20,7 @@ from app.models.runtime import (
 from app.services.fifo_inventory import load_fifo_isolation_cursor
 from app.services.fill_idempotency import (
     dedupe_execution_fills,
+    duplicate_fill_economic_conflict,
     execution_fill_dedupe_key,
     execution_fill_idempotency_key,
 )
@@ -477,33 +478,48 @@ def apply_execution_fill_repairs(
             or not duplicate_fills
         ):
             continue
+        conflict = group.get("economic_conflict") is True
+        outcome = "manual_review_required" if conflict else "non_destructive_isolation"
+        evidence_summary = {
+            "symbol": group.get("symbol"),
+            "side": group.get("side"),
+            "broker_order_id": group.get("broker_order_id"),
+            "retained_fill_id": retained.get("id"),
+            "duplicate_fill_ids": [
+                row.get("id") for row in duplicate_fills if isinstance(row, dict)
+            ],
+            "duplicate_group_key": group.get("duplicate_group_key"),
+            "group_membership_version": _duplicate_group_membership_version(group),
+            "fills_deleted": 0,
+            "fills_fabricated": 0,
+            "orders_submitted": 0,
+        }
+        if conflict:
+            evidence_summary["blocker"] = "duplicate_fill_economic_conflict"
+            evidence_summary["conflicting_fields"] = group.get("conflicting_fields")
+            evidence_summary["dedupe_behavior"] = (
+                "application_readers_preserve_conflicting_duplicate_identity_rows"
+            )
+        else:
+            evidence_summary["dedupe_behavior"] = (
+                "application_readers_ignore_duplicate_identity"
+            )
         if _record_remediation_event(
             db=db,
             runtime_mode=runtime_mode,
             candidate_type=DUPLICATE_FILL_CANDIDATE_TYPE,
             candidate_key=_duplicate_group_candidate_key(group),
             subject_id=str(group["broker_order_pk"]),
-            outcome="non_destructive_isolation",
+            outcome=outcome,
             actor=actor,
             reason=reason,
             occurred_at=repaired_at,
-            evidence_summary={
-                "symbol": group.get("symbol"),
-                "side": group.get("side"),
-                "broker_order_id": group.get("broker_order_id"),
-                "retained_fill_id": retained.get("id"),
-                "duplicate_fill_ids": [
-                    row.get("id") for row in duplicate_fills if isinstance(row, dict)
-                ],
-                "duplicate_group_key": group.get("duplicate_group_key"),
-                "group_membership_version": _duplicate_group_membership_version(group),
-                "dedupe_behavior": "application_readers_ignore_duplicate_identity",
-                "fills_deleted": 0,
-                "fills_fabricated": 0,
-                "orders_submitted": 0,
-            },
+            evidence_summary=evidence_summary,
         ):
-            applied_duplicate_isolation_count += 1
+            if conflict:
+                applied_manual_review_count += 1
+            else:
+                applied_duplicate_isolation_count += 1
             audit_event_count += 1
 
     db.commit()
@@ -557,6 +573,11 @@ def _repair_payload(
         for group in duplicates
         if group.get("review_outcome") == "non_destructive_isolation"
     )
+    manual_review_duplicate_count = sum(
+        1
+        for group in duplicates
+        if group.get("review_outcome") == "manual_review_required"
+    )
     return {
         "mode": mode,
         "runtime_mode": runtime_mode,
@@ -569,11 +590,25 @@ def _repair_payload(
                 for item in missing
                 if not item.get("proposed_fills") and not item.get("review_outcome")
             ),
-            "proposed_duplicate_fill_isolation_count": len(duplicates) - isolated_duplicate_count,
+            "proposed_duplicate_fill_isolation_count": sum(
+                1
+                for group in duplicates
+                if group.get("repair_action") == "isolate_non_destructively"
+                and not group.get("review_outcome")
+            ),
+            "proposed_duplicate_fill_manual_review_count": sum(
+                1
+                for group in duplicates
+                if group.get("repair_action") == "record_manual_review"
+                and not group.get("review_outcome")
+            ),
             "manual_review_missing_fill_count": manual_review_count,
             "unreviewed_missing_fill_count": len(missing) - manual_review_count,
             "isolated_duplicate_fill_group_count": isolated_duplicate_count,
-            "unreviewed_duplicate_fill_group_count": len(duplicates) - isolated_duplicate_count,
+            "manual_review_duplicate_fill_group_count": manual_review_duplicate_count,
+            "unreviewed_duplicate_fill_group_count": (
+                len(duplicates) - isolated_duplicate_count - manual_review_duplicate_count
+            ),
             "inserted_fill_count": inserted_fill_count,
             "deleted_fill_count": deleted_fill_count,
             "audit_event_count": audit_event_count,
@@ -790,6 +825,8 @@ def _duplicate_fill_groups(*, db: Session, runtime_mode: str) -> list[dict[str, 
             continue
         retained = group[0]
         duplicate_fills = group[1:]
+        economic_conflict = duplicate_fill_economic_conflict(group)
+        conflicting_fields = _duplicate_group_conflicting_fields(group)
         duplicate_groups.append(
             {
                 "duplicate_group_key": key,
@@ -800,6 +837,13 @@ def _duplicate_fill_groups(*, db: Session, runtime_mode: str) -> list[dict[str, 
                 "quantity": retained.quantity,
                 "price": _decimal_text(Decimal(retained.price)),
                 "filled_at": _serialize_datetime(retained.filled_at),
+                "base_quantity": (
+                    _decimal_text(Decimal(retained.base_quantity))
+                    if retained.base_quantity is not None
+                    else None
+                ),
+                "economic_conflict": economic_conflict,
+                "conflicting_fields": conflicting_fields,
                 "retained_fill": _fill_row_payload(retained),
                 "duplicate_fills": [_fill_row_payload(fill) for fill in duplicate_fills],
             }
@@ -919,7 +963,10 @@ def _annotate_remediation_reviews(
             "insert_authoritative_fill"
             if candidate_type == MISSING_FILL_CANDIDATE_TYPE and item.get("proposed_fills")
             else "record_manual_review"
-            if candidate_type == MISSING_FILL_CANDIDATE_TYPE
+            if (
+                candidate_type == MISSING_FILL_CANDIDATE_TYPE
+                or item.get("economic_conflict") is True
+            )
             else "isolate_non_destructively"
         )
         if review is not None:
@@ -953,6 +1000,27 @@ def _duplicate_group_membership_version(item: dict[str, object]) -> str:
         )
     membership = "\0".join(sorted(member_ids))
     return sha256(membership.encode("utf-8")).hexdigest()[:32]
+
+
+def _duplicate_group_conflicting_fields(group: list[ExecutionFill]) -> list[str]:
+    fields: list[str] = []
+    if len({int(fill.quantity) for fill in group}) > 1:
+        fields.append("quantity")
+    if (
+        len(
+            {
+                _decimal_text(Decimal(fill.base_quantity))
+                if fill.base_quantity is not None
+                else None
+                for fill in group
+            }
+        )
+        > 1
+    ):
+        fields.append("base_quantity")
+    if len({_decimal_text(Decimal(fill.price)) for fill in group}) > 1:
+        fields.append("price")
+    return fields
 
 
 def _record_remediation_event(
@@ -1003,6 +1071,11 @@ def _fill_row_payload(fill: ExecutionFill, *, id_override: str | None = "__fill_
         "symbol": fill.symbol,
         "side": fill.side,
         "quantity": fill.quantity,
+        "base_quantity": (
+            _decimal_text(Decimal(fill.base_quantity))
+            if fill.base_quantity is not None
+            else None
+        ),
         "price": _decimal_text(Decimal(fill.price)),
         "filled_at": _serialize_datetime(fill.filled_at),
         "created_at": _serialize_datetime(fill.created_at),

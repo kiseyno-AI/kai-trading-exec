@@ -41,6 +41,7 @@ from app.models.runtime import (
     ExecutionPosition,
     RuntimeRemediationEvent,
 )
+from app.services import reconciliation as reconciliation_service
 from app.services.execution_jobs import dispatch_due_execution_jobs
 from app.services.reconciliation import (
     reconcile_broker_order,
@@ -1726,6 +1727,85 @@ def test_reconcile_stale_orders_dry_run_summarizes_repairs_without_mutating() ->
     assert result["items"][0]["status_after"] == "manual_review_required"
     assert broker.reconcile_calls == []
     assert events == []
+    engine.dispose()
+
+
+def test_reconcile_adapter_error_event_keeps_attribution_after_outer_interruption(
+    tmp_path, monkeypatch
+) -> None:
+    database_url = f"sqlite:///{tmp_path / 'reconcile-attribution.db'}"
+    settings = Settings(
+        database_url=database_url,
+        runtime_mode="paper",
+        stale_broker_order_reconciliation_threshold_seconds=3600,
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    stale_submitted_at = datetime.now(UTC) - timedelta(days=5)
+    with session_factory() as db:
+        order = _order(broker_order_id="adapter-error-attribution")
+        order.submitted_at = stale_submitted_at
+        order.last_broker_sync_at = stale_submitted_at
+        db.add(order)
+        db.commit()
+        order_pk = order.id
+
+    class FailingReconcileBroker(ReconciliationStubBroker):
+        def reconcile_order(
+            self,
+            access_token: str,
+            broker_order_id: str,
+            *,
+            exchange: str = "KRX",
+            submitted_at: datetime | None = None,
+        ) -> dict[str, object]:
+            raise BrokerAdapterError(
+                "broker lookup unavailable",
+                status_code=503,
+                classification=BrokerErrorClassification.NETWORK,
+                retryable=True,
+                code="lookup_timeout",
+                observed_at=OBSERVED_AT,
+            )
+
+    def interrupt_before_outer_classification_commit(**kwargs) -> None:
+        raise RuntimeError("interrupted before classification commit")
+
+    monkeypatch.setattr(
+        reconciliation_service,
+        "_record_stale_order_classification_event",
+        interrupt_before_outer_classification_commit,
+    )
+
+    with pytest.raises(RuntimeError, match="interrupted before classification commit"):
+        with session_factory() as db:
+            reconcile_stale_nonterminal_broker_orders(
+                settings=settings,
+                db=db,
+                adapter=FailingReconcileBroker(),
+                actor="ops-desk",
+                operator_reason="investigate stale broker lookup",
+            )
+
+    with session_factory() as db:
+        event = db.scalar(
+            select(BrokerOrderEvent).where(
+                BrokerOrderEvent.broker_order_pk == order_pk,
+                BrokerOrderEvent.event_type == "reconcile_failed",
+            )
+        )
+        classifications = db.scalars(
+            select(BrokerOrderEvent).where(
+                BrokerOrderEvent.broker_order_pk == order_pk,
+                BrokerOrderEvent.event_type == "stale_order_reconcile_classification",
+            )
+        ).all()
+        assert event is not None
+        assert event.payload["actor"] == "ops-desk"
+        assert event.payload["operator_reason"] == "investigate stale broker lookup"
+        assert event.error_classification == "network"
+        assert classifications == []
     engine.dispose()
 
 

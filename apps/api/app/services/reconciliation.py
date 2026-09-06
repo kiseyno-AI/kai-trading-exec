@@ -121,6 +121,8 @@ def reconcile_broker_order(
             event_time=event_time,
             db=db,
             order_status_before=order_status_before,
+            actor=actor,
+            operator_reason=operator_reason,
         )
 
     event_time = _parse_timestamp(payload.get("observed_at"), fallback=event_time)
@@ -1313,6 +1315,8 @@ def _reconcile_adapter_error(
     event_time: datetime,
     db: Session,
     order_status_before: str,
+    actor: str | None = None,
+    operator_reason: str | None = None,
 ) -> dict[str, object]:
     if isinstance(exc, BrokerAdapterError):
         message = str(exc)
@@ -1345,6 +1349,24 @@ def _reconcile_adapter_error(
             error_classification=exc.classification.value,
             observed_at=order.last_broker_sync_at,
         ):
+            event_payload = _build_reconcile_event_payload(
+                payload={
+                    "provider": adapter.provider,
+                    "broker_order_id": requested_broker_order_id,
+                    "status": None,
+                    "broker_status": exc.code,
+                    "observed_at": _serialize_datetime(order.last_broker_sync_at),
+                    "message": message,
+                    "request_metadata": exc.request_metadata,
+                    "response_metadata": exc.response_metadata,
+                    "request_payload": exc.request_payload,
+                    "payload": exc.response_payload,
+                },
+                adapter=adapter,
+            )
+            if actor is not None or operator_reason is not None:
+                event_payload["actor"] = actor
+                event_payload["operator_reason"] = operator_reason
             db.add(
                 BrokerOrderEvent(
                     broker_order_pk=order.id,
@@ -1357,21 +1379,7 @@ def _reconcile_adapter_error(
                     message=message,
                     request_payload=exc.request_payload,
                     response_payload=exc.response_payload,
-                    payload=_build_reconcile_event_payload(
-                        payload={
-                            "provider": adapter.provider,
-                            "broker_order_id": requested_broker_order_id,
-                            "status": None,
-                            "broker_status": exc.code,
-                            "observed_at": _serialize_datetime(order.last_broker_sync_at),
-                            "message": message,
-                            "request_metadata": exc.request_metadata,
-                            "response_metadata": exc.response_metadata,
-                            "request_payload": exc.request_payload,
-                            "payload": exc.response_payload,
-                        },
-                        adapter=adapter,
-                    ),
+                    payload=event_payload,
                     observed_at=order.last_broker_sync_at,
                 )
             )
@@ -1414,6 +1422,20 @@ def _reconcile_adapter_error(
         error_classification="unknown",
         observed_at=observed_at,
     ):
+        event_payload = _build_reconcile_event_payload(
+            payload={
+                "provider": adapter.provider,
+                "broker_order_id": requested_broker_order_id,
+                "status": None,
+                "broker_status": None,
+                "observed_at": _serialize_datetime(observed_at),
+                "message": message,
+            },
+            adapter=adapter,
+        )
+        if actor is not None or operator_reason is not None:
+            event_payload["actor"] = actor
+            event_payload["operator_reason"] = operator_reason
         db.add(
             BrokerOrderEvent(
                 broker_order_pk=order.id,
@@ -1422,17 +1444,7 @@ def _reconcile_adapter_error(
                 normalized_status=order.status,
                 error_classification="unknown",
                 message=message,
-                payload=_build_reconcile_event_payload(
-                    payload={
-                        "provider": adapter.provider,
-                        "broker_order_id": requested_broker_order_id,
-                        "status": None,
-                        "broker_status": None,
-                        "observed_at": _serialize_datetime(observed_at),
-                        "message": message,
-                    },
-                    adapter=adapter,
-                ),
+                payload=event_payload,
                 observed_at=observed_at,
             )
         )

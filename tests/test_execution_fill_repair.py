@@ -29,6 +29,7 @@ from app.services.execution_fill_repair import (
     apply_fifo_inventory_repairs,
     apply_execution_fill_repairs,
 )
+from app.services.fill_idempotency import dedupe_execution_fills
 from app.services.runtime import broker_order_fill_quality_payload, daily_pnl_payload
 
 
@@ -537,6 +538,119 @@ def test_duplicate_isolation_review_is_versioned_when_group_membership_changes()
         second_duplicate.id,
     ]
     assert len(db.scalars(select(ExecutionFill)).all()) == 3
+    engine.dispose()
+
+
+def test_conflicting_duplicate_broker_fill_requires_manual_review_without_isolation() -> None:
+    settings = _settings()
+    engine, db = _session(settings)
+    order = _duplicate_fill_order()
+    db.add(order)
+    db.flush()
+    retained = ExecutionFill(
+        id="a-conflicting-retained-fill",
+        broker_order_pk=order.id,
+        broker_fill_id="conflicting-fill",
+        symbol=order.symbol,
+        side=order.side,
+        quantity=1,
+        base_quantity=Decimal("1.0"),
+        price=Decimal("73000"),
+        filled_at=SOLD_AT,
+    )
+    conflicting = ExecutionFill(
+        id="b-conflicting-duplicate-fill",
+        broker_order_pk=order.id,
+        broker_fill_id="conflicting-fill",
+        symbol=order.symbol,
+        side=order.side,
+        quantity=2,
+        base_quantity=Decimal("2.0"),
+        price=Decimal("74000"),
+        filled_at=SOLD_AT,
+    )
+    db.add_all([retained, conflicting])
+    db.commit()
+
+    dry_run = analyze_execution_fill_repairs(db=db, runtime_mode="paper")
+    applied = apply_execution_fill_repairs(
+        db=db,
+        runtime_mode="paper",
+        actor="test-operator",
+        reason="duplicate broker fill has conflicting economics",
+        now=SOLD_AT,
+    )
+
+    dry_run_group = dry_run["duplicate_fill_groups"][0]
+    applied_group = applied["duplicate_fill_groups"][0]
+    assert dry_run_group["economic_conflict"] is True
+    assert dry_run_group["conflicting_fields"] == [
+        "quantity",
+        "base_quantity",
+        "price",
+    ]
+    assert dry_run_group["repair_action"] == "record_manual_review"
+    assert applied["summary"]["applied_duplicate_isolation_count"] == 0
+    assert applied["summary"]["applied_manual_review_count"] == 1
+    assert applied["summary"]["isolated_duplicate_fill_group_count"] == 0
+    assert applied["summary"]["manual_review_duplicate_fill_group_count"] == 1
+    assert applied_group["review_outcome"] == "manual_review_required"
+    assert len(db.scalars(select(ExecutionFill)).all()) == 2
+
+    review = db.scalar(
+        select(RuntimeRemediationEvent).where(
+            RuntimeRemediationEvent.candidate_type == "duplicate_fill_group"
+        )
+    )
+    assert review is not None
+    assert review.outcome == "manual_review_required"
+    assert review.evidence_summary["blocker"] == "duplicate_fill_economic_conflict"
+    assert review.evidence_summary["fills_deleted"] == 0
+    assert review.evidence_summary["fills_fabricated"] == 0
+    assert review.evidence_summary["orders_submitted"] == 0
+    assert review.evidence_summary["duplicate_fill_ids"] == [conflicting.id]
+    engine.dispose()
+
+
+def test_conflicting_duplicate_fill_reader_does_not_silently_canonicalize() -> None:
+    settings = _settings()
+    engine, db = _session(settings)
+    order = _duplicate_fill_order()
+    db.add(order)
+    db.flush()
+    first = ExecutionFill(
+        broker_order_pk=order.id,
+        broker_fill_id="reader-conflict-fill",
+        symbol=order.symbol,
+        side=order.side,
+        quantity=1,
+        base_quantity=Decimal("1.0"),
+        price=Decimal("73000"),
+        filled_at=SOLD_AT,
+    )
+    second = ExecutionFill(
+        broker_order_pk=order.id,
+        broker_fill_id="reader-conflict-fill",
+        symbol=order.symbol,
+        side=order.side,
+        quantity=1,
+        base_quantity=Decimal("1.0"),
+        price=Decimal("74000"),
+        filled_at=SOLD_AT,
+    )
+    db.add_all([first, second])
+    db.commit()
+
+    quality = broker_order_fill_quality_payload(settings=settings, db=db)
+    fills = db.scalars(select(ExecutionFill).order_by(ExecutionFill.id.asc())).all()
+
+    assert [fill.id for fill in dedupe_execution_fills(fills)] == [
+        fills[0].id,
+        fills[1].id,
+    ]
+    assert quality["duplicate_fill_group_count"] == 1
+    assert quality["duplicate_fill_groups"][0]["economic_conflict"] is True
+    assert quality["duplicate_fill_groups"][0]["conflicting_fields"] == ["price"]
     engine.dispose()
 
 
