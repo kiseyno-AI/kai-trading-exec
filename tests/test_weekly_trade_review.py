@@ -72,6 +72,7 @@ def test_weekly_trade_review_exports_bounded_read_only_artifact(tmp_path) -> Non
     assert report["counts"]["linked_broker_order_event_count"] == 1
     assert report["counts"]["execution_failure_count"] == 1
     assert report["counts"]["closed_trade_count"] == 1
+    assert report["counts"]["closed_sell_fill_count"] == 1
     assert report["counts"]["total_sell_rows"] == 1
     assert report["counts"]["pnl_covered_sell_rows"] == 1
     assert report["counts"]["pnl_uncovered_sell_rows"] == 0
@@ -91,6 +92,38 @@ def test_weekly_trade_review_exports_bounded_read_only_artifact(tmp_path) -> Non
     assert report["closed_trades"][0]["realized_pnl"] == "-1800.0000"
     assert report["realized_pnl_coverage"]["status"] == "complete"
     assert report["realized_pnl_coverage"]["truncated"] is False
+    assert report["realized_pnl_summary"] == {
+        "status": "complete",
+        "sell_fill_count": 1,
+        "covered_sell_fill_count": 1,
+        "win_count": 0,
+        "loss_count": 1,
+        "flat_count": 0,
+        "realized_pnl": "-1800.0000",
+        "covered_realized_pnl": "-1800.0000",
+        "average_return_pct": "-16.6667",
+        "median_return_pct": "-16.6667",
+        "best_trade": {
+            "sell_fill_id": "legacy-sell-fill",
+            "sell_broker_order_pk": "legacy-sell-order",
+            "symbol": "049430",
+            "sell_filled_at": "2026-07-27T01:05:00+00:00",
+            "quantity": 6,
+            "cost_basis": "10800.0000",
+            "realized_pnl": "-1800.0000",
+            "return_pct": "-16.6667",
+        },
+        "worst_trade": {
+            "sell_fill_id": "legacy-sell-fill",
+            "sell_broker_order_pk": "legacy-sell-order",
+            "symbol": "049430",
+            "sell_filled_at": "2026-07-27T01:05:00+00:00",
+            "quantity": 6,
+            "cost_basis": "10800.0000",
+            "realized_pnl": "-1800.0000",
+            "return_pct": "-16.6667",
+        },
+    }
     assert report["stale_fifo_inventory_alerts"][0]["symbol"] == "049430"
     assert report["stale_fifo_inventory_alerts"][0]["fifo_open_quantity"] == 39
     assert report["linked_broker_orders"][0]["id"] == "weekly-order"
@@ -521,6 +554,7 @@ def test_weekly_trade_review_pnl_coverage_classifies_each_sell_fill_once(tmp_pat
         engine.dispose()
 
     assert report["counts"]["closed_trade_count"] == 4
+    assert report["counts"]["closed_sell_fill_count"] == 2
     assert report["counts"]["total_sell_rows"] == 2
     assert report["counts"]["pnl_covered_sell_rows"] == 1
     assert report["counts"]["pnl_uncovered_sell_rows"] == 1
@@ -533,6 +567,38 @@ def test_weekly_trade_review_pnl_coverage_classifies_each_sell_fill_once(tmp_pat
         "uncovered_gross_proceeds": "750.0000",
         "symbols_requiring_repair": ["PART"],
         "uncovered_sell_fill_ids": ["partial-sell-fill"],
+    }
+    assert report["realized_pnl_summary"] == {
+        "status": "incomplete",
+        "sell_fill_count": 2,
+        "covered_sell_fill_count": 1,
+        "win_count": 1,
+        "loss_count": 0,
+        "flat_count": 0,
+        "realized_pnl": None,
+        "covered_realized_pnl": "220.0000",
+        "average_return_pct": "41.5094",
+        "median_return_pct": "41.5094",
+        "best_trade": {
+            "sell_fill_id": "split-sell-fill",
+            "sell_broker_order_pk": "split-sell-order",
+            "symbol": "SPLIT",
+            "sell_filled_at": "2026-07-25T03:00:00+00:00",
+            "quantity": 5,
+            "cost_basis": "530.0000",
+            "realized_pnl": "220.0000",
+            "return_pct": "41.5094",
+        },
+        "worst_trade": {
+            "sell_fill_id": "split-sell-fill",
+            "sell_broker_order_pk": "split-sell-order",
+            "symbol": "SPLIT",
+            "sell_filled_at": "2026-07-25T03:00:00+00:00",
+            "quantity": 5,
+            "cost_basis": "530.0000",
+            "realized_pnl": "220.0000",
+            "return_pct": "41.5094",
+        },
     }
 
 

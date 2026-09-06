@@ -162,6 +162,10 @@ def generate_weekly_trade_review(
     )
     progress("weekly_closed_trades", row_count=len(closed_trades), truncated=closed_trades_truncated)
     pnl_coverage = _weekly_pnl_coverage(closed_trades, truncated=closed_trades_truncated)
+    realized_pnl_summary = _weekly_realized_pnl_summary(
+        closed_trades,
+        truncated=closed_trades_truncated,
+    )
     stale_fifo_inventory_alerts, stale_fifo_inventory_alerts_truncated = _stale_fifo_inventory_alerts(
         db=db,
         mode=settings.runtime_mode,
@@ -234,6 +238,7 @@ def generate_weekly_trade_review(
             "monitoring_checkpoint_count": len(monitoring_checkpoints),
             "protective_stop_actionability_warning_count": protective_stop_actionability["warning_count"],
             "closed_trade_count": len(closed_trades),
+            "closed_sell_fill_count": realized_pnl_summary["sell_fill_count"],
             "total_sell_rows": pnl_coverage["total_sell_rows"],
             "pnl_covered_sell_rows": pnl_coverage["covered_sell_rows"],
             "pnl_uncovered_sell_rows": pnl_coverage["uncovered_sell_rows"],
@@ -255,6 +260,7 @@ def generate_weekly_trade_review(
         "execution_failures": failures,
         "closed_trades": closed_trades,
         "realized_pnl_coverage": pnl_coverage,
+        "realized_pnl_summary": realized_pnl_summary,
         "stale_fifo_inventory_alerts": stale_fifo_inventory_alerts,
         "active_broker_order_summary": active_order_summary,
         "execution_plan_item_summary": plan_item_summary,
@@ -854,6 +860,98 @@ def _weekly_pnl_coverage(
         "uncovered_gross_proceeds": uncovered_proceeds,
         "symbols_requiring_repair": sorted({str(row["symbol"]) for row in uncovered_rows}),
         "uncovered_sell_fill_ids": sorted(uncovered_fill_ids),
+    }
+
+
+def _weekly_realized_pnl_summary(
+    closed_trades: Sequence[dict[str, object]],
+    *,
+    truncated: bool,
+) -> dict[str, object]:
+    """Aggregate FIFO lot rows into one outcome per sell fill."""
+
+    rows_by_fill_id: dict[str, list[dict[str, object]]] = {}
+    for row in closed_trades:
+        rows_by_fill_id.setdefault(str(row["sell_fill_id"]), []).append(row)
+
+    outcomes: list[dict[str, object]] = []
+    for fill_id, rows in rows_by_fill_id.items():
+        if any(
+            row.get("cost_basis_price") is None or row.get("realized_pnl") is None
+            for row in rows
+        ):
+            continue
+        cost_basis = sum(
+            (
+                Decimal(str(row["cost_basis_price"])) * Decimal(str(row["quantity"]))
+                for row in rows
+            ),
+            Decimal("0"),
+        )
+        realized_pnl = sum(
+            (Decimal(str(row["realized_pnl"])) for row in rows),
+            Decimal("0"),
+        ).quantize(Decimal("0.0001"))
+        return_pct = (
+            (realized_pnl / cost_basis * Decimal("100")).quantize(Decimal("0.0001"))
+            if cost_basis > 0
+            else None
+        )
+        outcomes.append(
+            {
+                "sell_fill_id": fill_id,
+                "sell_broker_order_pk": rows[0]["sell_broker_order_pk"],
+                "symbol": rows[0]["symbol"],
+                "sell_filled_at": rows[0]["sell_filled_at"],
+                "quantity": _quantity_value(
+                    sum((Decimal(str(row["quantity"])) for row in rows), Decimal("0"))
+                ),
+                "cost_basis": cost_basis.quantize(Decimal("0.0001")),
+                "realized_pnl": realized_pnl,
+                "return_pct": return_pct,
+            }
+        )
+
+    outcomes.sort(key=lambda row: (Decimal(str(row["realized_pnl"])), str(row["sell_fill_id"])))
+    returns = sorted(
+        Decimal(str(row["return_pct"]))
+        for row in outcomes
+        if row["return_pct"] is not None
+    )
+    average_return_pct = (
+        (sum(returns, Decimal("0")) / Decimal(len(returns))).quantize(Decimal("0.0001"))
+        if returns
+        else None
+    )
+    median_return_pct: Decimal | None = None
+    if returns:
+        midpoint = len(returns) // 2
+        if len(returns) % 2:
+            median_return_pct = returns[midpoint]
+        else:
+            median_return_pct = (
+                (returns[midpoint - 1] + returns[midpoint]) / Decimal("2")
+            ).quantize(Decimal("0.0001"))
+
+    coverage_complete = len(outcomes) == len(rows_by_fill_id)
+    status = "truncated" if truncated else ("complete" if coverage_complete else "incomplete")
+    covered_realized_pnl = sum(
+        (Decimal(str(row["realized_pnl"])) for row in outcomes),
+        Decimal("0"),
+    ).quantize(Decimal("0.0001"))
+    return {
+        "status": status,
+        "sell_fill_count": len(rows_by_fill_id),
+        "covered_sell_fill_count": len(outcomes),
+        "win_count": sum(1 for row in outcomes if Decimal(str(row["realized_pnl"])) > 0),
+        "loss_count": sum(1 for row in outcomes if Decimal(str(row["realized_pnl"])) < 0),
+        "flat_count": sum(1 for row in outcomes if Decimal(str(row["realized_pnl"])) == 0),
+        "realized_pnl": covered_realized_pnl if status == "complete" else None,
+        "covered_realized_pnl": covered_realized_pnl,
+        "average_return_pct": average_return_pct,
+        "median_return_pct": median_return_pct,
+        "best_trade": outcomes[-1] if outcomes else None,
+        "worst_trade": outcomes[0] if outcomes else None,
     }
 
 
