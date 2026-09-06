@@ -208,7 +208,7 @@ def test_live_strategy_requires_separate_live_gate() -> None:
     }
 
 
-def test_protective_exit_sells_only_strategy_owned_crypto_inventory(
+def test_protective_exit_dedupes_strategy_fills_and_preserves_manual_inventory(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     observed_at = datetime(2026, 8, 16, 0, 5, tzinfo=UTC)
@@ -260,6 +260,16 @@ def test_protective_exit_sells_only_strategy_owned_crypto_inventory(
         db.add_all([state, strategy_order, manual_order])
         db.flush()
         db.add_all([
+            ExecutionFill(
+                broker_order_pk=strategy_order.id,
+                symbol="BTC/USD",
+                side="buy",
+                quantity=0,
+                base_quantity=Decimal("0.25"),
+                quote_notional=Decimal("25"),
+                price=Decimal("100"),
+                filled_at=observed_at - timedelta(minutes=5),
+            ),
             ExecutionFill(
                 broker_order_pk=strategy_order.id,
                 symbol="BTC/USD",
@@ -340,6 +350,7 @@ def test_protective_exit_sells_only_strategy_owned_crypto_inventory(
     with session_factory() as db:
         state = db.query(CryptoStrategyState).filter_by(symbol="BTC/USD").one()
         assert state.strategy_owned_base_quantity == Decimal("0.250000000000")
+        assert db.query(ExecutionFill).count() == 3
 
 
 def test_force_exit_caps_crypto_sell_to_strategy_owned_quantity(

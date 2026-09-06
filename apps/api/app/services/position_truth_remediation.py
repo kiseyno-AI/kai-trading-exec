@@ -5,7 +5,7 @@ from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 
 from app.broker.base import BrokerAdapter
 from app.core.config import Settings
@@ -15,6 +15,7 @@ from app.models.runtime import (
     ExecutionPosition,
     RuntimeRemediationEvent,
 )
+from app.services.broker_auth import ensure_authenticated_broker_session
 from app.services.reconciliation import sync_execution_positions_from_broker_snapshot
 from app.services.runtime import position_truth_freshness_payload
 
@@ -88,6 +89,7 @@ def apply_position_truth_remediation(
     *,
     settings: Settings,
     db: Session,
+    auth_session_factory: sessionmaker[Session],
     adapter: BrokerAdapter,
     actor: str,
     reason: str,
@@ -118,6 +120,15 @@ def apply_position_truth_remediation(
 
     sync_results: dict[str, dict[str, int]] = {}
     try:
+        access_token = (
+            _durably_authenticate_for_position_refresh(
+                settings=settings,
+                session_factory=auth_session_factory,
+                adapter=adapter,
+            )
+            if symbols_by_exchange
+            else None
+        )
         for exchange, symbols in sorted(symbols_by_exchange.items()):
             sync_results[exchange] = sync_execution_positions_from_broker_snapshot(
                 settings=settings,
@@ -126,6 +137,7 @@ def apply_position_truth_remediation(
                 symbols=symbols,
                 exchange=exchange,
                 commit=False,
+                authenticated_access_token=access_token,
             )
     except Exception:
         db.rollback()
@@ -221,6 +233,24 @@ def apply_position_truth_remediation(
             for item in items
         ],
     }
+
+
+def _durably_authenticate_for_position_refresh(
+    *,
+    settings: Settings,
+    session_factory: sessionmaker[Session],
+    adapter: BrokerAdapter,
+) -> str:
+    """Commit auth state and its audit event outside the position transaction."""
+    with session_factory() as auth_db:
+        state = ensure_authenticated_broker_session(
+            settings=settings,
+            db=auth_db,
+            adapter=adapter,
+            source="position_truth_remediation",
+            reason="refresh execution positions from broker snapshot",
+        )
+        return state.access_token or ""
 
 
 def _candidate_key(item: dict[str, object]) -> str:

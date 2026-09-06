@@ -62,7 +62,6 @@ def ensure_authenticated_broker_session(
     adapter: BrokerAdapter | None = None,
     source: str = "system",
     reason: str = "broker order submission requires an active session",
-    commit: bool = True,
 ) -> BrokerSession:
     broker_adapter = adapter or build_broker_adapter(settings)
     config = broker_adapter.describe()
@@ -92,7 +91,6 @@ def ensure_authenticated_broker_session(
             message=str(exc),
             previous_state=previous_state,
             current_state=_session_snapshot(config=config, state=state, reconnect=reconnect),
-            commit=commit,
         )
         raise
 
@@ -108,7 +106,6 @@ def ensure_authenticated_broker_session(
         message="broker access token issued",
         previous_state=previous_state,
         current_state=_session_snapshot(config=config, state=state, reconnect=reconnect),
-        commit=commit,
     )
     db.refresh(state)
     return state
@@ -521,7 +518,6 @@ def _record_event(
     message: str,
     previous_state: dict[str, object],
     current_state: dict[str, object],
-    commit: bool = True,
 ) -> BrokerSessionEvent:
     event = BrokerSessionEvent(
         broker_session_id=state.id,
@@ -536,10 +532,7 @@ def _record_event(
         occurred_at=datetime.now(UTC),
     )
     db.add(event)
-    if commit:
-        db.commit()
-    else:
-        db.flush()
+    db.commit()
     return event
 
 

@@ -58,6 +58,7 @@ def main() -> int:
                 payload = apply_position_truth_remediation(
                     settings=settings,
                     db=db,
+                    auth_session_factory=session_factory,
                     adapter=KisBrokerAdapter(settings=settings),
                     actor=actor,
                     reason=reason,

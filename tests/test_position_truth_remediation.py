@@ -12,6 +12,7 @@ from sqlalchemy import select
 from app.broker.base import (
     BrokerAccountHolding,
     BrokerAccountSnapshot,
+    BrokerAdapterError,
     BrokerConfig,
     BrokerReconnectHandle,
     BrokerTokenGrant,
@@ -40,9 +41,15 @@ NOW = datetime(2026, 9, 6, 18, 0, tzinfo=UTC)
 class PositionInquiryAdapter:
     provider = "kis"
 
-    def __init__(self, *, fail_exchange: str | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        fail_exchange: str | None = None,
+        reject_authentication: bool = False,
+    ) -> None:
         self.exchanges: list[str] = []
         self.fail_exchange = fail_exchange
+        self.reject_authentication = reject_authentication
         self.authenticate_calls = 0
 
     def describe(self) -> BrokerConfig:
@@ -58,6 +65,8 @@ class PositionInquiryAdapter:
 
     def authenticate(self) -> BrokerTokenGrant:
         self.authenticate_calls += 1
+        if self.reject_authentication:
+            raise BrokerAdapterError("authentication rejected", status_code=401)
         return BrokerTokenGrant(
             access_token="renewed-token",
             token_type="Bearer",
@@ -109,7 +118,8 @@ def _session():
     )
     engine = create_db_engine(settings)
     Base.metadata.create_all(engine)
-    return settings, engine, create_session_factory(engine)()
+    session_factory = create_session_factory(engine)
+    return settings, engine, session_factory, session_factory()
 
 
 def _add_filled_us_buy_order_event(
@@ -154,7 +164,7 @@ def _add_filled_us_buy_order_event(
 
 
 def test_position_truth_remediation_routes_supported_and_blocks_unknown(monkeypatch) -> None:
-    settings, engine, db = _session()
+    settings, engine, session_factory, db = _session()
     old = NOW - timedelta(days=1)
     db.add_all(
         [
@@ -189,7 +199,7 @@ def test_position_truth_remediation_routes_supported_and_blocks_unknown(monkeypa
     db.commit()
     adapter = PositionInquiryAdapter()
     monkeypatch.setattr(
-        "app.services.reconciliation.ensure_authenticated_broker_session",
+        "app.services.position_truth_remediation.ensure_authenticated_broker_session",
         lambda **kwargs: type("SessionState", (), {"access_token": "test-token"})(),
     )
 
@@ -197,6 +207,7 @@ def test_position_truth_remediation_routes_supported_and_blocks_unknown(monkeypa
     applied = apply_position_truth_remediation(
         settings=settings,
         db=db,
+        auth_session_factory=session_factory,
         adapter=adapter,
         actor="Peter",
         reason="issue #265: refresh position truth through account inquiry only",
@@ -247,7 +258,7 @@ def test_missing_us_position_recovers_exchange_from_filled_order_event(
     symbol: str,
     exchange: str,
 ) -> None:
-    settings, engine, db = _session()
+    settings, engine, session_factory, db = _session()
     order = BrokerOrder(
         broker_name="kis",
         mode="paper",
@@ -282,7 +293,7 @@ def test_missing_us_position_recovers_exchange_from_filled_order_event(
     db.commit()
     adapter = PositionInquiryAdapter()
     monkeypatch.setattr(
-        "app.services.reconciliation.ensure_authenticated_broker_session",
+        "app.services.position_truth_remediation.ensure_authenticated_broker_session",
         lambda **kwargs: type("SessionState", (), {"access_token": "test-token"})(),
     )
 
@@ -290,6 +301,7 @@ def test_missing_us_position_recovers_exchange_from_filled_order_event(
     applied = apply_position_truth_remediation(
         settings=settings,
         db=db,
+        auth_session_factory=session_factory,
         adapter=adapter,
         actor="Peter",
         reason="refresh missing U.S. position through account inquiry only",
@@ -328,7 +340,7 @@ def test_missing_us_position_recovers_exchange_from_filled_order_event(
 def test_existing_us_position_without_exchange_recovers_unique_filled_order_exchange(
     monkeypatch,
 ) -> None:
-    settings, engine, db = _session()
+    settings, engine, session_factory, db = _session()
     db.add(
         ExecutionPosition(
             mode="paper",
@@ -349,7 +361,7 @@ def test_existing_us_position_without_exchange_recovers_unique_filled_order_exch
     db.commit()
     adapter = PositionInquiryAdapter()
     monkeypatch.setattr(
-        "app.services.reconciliation.ensure_authenticated_broker_session",
+        "app.services.position_truth_remediation.ensure_authenticated_broker_session",
         lambda **kwargs: type("SessionState", (), {"access_token": "test-token"})(),
     )
 
@@ -357,6 +369,7 @@ def test_existing_us_position_without_exchange_recovers_unique_filled_order_exch
     applied = apply_position_truth_remediation(
         settings=settings,
         db=db,
+        auth_session_factory=session_factory,
         adapter=adapter,
         actor="Peter",
         reason="recover existing U.S. position route from unique order evidence",
@@ -375,7 +388,7 @@ def test_existing_us_position_without_exchange_recovers_unique_filled_order_exch
 
 
 def test_existing_us_position_with_ambiguous_order_exchanges_fails_closed() -> None:
-    settings, engine, db = _session()
+    settings, engine, session_factory, db = _session()
     old = NOW - timedelta(days=1)
     db.add(
         ExecutionPosition(
@@ -407,6 +420,7 @@ def test_existing_us_position_with_ambiguous_order_exchanges_fails_closed() -> N
     applied = apply_position_truth_remediation(
         settings=settings,
         db=db,
+        auth_session_factory=session_factory,
         adapter=adapter,
         actor="Peter",
         reason="ambiguous exchange evidence requires manual review",
@@ -429,7 +443,7 @@ def test_existing_us_position_with_ambiguous_order_exchanges_fails_closed() -> N
 def test_position_truth_remediation_rolls_back_prior_exchange_when_later_inquiry_fails(
     monkeypatch,
 ) -> None:
-    settings, engine, db = _session()
+    settings, engine, session_factory, db = _session()
     old = NOW - timedelta(days=1)
     db.add_all(
         [
@@ -455,7 +469,7 @@ def test_position_truth_remediation_rolls_back_prior_exchange_when_later_inquiry
     db.commit()
     adapter = PositionInquiryAdapter(fail_exchange="NASD")
     monkeypatch.setattr(
-        "app.services.reconciliation.ensure_authenticated_broker_session",
+        "app.services.position_truth_remediation.ensure_authenticated_broker_session",
         lambda **kwargs: type("SessionState", (), {"access_token": "test-token"})(),
     )
 
@@ -463,6 +477,7 @@ def test_position_truth_remediation_rolls_back_prior_exchange_when_later_inquiry
         apply_position_truth_remediation(
             settings=settings,
             db=db,
+            auth_session_factory=session_factory,
             adapter=adapter,
             actor="Peter",
             reason="issue #265: refresh position truth through account inquiry only",
@@ -481,10 +496,18 @@ def test_position_truth_remediation_rolls_back_prior_exchange_when_later_inquiry
     engine.dispose()
 
 
-def test_position_truth_remediation_rolls_back_auth_refresh_with_prior_exchange(
-    monkeypatch,
+def test_position_truth_remediation_preserves_issued_auth_when_later_inquiry_fails(
+    tmp_path,
 ) -> None:
-    settings, engine, db = _session()
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'issued-auth.db'}",
+        runtime_mode="paper",
+        exec_agent_max_account_snapshot_age_seconds=300,
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    db = session_factory()
     old = NOW - timedelta(days=1)
     db.add_all(
         [
@@ -495,7 +518,7 @@ def test_position_truth_remediation_rolls_back_auth_refresh_with_prior_exchange(
                 api_base_url="https://broker.test",
                 access_token="original-token",
                 token_type="Bearer",
-                access_token_expires_at=NOW + timedelta(hours=1),
+                access_token_expires_at=NOW - timedelta(hours=1),
             ),
             ExecutionPosition(
                 mode="paper",
@@ -517,36 +540,99 @@ def test_position_truth_remediation_rolls_back_auth_refresh_with_prior_exchange(
         ]
     )
     db.commit()
-    reusable_results = iter((True, False))
-    monkeypatch.setattr(
-        "app.services.broker_auth._session_token_reusable",
-        lambda _state: next(reusable_results),
-    )
     adapter = PositionInquiryAdapter(fail_exchange="NASD")
 
     with pytest.raises(RuntimeError, match="NASD inquiry failed"):
         apply_position_truth_remediation(
             settings=settings,
             db=db,
+            auth_session_factory=session_factory,
             adapter=adapter,
             actor="Peter",
-            reason="all exchanges and authentication must remain atomic",
+            reason="position changes are atomic but authentication is durable",
             now=NOW,
         )
 
     db.expire_all()
     position = db.scalar(select(ExecutionPosition).where(ExecutionPosition.symbol == "003550"))
-    broker_session = db.get(BrokerSession, "kis:paper")
     assert adapter.exchanges == ["KRX", "NASD"]
     assert adapter.authenticate_calls == 1
     assert position is not None
     assert position.quantity == 5
     assert position.average_price == Decimal("200000.0000")
     assert position.last_reconciled_at == old.replace(tzinfo=None)
-    assert broker_session is not None
-    assert broker_session.access_token == "original-token"
-    assert db.scalars(select(BrokerSessionEvent)).all() == []
     assert db.scalars(select(RuntimeRemediationEvent)).all() == []
+    with session_factory() as verification_db:
+        broker_session = verification_db.get(BrokerSession, "kis:paper")
+        auth_events = verification_db.scalars(select(BrokerSessionEvent)).all()
+        assert broker_session is not None
+        assert broker_session.access_token == "renewed-token"
+        assert len(auth_events) == 1
+        assert auth_events[0].action == "authenticate"
+        assert auth_events[0].outcome == "applied"
+        assert auth_events[0].source == "position_truth_remediation"
+    db.close()
+    engine.dispose()
+
+
+def test_position_truth_remediation_preserves_rejected_auth_audit(
+    tmp_path,
+) -> None:
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'rejected-auth.db'}",
+        runtime_mode="paper",
+        exec_agent_max_account_snapshot_age_seconds=300,
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    old = NOW - timedelta(days=1)
+    with session_factory() as db:
+        db.add(
+            ExecutionPosition(
+                mode="paper",
+                symbol="003550",
+                quantity=5,
+                average_price=Decimal("200000"),
+                updated_from="test",
+                last_reconciled_at=old,
+            )
+        )
+        db.commit()
+        adapter = PositionInquiryAdapter(reject_authentication=True)
+
+        with pytest.raises(BrokerAdapterError, match="authentication rejected"):
+            apply_position_truth_remediation(
+                settings=settings,
+                db=db,
+                auth_session_factory=session_factory,
+                adapter=adapter,
+                actor="Peter",
+                reason="record rejected authentication independently",
+                now=NOW,
+            )
+
+        db.expire_all()
+        position = db.scalar(
+            select(ExecutionPosition).where(ExecutionPosition.symbol == "003550")
+        )
+        assert position is not None
+        assert position.quantity == 5
+        assert position.last_reconciled_at == old.replace(tzinfo=None)
+        assert db.scalars(select(RuntimeRemediationEvent)).all() == []
+        assert adapter.exchanges == []
+        assert adapter.authenticate_calls == 1
+
+    with session_factory() as verification_db:
+        broker_session = verification_db.get(BrokerSession, "kis:paper")
+        auth_events = verification_db.scalars(select(BrokerSessionEvent)).all()
+        assert broker_session is not None
+        assert broker_session.access_token is None
+        assert broker_session.last_error == "authentication rejected"
+        assert len(auth_events) == 1
+        assert auth_events[0].action == "authenticate"
+        assert auth_events[0].outcome == "rejected"
+        assert auth_events[0].source == "position_truth_remediation"
     engine.dispose()
 
 

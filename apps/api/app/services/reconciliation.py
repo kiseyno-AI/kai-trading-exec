@@ -1046,24 +1046,32 @@ def sync_execution_positions_from_broker_snapshot(
     exchange: str = "KRX",
     discover_holdings_only: bool = False,
     commit: bool = True,
+    authenticated_access_token: str | None = None,
 ) -> dict[str, int]:
     normalized_symbols = _normalize_symbols(symbols)
-    session_state = ensure_authenticated_broker_session(
-        settings=settings,
-        db=db,
-        adapter=adapter,
-        source="reconciliation",
-        reason="refresh execution positions from broker snapshot",
-        commit=commit,
-    )
+    if authenticated_access_token is None:
+        if not commit:
+            raise ValueError(
+                "commit=False position sync requires independently persisted authentication"
+            )
+        session_state = ensure_authenticated_broker_session(
+            settings=settings,
+            db=db,
+            adapter=adapter,
+            source="reconciliation",
+            reason="refresh execution positions from broker snapshot",
+        )
+        access_token = session_state.access_token or ""
+    else:
+        access_token = authenticated_access_token
     try:
         snapshot = adapter.get_account_snapshot(
-            session_state.access_token or "",
+            access_token,
             symbols=sorted(normalized_symbols) if normalized_symbols is not None else None,
             exchange=exchange,
         )
     except TypeError:
-        snapshot = adapter.get_account_snapshot(session_state.access_token or "")
+        snapshot = adapter.get_account_snapshot(access_token)
     if discover_holdings_only:
         if normalized_symbols is not None:
             raise ValueError("holdings-only discovery requires symbols=None")
