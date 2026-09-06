@@ -87,14 +87,19 @@ def apply_position_truth_remediation(
             symbols_by_exchange.setdefault(str(item["exchange"]), set()).add(str(item["symbol"]))
 
     sync_results: dict[str, dict[str, int]] = {}
-    for exchange, symbols in sorted(symbols_by_exchange.items()):
-        sync_results[exchange] = sync_execution_positions_from_broker_snapshot(
-            settings=settings,
-            db=db,
-            adapter=adapter,
-            symbols=symbols,
-            exchange=exchange,
-        )
+    try:
+        for exchange, symbols in sorted(symbols_by_exchange.items()):
+            sync_results[exchange] = sync_execution_positions_from_broker_snapshot(
+                settings=settings,
+                db=db,
+                adapter=adapter,
+                symbols=symbols,
+                exchange=exchange,
+                commit=False,
+            )
+    except Exception:
+        db.rollback()
+        raise
 
     applied_event_count = 0
     for item in items:

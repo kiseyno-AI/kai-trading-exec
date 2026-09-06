@@ -1041,6 +1041,7 @@ def sync_execution_positions_from_broker_snapshot(
     symbols: set[str] | None = None,
     exchange: str = "KRX",
     discover_holdings_only: bool = False,
+    commit: bool = True,
 ) -> dict[str, int]:
     normalized_symbols = _normalize_symbols(symbols)
     session_state = ensure_authenticated_broker_session(
@@ -1189,7 +1190,8 @@ def sync_execution_positions_from_broker_snapshot(
         if changed:
             updated += 1
 
-    db.commit()
+    if commit:
+        db.commit()
     return {
         "tracked_symbol_count": len(tracked_symbols),
         "created": created,
