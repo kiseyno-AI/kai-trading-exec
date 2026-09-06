@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.broker.base import BrokerAdapter
@@ -310,8 +310,16 @@ def _missing_position_order_exchanges(
             BrokerOrder.broker_name == "kis",
             BrokerOrder.asset_class == "us_equity",
             BrokerOrder.venue == "kis",
-            BrokerOrder.side == "buy",
-            BrokerOrder.status.in_(POSITION_EVIDENCE_ORDER_STATUSES),
+            or_(
+                and_(
+                    BrokerOrder.side == "buy",
+                    BrokerOrder.status.in_(POSITION_EVIDENCE_ORDER_STATUSES),
+                ),
+                and_(
+                    BrokerOrder.side == "sell",
+                    BrokerOrder.status.in_(ACTIONABLE_OPEN_ORDER_STATUSES),
+                ),
+            ),
             BrokerOrder.symbol.in_(sorted(symbols)),
             BrokerOrderEvent.event_type == "submit_requested",
         )

@@ -128,15 +128,17 @@ def _add_filled_us_buy_order_event(
     symbol: str,
     exchange: str,
     suffix: str,
+    side: str = "buy",
+    status: str = "filled",
 ) -> BrokerOrder:
     order = BrokerOrder(
         broker_name="kis",
         mode="paper",
         idempotency_key=f"{suffix}-{symbol.lower()}-position",
-        broker_order_id=f"{suffix}-{symbol.lower()}-buy",
+        broker_order_id=f"{suffix}-{symbol.lower()}-{side}",
         symbol=symbol,
-        side="buy",
-        status="filled",
+        side=side,
+        status=status,
         quantity=2,
         venue="kis",
         asset_class="us_equity",
@@ -154,7 +156,7 @@ def _add_filled_us_buy_order_event(
                 "venue": "kis",
                 "asset_class": "us_equity",
                 "symbol": symbol,
-                "side": "buy",
+                "side": side,
                 "exchange": exchange,
             },
             observed_at=NOW - timedelta(minutes=10),
@@ -408,6 +410,99 @@ def test_missing_us_position_recovers_exchange_from_active_order_event(
     assert applied["summary"]["refreshed_count"] == 1
     assert db.scalars(select(BrokerOrder)).all() == [order]
     assert db.scalars(select(ExecutionFill)).all() == []
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("symbol", "exchange", "status"),
+    [
+        ("AAPL", "NASD", "submitted"),
+        ("IBM", "NYSE", "partially_filled"),
+        ("SPY", "AMEX", "open"),
+    ],
+)
+def test_missing_us_position_recovers_exchange_from_active_sell_order_event(
+    monkeypatch,
+    symbol: str,
+    exchange: str,
+    status: str,
+) -> None:
+    settings, engine, session_factory, db = _session()
+    order = _add_filled_us_buy_order_event(
+        db,
+        symbol=symbol,
+        exchange=exchange,
+        suffix=f"active-sell-{status}",
+        side="sell",
+        status=status,
+    )
+    db.commit()
+    adapter = PositionInquiryAdapter()
+    monkeypatch.setattr(
+        "app.services.position_truth_remediation.ensure_authenticated_broker_session",
+        lambda **kwargs: type("SessionState", (), {"access_token": "test-token"})(),
+    )
+
+    dry_run = analyze_position_truth_remediation(settings=settings, db=db, now=NOW)
+    applied = apply_position_truth_remediation(
+        settings=settings,
+        db=db,
+        auth_session_factory=session_factory,
+        adapter=adapter,
+        actor="Peter",
+        reason="recover active U.S. sell order exchange through account inquiry only",
+        now=NOW,
+    )
+
+    assert dry_run["items"][0]["symbol"] == symbol
+    assert dry_run["items"][0]["exchange"] == exchange
+    assert dry_run["items"][0]["eligible"] is True
+    assert adapter.exchanges == [exchange]
+    assert applied["summary"]["refreshed_count"] == 1
+    assert db.scalars(select(BrokerOrder)).all() == [order]
+    assert db.scalars(select(ExecutionFill)).all() == []
+    engine.dispose()
+
+
+def test_missing_us_position_with_ambiguous_buy_and_sell_exchanges_fails_closed() -> None:
+    settings, engine, session_factory, db = _session()
+    _add_filled_us_buy_order_event(
+        db,
+        symbol="AAPL",
+        exchange="NASD",
+        suffix="ambiguous-buy",
+        side="buy",
+        status="filled",
+    )
+    _add_filled_us_buy_order_event(
+        db,
+        symbol="AAPL",
+        exchange="NYSE",
+        suffix="ambiguous-sell",
+        side="sell",
+        status="open",
+    )
+    db.commit()
+    adapter = PositionInquiryAdapter()
+
+    dry_run = analyze_position_truth_remediation(settings=settings, db=db, now=NOW)
+    applied = apply_position_truth_remediation(
+        settings=settings,
+        db=db,
+        auth_session_factory=session_factory,
+        adapter=adapter,
+        actor="Peter",
+        reason="ambiguous buy and sell exchange evidence requires manual review",
+        now=NOW,
+    )
+
+    assert dry_run["items"][0]["exchange"] is None
+    assert dry_run["items"][0]["eligible"] is False
+    assert adapter.exchanges == []
+    assert applied["summary"]["manual_review_count"] == 1
+    review = db.scalar(select(RuntimeRemediationEvent))
+    assert review is not None
+    assert review.outcome == "manual_review_required"
     engine.dispose()
 
 

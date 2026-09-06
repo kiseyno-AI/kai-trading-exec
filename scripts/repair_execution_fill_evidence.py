@@ -79,8 +79,7 @@ def main() -> int:
     settings_kwargs: dict[str, object] = {}
     if args.database_url:
         settings_kwargs["database_url"] = args.database_url
-    if args.runtime_mode:
-        settings_kwargs["runtime_mode"] = args.runtime_mode
+    settings_kwargs["runtime_mode"] = runtime_mode
     settings = Settings(**settings_kwargs)
 
     engine = create_db_engine(settings)

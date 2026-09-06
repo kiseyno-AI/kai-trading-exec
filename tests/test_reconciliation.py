@@ -955,6 +955,82 @@ def test_reconcile_stale_nonterminal_order_marks_closed_against_broker_truth() -
     engine.dispose()
 
 
+def test_reconcile_stale_order_commits_operator_attribution_with_inner_transition(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'stale-reconcile-attribution.db'}",
+        runtime_mode="paper",
+        stale_broker_order_reconciliation_threshold_seconds=3600,
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    db = session_factory()
+    stale_submitted_at = datetime.now(UTC) - timedelta(days=7)
+    order = _order(broker_order_id="stale-filled-attributed-1")
+    order.submitted_at = stale_submitted_at
+    order.last_broker_sync_at = stale_submitted_at
+    db.add(order)
+    db.commit()
+    order_id = order.id
+    broker = ReconciliationStubBroker(
+        reconcile_payloads=[
+            {
+                "broker_order_id": "stale-filled-attributed-1",
+                "status": "filled",
+                "filled_quantity": 2,
+                "remaining_quantity": 0,
+                "average_fill_price": "71000",
+                "observed_at": OBSERVED_AT.isoformat(),
+            }
+        ]
+    )
+
+    def raise_before_outer_commit(**kwargs) -> None:
+        raise RuntimeError("interrupted before outer audit commit")
+
+    monkeypatch.setattr(
+        "app.services.reconciliation._record_stale_order_classification_event",
+        raise_before_outer_commit,
+    )
+
+    with pytest.raises(RuntimeError, match="interrupted before outer audit commit"):
+        reconcile_stale_nonterminal_broker_orders(
+            settings=settings,
+            db=db,
+            adapter=broker,
+            actor="Peter",
+            operator_reason="operator requested read-only broker truth reconciliation",
+        )
+    db.rollback()
+    db.close()
+
+    with session_factory() as verification_db:
+        persisted_order = verification_db.get(BrokerOrder, order_id)
+        reconcile_event = verification_db.scalar(
+            select(BrokerOrderEvent).where(BrokerOrderEvent.event_type == "reconcile_result")
+        )
+        outer_events = verification_db.scalars(
+            select(BrokerOrderEvent).where(
+                BrokerOrderEvent.event_type.in_(
+                    ["stale_order_repair", "stale_order_reconcile_classification"]
+                )
+            )
+        ).all()
+        assert persisted_order is not None
+        assert persisted_order.status == "filled"
+        assert reconcile_event is not None
+        assert reconcile_event.payload["actor"] == "Peter"
+        assert (
+            reconcile_event.payload["operator_reason"]
+            == "operator requested read-only broker truth reconciliation"
+        )
+        assert outer_events == []
+    engine.dispose()
+
+
 def test_reconcile_stale_order_uses_submission_age_despite_recent_sync() -> None:
     settings = Settings(
         database_url="sqlite:///:memory:",

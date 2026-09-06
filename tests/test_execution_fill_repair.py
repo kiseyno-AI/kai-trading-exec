@@ -228,6 +228,42 @@ def test_live_fill_repair_requires_database_url_argument(tmp_path: Path) -> None
     assert not (tmp_path / "must-not-open.db").exists()
 
 
+def test_fill_remediation_uses_environment_runtime_mode_when_cli_mode_omitted(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "live-fill-remediation.db"
+    database_url = f"sqlite:///{db_path}"
+    settings = Settings(database_url=database_url, runtime_mode="live")
+    engine, db = _session(settings)
+    order = _filled_order_missing_fill()
+    order.mode = "live"
+    db.add(order)
+    db.commit()
+    db.close()
+    engine.dispose()
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "scripts/repair_execution_fill_evidence.py",
+            "--database-url",
+            database_url,
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "KAI_EXEC_RUNTIME_MODE": "live",
+        },
+    )
+    payload = json.loads(result.stdout)
+
+    assert payload["runtime_mode"] == "live"
+    assert payload["summary"]["missing_filled_order_count"] == 1
+    assert payload["missing_filled_orders"][0]["broker_order_id"] == "missing-buy-1"
+
+
 @pytest.mark.parametrize(
     ("actor", "reason"),
     [("   ", "valid reason"), ("Peter", "\t  ")],

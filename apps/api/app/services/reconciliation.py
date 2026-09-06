@@ -78,6 +78,8 @@ def reconcile_broker_order(
     db: Session,
     adapter: BrokerAdapter,
     order: BrokerOrder,
+    actor: str | None = None,
+    operator_reason: str | None = None,
 ) -> dict[str, object]:
     order_status_before = order.status
     event_time = _observation_time()
@@ -211,6 +213,8 @@ def reconcile_broker_order(
                     "response_metadata": payload.get("response_metadata"),
                     "payload": payload.get("payload"),
                 },
+                actor=actor,
+                operator_reason=operator_reason,
             )
         db.commit()
         db.refresh(order)
@@ -245,6 +249,9 @@ def reconcile_broker_order(
     reconcile_event_payload = _build_reconcile_event_payload(payload=payload, adapter=adapter)
     if fill_delta_anomalies:
         reconcile_event_payload["fill_delta_anomalies"] = _json_safe_value(fill_delta_anomalies)
+    if actor is not None or operator_reason is not None:
+        reconcile_event_payload["actor"] = actor
+        reconcile_event_payload["operator_reason"] = operator_reason
 
     db.add(
         BrokerOrderEvent(
@@ -418,6 +425,8 @@ def reconcile_stale_nonterminal_broker_orders(
                     db=db,
                     adapter=adapter,
                     order=order,
+                    actor=actor,
+                    operator_reason=operator_reason,
                 )
             classification, reason = _stale_order_reconciliation_classification(
                 status=str(result.get("status") or order.status),
