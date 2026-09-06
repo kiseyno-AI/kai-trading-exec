@@ -53,6 +53,7 @@ from app.services import runtime as runtime_service
 from app.services.monitoring import (
     _derived_source_plan_item_id,
     _nonretryable_sibling_monitor_suppresses_recreation,
+    _prepare_due_max_holding_items,
     list_autonomous_monitoring_symbols,
     run_autonomous_monitoring_cycle,
 )
@@ -6537,6 +6538,149 @@ def test_monitoring_submits_post_entry_max_holding_close_sell() -> None:
         assert order is not None
         assert order.idempotency_key == f"monitoring:max_holding_close_sell:{max_holding_item.id}"
         assert order.status == "submitted"
+
+    engine.dispose()
+
+
+def test_autonomous_monitoring_promotes_one_due_max_holding_exit_per_symbol() -> None:
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(broker_order_id="kis-autonomous-max-close"),
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+            exec_agent_max_holding_trading_sessions=3,
+            account_drawdown_gate_enabled=False,
+        ),
+        broker_adapter=broker_adapter,
+    )
+    client = TestClient(app)
+    assert client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "console", "reason": "enable automation"},
+    ).status_code == 200
+    _create_filled_buy_position(
+        app,
+        client,
+        plan_id="plan-autonomous-max-close",
+        market_date="2026-06-10",
+        source_plan_item_id="core-autonomous-max-close",
+    )
+
+    with app.state.db_session_factory() as session:
+        plan = session.scalar(
+            select(ExecutionPlan).where(
+                ExecutionPlan.external_plan_id == "plan-autonomous-max-close"
+            )
+        )
+        assert plan is not None
+        original = ExecutionPlanItem(
+            plan=plan,
+            plan_item_index=100,
+            symbol="005930",
+            side="sell",
+            intent="max_holding_close_sell",
+            status="max_holding_close_sell_pending_config",
+            quantity_policy={"kind": "position_exit_from_entry"},
+            time_in_force="day",
+            risk_context={"exchange": "KRX", "close_exit_date": "2026-06-13"},
+            source_plan_item_id="canonical-max-close",
+            source_market_date=date(2026, 6, 10),
+        )
+        duplicate = ExecutionPlanItem(
+            plan=plan,
+            plan_item_index=101,
+            symbol=original.symbol,
+            side="sell",
+            intent=original.intent,
+            status="max_holding_close_sell_pending_config",
+            quantity_policy={"kind": "position_exit_from_entry"},
+            time_in_force="day",
+            risk_context={"exchange": "KRX", "close_exit_date": "2026-06-13"},
+            source_plan_item_id="older-duplicate-max-close",
+            source_market_date=date(2026, 6, 9),
+        )
+        session.add_all([original, duplicate])
+        session.commit()
+
+        result = run_autonomous_monitoring_cycle(
+            settings=app.state.settings,
+            db=session,
+            adapter=broker_adapter,
+            prices=[],
+            now=datetime(2026, 6, 15, 1, 0, tzinfo=UTC),
+        )
+        assert result.payload["submitted_order_count"] == 1
+        assert len(broker_adapter.order_calls) == 1
+        assert session.get(ExecutionPlanItem, duplicate.id).status == "superseded"
+
+    engine.dispose()
+
+
+def test_due_max_holding_exit_is_blocked_for_stale_live_position_truth() -> None:
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="live",
+            exec_agent_max_account_snapshot_age_seconds=60,
+        )
+    )
+    with app.state.db_session_factory() as session:
+        plan = ExecutionPlan(
+            external_plan_id="plan-stale-max-close",
+            source="test",
+            mode="live",
+            market_date=date(2026, 6, 10),
+            status="accepted",
+        )
+        item = ExecutionPlanItem(
+            plan=plan,
+            plan_item_index=0,
+            symbol="005930",
+            side="sell",
+            intent="max_holding_close_sell",
+            status="max_holding_close_sell_pending_config",
+            quantity_policy={"kind": "position_exit_from_entry"},
+            risk_context={"close_exit_date": "2026-06-13"},
+        )
+        position = ExecutionPosition(
+            mode="live",
+            symbol="005930",
+            quantity=10,
+            updated_from="reconciliation",
+            last_reconciled_at=datetime(2026, 6, 15, 0, 0, tzinfo=UTC),
+        )
+        session.add_all([plan, item, position])
+        session.commit()
+
+        prepared = _prepare_due_max_holding_items(
+            settings=app.state.settings,
+            db=session,
+            items=[item],
+            positions_by_symbol={"005930": position},
+            triggered_at=datetime(2026, 6, 15, 1, 0, tzinfo=UTC),
+        )
+        session.commit()
+        assert prepared == []
+        assert item.status == "max_holding_close_sell_pending_config"
+        assert item.risk_context["last_monitoring_event"]["reason"] == "stale_or_missing_position_truth"
+        assert session.scalar(
+            select(ExecutionPlanItemAudit).where(
+                ExecutionPlanItemAudit.execution_plan_item_id == item.id,
+                ExecutionPlanItemAudit.event_type == "max_holding_close_blocked",
+            )
+        ) is not None
 
     engine.dispose()
 
