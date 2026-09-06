@@ -1037,6 +1037,8 @@ def test_reconcile_stale_submitted_kier_lookup_window_response_repairs_to_window
         settings=settings,
         db=db,
         adapter=broker,
+        actor="Peter",
+        operator_reason="issue #265: reconcile stale order with read-only broker inquiry",
     )
 
     repair = db.scalar(
@@ -1060,6 +1062,8 @@ def test_reconcile_stale_submitted_kier_lookup_window_response_repairs_to_window
     assert repair.payload["observed_broker_code"] == "KIER2570"
     assert repair.payload["classification"] == "reconcile_window_expired"
     assert repair.payload["reason"] == "broker_lookup_window_expired"
+    assert repair.payload["actor"] == "Peter"
+    assert repair.payload["operator_reason"].startswith("issue #265")
     failure = db.scalar(
         select(ExecutionFailure).where(ExecutionFailure.broker_order_pk == order.id)
     )
@@ -1515,8 +1519,13 @@ def test_reconcile_stale_orders_dry_run_summarizes_repairs_without_mutating() ->
     client = TestClient(app)
 
     response = client.post("/orders/reconcile-stale", json={"dry_run": True})
+    unaudited_apply = client.post("/orders/reconcile-stale", json={})
 
     assert response.status_code == 200
+    assert unaudited_apply.status_code == 422
+    assert unaudited_apply.json()["detail"] == (
+        "stale reconciliation apply requires actor and reason"
+    )
     result = response.json()
     with session_factory() as db:
         persisted = db.get(BrokerOrder, order_pk)

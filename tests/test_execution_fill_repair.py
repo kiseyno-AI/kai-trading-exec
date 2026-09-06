@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from datetime import UTC, datetime, timedelta
@@ -18,16 +19,16 @@ from app.models.runtime import (
     ExecutionFill,
     ExecutionPosition,
     FifoInventoryIsolation,
+    RuntimeRemediationEvent,
 )
 from app.services.execution_fill_repair import (
-    DUPLICATE_FILL_REPAIR_EVENT,
     MISSING_FILL_REPAIR_EVENT,
     analyze_fifo_inventory_repairs,
     analyze_execution_fill_repairs,
     apply_fifo_inventory_repairs,
     apply_execution_fill_repairs,
 )
-from app.services.runtime import daily_pnl_payload
+from app.services.runtime import broker_order_fill_quality_payload, daily_pnl_payload
 
 
 FILLED_AT = datetime(2026, 7, 24, 0, 5, 1, tzinfo=UTC)
@@ -145,7 +146,7 @@ def test_duplicate_fill_detection_reports_retained_and_deleted_rows() -> None:
     group = payload["duplicate_fill_groups"][0]
     assert group["symbol"] == "282330"
     assert group["retained_fill"]["id"] == first.id
-    assert [row["id"] for row in group["deleted_fills"]] == [second.id]
+    assert [row["id"] for row in group["duplicate_fills"]] == [second.id]
     engine.dispose()
 
 
@@ -202,7 +203,45 @@ def test_dry_run_command_outputs_missing_and_duplicate_repairs(tmp_path: Path) -
     assert payload["summary"]["missing_filled_order_count"] == 1
     assert payload["missing_filled_orders"][0]["broker_order_id"] == "missing-buy-1"
     assert payload["summary"]["duplicate_fill_group_count"] == 1
-    assert payload["summary"]["proposed_duplicate_fill_delete_count"] == 1
+    assert payload["summary"]["proposed_duplicate_fill_isolation_count"] == 1
+
+
+def test_live_fill_repair_requires_database_url_argument(tmp_path: Path) -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "scripts/repair_execution_fill_evidence.py",
+            "--runtime-mode",
+            "live",
+        ],
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "KAI_EXEC_DATABASE_URL": f"sqlite:///{tmp_path / 'must-not-open.db'}",
+        },
+    )
+
+    assert result.returncode != 0
+    assert "requires --database-url explicitly" in result.stderr
+    assert not (tmp_path / "must-not-open.db").exists()
+
+
+def test_legacy_duplicate_fill_apply_is_disabled(tmp_path: Path) -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "scripts/repair_duplicate_execution_fills.py",
+            str(tmp_path / "must-not-open.db"),
+            "--apply",
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "destructive duplicate-fill apply is disabled" in result.stderr
+    assert not (tmp_path / "must-not-open.db").exists()
 
 
 def test_apply_is_idempotent_auditable_and_repairs_fifo_pair() -> None:
@@ -271,7 +310,8 @@ def test_apply_is_idempotent_auditable_and_repairs_fifo_pair() -> None:
 
     assert before["unmatched_sell_quantity"] == 1
     assert first["summary"]["inserted_fill_count"] == 1
-    assert first["summary"]["deleted_fill_count"] == 1
+    assert first["summary"]["deleted_fill_count"] == 0
+    assert first["summary"]["isolated_duplicate_fill_group_count"] == 1
     assert first["summary"]["audit_event_count"] == 2
     assert second["summary"]["inserted_fill_count"] == 0
     assert second["summary"]["deleted_fill_count"] == 0
@@ -280,16 +320,73 @@ def test_apply_is_idempotent_auditable_and_repairs_fifo_pair() -> None:
     assert after["daily_realized_pnl"] == "1000.0000"
     events = db.scalars(
         select(BrokerOrderEvent).where(
-            BrokerOrderEvent.event_type.in_(
-                [MISSING_FILL_REPAIR_EVENT, DUPLICATE_FILL_REPAIR_EVENT]
-            )
+            BrokerOrderEvent.event_type == MISSING_FILL_REPAIR_EVENT
         )
     ).all()
-    assert sorted(event.event_type for event in events) == [
-        DUPLICATE_FILL_REPAIR_EVENT,
-        MISSING_FILL_REPAIR_EVENT,
-    ]
-    assert len(db.scalars(select(ExecutionFill)).all()) == 3
+    assert [event.event_type for event in events] == [MISSING_FILL_REPAIR_EVENT]
+    assert len(db.scalars(select(ExecutionFill)).all()) == 4
+    duplicate_review = db.scalar(
+        select(RuntimeRemediationEvent).where(
+            RuntimeRemediationEvent.candidate_type == "duplicate_fill_group"
+        )
+    )
+    assert duplicate_review is not None
+    assert duplicate_review.outcome == "non_destructive_isolation"
+    assert duplicate_review.evidence_summary["fills_deleted"] == 0
+    assert duplicate_review.evidence_summary["duplicate_fill_ids"] == [duplicate_two.id]
+    engine.dispose()
+
+
+def test_apply_records_manual_review_when_authoritative_fill_evidence_is_absent() -> None:
+    settings = _settings()
+    engine, db = _session(settings)
+    order = BrokerOrder(
+        broker_name="kis",
+        mode="paper",
+        idempotency_key="repair-missing-no-evidence",
+        broker_order_id="missing-no-evidence-1",
+        symbol="001800",
+        side="buy",
+        status="filled",
+        quantity=5,
+        submitted_at=FILLED_AT,
+    )
+    db.add(order)
+    db.commit()
+
+    first = apply_execution_fill_repairs(
+        db=db,
+        runtime_mode="paper",
+        actor="Peter",
+        reason="issue #265: authoritative broker fill evidence unavailable",
+        now=SOLD_AT,
+    )
+    second = apply_execution_fill_repairs(
+        db=db,
+        runtime_mode="paper",
+        actor="Peter",
+        reason="issue #265: authoritative broker fill evidence unavailable",
+        now=SOLD_AT,
+    )
+
+    assert first["summary"]["manual_review_missing_fill_count"] == 1
+    assert first["summary"]["applied_manual_review_count"] == 1
+    assert second["summary"]["applied_manual_review_count"] == 0
+    assert db.scalars(select(ExecutionFill)).all() == []
+    reviews = db.scalars(
+        select(RuntimeRemediationEvent).where(
+            RuntimeRemediationEvent.candidate_type == "missing_execution_fill"
+        )
+    ).all()
+    assert len(reviews) == 1
+    assert reviews[0].actor == "Peter"
+    assert reviews[0].outcome == "manual_review_required"
+    assert reviews[0].evidence_summary["fills_fabricated"] == 0
+    fill_quality = broker_order_fill_quality_payload(settings=settings, db=db)
+    assert fill_quality["missing_filled_order_fill_count"] == 1
+    assert fill_quality["missing_filled_order_fill_unreviewed_count"] == 0
+    assert fill_quality["missing_filled_order_fill_manual_review_count"] == 1
+    assert fill_quality["missing_filled_order_fill_items"][0]["review_actor"] == "Peter"
     engine.dispose()
 
 
@@ -362,6 +459,9 @@ def test_fifo_residual_dry_run_reports_required_broker_flat_evidence() -> None:
         "eligible_isolation_count": 1,
         "recency_blocked_count": 0,
         "applied_isolation_count": 0,
+        "manual_review_count": 0,
+        "unreviewed_recency_blocked_count": 0,
+        "applied_blocker_count": 0,
     }
     assert payload["broker_flat_fifo_residuals"][0] == {
         "symbol": "049430",
@@ -552,5 +652,15 @@ def test_fifo_isolation_recency_gate_blocks_flat_evidence_older_than_repurchase(
     assert item["eligible"] is False
     assert item["reason"] == "broker_flat_evidence_not_newer_than_last_local_fill"
     assert applied["summary"]["applied_isolation_count"] == 0
+    assert applied["summary"]["applied_blocker_count"] == 1
+    assert applied["summary"]["manual_review_count"] == 1
     assert db.scalars(select(FifoInventoryIsolation)).all() == []
+    review = db.scalar(
+        select(RuntimeRemediationEvent).where(
+            RuntimeRemediationEvent.candidate_type == "fifo_inventory_residual"
+        )
+    )
+    assert review is not None
+    assert review.outcome == "manual_review_required"
+    assert review.evidence_summary["fills_deleted"] == 0
     engine.dispose()

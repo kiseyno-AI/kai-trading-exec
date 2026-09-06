@@ -359,6 +359,8 @@ def reconcile_stale_nonterminal_broker_orders(
     older_than_seconds: int | None = None,
     symbols: set[str] | None = None,
     dry_run: bool = False,
+    actor: str | None = None,
+    operator_reason: str | None = None,
 ) -> dict[str, object]:
     threshold_seconds = (
         older_than_seconds
@@ -469,6 +471,8 @@ def reconcile_stale_nonterminal_broker_orders(
                     observed_broker_code=repair["observed_broker_code"],
                     observed_at=classification_observed_at,
                     result=result,
+                    actor=actor,
+                    operator_reason=operator_reason,
                 )
                 if repair["status_after"] == NormalizedBrokerOrderStatus.RECONCILE_WINDOW_EXPIRED.value:
                     resolve_execution_failure_for_order(
@@ -506,6 +510,8 @@ def reconcile_stale_nonterminal_broker_orders(
                 observed_broker_code=order.last_error_code,
                 observed_at=classification_observed_at,
                 result=result,
+                actor=actor,
+                operator_reason=operator_reason,
             )
 
         if not dry_run:
@@ -516,6 +522,8 @@ def reconcile_stale_nonterminal_broker_orders(
                 reason=reason,
                 observed_at=_observation_time(),
                 result=result,
+                actor=actor,
+                operator_reason=operator_reason,
             )
         counts[classification] += 1
         items.append(
@@ -932,6 +940,8 @@ def _record_stale_order_repair_event(
     observed_broker_code: str | None,
     observed_at: datetime,
     result: dict[str, object] | None,
+    actor: str | None = None,
+    operator_reason: str | None = None,
 ) -> None:
     db.add(
         BrokerOrderEvent(
@@ -952,6 +962,8 @@ def _record_stale_order_repair_event(
                 "broker_order_id": order.broker_order_id,
                 "idempotency_key": order.idempotency_key,
                 "result": _json_safe_value(result) if result is not None else None,
+                "actor": actor,
+                "operator_reason": operator_reason,
             },
             observed_at=observed_at,
         )
@@ -966,6 +978,8 @@ def _record_stale_order_classification_event(
     reason: str | None,
     observed_at: datetime,
     result: dict[str, object] | None,
+    actor: str | None = None,
+    operator_reason: str | None = None,
 ) -> None:
     db.add(
         BrokerOrderEvent(
@@ -985,6 +999,8 @@ def _record_stale_order_classification_event(
                 "idempotency_key": order.idempotency_key,
                 "last_broker_sync_at": _serialize_datetime(order.last_broker_sync_at),
                 "result": _json_safe_value(result) if result is not None else None,
+                "actor": actor,
+                "operator_reason": operator_reason,
             },
             observed_at=observed_at,
         )

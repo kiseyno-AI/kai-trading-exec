@@ -109,6 +109,7 @@ That includes:
 - `broker_order_events`
 - `execution_fills`
 - `fifo_inventory_isolations`
+- `runtime_remediation_events`
 - `execution_positions`
 - `runtime_control_state`
 - `runtime_control_events`

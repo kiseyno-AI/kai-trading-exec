@@ -106,6 +106,9 @@ does not create trading decisions.
   - `missing_filled_order_fill_count` and sample items for filled
     `broker_orders` that have no `execution_fills` rows, because FIFO P/L is
     incomplete until those fills are repaired
+  - `missing_filled_order_fill_unreviewed_count` and
+    `missing_filled_order_fill_manual_review_count` separate actionable repair
+    candidates from immutable no-authoritative-evidence blockers
   - `duplicate_fill_group_count` and sample groups for duplicate
     `execution_fills` rows that should be repaired before using raw fill
     exports
@@ -244,6 +247,7 @@ The runtime migrations create exec-owned runtime tables only:
 - `broker_order_events`
 - `execution_fills`
 - `fifo_inventory_isolations`
+- `runtime_remediation_events`
 - `execution_positions`
 - `monitoring_checkpoints`
 
@@ -557,6 +561,8 @@ Request body:
 - `symbols[]` (optional): limit repair candidates to specific symbols
 - `dry_run` (default `false`): return candidate and planned-repair summary
   without mutating `broker_orders` or writing `broker_order_events`
+- `actor` and `reason`: required for an applied run and persisted in repair and
+  classification audit payloads
 
 Applied repair writes `broker_order_events` with event type
 `stale_order_repair`, including previous status, repaired status, observed
@@ -605,7 +611,29 @@ fill. It does not delete or fabricate fills and does not create P/L. FIFO
 readers clear only lots at or before the verified-flat boundary, so buys after
 that boundary remain valid inventory. If a repurchase is newer than the flat
 evidence, the recency gate blocks isolation until newer broker truth is
-available.
+available. An applied run records that blocked decision as an immutable
+`runtime_remediation_events` manual-review event without changing fills or the
+FIFO boundary.
+
+The fill-evidence scope uses the same non-destructive operating rule. A missing
+fill is eligible for insertion only from persisted broker-origin evidence with
+an exact order symbol, side, and filled-quantity match. Missing evidence creates
+an immutable `runtime_remediation_events` manual-review record. Duplicate fill
+groups create a non-destructive isolation record containing the dedupe key and
+row IDs; no `execution_fills` row is deleted. Dry-run output distinguishes
+unreviewed candidates, existing manual reviews, and existing duplicate
+isolations. Live runs fail closed unless `--database-url` is explicit.
+
+### Position-truth remediation
+
+`scripts/refresh_execution_position_truth.py` reports stale/missing position
+truth without broker calls by default. Its `--apply` mode requires actor/reason
+metadata, uses only KIS account-snapshot inquiry for supported KRX and U.S.
+exchange routes, updates `execution_positions`, and appends
+`runtime_remediation_events`. Unsupported or unknown routes are not queried or
+zeroed; they receive explicit manual-review events. The script has no order
+submission, amendment, or cancellation path and live mode requires an explicit
+database URL.
 
 `active_broker_order_summary.actionable_order_count`,
 `actionable_status_counts`, and the compatibility field

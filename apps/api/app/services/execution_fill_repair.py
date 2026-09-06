@@ -14,6 +14,7 @@ from app.models.runtime import (
     ExecutionFill,
     ExecutionPosition,
     FifoInventoryIsolation,
+    RuntimeRemediationEvent,
 )
 from app.services.fifo_inventory import load_fifo_isolation_cursor
 from app.services.fill_idempotency import (
@@ -25,8 +26,10 @@ from app.services.fill_idempotency import (
 
 REPAIR_EVENT_SOURCE = "operator_repair"
 MISSING_FILL_REPAIR_EVENT = "execution_fill_missing_repair"
-DUPLICATE_FILL_REPAIR_EVENT = "execution_fill_duplicate_repair"
 FIFO_INVENTORY_ISOLATION_SOURCE = "broker_flat_reconciliation"
+MISSING_FILL_CANDIDATE_TYPE = "missing_execution_fill"
+DUPLICATE_FILL_CANDIDATE_TYPE = "duplicate_fill_group"
+FIFO_RESIDUAL_CANDIDATE_TYPE = "fifo_inventory_residual"
 
 
 def analyze_fifo_inventory_repairs(
@@ -54,8 +57,33 @@ def apply_fifo_inventory_repairs(
     isolated_at = now or datetime.now(UTC)
     items = _fifo_inventory_repair_items(db=db, runtime_mode=runtime_mode)
     applied_items: list[dict[str, object]] = []
+    applied_blocker_count = 0
     for item in items:
         if item["eligible"] is not True:
+            if _record_remediation_event(
+                db=db,
+                runtime_mode=runtime_mode,
+                candidate_type=FIFO_RESIDUAL_CANDIDATE_TYPE,
+                candidate_key=_fifo_candidate_key(item),
+                subject_id=str(item["broker_position_id"]),
+                outcome="manual_review_required",
+                actor=actor,
+                reason=reason,
+                occurred_at=isolated_at,
+                evidence_summary={
+                    "symbol": item["symbol"],
+                    "residual_quantity": item["residual_quantity"],
+                    "last_local_fill": item["last_local_fill"],
+                    "broker_reconciliation_timestamp": item[
+                        "broker_reconciliation_timestamp"
+                    ],
+                    "blocker": item["reason"],
+                    "fills_deleted": 0,
+                    "fills_fabricated": 0,
+                    "orders_submitted": 0,
+                },
+            ):
+                applied_blocker_count += 1
             continue
         broker_reconciled_at = _parse_timestamp(
             item["broker_reconciliation_timestamp"],
@@ -97,12 +125,18 @@ def apply_fifo_inventory_repairs(
         db.add(isolation)
         applied_items.append(item)
     db.commit()
+    items = _annotate_fifo_reviews(
+        db=db,
+        runtime_mode=runtime_mode,
+        items=items,
+    )
     return _fifo_inventory_repair_payload(
         mode="apply",
         runtime_mode=runtime_mode,
         items=items,
         applied_count=len(applied_items),
         applied_items=applied_items,
+        applied_blocker_count=applied_blocker_count,
     )
 
 
@@ -113,8 +147,12 @@ def _fifo_inventory_repair_payload(
     items: list[dict[str, object]],
     applied_count: int,
     applied_items: list[dict[str, object]] | None = None,
+    applied_blocker_count: int = 0,
 ) -> dict[str, object]:
     eligible_count = sum(1 for item in items if item["eligible"] is True)
+    manual_review_count = sum(
+        1 for item in items if item.get("review_outcome") == "manual_review_required"
+    )
     return {
         "mode": mode,
         "runtime_mode": runtime_mode,
@@ -123,6 +161,11 @@ def _fifo_inventory_repair_payload(
             "eligible_isolation_count": eligible_count,
             "recency_blocked_count": len(items) - eligible_count,
             "applied_isolation_count": applied_count,
+            "manual_review_count": manual_review_count,
+            "unreviewed_recency_blocked_count": (
+                len(items) - eligible_count - manual_review_count
+            ),
+            "applied_blocker_count": applied_blocker_count,
         },
         "broker_flat_fifo_residuals": items,
         "applied_isolations": applied_items or [],
@@ -219,6 +262,43 @@ def _fifo_inventory_repair_items(
                 ),
             }
         )
+    return _annotate_fifo_reviews(db=db, runtime_mode=runtime_mode, items=items)
+
+
+def _fifo_candidate_key(item: dict[str, object]) -> str:
+    return "|".join(
+        (
+            str(item["symbol"]),
+            str(item["last_local_fill"]),
+            str(item["broker_reconciliation_timestamp"]),
+        )
+    )
+
+
+def _annotate_fifo_reviews(
+    *,
+    db: Session,
+    runtime_mode: str,
+    items: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    candidate_keys = {_fifo_candidate_key(item) for item in items}
+    if not candidate_keys:
+        return items
+    reviews = db.scalars(
+        select(RuntimeRemediationEvent).where(
+            RuntimeRemediationEvent.mode == runtime_mode,
+            RuntimeRemediationEvent.candidate_type == FIFO_RESIDUAL_CANDIDATE_TYPE,
+            RuntimeRemediationEvent.candidate_key.in_(sorted(candidate_keys)),
+        )
+    ).all()
+    review_by_key = {review.candidate_key: review for review in reviews}
+    for item in items:
+        review = review_by_key.get(_fifo_candidate_key(item))
+        if review is not None:
+            item["review_outcome"] = review.outcome
+            item["review_actor"] = review.actor
+            item["review_reason"] = review.reason
+            item["reviewed_at"] = _serialize_datetime(review.occurred_at)
     return items
 
 
@@ -233,8 +313,18 @@ def analyze_execution_fill_repairs(
     db: Session,
     runtime_mode: str,
 ) -> dict[str, object]:
-    missing = _missing_fill_items(db=db, runtime_mode=runtime_mode)
-    duplicates = _duplicate_fill_groups(db=db, runtime_mode=runtime_mode)
+    missing = _annotate_remediation_reviews(
+        db=db,
+        runtime_mode=runtime_mode,
+        candidate_type=MISSING_FILL_CANDIDATE_TYPE,
+        items=_missing_fill_items(db=db, runtime_mode=runtime_mode),
+    )
+    duplicates = _annotate_remediation_reviews(
+        db=db,
+        runtime_mode=runtime_mode,
+        candidate_type=DUPLICATE_FILL_CANDIDATE_TYPE,
+        items=_duplicate_fill_groups(db=db, runtime_mode=runtime_mode),
+    )
     return _repair_payload(
         mode="dry-run",
         runtime_mode=runtime_mode,
@@ -243,6 +333,8 @@ def analyze_execution_fill_repairs(
         inserted_fill_count=0,
         deleted_fill_count=0,
         audit_event_count=0,
+        applied_manual_review_count=0,
+        applied_duplicate_isolation_count=0,
     )
 
 
@@ -256,8 +348,9 @@ def apply_execution_fill_repairs(
 ) -> dict[str, object]:
     repaired_at = now or datetime.now(UTC)
     inserted_fill_count = 0
-    deleted_fill_count = 0
     audit_event_count = 0
+    applied_manual_review_count = 0
+    applied_duplicate_isolation_count = 0
 
     missing = _missing_fill_items(db=db, runtime_mode=runtime_mode)
     existing_keys = {
@@ -270,6 +363,29 @@ def apply_execution_fill_repairs(
             continue
         proposed_fills = item.get("proposed_fills")
         if not isinstance(proposed_fills, list) or not proposed_fills:
+            if _record_remediation_event(
+                db=db,
+                runtime_mode=runtime_mode,
+                candidate_type=MISSING_FILL_CANDIDATE_TYPE,
+                candidate_key=str(order.id),
+                subject_id=order.id,
+                outcome="manual_review_required",
+                actor=actor,
+                reason=reason,
+                occurred_at=repaired_at,
+                evidence_summary={
+                    "symbol": order.symbol,
+                    "side": order.side,
+                    "broker_order_id": order.broker_order_id,
+                    "idempotency_key": order.idempotency_key,
+                    "blocker": "authoritative_broker_fill_evidence_unavailable",
+                    "fills_deleted": 0,
+                    "fills_fabricated": 0,
+                    "orders_submitted": 0,
+                },
+            ):
+                applied_manual_review_count += 1
+                audit_event_count += 1
             continue
         inserted_for_order: list[dict[str, object]] = []
         for proposed in proposed_fills:
@@ -327,58 +443,63 @@ def apply_execution_fill_repairs(
     duplicates = _duplicate_fill_groups(db=db, runtime_mode=runtime_mode)
     for group in duplicates:
         retained = group.get("retained_fill")
-        deleted = group.get("deleted_fills")
-        if not isinstance(retained, dict) or not isinstance(deleted, list) or not deleted:
+        duplicate_fills = group.get("duplicate_fills")
+        if (
+            not isinstance(retained, dict)
+            or not isinstance(duplicate_fills, list)
+            or not duplicate_fills
+        ):
             continue
-        retained_id = str(retained["id"])
-        retained_fill = db.get(ExecutionFill, retained_id)
-        if retained_fill is None:
-            continue
-        duplicate_ids = [str(row["id"]) for row in deleted if isinstance(row, dict)]
-        duplicate_rows = db.scalars(
-            select(ExecutionFill).where(ExecutionFill.id.in_(duplicate_ids))
-        ).all()
-        if not duplicate_rows:
-            continue
-        order = retained_fill.broker_order
-        db.add(
-            BrokerOrderEvent(
-                broker_order_pk=retained_fill.broker_order_pk,
-                event_type=DUPLICATE_FILL_REPAIR_EVENT,
-                event_source=REPAIR_EVENT_SOURCE,
-                normalized_status=order.status if order is not None else None,
-                broker_status=None,
-                message="operator repaired duplicate execution fill evidence",
-                payload={
-                    "actor": actor,
-                    "reason": reason,
-                    "repaired_at": repaired_at.isoformat(),
-                    "runtime_mode": runtime_mode,
-                    "retained_fill": retained,
-                    "deleted_fills": [_fill_row_payload(row) for row in duplicate_rows],
-                    "duplicate_group_key": group.get("duplicate_group_key"),
-                },
-                observed_at=repaired_at,
-            )
-        )
-        audit_event_count += 1
-        for duplicate in duplicate_rows:
-            db.delete(duplicate)
-            deleted_fill_count += 1
-        if retained_fill.idempotency_key is None:
-            retained_fill.idempotency_key = execution_fill_dedupe_key(retained_fill)
+        if _record_remediation_event(
+            db=db,
+            runtime_mode=runtime_mode,
+            candidate_type=DUPLICATE_FILL_CANDIDATE_TYPE,
+            candidate_key=str(group["duplicate_group_key"]),
+            subject_id=str(group["broker_order_pk"]),
+            outcome="non_destructive_isolation",
+            actor=actor,
+            reason=reason,
+            occurred_at=repaired_at,
+            evidence_summary={
+                "symbol": group.get("symbol"),
+                "side": group.get("side"),
+                "broker_order_id": group.get("broker_order_id"),
+                "retained_fill_id": retained.get("id"),
+                "duplicate_fill_ids": [
+                    row.get("id") for row in duplicate_fills if isinstance(row, dict)
+                ],
+                "dedupe_behavior": "application_readers_ignore_duplicate_identity",
+                "fills_deleted": 0,
+                "fills_fabricated": 0,
+                "orders_submitted": 0,
+            },
+        ):
+            applied_duplicate_isolation_count += 1
+            audit_event_count += 1
 
     db.commit()
-    remaining_missing = _missing_fill_items(db=db, runtime_mode=runtime_mode)
-    remaining_duplicates = _duplicate_fill_groups(db=db, runtime_mode=runtime_mode)
+    remaining_missing = _annotate_remediation_reviews(
+        db=db,
+        runtime_mode=runtime_mode,
+        candidate_type=MISSING_FILL_CANDIDATE_TYPE,
+        items=_missing_fill_items(db=db, runtime_mode=runtime_mode),
+    )
+    remaining_duplicates = _annotate_remediation_reviews(
+        db=db,
+        runtime_mode=runtime_mode,
+        candidate_type=DUPLICATE_FILL_CANDIDATE_TYPE,
+        items=_duplicate_fill_groups(db=db, runtime_mode=runtime_mode),
+    )
     return _repair_payload(
         mode="apply",
         runtime_mode=runtime_mode,
         missing=remaining_missing,
         duplicates=remaining_duplicates,
         inserted_fill_count=inserted_fill_count,
-        deleted_fill_count=deleted_fill_count,
+        deleted_fill_count=0,
         audit_event_count=audit_event_count,
+        applied_manual_review_count=applied_manual_review_count,
+        applied_duplicate_isolation_count=applied_duplicate_isolation_count,
     )
 
 
@@ -391,16 +512,21 @@ def _repair_payload(
     inserted_fill_count: int,
     deleted_fill_count: int,
     audit_event_count: int,
+    applied_manual_review_count: int,
+    applied_duplicate_isolation_count: int,
 ) -> dict[str, object]:
     proposed_missing = sum(
         len(item.get("proposed_fills") or [])
         for item in missing
         if isinstance(item.get("proposed_fills"), list)
     )
-    proposed_deleted = sum(
-        len(group.get("deleted_fills") or [])
+    manual_review_count = sum(
+        1 for item in missing if item.get("review_outcome") == "manual_review_required"
+    )
+    isolated_duplicate_count = sum(
+        1
         for group in duplicates
-        if isinstance(group.get("deleted_fills"), list)
+        if group.get("review_outcome") == "non_destructive_isolation"
     )
     return {
         "mode": mode,
@@ -409,10 +535,21 @@ def _repair_payload(
             "missing_filled_order_count": len(missing),
             "proposed_missing_fill_insert_count": proposed_missing,
             "duplicate_fill_group_count": len(duplicates),
-            "proposed_duplicate_fill_delete_count": proposed_deleted,
+            "proposed_manual_review_count": sum(
+                1
+                for item in missing
+                if not item.get("proposed_fills") and not item.get("review_outcome")
+            ),
+            "proposed_duplicate_fill_isolation_count": len(duplicates) - isolated_duplicate_count,
+            "manual_review_missing_fill_count": manual_review_count,
+            "unreviewed_missing_fill_count": len(missing) - manual_review_count,
+            "isolated_duplicate_fill_group_count": isolated_duplicate_count,
+            "unreviewed_duplicate_fill_group_count": len(duplicates) - isolated_duplicate_count,
             "inserted_fill_count": inserted_fill_count,
             "deleted_fill_count": deleted_fill_count,
             "audit_event_count": audit_event_count,
+            "applied_manual_review_count": applied_manual_review_count,
+            "applied_duplicate_isolation_count": applied_duplicate_isolation_count,
         },
         "missing_filled_orders": missing,
         "duplicate_fill_groups": duplicates,
@@ -457,6 +594,8 @@ def _repair_evidence_for_order(*, db: Session, order: BrokerOrder) -> dict[str, 
         .order_by(BrokerOrderEvent.observed_at.desc(), BrokerOrderEvent.created_at.desc())
     ).all()
     for event in events:
+        if str(event.event_source or "").lower() not in {"reconciliation", "realtime"}:
+            continue
         if isinstance(event.payload, dict):
             candidates.append(("broker_order_events.payload", event.payload, event.observed_at, event.id))
             normalized_payload = event.payload.get("normalized_payload")
@@ -471,13 +610,15 @@ def _repair_evidence_for_order(*, db: Session, order: BrokerOrder) -> dict[str, 
             order=order,
             observed_at=observed_at or order.submitted_at or datetime.now(UTC),
         )
-        if fills:
+        if fills and _fills_match_filled_order(order=order, fills=fills):
             return {
                 "available_repair_evidence": {
                     "source": source,
+                    "evidence_kind": "persisted_broker_payload",
                     "broker_order_event_id": event_id,
                     "observed_at": _serialize_datetime(observed_at),
                     "fields": sorted(_evidence_fields(payload)),
+                    "validation": "exact_quantity_symbol_and_side_match",
                 },
                 "proposed_fills": fills,
             }
@@ -485,6 +626,27 @@ def _repair_evidence_for_order(*, db: Session, order: BrokerOrder) -> dict[str, 
         "available_repair_evidence": None,
         "proposed_fills": [],
     }
+
+
+def _fills_match_filled_order(
+    *,
+    order: BrokerOrder,
+    fills: list[dict[str, object]],
+) -> bool:
+    if order.quantity is None or order.quantity <= 0:
+        return False
+    total_quantity = 0
+    for fill in fills:
+        if str(fill.get("symbol") or "").strip().upper() != order.symbol.strip().upper():
+            return False
+        if str(fill.get("side") or "").strip().lower() != order.side.strip().lower():
+            return False
+        quantity = _parse_int(fill.get("quantity"))
+        price = _parse_decimal(fill.get("price"))
+        if quantity is None or quantity <= 0 or price is None or price <= 0:
+            return False
+        total_quantity += quantity
+    return total_quantity == order.quantity
 
 
 def _proposed_fills_from_payload(
@@ -598,7 +760,7 @@ def _duplicate_fill_groups(*, db: Session, runtime_mode: str) -> list[dict[str, 
         if len(group) <= 1:
             continue
         retained = group[0]
-        deleted = group[1:]
+        duplicate_fills = group[1:]
         duplicate_groups.append(
             {
                 "duplicate_group_key": key,
@@ -610,7 +772,7 @@ def _duplicate_fill_groups(*, db: Session, runtime_mode: str) -> list[dict[str, 
                 "price": _decimal_text(Decimal(retained.price)),
                 "filled_at": _serialize_datetime(retained.filled_at),
                 "retained_fill": _fill_row_payload(retained),
-                "deleted_fills": [_fill_row_payload(fill) for fill in deleted],
+                "duplicate_fills": [_fill_row_payload(fill) for fill in duplicate_fills],
             }
         )
     return duplicate_groups
@@ -634,6 +796,91 @@ def _fill_signature(*, order: BrokerOrder, fill: dict[str, object]) -> str | Non
     )
 
 
+def _annotate_remediation_reviews(
+    *,
+    db: Session,
+    runtime_mode: str,
+    candidate_type: str,
+    items: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    if not items:
+        return items
+    candidate_keys = {
+        str(item["broker_order_pk"])
+        if candidate_type == MISSING_FILL_CANDIDATE_TYPE
+        else str(item["duplicate_group_key"])
+        for item in items
+    }
+    reviews = db.scalars(
+        select(RuntimeRemediationEvent).where(
+            RuntimeRemediationEvent.mode == runtime_mode,
+            RuntimeRemediationEvent.candidate_type == candidate_type,
+            RuntimeRemediationEvent.candidate_key.in_(sorted(candidate_keys)),
+        )
+    ).all()
+    review_by_key = {review.candidate_key: review for review in reviews}
+    for item in items:
+        candidate_key = (
+            str(item["broker_order_pk"])
+            if candidate_type == MISSING_FILL_CANDIDATE_TYPE
+            else str(item["duplicate_group_key"])
+        )
+        review = review_by_key.get(candidate_key)
+        item["candidate_key"] = candidate_key
+        item["repair_action"] = (
+            "insert_authoritative_fill"
+            if candidate_type == MISSING_FILL_CANDIDATE_TYPE and item.get("proposed_fills")
+            else "record_manual_review"
+            if candidate_type == MISSING_FILL_CANDIDATE_TYPE
+            else "isolate_non_destructively"
+        )
+        if review is not None:
+            item["review_outcome"] = review.outcome
+            item["review_actor"] = review.actor
+            item["review_reason"] = review.reason
+            item["reviewed_at"] = _serialize_datetime(review.occurred_at)
+    return items
+
+
+def _record_remediation_event(
+    *,
+    db: Session,
+    runtime_mode: str,
+    candidate_type: str,
+    candidate_key: str,
+    subject_id: str | None,
+    outcome: str,
+    actor: str,
+    reason: str,
+    occurred_at: datetime,
+    evidence_summary: dict[str, object],
+) -> bool:
+    existing = db.scalar(
+        select(RuntimeRemediationEvent.id).where(
+            RuntimeRemediationEvent.mode == runtime_mode,
+            RuntimeRemediationEvent.candidate_type == candidate_type,
+            RuntimeRemediationEvent.candidate_key == candidate_key,
+            RuntimeRemediationEvent.outcome == outcome,
+        )
+    )
+    if existing is not None:
+        return False
+    db.add(
+        RuntimeRemediationEvent(
+            mode=runtime_mode,
+            candidate_type=candidate_type,
+            candidate_key=candidate_key,
+            subject_id=subject_id,
+            outcome=outcome,
+            actor=actor,
+            reason=reason,
+            evidence_summary=evidence_summary,
+            occurred_at=occurred_at,
+        )
+    )
+    return True
+
+
 def _fill_row_payload(fill: ExecutionFill, *, id_override: str | None = "__fill_id__") -> dict[str, object]:
     payload = {
         "id": fill.id if id_override == "__fill_id__" else id_override,
@@ -647,7 +894,6 @@ def _fill_row_payload(fill: ExecutionFill, *, id_override: str | None = "__fill_
         "filled_at": _serialize_datetime(fill.filled_at),
         "created_at": _serialize_datetime(fill.created_at),
         "updated_at": _serialize_datetime(fill.updated_at),
-        "payload": _json_safe_value(fill.payload),
     }
     if payload["id"] is None:
         payload.pop("id")

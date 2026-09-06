@@ -21,6 +21,7 @@ from app.models.runtime import (
     ExecutionPlanItemAudit,
     ExecutionPosition,
     MonitoringCheckpoint,
+    RuntimeRemediationEvent,
 )
 from app.services.fill_idempotency import dedupe_execution_fills
 from app.services.fifo_inventory import load_fifo_isolation_cursor
@@ -349,25 +350,46 @@ def broker_order_fill_quality_payload(
         .group_by(BrokerOrder.id)
         .having(func.count(ExecutionFill.id) == 0)
     )
+    missing_fill_subquery = missing_fill_query.subquery()
     missing_fill_count = int(
-        db.scalar(select(func.count()).select_from(missing_fill_query.subquery())) or 0
+        db.scalar(select(func.count()).select_from(missing_fill_subquery)) or 0
     )
     missing_fill_rows = db.execute(
         missing_fill_query
         .order_by(BrokerOrder.submitted_at.desc(), BrokerOrder.created_at.desc())
         .limit(MAX_STATUS_DETAIL_ITEMS)
     ).all()
-    missing_fill_items = [
-        {
+    missing_order_ids = [
+        str(order_id)
+        for order_id in db.scalars(select(missing_fill_subquery.c.id)).all()
+    ]
+    missing_reviews = db.scalars(
+        select(RuntimeRemediationEvent).where(
+            RuntimeRemediationEvent.mode == settings.runtime_mode,
+            RuntimeRemediationEvent.candidate_type == "missing_execution_fill",
+            RuntimeRemediationEvent.outcome == "manual_review_required",
+            RuntimeRemediationEvent.subject_id.in_(missing_order_ids or [""]),
+        )
+    ).all()
+    missing_review_by_subject = {str(review.subject_id): review for review in missing_reviews}
+    missing_fill_items = []
+    for row in missing_fill_rows[:MAX_STATUS_DETAIL_ITEMS]:
+        review = missing_review_by_subject.get(str(row.id))
+        missing_fill_items.append({
             "broker_order_pk": row.id,
             "symbol": row.symbol,
             "side": row.side,
             "quantity": row.quantity,
             "submitted_at": _serialize_datetime(row.submitted_at),
             "idempotency_key": row.idempotency_key,
-        }
-        for row in missing_fill_rows[:MAX_STATUS_DETAIL_ITEMS]
-    ]
+            "review_outcome": review.outcome if review is not None else None,
+            "review_actor": review.actor if review is not None else None,
+            "review_reason": review.reason if review is not None else None,
+            "reviewed_at": _serialize_datetime(review.occurred_at) if review is not None else None,
+        })
+    missing_manual_review_count = sum(
+        1 for order_id in missing_order_ids if order_id in missing_review_by_subject
+    )
 
     duplicate_fill_identity = case(
         (
@@ -436,6 +458,8 @@ def broker_order_fill_quality_payload(
 
     return {
         "missing_filled_order_fill_count": missing_fill_count,
+        "missing_filled_order_fill_unreviewed_count": missing_fill_count - missing_manual_review_count,
+        "missing_filled_order_fill_manual_review_count": missing_manual_review_count,
         "missing_filled_order_fill_items": missing_fill_items,
         "missing_filled_order_fill_truncated": missing_fill_count > len(missing_fill_items),
         "duplicate_fill_group_count": duplicate_fill_count,
@@ -600,7 +624,11 @@ def runtime_actionable_alerts_payload(
         else None
     )
     if isinstance(fill_quality, dict):
-        missing_fill_count = int(fill_quality.get("missing_filled_order_fill_count") or 0)
+        missing_fill_count = int(
+            fill_quality.get("missing_filled_order_fill_unreviewed_count")
+            if "missing_filled_order_fill_unreviewed_count" in fill_quality
+            else fill_quality.get("missing_filled_order_fill_count") or 0
+        )
         if missing_fill_count > 0:
             alerts.append(
                 {
@@ -615,6 +643,28 @@ def runtime_actionable_alerts_payload(
                     "message": (
                         "filled broker orders are missing execution_fills rows, "
                         "so FIFO realized P/L is incomplete"
+                    ),
+                }
+            )
+        manual_review_fill_count = int(
+            fill_quality.get("missing_filled_order_fill_manual_review_count") or 0
+        )
+        if manual_review_fill_count > 0:
+            alerts.append(
+                {
+                    "kind": "filled_broker_orders_missing_fills_manual_review",
+                    "severity": "critical",
+                    "count": manual_review_fill_count,
+                    "symbols": sorted({
+                        str(item.get("symbol"))
+                        for item in fill_quality.get("missing_filled_order_fill_items") or []
+                        if isinstance(item, dict)
+                        and item.get("symbol")
+                        and item.get("review_outcome") == "manual_review_required"
+                    }),
+                    "message": (
+                        "missing execution_fills lack authoritative broker evidence and "
+                        "have durable manual-review blockers"
                     ),
                 }
             )

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -26,9 +27,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
             "Dry-run or apply operator-triggered repairs for missing/duplicate fill "
-            "evidence or broker-flat FIFO residuals. This script only reads/writes "
-            "local runtime database tables; it does not call broker APIs or "
-            "place/cancel/alter orders."
+            "evidence or broker-flat FIFO residuals. Duplicate and ambiguous missing "
+            "fill rows are isolated or marked for review without deletion/fabrication. "
+            "This script only reads/writes local runtime database tables; it does not "
+            "call broker APIs or place/cancel/alter orders."
         ),
     )
     parser.add_argument(
@@ -67,6 +69,10 @@ def main() -> int:
 
     if args.apply and (not args.actor or not args.reason):
         raise SystemExit("--apply requires --actor and --reason for auditability")
+
+    runtime_mode = args.runtime_mode or os.getenv("KAI_EXEC_RUNTIME_MODE") or "mock"
+    if runtime_mode == "live" and not args.database_url:
+        raise SystemExit("live fill remediation requires --database-url explicitly")
 
     settings_kwargs: dict[str, object] = {}
     if args.database_url:

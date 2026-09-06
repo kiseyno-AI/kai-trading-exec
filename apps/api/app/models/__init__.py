@@ -18,6 +18,7 @@ from app.models.runtime import (
     MonitoringCheckpoint,
     RuntimeControlEvent,
     RuntimeControlState,
+    RuntimeRemediationEvent,
 )
 
 EXEC_OWNED_TABLES = (
@@ -38,6 +39,7 @@ EXEC_OWNED_TABLES = (
     ExecutionFailure.__tablename__,
     ExecutionFill.__tablename__,
     ExecutionPosition.__tablename__,
+    RuntimeRemediationEvent.__tablename__,
     FifoInventoryIsolation.__tablename__,
     MonitoringCheckpoint.__tablename__,
 )
@@ -63,4 +65,5 @@ __all__ = [
     "MonitoringCheckpoint",
     "RuntimeControlEvent",
     "RuntimeControlState",
+    "RuntimeRemediationEvent",
 ]
