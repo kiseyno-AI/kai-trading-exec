@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import defaultdict
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
+from hashlib import sha256
 from typing import Any
 
 from sqlalchemy import func, select
@@ -454,7 +455,7 @@ def apply_execution_fill_repairs(
             db=db,
             runtime_mode=runtime_mode,
             candidate_type=DUPLICATE_FILL_CANDIDATE_TYPE,
-            candidate_key=str(group["duplicate_group_key"]),
+            candidate_key=_duplicate_group_candidate_key(group),
             subject_id=str(group["broker_order_pk"]),
             outcome="non_destructive_isolation",
             actor=actor,
@@ -468,6 +469,8 @@ def apply_execution_fill_repairs(
                 "duplicate_fill_ids": [
                     row.get("id") for row in duplicate_fills if isinstance(row, dict)
                 ],
+                "duplicate_group_key": group.get("duplicate_group_key"),
+                "group_membership_version": _duplicate_group_membership_version(group),
                 "dedupe_behavior": "application_readers_ignore_duplicate_identity",
                 "fills_deleted": 0,
                 "fills_fabricated": 0,
@@ -808,7 +811,7 @@ def _annotate_remediation_reviews(
     candidate_keys = {
         str(item["broker_order_pk"])
         if candidate_type == MISSING_FILL_CANDIDATE_TYPE
-        else str(item["duplicate_group_key"])
+        else _duplicate_group_candidate_key(item)
         for item in items
     }
     reviews = db.scalars(
@@ -823,7 +826,7 @@ def _annotate_remediation_reviews(
         candidate_key = (
             str(item["broker_order_pk"])
             if candidate_type == MISSING_FILL_CANDIDATE_TYPE
-            else str(item["duplicate_group_key"])
+            else _duplicate_group_candidate_key(item)
         )
         review = review_by_key.get(candidate_key)
         item["candidate_key"] = candidate_key
@@ -840,6 +843,31 @@ def _annotate_remediation_reviews(
             item["review_reason"] = review.reason
             item["reviewed_at"] = _serialize_datetime(review.occurred_at)
     return items
+
+
+def _duplicate_group_candidate_key(item: dict[str, object]) -> str:
+    return ":".join(
+        (
+            str(item["duplicate_group_key"]),
+            _duplicate_group_membership_version(item),
+        )
+    )
+
+
+def _duplicate_group_membership_version(item: dict[str, object]) -> str:
+    member_ids: list[str] = []
+    retained = item.get("retained_fill")
+    if isinstance(retained, dict) and retained.get("id") is not None:
+        member_ids.append(str(retained["id"]))
+    duplicate_fills = item.get("duplicate_fills")
+    if isinstance(duplicate_fills, list):
+        member_ids.extend(
+            str(fill["id"])
+            for fill in duplicate_fills
+            if isinstance(fill, dict) and fill.get("id") is not None
+        )
+    membership = "\0".join(sorted(member_ids))
+    return sha256(membership.encode("utf-8")).hexdigest()[:32]
 
 
 def _record_remediation_event(

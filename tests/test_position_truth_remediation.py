@@ -222,6 +222,19 @@ def test_position_truth_remediation_routes_supported_and_blocks_unknown(monkeypa
     ]
     assert all(event.actor == "Peter" for event in events)
     assert all(event.evidence_summary["orders_submitted"] == 0 for event in events)
+    events_by_symbol = {event.evidence_summary["symbol"]: event for event in events}
+    updated_evidence = events_by_symbol["003550"].evidence_summary
+    assert updated_evidence["broker_snapshot_observed_at"] == NOW.isoformat()
+    assert updated_evidence["position_refresh_outcome"] == "updated"
+    assert updated_evidence["resulting_quantity"] == 10
+    assert updated_evidence["resulting_base_quantity"] is None
+    assert updated_evidence["resulting_average_price"] == "250000.0000"
+    zeroed_evidence = events_by_symbol["APTX"].evidence_summary
+    assert zeroed_evidence["broker_snapshot_observed_at"] == NOW.isoformat()
+    assert zeroed_evidence["position_refresh_outcome"] == "zeroed"
+    assert zeroed_evidence["resulting_quantity"] == 0
+    assert zeroed_evidence["resulting_base_quantity"] is None
+    assert zeroed_evidence["resulting_average_price"] == "1.0000"
     engine.dispose()
 
 
@@ -299,6 +312,14 @@ def test_missing_us_position_recovers_exchange_from_filled_order_event(
     position = db.scalar(select(ExecutionPosition).where(ExecutionPosition.symbol == symbol))
     assert position is not None
     assert position.raw_payload["_position_sync"]["exchange"] == exchange
+    event = db.scalar(select(RuntimeRemediationEvent))
+    assert event is not None
+    assert event.evidence_summary["broker_snapshot_observed_at"] == NOW.isoformat()
+    assert event.evidence_summary["position_refresh_outcome"] == "created"
+    assert event.evidence_summary["resulting_position_id"] == position.id
+    assert event.evidence_summary["resulting_quantity"] == 2
+    assert event.evidence_summary["resulting_base_quantity"] is None
+    assert event.evidence_summary["resulting_average_price"] == "200.0000"
     assert db.scalars(select(ExecutionFill)).all() == []
     assert db.scalars(select(BrokerOrder)).all() == [order]
     engine.dispose()

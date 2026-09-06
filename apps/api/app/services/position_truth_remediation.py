@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import select
@@ -100,6 +101,21 @@ def apply_position_truth_remediation(
         if item["eligible"] is True:
             symbols_by_exchange.setdefault(str(item["exchange"]), set()).add(str(item["symbol"]))
 
+    eligible_symbols = {
+        str(item["symbol"])
+        for item in items
+        if item["eligible"] is True
+    }
+    positions_before = {
+        position.symbol: _position_quantity(position)
+        for position in db.scalars(
+            select(ExecutionPosition).where(
+                ExecutionPosition.mode == settings.runtime_mode,
+                ExecutionPosition.symbol.in_(sorted(eligible_symbols or {""})),
+            )
+        ).all()
+    }
+
     sync_results: dict[str, dict[str, int]] = {}
     try:
         for exchange, symbols in sorted(symbols_by_exchange.items()):
@@ -114,6 +130,25 @@ def apply_position_truth_remediation(
     except Exception:
         db.rollback()
         raise
+
+    db.flush()
+    positions_after = {
+        position.symbol: position
+        for position in db.scalars(
+            select(ExecutionPosition).where(
+                ExecutionPosition.mode == settings.runtime_mode,
+                ExecutionPosition.symbol.in_(sorted(eligible_symbols or {""})),
+            )
+        ).all()
+    }
+    post_refresh_evidence = {
+        symbol: _post_refresh_position_evidence(
+            position=positions_after[symbol],
+            existed_before=symbol in positions_before,
+            previous_quantity=positions_before.get(symbol),
+        )
+        for symbol in sorted(eligible_symbols)
+    }
 
     applied_event_count = 0
     for item in items:
@@ -144,6 +179,7 @@ def apply_position_truth_remediation(
                     "exchange": item["exchange"],
                     "previous_last_reconciled_at": item["last_reconciled_at"],
                     "inquiry_type": "broker_account_snapshot" if eligible else None,
+                    **(post_refresh_evidence[str(item["symbol"])] if eligible else {}),
                     "blocker": None if eligible else item["reason"],
                     "fills_deleted": 0,
                     "fills_fabricated": 0,
@@ -189,6 +225,41 @@ def apply_position_truth_remediation(
 
 def _candidate_key(item: dict[str, object]) -> str:
     return f"{item['symbol']}:{item.get('last_reconciled_at') or 'missing'}"
+
+
+def _post_refresh_position_evidence(
+    *,
+    position: ExecutionPosition,
+    existed_before: bool,
+    previous_quantity: Decimal | None,
+) -> dict[str, object]:
+    resulting_quantity = _position_quantity(position)
+    if not existed_before:
+        refresh_outcome = "created"
+    elif previous_quantity is not None and previous_quantity != 0 and resulting_quantity == 0:
+        refresh_outcome = "zeroed"
+    else:
+        refresh_outcome = "updated"
+    return {
+        "broker_snapshot_observed_at": _serialize_datetime(position.last_reconciled_at),
+        "position_refresh_outcome": refresh_outcome,
+        "resulting_position_id": position.id,
+        "resulting_quantity": position.quantity,
+        "resulting_base_quantity": _serialize_decimal(position.base_quantity),
+        "resulting_average_price": _serialize_decimal(position.average_price),
+    }
+
+
+def _position_quantity(position: ExecutionPosition) -> Decimal:
+    if position.base_quantity is not None:
+        return Decimal(position.base_quantity)
+    return Decimal(position.quantity)
+
+
+def _serialize_decimal(value: Any) -> str | None:
+    if value is None:
+        return None
+    return format(Decimal(value), "f")
 
 
 def _missing_position_order_exchanges(

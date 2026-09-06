@@ -705,6 +705,58 @@ def test_reconcile_cumulative_filled_quantity_adds_only_delta() -> None:
     engine.dispose()
 
 
+def test_reconcile_cumulative_share_fill_dedupes_preserved_existing_evidence() -> None:
+    settings = Settings(database_url="sqlite:///:memory:", runtime_mode="paper")
+    engine, db = _session(settings)
+    order = _order(broker_order_id="cumulative-preserved-duplicate-share")
+    db.add(order)
+    db.flush()
+    db.add_all(
+        [
+            ExecutionFill(
+                id=f"{prefix}-preserved-share-fill",
+                broker_order_pk=order.id,
+                broker_fill_id="actual-share-fill-1",
+                symbol=order.symbol,
+                side=order.side,
+                quantity=1,
+                quote_notional=Decimal("70000"),
+                price=Decimal("70000"),
+                filled_at=OBSERVED_AT,
+            )
+            for prefix in ("a", "b")
+        ]
+    )
+    db.commit()
+    broker = ReconciliationStubBroker(
+        reconcile_payloads=[
+            {
+                "broker_order_id": order.broker_order_id,
+                "status": "filled",
+                "filled_quantity": 2,
+                "remaining_quantity": 0,
+                "average_fill_price": "71000",
+                "filled_at": (OBSERVED_AT + timedelta(minutes=1)).isoformat(),
+                "observed_at": (OBSERVED_AT + timedelta(minutes=1)).isoformat(),
+            }
+        ]
+    )
+
+    result = reconcile_broker_order(settings=settings, db=db, adapter=broker, order=order)
+
+    fills = db.scalars(
+        select(ExecutionFill).order_by(ExecutionFill.filled_at.asc(), ExecutionFill.id.asc())
+    ).all()
+    assert result["fills_added"] == 1
+    assert len(fills) == 3
+    assert fills[-1].quantity == 1
+    assert fills[-1].quote_notional == Decimal("72000")
+    assert fills[-1].price == Decimal("72000")
+    assert fills[-1].payload["previous_quantity"] == 1
+    assert fills[-1].payload["previous_quote_notional"] == "70000.0000"
+    engine.dispose()
+
+
 def test_reconcile_cumulative_base_fill_derives_incremental_price_from_notional_delta() -> None:
     settings = Settings(database_url="sqlite:///:memory:", runtime_mode="paper")
     engine, db = _session(settings)
@@ -747,6 +799,59 @@ def test_reconcile_cumulative_base_fill_derives_incremental_price_from_notional_
     assert [fill.price for fill in fills] == [Decimal("100"), Decimal("200")]
     assert fills[1].payload["price_derivation"] == "cumulative_notional_delta"
     assert fills[1].payload["previous_quote_notional"] == "100.0000"
+    engine.dispose()
+
+
+def test_reconcile_cumulative_base_fill_dedupes_preserved_existing_evidence() -> None:
+    settings = Settings(database_url="sqlite:///:memory:", runtime_mode="paper")
+    engine, db = _session(settings)
+    order = _order(broker_order_id="cumulative-preserved-duplicate-base")
+    order.symbol = "BTC/USD"
+    db.add(order)
+    db.flush()
+    db.add_all(
+        [
+            ExecutionFill(
+                id=f"{prefix}-preserved-base-fill",
+                broker_order_pk=order.id,
+                broker_fill_id="actual-base-fill-1",
+                symbol=order.symbol,
+                side=order.side,
+                quantity=0,
+                base_quantity=Decimal("1"),
+                quote_notional=Decimal("100"),
+                price=Decimal("100"),
+                filled_at=OBSERVED_AT,
+            )
+            for prefix in ("a", "b")
+        ]
+    )
+    db.commit()
+    broker = ReconciliationStubBroker(
+        reconcile_payloads=[
+            {
+                "broker_order_id": order.broker_order_id,
+                "status": "filled",
+                "filled_base_quantity": "2",
+                "average_fill_price": "150",
+                "filled_at": (OBSERVED_AT + timedelta(minutes=1)).isoformat(),
+                "observed_at": (OBSERVED_AT + timedelta(minutes=1)).isoformat(),
+            }
+        ]
+    )
+
+    result = reconcile_broker_order(settings=settings, db=db, adapter=broker, order=order)
+
+    fills = db.scalars(
+        select(ExecutionFill).order_by(ExecutionFill.filled_at.asc(), ExecutionFill.id.asc())
+    ).all()
+    assert result["fills_added"] == 1
+    assert len(fills) == 3
+    assert fills[-1].base_quantity == Decimal("1")
+    assert fills[-1].quote_notional == Decimal("200")
+    assert fills[-1].price == Decimal("200")
+    assert fills[-1].payload["previous_base_quantity"] == "1.000000000000"
+    assert fills[-1].payload["previous_quote_notional"] == "100.0000"
     engine.dispose()
 
 

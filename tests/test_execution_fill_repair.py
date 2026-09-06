@@ -421,6 +421,89 @@ def test_apply_is_idempotent_auditable_and_repairs_fifo_pair() -> None:
     engine.dispose()
 
 
+def test_duplicate_isolation_review_is_versioned_when_group_membership_changes() -> None:
+    settings = _settings()
+    engine, db = _session(settings)
+    order = _duplicate_fill_order()
+    db.add(order)
+    db.flush()
+    retained = ExecutionFill(
+        id="a-membership-retained-fill",
+        broker_order_pk=order.id,
+        broker_fill_id="membership-fill",
+        symbol=order.symbol,
+        side=order.side,
+        quantity=1,
+        price=Decimal("73000"),
+        filled_at=SOLD_AT,
+    )
+    first_duplicate = ExecutionFill(
+        id="b-membership-duplicate-fill",
+        broker_order_pk=order.id,
+        broker_fill_id="membership-fill",
+        symbol=order.symbol,
+        side=order.side,
+        quantity=1,
+        price=Decimal("73000"),
+        filled_at=SOLD_AT,
+    )
+    db.add_all([retained, first_duplicate])
+    db.commit()
+
+    first = apply_execution_fill_repairs(
+        db=db,
+        runtime_mode="paper",
+        actor="test-operator",
+        reason="isolate first duplicate membership",
+        now=SOLD_AT,
+    )
+    first_group = first["duplicate_fill_groups"][0]
+    first_candidate_key = first_group["candidate_key"]
+    assert first_group["review_outcome"] == "non_destructive_isolation"
+
+    second_duplicate = ExecutionFill(
+        id="c-membership-duplicate-fill",
+        broker_order_pk=order.id,
+        broker_fill_id="membership-fill",
+        symbol=order.symbol,
+        side=order.side,
+        quantity=1,
+        price=Decimal("73000"),
+        filled_at=SOLD_AT,
+    )
+    db.add(second_duplicate)
+    db.commit()
+
+    enlarged = analyze_execution_fill_repairs(db=db, runtime_mode="paper")
+    enlarged_group = enlarged["duplicate_fill_groups"][0]
+    assert enlarged_group["candidate_key"] != first_candidate_key
+    assert "review_outcome" not in enlarged_group
+
+    second = apply_execution_fill_repairs(
+        db=db,
+        runtime_mode="paper",
+        actor="test-operator",
+        reason="isolate enlarged duplicate membership",
+        now=SOLD_AT + timedelta(minutes=1),
+    )
+
+    reviews = db.scalars(
+        select(RuntimeRemediationEvent)
+        .where(RuntimeRemediationEvent.candidate_type == "duplicate_fill_group")
+        .order_by(RuntimeRemediationEvent.occurred_at.asc())
+    ).all()
+    assert second["summary"]["isolated_duplicate_fill_group_count"] == 1
+    assert len(reviews) == 2
+    assert reviews[0].candidate_key != reviews[1].candidate_key
+    assert reviews[0].evidence_summary["duplicate_fill_ids"] == [first_duplicate.id]
+    assert reviews[1].evidence_summary["duplicate_fill_ids"] == [
+        first_duplicate.id,
+        second_duplicate.id,
+    ]
+    assert len(db.scalars(select(ExecutionFill)).all()) == 3
+    engine.dispose()
+
+
 def test_apply_records_manual_review_when_authoritative_fill_evidence_is_absent() -> None:
     settings = _settings()
     engine, db = _session(settings)

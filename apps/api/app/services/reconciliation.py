@@ -29,7 +29,11 @@ from app.services.broker_order_state import (
     NONTERMINAL_ORDER_STATUSES,
     broker_order_observed_at_expr,
 )
-from app.services.fill_idempotency import execution_fill_dedupe_key, execution_fill_idempotency_key
+from app.services.fill_idempotency import (
+    dedupe_execution_fills,
+    execution_fill_dedupe_key,
+    execution_fill_idempotency_key,
+)
 from app.services.execution_failures import (
     record_actionable_execution_failure,
     resolve_execution_failure_for_order,
@@ -1640,11 +1644,12 @@ def _parse_fills_from_payload(
             result.append(parsed_fill)
         return result, []
 
+    existing_fills = dedupe_execution_fills(order.fills)
     total_filled_base = _parse_decimal(payload.get("filled_base_quantity"))
     if total_filled_base is not None and total_filled_base > 0:
         existing_total_base = sum(
             Decimal(fill.base_quantity or 0)
-            for fill in order.fills
+            for fill in existing_fills
         )
         average_fill_price = _parse_decimal(payload.get("average_fill_price"))
         delta_result = _cumulative_fill_delta(
@@ -1653,6 +1658,7 @@ def _parse_fills_from_payload(
             existing_total=existing_total_base,
             average_fill_price=average_fill_price,
             quantity_basis="base_quantity",
+            existing_fills=existing_fills,
         )
         if delta_result["status"] != "ok":
             anomalies = delta_result["anomalies"]
@@ -1685,7 +1691,7 @@ def _parse_fills_from_payload(
     if total_filled is None or total_filled <= 0:
         return [], []
 
-    existing_total = _sum_fill_quantities(order.fills)
+    existing_total = _sum_fill_quantities(existing_fills)
     average_fill_price = _parse_decimal(payload.get("average_fill_price"))
     delta_result = _cumulative_fill_delta(
         order=order,
@@ -1693,6 +1699,7 @@ def _parse_fills_from_payload(
         existing_total=Decimal(existing_total),
         average_fill_price=average_fill_price,
         quantity_basis="quantity",
+        existing_fills=existing_fills,
     )
     if delta_result["status"] != "ok":
         anomalies = delta_result["anomalies"]
@@ -1732,6 +1739,7 @@ def _cumulative_fill_delta(
     existing_total: Decimal,
     average_fill_price: Decimal | None,
     quantity_basis: str,
+    existing_fills: list[ExecutionFill],
 ) -> dict[str, object]:
     if total_filled < existing_total:
         return _cumulative_fill_delta_anomaly(
@@ -1765,7 +1773,7 @@ def _cumulative_fill_delta(
 
     delta = total_filled - existing_total
     previous_cumulative_notional = _sum_existing_fill_notional(
-        fills=order.fills,
+        fills=existing_fills,
         quantity_basis=quantity_basis,
     )
     current_cumulative_notional = total_filled * average_fill_price
