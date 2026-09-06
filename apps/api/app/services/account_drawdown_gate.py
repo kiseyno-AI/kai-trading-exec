@@ -18,6 +18,7 @@ from app.models.runtime import (
     ExecutionPlanItem,
     ExecutionPlanItemAudit,
 )
+from app.services.fifo_inventory import load_fifo_isolation_cursor
 
 
 BLOCK_EVENT_TYPE = "account_drawdown_new_buy_blocked"
@@ -329,17 +330,27 @@ def _us_realized_pnl(*, settings: Settings, db: Session, now: datetime) -> tuple
         .order_by(ExecutionFill.filled_at.asc(), ExecutionFill.id.asc())
     ).all()
     lots: dict[str, list[list[Decimal]]] = {}
+    isolation_cursor = load_fifo_isolation_cursor(
+        db=db,
+        runtime_mode=settings.runtime_mode,
+        through=now,
+    )
     daily = Decimal("0")
     weekly = Decimal("0")
     for fill in fills:
         quantity = Decimal(fill.base_quantity) if fill.base_quantity is not None else Decimal(fill.quantity)
+        symbol_lots = lots.setdefault(fill.symbol, [])
+        isolation_cursor.apply_before(
+            symbol=fill.symbol,
+            observed_at=fill.filled_at,
+            lots=symbol_lots,
+        )
         if fill.side.lower() == "buy":
-            lots.setdefault(fill.symbol, []).append([quantity, Decimal(fill.price)])
+            symbol_lots.append([quantity, Decimal(fill.price)])
             continue
         if fill.side.lower() != "sell":
             continue
         remaining = quantity
-        symbol_lots = lots.setdefault(fill.symbol, [])
         while remaining > 0 and symbol_lots:
             lot = symbol_lots[0]
             matched = min(remaining, lot[0])

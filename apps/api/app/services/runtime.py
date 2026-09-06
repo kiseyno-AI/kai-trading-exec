@@ -23,6 +23,7 @@ from app.models.runtime import (
     MonitoringCheckpoint,
 )
 from app.services.fill_idempotency import dedupe_execution_fills
+from app.services.fifo_inventory import load_fifo_isolation_cursor
 from app.services.monitoring import (
     ACTIVE_WATCH_MONITORING_STATUSES,
     BLOCKED_MONITORING_STATUSES,
@@ -42,6 +43,7 @@ from app.services.trigger_time_exec_agent import (
 from app.services.broker_auth import build_broker_adapter, build_broker_session_summary
 from app.services.account_drawdown_gate import latest_account_drawdown_gate_state
 from app.services.broker_order_state import (
+    ACTIONABLE_OPEN_ORDER_STATUSES,
     NONTERMINAL_ORDER_STATUSES,
     UNTRUSTED_ACTIVE_ORDER_ERROR_CLASSIFICATIONS,
     active_local_broker_order_filters,
@@ -54,7 +56,7 @@ from app.services.runtime_controls import (
     runtime_safety_payload,
 )
 
-OPEN_ORDER_STATUSES = ("submitted", "open", "partially_filled")
+OPEN_ORDER_STATUSES = ACTIONABLE_OPEN_ORDER_STATUSES
 ACTIVE_JOB_STATUSES = ("queued", "scheduled", "running", "retrying")
 MONITORED_INTENTS = ("target_sell", "stop_sell")
 SELL_MONITORED_INTENTS = ("target_sell", "stop_sell", "max_holding_close_sell")
@@ -1693,6 +1695,11 @@ def daily_pnl_payload(
     ).all())
 
     lots_by_symbol: dict[str, list[dict[str, object]]] = {}
+    isolation_cursor = load_fifo_isolation_cursor(
+        db=db,
+        runtime_mode=settings.runtime_mode,
+        through=next_day_start,
+    )
     realized = Decimal("0")
     sell_notional = Decimal("0")
     buy_notional = Decimal("0")
@@ -1707,8 +1714,10 @@ def daily_pnl_payload(
         symbol = fill.symbol
         quantity = _pnl_fill_quantity(fill)
         notional = _pnl_fill_notional(fill=fill, quantity=quantity)
+        lots = lots_by_symbol.setdefault(symbol, [])
+        isolation_cursor.apply_before(symbol=symbol, observed_at=filled_at, lots=lots)
         if side == "buy":
-            lots_by_symbol.setdefault(symbol, []).append(
+            lots.append(
                 {"quantity": quantity, "price": fill.price, "filled_at": filled_at}
             )
             if filled_at >= day_start:
@@ -1720,7 +1729,6 @@ def daily_pnl_payload(
             sell_notional += notional
             sold_symbols.add(symbol)
         remaining = quantity
-        lots = lots_by_symbol.setdefault(symbol, [])
         while remaining > 0 and lots:
             lot = lots[0]
             matched = min(remaining, lot["quantity"])
@@ -1814,6 +1822,11 @@ def _period_realized_pnl_summary(
     positions_by_symbol = _pnl_positions_by_symbol(settings=settings, db=db, symbols=sell_symbols)
 
     lots_by_symbol: dict[str, list[dict[str, object]]] = {}
+    isolation_cursor = load_fifo_isolation_cursor(
+        db=db,
+        runtime_mode=settings.runtime_mode,
+        through=end_at,
+    )
     realized = Decimal("0")
     sell_notional = Decimal("0")
     buy_notional = Decimal("0")
@@ -1832,8 +1845,10 @@ def _period_realized_pnl_summary(
         symbol = fill.symbol
         quantity = _pnl_fill_quantity(fill)
         notional = _pnl_fill_notional(fill=fill, quantity=quantity)
+        lots = lots_by_symbol.setdefault(symbol, [])
+        isolation_cursor.apply_before(symbol=symbol, observed_at=filled_at, lots=lots)
         if side == "buy":
-            lots_by_symbol.setdefault(symbol, []).append(
+            lots.append(
                 {"quantity": quantity, "price": fill.price, "filled_at": filled_at}
             )
             if filled_at >= start_at:
@@ -1846,7 +1861,6 @@ def _period_realized_pnl_summary(
         if in_period:
             sell_notional += notional
         remaining = quantity
-        lots = lots_by_symbol.setdefault(symbol, [])
         while remaining > 0 and lots:
             lot = lots[0]
             lot_quantity = Decimal(str(lot["quantity"]))
@@ -1902,6 +1916,9 @@ def _period_realized_pnl_summary(
                 unknown_cost_basis_sell_quantity += remaining
                 unmatched_sell_symbols.add(symbol)
                 cost_basis_sources["unknown"] += 1
+
+    for symbol, lots in lots_by_symbol.items():
+        isolation_cursor.apply_through(symbol=symbol, observed_at=end_at, lots=lots)
 
     return {
         "realized": realized,

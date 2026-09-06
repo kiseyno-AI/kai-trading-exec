@@ -457,6 +457,42 @@ class ExecutionFill(TimestampMixin, Base):
     broker_order: Mapped[BrokerOrder] = relationship(back_populates="fills")
 
 
+class FifoInventoryIsolation(TimestampMixin, Base):
+    __tablename__ = "fifo_inventory_isolations"
+    __table_args__ = (
+        UniqueConstraint(
+            "mode",
+            "symbol",
+            "broker_reconciled_at",
+            name="uq_fifo_inventory_isolations_mode_symbol_reconciled",
+        ),
+        Index(
+            "ix_fifo_inventory_isolations_mode_symbol_isolated_at",
+            "mode",
+            "symbol",
+            "isolated_through_at",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    mode: Mapped[str] = mapped_column(String(16), nullable=False)
+    symbol: Mapped[str] = mapped_column(String(32), nullable=False)
+    residual_quantity: Mapped[Decimal] = mapped_column(Numeric(28, 12), nullable=False)
+    last_local_fill_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    broker_position_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    broker_position_quantity: Mapped[Decimal] = mapped_column(Numeric(28, 12), nullable=False)
+    broker_reconciled_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    isolated_through_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    evidence_source: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        default="broker_flat_reconciliation",
+    )
+    actor: Mapped[str] = mapped_column(String(128), nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False, deferred=True)
+    audit_payload: Mapped[dict[str, Any] | None] = mapped_column(JSON, deferred=True)
+
+
 class ExecutionPosition(TimestampMixin, Base):
     __tablename__ = "execution_positions"
     __table_args__ = (

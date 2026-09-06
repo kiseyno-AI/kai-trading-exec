@@ -8,8 +8,16 @@ from typing import Any
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from app.models.runtime import BrokerOrder, BrokerOrderEvent, ExecutionFill
+from app.models.runtime import (
+    BrokerOrder,
+    BrokerOrderEvent,
+    ExecutionFill,
+    ExecutionPosition,
+    FifoInventoryIsolation,
+)
+from app.services.fifo_inventory import load_fifo_isolation_cursor
 from app.services.fill_idempotency import (
+    dedupe_execution_fills,
     execution_fill_dedupe_key,
     execution_fill_idempotency_key,
 )
@@ -18,6 +26,206 @@ from app.services.fill_idempotency import (
 REPAIR_EVENT_SOURCE = "operator_repair"
 MISSING_FILL_REPAIR_EVENT = "execution_fill_missing_repair"
 DUPLICATE_FILL_REPAIR_EVENT = "execution_fill_duplicate_repair"
+FIFO_INVENTORY_ISOLATION_SOURCE = "broker_flat_reconciliation"
+
+
+def analyze_fifo_inventory_repairs(
+    *,
+    db: Session,
+    runtime_mode: str,
+) -> dict[str, object]:
+    items = _fifo_inventory_repair_items(db=db, runtime_mode=runtime_mode)
+    return _fifo_inventory_repair_payload(
+        mode="dry-run",
+        runtime_mode=runtime_mode,
+        items=items,
+        applied_count=0,
+    )
+
+
+def apply_fifo_inventory_repairs(
+    *,
+    db: Session,
+    runtime_mode: str,
+    actor: str,
+    reason: str,
+    now: datetime | None = None,
+) -> dict[str, object]:
+    isolated_at = now or datetime.now(UTC)
+    items = _fifo_inventory_repair_items(db=db, runtime_mode=runtime_mode)
+    applied_items: list[dict[str, object]] = []
+    for item in items:
+        if item["eligible"] is not True:
+            continue
+        broker_reconciled_at = _parse_timestamp(
+            item["broker_reconciliation_timestamp"],
+            fallback=isolated_at,
+        )
+        existing = db.scalar(
+            select(FifoInventoryIsolation).where(
+                FifoInventoryIsolation.mode == runtime_mode,
+                FifoInventoryIsolation.symbol == item["symbol"],
+                FifoInventoryIsolation.broker_reconciled_at == broker_reconciled_at,
+            )
+        )
+        if existing is not None:
+            continue
+        isolation = FifoInventoryIsolation(
+            mode=runtime_mode,
+            symbol=str(item["symbol"]),
+            residual_quantity=_parse_decimal(item["residual_quantity"]) or Decimal("0"),
+            last_local_fill_at=_parse_timestamp(item["last_local_fill"], fallback=isolated_at),
+            broker_position_id=str(item["broker_position_id"]),
+            broker_position_quantity=_parse_decimal(item["broker_position_quantity"])
+            or Decimal("0"),
+            broker_reconciled_at=broker_reconciled_at,
+            isolated_through_at=broker_reconciled_at,
+            evidence_source=FIFO_INVENTORY_ISOLATION_SOURCE,
+            actor=actor,
+            reason=reason,
+            audit_payload={
+                "action": "isolate_fifo_residual",
+                "actor": actor,
+                "reason": reason,
+                "isolated_at": isolated_at.isoformat(),
+                "runtime_mode": runtime_mode,
+                "evidence": item,
+                "fills_deleted": 0,
+                "fills_fabricated": 0,
+            },
+        )
+        db.add(isolation)
+        applied_items.append(item)
+    db.commit()
+    return _fifo_inventory_repair_payload(
+        mode="apply",
+        runtime_mode=runtime_mode,
+        items=items,
+        applied_count=len(applied_items),
+        applied_items=applied_items,
+    )
+
+
+def _fifo_inventory_repair_payload(
+    *,
+    mode: str,
+    runtime_mode: str,
+    items: list[dict[str, object]],
+    applied_count: int,
+    applied_items: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
+    eligible_count = sum(1 for item in items if item["eligible"] is True)
+    return {
+        "mode": mode,
+        "runtime_mode": runtime_mode,
+        "summary": {
+            "broker_flat_residual_count": len(items),
+            "eligible_isolation_count": eligible_count,
+            "recency_blocked_count": len(items) - eligible_count,
+            "applied_isolation_count": applied_count,
+        },
+        "broker_flat_fifo_residuals": items,
+        "applied_isolations": applied_items or [],
+    }
+
+
+def _fifo_inventory_repair_items(
+    *,
+    db: Session,
+    runtime_mode: str,
+) -> list[dict[str, object]]:
+    fills = dedupe_execution_fills(list(
+        db.scalars(
+            select(ExecutionFill)
+            .join(ExecutionFill.broker_order)
+            .where(BrokerOrder.mode == runtime_mode)
+            .order_by(ExecutionFill.filled_at.asc(), ExecutionFill.id.asc())
+        ).all()
+    ))
+    isolation_cursor = load_fifo_isolation_cursor(db=db, runtime_mode=runtime_mode)
+    lots_by_symbol: dict[str, list[Decimal]] = {}
+    last_fill_at_by_symbol: dict[str, datetime] = {}
+    for fill in fills:
+        symbol = fill.symbol
+        filled_at = _parse_timestamp(fill.filled_at, fallback=datetime.now(UTC))
+        lots = lots_by_symbol.setdefault(symbol, [])
+        isolation_cursor.apply_before(symbol=symbol, observed_at=filled_at, lots=lots)
+        quantity = (
+            Decimal(fill.base_quantity)
+            if fill.base_quantity is not None and fill.base_quantity > 0
+            else Decimal(fill.quantity)
+        )
+        if str(fill.side or "").lower() == "buy":
+            lots.append(quantity)
+        elif str(fill.side or "").lower() == "sell":
+            remaining = quantity
+            while remaining > 0 and lots:
+                matched = min(remaining, lots[0])
+                lots[0] -= matched
+                remaining -= matched
+                if lots[0] <= 0:
+                    lots.pop(0)
+        last_fill_at_by_symbol[symbol] = filled_at
+
+    for symbol, lots in lots_by_symbol.items():
+        isolation_cursor.apply_through(
+            symbol=symbol,
+            observed_at=datetime.max.replace(tzinfo=UTC),
+            lots=lots,
+        )
+
+    positions = db.scalars(
+        select(ExecutionPosition).where(
+            ExecutionPosition.mode == runtime_mode,
+            ExecutionPosition.last_reconciled_at.is_not(None),
+        )
+    ).all()
+    position_by_symbol = {position.symbol: position for position in positions}
+    items: list[dict[str, object]] = []
+    for symbol, lots in sorted(lots_by_symbol.items()):
+        residual_quantity = sum(lots, Decimal("0"))
+        if residual_quantity <= 0:
+            continue
+        position = position_by_symbol.get(symbol)
+        if (
+            position is None
+            or "reconciliation" not in str(position.updated_from or "")
+            or _position_quantity(position) > 0
+            or position.last_reconciled_at is None
+        ):
+            continue
+        last_fill_at = last_fill_at_by_symbol.get(symbol)
+        if last_fill_at is None:
+            continue
+        broker_reconciled_at = _parse_timestamp(
+            position.last_reconciled_at,
+            fallback=datetime.min.replace(tzinfo=UTC),
+        )
+        eligible = broker_reconciled_at > last_fill_at
+        items.append(
+            {
+                "symbol": symbol,
+                "residual_quantity": _decimal_text(residual_quantity),
+                "last_local_fill": last_fill_at.isoformat(),
+                "broker_reconciliation_timestamp": broker_reconciled_at.isoformat(),
+                "broker_position_id": position.id,
+                "broker_position_quantity": _decimal_text(_position_quantity(position)),
+                "eligible": eligible,
+                "repair_action": "isolate" if eligible else "skip",
+                "reason": (
+                    "broker_flat_evidence_newer_than_last_local_fill"
+                    if eligible
+                    else "broker_flat_evidence_not_newer_than_last_local_fill"
+                ),
+            }
+        )
+    return items
+
+
+def _position_quantity(position: ExecutionPosition) -> Decimal:
+    if position.base_quantity is not None:
+        return Decimal(position.base_quantity)
+    return Decimal(position.quantity)
 
 
 def analyze_execution_fill_repairs(

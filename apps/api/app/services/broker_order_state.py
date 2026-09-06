@@ -17,6 +17,11 @@ NONTERMINAL_ORDER_STATUSES = (
     NormalizedBrokerOrderStatus.CANCEL_PENDING.value,
     NormalizedBrokerOrderStatus.RETRY_PENDING.value,
 )
+ACTIONABLE_OPEN_ORDER_STATUSES = (
+    NormalizedBrokerOrderStatus.SUBMITTED.value,
+    NormalizedBrokerOrderStatus.OPEN.value,
+    NormalizedBrokerOrderStatus.PARTIALLY_FILLED.value,
+)
 UNTRUSTED_ACTIVE_ORDER_ERROR_CLASSIFICATIONS = frozenset(
     {
         "missing_broker_order_id",
@@ -26,11 +31,15 @@ UNTRUSTED_ACTIVE_ORDER_ERROR_CLASSIFICATIONS = frozenset(
 
 
 def broker_order_observed_at_expr():
+    """Return the lifecycle age anchor used by stale-order decisions.
+
+    A reconciliation heartbeat must not make an old day order young again.
+    """
     return func.coalesce(
-        BrokerOrder.last_broker_sync_at,
         BrokerOrder.submitted_at,
-        BrokerOrder.updated_at,
         BrokerOrder.created_at,
+        BrokerOrder.last_broker_sync_at,
+        BrokerOrder.updated_at,
     )
 
 

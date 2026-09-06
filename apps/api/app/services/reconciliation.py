@@ -4,6 +4,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from inspect import signature
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, selectinload
@@ -24,7 +25,10 @@ from app.models.runtime import (
     ExecutionPosition,
 )
 from app.services.broker_auth import ensure_authenticated_broker_session
-from app.services.broker_order_state import NONTERMINAL_ORDER_STATUSES
+from app.services.broker_order_state import (
+    NONTERMINAL_ORDER_STATUSES,
+    broker_order_observed_at_expr,
+)
 from app.services.fill_idempotency import execution_fill_dedupe_key, execution_fill_idempotency_key
 from app.services.execution_failures import (
     record_actionable_execution_failure,
@@ -153,17 +157,73 @@ def reconcile_broker_order(
             order=order,
             payload=payload,
         )
+        repaired_absent = _should_terminalize_absent_prior_session_order(
+            settings=settings,
+            adapter=adapter,
+            order=order,
+            payload=payload,
+            observed_at=event_time,
+        )
+        if repaired_absent:
+            status_after = NormalizedBrokerOrderStatus.STALE_TERMINAL_UNKNOWN.value
+            reason = "prior_session_order_absent_after_bounded_threshold"
+            apply_broker_order_status(order=order, status=status_after)
+            if order.plan_item is not None:
+                plan_status = _order_status_to_plan_item_status(status_after)
+                if plan_status is not None:
+                    set_plan_item_status(
+                        db=db,
+                        plan_item=order.plan_item,
+                        status=plan_status,
+                        source="reconciliation",
+                        reason=reason,
+                        payload={
+                            "broker_order_pk": order.id,
+                            "broker_order_id": order.broker_order_id,
+                            "status_before": order_status_before,
+                            "status": status_after,
+                            "broker_result": _json_safe_value(payload),
+                        },
+                        occurred_at=event_time,
+                    )
+            _record_stale_order_repair_event(
+                db=db,
+                order=order,
+                status_before=order_status_before,
+                status_after=status_after,
+                classification="stale_terminal_unknown",
+                reason=reason,
+                observed_broker_code=(
+                    _optional_str(payload.get("broker_status"))
+                    or _optional_str(payload.get("status"))
+                    or "unknown"
+                ),
+                observed_at=event_time,
+                result={
+                    "status_code": 200,
+                    "status": payload.get("status"),
+                    "broker_status": payload.get("broker_status"),
+                    "message": payload.get("message"),
+                    "response_metadata": payload.get("response_metadata"),
+                    "payload": payload.get("payload"),
+                },
+            )
         db.commit()
         db.refresh(order)
         return {
             "status_code": 200,
             "broker_order_id": order.broker_order_id,
-            "status": "unknown",
+            "status": order.status if repaired_absent else "unknown",
             "status_before": order_status_before,
-            "status_changed": False,
+            "status_changed": repaired_absent,
             "fills_added": 0,
             "filled_delta": 0,
-            "message": "unrecognized broker status",
+            "message": (
+                "prior-session order absent from successful broker reconciliation; "
+                "moved to terminal attention state"
+                if repaired_absent
+                else "unrecognized broker status"
+            ),
         }
 
     apply_broker_order_status(order=order, status=normalized_status)
@@ -697,12 +757,7 @@ def _load_stale_nonterminal_orders_for_reconciliation(
     stale_before: datetime,
     symbols: set[str] | None,
 ) -> list[BrokerOrder]:
-    observed_at = func.coalesce(
-        BrokerOrder.last_broker_sync_at,
-        BrokerOrder.submitted_at,
-        BrokerOrder.updated_at,
-        BrokerOrder.created_at,
-    )
+    observed_at = broker_order_observed_at_expr()
     where = [
         BrokerOrder.mode == settings.runtime_mode,
         BrokerOrder.broker_name == broker_name,
@@ -770,6 +825,37 @@ def _stale_order_dry_run_result(*, order: BrokerOrder) -> dict[str, object]:
         "filled_delta": 0,
         "message": order.last_error_message,
     }
+
+
+def _should_terminalize_absent_prior_session_order(
+    *,
+    settings: Settings,
+    adapter: BrokerAdapter,
+    order: BrokerOrder,
+    payload: dict[str, Any],
+    observed_at: datetime,
+) -> bool:
+    if adapter.provider != "kis" or order.status not in _reconcilable_order_statuses():
+        return False
+    status = str(payload.get("status") or "").strip().lower()
+    message = str(payload.get("message") or "").strip().lower()
+    if status != "unknown" or "not found in broker order query" not in message:
+        return False
+    age_anchor = order.submitted_at or order.created_at
+    if age_anchor is None:
+        return False
+    age_anchor_utc = _parse_timestamp(age_anchor, fallback=observed_at)
+    if observed_at - age_anchor_utc < timedelta(
+        seconds=settings.stale_broker_order_reconciliation_threshold_seconds
+    ):
+        return False
+    try:
+        market_timezone = ZoneInfo(settings.market_timezone)
+    except ZoneInfoNotFoundError:
+        market_timezone = UTC
+    return age_anchor_utc.astimezone(market_timezone).date() < observed_at.astimezone(
+        market_timezone
+    ).date()
 
 
 def _stale_order_repair_decision(
@@ -1360,6 +1446,8 @@ def _utc_naive(value: datetime) -> datetime:
 
 
 def _parse_timestamp(value: object, *, fallback: datetime) -> datetime:
+    if isinstance(value, datetime):
+        return value.astimezone(UTC) if value.tzinfo is not None else value.replace(tzinfo=UTC)
     if isinstance(value, str):
         for candidate in (value, value.replace(" ", "T"), value.replace("Z", "+00:00")):
             for fmt in (

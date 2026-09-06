@@ -16,6 +16,7 @@ from app.core.config import Settings, load_settings
 from app.db.session import create_db_engine, create_session_factory
 from app.models.runtime import BrokerOrder, ExecutionFill, ExecutionPlanItem, ExecutionPosition
 from app.services.fill_idempotency import dedupe_execution_fills
+from app.services.fifo_inventory import FifoIsolationCursor, load_fifo_isolation_cursor
 from app.services.account_drawdown_gate import (
     account_drawdown_gate_prompt_summary,
     account_drawdown_gate_report_lines,
@@ -116,7 +117,15 @@ def generate_trade_outcome_feedback(
     )
     closed_trades = [
         trade
-        for trade in _fifo_closed_trades(fills, legacy_sell_cost_basis=legacy_sell_cost_basis)
+        for trade in _fifo_closed_trades(
+            fills,
+            legacy_sell_cost_basis=legacy_sell_cost_basis,
+            isolation_cursor=load_fifo_isolation_cursor(
+                db=db,
+                runtime_mode=settings.runtime_mode,
+                through=now,
+            ),
+        )
         if _parse_datetime(str((trade.get("sell") or {}).get("filled_at"))) >= started_at
     ]
     broker_asset_performance = _broker_asset_performance(
@@ -308,14 +317,22 @@ def _fifo_closed_trades(
     fills: list[ExecutionFill],
     *,
     legacy_sell_cost_basis: dict[str, LegacySellCostBasis] | None = None,
+    isolation_cursor: FifoIsolationCursor | None = None,
 ) -> list[dict[str, object]]:
     lots_by_symbol: dict[str, list[OpenLot]] = {}
     closed: list[dict[str, object]] = []
     cost_basis = legacy_sell_cost_basis or {}
     for fill in sorted(fills, key=lambda row: (row.symbol, _normalize_utc(row.filled_at), row.id)):
         side = str(fill.side or "").lower()
+        lots = lots_by_symbol.setdefault(fill.symbol, [])
+        if isolation_cursor is not None:
+            isolation_cursor.apply_before(
+                symbol=fill.symbol,
+                observed_at=_normalize_utc(fill.filled_at),
+                lots=lots,
+            )
         if side == "buy":
-            lots_by_symbol.setdefault(fill.symbol, []).append(
+            lots.append(
                 OpenLot(
                     quantity=int(fill.quantity),
                     price=Decimal(fill.price),
@@ -327,7 +344,6 @@ def _fifo_closed_trades(
         if side != "sell":
             continue
         remaining = int(fill.quantity)
-        lots = lots_by_symbol.setdefault(fill.symbol, [])
         while remaining > 0 and lots:
             lot = lots[0]
             matched = min(remaining, lot.quantity)

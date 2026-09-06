@@ -847,6 +847,130 @@ def test_reconcile_stale_nonterminal_order_marks_closed_against_broker_truth() -
     engine.dispose()
 
 
+def test_reconcile_stale_order_uses_submission_age_despite_recent_sync() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        stale_broker_order_reconciliation_threshold_seconds=3600,
+    )
+    engine, db = _session(settings)
+    stale_submitted_at = datetime.now(UTC) - timedelta(days=7)
+    order = _order(broker_order_id="stale-recently-synced-1")
+    order.submitted_at = stale_submitted_at
+    order.last_broker_sync_at = datetime.now(UTC)
+    db.add(order)
+    db.commit()
+    broker = ReconciliationStubBroker(
+        reconcile_payloads=[
+            {
+                "broker_order_id": "stale-recently-synced-1",
+                "status": "filled",
+                "filled_quantity": 2,
+                "remaining_quantity": 0,
+                "average_fill_price": "71000",
+                "observed_at": OBSERVED_AT.isoformat(),
+            }
+        ]
+    )
+
+    result = reconcile_stale_nonterminal_broker_orders(
+        settings=settings,
+        db=db,
+        adapter=broker,
+    )
+
+    assert result["candidate_order_count"] == 1
+    assert result["counts"]["closed"] == 1
+    assert order.status == "filled"
+    assert broker.reconcile_calls == [
+        ("stale-recently-synced-1", "KRX", stale_submitted_at)
+    ]
+    engine.dispose()
+
+
+def test_successful_current_reconciliation_terminalizes_absent_prior_session_order() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        stale_broker_order_reconciliation_threshold_seconds=3600,
+    )
+    engine, db = _session(settings)
+    submitted_at = OBSERVED_AT - timedelta(days=2)
+    order = _order(status="open", broker_order_id="prior-session-absent-1")
+    order.submitted_at = submitted_at
+    order.last_broker_sync_at = submitted_at
+    db.add(order)
+    db.commit()
+    broker = ReconciliationStubBroker(
+        reconcile_payloads=[
+            {
+                "broker_order_id": order.broker_order_id,
+                "status": "unknown",
+                "broker_status": "unknown",
+                "message": "matching order was not found in broker order query",
+                "observed_at": OBSERVED_AT.isoformat(),
+                "response_metadata": {"status_code": 200, "msg_cd": "0"},
+                "payload": {"output": {"rt_cd": "0", "output1": []}},
+            }
+        ]
+    )
+
+    result = reconcile_broker_order(settings=settings, db=db, adapter=broker, order=order)
+
+    repair = db.scalar(
+        select(BrokerOrderEvent).where(BrokerOrderEvent.event_type == "stale_order_repair")
+    )
+    assert result["status"] == "stale_terminal_unknown"
+    assert result["status_changed"] is True
+    assert result["fills_added"] == 0
+    assert order.status == "stale_terminal_unknown"
+    assert order.fills == []
+    assert repair is not None
+    assert repair.payload["status_before"] == "open"
+    assert repair.payload["status_after"] == "stale_terminal_unknown"
+    assert repair.payload["observed_broker_code"] == "unknown"
+    assert repair.payload["reason"] == "prior_session_order_absent_after_bounded_threshold"
+    assert repair.payload["result"]["status_code"] == 200
+    assert repair.payload["result"]["response_metadata"]["msg_cd"] == "0"
+    engine.dispose()
+
+
+def test_successful_absent_reconciliation_keeps_order_open_before_threshold() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        stale_broker_order_reconciliation_threshold_seconds=3600,
+    )
+    engine, db = _session(settings)
+    submitted_at = OBSERVED_AT - timedelta(minutes=30)
+    order = _order(status="open", broker_order_id="recent-absent-1")
+    order.submitted_at = submitted_at
+    db.add(order)
+    db.commit()
+    broker = ReconciliationStubBroker(
+        reconcile_payloads=[
+            {
+                "broker_order_id": order.broker_order_id,
+                "status": "unknown",
+                "broker_status": "unknown",
+                "message": "matching order was not found in broker order query",
+                "observed_at": OBSERVED_AT.isoformat(),
+                "response_metadata": {"status_code": 200, "msg_cd": "0"},
+            }
+        ]
+    )
+
+    result = reconcile_broker_order(settings=settings, db=db, adapter=broker, order=order)
+
+    assert result["status"] == "unknown"
+    assert result["status_changed"] is False
+    assert order.status == "open"
+    assert db.scalar(
+        select(BrokerOrderEvent).where(BrokerOrderEvent.event_type == "stale_order_repair")
+    ) is None
+    engine.dispose()
+
+
 def test_reconcile_stale_submitted_kier_lookup_window_response_repairs_to_window_expired() -> None:
     settings = Settings(
         database_url="sqlite:///:memory:",

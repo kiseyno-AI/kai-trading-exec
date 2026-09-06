@@ -232,7 +232,7 @@ Current response includes:
 
 ## Persistence boundary
 
-The initial migration creates the exec-owned runtime tables only:
+The runtime migrations create exec-owned runtime tables only:
 - `runtime_control_state`
 - `runtime_control_events`
 - `broker_sessions`
@@ -243,6 +243,7 @@ The initial migration creates the exec-owned runtime tables only:
 - `broker_orders`
 - `broker_order_events`
 - `execution_fills`
+- `fifo_inventory_isolations`
 - `execution_positions`
 - `monitoring_checkpoints`
 
@@ -566,6 +567,51 @@ broker code, classification, and reason. Repaired non-actionable statuses are:
   configured threshold
 - `manual_review_required`: local retry-pending rows that are missing
   `broker_order_id` and cannot be safely retried automatically
+
+Normal KIS reconciliation also handles a successful lookup that returns no
+matching row for a prior-session order. Once the order's original submission
+age exceeds `KAI_EXEC_STALE_BROKER_ORDER_RECONCILIATION_THRESHOLD_SECONDS`, the
+order moves to `stale_terminal_unknown`. The `stale_order_repair` event records
+the before/after status, broker result/code, and reason. This is a terminal
+attention state only: reconciliation does not infer a fill or realized P/L.
+
+### FIFO residual isolation repair
+
+Operators can inspect local FIFO residuals contradicted by a broker-reconciled
+flat position without mutating state:
+
+```bash
+python3 scripts/repair_execution_fill_evidence.py \
+  --runtime-mode live \
+  --scope fifo-residuals
+```
+
+Each dry-run row includes `symbol`, `residual_quantity`, `last_local_fill`, and
+`broker_reconciliation_timestamp`, plus an eligibility decision. Apply only
+after reviewing the report:
+
+```bash
+python3 scripts/repair_execution_fill_evidence.py \
+  --runtime-mode live \
+  --scope fifo-residuals \
+  --apply \
+  --actor operator@example.com \
+  --reason 'verified weekly broker-flat drift repair'
+```
+
+Apply creates a durable `fifo_inventory_isolations` audit row only when the
+flat reconciliation timestamp is strictly newer than the symbol's last local
+fill. It does not delete or fabricate fills and does not create P/L. FIFO
+readers clear only lots at or before the verified-flat boundary, so buys after
+that boundary remain valid inventory. If a repurchase is newer than the flat
+evidence, the recency gate blocks isolation until newer broker truth is
+available.
+
+`active_broker_order_summary.actionable_order_count`,
+`actionable_status_counts`, and the compatibility field
+`nonterminal_status_counts` use the same status, freshness, and trust filters as
+`GET /runtime/status`'s `counts.open_orders`. Historical stale nonterminal rows
+remain visible in `stale_nonterminal_samples`.
 
 Rejected KIS orders from reconciliation now receive an explicit retry decision
 before they become terminal. The current integrated source is KIS
