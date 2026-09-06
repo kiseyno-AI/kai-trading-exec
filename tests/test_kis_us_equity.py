@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -32,7 +32,7 @@ from app.broker.kis import (
 from app.core.config import Settings
 from app.db.base import Base
 from app.db.session import create_db_engine, create_session_factory
-from app.models.runtime import BrokerOrder
+from app.models.runtime import BrokerOrder, ExecutionFill
 from app.services import broker_orders as broker_orders_module
 from app.services.account_drawdown_gate import evaluate_us_equity_account_gate
 from app.services.broker_orders import (
@@ -472,6 +472,96 @@ def test_kis_us_equity_account_gate_reserves_open_buy_notional() -> None:
     assert decision.gate_name == "us_total_exposure_usd"
     assert decision.payload["metrics"]["open_buy_notional_usd"] == "600.0000"
     assert decision.payload["metrics"]["projected_exposure_usd"] == "1200.0000"
+    db.close()
+    engine.dispose()
+
+
+def test_kis_us_equity_account_gate_dedupes_realized_loss_fills_before_buy_gating() -> None:
+    settings = _settings(
+        database_url="sqlite:///:memory:",
+        kis_us_daily_realized_loss_limit_usd=Decimal("100"),
+        kis_us_weekly_realized_loss_limit_usd=Decimal("100"),
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    db = create_session_factory(engine)()
+    observed_at = datetime(2026, 8, 19, 14, 0, tzinfo=UTC)
+    buy_order = BrokerOrder(
+        broker_name="kis",
+        mode="paper",
+        idempotency_key="us-deduped-loss-buy-order",
+        broker_order_id="us-deduped-loss-buy-order",
+        asset_class="us_equity",
+        symbol="AAPL",
+        side="buy",
+        status="filled",
+        quantity=2,
+    )
+    sell_order = BrokerOrder(
+        broker_name="kis",
+        mode="paper",
+        idempotency_key="us-deduped-loss-sell-order",
+        broker_order_id="us-deduped-loss-sell-order",
+        asset_class="us_equity",
+        symbol="AAPL",
+        side="sell",
+        status="filled",
+        quantity=1,
+    )
+    db.add_all([buy_order, sell_order])
+    db.flush()
+    db.add_all(
+        [
+            ExecutionFill(
+                broker_order_pk=buy_order.id,
+                broker_fill_id="us-deduped-loss-buy-fill",
+                symbol="AAPL",
+                side="buy",
+                quantity=2,
+                price=Decimal("100"),
+                filled_at=observed_at - timedelta(hours=1),
+            ),
+            ExecutionFill(
+                id="a-us-deduped-loss-sell-fill",
+                broker_order_pk=sell_order.id,
+                broker_fill_id="us-duplicate-sell-identity",
+                symbol="AAPL",
+                side="sell",
+                quantity=1,
+                price=Decimal("40"),
+                filled_at=observed_at,
+            ),
+            ExecutionFill(
+                id="b-us-deduped-loss-sell-fill",
+                broker_order_pk=sell_order.id,
+                broker_fill_id="us-duplicate-sell-identity",
+                symbol="AAPL",
+                side="sell",
+                quantity=1,
+                price=Decimal("40"),
+                filled_at=observed_at,
+            ),
+        ]
+    )
+    db.commit()
+
+    decision = evaluate_us_equity_account_gate(
+        settings=settings,
+        db=db,
+        snapshot=BrokerAccountSnapshot(
+            observed_at=observed_at,
+            source="test",
+        ),
+        order_notional=Decimal("100"),
+        order_idempotency_key="us-deduped-loss-next-buy",
+        execution_plan_item_id="us-deduped-loss-item",
+        now=observed_at,
+    )
+
+    assert decision.payload["metrics"]["daily_realized_pnl_usd"] == "-60.0000"
+    assert decision.payload["metrics"]["weekly_realized_pnl_usd"] == "-60.0000"
+    assert decision.allowed is True
+    assert decision.gate_name is None
     db.close()
     engine.dispose()
 

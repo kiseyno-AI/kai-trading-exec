@@ -5,8 +5,10 @@ from decimal import Decimal
 
 from fastapi.testclient import TestClient
 import pytest
+from pydantic import ValidationError
 from sqlalchemy import select
 
+from app.api.schemas.execution import StaleBrokerOrderReconciliationRequest
 from app.broker.base import (
     BrokerAccountHolding,
     BrokerAccountSnapshot,
@@ -1542,6 +1544,49 @@ def test_reconcile_stale_orders_dry_run_summarizes_repairs_without_mutating() ->
     assert result["items"][0]["status_after"] == "manual_review_required"
     assert broker.reconcile_calls == []
     assert events == []
+    engine.dispose()
+
+
+@pytest.mark.parametrize("field", ["actor", "reason"])
+def test_stale_reconciliation_schema_strips_and_rejects_whitespace_audit_fields(
+    field: str,
+) -> None:
+    with pytest.raises(ValidationError, match="field must not be empty"):
+        StaleBrokerOrderReconciliationRequest.model_validate({field: "   "})
+
+    command = StaleBrokerOrderReconciliationRequest.model_validate(
+        {"actor": "  operator  ", "reason": "  reconcile broker truth  "}
+    )
+
+    assert command.actor == "operator"
+    assert command.reason == "reconcile broker truth"
+
+
+@pytest.mark.parametrize("field", ["actor", "reason"])
+def test_reconcile_stale_orders_api_rejects_whitespace_audit_fields(field: str) -> None:
+    settings = Settings(database_url="sqlite:///:memory:", runtime_mode="paper")
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    app = create_app(
+        settings=settings,
+        engine=engine,
+        session_factory=session_factory,
+        broker_adapter_factory=lambda _settings: ReconciliationStubBroker(),
+    )
+    client = TestClient(app)
+    payload = {
+        "actor": "operator",
+        "reason": "reconcile broker truth",
+        field: "   ",
+    }
+
+    response = client.post("/orders/reconcile-stale", json=payload)
+
+    assert response.status_code == 422
+    error = response.json()["detail"][0]
+    assert error["loc"] == ["body", field]
+    assert error["type"] == "value_error"
     engine.dispose()
 
 

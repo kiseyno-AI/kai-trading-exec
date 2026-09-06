@@ -18,6 +18,7 @@ from app.models.runtime import (
     ExecutionPlanItem,
     ExecutionPlanItemAudit,
 )
+from app.services.fill_idempotency import dedupe_execution_fills
 from app.services.fifo_inventory import load_fifo_isolation_cursor
 
 
@@ -318,17 +319,19 @@ def _us_realized_pnl(*, settings: Settings, db: Session, now: datetime) -> tuple
         time.min,
         tzinfo=US_EASTERN,
     ).astimezone(UTC)
-    fills = db.scalars(
-        select(ExecutionFill)
-        .join(BrokerOrder)
-        .where(
-            BrokerOrder.mode == settings.runtime_mode,
-            BrokerOrder.broker_name == "kis",
-            BrokerOrder.asset_class == "us_equity",
-            ExecutionFill.filled_at <= now,
-        )
-        .order_by(ExecutionFill.filled_at.asc(), ExecutionFill.id.asc())
-    ).all()
+    fills = dedupe_execution_fills(
+        db.scalars(
+            select(ExecutionFill)
+            .join(BrokerOrder)
+            .where(
+                BrokerOrder.mode == settings.runtime_mode,
+                BrokerOrder.broker_name == "kis",
+                BrokerOrder.asset_class == "us_equity",
+                ExecutionFill.filled_at <= now,
+            )
+            .order_by(ExecutionFill.filled_at.asc(), ExecutionFill.id.asc())
+        ).all()
+    )
     lots: dict[str, list[list[Decimal]]] = {}
     isolation_cursor = load_fifo_isolation_cursor(
         db=db,
