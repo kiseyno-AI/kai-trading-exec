@@ -429,6 +429,18 @@ class StaleBrokerOrderReconciliationRequest(BaseModel):
     older_than_seconds: int | None = Field(default=None, ge=60, le=31536000)
     symbols: list[str] | None = None
     dry_run: bool = False
+    actor: str | None = Field(default=None, min_length=1, max_length=128)
+    reason: str | None = Field(default=None, min_length=1, max_length=2000)
+
+    @field_validator("actor", "reason")
+    @classmethod
+    def normalize_audit_fields(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("field must not be empty")
+        return normalized
 
     @field_validator("symbols")
     @classmethod

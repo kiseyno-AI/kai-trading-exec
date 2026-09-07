@@ -4,7 +4,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import String, and_, case, cast, distinct, func, literal, or_, select
+from sqlalchemy import and_, distinct, func, literal, or_, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -21,8 +21,13 @@ from app.models.runtime import (
     ExecutionPlanItemAudit,
     ExecutionPosition,
     MonitoringCheckpoint,
+    RuntimeRemediationEvent,
 )
-from app.services.fill_idempotency import dedupe_execution_fills
+from app.services.fill_idempotency import (
+    dedupe_execution_fills,
+    duplicate_fill_group_candidate_key,
+    execution_fill_dedupe_key,
+)
 from app.services.fifo_inventory import load_fifo_isolation_cursor
 from app.services.max_holding_actionability import max_holding_actionability_summary
 from app.services.late_entry_actionability import late_entry_actionability_summary
@@ -111,6 +116,23 @@ class RuntimeMetadata:
     @property
     def process_id(self) -> int:
         return os.getpid()
+
+
+@dataclass(frozen=True)
+class DuplicateFillQualityGroup:
+    broker_order_pk: str
+    broker_fill_id: str | None
+    symbol: str
+    side: str
+    quantity: int
+    price: Decimal
+    filled_at: datetime
+    duplicate_count: int
+    quantity_variants: int
+    base_quantity_variants: int
+    quote_notional_variants: int
+    price_variants: int
+    candidate_key: str
 
 
 def liveness_payload(runtime: RuntimeMetadata) -> dict[str, object]:
@@ -349,79 +371,90 @@ def broker_order_fill_quality_payload(
         .group_by(BrokerOrder.id)
         .having(func.count(ExecutionFill.id) == 0)
     )
+    missing_fill_subquery = missing_fill_query.subquery()
     missing_fill_count = int(
-        db.scalar(select(func.count()).select_from(missing_fill_query.subquery())) or 0
+        db.scalar(select(func.count()).select_from(missing_fill_subquery)) or 0
     )
     missing_fill_rows = db.execute(
         missing_fill_query
         .order_by(BrokerOrder.submitted_at.desc(), BrokerOrder.created_at.desc())
         .limit(MAX_STATUS_DETAIL_ITEMS)
     ).all()
-    missing_fill_items = [
-        {
+    missing_order_rows = db.execute(
+        select(missing_fill_subquery.c.id, missing_fill_subquery.c.symbol)
+    ).all()
+    missing_order_symbols = {
+        str(order_id): str(symbol)
+        for order_id, symbol in missing_order_rows
+    }
+    missing_order_ids = list(missing_order_symbols)
+    missing_reviews = db.scalars(
+        select(RuntimeRemediationEvent).where(
+            RuntimeRemediationEvent.mode == settings.runtime_mode,
+            RuntimeRemediationEvent.candidate_type == "missing_execution_fill",
+            RuntimeRemediationEvent.outcome == "manual_review_required",
+            RuntimeRemediationEvent.subject_id.in_(missing_order_ids or [""]),
+        )
+    ).all()
+    missing_review_by_subject = {str(review.subject_id): review for review in missing_reviews}
+    missing_fill_items = []
+    for row in missing_fill_rows[:MAX_STATUS_DETAIL_ITEMS]:
+        review = missing_review_by_subject.get(str(row.id))
+        missing_fill_items.append({
             "broker_order_pk": row.id,
             "symbol": row.symbol,
             "side": row.side,
             "quantity": row.quantity,
             "submitted_at": _serialize_datetime(row.submitted_at),
             "idempotency_key": row.idempotency_key,
-        }
-        for row in missing_fill_rows[:MAX_STATUS_DETAIL_ITEMS]
-    ]
+            "review_outcome": review.outcome if review is not None else None,
+            "review_actor": review.actor if review is not None else None,
+            "review_reason": review.reason if review is not None else None,
+            "reviewed_at": _serialize_datetime(review.occurred_at) if review is not None else None,
+        })
+    missing_manual_review_count = sum(
+        1 for order_id in missing_order_ids if order_id in missing_review_by_subject
+    )
+    missing_unreviewed_symbols = sorted({
+        symbol
+        for order_id, symbol in missing_order_symbols.items()
+        if order_id not in missing_review_by_subject
+    })
+    missing_manual_review_symbols = sorted({
+        symbol
+        for order_id, symbol in missing_order_symbols.items()
+        if order_id in missing_review_by_subject
+    })
 
-    duplicate_fill_identity = case(
-        (
-            ExecutionFill.broker_fill_id.is_not(None),
-            literal("broker:")
-            + ExecutionFill.broker_order_pk
-            + literal(":")
-            + ExecutionFill.broker_fill_id,
-        ),
-        else_=(
-            literal("fallback:")
-            + ExecutionFill.broker_order_pk
-            + literal(":")
-            + func.upper(ExecutionFill.symbol)
-            + literal(":")
-            + func.lower(ExecutionFill.side)
-            + literal(":")
-            + cast(ExecutionFill.filled_at, String)
-            + literal(":")
-            + cast(ExecutionFill.price, String)
-            + literal(":")
-            + cast(ExecutionFill.quantity, String)
-        ),
-    ).label("duplicate_fill_identity")
-    duplicate_fill_first_filled_at = func.min(ExecutionFill.filled_at).label("filled_at")
-    duplicate_fill_query = (
-        select(
-            ExecutionFill.broker_order_pk,
-            func.max(ExecutionFill.broker_fill_id).label("broker_fill_id"),
-            func.min(ExecutionFill.symbol).label("symbol"),
-            func.min(ExecutionFill.side).label("side"),
-            func.min(ExecutionFill.quantity).label("quantity"),
-            func.min(ExecutionFill.price).label("price"),
-            duplicate_fill_first_filled_at,
-            func.count(ExecutionFill.id).label("duplicate_count"),
-        )
-        .join(ExecutionFill.broker_order)
-        .where(BrokerOrder.mode == settings.runtime_mode)
-        .group_by(
-            ExecutionFill.broker_order_pk,
-            duplicate_fill_identity,
-        )
-        .having(func.count(ExecutionFill.id) > 1)
+    duplicate_fill_groups = _duplicate_fill_quality_groups(
+        db=db,
+        runtime_mode=settings.runtime_mode,
     )
-    duplicate_fill_count = int(
-        db.scalar(select(func.count()).select_from(duplicate_fill_query.subquery())) or 0
-    )
-    duplicate_fill_rows = db.execute(
-        duplicate_fill_query
-        .order_by(duplicate_fill_first_filled_at.desc())
-        .limit(MAX_STATUS_DETAIL_ITEMS)
+    duplicate_fill_count = len(duplicate_fill_groups)
+    duplicate_fill_rows = duplicate_fill_groups[:MAX_STATUS_DETAIL_ITEMS]
+    duplicate_candidate_keys = [row.candidate_key for row in duplicate_fill_rows]
+    duplicate_reviews = db.scalars(
+        select(RuntimeRemediationEvent).where(
+            RuntimeRemediationEvent.mode == settings.runtime_mode,
+            RuntimeRemediationEvent.candidate_type == "duplicate_fill_group",
+            RuntimeRemediationEvent.outcome.in_(
+                ["manual_review_required", "non_destructive_isolation"]
+            ),
+            RuntimeRemediationEvent.candidate_key.in_(duplicate_candidate_keys or [""]),
+        )
     ).all()
-    duplicate_fill_items = [
-        {
+    duplicate_review_by_key: dict[str, RuntimeRemediationEvent] = {}
+    for review in duplicate_reviews:
+        candidate_key = str(review.candidate_key)
+        if (
+            candidate_key not in duplicate_review_by_key
+            or review.occurred_at > duplicate_review_by_key[candidate_key].occurred_at
+        ):
+            duplicate_review_by_key[candidate_key] = review
+    duplicate_fill_items = []
+    for row in duplicate_fill_rows[:MAX_STATUS_DETAIL_ITEMS]:
+        review = duplicate_review_by_key.get(row.candidate_key)
+        duplicate_fill_items.append({
             "broker_order_pk": row.broker_order_pk,
             "symbol": row.symbol,
             "side": row.side,
@@ -430,18 +463,111 @@ def broker_order_fill_quality_payload(
             "filled_at": _serialize_datetime(row.filled_at),
             "broker_fill_id": row.broker_fill_id,
             "duplicate_count": int(row.duplicate_count),
-        }
-        for row in duplicate_fill_rows[:MAX_STATUS_DETAIL_ITEMS]
-    ]
+            "economic_conflict": (
+                int(row.quantity_variants or 0) > 1
+                or int(row.base_quantity_variants or 0) > 1
+                or int(row.quote_notional_variants or 0) > 1
+                or int(row.price_variants or 0) > 1
+            ),
+            "conflicting_fields": [
+                field
+                for field, count in (
+                    ("quantity", row.quantity_variants),
+                    ("base_quantity", row.base_quantity_variants),
+                    ("quote_notional", row.quote_notional_variants),
+                    ("price", row.price_variants),
+                )
+                if int(count or 0) > 1
+            ],
+            "review_outcome": review.outcome if review is not None else None,
+            "review_actor": review.actor if review is not None else None,
+            "review_reason": review.reason if review is not None else None,
+        })
 
     return {
         "missing_filled_order_fill_count": missing_fill_count,
+        "missing_filled_order_fill_unreviewed_count": missing_fill_count - missing_manual_review_count,
+        "missing_filled_order_fill_manual_review_count": missing_manual_review_count,
+        "missing_filled_order_fill_unreviewed_symbols": missing_unreviewed_symbols,
+        "missing_filled_order_fill_manual_review_symbols": missing_manual_review_symbols,
         "missing_filled_order_fill_items": missing_fill_items,
         "missing_filled_order_fill_truncated": missing_fill_count > len(missing_fill_items),
         "duplicate_fill_group_count": duplicate_fill_count,
         "duplicate_fill_groups": duplicate_fill_items,
         "duplicate_fill_groups_truncated": duplicate_fill_count > len(duplicate_fill_items),
     }
+
+
+def _duplicate_fill_quality_groups(
+    *,
+    db: Session,
+    runtime_mode: str,
+) -> list[DuplicateFillQualityGroup]:
+    fills = db.scalars(
+        select(ExecutionFill)
+        .join(ExecutionFill.broker_order)
+        .where(BrokerOrder.mode == runtime_mode)
+        .order_by(
+            ExecutionFill.broker_order_pk.asc(),
+            ExecutionFill.filled_at.asc(),
+            ExecutionFill.id.asc(),
+        )
+    ).all()
+    grouped: dict[str, list[ExecutionFill]] = {}
+    for fill in fills:
+        grouped.setdefault(execution_fill_dedupe_key(fill), []).append(fill)
+
+    duplicate_groups: list[DuplicateFillQualityGroup] = []
+    for group_key, group in grouped.items():
+        if len(group) <= 1:
+            continue
+        retained = group[0]
+        duplicate_groups.append(
+            DuplicateFillQualityGroup(
+                broker_order_pk=str(retained.broker_order_pk),
+                broker_fill_id=retained.broker_fill_id,
+                symbol=retained.symbol,
+                side=retained.side,
+                quantity=retained.quantity,
+                price=Decimal(retained.price),
+                filled_at=retained.filled_at,
+                duplicate_count=len(group),
+                quantity_variants=len({int(fill.quantity) for fill in group}),
+                base_quantity_variants=len(
+                    {
+                        _decimal_text(Decimal(fill.base_quantity))
+                        if fill.base_quantity is not None
+                        else None
+                        for fill in group
+                    }
+                ),
+                quote_notional_variants=len(
+                    {
+                        _decimal_text(Decimal(fill.quote_notional))
+                        if fill.quote_notional is not None
+                        else None
+                        for fill in group
+                    }
+                ),
+                price_variants=len({_decimal_text(Decimal(fill.price)) for fill in group}),
+                candidate_key=_duplicate_fill_candidate_key(
+                    group_key=group_key,
+                    fills=group,
+                ),
+            )
+        )
+    return sorted(
+        duplicate_groups,
+        key=lambda group: group.filled_at,
+        reverse=True,
+    )
+
+
+def _duplicate_fill_candidate_key(*, group_key: str, fills: list[ExecutionFill]) -> str:
+    return duplicate_fill_group_candidate_key(
+        group_key=group_key,
+        fill_ids=[str(fill.id) for fill in fills if fill.id is not None],
+    )
 
 
 def position_truth_freshness_payload(
@@ -600,21 +726,61 @@ def runtime_actionable_alerts_payload(
         else None
     )
     if isinstance(fill_quality, dict):
-        missing_fill_count = int(fill_quality.get("missing_filled_order_fill_count") or 0)
+        missing_fill_count = int(
+            fill_quality.get("missing_filled_order_fill_unreviewed_count")
+            if "missing_filled_order_fill_unreviewed_count" in fill_quality
+            else fill_quality.get("missing_filled_order_fill_count") or 0
+        )
         if missing_fill_count > 0:
+            if "missing_filled_order_fill_unreviewed_symbols" in fill_quality:
+                missing_fill_symbols = (
+                    fill_quality.get("missing_filled_order_fill_unreviewed_symbols") or []
+                )
+            else:
+                missing_fill_symbols = sorted({
+                    str(item.get("symbol"))
+                    for item in fill_quality.get("missing_filled_order_fill_items") or []
+                    if isinstance(item, dict)
+                    and item.get("symbol")
+                    and item.get("review_outcome") != "manual_review_required"
+                })
             alerts.append(
                 {
                     "kind": "filled_broker_orders_missing_execution_fills",
                     "severity": "critical",
                     "count": missing_fill_count,
-                    "symbols": sorted({
-                        str(item.get("symbol"))
-                        for item in fill_quality.get("missing_filled_order_fill_items") or []
-                        if isinstance(item, dict) and item.get("symbol")
-                    }),
+                    "symbols": missing_fill_symbols,
                     "message": (
                         "filled broker orders are missing execution_fills rows, "
                         "so FIFO realized P/L is incomplete"
+                    ),
+                }
+            )
+        manual_review_fill_count = int(
+            fill_quality.get("missing_filled_order_fill_manual_review_count") or 0
+        )
+        if manual_review_fill_count > 0:
+            if "missing_filled_order_fill_manual_review_symbols" in fill_quality:
+                manual_review_fill_symbols = (
+                    fill_quality.get("missing_filled_order_fill_manual_review_symbols") or []
+                )
+            else:
+                manual_review_fill_symbols = sorted({
+                    str(item.get("symbol"))
+                    for item in fill_quality.get("missing_filled_order_fill_items") or []
+                    if isinstance(item, dict)
+                    and item.get("symbol")
+                    and item.get("review_outcome") == "manual_review_required"
+                })
+            alerts.append(
+                {
+                    "kind": "filled_broker_orders_missing_fills_manual_review",
+                    "severity": "critical",
+                    "count": manual_review_fill_count,
+                    "symbols": manual_review_fill_symbols,
+                    "message": (
+                        "missing execution_fills lack authoritative broker evidence and "
+                        "have durable manual-review blockers"
                     ),
                 }
             )

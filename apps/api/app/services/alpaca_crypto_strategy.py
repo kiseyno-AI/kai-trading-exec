@@ -27,6 +27,7 @@ from app.services.crypto_trend_strategy import (
     allocate_inverse_volatility,
     evaluate_symbol,
 )
+from app.services.fill_idempotency import dedupe_execution_fills
 
 
 PROVIDER = "alpaca"
@@ -660,7 +661,7 @@ def _refresh_strategy_owned_quantities(
             direction = Decimal("0")
         if direction == 0:
             continue
-        for fill in order.fills:
+        for fill in dedupe_execution_fills(order.fills):
             base_quantity = Decimal(fill.base_quantity or 0)
             if base_quantity <= 0:
                 continue

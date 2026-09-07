@@ -449,7 +449,30 @@ python3 scripts/repair_execution_fill_evidence.py \
 The apply form requires `--actor` and `--reason`. It records a durable FIFO
 isolation boundary only when the broker-flat reconciliation is newer than the
 last local fill. Original fills remain unchanged, and repurchases after the
-flat boundary remain available to FIFO cost-basis calculations.
+flat boundary remain available to FIFO cost-basis calculations. Ineligible
+recency candidates remain unchanged and receive a durable manual-review event.
+
+Fill-evidence apply is also non-destructive. Missing fills are inserted only
+when persisted broker-origin evidence exactly matches the order symbol, side,
+and filled quantity. Otherwise a durable `runtime_remediation_events`
+manual-review record is written. Duplicate rows are never deleted; the same
+table records their deterministic dedupe identity and retained/duplicate row
+IDs while application FIFO readers continue to ignore repeated identities.
+Live mode requires an explicit `--database-url` even when the environment has a
+database URL.
+
+Stale position truth can be reviewed and refreshed through account inquiry only:
+
+```bash
+python3 scripts/refresh_execution_position_truth.py \
+  --database-url "$KAI_EXEC_DATABASE_URL" \
+  --runtime-mode live
+```
+
+Apply requires `--actor` and `--reason`. Supported KRX/NASD/NYSE/AMEX routes
+use broker account-snapshot reads and update `execution_positions`; unknown or
+unsupported routes receive durable manual-review events. This command imports
+no order placement service and never places, amends, or cancels orders.
 
 Default short-term sizing is tuned for higher-conviction filtered candidates:
 per-symbol budget `3,000,000` KRW, total exec-agent budget `9,000,000` KRW,

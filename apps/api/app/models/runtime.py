@@ -457,6 +457,40 @@ class ExecutionFill(TimestampMixin, Base):
     broker_order: Mapped[BrokerOrder] = relationship(back_populates="fills")
 
 
+class RuntimeRemediationEvent(TimestampMixin, Base):
+    __tablename__ = "runtime_remediation_events"
+    __table_args__ = (
+        UniqueConstraint(
+            "mode",
+            "candidate_type",
+            "candidate_key",
+            "outcome",
+            name="uq_runtime_remediation_events_candidate_outcome",
+        ),
+        Index(
+            "ix_runtime_remediation_events_mode_type_occurred",
+            "mode",
+            "candidate_type",
+            "occurred_at",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    mode: Mapped[str] = mapped_column(String(16), nullable=False)
+    candidate_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    candidate_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    subject_id: Mapped[str | None] = mapped_column(String(128), index=True)
+    outcome: Mapped[str] = mapped_column(String(64), nullable=False)
+    actor: Mapped[str] = mapped_column(String(128), nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False, deferred=True)
+    evidence_summary: Mapped[dict[str, Any] | None] = mapped_column(JSON, deferred=True)
+    occurred_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+
+
 class FifoInventoryIsolation(TimestampMixin, Base):
     __tablename__ = "fifo_inventory_isolations"
     __table_args__ = (

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -26,9 +27,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
             "Dry-run or apply operator-triggered repairs for missing/duplicate fill "
-            "evidence or broker-flat FIFO residuals. This script only reads/writes "
-            "local runtime database tables; it does not call broker APIs or "
-            "place/cancel/alter orders."
+            "evidence or broker-flat FIFO residuals. Duplicate and ambiguous missing "
+            "fill rows are isolated or marked for review without deletion/fabrication. "
+            "This script only reads/writes local runtime database tables; it does not "
+            "call broker APIs or place/cancel/alter orders."
         ),
     )
     parser.add_argument(
@@ -65,14 +67,19 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    if args.apply and (not args.actor or not args.reason):
+    actor = (args.actor or "").strip()
+    reason = (args.reason or "").strip()
+    if args.apply and (not actor or not reason):
         raise SystemExit("--apply requires --actor and --reason for auditability")
+
+    runtime_mode = args.runtime_mode or os.getenv("KAI_EXEC_RUNTIME_MODE") or "mock"
+    if runtime_mode == "live" and not args.database_url:
+        raise SystemExit("live fill remediation requires --database-url explicitly")
 
     settings_kwargs: dict[str, object] = {}
     if args.database_url:
         settings_kwargs["database_url"] = args.database_url
-    if args.runtime_mode:
-        settings_kwargs["runtime_mode"] = args.runtime_mode
+    settings_kwargs["runtime_mode"] = runtime_mode
     settings = Settings(**settings_kwargs)
 
     engine = create_db_engine(settings)
@@ -83,8 +90,8 @@ def main() -> int:
                 payload = apply_fifo_inventory_repairs(
                     db=db,
                     runtime_mode=settings.runtime_mode,
-                    actor=args.actor or "",
-                    reason=args.reason or "",
+                    actor=actor,
+                    reason=reason,
                 )
             elif args.scope == "fifo-residuals":
                 payload = analyze_fifo_inventory_repairs(
@@ -95,8 +102,8 @@ def main() -> int:
                 payload = apply_execution_fill_repairs(
                     db=db,
                     runtime_mode=settings.runtime_mode,
-                    actor=args.actor or "",
-                    reason=args.reason or "",
+                    actor=actor,
+                    reason=reason,
                 )
             else:
                 payload = analyze_execution_fill_repairs(

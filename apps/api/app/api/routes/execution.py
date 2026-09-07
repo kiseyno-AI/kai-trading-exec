@@ -199,6 +199,11 @@ def reconcile_stale_orders(
 ) -> dict[str, object]:
     settings: Settings = get_settings(request)
     command = payload or StaleBrokerOrderReconciliationRequest()
+    if not command.dry_run and (not command.actor or not command.reason):
+        raise HTTPException(
+            status_code=422,
+            detail="stale reconciliation apply requires actor and reason",
+        )
     return reconcile_stale_nonterminal_broker_orders(
         settings=settings,
         db=db,
@@ -206,6 +211,8 @@ def reconcile_stale_orders(
         older_than_seconds=command.older_than_seconds,
         symbols=set(command.symbols) if command.symbols is not None else None,
         dry_run=command.dry_run,
+        actor=command.actor,
+        operator_reason=command.reason,
     )
 
 

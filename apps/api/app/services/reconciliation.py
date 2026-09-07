@@ -29,7 +29,11 @@ from app.services.broker_order_state import (
     NONTERMINAL_ORDER_STATUSES,
     broker_order_observed_at_expr,
 )
-from app.services.fill_idempotency import execution_fill_dedupe_key, execution_fill_idempotency_key
+from app.services.fill_idempotency import (
+    dedupe_execution_fills,
+    execution_fill_dedupe_key,
+    execution_fill_idempotency_key,
+)
 from app.services.execution_failures import (
     record_actionable_execution_failure,
     resolve_execution_failure_for_order,
@@ -74,6 +78,8 @@ def reconcile_broker_order(
     db: Session,
     adapter: BrokerAdapter,
     order: BrokerOrder,
+    actor: str | None = None,
+    operator_reason: str | None = None,
 ) -> dict[str, object]:
     order_status_before = order.status
     event_time = _observation_time()
@@ -115,6 +121,8 @@ def reconcile_broker_order(
             event_time=event_time,
             db=db,
             order_status_before=order_status_before,
+            actor=actor,
+            operator_reason=operator_reason,
         )
 
     event_time = _parse_timestamp(payload.get("observed_at"), fallback=event_time)
@@ -207,6 +215,8 @@ def reconcile_broker_order(
                     "response_metadata": payload.get("response_metadata"),
                     "payload": payload.get("payload"),
                 },
+                actor=actor,
+                operator_reason=operator_reason,
             )
         db.commit()
         db.refresh(order)
@@ -241,6 +251,9 @@ def reconcile_broker_order(
     reconcile_event_payload = _build_reconcile_event_payload(payload=payload, adapter=adapter)
     if fill_delta_anomalies:
         reconcile_event_payload["fill_delta_anomalies"] = _json_safe_value(fill_delta_anomalies)
+    if actor is not None or operator_reason is not None:
+        reconcile_event_payload["actor"] = actor
+        reconcile_event_payload["operator_reason"] = operator_reason
 
     db.add(
         BrokerOrderEvent(
@@ -359,6 +372,8 @@ def reconcile_stale_nonterminal_broker_orders(
     older_than_seconds: int | None = None,
     symbols: set[str] | None = None,
     dry_run: bool = False,
+    actor: str | None = None,
+    operator_reason: str | None = None,
 ) -> dict[str, object]:
     threshold_seconds = (
         older_than_seconds
@@ -412,6 +427,8 @@ def reconcile_stale_nonterminal_broker_orders(
                     db=db,
                     adapter=adapter,
                     order=order,
+                    actor=actor,
+                    operator_reason=operator_reason,
                 )
             classification, reason = _stale_order_reconciliation_classification(
                 status=str(result.get("status") or order.status),
@@ -469,6 +486,8 @@ def reconcile_stale_nonterminal_broker_orders(
                     observed_broker_code=repair["observed_broker_code"],
                     observed_at=classification_observed_at,
                     result=result,
+                    actor=actor,
+                    operator_reason=operator_reason,
                 )
                 if repair["status_after"] == NormalizedBrokerOrderStatus.RECONCILE_WINDOW_EXPIRED.value:
                     resolve_execution_failure_for_order(
@@ -506,6 +525,8 @@ def reconcile_stale_nonterminal_broker_orders(
                 observed_broker_code=order.last_error_code,
                 observed_at=classification_observed_at,
                 result=result,
+                actor=actor,
+                operator_reason=operator_reason,
             )
 
         if not dry_run:
@@ -516,6 +537,8 @@ def reconcile_stale_nonterminal_broker_orders(
                 reason=reason,
                 observed_at=_observation_time(),
                 result=result,
+                actor=actor,
+                operator_reason=operator_reason,
             )
         counts[classification] += 1
         items.append(
@@ -932,6 +955,8 @@ def _record_stale_order_repair_event(
     observed_broker_code: str | None,
     observed_at: datetime,
     result: dict[str, object] | None,
+    actor: str | None = None,
+    operator_reason: str | None = None,
 ) -> None:
     db.add(
         BrokerOrderEvent(
@@ -952,6 +977,8 @@ def _record_stale_order_repair_event(
                 "broker_order_id": order.broker_order_id,
                 "idempotency_key": order.idempotency_key,
                 "result": _json_safe_value(result) if result is not None else None,
+                "actor": actor,
+                "operator_reason": operator_reason,
             },
             observed_at=observed_at,
         )
@@ -966,6 +993,8 @@ def _record_stale_order_classification_event(
     reason: str | None,
     observed_at: datetime,
     result: dict[str, object] | None,
+    actor: str | None = None,
+    operator_reason: str | None = None,
 ) -> None:
     db.add(
         BrokerOrderEvent(
@@ -985,6 +1014,8 @@ def _record_stale_order_classification_event(
                 "idempotency_key": order.idempotency_key,
                 "last_broker_sync_at": _serialize_datetime(order.last_broker_sync_at),
                 "result": _json_safe_value(result) if result is not None else None,
+                "actor": actor,
+                "operator_reason": operator_reason,
             },
             observed_at=observed_at,
         )
@@ -1025,23 +1056,33 @@ def sync_execution_positions_from_broker_snapshot(
     symbols: set[str] | None = None,
     exchange: str = "KRX",
     discover_holdings_only: bool = False,
+    commit: bool = True,
+    authenticated_access_token: str | None = None,
 ) -> dict[str, int]:
     normalized_symbols = _normalize_symbols(symbols)
-    session_state = ensure_authenticated_broker_session(
-        settings=settings,
-        db=db,
-        adapter=adapter,
-        source="reconciliation",
-        reason="refresh execution positions from broker snapshot",
-    )
+    if authenticated_access_token is None:
+        if not commit:
+            raise ValueError(
+                "commit=False position sync requires independently persisted authentication"
+            )
+        session_state = ensure_authenticated_broker_session(
+            settings=settings,
+            db=db,
+            adapter=adapter,
+            source="reconciliation",
+            reason="refresh execution positions from broker snapshot",
+        )
+        access_token = session_state.access_token or ""
+    else:
+        access_token = authenticated_access_token
     try:
         snapshot = adapter.get_account_snapshot(
-            session_state.access_token or "",
+            access_token,
             symbols=sorted(normalized_symbols) if normalized_symbols is not None else None,
             exchange=exchange,
         )
     except TypeError:
-        snapshot = adapter.get_account_snapshot(session_state.access_token or "")
+        snapshot = adapter.get_account_snapshot(access_token)
     if discover_holdings_only:
         if normalized_symbols is not None:
             raise ValueError("holdings-only discovery requires symbols=None")
@@ -1173,7 +1214,8 @@ def sync_execution_positions_from_broker_snapshot(
         if changed:
             updated += 1
 
-    db.commit()
+    if commit:
+        db.commit()
     return {
         "tracked_symbol_count": len(tracked_symbols),
         "created": created,
@@ -1273,6 +1315,8 @@ def _reconcile_adapter_error(
     event_time: datetime,
     db: Session,
     order_status_before: str,
+    actor: str | None = None,
+    operator_reason: str | None = None,
 ) -> dict[str, object]:
     if isinstance(exc, BrokerAdapterError):
         message = str(exc)
@@ -1305,6 +1349,24 @@ def _reconcile_adapter_error(
             error_classification=exc.classification.value,
             observed_at=order.last_broker_sync_at,
         ):
+            event_payload = _build_reconcile_event_payload(
+                payload={
+                    "provider": adapter.provider,
+                    "broker_order_id": requested_broker_order_id,
+                    "status": None,
+                    "broker_status": exc.code,
+                    "observed_at": _serialize_datetime(order.last_broker_sync_at),
+                    "message": message,
+                    "request_metadata": exc.request_metadata,
+                    "response_metadata": exc.response_metadata,
+                    "request_payload": exc.request_payload,
+                    "payload": exc.response_payload,
+                },
+                adapter=adapter,
+            )
+            if actor is not None or operator_reason is not None:
+                event_payload["actor"] = actor
+                event_payload["operator_reason"] = operator_reason
             db.add(
                 BrokerOrderEvent(
                     broker_order_pk=order.id,
@@ -1317,21 +1379,7 @@ def _reconcile_adapter_error(
                     message=message,
                     request_payload=exc.request_payload,
                     response_payload=exc.response_payload,
-                    payload=_build_reconcile_event_payload(
-                        payload={
-                            "provider": adapter.provider,
-                            "broker_order_id": requested_broker_order_id,
-                            "status": None,
-                            "broker_status": exc.code,
-                            "observed_at": _serialize_datetime(order.last_broker_sync_at),
-                            "message": message,
-                            "request_metadata": exc.request_metadata,
-                            "response_metadata": exc.response_metadata,
-                            "request_payload": exc.request_payload,
-                            "payload": exc.response_payload,
-                        },
-                        adapter=adapter,
-                    ),
+                    payload=event_payload,
                     observed_at=order.last_broker_sync_at,
                 )
             )
@@ -1374,6 +1422,20 @@ def _reconcile_adapter_error(
         error_classification="unknown",
         observed_at=observed_at,
     ):
+        event_payload = _build_reconcile_event_payload(
+            payload={
+                "provider": adapter.provider,
+                "broker_order_id": requested_broker_order_id,
+                "status": None,
+                "broker_status": None,
+                "observed_at": _serialize_datetime(observed_at),
+                "message": message,
+            },
+            adapter=adapter,
+        )
+        if actor is not None or operator_reason is not None:
+            event_payload["actor"] = actor
+            event_payload["operator_reason"] = operator_reason
         db.add(
             BrokerOrderEvent(
                 broker_order_pk=order.id,
@@ -1382,17 +1444,7 @@ def _reconcile_adapter_error(
                 normalized_status=order.status,
                 error_classification="unknown",
                 message=message,
-                payload=_build_reconcile_event_payload(
-                    payload={
-                        "provider": adapter.provider,
-                        "broker_order_id": requested_broker_order_id,
-                        "status": None,
-                        "broker_status": None,
-                        "observed_at": _serialize_datetime(observed_at),
-                        "message": message,
-                    },
-                    adapter=adapter,
-                ),
+                payload=event_payload,
                 observed_at=observed_at,
             )
         )
@@ -1621,11 +1673,12 @@ def _parse_fills_from_payload(
             result.append(parsed_fill)
         return result, []
 
+    existing_fills = dedupe_execution_fills(order.fills)
     total_filled_base = _parse_decimal(payload.get("filled_base_quantity"))
     if total_filled_base is not None and total_filled_base > 0:
         existing_total_base = sum(
             Decimal(fill.base_quantity or 0)
-            for fill in order.fills
+            for fill in existing_fills
         )
         average_fill_price = _parse_decimal(payload.get("average_fill_price"))
         delta_result = _cumulative_fill_delta(
@@ -1634,6 +1687,7 @@ def _parse_fills_from_payload(
             existing_total=existing_total_base,
             average_fill_price=average_fill_price,
             quantity_basis="base_quantity",
+            existing_fills=existing_fills,
         )
         if delta_result["status"] != "ok":
             anomalies = delta_result["anomalies"]
@@ -1666,7 +1720,7 @@ def _parse_fills_from_payload(
     if total_filled is None or total_filled <= 0:
         return [], []
 
-    existing_total = _sum_fill_quantities(order.fills)
+    existing_total = _sum_fill_quantities(existing_fills)
     average_fill_price = _parse_decimal(payload.get("average_fill_price"))
     delta_result = _cumulative_fill_delta(
         order=order,
@@ -1674,6 +1728,7 @@ def _parse_fills_from_payload(
         existing_total=Decimal(existing_total),
         average_fill_price=average_fill_price,
         quantity_basis="quantity",
+        existing_fills=existing_fills,
     )
     if delta_result["status"] != "ok":
         anomalies = delta_result["anomalies"]
@@ -1713,6 +1768,7 @@ def _cumulative_fill_delta(
     existing_total: Decimal,
     average_fill_price: Decimal | None,
     quantity_basis: str,
+    existing_fills: list[ExecutionFill],
 ) -> dict[str, object]:
     if total_filled < existing_total:
         return _cumulative_fill_delta_anomaly(
@@ -1746,7 +1802,7 @@ def _cumulative_fill_delta(
 
     delta = total_filled - existing_total
     previous_cumulative_notional = _sum_existing_fill_notional(
-        fills=order.fills,
+        fills=existing_fills,
         quantity_basis=quantity_basis,
     )
     current_cumulative_notional = total_filled * average_fill_price

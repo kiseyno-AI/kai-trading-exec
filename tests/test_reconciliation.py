@@ -5,8 +5,10 @@ from decimal import Decimal
 
 from fastapi.testclient import TestClient
 import pytest
+from pydantic import ValidationError
 from sqlalchemy import select
 
+from app.api.schemas.execution import StaleBrokerOrderReconciliationRequest
 from app.broker.base import (
     BrokerAccountHolding,
     BrokerAccountSnapshot,
@@ -37,14 +39,24 @@ from app.models.runtime import (
     ExecutionPlanItem,
     ExecutionPlanItemAudit,
     ExecutionPosition,
+    RuntimeRemediationEvent,
 )
+from app.services import reconciliation as reconciliation_service
 from app.services.execution_jobs import dispatch_due_execution_jobs
+from app.services.fill_idempotency import (
+    duplicate_fill_group_candidate_key,
+    execution_fill_dedupe_key,
+)
 from app.services.reconciliation import (
     reconcile_broker_order,
     reconcile_stale_nonterminal_broker_orders,
     sync_execution_positions_from_broker_snapshot,
 )
-from app.services.runtime import RuntimeMetadata, build_runtime_daily_board, build_runtime_status
+from app.services.runtime import (
+    RuntimeMetadata,
+    build_runtime_daily_board,
+    build_runtime_status,
+)
 from app.services.runtime_controls import ControlCommand, resume_runtime
 
 
@@ -702,6 +714,58 @@ def test_reconcile_cumulative_filled_quantity_adds_only_delta() -> None:
     engine.dispose()
 
 
+def test_reconcile_cumulative_share_fill_dedupes_preserved_existing_evidence() -> None:
+    settings = Settings(database_url="sqlite:///:memory:", runtime_mode="paper")
+    engine, db = _session(settings)
+    order = _order(broker_order_id="cumulative-preserved-duplicate-share")
+    db.add(order)
+    db.flush()
+    db.add_all(
+        [
+            ExecutionFill(
+                id=f"{prefix}-preserved-share-fill",
+                broker_order_pk=order.id,
+                broker_fill_id="actual-share-fill-1",
+                symbol=order.symbol,
+                side=order.side,
+                quantity=1,
+                quote_notional=Decimal("70000"),
+                price=Decimal("70000"),
+                filled_at=OBSERVED_AT,
+            )
+            for prefix in ("a", "b")
+        ]
+    )
+    db.commit()
+    broker = ReconciliationStubBroker(
+        reconcile_payloads=[
+            {
+                "broker_order_id": order.broker_order_id,
+                "status": "filled",
+                "filled_quantity": 2,
+                "remaining_quantity": 0,
+                "average_fill_price": "71000",
+                "filled_at": (OBSERVED_AT + timedelta(minutes=1)).isoformat(),
+                "observed_at": (OBSERVED_AT + timedelta(minutes=1)).isoformat(),
+            }
+        ]
+    )
+
+    result = reconcile_broker_order(settings=settings, db=db, adapter=broker, order=order)
+
+    fills = db.scalars(
+        select(ExecutionFill).order_by(ExecutionFill.filled_at.asc(), ExecutionFill.id.asc())
+    ).all()
+    assert result["fills_added"] == 1
+    assert len(fills) == 3
+    assert fills[-1].quantity == 1
+    assert fills[-1].quote_notional == Decimal("72000")
+    assert fills[-1].price == Decimal("72000")
+    assert fills[-1].payload["previous_quantity"] == 1
+    assert fills[-1].payload["previous_quote_notional"] == "70000.0000"
+    engine.dispose()
+
+
 def test_reconcile_cumulative_base_fill_derives_incremental_price_from_notional_delta() -> None:
     settings = Settings(database_url="sqlite:///:memory:", runtime_mode="paper")
     engine, db = _session(settings)
@@ -744,6 +808,59 @@ def test_reconcile_cumulative_base_fill_derives_incremental_price_from_notional_
     assert [fill.price for fill in fills] == [Decimal("100"), Decimal("200")]
     assert fills[1].payload["price_derivation"] == "cumulative_notional_delta"
     assert fills[1].payload["previous_quote_notional"] == "100.0000"
+    engine.dispose()
+
+
+def test_reconcile_cumulative_base_fill_dedupes_preserved_existing_evidence() -> None:
+    settings = Settings(database_url="sqlite:///:memory:", runtime_mode="paper")
+    engine, db = _session(settings)
+    order = _order(broker_order_id="cumulative-preserved-duplicate-base")
+    order.symbol = "BTC/USD"
+    db.add(order)
+    db.flush()
+    db.add_all(
+        [
+            ExecutionFill(
+                id=f"{prefix}-preserved-base-fill",
+                broker_order_pk=order.id,
+                broker_fill_id="actual-base-fill-1",
+                symbol=order.symbol,
+                side=order.side,
+                quantity=0,
+                base_quantity=Decimal("1"),
+                quote_notional=Decimal("100"),
+                price=Decimal("100"),
+                filled_at=OBSERVED_AT,
+            )
+            for prefix in ("a", "b")
+        ]
+    )
+    db.commit()
+    broker = ReconciliationStubBroker(
+        reconcile_payloads=[
+            {
+                "broker_order_id": order.broker_order_id,
+                "status": "filled",
+                "filled_base_quantity": "2",
+                "average_fill_price": "150",
+                "filled_at": (OBSERVED_AT + timedelta(minutes=1)).isoformat(),
+                "observed_at": (OBSERVED_AT + timedelta(minutes=1)).isoformat(),
+            }
+        ]
+    )
+
+    result = reconcile_broker_order(settings=settings, db=db, adapter=broker, order=order)
+
+    fills = db.scalars(
+        select(ExecutionFill).order_by(ExecutionFill.filled_at.asc(), ExecutionFill.id.asc())
+    ).all()
+    assert result["fills_added"] == 1
+    assert len(fills) == 3
+    assert fills[-1].base_quantity == Decimal("1")
+    assert fills[-1].quote_notional == Decimal("200")
+    assert fills[-1].price == Decimal("200")
+    assert fills[-1].payload["previous_base_quantity"] == "1.000000000000"
+    assert fills[-1].payload["previous_quote_notional"] == "100.0000"
     engine.dispose()
 
 
@@ -844,6 +961,82 @@ def test_reconcile_stale_nonterminal_order_marks_closed_against_broker_truth() -
     assert repair is not None
     assert repair.payload["status_before"] == "submitted"
     assert repair.payload["status_after"] == "filled"
+    engine.dispose()
+
+
+def test_reconcile_stale_order_commits_operator_attribution_with_inner_transition(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'stale-reconcile-attribution.db'}",
+        runtime_mode="paper",
+        stale_broker_order_reconciliation_threshold_seconds=3600,
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    db = session_factory()
+    stale_submitted_at = datetime.now(UTC) - timedelta(days=7)
+    order = _order(broker_order_id="stale-filled-attributed-1")
+    order.submitted_at = stale_submitted_at
+    order.last_broker_sync_at = stale_submitted_at
+    db.add(order)
+    db.commit()
+    order_id = order.id
+    broker = ReconciliationStubBroker(
+        reconcile_payloads=[
+            {
+                "broker_order_id": "stale-filled-attributed-1",
+                "status": "filled",
+                "filled_quantity": 2,
+                "remaining_quantity": 0,
+                "average_fill_price": "71000",
+                "observed_at": OBSERVED_AT.isoformat(),
+            }
+        ]
+    )
+
+    def raise_before_outer_commit(**kwargs) -> None:
+        raise RuntimeError("interrupted before outer audit commit")
+
+    monkeypatch.setattr(
+        "app.services.reconciliation._record_stale_order_classification_event",
+        raise_before_outer_commit,
+    )
+
+    with pytest.raises(RuntimeError, match="interrupted before outer audit commit"):
+        reconcile_stale_nonterminal_broker_orders(
+            settings=settings,
+            db=db,
+            adapter=broker,
+            actor="Peter",
+            operator_reason="operator requested read-only broker truth reconciliation",
+        )
+    db.rollback()
+    db.close()
+
+    with session_factory() as verification_db:
+        persisted_order = verification_db.get(BrokerOrder, order_id)
+        reconcile_event = verification_db.scalar(
+            select(BrokerOrderEvent).where(BrokerOrderEvent.event_type == "reconcile_result")
+        )
+        outer_events = verification_db.scalars(
+            select(BrokerOrderEvent).where(
+                BrokerOrderEvent.event_type.in_(
+                    ["stale_order_repair", "stale_order_reconcile_classification"]
+                )
+            )
+        ).all()
+        assert persisted_order is not None
+        assert persisted_order.status == "filled"
+        assert reconcile_event is not None
+        assert reconcile_event.payload["actor"] == "Peter"
+        assert (
+            reconcile_event.payload["operator_reason"]
+            == "operator requested read-only broker truth reconciliation"
+        )
+        assert outer_events == []
     engine.dispose()
 
 
@@ -1037,6 +1230,8 @@ def test_reconcile_stale_submitted_kier_lookup_window_response_repairs_to_window
         settings=settings,
         db=db,
         adapter=broker,
+        actor="Peter",
+        operator_reason="issue #265: reconcile stale order with read-only broker inquiry",
     )
 
     repair = db.scalar(
@@ -1060,6 +1255,8 @@ def test_reconcile_stale_submitted_kier_lookup_window_response_repairs_to_window
     assert repair.payload["observed_broker_code"] == "KIER2570"
     assert repair.payload["classification"] == "reconcile_window_expired"
     assert repair.payload["reason"] == "broker_lookup_window_expired"
+    assert repair.payload["actor"] == "Peter"
+    assert repair.payload["operator_reason"].startswith("issue #265")
     failure = db.scalar(
         select(ExecutionFailure).where(ExecutionFailure.broker_order_pk == order.id)
     )
@@ -1515,8 +1712,13 @@ def test_reconcile_stale_orders_dry_run_summarizes_repairs_without_mutating() ->
     client = TestClient(app)
 
     response = client.post("/orders/reconcile-stale", json={"dry_run": True})
+    unaudited_apply = client.post("/orders/reconcile-stale", json={})
 
     assert response.status_code == 200
+    assert unaudited_apply.status_code == 422
+    assert unaudited_apply.json()["detail"] == (
+        "stale reconciliation apply requires actor and reason"
+    )
     result = response.json()
     with session_factory() as db:
         persisted = db.get(BrokerOrder, order_pk)
@@ -1533,6 +1735,128 @@ def test_reconcile_stale_orders_dry_run_summarizes_repairs_without_mutating() ->
     assert result["items"][0]["status_after"] == "manual_review_required"
     assert broker.reconcile_calls == []
     assert events == []
+    engine.dispose()
+
+
+def test_reconcile_adapter_error_event_keeps_attribution_after_outer_interruption(
+    tmp_path, monkeypatch
+) -> None:
+    database_url = f"sqlite:///{tmp_path / 'reconcile-attribution.db'}"
+    settings = Settings(
+        database_url=database_url,
+        runtime_mode="paper",
+        stale_broker_order_reconciliation_threshold_seconds=3600,
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    stale_submitted_at = datetime.now(UTC) - timedelta(days=5)
+    with session_factory() as db:
+        order = _order(broker_order_id="adapter-error-attribution")
+        order.submitted_at = stale_submitted_at
+        order.last_broker_sync_at = stale_submitted_at
+        db.add(order)
+        db.commit()
+        order_pk = order.id
+
+    class FailingReconcileBroker(ReconciliationStubBroker):
+        def reconcile_order(
+            self,
+            access_token: str,
+            broker_order_id: str,
+            *,
+            exchange: str = "KRX",
+            submitted_at: datetime | None = None,
+        ) -> dict[str, object]:
+            raise BrokerAdapterError(
+                "broker lookup unavailable",
+                status_code=503,
+                classification=BrokerErrorClassification.NETWORK,
+                retryable=True,
+                code="lookup_timeout",
+                observed_at=OBSERVED_AT,
+            )
+
+    def interrupt_before_outer_classification_commit(**kwargs) -> None:
+        raise RuntimeError("interrupted before classification commit")
+
+    monkeypatch.setattr(
+        reconciliation_service,
+        "_record_stale_order_classification_event",
+        interrupt_before_outer_classification_commit,
+    )
+
+    with pytest.raises(RuntimeError, match="interrupted before classification commit"):
+        with session_factory() as db:
+            reconcile_stale_nonterminal_broker_orders(
+                settings=settings,
+                db=db,
+                adapter=FailingReconcileBroker(),
+                actor="ops-desk",
+                operator_reason="investigate stale broker lookup",
+            )
+
+    with session_factory() as db:
+        event = db.scalar(
+            select(BrokerOrderEvent).where(
+                BrokerOrderEvent.broker_order_pk == order_pk,
+                BrokerOrderEvent.event_type == "reconcile_failed",
+            )
+        )
+        classifications = db.scalars(
+            select(BrokerOrderEvent).where(
+                BrokerOrderEvent.broker_order_pk == order_pk,
+                BrokerOrderEvent.event_type == "stale_order_reconcile_classification",
+            )
+        ).all()
+        assert event is not None
+        assert event.payload["actor"] == "ops-desk"
+        assert event.payload["operator_reason"] == "investigate stale broker lookup"
+        assert event.error_classification == "network"
+        assert classifications == []
+    engine.dispose()
+
+
+@pytest.mark.parametrize("field", ["actor", "reason"])
+def test_stale_reconciliation_schema_strips_and_rejects_whitespace_audit_fields(
+    field: str,
+) -> None:
+    with pytest.raises(ValidationError, match="field must not be empty"):
+        StaleBrokerOrderReconciliationRequest.model_validate({field: "   "})
+
+    command = StaleBrokerOrderReconciliationRequest.model_validate(
+        {"actor": "  operator  ", "reason": "  reconcile broker truth  "}
+    )
+
+    assert command.actor == "operator"
+    assert command.reason == "reconcile broker truth"
+
+
+@pytest.mark.parametrize("field", ["actor", "reason"])
+def test_reconcile_stale_orders_api_rejects_whitespace_audit_fields(field: str) -> None:
+    settings = Settings(database_url="sqlite:///:memory:", runtime_mode="paper")
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    app = create_app(
+        settings=settings,
+        engine=engine,
+        session_factory=session_factory,
+        broker_adapter_factory=lambda _settings: ReconciliationStubBroker(),
+    )
+    client = TestClient(app)
+    payload = {
+        "actor": "operator",
+        "reason": "reconcile broker truth",
+        field: "   ",
+    }
+
+    response = client.post("/orders/reconcile-stale", json=payload)
+
+    assert response.status_code == 422
+    error = response.json()["detail"][0]
+    assert error["loc"] == ["body", field]
+    assert error["type"] == "value_error"
     engine.dispose()
 
 
@@ -1894,6 +2218,234 @@ def test_runtime_status_reports_pnl_fill_quality_alerts() -> None:
     alerts_by_kind = {alert["kind"]: alert for alert in alerts["alerts"]}
     assert alerts_by_kind["filled_broker_orders_missing_execution_fills"]["symbols"] == ["105560"]
     assert alerts_by_kind["duplicate_execution_fill_groups"]["symbols"] == ["282330"]
+    engine.dispose()
+
+
+def test_runtime_status_matches_duplicate_fill_reviews_by_candidate_key() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+    )
+    engine, db = _session(settings)
+    filled_at = datetime.now(UTC)
+    order = BrokerOrder(
+        broker_name="kis",
+        mode="paper",
+        idempotency_key="filled-order-two-duplicate-fill-groups",
+        broker_order_id="duplicate-fill-shared-order",
+        symbol="282330",
+        side="buy",
+        status="filled",
+        quantity=4,
+        submitted_at=filled_at,
+    )
+    db.add(order)
+    db.flush()
+    first_group = [
+        ExecutionFill(
+            id="a-shared-order-duplicate-fill-one",
+            broker_order_pk=order.id,
+            broker_fill_id="shared-fill-one",
+            symbol="282330",
+            side="buy",
+            quantity=1,
+            price=Decimal("125400.0000"),
+            filled_at=filled_at,
+        ),
+        ExecutionFill(
+            id="b-shared-order-duplicate-fill-one",
+            broker_order_pk=order.id,
+            broker_fill_id="shared-fill-one",
+            symbol="282330",
+            side="buy",
+            quantity=1,
+            price=Decimal("125400.0000"),
+            filled_at=filled_at,
+        ),
+    ]
+    second_group = [
+        ExecutionFill(
+            id="a-shared-order-duplicate-fill-two",
+            broker_order_pk=order.id,
+            broker_fill_id="shared-fill-two",
+            symbol="282330",
+            side="buy",
+            quantity=1,
+            price=Decimal("125500.0000"),
+            filled_at=filled_at + timedelta(seconds=1),
+        ),
+        ExecutionFill(
+            id="b-shared-order-duplicate-fill-two",
+            broker_order_pk=order.id,
+            broker_fill_id="shared-fill-two",
+            symbol="282330",
+            side="buy",
+            quantity=1,
+            price=Decimal("125500.0000"),
+            filled_at=filled_at + timedelta(seconds=1),
+        ),
+    ]
+    db.add_all([*first_group, *second_group])
+    db.flush()
+    db.add_all(
+        [
+            RuntimeRemediationEvent(
+                mode="paper",
+                candidate_type="duplicate_fill_group",
+                candidate_key=duplicate_fill_group_candidate_key(
+                    group_key=execution_fill_dedupe_key(first_group[0]),
+                    fill_ids=[fill.id for fill in first_group],
+                ),
+                subject_id=order.id,
+                outcome="non_destructive_isolation",
+                actor="first-reviewer",
+                reason="first group isolated",
+                evidence_summary={"fills_deleted": 0},
+                occurred_at=filled_at,
+            ),
+            RuntimeRemediationEvent(
+                mode="paper",
+                candidate_type="duplicate_fill_group",
+                candidate_key=duplicate_fill_group_candidate_key(
+                    group_key=execution_fill_dedupe_key(second_group[0]),
+                    fill_ids=[fill.id for fill in second_group],
+                ),
+                subject_id=order.id,
+                outcome="manual_review_required",
+                actor="second-reviewer",
+                reason="second group needs review",
+                evidence_summary={"fills_deleted": 0},
+                occurred_at=filled_at,
+            ),
+            RuntimeRemediationEvent(
+                mode="paper",
+                candidate_type="duplicate_fill_group",
+                candidate_key=duplicate_fill_group_candidate_key(
+                    group_key="execution_fill:stale-order-level-key",
+                    fill_ids=[fill.id for fill in first_group],
+                ),
+                subject_id=order.id,
+                outcome="manual_review_required",
+                actor="wrong-actor",
+                reason="wrong group review must not leak",
+                evidence_summary={"fills_deleted": 0},
+                occurred_at=filled_at + timedelta(minutes=1),
+            ),
+            RuntimeRemediationEvent(
+                mode="paper",
+                candidate_type="duplicate_fill_group",
+                candidate_key=duplicate_fill_group_candidate_key(
+                    group_key="execution_fill:stale-order-level-key",
+                    fill_ids=[fill.id for fill in second_group],
+                ),
+                subject_id=order.id,
+                outcome="manual_review_required",
+                actor="also-wrong",
+                reason="another wrong group review must not leak",
+                evidence_summary={"fills_deleted": 0},
+                occurred_at=filled_at + timedelta(minutes=2),
+            ),
+        ]
+    )
+    db.commit()
+
+    payload = build_runtime_status(
+        settings=settings,
+        runtime=RuntimeMetadata(started_at=datetime.now(UTC)),
+        db=db,
+    )
+
+    groups = payload["freshness"]["broker_orders"]["fill_quality"]["duplicate_fill_groups"]
+    assert len(groups) == 2
+    groups_by_fill_id = {group["broker_fill_id"]: group for group in groups}
+    assert groups_by_fill_id["shared-fill-one"]["review_outcome"] == "non_destructive_isolation"
+    assert groups_by_fill_id["shared-fill-one"]["review_actor"] == "first-reviewer"
+    assert groups_by_fill_id["shared-fill-one"]["review_reason"] == "first group isolated"
+    assert groups_by_fill_id["shared-fill-two"]["review_outcome"] == "manual_review_required"
+    assert groups_by_fill_id["shared-fill-two"]["review_actor"] == "second-reviewer"
+    assert groups_by_fill_id["shared-fill-two"]["review_reason"] == "second group needs review"
+    engine.dispose()
+
+
+def test_missing_fill_alert_symbols_exclude_reviewed_and_ignore_sample_limit() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+    )
+    engine, db = _session(settings)
+    submitted_at = datetime.now(UTC)
+    reviewed_orders = [
+        BrokerOrder(
+            broker_name="kis",
+            mode="paper",
+            idempotency_key=f"reviewed-missing-fill-{index}",
+            broker_order_id=f"reviewed-missing-fill-{index}",
+            symbol=f"REVIEWED{index:02d}",
+            side="buy",
+            status="filled",
+            quantity=1,
+            submitted_at=submitted_at + timedelta(minutes=index),
+        )
+        for index in range(20)
+    ]
+    unreviewed_order = BrokerOrder(
+        broker_name="kis",
+        mode="paper",
+        idempotency_key="older-actionable-missing-fill",
+        broker_order_id="older-actionable-missing-fill",
+        symbol="ACTIONABLE",
+        side="buy",
+        status="filled",
+        quantity=1,
+        submitted_at=submitted_at - timedelta(days=1),
+    )
+    db.add_all([*reviewed_orders, unreviewed_order])
+    db.flush()
+    db.add_all([
+        RuntimeRemediationEvent(
+            mode="paper",
+            candidate_type="missing_execution_fill",
+            candidate_key=f"{order.id}:missing",
+            subject_id=order.id,
+            outcome="manual_review_required",
+            actor="Peter",
+            reason="authoritative fill evidence unavailable",
+            evidence_summary={"fills_fabricated": 0},
+            occurred_at=submitted_at,
+        )
+        for order in reviewed_orders
+    ])
+    db.commit()
+
+    payload = build_runtime_status(
+        settings=settings,
+        runtime=RuntimeMetadata(started_at=datetime.now(UTC)),
+        db=db,
+    )
+
+    fill_quality = payload["freshness"]["broker_orders"]["fill_quality"]
+    assert fill_quality["missing_filled_order_fill_count"] == 21
+    assert fill_quality["missing_filled_order_fill_unreviewed_count"] == 1
+    assert fill_quality["missing_filled_order_fill_manual_review_count"] == 20
+    assert fill_quality["missing_filled_order_fill_truncated"] is True
+    assert all(
+        item["review_outcome"] == "manual_review_required"
+        for item in fill_quality["missing_filled_order_fill_items"]
+    )
+    assert fill_quality["missing_filled_order_fill_unreviewed_symbols"] == ["ACTIONABLE"]
+    alerts_by_kind = {
+        alert["kind"]: alert for alert in payload["actionable_alerts"]["alerts"]
+    }
+    assert alerts_by_kind["filled_broker_orders_missing_execution_fills"] == {
+        "kind": "filled_broker_orders_missing_execution_fills",
+        "severity": "critical",
+        "count": 1,
+        "symbols": ["ACTIONABLE"],
+        "message": (
+            "filled broker orders are missing execution_fills rows, "
+            "so FIFO realized P/L is incomplete"
+        ),
+    }
     engine.dispose()
 
 
