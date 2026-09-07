@@ -19,10 +19,16 @@ from app.models.runtime import (
 from app.services.fifo_inventory import load_fifo_isolation_cursor
 from app.services.fill_idempotency import (
     dedupe_execution_fills,
+    duplicate_fill_conflicting_fields,
     duplicate_fill_economic_conflict,
     duplicate_fill_group_candidate_key,
     execution_fill_dedupe_key,
     execution_fill_idempotency_key,
+)
+from app.services.fill_economics import (
+    COST_COVERAGE_UNKNOWN,
+    FillEconomics,
+    normalize_fill_economics,
 )
 
 
@@ -422,19 +428,29 @@ def apply_execution_fill_repairs(
             continue
         inserted_for_order: list[dict[str, object]] = []
         for proposed, signature in validated_fills:
+            economics = _proposed_fill_economics(proposed, order=order)
             fill = ExecutionFill(
                 idempotency_key=signature,
                 broker_order_pk=order.id,
                 broker_fill_id=_optional_str(proposed.get("broker_fill_id")),
                 symbol=str(proposed["symbol"]),
                 side=str(proposed["side"]),
-                quantity=int(proposed["quantity"]),
+                quantity=_parse_int(proposed.get("quantity")) or 0,
+                base_quantity=_parse_decimal(proposed.get("base_quantity")),
+                quote_notional=_parse_decimal(proposed.get("quote_notional")),
                 price=_parse_decimal(proposed["price"]) or Decimal("0"),
+                settlement_currency=economics.settlement_currency,
+                transaction_cost=economics.transaction_cost,
+                transaction_cost_coverage=economics.transaction_cost_coverage,
+                transaction_cost_source=economics.transaction_cost_source,
                 filled_at=_parse_timestamp(proposed.get("filled_at"), fallback=repaired_at),
                 payload={
                     "source": "operator_fill_evidence_repair",
                     "actor": actor,
                     "reason": reason,
+                    "settlement_currency_conflict": (
+                        economics.settlement_currency_conflict
+                    ),
                     "repair_evidence": item.get("available_repair_evidence"),
                     "proposed_fill": _json_safe_value(proposed),
                 },
@@ -697,20 +713,49 @@ def _fills_match_filled_order(
     order: BrokerOrder,
     fills: list[dict[str, object]],
 ) -> bool:
-    if order.quantity is None or order.quantity <= 0:
+    quantity_contract = _order_fill_quantity_contract(order)
+    if quantity_contract is None:
         return False
-    total_quantity = 0
+    quantity_basis, expected_quantity = quantity_contract
+    total_quantity = Decimal("0")
     for fill in fills:
         if str(fill.get("symbol") or "").strip().upper() != order.symbol.strip().upper():
             return False
         if str(fill.get("side") or "").strip().lower() != order.side.strip().lower():
             return False
-        quantity = _parse_int(fill.get("quantity"))
+        quantity = _fill_quantity_for_basis(fill, quantity_basis=quantity_basis)
         price = _parse_decimal(fill.get("price"))
         if quantity is None or quantity <= 0 or price is None or price <= 0:
             return False
         total_quantity += quantity
-    return total_quantity == order.quantity
+    return total_quantity == expected_quantity
+
+
+def _order_fill_quantity_contract(order: BrokerOrder) -> tuple[str, Decimal] | None:
+    base_quantity = _parse_decimal(order.base_quantity)
+    if base_quantity is not None and base_quantity > 0:
+        return "base_quantity", base_quantity
+    quantity = _parse_int(order.quantity)
+    if quantity is not None and quantity > 0:
+        return "quantity", Decimal(quantity)
+    return None
+
+
+def _fill_quantity_for_basis(
+    fill: dict[str, object],
+    *,
+    quantity_basis: str,
+) -> Decimal | None:
+    if quantity_basis == "base_quantity":
+        return _parse_decimal(fill.get("base_quantity"))
+    quantity = _parse_int(fill.get("quantity"))
+    return Decimal(quantity) if quantity is not None else None
+
+
+def _quantity_evidence_value(value: Decimal, *, quantity_basis: str) -> int | str:
+    if quantity_basis == "quantity":
+        return int(value)
+    return _decimal_evidence_text(value) or "0"
 
 
 def _proposed_fills_from_payload(
@@ -721,11 +766,19 @@ def _proposed_fills_from_payload(
 ) -> list[dict[str, object]]:
     fills = payload.get("fills")
     if isinstance(fills, list):
+        inherited_cost_scope = _transaction_cost_scope(payload)
         parsed = [
             parsed_fill
             for item in fills
             if isinstance(item, dict)
-            for parsed_fill in [_normalize_explicit_fill(item, order=order, observed_at=observed_at)]
+            for parsed_fill in [
+                _normalize_explicit_fill(
+                    item,
+                    order=order,
+                    observed_at=observed_at,
+                    inherited_transaction_cost_scope=inherited_cost_scope,
+                )
+            ]
             if parsed_fill is not None
         ]
         if parsed:
@@ -756,13 +809,31 @@ def _normalize_explicit_fill(
     *,
     order: BrokerOrder,
     observed_at: datetime,
+    inherited_transaction_cost_scope: str = "",
 ) -> dict[str, object] | None:
-    quantity = _parse_int(fill.get("quantity"))
+    quantity = _parse_int(fill.get("quantity")) or 0
+    base_quantity = _first_positive_decimal(
+        fill,
+        "base_quantity",
+        "filled_base_quantity",
+    )
+    quote_notional = _optional_positive_decimal(fill.get("quote_notional"))
     price = _parse_decimal(fill.get("price"))
-    if quantity is None or quantity <= 0 or price is None:
+    if (
+        (quantity <= 0 and base_quantity is None)
+        or price is None
+        or price <= 0
+    ):
         return None
     filled_at = _parse_timestamp(fill.get("filled_at"), fallback=observed_at)
-    return {
+    economics = normalize_fill_economics(fill, order=order)
+    cost_scope = _transaction_cost_scope(fill) or inherited_transaction_cost_scope
+    if economics.transaction_cost is not None and cost_scope == "cumulative":
+        economics = _unknown_transaction_cost(
+            economics,
+            source="broker_payload:ambiguous_explicit_fill_cumulative_cost_scope",
+        )
+    normalized: dict[str, object] = {
         "broker_fill_id": _optional_str(fill.get("broker_fill_id")),
         "symbol": _optional_str(fill.get("symbol")) or order.symbol,
         "side": _optional_str(fill.get("side")) or order.side,
@@ -770,6 +841,15 @@ def _normalize_explicit_fill(
         "price": _decimal_text(price),
         "filled_at": filled_at.isoformat(),
     }
+    if base_quantity is not None:
+        normalized["base_quantity"] = _decimal_evidence_text(base_quantity)
+    if quote_notional is not None:
+        normalized["quote_notional"] = _decimal_evidence_text(quote_notional)
+    if _has_explicit_economics_evidence(fill):
+        normalized.update(_fill_economics_payload(economics))
+    if cost_scope:
+        normalized["transaction_cost_scope"] = cost_scope
+    return normalized
 
 
 def _cumulative_fill_from_payload(
@@ -781,7 +861,14 @@ def _cumulative_fill_from_payload(
     quantity = _parse_int(payload.get("filled_quantity"))
     if quantity is None:
         quantity = _parse_int(payload.get("tot_ccld_qty"))
-    if quantity is None or quantity <= 0:
+    quantity = quantity or 0
+    base_quantity = _first_positive_decimal(
+        payload,
+        "filled_base_quantity",
+        "base_quantity",
+    )
+    quote_notional = _optional_positive_decimal(payload.get("quote_notional"))
+    if quantity <= 0 and base_quantity is None:
         return []
     price = (
         _parse_decimal(payload.get("average_fill_price"))
@@ -797,16 +884,128 @@ def _cumulative_fill_from_payload(
         payload.get("filled_at") or _kis_order_timestamp(payload),
         fallback=observed_at,
     )
-    return [
-        {
-            "broker_fill_id": _optional_str(payload.get("broker_fill_id")),
-            "symbol": _optional_str(payload.get("symbol")) or _optional_str(payload.get("pdno")) or order.symbol,
-            "side": _optional_str(payload.get("side")) or order.side,
-            "quantity": quantity,
-            "price": _decimal_text(price),
-            "filled_at": filled_at.isoformat(),
-        }
-    ]
+    economics = _cumulative_repair_economics(payload=payload, order=order)
+    normalized: dict[str, object] = {
+        "broker_fill_id": _optional_str(payload.get("broker_fill_id")),
+        "symbol": (
+            _optional_str(payload.get("symbol"))
+            or _optional_str(payload.get("pdno"))
+            or order.symbol
+        ),
+        "side": _optional_str(payload.get("side")) or order.side,
+        "quantity": quantity,
+        "price": _decimal_text(price),
+        "filled_at": filled_at.isoformat(),
+    }
+    if base_quantity is not None:
+        normalized["base_quantity"] = _decimal_evidence_text(base_quantity)
+    if quote_notional is not None:
+        normalized["quote_notional"] = _decimal_evidence_text(quote_notional)
+    if _has_explicit_economics_evidence(payload):
+        normalized.update(_fill_economics_payload(economics))
+    cost_scope = _transaction_cost_scope(payload)
+    if cost_scope:
+        normalized["transaction_cost_scope"] = cost_scope
+    return [normalized]
+
+
+def _cumulative_repair_economics(
+    *,
+    payload: dict[str, object],
+    order: BrokerOrder,
+) -> FillEconomics:
+    economics = normalize_fill_economics(payload, order=order)
+    if economics.transaction_cost is None:
+        return economics
+    if _transaction_cost_scope(payload) == "cumulative":
+        # A missing-fill repair creates one synthetic row for the full
+        # cumulative quantity, so an explicitly cumulative cost belongs wholly
+        # on that row. Preserve the broker's declared coverage as-is.
+        return economics
+    return _unknown_transaction_cost(
+        economics,
+        source="broker_payload:ambiguous_reconstructed_cumulative_cost_scope",
+    )
+
+
+def _proposed_fill_economics(
+    fill: dict[str, object],
+    *,
+    order: BrokerOrder,
+) -> FillEconomics:
+    economics = normalize_fill_economics(fill, order=order)
+    if fill.get("settlement_currency_conflict") is not True:
+        return economics
+    return FillEconomics(
+        settlement_currency=None,
+        transaction_cost=economics.transaction_cost,
+        transaction_cost_coverage=economics.transaction_cost_coverage,
+        transaction_cost_source=economics.transaction_cost_source,
+        settlement_currency_conflict=True,
+    )
+
+
+def _unknown_transaction_cost(
+    economics: FillEconomics,
+    *,
+    source: str,
+) -> FillEconomics:
+    return FillEconomics(
+        settlement_currency=economics.settlement_currency,
+        transaction_cost=None,
+        transaction_cost_coverage=COST_COVERAGE_UNKNOWN,
+        transaction_cost_source=source,
+        settlement_currency_conflict=economics.settlement_currency_conflict,
+    )
+
+
+def _fill_economics_payload(economics: FillEconomics) -> dict[str, object]:
+    return {
+        "settlement_currency": economics.settlement_currency,
+        "transaction_cost": _decimal_evidence_text(economics.transaction_cost),
+        "transaction_cost_coverage": economics.transaction_cost_coverage,
+        "transaction_cost_source": economics.transaction_cost_source,
+        "settlement_currency_conflict": economics.settlement_currency_conflict,
+    }
+
+
+def _transaction_cost_scope(payload: object) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    economics = payload.get("economics")
+    if isinstance(economics, dict) and "transaction_cost_scope" in economics:
+        raw_scope = economics.get("transaction_cost_scope")
+    else:
+        raw_scope = payload.get("transaction_cost_scope")
+    return str(raw_scope or "").strip().lower()
+
+
+def _has_explicit_economics_evidence(payload: dict[str, object]) -> bool:
+    economics = payload.get("economics")
+    candidates = {str(key) for key in payload}
+    if isinstance(economics, dict):
+        candidates.update(str(key) for key in economics)
+    return bool(
+        candidates.intersection(
+            {
+                "settlement_currency",
+                "quote_currency",
+                "currency",
+                "total_transaction_cost",
+                "transaction_cost",
+                "commission",
+                "commission_amount",
+                "fee",
+                "fee_amount",
+                "tax",
+                "tax_amount",
+                "transaction_cost_coverage",
+                "cost_coverage",
+                "transaction_cost_source",
+                "cost_source",
+            }
+        )
+    )
 
 
 def _duplicate_fill_groups(*, db: Session, runtime_mode: str) -> list[dict[str, object]]:
@@ -826,7 +1025,7 @@ def _duplicate_fill_groups(*, db: Session, runtime_mode: str) -> list[dict[str, 
         retained = group[0]
         duplicate_fills = group[1:]
         economic_conflict = duplicate_fill_economic_conflict(group)
-        conflicting_fields = _duplicate_group_conflicting_fields(group)
+        conflicting_fields = duplicate_fill_conflicting_fields(group)
         duplicate_groups.append(
             {
                 "duplicate_group_key": key,
@@ -852,11 +1051,19 @@ def _duplicate_fill_groups(*, db: Session, runtime_mode: str) -> list[dict[str, 
 
 
 def _fill_signature(*, order: BrokerOrder, fill: dict[str, object]) -> str | None:
-    quantity = _parse_int(fill.get("quantity"))
+    quantity = _parse_int(fill.get("quantity")) or 0
+    base_quantity = _optional_positive_decimal(fill.get("base_quantity"))
+    quote_notional = _optional_positive_decimal(fill.get("quote_notional"))
     price = _parse_decimal(fill.get("price"))
     symbol = _optional_str(fill.get("symbol"))
     side = _optional_str(fill.get("side"))
-    if quantity is None or quantity <= 0 or price is None or not symbol or not side:
+    if (
+        (quantity <= 0 and base_quantity is None)
+        or price is None
+        or price <= 0
+        or not symbol
+        or not side
+    ):
         return None
     return execution_fill_idempotency_key(
         broker_order_pk=order.id,
@@ -866,6 +1073,8 @@ def _fill_signature(*, order: BrokerOrder, fill: dict[str, object]) -> str | Non
         filled_at=_parse_timestamp(fill.get("filled_at"), fallback=datetime.now(UTC)),
         price=price,
         quantity=quantity,
+        base_quantity=base_quantity,
+        quote_notional=quote_notional,
     )
 
 
@@ -876,9 +1085,13 @@ def _validated_repair_fill_proposals(
     existing_keys: set[str],
 ) -> tuple[list[tuple[dict[str, object], str]], dict[str, object] | None]:
     """Preflight every fill so one order is repaired completely or not at all."""
+    quantity_contract = _order_fill_quantity_contract(order)
+    if quantity_contract is None:
+        return [], {"code": "missing_order_quantity_contract"}
+    quantity_basis, expected_quantity = quantity_contract
     validated: list[tuple[dict[str, object], str]] = []
     signatures: list[str] = []
-    proposed_quantity = 0
+    proposed_quantity = Decimal("0")
     for index, proposed in enumerate(proposed_fills):
         if not isinstance(proposed, dict):
             return [], {
@@ -886,7 +1099,10 @@ def _validated_repair_fill_proposals(
                 "invalid_fill_index": index,
             }
         signature = _fill_signature(order=order, fill=proposed)
-        quantity = _parse_int(proposed.get("quantity"))
+        quantity = _fill_quantity_for_basis(
+            proposed,
+            quantity_basis=quantity_basis,
+        )
         if signature is None or quantity is None or quantity <= 0:
             return [], {
                 "code": "invalid_proposed_fill",
@@ -903,14 +1119,16 @@ def _validated_repair_fill_proposals(
         signature for signature, count in signature_counts.items() if count > 1
     )
     existing_signature_collisions = sorted(set(signatures) & existing_keys)
-    retained_quantity = 0
+    retained_quantity = Decimal("0")
     retained_signatures: set[str] = set()
     for proposed, signature in validated:
         if signature in existing_signature_collisions or signature in retained_signatures:
             continue
         retained_signatures.add(signature)
-        retained_quantity += _parse_int(proposed.get("quantity")) or 0
-    expected_quantity = int(order.quantity or 0)
+        retained_quantity += _fill_quantity_for_basis(
+            proposed,
+            quantity_basis=quantity_basis,
+        ) or Decimal("0")
     if (
         duplicate_signatures
         or existing_signature_collisions
@@ -919,9 +1137,19 @@ def _validated_repair_fill_proposals(
     ):
         return [], {
             "code": "proposed_fill_set_not_insertable_atomically",
-            "expected_quantity": expected_quantity,
-            "proposed_quantity": proposed_quantity,
-            "retained_quantity": retained_quantity,
+            "quantity_basis": quantity_basis,
+            "expected_quantity": _quantity_evidence_value(
+                expected_quantity,
+                quantity_basis=quantity_basis,
+            ),
+            "proposed_quantity": _quantity_evidence_value(
+                proposed_quantity,
+                quantity_basis=quantity_basis,
+            ),
+            "retained_quantity": _quantity_evidence_value(
+                retained_quantity,
+                quantity_basis=quantity_basis,
+            ),
             "duplicate_signatures": duplicate_signatures,
             "existing_signature_collisions": existing_signature_collisions,
         }
@@ -1007,39 +1235,6 @@ def _duplicate_group_membership_version(item: dict[str, object]) -> str:
     return candidate_key.rsplit(":", 1)[-1]
 
 
-def _duplicate_group_conflicting_fields(group: list[ExecutionFill]) -> list[str]:
-    fields: list[str] = []
-    if len({int(fill.quantity) for fill in group}) > 1:
-        fields.append("quantity")
-    if (
-        len(
-            {
-                _decimal_text(Decimal(fill.base_quantity))
-                if fill.base_quantity is not None
-                else None
-                for fill in group
-            }
-        )
-        > 1
-    ):
-        fields.append("base_quantity")
-    if (
-        len(
-            {
-                _decimal_text(Decimal(fill.quote_notional))
-                if fill.quote_notional is not None
-                else None
-                for fill in group
-            }
-        )
-        > 1
-    ):
-        fields.append("quote_notional")
-    if len({_decimal_text(Decimal(fill.price)) for fill in group}) > 1:
-        fields.append("price")
-    return fields
-
-
 def _record_remediation_event(
     *,
     db: Session,
@@ -1088,12 +1283,13 @@ def _fill_row_payload(fill: ExecutionFill, *, id_override: str | None = "__fill_
         "symbol": fill.symbol,
         "side": fill.side,
         "quantity": fill.quantity,
-        "base_quantity": (
-            _decimal_text(Decimal(fill.base_quantity))
-            if fill.base_quantity is not None
-            else None
-        ),
+        "base_quantity": _decimal_evidence_text(fill.base_quantity),
+        "quote_notional": _decimal_evidence_text(fill.quote_notional),
         "price": _decimal_text(Decimal(fill.price)),
+        "settlement_currency": fill.settlement_currency,
+        "transaction_cost": _decimal_evidence_text(fill.transaction_cost),
+        "transaction_cost_coverage": fill.transaction_cost_coverage,
+        "transaction_cost_source": fill.transaction_cost_source,
         "filled_at": _serialize_datetime(fill.filled_at),
         "created_at": _serialize_datetime(fill.created_at),
         "updated_at": _serialize_datetime(fill.updated_at),
@@ -1157,13 +1353,17 @@ def _parse_timestamp(value: object, *, fallback: datetime) -> datetime:
 
 
 def _parse_decimal(value: object) -> Decimal | None:
+    if isinstance(value, bool):
+        return None
     if isinstance(value, Decimal):
-        return value
+        return value if value.is_finite() else None
     if isinstance(value, int | float):
-        return Decimal(str(value))
+        parsed = Decimal(str(value))
+        return parsed if parsed.is_finite() else None
     if isinstance(value, str):
         try:
-            return Decimal(value.strip())
+            parsed = Decimal(value.strip())
+            return parsed if parsed.is_finite() else None
         except (InvalidOperation, ValueError):
             return None
     return None
@@ -1172,13 +1372,25 @@ def _parse_decimal(value: object) -> Decimal | None:
 def _parse_int(value: object) -> int | None:
     if isinstance(value, bool):
         return None
-    if isinstance(value, int):
-        return value
-    if isinstance(value, str):
-        try:
-            return int(Decimal(value.strip()))
-        except (InvalidOperation, ValueError):
-            return None
+    parsed = _parse_decimal(value)
+    if parsed is None or parsed != parsed.to_integral_value():
+        return None
+    return int(parsed)
+
+
+def _optional_positive_decimal(value: object) -> Decimal | None:
+    parsed = _parse_decimal(value)
+    return parsed if parsed is not None and parsed > 0 else None
+
+
+def _first_positive_decimal(
+    payload: dict[str, object],
+    *keys: str,
+) -> Decimal | None:
+    for key in keys:
+        parsed = _optional_positive_decimal(payload.get(key))
+        if parsed is not None:
+            return parsed
     return None
 
 
@@ -1197,6 +1409,12 @@ def _serialize_datetime(value: datetime | None) -> str | None:
 
 def _decimal_text(value: Decimal) -> str:
     return f"{value:.4f}"
+
+
+def _decimal_evidence_text(value: Decimal | None) -> str | None:
+    if value is None:
+        return None
+    return format(Decimal(value), "f")
 
 
 def _json_safe_value(value: Any) -> Any:

@@ -17,7 +17,10 @@ from app.services.broker_orders import place_broker_order
 from app.services.execution_api import serialize_broker_order
 from app.services.live_market_context import load_live_market_regime_context, merge_live_market_regime_context
 from app.services.market_regime_guardrails import evaluate_market_regime_guardrail, market_regime_context_from_item_payloads
-from app.services.broker_order_state import active_local_broker_order_filters
+from app.services.broker_order_state import (
+    CAPITAL_RESERVING_ORDER_STATUSES,
+    active_local_broker_order_filters,
+)
 from app.services.runtime_controls import (
     automated_order_submission_allowed,
     automated_order_submission_block_reason,
@@ -25,7 +28,7 @@ from app.services.runtime_controls import (
     runtime_safety_payload,
 )
 
-OPEN_ORDER_STATUSES = frozenset({"submission_pending", "submitted", "open", "partially_filled", "retry_pending"})
+OPEN_ORDER_STATUSES = frozenset(CAPITAL_RESERVING_ORDER_STATUSES)
 SUPPORTED_SHORT_TERM_BUY_INTENTS = frozenset({"next_open_buy", "intraday_watch_buy"})
 SHORT_TERM_DECIDER_NAME = "short-term-decider"
 MAX_APPROVED_NOTIONAL = Decimal("10000000")

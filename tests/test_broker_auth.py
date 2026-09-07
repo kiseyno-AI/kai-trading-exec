@@ -1,5 +1,6 @@
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
+from threading import Event, Thread
 import time
 
 from fastapi.testclient import TestClient
@@ -7,6 +8,7 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.orm.attributes import flag_modified
 
+from app.api.schemas.execution import PlaceOrderRequest
 from app.broker.base import (
     BrokerAccountHolding,
     BrokerAccountOpenOrder,
@@ -55,6 +57,7 @@ from app.services.monitoring import (
     _derived_source_plan_item_id,
     _nonretryable_sibling_monitor_suppresses_recreation,
     _prepare_due_max_holding_items,
+    _reserve_existing_exit_orders,
     list_autonomous_monitoring_symbols,
     run_autonomous_monitoring_cycle,
 )
@@ -427,6 +430,7 @@ def test_settings_load_profit_protection_environment_fields() -> None:
             "KAI_EXEC_TRADE_OUTCOME_FEEDBACK_DIR": "var/test-feedback",
             "KAI_EXEC_TRADE_OUTCOME_FEEDBACK_LOOKBACK_DAYS": "30",
             "KAI_EXEC_TRADE_OUTCOME_FEEDBACK_MAX_LESSONS": "4",
+            "KAI_EXEC_TRADE_OUTCOME_FEEDBACK_MAX_AGE_SECONDS": "7200",
         },
     )
 
@@ -453,6 +457,7 @@ def test_settings_load_profit_protection_environment_fields() -> None:
     assert settings.trade_outcome_feedback_dir == "var/test-feedback"
     assert settings.trade_outcome_feedback_lookback_days == 30
     assert settings.trade_outcome_feedback_max_lessons == 4
+    assert settings.trade_outcome_feedback_max_age_seconds == 7200
 
 
 def test_kis_adapter_uses_client_credentials_token_flow() -> None:
@@ -1494,6 +1499,1095 @@ def test_place_order_endpoint_persists_normalized_order_and_events() -> None:
         plan_item = session.get(ExecutionPlanItem, plan_item_id)
         assert plan_item is not None
         assert plan_item.status == "broker_order_submitted"
+
+    engine.dispose()
+
+
+def test_uncertain_broker_failure_requires_manual_review_and_blocks_resubmit() -> None:
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_error=RuntimeError("connection lost after broker accepted the request"),
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+        ),
+        broker_adapter=broker_adapter,
+    )
+    client = TestClient(app)
+    assert client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "console", "reason": "enable automation"},
+    ).status_code == 200
+    plan_response = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-uncertain-broker-result-1",
+            "source": "kai-trading-core",
+            "items": [
+                {
+                    "symbol": "005930",
+                    "side": "buy",
+                    "intent": "next_open_buy",
+                    "limit_price": "71000.00",
+                    "time_in_force": "day",
+                }
+            ],
+        },
+    )
+    assert plan_response.status_code == 201
+    plan_item_id = plan_response.json()["persisted_execution_item_ids"][0]
+    payload = {
+        "idempotency_key": "uncertain-broker-result-1",
+        "execution_plan_item_id": plan_item_id,
+        "symbol": "005930",
+        "side": "buy",
+        "quantity": 2,
+        "order_type": "limit",
+        "limit_price": "71000.00",
+        "time_in_force": "day",
+        "exchange": "KRX",
+    }
+
+    response = client.post("/orders", json=payload)
+    assert response.status_code == 503
+    assert response.json()["manual_reconciliation_required"] is True
+    assert "connection lost" not in response.text
+
+    with app.state.db_session_factory() as session:
+        order = session.scalar(
+            select(BrokerOrder).where(
+                BrokerOrder.idempotency_key == "uncertain-broker-result-1"
+            )
+        )
+        assert order is not None
+        assert order.status == "manual_review_required"
+        assert order.broker_order_id is None
+        assert order.last_error_classification == "submit_outcome_unknown"
+        assert order.last_error_code == "SUBMIT_OUTCOME_UNKNOWN"
+        assert order.last_error_retryable is False
+        assert [event.event_type for event in order.events] == [
+            "submit_requested",
+            "submit_outcome_unknown",
+        ]
+        assert order.events[-1].retryable is False
+        plan_item = session.get(ExecutionPlanItem, plan_item_id)
+        assert plan_item is not None
+        assert plan_item.status == "broker_order_failed"
+
+    replay = client.post("/orders", json=payload)
+    assert replay.status_code == 200
+    assert replay.json()["duplicate"] is True
+    assert replay.json()["order"]["status"] == "manual_review_required"
+    assert len(broker_adapter.order_calls) == 1
+
+    engine.dispose()
+
+
+@pytest.mark.parametrize("side", ["buy", "sell"])
+def test_unresolved_submission_blocks_same_symbol_side_with_new_key(side: str) -> None:
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_error=RuntimeError("connection lost after broker accepted the request"),
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+        ),
+        broker_adapter=broker_adapter,
+    )
+    client = TestClient(app)
+    assert client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "console", "reason": "enable automation"},
+    ).status_code == 200
+    request = {
+        "idempotency_key": f"unresolved-{side}-first",
+        "symbol": "005930",
+        "side": side,
+        "quantity": 2,
+        "order_type": "limit",
+        "limit_price": "71000.00",
+        "time_in_force": "day",
+        "exchange": "KRX",
+    }
+
+    first = client.post("/orders", json=request)
+    assert first.status_code == 503
+    assert first.json()["manual_reconciliation_required"] is True
+
+    broker_adapter.order_error = None
+    broker_adapter.order_placement = build_order_placement()
+    replacement = client.post(
+        "/orders",
+        json={**request, "idempotency_key": f"unresolved-{side}-replacement"},
+    )
+
+    assert replacement.status_code == 409
+    assert replacement.json()["block_reason"] == "unresolved_prior_submission"
+    assert len(broker_adapter.order_calls) == 1
+    with app.state.db_session_factory() as session:
+        assert len(session.scalars(select(BrokerOrder)).all()) == 1
+
+    engine.dispose()
+
+
+@pytest.mark.parametrize("side", ["buy", "sell"])
+def test_submission_pending_blocks_same_symbol_side_with_new_key(side: str) -> None:
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(),
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+        ),
+        broker_adapter=broker_adapter,
+    )
+    client = TestClient(app)
+    assert client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "console", "reason": "enable automation"},
+    ).status_code == 200
+    with app.state.db_session_factory() as session:
+        session.add(
+            BrokerOrder(
+                broker_name="kis",
+                mode="paper",
+                idempotency_key=f"pending-{side}-first",
+                symbol="005930",
+                side=side,
+                status="submission_pending",
+                quantity=2,
+                asset_class="stock",
+                limit_price=Decimal("71000.00"),
+            )
+        )
+        session.commit()
+
+    replacement = client.post(
+        "/orders",
+        json={
+            "idempotency_key": f"pending-{side}-replacement",
+            "symbol": "005930",
+            "side": side,
+            "quantity": 2,
+            "order_type": "limit",
+            "limit_price": "71000.00",
+            "time_in_force": "day",
+            "exchange": "KRX",
+        },
+    )
+
+    assert replacement.status_code == 409
+    assert replacement.json()["block_reason"] == "unresolved_prior_submission"
+    assert broker_adapter.order_calls == []
+
+    engine.dispose()
+
+
+def test_direct_buy_reserves_local_open_order_notional_before_broker_call() -> None:
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(),
+        account_snapshot=BrokerAccountSnapshot(
+            available_cash=Decimal("1000.00"),
+            buying_power=Decimal("1000.00"),
+            observed_at=datetime.now(UTC),
+            source="stub:capital-reservation",
+            total_asset_value=Decimal("10000.00"),
+            previous_total_asset_value=Decimal("10000.00"),
+            asset_change_amount=Decimal("0"),
+            unrealized_pnl=Decimal("0"),
+        ),
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+        ),
+        broker_adapter=broker_adapter,
+    )
+    client = TestClient(app)
+    assert client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "console", "reason": "enable automation"},
+    ).status_code == 200
+    with app.state.db_session_factory() as session:
+        session.add(
+            BrokerOrder(
+                broker_name="kis",
+                mode="paper",
+                idempotency_key="capital-reservation-existing",
+                symbol="000660",
+                side="buy",
+                status="open",
+                quantity=8,
+                asset_class="stock",
+                limit_price=Decimal("100.00"),
+            )
+        )
+        session.commit()
+
+    response = client.post(
+        "/orders",
+        json={
+            "idempotency_key": "capital-reservation-candidate",
+            "symbol": "005930",
+            "side": "buy",
+            "quantity": 3,
+            "order_type": "limit",
+            "limit_price": "100.00",
+            "time_in_force": "day",
+            "exchange": "KRX",
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["order"]["last_error_code"] == "buy_capital_reservation"
+    assert broker_adapter.order_calls == []
+
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("account_drawdown_gate_enabled", "metadata"),
+    [
+        (False, None),
+        (True, {"order_purpose": "risk_reduction"}),
+        (True, {"order_purpose": "protective_hedge"}),
+    ],
+    ids=("drawdown-disabled", "risk-reduction", "protective-hedge"),
+)
+def test_buy_capital_reservation_cannot_be_disabled_or_relabelled(
+    account_drawdown_gate_enabled: bool,
+    metadata: dict[str, str] | None,
+) -> None:
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(),
+        account_snapshot=BrokerAccountSnapshot(
+            available_cash=Decimal("100.00"),
+            buying_power=Decimal("100.00"),
+            observed_at=datetime.now(UTC),
+            source="stub:mandatory-capital-reservation",
+        ),
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+            account_drawdown_gate_enabled=account_drawdown_gate_enabled,
+        ),
+        broker_adapter=broker_adapter,
+    )
+    client = TestClient(app)
+    assert client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "test", "reason": "enable guarded buy"},
+    ).status_code == 200
+
+    response = client.post(
+        "/orders",
+        json={
+            "idempotency_key": f"mandatory-capital-{metadata or 'disabled'}",
+            "symbol": "005930",
+            "side": "buy",
+            "quantity": 2,
+            "order_type": "limit",
+            "limit_price": "100.00",
+            "time_in_force": "day",
+            "exchange": "KRX",
+            **({"metadata": metadata} if metadata is not None else {}),
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["block_reason"] == "buy_capital_reservation"
+    assert response.json()["order"]["last_error_code"] == "buy_capital_reservation"
+    assert broker_adapter.order_calls == []
+    engine.dispose()
+
+
+def test_internal_buy_retry_replaces_source_reservation_without_double_counting() -> None:
+    settings = Settings(database_url="sqlite:///:memory:", runtime_mode="paper")
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    snapshot = BrokerAccountSnapshot(
+        available_cash=Decimal("150.00"),
+        buying_power=Decimal("150.00"),
+        observed_at=datetime.now(UTC),
+        source="stub:retry-capital-reservation",
+    )
+    with session_factory() as session:
+        source_order = BrokerOrder(
+            broker_name="kis",
+            mode="paper",
+            idempotency_key="retry-buy-source",
+            symbol="005930",
+            side="buy",
+            status="retry_pending",
+            quantity=1,
+            asset_class="stock",
+            limit_price=Decimal("100.00"),
+        )
+        session.add(source_order)
+        session.commit()
+        command = PlaceOrderRequest(
+            idempotency_key="retry-buy-child",
+            symbol="005930",
+            side="buy",
+            quantity=1,
+            order_type="limit",
+            limit_price=Decimal("100.00"),
+            time_in_force="day",
+            exchange="KRX",
+            metadata={
+                "retry": {
+                    "source": "rejected_order_retry",
+                    "source_broker_order_pk": source_order.id,
+                }
+            },
+        )
+
+        trusted_notional, trusted_unknown = (
+            broker_orders_service._local_unmatched_buy_reservation(
+                settings=settings,
+                db=session,
+                adapter=StubBrokerAdapter(
+                    config=BrokerConfig(
+                        provider="kis",
+                        mode="paper",
+                        configured=True,
+                        api_base_url=KIS_PAPER_API_BASE_URL,
+                    )
+                ),
+                command=command,
+                snapshot=snapshot,
+                request_source="execution-job:retry-buy-job",
+            )
+        )
+        untrusted_notional, untrusted_unknown = (
+            broker_orders_service._local_unmatched_buy_reservation(
+                settings=settings,
+                db=session,
+                adapter=StubBrokerAdapter(
+                    config=BrokerConfig(
+                        provider="kis",
+                        mode="paper",
+                        configured=True,
+                        api_base_url=KIS_PAPER_API_BASE_URL,
+                    )
+                ),
+                command=command,
+                snapshot=snapshot,
+                request_source="post:/orders",
+            )
+        )
+
+        assert (trusted_notional, trusted_unknown) == (Decimal("0"), 0)
+        assert (untrusted_notional, untrusted_unknown) == (Decimal("100.00"), 0)
+        assert broker_orders_service._buy_capital_reservation_decision(
+            settings=settings,
+            snapshot=snapshot,
+            command=command,
+            plan_item=None,
+            local_open_buy_notional=trusted_notional,
+            local_open_buy_unknown_count=trusted_unknown,
+            observed_at=datetime.now(UTC),
+        ) is None
+        untrusted_decision = broker_orders_service._buy_capital_reservation_decision(
+            settings=settings,
+            snapshot=snapshot,
+            command=command,
+            plan_item=None,
+            local_open_buy_notional=untrusted_notional,
+            local_open_buy_unknown_count=untrusted_unknown,
+            observed_at=datetime.now(UTC),
+        )
+        assert untrusted_decision is not None
+        assert untrusted_decision.gate_name == "buy_capital_reservation"
+    engine.dispose()
+
+
+def test_concurrent_buy_intents_share_one_account_capital_reservation(tmp_path) -> None:
+    snapshot_entered = Event()
+    release_snapshot = Event()
+
+    class BlockingSnapshotAdapter(StubBrokerAdapter):
+        def __init__(self) -> None:
+            super().__init__(
+                config=BrokerConfig(
+                    provider="kis",
+                    mode="paper",
+                    configured=True,
+                    api_base_url=KIS_PAPER_API_BASE_URL,
+                ),
+                token_grant=build_token_grant(),
+                order_placement=build_order_placement(broker_order_id="concurrent-buy-1"),
+                account_snapshot=BrokerAccountSnapshot(
+                    available_cash=Decimal("15.00"),
+                    buying_power=Decimal("15.00"),
+                    observed_at=datetime.now(UTC),
+                    source="stub:concurrent-capital",
+                    total_asset_value=Decimal("1000.00"),
+                    previous_total_asset_value=Decimal("1000.00"),
+                    asset_change_amount=Decimal("0"),
+                    unrealized_pnl=Decimal("0"),
+                ),
+            )
+            self.snapshot_calls = 0
+
+        def get_account_snapshot(
+            self,
+            access_token: str,
+            **kwargs: object,
+        ) -> BrokerAccountSnapshot:
+            self.snapshot_calls += 1
+            if self.snapshot_calls == 1:
+                snapshot_entered.set()
+                assert release_snapshot.wait(timeout=2)
+            return super().get_account_snapshot(access_token, **kwargs)
+
+    database_url = f"sqlite:///{tmp_path / 'concurrent-order-intents.db'}"
+    settings = Settings(
+        database_url=database_url,
+        runtime_mode="paper",
+        kis_app_key="paper-key",
+        kis_app_secret="paper-secret",
+        kis_account_number="12345678",
+    )
+    adapter = BlockingSnapshotAdapter()
+    app, engine = build_test_app(settings=settings, broker_adapter=adapter)
+    client = TestClient(app)
+    assert client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "test", "reason": "concurrency regression"},
+    ).status_code == 200
+    results: dict[str, object] = {}
+    errors: list[BaseException] = []
+
+    def submit(key: str, symbol: str) -> None:
+        try:
+            with app.state.db_session_factory() as session:
+                results[key] = broker_orders_service.place_broker_order(
+                    settings=settings,
+                    db=session,
+                    adapter=adapter,
+                    command=PlaceOrderRequest(
+                        idempotency_key=key,
+                        symbol=symbol,
+                        side="buy",
+                        quantity=1,
+                        order_type="limit",
+                        limit_price=Decimal("10.00"),
+                        time_in_force="day",
+                        exchange="KRX",
+                    ),
+                )
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    first = Thread(target=submit, args=("concurrent-buy-a", "005930"))
+    second = Thread(target=submit, args=("concurrent-buy-b", "000660"))
+    first.start()
+    assert snapshot_entered.wait(timeout=2)
+    second.start()
+    time.sleep(0.05)
+    assert adapter.snapshot_calls == 1
+    release_snapshot.set()
+    first.join(timeout=3)
+    second.join(timeout=3)
+
+    assert errors == []
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert sorted(result.status_code for result in results.values()) == [201, 409]
+    assert len(adapter.order_calls) == 1
+    blocked = next(result for result in results.values() if result.status_code == 409)
+    assert blocked.payload["order"]["last_error_code"] == "buy_capital_reservation"
+    engine.dispose()
+
+
+@pytest.mark.parametrize("control_path", ["/controls/pause", "/controls/kill-switch"])
+def test_order_submission_rechecks_runtime_control_after_account_snapshot(
+    tmp_path,
+    control_path: str,
+) -> None:
+    snapshot_entered = Event()
+    release_snapshot = Event()
+
+    class BlockingSnapshotAdapter(StubBrokerAdapter):
+        def get_account_snapshot(
+            self,
+            access_token: str,
+            **kwargs: object,
+        ) -> BrokerAccountSnapshot:
+            snapshot_entered.set()
+            assert release_snapshot.wait(timeout=2)
+            return super().get_account_snapshot(access_token, **kwargs)
+
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'runtime-fence-order.db'}",
+        runtime_mode="paper",
+        kis_app_key="paper-key",
+        kis_app_secret="paper-secret",
+        kis_account_number="12345678",
+    )
+    broker_adapter = BlockingSnapshotAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(),
+        account_snapshot=BrokerAccountSnapshot(
+            available_cash=Decimal("1000.00"),
+            buying_power=Decimal("1000.00"),
+            observed_at=datetime.now(UTC),
+            source="stub:runtime-fence",
+        ),
+    )
+    app, engine = build_test_app(settings=settings, broker_adapter=broker_adapter)
+    client = TestClient(app)
+    assert client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "test", "reason": "enable order"},
+    ).status_code == 200
+    result: dict[str, object] = {}
+    command = PlaceOrderRequest(
+        idempotency_key=f"runtime-fence-{control_path.rsplit('/', 1)[-1]}",
+        symbol="005930",
+        side="buy",
+        quantity=1,
+        order_type="limit",
+        limit_price=Decimal("100.00"),
+        time_in_force="day",
+        exchange="KRX",
+    )
+
+    def submit() -> None:
+        with app.state.db_session_factory() as session:
+            result["value"] = broker_orders_service.place_broker_order(
+                settings=settings,
+                db=session,
+                adapter=broker_adapter,
+                command=command,
+            )
+
+    thread = Thread(target=submit)
+    thread.start()
+    assert snapshot_entered.wait(timeout=2)
+    control = client.post(
+        control_path,
+        json={"actor": "ops", "source": "test", "reason": "stop in-flight order"},
+    )
+    assert control.status_code == 200
+    release_snapshot.set()
+    thread.join(timeout=3)
+
+    assert not thread.is_alive()
+    placement = result["value"]
+    assert isinstance(placement, broker_orders_service.PlaceBrokerOrderResult)
+    assert placement.status_code == 409
+    assert placement.payload["block_reason"] in {"paused", "kill_switch"}
+    assert broker_adapter.order_calls == []
+    with app.state.db_session_factory() as session:
+        order = session.scalar(
+            select(BrokerOrder).where(
+                BrokerOrder.idempotency_key
+                == f"runtime-fence-{control_path.rsplit('/', 1)[-1]}"
+            )
+        )
+        assert order is not None
+        assert order.status == "rejected"
+        assert order.last_error_classification == "runtime_safety_control"
+        assert order.last_error_code == placement.payload["block_reason"]
+        assert any(event.event_type == "submission_blocked" for event in order.events)
+    if control_path == "/controls/pause":
+        assert client.post(
+            "/controls/resume",
+            json={"actor": "ops", "source": "test", "reason": "resume fenced order"},
+        ).status_code == 200
+        with app.state.db_session_factory() as session:
+            changed_request = broker_orders_service.place_broker_order(
+                settings=settings,
+                db=session,
+                adapter=broker_adapter,
+                command=command.model_copy(update={"quantity": 2}),
+            )
+        assert changed_request.status_code == 200
+        assert changed_request.payload["duplicate"] is True
+        assert broker_adapter.order_calls == []
+        with app.state.db_session_factory() as session:
+            resumed = broker_orders_service.place_broker_order(
+                settings=settings,
+                db=session,
+                adapter=broker_adapter,
+                command=command,
+            )
+        assert resumed.status_code == 201
+        assert len(broker_adapter.order_calls) == 1
+        with app.state.db_session_factory() as session:
+            duplicate = broker_orders_service.place_broker_order(
+                settings=settings,
+                db=session,
+                adapter=broker_adapter,
+                command=command,
+            )
+        assert duplicate.status_code == 200
+        assert duplicate.payload["duplicate"] is True
+        assert len(broker_adapter.order_calls) == 1
+    engine.dispose()
+
+
+def test_direct_sell_reserves_known_open_sell_quantity_before_broker_call() -> None:
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(),
+        account_snapshot=BrokerAccountSnapshot(
+            available_cash=Decimal("1000.00"),
+            observed_at=datetime.now(UTC),
+            source="stub:sell-reservation",
+            holdings=[
+                BrokerAccountHolding(
+                    symbol="005930",
+                    quantity=10,
+                    sellable_quantity=10,
+                    average_price=Decimal("90.00"),
+                )
+            ],
+        ),
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+        ),
+        broker_adapter=broker_adapter,
+    )
+    client = TestClient(app)
+    assert client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "console", "reason": "enable automation"},
+    ).status_code == 200
+    with app.state.db_session_factory() as session:
+        session.add(
+            BrokerOrder(
+                broker_name="kis",
+                mode="paper",
+                idempotency_key="sell-reservation-existing",
+                symbol="005930",
+                side="sell",
+                status="open",
+                quantity=8,
+                asset_class="stock",
+                limit_price=Decimal("100.00"),
+            )
+        )
+        session.commit()
+
+    response = client.post(
+        "/orders",
+        json={
+            "idempotency_key": "sell-reservation-candidate",
+            "symbol": "005930",
+            "side": "sell",
+            "quantity": 3,
+            "order_type": "limit",
+            "limit_price": "100.00",
+            "time_in_force": "day",
+            "exchange": "KRX",
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["block_reason"] == "insufficient_unreserved_position"
+    assert broker_adapter.order_calls == []
+
+    engine.dispose()
+
+
+def test_direct_sell_uses_broker_sellable_quantity_as_the_upper_bound() -> None:
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="live",
+            configured=True,
+            api_base_url=KIS_LIVE_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(),
+        account_snapshot=BrokerAccountSnapshot(
+            available_cash=Decimal("1000.00"),
+            observed_at=datetime.now(UTC),
+            source="stub:sellable-upper-bound",
+            holdings=[
+                BrokerAccountHolding(
+                    symbol="005930",
+                    quantity=10,
+                    sellable_quantity=2,
+                    average_price=Decimal("90.00"),
+                )
+            ],
+        ),
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="live",
+            kis_app_key="live-key",
+            kis_app_secret="live-secret",
+            kis_account_number="12345678",
+        ),
+        broker_adapter=broker_adapter,
+    )
+    client = TestClient(app)
+    assert client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "test", "reason": "enable guarded sell"},
+    ).status_code == 200
+
+    response = client.post(
+        "/orders",
+        json={
+            "idempotency_key": "sellable-upper-bound",
+            "symbol": "005930",
+            "side": "sell",
+            "quantity": 3,
+            "order_type": "limit",
+            "limit_price": "100.00",
+            "time_in_force": "day",
+            "exchange": "KRX",
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["block_reason"] == "insufficient_unreserved_position"
+    assert response.json()["position_quantity"] == 2
+    assert response.json()["total_position_quantity"] == 10
+    assert broker_adapter.order_calls == []
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("unmatched_local_quantity", "expected_status"),
+    [(None, 201), (1, 409)],
+    ids=("broker-open-already-netted", "unmatched-local-still-reserved"),
+)
+def test_sellable_quantity_nets_broker_open_sells_but_not_unmatched_local_intents(
+    unmatched_local_quantity: int | None,
+    expected_status: int,
+) -> None:
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="live",
+            configured=True,
+            api_base_url=KIS_LIVE_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(broker_order_id="sell-after-netted-open"),
+        account_snapshot=BrokerAccountSnapshot(
+            available_cash=Decimal("1000.00"),
+            observed_at=datetime.now(UTC),
+            source="stub:sellable-already-net-of-open-orders",
+            holdings=[
+                BrokerAccountHolding(
+                    symbol="005930",
+                    quantity=10,
+                    sellable_quantity=6,
+                    average_price=Decimal("90.00"),
+                )
+            ],
+            open_orders=[
+                BrokerAccountOpenOrder(
+                    symbol="005930",
+                    side="sell",
+                    quantity=4,
+                    remaining_quantity=4,
+                    broker_order_id="broker-open-sell-4",
+                )
+            ],
+        ),
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="live",
+            kis_app_key="live-key",
+            kis_app_secret="live-secret",
+            kis_account_number="12345678",
+        ),
+        broker_adapter=broker_adapter,
+    )
+    client = TestClient(app)
+    assert client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "test", "reason": "enable guarded sell"},
+    ).status_code == 200
+    if unmatched_local_quantity is not None:
+        with app.state.db_session_factory() as session:
+            session.add(
+                BrokerOrder(
+                    broker_name="kis",
+                    mode="live",
+                    idempotency_key="unmatched-local-sell",
+                    broker_order_id="different-local-sell",
+                    symbol="005930",
+                    side="sell",
+                    status="open",
+                    quantity=unmatched_local_quantity,
+                    asset_class="stock",
+                )
+            )
+            session.commit()
+
+    response = client.post(
+        "/orders",
+        json={
+            "idempotency_key": f"sell-after-netted-open-{unmatched_local_quantity}",
+            "symbol": "005930",
+            "side": "sell",
+            "quantity": 6,
+            "order_type": "market",
+            "time_in_force": "day",
+            "exchange": "KRX",
+        },
+    )
+
+    assert response.status_code == expected_status
+    if expected_status == 201:
+        assert len(broker_adapter.order_calls) == 1
+    else:
+        assert response.json()["block_reason"] == "insufficient_unreserved_position"
+        assert response.json()["reserved_quantity"] == unmatched_local_quantity
+        assert broker_adapter.order_calls == []
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("classification", "code", "message"),
+    [
+        (BrokerErrorClassification.NETWORK, None, "connection reset while awaiting reply"),
+        (BrokerErrorClassification.TRANSIENT, "TIMEOUT", "broker request timed out"),
+    ],
+    ids=("network", "timeout"),
+)
+def test_typed_broker_error_without_rejection_ack_requires_manual_review(
+    classification: BrokerErrorClassification,
+    code: str | None,
+    message: str,
+) -> None:
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_error=BrokerAdapterError(
+            message,
+            status_code=503,
+            classification=classification,
+            retryable=True,
+            code=code,
+            normalized_status=NormalizedBrokerOrderStatus.RETRY_PENDING,
+        ),
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+        ),
+        broker_adapter=broker_adapter,
+    )
+    client = TestClient(app)
+    assert client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "console", "reason": "enable automation"},
+    ).status_code == 200
+
+    response = client.post(
+        "/orders",
+        json={
+            "idempotency_key": f"typed-uncertain-{classification.value}",
+            "symbol": "005930",
+            "side": "buy",
+            "quantity": 2,
+            "order_type": "limit",
+            "limit_price": "71000.00",
+            "time_in_force": "day",
+            "exchange": "KRX",
+        },
+    )
+
+    assert response.status_code == 503
+    payload = response.json()
+    assert payload["manual_reconciliation_required"] is True
+    assert payload["order"]["status"] == "manual_review_required"
+    assert payload["order"]["last_error_classification"] == "submit_outcome_unknown"
+    assert payload["order"]["last_error_retryable"] is False
+    assert {event["event_type"] for event in payload["order"]["events"]} == {
+        "submit_requested",
+        "submit_outcome_unknown",
+    }
+    unknown_event = next(
+        event
+        for event in payload["order"]["events"]
+        if event["event_type"] == "submit_outcome_unknown"
+    )
+    assert unknown_event["payload"]["broker_rejection_acknowledged"] is False
+    assert unknown_event["payload"]["reported_error_classification"] == classification.value
+    assert unknown_event["payload"]["reported_retryable"] is True
+    assert message not in response.text
+
+    replay = client.post(
+        "/orders",
+        json={
+            "idempotency_key": f"typed-uncertain-{classification.value}",
+            "symbol": "005930",
+            "side": "buy",
+            "quantity": 2,
+            "order_type": "limit",
+            "limit_price": "71000.00",
+            "time_in_force": "day",
+            "exchange": "KRX",
+        },
+    )
+    assert replay.status_code == 200
+    assert replay.json()["order"]["status"] == "manual_review_required"
+    assert len(broker_adapter.order_calls) == 1
+
+    engine.dispose()
+
+
+def test_unexpected_auth_failure_is_not_left_submission_pending() -> None:
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        auth_error=RuntimeError("credential backend leaked secret detail"),
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+        ),
+        broker_adapter=broker_adapter,
+    )
+    client = TestClient(app)
+    assert client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "console", "reason": "enable automation"},
+    ).status_code == 200
+    payload = {
+        "idempotency_key": "pre-submit-auth-failure-1",
+        "symbol": "005930",
+        "side": "sell",
+        "quantity": 1,
+        "order_type": "limit",
+        "limit_price": "71000.00",
+        "time_in_force": "day",
+        "exchange": "KRX",
+    }
+
+    response = client.post("/orders", json=payload)
+
+    assert response.status_code == 503
+    assert response.json()["manual_reconciliation_required"] is False
+    assert "leaked secret detail" not in response.text
+    assert broker_adapter.order_calls == []
+    with app.state.db_session_factory() as session:
+        order = session.scalar(
+            select(BrokerOrder).where(
+                BrokerOrder.idempotency_key == "pre-submit-auth-failure-1"
+            )
+        )
+        assert order is not None
+        assert order.status == "failed"
+        assert order.last_error_classification == "pre_submit_failure"
+        assert order.last_error_code == "PRE_SUBMIT_FAILURE"
+        assert [event.event_type for event in order.events] == [
+            "submit_requested",
+            "submit_failed_before_broker_call",
+        ]
+
+    replay = client.post("/orders", json=payload)
+    assert replay.status_code == 200
+    assert replay.json()["duplicate"] is True
+    assert replay.json()["order"]["status"] == "failed"
+    assert broker_adapter.authenticate_calls == 1
 
     engine.dispose()
 
@@ -3370,6 +4464,67 @@ def test_autonomous_monitoring_cycle_evaluates_watch_buy_without_position() -> N
     engine.dispose()
 
 
+def test_live_autonomous_monitoring_does_not_retry_blocked_watch_buy_without_quote() -> None:
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="live",
+            configured=True,
+            api_base_url=KIS_LIVE_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(broker_order_id="kis-live-no-quote-buy"),
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="live",
+            kis_app_key="live-key",
+            kis_app_secret="live-secret",
+            kis_account_number="12345678",
+            watch_buy_live_market_quality_veto_enabled=False,
+            account_drawdown_gate_enabled=False,
+        ),
+        broker_adapter=broker_adapter,
+    )
+    client = TestClient(app)
+    assert client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "console", "reason": "enable guarded live retry"},
+    ).status_code == 200
+    item_id = _create_watch_buy_candidate(
+        client,
+        plan_id="plan-live-no-quote-buy-retry",
+        market_date=None,
+        risk_context={
+            "exchange": "KRX",
+            "stop_price": "70000.00",
+            "trigger_direction": "at_or_above",
+        },
+    )
+
+    with app.state.db_session_factory() as session:
+        item = session.get(ExecutionPlanItem, item_id)
+        assert item is not None
+        item.status = "watch_buy_triggered_blocked"
+        session.commit()
+
+        result = run_autonomous_monitoring_cycle(
+            settings=app.state.settings,
+            db=session,
+            adapter=broker_adapter,
+            prices=[],
+            symbols=["005930"],
+            now=datetime(2026, 6, 8, 0, 3, tzinfo=UTC),
+        )
+
+        assert result.payload["submitted_order_count"] == 0
+        assert session.get(ExecutionPlanItem, item_id).status == "watch_buy_triggered_blocked"
+        assert broker_adapter.order_calls == []
+
+    engine.dispose()
+
+
 def test_watch_buy_drawdown_gate_disabled_releases_prior_block_and_submits() -> None:
     app, engine, client, broker_adapter = _build_watch_buy_test_app(
         order_id="kis-watch-buy-drawdown-release-1"
@@ -4787,6 +5942,89 @@ def test_watch_buy_rejects_stale_quote_without_submitting() -> None:
     engine.dispose()
 
 
+@pytest.mark.parametrize(
+    ("intent", "trigger_price", "observed_price"),
+    [
+        ("target_sell", "110.00", "111.00"),
+        ("stop_sell", "90.00", "89.00"),
+    ],
+)
+def test_price_based_sell_rejects_stale_quote_without_submitting(
+    intent: str,
+    trigger_price: str,
+    observed_price: str,
+) -> None:
+    app, engine, client, broker_adapter = _build_watch_buy_test_app(
+        max_quote_age_seconds=10
+    )
+    plan_response = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": f"plan-{intent}-stale-quote",
+            "source": "kai-trading-core",
+            "items": [
+                {
+                    "symbol": "005930",
+                    "side": "sell",
+                    "intent": intent,
+                    "quantity_policy": {"kind": "shares", "quantity": 1},
+                    "trigger_price": trigger_price,
+                    "time_in_force": "day",
+                    "risk_context": {"exchange": "KRX"},
+                }
+            ],
+        },
+    )
+    assert plan_response.status_code == 201
+    item_id = plan_response.json()["persisted_execution_item_ids"][0]
+    with app.state.db_session_factory() as session:
+        session.add(
+            ExecutionPosition(
+                mode="paper",
+                symbol="005930",
+                quantity=1,
+                average_price=Decimal("100.00"),
+                updated_from="reconciliation",
+                last_reconciled_at=datetime.now(UTC),
+            )
+        )
+        session.commit()
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "stale sell quote must not trigger an order",
+            "prices": [
+                {
+                    "symbol": "005930",
+                    "price": observed_price,
+                    "observed_at": (datetime.now(UTC) - timedelta(seconds=60)).isoformat(),
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    result = next(
+        item
+        for item in response.json()["items"]
+        if item["execution_plan_item_id"] == item_id
+    )
+    assert result["outcome"] == "stale_quote"
+    assert "quote is stale" in result["message"]
+    assert broker_adapter.order_calls == []
+
+    with app.state.db_session_factory() as session:
+        item = session.get(ExecutionPlanItem, item_id)
+        assert item is not None
+        assert item.status == f"{intent}_monitoring"
+        assert item.risk_context["last_monitoring_event"]["reason"] == "stale_quote"
+
+    engine.dispose()
+
+
 def test_watch_buy_safety_pause_keeps_trigger_retryable() -> None:
     app, engine, client, broker_adapter = _build_watch_buy_test_app(resume=False)
     item_id = _create_watch_buy_candidate(
@@ -5111,7 +6349,9 @@ def test_watch_buy_cycle_reserves_orderable_cash_before_broker_submission() -> N
                 side="buy",
                 quantity=10,
                 remaining_quantity=10,
-                limit_price=Decimal("75000.00"),
+                # KIS market orders can report ord_unpr=0. The matching local
+                # quote notional must remain the reservation source.
+                limit_price=Decimal("0"),
                 broker_order_id="kis-existing-open-buy-1",
             )
         ],
@@ -5147,7 +6387,8 @@ def test_watch_buy_cycle_reserves_orderable_cash_before_broker_submission() -> N
                 side="buy",
                 status="open",
                 quantity=10,
-                limit_price=Decimal("75000.00"),
+                quote_notional=Decimal("750000.00"),
+                limit_price=None,
             )
         )
         session.commit()
@@ -5221,6 +6462,87 @@ def test_watch_buy_cycle_reserves_orderable_cash_before_broker_submission() -> N
     assert retry.status_code == 200
     assert retry.json()["submitted_order_count"] == 0
     assert len(broker_adapter.order_calls) == 1
+
+    engine.dispose()
+
+
+def test_live_watch_buy_blocks_when_broker_open_order_truth_is_degraded() -> None:
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="live",
+            configured=True,
+            api_base_url=KIS_LIVE_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(broker_order_id="kis-degraded-open-orders"),
+        account_snapshot=BrokerAccountSnapshot(
+            available_cash=Decimal("1000000.00"),
+            buying_power=Decimal("1000000.00"),
+            observed_at=datetime.now(UTC),
+            source="stub:degraded_open_orders",
+            payload={
+                "open_orders_error": {
+                    "code": "KIER2570",
+                    "message": "open-order date rejected",
+                    "degraded": True,
+                }
+            },
+        ),
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="live",
+            kis_app_key="live-key",
+            kis_app_secret="live-secret",
+            kis_account_number="12345678",
+            watch_buy_live_market_quality_veto_enabled=False,
+            account_drawdown_gate_enabled=False,
+        ),
+        broker_adapter=broker_adapter,
+    )
+    client = TestClient(app)
+    assert client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "console", "reason": "enable guarded live buy"},
+    ).status_code == 200
+    _create_watch_buy_candidate(
+        client,
+        plan_id="plan-live-degraded-open-orders",
+        market_date=None,
+        risk_context={
+            "exchange": "KRX",
+            "stop_price": "70000.00",
+            "trigger_direction": "at_or_above",
+        },
+    )
+    observed_at = datetime.now(UTC)
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "degraded open-order truth must block live sizing",
+            "observed_at": observed_at.isoformat(),
+            "prices": [
+                {
+                    "symbol": "005930",
+                    "price": "71050.00",
+                    "observed_at": observed_at.isoformat(),
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["submitted_order_count"] == 0
+    assert payload["blocked_item_count"] == 1
+    assert payload["items"][0]["block_reason"] == "account_snapshot_unavailable"
+    assert "open-order truth is degraded" in payload["items"][0]["message"]
+    assert broker_adapter.order_calls == []
 
     engine.dispose()
 
@@ -6628,7 +7950,13 @@ def test_monitoring_submits_post_entry_max_holding_close_sell() -> None:
             "source": "test",
             "reason": "max holding exit should close stale position",
             "observed_at": "2026-06-15T01:00:00Z",
-            "prices": [{"symbol": "005930", "price": "100000.00"}],
+            "prices": [
+                {
+                    "symbol": "005930",
+                    "price": "100000.00",
+                    "observed_at": "2026-06-10T01:00:00Z",
+                }
+            ],
         },
     )
 
@@ -7009,7 +8337,206 @@ def test_monitoring_rearms_stop_to_breakeven_after_partial_take_profit() -> None
     engine.dispose()
 
 
-def test_monitoring_does_not_commit_partial_take_profit_without_stop_rearm(
+def test_fresh_broker_position_does_not_reserve_a_filled_sell_again() -> None:
+    settings = Settings(database_url="sqlite:///:memory:", runtime_mode="live")
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    with session_factory() as session:
+        order = BrokerOrder(
+            broker_name="kis",
+            mode="live",
+            idempotency_key="filled-sell-already-in-position",
+            symbol="005930",
+            side="sell",
+            status="filled",
+            quantity=4,
+            asset_class="stock",
+            limit_price=Decimal("102000"),
+        )
+        session.add(order)
+        session.commit()
+        position = ExecutionPosition(
+            mode="live",
+            symbol="005930",
+            quantity=6,
+            updated_from="broker_snapshot",
+            last_reconciled_at=datetime(2027, 1, 1, tzinfo=UTC),
+        )
+        remaining = {"005930": 6}
+
+        _reserve_existing_exit_orders(
+            settings=settings,
+            db=session,
+            remaining_quantities_by_symbol=remaining,
+            positions_by_symbol={"005930": position},
+            rearmed_plan_item_ids=set(),
+        )
+
+        assert remaining == {"005930": 6}
+    engine.dispose()
+
+
+def test_partial_sell_reserves_only_unfilled_quantity_from_fresh_position() -> None:
+    settings = Settings(database_url="sqlite:///:memory:", runtime_mode="live")
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    with session_factory() as session:
+        order = BrokerOrder(
+            broker_name="kis",
+            mode="live",
+            idempotency_key="partial-sell-reservation",
+            symbol="005930",
+            side="sell",
+            status="partially_filled",
+            quantity=4,
+            asset_class="stock",
+            limit_price=Decimal("102000"),
+        )
+        session.add(order)
+        session.flush()
+        session.add(
+            ExecutionFill(
+                broker_order_pk=order.id,
+                broker_fill_id="partial-sell-fill-2",
+                symbol="005930",
+                side="sell",
+                quantity=2,
+                price=Decimal("102000"),
+                filled_at=datetime(2026, 8, 26, 1, 0, tzinfo=UTC),
+            )
+        )
+        session.commit()
+        position = ExecutionPosition(
+            mode="live",
+            symbol="005930",
+            quantity=8,
+            updated_from="broker_snapshot",
+            last_reconciled_at=datetime(2026, 8, 26, 2, 0, tzinfo=UTC),
+        )
+        remaining = {"005930": 8}
+
+        _reserve_existing_exit_orders(
+            settings=settings,
+            db=session,
+            remaining_quantities_by_symbol=remaining,
+            positions_by_symbol={"005930": position},
+            rearmed_plan_item_ids=set(),
+        )
+
+        assert remaining == {"005930": 6}
+    engine.dispose()
+
+
+def test_sell_reservation_deduplicates_repeated_broker_fill_rows() -> None:
+    settings = Settings(database_url="sqlite:///:memory:", runtime_mode="live")
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    with session_factory() as session:
+        order = BrokerOrder(
+            broker_name="kis",
+            mode="live",
+            idempotency_key="duplicate-partial-fill-reservation",
+            symbol="005930",
+            side="sell",
+            status="partially_filled",
+            quantity=10,
+            asset_class="stock",
+            limit_price=Decimal("102000"),
+        )
+        session.add(order)
+        session.flush()
+        for fill_id in ("duplicate-fill-a", "duplicate-fill-b"):
+            session.add(
+                ExecutionFill(
+                    id=fill_id,
+                    broker_order_pk=order.id,
+                    broker_fill_id="same-broker-fill",
+                    symbol="005930",
+                    side="sell",
+                    quantity=4,
+                    price=Decimal("102000"),
+                    filled_at=datetime(2026, 8, 26, 1, 0, tzinfo=UTC),
+                )
+            )
+        session.commit()
+        position = ExecutionPosition(
+            mode="live",
+            symbol="005930",
+            quantity=6,
+            updated_from="broker_snapshot",
+            last_reconciled_at=datetime(2026, 8, 26, 2, 0, tzinfo=UTC),
+        )
+        remaining = {"005930": 6}
+
+        _reserve_existing_exit_orders(
+            settings=settings,
+            db=session,
+            remaining_quantities_by_symbol=remaining,
+            positions_by_symbol={"005930": position},
+            rearmed_plan_item_ids=set(),
+        )
+
+        assert remaining == {}
+    engine.dispose()
+
+
+def test_sell_fill_newer_than_position_truth_reduces_replacement_quantity() -> None:
+    settings = Settings(database_url="sqlite:///:memory:", runtime_mode="live")
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    with session_factory() as session:
+        order = BrokerOrder(
+            broker_name="kis",
+            mode="live",
+            idempotency_key="filled-after-position-snapshot",
+            symbol="005930",
+            side="sell",
+            status="filled",
+            quantity=4,
+            asset_class="stock",
+            limit_price=Decimal("102000"),
+            last_broker_sync_at=datetime(2026, 8, 26, 1, 0, tzinfo=UTC),
+        )
+        session.add(order)
+        session.flush()
+        session.add(
+            ExecutionFill(
+                broker_order_pk=order.id,
+                broker_fill_id="filled-after-position-snapshot-fill",
+                symbol="005930",
+                side="sell",
+                quantity=4,
+                price=Decimal("102000"),
+                filled_at=datetime(2026, 8, 26, 1, 0, tzinfo=UTC),
+            )
+        )
+        session.commit()
+        position = ExecutionPosition(
+            mode="live",
+            symbol="005930",
+            quantity=10,
+            updated_from="broker_snapshot",
+            last_reconciled_at=datetime(2026, 8, 26, 0, 59, tzinfo=UTC),
+        )
+        remaining = {"005930": 10}
+
+        _reserve_existing_exit_orders(
+            settings=settings,
+            db=session,
+            remaining_quantities_by_symbol=remaining,
+            positions_by_symbol={"005930": position},
+            rearmed_plan_item_ids=set(),
+        )
+
+        assert remaining == {"005930": 6}
+    engine.dispose()
+
+
+def test_monitoring_keeps_broker_ack_when_partial_take_profit_stop_rearm_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     broker_adapter = StubBrokerAdapter(
@@ -7118,14 +8645,33 @@ def test_monitoring_does_not_commit_partial_take_profit_without_stop_rearm(
         stop_item = session.get(ExecutionPlanItem, stop_item_id)
         assert target_item is not None
         assert stop_item is not None
-        assert target_item.status == "target_sell_monitoring"
+        assert target_item.status == "broker_order_submitted"
         assert stop_item.trigger_price == Decimal("97000.0000")
         assert stop_item.quantity_policy == {"kind": "shares", "quantity": 10}
         assert stop_item.risk_context == {"exchange": "KRX"}
         order = session.scalar(
             select(BrokerOrder).where(BrokerOrder.execution_plan_item_id == target_item_id)
         )
-        assert order is None
+        assert order is not None
+        assert order.status == "submitted"
+        assert order.broker_order_id == "kis-partial-profit-rollback"
+
+    retry = client.post(
+        "/orders",
+        json={
+            "idempotency_key": f"monitoring:target_sell:{target_item_id}",
+            "execution_plan_item_id": target_item_id,
+            "symbol": "005930",
+            "side": "sell",
+            "quantity": 4,
+            "order_type": "market",
+            "time_in_force": "day",
+            "exchange": "KRX",
+        },
+    )
+    assert retry.status_code == 200
+    assert retry.json()["duplicate"] is True
+    assert len(broker_adapter.order_calls) == 1
 
     engine.dispose()
 
@@ -8308,6 +9854,102 @@ def test_monitoring_evaluate_tracks_remaining_shares_across_triggered_items() ->
     engine.dispose()
 
 
+def test_monitoring_reserves_cross_day_unknown_sell_outcome_before_sibling_exit() -> None:
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(broker_order_id="must-not-submit"),
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+        ),
+        broker_adapter=broker_adapter,
+    )
+    client = TestClient(app)
+    assert client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "console", "reason": "enable automation"},
+    ).status_code == 200
+    plan_response = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-cross-day-unknown-sell-reservation",
+            "source": "kai-trading-core",
+            "items": [
+                {
+                    "symbol": "005930",
+                    "side": "sell",
+                    "intent": "target_sell",
+                    "quantity_policy": {"kind": "shares", "quantity": 10},
+                    "trigger_price": "125000.00",
+                    "time_in_force": "day",
+                    "risk_context": {"exchange": "KRX"},
+                }
+            ],
+        },
+    )
+    assert plan_response.status_code == 201
+
+    prior_day = datetime(2026, 8, 6, 2, 0, tzinfo=UTC)
+    with app.state.db_session_factory() as session:
+        session.add_all(
+            [
+                ExecutionPosition(
+                    mode="paper",
+                    symbol="005930",
+                    quantity=10,
+                    average_price=Decimal("120000.0000"),
+                    updated_from="reconciliation",
+                    last_reconciled_at=prior_day,
+                    raw_payload={"source": "broker"},
+                ),
+                BrokerOrder(
+                    broker_name="kis",
+                    mode="paper",
+                    idempotency_key="unknown-prior-day-sell",
+                    broker_order_id=None,
+                    symbol="005930",
+                    side="sell",
+                    status="manual_review_required",
+                    quantity=10,
+                    limit_price=Decimal("124000.0000"),
+                    last_error_classification="submit_outcome_unknown",
+                    last_error_code="SUBMIT_OUTCOME_UNKNOWN",
+                    last_error_retryable=False,
+                    created_at=prior_day,
+                    updated_at=prior_day,
+                ),
+            ]
+        )
+        session.commit()
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "unknown prior sell must reserve held quantity",
+            "observed_at": "2026-08-07T02:00:00Z",
+            "prices": [{"symbol": "005930", "price": "125100.00"}],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["submitted_order_count"] == 0
+    assert broker_adapter.order_calls == []
+    engine.dispose()
+
+
 def test_monitoring_evaluate_ignores_triggered_sell_for_non_held_symbol() -> None:
     broker_adapter = StubBrokerAdapter(
         config=BrokerConfig(
@@ -9094,6 +10736,7 @@ def test_place_order_endpoint_persists_retryable_failure() -> None:
     assert payload["order"]["status"] == "retry_pending"
     assert payload["order"]["last_error_classification"] == "rate_limit"
     assert payload["order"]["last_error_retryable"] is True
+    assert payload["manual_reconciliation_required"] is False
     assert {event["event_type"] for event in payload["order"]["events"]} == {
         "submit_requested",
         "submit_failed",
@@ -9976,7 +11619,11 @@ def test_autonomous_monitoring_loop_triggers_target_sell_from_price_source() -> 
             )
             session.commit()
 
-        wait_for(lambda: len(broker_adapter.order_calls) == 1)
+        wait_for(
+            lambda: len(broker_adapter.order_calls) == 1
+            and app.state.autonomous_runtime.snapshot()["monitoring"]["last_success_at"]
+            is not None
+        )
 
         runtime_status = client.get("/runtime/status")
         assert runtime_status.status_code == 200
@@ -10381,6 +12028,19 @@ def test_autonomous_monitoring_loop_retries_pending_dispatch_after_restart_with_
         ),
         token_grant=build_token_grant(),
         order_placement=build_order_placement(broker_order_id="kis-monitor-restarted-2"),
+        account_snapshot=BrokerAccountSnapshot(
+            available_cash=Decimal("1000000.00"),
+            observed_at=datetime.now(UTC),
+            source="stub:restart-position-truth",
+            holdings=[
+                BrokerAccountHolding(
+                    symbol="005930",
+                    quantity=2,
+                    sellable_quantity=2,
+                    average_price=Decimal("120000.00"),
+                )
+            ],
+        ),
     )
     restarted_app, restarted_engine = build_test_app(
         settings=Settings(

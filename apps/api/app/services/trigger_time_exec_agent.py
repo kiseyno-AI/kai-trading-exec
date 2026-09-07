@@ -28,22 +28,16 @@ from app.models.runtime import BrokerOrder, ExecutionPlan, ExecutionPlanItem, Ex
 from app.services.broker_auth import ensure_authenticated_broker_session
 from app.services.live_market_context import load_live_market_regime_context, merge_live_market_regime_context
 from app.services.plan_item_identity import serialize_plan_item_source_identity
-from app.services.broker_order_state import active_local_broker_order_filters
+from app.services.broker_order_state import (
+    CAPITAL_RESERVING_ORDER_STATUSES,
+    active_local_broker_order_filters,
+)
 from app.services.json_compaction import compact_json_object, compact_json_payload, json_payload_hash
 from app.services.trade_outcome_feedback import load_latest_trade_outcome_feedback_snippet
 
 TRIGGER_TIME_EXEC_AGENT_VERSION = "trigger-time-exec-agent-v1"
 TRIGGER_TIME_REASON_MAX_LENGTH = 1000
-OPEN_ORDER_STATUSES = frozenset(
-    {
-        "submission_pending",
-        "submitted",
-        "open",
-        "partially_filled",
-        "retry_pending",
-        "cancel_pending",
-    }
-)
+OPEN_ORDER_STATUSES = frozenset(CAPITAL_RESERVING_ORDER_STATUSES)
 AGENT_PENDING_STATUS = "triggered_pending_agent"
 AGENT_DELAY_STATUS = "agent_delay"
 AGENT_REJECTED_STATUS = "agent_rejected"
@@ -127,23 +121,7 @@ def trigger_time_exec_agent_enabled(*, settings: Settings, item: ExecutionPlanIt
 
 
 def deterministic_emergency_stop_required(item: ExecutionPlanItem) -> bool:
-    if item.side != "sell" or item.intent != "stop_sell":
-        return False
-    risk_context = item.risk_context if isinstance(item.risk_context, dict) else {}
-    for key in (
-        "deterministic_emergency_stop",
-        "emergency_stop",
-        "bypass_trigger_time_exec_agent",
-    ):
-        if risk_context.get(key) is True:
-            return True
-    execution_policy = risk_context.get("execution_policy")
-    if isinstance(execution_policy, str) and execution_policy.strip().lower() in {
-        "deterministic_emergency_stop",
-        "emergency_stop",
-    }:
-        return True
-    return False
+    return item.side == "sell" and item.intent == "stop_sell"
 
 
 def resolve_trigger_time_exec_agent_decision(

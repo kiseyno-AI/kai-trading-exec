@@ -1,11 +1,14 @@
 import logging
 import faulthandler
+from hmac import compare_digest
+from ipaddress import ip_address
 import signal
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from typing import Callable
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -24,6 +27,7 @@ from app.services.alpaca_crypto_runtime import AlpacaCryptoRuntimeCoordinator
 from app.services.alpaca_us_equity_runtime import AlpacaUsEquityRuntimeCoordinator
 from app.services.monitoring_price_source import build_default_monitoring_price_source
 from app.services.runtime import RuntimeMetadata
+from app.services.runtime_controls import ensure_runtime_control_state
 
 LOGGER = logging.getLogger(__name__)
 
@@ -37,6 +41,7 @@ def create_app(
     monitoring_price_source: object | None = None,
 ) -> FastAPI:
     app_settings = settings or get_settings()
+    _validate_api_security(app_settings)
     configure_logging(app_settings)
     try:
         faulthandler.register(signal.SIGUSR1, all_threads=True, chain=False)
@@ -83,6 +88,11 @@ def create_app(
                 "runtime_mode": app_settings.runtime_mode,
             },
         )
+        if app_settings.autonomous_runtime_enabled:
+            # Bootstrap the fail-closed control row before any background
+            # worker can race an operator request for the same singleton.
+            with db_session_factory() as db:
+                ensure_runtime_control_state(settings=app_settings, db=db)
         await autonomous_runtime.start()
         await alpaca_crypto_runtime.start()
         await alpaca_us_equity_runtime.start()
@@ -106,12 +116,66 @@ def create_app(
     app.state.alpaca_crypto_runtime = alpaca_crypto_runtime
     app.state.alpaca_us_equity_runtime = alpaca_us_equity_runtime
 
+    @app.middleware("http")
+    async def require_api_bearer_token(request: Request, call_next):  # type: ignore[no-untyped-def]
+        configured_token = (app_settings.api_bearer_token or "").strip()
+        if request.method == "OPTIONS" or request.url.path == "/health":
+            return await call_next(request)
+        if configured_token:
+            scheme, _, credentials = request.headers.get("Authorization", "").partition(" ")
+            authorized = (
+                scheme.lower() == "bearer"
+                and bool(credentials)
+                and compare_digest(credentials, configured_token)
+            )
+        else:
+            # Uvicorn CLI flags can bind more broadly than Settings.api_host.
+            # With no token, enforce loopback at request time as a second,
+            # independent boundary so a mismatched bind cannot expose writes.
+            authorized = _request_is_loopback(request)
+        if not authorized:
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "Unauthorized"},
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        return await call_next(request)
+
     app.include_router(health_router)
     app.include_router(runtime_router)
     app.include_router(broker_router)
     app.include_router(controls_router)
     app.include_router(execution_router)
     return app
+
+
+def _validate_api_security(settings: Settings) -> None:
+    if _is_loopback_host(settings.api_host):
+        return
+    if (settings.api_bearer_token or "").strip():
+        return
+    raise ValueError(
+        "KAI_EXEC_API_BEARER_TOKEN is required when KAI_EXEC_API_HOST is not loopback"
+    )
+
+
+def _is_loopback_host(host: str) -> bool:
+    normalized = host.strip().strip("[]").lower()
+    if normalized == "localhost":
+        return True
+    try:
+        return ip_address(normalized).is_loopback
+    except ValueError:
+        return False
+
+
+def _request_is_loopback(request: Request) -> bool:
+    client_host = request.client.host if request.client is not None else ""
+    # Starlette's in-process TestClient uses a non-network sentinel address.
+    if client_host == "testclient":
+        return True
+    request_host = request.url.hostname or ""
+    return _is_loopback_host(client_host) and _is_loopback_host(request_host)
 
 
 app = create_app()

@@ -200,10 +200,6 @@ class AutonomousRuntimeCoordinator:
     async def start(self) -> None:
         if not self.settings.autonomous_runtime_enabled:
             return
-        regular_market_session = _is_regular_market_session(
-            now=datetime.now(UTC),
-            market_timezone=self.settings.market_timezone,
-        )
         self._dispatch_task = asyncio.create_task(
             self._run_periodic_loop(
                 worker_key="dispatch",
@@ -216,7 +212,11 @@ class AutonomousRuntimeCoordinator:
                 worker_key="monitoring",
                 interval_seconds=self.settings.monitoring_loop_interval_seconds,
                 cycle=self._run_monitoring_cycle,
-                run_immediately=regular_market_session,
+                # Let startup/control initialization finish before the first
+                # DB-backed cycle. A one-interval delay also prevents an
+                # in-memory SQLite test/runtime from sharing one connection
+                # with the first operator request.
+                run_immediately=False,
             )
         )
         if self.settings.runtime_mode == "live":
@@ -506,19 +506,22 @@ class AutonomousRuntimeCoordinator:
         return payload
 
     def _monitoring_cycle_sync(self, started_at: datetime) -> dict[str, object]:
+        if self.settings.runtime_mode == "live" and self.session_factory is not None:
+            if not self._reconcile_and_refresh_monitoring_snapshot_if_due(started_at):
+                raise RuntimeError("live broker position reconciliation failed")
         core_desired_symbols = _load_core_desired_monitoring_symbols(settings=self.settings)
         local_desired_symbols = self._load_local_desired_monitoring_symbols()
-        monitoring_candidates = local_desired_symbols or core_desired_symbols
-        desired_symbols = [
-            symbol
-            for symbol in monitoring_candidates
-            if _is_krx_symbol(symbol)
-        ]
+        desired_symbols = (
+            local_desired_symbols
+            if local_desired_symbols
+            else [symbol for symbol in core_desired_symbols if _is_krx_symbol(symbol)]
+        )
         if desired_symbols:
+            desired_symbol_set = set(desired_symbols)
             position_symbols = {
                 symbol
                 for symbol in self._load_local_position_symbols()
-                if _is_krx_symbol(symbol)
+                if symbol in desired_symbol_set
             }
             symbols, self._monitoring_symbol_cursor = _select_monitoring_symbol_batch(
                 desired_symbols=desired_symbols,
@@ -526,7 +529,7 @@ class AutonomousRuntimeCoordinator:
                 batch_size=max(int(self.settings.monitoring_max_symbols_per_cycle or 0), 1),
                 cursor=self._monitoring_symbol_cursor,
             )
-            if self._monitoring_state.last_success_at is not None:
+            if self.session_factory is not None:
                 self._reconcile_monitoring_orders_if_due(
                     now=started_at,
                     symbols=set(symbols),
@@ -806,6 +809,7 @@ class AutonomousRuntimeCoordinator:
         reason: str,
         reconcile_broker: bool,
     ) -> MonitoringRuntimeSnapshot:
+        broker_reconciliation_succeeded = False
         if reconcile_broker and self.settings.runtime_mode == "live":
             adapter = self.broker_adapter_factory(self.settings)
             with self.session_factory() as db:
@@ -816,17 +820,21 @@ class AutonomousRuntimeCoordinator:
                         adapter=adapter,
                         symbols=None,
                         discover_krx_holdings=True,
+                        discover_us_holdings=self.settings.kis_us_trading_enabled,
                     )
                     db.commit()
                 except Exception:
+                    db.rollback()
                     LOGGER.exception(
                         "monitoring_snapshot_broker_reconcile_failed",
                         extra={"reason": reason, "runtime_mode": self.settings.runtime_mode},
                     )
+                else:
+                    broker_reconciliation_succeeded = True
         snapshot = self._load_monitoring_runtime_snapshot(loaded_at)
         with self._lock:
             self._monitoring_runtime_snapshot = snapshot
-            if reconcile_broker:
+            if broker_reconciliation_succeeded:
                 self._monitoring_snapshot_last_reconciled_at = loaded_at
         LOGGER.info(
             "monitoring_runtime_snapshot_refreshed",
@@ -837,21 +845,24 @@ class AutonomousRuntimeCoordinator:
                 "item_count": len(snapshot.items),
                 "position_count": len(snapshot.positions_by_symbol),
                 "reconcile_broker": reconcile_broker,
+                "broker_reconciliation_succeeded": broker_reconciliation_succeeded,
             },
         )
         return snapshot
 
-    def _reconcile_and_refresh_monitoring_snapshot_if_due(self, now: datetime) -> None:
+    def _reconcile_and_refresh_monitoring_snapshot_if_due(self, now: datetime) -> bool:
         last_reconciled_at = self._monitoring_snapshot_last_reconciled_at
         if last_reconciled_at is not None:
             elapsed = (now - last_reconciled_at).total_seconds()
             if elapsed < self.settings.exec_agent_max_account_snapshot_age_seconds:
-                return
+                return True
         self._refresh_monitoring_runtime_snapshot(
             loaded_at=now,
             reason="periodic_broker_truth_refresh",
             reconcile_broker=True,
         )
+        reconciled_at = self._monitoring_snapshot_last_reconciled_at
+        return reconciled_at is not None and reconciled_at >= now
 
     async def _run_daily_krx_position_discovery_loop(self) -> None:
         while True:
@@ -1098,6 +1109,11 @@ class AutonomousRuntimeCoordinator:
             return []
         if not url.drivername.startswith("sqlite") or not url.database or url.database == ":memory:":
             return []
+        # The ORM path performs provider/asset/exchange-aware routing for KIS
+        # overseas symbols. The lightweight SQL path intentionally remains
+        # KRX-only so it cannot absorb Alpaca positions from a shared database.
+        if self.settings.kis_us_trading_enabled:
+            return []
         configured_limit = int(self.settings.monitoring_max_symbols_per_cycle or 0)
         limit = max(configured_limit * 4, 128) if configured_limit > 0 else 128
         buy_statuses = tuple(ACTIVE_WATCH_MONITORING_STATUSES)
@@ -1148,7 +1164,7 @@ class AutonomousRuntimeCoordinator:
         seen: set[str] = set()
         for row in position_rows:
             symbol = str(row[0] or "").strip()
-            if not symbol or symbol in seen:
+            if not _is_krx_symbol(symbol) or symbol in seen:
                 continue
             ordered.append(symbol)
             seen.add(symbol)
@@ -1161,7 +1177,7 @@ class AutonomousRuntimeCoordinator:
             if len(ordered) >= local_limit:
                 break
             symbol = str(row[0] or "").strip()
-            if not symbol or symbol in seen:
+            if not _is_krx_symbol(symbol) or symbol in seen:
                 continue
             ordered.append(symbol)
             seen.add(symbol)
@@ -1866,12 +1882,11 @@ def _select_monitoring_symbol_batch(
     limit = max(int(batch_size), 1)
     priority = [symbol for symbol in desired_symbols if symbol in priority_symbols]
     rotating = [symbol for symbol in desired_symbols if symbol not in priority_symbols]
-    selected = priority[:limit]
-    remaining = limit - len(selected)
-    if remaining <= 0 or not rotating:
+    selected = list(priority)
+    if not rotating:
         return selected, cursor % max(len(rotating), 1)
     start = cursor % len(rotating)
-    take = min(remaining, len(rotating))
+    take = min(limit, len(rotating))
     selected.extend(rotating[(start + offset) % len(rotating)] for offset in range(take))
     return selected, (start + take) % len(rotating)
 

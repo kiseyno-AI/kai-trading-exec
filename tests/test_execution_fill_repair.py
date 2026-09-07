@@ -115,6 +115,252 @@ def test_missing_fill_detection_reports_evidence_and_proposed_fields() -> None:
     engine.dispose()
 
 
+def test_missing_explicit_fractional_fill_preserves_fee_and_currency_evidence() -> None:
+    settings = _settings()
+    engine, db = _session(settings)
+    order = BrokerOrder(
+        broker_name="upbit",
+        mode="paper",
+        idempotency_key="repair-explicit-crypto-fill",
+        broker_order_id="upbit-explicit-fill-1",
+        symbol="KRW-BTC",
+        side="buy",
+        status="filled",
+        quantity=None,
+        base_quantity=Decimal("0.00123456"),
+        quote_notional=Decimal("75000.5000"),
+        asset_class="crypto",
+        venue="UPBIT",
+        submitted_at=FILLED_AT,
+        raw_broker_payload={
+            "fills": [
+                {
+                    "broker_fill_id": "upbit-trade-1",
+                    "symbol": "KRW-BTC",
+                    "side": "buy",
+                    "base_quantity": "0.00123456",
+                    "quote_notional": "75000.5000",
+                    "price": "60750445.4470",
+                    "filled_at": FILLED_AT.isoformat(),
+                    "settlement_currency": "KRW",
+                    "commission": "7.25",
+                    "fee": "2.75",
+                    "tax": "0",
+                    "transaction_cost_coverage": "complete",
+                    "transaction_cost_source": "broker_payload:explicit_fee_bundle",
+                }
+            ]
+        },
+    )
+    db.add(order)
+    db.commit()
+
+    dry_run = analyze_execution_fill_repairs(db=db, runtime_mode="paper")
+    proposed = dry_run["missing_filled_orders"][0]["proposed_fills"][0]
+
+    assert proposed["quantity"] == 0
+    assert proposed["base_quantity"] == "0.00123456"
+    assert proposed["quote_notional"] == "75000.5000"
+    assert proposed["settlement_currency"] == "KRW"
+    assert proposed["transaction_cost"] == "10.00"
+    assert proposed["transaction_cost_coverage"] == "complete"
+    assert proposed["transaction_cost_source"] == "broker_payload:explicit_fee_bundle"
+
+    applied = apply_execution_fill_repairs(
+        db=db,
+        runtime_mode="paper",
+        actor="test-operator",
+        reason="restore explicit crypto fill economics",
+        now=FILLED_AT,
+    )
+    repeated = apply_execution_fill_repairs(
+        db=db,
+        runtime_mode="paper",
+        actor="test-operator",
+        reason="restore explicit crypto fill economics",
+        now=FILLED_AT,
+    )
+
+    fill = db.scalar(select(ExecutionFill).where(ExecutionFill.broker_order_pk == order.id))
+    assert applied["summary"]["inserted_fill_count"] == 1
+    assert repeated["summary"]["inserted_fill_count"] == 0
+    assert fill is not None
+    assert fill.quantity == 0
+    assert fill.base_quantity == Decimal("0.001234560000")
+    assert fill.quote_notional == Decimal("75000.5000")
+    assert fill.settlement_currency == "KRW"
+    assert fill.transaction_cost == Decimal("10.00000000")
+    assert fill.transaction_cost_coverage == "complete"
+    assert fill.transaction_cost_source == "broker_payload:explicit_fee_bundle"
+    engine.dispose()
+
+
+def test_missing_fractional_fill_dedupe_uses_base_quantity_and_quote_notional() -> None:
+    settings = _settings()
+    engine, db = _session(settings)
+    order = BrokerOrder(
+        broker_name="upbit",
+        mode="paper",
+        idempotency_key="repair-distinct-fractional-fills",
+        broker_order_id="upbit-distinct-fills-1",
+        symbol="KRW-ETH",
+        side="buy",
+        status="filled",
+        base_quantity=Decimal("0.003"),
+        quote_notional=Decimal("30.0000"),
+        asset_class="crypto",
+        venue="UPBIT",
+        submitted_at=FILLED_AT,
+        raw_broker_payload={
+            "fills": [
+                {
+                    "base_quantity": "0.001",
+                    "quote_notional": "10.0000",
+                    "price": "10000",
+                    "filled_at": FILLED_AT.isoformat(),
+                },
+                {
+                    "base_quantity": "0.002",
+                    "quote_notional": "20.0000",
+                    "price": "10000",
+                    "filled_at": FILLED_AT.isoformat(),
+                },
+            ]
+        },
+    )
+    db.add(order)
+    db.commit()
+
+    result = apply_execution_fill_repairs(
+        db=db,
+        runtime_mode="paper",
+        actor="test-operator",
+        reason="retain distinct fractional executions",
+        now=FILLED_AT,
+    )
+
+    fills = db.scalars(
+        select(ExecutionFill)
+        .where(ExecutionFill.broker_order_pk == order.id)
+        .order_by(ExecutionFill.base_quantity.asc())
+    ).all()
+    assert result["summary"]["inserted_fill_count"] == 2
+    assert [fill.quantity for fill in fills] == [0, 0]
+    assert [fill.base_quantity for fill in fills] == [
+        Decimal("0.001000000000"),
+        Decimal("0.002000000000"),
+    ]
+    assert [fill.quote_notional for fill in fills] == [
+        Decimal("10.0000"),
+        Decimal("20.0000"),
+    ]
+    assert fills[0].idempotency_key != fills[1].idempotency_key
+    engine.dispose()
+
+
+def test_missing_cumulative_fractional_fill_preserves_scoped_total_cost() -> None:
+    settings = _settings()
+    engine, db = _session(settings)
+    order = BrokerOrder(
+        broker_name="alpaca",
+        mode="paper",
+        idempotency_key="repair-cumulative-fractional-fill",
+        broker_order_id="alpaca-cumulative-fill-1",
+        symbol="BTC/USD",
+        side="buy",
+        status="filled",
+        quantity=None,
+        base_quantity=Decimal("0.0015"),
+        quote_notional=Decimal("30.0000"),
+        asset_class="crypto",
+        venue="ALPACA",
+        submitted_at=FILLED_AT,
+        raw_broker_payload={
+            "broker_fill_id": "alpaca-cumulative-fill-1",
+            "filled_base_quantity": "0.0015",
+            "quote_notional": "30.0000",
+            "average_fill_price": "20000",
+            "filled_at": FILLED_AT.isoformat(),
+            "settlement_currency": "USD",
+            "total_transaction_cost": "0.02000000",
+            "transaction_cost_coverage": "complete",
+            "transaction_cost_source": "broker_payload:reported_order_total",
+            "transaction_cost_scope": "cumulative",
+        },
+    )
+    db.add(order)
+    db.commit()
+
+    dry_run = analyze_execution_fill_repairs(db=db, runtime_mode="paper")
+    proposed = dry_run["missing_filled_orders"][0]["proposed_fills"][0]
+
+    assert proposed["quantity"] == 0
+    assert proposed["base_quantity"] == "0.0015"
+    assert proposed["quote_notional"] == "30.0000"
+    assert proposed["transaction_cost_scope"] == "cumulative"
+    assert proposed["settlement_currency"] == "USD"
+    assert proposed["transaction_cost"] == "0.02000000"
+    assert proposed["transaction_cost_coverage"] == "complete"
+
+    result = apply_execution_fill_repairs(
+        db=db,
+        runtime_mode="paper",
+        actor="test-operator",
+        reason="restore cumulative fractional fill",
+        now=FILLED_AT,
+    )
+
+    fill = db.scalar(select(ExecutionFill).where(ExecutionFill.broker_order_pk == order.id))
+    assert result["summary"]["inserted_fill_count"] == 1
+    assert fill is not None
+    assert fill.quantity == 0
+    assert fill.base_quantity == Decimal("0.001500000000")
+    assert fill.quote_notional == Decimal("30.0000")
+    assert fill.settlement_currency == "USD"
+    assert fill.transaction_cost == Decimal("0.02000000")
+    assert fill.transaction_cost_coverage == "complete"
+    assert fill.transaction_cost_source == "broker_payload:reported_order_total"
+    engine.dispose()
+
+
+def test_missing_cumulative_fill_does_not_trust_unscoped_total_cost() -> None:
+    settings = _settings()
+    engine, db = _session(settings)
+    order = BrokerOrder(
+        broker_name="alpaca",
+        mode="paper",
+        idempotency_key="repair-unscoped-cumulative-cost",
+        broker_order_id="alpaca-unscoped-cumulative-1",
+        symbol="ETH/USD",
+        side="buy",
+        status="filled",
+        base_quantity=Decimal("0.01"),
+        asset_class="crypto",
+        venue="ALPACA",
+        submitted_at=FILLED_AT,
+        raw_broker_payload={
+            "filled_base_quantity": "0.01",
+            "average_fill_price": "3000",
+            "filled_at": FILLED_AT.isoformat(),
+            "settlement_currency": "USD",
+            "total_transaction_cost": "0.03",
+            "transaction_cost_coverage": "complete",
+        },
+    )
+    db.add(order)
+    db.commit()
+
+    dry_run = analyze_execution_fill_repairs(db=db, runtime_mode="paper")
+    proposed = dry_run["missing_filled_orders"][0]["proposed_fills"][0]
+
+    assert proposed["transaction_cost"] is None
+    assert proposed["transaction_cost_coverage"] == "unknown"
+    assert proposed["transaction_cost_source"] == (
+        "broker_payload:ambiguous_reconstructed_cumulative_cost_scope"
+    )
+    engine.dispose()
+
+
 def test_duplicate_fill_detection_reports_retained_and_deleted_rows() -> None:
     settings = _settings()
     engine, db = _session(settings)
@@ -149,6 +395,143 @@ def test_duplicate_fill_detection_reports_retained_and_deleted_rows() -> None:
     assert group["symbol"] == "282330"
     assert group["retained_fill"]["id"] == first.id
     assert [row["id"] for row in group["duplicate_fills"]] == [second.id]
+    engine.dispose()
+
+
+def test_duplicate_repair_does_not_choose_richer_economics_without_broker_truth() -> None:
+    settings = _settings()
+    engine, db = _session(settings)
+    order = _duplicate_fill_order()
+    db.add(order)
+    db.flush()
+    retained = ExecutionFill(
+        id="a-economics-retained-fill",
+        broker_order_pk=order.id,
+        symbol="282330",
+        side="buy",
+        quantity=1,
+        price=Decimal("72000"),
+        transaction_cost_coverage="unknown",
+        filled_at=SOLD_AT,
+    )
+    richer_duplicate = ExecutionFill(
+        id="b-economics-deleted-fill",
+        broker_order_pk=order.id,
+        symbol="282330",
+        side="buy",
+        quantity=1,
+        price=Decimal("72000"),
+        settlement_currency="KRW",
+        transaction_cost=Decimal("12.34567890"),
+        transaction_cost_coverage="complete",
+        transaction_cost_source="broker_payload:commission+fee+tax",
+        filled_at=SOLD_AT,
+    )
+    db.add_all([retained, richer_duplicate])
+    db.commit()
+
+    result = apply_execution_fill_repairs(
+        db=db,
+        runtime_mode="paper",
+        actor="test-operator",
+        reason="preserve complete economics",
+        now=SOLD_AT,
+    )
+
+    assert result["summary"]["deleted_fill_count"] == 0
+    assert result["summary"]["applied_manual_review_count"] == 1
+    remaining = db.scalars(
+        select(ExecutionFill)
+        .where(ExecutionFill.broker_order_pk == order.id)
+        .order_by(ExecutionFill.id.asc())
+    ).all()
+    assert [fill.id for fill in remaining] == [retained.id, richer_duplicate.id]
+    assert retained.settlement_currency is None
+    assert retained.transaction_cost is None
+    assert retained.transaction_cost_coverage == "unknown"
+    assert richer_duplicate.transaction_cost == Decimal("12.34567890")
+    assert dedupe_execution_fills(remaining) == []
+    review = db.scalar(
+        select(RuntimeRemediationEvent).where(
+            RuntimeRemediationEvent.candidate_type == "duplicate_fill_group",
+            RuntimeRemediationEvent.subject_id == order.id,
+        )
+    )
+    assert review is not None
+    assert review.outcome == "manual_review_required"
+    assert review.evidence_summary["conflicting_fields"] == [
+        "settlement_currency",
+        "transaction_cost",
+        "transaction_cost_coverage",
+        "transaction_cost_source",
+    ]
+    assert review.evidence_summary["fills_deleted"] == 0
+    engine.dispose()
+
+
+def test_duplicate_repair_preserves_conflicting_cost_rows_for_manual_review() -> None:
+    settings = _settings()
+    engine, db = _session(settings)
+    order = _duplicate_fill_order()
+    db.add(order)
+    db.flush()
+    first = ExecutionFill(
+        id="a-conflicting-cost-retained-fill",
+        broker_order_pk=order.id,
+        symbol="282330",
+        side="buy",
+        quantity=1,
+        price=Decimal("72000"),
+        settlement_currency="KRW",
+        transaction_cost=Decimal("10"),
+        transaction_cost_coverage="complete",
+        transaction_cost_source="broker_payload:total_transaction_cost",
+        filled_at=SOLD_AT,
+    )
+    second = ExecutionFill(
+        id="b-conflicting-cost-deleted-fill",
+        broker_order_pk=order.id,
+        symbol="282330",
+        side="buy",
+        quantity=1,
+        price=Decimal("72000"),
+        settlement_currency="KRW",
+        transaction_cost=Decimal("20"),
+        transaction_cost_coverage="complete",
+        transaction_cost_source="broker_payload:total_transaction_cost",
+        filled_at=SOLD_AT,
+    )
+    db.add_all([first, second])
+    db.commit()
+
+    result = apply_execution_fill_repairs(
+        db=db,
+        runtime_mode="paper",
+        actor="test-operator",
+        reason="reject conflicting economics",
+        now=SOLD_AT,
+    )
+
+    remaining = db.scalars(
+        select(ExecutionFill)
+        .where(ExecutionFill.broker_order_pk == order.id)
+        .order_by(ExecutionFill.id.asc())
+    ).all()
+    assert [fill.id for fill in remaining] == [first.id, second.id]
+    assert [fill.transaction_cost for fill in remaining] == [Decimal("10"), Decimal("20")]
+    assert dedupe_execution_fills(remaining) == []
+    assert result["summary"]["deleted_fill_count"] == 0
+    assert result["summary"]["applied_manual_review_count"] == 1
+    review = db.scalar(
+        select(RuntimeRemediationEvent).where(
+            RuntimeRemediationEvent.candidate_type == "duplicate_fill_group",
+            RuntimeRemediationEvent.subject_id == order.id,
+        )
+    )
+    assert review is not None
+    assert review.outcome == "manual_review_required"
+    assert review.evidence_summary["conflicting_fields"] == ["transaction_cost"]
+    assert review.evidence_summary["fills_deleted"] == 0
     engine.dispose()
 
 

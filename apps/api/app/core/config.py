@@ -4,7 +4,7 @@ from decimal import Decimal
 from functools import lru_cache
 from typing import Literal, Mapping
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 RuntimeMode = Literal["mock", "paper", "live"]
 LogFormat = Literal["json", "plain"]
@@ -30,6 +30,7 @@ class Settings(BaseModel):
     log_format: LogFormat = "json"
     api_host: str = "127.0.0.1"
     api_port: int = Field(default=8010, ge=1, le=65535)
+    api_bearer_token: str | None = None
     automation_enabled: bool = False
     autonomous_runtime_enabled: bool = False
     dispatch_loop_interval_seconds: float = Field(default=1.0, gt=0, le=3600)
@@ -40,6 +41,7 @@ class Settings(BaseModel):
     monitoring_auto_symbol_batch_target_seconds: float = Field(default=12.0, gt=0, le=300)
     monitoring_max_broker_actions_per_cycle: int = Field(default=32, ge=0, le=10000)
     monitoring_max_quote_age_seconds: int = Field(default=30, ge=1, le=3600)
+    monitoring_max_quote_future_skew_seconds: int = Field(default=5, ge=0, le=300)
     monitoring_watch_buy_retry_cooldown_seconds: int = Field(default=5, ge=1, le=3600)
     monitoring_exit_on_stale_cycle_enabled: bool = False
     monitoring_stale_cycle_exit_grace_multiplier: float = Field(default=2.0, ge=1.0, le=20.0)
@@ -158,6 +160,11 @@ class Settings(BaseModel):
     trade_outcome_feedback_dir: str = "var/analytics/trade_outcome_feedback"
     trade_outcome_feedback_lookback_days: int = Field(default=20, ge=1, le=365)
     trade_outcome_feedback_max_lessons: int = Field(default=6, ge=1, le=25)
+    trade_outcome_feedback_max_age_seconds: int = Field(
+        default=172800,
+        ge=60,
+        le=31536000,
+    )
     weekly_trade_review_dir: str = "var/analytics/weekly_trade_review"
     openclaw_cli_path: str = "openclaw"
     kis_app_key: str | None = None
@@ -276,6 +283,20 @@ class Settings(BaseModel):
     nxt_eligible_source_timeout_seconds: int = Field(default=5, ge=1, le=60)
     nxt_eligible_source_ttl_seconds: int = Field(default=3600, ge=60, le=86400)
 
+    @model_validator(mode="after")
+    def reject_shared_us_equity_position_namespace(self) -> "Settings":
+        alpaca_us_equity_enabled = (
+            self.alpaca_us_equity_monitoring_enabled
+            or self.alpaca_us_equity_strategy_enabled
+        )
+        if self.kis_us_trading_enabled and alpaca_us_equity_enabled:
+            raise ValueError(
+                "KIS and Alpaca US equity cannot share the provider/account-less "
+                "(mode, symbol) position namespace; use a separate "
+                "database_url/service instance for each provider"
+            )
+        return self
+
     @field_validator("log_level")
     @classmethod
     def normalize_log_level(cls, value: str) -> str:
@@ -368,6 +389,7 @@ _ENV_FIELDS = {
     "MONITORING_AUTO_SYMBOL_BATCH_TARGET_SECONDS": "monitoring_auto_symbol_batch_target_seconds",
     "MONITORING_MAX_BROKER_ACTIONS_PER_CYCLE": "monitoring_max_broker_actions_per_cycle",
     "MONITORING_MAX_QUOTE_AGE_SECONDS": "monitoring_max_quote_age_seconds",
+    "MONITORING_MAX_QUOTE_FUTURE_SKEW_SECONDS": "monitoring_max_quote_future_skew_seconds",
     "MONITORING_WATCH_BUY_RETRY_COOLDOWN_SECONDS": "monitoring_watch_buy_retry_cooldown_seconds",
     "MONITORING_EXIT_ON_STALE_CYCLE_ENABLED": "monitoring_exit_on_stale_cycle_enabled",
     "MONITORING_STALE_CYCLE_EXIT_GRACE_MULTIPLIER": "monitoring_stale_cycle_exit_grace_multiplier",
@@ -482,10 +504,12 @@ _ENV_FIELDS = {
     "MARKET_CONTEXT_BEARER_TOKEN": "market_context_bearer_token",
     "MARKET_CONTEXT_TIMEOUT_SECONDS": "market_context_timeout_seconds",
     "MARKET_CONTEXT_CACHE_TTL_SECONDS": "market_context_cache_ttl_seconds",
+    "API_BEARER_TOKEN": "api_bearer_token",
     "TRADE_OUTCOME_FEEDBACK_ENABLED": "trade_outcome_feedback_enabled",
     "TRADE_OUTCOME_FEEDBACK_DIR": "trade_outcome_feedback_dir",
     "TRADE_OUTCOME_FEEDBACK_LOOKBACK_DAYS": "trade_outcome_feedback_lookback_days",
     "TRADE_OUTCOME_FEEDBACK_MAX_LESSONS": "trade_outcome_feedback_max_lessons",
+    "TRADE_OUTCOME_FEEDBACK_MAX_AGE_SECONDS": "trade_outcome_feedback_max_age_seconds",
     "WEEKLY_TRADE_REVIEW_DIR": "weekly_trade_review_dir",
     "OPENCLAW_CLI_PATH": "openclaw_cli_path",
     "KIS_APP_KEY": "kis_app_key",

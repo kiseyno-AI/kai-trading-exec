@@ -1599,7 +1599,7 @@ def test_trigger_time_sell_agent_can_adjust_quantity_limit_and_stop(
     engine.dispose()
 
 
-def test_trigger_time_agent_preserves_deterministic_emergency_stop(
+def test_trigger_time_agent_always_bypasses_protective_stop_without_metadata(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     app, engine, client, broker_adapter, captured = _build_trigger_agent_app(
@@ -1619,10 +1619,7 @@ def test_trigger_time_agent_preserves_deterministic_emergency_stop(
                     "quantity_policy": {"kind": "shares", "quantity": 5},
                     "trigger_price": "118000.00",
                     "time_in_force": "day",
-                    "risk_context": {
-                        "exchange": "KRX",
-                        "deterministic_emergency_stop": True,
-                    },
+                    "risk_context": {"exchange": "KRX"},
                 }
             ],
         },

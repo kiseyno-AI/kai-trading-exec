@@ -18,9 +18,22 @@ if [ -f .env.paper ]; then
   set +a
 fi
 
-PYTHON_BIN="${PYTHON_BIN:-/opt/homebrew/bin/python3.11}"
-HOST="${HOST:-127.0.0.1}"
+PYTHON_BIN="${PYTHON_BIN:-python3.12}"
+HOST="${HOST:-${KAI_EXEC_API_HOST:-127.0.0.1}}"
 PORT="${PORT:-8012}"
+API_BEARER_TOKEN="${KAI_EXEC_API_BEARER_TOKEN:-}"
+
+is_loopback_host() {
+  case "${1:-}" in
+    127.*|localhost|::1|'[::1]'|0:0:0:0:0:0:0:1|'[0:0:0:0:0:0:0:1]') return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+if ! is_loopback_host "$HOST" && [ -z "${API_BEARER_TOKEN//[[:space:]]/}" ]; then
+  echo "KAI_EXEC_API_BEARER_TOKEN is required when KAI_EXEC_API_HOST is not loopback: $HOST" >&2
+  exit 1
+fi
 
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}"
 export PYTHONPATH="apps/api${PYTHONPATH:+:$PYTHONPATH}"
@@ -35,6 +48,10 @@ export KAI_EXEC_SQLITE_WAL_AUTOCHECKPOINT_PAGES="1000"
 export KAI_EXEC_AUTONOMOUS_RUNTIME_ENABLED="true"
 export KAI_EXEC_KIS_US_TRADING_ENABLED="true"
 export KAI_EXEC_KIS_US_LIVE_TRADING_ENABLED="false"
+# KIS does not provide broker-confirmed historical realized PnL coverage on
+# this paper path. Opt in for paper by default so the advertised launcher can
+# place buys; explicitly set false to exercise the fail-closed coverage gate.
+export KAI_EXEC_KIS_US_ALLOW_DEGRADED_REALIZED_PNL_COVERAGE="${KAI_EXEC_KIS_US_ALLOW_DEGRADED_REALIZED_PNL_COVERAGE:-true}"
 export KAI_EXEC_ALPACA_CRYPTO_MONITORING_ENABLED="false"
 export KAI_EXEC_ALPACA_LIVE_TRADING_ENABLED="false"
 export KAI_EXEC_ALPACA_CRYPTO_STRATEGY_ENABLED="false"

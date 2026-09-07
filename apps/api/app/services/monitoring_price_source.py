@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.api.schemas.execution import MonitoringPriceRequest
 from app.broker.base import BrokerAdapter, BrokerCurrentPrice, BrokerLiveMarketContext
 from app.core.config import Settings
-from app.models.runtime import ExecutionPlan, ExecutionPlanItem
+from app.models.runtime import ExecutionPlan, ExecutionPlanItem, ExecutionPosition
 from app.services.broker_auth import ensure_authenticated_broker_session
 from app.services.domestic_order_router import resolve_domestic_order_route
 
@@ -336,10 +336,35 @@ def _load_monitoring_exchange_by_symbol(
             continue
         risk_context = item.risk_context if isinstance(item.risk_context, dict) else {}
         exchange = str(risk_context.get("exchange") or "").strip().upper()
-        if item.asset_class == "us_equity" and exchange in {"NASD", "NYSE", "AMEX"}:
+        if (
+            item.provider == "kis"
+            and item.asset_class == "us_equity"
+            and exchange in {"NASD", "NYSE", "AMEX"}
+        ):
             exchanges[item.symbol] = exchange
-        elif item.asset_class != "us_equity":
+        elif item.asset_class != "us_equity" and item.symbol.isdigit() and len(item.symbol) == 6:
             exchanges[item.symbol] = "KRX"
+    missing_symbols = [symbol for symbol in symbols if symbol not in exchanges]
+    if missing_symbols:
+        positions = db.scalars(
+            select(ExecutionPosition).where(
+                ExecutionPosition.mode == mode,
+                ExecutionPosition.symbol.in_(missing_symbols),
+                ExecutionPosition.quantity > 0,
+            )
+        ).all()
+        for position in positions:
+            raw_payload = position.raw_payload if isinstance(position.raw_payload, dict) else {}
+            sync_context = raw_payload.get("_position_sync")
+            if not isinstance(sync_context, dict):
+                continue
+            exchange = str(sync_context.get("exchange") or "").strip().upper()
+            if (
+                sync_context.get("asset_class") == "us_equity"
+                and sync_context.get("monitoring_eligible") is True
+                and exchange in {"NASD", "NYSE", "AMEX"}
+            ):
+                exchanges[position.symbol] = exchange
     return exchanges
 
 

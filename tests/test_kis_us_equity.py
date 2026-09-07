@@ -102,6 +102,25 @@ def _settings(**overrides: object) -> Settings:
     )
 
 
+@pytest.mark.parametrize(
+    "alpaca_flag",
+    [
+        "alpaca_us_equity_monitoring_enabled",
+        "alpaca_us_equity_strategy_enabled",
+    ],
+)
+def test_settings_reject_shared_kis_and_alpaca_us_equity_position_namespace(
+    alpaca_flag: str,
+) -> None:
+    with pytest.raises(ValidationError, match="separate database_url/service instance"):
+        Settings(
+            database_url="sqlite:///shared-us-equity.db",
+            runtime_mode="paper",
+            kis_us_trading_enabled=True,
+            **{alpaca_flag: True},
+        )
+
+
 def _placement_request(*, side: str = "buy") -> BrokerOrderPlacementRequest:
     return BrokerOrderPlacementRequest(
         idempotency_key=f"us-{side}-1",
@@ -558,8 +577,14 @@ def test_kis_us_equity_account_gate_dedupes_realized_loss_fills_before_buy_gatin
         now=observed_at,
     )
 
-    assert decision.payload["metrics"]["daily_realized_pnl_usd"] == "-60.0000"
-    assert decision.payload["metrics"]["weekly_realized_pnl_usd"] == "-60.0000"
+    assert decision.payload["metrics"]["daily_realized_pnl_usd"] is None
+    assert decision.payload["metrics"]["weekly_realized_pnl_usd"] is None
+    assert decision.payload["metrics"]["daily_gross_realized_pnl_usd"] == "-60.0000"
+    assert decision.payload["metrics"]["weekly_gross_realized_pnl_usd"] == "-60.0000"
+    assert decision.payload["metrics"]["daily_transaction_cost_coverage"] == "unknown"
+    assert decision.payload["metrics"]["daily_realized_loss_gate_basis"] == (
+        "degraded_gross_minus_known_transaction_cost"
+    )
     assert decision.allowed is True
     assert decision.gate_name is None
     db.close()

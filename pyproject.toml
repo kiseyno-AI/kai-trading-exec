@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "kai-trading-exec"
 version = "0.1.0"
@@ -21,3 +25,7 @@ dev = [
 [tool.pytest.ini_options]
 pythonpath = ["apps/api"]
 testpaths = ["tests"]
+
+[tool.setuptools.packages.find]
+where = ["apps/api"]
+include = ["app*"]

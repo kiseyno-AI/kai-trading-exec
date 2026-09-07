@@ -11,7 +11,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings, load_settings
@@ -28,11 +28,13 @@ from app.models.runtime import (
 )
 from app.services.broker_order_state import (
     ACTIONABLE_OPEN_ORDER_STATUSES,
+    MANUAL_REVIEW_ORDER_STATUSES,
     NONTERMINAL_ORDER_STATUSES,
     active_local_broker_order_filters,
 )
 from app.services.fifo_inventory import load_fifo_isolation_cursor
 from app.services.fill_idempotency import dedupe_execution_fills
+from app.services.fill_economics import closed_trade_economics
 from app.services.max_holding_actionability import max_holding_actionability_summary
 from app.services.late_entry_actionability import late_entry_actionability_summary
 
@@ -599,6 +601,7 @@ def _active_broker_order_summary(
         select(
             BrokerOrder.id,
             BrokerOrder.broker_order_id,
+            BrokerOrder.idempotency_key,
             BrokerOrder.symbol,
             BrokerOrder.side,
             BrokerOrder.status,
@@ -609,9 +612,14 @@ def _active_broker_order_summary(
         )
         .where(
             BrokerOrder.mode == settings.runtime_mode,
-            BrokerOrder.status.in_(NONTERMINAL_ORDER_STATUSES),
-            BrokerOrder.submitted_at.is_not(None),
-            BrokerOrder.submitted_at < stale_before,
+            or_(
+                BrokerOrder.status.in_(MANUAL_REVIEW_ORDER_STATUSES),
+                and_(
+                    BrokerOrder.status.in_(NONTERMINAL_ORDER_STATUSES),
+                    BrokerOrder.submitted_at.is_not(None),
+                    BrokerOrder.submitted_at < stale_before,
+                ),
+            ),
         )
         .order_by(BrokerOrder.submitted_at.asc(), BrokerOrder.id.asc())
         .limit(max_stale_order_samples + 1)
@@ -620,8 +628,16 @@ def _active_broker_order_summary(
     missing_submitted_at_count = db.scalar(
         select(func.count(BrokerOrder.id)).where(
             BrokerOrder.mode == settings.runtime_mode,
-            BrokerOrder.status.in_(NONTERMINAL_ORDER_STATUSES),
+            BrokerOrder.status.in_(
+                (*NONTERMINAL_ORDER_STATUSES, *MANUAL_REVIEW_ORDER_STATUSES)
+            ),
             BrokerOrder.submitted_at.is_(None),
+        )
+    )
+    manual_review_order_count = db.scalar(
+        select(func.count(BrokerOrder.id)).where(
+            BrokerOrder.mode == settings.runtime_mode,
+            BrokerOrder.status.in_(MANUAL_REVIEW_ORDER_STATUSES),
         )
     )
     return {
@@ -631,6 +647,7 @@ def _active_broker_order_summary(
         # same actionable semantics as runtime counts.
         "nonterminal_status_counts": _rows_to_dicts(actionable_counts),
         "actionable_order_count": sum(int(row.count) for row in actionable_counts),
+        "manual_review_order_count": int(manual_review_order_count or 0),
         "stale_nonterminal_samples": stale_samples,
         "stale_nonterminal_samples_truncated": stale_truncated,
         "missing_submitted_at_nonterminal_count": int(missing_submitted_at_count or 0),
@@ -770,6 +787,7 @@ def _weekly_closed_trades(
                     "price": Decimal(fill.price),
                     "filled_at": fill_time,
                     "fill_id": fill.id,
+                    "fill": fill,
                 }
             )
             continue
@@ -803,6 +821,11 @@ def _weekly_closed_trades(
                 closed.append(
                     _closed_trade_row(
                         fill=fill,
+                        buy_fill=(
+                            None
+                            if cost_basis_source == "broker_reconciliation"
+                            else lot["fill"]
+                        ),
                         quantity=matched,
                         buy_price=buy_price,
                         cost_basis_source=cost_basis_source,
@@ -824,6 +847,7 @@ def _weekly_closed_trades(
                 closed.append(
                     _closed_trade_row(
                         fill=fill,
+                        buy_fill=None,
                         quantity=remaining,
                         buy_price=broker_cost_basis,
                         cost_basis_source="broker_reconciliation",
@@ -834,6 +858,7 @@ def _weekly_closed_trades(
                 closed.append(
                     _closed_trade_row(
                         fill=fill,
+                        buy_fill=None,
                         quantity=remaining,
                         buy_price=None,
                         cost_basis_source="unknown",
@@ -927,6 +952,40 @@ def _weekly_realized_pnl_summary(
             (Decimal(str(row["realized_pnl"])) for row in rows),
             Decimal("0"),
         ).quantize(Decimal("0.0001"))
+        currencies = {
+            str(row["settlement_currency"])
+            for row in rows
+            if row.get("settlement_currency")
+        }
+        currency = (
+            next(iter(currencies))
+            if len(currencies) == 1
+            and all(row.get("settlement_currency") for row in rows)
+            else None
+        )
+        known_cost_values = [
+            Decimal(str(row["known_transaction_cost"]))
+            for row in rows
+            if row.get("known_transaction_cost") is not None
+        ]
+        known_transaction_cost = (
+            sum(known_cost_values, Decimal("0")).quantize(Decimal("0.0001"))
+            if known_cost_values
+            else None
+        )
+        net_complete = currency is not None and all(
+            row.get("transaction_cost_coverage") == "complete"
+            and row.get("net_realized_pnl") is not None
+            for row in rows
+        )
+        net_realized_pnl = (
+            sum(
+                (Decimal(str(row["net_realized_pnl"])) for row in rows),
+                Decimal("0"),
+            ).quantize(Decimal("0.0001"))
+            if net_complete
+            else None
+        )
         return_pct = (
             (realized_pnl / cost_basis * Decimal("100")).quantize(Decimal("0.0001"))
             if cost_basis > 0
@@ -942,12 +1001,30 @@ def _weekly_realized_pnl_summary(
                     sum((Decimal(str(row["quantity"])) for row in rows), Decimal("0"))
                 ),
                 "cost_basis": cost_basis.quantize(Decimal("0.0001")),
-                "realized_pnl": realized_pnl,
+                "realized_pnl": realized_pnl if currency == "KRW" else None,
+                "gross_realized_pnl": realized_pnl,
+                "known_transaction_cost": known_transaction_cost,
+                "net_realized_pnl": net_realized_pnl,
+                "settlement_currency": currency,
+                "transaction_cost_coverage": "complete" if net_complete else (
+                    "partial"
+                    if any(
+                        row.get("transaction_cost_coverage") in {"complete", "partial"}
+                        for row in rows
+                    )
+                    else "unknown"
+                ),
+                "legacy_realized_pnl_basis": "gross_before_transaction_costs",
                 "return_pct": return_pct,
             }
         )
 
-    outcomes.sort(key=lambda row: (Decimal(str(row["realized_pnl"])), str(row["sell_fill_id"])))
+    outcomes.sort(
+        key=lambda row: (
+            Decimal(str(row["gross_realized_pnl"])),
+            str(row["sell_fill_id"]),
+        )
+    )
     returns = sorted(
         Decimal(str(row["return_pct"]))
         for row in outcomes
@@ -971,22 +1048,112 @@ def _weekly_realized_pnl_summary(
     coverage_complete = len(outcomes) == len(rows_by_fill_id)
     status = "truncated" if truncated else ("complete" if coverage_complete else "incomplete")
     covered_realized_pnl = sum(
-        (Decimal(str(row["realized_pnl"])) for row in outcomes),
+        (
+            Decimal(str(row["gross_realized_pnl"]))
+            for row in outcomes
+            if row.get("settlement_currency") == "KRW"
+        ),
         Decimal("0"),
     ).quantize(Decimal("0.0001"))
+    all_krw = all(row.get("settlement_currency") == "KRW" for row in outcomes)
+    outcome_currencies_known = all(
+        row.get("settlement_currency") for row in outcomes
+    )
+    currency_coverage_complete = (
+        len(outcomes) == len(rows_by_fill_id) and outcome_currencies_known
+    )
+    gross_by_currency: dict[str, Decimal] = {}
+    net_by_currency: dict[str, Decimal | None] = {}
+    best_trade_by_currency: dict[str, dict[str, object]] = {}
+    worst_trade_by_currency: dict[str, dict[str, object]] = {}
+    for currency in sorted(
+        {str(row["settlement_currency"]) for row in outcomes if row.get("settlement_currency")}
+    ):
+        currency_rows = [row for row in outcomes if row.get("settlement_currency") == currency]
+        gross_by_currency[currency] = sum(
+            (Decimal(str(row["gross_realized_pnl"])) for row in currency_rows),
+            Decimal("0"),
+        ).quantize(Decimal("0.0001"))
+        net_by_currency[currency] = (
+            sum(
+                (Decimal(str(row["net_realized_pnl"])) for row in currency_rows),
+                Decimal("0"),
+            ).quantize(Decimal("0.0001"))
+            if all(row.get("net_realized_pnl") is not None for row in currency_rows)
+            else None
+        )
+        best_trade_by_currency[currency] = max(
+            currency_rows,
+            key=lambda row: Decimal(str(row["gross_realized_pnl"])),
+        )
+        worst_trade_by_currency[currency] = min(
+            currency_rows,
+            key=lambda row: Decimal(str(row["gross_realized_pnl"])),
+        )
+    transaction_cost_coverage = (
+        "complete"
+        if not rows_by_fill_id
+        or (
+            outcomes
+            and len(outcomes) == len(rows_by_fill_id)
+            and all(
+                row.get("transaction_cost_coverage") == "complete"
+                for row in outcomes
+            )
+        )
+        else (
+            "partial"
+            if any(
+                row.get("transaction_cost_coverage") in {"complete", "partial"}
+                for row in outcomes
+            )
+            else "unknown"
+        )
+    )
     return {
         "status": status,
         "sell_fill_count": len(rows_by_fill_id),
         "covered_sell_fill_count": len(outcomes),
-        "win_count": sum(1 for row in outcomes if Decimal(str(row["realized_pnl"])) > 0),
-        "loss_count": sum(1 for row in outcomes if Decimal(str(row["realized_pnl"])) < 0),
-        "flat_count": sum(1 for row in outcomes if Decimal(str(row["realized_pnl"])) == 0),
-        "realized_pnl": covered_realized_pnl if status == "complete" else None,
-        "covered_realized_pnl": covered_realized_pnl,
+        "win_count": sum(1 for row in outcomes if Decimal(str(row["gross_realized_pnl"])) > 0),
+        "loss_count": sum(1 for row in outcomes if Decimal(str(row["gross_realized_pnl"])) < 0),
+        "flat_count": sum(1 for row in outcomes if Decimal(str(row["gross_realized_pnl"])) == 0),
+        "win_count_basis": "gross_before_transaction_costs",
+        "return_pct_basis": "gross_before_transaction_costs",
+        "best_worst_trade_basis": "gross_before_transaction_costs_within_currency",
+        "net_win_count": sum(
+            1
+            for row in outcomes
+            if row.get("net_realized_pnl") is not None
+            and Decimal(str(row["net_realized_pnl"])) > 0
+        ),
+        "net_loss_count": sum(
+            1
+            for row in outcomes
+            if row.get("net_realized_pnl") is not None
+            and Decimal(str(row["net_realized_pnl"])) < 0
+        ),
+        "realized_pnl": covered_realized_pnl
+        if status == "complete" and all_krw
+        else None,
+        "covered_realized_pnl": covered_realized_pnl if all_krw else None,
+        "gross_realized_pnl_by_currency": gross_by_currency,
+        "net_realized_pnl_by_currency": net_by_currency,
+        "transaction_cost_coverage": transaction_cost_coverage,
+        "currency_coverage": (
+            "complete"
+            if currency_coverage_complete
+            else "incomplete"
+        ),
         "average_return_pct": average_return_pct,
         "median_return_pct": median_return_pct,
-        "best_trade": outcomes[-1] if outcomes else None,
-        "worst_trade": outcomes[0] if outcomes else None,
+        "best_trade": outcomes[-1]
+        if outcomes and len(gross_by_currency) == 1 and outcome_currencies_known
+        else None,
+        "worst_trade": outcomes[0]
+        if outcomes and len(gross_by_currency) == 1 and outcome_currencies_known
+        else None,
+        "best_trade_by_currency": best_trade_by_currency,
+        "worst_trade_by_currency": worst_trade_by_currency,
     }
 
 
@@ -1009,6 +1176,7 @@ def _next_buy_after(
 def _closed_trade_row(
     *,
     fill: ExecutionFill,
+    buy_fill: ExecutionFill | None,
     quantity: Decimal,
     buy_price: Decimal | None,
     cost_basis_source: str,
@@ -1016,6 +1184,16 @@ def _closed_trade_row(
 ) -> dict[str, object]:
     sell_price = Decimal(fill.price)
     pnl = ((sell_price - buy_price) * quantity).quantize(Decimal("0.0001")) if buy_price is not None else None
+    economics = (
+        closed_trade_economics(
+            buy_fill=buy_fill,
+            sell_fill=fill,
+            matched_quantity=quantity,
+            gross_realized_pnl=pnl,
+        )
+        if pnl is not None
+        else None
+    )
     return {
         "symbol": fill.symbol,
         "sell_fill_id": fill.id,
@@ -1027,6 +1205,22 @@ def _closed_trade_row(
         "cost_basis_source": cost_basis_source,
         "cost_basis_observed_at": cost_basis_observed_at,
         "realized_pnl": pnl,
+        "realized_pnl_basis": "gross_before_transaction_costs" if pnl is not None else None,
+        "settlement_currency": economics.settlement_currency if economics is not None else None,
+        "buy_settlement_currency": (
+            economics.buy_settlement_currency if economics is not None else None
+        ),
+        "sell_settlement_currency": (
+            economics.sell_settlement_currency if economics is not None else None
+        ),
+        "gross_realized_pnl": economics.gross_realized_pnl if economics is not None else None,
+        "buy_transaction_cost": economics.buy_transaction_cost if economics is not None else None,
+        "sell_transaction_cost": economics.sell_transaction_cost if economics is not None else None,
+        "known_transaction_cost": economics.known_transaction_cost if economics is not None else None,
+        "net_realized_pnl": economics.net_realized_pnl if economics is not None else None,
+        "transaction_cost_coverage": (
+            economics.transaction_cost_coverage if economics is not None else "unknown"
+        ),
     }
 
 

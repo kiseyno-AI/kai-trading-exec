@@ -7,11 +7,19 @@ import pytest
 from sqlalchemy import select
 
 from app.api.schemas.execution import MonitoringPriceRequest
+from app.broker.base import (
+    BrokerAccountHolding,
+    BrokerAccountSnapshot,
+    BrokerConfig,
+    BrokerReconnectHandle,
+    BrokerTokenGrant,
+)
 from app.core.config import Settings
 from app.db.base import Base
 from app.db.session import create_db_engine, create_session_factory
 from app.models.runtime import ExecutionPlan, ExecutionPlanItem, ExecutionPosition
 from app.services import monitoring
+from app.services.monitoring_price_source import _load_monitoring_exchange_by_symbol
 
 
 def _session():
@@ -153,6 +161,138 @@ def test_kis_monitoring_position_discovery_can_scope_to_krx(monkeypatch) -> None
     engine.dispose()
 
 
+def test_kis_krx_discovery_zeroes_preexisting_broker_absent_holding() -> None:
+    settings, engine, db = _session()
+    db.add(
+        ExecutionPosition(
+            mode="paper",
+            symbol="005930",
+            quantity=7,
+            average_price=Decimal("70000"),
+            updated_from="reconciliation",
+        )
+    )
+    db.commit()
+
+    class FlatSnapshotBroker:
+        provider = "kis"
+
+        def __init__(self) -> None:
+            self.snapshot_calls: list[tuple[list[str] | None, str]] = []
+
+        def describe(self) -> BrokerConfig:
+            return BrokerConfig(
+                provider="kis",
+                mode="paper",
+                configured=True,
+                api_base_url="https://stub.kis.local",
+            )
+
+        def authenticate(self) -> BrokerTokenGrant:
+            return BrokerTokenGrant(
+                access_token="test-token",
+                token_type="Bearer",
+                access_token_expires_at=datetime(2030, 1, 1, tzinfo=UTC),
+            )
+
+        def reconnect_handle(self) -> BrokerReconnectHandle:
+            return BrokerReconnectHandle(supported=True, strategy="stub")
+
+        def get_account_snapshot(
+            self,
+            access_token: str,
+            *,
+            symbols: list[str] | None = None,
+            exchange: str = "KRX",
+        ) -> BrokerAccountSnapshot:
+            assert access_token
+            self.snapshot_calls.append((symbols, exchange))
+            return BrokerAccountSnapshot(
+                available_cash=Decimal("1000000"),
+                observed_at=datetime(2026, 8, 19, 1, 0, tzinfo=UTC),
+                source="stub:account_snapshot",
+                holdings=(
+                    [
+                        BrokerAccountHolding(
+                            symbol="000660",
+                            quantity=3,
+                            average_price=Decimal("120000"),
+                        )
+                    ]
+                    if symbols is None
+                    else []
+                ),
+            )
+
+    broker = FlatSnapshotBroker()
+
+    monitoring._sync_positions_for_monitoring_routes(
+        settings=settings,
+        db=db,
+        adapter=broker,
+        symbols=None,
+        discover_krx_holdings=True,
+    )
+
+    assert broker.snapshot_calls == [
+        (None, "KRX"),
+        (["005930"], "KRX"),
+    ]
+    existing = db.scalar(
+        select(ExecutionPosition).where(ExecutionPosition.symbol == "005930")
+    )
+    assert existing is not None
+    assert existing.quantity == 0
+    discovered = db.scalar(
+        select(ExecutionPosition).where(ExecutionPosition.symbol == "000660")
+    )
+    assert discovered is not None
+    assert discovered.quantity == 3
+    db.close()
+    engine.dispose()
+
+
+def test_live_position_truth_refresh_propagates_snapshot_sync_failure(
+    monkeypatch,
+) -> None:
+    settings = Settings(database_url="sqlite:///:memory:", runtime_mode="live")
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    db = create_session_factory(engine)()
+    db.add(
+        ExecutionPosition(
+            mode="live",
+            symbol="005930",
+            quantity=7,
+            average_price=Decimal("70000"),
+            updated_from="reconciliation",
+            last_reconciled_at=datetime(2026, 8, 19, 0, 0, tzinfo=UTC),
+        )
+    )
+    db.commit()
+
+    def fail_position_sync(**kwargs) -> None:
+        del kwargs
+        raise RuntimeError("broker snapshot unavailable")
+
+    monkeypatch.setattr(
+        monitoring,
+        "_sync_positions_for_monitoring_routes",
+        fail_position_sync,
+    )
+
+    with pytest.raises(RuntimeError, match="broker snapshot unavailable"):
+        monitoring._refresh_position_truth_if_stale(
+            settings=settings,
+            db=db,
+            adapter=type("Adapter", (), {"provider": "kis"})(),
+            symbols={"005930"},
+        )
+
+    db.close()
+    engine.dispose()
+
+
 def test_kis_monitoring_routes_existing_us_position_from_broker_truth(monkeypatch) -> None:
     settings, engine, db = _session()
     db.add(
@@ -189,6 +329,36 @@ def test_kis_monitoring_routes_existing_us_position_from_broker_truth(monkeypatc
     )
 
     assert calls == [("NASD", {"AAPL"})]
+    db.close()
+    engine.dispose()
+
+
+def test_kis_quote_route_uses_verified_position_exchange_without_plan() -> None:
+    settings, engine, db = _session()
+    db.add(
+        ExecutionPosition(
+            mode="paper",
+            symbol="AAPL",
+            quantity=2,
+            average_price=Decimal("200"),
+            updated_from="reconciliation",
+            raw_payload={
+                "_position_sync": {
+                    "asset_class": "us_equity",
+                    "exchange": "NASD",
+                    "monitoring_eligible": True,
+                }
+            },
+        )
+    )
+    db.commit()
+
+    assert _load_monitoring_exchange_by_symbol(
+        db=db,
+        mode=settings.runtime_mode,
+        symbols=["AAPL"],
+    ) == {"AAPL": "NASD"}
+
     db.close()
     engine.dispose()
 

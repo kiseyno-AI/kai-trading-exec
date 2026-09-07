@@ -98,6 +98,8 @@ def run_due_watch_exec_agent_sizing(
         adapter=adapter,
         symbols=_candidate_symbols(plans),
     )
+    if settings.runtime_mode == "live" and _live_buy_sizing_block_reason(account_context) is not None:
+        return _account_context_blocked_result(account_context)
     plan_payloads: list[dict[str, object]] = []
     applied: list[dict[str, object]] = []
     errors: list[dict[str, object]] = []
@@ -255,6 +257,8 @@ def _run_due_watch_exec_agent_sizing_short_transactions(
         adapter=adapter,
         symbols=_candidate_symbols(plans),
     )
+    if settings.runtime_mode == "live" and _live_buy_sizing_block_reason(account_context) is not None:
+        return _account_context_blocked_result(account_context)
     stale_blocked_ids, stale_block_summaries = _reject_stale_state_blocked_items_short_transaction(
         session_factory=session_factory,
         plans=plans,
@@ -824,8 +828,10 @@ def _account_context_payload(
         }
         for order in snapshot.open_orders
     ]
+    open_orders_truth = _open_orders_truth_payload(snapshot)
     payload: dict[str, object] = {
         "available": True,
+        "buy_sizing_available": open_orders_truth["available"],
         "source": snapshot.source,
         "observed_at": snapshot.observed_at.isoformat(),
         "orderable_cash_krw": _json_decimal(snapshot.available_cash),
@@ -834,7 +840,10 @@ def _account_context_payload(
         "open_order_count": len(open_orders),
         "holdings": holdings,
         "open_orders": open_orders,
+        "open_orders_truth": open_orders_truth,
     }
+    if open_orders_truth["available"] is not True:
+        payload["buy_sizing_block_reason"] = "broker_open_orders_truth_unavailable"
     if stale_reconciliation is not None:
         blockers = _stale_state_blockers_from_reconciliation(stale_reconciliation)
         payload["stale_order_reconciliation"] = _json_safe(stale_reconciliation)
@@ -842,6 +851,36 @@ def _account_context_payload(
         payload["stale_state_blocked_symbols"] = sorted({str(row["symbol"]) for row in blockers})
         payload["stale_state_blockers"] = blockers
     return payload
+
+
+def _open_orders_truth_payload(snapshot: BrokerAccountSnapshot) -> dict[str, object]:
+    snapshot_payload = snapshot.payload if isinstance(snapshot.payload, dict) else {}
+    open_orders_error = snapshot_payload.get("open_orders_error")
+    degraded = isinstance(open_orders_error, dict) and open_orders_error.get("degraded") is True
+    payload: dict[str, object] = {
+        "available": not degraded,
+        "status": "degraded" if degraded else "available",
+        "source": snapshot.source,
+        "observed_at": snapshot.observed_at.isoformat(),
+    }
+    if isinstance(open_orders_error, dict):
+        code = str(open_orders_error.get("code") or "").strip()
+        if code:
+            payload["error_code"] = code
+    if degraded:
+        payload["reason"] = "broker open-order lookup returned degraded truth"
+    return payload
+
+
+def _live_buy_sizing_block_reason(account_context: dict[str, object]) -> str | None:
+    if account_context.get("available") is not True:
+        return "account_context_unavailable"
+    if account_context.get("buy_sizing_available") is False:
+        return str(
+            account_context.get("buy_sizing_block_reason")
+            or "broker_open_orders_truth_unavailable"
+        )
+    return None
 
 
 def _unavailable_account_context(
@@ -1768,6 +1807,14 @@ def _allowed_action_envelope_for_candidate(
         hard_reject_reasons.append("existing_holding")
     if open_buy_order_count > 0:
         hard_reject_reasons.append("duplicate_open_buy_order")
+    if (
+        isinstance(account_context, dict)
+        and account_context.get("buy_sizing_available") is False
+    ):
+        if settings.runtime_mode == "live":
+            hard_reject_reasons.append("broker_open_orders_truth_unavailable")
+        else:
+            soft_warnings.append("broker_open_orders_truth_unavailable")
 
     account_basis = _account_basis(settings=settings, account_context=account_context)
     cap_candidates: list[Decimal] = [
@@ -2149,3 +2196,33 @@ def _json_safe(value: Any) -> Any:
 
 def _result(**payload: object) -> WatchExecAgentSizingResult:
     return WatchExecAgentSizingResult(status_code=200, payload={"worker_name": "watch_exec_agent_sizing", **payload})
+
+
+def _account_context_blocked_result(
+    account_context: dict[str, object],
+) -> WatchExecAgentSizingResult:
+    block_reason = _live_buy_sizing_block_reason(account_context)
+    blocked_context: dict[str, object] = {
+        "available": account_context.get("available") is True,
+        "reason": str(
+            account_context.get("reason")
+            or block_reason
+            or "broker account snapshot unavailable"
+        ),
+    }
+    for key in (
+        "buy_sizing_available",
+        "buy_sizing_block_reason",
+        "source",
+        "observed_at",
+        "open_orders_truth",
+    ):
+        if key in account_context:
+            blocked_context[key] = account_context[key]
+    return _result(
+        idle=False,
+        blocked=True,
+        reason=block_reason or "account_context_unavailable",
+        account_context=blocked_context,
+        batches_processed=0,
+    )
