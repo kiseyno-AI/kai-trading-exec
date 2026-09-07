@@ -1,275 +1,271 @@
 # kai-trading-exec
 
-Dedicated execution runtime for real order placement, realtime monitoring, and execution-state management in the KAI trading stack.
+Always-on execution runtime for the KAI trading stack.
 
-## Why this repo exists
+Exec accepts plans from `kai-trading-core`, applies account and market safety gates, submits broker orders, monitors targets/stops, reconciles against broker truth, and persists the complete execution lifecycle. Strategy research, broad market-data collection, factor scoring, and portfolio prioritization belong in Core.
 
-`kai-trading-core` currently mixes strategy/read APIs with execution-adjacent concerns. That makes real trading monitoring vulnerable to core restarts, deploy hygiene gates, and dashboard-oriented changes.
+## Quickstart
 
-`kai-trading-exec` is the isolated runtime responsible for the parts that should stay alive even when the core service is restarted:
-
-- real buy/sell order submission
-- open-order monitoring
-- fill / partial-fill / cancel tracking
-- intraday target-stop automation
-- broker session/token lifecycle
-- reconciliation against broker truth
-- kill-switch / pause / resume operational controls
-
-`kai-trading-core` should become the strategy brain and read API. `kai-trading-exec` should become the always-on execution hands.
-
-## Intended service boundary
-
-### `kai-trading-core`
-- strategy, EOD pipeline, factor/scoring, signal decider
-- execution-plan generation
-- dashboards and portfolio/market read APIs
-- querying `kai-trading-exec` runtime status and execution outcomes
-
-### `kai-trading-exec`
-- execution plan intake
-- order submission to KIS
-- live monitoring of open positions and open orders
-- actual execution persistence and reconciliation
-- runtime controls and operator safety mechanisms
-
-## Initial repository contents
-
-- `ARCHITECTURE.md` — high-level design, ownership, and failure boundaries
-- `RULES.md` — repo operating rules for humans and coding agents
-- `AGENTS.md` — local guidance for Codex/agent work in this repo
-- `TASKS.md` — short backlog / launch sequence
-- `docs/API.md` — proposed northbound and operational API contract
-- `apps/api/app/main.py` — FastAPI runtime entrypoint
-- `apps/api/alembic/` — migration baseline for exec-owned runtime tables
-
-## Local development
-
-Create an environment and install the API plus test dependencies:
+Python 3.12 or newer is required.
 
 ```bash
-python3 -m venv .venv
+python3.12 -m venv .venv
 source .venv/bin/activate
-python -m pip install -e ".[dev]"
+python -m pip install -e '.[dev]'
+mkdir -p var
+PYTHONPATH=apps/api python -m alembic upgrade head
+./start-api.sh
 ```
 
-Apply the execution-runtime schema to the default local SQLite database:
-
-```bash
-PYTHONPATH=apps/api alembic upgrade head
-```
-
-Start the service:
-
-```bash
-PYTHONPATH=apps/api uvicorn app.main:app --host 127.0.0.1 --port 8010
-```
-
-Useful checks:
+The primary API listens on `http://127.0.0.1:8010` by default.
 
 ```bash
 curl http://127.0.0.1:8010/health
 curl http://127.0.0.1:8010/runtime/status
+curl http://127.0.0.1:8010/runtime/safety
 curl http://127.0.0.1:8010/runtime/daily-board
 curl http://127.0.0.1:8010/runtime/portfolio-risk
+```
+
+`start-api.sh` applies Alembic migrations before Uvicorn. Use `start-api-no-migrate.sh` only when migration ownership is deliberately handled by a separate deploy step.
+
+## Safety
+
+- The default bind is loopback-only. Every launcher exits before migration or startup when `KAI_EXEC_API_HOST`/`HOST` is non-loopback and `KAI_EXEC_API_BEARER_TOKEN` is empty. The application also rejects non-loopback requests at runtime when no token is configured, covering direct Uvicorn CLI binds that bypass launcher checks.
+- For a non-loopback bind, use a strong bearer token and send `Authorization: Bearer <token>` on every request except `GET /health` and `OPTIONS`. Do not expose Exec directly to the public internet.
+- The default runtime mode is `mock`; automation and autonomous runtime are disabled by default.
+- `paper` and `live` state must use separate processes and databases. The supplied paper launchers force provider isolation and keep every live-trading gate closed.
+- Live KIS US and Alpaca strategies require separate enable flags in addition to `KAI_EXEC_RUNTIME_MODE=live`. Upbit live submission is not implemented.
+- Pause, kill switch, account drawdown gates, buying-power checks, exposure caps, session routing, idempotency keys, and reconciliation remain mandatory regardless of the caller.
+- The idempotency intent is committed before the broker call. An unexpected pre-call failure is persisted as `failed`; if submission has started and no acknowledgement is available, the order becomes `manual_review_required` with a `submit_outcome_unknown` event. Its cash or sell quantity remains reserved across sessions, and no replacement order should be created until an operator records terminal broker truth. Raw exception details are not returned.
+- `/runtime/portfolio-risk` is an advisory read model. It does not place, amend, cancel, or reconcile orders.
+- Never commit `.env`, `.env.paper`, broker credentials, account identifiers, database files, or runtime logs.
+
+Example authenticated non-loopback configuration:
+
+```bash
+KAI_EXEC_API_HOST=0.0.0.0 \
+KAI_EXEC_API_BEARER_TOKEN='replace-with-a-long-random-secret' \
+./start-api.sh
+```
+
+```bash
+curl http://server:8010/runtime/status \
+  -H 'Authorization: Bearer replace-with-a-long-random-secret'
+```
+
+## Runtime matrix
+
+| Runtime | Launcher | Default port | Database | Forced isolation |
+| --- | --- | ---: | --- | --- |
+| Primary Exec | `start-api.sh` | 8010 | `var/kai_trading_exec.db` | configuration-driven; runs migrations |
+| Primary, migration skipped | `start-api-no-migrate.sh` | 8010 | configured database | configuration-driven; no Alembic upgrade |
+| Alpaca paper | `start-alpaca-paper.sh` | 8011 | `var/alpaca_paper_exec.db` | KIS coordinator off; Alpaca crypto/US paper strategies on by default; Alpaca live gates off |
+| KIS US paper | `start-kis-us-paper.sh` | 8012 | `var/kis_us_paper_exec.db` | KIS US paper path on; degraded realized-PnL coverage explicitly allowed for paper; every live gate remains off; Alpaca workers off |
+
+All launchers use `python3.12` by default and allow an explicit `PYTHON_BIN` override. They source `.env` first and paper launchers then source `.env.paper`; forced isolation settings are applied after both files.
+
+Each process owns its database pool and monitoring state. Keep the total configured pool capacity across processes below the PostgreSQL connection budget. Never point independently scheduled provider runtimes at the same SQLite file.
+
+## Architecture and execution flow
+
+The service is a FastAPI application backed by SQLAlchemy and Alembic. Its durable flow is:
+
+```text
+Core execution plan / operator request
+                  |
+                  v
+ validation -> runtime controls -> account/risk/session gates
+                  |
+                  v
+       durable job and order lifecycle
+                  |
+                  v
+             broker adapter
+                  |
+                  v
+ monitoring -> reconciliation -> fills/positions/failures
+                  |
+                  v
+       Core/Web execution read models
+```
+
+Implemented capabilities include:
+
+- execution-plan intake, preview, durable jobs, dispatch, and monitoring materialization
+- KIS Korean-equity and KIS US-equity order routing
+- Alpaca crypto and US-equity paper strategies with separately gated live paths
+- Upbit crypto paper order/fill simulation; live Upbit orders intentionally fail closed
+- broker session lifecycle, order/fill reconciliation, failure classification, and bounded rejected-order retries
+- target, stop, partial-profit, breakeven rearm, peak-giveback, and aged-position monitoring
+- trigger-time exec-agent decisions, sizing, market-quality checks, and Core market-context caching
+- pause/resume/kill-switch controls, account drawdown gates, exposure limits, and auditable risk decisions
+- symbol, daily-board, execution, position, failure, and portfolio-risk read models
+- FIFO-aware trade outcome feedback, weekly review exports, and repair tooling
+
+### Broker support
+
+| Provider/path | Paper | Live | Notes |
+| --- | --- | --- | --- |
+| KIS Korean equities | supported | guarded | runtime controls, account/session routing, reconciliation |
+| KIS US equities | supported when enabled | separately gated | approved-plan, whole-share, regular-session day-limit orders |
+| Alpaca crypto | isolated paper runtime | separately gated | closed-bar trend decisions plus continuous protective exits |
+| Alpaca US equities | isolated paper runtime | separately gated | SPY/QQQ by default, IEX data, market-clock enforcement |
+| Upbit crypto | simulated lifecycle | not implemented | paper plans only; live requests fail closed |
+
+## Configuration
+
+All application settings use the `KAI_EXEC_` prefix. `apps/api/app/core/config.py` is authoritative for names, defaults, validation, and compatibility aliases.
+
+No environment template is currently tracked. Create local, git-ignored `.env` and optional `.env.paper` files for the target runtime, using `apps/api/app/core/config.py` as the source of truth for accepted settings.
+
+```bash
+KAI_EXEC_RUNTIME_MODE=paper
+KAI_EXEC_DATABASE_URL=sqlite:///./var/kai_trading_exec.db
+KAI_EXEC_KIS_APP_KEY=replace_me
+KAI_EXEC_KIS_APP_SECRET=replace_me
+KAI_EXEC_KIS_ACCOUNT_NUMBER=12345678
+```
+
+### Service, authentication, and database
+
+| Setting | Default / purpose |
+| --- | --- |
+| `KAI_EXEC_API_HOST` | `127.0.0.1`; non-loopback requires an API bearer token |
+| `KAI_EXEC_API_PORT` | `8010` in application settings; launcher-specific `PORT` defaults are shown above |
+| `KAI_EXEC_API_BEARER_TOKEN` | optional on loopback, required by launchers on non-loopback binds |
+| `KAI_EXEC_RUNTIME_MODE` | `mock`, `paper`, or `live`; default `mock` |
+| `KAI_EXEC_DATABASE_URL` | default `sqlite:///./var/kai_trading_exec.db` |
+| `KAI_EXEC_AUTOMATION_ENABLED` | global order automation gate; default `false` |
+| `KAI_EXEC_AUTONOMOUS_RUNTIME_ENABLED` | dispatch/monitoring worker gate; default `false` |
+
+Pool controls are `KAI_EXEC_DB_POOL_SIZE` (`10`), `KAI_EXEC_DB_MAX_OVERFLOW` (`10`), `KAI_EXEC_DB_POOL_TIMEOUT_SECONDS` (`5`), `KAI_EXEC_DB_POOL_RECYCLE_SECONDS` (`900`), `KAI_EXEC_DB_POOL_USE_LIFO` (`true`), `KAI_EXEC_DB_CONNECT_TIMEOUT_SECONDS` (`5`), `KAI_EXEC_DB_LONG_CHECKOUT_WARNING_SECONDS` (`10`), and `KAI_EXEC_SQLITE_BUSY_TIMEOUT_SECONDS` (`30`). Database health checks are single-flight per process.
+
+### KIS
+
+Common authentication/session settings:
+
+- `KAI_EXEC_KIS_APP_KEY`, `KAI_EXEC_KIS_APP_SECRET`
+- `KAI_EXEC_KIS_ACCOUNT_NUMBER`, `KAI_EXEC_KIS_ACCOUNT_PRODUCT_CODE`
+- `KAI_EXEC_KIS_HTS_ID`, `KAI_EXEC_KIS_CUSTOMER_TYPE`
+- `KAI_EXEC_KIS_BASE_URL`, `KAI_EXEC_KIS_MOCK_BASE_URL`
+- `KAI_EXEC_KIS_USE_HASHKEY`, `KAI_EXEC_KIS_REQUEST_TIMEOUT_SECONDS`
+
+KIS US-equity execution is disabled by default and adds these controls:
+
+- `KAI_EXEC_KIS_US_TRADING_ENABLED`
+- `KAI_EXEC_KIS_US_LIVE_TRADING_ENABLED`
+- `KAI_EXEC_KIS_US_LIVE_CONFIRMATION_TOKEN` — live requires `ENABLE_KIS_US_LIVE`
+- `KAI_EXEC_KIS_US_ACCOUNT_ALLOWLIST`
+- `KAI_EXEC_KIS_US_MAX_ORDER_NOTIONAL_USD` — default `100`
+- `KAI_EXEC_KIS_US_MAX_TOTAL_EXPOSURE_USD` — default `1000`
+- `KAI_EXEC_KIS_US_DAILY_REALIZED_LOSS_LIMIT_USD` — default `25`
+- `KAI_EXEC_KIS_US_WEEKLY_REALIZED_LOSS_LIMIT_USD` — default `50`
+- `KAI_EXEC_KIS_US_UNREALIZED_LOSS_LIMIT_USD` — default `50`
+- `KAI_EXEC_KIS_US_UNREALIZED_LOSS_PCT` — default `5`
+- `KAI_EXEC_KIS_US_SEVERE_HOLDING_LOSS_PCT` — default `10`
+- `KAI_EXEC_KIS_US_ALLOW_DEGRADED_REALIZED_PNL_COVERAGE` — default `false`
+- `KAI_EXEC_KIS_US_PREFLIGHT_BUYING_POWER_ENABLED` — default `true`
+
+`NASD`, `NYSE`, and `AMEX` execution exchanges map to KIS quote codes `NAS`, `NYS`, and `AMS`. Before every buy, the adapter checks USD buying power, whole-share quantity, open buys, aggregate exposure, and account loss gates.
+
+The dedicated `start-kis-us-paper.sh` launcher defaults `KAI_EXEC_KIS_US_ALLOW_DEGRADED_REALIZED_PNL_COVERAGE=true` because KIS paper snapshots do not supply broker-confirmed historical realized PnL. This is a paper-only, explicit risk tradeoff: the general setting and every live launcher remain fail-closed by default. Set it to `false` in `.env.paper` to test the coverage block.
+
+### Alpaca and Upbit
+
+Alpaca credentials and endpoints use `KAI_EXEC_ALPACA_API_KEY`, `KAI_EXEC_ALPACA_API_SECRET`, `KAI_EXEC_ALPACA_LIVE_BASE_URL`, `KAI_EXEC_ALPACA_PAPER_BASE_URL`, `KAI_EXEC_ALPACA_DATA_BASE_URL`, and `KAI_EXEC_ALPACA_REQUEST_TIMEOUT_SECONDS`.
+
+Crypto runtime and strategy controls include:
+
+- `KAI_EXEC_ALPACA_CRYPTO_MONITORING_ENABLED`
+- `KAI_EXEC_ALPACA_CRYPTO_MONITORING_INTERVAL_SECONDS`, `KAI_EXEC_ALPACA_CRYPTO_RECONCILE_INTERVAL_SECONDS`
+- `KAI_EXEC_ALPACA_CRYPTO_ALLOWED_SYMBOLS`, `KAI_EXEC_ALPACA_CRYPTO_MAX_ORDER_NOTIONAL_USD`
+- `KAI_EXEC_ALPACA_CRYPTO_STRATEGY_ENABLED`, `KAI_EXEC_ALPACA_CRYPTO_STRATEGY_LIVE_ENABLED`
+- `KAI_EXEC_ALPACA_CRYPTO_STRATEGY_SLEEVE_USD`
+- `KAI_EXEC_ALPACA_CRYPTO_STRATEGY_MAX_INVESTED_FRACTION`
+- `KAI_EXEC_ALPACA_CRYPTO_STRATEGY_TARGET_VOLATILITY`
+- `KAI_EXEC_ALPACA_CRYPTO_STRATEGY_MAX_POSITION_RISK_FRACTION`
+- `KAI_EXEC_ALPACA_CRYPTO_STRATEGY_MIN_ORDER_NOTIONAL_USD`
+- `KAI_EXEC_ALPACA_CRYPTO_STRATEGY_MIN_REBALANCE_FRACTION`
+- `KAI_EXEC_ALPACA_CRYPTO_STRATEGY_QUOTE_MAX_AGE_SECONDS`
+- `KAI_EXEC_ALPACA_CRYPTO_STRATEGY_MAX_SPREAD_BPS`
+- `KAI_EXEC_ALPACA_CRYPTO_STRATEGY_STOP_ATR_MULTIPLE`
+- `KAI_EXEC_ALPACA_CRYPTO_STRATEGY_MAX_STOP_DISTANCE_FRACTION`
+- `KAI_EXEC_ALPACA_CRYPTO_STRATEGY_DAILY_DRAWDOWN_FRACTION`
+- `KAI_EXEC_ALPACA_CRYPTO_STRATEGY_WEEKLY_DRAWDOWN_FRACTION`
+- `KAI_EXEC_ALPACA_CRYPTO_STRATEGY_PEAK_DRAWDOWN_FRACTION`
+
+The US-equity lane uses the corresponding `KAI_EXEC_ALPACA_US_EQUITY_*` monitoring, allowed-symbol, order-notional, strategy, live-gate, and sleeve settings. `KAI_EXEC_ALPACA_LIVE_TRADING_ENABLED` is an additional provider-level live gate.
+
+Upbit paper settings are `KAI_EXEC_UPBIT_ACCESS_KEY`, `KAI_EXEC_UPBIT_SECRET_KEY`, `KAI_EXEC_UPBIT_BASE_URL`, `KAI_EXEC_UPBIT_LIVE_TRADING_ENABLED`, and `KAI_EXEC_UPBIT_REQUEST_TIMEOUT_SECONDS`. Keys are not required for paper simulation.
+
+See [the Alpaca setup and activation runbook](docs/ALPACA_CRYPTO_SETUP.md) before configuring credentials or funding an account.
+
+### Monitoring, sizing, and risk
+
+Important monitoring controls include `KAI_EXEC_DISPATCH_LOOP_INTERVAL_SECONDS`, `KAI_EXEC_MONITORING_LOOP_INTERVAL_SECONDS`, cycle timeout, maximum symbols/actions per cycle, quote age, allowed future clock skew, retry cooldown, late-entry mode/cutoff, live market-quality veto, turnover threshold, profit-protection thresholds, and breakeven buffer. Live price-triggered buys and sells reject quotes whose `observed_at` is missing, timezone-naive, too old, or more than `KAI_EXEC_MONITORING_MAX_QUOTE_FUTURE_SKEW_SECONDS` (default 5 seconds) in the future. Paper and mock modes retain timestamp-optional compatibility; when a timestamp is present, age and future-skew checks still apply.
+
+Short-term sizing is bounded by:
+
+- base/aggressive risk and confidence thresholds
+- per-symbol and total budgets
+- position allocation and symbol exposure
+- daily new-buy notional
+- stop distance and minimum reward/risk
+- available cash and broker buyable quantity
+- optional volatility/correlation caps
+- market breadth, sector weakness, and same-sector crowding
+- recent trade-outcome feedback and monthly capital-preservation settings
+
+The shared market-regime guardrail **downsizes** risk-off and caution buys using configured multipliers/caps. A downsize becomes a rejection only when another reject rule applies or the result falls below one share. The live watch-buy path is stricter: risk-off remains a hard veto unless `KAI_EXEC_WATCH_BUY_LIVE_MARKET_REGIME_DOWNSIZE_ALLOWED=true`.
+
+High-volatility chase vetoes are enabled by default. Fresh ATR and five-day return context can reject extended buys; confirmed pullbacks continue through pullback and live-market-quality checks.
+
+Core market context is advisory ordering context. If Core is temporarily unavailable, Exec retains the last successful priority list for its configured TTL, while the Exec-local plan remains the durable monitoring source of truth.
+
+## API surface
+
+Interactive OpenAPI is available at `/docs` and `/redoc`.
+
+| Area | Endpoints |
+| --- | --- |
+| Health/runtime | `GET /health`, `/runtime/status`, `/runtime/safety`, `/runtime/daily-board`, `/runtime/portfolio-risk`, `/runtime/alpaca-crypto`, `/runtime/alpaca-us-equity` |
+| Broker session | `GET /broker/session`, `POST /broker/session/authenticate`, `POST /broker/session/revoke` |
+| Controls | `POST /controls/pause`, `/controls/resume`, `/controls/kill-switch` |
+| Plans/jobs | `GET/POST /execution-plans`, `POST /execution-plans/preview`, `GET /execution-jobs`, `POST /execution-jobs/dispatch` |
+| Decisions/monitoring | `POST /short-term-watcher/decisions`, `POST /monitoring/evaluate` |
+| Orders | `POST/GET /orders`, `POST /orders/reconcile-stale` |
+| Failures and truth | `GET/PATCH /execution-failures`, `GET /executions`, `GET /positions` |
+| Symbol readback | `GET /symbols`, `GET /symbols/{symbol}` |
+
+Write endpoints can submit or schedule orders. Use `mock`/`paper`, inspect `/runtime/safety`, and verify the target database before calling them.
+
+## Operations
+
+### Health, controls, and manual cycles
+
+```bash
+curl http://127.0.0.1:8010/runtime/status
 curl http://127.0.0.1:8010/broker/session
 curl http://127.0.0.1:8010/execution-jobs
+curl http://127.0.0.1:8010/orders
+curl http://127.0.0.1:8010/symbols/005930
+```
+
+Manual dispatch and monitoring remain operator overrides:
+
+```bash
 curl -X POST http://127.0.0.1:8010/execution-jobs/dispatch
 curl -X POST http://127.0.0.1:8010/monitoring/evaluate \
   -H 'content-type: application/json' \
   -d '{"prices":[{"symbol":"005930","price":"125100.00"}]}'
-curl http://127.0.0.1:8010/orders
-curl http://127.0.0.1:8010/symbols
-curl http://127.0.0.1:8010/symbols/005930
 ```
 
-When the primary port 8010 process is a live KIS runtime, paper runtimes must
-stay isolated by provider. The Alpaca paper runtime can run independently on
-port 8011 via `start-alpaca-paper.sh`; it uses
-`var/alpaca_paper_exec.db`, keeps the global KIS autonomous coordinator off,
-and forces Alpaca live submission off. KIS US paper automation uses a separate
-port 8012 process via `start-kis-us-paper.sh` with
-`var/kis_us_paper_exec.db`; it enables the KIS autonomous coordinator only in
-that KIS-owned paper database and keeps KIS US live submission off.
+The autonomous loops persist dispatch backlog, retry eligible failures, cap work per cycle, and update liveness checkpoints. Short-term buys fail closed when account state, buying power, exposure, target/stop context, or reward/risk requirements are unresolved.
 
-The default database is `sqlite:///./var/kai_trading_exec.db`. Override settings
-with `KAI_EXEC_` environment variables, for example:
+### Korean after-hours routing
 
-```bash
-KAI_EXEC_RUNTIME_MODE=paper \
-KAI_EXEC_DATABASE_URL=postgresql+psycopg://user:pass@localhost/kai_exec \
-KAI_EXEC_KIS_APP_KEY=paper-app-key \
-KAI_EXEC_KIS_APP_SECRET=paper-app-secret \
-KAI_EXEC_KIS_ACCOUNT_NUMBER=12345678 \
-PYTHONPATH=apps/api uvicorn app.main:app --host 127.0.0.1 --port 8010
-```
-
-Database pool settings are configurable per process:
-
-- `KAI_EXEC_DB_POOL_SIZE` (default `10`)
-- `KAI_EXEC_DB_MAX_OVERFLOW` (default `10`)
-- `KAI_EXEC_DB_POOL_TIMEOUT_SECONDS` (default `5`)
-- `KAI_EXEC_DB_POOL_RECYCLE_SECONDS` (default `900`)
-- `KAI_EXEC_DB_POOL_USE_LIFO` (default `true`)
-- `KAI_EXEC_DB_CONNECT_TIMEOUT_SECONDS` (default `5`, PostgreSQL)
-- `KAI_EXEC_DB_LONG_CHECKOUT_WARNING_SECONDS` (default `10`)
-- `KAI_EXEC_SQLITE_BUSY_TIMEOUT_SECONDS` (default `30`)
-
-Each API or worker process owns a separate pool. Keep the sum of configured
-pool capacity across all processes below the PostgreSQL connection budget.
-Database health checks are single-flight per process so overlapping probes do
-not stack additional checkout attempts while the database is degraded.
-
-High-volatility chase vetoes are enabled by default. A chase buy is rejected
-when fresh ATR and five-day return inputs exceed the configured thresholds;
-stale or missing technical context fails closed only after that high-volatility
-condition is observed. Confirmed pullbacks below the breakout trigger continue
-through the existing pullback and live-market-quality checks.
-
-Local runtime artifacts such as `var/`, `logs/`, `.omx/`, Python caches,
-pytest/coverage caches, and virtual environments are intentionally ignored.
-They are not execution-runtime source changes; inspect them only when debugging
-a local run, and keep durable schema or state-transition changes in migrations,
-services, tests, and docs.
-
-KIS auth/session settings currently supported:
-- `KAI_EXEC_KIS_APP_KEY`
-- `KAI_EXEC_KIS_APP_SECRET`
-- `KAI_EXEC_KIS_ACCOUNT_NUMBER`
-- `KAI_EXEC_KIS_ACCOUNT_PRODUCT_CODE`
-- `KAI_EXEC_KIS_HTS_ID`
-- `KAI_EXEC_KIS_BASE_URL`
-- `KAI_EXEC_KIS_MOCK_BASE_URL`
-- `KAI_EXEC_KIS_CUSTOMER_TYPE`
-- `KAI_EXEC_KIS_USE_HASHKEY`
-- `KAI_EXEC_KIS_REQUEST_TIMEOUT_SECONDS`
-
-KIS US-equity execution is separately gated and defaults to disabled:
-- `KAI_EXEC_KIS_US_TRADING_ENABLED` (paper/readiness gate, default `false`)
-- `KAI_EXEC_KIS_US_LIVE_TRADING_ENABLED` (live gate, default `false`)
-- `KAI_EXEC_KIS_US_LIVE_CONFIRMATION_TOKEN` (live requires the exact value `ENABLE_KIS_US_LIVE`)
-- `KAI_EXEC_KIS_US_ACCOUNT_ALLOWLIST` (comma-separated live account numbers)
-- `KAI_EXEC_KIS_US_MAX_ORDER_NOTIONAL_USD` (default `100`)
-- `KAI_EXEC_KIS_US_PREFLIGHT_BUYING_POWER_ENABLED` (default `true`)
-
-The KIS US path accepts approved-plan, whole-share, regular-session day limit
-orders only. `NASD`, `NYSE`, and `AMEX` order exchanges are translated to the
-KIS quote codes `NAS`, `NYS`, and `AMS`. Before every buy, the adapter checks
-KIS-reported USD buying power and orderable quantity. Live submission remains
-closed unless the live flag, confirmation token, and account allowlist all match.
-
-Upbit crypto paper settings currently supported:
-- `KAI_EXEC_UPBIT_ACCESS_KEY`
-- `KAI_EXEC_UPBIT_SECRET_KEY`
-- `KAI_EXEC_UPBIT_BASE_URL`
-- `KAI_EXEC_UPBIT_LIVE_TRADING_ENABLED` (defaults to `false`)
-- `KAI_EXEC_UPBIT_REQUEST_TIMEOUT_SECONDS`
-
-In `paper` mode, Upbit is considered configured without live keys so BTC/ETH
-paper dry runs can exercise the exec lifecycle. Live Upbit order submission is
-disabled by default and is not implemented in this runtime slice.
-
-Alpaca crypto settings currently supported:
-- `KAI_EXEC_ALPACA_API_KEY`
-- `KAI_EXEC_ALPACA_API_SECRET`
-- `KAI_EXEC_ALPACA_LIVE_BASE_URL`
-- `KAI_EXEC_ALPACA_PAPER_BASE_URL`
-- `KAI_EXEC_ALPACA_DATA_BASE_URL`
-- `KAI_EXEC_ALPACA_LIVE_TRADING_ENABLED` (defaults to `false`)
-- `KAI_EXEC_ALPACA_REQUEST_TIMEOUT_SECONDS`
-- `KAI_EXEC_ALPACA_CRYPTO_MONITORING_ENABLED`
-- `KAI_EXEC_ALPACA_CRYPTO_MONITORING_INTERVAL_SECONDS`
-- `KAI_EXEC_ALPACA_CRYPTO_RECONCILE_INTERVAL_SECONDS`
-- `KAI_EXEC_ALPACA_CRYPTO_ALLOWED_SYMBOLS`
-- `KAI_EXEC_ALPACA_CRYPTO_MAX_ORDER_NOTIONAL_USD`
-- `KAI_EXEC_ALPACA_CRYPTO_STRATEGY_ENABLED` (defaults to `false`; the isolated
-  paper launcher defaults it to `true`)
-- `KAI_EXEC_ALPACA_CRYPTO_STRATEGY_LIVE_ENABLED` (second live gate; defaults to
-  `false`)
-- `KAI_EXEC_ALPACA_CRYPTO_STRATEGY_SLEEVE_USD` (default `1000`)
-- `KAI_EXEC_ALPACA_CRYPTO_STRATEGY_MAX_INVESTED_FRACTION` (default `0.60`)
-- `KAI_EXEC_ALPACA_CRYPTO_STRATEGY_TARGET_VOLATILITY` (default `0.10`)
-- `KAI_EXEC_ALPACA_CRYPTO_STRATEGY_MAX_POSITION_RISK_FRACTION` (default
-  `0.0025` of account equity)
-- `KAI_EXEC_ALPACA_US_EQUITY_MONITORING_ENABLED`
-- `KAI_EXEC_ALPACA_US_EQUITY_ALLOWED_SYMBOLS` (default `SPY,QQQ`)
-- `KAI_EXEC_ALPACA_US_EQUITY_MAX_ORDER_NOTIONAL_USD` (default `100`)
-- `KAI_EXEC_ALPACA_US_EQUITY_STRATEGY_ENABLED`
-- `KAI_EXEC_ALPACA_US_EQUITY_STRATEGY_LIVE_ENABLED` (separate live gate,
-  default `false`)
-- `KAI_EXEC_ALPACA_US_EQUITY_STRATEGY_SLEEVE_USD` (default `1000`)
-
-The dedicated Alpaca worker polls quotes every 15 seconds, reconciles every 30
-seconds, checks protective exits continuously, and makes normal trend decisions
-once per closed UTC daily bar. Orders still pass through the shared runtime
-pause/kill switch, provider validation, notional cap, and idempotency rails.
-The Alpaca trend strategies maintain durable per-symbol owned base quantity
-from strategy-attributed broker-order fills only, capped down by current broker
-truth during reconciliation; autonomous sells are capped by that owned quantity,
-so manual or other-strategy inventory is not liquidated by the sleeve.
-See [the account, funding, paper-test, strategy, and live activation
-runbook](docs/ALPACA_CRYPTO_SETUP.md) before configuring credentials or funds.
-
-The isolated Alpaca paper process also runs a concurrent Alpaca U.S.-equity
-lane for SPY and QQQ. It uses Alpaca's market clock, IEX quotes/daily bars, the
-same closed-bar trend/risk engine, separate durable decisions and deterministic
-order keys, and `day` orders only while the U.S. market is open. Its status is
-available at `GET /runtime/alpaca-us-equity`. This paper lane does not alter or
-restart the independently running live KIS Korean-stock process, and it does
-not run KIS monitoring against Alpaca paper position state.
-
-Monitoring runtime settings currently supported:
-- `KAI_EXEC_AUTONOMOUS_RUNTIME_ENABLED`
-- `KAI_EXEC_MARKET_CONTEXT_ENABLED`
-- `KAI_EXEC_MARKET_CONTEXT_BASE_URL`
-- `KAI_EXEC_MARKET_CONTEXT_BEARER_TOKEN`
-- `KAI_EXEC_MARKET_CONTEXT_CACHE_TTL_SECONDS`
-- `KAI_EXEC_DISPATCH_LOOP_INTERVAL_SECONDS`
-- `KAI_EXEC_MONITORING_LOOP_INTERVAL_SECONDS`
-- `KAI_EXEC_MONITORING_MAX_SYMBOLS_PER_CYCLE`
-- `KAI_EXEC_MONITORING_MAX_BROKER_ACTIONS_PER_CYCLE`
-- `KAI_EXEC_MONITORING_WATCH_BUY_RETRY_COOLDOWN_SECONDS`
-- `KAI_EXEC_WATCH_BUY_STALE_TRIGGER_RECLAIM_THRESHOLD_PCT`
-- `KAI_EXEC_WATCH_BUY_LATE_ENTRY_MODE` (`disabled`, `shadow`, or `block`; default
-  `shadow`)
-- `KAI_EXEC_WATCH_BUY_LATE_ENTRY_CUTOFF_KRX` (KRX-local `HH:MM`; default
-  `10:30`)
-- `KAI_EXEC_WATCH_BUY_LIVE_MARKET_QUALITY_VETO_ENABLED` (default `true`)
-- `KAI_EXEC_WATCH_BUY_LIVE_MARKET_REGIME_DOWNSIZE_ALLOWED` (default `false`;
-  live risk-off breadth remains a hard veto)
-- `KAI_EXEC_WATCH_BUY_LIVE_MIN_TRIGGER_TURNOVER_KRW` (default `100000000`)
-- `KAI_EXEC_PROFIT_PROTECTION_MIN_PEAK_PCT`
-- `KAI_EXEC_PROFIT_PROTECTION_GIVEBACK_PCT`
-- `KAI_EXEC_PROFIT_PROTECTION_AGED_SESSION_MIN`
-- `KAI_EXEC_PROFIT_PROTECTION_AGED_MIN_CURRENT_PROFIT_PCT`
-- `KAI_EXEC_BREAKEVEN_STOP_BUFFER_PCT`
-
-When Core market context is enabled, Exec requests a refreshed
-`/execution/runtime/monitored-symbols` read model each cycle. A transient Core
-failure retains the last successful priority list for the configured cache TTL;
-the Exec-local execution plan remains the durable monitoring source of truth.
-Core symbols affect ordering only and never filter active local watch plans.
-
-Domestic order-session routing settings currently supported:
-- `KAI_EXEC_DOMESTIC_ORDER_SESSION_ROUTING_ENABLED`
-- `KAI_EXEC_ALLOW_KRX_PRE_OPEN_OFFHOURS_ORDERS`
-- `KAI_EXEC_ALLOW_KRX_AFTER_HOURS_CLOSING_ORDERS`
-- `KAI_EXEC_ALLOW_KRX_AFTER_HOURS_SINGLE_PRICE_ORDERS`
-- `KAI_EXEC_ALLOW_NXT_PRE_ORDERS`
-- `KAI_EXEC_ALLOW_NXT_MAIN_ORDERS`
-- `KAI_EXEC_ALLOW_NXT_AFTER_ORDERS`
-- `KAI_EXEC_NXT_ORDER_ROUTE_PREFERENCE`
-- `KAI_EXEC_ALLOW_AFTER_HOURS_BUY_ORDERS`
-- `KAI_EXEC_ALLOW_AFTER_HOURS_SELL_ORDERS`
-- `KAI_EXEC_NXT_ELIGIBLE_SYMBOLS`
-- `KAI_EXEC_NXT_ELIGIBLE_SYNC_ENABLED`
-- `KAI_EXEC_NXT_ELIGIBLE_SOURCE_URL`
-- `KAI_EXEC_NXT_ELIGIBLE_SOURCE_TIMEOUT_SECONDS`
-- `KAI_EXEC_NXT_ELIGIBLE_SOURCE_TTL_SECONDS`
-
-To allow live monitoring orders through the Korean after-hours sessions, enable
-domestic order-session routing and the relevant after-hours policies in the
-runtime environment before starting the API:
+After-hours routing is disabled unless the relevant controls are enabled before process start:
 
 ```bash
 export KAI_EXEC_DOMESTIC_ORDER_SESSION_ROUTING_ENABLED=true
@@ -280,168 +276,50 @@ export KAI_EXEC_ALLOW_AFTER_HOURS_BUY_ORDERS=true
 export KAI_EXEC_ALLOW_AFTER_HOURS_SELL_ORDERS=true
 ```
 
-The `16:00-18:00` KST single-price session can route through KRX when
-`KAI_EXEC_ALLOW_KRX_AFTER_HOURS_SINGLE_PRICE_ORDERS=true`. The `18:00-20:00`
-KST session routes through NXT for eligible symbols. Eligibility is resolved in
-this order: explicit `nxt_eligible` order/plan metadata, manual
-`KAI_EXEC_NXT_ELIGIBLE_SYMBOLS` overrides, then the cached official NXT
-`/brdinfoTime/brdinfoTimeList.do` trading-target list. The official sync is
-enabled by default and refreshes on the autonomous runtime cadence controlled
-by `KAI_EXEC_NXT_ELIGIBLE_SOURCE_TTL_SECONDS`.
-After changing these settings, restart the exec API process and verify
-`/runtime/status` before relying on automated order submission.
+The `16:00-18:00` KST single-price session can route through KRX. The `18:00-20:00` session uses NXT for eligible symbols. Eligibility resolves from explicit order/plan metadata, then `KAI_EXEC_NXT_ELIGIBLE_SYMBOLS`, then the cached official NXT trading-target list. Restart Exec and verify `/runtime/status` after changing routing settings.
 
-Short-term exec risk settings currently supported:
-- `KAI_EXEC_EXEC_AGENT_BASE_RISK_PCT`
-- `KAI_EXEC_EXEC_AGENT_AGGRESSIVE_RISK_PCT`
-- `KAI_EXEC_EXEC_AGENT_AGGRESSIVE_CONFIDENCE_THRESHOLD`
-- `KAI_EXEC_EXEC_AGENT_MAX_SYMBOL_BUDGET`
-- `KAI_EXEC_EXEC_AGENT_MAX_TOTAL_BUDGET`
-- `KAI_EXEC_EXEC_AGENT_MAX_POSITION_ALLOCATION_PCT`
-- `KAI_EXEC_EXEC_AGENT_MAX_SYMBOL_EXPOSURE_PCT`
-- `KAI_EXEC_EXEC_AGENT_MAX_SYMBOL_TOTAL_EXPOSURE_PCT`
-- `KAI_EXEC_EXEC_AGENT_MAX_DAILY_NEW_BUY_NOTIONAL`
-- `KAI_EXEC_EXEC_AGENT_STOP_LOSS_PCT`
-- `KAI_EXEC_EXEC_AGENT_FIRST_TAKE_PROFIT_PCT`
-- `KAI_EXEC_EXEC_AGENT_FINAL_TAKE_PROFIT_PCT`
-- `KAI_EXEC_EXEC_AGENT_PARTIAL_TAKE_PROFIT_FRACTION`
-- `KAI_EXEC_EXEC_AGENT_TRIGGER_TIME_ENABLED`
-- `KAI_EXEC_EXEC_AGENT_TRIGGER_TIME_SELL_ENABLED`
-- `KAI_EXEC_EXEC_AGENT_TRIGGER_TIME_TIMEOUT_SECONDS`
-- `KAI_EXEC_EXEC_AGENT_WATCH_SIZING_START_LOCAL_TIME`
-- `KAI_EXEC_EXEC_AGENT_WATCH_SIZING_END_LOCAL_TIME`
-- `KAI_EXEC_EXEC_AGENT_WATCH_SIZING_MIN_NOTIONAL_KRW`
-- `KAI_EXEC_EXEC_AGENT_WATCH_SIZING_HIGH_CONVICTION_MIN_NOTIONAL_KRW`
-- `KAI_EXEC_EXEC_AGENT_WATCH_SIZING_HIGH_CONVICTION_THRESHOLD`
-- `KAI_EXEC_EXEC_AGENT_WATCH_SIZING_FALLBACK_ACCOUNT_BASIS_KRW`
-- `KAI_EXEC_VOL_CORR_SIZING_ENABLED`
-- `KAI_EXEC_VOL_CORR_VOLATILITY_LOOKBACK_DAYS`
-- `KAI_EXEC_VOL_CORR_MIN_RETURN_OBSERVATIONS`
-- `KAI_EXEC_VOL_CORR_HIGH_VOLATILITY_THRESHOLD_PCT`
-- `KAI_EXEC_VOL_CORR_VERY_HIGH_VOLATILITY_THRESHOLD_PCT`
-- `KAI_EXEC_VOL_CORR_HIGH_VOLATILITY_MULTIPLIER`
-- `KAI_EXEC_VOL_CORR_VERY_HIGH_VOLATILITY_MULTIPLIER`
-- `KAI_EXEC_VOL_CORR_HIGH_CORRELATION_THRESHOLD`
-- `KAI_EXEC_VOL_CORR_HIGH_CORRELATION_MULTIPLIER`
-- `KAI_EXEC_VOL_CORR_MISSING_DATA_BEHAVIOR`
-- `KAI_EXEC_VOL_CORR_MISSING_DATA_MULTIPLIER`
-- `KAI_EXEC_MARKET_REGIME_GUARD_ENABLED`
-- `KAI_EXEC_MARKET_REGIME_CAUTION_UP_RATIO_THRESHOLD`
-- `KAI_EXEC_MARKET_REGIME_NORMAL_UP_RATIO_THRESHOLD`
-- `KAI_EXEC_MARKET_REGIME_RISK_OFF_UP_RATIO_THRESHOLD`
-- `KAI_EXEC_MARKET_REGIME_CAUTION_ADVANCE_DECLINE_THRESHOLD`
-- `KAI_EXEC_MARKET_REGIME_RISK_OFF_ADVANCE_DECLINE_THRESHOLD`
-- `KAI_EXEC_MARKET_REGIME_BREADTH_MAX_AGE_SECONDS`
-- `KAI_EXEC_MARKET_REGIME_MISSING_BREADTH_BEHAVIOR`
-- `KAI_EXEC_MARKET_REGIME_LIVE_MISSING_BREADTH_BEHAVIOR`
-- `KAI_EXEC_MARKET_REGIME_STALE_BREADTH_BEHAVIOR`
-- `KAI_EXEC_MARKET_REGIME_CAUTION_SIZING_MULTIPLIER`
-- `KAI_EXEC_MARKET_REGIME_CAUTION_MAX_NOTIONAL_KRW`
-- `KAI_EXEC_MARKET_REGIME_SECTOR_WEAK_BEHAVIOR`
-- `KAI_EXEC_MARKET_REGIME_SECTOR_WEAK_MULTIPLIER`
-- `KAI_EXEC_MARKET_REGIME_SECTOR_WEAK_MAX_NOTIONAL_KRW`
-- `KAI_EXEC_MARKET_REGIME_SECTOR_WEAK_PERCENTILE_THRESHOLD`
-- `KAI_EXEC_MARKET_REGIME_SECTOR_WEAK_RELATIVE_RETURN_PCT`
-- `KAI_EXEC_TRADE_OUTCOME_FEEDBACK_ENABLED`
-- `KAI_EXEC_TRADE_OUTCOME_FEEDBACK_DIR`
-- `KAI_EXEC_TRADE_OUTCOME_FEEDBACK_LOOKBACK_DAYS`
-- `KAI_EXEC_TRADE_OUTCOME_FEEDBACK_MAX_LESSONS`
-- `KAI_EXEC_MONTHLY_TARGET_KRW`
-- `KAI_EXEC_MONTHLY_CAPITAL_PRESERVATION_ENABLED`
-- `KAI_EXEC_MONTHLY_AGGRESSIVE_LAG_RATIO`
+### Trade feedback and weekly review
 
-Watch-buy sizing preserves exec-agent-approved small probe quantities instead
-of enforcing a minimum-notional floor. Sizing still respects available cash,
-per-symbol budget, max-safe notional, and stop-risk caps. If account snapshot
-loading is unavailable, the fallback account basis defaults to `10,000,000`
-KRW. The default sizing window runs until `20:00` KST so triggered NXT
-after-hours watch buys can still receive share quantities before submission.
-
-Volatility/correlation buy sizing caps are disabled by default. When enabled,
-they can reduce but never increase the existing buy quantity using supplied
-recent return, realized-volatility, and holding-correlation context; missing
-data is neutral unless `KAI_EXEC_VOL_CORR_MISSING_DATA_BEHAVIOR=conservative`.
-
-Market-regime guardrails are enabled by default for automated Korean-equity
-buy sizing and approval paths. Normal breadth keeps baseline sizing, caution
-breadth downsizes with the configured multiplier/cap, and risk-off breadth
-rejects new automated buys with an auditable reason code. Missing market
-breadth is neutral with a warning in mock/paper by default, but becomes caution
-for live automation; stale breadth also becomes caution by default. Missing
-sector context warns and prevents elevated sizing, while configured weak sector
-signals or same-sector crowding downsize by default and can be set to reject.
-Every affected decision records a `market_regime_guardrail` audit payload with
-the posture, reason, breadth/sector inputs, freshness/source fields, action,
-and original versus adjusted sizing.
-
-Trade outcome feedback can be generated from stored broker fills with:
+Generate broad trade-outcome feedback from stored fills:
 
 ```bash
-PYTHONPATH=apps/api python3.11 -m app.services.trade_outcome_feedback --lookback-days 20
+PYTHONPATH=apps/api python3.12 -m app.services.trade_outcome_feedback --lookback-days 20
 ```
 
-The command writes JSON/Markdown artifacts under
-`var/analytics/trade_outcome_feedback/` by default and updates `latest.json`.
-When enabled, the latest compact lesson snippet is included in watch-buy sizing
-and trigger-time exec-agent request payloads so recent loss patterns can
-downsize, delay, or reject similar setups.
+Artifacts are written under `var/analytics/trade_outcome_feedback/` by default and `latest.json` is updated. When enabled, compact recent lessons are included in watch-buy sizing and trigger-time agent requests.
 
-Weekly trade-review evidence should use the lightweight bounded exporter, not
-the broader trade outcome feedback generator. The exporter reads indexed date
-ranges from exec-owned runtime tables, starts from weekly fills before loading
-linked broker orders/events, omits deferred JSON payload columns by default,
-and does not call broker APIs or mutate order state:
+Feedback is accepted only while the artifact is within `KAI_EXEC_TRADE_OUTCOME_FEEDBACK_MAX_AGE_SECONDS`; missing, future-dated, or stale evidence is ignored. Fill economics are deliberately conservative: settlement currencies are reported separately, only explicit broker transaction costs count as complete coverage, and unknown or partial cost coverage is never treated as zero. Net-P/L gates and strategy lessons therefore use only complete, currency-consistent evidence. Providers that do not report trusted fees remain `unknown`/degraded until that evidence is supplied.
+
+Use the bounded weekly exporter for review evidence:
 
 ```bash
-python3 scripts/export_weekly_trade_review.py \
+python3.12 scripts/export_weekly_trade_review.py \
   --runtime-mode paper \
   --start-at 2026-07-25T00:00:00Z \
   --end-at 2026-08-01T00:00:00Z
 ```
 
-Live weekly cron must fail closed when the service environment was not loaded.
-Source the same `.env` used by the exec service, then require the resolved mode
-before any database connection or artifact write:
+For live cron, source the service environment and keep the fail-closed mode guard:
 
 ```bash
 cd /Users/shawn/kai-trading-exec
 set -a
-. /Users/shawn/kai-trading-exec/.env
+source .env
 set +a
-python3 scripts/export_weekly_trade_review.py \
+python3.12 scripts/export_weekly_trade_review.py \
   --require-runtime-mode live \
   --start-at 2026-08-03T00:00:00+09:00 \
   --end-at 2026-08-08T00:00:00+09:00
 ```
 
-If cron cannot source `.env`, pass both settings explicitly and keep the guard:
+Weekly artifacts default to `var/analytics/weekly_trade_review/`. They include FIFO-based realized P/L, gross and eligible net results, transaction-cost coverage, currency-separated summaries, and lot-level evidence. Use explicit timezone offsets for trading-date boundaries and load stored JSON payloads only for deliberate deep dives.
+
+### Fill evidence repair
+
+Inspect broker-flat symbols with residual local FIFO inventory in dry-run mode first:
 
 ```bash
-KAI_EXEC_RUNTIME_MODE=live \
-KAI_EXEC_DATABASE_URL='postgresql+psycopg://user:pass@host/kai_exec' \
-python3 scripts/export_weekly_trade_review.py \
-  --require-runtime-mode live \
-  --start-at 2026-08-03T00:00:00+09:00 \
-  --end-at 2026-08-08T00:00:00+09:00
-```
-
-The command writes JSON artifacts under
-`var/analytics/weekly_trade_review/` by default and updates `latest.json`.
-Each artifact includes `realized_pnl_summary`, which aggregates FIFO lot rows
-into one outcome per sell fill and reports realized P/L, win/loss/flat counts,
-average/median return, and best/worst closed trades when cost-basis coverage is
-complete. `closed_trades` remains the lot-level audit evidence.
-Use `KAI_EXEC_WEEKLY_TRADE_REVIEW_DIR` or `--output-dir` to change the target.
-Naive timestamps are interpreted as UTC; use explicit `+09:00` offsets for KRX
-trading-date bounds.
-Only add `--include-json-payloads` for a manual deep-dive where loading stored
-broker/request payload JSON is intentional.
-
-To inspect broker-flat symbols whose local fill FIFO still has residual lots,
-run the fill repair tool in dry-run mode first:
-
-```bash
-python3 scripts/repair_execution_fill_evidence.py \
+python3.12 scripts/repair_execution_fill_evidence.py \
   --runtime-mode live \
   --scope fifo-residuals
 ```
@@ -474,75 +352,26 @@ use broker account-snapshot reads and update `execution_positions`; unknown or
 unsupported routes receive durable manual-review events. This command imports
 no order placement service and never places, amends, or cancels orders.
 
-Default short-term sizing is tuned for higher-conviction filtered candidates:
-per-symbol budget `3,000,000` KRW, total exec-agent budget `9,000,000` KRW,
-base risk `1.5%`, max position allocation `30%`, and max symbol exposure
-`30%`. Default profit capture takes a first partial profit near `+2.5%`,
-a final target near `+5.5%`, and rearms the remaining stop near breakeven after
-the first partial profit is submitted. Intraday profit protection starts from a
-higher peak threshold by default (`+3.0%` peak and `1.5%p` giveback), while aged
-position protection also requires at least `+1.0%` current profit so ordinary
-small gains are not converted into premature exits. Candidate-level budgets,
-stop-distance risk sizing, available cash, daily new-buy caps, and runtime
-pause/kill-switch controls still clamp final order size.
+## Tests and quality gates
 
-Operator broker-session endpoints:
-- `GET /broker/session`
-- `POST /broker/session/authenticate`
-- `POST /broker/session/revoke`
+```bash
+python3.12 -m pip install -e '.[dev]'
+python3.12 -m pytest -q
+PYTHONPATH=apps/api python3.12 -c 'from app.main import app'
+bash -n start-api.sh start-api-no-migrate.sh start-alpaca-paper.sh start-kis-us-paper.sh
+git diff --check
+```
 
-Initial broker-order submission endpoint:
-- `POST /orders`
+CI validates the complete Alembic chain and schema contract on both SQLite and PostgreSQL, then runs the launcher syntax check, FastAPI import smoke test, and complete pytest suite on Python 3.12. The repository does not currently configure a lint or static typecheck tool; do not claim those gates until configuration is added.
 
-Current execution slices:
-- `POST /execution-plans` schedules durable `execution_jobs` for eligible `next_open_buy` items
-- paper-mode Upbit crypto plans with explicit `asset_class=crypto`,
-  `provider=upbit`, and `venue=upbit` can queue `crypto_paper_order` jobs for
-  whitelisted `KRW-BTC` and `KRW-ETH`; dispatch records simulated paper
-  placement/fill audit events and decimal fill/position readback without live
-  Upbit placement
-- short-term watcher `next_open_buy` candidates from `short-term-decider` are run through deterministic exec-agent rails before scheduling; approved next-open candidates are converted to concrete share quantities using account cash/buying power, existing exposure/open-order guards, candidate budget, confidence/conviction, and target/stop presence
-- monitored buy/sell triggers can call exec-agent at trigger time, immediately before broker submission, with current quote/account/order context; `execute_now` decisions drive submitted quantity and optional limit/target/stop adjustments, while `keep_watching`, `delay`, and `reject` are persisted on the monitoring item without submitting
-- the autonomous dispatch loop submits due jobs on its configured cadence
-- the autonomous monitoring loop retries persisted triggered/backlogged monitoring items on its configured cadence and can evaluate fresh triggers when a monitoring price source is configured
-- `POST /execution-jobs/dispatch` remains available as an operator/manual dispatch override
-- `POST /monitoring/evaluate` remains available as an operator/manual monitoring override; it runs the shared symbol-monitoring scheduler against supplied price snapshots, round-robins triggered symbols, caps broker actions per cycle, persists dispatch backlog explicitly, and updates monitoring liveness checkpoints
-- `GET /symbols` exposes symbol-level readback rows for core/web consumers
-- `GET /symbols/{symbol}` exposes per-symbol execution, monitoring, order, fill, and position history
-- `GET /runtime/daily-board` exposes a compact current-day board with runtime status plus symbol rows
-- `GET /runtime/portfolio-risk` exposes a compact advisory live portfolio risk
-  snapshot for agents and dashboards. It reports cash/buying power when a broker
-  account snapshot is already available, otherwise falls back to exec-owned
-  positions and open orders with `source_status=partial` or `unavailable`. This
-  endpoint is risk visibility only; it is not an autonomous buy/sell trigger and
-  does not place, amend, cancel, or reconcile orders.
+## Documentation and related repositories
 
-Short-term watcher buys fail closed when broker account state cannot be resolved,
-when cash/buying power is insufficient, when an add-on would breach symbol
-exposure or reward/risk guardrails, when a symbol has a duplicate open buy
-order, or when target/stop monitoring context is missing. Exec-agent decision
-metadata is persisted in each plan item's `risk_context`. Approved short-term
-buys are sized from configured account-risk percent and stop distance first,
-then capped by allocation, symbol exposure, daily new-buy notional, cash/buying
-power, and exec-agent quantity/budget rails.
+- `ARCHITECTURE.md` — ownership and failure boundaries
+- `RULES.md` and `AGENTS.md` — repository operating rules
+- `docs/API.md` — API contract details
+- `docs/LIVE_VALIDATION.md` — guarded single-cycle live validation
+- `docs/ALPACA_CRYPTO_SETUP.md` — Alpaca account, funding, paper test, and activation
+- `kai-trading-core` — market data, strategy context, decisions, and execution plans
+- `kai-trading-web` — dashboards and operator console
 
-## Boot target
-
-First implementation target:
-1. standalone FastAPI service on a separate port
-2. health/runtime/status endpoints
-3. execution-plan intake endpoint
-4. database-backed execution job and order state model
-5. KIS adapter abstraction
-6. open-order + fill monitoring worker loop
-7. kill-switch / pause controls
-
-## Relationship to other repos
-
-- `kai-trading-core`: strategy, planning, dashboards, long-horizon orchestration
-- `kai-trading-web`: UI and operator console
-- `kai-trading-exec`: low-latency trading execution runtime
-
-## Validation runbook
-
-Use [docs/LIVE_VALIDATION.md](docs/LIVE_VALIDATION.md) for the guarded single-cycle live validation path, prerequisites, and failure handling notes.
+Keep Core/Exec execution-plan schemas and fixtures synchronized. Read the live validation runbook before any production-mode change.

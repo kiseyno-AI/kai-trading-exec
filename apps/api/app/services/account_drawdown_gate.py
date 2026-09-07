@@ -20,6 +20,12 @@ from app.models.runtime import (
 )
 from app.services.fill_idempotency import dedupe_execution_fills
 from app.services.fifo_inventory import load_fifo_isolation_cursor
+from app.services.fill_idempotency import dedupe_execution_fills
+from app.services.fill_economics import (
+    ClosedTradeEconomics,
+    closed_trade_economics,
+    effective_fill_quantity,
+)
 
 
 BLOCK_EVENT_TYPE = "account_drawdown_new_buy_blocked"
@@ -38,6 +44,18 @@ class AccountDrawdownDecision:
     sells_risk_reduction_allowed: bool
     summary: dict[str, object]
     payload: dict[str, object]
+
+
+@dataclass(frozen=True)
+class PeriodRealizedPnl:
+    gross: Decimal | None
+    covered_gross: Decimal
+    known_transaction_cost: Decimal | None
+    covered_loss_floor: Decimal | None
+    net: Decimal | None
+    transaction_cost_coverage: str
+    pnl_coverage: str
+    unmatched_sell_quantity: Decimal
 
 
 def evaluate_account_drawdown_gate(
@@ -128,13 +146,21 @@ def evaluate_us_equity_account_gate(
     order_notional: Decimal,
     order_idempotency_key: str,
     execution_plan_item_id: str | None,
+    additional_open_buy_notional: Decimal = Decimal("0"),
+    additional_open_buy_unknown_count: int = 0,
     now: datetime | None = None,
 ) -> AccountDrawdownDecision:
     observed_at = now or datetime.now(UTC)
     exposure = sum((_holding_market_value(holding) for holding in snapshot.holdings), Decimal("0"))
     open_buy_notional, unknown_open_buy_count = _open_buy_notional(snapshot)
+    open_buy_notional += additional_open_buy_notional
+    unknown_open_buy_count += additional_open_buy_unknown_count
     projected_exposure = exposure + open_buy_notional + order_notional
-    daily_realized, weekly_realized = _us_realized_pnl(settings=settings, db=db, now=observed_at)
+    daily_realized, weekly_realized = _us_realized_pnl(
+        settings=settings,
+        db=db,
+        now=observed_at,
+    )
     unrealized = snapshot.unrealized_pnl or sum(
         (holding.unrealized_pnl or Decimal("0") for holding in snapshot.holdings),
         Decimal("0"),
@@ -156,9 +182,49 @@ def evaluate_us_equity_account_gate(
         "open_buy_notional_usd": open_buy_notional,
         "open_buy_notional_unknown_count": unknown_open_buy_count,
         "projected_exposure_usd": projected_exposure,
-        "daily_realized_pnl_usd": daily_realized,
-        "weekly_realized_pnl_usd": weekly_realized,
-        "realized_pnl_source": "local_execution_fills_fifo",
+        "daily_realized_pnl_usd": daily_realized.net,
+        "weekly_realized_pnl_usd": weekly_realized.net,
+        "daily_gross_realized_pnl_usd": daily_realized.gross,
+        "weekly_gross_realized_pnl_usd": weekly_realized.gross,
+        "daily_covered_gross_realized_pnl_usd": daily_realized.covered_gross,
+        "weekly_covered_gross_realized_pnl_usd": weekly_realized.covered_gross,
+        "daily_known_transaction_cost_usd": daily_realized.known_transaction_cost,
+        "weekly_known_transaction_cost_usd": weekly_realized.known_transaction_cost,
+        "daily_covered_realized_pnl_loss_floor_usd": daily_realized.covered_loss_floor,
+        "weekly_covered_realized_pnl_loss_floor_usd": weekly_realized.covered_loss_floor,
+        "daily_transaction_cost_coverage": daily_realized.transaction_cost_coverage,
+        "weekly_transaction_cost_coverage": weekly_realized.transaction_cost_coverage,
+        "daily_realized_pnl_coverage": daily_realized.pnl_coverage,
+        "weekly_realized_pnl_coverage": weekly_realized.pnl_coverage,
+        "daily_unmatched_sell_quantity": daily_realized.unmatched_sell_quantity,
+        "weekly_unmatched_sell_quantity": weekly_realized.unmatched_sell_quantity,
+        "daily_realized_loss_gate_basis": (
+            "net_after_transaction_costs"
+            if daily_realized.net is not None
+            else (
+                "degraded_gross_minus_known_transaction_cost"
+                if daily_realized.gross is not None
+                else (
+                    "covered_loss_floor_gross_minus_known_transaction_cost"
+                    if daily_realized.covered_loss_floor is not None
+                    else "unavailable_unknown_cost_basis_or_currency"
+                )
+            )
+        ),
+        "weekly_realized_loss_gate_basis": (
+            "net_after_transaction_costs"
+            if weekly_realized.net is not None
+            else (
+                "degraded_gross_minus_known_transaction_cost"
+                if weekly_realized.gross is not None
+                else (
+                    "covered_loss_floor_gross_minus_known_transaction_cost"
+                    if weekly_realized.covered_loss_floor is not None
+                    else "unavailable_unknown_cost_basis_or_currency"
+                )
+            )
+        ),
+        "realized_pnl_source": "local_execution_fills_fifo_explicit_costs",
         "realized_pnl_coverage": (
             snapshot.payload.get("realized_pnl_coverage")
             if isinstance(snapshot.payload, dict)
@@ -169,6 +235,12 @@ def evaluate_us_equity_account_gate(
         "worst_holding_loss_pct": worst_holding_loss_pct,
     }
     realized_pnl_coverage = str(metrics["realized_pnl_coverage"])
+    transaction_cost_coverage_complete = (
+        daily_realized.transaction_cost_coverage == "complete"
+        and weekly_realized.transaction_cost_coverage == "complete"
+    )
+    daily_loss_metric = _period_loss_metric(daily_realized)
+    weekly_loss_metric = _period_loss_metric(weekly_realized)
     gates = [
         (
             "us_realized_pnl_coverage_unconfirmed",
@@ -179,6 +251,16 @@ def evaluate_us_equity_account_gate(
                 and not settings.kis_us_allow_degraded_realized_pnl_coverage
             ),
             "KIS US-equity realized PnL coverage is not broker-confirmed",
+        ),
+        (
+            "us_transaction_cost_coverage_unconfirmed",
+            Decimal("1"),
+            Decimal("0"),
+            (
+                not transaction_cost_coverage_complete
+                and not settings.kis_us_allow_degraded_realized_pnl_coverage
+            ),
+            "KIS US-equity realized PnL transaction-cost coverage is incomplete",
         ),
         (
             "us_open_buy_notional_unknown",
@@ -196,16 +278,18 @@ def evaluate_us_equity_account_gate(
         ),
         (
             "us_daily_realized_loss_usd",
-            -daily_realized,
+            -daily_loss_metric if daily_loss_metric is not None else None,
             settings.kis_us_daily_realized_loss_limit_usd,
-            daily_realized <= -settings.kis_us_daily_realized_loss_limit_usd,
+            daily_loss_metric is not None
+            and daily_loss_metric <= -settings.kis_us_daily_realized_loss_limit_usd,
             "KIS US-equity daily realized loss limit reached",
         ),
         (
             "us_weekly_realized_loss_usd",
-            -weekly_realized,
+            -weekly_loss_metric if weekly_loss_metric is not None else None,
             settings.kis_us_weekly_realized_loss_limit_usd,
-            weekly_realized <= -settings.kis_us_weekly_realized_loss_limit_usd,
+            weekly_loss_metric is not None
+            and weekly_loss_metric <= -settings.kis_us_weekly_realized_loss_limit_usd,
             "KIS US-equity weekly realized loss limit reached",
         ),
         (
@@ -311,7 +395,12 @@ def _open_buy_notional(snapshot: BrokerAccountSnapshot) -> tuple[Decimal, int]:
     return total, unknown_count
 
 
-def _us_realized_pnl(*, settings: Settings, db: Session, now: datetime) -> tuple[Decimal, Decimal]:
+def _us_realized_pnl(
+    *,
+    settings: Settings,
+    db: Session,
+    now: datetime,
+) -> tuple[PeriodRealizedPnl, PeriodRealizedPnl]:
     local_now = now.astimezone(US_EASTERN)
     day_start = datetime.combine(local_now.date(), time.min, tzinfo=US_EASTERN).astimezone(UTC)
     week_start = datetime.combine(
@@ -332,16 +421,21 @@ def _us_realized_pnl(*, settings: Settings, db: Session, now: datetime) -> tuple
             .order_by(ExecutionFill.filled_at.asc(), ExecutionFill.id.asc())
         ).all()
     )
-    lots: dict[str, list[list[Decimal]]] = {}
+    lots: dict[str, list[list[object]]] = {}
     isolation_cursor = load_fifo_isolation_cursor(
         db=db,
         runtime_mode=settings.runtime_mode,
         through=now,
     )
-    daily = Decimal("0")
-    weekly = Decimal("0")
+    daily_rows: list[ClosedTradeEconomics] = []
+    weekly_rows: list[ClosedTradeEconomics] = []
+    daily_unmatched_sell_quantity = Decimal("0")
+    weekly_unmatched_sell_quantity = Decimal("0")
     for fill in fills:
-        quantity = Decimal(fill.base_quantity) if fill.base_quantity is not None else Decimal(fill.quantity)
+        quantity = effective_fill_quantity(fill)
+        filled_at = fill.filled_at
+        if filled_at.tzinfo is None:
+            filled_at = filled_at.replace(tzinfo=UTC)
         symbol_lots = lots.setdefault(fill.symbol, [])
         isolation_cursor.apply_before(
             symbol=fill.symbol,
@@ -349,7 +443,7 @@ def _us_realized_pnl(*, settings: Settings, db: Session, now: datetime) -> tuple
             lots=symbol_lots,
         )
         if fill.side.lower() == "buy":
-            symbol_lots.append([quantity, Decimal(fill.price)])
+            symbol_lots.append([quantity, Decimal(fill.price), fill])
             continue
         if fill.side.lower() != "sell":
             continue
@@ -357,19 +451,115 @@ def _us_realized_pnl(*, settings: Settings, db: Session, now: datetime) -> tuple
         while remaining > 0 and symbol_lots:
             lot = symbol_lots[0]
             matched = min(remaining, lot[0])
-            pnl = (Decimal(fill.price) - lot[1]) * matched
-            filled_at = fill.filled_at
-            if filled_at.tzinfo is None:
-                filled_at = filled_at.replace(tzinfo=UTC)
+            pnl = ((Decimal(fill.price) - Decimal(str(lot[1]))) * matched).quantize(
+                Decimal("0.0001")
+            )
+            economics = closed_trade_economics(
+                buy_fill=lot[2],
+                sell_fill=fill,
+                matched_quantity=matched,
+                gross_realized_pnl=pnl,
+            )
             if filled_at >= day_start:
-                daily += pnl
+                daily_rows.append(economics)
             if filled_at >= week_start:
-                weekly += pnl
+                weekly_rows.append(economics)
             lot[0] -= matched
             remaining -= matched
             if lot[0] <= 0:
                 symbol_lots.pop(0)
-    return daily, weekly
+        if remaining > 0:
+            if filled_at >= day_start:
+                daily_unmatched_sell_quantity += remaining
+            if filled_at >= week_start:
+                weekly_unmatched_sell_quantity += remaining
+    return (
+        _period_realized_pnl(
+            daily_rows,
+            unmatched_sell_quantity=daily_unmatched_sell_quantity,
+        ),
+        _period_realized_pnl(
+            weekly_rows,
+            unmatched_sell_quantity=weekly_unmatched_sell_quantity,
+        ),
+    )
+
+
+def _period_realized_pnl(
+    rows: list[ClosedTradeEconomics],
+    *,
+    unmatched_sell_quantity: Decimal = Decimal("0"),
+) -> PeriodRealizedPnl:
+    covered_gross = sum((row.gross_realized_pnl for row in rows), Decimal("0")).quantize(
+        Decimal("0.0001")
+    )
+    currency_complete = all(row.settlement_currency == "USD" for row in rows)
+    pnl_complete = currency_complete and unmatched_sell_quantity <= 0
+    gross = covered_gross if pnl_complete else None
+    known_cost_values = [
+        row.known_transaction_cost
+        for row in rows
+        if row.known_transaction_cost is not None
+    ]
+    known_cost = (
+        sum(known_cost_values, Decimal("0")).quantize(Decimal("0.00000001"))
+        if known_cost_values and currency_complete
+        else (
+            Decimal("0")
+            if not rows and unmatched_sell_quantity <= 0
+            else None
+        )
+    )
+    if not rows and unmatched_sell_quantity <= 0:
+        coverage = "complete"
+    elif pnl_complete and all(
+        row.transaction_cost_coverage == "complete"
+        and row.settlement_currency == "USD"
+        for row in rows
+    ):
+        coverage = "complete"
+    elif known_cost is not None or any(
+        row.transaction_cost_coverage in {"complete", "partial"} for row in rows
+    ):
+        coverage = "partial"
+    else:
+        coverage = "unknown"
+    net = (
+        (gross - known_cost).quantize(Decimal("0.00000001"))
+        if coverage == "complete" and gross is not None and known_cost is not None
+        else None
+    )
+    covered_loss_floor = (
+        (
+            covered_gross
+            - sum(known_cost_values, Decimal("0"))
+        ).quantize(Decimal("0.00000001"))
+        if rows and currency_complete
+        else None
+    )
+    return PeriodRealizedPnl(
+        gross=gross,
+        covered_gross=covered_gross,
+        known_transaction_cost=known_cost,
+        covered_loss_floor=covered_loss_floor,
+        net=net,
+        transaction_cost_coverage=coverage,
+        pnl_coverage="complete" if pnl_complete else "incomplete",
+        unmatched_sell_quantity=unmatched_sell_quantity,
+    )
+
+
+def _period_loss_metric(period: PeriodRealizedPnl) -> Decimal | None:
+    if period.net is not None:
+        return period.net
+    if period.gross is None:
+        return (
+            period.covered_loss_floor
+            if period.covered_loss_floor is not None
+            and period.covered_loss_floor < 0
+            else None
+        )
+    return period.gross - (period.known_transaction_cost or Decimal("0"))
 
 
 def record_account_drawdown_block(

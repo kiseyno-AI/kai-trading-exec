@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from decimal import Decimal
 
@@ -24,6 +25,14 @@ from app.services.trigger_time_exec_agent import _request_payload
 from app.services.watch_exec_agent_sizing import _candidate_universe_payload, _sizing_request_payload
 
 
+COMPLETE_KRW_FILL_ECONOMICS: dict[str, object] = {
+    "settlement_currency": "KRW",
+    "transaction_cost": Decimal("0"),
+    "transaction_cost_coverage": "complete",
+    "transaction_cost_source": "test_fixture",
+}
+
+
 def _session():
     engine = create_engine("sqlite:///:memory:", future=True)
     Base.metadata.create_all(engine)
@@ -42,6 +51,8 @@ def _add_closed_trade(
     trigger_price: str | None = None,
     risk_context: dict[str, object] | None = None,
     filled_day: int = 10,
+    buy_transaction_cost: str = "0",
+    sell_transaction_cost: str = "0",
 ) -> None:
     item = ExecutionPlanItem(
         id=f"item-buy-{suffix}",
@@ -91,6 +102,10 @@ def _add_closed_trade(
                 side="buy",
                 quantity=quantity,
                 price=Decimal(buy_price),
+                settlement_currency="KRW",
+                transaction_cost=Decimal(buy_transaction_cost),
+                transaction_cost_coverage="complete",
+                transaction_cost_source="test_fixture",
                 filled_at=datetime(2026, 6, filled_day, 0, 30, tzinfo=UTC),
             ),
             ExecutionFill(
@@ -100,6 +115,10 @@ def _add_closed_trade(
                 side="sell",
                 quantity=quantity,
                 price=Decimal(sell_price),
+                settlement_currency="KRW",
+                transaction_cost=Decimal(sell_transaction_cost),
+                transaction_cost_coverage="complete",
+                transaction_cost_source="test_fixture",
                 filled_at=datetime(2026, 6, filled_day + 1, 1, 0, tzinfo=UTC),
             ),
         ]
@@ -183,6 +202,7 @@ def test_generate_trade_outcome_feedback_writes_fifo_report_and_snippet(tmp_path
                 side="buy",
                 quantity=10,
                 price=Decimal("71000"),
+                **COMPLETE_KRW_FILL_ECONOMICS,
                 filled_at=datetime(2026, 6, 10, 0, 30, tzinfo=UTC),
             ),
             ExecutionFill(
@@ -192,6 +212,7 @@ def test_generate_trade_outcome_feedback_writes_fifo_report_and_snippet(tmp_path
                 side="sell",
                 quantity=10,
                 price=Decimal("70000"),
+                **COMPLETE_KRW_FILL_ECONOMICS,
                 filled_at=datetime(2026, 6, 11, 1, 0, tzinfo=UTC),
             ),
         ]
@@ -221,7 +242,10 @@ def test_generate_trade_outcome_feedback_writes_fifo_report_and_snippet(tmp_path
     markdown = (tmp_path / "latest.md").read_text(encoding="utf-8")
     for heading in ("이번주 분석 결과", "포트폴리오 리스크", "개선 사항", "검증", "월요일 전 우선순위"):
         assert heading in markdown
-    assert load_latest_trade_outcome_feedback_snippet(settings)["closed_trade_count"] == 1
+    assert load_latest_trade_outcome_feedback_snippet(
+        settings,
+        now=datetime(2026, 6, 12, 0, 1, tzinfo=UTC),
+    )["closed_trade_count"] == 1
 
     session.close()
     engine.dispose()
@@ -297,14 +321,30 @@ def test_trade_outcome_feedback_estimates_legacy_sell_without_fifo_buy_lot(tmp_p
 
     trade = report["closed_trades"][0]
     assert trade["symbol"] == "002380"
-    assert trade["realized_pnl_krw"] == "-97500.0000"
-    assert trade["return_pct"] == "-19.0802"
+    assert trade["realized_pnl_krw"] is None
+    assert trade["gross_realized_pnl_krw"] == "-97500.0000"
+    assert trade["return_pct"] is None
+    assert trade["gross_return_pct"] == "-19.0802"
+    assert trade["profitability_eligible"] is False
+    assert trade["outcome_bucket"] == "unavailable"
+    assert trade["transaction_cost_coverage"] == "unknown"
     assert trade["outcome_source"] == "reconciled_average_cost_estimate"
     assert trade["buy"]["price"] == "511000.0000"
     assert "missing_fifo_buy_lot" in trade["outcome_quality_flags"]
-    assert report["summary"]["realized_pnl_krw"] == "-97500.0000"
+    assert report["summary"]["realized_pnl_krw"] is None
+    assert report["summary"]["gross_realized_pnl_by_currency"] == {
+        "KRW": "-97500.0000"
+    }
     assert report["summary"]["estimated_trade_count"] == 1
     assert report["summary"]["unavailable_trade_count"] == 0
+    assert report["candidate_rule_replay"]["status"] == "blocked"
+    assert report["candidate_rule_replay"]["promotion_eligible"] is False
+    assert report["candidate_rule_replay"]["blocked_reason"] == (
+        "transaction_costs_not_ingested"
+    )
+    assert "gross results are diagnostic only" in report["prompt_snippet"][
+        "candidate_rule_replay"
+    ][0]
     session.refresh(position)
     assert position.quantity == 0
     assert position.average_price == Decimal("511000.0000")
@@ -357,7 +397,7 @@ def test_trade_outcome_feedback_marks_legacy_sell_unavailable_without_cost_basis
     assert trade["outcome_source"] == "unavailable"
     assert trade["realized_pnl_krw"] is None
     assert "missing_average_cost_basis" in trade["outcome_quality_flags"]
-    assert report["summary"]["realized_pnl_krw"] == "0.0000"
+    assert report["summary"]["realized_pnl_krw"] is None
     assert report["summary"]["estimated_trade_count"] == 0
     assert report["summary"]["unavailable_trade_count"] == 1
 
@@ -1138,6 +1178,7 @@ def test_trade_outcome_feedback_portfolio_risk_and_sell_reason_contributions(tmp
                 side="buy",
                 quantity=10,
                 price=Decimal("100000"),
+                **COMPLETE_KRW_FILL_ECONOMICS,
                 filled_at=datetime(2026, 6, 15, 0, 0, tzinfo=UTC),
             ),
             ExecutionFill(
@@ -1147,6 +1188,7 @@ def test_trade_outcome_feedback_portfolio_risk_and_sell_reason_contributions(tmp
                 side="sell",
                 quantity=10,
                 price=Decimal("99000"),
+                **COMPLETE_KRW_FILL_ECONOMICS,
                 filled_at=datetime(2026, 6, 16, 0, 0, tzinfo=UTC),
             ),
             ExecutionFill(
@@ -1156,6 +1198,7 @@ def test_trade_outcome_feedback_portfolio_risk_and_sell_reason_contributions(tmp
                 side="buy",
                 quantity=5,
                 price=Decimal("100000"),
+                **COMPLETE_KRW_FILL_ECONOMICS,
                 filled_at=datetime(2026, 6, 15, 0, 0, tzinfo=UTC),
             ),
             ExecutionFill(
@@ -1165,6 +1208,7 @@ def test_trade_outcome_feedback_portfolio_risk_and_sell_reason_contributions(tmp
                 side="sell",
                 quantity=5,
                 price=Decimal("130000"),
+                **COMPLETE_KRW_FILL_ECONOMICS,
                 filled_at=datetime(2026, 6, 17, 0, 0, tzinfo=UTC),
             ),
             ExecutionFill(
@@ -1174,6 +1218,7 @@ def test_trade_outcome_feedback_portfolio_risk_and_sell_reason_contributions(tmp
                 side="buy",
                 quantity=2,
                 price=Decimal("100000"),
+                **COMPLETE_KRW_FILL_ECONOMICS,
                 filled_at=datetime(2026, 6, 15, 0, 0, tzinfo=UTC),
             ),
             ExecutionFill(
@@ -1183,6 +1228,7 @@ def test_trade_outcome_feedback_portfolio_risk_and_sell_reason_contributions(tmp
                 side="sell",
                 quantity=2,
                 price=Decimal("95000"),
+                **COMPLETE_KRW_FILL_ECONOMICS,
                 filled_at=datetime(2026, 6, 18, 0, 0, tzinfo=UTC),
             ),
         ]
@@ -1358,6 +1404,93 @@ def test_trade_outcome_feedback_portfolio_risk_uses_upbit_base_quantity(tmp_path
     engine.dispose()
 
 
+def test_trade_outcome_feedback_degrades_mixed_currency_portfolio_aggregation(
+    tmp_path,
+) -> None:
+    engine, session = _session()
+    settings = Settings(
+        runtime_mode="paper",
+        trade_outcome_feedback_dir=str(tmp_path),
+        exec_agent_max_account_snapshot_age_seconds=300,
+    )
+    reconciled_at = datetime(2026, 6, 20, 0, 9, tzinfo=UTC)
+    session.add_all(
+        [
+            ExecutionPosition(
+                id="pos-mixed-krw",
+                mode="paper",
+                symbol="005930",
+                quantity=10,
+                average_price=Decimal("100000"),
+                updated_from="broker_reconciliation",
+                last_reconciled_at=reconciled_at,
+            ),
+            ExecutionPosition(
+                id="pos-mixed-usd",
+                mode="paper",
+                symbol="AAPL",
+                quantity=2,
+                average_price=Decimal("200"),
+                updated_from="broker_reconciliation",
+                last_reconciled_at=reconciled_at,
+                raw_payload={
+                    "_position_sync": {
+                        "asset_class": "us_equity",
+                        "exchange": "NASD",
+                    }
+                },
+            ),
+        ]
+    )
+    session.commit()
+
+    report = generate_trade_outcome_feedback(
+        settings=settings,
+        db=session,
+        as_of=datetime(2026, 6, 20, 0, 10, tzinfo=UTC),
+    )
+
+    risk = report["portfolio_risk"]
+    assert risk["available"] is True
+    assert risk["aggregation_status"] == "degraded"
+    assert (
+        risk["aggregation_reason"]
+        == "mixed_settlement_currencies_without_fx_conversion"
+    )
+    assert risk["aggregate_currency"] is None
+    assert risk["total_market_value"] is None
+    assert risk["total_market_value_krw"] is None
+    assert risk["by_currency"] == {
+        "KRW": {
+            "position_count": 1,
+            "known_market_value_count": 1,
+            "known_market_value_subtotal": "1000000.0000",
+            "total_market_value": "1000000.0000",
+        },
+        "USD": {
+            "position_count": 1,
+            "known_market_value_count": 1,
+            "known_market_value_subtotal": "400.0000",
+            "total_market_value": "400.0000",
+        },
+    }
+    concentrations = {row["symbol"]: row for row in risk["top_position_concentration"]}
+    assert concentrations["005930"]["market_value_krw"] == "1000000.0000"
+    assert concentrations["AAPL"]["market_value_krw"] is None
+    assert concentrations["AAPL"]["market_value"] == "400.0000"
+    assert concentrations["005930"]["portfolio_weight_pct"] is None
+    assert concentrations["AAPL"]["portfolio_weight_pct"] is None
+    assert concentrations["005930"]["currency_weight_pct"] == "100.0000"
+    assert concentrations["AAPL"]["currency_weight_pct"] == "100.0000"
+    assert any(
+        "Currency aggregation degraded" in line
+        for line in report["prompt_snippet"]["top_portfolio_risks"]
+    )
+
+    session.close()
+    engine.dispose()
+
+
 def test_candidate_rule_replay_improves_pnl_by_avoiding_stale_trigger_loser(tmp_path) -> None:
     engine, session = _session()
     settings = Settings(runtime_mode="paper", trade_outcome_feedback_dir=str(tmp_path))
@@ -1458,6 +1591,50 @@ def test_candidate_rule_replay_flags_low_sample_size(tmp_path) -> None:
     assert high_volatility["matched_trade_count"] == 1
     assert high_volatility["recommendation"] == "needs_more_data"
     assert high_volatility["gross_pnl_delta_krw"] == "50.0000"
+
+    session.close()
+    engine.dispose()
+
+
+def test_downsize_replay_keeps_full_observed_cost_as_conservative_bound(tmp_path) -> None:
+    engine, session = _session()
+    settings = Settings(runtime_mode="paper", trade_outcome_feedback_dir=str(tmp_path))
+    plan = ExecutionPlan(
+        id="plan-replay-fixed-cost",
+        external_plan_id="plan-replay-fixed-cost",
+        source="kai-trading-core",
+        mode="paper",
+    )
+    session.add(plan)
+    _add_closed_trade(
+        session,
+        plan=plan,
+        suffix="fixed-cost",
+        symbol="COST",
+        buy_price="100",
+        sell_price="110",
+        quantity=1,
+        risk_context={"atr_pct": "12.5"},
+        buy_transaction_cost="4",
+        sell_transaction_cost="4",
+    )
+    session.commit()
+
+    report = generate_trade_outcome_feedback(
+        settings=settings,
+        db=session,
+        as_of=datetime(2026, 6, 20, tzinfo=UTC),
+    )
+
+    rules = {row["rule_id"]: row for row in report["candidate_rule_replay"]["rules"]}
+    downsize = rules["high_volatility_downsize"]
+    example = downsize["top_matched_examples"][0]
+    assert example["realized_pnl_krw"] == "2.0000"
+    assert example["candidate_pnl_krw"] == "-3.0000"
+    assert example["evidence"]["transaction_cost_replay_model"] == (
+        "scaled_gross_minus_full_observed_cost"
+    )
+    assert downsize["net_pnl_delta_krw"] == "-5.0000"
 
     session.close()
     engine.dispose()
@@ -1620,7 +1797,7 @@ def test_candidate_rule_replay_metrics_include_win_rate_and_drawdown_proxy(tmp_p
     assert replay["fee_slippage_assumption_bps"] == "15.0000"
     assert "win_rate_delta_pct" in high_correlation
     assert "max_drawdown_proxy_krw" in high_correlation
-    assert high_correlation["average_return_delta_pct"] == "1.6667"
+    assert high_correlation["average_return_delta_pct"] == "0.0000"
     assert high_correlation["max_drawdown_proxy_krw"] == "-60.0000"
     assert high_correlation["estimated_net_pnl_delta_krw"] is not None
     markdown = (tmp_path / "latest.md").read_text(encoding="utf-8")
@@ -1710,6 +1887,10 @@ def test_candidate_rule_replay_replays_post_entry_tightened_exit_price(tmp_path)
                     "observed_price": "99.50",
                     "tightened_stop_price": "99.00",
                     "recorded_at": f"2026-06-{10 + index:02d}T04:00:00+00:00",
+                    "exit_execution_evidence": {
+                        "bid_price": "99.00",
+                        "observed_at": f"2026-06-{10 + index:02d}T05:00:00+00:00",
+                    },
                 },
                 "last_monitoring_event": {
                     "event": "post_entry_review_required",
@@ -1728,10 +1909,13 @@ def test_candidate_rule_replay_replays_post_entry_tightened_exit_price(tmp_path)
     rules = {row["rule_id"]: row for row in report["candidate_rule_replay"]["rules"]}
     tightened = rules["post_entry_no_progress_exit_tighten"]
     assert tightened["recommendation"] == "promote_to_issue"
+    assert tightened["promotion_eligible"] is True
     assert tightened["matched_trade_count"] == 3
+    assert tightened["replay_eligible_count"] == 3
+    assert tightened["replay_ineligible_count"] == 0
     assert tightened["skipped_entries"] == 0
     assert tightened["avoided_losers"] == 0
-    assert tightened["estimated_net_pnl_delta_krw"] is None
+    assert tightened["estimated_net_pnl_delta_krw"] == "210.0000"
     assert tightened["gross_pnl_delta_krw"] == "210.0000"
     assert tightened["top_avoided_losers"] == []
     evidence = tightened["top_matched_examples"][0]["evidence"]
@@ -1739,6 +1923,238 @@ def test_candidate_rule_replay_replays_post_entry_tightened_exit_price(tmp_path)
     assert evidence["baseline_sell_price"] == "92.0000"
     assert evidence["replay_exit_price"] == "99.0000"
     assert evidence["replay_pnl_krw"] == "-10.0000"
+
+    session.close()
+    engine.dispose()
+
+
+def test_candidate_rule_replay_excludes_tighten_recorded_after_actual_sell(tmp_path) -> None:
+    engine, session = _session()
+    settings = Settings(runtime_mode="paper", trade_outcome_feedback_dir=str(tmp_path))
+    plan = ExecutionPlan(
+        id="plan-replay-post-sell-tighten",
+        external_plan_id="plan-replay-post-sell-tighten",
+        source="kai-trading-core",
+        mode="paper",
+    )
+    session.add(plan)
+    for index in range(3):
+        _add_closed_trade(
+            session,
+            plan=plan,
+            suffix=f"post-sell-tighten-{index}",
+            symbol=f"PST{index}",
+            buy_price="100",
+            sell_price="92",
+            filled_day=10 + index,
+            risk_context={
+                "post_entry_review": {
+                    "reasons": [
+                        "gap_down_breached_risk_threshold",
+                        "next_day_no_progress",
+                        "max_holding_without_progress",
+                    ],
+                    "tightened_stop_price": "99",
+                    "recorded_at": f"2026-06-{11 + index:02d}T02:00:00+00:00",
+                    "exit_execution_evidence": {
+                        "bid_price": "99",
+                        "observed_at": f"2026-06-{11 + index:02d}T02:01:00+00:00",
+                    },
+                }
+            },
+        )
+    session.commit()
+
+    report = generate_trade_outcome_feedback(
+        settings=settings,
+        db=session,
+        as_of=datetime(2026, 6, 20, tzinfo=UTC),
+    )
+
+    rules = {row["rule_id"]: row for row in report["candidate_rule_replay"]["rules"]}
+    tightened = rules["post_entry_no_progress_exit_tighten"]
+    assert tightened["recommendation"] == "needs_more_data"
+    assert tightened["promotion_eligible"] is False
+    assert tightened["promotion_eligible_matched_trade_count"] == 0
+    assert tightened["promotion_excluded_matched_trade_count"] == 3
+    assert tightened["net_pnl_delta_krw"] == "0.0000"
+    assert {
+        row["evidence"]["replay_status"]
+        for row in tightened["top_matched_examples"]
+    } == {"tighten_recorded_at_or_after_actual_sell"}
+
+    session.close()
+    engine.dispose()
+
+
+def test_candidate_rule_replay_uses_stored_tradable_price_below_tightened_stop(tmp_path) -> None:
+    engine, session = _session()
+    settings = Settings(runtime_mode="paper", trade_outcome_feedback_dir=str(tmp_path))
+    plan = ExecutionPlan(
+        id="plan-replay-gap-below-stop",
+        external_plan_id="plan-replay-gap-below-stop",
+        source="kai-trading-core",
+        mode="paper",
+    )
+    session.add(plan)
+    _add_closed_trade(
+        session,
+        plan=plan,
+        suffix="gap-below-stop",
+        symbol="GAPSTOP",
+        buy_price="100",
+        sell_price="97",
+        filled_day=10,
+        risk_context={
+            "post_entry_review": {
+                "reasons": [
+                    "gap_down_breached_risk_threshold",
+                    "next_day_no_progress",
+                    "max_holding_without_progress",
+                ],
+                "tightened_stop_price": "99",
+                "recorded_at": "2026-06-10T04:00:00+00:00",
+                "exit_execution_evidence": {
+                    "bid_price": "95",
+                    "observed_at": "2026-06-10T05:00:00+00:00",
+                },
+            }
+        },
+    )
+    session.commit()
+
+    report = generate_trade_outcome_feedback(
+        settings=settings,
+        db=session,
+        as_of=datetime(2026, 6, 20, tzinfo=UTC),
+    )
+
+    rules = {row["rule_id"]: row for row in report["candidate_rule_replay"]["rules"]}
+    tightened = rules["post_entry_no_progress_exit_tighten"]
+    evidence = tightened["top_matched_examples"][0]["evidence"]
+    assert evidence["replay_eligible"] is True
+    assert evidence["execution_evidence_source"] == "stored_quote.bid_price"
+    assert evidence["replay_exit_price"] == "95.0000"
+    assert evidence["baseline_sell_price"] == "97.0000"
+    assert tightened["net_pnl_delta_krw"] == "-20.0000"
+    assert tightened["recommendation"] == "needs_more_data"
+
+    session.close()
+    engine.dispose()
+
+
+def test_candidate_rule_replay_does_not_promote_three_tightens_without_price_path(tmp_path) -> None:
+    engine, session = _session()
+    settings = Settings(runtime_mode="paper", trade_outcome_feedback_dir=str(tmp_path))
+    plan = ExecutionPlan(
+        id="plan-replay-no-price-path",
+        external_plan_id="plan-replay-no-price-path",
+        source="kai-trading-core",
+        mode="paper",
+    )
+    session.add(plan)
+    for index in range(3):
+        _add_closed_trade(
+            session,
+            plan=plan,
+            suffix=f"no-price-path-{index}",
+            symbol=f"NPP{index}",
+            buy_price="100",
+            sell_price="92",
+            filled_day=10 + index,
+            risk_context={
+                "post_entry_review": {
+                    "reasons": [
+                        "gap_down_breached_risk_threshold",
+                        "next_day_no_progress",
+                        "max_holding_without_progress",
+                    ],
+                    "observed_price": "99.50",
+                    "tightened_stop_price": "99",
+                    "recorded_at": f"2026-06-{10 + index:02d}T04:00:00+00:00",
+                    "session_snapshot": {
+                        "day_low": "90",
+                        "observed_at": f"2026-06-{10 + index:02d}T05:00:00+00:00",
+                    },
+                }
+            },
+        )
+    session.commit()
+
+    report = generate_trade_outcome_feedback(
+        settings=settings,
+        db=session,
+        as_of=datetime(2026, 6, 20, tzinfo=UTC),
+    )
+
+    rules = {row["rule_id"]: row for row in report["candidate_rule_replay"]["rules"]}
+    tightened = rules["post_entry_no_progress_exit_tighten"]
+    assert tightened["matched_trade_count"] == 3
+    assert tightened["promotion_eligible_matched_trade_count"] == 0
+    assert tightened["promotion_excluded_matched_trade_count"] == 3
+    assert tightened["promotion_eligible"] is False
+    assert tightened["recommendation"] == "needs_more_data"
+    assert tightened["net_pnl_delta_krw"] == "0.0000"
+    assert {
+        row["evidence"]["replay_status"]
+        for row in tightened["top_matched_examples"]
+    } == {"missing_post_tighten_execution_evidence"}
+
+    session.close()
+    engine.dispose()
+
+
+def test_candidate_rule_replay_needs_three_replay_eligible_tightens_for_promotion(tmp_path) -> None:
+    engine, session = _session()
+    settings = Settings(runtime_mode="paper", trade_outcome_feedback_dir=str(tmp_path))
+    plan = ExecutionPlan(
+        id="plan-replay-one-evidenced-tighten",
+        external_plan_id="plan-replay-one-evidenced-tighten",
+        source="kai-trading-core",
+        mode="paper",
+    )
+    session.add(plan)
+    for index in range(3):
+        post_entry_review: dict[str, object] = {
+            "reasons": [
+                "gap_down_breached_risk_threshold",
+                "next_day_no_progress",
+                "max_holding_without_progress",
+            ],
+            "tightened_stop_price": "99",
+            "recorded_at": f"2026-06-{10 + index:02d}T04:00:00+00:00",
+        }
+        if index == 0:
+            post_entry_review["exit_execution_evidence"] = {
+                "bid_price": "99",
+                "observed_at": "2026-06-10T05:00:00+00:00",
+            }
+        _add_closed_trade(
+            session,
+            plan=plan,
+            suffix=f"one-evidenced-tighten-{index}",
+            symbol=f"OET{index}",
+            buy_price="100",
+            sell_price="92",
+            filled_day=10 + index,
+            risk_context={"post_entry_review": post_entry_review},
+        )
+    session.commit()
+
+    report = generate_trade_outcome_feedback(
+        settings=settings,
+        db=session,
+        as_of=datetime(2026, 6, 20, tzinfo=UTC),
+    )
+
+    rules = {row["rule_id"]: row for row in report["candidate_rule_replay"]["rules"]}
+    tightened = rules["post_entry_no_progress_exit_tighten"]
+    assert tightened["matched_trade_count"] == 3
+    assert tightened["replay_eligible_count"] == 1
+    assert tightened["replay_ineligible_count"] == 2
+    assert tightened["net_pnl_delta_krw"] == "70.0000"
+    assert tightened["promotion_eligible"] is False
+    assert tightened["recommendation"] == "needs_more_data"
 
     session.close()
     engine.dispose()
@@ -1808,6 +2224,7 @@ def test_candidate_rule_replay_uses_sell_post_entry_context(tmp_path) -> None:
                 side="buy",
                 quantity=10,
                 price=Decimal("100"),
+                **COMPLETE_KRW_FILL_ECONOMICS,
                 filled_at=datetime(2026, 6, 10, 0, 30, tzinfo=UTC),
             ),
             ExecutionFill(
@@ -1817,6 +2234,7 @@ def test_candidate_rule_replay_uses_sell_post_entry_context(tmp_path) -> None:
                 side="sell",
                 quantity=10,
                 price=Decimal("92"),
+                **COMPLETE_KRW_FILL_ECONOMICS,
                 filled_at=datetime(2026, 6, 11, 1, 0, tzinfo=UTC),
             ),
         ]
@@ -1841,22 +2259,22 @@ def test_exec_agent_payloads_include_latest_trade_outcome_feedback(tmp_path) -> 
     engine, session = _session()
     settings = Settings(runtime_mode="paper", trade_outcome_feedback_dir=str(tmp_path))
     (tmp_path / "latest.json").write_text(
-        """
-{
-  "version": "trade-outcome-feedback-v1",
-  "mode": "paper",
-  "generated_at": "2026-06-12T00:00:00+00:00",
-  "lookback_days": 20,
-  "closed_trade_count": 1,
-  "summary": {"realized_pnl_krw": "-10000.0000"},
-  "prompt_snippet": {
-    "summary": "Recent closed trades: pnl=-10000.0000 KRW",
-    "patterns_to_downsize_or_reject": ["Downsize standard_breakout"],
-    "positive_expectancy_patterns": [],
-    "required_hard_gates": ["Reject repeat worst-loss setups"]
-  }
-}
-""".strip(),
+        json.dumps(
+            {
+                "version": "trade-outcome-feedback-v1",
+                "mode": "paper",
+                "generated_at": datetime.now(UTC).isoformat(),
+                "lookback_days": 20,
+                "closed_trade_count": 1,
+                "summary": {"realized_pnl_krw": "-10000.0000"},
+                "prompt_snippet": {
+                    "summary": "Recent closed trades: pnl=-10000.0000 KRW",
+                    "patterns_to_downsize_or_reject": ["Downsize standard_breakout"],
+                    "positive_expectancy_patterns": [],
+                    "required_hard_gates": ["Reject repeat worst-loss setups"],
+                },
+            }
+        ),
         encoding="utf-8",
     )
     plan = ExecutionPlan(
@@ -1931,3 +2349,40 @@ def test_latest_trade_outcome_feedback_ignores_other_runtime_modes(tmp_path) -> 
     )
 
     assert load_latest_trade_outcome_feedback_snippet(settings) is None
+
+
+def test_latest_trade_outcome_feedback_ignores_stale_or_unversioned_artifacts(tmp_path) -> None:
+    settings = Settings(
+        runtime_mode="paper",
+        trade_outcome_feedback_dir=str(tmp_path),
+        trade_outcome_feedback_max_age_seconds=3600,
+    )
+    (tmp_path / "latest.json").write_text(
+        """
+{
+  "version": "trade-outcome-feedback-v1",
+  "mode": "paper",
+  "generated_at": "2026-06-12T00:00:00+00:00",
+  "lookback_days": 20,
+  "closed_trade_count": 1,
+  "summary": {},
+  "prompt_snippet": {"patterns_to_downsize_or_reject": ["stale lesson"]}
+}
+""".strip(),
+        encoding="utf-8",
+    )
+
+    assert load_latest_trade_outcome_feedback_snippet(
+        settings,
+        now=datetime(2026, 6, 12, 2, 0, tzinfo=UTC),
+    ) is None
+
+    (tmp_path / "latest.json").write_text(
+        '{"version":"trade-outcome-feedback-v1","mode":"paper",'
+        '"prompt_snippet":{"patterns_to_downsize_or_reject":[]}}',
+        encoding="utf-8",
+    )
+    assert load_latest_trade_outcome_feedback_snippet(
+        settings,
+        now=datetime(2026, 6, 12, 0, 1, tzinfo=UTC),
+    ) is None

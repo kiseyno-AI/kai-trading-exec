@@ -25,8 +25,15 @@ from app.models.runtime import (
 )
 from app.services.fill_idempotency import (
     dedupe_execution_fills,
+    duplicate_fill_conflicting_fields,
     duplicate_fill_group_candidate_key,
     execution_fill_dedupe_key,
+)
+from app.services.fill_economics import (
+    ClosedTradeEconomics,
+    closed_trade_economics,
+    execution_fill_economics,
+    summarize_closed_trade_economics,
 )
 from app.services.fifo_inventory import load_fifo_isolation_cursor
 from app.services.max_holding_actionability import max_holding_actionability_summary
@@ -51,6 +58,8 @@ from app.services.broker_auth import build_broker_adapter, build_broker_session_
 from app.services.account_drawdown_gate import latest_account_drawdown_gate_state
 from app.services.broker_order_state import (
     ACTIONABLE_OPEN_ORDER_STATUSES,
+    CAPITAL_RESERVING_ORDER_STATUSES,
+    MANUAL_REVIEW_ORDER_STATUSES,
     NONTERMINAL_ORDER_STATUSES,
     UNTRUSTED_ACTIVE_ORDER_ERROR_CLASSIFICATIONS,
     active_local_broker_order_filters,
@@ -132,6 +141,8 @@ class DuplicateFillQualityGroup:
     base_quantity_variants: int
     quote_notional_variants: int
     price_variants: int
+    economic_conflict: bool
+    conflicting_fields: tuple[str, ...]
     candidate_key: str
 
 
@@ -463,22 +474,8 @@ def broker_order_fill_quality_payload(
             "filled_at": _serialize_datetime(row.filled_at),
             "broker_fill_id": row.broker_fill_id,
             "duplicate_count": int(row.duplicate_count),
-            "economic_conflict": (
-                int(row.quantity_variants or 0) > 1
-                or int(row.base_quantity_variants or 0) > 1
-                or int(row.quote_notional_variants or 0) > 1
-                or int(row.price_variants or 0) > 1
-            ),
-            "conflicting_fields": [
-                field
-                for field, count in (
-                    ("quantity", row.quantity_variants),
-                    ("base_quantity", row.base_quantity_variants),
-                    ("quote_notional", row.quote_notional_variants),
-                    ("price", row.price_variants),
-                )
-                if int(count or 0) > 1
-            ],
+            "economic_conflict": row.economic_conflict,
+            "conflicting_fields": list(row.conflicting_fields),
             "review_outcome": review.outcome if review is not None else None,
             "review_actor": review.actor if review is not None else None,
             "review_reason": review.reason if review is not None else None,
@@ -522,6 +519,7 @@ def _duplicate_fill_quality_groups(
         if len(group) <= 1:
             continue
         retained = group[0]
+        conflicting_fields = tuple(duplicate_fill_conflicting_fields(group))
         duplicate_groups.append(
             DuplicateFillQualityGroup(
                 broker_order_pk=str(retained.broker_order_pk),
@@ -550,6 +548,8 @@ def _duplicate_fill_quality_groups(
                     }
                 ),
                 price_variants=len({_decimal_text(Decimal(fill.price)) for fill in group}),
+                economic_conflict=bool(conflicting_fields),
+                conflicting_fields=conflicting_fields,
                 candidate_key=_duplicate_fill_candidate_key(
                     group_key=group_key,
                     fills=group,
@@ -652,11 +652,16 @@ def stale_nonterminal_order_freshness_payload(
         select(BrokerOrder)
         .where(
             BrokerOrder.mode == settings.runtime_mode,
-            BrokerOrder.status.in_(NONTERMINAL_ORDER_STATUSES),
             or_(
-                order_observed_at < stale_before,
-                BrokerOrder.last_error_classification.in_(
-                    tuple(UNTRUSTED_ACTIVE_ORDER_ERROR_CLASSIFICATIONS)
+                BrokerOrder.status.in_(MANUAL_REVIEW_ORDER_STATUSES),
+                and_(
+                    BrokerOrder.status.in_(NONTERMINAL_ORDER_STATUSES),
+                    or_(
+                        order_observed_at < stale_before,
+                        BrokerOrder.last_error_classification.in_(
+                            tuple(UNTRUSTED_ACTIVE_ORDER_ERROR_CLASSIFICATIONS)
+                        ),
+                    ),
                 ),
             ),
         )
@@ -903,7 +908,11 @@ def _stale_nonterminal_order_item(*, order: BrokerOrder) -> dict[str, object]:
 
 
 def _stale_nonterminal_order_action(order: BrokerOrder) -> str:
-    if not order.broker_order_id or order.status == "retry_pending":
+    if (
+        order.status in MANUAL_REVIEW_ORDER_STATUSES
+        or not order.broker_order_id
+        or order.status == "retry_pending"
+    ):
         return "manual_review"
     return "reconcile_broker_truth"
 
@@ -911,6 +920,8 @@ def _stale_nonterminal_order_action(order: BrokerOrder) -> str:
 def _stale_nonterminal_order_reason(order: BrokerOrder) -> str:
     if order.last_error_classification in UNTRUSTED_ACTIVE_ORDER_ERROR_CLASSIFICATIONS:
         return str(order.last_error_classification)
+    if order.status in MANUAL_REVIEW_ORDER_STATUSES:
+        return order.last_error_classification or "manual_review_required"
     if not order.broker_order_id:
         return "missing_broker_order_id"
     if order.status == "retry_pending":
@@ -936,7 +947,12 @@ def _position_truth_evidence_symbols(
     symbols = set(
         db.scalars(
             select(BrokerOrder.symbol)
-            .where(*active_local_broker_order_filters(settings=settings, statuses=OPEN_ORDER_STATUSES))
+            .where(
+                *active_local_broker_order_filters(
+                    settings=settings,
+                    statuses=CAPITAL_RESERVING_ORDER_STATUSES,
+                )
+            )
             .distinct()
         ).all()
     )
@@ -1518,6 +1534,7 @@ def build_runtime_status(
         "failed_today": [],
         "positions": [],
     }
+    monthly_pnl = _default_monthly_pnl_payload(settings=settings)
     daily_pnl = _default_daily_pnl_payload()
     weekly_pnl = _default_weekly_pnl_payload()
     broker = build_broker_session_summary(settings=settings, db=None)
@@ -1661,6 +1678,7 @@ def build_runtime_status(
             "symbols": symbols,
             "freshness": freshness,
             "actionable_alerts": _default_actionable_alerts_payload(),
+            "monthly_pnl": monthly_pnl,
             "weekly_pnl": weekly_pnl,
             "daily_pnl": daily_pnl,
             "account_drawdown_gate": account_drawdown_gate,
@@ -1705,6 +1723,7 @@ def build_runtime_status(
             "late_entry_gate": late_entry_gate,
             "symbols": symbols,
             "freshness": freshness,
+            "monthly_pnl": monthly_pnl,
             "weekly_pnl": weekly_pnl,
             "daily_pnl": daily_pnl,
             "account_drawdown_gate": account_drawdown_gate,
@@ -1848,29 +1867,53 @@ def monthly_pnl_payload(
     )
 
     target = getattr(settings, "monthly_target_krw", Decimal("500000"))
-    monthly_realized = summary["realized"]
-    progress = (monthly_realized / target * Decimal("100")).quantize(Decimal("0.01")) if target > 0 else Decimal("0")
+    economics = _pnl_economics_payload(
+        summary["economics_rows"],
+        unmatched_sell_quantity_by_currency=summary[
+            "unmatched_sell_quantity_by_currency"
+        ],
+        unknown_currency_unmatched_sell_quantity=summary[
+            "unknown_currency_unmatched_sell_quantity"
+        ],
+    )
+    notionals = summary["notionals"]
+    monthly_gross = economics["gross_realized_pnl_krw"]
+    monthly_net = economics["net_realized_pnl_krw"]
+    progress = (
+        (Decimal(str(monthly_net)) / target * Decimal("100")).quantize(Decimal("0.01"))
+        if monthly_net is not None and target > 0
+        else None
+    )
     expected_progress = _expected_month_progress_pct(now)
-    recommendation = _monthly_mode_recommendation(
-        settings=settings,
-        progress_pct=progress,
-        expected_progress_pct=expected_progress,
+    recommendation = (
+        _monthly_mode_recommendation(
+            settings=settings,
+            progress_pct=progress,
+            expected_progress_pct=expected_progress,
+        )
+        if progress is not None
+        else "insufficient_net_pnl_data"
     )
     return {
         "month": month_start.astimezone(KRX_TIMEZONE).strftime("%Y-%m"),
-        "monthly_realized_pnl": _decimal_text(monthly_realized),
+        "monthly_realized_pnl": _decimal_text(monthly_gross),
+        "monthly_gross_realized_pnl_krw": _decimal_text(monthly_gross),
+        "monthly_net_realized_pnl_krw": _decimal_text(monthly_net),
         "monthly_target_krw": _decimal_text(target),
         "target_progress_pct": _decimal_text(progress),
         "expected_calendar_progress_pct": _decimal_text(expected_progress),
         "mode_recommendation": recommendation,
-        "monthly_buy_notional": _decimal_text(summary["buy_notional"]),
-        "monthly_sell_notional": _decimal_text(summary["sell_notional"]),
+        "monthly_buy_notional": notionals["buy_notional_krw"],
+        "monthly_sell_notional": notionals["sell_notional_krw"],
         "matched_sell_quantity": _quantity_value(summary["matched_sell_quantity"]),
         "unmatched_sell_quantity": _quantity_value(summary["unmatched_sell_quantity"]),
         "cost_basis_sources": summary["cost_basis_sources"],
         "unknown_cost_basis_sell_quantity": _quantity_value(summary["unknown_cost_basis_sell_quantity"]),
         "stale_fifo_inventory_alerts": summary["stale_fifo_inventory_alerts"],
+        **economics,
+        **notionals,
         "pnl_method": "fifo_internal_fills_with_broker_reconciliation_fallback",
+        "pnl_economics_method": "gross_by_currency_with_explicit_transaction_cost_coverage",
     }
 
 
@@ -1898,13 +1941,18 @@ def daily_pnl_payload(
         through=next_day_start,
     )
     realized = Decimal("0")
-    sell_notional = Decimal("0")
-    buy_notional = Decimal("0")
+    buy_notional_by_currency: dict[str, Decimal] = {}
+    sell_notional_by_currency: dict[str, Decimal] = {}
+    unknown_currency_buy_notional = Decimal("0")
+    unknown_currency_sell_notional = Decimal("0")
     matched_sell_quantity = Decimal("0")
     unmatched_sell_quantity = Decimal("0")
     closed_symbols: set[str] = set()
     sold_symbols: set[str] = set()
     unmatched_sell_symbols: set[str] = set()
+    unmatched_sell_quantity_by_currency: dict[str, Decimal] = {}
+    unknown_currency_unmatched_sell_quantity = Decimal("0")
+    economics_rows: list[ClosedTradeEconomics] = []
     for fill in fills:
         filled_at = _as_utc(fill.filled_at)
         side = fill.side.lower()
@@ -1915,22 +1963,50 @@ def daily_pnl_payload(
         isolation_cursor.apply_before(symbol=symbol, observed_at=filled_at, lots=lots)
         if side == "buy":
             lots.append(
-                {"quantity": quantity, "price": fill.price, "filled_at": filled_at}
+                {
+                    "quantity": quantity,
+                    "price": fill.price,
+                    "filled_at": filled_at,
+                    "fill": fill,
+                }
             )
             if filled_at >= day_start:
-                buy_notional += notional
+                currency = execution_fill_economics(fill).settlement_currency
+                if currency is None:
+                    unknown_currency_buy_notional += notional
+                else:
+                    buy_notional_by_currency[currency] = (
+                        buy_notional_by_currency.get(currency, Decimal("0")) + notional
+                    )
             continue
         if side != "sell":
             continue
         if filled_at >= day_start:
-            sell_notional += notional
+            currency = execution_fill_economics(fill).settlement_currency
+            if currency is None:
+                unknown_currency_sell_notional += notional
+            else:
+                sell_notional_by_currency[currency] = (
+                    sell_notional_by_currency.get(currency, Decimal("0")) + notional
+                )
             sold_symbols.add(symbol)
         remaining = quantity
         while remaining > 0 and lots:
             lot = lots[0]
             matched = min(remaining, lot["quantity"])
             if filled_at >= day_start:
-                realized += ((fill.price - lot["price"]) * matched).quantize(Decimal("0.0001"))
+                gross_pnl = ((fill.price - lot["price"]) * matched).quantize(
+                    Decimal("0.0001")
+                )
+                realized += gross_pnl
+                economics_rows.append(
+                    closed_trade_economics(
+                        buy_fill=lot["fill"],
+                        sell_fill=fill,
+                        matched_quantity=matched,
+                        gross_realized_pnl=gross_pnl,
+                    )
+                )
                 matched_sell_quantity += matched
                 closed_symbols.add(symbol)
             lot["quantity"] -= matched
@@ -1940,12 +2016,41 @@ def daily_pnl_payload(
         if remaining > 0 and filled_at >= day_start:
             unmatched_sell_quantity += remaining
             unmatched_sell_symbols.add(symbol)
+            unmatched_currency = execution_fill_economics(fill).settlement_currency
+            if unmatched_currency is None:
+                unknown_currency_unmatched_sell_quantity += remaining
+            else:
+                unmatched_sell_quantity_by_currency[unmatched_currency] = (
+                    unmatched_sell_quantity_by_currency.get(
+                        unmatched_currency, Decimal("0")
+                    )
+                    + remaining
+                )
 
+    economics = _pnl_economics_payload(
+        economics_rows,
+        unmatched_sell_quantity_by_currency=unmatched_sell_quantity_by_currency,
+        unknown_currency_unmatched_sell_quantity=(
+            unknown_currency_unmatched_sell_quantity
+        ),
+    )
+    notionals = _pnl_notional_payload(
+        buy_by_currency=buy_notional_by_currency,
+        sell_by_currency=sell_notional_by_currency,
+        unknown_buy=unknown_currency_buy_notional,
+        unknown_sell=unknown_currency_sell_notional,
+    )
     return {
         "date": day_start.astimezone(KRX_TIMEZONE).strftime("%Y-%m-%d"),
-        "daily_realized_pnl": _decimal_text(realized),
-        "daily_buy_notional": _decimal_text(buy_notional),
-        "daily_sell_notional": _decimal_text(sell_notional),
+        "daily_realized_pnl": _decimal_text(economics["gross_realized_pnl_krw"]),
+        "daily_gross_realized_pnl_krw": _decimal_text(
+            economics["gross_realized_pnl_krw"]
+        ),
+        "daily_net_realized_pnl_krw": _decimal_text(
+            economics["net_realized_pnl_krw"]
+        ),
+        "daily_buy_notional": notionals["buy_notional_krw"],
+        "daily_sell_notional": notionals["sell_notional_krw"],
         "matched_sell_quantity": _quantity_value(matched_sell_quantity),
         "unmatched_sell_quantity": _quantity_value(unmatched_sell_quantity),
         "sold_symbols": sorted(sold_symbols),
@@ -1954,7 +2059,10 @@ def daily_pnl_payload(
         "closed_symbol_count": len(closed_symbols),
         "unmatched_sell_symbols": sorted(unmatched_sell_symbols),
         "unmatched_sell_symbol_count": len(unmatched_sell_symbols),
+        **economics,
+        **notionals,
         "pnl_method": "fifo_internal_fills",
+        "pnl_economics_method": "gross_by_currency_with_explicit_transaction_cost_coverage",
     }
 
 
@@ -1972,12 +2080,28 @@ def weekly_pnl_payload(
         end_at=next_week_start,
     )
 
+    economics = _pnl_economics_payload(
+        summary["economics_rows"],
+        unmatched_sell_quantity_by_currency=summary[
+            "unmatched_sell_quantity_by_currency"
+        ],
+        unknown_currency_unmatched_sell_quantity=summary[
+            "unknown_currency_unmatched_sell_quantity"
+        ],
+    )
+    notionals = summary["notionals"]
     return {
         "week_start": week_start.astimezone(KRX_TIMEZONE).strftime("%Y-%m-%d"),
         "week_end_exclusive": next_week_start.astimezone(KRX_TIMEZONE).strftime("%Y-%m-%d"),
-        "weekly_realized_pnl": _decimal_text(summary["realized"]),
-        "weekly_buy_notional": _decimal_text(summary["buy_notional"]),
-        "weekly_sell_notional": _decimal_text(summary["sell_notional"]),
+        "weekly_realized_pnl": _decimal_text(economics["gross_realized_pnl_krw"]),
+        "weekly_gross_realized_pnl_krw": _decimal_text(
+            economics["gross_realized_pnl_krw"]
+        ),
+        "weekly_net_realized_pnl_krw": _decimal_text(
+            economics["net_realized_pnl_krw"]
+        ),
+        "weekly_buy_notional": notionals["buy_notional_krw"],
+        "weekly_sell_notional": notionals["sell_notional_krw"],
         "matched_sell_quantity": _quantity_value(summary["matched_sell_quantity"]),
         "unmatched_sell_quantity": _quantity_value(summary["unmatched_sell_quantity"]),
         "closed_trade_count": summary["closed_trade_count"],
@@ -1991,7 +2115,10 @@ def weekly_pnl_payload(
         "cost_basis_sources": summary["cost_basis_sources"],
         "unknown_cost_basis_sell_quantity": _quantity_value(summary["unknown_cost_basis_sell_quantity"]),
         "stale_fifo_inventory_alerts": summary["stale_fifo_inventory_alerts"],
+        **economics,
+        **notionals,
         "pnl_method": "fifo_internal_fills_with_broker_reconciliation_fallback",
+        "pnl_economics_method": "gross_by_currency_with_explicit_transaction_cost_coverage",
     }
 
 
@@ -2025,8 +2152,10 @@ def _period_realized_pnl_summary(
         through=end_at,
     )
     realized = Decimal("0")
-    sell_notional = Decimal("0")
-    buy_notional = Decimal("0")
+    buy_notional_by_currency: dict[str, Decimal] = {}
+    sell_notional_by_currency: dict[str, Decimal] = {}
+    unknown_currency_buy_notional = Decimal("0")
+    unknown_currency_sell_notional = Decimal("0")
     matched_sell_quantity = Decimal("0")
     unmatched_sell_quantity = Decimal("0")
     closed_symbols: set[str] = set()
@@ -2036,6 +2165,9 @@ def _period_realized_pnl_summary(
     breakeven_count = 0
     cost_basis_sources = {"fill_fifo": 0, "broker_reconciliation": 0, "unknown": 0}
     unknown_cost_basis_sell_quantity = Decimal("0")
+    unmatched_sell_quantity_by_currency: dict[str, Decimal] = {}
+    unknown_currency_unmatched_sell_quantity = Decimal("0")
+    economics_rows: list[ClosedTradeEconomics] = []
     for fill in fills:
         filled_at = _as_utc(fill.filled_at)
         side = fill.side.lower()
@@ -2046,17 +2178,34 @@ def _period_realized_pnl_summary(
         isolation_cursor.apply_before(symbol=symbol, observed_at=filled_at, lots=lots)
         if side == "buy":
             lots.append(
-                {"quantity": quantity, "price": fill.price, "filled_at": filled_at}
+                {
+                    "quantity": quantity,
+                    "price": fill.price,
+                    "filled_at": filled_at,
+                    "fill": fill,
+                }
             )
             if filled_at >= start_at:
-                buy_notional += notional
+                currency = execution_fill_economics(fill).settlement_currency
+                if currency is None:
+                    unknown_currency_buy_notional += notional
+                else:
+                    buy_notional_by_currency[currency] = (
+                        buy_notional_by_currency.get(currency, Decimal("0")) + notional
+                    )
             continue
         if side != "sell":
             continue
         in_period = filled_at >= start_at
         next_buy_after_sell = _pnl_next_buy_after(fills=fills, symbol=symbol, after=filled_at)
         if in_period:
-            sell_notional += notional
+            currency = execution_fill_economics(fill).settlement_currency
+            if currency is None:
+                unknown_currency_sell_notional += notional
+            else:
+                sell_notional_by_currency[currency] = (
+                    sell_notional_by_currency.get(currency, Decimal("0")) + notional
+                )
         remaining = quantity
         while remaining > 0 and lots:
             lot = lots[0]
@@ -2076,6 +2225,18 @@ def _period_realized_pnl_summary(
             pnl = ((fill.price - cost_price) * matched).quantize(Decimal("0.0001"))
             if in_period:
                 realized += pnl
+                economics_rows.append(
+                    closed_trade_economics(
+                        buy_fill=(
+                            None
+                            if cost_source == "broker_reconciliation"
+                            else lot["fill"]
+                        ),
+                        sell_fill=fill,
+                        matched_quantity=matched,
+                        gross_realized_pnl=pnl,
+                    )
+                )
                 matched_sell_quantity += matched
                 closed_symbols.add(symbol)
                 cost_basis_sources[cost_source] += 1
@@ -2099,6 +2260,14 @@ def _period_realized_pnl_summary(
             if broker_cost_basis is not None:
                 pnl = ((fill.price - broker_cost_basis) * remaining).quantize(Decimal("0.0001"))
                 realized += pnl
+                economics_rows.append(
+                    closed_trade_economics(
+                        buy_fill=None,
+                        sell_fill=fill,
+                        matched_quantity=remaining,
+                        gross_realized_pnl=pnl,
+                    )
+                )
                 matched_sell_quantity += remaining
                 closed_symbols.add(symbol)
                 cost_basis_sources["broker_reconciliation"] += 1
@@ -2113,14 +2282,28 @@ def _period_realized_pnl_summary(
                 unknown_cost_basis_sell_quantity += remaining
                 unmatched_sell_symbols.add(symbol)
                 cost_basis_sources["unknown"] += 1
+                unmatched_currency = execution_fill_economics(fill).settlement_currency
+                if unmatched_currency is None:
+                    unknown_currency_unmatched_sell_quantity += remaining
+                else:
+                    unmatched_sell_quantity_by_currency[unmatched_currency] = (
+                        unmatched_sell_quantity_by_currency.get(
+                            unmatched_currency, Decimal("0")
+                        )
+                        + remaining
+                    )
 
     for symbol, lots in lots_by_symbol.items():
         isolation_cursor.apply_through(symbol=symbol, observed_at=end_at, lots=lots)
 
     return {
         "realized": realized,
-        "buy_notional": buy_notional,
-        "sell_notional": sell_notional,
+        "notionals": _pnl_notional_payload(
+            buy_by_currency=buy_notional_by_currency,
+            sell_by_currency=sell_notional_by_currency,
+            unknown_buy=unknown_currency_buy_notional,
+            unknown_sell=unknown_currency_sell_notional,
+        ),
         "matched_sell_quantity": matched_sell_quantity,
         "unmatched_sell_quantity": unmatched_sell_quantity,
         "unknown_cost_basis_sell_quantity": unknown_cost_basis_sell_quantity,
@@ -2131,6 +2314,11 @@ def _period_realized_pnl_summary(
         "loss_count": loss_count,
         "breakeven_count": breakeven_count,
         "cost_basis_sources": cost_basis_sources,
+        "economics_rows": economics_rows,
+        "unmatched_sell_quantity_by_currency": unmatched_sell_quantity_by_currency,
+        "unknown_currency_unmatched_sell_quantity": (
+            unknown_currency_unmatched_sell_quantity
+        ),
         "stale_fifo_inventory_alerts": _stale_fifo_inventory_alerts(
             lots_by_symbol=lots_by_symbol,
             positions_by_symbol=positions_by_symbol,
@@ -2241,55 +2429,328 @@ def _pnl_fill_notional(*, fill: ExecutionFill, quantity: Decimal) -> Decimal:
     return (fill.price * quantity).quantize(Decimal("0.0001"))
 
 
+def _pnl_economics_payload(
+    rows: list[ClosedTradeEconomics],
+    *,
+    unmatched_sell_quantity_by_currency: dict[str, Decimal] | None = None,
+    unknown_currency_unmatched_sell_quantity: Decimal = Decimal("0"),
+) -> dict[str, object]:
+    unmatched_by_currency = {
+        str(currency): Decimal(str(quantity))
+        for currency, quantity in (unmatched_sell_quantity_by_currency or {}).items()
+        if Decimal(str(quantity)) > 0
+    }
+    unknown_unmatched_quantity = Decimal(
+        str(unknown_currency_unmatched_sell_quantity)
+    )
+    summary = summarize_closed_trade_economics(rows)
+    raw_by_currency = summary["by_currency"]
+    by_currency: dict[str, dict[str, object]] = {}
+    if isinstance(raw_by_currency, dict):
+        for currency, raw_bucket in raw_by_currency.items():
+            if not isinstance(raw_bucket, dict):
+                continue
+            by_currency[str(currency)] = {
+                **raw_bucket,
+                "gross_realized_pnl": _decimal_text(
+                    raw_bucket.get("gross_realized_pnl")
+                ),
+                "known_transaction_cost": _decimal_text(
+                    raw_bucket.get("known_transaction_cost")
+                ),
+                "net_realized_pnl": _decimal_text(raw_bucket.get("net_realized_pnl")),
+                "covered_net_realized_pnl": _decimal_text(
+                    raw_bucket.get("covered_net_realized_pnl")
+                ),
+            }
+
+    for currency, quantity in sorted(unmatched_by_currency.items()):
+        bucket = by_currency.setdefault(
+            currency,
+            {
+                "currency": currency,
+                "gross_realized_pnl": None,
+                "known_transaction_cost": None,
+                "net_realized_pnl": None,
+                "covered_net_realized_pnl": None,
+                "transaction_cost_coverage": "unknown",
+                "closed_lot_count": 0,
+                "complete_cost_lot_count": 0,
+            },
+        )
+        bucket["covered_gross_realized_pnl"] = bucket.get(
+            "gross_realized_pnl"
+        )
+        bucket["gross_realized_pnl"] = None
+        bucket["net_realized_pnl"] = None
+        bucket["pnl_coverage"] = "incomplete_unknown_cost_basis"
+        bucket["unmatched_sell_quantity"] = _quantity_value(quantity)
+
+    no_pnl_activity = (
+        not rows
+        and not unmatched_by_currency
+        and unknown_unmatched_quantity <= 0
+    )
+    krw = raw_by_currency.get("KRW") if isinstance(raw_by_currency, dict) else None
+    has_krw = isinstance(krw, dict)
+    krw_cost_basis_incomplete = (
+        "KRW" in unmatched_by_currency
+        or unknown_unmatched_quantity > 0
+        or int(summary["unknown_currency_lot_count"]) > 0
+    )
+    covered_gross_krw = (
+        Decimal(str(krw["gross_realized_pnl"])) if has_krw else None
+    )
+    if no_pnl_activity:
+        gross_krw: Decimal | None = Decimal("0")
+        net_krw: Decimal | None = Decimal("0")
+        status = "no_closed_trades"
+        krw_cost_coverage = "complete"
+    else:
+        gross_krw = (
+            covered_gross_krw
+            if has_krw and not krw_cost_basis_incomplete
+            else None
+        )
+        net_value = krw.get("net_realized_pnl") if has_krw else None
+        net_krw = (
+            Decimal(str(net_value))
+            if net_value is not None and not krw_cost_basis_incomplete
+            else None
+        )
+        krw_cost_coverage = (
+            str(krw.get("transaction_cost_coverage")) if has_krw else "unknown"
+        )
+        if krw_cost_basis_incomplete:
+            krw_cost_coverage = (
+                "partial"
+                if krw_cost_coverage in {"complete", "partial"}
+                else "unknown"
+            )
+        known_currencies = set(by_currency)
+        if (
+            int(summary["unknown_currency_lot_count"]) > 0
+            or unknown_unmatched_quantity > 0
+        ):
+            status = "degraded_unknown_currency"
+        elif len(known_currencies) > 1:
+            status = "degraded_mixed_currency"
+        elif unmatched_by_currency:
+            status = "degraded_unknown_cost_basis"
+        elif krw_cost_coverage != "complete" and has_krw:
+            status = "degraded_transaction_cost_coverage"
+        elif any(
+            isinstance(bucket, dict)
+            and bucket.get("transaction_cost_coverage") != "complete"
+            for bucket in raw_by_currency.values()
+        ):
+            status = "degraded_transaction_cost_coverage"
+        else:
+            status = "complete"
+
+    row_coverages = {row.transaction_cost_coverage for row in rows}
+    pnl_cost_basis_incomplete = bool(unmatched_by_currency) or (
+        unknown_unmatched_quantity > 0
+    )
+    cost_coverage = (
+        "complete"
+        if no_pnl_activity or (
+            not pnl_cost_basis_incomplete and row_coverages == {"complete"}
+        )
+        else (
+            "partial"
+            if row_coverages & {"complete", "partial"}
+            else "unknown"
+        )
+    )
+
+    return {
+        "gross_realized_pnl_krw": gross_krw,
+        "covered_gross_realized_pnl_krw": covered_gross_krw,
+        "net_realized_pnl_krw": net_krw,
+        "realized_pnl_by_currency": by_currency,
+        "currency_coverage": (
+            "complete"
+            if summary["currency_coverage"] == "complete"
+            and unknown_unmatched_quantity <= 0
+            else "incomplete"
+        ),
+        "unknown_currency_lot_count": summary["unknown_currency_lot_count"],
+        "unknown_currency_unmatched_sell_quantity": _quantity_value(
+            unknown_unmatched_quantity
+        ),
+        "unmatched_sell_quantity_by_currency": {
+            currency: _quantity_value(quantity)
+            for currency, quantity in sorted(unmatched_by_currency.items())
+        },
+        "pnl_cost_basis_coverage": (
+            "incomplete" if pnl_cost_basis_incomplete else "complete"
+        ),
+        "unknown_currency_gross_realized_pnl": _decimal_text(
+            summary["unknown_currency_gross_realized_pnl"]
+        ),
+        "transaction_cost_coverage": cost_coverage,
+        "krw_transaction_cost_coverage": krw_cost_coverage,
+        "profitability_status": status,
+        "calculation_status": "computed",
+        "calculation_reason": None,
+        "legacy_realized_pnl_basis": (
+            "gross_before_transaction_costs"
+            if gross_krw is not None
+            else "unavailable_incomplete_cost_basis_or_currency"
+        ),
+    }
+
+
+def _pnl_notional_payload(
+    *,
+    buy_by_currency: dict[str, Decimal],
+    sell_by_currency: dict[str, Decimal],
+    unknown_buy: Decimal,
+    unknown_sell: Decimal,
+) -> dict[str, object]:
+    currencies = sorted(set(buy_by_currency) | set(sell_by_currency))
+    no_activity = not currencies and unknown_buy == 0 and unknown_sell == 0
+    buy_krw = buy_by_currency.get("KRW")
+    sell_krw = sell_by_currency.get("KRW")
+    if "KRW" in currencies:
+        buy_krw = buy_krw or Decimal("0")
+        sell_krw = sell_krw or Decimal("0")
+    if no_activity:
+        buy_krw = sell_krw = Decimal("0")
+    return {
+        "buy_notional_krw": _decimal_text(buy_krw),
+        "sell_notional_krw": _decimal_text(sell_krw),
+        "buy_notional_by_currency": {
+            currency: _decimal_text(value)
+            for currency, value in sorted(buy_by_currency.items())
+        },
+        "sell_notional_by_currency": {
+            currency: _decimal_text(value)
+            for currency, value in sorted(sell_by_currency.items())
+        },
+        "unknown_currency_buy_notional": _decimal_text(unknown_buy),
+        "unknown_currency_sell_notional": _decimal_text(unknown_sell),
+        "notional_currency_coverage": (
+            "complete" if unknown_buy == 0 and unknown_sell == 0 else "incomplete"
+        ),
+        "notional_status": (
+            "no_activity"
+            if no_activity
+            else (
+                "degraded_unknown_currency"
+                if unknown_buy > 0 or unknown_sell > 0
+                else ("mixed_currency_subtotals" if len(currencies) > 1 else "complete")
+            )
+        ),
+    }
+
+
+def _unavailable_pnl_economics_payload(*, reason: str) -> dict[str, object]:
+    """Represent a skipped/failed calculation without claiming verified zero PnL."""
+
+    return {
+        "gross_realized_pnl_krw": None,
+        "covered_gross_realized_pnl_krw": None,
+        "net_realized_pnl_krw": None,
+        "realized_pnl_by_currency": {},
+        "currency_coverage": "not_computed",
+        "unknown_currency_lot_count": None,
+        "unknown_currency_unmatched_sell_quantity": None,
+        "unmatched_sell_quantity_by_currency": {},
+        "pnl_cost_basis_coverage": "not_computed",
+        "unknown_currency_gross_realized_pnl": None,
+        "transaction_cost_coverage": "not_computed",
+        "krw_transaction_cost_coverage": "not_computed",
+        "profitability_status": "degraded_not_computed",
+        "calculation_status": "not_computed",
+        "calculation_reason": reason,
+        "legacy_realized_pnl_basis": "unavailable_not_computed",
+    }
+
+
+def _unavailable_pnl_notional_payload() -> dict[str, object]:
+    return {
+        "buy_notional_krw": None,
+        "sell_notional_krw": None,
+        "buy_notional_by_currency": {},
+        "sell_notional_by_currency": {},
+        "unknown_currency_buy_notional": None,
+        "unknown_currency_sell_notional": None,
+        "notional_currency_coverage": "not_computed",
+        "notional_status": "not_computed",
+    }
+
+
 def _default_monthly_pnl_payload(*, settings: Settings) -> dict[str, object]:
     target = getattr(settings, "monthly_target_krw", Decimal("500000"))
+    economics = _unavailable_pnl_economics_payload(
+        reason="monthly_pnl_not_computed"
+    )
+    notionals = _unavailable_pnl_notional_payload()
     return {
         "month": datetime.now(KRX_TIMEZONE).strftime("%Y-%m"),
-        "monthly_realized_pnl": "0.0000",
+        "monthly_realized_pnl": None,
+        "monthly_gross_realized_pnl_krw": None,
+        "monthly_net_realized_pnl_krw": None,
         "monthly_target_krw": _decimal_text(target),
-        "target_progress_pct": "0.00",
+        "target_progress_pct": None,
         "expected_calendar_progress_pct": _decimal_text(_expected_month_progress_pct()),
-        "mode_recommendation": "normal",
-        "monthly_buy_notional": "0.0000",
-        "monthly_sell_notional": "0.0000",
-        "matched_sell_quantity": 0,
-        "unmatched_sell_quantity": 0,
+        "mode_recommendation": "insufficient_net_pnl_data",
+        "monthly_buy_notional": None,
+        "monthly_sell_notional": None,
+        "matched_sell_quantity": None,
+        "unmatched_sell_quantity": None,
         "cost_basis_sources": {"fill_fifo": 0, "broker_reconciliation": 0, "unknown": 0},
-        "unknown_cost_basis_sell_quantity": 0,
+        "unknown_cost_basis_sell_quantity": None,
         "stale_fifo_inventory_alerts": [],
+        **economics,
+        **notionals,
         "pnl_method": "fifo_internal_fills_with_broker_reconciliation_fallback",
+        "pnl_economics_method": "gross_by_currency_with_explicit_transaction_cost_coverage",
     }
 
 
 def _default_daily_pnl_payload() -> dict[str, object]:
+    economics = _unavailable_pnl_economics_payload(reason="daily_pnl_not_computed")
+    notionals = _unavailable_pnl_notional_payload()
     return {
         "date": datetime.now(KRX_TIMEZONE).strftime("%Y-%m-%d"),
-        "daily_realized_pnl": "0.0000",
-        "daily_buy_notional": "0.0000",
-        "daily_sell_notional": "0.0000",
-        "matched_sell_quantity": 0,
-        "unmatched_sell_quantity": 0,
+        "daily_realized_pnl": None,
+        "daily_gross_realized_pnl_krw": None,
+        "daily_net_realized_pnl_krw": None,
+        "daily_buy_notional": None,
+        "daily_sell_notional": None,
+        "matched_sell_quantity": None,
+        "unmatched_sell_quantity": None,
         "sold_symbols": [],
         "sold_symbol_count": 0,
         "closed_symbols": [],
         "closed_symbol_count": 0,
         "unmatched_sell_symbols": [],
         "unmatched_sell_symbol_count": 0,
+        **economics,
+        **notionals,
         "pnl_method": "fifo_internal_fills",
+        "pnl_economics_method": "gross_by_currency_with_explicit_transaction_cost_coverage",
     }
 
 
 def _default_weekly_pnl_payload() -> dict[str, object]:
     week_start, next_week_start = _current_krx_week_utc_bounds()
+    economics = _unavailable_pnl_economics_payload(reason="weekly_pnl_not_computed")
+    notionals = _unavailable_pnl_notional_payload()
     return {
         "week_start": week_start.astimezone(KRX_TIMEZONE).strftime("%Y-%m-%d"),
         "week_end_exclusive": next_week_start.astimezone(KRX_TIMEZONE).strftime("%Y-%m-%d"),
-        "weekly_realized_pnl": "0.0000",
-        "weekly_buy_notional": "0.0000",
-        "weekly_sell_notional": "0.0000",
-        "matched_sell_quantity": 0,
-        "unmatched_sell_quantity": 0,
-        "closed_trade_count": 0,
+        "weekly_realized_pnl": None,
+        "weekly_gross_realized_pnl_krw": None,
+        "weekly_net_realized_pnl_krw": None,
+        "weekly_buy_notional": None,
+        "weekly_sell_notional": None,
+        "matched_sell_quantity": None,
+        "unmatched_sell_quantity": None,
+        "closed_trade_count": None,
         "closed_symbols": [],
         "closed_symbol_count": 0,
         "unmatched_sell_symbols": [],
@@ -2298,9 +2759,12 @@ def _default_weekly_pnl_payload() -> dict[str, object]:
         "loss_count": 0,
         "breakeven_count": 0,
         "cost_basis_sources": {"fill_fifo": 0, "broker_reconciliation": 0, "unknown": 0},
-        "unknown_cost_basis_sell_quantity": 0,
+        "unknown_cost_basis_sell_quantity": None,
         "stale_fifo_inventory_alerts": [],
+        **economics,
+        **notionals,
         "pnl_method": "fifo_internal_fills_with_broker_reconciliation_fallback",
+        "pnl_economics_method": "gross_by_currency_with_explicit_transaction_cost_coverage",
     }
 
 
@@ -2357,7 +2821,9 @@ def _monthly_mode_recommendation(
     return "normal"
 
 
-def _decimal_text(value: Decimal) -> str:
+def _decimal_text(value: object) -> str | None:
+    if value is None:
+        return None
     return f"{value:.4f}"
 
 

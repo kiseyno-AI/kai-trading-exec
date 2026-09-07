@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  api:
+    name: API (Python 3.12)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: kai_exec_test
+          POSTGRES_USER: kai
+          POSTGRES_PASSWORD: kai
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U kai -d kai_exec_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install dependencies
+        run: python -m pip install -e ".[dev]"
+
+      - name: Prepare runtime directories
+        run: mkdir -p var logs
+
+      - name: Validate launcher syntax
+        run: bash -n start-api.sh start-api-no-migrate.sh start-alpaca-paper.sh start-kis-us-paper.sh
+
+      - name: Validate SQLite migrations and schema contract
+        run: |
+          KAI_EXEC_DATABASE_URL=sqlite:///./var/ci-migrations.db PYTHONPATH=apps/api python -m alembic upgrade head
+          KAI_EXEC_DATABASE_URL=sqlite:///./var/ci-migrations.db PYTHONPATH=apps/api python -m alembic check
+
+      - name: Validate PostgreSQL migrations and schema contract
+        env:
+          KAI_EXEC_DATABASE_URL: postgresql+psycopg://kai:kai@127.0.0.1:5432/kai_exec_test
+          PYTHONPATH: apps/api
+        run: |
+          python -m alembic upgrade head
+          python -m alembic check
+
+      - name: Compile application modules
+        run: python -m compileall -q apps/api/app
+
+      - name: Import FastAPI application
+        run: PYTHONPATH=apps/api python -c "from app.main import app"
+
+      - name: Run tests
+        run: python -m pytest -q

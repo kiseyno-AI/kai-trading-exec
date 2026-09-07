@@ -27,6 +27,8 @@ from app.broker.base import BrokerAccountOpenOrder, BrokerAccountSnapshot, Broke
 from app.core.config import Settings
 from app.models.runtime import (
     BrokerOrder,
+    BrokerOrderEvent,
+    ExecutionFill,
     ExecutionPlan,
     ExecutionPlanItem,
     ExecutionPlanItemAudit,
@@ -35,6 +37,9 @@ from app.models.runtime import (
     new_id,
 )
 from app.services.broker_auth import ensure_authenticated_broker_session
+from app.services.broker_order_state import CAPITAL_RESERVING_ORDER_STATUSES
+from app.services.fill_economics import effective_fill_quantity
+from app.services.fill_idempotency import dedupe_execution_fills
 from app.services.reconciliation import (
     reconcile_pending_broker_orders,
     sync_execution_positions_from_broker_snapshot,
@@ -64,6 +69,7 @@ _CORE_DESIRED_MONITORING_SYMBOL_WARNING_AT: dict[str, float] = {}
 
 SELL_MONITORED_INTENTS = frozenset({"target_sell", "stop_sell", "max_holding_close_sell"})
 WATCH_BUY_INTENTS = frozenset({"watch_buy", "trigger_buy", "chase_buy", "tactical_buy", "intraday_watch_buy", "next_open_buy"})
+PRICE_TRIGGERED_MONITORED_INTENTS = WATCH_BUY_INTENTS | frozenset({"target_sell", "stop_sell"})
 MONITORED_INTENTS = SELL_MONITORED_INTENTS | WATCH_BUY_INTENTS
 AGENT_PENDING_STATUS = trigger_time_exec_agent.AGENT_PENDING_STATUS
 AGENT_DELAY_STATUS = trigger_time_exec_agent.AGENT_DELAY_STATUS
@@ -170,6 +176,10 @@ SESSION_RETRYABLE_MESSAGE_MARKERS = (
     "market is not open",
     "not regular market",
 )
+PROTECTIVE_STOP_SESSION_RETRY_MAX_ATTEMPTS = 2
+ACTIVE_PROTECTIVE_STOP_ORDER_STATUSES = frozenset(CAPITAL_RESERVING_ORDER_STATUSES) - {
+    "retry_pending"
+}
 SELL_PENDING_CONFIG_STATUSES = frozenset(
     {
         "target_sell_pending_config",
@@ -201,9 +211,7 @@ WATCH_BUY_EXPIRABLE_STATUSES = frozenset(
         AGENT_APPROVED_PENDING_SUBMIT_STATUS,
     }
 )
-OPEN_BUY_ORDER_STATUSES = frozenset(
-    {"submitted", "open", "partially_filled", "submission_pending", "retry_pending"}
-)
+OPEN_BUY_ORDER_STATUSES = frozenset(CAPITAL_RESERVING_ORDER_STATUSES)
 RESERVED_CASH_EXHAUSTED_REASON = "reserved_cash_exhausted"
 LIVE_WATCH_BUY_VETO_EVENT_TYPE = "live_watch_buy_submission_veto"
 LATE_ENTRY_GATE_EVENT_TYPE = "watch_buy_late_entry_gate"
@@ -604,19 +612,44 @@ def list_autonomous_monitoring_symbols(
         if expired_count:
             db.commit()
 
-    held_symbols = set(
-        symbol
-        for symbol in db.scalars(
-            select(ExecutionPosition.symbol)
-            .where(
-                ExecutionPosition.mode == settings.runtime_mode,
-                ExecutionPosition.quantity > 0,
-            )
-            .order_by(ExecutionPosition.symbol.asc())
-        ).all()
-        if _is_krx_equity_symbol(symbol)
-    )
     mode_plan_ids = select(ExecutionPlan.id).where(ExecutionPlan.mode == settings.runtime_mode)
+    kis_us_symbols = {
+        item.symbol
+        for item in db.scalars(
+            select(ExecutionPlanItem)
+            .join(ExecutionPlanItem.plan)
+            .where(
+                ExecutionPlan.mode == settings.runtime_mode,
+                ExecutionPlanItem.provider == "kis",
+                ExecutionPlanItem.asset_class == "us_equity",
+            )
+        ).all()
+        if _plan_item_exchange(item) in {"NASD", "NYSE", "AMEX"}
+    }
+    held_positions = db.scalars(
+        select(ExecutionPosition)
+        .where(
+            ExecutionPosition.mode == settings.runtime_mode,
+            ExecutionPosition.quantity > 0,
+        )
+        .order_by(ExecutionPosition.symbol.asc())
+    ).all()
+    for position in held_positions:
+        raw_payload = position.raw_payload if isinstance(position.raw_payload, dict) else {}
+        sync_context = raw_payload.get("_position_sync")
+        if (
+            isinstance(sync_context, dict)
+            and sync_context.get("asset_class") == "us_equity"
+            and sync_context.get("monitoring_eligible") is True
+            and str(sync_context.get("exchange") or "").strip().upper()
+            in {"NASD", "NYSE", "AMEX"}
+        ):
+            kis_us_symbols.add(position.symbol)
+    held_symbols = {
+        position.symbol
+        for position in held_positions
+        if _is_krx_equity_symbol(position.symbol) or position.symbol in kis_us_symbols
+    }
     fresh_position_truth_after = datetime.now(UTC) - timedelta(
         seconds=settings.exec_agent_max_account_snapshot_age_seconds
     )
@@ -630,7 +663,7 @@ def list_autonomous_monitoring_symbols(
 
     def append_candidates(rows: list[str], *, enforce_limit: bool = True) -> None:
         for symbol in rows:
-            if not _is_krx_equity_symbol(symbol):
+            if not _is_krx_equity_symbol(symbol) and symbol not in kis_us_symbols:
                 continue
             if enforce_limit and len(symbol_candidates) >= symbol_cycle_limit:
                 return
@@ -1061,7 +1094,7 @@ def _evaluate_monitoring_cycle(
         symbols=symbols,
     )
     _log_cycle_step("load_monitored_items", item_count=len(items))
-    _reactivate_retryable_protective_stops(
+    rearmed_protective_stop_item_ids = _reactivate_retryable_protective_stops(
         items=items,
         db=db,
         triggered_at=triggered_at,
@@ -1189,9 +1222,11 @@ def _evaluate_monitoring_cycle(
         settings=settings,
         db=db,
         remaining_quantities_by_symbol=remaining_quantities_by_symbol,
-        triggered_at=triggered_at,
+        positions_by_symbol=positions_by_symbol,
+        rearmed_plan_item_ids=rearmed_protective_stop_item_ids,
     )
     primary_triggered_symbols = _primary_triggered_sell_symbols(
+        settings=settings,
         items=items,
         prices=prices,
         triggered_at=triggered_at,
@@ -1221,6 +1256,7 @@ def _evaluate_monitoring_cycle(
         retry_persisted_trigger = (
             allow_persisted_triggered_without_price
             and price is None
+            and not _is_watch_buy_item(item)
             and item.status in (
                 BLOCKED_MONITORING_STATUSES | PENDING_DISPATCH_MONITORING_STATUSES
             )
@@ -1285,7 +1321,7 @@ def _evaluate_monitoring_cycle(
             )
             continue
 
-        if _is_watch_buy_item(item) and not retry_persisted_trigger:
+        if item.intent in PRICE_TRIGGERED_MONITORED_INTENTS and not retry_persisted_trigger:
             quote_stale_reason = _quote_stale_reason(
                 settings=settings,
                 price=price,
@@ -1293,16 +1329,23 @@ def _evaluate_monitoring_cycle(
             )
             if quote_stale_reason is not None:
                 blocked_item_count += 1
-                if item.status != "watch_monitoring_active":
-                    item.status = "watch_monitoring_active"
+                monitoring_status = _monitoring_status(item.intent)
+                if item.status != monitoring_status:
+                    item.status = monitoring_status
                 _record_monitoring_event(
                     item=item,
                     event={
-                        "event": "watch_buy_quote_rejected",
+                        "event": (
+                            "watch_buy_quote_rejected"
+                            if _is_watch_buy_item(item)
+                            else "sell_quote_rejected"
+                        ),
                         "reason": "stale_quote",
                         "message": quote_stale_reason,
                         "observed_price": _serialize_decimal(observed_price),
-                        "observed_at": _serialize_datetime(_price_observed_at(price, triggered_at)),
+                        "observed_at": _serialize_datetime(
+                            _provided_price_observed_at(price)
+                        ),
                         "recorded_at": triggered_at.isoformat(),
                     },
                 )
@@ -3311,7 +3354,8 @@ def _reactivate_retryable_protective_stops(
     items: list[ExecutionPlanItem],
     db: Session,
     triggered_at: datetime,
-) -> None:
+) -> set[str]:
+    rearmed_item_ids: set[str] = set()
     for item in items:
         if (
             item.side != "sell"
@@ -3319,9 +3363,30 @@ def _reactivate_retryable_protective_stops(
             or item.status not in RETRYABLE_PROTECTIVE_STOP_STATUSES
         ):
             continue
-        if not _latest_order_failure_is_retryable_session_rejection(db=db, item=item):
+        source_order = _retryable_session_rejection_source_order(db=db, item=item)
+        if source_order is None:
             continue
         prior_status = item.status
+        retry_generation = _protective_stop_retry_generation(
+            db=db,
+            item=item,
+            source_order=source_order,
+        )
+        if retry_generation >= PROTECTIVE_STOP_SESSION_RETRY_MAX_ATTEMPTS:
+            item.status = "broker_order_failed"
+            _record_monitoring_event(
+                item=item,
+                event={
+                    "event": "protective_stop_retry_exhausted",
+                    "reason": "retryable_session_rejection_attempts_exhausted",
+                    "prior_status": prior_status,
+                    "source_broker_order_pk": source_order.id,
+                    "retry_attempt_count": retry_generation,
+                    "retry_max_attempts": PROTECTIVE_STOP_SESSION_RETRY_MAX_ATTEMPTS,
+                    "recorded_at": triggered_at.isoformat(),
+                },
+            )
+            continue
         if _quantity_policy_requires_position_exit(item.quantity_policy):
             broker_quantity = db.scalar(
                 select(BrokerOrder.quantity)
@@ -3338,9 +3403,14 @@ def _reactivate_retryable_protective_stops(
                 "event": "protective_stop_rearmed",
                 "reason": "retryable_session_rejection",
                 "prior_status": prior_status,
+                "source_broker_order_pk": source_order.id,
+                "retry_attempt_count": retry_generation,
+                "retry_max_attempts": PROTECTIVE_STOP_SESSION_RETRY_MAX_ATTEMPTS,
                 "recorded_at": triggered_at.isoformat(),
             },
         )
+        rearmed_item_ids.add(item.id)
+    return rearmed_item_ids
 
 
 def _repair_unprotected_stop_coverage(
@@ -4320,17 +4390,71 @@ def _latest_order_failure_is_retryable_session_rejection(
     db: Session,
     item: ExecutionPlanItem,
 ) -> bool:
+    order = _latest_plan_item_submission_attempt(db=db, item=item)
+    if order is None:
+        return item.status in {"broker_order_retry_pending", "retry_pending"}
+    return _order_is_retryable_session_rejection(order=order, item=item)
+
+
+def _latest_plan_item_submission_attempt(
+    *,
+    db: Session,
+    item: ExecutionPlanItem,
+) -> BrokerOrder | None:
+    """Return the latest durable submission attempt for a plan item.
+
+    SQLite's server-generated timestamps have one-second precision and broker
+    order IDs are UUIDs, so neither can order back-to-back attempts reliably.
+    ``submit_requested.observed_at`` is application-generated with microsecond
+    precision and is persisted before the broker boundary. Legacy rows without
+    that event retain the timestamp fallback.
+    """
+
     order = db.scalar(
+        select(BrokerOrder)
+        .join(BrokerOrderEvent, BrokerOrderEvent.broker_order_pk == BrokerOrder.id)
+        .where(BrokerOrder.execution_plan_item_id == item.id)
+        .where(BrokerOrderEvent.event_type == "submit_requested")
+        .options(
+            load_only(
+                BrokerOrder.id,
+                BrokerOrder.execution_plan_item_id,
+                BrokerOrder.idempotency_key,
+                BrokerOrder.status,
+                BrokerOrder.last_error_code,
+                BrokerOrder.last_error_classification,
+                BrokerOrder.last_error_message,
+                BrokerOrder.last_error_retryable,
+                BrokerOrder.response_metadata,
+                BrokerOrder.raw_broker_payload,
+                BrokerOrder.updated_at,
+                BrokerOrder.created_at,
+            )
+        )
+        .order_by(
+            BrokerOrderEvent.observed_at.desc(),
+            BrokerOrderEvent.created_at.desc(),
+            BrokerOrderEvent.id.desc(),
+        )
+        .limit(1)
+    )
+    if order is not None:
+        return order
+    return db.scalar(
         select(BrokerOrder)
         .where(BrokerOrder.execution_plan_item_id == item.id)
         .options(
             load_only(
                 BrokerOrder.id,
                 BrokerOrder.execution_plan_item_id,
+                BrokerOrder.idempotency_key,
                 BrokerOrder.status,
                 BrokerOrder.last_error_code,
                 BrokerOrder.last_error_classification,
                 BrokerOrder.last_error_message,
+                BrokerOrder.last_error_retryable,
+                BrokerOrder.response_metadata,
+                BrokerOrder.raw_broker_payload,
                 BrokerOrder.updated_at,
                 BrokerOrder.created_at,
             )
@@ -4340,9 +4464,15 @@ def _latest_order_failure_is_retryable_session_rejection(
             BrokerOrder.created_at.desc(),
             BrokerOrder.id.desc(),
         )
+        .limit(1)
     )
-    if order is None:
-        return item.status in {"broker_order_retry_pending", "retry_pending"}
+
+
+def _order_is_retryable_session_rejection(
+    *,
+    order: BrokerOrder,
+    item: ExecutionPlanItem,
+) -> bool:
     if order.status in {"submitted", "open", "partially_filled", "submission_pending"}:
         return False
     error_code = (order.last_error_code or "").strip().upper()
@@ -4364,6 +4494,78 @@ def _latest_order_failure_is_retryable_session_rejection(
         if any(marker.lower() in raw_message for marker in SESSION_RETRYABLE_MESSAGE_MARKERS):
             return True
     return bool(order.last_error_retryable and item.status in {"broker_order_retry_pending", "retry_pending"})
+
+
+def _retryable_session_rejection_source_order(
+    *,
+    db: Session,
+    item: ExecutionPlanItem,
+) -> BrokerOrder | None:
+    active_order_id = db.scalar(
+        select(BrokerOrder.id)
+        .where(
+            BrokerOrder.execution_plan_item_id == item.id,
+            BrokerOrder.status.in_(tuple(ACTIVE_PROTECTIVE_STOP_ORDER_STATUSES)),
+        )
+        .limit(1)
+    )
+    if active_order_id is not None:
+        return None
+    order = _latest_plan_item_submission_attempt(db=db, item=item)
+    if order is None or not _order_is_retryable_session_rejection(order=order, item=item):
+        return None
+    return order
+
+
+def _protective_stop_retry_generation(
+    *,
+    db: Session,
+    item: ExecutionPlanItem,
+    source_order: BrokerOrder,
+) -> int:
+    """Count the persisted monitoring retry lineage ending at ``source_order``."""
+
+    generation = 0
+    current = source_order
+    visited: set[str] = set()
+    while current.id not in visited:
+        visited.add(current.id)
+        event = db.scalar(
+            select(BrokerOrderEvent)
+            .where(
+                BrokerOrderEvent.broker_order_pk == current.id,
+                BrokerOrderEvent.event_type == "submit_requested",
+            )
+            .order_by(
+                BrokerOrderEvent.observed_at.desc(),
+                BrokerOrderEvent.created_at.desc(),
+                BrokerOrderEvent.id.desc(),
+            )
+            .limit(1)
+        )
+        request_payload = event.request_payload if event is not None else None
+        command_metadata = (
+            request_payload.get("metadata") if isinstance(request_payload, dict) else None
+        )
+        retry = command_metadata.get("retry") if isinstance(command_metadata, dict) else None
+        source_order_pk = (
+            retry.get("source_broker_order_pk")
+            if isinstance(retry, dict) and retry.get("source") == "rejected_order_retry"
+            else None
+        )
+        expected_key = (
+            f"monitoring:stop_sell:{item.id}:retry:{source_order_pk}"
+            if isinstance(source_order_pk, str) and source_order_pk
+            else None
+        )
+        if expected_key is None or current.idempotency_key != expected_key:
+            break
+        parent = db.get(BrokerOrder, source_order_pk)
+        if parent is None or parent.execution_plan_item_id != item.id:
+            break
+        generation += 1
+        current = parent
+    return generation
 
 
 def _monitored_item_filter():
@@ -5588,13 +5790,33 @@ def _reconcile_before_monitoring(
     if settings.runtime_mode != "live":
         return
     try:
-        reconcile_pending_broker_orders(
+        reconciliation = reconcile_pending_broker_orders(
             settings=settings,
             db=db,
             adapter=adapter,
             symbols=symbols,
         )
     except Exception:
+        return
+
+    # A position that was fresh immediately before reconciliation can become
+    # stale as soon as a fill is learned. Refresh it even inside the normal
+    # account-snapshot TTL so the next protective order uses post-fill truth.
+    if (
+        int(reconciliation.get("fills_added", 0)) > 0
+        or int(reconciliation.get("reconciled_order_count", 0)) > 0
+    ):
+        try:
+            _sync_positions_for_monitoring_routes(
+                settings=settings,
+                db=db,
+                adapter=adapter,
+                symbols=symbols,
+            )
+        except Exception:
+            # The fill-aware reservation pass below still removes executions
+            # newer than local position truth if the broker snapshot is down.
+            pass
         return
 
     if not refresh_positions:
@@ -5717,12 +5939,26 @@ def _refresh_position_truth_if_stale(
         except Exception:
             return
         return
+    if symbol_list:
+        stale_symbols = _positions_with_stale_local_state(
+            settings=settings,
+            db=db,
+            symbols=set(symbol_list),
+            max_age_seconds=settings.exec_agent_max_account_snapshot_age_seconds,
+        )
+        if not stale_symbols:
+            return
+        _sync_positions_for_monitoring_routes(
+            settings=settings,
+            db=db,
+            adapter=adapter,
+            symbols=stale_symbols,
+        )
+        return
     where = [
         ExecutionPosition.mode == settings.runtime_mode,
         ExecutionPosition.quantity > 0,
     ]
-    if symbol_list:
-        where.append(ExecutionPosition.symbol.in_(symbol_list))
     latest_reconciled_at = db.scalar(
         select(func.max(ExecutionPosition.last_reconciled_at)).where(*where)
     )
@@ -5731,15 +5967,12 @@ def _refresh_position_truth_if_stale(
     )
     if latest_reconciled_at is not None and _normalize_utc(latest_reconciled_at) >= stale_before:
         return
-    try:
-        _sync_positions_for_monitoring_routes(
-            settings=settings,
-            db=db,
-            adapter=adapter,
-            symbols=set(symbol_list) if symbol_list else None,
-        )
-    except Exception:
-        return
+    _sync_positions_for_monitoring_routes(
+        settings=settings,
+        db=db,
+        adapter=adapter,
+        symbols=None,
+    )
 
 
 def _sync_positions_for_monitoring_routes(
@@ -5760,7 +5993,18 @@ def _sync_positions_for_monitoring_routes(
         )
         return
 
-    discovered_exchanges: set[str] = set()
+    tracked_symbols = set(symbols or ())
+    if not tracked_symbols:
+        tracked_symbols.update(
+            str(symbol)
+            for symbol in db.scalars(
+                select(ExecutionPosition.symbol).where(
+                    ExecutionPosition.mode == settings.runtime_mode,
+                )
+            ).all()
+            if str(symbol).strip()
+        )
+
     discovery_exchanges = set()
     if discover_krx_holdings:
         discovery_exchanges.add("KRX")
@@ -5776,19 +6020,6 @@ def _sync_positions_for_monitoring_routes(
                 exchange=exchange,
                 discover_holdings_only=True,
             )
-            discovered_exchanges.add(exchange)
-
-    tracked_symbols = set(symbols or ())
-    if not tracked_symbols:
-        tracked_symbols.update(
-            str(symbol)
-            for symbol in db.scalars(
-                select(ExecutionPosition.symbol).where(
-                    ExecutionPosition.mode == settings.runtime_mode,
-                )
-            ).all()
-            if str(symbol).strip()
-        )
     if not tracked_symbols:
         return
 
@@ -5844,8 +6075,6 @@ def _sync_positions_for_monitoring_routes(
         symbols_by_exchange.setdefault(exchange, set()).add(symbol)
 
     for exchange, routed_symbols in sorted(symbols_by_exchange.items()):
-        if exchange in discovered_exchanges:
-            continue
         sync_execution_positions_from_broker_snapshot(
             settings=settings,
             db=db,
@@ -6109,6 +6338,7 @@ def _persisted_watch_buy_trigger_cross(item: ExecutionPlanItem) -> dict[str, obj
 
 def _primary_triggered_sell_symbols(
     *,
+    settings: Settings,
     items: list[ExecutionPlanItem],
     prices: dict[str, MonitoringPriceRequest],
     triggered_at: datetime,
@@ -6120,6 +6350,12 @@ def _primary_triggered_sell_symbols(
         if not _monitoring_item_is_configured(item):
             continue
         price = prices.get(item.symbol)
+        if _quote_stale_reason(
+            settings=settings,
+            price=price,
+            cycle_at=triggered_at,
+        ) is not None:
+            continue
         observed_price = price.price if price is not None else None
         if _is_triggered(
             item=item,
@@ -7266,15 +7502,27 @@ def _load_watch_buy_cash_reservation(
     snapshot = _load_watch_buy_account_snapshot(settings=settings, db=db, adapter=adapter)
     if isinstance(snapshot, str):
         return snapshot
+    snapshot_payload = snapshot.payload if isinstance(snapshot.payload, dict) else {}
+    open_orders_error = snapshot_payload.get("open_orders_error")
+    if (
+        settings.runtime_mode == "live"
+        and isinstance(open_orders_error, dict)
+        and open_orders_error.get("degraded") is True
+    ):
+        return "broker open-order truth is degraded; live watch-buy sizing is blocked"
     orderable_cash = _minimum_decimal(snapshot.available_cash, snapshot.buying_power)
     if orderable_cash is None:
         return "account snapshot did not include orderable cash"
-    already_reserved = _snapshot_open_buy_order_notional(snapshot.open_orders)
-    already_reserved += _local_open_buy_order_notional(
+    already_reserved, local_reservation_complete = _local_open_buy_order_notional(
         settings=settings,
         db=db,
         snapshot_open_orders=snapshot.open_orders,
     )
+    if settings.runtime_mode == "live" and not local_reservation_complete:
+        return (
+            "an earlier buy submission has unknown broker outcome and no defensible "
+            "capital reservation"
+        )
     return WatchBuyCashReservation(
         orderable_cash=orderable_cash,
         already_reserved_notional=already_reserved,
@@ -7282,72 +7530,95 @@ def _load_watch_buy_cash_reservation(
     )
 
 
-def _snapshot_open_buy_order_notional(open_orders: list[BrokerAccountOpenOrder]) -> Decimal:
-    total = Decimal("0")
-    for order in open_orders:
-        if order.side != "buy":
-            continue
-        total += _open_buy_order_notional(
-            quantity=order.remaining_quantity or order.quantity,
-            limit_price=order.limit_price,
-        )
-    return total
-
-
 def _local_open_buy_order_notional(
     *,
     settings: Settings,
     db: Session,
     snapshot_open_orders: list[BrokerAccountOpenOrder],
-) -> Decimal:
-    snapshot_broker_order_ids = {
-        order.broker_order_id
-        for order in snapshot_open_orders
-        if order.side == "buy" and order.broker_order_id
-    }
-    snapshot_idempotency_keys_without_broker_id = {
-        order.idempotency_key
-        for order in snapshot_open_orders
-        if order.side == "buy" and not order.broker_order_id and order.idempotency_key
-    }
+) -> tuple[Decimal, bool]:
+    valued_snapshot_orders: list[BrokerAccountOpenOrder] = []
+    unvalued_snapshot_orders: list[BrokerAccountOpenOrder] = []
+    total = Decimal("0")
+    for snapshot_order in snapshot_open_orders:
+        if snapshot_order.side != "buy":
+            continue
+        remaining_quantity = snapshot_order.remaining_quantity or snapshot_order.quantity
+        if remaining_quantity <= 0:
+            continue
+        snapshot_notional = _open_buy_order_notional(
+            quantity=remaining_quantity,
+            limit_price=snapshot_order.limit_price,
+        )
+        if snapshot_notional is None:
+            unvalued_snapshot_orders.append(snapshot_order)
+            continue
+        total += snapshot_notional
+        valued_snapshot_orders.append(snapshot_order)
     orders = db.scalars(
         select(BrokerOrder).where(
             BrokerOrder.mode == settings.runtime_mode,
             BrokerOrder.side == "buy",
             BrokerOrder.status.in_(tuple(OPEN_BUY_ORDER_STATUSES)),
         )
-        .options(
-            load_only(
-                BrokerOrder.id,
-                BrokerOrder.idempotency_key,
-                BrokerOrder.broker_order_id,
-                BrokerOrder.side,
-                BrokerOrder.status,
-                BrokerOrder.quantity,
-                BrokerOrder.limit_price,
-            )
-        )
     ).all()
-    total = Decimal("0")
+    complete = True
     for order in orders:
-        if order.broker_order_id and order.broker_order_id in snapshot_broker_order_ids:
-            continue
-        if (
-            not order.broker_order_id
-            and order.idempotency_key
-            and order.idempotency_key in snapshot_idempotency_keys_without_broker_id
+        if any(
+            _same_open_order_identity(local=order, snapshot=snapshot_order)
+            for snapshot_order in valued_snapshot_orders
         ):
             continue
-        total += _open_buy_order_notional(
-            quantity=order.quantity,
-            limit_price=order.limit_price,
-        )
-    return total
+        reserved_notional = _local_broker_order_buy_notional(order)
+        if reserved_notional is None:
+            complete = False
+            continue
+        total += reserved_notional
+        unvalued_snapshot_orders = [
+            snapshot_order
+            for snapshot_order in unvalued_snapshot_orders
+            if not _same_open_order_identity(local=order, snapshot=snapshot_order)
+        ]
+    return total, complete and not unvalued_snapshot_orders
 
 
-def _open_buy_order_notional(*, quantity: int | None, limit_price: Decimal | None) -> Decimal:
+def _same_open_order_identity(
+    *,
+    local: BrokerOrder,
+    snapshot: BrokerAccountOpenOrder,
+) -> bool:
+    if local.broker_order_id and snapshot.broker_order_id:
+        return local.broker_order_id == snapshot.broker_order_id
+    return bool(
+        local.idempotency_key
+        and snapshot.idempotency_key
+        and local.idempotency_key == snapshot.idempotency_key
+    )
+
+
+def _local_broker_order_buy_notional(order: BrokerOrder) -> Decimal | None:
+    if order.quote_notional is not None and order.quote_notional > 0:
+        return Decimal(order.quote_notional)
+    if order.limit_price is not None and order.limit_price > 0:
+        if order.base_quantity is not None and order.base_quantity > 0:
+            return Decimal(order.base_quantity) * Decimal(order.limit_price)
+        if order.quantity is not None and order.quantity > 0:
+            return Decimal(order.quantity) * Decimal(order.limit_price)
+    if order.plan_item is not None:
+        approved_notional = _approved_buy_notional(order.plan_item)
+        if approved_notional > 0:
+            return approved_notional
+    return None
+
+
+def _open_buy_order_notional(
+    *,
+    quantity: int | None,
+    limit_price: Decimal | None,
+) -> Decimal | None:
     if quantity is None or quantity <= 0 or limit_price is None:
-        return Decimal("0")
+        return None
+    if limit_price <= 0:
+        return None
     return Decimal(quantity) * limit_price
 
 
@@ -7439,6 +7710,26 @@ def _load_daily_new_buy_notional(
 ) -> Decimal:
     if market_date is None:
         return Decimal("0")
+    uncertain_statuses = ("submission_pending", "manual_review_required")
+    uncertain_orders = db.scalars(
+        select(BrokerOrder)
+        .join(
+            ExecutionPlanItem,
+            BrokerOrder.execution_plan_item_id == ExecutionPlanItem.id,
+        )
+        .join(ExecutionPlan, ExecutionPlanItem.execution_plan_id == ExecutionPlan.id)
+        .where(
+            ExecutionPlan.mode == settings.runtime_mode,
+            ExecutionPlan.market_date == market_date,
+            BrokerOrder.side == "buy",
+            BrokerOrder.status.in_(uncertain_statuses),
+        )
+    ).all()
+    uncertain_item_ids = {
+        order.execution_plan_item_id
+        for order in uncertain_orders
+        if order.execution_plan_item_id is not None
+    }
     items = db.scalars(
         select(ExecutionPlanItem)
         .join(ExecutionPlanItem.plan)
@@ -7478,7 +7769,13 @@ def _load_daily_new_buy_notional(
     ).all()
     total = Decimal("0")
     for item in items:
+        if item.id in uncertain_item_ids:
+            continue
         total += _approved_buy_notional(item)
+    for order in uncertain_orders:
+        reserved_notional = _local_broker_order_buy_notional(order)
+        if reserved_notional is not None:
+            total += reserved_notional
     return total
 
 
@@ -7576,25 +7873,30 @@ def _reserve_existing_exit_orders(
     settings: Settings,
     db: Session,
     remaining_quantities_by_symbol: dict[str, int],
-    triggered_at: datetime,
+    positions_by_symbol: dict[str, ExecutionPosition],
+    rearmed_plan_item_ids: set[str],
 ) -> None:
     if not remaining_quantities_by_symbol:
         return
-    day_start = triggered_at.astimezone(KRX_TIMEZONE).replace(
-        hour=0,
-        minute=0,
-        second=0,
-        microsecond=0,
-    ).astimezone(UTC)
+    where = [
+        BrokerOrder.mode == settings.runtime_mode,
+        BrokerOrder.side == "sell",
+        BrokerOrder.symbol.in_(sorted(remaining_quantities_by_symbol)),
+        BrokerOrder.status.in_(tuple(CAPITAL_RESERVING_ORDER_STATUSES)),
+    ]
+    if rearmed_plan_item_ids:
+        # Its retry-pending row represents the stop being rearmed, not a second
+        # concurrent exit. Other active rows for the same item still reserve.
+        where.append(
+            or_(
+                BrokerOrder.execution_plan_item_id.is_(None),
+                BrokerOrder.execution_plan_item_id.not_in(rearmed_plan_item_ids),
+                BrokerOrder.status != "retry_pending",
+            )
+        )
     orders = db.scalars(
         select(BrokerOrder)
-        .where(
-            BrokerOrder.mode == settings.runtime_mode,
-            BrokerOrder.side == "sell",
-            BrokerOrder.symbol.in_(sorted(remaining_quantities_by_symbol)),
-            BrokerOrder.status.in_(("submitted", "open", "partially_filled", "filled")),
-            BrokerOrder.updated_at >= day_start,
-        )
+        .where(*where)
         .options(
             load_only(
                 BrokerOrder.id,
@@ -7602,16 +7904,169 @@ def _reserve_existing_exit_orders(
                 BrokerOrder.side,
                 BrokerOrder.status,
                 BrokerOrder.quantity,
+                BrokerOrder.last_broker_sync_at,
                 BrokerOrder.updated_at,
             )
         )
         .order_by(BrokerOrder.updated_at.asc(), BrokerOrder.id.asc())
     ).all()
+    symbols = sorted(remaining_quantities_by_symbol)
+    terminal_where = [
+        BrokerOrder.mode == settings.runtime_mode,
+        BrokerOrder.side == "sell",
+        BrokerOrder.symbol.in_(symbols),
+        BrokerOrder.status == "filled",
+    ]
+    reconciled_times = [
+        _normalize_utc(position.last_reconciled_at)
+        for symbol in symbols
+        if (position := positions_by_symbol.get(symbol)) is not None
+        and position.last_reconciled_at is not None
+    ]
+    if len(reconciled_times) == len(symbols):
+        earliest_reconciled_at = min(reconciled_times)
+        terminal_where.append(
+            or_(
+                BrokerOrder.last_broker_sync_at > earliest_reconciled_at,
+                and_(
+                    BrokerOrder.last_broker_sync_at.is_(None),
+                    BrokerOrder.updated_at > earliest_reconciled_at,
+                ),
+            )
+        )
+    terminal_filled_orders = db.scalars(
+        select(BrokerOrder)
+        .where(*terminal_where)
+        .options(
+            load_only(
+                BrokerOrder.id,
+                BrokerOrder.symbol,
+                BrokerOrder.status,
+                BrokerOrder.quantity,
+                BrokerOrder.last_broker_sync_at,
+                BrokerOrder.updated_at,
+            )
+        )
+    ).all()
+    relevant_order_ids = [
+        order.id for order in [*orders, *terminal_filled_orders]
+    ]
+    fill_scope = [ExecutionFill.broker_order_pk.in_(relevant_order_ids)]
+    for symbol in symbols:
+        position = positions_by_symbol.get(symbol)
+        reconciled_at = position.last_reconciled_at if position is not None else None
+        fill_scope.append(
+            ExecutionFill.symbol == symbol
+            if reconciled_at is None
+            else and_(
+                ExecutionFill.symbol == symbol,
+                ExecutionFill.filled_at > _normalize_utc(reconciled_at),
+            )
+        )
+    fills = dedupe_execution_fills(
+        db.scalars(
+            select(ExecutionFill)
+            .join(BrokerOrder, BrokerOrder.id == ExecutionFill.broker_order_pk)
+            .where(
+                BrokerOrder.mode == settings.runtime_mode,
+                BrokerOrder.side == "sell",
+                ExecutionFill.side == "sell",
+                or_(*fill_scope),
+            )
+            .order_by(ExecutionFill.filled_at.asc(), ExecutionFill.id.asc())
+        ).all()
+    )
+    filled_quantities: dict[str, Decimal] = {}
+    fills_before_position_by_order: dict[str, Decimal] = {}
+    unreflected_by_symbol: dict[str, Decimal] = {}
+    uncertain_order_ids = {
+        order.id
+        for order in orders
+        if order.status in {"submission_pending", "manual_review_required"}
+    }
+    for fill in fills:
+        quantity = effective_fill_quantity(fill)
+        filled_quantities[fill.broker_order_pk] = (
+            filled_quantities.get(fill.broker_order_pk, Decimal("0")) + quantity
+        )
+        position = positions_by_symbol.get(fill.symbol)
+        reconciled_at = position.last_reconciled_at if position is not None else None
+        if reconciled_at is not None and _normalize_utc(fill.filled_at) <= _normalize_utc(
+            reconciled_at
+        ):
+            fills_before_position_by_order[fill.broker_order_pk] = (
+                fills_before_position_by_order.get(fill.broker_order_pk, Decimal("0"))
+                + quantity
+            )
+            continue
+        if fill.broker_order_pk in uncertain_order_ids:
+            # Full original quantity is reserved below for ambiguous outcomes.
+            continue
+        unreflected_by_symbol[fill.symbol] = (
+            unreflected_by_symbol.get(fill.symbol, Decimal("0")) + quantity
+        )
+
+    # Some broker status payloads prove a full fill without itemized fills. If
+    # that proof is newer than position truth, reserve the missing executed
+    # quantity as well; otherwise a TTL-fresh pre-fill position could produce
+    # an oversized replacement stop.
+    for order in terminal_filled_orders:
+        if order.quantity is None or order.quantity <= 0:
+            continue
+        position = positions_by_symbol.get(order.symbol)
+        reconciled_at = position.last_reconciled_at if position is not None else None
+        broker_observed_at = order.last_broker_sync_at or order.updated_at
+        if (
+            reconciled_at is not None
+            and broker_observed_at is not None
+            and _normalize_utc(broker_observed_at) <= _normalize_utc(reconciled_at)
+        ):
+            continue
+        known_before = fills_before_position_by_order.get(order.id, Decimal("0"))
+        known_after = sum(
+            (
+                effective_fill_quantity(fill)
+                for fill in fills
+                if fill.broker_order_pk == order.id
+                and (
+                    reconciled_at is None
+                    or _normalize_utc(fill.filled_at) > _normalize_utc(reconciled_at)
+                )
+            ),
+            Decimal("0"),
+        )
+        implied_after = max(Decimal(order.quantity) - known_before, Decimal("0"))
+        missing_after = max(implied_after - known_after, Decimal("0"))
+        if missing_after > 0:
+            unreflected_by_symbol[order.symbol] = (
+                unreflected_by_symbol.get(order.symbol, Decimal("0")) + missing_after
+            )
+
+    for symbol, quantity in unreflected_by_symbol.items():
+        _reserve_remaining_quantity(
+            remaining_quantities_by_symbol=remaining_quantities_by_symbol,
+            symbol=symbol,
+            quantity=max(int(quantity), 0),
+        )
     for order in orders:
+        if order.quantity is None or order.quantity <= 0:
+            # Unknown active sell quantity is not safely replaceable.
+            remaining_quantities_by_symbol.pop(order.symbol, None)
+            continue
+        if order.status in {
+            "submission_pending",
+            "manual_review_required",
+        }:
+            reserved_quantity = order.quantity
+        else:
+            reserved_quantity = max(
+                int(Decimal(order.quantity) - filled_quantities.get(order.id, Decimal("0"))),
+                0,
+            )
         _reserve_remaining_quantity(
             remaining_quantities_by_symbol=remaining_quantities_by_symbol,
             symbol=order.symbol,
-            quantity=order.quantity,
+            quantity=reserved_quantity,
         )
 
 
@@ -8294,7 +8749,24 @@ def _quote_stale_reason(
 ) -> str | None:
     if price is None:
         return "quote is missing for watch buy evaluation"
+    if price.observed_at is None:
+        if settings.runtime_mode == "live":
+            return "quote timestamp is missing; freshness cannot be verified"
+        return None
+    if price.observed_at.tzinfo is None or price.observed_at.utcoffset() is None:
+        if settings.runtime_mode == "live":
+            return "quote timestamp has no timezone; freshness cannot be verified"
     observed_at = _price_observed_at(price, cycle_at)
+    future_skew = observed_at - cycle_at
+    max_future_skew = timedelta(
+        seconds=settings.monitoring_max_quote_future_skew_seconds
+    )
+    if future_skew > max_future_skew:
+        return (
+            "quote timestamp is in the future: observed_at="
+            f"{observed_at.isoformat()} exceeds allowed clock skew "
+            f"{settings.monitoring_max_quote_future_skew_seconds}s"
+        )
     max_age = timedelta(seconds=settings.monitoring_max_quote_age_seconds)
     age = cycle_at - observed_at
     if age > max_age:
@@ -8304,6 +8776,14 @@ def _quote_stale_reason(
             f"{settings.monitoring_max_quote_age_seconds}s"
         )
     return None
+
+
+def _provided_price_observed_at(
+    price: MonitoringPriceRequest | None,
+) -> datetime | None:
+    if price is None or price.observed_at is None:
+        return None
+    return _normalize_utc(price.observed_at)
 
 
 def _price_observed_at(
@@ -8324,7 +8804,10 @@ def _record_monitoring_event(
     monitoring_events = risk_context.get("monitoring_events")
     if not isinstance(monitoring_events, list):
         monitoring_events = []
-    risk_context["monitoring_events"] = [*monitoring_events[-2:], event]
+    # A single trigger can legitimately emit quality, sizing, approval, and
+    # submission events. Keep enough bounded history for the approval/audit
+    # trail to survive the rest of that same decision cycle.
+    risk_context["monitoring_events"] = [*monitoring_events[-19:], event]
     risk_context["last_monitoring_event"] = event
     item.risk_context = compact_json_object(risk_context)
 
@@ -8416,12 +8899,29 @@ def _place_monitoring_order(
     )
     if item.asset_class == "us_equity" and limit_price is None:
         limit_price = observed_price
+    order_metadata = _monitoring_order_metadata(
+        item=item,
+        observed_price=observed_price,
+        trigger_reason=trigger_reason,
+        trigger_metadata=trigger_metadata,
+        triggered_at=triggered_at,
+    )
+    retry_source_order = (
+        _retryable_session_rejection_source_order(db=db, item=item)
+        if item.intent == "stop_sell"
+        else None
+    )
+    retry_source_order_pk = retry_source_order.id if retry_source_order is not None else None
+    if retry_source_order_pk is not None:
+        order_metadata["retry"] = {
+            "source": "rejected_order_retry",
+            "source_broker_order_pk": retry_source_order_pk,
+        }
     order_request = PlaceOrderRequest(
         idempotency_key=_monitoring_order_idempotency_key(
             item=item,
             is_watch_buy=is_watch_buy,
-            triggered_at=triggered_at,
-            db=db,
+            retry_source_order_pk=retry_source_order_pk,
         ),
         execution_plan_item_id=item.id,
         provider=item.provider or "kis",
@@ -8434,13 +8934,7 @@ def _place_monitoring_order(
         limit_price=limit_price,
         time_in_force=item.time_in_force or "day",
         exchange=_plan_item_exchange(item),
-        metadata=_monitoring_order_metadata(
-            item=item,
-            observed_price=observed_price,
-            trigger_reason=trigger_reason,
-            trigger_metadata=trigger_metadata,
-            triggered_at=triggered_at,
-        ),
+        metadata=order_metadata,
     )
     return place_broker_order(
         settings=settings,
@@ -8456,18 +8950,16 @@ def _monitoring_order_idempotency_key(
     *,
     item: ExecutionPlanItem,
     is_watch_buy: bool,
-    triggered_at: datetime,
-    db: Session,
+    retry_source_order_pk: str | None,
 ) -> str:
     if is_watch_buy:
         return f"monitoring:watch_buy:{item.id}"
     base = f"monitoring:{item.intent}:{item.id}"
-    if (
-        item.intent == "stop_sell"
-        and _latest_order_failure_is_retryable_session_rejection(db=db, item=item)
-    ):
-        retry_date = triggered_at.astimezone(KRX_TIMEZONE).date().isoformat()
-        return f"{base}:{retry_date}"
+    if item.intent == "stop_sell" and retry_source_order_pk is not None:
+        # One deterministic generation per confirmed terminal rejection.
+        # Replays against the same rejected source remain idempotent; a new
+        # generation is possible only after a new rejection row is durable.
+        return f"{base}:retry:{retry_source_order_pk}"
     return base
 
 

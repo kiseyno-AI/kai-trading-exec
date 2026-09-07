@@ -3,6 +3,14 @@ from decimal import Decimal
 
 from fastapi.testclient import TestClient
 
+from app.broker.base import (
+    BrokerAccountSnapshot,
+    BrokerAdapterError,
+    BrokerErrorClassification,
+    BrokerTokenGrant,
+    NormalizedBrokerOrderStatus,
+)
+from app.broker.kis import KisBrokerAdapter
 from app.core.config import Settings
 from app.db.base import Base
 from app.db.session import create_db_engine, create_session_factory
@@ -677,7 +685,36 @@ def test_crypto_paper_order_rejects_budget_breach() -> None:
     assert "block_reason" not in payload
 
 
-def test_kis_stock_order_preserves_integer_quantity_on_adapter_rejection() -> None:
+def test_kis_stock_order_preserves_integer_quantity_on_adapter_rejection(monkeypatch) -> None:
+    monkeypatch.setattr(
+        KisBrokerAdapter,
+        "authenticate",
+        lambda _self: BrokerTokenGrant(
+            access_token="test-token",
+            token_type="Bearer",
+            access_token_expires_at=datetime(2099, 1, 1, tzinfo=UTC),
+        ),
+    )
+    monkeypatch.setattr(
+        KisBrokerAdapter,
+        "get_account_snapshot",
+        lambda _self, _access_token, **_kwargs: BrokerAccountSnapshot(
+            available_cash=Decimal("100000.00"),
+            buying_power=Decimal("100000.00"),
+            observed_at=datetime.now(UTC),
+            source="test:sufficient-buying-power",
+        ),
+    )
+
+    def reject_order(_self, _access_token, _request):  # type: ignore[no-untyped-def]
+        raise BrokerAdapterError(
+            "deterministic adapter rejection",
+            status_code=422,
+            classification=BrokerErrorClassification.VALIDATION,
+            normalized_status=NormalizedBrokerOrderStatus.REJECTED,
+        )
+
+    monkeypatch.setattr(KisBrokerAdapter, "place_order", reject_order)
     app, _engine = build_test_app(
         Settings(
             database_url="sqlite:///:memory:",

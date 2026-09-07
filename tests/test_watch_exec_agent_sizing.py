@@ -58,9 +58,11 @@ class WatchSizingBrokerStub:
         *,
         reconcile_payloads: list[dict[str, object]],
         snapshot_error: Exception | None = None,
+        snapshot: BrokerAccountSnapshot | None = None,
     ) -> None:
         self.reconcile_payloads = reconcile_payloads
         self.snapshot_error = snapshot_error
+        self.snapshot = snapshot
         self.events: list[str] = []
         self.reconcile_calls: list[str] = []
 
@@ -91,6 +93,8 @@ class WatchSizingBrokerStub:
         self.events.append("snapshot")
         if self.snapshot_error is not None:
             raise self.snapshot_error
+        if self.snapshot is not None:
+            return self.snapshot
         return BrokerAccountSnapshot(
             available_cash=Decimal("10000000"),
             buying_power=Decimal("10000000"),
@@ -693,6 +697,178 @@ def test_short_transaction_batches_candidates_across_single_item_plans(tmp_path,
         "watch-item-2": "watch_buy_triggered_blocked",
         "watch-item-3": "watch_buy_triggered_blocked",
     }
+
+
+def test_live_watch_sizing_waits_when_account_snapshot_is_unavailable(tmp_path, monkeypatch) -> None:
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'watch-sizing-live-account-unavailable.db'}",
+        runtime_mode="live",
+        exec_agent_enabled=True,
+        exec_agent_watch_sizing_enabled=True,
+        exec_agent_watch_sizing_start_local_time="00:00",
+        exec_agent_watch_sizing_end_local_time="23:59",
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    with session_factory() as session:
+        session.add(
+            ExecutionPlan(
+                external_plan_id="plan-live-account-unavailable",
+                strategy_run_id="strategy-1",
+                source="core-short-term-decider",
+                market_date=date(2026, 6, 4),
+                mode="live",
+                items=[
+                    _watch_item(
+                        item_id="watch-item-account-unavailable",
+                        symbol="005930",
+                        risk_context={"target_price": "76000", "stop_price": "69000"},
+                    )
+                ],
+            )
+        )
+        session.commit()
+
+    monkeypatch.setattr(
+        watch_sizing,
+        "_request_exec_agent_decisions",
+        lambda **_: (_ for _ in ()).throw(
+            AssertionError("exec-agent must not size live orders without broker account truth")
+        ),
+    )
+
+    result = run_due_watch_exec_agent_sizing(
+        settings=settings,
+        session_factory=session_factory,
+        adapter=None,
+        now=datetime(2026, 6, 4, 0, 0, tzinfo=UTC),
+    )
+
+    assert result.payload["blocked"] is True
+    assert result.payload["reason"] == "account_context_unavailable"
+    assert result.payload["batches_processed"] == 0
+    with session_factory() as session:
+        item = session.get(ExecutionPlanItem, "watch-item-account-unavailable")
+        assert item is not None
+        assert item.status == "watch_monitoring_pending"
+
+    engine.dispose()
+
+
+def test_live_watch_sizing_blocks_when_broker_open_order_truth_is_degraded(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'watch-sizing-live-open-orders-degraded.db'}",
+        runtime_mode="live",
+        exec_agent_enabled=True,
+        exec_agent_watch_sizing_enabled=True,
+        exec_agent_watch_sizing_start_local_time="00:00",
+        exec_agent_watch_sizing_end_local_time="23:59",
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    with session_factory() as session:
+        session.add(
+            ExecutionPlan(
+                external_plan_id="plan-live-open-orders-degraded",
+                strategy_run_id="strategy-1",
+                source="core-short-term-decider",
+                market_date=date(2026, 6, 4),
+                mode="live",
+                items=[
+                    _watch_item(
+                        item_id="watch-item-open-orders-degraded",
+                        symbol="005930",
+                        risk_context={"target_price": "76000", "stop_price": "69000"},
+                    )
+                ],
+            )
+        )
+        session.commit()
+
+    monkeypatch.setattr(
+        watch_sizing,
+        "_request_exec_agent_decisions",
+        lambda **_: (_ for _ in ()).throw(
+            AssertionError("exec-agent must not size live buys from degraded open-order truth")
+        ),
+    )
+    broker = WatchSizingBrokerStub(
+        reconcile_payloads=[],
+        snapshot=BrokerAccountSnapshot(
+            available_cash=Decimal("10000000"),
+            buying_power=Decimal("10000000"),
+            observed_at=datetime(2026, 6, 4, 0, 1, tzinfo=UTC),
+            source="kis:account_snapshot",
+            open_orders=[],
+            payload={
+                "open_orders_error": {
+                    "code": "KIER2570",
+                    "message": "open-order inquiry unavailable",
+                    "degraded": True,
+                }
+            },
+        ),
+    )
+
+    result = run_due_watch_exec_agent_sizing(
+        settings=settings,
+        session_factory=session_factory,
+        adapter=broker,
+        now=datetime(2026, 6, 4, 0, 0, tzinfo=UTC),
+    )
+
+    assert result.payload["blocked"] is True
+    assert result.payload["reason"] == "broker_open_orders_truth_unavailable"
+    assert result.payload["batches_processed"] == 0
+    account_context = result.payload["account_context"]
+    assert account_context["available"] is True
+    assert account_context["buy_sizing_available"] is False
+    assert account_context["open_orders_truth"] == {
+        "available": False,
+        "status": "degraded",
+        "source": "kis:account_snapshot",
+        "observed_at": "2026-06-04T00:01:00+00:00",
+        "error_code": "KIER2570",
+        "reason": "broker open-order lookup returned degraded truth",
+    }
+    with session_factory() as session:
+        item = session.get(ExecutionPlanItem, "watch-item-open-orders-degraded")
+        assert item is not None
+        assert item.status == "watch_monitoring_pending"
+
+    engine.dispose()
+
+
+def test_paper_watch_envelope_warns_but_does_not_block_degraded_open_order_truth() -> None:
+    item = _watch_item(
+        risk_context={"target_price": "76000", "stop_loss_price": "69000"},
+    )
+    account_context = _account_context_payload(
+        BrokerAccountSnapshot(
+            available_cash=Decimal("10000000"),
+            buying_power=Decimal("10000000"),
+            source="kis:account_snapshot",
+            payload={"open_orders_error": {"code": "KIER2570", "degraded": True}},
+        )
+    )
+
+    payload = _sizing_request_payload(
+        settings=Settings(runtime_mode="paper"),
+        plan=ExecutionPlan(external_plan_id="plan-paper-degraded-open-orders"),
+        candidates=[_candidate_payload(item)],
+        account_context=account_context,
+        candidate_universe=_candidate_universe_payload([_candidate_payload(item)]),
+    )
+
+    envelope = payload["candidates"][0]["allowed_action_envelope"]  # type: ignore[index]
+    assert "buy" in envelope["allowed_actions"]
+    assert "broker_open_orders_truth_unavailable" in envelope["soft_warnings"]
+    assert "broker_open_orders_truth_unavailable" not in envelope["hard_reject_reasons"]
 
 
 def test_stale_open_order_unknown_broker_status_blocks_watch_sizing_before_agent(tmp_path, monkeypatch) -> None:

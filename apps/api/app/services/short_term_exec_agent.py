@@ -16,6 +16,7 @@ from app.broker.base import (
 from app.core.config import Settings
 from app.models.runtime import BrokerOrder, ExecutionPlan, ExecutionPlanItem, ExecutionPosition
 from app.services.broker_auth import ensure_authenticated_broker_session
+from app.services.broker_order_state import CAPITAL_RESERVING_ORDER_STATUSES
 from app.services.json_compaction import compact_json_object
 
 SHORT_TERM_DECIDER_NAME = "short-term-decider"
@@ -23,15 +24,7 @@ NEXT_OPEN_BUY_INTENT = "next_open_buy"
 EXEC_AGENT_NAME = "short_term_exec_agent_v1"
 EXEC_AGENT_DECISION_KEY = "exec_agent_decision"
 ORIGINAL_QUANTITY_POLICY_KEY = "original_quantity_policy"
-OPEN_BUY_ORDER_STATUSES = frozenset(
-    {
-        "submission_pending",
-        "submitted",
-        "open",
-        "partially_filled",
-        "retry_pending",
-    }
-)
+OPEN_BUY_ORDER_STATUSES = frozenset(CAPITAL_RESERVING_ORDER_STATUSES)
 ACTIVE_SOURCE_STATUSES = frozenset(
     {
         "pending",

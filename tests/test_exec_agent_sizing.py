@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
+import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -625,6 +626,15 @@ def test_daily_new_buy_notional_loaders_count_filled_buy_items() -> None:
             mode=app.state.settings.runtime_mode,
             raw_payload={},
         )
+        unresolved_item = ExecutionPlanItem(
+            plan_item_index=3,
+            symbol="068270",
+            side="buy",
+            intent="next_open_buy",
+            status="broker_order_failed",
+            quantity_policy={"kind": "shares", "quantity": 8},
+            limit_price=Decimal("10000"),
+        )
         plan.items = [
             ExecutionPlanItem(
                 plan_item_index=0,
@@ -653,6 +663,7 @@ def test_daily_new_buy_notional_loaders_count_filled_buy_items() -> None:
                 quantity_policy={"kind": "shares", "quantity": 10},
                 limit_price=Decimal("100000"),
             ),
+            unresolved_item,
         ]
         other_date_plan.items = [
             ExecutionPlanItem(
@@ -665,19 +676,35 @@ def test_daily_new_buy_notional_loaders_count_filled_buy_items() -> None:
                 limit_price=Decimal("50000"),
             )
         ]
-        db.add_all([plan, other_date_plan])
+        db.add_all(
+            [
+                plan,
+                other_date_plan,
+                BrokerOrder(
+                    plan_item=unresolved_item,
+                    broker_name="kis",
+                    mode=app.state.settings.runtime_mode,
+                    idempotency_key="daily-cap-unknown-buy",
+                    symbol="068270",
+                    side="buy",
+                    status="manual_review_required",
+                    quantity=8,
+                    limit_price=Decimal("10000"),
+                ),
+            ]
+        )
         db.commit()
 
         assert strict_exec_agent._load_daily_new_buy_notional(
             settings=app.state.settings,
             db=db,
             market_date=market_date,
-        ) == Decimal("170000.0000")
+        ) == Decimal("250000.0000")
         assert monitoring_service._load_daily_new_buy_notional(
             settings=app.state.settings,
             db=db,
             market_date=market_date,
-        ) == Decimal("170000.0000")
+        ) == Decimal("250000.0000")
 
     engine.dispose()
 
@@ -801,6 +828,84 @@ def test_short_term_exec_agent_approves_market_open_buy_and_materializes_monitor
             "momentum_continuation",
         ]
         assert audit["account_snapshot"]["available_cash"] == "500000.0000"
+
+    engine.dispose()
+
+
+def test_market_buy_capital_gate_prefers_verified_exec_agent_audit_over_legacy_context() -> None:
+    adapter = StubBrokerAdapter(available_cash=Decimal("500000"))
+    app, engine = build_test_app(adapter)
+    client = TestClient(app)
+
+    client.post("/controls/resume", json={"actor": "ops", "source": "test"})
+    response = client.post("/execution-plans", json=short_term_plan_payload())
+    assert response.status_code == 201
+
+    with app.state.db_session_factory() as session:
+        buy_item = session.scalar(
+            select(ExecutionPlanItem).where(ExecutionPlanItem.intent == "next_open_buy")
+        )
+        assert buy_item is not None
+        risk_context = dict(buy_item.risk_context or {})
+        risk_context["reference_price"] = "999999.0000"
+        buy_item.risk_context = risk_context
+        session.commit()
+
+    dispatch = client.post("/execution-jobs/dispatch")
+
+    assert dispatch.status_code == 200
+    assert dispatch.json()["completed_job_count"] == 1
+    assert len(adapter.order_calls) == 1
+    assert adapter.order_calls[0].order_type == "market"
+    assert adapter.order_calls[0].quantity == 2
+
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("sizing_price", "NaN"),
+        ("sizing_price", "Infinity"),
+        ("reference_price", "51000.0000"),
+        ("approved_notional", "99999.0000"),
+    ],
+)
+def test_market_buy_capital_gate_rejects_invalid_or_conflicting_exec_agent_audit(
+    field: str,
+    value: str,
+) -> None:
+    adapter = StubBrokerAdapter(available_cash=Decimal("500000"))
+    app, engine = build_test_app(adapter)
+    client = TestClient(app)
+
+    client.post("/controls/resume", json={"actor": "ops", "source": "test"})
+    response = client.post("/execution-plans", json=short_term_plan_payload())
+    assert response.status_code == 201
+
+    with app.state.db_session_factory() as session:
+        buy_item = session.scalar(
+            select(ExecutionPlanItem).where(ExecutionPlanItem.intent == "next_open_buy")
+        )
+        assert buy_item is not None
+        risk_context = dict(buy_item.risk_context or {})
+        risk_context["reference_price"] = "50000.0000"
+        decision = dict(risk_context["exec_agent_decision"])
+        decision[field] = value
+        risk_context["exec_agent_decision"] = decision
+        buy_item.risk_context = risk_context
+        session.commit()
+
+    dispatch = client.post("/execution-jobs/dispatch")
+
+    assert dispatch.status_code == 200
+    assert dispatch.json()["completed_job_count"] == 0
+    assert adapter.order_calls == []
+    with app.state.db_session_factory() as session:
+        blocked_order = session.scalar(select(BrokerOrder))
+        assert blocked_order is not None
+        assert blocked_order.status == "rejected"
+        assert blocked_order.last_error_code == "account_drawdown_snapshot_unavailable"
 
     engine.dispose()
 
@@ -1050,6 +1155,44 @@ def test_short_term_exec_agent_rejects_duplicate_open_buy_order() -> None:
     )
     assert adapter.order_calls == []
 
+    engine.dispose()
+
+
+def test_short_term_exec_agent_reserves_old_manual_review_buy_outcome() -> None:
+    adapter = StubBrokerAdapter(available_cash=Decimal("500000"))
+    app, engine = build_test_app(adapter)
+    client = TestClient(app)
+    old_observation = datetime.now(UTC) - timedelta(days=7)
+    with app.state.db_session_factory() as db:
+        db.add(
+            BrokerOrder(
+                broker_name="kis",
+                mode=app.state.settings.runtime_mode,
+                idempotency_key="unknown-buy-reserves-capital",
+                broker_order_id=None,
+                symbol="005930",
+                side="buy",
+                status="manual_review_required",
+                quantity=5,
+                limit_price=Decimal("50000"),
+                last_error_classification="submit_outcome_unknown",
+                last_error_code="SUBMIT_OUTCOME_UNKNOWN",
+                last_error_retryable=False,
+                created_at=old_observation,
+                updated_at=old_observation,
+            )
+        )
+        db.commit()
+
+    response = client.post("/execution-plans", json=short_term_plan_payload())
+
+    assert response.status_code == 201
+    item = client.get("/execution-plans").json()[0]["items"][0]
+    assert item["status"] == "exec_agent_rejected"
+    assert item["risk_context"]["exec_agent_decision"]["reason_code"] == (
+        "duplicate_open_buy_order"
+    )
+    assert adapter.order_calls == []
     engine.dispose()
 
 

@@ -1,8 +1,10 @@
 import threading
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from zoneinfo import ZoneInfo
 
 from fastapi.testclient import TestClient
+import pytest
 from sqlalchemy import inspect, select, text
 from sqlalchemy.orm import load_only
 
@@ -10,7 +12,9 @@ from app.api.schemas.execution import MonitoringPriceRequest
 from app.broker.base import (
     BrokerAccountHolding,
     BrokerAccountSnapshot,
+    BrokerAdapterError,
     BrokerConfig,
+    BrokerErrorClassification,
     BrokerOrderPlacement,
     BrokerOrderPlacementRequest,
     BrokerRealtimeApproval,
@@ -71,6 +75,17 @@ def build_test_app(
         monitoring_price_source=monitoring_price_source,
     )
     return app, engine
+
+
+def _freeze_runtime_service_now(monkeypatch, now: datetime) -> None:
+    class FixedDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):  # type: ignore[no-untyped-def]
+            if tz is None:
+                return now.replace(tzinfo=None)
+            return now.astimezone(tz)
+
+    monkeypatch.setattr(runtime_service, "datetime", FixedDatetime)
 
 
 def test_monitoring_symbol_cycle_limit_auto_uses_timeout_budget() -> None:
@@ -432,7 +447,7 @@ def test_create_app_injects_default_kis_monitoring_price_source_for_paper_runtim
     engine.dispose()
 
 
-def test_runtime_status_reports_monthly_realized_pnl_progress_and_mode() -> None:
+def test_runtime_status_reports_monthly_realized_pnl_progress_and_mode(monkeypatch) -> None:
     settings = Settings(
         database_url="sqlite:///:memory:",
         runtime_mode="paper",
@@ -440,7 +455,8 @@ def test_runtime_status_reports_monthly_realized_pnl_progress_and_mode() -> None
     )
     app, engine = build_test_app(settings=settings)
     client = TestClient(app)
-    now = datetime.now(UTC)
+    now = datetime(2026, 6, 17, 3, 0, tzinfo=UTC)
+    _freeze_runtime_service_now(monkeypatch, now)
 
     with app.state.db_session_factory() as session:
         buy_order = BrokerOrder(
@@ -490,12 +506,16 @@ def test_runtime_status_reports_monthly_realized_pnl_progress_and_mode() -> None
     assert response.status_code == 200
     monthly = response.json()["monthly_pnl"]
     assert monthly["monthly_realized_pnl"] == "5000.0000"
+    assert monthly["monthly_gross_realized_pnl_krw"] == "5000.0000"
+    assert monthly["monthly_net_realized_pnl_krw"] is None
+    assert monthly["transaction_cost_coverage"] == "unknown"
     assert monthly["monthly_target_krw"] == "1000.0000"
-    assert monthly["target_progress_pct"] == "500.0000"
-    assert monthly["mode_recommendation"] == "capital_preservation"
+    assert monthly["target_progress_pct"] is None
+    assert monthly["mode_recommendation"] == "insufficient_net_pnl_data"
     assert monthly["matched_sell_quantity"] == 5
     weekly = response.json()["weekly_pnl"]
     assert weekly["weekly_realized_pnl"] == "5000.0000"
+    assert weekly["weekly_net_realized_pnl_krw"] is None
     assert weekly["weekly_buy_notional"] == "100000.0000"
     assert weekly["weekly_sell_notional"] == "55000.0000"
     assert weekly["matched_sell_quantity"] == 5
@@ -509,6 +529,7 @@ def test_runtime_status_reports_monthly_realized_pnl_progress_and_mode() -> None
     assert weekly["pnl_method"] == "fifo_internal_fills_with_broker_reconciliation_fallback"
     daily = response.json()["daily_pnl"]
     assert daily["daily_realized_pnl"] == "5000.0000"
+    assert daily["daily_net_realized_pnl_krw"] is None
     assert daily["daily_buy_notional"] == "0.0000"
     assert daily["daily_sell_notional"] == "55000.0000"
     assert daily["matched_sell_quantity"] == 5
@@ -595,11 +616,12 @@ def test_runtime_status_weekly_pnl_uses_broker_reconciliation_cost_for_legacy_fl
     engine.dispose()
 
 
-def test_runtime_status_weekly_pnl_keeps_later_repurchase_basis_unknown() -> None:
+def test_runtime_status_weekly_pnl_keeps_later_repurchase_basis_unknown(monkeypatch) -> None:
     settings = Settings(database_url="sqlite:///:memory:", runtime_mode="paper")
     app, engine = build_test_app(settings=settings)
     client = TestClient(app)
-    now = datetime.now(UTC)
+    now = datetime(2026, 6, 17, 3, 0, tzinfo=UTC)
+    _freeze_runtime_service_now(monkeypatch, now)
     sell_at = now - timedelta(days=2)
     buy_at = now - timedelta(days=1)
 
@@ -658,7 +680,10 @@ def test_runtime_status_weekly_pnl_keeps_later_repurchase_basis_unknown() -> Non
 
     assert response.status_code == 200
     weekly = response.json()["weekly_pnl"]
-    assert weekly["weekly_realized_pnl"] == "0.0000"
+    assert weekly["weekly_realized_pnl"] is None
+    assert weekly["weekly_net_realized_pnl_krw"] is None
+    assert weekly["profitability_status"] == "degraded_unknown_currency"
+    assert weekly["pnl_cost_basis_coverage"] == "incomplete"
     assert weekly["matched_sell_quantity"] == 0
     assert weekly["unmatched_sell_quantity"] == 5
     assert weekly["unknown_cost_basis_sell_quantity"] == 5
@@ -850,7 +875,10 @@ def test_runtime_status_daily_pnl_surfaces_unmatched_sell_coverage() -> None:
 
     assert response.status_code == 200
     daily = response.json()["daily_pnl"]
-    assert daily["daily_realized_pnl"] == "1000.0000"
+    assert daily["daily_realized_pnl"] is None
+    assert daily["covered_gross_realized_pnl_krw"] == "1000.0000"
+    assert daily["daily_net_realized_pnl_krw"] is None
+    assert daily["profitability_status"] == "degraded_unknown_cost_basis"
     assert daily["daily_sell_notional"] == "314000.0000"
     assert daily["matched_sell_quantity"] == 1
     assert daily["unmatched_sell_quantity"] == 150
@@ -2060,7 +2088,20 @@ def test_autonomous_monitoring_rearms_retry_pending_stop_after_session_rejection
         )
     )
     client = TestClient(app)
-    broker_adapter = StubMonitoringBrokerAdapter()
+    broker_adapter = StubMonitoringBrokerAdapter(
+        account_snapshot=BrokerAccountSnapshot(
+            available_cash=Decimal("1000000.00"),
+            observed_at=datetime(2026, 5, 28, 1, 5, tzinfo=UTC),
+            source="stub:account_snapshot",
+            holdings=[
+                BrokerAccountHolding(
+                    symbol="033530",
+                    quantity=58,
+                    average_price=Decimal("8500.00"),
+                )
+            ],
+        )
+    )
 
     resume = client.post(
         "/controls/resume",
@@ -2124,20 +2165,19 @@ def test_autonomous_monitoring_rearms_retry_pending_stop_after_session_rejection
         assert newer_stop is not None
         older_stop.status = "broker_order_retry_pending"
         newer_stop.status = "broker_order_rejected"
-        session.add(
-            BrokerOrder(
-                execution_plan_item_id=older_stop_id,
-                mode="paper",
-                idempotency_key="session-retry-stop-033530",
-                symbol="033530",
-                side="sell",
-                status="retry_pending",
-                quantity=58,
-                last_error_code="KIOK0320",
-                last_error_message="장운영시간이 아닙니다",
-                last_error_retryable=True,
-            )
+        rejected_order = BrokerOrder(
+            execution_plan_item_id=older_stop_id,
+            mode="paper",
+            idempotency_key="session-retry-stop-033530",
+            symbol="033530",
+            side="sell",
+            status="retry_pending",
+            quantity=58,
+            last_error_code="KIOK0320",
+            last_error_message="장운영시간이 아닙니다",
+            last_error_retryable=True,
         )
+        session.add(rejected_order)
         session.add(
             ExecutionPosition(
                 mode="paper",
@@ -2164,11 +2204,218 @@ def test_autonomous_monitoring_rearms_retry_pending_stop_after_session_rejection
         assert broker_adapter.order_calls[0].side == "sell"
         assert broker_adapter.order_calls[0].quantity == 58
         assert broker_adapter.order_calls[0].execution_plan_item_id == older_stop_id
+        replacement_order = session.scalar(
+            select(BrokerOrder).where(BrokerOrder.id != rejected_order.id)
+        )
+        assert replacement_order is not None
+        assert replacement_order.request_metadata["metadata"]["retry"] == {
+            "source": "rejected_order_retry",
+            "source_broker_order_pk": rejected_order.id,
+        }
         rearmed_stop = session.get(ExecutionPlanItem, older_stop_id)
         assert rearmed_stop is not None
         assert rearmed_stop.status == "broker_order_submitted"
         events = rearmed_stop.risk_context["monitoring_events"]
         assert any(event["event"] == "protective_stop_rearmed" for event in events)
+
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("recover_on_call", "expected_final_status"),
+    [(2, "broker_order_retry_pending"), (None, "broker_order_failed")],
+    ids=("session-recovers", "retry-budget-exhausted"),
+)
+def test_autonomous_monitoring_retries_each_terminal_session_rejection_once(
+    recover_on_call: int | None,
+    expected_final_status: str,
+) -> None:
+    class RejectOnceThenSubmitAdapter(StubMonitoringBrokerAdapter):
+        def place_order(
+            self,
+            access_token: str,
+            request: BrokerOrderPlacementRequest,
+        ) -> BrokerOrderPlacement:
+            assert access_token
+            self.order_calls.append(request)
+            if recover_on_call is None or len(self.order_calls) < recover_on_call:
+                raise BrokerAdapterError(
+                    "장운영시간이 아닙니다",
+                    status_code=409,
+                    classification=BrokerErrorClassification.BROKER_REJECTED,
+                    retryable=True,
+                    code="KIOK0320",
+                    normalized_status=NormalizedBrokerOrderStatus.RETRY_PENDING,
+                    response_payload={
+                        "rt_cd": "1",
+                        "msg_cd": "KIOK0320",
+                        "msg1": "장운영시간이 아닙니다",
+                    },
+                )
+            return BrokerOrderPlacement(
+                broker_order_id="kis-recovered-stop",
+                normalized_status=NormalizedBrokerOrderStatus.SUBMITTED,
+                broker_status="submitted",
+                submitted_at=datetime(2026, 5, 28, 1, 6, tzinfo=UTC),
+                observed_at=datetime(2026, 5, 28, 1, 6, tzinfo=UTC),
+                request_metadata={"source": "stub"},
+                response_metadata={"source": "stub"},
+                request_payload={"symbol": request.symbol},
+                response_payload={"broker_order_id": "kis-recovered-stop"},
+            )
+
+    app, engine = build_test_app(
+        Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+        )
+    )
+    client = TestClient(app)
+    broker_adapter = RejectOnceThenSubmitAdapter(
+        account_snapshot=BrokerAccountSnapshot(
+            available_cash=Decimal("1000000.00"),
+            observed_at=datetime(2026, 5, 28, 1, 5, tzinfo=UTC),
+            source="stub:retry-chain-position",
+            holdings=[
+                BrokerAccountHolding(
+                    symbol="033530",
+                    quantity=58,
+                    sellable_quantity=58,
+                    average_price=Decimal("8500.00"),
+                )
+            ],
+        )
+    )
+    assert client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "test", "reason": "enable monitoring retry"},
+    ).status_code == 200
+    plan = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-033530-multi-session-retry",
+            "source": "kai-trading-core",
+            "market_date": "2026-05-27",
+            "items": [
+                {
+                    "symbol": "033530",
+                    "side": "sell",
+                    "intent": "stop_sell",
+                    "trigger_price": "8700.00",
+                    "quantity_policy": {"kind": "position_exit_from_entry"},
+                    "risk_context": {"exchange": "KRX"},
+                }
+            ],
+        },
+    )
+    assert plan.status_code == 201
+    stop_id = plan.json()["persisted_execution_item_ids"][0]
+
+    with app.state.db_session_factory() as session:
+        stop = session.get(ExecutionPlanItem, stop_id)
+        assert stop is not None
+        stop.status = "broker_order_retry_pending"
+        first_rejection = BrokerOrder(
+            execution_plan_item_id=stop_id,
+            broker_name="kis",
+            mode="paper",
+            idempotency_key="initial-session-rejected-stop-033530",
+            symbol="033530",
+            side="sell",
+            status="retry_pending",
+            quantity=58,
+            asset_class="stock",
+            last_error_classification="broker_rejected",
+            last_error_code="KIOK0320",
+            last_error_message="장운영시간이 아닙니다",
+            last_error_retryable=True,
+        )
+        session.add(first_rejection)
+        session.add(
+            ExecutionPosition(
+                mode="paper",
+                symbol="033530",
+                quantity=58,
+                average_price=Decimal("8500.00"),
+                updated_from="reconciliation",
+                last_reconciled_at=datetime.now(UTC),
+            )
+        )
+        session.commit()
+
+        first_cycle = run_autonomous_monitoring_cycle(
+            settings=app.state.settings,
+            db=session,
+            adapter=broker_adapter,
+            prices=[MonitoringPriceRequest(symbol="033530", price=Decimal("7550.00"))],
+            now=datetime(2026, 5, 28, 1, 5, tzinfo=UTC),
+        )
+        assert first_cycle.status_code == 200
+        assert len(broker_adapter.order_calls) == 1
+        assert broker_adapter.order_calls[0].idempotency_key == (
+            f"monitoring:stop_sell:{stop_id}:retry:{first_rejection.id}"
+        )
+        second_rejection = session.scalar(
+            select(BrokerOrder)
+            .where(BrokerOrder.id != first_rejection.id)
+            .order_by(BrokerOrder.created_at.desc(), BrokerOrder.id.desc())
+        )
+        assert second_rejection is not None
+        assert second_rejection.status == "retry_pending"
+
+        second_cycle = run_autonomous_monitoring_cycle(
+            settings=app.state.settings,
+            db=session,
+            adapter=broker_adapter,
+            prices=[MonitoringPriceRequest(symbol="033530", price=Decimal("7550.00"))],
+            now=datetime(2026, 5, 28, 1, 6, tzinfo=UTC),
+        )
+        assert second_cycle.status_code == 200
+        assert second_cycle.payload["submitted_order_count"] == (
+            1 if recover_on_call is not None else 0
+        ), repr(
+            second_cycle.payload.get("items")
+        )
+        assert len(broker_adapter.order_calls) == 2
+        assert broker_adapter.order_calls[1].idempotency_key == (
+            f"monitoring:stop_sell:{stop_id}:retry:{second_rejection.id}"
+        )
+
+        active_order_count = len(
+            session.scalars(
+                select(BrokerOrder).where(
+                    BrokerOrder.execution_plan_item_id == stop_id,
+                    BrokerOrder.status == "submitted",
+                )
+            ).all()
+        )
+        assert active_order_count == (1 if recover_on_call is not None else 0)
+        if recover_on_call is not None:
+            session.refresh(stop)
+            assert stop.status == "broker_order_submitted"
+            # Simulate a stale plan-item projection. The durable active order
+            # must still prevent an older rejection from spawning a new retry.
+            stop.status = "broker_order_retry_pending"
+            session.commit()
+        third_cycle = run_autonomous_monitoring_cycle(
+            settings=app.state.settings,
+            db=session,
+            adapter=broker_adapter,
+            prices=[MonitoringPriceRequest(symbol="033530", price=Decimal("7550.00"))],
+            now=datetime(2026, 5, 28, 1, 7, tzinfo=UTC),
+        )
+        assert third_cycle.status_code == 200
+        assert len(broker_adapter.order_calls) == 2
+        session.refresh(stop)
+        assert stop.status == expected_final_status
+        if recover_on_call is None:
+            assert stop.risk_context["last_monitoring_event"]["event"] == (
+                "protective_stop_retry_exhausted"
+            )
+            assert stop.risk_context["last_monitoring_event"]["retry_attempt_count"] == 2
 
     engine.dispose()
 
@@ -4738,7 +4985,12 @@ def test_fast_runtime_status_uses_autonomous_snapshot_for_monitored_symbols() ->
         items=[],
         filled_today_symbols=["282330"],
     )
-    now = datetime.now(UTC)
+    krx_today = datetime.now(ZoneInfo("Asia/Seoul")).date()
+    now = datetime.combine(
+        krx_today,
+        datetime.min.time(),
+        tzinfo=ZoneInfo("Asia/Seoul"),
+    ).astimezone(UTC) + timedelta(hours=12)
     with app.state.db_session_factory() as session:
         plan = ExecutionPlan(
             external_plan_id="fast-runtime-monitored-truth",
@@ -4816,13 +5068,15 @@ def test_fast_runtime_status_uses_autonomous_snapshot_for_monitored_symbols() ->
         "sell": {"symbols": 1, "fills": 1, "quantity": 3},
     }
     assert payload["monthly_pnl"]["pnl_method"] == "fifo_internal_fills_with_broker_reconciliation_fallback"
-    assert payload["monthly_pnl"]["monthly_realized_pnl"] == "0.0000"
-    assert payload["monthly_pnl"]["matched_sell_quantity"] == 0
+    assert payload["monthly_pnl"]["monthly_realized_pnl"] is None
+    assert payload["monthly_pnl"]["matched_sell_quantity"] is None
+    assert payload["monthly_pnl"]["calculation_status"] == "not_computed"
     assert payload["weekly_pnl"]["pnl_method"] == "fifo_internal_fills_with_broker_reconciliation_fallback"
-    assert payload["weekly_pnl"]["weekly_realized_pnl"] == "0.0000"
-    assert payload["weekly_pnl"]["weekly_buy_notional"] == "0.0000"
-    assert payload["weekly_pnl"]["weekly_sell_notional"] == "0.0000"
-    assert payload["weekly_pnl"]["matched_sell_quantity"] == 0
+    assert payload["weekly_pnl"]["weekly_realized_pnl"] is None
+    assert payload["weekly_pnl"]["weekly_buy_notional"] is None
+    assert payload["weekly_pnl"]["weekly_sell_notional"] is None
+    assert payload["weekly_pnl"]["matched_sell_quantity"] is None
+    assert payload["weekly_pnl"]["calculation_status"] == "not_computed"
     assert payload["weekly_pnl"]["closed_symbols"] == []
     assert payload["daily_pnl"]["pnl_method"] == "fifo_internal_fills"
     assert payload["daily_pnl"]["daily_realized_pnl"] == "-11700.0000"

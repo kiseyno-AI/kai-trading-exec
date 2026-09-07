@@ -34,7 +34,10 @@ from app.services.risk_sizing import (
     resolve_risk_based_buy_quantity,
 )
 from app.services.market_regime_guardrails import market_regime_context_from_item_payloads
-from app.services.broker_order_state import active_local_broker_order_filters
+from app.services.broker_order_state import (
+    CAPITAL_RESERVING_ORDER_STATUSES,
+    active_local_broker_order_filters,
+)
 from app.services.runtime_controls import RUNTIME_CONTROL_ID, effective_automation_enabled
 
 SHORT_TERM_DECIDER_NAME = "short-term-decider"
@@ -49,14 +52,11 @@ EXEC_AGENT_DECISION_VERSION = "short-term-exec-agent-v1"
 LOGGER = logging.getLogger(__name__)
 OPENCLAW_EXEC_AGENT_ID = "exec-agent"
 OPENCLAW_EXEC_AGENT_MODEL = "openai-codex/gpt-5.5"
-OPEN_BUY_ORDER_STATUSES = frozenset(
+OPEN_BUY_ORDER_STATUSES = frozenset(CAPITAL_RESERVING_ORDER_STATUSES)
+UNCERTAIN_BUY_CAPITAL_STATUSES = frozenset(
     {
         "submission_pending",
-        "submitted",
-        "open",
-        "partially_filled",
-        "retry_pending",
-        "cancel_pending",
+        "manual_review_required",
     }
 )
 REJECTED_STATUS = "exec_agent_rejected"
@@ -354,6 +354,8 @@ class _AccountContext:
     snapshot_payload: dict[str, object] | None
     holdings_by_symbol: dict[str, int]
     open_orders: list[BrokerAccountOpenOrder]
+    unresolved_buy_reserved_notional: Decimal
+    unresolved_buy_reservation_complete: bool
 
 
 class _InvalidAgentContract(ValueError):
@@ -424,8 +426,8 @@ def apply_short_term_exec_agent_decisions(
     decisions: list[dict[str, object]] = []
     approved_count = 0
     rejected_count = 0
-    reserved_total_budget = Decimal("0")
-    reserved_cash_budget = Decimal("0")
+    reserved_total_budget = account_context.unresolved_buy_reserved_notional
+    reserved_cash_budget = account_context.unresolved_buy_reserved_notional
     reserved_daily_buy_notional = _load_daily_new_buy_notional(
         settings=settings,
         db=db,
@@ -556,13 +558,24 @@ def _load_account_context(
             position.quantity,
         )
 
+    local_open_orders = _load_local_open_orders(settings=settings, db=db)
+    unresolved_reserved_notional, unresolved_reservation_complete = (
+        _unresolved_local_buy_reservation(local_open_orders)
+    )
+    snapshot_payload = _serialize_account_snapshot(snapshot)
+    snapshot_payload["local_unresolved_buy_reservation"] = {
+        "reserved_notional": str(unresolved_reserved_notional),
+        "complete": unresolved_reservation_complete,
+    }
     return _AccountContext(
         available_cash=snapshot.available_cash,
         buying_power=snapshot.buying_power,
         observed_at=snapshot.observed_at,
-        snapshot_payload=_serialize_account_snapshot(snapshot),
+        snapshot_payload=snapshot_payload,
         holdings_by_symbol=holdings_by_symbol,
-        open_orders=[*snapshot.open_orders, *_load_local_open_orders(settings=settings, db=db)],
+        open_orders=[*snapshot.open_orders, *local_open_orders],
+        unresolved_buy_reserved_notional=unresolved_reserved_notional,
+        unresolved_buy_reservation_complete=unresolved_reservation_complete,
     )
 
 
@@ -582,6 +595,8 @@ def _unavailable_account_context(
         },
         holdings_by_symbol={},
         open_orders=[],
+        unresolved_buy_reserved_notional=Decimal("0"),
+        unresolved_buy_reservation_complete=True,
     )
 
 
@@ -609,24 +624,68 @@ def _load_local_open_orders(
             BrokerOrder.side == "buy",
         )
     ).all()
-    return [
-        BrokerAccountOpenOrder(
-            symbol=order.symbol,
-            side=order.side,
-            quantity=order.quantity,
-            remaining_quantity=order.quantity,
-            status=order.status,
-            broker_order_id=order.broker_order_id,
-            idempotency_key=order.idempotency_key,
-            limit_price=order.limit_price,
-            payload={
-                "source": "local_broker_orders",
-                "broker_order_pk": order.id,
-                "execution_plan_item_id": order.execution_plan_item_id,
-            },
+    normalized_orders: list[BrokerAccountOpenOrder] = []
+    for order in orders:
+        reserved_notional = _broker_order_reserved_notional(order)
+        normalized_orders.append(
+            BrokerAccountOpenOrder(
+                symbol=order.symbol,
+                side=order.side,
+                quantity=order.quantity or 0,
+                remaining_quantity=order.quantity or 0,
+                status=order.status,
+                broker_order_id=order.broker_order_id,
+                idempotency_key=order.idempotency_key,
+                limit_price=order.limit_price,
+                payload={
+                    "source": "local_broker_orders",
+                    "broker_order_pk": order.id,
+                    "execution_plan_item_id": order.execution_plan_item_id,
+                    "capital_truth_uncertain": order.status
+                    in UNCERTAIN_BUY_CAPITAL_STATUSES,
+                    "reserved_notional": (
+                        str(reserved_notional) if reserved_notional is not None else None
+                    ),
+                },
+            )
         )
-        for order in orders
-    ]
+    return normalized_orders
+
+
+def _broker_order_reserved_notional(order: BrokerOrder) -> Decimal | None:
+    quote_notional = _parse_positive_decimal(order.quote_notional)
+    if quote_notional is not None:
+        return quote_notional
+
+    limit_price = _parse_positive_decimal(order.limit_price)
+    base_quantity = _parse_positive_decimal(order.base_quantity)
+    if limit_price is not None and base_quantity is not None:
+        return limit_price * base_quantity
+    quantity = _parse_positive_decimal(order.quantity)
+    if limit_price is not None and quantity is not None:
+        return limit_price * quantity
+    if order.plan_item is not None:
+        approved_notional = _approved_notional_from_item(order.plan_item)
+        if approved_notional > 0:
+            return approved_notional
+    return None
+
+
+def _unresolved_local_buy_reservation(
+    orders: list[BrokerAccountOpenOrder],
+) -> tuple[Decimal, bool]:
+    total = Decimal("0")
+    complete = True
+    for order in orders:
+        payload = order.payload if isinstance(order.payload, dict) else {}
+        if not payload.get("capital_truth_uncertain"):
+            continue
+        reserved_notional = _parse_positive_decimal(payload.get("reserved_notional"))
+        if reserved_notional is None:
+            complete = False
+            continue
+        total += reserved_notional
+    return total, complete
 
 
 def _load_daily_new_buy_notional(
@@ -637,6 +696,25 @@ def _load_daily_new_buy_notional(
 ) -> Decimal:
     if market_date is None:
         return Decimal("0")
+    uncertain_orders = db.scalars(
+        select(BrokerOrder)
+        .join(
+            ExecutionPlanItem,
+            BrokerOrder.execution_plan_item_id == ExecutionPlanItem.id,
+        )
+        .join(ExecutionPlan, ExecutionPlanItem.execution_plan_id == ExecutionPlan.id)
+        .where(
+            ExecutionPlan.mode == settings.runtime_mode,
+            ExecutionPlan.market_date == market_date,
+            BrokerOrder.side == "buy",
+            BrokerOrder.status.in_(tuple(UNCERTAIN_BUY_CAPITAL_STATUSES)),
+        )
+    ).all()
+    uncertain_item_ids = {
+        order.execution_plan_item_id
+        for order in uncertain_orders
+        if order.execution_plan_item_id is not None
+    }
     items = db.scalars(
         select(ExecutionPlanItem)
         .join(ExecutionPlanItem.plan)
@@ -664,7 +742,13 @@ def _load_daily_new_buy_notional(
     ).all()
     total = Decimal("0")
     for item in items:
+        if item.id in uncertain_item_ids:
+            continue
         total += _approved_notional_from_item(item)
+    for order in uncertain_orders:
+        reserved_notional = _broker_order_reserved_notional(order)
+        if reserved_notional is not None:
+            total += reserved_notional
     return total
 
 
@@ -784,6 +868,16 @@ def _decide_candidate(
             base,
             "unsupported_entry_trigger",
             "short-term exec agent does not support trigger buy semantics",
+            agent_contract=agent_contract,
+        )
+    if (
+        settings.runtime_mode == "live"
+        and not account_context.unresolved_buy_reservation_complete
+    ):
+        return _reject(
+            base,
+            "unresolved_buy_notional_unknown",
+            "an earlier buy submission has unknown broker outcome and no defensible capital reservation",
             agent_contract=agent_contract,
         )
     available_cash = account_context.available_cash
@@ -2405,7 +2499,16 @@ def _has_duplicate_open_buy_order(
     source_identity = serialize_plan_item_source_identity(item)
     source_candidate_id = source_identity.get("source_plan_item_id")
     for order in open_orders:
-        if order.side != "buy" or order.remaining_quantity <= 0:
+        if order.side != "buy":
+            continue
+        payload = order.payload if isinstance(order.payload, dict) else {}
+        if (
+            order.symbol == item.symbol
+            and payload.get("capital_truth_uncertain") is True
+        ):
+            return True
+        remaining_quantity = order.remaining_quantity or order.quantity
+        if remaining_quantity is not None and remaining_quantity <= 0:
             continue
         if order.idempotency_key == idempotency_key:
             return True

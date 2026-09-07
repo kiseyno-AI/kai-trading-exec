@@ -4,6 +4,8 @@ import threading
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
+import pytest
+
 from app.api.schemas.execution import MonitoringPriceRequest
 from app.core.config import Settings
 from app.db.base import Base
@@ -25,20 +27,30 @@ def test_krx_symbol_filter_excludes_alpaca_symbols() -> None:
     assert _is_krx_symbol("FRTX/CVR1") is False
 
 
-def test_monitoring_symbol_batches_keep_positions_and_rotate_all_candidates() -> None:
-    desired = ["030000", "001450", "002990", "003300", "003550", "003650", "005830"]
+def test_monitoring_symbol_batches_keep_all_positions_and_cap_only_rotating_candidates() -> None:
+    desired = [
+        "030000",
+        "001450",
+        "002990",
+        "003300",
+        "003550",
+        "003650",
+        "005830",
+        "006000",
+        "006100",
+    ]
     cursor = 0
     covered: set[str] = set()
 
-    for _ in range(2):
+    for _ in range(3):
         batch, cursor = _select_monitoring_symbol_batch(
             desired_symbols=desired,
-            priority_symbols={"030000"},
-            batch_size=4,
+            priority_symbols={"030000", "001450"},
+            batch_size=3,
             cursor=cursor,
         )
-        assert batch[0] == "030000"
-        assert len(batch) == 4
+        assert batch[:2] == ["030000", "001450"]
+        assert len(batch) == 5
         covered.update(batch)
 
     assert covered == set(desired)
@@ -66,7 +78,7 @@ def test_monitoring_cycle_does_not_mix_core_universe_into_active_local_work(
     monkeypatch.setattr(
         coordinator,
         "_load_local_desired_monitoring_symbols",
-        lambda: ["005930", "000660"],
+        lambda: ["005930", "AAPL"],
     )
     monkeypatch.setattr(coordinator, "_load_local_position_symbols", lambda: [])
     monkeypatch.setattr(
@@ -78,7 +90,7 @@ def test_monitoring_cycle_does_not_mix_core_universe_into_active_local_work(
 
     coordinator._monitoring_cycle_sync(datetime(2026, 8, 26, 1, 0, tzinfo=UTC))
 
-    assert requested == ["005930", "000660"]
+    assert requested == ["005930", "AAPL"]
 
 
 def test_monitoring_timeout_does_not_block_next_scheduler_tick() -> None:
@@ -543,6 +555,56 @@ def test_non_broker_snapshot_refresh_does_not_suppress_future_position_reconcili
     assert coordinator._monitoring_snapshot_last_reconciled_at is None
 
 
+def test_live_monitoring_cycle_fails_closed_and_retries_after_position_sync_failure(
+    monkeypatch,
+) -> None:
+    settings = Settings(database_url="sqlite:///:memory:", runtime_mode="live")
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    coordinator = AutonomousRuntimeCoordinator(
+        settings=settings,
+        session_factory=session_factory,
+        broker_adapter_factory=lambda settings: object(),  # type: ignore[arg-type,return-value]
+    )
+    started_at = datetime(2026, 8, 24, 0, 0, tzinfo=UTC)
+    stale_reconciled_at = started_at - timedelta(hours=1)
+    snapshot = MonitoringRuntimeSnapshot(
+        loaded_at=started_at,
+        symbols=["005930"],
+        positions_by_symbol={
+            "005930": CachedMonitoringPosition(symbol="005930", quantity=7)
+        },
+        items=[],
+        filled_today_symbols=[],
+    )
+    sync_attempts: list[datetime] = []
+
+    def fail_position_sync(**kwargs) -> None:
+        del kwargs
+        sync_attempts.append(started_at)
+        raise RuntimeError("broker snapshot unavailable")
+
+    coordinator._monitoring_snapshot_last_reconciled_at = stale_reconciled_at
+    monkeypatch.setattr(
+        "app.services.autonomous_runtime._sync_positions_for_monitoring_routes",
+        fail_position_sync,
+    )
+    monkeypatch.setattr(coordinator, "_load_monitoring_runtime_snapshot", lambda now: snapshot)
+
+    with pytest.raises(RuntimeError, match="live broker position reconciliation failed"):
+        coordinator._monitoring_cycle_sync(started_at)
+
+    assert coordinator._monitoring_snapshot_last_reconciled_at == stale_reconciled_at
+
+    with pytest.raises(RuntimeError, match="live broker position reconciliation failed"):
+        coordinator._monitoring_cycle_sync(started_at + timedelta(seconds=1))
+
+    assert coordinator._monitoring_snapshot_last_reconciled_at == stale_reconciled_at
+    assert len(sync_attempts) == 2
+    engine.dispose()
+
+
 def test_local_desired_symbols_fall_back_to_orm_when_sqlite_fast_path_is_unavailable(
     tmp_path,
     monkeypatch,
@@ -593,6 +655,116 @@ def test_local_desired_symbols_fall_back_to_orm_when_sqlite_fast_path_is_unavail
         assert coordinator._load_local_desired_monitoring_symbols() == ["005930"]
     finally:
         engine.dispose()
+
+
+def test_orm_monitoring_symbols_include_kis_us_and_exclude_alpaca() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        monitoring_max_symbols_per_cycle=8,
+        monitoring_expire_prior_market_watch_buys_enabled=False,
+        kis_us_trading_enabled=True,
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    coordinator = AutonomousRuntimeCoordinator(
+        settings=settings,
+        session_factory=session_factory,
+        broker_adapter_factory=lambda settings: None,  # type: ignore[arg-type,return-value]
+    )
+    with session_factory() as session:
+        session.add(
+            ExecutionPlan(
+                external_plan_id="mixed-provider-monitoring-symbols",
+                source="test",
+                market_date=date(2026, 8, 14),
+                mode="paper",
+                status="accepted",
+                items=[
+                    ExecutionPlanItem(
+                        plan_item_index=0,
+                        symbol="005930",
+                        side="buy",
+                        intent="intraday_watch_buy",
+                        status="watch_monitoring_active",
+                    ),
+                    ExecutionPlanItem(
+                        plan_item_index=1,
+                        symbol="AAPL",
+                        side="buy",
+                        intent="intraday_watch_buy",
+                        status="watch_monitoring_active",
+                        provider="kis",
+                        venue="kis",
+                        asset_class="us_equity",
+                        risk_context={"exchange": "NASD"},
+                    ),
+                    ExecutionPlanItem(
+                        plan_item_index=2,
+                        symbol="MSFT",
+                        side="buy",
+                        intent="intraday_watch_buy",
+                        status="watch_monitoring_active",
+                        provider="alpaca",
+                        venue="alpaca",
+                        asset_class="us_equity",
+                        risk_context={"exchange": "NASD"},
+                    ),
+                ],
+            )
+        )
+        session.add(
+            ExecutionPosition(
+                mode="paper",
+                symbol="AAPL",
+                quantity=2,
+                average_price=Decimal("200"),
+                updated_from="reconciliation",
+                raw_payload={
+                    "_position_sync": {
+                        "asset_class": "us_equity",
+                        "exchange": "NASD",
+                        "monitoring_eligible": True,
+                    }
+                },
+            )
+        )
+        session.commit()
+
+    assert set(coordinator._load_local_desired_monitoring_symbols()) == {"005930", "AAPL"}
+    engine.dispose()
+
+
+def test_live_snapshot_refresh_discovers_enabled_kis_us_holdings(monkeypatch) -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="live",
+        kis_us_trading_enabled=True,
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    coordinator = AutonomousRuntimeCoordinator(
+        settings=settings,
+        session_factory=session_factory,
+        broker_adapter_factory=lambda settings: object(),  # type: ignore[return-value]
+    )
+    calls: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        "app.services.autonomous_runtime._sync_positions_for_monitoring_routes",
+        lambda **kwargs: calls.append(kwargs),
+    )
+
+    coordinator._refresh_monitoring_runtime_snapshot(
+        loaded_at=datetime(2026, 8, 26, 1, 0, tzinfo=UTC),
+        reason="test",
+        reconcile_broker=True,
+    )
+
+    assert calls[0]["discover_krx_holdings"] is True
+    assert calls[0]["discover_us_holdings"] is True
+    engine.dispose()
 
 
 def test_local_position_symbols_fall_back_to_orm_when_sqlite_fast_path_is_unavailable(

@@ -34,6 +34,14 @@ from app.services.fill_idempotency import (
     execution_fill_dedupe_key,
     execution_fill_idempotency_key,
 )
+from app.services.fill_economics import (
+    COST_COVERAGE_COMPLETE,
+    COST_COVERAGE_UNKNOWN,
+    FillEconomics,
+    economics_payload,
+    execution_fill_economics,
+    normalize_fill_economics,
+)
 from app.services.execution_failures import (
     record_actionable_execution_failure,
     resolve_execution_failure_for_order,
@@ -1607,6 +1615,13 @@ def _order_reconciliation_exchange(order: BrokerOrder) -> str:
         exchange = _exchange_from_payload(order.plan_item.risk_context)
         if exchange is not None:
             return exchange
+    venue_exchange = _normalized_exchange(order.venue)
+    if venue_exchange is not None:
+        return venue_exchange
+    if str(order.asset_class or "").strip().lower() == "us_equity":
+        raise ValueError(
+            "US-equity reconciliation requires an explicit NASD, NYSE, or AMEX exchange"
+        )
     return "KRX"
 
 
@@ -1640,7 +1655,19 @@ def _normalized_exchange(value: object) -> str | None:
     if not isinstance(value, str):
         return None
     normalized = value.strip().upper()
-    if normalized in {"KRX", "NXT", "SOR", "UPBIT", "ALPACA", "US"}:
+    if normalized == "NASDAQ":
+        normalized = "NASD"
+    if normalized in {
+        "KRX",
+        "NXT",
+        "SOR",
+        "UPBIT",
+        "ALPACA",
+        "US",
+        "NASD",
+        "NYSE",
+        "AMEX",
+    }:
         return normalized
     return None
 
@@ -1660,6 +1687,7 @@ def _parse_fills_from_payload(
     fills_payload = payload.get("fills")
     if isinstance(fills_payload, list) and fills_payload:
         result: list[dict[str, object]] = []
+        inherited_cost_scope = _transaction_cost_scope(payload)
         for fill_item in fills_payload:
             if not isinstance(fill_item, dict):
                 continue
@@ -1667,6 +1695,7 @@ def _parse_fills_from_payload(
                 fill_item=fill_item,
                 observed_at=observed_at,
                 order=order,
+                inherited_transaction_cost_scope=inherited_cost_scope,
             )
             if parsed_fill is None:
                 continue
@@ -1689,6 +1718,8 @@ def _parse_fills_from_payload(
             quantity_basis="base_quantity",
             existing_fills=existing_fills,
         )
+        if delta_result["status"] == "noop":
+            return _cumulative_cost_revision_rows(payload=payload, order=order), []
         if delta_result["status"] != "ok":
             anomalies = delta_result["anomalies"]
             return [], anomalies if isinstance(anomalies, list) else []
@@ -1698,6 +1729,9 @@ def _parse_fills_from_payload(
         filled_at = _parse_timestamp(payload.get("filled_at"), fallback=observed_at)
         broker_fill_id = _optional_str(payload.get("broker_fill_id")) or (
             f"{order.broker_order_id}:cumulative:{format(total_filled_base.normalize(), 'f')}"
+        )
+        economics = economics_payload(
+            _cumulative_fill_economics(payload=payload, order=order)
         )
         return [{
             "broker_fill_id": broker_fill_id,
@@ -1714,6 +1748,7 @@ def _parse_fills_from_payload(
             "cumulative_quote_notional": delta_result["current_cumulative_notional"],
             "previous_base_quantity": existing_total_base,
             "previous_quote_notional": delta_result["previous_cumulative_notional"],
+            **economics,
         }], []
 
     total_filled = _parse_int(payload.get("filled_quantity"))
@@ -1730,6 +1765,8 @@ def _parse_fills_from_payload(
         quantity_basis="quantity",
         existing_fills=existing_fills,
     )
+    if delta_result["status"] == "noop":
+        return _cumulative_cost_revision_rows(payload=payload, order=order), []
     if delta_result["status"] != "ok":
         anomalies = delta_result["anomalies"]
         return [], anomalies if isinstance(anomalies, list) else []
@@ -1737,6 +1774,9 @@ def _parse_fills_from_payload(
     filled_at = _parse_timestamp(
         payload.get("filled_at"),
         fallback=observed_at,
+    )
+    economics = economics_payload(
+        _cumulative_fill_economics(payload=payload, order=order)
     )
     return [
         {
@@ -1753,8 +1793,187 @@ def _parse_fills_from_payload(
             "cumulative_quote_notional": delta_result["current_cumulative_notional"],
             "previous_quantity": existing_total,
             "previous_quote_notional": delta_result["previous_cumulative_notional"],
+            **economics,
         }
     ], []
+
+
+def _cumulative_fill_economics(
+    *,
+    payload: dict[str, object],
+    order: BrokerOrder,
+) -> FillEconomics:
+    economics = normalize_fill_economics(payload, order=order)
+    if economics.transaction_cost is None:
+        return economics
+
+    scope = _transaction_cost_scope(payload)
+    if scope in {"incremental", "per_fill"}:
+        return economics
+    if scope != "cumulative":
+        return FillEconomics(
+            settlement_currency=economics.settlement_currency,
+            transaction_cost=None,
+            transaction_cost_coverage=COST_COVERAGE_UNKNOWN,
+            transaction_cost_source="broker_payload:ambiguous_cumulative_cost_scope",
+            settlement_currency_conflict=economics.settlement_currency_conflict,
+        )
+
+    existing_cost = Decimal("0")
+    for fill in order.fills:
+        persisted_economics = execution_fill_economics(fill)
+        if (
+            persisted_economics.transaction_cost is None
+            or persisted_economics.transaction_cost_coverage != COST_COVERAGE_COMPLETE
+        ):
+            return FillEconomics(
+                settlement_currency=economics.settlement_currency,
+                transaction_cost=None,
+                transaction_cost_coverage=COST_COVERAGE_UNKNOWN,
+                transaction_cost_source="broker_payload:cumulative_cost_delta_unavailable",
+                settlement_currency_conflict=economics.settlement_currency_conflict,
+            )
+        existing_cost += persisted_economics.transaction_cost
+    incremental_cost = economics.transaction_cost - existing_cost
+    if incremental_cost < 0:
+        return FillEconomics(
+            settlement_currency=economics.settlement_currency,
+            transaction_cost=None,
+            transaction_cost_coverage=COST_COVERAGE_UNKNOWN,
+            transaction_cost_source="broker_payload:cumulative_cost_regressed",
+            settlement_currency_conflict=economics.settlement_currency_conflict,
+        )
+    return FillEconomics(
+        settlement_currency=economics.settlement_currency,
+        transaction_cost=incremental_cost,
+        transaction_cost_coverage=economics.transaction_cost_coverage,
+        transaction_cost_source="broker_payload:cumulative_cost_delta",
+        settlement_currency_conflict=economics.settlement_currency_conflict,
+    )
+
+
+def _transaction_cost_scope(payload: object) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    economics = payload.get("economics")
+    if isinstance(economics, dict) and "transaction_cost_scope" in economics:
+        raw_scope = economics.get("transaction_cost_scope")
+    else:
+        raw_scope = payload.get("transaction_cost_scope")
+    return str(raw_scope or "").strip().lower()
+
+
+def _transaction_cost_is_authoritative(payload: object) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    economics = payload.get("economics")
+    if isinstance(economics, dict) and "transaction_cost_authoritative" in economics:
+        return economics.get("transaction_cost_authoritative") is True
+    return payload.get("transaction_cost_authoritative") is True
+
+
+def _cumulative_cost_revision_rows(
+    *,
+    payload: dict[str, object],
+    order: BrokerOrder,
+) -> list[dict[str, object]]:
+    """Return an existing fill identity with a safely revised cumulative cost.
+
+    Quantity no-op snapshots can still finalize broker costs. With multiple
+    persisted fills, a revision is allocatable only when all prior costs are
+    complete; the cumulative delta is assigned to the latest fill. A lone fill
+    can safely receive the broker's full cumulative total.
+    """
+
+    economics = normalize_fill_economics(payload, order=order)
+    if (
+        _transaction_cost_scope(payload) != "cumulative"
+        or economics.transaction_cost is None
+        or economics.transaction_cost_coverage != COST_COVERAGE_COMPLETE
+        or not order.fills
+    ):
+        return []
+
+    fills = sorted(
+        order.fills,
+        key=lambda fill: (
+            _parse_timestamp(fill.filled_at, fallback=_observation_time()),
+            str(fill.id or ""),
+        ),
+    )
+    persisted_costs: list[Decimal] = []
+    for fill in fills:
+        persisted = execution_fill_economics(fill)
+        if (
+            persisted.transaction_cost is None
+            or persisted.transaction_cost_coverage != COST_COVERAGE_COMPLETE
+        ):
+            return []
+        persisted_costs.append(persisted.transaction_cost)
+
+    existing_total = sum(persisted_costs, Decimal("0"))
+    target_total = economics.transaction_cost
+    revised_costs = list(persisted_costs)
+    source = "broker_payload:cumulative_cost_revision"
+    if target_total < existing_total:
+        if (
+            not _transaction_cost_is_authoritative(payload)
+            or _normalize_status(payload.get("status"))
+            != NormalizedBrokerOrderStatus.FILLED.value
+        ):
+            return []
+        # Final settlement may correct a provisional fee downward. The broker only
+        # gives a cumulative total, so reduce newest fills first while preserving
+        # non-negative per-fill costs and the exact authoritative total.
+        remaining_reduction = existing_total - target_total
+        for index in range(len(revised_costs) - 1, -1, -1):
+            reduction = min(revised_costs[index], remaining_reduction)
+            revised_costs[index] -= reduction
+            remaining_reduction -= reduction
+            if remaining_reduction == 0:
+                break
+        if remaining_reduction != 0:
+            return []
+        source = "broker_payload:authoritative_cumulative_cost_revision"
+    else:
+        revised_costs[-1] += target_total - existing_total
+
+    rows: list[dict[str, object]] = []
+    for fill, previous_cost, revised_cost in zip(
+        fills,
+        persisted_costs,
+        revised_costs,
+        strict=True,
+    ):
+        if revised_cost == previous_cost:
+            continue
+        rows.append(
+            {
+                "broker_fill_id": fill.broker_fill_id,
+                "quantity": fill.quantity,
+                "base_quantity": fill.base_quantity,
+                "quote_notional": fill.quote_notional,
+                "price": fill.price,
+                "filled_at": _parse_timestamp(
+                    fill.filled_at,
+                    fallback=_observation_time(),
+                ).isoformat(),
+                "symbol": fill.symbol,
+                "side": fill.side,
+                **economics_payload(
+                    FillEconomics(
+                        settlement_currency=economics.settlement_currency,
+                        transaction_cost=revised_cost,
+                        transaction_cost_coverage=COST_COVERAGE_COMPLETE,
+                        transaction_cost_source=source,
+                        settlement_currency_conflict=(
+                            economics.settlement_currency_conflict
+                        ),
+                    )
+                ),
+            }
+        )
+    return rows
 
 
 def _sum_fill_quantities(fills: list[ExecutionFill]) -> int:
@@ -1887,6 +2106,7 @@ def _normalize_fill_payload(
     fill_item: dict[str, object],
     observed_at: datetime,
     order: BrokerOrder,
+    inherited_transaction_cost_scope: str = "",
 ) -> dict[str, object] | None:
     quantity = _parse_int(fill_item.get("quantity")) or 0
     base_quantity = _parse_decimal(fill_item.get("base_quantity"))
@@ -1899,6 +2119,18 @@ def _normalize_fill_payload(
         fill_item.get("filled_at"),
         fallback=observed_at,
     )
+    economics = normalize_fill_economics(fill_item, order=order)
+    cost_scope = _transaction_cost_scope(fill_item) or inherited_transaction_cost_scope
+    if economics.transaction_cost is not None and cost_scope == "cumulative":
+        economics = FillEconomics(
+            settlement_currency=economics.settlement_currency,
+            transaction_cost=None,
+            transaction_cost_coverage=COST_COVERAGE_UNKNOWN,
+            transaction_cost_source=(
+                "broker_payload:ambiguous_explicit_fill_cumulative_cost_scope"
+            ),
+            settlement_currency_conflict=economics.settlement_currency_conflict,
+        )
     return {
         "broker_fill_id": _optional_str(fill_item.get("broker_fill_id")),
         "quantity": quantity,
@@ -1908,6 +2140,7 @@ def _normalize_fill_payload(
         "filled_at": filled_at.isoformat(),
         "symbol": _optional_str(fill_item.get("symbol")) or order.symbol,
         "side": _optional_str(fill_item.get("side")) or order.side,
+        **economics_payload(economics),
     }
 
 
@@ -1920,38 +2153,111 @@ def _upsert_order_fills(
     existing_fill_rows = db.scalars(
         select(ExecutionFill).where(ExecutionFill.broker_order_pk == order.id)
     ).all()
-    existing_fill_keys = {
-        execution_fill_dedupe_key(fill)
-        for fill in existing_fill_rows
+    existing_fills_by_key = {
+        execution_fill_dedupe_key(fill): fill for fill in existing_fill_rows
     }
 
     added = 0
     for fill in fills:
         fill_signature = _fill_signature_candidate(order=order, fill=fill)
-        if fill_signature is None or fill_signature in existing_fill_keys:
+        if fill_signature is None:
+            continue
+        existing_fill = existing_fills_by_key.get(fill_signature)
+        if existing_fill is not None:
+            _enrich_existing_fill_economics(existing=existing_fill, incoming=fill)
             continue
 
-        db.add(
-            ExecutionFill(
-                idempotency_key=fill_signature,
-                broker_order_pk=order.id,
-                broker_fill_id=_optional_str(fill.get("broker_fill_id")),
-                symbol=str(fill["symbol"]),
-                side=str(fill["side"]),
-                quantity=int(fill["quantity"]),
-                base_quantity=_parse_decimal(fill.get("base_quantity")),
-                quote_notional=_parse_decimal(fill.get("quote_notional")),
-                price=_coerce_decimal(fill["price"]),
-                filled_at=_parse_timestamp(
-                    fill["filled_at"],
-                    fallback=_observation_time(),
-                ),
-                payload=_copy_payload(fill),
-            )
+        new_fill = ExecutionFill(
+            idempotency_key=fill_signature,
+            broker_order_pk=order.id,
+            broker_fill_id=_optional_str(fill.get("broker_fill_id")),
+            symbol=str(fill["symbol"]),
+            side=str(fill["side"]),
+            quantity=int(fill["quantity"]),
+            base_quantity=_parse_decimal(fill.get("base_quantity")),
+            quote_notional=_parse_decimal(fill.get("quote_notional")),
+            price=_coerce_decimal(fill["price"]),
+            settlement_currency=_optional_str(fill.get("settlement_currency")),
+            transaction_cost=_parse_decimal(fill.get("transaction_cost")),
+            transaction_cost_coverage=_optional_str(
+                fill.get("transaction_cost_coverage")
+            ),
+            transaction_cost_source=_optional_str(fill.get("transaction_cost_source")),
+            filled_at=_parse_timestamp(
+                fill["filled_at"],
+                fallback=_observation_time(),
+            ),
+            payload=_copy_payload(fill),
         )
+        db.add(new_fill)
         added += 1
-        existing_fill_keys.add(fill_signature)
+        existing_fills_by_key[fill_signature] = new_fill
     return added
+
+
+def _enrich_existing_fill_economics(
+    *,
+    existing: ExecutionFill,
+    incoming: dict[str, object],
+) -> None:
+    """Monotonically enrich economics without duplicating an execution fill."""
+
+    existing_payload = dict(existing.payload) if isinstance(existing.payload, dict) else {}
+    existing_currency_conflict = (
+        existing_payload.get("settlement_currency_conflict") is True
+    )
+    incoming_currency_conflict = incoming.get("settlement_currency_conflict") is True
+    incoming_currency = _optional_str(incoming.get("settlement_currency"))
+    existing_currency = _optional_str(existing.settlement_currency)
+    if incoming_currency_conflict:
+        existing.settlement_currency = None
+        existing_payload["settlement_currency_conflict"] = True
+    elif not existing_currency_conflict and incoming_currency is not None:
+        if existing_currency is None:
+            existing.settlement_currency = incoming_currency
+        elif existing_currency.upper() != incoming_currency.upper():
+            existing.settlement_currency = None
+            existing_payload["settlement_currency_conflict"] = True
+
+    incoming_cost = _parse_decimal(incoming.get("transaction_cost"))
+    incoming_coverage = _optional_str(incoming.get("transaction_cost_coverage"))
+    incoming_source = _optional_str(incoming.get("transaction_cost_source"))
+    persisted = execution_fill_economics(existing)
+    should_update_cost = False
+    if incoming_cost is not None and incoming_cost >= 0 and incoming_source is not None:
+        if incoming_coverage == COST_COVERAGE_COMPLETE:
+            should_update_cost = (
+                persisted.transaction_cost_coverage != COST_COVERAGE_COMPLETE
+                or persisted.transaction_cost is None
+                or incoming_cost >= persisted.transaction_cost
+                or incoming_source
+                == "broker_payload:authoritative_cumulative_cost_revision"
+            )
+        elif (
+            incoming_coverage == "partial"
+            and persisted.transaction_cost_coverage == COST_COVERAGE_UNKNOWN
+        ):
+            should_update_cost = True
+    if should_update_cost:
+        existing.transaction_cost = incoming_cost
+        existing.transaction_cost_coverage = incoming_coverage
+        existing.transaction_cost_source = incoming_source
+
+    if (
+        incoming_currency_conflict
+        or incoming_currency is not None
+        or should_update_cost
+    ):
+        existing_payload["economics_revision"] = _copy_payload(
+            {
+                "settlement_currency": incoming_currency,
+                "settlement_currency_conflict": incoming_currency_conflict,
+                "transaction_cost": incoming_cost,
+                "transaction_cost_coverage": incoming_coverage,
+                "transaction_cost_source": incoming_source,
+            }
+        )
+        existing.payload = existing_payload
 
 
 def _fill_signature_candidate(

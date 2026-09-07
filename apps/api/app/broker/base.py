@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal
 from enum import StrEnum
 from typing import Any, Protocol
@@ -146,7 +146,7 @@ class BrokerSymbolBuyingPower:
 @dataclass(frozen=True)
 class BrokerAccountSnapshot:
     available_cash: Decimal | None = None
-    observed_at: datetime = field(default_factory=datetime.utcnow)
+    observed_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     source: str = "compat:unknown"
     buying_power: Decimal | None = None
     total_asset_value: Decimal | None = None

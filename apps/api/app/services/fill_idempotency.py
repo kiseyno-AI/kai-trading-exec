@@ -42,8 +42,16 @@ def execution_fill_idempotency_key(
 def execution_fill_dedupe_key(fill: ExecutionFill) -> str:
     if fill.idempotency_key:
         return fill.idempotency_key
+    broker_order_pk = fill.broker_order_pk
+    if not broker_order_pk and fill.broker_order is not None:
+        broker_order_pk = fill.broker_order.id
+    if not broker_order_pk:
+        # A transient fill without an order identity cannot be compared safely
+        # with fills from another transient order. Keep its scope unique rather
+        # than collapsing unrelated broker evidence under a shared None key.
+        broker_order_pk = f"unpersisted:{fill.id or id(fill)}"
     return execution_fill_idempotency_key(
-        broker_order_pk=fill.broker_order_pk,
+        broker_order_pk=str(broker_order_pk),
         broker_fill_id=fill.broker_fill_id,
         symbol=fill.symbol,
         side=fill.side,
@@ -84,20 +92,93 @@ def dedupe_execution_fills(fills: list[ExecutionFill]) -> list[ExecutionFill]:
 
 
 def duplicate_fill_economic_conflict(fills: list[ExecutionFill]) -> bool:
-    signatures = {
+    return bool(duplicate_fill_conflicting_fields(fills))
+
+
+def duplicate_fill_conflicting_fields(fills: list[ExecutionFill]) -> list[str]:
+    """Return every persisted fact that disagrees inside one fill identity.
+
+    Duplicate broker identities are safe to collapse only when both the trade
+    and its economics agree.  Choosing one currency, fee, coverage state, or
+    provenance would silently manufacture P/L evidence, so readers exclude the
+    whole group and remediation records it for manual review instead.
+    """
+
+    field_values = (
+        ("quantity", {int(fill.quantity) for fill in fills}),
         (
-            int(fill.quantity),
-            _optional_decimal_key(
-                Decimal(fill.base_quantity) if fill.base_quantity is not None else None
-            ),
-            _decimal_key(Decimal(fill.price)),
-            _optional_decimal_key(
-                Decimal(fill.quote_notional) if fill.quote_notional is not None else None
-            ),
+            "base_quantity",
+            {
+                _optional_decimal_key(
+                    Decimal(fill.base_quantity)
+                    if fill.base_quantity is not None
+                    else None
+                )
+                for fill in fills
+            },
+        ),
+        (
+            "quote_notional",
+            {
+                _optional_decimal_key(
+                    Decimal(fill.quote_notional)
+                    if fill.quote_notional is not None
+                    else None
+                )
+                for fill in fills
+            },
+        ),
+        ("price", {_decimal_key(Decimal(fill.price)) for fill in fills}),
+        (
+            "settlement_currency",
+            {
+                str(fill.settlement_currency or "").strip().upper()
+                for fill in fills
+            },
+        ),
+        (
+            "transaction_cost",
+            {
+                _optional_decimal_key(
+                    Decimal(fill.transaction_cost)
+                    if fill.transaction_cost is not None
+                    else None
+                )
+                for fill in fills
+            },
+        ),
+        (
+            "transaction_cost_coverage",
+            {
+                str(fill.transaction_cost_coverage or "unknown").strip().lower()
+                for fill in fills
+            },
+        ),
+        (
+            "transaction_cost_source",
+            {
+                str(fill.transaction_cost_source or "").strip()
+                for fill in fills
+            },
+        ),
+        (
+            "settlement_currency_conflict",
+            {_stored_currency_conflict(fill) for fill in fills},
+        ),
+    )
+    return [name for name, values in field_values if len(values) > 1]
+
+
+def _stored_currency_conflict(fill: ExecutionFill) -> bool:
+    payload = fill.payload if isinstance(fill.payload, dict) else {}
+    nested = payload.get("economics")
+    return bool(
+        payload.get("settlement_currency_conflict") is True
+        or (
+            isinstance(nested, dict)
+            and nested.get("settlement_currency_conflict") is True
         )
-        for fill in fills
-    }
-    return len(signatures) > 1
+    )
 
 
 def _timestamp_key(value: datetime) -> str:

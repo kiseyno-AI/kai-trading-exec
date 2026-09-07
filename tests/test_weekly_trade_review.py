@@ -37,6 +37,16 @@ def _build_db(settings: Settings):
     return engine, create_session_factory(engine)()
 
 
+def _assert_mapping_contains(actual: object, expected: dict[str, object]) -> None:
+    assert isinstance(actual, dict)
+    for key, expected_value in expected.items():
+        assert key in actual
+        if isinstance(expected_value, dict):
+            _assert_mapping_contains(actual[key], expected_value)
+        else:
+            assert actual[key] == expected_value
+
+
 def test_weekly_trade_review_exports_bounded_read_only_artifact(tmp_path) -> None:
     settings = Settings(
         database_url="sqlite:///:memory:",
@@ -93,7 +103,7 @@ def test_weekly_trade_review_exports_bounded_read_only_artifact(tmp_path) -> Non
     assert report["closed_trades"][0]["realized_pnl"] == "-1800.0000"
     assert report["realized_pnl_coverage"]["status"] == "complete"
     assert report["realized_pnl_coverage"]["truncated"] is False
-    assert report["realized_pnl_summary"] == {
+    _assert_mapping_contains(report["realized_pnl_summary"], {
         "status": "complete",
         "sell_fill_count": 1,
         "covered_sell_fill_count": 1,
@@ -124,7 +134,14 @@ def test_weekly_trade_review_exports_bounded_read_only_artifact(tmp_path) -> Non
             "realized_pnl": "-1800.0000",
             "return_pct": "-16.6667",
         },
+    })
+    assert report["realized_pnl_summary"]["gross_realized_pnl_by_currency"] == {
+        "KRW": "-1800.0000"
     }
+    assert report["realized_pnl_summary"]["net_realized_pnl_by_currency"] == {
+        "KRW": None
+    }
+    assert report["realized_pnl_summary"]["transaction_cost_coverage"] == "unknown"
     assert report["stale_fifo_inventory_alerts"][0]["symbol"] == "049430"
     assert report["stale_fifo_inventory_alerts"][0]["fifo_open_quantity"] == 39
     assert report["linked_broker_orders"][0]["id"] == "weekly-order"
@@ -215,11 +232,12 @@ def test_weekly_trade_review_exports_bounded_read_only_artifact(tmp_path) -> Non
     engine.dispose()
 
 
-def test_weekly_active_order_summary_matches_runtime_actionable_semantics() -> None:
+def test_weekly_active_order_summary_matches_runtime_actionable_semantics(tmp_path) -> None:
     settings = Settings(
         database_url="sqlite:///:memory:",
         runtime_mode="paper",
         stale_broker_order_reconciliation_threshold_seconds=3600,
+        weekly_trade_review_dir=str(tmp_path),
     )
     engine, db = _build_db(settings)
     reference_at = datetime.now(UTC)
@@ -263,6 +281,19 @@ def test_weekly_active_order_summary_matches_runtime_actionable_semantics() -> N
                 submitted_at=stale_at,
                 last_broker_sync_at=reference_at,
             ),
+            BrokerOrder(
+                broker_name="kis",
+                mode="paper",
+                idempotency_key="weekly-manual-review-required",
+                broker_order_id=None,
+                symbol="005930",
+                side="sell",
+                status="manual_review_required",
+                quantity=1,
+                submitted_at=None,
+                last_broker_sync_at=reference_at,
+                last_error_classification="submit_outcome_unknown",
+            ),
         ]
     )
     db.commit()
@@ -277,6 +308,7 @@ def test_weekly_active_order_summary_matches_runtime_actionable_semantics() -> N
 
     assert runtime_counts(settings=settings, db=db)["open_orders"] == 1
     assert summary["actionable_order_count"] == 1
+    assert summary["manual_review_order_count"] == 1
     assert summary["actionable_status_counts"] == [
         {
             "status": "submitted",
@@ -285,9 +317,10 @@ def test_weekly_active_order_summary_matches_runtime_actionable_semantics() -> N
             "newest_submitted_at": recent_at.isoformat(),
         }
     ]
-    assert [row["broker_order_id"] for row in summary["stale_nonterminal_samples"]] == [
-        "stale-1"
-    ]
+    assert {row["idempotency_key"] for row in summary["stale_nonterminal_samples"]} == {
+        "weekly-nonactionable-stale",
+        "weekly-manual-review-required",
+    }
     engine.dispose()
 
 
@@ -461,7 +494,9 @@ def test_weekly_trade_review_keeps_later_repurchase_basis_unknown(tmp_path) -> N
         db.close()
         engine.dispose()
 
-    assert report["closed_trades"] == [
+    assert len(report["closed_trades"]) == 1
+    _assert_mapping_contains(
+        report["closed_trades"][0],
         {
             "cost_basis_observed_at": None,
             "cost_basis_price": None,
@@ -473,8 +508,11 @@ def test_weekly_trade_review_keeps_later_repurchase_basis_unknown(tmp_path) -> N
             "sell_filled_at": "2026-07-26T00:00:00+00:00",
             "sell_price": "1000.0000",
             "symbol": "LATER",
-        }
-    ]
+            "settlement_currency": None,
+            "net_realized_pnl": None,
+            "transaction_cost_coverage": "unknown",
+        },
+    )
     assert report["realized_pnl_coverage"] == {
         "status": "incomplete",
         "truncated": False,
@@ -504,6 +542,7 @@ def test_weekly_trade_review_pnl_coverage_classifies_each_sell_fill_once(tmp_pat
             mode="paper",
             idempotency_key="split-buy-order-1-key",
             symbol="SPLIT",
+            venue="KRX",
             side="buy",
             status="filled",
             quantity=2,
@@ -515,6 +554,7 @@ def test_weekly_trade_review_pnl_coverage_classifies_each_sell_fill_once(tmp_pat
             mode="paper",
             idempotency_key="split-buy-order-2-key",
             symbol="SPLIT",
+            venue="KRX",
             side="buy",
             status="filled",
             quantity=3,
@@ -526,6 +566,7 @@ def test_weekly_trade_review_pnl_coverage_classifies_each_sell_fill_once(tmp_pat
             mode="paper",
             idempotency_key="split-sell-order-key",
             symbol="SPLIT",
+            venue="KRX",
             side="sell",
             status="filled",
             quantity=5,
@@ -537,6 +578,7 @@ def test_weekly_trade_review_pnl_coverage_classifies_each_sell_fill_once(tmp_pat
             mode="paper",
             idempotency_key="partial-buy-order-key",
             symbol="PART",
+            venue="KRX",
             side="buy",
             status="filled",
             quantity=2,
@@ -548,6 +590,7 @@ def test_weekly_trade_review_pnl_coverage_classifies_each_sell_fill_once(tmp_pat
             mode="paper",
             idempotency_key="partial-sell-order-key",
             symbol="PART",
+            venue="KRX",
             side="sell",
             status="filled",
             quantity=5,
@@ -639,7 +682,7 @@ def test_weekly_trade_review_pnl_coverage_classifies_each_sell_fill_once(tmp_pat
         "symbols_requiring_repair": ["PART"],
         "uncovered_sell_fill_ids": ["partial-sell-fill"],
     }
-    assert report["realized_pnl_summary"] == {
+    _assert_mapping_contains(report["realized_pnl_summary"], {
         "status": "incomplete",
         "sell_fill_count": 2,
         "covered_sell_fill_count": 1,
@@ -670,7 +713,14 @@ def test_weekly_trade_review_pnl_coverage_classifies_each_sell_fill_once(tmp_pat
             "realized_pnl": "220.0000",
             "return_pct": "41.5094",
         },
+    })
+    assert report["realized_pnl_summary"]["gross_realized_pnl_by_currency"] == {
+        "KRW": "220.0000"
     }
+    assert report["realized_pnl_summary"]["net_realized_pnl_by_currency"] == {
+        "KRW": None
+    }
+    assert report["realized_pnl_summary"]["transaction_cost_coverage"] == "unknown"
 
 
 def test_weekly_trade_review_realized_summary_dedupes_duplicate_broker_sell_fills(tmp_path) -> None:
@@ -691,6 +741,7 @@ def test_weekly_trade_review_realized_summary_dedupes_duplicate_broker_sell_fill
                 mode="paper",
                 idempotency_key="dedupe-broker-buy-order-key",
                 symbol="DEDUP",
+                venue="KRX",
                 side="buy",
                 status="filled",
                 quantity=2,
@@ -702,6 +753,7 @@ def test_weekly_trade_review_realized_summary_dedupes_duplicate_broker_sell_fill
                 mode="paper",
                 idempotency_key="dedupe-broker-sell-order-key",
                 symbol="DEDUP",
+                venue="KRX",
                 side="sell",
                 status="filled",
                 quantity=1,
@@ -786,6 +838,7 @@ def test_weekly_trade_review_realized_summary_dedupes_fallback_sell_fill_identit
                 mode="paper",
                 idempotency_key="dedupe-fallback-buy-order-key",
                 symbol="FALLBK",
+                venue="KRX",
                 side="buy",
                 status="filled",
                 quantity=1,
@@ -797,6 +850,7 @@ def test_weekly_trade_review_realized_summary_dedupes_fallback_sell_fill_identit
                 mode="paper",
                 idempotency_key="dedupe-fallback-sell-order-key",
                 symbol="FALLBK",
+                venue="KRX",
                 side="sell",
                 status="filled",
                 quantity=1,

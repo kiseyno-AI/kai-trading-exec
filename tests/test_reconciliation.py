@@ -2117,6 +2117,53 @@ def test_runtime_status_reports_actionable_stale_nonterminal_orders() -> None:
     engine.dispose()
 
 
+def test_runtime_status_immediately_surfaces_unknown_submit_for_manual_review() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        stale_broker_order_reconciliation_threshold_seconds=3600,
+    )
+    engine, db = _session(settings)
+    observed_at = datetime.now(UTC)
+    db.add(
+        BrokerOrder(
+            broker_name="kis",
+            mode="paper",
+            idempotency_key="unknown-submit-visible",
+            broker_order_id=None,
+            symbol="005930",
+            side="buy",
+            status="manual_review_required",
+            quantity=1,
+            limit_price=Decimal("70000"),
+            submitted_at=None,
+            last_broker_sync_at=observed_at,
+            last_error_classification="submit_outcome_unknown",
+            last_error_code="SUBMIT_OUTCOME_UNKNOWN",
+            last_error_message="manual broker reconciliation is required",
+            last_error_retryable=False,
+        )
+    )
+    db.commit()
+
+    payload = build_runtime_status(
+        settings=settings,
+        runtime=RuntimeMetadata(started_at=observed_at),
+        db=db,
+    )
+
+    attention = payload["freshness"]["broker_orders"]["stale_nonterminal"]
+    assert attention["count"] == 1
+    assert attention["manual_review_count"] == 1
+    assert attention["needs_reconciliation_count"] == 0
+    assert attention["items"][0]["action"] == "manual_review"
+    assert attention["items"][0]["reason"] == "submit_outcome_unknown"
+    alerts = payload["actionable_alerts"]
+    assert alerts["critical_count"] == 1
+    assert alerts["alerts"][0]["kind"] == "stale_broker_orders_need_manual_review"
+    engine.dispose()
+
+
 def test_runtime_status_reports_pnl_fill_quality_alerts() -> None:
     settings = Settings(
         database_url="sqlite:///:memory:",
@@ -2785,6 +2832,58 @@ def test_reconcile_order_uses_route_exchange_from_order_metadata() -> None:
     assert broker.reconcile_calls == [("nxt-1", "NXT", OBSERVED_AT)]
     assert order.request_metadata["route"]["exchange"] == "NXT"
     assert order.request_metadata["params"]["EXCG_ID_DVSN_CD"] == "NXT"
+    engine.dispose()
+
+
+def test_reconcile_order_preserves_kis_us_exchange_from_plan_context() -> None:
+    settings = Settings(database_url="sqlite:///:memory:", runtime_mode="paper")
+    engine, db = _session(settings)
+    plan, _item, order = _plan_backed_order(
+        plan_id="plan-us-reconcile",
+        side="buy",
+        intent="next_open_buy",
+        symbol="AAPL",
+        broker_order_id="us-order-1",
+        risk_context={"exchange": "NASD", "asset_class": "us_equity"},
+    )
+    order.asset_class = "us_equity"
+    order.venue = "NASD"
+    order.request_metadata = {"source": "test"}
+    db.add(plan)
+    db.commit()
+    broker = ReconciliationStubBroker(
+        reconcile_payloads=[
+            {
+                "broker_order_id": "us-order-1",
+                "status": "open",
+                "observed_at": OBSERVED_AT.isoformat(),
+            }
+        ]
+    )
+
+    result = reconcile_broker_order(settings=settings, db=db, adapter=broker, order=order)
+
+    assert result["status"] == "open"
+    assert broker.reconcile_calls == [("us-order-1", "NASD", OBSERVED_AT)]
+    engine.dispose()
+
+
+def test_reconcile_order_fails_closed_for_us_equity_without_exchange() -> None:
+    settings = Settings(database_url="sqlite:///:memory:", runtime_mode="paper")
+    engine, db = _session(settings)
+    order = _order(broker_order_id="us-order-missing-exchange")
+    order.symbol = "AAPL"
+    order.asset_class = "us_equity"
+    db.add(order)
+    db.commit()
+    broker = ReconciliationStubBroker()
+
+    result = reconcile_broker_order(settings=settings, db=db, adapter=broker, order=order)
+
+    assert result["status_code"] == 503
+    assert result["status"] == "submitted"
+    assert broker.reconcile_calls == []
+    assert "explicit NASD, NYSE, or AMEX" in str(result["message"])
     engine.dispose()
 
 

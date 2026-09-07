@@ -16,6 +16,10 @@ from app.core.config import Settings, load_settings
 from app.db.session import create_db_engine, create_session_factory
 from app.models.runtime import BrokerOrder, ExecutionFill, ExecutionPlanItem, ExecutionPosition
 from app.services.fill_idempotency import dedupe_execution_fills
+from app.services.fill_economics import (
+    closed_trade_economics,
+    effective_fill_quantity,
+)
 from app.services.fifo_inventory import FifoIsolationCursor, load_fifo_isolation_cursor
 from app.services.account_drawdown_gate import (
     account_drawdown_gate_prompt_summary,
@@ -29,6 +33,14 @@ from app.services.broker_raw_holdings import (
     broker_raw_holding_payload,
     broker_raw_holdings_from_payload,
     raw_vs_normalized_position_drift,
+)
+from app.services.portfolio_risk import (
+    UNKNOWN_CURRENCY_KEY,
+    aggregation_state_with_value_coverage,
+    currency_aggregation_state,
+    infer_order_settlement_currency,
+    infer_settlement_currency,
+    load_symbol_settlement_currency_hints,
 )
 
 REPORT_VERSION = "trade-outcome-feedback-v1"
@@ -65,13 +77,12 @@ class CandidateTradeReplay:
     skipped_entry: bool
     skipped_winner: bool
     avoided_loser: bool
-    cost_savings_multiplier: Decimal
     evidence: dict[str, object]
 
 
 @dataclass
 class OpenLot:
-    quantity: int
+    quantity: Decimal
     price: Decimal
     filled_at: datetime
     fill: ExecutionFill
@@ -176,7 +187,11 @@ def generate_trade_outcome_feedback(
     return report
 
 
-def load_latest_trade_outcome_feedback_snippet(settings: Settings) -> dict[str, object] | None:
+def load_latest_trade_outcome_feedback_snippet(
+    settings: Settings,
+    *,
+    now: datetime | None = None,
+) -> dict[str, object] | None:
     if not settings.trade_outcome_feedback_enabled:
         return None
     latest_path = Path(settings.trade_outcome_feedback_dir) / "latest.json"
@@ -186,18 +201,37 @@ def load_latest_trade_outcome_feedback_snippet(settings: Settings) -> dict[str, 
         return None
     if payload.get("mode") != settings.runtime_mode:
         return None
+    generated_at = _parse_feedback_generated_at(payload.get("generated_at"))
+    if generated_at is None:
+        return None
+    current_time = (now or datetime.now(UTC)).astimezone(UTC)
+    age_seconds = (current_time - generated_at).total_seconds()
+    if age_seconds < -300 or age_seconds > settings.trade_outcome_feedback_max_age_seconds:
+        return None
     snippet = payload.get("prompt_snippet")
     if not isinstance(snippet, dict):
         return None
     return {
         "version": payload.get("version"),
         "mode": payload.get("mode"),
-        "generated_at": payload.get("generated_at"),
+        "generated_at": generated_at.isoformat(),
         "lookback_days": payload.get("lookback_days"),
         "closed_trade_count": payload.get("closed_trade_count"),
         "summary": payload.get("summary") if isinstance(payload.get("summary"), dict) else {},
         "snippet": snippet,
     }
+
+
+def _parse_feedback_generated_at(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(UTC)
 
 
 def _load_fills(*, settings: Settings, db: Session) -> list[ExecutionFill]:
@@ -217,7 +251,13 @@ def _load_fills(*, settings: Settings, db: Session) -> list[ExecutionFill]:
                     ExecutionFill.symbol,
                     ExecutionFill.side,
                     ExecutionFill.quantity,
+                    ExecutionFill.base_quantity,
+                    ExecutionFill.quote_notional,
                     ExecutionFill.price,
+                    ExecutionFill.settlement_currency,
+                    ExecutionFill.transaction_cost,
+                    ExecutionFill.transaction_cost_coverage,
+                    ExecutionFill.transaction_cost_source,
                     ExecutionFill.filled_at,
                 ),
                 selectinload(ExecutionFill.broker_order).load_only(
@@ -227,6 +267,9 @@ def _load_fills(*, settings: Settings, db: Session) -> list[ExecutionFill]:
                     BrokerOrder.symbol,
                     BrokerOrder.side,
                     BrokerOrder.mode,
+                    BrokerOrder.broker_name,
+                    BrokerOrder.venue,
+                    BrokerOrder.asset_class,
                 ),
                 selectinload(ExecutionFill.broker_order)
                 .selectinload(BrokerOrder.plan_item)
@@ -334,7 +377,7 @@ def _fifo_closed_trades(
         if side == "buy":
             lots.append(
                 OpenLot(
-                    quantity=int(fill.quantity),
+                    quantity=effective_fill_quantity(fill),
                     price=Decimal(fill.price),
                     filled_at=_normalize_utc(fill.filled_at),
                     fill=fill,
@@ -343,7 +386,7 @@ def _fifo_closed_trades(
             continue
         if side != "sell":
             continue
-        remaining = int(fill.quantity)
+        remaining = effective_fill_quantity(fill)
         while remaining > 0 and lots:
             lot = lots[0]
             matched = min(remaining, lot.quantity)
@@ -363,25 +406,64 @@ def _fifo_closed_trades(
     return closed
 
 
-def _closed_trade(*, lot: OpenLot, sell_fill: ExecutionFill, quantity: int) -> dict[str, object]:
+def _closed_trade(*, lot: OpenLot, sell_fill: ExecutionFill, quantity: Decimal) -> dict[str, object]:
     buy_order = lot.fill.broker_order
     sell_order = sell_fill.broker_order
     buy_item = buy_order.plan_item if buy_order is not None else None
     sell_item = sell_order.plan_item if sell_order is not None else None
     sell_price = Decimal(sell_fill.price)
-    buy_notional = lot.price * Decimal(quantity)
-    sell_notional = sell_price * Decimal(quantity)
-    pnl = sell_notional - buy_notional
-    return_pct = (pnl / buy_notional * Decimal("100")) if buy_notional > 0 else Decimal("0")
+    buy_notional = lot.price * quantity
+    sell_notional = sell_price * quantity
+    gross_pnl = sell_notional - buy_notional
+    economics = closed_trade_economics(
+        buy_fill=lot.fill,
+        sell_fill=sell_fill,
+        matched_quantity=quantity,
+        gross_realized_pnl=gross_pnl,
+    )
+    analysis_pnl = economics.net_realized_pnl
+    gross_return_pct = (
+        gross_pnl / buy_notional * Decimal("100")
+        if buy_notional > 0
+        else Decimal("0")
+    )
+    return_pct = (
+        analysis_pnl / buy_notional * Decimal("100")
+        if analysis_pnl is not None and buy_notional > 0
+        else None
+    )
     hold_minutes = int((_normalize_utc(sell_fill.filled_at) - lot.filled_at).total_seconds() // 60)
     source_item = buy_item or sell_item
     return {
         "symbol": sell_fill.symbol,
-        "quantity": quantity,
+        "quantity": _quantity_value(quantity),
         "buy": _fill_payload(fill=lot.fill, order=buy_order, item=buy_item, quantity=quantity),
         "sell": _fill_payload(fill=sell_fill, order=sell_order, item=sell_item, quantity=quantity),
-        "realized_pnl_krw": _decimal_text(pnl),
+        "realized_pnl_krw": _decimal_text(analysis_pnl)
+        if economics.settlement_currency == "KRW"
+        else None,
+        "realized_pnl_basis": "net_after_transaction_costs"
+        if analysis_pnl is not None
+        else "unavailable_incomplete_transaction_costs",
+        "profitability_eligible": analysis_pnl is not None
+        and economics.settlement_currency == "KRW",
+        "settlement_currency": economics.settlement_currency,
+        "buy_settlement_currency": economics.buy_settlement_currency,
+        "sell_settlement_currency": economics.sell_settlement_currency,
+        "gross_realized_pnl": _decimal_text(gross_pnl),
+        "gross_realized_pnl_krw": _decimal_text(gross_pnl)
+        if economics.settlement_currency == "KRW"
+        else None,
+        "buy_transaction_cost": _decimal_text(economics.buy_transaction_cost),
+        "sell_transaction_cost": _decimal_text(economics.sell_transaction_cost),
+        "known_transaction_cost": _decimal_text(economics.known_transaction_cost),
+        "net_realized_pnl": _decimal_text(economics.net_realized_pnl),
+        "net_realized_pnl_krw": _decimal_text(economics.net_realized_pnl)
+        if economics.settlement_currency == "KRW"
+        else None,
+        "transaction_cost_coverage": economics.transaction_cost_coverage,
         "return_pct": _decimal_text(return_pct),
+        "gross_return_pct": _decimal_text(gross_return_pct),
         "hold_minutes": hold_minutes,
         "hold_hours": _decimal_text(Decimal(hold_minutes) / Decimal("60")),
         "source_execution_plan_item_id": source_item.id if source_item is not None else None,
@@ -393,15 +475,22 @@ def _closed_trade(*, lot: OpenLot, sell_fill: ExecutionFill, quantity: int) -> d
         "market_enrichment": _market_enrichment_context(source_item),
         "candidate_rule_context": _merged_candidate_rule_context(buy_item=buy_item, sell_item=sell_item, buy_fill=lot.fill),
         "outcome_source": "fifo_exact",
-        "outcome_quality_flags": [],
-        "outcome_bucket": _outcome_bucket(pnl),
+        "outcome_quality_flags": (
+            []
+            if economics.transaction_cost_coverage == "complete"
+            else [f"transaction_cost_coverage_{economics.transaction_cost_coverage}"]
+        )
+        + ([] if economics.settlement_currency is not None else ["settlement_currency_unknown"]),
+        "outcome_bucket": (
+            _outcome_bucket(analysis_pnl) if analysis_pnl is not None else "unavailable"
+        ),
     }
 
 
 def _legacy_sell_estimate_trade(
     *,
     sell_fill: ExecutionFill,
-    quantity: int,
+    quantity: Decimal,
     cost_basis: LegacySellCostBasis | None,
 ) -> dict[str, object]:
     sell_order = sell_fill.broker_order
@@ -416,12 +505,29 @@ def _legacy_sell_estimate_trade(
         quality_flags = ["missing_fifo_buy_lot", "missing_average_cost_basis"]
     else:
         buy_price = cost_basis.average_price
-        buy_notional = buy_price * Decimal(quantity)
-        sell_notional = sell_price * Decimal(quantity)
+        buy_notional = buy_price * quantity
+        sell_notional = sell_price * quantity
         pnl = sell_notional - buy_notional
         return_pct = (pnl / buy_notional * Decimal("100")) if buy_notional > 0 else Decimal("0")
         outcome_source = cost_basis.source
         quality_flags = ["missing_fifo_buy_lot", f"estimated_from_{cost_basis.source}"]
+    economics = (
+        closed_trade_economics(
+            buy_fill=None,
+            sell_fill=sell_fill,
+            matched_quantity=quantity,
+            gross_realized_pnl=pnl,
+        )
+        if pnl is not None
+        else None
+    )
+    currency = economics.settlement_currency if economics is not None else None
+    if economics is not None:
+        quality_flags.append(
+            f"transaction_cost_coverage_{economics.transaction_cost_coverage}"
+        )
+    if currency is None:
+        quality_flags.append("settlement_currency_unknown")
     return {
         "symbol": sell_fill.symbol,
         "quantity": quantity,
@@ -429,7 +535,7 @@ def _legacy_sell_estimate_trade(
             "filled_at": cost_basis.observed_at.isoformat()
             if cost_basis is not None and cost_basis.observed_at is not None
             else None,
-            "quantity": quantity,
+            "quantity": _quantity_value(quantity),
             "price": _decimal_text(buy_price),
             "broker_fill_id": None,
             "broker_order_id": None,
@@ -439,8 +545,34 @@ def _legacy_sell_estimate_trade(
             "cost_basis_source": outcome_source,
         },
         "sell": _fill_payload(fill=sell_fill, order=sell_order, item=sell_item, quantity=quantity),
-        "realized_pnl_krw": _decimal_text(pnl),
-        "return_pct": _decimal_text(return_pct),
+        "realized_pnl_krw": None,
+        "realized_pnl_basis": "unavailable_incomplete_transaction_costs",
+        "profitability_eligible": False,
+        "settlement_currency": currency,
+        "buy_settlement_currency": (
+            economics.buy_settlement_currency if economics is not None else None
+        ),
+        "sell_settlement_currency": (
+            economics.sell_settlement_currency if economics is not None else None
+        ),
+        "gross_realized_pnl": _decimal_text(pnl),
+        "gross_realized_pnl_krw": _decimal_text(pnl) if currency == "KRW" else None,
+        "buy_transaction_cost": _decimal_text(
+            economics.buy_transaction_cost if economics is not None else None
+        ),
+        "sell_transaction_cost": _decimal_text(
+            economics.sell_transaction_cost if economics is not None else None
+        ),
+        "known_transaction_cost": _decimal_text(
+            economics.known_transaction_cost if economics is not None else None
+        ),
+        "net_realized_pnl": None,
+        "net_realized_pnl_krw": None,
+        "transaction_cost_coverage": (
+            economics.transaction_cost_coverage if economics is not None else "unknown"
+        ),
+        "return_pct": None,
+        "gross_return_pct": _decimal_text(return_pct),
         "hold_minutes": None,
         "hold_hours": None,
         "source_execution_plan_item_id": source_item.id if source_item is not None else None,
@@ -453,7 +585,7 @@ def _legacy_sell_estimate_trade(
         "candidate_rule_context": _candidate_rule_context(item=source_item, buy_fill=sell_fill),
         "outcome_source": outcome_source,
         "outcome_quality_flags": quality_flags,
-        "outcome_bucket": _outcome_bucket(pnl) if pnl is not None else "unavailable",
+        "outcome_bucket": "unavailable",
     }
 
 
@@ -462,11 +594,11 @@ def _fill_payload(
     fill: ExecutionFill,
     order: BrokerOrder | None,
     item: ExecutionPlanItem | None,
-    quantity: int,
+    quantity: Decimal,
 ) -> dict[str, object]:
     return {
         "filled_at": _normalize_utc(fill.filled_at).isoformat(),
-        "quantity": quantity,
+        "quantity": _quantity_value(quantity),
         "price": _decimal_text(Decimal(fill.price)),
         "broker_fill_id": fill.broker_fill_id,
         "broker_order_id": order.broker_order_id if order is not None else None,
@@ -490,6 +622,75 @@ def _summary(
     winners = [value for value in pnl_values if value > 0]
     losers = [value for value in pnl_values if value < 0]
     total = sum(pnl_values, Decimal("0"))
+    priced_trades = [row for row in closed_trades if row.get("gross_realized_pnl") is not None]
+    currencies = {
+        str(row["settlement_currency"])
+        for row in priced_trades
+        if row.get("settlement_currency")
+    }
+    unknown_currency_count = sum(
+        1 for row in closed_trades if not row.get("settlement_currency")
+    )
+    gross_by_currency: dict[str, str | None] = {}
+    net_by_currency: dict[str, str | None] = {}
+    for currency in sorted(currencies):
+        currency_rows = [
+            row for row in priced_trades if row.get("settlement_currency") == currency
+        ]
+        gross_by_currency[currency] = _decimal_text(
+            sum(
+                (
+                    _decimal_value(row.get("gross_realized_pnl")) or Decimal("0")
+                    for row in currency_rows
+                ),
+                Decimal("0"),
+            )
+        )
+        net_values = [_decimal_value(row.get("net_realized_pnl")) for row in currency_rows]
+        net_by_currency[currency] = (
+            _decimal_text(sum((value for value in net_values if value is not None), Decimal("0")))
+            if net_values and all(value is not None for value in net_values)
+            else None
+        )
+    cost_coverages = {
+        str(row.get("transaction_cost_coverage") or "unknown")
+        for row in closed_trades
+    }
+    transaction_cost_coverage = (
+        "complete"
+        if not closed_trades or cost_coverages == {"complete"}
+        else (
+            "partial"
+            if "complete" in cost_coverages or "partial" in cost_coverages
+            else "unknown"
+        )
+    )
+    eligible_trade_count = sum(
+        1 for row in closed_trades if row.get("profitability_eligible") is True
+    )
+    all_closed_trades_net_eligible = (
+        not closed_trades or eligible_trade_count == len(closed_trades)
+    )
+    known_krw_trades = [
+        row for row in closed_trades if row.get("settlement_currency") == "KRW"
+    ]
+    krw_net_subtotal_available = (
+        not closed_trades
+        or (
+            bool(known_krw_trades)
+            and unknown_currency_count == 0
+            and all(
+                row.get("profitability_eligible") is True
+                for row in known_krw_trades
+            )
+        )
+    )
+    gross_values = [
+        value
+        for row in priced_trades
+        for value in [_decimal_value(row.get("gross_realized_pnl"))]
+        if value is not None
+    ]
     estimated_count = sum(
         1
         for row in closed_trades
@@ -507,10 +708,60 @@ def _summary(
     summary: dict[str, object] = {
         "primary_performance_metric": "broker_total_asset_change"
         if broker_asset_performance and broker_asset_performance.get("available")
-        else "fifo_realized_pnl",
-        "realized_pnl_krw": _decimal_text(total),
+        else (
+            # Keep the legacy metric identifier for consumers while making its
+            # economic basis explicit below. It is emitted only for complete,
+            # KRW-denominated net outcomes.
+            "fifo_realized_pnl"
+            if all_closed_trades_net_eligible
+            else "fifo_gross_realized_pnl_degraded"
+        ),
+        "primary_performance_basis": (
+            "broker_total_asset_change"
+            if broker_asset_performance and broker_asset_performance.get("available")
+            else (
+                "net_after_transaction_costs"
+                if all_closed_trades_net_eligible
+                else "gross_diagnostic_only_incomplete_economics"
+            )
+        ),
+        "realized_pnl_krw": _decimal_text(total)
+        if krw_net_subtotal_available
+        else None,
+        "realized_pnl_basis": "net_after_transaction_costs"
+        if krw_net_subtotal_available
+        else "unavailable_incomplete_transaction_costs",
+        "krw_profitability_coverage": (
+            "complete" if krw_net_subtotal_available else "incomplete"
+        ),
+        "gross_realized_pnl_by_currency": gross_by_currency,
+        "net_realized_pnl_by_currency": net_by_currency,
+        "transaction_cost_coverage": transaction_cost_coverage,
+        "currency_coverage": "complete" if unknown_currency_count == 0 else "incomplete",
+        "unknown_currency_trade_count": unknown_currency_count,
+        "profitability_status": (
+            "complete"
+            if all_closed_trades_net_eligible
+            else (
+                "degraded_unknown_currency"
+                if unknown_currency_count > 0
+                else (
+                    "degraded_mixed_currency"
+                    if len(currencies) > 1
+                    else (
+                        "degraded_transaction_cost_coverage"
+                        if transaction_cost_coverage != "complete"
+                        else "complete_non_krw"
+                    )
+                )
+            )
+        ),
+        "profitability_eligible_trade_count": eligible_trade_count,
+        "excluded_degraded_trade_count": len(closed_trades) - eligible_trade_count,
         "win_count": len(winners),
         "loss_count": len(losers),
+        "gross_win_count": sum(1 for value in gross_values if value > 0),
+        "gross_loss_count": sum(1 for value in gross_values if value < 0),
         "win_rate_pct": _decimal_text((Decimal(len(winners)) / Decimal(len(pnl_values)) * Decimal("100")) if pnl_values else Decimal("0")),
         "average_win_krw": _decimal_text(sum(winners, Decimal("0")) / Decimal(len(winners)) if winners else Decimal("0")),
         "average_loss_krw": _decimal_text(sum(losers, Decimal("0")) / Decimal(len(losers)) if losers else Decimal("0")),
@@ -606,11 +857,22 @@ def _broker_asset_performance(
         if asset_change is not None and baseline_total_asset is not None and baseline_total_asset != 0
         else None
     )
-    realized_pnl = sum(
-        (_decimal_value(row.get("realized_pnl_krw")) or Decimal("0"))
-        for row in closed_trades
+    pnl_eligible = not closed_trades or all(
+        row.get("profitability_eligible") is True for row in closed_trades
     )
-    divergence = _asset_fifo_divergence(asset_change=asset_change, realized_pnl=realized_pnl)
+    realized_pnl = (
+        sum(
+            (_decimal_value(row.get("realized_pnl_krw")) or Decimal("0"))
+            for row in closed_trades
+        )
+        if pnl_eligible
+        else None
+    )
+    divergence = (
+        _asset_fifo_divergence(asset_change=asset_change, realized_pnl=realized_pnl)
+        if realized_pnl is not None
+        else None
+    )
     holdings = [broker_raw_holding_payload(holding) for holding in raw_holdings]
     if not holdings:
         holdings = [_position_holding_fallback(position=row) for row in positions if _position_effective_quantity(row) > 0]
@@ -639,6 +901,9 @@ def _broker_asset_performance(
         "broker_securities_value_krw": _decimal_text(_decimal_value(output2.get("evlu_amt_smtl_amt"))),
         "broker_cash_krw": _decimal_text(_decimal_value(output2.get("dnca_tot_amt"))),
         "fifo_realized_pnl_krw": _decimal_text(realized_pnl),
+        "fifo_realized_pnl_basis": "net_after_transaction_costs"
+        if pnl_eligible
+        else "unavailable_incomplete_transaction_costs",
         "divergence_warning": divergence,
         "holdings": _json_safe(holdings),
         "raw_normalized_position_drift": _json_safe(raw_drift),
@@ -880,28 +1145,78 @@ def _portfolio_risk(
         db=db,
         symbols={position.symbol for position in positions},
     )
+    position_currency_hints = load_symbol_settlement_currency_hints(
+        settings=settings,
+        db=db,
+        symbols=(position.symbol for position in positions),
+    )
     position_rows = [
-        _position_risk_row(position=position, sector=sectors.get(position.symbol))
+        _position_risk_row(
+            position=position,
+            sector=sectors.get(position.symbol),
+            currency_hint=position_currency_hints.get(position.symbol),
+        )
         for position in positions
     ]
     rows_with_value = [
         row
         for row in position_rows
-        if _decimal_value(row.get("market_value_krw")) is not None
+        if _decimal_value(row.get("market_value")) is not None
     ]
-    total_market_value = sum(
-        (_decimal_value(row.get("market_value_krw")) or Decimal("0"))
+    currency_aggregation = aggregation_state_with_value_coverage(
+        currency_aggregation_state(
+            (
+                str(row["settlement_currency"])
+                if row.get("settlement_currency") is not None
+                else None
+            )
+            for row in position_rows
+        ),
+        total_count=len(position_rows),
+        known_value_count=len(rows_with_value),
+        incomplete_reason="incomplete_market_value_coverage",
+    )
+    unconverted_market_value = sum(
+        (_decimal_value(row.get("market_value")) or Decimal("0"))
         for row in rows_with_value
     )
-    top_concentration = sorted(
-        rows_with_value,
-        key=lambda row: _decimal_value(row.get("market_value_krw")) or Decimal("0"),
-        reverse=True,
+    total_market_value = (
+        unconverted_market_value
+        if currency_aggregation["status"] == "available"
+        and len(rows_with_value) == len(position_rows)
+        else None
+    )
+    totals_by_currency = _position_market_value_totals(position_rows)
+    top_concentration = (
+        sorted(
+            rows_with_value,
+            key=lambda row: _decimal_value(row.get("market_value"))
+            or Decimal("0"),
+            reverse=True,
+        )
+        if currency_aggregation["status"] == "available"
+        else sorted(
+            rows_with_value,
+            key=lambda row: _portfolio_currency_sort_key(row),
+        )
     )[:5]
     for row in top_concentration:
-        value = _decimal_value(row.get("market_value_krw")) or Decimal("0")
+        value = _decimal_value(row.get("market_value")) or Decimal("0")
+        currency = (
+            str(row["settlement_currency"])
+            if row.get("settlement_currency") is not None
+            else None
+        )
         row["portfolio_weight_pct"] = _decimal_text(
-            (value / total_market_value * Decimal("100")) if total_market_value > 0 else Decimal("0")
+            (value / total_market_value * Decimal("100"))
+            if total_market_value is not None and total_market_value > 0
+            else None
+        )
+        currency_total = totals_by_currency.get(currency) if currency is not None else None
+        row["currency_weight_pct"] = _decimal_text(
+            (value / currency_total * Decimal("100"))
+            if currency_total is not None and currency_total > 0
+            else None
         )
     stale_positions = [
         {
@@ -919,7 +1234,14 @@ def _portfolio_risk(
         for position in positions
         if position.last_reconciled_at is None or _normalize_utc(position.last_reconciled_at) < stale_before
     ]
-    open_order_rows = [_open_order_risk_row(order=order, as_of=as_of, stale_before=stale_before) for order in open_orders]
+    open_order_rows = [
+        _open_order_risk_row(
+            order=order,
+            as_of=as_of,
+            stale_before=stale_before,
+        )
+        for order in open_orders
+    ]
     stale_orders = [row for row in open_order_rows if row.get("stale") is True]
     normal_open_orders = [row for row in open_order_rows if row.get("stale") is not True]
     stale_state_blockers = [_stale_state_blocker_row(row) for row in stale_orders]
@@ -930,7 +1252,15 @@ def _portfolio_risk(
             "broker account snapshots are not persisted by trade_outcome_feedback"
         )
     contributions = _realized_contributions(closed_trades)
-    sector_concentration = _sector_concentration(position_rows) if any(row.get("sector") for row in position_rows) else []
+    sector_concentration = (
+        _sector_concentration(
+            position_rows,
+            aggregation_available=currency_aggregation["status"] == "available",
+            totals_by_currency=totals_by_currency,
+        )
+        if any(row.get("sector") for row in position_rows)
+        else []
+    )
     monday_checks = _monday_pre_market_checks(
         positions=position_rows,
         stale_positions=stale_positions,
@@ -942,8 +1272,18 @@ def _portfolio_risk(
         "source_failed": account_source_failed,
         "as_of": as_of.isoformat(),
         "stale_threshold_seconds": settings.exec_agent_max_account_snapshot_age_seconds,
+        "aggregation_status": currency_aggregation["status"],
+        "aggregation_reason": currency_aggregation["reason"],
+        "aggregate_currency": currency_aggregation["aggregate_currency"],
+        "currency_aggregation": currency_aggregation,
         "open_holding_count": len(position_rows) if position_rows else None,
-        "total_market_value_krw": _decimal_text(total_market_value) if position_rows and len(rows_with_value) == len(position_rows) else None,
+        "total_market_value": _decimal_text(total_market_value),
+        "total_market_value_krw": (
+            _decimal_text(total_market_value)
+            if currency_aggregation["aggregate_currency"] == "KRW"
+            else None
+        ),
+        "by_currency": _position_subtotals_by_currency(position_rows),
         "positions_missing_market_value_count": len(position_rows) - len(rows_with_value),
         "top_position_concentration": _json_safe(top_concentration),
         "sector_concentration": _json_safe(sector_concentration),
@@ -953,6 +1293,7 @@ def _portfolio_risk(
         "target_sell_profit_contribution": contributions["target_sell_profit"],
         "max_holding_close_contribution": contributions["max_holding_close"],
         "open_orders": _json_safe(open_order_rows),
+        "open_orders_by_currency": _open_order_subtotals_by_currency(open_order_rows),
         "normal_open_orders": _json_safe(normal_open_orders),
         "stale_state_blockers": _json_safe(stale_state_blockers),
         "stale_open_order_warnings": _json_safe(stale_orders),
@@ -1009,18 +1350,36 @@ def _load_open_orders(*, settings: Settings, db: Session) -> list[BrokerOrder]:
     )
 
 
-def _position_risk_row(*, position: ExecutionPosition, sector: str | None) -> dict[str, object]:
+def _position_risk_row(
+    *,
+    position: ExecutionPosition,
+    sector: str | None,
+    currency_hint: tuple[str, str] | None,
+) -> dict[str, object]:
     effective_quantity = _position_effective_quantity(position)
     market_value = None
     if position.average_price is not None and effective_quantity > 0:
         market_value = Decimal(position.average_price) * effective_quantity
+    if currency_hint is not None:
+        settlement_currency, currency_source = currency_hint
+    else:
+        settlement_currency, currency_source = infer_settlement_currency(
+            symbol=position.symbol,
+        )
     return {
         "symbol": position.symbol,
         "quantity": position.quantity,
         "base_quantity": _position_base_quantity_text(position),
         "effective_quantity": _position_effective_quantity_text(position),
         "average_price": _decimal_text(Decimal(position.average_price)) if position.average_price is not None else None,
-        "market_value_krw": _decimal_text(market_value),
+        "market_value": _decimal_text(market_value),
+        "market_value_krw": (
+            _decimal_text(market_value)
+            if settlement_currency == "KRW"
+            else None
+        ),
+        "settlement_currency": settlement_currency,
+        "currency_source": currency_source,
         "last_reconciled_at": _normalize_utc(position.last_reconciled_at).isoformat()
         if position.last_reconciled_at is not None
         else None,
@@ -1053,6 +1412,21 @@ def _open_order_risk_row(*, order: BrokerOrder, as_of: datetime, stale_before: d
     normalized_reference = _normalize_utc(reference_at) if reference_at is not None else None
     remaining_quantity = _remaining_order_quantity(order)
     is_stale = normalized_reference is None or normalized_reference < stale_before
+    settlement_currency, currency_source = infer_order_settlement_currency(order)
+    effective_remaining_quantity = (
+        Decimal(order.base_quantity)
+        if order.base_quantity is not None and order.base_quantity > 0
+        else Decimal(remaining_quantity)
+        if remaining_quantity is not None
+        else None
+    )
+    notional = (
+        Decimal(order.quote_notional)
+        if order.quote_notional is not None
+        else effective_remaining_quantity * Decimal(order.limit_price)
+        if effective_remaining_quantity is not None and order.limit_price is not None
+        else None
+    )
     return {
         "broker_order_pk": order.id,
         "broker_order_id": order.broker_order_id,
@@ -1062,8 +1436,16 @@ def _open_order_risk_row(*, order: BrokerOrder, as_of: datetime, stale_before: d
         "intent": order.plan_item.intent if order.plan_item is not None else None,
         "status": order.status,
         "quantity": order.quantity,
+        "base_quantity": (
+            _quantity_text(Decimal(order.base_quantity))
+            if order.base_quantity is not None
+            else None
+        ),
         "remaining_quantity": remaining_quantity,
         "limit_price": _decimal_text(Decimal(order.limit_price)) if order.limit_price is not None else None,
+        "notional": _decimal_text(notional),
+        "settlement_currency": settlement_currency,
+        "currency_source": currency_source,
         "submitted_at": _normalize_utc(order.submitted_at).isoformat() if order.submitted_at is not None else None,
         "last_broker_sync_at": _normalize_utc(order.last_broker_sync_at).isoformat()
         if order.last_broker_sync_at is not None
@@ -1105,7 +1487,10 @@ def _remaining_order_quantity(order: BrokerOrder) -> int | None:
 def _realized_contributions(closed_trades: list[dict[str, object]]) -> dict[str, object]:
     by_symbol: dict[str, list[Decimal]] = {}
     by_reason: dict[str, list[Decimal]] = {}
-    for trade in closed_trades:
+    eligible_trades = [
+        trade for trade in closed_trades if trade.get("profitability_eligible") is True
+    ]
+    for trade in eligible_trades:
         symbol = str(trade.get("symbol") or "unknown")
         pnl = _decimal_value(trade.get("realized_pnl_krw")) or Decimal("0")
         reason = _sell_reason(trade)
@@ -1114,9 +1499,10 @@ def _realized_contributions(closed_trades: list[dict[str, object]]) -> dict[str,
     return {
         "by_symbol": _contribution_rows(by_symbol),
         "by_sell_reason": _contribution_rows(by_reason),
-        "stop_sell_loss": _reason_filtered_contribution(closed_trades, reason="stop_sell", pnl_filter="loss"),
-        "target_sell_profit": _reason_filtered_contribution(closed_trades, reason="target_sell", pnl_filter="profit"),
-        "max_holding_close": _reason_filtered_contribution(closed_trades, reason="max_holding_close_sell", pnl_filter=None),
+        "stop_sell_loss": _reason_filtered_contribution(eligible_trades, reason="stop_sell", pnl_filter="loss"),
+        "target_sell_profit": _reason_filtered_contribution(eligible_trades, reason="target_sell", pnl_filter="profit"),
+        "max_holding_close": _reason_filtered_contribution(eligible_trades, reason="max_holding_close_sell", pnl_filter=None),
+        "excluded_degraded_trade_count": len(closed_trades) - len(eligible_trades),
     }
 
 
@@ -1229,26 +1615,162 @@ def _sectors_for_symbols(*, settings: Settings, db: Session, symbols: set[str]) 
     return sectors
 
 
-def _sector_concentration(position_rows: list[dict[str, object]]) -> list[dict[str, object]]:
-    stats: dict[str, list[Decimal]] = {}
+def _position_market_value_totals(
+    position_rows: list[dict[str, object]],
+) -> dict[str, Decimal]:
+    values: dict[str, list[Decimal]] = {}
+    counts: dict[str, int] = {}
+    for row in position_rows:
+        currency = str(row.get("settlement_currency") or "").strip()
+        if not currency:
+            continue
+        counts[currency] = counts.get(currency, 0) + 1
+        value = _decimal_value(row.get("market_value"))
+        if value is not None:
+            values.setdefault(currency, []).append(value)
+    return {
+        currency: sum(currency_values, Decimal("0"))
+        for currency, currency_values in values.items()
+        if len(currency_values) == counts[currency]
+    }
+
+
+def _position_subtotals_by_currency(
+    position_rows: list[dict[str, object]],
+) -> dict[str, dict[str, object]]:
+    stats: dict[str, dict[str, object]] = {}
+    for row in position_rows:
+        currency = str(row.get("settlement_currency") or "").strip() or None
+        key = currency or UNKNOWN_CURRENCY_KEY
+        entry = stats.setdefault(
+            key,
+            {"position_count": 0, "known_market_value_count": 0, "values": []},
+        )
+        entry["position_count"] = int(entry["position_count"]) + 1
+        value = _decimal_value(row.get("market_value"))
+        if value is not None:
+            entry["known_market_value_count"] = (
+                int(entry["known_market_value_count"]) + 1
+            )
+            entry["values"].append(value)
+    return {
+        key: {
+            "position_count": entry["position_count"],
+            "known_market_value_count": entry["known_market_value_count"],
+            "known_market_value_subtotal": (
+                _decimal_text(sum(entry["values"], Decimal("0")))
+                if key != UNKNOWN_CURRENCY_KEY and entry["values"]
+                else None
+            ),
+            "total_market_value": (
+                _decimal_text(sum(entry["values"], Decimal("0")))
+                if key != UNKNOWN_CURRENCY_KEY
+                and entry["values"]
+                and entry["known_market_value_count"]
+                == entry["position_count"]
+                else None
+            ),
+        }
+        for key, entry in sorted(stats.items())
+    }
+
+
+def _open_order_subtotals_by_currency(
+    open_order_rows: list[dict[str, object]],
+) -> dict[str, dict[str, object]]:
+    stats: dict[str, dict[str, object]] = {}
+    for row in open_order_rows:
+        currency = str(row.get("settlement_currency") or "").strip() or None
+        key = currency or UNKNOWN_CURRENCY_KEY
+        entry = stats.setdefault(
+            key,
+            {"order_count": 0, "known_notional_count": 0, "notionals": []},
+        )
+        entry["order_count"] = int(entry["order_count"]) + 1
+        notional = _decimal_value(row.get("notional"))
+        if notional is not None:
+            entry["known_notional_count"] = int(entry["known_notional_count"]) + 1
+            entry["notionals"].append(notional)
+    return {
+        key: {
+            "order_count": entry["order_count"],
+            "known_notional_count": entry["known_notional_count"],
+            "known_notional_subtotal": (
+                _decimal_text(sum(entry["notionals"], Decimal("0")))
+                if key != UNKNOWN_CURRENCY_KEY and entry["notionals"]
+                else None
+            ),
+            "total_notional": (
+                _decimal_text(sum(entry["notionals"], Decimal("0")))
+                if key != UNKNOWN_CURRENCY_KEY
+                and entry["notionals"]
+                and entry["known_notional_count"] == entry["order_count"]
+                else None
+            ),
+        }
+        for key, entry in sorted(stats.items())
+    }
+
+
+def _portfolio_currency_sort_key(
+    row: dict[str, object],
+) -> tuple[bool, str, Decimal]:
+    currency = str(row.get("settlement_currency") or "").strip() or None
+    return (
+        currency is None,
+        currency or UNKNOWN_CURRENCY_KEY,
+        -(_decimal_value(row.get("market_value")) or Decimal("0")),
+    )
+
+
+def _sector_concentration(
+    position_rows: list[dict[str, object]],
+    *,
+    aggregation_available: bool,
+    totals_by_currency: dict[str, Decimal],
+) -> list[dict[str, object]]:
+    stats: dict[tuple[str, str | None], list[Decimal]] = {}
     for row in position_rows:
         sector = str(row.get("sector") or "").strip()
-        value = _decimal_value(row.get("market_value_krw"))
+        currency = str(row.get("settlement_currency") or "").strip() or None
+        value = _decimal_value(row.get("market_value"))
         if sector and value is not None:
-            stats.setdefault(sector, []).append(value)
-    total = sum((sum(values, Decimal("0")) for values in stats.values()), Decimal("0"))
+            stats.setdefault((sector, currency), []).append(value)
+    total = sum(
+        (sum(values, Decimal("0")) for values in stats.values()),
+        Decimal("0"),
+    )
     rows = []
-    for sector, values in stats.items():
+    for (sector, currency), values in stats.items():
         value = sum(values, Decimal("0"))
         rows.append(
             {
                 "sector": sector,
                 "position_count": len(values),
-                "market_value_krw": _decimal_text(value),
-                "portfolio_weight_pct": _decimal_text((value / total * Decimal("100")) if total > 0 else Decimal("0")),
+                "settlement_currency": currency,
+                "market_value": _decimal_text(value),
+                "market_value_krw": (
+                    _decimal_text(value) if currency == "KRW" else None
+                ),
+                "portfolio_weight_pct": _decimal_text(
+                    (value / total * Decimal("100"))
+                    if aggregation_available and total > 0
+                    else None
+                ),
+                "currency_weight_pct": _decimal_text(
+                    (value / totals_by_currency[currency] * Decimal("100"))
+                    if currency is not None and totals_by_currency[currency] > 0
+                    else None
+                ),
             }
         )
-    return sorted(rows, key=lambda row: Decimal(str(row["market_value_krw"])), reverse=True)
+    if aggregation_available:
+        return sorted(
+            rows,
+            key=lambda row: _decimal_value(row["market_value"]) or Decimal("0"),
+            reverse=True,
+        )
+    return sorted(rows, key=_portfolio_currency_sort_key)
 
 
 def _monday_pre_market_checks(
@@ -1289,7 +1811,9 @@ def _monday_pre_market_checks(
                     "quantity": position.get("quantity"),
                     "base_quantity": position.get("base_quantity"),
                     "effective_quantity": position.get("effective_quantity"),
+                    "market_value": position.get("market_value"),
                     "market_value_krw": position.get("market_value_krw"),
+                    "settlement_currency": position.get("settlement_currency"),
                     "reason": "review concentration and exit monitors before Monday pre-market",
                 }
             )
@@ -1297,13 +1821,16 @@ def _monday_pre_market_checks(
 
 
 def _lessons(closed_trades: list[dict[str, object]], *, max_lessons: int) -> dict[str, object]:
+    eligible_trades = [
+        trade for trade in closed_trades if trade.get("profitability_eligible") is True
+    ]
     worst_losses = sorted(
-        closed_trades,
+        eligible_trades,
         key=lambda row: _decimal_value(row.get("realized_pnl_krw")) or Decimal("0"),
     )[:max_lessons]
     profile_stats: dict[str, list[Decimal]] = {}
     reason_stats: dict[str, list[Decimal]] = {}
-    for trade in closed_trades:
+    for trade in eligible_trades:
         pnl = _decimal_value(trade.get("realized_pnl_krw")) or Decimal("0")
         decision = trade.get("exec_agent_decision") if isinstance(trade.get("exec_agent_decision"), dict) else {}
         profile = str(decision.get("target_profile") or "unknown")
@@ -1315,6 +1842,8 @@ def _lessons(closed_trades: list[dict[str, object]], *, max_lessons: int) -> dic
         "patterns_to_downsize_or_reject": _negative_patterns(profile_stats, max_lessons=max_lessons),
         "positive_expectancy_patterns": _positive_patterns(profile_stats, max_lessons=max_lessons),
         "negative_reason_codes": _negative_patterns(reason_stats, max_lessons=max_lessons),
+        "eligible_trade_count": len(eligible_trades),
+        "excluded_degraded_trade_count": len(closed_trades) - len(eligible_trades),
     }
 
 
@@ -1373,32 +1902,77 @@ def _candidate_rules(settings: Settings) -> list[CandidateRule]:
 
 
 def _candidate_rule_replay(*, settings: Settings, closed_trades: list[dict[str, object]]) -> dict[str, object]:
-    baseline_pnls = [_decimal_value(row.get("realized_pnl_krw")) or Decimal("0") for row in closed_trades]
-    baseline_returns = [_decimal_value(row.get("return_pct")) or Decimal("0") for row in closed_trades]
-    baseline_gross = sum(baseline_pnls, Decimal("0"))
+    eligible_trades = [
+        trade for trade in closed_trades if trade.get("profitability_eligible") is True
+    ]
+    incomplete_cost_trade_count = sum(
+        1
+        for trade in closed_trades
+        if trade.get("transaction_cost_coverage") != "complete"
+    )
+    if eligible_trades:
+        replay_status = "ready" if len(eligible_trades) == len(closed_trades) else "degraded"
+        blocked_reason = None
+    elif closed_trades and incomplete_cost_trade_count:
+        replay_status = "blocked"
+        blocked_reason = "transaction_costs_not_ingested"
+    elif closed_trades:
+        replay_status = "blocked"
+        blocked_reason = "no_krw_net_eligible_trades"
+    else:
+        replay_status = "no_data"
+        blocked_reason = "no_closed_trades"
+    baseline_pnls = [_decimal_value(row.get("realized_pnl_krw")) or Decimal("0") for row in eligible_trades]
+    baseline_gross_pnls = [
+        _decimal_value(row.get("gross_realized_pnl_krw")) or Decimal("0")
+        for row in eligible_trades
+    ]
+    baseline_returns = [_decimal_value(row.get("return_pct")) or Decimal("0") for row in eligible_trades]
+    baseline_net = sum(baseline_pnls, Decimal("0"))
+    baseline_gross = sum(baseline_gross_pnls, Decimal("0"))
     baseline_win_rate = _win_rate_pct(baseline_pnls)
     baseline_avg_return = _average_decimal(baseline_returns)
-    fee_slippage_bps = _fee_slippage_bps(closed_trades)
+    fee_slippage_bps = _fee_slippage_bps(eligible_trades)
+    rule_results = [
+        _candidate_rule_result(
+            rule=rule,
+            closed_trades=eligible_trades,
+            baseline_pnls=baseline_pnls,
+            baseline_gross_pnls=baseline_gross_pnls,
+            baseline_returns=baseline_returns,
+            baseline_net=baseline_net,
+            baseline_gross=baseline_gross,
+            baseline_win_rate=baseline_win_rate,
+            baseline_avg_return=baseline_avg_return,
+        )
+        for rule in _candidate_rules(settings)
+    ]
+    if replay_status != "ready":
+        for result in rule_results:
+            if result.get("recommendation") == "promote_to_issue":
+                result["recommendation"] = "needs_more_data"
+            result["promotion_eligible"] = False
+            result["promotion_blocked_reason"] = blocked_reason or (
+                "incomplete_profitability_cohort"
+            )
     return {
         "source": "execution_fills+broker_orders+execution_plan_items.risk_context",
-        "baseline_closed_trade_count": len(closed_trades),
+        "status": replay_status,
+        "promotion_eligible": replay_status == "ready",
+        "blocked_reason": blocked_reason,
+        "baseline_closed_trade_count": len(eligible_trades),
+        "excluded_degraded_trade_count": len(closed_trades) - len(eligible_trades),
+        "incomplete_transaction_cost_trade_count": incomplete_cost_trade_count,
+        "gross_diagnostics_available": any(
+            row.get("gross_realized_pnl") is not None for row in closed_trades
+        ),
+        "baseline_pnl_basis": "net_after_transaction_costs",
+        "baseline_net_pnl_krw": _decimal_text(baseline_net),
         "baseline_gross_pnl_krw": _decimal_text(baseline_gross),
         "baseline_win_rate_pct": _decimal_text(baseline_win_rate),
         "baseline_average_return_pct": _decimal_text(baseline_avg_return),
         "fee_slippage_assumption_bps": _decimal_text(fee_slippage_bps),
-        "rules": [
-            _candidate_rule_result(
-                rule=rule,
-                closed_trades=closed_trades,
-                baseline_pnls=baseline_pnls,
-                baseline_returns=baseline_returns,
-                baseline_gross=baseline_gross,
-                baseline_win_rate=baseline_win_rate,
-                baseline_avg_return=baseline_avg_return,
-                fee_slippage_bps=fee_slippage_bps,
-            )
-            for rule in _candidate_rules(settings)
-        ],
+        "rules": rule_results,
     }
 
 
@@ -1407,21 +1981,30 @@ def _candidate_rule_result(
     rule: CandidateRule,
     closed_trades: list[dict[str, object]],
     baseline_pnls: list[Decimal],
+    baseline_gross_pnls: list[Decimal],
     baseline_returns: list[Decimal],
+    baseline_net: Decimal,
     baseline_gross: Decimal,
     baseline_win_rate: Decimal,
     baseline_avg_return: Decimal,
-    fee_slippage_bps: Decimal | None,
 ) -> dict[str, object]:
     examples: list[dict[str, object]] = []
     candidate_pnls: list[Decimal] = []
+    candidate_gross_pnls: list[Decimal] = []
     candidate_returns: list[Decimal] = []
     skipped_entries = 0
     skipped_winners = 0
     avoided_losers = 0
     affected_count = 0
-    estimated_cost_savings = Decimal("0")
-    for trade, baseline_pnl, baseline_return in zip(closed_trades, baseline_pnls, baseline_returns, strict=False):
+    promotion_eligible_match_count = 0
+    promotion_excluded_match_count = 0
+    for trade, baseline_pnl, baseline_gross_pnl, baseline_return in zip(
+        closed_trades,
+        baseline_pnls,
+        baseline_gross_pnls,
+        baseline_returns,
+        strict=False,
+    ):
         matched, evidence = rule.evaluator(trade, rule)
         if matched:
             affected_count += 1
@@ -1438,6 +2021,13 @@ def _candidate_rule_result(
                 skipped_winners += 1
             if replay.avoided_loser:
                 avoided_losers += 1
+            if rule.action == "exit_tighten":
+                if replay.evidence.get("replay_eligible") is True:
+                    promotion_eligible_match_count += 1
+                else:
+                    promotion_excluded_match_count += 1
+            else:
+                promotion_eligible_match_count += 1
             examples.append(
                 _candidate_rule_example(
                     trade=trade,
@@ -1446,22 +2036,31 @@ def _candidate_rule_result(
                     evidence=replay.evidence,
                 )
             )
-            if fee_slippage_bps is not None:
-                estimated_cost_savings += (
-                    _trade_round_trip_cost(trade=trade, fee_slippage_bps=fee_slippage_bps)
-                    * replay.cost_savings_multiplier
-                )
             candidate_pnls.append(replay.pnl)
+            candidate_gross_pnls.append(
+                _candidate_gross_replay_pnl(
+                    rule=rule,
+                    baseline_gross_pnl=baseline_gross_pnl,
+                    replay=replay,
+                )
+            )
             candidate_returns.append(replay.return_pct)
         else:
             candidate_pnls.append(baseline_pnl)
+            candidate_gross_pnls.append(baseline_gross_pnl)
             candidate_returns.append(baseline_return)
-    candidate_gross = sum(candidate_pnls, Decimal("0"))
+    candidate_net = sum(candidate_pnls, Decimal("0"))
+    candidate_gross = sum(candidate_gross_pnls, Decimal("0"))
+    net_delta = candidate_net - baseline_net
     gross_delta = candidate_gross - baseline_gross
     win_rate_delta = _win_rate_pct(candidate_pnls) - baseline_win_rate
     avg_return_delta = _average_decimal(candidate_returns) - baseline_avg_return
     max_drawdown_proxy = _max_drawdown_proxy(candidate_pnls)
-    net_delta = gross_delta + estimated_cost_savings if fee_slippage_bps is not None else None
+    recommendation = _candidate_rule_recommendation(
+        matched_trade_count=promotion_eligible_match_count,
+        net_delta=net_delta,
+        skipped_winners=skipped_winners,
+    )
     return {
         "rule_id": rule.rule_id,
         "rule_name": rule.name,
@@ -1471,19 +2070,22 @@ def _candidate_rule_result(
         "baseline_closed_trade_count": len(closed_trades),
         "candidate_closed_trade_count": len(candidate_pnls) - skipped_entries,
         "matched_trade_count": affected_count,
+        "replay_eligible_count": promotion_eligible_match_count,
+        "replay_ineligible_count": promotion_excluded_match_count,
+        "promotion_eligible_matched_trade_count": promotion_eligible_match_count,
+        "promotion_excluded_matched_trade_count": promotion_excluded_match_count,
         "skipped_entries": skipped_entries,
         "skipped_winners": skipped_winners,
         "avoided_losers": avoided_losers,
         "gross_pnl_delta_krw": _decimal_text(gross_delta),
+        "net_pnl_delta_krw": _decimal_text(net_delta),
         "estimated_net_pnl_delta_krw": _decimal_text(net_delta),
+        "recommendation_pnl_basis": "net_after_transaction_costs",
         "win_rate_delta_pct": _decimal_text(win_rate_delta),
         "average_return_delta_pct": _decimal_text(avg_return_delta),
         "max_drawdown_proxy_krw": _decimal_text(max_drawdown_proxy),
-        "recommendation": _candidate_rule_recommendation(
-            matched_trade_count=affected_count,
-            gross_delta=gross_delta,
-            skipped_winners=skipped_winners,
-        ),
+        "promotion_eligible": recommendation == "promote_to_issue",
+        "recommendation": recommendation,
         "top_matched_examples": _top_candidate_examples(examples, outcome="matched")[:5],
         "top_skipped_winners": _top_candidate_examples(examples, outcome="skipped_win")[:5],
         "top_avoided_losers": _top_candidate_examples(examples, outcome="avoided_loss")[:5],
@@ -1507,20 +2109,60 @@ def _candidate_trade_replay(
         )
     multiplier = rule.size_multiplier
     skipped_entry = multiplier <= 0
+    replay_pnl = baseline_pnl * multiplier
+    replay_return = Decimal("0") if skipped_entry else baseline_return
+    replay_cost_model = "baseline_net_scaled"
+    if skipped_entry:
+        replay_pnl = Decimal("0")
+        replay_cost_model = "no_entry_no_transaction_cost"
+    elif multiplier < 1:
+        baseline_gross_pnl = _decimal_value(trade.get("gross_realized_pnl_krw"))
+        observed_transaction_cost = _decimal_value(trade.get("known_transaction_cost"))
+        buy_price = _nested_decimal(trade, ("buy", "price"))
+        quantity = (
+            _decimal_value(trade.get("quantity"))
+            or _nested_decimal(trade, ("buy", "quantity"))
+        )
+        if baseline_gross_pnl is not None and observed_transaction_cost is not None:
+            # A reduced order may still pay the same minimum/fixed fee. Keeping the
+            # entire observed cost is a conservative lower bound; scaling net P&L
+            # would incorrectly assume every cost component scales with quantity.
+            replay_pnl = baseline_gross_pnl * multiplier - observed_transaction_cost
+            replay_cost_model = "scaled_gross_minus_full_observed_cost"
+            scaled_buy_notional = (
+                buy_price * quantity * multiplier
+                if buy_price is not None and quantity is not None
+                else None
+            )
+            if scaled_buy_notional is not None and scaled_buy_notional > 0:
+                replay_return = replay_pnl / scaled_buy_notional * Decimal("100")
     return CandidateTradeReplay(
-        pnl=baseline_pnl * multiplier,
-        return_pct=baseline_return * multiplier,
+        pnl=replay_pnl,
+        return_pct=replay_return,
         skipped_entry=skipped_entry,
         skipped_winner=skipped_entry and baseline_pnl > 0,
         avoided_loser=baseline_pnl < 0,
-        cost_savings_multiplier=max(Decimal("0"), Decimal("1") - multiplier),
         evidence={
             **evidence,
             "replay_model": "entry_size_multiplier",
+            "transaction_cost_replay_model": replay_cost_model,
+            "replay_net_pnl_krw": _decimal_text(replay_pnl),
             "counts_as_skipped_winner": skipped_entry and baseline_pnl > 0,
             "counts_as_avoided_loser": baseline_pnl < 0,
         },
     )
+
+
+def _candidate_gross_replay_pnl(
+    *,
+    rule: CandidateRule,
+    baseline_gross_pnl: Decimal,
+    replay: CandidateTradeReplay,
+) -> Decimal:
+    if rule.action == "exit_tighten":
+        replay_gross = _decimal_value(replay.evidence.get("replay_gross_pnl_krw"))
+        return replay_gross if replay_gross is not None else baseline_gross_pnl
+    return baseline_gross_pnl * rule.size_multiplier
 
 
 def _exit_tighten_trade_replay(
@@ -1546,11 +2188,11 @@ def _exit_tighten_trade_replay(
             skipped_entry=False,
             skipped_winner=False,
             avoided_loser=False,
-            cost_savings_multiplier=Decimal("0"),
             evidence={
                 **replay_evidence,
                 "counts_as_skipped_winner": False,
                 "counts_as_avoided_loser": False,
+                "replay_eligible": False,
                 "replay_status": "missing_trade_price_or_quantity",
             },
         )
@@ -1562,35 +2204,98 @@ def _exit_tighten_trade_replay(
             skipped_entry=False,
             skipped_winner=False,
             avoided_loser=False,
-            cost_savings_multiplier=Decimal("0"),
             evidence={
                 **replay_evidence,
                 "counts_as_skipped_winner": False,
                 "counts_as_avoided_loser": False,
+                "replay_eligible": False,
                 "replay_status": "missing_tightened_exit_price",
             },
         )
-    observed_price = _decimal_value(tighten_context.get("observed_price"))
-    plausible_exit = min(tightened_stop, observed_price) if observed_price is not None and observed_price > 0 else tightened_stop
-    replay_exit_price = max(sell_price, plausible_exit)
-    if replay_exit_price <= sell_price:
+    tighten_recorded_at = _parse_optional_aware_datetime(
+        tighten_context.get("tighten_recorded_at")
+    )
+    sell_filled_at = _parse_optional_aware_datetime(
+        (trade.get("sell") or {}).get("filled_at")
+        if isinstance(trade.get("sell"), dict)
+        else None
+    )
+    if tighten_recorded_at is None or sell_filled_at is None:
         return CandidateTradeReplay(
             pnl=baseline_pnl,
             return_pct=baseline_return,
             skipped_entry=False,
             skipped_winner=False,
             avoided_loser=False,
-            cost_savings_multiplier=Decimal("0"),
             evidence={
                 **replay_evidence,
                 "baseline_sell_price": _decimal_text(sell_price),
-                "replay_exit_price": _decimal_text(replay_exit_price),
                 "counts_as_skipped_winner": False,
                 "counts_as_avoided_loser": False,
-                "replay_status": "actual_exit_at_or_above_tightened_exit",
+                "replay_eligible": False,
+                "replay_status": "missing_tighten_or_sell_timestamp",
             },
         )
-    replay_pnl = (replay_exit_price - buy_price) * quantity
+    if tighten_recorded_at >= sell_filled_at:
+        return CandidateTradeReplay(
+            pnl=baseline_pnl,
+            return_pct=baseline_return,
+            skipped_entry=False,
+            skipped_winner=False,
+            avoided_loser=False,
+            evidence={
+                **replay_evidence,
+                "baseline_sell_price": _decimal_text(sell_price),
+                "sell_filled_at": sell_filled_at.isoformat(),
+                "counts_as_skipped_winner": False,
+                "counts_as_avoided_loser": False,
+                "replay_eligible": False,
+                "replay_status": "tighten_recorded_at_or_after_actual_sell",
+            },
+        )
+    execution_evidence = _stored_tightened_exit_execution_evidence(
+        trade=trade,
+        tightened_stop=tightened_stop,
+        tighten_recorded_at=tighten_recorded_at,
+        sell_filled_at=sell_filled_at,
+    )
+    replay_exit_price = _decimal_value(execution_evidence.get("execution_price"))
+    if replay_exit_price is None or replay_exit_price <= 0:
+        return CandidateTradeReplay(
+            pnl=baseline_pnl,
+            return_pct=baseline_return,
+            skipped_entry=False,
+            skipped_winner=False,
+            avoided_loser=False,
+            evidence={
+                **replay_evidence,
+                "baseline_sell_price": _decimal_text(sell_price),
+                "sell_filled_at": sell_filled_at.isoformat(),
+                "counts_as_skipped_winner": False,
+                "counts_as_avoided_loser": False,
+                "replay_eligible": False,
+                "replay_status": "missing_post_tighten_execution_evidence",
+            },
+        )
+    replay_gross_pnl = (replay_exit_price - buy_price) * quantity
+    known_transaction_cost = _decimal_value(trade.get("known_transaction_cost"))
+    if known_transaction_cost is None:
+        return CandidateTradeReplay(
+            pnl=baseline_pnl,
+            return_pct=baseline_return,
+            skipped_entry=False,
+            skipped_winner=False,
+            avoided_loser=False,
+            evidence={
+                **replay_evidence,
+                **execution_evidence,
+                "counts_as_skipped_winner": False,
+                "counts_as_avoided_loser": False,
+                "replay_eligible": False,
+                "replay_status": "transaction_cost_unavailable",
+            },
+        )
+    replay_pnl = replay_gross_pnl - known_transaction_cost
     buy_notional = buy_price * quantity
     replay_return = replay_pnl / buy_notional * Decimal("100")
     return CandidateTradeReplay(
@@ -1599,25 +2304,160 @@ def _exit_tighten_trade_replay(
         skipped_entry=False,
         skipped_winner=False,
         avoided_loser=baseline_pnl < 0 and replay_pnl >= 0,
-        cost_savings_multiplier=Decimal("0"),
         evidence={
             **replay_evidence,
+            **execution_evidence,
             "baseline_sell_price": _decimal_text(sell_price),
             "replay_exit_price": _decimal_text(replay_exit_price),
+            "replay_gross_pnl_krw": _decimal_text(replay_gross_pnl),
             "replay_pnl_krw": _decimal_text(replay_pnl),
+            "replay_pnl_basis": "net_with_actual_transaction_cost_held_constant",
+            "actual_transaction_cost_krw": _decimal_text(known_transaction_cost),
             "counts_as_skipped_winner": False,
             "counts_as_avoided_loser": baseline_pnl < 0 and replay_pnl >= 0,
+            "replay_eligible": True,
             "replay_status": "replayed_tightened_exit_price",
         },
     )
 
 
-def _candidate_rule_recommendation(*, matched_trade_count: int, gross_delta: Decimal, skipped_winners: int) -> str:
+def _stored_tightened_exit_execution_evidence(
+    *,
+    trade: dict[str, object],
+    tightened_stop: Decimal,
+    tighten_recorded_at: datetime,
+    sell_filled_at: datetime,
+) -> dict[str, object]:
+    """Return the earliest stored, conservative sell-stop execution evidence.
+
+    A configured stop is not a fill. Only quote or OHLC observations recorded
+    after the tighten decision and no later than the actual sell may support the
+    counterfactual. For quote evidence we prefer the executable bid. For OHLC
+    evidence the stored low is deliberately used as the conservative price;
+    assuming a fill at the stop would overstate a gap-down exit.
+    """
+
+    context = trade.get("candidate_rule_context")
+    candidates: list[tuple[datetime, Decimal, str]] = []
+    for node in _iter_dict_nodes(context):
+        observed_at = _first_node_datetime(
+            node,
+            keys=(
+                "observed_at",
+                "quoted_at",
+                "timestamp",
+                "as_of",
+                "recorded_at",
+                "triggered_at",
+            ),
+        )
+        low_price = _first_node_decimal(node, keys=("low_price", "day_low", "low"))
+        interval_started_at = _first_node_datetime(
+            node,
+            keys=(
+                "interval_started_at",
+                "interval_start",
+                "bar_started_at",
+                "bar_start",
+                "opened_at",
+            ),
+        )
+        if (
+            low_price is not None
+            and Decimal("0") < low_price <= tightened_stop
+            and interval_started_at is not None
+            and interval_started_at > tighten_recorded_at
+            and interval_started_at <= sell_filled_at
+        ):
+            candidates.append((interval_started_at, low_price, "stored_ohlc_low"))
+            continue
+
+        if (
+            observed_at is None
+            or observed_at <= tighten_recorded_at
+            or observed_at > sell_filled_at
+        ):
+            continue
+
+        quote_price, quote_field = _first_node_decimal_with_key(
+            node,
+            keys=(
+                "bid_price",
+                "bid",
+                "trade_price",
+            ),
+        )
+        if quote_price is not None and Decimal("0") < quote_price <= tightened_stop:
+            candidates.append(
+                (observed_at, quote_price, f"stored_quote.{quote_field}")
+            )
+
+    if not candidates:
+        return {}
+    observed_at, execution_price, source = min(candidates, key=lambda row: row[0])
+    return {
+        "execution_price": _decimal_text(execution_price),
+        "execution_evidence_observed_at": observed_at.isoformat(),
+        "execution_evidence_source": source,
+        "execution_price_model": "stored_conservative_tradable_price",
+    }
+
+
+def _first_node_datetime(
+    node: dict[str, object],
+    *,
+    keys: tuple[str, ...],
+) -> datetime | None:
+    for key in keys:
+        parsed = _parse_optional_aware_datetime(node.get(key))
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _parse_optional_aware_datetime(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(UTC)
+
+
+def _first_node_decimal(
+    node: dict[str, object],
+    *,
+    keys: tuple[str, ...],
+) -> Decimal | None:
+    return _first_node_decimal_with_key(node, keys=keys)[0]
+
+
+def _first_node_decimal_with_key(
+    node: dict[str, object],
+    *,
+    keys: tuple[str, ...],
+) -> tuple[Decimal | None, str | None]:
+    for key in keys:
+        value = _decimal_value(node.get(key))
+        if value is not None:
+            return value, key
+    return None, None
+
+
+def _candidate_rule_recommendation(
+    *,
+    matched_trade_count: int,
+    net_delta: Decimal,
+    skipped_winners: int,
+) -> str:
     if matched_trade_count < MIN_CANDIDATE_RULE_SAMPLE_SIZE:
         return "needs_more_data"
-    if gross_delta > 0 and skipped_winners == 0:
+    if net_delta > 0 and skipped_winners == 0:
         return "promote_to_issue"
-    if gross_delta < 0:
+    if net_delta < 0:
         return "reject_candidate"
     return "needs_more_data"
 
@@ -1920,12 +2760,6 @@ def _fee_slippage_bps(closed_trades: list[dict[str, object]]) -> Decimal | None:
     return sum(values, Decimal("0")) / Decimal(len(values))
 
 
-def _trade_round_trip_cost(*, trade: dict[str, object], fee_slippage_bps: Decimal) -> Decimal:
-    buy_notional = (_nested_decimal(trade, ("buy", "price")) or Decimal("0")) * (_nested_decimal(trade, ("buy", "quantity")) or Decimal("0"))
-    sell_notional = (_nested_decimal(trade, ("sell", "price")) or Decimal("0")) * (_nested_decimal(trade, ("sell", "quantity")) or Decimal("0"))
-    return (buy_notional + sell_notional) * fee_slippage_bps / Decimal("10000")
-
-
 def _win_rate_pct(values: list[Decimal]) -> Decimal:
     if not values:
         return Decimal("0")
@@ -1953,6 +2787,13 @@ def _max_drawdown_proxy(values: list[Decimal]) -> Decimal:
 
 
 def _candidate_rule_replay_snippet_lines(candidate_rule_replay: dict[str, object]) -> list[str]:
+    status = str(candidate_rule_replay.get("status") or "")
+    if status in {"blocked", "no_data"}:
+        return [
+            "candidate-rule replay is "
+            f"{status}: {candidate_rule_replay.get('blocked_reason')}; "
+            "gross results are diagnostic only and no rule may be promoted."
+        ]
     rows = candidate_rule_replay.get("rules")
     if not isinstance(rows, list):
         return []
@@ -1961,6 +2802,7 @@ def _candidate_rule_replay_snippet_lines(candidate_rule_replay: dict[str, object
         if isinstance(row, dict):
             lines.append(
                 f"{row.get('rule_id')}: recommendation={row.get('recommendation')}, "
+                f"net_delta={row.get('net_pnl_delta_krw')} KRW, "
                 f"gross_delta={row.get('gross_pnl_delta_krw')} KRW, "
                 f"skipped_winners={row.get('skipped_winners')}, avoided_losers={row.get('avoided_losers')}."
             )
@@ -1976,6 +2818,7 @@ def _snippet(
     broker_asset_performance: dict[str, object],
     account_drawdown_gate: dict[str, object],
 ) -> dict[str, object]:
+    fifo_summary = _feedback_pnl_summary_text(summary)
     hard_gates = []
     for row in lessons.get("patterns_to_downsize_or_reject", []):
         if isinstance(row, dict):
@@ -1985,7 +2828,9 @@ def _snippet(
     for row in lessons.get("worst_losses", []):
         if isinstance(row, dict):
             hard_gates.append(
-                f"Recent worst loss {row.get('symbol')} {row.get('return_pct')}% ({row.get('realized_pnl_krw')} KRW), profile={row.get('target_profile')}, reason={row.get('reason_code')}."
+                f"Recent worst loss {row.get('symbol')} {row.get('return_pct')}% "
+                f"({row.get('realized_pnl_krw')} KRW; {row.get('realized_pnl_basis')}), "
+                f"profile={row.get('target_profile')}, reason={row.get('reason_code')}."
             )
     if broker_asset_performance.get("available"):
         snippet_summary = (
@@ -1994,11 +2839,11 @@ def _snippet(
             f"baseline={broker_asset_performance.get('baseline_total_asset_krw')} KRW, "
             f"latest_total={broker_asset_performance.get('latest_total_asset_krw')} KRW, "
             f"net_asset={broker_asset_performance.get('latest_net_asset_krw')} KRW. "
-            f"FIFO closed-trade realized PnL: {summary.get('realized_pnl_krw')} KRW."
+            f"FIFO closed-trade PnL: {fifo_summary}."
         )
     else:
         snippet_summary = (
-            f"Recent closed trades: pnl={summary.get('realized_pnl_krw')} KRW, "
+            f"Recent closed trades: pnl={fifo_summary}, "
             f"win_rate={summary.get('win_rate_pct')}%, worst_loss={summary.get('worst_loss_krw')} KRW."
         )
     return {
@@ -2015,6 +2860,21 @@ def _snippet(
             "Prefer delay/reject over execute_now when recent worst-loss conditions resemble the current candidate.",
         ],
     }
+
+
+def _feedback_pnl_summary_text(summary: dict[str, object]) -> str:
+    krw_net = summary.get("realized_pnl_krw")
+    prefix = (
+        f"{krw_net} KRW (net after transaction costs)"
+        if krw_net is not None
+        else "unavailable (no complete KRW net aggregate)"
+    )
+    return (
+        f"{prefix}; gross_by_currency={summary.get('gross_realized_pnl_by_currency')}, "
+        f"net_by_currency={summary.get('net_realized_pnl_by_currency')}, "
+        f"cost_coverage={summary.get('transaction_cost_coverage')}, "
+        f"currency_coverage={summary.get('currency_coverage')}"
+    )
 
 
 def _broker_asset_warning_lines(broker_asset_performance: dict[str, object]) -> list[str]:
@@ -2045,18 +2905,37 @@ def _broker_asset_warning_lines(broker_asset_performance: dict[str, object]) -> 
 def _portfolio_risk_snippet_lines(portfolio_risk: dict[str, object]) -> list[str]:
     if not portfolio_risk.get("available"):
         return [f"Portfolio risk unavailable: {portfolio_risk.get('source_failed')}"]
-    lines = [
-        (
-            f"Open holdings={portfolio_risk.get('open_holding_count')}, "
-            f"market_value={portfolio_risk.get('total_market_value_krw')} KRW."
-        )
-    ]
+    aggregation_degraded = portfolio_risk.get("aggregation_status") == "degraded"
+    if aggregation_degraded:
+        lines = [
+            "Currency aggregation degraded: "
+            f"{portfolio_risk.get('aggregation_reason')}; "
+            f"by_currency={portfolio_risk.get('by_currency')}."
+        ]
+    else:
+        lines = [
+            (
+                f"Open holdings={portfolio_risk.get('open_holding_count')}, "
+                f"market_value={portfolio_risk.get('total_market_value')} "
+                f"{portfolio_risk.get('aggregate_currency')}."
+            )
+        ]
     top_positions = portfolio_risk.get("top_position_concentration")
     if isinstance(top_positions, list):
         for row in top_positions[:3]:
             if isinstance(row, dict):
+                weight = (
+                    row.get("currency_weight_pct")
+                    if aggregation_degraded
+                    else row.get("portfolio_weight_pct")
+                )
+                weight_label = (
+                    "currency_weight" if aggregation_degraded else "portfolio_weight"
+                )
                 lines.append(
-                    f"Top concentration {row.get('symbol')}: {row.get('market_value_krw')} KRW ({row.get('portfolio_weight_pct')}%)."
+                    f"Top concentration {row.get('symbol')}: "
+                    f"{row.get('market_value')} {row.get('settlement_currency') or 'UNKNOWN'} "
+                    f"({weight_label}={weight}%)."
                 )
     stale_orders = portfolio_risk.get("stale_open_order_warnings")
     stale_blockers = portfolio_risk.get("stale_state_blockers")
@@ -2102,6 +2981,18 @@ def _markdown_report(report: dict[str, object]) -> str:
     portfolio_risk = report.get("portfolio_risk") if isinstance(report.get("portfolio_risk"), dict) else {}
     account_drawdown_gate = report.get("account_drawdown_gate") if isinstance(report.get("account_drawdown_gate"), dict) else {}
     candidate_rule_replay = report.get("candidate_rule_replay") if isinstance(report.get("candidate_rule_replay"), dict) else {}
+    fifo_summary = _feedback_pnl_summary_text(summary)
+    verified_fifo_krw = summary.get("realized_pnl_krw")
+    fifo_report_line = (
+        f"- FIFO realized P/L: {verified_fifo_krw} KRW; economics: {fifo_summary}"
+        if verified_fifo_krw is not None
+        else f"- FIFO realized P/L: unavailable; economics: {fifo_summary}"
+    )
+    fifo_report_line_ko = (
+        f"- FIFO 실현손익(보조 지표): {verified_fifo_krw} KRW; 경제성: {fifo_summary}"
+        if verified_fifo_krw is not None
+        else f"- FIFO 실현손익(보조 지표): 사용 불가; 경제성: {fifo_summary}"
+    )
     lines = [
         f"# Trade Outcome Feedback {str(report.get('generated_at'))[:10]}",
         "",
@@ -2111,7 +3002,7 @@ def _markdown_report(report: dict[str, object]) -> str:
         f"- Broker total asset change: {summary.get('broker_total_asset_change_krw')} KRW ({summary.get('broker_total_asset_change_pct')}%)"
         if broker_asset.get("available")
         else f"- Broker total asset change: unavailable ({broker_asset.get('source_failed')})",
-        f"- FIFO realized P/L: {summary.get('realized_pnl_krw')} KRW",
+        fifo_report_line,
         f"- Win rate: {summary.get('win_rate_pct')}%",
         f"- Worst loss: {summary.get('worst_loss_krw')} KRW",
         "",
@@ -2120,7 +3011,7 @@ def _markdown_report(report: dict[str, object]) -> str:
         f"- 브로커 총자산 변화: {summary.get('broker_total_asset_change_krw')} KRW ({summary.get('broker_total_asset_change_pct')}%)"
         if broker_asset.get("available")
         else f"- 브로커 총자산 변화: 사용 불가 ({broker_asset.get('source_failed')})",
-        f"- FIFO 실현손익(보조 지표): {summary.get('realized_pnl_krw')} KRW",
+        fifo_report_line_ko,
         f"- 승/패: {summary.get('win_count')}승 / {summary.get('loss_count')}패",
         "- 근거: execution_positions.raw_payload.balance.output2, execution_positions.raw_payload.balance.output1, execution_fills, broker_orders",
         "",
@@ -2181,12 +3072,20 @@ def _markdown_report(report: dict[str, object]) -> str:
         ]
     )
     if portfolio_risk.get("available"):
-        lines.extend(
-            [
-                f"- 보유 종목 수: {portfolio_risk.get('open_holding_count')}",
-                f"- 총 평가 금액: {portfolio_risk.get('total_market_value_krw')} KRW",
-                f"- 평가 금액 누락 포지션: {portfolio_risk.get('positions_missing_market_value_count')}",
-            ]
+        lines.append(f"- 보유 종목 수: {portfolio_risk.get('open_holding_count')}")
+        if portfolio_risk.get("aggregation_status") == "degraded":
+            lines.append(
+                "- 통화 합산 사용 불가: "
+                f"{portfolio_risk.get('aggregation_reason')} "
+                f"(통화별={portfolio_risk.get('by_currency')})"
+            )
+        else:
+            lines.append(
+                f"- 총 평가 금액: {portfolio_risk.get('total_market_value')} "
+                f"{portfolio_risk.get('aggregate_currency')}"
+            )
+        lines.append(
+            f"- 평가 금액 누락 포지션: {portfolio_risk.get('positions_missing_market_value_count')}"
         )
         top_positions = portfolio_risk.get("top_position_concentration")
         if isinstance(top_positions, list) and top_positions:
@@ -2194,7 +3093,10 @@ def _markdown_report(report: dict[str, object]) -> str:
             for row in top_positions[:5]:
                 if isinstance(row, dict):
                     lines.append(
-                        f"  - {row.get('symbol')}: {row.get('market_value_krw')} KRW ({row.get('portfolio_weight_pct')}%)"
+                        f"  - {row.get('symbol')}: {row.get('market_value')} "
+                        f"{row.get('settlement_currency') or 'UNKNOWN'} "
+                        f"(portfolio={row.get('portfolio_weight_pct')}%, "
+                        f"currency={row.get('currency_weight_pct')}%)"
                     )
     else:
         lines.append(f"- 사용 불가: {portfolio_risk.get('source_failed')}")
@@ -2223,6 +3125,7 @@ def _markdown_report(report: dict[str, object]) -> str:
             "### Candidate Rule Replay",
             "",
             f"- Baseline closed trades: {candidate_rule_replay.get('baseline_closed_trade_count')}",
+            f"- Baseline net P/L: {candidate_rule_replay.get('baseline_net_pnl_krw')} KRW",
             f"- Baseline gross P/L: {candidate_rule_replay.get('baseline_gross_pnl_krw')} KRW",
         ]
     )
@@ -2234,8 +3137,9 @@ def _markdown_report(report: dict[str, object]) -> str:
             lines.append(
                 f"- {row.get('rule_id')} ({row.get('rule_name')}): "
                 f"recommendation={row.get('recommendation')}, "
+                f"net_delta={row.get('net_pnl_delta_krw')} KRW, "
                 f"gross_delta={row.get('gross_pnl_delta_krw')} KRW, "
-                f"net_delta={row.get('estimated_net_pnl_delta_krw')} KRW, "
+                f"estimated_net_delta={row.get('estimated_net_pnl_delta_krw')} KRW, "
                 f"win_rate_delta={row.get('win_rate_delta_pct')}%, "
                 f"avg_return_delta={row.get('average_return_delta_pct')}%, "
                 f"drawdown_proxy={row.get('max_drawdown_proxy_krw')} KRW, "
@@ -2579,6 +3483,12 @@ def _decimal_text(value: Decimal | None) -> str | None:
 
 def _quantity_text(value: Decimal) -> str:
     return str(value.quantize(Decimal("0.000000000001"), rounding=ROUND_HALF_UP))
+
+
+def _quantity_value(value: Decimal) -> int | str:
+    if value == value.to_integral_value():
+        return int(value)
+    return _quantity_text(value)
 
 
 def _normalize_utc(value: datetime) -> datetime:

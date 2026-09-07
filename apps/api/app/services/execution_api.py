@@ -18,6 +18,7 @@ from app.models.runtime import (
     ExecutionPosition,
     new_id,
 )
+from app.services.fill_economics import execution_fill_economics
 from app.services.fill_idempotency import dedupe_execution_fills
 from app.services.exec_agent import apply_short_term_exec_agent_decisions
 from app.services.plan_item_identity import (
@@ -535,7 +536,10 @@ def serialize_broker_order(
         "side": order.side,
         "status": order.status,
         "quantity": order.quantity,
-        "base_quantity": _serialize_decimal(order.base_quantity),
+        "base_quantity": _serialize_decimal(
+            order.base_quantity,
+            precision=order.quantity_precision,
+        ),
         "quote_notional": _serialize_decimal(order.quote_notional),
         "quantity_precision": order.quantity_precision,
         "price_precision": order.price_precision,
@@ -594,6 +598,7 @@ def _serialize_execution_fill(fill: ExecutionFill) -> dict[str, object]:
     source_identity = None
     if fill.broker_order.plan_item is not None:
         source_identity = serialize_plan_item_source_identity(fill.broker_order.plan_item)
+    economics = execution_fill_economics(fill)
     return {
         "execution_fill_id": fill.id,
         "broker_order_pk": fill.broker_order_pk,
@@ -604,6 +609,11 @@ def _serialize_execution_fill(fill: ExecutionFill) -> dict[str, object]:
         "base_quantity": _serialize_decimal(fill.base_quantity),
         "quote_notional": _serialize_decimal(fill.quote_notional),
         "price": _serialize_decimal(fill.price),
+        "settlement_currency": economics.settlement_currency,
+        "settlement_currency_conflict": economics.settlement_currency_conflict,
+        "transaction_cost": _serialize_decimal(economics.transaction_cost),
+        "transaction_cost_coverage": economics.transaction_cost_coverage,
+        "transaction_cost_source": economics.transaction_cost_source,
         "filled_at": _serialize_datetime(fill.filled_at),
         "payload": fill.payload,
         "source_identity": source_identity,
@@ -640,8 +650,16 @@ def _serialize_datetime(value: datetime | None) -> str | None:
     return value.isoformat() if value else None
 
 
-def _serialize_decimal(value: Decimal | None) -> str | None:
-    return str(value) if value is not None else None
+def _serialize_decimal(
+    value: Decimal | None,
+    *,
+    precision: int | None = None,
+) -> str | None:
+    if value is None:
+        return None
+    if precision is not None:
+        return format(value, f".{precision}f")
+    return str(value)
 
 
 def _risk_context_value(item: ExecutionPlanItem, key: str) -> object | None:

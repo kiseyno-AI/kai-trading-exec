@@ -451,6 +451,10 @@ class ExecutionFill(TimestampMixin, Base):
     base_quantity: Mapped[Decimal | None] = mapped_column(Numeric(28, 12))
     quote_notional: Mapped[Decimal | None] = mapped_column(Numeric(28, 4))
     price: Mapped[Decimal] = mapped_column(Numeric(18, 4), nullable=False)
+    settlement_currency: Mapped[str | None] = mapped_column(String(8))
+    transaction_cost: Mapped[Decimal | None] = mapped_column(Numeric(28, 8))
+    transaction_cost_coverage: Mapped[str | None] = mapped_column(String(16))
+    transaction_cost_source: Mapped[str | None] = mapped_column(String(64))
     filled_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     payload: Mapped[dict[str, Any] | None] = mapped_column(JSON, deferred=True)
 
