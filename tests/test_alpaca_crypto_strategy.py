@@ -353,6 +353,114 @@ def test_protective_exit_dedupes_strategy_fills_and_preserves_manual_inventory(
         assert db.query(ExecutionFill).count() == 3
 
 
+def test_protective_exit_excludes_conflicting_duplicate_strategy_fill_quantity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed_at = datetime(2026, 8, 16, 0, 5, tzinfo=UTC)
+    settings = _settings()
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    service = AlpacaCryptoStrategyService(settings=settings, session_factory=session_factory)
+    submitted: list[tuple[Decimal, dict[str, object], str]] = []
+
+    with session_factory() as db:
+        state = CryptoStrategyState(
+            mode="paper",
+            provider="alpaca",
+            strategy_version=settings.alpaca_crypto_strategy_version,
+            symbol="BTC/USD",
+            eligible=True,
+            target_fraction=Decimal("0.40"),
+            high_water_price=Decimal("120"),
+            protective_stop_price=Decimal("100"),
+            metrics={"quantity_increment": "0.00000001"},
+        )
+        strategy_order = BrokerOrder(
+            broker_name="alpaca",
+            mode="paper",
+            idempotency_key="strategy-conflicting-buy",
+            broker_order_id="strategy-conflicting-buy",
+            symbol="BTC/USD",
+            side="buy",
+            status="filled",
+            base_quantity=Decimal("0.25"),
+            venue="alpaca",
+            asset_class="crypto",
+            request_metadata={"source": "alpaca_crypto_strategy:daily_rebalance"},
+        )
+        db.add_all([state, strategy_order])
+        db.flush()
+        db.add_all([
+            ExecutionFill(
+                broker_order_pk=strategy_order.id,
+                broker_fill_id="strategy-conflicting-fill",
+                symbol="BTC/USD",
+                side="buy",
+                quantity=0,
+                base_quantity=Decimal("0.25"),
+                quote_notional=Decimal("25"),
+                price=Decimal("100"),
+                filled_at=observed_at - timedelta(minutes=5),
+            ),
+            ExecutionFill(
+                broker_order_pk=strategy_order.id,
+                broker_fill_id="strategy-conflicting-fill",
+                symbol="BTC/USD",
+                side="buy",
+                quantity=0,
+                base_quantity=Decimal("0.30"),
+                quote_notional=Decimal("30"),
+                price=Decimal("100"),
+                filled_at=observed_at - timedelta(minutes=5),
+            ),
+        ])
+        db.commit()
+
+    def fake_place_broker_order(*, command, request_source, **_kwargs):  # noqa: ANN003, ANN201
+        submitted.append((command.base_quantity, command.metadata, request_source))
+        return PlaceBrokerOrderResult(
+            status_code=201,
+            payload={"duplicate": False, "message": "paper order accepted", "order": {"status": "submitted"}},
+        )
+
+    monkeypatch.setattr(strategy_module, "place_broker_order", fake_place_broker_order)
+    adapter = FakeStrategyAdapter(
+        observed_at=observed_at,
+        holdings=[
+            BrokerAccountHolding(
+                symbol="BTC/USD",
+                quantity=0,
+                payload={"base_quantity": "1.0"},
+            )
+        ],
+    )
+
+    result = service.run_cycle(
+        adapter=adapter,  # type: ignore[arg-type]
+        access_token="test",
+        quotes={
+            "BTC/USD": BrokerLiveMarketContext(
+                symbol="BTC/USD",
+                exchange="ALPACA",
+                observed_at=observed_at,
+                bid=Decimal("99"),
+                ask=Decimal("100"),
+                spread=Decimal("1"),
+                spread_bps=Decimal("100"),
+            )
+        },
+        observed_at=observed_at,
+    )
+
+    assert result["protective_actions"] == []
+    assert submitted == []
+    with session_factory() as db:
+        state = db.query(CryptoStrategyState).filter_by(symbol="BTC/USD").one()
+        assert state.strategy_owned_base_quantity == Decimal("0E-12")
+        assert db.query(ExecutionFill).count() == 2
+
+
 def test_force_exit_caps_crypto_sell_to_strategy_owned_quantity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

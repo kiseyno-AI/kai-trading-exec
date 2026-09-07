@@ -644,13 +644,65 @@ def test_conflicting_duplicate_fill_reader_does_not_silently_canonicalize() -> N
     quality = broker_order_fill_quality_payload(settings=settings, db=db)
     fills = db.scalars(select(ExecutionFill).order_by(ExecutionFill.id.asc())).all()
 
-    assert [fill.id for fill in dedupe_execution_fills(fills)] == [
-        fills[0].id,
-        fills[1].id,
-    ]
+    assert dedupe_execution_fills(fills) == []
     assert quality["duplicate_fill_group_count"] == 1
     assert quality["duplicate_fill_groups"][0]["economic_conflict"] is True
     assert quality["duplicate_fill_groups"][0]["conflicting_fields"] == ["price"]
+    engine.dispose()
+
+
+def test_quote_notional_conflict_requires_manual_review_and_is_excluded_from_readers() -> None:
+    settings = _settings()
+    engine, db = _session(settings)
+    order = _duplicate_fill_order()
+    db.add(order)
+    db.flush()
+    first = ExecutionFill(
+        id="a-quote-notional-conflict-fill",
+        broker_order_pk=order.id,
+        broker_fill_id="quote-notional-conflict-fill",
+        symbol=order.symbol,
+        side=order.side,
+        quantity=1,
+        base_quantity=Decimal("1.0"),
+        quote_notional=None,
+        price=Decimal("73000"),
+        filled_at=SOLD_AT,
+    )
+    second = ExecutionFill(
+        id="b-quote-notional-conflict-fill",
+        broker_order_pk=order.id,
+        broker_fill_id="quote-notional-conflict-fill",
+        symbol=order.symbol,
+        side=order.side,
+        quantity=1,
+        base_quantity=Decimal("1.0"),
+        quote_notional=Decimal("73000"),
+        price=Decimal("73000"),
+        filled_at=SOLD_AT,
+    )
+    db.add_all([first, second])
+    db.commit()
+
+    dry_run = analyze_execution_fill_repairs(db=db, runtime_mode="paper")
+    applied = apply_execution_fill_repairs(
+        db=db,
+        runtime_mode="paper",
+        actor="test-operator",
+        reason="duplicate broker fill has conflicting quote notional",
+        now=SOLD_AT,
+    )
+    fills = db.scalars(select(ExecutionFill).order_by(ExecutionFill.id.asc())).all()
+    quality = broker_order_fill_quality_payload(settings=settings, db=db)
+
+    assert dedupe_execution_fills(fills) == []
+    assert dry_run["duplicate_fill_groups"][0]["economic_conflict"] is True
+    assert dry_run["duplicate_fill_groups"][0]["conflicting_fields"] == ["quote_notional"]
+    assert dry_run["duplicate_fill_groups"][0]["repair_action"] == "record_manual_review"
+    assert applied["summary"]["applied_duplicate_isolation_count"] == 0
+    assert applied["summary"]["applied_manual_review_count"] == 1
+    assert quality["duplicate_fill_groups"][0]["economic_conflict"] is True
+    assert quality["duplicate_fill_groups"][0]["conflicting_fields"] == ["quote_notional"]
     engine.dispose()
 
 

@@ -1023,6 +1023,18 @@ def _duplicate_group_conflicting_fields(group: list[ExecutionFill]) -> list[str]
         > 1
     ):
         fields.append("base_quantity")
+    if (
+        len(
+            {
+                _decimal_text(Decimal(fill.quote_notional))
+                if fill.quote_notional is not None
+                else None
+                for fill in group
+            }
+        )
+        > 1
+    ):
+        fields.append("quote_notional")
     if len({_decimal_text(Decimal(fill.price)) for fill in group}) > 1:
         fields.append("price")
     return fields

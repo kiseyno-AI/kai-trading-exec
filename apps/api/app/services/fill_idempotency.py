@@ -75,7 +75,6 @@ def dedupe_execution_fills(fills: list[ExecutionFill]) -> list[ExecutionFill]:
     for fill in fills:
         key = execution_fill_dedupe_key(fill)
         if key in conflicting_keys:
-            unique.append(fill)
             continue
         if key in seen:
             continue
@@ -92,6 +91,9 @@ def duplicate_fill_economic_conflict(fills: list[ExecutionFill]) -> bool:
                 Decimal(fill.base_quantity) if fill.base_quantity is not None else None
             ),
             _decimal_key(Decimal(fill.price)),
+            _optional_decimal_key(
+                Decimal(fill.quote_notional) if fill.quote_notional is not None else None
+            ),
         )
         for fill in fills
     }

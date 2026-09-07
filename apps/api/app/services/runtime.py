@@ -130,6 +130,7 @@ class DuplicateFillQualityGroup:
     duplicate_count: int
     quantity_variants: int
     base_quantity_variants: int
+    quote_notional_variants: int
     price_variants: int
     candidate_key: str
 
@@ -465,6 +466,7 @@ def broker_order_fill_quality_payload(
             "economic_conflict": (
                 int(row.quantity_variants or 0) > 1
                 or int(row.base_quantity_variants or 0) > 1
+                or int(row.quote_notional_variants or 0) > 1
                 or int(row.price_variants or 0) > 1
             ),
             "conflicting_fields": [
@@ -472,6 +474,7 @@ def broker_order_fill_quality_payload(
                 for field, count in (
                     ("quantity", row.quantity_variants),
                     ("base_quantity", row.base_quantity_variants),
+                    ("quote_notional", row.quote_notional_variants),
                     ("price", row.price_variants),
                 )
                 if int(count or 0) > 1
@@ -534,6 +537,14 @@ def _duplicate_fill_quality_groups(
                     {
                         _decimal_text(Decimal(fill.base_quantity))
                         if fill.base_quantity is not None
+                        else None
+                        for fill in group
+                    }
+                ),
+                quote_notional_variants=len(
+                    {
+                        _decimal_text(Decimal(fill.quote_notional))
+                        if fill.quote_notional is not None
                         else None
                         for fill in group
                     }
