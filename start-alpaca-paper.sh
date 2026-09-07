@@ -21,6 +21,7 @@ fi
 PYTHON_BIN="${PYTHON_BIN:-python3.12}"
 HOST="${HOST:-${KAI_EXEC_API_HOST:-127.0.0.1}}"
 PORT="${PORT:-8011}"
+API_BEARER_TOKEN="${KAI_EXEC_API_BEARER_TOKEN:-}"
 
 is_loopback_host() {
   case "${1:-}" in
@@ -29,7 +30,7 @@ is_loopback_host() {
   esac
 }
 
-if ! is_loopback_host "$HOST" && [ -z "${KAI_EXEC_API_BEARER_TOKEN//[[:space:]]/}" ]; then
+if ! is_loopback_host "$HOST" && [ -z "${API_BEARER_TOKEN//[[:space:]]/}" ]; then
   echo "KAI_EXEC_API_BEARER_TOKEN is required when KAI_EXEC_API_HOST is not loopback: $HOST" >&2
   exit 1
 fi
