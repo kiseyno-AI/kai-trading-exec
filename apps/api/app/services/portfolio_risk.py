@@ -643,6 +643,7 @@ def build_portfolio_risk_snapshot(
     db: Session,
     adapter: BrokerAdapter | None = None,
     now: datetime | None = None,
+    market_scope: str = "all",
 ) -> dict[str, object]:
     generated_at = now or datetime.now(UTC)
     all_positions = _load_positions(settings=settings, db=db)
@@ -678,6 +679,7 @@ def build_portfolio_risk_snapshot(
         adapter=adapter,
         symbols=local_symbols,
         metadata_hints=metadata_hints,
+        market_scope=market_scope,
     )
     raw_balance_freshness_as_of = now or datetime.now(UTC)
     raw_balance_valid = broker_raw_balance_is_valid(snapshot.payload if snapshot is not None else None)
@@ -718,6 +720,14 @@ def build_portfolio_risk_snapshot(
         _open_orders_from_snapshot(snapshot) if snapshot is not None else [],
         local_open_orders,
     )
+    if market_scope in {"krx", "us"}:
+        expected_currency = "KRW" if market_scope == "krx" else "USD"
+        holdings = [
+            row for row in holdings if row.settlement_currency == expected_currency
+        ]
+        open_orders = [
+            row for row in open_orders if row.settlement_currency == expected_currency
+        ]
     holding_currency_state = aggregation_state_with_value_coverage(
         currency_aggregation_state(
             row.settlement_currency for row in holdings
@@ -853,6 +863,7 @@ def build_portfolio_risk_snapshot(
     return {
         "generated_at": generated_at.isoformat(),
         "mode": settings.runtime_mode,
+        "market_scope": market_scope,
         "source_status": source_status["status"],
         "source_reason": source_status["reason"],
         "aggregation_status": overall_currency_state["status"],
@@ -930,6 +941,7 @@ def _load_account_snapshot_if_available(
     adapter: BrokerAdapter | None,
     symbols: list[str],
     metadata_hints: dict[str, SymbolRiskMetadataHint],
+    market_scope: str = "all",
 ) -> tuple[BrokerAccountSnapshot | None, dict[str, str | None]]:
     if adapter is None:
         return None, {
@@ -971,6 +983,7 @@ def _load_account_snapshot_if_available(
             settings=settings,
             symbols=symbols,
             metadata_hints=metadata_hints,
+            market_scope=market_scope,
         )
         if not exchanges:
             return None, {
@@ -1043,7 +1056,12 @@ def _kis_account_snapshot_exchanges(
     settings: Settings,
     symbols: list[str],
     metadata_hints: dict[str, SymbolRiskMetadataHint],
+    market_scope: str = "all",
 ) -> tuple[list[str], str | None]:
+    if market_scope == "krx":
+        return ["KRX"], None
+    if market_scope == "us":
+        return ["AMEX", "NASD", "NYSE"], None
     if not symbols:
         exchanges = {"KRX"}
         if settings.kis_us_trading_enabled:
