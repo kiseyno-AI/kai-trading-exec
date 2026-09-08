@@ -203,7 +203,7 @@ See [the Alpaca setup and activation runbook](docs/ALPACA_CRYPTO_SETUP.md) befor
 
 ### Monitoring, sizing, and risk
 
-Important monitoring controls include `KAI_EXEC_DISPATCH_LOOP_INTERVAL_SECONDS`, `KAI_EXEC_MONITORING_LOOP_INTERVAL_SECONDS`, cycle timeout, maximum symbols/actions per cycle, quote age, allowed future clock skew, retry cooldown, late-entry mode/cutoff, live market-quality veto, turnover threshold, profit-protection thresholds, and breakeven buffer. Live price-triggered buys and sells reject quotes whose `observed_at` is missing, timezone-naive, too old, or more than `KAI_EXEC_MONITORING_MAX_QUOTE_FUTURE_SKEW_SECONDS` (default 5 seconds) in the future. Paper and mock modes retain timestamp-optional compatibility; when a timestamp is present, age and future-skew checks still apply.
+Important monitoring controls include `KAI_EXEC_DISPATCH_LOOP_INTERVAL_SECONDS`, `KAI_EXEC_MONITORING_LOOP_INTERVAL_SECONDS`, cycle timeout, maximum symbols/actions per cycle, quote age, allowed future clock skew, retry cooldown, late-entry mode/cutoff, live market-quality veto, turnover threshold, profit-protection thresholds, and breakeven buffer. All KIS REST requests within the Exec process are serialized with `KAI_EXEC_KIS_MIN_REQUEST_INTERVAL_SECONDS` (default `0.12`) to stay below the broker's per-second transaction ceiling when quote, balance, and reconciliation work overlap. Live price-triggered buys and sells reject quotes whose `observed_at` is missing, timezone-naive, too old, or more than `KAI_EXEC_MONITORING_MAX_QUOTE_FUTURE_SKEW_SECONDS` (default 5 seconds) in the future. Paper and mock modes retain timestamp-optional compatibility; when a timestamp is present, age and future-skew checks still apply.
 
 Short-term sizing is bounded by:
 
