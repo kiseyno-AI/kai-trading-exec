@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import ssl
 import threading
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
@@ -99,8 +100,16 @@ class JsonHttpClient(Protocol):
 
 
 class UrllibJsonHttpClient:
-    def __init__(self, *, ssl_context: ssl.SSLContext | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        ssl_context: ssl.SSLContext | None = None,
+        min_request_interval_seconds: float = 0.0,
+    ) -> None:
         self._ssl_context = ssl_context or _default_ssl_context()
+        self._min_request_interval_seconds = max(0.0, min_request_interval_seconds)
+        self._request_lock = threading.Lock()
+        self._last_request_started_at: float | None = None
 
     def get_json(
         self,
@@ -146,6 +155,7 @@ class UrllibJsonHttpClient:
         request: Request,
         timeout_seconds: float,
     ) -> JsonHttpResponse:
+        self._wait_for_request_slot()
         try:
             with urlopen(
                 request,
@@ -176,6 +186,21 @@ class UrllibJsonHttpClient:
                 normalized_status=NormalizedBrokerOrderStatus.RETRY_PENDING,
             ) from exc
 
+    def _wait_for_request_slot(self) -> None:
+        if self._min_request_interval_seconds <= 0:
+            return
+        with self._request_lock:
+            now = time.monotonic()
+            if self._last_request_started_at is not None:
+                remaining = (
+                    self._min_request_interval_seconds
+                    - (now - self._last_request_started_at)
+                )
+                if remaining > 0:
+                    time.sleep(remaining)
+                    now = time.monotonic()
+            self._last_request_started_at = now
+
 
 class KisBrokerAdapter(BrokerAdapter):
     provider = KIS_PROVIDER
@@ -187,7 +212,9 @@ class KisBrokerAdapter(BrokerAdapter):
         http_client: JsonHttpClient | None = None,
     ) -> None:
         self.settings = settings
-        self.http_client = http_client or UrllibJsonHttpClient()
+        self.http_client = http_client or UrllibJsonHttpClient(
+            min_request_interval_seconds=settings.kis_min_request_interval_seconds,
+        )
 
     def describe(self) -> BrokerConfig:
         api_base_url = _resolve_api_base_url(self.settings)

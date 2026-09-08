@@ -578,7 +578,11 @@ def position_truth_freshness_payload(
 ) -> dict[str, object]:
     observed_at = now or datetime.now(UTC)
     stale_before = observed_at - timedelta(seconds=settings.exec_agent_max_account_snapshot_age_seconds)
-    evidence_symbols = _position_truth_evidence_symbols(settings=settings, db=db)
+    evidence_symbols = _position_truth_evidence_symbols(
+        settings=settings,
+        db=db,
+        now=observed_at,
+    )
     positions = db.scalars(
         select(ExecutionPosition).where(
             ExecutionPosition.mode == settings.runtime_mode,
@@ -943,6 +947,7 @@ def _position_truth_evidence_symbols(
     *,
     settings: Settings,
     db: Session,
+    now: datetime | None = None,
 ) -> set[str]:
     symbols = set(
         db.scalars(
@@ -951,6 +956,7 @@ def _position_truth_evidence_symbols(
                 *active_local_broker_order_filters(
                     settings=settings,
                     statuses=CAPITAL_RESERVING_ORDER_STATUSES,
+                    now=now,
                 )
             )
             .distinct()

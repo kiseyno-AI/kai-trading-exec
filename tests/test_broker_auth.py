@@ -9,6 +9,7 @@ from sqlalchemy import select
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.api.schemas.execution import PlaceOrderRequest
+from app.broker import kis as kis_module
 from app.broker.base import (
     BrokerAccountHolding,
     BrokerAccountOpenOrder,
@@ -31,6 +32,7 @@ from app.broker.kis import (
     KIS_WEBSOCKET_APPROVAL_PATH,
     JsonHttpResponse,
     KisBrokerAdapter,
+    UrllibJsonHttpClient,
 )
 from app.core.config import Settings, load_settings
 from app.db.base import Base
@@ -393,6 +395,7 @@ def test_settings_load_kis_environment_fields() -> None:
             "KAI_EXEC_KIS_ACCOUNT_NUMBER": "12345678",
             "KAI_EXEC_KIS_ACCOUNT_PRODUCT_CODE": "01",
             "KAI_EXEC_KIS_HTS_ID": "ops-user",
+            "KAI_EXEC_KIS_MIN_REQUEST_INTERVAL_SECONDS": "0.25",
         },
     )
 
@@ -402,6 +405,20 @@ def test_settings_load_kis_environment_fields() -> None:
     assert settings.kis_account_number == "12345678"
     assert settings.kis_account_product_code == "01"
     assert settings.kis_hts_id == "ops-user"
+    assert settings.kis_min_request_interval_seconds == 0.25
+
+
+def test_kis_http_client_serializes_request_start_times(monkeypatch) -> None:
+    monotonic_values = iter((10.0, 10.02, 10.12))
+    sleeps: list[float] = []
+    monkeypatch.setattr(kis_module.time, "monotonic", lambda: next(monotonic_values))
+    monkeypatch.setattr(kis_module.time, "sleep", sleeps.append)
+    client = UrllibJsonHttpClient(min_request_interval_seconds=0.12)
+
+    client._wait_for_request_slot()
+    client._wait_for_request_slot()
+
+    assert sleeps == [pytest.approx(0.1)]
 
 
 def test_settings_load_profit_protection_environment_fields() -> None:

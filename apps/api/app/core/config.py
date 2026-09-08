@@ -177,6 +177,7 @@ class Settings(BaseModel):
     kis_customer_type: str = "P"
     kis_use_hashkey: bool = True
     kis_request_timeout_seconds: int = Field(default=10, ge=1, le=120)
+    kis_min_request_interval_seconds: float = Field(default=0.12, ge=0, le=10)
     kis_us_trading_enabled: bool = False
     kis_us_live_trading_enabled: bool = False
     kis_us_live_confirmation_token: str | None = None
@@ -522,6 +523,7 @@ _ENV_FIELDS = {
     "KIS_CUSTOMER_TYPE": "kis_customer_type",
     "KIS_USE_HASHKEY": "kis_use_hashkey",
     "KIS_REQUEST_TIMEOUT_SECONDS": "kis_request_timeout_seconds",
+    "KIS_MIN_REQUEST_INTERVAL_SECONDS": "kis_min_request_interval_seconds",
     "KIS_US_TRADING_ENABLED": "kis_us_trading_enabled",
     "KIS_US_LIVE_TRADING_ENABLED": "kis_us_live_trading_enabled",
     "KIS_US_LIVE_CONFIRMATION_TOKEN": "kis_us_live_confirmation_token",
