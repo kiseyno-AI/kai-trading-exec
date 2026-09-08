@@ -224,6 +224,13 @@ Current response includes:
 - `paused`, `kill_switch_enabled`, `automation_enabled`
 - `automated_order_submission_allowed`
 - `automated_order_submission_block_reason`
+- `automated_buy_submission_allowed`
+- `automated_buy_submission_block_reason`
+- `hourly_risk_off`
+  - `available`
+  - `active`
+  - `epoch`
+  - `context`
 - `readiness_reason`
 - `last_change`
   - `action`
@@ -232,6 +239,48 @@ Current response includes:
   - `reason`
   - `changed_at`
   - `event_id`
+
+If the runtime-control schema cannot be read, both automated submission flags
+fail closed. In that fallback payload `hourly_risk_off.available` is `false`
+and its state fields are `null`, so clients do not mistake missing fence truth
+for an inactive fence.
+
+### `POST /runtime/plan-judgment/action`
+
+Apply one hourly risk judgment to the durable global buy fence and its persisted
+`intraday_watch_buy` and `next_open_buy` projections. The body accepts
+`risk_flags` and `risk_reasons[]`.
+
+- `risk_flags >= 3` first activates the global buy-only fence, then expires all
+  mutable buy watches/jobs and records each prior safe status plus recovery
+  state. Projection is durably marked pending before item mutation. A late buy
+  candidate is still fenced at broker submission and is picked up by the next
+  active-fence reconciliation scan.
+- `risk_flags >= 1` keeps the fence and risk-off-expired items blocked, clears
+  healthy progress, and restarts the recovery cooldown.
+- `risk_flags == 0` records a later healthy observation. The fence clears only
+  after the configured observation count and cooldown are both satisfied and
+  every hourly-expired projection has been reconciled. The pending marker and
+  global fence remain active if any projection fails or another mutable buy is
+  discovered during reconciliation.
+
+Only items tagged as expired by this hourly action are eligible. Manual expiry,
+rejection, and unrelated status changes are not reversed. A restored item is
+only eligible for later monitoring or job dispatch. Transient in-flight states
+resume as a safe retry state rather than being replayed as in-flight. Trigger/job
+validity, quote freshness, broker session, runtime controls, account gates,
+sizing, and buying power are checked again before submission. Sells and explicit
+risk-reduction/protective-hedge orders are not stopped by this buy fence.
+
+An applied response includes `status`, `action`, `message`, `changed_count`,
+`recovery_observed_count`, `recovery_reset_count`, and
+`recovery_resumed_count`. Recovery uses
+`KAI_EXEC_HOURLY_PLAN_JUDGMENT_RECOVERY_REQUIRED_HEALTHY_OBSERVATIONS`
+(default `2`) and
+`KAI_EXEC_HOURLY_PLAN_JUDGMENT_RECOVERY_COOLDOWN_SECONDS` (default `900`).
+Counted observations must also be separated by
+`KAI_EXEC_HOURLY_PLAN_JUDGMENT_RECOVERY_MIN_OBSERVATION_INTERVAL_SECONDS`
+(default `300`) so duplicate scheduler/API calls cannot satisfy recovery immediately.
 
 ## Persistence boundary
 
@@ -668,6 +717,13 @@ active plan intent before submitting through the normal `/orders` idempotency
 path. Permanent rejects such as insufficient cash or insufficient sellable
 quantity record `skipped` and do not create retry jobs.
 
+When a due KIS buy is held by account-drawdown recovery, dispatch leaves the job
+scheduled instead of treating the durable rejected source order as a terminal
+job failure. When the recovery response supplies `retry_after_at`, dispatch moves
+`scheduled_for` to that time instead of polling through the cooldown. A later
+attempt still rebuilds and validates the current job/order request before it can
+add a recovery observation or submit.
+
 ### `POST /execution-jobs/dispatch`
 Manually dispatch due execution jobs through the broker adapter boundary.
 
@@ -707,6 +763,12 @@ The autonomous runtime now retries persisted `*_triggered_pending_dispatch` and
 `*_triggered_blocked` monitoring items on its configured cadence, and can also
 evaluate fresh triggers when a monitoring price source is configured. This
 endpoint remains as an operator/manual override.
+
+For KIS watch buys, monitoring checks the configured account/currency recovery
+latch before risk sizing. A known cooldown remains blocked without an extra
+broker snapshot; once eligible, the order service repeats the recovery check
+under its serialized intent boundary. Only fresh, complete, sufficiently spaced
+broker snapshots can advance the durable healthy-observation count.
 
 Suggested body shape:
 - `actor`
@@ -770,6 +832,55 @@ accepted. The service checks configured USD notional caps and the adapter
 performs a broker buying-power preflight before buy submission. Reconciliation
 uses KIS overseas order/fill history and preserves cumulative partial-fill
 quantities; account sync uses overseas balance and unfilled-order endpoints.
+
+KIS account-loss blocks are scoped to an opaque fingerprint of the configured
+account and its settlement currency (`krw` or `usd`). A policy-marked rejected
+buy latches all new buys in that exact lane until recovery completes. The default
+recovery policy requires a 300-second cooldown, two distinct healthy broker
+snapshots at least 60 seconds apart, and loss metrics below `0.80` times their
+stop thresholds. Account snapshots accept at most 30 seconds of future clock
+skew by default.
+Snapshots that are unavailable, stale, future-dated, incomplete for any enabled
+gate, or still unhealthy fail closed and reset progress.
+
+For a plan-linked source, only the same automated monitoring, execution-job, or
+short-term-watcher intent can advance observations while the gate is enabled.
+For an unlinked direct KIS stock source, only an exact replay of the original
+normalized `POST /orders` command—including every economic field and the same
+idempotency key—can advance it. A changed payload, another plan item, symbol, or
+idempotency key cannot bypass or accelerate recovery. On release, Exec preserves
+the source order as `rejected`, appends recovery evidence to plan-item audits or
+the unlinked source's broker-order events, and submits the current validated
+candidate using a deterministic child idempotency generation. Runtime controls,
+plan/trigger or job validity, session/route, cash and buying power, exposure, and
+reliable open-order truth remain mandatory. Current-policy metadata prevents
+deployment alone from reviving legacy rejected rows. The current policy marker
+and exact opaque account scope are required even when an operator disables the
+loss gate; disabling it bypasses only the health-threshold wait for that same
+proven scope. A terminal or operator-cancelled source is not resurrected and
+requires reviewed operator remediation before its account lane can trade again.
+
+Every KIS submission intent records an opaque `broker_account_scope`. A
+pre-broker runtime-safety rejection is reusable only under that same scope;
+legacy fenced intents without scope evidence and cross-account replays remain
+frozen.
+
+An initial loss block returns `409` with `blocked`, `block_reason`,
+`account_drawdown_gate`, `sells_risk_reduction_allowed`, and the durable rejected
+`order`. While the latch is cooling down or observing, `409` instead includes
+`retry_after_at` when applicable and `account_drawdown_recovery` with source
+lineage, observation progress when available, and the latest decision summary.
+
+`KAI_EXEC_ACCOUNT_DRAWDOWN_RECOVERY_SCOPE_SECRET` supplies a stable HMAC key for
+the opaque account scope and should be kept constant across KIS credential
+rotation. When unset, Exec falls back to the KIS app secret and then app key for
+backward compatibility; changing that fallback changes the recovery scope. An
+orphaned same-provider/currency latch then fails closed with
+`account_drawdown_recovery_scope_mismatch` until the original scope secret is
+restored. Disabling the gate does not waive scope proof. If that secret is no
+longer available, the latch requires reviewed operator remediation. A shared
+database used by multiple KIS accounts should always use a stable dedicated
+scope secret.
 
 Current response includes:
 - `duplicate`

@@ -4,9 +4,10 @@ import logging
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal, ROUND_DOWN
+from time import monotonic
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session, selectinload
 
 from app.api.schemas.execution import PlaceOrderRequest
@@ -15,10 +16,20 @@ from app.broker.base import (
     NormalizedBrokerOrderStatus,
 )
 from app.core.config import Settings
-from app.models.runtime import BrokerOrder, ExecutionJob, ExecutionPlan, ExecutionPlanItem, new_id
+from app.models.runtime import (
+    BrokerOrder,
+    ExecutionJob,
+    ExecutionPlan,
+    ExecutionPlanItem,
+    RuntimeControlState,
+    new_id,
+)
 from app.services.broker_orders import place_broker_order
 from app.services.broker_auth import build_broker_adapter
 from app.services.monitoring_price_source import is_us_regular_session, next_us_regular_open
+from app.services.plan_judgment_actions import (
+    project_buy_plan_item_for_hourly_risk_off,
+)
 from app.services.rejected_order_retries import (
     BROKER_ORDER_RETRY_JOB_TYPE,
     RetryOrderGuardError,
@@ -26,6 +37,7 @@ from app.services.rejected_order_retries import (
     record_retry_dispatch_result,
 )
 from app.services.runtime_controls import (
+    RUNTIME_CONTROL_ID,
     automated_order_submission_allowed,
     automated_order_submission_block_reason,
     ensure_runtime_control_state,
@@ -41,6 +53,34 @@ NEXT_OPEN_BUY_JOB_TYPE = "next_open_buy"
 CRYPTO_PAPER_ORDER_JOB_TYPE = "crypto_paper_order"
 UPBIT_PAPER_ALLOWED_SYMBOLS = frozenset({"KRW-BTC", "KRW-ETH"})
 DISPATCHABLE_JOB_STATUSES = ("queued", "scheduled", "retrying")
+RETRYABLE_ACCOUNT_DRAWDOWN_BLOCK_REASONS = frozenset(
+    {
+        "account_drawdown_recovery_cooldown",
+        "account_drawdown_recovery_disabled",
+        "account_drawdown_recovery_observation_interval",
+        "account_drawdown_recovery_pending",
+        "account_drawdown_recovery_scope_mismatch",
+        "account_drawdown_recovery_state_changed",
+    }
+)
+CLAIMABLE_PLAN_ITEM_STATUSES_BY_JOB_TYPE = {
+    NEXT_OPEN_BUY_JOB_TYPE: frozenset(
+        {
+            "next_open_buy_scheduled",
+            "next_open_buy_retry_pending",
+            "new_buy_blocked",
+        }
+    ),
+    BROKER_ORDER_RETRY_JOB_TYPE: frozenset({"broker_order_retry_pending"}),
+    CRYPTO_PAPER_ORDER_JOB_TYPE: frozenset(
+        {"crypto_paper_queued", "crypto_paper_retry_pending"}
+    ),
+}
+CLAIMABLE_PLAN_ITEM_STATUSES = frozenset(
+    status
+    for statuses in CLAIMABLE_PLAN_ITEM_STATUSES_BY_JOB_TYPE.values()
+    for status in statuses
+)
 MIN_STALE_RUNNING_JOB_SECONDS = 30
 STALE_RUNNING_JOB_TIMEOUT_MULTIPLIER = 3
 COMPLETED_JOB_ORDER_STATUSES = frozenset(
@@ -195,6 +235,7 @@ def dispatch_due_execution_jobs(
         .where(
             ExecutionPlan.mode == settings.runtime_mode,
             ExecutionJob.status.in_(DISPATCHABLE_JOB_STATUSES),
+            ExecutionPlanItem.status.in_(CLAIMABLE_PLAN_ITEM_STATUSES),
         )
         .options(
             selectinload(ExecutionJob.plan_item).selectinload(ExecutionPlanItem.plan),
@@ -216,7 +257,9 @@ def dispatch_due_execution_jobs(
         ):
             serialized_jobs.append(serialize_execution_job(job))
             continue
-        _claim_job(db=db, job=job, triggered_at=triggered_at)
+        if not _claim_job(db=db, job=job, triggered_at=triggered_at):
+            serialized_jobs.append(serialize_execution_job(job))
+            continue
         result = _dispatch_job(
             settings=settings,
             db=db,
@@ -276,7 +319,25 @@ def _claim_job(
     db: Session,
     job: ExecutionJob,
     triggered_at: datetime,
-) -> None:
+) -> bool:
+    claimable_plan_item_statuses = CLAIMABLE_PLAN_ITEM_STATUSES_BY_JOB_TYPE.get(
+        job.job_type,
+        frozenset(),
+    )
+    claim_state = db.execute(
+        select(ExecutionJob.status, ExecutionPlanItem.status)
+        .join(ExecutionJob.plan_item)
+        .where(ExecutionJob.id == job.id)
+        .with_for_update()
+    ).one_or_none()
+    if (
+        claim_state is None
+        or claim_state[0] not in DISPATCHABLE_JOB_STATUSES
+        or claim_state[1] not in claimable_plan_item_statuses
+    ):
+        return False
+    db.refresh(job)
+    db.refresh(job.plan_item, attribute_names=["status"])
     set_execution_job_status(
         db=db,
         job=job,
@@ -289,6 +350,7 @@ def _claim_job(
         occurred_at=triggered_at,
     )
     db.commit()
+    return True
 
 
 def _recover_stale_running_jobs(
@@ -297,40 +359,190 @@ def _recover_stale_running_jobs(
     db: Session,
     triggered_at: datetime,
 ) -> None:
-    running_jobs = db.scalars(
-        select(ExecutionJob)
+    running_job_rows = db.execute(
+        select(ExecutionJob.id, ExecutionJob.locked_at)
         .join(ExecutionJob.plan_item)
         .join(ExecutionPlanItem.plan)
         .where(
             ExecutionPlan.mode == settings.runtime_mode,
             ExecutionJob.status == "running",
         )
-        .options(selectinload(ExecutionJob.plan_item))
         .order_by(ExecutionJob.locked_at.asc(), ExecutionJob.created_at.asc())
     ).all()
+    stale_job_ids = [
+        job_id
+        for job_id, locked_at in running_job_rows
+        if _is_stale_running_job_lock(
+            settings=settings,
+            locked_at=locked_at,
+            triggered_at=triggered_at,
+        )
+    ]
+    if not stale_job_ids:
+        return
 
-    recovered_any = False
-    for job in running_jobs:
+    control_state = _lock_hourly_risk_off_fence(db=db)
+
+    for job_id in stale_job_ids:
+        locked_row = db.execute(
+            select(ExecutionJob, ExecutionPlanItem)
+            .join(ExecutionJob.plan_item)
+            .join(ExecutionPlanItem.plan)
+            .where(
+                ExecutionJob.id == job_id,
+                ExecutionPlan.mode == settings.runtime_mode,
+                ExecutionJob.status == "running",
+            )
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        ).one_or_none()
+        if locked_row is None:
+            continue
+        job, plan_item = locked_row
+        db.refresh(job, attribute_names=["status", "locked_at"])
+        db.refresh(
+            plan_item,
+            attribute_names=["status", "risk_context", "side", "intent"],
+        )
         if not _is_stale_running_job(
             settings=settings,
             job=job,
             triggered_at=triggered_at,
         ):
             continue
+        dispatching_status = _dispatching_plan_item_status(job.job_type)
+        has_active_risk_off_projection = _plan_item_has_active_hourly_risk_off(
+            plan_item
+        )
+        if (
+            plan_item.status != dispatching_status
+            and not has_active_risk_off_projection
+        ):
+            reason = (
+                "stale running job cannot resume because plan item is no longer "
+                "in its dispatching state"
+            )
+            set_execution_job_status(
+                db=db,
+                job=job,
+                status="failed",
+                source="execution_job_dispatch",
+                last_error=reason,
+                plan_item_status=None,
+                reason=reason,
+                occurred_at=triggered_at,
+            )
+            continue
+        preserve_risk_off_projection = False
+        if control_state.hourly_risk_off_active:
+            risk_flags, risk_reasons, fence_context = (
+                _active_hourly_risk_off_projection_inputs(control_state)
+            )
+            project_buy_plan_item_for_hourly_risk_off(
+                db=db,
+                settings=settings,
+                item=plan_item,
+                risk_flags=risk_flags,
+                risk_reasons=risk_reasons,
+                now=triggered_at,
+                resume_status=_retrying_plan_item_status(job.job_type),
+                fence_context=fence_context,
+            )
+            db.refresh(plan_item, attribute_names=["status", "risk_context"])
+            preserve_risk_off_projection = _plan_item_has_active_hourly_risk_off(
+                plan_item
+            )
+        elif _plan_item_has_active_hourly_risk_off(plan_item):
+            preserve_risk_off_projection = True
         set_execution_job_status(
             db=db,
             job=job,
             status="retrying",
             source="execution_job_dispatch",
             last_error="recovered stale running job after interrupted dispatch",
-            plan_item_status=_retrying_plan_item_status(job.job_type),
+            plan_item_status=(
+                None
+                if preserve_risk_off_projection
+                else _retrying_plan_item_status(job.job_type)
+            ),
             reason="recovered stale running job after interrupted dispatch",
             occurred_at=triggered_at,
         )
-        recovered_any = True
+    # Release the runtime fence row even if a job changed while we waited for
+    # its lock.  Hourly activation follows the same control-row-first order.
+    db.commit()
 
-    if recovered_any:
-        db.commit()
+
+def _lock_hourly_risk_off_fence(*, db: Session) -> RuntimeControlState:
+    if db.get_bind().dialect.name == "sqlite":
+        # SQLite ignores FOR UPDATE. This no-op write obtains the database's
+        # writer reservation before any execution job or plan item is changed.
+        db.execute(
+            update(RuntimeControlState)
+            .where(RuntimeControlState.id == RUNTIME_CONTROL_ID)
+            .values(
+                hourly_risk_off_epoch=RuntimeControlState.hourly_risk_off_epoch
+            )
+        )
+    state = db.scalar(
+        select(RuntimeControlState)
+        .where(RuntimeControlState.id == RUNTIME_CONTROL_ID)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if state is None:
+        raise RuntimeError("runtime control state disappeared during stale job recovery")
+    db.refresh(
+        state,
+        attribute_names=[
+            "hourly_risk_off_active",
+            "hourly_risk_off_epoch",
+            "hourly_risk_off_context",
+        ],
+    )
+    return state
+
+
+def _active_hourly_risk_off_projection_inputs(
+    state: RuntimeControlState,
+) -> tuple[int, list[str], dict[str, object]]:
+    context = (
+        state.hourly_risk_off_context
+        if isinstance(state.hourly_risk_off_context, dict)
+        else {}
+    )
+    raw_flags = context.get(
+        "activation_risk_flags",
+        context.get("last_risk_flags", 3),
+    )
+    try:
+        risk_flags = max(3, int(raw_flags))
+    except (TypeError, ValueError):
+        risk_flags = 3
+    raw_reasons = context.get(
+        "activation_risk_reasons",
+        context.get("last_risk_reasons", []),
+    )
+    risk_reasons = (
+        [reason for reason in raw_reasons if isinstance(reason, str) and reason]
+        if isinstance(raw_reasons, list)
+        else []
+    )
+    if not risk_reasons:
+        risk_reasons = ["active hourly buy risk-off fence"]
+    return risk_flags, risk_reasons, context
+
+
+def _plan_item_has_active_hourly_risk_off(item: ExecutionPlanItem) -> bool:
+    if item.status != "watch_expired":
+        return False
+    risk_context = item.risk_context if isinstance(item.risk_context, dict) else {}
+    adjustment = risk_context.get("hourly_plan_action")
+    return bool(
+        isinstance(adjustment, dict)
+        and adjustment.get("source") == "hourly_runtime_check"
+        and adjustment.get("action") == "risk_off_expire"
+    )
 
 
 def _dispatch_job(
@@ -346,6 +558,7 @@ def _dispatch_job(
         options=[selectinload(ExecutionJob.plan_item)],
     )
     assert job is not None
+    dispatch_started = monotonic()
 
     effective_adapter = _adapter_for_job(settings=settings, adapter=adapter, job=job)
     try:
@@ -379,6 +592,11 @@ def _dispatch_job(
             adapter=effective_adapter,
             command=command,
             request_source=f"execution-job:{job.id}",
+            now=_normalize_utc(job.locked_at or datetime.now(UTC)),
+            freshness_reference_at=(
+                _normalize_utc(job.locked_at or datetime.now(UTC))
+                + timedelta(seconds=max(0.0, monotonic() - dispatch_started))
+            ),
         )
         if job.job_type == BROKER_ORDER_RETRY_JOB_TYPE:
             record_retry_dispatch_result(
@@ -413,12 +631,36 @@ def _dispatch_job(
             plan_item_status=_failed_plan_item_status(job.job_type),
         )
     if result.status_code == 409 and "block_reason" in result.payload:
+        retry_after_at = _response_retry_after_at(result.payload)
+        if retry_after_at is not None:
+            job.scheduled_for = retry_after_at
+        block_reason = result.payload.get("block_reason")
+        terminal_account_recovery_block = (
+            _is_account_drawdown_recovery_block(result.payload)
+            and block_reason not in RETRYABLE_ACCOUNT_DRAWDOWN_BLOCK_REASONS
+        )
+        if block_reason == "hourly_plan_risk_off":
+            db.refresh(job.plan_item, attribute_names=["status", "risk_context"])
+            plan_item_status = (
+                None
+                if _plan_item_has_active_hourly_risk_off(job.plan_item)
+                else _retrying_plan_item_status(job.job_type)
+            )
+        elif (
+            block_reason in RETRYABLE_ACCOUNT_DRAWDOWN_BLOCK_REASONS
+            and job.job_type == NEXT_OPEN_BUY_JOB_TYPE
+        ):
+            plan_item_status = "new_buy_blocked"
+        elif block_reason in {"paused", "kill_switch"}:
+            plan_item_status = _retrying_plan_item_status(job.job_type)
+        else:
+            plan_item_status = None
         return _finish_job(
             db=db,
             job_id=job_id,
-            status="scheduled",
+            status="failed" if terminal_account_recovery_block else "scheduled",
             last_error=str(result.payload.get("message") or "dispatch blocked by safety controls"),
-            plan_item_status=None,
+            plan_item_status=plan_item_status,
         )
     if order_status is None:
         order_status = _load_order_status(
@@ -545,6 +787,28 @@ def _retrying_job_message(
     if order_status == NormalizedBrokerOrderStatus.SUBMISSION_PENDING.value:
         return "broker order submission is still pending"
     return "broker retry requested"
+
+
+def _response_retry_after_at(payload: dict[str, object]) -> datetime | None:
+    raw_retry_after = payload.get("retry_after_at")
+    if raw_retry_after is None:
+        recovery = payload.get("account_drawdown_recovery")
+        if isinstance(recovery, dict):
+            raw_retry_after = recovery.get("retry_after_at")
+    if not isinstance(raw_retry_after, str) or not raw_retry_after.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw_retry_after.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return _normalize_utc(parsed)
+
+
+def _is_account_drawdown_recovery_block(payload: dict[str, object]) -> bool:
+    block_reason = payload.get("block_reason")
+    return isinstance(block_reason, str) and block_reason.startswith(
+        "account_drawdown_recovery_"
+    )
 
 
 def _failed_job_message(
@@ -816,9 +1080,30 @@ def _defer_us_next_open_job_outside_session(
     local = triggered_at.astimezone(US_EASTERN_TIMEZONE)
     if is_us_regular_session(local):
         return False
+    claimable_plan_item_statuses = CLAIMABLE_PLAN_ITEM_STATUSES_BY_JOB_TYPE.get(
+        job.job_type,
+        frozenset(),
+    )
+    defer_state = db.execute(
+        select(ExecutionJob.status, ExecutionPlanItem.status)
+        .join(ExecutionJob.plan_item)
+        .where(ExecutionJob.id == job.id)
+        .with_for_update()
+    ).one_or_none()
+    if defer_state is None or defer_state[0] not in DISPATCHABLE_JOB_STATUSES:
+        return False
+    db.refresh(job)
+    db.refresh(job.plan_item, attribute_names=["status"])
     next_open = next_us_regular_open(triggered_at)
     reason = f"deferred KIS US-equity order outside New York regular session until {next_open.isoformat()}"
     job.scheduled_for = next_open
+    if defer_state[1] not in claimable_plan_item_statuses:
+        # Risk-off (or another terminal transition) may have changed the plan
+        # item after the due-job query.  The job can still be moved out of the
+        # hot polling window, but its safety status must remain untouched.
+        job.last_error = reason
+        db.commit()
+        return True
     set_execution_job_status(
         db=db,
         job=job,
@@ -867,14 +1152,27 @@ def _is_stale_running_job(
     job: ExecutionJob,
     triggered_at: datetime,
 ) -> bool:
-    if job.locked_at is None:
+    return _is_stale_running_job_lock(
+        settings=settings,
+        locked_at=job.locked_at,
+        triggered_at=triggered_at,
+    )
+
+
+def _is_stale_running_job_lock(
+    *,
+    settings: Settings,
+    locked_at: datetime | None,
+    triggered_at: datetime,
+) -> bool:
+    if locked_at is None:
         return True
     stale_after_seconds = max(
         settings.kis_request_timeout_seconds * STALE_RUNNING_JOB_TIMEOUT_MULTIPLIER,
         MIN_STALE_RUNNING_JOB_SECONDS,
     )
     cutoff = triggered_at - timedelta(seconds=stale_after_seconds)
-    return _normalize_utc(job.locked_at) <= cutoff
+    return _normalize_utc(locked_at) <= cutoff
 
 
 def _normalize_utc(value: datetime) -> datetime:

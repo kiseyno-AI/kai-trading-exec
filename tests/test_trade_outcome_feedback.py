@@ -21,6 +21,8 @@ from app.services.trade_outcome_feedback import (
     generate_trade_outcome_feedback,
     load_latest_trade_outcome_feedback_snippet,
 )
+from app.services.account_drawdown_gate import latest_account_drawdown_gate_state
+from app.services.account_drawdown_recovery import recovery_account_fingerprint
 from app.services.trigger_time_exec_agent import _request_payload
 from app.services.watch_exec_agent_sizing import _candidate_universe_payload, _sizing_request_payload
 
@@ -852,6 +854,498 @@ def test_trade_outcome_feedback_latest_allowed_order_clears_account_drawdown_gat
     )
     markdown = (tmp_path / "latest.md").read_text(encoding="utf-8")
     assert "Account drawdown gate: not currently gated by the latest audited decision." in markdown
+
+    session.close()
+    engine.dispose()
+
+
+def test_account_drawdown_gate_state_keeps_recovery_scopes_independent() -> None:
+    engine, session = _session()
+    settings = Settings(
+        runtime_mode="paper",
+        account_drawdown_gate_enabled=True,
+    )
+    account_fingerprint = recovery_account_fingerprint(settings)
+    krw_scope = f"kis:{account_fingerprint}:krw"
+    usd_scope = f"kis:{account_fingerprint}:usd"
+    plan = ExecutionPlan(
+        id="plan-drawdown-scope-state",
+        external_plan_id="plan-drawdown-scope-state",
+        source="kai-trading-core",
+        mode="paper",
+    )
+    krw_item = ExecutionPlanItem(
+        id="item-drawdown-scope-krw",
+        plan=plan,
+        symbol="005930",
+        side="buy",
+        intent="next_open_buy",
+        status="new_buy_blocked",
+    )
+    usd_item = ExecutionPlanItem(
+        id="item-drawdown-scope-usd",
+        plan=plan,
+        symbol="AAPL",
+        side="buy",
+        intent="next_open_buy",
+        status="new_buy_blocked",
+    )
+
+    def source_order(*, item: ExecutionPlanItem, order_id: str, scope: str) -> BrokerOrder:
+        summary = {
+            "gate_name": "daily_total_asset_drawdown_pct",
+            "order_idempotency_key": order_id,
+            "execution_plan_item_id": item.id,
+            "sells_risk_reduction_allowed": True,
+        }
+        return BrokerOrder(
+            id=order_id,
+            plan_item=item,
+            broker_name="kis",
+            mode="paper",
+            idempotency_key=order_id,
+            symbol=item.symbol,
+            side="buy",
+            status="rejected",
+            quantity=1,
+            request_metadata={
+                "account_drawdown_recovery_policy": {
+                    "policy_version": 1,
+                    "recovery_scope": scope,
+                }
+            },
+            response_metadata={"account_drawdown_gate": summary},
+            raw_broker_payload={"blocked": True, "decision": summary},
+            last_error_classification="validation",
+            last_error_code="daily_total_asset_drawdown_pct",
+            last_broker_sync_at=datetime(2026, 6, 20, 0, 30, tzinfo=UTC),
+        )
+
+    krw_order = source_order(
+        item=krw_item,
+        order_id="order-drawdown-scope-krw",
+        scope=krw_scope,
+    )
+    usd_order = source_order(
+        item=usd_item,
+        order_id="order-drawdown-scope-usd",
+        scope=usd_scope,
+    )
+    session.add_all(
+        [
+            plan,
+            krw_order,
+            usd_order,
+            ExecutionPlanItemAudit(
+                execution_plan_item_id=krw_item.id,
+                event_type="account_drawdown_new_buy_blocked",
+                source="broker_order_service",
+                summary=(krw_order.response_metadata or {})["account_drawdown_gate"],
+                payload=krw_order.raw_broker_payload,
+                occurred_at=datetime(2026, 6, 20, 0, 30, tzinfo=UTC),
+            ),
+            ExecutionPlanItemAudit(
+                execution_plan_item_id=usd_item.id,
+                event_type="account_drawdown_new_buy_blocked",
+                source="broker_order_service",
+                summary=(usd_order.response_metadata or {})["account_drawdown_gate"],
+                payload=usd_order.raw_broker_payload,
+                occurred_at=datetime(2026, 6, 20, 0, 30, tzinfo=UTC),
+            ),
+            ExecutionPlanItemAudit(
+                execution_plan_item_id=krw_item.id,
+                event_type="account_drawdown_recovery_released",
+                source="broker_order_service",
+                summary={"source_broker_order_pk": krw_order.id},
+                occurred_at=datetime(2026, 6, 20, 1, 0, tzinfo=UTC),
+            ),
+        ]
+    )
+    session.commit()
+
+    partially_recovered = latest_account_drawdown_gate_state(
+        settings=settings,
+        db=session,
+    )
+
+    assert partially_recovered["gated"] is True
+    assert set(partially_recovered["active_recovery_scopes"]) == {usd_scope}
+    assert partially_recovered["latest_decision"]["order_id"] == usd_order.id
+
+    session.add(
+        ExecutionPlanItemAudit(
+            execution_plan_item_id=usd_item.id,
+            event_type="account_drawdown_recovery_released",
+            source="broker_order_service",
+            summary={"source_broker_order_pk": usd_order.id},
+            occurred_at=datetime(2026, 6, 20, 1, 5, tzinfo=UTC),
+        )
+    )
+    session.commit()
+
+    recovered = latest_account_drawdown_gate_state(settings=settings, db=session)
+
+    assert recovered["gated"] is False
+    assert recovered["active_recovery_scopes"] == {}
+    assert recovered["latest_decision"]["source"] == "account_drawdown_recovery_audit"
+    assert recovered["latest_decision"]["event_type"] == "account_drawdown_recovery_released"
+
+    session.close()
+    engine.dispose()
+
+
+def test_account_drawdown_gate_state_preserves_nonrecoverable_policy_v1_block() -> None:
+    engine, session = _session()
+    settings = Settings(runtime_mode="paper", account_drawdown_gate_enabled=True)
+    plan = ExecutionPlan(
+        id="plan-drawdown-nonrecoverable-state",
+        external_plan_id="plan-drawdown-nonrecoverable-state",
+        source="kai-trading-core",
+        mode="paper",
+    )
+    item = ExecutionPlanItem(
+        id="item-drawdown-nonrecoverable-state",
+        plan=plan,
+        symbol="005930",
+        side="buy",
+        intent="next_open_buy",
+        status="new_buy_blocked",
+    )
+    summary = {
+        "gate_name": "account_drawdown_snapshot_unavailable",
+        "order_idempotency_key": "order-drawdown-nonrecoverable-state",
+        "execution_plan_item_id": item.id,
+        "sells_risk_reduction_allowed": True,
+    }
+    order = BrokerOrder(
+        id="order-drawdown-nonrecoverable-state",
+        plan_item=item,
+        broker_name="kis",
+        mode="paper",
+        idempotency_key="order-drawdown-nonrecoverable-state",
+        symbol="005930",
+        side="buy",
+        status="rejected",
+        quantity=1,
+        request_metadata={
+            "account_drawdown_recovery_policy": {
+                "policy_version": 1,
+                "recovery_scope": "kis:opaque-account:krw",
+            }
+        },
+        response_metadata={"account_drawdown_gate": summary},
+        raw_broker_payload={"blocked": True, "decision": summary},
+        last_error_classification="validation",
+        last_error_code="account_drawdown_snapshot_unavailable",
+        last_broker_sync_at=datetime(2026, 6, 20, 0, 30, tzinfo=UTC),
+    )
+    session.add_all(
+        [
+            plan,
+            order,
+            ExecutionPlanItemAudit(
+                execution_plan_item_id=item.id,
+                event_type="account_drawdown_new_buy_blocked",
+                source="broker_order_service",
+                summary=summary,
+                payload=order.raw_broker_payload,
+                occurred_at=datetime(2026, 6, 20, 0, 30, tzinfo=UTC),
+            ),
+        ]
+    )
+    session.commit()
+
+    state = latest_account_drawdown_gate_state(settings=settings, db=session)
+
+    assert state["gated"] is True
+    assert state["active_recovery_scopes"] == {}
+    assert (
+        state["latest_decision"]["summary"]["gate_name"]
+        == "account_drawdown_snapshot_unavailable"
+    )
+
+    session.close()
+    engine.dispose()
+
+
+def test_account_drawdown_gate_state_hides_foreign_account_policy_block_with_stable_secret() -> None:
+    engine, session = _session()
+    settings = Settings(
+        runtime_mode="paper",
+        account_drawdown_gate_enabled=True,
+        kis_account_number="11112222",
+        account_drawdown_recovery_scope_secret="stable-scope-secret",
+    )
+    plan = ExecutionPlan(
+        id="plan-drawdown-foreign-account-state",
+        external_plan_id="plan-drawdown-foreign-account-state",
+        source="kai-trading-core",
+        mode="paper",
+    )
+    item = ExecutionPlanItem(
+        id="item-drawdown-foreign-account-state",
+        plan=plan,
+        symbol="005930",
+        side="buy",
+        intent="next_open_buy",
+        status="new_buy_blocked",
+    )
+    summary = {
+        "gate_name": "account_drawdown_snapshot_unavailable",
+        "order_idempotency_key": "order-drawdown-foreign-account-state",
+        "execution_plan_item_id": item.id,
+        "sells_risk_reduction_allowed": True,
+    }
+    order = BrokerOrder(
+        id="order-drawdown-foreign-account-state",
+        plan_item=item,
+        broker_name="kis",
+        mode="paper",
+        idempotency_key="order-drawdown-foreign-account-state",
+        symbol="005930",
+        side="buy",
+        status="rejected",
+        quantity=1,
+        request_metadata={
+            "account_drawdown_recovery_policy": {
+                "policy_version": 1,
+                "recovery_scope": "kis:foreign-account-fingerprint:krw",
+            }
+        },
+        response_metadata={"account_drawdown_gate": summary},
+        raw_broker_payload={"blocked": True, "decision": summary},
+        last_error_classification="validation",
+        last_error_code="account_drawdown_snapshot_unavailable",
+        last_broker_sync_at=datetime(2026, 6, 20, 0, 30, tzinfo=UTC),
+    )
+    session.add_all(
+        [
+            plan,
+            order,
+            ExecutionPlanItemAudit(
+                execution_plan_item_id=item.id,
+                event_type="account_drawdown_new_buy_blocked",
+                source="broker_order_service",
+                summary=summary,
+                payload=order.raw_broker_payload,
+                occurred_at=datetime(2026, 6, 20, 0, 30, tzinfo=UTC),
+            ),
+        ]
+    )
+    session.commit()
+
+    state = latest_account_drawdown_gate_state(settings=settings, db=session)
+
+    assert state["gated"] is False
+    assert state["active_recovery_scopes"] == {}
+    assert state["latest_decision"] is None
+
+    session.close()
+    engine.dispose()
+
+
+def test_account_drawdown_gate_state_ignores_empty_order_metadata() -> None:
+    engine, session = _session()
+    settings = Settings(runtime_mode="paper", account_drawdown_gate_enabled=True)
+    session.add(
+        BrokerOrder(
+            id="order-with-empty-response-metadata",
+            broker_name="kis",
+            mode="paper",
+            idempotency_key="order-with-empty-response-metadata",
+            symbol="005930",
+            side="sell",
+            status="submitted",
+            quantity=1,
+            response_metadata={},
+            last_broker_sync_at=datetime(2026, 6, 20, 2, 0, tzinfo=UTC),
+        )
+    )
+    session.commit()
+
+    state = latest_account_drawdown_gate_state(settings=settings, db=session)
+
+    assert state["gated"] is False
+    assert state["latest_decision"] is None
+
+    session.close()
+    engine.dispose()
+
+
+def test_foreign_account_allowed_order_cannot_clear_current_scoped_block() -> None:
+    engine, session = _session()
+    settings = Settings(
+        runtime_mode="paper",
+        account_drawdown_gate_enabled=True,
+        kis_account_number="11112222",
+        account_drawdown_recovery_scope_secret="stable-scope-secret",
+    )
+    current_scope = (
+        f"kis:{recovery_account_fingerprint(settings)}:krw"
+    )
+    plan = ExecutionPlan(
+        id="plan-current-scoped-nonrecoverable-block",
+        external_plan_id="plan-current-scoped-nonrecoverable-block",
+        source="kai-trading-core",
+        mode="paper",
+    )
+    item = ExecutionPlanItem(
+        id="item-current-scoped-nonrecoverable-block",
+        plan=plan,
+        symbol="005930",
+        side="buy",
+        intent="next_open_buy",
+        status="new_buy_blocked",
+    )
+    blocked_summary = {
+        "gate_name": "account_drawdown_snapshot_unavailable",
+        "order_idempotency_key": "current-scoped-block",
+        "execution_plan_item_id": item.id,
+    }
+    blocked_order = BrokerOrder(
+        id="current-scoped-block",
+        plan_item=item,
+        broker_name="kis",
+        mode="paper",
+        idempotency_key="current-scoped-block",
+        symbol="005930",
+        side="buy",
+        status="rejected",
+        quantity=1,
+        request_metadata={
+            "account_drawdown_recovery_policy": {
+                "policy_version": 1,
+                "recovery_scope": current_scope,
+            }
+        },
+        response_metadata={"account_drawdown_gate": blocked_summary},
+        raw_broker_payload={"blocked": True, "decision": blocked_summary},
+        last_error_classification="validation",
+        last_error_code="account_drawdown_snapshot_unavailable",
+        last_broker_sync_at=datetime(2026, 6, 20, 1, 0, tzinfo=UTC),
+    )
+    allowed_summary = {
+        "blocked": False,
+        "order_idempotency_key": "foreign-account-allowed",
+        "execution_plan_item_id": None,
+    }
+    foreign_allowed = BrokerOrder(
+        id="foreign-account-allowed",
+        broker_name="kis",
+        mode="paper",
+        idempotency_key="foreign-account-allowed",
+        symbol="000660",
+        side="buy",
+        status="submitted",
+        quantity=1,
+        request_metadata={
+            "account_drawdown_recovery_policy": {
+                "policy_version": 1,
+                "recovery_scope": "kis:foreign-account-fingerprint:krw",
+            }
+        },
+        response_metadata={"account_drawdown_gate": allowed_summary},
+        raw_broker_payload={"accepted": True},
+        submitted_at=datetime(2026, 6, 20, 1, 5, tzinfo=UTC),
+        last_broker_sync_at=datetime(2026, 6, 20, 1, 5, tzinfo=UTC),
+    )
+    session.add_all(
+        [
+            plan,
+            blocked_order,
+            foreign_allowed,
+            ExecutionPlanItemAudit(
+                execution_plan_item_id=item.id,
+                event_type="account_drawdown_new_buy_blocked",
+                source="broker_order_service",
+                summary=blocked_summary,
+                payload=blocked_order.raw_broker_payload,
+                occurred_at=datetime(2026, 6, 20, 1, 0, tzinfo=UTC),
+            ),
+        ]
+    )
+    session.commit()
+
+    state = latest_account_drawdown_gate_state(settings=settings, db=session)
+
+    assert state["gated"] is True
+    assert state["latest_decision"]["summary"]["gate_name"] == (
+        "account_drawdown_snapshot_unavailable"
+    )
+
+    session.close()
+    engine.dispose()
+
+
+def test_account_drawdown_gate_state_honors_legacy_source_release() -> None:
+    engine, session = _session()
+    settings = Settings(runtime_mode="paper", account_drawdown_gate_enabled=True)
+    plan = ExecutionPlan(
+        id="plan-drawdown-legacy-release-state",
+        external_plan_id="plan-drawdown-legacy-release-state",
+        source="kai-trading-core",
+        mode="paper",
+    )
+    item = ExecutionPlanItem(
+        id="item-drawdown-legacy-release-state",
+        plan=plan,
+        symbol="005930",
+        side="buy",
+        intent="next_open_buy",
+        status="new_buy_blocked",
+    )
+    summary = {
+        "gate_name": "daily_total_asset_drawdown_pct",
+        "order_idempotency_key": "order-drawdown-legacy-release-state",
+        "execution_plan_item_id": item.id,
+        "sells_risk_reduction_allowed": True,
+    }
+    order = BrokerOrder(
+        id="order-drawdown-legacy-release-state",
+        plan_item=item,
+        broker_name="kis",
+        mode="paper",
+        idempotency_key="order-drawdown-legacy-release-state",
+        symbol="005930",
+        side="buy",
+        status="rejected",
+        quantity=1,
+        response_metadata={"account_drawdown_gate": summary},
+        raw_broker_payload={"blocked": True, "decision": summary},
+        last_error_classification="validation",
+        last_error_code="daily_total_asset_drawdown_pct",
+        last_broker_sync_at=datetime(2026, 6, 20, 0, 30, tzinfo=UTC),
+    )
+    session.add_all(
+        [
+            plan,
+            order,
+            ExecutionPlanItemAudit(
+                execution_plan_item_id=item.id,
+                event_type="account_drawdown_new_buy_blocked",
+                source="broker_order_service",
+                summary=summary,
+                payload=order.raw_broker_payload,
+                occurred_at=datetime(2026, 6, 20, 0, 30, tzinfo=UTC),
+            ),
+            ExecutionPlanItemAudit(
+                execution_plan_item_id=item.id,
+                event_type="account_drawdown_gate_disabled_release",
+                source="broker_order_service",
+                summary={"source_broker_order_pk": order.id, "gate_disabled": True},
+                occurred_at=datetime(2026, 6, 20, 1, 0, tzinfo=UTC),
+            ),
+        ]
+    )
+    session.commit()
+
+    state = latest_account_drawdown_gate_state(settings=settings, db=session)
+
+    assert state["gated"] is False
+    assert state["active_recovery_scopes"] == {}
+    assert state["latest_decision"]["event_type"] == (
+        "account_drawdown_gate_disabled_release"
+    )
 
     session.close()
     engine.dispose()

@@ -23,7 +23,13 @@ from app.api.schemas.execution import (
     MonitoringPriceRequest,
     PlaceOrderRequest,
 )
-from app.broker.base import BrokerAccountOpenOrder, BrokerAccountSnapshot, BrokerAdapter, BrokerAdapterError
+from app.broker.base import (
+    BrokerAccountOpenOrder,
+    BrokerAccountSnapshot,
+    BrokerAdapter,
+    BrokerAdapterError,
+    NormalizedBrokerOrderStatus,
+)
 from app.core.config import Settings
 from app.models.runtime import (
     BrokerOrder,
@@ -44,7 +50,12 @@ from app.services.reconciliation import (
     reconcile_pending_broker_orders,
     sync_execution_positions_from_broker_snapshot,
 )
-from app.services.broker_orders import place_broker_order
+from app.services.broker_orders import (
+    ACCOUNT_DRAWDOWN_RECOVERY_INELIGIBLE_PLAN_STATUSES,
+    _current_buy_plan_item_state,
+    inspect_account_drawdown_recovery,
+    place_broker_order,
+)
 from app.services.json_compaction import compact_json_object
 from app.services.plan_item_identity import serialize_plan_item_source_identity
 from app.services.risk_sizing import (
@@ -60,6 +71,7 @@ from app.services.runtime_controls import (
     automated_order_submission_block_reason,
     ensure_runtime_control_state,
 )
+from app.services.runtime_transitions import plan_item_status_for_broker_order_status
 from app.services import trigger_time_exec_agent
 
 logger = logging.getLogger(__name__)
@@ -212,10 +224,12 @@ WATCH_BUY_EXPIRABLE_STATUSES = frozenset(
     }
 )
 OPEN_BUY_ORDER_STATUSES = frozenset(CAPITAL_RESERVING_ORDER_STATUSES)
+WATCH_BUY_CONFIRMED_ORDER_STATUSES = frozenset(
+    {"submitted", "open", "partially_filled", "filled"}
+)
 RESERVED_CASH_EXHAUSTED_REASON = "reserved_cash_exhausted"
 LIVE_WATCH_BUY_VETO_EVENT_TYPE = "live_watch_buy_submission_veto"
 LATE_ENTRY_GATE_EVENT_TYPE = "watch_buy_late_entry_gate"
-ACCOUNT_DRAWDOWN_GATE_RELEASE_SUFFIX = ":account-drawdown-gate-disabled"
 
 
 @dataclass(frozen=True)
@@ -932,110 +946,6 @@ def expire_known_flat_pending_sell_monitors(
     return len(candidates)
 
 
-def release_disabled_account_drawdown_watch_buy_blocks(
-    *,
-    settings: Settings,
-    db: Session,
-    released_at: datetime | None = None,
-    symbols: list[str] | set[str] | None = None,
-) -> int:
-    if settings.account_drawdown_gate_enabled:
-        return 0
-    released_at = _normalize_utc(released_at or datetime.now(UTC))
-    where = [
-        ExecutionPlan.mode == settings.runtime_mode,
-        BrokerOrder.side == "buy",
-        BrokerOrder.status == "rejected",
-        BrokerOrder.broker_order_id.is_(None),
-        BrokerOrder.last_error_classification == "validation",
-        BrokerOrder.response_metadata["account_drawdown_gate"].is_not(None),
-        ExecutionPlanItem.side == "buy",
-        ExecutionPlanItem.intent.in_(tuple(WATCH_BUY_INTENTS)),
-        ExecutionPlanItem.status.in_(("watch_buy_triggered_blocked", "new_buy_blocked")),
-    ]
-    if symbols:
-        where.append(ExecutionPlanItem.symbol.in_(_ordered_symbol_scope(symbols)))
-    orders = db.scalars(
-        select(BrokerOrder)
-        .join(BrokerOrder.plan_item)
-        .join(ExecutionPlanItem.plan)
-        .where(*where)
-        .options(
-            load_only(
-                BrokerOrder.id,
-                BrokerOrder.execution_plan_item_id,
-                BrokerOrder.idempotency_key,
-                BrokerOrder.broker_order_id,
-                BrokerOrder.symbol,
-                BrokerOrder.side,
-                BrokerOrder.status,
-                BrokerOrder.last_error_classification,
-                BrokerOrder.response_metadata,
-                BrokerOrder.created_at,
-            ),
-            selectinload(BrokerOrder.plan_item).load_only(
-                ExecutionPlanItem.id,
-                ExecutionPlanItem.execution_plan_id,
-                ExecutionPlanItem.symbol,
-                ExecutionPlanItem.side,
-                ExecutionPlanItem.intent,
-                ExecutionPlanItem.status,
-            ),
-        )
-        .order_by(BrokerOrder.created_at.asc(), BrokerOrder.id.asc())
-    ).all()
-
-    released = 0
-    for order in orders:
-        item = order.plan_item
-        if item is None:
-            continue
-        if order.idempotency_key.endswith(ACCOUNT_DRAWDOWN_GATE_RELEASE_SUFFIX):
-            continue
-        prior_status = item.status
-        prior_idempotency_key = order.idempotency_key
-        order.idempotency_key = f"{order.idempotency_key}{ACCOUNT_DRAWDOWN_GATE_RELEASE_SUFFIX}"
-        item.status = "watch_monitoring_active"
-        _record_monitoring_event(
-            item=item,
-            event={
-                "event": "account_drawdown_gate_disabled_release",
-                "reason": "account_drawdown_gate_disabled",
-                "prior_status": prior_status,
-                "prior_order_id": order.id,
-                "prior_order_idempotency_key": prior_idempotency_key,
-                "released_order_idempotency_key": order.idempotency_key,
-                "recorded_at": released_at.isoformat(),
-            },
-        )
-        db.add(
-            ExecutionPlanItemAudit(
-                execution_plan_item_id=item.id,
-                event_type="account_drawdown_gate_disabled_release",
-                source=MONITORING_WORKER_NAME,
-                summary={
-                    "reason": "account_drawdown_gate_disabled",
-                    "prior_status": prior_status,
-                    "prior_order_id": order.id,
-                    "prior_order_idempotency_key": prior_idempotency_key,
-                    "released_order_idempotency_key": order.idempotency_key,
-                },
-                payload={
-                    "account_drawdown_gate": (order.response_metadata or {}).get("account_drawdown_gate"),
-                    "prior_order": {
-                        "id": order.id,
-                        "status": order.status,
-                        "last_error_code": order.last_error_code,
-                        "last_error_message": order.last_error_message,
-                    },
-                },
-                occurred_at=released_at,
-            )
-        )
-        released += 1
-    return released
-
-
 def _evaluate_monitoring_cycle(
     *,
     settings: Settings,
@@ -1059,20 +969,12 @@ def _evaluate_monitoring_cycle(
             },
         )
 
-    released_drawdown_blocks = release_disabled_account_drawdown_watch_buy_blocks(
-        settings=settings,
-        db=db,
-        released_at=triggered_at,
-        symbols=symbols,
-    )
-    if released_drawdown_blocks:
-        db.flush()
     skip_pre_cycle_broker_reconciliation = (
         allow_persisted_triggered_without_price and bool(symbols)
     )
     _log_cycle_step(
         "drawdown_release",
-        released_drawdown_blocks=released_drawdown_blocks,
+        released_drawdown_blocks=0,
         skip_pre_cycle_broker_reconciliation=skip_pre_cycle_broker_reconciliation,
         symbol_count=len(symbols or []),
         price_count=len(prices),
@@ -1246,6 +1148,7 @@ def _evaluate_monitoring_cycle(
     dispatch_action_count = 0
     retried_triggered_item_count = 0
     watch_buy_cash_reservation: WatchBuyCashReservation | str | None = None
+    drawdown_recovery_sources_by_scope: dict[str, BrokerOrder | None] = {}
 
     for item in items:
         if item.status in NON_MONITORABLE_PLAN_ITEM_STATUSES:
@@ -1330,7 +1233,10 @@ def _evaluate_monitoring_cycle(
             if quote_stale_reason is not None:
                 blocked_item_count += 1
                 monitoring_status = _monitoring_status(item.intent)
-                if item.status != monitoring_status:
+                if (
+                    item.status != "watch_buy_triggered_blocked"
+                    and item.status != monitoring_status
+                ):
                     item.status = monitoring_status
                 _record_monitoring_event(
                     item=item,
@@ -1357,6 +1263,22 @@ def _evaluate_monitoring_cycle(
                 )
                 continue
 
+        drawdown_recovery = None
+        if _is_watch_buy_item(item):
+            drawdown_recovery = inspect_account_drawdown_recovery(
+                settings=settings,
+                db=db,
+                adapter=adapter,
+                provider=item.provider or "kis",
+                asset_class=item.asset_class or "stock",
+                exchange=_plan_item_exchange(item),
+                idempotency_key=f"monitoring:watch_buy:{item.id}",
+                execution_plan_item_id=item.id,
+                symbol=item.symbol,
+                now=triggered_at,
+                scope_source_cache=drawdown_recovery_sources_by_scope,
+            )
+
         trigger_reason: str | None = None
         trigger_metadata: dict[str, object] | None = None
         if retry_persisted_trigger:
@@ -1372,6 +1294,9 @@ def _evaluate_monitoring_cycle(
                 price=price,
                 observed_price=observed_price,
                 triggered_at=triggered_at,
+                allow_persisted_trigger=not (
+                    drawdown_recovery is not None and drawdown_recovery.active
+                ),
             )
         elif _is_triggered(
             item=item,
@@ -1422,8 +1347,10 @@ def _evaluate_monitoring_cycle(
                 continue
 
         if trigger_reason is None:
-            if item.status in (
-                BLOCKED_MONITORING_STATUSES | PENDING_DISPATCH_MONITORING_STATUSES
+            if (
+                item.status
+                in (BLOCKED_MONITORING_STATUSES | PENDING_DISPATCH_MONITORING_STATUSES)
+                and item.status != "watch_buy_triggered_blocked"
             ) or item.status in AGENT_ACTIVE_STATUSES:
                 item.status = _monitoring_status(item.intent)
             result_by_item_id[item.id] = _monitoring_result_payload(
@@ -1448,12 +1375,32 @@ def _evaluate_monitoring_cycle(
                 triggered_item_count += 1
                 triggered_symbols.add(item.symbol)
                 blocked_item_count += 1
-                retryable_pullback_gate = _is_retryable_watch_buy_pullback_gate(risk_gate["reason"])
-                item.status = "watch_monitoring_active" if retryable_pullback_gate else "watch_buy_rejected"
+                recovery_source_must_remain_retryable = bool(
+                    drawdown_recovery is not None and drawdown_recovery.active
+                )
+                retryable_pullback_gate = _is_retryable_watch_buy_pullback_gate(
+                    risk_gate["reason"]
+                )
+                retryable_gate = (
+                    retryable_pullback_gate or recovery_source_must_remain_retryable
+                )
+                item.status = (
+                    "watch_buy_triggered_blocked"
+                    if recovery_source_must_remain_retryable
+                    else "watch_monitoring_active"
+                    if retryable_pullback_gate
+                    else "watch_buy_rejected"
+                )
                 _record_monitoring_event(
                     item=item,
                     event={
-                        "event": "watch_buy_pullback_wait" if retryable_pullback_gate else "watch_buy_rejected",
+                        "event": (
+                            "watch_buy_triggered_blocked"
+                            if recovery_source_must_remain_retryable
+                            else "watch_buy_pullback_wait"
+                            if retryable_pullback_gate
+                            else "watch_buy_rejected"
+                        ),
                         "reason": risk_gate["reason"],
                         "message": risk_gate["message"],
                         "details": risk_gate["details"],
@@ -1464,12 +1411,61 @@ def _evaluate_monitoring_cycle(
                 result_by_item_id[item.id] = _monitoring_result_payload(
                     item=item,
                     observed_price=observed_price,
-                    outcome="blocked" if retryable_pullback_gate else "rejected",
+                    outcome="blocked" if retryable_gate else "rejected",
                     block_reason=risk_gate["reason"],
                     message=risk_gate["message"],
                     risk_decision=risk_gate["details"],
                 )
                 continue
+
+        if (
+            drawdown_recovery is not None
+            and drawdown_recovery.block_reason is not None
+        ):
+            blocked_item_count += 1
+            current_plan_state = _current_buy_plan_item_state(
+                db=db,
+                item_id=item.id,
+                lock=True,
+            )
+            preserve_current_plan_status = bool(
+                current_plan_state is None
+                or current_plan_state[0]
+                in ACCOUNT_DRAWDOWN_RECOVERY_INELIGIBLE_PLAN_STATUSES
+            )
+            if current_plan_state is not None:
+                db.refresh(item, attribute_names=["status", "risk_context"])
+            if not preserve_current_plan_status:
+                item.status = "watch_buy_triggered_blocked"
+                event: dict[str, object] = {
+                    "event": "watch_buy_triggered_blocked",
+                    "reason": drawdown_recovery.block_reason,
+                    "message": drawdown_recovery.message,
+                    "source_broker_order_pk": drawdown_recovery.source_broker_order_pk,
+                    "observed_price": _serialize_decimal(observed_price),
+                    "recorded_at": triggered_at.isoformat(),
+                }
+                if drawdown_recovery.retry_after_at is not None:
+                    event["retry_after_at"] = (
+                        drawdown_recovery.retry_after_at.isoformat()
+                    )
+                _record_monitoring_event(item=item, event=event)
+            result_by_item_id[item.id] = _monitoring_result_payload(
+                item=item,
+                observed_price=observed_price,
+                outcome="blocked",
+                block_reason=drawdown_recovery.block_reason,
+                message=drawdown_recovery.message,
+                trigger_metadata={
+                    "source_broker_order_pk": drawdown_recovery.source_broker_order_pk,
+                    "retry_after_at": (
+                        drawdown_recovery.retry_after_at.isoformat()
+                        if drawdown_recovery.retry_after_at is not None
+                        else None
+                    ),
+                },
+            )
+            continue
 
         if retry_persisted_trigger:
             retried_triggered_item_count += 1
@@ -1933,6 +1929,10 @@ def _evaluate_monitoring_cycle(
                 trigger_reason=action.trigger_reason,
                 trigger_metadata=action.trigger_metadata,
                 triggered_at=triggered_at,
+                freshness_reference_at=(
+                    triggered_at
+                    + timedelta(seconds=max(0.0, time.monotonic() - cycle_started))
+                ),
                 limit_price_override=limit_price_override,
                 before_success_commit=before_success_commit,
             )
@@ -1986,11 +1986,25 @@ def _evaluate_monitoring_cycle(
                 )
             elif placement.status_code == 409 and "block_reason" in placement.payload:
                 blocked_item_count += 1
-                action.item.status = (
-                    "watch_buy_triggered_blocked"
-                    if is_watch_buy
-                    else f"{action.item.intent}_triggered_blocked"
+                hourly_risk_off_blocked = (
+                    placement.payload.get("block_reason") == "hourly_plan_risk_off"
                 )
+                if hourly_risk_off_blocked:
+                    db.refresh(action.item, attribute_names=["status", "risk_context"])
+                    if action.item.status != "watch_expired":
+                        action.item.status = (
+                            "watch_buy_triggered_blocked"
+                            if is_watch_buy
+                            else f"{action.item.intent}_triggered_blocked"
+                        )
+                elif _placement_preserves_current_plan_status(placement.payload):
+                    db.refresh(action.item, attribute_names=["status", "risk_context"])
+                else:
+                    action.item.status = (
+                        "watch_buy_triggered_blocked"
+                        if is_watch_buy
+                        else f"{action.item.intent}_triggered_blocked"
+                    )
                 if is_watch_buy:
                     _record_monitoring_event(
                         item=action.item,
@@ -2013,7 +2027,17 @@ def _evaluate_monitoring_cycle(
             elif placement.payload.get("duplicate") is True:
                 duplicate_quantity = _serialized_order_quantity(placement.payload.get("order"))
                 if is_watch_buy:
-                    action.item.status = "watch_buy_submitted"
+                    duplicate_status = _serialized_order_status(
+                        placement.payload.get("order")
+                    )
+                    if duplicate_status in WATCH_BUY_CONFIRMED_ORDER_STATUSES:
+                        action.item.status = "watch_buy_submitted"
+                    else:
+                        broker_truth_status = _plan_item_status_from_order_payload(
+                            placement.payload.get("order")
+                        )
+                        if broker_truth_status is not None:
+                            action.item.status = broker_truth_status
                 elif duplicate_quantity is not None:
                     _reserve_remaining_quantity(
                         remaining_quantities_by_symbol=remaining_quantities_by_symbol,
@@ -2029,17 +2053,23 @@ def _evaluate_monitoring_cycle(
                 )
             else:
                 if is_watch_buy:
-                    action.item.status = "watch_buy_rejected"
-                    _record_monitoring_event(
-                        item=action.item,
-                        event={
-                            "event": "watch_buy_rejected",
-                            "reason": "order_submission_failed",
-                            "message": placement.payload.get("message"),
-                            "observed_price": _serialize_decimal(action.observed_price),
-                            "recorded_at": triggered_at.isoformat(),
-                        },
+                    broker_truth_status = _plan_item_status_from_order_payload(
+                        placement.payload.get("order")
                     )
+                    if broker_truth_status is not None:
+                        action.item.status = broker_truth_status
+                    else:
+                        action.item.status = "watch_buy_rejected"
+                        _record_monitoring_event(
+                            item=action.item,
+                            event={
+                                "event": "watch_buy_rejected",
+                                "reason": "order_submission_failed",
+                                "message": placement.payload.get("message"),
+                                "observed_price": _serialize_decimal(action.observed_price),
+                                "recorded_at": triggered_at.isoformat(),
+                            },
+                        )
                 result_by_item_id[action.item.id] = _monitoring_result_payload(
                     item=action.item,
                     observed_price=action.observed_price,
@@ -6184,6 +6214,7 @@ def _watch_buy_trigger_reason(
     price: MonitoringPriceRequest | None,
     observed_price: Decimal | None,
     triggered_at: datetime,
+    allow_persisted_trigger: bool = True,
 ) -> tuple[str | None, dict[str, object] | None]:
     metadata = _watch_buy_intraday_cross_metadata(
         item=item,
@@ -6211,9 +6242,10 @@ def _watch_buy_trigger_reason(
             _record_watch_buy_trigger_cross(item=item, metadata=metadata)
         return item.intent, metadata
 
-    persisted = _persisted_watch_buy_trigger_cross(item)
-    if persisted is not None:
-        return str(persisted.get("reason") or "intraday_watch_buy_trigger_cross_seen"), persisted
+    if allow_persisted_trigger:
+        persisted = _persisted_watch_buy_trigger_cross(item)
+        if persisted is not None:
+            return str(persisted.get("reason") or "intraday_watch_buy_trigger_cross_seen"), persisted
     return None, None
 
 
@@ -8159,6 +8191,31 @@ def _serialized_order_quantity(order_payload: object) -> int | None:
     return _parse_positive_int(order_payload.get("quantity"))
 
 
+def _serialized_order_status(order_payload: object) -> str | None:
+    if not isinstance(order_payload, dict):
+        return None
+    status = order_payload.get("status")
+    if not isinstance(status, str) or not status.strip():
+        return None
+    return status.strip().lower()
+
+
+def _plan_item_status_from_order_payload(order_payload: object) -> str | None:
+    status = _serialized_order_status(order_payload)
+    if status not in {value.value for value in NormalizedBrokerOrderStatus}:
+        return None
+    return plan_item_status_for_broker_order_status(status)
+
+
+def _placement_preserves_current_plan_status(payload: dict[str, object]) -> bool:
+    return payload.get("block_reason") in {
+        "execution_plan_item_state_changed",
+        "account_drawdown_recovery_candidate_ineligible",
+        "account_drawdown_recovery_lineage_invalid",
+        "account_drawdown_recovery_state_changed",
+    }
+
+
 def _parse_positive_int(value: object) -> int | None:
     if isinstance(value, bool):
         return None
@@ -8887,6 +8944,7 @@ def _place_monitoring_order(
     trigger_reason: str | None,
     trigger_metadata: dict[str, object] | None,
     triggered_at: datetime,
+    freshness_reference_at: datetime | None = None,
     limit_price_override: Decimal | None = None,
     before_success_commit: Callable[[], None] | None = None,
 ):
@@ -8943,6 +9001,8 @@ def _place_monitoring_order(
         command=order_request,
         request_source=f"monitoring:{MONITORING_WORKER_NAME}",
         before_success_commit=before_success_commit,
+        now=triggered_at,
+        freshness_reference_at=freshness_reference_at or triggered_at,
     )
 
 

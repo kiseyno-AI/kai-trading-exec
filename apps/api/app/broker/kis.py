@@ -980,9 +980,13 @@ class KisBrokerAdapter(BrokerAdapter):
             _parse_overseas_available_cash(balance_response.payload),
         )
         holdings = _parse_overseas_holdings(balance_response.payload)
-        unrealized_pnl = sum(
-            (holding.unrealized_pnl or Decimal("0") for holding in holdings),
-            Decimal("0"),
+        unrealized_pnl = (
+            None
+            if any(holding.unrealized_pnl is None for holding in holdings)
+            else sum(
+                (holding.unrealized_pnl for holding in holdings),
+                Decimal("0"),
+            )
         )
         securities_value = sum(
             (

@@ -48,6 +48,10 @@ class StubBrokerAdapter:
             available_cash=available_cash,
             observed_at=datetime.now(UTC),
             source="stub:account_snapshot",
+            total_asset_value=available_cash,
+            previous_total_asset_value=available_cash,
+            asset_change_amount=Decimal("0"),
+            unrealized_pnl=Decimal("0"),
             holdings=holdings or [],
             open_orders=open_orders or [],
         )

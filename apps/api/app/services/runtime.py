@@ -163,6 +163,14 @@ def default_safety(settings: Settings, reason: str) -> dict[str, object]:
         "automation_enabled": False,
         "automated_order_submission_allowed": False,
         "automated_order_submission_block_reason": "paused",
+        "automated_buy_submission_allowed": False,
+        "automated_buy_submission_block_reason": "paused",
+        "hourly_risk_off": {
+            "available": False,
+            "active": None,
+            "epoch": None,
+            "context": None,
+        },
         "readiness_reason": reason,
         "updated_at": None,
         "last_change": {
@@ -1587,6 +1595,10 @@ def build_runtime_status(
 
     if settings.autonomous_runtime_enabled and not include_expensive_sections:
         late_entry_gate = runtime_late_entry_summary(settings=settings, db=db)
+        account_drawdown_gate = latest_account_drawdown_gate_state(
+            settings=settings,
+            db=db,
+        )
         cached_symbols = _autonomous_runtime_snapshot_symbol_summary(autonomous=autonomous)
         cycle_symbols = _autonomous_runtime_snapshot_symbols(autonomous=autonomous) or _autonomous_monitoring_symbols(
             autonomous=autonomous
@@ -1695,10 +1707,22 @@ def build_runtime_status(
     if schema["status"] != "ok":
         counts_available = False
         missing_tables = schema.get("missing_tables") or []
+        missing_columns = schema.get("missing_columns") or {}
         if missing_tables:
             schema_reason = (
                 "runtime schema incomplete: "
                 f"missing {', '.join(str(table) for table in missing_tables)}; run migrations"
+            )
+        elif isinstance(missing_columns, dict) and missing_columns:
+            missing_column_names = [
+                f"{table}.{column}"
+                for table, columns in missing_columns.items()
+                if isinstance(columns, list)
+                for column in columns
+            ]
+            schema_reason = (
+                "runtime schema incomplete: missing "
+                f"{', '.join(missing_column_names)}; run migrations"
             )
         else:
             schema_reason = "runtime schema unavailable; run migrations"

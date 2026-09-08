@@ -162,7 +162,18 @@ def evaluate_short_term_watcher_decision(
         command=PlaceOrderRequest(**order_preview),
         request_source="short-term-watcher:decision",
     )
-    persisted_order = _load_order(settings=settings, db=db, idempotency_key=order_preview["idempotency_key"])
+    result_order = order_result.payload.get("order")
+    result_order_key = (
+        result_order.get("idempotency_key")
+        if isinstance(result_order, dict)
+        and isinstance(result_order.get("idempotency_key"), str)
+        else None
+    )
+    persisted_order = _load_order(
+        settings=settings,
+        db=db,
+        idempotency_key=result_order_key or order_preview["idempotency_key"],
+    )
     refreshed_item = db.get(ExecutionPlanItem, item.id, options=[selectinload(ExecutionPlanItem.plan)]) or item
     submission_accepted = _order_submission_accepted(order_result=order_result, order=persisted_order)
     materialized_monitoring = []
