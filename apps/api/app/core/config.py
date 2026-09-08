@@ -121,6 +121,48 @@ class Settings(BaseModel):
     account_unrealized_loss_pct: Decimal = Field(default=Decimal("1.0"), ge=0, le=Decimal("100"))
     account_severe_holding_loss_pct: Decimal = Field(default=Decimal("7.0"), ge=0, le=Decimal("100"))
     account_severe_holding_loss_abs_krw: Decimal = Field(default=Decimal("0"), ge=0)
+    account_drawdown_recovery_enabled: bool = True
+    account_drawdown_recovery_threshold_ratio: Decimal = Field(
+        default=Decimal("0.80"),
+        gt=0,
+        le=1,
+    )
+    account_drawdown_recovery_required_healthy_observations: int = Field(
+        default=2,
+        ge=2,
+        le=24,
+    )
+    account_drawdown_recovery_cooldown_seconds: int = Field(
+        default=300,
+        ge=0,
+        le=86400,
+    )
+    account_drawdown_recovery_min_observation_interval_seconds: int = Field(
+        default=60,
+        ge=1,
+        le=3600,
+    )
+    account_drawdown_recovery_max_snapshot_future_skew_seconds: int = Field(
+        default=30,
+        ge=0,
+        le=300,
+    )
+    account_drawdown_recovery_scope_secret: str | None = None
+    hourly_plan_judgment_recovery_required_healthy_observations: int = Field(
+        default=2,
+        ge=2,
+        le=24,
+    )
+    hourly_plan_judgment_recovery_cooldown_seconds: int = Field(
+        default=900,
+        ge=0,
+        le=86400,
+    )
+    hourly_plan_judgment_recovery_min_observation_interval_seconds: int = Field(
+        default=300,
+        ge=1,
+        le=3600,
+    )
     vol_corr_sizing_enabled: bool = False
     vol_corr_volatility_lookback_days: int = Field(default=20, ge=2, le=252)
     vol_corr_min_return_observations: int = Field(default=10, ge=2, le=252)
@@ -470,6 +512,16 @@ _ENV_FIELDS = {
     "ACCOUNT_UNREALIZED_LOSS_PCT": "account_unrealized_loss_pct",
     "ACCOUNT_SEVERE_HOLDING_LOSS_PCT": "account_severe_holding_loss_pct",
     "ACCOUNT_SEVERE_HOLDING_LOSS_ABS_KRW": "account_severe_holding_loss_abs_krw",
+    "ACCOUNT_DRAWDOWN_RECOVERY_ENABLED": "account_drawdown_recovery_enabled",
+    "ACCOUNT_DRAWDOWN_RECOVERY_THRESHOLD_RATIO": "account_drawdown_recovery_threshold_ratio",
+    "ACCOUNT_DRAWDOWN_RECOVERY_REQUIRED_HEALTHY_OBSERVATIONS": "account_drawdown_recovery_required_healthy_observations",
+    "ACCOUNT_DRAWDOWN_RECOVERY_COOLDOWN_SECONDS": "account_drawdown_recovery_cooldown_seconds",
+    "ACCOUNT_DRAWDOWN_RECOVERY_MIN_OBSERVATION_INTERVAL_SECONDS": "account_drawdown_recovery_min_observation_interval_seconds",
+    "ACCOUNT_DRAWDOWN_RECOVERY_MAX_SNAPSHOT_FUTURE_SKEW_SECONDS": "account_drawdown_recovery_max_snapshot_future_skew_seconds",
+    "ACCOUNT_DRAWDOWN_RECOVERY_SCOPE_SECRET": "account_drawdown_recovery_scope_secret",
+    "HOURLY_PLAN_JUDGMENT_RECOVERY_REQUIRED_HEALTHY_OBSERVATIONS": "hourly_plan_judgment_recovery_required_healthy_observations",
+    "HOURLY_PLAN_JUDGMENT_RECOVERY_COOLDOWN_SECONDS": "hourly_plan_judgment_recovery_cooldown_seconds",
+    "HOURLY_PLAN_JUDGMENT_RECOVERY_MIN_OBSERVATION_INTERVAL_SECONDS": "hourly_plan_judgment_recovery_min_observation_interval_seconds",
     "VOL_CORR_SIZING_ENABLED": "vol_corr_sizing_enabled",
     "VOL_CORR_VOLATILITY_LOOKBACK_DAYS": "vol_corr_volatility_lookback_days",
     "VOL_CORR_MIN_RETURN_OBSERVATIONS": "vol_corr_min_return_observations",

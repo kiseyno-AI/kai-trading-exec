@@ -1,6 +1,6 @@
 from typing import Annotated, Literal
 
-from fastapi import APIRouter, Body, Depends, Request
+from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from sqlalchemy.orm import Session
 
 from app.api.dependencies import get_broker_adapter, get_db_session, get_runtime_metadata, get_settings
@@ -103,9 +103,12 @@ async def runtime_plan_judgment_action(
         if isinstance(risk_reasons_payload, list)
         else []
     )
-    return apply_hourly_plan_judgment_action(
+    result = apply_hourly_plan_judgment_action(
         settings=settings,
         db=db,
         risk_flags=max(0, int(payload.get("risk_flags") or 0)),
         risk_reasons=risk_reasons,
     )
+    if result.get("status") == "retry_required":
+        raise HTTPException(status_code=503, detail=result)
+    return result

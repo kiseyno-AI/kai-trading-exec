@@ -10,13 +10,14 @@ from hashlib import sha256
 from pathlib import Path
 from tempfile import gettempdir
 from threading import Lock, RLock
+from time import monotonic
 from typing import Iterator
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import select, text
+from sqlalchemy import case, exists, or_, select, text, update
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session, selectinload
+from sqlalchemy.orm import Session, selectinload, undefer
 
 from app.api.schemas.execution import PlaceOrderRequest
 from app.broker.base import (
@@ -34,8 +35,10 @@ from app.core.config import Settings
 from app.models.runtime import (
     BrokerOrder,
     BrokerOrderEvent,
+    BrokerSession,
     ExecutionPlan,
     ExecutionPlanItem,
+    ExecutionPlanItemAudit,
     RuntimeControlState,
 )
 from app.models.runtime import ExecutionFill, ExecutionPosition, new_id
@@ -46,6 +49,21 @@ from app.services.account_drawdown_gate import (
     evaluate_us_equity_account_gate,
     record_account_drawdown_block,
 )
+from app.services.account_drawdown_recovery import (
+    POLICY_DISABLED_RELEASE_EVENT_TYPE,
+    RECOVERABLE_LOSS_GATE_NAMES,
+    RECOVERY_RELEASED_EVENT_TYPE,
+    record_healthy_observation,
+    record_recovery_release,
+    record_recovery_reset,
+    recovery_account_fingerprint,
+    recovery_cooldown_until,
+    recovery_gate_settings,
+    recovery_idempotency_key,
+    recovery_policy_fingerprint,
+    recovery_state,
+    snapshot_is_fresh_for_recovery,
+)
 from app.services.broker_raw_holdings import snapshot_with_raw_balance_holdings
 from app.services.broker_auth import ensure_authenticated_broker_session
 from app.services.broker_order_state import CAPITAL_RESERVING_ORDER_STATUSES
@@ -55,10 +73,14 @@ from app.services.execution_api import serialize_broker_order
 from app.services.fill_idempotency import execution_fill_idempotency_key
 from app.services.fill_economics import COST_COVERAGE_UNKNOWN, settlement_currency_for_order
 from app.services.monitoring_price_source import is_us_regular_session, next_us_regular_open
+from app.services.plan_judgment_actions import project_buy_plan_item_for_hourly_risk_off
 from app.services.runtime_controls import (
+    RUNTIME_CONTROL_ID,
+    automated_buy_submission_block_reason,
     automated_order_submission_allowed,
     automated_order_submission_block_reason,
     ensure_runtime_control_state,
+    hourly_risk_off_retry_after_at,
     runtime_safety_payload,
 )
 from app.services.runtime_transitions import (
@@ -69,6 +91,38 @@ from app.services.runtime_transitions import (
 
 UPBIT_PAPER_ALLOWED_SYMBOLS = frozenset({"KRW-BTC", "KRW-ETH"})
 RUNTIME_SAFETY_CONTROL_CLASSIFICATION = "runtime_safety_control"
+ACCOUNT_DRAWDOWN_RECOVERY_INELIGIBLE_PLAN_STATUSES = frozenset(
+    {
+        "broker_order_submission_pending",
+        "broker_order_submitted",
+        "broker_order_open",
+        "broker_order_partially_filled",
+        "broker_order_rejected",
+        "broker_order_failed",
+        "cancel_pending",
+        "canceled",
+        "cancelled",
+        "exec_agent_rejected",
+        "expired",
+        "failed",
+        "filled",
+        "open",
+        "partially_filled",
+        "rejected",
+        "submitted",
+        "superseded",
+        "watch_buy_rejected",
+        "watch_buy_submitted",
+        "watch_cancelled",
+        "watch_expired",
+        "next_open_buy_failed",
+    }
+)
+ACCOUNT_DRAWDOWN_RECOVERY_AUTOMATED_SOURCE_PREFIXES = (
+    "monitoring:",
+    "execution-job:",
+    "short-term-watcher:",
+)
 _ORDER_SCOPE_LOCKS: dict[str, RLock] = {}
 _ORDER_SCOPE_LOCKS_GUARD = Lock()
 
@@ -77,6 +131,144 @@ _ORDER_SCOPE_LOCKS_GUARD = Lock()
 class PlaceBrokerOrderResult:
     status_code: int
     payload: dict[str, object]
+
+
+@dataclass(frozen=True)
+class AccountDrawdownRecoveryPreflight:
+    active: bool
+    block_reason: str | None = None
+    message: str | None = None
+    retry_after_at: datetime | None = None
+    source_broker_order_pk: str | None = None
+    source_idempotency_key: str | None = None
+
+
+def inspect_account_drawdown_recovery(
+    *,
+    settings: Settings,
+    db: Session,
+    adapter: BrokerAdapter,
+    provider: str,
+    asset_class: str,
+    exchange: str,
+    idempotency_key: str,
+    execution_plan_item_id: str,
+    symbol: str,
+    now: datetime,
+    scope_source_cache: dict[str, BrokerOrder | None] | None = None,
+) -> AccountDrawdownRecoveryPreflight:
+    """Return the durable buy-recovery fence without querying the broker.
+
+    Monitoring uses this before risk sizing so a known cooldown cannot trigger
+    redundant account snapshots. The order service repeats the same checks
+    under its serialized intent lock before any broker mutation.
+    """
+
+    if adapter.provider != "kis" or provider != "kis":
+        return AccountDrawdownRecoveryPreflight(active=False)
+    recovery_scope = _account_drawdown_recovery_scope(
+        settings=settings,
+        provider=adapter.provider,
+        asset_class=asset_class,
+        exchange=exchange,
+    )
+    direct_source = _load_order_by_idempotency_key(
+        settings=settings,
+        db=db,
+        idempotency_key=idempotency_key,
+    )
+    direct_source_matches = (
+        direct_source is not None
+        and _account_drawdown_recovery_preflight_source_matches(
+            settings=settings,
+            adapter=adapter,
+            order=direct_source,
+            recovery_scope=recovery_scope,
+            idempotency_key=idempotency_key,
+            execution_plan_item_id=execution_plan_item_id,
+            symbol=symbol,
+        )
+    )
+    if direct_source_matches:
+        source_order = direct_source
+    elif scope_source_cache is not None and recovery_scope in scope_source_cache:
+        source_order = scope_source_cache[recovery_scope]
+    else:
+        source_order = _load_active_account_drawdown_recovery_source_for_scope(
+            settings=settings,
+            db=db,
+            provider=adapter.provider,
+            recovery_scope=recovery_scope,
+        )
+        if scope_source_cache is not None:
+            scope_source_cache[recovery_scope] = source_order
+    if source_order is None:
+        return AccountDrawdownRecoveryPreflight(active=False)
+    common = {
+        "active": True,
+        "source_broker_order_pk": source_order.id,
+        "source_idempotency_key": source_order.idempotency_key,
+    }
+    source_scope = _account_drawdown_recovery_order_scope(source_order)
+    if source_scope != recovery_scope:
+        return AccountDrawdownRecoveryPreflight(
+            **common,
+            block_reason="account_drawdown_recovery_scope_mismatch",
+            message=(
+                "an active account drawdown latch belongs to a different opaque "
+                "account scope; restore the original stable scope secret or "
+                "complete reviewed operator remediation"
+            ),
+            retry_after_at=(
+                _normalize_utc_datetime(now)
+                + timedelta(
+                    seconds=settings.account_drawdown_recovery_min_observation_interval_seconds
+                )
+            ),
+        )
+    if settings.account_drawdown_gate_enabled and not settings.account_drawdown_recovery_enabled:
+        return AccountDrawdownRecoveryPreflight(
+            **common,
+            block_reason="account_drawdown_recovery_disabled",
+            message="account drawdown recovery is disabled by configuration",
+        )
+    state = recovery_state(
+        db=db,
+        execution_plan_item_id=source_order.execution_plan_item_id,
+        source_broker_order_pk=source_order.id,
+    )
+    if state.released:
+        # A released child can still be retryable when a runtime safety fence
+        # stopped it before the broker call. Keep forcing a fresh trigger in
+        # monitoring, but do not restart the already-completed cooldown.
+        return AccountDrawdownRecoveryPreflight(**common)
+    blocked_at = source_order.last_broker_sync_at or source_order.created_at
+    cooldown_until = recovery_cooldown_until(
+        blocked_at=blocked_at,
+        settings=settings,
+        last_unhealthy_at=state.last_unhealthy_at,
+    )
+    if settings.account_drawdown_gate_enabled and _normalize_utc_datetime(now) < cooldown_until:
+        return AccountDrawdownRecoveryPreflight(
+            **common,
+            block_reason="account_drawdown_recovery_cooldown",
+            message="account drawdown recovery cooldown has not elapsed",
+            retry_after_at=cooldown_until,
+        )
+    if state.last_snapshot_observed_at is not None:
+        next_observation_at = _normalize_utc_datetime(
+            state.last_snapshot_observed_at
+        ) + timedelta(
+            seconds=settings.account_drawdown_recovery_min_observation_interval_seconds
+        )
+        if _normalize_utc_datetime(now) < next_observation_at:
+            return AccountDrawdownRecoveryPreflight(
+                **common,
+                block_reason="account_drawdown_recovery_observation_interval",
+                message="account drawdown recovery is waiting for the next distinct snapshot",
+                retry_after_at=next_observation_at,
+            )
+    return AccountDrawdownRecoveryPreflight(**common)
 
 
 @contextmanager
@@ -182,6 +374,7 @@ def place_broker_order(
     request_source: str = "post:/orders",
     before_success_commit: Callable[[], None] | None = None,
     now: datetime | None = None,
+    freshness_reference_at: datetime | None = None,
 ) -> PlaceBrokerOrderResult:
     with _serialized_order_intent_scope(
         settings=settings,
@@ -197,6 +390,7 @@ def place_broker_order(
             request_source=request_source,
             before_success_commit=before_success_commit,
             now=now,
+            freshness_reference_at=freshness_reference_at,
         )
 
 
@@ -209,7 +403,13 @@ def _place_broker_order_serialized(
     request_source: str,
     before_success_commit: Callable[[], None] | None,
     now: datetime | None,
+    freshness_reference_at: datetime | None,
 ) -> PlaceBrokerOrderResult:
+    logical_command = command
+    observed_at = _normalize_utc_datetime(now or datetime.now(UTC))
+    snapshot_freshness_reference_at = _normalize_utc_datetime(
+        freshness_reference_at or observed_at
+    )
     existing = _load_order_by_idempotency_key(
         settings=settings,
         db=db,
@@ -226,7 +426,65 @@ def _place_broker_order_serialized(
         )
         else None
     )
-    if existing is not None and retryable_safety_fenced_order is None:
+    if retryable_safety_fenced_order is not None:
+        if not _runtime_safety_order_allows_resized_retrigger(
+            retryable_safety_fenced_order
+        ):
+            command = _runtime_safety_replay_command(
+                retryable_safety_fenced_order
+            ) or command
+    direct_drawdown_recovery_source_order = (
+        existing
+        if existing is not None
+        and _account_drawdown_recovery_source_matches_command(
+            settings=settings,
+            adapter=adapter,
+            order=existing,
+            command=logical_command,
+            request_source=request_source,
+        )
+        else None
+    )
+    active_drawdown_recovery_source_order = (
+        _load_active_account_drawdown_recovery_source(
+            settings=settings,
+            db=db,
+            adapter=adapter,
+            command=logical_command,
+        )
+        if direct_drawdown_recovery_source_order is None
+        else None
+    )
+    if (
+        existing is not None
+        and retryable_safety_fenced_order is None
+        and direct_drawdown_recovery_source_order is None
+    ):
+        current_recovery_scope = _account_drawdown_recovery_scope(
+            settings=settings,
+            provider=adapter.provider,
+            asset_class=logical_command.asset_class,
+            exchange=logical_command.exchange,
+        )
+        if (
+            not settings.account_drawdown_recovery_scope_secret
+            and active_drawdown_recovery_source_order is existing
+            and _account_drawdown_recovery_order_scope(existing)
+            != current_recovery_scope
+        ):
+            # Without a dedicated stable scope key, rotating the KIS secret
+            # changes the opaque account fingerprint. Treat an exact replay of
+            # that orphaned same-currency loss row as the active fail-closed
+            # latch instead of downgrading it to an ordinary rejected duplicate.
+            return _account_drawdown_recovery_blocked_result(
+                source_order=existing,
+                block_reason="account_drawdown_recovery_scope_mismatch",
+                message=(
+                    "an active account drawdown latch belongs to a different "
+                    "opaque account scope; restore the original stable scope "
+                    "secret or complete reviewed operator remediation"
+                ),
+            )
         return PlaceBrokerOrderResult(
             status_code=200,
             payload={
@@ -235,10 +493,30 @@ def _place_broker_order_serialized(
                 "order": serialize_broker_order(existing, include_events=True),
             },
         )
-
+    drawdown_recovery_source_order = (
+        direct_drawdown_recovery_source_order
+        or active_drawdown_recovery_source_order
+    )
     control_state = ensure_runtime_control_state(settings=settings, db=db)
-    if not automated_order_submission_allowed(control_state):
-        block_reason = automated_order_submission_block_reason(control_state)
+    submission_block_reason = automated_order_submission_block_reason(control_state)
+    if (
+        submission_block_reason is None
+        and command.side == "buy"
+        and command.execution_plan_item_id is None
+        and _is_new_buy_order(command=command, plan_item=None)
+    ):
+        submission_block_reason = automated_buy_submission_block_reason(control_state)
+    if submission_block_reason is not None:
+        block_reason = submission_block_reason
+        retry_after_at = (
+            hourly_risk_off_retry_after_at(
+                settings=settings,
+                state=control_state,
+                now=observed_at,
+            )
+            if block_reason == "hourly_plan_risk_off"
+            else None
+        )
         if retryable_safety_fenced_order is not None:
             return PlaceBrokerOrderResult(
                 status_code=409,
@@ -248,6 +526,9 @@ def _place_broker_order_serialized(
                         "automated order submission remains blocked by runtime safety controls"
                     ),
                     "block_reason": block_reason,
+                    "retry_after_at": (
+                        retry_after_at.isoformat() if retry_after_at is not None else None
+                    ),
                     "safety": runtime_safety_payload(control_state),
                     "order": serialize_broker_order(
                         retryable_safety_fenced_order,
@@ -260,6 +541,9 @@ def _place_broker_order_serialized(
             payload={
                 "message": "automated order submission is blocked by runtime safety controls",
                 "block_reason": block_reason,
+                "retry_after_at": (
+                    retry_after_at.isoformat() if retry_after_at is not None else None
+                ),
                 "safety": runtime_safety_payload(control_state),
             },
         )
@@ -296,6 +580,237 @@ def _place_broker_order_serialized(
             status_code=422,
             payload={"message": validation_error},
         )
+
+    if command.side == "buy" and not _is_new_buy_order(
+        command=command,
+        plan_item=plan_item,
+    ):
+        # Preserve the existing risk-reduction/protective-hedge exemption from
+        # loss-threshold gating. Cash and exposure reservation checks below
+        # remain mandatory for these orders.
+        drawdown_recovery_source_order = None
+        direct_drawdown_recovery_source_order = None
+    if (
+        drawdown_recovery_source_order is not None
+        and plan_item is not None
+        and request_source.startswith(ACCOUNT_DRAWDOWN_RECOVERY_AUTOMATED_SOURCE_PREFIXES)
+        and retryable_safety_fenced_order is None
+    ):
+        # A monitoring/job candidate can be cancelled while it is waiting on
+        # an account-wide cooldown or scope check. Refresh and lock its durable
+        # state before every early recovery response so the caller cannot
+        # overwrite a terminal operator decision with a retryable status.
+        current_recovery_candidate = _current_buy_plan_item_state(
+            db=db,
+            item_id=plan_item.id,
+            lock=True,
+        )
+        if (
+            current_recovery_candidate is None
+            or current_recovery_candidate[0]
+            in ACCOUNT_DRAWDOWN_RECOVERY_INELIGIBLE_PLAN_STATUSES
+        ):
+            return _account_drawdown_recovery_blocked_result(
+                source_order=drawdown_recovery_source_order,
+                block_reason="account_drawdown_recovery_candidate_ineligible",
+                message=(
+                    "execution plan item is no longer eligible for automatic "
+                    "account drawdown recovery"
+                ),
+            )
+    if (
+        drawdown_recovery_source_order is not None
+        and _account_drawdown_recovery_order_scope(drawdown_recovery_source_order)
+        != _account_drawdown_recovery_scope(
+            settings=settings,
+            provider=adapter.provider,
+            asset_class=logical_command.asset_class,
+            exchange=logical_command.exchange,
+        )
+    ):
+        return _account_drawdown_recovery_blocked_result(
+            source_order=drawdown_recovery_source_order,
+            block_reason="account_drawdown_recovery_scope_mismatch",
+            message=(
+                "an active account drawdown latch belongs to a different opaque "
+                "account scope; restore the original stable scope secret or "
+                "complete reviewed operator remediation"
+            ),
+            retry_after_at=(
+                observed_at
+                + timedelta(
+                    seconds=settings.account_drawdown_recovery_min_observation_interval_seconds
+                )
+            ),
+        )
+    if (
+        drawdown_recovery_source_order is not None
+        and settings.account_drawdown_gate_enabled
+        and not settings.account_drawdown_recovery_enabled
+    ):
+        return _account_drawdown_recovery_blocked_result(
+            source_order=drawdown_recovery_source_order,
+            block_reason="account_drawdown_recovery_disabled",
+            message="account drawdown recovery is disabled by configuration",
+        )
+
+    if (
+        command.side == "buy"
+        and _is_new_buy_order(command=command, plan_item=plan_item)
+        and control_state.hourly_risk_off_active
+    ):
+        retry_after_at = hourly_risk_off_retry_after_at(
+            settings=settings,
+            state=control_state,
+            now=observed_at,
+        )
+        return PlaceBrokerOrderResult(
+            status_code=409,
+            payload={
+                "duplicate": retryable_safety_fenced_order is not None,
+                "message": "new buy submission is blocked by the active hourly risk-off fence",
+                "block_reason": "hourly_plan_risk_off",
+                "retry_after_at": (
+                    retry_after_at.isoformat() if retry_after_at is not None else None
+                ),
+                "safety": runtime_safety_payload(control_state),
+                **(
+                    {
+                        "order": serialize_broker_order(
+                            retryable_safety_fenced_order,
+                            include_events=True,
+                        )
+                    }
+                    if retryable_safety_fenced_order is not None
+                    else {}
+                ),
+            },
+        )
+
+    recovery_generation: int | None = None
+    recovery_already_released = False
+    recovery_candidate_can_advance = False
+    if drawdown_recovery_source_order is not None:
+        if drawdown_recovery_source_order.execution_plan_item_id is None:
+            recovery_candidate_can_advance = bool(
+                direct_drawdown_recovery_source_order is not None
+                and plan_item is None
+                and logical_command.execution_plan_item_id is None
+                and request_source == "post:/orders"
+                and logical_command.idempotency_key
+                == drawdown_recovery_source_order.idempotency_key
+                and logical_command.symbol == drawdown_recovery_source_order.symbol
+                and logical_command.side == drawdown_recovery_source_order.side == "buy"
+            )
+        else:
+            recovery_candidate_can_advance = bool(
+                direct_drawdown_recovery_source_order is not None
+                and plan_item is not None
+                and request_source.startswith(
+                    ACCOUNT_DRAWDOWN_RECOVERY_AUTOMATED_SOURCE_PREFIXES
+                )
+                and plan_item.id
+                == drawdown_recovery_source_order.execution_plan_item_id
+                and logical_command.execution_plan_item_id
+                == drawdown_recovery_source_order.execution_plan_item_id
+                and logical_command.idempotency_key
+                == drawdown_recovery_source_order.idempotency_key
+                and logical_command.symbol == drawdown_recovery_source_order.symbol
+                and logical_command.side == drawdown_recovery_source_order.side == "buy"
+            )
+        recovery_generation = 1
+        state = recovery_state(
+            db=db,
+            execution_plan_item_id=(
+                drawdown_recovery_source_order.execution_plan_item_id
+            ),
+            source_broker_order_pk=drawdown_recovery_source_order.id,
+        )
+        blocked_at = (
+            drawdown_recovery_source_order.last_broker_sync_at
+            or drawdown_recovery_source_order.created_at
+        )
+        cooldown_until = recovery_cooldown_until(
+            blocked_at=blocked_at,
+            settings=settings,
+            last_unhealthy_at=state.last_unhealthy_at,
+        )
+        if settings.account_drawdown_gate_enabled and observed_at < cooldown_until:
+            return _account_drawdown_recovery_blocked_result(
+                source_order=drawdown_recovery_source_order,
+                block_reason="account_drawdown_recovery_cooldown",
+                message="account drawdown recovery cooldown has not elapsed",
+                retry_after_at=cooldown_until,
+            )
+        recovery_key = recovery_idempotency_key(
+            base_key=logical_command.idempotency_key,
+            source_broker_order_pk=drawdown_recovery_source_order.id,
+            generation=recovery_generation,
+        )
+        recovery_metadata = dict(logical_command.metadata or {})
+        recovery_metadata["account_drawdown_recovery"] = {
+            "policy_version": 1,
+            "recovery_scope": _account_drawdown_recovery_scope(
+                settings=settings,
+                provider=adapter.provider,
+                asset_class=logical_command.asset_class,
+                exchange=logical_command.exchange,
+            ),
+            "source_broker_order_pk": drawdown_recovery_source_order.id,
+            "source_idempotency_key": drawdown_recovery_source_order.idempotency_key,
+            "recovery_generation": recovery_generation,
+        }
+        command = logical_command.model_copy(
+            update={
+                "idempotency_key": recovery_key,
+                "metadata": recovery_metadata,
+            }
+        )
+        existing_recovery_order = _load_order_by_idempotency_key(
+            settings=settings,
+            db=db,
+            idempotency_key=recovery_key,
+        )
+        if existing_recovery_order is not None:
+            if _runtime_safety_fenced_order_matches_command(
+                settings=settings,
+                adapter=adapter,
+                order=existing_recovery_order,
+                command=command,
+            ):
+                retryable_safety_fenced_order = existing_recovery_order
+                recovery_already_released = True
+                if not _runtime_safety_order_allows_resized_retrigger(
+                    existing_recovery_order
+                ):
+                    command = _runtime_safety_replay_command(
+                        existing_recovery_order
+                    ) or command
+            else:
+                return PlaceBrokerOrderResult(
+                    status_code=200,
+                    payload={
+                        "duplicate": True,
+                        "message": "account drawdown recovery order already exists",
+                        "order": serialize_broker_order(
+                            existing_recovery_order,
+                            include_events=True,
+                        ),
+                    },
+                )
+        if (
+            plan_item is not None
+            and plan_item.status in ACCOUNT_DRAWDOWN_RECOVERY_INELIGIBLE_PLAN_STATUSES
+            and retryable_safety_fenced_order is None
+        ):
+            return _account_drawdown_recovery_blocked_result(
+                source_order=drawdown_recovery_source_order,
+                block_reason="account_drawdown_recovery_candidate_ineligible",
+                message=(
+                    "execution plan item is no longer eligible for automatic "
+                    "account drawdown recovery"
+                ),
+            )
 
     upbit_guard_error = _validate_upbit_paper_guardrails(
         settings=settings,
@@ -405,12 +920,165 @@ def _place_broker_order_serialized(
         route_decision=route_decision,
     )
 
+    prepared_broker_session: BrokerSession | None = None
+    prepared_broker_session_error: str | None = None
+    if (
+        routed_command.side == "buy"
+        and (routed_command.provider == "kis" or adapter.provider == "kis")
+    ):
+        # Broker authentication can commit token bookkeeping. Do it before the
+        # PostgreSQL transaction-scoped account lock so the commit cannot
+        # silently release serialization between account truth/reservation
+        # evaluation and the durable submission-intent commit.
+        try:
+            prepared_broker_session = ensure_authenticated_broker_session(
+                settings=settings,
+                db=db,
+                adapter=adapter,
+                source="account_drawdown_gate",
+                reason=(
+                    "prepare broker session before serialized account checks for "
+                    f"{routed_command.idempotency_key}"
+                ),
+            )
+        except Exception as exc:
+            prepared_broker_session_error = (
+                f"{exc.__class__.__name__}: {exc}"
+            )
+
     _acquire_cross_process_order_intent_lock(
         settings=settings,
         db=db,
         adapter=adapter,
         command=routed_command,
     )
+
+    if plan_item is not None and routed_command.side == "buy":
+        pending_plan_status = plan_item.status
+        pending_risk_context = _json_dict(plan_item.risk_context)
+        current_plan_state = _current_buy_plan_item_state(
+            db=db,
+            item_id=plan_item.id,
+            lock=False,
+        )
+        if current_plan_state is None:
+            return PlaceBrokerOrderResult(
+                status_code=409,
+                payload={
+                    "duplicate": False,
+                    "message": "execution plan item disappeared before order submission",
+                    "block_reason": "execution_plan_item_state_changed",
+                },
+            )
+        current_status, current_risk_context = current_plan_state
+        plan_item.status = pending_plan_status
+        plan_item.risk_context = _merge_pending_plan_item_risk_context(
+            persisted=current_risk_context,
+            pending=pending_risk_context,
+        )
+        if _risk_context_has_active_hourly_risk_off(current_risk_context):
+            return PlaceBrokerOrderResult(
+                status_code=409,
+                payload={
+                    "duplicate": False,
+                    "message": "buy submission is blocked by the active hourly risk-off fence",
+                    "block_reason": "hourly_plan_risk_off",
+                },
+            )
+        if (
+            request_source.startswith(
+                ACCOUNT_DRAWDOWN_RECOVERY_AUTOMATED_SOURCE_PREFIXES
+            )
+            and current_status in ACCOUNT_DRAWDOWN_RECOVERY_INELIGIBLE_PLAN_STATUSES
+            and retryable_safety_fenced_order is None
+        ):
+            return PlaceBrokerOrderResult(
+                status_code=409,
+                payload={
+                    "duplicate": False,
+                    "message": "execution plan item is no longer eligible for automated buy submission",
+                    "block_reason": "execution_plan_item_state_changed",
+                },
+            )
+        if (
+            drawdown_recovery_source_order is not None
+            and current_status
+            in ACCOUNT_DRAWDOWN_RECOVERY_INELIGIBLE_PLAN_STATUSES
+            and retryable_safety_fenced_order is None
+        ):
+            return _account_drawdown_recovery_blocked_result(
+                source_order=drawdown_recovery_source_order,
+                block_reason="account_drawdown_recovery_candidate_ineligible",
+                message=(
+                    "execution plan item became ineligible while waiting for "
+                    "the account lock"
+                ),
+            )
+
+    # The first latch lookup happens before PostgreSQL's account-scoped
+    # advisory lock.  A competing request can commit a new loss block while
+    # this transaction is waiting, so repeat the lookup after acquiring the
+    # lock.  Returning for a fresh evaluation is deliberately fail-closed: a
+    # command prepared before the latch existed must never become its release
+    # child or submit with stale recovery state.
+    locked_active_recovery_source = _load_active_account_drawdown_recovery_source(
+        settings=settings,
+        db=db,
+        adapter=adapter,
+        command=logical_command,
+    )
+    if locked_active_recovery_source is not None and (
+        drawdown_recovery_source_order is None
+        or locked_active_recovery_source.id != drawdown_recovery_source_order.id
+    ):
+        return _account_drawdown_recovery_blocked_result(
+            source_order=locked_active_recovery_source,
+            block_reason="account_drawdown_recovery_state_changed",
+            message=(
+                "account drawdown recovery state changed while waiting for the "
+                "account lock; reevaluate this candidate"
+            ),
+        )
+
+    if drawdown_recovery_source_order is not None and retryable_safety_fenced_order is None:
+        concurrent_recovery_order = _load_order_by_idempotency_key(
+            settings=settings,
+            db=db,
+            idempotency_key=routed_command.idempotency_key,
+        )
+        if concurrent_recovery_order is not None:
+            return PlaceBrokerOrderResult(
+                status_code=200,
+                payload={
+                    "duplicate": True,
+                    "message": "account drawdown recovery order already exists",
+                    "order": serialize_broker_order(
+                        concurrent_recovery_order,
+                        include_events=True,
+                    ),
+                },
+            )
+
+    if drawdown_recovery_source_order is not None:
+        locked_recovery_state = recovery_state(
+            db=db,
+            execution_plan_item_id=(
+                drawdown_recovery_source_order.execution_plan_item_id
+            ),
+            source_broker_order_pk=drawdown_recovery_source_order.id,
+        )
+        if locked_recovery_state.released and not recovery_already_released:
+            # Another process released this account-wide latch while this
+            # candidate waited on the account intent lock. Do not let two
+            # different candidates both become the release order.
+            return _account_drawdown_recovery_blocked_result(
+                source_order=drawdown_recovery_source_order,
+                block_reason="account_drawdown_recovery_state_changed",
+                message=(
+                    "account drawdown recovery was released by another order; "
+                    "reevaluate this candidate against fresh account state"
+                ),
+            )
 
     unresolved_prior = _load_unresolved_prior_submission(
         settings=settings,
@@ -443,26 +1111,196 @@ def _place_broker_order_serialized(
     if sell_reservation_block is not None:
         return sell_reservation_block
 
+    if (
+        drawdown_recovery_source_order is not None
+        and settings.account_drawdown_gate_enabled
+        and not recovery_candidate_can_advance
+    ):
+        return _account_drawdown_recovery_blocked_result(
+            source_order=drawdown_recovery_source_order,
+            block_reason="account_drawdown_recovery_pending",
+            message=(
+                "account drawdown recovery awaits the original stopped buy "
+                "candidate"
+            ),
+        )
+
+    account_gate_settings = (
+        recovery_gate_settings(settings)
+        if drawdown_recovery_source_order is not None
+        and settings.account_drawdown_gate_enabled
+        else settings
+    )
     account_gate_decision = _evaluate_new_buy_account_gate(
-        settings=settings,
+        settings=account_gate_settings,
         db=db,
         adapter=adapter,
         command=routed_command,
         plan_item=plan_item,
         request_source=request_source,
+        now=observed_at,
+        freshness_reference_at=snapshot_freshness_reference_at,
+        session_state=prepared_broker_session,
+        session_error=prepared_broker_session_error,
+        require_fresh_snapshot=drawdown_recovery_source_order is not None,
     )
     if account_gate_decision is not None and not account_gate_decision.allowed:
+        if drawdown_recovery_source_order is not None:
+            if not recovery_already_released and recovery_candidate_can_advance:
+                record_recovery_reset(
+                    db=db,
+                    execution_plan_item_id=(
+                        drawdown_recovery_source_order.execution_plan_item_id
+                    ),
+                    source_broker_order_pk=drawdown_recovery_source_order.id,
+                    source_idempotency_key=drawdown_recovery_source_order.idempotency_key,
+                    recovery_generation=recovery_generation or 1,
+                    decision=account_gate_decision,
+                    settings=settings,
+                    occurred_at=observed_at,
+                )
+                db.commit()
+            return _account_drawdown_recovery_blocked_result(
+                source_order=drawdown_recovery_source_order,
+                block_reason="account_drawdown_recovery_pending",
+                message=(
+                    "account drawdown metrics have not satisfied recovery thresholds"
+                ),
+                decision=account_gate_decision,
+            )
         return _persist_account_gate_block(
             settings=settings,
             db=db,
             adapter=adapter,
             command=routed_command,
+            original_command=logical_command,
             request_source=request_source,
             plan_item=plan_item,
             route_decision=route_decision,
             decision=account_gate_decision,
             existing_order=retryable_safety_fenced_order,
+            observed_at=observed_at,
         )
+
+    if plan_item is not None and routed_command.side == "buy":
+        pending_plan_status = plan_item.status
+        pending_risk_context = _json_dict(plan_item.risk_context)
+        current_plan_state = _current_buy_plan_item_state(
+            db=db,
+            item_id=plan_item.id,
+            lock=True,
+        )
+        if current_plan_state is None:
+            return PlaceBrokerOrderResult(
+                status_code=409,
+                payload={
+                    "duplicate": False,
+                    "message": "execution plan item disappeared before order intent commit",
+                    "block_reason": "execution_plan_item_state_changed",
+                },
+            )
+        current_status, current_risk_context = current_plan_state
+        if _risk_context_has_active_hourly_risk_off(current_risk_context):
+            return PlaceBrokerOrderResult(
+                status_code=409,
+                payload={
+                    "duplicate": False,
+                    "message": "buy submission is blocked by the active hourly risk-off fence",
+                    "block_reason": "hourly_plan_risk_off",
+                },
+            )
+        if (
+            request_source.startswith(
+                ACCOUNT_DRAWDOWN_RECOVERY_AUTOMATED_SOURCE_PREFIXES
+            )
+            and current_status in ACCOUNT_DRAWDOWN_RECOVERY_INELIGIBLE_PLAN_STATUSES
+            and retryable_safety_fenced_order is None
+        ):
+            return PlaceBrokerOrderResult(
+                status_code=409,
+                payload={
+                    "duplicate": False,
+                    "message": "execution plan item changed while account safety checks were running",
+                    "block_reason": "execution_plan_item_state_changed",
+                },
+            )
+        plan_item.status = pending_plan_status
+        plan_item.risk_context = _merge_pending_plan_item_risk_context(
+            persisted=current_risk_context,
+            pending=pending_risk_context,
+        )
+
+    if drawdown_recovery_source_order is not None:
+        healthy_count = 0
+        if settings.account_drawdown_gate_enabled:
+            assert account_gate_decision is not None
+            if recovery_already_released:
+                healthy_count = settings.account_drawdown_recovery_required_healthy_observations
+            else:
+                healthy_count, observation_recorded = record_healthy_observation(
+                    db=db,
+                    execution_plan_item_id=(
+                        drawdown_recovery_source_order.execution_plan_item_id
+                    ),
+                    source_broker_order_pk=drawdown_recovery_source_order.id,
+                    source_idempotency_key=drawdown_recovery_source_order.idempotency_key,
+                    recovery_generation=recovery_generation or 1,
+                    decision=account_gate_decision,
+                    settings=settings,
+                    occurred_at=observed_at,
+                )
+                if (
+                    not observation_recorded
+                    or healthy_count
+                    < settings.account_drawdown_recovery_required_healthy_observations
+                ):
+                    db.commit()
+                    snapshot_observed_at = _normalize_utc_datetime(
+                        account_gate_decision.baseline_timestamp
+                        if isinstance(account_gate_decision.baseline_timestamp, datetime)
+                        else datetime.fromisoformat(
+                            str(account_gate_decision.baseline_timestamp).replace(
+                                "Z", "+00:00"
+                            )
+                        )
+                    )
+                    retry_anchor = max(
+                        observed_at,
+                        snapshot_observed_at,
+                        *(
+                            [_normalize_utc_datetime(state.last_snapshot_observed_at)]
+                            if state.last_snapshot_observed_at is not None
+                            else []
+                        ),
+                    )
+                    return _account_drawdown_recovery_blocked_result(
+                        source_order=drawdown_recovery_source_order,
+                        block_reason="account_drawdown_recovery_pending",
+                        message="account drawdown recovery requires more healthy observations",
+                        decision=account_gate_decision,
+                        healthy_observation_count=healthy_count,
+                        retry_after_at=(
+                            retry_anchor
+                            + timedelta(
+                                seconds=settings.account_drawdown_recovery_min_observation_interval_seconds
+                            )
+                        ),
+                    )
+        if not recovery_already_released:
+            record_recovery_release(
+                db=db,
+                execution_plan_item_id=(
+                    drawdown_recovery_source_order.execution_plan_item_id
+                ),
+                source_broker_order_pk=drawdown_recovery_source_order.id,
+                source_idempotency_key=drawdown_recovery_source_order.idempotency_key,
+                recovery_idempotency_key=routed_command.idempotency_key,
+                recovery_generation=recovery_generation or 1,
+                healthy_observation_count=healthy_count,
+                settings=settings,
+                occurred_at=observed_at,
+                gate_disabled=not settings.account_drawdown_gate_enabled,
+            )
 
     request_metadata = {
         "source": request_source,
@@ -474,8 +1312,28 @@ def _place_broker_order_serialized(
         "asset_class": routed_command.asset_class,
         "venue": routed_command.venue,
         "sizing": _sizing_payload(routed_command),
+        **(
+            {"plan_item_status_before_submission": plan_item.status}
+            if plan_item is not None
+            else {}
+        ),
         **({"metadata": routed_command.metadata} if routed_command.metadata is not None else {}),
         **({"route": _route_payload(route_decision)} if route_decision is not None else {}),
+        **(
+            {
+                "broker_account_scope": {
+                    "policy_version": 1,
+                    "scope": _account_drawdown_recovery_scope(
+                        settings=settings,
+                        provider=adapter.provider,
+                        asset_class=routed_command.asset_class,
+                        exchange=routed_command.exchange,
+                    ),
+                }
+            }
+            if adapter.provider == "kis"
+            else {}
+        ),
     }
     if retryable_safety_fenced_order is None:
         order = BrokerOrder(
@@ -502,6 +1360,14 @@ def _place_broker_order_serialized(
             order=order,
             status=NormalizedBrokerOrderStatus.SUBMISSION_PENDING.value,
         )
+        order.quantity = routed_command.quantity
+        order.base_quantity = routed_command.base_quantity
+        order.quote_notional = routed_command.quote_notional
+        order.quantity_precision = routed_command.quantity_precision
+        order.price_precision = routed_command.price_precision
+        order.venue = routed_command.venue
+        order.asset_class = routed_command.asset_class
+        order.limit_price = routed_command.limit_price
         order.request_metadata = request_metadata
         order.response_metadata = None
         order.last_error_classification = None
@@ -572,8 +1438,17 @@ def _place_broker_order_serialized(
         # boundary. ``expire_on_commit`` is disabled for request sessions, so an
         # explicit refresh is required here.
         db.commit()
-        db.refresh(control_state)
-        if not automated_order_submission_allowed(control_state):
+        control_state = _lock_runtime_control_for_broker_boundary(
+            db=db,
+            control_state=control_state,
+        )
+        boundary_block_reason = (
+            automated_buy_submission_block_reason(control_state)
+            if routed_command.side == "buy"
+            and _is_new_buy_order(command=routed_command, plan_item=plan_item)
+            else automated_order_submission_block_reason(control_state)
+        )
+        if boundary_block_reason is not None:
             return _persist_runtime_safety_fence(
                 settings=settings,
                 db=db,
@@ -581,6 +1456,8 @@ def _place_broker_order_serialized(
                 plan_item=plan_item,
                 command=routed_command,
                 control_state=control_state,
+                block_reason_override=boundary_block_reason,
+                risk_off_fence=(boundary_block_reason == "hourly_plan_risk_off"),
             )
         broker_call_started = True
         placement = adapter.place_order(
@@ -803,12 +1680,24 @@ def _place_broker_order_serialized(
     apply_broker_order_status(order=order, status=placement.normalized_status.value)
     order.submitted_at = placement.submitted_at
     order.last_broker_sync_at = placement.observed_at
-    order.request_metadata = _merge_order_request_metadata(
+    order_request_metadata = _merge_order_request_metadata(
         base=placement.request_metadata,
         command=routed_command,
         request_source=request_source,
         route_decision=route_decision,
     )
+    if account_gate_decision is not None:
+        order_request_metadata["account_drawdown_recovery_policy"] = {
+            "policy_version": 1,
+            "recovery_scope": _account_drawdown_recovery_scope(
+                settings=settings,
+                provider=adapter.provider,
+                asset_class=logical_command.asset_class,
+                exchange=logical_command.exchange,
+            ),
+            "policy_fingerprint": recovery_policy_fingerprint(settings),
+        }
+    order.request_metadata = order_request_metadata
     response_metadata = dict(placement.response_metadata or {})
     if account_gate_decision is not None:
         response_metadata["account_drawdown_gate"] = account_gate_decision.summary
@@ -939,12 +1828,27 @@ def _persist_runtime_safety_fence(
     plan_item: ExecutionPlanItem | None,
     command: PlaceOrderRequest,
     control_state: RuntimeControlState,
+    block_reason_override: str | None = None,
+    risk_off_fence: bool = False,
 ) -> PlaceBrokerOrderResult:
     observed_at = datetime.now(UTC)
-    block_reason = automated_order_submission_block_reason(control_state) or "runtime_control"
+    block_reason = (
+        block_reason_override
+        or automated_order_submission_block_reason(control_state)
+        or "runtime_control"
+    )
     message = (
         "broker submission was fenced before the broker call because runtime safety controls "
         f"changed to {block_reason}"
+    )
+    retry_after_at = (
+        hourly_risk_off_retry_after_at(
+            settings=settings,
+            state=control_state,
+            now=observed_at,
+        )
+        if risk_off_fence
+        else None
     )
     apply_broker_order_status(
         order=order,
@@ -983,19 +1887,74 @@ def _persist_runtime_safety_fence(
         )
     )
     if plan_item is not None:
-        set_plan_item_status(
-            db=db,
-            plan_item=plan_item,
-            status="broker_order_rejected",
-            source="broker_order_service",
-            reason=message,
-            payload={
-                "broker_order_pk": order.id,
-                "idempotency_key": order.idempotency_key,
-                "block_reason": block_reason,
-                "broker_call_started": False,
-            },
-        )
+        if risk_off_fence:
+            db.refresh(plan_item, attribute_names=["status", "risk_context"])
+            fence_context = (
+                control_state.hourly_risk_off_context
+                if isinstance(control_state.hourly_risk_off_context, dict)
+                else {}
+            )
+            original_status = request_metadata.get(
+                "plan_item_status_before_submission"
+            )
+            if not isinstance(original_status, str) or not original_status:
+                original_status = (
+                    "next_open_buy_retry_pending"
+                    if plan_item.intent == "next_open_buy"
+                    else "watch_monitoring_active"
+                )
+            projected = project_buy_plan_item_for_hourly_risk_off(
+                db=db,
+                settings=settings,
+                item=plan_item,
+                risk_flags=int(
+                    fence_context.get("activation_risk_flags")
+                    or fence_context.get("last_risk_flags")
+                    or 3
+                ),
+                risk_reasons=[
+                    str(reason)
+                    for reason in (
+                        fence_context.get("activation_risk_reasons")
+                        or fence_context.get("last_risk_reasons")
+                        or ["active hourly risk-off fence"]
+                    )
+                ],
+                now=observed_at,
+                resume_status=original_status,
+                fence_context=fence_context,
+            )
+            if (
+                not projected
+                and not _plan_item_has_active_hourly_risk_off(plan_item)
+            ):
+                set_plan_item_status(
+                    db=db,
+                    plan_item=plan_item,
+                    status="broker_order_rejected",
+                    source="broker_order_service",
+                    reason=message,
+                    payload={
+                        "broker_order_pk": order.id,
+                        "idempotency_key": order.idempotency_key,
+                        "block_reason": block_reason,
+                        "broker_call_started": False,
+                    },
+                )
+        else:
+            set_plan_item_status(
+                db=db,
+                plan_item=plan_item,
+                status="broker_order_rejected",
+                source="broker_order_service",
+                reason=message,
+                payload={
+                    "broker_order_pk": order.id,
+                    "idempotency_key": order.idempotency_key,
+                    "block_reason": block_reason,
+                    "broker_call_started": False,
+                },
+            )
     db.commit()
     db.expire(order, ["events"])
     persisted = _load_order_by_idempotency_key(
@@ -1010,10 +1969,47 @@ def _persist_runtime_safety_fence(
             "blocked": True,
             "message": message,
             "block_reason": block_reason,
+            "retry_after_at": (
+                retry_after_at.isoformat() if retry_after_at is not None else None
+            ),
             "safety": runtime_safety_payload(control_state),
             "order": serialize_broker_order(persisted or order, include_events=True),
         },
     )
+
+
+def _lock_runtime_control_for_broker_boundary(
+    *,
+    db: Session,
+    control_state: RuntimeControlState,
+) -> RuntimeControlState:
+    if db.get_bind().dialect.name == "sqlite":
+        # SQLite ignores FOR UPDATE. This no-op write obtains its single-writer
+        # reservation and keeps a concurrent risk transition ordered behind the
+        # broker call (or vice versa).
+        db.execute(
+            update(RuntimeControlState)
+            .where(RuntimeControlState.id == RUNTIME_CONTROL_ID)
+            .values(hourly_risk_off_epoch=RuntimeControlState.hourly_risk_off_epoch)
+        )
+    locked = db.scalar(
+        select(RuntimeControlState)
+        .where(RuntimeControlState.id == RUNTIME_CONTROL_ID)
+        .with_for_update()
+    )
+    if locked is None:
+        raise RuntimeError("runtime control state disappeared before broker submission")
+    db.refresh(
+        locked,
+        attribute_names=[
+            "paused",
+            "kill_switch_enabled",
+            "hourly_risk_off_active",
+            "hourly_risk_off_epoch",
+            "hourly_risk_off_context",
+        ],
+    )
+    return locked
 
 
 def _load_order_by_idempotency_key(
@@ -1042,12 +2038,26 @@ def _runtime_safety_fenced_order_matches_command(
     """Allow a known pre-broker safety fence to resume under the same key.
 
     The row is reusable only because the runtime fence is recorded before
-    ``adapter.place_order`` starts. Every order-defining field must still match;
-    a caller cannot mutate an idempotent request while reusing the row.
+    ``adapter.place_order`` starts. Economic fields and durable approval
+    lineage must still match, while monitoring timestamps/prices are allowed
+    to change on the later fresh trigger. The persisted command is replayed
+    after this check so volatile metadata can never mutate the fenced order.
     """
 
     metadata = order.request_metadata if isinstance(order.request_metadata, dict) else {}
     original_command = metadata.get("original_command")
+    account_scope_policy = metadata.get("broker_account_scope")
+    account_scope_matches = adapter.provider != "kis" or bool(
+        isinstance(account_scope_policy, dict)
+        and account_scope_policy.get("policy_version") == 1
+        and account_scope_policy.get("scope")
+        == _account_drawdown_recovery_scope(
+            settings=settings,
+            provider=adapter.provider,
+            asset_class=command.asset_class,
+            exchange=command.exchange,
+        )
+    )
     return bool(
         order.status == NormalizedBrokerOrderStatus.REJECTED.value
         and order.last_error_classification == RUNTIME_SAFETY_CONTROL_CLASSIFICATION
@@ -1055,8 +2065,328 @@ def _runtime_safety_fenced_order_matches_command(
         and order.submitted_at is None
         and order.mode == settings.runtime_mode
         and order.broker_name == adapter.provider
+        and account_scope_matches
         and isinstance(original_command, dict)
+        and _runtime_safety_command_identity(original_command)
+        == _runtime_safety_command_identity(_order_command_payload(command))
+    )
+
+
+def _runtime_safety_command_identity(payload: dict[str, object]) -> dict[str, object]:
+    volatile_retrigger_fields = {
+        "base_quantity",
+        "limit_price",
+        "price_precision",
+        "quantity",
+        "quantity_precision",
+        "quote_notional",
+    }
+    allow_resized_retrigger = str(payload.get("idempotency_key") or "").startswith(
+        "monitoring:watch_buy:"
+    )
+    identity = {
+        key: value
+        for key, value in payload.items()
+        if key != "metadata"
+        and not (allow_resized_retrigger and key in volatile_retrigger_fields)
+    }
+    raw_metadata = payload.get("metadata")
+    metadata = raw_metadata if isinstance(raw_metadata, dict) else {}
+    stable_metadata_keys = (
+        "account_drawdown_recovery",
+        "monitoring_worker",
+        "order_purpose",
+        "paper",
+        "retry",
+        "simulated",
+    )
+    identity["metadata"] = {
+        key: metadata[key] for key in stable_metadata_keys if key in metadata
+    }
+    return identity
+
+
+def _runtime_safety_order_allows_resized_retrigger(order: BrokerOrder) -> bool:
+    return bool(
+        order.execution_plan_item_id
+        and order.side == "buy"
+        and order.idempotency_key.startswith("monitoring:watch_buy:")
+    )
+
+
+def _runtime_safety_replay_command(order: BrokerOrder) -> PlaceOrderRequest | None:
+    metadata = order.request_metadata if isinstance(order.request_metadata, dict) else {}
+    original_command = metadata.get("original_command")
+    if not isinstance(original_command, dict):
+        return None
+    try:
+        return PlaceOrderRequest.model_validate(original_command)
+    except ValueError:
+        return None
+
+
+def _account_drawdown_recovery_source_matches_command(
+    *,
+    settings: Settings,
+    adapter: BrokerAdapter,
+    order: BrokerOrder,
+    command: PlaceOrderRequest,
+    request_source: str,
+) -> bool:
+    response_metadata = (
+        order.response_metadata if isinstance(order.response_metadata, dict) else {}
+    )
+    gate_summary = response_metadata.get("account_drawdown_gate")
+    gate_name = (
+        order.last_error_code
+        or (gate_summary.get("gate_name") if isinstance(gate_summary, dict) else None)
+    )
+    request_metadata = (
+        order.request_metadata if isinstance(order.request_metadata, dict) else {}
+    )
+    recovery_policy = request_metadata.get("account_drawdown_recovery_policy")
+    policy_is_current = (
+        isinstance(recovery_policy, dict)
+        and recovery_policy.get("policy_version") == 1
+        and recovery_policy.get("recovery_scope")
+        == _account_drawdown_recovery_scope(
+            settings=settings,
+            provider=adapter.provider,
+            asset_class=command.asset_class,
+            exchange=command.exchange,
+        )
+    )
+    if not policy_is_current:
+        # Gate disablement may bypass health thresholds only after the source
+        # proves it belongs to this exact account lane. Legacy/unscoped and
+        # foreign-policy rows cannot prove that identity and remain frozen.
+        return False
+    source_shape_matches = bool(
+        order.status == NormalizedBrokerOrderStatus.REJECTED.value
+        and order.last_error_classification == "validation"
+        and gate_name in RECOVERABLE_LOSS_GATE_NAMES
+        and order.broker_order_id is None
+        and order.submitted_at is None
+        and order.mode == settings.runtime_mode
+        and order.broker_name == adapter.provider
+        and order.idempotency_key == command.idempotency_key
+        and order.symbol == command.symbol
+        and order.side == command.side
+    )
+    if not source_shape_matches:
+        return False
+    if order.execution_plan_item_id is not None:
+        return bool(
+            request_source.startswith(
+                ACCOUNT_DRAWDOWN_RECOVERY_AUTOMATED_SOURCE_PREFIXES
+            )
+            and order.execution_plan_item_id == command.execution_plan_item_id
+        )
+    original_command = request_metadata.get("original_command")
+    return bool(
+        request_source == "post:/orders"
+        and command.execution_plan_item_id is None
+        and isinstance(original_command, dict)
+        # An unlinked API caller may choose an idempotency key that resembles
+        # an internal monitoring key. Direct recovery has no trusted plan
+        # lineage, so every normalized command field must remain identical;
+        # the monitoring-only resized-retrigger identity is unsafe here.
         and original_command == _order_command_payload(command)
+    )
+
+
+def _account_drawdown_recovery_preflight_source_matches(
+    *,
+    settings: Settings,
+    adapter: BrokerAdapter,
+    order: BrokerOrder,
+    recovery_scope: str,
+    idempotency_key: str,
+    execution_plan_item_id: str,
+    symbol: str,
+) -> bool:
+    request_metadata = (
+        order.request_metadata if isinstance(order.request_metadata, dict) else {}
+    )
+    policy = request_metadata.get("account_drawdown_recovery_policy")
+    return bool(
+        isinstance(policy, dict)
+        and policy.get("policy_version") == 1
+        and policy.get("recovery_scope") == recovery_scope
+        and order.status == NormalizedBrokerOrderStatus.REJECTED.value
+        and order.last_error_classification == "validation"
+        and order.last_error_code in RECOVERABLE_LOSS_GATE_NAMES
+        and order.broker_order_id is None
+        and order.submitted_at is None
+        and order.mode == settings.runtime_mode
+        and order.broker_name == adapter.provider
+        and order.idempotency_key == idempotency_key
+        and order.execution_plan_item_id == execution_plan_item_id
+        and order.symbol == symbol
+        and order.side == "buy"
+    )
+
+
+def _load_active_account_drawdown_recovery_source(
+    *,
+    settings: Settings,
+    db: Session,
+    adapter: BrokerAdapter,
+    command: PlaceOrderRequest,
+) -> BrokerOrder | None:
+    if command.side != "buy" or adapter.provider != "kis" or command.provider != "kis":
+        return None
+    recovery_scope = _account_drawdown_recovery_scope(
+        settings=settings,
+        provider=adapter.provider,
+        asset_class=command.asset_class,
+        exchange=command.exchange,
+    )
+    return _load_active_account_drawdown_recovery_source_for_scope(
+        settings=settings,
+        db=db,
+        provider=adapter.provider,
+        recovery_scope=recovery_scope,
+    )
+
+
+def _load_active_account_drawdown_recovery_source_for_scope(
+    *,
+    settings: Settings,
+    db: Session,
+    provider: str,
+    recovery_scope: str,
+) -> BrokerOrder | None:
+    audit_released = exists(
+        select(1).where(
+            ExecutionPlanItemAudit.execution_plan_item_id
+            == BrokerOrder.execution_plan_item_id,
+            ExecutionPlanItemAudit.event_type.in_(
+                (
+                    RECOVERY_RELEASED_EVENT_TYPE,
+                    POLICY_DISABLED_RELEASE_EVENT_TYPE,
+                )
+            ),
+            ExecutionPlanItemAudit.summary[
+                "source_broker_order_pk"
+            ].as_string()
+            == BrokerOrder.id,
+        )
+    )
+    order_event_released = exists(
+        select(1).where(
+            BrokerOrderEvent.broker_order_pk == BrokerOrder.id,
+            BrokerOrderEvent.event_type.in_(
+                (
+                    RECOVERY_RELEASED_EVENT_TYPE,
+                    POLICY_DISABLED_RELEASE_EVENT_TYPE,
+                )
+            ),
+        )
+    )
+    released = or_(audit_released, order_event_released)
+    scope_expression = BrokerOrder.request_metadata[
+        "account_drawdown_recovery_policy"
+    ]["recovery_scope"].as_string()
+    currency_scope = recovery_scope.rsplit(":", 1)[-1]
+    scope_predicate = scope_expression == recovery_scope
+    if not settings.account_drawdown_recovery_scope_secret:
+        # Without a dedicated stable key, a broker-credential rotation changes
+        # the opaque account fingerprint. Conservatively keep a same-currency
+        # orphan latch closed. A configured stable key makes account identity
+        # deterministic, so matching another account would be a false block.
+        scope_predicate = or_(
+            scope_predicate,
+            scope_expression.like(f"{provider}:%:{currency_scope}"),
+        )
+    return db.scalar(
+        select(BrokerOrder)
+        .where(
+            BrokerOrder.mode == settings.runtime_mode,
+            BrokerOrder.broker_name == provider,
+            BrokerOrder.side == "buy",
+            BrokerOrder.status == NormalizedBrokerOrderStatus.REJECTED.value,
+            BrokerOrder.last_error_classification == "validation",
+            BrokerOrder.last_error_code.in_(tuple(RECOVERABLE_LOSS_GATE_NAMES)),
+            BrokerOrder.broker_order_id.is_(None),
+            BrokerOrder.submitted_at.is_(None),
+            BrokerOrder.request_metadata["account_drawdown_recovery_policy"][
+                "policy_version"
+            ].as_integer()
+            == 1,
+            scope_predicate,
+            ~released,
+        )
+        .options(
+            undefer(BrokerOrder.request_metadata),
+            undefer(BrokerOrder.response_metadata),
+            selectinload(BrokerOrder.events),
+        )
+        .order_by(
+            case((scope_expression == recovery_scope, 0), else_=1),
+            BrokerOrder.last_broker_sync_at.desc(),
+            BrokerOrder.created_at.desc(),
+            BrokerOrder.id.desc(),
+        )
+        .limit(1)
+    )
+
+
+def _account_drawdown_recovery_order_scope(order: BrokerOrder) -> str | None:
+    metadata = order.request_metadata if isinstance(order.request_metadata, dict) else {}
+    policy = metadata.get("account_drawdown_recovery_policy")
+    if not isinstance(policy, dict):
+        return None
+    scope = policy.get("recovery_scope")
+    return str(scope) if isinstance(scope, str) and scope else None
+
+
+def _account_drawdown_recovery_scope(
+    *,
+    settings: Settings,
+    provider: str,
+    asset_class: str,
+    exchange: str,
+) -> str:
+    currency_scope = (
+        "usd"
+        if asset_class == "us_equity" or exchange in {"NASD", "NYSE", "AMEX", "US"}
+        else "krw"
+    )
+    account_fingerprint = recovery_account_fingerprint(settings)
+    return f"{provider}:{account_fingerprint}:{currency_scope}"
+
+
+def _account_drawdown_recovery_blocked_result(
+    *,
+    source_order: BrokerOrder,
+    block_reason: str,
+    message: str,
+    retry_after_at: datetime | None = None,
+    decision: AccountDrawdownDecision | None = None,
+    healthy_observation_count: int | None = None,
+) -> PlaceBrokerOrderResult:
+    recovery: dict[str, object] = {
+        "source_broker_order_pk": source_order.id,
+        "source_idempotency_key": source_order.idempotency_key,
+    }
+    if retry_after_at is not None:
+        recovery["retry_after_at"] = _normalize_utc_datetime(retry_after_at).isoformat()
+    if healthy_observation_count is not None:
+        recovery["healthy_observation_count"] = healthy_observation_count
+    if decision is not None:
+        recovery["decision"] = decision.summary
+    return PlaceBrokerOrderResult(
+        status_code=409,
+        payload={
+            "duplicate": True,
+            "blocked": True,
+            "message": message,
+            "block_reason": block_reason,
+            "retry_after_at": recovery.get("retry_after_at"),
+            "account_drawdown_recovery": recovery,
+            "order": serialize_broker_order(source_order, include_events=True),
+        },
     )
 
 
@@ -1076,6 +2406,79 @@ def _load_plan_item(
             ExecutionPlan.mode == settings.runtime_mode,
         )
     )
+
+
+def _json_dict(value: object) -> dict[str, object]:
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def _risk_context_has_active_hourly_risk_off(risk_context: object) -> bool:
+    risk_context = _json_dict(risk_context)
+    adjustment = risk_context.get("hourly_plan_action")
+    return bool(
+        isinstance(adjustment, dict)
+        and adjustment.get("source") == "hourly_runtime_check"
+        and adjustment.get("action") == "risk_off_expire"
+    )
+
+
+def _plan_item_has_active_hourly_risk_off(plan_item: ExecutionPlanItem) -> bool:
+    return plan_item.status == "watch_expired" and _risk_context_has_active_hourly_risk_off(
+        plan_item.risk_context
+    )
+
+
+def _current_buy_plan_item_state(
+    *,
+    db: Session,
+    item_id: str,
+    lock: bool,
+) -> tuple[str, dict[str, object]] | None:
+    # Do not autoflush a monitoring cycle's stale status before reading the
+    # current durable row. In SQLite the no-op write establishes the same
+    # single-writer ordering that SELECT FOR UPDATE provides on PostgreSQL.
+    with db.no_autoflush:
+        if lock and db.get_bind().dialect.name == "sqlite":
+            db.execute(
+                text(
+                    "UPDATE execution_plan_items SET id = id WHERE id = :item_id"
+                ),
+                {"item_id": item_id},
+            )
+        statement = select(
+            ExecutionPlanItem.status,
+            ExecutionPlanItem.risk_context,
+        ).where(ExecutionPlanItem.id == item_id)
+        if lock:
+            statement = statement.with_for_update()
+        row = db.execute(statement).one_or_none()
+    if row is None:
+        return None
+    return str(row[0]), _json_dict(row[1])
+
+
+def _merge_pending_plan_item_risk_context(
+    *,
+    persisted: dict[str, object],
+    pending: dict[str, object],
+) -> dict[str, object]:
+    merged = dict(persisted)
+    for key, value in pending.items():
+        if key == "hourly_plan_action" and key in persisted:
+            continue
+        merged[key] = value
+    persisted_events = persisted.get("monitoring_events")
+    pending_events = pending.get("monitoring_events")
+    if isinstance(persisted_events, list) or isinstance(pending_events, list):
+        combined: list[object] = []
+        for event in (
+            *(persisted_events if isinstance(persisted_events, list) else []),
+            *(pending_events if isinstance(pending_events, list) else []),
+        ):
+            if event not in combined:
+                combined.append(event)
+        merged["monitoring_events"] = combined[-20:]
+    return merged
 
 
 def _validate_plan_item(
@@ -1843,13 +3246,27 @@ def _evaluate_new_buy_account_gate(
     command: PlaceOrderRequest,
     plan_item: ExecutionPlanItem | None,
     request_source: str = "account_drawdown_gate",
+    now: datetime | None = None,
+    freshness_reference_at: datetime | None = None,
+    session_state: BrokerSession | None = None,
+    session_error: str | None = None,
+    require_fresh_snapshot: bool = False,
 ) -> AccountDrawdownDecision | None:
     if command.side != "buy":
         return None
     if command.provider != "kis" and adapter.provider != "kis":
         return None
+    snapshot_fetch_started = monotonic()
+    if session_error is not None:
+        return account_drawdown_uncertain_decision(
+            order_idempotency_key=command.idempotency_key,
+            execution_plan_item_id=(
+                plan_item.id if plan_item is not None else command.execution_plan_item_id
+            ),
+            reason=f"broker account snapshot unavailable before new buy: {session_error}",
+        )
     try:
-        session_state = ensure_authenticated_broker_session(
+        session_state = session_state or ensure_authenticated_broker_session(
             settings=settings,
             db=db,
             adapter=adapter,
@@ -1885,7 +3302,47 @@ def _evaluate_new_buy_account_gate(
             reason=f"broker account snapshot unavailable before new buy: {exc.__class__.__name__}: {exc}",
         )
 
-    observed_at = datetime.now(UTC)
+    observed_at = (
+        _normalize_utc_datetime(freshness_reference_at or now)
+        + timedelta(seconds=max(0.0, monotonic() - snapshot_fetch_started))
+        if freshness_reference_at is not None or now is not None
+        else datetime.now(UTC)
+    )
+    if require_fresh_snapshot and not snapshot_is_fresh_for_recovery(
+        observed_at=snapshot.observed_at,
+        now=observed_at,
+        settings=settings,
+    ):
+        return account_drawdown_uncertain_decision(
+            order_idempotency_key=command.idempotency_key,
+            execution_plan_item_id=(
+                plan_item.id if plan_item is not None else command.execution_plan_item_id
+            ),
+            reason="broker account snapshot is stale or future-dated during recovery",
+            now=observed_at,
+        )
+    snapshot_completeness_required = require_fresh_snapshot or (
+        settings.account_drawdown_gate_enabled
+        and _is_new_buy_order(command=command, plan_item=plan_item)
+    )
+    if snapshot_completeness_required:
+        incomplete_reason = _account_drawdown_recovery_snapshot_incomplete(
+            settings=settings,
+            snapshot=snapshot,
+            command=command,
+            require_reliable_open_orders=require_fresh_snapshot,
+        )
+        if incomplete_reason is not None:
+            return account_drawdown_uncertain_decision(
+                order_idempotency_key=command.idempotency_key,
+                execution_plan_item_id=(
+                    plan_item.id
+                    if plan_item is not None
+                    else command.execution_plan_item_id
+                ),
+                reason=incomplete_reason,
+                now=observed_at,
+            )
     local_open_buy_notional, local_open_buy_unknown_count = _local_unmatched_buy_reservation(
         settings=settings,
         db=db,
@@ -1944,6 +3401,97 @@ def _evaluate_new_buy_account_gate(
     )
 
 
+def _account_drawdown_recovery_snapshot_incomplete(
+    *,
+    settings: Settings,
+    snapshot: BrokerAccountSnapshot,
+    command: PlaceOrderRequest,
+    require_reliable_open_orders: bool = True,
+) -> str | None:
+    snapshot_payload = snapshot.payload if isinstance(snapshot.payload, dict) else {}
+    degraded_open_orders = snapshot_payload.get("open_orders_error")
+    aggregated_open_order_errors = snapshot_payload.get("open_orders_errors")
+    if require_reliable_open_orders and (
+        (
+            isinstance(degraded_open_orders, dict)
+            and degraded_open_orders.get("degraded") is True
+        )
+        or (
+            isinstance(aggregated_open_order_errors, list)
+            and any(
+                isinstance(error, dict) and error.get("degraded") is True
+                for error in aggregated_open_order_errors
+            )
+        )
+    ):
+        return "broker account snapshot lacks reliable open-order truth required for recovery"
+    if command.asset_class == "us_equity":
+        if (
+            settings.kis_us_unrealized_loss_limit_usd > 0
+            or settings.kis_us_unrealized_loss_pct > 0
+        ) and snapshot.unrealized_pnl is None:
+            return "broker account snapshot lacks US unrealized P/L required for recovery"
+        if settings.kis_us_severe_holding_loss_pct > 0 and any(
+            holding.unrealized_pnl_pct is None for holding in snapshot.holdings
+        ):
+            return "broker account snapshot has US holdings without loss percent required for recovery"
+        return None
+
+    if (
+        settings.account_daily_total_asset_drawdown_pct > 0
+        and (
+            snapshot.total_asset_value is None
+            or snapshot.previous_total_asset_value is None
+        )
+    ):
+        return "broker account snapshot lacks daily asset baseline required for recovery"
+    if (
+        settings.account_daily_total_asset_drawdown_krw > 0
+        and snapshot.asset_change_amount is None
+        and (
+            snapshot.total_asset_value is None
+            or snapshot.previous_total_asset_value is None
+        )
+    ):
+        return "broker account snapshot lacks daily asset change required for recovery"
+    if (
+        settings.account_weekly_total_asset_baseline_krw > 0
+        and settings.account_weekly_total_asset_drawdown_pct > 0
+        and snapshot.total_asset_value is None
+    ):
+        return "broker account snapshot lacks weekly asset value required for recovery"
+    if (
+        settings.account_unrealized_loss_abs_krw > 0
+        or settings.account_unrealized_loss_pct > 0
+    ) and snapshot.unrealized_pnl is None:
+        return "broker account snapshot lacks unrealized P/L required for recovery"
+    if settings.account_severe_holding_loss_abs_krw > 0 and any(
+        holding.unrealized_pnl is None for holding in snapshot.holdings
+    ):
+        return "broker account snapshot has holdings without unrealized P/L required for recovery"
+    if settings.account_severe_holding_loss_pct > 0 and any(
+        not _holding_has_loss_percent(holding) for holding in snapshot.holdings
+    ):
+        return "broker account snapshot has holdings without loss percent required for recovery"
+    return None
+
+
+def _holding_has_loss_percent(holding: BrokerAccountHolding) -> bool:
+    if holding.unrealized_pnl_pct is not None:
+        return True
+    payload = holding.payload if isinstance(holding.payload, dict) else {}
+    for key in ("evlu_pfls_rt", "evlu_erng_rt", "profit_loss_pct"):
+        value = payload.get(key)
+        if isinstance(value, bool) or value is None:
+            continue
+        try:
+            Decimal(str(value).replace(",", "").strip())
+        except Exception:
+            continue
+        return True
+    return False
+
+
 def _merge_us_account_gate_snapshots(
     routed_snapshots: list[tuple[str, BrokerAccountSnapshot]],
 ) -> BrokerAccountSnapshot:
@@ -1987,15 +3535,36 @@ def _merge_us_account_gate_snapshots(
                     "conflicting duplicate KIS US open order for "
                     f"{order_exchange}:{identity}"
                 )
+    holdings = list(holdings_by_key.values())
+    unrealized_pnl = (
+        None
+        if any(holding.unrealized_pnl is None for holding in holdings)
+        else sum(
+            (holding.unrealized_pnl for holding in holdings),
+            Decimal("0"),
+        )
+    )
+    open_orders_errors = [
+        {
+            "exchange": requested_exchange,
+            **error,
+        }
+        for requested_exchange, snapshot in routed_snapshots
+        for error in [
+            (
+                snapshot.payload.get("open_orders_error")
+                if isinstance(snapshot.payload, dict)
+                else None
+            )
+        ]
+        if isinstance(error, dict)
+    ]
     return BrokerAccountSnapshot(
         available_cash=min(cash_values) if cash_values else None,
         observed_at=observed_at,
         source="kis:us_equity_account_gate_aggregate",
-        unrealized_pnl=sum(
-            (holding.unrealized_pnl or Decimal("0") for holding in holdings_by_key.values()),
-            Decimal("0"),
-        ),
-        holdings=list(holdings_by_key.values()),
+        unrealized_pnl=unrealized_pnl,
+        holdings=holdings,
         open_orders=list(open_orders_by_key.values()),
         symbol_buying_power={
             symbol: buying_power
@@ -2007,6 +3576,7 @@ def _merge_us_account_gate_snapshots(
             "account_gate_exchange_coverage": ["AMEX", "NASD", "NYSE"],
             "realized_pnl_coverage": "degraded_local_execution_fills_only",
             "snapshot_sources": [snapshot.source for snapshot in snapshots],
+            "open_orders_errors": open_orders_errors,
         },
     )
 
@@ -2057,16 +3627,52 @@ def _persist_account_gate_block(
     db: Session,
     adapter: BrokerAdapter,
     command: PlaceOrderRequest,
+    original_command: PlaceOrderRequest,
     request_source: str,
     plan_item: ExecutionPlanItem | None,
     route_decision: RouteDecision | None,
     decision: AccountDrawdownDecision,
     existing_order: BrokerOrder | None = None,
+    observed_at: datetime | None = None,
 ) -> PlaceBrokerOrderResult:
-    observed_at = datetime.now(UTC)
+    observed_at = _normalize_utc_datetime(observed_at or datetime.now(UTC))
+    preserve_current_plan_status = False
+    if plan_item is not None:
+        current_plan_state = _current_buy_plan_item_state(
+            db=db,
+            item_id=plan_item.id,
+            lock=True,
+        )
+        preserve_current_plan_status = bool(
+            current_plan_state is None
+            or current_plan_state[0]
+            in ACCOUNT_DRAWDOWN_RECOVERY_INELIGIBLE_PLAN_STATUSES
+        )
+        if current_plan_state is not None:
+            # Keep the caller's identity-mapped object aligned with the row we
+            # just locked. Otherwise a monitoring caller can commit its stale
+            # pre-snapshot status after this function returns.
+            db.refresh(plan_item, attribute_names=["status", "risk_context"])
     request_metadata = {
         "source": request_source,
         "requested_at": observed_at.isoformat(),
+        "original_command": _order_command_payload(original_command),
+        "account_drawdown_recovery_policy": {
+            "policy_version": 1,
+            "recovery_scope": _account_drawdown_recovery_scope(
+                settings=settings,
+                provider=adapter.provider,
+                asset_class=original_command.asset_class,
+                exchange=original_command.exchange,
+            ),
+            "enabled": settings.account_drawdown_recovery_enabled,
+            "policy_fingerprint": recovery_policy_fingerprint(settings),
+            "threshold_ratio": str(settings.account_drawdown_recovery_threshold_ratio),
+            "required_healthy_observations": (
+                settings.account_drawdown_recovery_required_healthy_observations
+            ),
+            "cooldown_seconds": settings.account_drawdown_recovery_cooldown_seconds,
+        },
         "time_in_force": command.time_in_force,
         "provider": command.provider,
         "asset_class": command.asset_class,
@@ -2146,7 +3752,7 @@ def _persist_account_gate_block(
             observed_at=observed_at,
         )
     )
-    if plan_item is not None:
+    if plan_item is not None and not preserve_current_plan_status:
         set_plan_item_status(
             db=db,
             plan_item=plan_item,
@@ -2177,7 +3783,12 @@ def _persist_account_gate_block(
             "duplicate": False,
             "message": "new buy order blocked by account drawdown gate",
             "blocked": True,
-            "block_reason": decision.gate_name,
+            "block_reason": (
+                "execution_plan_item_state_changed"
+                if preserve_current_plan_status
+                else decision.gate_name
+            ),
+            "account_drawdown_block_reason": decision.gate_name,
             "account_drawdown_gate": decision.summary,
             "sells_risk_reduction_allowed": decision.sells_risk_reduction_allowed,
             "order": serialize_broker_order(persisted or order, include_events=True),
@@ -2528,7 +4139,8 @@ def _verified_exec_agent_market_notional(
         or decision.get("action") != "approve"
         or decision.get("reason_code") != "approved"
         or decision.get("execution_plan_item_id") != plan_item.id
-        or decision.get("idempotency_key") != command.idempotency_key
+        or decision.get("idempotency_key")
+        not in _verified_exec_agent_idempotency_keys(command)
     ):
         return None
 
@@ -2554,6 +4166,42 @@ def _verified_exec_agent_market_notional(
     if candidate_notional != approved_notional:
         return None
     return candidate_notional
+
+
+def _verified_exec_agent_idempotency_keys(command: PlaceOrderRequest) -> set[str]:
+    """Return command identities covered by the original agent approval.
+
+    A recovery child may retain the logical source approval only when its key
+    is the deterministic child key derived from complete recovery lineage.
+    Arbitrary metadata or a mismatched child key remains fail-closed.
+    """
+
+    keys = {command.idempotency_key}
+    metadata = command.metadata if isinstance(command.metadata, dict) else {}
+    recovery = metadata.get("account_drawdown_recovery")
+    if not isinstance(recovery, dict) or recovery.get("policy_version") != 1:
+        return keys
+    source_key = recovery.get("source_idempotency_key")
+    source_pk = recovery.get("source_broker_order_pk")
+    generation = recovery.get("recovery_generation")
+    if (
+        not isinstance(source_key, str)
+        or not source_key
+        or not isinstance(source_pk, str)
+        or not source_pk
+        or isinstance(generation, bool)
+        or not isinstance(generation, int)
+        or generation <= 0
+    ):
+        return keys
+    expected_child_key = recovery_idempotency_key(
+        base_key=source_key,
+        source_broker_order_pk=source_pk,
+        generation=generation,
+    )
+    if command.idempotency_key == expected_child_key:
+        keys.add(source_key)
+    return keys
 
 
 def _positive_decimal(value: object) -> Decimal | None:
@@ -2595,6 +4243,12 @@ def _route_now(metadata: dict[str, object]) -> datetime:
             return parsed.replace(tzinfo=UTC)
         return parsed
     return datetime.now(UTC)
+
+
+def _normalize_utc_datetime(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
 
 
 def _plan_item_status_for_order_status(order_status: str) -> str:

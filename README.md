@@ -37,6 +37,7 @@ curl http://127.0.0.1:8010/runtime/portfolio-risk
 - `paper` and `live` state must use separate processes and databases. The supplied paper launchers force provider isolation and keep every live-trading gate closed.
 - Live KIS US and Alpaca strategies require separate enable flags in addition to `KAI_EXEC_RUNTIME_MODE=live`. Upbit live submission is not implemented.
 - Pause, kill switch, account drawdown gates, buying-power checks, exposure caps, session routing, idempotency keys, and reconciliation remain mandatory regardless of the caller.
+- Account-loss recovery is conservative and durable: a blocked KIS buy latches its account/currency scope, recovery needs multiple fresh observations after a cooldown, and release never rewrites the rejected source order.
 - The idempotency intent is committed before the broker call. An unexpected pre-call failure is persisted as `failed`; if submission has started and no acknowledgement is available, the order becomes `manual_review_required` with a `submit_outcome_unknown` event. Its cash or sell quantity remains reserved across sessions, and no replacement order should be created until an operator records terminal broker truth. Raw exception details are not returned.
 - `/runtime/portfolio-risk` is an advisory read model. It does not place, amend, cancel, or reconcile orders.
 - Never commit `.env`, `.env.paper`, broker credentials, account identifiers, database files, or runtime logs.
@@ -99,7 +100,7 @@ Implemented capabilities include:
 - broker session lifecycle, order/fill reconciliation, failure classification, and bounded rejected-order retries
 - target, stop, partial-profit, breakeven rearm, peak-giveback, and aged-position monitoring
 - trigger-time exec-agent decisions, sizing, market-quality checks, and Core market-context caching
-- pause/resume/kill-switch controls, account drawdown gates, exposure limits, and auditable risk decisions
+- pause/resume/kill-switch controls, account drawdown gates with hysteretic recovery, exposure limits, and auditable risk decisions
 - symbol, daily-board, execution, position, failure, and portfolio-risk read models
 - FIFO-aware trade outcome feedback, weekly review exports, and repair tooling
 
@@ -223,13 +224,107 @@ High-volatility chase vetoes are enabled by default. Fresh ATR and five-day retu
 
 Core market context is advisory ordering context. If Core is temporarily unavailable, Exec retains the last successful priority list for its configured TTL, while the Exec-local plan remains the durable monitoring source of truth.
 
+### Account drawdown stop and automatic recovery
+
+This recovery path applies to KIS buys. When a loss gate rejects a buy, Exec keeps a durable latch for the configured KIS account and settlement-currency lane. The stored scope is `kis:<opaque-account-fingerprint>:krw` for Korean equities or `kis:<opaque-account-fingerprint>:usd` for US equities; the account number is not written to recovery metadata. Another symbol, legacy row, or different account cannot bypass or advance the latch, even when an operator disables loss-threshold enforcement. The KRW and USD lanes recover independently, and sells or explicitly tagged risk-reducing orders remain available.
+
+Recovery is deliberately stricter than the initial stop:
+
+1. The cooldown runs from the original block or the latest unhealthy recovery observation.
+2. For a plan-linked source, only the same automated monitoring, execution-job, or short-term-watcher intent can advance recovery. For an unlinked direct KIS stock order, only an exact replay of the original normalized `POST /orders` command—including every economic field and the idempotency key—can advance it. A changed or unrelated request remains blocked and cannot donate healthy observations. The source intent must still pass current plan/trigger, runtime pause and kill-switch, broker session and route, sizing, cash/buying-power, exposure, and open-order checks.
+3. The broker account snapshot must be fresh and contain every field required by the enabled loss gates. An unavailable, stale, future-dated, incomplete, or still-unhealthy snapshot fails closed, clears healthy progress, and restarts the cooldown.
+4. Each healthy snapshot must be distinct and at least the configured observation interval after the preceding one. Healthy progress is stored in append-only plan-item audit events for linked intents and source broker-order events for unlinked direct orders, so a process restart does not clear or manufacture progress.
+5. After the cooldown and required healthy observations, Exec revalidates that source intent and creates a new child order with a deterministic recovery idempotency generation and exact source lineage. The original rejected order remains immutable. A pause, kill switch, hourly risk-off fence, cancellation, stale trigger, insufficient capital, or ambiguous broker result still prevents submission.
+
+During cooldown, monitoring keeps the watch blocked without requesting another account snapshot. A blocked next-open job stays scheduled and moves to the returned `retry_after_at` when one is available. Both paths converge on the same serialized order-service recovery check.
+
+The hysteresis ratio multiplies each enabled loss-stop threshold. With the default `0.80`, a metric that stopped buys at a loss magnitude of `100` must improve below the recovery magnitude of `80`. It does not relax buying-power, cash-reservation, or exposure limits.
+
+| Setting | Default | Meaning |
+| --- | ---: | --- |
+| `KAI_EXEC_ACCOUNT_DRAWDOWN_GATE_ENABLED` | `true` | Enforce KIS account loss gates on new buys |
+| `KAI_EXEC_ACCOUNT_DRAWDOWN_RECOVERY_ENABLED` | `true` | Allow policy-marked loss blocks to recover automatically |
+| `KAI_EXEC_ACCOUNT_DRAWDOWN_RECOVERY_THRESHOLD_RATIO` | `0.80` | Hysteresis multiplier applied to enabled loss thresholds; range `(0, 1]` |
+| `KAI_EXEC_ACCOUNT_DRAWDOWN_RECOVERY_REQUIRED_HEALTHY_OBSERVATIONS` | `2` | Distinct healthy snapshots required before release; range `2-24` |
+| `KAI_EXEC_ACCOUNT_DRAWDOWN_RECOVERY_COOLDOWN_SECONDS` | `300` | Quiet period after the block or latest unhealthy observation; range `0-86400` |
+| `KAI_EXEC_ACCOUNT_DRAWDOWN_RECOVERY_MIN_OBSERVATION_INTERVAL_SECONDS` | `60` | Minimum broker-snapshot time separation; range `1-3600` |
+| `KAI_EXEC_EXEC_AGENT_MAX_ACCOUNT_SNAPSHOT_AGE_SECONDS` | `300` | Maximum snapshot age accepted during recovery |
+| `KAI_EXEC_ACCOUNT_DRAWDOWN_RECOVERY_MAX_SNAPSHOT_FUTURE_SKEW_SECONDS` | `30` | Maximum future clock skew accepted for a recovery account snapshot; range `0-300` |
+| `KAI_EXEC_ACCOUNT_DRAWDOWN_RECOVERY_SCOPE_SECRET` | unset | Stable HMAC secret used only for opaque account scoping; keep constant across KIS credential rotation |
+
+Example non-secret `.env` policy:
+
+```bash
+KAI_EXEC_ACCOUNT_DRAWDOWN_GATE_ENABLED=true
+KAI_EXEC_ACCOUNT_DRAWDOWN_RECOVERY_ENABLED=true
+KAI_EXEC_ACCOUNT_DRAWDOWN_RECOVERY_THRESHOLD_RATIO=0.80
+KAI_EXEC_ACCOUNT_DRAWDOWN_RECOVERY_REQUIRED_HEALTHY_OBSERVATIONS=2
+KAI_EXEC_ACCOUNT_DRAWDOWN_RECOVERY_COOLDOWN_SECONDS=300
+KAI_EXEC_ACCOUNT_DRAWDOWN_RECOVERY_MIN_OBSERVATION_INTERVAL_SECONDS=60
+KAI_EXEC_ACCOUNT_DRAWDOWN_RECOVERY_MAX_SNAPSHOT_FUTURE_SKEW_SECONDS=30
+```
+
+Set `KAI_EXEC_ACCOUNT_DRAWDOWN_RECOVERY_SCOPE_SECRET` through the deployment's
+secret store before live use and preserve it across broker-key rotation. If it
+is unset, Exec falls back to the configured KIS app secret (then app key) for
+backward compatibility; rotating that fallback changes the opaque scope. An
+existing same-provider/currency latch whose old account fingerprint can no
+longer be reproduced then fails closed with `account_drawdown_recovery_scope_mismatch`
+instead of being silently bypassed. Restore the stable secret or deliberately
+restore the original fallback secret before retrying. Disabling the loss gate
+does not waive account-scope proof. If the original secret is unavailable, the
+latch remains fail closed and requires reviewed operator remediation. Deployments
+that share a database across KIS accounts should always configure one stable
+dedicated secret. Never commit it.
+
+The ratio applies to the enabled KRW loss thresholds
+`KAI_EXEC_ACCOUNT_DAILY_TOTAL_ASSET_DRAWDOWN_PCT`,
+`KAI_EXEC_ACCOUNT_DAILY_TOTAL_ASSET_DRAWDOWN_KRW`,
+`KAI_EXEC_ACCOUNT_WEEKLY_TOTAL_ASSET_DRAWDOWN_PCT`,
+`KAI_EXEC_ACCOUNT_UNREALIZED_LOSS_ABS_KRW`,
+`KAI_EXEC_ACCOUNT_UNREALIZED_LOSS_PCT`,
+`KAI_EXEC_ACCOUNT_SEVERE_HOLDING_LOSS_PCT`, and
+`KAI_EXEC_ACCOUNT_SEVERE_HOLDING_LOSS_ABS_KRW`; the weekly reference is supplied
+by `KAI_EXEC_ACCOUNT_WEEKLY_TOTAL_ASSET_BASELINE_KRW` and
+`KAI_EXEC_ACCOUNT_WEEKLY_TOTAL_ASSET_BASELINE_AT`. The USD loss thresholds are
+`KAI_EXEC_KIS_US_DAILY_REALIZED_LOSS_LIMIT_USD`,
+`KAI_EXEC_KIS_US_WEEKLY_REALIZED_LOSS_LIMIT_USD`,
+`KAI_EXEC_KIS_US_UNREALIZED_LOSS_LIMIT_USD`,
+`KAI_EXEC_KIS_US_UNREALIZED_LOSS_PCT`, and
+`KAI_EXEC_KIS_US_SEVERE_HOLDING_LOSS_PCT`. Only blocks written with the current
+recovery-policy marker and exact current account scope are eligible, regardless
+of whether the drawdown gate is enabled; older rejected rows remain frozen.
+Explicitly disabling the gate may bypass only the health-threshold wait for that
+same proven scope. The release is still audited and still creates a new child
+order rather than altering the rejected row. A terminal or operator-cancelled
+source is never resurrected automatically; its account lane stays fail closed
+until reviewed operator remediation.
+
+Every KIS submission intent also stores this opaque account scope. A pre-broker
+runtime-safety rejection can be retried only when the current KIS account scope
+matches; legacy intents without scope evidence remain frozen.
+
+### Hourly risk-off buy fence and recovery
+
+The hourly plan-judgment path owns a durable, global, buy-only fence. A severe judgment (`risk_flags >= 3`) activates the fence before projecting item state, increments its epoch, and drains mutable `intraday_watch_buy` and `next_open_buy` items to `watch_expired` with their prior safe state recorded. A buy that reaches the broker boundary after the scan is still blocked and projected into the same recovery contract. Sells and explicitly tagged risk-reduction or protective-hedge orders remain eligible.
+
+While the fence is active, any later risky observation (`risk_flags >= 1`) resets global healthy progress and restarts the cooldown. Distinct risk-free observations (`risk_flags == 0`) advance it. Projection work is durably marked pending before any item mutation. Every active-fence call rescans mutable buys, and recovery reconciles the complete hourly-expired set—including items created after activation—before the pending marker and global fence can clear. Stable watch states are restored exactly, while transient in-flight states are normalized to a retryable safe state (`next_open_buy_retry_pending` or `watch_monitoring_active`) and must pass every normal gate again.
+
+| Setting | Default | Meaning |
+| --- | ---: | --- |
+| `KAI_EXEC_HOURLY_PLAN_JUDGMENT_RECOVERY_REQUIRED_HEALTHY_OBSERVATIONS` | `2` | Later risk-free observations required to restore the watch; range `2-24` |
+| `KAI_EXEC_HOURLY_PLAN_JUDGMENT_RECOVERY_COOLDOWN_SECONDS` | `900` | Quiet period from the latest risky observation; range `0-86400` |
+| `KAI_EXEC_HOURLY_PLAN_JUDGMENT_RECOVERY_MIN_OBSERVATION_INTERVAL_SECONDS` | `300` | Minimum spacing between counted risk-free observations; range `1-3600` |
+
+The authoritative fence lives in `runtime_control_state`; activation, reset, observation, and recovery are appended to `runtime_control_events`. Per-item recovery state remains in item risk context and append-only plan-item audits. Manually expired, rejected, cancelled, or unrelated items are not restored. Restoring an item only makes it eligible for evaluation again: a subsequent monitoring or next-open attempt must still revalidate its trigger or job, quote freshness, session, runtime controls, account latch, sizing, and buying power before any order can be submitted.
+
 ## API surface
 
 Interactive OpenAPI is available at `/docs` and `/redoc`.
 
 | Area | Endpoints |
 | --- | --- |
-| Health/runtime | `GET /health`, `/runtime/status`, `/runtime/safety`, `/runtime/daily-board`, `/runtime/portfolio-risk` (`market=all|krx|us`), `/runtime/alpaca-crypto`, `/runtime/alpaca-us-equity` |
+| Health/runtime | `GET /health`, `/runtime/status`, `/runtime/safety`, `/runtime/daily-board`, `/runtime/portfolio-risk` (`market=all|krx|us`), `/runtime/alpaca-crypto`, `/runtime/alpaca-us-equity`; `POST /runtime/plan-judgment/action` |
 | Broker session | `GET /broker/session`, `POST /broker/session/authenticate`, `POST /broker/session/revoke` |
 | Controls | `POST /controls/pause`, `/controls/resume`, `/controls/kill-switch` |
 | Plans/jobs | `GET/POST /execution-plans`, `POST /execution-plans/preview`, `GET /execution-jobs`, `POST /execution-jobs/dispatch` |

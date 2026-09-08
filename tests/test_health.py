@@ -357,6 +357,10 @@ def test_runtime_status_reports_readiness_and_default_safety() -> None:
     assert payload["safety"]["kill_switch_enabled"] is False
     assert payload["safety"]["automated_order_submission_allowed"] is False
     assert payload["safety"]["automated_order_submission_block_reason"] == "paused"
+    assert payload["safety"]["automated_buy_submission_allowed"] is False
+    assert payload["safety"]["automated_buy_submission_block_reason"] == "paused"
+    assert payload["safety"]["hourly_risk_off"]["available"] is True
+    assert payload["safety"]["hourly_risk_off"]["active"] is False
     assert payload["safety"]["last_change"]["action"] == "bootstrap"
     assert payload["counts"] == {"open_orders": 0, "active_execution_jobs": 0}
     assert payload["symbols"] == {
@@ -911,6 +915,40 @@ def test_runtime_status_requires_complete_exec_owned_schema() -> None:
     assert payload["dependencies"]["runtime_schema"] == "missing"
     assert "database or runtime schema dependency is not ready" in payload["readiness"]["reasons"]
     assert "execution_fills" in payload["safety"]["readiness_reason"]
+
+    engine.dispose()
+
+
+def test_runtime_status_requires_hourly_risk_off_schema_columns() -> None:
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            automation_enabled=True,
+        )
+    )
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            "ALTER TABLE runtime_control_state DROP COLUMN hourly_risk_off_context"
+        )
+    client = TestClient(app)
+
+    response = client.get("/runtime/status")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ready"] is False
+    assert payload["dependencies"]["runtime_schema"] == "missing"
+    assert "runtime_control_state.hourly_risk_off_context" in (
+        payload["safety"]["readiness_reason"]
+    )
+    assert payload["safety"]["automated_buy_submission_allowed"] is False
+    assert payload["safety"]["automated_buy_submission_block_reason"] == "paused"
+    assert payload["safety"]["hourly_risk_off"] == {
+        "available": False,
+        "active": None,
+        "epoch": None,
+        "context": None,
+    }
 
     engine.dispose()
 
@@ -5112,6 +5150,37 @@ def test_fast_runtime_status_honors_durable_paused_state() -> None:
     assert payload["safety"]["automated_order_submission_allowed"] is False
     assert payload["safety"]["automated_order_submission_block_reason"] == "paused"
 
+    engine.dispose()
+
+
+def test_fast_runtime_status_reports_durable_account_drawdown_gate(monkeypatch) -> None:
+    expected_gate = {
+        "enabled": True,
+        "gated": True,
+        "latest_decision": {"summary": {"gate_name": "daily_total_asset_drawdown_pct"}},
+        "active_recovery_scopes": {"kis:opaque:krw": {"order_id": "blocked-buy"}},
+    }
+    monkeypatch.setattr(
+        runtime_service,
+        "latest_account_drawdown_gate_state",
+        lambda **_: expected_gate,
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            automation_enabled=True,
+            autonomous_runtime_enabled=True,
+            account_drawdown_gate_enabled=True,
+        ),
+        autonomous_runtime_enabled=True,
+    )
+    client = TestClient(app)
+
+    response = client.get("/runtime/status")
+
+    assert response.status_code == 200
+    assert response.json()["account_drawdown_gate"] == expected_gate
     engine.dispose()
 
 

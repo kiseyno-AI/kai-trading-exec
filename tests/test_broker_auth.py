@@ -53,8 +53,14 @@ from app.models.runtime import (
     MonitoringCheckpoint,
 )
 from app.services import broker_orders as broker_orders_service
+from app.services import execution_jobs as execution_jobs_service
+from app.services import monitoring as monitoring_service
+from app.services import plan_judgment_actions
 from app.services import runtime as runtime_service
+from app.services.account_drawdown_recovery import recovery_idempotency_key
+from app.services.execution_jobs import dispatch_due_execution_jobs
 from app.services.late_entry_actionability import late_entry_actionability_summary
+from app.services.runtime_controls import ControlCommand, pause_runtime
 from app.services.monitoring import (
     _derived_source_plan_item_id,
     _nonretryable_sibling_monitor_suppresses_recreation,
@@ -159,6 +165,7 @@ class StubBrokerAdapter:
         self.revoke_error = revoke_error
         self.authenticate_calls = 0
         self.approval_calls = 0
+        self.account_snapshot_calls = 0
         self.revoke_calls: list[str] = []
         self.order_calls: list[BrokerOrderPlacementRequest] = []
         self.current_price_calls: list[tuple[str, str]] = []
@@ -221,6 +228,7 @@ class StubBrokerAdapter:
         )
 
     def get_account_snapshot(self, access_token: str, **_kwargs: object) -> BrokerAccountSnapshot:
+        self.account_snapshot_calls += 1
         assert access_token
         if self.account_snapshot_error is not None:
             raise self.account_snapshot_error
@@ -396,6 +404,7 @@ def test_settings_load_kis_environment_fields() -> None:
             "KAI_EXEC_KIS_ACCOUNT_PRODUCT_CODE": "01",
             "KAI_EXEC_KIS_HTS_ID": "ops-user",
             "KAI_EXEC_KIS_MIN_REQUEST_INTERVAL_SECONDS": "0.25",
+            "KAI_EXEC_ACCOUNT_DRAWDOWN_RECOVERY_SCOPE_SECRET": "stable-scope-secret",
         },
     )
 
@@ -406,6 +415,7 @@ def test_settings_load_kis_environment_fields() -> None:
     assert settings.kis_account_product_code == "01"
     assert settings.kis_hts_id == "ops-user"
     assert settings.kis_min_request_interval_seconds == 0.25
+    assert settings.account_drawdown_recovery_scope_secret == "stable-scope-secret"
 
 
 def test_kis_http_client_serializes_request_start_times(monkeypatch) -> None:
@@ -2109,12 +2119,16 @@ def test_order_submission_rechecks_runtime_control_after_account_snapshot(
         ),
         token_grant=build_token_grant(),
         order_placement=build_order_placement(),
-        account_snapshot=BrokerAccountSnapshot(
-            available_cash=Decimal("1000.00"),
-            buying_power=Decimal("1000.00"),
-            observed_at=datetime.now(UTC),
-            source="stub:runtime-fence",
-        ),
+            account_snapshot=BrokerAccountSnapshot(
+                available_cash=Decimal("1000.00"),
+                buying_power=Decimal("1000.00"),
+                observed_at=datetime.now(UTC),
+                source="stub:runtime-fence",
+                total_asset_value=Decimal("10000.00"),
+                previous_total_asset_value=Decimal("10000.00"),
+                asset_change_amount=Decimal("0.00"),
+                unrealized_pnl=Decimal("0.00"),
+            ),
     )
     app, engine = build_test_app(settings=settings, broker_adapter=broker_adapter)
     client = TestClient(app)
@@ -2171,6 +2185,15 @@ def test_order_submission_rechecks_runtime_control_after_account_snapshot(
         assert order.status == "rejected"
         assert order.last_error_classification == "runtime_safety_control"
         assert order.last_error_code == placement.payload["block_reason"]
+        assert order.request_metadata["broker_account_scope"] == {
+            "policy_version": 1,
+            "scope": broker_orders_service._account_drawdown_recovery_scope(
+                settings=settings,
+                provider="kis",
+                asset_class="stock",
+                exchange="KRX",
+            ),
+        }
         assert any(event.event_type == "submission_blocked" for event in order.events)
     if control_path == "/controls/pause":
         assert client.post(
@@ -2206,6 +2229,857 @@ def test_order_submission_rechecks_runtime_control_after_account_snapshot(
         assert duplicate.status_code == 200
         assert duplicate.payload["duplicate"] is True
         assert len(broker_adapter.order_calls) == 1
+    engine.dispose()
+
+
+def test_runtime_fenced_recovery_child_cannot_cross_kis_account_scope() -> None:
+    account_a = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        kis_app_key="paper-key",
+        kis_app_secret="paper-secret",
+        kis_account_number="11112222",
+        account_drawdown_recovery_scope_secret="stable-scope-secret",
+        account_drawdown_gate_enabled=False,
+    )
+    account_b = account_a.model_copy(update={"kis_account_number": "99990000"})
+    account_a_scope = broker_orders_service._account_drawdown_recovery_scope(
+        settings=account_a,
+        provider="kis",
+        asset_class="stock",
+        exchange="KRX",
+    )
+    account_b_scope = broker_orders_service._account_drawdown_recovery_scope(
+        settings=account_b,
+        provider="kis",
+        asset_class="stock",
+        exchange="KRX",
+    )
+    assert account_a_scope != account_b_scope
+    command = PlaceOrderRequest(
+        idempotency_key="execution-job:account-a:recovery:1",
+        provider="kis",
+        asset_class="stock",
+        symbol="005930",
+        side="buy",
+        quantity=1,
+        order_type="limit",
+        limit_price=Decimal("100000"),
+        time_in_force="day",
+        exchange="KRX",
+        metadata={
+            "account_drawdown_recovery": {
+                "policy_version": 1,
+                "recovery_scope": account_a_scope,
+                "source_broker_order_pk": "account-a-source",
+                "source_idempotency_key": "execution-job:account-a",
+                "recovery_generation": 1,
+            }
+        },
+    )
+    account_b_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(
+            broker_order_id="must-not-submit-account-a-child-on-account-b"
+        ),
+    )
+    account_a_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(
+            broker_order_id="same-account-fenced-child-retry"
+        ),
+    )
+    app, engine = build_test_app(
+        settings=account_b,
+        broker_adapter=account_b_adapter,
+    )
+    client = TestClient(app)
+    assert client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "test", "reason": "enable retries"},
+    ).status_code == 200
+
+    with app.state.db_session_factory() as session:
+        session.add(
+            BrokerOrder(
+                broker_name="kis",
+                execution_plan_item_id=None,
+                mode="paper",
+                idempotency_key=command.idempotency_key,
+                symbol=command.symbol,
+                side="buy",
+                status="rejected",
+                quantity=command.quantity,
+                asset_class=command.asset_class,
+                limit_price=command.limit_price,
+                request_metadata={
+                    "original_command": (
+                        broker_orders_service._order_command_payload(command)
+                    ),
+                    "broker_account_scope": {
+                        "policy_version": 1,
+                        "scope": account_a_scope,
+                    },
+                    "runtime_safety_fence": {
+                        "block_reason": "paused",
+                        "broker_call_started": False,
+                    },
+                },
+                response_metadata={"runtime_safety_fence": {"paused": True}},
+                last_error_classification="runtime_safety_control",
+                last_error_code="paused",
+                last_error_retryable=True,
+            )
+        )
+        session.commit()
+
+    with app.state.db_session_factory() as session:
+        foreign_retry = broker_orders_service.place_broker_order(
+            settings=account_b,
+            db=session,
+            adapter=account_b_adapter,
+            command=command,
+            request_source="execution-job:next_open_buy",
+        )
+
+    assert foreign_retry.status_code == 200
+    assert foreign_retry.payload["duplicate"] is True
+    assert account_b_adapter.order_calls == []
+
+    with app.state.db_session_factory() as session:
+        same_account_retry = broker_orders_service.place_broker_order(
+            settings=account_a,
+            db=session,
+            adapter=account_a_adapter,
+            command=command,
+            request_source="execution-job:next_open_buy",
+        )
+
+    assert same_account_retry.status_code == 201
+    assert len(account_a_adapter.order_calls) == 1
+    engine.dispose()
+
+
+def test_automated_buy_rechecks_hourly_risk_off_after_account_snapshot(
+    tmp_path,
+) -> None:
+    snapshot_entered = Event()
+    release_snapshot = Event()
+
+    class BlockingSnapshotAdapter(StubBrokerAdapter):
+        def get_account_snapshot(
+            self,
+            access_token: str,
+            **kwargs: object,
+        ) -> BrokerAccountSnapshot:
+            snapshot_entered.set()
+            assert release_snapshot.wait(timeout=2)
+            return super().get_account_snapshot(access_token, **kwargs)
+
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'hourly-risk-off-order-race.db'}",
+        runtime_mode="paper",
+        kis_app_key="paper-key",
+        kis_app_secret="paper-secret",
+        kis_account_number="12345678",
+    )
+    broker_adapter = BlockingSnapshotAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(),
+        account_snapshot=BrokerAccountSnapshot(
+            available_cash=Decimal("1000000.00"),
+            buying_power=Decimal("1000000.00"),
+            observed_at=datetime.now(UTC),
+            source="stub:hourly-risk-off-order-race",
+            total_asset_value=Decimal("10000000.00"),
+            previous_total_asset_value=Decimal("10000000.00"),
+            asset_change_amount=Decimal("0.00"),
+            unrealized_pnl=Decimal("0.00"),
+        ),
+    )
+    app, engine = build_test_app(settings=settings, broker_adapter=broker_adapter)
+    client = TestClient(app)
+    assert client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "test", "reason": "enable order"},
+    ).status_code == 200
+    item_id = _create_watch_buy_candidate(
+        client,
+        plan_id="plan-hourly-risk-off-order-race",
+        trigger_price="100.00",
+        chase_limit_price="110.00",
+        risk_context={
+            "exchange": "KRX",
+            "stop_price": "90.00",
+            "trigger_direction": "at_or_above",
+        },
+    )
+    result: dict[str, object] = {}
+    errors: list[BaseException] = []
+    command = PlaceOrderRequest(
+        idempotency_key=f"monitoring:watch_buy:{item_id}",
+        execution_plan_item_id=item_id,
+        provider="kis",
+        asset_class="stock",
+        symbol="005930",
+        side="buy",
+        quantity=2,
+        order_type="limit",
+        limit_price=Decimal("100.00"),
+        time_in_force="day",
+        exchange="KRX",
+    )
+
+    def submit() -> None:
+        try:
+            with app.state.db_session_factory() as session:
+                result["value"] = broker_orders_service.place_broker_order(
+                    settings=settings,
+                    db=session,
+                    adapter=broker_adapter,
+                    command=command,
+                    request_source="monitoring:intraday_target_stop_monitor",
+                )
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    thread = Thread(target=submit)
+    thread.start()
+    assert snapshot_entered.wait(timeout=2)
+    try:
+        risk_off = client.post(
+            "/runtime/plan-judgment/action",
+            json={
+                "risk_flags": 3,
+                "risk_reasons": ["severe risk appeared during buy preparation"],
+            },
+        )
+        assert risk_off.status_code == 200
+        assert risk_off.json()["action"] == "risk_off_expire"
+        with app.state.db_session_factory() as session:
+            fenced_item = session.get(ExecutionPlanItem, item_id)
+            assert fenced_item is not None
+            assert fenced_item.status == "watch_expired"
+            assert fenced_item.risk_context["hourly_plan_action"]["action"] == (
+                "risk_off_expire"
+            )
+    finally:
+        release_snapshot.set()
+    thread.join(timeout=3)
+
+    assert errors == []
+    assert not thread.is_alive()
+    placement = result["value"]
+    assert isinstance(placement, broker_orders_service.PlaceBrokerOrderResult)
+    assert (placement.status_code, len(broker_adapter.order_calls)) == (409, 0)
+    assert placement.payload["block_reason"] == "hourly_plan_risk_off"
+    engine.dispose()
+
+
+def test_automated_buy_rechecks_watch_cancelled_after_plan_row_lock(tmp_path) -> None:
+    snapshot_entered = Event()
+    release_snapshot = Event()
+
+    class BlockingSnapshotAdapter(StubBrokerAdapter):
+        def get_account_snapshot(
+            self,
+            access_token: str,
+            **kwargs: object,
+        ) -> BrokerAccountSnapshot:
+            snapshot_entered.set()
+            assert release_snapshot.wait(timeout=2)
+            return super().get_account_snapshot(access_token, **kwargs)
+
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'watch-cancelled-order-race.db'}",
+        runtime_mode="paper",
+        kis_app_key="paper-key",
+        kis_app_secret="paper-secret",
+        kis_account_number="12345678",
+    )
+    broker_adapter = BlockingSnapshotAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(
+            broker_order_id="must-not-submit-after-watch-cancel"
+        ),
+        account_snapshot=BrokerAccountSnapshot(
+            available_cash=Decimal("1000000.00"),
+            buying_power=Decimal("1000000.00"),
+            observed_at=datetime.now(UTC),
+            source="stub:watch-cancelled-order-race",
+            total_asset_value=Decimal("10000000.00"),
+            previous_total_asset_value=Decimal("10000000.00"),
+            asset_change_amount=Decimal("0.00"),
+            unrealized_pnl=Decimal("0.00"),
+        ),
+    )
+    app, engine = build_test_app(settings=settings, broker_adapter=broker_adapter)
+    client = TestClient(app)
+    assert client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "test", "reason": "enable order"},
+    ).status_code == 200
+    item_id = _create_watch_buy_candidate(
+        client,
+        plan_id="plan-watch-cancelled-order-race",
+        trigger_price="100.00",
+        chase_limit_price="110.00",
+        risk_context={
+            "exchange": "KRX",
+            "stop_price": "90.00",
+            "trigger_direction": "at_or_above",
+        },
+    )
+    command = PlaceOrderRequest(
+        idempotency_key=f"monitoring:watch_buy:{item_id}",
+        execution_plan_item_id=item_id,
+        provider="kis",
+        asset_class="stock",
+        symbol="005930",
+        side="buy",
+        quantity=2,
+        order_type="limit",
+        limit_price=Decimal("100.00"),
+        time_in_force="day",
+        exchange="KRX",
+    )
+    result: dict[str, object] = {}
+    errors: list[BaseException] = []
+
+    def submit() -> None:
+        try:
+            with app.state.db_session_factory() as session:
+                result["value"] = broker_orders_service.place_broker_order(
+                    settings=settings,
+                    db=session,
+                    adapter=broker_adapter,
+                    command=command,
+                    request_source="monitoring:intraday_target_stop_monitor",
+                )
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    thread = Thread(target=submit)
+    thread.start()
+    assert snapshot_entered.wait(timeout=2)
+    try:
+        # Account-snapshot evaluation starts only after the initial plan-item
+        # SELECT FOR UPDATE/refresh. This simulates a cancellation committed by
+        # another request after that first row-state validation.
+        with app.state.db_session_factory() as session:
+            cancelled = session.get(ExecutionPlanItem, item_id)
+            assert cancelled is not None
+            cancelled.status = "watch_cancelled"
+            session.commit()
+    finally:
+        release_snapshot.set()
+    thread.join(timeout=3)
+
+    assert errors == []
+    assert not thread.is_alive()
+    placement = result["value"]
+    assert isinstance(placement, broker_orders_service.PlaceBrokerOrderResult)
+    assert (placement.status_code, len(broker_adapter.order_calls)) == (409, 0)
+    assert placement.payload["block_reason"] == "execution_plan_item_state_changed"
+    with app.state.db_session_factory() as session:
+        item = session.get(ExecutionPlanItem, item_id)
+        assert item is not None
+        assert item.status == "watch_cancelled"
+
+    engine.dispose()
+
+
+def test_account_drawdown_block_does_not_revive_watch_cancelled_during_snapshot(
+    tmp_path,
+) -> None:
+    snapshot_entered = Event()
+    release_snapshot = Event()
+
+    class BlockingLossSnapshotAdapter(StubBrokerAdapter):
+        def get_account_snapshot(
+            self,
+            access_token: str,
+            **kwargs: object,
+        ) -> BrokerAccountSnapshot:
+            snapshot_entered.set()
+            assert release_snapshot.wait(timeout=2)
+            return super().get_account_snapshot(access_token, **kwargs)
+
+    blocked_at = datetime.now(UTC)
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'drawdown-block-cancel-race.db'}",
+        runtime_mode="paper",
+        kis_app_key="paper-key",
+        kis_app_secret="paper-secret",
+        kis_account_number="12345678",
+    )
+    broker_adapter = BlockingLossSnapshotAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(
+            broker_order_id="must-not-submit-cancelled-drawdown-buy"
+        ),
+        account_snapshot=_daily_drawdown_snapshot(
+            drawdown_krw=Decimal("200000"),
+            observed_at=blocked_at,
+        ),
+    )
+    app, engine = build_test_app(settings=settings, broker_adapter=broker_adapter)
+    client = TestClient(app)
+    assert client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "test", "reason": "enable order"},
+    ).status_code == 200
+    item_id = _create_watch_buy_candidate(
+        client,
+        plan_id="plan-drawdown-block-cancel-race",
+        trigger_price="100.00",
+        chase_limit_price="110.00",
+        risk_context={
+            "exchange": "KRX",
+            "stop_price": "90.00",
+            "trigger_direction": "at_or_above",
+        },
+    )
+    command = PlaceOrderRequest(
+        idempotency_key=f"monitoring:watch_buy:{item_id}",
+        execution_plan_item_id=item_id,
+        provider="kis",
+        asset_class="stock",
+        symbol="005930",
+        side="buy",
+        quantity=2,
+        order_type="limit",
+        limit_price=Decimal("100.00"),
+        time_in_force="day",
+        exchange="KRX",
+    )
+    result: dict[str, object] = {}
+    errors: list[BaseException] = []
+
+    def submit() -> None:
+        try:
+            with app.state.db_session_factory() as session:
+                result["value"] = broker_orders_service.place_broker_order(
+                    settings=settings,
+                    db=session,
+                    adapter=broker_adapter,
+                    command=command,
+                    request_source="monitoring:intraday_target_stop_monitor",
+                )
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    thread = Thread(target=submit)
+    thread.start()
+    assert snapshot_entered.wait(timeout=2)
+    try:
+        with app.state.db_session_factory() as session:
+            cancelled = session.get(ExecutionPlanItem, item_id)
+            assert cancelled is not None
+            cancelled.status = "watch_cancelled"
+            session.commit()
+    finally:
+        release_snapshot.set()
+    thread.join(timeout=3)
+
+    assert errors == []
+    assert not thread.is_alive()
+    placement = result["value"]
+    assert isinstance(placement, broker_orders_service.PlaceBrokerOrderResult)
+    assert placement.status_code == 409
+    assert placement.payload["block_reason"] == "execution_plan_item_state_changed"
+    assert placement.payload["account_drawdown_block_reason"] in {
+        "daily_total_asset_drawdown_pct",
+        "daily_total_asset_drawdown_krw",
+    }
+    assert broker_adapter.order_calls == []
+    with app.state.db_session_factory() as session:
+        item = session.get(ExecutionPlanItem, item_id)
+        source_order = session.scalar(
+            select(BrokerOrder).where(
+                BrokerOrder.idempotency_key == command.idempotency_key
+            )
+        )
+        block_audit = session.scalar(
+            select(ExecutionPlanItemAudit).where(
+                ExecutionPlanItemAudit.execution_plan_item_id == item_id,
+                ExecutionPlanItemAudit.event_type
+                == "account_drawdown_new_buy_blocked",
+            )
+        )
+        assert item is not None
+        assert item.status == "watch_cancelled"
+        assert source_order is not None
+        assert source_order.status == "rejected"
+        assert source_order.last_error_code in {
+            "daily_total_asset_drawdown_pct",
+            "daily_total_asset_drawdown_krw",
+        }
+        assert block_audit is not None
+
+    engine.dispose()
+
+
+def test_drawdown_recovery_preflight_does_not_revive_watch_cancelled(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    preflight_entered = Event()
+    release_preflight = Event()
+    triggered_at = datetime.now(UTC)
+
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'drawdown-preflight-cancel-race.db'}",
+        runtime_mode="paper",
+        kis_app_key="paper-key",
+        kis_app_secret="paper-secret",
+        kis_account_number="12345678",
+        account_drawdown_gate_enabled=True,
+    )
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(
+            broker_order_id="must-not-submit-preflight-cancelled-buy"
+        ),
+    )
+    app, engine = build_test_app(settings=settings, broker_adapter=broker_adapter)
+    client = TestClient(app)
+    assert client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "test", "reason": "enable order"},
+    ).status_code == 200
+    item_id = _create_watch_buy_candidate(
+        client,
+        plan_id="plan-drawdown-preflight-cancel-race",
+        trigger_price="100.00",
+        chase_limit_price="110.00",
+        risk_context={
+            "exchange": "KRX",
+            "stop_price": "90.00",
+            "trigger_direction": "at_or_above",
+        },
+    )
+
+    def blocking_preflight(**_kwargs: object):
+        preflight_entered.set()
+        assert release_preflight.wait(timeout=2)
+        return broker_orders_service.AccountDrawdownRecoveryPreflight(
+            active=True,
+            block_reason="account_drawdown_recovery_cooldown",
+            message="account drawdown recovery cooldown has not elapsed",
+            retry_after_at=triggered_at + timedelta(seconds=300),
+            source_broker_order_pk="blocked-source-order",
+            source_idempotency_key=f"monitoring:watch_buy:{item_id}",
+        )
+
+    monkeypatch.setattr(
+        monitoring_service,
+        "inspect_account_drawdown_recovery",
+        blocking_preflight,
+    )
+    result: dict[str, object] = {}
+    errors: list[BaseException] = []
+
+    def evaluate() -> None:
+        try:
+            result["response"] = client.post(
+                "/monitoring/evaluate",
+                json={
+                    "actor": "ops",
+                    "source": "test",
+                    "observed_at": triggered_at.isoformat(),
+                    "prices": [
+                        {
+                            "symbol": "005930",
+                            "price": "100.00",
+                            "observed_at": triggered_at.isoformat(),
+                        }
+                    ],
+                },
+            )
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    thread = Thread(target=evaluate)
+    thread.start()
+    assert preflight_entered.wait(timeout=2)
+    try:
+        with app.state.db_session_factory() as session:
+            cancelled = session.get(ExecutionPlanItem, item_id)
+            assert cancelled is not None
+            cancelled.status = "watch_cancelled"
+            session.commit()
+    finally:
+        release_preflight.set()
+    thread.join(timeout=3)
+
+    assert errors == []
+    assert not thread.is_alive()
+    response = result["response"]
+    assert hasattr(response, "status_code")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["items"][0]["block_reason"] == (
+        "account_drawdown_recovery_cooldown"
+    )
+    assert broker_adapter.order_calls == []
+    with app.state.db_session_factory() as session:
+        item = session.get(ExecutionPlanItem, item_id)
+        assert item is not None
+        assert item.status == "watch_cancelled"
+
+    engine.dispose()
+
+
+def test_next_open_pending_intent_resumes_same_job_once_after_hourly_recovery(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    boundary_entered = Event()
+    release_boundary = Event()
+    real_ensure_session = broker_orders_service.ensure_authenticated_broker_session
+    block_once = {"armed": True}
+
+    class FrozenHourlyDateTime(datetime):
+        current = datetime(2026, 9, 8, 0, 0, tzinfo=UTC)
+
+        @classmethod
+        def now(cls, tz=None):
+            if tz is None:
+                return cls.current.replace(tzinfo=None)
+            return cls.current.astimezone(tz)
+
+    def ensure_then_block_pending_intent(*args: object, **kwargs: object):
+        state = real_ensure_session(*args, **kwargs)
+        if block_once["armed"] and kwargs.get("source") == "broker_order_service":
+            block_once["armed"] = False
+            boundary_entered.set()
+            assert release_boundary.wait(timeout=3)
+        return state
+
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'pending-intent-risk-off-recovery.db'}",
+        runtime_mode="paper",
+        kis_app_key="paper-key",
+        kis_app_secret="paper-secret",
+        kis_account_number="12345678",
+        account_drawdown_gate_enabled=False,
+        hourly_plan_judgment_recovery_required_healthy_observations=2,
+        hourly_plan_judgment_recovery_cooldown_seconds=0,
+        hourly_plan_judgment_recovery_min_observation_interval_seconds=1,
+    )
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(
+            broker_order_id="kis-pending-intent-hourly-recovery"
+        ),
+    )
+    app, engine = build_test_app(settings=settings, broker_adapter=broker_adapter)
+    client = TestClient(app)
+    assert client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "test", "reason": "enable next-open job"},
+    ).status_code == 200
+    # Keep the blocking hook read-only so the concurrent SQLite risk transition
+    # can acquire its writer reservation while the intent is durable.
+    assert client.post(
+        "/broker/session/authenticate",
+        json={"actor": "ops", "source": "test", "reason": "prewarm broker session"},
+    ).status_code == 200
+    plan_response = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-pending-intent-hourly-recovery",
+            "source": "kai-trading-core",
+            "market_date": "2024-01-03",
+            "items": [
+                {
+                    "symbol": "005930",
+                    "side": "buy",
+                    "intent": "next_open_buy",
+                    "quantity_policy": {"kind": "shares", "quantity": 2},
+                    "limit_price": "71000.00",
+                    "time_in_force": "day",
+                }
+            ],
+        },
+    )
+    assert plan_response.status_code == 201
+    item_id = plan_response.json()["persisted_execution_item_ids"][0]
+    with app.state.db_session_factory() as session:
+        job = session.scalar(
+            select(ExecutionJob).where(ExecutionJob.execution_plan_item_id == item_id)
+        )
+        assert job is not None
+        job_id = job.id
+    order_key = f"execution-job:{job_id}"
+    first_result: dict[str, object] = {}
+    errors: list[BaseException] = []
+    monkeypatch.setattr(
+        broker_orders_service,
+        "ensure_authenticated_broker_session",
+        ensure_then_block_pending_intent,
+    )
+    monkeypatch.setattr(
+        plan_judgment_actions,
+        "datetime",
+        FrozenHourlyDateTime,
+    )
+
+    def dispatch_first_attempt() -> None:
+        try:
+            with app.state.db_session_factory() as session:
+                first_result["value"] = dispatch_due_execution_jobs(
+                    settings=settings,
+                    db=session,
+                    adapter=broker_adapter,
+                    now=datetime.now(UTC),
+                )
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    thread = Thread(target=dispatch_first_attempt)
+    thread.start()
+    assert boundary_entered.wait(timeout=3)
+    risk_off_payload: dict[str, object]
+    try:
+        with app.state.db_session_factory() as session:
+            pending_order = session.scalar(
+                select(BrokerOrder).where(BrokerOrder.idempotency_key == order_key)
+            )
+            pending_item = session.get(ExecutionPlanItem, item_id)
+            assert pending_order is not None
+            assert pending_order.status == "submission_pending"
+            assert pending_item is not None
+            assert pending_item.status == "broker_order_submission_pending"
+        risk_off = client.post(
+            "/runtime/plan-judgment/action",
+            json={
+                "risk_flags": 3,
+                "risk_reasons": ["risk-off arrived after durable broker intent"],
+            },
+        )
+        assert risk_off.status_code == 200
+        risk_off_payload = risk_off.json()
+        assert risk_off_payload["action"] == "risk_off_expire"
+    finally:
+        release_boundary.set()
+    thread.join(timeout=4)
+
+    assert errors == []
+    assert not thread.is_alive()
+    fenced = first_result["value"]
+    assert fenced.payload["due_job_count"] == 1
+    assert fenced.payload["completed_job_count"] == 0
+    assert fenced.payload["jobs"][0]["status"] == "scheduled"
+    assert broker_adapter.order_calls == []
+    with app.state.db_session_factory() as session:
+        fenced_order = session.scalar(
+            select(BrokerOrder).where(BrokerOrder.idempotency_key == order_key)
+        )
+        fenced_item = session.get(ExecutionPlanItem, item_id)
+        fenced_job = session.get(ExecutionJob, job_id)
+        assert fenced_order is not None
+        assert fenced_order.status == "rejected"
+        assert fenced_order.last_error_code == "hourly_plan_risk_off"
+        fenced_order_id = fenced_order.id
+        assert fenced_item is not None
+        assert fenced_item.status == "watch_expired"
+        assert fenced_job is not None
+        assert fenced_job.status == "scheduled"
+
+    FrozenHourlyDateTime.current += timedelta(seconds=1)
+    first_healthy = client.post(
+        "/runtime/plan-judgment/action",
+        json={"risk_flags": 0, "risk_reasons": []},
+    )
+    FrozenHourlyDateTime.current += timedelta(seconds=1)
+    second_healthy = client.post(
+        "/runtime/plan-judgment/action",
+        json={"risk_flags": 0, "risk_reasons": []},
+    )
+    assert first_healthy.status_code == 200
+    assert first_healthy.json()["recovery_resumed_count"] == 0
+    assert second_healthy.status_code == 200
+    assert second_healthy.json()["recovery_resumed_count"] == 1
+    with app.state.db_session_factory() as session:
+        resumed_item = session.get(ExecutionPlanItem, item_id)
+        resumed_job = session.get(ExecutionJob, job_id)
+        assert resumed_item is not None
+        assert resumed_item.status == "next_open_buy_retry_pending"
+        assert resumed_job is not None
+        assert resumed_job.status == "scheduled"
+        assert resumed_job.scheduled_for is not None
+        retry_at = resumed_job.scheduled_for
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=UTC)
+
+    with app.state.db_session_factory() as session:
+        retried = dispatch_due_execution_jobs(
+            settings=settings,
+            db=session,
+            adapter=broker_adapter,
+            now=retry_at,
+        )
+    assert retried.payload["due_job_count"] == 1
+    assert retried.payload["completed_job_count"] == 1
+    assert len(broker_adapter.order_calls) == 1
+    with app.state.db_session_factory() as session:
+        orders = session.scalars(
+            select(BrokerOrder).where(BrokerOrder.idempotency_key == order_key)
+        ).all()
+        item = session.get(ExecutionPlanItem, item_id)
+        job = session.get(ExecutionJob, job_id)
+        assert len(orders) == 1
+        assert orders[0].id == fenced_order_id
+        assert orders[0].status == "submitted"
+        assert item is not None
+        assert item.status == "broker_order_submitted"
+        assert job is not None
+        assert job.status == "completed"
+
     engine.dispose()
 
 
@@ -2889,6 +3763,195 @@ def test_new_buy_blocked_by_severe_unrealized_holding_loss_but_sell_allowed() ->
     engine.dispose()
 
 
+def test_initial_krw_new_buy_fails_closed_when_enabled_loss_truth_is_missing() -> None:
+    observed_at = datetime(2026, 9, 8, 0, 30, tzinfo=UTC)
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(
+            broker_order_id="must-not-submit-incomplete-krw-loss-truth"
+        ),
+        account_snapshot=BrokerAccountSnapshot(
+            available_cash=Decimal("5000000"),
+            buying_power=Decimal("5000000"),
+            observed_at=observed_at,
+            source="stub:incomplete-krw-loss-truth",
+            total_asset_value=Decimal("10000000"),
+            previous_total_asset_value=Decimal("10000000"),
+            asset_change_amount=Decimal("0"),
+            unrealized_pnl=None,
+            holdings=[
+                BrokerAccountHolding(
+                    symbol="005930",
+                    quantity=10,
+                    average_price=Decimal("100000"),
+                    unrealized_pnl=None,
+                    unrealized_pnl_pct=None,
+                )
+            ],
+        ),
+    )
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        kis_app_key="paper-key",
+        kis_app_secret="paper-secret",
+        kis_account_number="12345678",
+        account_drawdown_gate_enabled=True,
+    )
+    app, engine = build_test_app(settings=settings, broker_adapter=broker_adapter)
+    client = TestClient(app)
+    assert client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "test", "reason": "enable order"},
+    ).status_code == 200
+    command = PlaceOrderRequest(
+        idempotency_key="incomplete-krw-loss-truth-buy",
+        provider="kis",
+        asset_class="stock",
+        symbol="000660",
+        side="buy",
+        quantity=1,
+        order_type="limit",
+        limit_price=Decimal("100000"),
+        time_in_force="day",
+        exchange="KRX",
+        metadata={"route_now": observed_at.isoformat()},
+    )
+
+    with app.state.db_session_factory() as session:
+        result = broker_orders_service.place_broker_order(
+            settings=settings,
+            db=session,
+            adapter=broker_adapter,
+            command=command,
+            now=observed_at,
+        )
+
+    assert (result.status_code, len(broker_adapter.order_calls)) == (409, 0)
+    assert result.payload["block_reason"] == "account_drawdown_snapshot_unavailable"
+    assert "lacks unrealized P/L" in str(
+        result.payload["account_drawdown_gate"]["reason"]
+    )
+    engine.dispose()
+
+
+def test_initial_us_new_buy_fails_closed_when_degraded_loss_truth_is_missing() -> None:
+    observed_at = datetime(2026, 9, 8, 15, 0, tzinfo=UTC)
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(
+            broker_order_id="must-not-submit-incomplete-us-loss-truth"
+        ),
+        account_snapshot=BrokerAccountSnapshot(
+            available_cash=Decimal("50000"),
+            observed_at=observed_at,
+            source="stub:incomplete-us-loss-truth",
+            unrealized_pnl=None,
+            holdings=[
+                BrokerAccountHolding(
+                    symbol="AAPL",
+                    quantity=100,
+                    average_price=Decimal("100"),
+                    unrealized_pnl=None,
+                    unrealized_pnl_pct=None,
+                    payload={
+                        "ovrs_excg_cd": "NASD",
+                        "ovrs_stck_evlu_amt": "10000",
+                    },
+                )
+            ],
+            payload={"realized_pnl_coverage": "degraded_local_execution_fills_only"},
+        ),
+    )
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        kis_app_key="paper-key",
+        kis_app_secret="paper-secret",
+        kis_account_number="12345678",
+        kis_us_trading_enabled=True,
+        kis_us_allow_degraded_realized_pnl_coverage=True,
+        kis_us_max_total_exposure_usd=Decimal("50000"),
+        account_drawdown_gate_enabled=True,
+    )
+    app, engine = build_test_app(settings=settings, broker_adapter=broker_adapter)
+    client = TestClient(app)
+    assert client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "test", "reason": "enable US order"},
+    ).status_code == 200
+    plan_response = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-incomplete-us-loss-truth",
+            "source": "kai-trading-core",
+            "market_date": "2026-09-08",
+            "items": [
+                {
+                    "symbol": "AAPL",
+                    "side": "buy",
+                    "intent": "next_open_buy",
+                    "quantity_policy": {"kind": "shares", "quantity": 1},
+                    "provider": "kis",
+                    "venue": "kis",
+                    "asset_class": "us_equity",
+                    "exchange": "NASD",
+                    "currency": "USD",
+                    "source_plan_item_id": "incomplete-us-loss-truth:AAPL:buy",
+                    "limit_price": "100.00",
+                    "time_in_force": "day",
+                }
+            ],
+        },
+    )
+    assert plan_response.status_code == 201, plan_response.text
+    item_id = plan_response.json()["persisted_execution_item_ids"][0]
+    command = PlaceOrderRequest(
+        idempotency_key="incomplete-us-loss-truth-buy",
+        execution_plan_item_id=item_id,
+        provider="kis",
+        asset_class="us_equity",
+        venue="kis",
+        symbol="AAPL",
+        side="buy",
+        quantity=1,
+        order_type="limit",
+        limit_price=Decimal("100"),
+        time_in_force="day",
+        exchange="NASD",
+        metadata={"route_now": observed_at.isoformat()},
+    )
+
+    with app.state.db_session_factory() as session:
+        result = broker_orders_service.place_broker_order(
+            settings=settings,
+            db=session,
+            adapter=broker_adapter,
+            command=command,
+            request_source="execution-job:incomplete-us-loss-truth",
+            now=observed_at,
+        )
+
+    assert (result.status_code, len(broker_adapter.order_calls)) == (409, 0)
+    assert result.payload["block_reason"] == "account_drawdown_snapshot_unavailable"
+    assert "lacks US unrealized P/L" in str(
+        result.payload["account_drawdown_gate"]["reason"]
+    )
+    engine.dispose()
+
+
 def test_new_buy_blocked_by_broker_raw_holding_loss_missing_from_normalized_positions() -> None:
     broker_adapter = StubBrokerAdapter(
         config=BrokerConfig(
@@ -3560,6 +4623,329 @@ def test_dispatch_due_next_open_buy_job_keeps_retrying_duplicate_retryable_order
     engine.dispose()
 
 
+def test_next_open_drawdown_recovery_uses_new_generation_after_confirmed_health() -> None:
+    blocked_at = datetime.now(UTC)
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(
+            broker_order_id="kis-next-open-drawdown-recovery-1"
+        ),
+        account_snapshot=_daily_drawdown_snapshot(
+            drawdown_krw=Decimal("200000"),
+            observed_at=blocked_at,
+        ),
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+            account_drawdown_gate_enabled=True,
+            account_drawdown_recovery_enabled=True,
+            account_drawdown_recovery_threshold_ratio=Decimal("0.80"),
+            account_drawdown_recovery_required_healthy_observations=2,
+            account_drawdown_recovery_cooldown_seconds=300,
+            account_drawdown_recovery_min_observation_interval_seconds=1,
+        ),
+        broker_adapter=broker_adapter,
+    )
+    client = TestClient(app)
+    assert client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "test", "reason": "enable next-open recovery"},
+    ).status_code == 200
+    plan_response = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-next-open-drawdown-recovery-1",
+            "source": "kai-trading-core",
+            "market_date": "2024-01-03",
+            "items": [
+                {
+                    "symbol": "005930",
+                    "side": "buy",
+                    "intent": "next_open_buy",
+                    "quantity_policy": {"kind": "shares", "quantity": 2},
+                    "limit_price": "71000.00",
+                    "time_in_force": "day",
+                }
+            ],
+        },
+    )
+    assert plan_response.status_code == 201
+    item_id = plan_response.json()["persisted_execution_item_ids"][0]
+    with app.state.db_session_factory() as session:
+        job = session.scalar(
+            select(ExecutionJob).where(ExecutionJob.execution_plan_item_id == item_id)
+        )
+        assert job is not None
+        job_id = job.id
+    original_key = f"execution-job:{job_id}"
+
+    with app.state.db_session_factory() as session:
+        first = dispatch_due_execution_jobs(
+            settings=app.state.settings,
+            db=session,
+            adapter=broker_adapter,
+            now=blocked_at,
+        )
+    assert first.status_code == 200
+    assert first.payload["due_job_count"] == 1
+    assert first.payload["completed_job_count"] == 0
+    assert first.payload["failed_job_count"] == 0
+    assert first.payload["jobs"][0]["status"] == "scheduled", first.payload
+    assert broker_adapter.order_calls == []
+    snapshot_calls_after_block = broker_adapter.account_snapshot_calls
+
+    with app.state.db_session_factory() as session:
+        original_order = session.scalar(
+            select(BrokerOrder).where(BrokerOrder.idempotency_key == original_key)
+        )
+        assert original_order is not None
+        assert original_order.status == "rejected"
+        original_order_id = original_order.id
+        original_updated_at = original_order.updated_at
+        original_request_metadata = original_order.request_metadata
+        original_response_metadata = original_order.response_metadata
+        assert session.get(ExecutionPlanItem, item_id).status == "new_buy_blocked"
+
+    broker_adapter.account_snapshot = _daily_drawdown_snapshot(
+        drawdown_krw=Decimal("70000"),
+        observed_at=blocked_at + timedelta(seconds=1),
+    )
+    with app.state.db_session_factory() as session:
+        immediate = dispatch_due_execution_jobs(
+            settings=app.state.settings,
+            db=session,
+            adapter=broker_adapter,
+            now=blocked_at + timedelta(seconds=1),
+        )
+    assert immediate.payload["due_job_count"] == 1
+    assert immediate.payload["completed_job_count"] == 0
+    assert immediate.payload["failed_job_count"] == 0
+    assert immediate.payload["jobs"][0]["status"] == "scheduled"
+    assert broker_adapter.account_snapshot_calls == snapshot_calls_after_block
+    assert broker_adapter.order_calls == []
+
+    first_healthy_at = blocked_at + timedelta(seconds=301)
+    broker_adapter.account_snapshot = _daily_drawdown_snapshot(
+        drawdown_krw=Decimal("70000"),
+        observed_at=first_healthy_at,
+    )
+    with app.state.db_session_factory() as session:
+        first_healthy = dispatch_due_execution_jobs(
+            settings=app.state.settings,
+            db=session,
+            adapter=broker_adapter,
+            now=first_healthy_at,
+        )
+    assert first_healthy.payload["due_job_count"] == 1
+    assert first_healthy.payload["completed_job_count"] == 0
+    assert first_healthy.payload["failed_job_count"] == 0
+    assert first_healthy.payload["jobs"][0]["status"] == "scheduled", first_healthy.payload
+    assert broker_adapter.order_calls == []
+
+    second_healthy_at = first_healthy_at + timedelta(seconds=1)
+    broker_adapter.account_snapshot = _daily_drawdown_snapshot(
+        drawdown_krw=Decimal("60000"),
+        observed_at=second_healthy_at,
+    )
+    with app.state.db_session_factory() as session:
+        second_healthy = dispatch_due_execution_jobs(
+            settings=app.state.settings,
+            db=session,
+            adapter=broker_adapter,
+            now=second_healthy_at,
+        )
+    assert second_healthy.payload["due_job_count"] == 1
+    assert second_healthy.payload["completed_job_count"] == 1
+    assert second_healthy.payload["failed_job_count"] == 0
+    assert second_healthy.payload["jobs"][0]["status"] == "completed"
+    assert len(broker_adapter.order_calls) == 1
+
+    with app.state.db_session_factory() as session:
+        old_order = session.get(BrokerOrder, original_order_id)
+        assert old_order is not None
+        assert old_order.idempotency_key == original_key
+        assert old_order.status == "rejected"
+        assert old_order.updated_at == original_updated_at
+        assert old_order.request_metadata == original_request_metadata
+        assert old_order.response_metadata == original_response_metadata
+
+        replacement = session.scalar(
+            select(BrokerOrder).where(
+                BrokerOrder.execution_plan_item_id == item_id,
+                BrokerOrder.idempotency_key == f"{original_key}:recovery:1",
+            )
+        )
+        assert replacement is not None
+        assert replacement.status == "submitted"
+        assert replacement.request_metadata["metadata"]["account_drawdown_recovery"][
+            "source_broker_order_pk"
+        ] == original_order_id
+        item = session.get(ExecutionPlanItem, item_id)
+        assert item is not None
+        assert item.status == "broker_order_submitted"
+
+        observed_audits = session.scalars(
+            select(ExecutionPlanItemAudit).where(
+                ExecutionPlanItemAudit.execution_plan_item_id == item_id,
+                ExecutionPlanItemAudit.event_type == "account_drawdown_recovery_observed",
+            )
+        ).all()
+        assert len(observed_audits) == 2
+        released = session.scalar(
+            select(ExecutionPlanItemAudit).where(
+                ExecutionPlanItemAudit.execution_plan_item_id == item_id,
+                ExecutionPlanItemAudit.event_type == "account_drawdown_recovery_released",
+            )
+        )
+        assert released is not None
+        assert released.summary["source_broker_order_pk"] == original_order_id
+        assert released.summary["recovery_generation"] == 1
+
+    engine.dispose()
+
+
+def test_next_open_recovery_runtime_fence_reuses_same_child_on_original_key_retry(
+    monkeypatch,
+) -> None:
+    app, engine, broker_adapter, item_id, job_id, blocked_at = (
+        _build_blocked_next_open_recovery_scenario(
+            required_healthy_observations=2,
+            cooldown_seconds=0,
+        )
+    )
+    client = TestClient(app)
+    original_key = f"execution-job:{job_id}"
+    child_key = f"{original_key}:recovery:1"
+    real_ensure_session = broker_orders_service.ensure_authenticated_broker_session
+    pause_once = {"armed": True}
+
+    def ensure_session_then_pause_before_broker(*args: object, **kwargs: object):
+        session_state = real_ensure_session(*args, **kwargs)
+        if pause_once["armed"] and kwargs.get("source") == "broker_order_service":
+            pause_once["armed"] = False
+            pause_runtime(
+                settings=kwargs["settings"],
+                db=kwargs["db"],
+                command=ControlCommand(
+                    actor="ops",
+                    source="test",
+                    reason="fence recovered child immediately before broker call",
+                ),
+            )
+        return session_state
+
+    monkeypatch.setattr(
+        broker_orders_service,
+        "ensure_authenticated_broker_session",
+        ensure_session_then_pause_before_broker,
+    )
+    first_healthy_at = blocked_at + timedelta(seconds=1)
+    broker_adapter.account_snapshot = _daily_drawdown_snapshot(
+        drawdown_krw=Decimal("70000"),
+        observed_at=first_healthy_at,
+    )
+    with app.state.db_session_factory() as session:
+        observed = dispatch_due_execution_jobs(
+            settings=app.state.settings,
+            db=session,
+            adapter=broker_adapter,
+            now=first_healthy_at,
+        )
+    assert observed.payload["jobs"][0]["status"] == "scheduled"
+    assert pause_once["armed"] is True
+
+    healthy_at = first_healthy_at + timedelta(seconds=1)
+    broker_adapter.account_snapshot = _daily_drawdown_snapshot(
+        drawdown_krw=Decimal("60000"),
+        observed_at=healthy_at,
+    )
+    with app.state.db_session_factory() as session:
+        fenced = dispatch_due_execution_jobs(
+            settings=app.state.settings,
+            db=session,
+            adapter=broker_adapter,
+            now=healthy_at,
+        )
+
+    assert fenced.payload["due_job_count"] == 1
+    assert fenced.payload["completed_job_count"] == 0
+    assert fenced.payload["jobs"][0]["status"] == "scheduled"
+    assert broker_adapter.order_calls == []
+    with app.state.db_session_factory() as session:
+        source = session.scalar(
+            select(BrokerOrder).where(BrokerOrder.idempotency_key == original_key)
+        )
+        child = session.scalar(
+            select(BrokerOrder).where(BrokerOrder.idempotency_key == child_key)
+        )
+        job = session.get(ExecutionJob, job_id)
+        assert source is not None
+        assert source.status == "rejected"
+        assert child is not None
+        assert child.status == "rejected"
+        assert child.last_error_classification == "runtime_safety_control"
+        assert child.last_error_code == "paused"
+        assert child.last_error_retryable is True
+        assert job is not None
+        assert job.status == "scheduled"
+        child_id = child.id
+
+    runtime_status = client.get("/runtime/status")
+    assert runtime_status.status_code == 200
+    assert runtime_status.json()["account_drawdown_gate"]["gated"] is False
+
+    assert client.post(
+        "/controls/resume",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "retry the original next-open job key",
+        },
+    ).status_code == 200
+    retry_at = healthy_at + timedelta(seconds=1)
+    broker_adapter.account_snapshot = _daily_drawdown_snapshot(
+        drawdown_krw=Decimal("50000"),
+        observed_at=retry_at,
+    )
+    with app.state.db_session_factory() as session:
+        retried = dispatch_due_execution_jobs(
+            settings=app.state.settings,
+            db=session,
+            adapter=broker_adapter,
+            now=retry_at,
+        )
+
+    assert (
+        retried.payload["due_job_count"],
+        retried.payload["completed_job_count"],
+        len(broker_adapter.order_calls),
+    ) == (1, 1, 1)
+    with app.state.db_session_factory() as session:
+        children = session.scalars(
+            select(BrokerOrder).where(
+                BrokerOrder.execution_plan_item_id == item_id,
+                BrokerOrder.idempotency_key.like(f"{original_key}:recovery:%"),
+            )
+        ).all()
+        assert len(children) == 1
+        assert children[0].id == child_id
+        assert children[0].idempotency_key == child_key
+        assert children[0].status == "submitted"
+        assert session.get(ExecutionJob, job_id).status == "completed"
+    engine.dispose()
+
+
 def test_dispatch_due_next_open_buy_job_recovers_stale_running_job() -> None:
     broker_adapter = StubBrokerAdapter(
         config=BrokerConfig(
@@ -4042,6 +5428,11 @@ def _build_watch_buy_test_app(
     max_quote_age_seconds: int = 30,
     retry_cooldown_seconds: int = 5,
     account_drawdown_gate_enabled: bool = False,
+    account_drawdown_recovery_enabled: bool = True,
+    account_drawdown_recovery_threshold_ratio: Decimal = Decimal("0.80"),
+    account_drawdown_recovery_required_healthy_observations: int = 2,
+    account_drawdown_recovery_cooldown_seconds: int = 300,
+    account_drawdown_recovery_min_observation_interval_seconds: int = 1,
     late_entry_mode: str = "shadow",
 ):
     broker_adapter = StubBrokerAdapter(
@@ -4065,6 +5456,17 @@ def _build_watch_buy_test_app(
             monitoring_watch_buy_retry_cooldown_seconds=retry_cooldown_seconds,
             exec_agent_max_position_allocation_pct=Decimal("0.20"),
             account_drawdown_gate_enabled=account_drawdown_gate_enabled,
+            account_drawdown_recovery_enabled=account_drawdown_recovery_enabled,
+            account_drawdown_recovery_threshold_ratio=account_drawdown_recovery_threshold_ratio,
+            account_drawdown_recovery_required_healthy_observations=(
+                account_drawdown_recovery_required_healthy_observations
+            ),
+            account_drawdown_recovery_cooldown_seconds=(
+                account_drawdown_recovery_cooldown_seconds
+            ),
+            account_drawdown_recovery_min_observation_interval_seconds=(
+                account_drawdown_recovery_min_observation_interval_seconds
+            ),
             watch_buy_late_entry_mode=late_entry_mode,
         ),
         broker_adapter=broker_adapter,
@@ -4077,6 +5479,732 @@ def _build_watch_buy_test_app(
         )
         assert response.status_code == 200
     return app, engine, client, broker_adapter
+
+
+def _daily_drawdown_snapshot(
+    *,
+    drawdown_krw: Decimal,
+    observed_at: datetime,
+) -> BrokerAccountSnapshot:
+    previous_total = Decimal("10000000")
+    total = previous_total - drawdown_krw
+    return BrokerAccountSnapshot(
+        available_cash=Decimal("5000000"),
+        buying_power=Decimal("5000000"),
+        observed_at=observed_at,
+        source="stub:account_snapshot",
+        total_asset_value=total,
+        previous_total_asset_value=previous_total,
+        asset_change_amount=-drawdown_krw,
+        unrealized_pnl=Decimal("0"),
+        payload={
+            "balance": {
+                "output2": [
+                    {
+                        "tot_evlu_amt": str(total),
+                        "bfdy_tot_asst_evlu_amt": str(previous_total),
+                        "asst_icdc_amt": str(-drawdown_krw),
+                        "evlu_pfls_smtl_amt": "0",
+                    }
+                ]
+            }
+        },
+    )
+
+
+def test_drawdown_recovery_idempotency_key_hashes_overflow_deterministically() -> None:
+    boundary_base = "b" * (128 - len(":recovery:1"))
+    assert recovery_idempotency_key(
+        base_key=boundary_base,
+        source_broker_order_pk="source-order-1",
+        generation=1,
+    ) == f"{boundary_base}:recovery:1"
+
+    overflow_base = f"monitoring:watch_buy:{'x' * 110}"
+    first = recovery_idempotency_key(
+        base_key=overflow_base,
+        source_broker_order_pk="source-order-1",
+        generation=1,
+    )
+    replay = recovery_idempotency_key(
+        base_key=overflow_base,
+        source_broker_order_pk="source-order-1",
+        generation=1,
+    )
+    different_source = recovery_idempotency_key(
+        base_key=overflow_base,
+        source_broker_order_pk="source-order-2",
+        generation=1,
+    )
+    next_generation = recovery_idempotency_key(
+        base_key=overflow_base,
+        source_broker_order_pk="source-order-1",
+        generation=2,
+    )
+
+    assert first == replay
+    assert first.startswith("account-drawdown-recovery:1:")
+    assert len(first) <= 128
+    assert len(different_source) <= 128
+    assert len(next_generation) <= 128
+    assert len({first, different_source, next_generation}) == 3
+
+
+def _build_blocked_next_open_recovery_scenario(
+    *,
+    required_healthy_observations: int = 2,
+    cooldown_seconds: int = 0,
+):
+    blocked_at = datetime.now(UTC)
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(
+            broker_order_id="kis-next-open-drawdown-edge"
+        ),
+        account_snapshot=_daily_drawdown_snapshot(
+            drawdown_krw=Decimal("200000"),
+            observed_at=blocked_at,
+        ),
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+            account_drawdown_gate_enabled=True,
+            account_drawdown_recovery_enabled=True,
+            account_drawdown_recovery_threshold_ratio=Decimal("0.80"),
+            account_drawdown_recovery_required_healthy_observations=(
+                required_healthy_observations
+            ),
+            account_drawdown_recovery_cooldown_seconds=cooldown_seconds,
+            account_drawdown_recovery_min_observation_interval_seconds=1,
+        ),
+        broker_adapter=broker_adapter,
+    )
+    client = TestClient(app)
+    assert client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "test", "reason": "enable recovery edge test"},
+    ).status_code == 200
+    plan_response = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-next-open-drawdown-edge",
+            "source": "kai-trading-core",
+            "market_date": "2024-01-03",
+            "items": [
+                {
+                    "symbol": "005930",
+                    "side": "buy",
+                    "intent": "next_open_buy",
+                    "quantity_policy": {"kind": "shares", "quantity": 2},
+                    "limit_price": "71000.00",
+                    "time_in_force": "day",
+                }
+            ],
+        },
+    )
+    assert plan_response.status_code == 201
+    item_id = plan_response.json()["persisted_execution_item_ids"][0]
+    with app.state.db_session_factory() as session:
+        job = session.scalar(
+            select(ExecutionJob).where(ExecutionJob.execution_plan_item_id == item_id)
+        )
+        assert job is not None
+        job_id = job.id
+        blocked = dispatch_due_execution_jobs(
+            settings=app.state.settings,
+            db=session,
+            adapter=broker_adapter,
+            now=blocked_at,
+        )
+    assert blocked.payload["due_job_count"] == 1
+    assert blocked.payload["jobs"][0]["status"] == "scheduled"
+    assert broker_adapter.order_calls == []
+    return app, engine, broker_adapter, item_id, job_id, blocked_at
+
+
+def test_drawdown_recovery_does_not_count_same_broker_snapshot_twice() -> None:
+    app, engine, broker_adapter, item_id, _job_id, blocked_at = (
+        _build_blocked_next_open_recovery_scenario(
+            required_healthy_observations=2,
+            cooldown_seconds=0,
+        )
+    )
+    snapshot_observed_at = blocked_at + timedelta(seconds=1)
+    broker_adapter.account_snapshot = _daily_drawdown_snapshot(
+        drawdown_krw=Decimal("70000"),
+        observed_at=snapshot_observed_at,
+    )
+
+    with app.state.db_session_factory() as session:
+        first = dispatch_due_execution_jobs(
+            settings=app.state.settings,
+            db=session,
+            adapter=broker_adapter,
+            now=snapshot_observed_at,
+        )
+    with app.state.db_session_factory() as session:
+        repeated = dispatch_due_execution_jobs(
+            settings=app.state.settings,
+            db=session,
+            adapter=broker_adapter,
+            now=snapshot_observed_at + timedelta(seconds=1),
+        )
+
+    assert first.payload["jobs"][0]["status"] == "scheduled"
+    assert repeated.payload["jobs"][0]["status"] == "scheduled"
+    assert repeated.payload["completed_job_count"] == 0
+    assert repeated.payload["failed_job_count"] == 0
+    assert broker_adapter.order_calls == []
+    repeated_at = snapshot_observed_at + timedelta(seconds=1)
+    assert datetime.fromisoformat(repeated.payload["jobs"][0]["scheduled_for"]) > (
+        repeated_at
+    )
+
+    with app.state.db_session_factory() as session:
+        observed_audits = session.scalars(
+            select(ExecutionPlanItemAudit).where(
+                ExecutionPlanItemAudit.execution_plan_item_id == item_id,
+                ExecutionPlanItemAudit.event_type == "account_drawdown_recovery_observed",
+            )
+        ).all()
+        assert len(observed_audits) == 1
+        assert observed_audits[0].summary["healthy_observation_count"] == 1
+        assert (
+            observed_audits[0].summary["snapshot_observed_at"]
+            == snapshot_observed_at.isoformat()
+        )
+        released = session.scalar(
+            select(ExecutionPlanItemAudit).where(
+                ExecutionPlanItemAudit.execution_plan_item_id == item_id,
+                ExecutionPlanItemAudit.event_type == "account_drawdown_recovery_released",
+            )
+        )
+        assert released is None
+        orders = session.scalars(
+            select(BrokerOrder).where(BrokerOrder.execution_plan_item_id == item_id)
+        ).all()
+        assert len(orders) == 1
+        assert orders[0].status == "rejected"
+
+    engine.dispose()
+
+
+def test_drawdown_recovery_cooldown_does_not_resurrect_cancelled_job_item() -> None:
+    app, engine, broker_adapter, item_id, job_id, blocked_at = (
+        _build_blocked_next_open_recovery_scenario(
+            required_healthy_observations=2,
+            cooldown_seconds=300,
+        )
+    )
+    with app.state.db_session_factory() as session:
+        item = session.get(ExecutionPlanItem, item_id)
+        job = session.get(ExecutionJob, job_id)
+        assert item is not None
+        assert job is not None
+        item.status = "watch_cancelled"
+        job.status = "running"
+        job.locked_at = blocked_at + timedelta(seconds=1)
+        session.commit()
+
+    with app.state.db_session_factory() as session:
+        outcome = execution_jobs_service._dispatch_job(
+            settings=app.state.settings,
+            db=session,
+            adapter=broker_adapter,
+            job_id=job_id,
+        )
+
+    assert outcome == "failed"
+    assert broker_adapter.order_calls == []
+    with app.state.db_session_factory() as session:
+        item = session.get(ExecutionPlanItem, item_id)
+        job = session.get(ExecutionJob, job_id)
+        assert item is not None
+        assert item.status == "watch_cancelled"
+        assert job is not None
+        assert job.status == "failed"
+        assert job.last_error == (
+            "execution plan item is no longer eligible for automatic account "
+            "drawdown recovery"
+        )
+
+    engine.dispose()
+
+
+def test_execution_job_recovery_accepts_snapshot_after_slow_preflight(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, engine, broker_adapter, item_id, _job_id, blocked_at = (
+        _build_blocked_next_open_recovery_scenario(
+            required_healthy_observations=2,
+            cooldown_seconds=0,
+        )
+    )
+    # A snapshot completed after slow request construction/authentication must
+    # not become "future" merely because recovery began at job-claim time.
+    settings = app.state.settings.model_copy(
+        update={"account_drawdown_recovery_max_snapshot_future_skew_seconds": 0}
+    )
+    claimed_at = blocked_at + timedelta(seconds=1)
+    snapshot_observed_at = claimed_at + timedelta(seconds=35)
+    dispatch_ticks = iter((100.0, 135.0))
+    snapshot_ticks = iter((200.0, 200.0))
+    monkeypatch.setattr(
+        execution_jobs_service,
+        "monotonic",
+        lambda: next(dispatch_ticks),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        broker_orders_service,
+        "monotonic",
+        lambda: next(snapshot_ticks),
+        raising=False,
+    )
+    broker_adapter.account_snapshot = _daily_drawdown_snapshot(
+        drawdown_krw=Decimal("70000"),
+        observed_at=snapshot_observed_at,
+    )
+
+    with app.state.db_session_factory() as session:
+        result = dispatch_due_execution_jobs(
+            settings=settings,
+            db=session,
+            adapter=broker_adapter,
+            now=claimed_at,
+        )
+
+    assert result.payload["due_job_count"] == 1
+    assert result.payload["jobs"][0]["status"] == "scheduled"
+    assert result.payload["completed_job_count"] == 0
+    assert result.payload["failed_job_count"] == 0
+    assert broker_adapter.order_calls == []
+    with app.state.db_session_factory() as session:
+        observations = session.scalars(
+            select(ExecutionPlanItemAudit).where(
+                ExecutionPlanItemAudit.execution_plan_item_id == item_id,
+                ExecutionPlanItemAudit.event_type
+                == "account_drawdown_recovery_observed",
+            )
+        ).all()
+        assert len(observations) == 1
+        assert observations[0].summary["healthy_observation_count"] == 1
+        assert (
+            observations[0].summary["snapshot_observed_at"]
+            == snapshot_observed_at.isoformat()
+        )
+
+    engine.dispose()
+
+
+@pytest.mark.parametrize("regression_kind", ["unhealthy", "unavailable"])
+def test_drawdown_recovery_regression_resets_streak_and_restarts_cooldown(
+    regression_kind: str,
+) -> None:
+    cooldown_seconds = 10
+    app, engine, broker_adapter, item_id, _job_id, blocked_at = (
+        _build_blocked_next_open_recovery_scenario(
+            required_healthy_observations=2,
+            cooldown_seconds=cooldown_seconds,
+        )
+    )
+    first_healthy_at = blocked_at + timedelta(seconds=cooldown_seconds + 1)
+    broker_adapter.account_snapshot = _daily_drawdown_snapshot(
+        drawdown_krw=Decimal("70000"),
+        observed_at=first_healthy_at,
+    )
+    with app.state.db_session_factory() as session:
+        first_healthy = dispatch_due_execution_jobs(
+            settings=app.state.settings,
+            db=session,
+            adapter=broker_adapter,
+            now=first_healthy_at,
+        )
+    assert first_healthy.payload["jobs"][0]["status"] == "scheduled", first_healthy.payload
+
+    regressed_at = first_healthy_at + timedelta(seconds=1)
+    if regression_kind == "unhealthy":
+        broker_adapter.account_snapshot = _daily_drawdown_snapshot(
+            drawdown_krw=Decimal("200000"),
+            observed_at=regressed_at,
+        )
+    else:
+        broker_adapter.account_snapshot_error = BrokerAdapterError(
+            "recovery account snapshot unavailable"
+        )
+    with app.state.db_session_factory() as session:
+        regressed = dispatch_due_execution_jobs(
+            settings=app.state.settings,
+            db=session,
+            adapter=broker_adapter,
+            now=regressed_at,
+        )
+    assert regressed.payload["jobs"][0]["status"] == "scheduled"
+    assert regressed.payload["completed_job_count"] == 0
+    assert regressed.payload["failed_job_count"] == 0
+    assert broker_adapter.order_calls == []
+    broker_adapter.account_snapshot_error = None
+
+    with app.state.db_session_factory() as session:
+        reset = session.scalar(
+            select(ExecutionPlanItemAudit).where(
+                ExecutionPlanItemAudit.execution_plan_item_id == item_id,
+                ExecutionPlanItemAudit.event_type == "account_drawdown_recovery_reset",
+            )
+        )
+        assert reset is not None
+        assert reset.summary["previous_healthy_observation_count"] == 1
+        assert reset.occurred_at.replace(tzinfo=UTC) == regressed_at
+
+    calls_after_regression = broker_adapter.account_snapshot_calls
+    before_latest_cooldown = regressed_at + timedelta(seconds=cooldown_seconds - 1)
+    broker_adapter.account_snapshot = _daily_drawdown_snapshot(
+        drawdown_krw=Decimal("60000"),
+        observed_at=before_latest_cooldown,
+    )
+    with app.state.db_session_factory() as session:
+        still_cooling_down = dispatch_due_execution_jobs(
+            settings=app.state.settings,
+            db=session,
+            adapter=broker_adapter,
+            now=before_latest_cooldown,
+        )
+    assert still_cooling_down.payload["jobs"][0]["status"] == "scheduled"
+    assert (
+        still_cooling_down.payload["jobs"][0]["last_error"]
+        == "account drawdown recovery cooldown has not elapsed"
+    )
+    assert broker_adapter.account_snapshot_calls == calls_after_regression
+    assert broker_adapter.order_calls == []
+
+    after_latest_cooldown = regressed_at + timedelta(seconds=cooldown_seconds + 1)
+    broker_adapter.account_snapshot = _daily_drawdown_snapshot(
+        drawdown_krw=Decimal("60000"),
+        observed_at=after_latest_cooldown,
+    )
+    with app.state.db_session_factory() as session:
+        restarted = dispatch_due_execution_jobs(
+            settings=app.state.settings,
+            db=session,
+            adapter=broker_adapter,
+            now=after_latest_cooldown,
+        )
+    assert restarted.payload["jobs"][0]["status"] == "scheduled"
+    assert restarted.payload["completed_job_count"] == 0
+    assert broker_adapter.order_calls == []
+
+    with app.state.db_session_factory() as session:
+        observations = session.scalars(
+            select(ExecutionPlanItemAudit)
+            .where(
+                ExecutionPlanItemAudit.execution_plan_item_id == item_id,
+                ExecutionPlanItemAudit.event_type == "account_drawdown_recovery_observed",
+            )
+            .order_by(ExecutionPlanItemAudit.occurred_at.asc())
+        ).all()
+        assert [audit.summary["healthy_observation_count"] for audit in observations] == [
+            1,
+            1,
+        ]
+        released = session.scalar(
+            select(ExecutionPlanItemAudit).where(
+                ExecutionPlanItemAudit.execution_plan_item_id == item_id,
+                ExecutionPlanItemAudit.event_type == "account_drawdown_recovery_released",
+            )
+        )
+        assert released is None
+
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("snapshot_kind", "expected_error_marker"),
+    [
+        ("stale", "stale or future-dated"),
+        ("missing_daily_baseline", "daily asset baseline"),
+        ("missing_unrealized_pnl", "unrealized P/L"),
+        ("degraded_open_orders", "reliable open-order truth"),
+    ],
+)
+def test_drawdown_recovery_never_releases_from_stale_or_incomplete_snapshot(
+    snapshot_kind: str,
+    expected_error_marker: str,
+) -> None:
+    app, engine, broker_adapter, item_id, _job_id, blocked_at = (
+        _build_blocked_next_open_recovery_scenario(
+            required_healthy_observations=2,
+            cooldown_seconds=0,
+        )
+    )
+    first_healthy_at = blocked_at + timedelta(seconds=1)
+    broker_adapter.account_snapshot = _daily_drawdown_snapshot(
+        drawdown_krw=Decimal("70000"),
+        observed_at=first_healthy_at,
+    )
+    with app.state.db_session_factory() as session:
+        first_healthy = dispatch_due_execution_jobs(
+            settings=app.state.settings,
+            db=session,
+            adapter=broker_adapter,
+            now=first_healthy_at,
+        )
+    assert first_healthy.payload["jobs"][0]["status"] == "scheduled"
+
+    attempted_at = first_healthy_at + timedelta(seconds=1)
+    if snapshot_kind == "stale":
+        snapshot = _daily_drawdown_snapshot(
+            drawdown_krw=Decimal("60000"),
+            observed_at=attempted_at - timedelta(seconds=301),
+        )
+    elif snapshot_kind == "missing_daily_baseline":
+        snapshot = BrokerAccountSnapshot(
+            available_cash=Decimal("5000000"),
+            buying_power=Decimal("5000000"),
+            observed_at=attempted_at,
+            source="stub:missing_daily_baseline",
+            total_asset_value=None,
+            previous_total_asset_value=None,
+            asset_change_amount=None,
+            unrealized_pnl=Decimal("0"),
+        )
+    elif snapshot_kind == "missing_unrealized_pnl":
+        snapshot = BrokerAccountSnapshot(
+            available_cash=Decimal("5000000"),
+            buying_power=Decimal("5000000"),
+            observed_at=attempted_at,
+            source="stub:missing_unrealized_pnl",
+            total_asset_value=Decimal("9940000"),
+            previous_total_asset_value=Decimal("10000000"),
+            asset_change_amount=Decimal("-60000"),
+            unrealized_pnl=None,
+        )
+    else:
+        snapshot = _daily_drawdown_snapshot(
+            drawdown_krw=Decimal("60000"),
+            observed_at=attempted_at,
+        )
+        snapshot.payload["open_orders_error"] = {
+            "code": "KIER2570",
+            "message": "open-order truth unavailable",
+            "degraded": True,
+        }
+    broker_adapter.account_snapshot = snapshot
+
+    with app.state.db_session_factory() as session:
+        result = dispatch_due_execution_jobs(
+            settings=app.state.settings,
+            db=session,
+            adapter=broker_adapter,
+            now=attempted_at,
+        )
+
+    assert result.payload["jobs"][0]["status"] == "scheduled"
+    assert result.payload["completed_job_count"] == 0
+    assert result.payload["failed_job_count"] == 0
+    assert broker_adapter.order_calls == []
+
+    with app.state.db_session_factory() as session:
+        reset = session.scalar(
+            select(ExecutionPlanItemAudit).where(
+                ExecutionPlanItemAudit.execution_plan_item_id == item_id,
+                ExecutionPlanItemAudit.event_type == "account_drawdown_recovery_reset",
+            )
+        )
+        assert reset is not None
+        assert reset.summary["gate_name"] == "account_drawdown_snapshot_unavailable"
+        assert reset.summary["previous_healthy_observation_count"] == 1
+        assert expected_error_marker in reset.error_message
+        observations = session.scalars(
+            select(ExecutionPlanItemAudit).where(
+                ExecutionPlanItemAudit.execution_plan_item_id == item_id,
+                ExecutionPlanItemAudit.event_type == "account_drawdown_recovery_observed",
+            )
+        ).all()
+        assert len(observations) == 1
+        assert observations[0].summary["healthy_observation_count"] == 1
+        assert session.scalar(
+            select(ExecutionPlanItemAudit).where(
+                ExecutionPlanItemAudit.execution_plan_item_id == item_id,
+                ExecutionPlanItemAudit.event_type == "account_drawdown_recovery_released",
+            )
+        ) is None
+        orders = session.scalars(
+            select(BrokerOrder).where(BrokerOrder.execution_plan_item_id == item_id)
+        ).all()
+        assert len(orders) == 1
+        assert orders[0].status == "rejected"
+
+    engine.dispose()
+
+
+def test_us_drawdown_recovery_rejects_holding_without_absolute_unrealized_pnl() -> None:
+    blocked_at = datetime(2026, 9, 8, 15, 0, tzinfo=UTC)
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(
+            broker_order_id="kis-us-incomplete-recovery-must-not-submit"
+        ),
+        account_snapshot=BrokerAccountSnapshot(
+            available_cash=Decimal("1000.00"),
+            observed_at=blocked_at,
+            source="stub:us-loss-block",
+            holdings=[
+                BrokerAccountHolding(
+                    symbol="AAPL",
+                    quantity=1,
+                    average_price=Decimal("100.00"),
+                    unrealized_pnl=Decimal("-100.00"),
+                    unrealized_pnl_pct=Decimal("-50.00"),
+                    payload={
+                        "ovrs_excg_cd": "NASD",
+                        "ovrs_stck_evlu_amt": "100.00",
+                    },
+                )
+            ],
+        ),
+    )
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        kis_app_key="paper-key",
+        kis_app_secret="paper-secret",
+        kis_account_number="12345678",
+        kis_us_trading_enabled=True,
+        kis_us_allow_degraded_realized_pnl_coverage=True,
+        account_drawdown_gate_enabled=True,
+        account_drawdown_recovery_enabled=True,
+        account_drawdown_recovery_threshold_ratio=Decimal("0.80"),
+        account_drawdown_recovery_required_healthy_observations=2,
+        account_drawdown_recovery_cooldown_seconds=0,
+        account_drawdown_recovery_min_observation_interval_seconds=1,
+    )
+    app, engine = build_test_app(settings=settings, broker_adapter=broker_adapter)
+    client = TestClient(app)
+    assert client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "test", "reason": "enable US recovery"},
+    ).status_code == 200
+    plan_response = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-us-incomplete-holding-recovery",
+            "source": "kai-trading-core",
+            "market_date": "2026-09-08",
+            "items": [
+                {
+                    "symbol": "AAPL",
+                    "side": "buy",
+                    "intent": "next_open_buy",
+                    "quantity_policy": {"kind": "shares", "quantity": 1},
+                    "provider": "kis",
+                    "venue": "kis",
+                    "asset_class": "us_equity",
+                    "exchange": "NASD",
+                    "currency": "USD",
+                    "source_plan_item_id": "us-incomplete-holding-recovery:AAPL:buy",
+                    "limit_price": "50.00",
+                    "time_in_force": "day",
+                }
+            ],
+        },
+    )
+    assert plan_response.status_code == 201, plan_response.text
+    item_id = plan_response.json()["persisted_execution_item_ids"][0]
+    command = PlaceOrderRequest(
+        idempotency_key="execution-job:us-incomplete-holding-recovery",
+        execution_plan_item_id=item_id,
+        provider="kis",
+        asset_class="us_equity",
+        venue="kis",
+        symbol="AAPL",
+        side="buy",
+        quantity=1,
+        order_type="limit",
+        limit_price=Decimal("50.00"),
+        time_in_force="day",
+        exchange="NASD",
+        metadata={"route_now": blocked_at.isoformat()},
+    )
+    with app.state.db_session_factory() as session:
+        blocked = broker_orders_service.place_broker_order(
+            settings=settings,
+            db=session,
+            adapter=broker_adapter,
+            command=command,
+            request_source="execution-job:us-incomplete-holding-recovery",
+            now=blocked_at,
+        )
+    assert blocked.status_code == 409
+    assert blocked.payload["block_reason"] == "us_unrealized_loss_usd"
+    assert broker_adapter.order_calls == []
+
+    attempted_at = blocked_at + timedelta(seconds=1)
+    broker_adapter.account_snapshot = BrokerAccountSnapshot(
+        available_cash=Decimal("1000.00"),
+        observed_at=attempted_at,
+        source="stub:us-missing-holding-absolute-pnl",
+        holdings=[
+            BrokerAccountHolding(
+                symbol="AAPL",
+                quantity=1,
+                average_price=Decimal("100.00"),
+                unrealized_pnl=None,
+                unrealized_pnl_pct=Decimal("-1.00"),
+                payload={
+                    "ovrs_excg_cd": "NASD",
+                    "ovrs_stck_evlu_amt": "99.00",
+                    "evlu_pfls_rt": "-1.00",
+                },
+            )
+        ],
+    )
+    with app.state.db_session_factory() as session:
+        incomplete = broker_orders_service.place_broker_order(
+            settings=settings,
+            db=session,
+            adapter=broker_adapter,
+            command=command,
+            request_source="execution-job:us-incomplete-holding-recovery",
+            now=attempted_at,
+        )
+
+    assert (incomplete.status_code, len(broker_adapter.order_calls)) == (409, 0)
+    assert incomplete.payload["block_reason"] == "account_drawdown_recovery_pending"
+    assert incomplete.payload["account_drawdown_recovery"]["decision"]["gate_name"] == (
+        "account_drawdown_snapshot_unavailable"
+    )
+    with app.state.db_session_factory() as session:
+        observations = session.scalars(
+            select(ExecutionPlanItemAudit).where(
+                ExecutionPlanItemAudit.execution_plan_item_id == item_id,
+                ExecutionPlanItemAudit.event_type == "account_drawdown_recovery_observed",
+            )
+        ).all()
+        assert observations == []
+        assert session.scalar(
+            select(ExecutionPlanItemAudit).where(
+                ExecutionPlanItemAudit.execution_plan_item_id == item_id,
+                ExecutionPlanItemAudit.event_type == "account_drawdown_recovery_released",
+            )
+        ) is None
+    engine.dispose()
 
 
 def _create_watch_buy_candidate(
@@ -4561,29 +6689,46 @@ def test_watch_buy_drawdown_gate_disabled_releases_prior_block_and_submits() -> 
         item = session.get(ExecutionPlanItem, item_id)
         assert item is not None
         item.status = "watch_buy_triggered_blocked"
-        session.add(
-            BrokerOrder(
-                broker_name="kis",
-                execution_plan_item_id=item_id,
-                mode=app.state.settings.runtime_mode,
-                idempotency_key=original_key,
-                symbol="005930",
-                side="buy",
-                status="rejected",
-                quantity=2,
-                limit_price=Decimal("71050.00"),
-                last_error_classification="validation",
-                last_error_code="unrealized_portfolio_loss_krw",
-                last_error_message="unrealized portfolio loss amount threshold reached",
-                response_metadata={
-                    "account_drawdown_gate": {
-                        "gate_name": "unrealized_portfolio_loss_krw",
-                        "reason": "unrealized portfolio loss amount threshold reached",
-                    }
-                },
-            )
+        original_order = BrokerOrder(
+            broker_name="kis",
+            execution_plan_item_id=item_id,
+            mode=app.state.settings.runtime_mode,
+            idempotency_key=original_key,
+            symbol="005930",
+            side="buy",
+            status="rejected",
+            quantity=2,
+            limit_price=Decimal("71050.00"),
+            request_metadata={
+                "account_drawdown_recovery_policy": {
+                    "policy_version": 1,
+                    "recovery_scope": (
+                        broker_orders_service._account_drawdown_recovery_scope(
+                            settings=app.state.settings,
+                            provider="kis",
+                            asset_class="stock",
+                            exchange="KRX",
+                        )
+                    ),
+                }
+            },
+            last_error_classification="validation",
+            last_error_code="unrealized_portfolio_loss_krw",
+            last_error_message="unrealized portfolio loss amount threshold reached",
+            response_metadata={
+                "account_drawdown_gate": {
+                    "gate_name": "unrealized_portfolio_loss_krw",
+                    "reason": "unrealized portfolio loss amount threshold reached",
+                }
+            },
         )
+        session.add(original_order)
         session.commit()
+        original_order_id = original_order.id
+        original_created_at = original_order.created_at
+        original_updated_at = original_order.updated_at
+        original_request_metadata = original_order.request_metadata
+        original_response_metadata = original_order.response_metadata
 
     response = client.post(
         "/monitoring/evaluate",
@@ -4597,28 +6742,30 @@ def test_watch_buy_drawdown_gate_disabled_releases_prior_block_and_submits() -> 
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["submitted_order_count"] == 1
+    assert payload["submitted_order_count"] == 1, payload
     assert len(broker_adapter.order_calls) == 1
     assert broker_adapter.order_calls[0].execution_plan_item_id == item_id
 
     with app.state.db_session_factory() as session:
-        old_order = session.scalar(
-            select(BrokerOrder).where(
-                BrokerOrder.execution_plan_item_id == item_id,
-                BrokerOrder.status == "rejected",
-            )
-        )
+        old_order = session.get(BrokerOrder, original_order_id)
         assert old_order is not None
-        assert old_order.idempotency_key.startswith(original_key)
-        assert old_order.idempotency_key != original_key
+        assert old_order.idempotency_key == original_key
+        assert old_order.status == "rejected"
+        assert old_order.created_at == original_created_at
+        assert old_order.updated_at == original_updated_at
+        assert old_order.request_metadata == original_request_metadata
+        assert old_order.response_metadata == original_response_metadata
         new_order = session.scalar(
             select(BrokerOrder).where(
                 BrokerOrder.execution_plan_item_id == item_id,
-                BrokerOrder.idempotency_key == original_key,
+                BrokerOrder.idempotency_key == f"{original_key}:recovery:1",
             )
         )
         assert new_order is not None
         assert new_order.status == "submitted"
+        assert new_order.request_metadata["metadata"]["account_drawdown_recovery"][
+            "source_broker_order_pk"
+        ] == original_order_id
         audit = session.scalar(
             select(ExecutionPlanItemAudit).where(
                 ExecutionPlanItemAudit.execution_plan_item_id == item_id,
@@ -4626,6 +6773,917 @@ def test_watch_buy_drawdown_gate_disabled_releases_prior_block_and_submits() -> 
             )
         )
         assert audit is not None
+        assert audit.summary["source_broker_order_pk"] == original_order_id
+        assert audit.summary["recovery_idempotency_key"] == (
+            f"{original_key}:recovery:1"
+        )
+
+    engine.dispose()
+
+
+@pytest.mark.parametrize("source_policy_kind", ["foreign_v1", "legacy"])
+def test_gate_disabled_exact_replay_cannot_release_another_account_scope(
+    source_policy_kind: str,
+) -> None:
+    observed_at = datetime.now(UTC)
+    account_a = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        kis_app_key="paper-key",
+        kis_app_secret="paper-secret",
+        kis_account_number="11112222",
+        account_drawdown_recovery_scope_secret="stable-scope-secret",
+        account_drawdown_gate_enabled=True,
+    )
+    account_b = account_a.model_copy(
+        update={
+            "kis_account_number": "99990000",
+            "account_drawdown_gate_enabled": False,
+        }
+    )
+    account_a_scope = broker_orders_service._account_drawdown_recovery_scope(
+        settings=account_a,
+        provider="kis",
+        asset_class="stock",
+        exchange="KRX",
+    )
+    account_b_scope = broker_orders_service._account_drawdown_recovery_scope(
+        settings=account_b,
+        provider="kis",
+        asset_class="stock",
+        exchange="KRX",
+    )
+    assert account_a_scope != account_b_scope
+    command = PlaceOrderRequest(
+        idempotency_key="cross-account-disabled-replay",
+        provider="kis",
+        asset_class="stock",
+        symbol="005930",
+        side="buy",
+        quantity=1,
+        order_type="limit",
+        limit_price=Decimal("100000"),
+        time_in_force="day",
+        exchange="KRX",
+    )
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(
+            broker_order_id="must-not-submit-cross-account-disabled-replay"
+        ),
+        account_snapshot=_daily_drawdown_snapshot(
+            drawdown_krw=Decimal("0"),
+            observed_at=observed_at,
+        ),
+    )
+    app, engine = build_test_app(
+        settings=account_b,
+        broker_adapter=broker_adapter,
+    )
+    client = TestClient(app)
+    assert client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "test", "reason": "enable account B"},
+    ).status_code == 200
+
+    source_request_metadata = {
+        "original_command": broker_orders_service._order_command_payload(command),
+    }
+    if source_policy_kind == "foreign_v1":
+        source_request_metadata["account_drawdown_recovery_policy"] = {
+            "policy_version": 1,
+            "recovery_scope": account_a_scope,
+        }
+
+    with app.state.db_session_factory() as session:
+        source = BrokerOrder(
+            broker_name="kis",
+            execution_plan_item_id=None,
+            mode="paper",
+            idempotency_key=command.idempotency_key,
+            symbol=command.symbol,
+            side="buy",
+            status="rejected",
+            quantity=command.quantity,
+            asset_class=command.asset_class,
+            limit_price=command.limit_price,
+            request_metadata=source_request_metadata,
+            response_metadata={
+                "account_drawdown_gate": {
+                    "gate_name": "daily_total_asset_drawdown_pct",
+                }
+            },
+            last_error_classification="validation",
+            last_error_code="daily_total_asset_drawdown_pct",
+            last_error_retryable=False,
+            last_broker_sync_at=observed_at,
+        )
+        session.add(source)
+        session.commit()
+        source_id = source.id
+
+    with app.state.db_session_factory() as session:
+        result = broker_orders_service.place_broker_order(
+            settings=account_b,
+            db=session,
+            adapter=broker_adapter,
+            command=command,
+            request_source="post:/orders",
+            now=observed_at,
+        )
+
+    assert result.status_code == 200
+    assert result.payload["duplicate"] is True
+    assert broker_adapter.order_calls == []
+    with app.state.db_session_factory() as session:
+        released = session.scalar(
+            select(BrokerOrderEvent).where(
+                BrokerOrderEvent.broker_order_pk == source_id,
+                BrokerOrderEvent.event_type
+                == "account_drawdown_gate_disabled_release",
+            )
+        )
+        assert released is None
+        source = session.get(BrokerOrder, source_id)
+        assert source is not None
+        assert source.status == "rejected"
+
+    engine.dispose()
+
+
+@pytest.mark.parametrize("account_drawdown_gate_enabled", [True, False])
+def test_exact_replay_after_kis_secret_rotation_reports_scope_mismatch(
+    account_drawdown_gate_enabled: bool,
+) -> None:
+    observed_at = datetime.now(UTC)
+    original_settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        kis_app_key="paper-key",
+        kis_app_secret="paper-secret",
+        kis_account_number="12345678",
+        account_drawdown_gate_enabled=account_drawdown_gate_enabled,
+    )
+    rotated_settings = original_settings.model_copy(
+        update={"kis_app_secret": "rotated-paper-secret"}
+    )
+    original_scope = broker_orders_service._account_drawdown_recovery_scope(
+        settings=original_settings,
+        provider="kis",
+        asset_class="stock",
+        exchange="KRX",
+    )
+    rotated_scope = broker_orders_service._account_drawdown_recovery_scope(
+        settings=rotated_settings,
+        provider="kis",
+        asset_class="stock",
+        exchange="KRX",
+    )
+    assert original_scope != rotated_scope
+    command = PlaceOrderRequest(
+        idempotency_key="exact-buy-after-kis-secret-rotation",
+        provider="kis",
+        asset_class="stock",
+        symbol="005930",
+        side="buy",
+        quantity=1,
+        order_type="limit",
+        limit_price=Decimal("100000"),
+        time_in_force="day",
+        exchange="KRX",
+    )
+    adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(
+            broker_order_id="must-not-submit-after-secret-rotation"
+        ),
+    )
+    app, engine = build_test_app(
+        settings=original_settings,
+        broker_adapter=adapter,
+    )
+
+    with app.state.db_session_factory() as session:
+        session.add(
+            BrokerOrder(
+                broker_name="kis",
+                execution_plan_item_id=None,
+                mode="paper",
+                idempotency_key=command.idempotency_key,
+                symbol=command.symbol,
+                side="buy",
+                status="rejected",
+                quantity=command.quantity,
+                asset_class=command.asset_class,
+                limit_price=command.limit_price,
+                request_metadata={
+                    "original_command": (
+                        broker_orders_service._order_command_payload(command)
+                    ),
+                    "account_drawdown_recovery_policy": {
+                        "policy_version": 1,
+                        "recovery_scope": original_scope,
+                    },
+                },
+                response_metadata={
+                    "account_drawdown_gate": {
+                        "gate_name": "daily_total_asset_drawdown_pct",
+                    }
+                },
+                last_error_classification="validation",
+                last_error_code="daily_total_asset_drawdown_pct",
+                last_error_retryable=False,
+                last_broker_sync_at=observed_at,
+            )
+        )
+        session.commit()
+
+    with app.state.db_session_factory() as session:
+        result = broker_orders_service.place_broker_order(
+            settings=rotated_settings,
+            db=session,
+            adapter=adapter,
+            command=command,
+            request_source="post:/orders",
+            now=observed_at,
+        )
+
+    assert result.status_code == 409
+    assert result.payload["block_reason"] == (
+        "account_drawdown_recovery_scope_mismatch"
+    )
+    assert adapter.order_calls == []
+    engine.dispose()
+
+
+def test_watch_buy_drawdown_rejection_duplicate_stays_blocked_during_recovery_cooldown() -> None:
+    app, engine, client, broker_adapter = _build_watch_buy_test_app(
+        order_id="kis-watch-buy-drawdown-recovery-cooldown",
+        account_drawdown_gate_enabled=True,
+        account_drawdown_recovery_cooldown_seconds=300,
+    )
+    blocked_at = datetime.now(UTC)
+    broker_adapter.account_snapshot = _daily_drawdown_snapshot(
+        drawdown_krw=Decimal("200000"),
+        observed_at=blocked_at,
+    )
+    item_id = _create_watch_buy_candidate(
+        client,
+        plan_id="plan-watch-buy-drawdown-recovery-cooldown",
+        market_date=None,
+        risk_context={
+            "exchange": "KRX",
+            "stop_price": "70000.00",
+            "trigger_direction": "at_or_above",
+        },
+    )
+    original_key = f"monitoring:watch_buy:{item_id}"
+
+    blocked = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "observed_at": blocked_at.isoformat(),
+            "prices": [
+                {
+                    "symbol": "005930",
+                    "price": "71050.00",
+                    "observed_at": blocked_at.isoformat(),
+                }
+            ],
+        },
+    )
+
+    assert blocked.status_code == 200
+    assert blocked.json()["submitted_order_count"] == 0
+    assert blocked.json()["items"][0]["block_reason"] == "daily_total_asset_drawdown_pct"
+    snapshot_calls_after_block = broker_adapter.account_snapshot_calls
+    with app.state.db_session_factory() as session:
+        original_order = session.scalar(
+            select(BrokerOrder).where(BrokerOrder.idempotency_key == original_key)
+        )
+        assert original_order is not None
+        assert original_order.status == "rejected"
+        original_order_id = original_order.id
+        original_response_metadata = original_order.response_metadata
+
+    broker_adapter.account_snapshot = _daily_drawdown_snapshot(
+        drawdown_krw=Decimal("70000"),
+        observed_at=blocked_at + timedelta(seconds=1),
+    )
+    immediate_retry = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "observed_at": (blocked_at + timedelta(seconds=1)).isoformat(),
+            "prices": [
+                {
+                    "symbol": "005930",
+                    "price": "71050.00",
+                    "observed_at": (blocked_at + timedelta(seconds=1)).isoformat(),
+                }
+            ],
+        },
+    )
+
+    assert immediate_retry.status_code == 200
+    payload = immediate_retry.json()
+    assert payload["submitted_order_count"] == 0
+    assert payload["blocked_item_count"] == 1
+    assert payload["items"][0]["outcome"] == "blocked"
+    assert payload["items"][0]["block_reason"] == "account_drawdown_recovery_cooldown"
+    assert payload["items"][0]["status"] == "watch_buy_triggered_blocked"
+    assert broker_adapter.account_snapshot_calls == snapshot_calls_after_block
+    assert broker_adapter.order_calls == []
+
+    with app.state.db_session_factory() as session:
+        orders = session.scalars(
+            select(BrokerOrder).where(BrokerOrder.execution_plan_item_id == item_id)
+        ).all()
+        assert len(orders) == 1
+        assert orders[0].id == original_order_id
+        assert orders[0].idempotency_key == original_key
+        assert orders[0].status == "rejected"
+        assert orders[0].response_metadata == original_response_metadata
+
+    engine.dispose()
+
+
+def test_account_drawdown_recovery_latch_blocks_distinct_new_order_until_release() -> None:
+    app, engine, client, broker_adapter = _build_watch_buy_test_app(
+        order_id="kis-account-drawdown-global-latch",
+        account_drawdown_gate_enabled=True,
+        account_drawdown_recovery_cooldown_seconds=0,
+    )
+    blocked_at = datetime.now(UTC)
+    broker_adapter.account_snapshot = _daily_drawdown_snapshot(
+        drawdown_krw=Decimal("200000"),
+        observed_at=blocked_at,
+    )
+    item_id = _create_watch_buy_candidate(
+        client,
+        plan_id="plan-account-drawdown-global-latch",
+        market_date=None,
+        risk_context={
+            "exchange": "KRX",
+            "stop_price": "70000.00",
+            "trigger_direction": "at_or_above",
+        },
+    )
+    blocked = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "observed_at": blocked_at.isoformat(),
+            "prices": [
+                {
+                    "symbol": "005930",
+                    "price": "71050.00",
+                    "observed_at": blocked_at.isoformat(),
+                }
+            ],
+        },
+    )
+    assert blocked.status_code == 200
+    assert blocked.json()["items"][0]["block_reason"] == "daily_total_asset_drawdown_pct"
+
+    probe_at = datetime.now(UTC)
+    broker_adapter.account_snapshot = _daily_drawdown_snapshot(
+        drawdown_krw=Decimal("90000"),
+        observed_at=probe_at,
+    )
+    distinct = client.post(
+        "/orders",
+        json={
+            "idempotency_key": "distinct-order-must-not-bypass-account-recovery",
+            "provider": "kis",
+            "asset_class": "stock",
+            "symbol": "000660",
+            "side": "buy",
+            "quantity": 1,
+            "order_type": "limit",
+            "limit_price": "100000.00",
+            "time_in_force": "day",
+            "exchange": "KRX",
+        },
+    )
+
+    assert distinct.status_code == 409
+    payload = distinct.json()
+    assert payload["block_reason"] == "account_drawdown_recovery_pending"
+    assert payload["account_drawdown_recovery"]["source_broker_order_pk"]
+    assert broker_adapter.order_calls == []
+    with app.state.db_session_factory() as session:
+        assert session.scalar(
+            select(BrokerOrder).where(
+                BrokerOrder.idempotency_key
+                == "distinct-order-must-not-bypass-account-recovery"
+            )
+        ) is None
+        assert session.get(ExecutionPlanItem, item_id).status == "watch_buy_triggered_blocked"
+
+    engine.dispose()
+
+
+def test_account_drawdown_latch_is_not_hidden_by_newer_other_currency_losses() -> None:
+    app, engine, client, broker_adapter = _build_watch_buy_test_app(
+        order_id="kis-account-drawdown-deep-scope-search",
+        account_drawdown_gate_enabled=True,
+        account_drawdown_recovery_cooldown_seconds=0,
+    )
+    item_id = _create_watch_buy_candidate(
+        client,
+        plan_id="plan-account-drawdown-deep-scope-search",
+        market_date=None,
+        risk_context={
+            "exchange": "KRX",
+            "stop_price": "70000.00",
+            "trigger_direction": "at_or_above",
+        },
+    )
+    blocked_at = datetime.now(UTC) - timedelta(minutes=5)
+    krw_scope = broker_orders_service._account_drawdown_recovery_scope(
+        settings=app.state.settings,
+        provider="kis",
+        asset_class="stock",
+        exchange="KRX",
+    )
+    usd_scope = broker_orders_service._account_drawdown_recovery_scope(
+        settings=app.state.settings,
+        provider="kis",
+        asset_class="us_equity",
+        exchange="NASD",
+    )
+    with app.state.db_session_factory() as session:
+        krw_source = BrokerOrder(
+            broker_name="kis",
+            execution_plan_item_id=item_id,
+            mode="paper",
+            idempotency_key="old-active-krw-loss-latch",
+            symbol="005930",
+            side="buy",
+            status="rejected",
+            quantity=1,
+            asset_class="stock",
+            limit_price=Decimal("71000.00"),
+            last_broker_sync_at=blocked_at,
+            last_error_classification="validation",
+            last_error_code="daily_total_asset_drawdown_pct",
+            last_error_message="KRW account loss latch remains active",
+            last_error_retryable=False,
+            request_metadata={
+                "account_drawdown_recovery_policy": {
+                    "policy_version": 1,
+                    "recovery_scope": krw_scope,
+                }
+            },
+            created_at=blocked_at,
+            updated_at=blocked_at,
+        )
+        session.add(krw_source)
+        for index in range(100):
+            newer_at = blocked_at + timedelta(minutes=1, microseconds=index)
+            session.add(
+                BrokerOrder(
+                    broker_name="kis",
+                    execution_plan_item_id=item_id,
+                    mode="paper",
+                    idempotency_key=f"newer-us-loss-noise-{index:03d}",
+                    symbol="AAPL",
+                    side="buy",
+                    status="rejected",
+                    quantity=1,
+                    asset_class="us_equity",
+                    venue="kis",
+                    limit_price=Decimal("50.00"),
+                    last_broker_sync_at=newer_at,
+                    last_error_classification="validation",
+                    last_error_code="us_unrealized_loss_usd",
+                    last_error_message="newer USD loss from another currency scope",
+                    last_error_retryable=False,
+                    request_metadata={
+                        "account_drawdown_recovery_policy": {
+                            "policy_version": 1,
+                            "recovery_scope": usd_scope,
+                        }
+                    },
+                    created_at=newer_at,
+                    updated_at=newer_at,
+                )
+            )
+        session.commit()
+        krw_source_id = krw_source.id
+
+    broker_adapter.account_snapshot = _daily_drawdown_snapshot(
+        drawdown_krw=Decimal("0"),
+        observed_at=datetime.now(UTC),
+    )
+    distinct = client.post(
+        "/orders",
+        json={
+            "idempotency_key": "deep-scope-search-distinct-krw-buy",
+            "provider": "kis",
+            "asset_class": "stock",
+            "symbol": "000660",
+            "side": "buy",
+            "quantity": 1,
+            "order_type": "limit",
+            "limit_price": "100000.00",
+            "time_in_force": "day",
+            "exchange": "KRX",
+        },
+    )
+
+    assert (distinct.status_code, len(broker_adapter.order_calls)) == (409, 0)
+    payload = distinct.json()
+    assert payload["block_reason"] == "account_drawdown_recovery_pending"
+    assert payload["account_drawdown_recovery"]["source_broker_order_pk"] == (
+        krw_source_id
+    )
+    with app.state.db_session_factory() as session:
+        assert session.scalar(
+            select(BrokerOrder).where(
+                BrokerOrder.idempotency_key == "deep-scope-search-distinct-krw-buy"
+            )
+        ) is None
+    engine.dispose()
+
+
+def test_account_drawdown_recovery_advances_only_from_the_original_stopped_buy() -> None:
+    app, engine, client, broker_adapter = _build_watch_buy_test_app(
+        order_id="kis-account-drawdown-source-only-recovery",
+        account_drawdown_gate_enabled=True,
+        account_drawdown_recovery_cooldown_seconds=0,
+    )
+    blocked_at = datetime.now(UTC)
+    broker_adapter.account_snapshot = _daily_drawdown_snapshot(
+        drawdown_krw=Decimal("200000"),
+        observed_at=blocked_at,
+    )
+    source_item_id = _create_watch_buy_candidate(
+        client,
+        plan_id="plan-account-drawdown-source-only-recovery",
+        market_date=None,
+        risk_context={
+            "exchange": "KRX",
+            "stop_price": "70000.00",
+            "trigger_direction": "at_or_above",
+        },
+    )
+    other_plan = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-account-drawdown-other-candidate",
+            "source": "kai-trading-core",
+            "market_date": None,
+            "items": [
+                {
+                    "symbol": "000660",
+                    "side": "buy",
+                    "intent": "next_open_buy",
+                    "quantity_policy": {"kind": "shares", "quantity": 2},
+                    "buy_recommendation_price": "100000.00",
+                    "chase_limit_price": "101000.00",
+                    "time_in_force": "day",
+                    "risk_context": {
+                        "exchange": "KRX",
+                        "stop_price": "99000.00",
+                        "trigger_direction": "at_or_above",
+                    },
+                    "decision_agent_name": "short-term-decider",
+                    "source_plan_item_id": "plan-account-drawdown-other-candidate-watch",
+                }
+            ],
+        },
+    )
+    assert other_plan.status_code == 201
+    other_item_id = other_plan.json()["persisted_execution_item_ids"][0]
+    blocked = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "observed_at": blocked_at.isoformat(),
+            "prices": [
+                {
+                    "symbol": "005930",
+                    "price": "71050.00",
+                    "observed_at": blocked_at.isoformat(),
+                }
+            ],
+        },
+    )
+    assert blocked.status_code == 200
+    assert blocked.json()["items"][0]["block_reason"] == "daily_total_asset_drawdown_pct"
+    healthy_at = blocked_at + timedelta(seconds=1)
+    broker_adapter.account_snapshot = _daily_drawdown_snapshot(
+        drawdown_krw=Decimal("70000"),
+        observed_at=healthy_at,
+    )
+    other_candidate = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "observed_at": healthy_at.isoformat(),
+            "prices": [
+                {
+                    "symbol": "000660",
+                    "price": "100500.00",
+                    "observed_at": healthy_at.isoformat(),
+                }
+            ],
+        },
+    )
+
+    assert other_candidate.status_code == 200
+    assert other_candidate.json()["submitted_order_count"] == 0
+    assert other_candidate.json()["items"][0]["block_reason"] == (
+        "account_drawdown_recovery_pending"
+    )
+    with app.state.db_session_factory() as session:
+        observed_count = len(
+            session.scalars(
+                select(ExecutionPlanItemAudit).where(
+                ExecutionPlanItemAudit.execution_plan_item_id == source_item_id,
+                ExecutionPlanItemAudit.event_type
+                == "account_drawdown_recovery_observed",
+                )
+            ).all()
+        )
+        assert observed_count == 0
+        assert session.scalar(
+            select(BrokerOrder).where(
+                BrokerOrder.execution_plan_item_id == other_item_id,
+                BrokerOrder.idempotency_key.like("%:recovery:%"),
+            )
+        ) is None
+
+    engine.dispose()
+
+
+def test_watch_buy_drawdown_recovery_revalidates_trigger_and_controls_before_new_generation() -> None:
+    app, engine, client, broker_adapter = _build_watch_buy_test_app(
+        order_id="kis-watch-buy-drawdown-recovery-1",
+        max_quote_age_seconds=30,
+        account_drawdown_gate_enabled=True,
+        account_drawdown_recovery_enabled=True,
+        account_drawdown_recovery_threshold_ratio=Decimal("0.80"),
+        account_drawdown_recovery_required_healthy_observations=2,
+        account_drawdown_recovery_cooldown_seconds=300,
+    )
+    blocked_at = datetime.now(UTC)
+    broker_adapter.account_snapshot = _daily_drawdown_snapshot(
+        drawdown_krw=Decimal("200000"),
+        observed_at=blocked_at,
+    )
+    item_id = _create_watch_buy_candidate(
+        client,
+        plan_id="plan-watch-buy-drawdown-recovery-1",
+        market_date=None,
+        risk_context={
+            "exchange": "KRX",
+            "stop_price": "70000.00",
+            "trigger_direction": "at_or_above",
+        },
+    )
+    original_key = f"monitoring:watch_buy:{item_id}"
+
+    first = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "observed_at": blocked_at.isoformat(),
+            "prices": [
+                {
+                    "symbol": "005930",
+                    "price": "71050.00",
+                    "observed_at": blocked_at.isoformat(),
+                }
+            ],
+        },
+    )
+    assert first.status_code == 200
+    assert first.json()["items"][0]["block_reason"] == "daily_total_asset_drawdown_pct"
+    assert broker_adapter.order_calls == []
+
+    with app.state.db_session_factory() as session:
+        original_order = session.scalar(
+            select(BrokerOrder).where(BrokerOrder.idempotency_key == original_key)
+        )
+        assert original_order is not None
+        original_order_id = original_order.id
+        original_created_at = original_order.created_at
+        original_updated_at = original_order.updated_at
+        original_request_metadata = original_order.request_metadata
+        original_response_metadata = original_order.response_metadata
+
+    after_cooldown = blocked_at + timedelta(seconds=301)
+    snapshot_calls_after_block = broker_adapter.account_snapshot_calls
+
+    stale_quote = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "observed_at": after_cooldown.isoformat(),
+            "prices": [
+                {
+                    "symbol": "005930",
+                    "price": "71050.00",
+                    "observed_at": blocked_at.isoformat(),
+                }
+            ],
+        },
+    )
+    assert stale_quote.status_code == 200
+    assert stale_quote.json()["submitted_order_count"] == 0
+    assert stale_quote.json()["items"][0]["outcome"] == "stale_quote"
+    assert stale_quote.json()["items"][0]["status"] == "watch_buy_triggered_blocked"
+    assert broker_adapter.account_snapshot_calls == snapshot_calls_after_block
+
+    trigger_not_met_at = after_cooldown + timedelta(seconds=1)
+    trigger_not_met = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "observed_at": trigger_not_met_at.isoformat(),
+            "prices": [
+                {
+                    "symbol": "005930",
+                    "price": "70900.00",
+                    "observed_at": trigger_not_met_at.isoformat(),
+                }
+            ],
+        },
+    )
+    assert trigger_not_met.status_code == 200
+    assert trigger_not_met.json()["submitted_order_count"] == 0
+    assert trigger_not_met.json()["items"][0]["outcome"] == "waiting"
+    assert broker_adapter.account_snapshot_calls == snapshot_calls_after_block
+
+    first_healthy_at = trigger_not_met_at + timedelta(seconds=1)
+    broker_adapter.account_snapshot = _daily_drawdown_snapshot(
+        drawdown_krw=Decimal("70000"),
+        observed_at=first_healthy_at,
+    )
+    first_healthy = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "observed_at": first_healthy_at.isoformat(),
+            "prices": [
+                {
+                    "symbol": "005930",
+                    "price": "71050.00",
+                    "observed_at": first_healthy_at.isoformat(),
+                }
+            ],
+        },
+    )
+    assert first_healthy.status_code == 200
+    assert first_healthy.json()["submitted_order_count"] == 0
+    assert first_healthy.json()["items"][0]["outcome"] == "blocked"
+    assert (
+        first_healthy.json()["items"][0]["block_reason"]
+        == "account_drawdown_recovery_pending"
+    )
+    assert broker_adapter.order_calls == []
+
+    with app.state.db_session_factory() as session:
+        observed_audits = session.scalars(
+            select(ExecutionPlanItemAudit).where(
+                ExecutionPlanItemAudit.execution_plan_item_id == item_id,
+                ExecutionPlanItemAudit.event_type == "account_drawdown_recovery_observed",
+            )
+        ).all()
+        assert len(observed_audits) == 1
+        assert observed_audits[0].summary["healthy_observation_count"] == 1
+        assert observed_audits[0].summary["required_healthy_observations"] == 2
+
+    pause = client.post(
+        "/controls/pause",
+        json={"actor": "ops", "source": "test", "reason": "verify recovery safety fence"},
+    )
+    assert pause.status_code == 200
+    snapshot_calls_before_pause_cycle = broker_adapter.account_snapshot_calls
+    paused_at = first_healthy_at + timedelta(seconds=1)
+    broker_adapter.account_snapshot = _daily_drawdown_snapshot(
+        drawdown_krw=Decimal("60000"),
+        observed_at=paused_at,
+    )
+    paused = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "observed_at": paused_at.isoformat(),
+            "prices": [
+                {
+                    "symbol": "005930",
+                    "price": "71050.00",
+                    "observed_at": paused_at.isoformat(),
+                }
+            ],
+        },
+    )
+    assert paused.status_code == 200
+    assert paused.json()["submitted_order_count"] == 0
+    assert paused.json()["items"][0]["outcome"] == "blocked"
+    assert paused.json()["items"][0]["block_reason"] == "paused"
+    assert paused.json()["items"][0]["status"] == "watch_buy_triggered_blocked"
+    assert broker_adapter.account_snapshot_calls == snapshot_calls_before_pause_cycle
+    assert broker_adapter.order_calls == []
+
+    resume = client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "test", "reason": "complete verified recovery"},
+    )
+    assert resume.status_code == 200
+    second_healthy_at = paused_at + timedelta(seconds=1)
+    broker_adapter.account_snapshot = _daily_drawdown_snapshot(
+        drawdown_krw=Decimal("60000"),
+        observed_at=second_healthy_at,
+    )
+    second_healthy = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "observed_at": second_healthy_at.isoformat(),
+            "prices": [
+                {
+                    "symbol": "005930",
+                    "price": "71050.00",
+                    "observed_at": second_healthy_at.isoformat(),
+                }
+            ],
+        },
+    )
+
+    assert second_healthy.status_code == 200
+    payload = second_healthy.json()
+    assert payload["submitted_order_count"] == 1
+    assert payload["items"][0]["outcome"] == "submitted"
+    assert payload["items"][0]["status"] == "watch_buy_submitted"
+    assert len(broker_adapter.order_calls) == 1
+
+    with app.state.db_session_factory() as session:
+        old_order = session.get(BrokerOrder, original_order_id)
+        assert old_order is not None
+        assert old_order.idempotency_key == original_key
+        assert old_order.status == "rejected"
+        assert old_order.created_at == original_created_at
+        assert old_order.updated_at == original_updated_at
+        assert old_order.request_metadata == original_request_metadata
+        assert old_order.response_metadata == original_response_metadata
+
+        replacement = session.scalar(
+            select(BrokerOrder).where(
+                BrokerOrder.execution_plan_item_id == item_id,
+                BrokerOrder.idempotency_key == f"{original_key}:recovery:1",
+            )
+        )
+        assert replacement is not None
+        assert replacement.status == "submitted"
+        assert replacement.request_metadata["metadata"]["account_drawdown_recovery"][
+            "source_broker_order_pk"
+        ] == original_order_id
+
+        observed_audits = session.scalars(
+            select(ExecutionPlanItemAudit).where(
+                ExecutionPlanItemAudit.execution_plan_item_id == item_id,
+                ExecutionPlanItemAudit.event_type == "account_drawdown_recovery_observed",
+            )
+        ).all()
+        assert len(observed_audits) == 2
+        released = session.scalar(
+            select(ExecutionPlanItemAudit).where(
+                ExecutionPlanItemAudit.execution_plan_item_id == item_id,
+                ExecutionPlanItemAudit.event_type == "account_drawdown_recovery_released",
+            )
+        )
+        assert released is not None
+        assert released.summary["source_broker_order_pk"] == original_order_id
+        assert released.summary["recovery_generation"] == 1
 
     engine.dispose()
 
@@ -6351,6 +9409,73 @@ def test_watch_buy_duplicate_monitor_cycles_do_not_submit_duplicate_order() -> N
     engine.dispose()
 
 
+def test_watch_buy_duplicate_manual_review_truth_is_not_downgraded_to_rejected() -> None:
+    app, engine, client, broker_adapter = _build_watch_buy_test_app(
+        order_id="must-not-submit-manual-review-duplicate"
+    )
+    item_id = _create_watch_buy_candidate(
+        client,
+        plan_id="plan-watch-buy-manual-review-duplicate",
+        risk_context={
+            "exchange": "KRX",
+            "stop_price": "70000.00",
+            "trigger_direction": "at_or_above",
+        },
+    )
+    with app.state.db_session_factory() as session:
+        session.add(
+            BrokerOrder(
+                broker_name="kis",
+                execution_plan_item_id=item_id,
+                mode="paper",
+                idempotency_key=f"monitoring:watch_buy:{item_id}",
+                symbol="005930",
+                side="buy",
+                status="manual_review_required",
+                quantity=2,
+                limit_price=Decimal("71050.00"),
+                last_error_classification="submit_outcome_unknown",
+                last_error_code="SUBMIT_OUTCOME_UNKNOWN",
+                last_error_message="broker submission outcome is unknown",
+                last_error_retryable=False,
+            )
+        )
+        session.commit()
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "duplicate must preserve manual-review broker truth",
+            "prices": [{"symbol": "005930", "price": "71050.00"}],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["triggered_item_count"] == 1
+    assert payload["submitted_order_count"] == 0
+    assert payload["items"][0]["outcome"] == "duplicate"
+    assert payload["items"][0]["order"]["status"] == "manual_review_required"
+    assert payload["items"][0]["status"] == "broker_order_failed"
+    assert broker_adapter.order_calls == []
+    with app.state.db_session_factory() as session:
+        order = session.scalar(
+            select(BrokerOrder).where(
+                BrokerOrder.idempotency_key == f"monitoring:watch_buy:{item_id}"
+            )
+        )
+        item = session.get(ExecutionPlanItem, item_id)
+        assert order is not None
+        assert order.status == "manual_review_required"
+        assert item is not None
+        assert item.status == "broker_order_failed"
+        assert item.status != "watch_buy_rejected"
+
+    engine.dispose()
+
+
 def test_watch_buy_cycle_reserves_orderable_cash_before_broker_submission() -> None:
     app, engine, client, broker_adapter = _build_watch_buy_test_app(
         order_id="kis-watch-buy-reserved-cash-1"
@@ -6741,6 +9866,89 @@ def test_short_term_watcher_approved_market_buy_submits_order_and_materializes_m
     assert items_by_intent["target_sell"]["trigger_price"] == "77000.0000"
     assert items_by_intent["stop_sell"]["status"] == "stop_sell_monitoring"
     assert items_by_intent["stop_sell"]["trigger_price"] == "66500.0000"
+    engine.dispose()
+
+
+def test_short_term_watcher_loss_block_can_recover_on_same_candidate() -> None:
+    blocked_at = datetime.now(UTC)
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(
+            broker_order_id="kis-short-term-recovery"
+        ),
+        account_snapshot=_daily_drawdown_snapshot(
+            drawdown_krw=Decimal("200000"),
+            observed_at=blocked_at,
+        ),
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+            account_drawdown_gate_enabled=True,
+            account_drawdown_recovery_enabled=True,
+            account_drawdown_recovery_cooldown_seconds=0,
+            account_drawdown_recovery_required_healthy_observations=2,
+            account_drawdown_recovery_min_observation_interval_seconds=1,
+        ),
+        broker_adapter=broker_adapter,
+    )
+    client = TestClient(app)
+    assert client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "test", "reason": "enable recovery"},
+    ).status_code == 200
+    item_id = _create_short_term_watcher_candidate(client)
+    decision = _short_term_decision_payload(item_id, dry_run=False)
+
+    blocked = client.post("/short-term-watcher/decisions", json=decision)
+
+    assert blocked.status_code == 409
+    assert blocked.json()["approved"] is False
+    assert broker_adapter.order_calls == []
+
+    broker_adapter.account_snapshot = _daily_drawdown_snapshot(
+        drawdown_krw=Decimal("70000"),
+        observed_at=blocked_at + timedelta(seconds=1),
+    )
+    observing = client.post("/short-term-watcher/decisions", json=decision)
+    assert observing.status_code == 409
+    assert observing.json()["approved"] is False
+    assert broker_adapter.order_calls == []
+
+    broker_adapter.account_snapshot = _daily_drawdown_snapshot(
+        drawdown_krw=Decimal("60000"),
+        observed_at=blocked_at + timedelta(seconds=3),
+    )
+    recovered = client.post("/short-term-watcher/decisions", json=decision)
+
+    assert recovered.status_code == 201
+    assert recovered.json()["approved"] is True
+    assert len(broker_adapter.order_calls) == 1
+    with app.state.db_session_factory() as session:
+        source = session.scalar(
+            select(BrokerOrder).where(
+                BrokerOrder.idempotency_key == f"short-term-watcher:buy:{item_id}"
+            )
+        )
+        child = session.scalar(
+            select(BrokerOrder).where(
+                BrokerOrder.idempotency_key
+                == f"short-term-watcher:buy:{item_id}:recovery:1"
+            )
+        )
+        assert source is not None and source.status == "rejected"
+        assert child is not None and child.status == "submitted"
+
     engine.dispose()
 
 

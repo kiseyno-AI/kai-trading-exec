@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import update
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
@@ -79,6 +79,55 @@ def automated_order_submission_block_reason(state: RuntimeControlState) -> str |
     return None
 
 
+def automated_buy_submission_block_reason(state: RuntimeControlState) -> str | None:
+    runtime_reason = automated_order_submission_block_reason(state)
+    if runtime_reason is not None:
+        return runtime_reason
+    if state.hourly_risk_off_active:
+        return "hourly_plan_risk_off"
+    return None
+
+
+def automated_buy_submission_allowed(state: RuntimeControlState) -> bool:
+    return automated_buy_submission_block_reason(state) is None
+
+
+def hourly_risk_off_retry_after_at(
+    *,
+    settings: Settings,
+    state: RuntimeControlState,
+    now: datetime | None = None,
+) -> datetime | None:
+    if not state.hourly_risk_off_active:
+        return None
+    observed_at = _normalize_utc(now or datetime.now(UTC))
+    context = (
+        state.hourly_risk_off_context
+        if isinstance(state.hourly_risk_off_context, dict)
+        else {}
+    )
+    cooldown_until = _parse_utc_datetime(context.get("cooldown_until"))
+    last_healthy = _parse_utc_datetime(context.get("last_healthy_observed_at"))
+    next_observation_at = (
+        last_healthy
+        + timedelta(
+            seconds=settings.hourly_plan_judgment_recovery_min_observation_interval_seconds
+        )
+        if last_healthy is not None
+        else None
+    )
+    candidates = [
+        candidate
+        for candidate in (cooldown_until, next_observation_at)
+        if candidate is not None and candidate > observed_at
+    ]
+    if candidates:
+        return max(candidates)
+    return observed_at + timedelta(
+        seconds=settings.hourly_plan_judgment_recovery_min_observation_interval_seconds
+    )
+
+
 def last_change_payload(state: RuntimeControlState) -> dict[str, object]:
     return {
         "action": state.last_transition_action,
@@ -98,10 +147,34 @@ def runtime_safety_payload(state: RuntimeControlState) -> dict[str, object]:
         "automation_enabled": effective_automation_enabled(state),
         "automated_order_submission_allowed": automated_order_submission_allowed(state),
         "automated_order_submission_block_reason": automated_order_submission_block_reason(state),
+        "automated_buy_submission_allowed": automated_buy_submission_allowed(state),
+        "automated_buy_submission_block_reason": automated_buy_submission_block_reason(state),
+        "hourly_risk_off": {
+            "available": True,
+            "active": state.hourly_risk_off_active,
+            "epoch": state.hourly_risk_off_epoch,
+            "context": state.hourly_risk_off_context,
+        },
         "readiness_reason": state.readiness_reason,
         "updated_at": state.updated_at.isoformat() if state.updated_at else None,
         "last_change": last_change_payload(state),
     }
+
+
+def _normalize_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
+
+
+def _parse_utc_datetime(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return _normalize_utc(parsed)
 
 
 def pause_runtime(
@@ -216,6 +289,9 @@ def enable_kill_switch(
         "paused": True,
         "kill_switch_enabled": True,
         "automation_enabled": False,
+        "hourly_risk_off_active": state.hourly_risk_off_active,
+        "hourly_risk_off_epoch": state.hourly_risk_off_epoch,
+        "hourly_risk_off_context": state.hourly_risk_off_context,
         "readiness_reason": readiness_reason,
     }
     result = db.execute(
@@ -335,6 +411,9 @@ def _bootstrap_state_values(*, settings: Settings) -> dict[str, object]:
         "paused": True,
         "kill_switch_enabled": False,
         "automation_enabled": False,
+        "hourly_risk_off_active": False,
+        "hourly_risk_off_epoch": 0,
+        "hourly_risk_off_context": None,
         "readiness_reason": readiness_reason,
         "last_transition_action": "bootstrap",
         "last_transition_source": "system",
@@ -350,6 +429,9 @@ def _state_snapshot(state: RuntimeControlState) -> dict[str, object]:
         "paused": state.paused,
         "kill_switch_enabled": state.kill_switch_enabled,
         "automation_enabled": state.automation_enabled,
+        "hourly_risk_off_active": state.hourly_risk_off_active,
+        "hourly_risk_off_epoch": state.hourly_risk_off_epoch,
+        "hourly_risk_off_context": state.hourly_risk_off_context,
         "readiness_reason": state.readiness_reason,
     }
 

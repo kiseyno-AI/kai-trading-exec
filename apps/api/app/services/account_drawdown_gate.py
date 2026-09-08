@@ -6,25 +6,31 @@ from decimal import Decimal
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy import and_, exists, func, or_, select
+from sqlalchemy.orm import Session, aliased, undefer
 
 from app.broker.base import BrokerAccountHolding, BrokerAccountSnapshot
 from app.core.config import Settings
 from app.models.runtime import (
     BrokerOrder,
+    BrokerOrderEvent,
     ExecutionFill,
     ExecutionPlan,
     ExecutionPlanItem,
     ExecutionPlanItemAudit,
 )
-from app.services.fill_idempotency import dedupe_execution_fills
 from app.services.fifo_inventory import load_fifo_isolation_cursor
 from app.services.fill_idempotency import dedupe_execution_fills
 from app.services.fill_economics import (
     ClosedTradeEconomics,
     closed_trade_economics,
     effective_fill_quantity,
+)
+from app.services.account_drawdown_recovery import (
+    POLICY_DISABLED_RELEASE_EVENT_TYPE,
+    RECOVERABLE_LOSS_GATE_NAMES,
+    RECOVERY_RELEASED_EVENT_TYPE,
+    recovery_account_fingerprint,
 )
 
 
@@ -634,7 +640,170 @@ def latest_account_drawdown_gate_state(
             "gated": False,
             "enabled": False,
             "latest_decision": None,
+            "active_recovery_scopes": {},
         }
+
+    release_event_types = (
+        RECOVERY_RELEASED_EVENT_TYPE,
+        POLICY_DISABLED_RELEASE_EVENT_TYPE,
+    )
+    account_fingerprint = recovery_account_fingerprint(settings)
+    current_recovery_scopes = (
+        f"kis:{account_fingerprint}:krw",
+        f"kis:{account_fingerprint}:usd",
+    )
+    source_audit_released = (
+        exists(
+            select(1).where(
+                ExecutionPlanItemAudit.execution_plan_item_id
+                == BrokerOrder.execution_plan_item_id,
+                ExecutionPlanItemAudit.event_type.in_(release_event_types),
+                ExecutionPlanItemAudit.summary[
+                    "source_broker_order_pk"
+                ].as_string()
+                == BrokerOrder.id,
+            )
+        )
+        .correlate(BrokerOrder)
+    )
+    source_order_event_released = (
+        exists(
+            select(1).where(
+                BrokerOrderEvent.broker_order_pk == BrokerOrder.id,
+                BrokerOrderEvent.event_type.in_(release_event_types),
+            )
+        )
+        .correlate(BrokerOrder)
+    )
+    source_released = or_(source_audit_released, source_order_event_released)
+    visible_recovery_scopes = (
+        current_recovery_scopes
+        if settings.account_drawdown_recovery_scope_secret
+        else None
+    )
+    recovery_sources = db.scalars(
+        select(BrokerOrder)
+        .where(
+            _recoverable_recovery_source_predicate(
+                BrokerOrder,
+                runtime_mode=settings.runtime_mode,
+                recovery_scopes=visible_recovery_scopes,
+            ),
+            ~source_released,
+        )
+        .options(
+            undefer(BrokerOrder.request_metadata),
+            undefer(BrokerOrder.response_metadata),
+            undefer(BrokerOrder.raw_broker_payload),
+        )
+        .order_by(
+            BrokerOrder.last_broker_sync_at.desc(),
+            BrokerOrder.created_at.desc(),
+            BrokerOrder.id.desc(),
+        )
+    ).all()
+    active_recovery_scopes: dict[str, dict[str, object]] = {}
+    latest_active_recovery: tuple[datetime, dict[str, object]] | None = None
+    for source_order in recovery_sources:
+        policy = (
+            source_order.request_metadata.get("account_drawdown_recovery_policy")
+            if isinstance(source_order.request_metadata, dict)
+            else None
+        )
+        recovery_scope = (
+            str(policy.get("recovery_scope"))
+            if isinstance(policy, dict) and policy.get("recovery_scope")
+            else None
+        )
+        if recovery_scope is None or recovery_scope in active_recovery_scopes:
+            continue
+        decision = _broker_order_gate_state(source_order, recovery_scope=recovery_scope)
+        active_recovery_scopes[recovery_scope] = decision
+        occurred_at = source_order.last_broker_sync_at or source_order.created_at
+        if latest_active_recovery is None or _timestamp_for_ordering(
+            occurred_at
+        ) > _timestamp_for_ordering(latest_active_recovery[0]):
+            latest_active_recovery = (occurred_at, decision)
+
+    recovery_source_alias = aliased(BrokerOrder)
+    matching_recovery_source = (
+        exists(
+            select(1).where(
+                _recoverable_recovery_source_predicate(
+                    recovery_source_alias,
+                    runtime_mode=settings.runtime_mode,
+                ),
+                recovery_source_alias.execution_plan_item_id
+                == ExecutionPlanItemAudit.execution_plan_item_id,
+                recovery_source_alias.idempotency_key
+                == ExecutionPlanItemAudit.summary[
+                    "order_idempotency_key"
+                ].as_string(),
+            )
+        )
+        .correlate(ExecutionPlanItemAudit)
+    )
+    policy_source_alias = aliased(BrokerOrder)
+    policy_source_policy = policy_source_alias.request_metadata[
+        "account_drawdown_recovery_policy"
+    ]
+    matching_foreign_policy_source = (
+        exists(
+            select(1).where(
+                policy_source_alias.mode == settings.runtime_mode,
+                policy_source_alias.execution_plan_item_id
+                == ExecutionPlanItemAudit.execution_plan_item_id,
+                policy_source_alias.idempotency_key
+                == ExecutionPlanItemAudit.summary[
+                    "order_idempotency_key"
+                ].as_string(),
+                func.coalesce(
+                    policy_source_policy["policy_version"].as_integer(),
+                    0,
+                )
+                == 1,
+                func.coalesce(
+                    policy_source_policy["recovery_scope"].as_string(),
+                    "",
+                )
+                != "",
+                policy_source_policy["recovery_scope"].as_string().not_in(
+                    current_recovery_scopes
+                ),
+            )
+        )
+        .correlate(ExecutionPlanItemAudit)
+    )
+    released_legacy_source_alias = aliased(BrokerOrder)
+    legacy_release_audit_alias = aliased(ExecutionPlanItemAudit)
+    matching_released_source = (
+        exists(
+            select(1)
+            .select_from(released_legacy_source_alias)
+            .join(
+                legacy_release_audit_alias,
+                and_(
+                    legacy_release_audit_alias.execution_plan_item_id
+                    == released_legacy_source_alias.execution_plan_item_id,
+                    legacy_release_audit_alias.event_type.in_(release_event_types),
+                    legacy_release_audit_alias.summary[
+                        "source_broker_order_pk"
+                    ].as_string()
+                    == released_legacy_source_alias.id,
+                ),
+            )
+            .where(
+                released_legacy_source_alias.mode == settings.runtime_mode,
+                released_legacy_source_alias.execution_plan_item_id
+                == ExecutionPlanItemAudit.execution_plan_item_id,
+                released_legacy_source_alias.idempotency_key
+                == ExecutionPlanItemAudit.summary[
+                    "order_idempotency_key"
+                ].as_string(),
+            )
+        )
+        .correlate(ExecutionPlanItemAudit)
+    )
     audit = db.scalar(
         select(ExecutionPlanItemAudit)
         .join(ExecutionPlanItemAudit.plan_item)
@@ -642,21 +811,155 @@ def latest_account_drawdown_gate_state(
         .where(
             ExecutionPlan.mode == settings.runtime_mode,
             ExecutionPlanItemAudit.event_type == BLOCK_EVENT_TYPE,
+            ~matching_recovery_source,
+            ~matching_released_source,
+            *(
+                (~matching_foreign_policy_source,)
+                if settings.account_drawdown_recovery_scope_secret
+                else ()
+            ),
         )
-        .order_by(ExecutionPlanItemAudit.occurred_at.desc())
+        .options(
+            undefer(ExecutionPlanItemAudit.summary),
+            undefer(ExecutionPlanItemAudit.payload),
+        )
+        .order_by(
+            ExecutionPlanItemAudit.occurred_at.desc(),
+            ExecutionPlanItemAudit.created_at.desc(),
+            ExecutionPlanItemAudit.id.desc(),
+        )
         .limit(1)
+    )
+    order_policy = BrokerOrder.request_metadata["account_drawdown_recovery_policy"]
+    order_gate_summary = BrokerOrder.response_metadata["account_drawdown_gate"]
+    visible_order_scope = or_(
+        order_policy["recovery_scope"].as_string().in_(current_recovery_scopes),
+        and_(
+            func.coalesce(order_policy["recovery_scope"].as_string(), "") == "",
+            or_(
+                order_gate_summary["blocked"].as_boolean().is_(True),
+                func.coalesce(order_gate_summary["gate_name"].as_string(), "")
+                != "",
+            ),
+        ),
     )
     order = db.scalar(
         select(BrokerOrder)
         .where(
             BrokerOrder.mode == settings.runtime_mode,
-            BrokerOrder.response_metadata["account_drawdown_gate"].is_not(None),
+            or_(
+                order_gate_summary["blocked"].as_boolean().is_not(None),
+                func.coalesce(order_gate_summary["gate_name"].as_string(), "")
+                != "",
+                func.coalesce(
+                    order_gate_summary["order_idempotency_key"].as_string(),
+                    "",
+                )
+                != "",
+            ),
+            ~_recoverable_recovery_source_predicate(
+                BrokerOrder,
+                runtime_mode=settings.runtime_mode,
+            ),
+            ~source_released,
+            *(
+                (visible_order_scope,)
+                if settings.account_drawdown_recovery_scope_secret
+                else ()
+            ),
         )
-        .order_by(BrokerOrder.last_broker_sync_at.desc(), BrokerOrder.created_at.desc())
+        .options(
+            undefer(BrokerOrder.response_metadata),
+            undefer(BrokerOrder.raw_broker_payload),
+        )
+        .order_by(
+            BrokerOrder.last_broker_sync_at.desc(),
+            BrokerOrder.created_at.desc(),
+            BrokerOrder.id.desc(),
+        )
         .limit(1)
     )
-    if audit is None and order is None:
-        return {"gated": False, "latest_decision": None}
+    released_source_alias = aliased(BrokerOrder)
+    released_policy = released_source_alias.request_metadata[
+        "account_drawdown_recovery_policy"
+    ]
+    matching_visible_released_source = (
+        exists(
+            select(1).where(
+                released_source_alias.mode == settings.runtime_mode,
+                released_source_alias.last_error_code.in_(
+                    tuple(RECOVERABLE_LOSS_GATE_NAMES)
+                ),
+                released_source_alias.id
+                == ExecutionPlanItemAudit.summary[
+                    "source_broker_order_pk"
+                ].as_string(),
+                or_(
+                    _recoverable_recovery_source_predicate(
+                        released_source_alias,
+                        runtime_mode=settings.runtime_mode,
+                        recovery_scopes=current_recovery_scopes,
+                    ),
+                    func.coalesce(
+                        released_policy["policy_version"].as_integer(),
+                        0,
+                    )
+                    != 1,
+                    func.coalesce(
+                        released_policy["recovery_scope"].as_string(),
+                        "",
+                    )
+                    == "",
+                ),
+            )
+        )
+        .correlate(ExecutionPlanItemAudit)
+    )
+    latest_release = db.scalar(
+        select(ExecutionPlanItemAudit)
+        .join(ExecutionPlanItemAudit.plan_item)
+        .join(ExecutionPlanItem.plan)
+        .where(
+            ExecutionPlan.mode == settings.runtime_mode,
+            ExecutionPlanItemAudit.event_type.in_(release_event_types),
+            matching_visible_released_source,
+        )
+        .options(
+            undefer(ExecutionPlanItemAudit.summary),
+            undefer(ExecutionPlanItemAudit.payload),
+        )
+        .order_by(
+            ExecutionPlanItemAudit.occurred_at.desc(),
+            ExecutionPlanItemAudit.created_at.desc(),
+            ExecutionPlanItemAudit.id.desc(),
+        )
+        .limit(1)
+    )
+    released_event_source_alias = aliased(BrokerOrder)
+    latest_order_release = db.scalar(
+        select(BrokerOrderEvent)
+        .join(
+            released_event_source_alias,
+            released_event_source_alias.id == BrokerOrderEvent.broker_order_pk,
+        )
+        .where(
+            BrokerOrderEvent.event_type.in_(release_event_types),
+            _recoverable_recovery_source_predicate(
+                released_event_source_alias,
+                runtime_mode=settings.runtime_mode,
+                recovery_scopes=visible_recovery_scopes,
+            ),
+        )
+        .options(undefer(BrokerOrderEvent.response_payload))
+        .order_by(
+            BrokerOrderEvent.observed_at.desc(),
+            BrokerOrderEvent.created_at.desc(),
+            BrokerOrderEvent.id.desc(),
+        )
+        .limit(1)
+    )
+
+    legacy_decision: tuple[datetime, bool, dict[str, object]] | None = None
     order_occurred_at = (
         (order.last_broker_sync_at or order.created_at) if order is not None else None
     )
@@ -664,31 +967,135 @@ def latest_account_drawdown_gate_state(
         order_occurred_at is None
         or _timestamp_for_ordering(audit.occurred_at) >= _timestamp_for_ordering(order_occurred_at)
     ):
-        return {
-            "gated": True,
-            "latest_decision": {
+        legacy_decision = (
+            audit.occurred_at,
+            True,
+            {
                 "source": "execution_plan_item_audit",
                 "occurred_at": audit.occurred_at.isoformat(),
                 "execution_plan_item_id": audit.execution_plan_item_id,
                 "summary": audit.summary or {},
                 "payload": audit.payload or {},
             },
+        )
+    elif order is not None and order_occurred_at is not None:
+        order_decision = _broker_order_gate_state(order)
+        legacy_decision = (
+            order_occurred_at,
+            _account_drawdown_decision_is_blocked(
+                summary=order_decision["summary"],
+                payload=order_decision["payload"],
+            ),
+            order_decision,
+        )
+
+    gated_decisions: list[tuple[datetime, dict[str, object]]] = []
+    if latest_active_recovery is not None:
+        gated_decisions.append(latest_active_recovery)
+    if legacy_decision is not None and legacy_decision[1]:
+        gated_decisions.append((legacy_decision[0], legacy_decision[2]))
+    if gated_decisions:
+        latest_decision = max(
+            gated_decisions,
+            key=lambda candidate: _timestamp_for_ordering(candidate[0]),
+        )[1]
+        return {
+            "gated": True,
+            "latest_decision": latest_decision,
+            "active_recovery_scopes": active_recovery_scopes,
         }
+
+    informational_decisions: list[tuple[datetime, dict[str, object]]] = []
+    if legacy_decision is not None:
+        informational_decisions.append((legacy_decision[0], legacy_decision[2]))
+    if latest_release is not None:
+        informational_decisions.append(
+            (
+                latest_release.occurred_at,
+                {
+                    "source": "account_drawdown_recovery_audit",
+                    "event_type": latest_release.event_type,
+                    "occurred_at": latest_release.occurred_at.isoformat(),
+                    "execution_plan_item_id": latest_release.execution_plan_item_id,
+                    "summary": latest_release.summary or {},
+                    "payload": latest_release.payload or {},
+                },
+            )
+        )
+    if latest_order_release is not None:
+        informational_decisions.append(
+            (
+                latest_order_release.observed_at,
+                {
+                    "source": "broker_order_recovery_event",
+                    "event_type": latest_order_release.event_type,
+                    "occurred_at": latest_order_release.observed_at.isoformat(),
+                    "broker_order_pk": latest_order_release.broker_order_pk,
+                    "execution_plan_item_id": None,
+                    "summary": latest_order_release.payload or {},
+                    "payload": latest_order_release.response_payload or {},
+                },
+            )
+        )
+    latest_decision = (
+        max(
+            informational_decisions,
+            key=lambda candidate: _timestamp_for_ordering(candidate[0]),
+        )[1]
+        if informational_decisions
+        else None
+    )
     return {
-        "gated": _account_drawdown_decision_is_blocked(
-            summary=(order.response_metadata or {}).get("account_drawdown_gate") or {},
-            payload=order.raw_broker_payload or {},
-        ),
-        "latest_decision": {
-            "source": "broker_order",
-            "occurred_at": (order.last_broker_sync_at or order.created_at).isoformat(),
-            "order_id": order.id,
-            "order_idempotency_key": order.idempotency_key,
-            "execution_plan_item_id": order.execution_plan_item_id,
-            "summary": (order.response_metadata or {}).get("account_drawdown_gate") or {},
-            "payload": order.raw_broker_payload or {},
-        },
+        "gated": False,
+        "latest_decision": latest_decision,
+        "active_recovery_scopes": active_recovery_scopes,
     }
+
+
+def _broker_order_gate_state(
+    order: BrokerOrder,
+    *,
+    recovery_scope: str | None = None,
+) -> dict[str, object]:
+    state: dict[str, object] = {
+        "source": "broker_order",
+        "occurred_at": (order.last_broker_sync_at or order.created_at).isoformat(),
+        "order_id": order.id,
+        "order_idempotency_key": order.idempotency_key,
+        "execution_plan_item_id": order.execution_plan_item_id,
+        "summary": (order.response_metadata or {}).get("account_drawdown_gate") or {},
+        "payload": order.raw_broker_payload or {},
+    }
+    if recovery_scope is not None:
+        state["recovery_scope"] = recovery_scope
+    return state
+
+
+def _recoverable_recovery_source_predicate(
+    order_model: Any,
+    *,
+    runtime_mode: str,
+    recovery_scopes: tuple[str, ...] | None = None,
+) -> Any:
+    policy = order_model.request_metadata["account_drawdown_recovery_policy"]
+    recovery_scope = policy["recovery_scope"].as_string()
+    conditions = [
+        order_model.mode == runtime_mode,
+        order_model.side == "buy",
+        order_model.status == "rejected",
+        func.coalesce(order_model.last_error_classification == "validation", False),
+        func.coalesce(
+            order_model.last_error_code.in_(tuple(RECOVERABLE_LOSS_GATE_NAMES)),
+            False,
+        ),
+        order_model.broker_order_id.is_(None),
+        order_model.submitted_at.is_(None),
+        func.coalesce(policy["policy_version"].as_integer(), 0) == 1,
+        func.coalesce(recovery_scope, "") != "",
+    ]
+    if recovery_scopes is not None:
+        conditions.append(recovery_scope.in_(recovery_scopes))
+    return and_(*conditions)
 
 
 def account_drawdown_gate_report_lines(gate_state: dict[str, object]) -> list[str]:

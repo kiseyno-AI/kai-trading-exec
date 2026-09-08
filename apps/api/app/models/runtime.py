@@ -48,6 +48,20 @@ class RuntimeControlState(TimestampMixin, Base):
     paused: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     kill_switch_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     automation_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    hourly_risk_off_active: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+    )
+    hourly_risk_off_epoch: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+    )
+    hourly_risk_off_context: Mapped[dict[str, Any] | None] = mapped_column(
+        JSON,
+        deferred=True,
+    )
     readiness_reason: Mapped[str | None] = mapped_column(Text, deferred=True)
     last_transition_action: Mapped[str] = mapped_column(
         String(32),

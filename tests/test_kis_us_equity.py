@@ -659,6 +659,8 @@ def test_kis_us_equity_new_buy_gate_aggregates_all_supported_exchange_snapshots(
                     symbol="AAPL",
                     quantity=1,
                     average_price=Decimal("300"),
+                    unrealized_pnl=Decimal("0"),
+                    unrealized_pnl_pct=Decimal("0"),
                     payload={"ovrs_stck_evlu_amt": "300"},
                 )
             ],
@@ -671,6 +673,8 @@ def test_kis_us_equity_new_buy_gate_aggregates_all_supported_exchange_snapshots(
                     symbol="IBM",
                     quantity=1,
                     average_price=Decimal("250"),
+                    unrealized_pnl=Decimal("0"),
+                    unrealized_pnl_pct=Decimal("0"),
                     payload={"ovrs_stck_evlu_amt": "250"},
                 )
             ],
