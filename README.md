@@ -229,7 +229,7 @@ Interactive OpenAPI is available at `/docs` and `/redoc`.
 
 | Area | Endpoints |
 | --- | --- |
-| Health/runtime | `GET /health`, `/runtime/status`, `/runtime/safety`, `/runtime/daily-board`, `/runtime/portfolio-risk`, `/runtime/alpaca-crypto`, `/runtime/alpaca-us-equity` |
+| Health/runtime | `GET /health`, `/runtime/status`, `/runtime/safety`, `/runtime/daily-board`, `/runtime/portfolio-risk` (`market=all|krx|us`), `/runtime/alpaca-crypto`, `/runtime/alpaca-us-equity` |
 | Broker session | `GET /broker/session`, `POST /broker/session/authenticate`, `POST /broker/session/revoke` |
 | Controls | `POST /controls/pause`, `/controls/resume`, `/controls/kill-switch` |
 | Plans/jobs | `GET/POST /execution-plans`, `POST /execution-plans/preview`, `GET /execution-jobs`, `POST /execution-jobs/dispatch` |

@@ -1,4 +1,4 @@
-from typing import Annotated
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, Body, Depends, Request
 from sqlalchemy.orm import Session
@@ -79,12 +79,14 @@ def runtime_portfolio_risk(
     request: Request,
     db: Annotated[Session, Depends(get_db_session)],
     adapter: Annotated[BrokerAdapter, Depends(get_broker_adapter)],
+    market: Literal["all", "krx", "us"] = "all",
 ) -> dict[str, object]:
     settings: Settings = get_settings(request)
     return build_portfolio_risk_snapshot(
         settings=settings,
         db=db,
         adapter=adapter,
+        market_scope=market,
     )
 
 

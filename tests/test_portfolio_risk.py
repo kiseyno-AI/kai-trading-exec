@@ -2,6 +2,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 from fastapi.testclient import TestClient
+import pytest
 from sqlalchemy import event
 
 from app.broker.base import (
@@ -731,6 +732,61 @@ def test_portfolio_risk_empty_local_scope_queries_krx_and_us_when_enabled() -> N
     assert adapter.calls == ["AMEX", "KRX", "NASD", "NYSE"]
     assert payload["source_status"] == "ok"
     assert payload["account"]["snapshot_exchange"] == "AMEX,KRX,NASD,NYSE"
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("market_scope", "expected_exchanges", "expected_total"),
+    [
+        ("krx", ["KRX"], "9000000.0000"),
+        ("us", ["AMEX", "NASD", "NYSE"], None),
+    ],
+)
+def test_portfolio_risk_market_scope_keeps_domestic_and_us_accounts_separate(
+    market_scope: str,
+    expected_exchanges: list[str],
+    expected_total: str | None,
+) -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        kis_us_trading_enabled=True,
+    )
+    engine, _factory, db = _session(settings)
+    _add_broker_session(db, expires_at=datetime.now(UTC) + timedelta(hours=1))
+    db.commit()
+
+    class ScopedAdapter(PortfolioRiskStubAdapter):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls: list[str] = []
+
+        def get_account_snapshot(self, access_token: str, **kwargs: object) -> BrokerAccountSnapshot:
+            assert access_token == "stored-token"
+            exchange = str(kwargs["exchange"])
+            self.calls.append(exchange)
+            is_krx = exchange == "KRX"
+            return BrokerAccountSnapshot(
+                available_cash=Decimal("1000000") if is_krx else Decimal("1000"),
+                total_asset_value=Decimal("9000000") if is_krx else Decimal("10000"),
+                observed_at=datetime(2026, 6, 20, tzinfo=UTC),
+                source=f"kis:{exchange.lower()}",
+                payload={"currency": "KRW" if is_krx else "USD"},
+            )
+
+    adapter = ScopedAdapter()
+    payload = build_portfolio_risk_snapshot(
+        settings=settings,
+        db=db,
+        adapter=adapter,
+        now=datetime(2026, 6, 20, 3, 0, tzinfo=UTC),
+        market_scope=market_scope,
+    )
+
+    assert adapter.calls == expected_exchanges
+    assert payload["market_scope"] == market_scope
+    assert payload["account"]["total_asset_value"] == expected_total
+    assert "mixed_settlement_currencies" not in str(payload["aggregation_reason"])
     engine.dispose()
 
 
