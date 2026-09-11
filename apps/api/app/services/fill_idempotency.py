@@ -1,12 +1,29 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from hashlib import sha256
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from app.models.runtime import ExecutionFill
+
+
+TERMINAL_FILL_EVIDENCE_STATUSES = (
+    "filled",
+    "canceled",
+    "rejected",
+    "failed",
+    "expired",
+)
+BROKER_FILLED_QUANTITY_KEYS = frozenset(
+    {
+        "filled_quantity",
+        "ft_ccld_qty",
+        "tot_ccld_qty",
+        "ccld_qty",
+    }
+)
 
 
 def execution_fill_idempotency_key(
@@ -77,6 +94,11 @@ def dedupe_execution_fills(fills: list[ExecutionFill]) -> list[ExecutionFill]:
     conflicting_keys = {
         key for key, group in groups.items() if duplicate_fill_economic_conflict(group)
     }
+    conservative_representatives = {
+        key: max(group, key=_fill_chronology_risk_rank)
+        for key, group in groups.items()
+        if key not in conflicting_keys
+    }
 
     seen: set[str] = set()
     unique: list[ExecutionFill] = []
@@ -87,12 +109,22 @@ def dedupe_execution_fills(fills: list[ExecutionFill]) -> list[ExecutionFill]:
         if key in seen:
             continue
         seen.add(key)
-        unique.append(fill)
+        unique.append(conservative_representatives[key])
     return unique
 
 
 def duplicate_fill_economic_conflict(fills: list[ExecutionFill]) -> bool:
     return bool(duplicate_fill_conflicting_fields(fills))
+
+
+def execution_fills_have_conflicting_identity(fills: list[ExecutionFill]) -> bool:
+    groups: dict[str, list[ExecutionFill]] = {}
+    for fill in fills:
+        groups.setdefault(execution_fill_dedupe_key(fill), []).append(fill)
+    return any(
+        len(group) > 1 and duplicate_fill_economic_conflict(group)
+        for group in groups.values()
+    )
 
 
 def duplicate_fill_conflicting_fields(fills: list[ExecutionFill]) -> list[str]:
@@ -105,6 +137,18 @@ def duplicate_fill_conflicting_fields(fills: list[ExecutionFill]) -> list[str]:
     """
 
     field_values = (
+        (
+            "filled_at",
+            {_timestamp_key(fill.filled_at) for fill in fills},
+        ),
+        (
+            "symbol",
+            {str(fill.symbol or "").strip().upper() for fill in fills},
+        ),
+        (
+            "side",
+            {str(fill.side or "").strip().lower() for fill in fills},
+        ),
         ("quantity", {int(fill.quantity) for fill in fills}),
         (
             "base_quantity",
@@ -181,6 +225,29 @@ def _stored_currency_conflict(fill: ExecutionFill) -> bool:
     )
 
 
+def _fill_chronology_risk_rank(fill: ExecutionFill) -> int:
+    """Prefer the duplicate carrying the most conservative chronology proof."""
+
+    payload = fill.payload if isinstance(fill.payload, dict) else {}
+    precision = payload.get("fill_time_precision")
+    if precision == "observed_upper_bound":
+        return 3
+    if precision == "exact":
+        return 0
+    if payload.get("source") == "operator_fill_evidence_repair":
+        return 2
+    if payload.get("price_derivation") == "cumulative_notional_delta" or any(
+        key in payload
+        for key in (
+            "cumulative_quantity",
+            "cumulative_base_quantity",
+            "cumulative_quote_notional",
+        )
+    ):
+        return 2
+    return 1
+
+
 def _timestamp_key(value: datetime) -> str:
     if value.tzinfo is None:
         value = value.replace(tzinfo=UTC)
@@ -193,3 +260,73 @@ def _decimal_key(value: Decimal) -> str:
 
 def _optional_decimal_key(value: Decimal | None) -> str:
     return "" if value is None else _decimal_key(value)
+
+
+def broker_reported_filled_quantity(order: object) -> Decimal | None:
+    """Return conservative positive integer fill evidence from broker payloads."""
+
+    evidence_payloads: list[object] = [
+        getattr(order, "response_metadata", None),
+        getattr(order, "raw_broker_payload", None),
+    ]
+    for event in getattr(order, "events", ()):
+        if str(getattr(event, "event_source", "") or "").strip().lower() not in {
+            "reconciliation",
+            "realtime",
+        }:
+            continue
+        evidence_payloads.extend(
+            (
+                getattr(event, "payload", None),
+                getattr(event, "response_payload", None),
+            )
+        )
+    quantities = [
+        quantity
+        for payload in evidence_payloads
+        for key, value in _nested_payload_items(payload)
+        if key.strip().lower() in BROKER_FILLED_QUANTITY_KEYS
+        for quantity in [_positive_integral_decimal(value)]
+        if quantity is not None
+    ]
+    return max(quantities) if quantities else None
+
+
+def _nested_payload_items(payload: object) -> list[tuple[str, object]]:
+    pending: list[object] = [payload]
+    items: list[tuple[str, object]] = []
+    visited: set[int] = set()
+    while pending:
+        value = pending.pop()
+        if isinstance(value, dict):
+            identity = id(value)
+            if identity in visited:
+                continue
+            visited.add(identity)
+            for key, nested in value.items():
+                items.append((str(key), nested))
+                if isinstance(nested, dict | list):
+                    pending.append(nested)
+        elif isinstance(value, list):
+            identity = id(value)
+            if identity in visited:
+                continue
+            visited.add(identity)
+            pending.extend(value)
+    return items
+
+
+def _positive_integral_decimal(value: object) -> Decimal | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        parsed = Decimal(str(value).replace(",", "").strip())
+    except (InvalidOperation, ValueError):
+        return None
+    if (
+        not parsed.is_finite()
+        or parsed <= 0
+        or parsed != parsed.to_integral_value()
+    ):
+        return None
+    return parsed

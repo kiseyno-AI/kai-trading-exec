@@ -8,9 +8,22 @@ Minimal process and dependency health.
 Current response includes:
 - service name, environment, runtime mode, version
 - process liveness metadata (`process_id`, `started_at`, `uptime_seconds`)
-- dependency statuses for database connectivity and the exec-owned runtime schema
+- dependency statuses for database connectivity, the exec-owned runtime schema,
+  and live execution-account scope readiness
+- runtime-schema evidence includes the exact Alembic head plus required unique
+  constraints, partial unique indexes, and scope-completeness checks; missing or
+  mismatched invariants degrade health even when every expected column exists
+- when any automated runtime is requested, a non-current schema also keeps all
+  KIS and Alpaca background coordinators blocked for the process lifetime;
+  migrate and restart before expecting dispatch, monitoring, or strategy work
 - database pool checked-in, checked-out, overflow, and size diagnostics
-- `status: ok` only when required dependencies are reachable and migrated
+- `status: ok` only when required dependencies are reachable, migrated, and an
+  active live broker route has a stable opaque account scope. KIS is
+  included when its account credentials are configured; Alpaca and Upbit are
+  included only when their live-trading flag is enabled, so dormant secondary
+  credentials do not degrade a KIS-only process. Missing scope responses name
+  only the required setting and affected provider; they never expose an account
+  ID, account number, credential, or HMAC key.
 
 ### `GET /runtime/status`
 Returns:
@@ -25,6 +38,12 @@ Current foundation response includes:
 - `mode`
 - `ready`
 - `readiness.reasons[]`
+- `exec_agent.status` and `exec_agent.enabled`
+- `exec_agent.agent_id` and `exec_agent.expected_model`
+- `exec_agent.provenance_policy` (`exact_agent_and_model`)
+- `exec_agent.trigger_time` / `exec_agent.watch_sizing`
+  - each reports the configured flag and the effective state after the global
+    agent gate; `reason_codes` makes an intentionally disabled agent explicit
 - `broker.provider`
 - `broker.status`
 - `broker.configured`
@@ -54,7 +73,7 @@ does not create trading decisions.
   - `enabled`
   - `dispatch`
     - `worker_name`
-    - `status` (`disabled`, `idle`, `running`, `error`)
+    - `status` (`disabled`, `blocked`, `idle`, `running`, `error`)
     - `poll_interval_seconds`
     - `last_started_at`
     - `last_heartbeat_at`
@@ -63,7 +82,7 @@ does not create trading decisions.
     - `last_cycle`
   - `monitoring`
     - `worker_name`
-    - `status` (`disabled`, `idle`, `running`, `error`)
+    - `status` (`disabled`, `blocked`, `idle`, `running`, `error`)
     - `poll_interval_seconds`
     - `price_source_configured`
     - `last_started_at`
@@ -289,11 +308,19 @@ The runtime migrations create exec-owned runtime tables only:
 - `runtime_control_events`
 - `broker_sessions`
 - `broker_session_events`
+- `core_buy_authority_states`
+- `core_buy_authority_observations`
+- `crypto_daily_bars`
+- `crypto_strategy_states`
+- `crypto_strategy_risk_states`
+- `crypto_strategy_decisions`
 - `execution_plans`
 - `execution_plan_items`
+- `execution_plan_item_audits`
 - `execution_jobs`
 - `broker_orders`
 - `broker_order_events`
+- `execution_failures`
 - `execution_fills`
 - `fifo_inventory_isolations`
 - `runtime_remediation_events`
@@ -395,8 +422,21 @@ Safety control and broker auth actions are additionally audited in:
 
 ## Execution plan intake
 
+### `POST /v4/execution-plans`
+This is the only Core delegation endpoint. It requires the exact v4 request metadata and `delegated_final_full_cost_gate_recheck_v1` capability. The executable capability is currently limited to canonical KIS/stock/KRX/KRW plans. USD or US-equity delegated sizing returns 422 with `unsupported_us_equity_exec_agent_sizing` before plan or job persistence. Each supported entry family contains one buy, one linked target sell, and one linked stop sell. Intake is all-or-none: items remain non-claimable while persisted contract proof is checked, then the complete family is activated in the same commit. The response is accepted only when it includes exact contract metadata, counts, and a one-to-one accepted acknowledgement with durable IDs for every `core_item_key`.
+
+Both request timestamps must be timezone-aware and equal. A buy
+`quantity_policy` must be exactly `type=exec_agent_sized`; executable aliases
+(`kind`, `quantity`, `planned_quantity`, and `computed_quantity`) are rejected
+rather than treated as a delegated share count. Future-market-date plans are
+durable but dormant: they cannot enter the monitoring universe, supersede a
+current watch, populate a runtime buy cache, or pass the final broker boundary
+before their date.
+
+`POST /v4/execution-plans/revocations` atomically fences the exact submitted items. With no committed order or exposure, entry and exits are revoked. Any order that is not conclusively local pre-submission rejected/failed requires manual review; the stale buy and its lease remain non-claimable while protective target/stop exits are preserved. Every result has an exact per-item acknowledgement. Persisted pre-v4 plans marked as Core-originated are reconciled before job claims and direct order placement: every buy is quarantined regardless of its legacy intent spelling, while sell protection is retained.
+
 ### `POST /execution-plans`
-Accept a normalized execution plan from `kai-trading-core`.
+Accept a legacy operator-import plan. This endpoint and its preview reject `source=kai-trading-core` and any Core schema, contract, or capability marker with an upgrade response before plan, item, or job persistence. Core callers must use the v4 endpoint above; legacy permissive parsing is never a compatibility fallback for delegated authority.
 
 Suggested body shape:
 - `plan_id`
@@ -444,10 +484,12 @@ Current item behavior additionally includes:
   simulated fill price in `risk_context.simulated_fill_price`,
   `risk_context.paper_fill_price`, `risk_context.reference_price`, or
   `risk_context.provider_metadata`
-- KIS US-equity items require `asset_class=us_equity`, `provider=kis`,
+- Legacy/operator KIS US-equity items require `asset_class=us_equity`, `provider=kis`,
   `venue=kis`, `market=US`, `currency=USD`, and an order exchange of `NASD`,
   `NYSE`, or `AMEX`. Routing fields are preserved in `risk_context`; jobs are
   scheduled for 09:30 `America/New_York` and require an explicit limit price.
+  This does not apply to Core v4 `exec_agent_sized` plans, which remain blocked
+  until a currency-aware USD sizing capability is implemented end to end.
 
 ### `POST /execution-plans/preview`
 Runs execution-plan intake, exec-agent decision/sizing, job materialization, and
@@ -479,7 +521,11 @@ broker/account snapshot before approval, applies risk-by-stop-distance sizing,
 cash/holding/open-order/budget, per-symbol, and daily new-buy rails, writes the
 approved share quantity and deterministic idempotency key into
 `quantity_policy`, and materializes partial/final target, stop, and time-stop
-monitoring items. When the first partial take-profit monitor submits, exec
+monitoring items. The asynchronous response is applied only after Exec locks and
+rebuilds the current candidate and its server-owned action envelope. A changed
+target, stop, route, status, risk context, expired binding, or stale account
+snapshot invalidates the response and requires a new sizing decision. When the
+first partial take-profit monitor submits, exec
 rearms the sibling stop monitor to the remaining quantity near breakeven so the
 unrealized remainder is no longer protected by the original loss stop. Invalid
 or rejected decisions persist as `exec_agent_rejected`
@@ -568,6 +614,19 @@ Current response includes:
 ### `GET /orders`
 List stored broker orders for the active runtime mode.
 Current readback includes `source_identity` when the order is tied to an accepted execution-plan item.
+Orders that reached the final broker boundary include a canonical
+`request_metadata.execution_scope` containing only `policy_version`, provider,
+an opaque 24-character account scope, broker venue, asset class, and market
+exchange. The venue is the broker execution lane; exchange is the actual market
+and remains distinct so `NASD` and `NYSE` inventory cannot share FIFO lots. This scope is
+committed before placement and remains immutable across retries and broker
+success/error metadata. Live submission fails before `place_order` when stable
+account proof is unavailable. Account identifier keys are recursively removed
+from persisted order metadata, raw broker payloads, and order-event JSON.
+The final normalized command and boundary event are committed before the broker
+call. A new transaction then reacquires the account advisory lock and order-row
+lock and revalidates runtime, plan or intent, identity, route, protective-stop,
+and market-freshness authority before submission.
 
 ### `GET /executions`
 List stored execution fills for the active runtime mode.
@@ -575,7 +634,40 @@ Current readback includes `source_identity` when the fill is tied to a broker or
 
 ### `GET /positions`
 List stored execution positions for the active runtime mode.
+
+Query parameters:
+
+- `symbols`: optional comma-separated display filter
+- `external_plan_id` and `execution_plan_id`: optional only as a pair; when
+  either is supplied, both are required and the internal ID must belong to the
+  exact external plan in the active runtime mode
+
+Plan-scoped callers receive only positions on routes proven by persisted plan
+items. Each row includes `position_scope_proof` with both plan IDs plus provider,
+opaque account scope, and exchange. Missing, mismatched, or incomplete scope
+evidence returns `409`; consumers must treat that as unavailable broker truth
+and must not retry through an unscoped symbol-only read.
+
+The storage invariant is exactly one row per `(runtime mode, provider, opaque
+account scope, exchange, symbol)`. Broker reconciliation uses that complete key
+and fails closed before any cross-route mutation. Raw broker account IDs and
+credentials are not stored. Live derivation from an Alpaca broker account ID or
+configured KIS account uses HMAC-SHA256 and requires the stable
+`KAI_EXEC_ACCOUNT_DRAWDOWN_RECOVERY_SCOPE_SECRET` with at least 32 UTF-8 bytes;
+blank or shorter keys keep live readiness degraded. Rotating broker credentials
+therefore does not change identity. Providers without a stable broker ID, or a
+deployment that cannot safely key raw account material, require the stable,
+non-secret `KAI_EXEC_EXECUTION_POSITION_ACCOUNT_SCOPE` route label. That label
+must never contain an account number or credential. Migrated legacy rows have
+nullable route columns and are not consumed by route-specific logic until an
+unambiguous reconciliation safely binds them.
 Current readback includes `source_identities[]` aggregated from related execution-plan items for that symbol.
+
+`GET /symbols` aggregates quantities across explicit position routes and reports
+`position_route_count` plus `position_scope_complete`. `GET /symbols/{symbol}`
+returns every route in `positions[]`; its backward-compatible singular
+`position` is `null` when more than one route exists, with
+`position_ambiguity.reason=multiple_execution_position_routes`.
 
 `GET /executions` and `GET /positions` reflect durable exec-owned broker truth as fills
 and position updates arrive. Order acknowledgement alone does not create fill or
@@ -684,6 +776,19 @@ zeroed; they receive explicit manual-review events. The script has no order
 submission, amendment, or cancellation path and live mode requires an explicit
 database URL.
 
+Legacy non-flat positions whose provider/account/exchange fields are still null
+are intentionally excluded from the ordinary stale-truth apply path. After all
+writers are drained, run `--legacy-attribution-exchange` for exactly one of
+`KRX`, `NASD`, `NYSE`, or `AMEX`. The default is a broker-read-only dry-run. An
+apply requires one or more exact `--approve-position POSITION_ID=64HEX`
+fingerprints copied from that dry-run plus `--actor` and `--reason`. The service
+re-reads complete broker holdings, verifies exact account/exchange/quantity/
+average-price evidence under row locks, and rolls back the entire apply on drift
+or collision. There is no approve-all or inferred-route mode. Any remaining
+non-flat unscoped row keeps startup blocked; restart after the final successful
+apply and verify the runtime-schema/startup-gate health fields. The complete
+sequence is documented in `docs/DEPLOYMENT.md`.
+
 `active_broker_order_summary.actionable_order_count`,
 `actionable_status_counts`, and the compatibility field
 `nonterminal_status_counts` use the same status, freshness, and trust filters as
@@ -717,12 +822,33 @@ active plan intent before submitting through the normal `/orders` idempotency
 path. Permanent rejects such as insufficient cash or insufficient sellable
 quantity record `skipped` and do not create retry jobs.
 
+Every retry command must reproduce the source order's persisted provider,
+opaque account scope, venue, asset class, exchange, plan item, failure/attempt,
+and idempotency lineage. A session-driven route change fails with
+`retry_route_authority_changed`, creates no new broker order, and moves the
+source lineage to manual review. Invalid or incomplete lineage fails with
+`retry_lineage_authority_invalid`. Only an exact replay with conclusive
+pre-submit-failure evidence may remove its own local reservation from the new
+capital or sell-quantity calculation.
+
+Alpaca's account `buying_power` is already net of broker-visible open orders, so
+Exec does not subtract those open orders a second time. It still subtracts local
+capital reservations that Alpaca cannot yet see, including durable pre-submit
+intents; KIS and Upbit continue to combine broker-open and unmatched local
+reservations. Unknown live reservation amounts fail closed.
+
 When a due KIS buy is held by account-drawdown recovery, dispatch leaves the job
 scheduled instead of treating the durable rejected source order as a terminal
 job failure. When the recovery response supplies `retry_after_at`, dispatch moves
 `scheduled_for` to that time instead of polling through the cooldown. A later
 attempt still rebuilds and validates the current job/order request before it can
 add a recovery observation or submit.
+
+Running-job recovery uses a route-aware lease. For KIS US-equity jobs the lease
+covers the adapter's full bounded balance/open-order pagination graph across the
+three supported exchanges, plus buying-power and final-boundary calls. A healthy
+long account check is therefore not reclaimed as a crashed job; recovery still
+uses the shorter bounded lease for routes with a smaller request graph.
 
 ### `POST /execution-jobs/dispatch`
 Manually dispatch due execution jobs through the broker adapter boundary.
@@ -810,21 +936,29 @@ current scheduler:
 List broker orders with internal normalized statuses.
 
 ### `POST /orders`
-Submit an initial broker order through the KIS adapter boundary.
+Submit an initial broker order through the adapter selected by `provider`.
 
 Suggested body shape:
 - `idempotency_key`
 - `execution_plan_item_id` (optional but recommended when tied to an accepted plan item)
 - `symbol`
 - `side` (`buy`, `sell`)
-- `quantity`
+- exactly one route-supported sizing field: `quantity`, `base_quantity`, or
+  `quote_notional`
 - `order_type` (`limit`, `market`)
 - `limit_price` (required for `limit`, omitted for `market`)
-- `time_in_force` (`day`)
-- `provider` (`kis`)
-- `asset_class` (`stock` or `us_equity`)
-- `venue` (`kis` for US equities)
-- `exchange` (`KRX`, `SOR`, `NASD`, `NYSE`, `AMEX`)
+- `time_in_force` (`day`, `gtc`, or `ioc`, constrained by route)
+- `provider` (`kis`, `alpaca`, or `upbit`)
+- `asset_class` (`stock`, `us_equity`, or `crypto`)
+- `venue` and `exchange` for the exact broker route
+
+| Route | Required execution shape |
+| --- | --- |
+| KIS Korean stock | `provider=kis`, `asset_class=stock`, `exchange=KRX|NXT|SOR`, integer `quantity`, and `time_in_force=day`; only a KRX limit order may use `ioc` |
+| KIS US equity | `provider=kis`, `asset_class=us_equity`, `venue=kis`, `exchange=NASD|NYSE|AMEX`, integer `quantity`, day limit order, and an approved execution-plan item |
+| Alpaca US equity | `provider=alpaca`, `asset_class=us_equity`, `exchange=US`, exactly one of `base_quantity` or `quote_notional`, and `time_in_force=day`; quote notional is limited to market buys |
+| Alpaca crypto | `provider=alpaca`, `asset_class=crypto`, `exchange=ALPACA`, exactly one of `base_quantity` or `quote_notional`, and `time_in_force=gtc|ioc`; quote notional is limited to market buys |
+| Upbit crypto | `provider=upbit`, `asset_class=crypto`, `exchange=UPBIT`, exactly one of `base_quantity` or `quote_notional`, and `time_in_force=day`; execution is paper-only and live requests fail closed |
 
 For KIS US equities, `/orders` rejects requests that are not linked to an
 approved execution-plan item. Only integer-share `day` limit orders are
@@ -843,22 +977,31 @@ skew by default.
 Snapshots that are unavailable, stale, future-dated, incomplete for any enabled
 gate, or still unhealthy fail closed and reset progress.
 
-For a plan-linked source, only the same automated monitoring, execution-job, or
-short-term-watcher intent can advance observations while the gate is enabled.
-For an unlinked direct KIS stock source, only an exact replay of the original
-normalized `POST /orders` command—including every economic field and the same
-idempotency key—can advance it. A changed payload, another plan item, symbol, or
-idempotency key cannot bypass or accelerate recovery. On release, Exec preserves
-the source order as `rejected`, appends recovery evidence to plan-item audits or
-the unlinked source's broker-order events, and submits the current validated
-candidate using a deterministic child idempotency generation. Runtime controls,
-plan/trigger or job validity, session/route, cash and buying power, exposure, and
-reliable open-order truth remain mandatory. Current-policy metadata prevents
-deployment alone from reviving legacy rejected rows. The current policy marker
-and exact opaque account scope are required even when an operator disables the
-loss gate; disabling it bypasses only the health-threshold wait for that same
-proven scope. A terminal or operator-cancelled source is not resurrected and
-requires reviewed operator remediation before its account lane can trade again.
+An eligible automated new-buy candidate in the exact provider, opaque-account,
+and settlement-currency scope may contribute recovery observations even when
+the blocked source was direct, cancelled, or expired. It only reads
+authoritative account truth and records progress; it cannot become a recovery
+order. An eligible exact replay of a still-live original source may also advance
+recovery. Cross-account, cross-currency, ineligible, manual, or otherwise
+unproven requests cannot bypass or accelerate the latch.
+
+On release, Exec preserves the source order as `rejected` and appends recovery
+evidence to plan-item audits or the unlinked source's broker-order events. An
+observer release returns `account_drawdown_recovery_fresh_candidate_required`
+without submitting anything. The original rejected, cancelled, or expired item
+is immutable and is never resurrected; a fresh candidate on a later cycle must
+repeat every runtime, session, route, trigger, quote, sizing, cash, buying-power,
+exposure, and broker-boundary fence. Current-policy metadata prevents deployment
+alone from reviving legacy rejected rows. The current policy marker and exact
+opaque account scope remain required even when an operator disables the loss
+gate; disabling it bypasses only the health-threshold wait for that proven scope.
+Reviewed operator remediation is required only when the original account scope
+or recovery lineage can no longer be proved, not merely because the source is
+terminal.
+Runtime status and order admission share the same exact-release predicate: the
+source primary key, canonical recovery key, current generation, current policy
+fingerprint, and durable released state must all agree. An isolated or stale
+release event cannot clear the lane.
 
 Every KIS submission intent records an opaque `broker_account_scope`. A
 pre-broker runtime-safety rejection is reusable only under that same scope;
@@ -872,7 +1015,8 @@ An initial loss block returns `409` with `blocked`, `block_reason`,
 lineage, observation progress when available, and the latest decision summary.
 
 `KAI_EXEC_ACCOUNT_DRAWDOWN_RECOVERY_SCOPE_SECRET` supplies a stable HMAC key for
-the opaque account scope and should be kept constant across KIS credential
+the opaque account scope, must contain at least 32 UTF-8 bytes for live raw
+account identity, and should be kept constant across KIS credential
 rotation. When unset, Exec falls back to the KIS app secret and then app key for
 backward compatibility; changing that fallback changes the recovery scope. An
 orphaned same-provider/currency latch then fails closed with
@@ -961,6 +1105,8 @@ Current response includes:
 - `api_base_url`
 - `access_token_present`
 - `access_token_expires_at`
+- `token_generation` (opaque shared-cache generation; never an access token)
+- `token_refresh_after`
 - `approval_key_present`
 - `approval_key_issued_at`
 - `shared_realtime_subscriptions_supported`
@@ -973,7 +1119,8 @@ Current response includes:
 - `last_error`
 
 ### `POST /broker/session/authenticate`
-Issue or reuse a KIS access token for the active runtime mode.
+Issue or reuse the authoritative shared KIS access token for the active runtime
+mode. The database session is a mirror, not a fallback source.
 
 Suggested body shape:
 - `actor`
@@ -990,4 +1137,6 @@ Current response includes:
 - `session` (current `GET /broker/session` payload)
 
 ### `POST /broker/session/revoke`
-Revoke the currently stored KIS access token and clear the local broker session.
+CAS-tombstone the authoritative shared KIS access token first, then request
+remote revocation and clear the local broker-session mirror. A remote failure
+does not restore the locally revoked token.

@@ -1,12 +1,23 @@
 from __future__ import annotations
 
+from copy import deepcopy
 import threading
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
+import json
+from pathlib import Path
+from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
-from sqlalchemy import select
+import pytest
 
-from app.api.schemas.execution import MonitoringEvaluationRequest, MonitoringPriceRequest
+from sqlalchemy import UniqueConstraint, select
+
+from app.api.schemas.execution import (
+    ExecutionPlanRequest,
+    MonitoringEvaluationRequest,
+    MonitoringPriceRequest,
+)
 from app.broker.base import (
     BrokerAdapterError,
     BrokerAccountHolding,
@@ -25,8 +36,20 @@ from app.broker.base import (
 from app.core.config import Settings
 from app.db.base import Base
 from app.db.session import create_db_engine, create_session_factory
-from app.models.runtime import BrokerOrder, BrokerOrderEvent, ExecutionPlan, ExecutionPlanItem, ExecutionPlanItemAudit
+from app.models.runtime import BrokerOrder, BrokerOrderEvent, ExecutionJob, ExecutionPlan, ExecutionPlanItem, ExecutionPlanItemAudit
 from app.services import watch_exec_agent_sizing as watch_sizing
+from app.services.openclaw_runtime_contract import runtime_contract_proof_is_valid
+from openclaw_contract_test_support import (
+    matching_runtime_contract_snapshot,
+    verified_runtime_contract_proof,
+)
+from app.services.exec_agent_approval import (
+    assess_buy_economics,
+    configured_execution_cost_evidence,
+    delegated_buy_gate_rejections,
+)
+from app.services.json_compaction import json_payload_hash
+from app.services.execution_account_route import bind_kis_account_route
 from app.services.monitoring import (
     LIVE_WATCH_BUY_VETO_EVENT_TYPE,
     _resolve_watch_buy_order,
@@ -35,7 +58,12 @@ from app.services.monitoring import (
     evaluate_monitoring,
     list_autonomous_monitoring_symbols,
 )
+from app.services.position_identity import (
+    build_position_identity,
+    execution_scope_payload,
+)
 from app.services.runtime import RuntimeMetadata, build_runtime_daily_board, build_runtime_status
+from app.services.execution_api import create_execution_plan
 from app.services.watch_exec_agent_sizing import (
     _apply_decisions,
     _applicable_decision_ids,
@@ -89,7 +117,15 @@ class WatchSizingBrokerStub:
     def get_current_price(self, access_token: str, *, symbol: str, exchange: str = "KRX") -> BrokerCurrentPrice | None:
         return None
 
-    def get_account_snapshot(self, access_token: str) -> BrokerAccountSnapshot:
+    def get_account_snapshot(
+        self,
+        access_token: str,
+        *,
+        symbols: list[str] | None = None,
+        reference_prices: dict[str, Decimal] | None = None,
+        exchange: str = "KRX",
+    ) -> BrokerAccountSnapshot:
+        del symbols, reference_prices, exchange
         self.events.append("snapshot")
         if self.snapshot_error is not None:
             raise self.snapshot_error
@@ -98,8 +134,9 @@ class WatchSizingBrokerStub:
         return BrokerAccountSnapshot(
             available_cash=Decimal("10000000"),
             buying_power=Decimal("10000000"),
-            observed_at=datetime(2026, 6, 4, 0, 1, tzinfo=UTC),
+            observed_at=datetime(2026, 6, 4, 0, 0, tzinfo=UTC),
             source="stub:account_snapshot",
+            broker_account_id="watch-sizing-test-account",
         )
 
     def reconnect_handle(self) -> BrokerReconnectHandle:
@@ -119,6 +156,8 @@ def _watch_item(
     item_id: str = "watch-item-1",
     symbol: str = "005930",
     risk_context: dict[str, object] | None,
+    trigger_price: str = "71000",
+    limit_price: str = "71500",
 ) -> ExecutionPlanItem:
     return ExecutionPlanItem(
         id=item_id,
@@ -127,10 +166,50 @@ def _watch_item(
         side="buy",
         intent="intraday_watch_buy",
         status="watch_monitoring_pending",
-        trigger_price=Decimal("71000"),
-        limit_price=Decimal("71500"),
-        quantity_policy={"type": "exec_agent_sized", "budget_krw": "1500000"},
+        trigger_price=Decimal(trigger_price),
+        limit_price=Decimal(limit_price),
+        quantity_policy={
+            "type": "exec_agent_sized",
+            "budget_krw": "1500000",
+            "estimated_round_trip_cost_bps": "20",
+        },
         risk_context=risk_context,
+    )
+
+
+def _next_open_watch_item(
+    *,
+    item_id: str = "next-open-item-1",
+    symbol: str = "005930",
+    estimated_reference_price: str = "71500",
+    target_price: str | None = "76000",
+    stop_price: str | None = "69000",
+) -> ExecutionPlanItem:
+    risk_context: dict[str, object] = {
+        "exchange": "KRX",
+        "estimated_round_trip_cost_bps": "20",
+    }
+    if target_price is not None:
+        risk_context["target_price"] = target_price
+    if stop_price is not None:
+        risk_context["stop_price"] = stop_price
+    return ExecutionPlanItem(
+        id=item_id,
+        plan_item_index=0,
+        symbol=symbol,
+        side="buy",
+        intent="next_open_buy",
+        status="watch_monitoring_pending",
+        trigger_price=None,
+        limit_price=None,
+        time_in_force="day",
+        quantity_policy={
+            "type": "exec_agent_sized",
+            "budget_krw": "150000",
+            "estimated_reference_price": estimated_reference_price,
+        },
+        risk_context=risk_context,
+        decision_agent_name="signal-decider",
     )
 
 
@@ -139,8 +218,59 @@ def _watch_veto_settings(**overrides) -> Settings:
         runtime_mode="live",
         automation_enabled=True,
         market_regime_breadth_max_age_seconds=300,
+        execution_position_account_scope="watch-sizing-test-route",
         **overrides,
     )
+
+
+def _fresh_account_context(**overrides: object) -> dict[str, object]:
+    context: dict[str, object] = {
+        "available": True,
+        "buy_sizing_available": True,
+        "observed_at": datetime.now(UTC).isoformat(),
+        "orderable_cash_krw": "10000000",
+        "buying_power_krw": "10000000",
+        "holdings": [],
+        "open_orders": [],
+    }
+    context.update(overrides)
+    return context
+
+
+_DIRECT_APPLY_REQUEST_PAYLOAD: dict[str, object] = {
+    "test_scope": "direct-watch-apply",
+}
+
+
+def _verified_sizing_runtime(
+    settings: Settings | None = None,
+    *,
+    session_id: str = "test-watch-sizing-session",
+    request_payload: dict[str, object] | None = None,
+) -> dict[str, object]:
+    resolved = settings or Settings()
+    provider, model = resolved.exec_agent_model.split("/", 1)
+    requested_session_key = f"test-requested-{session_id}"
+    bound_request = request_payload or _DIRECT_APPLY_REQUEST_PAYLOAD
+    request_sha256 = json_payload_hash(watch_sizing._json_safe(bound_request))
+    return {
+        "agent_id": resolved.exec_agent_id,
+        "configured_agent_id": resolved.exec_agent_id,
+        "configured_model_hint": resolved.exec_agent_model,
+        "actual_agent_id": resolved.exec_agent_id,
+        "actual_provider": provider,
+        "actual_model": model,
+        "actual_model_ref": resolved.exec_agent_model,
+        "session_id": session_id,
+        "requested_session_key": requested_session_key,
+        "request_sha256": request_sha256,
+        "runtime_contract": verified_runtime_contract_proof(
+            expected_model_ref=resolved.exec_agent_model,
+            requested_session_key=requested_session_key,
+            reported_session_id=session_id,
+            request_sha256=request_sha256,
+        ),
+    }
 
 
 def _watch_veto_plan(
@@ -166,7 +296,7 @@ def _watch_veto_plan(
                 symbol=symbol,
                 risk_context={
                     "exchange": "KRX",
-                    "target_price": "76000",
+                    "target_price": "78000",
                     "stop_price": "69000",
                     **risk_context,
                 },
@@ -200,14 +330,27 @@ def _price(
     day_high: Decimal | None = Decimal("72000"),
     day_low: Decimal | None = Decimal("70000"),
 ) -> MonitoringPriceRequest:
+    observed_at = datetime(2026, 8, 18, 1, 5, tzinfo=UTC)
     return MonitoringPriceRequest(
         symbol="005930",
         price=Decimal("71000"),
-        observed_at=datetime(2026, 8, 18, 1, 5, tzinfo=UTC),
+        observed_at=observed_at,
+        freshness_source="kis_exchange_orderbook_time",
+        bid=Decimal("70990"),
+        ask=Decimal("71010"),
         turnover=turnover,
         volume=volume,
         day_high=day_high,
         day_low=day_low,
+        provenance={
+            "field_sources": {
+                side: {
+                    "freshness_source": "kis_exchange_orderbook_time",
+                    "observed_at": observed_at.isoformat(),
+                }
+                for side in ("bid", "ask")
+            }
+        },
     )
 
 
@@ -289,6 +432,51 @@ def test_live_watch_buy_stale_breadth_fails_closed_without_override() -> None:
     assert payload is not None
     assert payload["market_regime_reason_code"] == "market_breadth_stale_caution"
     assert payload["override"] is None
+
+
+def test_live_watch_buy_without_breadth_observation_time_fails_closed() -> None:
+    breadth = _fresh_breadth()
+    breadth.pop("observed_at")
+
+    approval, _, payload = _resolve_live_watch_veto(
+        settings=_watch_veto_settings(),
+        risk_context={"market_breadth": breadth},
+        price=_price(),
+    )
+
+    assert approval.quantity is None
+    assert approval.reason == "market_breadth_stale"
+    assert payload is not None
+    assert payload["market_regime_reason_code"] == "market_breadth_stale_caution"
+
+
+@pytest.mark.parametrize(
+    ("market_date", "observed_at"),
+    [
+        ("2026-08-18", "2026-08-18T01:00:00"),
+        ("2026-08-18", "2026-08-18T01:10:00+00:00"),
+        ("2026-08-19", "2026-08-18T01:00:00+00:00"),
+    ],
+)
+def test_live_watch_buy_rejects_untrustworthy_breadth_time_provenance(
+    market_date: str,
+    observed_at: str,
+) -> None:
+    approval, _, payload = _resolve_live_watch_veto(
+        settings=_watch_veto_settings(),
+        risk_context={
+            "market_breadth": _fresh_breadth(
+                market_date=market_date,
+                observed_at=observed_at,
+            )
+        },
+        price=_price(),
+    )
+
+    assert approval.quantity is None
+    assert approval.reason == "market_breadth_stale"
+    assert payload is not None
+    assert payload["market_regime_reason_code"] == "market_breadth_stale_caution"
 
 
 def test_live_watch_buy_downsize_flag_false_blocks_market_guardrail_downsize_reasons() -> None:
@@ -447,9 +635,10 @@ def test_monitoring_cycle_persists_live_veto_status_and_operator_summaries() -> 
                 market_date=date(2026, 8, 18),
                 mode="live",
                 items=[
-                    _watch_item(
-                        item_id="watch-live-cycle-veto",
-                        symbol="005930",
+                        _watch_item(
+                            item_id="watch-live-cycle-veto",
+                            symbol="005930",
+                            trigger_price="71010",
                         risk_context={
                             "exchange": "KRX",
                             "target_price": "76000",
@@ -461,7 +650,16 @@ def test_monitoring_cycle_persists_live_veto_status_and_operator_summaries() -> 
             )
             item = plan.items[0]
             item.status = "watch_monitoring_active"
+            item.provider = "kis"
+            item.venue = "KRX"
+            item.asset_class = "stock"
             item.quantity_policy = {"kind": "shares", "quantity": 10}
+            item.risk_context, item.quantity_policy = bind_kis_account_route(
+                settings=settings,
+                provider="kis",
+                risk_context=item.risk_context,
+                quantity_policy=item.quantity_policy,
+            )
             session.add(plan)
             session.commit()
 
@@ -477,7 +675,10 @@ def test_monitoring_cycle_persists_live_veto_status_and_operator_summaries() -> 
             assert result.status_code == 200
             item = session.get(ExecutionPlanItem, "watch-live-cycle-veto")
             assert item is not None
-            assert item.status == "watch_buy_rejected"
+            # A live market veto is recoverable: retain the triggered item so a
+            # later healthy observation can re-evaluate it instead of making
+            # the market-state block terminal.
+            assert item.status == "watch_buy_triggered_blocked"
             audit = session.scalar(
                 select(ExecutionPlanItemAudit).where(
                     ExecutionPlanItemAudit.execution_plan_item_id == item.id,
@@ -501,7 +702,7 @@ def test_monitoring_cycle_persists_live_veto_status_and_operator_summaries() -> 
             )
             assert status["watch_buy_vetoes"] == {"today_count": 1, "today_symbols": ["005930"]}
             assert board["watch_buy_vetoes"] == {"today_count": 1, "today_symbols": ["005930"]}
-            assert board["symbols"][0]["latest_plan_item_status"] == "watch_buy_rejected"
+            assert board["symbols"][0]["latest_plan_item_status"] == "watch_buy_triggered_blocked"
     finally:
         engine.dispose()
 
@@ -537,6 +738,11 @@ def test_issue_231_weekly_candidate_replay_fixture_demonstrates_veto_impact() ->
 
 
 def _stale_local_order(*, symbol: str = "005930", broker_order_id: str = "stale-open-1") -> BrokerOrder:
+    identity = build_position_identity(
+        settings=Settings(runtime_mode="paper"),
+        provider="kis",
+        exchange="KRX",
+    )
     return BrokerOrder(
         broker_name="kis",
         mode="paper",
@@ -548,6 +754,16 @@ def _stale_local_order(*, symbol: str = "005930", broker_order_id: str = "stale-
         quantity=2,
         submitted_at=datetime(2026, 6, 3, 0, 0, tzinfo=UTC),
         last_broker_sync_at=datetime(2026, 6, 3, 0, 0, tzinfo=UTC),
+        venue="KRX",
+        asset_class="stock",
+        request_metadata={
+            "exchange": "KRX",
+            "execution_scope": execution_scope_payload(
+                identity=identity,
+                venue="KRX",
+                asset_class="stock",
+            ),
+        },
     )
 
 
@@ -608,95 +824,6 @@ def test_blocked_watch_buy_still_loads_for_exec_agent_sizing(tmp_path) -> None:
         )
 
     assert [plan.external_plan_id for plan in plans] == ["plan-blocked-only"]
-
-
-def test_short_transaction_batches_candidates_across_single_item_plans(tmp_path, monkeypatch) -> None:
-    settings = Settings(
-        database_url=f"sqlite:///{tmp_path / 'watch-sizing-multi-plan.db'}",
-        runtime_mode="paper",
-        exec_agent_enabled=True,
-        exec_agent_watch_sizing_enabled=True,
-        exec_agent_watch_sizing_start_local_time="00:00",
-        exec_agent_watch_sizing_end_local_time="23:59",
-        exec_agent_watch_sizing_batch_size=3,
-        exec_agent_watch_sizing_max_batches_per_cycle=1,
-        exec_agent_watch_sizing_min_notional_krw=Decimal("50000"),
-        exec_agent_watch_sizing_high_conviction_min_notional_krw=Decimal("50000"),
-    )
-    engine = create_db_engine(settings)
-    Base.metadata.create_all(engine)
-    session_factory = create_session_factory(engine)
-
-    with session_factory() as session:
-        for index, symbol in enumerate(("005930", "000660", "035420"), start=1):
-            item = _watch_item(
-                item_id=f"watch-item-{index}",
-                symbol=symbol,
-                risk_context={
-                    "target_price": "76000",
-                    "stop_price": "69000",
-                    "execution_feasibility_context": {"max_safe_notional_krw": "800000"},
-                },
-            )
-            item.status = "watch_buy_triggered_blocked"
-            session.add(
-                ExecutionPlan(
-                    external_plan_id=f"plan-{symbol}",
-                    strategy_run_id="strategy-1",
-                    source="core-short-term-decider",
-                    market_date=date(2026, 6, 4),
-                    mode="paper",
-                    items=[item],
-                )
-            )
-        session.commit()
-
-    calls: list[list[str]] = []
-
-    def fake_decisions(*, payload, **_) -> dict[str, object]:
-        calls.append([str(candidate["execution_plan_item_id"]) for candidate in payload["candidates"]])
-        return {
-            "version": "manual-exec-agent-watch-sizing-v1",
-            "decisions": [
-                {
-                    "execution_plan_item_id": candidate["execution_plan_item_id"],
-                    "symbol": candidate["symbol"],
-                    "action": "approve",
-                    "quantity": 1,
-                    "approved_notional_krw": 71500,
-                    "sizing_price": candidate["chase_limit_price"] or candidate["trigger_price"],
-                    "confidence": 0.5,
-                    "target_profile": "tactical_2pct",
-                    "reason_code": "test_approve",
-                    "reason": "fixture approval",
-                }
-                for candidate in payload["candidates"]
-            ],
-        }
-
-    monkeypatch.setattr(watch_sizing, "_request_exec_agent_decisions", fake_decisions)
-
-    result = run_due_watch_exec_agent_sizing(
-        settings=settings,
-        session_factory=session_factory,
-        now=datetime(2026, 6, 4, 0, 0, tzinfo=UTC),
-    )
-
-    assert calls == [["watch-item-1", "watch-item-2", "watch-item-3"]]
-    assert result.payload["batches_processed"] == 1
-    assert sum(summary["approved"] for summary in result.payload["applied"]) == 3
-
-    with session_factory() as session:
-        statuses = {
-            item.id: item.status
-            for item in session.query(ExecutionPlanItem).order_by(ExecutionPlanItem.id).all()
-        }
-
-    assert statuses == {
-        "watch-item-1": "watch_buy_triggered_blocked",
-        "watch-item-2": "watch_buy_triggered_blocked",
-        "watch-item-3": "watch_buy_triggered_blocked",
-    }
 
 
 def test_live_watch_sizing_waits_when_account_snapshot_is_unavailable(tmp_path, monkeypatch) -> None:
@@ -802,7 +929,7 @@ def test_live_watch_sizing_blocks_when_broker_open_order_truth_is_degraded(
         snapshot=BrokerAccountSnapshot(
             available_cash=Decimal("10000000"),
             buying_power=Decimal("10000000"),
-            observed_at=datetime(2026, 6, 4, 0, 1, tzinfo=UTC),
+                observed_at=datetime(2026, 6, 4, 0, 0, tzinfo=UTC),
             source="kis:account_snapshot",
             open_orders=[],
             payload={
@@ -832,7 +959,7 @@ def test_live_watch_sizing_blocks_when_broker_open_order_truth_is_degraded(
         "available": False,
         "status": "degraded",
         "source": "kis:account_snapshot",
-        "observed_at": "2026-06-04T00:01:00+00:00",
+        "observed_at": "2026-06-04T00:00:00+00:00",
         "error_code": "KIER2570",
         "reason": "broker open-order lookup returned degraded truth",
     }
@@ -869,6 +996,35 @@ def test_paper_watch_envelope_warns_but_does_not_block_degraded_open_order_truth
     assert "buy" in envelope["allowed_actions"]
     assert "broker_open_orders_truth_unavailable" in envelope["soft_warnings"]
     assert "broker_open_orders_truth_unavailable" not in envelope["hard_reject_reasons"]
+
+
+@pytest.mark.parametrize(
+    ("snapshot_kwargs", "expected_reason"),
+    [
+        ({"holdings_complete": False}, "broker_holdings_truth_unavailable"),
+        ({"open_orders_complete": False}, "broker_open_orders_truth_unavailable"),
+    ],
+)
+def test_typed_snapshot_completeness_blocks_live_watch_sizing(
+    snapshot_kwargs: dict[str, object],
+    expected_reason: str,
+) -> None:
+    account_context = _account_context_payload(
+        BrokerAccountSnapshot(
+            available_cash=Decimal("10000000"),
+            buying_power=Decimal("10000000"),
+            source="kis:account_snapshot",
+            **snapshot_kwargs,
+        ),
+        settings=Settings(runtime_mode="live"),
+        provider="kis",
+        observed_at=datetime.now(UTC),
+    )
+
+    assert account_context["available"] is True
+    assert account_context["buy_sizing_available"] is False
+    assert account_context["buy_sizing_block_reason"] == expected_reason
+    assert watch_sizing._live_buy_sizing_block_reason(account_context) == expected_reason
 
 
 def test_stale_open_order_unknown_broker_status_blocks_watch_sizing_before_agent(tmp_path, monkeypatch) -> None:
@@ -1071,6 +1227,11 @@ def test_stale_open_order_successful_refresh_allows_watch_sizing(tmp_path, monke
         calls.append([str(candidate["execution_plan_item_id"]) for candidate in payload["candidates"]])
         return {
             "version": "manual-exec-agent-watch-sizing-v1",
+            "plan_id": payload["plan_id"],
+            "_runtime_provenance": _verified_sizing_runtime(
+                settings,
+                request_payload=payload,
+            ),
             "decisions": [
                 {
                     "execution_plan_item_id": "watch-item-refreshed",
@@ -1299,7 +1460,7 @@ def test_sizing_request_payload_includes_allowed_action_envelope() -> None:
     settings = Settings(runtime_mode="live")
     item = _watch_item(
         risk_context={
-            "target_price": "76000",
+            "target_price": "78000",
             "stop_price": "69000",
             "execution_feasibility_context": {"max_safe_notional_krw": "800000"},
         }
@@ -1314,13 +1475,7 @@ def test_sizing_request_payload_includes_allowed_action_envelope() -> None:
             market_date=date(2026, 6, 4),
         ),
         candidates=[candidate],
-        account_context={
-            "available": True,
-            "orderable_cash_krw": "10000000",
-            "buying_power_krw": "10000000",
-            "holdings": [],
-            "open_orders": [],
-        },
+        account_context=_fresh_account_context(),
         candidate_universe=_candidate_universe_payload([candidate]),
     )
 
@@ -1329,6 +1484,71 @@ def test_sizing_request_payload_includes_allowed_action_envelope() -> None:
     assert "buy" in envelope["allowed_actions"]
     assert envelope["max_quantity"] == 11
     assert envelope["max_notional_krw"] == "800000.0000"
+
+
+def _delegated_gate_context() -> dict[str, object]:
+    observed_at = datetime.now(UTC) - timedelta(hours=1)
+    expiry_date = (observed_at + timedelta(days=2)).astimezone(
+        ZoneInfo("Asia/Seoul")
+    ).date()
+    expires_at = datetime(
+        expiry_date.year,
+        expiry_date.month,
+        expiry_date.day,
+        15,
+        30,
+        tzinfo=ZoneInfo("Asia/Seoul"),
+    )
+    codes = [
+        "short_term_liquidity_floor_block_delegated_to_exec_watch",
+        "short_term_reward_risk_ratio_block_delegated_to_exec_watch",
+        "transaction_cost_evidence_pending_live_delegated_to_exec_watch",
+    ]
+    return {
+        "target_price": "78000",
+        "stop_price": "69000",
+        "delegated_gate_codes": codes,
+        "delegated_gate_confirmation_required": True,
+        "delegated_gates": [
+            {
+                "code": codes[0],
+                "observed_value": "2500000000",
+                "field_path": "risk_context.validation.short_term_entry_quality.raw_trading_value_krw",
+                "comparator": "gte",
+                "threshold": "3000000000",
+                "policy_version": "core_delegated_gate_policy_v1",
+                "observed_at": observed_at.isoformat(),
+                "recheck_source": "exec_trigger_time_market_liquidity",
+                "expires_at": expires_at.isoformat(),
+            },
+            {
+                "code": codes[1],
+                "observed_value": "1.50",
+                "field_path": "risk_context.validation.short_term_entry_quality.reward_risk_ratio",
+                "comparator": "gte",
+                "threshold": "1.80",
+                "policy_version": "core_delegated_gate_policy_v1",
+                "observed_at": observed_at.isoformat(),
+                "recheck_source": "exec_trigger_time_price_geometry_and_cost_model",
+                "expires_at": expires_at.isoformat(),
+            },
+            {
+                "code": codes[2],
+                "observed_value": None,
+                "field_path": "risk_context.execution_feasibility_context.expected_slippage_bps",
+                "comparator": "finite_non_negative_with_basis",
+                "threshold": "0",
+                "policy_version": "core_delegated_gate_policy_v1",
+                "observed_at": observed_at.isoformat(),
+                "recheck_source": "exec_trigger_time_quote_and_cost_model",
+                "expires_at": expires_at.isoformat(),
+            },
+        ],
+        "execution_feasibility_context": {
+            "expected_slippage_bps": None,
+            "expected_slippage_basis": "unavailable",
+        },
+    }
 
 
 def test_sizing_request_payload_blocks_existing_holding_in_allowed_action_envelope() -> None:
@@ -1340,13 +1560,9 @@ def test_sizing_request_payload_blocks_existing_holding_in_allowed_action_envelo
         settings=settings,
         plan=ExecutionPlan(external_plan_id="plan-envelope-holding", market_date=date(2026, 6, 4)),
         candidates=[candidate],
-        account_context={
-            "available": True,
-            "orderable_cash_krw": "10000000",
-            "buying_power_krw": "10000000",
-            "holdings": [{"symbol": "005930", "quantity": 3}],
-            "open_orders": [],
-        },
+        account_context=_fresh_account_context(
+            holdings=[{"symbol": "005930", "quantity": 3}],
+        ),
         candidate_universe=_candidate_universe_payload([candidate]),
     )
 
@@ -1381,65 +1597,6 @@ def test_watch_sizing_decision_record_tags_tactical_target_profile() -> None:
     assert record["target_tag"] == "target_profile:tactical_2pct"
 
 
-def test_apply_decisions_applies_partial_response_and_leaves_missing_item_pending() -> None:
-    plan = ExecutionPlan(
-        id="plan-1",
-        external_plan_id="plan-partial",
-        strategy_run_id="strategy-1",
-        source="core-short-term-decider",
-        market_date=date(2026, 6, 4),
-        mode="paper",
-        items=[
-            _watch_item(item_id="watch-item-1", symbol="005930", risk_context={"target_price": "72420"}),
-            _watch_item(item_id="watch-item-2", symbol="000660", risk_context={"target_price": "128000"}),
-        ],
-    )
-
-    summary = _apply_decisions(
-        db=None,  # type: ignore[arg-type]
-        settings=Settings(runtime_mode="paper"),
-        plan=plan,
-        account_context={
-            "available": True,
-            "orderable_cash_krw": "10000000",
-            "buying_power_krw": "10000000",
-            "holdings": [],
-            "open_orders": [],
-        },
-        expected_item_ids={"watch-item-1", "watch-item-2"},
-        decision_payload={
-            "version": "manual-exec-agent-watch-sizing-v1",
-            "decisions": [
-                {
-                    "execution_plan_item_id": "watch-item-1",
-                    "symbol": "005930",
-                    "action": "approve",
-                    "quantity": 2,
-                    "approved_notional_krw": 143000,
-                    "sizing_price": "71000",
-                    "confidence": 0.68,
-                    "target_profile": "tactical_2pct",
-                    "reason_code": "small_tactical_upside",
-                    "reason": "2% target with tight stop",
-                }
-            ],
-        },
-    )
-
-    assert summary == {
-        "plan_id": "plan-partial",
-        "evaluated": 1,
-        "approved": 1,
-        "rejected": 0,
-        "missing": 1,
-        "missing_item_ids": ["watch-item-2"],
-        "ignored_extra": 0,
-    }
-    assert plan.items[0].status == "watch_monitoring_active"
-    assert plan.items[0].quantity_policy["quantity"] == 2
-    assert plan.items[1].status == "watch_monitoring_pending"
-
-
 def test_apply_decisions_preserves_triggered_blocked_watch_buy_for_retry() -> None:
     plan = ExecutionPlan(
         id="plan-1",
@@ -1449,11 +1606,11 @@ def test_apply_decisions_preserves_triggered_blocked_watch_buy_for_retry() -> No
         market_date=date(2026, 6, 4),
         mode="paper",
         items=[
-            _watch_item(
-                item_id="watch-item-blocked",
-                symbol="005930",
-                risk_context={"target_price": "72420", "stop_price": "69000"},
-            ),
+                _watch_item(
+                    item_id="watch-item-blocked",
+                    symbol="005930",
+                    risk_context={"target_price": "74000", "stop_price": "70950"},
+                ),
         ],
     )
     plan.items[0].status = "watch_buy_triggered_blocked"
@@ -1462,16 +1619,12 @@ def test_apply_decisions_preserves_triggered_blocked_watch_buy_for_retry() -> No
         db=None,  # type: ignore[arg-type]
         settings=Settings(runtime_mode="paper"),
         plan=plan,
-        account_context={
-            "available": True,
-            "orderable_cash_krw": "10000000",
-            "buying_power_krw": "10000000",
-            "holdings": [],
-            "open_orders": [],
-        },
+        account_context=_fresh_account_context(),
         expected_item_ids={"watch-item-blocked"},
+        request_payload=_DIRECT_APPLY_REQUEST_PAYLOAD,
         decision_payload={
             "version": "manual-exec-agent-watch-sizing-v1",
+            "_runtime_provenance": _verified_sizing_runtime(),
             "decisions": [
                 {
                     "execution_plan_item_id": "watch-item-blocked",
@@ -1494,7 +1647,60 @@ def test_apply_decisions_preserves_triggered_blocked_watch_buy_for_retry() -> No
     assert plan.items[0].quantity_policy["quantity"] == 2
 
 
+def test_paper_intraday_approval_without_contract_proof_is_rejected() -> None:
+    plan = ExecutionPlan(
+        id="plan-contract-proof-required",
+        external_plan_id="plan-contract-proof-required",
+        strategy_run_id="strategy-contract-proof-required",
+        source="core-short-term-decider",
+        market_date=date(2026, 6, 4),
+        mode="paper",
+        items=[
+            _watch_item(
+                item_id="watch-contract-proof-required",
+                risk_context={"target_price": "78000", "stop_price": "69000"},
+            )
+        ],
+    )
+
+    summary = _apply_decisions(
+        db=None,  # type: ignore[arg-type]
+        settings=Settings(runtime_mode="paper"),
+        plan=plan,
+        account_context=_fresh_account_context(),
+        expected_item_ids={"watch-contract-proof-required"},
+        decision_payload={
+            "version": "manual-exec-agent-watch-sizing-v1",
+            "_runtime_provenance": {
+                "actual_agent_id": Settings().exec_agent_id,
+                "actual_model_ref": Settings().exec_agent_model,
+                "session_id": "missing-contract-proof",
+            },
+            "decisions": [
+                {
+                    "execution_plan_item_id": "watch-contract-proof-required",
+                    "symbol": "005930",
+                    "action": "approve",
+                    "quantity": 1,
+                    "approved_notional_krw": 71500,
+                    "sizing_price": "71500",
+                    "reason_code": "approve_without_contract",
+                    "reason": "must fail closed",
+                }
+            ],
+        },
+    )
+
+    assert summary["approved"] == 0
+    assert summary["rejected"] == 1
+    assert plan.items[0].status == "exec_agent_rejected"
+    assert plan.items[0].quantity_policy["reason_code"] == (
+        "unverified_exec_agent_runtime"
+    )
+
+
 def test_apply_decisions_allows_small_agent_probe_below_min_notional() -> None:
+    settings = Settings(runtime_mode="live")
     plan = ExecutionPlan(
         id="plan-1",
         external_plan_id="plan-min-notional",
@@ -1503,12 +1709,14 @@ def test_apply_decisions_allows_small_agent_probe_below_min_notional() -> None:
         market_date=date(2026, 6, 4),
         mode="live",
         items=[
-            _watch_item(
-                item_id="watch-item-1",
-                symbol="005930",
-                risk_context={
-                    "target_price": "76000",
-                    "stop_price": "69000",
+                _watch_item(
+                    item_id="watch-item-1",
+                    symbol="005930",
+                    trigger_price="50000",
+                    limit_price="50500",
+                    risk_context={
+                    "target_price": "78000",
+                    "stop_price": "49000",
                     "execution_feasibility_context": {
                         "max_safe_notional_krw": "5000000",
                         "liquidity_tier": "high",
@@ -1520,16 +1728,14 @@ def test_apply_decisions_allows_small_agent_probe_below_min_notional() -> None:
 
     summary = _apply_decisions(
         db=None,  # type: ignore[arg-type]
-        settings=Settings(runtime_mode="live"),
+        settings=settings,
         plan=plan,
-        account_context={
-            "available": True,
-            "orderable_cash_krw": "10000000",
-            "buying_power_krw": "10000000",
-        },
+        account_context=_fresh_account_context(),
         expected_item_ids={"watch-item-1"},
+        request_payload=_DIRECT_APPLY_REQUEST_PAYLOAD,
         decision_payload={
             "version": "manual-exec-agent-watch-sizing-v1",
+            "_runtime_provenance": _verified_sizing_runtime(settings),
             "decisions": [
                 {
                     "execution_plan_item_id": "watch-item-1",
@@ -1565,6 +1771,7 @@ def test_apply_decisions_allows_small_agent_probe_below_min_notional() -> None:
 
 
 def test_apply_decisions_allows_when_order_lot_minimum_exceeds_agent_cap() -> None:
+    settings = Settings(runtime_mode="live")
     plan = ExecutionPlan(
         id="plan-1",
         external_plan_id="plan-min-notional-cap",
@@ -1576,9 +1783,11 @@ def test_apply_decisions_allows_when_order_lot_minimum_exceeds_agent_cap() -> No
             _watch_item(
                 item_id="watch-item-1",
                 symbol="005930",
+                trigger_price="2000",
+                limit_price="2030",
                 risk_context={
-                    "target_price": "76000",
-                    "stop_price": "69000",
+                    "target_price": "2300",
+                    "stop_price": "1900",
                     "execution_feasibility_context": {
                         "max_safe_notional_krw": "800000",
                         "liquidity_tier": "high",
@@ -1589,20 +1798,18 @@ def test_apply_decisions_allows_when_order_lot_minimum_exceeds_agent_cap() -> No
     )
     _apply_decisions(
         db=None,  # type: ignore[arg-type]
-        settings=Settings(runtime_mode="live"),
+        settings=settings,
         plan=plan,
-        account_context={
-            "available": True,
-            "orderable_cash_krw": "10000000",
-            "buying_power_krw": "10000000",
-        },
+        account_context=_fresh_account_context(),
         expected_item_ids={"watch-item-1"},
+        request_payload=_DIRECT_APPLY_REQUEST_PAYLOAD,
         decision_payload={
             "version": "manual-exec-agent-watch-sizing-v1",
+            "_runtime_provenance": _verified_sizing_runtime(settings),
             "decisions": [
                 {
                     "execution_plan_item_id": "watch-item-1",
-                    "symbol": "003550",
+                    "symbol": "005930",
                     "action": "approve",
                     "quantity": 200,
                     "approved_notional_krw": 406000,
@@ -1632,6 +1839,7 @@ def test_apply_decisions_allows_when_order_lot_minimum_exceeds_agent_cap() -> No
 
 
 def test_apply_decisions_records_vol_corr_cap_details_when_enabled() -> None:
+    settings = Settings(runtime_mode="live", vol_corr_sizing_enabled=True)
     plan = ExecutionPlan(
         id="plan-1",
         external_plan_id="plan-vol-corr-cap",
@@ -1644,7 +1852,7 @@ def test_apply_decisions_records_vol_corr_cap_details_when_enabled() -> None:
                 item_id="watch-item-1",
                 symbol="005930",
                 risk_context={
-                    "target_price": "76000",
+                    "target_price": "78000",
                     "stop_price": "69000",
                     "realized_volatility_pct": "5.0",
                     "max_holding_correlation": "0.82",
@@ -1657,21 +1865,24 @@ def test_apply_decisions_records_vol_corr_cap_details_when_enabled() -> None:
             )
         ],
     )
-    plan.items[0].quantity_policy = {"type": "exec_agent_sized", "budget_krw": "5000000"}
+    plan.items[0].quantity_policy = {
+        "type": "exec_agent_sized",
+        "budget_krw": "5000000",
+        "estimated_round_trip_cost_bps": "20",
+    }
 
     _apply_decisions(
         db=None,  # type: ignore[arg-type]
-        settings=Settings(runtime_mode="live", vol_corr_sizing_enabled=True),
+        settings=settings,
         plan=plan,
-        account_context={
-            "available": True,
-            "orderable_cash_krw": "10000000",
-            "buying_power_krw": "10000000",
-            "holdings": [{"symbol": "000660", "quantity": 3}],
-        },
+        account_context=_fresh_account_context(
+            holdings=[{"symbol": "000660", "quantity": 3}],
+        ),
         expected_item_ids={"watch-item-1"},
+        request_payload=_DIRECT_APPLY_REQUEST_PAYLOAD,
         decision_payload={
             "version": "manual-exec-agent-watch-sizing-v1",
+            "_runtime_provenance": _verified_sizing_runtime(settings),
             "decisions": [
                 {
                     "execution_plan_item_id": "watch-item-1",
@@ -1702,6 +1913,7 @@ def test_apply_decisions_records_vol_corr_cap_details_when_enabled() -> None:
 
 
 def test_apply_decisions_clamps_agent_approval_that_exceeds_cap() -> None:
+    settings = Settings(runtime_mode="live")
     plan = ExecutionPlan(
         id="plan-1",
         external_plan_id="plan-approval-cap",
@@ -1714,7 +1926,7 @@ def test_apply_decisions_clamps_agent_approval_that_exceeds_cap() -> None:
                 item_id="watch-item-1",
                 symbol="005930",
                 risk_context={
-                    "target_price": "76000",
+                    "target_price": "78000",
                     "stop_price": "69000",
                     "execution_feasibility_context": {
                         "max_safe_notional_krw": "800000",
@@ -1727,16 +1939,14 @@ def test_apply_decisions_clamps_agent_approval_that_exceeds_cap() -> None:
 
     _apply_decisions(
         db=None,  # type: ignore[arg-type]
-        settings=Settings(runtime_mode="live"),
+        settings=settings,
         plan=plan,
-        account_context={
-            "available": True,
-            "orderable_cash_krw": "10000000",
-            "buying_power_krw": "10000000",
-        },
+        account_context=_fresh_account_context(),
         expected_item_ids={"watch-item-1"},
+        request_payload=_DIRECT_APPLY_REQUEST_PAYLOAD,
         decision_payload={
             "version": "manual-exec-agent-watch-sizing-v1",
+            "_runtime_provenance": _verified_sizing_runtime(settings),
             "decisions": [
                 {
                     "execution_plan_item_id": "watch-item-1",
@@ -1767,6 +1977,7 @@ def test_apply_decisions_clamps_agent_approval_that_exceeds_cap() -> None:
 
 
 def test_apply_decisions_rejects_when_allowed_action_envelope_has_no_quantity() -> None:
+    settings = Settings(runtime_mode="live")
     plan = ExecutionPlan(
         id="plan-1",
         external_plan_id="plan-envelope-blocked",
@@ -1785,18 +1996,17 @@ def test_apply_decisions_rejects_when_allowed_action_envelope_has_no_quantity() 
 
     summary = _apply_decisions(
         db=None,  # type: ignore[arg-type]
-        settings=Settings(runtime_mode="live"),
+        settings=settings,
         plan=plan,
-        account_context={
-            "available": True,
-            "orderable_cash_krw": "1000",
-            "buying_power_krw": "1000",
-            "holdings": [],
-            "open_orders": [],
-        },
+        account_context=_fresh_account_context(
+            orderable_cash_krw="1000",
+            buying_power_krw="1000",
+        ),
         expected_item_ids={"watch-item-1"},
+        request_payload=_DIRECT_APPLY_REQUEST_PAYLOAD,
         decision_payload={
             "version": "manual-exec-agent-watch-sizing-v1",
+            "_runtime_provenance": _verified_sizing_runtime(settings),
             "decisions": [
                 {
                     "execution_plan_item_id": "watch-item-1",
@@ -1821,6 +2031,7 @@ def test_apply_decisions_rejects_when_allowed_action_envelope_has_no_quantity() 
 
 
 def test_apply_decisions_rejects_when_allowed_action_envelope_has_hard_reject_reason() -> None:
+    settings = Settings(runtime_mode="live")
     plan = ExecutionPlan(
         id="plan-1",
         external_plan_id="plan-envelope-hard-reject",
@@ -1839,18 +2050,16 @@ def test_apply_decisions_rejects_when_allowed_action_envelope_has_hard_reject_re
 
     summary = _apply_decisions(
         db=None,  # type: ignore[arg-type]
-        settings=Settings(runtime_mode="live"),
+        settings=settings,
         plan=plan,
-        account_context={
-            "available": True,
-            "orderable_cash_krw": "10000000",
-            "buying_power_krw": "10000000",
-            "holdings": [{"symbol": "005930", "quantity": 1}],
-            "open_orders": [],
-        },
+        account_context=_fresh_account_context(
+            holdings=[{"symbol": "005930", "quantity": 1}],
+        ),
         expected_item_ids={"watch-item-1"},
+        request_payload=_DIRECT_APPLY_REQUEST_PAYLOAD,
         decision_payload={
             "version": "manual-exec-agent-watch-sizing-v1",
+            "_runtime_provenance": _verified_sizing_runtime(settings),
             "decisions": [
                 {
                     "execution_plan_item_id": "watch-item-1",
@@ -1878,6 +2087,7 @@ def test_apply_decisions_rejects_when_allowed_action_envelope_has_hard_reject_re
 
 
 def test_apply_decisions_rejects_when_allowed_action_envelope_disallows_buy_downsize(monkeypatch) -> None:
+    settings = Settings(runtime_mode="live")
     plan = ExecutionPlan(
         id="plan-1",
         external_plan_id="plan-envelope-disallows-buy",
@@ -1908,18 +2118,14 @@ def test_apply_decisions_rejects_when_allowed_action_envelope_disallows_buy_down
 
     summary = _apply_decisions(
         db=None,  # type: ignore[arg-type]
-        settings=Settings(runtime_mode="live"),
+        settings=settings,
         plan=plan,
-        account_context={
-            "available": True,
-            "orderable_cash_krw": "10000000",
-            "buying_power_krw": "10000000",
-            "holdings": [],
-            "open_orders": [],
-        },
+        account_context=_fresh_account_context(),
         expected_item_ids={"watch-item-1"},
+        request_payload=_DIRECT_APPLY_REQUEST_PAYLOAD,
         decision_payload={
             "version": "manual-exec-agent-watch-sizing-v1",
+            "_runtime_provenance": _verified_sizing_runtime(settings),
             "decisions": [
                 {
                     "execution_plan_item_id": "watch-item-1",
@@ -1944,128 +2150,6 @@ def test_apply_decisions_rejects_when_allowed_action_envelope_disallows_buy_down
     assert policy["reason_code"] == "allowed_action_envelope_blocked"
     assert policy["allowed_action_envelope"]["max_quantity"] == 5
     assert policy["reason"] == "allowed action envelope disallows buy/downsize approval"
-
-
-def test_run_due_retry_applies_sizing_context_to_missing_decision(monkeypatch) -> None:
-    plan = ExecutionPlan(
-        id="plan-1",
-        external_plan_id="plan-retry-context",
-        strategy_run_id="strategy-1",
-        source="core-short-term-decider",
-        market_date=date(2026, 6, 4),
-        mode="live",
-        items=[
-            _watch_item(
-                item_id="watch-item-1",
-                symbol="005930",
-                risk_context={
-                    "target_price": "76000",
-                    "stop_price": "69000",
-                    "execution_feasibility_context": {
-                        "max_safe_notional_krw": "5000000",
-                        "liquidity_tier": "high",
-                    },
-                },
-            ),
-            _watch_item(
-                item_id="watch-item-2",
-                symbol="005931",
-                risk_context={
-                    "target_price": "76000",
-                    "stop_price": "69000",
-                    "execution_feasibility_context": {
-                        "max_safe_notional_krw": "800000",
-                        "liquidity_tier": "high",
-                    },
-                },
-            ),
-        ],
-    )
-    settings = Settings(
-        runtime_mode="live",
-        exec_agent_enabled=True,
-        exec_agent_watch_sizing_enabled=True,
-        exec_agent_watch_sizing_start_local_time="00:00",
-        exec_agent_watch_sizing_end_local_time="23:59",
-        exec_agent_watch_sizing_min_notional_krw=Decimal("100000"),
-        exec_agent_watch_sizing_high_conviction_min_notional_krw=Decimal("100000"),
-    )
-    account_context = {
-        "available": True,
-        "orderable_cash_krw": "10000000",
-        "buying_power_krw": "10000000",
-    }
-    responses = [
-        {
-            "version": "manual-exec-agent-watch-sizing-v1",
-            "decisions": [
-                {
-                    "execution_plan_item_id": "watch-item-1",
-                    "symbol": "005930",
-                    "action": "approve",
-                    "quantity": 3,
-                    "approved_notional_krw": 214500,
-                    "sizing_price": "71500",
-                    "confidence": 0.68,
-                    "target_profile": "short_swing",
-                    "reason_code": "small_probe",
-                    "reason": "initial response omitted the second candidate",
-                }
-            ],
-        },
-        {
-            "version": "manual-exec-agent-watch-sizing-v1",
-            "decisions": [
-                {
-                    "execution_plan_item_id": "watch-item-2",
-                    "symbol": "005931",
-                    "action": "approve",
-                    "quantity": 3,
-                    "approved_notional_krw": 214500,
-                    "sizing_price": "71500",
-                    "confidence": 0.68,
-                    "target_profile": "short_swing",
-                    "reason_code": "small_probe_retry",
-                    "reason": "retry returns the missing candidate",
-                }
-            ],
-        },
-    ]
-
-    class FakeSession:
-        def __init__(self) -> None:
-            self.committed = False
-
-        def commit(self) -> None:
-            self.committed = True
-
-    db = FakeSession()
-
-    monkeypatch.setattr(watch_sizing, "_load_candidate_plans", lambda **_: [plan])
-    monkeypatch.setattr(watch_sizing, "_load_sizing_account_context", lambda **_: account_context)
-    monkeypatch.setattr(
-        watch_sizing,
-        "_request_exec_agent_decisions_with_retries",
-        lambda **_: responses.pop(0),
-    )
-
-    result = run_due_watch_exec_agent_sizing(
-        settings=settings,
-        db=db,  # type: ignore[arg-type]
-        now=datetime(2026, 6, 4, 0, 0, tzinfo=UTC),
-    )
-
-    assert result.payload["applied"][0]["missing_item_ids"] == ["watch-item-2"]
-    assert result.payload["applied"][1]["approved"] == 1
-    assert db.committed is True
-    retry_policy = plan.items[1].quantity_policy
-    assert retry_policy["quantity"] == 3
-    assert retry_policy["approved_notional"] == "214500.0000"
-    assert retry_policy["sizing_adjustment"]["applied"] is False
-    assert retry_policy["sizing_adjustment"]["cap_notional"] == "214500.0000"
-    assert retry_policy["sizing_adjustment"]["runtime_cap_notional"] == "800000.0000"
-    assert retry_policy["sizing_adjustment"]["min_notional_upsize_suppressed"] is False
-    assert retry_policy["sizing_adjustment"]["reason"] is None
 
 
 def test_applicable_decision_ids_only_counts_expected_candidates() -> None:
@@ -2189,8 +2273,10 @@ def test_apply_decisions_persists_audit_without_rewriting_large_risk_context(tmp
                 "buying_power_krw": "10000000",
             },
             expected_item_ids={"watch-item-large-risk"},
+            request_payload=_DIRECT_APPLY_REQUEST_PAYLOAD,
             decision_payload={
                 "version": "manual-exec-agent-watch-sizing-v1",
+                "_runtime_provenance": _verified_sizing_runtime(settings),
                 "decisions": [
                     {
                         "execution_plan_item_id": "watch-item-large-risk",
@@ -2290,9 +2376,9 @@ def test_short_transaction_no_decision_attempts_persist_for_monitoring_fallback(
         assert item.risk_context == large_context
         assert item.quantity_policy["exec_agent_watch_sizing_attempt_count"] == 2
         assert item.quantity_policy["exec_agent_watch_sizing_max_attempts"] == 2
-        assert item.quantity_policy["exec_agent_watch_sizing_fallback_allowed"] is True
+        assert item.quantity_policy["exec_agent_watch_sizing_fallback_allowed"] is False
         assert item.quantity_policy["exec_agent_watch_sizing_attempts"][-1]["success"] is False
-        assert _watch_buy_exec_agent_sizing_fallback_allowed(settings=settings, item=item) is True
+        assert _watch_buy_exec_agent_sizing_fallback_allowed(settings=settings, item=item) is False
 
 
 def test_concurrent_watch_sizing_cycles_with_large_risk_contexts_do_not_lock(tmp_path, monkeypatch) -> None:
@@ -2335,9 +2421,14 @@ def test_concurrent_watch_sizing_cycles_with_large_risk_contexts_do_not_lock(tmp
         session.commit()
 
     def fake_decisions(*, payload, **_) -> dict[str, object]:
-        return {
-            "version": "manual-exec-agent-watch-sizing-v1",
-            "decisions": [
+            return {
+                "version": "manual-exec-agent-watch-sizing-v1",
+                "plan_id": payload["plan_id"],
+                "_runtime_provenance": _verified_sizing_runtime(
+                    settings,
+                    request_payload=payload,
+                ),
+                "decisions": [
                 {
                     "execution_plan_item_id": candidate["execution_plan_item_id"],
                     "symbol": candidate["symbol"],
@@ -2406,3 +2497,2935 @@ def test_concurrent_watch_sizing_cycles_with_large_risk_contexts_do_not_lock(tmp
         assert rejected_count == 12
         audit_count = session.query(watch_sizing.ExecutionPlanItemAudit).count()
         assert audit_count == 12
+
+
+def test_short_transaction_rejects_agent_decision_after_candidate_state_changes(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'watch-sizing-candidate-cas.db'}",
+        runtime_mode="paper",
+        exec_agent_enabled=True,
+        exec_agent_watch_sizing_enabled=True,
+        exec_agent_watch_sizing_start_local_time="00:00",
+        exec_agent_watch_sizing_end_local_time="23:59",
+        exec_agent_watch_sizing_max_attempts=1,
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    item_id = "watch-candidate-cas"
+
+    with session_factory() as session:
+        session.add(
+            ExecutionPlan(
+                external_plan_id="plan-candidate-cas",
+                strategy_run_id="strategy-candidate-cas",
+                source="core-short-term-decider",
+                market_date=date(2026, 6, 4),
+                mode="paper",
+                items=[
+                    _watch_item(
+                        item_id=item_id,
+                        risk_context={
+                            "target_price": "76000",
+                            "stop_price": "69000",
+                        },
+                    )
+                ],
+            )
+        )
+        session.commit()
+
+    monkeypatch.setattr(
+        watch_sizing,
+        "_load_sizing_account_context_short_transaction",
+        lambda **_: {
+            "available": True,
+            "buy_sizing_available": True,
+            "orderable_cash_krw": "10000000",
+            "buying_power_krw": "10000000",
+            "holdings": [],
+            "open_orders": [],
+            "open_orders_truth": {"available": True},
+        },
+    )
+
+    def approve_stale_candidate(*, payload, **_) -> dict[str, object]:
+        candidate = payload["candidates"][0]
+        with session_factory() as concurrent:
+            item = concurrent.get(ExecutionPlanItem, item_id)
+            assert item is not None
+            item.risk_context = {
+                **dict(item.risk_context or {}),
+                "target_price": "77000",
+            }
+            concurrent.commit()
+            return {
+                "version": "manual-exec-agent-watch-sizing-v1",
+                "plan_id": payload["plan_id"],
+                "_runtime_provenance": _verified_sizing_runtime(
+                    settings,
+                    request_payload=payload,
+                ),
+                "decisions": [
+                {
+                    "execution_plan_item_id": item_id,
+                    "symbol": candidate["symbol"],
+                    "action": "approve",
+                    "quantity": 1,
+                    "approved_notional_krw": "71500",
+                    "sizing_price": "71500",
+                    "confidence": "0.7",
+                    "target_profile": "short_swing",
+                    "reason_code": "stale_approval",
+                    "reason": "approval for the pre-change candidate",
+                }
+            ],
+        }
+
+    monkeypatch.setattr(
+        watch_sizing,
+        "_request_exec_agent_decisions",
+        approve_stale_candidate,
+    )
+
+    result = run_due_watch_exec_agent_sizing(
+        settings=settings,
+        session_factory=session_factory,
+        now=datetime(2026, 6, 4, 0, 0, tzinfo=UTC),
+    )
+
+    assert result.payload["applied"] == []
+    assert result.payload["errors"][0]["error"].startswith(
+        "watch sizing candidate state changed after exec-agent request"
+    )
+    with session_factory() as session:
+        item = session.get(ExecutionPlanItem, item_id)
+        assert item is not None
+        assert item.status == "watch_monitoring_pending"
+        assert item.risk_context["target_price"] == "77000"
+        assert item.quantity_policy.get("quantity") is None
+
+    engine.dispose()
+
+
+def test_short_transaction_rechecks_binding_deadline_after_agent_lock_wait(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'watch-sizing-binding-deadline.db'}",
+        runtime_mode="paper",
+        exec_agent_enabled=True,
+        exec_agent_watch_sizing_enabled=True,
+        exec_agent_watch_sizing_start_local_time="00:00",
+        exec_agent_watch_sizing_end_local_time="23:59",
+        exec_agent_watch_sizing_timeout_seconds=30,
+        exec_agent_watch_sizing_max_attempts=1,
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    item_id = "watch-binding-deadline"
+    with session_factory() as session:
+        session.add(
+            ExecutionPlan(
+                external_plan_id="plan-binding-deadline",
+                strategy_run_id="strategy-binding-deadline",
+                source="core-short-term-decider",
+                market_date=date(2026, 6, 4),
+                mode="paper",
+                items=[
+                    _watch_item(
+                        item_id=item_id,
+                        risk_context={
+                            "target_price": "76000",
+                            "stop_price": "69000",
+                        },
+                    )
+                ],
+            )
+        )
+        session.commit()
+
+    monkeypatch.setattr(
+        watch_sizing,
+        "_load_sizing_account_context_short_transaction",
+        lambda **_: {
+            "available": True,
+            "buy_sizing_available": True,
+            "orderable_cash_krw": "10000000",
+            "buying_power_krw": "10000000",
+            "holdings": [],
+            "open_orders": [],
+            "open_orders_truth": {"available": True},
+        },
+    )
+
+    def approve(*, payload, **_) -> dict[str, object]:
+        candidate = payload["candidates"][0]
+        return {
+            "version": "manual-exec-agent-watch-sizing-v1",
+            "plan_id": payload["plan_id"],
+            "_runtime_provenance": _verified_sizing_runtime(
+                settings,
+                request_payload=payload,
+            ),
+            "decisions": [
+                {
+                    "execution_plan_item_id": item_id,
+                    "symbol": candidate["symbol"],
+                    "action": "approve",
+                    "quantity": 1,
+                    "approved_notional_krw": "71500",
+                    "sizing_price": "71500",
+                    "confidence": "0.7",
+                    "target_profile": "short_swing",
+                    "reason_code": "late_approval",
+                    "reason": "fixture response that waited past its deadline",
+                }
+            ],
+        }
+
+    monkeypatch.setattr(watch_sizing, "_request_exec_agent_decisions", approve)
+    clock = iter((100.0, 131.0))
+    monkeypatch.setattr(watch_sizing, "monotonic", lambda: next(clock))
+
+    result = run_due_watch_exec_agent_sizing(
+        settings=settings,
+        session_factory=session_factory,
+        now=datetime(2026, 6, 4, 0, 0, tzinfo=UTC),
+    )
+
+    assert result.payload["applied"] == []
+    assert result.payload["errors"][0]["error"] == (
+        "watch sizing request candidate binding expired before apply"
+    )
+    with session_factory() as session:
+        item = session.get(ExecutionPlanItem, item_id)
+        assert item is not None
+        assert item.status == "watch_monitoring_pending"
+        assert item.quantity_policy.get("quantity") is None
+
+    engine.dispose()
+
+
+def test_watch_sizing_quarantines_candidates_for_a_different_broker_provider(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'watch-sizing-provider.db'}",
+        runtime_mode="paper",
+        exec_agent_enabled=True,
+        exec_agent_watch_sizing_enabled=True,
+        exec_agent_watch_sizing_start_local_time="00:00",
+        exec_agent_watch_sizing_end_local_time="23:59",
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    kis_item = _watch_item(
+        item_id="watch-provider-kis",
+        symbol="005930",
+        risk_context={"target_price": "76000", "stop_price": "69000"},
+    )
+    kis_item.provider = "kis"
+    alpaca_item = _watch_item(
+        item_id="watch-provider-alpaca",
+        symbol="AAPL",
+        trigger_price="200",
+        limit_price="201",
+        risk_context={"target_price": "220", "stop_price": "190"},
+    )
+    alpaca_item.provider = "alpaca"
+    alpaca_item.asset_class = "us_equity"
+    kis_us_item = _watch_item(
+        item_id="watch-provider-kis-us",
+        symbol="MSFT",
+        trigger_price="400",
+        limit_price="401",
+        risk_context={
+            "exchange": "NASD",
+            "target_price": "440",
+            "stop_price": "380",
+        },
+    )
+    kis_us_item.provider = "kis"
+    kis_us_item.asset_class = "us_equity"
+    with session_factory() as session:
+        session.add(
+            ExecutionPlan(
+                external_plan_id="plan-mixed-sizing-providers",
+                source="test",
+                market_date=date(2026, 6, 4),
+                mode="paper",
+                items=[kis_item, alpaca_item, kis_us_item],
+            )
+        )
+        session.commit()
+
+    monkeypatch.setattr(
+        watch_sizing,
+        "_load_sizing_account_context_short_transaction",
+        lambda **_: {
+            "available": True,
+            "buy_sizing_available": True,
+            "orderable_cash_krw": "1000000",
+            "buying_power_krw": "1000000",
+            "holdings": [],
+            "open_orders": [],
+            "open_orders_truth": {"available": True},
+        },
+    )
+    requested_ids: list[str] = []
+
+    def fake_decisions(*, payload, **_) -> dict[str, object]:
+        requested_ids.extend(
+            str(candidate["execution_plan_item_id"])
+            for candidate in payload["candidates"]
+        )
+        candidate = payload["candidates"][0]
+        return {
+            "version": "manual-exec-agent-watch-sizing-v1",
+            "plan_id": payload["plan_id"],
+            "_runtime_provenance": _verified_sizing_runtime(
+                settings,
+                request_payload=payload,
+            ),
+            "decisions": [
+                {
+                    "execution_plan_item_id": candidate["execution_plan_item_id"],
+                    "symbol": candidate["symbol"],
+                    "action": "approve",
+                    "quantity": 1,
+                    "approved_notional_krw": 71500,
+                    "sizing_price": 71500,
+                    "confidence": 0.7,
+                    "target_profile": "tactical_2pct",
+                    "reason_code": "test_approve",
+                    "reason": "provider-matched fixture",
+                }
+            ],
+        }
+
+    monkeypatch.setattr(watch_sizing, "_request_exec_agent_decisions", fake_decisions)
+    result = run_due_watch_exec_agent_sizing(
+        settings=settings,
+        session_factory=session_factory,
+        adapter=WatchSizingBrokerStub(reconcile_payloads=[]),
+        now=datetime(2026, 6, 4, 0, 1, tzinfo=UTC),
+    )
+
+    assert requested_ids == ["watch-provider-kis"]
+    assert any(
+        summary.get("provider_mismatch_item_ids")
+        == ["watch-provider-alpaca", "watch-provider-kis-us"]
+        for summary in result.payload["applied"]
+    )
+    with session_factory() as session:
+        persisted_alpaca = session.get(ExecutionPlanItem, "watch-provider-alpaca")
+        assert persisted_alpaca is not None
+        assert persisted_alpaca.status == "exec_agent_rejected"
+        assert persisted_alpaca.quantity_policy["type"] == "exec_agent_sized"
+        persisted_kis_us = session.get(ExecutionPlanItem, "watch-provider-kis-us")
+        assert persisted_kis_us is not None
+        assert persisted_kis_us.status == "exec_agent_rejected"
+        for persisted in (persisted_alpaca, persisted_kis_us):
+            assert persisted.quantity_policy["type"] == "exec_agent_sized"
+            audit = session.scalar(
+                select(ExecutionPlanItemAudit).where(
+                    ExecutionPlanItemAudit.execution_plan_item_id == persisted.id,
+                    ExecutionPlanItemAudit.event_type
+                    == "watch_exec_agent_sizing_route_unsupported",
+                )
+            )
+            assert audit is not None
+
+
+def test_short_transaction_keeps_each_candidate_bound_to_its_source_plan(tmp_path, monkeypatch) -> None:
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'watch-sizing-multi-plan.db'}",
+        runtime_mode="paper",
+        exec_agent_enabled=True,
+        exec_agent_watch_sizing_enabled=True,
+        exec_agent_watch_sizing_start_local_time="00:00",
+        exec_agent_watch_sizing_end_local_time="23:59",
+        exec_agent_watch_sizing_batch_size=3,
+        exec_agent_watch_sizing_max_batches_per_cycle=3,
+        exec_agent_watch_sizing_min_notional_krw=Decimal("50000"),
+        exec_agent_watch_sizing_high_conviction_min_notional_krw=Decimal("50000"),
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+
+    with session_factory() as session:
+        for index, symbol in enumerate(("005930", "000660", "035420"), start=1):
+            item = _watch_item(
+                item_id=f"watch-item-{index}",
+                symbol=symbol,
+                risk_context={
+                    "target_price": "76000",
+                    "stop_price": "69000",
+                    "execution_feasibility_context": {"max_safe_notional_krw": "800000"},
+                },
+            )
+            item.status = "watch_buy_triggered_blocked"
+            session.add(
+                ExecutionPlan(
+                    external_plan_id=f"plan-{symbol}",
+                    strategy_run_id="strategy-1",
+                    source="core-short-term-decider",
+                    market_date=date(2026, 6, 4),
+                    mode="paper",
+                    items=[item],
+                )
+            )
+        session.commit()
+
+    calls: list[tuple[str, list[str]]] = []
+
+    def fake_decisions(*, payload, **_) -> dict[str, object]:
+        calls.append(
+            (
+                str(payload["plan_id"]),
+                [str(candidate["execution_plan_item_id"]) for candidate in payload["candidates"]],
+            )
+        )
+        return {
+            "version": "manual-exec-agent-watch-sizing-v1",
+            "plan_id": payload["plan_id"],
+            "_runtime_provenance": _verified_sizing_runtime(
+                settings,
+                request_payload=payload,
+            ),
+            "decisions": [
+                {
+                    "execution_plan_item_id": candidate["execution_plan_item_id"],
+                    "symbol": candidate["symbol"],
+                    "action": "approve",
+                    "quantity": 1,
+                    "approved_notional_krw": 71500,
+                    "sizing_price": candidate["chase_limit_price"] or candidate["trigger_price"],
+                    "confidence": 0.5,
+                    "target_profile": "tactical_2pct",
+                    "reason_code": "test_approve",
+                    "reason": "fixture approval",
+                }
+                for candidate in payload["candidates"]
+            ],
+        }
+
+    monkeypatch.setattr(watch_sizing, "_request_exec_agent_decisions", fake_decisions)
+
+    result = run_due_watch_exec_agent_sizing(
+        settings=settings,
+        session_factory=session_factory,
+        now=datetime(2026, 6, 4, 0, 0, tzinfo=UTC),
+    )
+
+    assert dict(calls) == {
+        "plan-005930": ["watch-item-1"],
+        "plan-000660": ["watch-item-2"],
+        "plan-035420": ["watch-item-3"],
+    }
+    assert result.payload["batches_processed"] == 3
+    assert sum(summary["approved"] for summary in result.payload["applied"]) == 3
+
+    with session_factory() as session:
+        statuses = {
+            item.id: item.status
+            for item in session.query(ExecutionPlanItem).order_by(ExecutionPlanItem.id).all()
+        }
+
+    assert statuses == {
+        "watch-item-1": "watch_buy_triggered_blocked",
+        "watch-item-2": "watch_buy_triggered_blocked",
+        "watch-item-3": "watch_buy_triggered_blocked",
+    }
+
+
+def test_short_transaction_reserves_approved_cash_before_the_next_agent_batch(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'watch-sizing-cash-reservation.db'}",
+        runtime_mode="paper",
+        exec_agent_enabled=True,
+        exec_agent_watch_sizing_enabled=True,
+        exec_agent_watch_sizing_start_local_time="00:00",
+        exec_agent_watch_sizing_end_local_time="23:59",
+        exec_agent_watch_sizing_batch_size=1,
+        exec_agent_watch_sizing_max_batches_per_cycle=2,
+        exec_agent_watch_sizing_min_notional_krw=Decimal("50000"),
+        exec_agent_watch_sizing_high_conviction_min_notional_krw=Decimal("50000"),
+        exec_agent_max_position_allocation_pct=Decimal("1"),
+        exec_agent_max_symbol_exposure_pct=Decimal("1"),
+        exec_agent_max_symbol_total_exposure_pct=Decimal("1"),
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+
+    with session_factory() as session:
+        session.add(
+            ExecutionPlan(
+                external_plan_id="plan-cash-reservation",
+                strategy_run_id="strategy-1",
+                source="core-short-term-decider",
+                market_date=date(2026, 6, 4),
+                mode="paper",
+                items=[
+                    _watch_item(
+                        item_id=f"watch-cash-{index}",
+                        symbol=symbol,
+                        risk_context={
+                            "target_price": "76000",
+                            "stop_price": "71000",
+                            "execution_feasibility_context": {
+                                "max_safe_notional_krw": "100000",
+                            },
+                        },
+                    )
+                    for index, symbol in enumerate(("005930", "000660"), start=1)
+                ],
+            )
+        )
+        session.commit()
+
+    account_context = {
+        "available": True,
+        "buy_sizing_available": True,
+        "orderable_cash_krw": "100000",
+        "buying_power_krw": "100000",
+        "holdings": [],
+        "open_orders": [],
+        "open_orders_truth": {"available": True},
+    }
+    observed_cash: list[str] = []
+
+    monkeypatch.setattr(
+        watch_sizing,
+        "_load_sizing_account_context_short_transaction",
+        lambda **_: dict(account_context),
+    )
+
+    def fake_decisions(*, payload, **_) -> dict[str, object]:
+        observed_cash.append(str(payload["account_context"]["orderable_cash_krw"]))
+        candidate = payload["candidates"][0]
+        return {
+            "version": "manual-exec-agent-watch-sizing-v1",
+            "plan_id": payload["plan_id"],
+            "_runtime_provenance": _verified_sizing_runtime(
+                settings,
+                request_payload=payload,
+            ),
+            "decisions": [
+                {
+                    "execution_plan_item_id": candidate["execution_plan_item_id"],
+                    "symbol": candidate["symbol"],
+                    "action": "approve",
+                    "quantity": 1,
+                    "approved_notional_krw": 71500,
+                    "sizing_price": 71500,
+                    "confidence": 0.6,
+                    "target_profile": "tactical_2pct",
+                    "reason_code": "test_approve",
+                    "reason": "fixture approval",
+                }
+            ],
+        }
+
+    monkeypatch.setattr(watch_sizing, "_request_exec_agent_decisions", fake_decisions)
+
+    result = run_due_watch_exec_agent_sizing(
+        settings=settings,
+        session_factory=session_factory,
+        now=datetime(2026, 6, 4, 0, 0, tzinfo=UTC),
+    )
+
+    assert observed_cash == ["100000", "28500.0000"], result.payload
+    assert sum(summary["approved"] for summary in result.payload["applied"]) == 1
+    assert sum(summary["rejected"] for summary in result.payload["applied"]) == 1
+
+
+def test_short_transaction_prioritizes_highest_edge_candidate_when_batch_budget_is_limited(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'watch-sizing-priority.db'}",
+        runtime_mode="paper",
+        exec_agent_enabled=True,
+        exec_agent_watch_sizing_enabled=True,
+        exec_agent_watch_sizing_start_local_time="00:00",
+        exec_agent_watch_sizing_end_local_time="23:59",
+        exec_agent_watch_sizing_batch_size=1,
+        exec_agent_watch_sizing_max_batches_per_cycle=1,
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+
+    with session_factory() as session:
+        session.add(
+            ExecutionPlan(
+                external_plan_id="plan-priority",
+                strategy_run_id="strategy-1",
+                source="core-short-term-decider",
+                market_date=date(2026, 6, 4),
+                mode="paper",
+                items=[
+                    _watch_item(
+                        item_id="watch-low-edge",
+                        symbol="000001",
+                        risk_context={
+                            "target_price": "72420",
+                            "stop_price": "69000",
+                            "expected_return_pct": "2.0",
+                            "confidence_score_10": "5.0",
+                        },
+                    ),
+                    _watch_item(
+                        item_id="watch-high-edge",
+                        symbol="999999",
+                        risk_context={
+                            "target_price": "79520",
+                            "stop_price": "69000",
+                            "expected_return_pct": "12.0",
+                            "confidence_score_10": "8.0",
+                            "conviction_score_10": "8.5",
+                        },
+                    ),
+                    _watch_item(
+                        item_id="watch-medium-edge",
+                        symbol="111111",
+                        risk_context={
+                            "target_price": "74550",
+                            "stop_price": "69000",
+                            "expected_return_pct": "5.0",
+                            "confidence_score_10": "6.0",
+                        },
+                    ),
+                ],
+            )
+        )
+        session.commit()
+
+    monkeypatch.setattr(
+        watch_sizing,
+        "_load_sizing_account_context_short_transaction",
+        lambda **_: {
+            "available": True,
+            "buy_sizing_available": True,
+            "orderable_cash_krw": "10000000",
+            "buying_power_krw": "10000000",
+            "holdings": [],
+            "open_orders": [],
+            "open_orders_truth": {"available": True},
+        },
+    )
+    observed_symbols: list[str] = []
+
+    def reject_candidate(*, payload, **_) -> dict[str, object]:
+        candidate = payload["candidates"][0]
+        observed_symbols.append(str(candidate["symbol"]))
+        return {
+            "version": "manual-exec-agent-watch-sizing-v1",
+            "plan_id": payload["plan_id"],
+            "decisions": [
+                {
+                    "execution_plan_item_id": candidate["execution_plan_item_id"],
+                    "symbol": candidate["symbol"],
+                    "action": "reject",
+                    "quantity": 0,
+                    "approved_notional_krw": 0,
+                    "sizing_price": candidate["trigger_price"],
+                    "confidence": 0.5,
+                    "reason_code": "fixture_reject",
+                    "reason": "fixture rejection",
+                }
+            ],
+        }
+
+    monkeypatch.setattr(watch_sizing, "_request_exec_agent_decisions", reject_candidate)
+
+    run_due_watch_exec_agent_sizing(
+        settings=settings,
+        session_factory=session_factory,
+        now=datetime(2026, 6, 4, 0, 0, tzinfo=UTC),
+    )
+
+    assert observed_symbols == ["999999"]
+
+
+def test_short_transaction_supersedes_older_duplicate_symbol_before_sizing(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'watch-sizing-dedupe.db'}",
+        runtime_mode="paper",
+        exec_agent_enabled=True,
+        exec_agent_watch_sizing_enabled=True,
+        exec_agent_watch_sizing_start_local_time="00:00",
+        exec_agent_watch_sizing_end_local_time="23:59",
+        exec_agent_watch_sizing_batch_size=1,
+        exec_agent_watch_sizing_max_batches_per_cycle=2,
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+
+    with session_factory() as session:
+        older = ExecutionPlan(
+            external_plan_id="plan-duplicate-older",
+            strategy_run_id="strategy-older",
+            source="core-short-term-decider",
+            market_date=date(2026, 6, 4),
+            mode="paper",
+            accepted_at=datetime(2026, 6, 3, 20, 0, tzinfo=UTC),
+            items=[
+                _watch_item(
+                    item_id="watch-duplicate-older",
+                    symbol="005930",
+                    risk_context={"target_price": "76000", "stop_price": "69000"},
+                ),
+                _watch_item(
+                    item_id="watch-older-plan-active-sibling",
+                    symbol="000660",
+                    risk_context={"target_price": "135000", "stop_price": "115000"},
+                ),
+            ],
+        )
+        newer = ExecutionPlan(
+            external_plan_id="plan-duplicate-newer",
+            strategy_run_id="strategy-newer",
+            source="core-short-term-decider",
+            market_date=date(2026, 6, 4),
+            mode="paper",
+            accepted_at=datetime(2026, 6, 3, 21, 0, tzinfo=UTC),
+            items=[
+                _watch_item(
+                    item_id="watch-duplicate-newer",
+                    symbol="005930",
+                    risk_context={"target_price": "77000", "stop_price": "70000"},
+                )
+            ],
+        )
+        session.add_all([older, newer])
+        session.commit()
+
+    monkeypatch.setattr(
+        watch_sizing,
+        "_load_sizing_account_context_short_transaction",
+        lambda **_: {
+            "available": True,
+            "buy_sizing_available": True,
+            "orderable_cash_krw": "10000000",
+            "buying_power_krw": "10000000",
+            "holdings": [],
+            "open_orders": [],
+            "open_orders_truth": {"available": True},
+        },
+    )
+    observed_item_ids: list[str] = []
+
+    def reject_candidate(*, payload, **_) -> dict[str, object]:
+        candidate = payload["candidates"][0]
+        observed_item_ids.append(str(candidate["execution_plan_item_id"]))
+        return {
+            "version": "manual-exec-agent-watch-sizing-v1",
+            "plan_id": payload["plan_id"],
+            "decisions": [
+                {
+                    "execution_plan_item_id": candidate["execution_plan_item_id"],
+                    "symbol": candidate["symbol"],
+                    "action": "reject",
+                    "quantity": 0,
+                    "approved_notional_krw": 0,
+                    "sizing_price": candidate["trigger_price"],
+                    "confidence": 0.5,
+                    "reason_code": "fixture_reject",
+                    "reason": "fixture rejection",
+                }
+            ],
+        }
+
+    monkeypatch.setattr(watch_sizing, "_request_exec_agent_decisions", reject_candidate)
+
+    run_due_watch_exec_agent_sizing(
+        settings=settings,
+        session_factory=session_factory,
+        now=datetime(2026, 6, 4, 0, 0, tzinfo=UTC),
+    )
+
+    assert set(observed_item_ids) == {
+        "watch-duplicate-newer",
+        "watch-older-plan-active-sibling",
+    }
+    assert "watch-duplicate-older" not in observed_item_ids
+    with session_factory() as session:
+        older_item = session.get(ExecutionPlanItem, "watch-duplicate-older")
+        assert older_item is not None
+        assert older_item.status == "superseded"
+
+
+@pytest.mark.parametrize(
+    ("observed_at", "expected_reason"),
+    [
+        (datetime(2026, 6, 3, 23, 58, 59, tzinfo=UTC), "account_snapshot_stale"),
+        (datetime(2026, 6, 4, 0, 0, 31, tzinfo=UTC), "account_snapshot_future_skew"),
+    ],
+    ids=["stale", "future-skew"],
+)
+@pytest.mark.parametrize("runtime_mode", ["paper", "live"])
+def test_watch_sizing_account_snapshot_freshness_blocks_before_agent_call(
+    tmp_path,
+    monkeypatch,
+    observed_at: datetime,
+    expected_reason: str,
+    runtime_mode: str,
+) -> None:
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / f'watch-sizing-{runtime_mode}-{expected_reason}.db'}",
+        runtime_mode=runtime_mode,
+        exec_agent_enabled=True,
+        exec_agent_watch_sizing_enabled=True,
+        exec_agent_watch_sizing_start_local_time="00:00",
+        exec_agent_watch_sizing_end_local_time="23:59",
+        exec_agent_max_account_snapshot_age_seconds=60,
+        account_drawdown_recovery_max_snapshot_future_skew_seconds=5,
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    with session_factory() as session:
+        session.add(
+            ExecutionPlan(
+                external_plan_id=f"plan-{expected_reason}",
+                source="core-short-term-decider",
+                market_date=date(2026, 6, 4),
+                mode=runtime_mode,
+                items=[
+                    _watch_item(
+                        item_id=f"watch-{expected_reason}",
+                        symbol="005930",
+                        risk_context={"target_price": "76000", "stop_price": "69000"},
+                    )
+                ],
+            )
+        )
+        session.commit()
+    monkeypatch.setattr(
+        watch_sizing,
+        "_request_exec_agent_decisions",
+        lambda **_: (_ for _ in ()).throw(
+            AssertionError("stale account truth must not reach the exec-agent")
+        ),
+    )
+    broker = WatchSizingBrokerStub(
+        reconcile_payloads=[],
+        snapshot=BrokerAccountSnapshot(
+            available_cash=Decimal("10000000"),
+            buying_power=Decimal("10000000"),
+            observed_at=observed_at,
+            source="stub:account_snapshot",
+        ),
+    )
+
+    result = run_due_watch_exec_agent_sizing(
+        settings=settings,
+        session_factory=session_factory,
+        adapter=broker,
+        now=datetime(2026, 6, 4, 0, 0, tzinfo=UTC),
+    )
+
+    assert result.payload["blocked"] is True
+    assert result.payload["reason"] == "account_context_unavailable"
+    assert result.payload["account_context"]["reason"] == expected_reason
+    assert result.payload["batches_processed"] == 0
+    engine.dispose()
+
+
+def test_candidate_payload_maps_legacy_stop_price_to_agent_stop_loss_price() -> None:
+    item = _watch_item(
+        risk_context={
+            "target_price": "76000",
+            "stop_price": "69000",
+        }
+    )
+
+    payload = _candidate_payload(item)
+
+    assert payload["stop_loss_price"] == "69000"
+
+
+@pytest.mark.parametrize(
+    ("risk_context", "expected_reason"),
+    [
+        pytest.param(
+            {"stop_price": "69000"},
+            "missing_target_price",
+            id="missing-target",
+        ),
+        pytest.param(
+            {"target_price": "71500", "stop_price": "69000"},
+            "invalid_target_distance",
+            id="target-at-reference",
+        ),
+        pytest.param(
+            {"target_price": "71000", "stop_price": "69000"},
+            "invalid_target_distance",
+            id="target-below-reference",
+        ),
+        pytest.param(
+            {"target_price": "76000"},
+            "missing_stop_price",
+            id="missing-stop",
+        ),
+    ],
+)
+def test_sizing_request_payload_hard_rejects_incomplete_or_unprofitable_geometry(
+    risk_context: dict[str, object],
+    expected_reason: str,
+) -> None:
+    settings = Settings(runtime_mode="live")
+    item = _watch_item(risk_context=risk_context)
+    candidate = _candidate_payload(item)
+
+    payload = _sizing_request_payload(
+        settings=settings,
+        plan=ExecutionPlan(
+            external_plan_id="plan-envelope-invalid-geometry",
+            strategy_run_id="strategy-1",
+            market_date=date(2026, 6, 4),
+        ),
+        candidates=[candidate],
+        account_context=_fresh_account_context(),
+        candidate_universe=_candidate_universe_payload([candidate]),
+    )
+
+    envelope = payload["candidates"][0]["allowed_action_envelope"]  # type: ignore[index]
+    assert envelope["allowed_actions"] == ["hold", "reject"]
+    assert expected_reason in envelope["hard_reject_reasons"]
+    assert expected_reason not in envelope["soft_warnings"]
+
+
+def test_sizing_envelope_rejects_reward_risk_below_deterministic_floor() -> None:
+    item = _watch_item(
+        risk_context={
+            "target_price": "72700",
+            "stop_price": "70500",
+            "estimated_round_trip_cost_bps": "20",
+        }
+    )
+    candidate = _candidate_payload(item)
+
+    envelope = watch_sizing._allowed_action_envelope_for_candidate(
+        settings=Settings(runtime_mode="paper"),
+        candidate=candidate,
+        account_context={
+            "available": True,
+            "orderable_cash_krw": "10000000",
+            "buying_power_krw": "10000000",
+            "holdings": [],
+            "open_orders": [],
+        },
+    )
+
+    assert "reward_risk_below_minimum" in envelope["hard_reject_reasons"]
+    assert envelope["allowed_actions"] == ["hold", "reject"]
+
+
+def test_live_sizing_envelope_requires_configured_transaction_cost_policy() -> None:
+    item = _watch_item(
+        risk_context={"target_price": "76000", "stop_price": "69000"}
+    )
+    candidate = _candidate_payload(item)
+    candidate.pop("estimated_round_trip_cost_bps", None)
+    candidate["provider"] = "unknown"
+
+    envelope = watch_sizing._allowed_action_envelope_for_candidate(
+        settings=Settings(runtime_mode="live"),
+        candidate=candidate,
+        account_context={
+            "available": True,
+            "orderable_cash_krw": "10000000",
+            "buying_power_krw": "10000000",
+            "holdings": [],
+            "open_orders": [],
+        },
+    )
+
+    assert "transaction_cost_evidence_missing" in envelope["hard_reject_reasons"]
+    assert envelope["allowed_actions"] == ["hold", "reject"]
+
+
+@pytest.mark.parametrize(
+    "basis",
+    [None, "unavailable", "liquidity_tier_estimate", "unknown"],
+)
+def test_live_sizing_ignores_unverified_pretrigger_slippage_basis(
+    basis: str | None,
+) -> None:
+    feasibility: dict[str, object] = {"expected_slippage_bps": "12"}
+    if basis is not None:
+        feasibility["expected_slippage_basis"] = basis
+    candidate = _candidate_payload(
+        _watch_item(
+            risk_context={
+                "target_price": "78000",
+                "stop_price": "69000",
+                "execution_feasibility_context": feasibility,
+            }
+        )
+    )
+    candidate.pop("estimated_round_trip_cost_bps", None)
+
+    envelope = watch_sizing._allowed_action_envelope_for_candidate(
+        settings=Settings(runtime_mode="live"),
+        candidate=candidate,
+        account_context={
+            "available": True,
+            "orderable_cash_krw": "10000000",
+            "buying_power_krw": "10000000",
+            "holdings": [],
+            "open_orders": [],
+        },
+    )
+
+    assert "buy" in envelope["allowed_actions"]
+    assert envelope["estimated_round_trip_cost_bps"] == "50.0000"
+    assert envelope["transaction_cost_evidence_source"] == (
+        "settings:kis_krx_round_trip_non_spread_cost_bps"
+    )
+
+
+def test_buy_economics_extreme_decimal_fails_closed_without_raising() -> None:
+    assessment = assess_buy_economics(
+        reference_price=Decimal("1e999999"),
+        target_price=Decimal("2e999999"),
+        stop_price=Decimal("0.5e999999"),
+        minimum_reward_risk=Decimal("1.30"),
+        evidence={"estimated_round_trip_cost_bps": "20"},
+        require_cost_evidence=True,
+    )
+
+    assert assessment.reason == "economic_value_out_of_range"
+
+
+def test_buy_economics_ignores_nested_agent_claimed_cost_evidence() -> None:
+    assessment = assess_buy_economics(
+        reference_price=Decimal("100"),
+        target_price=Decimal("110"),
+        stop_price=Decimal("95"),
+        minimum_reward_risk=Decimal("1.30"),
+        evidence={
+            "exec_agent_decision": {
+                "context": {"estimated_round_trip_cost_bps": "1"},
+                "explanation": {"expected_slippage_bps": "1"},
+            }
+        },
+        require_cost_evidence=True,
+    )
+
+    assert assessment.reason == "transaction_cost_evidence_missing"
+    assert assessment.cost_evidence_source is None
+
+
+def test_delegated_gate_validator_ignores_nested_agent_claims() -> None:
+    candidate = _candidate_payload(
+        _watch_item(
+            risk_context={
+                "target_price": "76000",
+                "stop_price": "69000",
+                "exec_agent_decision": {
+                    "context": _delegated_gate_context(),
+                },
+            }
+        )
+    )
+
+    envelope = watch_sizing._allowed_action_envelope_for_candidate(
+        settings=Settings(runtime_mode="paper"),
+        candidate=candidate,
+        account_context={
+            "available": True,
+            "orderable_cash_krw": "10000000",
+            "buying_power_krw": "10000000",
+            "holdings": [],
+            "open_orders": [],
+        },
+    )
+
+    assert envelope["delegated_gate_rejections"] == []
+
+
+def test_sizing_envelope_uses_configured_cost_floor_over_candidate_claim() -> None:
+    item = _watch_item(
+        risk_context={
+            "target_price": "72810",
+            "stop_price": "70500",
+            "estimated_round_trip_cost_bps": "20",
+        }
+    )
+    candidate = _candidate_payload(item)
+
+    envelope = watch_sizing._allowed_action_envelope_for_candidate(
+        settings=Settings(runtime_mode="paper"),
+        candidate=candidate,
+        account_context={
+            "available": True,
+            "orderable_cash_krw": "10000000",
+            "buying_power_krw": "10000000",
+            "holdings": [],
+            "open_orders": [],
+        },
+    )
+
+    assert "net_reward_risk_below_minimum" in envelope["hard_reject_reasons"]
+    assert Decimal(envelope["gross_reward_risk"]) >= Decimal("1.30")
+    assert Decimal(envelope["net_reward_risk"]) < Decimal("1.30")
+    assert envelope["estimated_round_trip_cost_bps"] == "50.0000"
+
+
+def test_watch_sizing_preserves_and_enforces_core_delegated_gate_contract() -> None:
+    risk_context = _delegated_gate_context()
+    candidate = _candidate_payload(_watch_item(risk_context=risk_context))
+    candidate.pop("estimated_round_trip_cost_bps", None)
+
+    assert candidate["delegated_gate_codes"] == _delegated_gate_context()[
+        "delegated_gate_codes"
+    ]
+    assert candidate["delegated_gate_confirmation_required"] is True
+    assert candidate["delegated_gates"] == risk_context["delegated_gates"]
+    assert candidate["execution_feasibility_context"] == {
+        "expected_slippage_bps": None,
+        "expected_slippage_basis": "unavailable",
+    }
+    envelope = watch_sizing._allowed_action_envelope_for_candidate(
+        settings=Settings(runtime_mode="live"),
+        candidate=candidate,
+        account_context={
+            "available": True,
+            "orderable_cash_krw": "10000000",
+            "buying_power_krw": "10000000",
+            "holdings": [],
+            "open_orders": [],
+        },
+    )
+
+    assert envelope["delegated_gate_rejections"] == []
+    assert "buy" in envelope["allowed_actions"]
+    assert envelope["transaction_cost_evidence_source"] == (
+        "settings:kis_krx_round_trip_non_spread_cost_bps"
+    )
+
+
+def test_live_sizing_accepts_zero_quote_spread_cost_evidence() -> None:
+    risk_context = _delegated_gate_context()
+    risk_context["execution_feasibility_context"] = {
+        "expected_slippage_bps": "0",
+        "expected_slippage_basis": "quote_spread_bps",
+    }
+    candidate = _candidate_payload(_watch_item(risk_context=risk_context))
+    candidate.pop("estimated_round_trip_cost_bps", None)
+
+    envelope = watch_sizing._allowed_action_envelope_for_candidate(
+        settings=Settings(
+            runtime_mode="live",
+            kis_krx_round_trip_non_spread_cost_bps=Decimal("0"),
+        ),
+        candidate=candidate,
+        account_context={
+            "available": True,
+            "orderable_cash_krw": "10000000",
+            "buying_power_krw": "10000000",
+            "holdings": [],
+            "open_orders": [],
+        },
+    )
+
+    assert "buy" in envelope["allowed_actions"]
+    assert envelope["estimated_round_trip_cost_bps"] == "0.0000"
+
+
+@pytest.mark.parametrize(
+    ("risk_context", "expected_reason"),
+    [
+        pytest.param(
+            {
+                **_delegated_gate_context(),
+                "delegated_gate_confirmation_required": False,
+            },
+            "delegated_gate_confirmation_missing",
+            id="confirmation-missing",
+        ),
+        pytest.param(
+            {
+                **_delegated_gate_context(),
+                "delegated_gate_codes": ["unknown_delegated_gate"],
+            },
+            "delegated_gate_unknown:unknown_delegated_gate",
+            id="unknown-code",
+        ),
+        pytest.param(
+            {
+                **_delegated_gate_context(),
+                "delegated_gate_codes": [
+                    "short_term_buy_quality_score_block_delegated_to_exec_watch"
+                ],
+            },
+            "delegated_gate_unknown:short_term_buy_quality_score_block_delegated_to_exec_watch",
+            id="non-recomputable-code",
+        ),
+        pytest.param(
+            {
+                **_delegated_gate_context(),
+                "delegated_gates": [],
+            },
+            "delegated_gate_contract_missing",
+            id="structured-contract-missing",
+        ),
+        pytest.param(
+            {
+                **_delegated_gate_context(),
+                "delegated_gates": [
+                    {
+                        **_delegated_gate_context()["delegated_gates"][0],
+                        "field_path": "risk_context.agent_claimed_turnover",
+                    },
+                    *_delegated_gate_context()["delegated_gates"][1:],
+                ],
+            },
+            "delegated_gate_contract_mismatch:short_term_liquidity_floor_block_delegated_to_exec_watch:field_path",
+            id="field-path-mismatch",
+        ),
+    ],
+)
+def test_watch_sizing_fails_closed_when_delegated_gate_is_unconfirmed_or_fails(
+    risk_context: dict[str, object],
+    expected_reason: str,
+) -> None:
+    envelope = watch_sizing._allowed_action_envelope_for_candidate(
+        settings=Settings(runtime_mode="live"),
+        candidate=_candidate_payload(_watch_item(risk_context=risk_context)),
+        account_context={
+            "available": True,
+            "orderable_cash_krw": "10000000",
+            "buying_power_krw": "10000000",
+            "holdings": [],
+            "open_orders": [],
+        },
+    )
+
+    assert expected_reason in envelope["hard_reject_reasons"]
+    assert envelope["allowed_actions"] == ["hold", "reject"]
+
+
+def test_dynamic_delegated_gates_resume_only_with_fresh_authoritative_evidence() -> None:
+    evaluated_at = datetime.now(UTC)
+    economics = assess_buy_economics(
+        reference_price=Decimal("100"),
+        target_price=Decimal("120"),
+        stop_price=Decimal("95"),
+        minimum_reward_risk=Decimal("1.30"),
+        evidence=configured_execution_cost_evidence(
+            settings=Settings(),
+            provider="kis",
+            asset_class="stock",
+            exchange="KRX",
+            live_quote_spread_bps="5",
+            require_live_quote_spread=True,
+        ),
+        require_cost_evidence=True,
+    )
+    live_context = {
+        "live_execution_context_available": True,
+        "turnover": "3500000000",
+        "field_freshness": {
+            "turnover": {
+                "valid": True,
+                "source": "broker_realtime_exchange_time",
+                "observed_at": evaluated_at.isoformat(),
+                "max_age_seconds": 30,
+                "max_future_skew_seconds": 5,
+            }
+        },
+    }
+
+    assert delegated_buy_gate_rejections(
+        _delegated_gate_context(),
+        evaluated_at=evaluated_at,
+        live_market_context=live_context,
+        economics=economics,
+        require_live_recheck=True,
+    ) == []
+
+    live_context["turnover"] = "2500000000"
+    assert delegated_buy_gate_rejections(
+        _delegated_gate_context(),
+        evaluated_at=evaluated_at,
+        live_market_context=live_context,
+        economics=economics,
+        require_live_recheck=True,
+    ) == [
+        "delegated_gate_failed:short_term_liquidity_floor_block_delegated_to_exec_watch"
+    ]
+
+
+@pytest.mark.parametrize(
+    "freshness_update",
+    [
+        {"source": "transport_received_at_untrusted"},
+        {"observed_at": (datetime.now(UTC) - timedelta(minutes=5)).isoformat()},
+        {"observed_at": (datetime.now(UTC) + timedelta(minutes=5)).isoformat()},
+    ],
+)
+def test_dynamic_liquidity_gate_rejects_untrusted_stale_or_future_turnover(
+    freshness_update: dict[str, object],
+) -> None:
+    evaluated_at = datetime.now(UTC)
+    freshness = {
+        "valid": True,
+        "source": "broker_realtime_exchange_time",
+        "observed_at": evaluated_at.isoformat(),
+        "max_age_seconds": 30,
+        "max_future_skew_seconds": 5,
+        **freshness_update,
+    }
+    live_context = {
+        "live_execution_context_available": True,
+        "turnover": "3500000000",
+        "field_freshness": {"turnover": freshness},
+    }
+    economics = assess_buy_economics(
+        reference_price=Decimal("100"),
+        target_price=Decimal("120"),
+        stop_price=Decimal("95"),
+        minimum_reward_risk=Decimal("1.30"),
+        evidence=configured_execution_cost_evidence(
+            settings=Settings(),
+            provider="kis",
+            asset_class="stock",
+            exchange="KRX",
+            live_quote_spread_bps="5",
+            require_live_quote_spread=True,
+        ),
+        require_cost_evidence=True,
+    )
+
+    rejections = delegated_buy_gate_rejections(
+        _delegated_gate_context(),
+        evaluated_at=evaluated_at,
+        live_market_context=live_context,
+        economics=economics,
+        require_live_recheck=True,
+    )
+
+    assert rejections == [
+        "delegated_gate_failed:short_term_liquidity_floor_block_delegated_to_exec_watch"
+    ]
+
+
+@pytest.mark.parametrize(
+    "target_price",
+    [
+        pytest.param(None, id="missing-target"),
+        pytest.param("71000", id="target-at-reference"),
+        pytest.param("70000", id="target-below-reference"),
+    ],
+)
+def test_watch_sizing_decision_record_does_not_tag_invalid_geometry_as_tactical(
+    target_price: str | None,
+) -> None:
+    item = _watch_item(
+        risk_context={
+            "target_price": target_price,
+            "stop_price": "69000",
+        }
+    )
+
+    record = _decision_record(
+        decision={
+            "action": "reject",
+            "quantity": 2,
+            "approved_notional_krw": 142000,
+            "sizing_price": "71000",
+            "confidence": 0.68,
+            "target_profile": "tactical_2pct",
+            "reason_code": "invalid_geometry",
+            "reason": "invalid target geometry",
+        },
+        item=item,
+        version="manual-exec-agent-watch-sizing-v1",
+    )
+
+    assert record["target_profile"] == "standard_breakout"
+    assert record["target_tag"] == "target_profile:standard_breakout"
+
+
+def test_apply_decisions_rejects_partial_response_and_leaves_every_item_pending() -> None:
+    plan = ExecutionPlan(
+        id="plan-1",
+        external_plan_id="plan-partial",
+        strategy_run_id="strategy-1",
+        source="core-short-term-decider",
+        market_date=date(2026, 6, 4),
+        mode="paper",
+        items=[
+            _watch_item(
+                item_id="watch-item-1",
+                symbol="005930",
+                risk_context={"target_price": "72700", "stop_price": "70950"},
+            ),
+            _watch_item(
+                item_id="watch-item-2",
+                symbol="000660",
+                risk_context={"target_price": "128000", "stop_price": "69000"},
+            ),
+        ],
+    )
+
+    with pytest.raises(ValueError, match="missing decisions.*watch-item-2"):
+        _apply_decisions(
+            db=None,  # type: ignore[arg-type]
+            settings=Settings(runtime_mode="paper"),
+            plan=plan,
+            account_context={
+                "available": True,
+                "orderable_cash_krw": "10000000",
+                "buying_power_krw": "10000000",
+                "holdings": [],
+                "open_orders": [],
+            },
+            expected_item_ids={"watch-item-1", "watch-item-2"},
+            decision_payload={
+                "version": "manual-exec-agent-watch-sizing-v1",
+                "decisions": [
+                    {
+                        "execution_plan_item_id": "watch-item-1",
+                        "symbol": "005930",
+                        "action": "approve",
+                        "quantity": 2,
+                        "approved_notional_krw": 143000,
+                        "sizing_price": "71000",
+                        "confidence": 0.68,
+                        "target_profile": "tactical_2pct",
+                        "reason_code": "small_tactical_upside",
+                        "reason": "2% target with tight stop",
+                    }
+                ],
+            },
+        )
+
+    assert plan.items[0].status == "watch_monitoring_pending"
+    assert plan.items[1].status == "watch_monitoring_pending"
+
+
+def test_apply_decisions_rejects_unknown_response_contract_version() -> None:
+    plan = ExecutionPlan(
+        id="plan-1",
+        external_plan_id="plan-invalid-version",
+        strategy_run_id="strategy-1",
+        source="core-short-term-decider",
+        market_date=date(2026, 6, 4),
+        mode="paper",
+        items=[
+            _watch_item(
+                item_id="watch-item-1",
+                symbol="005930",
+                risk_context={"target_price": "76000", "stop_price": "69000"},
+            )
+        ],
+    )
+
+    with pytest.raises(ValueError, match="unsupported exec-agent response version"):
+        _apply_decisions(
+            db=None,  # type: ignore[arg-type]
+            settings=Settings(runtime_mode="paper"),
+            plan=plan,
+            expected_item_ids={"watch-item-1"},
+            decision_payload={
+                "version": "manual-exec-agent-watch-sizing-v999",
+                "decisions": [
+                    {
+                        "execution_plan_item_id": "watch-item-1",
+                        "symbol": "005930",
+                        "action": "reject",
+                        "quantity": 0,
+                    }
+                ],
+            },
+        )
+
+
+def test_apply_decisions_rejects_item_symbol_mismatch() -> None:
+    plan = ExecutionPlan(
+        id="plan-1",
+        external_plan_id="plan-symbol-mismatch",
+        strategy_run_id="strategy-1",
+        source="core-short-term-decider",
+        market_date=date(2026, 6, 4),
+        mode="paper",
+        items=[
+            _watch_item(
+                item_id="watch-item-1",
+                symbol="005930",
+                risk_context={"target_price": "76000", "stop_price": "69000"},
+            )
+        ],
+    )
+
+    with pytest.raises(ValueError, match="symbol mismatch"):
+        _apply_decisions(
+            db=None,  # type: ignore[arg-type]
+            settings=Settings(runtime_mode="paper"),
+            plan=plan,
+            expected_item_ids={"watch-item-1"},
+            decision_payload={
+                "version": "manual-exec-agent-watch-sizing-v1",
+                "decisions": [
+                    {
+                        "execution_plan_item_id": "watch-item-1",
+                        "symbol": "000660",
+                        "action": "reject",
+                        "quantity": 0,
+                    }
+                ],
+            },
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "expected_error"),
+    [
+        ("version", " manual-exec-agent-watch-sizing-v1", "unsupported exec-agent response version"),
+        ("plan_id", "plan-symbol-mismatch ", "plan_id mismatch"),
+        ("execution_plan_item_id", "watch-item-1 ", "unknown execution_plan_item_id"),
+        ("symbol", " 005930", "symbol mismatch"),
+    ],
+)
+def test_watch_sizing_authoritative_identity_requires_exact_match(
+    field: str,
+    value: str,
+    expected_error: str,
+) -> None:
+    plan = ExecutionPlan(
+        id="plan-1",
+        external_plan_id="plan-symbol-mismatch",
+        strategy_run_id="strategy-1",
+        source="core-short-term-decider",
+        market_date=date(2026, 6, 4),
+        mode="paper",
+        items=[
+            _watch_item(
+                item_id="watch-item-1",
+                symbol="005930",
+                risk_context={"target_price": "76000", "stop_price": "69000"},
+            )
+        ],
+    )
+    payload: dict[str, object] = {
+        "version": "manual-exec-agent-watch-sizing-v1",
+        "plan_id": "plan-symbol-mismatch",
+        "decisions": [
+            {
+                "execution_plan_item_id": "watch-item-1",
+                "symbol": "005930",
+                "action": "reject",
+                "quantity": 0,
+            }
+        ],
+    }
+    if field in {"version", "plan_id"}:
+        payload[field] = value
+    else:
+        decisions = payload["decisions"]
+        assert isinstance(decisions, list) and isinstance(decisions[0], dict)
+        decisions[0][field] = value
+
+    with pytest.raises(ValueError, match=expected_error):
+        _apply_decisions(
+            db=None,  # type: ignore[arg-type]
+            settings=Settings(runtime_mode="paper"),
+            plan=plan,
+            expected_item_ids={"watch-item-1"},
+            decision_payload=payload,
+        )
+
+
+@pytest.mark.parametrize(
+    "payload_text",
+    [
+        pytest.param('```json\n{"decisions":[]}\n```', id="markdown-fence"),
+        pytest.param('result: {"decisions":[]}', id="leading-prose"),
+        pytest.param('{"decisions":[]} done', id="trailing-prose"),
+        pytest.param('{"version":"v1","version":"v2"}', id="duplicate-top-level"),
+        pytest.param('{"decisions":[{"symbol":"005930","symbol":"000660"}]}', id="duplicate-nested"),
+        pytest.param('{"confidence":NaN}', id="nan"),
+        pytest.param('{"confidence":Infinity}', id="infinity"),
+        pytest.param('{"confidence":1e9999}', id="exponent-overflow"),
+    ],
+)
+def test_watch_sizing_parser_rejects_ambiguous_json(payload_text: str) -> None:
+    with pytest.raises((ValueError, json.JSONDecodeError)):
+        watch_sizing._parse_json_text(payload_text)
+
+
+@pytest.mark.parametrize("value", ["NaN", "Infinity", "-Infinity"])
+def test_watch_sizing_numeric_helpers_reject_nonfinite_strings(value: str) -> None:
+    assert watch_sizing._positive_decimal(value) is None
+    assert watch_sizing._nonnegative_decimal(value) is None
+    assert watch_sizing._positive_int(value) is None
+
+
+def test_apply_decisions_rejects_unknown_item_mixed_with_expected_item() -> None:
+    plan = ExecutionPlan(
+        id="plan-1",
+        external_plan_id="plan-unknown-item",
+        strategy_run_id="strategy-1",
+        source="core-short-term-decider",
+        market_date=date(2026, 6, 4),
+        mode="paper",
+        items=[
+            _watch_item(
+                item_id="watch-item-1",
+                symbol="005930",
+                risk_context={"target_price": "76000", "stop_price": "69000"},
+            )
+        ],
+    )
+
+    with pytest.raises(ValueError, match="unknown execution_plan_item_id"):
+        _apply_decisions(
+            db=None,  # type: ignore[arg-type]
+            settings=Settings(runtime_mode="paper"),
+            plan=plan,
+            expected_item_ids={"watch-item-1"},
+            decision_payload={
+                "version": "manual-exec-agent-watch-sizing-v1",
+                "plan_id": "plan-unknown-item",
+                "decisions": [
+                    {
+                        "execution_plan_item_id": "watch-item-1",
+                        "symbol": "005930",
+                        "action": "reject",
+                        "quantity": 0,
+                    },
+                    {
+                        "execution_plan_item_id": "foreign-item",
+                        "symbol": "000660",
+                        "action": "approve",
+                        "quantity": 1,
+                    },
+                ],
+            },
+        )
+
+
+@pytest.mark.parametrize(
+    ("available_cash", "expected_approved", "expected_rejected"),
+    [
+        pytest.param("100000", 1, 1, id="one-share-then-reserved-cash-exhausted"),
+        pytest.param("60000", 0, 2, id="cash-below-executable-reference"),
+    ],
+)
+def test_apply_decisions_reserves_cash_between_approvals_in_the_same_response(
+    available_cash: str,
+    expected_approved: int,
+    expected_rejected: int,
+) -> None:
+    settings = Settings(
+        runtime_mode="live",
+        exec_agent_max_position_allocation_pct=Decimal("1"),
+    )
+    plan = ExecutionPlan(
+        id="plan-1",
+        external_plan_id="plan-intra-batch-cash-reservation",
+        strategy_run_id="strategy-1",
+        source="core-short-term-decider",
+        market_date=date(2026, 6, 4),
+        mode="live",
+        items=[
+                _watch_item(
+                    item_id="watch-item-1",
+                    symbol="005930",
+                    risk_context={"target_price": "76000", "stop_price": "71400"},
+                ),
+                _watch_item(
+                    item_id="watch-item-2",
+                    symbol="000660",
+                    risk_context={"target_price": "76000", "stop_price": "71400"},
+                ),
+        ],
+    )
+    account_context = _fresh_account_context(
+        orderable_cash_krw=available_cash,
+        buying_power_krw=available_cash,
+    )
+
+    summary = _apply_decisions(
+        db=None,  # type: ignore[arg-type]
+        settings=settings,
+        plan=plan,
+        account_context=account_context,
+        expected_item_ids={"watch-item-1", "watch-item-2"},
+        request_payload=_DIRECT_APPLY_REQUEST_PAYLOAD,
+        decision_payload={
+            "version": "manual-exec-agent-watch-sizing-v1",
+            "_runtime_provenance": _verified_sizing_runtime(settings),
+            "decisions": [
+                {
+                    "execution_plan_item_id": "watch-item-1",
+                    "symbol": "005930",
+                    "action": "approve",
+                    "quantity": 1,
+                    "approved_notional_krw": 71500,
+                    "sizing_price": "60000",
+                    "confidence": 0.60,
+                    "target_profile": "short_swing",
+                    "reason_code": "cash_probe_one",
+                    "reason": "first candidate consumes most available cash",
+                },
+                {
+                    "execution_plan_item_id": "watch-item-2",
+                    "symbol": "000660",
+                    "action": "approve",
+                    "quantity": 1,
+                    "approved_notional_krw": 71500,
+                    "sizing_price": "60000",
+                    "confidence": 0.60,
+                    "target_profile": "short_swing",
+                    "reason_code": "cash_probe_two",
+                    "reason": "second candidate requests the same remaining cash",
+                },
+            ],
+        },
+    )
+
+    assert summary["approved"] == expected_approved
+    assert summary["rejected"] == expected_rejected
+    assert summary["approved_notional_krw"] == (
+        "71500.0000" if expected_approved else "0.0000"
+    )
+    assert sum(item.status == "watch_monitoring_active" for item in plan.items) == (
+        expected_approved
+    )
+    rejected_items = [
+        item for item in plan.items if item.status == "exec_agent_rejected"
+    ]
+    assert len(rejected_items) == expected_rejected
+    assert all(
+        item.quantity_policy["allowed_action_envelope"]["max_quantity"] == 0
+        for item in rejected_items
+    )
+    approved_items = [
+        item for item in plan.items if item.status == "watch_monitoring_active"
+    ]
+    assert all(
+        item.quantity_policy["sizing_price"] == "71500.0000"
+        and item.quantity_policy["approved_notional"] == "71500.0000"
+        and item.quantity_policy["sizing_adjustment"]["final_notional"]
+        == "71500.0000"
+        for item in approved_items
+    )
+    assert account_context["orderable_cash_krw"] == available_cash
+
+
+def test_run_due_retries_the_entire_batch_after_a_partial_response(monkeypatch) -> None:
+    plan = ExecutionPlan(
+        id="plan-1",
+        external_plan_id="plan-retry-context",
+        strategy_run_id="strategy-1",
+        source="core-short-term-decider",
+        market_date=date(2026, 6, 4),
+        mode="live",
+        items=[
+            _watch_item(
+                item_id="watch-item-1",
+                symbol="005930",
+                risk_context={
+                    "target_price": "78000",
+                    "stop_price": "69000",
+                    "execution_feasibility_context": {
+                        "max_safe_notional_krw": "5000000",
+                        "liquidity_tier": "high",
+                    },
+                },
+            ),
+            _watch_item(
+                item_id="watch-item-2",
+                symbol="005931",
+                risk_context={
+                    "target_price": "78000",
+                    "stop_price": "69000",
+                    "execution_feasibility_context": {
+                        "max_safe_notional_krw": "800000",
+                        "liquidity_tier": "high",
+                    },
+                },
+            ),
+        ],
+    )
+    settings = Settings(
+        runtime_mode="live",
+        exec_agent_enabled=True,
+        exec_agent_watch_sizing_enabled=True,
+        exec_agent_watch_sizing_start_local_time="00:00",
+        exec_agent_watch_sizing_end_local_time="23:59",
+        exec_agent_watch_sizing_min_notional_krw=Decimal("100000"),
+        exec_agent_watch_sizing_high_conviction_min_notional_krw=Decimal("100000"),
+    )
+    account_context = _fresh_account_context(
+        observed_at="2026-06-04T00:00:00+00:00",
+    )
+    responses = [
+        {
+            "version": "manual-exec-agent-watch-sizing-v1",
+            "plan_id": "plan-retry-context",
+            "_runtime_provenance": _verified_sizing_runtime(settings),
+            "decisions": [
+                {
+                    "execution_plan_item_id": "watch-item-1",
+                    "symbol": "005930",
+                    "action": "approve",
+                    "quantity": 3,
+                    "approved_notional_krw": 214500,
+                    "sizing_price": "71500",
+                    "confidence": 0.68,
+                    "target_profile": "short_swing",
+                    "reason_code": "small_probe",
+                    "reason": "initial response omitted the second candidate",
+                }
+            ],
+        },
+        {
+            "version": "manual-exec-agent-watch-sizing-v1",
+            "plan_id": "plan-retry-context",
+            "_runtime_provenance": _verified_sizing_runtime(settings),
+            "decisions": [
+                {
+                    "execution_plan_item_id": "watch-item-1",
+                    "symbol": "005930",
+                    "action": "approve",
+                    "quantity": 3,
+                    "approved_notional_krw": 214500,
+                    "sizing_price": "71500",
+                    "confidence": 0.68,
+                    "target_profile": "short_swing",
+                    "reason_code": "small_probe_retry",
+                    "reason": "retry returns the complete batch",
+                },
+                {
+                    "execution_plan_item_id": "watch-item-2",
+                    "symbol": "005931",
+                    "action": "approve",
+                    "quantity": 3,
+                    "approved_notional_krw": 214500,
+                    "sizing_price": "71500",
+                    "confidence": 0.68,
+                    "target_profile": "short_swing",
+                    "reason_code": "small_probe_retry",
+                    "reason": "retry returns the complete batch",
+                }
+            ],
+        },
+    ]
+
+    class FakeSession:
+        def __init__(self) -> None:
+            self.committed = False
+
+        def commit(self) -> None:
+            self.committed = True
+
+    db = FakeSession()
+
+    def next_response(*, payload, **_) -> dict[str, object]:
+        response = responses.pop(0)
+        response["_runtime_provenance"] = _verified_sizing_runtime(
+            settings,
+            request_payload=payload,
+        )
+        return response
+
+    monkeypatch.setattr(watch_sizing, "_load_candidate_plans", lambda **_: [plan])
+    monkeypatch.setattr(
+        watch_sizing,
+        "_supersede_duplicate_watch_buys_before_sizing",
+        lambda **_: 0,
+    )
+    monkeypatch.setattr(watch_sizing, "_load_sizing_account_context", lambda **_: account_context)
+    monkeypatch.setattr(
+        watch_sizing,
+        "_request_exec_agent_decisions",
+        next_response,
+    )
+
+    result = run_due_watch_exec_agent_sizing(
+        settings=settings,
+        db=db,  # type: ignore[arg-type]
+        now=datetime(2026, 6, 4, 0, 0, tzinfo=UTC),
+    )
+
+    assert result.payload["applied"][0]["missing_item_ids"] == []
+    assert result.payload["applied"][0]["approved"] == 2
+    assert responses == []
+    assert db.committed is True
+    retry_policy = plan.items[1].quantity_policy
+    assert retry_policy["quantity"] == 3
+    assert retry_policy["approved_notional"] == "214500.0000"
+    assert retry_policy["sizing_adjustment"]["applied"] is False
+    assert retry_policy["sizing_adjustment"]["cap_notional"] == "214500.0000"
+    assert retry_policy["sizing_adjustment"]["runtime_cap_notional"] == "800000.0000"
+    assert retry_policy["sizing_adjustment"]["min_notional_upsize_suppressed"] is False
+    assert retry_policy["sizing_adjustment"]["reason"] is None
+
+
+def test_watch_sizing_request_binding_covers_candidate_account_caps_and_route() -> None:
+    request_started_at = datetime(2026, 6, 4, 0, 0, tzinfo=UTC)
+    item = _watch_item(
+        item_id="watch-bound",
+        symbol="005930",
+        risk_context={
+            "target_price": "76000",
+            "stop_price": "69000",
+            "execution_account_route": {
+                "version": "kis-account-route-v1",
+                "configured_route_fingerprint": "a" * 32,
+            },
+        },
+    )
+    plan = ExecutionPlan(
+        external_plan_id="plan-watch-bound",
+        market_date=date(2026, 6, 4),
+        items=[item],
+    )
+    candidate = _candidate_payload(item)
+    account = {
+        "available": True,
+        "observed_at": "2026-06-04T00:00:00+00:00",
+        "orderable_cash_krw": "1000000",
+        "holdings": [],
+        "open_orders": [],
+    }
+    baseline = _sizing_request_payload(
+        settings=Settings(runtime_mode="paper"),
+        plan=plan,
+        candidates=[candidate],
+        account_context=account,
+        candidate_universe=_candidate_universe_payload([candidate]),
+        request_started_at=request_started_at,
+    )
+    changed_account = _sizing_request_payload(
+        settings=Settings(runtime_mode="paper"),
+        plan=plan,
+        candidates=[candidate],
+        account_context={**account, "orderable_cash_krw": "900000"},
+        candidate_universe=_candidate_universe_payload([candidate]),
+        request_started_at=request_started_at,
+    )
+    changed_caps = _sizing_request_payload(
+        settings=Settings(
+            runtime_mode="paper",
+            exec_agent_max_symbol_budget=Decimal("900000"),
+        ),
+        plan=plan,
+        candidates=[candidate],
+        account_context=account,
+        candidate_universe=_candidate_universe_payload([candidate]),
+        request_started_at=request_started_at,
+    )
+    changed_candidate = deepcopy(candidate)
+    changed_candidate["target_price"] = "77000"
+    changed_economics = _sizing_request_payload(
+        settings=Settings(runtime_mode="paper"),
+        plan=plan,
+        candidates=[changed_candidate],
+        account_context=account,
+        candidate_universe=_candidate_universe_payload([changed_candidate]),
+        request_started_at=request_started_at,
+    )
+
+    binding = baseline["candidates"][0]["binding"]  # type: ignore[index]
+    assert binding["version"] == "watch-exec-agent-binding-v1"
+    assert binding["plan_id"] == "plan-watch-bound"
+    assert binding["item_id"] == "watch-bound"
+    assert binding["provider"] == "kis"
+    assert binding["asset_class"] == "stock"
+    assert binding["side"] == "buy"
+    assert binding["intent"] == "intraday_watch_buy"
+    assert len(binding["candidate_digest"]) == 64
+    assert len(binding["request_context_digest"]) == 64
+    assert binding["request_context_digest"] != changed_account["candidates"][0]["binding"]["request_context_digest"]  # type: ignore[index]
+    assert binding["request_context_digest"] != changed_caps["candidates"][0]["binding"]["request_context_digest"]  # type: ignore[index]
+    assert binding["candidate_digest"] != changed_economics["candidates"][0]["binding"]["candidate_digest"]  # type: ignore[index]
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_error"),
+    [
+        pytest.param("missing", "binding is missing", id="missing"),
+        pytest.param("mismatch", "binding mismatch", id="mismatch"),
+        pytest.param("expired", "binding expired", id="expired"),
+        pytest.param("partial", "missing decisions", id="partial"),
+    ],
+)
+def test_watch_sizing_response_requires_exact_current_binding(
+    mutation: str,
+    expected_error: str,
+) -> None:
+    items = [
+        _watch_item(
+            item_id=f"watch-binding-{index}",
+            symbol=symbol,
+            risk_context={"target_price": "76000", "stop_price": "69000"},
+        )
+        for index, symbol in enumerate(("005930", "000660"), start=1)
+    ]
+    plan = ExecutionPlan(external_plan_id="plan-watch-binding", items=items)
+    candidates = [_candidate_payload(item) for item in items]
+    request = _sizing_request_payload(
+        settings=Settings(runtime_mode="paper"),
+        plan=plan,
+        candidates=candidates,
+        account_context={"available": True, "orderable_cash_krw": "1000000"},
+        candidate_universe=_candidate_universe_payload(candidates),
+    )
+    decisions = [
+        {
+            "execution_plan_item_id": candidate["execution_plan_item_id"],
+            "symbol": candidate["symbol"],
+            "binding": deepcopy(candidate["binding"]),
+            "action": "reject",
+            "quantity": 0,
+        }
+        for candidate in request["candidates"]
+    ]
+    if mutation == "missing":
+        decisions[0].pop("binding")
+    elif mutation == "mismatch":
+        decisions[0]["binding"]["candidate_digest"] = "0" * 64
+    elif mutation == "expired":
+        expired = "2020-01-01T00:00:00+00:00"
+        request["candidates"][0]["binding"]["valid_until"] = expired
+        decisions[0]["binding"]["valid_until"] = expired
+    else:
+        decisions.pop()
+
+    with pytest.raises(ValueError, match=expected_error):
+        watch_sizing._validate_watch_response_bindings(
+            request_payload=request,
+            decision_payload={"decisions": decisions},
+        )
+
+
+def test_watch_sizing_binding_cannot_extend_a_299_second_old_snapshot() -> None:
+    request_started_at = datetime(2026, 6, 4, 0, 0, tzinfo=UTC)
+    item = _watch_item(
+        item_id="watch-old-snapshot-binding",
+        risk_context={"target_price": "76000", "stop_price": "69000"},
+    )
+    plan = ExecutionPlan(external_plan_id="plan-watch-old-snapshot", items=[item])
+    candidates = [_candidate_payload(item)]
+
+    request = _sizing_request_payload(
+        settings=Settings(
+            runtime_mode="live",
+            exec_agent_max_account_snapshot_age_seconds=300,
+            exec_agent_watch_sizing_timeout_seconds=900,
+        ),
+        plan=plan,
+        candidates=candidates,
+        account_context={
+            "available": True,
+            "buy_sizing_available": True,
+            "observed_at": (request_started_at - timedelta(seconds=299)).isoformat(),
+            "orderable_cash_krw": "1000000",
+            "buying_power_krw": "1000000",
+            "holdings": [],
+            "open_orders": [],
+            "open_orders_truth": {"available": True},
+        },
+        candidate_universe=_candidate_universe_payload(candidates),
+        request_started_at=request_started_at,
+    )
+
+    valid_until = datetime.fromisoformat(
+        request["candidates"][0]["binding"]["valid_until"]
+    )
+    assert valid_until == request_started_at + timedelta(seconds=1)
+
+
+def test_live_watch_sizing_discards_approval_after_account_snapshot_expires() -> None:
+    decision_at = datetime(2026, 6, 4, 0, 0, tzinfo=UTC)
+    item = _watch_item(
+        item_id="watch-expired-snapshot-apply",
+        risk_context={"target_price": "76000", "stop_price": "69000"},
+    )
+    plan = ExecutionPlan(external_plan_id="plan-watch-expired-snapshot", items=[item])
+
+    with pytest.raises(ValueError, match="account_snapshot_stale"):
+        _apply_decisions(
+            db=None,  # type: ignore[arg-type]
+            settings=Settings(
+                runtime_mode="live",
+                exec_agent_max_account_snapshot_age_seconds=300,
+            ),
+            plan=plan,
+            decision_payload={
+                "version": "manual-exec-agent-watch-sizing-v1",
+                "plan_id": plan.external_plan_id,
+                "decisions": [
+                    {
+                        "execution_plan_item_id": item.id,
+                        "symbol": item.symbol,
+                        "action": "approve",
+                        "quantity": 1,
+                        "approved_notional_krw": "71500",
+                        "sizing_price": "71500",
+                        "reason": "too late",
+                    }
+                ],
+            },
+            account_context={
+                "available": True,
+                "buy_sizing_available": True,
+                "observed_at": (decision_at - timedelta(seconds=301)).isoformat(),
+                "orderable_cash_krw": "1000000",
+                "buying_power_krw": "1000000",
+                "holdings": [],
+                "open_orders": [],
+            },
+            expected_item_ids={item.id},
+            now=decision_at,
+        )
+
+
+def test_next_open_candidate_uses_estimated_reference_with_explicit_provenance() -> None:
+    plan = ExecutionPlan(
+        id="plan-next-open-prompt",
+        external_plan_id="plan-next-open-prompt",
+        strategy_run_id="strategy-1",
+        market_date=date(2026, 6, 4),
+        mode="paper",
+        items=[_next_open_watch_item()],
+    )
+    candidate = _candidate_payload(plan.items[0])
+
+    assert candidate["intent"] == "next_open_buy"
+    assert candidate["estimated_reference_price"] == "71500"
+    assert candidate["entry_reference_price"] == "71500"
+    assert candidate["entry_reference_source"] == "quantity_policy.estimated_reference_price"
+
+    payload = _sizing_request_payload(
+        settings=Settings(runtime_mode="paper"),
+        plan=plan,
+        candidates=[candidate],
+        account_context={
+            "available": True,
+            "orderable_cash_krw": "1000000",
+            "buying_power_krw": "1000000",
+            "holdings": [],
+            "open_orders": [],
+        },
+        candidate_universe=_candidate_universe_payload([candidate]),
+    )
+
+    assert "next_open_buy" in payload["task"]
+    assert "estimated reference" in payload["task"]
+    assert "limit ceiling" in payload["task"]
+    assert "pending trigger-limit buys" not in payload["task"]
+
+
+def test_next_open_approval_materializes_one_limit_job_with_agent_provenance() -> None:
+    settings = Settings(
+        runtime_mode="paper",
+        exec_agent_model="openai/gpt-5.6-sol",
+        kis_account_number="12345678",
+        kis_account_product_code="01",
+        account_drawdown_recovery_scope_secret="route-binding-secret",
+    )
+    plan = ExecutionPlan(
+        id="plan-next-open-approved",
+        external_plan_id="plan-next-open-approved",
+        strategy_run_id="strategy-1",
+        source="core-signal-decider",
+        market_date=date(2026, 6, 4),
+        mode="paper",
+        items=[_next_open_watch_item(item_id="next-open-approved")],
+    )
+    decision_payload = {
+        "version": "manual-exec-agent-watch-sizing-v1",
+        "plan_id": plan.external_plan_id,
+        "_runtime_provenance": _verified_sizing_runtime(
+            settings,
+            session_id="session-next-open",
+        ),
+        "decisions": [
+            {
+                "execution_plan_item_id": "next-open-approved",
+                "symbol": "005930",
+                "action": "approve",
+                "quantity": 2,
+                "approved_notional_krw": "143000",
+                "sizing_price": "70000",
+                "confidence": 0.71,
+                "target_profile": "short_swing",
+                "reason_code": "approved",
+                "reason": "bounded next-open entry",
+            }
+        ],
+    }
+    account_context = {
+        "available": True,
+        "orderable_cash_krw": "1000000",
+        "buying_power_krw": "1000000",
+        "holdings": [],
+        "open_orders": [],
+    }
+    plan.items[0].risk_context, plan.items[0].quantity_policy = (
+        bind_kis_account_route(
+            settings=settings,
+            provider="kis",
+            risk_context=plan.items[0].risk_context,
+            quantity_policy=plan.items[0].quantity_policy,
+        )
+    )
+
+    summary = _apply_decisions(
+        db=None,  # type: ignore[arg-type]
+        settings=settings,
+        plan=plan,
+        decision_payload=decision_payload,
+        request_payload=_DIRECT_APPLY_REQUEST_PAYLOAD,
+        account_context=account_context,
+        expected_item_ids={"next-open-approved"},
+        now=datetime(2026, 6, 3, 23, 30, tzinfo=UTC),
+    )
+    item = plan.items[0]
+
+    assert summary["approved"] == 1
+    assert item.status == "next_open_buy_scheduled"
+    assert item.limit_price == Decimal("71500")
+    assert item.quantity_policy["kind"] == "shares"
+    assert item.quantity_policy["quantity"] == 2
+    assert item.quantity_policy["sizing_price"] == "71500.0000"
+    assert item.quantity_policy["approved_notional"] == "143000.0000"
+    assert "account_reference" not in str(item.quantity_policy)
+    assert "account_reference" not in str(item.risk_context)
+    assert item.risk_context["execution_account_route"]["version"] == (
+        "kis-account-route-v1"
+    )
+    assert item.quantity_policy["exec_agent_decision"]["runtime_provenance"][
+        "actual_model_ref"
+    ] == "openai/gpt-5.6-sol"
+    assert len(item.jobs) == 1
+    assert item.jobs[0].job_type == "next_open_buy"
+    assert item.jobs[0].status == "scheduled"
+    assert item.jobs[0].scheduled_for == datetime(2026, 6, 4, 0, 0, tzinfo=UTC)
+    assert Decimal(item.risk_context["stop_price"]) < item.limit_price
+    assert item.limit_price < Decimal(item.risk_context["target_price"])
+
+    retry = _apply_decisions(
+        db=None,  # type: ignore[arg-type]
+        settings=settings,
+        plan=plan,
+        decision_payload=decision_payload,
+        account_context=account_context,
+        expected_item_ids={"next-open-approved"},
+        now=datetime(2026, 6, 3, 23, 31, tzinfo=UTC),
+    )
+    assert retry["evaluated"] == 0
+    assert len(item.jobs) == 1
+
+
+def test_signal_next_open_ingress_persists_then_async_sizes_exactly_one_job(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'signal-next-open-async.db'}",
+        runtime_mode="paper",
+        exec_agent_enabled=True,
+        exec_agent_watch_sizing_enabled=True,
+        exec_agent_watch_sizing_start_local_time="00:00",
+        exec_agent_watch_sizing_end_local_time="23:59",
+        exec_agent_watch_sizing_max_attempts=1,
+        exec_agent_model="openai/gpt-5.6-sol",
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    command = ExecutionPlanRequest.model_validate(
+        {
+            "plan_id": "signal-next-open-async",
+            "source": "test-fixture",
+            "market_date": "2026-06-04",
+            "items": [
+                {
+                    "symbol": "005930",
+                    "side": "buy",
+                    "intent": "next_open_buy",
+                    "decision_agent_name": "signal-decider",
+                    "quantity_policy": {
+                        "type": "exec_agent_sized",
+                        "budget_krw": "150000",
+                        "estimated_reference_price": "71500",
+                    },
+                    "risk_context": {
+                        "exchange": "KRX",
+                        "target_price": "76000",
+                        "stop_price": "69000",
+                    },
+                }
+            ],
+        }
+    )
+    with session_factory() as db:
+        created = create_execution_plan(
+            settings=settings,
+            db=db,
+            command=command,
+        )
+        assert created.status_code == 201
+        item_id = str(created.payload["persisted_execution_item_ids"][0])
+    with session_factory() as db:
+        item = db.get(ExecutionPlanItem, item_id)
+        assert item is not None
+        assert item.status == "watch_monitoring_pending"
+        assert item.quantity_policy["type"] == "exec_agent_sized"
+        assert db.scalars(select(ExecutionJob)).all() == []
+
+    observed_candidates: list[dict[str, object]] = []
+
+    def approve(**kwargs: object) -> dict[str, object]:
+        payload = kwargs["payload"]
+        assert isinstance(payload, dict)
+        candidates = payload["candidates"]
+        assert isinstance(candidates, list) and isinstance(candidates[0], dict)
+        observed_candidates.extend(candidates)
+        return {
+            "version": "manual-exec-agent-watch-sizing-v1",
+            "plan_id": "signal-next-open-async",
+            "_runtime_provenance": _verified_sizing_runtime(
+                settings,
+                session_id="signal-next-open-session",
+                request_payload=payload,
+            ),
+            "decisions": [
+                {
+                    "execution_plan_item_id": item_id,
+                    "symbol": "005930",
+                    "action": "approve",
+                    "quantity": 2,
+                    "approved_notional_krw": "143000",
+                    "sizing_price": "71500",
+                    "confidence": "0.7",
+                    "target_profile": "short_swing",
+                    "reason_code": "approved",
+                    "reason": "bounded signal entry",
+                }
+            ],
+        }
+
+    monkeypatch.setattr(watch_sizing, "_request_exec_agent_decisions", approve)
+    result = run_due_watch_exec_agent_sizing(
+        settings=settings,
+        session_factory=session_factory,
+        adapter=WatchSizingBrokerStub(
+            reconcile_payloads=[],
+            snapshot=BrokerAccountSnapshot(
+                available_cash=Decimal("10000000"),
+                buying_power=Decimal("10000000"),
+                observed_at=datetime(2026, 6, 3, 23, 30, tzinfo=UTC),
+                source="stub:account_snapshot",
+            ),
+        ),
+        now=datetime(2026, 6, 3, 23, 30, tzinfo=UTC),
+    )
+
+    assert result.payload["applied"][0]["approved"] == 1
+    assert observed_candidates[0]["entry_reference_price"] == "71500"
+    assert observed_candidates[0]["entry_reference_source"] == (
+        "quantity_policy.estimated_reference_price"
+    )
+    with session_factory() as db:
+        item = db.get(ExecutionPlanItem, item_id)
+        assert item is not None
+        assert item.status == "next_open_buy_scheduled"
+        assert item.limit_price == Decimal("71500")
+        assert item.quantity_policy["approval_provenance"]["kind"] == (
+            "verified_exec_agent_watch_sizing"
+        )
+        jobs = db.scalars(select(ExecutionJob)).all()
+        assert len(jobs) == 1
+        assert jobs[0].execution_plan_item_id == item.id
+
+    retry = run_due_watch_exec_agent_sizing(
+        settings=settings,
+        session_factory=session_factory,
+        adapter=WatchSizingBrokerStub(reconcile_payloads=[]),
+        now=datetime(2026, 6, 3, 23, 31, tzinfo=UTC),
+    )
+    assert retry.payload["reason"] == "no_unsized_watch_candidates"
+    with session_factory() as db:
+        assert len(db.scalars(select(ExecutionJob)).all()) == 1
+    engine.dispose()
+
+
+def test_next_open_sizing_quarantines_a_candidate_bound_to_another_account(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_url = f"sqlite:///{tmp_path / 'foreign-next-open-binding.db'}"
+    original_settings = Settings(
+        database_url=database_url,
+        runtime_mode="paper",
+        exec_agent_enabled=True,
+        exec_agent_watch_sizing_enabled=True,
+        exec_agent_watch_sizing_start_local_time="00:00",
+        exec_agent_watch_sizing_end_local_time="23:59",
+        kis_account_number="12345678",
+        kis_account_product_code="01",
+        account_drawdown_recovery_scope_secret="stable-route-binding-secret-for-tests",
+    )
+    rotated_settings = original_settings.model_copy(
+        update={"kis_account_number": "87654321"}
+    )
+    engine = create_db_engine(original_settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    item = _next_open_watch_item(item_id="foreign-next-open")
+    item.status = "pending"
+    item.risk_context, item.quantity_policy = bind_kis_account_route(
+        settings=original_settings,
+        provider="kis",
+        risk_context=item.risk_context,
+        quantity_policy=item.quantity_policy,
+    )
+    with session_factory() as db:
+        db.add(
+            ExecutionPlan(
+                external_plan_id="foreign-next-open-plan",
+                source="core-signal-decider",
+                market_date=date(2026, 6, 4),
+                mode="paper",
+                status="accepted",
+                items=[item],
+            )
+        )
+        db.commit()
+
+    agent_was_called = False
+
+    def unexpected_agent_call(**_kwargs: object) -> dict[str, object]:
+        nonlocal agent_was_called
+        agent_was_called = True
+        return {
+            "version": "manual-exec-agent-watch-sizing-v1",
+            "plan_id": "foreign-next-open-plan",
+            "decisions": [
+                {
+                    "execution_plan_item_id": item.id,
+                    "symbol": item.symbol,
+                    "action": "reject",
+                    "reason_code": "test",
+                    "reason": "should not be consulted",
+                }
+            ],
+        }
+
+    monkeypatch.setattr(
+        watch_sizing,
+        "_request_exec_agent_decisions",
+        unexpected_agent_call,
+    )
+    adapter = WatchSizingBrokerStub(reconcile_payloads=[])
+
+    result = run_due_watch_exec_agent_sizing(
+        settings=rotated_settings,
+        session_factory=session_factory,
+        adapter=adapter,
+        now=datetime(2026, 6, 3, 23, 30, tzinfo=UTC),
+    )
+
+    assert agent_was_called is False
+    assert "snapshot" not in adapter.events
+    assert result.payload["applied"][0]["account_route_mismatch_item_ids"] == [
+        item.id
+    ]
+    with session_factory() as db:
+        persisted = db.get(ExecutionPlanItem, item.id)
+        assert persisted is not None
+        assert persisted.status == "exec_agent_rejected"
+        assert persisted.risk_context["watch_exec_agent_account_route_guard"][
+            "reason_code"
+        ] == "account_route_mismatch"
+    engine.dispose()
+
+
+def test_next_open_approval_at_market_open_is_terminal_without_a_job() -> None:
+    plan = ExecutionPlan(
+        id="plan-next-open-late",
+        external_plan_id="plan-next-open-late",
+        strategy_run_id="strategy-1",
+        source="core-signal-decider",
+        market_date=date(2026, 6, 4),
+        mode="paper",
+        items=[_next_open_watch_item(item_id="next-open-late")],
+    )
+
+    summary = _apply_decisions(
+        db=None,  # type: ignore[arg-type]
+        settings=Settings(runtime_mode="paper"),
+        plan=plan,
+        decision_payload={
+            "version": "manual-exec-agent-watch-sizing-v1",
+            "plan_id": plan.external_plan_id,
+            "decisions": [
+                {
+                    "execution_plan_item_id": "next-open-late",
+                    "symbol": "005930",
+                    "action": "approve",
+                    "quantity": 2,
+                    "approved_notional_krw": "143000",
+                    "sizing_price": "71500",
+                    "reason_code": "approved",
+                    "reason": "response arrived at the deadline",
+                }
+            ],
+        },
+        account_context={
+            "available": True,
+            "orderable_cash_krw": "1000000",
+            "buying_power_krw": "1000000",
+            "holdings": [],
+            "open_orders": [],
+        },
+        expected_item_ids={"next-open-late"},
+        now=datetime(2026, 6, 4, 0, 0, tzinfo=UTC),
+    )
+
+    assert summary["approved"] == 0
+    assert summary["rejected"] == 1
+    assert plan.items[0].status == "next_open_buy_expired"
+    assert plan.items[0].quantity_policy["reason_code"] == "missed_next_open_window"
+    assert plan.items[0].jobs == []
+
+
+def test_next_open_approval_without_runtime_provenance_is_rejected_preopen() -> None:
+    plan = ExecutionPlan(
+        id="plan-next-open-unverified-runtime",
+        external_plan_id="plan-next-open-unverified-runtime",
+        strategy_run_id="strategy-1",
+        source="core-signal-decider",
+        market_date=date(2026, 6, 4),
+        mode="paper",
+        items=[_next_open_watch_item(item_id="next-open-unverified")],
+    )
+
+    summary = _apply_decisions(
+        db=None,  # type: ignore[arg-type]
+        settings=Settings(runtime_mode="paper"),
+        plan=plan,
+        decision_payload={
+            "version": "manual-exec-agent-watch-sizing-v1",
+            "plan_id": plan.external_plan_id,
+            "decisions": [
+                {
+                    "execution_plan_item_id": "next-open-unverified",
+                    "symbol": "005930",
+                    "action": "approve",
+                    "quantity": 1,
+                    "approved_notional_krw": "71500",
+                    "sizing_price": "71500",
+                    "reason_code": "approved",
+                    "reason": "missing runtime envelope",
+                }
+            ],
+        },
+        account_context={
+            "available": True,
+            "orderable_cash_krw": "1000000",
+            "buying_power_krw": "1000000",
+            "holdings": [],
+            "open_orders": [],
+        },
+        expected_item_ids={"next-open-unverified"},
+        now=datetime(2026, 6, 3, 23, 30, tzinfo=UTC),
+    )
+
+    assert summary["approved"] == 0
+    assert summary["rejected"] == 1
+
+
+@pytest.mark.parametrize(
+    "runtime_provenance",
+    [
+        None,
+        {
+            "actual_agent_id": "other-agent",
+            "actual_model_ref": "openai/gpt-5.6-sol",
+            "session_id": "session-1",
+        },
+        {
+            "actual_agent_id": "exec-agent",
+            "actual_model_ref": "other/model",
+            "session_id": "session-1",
+        },
+        {
+            "actual_agent_id": "exec-agent",
+            "actual_model_ref": "openai/gpt-5.6-sol",
+            "session_id": None,
+        },
+    ],
+    ids=["missing", "wrong-agent", "wrong-model", "missing-run"],
+)
+def test_live_intraday_watch_approval_requires_exact_runtime_provenance(
+    runtime_provenance: dict[str, object] | None,
+) -> None:
+    decided_at = datetime(2026, 6, 4, 0, 0, tzinfo=UTC)
+    item = _watch_item(
+        item_id="live-intraday-runtime-proof",
+        risk_context={"target_price": "78000", "stop_price": "69000"},
+    )
+    plan = ExecutionPlan(
+        external_plan_id="plan-live-intraday-runtime-proof",
+        items=[item],
+    )
+    payload: dict[str, object] = {
+        "version": "manual-exec-agent-watch-sizing-v1",
+        "plan_id": plan.external_plan_id,
+        "decisions": [
+            {
+                "execution_plan_item_id": item.id,
+                "symbol": item.symbol,
+                "action": "approve",
+                "quantity": 1,
+                "approved_notional_krw": "71500",
+                "sizing_price": "71500",
+                "reason": "must not be trusted",
+            }
+        ],
+    }
+    if runtime_provenance is not None:
+        payload["_runtime_provenance"] = runtime_provenance
+
+    summary = _apply_decisions(
+        db=None,  # type: ignore[arg-type]
+        settings=Settings(runtime_mode="live"),
+        plan=plan,
+        decision_payload=payload,
+        account_context={
+            "available": True,
+            "buy_sizing_available": True,
+            "observed_at": decided_at.isoformat(),
+            "orderable_cash_krw": "1000000",
+            "buying_power_krw": "1000000",
+            "holdings": [],
+            "open_orders": [],
+        },
+        expected_item_ids={item.id},
+        now=decided_at,
+    )
+
+    assert summary["approved"] == 0
+    assert summary["rejected"] == 1
+    assert item.status == "exec_agent_rejected"
+    assert item.quantity_policy["reason_code"] == "unverified_exec_agent_runtime"
+    assert plan.items[0].status == "exec_agent_rejected"
+    decision = plan.items[0].quantity_policy["exec_agent_decision"]
+    assert decision["reason_code"] == "unverified_exec_agent_runtime"
+    assert plan.items[0].jobs == []
+
+
+def test_apply_decisions_audits_the_final_target_geometry_rejection(tmp_path) -> None:
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'watch-sizing-final-audit.db'}",
+        runtime_mode="paper",
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+
+    with session_factory() as session:
+        plan = ExecutionPlan(
+            external_plan_id="plan-final-audit",
+            strategy_run_id="strategy-1",
+            source="core-short-term-decider",
+            market_date=date(2026, 6, 4),
+            mode="paper",
+            items=[
+                _watch_item(
+                    item_id="watch-item-final-audit",
+                    symbol="005930",
+                    risk_context={"target_price": "71000", "stop_price": "59000"},
+                )
+            ],
+        )
+        session.add(plan)
+        session.commit()
+        plan_id = plan.id
+
+    with session_factory() as session:
+        plan = watch_sizing._load_plan_for_update(db=session, plan_id=plan_id)
+        summary = _apply_decisions(
+            db=session,
+            settings=settings,
+            plan=plan,
+            account_context={
+                "available": True,
+                "orderable_cash_krw": "10000000",
+                "buying_power_krw": "10000000",
+                "holdings": [],
+                "open_orders": [],
+            },
+            expected_item_ids={"watch-item-final-audit"},
+            request_payload=_DIRECT_APPLY_REQUEST_PAYLOAD,
+            decision_payload={
+                "version": "manual-exec-agent-watch-sizing-v1",
+                "_runtime_provenance": _verified_sizing_runtime(
+                    settings,
+                    session_id="session-final-audit",
+                ),
+                "decisions": [
+                    {
+                        "execution_plan_item_id": "watch-item-final-audit",
+                        "symbol": "005930",
+                        "action": "approve",
+                        "quantity": 3,
+                        "approved_notional_krw": 214500,
+                        "sizing_price": "60000",
+                        "confidence": 0.68,
+                        "target_profile": "short_swing",
+                        "reason_code": "agent_approve",
+                        "reason": "agent requested approval",
+                    }
+                ],
+            },
+        )
+        session.commit()
+
+    assert summary["approved"] == 0
+    assert summary["rejected"] == 1
+    with session_factory() as session:
+        decision_audit = session.scalar(
+            select(ExecutionPlanItemAudit).where(
+                ExecutionPlanItemAudit.event_type == "watch_exec_agent_sizing_decision"
+            )
+        )
+        assert decision_audit is not None
+        assert decision_audit.summary["action"] == "reject"
+        assert decision_audit.summary["reason_code"] == "allowed_action_envelope_blocked"
+        assert decision_audit.payload["agent_decision"]["action"] == "approve"
+        assert decision_audit.payload["final_decision"]["action"] == "reject"
+        assert "invalid_target_distance" in decision_audit.payload[
+            "deterministic_context"
+        ]["allowed_action_envelope"]["hard_reject_reasons"]
+        assert decision_audit.payload["deterministic_context"][
+            "allowed_action_envelope"
+        ]["reference_price"] == "71500.0000"
+        assert decision_audit.payload["runtime_provenance"]["configured_model_hint"] == "openai/gpt-5.6-sol"
+        assert decision_audit.payload["runtime_provenance"]["actual_model_ref"] == "openai/gpt-5.6-sol"
+
+
+def test_exec_agent_request_removes_temporary_payload_file(tmp_path, monkeypatch) -> None:
+    original_named_temporary_file = watch_sizing.tempfile.NamedTemporaryFile
+    captured: dict[str, object] = {}
+
+    def named_temporary_file(*args, **kwargs):
+        return original_named_temporary_file(*args, dir=tmp_path, **kwargs)
+
+    monkeypatch.setattr(watch_sizing.tempfile, "NamedTemporaryFile", named_temporary_file)
+
+    def run_exec_agent_command(command, **_):
+        captured["command"] = command
+        message_path = Path(command[command.index("--message-file") + 1])
+        captured["message"] = message_path.read_text(encoding="utf-8")
+        return SimpleNamespace(
+            stdout=(
+                '{"meta":{"agentMeta":{"sessionId":"session-temp-cleanup",'
+                '"agentId":"exec-agent","provider":"openai","model":"gpt-5.6-sol"}},"payloads":[{"text":"'
+                '{\\"version\\":\\"manual-exec-agent-watch-sizing-v1\\",'
+                '\\"plan_id\\":\\"plan-temp-cleanup\\",\\"decisions\\":[]}'
+                '"}]}'
+            )
+        )
+
+    monkeypatch.setattr(watch_sizing, "_run_exec_agent_command", run_exec_agent_command)
+    monkeypatch.setattr(
+        watch_sizing,
+        "capture_runtime_contract",
+        lambda **_: matching_runtime_contract_snapshot(),
+    )
+
+    response = watch_sizing._request_exec_agent_decisions(
+        settings=Settings(runtime_mode="paper"),
+        payload={"plan_id": "plan-temp-cleanup", "candidates": []},
+    )
+
+    assert response["plan_id"] == "plan-temp-cleanup"
+    assert "--message-file" in captured["command"]
+    assert "--message" not in captured["command"]
+    assert captured["command"][captured["command"].index("--model") + 1] == (
+        Settings().exec_agent_model
+    )
+    assert '"plan_id": "plan-temp-cleanup"' in captured["message"]
+    assert "Read /" not in captured["message"]
+    provenance = response["_runtime_provenance"]
+    assert isinstance(provenance, dict)
+    assert {
+        key: value
+        for key, value in provenance.items()
+        if key not in {"runtime_contract", "requested_session_key", "request_sha256"}
+    } == {
+        "agent_id": "exec-agent",
+        "configured_agent_id": "exec-agent",
+        "configured_model_hint": "openai/gpt-5.6-sol",
+        "actual_agent_id": "exec-agent",
+        "actual_provider": "openai",
+        "actual_model": "gpt-5.6-sol",
+        "actual_model_ref": "openai/gpt-5.6-sol",
+        "session_id": "session-temp-cleanup",
+    }
+    assert str(provenance["requested_session_key"]).startswith("watch-sizing-")
+    assert runtime_contract_proof_is_valid(
+        provenance["runtime_contract"],
+        agent_id="exec-agent",
+        expected_model_ref=Settings().exec_agent_model,
+        requested_session_key=str(provenance["requested_session_key"]),
+        reported_session_id="session-temp-cleanup",
+        request_sha256=str(provenance["request_sha256"]),
+    )
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_watch_sizing_timeout_closes_pipes_without_unbounded_communicate(
+    monkeypatch,
+) -> None:
+    class Pipe:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    class HungProcess:
+        pid = 4321
+        returncode = None
+
+        def __init__(self) -> None:
+            self.stdout = Pipe()
+            self.stderr = Pipe()
+            self.communicate_calls = 0
+            self.wait_calls = 0
+
+        def communicate(self, *, timeout=None):
+            self.communicate_calls += 1
+            if self.communicate_calls > 1:
+                raise AssertionError("timed-out command must not communicate again")
+            raise watch_sizing.subprocess.TimeoutExpired(
+                cmd=["hung-agent"],
+                timeout=timeout,
+                output="partial stdout",
+                stderr="partial stderr",
+            )
+
+        def wait(self, *, timeout=None):
+            self.wait_calls += 1
+            raise watch_sizing.subprocess.TimeoutExpired(
+                cmd=["hung-agent"],
+                timeout=timeout,
+            )
+
+    process = HungProcess()
+    signals: list[int] = []
+    monkeypatch.setattr(
+        watch_sizing.subprocess,
+        "Popen",
+        lambda *args, **kwargs: process,
+    )
+    monkeypatch.setattr(
+        watch_sizing.os,
+        "killpg",
+        lambda pid, sent_signal: signals.append(sent_signal),
+    )
+
+    with pytest.raises(watch_sizing.subprocess.TimeoutExpired) as raised:
+        watch_sizing._run_exec_agent_command(
+            ["hung-agent"],
+            timeout_seconds=1,
+        )
+
+    assert raised.value.output == "partial stdout"
+    assert raised.value.stderr == "partial stderr"
+    assert process.communicate_calls == 1
+    assert process.wait_calls == 2
+    assert signals == [watch_sizing.signal.SIGTERM, watch_sizing.signal.SIGKILL]
+    assert process.stdout.closed is True
+    assert process.stderr.closed is True
+
+
+def test_watch_sizing_write_reload_locks_and_refreshes_plan_items() -> None:
+    statements: list[object] = []
+    expected = ExecutionPlan(
+        id="plan-lock",
+        external_plan_id="external-plan-lock",
+        source="core-short-term-decider",
+        mode="paper",
+    )
+    expected_item = ExecutionPlanItem(
+        id="item-lock",
+        execution_plan_id=expected.id,
+        plan_item_index=0,
+        symbol="005930",
+        side="buy",
+        intent="watch",
+    )
+
+    class ScalarResult:
+        def __init__(self, values):
+            self.values = values
+
+        def one(self):
+            return self.values[0]
+
+        def all(self):
+            return self.values
+
+    class RecordingSession:
+        def scalars(self, statement):
+            statements.append(statement)
+            if len(statements) == 1:
+                return ScalarResult([expected])
+            return ScalarResult([expected_item])
+
+    loaded = watch_sizing._load_plan_for_update(
+        db=RecordingSession(),
+        plan_id="plan-lock",
+    )
+
+    assert loaded is expected
+    assert loaded.items == [expected_item]
+    assert len(statements) == 2
+    assert statements[0]._for_update_arg is not None
+    assert statements[1]._for_update_arg is not None
+    assert statements[1].get_execution_options()["populate_existing"] is True
+    assert len(statements[1]._order_by_clauses) == 2
+
+
+def test_execution_jobs_enforce_one_job_type_per_plan_item() -> None:
+    unique_column_sets = {
+        tuple(column.name for column in constraint.columns)
+        for constraint in ExecutionJob.__table__.constraints
+        if isinstance(constraint, UniqueConstraint)
+    }
+
+    assert ("execution_plan_item_id", "job_type") in unique_column_sets

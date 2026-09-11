@@ -4,8 +4,12 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from app.core.config import Settings
+
+
+_MARKET_BREADTH_MAX_FUTURE_SKEW_SECONDS = 30
 
 
 @dataclass(frozen=True)
@@ -352,16 +356,22 @@ def _breadth_stale(
     evaluated_at: datetime,
 ) -> bool:
     observed_date = _date_value(_first_present(breadth, ("market_date", "date", "as_of_date", "trading_date")))
-    expected_date = _date_value(market_date) or evaluated_at.date()
-    if observed_date is not None and observed_date < expected_date:
-        return True
+    market_timezone = ZoneInfo(settings.market_timezone)
+    normalized_evaluated_at = evaluated_at if evaluated_at.tzinfo is not None else evaluated_at.replace(tzinfo=UTC)
+    expected_date = _date_value(market_date) or normalized_evaluated_at.astimezone(market_timezone).date()
     observed_at = _datetime_value(_first_present(breadth, ("observed_at", "as_of", "created_at", "updated_at")))
-    if observed_at is None:
-        return False
-    if observed_at.tzinfo is None:
-        observed_at = observed_at.replace(tzinfo=UTC)
+    if observed_at is None or observed_at.tzinfo is None:
+        return True
+    normalized_observed_at = observed_at.astimezone(UTC)
+    if observed_date is None or observed_date != expected_date:
+        return True
+    if observed_at.astimezone(market_timezone).date() != observed_date:
+        return True
+    age_seconds = (normalized_evaluated_at.astimezone(UTC) - normalized_observed_at).total_seconds()
+    if age_seconds < -_MARKET_BREADTH_MAX_FUTURE_SKEW_SECONDS:
+        return True
     max_age = int(settings.market_regime_breadth_max_age_seconds)
-    return (evaluated_at - observed_at.astimezone(UTC)).total_seconds() > max_age
+    return age_seconds > max_age
 
 
 def _audit_payload(

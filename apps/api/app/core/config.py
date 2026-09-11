@@ -7,6 +7,7 @@ from typing import Literal, Mapping
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 RuntimeMode = Literal["mock", "paper", "live"]
+RuntimeBrokerProvider = Literal["kis", "alpaca", "upbit"]
 LogFormat = Literal["json", "plain"]
 
 
@@ -16,7 +17,11 @@ class Settings(BaseModel):
     service_name: str = "kai-trading-exec"
     environment: str = "local"
     runtime_mode: RuntimeMode = "mock"
-    database_url: str = "sqlite:///./var/kai_trading_exec.db"
+    runtime_broker_provider: RuntimeBrokerProvider = "kis"
+    database_url: str = Field(
+        default="sqlite:///./var/kai_trading_exec.db",
+        repr=False,
+    )
     db_pool_size: int = Field(default=10, ge=1, le=200)
     db_max_overflow: int = Field(default=10, ge=0, le=200)
     db_pool_timeout_seconds: float = Field(default=5.0, gt=0, le=120)
@@ -30,18 +35,25 @@ class Settings(BaseModel):
     log_format: LogFormat = "json"
     api_host: str = "127.0.0.1"
     api_port: int = Field(default=8010, ge=1, le=65535)
-    api_bearer_token: str | None = None
+    api_bearer_token: str | None = Field(default=None, repr=False)
     automation_enabled: bool = False
     autonomous_runtime_enabled: bool = False
     dispatch_loop_interval_seconds: float = Field(default=1.0, gt=0, le=3600)
     monitoring_loop_interval_seconds: float = Field(default=1.0, gt=0, le=3600)
     monitoring_cycle_timeout_seconds: float = Field(default=20.0, gt=0, le=3600)
     monitoring_expire_prior_market_watch_buys_enabled: bool = True
+    monitoring_watch_buy_max_age_trading_sessions: int = Field(default=2, ge=1, le=10)
     monitoring_max_symbols_per_cycle: int = Field(default=128, ge=0, le=10000)
     monitoring_auto_symbol_batch_target_seconds: float = Field(default=12.0, gt=0, le=300)
     monitoring_max_broker_actions_per_cycle: int = Field(default=32, ge=0, le=10000)
     monitoring_max_quote_age_seconds: int = Field(default=30, ge=1, le=3600)
     monitoring_max_quote_future_skew_seconds: int = Field(default=5, ge=0, le=300)
+    next_open_buy_initial_submission_grace_seconds: int = Field(
+        default=300,
+        ge=0,
+        le=3600,
+    )
+    krx_market_holiday_dates: str = ""
     monitoring_watch_buy_retry_cooldown_seconds: int = Field(default=5, ge=1, le=3600)
     monitoring_exit_on_stale_cycle_enabled: bool = False
     monitoring_stale_cycle_exit_grace_multiplier: float = Field(default=2.0, ge=1.0, le=20.0)
@@ -70,7 +82,7 @@ class Settings(BaseModel):
     market_timezone: str = "Asia/Seoul"
     exec_agent_enabled: bool = False
     exec_agent_id: str = "exec-agent"
-    exec_agent_model: str = "openai-codex/gpt-5.5"
+    exec_agent_model: str = "openai/gpt-5.6-sol"
     exec_agent_max_symbol_budget: Decimal = Field(default=Decimal("3000000"), gt=0)
     exec_agent_max_total_budget: Decimal = Field(default=Decimal("9000000"), gt=0)
     exec_agent_base_risk_pct: Decimal = Field(default=Decimal("0.015"), gt=0, le=Decimal("0.015"))
@@ -96,6 +108,18 @@ class Settings(BaseModel):
     exec_agent_trigger_time_enabled: bool = True
     exec_agent_trigger_time_sell_enabled: bool = True
     exec_agent_trigger_time_timeout_seconds: int = Field(default=900, ge=10, le=3600)
+    kis_krx_round_trip_non_spread_cost_bps: Decimal = Field(
+        default=Decimal("50"),
+        ge=0,
+    )
+    kis_us_round_trip_non_spread_cost_bps: Decimal | None = Field(
+        default=None,
+        ge=0,
+    )
+    alpaca_us_equity_round_trip_non_spread_cost_bps: Decimal = Field(
+        default=Decimal("0"),
+        ge=0,
+    )
     monthly_target_krw: Decimal = Field(default=Decimal("500000"), gt=0)
     monthly_capital_preservation_enabled: bool = True
     monthly_aggressive_lag_ratio: Decimal = Field(default=Decimal("0.75"), gt=0, le=1)
@@ -147,7 +171,11 @@ class Settings(BaseModel):
         ge=0,
         le=300,
     )
-    account_drawdown_recovery_scope_secret: str | None = None
+    account_drawdown_recovery_scope_secret: str | None = Field(
+        default=None,
+        repr=False,
+    )
+    execution_position_account_scope: str | None = Field(default=None, repr=False)
     hourly_plan_judgment_recovery_required_healthy_observations: int = Field(
         default=2,
         ge=2,
@@ -162,6 +190,16 @@ class Settings(BaseModel):
         default=300,
         ge=1,
         le=3600,
+    )
+    core_buy_authority_max_observation_age_seconds: int = Field(
+        default=420,
+        ge=60,
+        le=3600,
+    )
+    core_buy_authority_max_future_skew_seconds: int = Field(
+        default=5,
+        ge=0,
+        le=300,
     )
     vol_corr_sizing_enabled: bool = False
     vol_corr_volatility_lookback_days: int = Field(default=20, ge=2, le=252)
@@ -195,7 +233,7 @@ class Settings(BaseModel):
     market_regime_sector_weak_relative_return_pct: Decimal = Field(default=Decimal("-2.0"), ge=Decimal("-100"), le=Decimal("100"))
     market_context_enabled: bool = False
     market_context_base_url: str | None = None
-    market_context_bearer_token: str | None = None
+    market_context_bearer_token: str | None = Field(default=None, repr=False)
     market_context_timeout_seconds: float = Field(default=5.0, gt=0, le=120)
     market_context_cache_ttl_seconds: int = Field(default=60, ge=1, le=3600)
     trade_outcome_feedback_enabled: bool = True
@@ -209,21 +247,27 @@ class Settings(BaseModel):
     )
     weekly_trade_review_dir: str = "var/analytics/weekly_trade_review"
     openclaw_cli_path: str = "openclaw"
-    kis_app_key: str | None = None
-    kis_app_secret: str | None = None
-    kis_account_number: str | None = None
+    kis_app_key: str | None = Field(default=None, repr=False)
+    kis_app_secret: str | None = Field(default=None, repr=False)
+    kis_account_number: str | None = Field(default=None, repr=False)
     kis_account_product_code: str = "01"
-    kis_hts_id: str | None = None
+    kis_hts_id: str | None = Field(default=None, repr=False)
     kis_base_url: str = "https://openapi.koreainvestment.com:9443"
     kis_mock_base_url: str = "https://openapivts.koreainvestment.com:29443"
     kis_customer_type: str = "P"
     kis_use_hashkey: bool = True
     kis_request_timeout_seconds: int = Field(default=10, ge=1, le=120)
     kis_min_request_interval_seconds: float = Field(default=0.12, ge=0, le=10)
+    kis_token_refresh_margin_seconds: int = Field(default=300, ge=0, le=172_799)
+    kis_token_failure_cooldown_seconds: int = Field(default=60, ge=60, le=3600)
+    kis_token_request_timeout_seconds: int = Field(default=15, ge=1, le=120)
+    kis_token_issuance_lease_seconds: int = Field(default=90, ge=75, le=3600)
+    kis_token_min_issue_interval_seconds: int = Field(default=60, ge=60, le=3600)
+    kis_token_cache_directory: str = "~/.cache/kai-trading/kis-oauth-tokens"
     kis_us_trading_enabled: bool = False
     kis_us_live_trading_enabled: bool = False
-    kis_us_live_confirmation_token: str | None = None
-    kis_us_account_allowlist: str = ""
+    kis_us_live_confirmation_token: str | None = Field(default=None, repr=False)
+    kis_us_account_allowlist: str = Field(default="", repr=False)
     kis_us_max_order_notional_usd: Decimal = Field(default=Decimal("100"), gt=0)
     kis_us_max_total_exposure_usd: Decimal = Field(default=Decimal("1000"), gt=0)
     kis_us_daily_realized_loss_limit_usd: Decimal = Field(default=Decimal("25"), gt=0)
@@ -233,13 +277,13 @@ class Settings(BaseModel):
     kis_us_severe_holding_loss_pct: Decimal = Field(default=Decimal("10"), gt=0, le=Decimal("100"))
     kis_us_allow_degraded_realized_pnl_coverage: bool = False
     kis_us_preflight_buying_power_enabled: bool = True
-    upbit_access_key: str | None = None
-    upbit_secret_key: str | None = None
+    upbit_access_key: str | None = Field(default=None, repr=False)
+    upbit_secret_key: str | None = Field(default=None, repr=False)
     upbit_base_url: str = "https://api.upbit.com"
     upbit_live_trading_enabled: bool = False
     upbit_request_timeout_seconds: int = Field(default=10, ge=1, le=120)
-    alpaca_api_key: str | None = None
-    alpaca_api_secret: str | None = None
+    alpaca_api_key: str | None = Field(default=None, repr=False)
+    alpaca_api_secret: str | None = Field(default=None, repr=False)
     alpaca_live_base_url: str = "https://api.alpaca.markets"
     alpaca_paper_base_url: str = "https://paper-api.alpaca.markets"
     alpaca_data_base_url: str = "https://data.alpaca.markets"
@@ -279,6 +323,16 @@ class Settings(BaseModel):
         le=1,
     )
     alpaca_crypto_strategy_quote_max_age_seconds: int = Field(default=60, ge=5, le=3600)
+    alpaca_crypto_strategy_annualization_days: Decimal = Field(
+        default=Decimal("365"),
+        gt=0,
+        le=Decimal("366"),
+    )
+    alpaca_crypto_strategy_max_closed_bar_age_days: int = Field(
+        default=1,
+        ge=1,
+        le=7,
+    )
     alpaca_crypto_strategy_max_spread_bps: Decimal = Field(default=Decimal("100"), gt=0)
     alpaca_crypto_strategy_stop_atr_multiple: Decimal = Field(default=Decimal("3"), gt=0, le=10)
     alpaca_crypto_strategy_max_stop_distance_fraction: Decimal = Field(
@@ -310,6 +364,16 @@ class Settings(BaseModel):
     alpaca_us_equity_strategy_live_enabled: bool = False
     alpaca_us_equity_strategy_version: str = "us_equity_trend_v1"
     alpaca_us_equity_strategy_sleeve_usd: Decimal = Field(default=Decimal("1000"), gt=0)
+    alpaca_us_equity_strategy_annualization_days: Decimal = Field(
+        default=Decimal("252"),
+        gt=0,
+        le=Decimal("366"),
+    )
+    alpaca_us_equity_strategy_max_closed_bar_age_days: int = Field(
+        default=4,
+        ge=1,
+        le=10,
+    )
     domestic_order_session_routing_enabled: bool = False
     allow_krx_pre_open_offhours_orders: bool = False
     allow_krx_after_hours_closing_orders: bool = False
@@ -327,16 +391,31 @@ class Settings(BaseModel):
     nxt_eligible_source_ttl_seconds: int = Field(default=3600, ge=60, le=86400)
 
     @model_validator(mode="after")
-    def reject_shared_us_equity_position_namespace(self) -> "Settings":
-        alpaca_us_equity_enabled = (
-            self.alpaca_us_equity_monitoring_enabled
-            or self.alpaca_us_equity_strategy_enabled
+    def validate_kis_token_issuance_timing(self) -> "Settings":
+        required_lease_seconds = (
+            max(
+                self.kis_token_request_timeout_seconds,
+                self.kis_request_timeout_seconds,
+            )
+            + self.kis_token_min_issue_interval_seconds
         )
-        if self.kis_us_trading_enabled and alpaca_us_equity_enabled:
+        if self.kis_token_issuance_lease_seconds < required_lease_seconds:
             raise ValueError(
-                "KIS and Alpaca US equity cannot share the provider/account-less "
-                "(mode, symbol) position namespace; use a separate "
-                "database_url/service instance for each provider"
+                "KIS_TOKEN_ISSUANCE_LEASE_SECONDS must be at least "
+                "the larger of KIS_TOKEN_REQUEST_TIMEOUT_SECONDS and "
+                "KIS_REQUEST_TIMEOUT_SECONDS, plus "
+                "KIS_TOKEN_MIN_ISSUE_INTERVAL_SECONDS"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def validate_autonomous_runtime_provider(self) -> "Settings":
+        if (
+            self.autonomous_runtime_enabled
+            and self.runtime_broker_provider != "kis"
+        ):
+            raise ValueError(
+                "autonomous runtime currently supports only the KIS provider"
             )
         return self
 
@@ -348,6 +427,13 @@ class Settings(BaseModel):
         if normalized not in allowed:
             raise ValueError(f"log_level must be one of {sorted(allowed)}")
         return normalized
+
+    @field_validator("runtime_broker_provider", mode="before")
+    @classmethod
+    def normalize_runtime_broker_provider(cls, value: object) -> object:
+        if isinstance(value, str):
+            return value.strip().lower()
+        return value
 
     @field_validator("vol_corr_missing_data_behavior")
     @classmethod
@@ -408,6 +494,7 @@ _ENV_FIELDS = {
     "SERVICE_NAME": "service_name",
     "ENVIRONMENT": "environment",
     "RUNTIME_MODE": "runtime_mode",
+    "RUNTIME_BROKER_PROVIDER": "runtime_broker_provider",
     "DATABASE_URL": "database_url",
     "DB_POOL_SIZE": "db_pool_size",
     "DB_MAX_OVERFLOW": "db_max_overflow",
@@ -428,11 +515,14 @@ _ENV_FIELDS = {
     "MONITORING_LOOP_INTERVAL_SECONDS": "monitoring_loop_interval_seconds",
     "MONITORING_CYCLE_TIMEOUT_SECONDS": "monitoring_cycle_timeout_seconds",
     "MONITORING_EXPIRE_PRIOR_MARKET_WATCH_BUYS_ENABLED": "monitoring_expire_prior_market_watch_buys_enabled",
+    "MONITORING_WATCH_BUY_MAX_AGE_TRADING_SESSIONS": "monitoring_watch_buy_max_age_trading_sessions",
     "MONITORING_MAX_SYMBOLS_PER_CYCLE": "monitoring_max_symbols_per_cycle",
     "MONITORING_AUTO_SYMBOL_BATCH_TARGET_SECONDS": "monitoring_auto_symbol_batch_target_seconds",
     "MONITORING_MAX_BROKER_ACTIONS_PER_CYCLE": "monitoring_max_broker_actions_per_cycle",
     "MONITORING_MAX_QUOTE_AGE_SECONDS": "monitoring_max_quote_age_seconds",
     "MONITORING_MAX_QUOTE_FUTURE_SKEW_SECONDS": "monitoring_max_quote_future_skew_seconds",
+    "NEXT_OPEN_BUY_INITIAL_SUBMISSION_GRACE_SECONDS": "next_open_buy_initial_submission_grace_seconds",
+    "KRX_MARKET_HOLIDAY_DATES": "krx_market_holiday_dates",
     "MONITORING_WATCH_BUY_RETRY_COOLDOWN_SECONDS": "monitoring_watch_buy_retry_cooldown_seconds",
     "MONITORING_EXIT_ON_STALE_CYCLE_ENABLED": "monitoring_exit_on_stale_cycle_enabled",
     "MONITORING_STALE_CYCLE_EXIT_GRACE_MULTIPLIER": "monitoring_stale_cycle_exit_grace_multiplier",
@@ -487,6 +577,9 @@ _ENV_FIELDS = {
     "EXEC_AGENT_TRIGGER_TIME_ENABLED": "exec_agent_trigger_time_enabled",
     "EXEC_AGENT_TRIGGER_TIME_SELL_ENABLED": "exec_agent_trigger_time_sell_enabled",
     "EXEC_AGENT_TRIGGER_TIME_TIMEOUT_SECONDS": "exec_agent_trigger_time_timeout_seconds",
+    "KIS_KRX_ROUND_TRIP_NON_SPREAD_COST_BPS": "kis_krx_round_trip_non_spread_cost_bps",
+    "KIS_US_ROUND_TRIP_NON_SPREAD_COST_BPS": "kis_us_round_trip_non_spread_cost_bps",
+    "ALPACA_US_EQUITY_ROUND_TRIP_NON_SPREAD_COST_BPS": "alpaca_us_equity_round_trip_non_spread_cost_bps",
     "MONTHLY_TARGET_KRW": "monthly_target_krw",
     "MONTHLY_CAPITAL_PRESERVATION_ENABLED": "monthly_capital_preservation_enabled",
     "MONTHLY_AGGRESSIVE_LAG_RATIO": "monthly_aggressive_lag_ratio",
@@ -519,9 +612,12 @@ _ENV_FIELDS = {
     "ACCOUNT_DRAWDOWN_RECOVERY_MIN_OBSERVATION_INTERVAL_SECONDS": "account_drawdown_recovery_min_observation_interval_seconds",
     "ACCOUNT_DRAWDOWN_RECOVERY_MAX_SNAPSHOT_FUTURE_SKEW_SECONDS": "account_drawdown_recovery_max_snapshot_future_skew_seconds",
     "ACCOUNT_DRAWDOWN_RECOVERY_SCOPE_SECRET": "account_drawdown_recovery_scope_secret",
+    "EXECUTION_POSITION_ACCOUNT_SCOPE": "execution_position_account_scope",
     "HOURLY_PLAN_JUDGMENT_RECOVERY_REQUIRED_HEALTHY_OBSERVATIONS": "hourly_plan_judgment_recovery_required_healthy_observations",
     "HOURLY_PLAN_JUDGMENT_RECOVERY_COOLDOWN_SECONDS": "hourly_plan_judgment_recovery_cooldown_seconds",
     "HOURLY_PLAN_JUDGMENT_RECOVERY_MIN_OBSERVATION_INTERVAL_SECONDS": "hourly_plan_judgment_recovery_min_observation_interval_seconds",
+    "CORE_BUY_AUTHORITY_MAX_OBSERVATION_AGE_SECONDS": "core_buy_authority_max_observation_age_seconds",
+    "CORE_BUY_AUTHORITY_MAX_FUTURE_SKEW_SECONDS": "core_buy_authority_max_future_skew_seconds",
     "VOL_CORR_SIZING_ENABLED": "vol_corr_sizing_enabled",
     "VOL_CORR_VOLATILITY_LOOKBACK_DAYS": "vol_corr_volatility_lookback_days",
     "VOL_CORR_MIN_RETURN_OBSERVATIONS": "vol_corr_min_return_observations",
@@ -576,6 +672,12 @@ _ENV_FIELDS = {
     "KIS_USE_HASHKEY": "kis_use_hashkey",
     "KIS_REQUEST_TIMEOUT_SECONDS": "kis_request_timeout_seconds",
     "KIS_MIN_REQUEST_INTERVAL_SECONDS": "kis_min_request_interval_seconds",
+    "KIS_TOKEN_REFRESH_MARGIN_SECONDS": "kis_token_refresh_margin_seconds",
+    "KIS_TOKEN_FAILURE_COOLDOWN_SECONDS": "kis_token_failure_cooldown_seconds",
+    "KIS_TOKEN_REQUEST_TIMEOUT_SECONDS": "kis_token_request_timeout_seconds",
+    "KIS_TOKEN_ISSUANCE_LEASE_SECONDS": "kis_token_issuance_lease_seconds",
+    "KIS_TOKEN_MIN_ISSUE_INTERVAL_SECONDS": "kis_token_min_issue_interval_seconds",
+    "KIS_TOKEN_CACHE_DIRECTORY": "kis_token_cache_directory",
     "KIS_US_TRADING_ENABLED": "kis_us_trading_enabled",
     "KIS_US_LIVE_TRADING_ENABLED": "kis_us_live_trading_enabled",
     "KIS_US_LIVE_CONFIRMATION_TOKEN": "kis_us_live_confirmation_token",
@@ -619,6 +721,8 @@ _ENV_FIELDS = {
     "ALPACA_CRYPTO_STRATEGY_MIN_ORDER_NOTIONAL_USD": "alpaca_crypto_strategy_min_order_notional_usd",
     "ALPACA_CRYPTO_STRATEGY_MIN_REBALANCE_FRACTION": "alpaca_crypto_strategy_min_rebalance_fraction",
     "ALPACA_CRYPTO_STRATEGY_QUOTE_MAX_AGE_SECONDS": "alpaca_crypto_strategy_quote_max_age_seconds",
+    "ALPACA_CRYPTO_STRATEGY_ANNUALIZATION_DAYS": "alpaca_crypto_strategy_annualization_days",
+    "ALPACA_CRYPTO_STRATEGY_MAX_CLOSED_BAR_AGE_DAYS": "alpaca_crypto_strategy_max_closed_bar_age_days",
     "ALPACA_CRYPTO_STRATEGY_MAX_SPREAD_BPS": "alpaca_crypto_strategy_max_spread_bps",
     "ALPACA_CRYPTO_STRATEGY_STOP_ATR_MULTIPLE": "alpaca_crypto_strategy_stop_atr_multiple",
     "ALPACA_CRYPTO_STRATEGY_MAX_STOP_DISTANCE_FRACTION": "alpaca_crypto_strategy_max_stop_distance_fraction",
@@ -634,6 +738,8 @@ _ENV_FIELDS = {
     "ALPACA_US_EQUITY_STRATEGY_LIVE_ENABLED": "alpaca_us_equity_strategy_live_enabled",
     "ALPACA_US_EQUITY_STRATEGY_VERSION": "alpaca_us_equity_strategy_version",
     "ALPACA_US_EQUITY_STRATEGY_SLEEVE_USD": "alpaca_us_equity_strategy_sleeve_usd",
+    "ALPACA_US_EQUITY_STRATEGY_ANNUALIZATION_DAYS": "alpaca_us_equity_strategy_annualization_days",
+    "ALPACA_US_EQUITY_STRATEGY_MAX_CLOSED_BAR_AGE_DAYS": "alpaca_us_equity_strategy_max_closed_bar_age_days",
     "DOMESTIC_ORDER_SESSION_ROUTING_ENABLED": "domestic_order_session_routing_enabled",
     "ALLOW_KRX_PRE_OPEN_OFFHOURS_ORDERS": "allow_krx_pre_open_offhours_orders",
     "ALLOW_KRX_AFTER_HOURS_CLOSING_ORDERS": "allow_krx_after_hours_closing_orders",

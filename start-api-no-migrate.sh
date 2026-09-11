@@ -31,6 +31,9 @@ export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${PA
 export PYTHONPATH="apps/api${PYTHONPATH:+:$PYTHONPATH}"
 export KAI_EXEC_API_HOST="$HOST"
 export KAI_EXEC_API_PORT="$PORT"
+# This launcher owns the primary KIS runtime even if a sourced environment
+# file contains settings for another isolated provider process.
+export KAI_EXEC_RUNTIME_BROKER_PROVIDER="kis"
 
 if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
   echo "Python not found: $PYTHON_BIN" >&2

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import date
 from typing import Any
 
 from sqlalchemy import inspect as sa_inspect
+from sqlalchemy.orm.exc import DetachedInstanceError
 
 from app.models.runtime import ExecutionPlanItem
 
@@ -84,6 +86,83 @@ def plan_item_source_market_date(plan_item: ExecutionPlanItem) -> date | None:
     if "plan" in sa_inspect(plan_item).unloaded:
         return None
     return plan_item.plan.market_date
+
+
+def plan_item_entry_family_key(plan_item: ExecutionPlanItem) -> str | None:
+    """Return the exact entry family represented by an entry or managed exit."""
+    if plan_item.side == "buy":
+        source_key = plan_item_source_plan_item_id(plan_item)
+        if source_key is not None:
+            return f"source:{source_key}"
+        item_id = str(plan_item.id or "").strip()
+        return f"execution:{item_id}" if item_id else None
+
+    for payload in (plan_item.quantity_policy, plan_item.risk_context):
+        family_key = _entry_family_key_from_payload(payload)
+        if family_key is not None:
+            return family_key
+    return None
+
+
+def select_plan_item_family_members(
+    *,
+    anchor: ExecutionPlanItem,
+    candidates: Sequence[ExecutionPlanItem],
+) -> list[ExecutionPlanItem]:
+    """Select only candidates proven to belong to ``anchor``'s entry family.
+
+    A single unlinked candidate is retained for a genuine one-entry legacy
+    plan. Linked or multi-entry plans never fall back to symbol-only matching.
+    """
+    candidate_list = list(candidates)
+    anchor_key = plan_item_entry_family_key(anchor)
+    if anchor_key is not None:
+        exact = [
+            candidate
+            for candidate in candidate_list
+            if plan_item_entry_family_key(candidate) == anchor_key
+        ]
+        if exact:
+            return exact
+    if any(plan_item_entry_family_key(candidate) is not None for candidate in candidate_list):
+        return []
+    if len(candidate_list) != 1 or _same_symbol_entry_count(anchor) > 1:
+        return []
+    return candidate_list
+
+
+def _entry_family_key_from_payload(payload: object) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+    linked_key = payload.get("linked_entry_item_key")
+    if isinstance(linked_key, str) and linked_key.strip():
+        return f"source:{linked_key.strip()}"
+    entry_context = payload.get("entry_context")
+    if not isinstance(entry_context, dict):
+        return None
+    source_key = entry_context.get("source_plan_item_id")
+    if isinstance(source_key, str) and source_key.strip():
+        return f"source:{source_key.strip()}"
+    execution_item_id = entry_context.get("execution_plan_item_id")
+    if isinstance(execution_item_id, str) and execution_item_id.strip():
+        return f"execution:{execution_item_id.strip()}"
+    return None
+
+
+def _same_symbol_entry_count(anchor: ExecutionPlanItem) -> int:
+    try:
+        plan = anchor.plan
+    except DetachedInstanceError:
+        # An unloaded detached plan cannot prove that symbol-only fallback is
+        # unambiguous.
+        return 2
+    if plan is None:
+        return 0
+    return sum(
+        1
+        for item in plan.items
+        if item.symbol == anchor.symbol and item.side == "buy"
+    )
 
 
 def serialize_plan_item_source_identity(plan_item: ExecutionPlanItem) -> dict[str, object | None]:

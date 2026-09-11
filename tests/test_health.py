@@ -1,14 +1,21 @@
+import asyncio
 import threading
+import time
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from alembic.config import Config
+from alembic.script import ScriptDirectory
 from fastapi.testclient import TestClient
+import httpx
 import pytest
 from sqlalchemy import inspect, select, text
 from sqlalchemy.orm import load_only
 
 from app.api.schemas.execution import MonitoringPriceRequest
+from app.api.routes import runtime as runtime_routes
 from app.broker.base import (
     BrokerAccountHolding,
     BrokerAccountSnapshot,
@@ -39,6 +46,13 @@ from app.models.runtime import (
     RuntimeControlState,
 )
 from app.services import runtime as runtime_service, runtime_controls
+from app.services import schema as schema_service
+from app.services.execution_account_route import bind_kis_account_route
+from app.services.position_identity import (
+    build_position_identity,
+    execution_scope_payload,
+    payload_with_position_identity,
+)
 from app.services.autonomous_runtime import MonitoringRuntimeSnapshot, _is_regular_market_session, _merge_symbol_priority
 from app.services.monitoring import (
     _maintain_post_entry_exit_monitors,
@@ -86,6 +100,68 @@ def _freeze_runtime_service_now(monkeypatch, now: datetime) -> None:
             return now.astimezone(tz)
 
     monkeypatch.setattr(runtime_service, "datetime", FixedDatetime)
+
+
+def _execution_scope_metadata(
+    settings: Settings,
+    *,
+    provider: str = "kis",
+    exchange: str = "KRX",
+    venue: str | None = None,
+    asset_class: str = "kr_equity",
+) -> dict[str, object]:
+    identity = build_position_identity(
+        settings=settings,
+        provider=provider,
+        exchange=exchange,
+    )
+    return {
+        "exchange": identity.exchange,
+        "execution_scope": execution_scope_payload(
+            identity=identity,
+            venue=venue or exchange,
+            asset_class=asset_class,
+        ),
+    }
+
+
+def _scoped_execution_position(
+    settings: Settings,
+    *,
+    symbol: str,
+    quantity: int,
+    mode: str | None = None,
+    provider: str = "kis",
+    exchange: str = "KRX",
+    raw_payload: object = None,
+    **values: object,
+) -> ExecutionPosition:
+    target_mode = mode or settings.runtime_mode
+    identity_settings = settings
+    if target_mode != settings.runtime_mode:
+        identity_settings = settings.model_copy(update={"runtime_mode": target_mode})
+        if target_mode == "live":
+            identity_settings = identity_settings.model_copy(
+                update={"execution_position_account_scope": "inactive-test-route"}
+            )
+    identity = build_position_identity(
+        settings=identity_settings,
+        provider=provider,
+        exchange=exchange,
+    )
+    return ExecutionPosition(
+        mode=target_mode,
+        symbol=symbol,
+        quantity=quantity,
+        provider=identity.provider,
+        account_scope=identity.account_scope,
+        exchange=identity.exchange,
+        raw_payload=payload_with_position_identity(
+            raw_payload,
+            identity=identity,
+        ),
+        **values,
+    )
 
 
 def test_monitoring_symbol_cycle_limit_auto_uses_timeout_budget() -> None:
@@ -332,6 +408,811 @@ def test_health_returns_dependency_aware_payload() -> None:
     engine.dispose()
 
 
+@pytest.mark.parametrize(
+    ("inspection_method", "table_name", "expected_invariant"),
+    [
+        pytest.param(
+            "get_unique_constraints",
+            "execution_jobs",
+            "uq_execution_jobs_plan_item_job_type",
+            id="unique-constraint",
+        ),
+        pytest.param(
+            "get_check_constraints",
+            "execution_positions",
+            "ck_execution_positions_scope_complete",
+            id="check-constraint",
+        ),
+        pytest.param(
+            "get_indexes",
+            "execution_positions",
+            "uq_execution_positions_legacy_symbol_mode",
+            id="unique-index",
+        ),
+        pytest.param(
+            "get_indexes",
+            "crypto_strategy_states",
+            "uq_crypto_strategy_states_legacy_mode_provider_version_symbol",
+            id="crypto-state-legacy-unique-index",
+        ),
+        pytest.param(
+            "get_indexes",
+            "crypto_strategy_risk_states",
+            "uq_crypto_strategy_risk_states_legacy_mode_provider_version",
+            id="crypto-risk-legacy-unique-index",
+        ),
+        pytest.param(
+            "get_indexes",
+            "crypto_strategy_decisions",
+            "uq_crypto_strategy_decisions_legacy_scope_bar",
+            id="crypto-decision-legacy-unique-index",
+        ),
+    ],
+)
+def test_health_degrades_when_a_safety_invariant_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+    inspection_method: str,
+    table_name: str,
+    expected_invariant: str,
+) -> None:
+    app, engine = build_test_app()
+    actual_inspector = inspect(engine)
+
+    class MissingInvariantInspector:
+        def __getattr__(self, name: str):
+            if name == inspection_method:
+                return lambda inspected_table: (
+                    []
+                    if inspected_table == table_name
+                    else getattr(actual_inspector, name)(inspected_table)
+                )
+            return getattr(actual_inspector, name)
+
+    monkeypatch.setattr(
+        schema_service,
+        "inspect",
+        lambda _bind: MissingInvariantInspector(),
+    )
+
+    payload = TestClient(app).get("/health").json()
+
+    assert payload["status"] == "degraded"
+    runtime_schema = payload["dependencies"]["runtime_schema"]
+    assert runtime_schema["status"] == "missing"
+    assert expected_invariant in runtime_schema["missing_safety_invariants"][
+        table_name
+    ]
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("table_name", "index_name"),
+    [
+        (
+            "fifo_inventory_isolations",
+            "uq_fifo_inventory_isolations_legacy_mode_symbol_reconciled",
+        ),
+        (
+            "execution_positions",
+            "uq_execution_positions_legacy_symbol_mode",
+        ),
+        (
+            "monitoring_checkpoints",
+            "uq_monitoring_checkpoints_legacy_worker_mode",
+        ),
+        (
+            "crypto_strategy_states",
+            "uq_crypto_strategy_states_legacy_mode_provider_version_symbol",
+        ),
+        (
+            "crypto_strategy_risk_states",
+            "uq_crypto_strategy_risk_states_legacy_mode_provider_version",
+        ),
+        (
+            "crypto_strategy_decisions",
+            "uq_crypto_strategy_decisions_legacy_scope_bar",
+        ),
+    ],
+)
+def test_health_degrades_when_legacy_index_predicate_is_wrong(
+    monkeypatch: pytest.MonkeyPatch,
+    table_name: str,
+    index_name: str,
+) -> None:
+    app, engine = build_test_app()
+    actual_inspector = inspect(engine)
+
+    class WrongPredicateInspector:
+        def __getattr__(self, name: str):
+            if name != "get_indexes":
+                return getattr(actual_inspector, name)
+
+            def get_indexes(inspected_table: str):
+                indexes = actual_inspector.get_indexes(inspected_table)
+                if inspected_table != table_name:
+                    return indexes
+                return [
+                    {
+                        **index,
+                        "dialect_options": {
+                            "sqlite_where": text("1 = 1")
+                        },
+                    }
+                    if index["name"] == index_name
+                    else index
+                    for index in indexes
+                ]
+
+            return get_indexes
+
+    monkeypatch.setattr(
+        schema_service,
+        "inspect",
+        lambda _bind: WrongPredicateInspector(),
+    )
+
+    payload = TestClient(app).get("/health").json()
+
+    assert payload["status"] == "degraded"
+    runtime_schema = payload["dependencies"]["runtime_schema"]
+    assert runtime_schema["status"] == "missing"
+    assert index_name in runtime_schema["missing_safety_invariants"][table_name]
+    engine.dispose()
+
+
+def test_schema_check_validation_accepts_postgres_truncated_constraint_name() -> None:
+    expression = schema_service.REQUIRED_CHECK_CONSTRAINTS[
+        "fifo_inventory_isolations"
+    ]["ck_fifo_inventory_isolations_scope_complete"]
+
+    assert schema_service._has_check_constraint(
+        [
+            {
+                "name": "ck_fifo_inventory_isolations_ck_fifo_inventory_isola_9f31",
+                "sqltext": expression,
+            }
+        ],
+        expression=expression,
+    )
+
+
+def test_runtime_schema_required_head_matches_alembic_script_head() -> None:
+    config = Config(str(Path(__file__).resolve().parents[1] / "alembic.ini"))
+    script = ScriptDirectory.from_config(config)
+
+    assert sorted(schema_service.REQUIRED_ALEMBIC_HEADS) == sorted(
+        script.get_heads()
+    )
+
+
+def test_health_degrades_when_alembic_revision_is_behind_head() -> None:
+    app, engine = build_test_app()
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            "UPDATE alembic_version SET version_num = '202609110001'"
+        )
+
+    payload = TestClient(app).get("/health").json()
+
+    assert payload["status"] == "degraded"
+    runtime_schema = payload["dependencies"]["runtime_schema"]
+    assert runtime_schema["status"] == "missing"
+    assert runtime_schema["alembic"] == {
+        "status": "behind",
+        "expected_heads": ["202609110003"],
+        "current_heads": ["202609110001"],
+    }
+    engine.dispose()
+
+
+def test_health_degrades_when_alembic_version_table_is_missing() -> None:
+    app, engine = build_test_app()
+    with engine.begin() as connection:
+        connection.exec_driver_sql("DROP TABLE alembic_version")
+
+    payload = TestClient(app).get("/health").json()
+
+    assert payload["status"] == "degraded"
+    runtime_schema = payload["dependencies"]["runtime_schema"]
+    assert runtime_schema["status"] == "missing"
+    assert runtime_schema["alembic"] == {
+        "status": "missing",
+        "expected_heads": ["202609110003"],
+        "current_heads": [],
+    }
+    engine.dispose()
+
+
+def test_lifespan_keeps_automated_workers_stopped_when_schema_is_behind(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, engine = build_test_app(
+        Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            alpaca_crypto_monitoring_enabled=True,
+            alpaca_us_equity_monitoring_enabled=True,
+        ),
+        autonomous_runtime_enabled=True,
+    )
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            "UPDATE alembic_version SET version_num = '202609110001'"
+        )
+    starts: list[str] = []
+
+    def tracked_start(name: str):
+        async def start() -> None:
+            starts.append(name)
+
+        return start
+
+    monkeypatch.setattr(
+        app.state.autonomous_runtime,
+        "start",
+        tracked_start("autonomous"),
+    )
+    monkeypatch.setattr(
+        app.state.alpaca_crypto_runtime,
+        "start",
+        tracked_start("alpaca_crypto"),
+    )
+    monkeypatch.setattr(
+        app.state.alpaca_us_equity_runtime,
+        "start",
+        tracked_start("alpaca_us_equity"),
+    )
+
+    with TestClient(app) as client:
+        payload = client.get("/health").json()
+        runtime_status = client.get("/runtime/status").json()
+
+        assert starts == []
+        assert payload["status"] == "degraded"
+        assert payload["dependencies"]["automated_runtime_startup"]["status"] == (
+            "blocked"
+        )
+        assert runtime_status["ready"] is False
+        assert runtime_status["dependencies"] == {
+            "database": "ok",
+            "runtime_schema": "missing",
+            "automated_runtime_startup": "blocked",
+        }
+        assert app.state.runtime_startup_gate == {
+            "status": "blocked",
+            "reason": "runtime_schema_not_ready",
+            "runtime_schema_status": "missing",
+            "alembic_status": "behind",
+        }
+        autonomous = app.state.autonomous_runtime.snapshot()
+        assert autonomous["dispatch"]["status"] == "blocked"
+        assert autonomous["monitoring"]["status"] == "blocked"
+        assert app.state.alpaca_crypto_runtime.snapshot()["status"] == "blocked"
+        assert app.state.alpaca_us_equity_runtime.snapshot()["status"] == "blocked"
+
+        with engine.begin() as connection:
+            connection.exec_driver_sql(
+                "UPDATE alembic_version SET version_num = '202609110003'"
+            )
+
+        repaired_health = client.get("/health").json()
+        repaired_runtime = client.get("/runtime/status").json()
+        repaired_board_runtime = client.get("/runtime/daily-board").json()["runtime"]
+        assert repaired_health["dependencies"]["runtime_schema"]["status"] == "ok"
+        assert repaired_health["status"] == "degraded"
+        assert repaired_runtime["dependencies"]["runtime_schema"] == "ok"
+        assert repaired_runtime["dependencies"]["automated_runtime_startup"] == (
+            "blocked"
+        )
+        assert repaired_runtime["ready"] is False
+        assert "restart" in " ".join(repaired_runtime["readiness"]["reasons"])
+        assert repaired_board_runtime["dependencies"][
+            "automated_runtime_startup"
+        ] == "blocked"
+        assert repaired_board_runtime["ready"] is False
+
+    engine.dispose()
+
+
+def test_lifespan_blocks_workers_for_unattributed_non_flat_position(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, engine = build_test_app(
+        Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+        ),
+        autonomous_runtime_enabled=True,
+    )
+    with app.state.db_session_factory() as db:
+        db.add(
+            ExecutionPosition(
+                id="legacy-open-position",
+                mode="paper",
+                provider=None,
+                account_scope=None,
+                exchange=None,
+                symbol="005930",
+                quantity=3,
+                average_price=Decimal("70000"),
+                updated_from="legacy_position_import",
+            )
+        )
+        db.commit()
+    starts: list[str] = []
+
+    async def tracked_start() -> None:
+        starts.append("autonomous")
+
+    monkeypatch.setattr(app.state.autonomous_runtime, "start", tracked_start)
+
+    with TestClient(app) as client:
+        health = client.get("/health").json()
+
+        assert starts == []
+        runtime_schema = health["dependencies"]["runtime_schema"]
+        assert runtime_schema["status"] == "blocked"
+        assert runtime_schema["blocking_data"]["execution_positions"] == {
+            "status": "blocked",
+            "reason": "non_flat_execution_position_scope_attribution_required",
+            "blocking_row_count": 1,
+            "remediation": (
+                "kis_legacy_position_attribution_dry_run_apply_then_restart"
+            ),
+        }
+        startup_dependency = health["dependencies"]["automated_runtime_startup"]
+        assert startup_dependency == {
+            "status": "blocked",
+            "startup_status": "blocked",
+            "reason": "non_flat_execution_position_scope_attribution_required",
+            "runtime_schema_status": "blocked",
+            "alembic_status": "ok",
+            "remediation": (
+                "kis_legacy_position_attribution_dry_run_apply_then_restart"
+            ),
+            "restart_required": True,
+        }
+        assert app.state.runtime_startup_gate == {
+            "status": "blocked",
+            "reason": "non_flat_execution_position_scope_attribution_required",
+            "runtime_schema_status": "blocked",
+            "alembic_status": "ok",
+            "remediation": (
+                "kis_legacy_position_attribution_dry_run_apply_then_restart"
+            ),
+            "restart_required": True,
+        }
+
+    engine.dispose()
+
+
+def test_lifespan_requires_current_schema_before_position_attribution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, engine = build_test_app(
+        Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+        ),
+        autonomous_runtime_enabled=True,
+    )
+    with app.state.db_session_factory() as db:
+        db.add(
+            ExecutionPosition(
+                id="legacy-open-position-behind-schema",
+                mode="paper",
+                provider=None,
+                account_scope=None,
+                exchange=None,
+                symbol="005930",
+                quantity=3,
+                updated_from="legacy_position_import",
+            )
+        )
+        db.commit()
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            "UPDATE alembic_version SET version_num = '202609110001'"
+        )
+    starts: list[str] = []
+
+    async def tracked_start() -> None:
+        starts.append("autonomous")
+
+    monkeypatch.setattr(app.state.autonomous_runtime, "start", tracked_start)
+
+    with TestClient(app):
+        assert starts == []
+        assert app.state.runtime_startup_gate == {
+            "status": "blocked",
+            "reason": "runtime_schema_not_ready",
+            "runtime_schema_status": "missing",
+            "alembic_status": "behind",
+        }
+
+    engine.dispose()
+
+
+def test_runtime_schema_blocks_partial_non_flat_position_scope() -> None:
+    app, engine = build_test_app()
+    with engine.begin() as connection:
+        connection.exec_driver_sql("PRAGMA ignore_check_constraints = ON")
+        connection.execute(
+            text(
+                """
+                INSERT INTO execution_positions (
+                    id,
+                    mode,
+                    provider,
+                    account_scope,
+                    exchange,
+                    symbol,
+                    quantity,
+                    updated_from
+                ) VALUES (
+                    'partial-open-position',
+                    'paper',
+                    'kis',
+                    NULL,
+                    'KRX',
+                    '000660',
+                    2,
+                    'corrupt_partial_import'
+                )
+                """
+            )
+        )
+
+    with app.state.db_session_factory() as db:
+        runtime_schema = schema_service.check_runtime_schema(db)
+
+    assert runtime_schema["status"] == "blocked"
+    assert runtime_schema["blocking_data"]["execution_positions"][
+        "blocking_row_count"
+    ] == 1
+    engine.dispose()
+
+
+def test_lifespan_allows_flat_legacy_position(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, engine = build_test_app(
+        Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+        ),
+        autonomous_runtime_enabled=True,
+    )
+    with app.state.db_session_factory() as db:
+        db.add(
+            ExecutionPosition(
+                id="legacy-flat-position",
+                mode="paper",
+                provider=None,
+                account_scope=None,
+                exchange=None,
+                symbol="005930",
+                quantity=0,
+                base_quantity=Decimal("0"),
+                average_price=Decimal("70000"),
+                updated_from="legacy_position_import",
+            )
+        )
+        db.commit()
+    starts: list[str] = []
+
+    async def tracked_start() -> None:
+        starts.append("autonomous")
+
+    monkeypatch.setattr(app.state.autonomous_runtime, "start", tracked_start)
+
+    with TestClient(app) as client:
+        runtime_schema = client.get("/health").json()["dependencies"][
+            "runtime_schema"
+        ]
+
+        assert starts == ["autonomous"]
+        assert runtime_schema["status"] == "ok"
+        assert runtime_schema["blocking_data"] == {}
+
+    engine.dispose()
+
+
+def test_lifespan_starts_requested_workers_when_schema_is_current(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, engine = build_test_app(
+        Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            alpaca_crypto_monitoring_enabled=True,
+            alpaca_us_equity_monitoring_enabled=True,
+        ),
+        autonomous_runtime_enabled=True,
+    )
+    starts: list[str] = []
+
+    def tracked_start(name: str):
+        async def start() -> None:
+            starts.append(name)
+
+        return start
+
+    monkeypatch.setattr(
+        app.state.autonomous_runtime,
+        "start",
+        tracked_start("autonomous"),
+    )
+    monkeypatch.setattr(
+        app.state.alpaca_crypto_runtime,
+        "start",
+        tracked_start("alpaca_crypto"),
+    )
+    monkeypatch.setattr(
+        app.state.alpaca_us_equity_runtime,
+        "start",
+        tracked_start("alpaca_us_equity"),
+    )
+
+    with TestClient(app):
+        assert starts == ["autonomous", "alpaca_crypto", "alpaca_us_equity"]
+        assert app.state.runtime_startup_gate == {
+            "status": "ready",
+            "reason": None,
+            "runtime_schema_status": "ok",
+            "alembic_status": "ok",
+        }
+
+    engine.dispose()
+
+
+def test_live_health_reports_missing_stable_execution_account_scope() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="live",
+        kis_app_key="configured-key",
+        kis_app_secret="configured-secret",
+        kis_account_number="12345678",
+        kis_account_product_code="01",
+    )
+    app, engine = build_test_app(settings)
+    client = TestClient(app)
+
+    payload = client.get("/health").json()
+
+    scope_health = payload["dependencies"]["execution_account_scope"]
+    assert payload["status"] == "degraded"
+    assert scope_health["status"] == "error"
+    assert scope_health["providers"] == ["kis"]
+    assert scope_health["required_settings"] == [
+        "KAI_EXEC_ACCOUNT_DRAWDOWN_RECOVERY_SCOPE_SECRET",
+        "KAI_EXEC_EXECUTION_POSITION_ACCOUNT_SCOPE",
+    ]
+    assert "12345678" not in str(payload)
+    assert "configured-secret" not in str(payload)
+    engine.dispose()
+
+
+def test_live_health_accepts_stable_hmac_execution_account_scope() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="live",
+        kis_app_key="configured-key",
+        kis_app_secret="configured-secret",
+        kis_account_number="12345678",
+        kis_account_product_code="01",
+        account_drawdown_recovery_scope_secret=(
+            "stable-position-scope-secret-32-bytes"
+        ),
+    )
+    app, engine = build_test_app(settings)
+    client = TestClient(app)
+
+    payload = client.get("/health").json()
+
+    assert payload["status"] == "ok"
+    assert payload["dependencies"]["execution_account_scope"] == {
+        "status": "ok",
+        "providers": ["kis"],
+        "source": "stable_hmac_secret",
+    }
+    assert "stable-position-scope-secret-32-bytes" not in str(payload)
+    engine.dispose()
+
+
+def test_live_alpaca_health_does_not_accept_route_label_without_hmac_secret() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="live",
+        alpaca_api_key="configured-key",
+        alpaca_api_secret="configured-secret",
+        alpaca_live_trading_enabled=True,
+        execution_position_account_scope="opaque-live-account-route",
+    )
+    app, engine = build_test_app(settings)
+    client = TestClient(app)
+
+    payload = client.get("/health").json()
+
+    scope_health = payload["dependencies"]["execution_account_scope"]
+    assert payload["status"] == "degraded"
+    assert scope_health["status"] == "error"
+    assert scope_health["providers"] == ["alpaca"]
+    assert scope_health["required_settings"] == [
+        "KAI_EXEC_ACCOUNT_DRAWDOWN_RECOVERY_SCOPE_SECRET"
+    ]
+    engine.dispose()
+
+
+def test_live_alpaca_health_reports_authenticated_identity_hmac_source() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="live",
+        alpaca_api_key="configured-key",
+        alpaca_api_secret="configured-secret",
+        alpaca_live_trading_enabled=True,
+        execution_position_account_scope="ignored-when-account-id-is-authenticated",
+        account_drawdown_recovery_scope_secret=(
+            "stable-position-scope-secret-32-bytes"
+        ),
+    )
+    app, engine = build_test_app(settings)
+    client = TestClient(app)
+
+    payload = client.get("/health").json()
+
+    assert payload["status"] == "ok"
+    assert payload["dependencies"]["execution_account_scope"] == {
+        "status": "ok",
+        "providers": ["alpaca"],
+        "source": "stable_hmac_secret",
+    }
+    engine.dispose()
+
+
+def test_live_health_configured_route_label_can_bind_a_kis_plan() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="live",
+        kis_app_key="configured-key",
+        kis_app_secret="configured-secret",
+        kis_account_number="12345678",
+        kis_account_product_code="01",
+        execution_position_account_scope="opaque-live-account-route",
+    )
+    app, engine = build_test_app(settings)
+    client = TestClient(app)
+
+    health = client.get("/health").json()
+    plan = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "configured-route-label-plan",
+            "source": "operator-import",
+            "items": [
+                {
+                    "provider": "kis",
+                    "venue": "krx",
+                    "asset_class": "stock",
+                    "symbol": "005930",
+                    "side": "sell",
+                    "intent": "stop_sell",
+                    "quantity_policy": {"kind": "shares", "quantity": 1},
+                    "trigger_price": "70000",
+                    "risk_context": {"exchange": "KRX"},
+                }
+            ],
+        },
+    )
+
+    assert health["status"] == "ok"
+    assert health["dependencies"]["execution_account_scope"] == {
+        "status": "ok",
+        "providers": ["kis"],
+        "source": "configured_route_label",
+    }
+    assert plan.status_code == 201
+    persisted_item = client.get("/execution-plans").json()[0]["items"][0]
+    binding = persisted_item["risk_context"]["execution_account_route"]
+    assert binding["version"] == "kis-account-route-v1"
+    assert len(binding["configured_route_fingerprint"]) == 32
+    engine.dispose()
+
+
+def test_live_health_ignores_credentials_for_disabled_secondary_providers() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="live",
+        kis_app_key="configured-key",
+        kis_app_secret="configured-secret",
+        kis_account_number="12345678",
+        kis_account_product_code="01",
+        alpaca_api_key="dormant-key",
+        alpaca_api_secret="dormant-secret",
+        alpaca_live_trading_enabled=False,
+        upbit_access_key="dormant-access-key",
+        upbit_secret_key="dormant-secret-key",
+        upbit_live_trading_enabled=False,
+        execution_position_account_scope="opaque-live-account-route",
+    )
+    app, engine = build_test_app(settings)
+    client = TestClient(app)
+
+    payload = client.get("/health").json()
+
+    assert payload["status"] == "ok"
+    assert payload["dependencies"]["execution_account_scope"] == {
+        "status": "ok",
+        "providers": ["kis"],
+        "source": "configured_route_label",
+    }
+    assert "dormant-key" not in str(payload)
+    assert "dormant-secret" not in str(payload)
+    engine.dispose()
+
+
+def test_live_health_rejects_short_execution_account_scope_hmac_secret() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="live",
+        kis_app_key="configured-key",
+        kis_app_secret="configured-secret",
+        kis_account_number="12345678",
+        kis_account_product_code="01",
+        account_drawdown_recovery_scope_secret="short-secret",
+    )
+    app, engine = build_test_app(settings)
+    client = TestClient(app)
+
+    payload = client.get("/health").json()
+
+    scope_health = payload["dependencies"]["execution_account_scope"]
+    assert payload["status"] == "degraded"
+    assert scope_health["status"] == "error"
+    assert scope_health["invalid_settings"] == [
+        "KAI_EXEC_ACCOUNT_DRAWDOWN_RECOVERY_SCOPE_SECRET"
+    ]
+    assert "short-secret" not in str(payload)
+    engine.dispose()
+
+
+def test_settings_repr_hides_account_scope_hmac_secret() -> None:
+    secret = "stable-position-scope-secret-32-bytes"
+
+    rendered = repr(Settings(account_drawdown_recovery_scope_secret=secret))
+
+    assert secret not in rendered
+    assert "account_drawdown_recovery_scope_secret" not in rendered
+
+
+def test_live_upbit_health_requires_explicit_route_label_even_with_hmac_key() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="live",
+        upbit_access_key="configured-key",
+        upbit_secret_key="configured-secret",
+        upbit_live_trading_enabled=True,
+        account_drawdown_recovery_scope_secret=(
+            "stable-position-scope-secret-32-bytes"
+        ),
+    )
+    app, engine = build_test_app(settings)
+    client = TestClient(app)
+
+    scope_health = client.get("/health").json()["dependencies"][
+        "execution_account_scope"
+    ]
+
+    assert scope_health["status"] == "error"
+    assert scope_health["providers"] == ["upbit"]
+    assert scope_health["required_settings"] == [
+        "KAI_EXEC_EXECUTION_POSITION_ACCOUNT_SCOPE"
+    ]
+    assert "configured-key" not in str(scope_health)
+    assert "configured-secret" not in str(scope_health)
+    engine.dispose()
+
+
 def test_runtime_metadata_reads_process_id_at_liveness_time(monkeypatch) -> None:
     runtime = runtime_service.RuntimeMetadata(started_at=datetime.now(UTC))
 
@@ -359,9 +1240,28 @@ def test_runtime_status_reports_readiness_and_default_safety() -> None:
     assert payload["safety"]["automated_order_submission_block_reason"] == "paused"
     assert payload["safety"]["automated_buy_submission_allowed"] is False
     assert payload["safety"]["automated_buy_submission_block_reason"] == "paused"
+    assert payload["exec_agent"] == {
+        "status": "disabled",
+        "enabled": False,
+        "agent_id": "exec-agent",
+        "expected_model": "openai/gpt-5.6-sol",
+        "provenance_policy": "exact_agent_and_model",
+        "trigger_time": {"configured": True, "effective": False},
+        "watch_sizing": {"configured": False, "effective": False},
+        "reason_codes": ["exec_agent_disabled"],
+    }
     assert payload["safety"]["hourly_risk_off"]["available"] is True
     assert payload["safety"]["hourly_risk_off"]["active"] is False
     assert payload["safety"]["last_change"]["action"] == "bootstrap"
+    assert payload["account_drawdown_gate"] == {
+        "available": True,
+        "enabled": True,
+        "gated": False,
+        "provider": "kis",
+        "latest_decision": None,
+        "active_recovery_scopes": {},
+        "reason": None,
+    }
     assert payload["counts"] == {"open_orders": 0, "active_execution_jobs": 0}
     assert payload["symbols"] == {
         "monitored": [],
@@ -423,6 +1323,15 @@ def test_runtime_status_falls_back_to_autonomous_snapshot_when_database_pool_is_
     assert response.status_code == 200
     payload = response.json()
     assert payload["dependencies"]["database"] == "error"
+    assert payload["account_drawdown_gate"] == {
+        "available": False,
+        "enabled": True,
+        "gated": None,
+        "provider": "kis",
+        "latest_decision": None,
+        "active_recovery_scopes": {},
+        "reason": "account_drawdown_gate_state_unavailable",
+    }
     monitoring = payload["liveness"]["monitoring"]
     assert monitoring["source"] == "autonomous_runtime_snapshot"
     assert monitoring["status"] == "running"
@@ -470,6 +1379,7 @@ def test_runtime_status_reports_monthly_realized_pnl_progress_and_mode(monkeypat
             side="buy",
             status="filled",
             quantity=10,
+            request_metadata=_execution_scope_metadata(settings),
         )
         sell_order = BrokerOrder(
             mode="paper",
@@ -478,6 +1388,7 @@ def test_runtime_status_reports_monthly_realized_pnl_progress_and_mode(monkeypat
             side="sell",
             status="filled",
             quantity=5,
+            request_metadata=_execution_scope_metadata(settings),
         )
         session.add_all([buy_order, sell_order])
         session.flush()
@@ -564,6 +1475,7 @@ def test_runtime_status_weekly_pnl_uses_broker_reconciliation_cost_for_legacy_fl
             side="buy",
             status="filled",
             quantity=45,
+            request_metadata=_execution_scope_metadata(settings),
         )
         sell_order = BrokerOrder(
             mode="paper",
@@ -572,6 +1484,7 @@ def test_runtime_status_weekly_pnl_uses_broker_reconciliation_cost_for_legacy_fl
             side="sell",
             status="filled",
             quantity=6,
+            request_metadata=_execution_scope_metadata(settings),
         )
         session.add_all([buy_order, sell_order])
         session.flush()
@@ -595,8 +1508,8 @@ def test_runtime_status_weekly_pnl_uses_broker_reconciliation_cost_for_legacy_fl
                     price=Decimal("1500"),
                     filled_at=now,
                 ),
-                ExecutionPosition(
-                    mode="paper",
+                _scoped_execution_position(
+                    settings,
                     symbol="049430",
                     quantity=0,
                     average_price=Decimal("1800"),
@@ -637,6 +1550,7 @@ def test_runtime_status_weekly_pnl_keeps_later_repurchase_basis_unknown(monkeypa
             side="sell",
             status="filled",
             quantity=5,
+            request_metadata=_execution_scope_metadata(settings),
         )
         buy_order = BrokerOrder(
             mode="paper",
@@ -645,6 +1559,7 @@ def test_runtime_status_weekly_pnl_keeps_later_repurchase_basis_unknown(monkeypa
             side="buy",
             status="filled",
             quantity=3,
+            request_metadata=_execution_scope_metadata(settings),
         )
         session.add_all([sell_order, buy_order])
         session.flush()
@@ -668,8 +1583,8 @@ def test_runtime_status_weekly_pnl_keeps_later_repurchase_basis_unknown(monkeypa
                     price=Decimal("700"),
                     filled_at=buy_at,
                 ),
-                ExecutionPosition(
-                    mode="paper",
+                _scoped_execution_position(
+                    settings,
                     symbol="LATER",
                     quantity=3,
                     average_price=Decimal("700"),
@@ -704,6 +1619,7 @@ def test_runtime_status_daily_pnl_uses_crypto_base_quantity_and_quote_notional()
         settings=Settings(
             database_url="sqlite:///:memory:",
             runtime_mode="paper",
+            runtime_broker_provider="upbit",
             automation_enabled=True,
         )
     )
@@ -724,6 +1640,13 @@ def test_runtime_status_daily_pnl_uses_crypto_base_quantity_and_quote_notional()
             quote_notional=Decimal("100000.0000"),
             asset_class="crypto",
             venue="upbit",
+            request_metadata=_execution_scope_metadata(
+                app.state.settings,
+                provider="upbit",
+                exchange="UPBIT",
+                venue="UPBIT",
+                asset_class="crypto",
+            ),
         )
         sell_order = BrokerOrder(
             broker_name="upbit",
@@ -736,6 +1659,13 @@ def test_runtime_status_daily_pnl_uses_crypto_base_quantity_and_quote_notional()
             base_quantity=Decimal("0.000400000000"),
             asset_class="crypto",
             venue="upbit",
+            request_metadata=_execution_scope_metadata(
+                app.state.settings,
+                provider="upbit",
+                exchange="UPBIT",
+                venue="UPBIT",
+                asset_class="crypto",
+            ),
         )
         session.add_all([buy_order, sell_order])
         session.flush()
@@ -823,6 +1753,7 @@ def test_runtime_status_daily_pnl_surfaces_unmatched_sell_coverage() -> None:
             side="buy",
             status="filled",
             quantity=2,
+            request_metadata=_execution_scope_metadata(app.state.settings),
         )
         matched_sell_order = BrokerOrder(
             mode="paper",
@@ -831,6 +1762,7 @@ def test_runtime_status_daily_pnl_surfaces_unmatched_sell_coverage() -> None:
             side="sell",
             status="filled",
             quantity=1,
+            request_metadata=_execution_scope_metadata(app.state.settings),
         )
         unmatched_sell_order = BrokerOrder(
             mode="paper",
@@ -839,6 +1771,7 @@ def test_runtime_status_daily_pnl_surfaces_unmatched_sell_coverage() -> None:
             side="sell",
             status="filled",
             quantity=150,
+            request_metadata=_execution_scope_metadata(app.state.settings),
         )
         session.add_all([buy_order, matched_sell_order, unmatched_sell_order])
         session.flush()
@@ -953,6 +1886,52 @@ def test_runtime_status_requires_hourly_risk_off_schema_columns() -> None:
     engine.dispose()
 
 
+@pytest.mark.parametrize(
+    ("table_name", "scope_columns"),
+    [
+        ("broker_sessions", ("generation", "refresh_after")),
+        (
+            "fifo_inventory_isolations",
+            ("provider", "account_scope", "venue", "asset_class", "exchange"),
+        ),
+        ("execution_positions", ("provider", "account_scope", "exchange")),
+        ("monitoring_checkpoints", ("provider", "account_scope")),
+        ("crypto_strategy_states", ("account_scope", "strategy_family")),
+        ("crypto_strategy_risk_states", ("account_scope", "strategy_family")),
+        ("crypto_strategy_decisions", ("account_scope", "strategy_family")),
+    ],
+)
+def test_health_rejects_pre_scope_migration_runtime_tables(
+    table_name: str,
+    scope_columns: tuple[str, ...],
+) -> None:
+    app, engine = build_test_app()
+    legacy_table_name = f"{table_name}_pre_scope_migration"
+    retained_columns = [
+        str(column["name"])
+        for column in inspect(engine).get_columns(table_name)
+        if column["name"] not in scope_columns
+    ]
+    quoted_columns = ", ".join(f'"{column}"' for column in retained_columns)
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            f'ALTER TABLE "{table_name}" RENAME TO "{legacy_table_name}"'
+        )
+        connection.exec_driver_sql(
+            f'CREATE TABLE "{table_name}" AS '
+            f'SELECT {quoted_columns} FROM "{legacy_table_name}" WHERE 0'
+        )
+    client = TestClient(app)
+
+    payload = client.get("/health").json()
+
+    assert payload["status"] == "degraded"
+    runtime_schema = payload["dependencies"]["runtime_schema"]
+    assert runtime_schema["status"] == "missing"
+    assert runtime_schema["missing_columns"][table_name] == list(scope_columns)
+    engine.dispose()
+
+
 def test_metadata_matches_exec_owned_table_boundary() -> None:
     app, engine = build_test_app()
     inspector = inspect(engine)
@@ -996,6 +1975,53 @@ def test_runtime_safety_endpoint_reports_bootstrap_metadata() -> None:
     assert payload["last_change"]["source"] == "system"
     assert payload["last_change"]["event_id"] is None
 
+    engine.dispose()
+
+
+def test_plan_judgment_action_does_not_block_runtime_safety_heartbeat(
+    monkeypatch,
+) -> None:
+    app, engine = build_test_app()
+    release_projection = threading.Event()
+
+    def blocking_projection(**_kwargs: object) -> dict[str, object]:
+        release_projection.wait(timeout=2)
+        return {"status": "applied", "action": "risk_off_expire"}
+
+    monkeypatch.setattr(
+        runtime_routes,
+        "apply_hourly_plan_judgment_action",
+        blocking_projection,
+    )
+
+    async def scenario() -> tuple[httpx.Response, float]:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://127.0.0.1",
+        ) as client:
+            timer = threading.Timer(0.75, release_projection.set)
+            timer.start()
+            try:
+                projection = asyncio.create_task(
+                    client.post(
+                        "/runtime/plan-judgment/action",
+                        json={"risk_flags": 3, "risk_reasons": ["test"]},
+                    )
+                )
+                heartbeat_started = time.monotonic()
+                heartbeat = await client.get("/runtime/safety")
+                heartbeat_elapsed = time.monotonic() - heartbeat_started
+                await projection
+                return heartbeat, heartbeat_elapsed
+            finally:
+                release_projection.set()
+                timer.cancel()
+
+    heartbeat, heartbeat_elapsed = asyncio.run(scenario())
+
+    assert heartbeat.status_code == 200
+    assert heartbeat_elapsed < 0.5
     engine.dispose()
 
 
@@ -1278,7 +2304,7 @@ def test_execution_plan_intake_and_read_endpoints() -> None:
         "/execution-plans",
         json={
             "plan_id": "plan-20260429-open",
-            "source": "kai-trading-core",
+            "source": "test-fixture",
             "market_date": "2026-04-29",
             "strategy_run_id": "run-123",
             "requested_at": "2026-04-29T09:00:00Z",
@@ -1319,7 +2345,7 @@ def test_execution_plan_intake_and_read_endpoints() -> None:
     assert len(plans_payload) == 1
     plan = plans_payload[0]
     assert plan["plan_id"] == "plan-20260429-open"
-    assert plan["source"] == "kai-trading-core"
+    assert plan["source"] == "test-fixture"
     assert plan["market_date"] == "2026-04-29"
     assert plan["strategy_run_id"] == "run-123"
     assert plan["mode"] == "paper"
@@ -1366,6 +2392,7 @@ def test_execution_plan_intake_schedules_next_open_buy_jobs() -> None:
         Settings(
             database_url="sqlite:///:memory:",
             runtime_mode="paper",
+            execution_position_account_scope="runtime-health-paper-account",
         )
     )
     client = TestClient(app)
@@ -1374,7 +2401,7 @@ def test_execution_plan_intake_schedules_next_open_buy_jobs() -> None:
         "/execution-plans",
         json={
             "plan_id": "plan-20260430-open",
-            "source": "kai-trading-core",
+            "source": "test-fixture",
             "market_date": "2026-04-30",
             "items": [
                 {
@@ -1461,7 +2488,7 @@ def test_monitoring_items_use_short_pending_config_status_and_stay_evaluable() -
         "/execution-plans",
         json={
             "plan_id": "plan-target-sell-missing-config",
-            "source": "kai-trading-core",
+            "source": "test-fixture",
             "items": [
                 {
                     "symbol": "000660",
@@ -1535,7 +2562,7 @@ def test_position_exit_pending_sell_is_autonomous_monitored_when_position_exists
         "/execution-plans",
         json={
             "plan_id": "plan-position-exit-target",
-            "source": "kai-trading-core",
+            "source": "test-fixture",
             "items": [
                 {
                     "symbol": "000660",
@@ -1566,7 +2593,8 @@ def test_position_exit_pending_sell_is_autonomous_monitored_when_position_exists
         assert [item.id for item in stale_state_autonomous_items] == []
 
         session.add(
-            ExecutionPosition(
+            _scoped_execution_position(
+                app.state.settings,
                 mode="paper",
                 symbol="000660",
                 quantity=7,
@@ -1599,6 +2627,7 @@ def test_autonomous_runtime_prefers_local_latest_watch_symbols_over_stale_core_d
         Settings(
             database_url=f"sqlite:///{tmp_path / 'monitoring-symbol-union.db'}",
             runtime_mode="live",
+            execution_position_account_scope="monitoring-symbol-union-account",
             monitoring_max_symbols_per_cycle=4,
             market_context_enabled=True,
             market_context_base_url="http://core.test",
@@ -1626,31 +2655,43 @@ def test_autonomous_runtime_prefers_local_latest_watch_symbols_over_stale_core_d
             status="accepted",
             accepted_at=datetime(2026, 8, 10, 5, tzinfo=UTC),
         )
-        older_plan.items.append(
-            ExecutionPlanItem(
-                id="older-watch",
-                plan_item_index=0,
-                symbol="OLD001",
+        older_item = ExecutionPlanItem(
+            id="older-watch",
+            plan_item_index=0,
+            symbol="OLD001",
+            side="buy",
+            intent="intraday_watch_buy",
+            status="watch_monitoring_active",
+            trigger_price=Decimal("100"),
+            quantity_policy={"kind": "shares", "quantity": 1},
+        )
+        older_item.risk_context, older_item.quantity_policy = bind_kis_account_route(
+            settings=app.state.settings,
+            provider="kis",
+            risk_context={"exchange": "KRX"},
+            quantity_policy=older_item.quantity_policy,
+        )
+        older_item.provider = "kis"
+        older_plan.items.append(older_item)
+        for index, symbol in enumerate(["004370", "027040", "028670", "049430"]):
+            current_item = ExecutionPlanItem(
+                id=f"current-watch-{symbol}",
+                plan_item_index=index,
+                symbol=symbol,
                 side="buy",
                 intent="intraday_watch_buy",
                 status="watch_monitoring_active",
                 trigger_price=Decimal("100"),
                 quantity_policy={"kind": "shares", "quantity": 1},
             )
-        )
-        for index, symbol in enumerate(["004370", "027040", "028670", "049430"]):
-            current_plan.items.append(
-                ExecutionPlanItem(
-                    id=f"current-watch-{symbol}",
-                    plan_item_index=index,
-                    symbol=symbol,
-                    side="buy",
-                    intent="intraday_watch_buy",
-                    status="watch_monitoring_active",
-                    trigger_price=Decimal("100"),
-                    quantity_policy={"kind": "shares", "quantity": 1},
-                )
+            current_item.risk_context, current_item.quantity_policy = bind_kis_account_route(
+                settings=app.state.settings,
+                provider="kis",
+                risk_context={"exchange": "KRX"},
+                quantity_policy=current_item.quantity_policy,
             )
+            current_item.provider = "kis"
+            current_plan.items.append(current_item)
         session.add_all([older_plan, current_plan])
         session.commit()
 
@@ -1698,6 +2739,13 @@ def test_weekend_handoff_watch_buy_is_monitored_on_target_market_date() -> None:
             trigger_price=Decimal("1000"),
             quantity_policy={"kind": "shares", "quantity": 1},
         )
+        item.risk_context, item.quantity_policy = bind_kis_account_route(
+            settings=app.state.settings,
+            provider="kis",
+            risk_context={"exchange": "KRX"},
+            quantity_policy=item.quantity_policy,
+        )
+        item.provider = "kis"
         session.add(plan)
         session.add(item)
         session.commit()
@@ -1729,7 +2777,7 @@ def test_autonomous_monitoring_uses_latest_plan_per_symbol_only() -> None:
         "/execution-plans",
         json={
             "plan_id": "plan-old-sell",
-            "source": "kai-trading-core",
+            "source": "test-fixture",
             "market_date": "2026-05-21",
             "items": [
                 {
@@ -1737,7 +2785,10 @@ def test_autonomous_monitoring_uses_latest_plan_per_symbol_only() -> None:
                     "side": "sell",
                     "intent": "target_sell",
                     "trigger_price": "100.00",
-                    "quantity_policy": {"kind": "shares", "quantity": 1},
+                    "quantity_policy": {
+                        "type": "position_exit_from_entry",
+                        "linked_entry_item_key": "entry-1",
+                    },
                 }
             ],
         },
@@ -1746,7 +2797,7 @@ def test_autonomous_monitoring_uses_latest_plan_per_symbol_only() -> None:
         "/execution-plans",
         json={
             "plan_id": "plan-new-sell",
-            "source": "kai-trading-core",
+            "source": "test-fixture",
             "market_date": "2026-05-22",
             "items": [
                 {
@@ -1779,7 +2830,8 @@ def test_autonomous_monitoring_uses_latest_plan_per_symbol_only() -> None:
 
     with app.state.db_session_factory() as session:
         session.add(
-            ExecutionPosition(
+            _scoped_execution_position(
+                app.state.settings,
                 mode="paper",
                 symbol="000660",
                 quantity=7,
@@ -1799,8 +2851,12 @@ def test_autonomous_monitoring_uses_latest_plan_per_symbol_only() -> None:
         assert autonomous_item_ids == newer_item_ids
         older_item = session.get(ExecutionPlanItem, older_item_id)
         assert older_item is not None
-        assert older_item.status == "superseded"
-        assert older_item.risk_context["last_monitoring_event"]["event"] == "active_sell_monitor_superseded"
+        assert older_item.status == "target_sell_pending_config"
+        assert older_item.risk_context == {
+            "market": "KRX",
+            "exchange": "KRX",
+            "currency": "KRW",
+        }
 
     engine.dispose()
 
@@ -1810,6 +2866,11 @@ def test_replanned_sell_monitor_updates_existing_source_row_in_place() -> None:
         Settings(
             database_url="sqlite:///:memory:",
             runtime_mode="paper",
+            kis_account_number="12345678",
+            kis_account_product_code="01",
+            account_drawdown_recovery_scope_secret=(
+                "replanned-sell-scope-secret-at-least-32-bytes"
+            ),
         )
     )
     client = TestClient(app)
@@ -1818,7 +2879,7 @@ def test_replanned_sell_monitor_updates_existing_source_row_in_place() -> None:
         "/execution-plans",
         json={
             "plan_id": "plan-old-replanned-sell",
-            "source": "kai-trading-core",
+            "source": "test-fixture",
             "market_date": "2026-05-21",
             "items": [
                 {
@@ -1849,7 +2910,7 @@ def test_replanned_sell_monitor_updates_existing_source_row_in_place() -> None:
         "/execution-plans",
         json={
             "plan_id": "plan-new-replanned-sell",
-            "source": "kai-trading-core",
+            "source": "test-fixture",
             "market_date": "2026-05-21",
             "items": [
                 {
@@ -1878,7 +2939,8 @@ def test_replanned_sell_monitor_updates_existing_source_row_in_place() -> None:
 
     with app.state.db_session_factory() as session:
         session.add(
-            ExecutionPosition(
+            _scoped_execution_position(
+                app.state.settings,
                 mode="paper",
                 symbol="000660",
                 quantity=3,
@@ -1932,7 +2994,7 @@ def test_autonomous_monitoring_includes_older_active_sell_monitor_without_same_i
         "/execution-plans",
         json={
             "plan_id": "plan-old-target-still-active",
-            "source": "kai-trading-core",
+            "source": "test-fixture",
             "market_date": "2026-06-11",
             "items": [
                 {
@@ -1949,7 +3011,7 @@ def test_autonomous_monitoring_includes_older_active_sell_monitor_without_same_i
         "/execution-plans",
         json={
             "plan_id": "plan-new-stop-only",
-            "source": "kai-trading-core",
+            "source": "test-fixture",
             "market_date": "2026-06-12",
             "items": [
                 {
@@ -1969,7 +3031,8 @@ def test_autonomous_monitoring_includes_older_active_sell_monitor_without_same_i
 
     with app.state.db_session_factory() as session:
         session.add(
-            ExecutionPosition(
+            _scoped_execution_position(
+                app.state.settings,
                 mode="paper",
                 symbol="073560",
                 quantity=98,
@@ -2017,7 +3080,7 @@ def test_autonomous_monitoring_repairs_rejected_latest_stop_before_dispatch() ->
         "/execution-plans",
         json={
             "plan_id": "plan-033530-old-stop",
-            "source": "kai-trading-core",
+            "source": "test-fixture",
             "market_date": "2026-05-26",
             "items": [
                 {
@@ -2035,7 +3098,7 @@ def test_autonomous_monitoring_repairs_rejected_latest_stop_before_dispatch() ->
         "/execution-plans",
         json={
             "plan_id": "plan-033530-new-target-rejected-stop",
-            "source": "kai-trading-core",
+            "source": "test-fixture",
             "market_date": "2026-05-27",
             "items": [
                 {
@@ -2067,7 +3130,8 @@ def test_autonomous_monitoring_repairs_rejected_latest_stop_before_dispatch() ->
         assert newer_stop is not None
         newer_stop.status = "broker_order_rejected"
         session.add(
-            ExecutionPosition(
+            _scoped_execution_position(
+                app.state.settings,
                 mode="paper",
                 symbol="033530",
                 quantity=58,
@@ -2151,7 +3215,7 @@ def test_autonomous_monitoring_rearms_retry_pending_stop_after_session_rejection
         "/execution-plans",
         json={
             "plan_id": "plan-033530-retry-pending-stop",
-            "source": "kai-trading-core",
+            "source": "test-fixture",
             "market_date": "2026-05-26",
             "items": [
                 {
@@ -2169,7 +3233,7 @@ def test_autonomous_monitoring_rearms_retry_pending_stop_after_session_rejection
         "/execution-plans",
         json={
             "plan_id": "plan-033530-latest-target-dead-stop",
-            "source": "kai-trading-core",
+            "source": "test-fixture",
             "market_date": "2026-05-27",
             "items": [
                 {
@@ -2205,19 +3269,24 @@ def test_autonomous_monitoring_rearms_retry_pending_stop_after_session_rejection
         newer_stop.status = "broker_order_rejected"
         rejected_order = BrokerOrder(
             execution_plan_item_id=older_stop_id,
+            broker_name="kis",
             mode="paper",
             idempotency_key="session-retry-stop-033530",
             symbol="033530",
             side="sell",
             status="retry_pending",
             quantity=58,
+            venue="KRX",
+            asset_class="kr_equity",
+            request_metadata=_execution_scope_metadata(app.state.settings),
             last_error_code="KIOK0320",
             last_error_message="장운영시간이 아닙니다",
             last_error_retryable=True,
         )
         session.add(rejected_order)
         session.add(
-            ExecutionPosition(
+            _scoped_execution_position(
+                app.state.settings,
                 mode="paper",
                 symbol="033530",
                 quantity=58,
@@ -2335,7 +3404,7 @@ def test_autonomous_monitoring_retries_each_terminal_session_rejection_once(
         "/execution-plans",
         json={
             "plan_id": "plan-033530-multi-session-retry",
-            "source": "kai-trading-core",
+            "source": "test-fixture",
             "market_date": "2026-05-27",
             "items": [
                 {
@@ -2365,7 +3434,12 @@ def test_autonomous_monitoring_retries_each_terminal_session_rejection_once(
             side="sell",
             status="retry_pending",
             quantity=58,
+            venue="KRX",
             asset_class="stock",
+            request_metadata=_execution_scope_metadata(
+                app.state.settings,
+                asset_class="stock",
+            ),
             last_error_classification="broker_rejected",
             last_error_code="KIOK0320",
             last_error_message="장운영시간이 아닙니다",
@@ -2373,7 +3447,8 @@ def test_autonomous_monitoring_retries_each_terminal_session_rejection_once(
         )
         session.add(first_rejection)
         session.add(
-            ExecutionPosition(
+            _scoped_execution_position(
+                app.state.settings,
                 mode="paper",
                 symbol="033530",
                 quantity=58,
@@ -2479,6 +3554,24 @@ def test_autonomous_monitoring_submits_same_symbol_sell_before_watch_buy_when_ca
     )
     assert resume.status_code == 200
 
+    buy_risk_context, buy_quantity_policy = bind_kis_account_route(
+        settings=app.state.settings,
+        provider="kis",
+        risk_context={},
+        quantity_policy={
+            "kind": "shares",
+            "quantity": 1,
+            "stop_price": "7200.0000",
+            "max_budget": "10000.0000",
+        },
+    )
+    sell_risk_context, sell_quantity_policy = bind_kis_account_route(
+        settings=app.state.settings,
+        provider="kis",
+        risk_context={"exchange": "KRX"},
+        quantity_policy={"kind": "position_exit_from_entry"},
+    )
+
     with app.state.db_session_factory() as session:
         plan = ExecutionPlan(
             id="plan-same-symbol-buy-before-sell",
@@ -2492,7 +3585,8 @@ def test_autonomous_monitoring_submits_same_symbol_sell_before_watch_buy_when_ca
         )
         session.add(plan)
         session.add(
-            ExecutionPosition(
+            _scoped_execution_position(
+                app.state.settings,
                 mode="paper",
                 symbol="033530",
                 quantity=1,
@@ -2511,12 +3605,8 @@ def test_autonomous_monitoring_submits_same_symbol_sell_before_watch_buy_when_ca
                     side="buy",
                     intent="intraday_watch_buy",
                     status="watch_monitoring_active",
-                    quantity_policy={
-                        "kind": "shares",
-                        "quantity": 1,
-                        "stop_price": "7200.0000",
-                        "max_budget": "10000.0000",
-                    },
+                        quantity_policy=buy_quantity_policy,
+                        risk_context=buy_risk_context,
                     trigger_price=Decimal("7300.0000"),
                     limit_price=Decimal("7300.0000"),
                     time_in_force="day",
@@ -2529,10 +3619,10 @@ def test_autonomous_monitoring_submits_same_symbol_sell_before_watch_buy_when_ca
                     side="sell",
                     intent="stop_sell",
                     status="stop_sell_monitoring",
-                    quantity_policy={"kind": "position_exit_from_entry"},
+                        quantity_policy=sell_quantity_policy,
                     trigger_price=Decimal("7600.0000"),
                     time_in_force="day",
-                    risk_context={"exchange": "KRX"},
+                        risk_context=sell_risk_context,
                 ),
             ]
         )
@@ -2576,7 +3666,7 @@ def test_autonomous_monitoring_expires_known_flat_pending_sell_monitors() -> Non
         "/execution-plans",
         json={
             "plan_id": "plan-flat-position-sell",
-            "source": "kai-trading-core",
+            "source": "test-fixture",
             "market_date": "2026-05-22",
             "items": [
                 {
@@ -2596,7 +3686,7 @@ def test_autonomous_monitoring_expires_known_flat_pending_sell_monitors() -> Non
         "/execution-plans",
         json={
             "plan_id": "plan-held-position-sell",
-            "source": "kai-trading-core",
+            "source": "test-fixture",
             "market_date": "2026-05-22",
             "items": [
                 {
@@ -2643,14 +3733,16 @@ def test_autonomous_monitoring_expires_known_flat_pending_sell_monitors() -> Non
         session.add_all(
             [
                 live_watch_plan,
-                ExecutionPosition(
+                _scoped_execution_position(
+                    app.state.settings,
                     mode="paper",
                     symbol="000660",
                     quantity=0,
                     average_price=Decimal("0.00"),
                     updated_from="reconciliation",
                 ),
-                ExecutionPosition(
+                _scoped_execution_position(
+                    app.state.settings,
                     mode="paper",
                     symbol="005930",
                     quantity=3,
@@ -2692,7 +3784,7 @@ def test_autonomous_monitoring_expires_known_flat_active_sell_monitors() -> None
         "/execution-plans",
         json={
             "plan_id": "plan-flat-active-sell",
-            "source": "kai-trading-core",
+            "source": "test-fixture",
             "market_date": "2026-05-22",
             "items": [
                 {
@@ -2712,7 +3804,7 @@ def test_autonomous_monitoring_expires_known_flat_active_sell_monitors() -> None
         "/execution-plans",
         json={
             "plan_id": "plan-held-active-sell",
-            "source": "kai-trading-core",
+            "source": "test-fixture",
             "market_date": "2026-05-22",
             "items": [
                 {
@@ -2742,14 +3834,16 @@ def test_autonomous_monitoring_expires_known_flat_active_sell_monitors() -> None
         held_item.status = "stop_sell_monitoring"
         session.add_all(
             [
-                ExecutionPosition(
+                _scoped_execution_position(
+                    app.state.settings,
                     mode="paper",
                     symbol="000660",
                     quantity=0,
                     average_price=Decimal("0.00"),
                     updated_from="reconciliation",
                 ),
-                ExecutionPosition(
+                _scoped_execution_position(
+                    app.state.settings,
                     mode="paper",
                     symbol="005930",
                     quantity=3,
@@ -2792,7 +3886,8 @@ def test_stale_sell_monitor_expiry_preserves_only_active_protection_for_held_pos
         )
         session.add(plan)
         session.add(
-            ExecutionPosition(
+            _scoped_execution_position(
+                app.state.settings,
                 mode="paper",
                 symbol="459550",
                 quantity=200,
@@ -2888,6 +3983,7 @@ def test_monitoring_refreshes_stale_flat_position_before_sell_symbol_selection()
         Settings(
             database_url="sqlite:///:memory:",
             runtime_mode="live",
+            execution_position_account_scope="health-test-live-account",
             exec_agent_max_account_snapshot_age_seconds=60,
         )
     )
@@ -2896,7 +3992,7 @@ def test_monitoring_refreshes_stale_flat_position_before_sell_symbol_selection()
         "/execution-plans",
         json={
             "plan_id": "plan-stale-position-sell-monitor",
-            "source": "kai-trading-core",
+            "source": "test-fixture",
             "market_date": "2026-05-22",
             "items": [
                 {
@@ -2920,7 +4016,8 @@ def test_monitoring_refreshes_stale_flat_position_before_sell_symbol_selection()
         assert item is not None
         item.status = "stop_sell_monitoring"
         session.add(
-            ExecutionPosition(
+            _scoped_execution_position(
+                app.state.settings,
                 mode="live",
                 symbol="005930",
                 quantity=0,
@@ -2970,7 +4067,7 @@ def test_autonomous_monitoring_retains_pending_sell_after_unexited_buy_order() -
         "/execution-plans",
         json={
             "plan_id": "plan-buy-filled-local-position-stale",
-            "source": "kai-trading-core",
+            "source": "test-fixture",
             "market_date": "2026-06-04",
             "items": [
                 {
@@ -3003,6 +4100,7 @@ def test_autonomous_monitoring_retains_pending_sell_after_unexited_buy_order() -
         stop_item.status = "stop_sell_pending_config"
         session.add(
             BrokerOrder(
+                broker_name="kis",
                 mode="paper",
                 execution_plan_item_id=buy_item_id,
                 idempotency_key=f"monitoring:watch_buy:{buy_item_id}",
@@ -3010,12 +4108,16 @@ def test_autonomous_monitoring_retains_pending_sell_after_unexited_buy_order() -
                 side="buy",
                 status="filled",
                 quantity=1,
+                venue="KRX",
+                asset_class="kr_equity",
                 limit_price=Decimal("567000.00"),
+                request_metadata=_execution_scope_metadata(app.state.settings),
                 submitted_at=datetime(2026, 6, 4, 0, 55, tzinfo=UTC),
             )
         )
         session.add(
-            ExecutionPosition(
+            _scoped_execution_position(
+                app.state.settings,
                 mode="paper",
                 symbol="002380",
                 quantity=0,
@@ -3045,6 +4147,7 @@ def test_live_autonomous_monitoring_preserves_pending_sell_before_fresh_position
         Settings(
             database_url="sqlite:///:memory:",
             runtime_mode="live",
+            execution_position_account_scope="health-test-live-account",
         )
     )
     client = TestClient(app)
@@ -3053,7 +4156,7 @@ def test_live_autonomous_monitoring_preserves_pending_sell_before_fresh_position
         "/execution-plans",
         json={
             "plan_id": "plan-live-buy-filled-position-stale-flat",
-            "source": "kai-trading-core",
+            "source": "test-fixture",
             "market_date": "2026-06-04",
             "items": [
                 {
@@ -3086,6 +4189,7 @@ def test_live_autonomous_monitoring_preserves_pending_sell_before_fresh_position
         stop_item.status = "stop_sell_pending_config"
         session.add(
             BrokerOrder(
+                broker_name="kis",
                 mode="live",
                 execution_plan_item_id=buy_item_id,
                 idempotency_key=f"monitoring:watch_buy:{buy_item_id}",
@@ -3093,12 +4197,16 @@ def test_live_autonomous_monitoring_preserves_pending_sell_before_fresh_position
                 side="buy",
                 status="filled",
                 quantity=1,
+                venue="KRX",
+                asset_class="kr_equity",
                 limit_price=Decimal("567000.00"),
+                request_metadata=_execution_scope_metadata(app.state.settings),
                 submitted_at=datetime(2026, 6, 4, 0, 55, tzinfo=UTC),
             )
         )
         session.add(
-            ExecutionPosition(
+            _scoped_execution_position(
+                app.state.settings,
                 mode="live",
                 symbol="002380",
                 quantity=0,
@@ -3128,6 +4236,7 @@ def test_live_autonomous_monitoring_drops_pending_sell_after_fresh_flat_position
         Settings(
             database_url="sqlite:///:memory:",
             runtime_mode="live",
+            execution_position_account_scope="health-test-live-account",
         )
     )
     client = TestClient(app)
@@ -3136,7 +4245,7 @@ def test_live_autonomous_monitoring_drops_pending_sell_after_fresh_flat_position
         "/execution-plans",
         json={
             "plan_id": "plan-live-buy-filled-position-flat",
-            "source": "kai-trading-core",
+            "source": "test-fixture",
             "market_date": "2026-06-04",
             "items": [
                 {
@@ -3181,7 +4290,8 @@ def test_live_autonomous_monitoring_drops_pending_sell_after_fresh_flat_position
             )
         )
         session.add(
-            ExecutionPosition(
+            _scoped_execution_position(
+                app.state.settings,
                 mode="live",
                 symbol="002380",
                 quantity=0,
@@ -3220,7 +4330,7 @@ def test_autonomous_monitoring_includes_held_stop_sell_outside_symbol_cap() -> N
         "/execution-plans",
         json={
             "plan_id": "plan-cap-first-target",
-            "source": "kai-trading-core",
+            "source": "test-fixture",
             "market_date": "2026-06-08",
             "items": [
                 {
@@ -3237,7 +4347,7 @@ def test_autonomous_monitoring_includes_held_stop_sell_outside_symbol_cap() -> N
         "/execution-plans",
         json={
             "plan_id": "plan-cap-second-target",
-            "source": "kai-trading-core",
+            "source": "test-fixture",
             "market_date": "2026-06-08",
             "items": [
                 {
@@ -3254,7 +4364,7 @@ def test_autonomous_monitoring_includes_held_stop_sell_outside_symbol_cap() -> N
         "/execution-plans",
         json={
             "plan_id": "plan-cap-held-kcc-stop",
-            "source": "kai-trading-core",
+            "source": "test-fixture",
             "market_date": "2026-06-08",
             "items": [
                 {
@@ -3288,7 +4398,8 @@ def test_autonomous_monitoring_includes_held_stop_sell_outside_symbol_cap() -> N
         second_item.plan.accepted_at = datetime(2026, 6, 8, 0, 1, tzinfo=UTC)
         held_stop_item.plan.accepted_at = datetime(2026, 6, 8, 0, 2, tzinfo=UTC)
         session.add(
-            ExecutionPosition(
+            _scoped_execution_position(
+                app.state.settings,
                 mode="paper",
                 symbol="002380",
                 quantity=1,
@@ -3416,7 +4527,8 @@ def test_monitoring_cycle_preserves_all_held_symbols_past_fast_path_cap(tmp_path
             )
         for symbol in ("000001", "000002", "000003"):
             session.add(
-                ExecutionPosition(
+                _scoped_execution_position(
+                    app.state.settings,
                     mode="paper",
                     symbol=symbol,
                     quantity=1,
@@ -3450,7 +4562,7 @@ def test_post_entry_maintenance_creates_missing_target_sell_monitor() -> None:
         "/execution-plans",
         json={
             "plan_id": "plan-held-entry-target-repair",
-            "source": "kai-trading-core",
+            "source": "test-fixture",
             "market_date": "2026-06-08",
             "items": [
                 {
@@ -3485,6 +4597,7 @@ def test_post_entry_maintenance_creates_missing_target_sell_monitor() -> None:
         buy_item.status = "broker_order_submitted"
         session.add(
             BrokerOrder(
+                broker_name="kis",
                 mode="paper",
                 execution_plan_item_id=buy_item_id,
                 idempotency_key=f"monitoring:watch_buy:{buy_item_id}",
@@ -3492,11 +4605,15 @@ def test_post_entry_maintenance_creates_missing_target_sell_monitor() -> None:
                 side="buy",
                 status="filled",
                 quantity=3,
+                venue="KRX",
+                asset_class="kr_equity",
                 limit_price=Decimal("100.00"),
+                request_metadata=_execution_scope_metadata(app.state.settings),
                 submitted_at=datetime(2026, 6, 8, 0, 55, tzinfo=UTC),
             )
         )
-        position = ExecutionPosition(
+        position = _scoped_execution_position(
+            app.state.settings,
             mode="paper",
             symbol="002380",
             quantity=3,
@@ -3547,13 +4664,14 @@ def test_post_entry_maintenance_promotes_pending_target_sell_monitor() -> None:
         "/execution-plans",
         json={
             "plan_id": "plan-held-entry-target-pending-repair",
-            "source": "kai-trading-core",
+            "source": "test-fixture",
             "market_date": "2026-06-08",
             "items": [
                 {
                     "symbol": "002380",
                     "side": "buy",
                     "intent": "intraday_watch_buy",
+                    "source_plan_item_id": "entry-1",
                     "trigger_price": "100.00",
                     "limit_price": "100.00",
                     "quantity_policy": {"kind": "shares", "quantity": 3},
@@ -3588,6 +4706,7 @@ def test_post_entry_maintenance_promotes_pending_target_sell_monitor() -> None:
         buy_item.status = "broker_order_submitted"
         session.add(
             BrokerOrder(
+                broker_name="kis",
                 mode="paper",
                 execution_plan_item_id=buy_item_id,
                 idempotency_key=f"monitoring:watch_buy:{buy_item_id}",
@@ -3595,11 +4714,15 @@ def test_post_entry_maintenance_promotes_pending_target_sell_monitor() -> None:
                 side="buy",
                 status="filled",
                 quantity=3,
+                venue="KRX",
+                asset_class="kr_equity",
                 limit_price=Decimal("100.00"),
+                request_metadata=_execution_scope_metadata(app.state.settings),
                 submitted_at=datetime(2026, 6, 8, 0, 55, tzinfo=UTC),
             )
         )
-        position = ExecutionPosition(
+        position = _scoped_execution_position(
+            app.state.settings,
             mode="paper",
             symbol="002380",
             quantity=3,
@@ -3684,13 +4807,14 @@ def test_cached_autonomous_monitoring_repairs_targets_before_idle_exit() -> None
         "/execution-plans",
         json={
             "plan_id": "plan-cached-target-repair-before-idle",
-            "source": "kai-trading-core",
+            "source": "test-fixture",
             "market_date": "2026-06-08",
             "items": [
                 {
                     "symbol": "002380",
                     "side": "buy",
                     "intent": "intraday_watch_buy",
+                    "source_plan_item_id": "entry-1",
                     "trigger_price": "100.00",
                     "limit_price": "100.00",
                     "quantity_policy": {"kind": "shares", "quantity": 3},
@@ -3725,6 +4849,7 @@ def test_cached_autonomous_monitoring_repairs_targets_before_idle_exit() -> None
         buy_item.status = "broker_order_submitted"
         session.add(
             BrokerOrder(
+                broker_name="kis",
                 mode="paper",
                 execution_plan_item_id=buy_item_id,
                 idempotency_key=f"monitoring:watch_buy:{buy_item_id}",
@@ -3732,12 +4857,16 @@ def test_cached_autonomous_monitoring_repairs_targets_before_idle_exit() -> None
                 side="buy",
                 status="filled",
                 quantity=3,
+                venue="KRX",
+                asset_class="kr_equity",
                 limit_price=Decimal("100.00"),
+                request_metadata=_execution_scope_metadata(app.state.settings),
                 submitted_at=datetime(2026, 6, 8, 0, 55, tzinfo=UTC),
             )
         )
         session.add(
-            ExecutionPosition(
+            _scoped_execution_position(
+                app.state.settings,
                 mode="paper",
                 symbol="002380",
                 quantity=3,
@@ -3799,7 +4928,9 @@ def test_live_desired_symbol_reconcile_syncs_positions_and_filled_today(tmp_path
         def __init__(self, observed_at: datetime) -> None:
             self.observed_at = observed_at
             self.reconcile_calls: list[tuple[str, str, datetime | None]] = []
-            self.account_snapshot_calls = 0
+            self.account_snapshot_calls: list[
+                tuple[list[str] | None, dict[str, Decimal] | None, str]
+            ] = []
 
         def describe(self) -> BrokerConfig:
             return BrokerConfig(
@@ -3847,9 +4978,16 @@ def test_live_desired_symbol_reconcile_syncs_positions_and_filled_today(tmp_path
                 "observed_at": self.observed_at.isoformat(),
             }
 
-        def get_account_snapshot(self, access_token: str) -> BrokerAccountSnapshot:
+        def get_account_snapshot(
+            self,
+            access_token: str,
+            *,
+            symbols: list[str] | None = None,
+            reference_prices: dict[str, Decimal] | None = None,
+            exchange: str = "KRX",
+        ) -> BrokerAccountSnapshot:
             assert access_token
-            self.account_snapshot_calls += 1
+            self.account_snapshot_calls.append((symbols, reference_prices, exchange))
             return BrokerAccountSnapshot(
                 available_cash=Decimal("1000000"),
                 observed_at=self.observed_at,
@@ -3876,6 +5014,7 @@ def test_live_desired_symbol_reconcile_syncs_positions_and_filled_today(tmp_path
             kis_app_key="live-key",
             kis_app_secret="live-secret",
             kis_account_number="12345678",
+            execution_position_account_scope="health-test-live-account",
         ),
         autonomous_runtime_enabled=True,
         monitoring_price_source=price_source,
@@ -3911,6 +5050,14 @@ def test_live_desired_symbol_reconcile_syncs_positions_and_filled_today(tmp_path
             limit_price=Decimal("110.00"),
             quantity_policy={"kind": "shares", "quantity": 3},
         )
+        for item in (buy_item, target_item):
+            item.risk_context, item.quantity_policy = bind_kis_account_route(
+                settings=app.state.settings,
+                provider="kis",
+                risk_context={"exchange": "KRX"},
+                quantity_policy=item.quantity_policy,
+            )
+            item.provider = "kis"
         plan.items.extend([buy_item, target_item])
         session.add(plan)
         session.flush()
@@ -3925,8 +5072,11 @@ def test_live_desired_symbol_reconcile_syncs_positions_and_filled_today(tmp_path
                 side="buy",
                 status="submitted",
                 quantity=3,
+                venue="KRX",
+                asset_class="kr_equity",
                 limit_price=Decimal("100.00"),
                 submitted_at=started_at - timedelta(minutes=1),
+                request_metadata=_execution_scope_metadata(app.state.settings),
             )
         )
         session.commit()
@@ -3938,7 +5088,10 @@ def test_live_desired_symbol_reconcile_syncs_positions_and_filled_today(tmp_path
     ]
     # KRX holdings discovery runs before the symbol-scoped order reconciliation
     # refresh, without serially querying unrelated overseas exchanges.
-    assert broker.account_snapshot_calls == 2
+    assert broker.account_snapshot_calls == [
+        (None, None, "KRX"),
+        (["002380"], None, "KRX"),
+    ]
     assert price_source.calls == [["002380"]]
     assert payload["cached_evaluation"] is True
     assert payload["evaluated_item_count"] == 3
@@ -3976,7 +5129,7 @@ def test_monitoring_reports_missing_profit_target_coverage() -> None:
         "/execution-plans",
         json={
             "plan_id": "plan-held-target-coverage-gap",
-            "source": "kai-trading-core",
+            "source": "test-fixture",
             "market_date": "2026-06-08",
             "items": [
                 {
@@ -4002,7 +5155,8 @@ def test_monitoring_reports_missing_profit_target_coverage() -> None:
 
     with app.state.db_session_factory() as session:
         session.add(
-            ExecutionPosition(
+            _scoped_execution_position(
+                app.state.settings,
                 mode="paper",
                 symbol="002380",
                 quantity=3,
@@ -4057,6 +5211,7 @@ def test_pending_broker_order_symbols_include_flat_submitted_sell() -> None:
     with app.state.db_session_factory() as session:
         session.add(
             BrokerOrder(
+                broker_name="kis",
                 mode="paper",
                 idempotency_key="monitoring:target_sell:flat-submitted",
                 broker_order_id="flat-submitted-sell-1",
@@ -4064,10 +5219,14 @@ def test_pending_broker_order_symbols_include_flat_submitted_sell() -> None:
                 side="sell",
                 status="submitted",
                 quantity=150,
+                venue="KRX",
+                asset_class="kr_equity",
+                request_metadata=_execution_scope_metadata(app.state.settings),
             )
         )
         session.add(
-            ExecutionPosition(
+            _scoped_execution_position(
+                app.state.settings,
                 mode="paper",
                 symbol="003280",
                 quantity=0,
@@ -4101,7 +5260,7 @@ def test_autonomous_monitoring_prioritizes_watch_buys_over_nonheld_stale_sell_pe
         "/execution-plans",
         json={
             "plan_id": "plan-stale-nonheld-sell-pending",
-            "source": "kai-trading-core",
+            "source": "test-fixture",
             "market_date": "2026-06-01",
             "items": [
                 {
@@ -4125,7 +5284,7 @@ def test_autonomous_monitoring_prioritizes_watch_buys_over_nonheld_stale_sell_pe
         "/execution-plans",
         json={
             "plan_id": "plan-current-watch-buy",
-            "source": "kai-trading-core",
+            "source": "test-fixture",
             "market_date": "2026-06-12",
             "items": [
                 {
@@ -4169,7 +5328,7 @@ def test_autonomous_monitoring_includes_watch_buys_when_positions_are_held() -> 
         "/execution-plans",
         json={
             "plan_id": "plan-held-stop-and-watch-buy",
-            "source": "kai-trading-core",
+            "source": "test-fixture",
             "market_date": "2026-06-12",
             "items": [
                 {
@@ -4186,7 +5345,7 @@ def test_autonomous_monitoring_includes_watch_buys_when_positions_are_held() -> 
         "/execution-plans",
         json={
             "plan_id": "plan-live-watch-buy-with-held-position",
-            "source": "kai-trading-core",
+            "source": "test-fixture",
             "market_date": "2026-06-12",
             "items": [
                 {
@@ -4207,7 +5366,8 @@ def test_autonomous_monitoring_includes_watch_buys_when_positions_are_held() -> 
 
     with app.state.db_session_factory() as session:
         session.add(
-            ExecutionPosition(
+            _scoped_execution_position(
+                app.state.settings,
                 mode="paper",
                 symbol="005930",
                 quantity=1,
@@ -4244,7 +5404,7 @@ def test_duplicate_execution_plan_is_rejected() -> None:
     client = TestClient(app)
     payload = {
         "plan_id": "duplicate-plan",
-        "source": "kai-trading-core",
+        "source": "test-fixture",
         "items": [
             {
                 "symbol": "005930",
@@ -4278,7 +5438,7 @@ def test_execution_plan_intake_allows_same_plan_id_in_different_runtime_modes(tm
     database_url = f"sqlite:///{tmp_path / 'shared-execution-plans.db'}"
     payload = {
         "plan_id": "shared-plan",
-        "source": "kai-trading-core",
+        "source": "test-fixture",
         "items": [
             {
                 "symbol": "005930",
@@ -4429,7 +5589,8 @@ def test_order_execution_and_position_read_endpoints_return_persisted_state() ->
             )
         )
         session.add(
-            ExecutionPosition(
+            _scoped_execution_position(
+                app.state.settings,
                 mode="mock",
                 symbol="005930",
                 quantity=10,
@@ -4476,6 +5637,7 @@ def test_order_execution_and_position_reads_are_filtered_to_active_runtime_mode(
         settings=Settings(
             database_url="sqlite:///:memory:",
             runtime_mode="paper",
+            kis_account_number="12345678",
         )
     )
 
@@ -4557,14 +5719,16 @@ def test_order_execution_and_position_reads_are_filtered_to_active_runtime_mode(
                     price=Decimal("71950.0000"),
                     filled_at=datetime(2026, 4, 29, 9, 4, tzinfo=UTC),
                 ),
-                ExecutionPosition(
+                _scoped_execution_position(
+                    app.state.settings,
                     mode="paper",
                     symbol="005930",
                     quantity=2,
                     average_price=Decimal("70950.0000"),
                     updated_from="reconciliation",
                 ),
-                ExecutionPosition(
+                _scoped_execution_position(
+                    app.state.settings,
                     mode="live",
                     symbol="005930",
                     quantity=3,
@@ -4671,14 +5835,16 @@ def test_execution_read_endpoints_apply_plan_and_symbol_filters() -> None:
                     price=Decimal("180000.0000"),
                     filled_at=datetime(2026, 4, 29, 9, 4, tzinfo=UTC),
                 ),
-                ExecutionPosition(
+                _scoped_execution_position(
+                    app.state.settings,
                     mode="paper",
                     symbol="005930",
                     quantity=1,
                     average_price=Decimal("70000.0000"),
                     updated_from="reconciliation",
                 ),
-                ExecutionPosition(
+                _scoped_execution_position(
+                    app.state.settings,
                     mode="paper",
                     symbol="000660",
                     quantity=1,
@@ -4779,6 +5945,14 @@ def test_runtime_status_exposes_core_facing_symbol_summary() -> None:
                 historical_fill_item,
             ]
         )
+        for item in paper_plan.items:
+            item.risk_context, item.quantity_policy = bind_kis_account_route(
+                settings=app.state.settings,
+                provider="kis",
+                risk_context={"exchange": "KRX"},
+                quantity_policy=item.quantity_policy,
+            )
+            item.provider = "kis"
         session.add(paper_plan)
         session.flush()
 
@@ -4800,6 +5974,7 @@ def test_runtime_status_exposes_core_facing_symbol_summary() -> None:
         )
         open_order = BrokerOrder(
             execution_plan_item_id=scheduled_item.id,
+            broker_name="kis",
             mode="paper",
             idempotency_key="paper-open-order",
             broker_order_id="kis-open-1",
@@ -4807,11 +5982,15 @@ def test_runtime_status_exposes_core_facing_symbol_summary() -> None:
             side="buy",
             status="open",
             quantity=3,
+            venue="KRX",
+            asset_class="kr_equity",
+            request_metadata=_execution_scope_metadata(app.state.settings),
             submitted_at=today_edge_naive,
             last_broker_sync_at=today_edge_naive,
         )
         failed_order = BrokerOrder(
             execution_plan_item_id=failed_item.id,
+            broker_name="kis",
             mode="paper",
             idempotency_key="paper-failed-order",
             broker_order_id="kis-failed-1",
@@ -4819,12 +5998,16 @@ def test_runtime_status_exposes_core_facing_symbol_summary() -> None:
             side="buy",
             status="failed",
             quantity=2,
+            venue="KRX",
+            asset_class="kr_equity",
+            request_metadata=_execution_scope_metadata(app.state.settings),
             submitted_at=today_edge_naive,
             last_broker_sync_at=None,
             last_error_message="broker rejected order",
         )
         historical_failed_order = BrokerOrder(
             execution_plan_item_id=historical_failed_item.id,
+            broker_name="kis",
             mode="paper",
             idempotency_key="paper-failed-order-yesterday",
             broker_order_id="kis-failed-2",
@@ -4832,12 +6015,16 @@ def test_runtime_status_exposes_core_facing_symbol_summary() -> None:
             side="buy",
             status="rejected",
             quantity=1,
+            venue="KRX",
+            asset_class="kr_equity",
+            request_metadata=_execution_scope_metadata(app.state.settings),
             submitted_at=yesterday_edge_naive,
             last_broker_sync_at=None,
             last_error_message="historical rejection",
         )
         historical_filled_order = BrokerOrder(
             execution_plan_item_id=historical_fill_item.id,
+            broker_name="kis",
             mode="paper",
             idempotency_key="paper-filled-order-yesterday",
             broker_order_id="kis-filled-2",
@@ -4845,6 +6032,9 @@ def test_runtime_status_exposes_core_facing_symbol_summary() -> None:
             side="buy",
             status="filled",
             quantity=4,
+            venue="KRX",
+            asset_class="kr_equity",
+            request_metadata=_execution_scope_metadata(app.state.settings),
             submitted_at=yesterday_edge_naive,
             last_broker_sync_at=yesterday_edge_naive,
         )
@@ -4932,7 +6122,7 @@ def test_runtime_status_exposes_core_facing_symbol_summary() -> None:
     engine.dispose()
 
 
-def test_runtime_status_deduplicates_legacy_fills_before_daily_counts() -> None:
+def test_runtime_status_deduplicates_repeated_fills_before_daily_counts() -> None:
     app, engine = build_test_app(
         settings=Settings(
             database_url="sqlite:///:memory:",
@@ -4943,20 +6133,28 @@ def test_runtime_status_deduplicates_legacy_fills_before_daily_counts() -> None:
     now = datetime.now(UTC)
     with app.state.db_session_factory() as session:
         buy_order = BrokerOrder(
+            broker_name="kis",
             mode="paper",
             idempotency_key="legacy-duplicate-fill-buy",
             symbol="282330",
             side="buy",
             status="filled",
             quantity=6,
+            venue="KRX",
+            asset_class="kr_equity",
+            request_metadata=_execution_scope_metadata(app.state.settings),
         )
         sell_order = BrokerOrder(
+            broker_name="kis",
             mode="paper",
             idempotency_key="legacy-duplicate-fill-sell",
             symbol="282330",
             side="sell",
             status="filled",
             quantity=2,
+            venue="KRX",
+            asset_class="kr_equity",
+            request_metadata=_execution_scope_metadata(app.state.settings),
         )
         session.add_all([buy_order, sell_order])
         session.flush()
@@ -5013,15 +6211,27 @@ def test_fast_runtime_status_uses_autonomous_snapshot_for_monitored_symbols() ->
         autonomous_runtime_enabled=True,
     )
     app.state.autonomous_runtime._monitoring_state.status = "running"
-    app.state.autonomous_runtime._monitoring_state.last_cycle = {
-        "monitored_symbols": ["005930", "000660", "005930"],
+    identity = build_position_identity(
+        settings=app.state.settings,
+        provider="kis",
+        exchange="KRX",
+    )
+    exact_scope = {
+        "policy_version": 1,
+        "provider": "kis",
+        "account_scope": identity.account_scope,
     }
+    app.state.autonomous_runtime._store_cycle_payload(
+        worker_key="monitoring",
+        payload={"monitored_symbols": ["005930", "000660", "005930"]},
+    )
     app.state.autonomous_runtime._monitoring_runtime_snapshot = MonitoringRuntimeSnapshot(
         loaded_at=datetime.now(UTC),
         symbols=["005930", "000660", "005930"],
         positions_by_symbol={},
         items=[],
         filled_today_symbols=["282330"],
+        execution_scope=exact_scope,
     )
     krx_today = datetime.now(ZoneInfo("Asia/Seoul")).date()
     now = datetime.combine(
@@ -5055,6 +6265,7 @@ def test_fast_runtime_status_uses_autonomous_snapshot_for_monitored_symbols() ->
             side="buy",
             status="filled",
             quantity=3,
+            request_metadata=_execution_scope_metadata(app.state.settings),
         )
         sell_order = BrokerOrder(
             mode="paper",
@@ -5063,6 +6274,7 @@ def test_fast_runtime_status_uses_autonomous_snapshot_for_monitored_symbols() ->
             side="sell",
             status="filled",
             quantity=3,
+            request_metadata=_execution_scope_metadata(app.state.settings),
         )
         session.add_all([buy_order, sell_order])
         session.flush()
@@ -5155,10 +6367,13 @@ def test_fast_runtime_status_honors_durable_paused_state() -> None:
 
 def test_fast_runtime_status_reports_durable_account_drawdown_gate(monkeypatch) -> None:
     expected_gate = {
+        "available": True,
         "enabled": True,
         "gated": True,
+        "provider": "kis",
         "latest_decision": {"summary": {"gate_name": "daily_total_asset_drawdown_pct"}},
         "active_recovery_scopes": {"kis:opaque:krw": {"order_id": "blocked-buy"}},
+        "reason": None,
     }
     monkeypatch.setattr(
         runtime_service,
@@ -5272,6 +6487,7 @@ def test_runtime_status_counts_are_filtered_to_active_runtime_mode() -> None:
         settings=Settings(
             database_url="sqlite:///:memory:",
             runtime_mode="paper",
+            execution_position_account_scope="runtime-counts-paper-account",
         )
     )
 
@@ -5287,6 +6503,17 @@ def test_runtime_status_counts_are_filtered_to_active_runtime_mode() -> None:
             side="buy",
             intent="next_open_buy",
             status="next_open_buy_scheduled",
+            provider="kis",
+            venue="KRX",
+            asset_class="kr_equity",
+            risk_context={"exchange": "KRX"},
+            quantity_policy={"kind": "shares", "quantity": 1},
+        )
+        paper_item.risk_context, paper_item.quantity_policy = bind_kis_account_route(
+            settings=app.state.settings,
+            provider="kis",
+            risk_context=paper_item.risk_context,
+            quantity_policy=paper_item.quantity_policy,
         )
         paper_plan.items.append(paper_item)
 
@@ -5301,6 +6528,17 @@ def test_runtime_status_counts_are_filtered_to_active_runtime_mode() -> None:
             side="buy",
             intent="next_open_buy",
             status="next_open_buy_scheduled",
+            provider="kis",
+            venue="KRX",
+            asset_class="kr_equity",
+            risk_context={"exchange": "KRX"},
+            quantity_policy={"kind": "shares", "quantity": 1},
+        )
+        live_item.risk_context, live_item.quantity_policy = bind_kis_account_route(
+            settings=app.state.settings,
+            provider="kis",
+            risk_context=live_item.risk_context,
+            quantity_policy=live_item.quantity_policy,
         )
         live_plan.items.append(live_item)
         session.add_all([paper_plan, live_plan])
@@ -5327,6 +6565,10 @@ def test_runtime_status_counts_are_filtered_to_active_runtime_mode() -> None:
                     side="buy",
                     status="open",
                     quantity=1,
+                    broker_name="kis",
+                    venue="KRX",
+                    asset_class="kr_equity",
+                    request_metadata=_execution_scope_metadata(app.state.settings),
                 ),
                 BrokerOrder(
                     execution_plan_item_id=live_item.id,
@@ -5337,6 +6579,10 @@ def test_runtime_status_counts_are_filtered_to_active_runtime_mode() -> None:
                     side="buy",
                     status="open",
                     quantity=1,
+                    broker_name="kis",
+                    venue="KRX",
+                    asset_class="kr_equity",
+                    request_metadata=_execution_scope_metadata(app.state.settings),
                 ),
             ]
         )

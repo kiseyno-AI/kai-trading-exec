@@ -9,7 +9,7 @@ from decimal import Decimal
 from pathlib import Path
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 from app.core.config import Settings
 from app.db.base import Base
@@ -29,12 +29,34 @@ from app.services.execution_fill_repair import (
     apply_fifo_inventory_repairs,
     apply_execution_fill_repairs,
 )
-from app.services.fill_idempotency import dedupe_execution_fills
+from app.services.fill_idempotency import (
+    dedupe_execution_fills,
+    duplicate_fill_conflicting_fields,
+)
+from app.services.position_identity import (
+    PositionIdentity,
+    build_position_identity,
+    execution_scope_payload,
+    payload_with_position_identity,
+)
 from app.services.runtime import broker_order_fill_quality_payload, daily_pnl_payload
 
 
 FILLED_AT = datetime(2026, 7, 24, 0, 5, 1, tzinfo=UTC)
 SOLD_AT = datetime(2026, 7, 24, 1, 0, 0, tzinfo=UTC)
+FIFO_TEST_ACCOUNT_SCOPE = "a" * 24
+FIFO_FOREIGN_ACCOUNT_SCOPE = "b" * 24
+
+
+def _fifo_position_payload(*, exchange: str = "KRX") -> dict[str, object]:
+    return payload_with_position_identity(
+        None,
+        identity=PositionIdentity(
+            provider="kis",
+            account_scope=FIFO_TEST_ACCOUNT_SCOPE,
+            exchange=exchange,
+        ),
+    )
 
 
 def _session(settings: Settings):
@@ -47,9 +69,32 @@ def _settings(database_url: str = "sqlite:///:memory:") -> Settings:
     return Settings(database_url=database_url, runtime_mode="paper")
 
 
+def _bind_order_to_runtime_scope(
+    order: BrokerOrder,
+    *,
+    settings: Settings,
+    exchange: str = "KRX",
+) -> None:
+    identity = build_position_identity(
+        settings=settings,
+        provider=order.broker_name,
+        exchange=exchange,
+    )
+    order.request_metadata = {
+        "exchange": exchange,
+        "execution_scope": execution_scope_payload(
+            identity=identity,
+            venue=str(order.venue or exchange),
+            asset_class=str(order.asset_class or "stock"),
+        ),
+    }
+
+
 def _filled_order_missing_fill() -> BrokerOrder:
     return BrokerOrder(
         broker_name="kis",
+        venue="KRX",
+        asset_class="stock",
         mode="paper",
         idempotency_key="repair-missing-105560-buy",
         broker_order_id="missing-buy-1",
@@ -58,6 +103,13 @@ def _filled_order_missing_fill() -> BrokerOrder:
         status="filled",
         quantity=1,
         submitted_at=FILLED_AT,
+        request_metadata={
+            "exchange": "KRX",
+            "broker_account_scope": {
+                "policy_version": 2,
+                "scope": FIFO_TEST_ACCOUNT_SCOPE,
+            }
+        },
         raw_broker_payload={
             "order": {
                 "odno": "missing-buy-1",
@@ -66,6 +118,7 @@ def _filled_order_missing_fill() -> BrokerOrder:
                 "tot_ccld_qty": "1",
                 "rmn_qty": "0",
                 "avg_pric": "71000",
+                "filled_at": FILLED_AT.isoformat(),
                 "ord_dt": "20260724",
                 "ord_tmd": "090501",
             }
@@ -112,6 +165,193 @@ def test_missing_fill_detection_reports_evidence_and_proposed_fields() -> None:
             "filled_at": FILLED_AT.isoformat(),
         }
     ]
+    engine.dispose()
+
+
+def test_canceled_order_with_broker_reported_fill_is_manual_review_candidate() -> None:
+    settings = _settings()
+    engine, db = _session(settings)
+    order = BrokerOrder(
+        broker_name="kis",
+        venue="NASD",
+        asset_class="us_equity",
+        mode="paper",
+        idempotency_key="repair-canceled-partial-us-fill",
+        broker_order_id="canceled-partial-us-fill",
+        symbol="AAPL",
+        side="buy",
+        status="canceled",
+        quantity=10,
+        submitted_at=FILLED_AT,
+        request_metadata={
+            "exchange": "NASD",
+            "broker_account_scope": {
+                "policy_version": 2,
+                "scope": FIFO_TEST_ACCOUNT_SCOPE,
+            },
+        },
+        raw_broker_payload={
+            "output": [
+                {
+                    "ft_ord_qty": "10",
+                    "ft_ccld_qty": "1",
+                    "nccs_qty": "0",
+                }
+            ]
+        },
+    )
+    db.add(order)
+    db.commit()
+
+    payload = analyze_execution_fill_repairs(db=db, runtime_mode="paper")
+
+    assert payload["summary"]["missing_filled_order_count"] == 1
+    item = payload["missing_filled_orders"][0]
+    assert item["broker_order_pk"] == order.id
+    assert item["candidate_reason"] == "missing_execution_fill"
+    assert item["quantity_basis"] == "quantity"
+    assert item["expected_quantity"] == 1
+    assert item["persisted_quantity"] == 0
+    assert item["proposed_fills"] == []
+    assert item["repair_action"] == "record_manual_review"
+    engine.dispose()
+
+
+def test_partial_terminal_fill_is_manual_review_candidate_using_base_quantity() -> None:
+    settings = _settings()
+    engine, db = _session(settings)
+    order = _filled_order_missing_fill()
+    order.idempotency_key = "repair-partial-base-quantity"
+    order.broker_order_id = "partial-base-quantity"
+    order.quantity = 10
+    order.base_quantity = Decimal("1.5")
+    db.add(order)
+    db.flush()
+    persisted_fill = ExecutionFill(
+        idempotency_key="persisted-partial-base-quantity-fill",
+        broker_order_pk=order.id,
+        broker_fill_id="partial-base-quantity-fill",
+        symbol=order.symbol,
+        side=order.side,
+        quantity=10,
+        base_quantity=Decimal("0.5"),
+        price=Decimal("71000"),
+        filled_at=FILLED_AT,
+    )
+    db.add(persisted_fill)
+    db.commit()
+
+    dry_run = analyze_execution_fill_repairs(db=db, runtime_mode="paper")
+
+    assert dry_run["summary"]["missing_filled_order_count"] == 1
+    item = dry_run["missing_filled_orders"][0]
+    assert item["candidate_reason"] == "terminal_fill_quantity_mismatch"
+    assert item["quantity_basis"] == "base_quantity"
+    assert item["expected_quantity"] == "1.5"
+    assert item["persisted_quantity"] == "0.5"
+    assert item["persisted_fill_count"] == 1
+    assert item["proposed_fills"] == []
+    assert item["repair_action"] == "record_manual_review"
+
+    applied = apply_execution_fill_repairs(
+        db=db,
+        runtime_mode="paper",
+        actor="test-operator",
+        reason="partial evidence cannot be completed automatically",
+        now=FILLED_AT + timedelta(minutes=10),
+    )
+
+    assert applied["summary"]["inserted_fill_count"] == 0
+    assert applied["summary"]["manual_review_missing_fill_count"] == 1
+    assert db.scalars(
+        select(ExecutionFill).where(ExecutionFill.broker_order_pk == order.id)
+    ).all() == [persisted_fill]
+    review = db.scalar(
+        select(RuntimeRemediationEvent).where(
+            RuntimeRemediationEvent.candidate_type == "missing_execution_fill",
+            RuntimeRemediationEvent.subject_id == order.id,
+        )
+    )
+    assert review is not None
+    assert review.outcome == "manual_review_required"
+    assert review.evidence_summary["blocker"] == "terminal_fill_quantity_mismatch"
+    engine.dispose()
+
+
+def test_missing_fill_repair_rejects_event_time_as_fill_chronology() -> None:
+    settings = _settings()
+    engine, db = _session(settings)
+    order = BrokerOrder(
+        broker_name="kis",
+        venue="KRX",
+        asset_class="stock",
+        mode="paper",
+        idempotency_key="repair-missing-without-broker-time",
+        broker_order_id="missing-without-broker-time",
+        symbol="105560",
+        side="buy",
+        status="filled",
+        quantity=1,
+        submitted_at=FILLED_AT,
+    )
+    db.add(order)
+    db.flush()
+    db.add(
+        BrokerOrderEvent(
+            broker_order_pk=order.id,
+            event_type="reconciliation",
+            event_source="reconciliation",
+            normalized_status="filled",
+            payload={
+                "odno": order.broker_order_id,
+                "pdno": order.symbol,
+                "tot_ccld_qty": "1",
+                "avg_pric": "71000",
+            },
+            observed_at=FILLED_AT + timedelta(minutes=10),
+        )
+    )
+    db.commit()
+
+    dry_run = analyze_execution_fill_repairs(db=db, runtime_mode="paper")
+    item = dry_run["missing_filled_orders"][0]
+
+    assert item["proposed_fills"] == []
+    assert item["available_repair_evidence"] is None
+    assert item["repair_action"] == "record_manual_review"
+
+    applied = apply_execution_fill_repairs(
+        db=db,
+        runtime_mode="paper",
+        actor="test-operator",
+        reason="do not invent broker chronology",
+        now=FILLED_AT + timedelta(minutes=20),
+    )
+
+    assert applied["summary"]["inserted_fill_count"] == 0
+    assert db.scalar(
+        select(ExecutionFill).where(ExecutionFill.broker_order_pk == order.id)
+    ) is None
+    engine.dispose()
+
+
+def test_missing_fill_repair_rejects_kis_order_time_as_fill_chronology() -> None:
+    settings = _settings()
+    engine, db = _session(settings)
+    order = _filled_order_missing_fill()
+    assert isinstance(order.raw_broker_payload, dict)
+    raw_order = order.raw_broker_payload["order"]
+    assert isinstance(raw_order, dict)
+    raw_order.pop("filled_at")
+    db.add(order)
+    db.commit()
+
+    dry_run = analyze_execution_fill_repairs(db=db, runtime_mode="paper")
+    item = dry_run["missing_filled_orders"][0]
+
+    assert item["proposed_fills"] == []
+    assert item["available_repair_evidence"] is None
+    assert item["repair_action"] == "record_manual_review"
     engine.dispose()
 
 
@@ -192,6 +432,8 @@ def test_missing_explicit_fractional_fill_preserves_fee_and_currency_evidence() 
     assert fill.transaction_cost == Decimal("10.00000000")
     assert fill.transaction_cost_coverage == "complete"
     assert fill.transaction_cost_source == "broker_payload:explicit_fee_bundle"
+    assert fill.payload["fill_time_precision"] == "exact"
+    assert fill.payload["fill_time_source"] == "broker_payload"
     engine.dispose()
 
 
@@ -469,6 +711,48 @@ def test_duplicate_repair_does_not_choose_richer_economics_without_broker_truth(
     engine.dispose()
 
 
+def test_duplicate_reader_preserves_most_conservative_chronology_evidence() -> None:
+    settings = _settings()
+    engine, db = _session(settings)
+    order = _duplicate_fill_order()
+    db.add(order)
+    db.flush()
+    unmarked = ExecutionFill(
+        id="a-unmarked-chronology-fill",
+        broker_order_pk=order.id,
+        broker_fill_id="shared-chronology-fill",
+        symbol="282330",
+        side="buy",
+        quantity=1,
+        price=Decimal("72000"),
+        transaction_cost_coverage="unknown",
+        filled_at=SOLD_AT,
+        payload={},
+    )
+    bounded = ExecutionFill(
+        id="b-bounded-chronology-fill",
+        broker_order_pk=order.id,
+        broker_fill_id="shared-chronology-fill",
+        symbol="282330",
+        side="buy",
+        quantity=1,
+        price=Decimal("72000"),
+        transaction_cost_coverage="unknown",
+        filled_at=SOLD_AT,
+        payload={
+            "fill_time_precision": "observed_upper_bound",
+            "fill_time_source": "reconciliation_observed_at",
+        },
+    )
+    db.add_all([unmarked, bounded])
+    db.commit()
+
+    fills = db.scalars(select(ExecutionFill).order_by(ExecutionFill.id.asc())).all()
+
+    assert dedupe_execution_fills(fills) == [bounded]
+    engine.dispose()
+
+
 def test_duplicate_repair_preserves_conflicting_cost_rows_for_manual_review() -> None:
     settings = _settings()
     engine, db = _session(settings)
@@ -591,7 +875,7 @@ def test_dry_run_command_outputs_missing_and_duplicate_repairs(tmp_path: Path) -
     assert payload["summary"]["proposed_duplicate_fill_isolation_count"] == 1
 
 
-def test_live_fill_repair_requires_database_url_argument(tmp_path: Path) -> None:
+def test_live_fill_repair_requires_explicit_database_url_source(tmp_path: Path) -> None:
     result = subprocess.run(
         [
             sys.executable,
@@ -603,16 +887,16 @@ def test_live_fill_repair_requires_database_url_argument(tmp_path: Path) -> None
         text=True,
         env={
             **os.environ,
-            "KAI_EXEC_DATABASE_URL": f"sqlite:///{tmp_path / 'must-not-open.db'}",
+            "KAI_EXEC_DATABASE_URL": "",
         },
     )
 
     assert result.returncode != 0
-    assert "requires --database-url explicitly" in result.stderr
+    assert "requires KAI_EXEC_DATABASE_URL or --database-url" in result.stderr
     assert not (tmp_path / "must-not-open.db").exists()
 
 
-def test_fill_remediation_uses_environment_runtime_mode_when_cli_mode_omitted(
+def test_fill_remediation_uses_environment_runtime_and_database_when_cli_values_omitted(
     tmp_path: Path,
 ) -> None:
     db_path = tmp_path / "live-fill-remediation.db"
@@ -630,8 +914,6 @@ def test_fill_remediation_uses_environment_runtime_mode_when_cli_mode_omitted(
         [
             sys.executable,
             "scripts/repair_execution_fill_evidence.py",
-            "--database-url",
-            database_url,
         ],
         check=True,
         capture_output=True,
@@ -639,6 +921,7 @@ def test_fill_remediation_uses_environment_runtime_mode_when_cli_mode_omitted(
         env={
             **os.environ,
             "KAI_EXEC_RUNTIME_MODE": "live",
+            "KAI_EXEC_DATABASE_URL": database_url,
         },
     )
     payload = json.loads(result.stdout)
@@ -646,6 +929,55 @@ def test_fill_remediation_uses_environment_runtime_mode_when_cli_mode_omitted(
     assert payload["runtime_mode"] == "live"
     assert payload["summary"]["missing_filled_order_count"] == 1
     assert payload["missing_filled_orders"][0]["broker_order_id"] == "missing-buy-1"
+
+
+def test_fill_remediation_rejects_password_in_database_argv(tmp_path: Path) -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "scripts/repair_execution_fill_evidence.py",
+            "--database-url",
+            "postgresql+psycopg://operator:secret@db.example/exec",
+            "--runtime-mode",
+            "live",
+        ],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "KAI_EXEC_DATABASE_URL": ""},
+    )
+
+    assert result.returncode != 0
+    assert "KAI_EXEC_DATABASE_URL environment variable" in result.stderr
+    assert not (tmp_path / "must-not-open.db").exists()
+
+
+def test_fill_remediation_rejects_query_embedded_database_secret_before_db_open(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "must-not-open.db"
+    secret = "must-not-leak-fill-secret"
+    database_url = (
+        f"sqlite:///{database_path}?auth={secret}"
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            "scripts/repair_execution_fill_evidence.py",
+            "--database-url",
+            database_url,
+            "--runtime-mode",
+            "live",
+        ],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "KAI_EXEC_DATABASE_URL": ""},
+    )
+
+    assert result.returncode != 0
+    assert "KAI_EXEC_DATABASE_URL environment variable" in result.stderr
+    assert secret not in result.stdout
+    assert secret not in result.stderr
+    assert not database_path.exists()
 
 
 @pytest.mark.parametrize(
@@ -754,6 +1086,8 @@ def test_apply_is_idempotent_auditable_and_repairs_fifo_pair() -> None:
     missing_buy = _filled_order_missing_fill()
     sell_order = BrokerOrder(
         broker_name="kis",
+        venue="KRX",
+        asset_class="stock",
         mode="paper",
         idempotency_key="repair-105560-sell",
         broker_order_id="sell-1",
@@ -762,8 +1096,19 @@ def test_apply_is_idempotent_auditable_and_repairs_fifo_pair() -> None:
         status="filled",
         quantity=1,
         submitted_at=SOLD_AT,
+            request_metadata={
+                "exchange": "KRX",
+                "broker_account_scope": {
+                "policy_version": 2,
+                "scope": FIFO_TEST_ACCOUNT_SCOPE,
+            }
+        },
     )
     duplicate_order = _duplicate_fill_order()
+    for order in (missing_buy, sell_order, duplicate_order):
+        order.venue = order.venue or "KRX"
+        order.asset_class = order.asset_class or "stock"
+        _bind_order_to_runtime_scope(order, settings=settings)
     db.add_all([missing_buy, sell_order, duplicate_order])
     db.flush()
     sell_fill = ExecutionFill(
@@ -995,6 +1340,38 @@ def test_conflicting_duplicate_broker_fill_requires_manual_review_without_isolat
     engine.dispose()
 
 
+@pytest.mark.parametrize(
+    ("field_name", "conflicting_value"),
+    [("symbol", "005930"), ("side", "sell")],
+)
+def test_duplicate_fill_identity_detects_normalized_route_fact_conflict(
+    field_name: str,
+    conflicting_value: str,
+) -> None:
+    order = _duplicate_fill_order()
+    first = ExecutionFill(
+        broker_order=order,
+        broker_fill_id="same-normalized-route-fill",
+        symbol=f" {order.symbol.lower()} ",
+        side=f" {order.side.upper()} ",
+        quantity=1,
+        price=Decimal("73000"),
+        filled_at=SOLD_AT,
+    )
+    second = ExecutionFill(
+        broker_order=order,
+        broker_fill_id="same-normalized-route-fill",
+        symbol=order.symbol,
+        side=order.side,
+        quantity=1,
+        price=Decimal("73000"),
+        filled_at=SOLD_AT,
+    )
+    setattr(second, field_name, conflicting_value)
+
+    assert duplicate_fill_conflicting_fields([first, second]) == [field_name]
+
+
 def test_conflicting_duplicate_fill_reader_does_not_silently_canonicalize() -> None:
     settings = _settings()
     engine, db = _session(settings)
@@ -1219,6 +1596,8 @@ def _add_fill(
     price: str,
     filled_at: datetime,
     suffix: str,
+    exchange: str = "KRX",
+    settings: Settings | None = None,
 ) -> ExecutionFill:
     order = BrokerOrder(
         broker_name="kis",
@@ -1230,7 +1609,25 @@ def _add_fill(
         status="filled",
         quantity=quantity,
         submitted_at=filled_at,
+        venue="KRX",
+        asset_class="stock",
+        request_metadata={
+            "provider": "kis",
+            "venue": "KRX",
+            "asset_class": "stock",
+            "exchange": exchange,
+            "broker_account_scope": {
+                "policy_version": 2,
+                "scope": FIFO_TEST_ACCOUNT_SCOPE,
+            },
+        },
     )
+    if settings is not None:
+        _bind_order_to_runtime_scope(
+            order,
+            settings=settings,
+            exchange=exchange,
+        )
     db.add(order)
     db.flush()
     fill = ExecutionFill(
@@ -1262,11 +1659,15 @@ def test_fifo_residual_dry_run_reports_required_broker_flat_evidence() -> None:
     db.add(
         ExecutionPosition(
             mode="paper",
+            provider="kis",
+            account_scope=FIFO_TEST_ACCOUNT_SCOPE,
+            exchange="KRX",
             symbol="049430",
             quantity=0,
             average_price=None,
             updated_from="reconciliation",
             last_reconciled_at=reconciled_at,
+            raw_payload=_fifo_position_payload(),
         )
     )
     db.commit()
@@ -1290,6 +1691,13 @@ def test_fifo_residual_dry_run_reports_required_broker_flat_evidence() -> None:
         "broker_reconciliation_timestamp": reconciled_at.isoformat(),
         "broker_position_id": db.scalar(select(ExecutionPosition.id)),
         "broker_position_quantity": "0.0000",
+            "execution_scope": {
+                "provider": "kis",
+                "account_scope": FIFO_TEST_ACCOUNT_SCOPE,
+                "venue": "KRX",
+                "asset_class": "stock",
+                "exchange": "KRX",
+            },
         "eligible": True,
         "repair_action": "isolate",
         "reason": "broker_flat_evidence_newer_than_last_local_fill",
@@ -1315,10 +1723,14 @@ def test_fifo_residual_command_defaults_to_dry_run(tmp_path: Path) -> None:
     db.add(
         ExecutionPosition(
             mode="paper",
+            provider="kis",
+            account_scope=FIFO_TEST_ACCOUNT_SCOPE,
+            exchange="KRX",
             symbol="049430",
             quantity=0,
             updated_from="reconciliation",
             last_reconciled_at=fill_at + timedelta(hours=1),
+            raw_payload=_fifo_position_payload(),
         )
     )
     db.commit()
@@ -1360,14 +1772,27 @@ def test_fifo_isolation_preserves_repurchase_after_verified_flat_boundary() -> N
         price="100",
         filled_at=old_buy_at,
         suffix="old-buy",
+        settings=settings,
+    )
+    active_identity = build_position_identity(
+        settings=settings,
+        provider="kis",
+        exchange="KRX",
     )
     db.add(
         ExecutionPosition(
             mode="paper",
+            provider=active_identity.provider,
+            account_scope=active_identity.account_scope,
+            exchange=active_identity.exchange,
             symbol="001450",
             quantity=0,
             updated_from="reconciliation",
             last_reconciled_at=flat_at,
+            raw_payload=payload_with_position_identity(
+                None,
+                identity=active_identity,
+            ),
         )
     )
     db.commit()
@@ -1396,6 +1821,7 @@ def test_fifo_isolation_preserves_repurchase_after_verified_flat_boundary() -> N
         price="200",
         filled_at=repurchase_at,
         suffix="repurchase",
+        settings=settings,
     )
     _add_fill(
         db,
@@ -1405,6 +1831,7 @@ def test_fifo_isolation_preserves_repurchase_after_verified_flat_boundary() -> N
         price="250",
         filled_at=sell_at,
         suffix="repurchase-sell",
+        settings=settings,
     )
     db.commit()
 
@@ -1420,6 +1847,120 @@ def test_fifo_isolation_preserves_repurchase_after_verified_flat_boundary() -> N
     assert pnl["matched_sell_quantity"] == 1
     assert pnl["daily_realized_pnl"] == "50.0000"
     assert len(db.scalars(select(ExecutionFill)).all()) == 3
+    engine.dispose()
+
+
+def test_fifo_repair_starts_clean_generation_after_ambiguous_history_and_exact_flat() -> None:
+    settings = _settings()
+    engine, db = _session(settings)
+    ambiguous_at = datetime(2026, 8, 20, 1, 0, tzinfo=UTC)
+    flat_at = ambiguous_at + timedelta(hours=1)
+    _add_fill(
+        db,
+        symbol="001451",
+        side="buy",
+        quantity=1,
+        price="100",
+        filled_at=ambiguous_at,
+        suffix="ambiguous-buy",
+        settings=settings,
+    )
+    _add_fill(
+        db,
+        symbol="001451",
+        side="sell",
+        quantity=1,
+        price="110",
+        filled_at=ambiguous_at,
+        suffix="ambiguous-sell",
+        settings=settings,
+    )
+    active_identity = build_position_identity(
+        settings=settings,
+        provider="kis",
+        exchange="KRX",
+    )
+    db.add(
+        ExecutionPosition(
+            mode="paper",
+            provider=active_identity.provider,
+            account_scope=active_identity.account_scope,
+            exchange=active_identity.exchange,
+            symbol="001451",
+            quantity=0,
+            updated_from="reconciliation",
+            last_reconciled_at=flat_at,
+            raw_payload=payload_with_position_identity(
+                None,
+                identity=active_identity,
+            ),
+        )
+    )
+    db.commit()
+
+    dry_run = analyze_fifo_inventory_repairs(db=db, runtime_mode="paper")
+    applied = apply_fifo_inventory_repairs(
+        db=db,
+        runtime_mode="paper",
+        actor="test-operator",
+        reason="exact broker flat resets ambiguous generation",
+        now=flat_at,
+    )
+    historical = daily_pnl_payload(
+        settings=settings,
+        db=db,
+        now=ambiguous_at + timedelta(minutes=30),
+    )
+
+    assert dry_run["summary"]["eligible_isolation_count"] == 1
+    candidate = dry_run["broker_flat_fifo_residuals"][0]
+    assert candidate["eligible"] is True
+    assert candidate["execution_scope"] == {
+        "provider": "kis",
+        "account_scope": active_identity.account_scope,
+        "venue": "KRX",
+        "asset_class": "stock",
+        "exchange": "KRX",
+    }
+    assert candidate["reason"] == (
+        "broker_flat_evidence_resets_ambiguous_generation"
+    )
+    assert applied["summary"]["applied_isolation_count"] == 1
+    assert historical["daily_realized_pnl"] is None
+    assert historical["calculation_reason"] == "indeterminate_fill_chronology"
+
+    repurchase_at = ambiguous_at + timedelta(days=1)
+    sell_at = repurchase_at + timedelta(hours=1)
+    _add_fill(
+        db,
+        symbol="001451",
+        side="buy",
+        quantity=1,
+        price="200",
+        filled_at=repurchase_at,
+        suffix="clean-generation-buy",
+        settings=settings,
+    )
+    _add_fill(
+        db,
+        symbol="001451",
+        side="sell",
+        quantity=1,
+        price="250",
+        filled_at=sell_at,
+        suffix="clean-generation-sell",
+        settings=settings,
+    )
+    db.commit()
+
+    current = daily_pnl_payload(
+        settings=settings,
+        db=db,
+        now=sell_at + timedelta(minutes=1),
+    )
+
+    assert current["daily_realized_pnl"] == "50.0000"
+    assert current["calculation_status"] == "computed"
     engine.dispose()
 
 
@@ -1450,10 +1991,14 @@ def test_fifo_isolation_recency_gate_blocks_flat_evidence_older_than_repurchase(
     db.add(
         ExecutionPosition(
             mode="paper",
+            provider="kis",
+            account_scope=FIFO_TEST_ACCOUNT_SCOPE,
+            exchange="KRX",
             symbol="055550",
             quantity=0,
             updated_from="reconciliation",
             last_reconciled_at=flat_at,
+            raw_payload=_fifo_position_payload(),
         )
     )
     db.commit()
@@ -1483,4 +2028,204 @@ def test_fifo_isolation_recency_gate_blocks_flat_evidence_older_than_repurchase(
     assert review is not None
     assert review.outcome == "manual_review_required"
     assert review.evidence_summary["fills_deleted"] == 0
+    engine.dispose()
+
+
+def test_fifo_isolation_selects_exact_position_route_for_same_symbol() -> None:
+    settings = _settings()
+    engine, db = _session(settings)
+    fill_at = datetime(2026, 8, 20, 1, 0, tzinfo=UTC)
+    reconciled_at = fill_at + timedelta(hours=1)
+    _add_fill(
+        db,
+        symbol="049430",
+        side="buy",
+        quantity=3,
+        price="1000",
+        filled_at=fill_at,
+        suffix="route-isolated-buy",
+    )
+    db.add_all(
+        [
+            ExecutionPosition(
+                mode="paper",
+                provider="kis",
+                account_scope=FIFO_TEST_ACCOUNT_SCOPE,
+                exchange="KRX",
+                symbol="049430",
+                quantity=0,
+                updated_from="reconciliation",
+                last_reconciled_at=reconciled_at,
+                raw_payload=_fifo_position_payload(),
+            ),
+            ExecutionPosition(
+                mode="paper",
+                provider="kis",
+                account_scope=FIFO_TEST_ACCOUNT_SCOPE,
+                exchange="NYSE",
+                symbol="049430",
+                quantity=10,
+                updated_from="reconciliation",
+                last_reconciled_at=reconciled_at,
+                raw_payload=payload_with_position_identity(
+                    None,
+                    identity=PositionIdentity(
+                        provider="kis",
+                        account_scope=FIFO_TEST_ACCOUNT_SCOPE,
+                        exchange="NYSE",
+                    ),
+                ),
+            ),
+        ]
+    )
+    db.commit()
+
+    payload = analyze_fifo_inventory_repairs(db=db, runtime_mode="paper")
+
+    assert payload["summary"]["eligible_isolation_count"] == 1
+    assert payload["broker_flat_fifo_residuals"][0]["execution_scope"] == {
+        "provider": "kis",
+        "account_scope": FIFO_TEST_ACCOUNT_SCOPE,
+        "venue": "KRX",
+        "asset_class": "stock",
+        "exchange": "KRX",
+    }
+    assert payload["broker_flat_fifo_residuals"][0]["eligible"] is True
+    engine.dispose()
+
+
+def test_fifo_isolation_repair_fails_closed_for_legacy_unscoped_evidence() -> None:
+    settings = _settings()
+    engine, db = _session(settings)
+    fill_at = datetime(2026, 8, 20, 1, 0, tzinfo=UTC)
+    flat_at = fill_at + timedelta(hours=1)
+    order = BrokerOrder(
+        broker_name="kis",
+        mode="paper",
+        idempotency_key="legacy-unscoped-fifo-buy",
+        symbol="009999",
+        side="buy",
+        status="filled",
+        quantity=1,
+        submitted_at=fill_at,
+        venue="KRX",
+        asset_class="stock",
+    )
+    db.add_all(
+        [
+            order,
+            ExecutionPosition(
+                mode="paper",
+                symbol="009999",
+                quantity=0,
+                updated_from="reconciliation",
+                last_reconciled_at=flat_at,
+            ),
+        ]
+    )
+    db.flush()
+    db.add(
+        ExecutionFill(
+            broker_order_pk=order.id,
+            symbol="009999",
+            side="buy",
+            quantity=1,
+            price=Decimal("100"),
+            filled_at=fill_at,
+        )
+    )
+    db.commit()
+
+    dry_run = analyze_fifo_inventory_repairs(db=db, runtime_mode="paper")
+    applied = apply_fifo_inventory_repairs(
+        db=db,
+        runtime_mode="paper",
+        actor="test-operator",
+        reason="scope must be proven",
+        now=flat_at,
+    )
+
+    item = dry_run["broker_flat_fifo_residuals"][0]
+    assert item["eligible"] is False
+    assert item["execution_scope"] is None
+    assert item["reason"] == "execution_scope_unavailable"
+    assert applied["summary"]["applied_isolation_count"] == 0
+    assert applied["summary"]["applied_blocker_count"] == 1
+    assert db.scalars(select(FifoInventoryIsolation)).all() == []
+    engine.dispose()
+
+
+def test_fifo_repair_reports_duplicate_legacy_position_scope_as_ambiguous() -> None:
+    settings = _settings()
+    engine, db = _session(settings)
+    fill_at = datetime(2026, 8, 20, 1, 0, tzinfo=UTC)
+    flat_at = fill_at + timedelta(hours=1)
+    order = BrokerOrder(
+        broker_name="kis",
+        mode="paper",
+        idempotency_key="duplicate-legacy-position-fifo-buy",
+        symbol="009998",
+        side="buy",
+        status="filled",
+        quantity=1,
+        submitted_at=fill_at,
+        venue="KRX",
+        asset_class="stock",
+    )
+    # Simulate a pre-constraint/corrupt legacy database so the repair audit can
+    # prove it never selects one duplicate by query order.
+    db.execute(text("DROP INDEX uq_execution_positions_legacy_symbol_mode"))
+    db.add_all(
+        [
+            order,
+            ExecutionPosition(
+                id="legacy-position-a",
+                mode="paper",
+                symbol="009998",
+                quantity=0,
+                updated_from="reconciliation",
+                last_reconciled_at=flat_at,
+            ),
+            ExecutionPosition(
+                id="legacy-position-b",
+                mode="paper",
+                symbol="009998",
+                quantity=0,
+                updated_from="reconciliation",
+                last_reconciled_at=flat_at + timedelta(seconds=1),
+            ),
+        ]
+    )
+    db.flush()
+    db.add(
+        ExecutionFill(
+            broker_order_pk=order.id,
+            symbol="009998",
+            side="buy",
+            quantity=1,
+            price=Decimal("100"),
+            filled_at=fill_at,
+        )
+    )
+    db.commit()
+
+    dry_run = analyze_fifo_inventory_repairs(db=db, runtime_mode="paper")
+    applied = apply_fifo_inventory_repairs(
+        db=db,
+        runtime_mode="paper",
+        actor="test-operator",
+        reason="duplicate legacy route needs review",
+        now=flat_at + timedelta(hours=1),
+    )
+
+    item = dry_run["broker_flat_fifo_residuals"][0]
+    assert item["eligible"] is False
+    assert item["reason"] == "legacy_position_route_ambiguous"
+    assert item["broker_position_ids"] == [
+        "legacy-position-a",
+        "legacy-position-b",
+    ]
+    assert applied["summary"]["applied_isolation_count"] == 0
+    assert applied["summary"]["applied_blocker_count"] == 1
+    assert db.scalars(select(FifoInventoryIsolation)).all() == []
     engine.dispose()

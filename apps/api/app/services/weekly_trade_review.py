@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from sqlalchemy import and_, func, or_, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload, undefer
 
 from app.core.config import Settings, load_settings
 from app.db.session import create_db_engine, create_session_factory
@@ -32,7 +32,16 @@ from app.services.broker_order_state import (
     NONTERMINAL_ORDER_STATUSES,
     active_local_broker_order_filters,
 )
-from app.services.fifo_inventory import load_fifo_isolation_cursor
+from app.services.database_cli_security import reject_secret_database_url_argument
+from app.services.execution_account_route import redact_account_references
+from app.services.fifo_inventory import (
+    FifoRouteScope,
+    ambiguous_fifo_chronology_buckets,
+    fifo_chronology_is_ambiguous_at,
+    fifo_fill_sort_key,
+    fifo_route_scope_from_order,
+    load_fifo_isolation_cursor,
+)
 from app.services.fill_idempotency import dedupe_execution_fills
 from app.services.fill_economics import closed_trade_economics
 from app.services.max_holding_actionability import max_holding_actionability_summary
@@ -209,6 +218,7 @@ def generate_weekly_trade_review(
         mode=settings.runtime_mode,
     )
     max_holding_actionability = max_holding_actionability_summary(
+        settings=settings,
         db=db,
         mode=settings.runtime_mode,
         reference_at=end_at,
@@ -755,31 +765,102 @@ def _weekly_closed_trades(
             BrokerOrder.mode == mode,
             ExecutionFill.filled_at < end_at,
         )
+        .options(
+            undefer(ExecutionFill.payload),
+            selectinload(ExecutionFill.broker_order).load_only(
+                BrokerOrder.id,
+                BrokerOrder.broker_name,
+                BrokerOrder.request_metadata,
+                BrokerOrder.venue,
+                BrokerOrder.asset_class,
+            )
+        )
         .order_by(ExecutionFill.filled_at.desc(), ExecutionFill.id.desc())
         .limit(max_rows + 1)
     ).all()
     truncated = len(newest_fills) > max_rows
     fills = dedupe_execution_fills(list(reversed(newest_fills[:max_rows])))
-    sell_symbols = {
-        fill.symbol
+    ambiguous_buckets = ambiguous_fifo_chronology_buckets(fills)
+    sell_route_symbols = {
+        (route_scope, fill.symbol)
         for fill in fills
+        if (route_scope := fifo_route_scope_from_order(fill.broker_order)) is not None
         if str(fill.side or "").lower() == "sell" and start_at <= _normalize_utc(fill.filled_at) < end_at
     }
-    positions_by_symbol = _positions_by_symbol(db=db, mode=mode, symbols=sell_symbols)
+    positions_by_route_symbol = _positions_by_route_symbol(
+        db=db,
+        mode=mode,
+        route_symbols=sell_route_symbols,
+    )
     isolation_cursor = load_fifo_isolation_cursor(db=db, runtime_mode=mode, through=end_at)
 
-    lots_by_symbol: dict[str, list[dict[str, object]]] = {}
+    lots_by_route_symbol: dict[
+        tuple[FifoRouteScope, str],
+        list[dict[str, object]],
+    ] = {}
     closed: list[dict[str, object]] = []
-    for fill in fills:
+    for fill in sorted(fills, key=fifo_fill_sort_key):
         side = str(fill.side or "").lower()
         quantity = _fill_quantity(fill)
         fill_time = _normalize_utc(fill.filled_at)
-        lots = lots_by_symbol.setdefault(fill.symbol, [])
-        isolation_cursor.apply_before(
+        in_period = start_at <= fill_time < end_at
+        route_scope = fifo_route_scope_from_order(fill.broker_order)
+        if route_scope is None:
+            if side == "sell" and in_period:
+                closed.append(
+                    _closed_trade_row(
+                        fill=fill,
+                        buy_fill=None,
+                        quantity=quantity,
+                        buy_price=None,
+                        cost_basis_source="execution_scope_unavailable",
+                        cost_basis_observed_at=None,
+                        route_scope=None,
+                    )
+                )
+            continue
+        route_symbol = (route_scope, fill.symbol)
+        lots = lots_by_route_symbol.setdefault(route_symbol, [])
+        scope_quality_available = isolation_cursor.apply_before(
+            route_scope=route_scope,
             symbol=fill.symbol,
             observed_at=fill_time,
             lots=lots,
         )
+        if fifo_chronology_is_ambiguous_at(
+            ambiguous_buckets=ambiguous_buckets,
+            isolation_cursor=isolation_cursor,
+            route_scope=route_scope,
+            symbol=fill.symbol,
+            observed_at=fill_time,
+        ):
+            if side == "sell" and in_period:
+                closed.append(
+                    _closed_trade_row(
+                        fill=fill,
+                        buy_fill=None,
+                        quantity=quantity,
+                        buy_price=None,
+                        cost_basis_source="fill_chronology_ambiguous",
+                        cost_basis_observed_at=None,
+                        route_scope=route_scope,
+                    )
+                )
+            continue
+        if not scope_quality_available:
+            if side == "sell" and in_period:
+                closed.append(
+                    _closed_trade_row(
+                        fill=fill,
+                        buy_fill=None,
+                        quantity=quantity,
+                        buy_price=None,
+                        cost_basis_source="execution_scope_unavailable",
+                        cost_basis_observed_at=None,
+                        route_scope=route_scope,
+                    )
+                )
+            continue
         if side == "buy":
             lots.append(
                 {
@@ -794,8 +875,12 @@ def _weekly_closed_trades(
         if side != "sell":
             continue
         filled_at = fill_time
-        in_period = start_at <= filled_at < end_at
-        next_buy_after_sell = _next_buy_after(fills=fills, symbol=fill.symbol, after=filled_at)
+        next_buy_after_sell = _next_buy_after(
+            fills=fills,
+            route_scope=route_scope,
+            symbol=fill.symbol,
+            after=filled_at,
+        )
         remaining = quantity
         while remaining > 0 and lots:
             lot = lots[0]
@@ -804,7 +889,7 @@ def _weekly_closed_trades(
             if in_period:
                 buy_price = Decimal(str(lot["price"]))
                 cost_basis_source = "fill_fifo"
-                position = positions_by_symbol.get(fill.symbol)
+                position = positions_by_route_symbol.get(route_symbol)
                 broker_cost_basis = _broker_reconciliation_cost_basis(
                     position=position,
                     sold_at=filled_at,
@@ -830,6 +915,7 @@ def _weekly_closed_trades(
                         buy_price=buy_price,
                         cost_basis_source=cost_basis_source,
                         cost_basis_observed_at=cost_basis_observed_at,
+                        route_scope=route_scope,
                     )
                 )
             lot["quantity"] = lot_quantity - matched
@@ -837,7 +923,7 @@ def _weekly_closed_trades(
             if Decimal(str(lot["quantity"])) <= 0:
                 lots.pop(0)
         if remaining > 0 and in_period:
-            position = positions_by_symbol.get(fill.symbol)
+            position = positions_by_route_symbol.get(route_symbol)
             broker_cost_basis = _broker_reconciliation_cost_basis(
                 position=position,
                 sold_at=filled_at,
@@ -852,6 +938,7 @@ def _weekly_closed_trades(
                         buy_price=broker_cost_basis,
                         cost_basis_source="broker_reconciliation",
                         cost_basis_observed_at=position.last_reconciled_at if position is not None else None,
+                        route_scope=route_scope,
                     )
                 )
             else:
@@ -863,6 +950,7 @@ def _weekly_closed_trades(
                         buy_price=None,
                         cost_basis_source="unknown",
                         cost_basis_observed_at=None,
+                        route_scope=route_scope,
                     )
                 )
     return closed, truncated
@@ -897,11 +985,20 @@ def _weekly_pnl_coverage(
     rows_by_fill_id: dict[str, list[dict[str, object]]] = {}
     for row in closed_trades:
         rows_by_fill_id.setdefault(str(row["sell_fill_id"]), []).append(row)
-    uncovered_rows = [row for row in closed_trades if row.get("cost_basis_source") == "unknown"]
+    uncovered_rows = [
+        row
+        for row in closed_trades
+        if row.get("cost_basis_source")
+        not in {"fill_fifo", "broker_reconciliation"}
+    ]
     uncovered_fill_ids = {
         fill_id
         for fill_id, rows in rows_by_fill_id.items()
-        if any(row.get("cost_basis_source") == "unknown" for row in rows)
+        if any(
+            row.get("cost_basis_source")
+            not in {"fill_fifo", "broker_reconciliation"}
+            for row in rows
+        )
     }
     covered_fill_ids = set(rows_by_fill_id) - uncovered_fill_ids
     uncovered_proceeds = sum(
@@ -1160,6 +1257,7 @@ def _weekly_realized_pnl_summary(
 def _next_buy_after(
     *,
     fills: Sequence[ExecutionFill],
+    route_scope: FifoRouteScope,
     symbol: str,
     after: datetime,
 ) -> datetime | None:
@@ -1167,6 +1265,7 @@ def _next_buy_after(
         _normalize_utc(fill.filled_at)
         for fill in fills
         if fill.symbol == symbol
+        and fifo_route_scope_from_order(fill.broker_order) == route_scope
         and str(fill.side or "").lower() == "buy"
         and _normalize_utc(fill.filled_at) > after
     ]
@@ -1181,6 +1280,7 @@ def _closed_trade_row(
     buy_price: Decimal | None,
     cost_basis_source: str,
     cost_basis_observed_at: object,
+    route_scope: FifoRouteScope | None,
 ) -> dict[str, object]:
     sell_price = Decimal(fill.price)
     pnl = ((sell_price - buy_price) * quantity).quantize(Decimal("0.0001")) if buy_price is not None else None
@@ -1196,6 +1296,9 @@ def _closed_trade_row(
     )
     return {
         "symbol": fill.symbol,
+        "execution_scope": (
+            route_scope.as_payload() if route_scope is not None else None
+        ),
         "sell_fill_id": fill.id,
         "sell_broker_order_pk": fill.broker_order_pk,
         "sell_filled_at": _normalize_utc(fill.filled_at),
@@ -1238,22 +1341,87 @@ def _stale_fifo_inventory_alerts(
             BrokerOrder.mode == mode,
             ExecutionFill.filled_at < end_at,
         )
+        .options(
+            undefer(ExecutionFill.payload),
+            selectinload(ExecutionFill.broker_order).load_only(
+                BrokerOrder.id,
+                BrokerOrder.broker_name,
+                BrokerOrder.request_metadata,
+                BrokerOrder.venue,
+                BrokerOrder.asset_class,
+            )
+        )
         .order_by(ExecutionFill.filled_at.desc(), ExecutionFill.id.desc())
         .limit(max_rows + 1)
     ).all()
     truncated = len(newest_fills) > max_rows
     fills = dedupe_execution_fills(list(reversed(newest_fills[:max_rows])))
+    ambiguous_buckets = ambiguous_fifo_chronology_buckets(fills)
     isolation_cursor = load_fifo_isolation_cursor(db=db, runtime_mode=mode, through=end_at)
-    lots_by_symbol: dict[str, list[Decimal]] = {}
-    first_fill_at: dict[str, datetime] = {}
-    last_fill_at: dict[str, datetime] = {}
-    for fill in fills:
+    lots_by_route_symbol: dict[tuple[FifoRouteScope, str], list[Decimal]] = {}
+    first_fill_at: dict[tuple[FifoRouteScope, str], datetime] = {}
+    last_fill_at: dict[tuple[FifoRouteScope, str], datetime] = {}
+    unavailable_scope_fill_count: dict[str, int] = {}
+    ambiguous_chronology_fill_count: dict[tuple[FifoRouteScope, str], int] = {}
+    generation_by_route_symbol: dict[
+        tuple[FifoRouteScope, str], datetime | None
+    ] = {}
+    for fill in sorted(fills, key=fifo_fill_sort_key):
         observed_at = _normalize_utc(fill.filled_at)
-        first_fill_at[fill.symbol] = min(first_fill_at.get(fill.symbol, observed_at), observed_at)
-        last_fill_at[fill.symbol] = max(last_fill_at.get(fill.symbol, observed_at), observed_at)
         quantity = _fill_quantity(fill)
-        lots = lots_by_symbol.setdefault(fill.symbol, [])
-        isolation_cursor.apply_before(symbol=fill.symbol, observed_at=observed_at, lots=lots)
+        route_scope = fifo_route_scope_from_order(fill.broker_order)
+        if route_scope is None:
+            unavailable_scope_fill_count[fill.symbol] = (
+                unavailable_scope_fill_count.get(fill.symbol, 0) + 1
+            )
+            continue
+        route_symbol = (route_scope, fill.symbol)
+        lots = lots_by_route_symbol.setdefault(route_symbol, [])
+        generation_boundary = isolation_cursor.latest_boundary_before(
+            route_scope=route_scope,
+            symbol=fill.symbol,
+            observed_at=observed_at,
+        )
+        if (
+            route_symbol in generation_by_route_symbol
+            and generation_by_route_symbol[route_symbol] != generation_boundary
+        ):
+            lots.clear()
+            ambiguous_chronology_fill_count.pop(route_symbol, None)
+            first_fill_at.pop(route_symbol, None)
+            last_fill_at.pop(route_symbol, None)
+        generation_by_route_symbol[route_symbol] = generation_boundary
+        scope_quality_available = isolation_cursor.apply_before(
+            route_scope=route_scope,
+            symbol=fill.symbol,
+            observed_at=observed_at,
+            lots=lots,
+        )
+        if fifo_chronology_is_ambiguous_at(
+            ambiguous_buckets=ambiguous_buckets,
+            isolation_cursor=isolation_cursor,
+            route_scope=route_scope,
+            symbol=fill.symbol,
+            observed_at=observed_at,
+        ):
+            ambiguous_chronology_fill_count[route_symbol] = (
+                ambiguous_chronology_fill_count.get(route_symbol, 0) + 1
+            )
+            lots.clear()
+            continue
+        first_fill_at[route_symbol] = min(
+            first_fill_at.get(route_symbol, observed_at),
+            observed_at,
+        )
+        last_fill_at[route_symbol] = max(
+            last_fill_at.get(route_symbol, observed_at),
+            observed_at,
+        )
+        if not scope_quality_available:
+            unavailable_scope_fill_count[fill.symbol] = (
+                unavailable_scope_fill_count.get(fill.symbol, 0) + 1
+            )
+            continue
         if str(fill.side or "").lower() == "buy":
             lots.append(quantity)
         elif str(fill.side or "").lower() == "sell":
@@ -1264,15 +1432,69 @@ def _stale_fifo_inventory_alerts(
                 remaining -= matched
                 if lots[0] <= 0:
                     lots.pop(0)
-    quantities: dict[str, Decimal] = {}
-    for symbol, lots in lots_by_symbol.items():
-        isolation_cursor.apply_through(symbol=symbol, observed_at=end_at, lots=lots)
-        quantities[symbol] = sum(lots, Decimal("0"))
-    candidate_symbols = {symbol for symbol, quantity in quantities.items() if quantity > 0}
-    positions_by_symbol = _positions_by_symbol(db=db, mode=mode, symbols=candidate_symbols)
-    alerts: list[dict[str, object]] = []
-    for symbol in sorted(candidate_symbols):
-        position = positions_by_symbol.get(symbol)
+    quantities: dict[tuple[FifoRouteScope, str], Decimal] = {}
+    for (route_scope, symbol), lots in lots_by_route_symbol.items():
+        route_symbol = (route_scope, symbol)
+        final_boundary = isolation_cursor.latest_boundary_through(
+            route_scope=route_scope,
+            symbol=symbol,
+            observed_at=end_at,
+        )
+        if (
+            final_boundary is not None
+            and final_boundary != generation_by_route_symbol.get(route_symbol)
+        ):
+            ambiguous_chronology_fill_count.pop(route_symbol, None)
+            first_fill_at.pop(route_symbol, None)
+            last_fill_at.pop(route_symbol, None)
+        isolation_cursor.apply_through(
+            route_scope=route_scope,
+            symbol=symbol,
+            observed_at=end_at,
+            lots=lots,
+        )
+        quantities[route_symbol] = sum(lots, Decimal("0"))
+    candidate_route_symbols = {
+        route_symbol
+        for route_symbol, quantity in quantities.items()
+        if quantity > 0
+    }
+    positions_by_route_symbol = _positions_by_route_symbol(
+        db=db,
+        mode=mode,
+        route_symbols=candidate_route_symbols,
+    )
+    alerts: list[dict[str, object]] = [
+        {
+            "kind": "fifo_execution_scope_unavailable",
+            "symbol": symbol,
+            "execution_scope": None,
+            "unscoped_fill_count": fill_count,
+            "repair_action": "bind fills to an exact broker execution scope",
+            "message": "FIFO inventory was excluded because execution scope is unavailable",
+        }
+        for symbol, fill_count in sorted(unavailable_scope_fill_count.items())
+    ]
+    alerts.extend(
+        {
+            "kind": "fifo_fill_chronology_ambiguous",
+            "symbol": symbol,
+            "execution_scope": route_scope.as_payload(),
+            "ambiguous_fill_count": fill_count,
+            "repair_action": "obtain broker fill sequence evidence before FIFO replay",
+            "message": "materially order-sensitive fills share one broker timestamp and were excluded from FIFO",
+        }
+        for (route_scope, symbol), fill_count in sorted(
+            ambiguous_chronology_fill_count.items(),
+            key=lambda item: (*item[0][0].as_payload().values(), item[0][1]),
+        )
+    )
+    for route_scope, symbol in sorted(
+        candidate_route_symbols,
+        key=lambda item: (*item[0].as_payload().values(), item[1]),
+    ):
+        route_symbol = (route_scope, symbol)
+        position = positions_by_route_symbol.get(route_symbol)
         if position is None or position.last_reconciled_at is None:
             continue
         broker_quantity = _position_quantity(position)
@@ -1282,11 +1504,12 @@ def _stale_fifo_inventory_alerts(
             {
                 "kind": "stale_fill_fifo_inventory_flat_broker_position",
                 "symbol": symbol,
-                "fifo_open_quantity": _quantity_value(quantities[symbol]),
+                "execution_scope": route_scope.as_payload(),
+                "fifo_open_quantity": _quantity_value(quantities[route_symbol]),
                 "broker_position_quantity": _quantity_value(broker_quantity),
                 "position_last_reconciled_at": position.last_reconciled_at,
-                "fifo_scan_first_fill_at": first_fill_at.get(symbol),
-                "fifo_scan_last_fill_at": last_fill_at.get(symbol),
+                "fifo_scan_first_fill_at": first_fill_at.get(route_symbol),
+                "fifo_scan_last_fill_at": last_fill_at.get(route_symbol),
                 "repair_action": "reconcile broker execution history before retiring local FIFO lots",
                 "message": "fill FIFO leaves open quantity but latest broker reconciliation reports flat",
             }
@@ -1294,22 +1517,65 @@ def _stale_fifo_inventory_alerts(
     return alerts, truncated
 
 
-def _positions_by_symbol(
+def _positions_by_route_symbol(
     *,
     db: Session,
     mode: str,
-    symbols: set[str],
-) -> dict[str, ExecutionPosition]:
-    if not symbols:
+    route_symbols: set[tuple[FifoRouteScope, str]],
+) -> dict[tuple[FifoRouteScope, str], ExecutionPosition]:
+    if not route_symbols:
         return {}
+    route_predicates = [
+        and_(
+            ExecutionPosition.provider == route_scope.provider,
+            ExecutionPosition.account_scope == route_scope.account_scope,
+            ExecutionPosition.exchange == route_scope.exchange,
+            ExecutionPosition.symbol == symbol,
+        )
+        for route_scope, symbol in sorted(
+            route_symbols,
+            key=lambda item: (*item[0].as_payload().values(), item[1]),
+        )
+    ]
+    positions = db.scalars(
+        select(ExecutionPosition).where(
+            ExecutionPosition.mode == mode,
+            or_(*route_predicates),
+        )
+    ).all()
+    positions_by_route: dict[
+        tuple[str, str, str, str],
+        list[ExecutionPosition],
+    ] = {}
+    for position in positions:
+        if (
+            position.provider is None
+            or position.account_scope is None
+            or position.exchange is None
+        ):
+            continue
+        key = (
+            position.provider.strip().lower(),
+            position.account_scope,
+            position.exchange.strip().upper(),
+            position.symbol,
+        )
+        positions_by_route.setdefault(key, []).append(position)
     return {
-        position.symbol: position
-        for position in db.scalars(
-            select(ExecutionPosition).where(
-                ExecutionPosition.mode == mode,
-                ExecutionPosition.symbol.in_(sorted(symbols)),
+        (route_scope, symbol): matches[0]
+        for route_scope, symbol in route_symbols
+        if len(
+            matches := positions_by_route.get(
+                (
+                    route_scope.provider,
+                    route_scope.account_scope,
+                    route_scope.exchange,
+                    symbol,
+                ),
+                [],
             )
-        ).all()
+        )
+        == 1
     }
 
 
@@ -1424,7 +1690,10 @@ def _json_safe(value: object) -> Any:
     if isinstance(value, date):
         return value.isoformat()
     if isinstance(value, dict):
-        return {str(key): _json_safe(item) for key, item in value.items()}
+        redacted = redact_account_references(value)
+        if not isinstance(redacted, dict):
+            return {}
+        return {str(key): _json_safe(item) for key, item in redacted.items()}
     if isinstance(value, list):
         return [_json_safe(item) for item in value]
     return value
@@ -1464,7 +1733,14 @@ def main() -> None:
             "to this runtime mode. Use this for live cron exports."
         ),
     )
-    parser.add_argument("--database-url", default=None)
+    parser.add_argument(
+        "--database-url",
+        default=None,
+        help=(
+            "Explicit non-secret SQLAlchemy URL. Supply credential-bearing URLs "
+            "through KAI_EXEC_DATABASE_URL so they are not exposed in argv."
+        ),
+    )
     parser.add_argument("--include-json-payloads", action="store_true")
     parser.add_argument("--max-range-days", type=int, default=14)
     parser.add_argument(
@@ -1479,6 +1755,8 @@ def main() -> None:
         help="Write JSON progress events to stderr as each bounded query step completes.",
     )
     args = parser.parse_args()
+
+    reject_secret_database_url_argument(args.database_url)
 
     settings_kwargs: dict[str, object] = {}
     if args.database_url:
@@ -1500,7 +1778,7 @@ def main() -> None:
         parser.error(
             "live weekly export requires an explicit database URL via "
             "--database-url or KAI_EXEC_DATABASE_URL when --require-runtime-mode "
-            "is 'live'; source the service .env or pass --database-url"
+            "is 'live'; source the service .env or pass a non-secret --database-url"
         )
 
     engine = create_db_engine(settings)

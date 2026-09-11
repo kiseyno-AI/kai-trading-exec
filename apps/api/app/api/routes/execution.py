@@ -11,6 +11,8 @@ from app.api.dependencies import (
     get_settings,
 )
 from app.api.schemas.execution import (
+    CoreExecutionPlanRequestV4,
+    CoreExecutionRevocationRequestV4,
     ExecutionFailureStatusUpdateRequest,
     ExecutionPlanRequest,
     MonitoringEvaluationRequest,
@@ -22,6 +24,7 @@ from app.broker.base import BrokerAdapter
 from app.core.config import Settings
 from app.services.broker_orders import place_broker_order
 from app.services.execution_api import (
+    ExecutionPositionScopeError,
     create_execution_plan,
     get_runtime_symbol_detail,
     list_broker_orders,
@@ -30,6 +33,11 @@ from app.services.execution_api import (
     list_execution_positions,
     list_runtime_symbols,
     preview_execution_plan,
+)
+from app.services.core_handoff_v4 import (
+    create_core_execution_plan_v4,
+    list_core_execution_plans_v4,
+    revoke_core_execution_plan_v4,
 )
 from app.services.execution_failures import (
     ExecutionFailureStatusUpdateCommand,
@@ -42,6 +50,35 @@ from app.services.reconciliation import reconcile_stale_nonterminal_broker_order
 from app.services.short_term_watcher import evaluate_short_term_watcher_decision
 
 router = APIRouter(tags=["execution"])
+
+
+def _legacy_core_handoff_rejection(
+    payload: ExecutionPlanRequest,
+) -> JSONResponse | None:
+    extras = payload.model_extra or {}
+    metadata = extras.get("metadata")
+    metadata = metadata if isinstance(metadata, dict) else {}
+    core_marker = (
+        payload.source == "kai-trading-core"
+        or str(metadata.get("schema_version") or "").startswith(
+            "signal_decider_exec_plan"
+        )
+        or str(metadata.get("contract_version") or "").startswith(
+            "execution_handoff_contract"
+        )
+        or str(metadata.get("required_capability") or "").startswith(
+            "delegated_final_full_cost_gate_recheck"
+        )
+    )
+    if not core_marker:
+        return None
+    return JSONResponse(
+        status_code=426,
+        content={
+            "detail": "Core delegated plans require the v4 execution handoff endpoint",
+            "required_endpoint": "/v4/execution-plans",
+        },
+    )
 
 
 @router.get("/execution-plans")
@@ -66,6 +103,9 @@ def create_execution_plan_handler(
     payload: ExecutionPlanRequest = Body(...),
 ) -> JSONResponse:
     settings: Settings = get_settings(request)
+    legacy_rejection = _legacy_core_handoff_rejection(payload)
+    if legacy_rejection is not None:
+        return legacy_rejection
     result = create_execution_plan(
         settings=settings,
         db=db,
@@ -79,6 +119,64 @@ def create_execution_plan_handler(
     return JSONResponse(status_code=result.status_code, content=result.payload)
 
 
+@router.get("/v4/execution-plans")
+def core_execution_plans_v4(
+    request: Request,
+    db: Annotated[Session, Depends(get_db_session)],
+    external_plan_id: str | None = None,
+) -> list[dict[str, object]]:
+    settings: Settings = get_settings(request)
+    return list_core_execution_plans_v4(
+        settings=settings,
+        db=db,
+        external_plan_id=external_plan_id,
+    )
+
+
+@router.post("/v4/execution-plans")
+def create_core_execution_plan_v4_handler(
+    request: Request,
+    db: Annotated[Session, Depends(get_db_session)],
+    adapter: Annotated[BrokerAdapter, Depends(get_broker_adapter)],
+    payload: CoreExecutionPlanRequestV4 = Body(...),
+) -> JSONResponse:
+    settings: Settings = get_settings(request)
+    result = create_core_execution_plan_v4(
+        settings=settings,
+        db=db,
+        adapter=adapter,
+        command=payload,
+    )
+    if result.status_code == 201 and result.payload.get("item_acks"):
+        runtime = getattr(request.app.state, "autonomous_runtime", None)
+        if runtime is not None:
+            runtime.invalidate_monitoring_runtime_snapshot(
+                reason="core_execution_plan_v4_created"
+            )
+    return JSONResponse(status_code=result.status_code, content=result.payload)
+
+
+@router.post("/v4/execution-plans/revocations")
+def revoke_core_execution_plan_v4_handler(
+    request: Request,
+    db: Annotated[Session, Depends(get_db_session)],
+    payload: CoreExecutionRevocationRequestV4 = Body(...),
+) -> JSONResponse:
+    settings: Settings = get_settings(request)
+    result = revoke_core_execution_plan_v4(
+        settings=settings,
+        db=db,
+        command=payload,
+    )
+    if result.status_code == 200:
+        runtime = getattr(request.app.state, "autonomous_runtime", None)
+        if runtime is not None:
+            runtime.invalidate_monitoring_runtime_snapshot(
+                reason="core_execution_plan_v4_revoked"
+            )
+    return JSONResponse(status_code=result.status_code, content=result.payload)
+
+
 @router.post("/execution-plans/preview")
 def preview_execution_plan_handler(
     request: Request,
@@ -87,6 +185,9 @@ def preview_execution_plan_handler(
     payload: ExecutionPlanRequest = Body(...),
 ) -> JSONResponse:
     settings: Settings = get_settings(request)
+    legacy_rejection = _legacy_core_handoff_rejection(payload)
+    if legacy_rejection is not None:
+        return legacy_rejection
     result = preview_execution_plan(
         settings=settings,
         db=db,
@@ -275,15 +376,22 @@ def positions(
     request: Request,
     db: Annotated[Session, Depends(get_db_session)],
     symbols: str | None = None,
+    external_plan_id: str | None = None,
+    execution_plan_id: str | None = None,
 ) -> list[dict[str, object]]:
     settings: Settings = get_settings(request)
     symbol_filter = _parse_symbols_filter(symbols)
-    return list_execution_positions(
-        settings=settings,
-        db=db,
-        symbols=symbol_filter,
-        include_related_plan_items=symbol_filter is None,
-    )
+    try:
+        return list_execution_positions(
+            settings=settings,
+            db=db,
+            symbols=symbol_filter,
+            include_related_plan_items=symbol_filter is None,
+            external_plan_id=external_plan_id,
+            execution_plan_id=execution_plan_id,
+        )
+    except ExecutionPositionScopeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @router.get("/symbols")

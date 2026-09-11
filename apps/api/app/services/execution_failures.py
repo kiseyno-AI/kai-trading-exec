@@ -65,6 +65,13 @@ _DECISION_ACTOR_KEYS = (
     "agent",
     "decider",
 )
+_ACTIONABLE_CODE_CLASSIFICATIONS = {
+    "INSUFFICIENT_CASH": "insufficient_funds",
+    "INSUFFICIENT_FUNDS": "insufficient_funds",
+    "INSUFFICIENT_BUYING_POWER": "insufficient_buying_power",
+    "INSUFFICIENT_SELLABLE_QTY": "insufficient_sellable_quantity",
+    "INSUFFICIENT_SELLABLE_QUANTITY": "insufficient_sellable_quantity",
+}
 
 
 @dataclass(frozen=True)
@@ -314,6 +321,16 @@ def classify_actionable_failure(
     broker_error_code: str | None,
     broker_error_message: str,
 ) -> str | None:
+    normalized_code = str(broker_error_code or "").strip().upper()
+    code_classification = _ACTIONABLE_CODE_CLASSIFICATIONS.get(normalized_code)
+    if code_classification is not None:
+        if side == "sell" and code_classification == "insufficient_sellable_quantity":
+            return code_classification
+        if side == "buy" and code_classification in {
+            "insufficient_funds",
+            "insufficient_buying_power",
+        }:
+            return code_classification
     haystack_lower = f"{broker_error_code or ''} {broker_error_message}".lower()
     haystack = f"{broker_error_code or ''} {broker_error_message}"
 

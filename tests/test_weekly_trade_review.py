@@ -8,7 +8,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
-from sqlalchemy import event, inspect, text
+from sqlalchemy import event, inspect, select, text
 
 from app.core.config import Settings
 from app.db.base import Base
@@ -18,17 +18,36 @@ from app.models.runtime import (
     BrokerOrderEvent,
     ExecutionFailure,
     ExecutionFill,
+    FifoInventoryIsolation,
     ExecutionPlan,
     ExecutionPlanItem,
     ExecutionPosition,
     MonitoringCheckpoint,
 )
-from app.services.weekly_trade_review import WeeklyTradeReviewTimeoutError, generate_weekly_trade_review
+from app.services.weekly_trade_review import (
+    WeeklyTradeReviewTimeoutError,
+    _weekly_closed_trades,
+    generate_weekly_trade_review,
+)
 from app.services.runtime import runtime_counts
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 WEEKLY_REVIEW_SCRIPT = REPO_ROOT / "scripts" / "export_weekly_trade_review.py"
+WEEKLY_TEST_ACCOUNT_SCOPE = "a" * 24
+
+
+def _scope_orders(*orders: BrokerOrder) -> None:
+    for order in orders:
+        order.venue = order.venue or "KRX"
+        order.asset_class = order.asset_class or "stock"
+        metadata = dict(order.request_metadata or {})
+        metadata["broker_account_scope"] = {
+            "policy_version": 1,
+            "scope": WEEKLY_TEST_ACCOUNT_SCOPE,
+        }
+        metadata["exchange"] = order.venue
+        order.request_metadata = metadata
 
 
 def _build_db(settings: Settings):
@@ -45,6 +64,270 @@ def _assert_mapping_contains(actual: object, expected: dict[str, object]) -> Non
             _assert_mapping_contains(actual[key], expected_value)
         else:
             assert actual[key] == expected_value
+
+
+def test_weekly_fifo_never_pairs_same_symbol_across_execution_routes() -> None:
+    settings = Settings(database_url="sqlite:///:memory:", runtime_mode="paper")
+    engine, db = _build_db(settings)
+    start_at = datetime(2026, 9, 1, tzinfo=UTC)
+    end_at = datetime(2026, 9, 8, tzinfo=UTC)
+
+    def order(
+        *,
+        order_id: str,
+        provider: str,
+        side: str,
+        account_scope: str | None,
+        exchange: str,
+    ) -> BrokerOrder:
+        venue = "KRX" if provider == "kis" else "ALPACA"
+        return BrokerOrder(
+            id=order_id,
+            broker_name=provider,
+            mode="paper",
+            idempotency_key=order_id,
+            symbol="SHARED",
+            side=side,
+            status="filled",
+            quantity=1,
+            venue=venue,
+            asset_class="stock",
+            request_metadata=(
+                {
+                    "exchange": exchange,
+                    "broker_account_scope": {
+                        "policy_version": 1,
+                        "scope": account_scope,
+                    }
+                }
+                if account_scope is not None
+                else None
+            ),
+        )
+
+    kis_buy = order(
+        order_id="weekly-kis-buy",
+        provider="kis",
+        side="buy",
+        account_scope="account-a",
+        exchange="KRX",
+    )
+    alpaca_sell = order(
+        order_id="weekly-alpaca-sell",
+        provider="alpaca",
+        side="sell",
+        account_scope="account-a",
+        exchange="NASD",
+    )
+    kis_sell = order(
+        order_id="weekly-kis-sell",
+        provider="kis",
+        side="sell",
+        account_scope="account-a",
+        exchange="KRX",
+    )
+    cross_exchange_sell = order(
+        order_id="weekly-cross-exchange-sell",
+        provider="kis",
+        side="sell",
+        account_scope="account-a",
+        exchange="NYSE",
+    )
+    unscoped_sell = order(
+        order_id="weekly-unscoped-sell",
+        provider="kis",
+        side="sell",
+        account_scope=None,
+        exchange="KRX",
+    )
+    db.add_all(
+        [
+            kis_buy,
+            alpaca_sell,
+            kis_sell,
+            cross_exchange_sell,
+            unscoped_sell,
+            ExecutionFill(
+                id="weekly-kis-buy-fill",
+                broker_order=kis_buy,
+                symbol="SHARED",
+                side="buy",
+                quantity=1,
+                price=Decimal("100"),
+                filled_at=start_at + timedelta(hours=1),
+            ),
+            ExecutionFill(
+                id="weekly-alpaca-sell-fill",
+                broker_order=alpaca_sell,
+                symbol="SHARED",
+                side="sell",
+                quantity=1,
+                price=Decimal("200"),
+                filled_at=start_at + timedelta(hours=2),
+            ),
+            ExecutionFill(
+                id="weekly-kis-sell-fill",
+                broker_order=kis_sell,
+                symbol="SHARED",
+                side="sell",
+                quantity=1,
+                price=Decimal("110"),
+                filled_at=start_at + timedelta(hours=3),
+            ),
+            ExecutionFill(
+                id="weekly-cross-exchange-sell-fill",
+                broker_order=cross_exchange_sell,
+                symbol="SHARED",
+                side="sell",
+                quantity=1,
+                price=Decimal("250"),
+                filled_at=start_at + timedelta(hours=4),
+            ),
+            ExecutionFill(
+                id="weekly-unscoped-sell-fill",
+                broker_order=unscoped_sell,
+                symbol="SHARED",
+                side="sell",
+                quantity=1,
+                price=Decimal("300"),
+                filled_at=start_at + timedelta(hours=5),
+            ),
+        ]
+    )
+    db.commit()
+
+    rows, truncated = _weekly_closed_trades(
+        db=db,
+        mode="paper",
+        start_at=start_at,
+        end_at=end_at,
+        max_rows=20,
+    )
+
+    rows_by_fill = {row["sell_fill_id"]: row for row in rows}
+    assert truncated is False
+    assert rows_by_fill["weekly-alpaca-sell-fill"]["cost_basis_source"] == "unknown"
+    assert rows_by_fill["weekly-alpaca-sell-fill"]["realized_pnl"] is None
+    assert rows_by_fill["weekly-kis-sell-fill"]["realized_pnl"] == Decimal("10.0000")
+    assert rows_by_fill["weekly-cross-exchange-sell-fill"]["cost_basis_source"] == (
+        "unknown"
+    )
+    assert rows_by_fill["weekly-cross-exchange-sell-fill"]["realized_pnl"] is None
+    assert rows_by_fill["weekly-unscoped-sell-fill"]["cost_basis_source"] == (
+        "execution_scope_unavailable"
+    )
+    db.close()
+    engine.dispose()
+
+
+def test_weekly_fifo_starts_clean_generation_after_exact_route_verified_flat() -> None:
+    settings = Settings(database_url="sqlite:///:memory:", runtime_mode="paper")
+    engine, db = _build_db(settings)
+    start_at = datetime(2026, 9, 1, tzinfo=UTC)
+    end_at = datetime(2026, 9, 8, tzinfo=UTC)
+    old_at = start_at + timedelta(hours=1)
+    boundary_at = old_at + timedelta(seconds=1)
+
+    def order(*, row_id: str, side: str) -> BrokerOrder:
+        row = BrokerOrder(
+            id=row_id,
+            broker_name="kis",
+            mode="paper",
+            idempotency_key=row_id,
+            symbol="005930",
+            side=side,
+            status="filled",
+            quantity=1,
+            venue="KRX",
+            asset_class="stock",
+        )
+        _scope_orders(row)
+        return row
+
+    old_one = order(row_id="weekly-old-ambiguous-one", side="buy")
+    old_two = order(row_id="weekly-old-ambiguous-two", side="buy")
+    new_buy = order(row_id="weekly-new-generation-buy", side="buy")
+    new_sell = order(row_id="weekly-new-generation-sell", side="sell")
+    db.add_all(
+        [
+            old_one,
+            old_two,
+            new_buy,
+            new_sell,
+            FifoInventoryIsolation(
+                id="weekly-generation-boundary",
+                mode="paper",
+                provider="kis",
+                account_scope=WEEKLY_TEST_ACCOUNT_SCOPE,
+                venue="KRX",
+                asset_class="stock",
+                exchange="KRX",
+                symbol="005930",
+                residual_quantity=Decimal("2"),
+                last_local_fill_at=old_at,
+                broker_position_id="weekly-flat-position",
+                broker_position_quantity=Decimal("0"),
+                broker_reconciled_at=boundary_at,
+                isolated_through_at=boundary_at,
+                evidence_source="broker_flat_reconciliation",
+                actor="test",
+                reason="exact-route broker-authenticated verified flat",
+            ),
+            ExecutionFill(
+                id="weekly-old-ambiguous-fill-one",
+                broker_order=old_one,
+                symbol="005930",
+                side="buy",
+                quantity=1,
+                price=Decimal("100"),
+                filled_at=old_at,
+            ),
+            ExecutionFill(
+                id="weekly-old-ambiguous-fill-two",
+                broker_order=old_two,
+                symbol="005930",
+                side="buy",
+                quantity=1,
+                price=Decimal("200"),
+                filled_at=old_at,
+            ),
+            ExecutionFill(
+                id="weekly-new-generation-buy-fill",
+                broker_order=new_buy,
+                symbol="005930",
+                side="buy",
+                quantity=1,
+                price=Decimal("300"),
+                filled_at=boundary_at + timedelta(seconds=1),
+            ),
+            ExecutionFill(
+                id="weekly-new-generation-sell-fill",
+                broker_order=new_sell,
+                symbol="005930",
+                side="sell",
+                quantity=1,
+                price=Decimal("350"),
+                filled_at=boundary_at + timedelta(minutes=1),
+            ),
+        ]
+    )
+    db.commit()
+
+    rows, truncated = _weekly_closed_trades(
+        db=db,
+        mode="paper",
+        start_at=start_at,
+        end_at=end_at,
+        max_rows=20,
+    )
+
+    assert truncated is False
+    assert len(rows) == 1
+    assert rows[0]["sell_fill_id"] == "weekly-new-generation-sell-fill"
+    assert rows[0]["cost_basis_source"] == "fill_fifo"
+    assert rows[0]["realized_pnl"] == Decimal("50.0000")
+    db.close()
+    engine.dispose()
 
 
 def test_weekly_trade_review_exports_bounded_read_only_artifact(tmp_path) -> None:
@@ -216,7 +499,7 @@ def test_weekly_trade_review_exports_bounded_read_only_artifact(tmp_path) -> Non
     assert mutating_statements == []
     selected_sql = "\n".join(statements)
     assert "raw_broker_payload" not in selected_sql
-    assert "request_metadata" not in selected_sql
+    assert "broker_orders.request_metadata" in selected_sql
     assert "response_metadata" not in selected_sql
     assert "raw_context" not in selected_sql
     assert "risk_context" not in selected_sql
@@ -228,6 +511,80 @@ def test_weekly_trade_review_exports_bounded_read_only_artifact(tmp_path) -> Non
     assert json.loads(artifact_path.read_text(encoding="utf-8"))["counts"]["fill_count"] == 2
     assert json.loads(latest_path.read_text(encoding="utf-8"))["artifact_path"] == str(artifact_path)
 
+    db.close()
+    engine.dispose()
+
+
+def test_weekly_json_export_recursively_redacts_account_identifiers(tmp_path) -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        weekly_trade_review_dir=str(tmp_path),
+    )
+    engine, db = _build_db(settings)
+    start_at = datetime(2026, 9, 1, tzinfo=UTC)
+    end_at = datetime(2026, 9, 8, tzinfo=UTC)
+    order = BrokerOrder(
+        id="weekly-redaction-order",
+        broker_name="kis",
+        mode="paper",
+        idempotency_key="weekly-redaction-order",
+        symbol="005930",
+        side="buy",
+        status="filled",
+        quantity=1,
+        submitted_at=start_at + timedelta(hours=1),
+        request_metadata={
+            "account_scope": WEEKLY_TEST_ACCOUNT_SCOPE,
+            "nested": {"Account_No": "12345678", "exchange": "KRX"},
+        },
+        response_metadata={"nested": [{"broker_account_id": "raw-id", "ok": True}]},
+        raw_broker_payload={"output": {"CANO": "12345678", "status": "filled"}},
+    )
+    fill = ExecutionFill(
+        id="weekly-redaction-fill",
+        broker_order=order,
+        symbol="005930",
+        side="buy",
+        quantity=1,
+        price=Decimal("70000"),
+        filled_at=start_at + timedelta(hours=2),
+        payload={"nested": {"ACNT_PRDT_CD": "01", "marker": "kept"}},
+    )
+    event_row = BrokerOrderEvent(
+        broker_order=order,
+        event_type="reconcile_result",
+        observed_at=start_at + timedelta(hours=2),
+        request_payload={"acct_id": "raw-acct", "request_marker": "kept"},
+        response_payload={"account_id": "raw-id", "response_marker": "kept"},
+        payload={"acct_no": "raw-acct", "event_marker": "kept"},
+    )
+    db.add_all([order, fill, event_row])
+    db.commit()
+
+    report = generate_weekly_trade_review(
+        settings=settings,
+        db=db,
+        start_at=start_at,
+        end_at=end_at,
+        include_json_payloads=True,
+    )
+
+    serialized = json.dumps(report, sort_keys=True)
+    assert "12345678" not in serialized
+    assert "raw-id" not in serialized
+    assert "raw-acct" not in serialized
+    assert "CANO" not in serialized
+    assert "ACNT_PRDT_CD" not in serialized
+    assert report["linked_broker_orders"][0]["request_metadata"] == {
+        "account_scope": WEEKLY_TEST_ACCOUNT_SCOPE,
+        "nested": {"exchange": "KRX"},
+    }
+    assert report["fills"][0]["payload"] == {"nested": {"marker": "kept"}}
+    assert report["linked_broker_order_events"][0]["payload"] == {
+        "event_marker": "kept"
+    }
+    assert "12345678" not in (tmp_path / "latest.json").read_text(encoding="utf-8")
     db.close()
     engine.dispose()
 
@@ -445,6 +802,7 @@ def test_weekly_trade_review_keeps_later_repurchase_basis_unknown(tmp_path) -> N
         quantity=3,
         submitted_at=buy_at,
     )
+    _scope_orders(sell_order, buy_order)
     db.add_all([sell_order, buy_order])
     db.flush()
     db.add_all(
@@ -469,10 +827,13 @@ def test_weekly_trade_review_keeps_later_repurchase_basis_unknown(tmp_path) -> N
                 price=Decimal("700"),
                 filled_at=buy_at,
             ),
-            ExecutionPosition(
-                id="later-current-position",
-                mode="paper",
-                symbol="LATER",
+                ExecutionPosition(
+                    id="later-current-position",
+                    mode="paper",
+                    provider="kis",
+                    account_scope=WEEKLY_TEST_ACCOUNT_SCOPE,
+                    exchange="KRX",
+                    symbol="LATER",
                 quantity=3,
                 average_price=Decimal("700"),
                 updated_from="reconciliation",
@@ -597,6 +958,7 @@ def test_weekly_trade_review_pnl_coverage_classifies_each_sell_fill_once(tmp_pat
             submitted_at=start_at + timedelta(hours=5),
         ),
     ]
+    _scope_orders(*orders)
     db.add_all(orders)
     db.flush()
     db.add_all(
@@ -762,6 +1124,7 @@ def test_weekly_trade_review_realized_summary_dedupes_duplicate_broker_sell_fill
         ]
     )
     db.flush()
+    _scope_orders(*db.scalars(select(BrokerOrder)).all())
     db.add_all(
         [
             ExecutionFill(
@@ -859,6 +1222,7 @@ def test_weekly_trade_review_realized_summary_dedupes_fallback_sell_fill_identit
         ]
     )
     db.flush()
+    _scope_orders(*db.scalars(select(BrokerOrder)).all())
     sell_at = start_at + timedelta(hours=2)
     db.add_all(
         [
@@ -986,6 +1350,78 @@ def test_weekly_trade_review_cli_requires_explicit_live_database_url_before_open
     assert not default_sqlite_path.exists()
     assert not (output_dir / "2026-07-25_to_2026-08-01_weekly_trade_review.json").exists()
     assert not (output_dir / "latest.json").exists()
+
+
+def test_weekly_trade_review_cli_rejects_credential_bearing_database_url_argv(
+    tmp_path,
+) -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(WEEKLY_REVIEW_SCRIPT),
+            "--runtime-mode",
+            "live",
+            "--require-runtime-mode",
+            "live",
+            "--database-url",
+            "postgresql+psycopg://operator:not-a-real-secret@db.invalid/exec",
+            "--start-at",
+            "2026-07-25T00:00:00Z",
+            "--end-at",
+            "2026-08-01T00:00:00Z",
+            "--output-dir",
+            str(tmp_path),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=_clean_kai_exec_env(),
+    )
+
+    assert result.returncode != 0
+    assert result.stdout == ""
+    assert "KAI_EXEC_DATABASE_URL environment variable" in result.stderr
+    assert not (tmp_path / "latest.json").exists()
+
+
+def test_weekly_trade_review_cli_rejects_opaque_database_query_before_db_open(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "must-not-open.db"
+    secret = "must-not-leak-weekly-secret"
+    database_url = (
+        f"sqlite:///{database_path}?connection_string="
+        f"password%3D{secret}"
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(WEEKLY_REVIEW_SCRIPT),
+            "--runtime-mode",
+            "live",
+            "--require-runtime-mode",
+            "live",
+            "--database-url",
+            database_url,
+            "--start-at",
+            "2026-07-25T00:00:00Z",
+            "--end-at",
+            "2026-08-01T00:00:00Z",
+            "--output-dir",
+            str(tmp_path / "artifacts"),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=_clean_kai_exec_env(),
+    )
+
+    assert result.returncode != 0
+    assert "KAI_EXEC_DATABASE_URL environment variable" in result.stderr
+    assert secret not in result.stdout
+    assert secret not in result.stderr
+    assert not database_path.exists()
+    assert not (tmp_path / "artifacts" / "latest.json").exists()
 
 
 def test_weekly_trade_review_cli_allows_required_live_with_explicit_database_url(tmp_path) -> None:
@@ -1352,6 +1788,9 @@ def _seed_weekly_review_fixture(*, db, start_at: datetime) -> None:
     flat_position = ExecutionPosition(
         id="flat-legacy-position",
         mode="paper",
+        provider="kis",
+        account_scope=WEEKLY_TEST_ACCOUNT_SCOPE,
+        exchange="KRX",
         symbol="049430",
         quantity=0,
         average_price=Decimal("1800"),
@@ -1359,6 +1798,14 @@ def _seed_weekly_review_fixture(*, db, start_at: datetime) -> None:
         last_reconciled_at=start_at + timedelta(days=2, hours=1, minutes=10),
         created_at=start_at + timedelta(days=2, hours=1, minutes=10),
         updated_at=start_at + timedelta(days=2, hours=1, minutes=10),
+    )
+    _scope_orders(
+        weekly_order,
+        old_order,
+        legacy_buy_order,
+        legacy_sell_order,
+        missing_submitted_order,
+        *active_nonterminal_orders,
     )
     event = BrokerOrderEvent(
         id="weekly-event",

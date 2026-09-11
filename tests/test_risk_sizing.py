@@ -1,3 +1,4 @@
+from datetime import UTC, datetime
 from decimal import Decimal
 
 from app.core.config import Settings, load_settings
@@ -217,10 +218,12 @@ def test_risk_sizing_normal_market_breadth_preserves_baseline_quantity() -> None
                 "flat_count": 50,
                 "up_ratio": "0.52",
                 "advance_decline_ratio": "1.21",
+                "observed_at": "2026-06-25T05:00:00+00:00",
                 "source": "test",
             }
         },
         market_date="2026-06-25",
+        evaluated_at=datetime(2026, 6, 25, 5, 1, tzinfo=UTC),
     )
 
     assert isinstance(decision, RiskSizingResult)
@@ -261,9 +264,11 @@ def test_risk_sizing_risk_off_market_breadth_downsizes_quantity() -> None:
                 "down_count": 600,
                 "flat_count": 50,
                 "up_ratio": "0.35",
+                "observed_at": "2026-06-25T05:00:00+00:00",
             }
         },
         market_date="2026-06-25",
+        evaluated_at=datetime(2026, 6, 25, 5, 1, tzinfo=UTC),
     )
 
     assert isinstance(decision, RiskSizingResult)
@@ -293,9 +298,11 @@ def test_risk_sizing_below_normal_market_breadth_downsizes_quantity() -> None:
                 "market_date": "2026-06-25",
                 "up_ratio": "0.42",
                 "advance_decline_ratio": "1.10",
+                "observed_at": "2026-06-25T05:00:00+00:00",
             }
         },
         market_date="2026-06-25",
+        evaluated_at=datetime(2026, 6, 25, 5, 1, tzinfo=UTC),
     )
 
     assert isinstance(decision, RiskSizingResult)
@@ -327,9 +334,11 @@ def test_risk_sizing_risk_off_market_breadth_downsizes_buy() -> None:
                 "down_count": 700,
                 "flat_count": 50,
                 "up_ratio": "0.25",
+                "observed_at": "2026-06-25T05:00:00+00:00",
             }
         },
         market_date="2026-06-25",
+        evaluated_at=datetime(2026, 6, 25, 5, 1, tzinfo=UTC),
     )
 
     assert isinstance(decision, RiskSizingResult)
@@ -388,6 +397,7 @@ def test_risk_sizing_nested_decider_handoff_market_regime_rejects_when_downsized
                         "flat_count": 134,
                         "up_ratio": "0.1203",
                         "advance_decline_ratio": "0.149684",
+                        "observed_at": "2026-07-14T05:00:00+00:00",
                     },
                     "sector_context": {
                         "sector_name": "기계·장비",
@@ -397,6 +407,7 @@ def test_risk_sizing_nested_decider_handoff_market_regime_rejects_when_downsized
             },
         },
         market_date="2026-07-14",
+        evaluated_at=datetime(2026, 7, 14, 5, 1, tzinfo=UTC),
     )
 
     assert isinstance(decision, RiskSizingRejection)
@@ -477,6 +488,7 @@ def test_risk_sizing_sector_weakness_downsizes_buy() -> None:
             "market_breadth": {
                 "market_date": "2026-06-25",
                 "up_ratio": "0.55",
+                "observed_at": "2026-06-25T05:00:00+00:00",
             },
             "sector_peer_context": {
                 "sector_name": "Semiconductors",
@@ -485,6 +497,7 @@ def test_risk_sizing_sector_weakness_downsizes_buy() -> None:
             },
         },
         market_date="2026-06-25",
+        evaluated_at=datetime(2026, 6, 25, 5, 1, tzinfo=UTC),
     )
 
     assert isinstance(decision, RiskSizingResult)

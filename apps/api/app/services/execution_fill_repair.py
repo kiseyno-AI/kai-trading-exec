@@ -5,8 +5,8 @@ from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
-from sqlalchemy import func, select
-from sqlalchemy.orm import Session
+from sqlalchemy import select
+from sqlalchemy.orm import Session, selectinload, undefer
 
 from app.models.runtime import (
     BrokerOrder,
@@ -16,12 +16,22 @@ from app.models.runtime import (
     FifoInventoryIsolation,
     RuntimeRemediationEvent,
 )
-from app.services.fifo_inventory import load_fifo_isolation_cursor
+from app.services.fifo_inventory import (
+    FifoRouteScope,
+    ambiguous_fifo_chronology_buckets,
+    fifo_chronology_is_ambiguous_at,
+    fifo_fill_sort_key,
+    fifo_route_scope_from_order,
+    load_fifo_isolation_cursor,
+)
 from app.services.fill_idempotency import (
+    TERMINAL_FILL_EVIDENCE_STATUSES,
+    broker_reported_filled_quantity,
     dedupe_execution_fills,
     duplicate_fill_conflicting_fields,
     duplicate_fill_economic_conflict,
     duplicate_fill_group_candidate_key,
+    execution_fills_have_conflicting_identity,
     execution_fill_dedupe_key,
     execution_fill_idempotency_key,
 )
@@ -29,6 +39,12 @@ from app.services.fill_economics import (
     COST_COVERAGE_UNKNOWN,
     FillEconomics,
     normalize_fill_economics,
+)
+from app.services.position_identity import (
+    PositionIdentity,
+    PositionIdentityConflictError,
+    position_identity_from_columns,
+    position_identity_from_payload,
 )
 
 
@@ -100,6 +116,16 @@ def apply_fifo_inventory_repairs(
         existing = db.scalar(
             select(FifoInventoryIsolation).where(
                 FifoInventoryIsolation.mode == runtime_mode,
+                FifoInventoryIsolation.provider
+                == item["execution_scope"]["provider"],
+                FifoInventoryIsolation.account_scope
+                == item["execution_scope"]["account_scope"],
+                FifoInventoryIsolation.venue
+                == item["execution_scope"]["venue"],
+                FifoInventoryIsolation.asset_class
+                == item["execution_scope"]["asset_class"],
+                FifoInventoryIsolation.exchange
+                == item["execution_scope"]["exchange"],
                 FifoInventoryIsolation.symbol == item["symbol"],
                 FifoInventoryIsolation.broker_reconciled_at == broker_reconciled_at,
             )
@@ -108,6 +134,11 @@ def apply_fifo_inventory_repairs(
             continue
         isolation = FifoInventoryIsolation(
             mode=runtime_mode,
+            provider=str(item["execution_scope"]["provider"]),
+            account_scope=str(item["execution_scope"]["account_scope"]),
+            venue=str(item["execution_scope"]["venue"]),
+            asset_class=str(item["execution_scope"]["asset_class"]),
+            exchange=str(item["execution_scope"]["exchange"]),
             symbol=str(item["symbol"]),
             residual_quantity=_parse_decimal(item["residual_quantity"]) or Decimal("0"),
             last_local_fill_at=_parse_timestamp(item["last_local_fill"], fallback=isolated_at),
@@ -125,6 +156,7 @@ def apply_fifo_inventory_repairs(
                 "reason": reason,
                 "isolated_at": isolated_at.isoformat(),
                 "runtime_mode": runtime_mode,
+                "execution_scope": item["execution_scope"],
                 "evidence": item,
                 "fills_deleted": 0,
                 "fills_fabricated": 0,
@@ -190,17 +222,75 @@ def _fifo_inventory_repair_items(
             select(ExecutionFill)
             .join(ExecutionFill.broker_order)
             .where(BrokerOrder.mode == runtime_mode)
+            .options(
+                undefer(ExecutionFill.payload),
+                selectinload(ExecutionFill.broker_order).load_only(
+                    BrokerOrder.id,
+                    BrokerOrder.broker_name,
+                    BrokerOrder.request_metadata,
+                    BrokerOrder.venue,
+                    BrokerOrder.asset_class,
+                )
+            )
             .order_by(ExecutionFill.filled_at.asc(), ExecutionFill.id.asc())
         ).all()
     ))
+    ambiguous_buckets = ambiguous_fifo_chronology_buckets(fills)
     isolation_cursor = load_fifo_isolation_cursor(db=db, runtime_mode=runtime_mode)
-    lots_by_symbol: dict[str, list[Decimal]] = {}
-    last_fill_at_by_symbol: dict[str, datetime] = {}
-    for fill in fills:
+    lots_by_route_symbol: dict[
+        tuple[FifoRouteScope | None, str],
+        list[Decimal],
+    ] = {}
+    last_fill_at_by_route_symbol: dict[
+        tuple[FifoRouteScope | None, str],
+        datetime,
+    ] = {}
+    ambiguous_isolation_scopes: set[tuple[FifoRouteScope, str]] = set()
+    generation_by_route_symbol: dict[
+        tuple[FifoRouteScope, str], datetime | None
+    ] = {}
+    for fill in sorted(fills, key=fifo_fill_sort_key):
         symbol = fill.symbol
         filled_at = _parse_timestamp(fill.filled_at, fallback=datetime.now(UTC))
-        lots = lots_by_symbol.setdefault(symbol, [])
-        isolation_cursor.apply_before(symbol=symbol, observed_at=filled_at, lots=lots)
+        route_scope = fifo_route_scope_from_order(fill.broker_order)
+        route_symbol = (route_scope, symbol)
+        lots = lots_by_route_symbol.setdefault(route_symbol, [])
+        if route_scope is not None:
+            scoped_route_symbol = (route_scope, symbol)
+            generation_boundary = isolation_cursor.latest_boundary_before(
+                route_scope=route_scope,
+                symbol=symbol,
+                observed_at=filled_at,
+            )
+            if (
+                scoped_route_symbol in generation_by_route_symbol
+                and generation_by_route_symbol[scoped_route_symbol]
+                != generation_boundary
+            ):
+                lots.clear()
+                ambiguous_isolation_scopes.discard(scoped_route_symbol)
+            generation_by_route_symbol[scoped_route_symbol] = generation_boundary
+            scope_quality_available = isolation_cursor.apply_before(
+                route_scope=route_scope,
+                symbol=symbol,
+                observed_at=filled_at,
+                lots=lots,
+            )
+        else:
+            scope_quality_available = False
+        if route_scope is not None and fifo_chronology_is_ambiguous_at(
+            ambiguous_buckets=ambiguous_buckets,
+            isolation_cursor=isolation_cursor,
+            route_scope=route_scope,
+            symbol=symbol,
+            observed_at=filled_at,
+        ):
+            lots.clear()
+            ambiguous_isolation_scopes.add((route_scope, symbol))
+            last_fill_at_by_route_symbol[route_symbol] = filled_at
+            continue
+        if route_scope is not None and not scope_quality_available:
+            ambiguous_isolation_scopes.add((route_scope, symbol))
         quantity = (
             Decimal(fill.base_quantity)
             if fill.base_quantity is not None and fill.base_quantity > 0
@@ -216,14 +306,29 @@ def _fifo_inventory_repair_items(
                 remaining -= matched
                 if lots[0] <= 0:
                     lots.pop(0)
-        last_fill_at_by_symbol[symbol] = filled_at
+        last_fill_at_by_route_symbol[route_symbol] = filled_at
 
-    for symbol, lots in lots_by_symbol.items():
-        isolation_cursor.apply_through(
-            symbol=symbol,
-            observed_at=datetime.max.replace(tzinfo=UTC),
-            lots=lots,
-        )
+    for (route_scope, symbol), lots in lots_by_route_symbol.items():
+        if route_scope is not None:
+            scoped_route_symbol = (route_scope, symbol)
+            final_boundary = isolation_cursor.latest_boundary_through(
+                route_scope=route_scope,
+                symbol=symbol,
+                observed_at=datetime.max.replace(tzinfo=UTC),
+            )
+            if (
+                final_boundary is not None
+                and final_boundary
+                != generation_by_route_symbol.get(scoped_route_symbol)
+            ):
+                ambiguous_isolation_scopes.discard(scoped_route_symbol)
+            if not isolation_cursor.apply_through(
+                route_scope=route_scope,
+                symbol=symbol,
+                observed_at=datetime.max.replace(tzinfo=UTC),
+                lots=lots,
+            ):
+                ambiguous_isolation_scopes.add(scoped_route_symbol)
 
     positions = db.scalars(
         select(ExecutionPosition).where(
@@ -231,13 +336,102 @@ def _fifo_inventory_repair_items(
             ExecutionPosition.last_reconciled_at.is_not(None),
         )
     ).all()
-    position_by_symbol = {position.symbol: position for position in positions}
-    items: list[dict[str, object]] = []
-    for symbol, lots in sorted(lots_by_symbol.items()):
-        residual_quantity = sum(lots, Decimal("0"))
-        if residual_quantity <= 0:
+    scoped_position_candidates: dict[
+        tuple[str, str, str, str],
+        list[ExecutionPosition],
+    ] = defaultdict(list)
+    legacy_position_candidates: dict[str, list[ExecutionPosition]] = defaultdict(list)
+    for position in positions:
+        identity = _validated_position_identity(position)
+        if identity is None:
+            if _is_legacy_unscoped_position(position):
+                legacy_position_candidates[position.symbol].append(position)
             continue
-        position = position_by_symbol.get(symbol)
+        scoped_position_candidates[
+            (
+                identity.provider,
+                identity.account_scope,
+                identity.exchange,
+                position.symbol,
+            )
+        ].append(position)
+    position_by_route_symbol = {
+        key: candidates[0]
+        for key, candidates in scoped_position_candidates.items()
+        if len(candidates) == 1
+    }
+    legacy_position_by_symbol = {
+        symbol: candidates[0]
+        for symbol, candidates in legacy_position_candidates.items()
+        if len(candidates) == 1
+    }
+    items: list[dict[str, object]] = []
+    for (route_scope, symbol), lots in sorted(
+        lots_by_route_symbol.items(),
+        key=lambda item: (
+            item[0][1],
+            item[0][0].provider if item[0][0] is not None else "",
+            item[0][0].account_scope if item[0][0] is not None else "",
+            item[0][0].venue if item[0][0] is not None else "",
+            item[0][0].asset_class if item[0][0] is not None else "",
+            item[0][0].exchange if item[0][0] is not None else "",
+        ),
+    ):
+        residual_quantity = sum(lots, Decimal("0"))
+        ambiguous_generation = bool(
+            route_scope is not None
+            and (route_scope, symbol) in ambiguous_isolation_scopes
+        )
+        if residual_quantity <= 0 and not ambiguous_generation:
+            continue
+        last_fill_at = last_fill_at_by_route_symbol.get((route_scope, symbol))
+        if last_fill_at is None:
+            continue
+        route_position_key = (
+            (
+                route_scope.provider,
+                route_scope.account_scope,
+                route_scope.exchange,
+                symbol,
+            )
+            if route_scope is not None
+            else None
+        )
+        ambiguous_positions = (
+            scoped_position_candidates.get(route_position_key, [])
+            if route_position_key is not None
+            else legacy_position_candidates.get(symbol, [])
+        )
+        if len(ambiguous_positions) > 1:
+            items.append(
+                {
+                    "symbol": symbol,
+                    "residual_quantity": _decimal_text(residual_quantity),
+                    "last_local_fill": last_fill_at.isoformat(),
+                    "broker_reconciliation_timestamp": None,
+                    "broker_position_id": f"ambiguous-position-route:{symbol}",
+                    "broker_position_ids": sorted(
+                        position.id for position in ambiguous_positions
+                    ),
+                    "broker_position_quantity": None,
+                    "execution_scope": (
+                        route_scope.as_payload() if route_scope is not None else None
+                    ),
+                    "eligible": False,
+                    "repair_action": "skip",
+                    "reason": (
+                        "broker_position_route_ambiguous"
+                        if route_scope is not None
+                        else "legacy_position_route_ambiguous"
+                    ),
+                }
+            )
+            continue
+        position = (
+            position_by_route_symbol.get(route_position_key)
+            if route_position_key is not None
+            else legacy_position_by_symbol.get(symbol)
+        )
         if (
             position is None
             or "reconciliation" not in str(position.updated_from or "")
@@ -245,14 +439,26 @@ def _fifo_inventory_repair_items(
             or position.last_reconciled_at is None
         ):
             continue
-        last_fill_at = last_fill_at_by_symbol.get(symbol)
-        if last_fill_at is None:
-            continue
         broker_reconciled_at = _parse_timestamp(
             position.last_reconciled_at,
             fallback=datetime.min.replace(tzinfo=UTC),
         )
-        eligible = broker_reconciled_at > last_fill_at
+        scope_matches_position = _fifo_position_matches_route(
+            position=position,
+            route_scope=route_scope,
+        )
+        scope_available = bool(route_scope is not None and scope_matches_position)
+        eligible = scope_available and broker_reconciled_at > last_fill_at
+        if route_scope is None:
+            reason = "execution_scope_unavailable"
+        elif not scope_matches_position:
+            reason = "broker_position_execution_scope_mismatch"
+        elif eligible and ambiguous_generation:
+            reason = "broker_flat_evidence_resets_ambiguous_generation"
+        elif eligible:
+            reason = "broker_flat_evidence_newer_than_last_local_fill"
+        else:
+            reason = "broker_flat_evidence_not_newer_than_last_local_fill"
         items.append(
             {
                 "symbol": symbol,
@@ -261,12 +467,16 @@ def _fifo_inventory_repair_items(
                 "broker_reconciliation_timestamp": broker_reconciled_at.isoformat(),
                 "broker_position_id": position.id,
                 "broker_position_quantity": _decimal_text(_position_quantity(position)),
+                "execution_scope": (
+                    route_scope.as_payload() if route_scope is not None else None
+                ),
                 "eligible": eligible,
                 "repair_action": "isolate" if eligible else "skip",
-                "reason": (
-                    "broker_flat_evidence_newer_than_last_local_fill"
-                    if eligible
-                    else "broker_flat_evidence_not_newer_than_last_local_fill"
+                "reason": reason,
+                **(
+                    {"fifo_history_quality": "ambiguous_before_flat_boundary"}
+                    if ambiguous_generation
+                    else {}
                 ),
             }
         )
@@ -274,13 +484,63 @@ def _fifo_inventory_repair_items(
 
 
 def _fifo_candidate_key(item: dict[str, object]) -> str:
+    scope = item.get("execution_scope")
+    scope = scope if isinstance(scope, dict) else {}
     return "|".join(
         (
+            str(scope.get("provider") or "unscoped"),
+            str(scope.get("account_scope") or "unscoped"),
+            str(scope.get("venue") or "unscoped"),
+            str(scope.get("asset_class") or "unscoped"),
+            str(scope.get("exchange") or "unscoped"),
             str(item["symbol"]),
             str(item["last_local_fill"]),
             str(item["broker_reconciliation_timestamp"]),
         )
     )
+
+
+def _fifo_position_matches_route(
+    *,
+    position: ExecutionPosition,
+    route_scope: FifoRouteScope | None,
+) -> bool:
+    if route_scope is None:
+        return False
+    identity = _validated_position_identity(position)
+    return bool(
+        identity is not None
+        and identity.provider == route_scope.provider
+        and identity.account_scope == route_scope.account_scope
+        and identity.exchange == route_scope.exchange
+    )
+
+
+def _validated_position_identity(
+    position: ExecutionPosition,
+) -> PositionIdentity | None:
+    try:
+        column_identity = position_identity_from_columns(position)
+        payload_identity = position_identity_from_payload(position.raw_payload)
+    except PositionIdentityConflictError:
+        return None
+    if column_identity is None:
+        return None
+    if payload_identity is not None and payload_identity != column_identity:
+        return None
+    return column_identity
+
+
+def _is_legacy_unscoped_position(position: ExecutionPosition) -> bool:
+    if any(
+        value is not None
+        for value in (position.provider, position.account_scope, position.exchange)
+    ):
+        return False
+    try:
+        return position_identity_from_payload(position.raw_payload) is None
+    except PositionIdentityConflictError:
+        return False
 
 
 def _annotate_fifo_reviews(
@@ -367,10 +627,19 @@ def apply_execution_fill_repairs(
     }
     for item in missing:
         order = db.get(BrokerOrder, item["broker_order_pk"])
-        if order is None or order.fills:
+        if order is None:
+            continue
+        current_issue = _terminal_fill_evidence_issue(order)
+        if current_issue is None:
             continue
         proposed_fills = item.get("proposed_fills")
         if not isinstance(proposed_fills, list) or not proposed_fills:
+            blocker = str(
+                current_issue.get("candidate_reason")
+                or "authoritative_broker_fill_evidence_unavailable"
+            )
+            if blocker == "missing_execution_fill":
+                blocker = "authoritative_broker_fill_evidence_unavailable"
             if _record_remediation_event(
                 db=db,
                 runtime_mode=runtime_mode,
@@ -386,7 +655,13 @@ def apply_execution_fill_repairs(
                     "side": order.side,
                     "broker_order_id": order.broker_order_id,
                     "idempotency_key": order.idempotency_key,
-                    "blocker": "authoritative_broker_fill_evidence_unavailable",
+                    "blocker": blocker,
+                    "quantity_basis": current_issue.get("quantity_basis"),
+                    "expected_quantity": current_issue.get("expected_quantity"),
+                    "persisted_quantity": current_issue.get("persisted_quantity"),
+                    "persisted_fill_count": current_issue.get(
+                        "persisted_fill_count"
+                    ),
                     "fills_deleted": 0,
                     "fills_fabricated": 0,
                     "orders_submitted": 0,
@@ -429,6 +704,11 @@ def apply_execution_fill_repairs(
         inserted_for_order: list[dict[str, object]] = []
         for proposed, signature in validated_fills:
             economics = _proposed_fill_economics(proposed, order=order)
+            filled_at = _parse_authoritative_fill_timestamp(proposed.get("filled_at"))
+            if filled_at is None:
+                raise ValueError(
+                    "validated repair fill is missing broker-authoritative chronology"
+                )
             fill = ExecutionFill(
                 idempotency_key=signature,
                 broker_order_pk=order.id,
@@ -443,11 +723,13 @@ def apply_execution_fill_repairs(
                 transaction_cost=economics.transaction_cost,
                 transaction_cost_coverage=economics.transaction_cost_coverage,
                 transaction_cost_source=economics.transaction_cost_source,
-                filled_at=_parse_timestamp(proposed.get("filled_at"), fallback=repaired_at),
+                filled_at=filled_at,
                 payload={
                     "source": "operator_fill_evidence_repair",
                     "actor": actor,
                     "reason": reason,
+                    "fill_time_precision": "exact",
+                    "fill_time_source": "broker_payload",
                     "settlement_currency_conflict": (
                         economics.settlement_currency_conflict
                     ),
@@ -639,18 +921,36 @@ def _repair_payload(
 def _missing_fill_items(*, db: Session, runtime_mode: str) -> list[dict[str, object]]:
     rows = db.scalars(
         select(BrokerOrder)
-        .outerjoin(ExecutionFill, ExecutionFill.broker_order_pk == BrokerOrder.id)
-        .where(BrokerOrder.mode == runtime_mode, BrokerOrder.status == "filled")
-        .group_by(BrokerOrder.id)
-        .having(func.count(ExecutionFill.id) == 0)
+        .where(
+            BrokerOrder.mode == runtime_mode,
+            BrokerOrder.status.in_(TERMINAL_FILL_EVIDENCE_STATUSES),
+        )
+        .options(
+            undefer(BrokerOrder.response_metadata),
+            undefer(BrokerOrder.raw_broker_payload),
+            selectinload(BrokerOrder.fills).undefer(ExecutionFill.payload),
+            selectinload(BrokerOrder.events).undefer(
+                BrokerOrderEvent.response_payload
+            ),
+        )
         .order_by(BrokerOrder.submitted_at.asc(), BrokerOrder.created_at.asc())
     ).all()
-    return [_missing_fill_item(db=db, order=order) for order in rows]
+    return [
+        _missing_fill_item(db=db, order=order, issue=issue)
+        for order in rows
+        if (issue := _terminal_fill_evidence_issue(order)) is not None
+    ]
 
 
-def _missing_fill_item(*, db: Session, order: BrokerOrder) -> dict[str, object]:
+def _missing_fill_item(
+    *,
+    db: Session,
+    order: BrokerOrder,
+    issue: dict[str, object],
+) -> dict[str, object]:
     evidence = _repair_evidence_for_order(db=db, order=order)
     proposed_fills = evidence.get("proposed_fills")
+    automatic_repair_safe = issue["candidate_reason"] == "missing_execution_fill"
     return {
         "broker_order_pk": order.id,
         "broker_order_id": order.broker_order_id,
@@ -659,8 +959,92 @@ def _missing_fill_item(*, db: Session, order: BrokerOrder) -> dict[str, object]:
         "side": order.side,
         "quantity": order.quantity,
         "submitted_at": _serialize_datetime(order.submitted_at),
+        **issue,
         "available_repair_evidence": evidence.get("available_repair_evidence"),
-        "proposed_fills": proposed_fills if isinstance(proposed_fills, list) else [],
+        "proposed_fills": (
+            proposed_fills
+            if automatic_repair_safe and isinstance(proposed_fills, list)
+            else []
+        ),
+    }
+
+
+def _terminal_fill_evidence_issue(order: BrokerOrder) -> dict[str, object] | None:
+    quantity_contract = _terminal_order_fill_quantity_contract(order)
+    if order.status != "filled" and quantity_contract is None:
+        return None
+    persisted_fills = dedupe_execution_fills(list(order.fills))
+    if not order.fills:
+        quantity_basis = quantity_contract[0] if quantity_contract else None
+        expected_quantity = quantity_contract[1] if quantity_contract else None
+        return {
+            "candidate_reason": "missing_execution_fill",
+            "quantity_basis": quantity_basis,
+            "expected_quantity": (
+                _quantity_evidence_value(
+                    expected_quantity,
+                    quantity_basis=quantity_basis,
+                )
+                if expected_quantity is not None and quantity_basis is not None
+                else None
+            ),
+            "persisted_quantity": (
+                _quantity_evidence_value(
+                    Decimal("0"),
+                    quantity_basis=quantity_basis,
+                )
+                if quantity_basis is not None
+                else None
+            ),
+            "persisted_fill_count": 0,
+        }
+    if execution_fills_have_conflicting_identity(list(order.fills)):
+        # The duplicate-fill candidate retains all conflicting evidence and
+        # records one manual-review decision for this defect.
+        return None
+    if quantity_contract is None:
+        return {
+            "candidate_reason": "terminal_fill_quantity_mismatch",
+            "quantity_basis": None,
+            "expected_quantity": None,
+            "persisted_quantity": None,
+            "persisted_fill_count": len(order.fills),
+        }
+
+    quantity_basis, expected_quantity = quantity_contract
+    persisted_quantities = [
+        _fill_quantity_for_basis(
+            _fill_row_payload(fill),
+            quantity_basis=quantity_basis,
+        )
+        for fill in persisted_fills
+    ]
+    complete_quantity_evidence = bool(persisted_fills) and all(
+        quantity is not None and quantity > 0
+        for quantity in persisted_quantities
+    )
+    persisted_quantity = sum(
+        (
+            quantity
+            for quantity in persisted_quantities
+            if quantity is not None and quantity > 0
+        ),
+        Decimal("0"),
+    )
+    if complete_quantity_evidence and persisted_quantity == expected_quantity:
+        return None
+    return {
+        "candidate_reason": "terminal_fill_quantity_mismatch",
+        "quantity_basis": quantity_basis,
+        "expected_quantity": _quantity_evidence_value(
+            expected_quantity,
+            quantity_basis=quantity_basis,
+        ),
+        "persisted_quantity": _quantity_evidence_value(
+            persisted_quantity,
+            quantity_basis=quantity_basis,
+        ),
+        "persisted_fill_count": len(order.fills),
     }
 
 
@@ -688,7 +1072,6 @@ def _repair_evidence_for_order(*, db: Session, order: BrokerOrder) -> dict[str, 
         fills = _proposed_fills_from_payload(
             payload=payload,
             order=order,
-            observed_at=observed_at or order.submitted_at or datetime.now(UTC),
         )
         if fills and _fills_match_filled_order(order=order, fills=fills):
             return {
@@ -713,7 +1096,7 @@ def _fills_match_filled_order(
     order: BrokerOrder,
     fills: list[dict[str, object]],
 ) -> bool:
-    quantity_contract = _order_fill_quantity_contract(order)
+    quantity_contract = _terminal_order_fill_quantity_contract(order)
     if quantity_contract is None:
         return False
     quantity_basis, expected_quantity = quantity_contract
@@ -741,6 +1124,17 @@ def _order_fill_quantity_contract(order: BrokerOrder) -> tuple[str, Decimal] | N
     return None
 
 
+def _terminal_order_fill_quantity_contract(
+    order: BrokerOrder,
+) -> tuple[str, Decimal] | None:
+    if order.status == "filled":
+        return _order_fill_quantity_contract(order)
+    reported_quantity = broker_reported_filled_quantity(order)
+    if reported_quantity is None:
+        return None
+    return "quantity", reported_quantity
+
+
 def _fill_quantity_for_basis(
     fill: dict[str, object],
     *,
@@ -762,7 +1156,6 @@ def _proposed_fills_from_payload(
     *,
     payload: dict[str, object],
     order: BrokerOrder,
-    observed_at: datetime,
 ) -> list[dict[str, object]]:
     fills = payload.get("fills")
     if isinstance(fills, list):
@@ -775,7 +1168,6 @@ def _proposed_fills_from_payload(
                 _normalize_explicit_fill(
                     item,
                     order=order,
-                    observed_at=observed_at,
                     inherited_transaction_cost_scope=inherited_cost_scope,
                 )
             ]
@@ -786,7 +1178,7 @@ def _proposed_fills_from_payload(
 
     nested_order = payload.get("order")
     if isinstance(nested_order, dict):
-        nested = _proposed_fills_from_payload(payload=nested_order, order=order, observed_at=observed_at)
+        nested = _proposed_fills_from_payload(payload=nested_order, order=order)
         if nested:
             return nested
 
@@ -797,18 +1189,17 @@ def _proposed_fills_from_payload(
                 continue
             if _optional_str(row.get("odno")) not in {None, order.broker_order_id}:
                 continue
-            parsed = _cumulative_fill_from_payload(payload=row, order=order, observed_at=observed_at)
+            parsed = _cumulative_fill_from_payload(payload=row, order=order)
             if parsed:
                 return parsed
 
-    return _cumulative_fill_from_payload(payload=payload, order=order, observed_at=observed_at)
+    return _cumulative_fill_from_payload(payload=payload, order=order)
 
 
 def _normalize_explicit_fill(
     fill: dict[str, object],
     *,
     order: BrokerOrder,
-    observed_at: datetime,
     inherited_transaction_cost_scope: str = "",
 ) -> dict[str, object] | None:
     quantity = _parse_int(fill.get("quantity")) or 0
@@ -825,7 +1216,9 @@ def _normalize_explicit_fill(
         or price <= 0
     ):
         return None
-    filled_at = _parse_timestamp(fill.get("filled_at"), fallback=observed_at)
+    filled_at = _parse_authoritative_fill_timestamp(fill.get("filled_at"))
+    if filled_at is None:
+        return None
     economics = normalize_fill_economics(fill, order=order)
     cost_scope = _transaction_cost_scope(fill) or inherited_transaction_cost_scope
     if economics.transaction_cost is not None and cost_scope == "cumulative":
@@ -856,7 +1249,6 @@ def _cumulative_fill_from_payload(
     *,
     payload: dict[str, object],
     order: BrokerOrder,
-    observed_at: datetime,
 ) -> list[dict[str, object]]:
     quantity = _parse_int(payload.get("filled_quantity"))
     if quantity is None:
@@ -880,10 +1272,11 @@ def _cumulative_fill_from_payload(
     )
     if price is None or price <= 0:
         return []
-    filled_at = _parse_timestamp(
-        payload.get("filled_at") or _kis_order_timestamp(payload),
-        fallback=observed_at,
-    )
+    if _optional_str(payload.get("fill_time_precision")) == "observed_upper_bound":
+        return []
+    filled_at = _parse_authoritative_fill_timestamp(payload.get("filled_at"))
+    if filled_at is None:
+        return []
     economics = _cumulative_repair_economics(payload=payload, order=order)
     normalized: dict[str, object] = {
         "broker_fill_id": _optional_str(payload.get("broker_fill_id")),
@@ -1057,12 +1450,14 @@ def _fill_signature(*, order: BrokerOrder, fill: dict[str, object]) -> str | Non
     price = _parse_decimal(fill.get("price"))
     symbol = _optional_str(fill.get("symbol"))
     side = _optional_str(fill.get("side"))
+    filled_at = _parse_authoritative_fill_timestamp(fill.get("filled_at"))
     if (
         (quantity <= 0 and base_quantity is None)
         or price is None
         or price <= 0
         or not symbol
         or not side
+        or filled_at is None
     ):
         return None
     return execution_fill_idempotency_key(
@@ -1070,7 +1465,7 @@ def _fill_signature(*, order: BrokerOrder, fill: dict[str, object]) -> str | Non
         broker_fill_id=_optional_str(fill.get("broker_fill_id")),
         symbol=symbol,
         side=side,
-        filled_at=_parse_timestamp(fill.get("filled_at"), fallback=datetime.now(UTC)),
+        filled_at=filled_at,
         price=price,
         quantity=quantity,
         base_quantity=base_quantity,
@@ -1307,14 +1702,39 @@ def _evidence_fields(payload: dict[str, object]) -> set[str]:
     return fields
 
 
-def _kis_order_timestamp(payload: dict[str, object]) -> str | None:
-    date_value = _optional_str(payload.get("ord_dt"))
-    time_value = _optional_str(payload.get("ord_tmd"))
-    if not date_value or not time_value:
+def _parse_authoritative_fill_timestamp(value: object) -> datetime | None:
+    """Parse only broker-origin timestamps with an explicit timezone.
+
+    A reconciliation/event observation time describes when Exec learned about
+    a fill, not when the broker executed it, so it is intentionally not a
+    fallback for canonical FIFO chronology.
+    """
+
+    if isinstance(value, datetime):
+        if value.tzinfo is None or value.utcoffset() is None:
+            return None
+        return value.astimezone(UTC)
+    if not isinstance(value, str) or not value.strip():
         return None
-    # KIS domestic order inquiry fields are Korea-local wall-clock values.
-    # Include the offset so repair fills do not reinterpret them as UTC.
-    return f"{date_value}{time_value}+0900"
+    text = value.strip()
+    candidates = (text.replace("Z", "+00:00"), text.replace(" ", "T"))
+    for candidate in candidates:
+        try:
+            parsed = datetime.fromisoformat(candidate)
+        except ValueError:
+            parsed = None
+        if parsed is not None and parsed.tzinfo is not None and parsed.utcoffset() is not None:
+            return parsed.astimezone(UTC)
+        for fmt in (
+            "%Y-%m-%dT%H:%M:%S.%f%z",
+            "%Y-%m-%dT%H:%M:%S%z",
+            "%Y%m%d%H%M%S%z",
+        ):
+            try:
+                return datetime.strptime(candidate, fmt).astimezone(UTC)
+            except ValueError:
+                continue
+    return None
 
 
 def _parse_timestamp(value: object, *, fallback: datetime) -> datetime:

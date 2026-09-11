@@ -5,7 +5,10 @@ from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 
 from app.api.dependencies import get_broker_adapter, get_db_session, get_settings
-from app.api.schemas.broker import BrokerSessionActionRequest
+from app.api.schemas.broker import (
+    BrokerSessionActionRequest,
+    BrokerSessionActionResponse,
+)
 from app.broker.base import BrokerAdapter
 from app.core.config import Settings
 from app.services.broker_auth import (
@@ -32,7 +35,10 @@ def broker_session(
     )
 
 
-@router.post("/session/authenticate")
+@router.post(
+    "/session/authenticate",
+    response_model=BrokerSessionActionResponse,
+)
 def authenticate_broker_session_handler(
     request: Request,
     db: Annotated[Session, Depends(get_db_session)],
@@ -51,10 +57,17 @@ def authenticate_broker_session_handler(
         ),
         adapter=adapter,
     )
-    return JSONResponse(status_code=result.status_code, content=result.payload)
+    response_payload = BrokerSessionActionResponse.model_validate(result.payload)
+    return JSONResponse(
+        status_code=result.status_code,
+        content=response_payload.model_dump(mode="json"),
+    )
 
 
-@router.post("/session/revoke")
+@router.post(
+    "/session/revoke",
+    response_model=BrokerSessionActionResponse,
+)
 def revoke_broker_session_handler(
     request: Request,
     db: Annotated[Session, Depends(get_db_session)],
@@ -73,4 +86,8 @@ def revoke_broker_session_handler(
         ),
         adapter=adapter,
     )
-    return JSONResponse(status_code=result.status_code, content=result.payload)
+    response_payload = BrokerSessionActionResponse.model_validate(result.payload)
+    return JSONResponse(
+        status_code=result.status_code,
+        content=response_payload.model_dump(mode="json"),
+    )

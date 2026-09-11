@@ -7,7 +7,6 @@ import os
 import sys
 from pathlib import Path
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 API_ROOT = REPO_ROOT / "apps" / "api"
 if str(API_ROOT) not in sys.path:
@@ -15,6 +14,9 @@ if str(API_ROOT) not in sys.path:
 
 from app.core.config import Settings  # noqa: E402
 from app.db.session import create_db_engine, create_session_factory  # noqa: E402
+from app.services.database_cli_security import (  # noqa: E402
+    reject_secret_database_url_argument,
+)
 from app.services.execution_fill_repair import (  # noqa: E402
     analyze_fifo_inventory_repairs,
     analyze_execution_fill_repairs,
@@ -35,7 +37,10 @@ def main() -> int:
     )
     parser.add_argument(
         "--database-url",
-        help="SQLAlchemy database URL. Defaults to KAI_EXEC_DATABASE_URL or Settings default.",
+        help=(
+            "Explicit non-secret SQLAlchemy database URL. Supply credential-bearing "
+            "URLs through KAI_EXEC_DATABASE_URL so they are not exposed in argv."
+        ),
     )
     parser.add_argument(
         "--runtime-mode",
@@ -73,12 +78,17 @@ def main() -> int:
         raise SystemExit("--apply requires --actor and --reason for auditability")
 
     runtime_mode = args.runtime_mode or os.getenv("KAI_EXEC_RUNTIME_MODE") or "mock"
-    if runtime_mode == "live" and not args.database_url:
-        raise SystemExit("live fill remediation requires --database-url explicitly")
+    reject_secret_database_url_argument(args.database_url)
+    environment_database_url = (os.getenv("KAI_EXEC_DATABASE_URL") or "").strip()
+    database_url = args.database_url or environment_database_url or None
+    if runtime_mode == "live" and not database_url:
+        raise SystemExit(
+            "live fill remediation requires KAI_EXEC_DATABASE_URL or --database-url"
+        )
 
     settings_kwargs: dict[str, object] = {}
-    if args.database_url:
-        settings_kwargs["database_url"] = args.database_url
+    if database_url:
+        settings_kwargs["database_url"] = database_url
     settings_kwargs["runtime_mode"] = runtime_mode
     settings = Settings(**settings_kwargs)
 

@@ -17,6 +17,7 @@ from app.broker.base import (
     BrokerReconnectHandle,
     BrokerTokenGrant,
 )
+from app.broker.error_safety import safe_broker_error_message
 from app.core.config import Settings
 from app.db.base import Base
 from app.db.session import create_db_engine, create_session_factory
@@ -29,9 +30,15 @@ from app.models.runtime import (
     ExecutionPosition,
     RuntimeRemediationEvent,
 )
+from app.services import position_truth_remediation as remediation_service
 from app.services.position_truth_remediation import (
     analyze_position_truth_remediation,
     apply_position_truth_remediation,
+)
+from app.services.position_identity import (
+    PositionIdentityConflictError,
+    build_position_identity,
+    execution_scope_payload,
 )
 
 
@@ -110,6 +117,17 @@ class PositionInquiryAdapter:
         )
 
 
+class LegacyAttributionAdapter(PositionInquiryAdapter):
+    def __init__(self, snapshot: BrokerAccountSnapshot) -> None:
+        super().__init__()
+        self.snapshot = snapshot
+        self.snapshot_requests: list[tuple[list[str] | None, str]] = []
+
+    def get_account_snapshot(self, access_token: str, *, symbols=None, exchange="KRX"):
+        self.snapshot_requests.append((symbols, exchange))
+        return self.snapshot
+
+
 def _session():
     settings = Settings(
         database_url="sqlite:///:memory:",
@@ -122,15 +140,60 @@ def _session():
     return settings, engine, session_factory, session_factory()
 
 
+def _scoped_position(
+    settings: Settings,
+    *,
+    exchange: str,
+    **values: object,
+) -> ExecutionPosition:
+    identity = build_position_identity(
+        settings=settings,
+        provider="kis",
+        exchange=exchange,
+    )
+    return ExecutionPosition(
+        provider=identity.provider,
+        account_scope=identity.account_scope,
+        exchange=identity.exchange,
+        **values,
+    )
+
+
+def _legacy_position(*, symbol: str, quantity: int, average_price: str) -> ExecutionPosition:
+    return ExecutionPosition(
+        mode="paper",
+        symbol=symbol,
+        quantity=quantity,
+        average_price=Decimal(average_price),
+        updated_from="reconciliation",
+        last_reconciled_at=NOW - timedelta(minutes=10),
+        raw_payload={"legacy_snapshot": True},
+    )
+
+
 def _add_filled_us_buy_order_event(
     db,
     *,
+    settings: Settings,
     symbol: str,
     exchange: str,
     suffix: str,
     side: str = "buy",
     status: str = "filled",
+    account_scope: str | None = None,
 ) -> BrokerOrder:
+    identity = build_position_identity(
+        settings=settings,
+        provider="kis",
+        exchange=exchange,
+    )
+    execution_scope = execution_scope_payload(
+        identity=identity,
+        venue="KIS",
+        asset_class="us_equity",
+    )
+    if account_scope is not None:
+        execution_scope["account_scope"] = account_scope
     order = BrokerOrder(
         broker_name="kis",
         mode="paper",
@@ -142,6 +205,10 @@ def _add_filled_us_buy_order_event(
         quantity=2,
         venue="kis",
         asset_class="us_equity",
+        request_metadata={
+            "exchange": exchange,
+            "execution_scope": execution_scope,
+        },
         submitted_at=NOW - timedelta(minutes=10),
     )
     db.add(order)
@@ -170,7 +237,9 @@ def test_position_truth_remediation_routes_supported_and_blocks_unknown(monkeypa
     old = NOW - timedelta(days=1)
     db.add_all(
         [
-            ExecutionPosition(
+            _scoped_position(
+                settings,
+                exchange="KRX",
                 mode="paper",
                 symbol="003550",
                 quantity=10,
@@ -178,7 +247,9 @@ def test_position_truth_remediation_routes_supported_and_blocks_unknown(monkeypa
                 updated_from="reconciliation",
                 last_reconciled_at=old,
             ),
-            ExecutionPosition(
+            _scoped_position(
+                settings,
+                exchange="NASD",
                 mode="paper",
                 symbol="APTX",
                 quantity=3,
@@ -187,7 +258,9 @@ def test_position_truth_remediation_routes_supported_and_blocks_unknown(monkeypa
                 last_reconciled_at=old,
                 raw_payload={"_position_sync": {"exchange": "NASD"}},
             ),
-            ExecutionPosition(
+            _scoped_position(
+                settings,
+                exchange="OTCB",
                 mode="paper",
                 symbol="AFIB",
                 quantity=4,
@@ -261,36 +334,12 @@ def test_missing_us_position_recovers_exchange_from_filled_order_event(
     exchange: str,
 ) -> None:
     settings, engine, session_factory, db = _session()
-    order = BrokerOrder(
-        broker_name="kis",
-        mode="paper",
-        idempotency_key=f"missing-{symbol.lower()}-position",
-        broker_order_id=f"broker-{symbol.lower()}-buy",
+    order = _add_filled_us_buy_order_event(
+        db,
+        settings=settings,
         symbol=symbol,
-        side="buy",
-        status="filled",
-        quantity=2,
-        venue="kis",
-        asset_class="us_equity",
-        submitted_at=NOW - timedelta(minutes=10),
-    )
-    db.add(order)
-    db.flush()
-    db.add(
-        BrokerOrderEvent(
-            broker_order_pk=order.id,
-            event_type="submit_requested",
-            event_source="submission",
-            request_payload={
-                "provider": "kis",
-                "venue": "kis",
-                "asset_class": "us_equity",
-                "symbol": symbol,
-                "side": "buy",
-                "exchange": exchange,
-            },
-            observed_at=NOW - timedelta(minutes=10),
-        )
+        exchange=exchange,
+        suffix="missing",
     )
     db.commit()
     adapter = PositionInquiryAdapter()
@@ -339,6 +388,29 @@ def test_missing_us_position_recovers_exchange_from_filled_order_event(
     engine.dispose()
 
 
+def test_missing_position_ignores_foreign_account_order_route() -> None:
+    settings, engine, _session_factory, db = _session()
+    _add_filled_us_buy_order_event(
+        db,
+        settings=settings,
+        symbol="AAPL",
+        exchange="NASD",
+        suffix="foreign-account",
+        account_scope="f" * 24,
+    )
+    db.commit()
+
+    dry_run = analyze_position_truth_remediation(settings=settings, db=db, now=NOW)
+
+    assert dry_run["summary"] == {
+        "candidate_count": 0,
+        "eligible_refresh_count": 0,
+        "manual_review_count": 0,
+    }
+    assert dry_run["items"] == []
+    engine.dispose()
+
+
 @pytest.mark.parametrize(
     ("symbol", "exchange", "status"),
     [
@@ -354,36 +426,13 @@ def test_missing_us_position_recovers_exchange_from_active_order_event(
     status: str,
 ) -> None:
     settings, engine, session_factory, db = _session()
-    order = BrokerOrder(
-        broker_name="kis",
-        mode="paper",
-        idempotency_key=f"active-{status}-{symbol.lower()}-position",
-        broker_order_id=f"active-{status}-{symbol.lower()}-buy",
+    order = _add_filled_us_buy_order_event(
+        db,
+        settings=settings,
         symbol=symbol,
-        side="buy",
+        exchange=exchange,
+        suffix=f"active-{status}",
         status=status,
-        quantity=2,
-        venue="kis",
-        asset_class="us_equity",
-        submitted_at=NOW - timedelta(minutes=10),
-    )
-    db.add(order)
-    db.flush()
-    db.add(
-        BrokerOrderEvent(
-            broker_order_pk=order.id,
-            event_type="submit_requested",
-            event_source="submission",
-            request_payload={
-                "provider": "kis",
-                "venue": "kis",
-                "asset_class": "us_equity",
-                "symbol": symbol,
-                "side": "buy",
-                "exchange": exchange,
-            },
-            observed_at=NOW - timedelta(minutes=10),
-        )
     )
     db.commit()
     adapter = PositionInquiryAdapter()
@@ -430,6 +479,7 @@ def test_missing_us_position_recovers_exchange_from_sell_order_event(
     settings, engine, session_factory, db = _session()
     order = _add_filled_us_buy_order_event(
         db,
+        settings=settings,
         symbol=symbol,
         exchange=exchange,
         suffix=f"active-sell-{status}",
@@ -470,7 +520,9 @@ def test_stale_us_position_recovers_exchange_from_filled_sell_order_event(
     settings, engine, session_factory, db = _session()
     old = NOW - timedelta(days=1)
     db.add(
-        ExecutionPosition(
+        _scoped_position(
+            settings,
+            exchange="NASD",
             mode="paper",
             symbol="AAPL",
             quantity=1,
@@ -482,6 +534,7 @@ def test_stale_us_position_recovers_exchange_from_filled_sell_order_event(
     )
     order = _add_filled_us_buy_order_event(
         db,
+        settings=settings,
         symbol="AAPL",
         exchange="NASD",
         suffix="filled-sell",
@@ -520,7 +573,9 @@ def test_missing_us_position_with_ambiguous_buy_and_sell_exchanges_fails_closed(
     settings, engine, session_factory, db = _session()
     old = NOW - timedelta(days=1)
     db.add(
-        ExecutionPosition(
+        _scoped_position(
+            settings,
+            exchange="UNKNOWN",
             mode="paper",
             symbol="AAPL",
             quantity=1,
@@ -532,6 +587,7 @@ def test_missing_us_position_with_ambiguous_buy_and_sell_exchanges_fails_closed(
     )
     _add_filled_us_buy_order_event(
         db,
+        settings=settings,
         symbol="AAPL",
         exchange="NASD",
         suffix="ambiguous-buy",
@@ -540,6 +596,7 @@ def test_missing_us_position_with_ambiguous_buy_and_sell_exchanges_fails_closed(
     )
     _add_filled_us_buy_order_event(
         db,
+        settings=settings,
         symbol="AAPL",
         exchange="NYSE",
         suffix="ambiguous-sell",
@@ -560,7 +617,7 @@ def test_missing_us_position_with_ambiguous_buy_and_sell_exchanges_fails_closed(
         now=NOW,
     )
 
-    assert dry_run["items"][0]["exchange"] is None
+    assert dry_run["items"][0]["exchange"] == "UNKNOWN"
     assert dry_run["items"][0]["eligible"] is False
     assert adapter.exchanges == []
     assert applied["summary"]["manual_review_count"] == 1
@@ -575,7 +632,9 @@ def test_existing_us_position_without_exchange_recovers_unique_filled_order_exch
 ) -> None:
     settings, engine, session_factory, db = _session()
     db.add(
-        ExecutionPosition(
+        _scoped_position(
+            settings,
+            exchange="NASD",
             mode="paper",
             symbol="AAPL",
             quantity=0,
@@ -587,6 +646,7 @@ def test_existing_us_position_without_exchange_recovers_unique_filled_order_exch
     )
     _add_filled_us_buy_order_event(
         db,
+        settings=settings,
         symbol="AAPL",
         exchange="NASD",
         suffix="existing",
@@ -624,7 +684,9 @@ def test_existing_us_position_with_ambiguous_order_exchanges_fails_closed() -> N
     settings, engine, session_factory, db = _session()
     old = NOW - timedelta(days=1)
     db.add(
-        ExecutionPosition(
+        _scoped_position(
+            settings,
+            exchange="UNKNOWN",
             mode="paper",
             symbol="AAPL",
             quantity=0,
@@ -636,12 +698,14 @@ def test_existing_us_position_with_ambiguous_order_exchanges_fails_closed() -> N
     )
     _add_filled_us_buy_order_event(
         db,
+        settings=settings,
         symbol="AAPL",
         exchange="NASD",
         suffix="ambiguous-nasd",
     )
     _add_filled_us_buy_order_event(
         db,
+        settings=settings,
         symbol="AAPL",
         exchange="NYSE",
         suffix="ambiguous-nyse",
@@ -660,7 +724,7 @@ def test_existing_us_position_with_ambiguous_order_exchanges_fails_closed() -> N
         now=NOW,
     )
 
-    assert dry_run["items"][0]["exchange"] is None
+    assert dry_run["items"][0]["exchange"] == "UNKNOWN"
     assert dry_run["items"][0]["eligible"] is False
     assert adapter.exchanges == []
     assert applied["summary"]["manual_review_count"] == 1
@@ -680,7 +744,9 @@ def test_position_truth_remediation_rolls_back_prior_exchange_when_later_inquiry
     old = NOW - timedelta(days=1)
     db.add_all(
         [
-            ExecutionPosition(
+            _scoped_position(
+                settings,
+                exchange="KRX",
                 mode="paper",
                 symbol="003550",
                 quantity=5,
@@ -688,7 +754,9 @@ def test_position_truth_remediation_rolls_back_prior_exchange_when_later_inquiry
                 updated_from="test",
                 last_reconciled_at=old,
             ),
-            ExecutionPosition(
+            _scoped_position(
+                settings,
+                exchange="NASD",
                 mode="paper",
                 symbol="APTX",
                 quantity=3,
@@ -753,7 +821,9 @@ def test_position_truth_remediation_preserves_issued_auth_when_later_inquiry_fai
                 token_type="Bearer",
                 access_token_expires_at=NOW - timedelta(hours=1),
             ),
-            ExecutionPosition(
+            _scoped_position(
+                settings,
+                exchange="KRX",
                 mode="paper",
                 symbol="003550",
                 quantity=5,
@@ -761,7 +831,9 @@ def test_position_truth_remediation_preserves_issued_auth_when_later_inquiry_fai
                 updated_from="test",
                 last_reconciled_at=old,
             ),
-            ExecutionPosition(
+            _scoped_position(
+                settings,
+                exchange="NASD",
                 mode="paper",
                 symbol="APTX",
                 quantity=3,
@@ -822,7 +894,9 @@ def test_position_truth_remediation_preserves_rejected_auth_audit(
     old = NOW - timedelta(days=1)
     with session_factory() as db:
         db.add(
-            ExecutionPosition(
+            _scoped_position(
+                settings,
+                exchange="KRX",
                 mode="paper",
                 symbol="003550",
                 quantity=5,
@@ -861,7 +935,10 @@ def test_position_truth_remediation_preserves_rejected_auth_audit(
         auth_events = verification_db.scalars(select(BrokerSessionEvent)).all()
         assert broker_session is not None
         assert broker_session.access_token is None
-        assert broker_session.last_error == "authentication rejected"
+        assert broker_session.last_error == safe_broker_error_message(
+            "authentication rejected"
+        )
+        assert "authentication rejected" not in broker_session.last_error
         assert len(auth_events) == 1
         assert auth_events[0].action == "authenticate"
         assert auth_events[0].outcome == "rejected"
@@ -869,7 +946,7 @@ def test_position_truth_remediation_preserves_rejected_auth_audit(
     engine.dispose()
 
 
-def test_live_position_remediation_requires_database_url_argument(tmp_path) -> None:
+def test_live_position_remediation_requires_explicit_database_url_source(tmp_path) -> None:
     result = subprocess.run(
         [
             sys.executable,
@@ -881,12 +958,12 @@ def test_live_position_remediation_requires_database_url_argument(tmp_path) -> N
         text=True,
         env={
             **os.environ,
-            "KAI_EXEC_DATABASE_URL": f"sqlite:///{tmp_path / 'must-not-open.db'}",
+            "KAI_EXEC_DATABASE_URL": "",
         },
     )
 
     assert result.returncode != 0
-    assert "requires --database-url explicitly" in result.stderr
+    assert "requires KAI_EXEC_DATABASE_URL or --database-url" in result.stderr
     assert not (tmp_path / "must-not-open.db").exists()
 
 
@@ -932,7 +1009,9 @@ def test_position_remediation_trims_applied_audit_metadata(tmp_path) -> None:
     session_factory = create_session_factory(engine)
     with session_factory() as db:
         db.add(
-            ExecutionPosition(
+            _scoped_position(
+                settings,
+                exchange="OTCB",
                 mode="paper",
                 symbol="AFIB",
                 quantity=4,
@@ -971,4 +1050,1200 @@ def test_position_remediation_trims_applied_audit_metadata(tmp_path) -> None:
         assert event is not None
         assert event.actor == "Peter"
         assert event.reason == "inspect unsupported route"
+    engine.dispose()
+
+
+def test_legacy_position_attribution_dry_run_proves_exact_matches_without_mutation(
+    monkeypatch,
+) -> None:
+    settings, engine, session_factory, db = _session()
+    settings = settings.model_copy(
+        update={"account_drawdown_recovery_scope_secret": "s" * 32}
+    )
+    exact = _legacy_position(
+        symbol="003550",
+        quantity=10,
+        average_price="250000",
+    )
+    another_exact = _legacy_position(
+        symbol="005930",
+        quantity=2,
+        average_price="80000",
+    )
+    mismatch = _legacy_position(
+        symbol="000660",
+        quantity=5,
+        average_price="120000",
+    )
+    db.add_all([exact, another_exact, mismatch])
+    db.commit()
+    snapshot = BrokerAccountSnapshot(
+        observed_at=NOW,
+        source="kis:account_snapshot",
+        holdings=[
+            BrokerAccountHolding(
+                symbol="003550",
+                quantity=10,
+                average_price=Decimal("250000"),
+            ),
+            BrokerAccountHolding(
+                symbol="005930",
+                quantity=2,
+                average_price=Decimal("80000"),
+            ),
+            BrokerAccountHolding(
+                symbol="000660",
+                quantity=6,
+                average_price=Decimal("120000"),
+            ),
+        ],
+        payload={"exchange": "KRX"},
+    )
+    adapter = LegacyAttributionAdapter(snapshot)
+    monkeypatch.setattr(
+        "app.services.position_truth_remediation.ensure_authenticated_broker_session",
+        lambda **kwargs: type("SessionState", (), {"access_token": "test-token"})(),
+    )
+
+    result = remediation_service.analyze_legacy_position_attribution(
+        settings=settings,
+        db=db,
+        auth_session_factory=session_factory,
+        adapter=adapter,
+        exchange="KRX",
+        now=NOW,
+    )
+
+    assert result["mode"] == "dry-run"
+    assert result["summary"] == {
+        "candidate_count": 3,
+        "eligible_count": 2,
+        "manual_review_count": 1,
+    }
+    by_symbol = {item["symbol"]: item for item in result["items"]}
+    assert by_symbol["003550"]["reason"] == "exact_broker_holding_match"
+    assert by_symbol["003550"]["evidence_fingerprint"]
+    assert by_symbol["005930"]["reason"] == "exact_broker_holding_match"
+    assert by_symbol["000660"]["reason"] == "quantity_mismatch"
+    assert by_symbol["000660"]["evidence_fingerprint"] is None
+    assert adapter.snapshot_requests == [
+        (["000660", "003550", "005930"], "KRX")
+    ]
+    db.expire_all()
+    assert all(
+        position.provider is None
+        and position.account_scope is None
+        and position.exchange is None
+        for position in db.scalars(select(ExecutionPosition)).all()
+    )
+    assert db.scalars(select(RuntimeRemediationEvent)).all() == []
+    db.close()
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("broker_quantity", "broker_average_price", "expected_reason"),
+    [
+        (9, Decimal("250000"), "quantity_mismatch"),
+        (10, Decimal("249999"), "average_price_mismatch"),
+        (10, None, "average_price_missing"),
+    ],
+)
+def test_legacy_position_attribution_requires_exact_quantity_and_average_price(
+    monkeypatch,
+    broker_quantity: int,
+    broker_average_price: Decimal | None,
+    expected_reason: str,
+) -> None:
+    settings, engine, session_factory, db = _session()
+    position = _legacy_position(
+        symbol="003550",
+        quantity=10,
+        average_price="250000",
+    )
+    db.add(position)
+    db.commit()
+    adapter = LegacyAttributionAdapter(
+        BrokerAccountSnapshot(
+            observed_at=NOW,
+            source="kis:account_snapshot",
+            holdings=[
+                BrokerAccountHolding(
+                    symbol="003550",
+                    quantity=broker_quantity,
+                    average_price=broker_average_price,
+                )
+            ],
+            payload={"exchange": "KRX"},
+        )
+    )
+    monkeypatch.setattr(
+        "app.services.position_truth_remediation.ensure_authenticated_broker_session",
+        lambda **kwargs: type("SessionState", (), {"access_token": "test-token"})(),
+    )
+
+    result = remediation_service.analyze_legacy_position_attribution(
+        settings=settings,
+        db=db,
+        auth_session_factory=session_factory,
+        adapter=adapter,
+        exchange="KRX",
+        now=NOW,
+    )
+
+    assert result["summary"]["eligible_count"] == 0
+    assert result["items"][0]["reason"] == expected_reason
+    assert result["items"][0]["evidence_fingerprint"] is None
+    assert db.get(ExecutionPosition, position.id).provider is None
+    db.close()
+    engine.dispose()
+
+
+def test_legacy_position_attribution_rejects_incomplete_holdings_snapshot(
+    monkeypatch,
+) -> None:
+    settings, engine, session_factory, db = _session()
+    position = _legacy_position(
+        symbol="003550",
+        quantity=10,
+        average_price="250000",
+    )
+    db.add(position)
+    db.commit()
+    adapter = LegacyAttributionAdapter(
+        BrokerAccountSnapshot(
+            observed_at=NOW,
+            source="kis:account_snapshot",
+            holdings=[
+                BrokerAccountHolding(
+                    symbol="003550",
+                    quantity=10,
+                    average_price=Decimal("250000"),
+                )
+            ],
+            holdings_complete=False,
+            diagnostics={"holdings_pagination": {"complete": False}},
+            payload={"exchange": "KRX", "holdings_coverage": "incomplete"},
+        )
+    )
+    monkeypatch.setattr(
+        "app.services.position_truth_remediation.ensure_authenticated_broker_session",
+        lambda **kwargs: type("SessionState", (), {"access_token": "test-token"})(),
+    )
+
+    with pytest.raises(BrokerAdapterError, match="holdings coverage is incomplete"):
+        remediation_service.analyze_legacy_position_attribution(
+            settings=settings,
+            db=db,
+            auth_session_factory=session_factory,
+            adapter=adapter,
+            exchange="KRX",
+            now=NOW,
+        )
+
+    db.expire_all()
+    persisted = db.get(ExecutionPosition, position.id)
+    assert persisted is not None
+    assert persisted.provider is None
+    assert persisted.account_scope is None
+    assert persisted.exchange is None
+    db.close()
+    engine.dispose()
+
+
+def test_legacy_position_attribution_rejects_duplicate_broker_holdings(
+    monkeypatch,
+) -> None:
+    settings, engine, session_factory, db = _session()
+    position = _legacy_position(
+        symbol="AAPL",
+        quantity=2,
+        average_price="200",
+    )
+    db.add(position)
+    db.commit()
+    adapter = LegacyAttributionAdapter(
+        BrokerAccountSnapshot(
+            observed_at=NOW,
+            source="kis:us_equity_account_snapshot",
+            holdings=[
+                BrokerAccountHolding(
+                    symbol="AAPL",
+                    quantity=2,
+                    average_price=Decimal("200"),
+                    payload={"exchange": "NASD"},
+                ),
+                BrokerAccountHolding(
+                    symbol="aapl",
+                    quantity=2,
+                    average_price=Decimal("200"),
+                    payload={"exchange": "NASD"},
+                ),
+            ],
+            payload={"exchange": "NASD"},
+        )
+    )
+    monkeypatch.setattr(
+        "app.services.position_truth_remediation.ensure_authenticated_broker_session",
+        lambda **kwargs: type("SessionState", (), {"access_token": "test-token"})(),
+    )
+
+    with pytest.raises(
+        PositionIdentityConflictError,
+        match="duplicate broker holding",
+    ):
+        remediation_service.analyze_legacy_position_attribution(
+            settings=settings,
+            db=db,
+            auth_session_factory=session_factory,
+            adapter=adapter,
+            exchange="NASD",
+            now=NOW,
+        )
+
+    db.expire_all()
+    persisted = db.get(ExecutionPosition, position.id)
+    assert persisted is not None
+    assert persisted.provider is None
+    assert persisted.account_scope is None
+    assert persisted.exchange is None
+    db.close()
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    "snapshot_observed_at",
+    [
+        NOW - timedelta(seconds=301),
+        NOW + timedelta(seconds=31),
+        NOW.replace(tzinfo=None),
+    ],
+)
+def test_legacy_position_attribution_requires_current_aware_snapshot(
+    monkeypatch,
+    snapshot_observed_at: datetime,
+) -> None:
+    settings, engine, session_factory, db = _session()
+    position = _legacy_position(
+        symbol="003550",
+        quantity=10,
+        average_price="250000",
+    )
+    db.add(position)
+    db.commit()
+    adapter = LegacyAttributionAdapter(
+        BrokerAccountSnapshot(
+            observed_at=snapshot_observed_at,
+            source="kis:account_snapshot",
+            holdings=[
+                BrokerAccountHolding(
+                    symbol="003550",
+                    quantity=10,
+                    average_price=Decimal("250000"),
+                )
+            ],
+            payload={"exchange": "KRX"},
+        )
+    )
+    monkeypatch.setattr(
+        "app.services.position_truth_remediation.ensure_authenticated_broker_session",
+        lambda **kwargs: type("SessionState", (), {"access_token": "test-token"})(),
+    )
+
+    with pytest.raises(BrokerAdapterError, match="snapshot is not current"):
+        remediation_service.analyze_legacy_position_attribution(
+            settings=settings,
+            db=db,
+            auth_session_factory=session_factory,
+            adapter=adapter,
+            exchange="KRX",
+            now=NOW,
+        )
+
+    db.expire_all()
+    persisted = db.get(ExecutionPosition, position.id)
+    assert persisted is not None
+    assert persisted.provider is None
+    assert persisted.account_scope is None
+    assert persisted.exchange is None
+    db.close()
+    engine.dispose()
+
+
+def test_legacy_position_attribution_rejects_missing_broker_provider(
+    monkeypatch,
+) -> None:
+    settings, engine, session_factory, db = _session()
+    db.add(_legacy_position(symbol="003550", quantity=10, average_price="250000"))
+    db.commit()
+    adapter = LegacyAttributionAdapter(
+        BrokerAccountSnapshot(
+            observed_at=NOW,
+            source="unknown:account_snapshot",
+            holdings=[
+                BrokerAccountHolding(
+                    symbol="003550",
+                    quantity=10,
+                    average_price=Decimal("250000"),
+                )
+            ],
+            payload={"exchange": "KRX"},
+        )
+    )
+    adapter.provider = ""
+    monkeypatch.setattr(
+        "app.services.position_truth_remediation.ensure_authenticated_broker_session",
+        lambda **kwargs: type("SessionState", (), {"access_token": "test-token"})(),
+    )
+
+    with pytest.raises(
+        PositionIdentityConflictError,
+        match="broker provider is unavailable",
+    ):
+        remediation_service.analyze_legacy_position_attribution(
+            settings=settings,
+            db=db,
+            auth_session_factory=session_factory,
+            adapter=adapter,
+            exchange="KRX",
+            now=NOW,
+        )
+
+    assert db.scalar(select(ExecutionPosition)).provider is None
+    db.close()
+    engine.dispose()
+
+
+def test_legacy_position_attribution_rejects_non_kis_route_semantics(
+    monkeypatch,
+) -> None:
+    settings, engine, session_factory, db = _session()
+    settings = settings.model_copy(
+        update={"account_drawdown_recovery_scope_secret": "s" * 32}
+    )
+    db.add(_legacy_position(symbol="AAPL", quantity=2, average_price="200"))
+    db.commit()
+    adapter = LegacyAttributionAdapter(
+        BrokerAccountSnapshot(
+            broker_account_id="alpaca-account-id",
+            observed_at=NOW,
+            source="alpaca:paper:us_equity",
+            holdings=[
+                BrokerAccountHolding(
+                    symbol="AAPL",
+                    quantity=2,
+                    average_price=Decimal("200"),
+                )
+            ],
+            payload={"asset_class": "us_equity"},
+        )
+    )
+    adapter.provider = "alpaca"
+    monkeypatch.setattr(
+        "app.services.position_truth_remediation.ensure_authenticated_broker_session",
+        lambda **kwargs: type("SessionState", (), {"access_token": "test-token"})(),
+    )
+
+    with pytest.raises(
+        PositionIdentityConflictError,
+        match="supports only KIS",
+    ):
+        remediation_service.analyze_legacy_position_attribution(
+            settings=settings,
+            db=db,
+            auth_session_factory=session_factory,
+            adapter=adapter,
+            exchange="NASD",
+            now=NOW,
+        )
+
+    assert db.scalar(select(ExecutionPosition)).provider is None
+    db.close()
+    engine.dispose()
+
+
+def test_legacy_position_attribution_rejects_snapshot_route_mismatch(
+    monkeypatch,
+) -> None:
+    settings, engine, session_factory, db = _session()
+    db.add(_legacy_position(symbol="AAPL", quantity=2, average_price="200"))
+    db.commit()
+    adapter = LegacyAttributionAdapter(
+        BrokerAccountSnapshot(
+            observed_at=NOW,
+            source="kis:us_equity_account_snapshot",
+            holdings=[
+                BrokerAccountHolding(
+                    symbol="AAPL",
+                    quantity=2,
+                    average_price=Decimal("200"),
+                    payload={"exchange": "NYSE"},
+                )
+            ],
+            payload={"exchange": "NYSE"},
+        )
+    )
+    monkeypatch.setattr(
+        "app.services.position_truth_remediation.ensure_authenticated_broker_session",
+        lambda **kwargs: type("SessionState", (), {"access_token": "test-token"})(),
+    )
+
+    with pytest.raises(
+        PositionIdentityConflictError,
+        match="snapshot exchange does not match",
+    ):
+        remediation_service.analyze_legacy_position_attribution(
+            settings=settings,
+            db=db,
+            auth_session_factory=session_factory,
+            adapter=adapter,
+            exchange="NASD",
+            now=NOW,
+        )
+
+    assert db.scalar(select(ExecutionPosition)).provider is None
+    db.close()
+    engine.dispose()
+
+
+def test_legacy_kis_position_attribution_requires_snapshot_route_proof(
+    monkeypatch,
+) -> None:
+    settings, engine, session_factory, db = _session()
+    db.add(_legacy_position(symbol="003550", quantity=10, average_price="250000"))
+    db.commit()
+    adapter = LegacyAttributionAdapter(
+        BrokerAccountSnapshot(
+            observed_at=NOW,
+            source="kis:account_snapshot",
+            holdings=[
+                BrokerAccountHolding(
+                    symbol="003550",
+                    quantity=10,
+                    average_price=Decimal("250000"),
+                )
+            ],
+            payload={"rt_cd": "0"},
+        )
+    )
+    monkeypatch.setattr(
+        "app.services.position_truth_remediation.ensure_authenticated_broker_session",
+        lambda **kwargs: type("SessionState", (), {"access_token": "test-token"})(),
+    )
+
+    with pytest.raises(
+        PositionIdentityConflictError,
+        match="snapshot exchange proof is unavailable",
+    ):
+        remediation_service.analyze_legacy_position_attribution(
+            settings=settings,
+            db=db,
+            auth_session_factory=session_factory,
+            adapter=adapter,
+            exchange="KRX",
+            now=NOW,
+        )
+
+    assert db.scalar(select(ExecutionPosition)).provider is None
+    db.close()
+    engine.dispose()
+
+
+def test_legacy_position_attribution_blocks_holding_route_mismatch(
+    monkeypatch,
+) -> None:
+    settings, engine, session_factory, db = _session()
+    position = _legacy_position(symbol="AAPL", quantity=2, average_price="200")
+    db.add(position)
+    db.commit()
+    adapter = LegacyAttributionAdapter(
+        BrokerAccountSnapshot(
+            observed_at=NOW,
+            source="kis:us_equity_account_snapshot",
+            holdings=[
+                BrokerAccountHolding(
+                    symbol="AAPL",
+                    quantity=2,
+                    average_price=Decimal("200"),
+                    payload={"ovrs_excg_cd": "NYSE"},
+                )
+            ],
+            payload={"exchange": "NASD"},
+        )
+    )
+    monkeypatch.setattr(
+        "app.services.position_truth_remediation.ensure_authenticated_broker_session",
+        lambda **kwargs: type("SessionState", (), {"access_token": "test-token"})(),
+    )
+
+    result = remediation_service.analyze_legacy_position_attribution(
+        settings=settings,
+        db=db,
+        auth_session_factory=session_factory,
+        adapter=adapter,
+        exchange="NASD",
+        now=NOW,
+    )
+
+    assert result["summary"]["eligible_count"] == 0
+    assert result["items"][0]["reason"] == "broker_holding_exchange_mismatch"
+    assert result["items"][0]["evidence_fingerprint"] is None
+    db.expire_all()
+    assert db.get(ExecutionPosition, position.id).provider is None
+    db.close()
+    engine.dispose()
+
+
+def test_legacy_us_position_attribution_requires_holding_exchange_proof(
+    monkeypatch,
+) -> None:
+    settings, engine, session_factory, db = _session()
+    position = _legacy_position(symbol="AAPL", quantity=2, average_price="200")
+    db.add(position)
+    db.commit()
+    adapter = LegacyAttributionAdapter(
+        BrokerAccountSnapshot(
+            observed_at=NOW,
+            source="kis:us_equity_account_snapshot",
+            holdings=[
+                BrokerAccountHolding(
+                    symbol="AAPL",
+                    quantity=2,
+                    average_price=Decimal("200"),
+                    payload={},
+                )
+            ],
+            payload={"exchange": "NASD"},
+        )
+    )
+    monkeypatch.setattr(
+        "app.services.position_truth_remediation.ensure_authenticated_broker_session",
+        lambda **kwargs: type("SessionState", (), {"access_token": "test-token"})(),
+    )
+
+    result = remediation_service.analyze_legacy_position_attribution(
+        settings=settings,
+        db=db,
+        auth_session_factory=session_factory,
+        adapter=adapter,
+        exchange="NASD",
+        now=NOW,
+    )
+
+    assert result["summary"]["eligible_count"] == 0
+    assert result["items"][0]["reason"] == "broker_holding_exchange_missing"
+    assert result["items"][0]["evidence_fingerprint"] is None
+    db.expire_all()
+    persisted = db.get(ExecutionPosition, position.id)
+    assert persisted is not None
+    assert persisted.provider is None
+    assert persisted.account_scope is None
+    assert persisted.exchange is None
+    db.close()
+    engine.dispose()
+
+
+def test_legacy_position_attribution_blocks_existing_target_route_collision(
+    monkeypatch,
+) -> None:
+    settings, engine, session_factory, db = _session()
+    legacy = _legacy_position(symbol="003550", quantity=10, average_price="250000")
+    scoped = _scoped_position(
+        settings,
+        exchange="KRX",
+        mode="paper",
+        symbol="003550",
+        quantity=10,
+        average_price=Decimal("250000"),
+        updated_from="reconciliation",
+        last_reconciled_at=NOW,
+    )
+    db.add_all([legacy, scoped])
+    db.commit()
+    adapter = LegacyAttributionAdapter(
+        BrokerAccountSnapshot(
+            observed_at=NOW,
+            source="kis:account_snapshot",
+            holdings=[
+                BrokerAccountHolding(
+                    symbol="003550",
+                    quantity=10,
+                    average_price=Decimal("250000"),
+                )
+            ],
+            payload={"exchange": "KRX"},
+        )
+    )
+    monkeypatch.setattr(
+        "app.services.position_truth_remediation.ensure_authenticated_broker_session",
+        lambda **kwargs: type("SessionState", (), {"access_token": "test-token"})(),
+    )
+
+    result = remediation_service.analyze_legacy_position_attribution(
+        settings=settings,
+        db=db,
+        auth_session_factory=session_factory,
+        adapter=adapter,
+        exchange="KRX",
+        now=NOW,
+    )
+
+    assert result["summary"]["eligible_count"] == 0
+    assert result["items"][0]["reason"] == "scoped_route_symbol_collision"
+    assert result["items"][0]["evidence_fingerprint"] is None
+    db.expire_all()
+    assert db.get(ExecutionPosition, legacy.id).provider is None
+    assert db.get(ExecutionPosition, scoped.id).provider == "kis"
+    db.close()
+    engine.dispose()
+
+
+def test_legacy_position_attribution_rejects_normalized_legacy_symbol_duplicates(
+    monkeypatch,
+) -> None:
+    settings, engine, session_factory, db = _session()
+    upper = _legacy_position(symbol="AAPL", quantity=2, average_price="200")
+    lower = _legacy_position(symbol="aapl", quantity=2, average_price="200")
+    db.add_all([upper, lower])
+    db.commit()
+    adapter = LegacyAttributionAdapter(
+        BrokerAccountSnapshot(
+            observed_at=NOW,
+            source="kis:us_equity_account_snapshot",
+            holdings=[
+                BrokerAccountHolding(
+                    symbol="AAPL",
+                    quantity=2,
+                    average_price=Decimal("200"),
+                    payload={"exchange": "NASD"},
+                )
+            ],
+            payload={"exchange": "NASD"},
+        )
+    )
+    monkeypatch.setattr(
+        "app.services.position_truth_remediation.ensure_authenticated_broker_session",
+        lambda **kwargs: type("SessionState", (), {"access_token": "test-token"})(),
+    )
+
+    with pytest.raises(
+        PositionIdentityConflictError,
+        match="duplicate legacy position symbol",
+    ):
+        remediation_service.analyze_legacy_position_attribution(
+            settings=settings,
+            db=db,
+            auth_session_factory=session_factory,
+            adapter=adapter,
+            exchange="NASD",
+            now=NOW,
+        )
+
+    assert adapter.snapshot_requests == []
+    db.expire_all()
+    assert all(
+        position.provider is None
+        for position in db.scalars(select(ExecutionPosition)).all()
+    )
+    db.close()
+    engine.dispose()
+
+
+def test_legacy_position_attribution_blocks_noncanonical_legacy_symbol(
+    monkeypatch,
+) -> None:
+    settings, engine, session_factory, db = _session()
+    position = _legacy_position(symbol="aapl", quantity=2, average_price="200")
+    db.add(position)
+    db.commit()
+    adapter = LegacyAttributionAdapter(
+        BrokerAccountSnapshot(
+            observed_at=NOW,
+            source="kis:us_equity_account_snapshot",
+            holdings=[
+                BrokerAccountHolding(
+                    symbol="AAPL",
+                    quantity=2,
+                    average_price=Decimal("200"),
+                    payload={"exchange": "NASD"},
+                )
+            ],
+            payload={"exchange": "NASD"},
+        )
+    )
+    monkeypatch.setattr(
+        "app.services.position_truth_remediation.ensure_authenticated_broker_session",
+        lambda **kwargs: type("SessionState", (), {"access_token": "test-token"})(),
+    )
+
+    result = remediation_service.analyze_legacy_position_attribution(
+        settings=settings,
+        db=db,
+        auth_session_factory=session_factory,
+        adapter=adapter,
+        exchange="NASD",
+        now=NOW,
+    )
+
+    assert result["summary"]["eligible_count"] == 0
+    assert result["items"][0]["reason"] == "legacy_symbol_not_canonical"
+    assert result["items"][0]["evidence_fingerprint"] is None
+    assert db.get(ExecutionPosition, position.id).provider is None
+    db.close()
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("symbol", "exchange"),
+    [("AAPL", "KRX"), ("003550", "NASD")],
+)
+def test_legacy_position_attribution_blocks_symbol_market_shape_mismatch(
+    monkeypatch,
+    symbol: str,
+    exchange: str,
+) -> None:
+    settings, engine, session_factory, db = _session()
+    position = _legacy_position(symbol=symbol, quantity=2, average_price="200")
+    db.add(position)
+    db.commit()
+    adapter = LegacyAttributionAdapter(
+        BrokerAccountSnapshot(
+            observed_at=NOW,
+            source="kis:account_snapshot",
+            holdings=[
+                BrokerAccountHolding(
+                    symbol=symbol,
+                    quantity=2,
+                    average_price=Decimal("200"),
+                    payload={"exchange": exchange},
+                )
+            ],
+            payload={"exchange": exchange},
+        )
+    )
+    monkeypatch.setattr(
+        "app.services.position_truth_remediation.ensure_authenticated_broker_session",
+        lambda **kwargs: type("SessionState", (), {"access_token": "test-token"})(),
+    )
+
+    result = remediation_service.analyze_legacy_position_attribution(
+        settings=settings,
+        db=db,
+        auth_session_factory=session_factory,
+        adapter=adapter,
+        exchange=exchange,
+        now=NOW,
+    )
+
+    assert result["summary"]["eligible_count"] == 0
+    assert result["items"][0]["reason"] == "symbol_exchange_incompatible"
+    assert result["items"][0]["evidence_fingerprint"] is None
+    assert db.get(ExecutionPosition, position.id).provider is None
+    db.close()
+    engine.dispose()
+
+
+def test_legacy_position_attribution_apply_binds_only_explicitly_approved_match(
+    monkeypatch,
+) -> None:
+    settings, engine, session_factory, db = _session()
+    settings = settings.model_copy(
+        update={"account_drawdown_recovery_scope_secret": "s" * 32}
+    )
+    approved = _legacy_position(
+        symbol="003550",
+        quantity=10,
+        average_price="250000",
+    )
+    unapproved = _legacy_position(
+        symbol="005930",
+        quantity=2,
+        average_price="80000",
+    )
+    mismatch = _legacy_position(
+        symbol="000660",
+        quantity=5,
+        average_price="120000",
+    )
+    db.add_all([approved, unapproved, mismatch])
+    db.commit()
+    adapter = LegacyAttributionAdapter(
+        BrokerAccountSnapshot(
+            observed_at=NOW,
+            source="kis:account_snapshot",
+            holdings=[
+                BrokerAccountHolding(
+                    symbol="003550",
+                    quantity=10,
+                    average_price=Decimal("250000"),
+                ),
+                BrokerAccountHolding(
+                    symbol="005930",
+                    quantity=2,
+                    average_price=Decimal("80000"),
+                ),
+                BrokerAccountHolding(
+                    symbol="000660",
+                    quantity=6,
+                    average_price=Decimal("120000"),
+                ),
+            ],
+            payload={"exchange": "KRX"},
+        )
+    )
+    monkeypatch.setattr(
+        "app.services.position_truth_remediation.ensure_authenticated_broker_session",
+        lambda **kwargs: type("SessionState", (), {"access_token": "test-token"})(),
+    )
+    dry_run = remediation_service.analyze_legacy_position_attribution(
+        settings=settings,
+        db=db,
+        auth_session_factory=session_factory,
+        adapter=adapter,
+        exchange="KRX",
+        now=NOW,
+    )
+    approved_item = next(
+        item for item in dry_run["items"] if item["position_id"] == approved.id
+    )
+
+    result = remediation_service.apply_legacy_position_attribution(
+        settings=settings,
+        db=db,
+        auth_session_factory=session_factory,
+        adapter=adapter,
+        exchange="KRX",
+        approved_evidence={
+            approved.id: str(approved_item["evidence_fingerprint"]),
+        },
+        actor="  Peter  ",
+        reason="  bind the broker-proven legacy position  ",
+        now=NOW,
+    )
+
+    assert result["mode"] == "apply"
+    assert result["summary"] == {
+        "approved_count": 1,
+        "attributed_count": 1,
+        "manual_review_count": 0,
+    }
+    db.expire_all()
+    attributed = db.get(ExecutionPosition, approved.id)
+    preserved_unapproved = db.get(ExecutionPosition, unapproved.id)
+    preserved_mismatch = db.get(ExecutionPosition, mismatch.id)
+    expected_identity = build_position_identity(
+        settings=settings,
+        provider="kis",
+        exchange="KRX",
+    )
+    assert attributed is not None
+    assert (
+        attributed.provider,
+        attributed.account_scope,
+        attributed.exchange,
+    ) == (
+        expected_identity.provider,
+        expected_identity.account_scope,
+        expected_identity.exchange,
+    )
+    assert attributed.quantity == 10
+    assert attributed.average_price == Decimal("250000.0000")
+    assert attributed.raw_payload["legacy_snapshot"] is True
+    assert attributed.raw_payload["_position_identity"] == expected_identity.as_payload()
+    assert preserved_unapproved is not None
+    assert preserved_unapproved.provider is None
+    assert preserved_mismatch is not None
+    assert preserved_mismatch.provider is None
+    events = db.scalars(select(RuntimeRemediationEvent)).all()
+    assert len(events) == 1
+    assert events[0].candidate_type == "legacy_position_attribution"
+    assert events[0].candidate_key == approved.id
+    assert events[0].outcome == "position_route_attributed"
+    assert events[0].actor == "Peter"
+    assert events[0].reason == "bind the broker-proven legacy position"
+    assert events[0].evidence_summary["evidence_fingerprint"] == approved_item[
+        "evidence_fingerprint"
+    ]
+    db.close()
+    engine.dispose()
+
+
+def test_legacy_position_attribution_does_not_overwrite_stored_route_identity(
+    monkeypatch,
+) -> None:
+    settings, engine, session_factory, db = _session()
+    foreign_identity = build_position_identity(
+        settings=settings.model_copy(
+            update={"execution_position_account_scope": "foreign-account"}
+        ),
+        provider="kis",
+        exchange="KRX",
+    )
+    position = _legacy_position(
+        symbol="003550",
+        quantity=10,
+        average_price="250000",
+    )
+    position.raw_payload = {
+        "_position_identity": foreign_identity.as_payload(),
+    }
+    db.add(position)
+    db.commit()
+    adapter = LegacyAttributionAdapter(
+        BrokerAccountSnapshot(
+            observed_at=NOW,
+            source="kis:account_snapshot",
+            holdings=[
+                BrokerAccountHolding(
+                    symbol="003550",
+                    quantity=10,
+                    average_price=Decimal("250000"),
+                )
+            ],
+            payload={"exchange": "KRX"},
+        )
+    )
+    monkeypatch.setattr(
+        "app.services.position_truth_remediation.ensure_authenticated_broker_session",
+        lambda **kwargs: type("SessionState", (), {"access_token": "test-token"})(),
+    )
+
+    result = remediation_service.analyze_legacy_position_attribution(
+        settings=settings,
+        db=db,
+        auth_session_factory=session_factory,
+        adapter=adapter,
+        exchange="KRX",
+        now=NOW,
+    )
+
+    assert result["summary"]["eligible_count"] == 0
+    assert result["items"][0]["reason"] == "stored_route_identity_present"
+    assert result["items"][0]["evidence_fingerprint"] is None
+    db.expire_all()
+    persisted = db.get(ExecutionPosition, position.id)
+    assert persisted.provider is None
+    assert persisted.raw_payload["_position_identity"] == foreign_identity.as_payload()
+    db.close()
+    engine.dispose()
+
+
+def test_legacy_position_attribution_rejects_provenance_drift_after_dry_run(
+    monkeypatch,
+) -> None:
+    settings, engine, session_factory, db = _session()
+    position = _legacy_position(
+        symbol="003550",
+        quantity=10,
+        average_price="250000",
+    )
+    db.add(position)
+    db.commit()
+    adapter = LegacyAttributionAdapter(
+        BrokerAccountSnapshot(
+            observed_at=NOW,
+            source="kis:account_snapshot",
+            holdings=[
+                BrokerAccountHolding(
+                    symbol="003550",
+                    quantity=10,
+                    average_price=Decimal("250000"),
+                )
+            ],
+            payload={"exchange": "KRX"},
+        )
+    )
+    monkeypatch.setattr(
+        "app.services.position_truth_remediation.ensure_authenticated_broker_session",
+        lambda **kwargs: type("SessionState", (), {"access_token": "test-token"})(),
+    )
+    dry_run = remediation_service.analyze_legacy_position_attribution(
+        settings=settings,
+        db=db,
+        auth_session_factory=session_factory,
+        adapter=adapter,
+        exchange="KRX",
+        now=NOW,
+    )
+    fingerprint = str(dry_run["items"][0]["evidence_fingerprint"])
+    position.updated_from = "manual_edit_after_review"
+    db.commit()
+
+    with pytest.raises(
+        PositionIdentityConflictError,
+        match="evidence no longer matches",
+    ):
+        remediation_service.apply_legacy_position_attribution(
+            settings=settings,
+            db=db,
+            auth_session_factory=session_factory,
+            adapter=adapter,
+            exchange="KRX",
+            approved_evidence={position.id: fingerprint},
+            actor="Peter",
+            reason="must re-review changed provenance",
+            now=NOW,
+        )
+
+    db.expire_all()
+    persisted = db.get(ExecutionPosition, position.id)
+    assert persisted is not None
+    assert persisted.provider is None
+    assert persisted.account_scope is None
+    assert persisted.exchange is None
+    assert db.scalars(select(RuntimeRemediationEvent)).all() == []
+    db.close()
+    engine.dispose()
+
+
+def test_legacy_position_attribution_rejects_quantity_semantics_drift(
+    monkeypatch,
+) -> None:
+    settings, engine, session_factory, db = _session()
+    position = _legacy_position(
+        symbol="003550",
+        quantity=10,
+        average_price="250000",
+    )
+    db.add(position)
+    db.commit()
+    adapter = LegacyAttributionAdapter(
+        BrokerAccountSnapshot(
+            observed_at=NOW,
+            source="kis:account_snapshot",
+            holdings=[
+                BrokerAccountHolding(
+                    symbol="003550",
+                    quantity=10,
+                    average_price=Decimal("250000"),
+                )
+            ],
+            payload={"exchange": "KRX"},
+        )
+    )
+    monkeypatch.setattr(
+        "app.services.position_truth_remediation.ensure_authenticated_broker_session",
+        lambda **kwargs: type("SessionState", (), {"access_token": "test-token"})(),
+    )
+    dry_run = remediation_service.analyze_legacy_position_attribution(
+        settings=settings,
+        db=db,
+        auth_session_factory=session_factory,
+        adapter=adapter,
+        exchange="KRX",
+        now=NOW,
+    )
+    fingerprint = str(dry_run["items"][0]["evidence_fingerprint"])
+    position.quantity = 0
+    position.base_quantity = Decimal("10")
+    db.commit()
+
+    with pytest.raises(
+        PositionIdentityConflictError,
+        match="evidence no longer matches",
+    ):
+        remediation_service.apply_legacy_position_attribution(
+            settings=settings,
+            db=db,
+            auth_session_factory=session_factory,
+            adapter=adapter,
+            exchange="KRX",
+            approved_evidence={position.id: fingerprint},
+            actor="Peter",
+            reason="quantity representation changed after review",
+            now=NOW,
+        )
+
+    db.expire_all()
+    persisted = db.get(ExecutionPosition, position.id)
+    assert persisted is not None
+    assert persisted.provider is None
+    assert persisted.quantity == 0
+    assert persisted.base_quantity == Decimal("10.000000000000")
+    db.close()
+    engine.dispose()
+
+
+def test_legacy_position_attribution_rejects_broker_drift_atomically(
+    monkeypatch,
+) -> None:
+    settings, engine, session_factory, db = _session()
+    first = _legacy_position(symbol="003550", quantity=10, average_price="250000")
+    second = _legacy_position(symbol="005930", quantity=2, average_price="80000")
+    db.add_all([first, second])
+    db.commit()
+    snapshot = BrokerAccountSnapshot(
+        observed_at=NOW,
+        source="kis:account_snapshot",
+        holdings=[
+            BrokerAccountHolding(
+                symbol="003550",
+                quantity=10,
+                average_price=Decimal("250000"),
+            ),
+            BrokerAccountHolding(
+                symbol="005930",
+                quantity=2,
+                average_price=Decimal("80000"),
+            ),
+        ],
+        payload={"exchange": "KRX"},
+    )
+    adapter = LegacyAttributionAdapter(snapshot)
+    monkeypatch.setattr(
+        "app.services.position_truth_remediation.ensure_authenticated_broker_session",
+        lambda **kwargs: type("SessionState", (), {"access_token": "test-token"})(),
+    )
+    dry_run = remediation_service.analyze_legacy_position_attribution(
+        settings=settings,
+        db=db,
+        auth_session_factory=session_factory,
+        adapter=adapter,
+        exchange="KRX",
+        now=NOW,
+    )
+    approvals = {
+        str(item["position_id"]): str(item["evidence_fingerprint"])
+        for item in dry_run["items"]
+    }
+    adapter.snapshot = BrokerAccountSnapshot(
+        observed_at=NOW,
+        source="kis:account_snapshot",
+        holdings=[
+            BrokerAccountHolding(
+                symbol="003550",
+                quantity=10,
+                average_price=Decimal("250000"),
+            ),
+            BrokerAccountHolding(
+                symbol="005930",
+                quantity=3,
+                average_price=Decimal("80000"),
+            ),
+        ],
+        payload={"exchange": "KRX"},
+    )
+
+    with pytest.raises(
+        PositionIdentityConflictError,
+        match="evidence no longer matches",
+    ):
+        remediation_service.apply_legacy_position_attribution(
+            settings=settings,
+            db=db,
+            auth_session_factory=session_factory,
+            adapter=adapter,
+            exchange="KRX",
+            approved_evidence=approvals,
+            actor="Peter",
+            reason="both rows were reviewed together",
+            now=NOW,
+        )
+
+    db.expire_all()
+    persisted = db.scalars(select(ExecutionPosition)).all()
+    assert len(persisted) == 2
+    assert all(position.provider is None for position in persisted)
+    assert db.scalars(select(RuntimeRemediationEvent)).all() == []
+    db.close()
     engine.dispose()

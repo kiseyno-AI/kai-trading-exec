@@ -17,7 +17,11 @@ from app.core.config import Settings
 from app.models.runtime import BrokerOrder, ExecutionPlan, ExecutionPlanItem, ExecutionPosition
 from app.services.broker_auth import ensure_authenticated_broker_session
 from app.services.broker_order_state import CAPITAL_RESERVING_ORDER_STATUSES
+from app.services.execution_account_route import classify_kis_account_route
+from app.services.fifo_inventory import fifo_route_scope_from_order
 from app.services.json_compaction import compact_json_object
+from app.services.plan_item_identity import select_plan_item_family_members
+from app.services.position_identity import build_position_identity
 
 SHORT_TERM_DECIDER_NAME = "short-term-decider"
 NEXT_OPEN_BUY_INTENT = "next_open_buy"
@@ -216,6 +220,22 @@ def apply_short_term_exec_agent_decisions(
             )
         return
 
+    if (
+        not account_snapshot.holdings_complete
+        or not account_snapshot.open_orders_complete
+    ):
+        for candidate in prepared_candidates:
+            _reject(
+                item=candidate.item,
+                reason="account_state_incomplete",
+                details={
+                    "holdings_complete": account_snapshot.holdings_complete,
+                    "open_orders_complete": account_snapshot.open_orders_complete,
+                    "diagnostics": dict(account_snapshot.diagnostics),
+                },
+            )
+        return
+
     remaining_cash = _minimum_decimal(
         account_snapshot.available_cash,
         account_snapshot.buying_power,
@@ -326,8 +346,18 @@ def _load_local_account_state(
     settings: Settings,
     db: Session,
 ) -> LocalAccountState:
+    identity = build_position_identity(
+        settings=settings,
+        provider="kis",
+        exchange="KRX",
+    )
     positions = db.scalars(
-        select(ExecutionPosition).where(ExecutionPosition.mode == settings.runtime_mode)
+        select(ExecutionPosition).where(
+            ExecutionPosition.mode == settings.runtime_mode,
+            ExecutionPosition.provider == identity.provider,
+            ExecutionPosition.account_scope == identity.account_scope,
+            ExecutionPosition.exchange == identity.exchange,
+        )
     ).all()
     orders = db.scalars(
         select(BrokerOrder).where(
@@ -336,6 +366,19 @@ def _load_local_account_state(
             BrokerOrder.status.in_(tuple(OPEN_BUY_ORDER_STATUSES)),
         )
     ).all()
+    scoped_orders: list[BrokerOrder] = []
+    for order in orders:
+        route_scope = fifo_route_scope_from_order(order)
+        if (
+            route_scope is None
+            or (
+                route_scope.provider == identity.provider
+                and route_scope.account_scope == identity.account_scope
+                and route_scope.exchange == identity.exchange
+            )
+        ):
+            scoped_orders.append(order)
+    orders = scoped_orders
     plan_items = db.scalars(
         select(ExecutionPlanItem)
         .join(ExecutionPlanItem.plan)
@@ -346,6 +389,17 @@ def _load_local_account_state(
             ExecutionPlanItem.status.in_(tuple(ACTIVE_SOURCE_STATUSES)),
         )
     ).all()
+    plan_items = [
+        item
+        for item in plan_items
+        if classify_kis_account_route(
+            settings=settings,
+            provider=item.provider,
+            risk_context=item.risk_context,
+            quantity_policy=item.quantity_policy,
+        )
+        != "foreign"
+    ]
     return LocalAccountState(
         positions_by_symbol={
             position.symbol: position.quantity
@@ -382,8 +436,18 @@ def _target_stop_context(
         and sibling.side == "sell"
         and sibling.intent in {"target_sell", "stop_sell"}
     ]
-    target_items = [sibling for sibling in sibling_items if sibling.intent == "target_sell"]
-    stop_items = [sibling for sibling in sibling_items if sibling.intent == "stop_sell"]
+    target_items = select_plan_item_family_members(
+        anchor=item,
+        candidates=[
+            sibling for sibling in sibling_items if sibling.intent == "target_sell"
+        ],
+    )
+    stop_items = select_plan_item_family_members(
+        anchor=item,
+        candidates=[
+            sibling for sibling in sibling_items if sibling.intent == "stop_sell"
+        ],
+    )
     return TargetStopContext(
         target_price=_first_decimal_from_item(item, TARGET_PRICE_KEYS),
         stop_price=_first_decimal_from_item(item, STOP_PRICE_KEYS),
@@ -669,6 +733,11 @@ def _new_monitoring_item(
             "kind": "shares",
             "quantity": quantity,
             "source": EXEC_AGENT_NAME,
+            **(
+                {"linked_entry_item_key": entry_item.source_plan_item_id}
+                if entry_item.source_plan_item_id
+                else {}
+            ),
         },
         trigger_price=trigger_price,
         time_in_force=entry_item.time_in_force,
@@ -700,6 +769,11 @@ def _link_monitoring_item(
             "kind": "shares",
             "quantity": quantity,
             "source": EXEC_AGENT_NAME,
+            **(
+                {"linked_entry_item_key": entry_item.source_plan_item_id}
+                if entry_item.source_plan_item_id
+                else {}
+            ),
         }
     elif isinstance(monitor_item.quantity_policy, dict) and monitor_item.quantity_policy.get("kind") == "shares":
         monitor_quantity = _parse_positive_int(monitor_item.quantity_policy.get("quantity"))
@@ -712,6 +786,10 @@ def _link_monitoring_item(
 
     risk_context = _risk_context(monitor_item)
     risk_context.setdefault("exchange", _exchange(entry_item))
+    if entry_item.source_plan_item_id:
+        quantity_policy = dict(monitor_item.quantity_policy or {})
+        quantity_policy["linked_entry_item_key"] = entry_item.source_plan_item_id
+        monitor_item.quantity_policy = quantity_policy
     risk_context["entry_context"] = {
         "source_plan_item_id": entry_item.source_plan_item_id,
         "decision_run_id": entry_item.decision_run_id,

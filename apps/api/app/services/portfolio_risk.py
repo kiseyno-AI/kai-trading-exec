@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from collections.abc import Iterable
@@ -15,9 +15,19 @@ from app.broker.base import (
     BrokerAccountPosition,
     BrokerAccountSnapshot,
     BrokerAdapter,
+    BrokerAdapterError,
+    BrokerSymbolBuyingPower,
 )
+from app.broker.kis import KisBrokerAdapter
 from app.core.config import Settings
-from app.models.runtime import BrokerOrder, BrokerSession, ExecutionPlan, ExecutionPlanItem, ExecutionPosition
+from app.models.runtime import (
+    BrokerOrder,
+    BrokerSession,
+    ExecutionPlan,
+    ExecutionPlanItem,
+    ExecutionPosition,
+)
+from app.services.broker_auth import ensure_authenticated_broker_session
 from app.services.broker_raw_holdings import (
     broker_raw_balance_is_fresh,
     broker_raw_balance_is_valid,
@@ -32,6 +42,21 @@ from app.services.broker_order_state import (
     active_local_broker_order_filters,
 )
 from app.services.fill_economics import settlement_currency_for_order
+from app.services.fifo_inventory import fifo_route_scope_from_order
+from app.services.execution_account_route import (
+    configured_kis_route_fingerprint,
+    kis_account_route_binding_from_payloads,
+    validate_execution_account_scope,
+    validate_kis_account_route,
+)
+from app.services.position_identity import (
+    EXECUTION_SCOPE_POLICY_VERSION,
+    PositionIdentity,
+    PositionIdentityConflictError,
+    build_authenticated_broker_position_identity,
+    build_position_identity,
+)
+from app.services.plan_item_identity import plan_item_entry_family_key
 
 TOP_SYMBOL_ALLOCATION_WARNING_PCT = Decimal("0.30")
 TOP_THREE_ALLOCATION_WARNING_PCT = Decimal("0.60")
@@ -41,13 +66,13 @@ CURRENCY_HINT_HISTORY_PER_SYMBOL = 3
 STOP_MONITOR_INTENTS = {"stop_sell", "target_sell", "max_holding_close_sell"}
 ACTIVE_MONITORING_STATUSES = (
     "target_sell_monitoring",
-    "target_sell_pending_dispatch",
+    "target_sell_triggered_pending_dispatch",
     "target_sell_triggered_blocked",
     "stop_sell_monitoring",
-    "stop_sell_pending_dispatch",
+    "stop_sell_triggered_pending_dispatch",
     "stop_sell_triggered_blocked",
     "max_holding_close_sell_monitoring",
-    "max_holding_close_sell_pending_dispatch",
+    "max_holding_close_sell_triggered_pending_dispatch",
     "max_holding_close_sell_triggered_blocked",
 )
 
@@ -88,6 +113,20 @@ class SymbolRiskMetadataHint:
     account_exchange: str | None
     exchange_source: str | None
     position_market_value: Decimal | None
+
+
+@dataclass(frozen=True)
+class PortfolioPositionScope:
+    identity: PositionIdentity
+    exchanges: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class StopFamilyRiskMetadata:
+    family_key: str
+    item: ExecutionPlanItem
+    stop_price: Decimal
+    protected_units: Decimal | None
 
 
 def infer_settlement_currency(
@@ -242,6 +281,7 @@ def load_symbol_risk_metadata_hints(
     settings: Settings,
     db: Session,
     symbols: Iterable[str],
+    position_scope: PortfolioPositionScope | None = None,
 ) -> dict[str, SymbolRiskMetadataHint]:
     normalized_symbols = sorted(
         {str(symbol).strip() for symbol in symbols if str(symbol).strip()}
@@ -255,7 +295,9 @@ def load_symbol_risk_metadata_hints(
     exchange_candidates: dict[str, dict[str, str]] = {
         symbol: {} for symbol in normalized_symbols
     }
-    position_market_values: dict[str, Decimal | None] = {}
+    position_market_value_candidates: dict[str, list[Decimal]] = {
+        symbol: [] for symbol in normalized_symbols
+    }
 
     for symbol in normalized_symbols:
         _record_symbol_metadata_candidates(
@@ -264,26 +306,67 @@ def load_symbol_risk_metadata_hints(
             exchange_candidates=exchange_candidates,
         )
 
-    position_rows = db.execute(
-        select(ExecutionPosition.symbol, ExecutionPosition.raw_payload)
-        .where(
-            ExecutionPosition.mode == settings.runtime_mode,
-            ExecutionPosition.symbol.in_(normalized_symbols),
+    position_where = [
+        ExecutionPosition.mode == settings.runtime_mode,
+        ExecutionPosition.provider.is_not(None),
+        ExecutionPosition.account_scope.is_not(None),
+        ExecutionPosition.exchange.is_not(None),
+        ExecutionPosition.symbol.in_(normalized_symbols),
+    ]
+    if position_scope is not None:
+        position_where.extend(
+            [
+                ExecutionPosition.provider == position_scope.identity.provider,
+                ExecutionPosition.account_scope
+                == position_scope.identity.account_scope,
+                ExecutionPosition.exchange.in_(position_scope.exchanges),
+            ]
         )
-        .order_by(ExecutionPosition.symbol.asc())
-        .limit(len(normalized_symbols))
+    ranked_positions = (
+        select(
+            ExecutionPosition.symbol.label("symbol"),
+            ExecutionPosition.provider.label("provider"),
+            ExecutionPosition.exchange.label("exchange"),
+            ExecutionPosition.raw_payload.label("raw_payload"),
+            func.row_number()
+            .over(
+                partition_by=ExecutionPosition.symbol,
+                order_by=(
+                    ExecutionPosition.updated_at.desc(),
+                    ExecutionPosition.id.desc(),
+                ),
+            )
+            .label("row_number"),
+        )
+        .where(*position_where)
+        .subquery()
+    )
+    position_rows = db.execute(
+        select(
+            ranked_positions.c.symbol,
+            ranked_positions.c.provider,
+            ranked_positions.c.exchange,
+            ranked_positions.c.raw_payload,
+        )
+        .where(ranked_positions.c.row_number <= CURRENCY_HINT_HISTORY_PER_SYMBOL)
+        .order_by(ranked_positions.c.symbol.asc())
+        .limit(len(normalized_symbols) * CURRENCY_HINT_HISTORY_PER_SYMBOL)
     ).all()
-    for symbol, raw_payload in position_rows:
+    for symbol, provider, exchange, raw_payload in position_rows:
         _record_symbol_metadata_candidates(
             symbol=symbol,
             payloads=(("execution_position.raw_payload", raw_payload),),
+            provider=provider,
+            venue=exchange,
             currency_candidates=currency_candidates,
             exchange_candidates=exchange_candidates,
         )
-        position_market_values[symbol] = _decimal_from_payload(
+        market_value = _decimal_from_payload(
             raw_payload,
             ("market_value", "valuation", "evaluated_amount", "evlu_amt"),
         )
+        if market_value is not None:
+            position_market_value_candidates[str(symbol)].append(market_value)
 
     history_symbols = _symbols_needing_metadata_fallback(
         symbols=normalized_symbols,
@@ -294,6 +377,7 @@ def load_symbol_risk_metadata_hints(
         settings=settings,
         db=db,
         symbols=history_symbols,
+        position_scope=position_scope,
     ):
         _record_symbol_metadata_candidates(
             symbol=order.symbol,
@@ -309,10 +393,14 @@ def load_symbol_risk_metadata_hints(
             exchange_candidates=exchange_candidates,
         )
 
-    plan_symbols = _symbols_needing_metadata_fallback(
-        symbols=history_symbols,
-        currency_candidates=currency_candidates,
-        exchange_candidates=exchange_candidates,
+    plan_symbols = (
+        []
+        if position_scope is not None
+        else _symbols_needing_metadata_fallback(
+            symbols=history_symbols,
+            currency_candidates=currency_candidates,
+            exchange_candidates=exchange_candidates,
+        )
     )
     for item in _bounded_recent_plan_items(
         settings=settings,
@@ -344,9 +432,10 @@ def load_symbol_risk_metadata_hints(
                 exchange_candidates[symbol],
                 conflict_source="conflicting_account_exchange_metadata",
             ),
-            position_market_value=position_market_values.get(symbol),
+            position_market_value=values[0] if len(set(values)) == 1 else None,
         )
         for symbol in normalized_symbols
+        for values in [position_market_value_candidates[symbol]]
     }
 
 
@@ -376,6 +465,7 @@ def _bounded_recent_broker_orders(
     settings: Settings,
     db: Session,
     symbols: list[str],
+    position_scope: PortfolioPositionScope | None = None,
 ) -> list[BrokerOrder]:
     if not symbols:
         return []
@@ -399,7 +489,7 @@ def _bounded_recent_broker_orders(
         )
         .subquery()
     )
-    return list(
+    orders = list(
         db.scalars(
             select(BrokerOrder)
             .join(
@@ -429,6 +519,16 @@ def _bounded_recent_broker_orders(
             .limit(len(symbols) * CURRENCY_HINT_HISTORY_PER_SYMBOL)
         )
     )
+    if position_scope is None:
+        return orders
+    return [
+        order
+        for order in orders
+        if _order_matches_position_scope(
+            order=order,
+            position_scope=position_scope,
+        )
+    ]
 
 
 def _bounded_recent_plan_items(
@@ -637,6 +737,72 @@ def _degrade_for_partial_snapshot_scope(
     return degraded
 
 
+def _portfolio_position_scope(
+    *,
+    settings: Settings,
+    adapter: BrokerAdapter | None,
+    market_scope: str,
+) -> tuple[PortfolioPositionScope | None, str | None]:
+    if adapter is None:
+        return None, "broker_adapter_unavailable_for_position_scope"
+    try:
+        provider = _normalized_provider(adapter.describe().provider)
+    except Exception:
+        return None, "broker_provider_unavailable_for_position_scope"
+    if provider == "kis":
+        exchanges = (
+            ("KRX",)
+            if market_scope == "krx"
+            else ("AMEX", "NASD", "NYSE")
+            if market_scope == "us"
+            else ("KRX", "AMEX", "NASD", "NYSE")
+        )
+    elif provider == "alpaca":
+        if market_scope == "krx":
+            return None, "broker_provider_does_not_support_requested_market_scope"
+        exchanges = ("ALPACA", "US")
+    elif provider == "upbit":
+        if market_scope in {"krx", "us"}:
+            return None, "broker_provider_does_not_support_requested_market_scope"
+        exchanges = ("UPBIT",)
+    else:
+        return None, "unsupported_broker_provider_for_position_scope"
+    broker_account_id: str | None = None
+    if provider == "alpaca":
+        account_id_loader = getattr(adapter, "get_broker_account_id", None)
+        if not callable(account_id_loader):
+            return None, "authenticated_account_identity_unavailable"
+        try:
+            raw_account_id = account_id_loader("")
+        except Exception:
+            return None, "authenticated_account_identity_unavailable"
+        broker_account_id = (
+            raw_account_id.strip()
+            if isinstance(raw_account_id, str) and raw_account_id.strip()
+            else None
+        )
+        if broker_account_id is None:
+            return None, "authenticated_account_identity_unavailable"
+    try:
+        identity = (
+            build_authenticated_broker_position_identity(
+                settings=settings,
+                provider=provider,
+                exchange=exchanges[0],
+                broker_account_id=broker_account_id or "",
+            )
+            if provider == "alpaca"
+            else build_position_identity(
+                settings=settings,
+                provider=provider,
+                exchange=exchanges[0],
+            )
+        )
+    except PositionIdentityConflictError:
+        return None, "stable_position_account_scope_unavailable"
+    return PortfolioPositionScope(identity=identity, exchanges=exchanges), None
+
+
 def build_portfolio_risk_snapshot(
     *,
     settings: Settings,
@@ -646,16 +812,34 @@ def build_portfolio_risk_snapshot(
     market_scope: str = "all",
 ) -> dict[str, object]:
     generated_at = now or datetime.now(UTC)
-    all_positions = _load_positions(settings=settings, db=db)
+    position_scope, position_scope_reason = _portfolio_position_scope(
+        settings=settings,
+        adapter=adapter,
+        market_scope=market_scope,
+    )
+    try:
+        all_positions = (
+            _load_positions(
+                settings=settings,
+                db=db,
+                position_scope=position_scope,
+            )
+            if position_scope is not None
+            else []
+        )
+    except PositionIdentityConflictError:
+        all_positions = []
+        position_scope_reason = "ambiguous_same_symbol_position_routes"
     active_positions = [
         position
         for position in all_positions
         if position.quantity > 0
         or (position.base_quantity is not None and position.base_quantity > 0)
     ]
-    local_open_orders = _load_local_open_orders(
+    local_open_orders, local_open_order_scope = _load_local_open_orders(
         settings=settings,
         db=db,
+        position_scope=position_scope,
         now=generated_at,
     )
     local_symbols = sorted(
@@ -668,6 +852,7 @@ def build_portfolio_risk_snapshot(
         settings=settings,
         db=db,
         symbols=local_symbols,
+        position_scope=position_scope,
     )
     local_positions = _load_local_holdings(
         positions=active_positions,
@@ -698,20 +883,47 @@ def build_portfolio_risk_snapshot(
         else []
     )
     if snapshot is not None and raw_holdings:
+        original_snapshot = snapshot
         snapshot = snapshot_with_raw_balance_holdings(
             snapshot,
             as_of=raw_balance_freshness_as_of,
             max_age_seconds=settings.exec_agent_max_account_snapshot_age_seconds,
         )
-    raw_drift = raw_vs_normalized_position_drift(
-        raw_holdings=raw_holdings,
-        positions=all_positions,
+        if snapshot is not original_snapshot:
+            snapshot = replace(
+                snapshot,
+                positions=original_snapshot.positions,
+                holdings_complete=original_snapshot.holdings_complete,
+                open_orders_complete=original_snapshot.open_orders_complete,
+                diagnostics=original_snapshot.diagnostics,
+                broker_account_id=original_snapshot.broker_account_id,
+            )
+    snapshot_exchanges = {
+        exchange.strip().upper()
+        for exchange in str(account_status.get("exchange") or "").split(",")
+        if exchange.strip()
+    }
+    raw_drift_scope_available = bool(
+        position_scope is not None
+        and len(snapshot_exchanges) == 1
+        and all(
+            str(position.exchange or "").strip().upper() in snapshot_exchanges
+            for position in all_positions
+        )
+    )
+    raw_drift = (
+        raw_vs_normalized_position_drift(
+            raw_holdings=raw_holdings,
+            positions=all_positions,
+        )
+        if raw_drift_scope_available
+        else []
     )
 
     snapshot_holdings = _holdings_from_snapshot(snapshot) if snapshot is not None else []
     holdings = (
         _merge_holdings(snapshot_holdings, local_positions)
-        if account_status["status"] == "partial"
+        if snapshot is not None and not snapshot.holdings_complete
         else snapshot_holdings
         if snapshot is not None
         else local_positions
@@ -806,8 +1018,16 @@ def build_portfolio_risk_snapshot(
         total_market_value=total_market_value,
         aggregation_available=exposure_currency_state["status"] == "available",
     )
-    stop_metadata = _load_stop_metadata(settings=settings, db=db)
-    stop_risk_payload = _estimated_stop_risk_payload(holdings=holdings, stop_metadata=stop_metadata)
+    stop_metadata, stop_metadata_scope = _load_stop_metadata(
+        settings=settings,
+        db=db,
+        position_scope=position_scope,
+    )
+    stop_risk_payload = _estimated_stop_risk_payload(
+        holdings=holdings,
+        stop_metadata=stop_metadata,
+        ambiguous_symbols=set(stop_metadata_scope["ambiguous_family_symbols"]),
+    )
     known_stop_risk_count = sum(
         _decimal_or_none(row.get("estimated_risk")) is not None
         for row in stop_risk_payload
@@ -841,7 +1061,12 @@ def build_portfolio_risk_snapshot(
         db=db,
         now=generated_at,
     )
-    stale_order_warnings = _stale_order_warnings(settings=settings, db=db, now=generated_at)
+    stale_order_warnings, stale_order_scope = _stale_order_warnings(
+        settings=settings,
+        db=db,
+        position_scope=position_scope,
+        now=generated_at,
+    )
     concentration_warnings = _concentration_warnings(
         holdings_payload=holdings_payload,
         exposures_payload=exposures_payload,
@@ -857,6 +1082,7 @@ def build_portfolio_risk_snapshot(
 
     source_status = _source_status(
         account_status=account_status,
+        local_open_order_scope=local_open_order_scope,
         holdings=holdings,
         open_orders=open_orders,
     )
@@ -884,6 +1110,16 @@ def build_portfolio_risk_snapshot(
             "snapshot_status": account_status["status"],
             "snapshot_reason": account_status["reason"],
             "snapshot_exchange": account_status.get("exchange"),
+            "holdings_complete": (
+                snapshot.holdings_complete if snapshot is not None else None
+            ),
+            "open_orders_complete": (
+                snapshot.open_orders_complete if snapshot is not None else None
+            ),
+            "position_scope_status": (
+                "ok" if position_scope_reason is None else "unavailable"
+            ),
+            "position_scope_reason": position_scope_reason,
         },
         "holdings": {
             "open_count": len(holdings),
@@ -899,12 +1135,23 @@ def build_portfolio_risk_snapshot(
                 "holdings": [broker_raw_holding_payload(holding) for holding in raw_holdings],
                 "normalized_drift_count": len(raw_drift),
                 "normalized_drift": raw_drift,
+                "normalized_drift_scope_status": (
+                    "available" if raw_drift_scope_available else "unavailable"
+                ),
             },
         },
         "open_orders": {
             "open_count": len(open_orders),
             "top_by_notional": open_orders_payload,
             "by_currency": _open_order_subtotals_by_currency(open_orders),
+            "scope_status": local_open_order_scope["status"],
+            "scope_reason": local_open_order_scope["reason"],
+            "excluded_missing_or_invalid_scope_count": local_open_order_scope[
+                "excluded_missing_or_invalid_scope_count"
+            ],
+            "excluded_other_route_count": local_open_order_scope[
+                "excluded_other_route_count"
+            ],
         },
         "exposures": {
             "by_symbol": exposures_payload,
@@ -920,6 +1167,14 @@ def build_portfolio_risk_snapshot(
             "settlement_currency": stop_currency_state["aggregate_currency"],
             "by_currency": _stop_risk_subtotals_by_currency(stop_risk_payload),
             "currency_aggregation": stop_currency_state,
+            "scope_status": stop_metadata_scope["status"],
+            "scope_reason": stop_metadata_scope["reason"],
+            "excluded_missing_or_invalid_scope_count": stop_metadata_scope[
+                "excluded_missing_or_invalid_scope_count"
+            ],
+            "excluded_other_route_count": stop_metadata_scope[
+                "excluded_other_route_count"
+            ],
         },
         "warnings": {
             "concentration": concentration_warnings,
@@ -930,6 +1185,7 @@ def build_portfolio_risk_snapshot(
                 "max_age_seconds": freshness["max_age_seconds"],
             },
             "stale_orders": stale_order_warnings,
+            "stale_order_scope": stale_order_scope,
         },
     }
 
@@ -963,16 +1219,37 @@ def _load_account_snapshot_if_available(
             "reason": config.reason or "broker provider is not configured",
             "exchange": None,
         }
-    session = db.get(BrokerSession, f"{config.provider}:{config.mode}")
-    if session is None or not session.access_token:
-        return None, {
-            "status": "missing",
-            "reason": "no reusable broker access token is stored",
-            "exchange": None,
-        }
-    if session.access_token_expires_at is not None:
-        expires_at = _as_utc(session.access_token_expires_at)
-        if expires_at <= datetime.now(UTC) + timedelta(minutes=5):
+    if isinstance(adapter, KisBrokerAdapter):
+        try:
+            session = ensure_authenticated_broker_session(
+                settings=settings,
+                db=db,
+                adapter=adapter,
+                source="portfolio_risk",
+                reason="portfolio risk snapshot requires authoritative broker authentication",
+            )
+        except BrokerAdapterError as exc:
+            return None, {
+                "status": "unavailable",
+                "reason": f"broker authentication unavailable: {exc}",
+                "exchange": None,
+            }
+    else:
+        # Test and alternate adapters have no shared KIS-cache contract. Keep
+        # their legacy read-only session behavior without weakening the
+        # concrete production adapter's shared-first authority.
+        session = db.get(BrokerSession, f"{config.provider}:{config.mode}")
+        if session is None or not session.access_token:
+            return None, {
+                "status": "missing",
+                "reason": "no reusable broker access token is stored",
+                "exchange": None,
+            }
+        if (
+            session.access_token_expires_at is not None
+            and _as_utc(session.access_token_expires_at)
+            <= datetime.now(UTC) + timedelta(minutes=5)
+        ):
             return None, {
                 "status": "missing",
                 "reason": "stored broker access token is expired or near expiry",
@@ -1011,44 +1288,25 @@ def _load_account_snapshot_if_available(
             "exchange": None,
         }
     try:
-        return (
-            adapter.get_account_snapshot(
-                session.access_token,
-                symbols=symbols or None,
-                exchange=exchange,
-            ),
-            {"status": "ok", "reason": None, "exchange": exchange},
+        snapshot = adapter.get_account_snapshot(
+            session.access_token,
+            symbols=symbols or None,
+            exchange=exchange,
         )
-    except TypeError as exc:
-        if exchange not in {"ALPACA", "KRX", "UPBIT"}:
-            return None, {
-                "status": "unavailable",
-                "reason": (
-                    f"adapter does not support scoped {exchange} account snapshots: "
-                    f"{exc.__class__.__name__}: {exc}"
-                ),
-                "exchange": exchange,
-            }
-        try:
-            return adapter.get_account_snapshot(session.access_token), {
-                "status": "ok",
-                "reason": None,
-                "exchange": exchange,
-            }
-        except Exception as fallback_exc:
-            return None, {
-                "status": "unavailable",
-                "reason": (
-                    f"{fallback_exc.__class__.__name__}: {fallback_exc}"
-                ),
-                "exchange": exchange,
-            }
     except Exception as exc:
         return None, {
             "status": "unavailable",
             "reason": f"{exc.__class__.__name__}: {exc}",
             "exchange": exchange,
         }
+    incomplete_reason = _account_snapshot_incomplete_reason(snapshot)
+    if incomplete_reason is not None:
+        return snapshot, {
+            "status": "partial",
+            "reason": incomplete_reason,
+            "exchange": exchange,
+        }
+    return snapshot, {"status": "ok", "reason": None, "exchange": exchange}
 
 
 def _kis_account_snapshot_exchanges(
@@ -1134,14 +1392,101 @@ def _load_kis_account_snapshots(
             "reason": "all scoped KIS account snapshots failed: " + "; ".join(failures),
             "exchange": exchange_label,
         }
-    merged = _merge_kis_account_snapshots(snapshots)
+    try:
+        merged = _merge_kis_account_snapshots(snapshots)
+    except PositionIdentityConflictError as exc:
+        return None, {
+            "status": "unavailable",
+            "reason": f"broker account snapshot merge conflict: {exc}",
+            "exchange": exchange_label,
+        }
     if failures:
+        merged = replace(
+            merged,
+            holdings_complete=False,
+            open_orders_complete=False,
+            diagnostics={
+                **merged.diagnostics,
+                "failed_scopes": list(failures),
+            },
+            payload={
+                **merged.payload,
+                "holdings_coverage": "incomplete",
+                "open_orders_coverage": "incomplete",
+            },
+        )
+    incomplete_reason = _account_snapshot_incomplete_reason(merged)
+    if failures or incomplete_reason is not None:
+        reasons = []
+        if failures:
+            reasons.append(
+                "some scoped KIS account snapshots failed: " + "; ".join(failures)
+            )
+        if incomplete_reason is not None:
+            reasons.append(incomplete_reason)
         return merged, {
             "status": "partial",
-            "reason": "some scoped KIS account snapshots failed: " + "; ".join(failures),
+            "reason": "; ".join(reasons),
             "exchange": exchange_label,
         }
     return merged, {"status": "ok", "reason": None, "exchange": exchange_label}
+
+
+def _account_snapshot_incomplete_reason(
+    snapshot: BrokerAccountSnapshot,
+) -> str | None:
+    incomplete: list[str] = []
+    scoped_incomplete_collections: set[str] = set()
+    scoped_snapshots = snapshot.diagnostics.get("scoped_snapshots")
+    if isinstance(scoped_snapshots, dict):
+        for exchange, scoped_diagnostic in scoped_snapshots.items():
+            if not isinstance(scoped_diagnostic, dict):
+                continue
+            diagnostics = scoped_diagnostic.get("diagnostics")
+            diagnostics = diagnostics if isinstance(diagnostics, dict) else {}
+            for collection in ("holdings", "open_orders"):
+                if scoped_diagnostic.get(f"{collection}_complete") is False:
+                    scoped_incomplete_collections.add(collection)
+                    incomplete.append(
+                        _snapshot_collection_incomplete_description(
+                            collection=collection,
+                            diagnostics=diagnostics,
+                            prefix=f"{exchange}:",
+                        )
+                    )
+    for collection, complete in (
+        ("holdings", snapshot.holdings_complete),
+        ("open_orders", snapshot.open_orders_complete),
+    ):
+        if complete or collection in scoped_incomplete_collections:
+            continue
+        incomplete.append(
+            _snapshot_collection_incomplete_description(
+                collection=collection,
+                diagnostics=snapshot.diagnostics,
+            )
+        )
+    if not incomplete:
+        return None
+    return "broker account snapshot coverage is incomplete: " + ", ".join(incomplete)
+
+
+def _snapshot_collection_incomplete_description(
+    *,
+    collection: str,
+    diagnostics: dict[str, Any],
+    prefix: str = "",
+) -> str:
+    pagination = diagnostics.get(f"{collection}_pagination")
+    diagnostic_reason = (
+        str(pagination.get("reason"))
+        if isinstance(pagination, dict) and pagination.get("reason")
+        else None
+    )
+    return (
+        f"{prefix}{collection} incomplete"
+        + (f" ({diagnostic_reason})" if diagnostic_reason is not None else "")
+    )
 
 
 def _merge_kis_account_snapshots(
@@ -1152,24 +1497,55 @@ def _merge_kis_account_snapshots(
     holdings: dict[tuple[str, str], BrokerAccountHolding] = {}
     positions: dict[tuple[str, str], BrokerAccountPosition] = {}
     open_orders: dict[tuple[str, str], BrokerAccountOpenOrder] = {}
+    symbol_buying_power: dict[str, BrokerSymbolBuyingPower] = {}
     currencies: set[str] = set()
     for exchange, snapshot in snapshots:
         currency = str(snapshot.payload.get("currency") or ("KRW" if exchange == "KRX" else "USD"))
         currencies.add(currency)
         for holding in snapshot.holdings:
             key = (_snapshot_row_exchange(holding.payload, fallback=exchange), holding.symbol)
-            holdings.setdefault(key, holding)
+            existing_holding = holdings.get(key)
+            if existing_holding is not None and existing_holding != holding:
+                raise PositionIdentityConflictError(
+                    "conflicting KIS holdings snapshot rows for "
+                    f"{key[0]}:{key[1]}"
+                )
+            holdings[key] = holding
         for position in snapshot.positions:
             key = (_snapshot_row_exchange(position.payload, fallback=exchange), position.symbol)
-            positions.setdefault(key, position)
+            existing_position = positions.get(key)
+            if existing_position is not None and existing_position != position:
+                raise PositionIdentityConflictError(
+                    "conflicting KIS positions snapshot rows for "
+                    f"{key[0]}:{key[1]}"
+                )
+            positions[key] = position
         for order in snapshot.open_orders:
             identity = order.broker_order_id or order.idempotency_key or (
                 f"{order.symbol}:{order.side}:{order.quantity}:{order.limit_price}"
             )
-            open_orders.setdefault(
-                (_snapshot_row_exchange(order.payload, fallback=exchange), identity),
-                order,
+            key = (
+                _snapshot_row_exchange(order.payload, fallback=exchange),
+                identity,
             )
+            existing_order = open_orders.get(key)
+            if existing_order is not None and existing_order != order:
+                raise PositionIdentityConflictError(
+                    "conflicting KIS open_orders snapshot rows for "
+                    f"{key[0]}:{key[1]}"
+                )
+            open_orders[key] = order
+        for symbol, buying_power in snapshot.symbol_buying_power.items():
+            existing_buying_power = symbol_buying_power.get(symbol)
+            if (
+                existing_buying_power is not None
+                and existing_buying_power != buying_power
+            ):
+                raise PositionIdentityConflictError(
+                    "conflicting KIS symbol_buying_power snapshot rows for "
+                    f"{symbol}"
+                )
+            symbol_buying_power[symbol] = buying_power
 
     same_currency = len(currencies) == 1
     source_snapshots = [snapshot for _exchange, snapshot in snapshots]
@@ -1183,6 +1559,12 @@ def _merge_kis_account_snapshots(
         for snapshot in source_snapshots
         if snapshot.buying_power is not None
     ]
+    holdings_complete = all(
+        snapshot.holdings_complete for snapshot in source_snapshots
+    )
+    open_orders_complete = all(
+        snapshot.open_orders_complete for snapshot in source_snapshots
+    )
     return BrokerAccountSnapshot(
         available_cash=(min(available_cash_values) if same_currency and available_cash_values else None),
         buying_power=(min(buying_power_values) if same_currency and buying_power_values else None),
@@ -1214,16 +1596,31 @@ def _merge_kis_account_snapshots(
         holdings=list(holdings.values()),
         positions=list(positions.values()),
         open_orders=list(open_orders.values()),
-        symbol_buying_power={
-            symbol: buying_power
-            for snapshot in source_snapshots
-            for symbol, buying_power in snapshot.symbol_buying_power.items()
+        symbol_buying_power=symbol_buying_power,
+        holdings_complete=holdings_complete,
+        open_orders_complete=open_orders_complete,
+        diagnostics={
+            "scoped_snapshots": {
+                exchange: {
+                    "source": snapshot.source,
+                    "holdings_complete": snapshot.holdings_complete,
+                    "open_orders_complete": snapshot.open_orders_complete,
+                    "diagnostics": snapshot.diagnostics,
+                }
+                for exchange, snapshot in snapshots
+            }
         },
         payload={
             **({"currency": next(iter(currencies))} if same_currency else {}),
             "snapshot_exchanges": [exchange for exchange, _snapshot in snapshots],
             "snapshot_sources": [snapshot.source for snapshot in source_snapshots],
             "currency_aggregation": "single_currency" if same_currency else "mixed_without_fx",
+            "holdings_coverage": (
+                "complete" if holdings_complete else "incomplete"
+            ),
+            "open_orders_coverage": (
+                "complete" if open_orders_complete else "incomplete"
+            ),
         },
     )
 
@@ -1282,19 +1679,30 @@ def _account_snapshot_scope(
 def _source_status(
     *,
     account_status: dict[str, str | None],
+    local_open_order_scope: dict[str, object],
     holdings: list[HoldingRiskRow],
     open_orders: list[OpenOrderRiskRow],
 ) -> dict[str, str | None]:
-    if account_status["status"] == "ok":
+    order_scope_incomplete = local_open_order_scope["status"] != "ok"
+    if account_status["status"] == "ok" and not order_scope_incomplete:
         return {"status": "ok", "reason": None}
-    if holdings or open_orders:
+    reasons = [
+        str(reason)
+        for reason in (
+            account_status.get("reason"),
+            local_open_order_scope.get("reason") if order_scope_incomplete else None,
+        )
+        if reason
+    ]
+    reason = "; ".join(dict.fromkeys(reasons)) or None
+    if holdings or open_orders or account_status["status"] == "ok":
         return {
             "status": "partial",
-            "reason": account_status["reason"] or "using local exec state without broker account snapshot",
+            "reason": reason or "using local exec state without broker account snapshot",
         }
     return {
         "status": "unavailable",
-        "reason": account_status["reason"] or "no portfolio source data is available",
+        "reason": reason or "no portfolio source data is available",
     }
 
 
@@ -1337,14 +1745,40 @@ def _load_local_holdings(
     return rows
 
 
-def _load_positions(*, settings: Settings, db: Session) -> list[ExecutionPosition]:
-    return list(
+def _load_positions(
+    *,
+    settings: Settings,
+    db: Session,
+    position_scope: PortfolioPositionScope,
+) -> list[ExecutionPosition]:
+    positions = list(
         db.scalars(
             select(ExecutionPosition)
-            .where(ExecutionPosition.mode == settings.runtime_mode)
-            .order_by(ExecutionPosition.symbol.asc())
+            .where(
+                ExecutionPosition.mode == settings.runtime_mode,
+                ExecutionPosition.provider == position_scope.identity.provider,
+                ExecutionPosition.account_scope
+                == position_scope.identity.account_scope,
+                ExecutionPosition.exchange.in_(position_scope.exchanges),
+            )
+            .order_by(
+                ExecutionPosition.symbol.asc(),
+                ExecutionPosition.provider.asc(),
+                ExecutionPosition.account_scope.asc(),
+                ExecutionPosition.exchange.asc(),
+            )
         )
     )
+    seen_symbols: set[str] = set()
+    for position in positions:
+        if position.symbol in seen_symbols:
+            raise PositionIdentityConflictError(
+                "portfolio position route is ambiguous for symbol "
+                f"{position.symbol}"
+            )
+        seen_symbols.add(position.symbol)
+    return positions
+
 
 def _position_market_value(
     position: ExecutionPosition,
@@ -1355,7 +1789,11 @@ def _position_market_value(
         return raw_market_value
     if position.average_price is None:
         return None
-    units = position.base_quantity if position.base_quantity and position.base_quantity > 0 else Decimal(position.quantity)
+    units = (
+        position.base_quantity
+        if position.base_quantity and position.base_quantity > 0
+        else Decimal(position.quantity)
+    )
     if units <= 0:
         return None
     return units * position.average_price
@@ -1452,7 +1890,13 @@ def _position_snapshot_market_value(position: BrokerAccountPosition, *, base_qua
     return units * position.average_price
 
 
-def _load_local_open_orders(*, settings: Settings, db: Session, now: datetime | None = None) -> list[OpenOrderRiskRow]:
+def _load_local_open_orders(
+    *,
+    settings: Settings,
+    db: Session,
+    position_scope: PortfolioPositionScope | None,
+    now: datetime | None = None,
+) -> tuple[list[OpenOrderRiskRow], dict[str, object]]:
     orders = db.scalars(
         select(BrokerOrder)
         .where(
@@ -1465,31 +1909,88 @@ def _load_local_open_orders(*, settings: Settings, db: Session, now: datetime | 
         .order_by(BrokerOrder.symbol.asc(), BrokerOrder.updated_at.desc())
     ).all()
     rows: list[OpenOrderRiskRow] = []
+    missing_or_invalid_scope_count = 0
+    other_route_count = 0
     for order in orders:
+        metadata = order.request_metadata
+        if (
+            not isinstance(metadata, dict)
+            or "execution_scope" not in metadata
+        ):
+            missing_or_invalid_scope_count += 1
+            continue
+        route_scope = fifo_route_scope_from_order(order)
+        if route_scope is None:
+            missing_or_invalid_scope_count += 1
+            continue
+        if position_scope is None or not _order_matches_position_scope(
+            order=order,
+            position_scope=position_scope,
+        ):
+            other_route_count += 1
+            continue
         settlement_currency, currency_source = infer_order_settlement_currency(order)
         rows.append(
             OpenOrderRiskRow(
-            symbol=order.symbol,
-            side=order.side,
-            quantity=order.quantity,
-            base_quantity=order.base_quantity,
-            remaining_quantity=order.base_quantity if order.base_quantity and order.base_quantity > 0 else _decimal_or_none(order.quantity),
-            limit_price=order.limit_price,
-            notional=_order_notional(
-                quantity=_decimal_or_none(order.quantity),
+                symbol=order.symbol,
+                side=order.side,
+                quantity=order.quantity,
                 base_quantity=order.base_quantity,
+                remaining_quantity=(
+                    order.base_quantity
+                    if order.base_quantity and order.base_quantity > 0
+                    else _decimal_or_none(order.quantity)
+                ),
                 limit_price=order.limit_price,
-                quote_notional=order.quote_notional,
-            ),
-            settlement_currency=settlement_currency,
-            currency_source=currency_source,
-            status=order.status,
-            broker_order_id=order.broker_order_id,
-            idempotency_key=order.idempotency_key,
-            source="local_broker_orders",
+                notional=_order_notional(
+                    quantity=_decimal_or_none(order.quantity),
+                    base_quantity=order.base_quantity,
+                    limit_price=order.limit_price,
+                    quote_notional=order.quote_notional,
+                ),
+                settlement_currency=settlement_currency,
+                currency_source=currency_source,
+                status=order.status,
+                broker_order_id=order.broker_order_id,
+                idempotency_key=order.idempotency_key,
+                source="local_broker_orders",
+            )
         )
+    if missing_or_invalid_scope_count:
+        scope_status = "incomplete"
+        scope_reason = (
+            "local open orders lack canonical execution scope; "
+            f"excluded_count={missing_or_invalid_scope_count}"
         )
-    return rows
+    elif position_scope is None and orders:
+        scope_status = "unavailable"
+        scope_reason = "portfolio position route is unavailable for local open orders"
+    else:
+        scope_status = "ok"
+        scope_reason = None
+    return rows, {
+        "status": scope_status,
+        "reason": scope_reason,
+        "excluded_missing_or_invalid_scope_count": missing_or_invalid_scope_count,
+        "excluded_other_route_count": other_route_count,
+    }
+
+
+def _order_matches_position_scope(
+    *,
+    order: BrokerOrder,
+    position_scope: PortfolioPositionScope,
+) -> bool:
+    metadata = order.request_metadata
+    if not isinstance(metadata, dict) or "execution_scope" not in metadata:
+        return False
+    route_scope = fifo_route_scope_from_order(order)
+    return bool(
+        route_scope is not None
+        and route_scope.provider == position_scope.identity.provider
+        and route_scope.account_scope == position_scope.identity.account_scope
+        and route_scope.exchange in position_scope.exchanges
+    )
 
 
 def _open_orders_from_snapshot(snapshot: BrokerAccountSnapshot) -> list[OpenOrderRiskRow]:
@@ -1796,7 +2297,12 @@ def _exposures_payload(
     )
 
 
-def _load_stop_metadata(*, settings: Settings, db: Session) -> dict[str, ExecutionPlanItem]:
+def _load_stop_metadata(
+    *,
+    settings: Settings,
+    db: Session,
+    position_scope: PortfolioPositionScope | None,
+) -> tuple[dict[str, list[StopFamilyRiskMetadata]], dict[str, object]]:
     items = db.scalars(
         select(ExecutionPlanItem)
         .join(ExecutionPlanItem.plan)
@@ -1807,37 +2313,318 @@ def _load_stop_metadata(*, settings: Settings, db: Session) -> dict[str, Executi
         )
         .order_by(ExecutionPlanItem.updated_at.desc())
     ).all()
-    by_symbol: dict[str, ExecutionPlanItem] = {}
+    eligible_by_symbol: dict[str, list[ExecutionPlanItem]] = {}
+    missing_or_invalid_scope_count = 0
+    other_route_count = 0
     for item in items:
-        by_symbol.setdefault(item.symbol, item)
-    return by_symbol
+        classification = _plan_item_position_scope_classification(
+            settings=settings,
+            item=item,
+            position_scope=position_scope,
+        )
+        if classification == "invalid":
+            missing_or_invalid_scope_count += 1
+            continue
+        if classification == "foreign":
+            other_route_count += 1
+            continue
+        eligible_by_symbol.setdefault(item.symbol, []).append(item)
+
+    by_symbol: dict[str, list[StopFamilyRiskMetadata]] = {}
+    ambiguous_family_symbols: set[str] = set()
+    for symbol, symbol_items in eligible_by_symbol.items():
+        items_by_family: dict[str, list[ExecutionPlanItem]] = {}
+        unresolved_items: list[ExecutionPlanItem] = []
+        for item in symbol_items:
+            family_key = plan_item_entry_family_key(item)
+            if family_key is None:
+                unresolved_items.append(item)
+            else:
+                items_by_family.setdefault(family_key, []).append(item)
+        if unresolved_items:
+            if len(symbol_items) == 1:
+                item = unresolved_items[0]
+                items_by_family[f"legacy-single:{item.id}"] = [item]
+            else:
+                missing_or_invalid_scope_count += len(unresolved_items)
+                ambiguous_family_symbols.add(symbol)
+
+        family_metadata: list[StopFamilyRiskMetadata] = []
+        for family_key, family_items in items_by_family.items():
+            metadata = _select_stop_family_risk_metadata(
+                family_key=family_key,
+                items=family_items,
+            )
+            if metadata is None:
+                missing_or_invalid_scope_count += len(family_items)
+                ambiguous_family_symbols.add(symbol)
+                continue
+            family_metadata.append(metadata)
+        if family_metadata:
+            by_symbol[symbol] = sorted(
+                family_metadata,
+                key=lambda metadata: metadata.family_key,
+            )
+    scope_summary = _position_scope_filter_summary(
+        position_scope=position_scope,
+        missing_or_invalid_scope_count=missing_or_invalid_scope_count,
+        other_route_count=other_route_count,
+        subject="sell monitor metadata",
+    )
+    scope_summary["ambiguous_family_symbols"] = sorted(ambiguous_family_symbols)
+    return by_symbol, scope_summary
+
+
+def _select_stop_family_risk_metadata(
+    *,
+    family_key: str,
+    items: list[ExecutionPlanItem],
+) -> StopFamilyRiskMetadata | None:
+    candidates = [
+        (item, _stop_price(item))
+        for item in items
+        if item.intent == "stop_sell" and _stop_price(item) is not None
+    ]
+    stop_prices = {
+        stop_price
+        for _item, stop_price in candidates
+        if stop_price is not None
+    }
+    if not candidates or len(stop_prices) != 1:
+        return None
+    item, stop_price = candidates[0]
+    if stop_price is None:
+        return None
+    return StopFamilyRiskMetadata(
+        family_key=family_key,
+        item=item,
+        stop_price=stop_price,
+        protected_units=_stop_family_protected_units(items),
+    )
+
+
+def _stop_family_protected_units(
+    items: list[ExecutionPlanItem],
+) -> Decimal | None:
+    values: set[Decimal] = set()
+    for item in items:
+        if item.base_quantity is not None and item.base_quantity > 0:
+            values.add(Decimal(item.base_quantity))
+        quantity_policy = (
+            item.quantity_policy if isinstance(item.quantity_policy, dict) else {}
+        )
+        risk_context = item.risk_context if isinstance(item.risk_context, dict) else {}
+        entry_context = risk_context.get("entry_context")
+        sources = [quantity_policy]
+        if isinstance(entry_context, dict):
+            sources.append(entry_context)
+        for source in sources:
+            quantity = _decimal_from_payload(
+                source,
+                ("base_quantity", "quantity", "entry_quantity"),
+            )
+            if quantity is not None and quantity > 0:
+                values.add(quantity)
+    if len(values) != 1:
+        return None
+    return next(iter(values))
+
+
+def _plan_item_position_scope_classification(
+    *,
+    settings: Settings,
+    item: ExecutionPlanItem,
+    position_scope: PortfolioPositionScope | None,
+) -> str:
+    if position_scope is None:
+        return "invalid"
+    provider = _normalized_provider(item.provider)
+    risk_context = item.risk_context if isinstance(item.risk_context, dict) else {}
+    exchange = str(risk_context.get("exchange") or item.venue or "").strip().upper()
+    if provider is None or not exchange:
+        return "invalid"
+    if (
+        provider != position_scope.identity.provider
+        or exchange not in position_scope.exchanges
+    ):
+        return "foreign"
+    if provider != "kis":
+        mismatch = validate_execution_account_scope(
+            provider=provider,
+            risk_context=risk_context,
+            quantity_policy=item.quantity_policy,
+            current_binding={
+                "policy_version": EXECUTION_SCOPE_POLICY_VERSION,
+                "provider": position_scope.identity.provider,
+                "account_scope": position_scope.identity.account_scope,
+            },
+            require_binding=True,
+        )
+        if mismatch is None:
+            return "active"
+        return (
+            "foreign"
+            if mismatch.reason_code == "execution_account_scope_mismatch"
+            else "invalid"
+        )
+    mismatch = validate_kis_account_route(
+        settings=settings,
+        provider=provider,
+        risk_context=risk_context,
+        quantity_policy=item.quantity_policy,
+        require_binding=True,
+    )
+    if mismatch is not None:
+        return (
+            "foreign"
+            if mismatch.reason_code == "account_route_mismatch"
+            else "invalid"
+        )
+    binding = kis_account_route_binding_from_payloads(
+        risk_context,
+        item.quantity_policy,
+    )
+    if configured_kis_route_fingerprint(settings) is not None and binding is None:
+        return "invalid"
+    return "active"
+
+
+def _position_scope_filter_summary(
+    *,
+    position_scope: PortfolioPositionScope | None,
+    missing_or_invalid_scope_count: int,
+    other_route_count: int,
+    subject: str,
+) -> dict[str, object]:
+    if position_scope is None:
+        status = "unavailable"
+        reason = f"portfolio position route is unavailable for {subject}"
+    elif missing_or_invalid_scope_count:
+        status = "incomplete"
+        reason = (
+            f"{subject} lacks canonical execution scope; "
+            f"excluded_count={missing_or_invalid_scope_count}"
+        )
+    else:
+        status = "ok"
+        reason = None
+    return {
+        "status": status,
+        "reason": reason,
+        "excluded_missing_or_invalid_scope_count": missing_or_invalid_scope_count,
+        "excluded_other_route_count": other_route_count,
+    }
 
 
 def _estimated_stop_risk_payload(
     *,
     holdings: list[HoldingRiskRow],
-    stop_metadata: dict[str, ExecutionPlanItem],
+    stop_metadata: dict[str, list[StopFamilyRiskMetadata]],
+    ambiguous_symbols: set[str] | None = None,
 ) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
+    ambiguous = ambiguous_symbols or set()
     for holding in holdings:
-        item = stop_metadata.get(holding.symbol)
-        stop_price = _stop_price(item)
         units = holding.base_quantity if holding.base_quantity and holding.base_quantity > 0 else Decimal(holding.quantity)
-        estimated_risk = None
-        if stop_price is not None and holding.average_price is not None and units > 0:
-            estimated_risk = max((holding.average_price - stop_price) * units, Decimal("0"))
-        rows.append(
-            {
-                "symbol": holding.symbol,
-                "stop_price": _decimal_text(stop_price),
-                "estimated_risk": _decimal_text(estimated_risk),
-                "settlement_currency": holding.settlement_currency,
-                "currency_source": holding.currency_source,
-                "metadata_status": "present" if stop_price is not None else "missing",
-                "plan_item_id": item.id if item is not None else None,
-            }
-        )
+        family_metadata = stop_metadata.get(holding.symbol, [])
+        if not family_metadata:
+            rows.append(
+                _unavailable_stop_risk_row(
+                    holding=holding,
+                    units=units,
+                    reason=(
+                        "ambiguous_entry_family"
+                        if holding.symbol in ambiguous
+                        else "missing_stop_metadata"
+                    ),
+                    status=(
+                        "unavailable"
+                        if holding.symbol in ambiguous
+                        else "missing"
+                    ),
+                )
+            )
+            continue
+
+        resolved_units = [metadata.protected_units for metadata in family_metadata]
+        if len(family_metadata) == 1 and resolved_units[0] is None:
+            resolved_units = [units]
+        if any(value is None for value in resolved_units):
+            rows.append(
+                _unavailable_stop_risk_row(
+                    holding=holding,
+                    units=units,
+                    reason="ambiguous_family_quantity",
+                )
+            )
+            continue
+        protected_units = [Decimal(value) for value in resolved_units if value is not None]
+        covered_units = sum(protected_units, Decimal("0"))
+        if covered_units > units:
+            rows.append(
+                _unavailable_stop_risk_row(
+                    holding=holding,
+                    units=units,
+                    reason="family_quantity_exceeds_position",
+                )
+            )
+            continue
+
+        for metadata, family_units in zip(
+            family_metadata,
+            protected_units,
+            strict=True,
+        ):
+            estimated_risk = None
+            if holding.average_price is not None and family_units > 0:
+                estimated_risk = max(
+                    (holding.average_price - metadata.stop_price) * family_units,
+                    Decimal("0"),
+                )
+            rows.append(
+                {
+                    "symbol": holding.symbol,
+                    "entry_family_key": metadata.family_key,
+                    "protected_quantity": _decimal_text(family_units),
+                    "stop_price": _decimal_text(metadata.stop_price),
+                    "estimated_risk": _decimal_text(estimated_risk),
+                    "settlement_currency": holding.settlement_currency,
+                    "currency_source": holding.currency_source,
+                    "metadata_status": "present",
+                    "metadata_reason": None,
+                    "plan_item_id": metadata.item.id,
+                }
+            )
+        if covered_units < units:
+            rows.append(
+                _unavailable_stop_risk_row(
+                    holding=holding,
+                    units=units - covered_units,
+                    reason="uncovered_position_quantity",
+                )
+            )
     return rows
+
+
+def _unavailable_stop_risk_row(
+    *,
+    holding: HoldingRiskRow,
+    units: Decimal,
+    reason: str,
+    status: str = "unavailable",
+) -> dict[str, object]:
+    return {
+        "symbol": holding.symbol,
+        "entry_family_key": None,
+        "protected_quantity": _decimal_text(units),
+        "stop_price": None,
+        "estimated_risk": None,
+        "settlement_currency": holding.settlement_currency,
+        "currency_source": holding.currency_source,
+        "metadata_status": status,
+        "metadata_reason": reason,
+        "plan_item_id": None,
+    }
 
 
 def _stop_price(item: ExecutionPlanItem | None) -> Decimal | None:
@@ -1852,7 +2639,13 @@ def _stop_price(item: ExecutionPlanItem | None) -> Decimal | None:
     return None
 
 
-def _stale_order_warnings(*, settings: Settings, db: Session, now: datetime) -> list[dict[str, object]]:
+def _stale_order_warnings(
+    *,
+    settings: Settings,
+    db: Session,
+    position_scope: PortfolioPositionScope | None,
+    now: datetime,
+) -> tuple[list[dict[str, object]], dict[str, object]]:
     stale_before = now - timedelta(seconds=settings.stale_broker_order_reconciliation_threshold_seconds)
     orders = db.scalars(
         select(BrokerOrder)
@@ -1867,18 +2660,45 @@ def _stale_order_warnings(*, settings: Settings, db: Session, now: datetime) -> 
         )
         .order_by(BrokerOrder.symbol.asc())
     ).all()
-    return [
-        {
-            "symbol": order.symbol,
-            "side": order.side,
-            "status": order.status,
-            "broker_order_id": order.broker_order_id,
-            "idempotency_key": order.idempotency_key,
-            "last_broker_sync_at": order.last_broker_sync_at.astimezone(UTC).isoformat() if order.last_broker_sync_at else None,
-            "reason": "missing_broker_sync" if order.last_broker_sync_at is None else "stale_broker_sync",
-        }
-        for order in orders
-    ]
+    warnings: list[dict[str, object]] = []
+    missing_or_invalid_scope_count = 0
+    other_route_count = 0
+    for order in orders:
+        route_scope = fifo_route_scope_from_order(order)
+        if route_scope is None:
+            missing_or_invalid_scope_count += 1
+            continue
+        if position_scope is None or not _order_matches_position_scope(
+            order=order,
+            position_scope=position_scope,
+        ):
+            other_route_count += 1
+            continue
+        warnings.append(
+            {
+                "symbol": order.symbol,
+                "side": order.side,
+                "status": order.status,
+                "broker_order_id": order.broker_order_id,
+                "idempotency_key": order.idempotency_key,
+                "last_broker_sync_at": (
+                    order.last_broker_sync_at.astimezone(UTC).isoformat()
+                    if order.last_broker_sync_at
+                    else None
+                ),
+                "reason": (
+                    "missing_broker_sync"
+                    if order.last_broker_sync_at is None
+                    else "stale_broker_sync"
+                ),
+            }
+        )
+    return warnings, _position_scope_filter_summary(
+        position_scope=position_scope,
+        missing_or_invalid_scope_count=missing_or_invalid_scope_count,
+        other_route_count=other_route_count,
+        subject="stale broker orders",
+    )
 
 
 def _concentration_warnings(
@@ -1937,7 +2757,7 @@ def _concentration_warnings(
     for symbol in sorted(held_symbols & open_buy_symbols):
         warnings.append({"code": "holding_plus_open_buy_order", "symbol": symbol})
     for row in stop_risk_payload:
-        if row.get("metadata_status") == "missing":
+        if row.get("metadata_status") in {"missing", "unavailable"}:
             warnings.append({"code": "missing_stop_metadata", "symbol": row["symbol"]})
     for symbol in freshness.get("stale_symbols", []):
         warnings.append({"code": "stale_position_truth", "symbol": symbol})

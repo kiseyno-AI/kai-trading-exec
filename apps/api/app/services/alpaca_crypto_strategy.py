@@ -1,16 +1,24 @@
 from __future__ import annotations
 
+import hmac
 from dataclasses import asdict
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
+from hashlib import sha256
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session, sessionmaker, selectinload
 
 from app.api.schemas.execution import PlaceOrderRequest
 from app.broker.alpaca import AlpacaBrokerAdapter
-from app.broker.base import BrokerAccountHolding, BrokerAccountSnapshot, BrokerLiveMarketContext
+from app.broker.base import (
+    BrokerAccountHolding,
+    BrokerAccountOpenOrder,
+    BrokerAccountSnapshot,
+    BrokerLiveMarketContext,
+    NormalizedBrokerOrderStatus,
+)
 from app.core.config import Settings
 from app.models.runtime import (
     BrokerOrder,
@@ -28,12 +36,54 @@ from app.services.crypto_trend_strategy import (
     evaluate_symbol,
 )
 from app.services.fill_idempotency import dedupe_execution_fills
+from app.services.fifo_inventory import FifoRouteScope, fifo_route_scope_from_order
+from app.services.monitoring_checkpoint_scope import exact_monitoring_execution_scope
+from app.services.position_identity import (
+    EXECUTION_SCOPE_POLICY_VERSION,
+    PositionIdentityConflictError,
+    build_authenticated_broker_position_identity,
+)
 
 
 PROVIDER = "alpaca"
 EXCHANGE = "ALPACA"
 TERMINAL_DECISION_STATUSES = frozenset(
-    {"no_action", "submitted", "duplicate", "blocked_risk", "rejected"}
+    {"no_action", "submitted", "duplicate", "rejected"}
+)
+ALPACA_TRUSTED_QUOTE_FRESHNESS_SOURCES = frozenset(
+    {"alpaca_exchange_quote_time"}
+)
+ALPACA_QUOTE_MAX_FUTURE_SKEW_SECONDS = 5
+ALPACA_ACCOUNT_SNAPSHOT_MAX_AGE_SECONDS = 300
+PROTECTIVE_EXIT_TERMINAL_STATUSES = frozenset(
+    {
+        NormalizedBrokerOrderStatus.FILLED.value,
+        NormalizedBrokerOrderStatus.CANCELED.value,
+        NormalizedBrokerOrderStatus.REJECTED.value,
+        NormalizedBrokerOrderStatus.FAILED.value,
+        NormalizedBrokerOrderStatus.EXPIRED.value,
+    }
+)
+PROTECTIVE_EXIT_ACTIVE_ACK_STATUSES = frozenset(
+    {
+        "accepted",
+        "new",
+        NormalizedBrokerOrderStatus.SUBMISSION_PENDING.value,
+        NormalizedBrokerOrderStatus.SUBMITTED.value,
+        NormalizedBrokerOrderStatus.OPEN.value,
+        NormalizedBrokerOrderStatus.PARTIALLY_FILLED.value,
+    }
+)
+ALPACA_ACTIVE_OPEN_ORDER_STATUSES = frozenset(
+    {"accepted", "new", "open", "partially_filled", "pending_new"}
+)
+DAILY_DATA_INTEGRITY_BLOCK_REASONS = frozenset(
+    {
+        "closed_daily_bars_unavailable",
+        "symbols_do_not_share_latest_closed_bar",
+        "daily_bars_stale",
+        "broker_open_orders_truth_unavailable",
+    }
 )
 
 
@@ -58,6 +108,24 @@ class AlpacaCryptoStrategyService:
         self.time_in_force = time_in_force
         self.bar_source = bar_source
         self.order_origin = order_origin
+        self.strategy_family = _strategy_family(
+            asset_class=asset_class,
+            exchange=exchange,
+        )
+        if str(asset_class).strip().lower() == "us_equity":
+            self.annualization_days = (
+                settings.alpaca_us_equity_strategy_annualization_days
+            )
+            self.max_closed_bar_age_days = (
+                settings.alpaca_us_equity_strategy_max_closed_bar_age_days
+            )
+        else:
+            self.annualization_days = (
+                settings.alpaca_crypto_strategy_annualization_days
+            )
+            self.max_closed_bar_age_days = (
+                settings.alpaca_crypto_strategy_max_closed_bar_age_days
+            )
         self._last_result: dict[str, object] = {
             "enabled": settings.alpaca_crypto_strategy_enabled,
             "status": "not_started" if settings.alpaca_crypto_strategy_enabled else "disabled",
@@ -73,6 +141,7 @@ class AlpacaCryptoStrategyService:
         access_token: str,
         quotes: dict[str, BrokerLiveMarketContext],
         observed_at: datetime,
+        execution_scope: object,
         market_open: bool = True,
     ) -> dict[str, object]:
         if not self.settings.alpaca_crypto_strategy_enabled:
@@ -83,36 +152,91 @@ class AlpacaCryptoStrategyService:
                 "status": "blocked",
                 "reason": "alpaca_crypto_strategy_live_enabled_is_false",
             })
+        symbols = _allowed_symbols(self.settings)
+        coordinator_scope = exact_monitoring_execution_scope(
+            execution_scope,
+            provider=PROVIDER,
+        )
+        if coordinator_scope is None:
+            return self._remember({
+                "enabled": True,
+                "status": "blocked",
+                "reason": "authenticated_execution_scope_unavailable",
+            })
+        snapshot = adapter.get_account_snapshot(
+            access_token,
+            symbols=list(symbols),
+            exchange=self.exchange,
+        )
+        try:
+            snapshot_identity = build_authenticated_broker_position_identity(
+                settings=self.settings,
+                provider=PROVIDER,
+                exchange=self.exchange,
+                broker_account_id=str(snapshot.broker_account_id or ""),
+            )
+        except PositionIdentityConflictError:
+            return self._remember({
+                "enabled": True,
+                "status": "blocked",
+                "reason": "authenticated_execution_scope_unavailable",
+            })
+        account_scope = str(coordinator_scope["account_scope"])
+        if not hmac.compare_digest(account_scope, snapshot_identity.account_scope):
+            return self._remember({
+                "enabled": True,
+                "status": "blocked",
+                "reason": "authenticated_execution_scope_mismatch",
+            })
+        snapshot_integrity_reason = _snapshot_inventory_integrity_reason(snapshot)
+        if snapshot_integrity_reason is not None:
+            return self._remember({
+                "enabled": True,
+                "status": "blocked",
+                "reason": snapshot_integrity_reason,
+            })
         if not market_open:
             return self._remember({
                 "enabled": True,
                 "status": "market_closed",
                 "strategy_version": self.settings.alpaca_crypto_strategy_version,
+                "strategy_family": self.strategy_family,
                 "asset_class": self.asset_class,
                 "observed_at": observed_at.isoformat(),
             })
-
-        symbols = _allowed_symbols(self.settings)
         quote_health = _quote_health(
             quotes=quotes,
             symbols=symbols,
             observed_at=observed_at,
             max_age_seconds=self.settings.alpaca_crypto_strategy_quote_max_age_seconds,
             max_spread_bps=self.settings.alpaca_crypto_strategy_max_spread_bps,
+            expected_exchange=self.exchange,
         )
-        snapshot = adapter.get_account_snapshot(
-            access_token,
-            symbols=list(symbols),
+        route_scope = FifoRouteScope(
+            provider=PROVIDER,
+            account_scope=account_scope,
+            venue=PROVIDER,
+            asset_class=self.asset_class,
             exchange=self.exchange,
         )
         with self.session_factory() as db:
-            risk = _update_risk_state(
+            legacy_strategy_authority = _has_legacy_strategy_authority(
                 settings=self.settings,
                 db=db,
-                snapshot=snapshot,
-                observed_at=observed_at,
+                symbols=symbols,
+                asset_class=self.asset_class,
+                order_origin=self.order_origin,
+                strategy_family=self.strategy_family,
+                route_scope=route_scope,
             )
-            states = _load_strategy_states(settings=self.settings, db=db, symbols=symbols)
+            states = _load_strategy_states(
+                settings=self.settings,
+                db=db,
+                symbols=symbols,
+                account_scope=account_scope,
+                strategy_family=self.strategy_family,
+                create_missing=not legacy_strategy_authority,
+            )
             _refresh_strategy_owned_quantities(
                 settings=self.settings,
                 db=db,
@@ -120,6 +244,8 @@ class AlpacaCryptoStrategyService:
                 snapshot=snapshot,
                 asset_class=self.asset_class,
                 order_origin=self.order_origin,
+                strategy_family=self.strategy_family,
+                route_scope=route_scope,
             )
             protective_actions = self._run_protective_exits(
                 db=db,
@@ -129,6 +255,33 @@ class AlpacaCryptoStrategyService:
                 quote_health=quote_health,
                 states=states,
                 observed_at=observed_at,
+                route_scope=route_scope,
+            )
+            if legacy_strategy_authority:
+                db.commit()
+                return self._remember({
+                    "enabled": True,
+                    "status": "blocked",
+                    "reason": "legacy_strategy_scope_requires_manual_review",
+                    "strategy_version": self.settings.alpaca_crypto_strategy_version,
+                    "strategy_family": self.strategy_family,
+                    "asset_class": self.asset_class,
+                    "mode": self.settings.runtime_mode,
+                    "observed_at": observed_at.isoformat(),
+                    "quote_health": quote_health,
+                    "protective_actions": protective_actions,
+                    "daily_decision": {
+                        "status": "blocked",
+                        "reason": "legacy_strategy_scope_requires_manual_review",
+                    },
+                })
+            risk = _update_risk_state(
+                settings=self.settings,
+                db=db,
+                snapshot=snapshot,
+                observed_at=observed_at,
+                account_scope=account_scope,
+                strategy_family=self.strategy_family,
             )
             decision_result = self._run_daily_decision_if_due(
                 db=db,
@@ -140,6 +293,8 @@ class AlpacaCryptoStrategyService:
                 states=states,
                 risk=risk,
                 observed_at=observed_at,
+                account_scope=account_scope,
+                route_scope=route_scope,
             )
             db.commit()
 
@@ -151,10 +306,24 @@ class AlpacaCryptoStrategyService:
         if risk.risk_status != "healthy":
             status = "risk_blocked"
             reasons.extend(str(reason) for reason in (risk.risk_reasons or []))
+        daily_decision_reason = decision_result.get("reason")
+        if daily_decision_reason in DAILY_DATA_INTEGRITY_BLOCK_REASONS:
+            status = "degraded"
+            reasons.append(str(daily_decision_reason))
+        rebalance_attention_reason = _daily_rebalance_attention_reason(
+            decision_result
+        )
+        if rebalance_attention_reason is not None:
+            status = "degraded"
+            reasons.append(rebalance_attention_reason)
+        if any(_protective_action_requires_attention(action) for action in protective_actions):
+            status = "degraded"
+            reasons.append("protection_blocked")
         return self._remember({
             "enabled": True,
             "status": status,
             "strategy_version": self.settings.alpaca_crypto_strategy_version,
+            "strategy_family": self.strategy_family,
             "asset_class": self.asset_class,
             "mode": self.settings.runtime_mode,
             "observed_at": observed_at.isoformat(),
@@ -175,9 +344,12 @@ class AlpacaCryptoStrategyService:
         quote_health: dict[str, object],
         states: dict[str, CryptoStrategyState],
         observed_at: datetime,
+        route_scope: FifoRouteScope,
     ) -> list[dict[str, object]]:
         holdings = _holdings_by_symbol(snapshot)
-        open_symbols = {order.symbol for order in snapshot.open_orders}
+        open_orders_by_symbol: dict[str, list[BrokerAccountOpenOrder]] = {}
+        for order in snapshot.open_orders:
+            open_orders_by_symbol.setdefault(order.symbol, []).append(order)
         blocked_symbols = set(quote_health["blocked_symbols"])
         actions: list[dict[str, object]] = []
         for symbol, state in states.items():
@@ -192,25 +364,98 @@ class AlpacaCryptoStrategyService:
                 broker_base_quantity <= 0
                 or owned_base_quantity <= 0
                 or stop is None
-                or bid is None
-                or bid > stop
-                or symbol in blocked_symbols
-                or symbol in open_symbols
             ):
+                continue
+            if bid is None or symbol in blocked_symbols:
+                actions.append(
+                    {
+                        "symbol": symbol,
+                        "action": "protective_sell_blocked",
+                        "reason": "quote_not_actionable",
+                    }
+                )
+                continue
+            if bid > stop:
+                continue
+            if not _open_orders_coverage_is_complete(snapshot):
+                actions.append(
+                    {
+                        "symbol": symbol,
+                        "action": "protective_sell_blocked",
+                        "reason": "open_orders_coverage_degraded",
+                    }
+                )
+                continue
+            symbol_open_orders = open_orders_by_symbol.get(symbol, [])
+            conflicting_sides = {
+                str(order.side or "").strip().lower()
+                for order in symbol_open_orders
+                if str(order.side or "").strip().lower() != "sell"
+            }
+            if conflicting_sides:
+                actions.append(
+                    {
+                        "symbol": symbol,
+                        "action": "protective_sell_blocked",
+                        "reason": (
+                            "conflicting_open_buy"
+                            if "buy" in conflicting_sides
+                            else "conflicting_open_order"
+                        ),
+                    }
+                )
                 continue
             increment = _state_quantity_increment(state)
             if increment is None:
-                actions.append({"symbol": symbol, "action": "blocked", "reason": "trade_increment_unavailable"})
+                actions.append({
+                    "symbol": symbol,
+                    "action": "protective_sell_blocked",
+                    "reason": "trade_increment_unavailable",
+                })
                 continue
-            sell_quantity = _floor_to_increment(base_quantity, increment)
+            desired_sell_quantity = _floor_to_increment(base_quantity, increment)
+            if desired_sell_quantity <= 0:
+                actions.append({
+                    "symbol": symbol,
+                    "action": "protective_sell_blocked",
+                    "reason": "below_trade_increment",
+                })
+                continue
+            active_coverage, matched_protective_order_ids = (
+                _verified_active_protective_sell_coverage(
+                    settings=self.settings,
+                    db=db,
+                    symbol=symbol,
+                    open_orders=symbol_open_orders,
+                    desired_stop=stop,
+                    order_origin=self.order_origin,
+                    strategy_family=self.strategy_family,
+                    route_scope=route_scope,
+                )
+            )
+            sell_quantity = _floor_to_increment(
+                max(desired_sell_quantity - active_coverage, Decimal("0")),
+                increment,
+            )
             if sell_quantity <= 0:
-                actions.append({"symbol": symbol, "action": "blocked", "reason": "below_trade_increment"})
+                actions.append(
+                    {
+                        "symbol": symbol,
+                        "action": "protective_sell_active",
+                        "reason": "verified_active_protective_sell",
+                        "covered_quantity": _decimal_text(active_coverage),
+                    }
+                )
                 continue
-            idempotency_key = _order_key(
-                version=self.settings.alpaca_crypto_strategy_version,
-                decision_date=observed_at.date(),
+            idempotency_key = _protective_exit_order_key(
+                settings=self.settings,
+                db=db,
                 symbol=symbol,
-                action="protective-sell",
+                observed_at=observed_at,
+                order_origin=self.order_origin,
+                strategy_family=self.strategy_family,
+                route_scope=route_scope,
+                advance_after_order_ids=matched_protective_order_ids,
             )
             result = place_broker_order(
                 settings=self.settings,
@@ -222,7 +467,9 @@ class AlpacaCryptoStrategyService:
                     idempotency_key=idempotency_key,
                     metadata={
                         "strategy_version": self.settings.alpaca_crypto_strategy_version,
+                        "strategy_family": self.strategy_family,
                         "order_origin": self.order_origin,
+                        "expected_execution_scope": _execution_scope_payload(route_scope),
                         "autonomous_strategy_order": True,
                         "decision_type": "protective_exit",
                         "protective_stop_price": _decimal_text(stop),
@@ -230,6 +477,10 @@ class AlpacaCryptoStrategyService:
                         "risk_reduction": True,
                         "strategy_owned_base_quantity": _decimal_text(owned_base_quantity),
                         "broker_base_quantity": _decimal_text(broker_base_quantity),
+                        "active_protective_base_quantity": _decimal_text(active_coverage),
+                        "desired_protective_base_quantity": _decimal_text(
+                            desired_sell_quantity
+                        ),
                     },
                     asset_class=self.asset_class,
                     exchange=self.exchange,
@@ -238,16 +489,33 @@ class AlpacaCryptoStrategyService:
                 request_source=f"{self.order_origin}:protective_exit",
             )
             outcome = _order_outcome(result.status_code, result.payload)
-            state.last_action = "protective_sell"
-            state.last_action_at = observed_at
-            actions.append({
+            action_payload: dict[str, object] = {
                 "symbol": symbol,
-                "action": "protective_sell",
                 "quantity": _decimal_text(sell_quantity),
                 "stop_price": _decimal_text(stop),
                 "trigger_bid": _decimal_text(bid),
                 "order": outcome,
-            })
+            }
+            if _protective_order_acknowledged(result.status_code, result.payload):
+                state.last_action = "protective_sell"
+                state.last_action_at = observed_at
+                action_payload["action"] = "protective_sell"
+            else:
+                action_payload.update(
+                    {
+                        "action": (
+                            "protective_sell_failed"
+                            if result.status_code >= 500
+                            else "protective_sell_blocked"
+                        ),
+                        "reason": _protective_order_failure_reason(
+                            result.status_code,
+                            result.payload,
+                        ),
+                        "status_code": result.status_code,
+                    }
+                )
+            actions.append(action_payload)
         return actions
 
     def _run_daily_decision_if_due(
@@ -262,9 +530,16 @@ class AlpacaCryptoStrategyService:
         states: dict[str, CryptoStrategyState],
         risk: CryptoStrategyRiskState,
         observed_at: datetime,
+        account_scope: str,
+        route_scope: FifoRouteScope,
     ) -> dict[str, object]:
         if not _after_decision_time(self.settings, observed_at):
             return {"status": "not_due", "next_decision_after": _decision_time_text(self.settings)}
+        if not snapshot.open_orders_complete:
+            return {
+                "status": "blocked",
+                "reason": "broker_open_orders_truth_unavailable",
+            }
 
         symbols = tuple(states)
         start = observed_at - timedelta(days=self.settings.alpaca_crypto_strategy_history_days)
@@ -281,7 +556,12 @@ class AlpacaCryptoStrategyService:
             source=self.bar_source,
         )
         features = {
-            symbol: evaluate_symbol(symbol, bars_by_symbol.get(symbol, ()), as_of=observed_at)
+            symbol: evaluate_symbol(
+                symbol,
+                bars_by_symbol.get(symbol, ()),
+                as_of=observed_at,
+                annualization_days=self.annualization_days,
+            )
             for symbol in symbols
         }
         if any(feature.latest_bar_date is None for feature in features.values()):
@@ -295,8 +575,30 @@ class AlpacaCryptoStrategyService:
             }
         decision_date = next(iter(latest_dates))
         assert decision_date is not None
+        if not _latest_closed_bar_is_fresh(
+            latest_bar_date=decision_date,
+            observed_at=observed_at,
+            asset_class=self.asset_class,
+            max_age_days=self.max_closed_bar_age_days,
+        ):
+            return {
+                "status": "blocked",
+                "reason": "daily_bars_stale",
+                "latest_bar_date": decision_date.isoformat(),
+                "max_age_days": self.max_closed_bar_age_days,
+            }
         decision_bar_at = datetime.combine(decision_date, datetime.min.time(), tzinfo=UTC)
-        if all(_decision_exists(db=db, settings=self.settings, symbol=symbol, bar_at=decision_bar_at) for symbol in symbols):
+        if all(
+            _decision_exists(
+                db=db,
+                settings=self.settings,
+                symbol=symbol,
+                bar_at=decision_bar_at,
+                account_scope=account_scope,
+                strategy_family=self.strategy_family,
+            )
+            for symbol in symbols
+        ):
             return {"status": "already_processed", "decision_bar_at": decision_bar_at.isoformat()}
 
         allocation = allocate_inverse_volatility(
@@ -332,7 +634,14 @@ class AlpacaCryptoStrategyService:
         all_terminal = True
         blocked_symbols = set(quote_health["blocked_symbols"])
         for symbol in symbols:
-            if _decision_exists(db=db, settings=self.settings, symbol=symbol, bar_at=decision_bar_at):
+            if _decision_exists(
+                db=db,
+                settings=self.settings,
+                symbol=symbol,
+                bar_at=decision_bar_at,
+                account_scope=account_scope,
+                strategy_family=self.strategy_family,
+            ):
                 actions.append({"symbol": symbol, "status": "already_processed"})
                 continue
             if symbol in blocked_symbols or symbol not in quotes:
@@ -395,11 +704,16 @@ class AlpacaCryptoStrategyService:
                 )
                 if requested_base > 0:
                     action = "sell"
-                    order_key = _order_key(
-                        version=self.settings.alpaca_crypto_strategy_version,
+                    order_key = _daily_rebalance_order_key(
+                        settings=self.settings,
+                        db=db,
                         decision_date=decision_date,
+                        decision_bar_at=decision_bar_at,
                         symbol=symbol,
                         action="daily-sell",
+                        order_origin=self.order_origin,
+                        strategy_family=self.strategy_family,
+                        route_scope=route_scope,
                     )
                     result = place_broker_order(
                         settings=self.settings,
@@ -415,6 +729,8 @@ class AlpacaCryptoStrategyService:
                                 target_weight,
                                 decision_bar_at,
                                 order_origin=self.order_origin,
+                                strategy_family=self.strategy_family,
+                                route_scope=route_scope,
                                 owned_base_quantity=owned_base_quantity,
                                 broker_base_quantity=broker_base_quantity,
                                 force_exit=force_exit,
@@ -440,11 +756,16 @@ class AlpacaCryptoStrategyService:
                     ).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
                     if requested_notional >= self.settings.alpaca_crypto_strategy_min_order_notional_usd:
                         action = "buy"
-                        order_key = _order_key(
-                            version=self.settings.alpaca_crypto_strategy_version,
+                        order_key = _daily_rebalance_order_key(
+                            settings=self.settings,
+                            db=db,
                             decision_date=decision_date,
+                            decision_bar_at=decision_bar_at,
                             symbol=symbol,
                             action="daily-buy",
+                            order_origin=self.order_origin,
+                            strategy_family=self.strategy_family,
+                            route_scope=route_scope,
                         )
                         result = place_broker_order(
                             settings=self.settings,
@@ -460,6 +781,8 @@ class AlpacaCryptoStrategyService:
                                     target_weight,
                                     decision_bar_at,
                                     order_origin=self.order_origin,
+                                    strategy_family=self.strategy_family,
+                                    route_scope=route_scope,
                                     owned_base_quantity=owned_base_quantity,
                                     broker_base_quantity=broker_base_quantity,
                                 ),
@@ -474,32 +797,50 @@ class AlpacaCryptoStrategyService:
                         if status in {"submitted", "duplicate"}:
                             available_cash -= requested_notional
 
-            decision = CryptoStrategyDecision(
-                mode=self.settings.runtime_mode,
-                provider=PROVIDER,
-                strategy_version=self.settings.alpaca_crypto_strategy_version,
+            decision = _load_strategy_decision(
+                db=db,
+                settings=self.settings,
                 symbol=symbol,
-                decision_bar_at=decision_bar_at,
-                decided_at=observed_at,
-                action=action,
-                decision_status=status,
-                eligible=feature.eligible,
-                target_fraction=target_weight,
-                reference_price=quote.ask if action == "buy" else quote.bid,
-                requested_base_quantity=requested_base,
-                requested_quote_notional=requested_notional,
-                high_water_price=state.high_water_price,
-                protective_stop_price=state.protective_stop_price,
-                idempotency_key=order_key,
-                reasons=reasons,
-                metrics=_feature_payload(feature),
-                risk_context=_risk_payload(risk),
-                payload=order_payload,
+                bar_at=decision_bar_at,
+                account_scope=account_scope,
+                strategy_family=self.strategy_family,
             )
-            db.add(decision)
-            state.last_processed_bar_at = decision_bar_at
-            state.last_action = action
-            state.last_action_at = observed_at
+            if decision is None:
+                decision = CryptoStrategyDecision(
+                    mode=self.settings.runtime_mode,
+                    provider=PROVIDER,
+                    account_scope=account_scope,
+                    strategy_family=self.strategy_family,
+                    strategy_version=self.settings.alpaca_crypto_strategy_version,
+                    symbol=symbol,
+                    decision_bar_at=decision_bar_at,
+                    decided_at=observed_at,
+                    action=action,
+                    decision_status=status,
+                    eligible=feature.eligible,
+                    target_fraction=target_weight,
+                )
+                db.add(decision)
+            decision.decided_at = observed_at
+            decision.action = action
+            decision.decision_status = status
+            decision.eligible = feature.eligible
+            decision.target_fraction = target_weight
+            decision.reference_price = quote.ask if action == "buy" else quote.bid
+            decision.requested_base_quantity = requested_base
+            decision.requested_quote_notional = requested_notional
+            decision.high_water_price = state.high_water_price
+            decision.protective_stop_price = state.protective_stop_price
+            decision.idempotency_key = order_key
+            decision.reasons = reasons
+            decision.metrics = _feature_payload(feature)
+            decision.risk_context = _risk_payload(risk)
+            decision.payload = order_payload
+            if status in TERMINAL_DECISION_STATUSES:
+                state.last_processed_bar_at = decision_bar_at
+                if status in {"no_action", "submitted", "duplicate"}:
+                    state.last_action = action
+                    state.last_action_at = observed_at
             actions.append({
                 "symbol": symbol,
                 "action": action,
@@ -599,6 +940,9 @@ def _load_strategy_states(
     settings: Settings,
     db: Session,
     symbols: tuple[str, ...],
+    account_scope: str,
+    strategy_family: str,
+    create_missing: bool,
 ) -> dict[str, CryptoStrategyState]:
     existing = {
         state.symbol: state
@@ -606,16 +950,22 @@ def _load_strategy_states(
             select(CryptoStrategyState).where(
                 CryptoStrategyState.mode == settings.runtime_mode,
                 CryptoStrategyState.provider == PROVIDER,
+                CryptoStrategyState.account_scope == account_scope,
+                CryptoStrategyState.strategy_family == strategy_family,
                 CryptoStrategyState.strategy_version == settings.alpaca_crypto_strategy_version,
                 CryptoStrategyState.symbol.in_(symbols),
             )
         ).all()
     }
-    for symbol in symbols:
-        if symbol not in existing:
+    if create_missing:
+        for symbol in symbols:
+            if symbol in existing:
+                continue
             state = CryptoStrategyState(
                 mode=settings.runtime_mode,
                 provider=PROVIDER,
+                account_scope=account_scope,
+                strategy_family=strategy_family,
                 strategy_version=settings.alpaca_crypto_strategy_version,
                 symbol=symbol,
                 eligible=False,
@@ -624,7 +974,97 @@ def _load_strategy_states(
             db.add(state)
             existing[symbol] = state
     db.flush()
-    return {symbol: existing[symbol] for symbol in symbols}
+    return {
+        symbol: existing[symbol]
+        for symbol in symbols
+        if symbol in existing
+    }
+
+
+def _has_legacy_strategy_authority(
+    *,
+    settings: Settings,
+    db: Session,
+    symbols: tuple[str, ...],
+    asset_class: str,
+    order_origin: str,
+    strategy_family: str,
+    route_scope: FifoRouteScope,
+) -> bool:
+    # A strategy-version bump cannot restore the account/family attribution
+    # missing from quarantined rows, so legacy authority remains version-agnostic.
+    if db.scalar(
+        select(CryptoStrategyState.id).where(
+            CryptoStrategyState.mode == settings.runtime_mode,
+            CryptoStrategyState.provider == PROVIDER,
+            or_(
+                CryptoStrategyState.account_scope.is_(None),
+                CryptoStrategyState.strategy_family.is_(None),
+            ),
+            CryptoStrategyState.symbol.in_(symbols),
+        )
+    ) is not None:
+        return True
+    if db.scalar(
+        select(CryptoStrategyRiskState.id).where(
+            CryptoStrategyRiskState.mode == settings.runtime_mode,
+            CryptoStrategyRiskState.provider == PROVIDER,
+            or_(
+                CryptoStrategyRiskState.account_scope.is_(None),
+                CryptoStrategyRiskState.strategy_family.is_(None),
+            ),
+        )
+    ) is not None:
+        return True
+    if db.scalar(
+        select(CryptoStrategyDecision.id).where(
+            CryptoStrategyDecision.mode == settings.runtime_mode,
+            CryptoStrategyDecision.provider == PROVIDER,
+            or_(
+                CryptoStrategyDecision.account_scope.is_(None),
+                CryptoStrategyDecision.strategy_family.is_(None),
+            ),
+            CryptoStrategyDecision.symbol.in_(symbols),
+        )
+    ) is not None:
+        return True
+
+    orders = db.scalars(
+        select(BrokerOrder)
+        .where(
+            BrokerOrder.mode == settings.runtime_mode,
+            BrokerOrder.broker_name == PROVIDER,
+            BrokerOrder.asset_class == asset_class,
+            BrokerOrder.symbol.in_(symbols),
+        )
+    ).all()
+    expected_scope = _execution_scope_payload(route_scope)
+    for order in orders:
+        request_metadata = (
+            order.request_metadata
+            if isinstance(order.request_metadata, dict)
+            else {}
+        )
+        source = str(request_metadata.get("source") or "")
+        if not (
+            source == order_origin or source.startswith(f"{order_origin}:")
+        ):
+            continue
+        stored_route = fifo_route_scope_from_order(order)
+        if stored_route is None:
+            return True
+        if stored_route != route_scope:
+            continue
+        command_metadata = request_metadata.get("metadata")
+        command_metadata = (
+            command_metadata if isinstance(command_metadata, dict) else {}
+        )
+        if (
+            command_metadata.get("strategy_family") != strategy_family
+            or command_metadata.get("expected_execution_scope") != expected_scope
+        ):
+            return True
+    return False
 
 
 def _refresh_strategy_owned_quantities(
@@ -635,6 +1075,8 @@ def _refresh_strategy_owned_quantities(
     snapshot: BrokerAccountSnapshot,
     asset_class: str,
     order_origin: str,
+    strategy_family: str,
+    route_scope: FifoRouteScope,
 ) -> None:
     symbols = tuple(states)
     if not symbols:
@@ -651,7 +1093,12 @@ def _refresh_strategy_owned_quantities(
     ).all()
     totals = {symbol: Decimal("0") for symbol in symbols}
     for order in orders:
-        if not _is_strategy_attributable_order(order=order, order_origin=order_origin):
+        if not _is_strategy_attributable_order(
+            order=order,
+            order_origin=order_origin,
+            strategy_family=strategy_family,
+            route_scope=route_scope,
+        ):
             continue
         if order.side == "buy":
             direction = Decimal("1")
@@ -673,10 +1120,25 @@ def _refresh_strategy_owned_quantities(
         state.strategy_owned_base_quantity = min(ledger_quantity, broker_quantity)
 
 
-def _is_strategy_attributable_order(*, order: BrokerOrder, order_origin: str) -> bool:
+def _is_strategy_attributable_order(
+    *,
+    order: BrokerOrder,
+    order_origin: str,
+    strategy_family: str,
+    route_scope: FifoRouteScope,
+) -> bool:
     request_metadata = order.request_metadata if isinstance(order.request_metadata, dict) else {}
     source = str(request_metadata.get("source") or "")
-    return source == order_origin or source.startswith(f"{order_origin}:")
+    command_metadata = request_metadata.get("metadata")
+    command_metadata = command_metadata if isinstance(command_metadata, dict) else {}
+    return (
+        source == order_origin or source.startswith(f"{order_origin}:")
+    ) and (
+        command_metadata.get("strategy_family") == strategy_family
+        and command_metadata.get("expected_execution_scope")
+        == _execution_scope_payload(route_scope)
+        and fifo_route_scope_from_order(order) == route_scope
+    )
 
 
 def _update_risk_state(
@@ -685,18 +1147,25 @@ def _update_risk_state(
     db: Session,
     snapshot: BrokerAccountSnapshot,
     observed_at: datetime,
+    account_scope: str,
+    strategy_family: str,
 ) -> CryptoStrategyRiskState:
     state = db.scalar(
         select(CryptoStrategyRiskState).where(
             CryptoStrategyRiskState.mode == settings.runtime_mode,
             CryptoStrategyRiskState.provider == PROVIDER,
+            CryptoStrategyRiskState.account_scope == account_scope,
+            CryptoStrategyRiskState.strategy_family == strategy_family,
             CryptoStrategyRiskState.strategy_version == settings.alpaca_crypto_strategy_version,
         )
     )
+    is_new_state = state is None
     if state is None:
         state = CryptoStrategyRiskState(
             mode=settings.runtime_mode,
             provider=PROVIDER,
+            account_scope=account_scope,
+            strategy_family=strategy_family,
             strategy_version=settings.alpaca_crypto_strategy_version,
         )
         db.add(state)
@@ -709,16 +1178,34 @@ def _update_risk_state(
         state.current_equity_at = observed_at
         return state
 
+    previous_equity = _authenticated_previous_equity(
+        snapshot=snapshot,
+        observed_at=observed_at,
+    )
     daily_date = observed_at.astimezone(UTC).date()
     week_start = daily_date - timedelta(days=daily_date.weekday())
     if state.daily_baseline_at is None or _utc_date(state.daily_baseline_at) != daily_date:
-        state.daily_baseline_equity = equity
-        state.daily_baseline_at = observed_at
+        state.daily_baseline_equity = previous_equity
+        state.daily_baseline_at = datetime.combine(
+            daily_date,
+            datetime.min.time(),
+            tzinfo=UTC,
+        )
     if state.weekly_baseline_at is None or _utc_date(state.weekly_baseline_at) != week_start:
-        state.weekly_baseline_equity = equity
-        state.weekly_baseline_at = datetime.combine(week_start, datetime.min.time(), tzinfo=UTC)
-    if state.peak_equity is None or equity > state.peak_equity:
-        state.peak_equity = equity
+        state.weekly_baseline_at = datetime.combine(
+            week_start,
+            datetime.min.time(),
+            tzinfo=UTC,
+        )
+        state.weekly_baseline_equity = (
+            previous_equity if daily_date == week_start else None
+        )
+    peak_candidate = max(
+        equity,
+        previous_equity or equity,
+    )
+    if state.peak_equity is None or peak_candidate > state.peak_equity:
+        state.peak_equity = peak_candidate
         state.peak_equity_at = observed_at
     state.current_equity = equity
     state.current_equity_at = observed_at
@@ -727,6 +1214,10 @@ def _update_risk_state(
     weekly_drawdown = _drawdown_fraction(state.weekly_baseline_equity, equity)
     peak_drawdown = _drawdown_fraction(state.peak_equity, equity)
     reasons: list[str] = []
+    if state.daily_baseline_equity is None:
+        reasons.append("daily_baseline_warmup")
+    if state.weekly_baseline_equity is None:
+        reasons.append("weekly_baseline_warmup")
     if daily_drawdown >= settings.alpaca_crypto_strategy_daily_drawdown_fraction:
         reasons.append("daily_drawdown_limit")
     if weekly_drawdown >= settings.alpaca_crypto_strategy_weekly_drawdown_fraction:
@@ -735,12 +1226,50 @@ def _update_risk_state(
         reasons.append("peak_drawdown_limit")
     state.risk_status = "blocked_entries" if reasons else "healthy"
     state.risk_reasons = reasons
+    prior_metrics = state.metrics if isinstance(state.metrics, dict) else {}
     state.metrics = {
+        **prior_metrics,
         "daily_drawdown_fraction": _decimal_text(daily_drawdown),
         "weekly_drawdown_fraction": _decimal_text(weekly_drawdown),
         "peak_drawdown_fraction": _decimal_text(peak_drawdown),
+        "daily_baseline_source": (
+            "authenticated_previous_equity"
+            if state.daily_baseline_equity is not None
+            else "warmup"
+        ),
+        "weekly_baseline_source": (
+            "authenticated_previous_equity"
+            if state.weekly_baseline_equity is not None
+            else "warmup"
+        ),
+        "cold_start": is_new_state,
     }
     return state
+
+
+def _authenticated_previous_equity(
+    *,
+    snapshot: BrokerAccountSnapshot,
+    observed_at: datetime,
+) -> Decimal | None:
+    """Return broker session evidence only when it belongs to this live snapshot."""
+
+    previous_equity = snapshot.previous_total_asset_value
+    if (
+        previous_equity is None
+        or previous_equity <= 0
+        or not str(snapshot.broker_account_id or "").strip()
+        or not str(snapshot.source or "").strip()
+    ):
+        return None
+    age_seconds = (_as_utc(observed_at) - _as_utc(snapshot.observed_at)).total_seconds()
+    if not (
+        -ALPACA_QUOTE_MAX_FUTURE_SKEW_SECONDS
+        <= age_seconds
+        <= ALPACA_ACCOUNT_SNAPSHOT_MAX_AGE_SECONDS
+    ):
+        return None
+    return previous_equity
 
 
 def _update_protective_stop(
@@ -832,6 +1361,8 @@ def _quote_health(
     observed_at: datetime,
     max_age_seconds: int,
     max_spread_bps: Decimal,
+    max_future_skew_seconds: int = ALPACA_QUOTE_MAX_FUTURE_SKEW_SECONDS,
+    expected_exchange: str | None = None,
 ) -> dict[str, object]:
     details: dict[str, dict[str, object]] = {}
     blocked: list[str] = []
@@ -843,12 +1374,21 @@ def _quote_health(
             age = None
         else:
             quote_observed_at = _as_utc(quote.observed_at)
-            age = max(
-                Decimal("0"),
-                Decimal(str((_as_utc(observed_at) - quote_observed_at).total_seconds())),
+            age = Decimal(
+                str((_as_utc(observed_at) - quote_observed_at).total_seconds())
             )
-            if age > max_age_seconds:
+            if quote.freshness_source not in ALPACA_TRUSTED_QUOTE_FRESHNESS_SOURCES:
+                reasons.append("untrusted_quote_timestamp")
+            if age < -Decimal(max_future_skew_seconds):
+                reasons.append("future_quote_timestamp")
+            elif age > max_age_seconds:
                 reasons.append("stale_quote")
+            if (
+                expected_exchange is not None
+                and str(quote.exchange or "").strip().upper()
+                != str(expected_exchange).strip().upper()
+            ):
+                reasons.append("quote_exchange_mismatch")
             if quote.bid is None or quote.ask is None or quote.bid <= 0 or quote.ask <= 0:
                 reasons.append("nonpositive_quote")
             elif quote.ask < quote.bid:
@@ -871,11 +1411,18 @@ def _quote_health(
 
 def _asset_increments(assets: list[dict[str, Any]]) -> dict[str, Decimal]:
     result: dict[str, Decimal] = {}
+    duplicate_symbols: set[str] = set()
     for asset in assets:
-        symbol = str(asset.get("symbol") or "").strip().upper().replace("-", "/")
+        symbol = _canonical_snapshot_symbol(str(asset.get("symbol") or ""))
         increment = _decimal_or_none(asset.get("min_trade_increment") or asset.get("min_order_size"))
-        if symbol and increment is not None and increment > 0:
-            result[symbol] = increment
+        if not symbol or increment is None or increment <= 0:
+            continue
+        if symbol in result:
+            duplicate_symbols.add(symbol)
+            continue
+        result[symbol] = increment
+    for symbol in duplicate_symbols:
+        result.pop(symbol, None)
     return result
 
 
@@ -908,13 +1455,17 @@ def _daily_order_metadata(
     decision_bar_at: datetime,
     *,
     order_origin: str,
+    strategy_family: str,
+    route_scope: FifoRouteScope,
     owned_base_quantity: Decimal,
     broker_base_quantity: Decimal,
     force_exit: bool = False,
 ) -> dict[str, object]:
     return {
         "strategy_version": strategy_version,
+        "strategy_family": strategy_family,
         "order_origin": order_origin,
+        "expected_execution_scope": _execution_scope_payload(route_scope),
         "autonomous_strategy_order": True,
         "decision_type": "daily_target_rebalance",
         "decision_bar_at": decision_bar_at.isoformat(),
@@ -976,20 +1527,83 @@ def _sell_command(
     )
 
 
-def _decision_exists(*, db: Session, settings: Settings, symbol: str, bar_at: datetime) -> bool:
+def _decision_exists(
+    *,
+    db: Session,
+    settings: Settings,
+    symbol: str,
+    bar_at: datetime,
+    account_scope: str,
+    strategy_family: str,
+) -> bool:
     return db.scalar(
         select(CryptoStrategyDecision.id).where(
             CryptoStrategyDecision.mode == settings.runtime_mode,
             CryptoStrategyDecision.provider == PROVIDER,
+            CryptoStrategyDecision.account_scope == account_scope,
+            CryptoStrategyDecision.strategy_family == strategy_family,
             CryptoStrategyDecision.strategy_version == settings.alpaca_crypto_strategy_version,
             CryptoStrategyDecision.symbol == symbol,
             CryptoStrategyDecision.decision_bar_at == bar_at,
+            CryptoStrategyDecision.decision_status.in_(
+                tuple(TERMINAL_DECISION_STATUSES)
+            ),
         )
     ) is not None
 
 
+def _load_strategy_decision(
+    *,
+    db: Session,
+    settings: Settings,
+    symbol: str,
+    bar_at: datetime,
+    account_scope: str,
+    strategy_family: str,
+) -> CryptoStrategyDecision | None:
+    return db.scalar(
+        select(CryptoStrategyDecision).where(
+            CryptoStrategyDecision.mode == settings.runtime_mode,
+            CryptoStrategyDecision.provider == PROVIDER,
+            CryptoStrategyDecision.account_scope == account_scope,
+            CryptoStrategyDecision.strategy_family == strategy_family,
+            CryptoStrategyDecision.strategy_version
+            == settings.alpaca_crypto_strategy_version,
+            CryptoStrategyDecision.symbol == symbol,
+            CryptoStrategyDecision.decision_bar_at == bar_at,
+        )
+    )
+
+
+def _snapshot_inventory_integrity_reason(
+    snapshot: BrokerAccountSnapshot,
+) -> str | None:
+    if not snapshot.holdings_complete:
+        return "broker_holdings_truth_unavailable"
+    try:
+        _holdings_by_symbol(snapshot)
+    except ValueError as exc:
+        return str(exc)
+    return None
+
+
+def _canonical_snapshot_symbol(value: str) -> str:
+    normalized = value.strip().upper().replace("-", "/")
+    if "/" not in normalized and normalized.endswith("USD") and len(normalized) > 3:
+        return f"{normalized[:-3]}/USD"
+    return normalized
+
+
 def _holdings_by_symbol(snapshot: BrokerAccountSnapshot) -> dict[str, BrokerAccountHolding]:
-    return {holding.symbol: holding for holding in snapshot.holdings}
+    result: dict[str, BrokerAccountHolding] = {}
+    for holding in snapshot.holdings:
+        symbol = _canonical_snapshot_symbol(holding.symbol)
+        if not symbol:
+            raise ValueError("malformed_broker_holding_identity")
+        if symbol in result:
+            raise ValueError("duplicate_broker_holding_identity")
+        result[symbol] = holding
+    return result
 
 
 def _holding_base_quantity(holding: BrokerAccountHolding | None) -> Decimal:
@@ -1000,6 +1614,14 @@ def _holding_base_quantity(holding: BrokerAccountHolding | None) -> Decimal:
 
 def _strategy_owned_base_quantity(state: CryptoStrategyState) -> Decimal:
     return max(Decimal(state.strategy_owned_base_quantity or 0), Decimal("0"))
+
+
+def _open_orders_coverage_is_complete(snapshot: BrokerAccountSnapshot) -> bool:
+    payload = snapshot.payload if isinstance(snapshot.payload, dict) else {}
+    error = payload.get("open_orders_error")
+    return payload.get("open_orders_coverage") == "complete" and not (
+        isinstance(error, dict) and error.get("degraded") is True
+    )
 
 
 def _floor_to_increment(value: Decimal, increment: Decimal) -> Decimal:
@@ -1022,6 +1644,22 @@ def _after_decision_time(settings: Settings, observed_at: datetime) -> bool:
     )
 
 
+def _latest_closed_bar_is_fresh(
+    *,
+    latest_bar_date: date,
+    observed_at: datetime,
+    asset_class: str,
+    max_age_days: int,
+) -> bool:
+    normalized_asset_class = str(asset_class or "").strip().lower()
+    if normalized_asset_class not in {"crypto", "us_equity"}:
+        return False
+    calendar_age_days = (
+        _as_utc(observed_at).date() - latest_bar_date
+    ).days
+    return 1 <= calendar_age_days <= max_age_days
+
+
 def _decision_time_text(settings: Settings) -> str:
     return (
         f"{settings.alpaca_crypto_strategy_decision_hour_utc:02d}:"
@@ -1029,11 +1667,334 @@ def _decision_time_text(settings: Settings) -> str:
     )
 
 
-def _order_key(*, version: str, decision_date: date, symbol: str, action: str) -> str:
+def _order_key(
+    *,
+    version: str,
+    decision_date: date,
+    symbol: str,
+    action: str,
+    account_scope: str,
+    strategy_family: str,
+) -> str:
     version_slug = "".join(character for character in version.lower() if character.isalnum())[:24]
     symbol_slug = "".join(character for character in symbol.lower() if character.isalnum())[:16]
-    action_slug = "".join(character for character in action.lower() if character.isalnum())[:24]
-    return f"{version_slug}-{decision_date:%Y%m%d}-{symbol_slug}-{action_slug}"[:128]
+    action_slug = "".join(character for character in action.lower() if character.isalnum())[:40]
+    scope_digest = sha256(
+        f"{account_scope}\0{strategy_family}".encode("utf-8")
+    ).hexdigest()[:20]
+    return (
+        f"{version_slug}-{scope_digest}-{decision_date:%Y%m%d}-"
+        f"{symbol_slug}-{action_slug}"
+    )[:128]
+
+
+def _protective_exit_order_key(
+    *,
+    settings: Settings,
+    db: Session,
+    symbol: str,
+    observed_at: datetime,
+    order_origin: str,
+    strategy_family: str,
+    route_scope: FifoRouteScope,
+    advance_after_order_ids: tuple[str, ...] = (),
+) -> str:
+    protective_orders = _strategy_protective_orders(
+        settings=settings,
+        db=db,
+        symbol=symbol,
+        order_origin=order_origin,
+        strategy_family=strategy_family,
+        route_scope=route_scope,
+    )
+    unresolved = [
+        order
+        for order in protective_orders
+        if str(order.status or "").strip().lower()
+        not in PROTECTIVE_EXIT_TERMINAL_STATUSES
+    ]
+    generation_anchor_ids = frozenset(advance_after_order_ids)
+    if generation_anchor_ids:
+        unobserved_unresolved = [
+            order for order in unresolved if str(order.id) not in generation_anchor_ids
+        ]
+        if unobserved_unresolved:
+            return max(
+                unobserved_unresolved,
+                key=_protective_order_sort_key,
+            ).idempotency_key
+        prior = max(protective_orders, key=_protective_order_sort_key)
+        generation_material = "\0".join(
+            sorted(str(order.id) for order in protective_orders)
+        )
+        generation = sha256(generation_material.encode("utf-8")).hexdigest()[:16]
+        anchor = prior.submitted_at or prior.created_at or observed_at
+        return _order_key(
+            version=settings.alpaca_crypto_strategy_version,
+            decision_date=_as_utc(anchor).date(),
+            symbol=symbol,
+            action=f"protective-sell-supplement-{generation}",
+            account_scope=route_scope.account_scope,
+            strategy_family=strategy_family,
+        )
+
+    if unresolved:
+        return max(unresolved, key=_protective_order_sort_key).idempotency_key
+
+    if protective_orders:
+        prior = max(protective_orders, key=_protective_order_sort_key)
+        generation = sha256(str(prior.id).encode("utf-8")).hexdigest()[:16]
+        anchor = prior.submitted_at or prior.created_at or observed_at
+        return _order_key(
+            version=settings.alpaca_crypto_strategy_version,
+            decision_date=_as_utc(anchor).date(),
+            symbol=symbol,
+            action=f"protective-sell-{generation}",
+            account_scope=route_scope.account_scope,
+            strategy_family=strategy_family,
+        )
+
+    return _order_key(
+        version=settings.alpaca_crypto_strategy_version,
+        decision_date=_as_utc(observed_at).date(),
+        symbol=symbol,
+        action="protective-sell",
+        account_scope=route_scope.account_scope,
+        strategy_family=strategy_family,
+    )
+
+
+def _daily_rebalance_order_key(
+    *,
+    settings: Settings,
+    db: Session,
+    symbol: str,
+    decision_date: date,
+    decision_bar_at: datetime,
+    action: str,
+    order_origin: str,
+    strategy_family: str,
+    route_scope: FifoRouteScope,
+) -> str:
+    base_key = _order_key(
+        version=settings.alpaca_crypto_strategy_version,
+        decision_date=decision_date,
+        symbol=symbol,
+        action=action,
+        account_scope=route_scope.account_scope,
+        strategy_family=strategy_family,
+    )
+    decision = _load_strategy_decision(
+        db=db,
+        settings=settings,
+        symbol=symbol,
+        bar_at=decision_bar_at,
+        account_scope=route_scope.account_scope,
+        strategy_family=strategy_family,
+    )
+    if (
+        decision is None
+        or decision.decision_status != "retryable"
+        or not decision.idempotency_key
+    ):
+        return base_key
+    prior_key = decision.idempotency_key
+    prior_order = db.scalar(
+        select(BrokerOrder).where(
+            BrokerOrder.mode == settings.runtime_mode,
+            BrokerOrder.idempotency_key == prior_key,
+        )
+    )
+    if prior_order is None:
+        return prior_key
+    if not _is_strategy_attributable_order(
+        order=prior_order,
+        order_origin=order_origin,
+        strategy_family=strategy_family,
+        route_scope=route_scope,
+    ):
+        return prior_key
+    request_metadata = (
+        prior_order.request_metadata
+        if isinstance(prior_order.request_metadata, dict)
+        else {}
+    )
+    command_metadata = request_metadata.get("metadata")
+    command_metadata = command_metadata if isinstance(command_metadata, dict) else {}
+    if (
+        command_metadata.get("decision_type") != "daily_target_rebalance"
+        or command_metadata.get("decision_bar_at") != decision_bar_at.isoformat()
+    ):
+        return prior_key
+    prior_status = str(prior_order.status or "").strip().lower()
+    if prior_status not in PROTECTIVE_EXIT_TERMINAL_STATUSES:
+        return prior_key
+    if prior_status == NormalizedBrokerOrderStatus.FILLED.value:
+        return prior_key
+    generation = sha256(str(prior_order.id).encode("utf-8")).hexdigest()[:16]
+    return _order_key(
+        version=settings.alpaca_crypto_strategy_version,
+        decision_date=decision_date,
+        symbol=symbol,
+        action=f"{action}-retry-{generation}",
+        account_scope=route_scope.account_scope,
+        strategy_family=strategy_family,
+    )
+
+
+def _strategy_protective_orders(
+    *,
+    settings: Settings,
+    db: Session,
+    symbol: str,
+    order_origin: str,
+    strategy_family: str,
+    route_scope: FifoRouteScope,
+) -> list[BrokerOrder]:
+    orders = db.scalars(
+        select(BrokerOrder).where(
+            BrokerOrder.mode == settings.runtime_mode,
+            BrokerOrder.broker_name == PROVIDER,
+            BrokerOrder.asset_class == route_scope.asset_class,
+            BrokerOrder.symbol == symbol,
+            BrokerOrder.side == "sell",
+        )
+    ).all()
+    protective_orders: list[BrokerOrder] = []
+    for order in orders:
+        request_metadata = (
+            order.request_metadata
+            if isinstance(order.request_metadata, dict)
+            else {}
+        )
+        command_metadata = request_metadata.get("metadata")
+        if not isinstance(command_metadata, dict):
+            continue
+        if command_metadata.get("decision_type") != "protective_exit":
+            continue
+        if not _is_strategy_attributable_order(
+            order=order,
+            order_origin=order_origin,
+            strategy_family=strategy_family,
+            route_scope=route_scope,
+        ):
+            continue
+        protective_orders.append(order)
+    return protective_orders
+
+
+def _verified_active_protective_sell_coverage(
+    *,
+    settings: Settings,
+    db: Session,
+    symbol: str,
+    open_orders: list[BrokerAccountOpenOrder],
+    desired_stop: Decimal,
+    order_origin: str,
+    strategy_family: str,
+    route_scope: FifoRouteScope,
+) -> tuple[Decimal, tuple[str, ...]]:
+    exact_orders = _strategy_protective_orders(
+        settings=settings,
+        db=db,
+        symbol=symbol,
+        order_origin=order_origin,
+        strategy_family=strategy_family,
+        route_scope=route_scope,
+    )
+    by_idempotency_key = {
+        order.idempotency_key: order for order in exact_orders
+    }
+    by_broker_order_id = {
+        order.broker_order_id: order
+        for order in exact_orders
+        if order.broker_order_id
+    }
+    matched_order_ids: set[str] = set()
+    counted_order_ids: set[str] = set()
+    covered_quantity = Decimal("0")
+    for open_order in open_orders:
+        if str(open_order.side or "").strip().lower() != "sell":
+            continue
+        if (
+            str(open_order.status or "").strip().lower()
+            not in ALPACA_ACTIVE_OPEN_ORDER_STATUSES
+        ):
+            continue
+        local_order = None
+        if open_order.idempotency_key:
+            local_order = by_idempotency_key.get(open_order.idempotency_key)
+        if local_order is None and open_order.broker_order_id:
+            local_order = by_broker_order_id.get(open_order.broker_order_id)
+        if local_order is None:
+            continue
+        local_order_id = str(local_order.id)
+        matched_order_ids.add(local_order_id)
+        if local_order_id in counted_order_ids:
+            continue
+        if (
+            str(local_order.status or "").strip().lower()
+            not in PROTECTIVE_EXIT_ACTIVE_ACK_STATUSES
+            or local_order.limit_price is not None
+        ):
+            continue
+        request_metadata = (
+            local_order.request_metadata
+            if isinstance(local_order.request_metadata, dict)
+            else {}
+        )
+        command_metadata = request_metadata.get("metadata")
+        command_metadata = (
+            command_metadata if isinstance(command_metadata, dict) else {}
+        )
+        protective_stop = _decimal_or_none(
+            command_metadata.get("protective_stop_price")
+        )
+        trigger_bid = _decimal_or_none(command_metadata.get("trigger_bid"))
+        open_payload = (
+            open_order.payload if isinstance(open_order.payload, dict) else {}
+        )
+        remaining_quantity = _decimal_or_none(
+            open_payload.get("remaining_base_quantity")
+        )
+        if (
+            protective_stop is None
+            or protective_stop < desired_stop
+            or trigger_bid is None
+            or trigger_bid > protective_stop
+            or remaining_quantity is None
+            or remaining_quantity <= 0
+        ):
+            continue
+        counted_order_ids.add(local_order_id)
+        covered_quantity += remaining_quantity
+    return covered_quantity, tuple(sorted(matched_order_ids))
+
+
+def _protective_order_sort_key(order: BrokerOrder) -> tuple[datetime, str]:
+    observed_at = order.submitted_at or order.created_at
+    return (
+        _as_utc(observed_at) if observed_at is not None else datetime.min.replace(tzinfo=UTC),
+        str(order.id),
+    )
+
+
+def _strategy_family(*, asset_class: str, exchange: str) -> str:
+    normalized_asset_class = str(asset_class or "").strip().lower()
+    normalized_exchange = str(exchange or "").strip().upper()
+    if not normalized_asset_class or not normalized_exchange:
+        raise ValueError("strategy family requires asset class and exchange")
+    value = f"{normalized_asset_class}:{normalized_exchange}"
+    if len(value) > 64:
+        raise ValueError("strategy family exceeds persistence limit")
+    return value
+
+
+def _execution_scope_payload(route_scope: FifoRouteScope) -> dict[str, object]:
+    return {
+        "policy_version": EXECUTION_SCOPE_POLICY_VERSION,
+        **route_scope.as_payload(),
+    }
 
 
 def _order_outcome(status_code: int, payload: dict[str, object]) -> dict[str, object]:
@@ -1048,12 +2009,84 @@ def _order_outcome(status_code: int, payload: dict[str, object]) -> dict[str, ob
     }
 
 
+def _protective_order_acknowledged(
+    status_code: int,
+    payload: dict[str, object],
+) -> bool:
+    if not 200 <= status_code < 300:
+        return False
+    order = payload.get("order")
+    order = order if isinstance(order, dict) else {}
+    status = str(order.get("status") or "").strip().lower()
+    if bool(payload.get("duplicate")):
+        return status in PROTECTIVE_EXIT_ACTIVE_ACK_STATUSES
+    return (
+        status in PROTECTIVE_EXIT_ACTIVE_ACK_STATUSES
+        or status == NormalizedBrokerOrderStatus.FILLED.value
+    )
+
+
+def _protective_order_failure_reason(
+    status_code: int,
+    payload: dict[str, object],
+) -> str:
+    order = payload.get("order")
+    order = order if isinstance(order, dict) else {}
+    status = str(order.get("status") or "").strip().lower()
+    if bool(payload.get("duplicate")):
+        return (
+            f"terminal_duplicate:{status}"
+            if status in PROTECTIVE_EXIT_TERMINAL_STATUSES
+            else "duplicate_not_active"
+        )
+    for key in ("block_reason", "rejection_reason"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    if status_code >= 500:
+        return "broker_order_submission_failed"
+    return "broker_order_not_acknowledged"
+
+
+def _protective_action_requires_attention(action: dict[str, object]) -> bool:
+    return action.get("action") in {
+        "protective_sell_blocked",
+        "protective_sell_failed",
+    }
+
+
+def _daily_rebalance_attention_reason(
+    decision_result: dict[str, object],
+) -> str | None:
+    actions = decision_result.get("actions")
+    if not isinstance(actions, list):
+        return None
+    statuses = {
+        str(action.get("status") or "")
+        for action in actions
+        if isinstance(action, dict)
+    }
+    if "retryable" in statuses:
+        return "rebalance_retryable_failure"
+    if "rejected" in statuses:
+        return "rebalance_rejected"
+    return None
+
+
 def _decision_status(status_code: int, payload: dict[str, object]) -> str:
-    if payload.get("duplicate"):
-        return "duplicate"
-    if 200 <= status_code < 300:
-        return "submitted"
-    return "rejected"
+    order = payload.get("order")
+    order = order if isinstance(order, dict) else {}
+    order_status = str(order.get("status") or "").strip().lower()
+    duplicate = bool(payload.get("duplicate"))
+    acknowledged_statuses = {
+        *PROTECTIVE_EXIT_ACTIVE_ACK_STATUSES,
+        NormalizedBrokerOrderStatus.FILLED.value,
+    }
+    if 200 <= status_code < 300 and order_status in acknowledged_statuses:
+        return "duplicate" if duplicate else "submitted"
+    if payload.get("permanent_rejection") is True:
+        return "rejected"
+    return "retryable"
 
 
 def _risk_payload(state: CryptoStrategyRiskState) -> dict[str, object]:

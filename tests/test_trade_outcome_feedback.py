@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
+import pytest
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 
@@ -18,11 +19,20 @@ from app.models.runtime import (
     ExecutionPosition,
 )
 from app.services.trade_outcome_feedback import (
+    REPORT_VERSION,
+    ensure_fresh_trade_outcome_feedback,
     generate_trade_outcome_feedback,
     load_latest_trade_outcome_feedback_snippet,
 )
 from app.services.account_drawdown_gate import latest_account_drawdown_gate_state
-from app.services.account_drawdown_recovery import recovery_account_fingerprint
+from app.services.account_drawdown_recovery import (
+    recovery_account_fingerprint,
+    recovery_idempotency_key,
+    recovery_policy_fingerprint,
+)
+from app.services import trade_outcome_feedback as feedback_service
+from app.services.fifo_inventory import FifoIsolationCursor, FifoRouteScope
+from app.services.position_identity import PositionIdentity, payload_with_position_identity
 from app.services.trigger_time_exec_agent import _request_payload
 from app.services.watch_exec_agent_sizing import _candidate_universe_payload, _sizing_request_payload
 
@@ -33,12 +43,102 @@ COMPLETE_KRW_FILL_ECONOMICS: dict[str, object] = {
     "transaction_cost_coverage": "complete",
     "transaction_cost_source": "test_fixture",
 }
+FEEDBACK_TEST_ACCOUNT_SCOPE = "a" * 24
+
+
+class _CapturingPositionSession:
+    def __init__(self, positions: list[ExecutionPosition]) -> None:
+        self.positions = positions
+        self.statement = None
+
+    def scalars(self, statement):
+        self.statement = statement
+        return self.positions
 
 
 def _session():
     engine = create_engine("sqlite:///:memory:", future=True)
     Base.metadata.create_all(engine)
     return engine, sessionmaker(bind=engine, future=True, expire_on_commit=False)()
+
+
+def _current_recovery_release_summary(
+    *,
+    settings: Settings,
+    source_order: BrokerOrder,
+    gate_disabled: bool = False,
+) -> dict[str, object]:
+    return {
+        "source_broker_order_pk": source_order.id,
+        "source_idempotency_key": source_order.idempotency_key,
+        "recovery_idempotency_key": recovery_idempotency_key(
+            base_key=source_order.idempotency_key,
+            source_broker_order_pk=source_order.id,
+            generation=1,
+        ),
+        "recovery_generation": 1,
+        "healthy_observation_count": 2,
+        "policy_fingerprint": recovery_policy_fingerprint(settings),
+        "gate_disabled": gate_disabled,
+    }
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_account_drawdown_gate_state_has_stable_empty_contract(enabled: bool) -> None:
+    engine, session = _session()
+
+    state = latest_account_drawdown_gate_state(
+        settings=Settings(
+            runtime_mode="paper",
+            account_drawdown_gate_enabled=enabled,
+        ),
+        db=session,
+    )
+
+    assert state == {
+        "available": True,
+        "enabled": enabled,
+        "gated": False,
+        "provider": "kis",
+        "latest_decision": None,
+        "active_recovery_scopes": {},
+        "reason": None,
+    }
+
+    session.close()
+    engine.dispose()
+
+
+def test_legacy_cost_basis_loader_fails_closed_on_duplicate_symbol_positions() -> None:
+    identity = PositionIdentity(
+        provider="kis",
+        account_scope="a" * 24,
+        exchange="KRX",
+    )
+    positions = [
+        ExecutionPosition(
+            id=f"position-{suffix}",
+            mode="paper",
+            symbol="005930",
+            quantity=0,
+            average_price=price,
+            updated_from="reconciliation",
+            raw_payload=payload_with_position_identity(None, identity=identity),
+        )
+        for suffix, price in (("one", Decimal("100")), ("two", Decimal("200")))
+    ]
+    db = _CapturingPositionSession(positions)
+    route = FifoRouteScope("kis", "a" * 24, "KRX", "stock", "KRX")
+
+    costs = feedback_service._load_legacy_sell_cost_basis(
+        settings=Settings(runtime_mode="paper"),
+        db=db,  # type: ignore[arg-type]
+        route_symbols={(route, "005930")},
+    )
+
+    assert costs == {}
+    assert db.statement is not None
+    assert " LIMIT " in f" {db.statement} ".upper()
 
 
 def _add_closed_trade(
@@ -81,6 +181,18 @@ def _add_closed_trade(
         side="buy",
         status="filled",
         quantity=quantity,
+        venue="KRX",
+        asset_class="stock",
+        request_metadata={
+            "provider": "kis",
+            "venue": "KRX",
+            "asset_class": "stock",
+            "exchange": "KRX",
+            "broker_account_scope": {
+                "policy_version": 1,
+                "scope": "kis:test-account:krw",
+            },
+        },
     )
     sell_order = BrokerOrder(
         id=f"order-sell-{suffix}",
@@ -92,6 +204,18 @@ def _add_closed_trade(
         side="sell",
         status="filled",
         quantity=quantity,
+        venue="KRX",
+        asset_class="stock",
+        request_metadata={
+            "provider": "kis",
+            "venue": "KRX",
+            "asset_class": "stock",
+            "exchange": "KRX",
+            "broker_account_scope": {
+                "policy_version": 1,
+                "scope": "kis:test-account:krw",
+            },
+        },
     )
     session.add_all(
         [
@@ -125,6 +249,398 @@ def _add_closed_trade(
             ),
         ]
     )
+
+
+def _bind_closed_trade_to_execution_scope(
+    session,
+    *,
+    suffix: str,
+    account_scope: str,
+    exchange: str = "KRX",
+    provider: str = "kis",
+) -> None:
+    for side in ("buy", "sell"):
+        order = session.get(BrokerOrder, f"order-{side}-{suffix}")
+        assert order is not None
+        order.broker_name = provider
+        order.venue = exchange
+        order.request_metadata = {
+            "execution_scope": {
+                "policy_version": 1,
+                "provider": provider,
+                "account_scope": account_scope,
+                "venue": exchange,
+                "asset_class": "stock",
+                "exchange": exchange,
+            }
+        }
+
+
+def _fifo_test_order(*, row_id: str, side: str) -> BrokerOrder:
+    return BrokerOrder(
+        id=row_id,
+        broker_name="kis",
+        mode="paper",
+        idempotency_key=row_id,
+        symbol="005930",
+        side=side,
+        status="filled",
+        quantity=1,
+        venue="KRX",
+        asset_class="stock",
+        request_metadata={
+            "execution_scope": {
+                "policy_version": 1,
+                "provider": "kis",
+                "account_scope": FEEDBACK_TEST_ACCOUNT_SCOPE,
+                "venue": "KRX",
+                "asset_class": "stock",
+                "exchange": "KRX",
+            }
+        },
+    )
+
+
+def _fifo_test_fill(
+    *,
+    row_id: str,
+    order: BrokerOrder,
+    side: str,
+    price: str,
+    filled_at: datetime,
+) -> ExecutionFill:
+    return ExecutionFill(
+        id=row_id,
+        broker_order=order,
+        broker_fill_id=row_id,
+        symbol="005930",
+        side=side,
+        quantity=1,
+        price=Decimal(price),
+        **COMPLETE_KRW_FILL_ECONOMICS,
+        filled_at=filled_at,
+    )
+
+
+def test_fifo_outcome_fails_closed_for_materially_different_same_time_buys() -> None:
+    filled_at = datetime(2026, 6, 10, 0, 30, tzinfo=UTC)
+    first_buy = _fifo_test_order(row_id="ambiguous-buy-one", side="buy")
+    second_buy = _fifo_test_order(row_id="ambiguous-buy-two", side="buy")
+    sell = _fifo_test_order(row_id="ambiguous-later-sell", side="sell")
+
+    rows = feedback_service._fifo_closed_trades(
+        [
+            _fifo_test_fill(
+                row_id="ambiguous-buy-fill-one",
+                order=first_buy,
+                side="buy",
+                price="100",
+                filled_at=filled_at,
+            ),
+            _fifo_test_fill(
+                row_id="ambiguous-buy-fill-two",
+                order=second_buy,
+                side="buy",
+                price="200",
+                filled_at=filled_at,
+            ),
+            _fifo_test_fill(
+                row_id="ambiguous-sell-fill",
+                order=sell,
+                side="sell",
+                price="150",
+                filled_at=filled_at + timedelta(minutes=1),
+            ),
+        ]
+    )
+
+    assert len(rows) == 1
+    assert rows[0]["profitability_eligible"] is False
+    assert "fill_chronology_ambiguous" in rows[0]["outcome_quality_flags"]
+
+
+def test_fifo_outcome_accepts_clean_trade_after_exact_route_flat_boundary() -> None:
+    old_at = datetime(2026, 6, 10, 0, 30, tzinfo=UTC)
+    boundary_at = old_at + timedelta(seconds=1)
+    route = FifoRouteScope(
+        "kis", FEEDBACK_TEST_ACCOUNT_SCOPE, "KRX", "stock", "KRX"
+    )
+    cursor = FifoIsolationCursor(
+        isolated_at_by_route_symbol={(route, "005930"): [boundary_at]}
+    )
+    orders = {
+        key: _fifo_test_order(row_id=f"generation-{key}", side=side)
+        for key, side in (
+            ("old-buy-one", "buy"),
+            ("old-buy-two", "buy"),
+            ("new-buy", "buy"),
+            ("new-sell", "sell"),
+        )
+    }
+
+    rows = feedback_service._fifo_closed_trades(
+        [
+            _fifo_test_fill(
+                row_id="generation-old-buy-fill-one",
+                order=orders["old-buy-one"],
+                side="buy",
+                price="100",
+                filled_at=old_at,
+            ),
+            _fifo_test_fill(
+                row_id="generation-old-buy-fill-two",
+                order=orders["old-buy-two"],
+                side="buy",
+                price="200",
+                filled_at=old_at,
+            ),
+            _fifo_test_fill(
+                row_id="generation-new-buy-fill",
+                order=orders["new-buy"],
+                side="buy",
+                price="300",
+                filled_at=boundary_at + timedelta(seconds=1),
+            ),
+            _fifo_test_fill(
+                row_id="generation-new-sell-fill",
+                order=orders["new-sell"],
+                side="sell",
+                price="350",
+                filled_at=boundary_at + timedelta(minutes=1),
+            ),
+        ],
+        isolation_cursor=cursor,
+    )
+
+    assert len(rows) == 1
+    assert rows[0]["profitability_eligible"] is True
+    assert rows[0]["gross_realized_pnl"] == "50.0000"
+    assert "fill_chronology_ambiguous" not in rows[0]["outcome_quality_flags"]
+
+
+@pytest.mark.parametrize(
+    (
+        "buy_provider",
+        "buy_account_scope",
+        "buy_venue",
+        "buy_exchange",
+        "sell_provider",
+        "sell_account_scope",
+        "sell_venue",
+        "sell_exchange",
+    ),
+    [
+        (
+            "kis",
+            "kis-account-a",
+            "KRX",
+            "KRX",
+            "alpaca",
+            "alpaca-account-b",
+            "ALPACA",
+            "NASD",
+        ),
+        (
+            "alpaca",
+            "alpaca-account-a",
+            "ALPACA",
+            "NASD",
+            "alpaca",
+            "alpaca-account-a",
+            "ALPACA",
+            "NYSE",
+        ),
+    ],
+)
+def test_trade_outcome_feedback_never_matches_same_symbol_across_route_dimensions(
+    tmp_path,
+    buy_provider: str,
+    buy_account_scope: str,
+    buy_venue: str,
+    buy_exchange: str,
+    sell_provider: str,
+    sell_account_scope: str,
+    sell_venue: str,
+    sell_exchange: str,
+) -> None:
+    engine, session = _session()
+    settings = Settings(
+        runtime_mode="paper",
+        trade_outcome_feedback_dir=str(tmp_path),
+        trade_outcome_feedback_lookback_days=7,
+    )
+
+    def order(
+        *,
+        row_id: str,
+        provider: str,
+        side: str,
+        account_scope: str,
+        venue: str,
+        exchange: str,
+    ) -> BrokerOrder:
+        return BrokerOrder(
+            id=row_id,
+            broker_name=provider,
+            mode="paper",
+            idempotency_key=row_id,
+            broker_order_id=row_id,
+            symbol="AAPL",
+            side=side,
+            status="filled",
+            quantity=1,
+            venue=venue,
+            asset_class="stock",
+            request_metadata={
+                "provider": provider,
+                "venue": venue,
+                "asset_class": "stock",
+                "exchange": exchange,
+                "broker_account_scope": {
+                    "policy_version": 1,
+                    "scope": account_scope,
+                },
+            },
+        )
+
+    scoped_buy = order(
+        row_id="kis-aapl-buy",
+        provider=buy_provider,
+        side="buy",
+        account_scope=buy_account_scope,
+        venue=buy_venue,
+        exchange=buy_exchange,
+    )
+    scoped_sell = order(
+        row_id="alpaca-aapl-sell",
+        provider=sell_provider,
+        side="sell",
+        account_scope=sell_account_scope,
+        venue=sell_venue,
+        exchange=sell_exchange,
+    )
+    session.add_all([scoped_buy, scoped_sell])
+    session.flush()
+    session.add_all(
+        [
+            ExecutionFill(
+                broker_order=scoped_buy,
+                broker_fill_id="kis-aapl-buy-fill",
+                symbol="AAPL",
+                side="buy",
+                quantity=1,
+                price=Decimal("100"),
+                **COMPLETE_KRW_FILL_ECONOMICS,
+                filled_at=datetime(2026, 6, 10, 0, 30, tzinfo=UTC),
+            ),
+            ExecutionFill(
+                broker_order=scoped_sell,
+                broker_fill_id="alpaca-aapl-sell-fill",
+                symbol="AAPL",
+                side="sell",
+                quantity=1,
+                price=Decimal("200"),
+                **COMPLETE_KRW_FILL_ECONOMICS,
+                filled_at=datetime(2026, 6, 11, 0, 30, tzinfo=UTC),
+            ),
+        ]
+    )
+    session.commit()
+
+    report = generate_trade_outcome_feedback(
+        settings=settings,
+        db=session,
+        as_of=datetime(2026, 6, 12, tzinfo=UTC),
+    )
+
+    assert report["closed_trade_count"] == 1
+    trade = report["closed_trades"][0]
+    assert trade["gross_realized_pnl"] is None
+    assert trade["profitability_eligible"] is False
+    assert trade["execution_scope"]["provider"] == sell_provider
+    assert trade["execution_scope"]["exchange"] == sell_exchange
+    assert report["lessons"]["eligible_trade_count"] == 0
+    assert report["summary"]["realized_pnl_krw"] is None
+    session.close()
+    engine.dispose()
+
+
+def test_trade_outcome_feedback_marks_legacy_unscoped_fifo_quality_unavailable(
+    tmp_path,
+) -> None:
+    engine, session = _session()
+    settings = Settings(
+        runtime_mode="paper",
+        trade_outcome_feedback_dir=str(tmp_path),
+        trade_outcome_feedback_lookback_days=7,
+    )
+    buy_order = BrokerOrder(
+        id="legacy-scope-buy",
+        broker_name="kis",
+        mode="paper",
+        idempotency_key="legacy-scope-buy",
+        symbol="005930",
+        side="buy",
+        status="filled",
+        quantity=1,
+        venue="KRX",
+        asset_class="stock",
+    )
+    sell_order = BrokerOrder(
+        id="legacy-scope-sell",
+        broker_name="kis",
+        mode="paper",
+        idempotency_key="legacy-scope-sell",
+        symbol="005930",
+        side="sell",
+        status="filled",
+        quantity=1,
+        venue="KRX",
+        asset_class="stock",
+    )
+    session.add_all([buy_order, sell_order])
+    session.flush()
+    session.add_all(
+        [
+            ExecutionFill(
+                broker_order=buy_order,
+                broker_fill_id="legacy-scope-buy-fill",
+                symbol="005930",
+                side="buy",
+                quantity=1,
+                price=Decimal("100"),
+                **COMPLETE_KRW_FILL_ECONOMICS,
+                filled_at=datetime(2026, 6, 10, 0, 30, tzinfo=UTC),
+            ),
+            ExecutionFill(
+                broker_order=sell_order,
+                broker_fill_id="legacy-scope-sell-fill",
+                symbol="005930",
+                side="sell",
+                quantity=1,
+                price=Decimal("200"),
+                **COMPLETE_KRW_FILL_ECONOMICS,
+                filled_at=datetime(2026, 6, 11, 0, 30, tzinfo=UTC),
+            ),
+        ]
+    )
+    session.commit()
+
+    report = generate_trade_outcome_feedback(
+        settings=settings,
+        db=session,
+        as_of=datetime(2026, 6, 12, tzinfo=UTC),
+    )
+
+    assert report["closed_trade_count"] == 1
+    trade = report["closed_trades"][0]
+    assert trade["gross_realized_pnl"] is None
+    assert trade["profitability_eligible"] is False
+    assert trade["outcome_source"] == "unavailable"
+    assert "execution_scope_unavailable" in trade["outcome_quality_flags"]
+    assert report["lessons"]["eligible_trade_count"] == 0
+    session.close()
+    engine.dispose()
 
 
 def test_generate_trade_outcome_feedback_writes_fifo_report_and_snippet(tmp_path) -> None:
@@ -180,6 +696,18 @@ def test_generate_trade_outcome_feedback_writes_fifo_report_and_snippet(tmp_path
         side="buy",
         status="filled",
         quantity=10,
+        venue="KRX",
+        asset_class="stock",
+        request_metadata={
+            "provider": "kis",
+            "venue": "KRX",
+            "asset_class": "stock",
+            "exchange": "KRX",
+            "broker_account_scope": {
+                "policy_version": 1,
+                "scope": FEEDBACK_TEST_ACCOUNT_SCOPE,
+            },
+        },
     )
     sell_order = BrokerOrder(
         id="order-sell-1",
@@ -191,6 +719,18 @@ def test_generate_trade_outcome_feedback_writes_fifo_report_and_snippet(tmp_path
         side="sell",
         status="filled",
         quantity=10,
+        venue="KRX",
+        asset_class="stock",
+        request_metadata={
+            "provider": "kis",
+            "venue": "KRX",
+            "asset_class": "stock",
+            "exchange": "KRX",
+            "broker_account_scope": {
+                "policy_version": 1,
+                "scope": FEEDBACK_TEST_ACCOUNT_SCOPE,
+            },
+        },
     )
     session.add_all(
         [
@@ -247,13 +787,16 @@ def test_generate_trade_outcome_feedback_writes_fifo_report_and_snippet(tmp_path
     assert load_latest_trade_outcome_feedback_snippet(
         settings,
         now=datetime(2026, 6, 12, 0, 1, tzinfo=UTC),
+        provider="kis",
+        account_scope=FEEDBACK_TEST_ACCOUNT_SCOPE,
+        exchange="KRX",
     )["closed_trade_count"] == 1
 
     session.close()
     engine.dispose()
 
 
-def test_trade_outcome_feedback_estimates_legacy_sell_without_fifo_buy_lot(tmp_path) -> None:
+def test_trade_outcome_feedback_does_not_use_unscoped_position_cost_basis(tmp_path) -> None:
     engine, session = _session()
     settings = Settings(
         runtime_mode="paper",
@@ -324,21 +867,20 @@ def test_trade_outcome_feedback_estimates_legacy_sell_without_fifo_buy_lot(tmp_p
     trade = report["closed_trades"][0]
     assert trade["symbol"] == "002380"
     assert trade["realized_pnl_krw"] is None
-    assert trade["gross_realized_pnl_krw"] == "-97500.0000"
+    assert trade["gross_realized_pnl_krw"] is None
     assert trade["return_pct"] is None
-    assert trade["gross_return_pct"] == "-19.0802"
+    assert trade["gross_return_pct"] is None
     assert trade["profitability_eligible"] is False
     assert trade["outcome_bucket"] == "unavailable"
     assert trade["transaction_cost_coverage"] == "unknown"
-    assert trade["outcome_source"] == "reconciled_average_cost_estimate"
-    assert trade["buy"]["price"] == "511000.0000"
+    assert trade["outcome_source"] == "unavailable"
+    assert trade["buy"]["price"] is None
     assert "missing_fifo_buy_lot" in trade["outcome_quality_flags"]
+    assert "execution_scope_unavailable" in trade["outcome_quality_flags"]
     assert report["summary"]["realized_pnl_krw"] is None
-    assert report["summary"]["gross_realized_pnl_by_currency"] == {
-        "KRW": "-97500.0000"
-    }
-    assert report["summary"]["estimated_trade_count"] == 1
-    assert report["summary"]["unavailable_trade_count"] == 0
+    assert report["summary"]["gross_realized_pnl_by_currency"] == {}
+    assert report["summary"]["estimated_trade_count"] == 0
+    assert report["summary"]["unavailable_trade_count"] == 1
     assert report["candidate_rule_replay"]["status"] == "blocked"
     assert report["candidate_rule_replay"]["promotion_eligible"] is False
     assert report["candidate_rule_replay"]["blocked_reason"] == (
@@ -437,6 +979,9 @@ def test_trade_outcome_feedback_headlines_broker_total_asset_change_with_unreali
         ExecutionPosition(
             id="pos-asset-drawdown",
             mode="paper",
+            provider="kis",
+            account_scope=FEEDBACK_TEST_ACCOUNT_SCOPE,
+            exchange="KRX",
             symbol="000660",
             quantity=10,
             average_price=Decimal("200000"),
@@ -505,6 +1050,75 @@ def test_trade_outcome_feedback_headlines_broker_total_asset_change_with_unreali
     engine.dispose()
 
 
+def test_broker_asset_performance_fails_closed_across_account_scopes(tmp_path) -> None:
+    engine, session = _session()
+    settings = Settings(
+        runtime_mode="paper",
+        trade_outcome_feedback_dir=str(tmp_path),
+        trade_outcome_feedback_lookback_days=1,
+        exec_agent_max_account_snapshot_age_seconds=20000,
+    )
+
+    def position(*, symbol: str, scope: str, observed_at: datetime) -> ExecutionPosition:
+        return ExecutionPosition(
+            mode="paper",
+            provider="kis",
+            account_scope=scope,
+            exchange="KRX",
+            symbol=symbol,
+            quantity=1,
+            average_price=Decimal("100"),
+            updated_from="reconciliation",
+            last_reconciled_at=observed_at,
+            raw_payload={
+                "balance": {
+                    "output2": [
+                        {
+                            "tot_evlu_amt": "1000",
+                            "nass_amt": "1000",
+                            "bfdy_tot_asst_evlu_amt": "900",
+                            "asst_icdc_amt": "100",
+                        }
+                    ]
+                }
+            },
+        )
+
+    session.add_all(
+        [
+            position(
+                symbol="005930",
+                scope="a" * 24,
+                observed_at=datetime(2026, 6, 26, 5, 0, tzinfo=UTC),
+            ),
+            position(
+                symbol="000660",
+                scope="b" * 24,
+                observed_at=datetime(2026, 6, 26, 6, 0, tzinfo=UTC),
+            ),
+        ]
+    )
+    session.commit()
+
+    report = generate_trade_outcome_feedback(
+        settings=settings,
+        db=session,
+        as_of=datetime(2026, 6, 26, 9, 0, tzinfo=UTC),
+    )
+
+    broker_asset = report["broker_asset_performance"]
+    assert broker_asset["available"] is False
+    assert broker_asset["source_failed"] == (
+        "multiple broker account scopes are present in balance snapshots; "
+        "account-level asset performance is unavailable"
+    )
+    assert report["summary"]["primary_performance_metric"] != (
+        "broker_total_asset_change"
+    )
+    session.close()
+    engine.dispose()
+
+
 def test_trade_outcome_feedback_surfaces_broker_raw_normalized_drift(tmp_path) -> None:
     engine, session = _session()
     settings = Settings(
@@ -535,6 +1149,9 @@ def test_trade_outcome_feedback_surfaces_broker_raw_normalized_drift(tmp_path) -
         ExecutionPosition(
             id="pos-raw-drift-carrier",
             mode="paper",
+            provider="kis",
+            account_scope=FEEDBACK_TEST_ACCOUNT_SCOPE,
+            exchange="KRX",
             symbol="005930",
             quantity=0,
             average_price=None,
@@ -641,6 +1258,9 @@ def test_trade_outcome_feedback_bounds_execution_position_raw_payload_reads(tmp_
             ExecutionPosition(
                 id=f"pos-large-raw-{index}",
                 mode="paper",
+                provider="kis",
+                account_scope=FEEDBACK_TEST_ACCOUNT_SCOPE,
+                exchange="KRX",
                 symbol=f"9{index:05d}",
                 quantity=0,
                 average_price=None,
@@ -653,6 +1273,9 @@ def test_trade_outcome_feedback_bounds_execution_position_raw_payload_reads(tmp_
         ExecutionPosition(
             id="pos-latest-balance",
             mode="paper",
+            provider="kis",
+            account_scope=FEEDBACK_TEST_ACCOUNT_SCOPE,
+            exchange="KRX",
             symbol="005930",
             quantity=1,
             average_price=Decimal("100000"),
@@ -755,6 +1378,10 @@ def test_trade_outcome_feedback_reports_account_drawdown_gate_state(tmp_path) ->
         as_of=datetime(2026, 6, 20, tzinfo=UTC),
     )
 
+    assert report["account_drawdown_gate"]["available"] is True
+    assert report["account_drawdown_gate"]["enabled"] is True
+    assert report["account_drawdown_gate"]["provider"] == "kis"
+    assert report["account_drawdown_gate"]["reason"] is None
     assert report["account_drawdown_gate"]["gated"] is True
     assert (
         report["account_drawdown_gate"]["latest_decision"]["summary"]["gate_name"]
@@ -956,7 +1583,10 @@ def test_account_drawdown_gate_state_keeps_recovery_scopes_independent() -> None
                 execution_plan_item_id=krw_item.id,
                 event_type="account_drawdown_recovery_released",
                 source="broker_order_service",
-                summary={"source_broker_order_pk": krw_order.id},
+                summary=_current_recovery_release_summary(
+                    settings=settings,
+                    source_order=krw_order,
+                ),
                 occurred_at=datetime(2026, 6, 20, 1, 0, tzinfo=UTC),
             ),
         ]
@@ -977,7 +1607,10 @@ def test_account_drawdown_gate_state_keeps_recovery_scopes_independent() -> None
             execution_plan_item_id=usd_item.id,
             event_type="account_drawdown_recovery_released",
             source="broker_order_service",
-            summary={"source_broker_order_pk": usd_order.id},
+            summary=_current_recovery_release_summary(
+                settings=settings,
+                source_order=usd_order,
+            ),
             occurred_at=datetime(2026, 6, 20, 1, 5, tzinfo=UTC),
         )
     )
@@ -1068,13 +1701,28 @@ def test_account_drawdown_gate_state_preserves_nonrecoverable_policy_v1_block() 
     engine.dispose()
 
 
-def test_account_drawdown_gate_state_hides_foreign_account_policy_block_with_stable_secret() -> None:
+@pytest.mark.parametrize(
+    "scope_settings",
+    [
+        {
+            "kis_account_number": "11112222",
+            "account_drawdown_recovery_scope_secret": "stable-scope-secret",
+        },
+        {
+            "kis_account_number": "11112222",
+            "execution_position_account_scope": "primary-kis-account",
+        },
+    ],
+    ids=("stable-secret", "configured-route-label"),
+)
+def test_account_drawdown_gate_state_hides_foreign_account_policy_block_with_scope_authority(
+    scope_settings: dict[str, str],
+) -> None:
     engine, session = _session()
     settings = Settings(
         runtime_mode="paper",
         account_drawdown_gate_enabled=True,
-        kis_account_number="11112222",
-        account_drawdown_recovery_scope_secret="stable-scope-secret",
+        **scope_settings,
     )
     plan = ExecutionPlan(
         id="plan-drawdown-foreign-account-state",
@@ -1332,7 +1980,11 @@ def test_account_drawdown_gate_state_honors_legacy_source_release() -> None:
                 execution_plan_item_id=item.id,
                 event_type="account_drawdown_gate_disabled_release",
                 source="broker_order_service",
-                summary={"source_broker_order_pk": order.id, "gate_disabled": True},
+                summary=_current_recovery_release_summary(
+                    settings=settings,
+                    source_order=order,
+                    gate_disabled=True,
+                ),
                 occurred_at=datetime(2026, 6, 20, 1, 0, tzinfo=UTC),
             ),
         ]
@@ -1380,6 +2032,9 @@ def test_trade_outcome_feedback_multi_day_does_not_headline_previous_day_broker_
         ExecutionPosition(
             id="pos-multiday-latest-only",
             mode="paper",
+            provider="kis",
+            account_scope=FEEDBACK_TEST_ACCOUNT_SCOPE,
+            exchange="KRX",
             symbol="000660",
             quantity=10,
             average_price=Decimal("200000"),
@@ -1420,7 +2075,23 @@ def test_trade_outcome_feedback_multi_day_does_not_headline_previous_day_broker_
     engine.dispose()
 
 
-def test_trade_outcome_feedback_output2_without_asset_fields_is_unavailable(tmp_path) -> None:
+@pytest.mark.parametrize(
+    "output2",
+    [
+        {"ord_psbl_cash": "123456"},
+        {
+            "tot_evlu_amt": "Infinity",
+            "nass_amt": "NaN",
+            "bfdy_tot_asst_evlu_amt": "-Infinity",
+            "asst_icdc_amt": "Infinity",
+        },
+    ],
+    ids=["missing", "nonfinite"],
+)
+def test_trade_outcome_feedback_output2_without_finite_asset_fields_is_unavailable(
+    tmp_path,
+    output2: dict[str, str],
+) -> None:
     engine, session = _session()
     settings = Settings(
         runtime_mode="paper",
@@ -1449,12 +2120,15 @@ def test_trade_outcome_feedback_output2_without_asset_fields_is_unavailable(tmp_
         ExecutionPosition(
             id="pos-missing-asset-fields",
             mode="paper",
+            provider="kis",
+            account_scope=FEEDBACK_TEST_ACCOUNT_SCOPE,
+            exchange="KRX",
             symbol="000660",
             quantity=10,
             average_price=Decimal("200000"),
             updated_from="reconciliation",
             last_reconciled_at=datetime(2026, 6, 26, 6, 0, tzinfo=UTC),
-            raw_payload={"balance": {"output2": [{"ord_psbl_cash": "123456"}]}},
+            raw_payload={"balance": {"output2": [output2]}},
         )
     )
     session.commit()
@@ -1643,6 +2317,19 @@ def test_trade_outcome_feedback_portfolio_risk_and_sell_reason_contributions(tmp
             last_broker_sync_at=datetime(2026, 6, 19, 0, 1, tzinfo=UTC),
         ),
     ]
+    for order in orders:
+        order.venue = "KRX"
+        order.asset_class = "stock"
+        order.request_metadata = {
+            "provider": "kis",
+            "venue": "KRX",
+            "asset_class": "stock",
+            "exchange": "KRX",
+            "broker_account_scope": {
+                "policy_version": 1,
+                "scope": "kis:test-account:krw",
+            },
+        }
     session.add_all(
         [
             plan,
@@ -1908,6 +2595,16 @@ def test_trade_outcome_feedback_degrades_mixed_currency_portfolio_aggregation(
         exec_agent_max_account_snapshot_age_seconds=300,
     )
     reconciled_at = datetime(2026, 6, 20, 0, 9, tzinfo=UTC)
+    krw_identity = PositionIdentity(
+        provider="kis",
+        account_scope=FEEDBACK_TEST_ACCOUNT_SCOPE,
+        exchange="KRX",
+    )
+    usd_identity = PositionIdentity(
+        provider="kis",
+        account_scope=FEEDBACK_TEST_ACCOUNT_SCOPE,
+        exchange="NASD",
+    )
     session.add_all(
         [
             ExecutionPosition(
@@ -1916,8 +2613,15 @@ def test_trade_outcome_feedback_degrades_mixed_currency_portfolio_aggregation(
                 symbol="005930",
                 quantity=10,
                 average_price=Decimal("100000"),
+                provider=krw_identity.provider,
+                account_scope=krw_identity.account_scope,
+                exchange=krw_identity.exchange,
                 updated_from="broker_reconciliation",
                 last_reconciled_at=reconciled_at,
+                raw_payload=payload_with_position_identity(
+                    None,
+                    identity=krw_identity,
+                ),
             ),
             ExecutionPosition(
                 id="pos-mixed-usd",
@@ -1925,14 +2629,20 @@ def test_trade_outcome_feedback_degrades_mixed_currency_portfolio_aggregation(
                 symbol="AAPL",
                 quantity=2,
                 average_price=Decimal("200"),
+                provider=usd_identity.provider,
+                account_scope=usd_identity.account_scope,
+                exchange=usd_identity.exchange,
                 updated_from="broker_reconciliation",
                 last_reconciled_at=reconciled_at,
-                raw_payload={
-                    "_position_sync": {
-                        "asset_class": "us_equity",
-                        "exchange": "NASD",
-                    }
-                },
+                raw_payload=payload_with_position_identity(
+                    {
+                        "_position_sync": {
+                            "asset_class": "us_equity",
+                            "exchange": "NASD",
+                        }
+                    },
+                    identity=usd_identity,
+                ),
             ),
         ]
     )
@@ -2694,6 +3404,18 @@ def test_candidate_rule_replay_uses_sell_post_entry_context(tmp_path) -> None:
         side="buy",
         status="filled",
         quantity=10,
+        venue="KRX",
+        asset_class="stock",
+        request_metadata={
+            "provider": "kis",
+            "venue": "KRX",
+            "asset_class": "stock",
+            "exchange": "KRX",
+            "broker_account_scope": {
+                "policy_version": 1,
+                "scope": "kis:test-account:krw",
+            },
+        },
     )
     sell_order = BrokerOrder(
         id="order-sell-sell-context",
@@ -2706,6 +3428,18 @@ def test_candidate_rule_replay_uses_sell_post_entry_context(tmp_path) -> None:
         side="sell",
         status="filled",
         quantity=10,
+        venue="KRX",
+        asset_class="stock",
+        request_metadata={
+            "provider": "kis",
+            "venue": "KRX",
+            "asset_class": "stock",
+            "exchange": "KRX",
+            "broker_account_scope": {
+                "policy_version": 1,
+                "scope": "kis:test-account:krw",
+            },
+        },
     )
     session.add_all(
         [
@@ -2755,8 +3489,13 @@ def test_exec_agent_payloads_include_latest_trade_outcome_feedback(tmp_path) -> 
     (tmp_path / "latest.json").write_text(
         json.dumps(
             {
-                "version": "trade-outcome-feedback-v1",
+                "version": "trade-outcome-feedback-v2",
                 "mode": "paper",
+                "execution_account_scope": {
+                    "status": "single",
+                    "provider": "kis",
+                    "account_scope": FEEDBACK_TEST_ACCOUNT_SCOPE,
+                },
                 "generated_at": datetime.now(UTC).isoformat(),
                 "lookback_days": 20,
                 "closed_trade_count": 1,
@@ -2795,7 +3534,13 @@ def test_exec_agent_payloads_include_latest_trade_outcome_feedback(tmp_path) -> 
         settings=settings,
         plan=plan,
         candidates=[{"execution_plan_item_id": item.id, "symbol": item.symbol}],
-        account_context={"available": False},
+        account_context={
+            "available": False,
+            "execution_account_scope": {
+                "provider": "kis",
+                "account_scope": FEEDBACK_TEST_ACCOUNT_SCOPE,
+            },
+        },
         candidate_universe=_candidate_universe_payload([]),
     )
     trigger_payload = _request_payload(
@@ -2803,7 +3548,12 @@ def test_exec_agent_payloads_include_latest_trade_outcome_feedback(tmp_path) -> 
         item=item,
         side="buy",
         market_context={},
-        account_context={},
+        account_context={
+            "execution_account_scope": {
+                "provider": "kis",
+                "account_scope": FEEDBACK_TEST_ACCOUNT_SCOPE,
+            }
+        },
         peer_context={},
         intended_quantity=None,
         remaining_quantity=None,
@@ -2820,12 +3570,429 @@ def test_exec_agent_payloads_include_latest_trade_outcome_feedback(tmp_path) -> 
     engine.dispose()
 
 
+def test_latest_trade_outcome_feedback_requires_exact_account_scope(tmp_path) -> None:
+    settings = Settings(runtime_mode="paper", trade_outcome_feedback_dir=str(tmp_path))
+    (tmp_path / "latest.json").write_text(
+        json.dumps(
+            {
+                "version": "trade-outcome-feedback-v2",
+                "mode": "paper",
+                "execution_account_scope": {
+                    "status": "single",
+                    "provider": "kis",
+                    "account_scope": FEEDBACK_TEST_ACCOUNT_SCOPE,
+                },
+                "generated_at": datetime.now(UTC).isoformat(),
+                "lookback_days": 20,
+                "closed_trade_count": 1,
+                "summary": {"realized_pnl_krw": "-10000.0000"},
+                "prompt_snippet": {"patterns_to_downsize_or_reject": ["loss-pattern"]},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert load_latest_trade_outcome_feedback_snippet(
+        settings,
+        provider="kis",
+        account_scope=FEEDBACK_TEST_ACCOUNT_SCOPE,
+    ) is not None
+    assert load_latest_trade_outcome_feedback_snippet(
+        settings,
+        provider="kis",
+        account_scope="b" * 24,
+    ) is None
+    assert load_latest_trade_outcome_feedback_snippet(
+        settings,
+        provider="alpaca",
+        account_scope=FEEDBACK_TEST_ACCOUNT_SCOPE,
+    ) is None
+    assert load_latest_trade_outcome_feedback_snippet(settings) is None
+
+
+def test_mixed_account_feedback_is_never_reused_for_agent_decisions(tmp_path) -> None:
+    engine, session = _session()
+    settings = Settings(runtime_mode="paper", trade_outcome_feedback_dir=str(tmp_path))
+    for suffix, account_scope in (("a", "a" * 24), ("b", "b" * 24)):
+        session.add(
+            BrokerOrder(
+                id=f"open-{suffix}",
+                broker_name="kis",
+                mode="paper",
+                idempotency_key=f"open-{suffix}",
+                broker_order_id=f"open-{suffix}",
+                symbol="005930",
+                side="buy",
+                status="submitted",
+                quantity=1,
+                venue="KRX",
+                asset_class="stock",
+                request_metadata={
+                    "execution_scope": {
+                        "policy_version": 1,
+                        "provider": "kis",
+                        "account_scope": account_scope,
+                        "venue": "KRX",
+                        "asset_class": "stock",
+                        "exchange": "KRX",
+                    }
+                },
+            )
+        )
+    session.commit()
+
+    report = generate_trade_outcome_feedback(
+        settings=settings,
+        db=session,
+        as_of=datetime.now(UTC),
+    )
+
+    assert report["execution_account_scope"]["status"] == "mixed"
+    assert load_latest_trade_outcome_feedback_snippet(
+        settings,
+        provider="kis",
+        account_scope="a" * 24,
+    ) is None
+
+    session.close()
+    engine.dispose()
+
+
+def test_scoped_feedback_generation_excludes_foreign_and_legacy_route_rows(
+    tmp_path,
+) -> None:
+    engine, session = _session()
+    settings = Settings(
+        runtime_mode="paper",
+        trade_outcome_feedback_dir=str(tmp_path),
+        trade_outcome_feedback_lookback_days=10,
+    )
+    account_a = "a" * 24
+    account_b = "b" * 24
+    plan_a = ExecutionPlan(
+        id="plan-scoped-feedback-a",
+        external_plan_id="plan-scoped-feedback-a",
+        source="kai-trading-core",
+        mode="paper",
+    )
+    plan_b = ExecutionPlan(
+        id="plan-scoped-feedback-b",
+        external_plan_id="plan-scoped-feedback-b",
+        source="kai-trading-core",
+        mode="paper",
+    )
+    session.add_all([plan_a, plan_b])
+    _add_closed_trade(
+        session,
+        plan=plan_a,
+        suffix="scoped-a",
+        symbol="ACCOUNT-A-WINNER",
+        buy_price="100",
+        sell_price="110",
+    )
+    _add_closed_trade(
+        session,
+        plan=plan_b,
+        suffix="scoped-b",
+        symbol="ACCOUNT-B-LOSER",
+        buy_price="100",
+        sell_price="80",
+    )
+    _bind_closed_trade_to_execution_scope(
+        session,
+        suffix="scoped-a",
+        account_scope=account_a,
+    )
+    _bind_closed_trade_to_execution_scope(
+        session,
+        suffix="scoped-b",
+        account_scope=account_b,
+    )
+    session.add(
+        BrokerOrder(
+            id="legacy-open-feedback-order",
+            broker_name="kis",
+            mode="paper",
+            idempotency_key="legacy-open-feedback-order",
+            broker_order_id="legacy-open-feedback-order",
+            symbol="LEGACY-FOREIGN",
+            side="buy",
+            status="submitted",
+            quantity=1,
+            venue="KRX",
+            asset_class="stock",
+            request_metadata={
+                "broker_account_scope": {
+                    "policy_version": 1,
+                    "scope": account_a,
+                },
+                "exchange": "KRX",
+            },
+        )
+    )
+    session.add(
+        BrokerOrder(
+            id="invalid-open-feedback-order",
+            broker_name="kis",
+            mode="paper",
+            idempotency_key="invalid-open-feedback-order",
+            broker_order_id="invalid-open-feedback-order",
+            symbol="INVALID-FOREIGN",
+            side="buy",
+            status="submitted",
+            quantity=1,
+            venue="KRX",
+            asset_class="stock",
+            request_metadata={
+                "execution_scope": {
+                    "policy_version": 1,
+                    "provider": "kis",
+                    "account_scope": "raw-account-reference",
+                    "venue": "KRX",
+                    "asset_class": "stock",
+                    "exchange": "KRX",
+                }
+            },
+        )
+    )
+    identity_a = PositionIdentity(
+        provider="kis",
+        account_scope=account_a,
+        exchange="KRX",
+    )
+    identity_b = PositionIdentity(
+        provider="kis",
+        account_scope=account_b,
+        exchange="KRX",
+    )
+    session.add_all(
+        [
+            ExecutionPosition(
+                id="scoped-feedback-position-a",
+                mode="paper",
+                provider="kis",
+                account_scope=account_a,
+                exchange="KRX",
+                symbol="POSITION-A",
+                quantity=1,
+                average_price=Decimal("100"),
+                updated_from="reconciliation",
+                raw_payload=payload_with_position_identity(None, identity=identity_a),
+                last_reconciled_at=datetime(2026, 6, 12, tzinfo=UTC),
+            ),
+            ExecutionPosition(
+                id="scoped-feedback-position-b",
+                mode="paper",
+                provider="kis",
+                account_scope=account_b,
+                exchange="KRX",
+                symbol="POSITION-B",
+                quantity=1,
+                average_price=Decimal("100"),
+                updated_from="reconciliation",
+                raw_payload=payload_with_position_identity(None, identity=identity_b),
+                last_reconciled_at=datetime(2026, 6, 12, tzinfo=UTC),
+            ),
+            ExecutionPosition(
+                id="scoped-feedback-position-legacy",
+                mode="paper",
+                provider="kis",
+                account_scope=account_a,
+                exchange="KRX",
+                symbol="POSITION-LEGACY",
+                quantity=1,
+                average_price=Decimal("100"),
+                updated_from="legacy",
+                raw_payload={},
+                last_reconciled_at=datetime(2026, 6, 12, tzinfo=UTC),
+            ),
+        ]
+    )
+    session.commit()
+
+    report = generate_trade_outcome_feedback(
+        settings=settings,
+        db=session,
+        as_of=datetime(2026, 6, 12, tzinfo=UTC),
+        provider="kis",
+        account_scope=account_a,
+        exchange="KRX",
+    )
+
+    assert report["execution_account_scope"] == {
+        "status": "single",
+        "provider": "kis",
+        "account_scope": account_a,
+        "exchange": "KRX",
+        "evidence_count": 3,
+    }
+    assert report["closed_trade_count"] == 1
+    assert report["closed_trades"][0]["symbol"] == "ACCOUNT-A-WINNER"
+    assert report["summary"]["realized_pnl_krw"] == "100.0000"
+    serialized_report = json.dumps(report)
+    assert "ACCOUNT-B-LOSER" not in serialized_report
+    assert "LEGACY-FOREIGN" not in serialized_report
+    assert "INVALID-FOREIGN" not in serialized_report
+    assert "POSITION-A" in serialized_report
+    assert "POSITION-B" not in serialized_report
+    assert "POSITION-LEGACY" not in serialized_report
+    assert "raw-account-reference" not in serialized_report
+
+    session.close()
+    engine.dispose()
+
+
+def test_feedback_freshness_and_artifacts_are_exact_account_and_exchange_scoped(
+    tmp_path,
+) -> None:
+    engine, session = _session()
+    settings = Settings(
+        runtime_mode="paper",
+        trade_outcome_feedback_dir=str(tmp_path),
+        trade_outcome_feedback_lookback_days=10,
+        trade_outcome_feedback_max_age_seconds=3600,
+    )
+    account_a = "a" * 24
+    account_b = "b" * 24
+    plan_a = ExecutionPlan(
+        id="plan-feedback-freshness-a",
+        external_plan_id="plan-feedback-freshness-a",
+        source="kai-trading-core",
+        mode="paper",
+    )
+    plan_b = ExecutionPlan(
+        id="plan-feedback-freshness-b",
+        external_plan_id="plan-feedback-freshness-b",
+        source="kai-trading-core",
+        mode="paper",
+    )
+    session.add_all([plan_a, plan_b])
+    _add_closed_trade(
+        session,
+        plan=plan_a,
+        suffix="freshness-a",
+        symbol="FRESH-A",
+        buy_price="100",
+        sell_price="110",
+    )
+    _add_closed_trade(
+        session,
+        plan=plan_b,
+        suffix="freshness-b",
+        symbol="FRESH-B",
+        buy_price="100",
+        sell_price="90",
+    )
+    _bind_closed_trade_to_execution_scope(
+        session,
+        suffix="freshness-a",
+        account_scope=account_a,
+        exchange="KRX",
+    )
+    _bind_closed_trade_to_execution_scope(
+        session,
+        suffix="freshness-b",
+        account_scope=account_b,
+        exchange="KRX",
+    )
+    session.commit()
+    as_of = datetime(2026, 6, 12, 0, 1, tzinfo=UTC)
+
+    generated_a = ensure_fresh_trade_outcome_feedback(
+        settings=settings,
+        db=session,
+        now=as_of,
+        provider="kis",
+        account_scope=account_a,
+        exchange="KRX",
+    )
+    generated_b = ensure_fresh_trade_outcome_feedback(
+        settings=settings,
+        db=session,
+        now=as_of,
+        provider="kis",
+        account_scope=account_b,
+        exchange="KRX",
+    )
+    reused_a = ensure_fresh_trade_outcome_feedback(
+        settings=settings,
+        db=session,
+        now=as_of,
+        provider="kis",
+        account_scope=account_a,
+        exchange="KRX",
+    )
+
+    assert generated_a["status"] == "generated"
+    assert generated_b["status"] == "generated"
+    assert reused_a["status"] == "fresh"
+    assert not (tmp_path / "latest.json").exists()
+    scoped_latest_paths = sorted(tmp_path.glob("latest.*.json"))
+    assert len(scoped_latest_paths) == 2
+    assert all(
+        account_a not in path.name and account_b not in path.name
+        for path in scoped_latest_paths
+    )
+    feedback_a = load_latest_trade_outcome_feedback_snippet(
+        settings,
+        now=as_of,
+        provider="kis",
+        account_scope=account_a,
+        exchange="KRX",
+    )
+    feedback_b = load_latest_trade_outcome_feedback_snippet(
+        settings,
+        now=as_of,
+        provider="kis",
+        account_scope=account_b,
+        exchange="KRX",
+    )
+    assert feedback_a is not None
+    assert feedback_b is not None
+    assert feedback_a["summary"]["realized_pnl_krw"] == "100.0000"
+    assert feedback_b["summary"]["realized_pnl_krw"] == "-100.0000"
+    assert load_latest_trade_outcome_feedback_snippet(
+        settings,
+        now=as_of,
+        provider="kis",
+        account_scope=account_a,
+        exchange="NASD",
+    ) is None
+
+    session.close()
+    engine.dispose()
+
+
+def test_feedback_generation_rejects_invalid_requested_account_scope(tmp_path) -> None:
+    engine, session = _session()
+    settings = Settings(runtime_mode="paper", trade_outcome_feedback_dir=str(tmp_path))
+
+    result = ensure_fresh_trade_outcome_feedback(
+        settings=settings,
+        db=session,
+        now=datetime(2026, 6, 12, tzinfo=UTC),
+        provider="kis",
+        account_scope="raw-account-reference",
+        exchange="KRX",
+    )
+
+    assert result == {
+        "status": "unavailable",
+        "version": REPORT_VERSION,
+        "reason": "invalid_requested_execution_account_scope",
+    }
+    assert not (tmp_path / "latest.json").exists()
+
+    session.close()
+    engine.dispose()
+
+
 def test_latest_trade_outcome_feedback_ignores_other_runtime_modes(tmp_path) -> None:
     settings = Settings(runtime_mode="live", trade_outcome_feedback_dir=str(tmp_path))
     (tmp_path / "latest.json").write_text(
         """
 {
-  "version": "trade-outcome-feedback-v1",
+  "version": "trade-outcome-feedback-v2",
   "mode": "paper",
   "generated_at": "2026-06-12T00:00:00+00:00",
   "lookback_days": 20,
@@ -2854,7 +4021,7 @@ def test_latest_trade_outcome_feedback_ignores_stale_or_unversioned_artifacts(tm
     (tmp_path / "latest.json").write_text(
         """
 {
-  "version": "trade-outcome-feedback-v1",
+  "version": "trade-outcome-feedback-v2",
   "mode": "paper",
   "generated_at": "2026-06-12T00:00:00+00:00",
   "lookback_days": 20,
@@ -2872,7 +4039,7 @@ def test_latest_trade_outcome_feedback_ignores_stale_or_unversioned_artifacts(tm
     ) is None
 
     (tmp_path / "latest.json").write_text(
-        '{"version":"trade-outcome-feedback-v1","mode":"paper",'
+        '{"version":"trade-outcome-feedback-v2","mode":"paper",'
         '"prompt_snippet":{"patterns_to_downsize_or_reject":[]}}',
         encoding="utf-8",
     )
@@ -2880,3 +4047,127 @@ def test_latest_trade_outcome_feedback_ignores_stale_or_unversioned_artifacts(tm
         settings,
         now=datetime(2026, 6, 12, 0, 1, tzinfo=UTC),
     ) is None
+
+    (tmp_path / "latest.json").write_text(
+        '{"version":"trade-outcome-feedback-v999","mode":"paper",'
+        '"generated_at":"2026-06-12T00:00:00+00:00",'
+        '"prompt_snippet":{"patterns_to_downsize_or_reject":[]}}',
+        encoding="utf-8",
+    )
+    assert load_latest_trade_outcome_feedback_snippet(
+        settings,
+        now=datetime(2026, 6, 12, 0, 1, tzinfo=UTC),
+    ) is None
+
+
+def test_ensure_fresh_trade_outcome_feedback_generates_missing_artifact_once(tmp_path) -> None:
+    engine, session = _session()
+    settings = Settings(
+        runtime_mode="paper",
+        trade_outcome_feedback_dir=str(tmp_path),
+        trade_outcome_feedback_max_age_seconds=3600,
+    )
+    as_of = datetime(2026, 6, 12, 0, 1, tzinfo=UTC)
+
+    generated = ensure_fresh_trade_outcome_feedback(
+        settings=settings,
+        db=session,
+        now=as_of,
+    )
+    latest_path = tmp_path / "latest.json"
+    first_contents = latest_path.read_text(encoding="utf-8")
+    reused = ensure_fresh_trade_outcome_feedback(
+        settings=settings,
+        db=session,
+        now=as_of,
+    )
+
+    assert generated["status"] == "generated"
+    assert generated["version"] == REPORT_VERSION
+    assert reused["status"] == "fresh"
+    assert latest_path.read_text(encoding="utf-8") == first_contents
+
+    session.close()
+    engine.dispose()
+
+
+def test_ensure_fresh_trade_outcome_feedback_replaces_non_object_artifact(
+    tmp_path,
+) -> None:
+    engine, session = _session()
+    settings = Settings(
+        runtime_mode="paper",
+        trade_outcome_feedback_dir=str(tmp_path),
+        trade_outcome_feedback_max_age_seconds=3600,
+    )
+    (tmp_path / "latest.json").write_text("[]", encoding="utf-8")
+
+    result = ensure_fresh_trade_outcome_feedback(
+        settings=settings,
+        db=session,
+        now=datetime(2026, 6, 12, 0, 1, tzinfo=UTC),
+    )
+
+    assert result["status"] == "generated"
+    refreshed = json.loads((tmp_path / "latest.json").read_text(encoding="utf-8"))
+    assert isinstance(refreshed, dict)
+    assert refreshed["version"] == REPORT_VERSION
+
+    session.close()
+    engine.dispose()
+
+
+def test_feedback_atomic_write_preserves_last_good_artifact_when_replace_fails(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    target = tmp_path / "latest.json"
+    target.write_text("last-good", encoding="utf-8")
+
+    def fail_replace(*_):
+        raise OSError("simulated replace failure")
+
+    monkeypatch.setattr(feedback_service.os, "replace", fail_replace)
+
+    with pytest.raises(OSError, match="simulated replace failure"):
+        feedback_service._atomic_write_text(target, "new-report")
+
+    assert target.read_text(encoding="utf-8") == "last-good"
+    assert list(tmp_path.iterdir()) == [target]
+
+
+def test_feedback_artifacts_recursively_redact_raw_account_identifiers(tmp_path) -> None:
+    report_date = datetime(2026, 6, 12, tzinfo=UTC).date()
+    feedback_service._write_artifacts(
+        report={
+            "version": REPORT_VERSION,
+            "generated_at": datetime(2026, 6, 12, tzinfo=UTC),
+            "mode": "paper",
+            "closed_trade_count": 0,
+            "summary": {},
+            "prompt_snippet": {},
+            "broker_response": {
+                "CANO": "12345678",
+                "nested": [
+                    {
+                        "AcCoUnT_Id": "raw-broker-account",
+                        "ACNT_PRDT_CD": "01",
+                        "account_scope": FEEDBACK_TEST_ACCOUNT_SCOPE,
+                        "operational_marker": "preserved",
+                    }
+                ],
+            },
+        },
+        report_date=report_date,
+        output_dir=tmp_path,
+    )
+
+    persisted = json.loads((tmp_path / "latest.json").read_text(encoding="utf-8"))
+    nested = persisted["broker_response"]["nested"][0]
+    assert "CANO" not in persisted["broker_response"]
+    assert "AcCoUnT_Id" not in nested
+    assert "ACNT_PRDT_CD" not in nested
+    assert nested == {
+        "account_scope": FEEDBACK_TEST_ACCOUNT_SCOPE,
+        "operational_marker": "preserved",
+    }

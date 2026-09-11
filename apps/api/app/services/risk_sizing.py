@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from decimal import Decimal, ROUND_DOWN
 from math import sqrt
 from typing import Any
@@ -68,6 +69,7 @@ def resolve_risk_based_buy_quantity(
     vol_corr_context: dict[str, object] | None = None,
     market_regime_context: dict[str, object] | None = None,
     market_date: object | None = None,
+    evaluated_at: datetime | None = None,
 ) -> RiskSizingDecision:
     if account_basis is None or account_basis <= 0:
         return _reject("account_basis_unavailable", "account equity/cash basis is unavailable")
@@ -185,6 +187,7 @@ def resolve_risk_based_buy_quantity(
         original_quantity=quantity,
         original_notional=entry_price * Decimal(quantity),
         reference_price=entry_price,
+        now=evaluated_at,
     )
     if market_regime_guardrail.rejected:
         return _reject(

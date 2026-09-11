@@ -13,6 +13,8 @@ from sqlalchemy.orm import Session, undefer
 
 from app.core.config import Settings
 from app.models.runtime import BrokerOrderEvent, ExecutionPlanItemAudit
+from app.services.execution_account_route import sanitize_account_payload
+from app.services.position_identity import stable_account_scope_hmac_key
 
 if TYPE_CHECKING:
     from app.services.account_drawdown_gate import AccountDrawdownDecision
@@ -69,6 +71,9 @@ class AccountDrawdownRecoveryState:
     last_unhealthy_at: datetime | None = None
     policy_fingerprint: str | None = None
     recovery_idempotency_key: str | None = None
+    recovery_generation: int | None = None
+    source_broker_order_pk: str | None = None
+    source_idempotency_key: str | None = None
     released: bool = False
 
 
@@ -106,24 +111,38 @@ def recovery_policy_fingerprint(settings: Settings) -> str:
 
 
 def recovery_account_fingerprint(settings: Settings) -> str:
-    identity = "|".join(
-        (
-            "kis",
-            settings.kis_account_number or "unconfigured",
-            settings.kis_account_product_code,
-        )
-    )
+    configured_scope = str(settings.execution_position_account_scope or "").strip()
+    account_number = str(settings.kis_account_number or "").strip()
+    product_code = str(settings.kis_account_product_code or "").strip()
     # KIS account numbers have a small input space, so an unkeyed digest would
     # still be reversible by offline enumeration.  Key the opaque identifier
     # with the broker credential; the raw account number never enters durable
     # recovery metadata.
-    key = (
+    key = stable_account_scope_hmac_key(settings)
+    keyed_kis_account_available = bool(account_number and product_code and key)
+    identity = (
+        "|".join(("kis", account_number, product_code))
+        if keyed_kis_account_available or not configured_scope
+        else f"configured-account-scope|{configured_scope}"
+    )
+    if not account_number and not configured_scope:
+        identity = "|".join(("kis", "unconfigured", product_code))
+    if key is not None:
+        return hmac.new(key, identity.encode("utf-8"), sha256).hexdigest()[:24]
+    if configured_scope:
+        return sha256(identity.encode("utf-8")).hexdigest()[:24]
+    if settings.runtime_mode == "live":
+        # Health and order intake reject this configuration. A constant opaque
+        # sentinel deliberately keeps any pre-existing recovery latch closed
+        # rather than keying durable metadata with a short or rotating secret.
+        return sha256(b"live-kis-account-scope-unavailable").hexdigest()[:24]
+    paper_key = (
         settings.account_drawdown_recovery_scope_secret
         or settings.kis_app_secret
         or settings.kis_app_key
         or "unconfigured"
     ).encode("utf-8")
-    return hmac.new(key, identity.encode("utf-8"), sha256).hexdigest()[:24]
+    return hmac.new(paper_key, identity.encode("utf-8"), sha256).hexdigest()[:24]
 
 
 def recovery_idempotency_key(
@@ -139,6 +158,49 @@ def recovery_idempotency_key(
         f"{base_key}|{source_broker_order_pk}|{generation}".encode("utf-8")
     ).hexdigest()
     return f"account-drawdown-recovery:{generation}:{digest}"
+
+
+def scope_recovery_release_idempotency_key(
+    *,
+    source_broker_order_pk: str,
+    generation: int,
+) -> str:
+    """Return the canonical key for an observer-only account latch release."""
+
+    digest = sha256(
+        f"{source_broker_order_pk}|{generation}".encode("utf-8")
+    ).hexdigest()
+    return f"account-drawdown-scope-release:{digest}"
+
+
+def recovery_state_is_current_release(
+    *,
+    settings: Settings,
+    state: AccountDrawdownRecoveryState,
+    source_broker_order_pk: str,
+    source_idempotency_key: str,
+    recovery_generation: int,
+) -> bool:
+    """Trust only an exact, current durable release transition."""
+
+    expected_order_recovery_key = recovery_idempotency_key(
+        base_key=source_idempotency_key,
+        source_broker_order_pk=source_broker_order_pk,
+        generation=recovery_generation,
+    )
+    expected_scope_release_key = scope_recovery_release_idempotency_key(
+        source_broker_order_pk=source_broker_order_pk,
+        generation=recovery_generation,
+    )
+    return bool(
+        state.released
+        and state.source_broker_order_pk == source_broker_order_pk
+        and state.source_idempotency_key == source_idempotency_key
+        and state.recovery_generation == recovery_generation
+        and state.recovery_idempotency_key
+        in {expected_order_recovery_key, expected_scope_release_key}
+        and state.policy_fingerprint == recovery_policy_fingerprint(settings)
+    )
 
 
 def recovery_cooldown_until(
@@ -159,16 +221,68 @@ def snapshot_is_fresh_for_recovery(
     now: datetime,
     settings: Settings,
 ) -> bool:
+    return account_snapshot_freshness_failure(
+        observed_at=observed_at,
+        now=now,
+        settings=settings,
+    ) is None
+
+
+def account_snapshot_freshness_failure(
+    *,
+    observed_at: datetime | None,
+    now: datetime,
+    settings: Settings,
+) -> str | None:
+    if (
+        not isinstance(observed_at, datetime)
+        or observed_at.tzinfo is None
+        or observed_at.utcoffset() is None
+    ):
+        return "account_snapshot_timestamp_invalid"
     observed = _normalize_utc(observed_at)
     current = _normalize_utc(now)
-    return (
-        observed >= current - timedelta(seconds=settings.exec_agent_max_account_snapshot_age_seconds)
-        and observed
-        <= current
-        + timedelta(
-            seconds=settings.account_drawdown_recovery_max_snapshot_future_skew_seconds
-        )
+    if observed < current - timedelta(
+        seconds=settings.exec_agent_max_account_snapshot_age_seconds
+    ):
+        return "account_snapshot_stale"
+    if observed > current + timedelta(
+        seconds=settings.account_drawdown_recovery_max_snapshot_future_skew_seconds
+    ):
+        return "account_snapshot_future_skew"
+    return None
+
+
+def account_snapshot_authority_deadline(
+    *,
+    observed_at: datetime | None,
+    request_started_at: datetime,
+    settings: Settings,
+    agent_sla_seconds: int | float,
+    enclosing_deadline: datetime | None = None,
+) -> datetime:
+    """Bound a decision to the original snapshot, request SLA, and caller deadline."""
+
+    freshness_failure = account_snapshot_freshness_failure(
+        observed_at=observed_at,
+        now=request_started_at,
+        settings=settings,
     )
+    if freshness_failure is not None:
+        raise ValueError(freshness_failure)
+    assert observed_at is not None
+    snapshot_deadline = _normalize_utc(observed_at) + timedelta(
+        seconds=settings.exec_agent_max_account_snapshot_age_seconds
+    )
+    request_deadline = _normalize_utc(request_started_at) + timedelta(
+        seconds=max(1.0, float(agent_sla_seconds))
+    )
+    deadlines = [snapshot_deadline, request_deadline]
+    if enclosing_deadline is not None:
+        if enclosing_deadline.tzinfo is None or enclosing_deadline.utcoffset() is None:
+            raise ValueError("enclosing_deadline_timestamp_invalid")
+        deadlines.append(_normalize_utc(enclosing_deadline))
+    return min(deadlines)
 
 
 def recovery_state(
@@ -211,8 +325,8 @@ def recovery_state(
             )
             .order_by(
                 BrokerOrderEvent.observed_at.desc(),
-                BrokerOrderEvent.created_at.desc(),
                 broker_event_priority.desc(),
+                BrokerOrderEvent.created_at.desc(),
                 BrokerOrderEvent.id.desc(),
             )
         ).all()
@@ -227,8 +341,8 @@ def recovery_state(
         .options(undefer(ExecutionPlanItemAudit.summary))
         .order_by(
             ExecutionPlanItemAudit.occurred_at.desc(),
-            ExecutionPlanItemAudit.created_at.desc(),
             event_priority.desc(),
+            ExecutionPlanItemAudit.created_at.desc(),
             ExecutionPlanItemAudit.id.desc(),
         )
     ).all()
@@ -272,6 +386,13 @@ def recovery_state(
             policy_fingerprint=_optional_text(summary.get("policy_fingerprint")),
             recovery_idempotency_key=_optional_text(
                 summary.get("recovery_idempotency_key")
+            ),
+            recovery_generation=_optional_int(summary.get("recovery_generation")),
+            source_broker_order_pk=_optional_text(
+                summary.get("source_broker_order_pk")
+            ),
+            source_idempotency_key=_optional_text(
+                summary.get("source_idempotency_key")
             ),
             released=True,
         )
@@ -477,14 +598,16 @@ def _add_recovery_event(
     occurred_at: datetime,
 ) -> None:
     normalized_at = _normalize_utc(occurred_at)
+    sanitized_summary = sanitize_account_payload(summary)
+    sanitized_evidence = sanitize_account_payload(evidence)
     if execution_plan_item_id is not None:
         db.add(
             ExecutionPlanItemAudit(
                 execution_plan_item_id=execution_plan_item_id,
                 event_type=event_type,
                 source="broker_order_service",
-                summary=summary,
-                payload=evidence,
+                summary=sanitized_summary,
+                payload=sanitized_evidence,
                 error_message=error_message,
                 occurred_at=normalized_at,
             )
@@ -497,8 +620,8 @@ def _add_recovery_event(
             event_source="system",
             normalized_status="rejected",
             message=error_message,
-            response_payload=evidence,
-            payload=summary,
+            response_payload=sanitized_evidence,
+            payload=sanitized_summary,
             observed_at=normalized_at,
         )
     )
@@ -543,6 +666,13 @@ def _state_from_broker_order_events(
             policy_fingerprint=_optional_text(summary.get("policy_fingerprint")),
             recovery_idempotency_key=_optional_text(
                 summary.get("recovery_idempotency_key")
+            ),
+            recovery_generation=_optional_int(summary.get("recovery_generation")),
+            source_broker_order_pk=_optional_text(
+                summary.get("source_broker_order_pk")
+            ),
+            source_idempotency_key=_optional_text(
+                summary.get("source_idempotency_key")
             ),
             released=True,
         )
@@ -589,3 +719,9 @@ def _optional_text(value: object) -> str | None:
     if not isinstance(value, str) or not value.strip():
         return None
     return value.strip()
+
+
+def _optional_int(value: object) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value

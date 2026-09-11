@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
+import tempfile
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
@@ -20,12 +23,27 @@ from app.services.fill_economics import (
     closed_trade_economics,
     effective_fill_quantity,
 )
-from app.services.fifo_inventory import FifoIsolationCursor, load_fifo_isolation_cursor
+from app.services.fifo_inventory import (
+    FifoIsolationCursor,
+    FifoRouteScope,
+    ambiguous_fifo_chronology_buckets,
+    fifo_chronology_ambiguity_reason_at,
+    fifo_fill_sort_key,
+    fifo_route_scope_from_order,
+    load_fifo_isolation_cursor,
+)
+from app.services.position_identity import (
+    PositionIdentity,
+    PositionIdentityConflictError,
+    position_identity_from_columns,
+    position_identity_from_payload,
+)
 from app.services.account_drawdown_gate import (
     account_drawdown_gate_prompt_summary,
     account_drawdown_gate_report_lines,
     latest_account_drawdown_gate_state,
 )
+from app.services.execution_account_route import redact_account_references
 from app.services.broker_raw_holdings import (
     BrokerRawHolding,
     broker_raw_balance_is_fresh,
@@ -43,7 +61,7 @@ from app.services.portfolio_risk import (
     load_symbol_settlement_currency_hints,
 )
 
-REPORT_VERSION = "trade-outcome-feedback-v1"
+REPORT_VERSION = "trade-outcome-feedback-v2"
 MIN_CANDIDATE_RULE_SAMPLE_SIZE = 3
 BROKER_BALANCE_OUTPUT2_FIELDS = (
     "tot_evlu_amt",
@@ -99,9 +117,26 @@ class LegacySellCostBasis:
 @dataclass(frozen=True)
 class BrokerBalanceSnapshot:
     position: ExecutionPosition
+    position_identity: PositionIdentity
     balance: dict[str, object]
     output2: dict[str, object]
     observed_at: datetime | None
+
+
+@dataclass(frozen=True)
+class FeedbackExecutionScope:
+    provider: str
+    account_scope: str
+    exchange: str | None = None
+
+    def as_payload(self) -> dict[str, str]:
+        payload = {
+            "provider": self.provider,
+            "account_scope": self.account_scope,
+        }
+        if self.exchange is not None:
+            payload["exchange"] = self.exchange
+        return payload
 
 
 def generate_trade_outcome_feedback(
@@ -111,20 +146,41 @@ def generate_trade_outcome_feedback(
     lookback_days: int | None = None,
     as_of: datetime | None = None,
     output_dir: Path | None = None,
+    provider: str | None = None,
+    account_scope: str | None = None,
+    exchange: str | None = None,
 ) -> dict[str, object]:
+    requested_scope, scope_error = _requested_feedback_scope(
+        provider=provider,
+        account_scope=account_scope,
+        exchange=exchange,
+    )
+    if scope_error is not None:
+        raise ValueError(scope_error)
     now = _normalize_utc(as_of or datetime.now(UTC))
     days = max(1, int(lookback_days or settings.trade_outcome_feedback_lookback_days))
     started_at = now - timedelta(days=days)
-    fills = _load_fills(settings=settings, db=db)
-    sell_symbols = {
-        fill.symbol
+    fills = _load_fills(
+        settings=settings,
+        db=db,
+        requested_scope=requested_scope,
+    )
+    execution_account_scope = _report_execution_account_scope(
+        settings=settings,
+        db=db,
+        fills=fills,
+        requested_scope=requested_scope,
+    )
+    scoped_sell_routes = {
+        (route_scope, fill.symbol)
         for fill in fills
+        if (route_scope := fifo_route_scope_from_order(fill.broker_order)) is not None
         if str(fill.side or "").lower() == "sell"
     }
     legacy_sell_cost_basis = _load_legacy_sell_cost_basis(
         settings=settings,
         db=db,
-        symbols=sell_symbols,
+        route_symbols=scoped_sell_routes,
     )
     closed_trades = [
         trade
@@ -146,6 +202,7 @@ def generate_trade_outcome_feedback(
         lookback_days=days,
         started_at=started_at,
         as_of=now,
+        requested_scope=requested_scope,
     )
     summary = _summary(closed_trades, broker_asset_performance=broker_asset_performance)
     lessons = _lessons(closed_trades, max_lessons=settings.trade_outcome_feedback_max_lessons)
@@ -154,6 +211,7 @@ def generate_trade_outcome_feedback(
         db=db,
         closed_trades=closed_trades,
         as_of=now,
+        requested_scope=requested_scope,
     )
     account_drawdown_gate = latest_account_drawdown_gate_state(settings=settings, db=db)
     candidate_rule_replay = _candidate_rule_replay(settings=settings, closed_trades=closed_trades)
@@ -169,6 +227,7 @@ def generate_trade_outcome_feedback(
     report: dict[str, object] = {
         "version": REPORT_VERSION,
         "mode": settings.runtime_mode,
+        "execution_account_scope": execution_account_scope,
         "generated_at": now.isoformat(),
         "lookback_days": days,
         "started_at": started_at.isoformat(),
@@ -183,7 +242,12 @@ def generate_trade_outcome_feedback(
         "prompt_snippet": snippet,
     }
     target_dir = output_dir or Path(settings.trade_outcome_feedback_dir)
-    _write_artifacts(report=report, report_date=report_date, output_dir=target_dir)
+    _write_artifacts(
+        report=report,
+        report_date=report_date,
+        output_dir=target_dir,
+        artifact_scope=requested_scope,
+    )
     return report
 
 
@@ -191,22 +255,28 @@ def load_latest_trade_outcome_feedback_snippet(
     settings: Settings,
     *,
     now: datetime | None = None,
+    provider: str | None = None,
+    account_scope: str | None = None,
+    exchange: str | None = None,
 ) -> dict[str, object] | None:
     if not settings.trade_outcome_feedback_enabled:
         return None
-    latest_path = Path(settings.trade_outcome_feedback_dir) / "latest.json"
-    try:
-        payload = json.loads(latest_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    loaded = _load_latest_trade_outcome_feedback(
+        settings=settings,
+        now=now,
+        provider=provider,
+        account_scope=account_scope,
+        exchange=exchange,
+    )
+    if loaded is None:
         return None
-    if payload.get("mode") != settings.runtime_mode:
-        return None
-    generated_at = _parse_feedback_generated_at(payload.get("generated_at"))
-    if generated_at is None:
-        return None
-    current_time = (now or datetime.now(UTC)).astimezone(UTC)
-    age_seconds = (current_time - generated_at).total_seconds()
-    if age_seconds < -300 or age_seconds > settings.trade_outcome_feedback_max_age_seconds:
+    payload, generated_at = loaded
+    if not _feedback_scope_matches(
+        payload.get("execution_account_scope"),
+        provider=provider,
+        account_scope=account_scope,
+        exchange=exchange,
+    ):
         return None
     snippet = payload.get("prompt_snippet")
     if not isinstance(snippet, dict):
@@ -214,12 +284,164 @@ def load_latest_trade_outcome_feedback_snippet(
     return {
         "version": payload.get("version"),
         "mode": payload.get("mode"),
+        "execution_account_scope": payload.get("execution_account_scope"),
         "generated_at": generated_at.isoformat(),
         "lookback_days": payload.get("lookback_days"),
         "closed_trade_count": payload.get("closed_trade_count"),
         "summary": payload.get("summary") if isinstance(payload.get("summary"), dict) else {},
         "snippet": snippet,
     }
+
+
+def ensure_fresh_trade_outcome_feedback(
+    *,
+    settings: Settings,
+    db: Session,
+    now: datetime | None = None,
+    provider: str | None = None,
+    account_scope: str | None = None,
+    exchange: str | None = None,
+) -> dict[str, object]:
+    """Generate the bounded feedback artifact when the configured copy is missing or stale."""
+    if not settings.trade_outcome_feedback_enabled:
+        return {"status": "disabled", "version": REPORT_VERSION}
+
+    requested_scope, scope_error = _requested_feedback_scope(
+        provider=provider,
+        account_scope=account_scope,
+        exchange=exchange,
+    )
+    if scope_error is not None:
+        return {
+            "status": "unavailable",
+            "version": REPORT_VERSION,
+            "reason": scope_error,
+        }
+
+    current_time = _normalize_utc(now or datetime.now(UTC))
+    existing = _load_latest_trade_outcome_feedback(
+        settings=settings,
+        now=current_time,
+        provider=provider,
+        account_scope=account_scope,
+        exchange=exchange,
+    )
+    if existing is not None:
+        existing_payload, generated_at = existing
+        return {
+            "status": "fresh",
+            "version": existing_payload["version"],
+            "generated_at": generated_at.isoformat(),
+            "closed_trade_count": existing_payload.get("closed_trade_count"),
+        }
+
+    report = generate_trade_outcome_feedback(
+        settings=settings,
+        db=db,
+        as_of=current_time,
+        provider=requested_scope.provider if requested_scope is not None else None,
+        account_scope=(
+            requested_scope.account_scope if requested_scope is not None else None
+        ),
+        exchange=requested_scope.exchange if requested_scope is not None else None,
+    )
+    return {
+        "status": "generated",
+        "version": report["version"],
+        "generated_at": report["generated_at"],
+        "closed_trade_count": report["closed_trade_count"],
+    }
+
+
+def _load_latest_trade_outcome_feedback(
+    *,
+    settings: Settings,
+    now: datetime | None,
+    provider: str | None = None,
+    account_scope: str | None = None,
+    exchange: str | None = None,
+) -> tuple[dict[str, object], datetime] | None:
+    requested_scope, scope_error = _requested_feedback_scope(
+        provider=provider,
+        account_scope=account_scope,
+        exchange=exchange,
+    )
+    if scope_error is not None:
+        return None
+    output_dir = Path(settings.trade_outcome_feedback_dir)
+    candidate_paths = (
+        [
+            output_dir
+            / _scoped_artifact_name(
+                prefix="latest",
+                suffix="json",
+                scope=requested_scope,
+                runtime_mode=settings.runtime_mode,
+            ),
+            output_dir / "latest.json",
+        ]
+        if requested_scope is not None
+        else [output_dir / "latest.json"]
+    )
+    for latest_path in candidate_paths:
+        try:
+            payload = json.loads(latest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        if payload.get("version") != REPORT_VERSION:
+            continue
+        if payload.get("mode") != settings.runtime_mode:
+            continue
+        if requested_scope is not None and not _feedback_scope_matches(
+            payload.get("execution_account_scope"),
+            provider=requested_scope.provider,
+            account_scope=requested_scope.account_scope,
+            exchange=requested_scope.exchange,
+        ):
+            continue
+        generated_at = _parse_feedback_generated_at(payload.get("generated_at"))
+        if generated_at is None:
+            continue
+        current_time = _normalize_utc(now or datetime.now(UTC))
+        age_seconds = (current_time - generated_at).total_seconds()
+        if (
+            age_seconds < -300
+            or age_seconds > settings.trade_outcome_feedback_max_age_seconds
+        ):
+            continue
+        return payload, generated_at
+    return None
+
+
+def _feedback_scope_matches(
+    value: object,
+    *,
+    provider: str | None,
+    account_scope: str | None,
+    exchange: str | None = None,
+) -> bool:
+    if not isinstance(value, dict) or set(value) < {
+        "status",
+        "provider",
+        "account_scope",
+    }:
+        return False
+    expected_provider = str(provider or "").strip().lower()
+    expected_account_scope = str(account_scope or "").strip()
+    stored_provider = str(value.get("provider") or "").strip().lower()
+    stored_account_scope = str(value.get("account_scope") or "").strip()
+    expected_exchange = str(exchange or "").strip().upper()
+    stored_exchange = str(value.get("exchange") or "").strip().upper()
+    return (
+        value.get("status") == "single"
+        and bool(expected_provider)
+        and _valid_account_scope(expected_account_scope)
+        and stored_provider == expected_provider
+        and stored_account_scope == expected_account_scope
+        and stored_exchange == expected_exchange
+    )
 
 
 def _parse_feedback_generated_at(value: object) -> datetime | None:
@@ -234,8 +456,13 @@ def _parse_feedback_generated_at(value: object) -> datetime | None:
     return parsed.astimezone(UTC)
 
 
-def _load_fills(*, settings: Settings, db: Session) -> list[ExecutionFill]:
-    return dedupe_execution_fills(list(
+def _load_fills(
+    *,
+    settings: Settings,
+    db: Session,
+    requested_scope: FeedbackExecutionScope | None = None,
+) -> list[ExecutionFill]:
+    fills = dedupe_execution_fills(list(
         db.scalars(
             select(ExecutionFill)
             .join(ExecutionFill.broker_order)
@@ -258,6 +485,7 @@ def _load_fills(*, settings: Settings, db: Session) -> list[ExecutionFill]:
                     ExecutionFill.transaction_cost,
                     ExecutionFill.transaction_cost_coverage,
                     ExecutionFill.transaction_cost_source,
+                    ExecutionFill.payload,
                     ExecutionFill.filled_at,
                 ),
                 selectinload(ExecutionFill.broker_order).load_only(
@@ -270,6 +498,7 @@ def _load_fills(*, settings: Settings, db: Session) -> list[ExecutionFill]:
                     BrokerOrder.broker_name,
                     BrokerOrder.venue,
                     BrokerOrder.asset_class,
+                    BrokerOrder.request_metadata,
                 ),
                 selectinload(ExecutionFill.broker_order)
                 .selectinload(BrokerOrder.plan_item)
@@ -286,47 +515,337 @@ def _load_fills(*, settings: Settings, db: Session) -> list[ExecutionFill]:
             .order_by(ExecutionFill.symbol.asc(), ExecutionFill.filled_at.asc(), ExecutionFill.id.asc())
         )
     ))
+    if requested_scope is None:
+        return fills
+    return [
+        fill
+        for fill in fills
+        if _order_matches_feedback_scope(
+            fill.broker_order,
+            requested_scope,
+        )
+    ]
+
+
+def _report_execution_account_scope(
+    *,
+    settings: Settings,
+    db: Session,
+    fills: list[ExecutionFill],
+    requested_scope: FeedbackExecutionScope | None = None,
+) -> dict[str, object]:
+    scopes: set[tuple[str, str, str]] = set()
+    invalid_evidence_count = 0
+    evidence_count = 0
+
+    def record_scope(
+        provider: object,
+        account_scope: object,
+        exchange: object,
+    ) -> None:
+        nonlocal evidence_count, invalid_evidence_count
+        evidence_count += 1
+        normalized_provider = str(provider or "").strip().lower()
+        normalized_account_scope = str(account_scope or "").strip()
+        normalized_exchange = str(exchange or "").strip().upper()
+        if (
+            not normalized_provider
+            or not _valid_account_scope(normalized_account_scope)
+            or not normalized_exchange
+        ):
+            invalid_evidence_count += 1
+            return
+        scopes.add(
+            (normalized_provider, normalized_account_scope, normalized_exchange)
+        )
+
+    for fill in fills:
+        route_scope = fifo_route_scope_from_order(fill.broker_order)
+        if route_scope is None:
+            record_scope(None, None, None)
+        else:
+            record_scope(
+                route_scope.provider,
+                route_scope.account_scope,
+                route_scope.exchange,
+            )
+
+    position_scope_fields = [
+        ExecutionPosition.provider,
+        ExecutionPosition.account_scope,
+        ExecutionPosition.exchange,
+    ]
+    if requested_scope is not None:
+        position_scope_fields.append(ExecutionPosition.raw_payload)
+    relevant_positions = db.scalars(
+        select(ExecutionPosition)
+        .where(
+            ExecutionPosition.mode == settings.runtime_mode,
+        )
+        .options(
+            load_only(*position_scope_fields)
+        )
+    ).all()
+    for position in relevant_positions:
+        identity = (
+            _canonical_position_identity(position)
+            if requested_scope is not None
+            else _position_column_identity(position)
+        )
+        if identity is None:
+            if requested_scope is None:
+                record_scope(None, None, None)
+            continue
+        if requested_scope is not None and not _position_identity_matches_feedback_scope(
+            identity,
+            requested_scope,
+        ):
+            continue
+        record_scope(identity.provider, identity.account_scope, identity.exchange)
+
+    for order in _load_open_orders(
+        settings=settings,
+        db=db,
+        requested_scope=requested_scope,
+    ):
+        route_scope = fifo_route_scope_from_order(order)
+        if route_scope is None:
+            if requested_scope is None:
+                record_scope(None, None, None)
+        else:
+            record_scope(
+                route_scope.provider,
+                route_scope.account_scope,
+                route_scope.exchange,
+            )
+
+    if requested_scope is not None:
+        payload: dict[str, object] = {
+            "status": "single",
+            **requested_scope.as_payload(),
+            "evidence_count": evidence_count,
+        }
+        return payload
+
+    if invalid_evidence_count:
+        return {
+            "status": "unavailable",
+            "reason": "unscoped_or_invalid_route_evidence",
+            "evidence_count": evidence_count,
+            "invalid_evidence_count": invalid_evidence_count,
+        }
+    if len(scopes) > 1:
+        return {
+            "status": "mixed",
+            "reason": "multiple_execution_account_scopes",
+            "evidence_count": evidence_count,
+            "scope_count": len(scopes),
+        }
+    if not scopes:
+        return {
+            "status": "unavailable",
+            "reason": "no_execution_account_scope_evidence",
+            "evidence_count": 0,
+        }
+    provider, account_scope, exchange = next(iter(scopes))
+    return {
+        "status": "single",
+        "provider": provider,
+        "account_scope": account_scope,
+        "exchange": exchange,
+        "evidence_count": evidence_count,
+    }
+
+
+def _valid_account_scope(value: object) -> bool:
+    normalized = str(value or "").strip()
+    return len(normalized) == 24 and all(
+        character in "0123456789abcdef" for character in normalized
+    )
+
+
+def _requested_feedback_scope(
+    *,
+    provider: str | None,
+    account_scope: str | None,
+    exchange: str | None,
+) -> tuple[FeedbackExecutionScope | None, str | None]:
+    if provider is None and account_scope is None and exchange is None:
+        return None, None
+    normalized_provider = str(provider or "").strip().lower()
+    normalized_account_scope = str(account_scope or "").strip()
+    normalized_exchange = str(exchange or "").strip().upper() or None
+    provider_is_safe = bool(normalized_provider) and all(
+        character.isalnum() or character in {"-", "_"}
+        for character in normalized_provider
+    )
+    exchange_is_safe = normalized_exchange is None or all(
+        character.isalnum() or character in {"-", "_", "."}
+        for character in normalized_exchange
+    )
+    if (
+        not provider_is_safe
+        or not _valid_account_scope(normalized_account_scope)
+        or not exchange_is_safe
+    ):
+        return None, "invalid_requested_execution_account_scope"
+    return (
+        FeedbackExecutionScope(
+            provider=normalized_provider,
+            account_scope=normalized_account_scope,
+            exchange=normalized_exchange,
+        ),
+        None,
+    )
+
+
+def _fifo_route_matches_feedback_scope(
+    route_scope: FifoRouteScope | None,
+    requested_scope: FeedbackExecutionScope,
+) -> bool:
+    return (
+        route_scope is not None
+        and route_scope.provider == requested_scope.provider
+        and route_scope.account_scope == requested_scope.account_scope
+        and (
+            requested_scope.exchange is None
+            or route_scope.exchange == requested_scope.exchange
+        )
+    )
+
+
+def _order_matches_feedback_scope(
+    order: BrokerOrder,
+    requested_scope: FeedbackExecutionScope,
+) -> bool:
+    metadata = order.request_metadata
+    if not isinstance(metadata, dict) or "execution_scope" not in metadata:
+        return False
+    return _fifo_route_matches_feedback_scope(
+        fifo_route_scope_from_order(order),
+        requested_scope,
+    )
+
+
+def _position_identity_matches_feedback_scope(
+    identity: PositionIdentity,
+    requested_scope: FeedbackExecutionScope,
+) -> bool:
+    return (
+        identity.provider == requested_scope.provider
+        and identity.account_scope == requested_scope.account_scope
+        and (
+            requested_scope.exchange is None
+            or identity.exchange == requested_scope.exchange
+        )
+    )
+
+
+def _position_column_identity(position: ExecutionPosition) -> PositionIdentity | None:
+    try:
+        return position_identity_from_columns(position)
+    except PositionIdentityConflictError:
+        return None
+
+
+def _canonical_position_identity(
+    position: ExecutionPosition,
+) -> PositionIdentity | None:
+    column_identity = _position_column_identity(position)
+    if column_identity is None:
+        return None
+    try:
+        payload_identity = position_identity_from_payload(position.raw_payload)
+    except PositionIdentityConflictError:
+        return None
+    return column_identity if payload_identity == column_identity else None
+
+
+def _scoped_artifact_name(
+    *,
+    prefix: str,
+    suffix: str,
+    scope: FeedbackExecutionScope,
+    runtime_mode: str,
+) -> str:
+    scope_key = "\0".join(
+        (
+            scope.provider,
+            scope.account_scope,
+            scope.exchange or "*",
+            str(runtime_mode or "").strip().lower(),
+        )
+    )
+    digest = hashlib.sha256(scope_key.encode("utf-8")).hexdigest()[:24]
+    return f"{prefix}.{digest}.{suffix}"
 
 
 def _load_legacy_sell_cost_basis(
     *,
     settings: Settings,
     db: Session,
-    symbols: set[str],
-) -> dict[str, LegacySellCostBasis]:
-    normalized_symbols = sorted(symbol.strip().upper() for symbol in symbols if symbol.strip())
-    if not normalized_symbols:
+    route_symbols: set[tuple[FifoRouteScope, str]],
+) -> dict[tuple[FifoRouteScope, str], LegacySellCostBasis]:
+    normalized_route_symbols = {
+        (route_scope, symbol.strip().upper())
+        for route_scope, symbol in route_symbols
+        if symbol.strip()
+    }
+    if not normalized_route_symbols:
         return {}
-    positions = db.scalars(
-        select(ExecutionPosition)
-        .where(
-            ExecutionPosition.mode == settings.runtime_mode,
-            ExecutionPosition.symbol.in_(normalized_symbols),
-        )
-        .options(
-            load_only(
-                ExecutionPosition.symbol,
-                ExecutionPosition.average_price,
-                ExecutionPosition.last_reconciled_at,
-                ExecutionPosition.updated_at,
-                ExecutionPosition.raw_payload,
+    costs: dict[tuple[FifoRouteScope, str], LegacySellCostBasis] = {}
+    for route_scope, symbol in sorted(
+        normalized_route_symbols,
+        key=lambda item: (*item[0].as_payload().values(), item[1]),
+    ):
+        positions = list(
+            db.scalars(
+                select(ExecutionPosition)
+                .where(
+                    ExecutionPosition.mode == settings.runtime_mode,
+                    ExecutionPosition.provider == route_scope.provider,
+                    ExecutionPosition.account_scope == route_scope.account_scope,
+                    ExecutionPosition.exchange == route_scope.exchange,
+                    ExecutionPosition.symbol == symbol,
+                )
+                .options(
+                    load_only(
+                        ExecutionPosition.provider,
+                        ExecutionPosition.account_scope,
+                        ExecutionPosition.exchange,
+                        ExecutionPosition.symbol,
+                        ExecutionPosition.average_price,
+                        ExecutionPosition.last_reconciled_at,
+                        ExecutionPosition.updated_at,
+                        ExecutionPosition.raw_payload,
+                    )
+                )
+                # A second exact row means the scoped uniqueness invariant is
+                # damaged; never pick one by ordering.
+                .limit(2)
             )
         )
-        .order_by(
-            ExecutionPosition.symbol.asc(),
-            ExecutionPosition.last_reconciled_at.desc().nulls_last(),
-            ExecutionPosition.updated_at.desc(),
-        )
-        .limit(len(normalized_symbols))
-    )
-    costs: dict[str, LegacySellCostBasis] = {}
-    for position in positions:
-        symbol = position.symbol.strip().upper()
-        if symbol in costs:
+        if len(positions) != 1:
+            continue
+        position = positions[0]
+        try:
+            column_identity = position_identity_from_columns(position)
+            payload_identity = position_identity_from_payload(position.raw_payload)
+        except PositionIdentityConflictError:
+            continue
+        if column_identity is None or (
+            payload_identity is not None and payload_identity != column_identity
+        ):
+            continue
+        if (
+            column_identity.provider != route_scope.provider
+            or column_identity.account_scope != route_scope.account_scope
+            or column_identity.exchange != route_scope.exchange
+        ):
             continue
         position_average = _decimal_value(position.average_price)
         if position_average is not None and position_average > 0:
-            costs[symbol] = LegacySellCostBasis(
+            costs[(route_scope, symbol)] = LegacySellCostBasis(
                 symbol=symbol,
                 average_price=position_average,
                 source="reconciled_average_cost_estimate",
@@ -337,7 +856,7 @@ def _load_legacy_sell_cost_basis(
             continue
         raw_holding = _raw_holding_for_symbol(payload=position.raw_payload, symbol=symbol)
         if raw_holding is not None and raw_holding.average_price is not None and raw_holding.average_price > 0:
-            costs[symbol] = LegacySellCostBasis(
+            costs[(route_scope, symbol)] = LegacySellCostBasis(
                 symbol=symbol,
                 average_price=raw_holding.average_price,
                 source="broker_raw_holding_average_cost_estimate",
@@ -359,21 +878,83 @@ def _raw_holding_for_symbol(*, payload: dict[str, Any] | None, symbol: str) -> B
 def _fifo_closed_trades(
     fills: list[ExecutionFill],
     *,
-    legacy_sell_cost_basis: dict[str, LegacySellCostBasis] | None = None,
+    legacy_sell_cost_basis: (
+        dict[tuple[FifoRouteScope, str], LegacySellCostBasis] | None
+    ) = None,
     isolation_cursor: FifoIsolationCursor | None = None,
 ) -> list[dict[str, object]]:
-    lots_by_symbol: dict[str, list[OpenLot]] = {}
+    lots_by_route_symbol: dict[tuple[FifoRouteScope, str], list[OpenLot]] = {}
     closed: list[dict[str, object]] = []
     cost_basis = legacy_sell_cost_basis or {}
-    for fill in sorted(fills, key=lambda row: (row.symbol, _normalize_utc(row.filled_at), row.id)):
+    ambiguous_buckets = ambiguous_fifo_chronology_buckets(fills)
+    for fill in sorted(
+        fills,
+        key=lambda row: (
+            row.symbol,
+            *fifo_fill_sort_key(row),
+        ),
+    ):
         side = str(fill.side or "").lower()
-        lots = lots_by_symbol.setdefault(fill.symbol, [])
+        route_scope = fifo_route_scope_from_order(fill.broker_order)
+        if route_scope is None:
+            if side == "sell":
+                closed.append(
+                    _legacy_sell_estimate_trade(
+                        sell_fill=fill,
+                        quantity=effective_fill_quantity(fill),
+                        cost_basis=None,
+                        route_scope=None,
+                        scope_quality_available=False,
+                    )
+                )
+            continue
+        route_symbol = (route_scope, fill.symbol)
+        lots = lots_by_route_symbol.setdefault(route_symbol, [])
+        scope_quality_available = True
         if isolation_cursor is not None:
-            isolation_cursor.apply_before(
+            scope_quality_available = isolation_cursor.apply_before(
+                route_scope=route_scope,
                 symbol=fill.symbol,
                 observed_at=_normalize_utc(fill.filled_at),
                 lots=lots,
             )
+        chronology_reason = fifo_chronology_ambiguity_reason_at(
+            ambiguous_buckets=ambiguous_buckets,
+            isolation_cursor=isolation_cursor,
+            route_scope=route_scope,
+            symbol=fill.symbol,
+            observed_at=_normalize_utc(fill.filled_at),
+        )
+        if chronology_reason is not None:
+            if side == "sell":
+                closed.append(
+                    _legacy_sell_estimate_trade(
+                        sell_fill=fill,
+                        quantity=effective_fill_quantity(fill),
+                        cost_basis=None,
+                        route_scope=route_scope,
+                        scope_quality_available=True,
+                        quality_flag=(
+                            "fill_chronology_observation_bounded_generation"
+                            if chronology_reason
+                            == "observation_bounded_generation"
+                            else "fill_chronology_ambiguous"
+                        ),
+                    )
+                )
+            continue
+        if not scope_quality_available:
+            if side == "sell":
+                closed.append(
+                    _legacy_sell_estimate_trade(
+                        sell_fill=fill,
+                        quantity=effective_fill_quantity(fill),
+                        cost_basis=None,
+                        route_scope=route_scope,
+                        scope_quality_available=False,
+                    )
+                )
+            continue
         if side == "buy":
             lots.append(
                 OpenLot(
@@ -390,7 +971,14 @@ def _fifo_closed_trades(
         while remaining > 0 and lots:
             lot = lots[0]
             matched = min(remaining, lot.quantity)
-            closed.append(_closed_trade(lot=lot, sell_fill=fill, quantity=matched))
+            closed.append(
+                _closed_trade(
+                    lot=lot,
+                    sell_fill=fill,
+                    quantity=matched,
+                    route_scope=route_scope,
+                )
+            )
             lot.quantity -= matched
             remaining -= matched
             if lot.quantity <= 0:
@@ -400,13 +988,21 @@ def _fifo_closed_trades(
                 _legacy_sell_estimate_trade(
                     sell_fill=fill,
                     quantity=remaining,
-                    cost_basis=cost_basis.get(fill.symbol),
+                    cost_basis=cost_basis.get(route_symbol),
+                    route_scope=route_scope,
+                    scope_quality_available=True,
                 )
             )
     return closed
 
 
-def _closed_trade(*, lot: OpenLot, sell_fill: ExecutionFill, quantity: Decimal) -> dict[str, object]:
+def _closed_trade(
+    *,
+    lot: OpenLot,
+    sell_fill: ExecutionFill,
+    quantity: Decimal,
+    route_scope: FifoRouteScope,
+) -> dict[str, object]:
     buy_order = lot.fill.broker_order
     sell_order = sell_fill.broker_order
     buy_item = buy_order.plan_item if buy_order is not None else None
@@ -436,6 +1032,7 @@ def _closed_trade(*, lot: OpenLot, sell_fill: ExecutionFill, quantity: Decimal) 
     source_item = buy_item or sell_item
     return {
         "symbol": sell_fill.symbol,
+        "execution_scope": route_scope.as_payload(),
         "quantity": _quantity_value(quantity),
         "buy": _fill_payload(fill=lot.fill, order=buy_order, item=buy_item, quantity=quantity),
         "sell": _fill_payload(fill=sell_fill, order=sell_order, item=sell_item, quantity=quantity),
@@ -492,17 +1089,22 @@ def _legacy_sell_estimate_trade(
     sell_fill: ExecutionFill,
     quantity: Decimal,
     cost_basis: LegacySellCostBasis | None,
+    route_scope: FifoRouteScope | None,
+    scope_quality_available: bool,
+    quality_flag: str | None = None,
 ) -> dict[str, object]:
     sell_order = sell_fill.broker_order
     sell_item = sell_order.plan_item if sell_order is not None else None
     sell_price = Decimal(sell_fill.price)
     source_item = sell_item
-    if cost_basis is None:
+    if cost_basis is None or not scope_quality_available:
         pnl = None
         return_pct = None
         buy_price = None
         outcome_source = "unavailable"
         quality_flags = ["missing_fifo_buy_lot", "missing_average_cost_basis"]
+        if not scope_quality_available:
+            quality_flags.append("execution_scope_unavailable")
     else:
         buy_price = cost_basis.average_price
         buy_notional = buy_price * quantity
@@ -528,8 +1130,13 @@ def _legacy_sell_estimate_trade(
         )
     if currency is None:
         quality_flags.append("settlement_currency_unknown")
+    if quality_flag is not None:
+        quality_flags.append(quality_flag)
     return {
         "symbol": sell_fill.symbol,
+        "execution_scope": (
+            route_scope.as_payload() if route_scope is not None else None
+        ),
         "quantity": quantity,
         "buy": {
             "filled_at": cost_basis.observed_at.isoformat()
@@ -792,19 +1399,38 @@ def _broker_asset_performance(
     lookback_days: int,
     started_at: datetime,
     as_of: datetime,
+    requested_scope: FeedbackExecutionScope | None = None,
 ) -> dict[str, object]:
     snapshot_positions = _load_broker_balance_snapshot_positions(
         settings=settings,
         db=db,
         started_at=started_at,
         lookback_days=lookback_days,
+        requested_scope=requested_scope,
     )
-    snapshots = _broker_balance_snapshots(snapshot_positions)
+    snapshots = _broker_balance_snapshots(
+        snapshot_positions,
+        require_canonical_identity=requested_scope is not None,
+    )
     if not snapshots:
         return _broker_asset_unavailable(
             f"execution_positions raw broker balance payload unavailable for mode={settings.runtime_mode}; "
             "cannot headline broker total asset change"
         )
+
+    account_scopes = {
+        (
+            snapshot.position_identity.provider,
+            snapshot.position_identity.account_scope,
+        )
+        for snapshot in snapshots
+    }
+    if len(account_scopes) != 1:
+        return _broker_asset_unavailable(
+            "multiple broker account scopes are present in balance snapshots; "
+            "account-level asset performance is unavailable"
+        )
+    account_provider, account_scope = next(iter(account_scopes))
 
     if lookback_days <= 1:
         snapshot = snapshots[0]
@@ -836,7 +1462,16 @@ def _broker_asset_performance(
         )
 
     position = snapshot.position
-    positions = _load_positions(settings=settings, db=db)
+    positions = _load_positions(
+        settings=settings,
+        db=db,
+        provider=account_provider,
+        account_scope=account_scope,
+        exchange=(
+            requested_scope.exchange if requested_scope is not None else None
+        ),
+        require_canonical_identity=requested_scope is not None,
+    )
     balance = snapshot.balance
     output2 = snapshot.output2
     raw_balance_valid = broker_raw_balance_is_valid(position.raw_payload)
@@ -862,8 +1497,11 @@ def _broker_asset_performance(
     )
     realized_pnl = (
         sum(
-            (_decimal_value(row.get("realized_pnl_krw")) or Decimal("0"))
-            for row in closed_trades
+            (
+                _decimal_value(row.get("realized_pnl_krw")) or Decimal("0")
+                for row in closed_trades
+            ),
+            Decimal("0"),
         )
         if pnl_eligible
         else None
@@ -879,6 +1517,8 @@ def _broker_asset_performance(
     return {
         "available": True,
         "source": "execution_positions.raw_payload.balance.output2",
+        "provider": account_provider,
+        "account_scope": account_scope,
         "source_window": source_window,
         "holdings_source": "execution_positions.raw_payload.balance.output1"
         if raw_holdings
@@ -918,16 +1558,30 @@ def _load_broker_balance_snapshot_positions(
     db: Session,
     started_at: datetime,
     lookback_days: int,
+    requested_scope: FeedbackExecutionScope | None = None,
 ) -> list[ExecutionPosition]:
+    where = [
+        ExecutionPosition.mode == settings.runtime_mode,
+        ExecutionPosition.raw_payload.is_not(None),
+    ]
+    if requested_scope is not None:
+        where.extend(
+            [
+                ExecutionPosition.provider == requested_scope.provider,
+                ExecutionPosition.account_scope == requested_scope.account_scope,
+            ]
+        )
+        if requested_scope.exchange is not None:
+            where.append(ExecutionPosition.exchange == requested_scope.exchange)
     base_query = (
         select(ExecutionPosition)
-        .where(
-            ExecutionPosition.mode == settings.runtime_mode,
-            ExecutionPosition.raw_payload.is_not(None),
-        )
+        .where(*where)
         .options(
             load_only(
                 ExecutionPosition.id,
+                ExecutionPosition.provider,
+                ExecutionPosition.account_scope,
+                ExecutionPosition.exchange,
                 ExecutionPosition.symbol,
                 ExecutionPosition.quantity,
                 ExecutionPosition.base_quantity,
@@ -973,9 +1627,24 @@ def _broker_asset_unavailable(reason: str | None) -> dict[str, object]:
     }
 
 
-def _broker_balance_snapshots(positions: list[ExecutionPosition]) -> list[BrokerBalanceSnapshot]:
+def _broker_balance_snapshots(
+    positions: list[ExecutionPosition],
+    *,
+    require_canonical_identity: bool = False,
+) -> list[BrokerBalanceSnapshot]:
     snapshots = []
     for position in positions:
+        try:
+            column_identity = position_identity_from_columns(position)
+            payload_identity = position_identity_from_payload(position.raw_payload)
+        except PositionIdentityConflictError:
+            continue
+        if column_identity is None or (
+            payload_identity is not None and payload_identity != column_identity
+        ):
+            continue
+        if require_canonical_identity and payload_identity is None:
+            continue
         payload = position.raw_payload if isinstance(position.raw_payload, dict) else None
         if payload is None:
             continue
@@ -989,6 +1658,7 @@ def _broker_balance_snapshots(positions: list[ExecutionPosition]) -> list[Broker
         snapshots.append(
             BrokerBalanceSnapshot(
                 position=position,
+                position_identity=column_identity,
                 balance=balance,
                 output2=output2,
                 observed_at=observed_at,
@@ -1136,19 +1806,52 @@ def _portfolio_risk(
     db: Session,
     closed_trades: list[dict[str, object]],
     as_of: datetime,
+    requested_scope: FeedbackExecutionScope | None = None,
 ) -> dict[str, object]:
-    positions = _load_positions(settings=settings, db=db)
-    open_orders = _load_open_orders(settings=settings, db=db)
-    stale_before = as_of - timedelta(seconds=settings.exec_agent_max_account_snapshot_age_seconds)
-    sectors = _sectors_for_symbols(
+    positions = _load_positions(
         settings=settings,
         db=db,
-        symbols={position.symbol for position in positions},
+        provider=requested_scope.provider if requested_scope is not None else None,
+        account_scope=(
+            requested_scope.account_scope if requested_scope is not None else None
+        ),
+        exchange=requested_scope.exchange if requested_scope is not None else None,
+        require_canonical_identity=requested_scope is not None,
     )
-    position_currency_hints = load_symbol_settlement_currency_hints(
+    open_orders = _load_open_orders(
         settings=settings,
         db=db,
-        symbols=(position.symbol for position in positions),
+        requested_scope=requested_scope,
+    )
+    stale_before = as_of - timedelta(seconds=settings.exec_agent_max_account_snapshot_age_seconds)
+    sectors = (
+        {}
+        if requested_scope is not None
+        else _sectors_for_symbols(
+            settings=settings,
+            db=db,
+            symbols={position.symbol for position in positions},
+        )
+    )
+    position_currency_hints = (
+        {
+            position.symbol: currency_hint
+            for position in positions
+            if (
+                currency_hint := infer_settlement_currency(
+                    symbol=position.symbol,
+                    provider=position.provider,
+                    venue=position.exchange,
+                )
+            )[0]
+            is not None
+        }
+        if requested_scope is not None
+        else load_symbol_settlement_currency_hints(
+            settings=settings,
+            db=db,
+            symbols=(position.symbol for position in positions),
+        )
     )
     position_rows = [
         _position_risk_row(
@@ -1302,34 +2005,72 @@ def _portfolio_risk(
     }
 
 
-def _load_positions(*, settings: Settings, db: Session) -> list[ExecutionPosition]:
-    return list(
+def _load_positions(
+    *,
+    settings: Settings,
+    db: Session,
+    provider: str | None = None,
+    account_scope: str | None = None,
+    exchange: str | None = None,
+    require_canonical_identity: bool = False,
+) -> list[ExecutionPosition]:
+    where = [
+        ExecutionPosition.mode == settings.runtime_mode,
+        or_(
+            ExecutionPosition.quantity > 0,
+            ExecutionPosition.base_quantity > 0,
+        ),
+    ]
+    if provider is not None or account_scope is not None or exchange is not None:
+        if provider is None or account_scope is None:
+            return []
+        where.extend(
+            [
+                ExecutionPosition.provider == provider,
+                ExecutionPosition.account_scope == account_scope,
+            ]
+        )
+        if exchange is not None:
+            where.append(ExecutionPosition.exchange == exchange)
+    position_fields = [
+        ExecutionPosition.id,
+        ExecutionPosition.provider,
+        ExecutionPosition.account_scope,
+        ExecutionPosition.exchange,
+        ExecutionPosition.symbol,
+        ExecutionPosition.quantity,
+        ExecutionPosition.base_quantity,
+        ExecutionPosition.average_price,
+        ExecutionPosition.last_reconciled_at,
+        ExecutionPosition.updated_from,
+    ]
+    if require_canonical_identity:
+        position_fields.append(ExecutionPosition.raw_payload)
+    positions = list(
         db.scalars(
             select(ExecutionPosition)
-            .where(
-                ExecutionPosition.mode == settings.runtime_mode,
-                or_(
-                    ExecutionPosition.quantity > 0,
-                    ExecutionPosition.base_quantity > 0,
-                ),
-            )
+            .where(*where)
             .options(
-                load_only(
-                    ExecutionPosition.id,
-                    ExecutionPosition.symbol,
-                    ExecutionPosition.quantity,
-                    ExecutionPosition.base_quantity,
-                    ExecutionPosition.average_price,
-                    ExecutionPosition.last_reconciled_at,
-                    ExecutionPosition.updated_from,
-                )
+                load_only(*position_fields)
             )
             .order_by(ExecutionPosition.symbol.asc())
         )
     )
+    if not require_canonical_identity:
+        return positions
+    return [
+        position
+        for position in positions
+        if _canonical_position_identity(position) is not None
+    ]
 
 
-def _load_open_orders(*, settings: Settings, db: Session) -> list[BrokerOrder]:
+def _load_open_orders(
+    *,
+    settings: Settings,
+    db: Session,
+    requested_scope: FeedbackExecutionScope | None = None,
+) -> list[BrokerOrder]:
     terminal_statuses = {
         "filled",
         "canceled",
@@ -1339,7 +2080,7 @@ def _load_open_orders(*, settings: Settings, db: Session) -> list[BrokerOrder]:
         "failed",
         "closed",
     }
-    return list(
+    orders = list(
         db.scalars(
             select(BrokerOrder)
             .where(BrokerOrder.mode == settings.runtime_mode)
@@ -1348,6 +2089,16 @@ def _load_open_orders(*, settings: Settings, db: Session) -> list[BrokerOrder]:
             .order_by(BrokerOrder.symbol.asc(), BrokerOrder.submitted_at.asc().nulls_last(), BrokerOrder.id.asc())
         )
     )
+    if requested_scope is None:
+        return orders
+    return [
+        order
+        for order in orders
+        if _order_matches_feedback_scope(
+            order,
+            requested_scope,
+        )
+    ]
 
 
 def _position_risk_row(
@@ -1367,6 +2118,9 @@ def _position_risk_row(
             symbol=position.symbol,
         )
     return {
+        "provider": position.provider,
+        "account_scope": position.account_scope,
+        "exchange": position.exchange,
         "symbol": position.symbol,
         "quantity": position.quantity,
         "base_quantity": _position_base_quantity_text(position),
@@ -2962,16 +3716,88 @@ def _monday_check_snippet_lines(portfolio_risk: dict[str, object]) -> list[str]:
     return lines
 
 
-def _write_artifacts(*, report: dict[str, object], report_date: date, output_dir: Path) -> None:
+def _write_artifacts(
+    *,
+    report: dict[str, object],
+    report_date: date,
+    output_dir: Path,
+    artifact_scope: FeedbackExecutionScope | None = None,
+) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     json_path = output_dir / f"{report_date.isoformat()}.json"
     md_path = output_dir / f"{report_date.isoformat()}.md"
-    payload = _json_safe(report)
+    payload = _json_safe(redact_account_references(report))
     json_text = json.dumps(payload, ensure_ascii=False, indent=2)
-    json_path.write_text(json_text + "\n", encoding="utf-8")
-    (output_dir / "latest.json").write_text(json_text + "\n", encoding="utf-8")
-    md_path.write_text(_markdown_report(payload), encoding="utf-8")
-    (output_dir / "latest.md").write_text(_markdown_report(payload), encoding="utf-8")
+    markdown_text = _markdown_report(payload)
+    if artifact_scope is not None:
+        _atomic_write_text(
+            output_dir
+            / _scoped_artifact_name(
+                prefix=report_date.isoformat(),
+                suffix="json",
+                scope=artifact_scope,
+                runtime_mode=str(report.get("mode") or ""),
+            ),
+            json_text + "\n",
+        )
+        _atomic_write_text(
+            output_dir
+            / _scoped_artifact_name(
+                prefix="latest",
+                suffix="json",
+                scope=artifact_scope,
+                runtime_mode=str(report.get("mode") or ""),
+            ),
+            json_text + "\n",
+        )
+        _atomic_write_text(
+            output_dir
+            / _scoped_artifact_name(
+                prefix=report_date.isoformat(),
+                suffix="md",
+                scope=artifact_scope,
+                runtime_mode=str(report.get("mode") or ""),
+            ),
+            markdown_text,
+        )
+        _atomic_write_text(
+            output_dir
+            / _scoped_artifact_name(
+                prefix="latest",
+                suffix="md",
+                scope=artifact_scope,
+                runtime_mode=str(report.get("mode") or ""),
+            ),
+            markdown_text,
+        )
+        return
+    _atomic_write_text(json_path, json_text + "\n")
+    _atomic_write_text(output_dir / "latest.json", json_text + "\n")
+    _atomic_write_text(md_path, markdown_text)
+    _atomic_write_text(output_dir / "latest.md", markdown_text)
+
+
+def _atomic_write_text(path: Path, contents: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            handle.write(contents)
+            handle.flush()
+            os.fsync(handle.fileno())
+            temp_path = Path(handle.name)
+        os.replace(temp_path, path)
+        temp_path = None
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
 
 
 def _markdown_report(report: dict[str, object]) -> str:
@@ -3470,9 +4296,10 @@ def _decimal_value(value: object) -> Decimal | None:
     if value is None:
         return None
     try:
-        return Decimal(str(value))
+        parsed = Decimal(str(value))
     except Exception:
         return None
+    return parsed if parsed.is_finite() else None
 
 
 def _decimal_text(value: Decimal | None) -> str | None:

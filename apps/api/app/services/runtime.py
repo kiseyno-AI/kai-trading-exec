@@ -6,8 +6,9 @@ from zoneinfo import ZoneInfo
 
 from sqlalchemy import and_, distinct, func, literal, or_, select
 from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, load_only, selectinload, undefer
 
+from app.broker.base import BrokerAdapter
 from app.core.config import Settings
 from app.db.sqlite_diagnostics import sqlite_diagnostics_payload
 from app.db.session import ping_database
@@ -35,9 +36,23 @@ from app.services.fill_economics import (
     execution_fill_economics,
     summarize_closed_trade_economics,
 )
-from app.services.fifo_inventory import load_fifo_isolation_cursor
+from app.services.fifo_inventory import (
+    FifoRouteScope,
+    ambiguous_fifo_realized_pnl_sell_count,
+    fifo_fill_sort_key,
+    fifo_route_scope_from_order,
+    load_fifo_isolation_cursor,
+    replay_open_long_fill_inventory,
+)
 from app.services.max_holding_actionability import max_holding_actionability_summary
-from app.services.late_entry_actionability import late_entry_actionability_summary
+from app.services.position_identity import (
+    EXECUTION_SCOPE_POLICY_VERSION,
+    PositionIdentityConflictError,
+    build_authenticated_broker_position_identity,
+    build_position_identity,
+    position_identity_from_columns,
+)
+from app.services.late_entry_actionability import LATE_ENTRY_GATE_EVENT_TYPE
 from app.services.monitoring import (
     ACTIVE_WATCH_MONITORING_STATUSES,
     BLOCKED_MONITORING_STATUSES,
@@ -66,6 +81,11 @@ from app.services.broker_order_state import (
     broker_order_observed_at_expr,
 )
 from app.services.execution_api import list_runtime_symbols
+from app.services.execution_account_route import (
+    classify_kis_account_route,
+    validate_execution_account_scope,
+)
+from app.services.execution_semantics import KRX_EXCHANGES, WATCH_BUY_INTENTS
 from app.services.schema import check_runtime_schema
 from app.services.runtime_controls import (
     ensure_runtime_control_state,
@@ -76,7 +96,37 @@ OPEN_ORDER_STATUSES = ACTIONABLE_OPEN_ORDER_STATUSES
 ACTIVE_JOB_STATUSES = ("queued", "scheduled", "running", "retrying")
 MONITORED_INTENTS = ("target_sell", "stop_sell")
 SELL_MONITORED_INTENTS = ("target_sell", "stop_sell", "max_holding_close_sell")
-WATCH_BUY_INTENTS = ("watch_buy", "trigger_buy", "chase_buy", "tactical_buy", "intraday_watch_buy", "next_open_buy")
+WATCH_BUY_INTENTS = tuple(sorted(WATCH_BUY_INTENTS))
+KIS_US_EXCHANGES = frozenset({"AMEX", "NASD", "NYSE"})
+RUNTIME_PROVIDER_EXCHANGES = {
+    "alpaca": ("ALPACA", "US"),
+    "kis": tuple(sorted(KRX_EXCHANGES | KIS_US_EXCHANGES)),
+    "upbit": ("UPBIT",),
+}
+RUNTIME_PROVIDER_BROKER_NAMES = {
+    "alpaca": ("alpaca",),
+    "kis": ("kis", "korea-investment", "korea_investment"),
+    "upbit": ("upbit",),
+}
+KNOWN_RUNTIME_PROVIDER_BROKER_NAMES = tuple(
+    sorted(
+        {
+            broker_name
+            for broker_names in RUNTIME_PROVIDER_BROKER_NAMES.values()
+            for broker_name in broker_names
+        }
+    )
+)
+RUNTIME_EXECUTION_SCOPE_KEYS = frozenset(
+    {
+        "policy_version",
+        "provider",
+        "account_scope",
+        "venue",
+        "asset_class",
+        "exchange",
+    }
+)
 WATCH_BUY_STATUSES = (
     "watch_monitoring_pending",
     "watch_monitoring_active",
@@ -115,6 +165,8 @@ SHORT_TERM_DECIDER_NAME = "short-term-decider"
 SIGNAL_DECIDER_NAME = "signal-decider"
 FAILED_ORDER_STATUSES = ("rejected", "failed")
 KRX_TIMEZONE = ZoneInfo("Asia/Seoul")
+US_MARKET_TIMEZONE = ZoneInfo("America/New_York")
+UPBIT_MARKET_TIMEZONE = ZoneInfo("Asia/Seoul")
 MAX_STATUS_DETAIL_ITEMS = 20
 
 
@@ -144,6 +196,45 @@ class DuplicateFillQualityGroup:
     economic_conflict: bool
     conflicting_fields: tuple[str, ...]
     candidate_key: str
+
+
+@dataclass(frozen=True)
+class RuntimeFillScopeSelection:
+    fills: list[ExecutionFill]
+    indeterminate_fill_count: int
+    scope_unavailable_reason: str | None = None
+    chronology_ambiguous_fill_count: int = 0
+
+
+@dataclass(frozen=True)
+class RuntimeOrderScopeSelection:
+    orders: list[BrokerOrder]
+    indeterminate_order_count: int
+    foreign_order_count: int
+    scope_unavailable_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class RuntimePositionEvidenceSelection:
+    symbols: set[str]
+    indeterminate_order_count: int
+    indeterminate_fill_count: int
+    foreign_order_count: int
+    scope_unavailable_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class RuntimeExecutionScope:
+    provider: str
+    exchanges: tuple[str, ...]
+    account_scope: str | None
+    status: str
+    source: str | None
+    reason: str | None
+
+    @property
+    def available(self) -> bool:
+        return self.status == "available" and self.account_scope is not None
 
 
 def liveness_payload(runtime: RuntimeMetadata) -> dict[str, object]:
@@ -220,25 +311,58 @@ def runtime_counts(
     *,
     settings: Settings,
     db: Session,
+    provider: str = "kis",
+    runtime_scope: RuntimeExecutionScope | None = None,
 ) -> dict[str, int]:
-    open_orders = db.scalar(
-        select(func.count())
-        .select_from(BrokerOrder)
-        .where(*active_local_broker_order_filters(settings=settings, statuses=OPEN_ORDER_STATUSES)),
+    candidate_orders = list(
+        db.scalars(
+            select(BrokerOrder)
+            .where(
+                *active_local_broker_order_filters(
+                    settings=settings,
+                    statuses=OPEN_ORDER_STATUSES,
+                )
+            )
+            .options(undefer(BrokerOrder.request_metadata))
+        ).all()
     )
-    active_jobs = db.scalar(
-        select(func.count())
-        .select_from(ExecutionJob)
+    open_orders = (
+        _runtime_order_scope_selection(
+            settings=settings,
+            orders=candidate_orders,
+            provider=provider,
+            runtime_scope=runtime_scope,
+        ).orders
+        if runtime_scope is not None
+        else candidate_orders
+    )
+    candidate_jobs = list(
+        db.scalars(
+            select(ExecutionJob)
         .join(ExecutionJob.plan_item)
         .join(ExecutionPlanItem.plan)
         .where(
             ExecutionPlan.mode == settings.runtime_mode,
             ExecutionJob.status.in_(ACTIVE_JOB_STATUSES),
-        ),
+        )
+        .options(selectinload(ExecutionJob.plan_item))
+        ).all()
     )
+    active_jobs = [
+        job
+        for job in candidate_jobs
+        if runtime_scope is None
+        or _active_runtime_plan_item_exchange(
+            settings=settings,
+            item=job.plan_item,
+            provider=provider,
+            runtime_scope=runtime_scope,
+        )
+        is not None
+    ]
     return {
-        "open_orders": int(open_orders or 0),
-        "active_execution_jobs": int(active_jobs or 0),
+        "open_orders": len(open_orders),
+        "active_execution_jobs": len(active_jobs),
     }
 
 
@@ -246,10 +370,16 @@ def runtime_watch_buy_veto_summary(
     *,
     settings: Settings,
     db: Session,
+    provider: str = "kis",
+    runtime_scope: RuntimeExecutionScope | None = None,
 ) -> dict[str, object]:
-    today_start_utc, tomorrow_start_utc = _current_krx_day_utc_bounds()
+    today_start_utc, tomorrow_start_utc = _runtime_today_utc_bounds(
+        settings=settings,
+        provider=provider,
+        runtime_scope=runtime_scope,
+    )
     rows = db.execute(
-        select(ExecutionPlanItem.symbol, func.count())
+        select(ExecutionPlanItemAudit, ExecutionPlanItem)
         .select_from(ExecutionPlanItemAudit)
         .join(ExecutionPlanItemAudit.plan_item)
         .join(ExecutionPlanItem.plan)
@@ -259,23 +389,86 @@ def runtime_watch_buy_veto_summary(
             ExecutionPlanItemAudit.occurred_at >= today_start_utc,
             ExecutionPlanItemAudit.occurred_at < tomorrow_start_utc,
         )
-        .group_by(ExecutionPlanItem.symbol)
     ).all()
-    symbols = sorted(str(symbol) for symbol, count in rows if int(count or 0) > 0)
+    counts_by_symbol: dict[str, int] = {}
+    for _audit, item in rows:
+        if (
+            runtime_scope is not None
+            and _active_runtime_plan_item_exchange(
+                settings=settings,
+                item=item,
+                provider=provider,
+                runtime_scope=runtime_scope,
+            )
+            is None
+        ):
+            continue
+        symbol = str(item.symbol)
+        counts_by_symbol[symbol] = counts_by_symbol.get(symbol, 0) + 1
     return {
-        "today_count": sum(int(count or 0) for _, count in rows),
-        "today_symbols": symbols,
+        "today_count": sum(counts_by_symbol.values()),
+        "today_symbols": sorted(counts_by_symbol),
     }
 
 
-def runtime_late_entry_summary(*, settings: Settings, db: Session) -> dict[str, object]:
-    today_start_utc, tomorrow_start_utc = _current_krx_day_utc_bounds()
-    return late_entry_actionability_summary(
-        db=db,
-        mode=settings.runtime_mode,
-        start_at=today_start_utc,
-        end_at=tomorrow_start_utc,
+def runtime_late_entry_summary(
+    *,
+    settings: Settings,
+    db: Session,
+    provider: str = "kis",
+    runtime_scope: RuntimeExecutionScope | None = None,
+) -> dict[str, object]:
+    today_start_utc, tomorrow_start_utc = _runtime_today_utc_bounds(
+        settings=settings,
+        provider=provider,
+        runtime_scope=runtime_scope,
     )
+    rows = db.execute(
+        select(ExecutionPlanItemAudit, ExecutionPlanItem)
+        .select_from(ExecutionPlanItemAudit)
+        .join(ExecutionPlanItemAudit.plan_item)
+        .join(ExecutionPlanItem.plan)
+        .where(
+            ExecutionPlan.mode == settings.runtime_mode,
+            ExecutionPlanItemAudit.event_type == LATE_ENTRY_GATE_EVENT_TYPE,
+            ExecutionPlanItemAudit.occurred_at >= today_start_utc,
+            ExecutionPlanItemAudit.occurred_at < tomorrow_start_utc,
+        )
+        .order_by(ExecutionPlanItemAudit.occurred_at.asc())
+    ).all()
+    scoped_rows = [
+        (audit, item)
+        for audit, item in rows
+        if runtime_scope is None
+        or _active_runtime_plan_item_exchange(
+            settings=settings,
+            item=item,
+            provider=provider,
+            runtime_scope=runtime_scope,
+        )
+        is not None
+    ]
+    counts = {"shadow": 0, "block": 0}
+    symbols: set[str] = set()
+    for audit, item in scoped_rows:
+        summary = audit.summary if isinstance(audit.summary, dict) else {}
+        gate_mode = summary.get("mode")
+        if gate_mode in counts:
+            counts[str(gate_mode)] += 1
+        symbols.add(str(item.symbol))
+    return {
+        "event_count": len(scoped_rows),
+        "shadow_count": counts["shadow"],
+        "block_count": counts["block"],
+        "symbols": sorted(symbols),
+        "first_observed_at": (
+            scoped_rows[0][0].occurred_at.isoformat() if scoped_rows else None
+        ),
+        "last_observed_at": (
+            scoped_rows[-1][0].occurred_at.isoformat() if scoped_rows else None
+        ),
+        "broker_mutations": False,
+    }
 
 
 def runtime_freshness_payload(
@@ -284,34 +477,23 @@ def runtime_freshness_payload(
     db: Session,
     monitoring: dict[str, object],
     now: datetime | None = None,
+    provider: str = "kis",
+    runtime_scope: RuntimeExecutionScope | None = None,
 ) -> dict[str, object]:
     observed_at = now or datetime.now(UTC)
     position_truth = position_truth_freshness_payload(
         settings=settings,
         db=db,
         now=observed_at,
-    )
-    latest_order_sync_at = db.scalar(
-        select(func.max(BrokerOrder.last_broker_sync_at)).where(
-            BrokerOrder.mode == settings.runtime_mode,
-            BrokerOrder.last_broker_sync_at.is_not(None),
-        )
-    )
-    latest_reconcile_event_at = db.scalar(
-        select(func.max(BrokerOrderEvent.observed_at))
-        .select_from(BrokerOrderEvent)
-        .join(BrokerOrderEvent.broker_order)
-        .where(
-            BrokerOrder.mode == settings.runtime_mode,
-            BrokerOrderEvent.event_source == "reconciliation",
-        )
+        provider=provider,
+        runtime_scope=runtime_scope,
     )
     broker_orders = broker_order_freshness_payload(
         settings=settings,
         db=db,
         now=observed_at,
-        latest_order_sync_at=latest_order_sync_at,
-        latest_reconcile_event_at=latest_reconcile_event_at,
+        provider=provider,
+        runtime_scope=runtime_scope,
     )
     return {
         "generated_at": observed_at.isoformat(),
@@ -333,25 +515,23 @@ def broker_order_freshness_payload(
     now: datetime | None = None,
     latest_order_sync_at: datetime | None = None,
     latest_reconcile_event_at: datetime | None = None,
+    provider: str = "kis",
+    runtime_scope: RuntimeExecutionScope | None = None,
 ) -> dict[str, object]:
     observed_at = now or datetime.now(UTC)
-    if latest_order_sync_at is None:
-        latest_order_sync_at = db.scalar(
-            select(func.max(BrokerOrder.last_broker_sync_at)).where(
-                BrokerOrder.mode == settings.runtime_mode,
-                BrokerOrder.last_broker_sync_at.is_not(None),
+    if latest_order_sync_at is None or latest_reconcile_event_at is None:
+        scoped_order_sync_at, scoped_reconcile_event_at = (
+            _runtime_broker_order_freshness_times(
+                settings=settings,
+                db=db,
+                provider=provider,
+                runtime_scope=runtime_scope,
             )
         )
-    if latest_reconcile_event_at is None:
-        latest_reconcile_event_at = db.scalar(
-            select(func.max(BrokerOrderEvent.observed_at))
-            .select_from(BrokerOrderEvent)
-            .join(BrokerOrderEvent.broker_order)
-            .where(
-                BrokerOrder.mode == settings.runtime_mode,
-                BrokerOrderEvent.event_source == "reconciliation",
-            )
-        )
+        if latest_order_sync_at is None:
+            latest_order_sync_at = scoped_order_sync_at
+        if latest_reconcile_event_at is None:
+            latest_reconcile_event_at = scoped_reconcile_event_at
     return {
         "latest_broker_sync_at": _serialize_datetime(latest_order_sync_at),
         "latest_reconciliation_event_at": _serialize_datetime(latest_reconcile_event_at),
@@ -359,19 +539,101 @@ def broker_order_freshness_payload(
             settings=settings,
             db=db,
             now=observed_at,
+            provider=provider,
+            runtime_scope=runtime_scope,
         ),
         "fill_quality": broker_order_fill_quality_payload(
             settings=settings,
             db=db,
+            provider=provider,
+            runtime_scope=runtime_scope,
         ),
     }
+
+
+def _runtime_broker_order_freshness_times(
+    *,
+    settings: Settings,
+    db: Session,
+    provider: str,
+    runtime_scope: RuntimeExecutionScope | None,
+) -> tuple[datetime | None, datetime | None]:
+    if runtime_scope is None:
+        return (
+            db.scalar(
+                select(func.max(BrokerOrder.last_broker_sync_at)).where(
+                    BrokerOrder.mode == settings.runtime_mode,
+                    BrokerOrder.last_broker_sync_at.is_not(None),
+                )
+            ),
+            db.scalar(
+                select(func.max(BrokerOrderEvent.observed_at))
+                .select_from(BrokerOrderEvent)
+                .join(BrokerOrderEvent.broker_order)
+                .where(
+                    BrokerOrder.mode == settings.runtime_mode,
+                    BrokerOrderEvent.event_source == "reconciliation",
+                )
+            ),
+        )
+    candidate_orders = list(
+        db.scalars(
+            select(BrokerOrder)
+            .where(BrokerOrder.mode == settings.runtime_mode)
+            .options(undefer(BrokerOrder.request_metadata))
+        ).all()
+    )
+    active_orders = _runtime_order_scope_selection(
+        settings=settings,
+        orders=candidate_orders,
+        provider=provider,
+        runtime_scope=runtime_scope,
+    ).orders
+    active_order_ids = [order.id for order in active_orders]
+    latest_sync = max(
+        (order.last_broker_sync_at for order in active_orders if order.last_broker_sync_at is not None),
+        default=None,
+    )
+    latest_reconcile = (
+        db.scalar(
+            select(func.max(BrokerOrderEvent.observed_at)).where(
+                BrokerOrderEvent.broker_order_pk.in_(active_order_ids),
+                BrokerOrderEvent.event_source == "reconciliation",
+            )
+        )
+        if active_order_ids
+        else None
+    )
+    return latest_sync, latest_reconcile
 
 
 def broker_order_fill_quality_payload(
     *,
     settings: Settings,
     db: Session,
+    provider: str = "kis",
+    runtime_scope: RuntimeExecutionScope | None = None,
 ) -> dict[str, object]:
+    scoped_order_selection: RuntimeOrderScopeSelection | None = None
+    scoped_order_ids: list[str] | None = None
+    if runtime_scope is not None:
+        candidate_orders = list(
+            db.scalars(
+                select(BrokerOrder)
+                .where(
+                    BrokerOrder.mode == settings.runtime_mode,
+                    BrokerOrder.status == "filled",
+                )
+                .options(undefer(BrokerOrder.request_metadata))
+            ).all()
+        )
+        scoped_order_selection = _runtime_order_scope_selection(
+            settings=settings,
+            orders=candidate_orders,
+            provider=provider,
+            runtime_scope=runtime_scope,
+        )
+        scoped_order_ids = [order.id for order in scoped_order_selection.orders]
     missing_fill_query = (
         select(
             BrokerOrder.id,
@@ -386,6 +648,11 @@ def broker_order_fill_quality_payload(
         .where(
             BrokerOrder.mode == settings.runtime_mode,
             BrokerOrder.status == "filled",
+            *(
+                (BrokerOrder.id.in_(scoped_order_ids),)
+                if scoped_order_ids is not None
+                else ()
+            ),
         )
         .group_by(BrokerOrder.id)
         .having(func.count(ExecutionFill.id) == 0)
@@ -448,6 +715,7 @@ def broker_order_fill_quality_payload(
     duplicate_fill_groups = _duplicate_fill_quality_groups(
         db=db,
         runtime_mode=settings.runtime_mode,
+        broker_order_ids=scoped_order_ids,
     )
     duplicate_fill_count = len(duplicate_fill_groups)
     duplicate_fill_rows = duplicate_fill_groups[:MAX_STATUS_DETAIL_ITEMS]
@@ -490,6 +758,37 @@ def broker_order_fill_quality_payload(
         })
 
     return {
+        "scope_status": (
+            "unavailable"
+            if scoped_order_selection is not None
+            and (
+                scoped_order_selection.scope_unavailable_reason is not None
+                or scoped_order_selection.indeterminate_order_count > 0
+            )
+            else "ok"
+        ),
+        "scope_reason": (
+            (
+                scoped_order_selection.scope_unavailable_reason
+                or "indeterminate_execution_scope"
+            )
+            if scoped_order_selection is not None
+            and (
+                scoped_order_selection.scope_unavailable_reason is not None
+                or scoped_order_selection.indeterminate_order_count > 0
+            )
+            else None
+        ),
+        "excluded_indeterminate_order_count": (
+            scoped_order_selection.indeterminate_order_count
+            if scoped_order_selection is not None
+            else 0
+        ),
+        "excluded_other_route_count": (
+            scoped_order_selection.foreign_order_count
+            if scoped_order_selection is not None
+            else 0
+        ),
         "missing_filled_order_fill_count": missing_fill_count,
         "missing_filled_order_fill_unreviewed_count": missing_fill_count - missing_manual_review_count,
         "missing_filled_order_fill_manual_review_count": missing_manual_review_count,
@@ -507,11 +806,19 @@ def _duplicate_fill_quality_groups(
     *,
     db: Session,
     runtime_mode: str,
+    broker_order_ids: list[str] | None = None,
 ) -> list[DuplicateFillQualityGroup]:
     fills = db.scalars(
         select(ExecutionFill)
         .join(ExecutionFill.broker_order)
-        .where(BrokerOrder.mode == runtime_mode)
+        .where(
+            BrokerOrder.mode == runtime_mode,
+            *(
+                (BrokerOrder.id.in_(broker_order_ids),)
+                if broker_order_ids is not None
+                else ()
+            ),
+        )
         .order_by(
             ExecutionFill.broker_order_pk.asc(),
             ExecutionFill.filled_at.asc(),
@@ -578,25 +885,621 @@ def _duplicate_fill_candidate_key(*, group_key: str, fills: list[ExecutionFill])
     )
 
 
+def _active_runtime_kis_position_filters(
+    *, settings: Settings
+) -> tuple[object, ...]:
+    return _active_runtime_position_filters(
+        settings=settings,
+        provider="kis",
+    )
+
+
+def _active_runtime_position_filters(
+    *,
+    settings: Settings,
+    provider: str,
+    runtime_scope: RuntimeExecutionScope | None = None,
+) -> tuple[object, ...]:
+    scope = _runtime_scope_for_provider(
+        settings=settings,
+        provider=provider,
+        runtime_scope=runtime_scope,
+    )
+    if not scope.available:
+        return (ExecutionPosition.id.is_(None),)
+    return (
+        ExecutionPosition.mode == settings.runtime_mode,
+        ExecutionPosition.provider == scope.provider,
+        ExecutionPosition.account_scope == scope.account_scope,
+        ExecutionPosition.exchange.in_(scope.exchanges),
+    )
+
+
+def _normalize_runtime_provider(provider: object) -> str:
+    normalized = str(provider or "kis").strip().lower()
+    if normalized in {"korea-investment", "korea_investment"}:
+        return "kis"
+    return normalized
+
+
+def _runtime_account_drawdown_gate_state(
+    *,
+    settings: Settings,
+    db: Session,
+    provider: str,
+) -> dict[str, object]:
+    normalized_provider = _normalize_runtime_provider(provider)
+    if normalized_provider != "kis":
+        # The durable legacy gate reader derives KIS recovery fingerprints.
+        # Until another provider has an exact-account reader, report the
+        # absence of scoped evidence instead of displaying a KIS latch as if
+        # it belonged to the active Alpaca or Upbit runtime.
+        return {
+            "available": False,
+            "enabled": settings.account_drawdown_gate_enabled,
+            "gated": None,
+            "provider": normalized_provider,
+            "latest_decision": None,
+            "active_recovery_scopes": {},
+            "reason": "provider_scoped_gate_state_unavailable",
+        }
+    return latest_account_drawdown_gate_state(settings=settings, db=db)
+
+
+def _resolve_runtime_execution_scope(
+    *,
+    settings: Settings,
+    provider: str,
+    broker_adapter: BrokerAdapter | None = None,
+) -> RuntimeExecutionScope:
+    normalized_provider = _normalize_runtime_provider(provider)
+    exchanges = RUNTIME_PROVIDER_EXCHANGES.get(normalized_provider, ())
+    if not exchanges:
+        return RuntimeExecutionScope(
+            provider=normalized_provider,
+            exchanges=(),
+            account_scope=None,
+            status="unavailable",
+            source=None,
+            reason="unsupported_broker_provider",
+        )
+
+    broker_account_id: str | None = None
+    configured_scope = str(settings.execution_position_account_scope or "").strip()
+    if normalized_provider == "alpaca":
+        adapter_provider = _normalize_runtime_provider(
+            getattr(broker_adapter, "provider", "")
+        )
+        account_id_loader = getattr(broker_adapter, "get_broker_account_id", None)
+        if adapter_provider != normalized_provider or not callable(account_id_loader):
+            return RuntimeExecutionScope(
+                provider=normalized_provider,
+                exchanges=exchanges,
+                account_scope=None,
+                status="unavailable",
+                source=None,
+                reason="authenticated_account_identity_unavailable",
+            )
+        try:
+            raw_account_id = account_id_loader("")
+        except Exception:
+            return RuntimeExecutionScope(
+                provider=normalized_provider,
+                exchanges=exchanges,
+                account_scope=None,
+                status="unavailable",
+                source=None,
+                reason="authenticated_account_identity_unavailable",
+            )
+        broker_account_id = (
+            raw_account_id.strip()
+            if isinstance(raw_account_id, str) and raw_account_id.strip()
+            else None
+        )
+        if broker_account_id is None:
+            return RuntimeExecutionScope(
+                provider=normalized_provider,
+                exchanges=exchanges,
+                account_scope=None,
+                status="unavailable",
+                source=None,
+                reason="authenticated_account_identity_unavailable",
+            )
+
+    try:
+        identity = (
+            build_authenticated_broker_position_identity(
+                settings=settings,
+                provider=normalized_provider,
+                exchange=exchanges[0],
+                broker_account_id=str(broker_account_id or ""),
+            )
+            if normalized_provider == "alpaca"
+            else build_position_identity(
+                settings=settings,
+                provider=normalized_provider,
+                exchange=exchanges[0],
+                broker_account_id=broker_account_id,
+            )
+        )
+    except PositionIdentityConflictError:
+        return RuntimeExecutionScope(
+            provider=normalized_provider,
+            exchanges=exchanges,
+            account_scope=None,
+            status="unavailable",
+            source=None,
+            reason="stable_account_scope_unavailable",
+        )
+    if broker_account_id is not None:
+        source = "authenticated_broker_account"
+    elif configured_scope:
+        source = "configured_account_scope"
+    elif normalized_provider == "kis" and str(settings.kis_account_number or "").strip():
+        source = "configured_broker_account"
+    else:
+        source = "simulated_provider_route"
+    return RuntimeExecutionScope(
+        provider=normalized_provider,
+        exchanges=exchanges,
+        account_scope=identity.account_scope,
+        status="available",
+        source=source,
+        reason=None,
+    )
+
+
+def _runtime_scope_for_provider(
+    *,
+    settings: Settings,
+    provider: str,
+    runtime_scope: RuntimeExecutionScope | None,
+) -> RuntimeExecutionScope:
+    normalized_provider = _normalize_runtime_provider(provider)
+    if runtime_scope is None:
+        return _resolve_runtime_execution_scope(
+            settings=settings,
+            provider=normalized_provider,
+        )
+    if runtime_scope.provider == normalized_provider:
+        return runtime_scope
+    return RuntimeExecutionScope(
+        provider=normalized_provider,
+        exchanges=RUNTIME_PROVIDER_EXCHANGES.get(normalized_provider, ()),
+        account_scope=None,
+        status="unavailable",
+        source=None,
+        reason="runtime_scope_provider_mismatch",
+    )
+
+
+def _runtime_pnl_timezone(
+    *,
+    settings: Settings | None,
+    provider: str,
+    runtime_scope: RuntimeExecutionScope | None,
+) -> ZoneInfo:
+    normalized_provider = _normalize_runtime_provider(provider)
+    exchanges = {
+        str(exchange).strip().upper()
+        for exchange in (runtime_scope.exchanges if runtime_scope is not None else ())
+        if str(exchange).strip()
+    }
+    if normalized_provider == "alpaca":
+        return US_MARKET_TIMEZONE
+    if normalized_provider == "upbit":
+        return UPBIT_MARKET_TIMEZONE
+    if normalized_provider == "kis":
+        has_krx = "KRX" in exchanges
+        has_us = bool(exchanges & KIS_US_EXCHANGES)
+        if has_us and not has_krx:
+            return US_MARKET_TIMEZONE
+        if has_krx and not has_us:
+            return KRX_TIMEZONE
+        if bool(getattr(settings, "kis_us_trading_enabled", False)):
+            return US_MARKET_TIMEZONE
+    return KRX_TIMEZONE
+
+
+def _runtime_pnl_scope(
+    *,
+    settings: Settings,
+    provider: str,
+    runtime_scope: RuntimeExecutionScope | None,
+) -> tuple[RuntimeExecutionScope, ZoneInfo]:
+    scope = _runtime_scope_for_provider(
+        settings=settings,
+        provider=provider,
+        runtime_scope=runtime_scope,
+    )
+    timezone = _runtime_pnl_timezone(
+        settings=settings,
+        provider=provider,
+        runtime_scope=scope,
+    )
+    return scope, timezone
+
+
+def _runtime_today_utc_bounds(
+    *,
+    settings: Settings,
+    provider: str,
+    runtime_scope: RuntimeExecutionScope | None,
+) -> tuple[datetime, datetime]:
+    timezone = _runtime_pnl_timezone(
+        settings=settings,
+        provider=provider,
+        runtime_scope=runtime_scope,
+    )
+    return _current_pnl_day_utc_bounds(timezone=timezone)
+
+
+def _runtime_execution_scope_payload(
+    runtime_scope: RuntimeExecutionScope,
+) -> dict[str, object]:
+    return {
+        "provider": runtime_scope.provider,
+        "status": runtime_scope.status,
+        "source": runtime_scope.source,
+        "reason": runtime_scope.reason,
+        "exchanges": list(runtime_scope.exchanges),
+    }
+
+
+def _canonical_runtime_snapshot_execution_scope(
+    runtime_scope: RuntimeExecutionScope,
+) -> dict[str, object] | None:
+    if not runtime_scope.available:
+        return None
+    return {
+        "policy_version": EXECUTION_SCOPE_POLICY_VERSION,
+        "provider": runtime_scope.provider,
+        "account_scope": runtime_scope.account_scope,
+    }
+
+
+def _exact_runtime_snapshot_scope_matches(
+    *,
+    value: object,
+    runtime_scope: RuntimeExecutionScope,
+) -> bool:
+    expected = _canonical_runtime_snapshot_execution_scope(runtime_scope)
+    return bool(
+        expected is not None
+        and isinstance(value, dict)
+        and set(value) == set(expected)
+        and value == expected
+    )
+
+
+def _autonomous_runtime_snapshot_scope_reasons(
+    *,
+    autonomous: dict[str, object],
+    runtime_scope: RuntimeExecutionScope,
+) -> list[str]:
+    if not _exact_runtime_snapshot_scope_matches(
+        value=autonomous.get("execution_scope"),
+        runtime_scope=runtime_scope,
+    ):
+        return ["autonomous runtime snapshot execution scope is unavailable or mismatched"]
+
+    monitoring = autonomous.get("monitoring")
+    if not isinstance(monitoring, dict):
+        return []
+    reasons: list[str] = []
+    last_cycle = monitoring.get("last_cycle")
+    if isinstance(last_cycle, dict) and not _exact_runtime_snapshot_scope_matches(
+        value=last_cycle.get("execution_scope"),
+        runtime_scope=runtime_scope,
+    ):
+        reasons.append(
+            "autonomous monitoring cycle execution scope is unavailable or mismatched"
+        )
+    runtime_snapshot = monitoring.get("runtime_snapshot")
+    if isinstance(runtime_snapshot, dict) and not _exact_runtime_snapshot_scope_matches(
+        value=runtime_snapshot.get("execution_scope"),
+        runtime_scope=runtime_scope,
+    ):
+        reasons.append(
+            "autonomous monitoring data snapshot execution scope is unavailable or mismatched"
+        )
+    return reasons
+
+
+def _strip_account_scope(value: object) -> object:
+    if isinstance(value, dict):
+        return {
+            key: _strip_account_scope(item)
+            for key, item in value.items()
+            if key != "account_scope"
+        }
+    if isinstance(value, list):
+        return [_strip_account_scope(item) for item in value]
+    if isinstance(value, tuple):
+        return [_strip_account_scope(item) for item in value]
+    return value
+
+
+def _public_autonomous_runtime_payload(
+    *,
+    autonomous: dict[str, object],
+    snapshot_trusted: bool,
+    scope_reasons: list[str],
+) -> dict[str, object]:
+    public = _strip_account_scope(autonomous)
+    assert isinstance(public, dict)
+    public["snapshot_scope_status"] = "available" if snapshot_trusted else "unavailable"
+    public["snapshot_scope_reason"] = scope_reasons[0] if scope_reasons else None
+    if snapshot_trusted:
+        return public
+    monitoring = public.get("monitoring")
+    if isinstance(monitoring, dict):
+        monitoring["status"] = "degraded"
+        monitoring["last_cycle"] = None
+        monitoring["runtime_snapshot"] = None
+    for worker_key in ("dispatch", "watch_exec_agent_sizing", "nxt_eligible_sync"):
+        worker = public.get(worker_key)
+        if isinstance(worker, dict):
+            worker["last_cycle"] = None
+    return public
+
+
+def _active_runtime_plan_item_exchange(
+    *,
+    settings: Settings,
+    item: ExecutionPlanItem,
+    provider: str,
+    runtime_scope: RuntimeExecutionScope | None = None,
+) -> str | None:
+    scope = _runtime_scope_for_provider(
+        settings=settings,
+        provider=provider,
+        runtime_scope=runtime_scope,
+    )
+    if not scope.available:
+        return None
+    active_provider = scope.provider
+    if not isinstance(item.provider, str) or not item.provider.strip():
+        return None
+    item_provider = _normalize_runtime_provider(item.provider)
+    if item_provider != active_provider:
+        return None
+    if active_provider == "kis" and classify_kis_account_route(
+        settings=settings,
+        provider=item_provider,
+        risk_context=item.risk_context,
+        quantity_policy=item.quantity_policy,
+    ) != "active":
+        return None
+    if active_provider != "kis" and validate_execution_account_scope(
+        provider=item_provider,
+        risk_context=item.risk_context,
+        quantity_policy=item.quantity_policy,
+        current_binding={
+            "policy_version": EXECUTION_SCOPE_POLICY_VERSION,
+            "provider": scope.provider,
+            "account_scope": scope.account_scope,
+        },
+        require_binding=True,
+    ) is not None:
+        return None
+    risk_context = item.risk_context if isinstance(item.risk_context, dict) else {}
+    exchange = risk_context.get("exchange")
+    if not isinstance(exchange, str) and active_provider != "kis":
+        exchange = item.venue
+    if not isinstance(exchange, str):
+        return None
+    normalized_exchange = exchange.strip().upper()
+    if normalized_exchange not in scope.exchanges:
+        return None
+    return normalized_exchange
+
+
+def _active_runtime_order_scope(
+    *,
+    settings: Settings,
+    order: BrokerOrder,
+    provider: str,
+    runtime_scope: RuntimeExecutionScope | None = None,
+) -> FifoRouteScope | None:
+    classification, route_scope = _runtime_order_scope_classification(
+        settings=settings,
+        order=order,
+        provider=provider,
+        runtime_scope=runtime_scope,
+    )
+    return route_scope if classification == "active" else None
+
+
+def _runtime_order_scope_classification(
+    *,
+    settings: Settings,
+    order: BrokerOrder,
+    provider: str,
+    runtime_scope: RuntimeExecutionScope | None = None,
+) -> tuple[str, FifoRouteScope | None]:
+    scope = _runtime_scope_for_provider(
+        settings=settings,
+        provider=provider,
+        runtime_scope=runtime_scope,
+    )
+    if not scope.available:
+        return "indeterminate", None
+    active_provider = scope.provider
+    if isinstance(order.broker_name, str) and order.broker_name.strip():
+        broker_provider = _normalize_runtime_provider(order.broker_name)
+        if (
+            broker_provider in RUNTIME_PROVIDER_EXCHANGES
+            and broker_provider != active_provider
+        ):
+            return "foreign", None
+    metadata = order.request_metadata
+    raw_scope = metadata.get("execution_scope") if isinstance(metadata, dict) else None
+    if not isinstance(raw_scope, dict) or set(raw_scope) != RUNTIME_EXECUTION_SCOPE_KEYS:
+        return "indeterminate", None
+    route_scope = fifo_route_scope_from_order(order)
+    if route_scope is None:
+        return "indeterminate", None
+    if (
+        route_scope.provider != active_provider
+        or _normalize_runtime_provider(order.broker_name) != active_provider
+        or route_scope.exchange not in scope.exchanges
+        or order.mode != settings.runtime_mode
+    ):
+        return "foreign", route_scope
+    if (
+        route_scope.provider != scope.provider
+        or route_scope.account_scope != scope.account_scope
+    ):
+        return "foreign", route_scope
+    return "active", route_scope
+
+
+def _runtime_order_scope_selection(
+    *,
+    settings: Settings,
+    orders: list[BrokerOrder],
+    provider: str,
+    runtime_scope: RuntimeExecutionScope | None = None,
+) -> RuntimeOrderScopeSelection:
+    scope = _runtime_scope_for_provider(
+        settings=settings,
+        provider=provider,
+        runtime_scope=runtime_scope,
+    )
+    active_orders: list[BrokerOrder] = []
+    indeterminate_order_count = 0
+    foreign_order_count = 0
+    for order in orders:
+        classification, _route_scope = _runtime_order_scope_classification(
+            settings=settings,
+            order=order,
+            provider=provider,
+            runtime_scope=scope,
+        )
+        if classification == "active":
+            active_orders.append(order)
+        elif classification == "foreign":
+            foreign_order_count += 1
+        else:
+            indeterminate_order_count += 1
+    return RuntimeOrderScopeSelection(
+        orders=active_orders,
+        indeterminate_order_count=indeterminate_order_count,
+        foreign_order_count=foreign_order_count,
+        scope_unavailable_reason=(
+            None if scope.available else scope.reason or "runtime_execution_scope_unavailable"
+        ),
+    )
+
+
+def _active_runtime_fills_for_period(
+    *,
+    settings: Settings,
+    db: Session,
+    start_at: datetime | None,
+    end_at: datetime,
+    provider: str,
+    runtime_scope: RuntimeExecutionScope | None = None,
+) -> RuntimeFillScopeSelection:
+    scope = _runtime_scope_for_provider(
+        settings=settings,
+        provider=provider,
+        runtime_scope=runtime_scope,
+    )
+    if not scope.available:
+        return RuntimeFillScopeSelection(
+            fills=[],
+            indeterminate_fill_count=0,
+            scope_unavailable_reason=(
+                scope.reason or "runtime_execution_scope_unavailable"
+            ),
+        )
+    period_filters = [
+        BrokerOrder.mode == settings.runtime_mode,
+        ExecutionFill.filled_at < end_at,
+        or_(
+            BrokerOrder.broker_name.is_(None),
+            func.trim(BrokerOrder.broker_name) == "",
+            func.lower(func.trim(BrokerOrder.broker_name)).in_(
+                RUNTIME_PROVIDER_BROKER_NAMES.get(scope.provider, (scope.provider,))
+            ),
+            ~func.lower(func.trim(BrokerOrder.broker_name)).in_(
+                KNOWN_RUNTIME_PROVIDER_BROKER_NAMES
+            ),
+        ),
+    ]
+    if start_at is not None:
+        period_filters.append(ExecutionFill.filled_at >= start_at)
+    fills = dedupe_execution_fills(
+        db.scalars(
+            select(ExecutionFill)
+            .select_from(ExecutionFill)
+            .join(ExecutionFill.broker_order)
+            .where(*period_filters)
+            .options(
+                undefer(ExecutionFill.payload),
+                selectinload(ExecutionFill.broker_order).load_only(
+                    BrokerOrder.id,
+                    BrokerOrder.broker_name,
+                    BrokerOrder.mode,
+                    BrokerOrder.request_metadata,
+                    BrokerOrder.venue,
+                    BrokerOrder.asset_class,
+                ),
+            )
+            .order_by(ExecutionFill.filled_at.asc(), ExecutionFill.id.asc())
+        ).all()
+    )
+    active_fills: list[ExecutionFill] = []
+    indeterminate_fill_count = 0
+    for fill in fills:
+        classification, _route_scope = _runtime_order_scope_classification(
+            settings=settings,
+            order=fill.broker_order,
+            provider=provider,
+            runtime_scope=scope,
+        )
+        if classification == "active":
+            active_fills.append(fill)
+        elif classification == "indeterminate":
+            indeterminate_fill_count += 1
+    return RuntimeFillScopeSelection(
+        fills=active_fills,
+        indeterminate_fill_count=indeterminate_fill_count,
+    )
+
+
 def position_truth_freshness_payload(
     *,
     settings: Settings,
     db: Session,
     now: datetime | None = None,
+    provider: str = "kis",
+    runtime_scope: RuntimeExecutionScope | None = None,
 ) -> dict[str, object]:
     observed_at = now or datetime.now(UTC)
     stale_before = observed_at - timedelta(seconds=settings.exec_agent_max_account_snapshot_age_seconds)
-    evidence_symbols = _position_truth_evidence_symbols(
+    evidence = _position_truth_evidence_symbols(
         settings=settings,
         db=db,
         now=observed_at,
+        provider=provider,
+        runtime_scope=runtime_scope,
     )
+    evidence_symbols = evidence.symbols
     positions = db.scalars(
         select(ExecutionPosition).where(
-            ExecutionPosition.mode == settings.runtime_mode,
+            *_active_runtime_position_filters(
+                settings=settings,
+                provider=provider,
+                runtime_scope=runtime_scope,
+            ),
         )
     ).all()
-    positions_by_symbol = {position.symbol: position for position in positions}
+    positions_by_symbol: dict[str, list[ExecutionPosition]] = {}
+    for position in positions:
+        positions_by_symbol.setdefault(position.symbol, []).append(position)
     nonzero_position_symbols = {
         position.symbol
         for position in positions
@@ -605,8 +1508,9 @@ def position_truth_freshness_payload(
     candidate_symbols = nonzero_position_symbols | evidence_symbols
     trusted_flat_count = sum(
         1
-        for symbol, position in positions_by_symbol.items()
-        if symbol not in evidence_symbols and not _position_has_quantity(position)
+        for symbol, symbol_positions in positions_by_symbol.items()
+        if symbol not in evidence_symbols
+        and not any(_position_has_quantity(position) for position in symbol_positions)
     )
     stale_symbols: list[str] = []
     oldest_age_seconds: float | None = None
@@ -623,18 +1527,45 @@ def position_truth_freshness_payload(
             oldest_reconciled_at = normalized_reconciled_at
 
     for symbol in sorted(candidate_symbols):
-        position = positions_by_symbol.get(symbol)
-        reconciled_at = position.last_reconciled_at if position is not None else None
-        if reconciled_at is None or _as_utc(reconciled_at) < stale_before:
+        symbol_positions = positions_by_symbol.get(symbol, [])
+        reconciled_times = [
+            _as_utc(position.last_reconciled_at)
+            for position in symbol_positions
+            if position.last_reconciled_at is not None
+        ]
+        route_is_stale = (
+            not symbol_positions
+            or len(reconciled_times) != len(symbol_positions)
+            or any(reconciled_at < stale_before for reconciled_at in reconciled_times)
+        )
+        if route_is_stale:
             stale_symbols.append(symbol)
-            if reconciled_at is None:
+            if not reconciled_times:
                 continue
-            age_seconds = (observed_at - _as_utc(reconciled_at)).total_seconds()
+            age_seconds = (observed_at - min(reconciled_times)).total_seconds()
             if oldest_age_seconds is None or age_seconds > oldest_age_seconds:
                 oldest_age_seconds = age_seconds
 
-    broker_truth_reachable = latest_reconciled_at is not None and latest_reconciled_at >= stale_before
+    if evidence.scope_unavailable_reason is not None:
+        scope_status = "unavailable"
+        scope_reason = evidence.scope_unavailable_reason
+    elif evidence.indeterminate_order_count or evidence.indeterminate_fill_count:
+        scope_status = "unavailable"
+        scope_reason = "indeterminate_execution_scope"
+    else:
+        scope_status = "ok"
+        scope_reason = None
+    broker_truth_reachable = bool(
+        scope_status == "ok"
+        and latest_reconciled_at is not None
+        and latest_reconciled_at >= stale_before
+    )
     return {
+        "scope_status": scope_status,
+        "scope_reason": scope_reason,
+        "excluded_indeterminate_order_count": evidence.indeterminate_order_count,
+        "excluded_indeterminate_fill_count": evidence.indeterminate_fill_count,
+        "excluded_other_route_count": evidence.foreign_order_count,
         "stale_count": len(stale_symbols),
         "oldest_age_seconds": round(oldest_age_seconds, 3) if oldest_age_seconds is not None else None,
         "oldest_age": _duration_text(oldest_age_seconds),
@@ -655,12 +1586,14 @@ def stale_nonterminal_order_freshness_payload(
     settings: Settings,
     db: Session,
     now: datetime | None = None,
+    provider: str = "kis",
+    runtime_scope: RuntimeExecutionScope | None = None,
 ) -> dict[str, object]:
     observed_at = now or datetime.now(UTC)
     threshold_seconds = settings.stale_broker_order_reconciliation_threshold_seconds
     stale_before = observed_at - timedelta(seconds=threshold_seconds)
     order_observed_at = broker_order_observed_at_expr()
-    orders = db.scalars(
+    candidate_orders = list(db.scalars(
         select(BrokerOrder)
         .where(
             BrokerOrder.mode == settings.runtime_mode,
@@ -677,8 +1610,25 @@ def stale_nonterminal_order_freshness_payload(
                 ),
             ),
         )
+        .options(undefer(BrokerOrder.request_metadata))
         .order_by(order_observed_at.asc(), BrokerOrder.created_at.asc())
-    ).all()
+    ).all())
+    selection = _runtime_order_scope_selection(
+        settings=settings,
+        orders=candidate_orders,
+        provider=provider,
+        runtime_scope=runtime_scope,
+    )
+    orders = selection.orders
+    if selection.scope_unavailable_reason is not None:
+        scope_status = "unavailable"
+        scope_reason = selection.scope_unavailable_reason
+    elif selection.indeterminate_order_count:
+        scope_status = "unavailable"
+        scope_reason = "indeterminate_execution_scope"
+    else:
+        scope_status = "ok"
+        scope_reason = None
     items = [
         _stale_nonterminal_order_item(order=order)
         for order in orders[:MAX_STATUS_DETAIL_ITEMS]
@@ -689,6 +1639,10 @@ def stale_nonterminal_order_freshness_payload(
         if _stale_nonterminal_order_action(order) == "manual_review"
     )
     return {
+        "scope_status": scope_status,
+        "scope_reason": scope_reason,
+        "excluded_indeterminate_order_count": selection.indeterminate_order_count,
+        "excluded_other_route_count": selection.foreign_order_count,
         "count": len(orders),
         "threshold_seconds": threshold_seconds,
         "stale_before": stale_before.isoformat(),
@@ -714,6 +1668,22 @@ def runtime_actionable_alerts_payload(
         else None
     )
     if isinstance(stale_nonterminal, dict):
+        if stale_nonterminal.get("scope_status") == "unavailable":
+            alerts.append(
+                {
+                    "kind": "broker_order_execution_scope_unavailable",
+                    "severity": "critical",
+                    "count": int(
+                        stale_nonterminal.get("excluded_indeterminate_order_count")
+                        or 0
+                    ),
+                    "symbols": [],
+                    "message": (
+                        "broker-order freshness excludes rows whose active execution "
+                        "scope cannot be proven"
+                    ),
+                }
+            )
         needs_reconciliation_count = int(stale_nonterminal.get("needs_reconciliation_count") or 0)
         manual_review_count = int(stale_nonterminal.get("manual_review_count") or 0)
         if needs_reconciliation_count > 0:
@@ -956,10 +1926,13 @@ def _position_truth_evidence_symbols(
     settings: Settings,
     db: Session,
     now: datetime | None = None,
-) -> set[str]:
-    symbols = set(
+    provider: str = "kis",
+    runtime_scope: RuntimeExecutionScope | None = None,
+) -> RuntimePositionEvidenceSelection:
+    observed_at = _as_utc(now or datetime.now(UTC))
+    reserving_orders = list(
         db.scalars(
-            select(BrokerOrder.symbol)
+            select(BrokerOrder)
             .where(
                 *active_local_broker_order_filters(
                     settings=settings,
@@ -967,33 +1940,100 @@ def _position_truth_evidence_symbols(
                     now=now,
                 )
             )
-            .distinct()
+            .options(undefer(BrokerOrder.request_metadata))
         ).all()
     )
-    filled_buy_symbols = set(
+    filled_orders = list(
         db.scalars(
-            select(BrokerOrder.symbol)
+            select(BrokerOrder)
             .where(
                 BrokerOrder.mode == settings.runtime_mode,
-                BrokerOrder.side == "buy",
+                BrokerOrder.side.in_(("buy", "sell")),
                 BrokerOrder.status == "filled",
             )
-            .distinct()
+            .options(undefer(BrokerOrder.request_metadata))
         ).all()
     )
-    exited_symbols = set(
-        db.scalars(
-            select(BrokerOrder.symbol)
-            .where(
-                BrokerOrder.mode == settings.runtime_mode,
-                BrokerOrder.side == "sell",
-                BrokerOrder.status == "filled",
-            )
-            .distinct()
-        ).all()
+    reserving_selection = _runtime_order_scope_selection(
+        settings=settings,
+        orders=reserving_orders,
+        provider=provider,
+        runtime_scope=runtime_scope,
     )
-    symbols.update(filled_buy_symbols - exited_symbols)
-    return {str(symbol) for symbol in symbols}
+    filled_selection = _runtime_order_scope_selection(
+        settings=settings,
+        orders=filled_orders,
+        provider=provider,
+        runtime_scope=runtime_scope,
+    )
+    fill_selection = _active_runtime_fills_for_period(
+        settings=settings,
+        db=db,
+        start_at=None,
+        end_at=observed_at + timedelta(microseconds=1),
+        provider=provider,
+        runtime_scope=runtime_scope,
+    )
+    symbols = {str(order.symbol) for order in reserving_selection.orders}
+    fill_quantity_by_order_id: dict[str, Decimal] = {}
+    for fill in fill_selection.fills:
+        fill_quantity_by_order_id[fill.broker_order_pk] = (
+            fill_quantity_by_order_id.get(fill.broker_order_pk, Decimal("0"))
+            + _pnl_fill_quantity(fill)
+        )
+    incomplete_filled_orders = [
+        order
+        for order in filled_selection.orders
+        if (
+            _broker_order_expected_fill_quantity(order) is None
+            or fill_quantity_by_order_id.get(order.id, Decimal("0"))
+            != _broker_order_expected_fill_quantity(order)
+        )
+    ]
+    # A filled order without complete fill rows is still exposure evidence.  It
+    # must not disappear merely because a symbol-level buy/sell set happens to
+    # cancel out.
+    symbols.update(str(order.symbol) for order in incomplete_filled_orders)
+    isolation_cursor = load_fifo_isolation_cursor(
+        db=db,
+        runtime_mode=settings.runtime_mode,
+        through=observed_at,
+    )
+    inventory = replay_open_long_fill_inventory(
+        fills=fill_selection.fills,
+        isolation_cursor=isolation_cursor,
+        through=observed_at,
+    )
+    symbols.update(symbol for (_route_scope, symbol) in inventory.open_quantities)
+    return RuntimePositionEvidenceSelection(
+        symbols=symbols,
+        indeterminate_order_count=(
+            reserving_selection.indeterminate_order_count
+            + filled_selection.indeterminate_order_count
+        ),
+        indeterminate_fill_count=(
+            fill_selection.indeterminate_fill_count
+            + inventory.indeterminate_fill_count
+            + len(incomplete_filled_orders)
+        ),
+        foreign_order_count=(
+            reserving_selection.foreign_order_count
+            + filled_selection.foreign_order_count
+        ),
+        scope_unavailable_reason=(
+            reserving_selection.scope_unavailable_reason
+            or filled_selection.scope_unavailable_reason
+            or fill_selection.scope_unavailable_reason
+        ),
+    )
+
+
+def _broker_order_expected_fill_quantity(order: BrokerOrder) -> Decimal | None:
+    if order.base_quantity is not None and order.base_quantity > 0:
+        return Decimal(order.base_quantity)
+    if order.quantity is not None and order.quantity > 0:
+        return Decimal(order.quantity)
+    return None
 
 
 def _duration_text(seconds: float | None) -> str | None:
@@ -1016,8 +2056,14 @@ def runtime_symbol_summary(
     *,
     settings: Settings,
     db: Session,
+    provider: str = "kis",
+    runtime_scope: RuntimeExecutionScope | None = None,
 ) -> dict[str, object]:
-    today_start_utc, tomorrow_start_utc = _current_krx_day_utc_bounds()
+    today_start_utc, tomorrow_start_utc = _runtime_today_utc_bounds(
+        settings=settings,
+        provider=provider,
+        runtime_scope=runtime_scope,
+    )
     failed_observed_at = func.coalesce(
         BrokerOrder.last_broker_sync_at,
         BrokerOrder.submitted_at,
@@ -1027,9 +2073,11 @@ def runtime_symbol_summary(
         settings=settings,
         db=db,
         today_start_utc=today_start_utc,
+        provider=provider,
+        runtime_scope=runtime_scope,
     )
-    scheduled_today = db.scalars(
-        select(distinct(ExecutionPlanItem.symbol))
+    scheduled_items = db.scalars(
+        select(ExecutionPlanItem)
         .select_from(ExecutionJob)
         .join(ExecutionJob.plan_item)
         .join(ExecutionPlanItem.plan)
@@ -1040,25 +2088,45 @@ def runtime_symbol_summary(
             ExecutionJob.scheduled_for >= today_start_utc,
             ExecutionJob.scheduled_for < tomorrow_start_utc,
         )
-    ).all()
-    filled_today = db.scalars(
-        select(distinct(ExecutionFill.symbol))
-        .select_from(ExecutionFill)
-        .join(ExecutionFill.broker_order)
-        .where(
-            BrokerOrder.mode == settings.runtime_mode,
-            ExecutionFill.filled_at >= today_start_utc,
-            ExecutionFill.filled_at < tomorrow_start_utc,
+        .options(
+            load_only(
+                ExecutionPlanItem.symbol,
+                ExecutionPlanItem.provider,
+                ExecutionPlanItem.venue,
+                ExecutionPlanItem.risk_context,
+                ExecutionPlanItem.quantity_policy,
+            )
         )
     ).all()
+    scheduled_today = sorted(
+        {
+            item.symbol
+            for item in scheduled_items
+            if _active_runtime_plan_item_exchange(
+                settings=settings,
+                item=item,
+                provider=provider,
+                runtime_scope=runtime_scope,
+            )
+            is not None
+        }
+    )
     filled_summary = runtime_filled_today_summary(
         settings=settings,
         db=db,
         today_start_utc=today_start_utc,
         tomorrow_start_utc=tomorrow_start_utc,
+        provider=provider,
+        runtime_scope=runtime_scope,
     )
-    failed_today = db.scalars(
-        select(distinct(BrokerOrder.symbol))
+    filled_today = sorted(
+        {
+            *filled_summary["by_side"]["buy"],
+            *filled_summary["by_side"]["sell"],
+        }
+    )
+    failed_orders = db.scalars(
+        select(BrokerOrder)
         .select_from(BrokerOrder)
         .where(
             BrokerOrder.mode == settings.runtime_mode,
@@ -1067,10 +2135,37 @@ def runtime_symbol_summary(
             failed_observed_at >= today_start_utc,
             failed_observed_at < tomorrow_start_utc,
         )
+        .options(
+            load_only(
+                BrokerOrder.symbol,
+                BrokerOrder.broker_name,
+                BrokerOrder.mode,
+                BrokerOrder.request_metadata,
+                BrokerOrder.venue,
+                BrokerOrder.asset_class,
+            )
+        )
     ).all()
+    failed_today = sorted(
+        {
+            order.symbol
+            for order in failed_orders
+            if _active_runtime_order_scope(
+                settings=settings,
+                order=order,
+                provider=provider,
+                runtime_scope=runtime_scope,
+            )
+            is not None
+        }
+    )
     position_symbols = db.scalars(
         select(distinct(ExecutionPosition.symbol)).where(
-            ExecutionPosition.mode == settings.runtime_mode,
+            *_active_runtime_position_filters(
+                settings=settings,
+                provider=provider,
+                runtime_scope=runtime_scope,
+            ),
             or_(
                 ExecutionPosition.quantity > 0,
                 ExecutionPosition.base_quantity > 0,
@@ -1079,11 +2174,11 @@ def runtime_symbol_summary(
     ).all()
     return {
         "monitored": monitored_symbols,
-        "scheduled_today": sorted(scheduled_today),
-        "filled_today": sorted(filled_today),
+        "scheduled_today": scheduled_today,
+        "filled_today": filled_today,
         "filled_today_by_side": filled_summary["by_side"],
         "filled_today_counts": filled_summary["counts"],
-        "failed_today": sorted(failed_today),
+        "failed_today": failed_today,
         "positions": sorted(position_symbols),
     }
 
@@ -1093,45 +2188,83 @@ def runtime_monitored_symbols(
     settings: Settings,
     db: Session,
     today_start_utc: datetime | None = None,
+    provider: str = "kis",
+    runtime_scope: RuntimeExecutionScope | None = None,
 ) -> list[str]:
     if today_start_utc is None:
-        today_start_utc, _ = _current_krx_day_utc_bounds()
-    held_position_symbols = select(ExecutionPosition.symbol).where(
-        ExecutionPosition.mode == settings.runtime_mode,
-        ExecutionPosition.quantity > 0,
-    )
-    sell_monitoring_conditions = [
-        ExecutionPlanItem.side == "sell",
-        ExecutionPlanItem.intent.in_(SELL_MONITORED_INTENTS),
-        ExecutionPlanItem.status.in_(
-            tuple(
-                SELL_ACTIVE_MONITORING_STATUSES
-                | SELL_PENDING_CONFIG_STATUSES
-                | BLOCKED_MONITORING_STATUSES
-                | PENDING_DISPATCH_MONITORING_STATUSES
+        today_start_utc, _ = _runtime_today_utc_bounds(
+            settings=settings,
+            provider=provider,
+            runtime_scope=runtime_scope,
+        )
+    held_position_routes = {
+        (str(symbol), str(exchange).strip().upper())
+        for symbol, exchange in db.execute(
+            select(ExecutionPosition.symbol, ExecutionPosition.exchange).where(
+                *_active_runtime_position_filters(
+                    settings=settings,
+                    provider=provider,
+                    runtime_scope=runtime_scope,
+                ),
+                ExecutionPosition.quantity > 0,
             )
-        ),
-    ]
-    if settings.runtime_mode == "live":
-        sell_monitoring_conditions.append(ExecutionPlanItem.symbol.in_(held_position_symbols))
-    sell_symbols = db.scalars(
-        select(distinct(ExecutionPlanItem.symbol))
+        ).all()
+    }
+    sell_statuses = tuple(
+        SELL_ACTIVE_MONITORING_STATUSES
+        | SELL_PENDING_CONFIG_STATUSES
+        | BLOCKED_MONITORING_STATUSES
+        | PENDING_DISPATCH_MONITORING_STATUSES
+    )
+    monitored_items = db.scalars(
+        select(ExecutionPlanItem)
         .join(ExecutionPlanItem.plan)
         .where(
             ExecutionPlan.mode == settings.runtime_mode,
-            and_(*sell_monitoring_conditions),
+            or_(
+                and_(
+                    ExecutionPlanItem.side == "sell",
+                    ExecutionPlanItem.intent.in_(SELL_MONITORED_INTENTS),
+                    ExecutionPlanItem.status.in_(sell_statuses),
+                ),
+                and_(
+                    ExecutionPlanItem.side == "buy",
+                    ExecutionPlanItem.intent.in_(WATCH_BUY_INTENTS),
+                    ExecutionPlanItem.status.in_(
+                        tuple(ACTIVE_WATCH_MONITORING_STATUSES)
+                    ),
+                ),
+            ),
+        )
+        .options(
+            load_only(
+                ExecutionPlanItem.symbol,
+                ExecutionPlanItem.side,
+                ExecutionPlanItem.provider,
+                ExecutionPlanItem.venue,
+                ExecutionPlanItem.risk_context,
+                ExecutionPlanItem.quantity_policy,
+            )
         )
     ).all()
-    mode_plan_ids = select(ExecutionPlan.id).where(ExecutionPlan.mode == settings.runtime_mode)
-    buy_symbols = db.scalars(
-        select(distinct(ExecutionPlanItem.symbol)).where(
-            ExecutionPlanItem.execution_plan_id.in_(mode_plan_ids),
-            ExecutionPlanItem.side == "buy",
-            ExecutionPlanItem.intent.in_(WATCH_BUY_INTENTS),
-            ExecutionPlanItem.status.in_(tuple(ACTIVE_WATCH_MONITORING_STATUSES)),
+    monitored_symbols: set[str] = set()
+    for item in monitored_items:
+        exchange = _active_runtime_plan_item_exchange(
+            settings=settings,
+            item=item,
+            provider=provider,
+            runtime_scope=runtime_scope,
         )
-    ).all()
-    return sorted({*sell_symbols, *buy_symbols})
+        if exchange is None:
+            continue
+        if (
+            item.side == "sell"
+            and settings.runtime_mode == "live"
+            and (item.symbol, exchange) not in held_position_routes
+        ):
+            continue
+        monitored_symbols.add(item.symbol)
+    return sorted(monitored_symbols)
 
 
 def runtime_filled_today_summary(
@@ -1140,22 +2273,24 @@ def runtime_filled_today_summary(
     db: Session,
     today_start_utc: datetime | None = None,
     tomorrow_start_utc: datetime | None = None,
+    provider: str = "kis",
+    runtime_scope: RuntimeExecutionScope | None = None,
 ) -> dict[str, object]:
     if today_start_utc is None or tomorrow_start_utc is None:
-        today_start_utc, tomorrow_start_utc = _current_krx_day_utc_bounds()
-    fills = dedupe_execution_fills(
-        db.scalars(
-            select(ExecutionFill)
-            .select_from(ExecutionFill)
-            .join(ExecutionFill.broker_order)
-            .where(
-                BrokerOrder.mode == settings.runtime_mode,
-                ExecutionFill.filled_at >= today_start_utc,
-                ExecutionFill.filled_at < tomorrow_start_utc,
-            )
-            .order_by(ExecutionFill.filled_at.asc(), ExecutionFill.id.asc())
-        ).all()
+        today_start_utc, tomorrow_start_utc = _runtime_today_utc_bounds(
+            settings=settings,
+            provider=provider,
+            runtime_scope=runtime_scope,
+        )
+    selection = _active_runtime_fills_for_period(
+        settings=settings,
+        db=db,
+        start_at=today_start_utc,
+        end_at=tomorrow_start_utc,
+        provider=provider,
+        runtime_scope=runtime_scope,
     )
+    fills = selection.fills
     by_side: dict[str, list[str]] = {"buy": [], "sell": []}
     counts: dict[str, dict[str, int]] = {
         "all": {"symbols": 0, "fills": 0, "quantity": 0},
@@ -1164,7 +2299,7 @@ def runtime_filled_today_summary(
     }
     all_symbols: set[str] = set()
     side_symbols: dict[str, set[str]] = {"buy": set(), "sell": set()}
-    for fill in fills:
+    for fill in sorted(fills, key=fifo_fill_sort_key):
         side = str(fill.side or "").strip().lower()
         symbol = str(fill.symbol or "").strip().upper()
         if side not in {"buy", "sell"} or not symbol:
@@ -1187,66 +2322,105 @@ def runtime_filled_today_symbols(
     *,
     settings: Settings,
     db: Session,
+    today_start_utc: datetime | None = None,
+    tomorrow_start_utc: datetime | None = None,
+    provider: str = "kis",
+    runtime_scope: RuntimeExecutionScope | None = None,
 ) -> list[str]:
-    today_start_utc, tomorrow_start_utc = _current_krx_day_utc_bounds()
-    filled_today = db.scalars(
-        select(distinct(ExecutionFill.symbol))
-        .select_from(ExecutionFill)
-        .join(ExecutionFill.broker_order)
-        .where(
-            BrokerOrder.mode == settings.runtime_mode,
-            ExecutionFill.filled_at >= today_start_utc,
-            ExecutionFill.filled_at < tomorrow_start_utc,
+    if today_start_utc is None or tomorrow_start_utc is None:
+        today_start_utc, tomorrow_start_utc = _runtime_today_utc_bounds(
+            settings=settings,
+            provider=provider,
+            runtime_scope=runtime_scope,
         )
-    ).all()
-    return sorted(filled_today)
+    selection = _active_runtime_fills_for_period(
+        settings=settings,
+        db=db,
+        start_at=today_start_utc,
+        end_at=tomorrow_start_utc,
+        provider=provider,
+        runtime_scope=runtime_scope,
+    )
+    return sorted({str(fill.symbol) for fill in selection.fills})
+
+
+def _current_pnl_day_utc_bounds(
+    now: datetime | None = None,
+    *,
+    timezone: ZoneInfo,
+) -> tuple[datetime, datetime]:
+    current = (now or datetime.now(timezone)).astimezone(timezone)
+    day_start = current.replace(hour=0, minute=0, second=0, microsecond=0)
+    next_day_start = day_start + timedelta(days=1)
+    return day_start.astimezone(UTC), next_day_start.astimezone(UTC)
 
 
 def _current_krx_day_utc_bounds(now: datetime | None = None) -> tuple[datetime, datetime]:
-    current_krx = (now or datetime.now(KRX_TIMEZONE)).astimezone(KRX_TIMEZONE)
-    day_start_krx = current_krx.replace(hour=0, minute=0, second=0, microsecond=0)
-    next_day_start_krx = day_start_krx + timedelta(days=1)
-    return day_start_krx.astimezone(UTC), next_day_start_krx.astimezone(UTC)
+    return _current_pnl_day_utc_bounds(now, timezone=KRX_TIMEZONE)
 
 
 def monitoring_payload(
     *,
     settings: Settings,
     db: Session,
+    provider: str = "kis",
+    runtime_scope: RuntimeExecutionScope | None = None,
 ) -> dict[str, object]:
-    segments = monitoring_segments(settings=settings, db=db)
-    agent_decisions = monitoring_agent_decision_counts(settings=settings, db=db)
+    items = list(
+        db.scalars(
+            select(ExecutionPlanItem)
+            .join(ExecutionPlanItem.plan)
+            .where(ExecutionPlan.mode == settings.runtime_mode)
+        ).all()
+    )
+    if runtime_scope is not None:
+        items = [
+            item
+            for item in items
+            if _active_runtime_plan_item_exchange(
+                settings=settings,
+                item=item,
+                provider=provider,
+                runtime_scope=runtime_scope,
+            )
+            is not None
+        ]
+    segments = monitoring_segments(settings=settings, db=db, items=items)
+    agent_decisions = monitoring_agent_decision_counts(
+        settings=settings,
+        db=db,
+        items=items,
+    )
     max_holding_actionability = max_holding_actionability_summary(
+        settings=settings,
         db=db,
         mode=settings.runtime_mode,
+        provider=(runtime_scope.provider if runtime_scope is not None else None),
+        account_scope=(runtime_scope.account_scope if runtime_scope is not None else None),
+        exchanges=(runtime_scope.exchanges if runtime_scope is not None else None),
     )
-    backlog_symbols = db.scalars(
-        select(distinct(ExecutionPlanItem.symbol))
-        .join(ExecutionPlanItem.plan)
-        .where(
-            ExecutionPlan.mode == settings.runtime_mode,
-            ExecutionPlanItem.status.in_(tuple(PENDING_DISPATCH_MONITORING_STATUSES)),
-        )
-        .order_by(ExecutionPlanItem.symbol.asc())
-    ).all()
-    backlog_item_count = int(
-        db.scalar(
-            select(func.count())
-            .select_from(ExecutionPlanItem)
-            .join(ExecutionPlanItem.plan)
-            .where(
-                ExecutionPlan.mode == settings.runtime_mode,
-                ExecutionPlanItem.status.in_(tuple(PENDING_DISPATCH_MONITORING_STATUSES)),
-            )
-        )
-        or 0
-    )
-    checkpoints = db.scalars(select(MonitoringCheckpoint)).all()
-    checkpoints = [
+    backlog_items = [
+        item
+        for item in items
+        if item.status in PENDING_DISPATCH_MONITORING_STATUSES
+    ]
+    backlog_symbols = sorted({item.symbol for item in backlog_items})
+    backlog_item_count = len(backlog_items)
+    mode_checkpoints = [
         checkpoint
-        for checkpoint in checkpoints
+        for checkpoint in db.scalars(select(MonitoringCheckpoint)).all()
         if checkpoint.mode == settings.runtime_mode
     ]
+    checkpoints = [
+        checkpoint
+        for checkpoint in mode_checkpoints
+        if runtime_scope is None
+        or _monitoring_checkpoint_matches_runtime_scope(
+            checkpoint=checkpoint,
+            runtime_scope=runtime_scope,
+        )
+    ]
+    excluded_checkpoint_count = len(mode_checkpoints) - len(checkpoints)
     if not checkpoints:
         return {
             "status": "not_started",
@@ -1264,6 +2438,12 @@ def monitoring_payload(
             "segments": segments,
             "agent_decisions": agent_decisions,
             "max_holding_actionability": max_holding_actionability,
+            "execution_scope": (
+                _runtime_execution_scope_payload(runtime_scope)
+                if runtime_scope is not None
+                else None
+            ),
+            "excluded_checkpoint_count": excluded_checkpoint_count,
             "workers": [],
             "last_heartbeat_at": None,
             "last_success_at": None,
@@ -1301,6 +2481,12 @@ def monitoring_payload(
         status = "running"
     else:
         status = "not_started"
+    public_latest_details = _strip_account_scope(latest_details)
+    assert isinstance(public_latest_details, dict)
+    public_protective_stop_coverage = _strip_account_scope(protective_stop_coverage)
+    public_profit_target_coverage = _strip_account_scope(profit_target_coverage)
+    assert isinstance(public_protective_stop_coverage, dict)
+    assert isinstance(public_profit_target_coverage, dict)
     return {
         "status": status,
         "topology": MONITORING_RUNTIME_TOPOLOGY,
@@ -1317,6 +2503,12 @@ def monitoring_payload(
         "segments": segments,
         "agent_decisions": agent_decisions,
         "max_holding_actionability": max_holding_actionability,
+        "execution_scope": (
+            _runtime_execution_scope_payload(runtime_scope)
+            if runtime_scope is not None
+            else None
+        ),
+        "excluded_checkpoint_count": excluded_checkpoint_count,
         "workers": [
             {
                 "name": checkpoint.worker_name,
@@ -1336,24 +2528,51 @@ def monitoring_payload(
         ],
         "last_heartbeat_at": last_heartbeat,
         "last_success_at": last_success,
-        "protective_stop_coverage": protective_stop_coverage,
-        "profit_target_coverage": profit_target_coverage,
-        "last_cycle": latest_details or None,
+        "protective_stop_coverage": public_protective_stop_coverage,
+        "profit_target_coverage": public_profit_target_coverage,
+        "last_cycle": public_latest_details or None,
     }
+
+
+def _monitoring_checkpoint_matches_runtime_scope(
+    *,
+    checkpoint: MonitoringCheckpoint,
+    runtime_scope: RuntimeExecutionScope,
+) -> bool:
+    details = checkpoint.details if isinstance(checkpoint.details, dict) else {}
+    execution_scope = details.get("execution_scope")
+    expected = {
+        "policy_version": EXECUTION_SCOPE_POLICY_VERSION,
+        "provider": runtime_scope.provider,
+        "account_scope": runtime_scope.account_scope,
+    }
+    return (
+        runtime_scope.available
+        and checkpoint.provider == runtime_scope.provider
+        and checkpoint.account_scope == runtime_scope.account_scope
+        and isinstance(execution_scope, dict)
+        and set(execution_scope) == set(expected)
+        and execution_scope == expected
+    )
 
 
 def monitoring_agent_decision_counts(
     *,
     settings: Settings,
     db: Session,
+    items: list[ExecutionPlanItem] | None = None,
 ) -> dict[str, int]:
-    rows = db.execute(
-        select(ExecutionPlanItem.status, func.count())
-        .join(ExecutionPlanItem.plan)
-        .where(ExecutionPlan.mode == settings.runtime_mode)
-        .group_by(ExecutionPlanItem.status)
-    ).all()
-    counts_by_status = {str(status): int(count or 0) for status, count in rows}
+    if items is None:
+        items = list(
+            db.scalars(
+                select(ExecutionPlanItem)
+                .join(ExecutionPlanItem.plan)
+                .where(ExecutionPlan.mode == settings.runtime_mode)
+            ).all()
+        )
+    counts_by_status: dict[str, int] = {}
+    for item in items:
+        counts_by_status[item.status] = counts_by_status.get(item.status, 0) + 1
     watching = sum(counts_by_status.get(status, 0) for status in WATCHING_AGENT_COUNT_STATUSES)
     pending = counts_by_status.get(AGENT_PENDING_STATUS, 0)
     delayed = counts_by_status.get(AGENT_DELAY_STATUS, 0)
@@ -1375,12 +2594,16 @@ def monitoring_segments(
     *,
     settings: Settings,
     db: Session,
+    items: list[ExecutionPlanItem] | None = None,
 ) -> dict[str, object]:
-    items = db.scalars(
-        select(ExecutionPlanItem)
-        .join(ExecutionPlanItem.plan)
-        .where(ExecutionPlan.mode == settings.runtime_mode)
-    ).all()
+    if items is None:
+        items = list(
+            db.scalars(
+                select(ExecutionPlanItem)
+                .join(ExecutionPlanItem.plan)
+                .where(ExecutionPlan.mode == settings.runtime_mode)
+            ).all()
+        )
     held_sell = [
         item
         for item in items
@@ -1504,18 +2727,88 @@ def readiness_payload(
     }
 
 
+def exec_agent_runtime_configuration(settings: Settings) -> dict[str, object]:
+    """Expose configured decision-agent authority without implying liveness."""
+
+    enabled = bool(getattr(settings, "exec_agent_enabled", False))
+    trigger_configured = bool(
+        getattr(settings, "exec_agent_trigger_time_enabled", False)
+    )
+    watch_configured = bool(
+        getattr(settings, "exec_agent_watch_sizing_enabled", False)
+    )
+    return {
+        "status": "enabled" if enabled else "disabled",
+        "enabled": enabled,
+        "agent_id": str(getattr(settings, "exec_agent_id", "") or ""),
+        "expected_model": str(getattr(settings, "exec_agent_model", "") or ""),
+        "provenance_policy": "exact_agent_and_model",
+        "trigger_time": {
+            "configured": trigger_configured,
+            "effective": enabled and trigger_configured,
+        },
+        "watch_sizing": {
+            "configured": watch_configured,
+            "effective": enabled and watch_configured,
+        },
+        "reason_codes": [] if enabled else ["exec_agent_disabled"],
+    }
+
+
 def build_runtime_status(
     *,
     settings: Settings,
     runtime: RuntimeMetadata,
     db: Session,
+    broker_adapter: BrokerAdapter | None = None,
     autonomous_runtime: dict[str, object] | None = None,
     include_expensive_sections: bool = True,
+    runtime_scope: RuntimeExecutionScope | None = None,
+    runtime_startup_gate: dict[str, object] | None = None,
 ) -> dict[str, object]:
+    runtime_provider = _normalize_runtime_provider(
+        getattr(broker_adapter, "provider", "kis")
+    )
+    active_runtime_scope = _runtime_scope_for_provider(
+        settings=settings,
+        provider=runtime_provider,
+        runtime_scope=(
+            runtime_scope
+            or _resolve_runtime_execution_scope(
+                settings=settings,
+                provider=runtime_provider,
+                broker_adapter=broker_adapter,
+            )
+        ),
+    )
+    runtime_scope_payload = _runtime_execution_scope_payload(active_runtime_scope)
+    runtime_scope_reasons = (
+        []
+        if active_runtime_scope.available
+        else [
+            "runtime execution scope is unavailable: "
+            f"{active_runtime_scope.reason or 'unknown_reason'}"
+        ]
+    )
     dependencies = {
         "database": "ok",
         "runtime_schema": "ok",
     }
+    startup_gate_payload = (
+        dict(runtime_startup_gate)
+        if isinstance(runtime_startup_gate, dict)
+        else {"status": "not_reported", "reason": None}
+    )
+    startup_gate_blocked = startup_gate_payload.get("status") == "blocked"
+    startup_gate_reasons = (
+        ["automated runtime startup is blocked; migrate if needed and restart"]
+        if startup_gate_blocked
+        else []
+    )
+    if isinstance(runtime_startup_gate, dict):
+        dependencies["automated_runtime_startup"] = (
+            "blocked" if startup_gate_blocked else "ok"
+        )
     diagnostics = {
         "sqlite": sqlite_diagnostics_payload(),
     }
@@ -1527,13 +2820,41 @@ def build_runtime_status(
         "block_count": 0,
         "symbols": [],
     }
-    account_drawdown_gate: dict[str, object] = {"gated": False, "latest_decision": None}
-    autonomous = autonomous_runtime or _default_autonomous_runtime_payload(settings)
+    account_drawdown_gate: dict[str, object] = {
+        "available": False,
+        "enabled": settings.account_drawdown_gate_enabled,
+        "gated": None,
+        "provider": runtime_provider,
+        "latest_decision": None,
+        "active_recovery_scopes": {},
+        "reason": "account_drawdown_gate_state_unavailable",
+    }
+    autonomous = (
+        autonomous_runtime
+        if isinstance(autonomous_runtime, dict)
+        else _default_autonomous_runtime_payload(settings)
+    )
+    autonomous_scope_reasons = (
+        _autonomous_runtime_snapshot_scope_reasons(
+            autonomous=autonomous,
+            runtime_scope=active_runtime_scope,
+        )
+        if settings.autonomous_runtime_enabled
+        else []
+    )
+    autonomous_snapshot_trusted = not autonomous_scope_reasons
+    public_autonomous = _public_autonomous_runtime_payload(
+        autonomous=autonomous,
+        snapshot_trusted=autonomous_snapshot_trusted,
+        scope_reasons=autonomous_scope_reasons,
+    )
     monitoring_price_source = _autonomous_monitoring_price_source(autonomous)
     monitoring: dict[str, object] = _monitoring_payload_from_autonomous(
         settings=settings,
         autonomous=autonomous,
         monitoring_price_source=monitoring_price_source,
+        snapshot_trusted=autonomous_snapshot_trusted,
+        scope_reason=(autonomous_scope_reasons[0] if autonomous_scope_reasons else None),
     )
     symbols: dict[str, object] = {
         "monitored": [],
@@ -1548,10 +2869,26 @@ def build_runtime_status(
         "failed_today": [],
         "positions": [],
     }
-    monthly_pnl = _default_monthly_pnl_payload(settings=settings)
-    daily_pnl = _default_daily_pnl_payload()
-    weekly_pnl = _default_weekly_pnl_payload()
-    broker = build_broker_session_summary(settings=settings, db=None)
+    monthly_pnl = _default_monthly_pnl_payload(
+        settings=settings,
+        provider=runtime_provider,
+        runtime_scope=active_runtime_scope,
+    )
+    daily_pnl = _default_daily_pnl_payload(
+        settings=settings,
+        provider=runtime_provider,
+        runtime_scope=active_runtime_scope,
+    )
+    weekly_pnl = _default_weekly_pnl_payload(
+        settings=settings,
+        provider=runtime_provider,
+        runtime_scope=active_runtime_scope,
+    )
+    broker = build_broker_session_summary(
+        settings=settings,
+        db=None,
+        adapter=broker_adapter,
+    )
     broker_providers = broker_provider_readiness(settings=settings, db=None)
     freshness: dict[str, object] = {
         "generated_at": datetime.now(UTC).isoformat(),
@@ -1593,21 +2930,67 @@ def build_runtime_status(
     }
     counts_available = True
 
+    fast_runtime_schema: dict[str, object] | None = None
     if settings.autonomous_runtime_enabled and not include_expensive_sections:
-        late_entry_gate = runtime_late_entry_summary(settings=settings, db=db)
-        account_drawdown_gate = latest_account_drawdown_gate_state(
+        fast_runtime_schema = check_runtime_schema(db)
+        dependencies["runtime_schema"] = str(fast_runtime_schema["status"])
+
+    if (
+        settings.autonomous_runtime_enabled
+        and not include_expensive_sections
+        and fast_runtime_schema is not None
+        and fast_runtime_schema["status"] == "ok"
+        and not startup_gate_blocked
+    ):
+        counts = runtime_counts(
             settings=settings,
             db=db,
+            provider=runtime_provider,
+            runtime_scope=active_runtime_scope,
         )
-        cached_symbols = _autonomous_runtime_snapshot_symbol_summary(autonomous=autonomous)
-        cycle_symbols = _autonomous_runtime_snapshot_symbols(autonomous=autonomous) or _autonomous_monitoring_symbols(
-            autonomous=autonomous
+        watch_buy_vetoes = runtime_watch_buy_veto_summary(
+            settings=settings,
+            db=db,
+            provider=runtime_provider,
+            runtime_scope=active_runtime_scope,
         )
-        filled_summary = runtime_filled_today_summary(settings=settings, db=db)
+        late_entry_gate = runtime_late_entry_summary(
+            settings=settings,
+            db=db,
+            provider=runtime_provider,
+            runtime_scope=active_runtime_scope,
+        )
+        account_drawdown_gate = _runtime_account_drawdown_gate_state(
+            settings=settings,
+            db=db,
+            provider=runtime_provider,
+        )
+        cached_symbols = (
+            _autonomous_runtime_snapshot_symbol_summary(autonomous=autonomous)
+            if autonomous_snapshot_trusted
+            else {}
+        )
+        cycle_symbols = (
+            _autonomous_runtime_snapshot_symbols(autonomous=autonomous)
+            or _autonomous_monitoring_symbols(autonomous=autonomous)
+            if autonomous_snapshot_trusted
+            else []
+        )
+        filled_summary = runtime_filled_today_summary(
+            settings=settings,
+            db=db,
+            provider=runtime_provider,
+            runtime_scope=active_runtime_scope,
+        )
         symbols = {
             **symbols,
             **cached_symbols,
-            "filled_today": runtime_filled_today_symbols(settings=settings, db=db),
+            "filled_today": runtime_filled_today_symbols(
+                settings=settings,
+                db=db,
+                provider=runtime_provider,
+                runtime_scope=active_runtime_scope,
+            ),
             "filled_today_by_side": filled_summary["by_side"],
             "filled_today_counts": filled_summary["counts"],
             "monitored": cycle_symbols,
@@ -1622,23 +3005,31 @@ def build_runtime_status(
             monitoring["status"] = "degraded"
         safety = fast_autonomous_safety(settings=settings, db=db)
         readiness = readiness_payload(
-            dependencies_ok=True,
+            dependencies_ok=all(value == "ok" for value in dependencies.values()),
             safety=safety,
             counts_available=counts_available,
-            extra_reasons=monitoring_reasons,
+            extra_reasons=[
+                *monitoring_reasons,
+                *runtime_scope_reasons,
+                *autonomous_scope_reasons,
+                *startup_gate_reasons,
+            ],
         )
         return {
             "service": settings.service_name,
             "environment": settings.environment,
             "mode": safety["mode"],
+            "execution_scope": runtime_scope_payload,
+            "exec_agent": exec_agent_runtime_configuration(settings),
             "ready": readiness["ready"],
             "readiness": readiness,
             "safety": safety,
             "dependencies": dependencies,
+            "runtime_startup_gate": startup_gate_payload,
             "diagnostics": diagnostics,
             "liveness": {
                 **liveness_payload(runtime),
-                "autonomous": autonomous,
+                "autonomous": public_autonomous,
                 "monitoring": monitoring,
             },
             "broker": broker,
@@ -1652,9 +3043,22 @@ def build_runtime_status(
                 monitoring=monitoring,
                 freshness=freshness,
             ),
-            "monthly_pnl": _default_monthly_pnl_payload(settings=settings),
-            "weekly_pnl": _default_weekly_pnl_payload(),
-            "daily_pnl": daily_pnl_payload(settings=settings, db=db),
+            "monthly_pnl": _default_monthly_pnl_payload(
+                settings=settings,
+                provider=runtime_provider,
+                runtime_scope=active_runtime_scope,
+            ),
+            "weekly_pnl": _default_weekly_pnl_payload(
+                settings=settings,
+                provider=runtime_provider,
+                runtime_scope=active_runtime_scope,
+            ),
+            "daily_pnl": daily_pnl_payload(
+                settings=settings,
+                db=db,
+                provider=runtime_provider,
+                runtime_scope=active_runtime_scope,
+            ),
             "account_drawdown_gate": account_drawdown_gate,
         }
 
@@ -1673,19 +3077,23 @@ def build_runtime_status(
             dependencies_ok=False,
             safety=safety,
             counts_available=counts_available,
+            extra_reasons=startup_gate_reasons,
         )
         return {
             "service": settings.service_name,
             "environment": settings.environment,
             "mode": safety["mode"],
+            "execution_scope": runtime_scope_payload,
+            "exec_agent": exec_agent_runtime_configuration(settings),
             "ready": readiness["ready"],
             "readiness": readiness,
             "safety": safety,
             "dependencies": dependencies,
+            "runtime_startup_gate": startup_gate_payload,
             "diagnostics": diagnostics,
             "liveness": {
                 **liveness_payload(runtime),
-                "autonomous": autonomous,
+                "autonomous": public_autonomous,
                 "monitoring": monitoring,
             },
             "broker": broker,
@@ -1731,19 +3139,23 @@ def build_runtime_status(
             dependencies_ok=False,
             safety=safety,
             counts_available=counts_available,
+            extra_reasons=startup_gate_reasons,
         )
         return {
             "service": settings.service_name,
             "environment": settings.environment,
             "mode": safety["mode"],
+            "execution_scope": runtime_scope_payload,
+            "exec_agent": exec_agent_runtime_configuration(settings),
             "ready": readiness["ready"],
             "readiness": readiness,
             "safety": safety,
             "dependencies": dependencies,
+            "runtime_startup_gate": startup_gate_payload,
             "diagnostics": diagnostics,
             "liveness": {
                 **liveness_payload(runtime),
-                "autonomous": autonomous,
+                "autonomous": public_autonomous,
                 "monitoring": monitoring,
             },
             "broker": broker,
@@ -1762,51 +3174,140 @@ def build_runtime_status(
     try:
         state = ensure_runtime_control_state(settings=settings, db=db)
         safety = runtime_safety_payload(state)
-        counts = runtime_counts(settings=settings, db=db)
-        watch_buy_vetoes = runtime_watch_buy_veto_summary(settings=settings, db=db)
-        late_entry_gate = runtime_late_entry_summary(settings=settings, db=db)
+        counts = runtime_counts(
+            settings=settings,
+            db=db,
+            provider=runtime_provider,
+            runtime_scope=active_runtime_scope,
+        )
+        watch_buy_vetoes = runtime_watch_buy_veto_summary(
+            settings=settings,
+            db=db,
+            provider=runtime_provider,
+            runtime_scope=active_runtime_scope,
+        )
+        late_entry_gate = runtime_late_entry_summary(
+            settings=settings,
+            db=db,
+            provider=runtime_provider,
+            runtime_scope=active_runtime_scope,
+        )
         if include_expensive_sections:
-            broker = build_broker_session_summary(settings=settings, db=db)
+            broker = build_broker_session_summary(
+                settings=settings,
+                db=db,
+                adapter=broker_adapter,
+            )
             broker_providers = broker_provider_readiness(settings=settings, db=db)
-            account_drawdown_gate = latest_account_drawdown_gate_state(settings=settings, db=db)
-            symbols = runtime_symbol_summary(settings=settings, db=db)
+            account_drawdown_gate = _runtime_account_drawdown_gate_state(
+                settings=settings,
+                db=db,
+                provider=runtime_provider,
+            )
+            symbols = runtime_symbol_summary(
+                settings=settings,
+                db=db,
+                provider=runtime_provider,
+                runtime_scope=active_runtime_scope,
+            )
         if include_expensive_sections:
-            monitoring = monitoring_payload(settings=settings, db=db)
+            monitoring = monitoring_payload(
+                settings=settings,
+                db=db,
+                provider=runtime_provider,
+                runtime_scope=active_runtime_scope,
+            )
             monitoring["price_source"] = monitoring_price_source
             freshness = runtime_freshness_payload(
                 settings=settings,
                 db=db,
                 monitoring=monitoring,
+                provider=runtime_provider,
+                runtime_scope=active_runtime_scope,
             )
-            monthly_pnl = monthly_pnl_payload(settings=settings, db=db)
-            weekly_pnl = weekly_pnl_payload(settings=settings, db=db)
-            daily_pnl = daily_pnl_payload(settings=settings, db=db)
+            monthly_pnl = monthly_pnl_payload(
+                settings=settings,
+                db=db,
+                provider=runtime_provider,
+                runtime_scope=active_runtime_scope,
+            )
+            weekly_pnl = weekly_pnl_payload(
+                settings=settings,
+                db=db,
+                provider=runtime_provider,
+                runtime_scope=active_runtime_scope,
+            )
+            daily_pnl = daily_pnl_payload(
+                settings=settings,
+                db=db,
+                provider=runtime_provider,
+                runtime_scope=active_runtime_scope,
+            )
         elif settings.autonomous_runtime_enabled:
             cached_symbols = _autonomous_runtime_snapshot_symbol_summary(autonomous=autonomous)
             if "filled_today" not in cached_symbols:
                 cached_symbols["filled_today"] = runtime_filled_today_symbols(
                     settings=settings,
                     db=db,
+                    provider=runtime_provider,
+                    runtime_scope=active_runtime_scope,
                 )
             if "filled_today_by_side" not in cached_symbols or "filled_today_counts" not in cached_symbols:
-                filled_summary = runtime_filled_today_summary(settings=settings, db=db)
+                filled_summary = runtime_filled_today_summary(
+                    settings=settings,
+                    db=db,
+                    provider=runtime_provider,
+                    runtime_scope=active_runtime_scope,
+                )
                 cached_symbols["filled_today_by_side"] = filled_summary["by_side"]
                 cached_symbols["filled_today_counts"] = filled_summary["counts"]
             symbols = {
                 **symbols,
                 **cached_symbols,
-                "monitored": runtime_monitored_symbols(settings=settings, db=db),
+                "monitored": runtime_monitored_symbols(
+                    settings=settings,
+                    db=db,
+                    provider=runtime_provider,
+                    runtime_scope=active_runtime_scope,
+                ),
                 "monitoring_cycle_batch": _autonomous_monitoring_symbols(autonomous=autonomous),
             }
             freshness["summary_source"] = "fast_autonomous_runtime_snapshot"
-            monthly_pnl = _default_monthly_pnl_payload(settings=settings)
-            weekly_pnl = _default_weekly_pnl_payload()
-            daily_pnl = _default_daily_pnl_payload()
+            monthly_pnl = _default_monthly_pnl_payload(
+                settings=settings,
+                provider=runtime_provider,
+                runtime_scope=active_runtime_scope,
+            )
+            weekly_pnl = _default_weekly_pnl_payload(
+                settings=settings,
+                provider=runtime_provider,
+                runtime_scope=active_runtime_scope,
+            )
+            daily_pnl = _default_daily_pnl_payload(
+                settings=settings,
+                provider=runtime_provider,
+                runtime_scope=active_runtime_scope,
+            )
         else:
             freshness["summary_source"] = "fast_runtime_status"
-            monthly_pnl = monthly_pnl_payload(settings=settings, db=db)
-            weekly_pnl = weekly_pnl_payload(settings=settings, db=db)
-            daily_pnl = daily_pnl_payload(settings=settings, db=db)
+            monthly_pnl = monthly_pnl_payload(
+                settings=settings,
+                db=db,
+                provider=runtime_provider,
+                runtime_scope=active_runtime_scope,
+            )
+            weekly_pnl = weekly_pnl_payload(
+                settings=settings,
+                db=db,
+                provider=runtime_provider,
+                runtime_scope=active_runtime_scope,
+            )
+            daily_pnl = daily_pnl_payload(
+                settings=settings,
+                db=db,
+                provider=runtime_provider,
+                runtime_scope=active_runtime_scope,
+            )
         actionable_alerts = runtime_actionable_alerts_payload(
             monitoring=monitoring,
             freshness=freshness,
@@ -1819,9 +3320,21 @@ def build_runtime_status(
             settings,
             f"runtime state unavailable: {exc.__class__.__name__}; run migrations",
         )
-        monthly_pnl = _default_monthly_pnl_payload(settings=settings)
-        weekly_pnl = _default_weekly_pnl_payload()
-        daily_pnl = _default_daily_pnl_payload()
+        monthly_pnl = _default_monthly_pnl_payload(
+            settings=settings,
+            provider=runtime_provider,
+            runtime_scope=active_runtime_scope,
+        )
+        weekly_pnl = _default_weekly_pnl_payload(
+            settings=settings,
+            provider=runtime_provider,
+            runtime_scope=active_runtime_scope,
+        )
+        daily_pnl = _default_daily_pnl_payload(
+            settings=settings,
+            provider=runtime_provider,
+            runtime_scope=active_runtime_scope,
+        )
         actionable_alerts = _default_actionable_alerts_payload()
 
     monitoring_reasons = _monitoring_price_source_readiness_reasons(
@@ -1835,20 +3348,28 @@ def build_runtime_status(
         dependencies_ok=all(value == "ok" for value in dependencies.values()),
         safety=safety,
         counts_available=counts_available,
-        extra_reasons=monitoring_reasons,
+        extra_reasons=[
+            *monitoring_reasons,
+            *runtime_scope_reasons,
+            *autonomous_scope_reasons,
+            *startup_gate_reasons,
+        ],
     )
     return {
         "service": settings.service_name,
         "environment": settings.environment,
         "mode": safety["mode"],
+        "execution_scope": runtime_scope_payload,
+        "exec_agent": exec_agent_runtime_configuration(settings),
         "ready": readiness["ready"],
         "readiness": readiness,
         "safety": safety,
         "dependencies": dependencies,
+        "runtime_startup_gate": startup_gate_payload,
         "diagnostics": diagnostics,
         "liveness": {
             **liveness_payload(runtime),
-            "autonomous": autonomous,
+            "autonomous": public_autonomous,
             "monitoring": monitoring,
         },
         "broker": broker,
@@ -1887,14 +3408,39 @@ def monthly_pnl_payload(
     settings: Settings,
     db: Session,
     now: datetime | None = None,
+    provider: str = "kis",
+    runtime_scope: RuntimeExecutionScope | None = None,
 ) -> dict[str, object]:
-    month_start, next_month_start = _current_krx_month_utc_bounds(now)
+    pnl_scope, pnl_timezone = _runtime_pnl_scope(
+        settings=settings,
+        provider=provider,
+        runtime_scope=runtime_scope,
+    )
+    month_start, next_month_start = _current_pnl_month_utc_bounds(
+        now,
+        timezone=pnl_timezone,
+    )
     summary = _period_realized_pnl_summary(
         settings=settings,
         db=db,
         start_at=month_start,
         end_at=next_month_start,
+        provider=provider,
+        runtime_scope=pnl_scope,
     )
+    if summary.get("scope_unavailable_reason") or int(
+        summary.get("scope_unavailable_fill_count") or 0
+    ) > 0:
+        return _default_monthly_pnl_payload(
+            settings=settings,
+            now=now,
+            provider=provider,
+            runtime_scope=pnl_scope,
+            reason=str(
+                summary.get("scope_unavailable_reason")
+                or "execution_scope_unavailable"
+            ),
+        )
 
     target = getattr(settings, "monthly_target_krw", Decimal("500000"))
     economics = _pnl_economics_payload(
@@ -1914,7 +3460,10 @@ def monthly_pnl_payload(
         if monthly_net is not None and target > 0
         else None
     )
-    expected_progress = _expected_month_progress_pct(now)
+    expected_progress = _expected_month_progress_pct(
+        now,
+        timezone=pnl_timezone,
+    )
     recommendation = (
         _monthly_mode_recommendation(
             settings=settings,
@@ -1925,7 +3474,8 @@ def monthly_pnl_payload(
         else "insufficient_net_pnl_data"
     )
     return {
-        "month": month_start.astimezone(KRX_TIMEZONE).strftime("%Y-%m"),
+        "month": month_start.astimezone(pnl_timezone).strftime("%Y-%m"),
+        "timezone": pnl_timezone.key,
         "monthly_realized_pnl": _decimal_text(monthly_gross),
         "monthly_gross_realized_pnl_krw": _decimal_text(monthly_gross),
         "monthly_net_realized_pnl_krw": _decimal_text(monthly_net),
@@ -1938,7 +3488,9 @@ def monthly_pnl_payload(
         "matched_sell_quantity": _quantity_value(summary["matched_sell_quantity"]),
         "unmatched_sell_quantity": _quantity_value(summary["unmatched_sell_quantity"]),
         "cost_basis_sources": summary["cost_basis_sources"],
-        "unknown_cost_basis_sell_quantity": _quantity_value(summary["unknown_cost_basis_sell_quantity"]),
+        "unknown_cost_basis_sell_quantity": _quantity_value(
+            summary["unknown_cost_basis_sell_quantity"]
+        ),
         "stale_fifo_inventory_alerts": summary["stale_fifo_inventory_alerts"],
         **economics,
         **notionals,
@@ -1952,24 +3504,62 @@ def daily_pnl_payload(
     settings: Settings,
     db: Session,
     now: datetime | None = None,
+    provider: str = "kis",
+    runtime_scope: RuntimeExecutionScope | None = None,
 ) -> dict[str, object]:
-    day_start, next_day_start = _current_krx_day_utc_bounds(now)
-    fills = dedupe_execution_fills(db.scalars(
-        select(ExecutionFill)
-        .join(ExecutionFill.broker_order)
-        .where(
-            BrokerOrder.mode == settings.runtime_mode,
-            ExecutionFill.filled_at < next_day_start,
-        )
-        .order_by(ExecutionFill.filled_at.asc(), ExecutionFill.id.asc())
-    ).all())
-
-    lots_by_symbol: dict[str, list[dict[str, object]]] = {}
+    pnl_scope, pnl_timezone = _runtime_pnl_scope(
+        settings=settings,
+        provider=provider,
+        runtime_scope=runtime_scope,
+    )
+    day_start, next_day_start = _current_pnl_day_utc_bounds(
+        now,
+        timezone=pnl_timezone,
+    )
+    selection = _active_runtime_fills_for_period(
+        settings=settings,
+        db=db,
+        start_at=None,
+        end_at=next_day_start,
+        provider=provider,
+        runtime_scope=pnl_scope,
+    )
     isolation_cursor = load_fifo_isolation_cursor(
         db=db,
         runtime_mode=settings.runtime_mode,
         through=next_day_start,
     )
+    chronology_ambiguous_fill_count = ambiguous_fifo_realized_pnl_sell_count(
+        selection.fills,
+        isolation_cursor=isolation_cursor,
+        start_at=day_start,
+        end_at=next_day_start,
+    )
+    if (
+        selection.scope_unavailable_reason is not None
+        or selection.indeterminate_fill_count > 0
+        or chronology_ambiguous_fill_count > 0
+    ):
+        return _default_daily_pnl_payload(
+            settings=settings,
+            now=now,
+            provider=provider,
+            runtime_scope=pnl_scope,
+            reason=(
+                selection.scope_unavailable_reason
+                or (
+                    "indeterminate_fill_chronology"
+                    if chronology_ambiguous_fill_count > 0
+                    else "indeterminate_execution_fill_scope"
+                )
+            ),
+        )
+    fills = selection.fills
+
+    lots_by_route_symbol: dict[
+        tuple[FifoRouteScope, str],
+        list[dict[str, object]],
+    ] = {}
     realized = Decimal("0")
     buy_notional_by_currency: dict[str, Decimal] = {}
     sell_notional_by_currency: dict[str, Decimal] = {}
@@ -1983,23 +3573,38 @@ def daily_pnl_payload(
     unmatched_sell_quantity_by_currency: dict[str, Decimal] = {}
     unknown_currency_unmatched_sell_quantity = Decimal("0")
     economics_rows: list[ClosedTradeEconomics] = []
-    for fill in fills:
+    for fill in sorted(fills, key=fifo_fill_sort_key):
         filled_at = _as_utc(fill.filled_at)
         side = fill.side.lower()
         symbol = fill.symbol
         quantity = _pnl_fill_quantity(fill)
         notional = _pnl_fill_notional(fill=fill, quantity=quantity)
-        lots = lots_by_symbol.setdefault(symbol, [])
-        isolation_cursor.apply_before(symbol=symbol, observed_at=filled_at, lots=lots)
-        if side == "buy":
-            lots.append(
-                {
-                    "quantity": quantity,
-                    "price": fill.price,
-                    "filled_at": filled_at,
-                    "fill": fill,
-                }
+        route_scope = fifo_route_scope_from_order(fill.broker_order)
+        lots = (
+            lots_by_route_symbol.setdefault((route_scope, symbol), [])
+            if route_scope is not None
+            else []
+        )
+        scope_quality_available = (
+            isolation_cursor.apply_before(
+                route_scope=route_scope,
+                symbol=symbol,
+                observed_at=filled_at,
+                lots=lots,
             )
+            if route_scope is not None
+            else False
+        )
+        if side == "buy":
+            if scope_quality_available:
+                lots.append(
+                    {
+                        "quantity": quantity,
+                        "price": fill.price,
+                        "filled_at": filled_at,
+                        "fill": fill,
+                    }
+                )
             if filled_at >= day_start:
                 currency = execution_fill_economics(fill).settlement_currency
                 if currency is None:
@@ -2071,7 +3676,8 @@ def daily_pnl_payload(
         unknown_sell=unknown_currency_sell_notional,
     )
     return {
-        "date": day_start.astimezone(KRX_TIMEZONE).strftime("%Y-%m-%d"),
+        "date": day_start.astimezone(pnl_timezone).strftime("%Y-%m-%d"),
+        "timezone": pnl_timezone.key,
         "daily_realized_pnl": _decimal_text(economics["gross_realized_pnl_krw"]),
         "daily_gross_realized_pnl_krw": _decimal_text(
             economics["gross_realized_pnl_krw"]
@@ -2101,14 +3707,39 @@ def weekly_pnl_payload(
     settings: Settings,
     db: Session,
     now: datetime | None = None,
+    provider: str = "kis",
+    runtime_scope: RuntimeExecutionScope | None = None,
 ) -> dict[str, object]:
-    week_start, next_week_start = _current_krx_week_utc_bounds(now)
+    pnl_scope, pnl_timezone = _runtime_pnl_scope(
+        settings=settings,
+        provider=provider,
+        runtime_scope=runtime_scope,
+    )
+    week_start, next_week_start = _current_pnl_week_utc_bounds(
+        now,
+        timezone=pnl_timezone,
+    )
     summary = _period_realized_pnl_summary(
         settings=settings,
         db=db,
         start_at=week_start,
         end_at=next_week_start,
+        provider=provider,
+        runtime_scope=pnl_scope,
     )
+    if summary.get("scope_unavailable_reason") or int(
+        summary.get("scope_unavailable_fill_count") or 0
+    ) > 0:
+        return _default_weekly_pnl_payload(
+            settings=settings,
+            now=now,
+            provider=provider,
+            runtime_scope=pnl_scope,
+            reason=str(
+                summary.get("scope_unavailable_reason")
+                or "execution_scope_unavailable"
+            ),
+        )
 
     economics = _pnl_economics_payload(
         summary["economics_rows"],
@@ -2121,8 +3752,9 @@ def weekly_pnl_payload(
     )
     notionals = summary["notionals"]
     return {
-        "week_start": week_start.astimezone(KRX_TIMEZONE).strftime("%Y-%m-%d"),
-        "week_end_exclusive": next_week_start.astimezone(KRX_TIMEZONE).strftime("%Y-%m-%d"),
+        "week_start": week_start.astimezone(pnl_timezone).strftime("%Y-%m-%d"),
+        "week_end_exclusive": next_week_start.astimezone(pnl_timezone).strftime("%Y-%m-%d"),
+        "timezone": pnl_timezone.key,
         "weekly_realized_pnl": _decimal_text(economics["gross_realized_pnl_krw"]),
         "weekly_gross_realized_pnl_krw": _decimal_text(
             economics["gross_realized_pnl_krw"]
@@ -2158,29 +3790,65 @@ def _period_realized_pnl_summary(
     db: Session,
     start_at: datetime,
     end_at: datetime,
+    provider: str = "kis",
+    runtime_scope: RuntimeExecutionScope | None = None,
 ) -> dict[str, object]:
-    fills = dedupe_execution_fills(db.scalars(
-        select(ExecutionFill)
-        .join(ExecutionFill.broker_order)
-        .where(
-            BrokerOrder.mode == settings.runtime_mode,
-            ExecutionFill.filled_at < end_at,
-        )
-        .order_by(ExecutionFill.filled_at.asc(), ExecutionFill.id.asc())
-    ).all())
-    sell_symbols = {
-        fill.symbol
-        for fill in fills
-        if str(fill.side or "").lower() == "sell" and start_at <= _as_utc(fill.filled_at) < end_at
-    }
-    positions_by_symbol = _pnl_positions_by_symbol(settings=settings, db=db, symbols=sell_symbols)
-
-    lots_by_symbol: dict[str, list[dict[str, object]]] = {}
+    selection = _active_runtime_fills_for_period(
+        settings=settings,
+        db=db,
+        start_at=None,
+        end_at=end_at,
+        provider=provider,
+        runtime_scope=runtime_scope,
+    )
     isolation_cursor = load_fifo_isolation_cursor(
         db=db,
         runtime_mode=settings.runtime_mode,
         through=end_at,
     )
+    chronology_ambiguous_fill_count = ambiguous_fifo_realized_pnl_sell_count(
+        selection.fills,
+        isolation_cursor=isolation_cursor,
+        start_at=start_at,
+        end_at=end_at,
+    )
+    if (
+        selection.scope_unavailable_reason is not None
+        or selection.indeterminate_fill_count > 0
+        or chronology_ambiguous_fill_count > 0
+    ):
+        return {
+            "scope_unavailable_fill_count": (
+                selection.indeterminate_fill_count
+                + chronology_ambiguous_fill_count
+            ),
+            "scope_unavailable_reason": (
+                selection.scope_unavailable_reason
+                or (
+                    "indeterminate_fill_chronology"
+                    if chronology_ambiguous_fill_count > 0
+                    else "indeterminate_execution_fill_scope"
+                )
+            ),
+        }
+    fills = selection.fills
+    sell_symbols = {
+        fill.symbol
+        for fill in fills
+        if str(fill.side or "").lower() == "sell" and start_at <= _as_utc(fill.filled_at) < end_at
+    }
+    positions_by_route_symbol = _pnl_positions_by_route_symbol(
+        settings=settings,
+        db=db,
+        symbols=sell_symbols,
+        provider=provider,
+        runtime_scope=runtime_scope,
+    )
+
+    lots_by_route_symbol: dict[
+        tuple[FifoRouteScope, str],
+        list[dict[str, object]],
+    ] = {}
     realized = Decimal("0")
     buy_notional_by_currency: dict[str, Decimal] = {}
     sell_notional_by_currency: dict[str, Decimal] = {}
@@ -2198,23 +3866,38 @@ def _period_realized_pnl_summary(
     unmatched_sell_quantity_by_currency: dict[str, Decimal] = {}
     unknown_currency_unmatched_sell_quantity = Decimal("0")
     economics_rows: list[ClosedTradeEconomics] = []
-    for fill in fills:
+    for fill in sorted(fills, key=fifo_fill_sort_key):
         filled_at = _as_utc(fill.filled_at)
         side = fill.side.lower()
         symbol = fill.symbol
         quantity = _pnl_fill_quantity(fill)
         notional = _pnl_fill_notional(fill=fill, quantity=quantity)
-        lots = lots_by_symbol.setdefault(symbol, [])
-        isolation_cursor.apply_before(symbol=symbol, observed_at=filled_at, lots=lots)
-        if side == "buy":
-            lots.append(
-                {
-                    "quantity": quantity,
-                    "price": fill.price,
-                    "filled_at": filled_at,
-                    "fill": fill,
-                }
+        route_scope = fifo_route_scope_from_order(fill.broker_order)
+        lots = (
+            lots_by_route_symbol.setdefault((route_scope, symbol), [])
+            if route_scope is not None
+            else []
+        )
+        scope_quality_available = (
+            isolation_cursor.apply_before(
+                route_scope=route_scope,
+                symbol=symbol,
+                observed_at=filled_at,
+                lots=lots,
             )
+            if route_scope is not None
+            else False
+        )
+        if side == "buy":
+            if scope_quality_available:
+                lots.append(
+                    {
+                        "quantity": quantity,
+                        "price": fill.price,
+                        "filled_at": filled_at,
+                        "fill": fill,
+                    }
+                )
             if filled_at >= start_at:
                 currency = execution_fill_economics(fill).settlement_currency
                 if currency is None:
@@ -2227,7 +3910,12 @@ def _period_realized_pnl_summary(
         if side != "sell":
             continue
         in_period = filled_at >= start_at
-        next_buy_after_sell = _pnl_next_buy_after(fills=fills, symbol=symbol, after=filled_at)
+        next_buy_after_sell = _pnl_next_buy_after(
+            fills=fills,
+            route_scope=route_scope,
+            symbol=symbol,
+            after=filled_at,
+        )
         if in_period:
             currency = execution_fill_economics(fill).settlement_currency
             if currency is None:
@@ -2243,7 +3931,11 @@ def _period_realized_pnl_summary(
             matched = min(remaining, lot_quantity)
             cost_price = Decimal(str(lot["price"]))
             cost_source = "fill_fifo"
-            position = positions_by_symbol.get(symbol)
+            position = _pnl_position_for_route(
+                positions_by_route_symbol=positions_by_route_symbol,
+                route_scope=route_scope,
+                symbol=symbol,
+            )
             broker_cost_basis = _pnl_broker_reconciliation_cost_basis(
                 position=position,
                 sold_at=filled_at,
@@ -2281,7 +3973,11 @@ def _period_realized_pnl_summary(
             if Decimal(str(lot["quantity"])) <= 0:
                 lots.pop(0)
         if remaining > 0 and in_period:
-            position = positions_by_symbol.get(symbol)
+            position = _pnl_position_for_route(
+                positions_by_route_symbol=positions_by_route_symbol,
+                route_scope=route_scope,
+                symbol=symbol,
+            )
             broker_cost_basis = _pnl_broker_reconciliation_cost_basis(
                 position=position,
                 sold_at=filled_at,
@@ -2323,10 +4019,17 @@ def _period_realized_pnl_summary(
                         + remaining
                     )
 
-    for symbol, lots in lots_by_symbol.items():
-        isolation_cursor.apply_through(symbol=symbol, observed_at=end_at, lots=lots)
+    for (route_scope, symbol), lots in lots_by_route_symbol.items():
+        isolation_cursor.apply_through(
+            route_scope=route_scope,
+            symbol=symbol,
+            observed_at=end_at,
+            lots=lots,
+        )
 
     return {
+        "scope_unavailable_fill_count": 0,
+        "scope_unavailable_reason": None,
         "realized": realized,
         "notionals": _pnl_notional_payload(
             buy_by_currency=buy_notional_by_currency,
@@ -2350,8 +4053,8 @@ def _period_realized_pnl_summary(
             unknown_currency_unmatched_sell_quantity
         ),
         "stale_fifo_inventory_alerts": _stale_fifo_inventory_alerts(
-            lots_by_symbol=lots_by_symbol,
-            positions_by_symbol=positions_by_symbol,
+            lots_by_route_symbol=lots_by_route_symbol,
+            positions_by_route_symbol=positions_by_route_symbol,
         ),
     }
 
@@ -2380,6 +4083,7 @@ def _pnl_broker_reconciliation_cost_basis(
 def _pnl_next_buy_after(
     *,
     fills: list[ExecutionFill],
+    route_scope: FifoRouteScope | None,
     symbol: str,
     after: datetime,
 ) -> datetime | None:
@@ -2387,43 +4091,146 @@ def _pnl_next_buy_after(
         _as_utc(fill.filled_at)
         for fill in fills
         if fill.symbol == symbol
+        and fifo_route_scope_from_order(fill.broker_order) == route_scope
         and str(fill.side or "").lower() == "buy"
         and _as_utc(fill.filled_at) > after
     ]
     return min(later_buys) if later_buys else None
 
 
-def _pnl_positions_by_symbol(
+def _pnl_position_matches_route(
+    *,
+    position: ExecutionPosition | None,
+    route_scope: FifoRouteScope | None,
+) -> bool:
+    if position is None or route_scope is None:
+        return False
+    try:
+        identity = position_identity_from_columns(position)
+    except PositionIdentityConflictError:
+        return False
+    return bool(
+        identity is not None
+        and identity.provider == route_scope.provider
+        and identity.account_scope == route_scope.account_scope
+        and identity.exchange == route_scope.exchange
+    )
+
+
+PnlPositionRouteKey = tuple[str, str, str, str]
+
+
+def _pnl_position_route_key(position: ExecutionPosition) -> PnlPositionRouteKey | None:
+    try:
+        identity = position_identity_from_columns(position)
+    except PositionIdentityConflictError:
+        return None
+    if identity is None:
+        return None
+    return (
+        identity.provider,
+        identity.account_scope,
+        identity.exchange,
+        position.symbol,
+    )
+
+
+def _pnl_positions_by_route_symbol(
     *,
     settings: Settings,
     db: Session,
     symbols: set[str],
-) -> dict[str, ExecutionPosition]:
+    provider: str | None = None,
+    runtime_scope: RuntimeExecutionScope | None = None,
+) -> dict[PnlPositionRouteKey, ExecutionPosition]:
     if not symbols:
         return {}
-    return {
-        position.symbol: position
-        for position in db.scalars(
-            select(ExecutionPosition).where(
-                ExecutionPosition.mode == settings.runtime_mode,
-                ExecutionPosition.symbol.in_(sorted(symbols)),
+    positions_by_route_symbol: dict[PnlPositionRouteKey, ExecutionPosition] = {}
+    route_filters = (
+        _active_runtime_position_filters(
+            settings=settings,
+            provider=provider,
+            runtime_scope=runtime_scope,
+        )
+        if provider is not None
+        else (
+            ExecutionPosition.mode == settings.runtime_mode,
+            ExecutionPosition.provider.is_not(None),
+            ExecutionPosition.account_scope.is_not(None),
+            ExecutionPosition.exchange.is_not(None),
+        )
+    )
+    positions = db.scalars(
+        select(ExecutionPosition).where(
+            *route_filters,
+            ExecutionPosition.symbol.in_(sorted(symbols)),
+        )
+    ).all()
+    for position in positions:
+        key = _pnl_position_route_key(position)
+        if key is None:
+            continue
+        if key in positions_by_route_symbol:
+            raise PositionIdentityConflictError(
+                "multiple execution positions exist for one PnL route and symbol"
             )
-        ).all()
-    }
+        positions_by_route_symbol[key] = position
+    return positions_by_route_symbol
+
+
+def _pnl_position_for_route(
+    *,
+    positions_by_route_symbol: dict[PnlPositionRouteKey, ExecutionPosition],
+    route_scope: FifoRouteScope | None,
+    symbol: str,
+) -> ExecutionPosition | None:
+    if route_scope is None:
+        return None
+    return positions_by_route_symbol.get(
+        (
+            route_scope.provider,
+            route_scope.account_scope,
+            route_scope.exchange,
+            symbol,
+        )
+    )
 
 
 def _stale_fifo_inventory_alerts(
     *,
-    lots_by_symbol: dict[str, list[dict[str, object]]],
-    positions_by_symbol: dict[str, ExecutionPosition],
+    lots_by_route_symbol: dict[
+        tuple[FifoRouteScope, str],
+        list[dict[str, object]],
+    ],
+    positions_by_route_symbol: dict[PnlPositionRouteKey, ExecutionPosition],
 ) -> list[dict[str, object]]:
     alerts: list[dict[str, object]] = []
-    for symbol, lots in sorted(lots_by_symbol.items()):
+    for (route_scope, symbol), lots in sorted(
+        lots_by_route_symbol.items(),
+        key=lambda item: (
+            item[0][1],
+            item[0][0].provider,
+            item[0][0].account_scope,
+            item[0][0].venue,
+            item[0][0].asset_class,
+        ),
+    ):
         fifo_quantity = sum((Decimal(str(lot["quantity"])) for lot in lots), Decimal("0"))
         if fifo_quantity <= 0:
             continue
-        position = positions_by_symbol.get(symbol)
-        if position is None or position.last_reconciled_at is None:
+        position = _pnl_position_for_route(
+            positions_by_route_symbol=positions_by_route_symbol,
+            route_scope=route_scope,
+            symbol=symbol,
+        )
+        if (
+            position is None
+            or position.last_reconciled_at is None
+            or not _pnl_position_matches_route(
+                position=position,
+                route_scope=route_scope,
+            )
+        ):
             continue
         position_quantity = _position_effective_quantity(position)
         if position_quantity > 0:
@@ -2432,6 +4239,7 @@ def _stale_fifo_inventory_alerts(
             {
                 "kind": "stale_fill_fifo_inventory_flat_broker_position",
                 "symbol": symbol,
+                "execution_scope": route_scope.as_payload(),
                 "fifo_open_quantity": _quantity_value(fifo_quantity),
                 "broker_position_quantity": _quantity_value(position_quantity),
                 "position_last_reconciled_at": _serialize_datetime(position.last_reconciled_at),
@@ -2712,20 +4520,37 @@ def _unavailable_pnl_notional_payload() -> dict[str, object]:
     }
 
 
-def _default_monthly_pnl_payload(*, settings: Settings) -> dict[str, object]:
+def _default_monthly_pnl_payload(
+    *,
+    settings: Settings,
+    now: datetime | None = None,
+    provider: str = "kis",
+    runtime_scope: RuntimeExecutionScope | None = None,
+    reason: str = "monthly_pnl_not_computed",
+) -> dict[str, object]:
     target = getattr(settings, "monthly_target_krw", Decimal("500000"))
-    economics = _unavailable_pnl_economics_payload(
-        reason="monthly_pnl_not_computed"
-    )
+    economics = _unavailable_pnl_economics_payload(reason=reason)
     notionals = _unavailable_pnl_notional_payload()
+    pnl_timezone = _runtime_pnl_timezone(
+        settings=settings,
+        provider=provider,
+        runtime_scope=runtime_scope,
+    )
+    month_start, _next_month_start = _current_pnl_month_utc_bounds(
+        now,
+        timezone=pnl_timezone,
+    )
     return {
-        "month": datetime.now(KRX_TIMEZONE).strftime("%Y-%m"),
+        "month": month_start.astimezone(pnl_timezone).strftime("%Y-%m"),
+        "timezone": pnl_timezone.key,
         "monthly_realized_pnl": None,
         "monthly_gross_realized_pnl_krw": None,
         "monthly_net_realized_pnl_krw": None,
         "monthly_target_krw": _decimal_text(target),
         "target_progress_pct": None,
-        "expected_calendar_progress_pct": _decimal_text(_expected_month_progress_pct()),
+        "expected_calendar_progress_pct": _decimal_text(
+            _expected_month_progress_pct(now, timezone=pnl_timezone)
+        ),
         "mode_recommendation": "insufficient_net_pnl_data",
         "monthly_buy_notional": None,
         "monthly_sell_notional": None,
@@ -2741,11 +4566,28 @@ def _default_monthly_pnl_payload(*, settings: Settings) -> dict[str, object]:
     }
 
 
-def _default_daily_pnl_payload() -> dict[str, object]:
-    economics = _unavailable_pnl_economics_payload(reason="daily_pnl_not_computed")
+def _default_daily_pnl_payload(
+    *,
+    settings: Settings | None = None,
+    now: datetime | None = None,
+    provider: str = "kis",
+    runtime_scope: RuntimeExecutionScope | None = None,
+    reason: str = "daily_pnl_not_computed",
+) -> dict[str, object]:
+    economics = _unavailable_pnl_economics_payload(reason=reason)
     notionals = _unavailable_pnl_notional_payload()
+    pnl_timezone = _runtime_pnl_timezone(
+        settings=settings,
+        provider=provider,
+        runtime_scope=runtime_scope,
+    )
+    day_start, _next_day_start = _current_pnl_day_utc_bounds(
+        now,
+        timezone=pnl_timezone,
+    )
     return {
-        "date": datetime.now(KRX_TIMEZONE).strftime("%Y-%m-%d"),
+        "date": day_start.astimezone(pnl_timezone).strftime("%Y-%m-%d"),
+        "timezone": pnl_timezone.key,
         "daily_realized_pnl": None,
         "daily_gross_realized_pnl_krw": None,
         "daily_net_realized_pnl_krw": None,
@@ -2766,13 +4608,29 @@ def _default_daily_pnl_payload() -> dict[str, object]:
     }
 
 
-def _default_weekly_pnl_payload() -> dict[str, object]:
-    week_start, next_week_start = _current_krx_week_utc_bounds()
-    economics = _unavailable_pnl_economics_payload(reason="weekly_pnl_not_computed")
+def _default_weekly_pnl_payload(
+    *,
+    settings: Settings | None = None,
+    now: datetime | None = None,
+    provider: str = "kis",
+    runtime_scope: RuntimeExecutionScope | None = None,
+    reason: str = "weekly_pnl_not_computed",
+) -> dict[str, object]:
+    pnl_timezone = _runtime_pnl_timezone(
+        settings=settings,
+        provider=provider,
+        runtime_scope=runtime_scope,
+    )
+    week_start, next_week_start = _current_pnl_week_utc_bounds(
+        now,
+        timezone=pnl_timezone,
+    )
+    economics = _unavailable_pnl_economics_payload(reason=reason)
     notionals = _unavailable_pnl_notional_payload()
     return {
-        "week_start": week_start.astimezone(KRX_TIMEZONE).strftime("%Y-%m-%d"),
-        "week_end_exclusive": next_week_start.astimezone(KRX_TIMEZONE).strftime("%Y-%m-%d"),
+        "week_start": week_start.astimezone(pnl_timezone).strftime("%Y-%m-%d"),
+        "week_end_exclusive": next_week_start.astimezone(pnl_timezone).strftime("%Y-%m-%d"),
+        "timezone": pnl_timezone.key,
         "weekly_realized_pnl": None,
         "weekly_gross_realized_pnl_krw": None,
         "weekly_net_realized_pnl_krw": None,
@@ -2798,15 +4656,32 @@ def _default_weekly_pnl_payload() -> dict[str, object]:
     }
 
 
-def _current_krx_week_utc_bounds(now: datetime | None = None) -> tuple[datetime, datetime]:
-    current = (now or datetime.now(KRX_TIMEZONE)).astimezone(KRX_TIMEZONE)
-    week_start = (current - timedelta(days=current.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+def _current_pnl_week_utc_bounds(
+    now: datetime | None = None,
+    *,
+    timezone: ZoneInfo,
+) -> tuple[datetime, datetime]:
+    current = (now or datetime.now(timezone)).astimezone(timezone)
+    week_start = (current - timedelta(days=current.weekday())).replace(
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
     next_week = week_start + timedelta(days=7)
     return week_start.astimezone(UTC), next_week.astimezone(UTC)
 
 
-def _current_krx_month_utc_bounds(now: datetime | None = None) -> tuple[datetime, datetime]:
-    current = (now or datetime.now(KRX_TIMEZONE)).astimezone(KRX_TIMEZONE)
+def _current_krx_week_utc_bounds(now: datetime | None = None) -> tuple[datetime, datetime]:
+    return _current_pnl_week_utc_bounds(now, timezone=KRX_TIMEZONE)
+
+
+def _current_pnl_month_utc_bounds(
+    now: datetime | None = None,
+    *,
+    timezone: ZoneInfo,
+) -> tuple[datetime, datetime]:
+    current = (now or datetime.now(timezone)).astimezone(timezone)
     month_start = current.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     if month_start.month == 12:
         next_month = month_start.replace(year=month_start.year + 1, month=1)
@@ -2815,8 +4690,16 @@ def _current_krx_month_utc_bounds(now: datetime | None = None) -> tuple[datetime
     return month_start.astimezone(UTC), next_month.astimezone(UTC)
 
 
-def _expected_month_progress_pct(now: datetime | None = None) -> Decimal:
-    current = (now or datetime.now(KRX_TIMEZONE)).astimezone(KRX_TIMEZONE)
+def _current_krx_month_utc_bounds(now: datetime | None = None) -> tuple[datetime, datetime]:
+    return _current_pnl_month_utc_bounds(now, timezone=KRX_TIMEZONE)
+
+
+def _expected_month_progress_pct(
+    now: datetime | None = None,
+    *,
+    timezone: ZoneInfo = KRX_TIMEZONE,
+) -> Decimal:
+    current = (now or datetime.now(timezone)).astimezone(timezone)
     if current.month == 12:
         next_month = current.replace(year=current.year + 1, month=1, day=1)
     else:
@@ -2868,14 +4751,27 @@ def build_runtime_daily_board(
     settings: Settings,
     runtime: RuntimeMetadata,
     db: Session,
+    broker_adapter: BrokerAdapter | None = None,
     autonomous_runtime: dict[str, object] | None = None,
+    runtime_startup_gate: dict[str, object] | None = None,
 ) -> dict[str, object]:
+    runtime_provider = _normalize_runtime_provider(
+        getattr(broker_adapter, "provider", "kis")
+    )
+    runtime_scope = _resolve_runtime_execution_scope(
+        settings=settings,
+        provider=runtime_provider,
+        broker_adapter=broker_adapter,
+    )
     runtime_status = build_runtime_status(
         settings=settings,
         runtime=runtime,
         db=db,
+        broker_adapter=broker_adapter,
         autonomous_runtime=autonomous_runtime,
         include_expensive_sections=True,
+        runtime_scope=runtime_scope,
+        runtime_startup_gate=runtime_startup_gate,
     )
     symbols: list[dict[str, object]] = []
     if runtime_status["dependencies"]["database"] == "ok" and runtime_status["dependencies"]["runtime_schema"] == "ok":
@@ -2883,7 +4779,6 @@ def build_runtime_daily_board(
             monitored_symbols = runtime_status.get("symbols", {}).get("monitored", [])
             status_symbols = runtime_status.get("symbols", {})
             if isinstance(monitored_symbols, list) and isinstance(status_symbols, dict):
-                monitored_symbol_set = {str(symbol) for symbol in monitored_symbols}
                 normalized_symbols = set()
                 for key in ("monitored", "scheduled_today", "filled_today", "failed_today", "positions"):
                     values = status_symbols.get(key, [])
@@ -2892,20 +4787,22 @@ def build_runtime_daily_board(
                 vetoes = runtime_status.get("watch_buy_vetoes", {})
                 if isinstance(vetoes, dict) and isinstance(vetoes.get("today_symbols"), list):
                     normalized_symbols.update(str(symbol) for symbol in vetoes["today_symbols"])
-                if len(normalized_symbols) > 20:
-                    symbols = _minimal_runtime_symbol_rows(
-                        settings=settings,
-                        symbols=normalized_symbols,
-                        monitored_symbols=monitored_symbol_set,
-                    )
-                else:
-                    symbols = list_runtime_symbols(
-                        settings=settings,
-                        db=db,
-                        symbols=normalized_symbols,
-                    )
+                symbols = list_runtime_symbols(
+                    settings=settings,
+                    db=db,
+                    symbols=normalized_symbols,
+                    provider=runtime_scope.provider,
+                    account_scope=runtime_scope.account_scope,
+                    exchanges=runtime_scope.exchanges,
+                )
             else:
-                symbols = list_runtime_symbols(settings=settings, db=db)
+                symbols = list_runtime_symbols(
+                    settings=settings,
+                    db=db,
+                    provider=runtime_scope.provider,
+                    account_scope=runtime_scope.account_scope,
+                    exchanges=runtime_scope.exchanges,
+                )
         except SQLAlchemyError:
             db.rollback()
             symbols = []
@@ -2915,7 +4812,11 @@ def build_runtime_daily_board(
         "market_date": datetime.now(KRX_TIMEZONE).date().isoformat(),
         "mode": settings.runtime_mode,
         "runtime": runtime_status,
-        "account_drawdown_gate": latest_account_drawdown_gate_state(settings=settings, db=db),
+        "account_drawdown_gate": _runtime_account_drawdown_gate_state(
+            settings=settings,
+            db=db,
+            provider=runtime_scope.provider,
+        ),
         "watch_buy_vetoes": runtime_status.get("watch_buy_vetoes", {"today_count": 0, "today_symbols": []}),
         "totals": {
             "symbol_count": len(symbols),
@@ -2932,41 +4833,6 @@ def build_runtime_daily_board(
     }
 
 
-def _minimal_runtime_symbol_rows(
-    *,
-    settings: Settings,
-    symbols: set[str],
-    monitored_symbols: set[str],
-) -> list[dict[str, object]]:
-    return [
-        {
-            "symbol": symbol,
-            "mode": settings.runtime_mode,
-            "asset_classes": [],
-            "providers": [],
-            "venues": [],
-            "monitored": symbol in monitored_symbols,
-            "monitoring_statuses": [],
-            "intents": [],
-            "plan_item_count": 0,
-            "latest_plan_item_status": None,
-            "order_count": 0,
-            "open_order_count": 0,
-            "fill_count": 0,
-            "filled_quantity": 0,
-            "filled_base_quantity": "0",
-            "filled_quote_notional": "0",
-            "position_quantity": 0,
-            "position_base_quantity": None,
-            "position_average_price": None,
-            "last_reconciliation_error": None,
-            "latest_activity_at": None,
-            "summary_source": "runtime_status_monitored_symbols",
-        }
-        for symbol in sorted(symbols)
-    ]
-
-
 def _positive_decimal_value(value: object) -> bool:
     if value is None:
         return False
@@ -2981,18 +4847,24 @@ def _monitoring_payload_from_autonomous(
     settings: Settings,
     autonomous: dict[str, object],
     monitoring_price_source: dict[str, object],
+    snapshot_trusted: bool,
+    scope_reason: str | None,
 ) -> dict[str, object]:
     autonomous_monitoring = autonomous.get("monitoring")
     if not isinstance(autonomous_monitoring, dict):
         autonomous_monitoring = {}
-    last_cycle = autonomous_monitoring.get("last_cycle")
+    last_cycle = autonomous_monitoring.get("last_cycle") if snapshot_trusted else None
     if not isinstance(last_cycle, dict):
         last_cycle = None
     else:
         last_cycle = _compact_monitoring_cycle_payload(last_cycle)
+        stripped_last_cycle = _strip_account_scope(last_cycle)
+        last_cycle = stripped_last_cycle if isinstance(stripped_last_cycle, dict) else None
     status = str(autonomous_monitoring.get("status") or "not_started")
     if status == "disabled":
         status = "not_started"
+    if not snapshot_trusted:
+        status = "degraded"
     return {
         "status": status,
         "topology": MONITORING_RUNTIME_TOPOLOGY,
@@ -3024,7 +4896,9 @@ def _monitoring_payload_from_autonomous(
         "last_heartbeat_at": autonomous_monitoring.get("last_heartbeat_at"),
         "last_success_at": autonomous_monitoring.get("last_success_at"),
         "last_cycle": last_cycle,
-        "price_source": monitoring_price_source,
+        "execution_scope_status": "available" if snapshot_trusted else "unavailable",
+        "execution_scope_reason": scope_reason,
+        "price_source": _strip_account_scope(monitoring_price_source),
         "source": "autonomous_runtime_snapshot",
     }
 
@@ -3084,8 +4958,13 @@ def _unknown_profit_target_coverage_payload() -> dict[str, object]:
 
 def _default_autonomous_runtime_payload(settings: Settings) -> dict[str, object]:
     default_status = "idle" if settings.autonomous_runtime_enabled else "disabled"
+    runtime_scope = _resolve_runtime_execution_scope(
+        settings=settings,
+        provider=_normalize_runtime_provider(settings.runtime_broker_provider),
+    )
     return {
         "enabled": settings.autonomous_runtime_enabled,
+        "execution_scope": _canonical_runtime_snapshot_execution_scope(runtime_scope),
         "dispatch": {
             "worker_name": "execution_job_dispatch_loop",
             "status": default_status,

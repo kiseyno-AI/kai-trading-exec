@@ -1,11 +1,13 @@
 import logging
 from pathlib import Path
+import secrets
+import sqlite3
 import time
 
 from sqlalchemy import create_engine, event, text
 from sqlalchemy.engine import Engine, make_url
 from sqlalchemy.orm import Session, sessionmaker
-from sqlalchemy.pool import StaticPool
+from sqlalchemy.pool import QueuePool
 
 from app.core.config import Settings
 from app.db.sqlite_diagnostics import record_sqlite_lock_error
@@ -26,6 +28,17 @@ def create_db_engine(settings: Settings) -> Engine:
     ensure_database_parent_dir(settings.database_url)
     url = make_url(settings.database_url)
     kwargs = _build_engine_kwargs(settings)
+    if url.drivername.startswith("sqlite") and url.database == ":memory:":
+        shared_memory_uri = (
+            f"file:kai_exec_{secrets.token_hex(16)}?mode=memory&cache=shared"
+        )
+        kwargs.pop("connect_args", None)
+        kwargs["creator"] = lambda: sqlite3.connect(
+            shared_memory_uri,
+            uri=True,
+            check_same_thread=False,
+            timeout=float(settings.sqlite_busy_timeout_seconds),
+        )
     engine = create_engine(settings.database_url, **kwargs)
     _configure_pool_diagnostics(engine, settings=settings)
     if url.drivername.startswith("sqlite"):
@@ -46,7 +59,14 @@ def _build_engine_kwargs(settings: Settings) -> dict[str, object]:
             "timeout": float(settings.sqlite_busy_timeout_seconds),
         }
         if url.database == ":memory:":
-            kwargs["poolclass"] = StaticPool
+            # Each engine gets an isolated named shared-memory database in
+            # ``create_db_engine``. A queue pool then provides distinct DB-API
+            # connections to concurrent sessions while every connection sees
+            # the same schema. Recycling is disabled so the database cannot
+            # disappear between test/dev checkouts.
+            kwargs.update(_queue_pool_kwargs(settings))
+            kwargs["poolclass"] = QueuePool
+            kwargs["pool_recycle"] = -1
         else:
             kwargs.update(_queue_pool_kwargs(settings))
     else:

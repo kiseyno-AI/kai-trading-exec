@@ -3,10 +3,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
-from typing import Any
+from typing import Any, TypeVar
 
 from app.broker.base import BrokerAccountHolding, BrokerAccountSnapshot
 from app.models.runtime import ExecutionPosition
+from app.services.position_identity import (
+    PositionIdentityConflictError,
+    position_identity_from_columns,
+)
 
 
 @dataclass(frozen=True)
@@ -21,6 +25,9 @@ class BrokerRawHolding:
     sellable_quantity: Decimal | None
     name: str | None
     raw_payload: dict[str, object]
+
+
+HoldingT = TypeVar("HoldingT", BrokerAccountHolding, BrokerRawHolding)
 
 
 def broker_raw_balance_is_valid(payload: dict[str, Any] | None) -> bool:
@@ -103,8 +110,8 @@ def snapshot_with_raw_balance_holdings(
     raw_holdings = broker_holdings_from_raw_balance(snapshot.payload)
     if not raw_holdings:
         return snapshot
-    by_symbol = {holding.symbol: holding for holding in snapshot.holdings}
-    by_symbol.update({holding.symbol: holding for holding in raw_holdings})
+    by_symbol = _broker_holdings_by_symbol(snapshot.holdings)
+    by_symbol.update(_broker_holdings_by_symbol(raw_holdings))
     return BrokerAccountSnapshot(
         available_cash=snapshot.available_cash,
         observed_at=snapshot.observed_at,
@@ -115,9 +122,14 @@ def snapshot_with_raw_balance_holdings(
         asset_change_amount=snapshot.asset_change_amount,
         unrealized_pnl=snapshot.unrealized_pnl,
         holdings=sorted(by_symbol.values(), key=lambda row: row.symbol),
+        positions=snapshot.positions,
         open_orders=snapshot.open_orders,
         symbol_buying_power=snapshot.symbol_buying_power,
         payload=snapshot.payload,
+        holdings_complete=snapshot.holdings_complete,
+        open_orders_complete=snapshot.open_orders_complete,
+        diagnostics=dict(snapshot.diagnostics),
+        broker_account_id=snapshot.broker_account_id,
     )
 
 
@@ -126,8 +138,8 @@ def raw_vs_normalized_position_drift(
     raw_holdings: list[BrokerRawHolding],
     positions: list[ExecutionPosition],
 ) -> list[dict[str, object]]:
-    position_by_symbol = {position.symbol.upper(): position for position in positions}
-    raw_by_symbol = {holding.symbol: holding for holding in raw_holdings}
+    position_by_symbol = _positions_by_symbol_for_exact_route(positions)
+    raw_by_symbol = _broker_holdings_by_symbol(raw_holdings)
     rows: list[dict[str, object]] = []
     for symbol in sorted(set(position_by_symbol) | set(raw_by_symbol)):
         raw = raw_by_symbol.get(symbol)
@@ -158,6 +170,48 @@ def raw_vs_normalized_position_drift(
             }
         )
     return rows
+
+
+def _positions_by_symbol_for_exact_route(
+    positions: list[ExecutionPosition],
+) -> dict[str, ExecutionPosition]:
+    expected_route: tuple[str, str, str] | None = None
+    positions_by_symbol: dict[str, ExecutionPosition] = {}
+    for position in positions:
+        try:
+            identity = position_identity_from_columns(position)
+        except PositionIdentityConflictError as exc:
+            raise ValueError(
+                "normalized position drift requires one exact route"
+            ) from exc
+        if identity is None:
+            raise ValueError("normalized position drift requires one exact route")
+        route = (identity.provider, identity.account_scope, identity.exchange)
+        if expected_route is None:
+            expected_route = route
+        elif route != expected_route:
+            raise ValueError("normalized position drift requires one exact route")
+        symbol = position.symbol.upper()
+        if symbol in positions_by_symbol:
+            raise ValueError(
+                "normalized position drift requires unique symbols within one exact route"
+            )
+        positions_by_symbol[symbol] = position
+    return positions_by_symbol
+
+
+def _broker_holdings_by_symbol(
+    holdings: list[HoldingT],
+) -> dict[str, HoldingT]:
+    holdings_by_symbol: dict[str, HoldingT] = {}
+    for holding in holdings:
+        symbol = holding.symbol.upper()
+        if symbol in holdings_by_symbol:
+            raise ValueError(
+                "broker holdings must contain unique symbols from one exact route"
+            )
+        holdings_by_symbol[symbol] = holding
+    return holdings_by_symbol
 
 
 def broker_raw_holding_payload(holding: BrokerRawHolding) -> dict[str, object]:
