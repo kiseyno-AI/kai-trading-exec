@@ -18226,6 +18226,42 @@ def test_autonomous_monitoring_loop_retries_pending_dispatch_after_restart_with_
     restarted_engine.dispose()
 
 
+def test_monitoring_checkpoint_preserves_retry_evidence_across_no_price_heartbeat() -> None:
+    triggered_at = datetime(2026, 9, 11, 12, 0, tzinfo=UTC)
+
+    merged = monitoring_service._preserve_checkpoint_retry_evidence(
+        previous_details={
+            "retried_triggered_item_count": 1,
+            "retried_triggered_symbols": ["005930"],
+            "last_retried_triggered_at": "2026-09-11T11:59:59+00:00",
+        },
+        details={
+            "price_count": 0,
+            "retried_triggered_item_count": 0,
+            "retried_triggered_symbols": [],
+        },
+        triggered_at=triggered_at,
+    )
+
+    assert merged["retried_triggered_item_count"] == 1
+    assert merged["retried_triggered_symbols"] == ["005930"]
+    assert merged["last_retried_triggered_at"] == "2026-09-11T11:59:59+00:00"
+
+    recovered = monitoring_service._preserve_checkpoint_retry_evidence(
+        previous_details=merged,
+        details={
+            "price_count": 1,
+            "retried_triggered_item_count": 0,
+            "retried_triggered_symbols": [],
+        },
+        triggered_at=triggered_at,
+    )
+
+    assert recovered["retried_triggered_item_count"] == 0
+    assert recovered["retried_triggered_symbols"] == []
+    assert "last_retried_triggered_at" not in recovered
+
+
 def test_default_app_reuses_one_kis_adapter_across_parallel_callers() -> None:
     settings = Settings(
         database_url="sqlite:///:memory:",

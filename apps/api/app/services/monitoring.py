@@ -13006,12 +13006,59 @@ def _update_monitoring_checkpoint(
             account_scope=account_scope,
         )
         db.add(checkpoint)
+    details = _preserve_checkpoint_retry_evidence(
+        previous_details=checkpoint.details,
+        details=details,
+        triggered_at=triggered_at,
+    )
     checkpoint.status = status
     checkpoint.last_heartbeat_at = triggered_at
     checkpoint.last_success_at = triggered_at
     checkpoint.details = details
     db.commit()
     return checkpoint
+
+
+def _preserve_checkpoint_retry_evidence(
+    *,
+    previous_details: object,
+    details: dict[str, object],
+    triggered_at: datetime,
+) -> dict[str, object]:
+    current_retry_count = _nonnegative_int_value(
+        details.get("retried_triggered_item_count")
+    )
+    merged = dict(details)
+    if current_retry_count > 0:
+        merged["last_retried_triggered_at"] = triggered_at.isoformat()
+        return merged
+    if _nonnegative_int_value(details.get("price_count")) != 0:
+        return merged
+    if not isinstance(previous_details, dict):
+        return merged
+    previous_retry_count = _nonnegative_int_value(
+        previous_details.get("retried_triggered_item_count")
+    )
+    if previous_retry_count <= 0:
+        return merged
+    merged["retried_triggered_item_count"] = previous_retry_count
+    previous_symbols = previous_details.get("retried_triggered_symbols")
+    if isinstance(previous_symbols, list) and not merged.get("retried_triggered_symbols"):
+        merged["retried_triggered_symbols"] = [
+            symbol for symbol in previous_symbols if isinstance(symbol, str)
+        ]
+    previous_retry_at = previous_details.get("last_retried_triggered_at")
+    if isinstance(previous_retry_at, str):
+        merged["last_retried_triggered_at"] = previous_retry_at
+    return merged
+
+
+def _nonnegative_int_value(value: object) -> int:
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, int) and value > 0:
+        return value
+    return 0
 
 
 def _normalize_utc(value: datetime) -> datetime:
