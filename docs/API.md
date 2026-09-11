@@ -850,6 +850,11 @@ three supported exchanges, plus buying-power and final-boundary calls. A healthy
 long account check is therefore not reclaimed as a crashed job; recovery still
 uses the shorter bounded lease for routes with a smaller request graph.
 
+Every KIS paginated account and reconciliation read treats only `D` or `E` as
+proof of a terminal page. `F` or `M` requires the returned cursor to be followed;
+a missing, blank, or unknown `tr_cont` value invalidates the read instead of
+silently treating potentially truncated broker evidence as complete.
+
 ### `POST /execution-jobs/dispatch`
 Manually dispatch due execution jobs through the broker adapter boundary.
 

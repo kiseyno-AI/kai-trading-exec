@@ -194,8 +194,8 @@ def test_domestic_snapshot_rejects_a_repeated_continuation_cursor() -> None:
     assert len(http.get_calls) == 2
 
 
-@pytest.mark.parametrize("tr_cont", ["", "D", "E", "X"])
-def test_domestic_snapshot_treats_every_non_continuation_state_as_terminal(
+@pytest.mark.parametrize("tr_cont", ["D", "E"])
+def test_domestic_snapshot_accepts_only_documented_terminal_continuation_states(
     tr_cont: str,
 ) -> None:
     http = QueueHttpClient(
@@ -217,6 +217,42 @@ def test_domestic_snapshot_treats_every_non_continuation_state_as_terminal(
     assert snapshot.holdings_complete is True
     assert snapshot.open_orders_complete is True
     assert len(http.get_calls) == 2
+
+
+@pytest.mark.parametrize(
+    "headers, expected_state",
+    [
+        ({}, "missing"),
+        ({"tr_cont": ""}, "missing"),
+        ({"tr_cont": "X"}, "X"),
+    ],
+)
+def test_domestic_snapshot_rejects_missing_or_unknown_continuation_state(
+    headers: dict[str, str],
+    expected_state: str,
+) -> None:
+    http = QueueHttpClient(
+        [
+            JsonHttpResponse(
+                status_code=200,
+                headers=headers,
+                payload={
+                    "rt_cd": "0",
+                    "output1": [],
+                    "output2": [{"ord_psbl_cash": "1000000"}],
+                },
+            ),
+        ]
+    )
+    adapter = KisBrokerAdapter(settings=_settings(), http_client=http)
+
+    with pytest.raises(
+        BrokerAdapterError,
+        match=rf"invalid continuation state: {expected_state}",
+    ):
+        adapter.get_account_snapshot("token", exchange="KRX")
+
+    assert len(http.get_calls) == 1
 
 
 def test_domestic_order_reconciliation_finds_a_match_on_a_later_page() -> None:

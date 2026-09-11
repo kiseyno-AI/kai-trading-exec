@@ -2797,10 +2797,7 @@ def _get_kis_paginated_json(
             or response.headers.get("TR_CONT")
             or ""
         ).strip().upper()
-        # KIS documents F/M as the only states that mean another page exists.
-        # Normal terminal responses may omit tr_cont entirely, so every other
-        # value is terminal rather than evidence of incomplete coverage.
-        if continuation not in {"F", "M"}:
+        if continuation in {"D", "E"}:
             return JsonHttpResponse(
                 status_code=response.status_code,
                 headers=response.headers,
@@ -2810,6 +2807,15 @@ def _get_kis_paginated_json(
                     "page_count": page_index + 1,
                     "cursor_width": cursor_width,
                 },
+            )
+        if continuation not in {"F", "M"}:
+            continuation_label = continuation or "missing"
+            raise BrokerAdapterError(
+                f"KIS {market_label} pagination invalid continuation state: "
+                f"{continuation_label}",
+                status_code=502,
+                classification=BrokerErrorClassification.UNKNOWN,
+                response_payload=response.payload,
             )
         cursor = _pagination_cursor(response.payload, cursor_width=cursor_width)
         if cursor is None:
