@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from enum import StrEnum
 from typing import Any, Protocol
 
 from app.core.config import RuntimeMode
+from app.broker.error_safety import sanitize_broker_error_payload
 
 
 class BrokerErrorClassification(StrEnum):
@@ -64,6 +65,8 @@ class BrokerTokenGrant:
     access_token_expires_at: datetime
     refresh_token: str | None = None
     refresh_token_expires_at: datetime | None = None
+    generation: str | None = None
+    refresh_after: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -79,6 +82,7 @@ class BrokerCurrentPrice:
     price: Decimal
     observed_at: datetime
     payload: dict[str, Any]
+    freshness_source: str = "unspecified"
 
 
 @dataclass(frozen=True)
@@ -95,6 +99,20 @@ class BrokerLiveMarketContext:
     session_type: str | None = None
     normal_ordering_available: bool | None = None
     payload: dict[str, Any] = field(default_factory=dict)
+    freshness_source: str = "unspecified"
+
+
+@dataclass(frozen=True)
+class BrokerIntradayLiquiditySnapshot:
+    symbol: str
+    exchange: str
+    observed_at: datetime
+    volume: Decimal
+    turnover: Decimal
+    day_high: Decimal
+    day_low: Decimal
+    payload: dict[str, Any] = field(default_factory=dict)
+    freshness_source: str = "unspecified"
 
 
 @dataclass(frozen=True)
@@ -158,8 +176,18 @@ class BrokerAccountSnapshot:
     open_orders: list[BrokerAccountOpenOrder] = field(default_factory=list)
     symbol_buying_power: dict[str, BrokerSymbolBuyingPower] = field(default_factory=dict)
     payload: dict[str, Any] = field(default_factory=dict)
+    holdings_complete: bool = True
+    open_orders_complete: bool = True
+    diagnostics: dict[str, Any] = field(default_factory=dict)
+    # Transient broker-owned identifier used only to derive an opaque position
+    # scope. Adapters must never copy this raw value into ``payload``.
+    broker_account_id: str | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
+        if self.payload.get("holdings_coverage") == "incomplete":
+            object.__setattr__(self, "holdings_complete", False)
+        if self.payload.get("open_orders_coverage") == "incomplete":
+            object.__setattr__(self, "open_orders_complete", False)
         if not self.positions and self.holdings:
             object.__setattr__(
                 self,
@@ -243,9 +271,23 @@ class BrokerAdapterError(Exception):
         self.code = code
         self.normalized_status = normalized_status
         self.request_metadata = request_metadata or {}
-        self.response_metadata = response_metadata or {}
+        sanitized_response_metadata = sanitize_broker_error_payload(
+            response_metadata or {}
+        )
+        self.response_metadata = (
+            dict(sanitized_response_metadata)
+            if isinstance(sanitized_response_metadata, dict)
+            else {}
+        )
         self.request_payload = request_payload or {}
-        self.response_payload = response_payload or {}
+        sanitized_response_payload = sanitize_broker_error_payload(
+            response_payload or {}
+        )
+        self.response_payload = (
+            dict(sanitized_response_payload)
+            if isinstance(sanitized_response_payload, dict)
+            else {}
+        )
         self.observed_at = observed_at
 
 
@@ -281,6 +323,13 @@ class BrokerAdapter(Protocol):
         exchange: str = "KRX",
     ) -> BrokerCurrentPrice | None: ...
 
+    def is_krx_trading_day(
+        self,
+        access_token: str,
+        *,
+        market_date: date,
+    ) -> bool | None: ...
+
     def get_live_market_context(
         self,
         access_token: str,
@@ -289,6 +338,15 @@ class BrokerAdapter(Protocol):
         exchange: str = "KRX",
         reference_price: Decimal | None = None,
     ) -> BrokerLiveMarketContext | None: ...
+
+    def get_intraday_liquidity_snapshot(
+        self,
+        access_token: str,
+        *,
+        symbol: str,
+        exchange: str = "KRX",
+        reference_at: datetime,
+    ) -> BrokerIntradayLiquiditySnapshot | None: ...
 
     def get_account_snapshot(
         self,
@@ -308,6 +366,7 @@ class BrokerAdapter(Protocol):
         *,
         exchange: str = "KRX",
         submitted_at: datetime | None = None,
+        expected_symbol: str | None = None,
     ) -> dict[str, Any] | None: ...
 
     def build_headers(

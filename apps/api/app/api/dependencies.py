@@ -24,8 +24,9 @@ def get_broker_adapter(request: Request) -> BrokerAdapter:
 
 def get_broker_adapter_for_provider(request: Request, provider: str) -> BrokerAdapter:
     normalized_provider = provider.strip().lower()
-    if normalized_provider == "kis":
-        return get_broker_adapter(request)
+    default_adapter = get_broker_adapter(request)
+    if str(getattr(default_adapter, "provider", "")).strip().lower() == normalized_provider:
+        return default_adapter
     return build_broker_adapter(request.app.state.settings, provider=normalized_provider)
 
 

@@ -12,11 +12,13 @@ from app.broker.base import (
     BrokerLiveMarketContext,
 )
 from app.core.config import Settings
-from app.models.runtime import ExecutionPlanItem, ExecutionPosition
+from app.models.runtime import ExecutionPlan, ExecutionPlanItem, ExecutionPosition
 from app.services import monitoring_price_source as monitoring_price_source_module
 from app.services.monitoring_price_source import KisCurrentQuoteMonitoringPriceSource
 from app.services.monitoring_price_source import _derive_orderability_context
+from app.services.monitoring_price_source import monitoring_price_from_broker_quote
 from app.services.monitoring_price_source import next_us_regular_open
+from app.services.position_identity import build_position_identity
 from test_broker_auth import (
     KIS_PAPER_API_BASE_URL,
     StubBrokerAdapter,
@@ -121,6 +123,66 @@ def test_us_orderability_uses_new_york_regular_session_while_krx_is_closed() -> 
     assert context["orderability_source"] == "us_regular_session_clock"
 
 
+def test_terminal_newer_route_cannot_redirect_active_protective_quote() -> None:
+    settings = Settings(database_url="sqlite:///:memory:", runtime_mode="paper")
+    app, engine = build_test_app(settings=settings)
+    with app.state.db_session_factory() as db:
+        plan = ExecutionPlan(
+            external_plan_id="route-authority-plan",
+            source="test",
+            market_date=datetime(2026, 9, 9, tzinfo=UTC).date(),
+            mode="paper",
+            status="accepted",
+            items=[
+                ExecutionPlanItem(
+                    id="active-nasd-stop",
+                    plan_item_index=0,
+                    symbol="AAPL",
+                    side="sell",
+                    intent="stop_sell",
+                    status="stop_sell_monitoring",
+                    provider="kis",
+                    venue="kis",
+                    asset_class="us_equity",
+                    trigger_price=Decimal("220"),
+                    risk_context={"exchange": "NASD"},
+                    updated_at=datetime(2026, 9, 9, 13, 0, tzinfo=UTC),
+                ),
+                ExecutionPlanItem(
+                    id="newer-rejected-nyse-target",
+                    plan_item_index=1,
+                    symbol="AAPL",
+                    side="sell",
+                    intent="target_sell",
+                    status="agent_rejected",
+                    provider="kis",
+                    venue="kis",
+                    asset_class="us_equity",
+                    trigger_price=Decimal("240"),
+                    risk_context={"exchange": "NYSE"},
+                    updated_at=datetime(2026, 9, 9, 13, 5, tzinfo=UTC),
+                ),
+            ],
+        )
+        db.add(plan)
+        db.commit()
+
+        contexts = (
+            monitoring_price_source_module._load_monitoring_execution_context_by_symbol(
+                settings=Settings(runtime_mode="paper"),
+                db=db,
+                symbols=["AAPL"],
+            )
+        )
+
+    assert contexts["AAPL"]["exchange"] == "NASD"
+    assert contexts["AAPL"]["provider"] == "kis"
+    assert contexts["AAPL"]["order_contexts"] == [
+        {"side": "sell", "purpose": "protective_stop"}
+    ]
+    engine.dispose()
+
+
 def test_us_orderability_closes_on_nyse_holiday() -> None:
     context = _derive_orderability_context(
         settings=Settings(),
@@ -173,6 +235,21 @@ def test_us_orderability_closes_after_christmas_eve_early_close() -> None:
 
     assert context["session_type"] == "us_closed"
     assert context["normal_ordering_available"] is False
+
+
+def test_krx_orderability_uses_actual_buy_side_and_entry_purpose() -> None:
+    context = _derive_orderability_context(
+        settings=Settings(),
+        symbol="005930",
+        price=Decimal("71000"),
+        observed_at=datetime(2026, 6, 9, 12, 0, tzinfo=UTC),
+        exchange="KRX",
+        side="buy",
+        purpose="intraday_watch_buy",
+    )
+
+    assert context["orderability_action"] == "block"
+    assert context["orderability_reason"] == "closed_not_orderable"
 
 
 def test_kis_price_source_enriches_monitoring_price_with_live_market_context() -> None:
@@ -248,6 +325,102 @@ def test_kis_price_source_enriches_monitoring_price_with_live_market_context() -
     engine.dispose()
 
 
+def test_fresh_partial_orderbook_does_not_relabel_untrusted_bid_as_fresh() -> None:
+    stale_transport_at = datetime(2026, 9, 9, 0, 0, tzinfo=UTC)
+    fresh_exchange_at = datetime(2026, 9, 9, 0, 1, tzinfo=UTC)
+
+    price = monitoring_price_from_broker_quote(
+        settings=Settings(runtime_mode="live"),
+        quote=BrokerCurrentPrice(
+            symbol="005930",
+            exchange="KRX",
+            price=Decimal("71000"),
+            observed_at=stale_transport_at,
+            freshness_source="transport_received_at_untrusted",
+            payload={"output": {"bidp1": "70990"}},
+        ),
+        context=BrokerLiveMarketContext(
+            symbol="005930",
+            exchange="KRX",
+            observed_at=fresh_exchange_at,
+            ask=Decimal("71010"),
+            freshness_source="kis_exchange_orderbook_time",
+            payload={"endpoint": "orderbook"},
+        ),
+        context_failure=None,
+        side="sell",
+        purpose="target_sell",
+    )
+
+    assert price.observed_at == fresh_exchange_at
+    assert price.ask == Decimal("71010")
+    assert price.bid is None
+    assert price.provenance is not None
+    assert "bid" not in price.provenance["field_sources"]
+
+
+def test_kis_price_source_derives_orderability_from_actual_watch_buy() -> None:
+    observed_at = datetime(2026, 6, 9, 12, 0, tzinfo=UTC)
+    broker_adapter = LiveMarketContextAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        current_prices={"005930": Decimal("71000")},
+        current_price_observed_at=observed_at,
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+        ),
+        broker_adapter=broker_adapter,
+    )
+    with app.state.db_session_factory() as db:
+        db.add(
+            ExecutionPlan(
+                external_plan_id="plan-buy-orderability",
+                source="test",
+                mode="paper",
+                items=[
+                    ExecutionPlanItem(
+                        symbol="005930",
+                        side="buy",
+                        intent="intraday_watch_buy",
+                        status="watch_monitoring_active",
+                        trigger_price=Decimal("71000"),
+                        risk_context={"exchange": "KRX"},
+                    )
+                ],
+            )
+        )
+        db.commit()
+    price_source = KisCurrentQuoteMonitoringPriceSource(
+        settings=app.state.settings,
+        session_factory=app.state.db_session_factory,
+        broker_adapter_factory=lambda _settings: broker_adapter,
+    )
+
+    prices = price_source.get_prices(
+        symbols=["005930"],
+        observed_at=observed_at,
+        settings=app.state.settings,
+    )
+
+    assert len(prices) == 1
+    assert prices[0].normal_ordering_available is False
+    assert prices[0].provenance is not None
+    assert prices[0].provenance["session"]["action"] == "block"
+    assert prices[0].provenance["session"]["reason"] == "closed_not_orderable"
+    engine.dispose()
+
+
 def test_kis_price_source_keeps_quote_and_reports_context_enrichment_failure() -> None:
     observed_at = datetime(2026, 6, 9, 1, 5, tzinfo=UTC)
     broker_adapter = LiveMarketContextAdapter(
@@ -314,6 +487,84 @@ def test_kis_price_source_keeps_quote_and_reports_context_enrichment_failure() -
             "reason": "KIS orderbook endpoint timed out",
         }
     ]
+    engine.dispose()
+
+
+def test_kis_price_source_enriches_contexts_concurrently_with_deterministic_order() -> None:
+    observed_at = datetime(2026, 6, 9, 1, 5, tzinfo=UTC)
+    active_context_calls = 0
+    max_active_context_calls = 0
+    concurrent_calls_entered = threading.Event()
+    call_lock = threading.Lock()
+
+    class ConcurrentContextAdapter(LiveMarketContextAdapter):
+        def get_live_market_context(
+            self,
+            access_token: str,
+            *,
+            symbol: str,
+            exchange: str = "KRX",
+            reference_price: Decimal | None = None,
+        ) -> BrokerLiveMarketContext | None:
+            nonlocal active_context_calls, max_active_context_calls
+            del reference_price
+            assert access_token
+            with call_lock:
+                active_context_calls += 1
+                max_active_context_calls = max(max_active_context_calls, active_context_calls)
+                if active_context_calls >= 2:
+                    concurrent_calls_entered.set()
+            try:
+                assert concurrent_calls_entered.wait(timeout=1)
+                return BrokerLiveMarketContext(
+                    symbol=symbol,
+                    exchange=exchange,
+                    observed_at=observed_at,
+                    bid=Decimal("99"),
+                    ask=Decimal("101"),
+                    orderbook_depth=Decimal("1000"),
+                )
+            finally:
+                with call_lock:
+                    active_context_calls -= 1
+
+    symbols = ["000003", "000001", "000002"]
+    broker_adapter = ConcurrentContextAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        current_prices={symbol: Decimal("100") for symbol in symbols},
+        current_price_observed_at=observed_at,
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+        ),
+        broker_adapter=broker_adapter,
+    )
+    price_source = KisCurrentQuoteMonitoringPriceSource(
+        settings=app.state.settings,
+        session_factory=app.state.db_session_factory,
+        broker_adapter_factory=lambda _settings: broker_adapter,
+    )
+
+    prices = price_source.get_prices(
+        symbols=symbols,
+        observed_at=observed_at,
+        settings=app.state.settings,
+    )
+
+    assert [price.symbol for price in prices] == symbols
+    assert 2 <= max_active_context_calls <= monitoring_price_source_module.MAX_QUOTE_WORKERS
+    assert price_source.get_last_diagnostics()["context_failure_count"] == 0
     engine.dispose()
 
 
@@ -412,16 +663,17 @@ def test_autonomous_monitoring_keeps_partial_prices_when_one_live_quote_fails() 
             )
         },
     )
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        kis_app_key="paper-key",
+        kis_app_secret="paper-secret",
+        kis_account_number="12345678",
+        dispatch_loop_interval_seconds=60,
+        monitoring_loop_interval_seconds=0.05,
+    )
     app, engine = build_test_app(
-        settings=Settings(
-            database_url="sqlite:///:memory:",
-            runtime_mode="paper",
-            kis_app_key="paper-key",
-            kis_app_secret="paper-secret",
-            kis_account_number="12345678",
-            dispatch_loop_interval_seconds=60,
-            monitoring_loop_interval_seconds=0.05,
-        ),
+        settings=settings,
         broker_adapter=broker_adapter,
         autonomous_runtime_enabled=True,
     )
@@ -436,7 +688,7 @@ def test_autonomous_monitoring_keeps_partial_prices_when_one_live_quote_fails() 
             "/execution-plans",
             json={
                 "plan_id": "plan-autonomous-monitoring-partial-quotes",
-                "source": "kai-trading-core",
+                "source": "test-fixture",
                 "items": [
                     {
                         "symbol": "005930",
@@ -461,12 +713,20 @@ def test_autonomous_monitoring_keeps_partial_prices_when_one_live_quote_fails() 
         )
         assert plan_response.status_code == 201
         first_item_id, second_item_id = plan_response.json()["persisted_execution_item_ids"]
+        identity = build_position_identity(
+            settings=settings,
+            provider="kis",
+            exchange="KRX",
+        )
 
         with app.state.db_session_factory() as session:
             session.add_all(
                 [
                     ExecutionPosition(
                         mode="paper",
+                        provider=identity.provider,
+                        account_scope=identity.account_scope,
+                        exchange=identity.exchange,
                         symbol="005930",
                         quantity=1,
                         average_price=Decimal("120000.0000"),
@@ -476,6 +736,9 @@ def test_autonomous_monitoring_keeps_partial_prices_when_one_live_quote_fails() 
                     ),
                     ExecutionPosition(
                         mode="paper",
+                        provider=identity.provider,
+                        account_scope=identity.account_scope,
+                        exchange=identity.exchange,
                         symbol="000660",
                         quantity=1,
                         average_price=Decimal("88000.0000"),
@@ -487,13 +750,19 @@ def test_autonomous_monitoring_keeps_partial_prices_when_one_live_quote_fails() 
             )
             session.commit()
 
-        wait_for(
-            lambda: (
-                client.get("/runtime/status")
-                .json()["liveness"]["autonomous"]["monitoring"]["price_source"]["last_price_count"]
-                == 1
+        def monitoring_cycle_covers_both_positions() -> bool:
+            response = client.get("/runtime/status")
+            if response.status_code != 200:
+                return False
+            monitoring = response.json()["liveness"]["autonomous"]["monitoring"]
+            last_cycle = monitoring.get("last_cycle")
+            return bool(
+                monitoring["price_source"]["last_price_count"] == 1
+                and isinstance(last_cycle, dict)
+                and last_cycle.get("evaluated_item_count") == 2
             )
-        )
+
+        wait_for(monitoring_cycle_covers_both_positions)
 
         runtime_status = client.get("/runtime/status")
         assert runtime_status.status_code == 200

@@ -28,6 +28,11 @@ from app.broker.base import (
     NormalizedBrokerOrderStatus,
 )
 from app.core.config import Settings
+from app.broker.error_safety import (
+    safe_broker_error_code,
+    safe_broker_error_message,
+    sanitize_broker_error_payload,
+)
 
 ALPACA_PROVIDER = "alpaca"
 ALPACA_LIVE_API_BASE_URL = "https://api.alpaca.markets"
@@ -43,6 +48,7 @@ ALPACA_LATEST_QUOTES_PATH = "/v1beta3/crypto/us/latest/quotes"
 ALPACA_STOCK_BARS_PATH = "/v2/stocks/bars"
 ALPACA_STOCK_LATEST_QUOTES_PATH = "/v2/stocks/quotes/latest"
 ALPACA_CLOCK_PATH = "/v2/clock"
+ALPACA_OPEN_ORDERS_PAGE_LIMIT = 500
 
 
 @dataclass(frozen=True)
@@ -115,7 +121,7 @@ class UrllibAlpacaHttpClient:
             ) from exc
         except URLError as exc:
             raise BrokerAdapterError(
-                f"Alpaca request failed: {exc.reason}",
+                safe_broker_error_message(exc.reason),
                 status_code=503,
                 classification=BrokerErrorClassification.NETWORK,
                 retryable=True,
@@ -270,13 +276,19 @@ class AlpacaBrokerAdapter:
         price = _optional_decimal(trade.get("p") or trade.get("price"))
         if price is None or price <= 0:
             return None
-        observed_at = _parse_timestamp(trade.get("t") or trade.get("timestamp")) or datetime.now(UTC)
+        exchange_observed_at = _parse_timestamp(trade.get("t") or trade.get("timestamp"))
+        observed_at = exchange_observed_at or datetime.now(UTC)
         return BrokerCurrentPrice(
             symbol=normalized_symbol,
             exchange=exchange,
             price=price,
             observed_at=observed_at,
             payload={"provider": self.provider, "endpoint": ALPACA_LATEST_TRADES_PATH, **trade},
+            freshness_source=(
+                "alpaca_exchange_trade_time"
+                if exchange_observed_at is not None
+                else "transport_received_at_untrusted"
+            ),
         )
 
     def get_crypto_daily_bars(
@@ -448,7 +460,10 @@ class AlpacaBrokerAdapter:
         spread = ask - bid if bid is not None and ask is not None and ask >= bid else None
         midpoint = (ask + bid) / 2 if bid is not None and ask is not None and ask + bid > 0 else None
         spread_bps = (spread / midpoint * Decimal("10000")) if spread is not None and midpoint else None
-        observed_at = _parse_timestamp(quote_payload.get("t") or quote_payload.get("timestamp")) or datetime.now(UTC)
+        exchange_observed_at = _parse_timestamp(
+            quote_payload.get("t") or quote_payload.get("timestamp")
+        )
+        observed_at = exchange_observed_at or datetime.now(UTC)
         return BrokerLiveMarketContext(
             symbol=normalized_symbol,
             exchange=exchange,
@@ -459,6 +474,11 @@ class AlpacaBrokerAdapter:
             spread_bps=spread_bps,
             session_type="us_equity_regular",
             payload={"provider": self.provider, "endpoint": ALPACA_STOCK_LATEST_QUOTES_PATH, **quote_payload},
+            freshness_source=(
+                "alpaca_exchange_quote_time"
+                if exchange_observed_at is not None
+                else "transport_received_at_untrusted"
+            ),
         )
 
     def get_market_clock(self, access_token: str) -> dict[str, Any]:
@@ -494,7 +514,10 @@ class AlpacaBrokerAdapter:
         spread = ask - bid if bid is not None and ask is not None and ask >= bid else None
         midpoint = (ask + bid) / 2 if bid is not None and ask is not None and ask + bid > 0 else None
         spread_bps = (spread / midpoint * Decimal("10000")) if spread is not None and midpoint else None
-        observed_at = _parse_timestamp(quote_payload.get("t") or quote_payload.get("timestamp")) or datetime.now(UTC)
+        exchange_observed_at = _parse_timestamp(
+            quote_payload.get("t") or quote_payload.get("timestamp")
+        )
+        observed_at = exchange_observed_at or datetime.now(UTC)
         return BrokerLiveMarketContext(
             symbol=normalized_symbol,
             exchange=exchange,
@@ -506,6 +529,11 @@ class AlpacaBrokerAdapter:
             session_type="crypto_24_7",
             normal_ordering_available=True,
             payload={"provider": self.provider, "endpoint": ALPACA_LATEST_QUOTES_PATH, **quote_payload},
+            freshness_source=(
+                "alpaca_exchange_quote_time"
+                if exchange_observed_at is not None
+                else "transport_received_at_untrusted"
+            ),
         )
 
     def get_account_snapshot(
@@ -516,7 +544,13 @@ class AlpacaBrokerAdapter:
         reference_prices: dict[str, Decimal] | None = None,
         exchange: str = "ALPACA",
     ) -> BrokerAccountSnapshot:
-        del access_token, reference_prices, exchange
+        normalized_exchange = str(exchange or "").strip().upper()
+        if normalized_exchange in {"US", "AMEX", "NASD", "NASDAQ", "NYSE"}:
+            return self.get_us_equity_account_snapshot(
+                access_token,
+                symbols=symbols,
+            )
+        del access_token, reference_prices
         account_response = self._request(
             method="GET",
             url=f"{_trading_base_url(self.settings)}{ALPACA_ACCOUNT_PATH}",
@@ -530,20 +564,39 @@ class AlpacaBrokerAdapter:
         orders_response = self._request(
             method="GET",
             url=f"{_trading_base_url(self.settings)}{ALPACA_ORDERS_PATH}",
-            params={"status": "open", "asset_class": "crypto", "limit": 500},
+            params={
+                "status": "open",
+                "asset_class": "crypto",
+                "limit": ALPACA_OPEN_ORDERS_PAGE_LIMIT,
+            },
         )
         allowed = {_normalize_symbol(value) for value in symbols} if symbols else None
-        holdings = [
-            _holding_from_position(item)
-            for item in _list_payload(positions_response.payload, context="Alpaca positions")
-            if _is_crypto_position(item) and (allowed is None or _normalize_symbol(str(item.get("symbol") or "")) in allowed)
-        ]
-        open_orders = [
-            _open_order_from_payload(item)
-            for item in _list_payload(orders_response.payload, context="Alpaca open orders")
-            if _is_crypto_order(item) and (allowed is None or _normalize_symbol(str(item.get("symbol") or "")) in allowed)
-        ]
+        holdings, holdings_parse, holdings_parse_complete = _snapshot_holdings(
+            positions_response.payload,
+            asset_class="crypto",
+            allowed=allowed,
+        )
+        open_orders, open_orders_parse, open_orders_parse_complete = (
+            _snapshot_open_orders(
+                orders_response.payload,
+                asset_class="crypto",
+                allowed=allowed,
+            )
+        )
+        raw_open_orders = (
+            orders_response.payload if isinstance(orders_response.payload, list) else []
+        )
+        open_orders_coverage = _open_orders_coverage_payload(raw_open_orders)
+        account_id = _snapshot_identity(account.get("id"))
+        account_identity = _account_identity_diagnostics(account_id)
+        holdings_complete = account_id is not None and holdings_parse_complete
+        open_orders_complete = (
+            account_id is not None
+            and open_orders_parse_complete
+            and open_orders_coverage["open_orders_coverage"] == "complete"
+        )
         return BrokerAccountSnapshot(
+            broker_account_id=account_id,
             available_cash=_optional_decimal(account.get("cash")),
             buying_power=_optional_decimal(account.get("non_marginable_buying_power")),
             total_asset_value=_optional_decimal(account.get("portfolio_value")),
@@ -552,12 +605,36 @@ class AlpacaBrokerAdapter:
             source=f"alpaca:{self.settings.runtime_mode}",
             holdings=holdings,
             open_orders=open_orders,
+            holdings_complete=holdings_complete,
+            open_orders_complete=open_orders_complete,
+            diagnostics={
+                "account_identity": account_identity,
+                "holdings_parse": holdings_parse,
+                "open_orders_parse": open_orders_parse,
+            },
             payload={
                 "provider": self.provider,
                 "mode": self.settings.runtime_mode,
                 "account": _redacted_account_payload(account),
+                **open_orders_coverage,
+                "holdings_coverage": (
+                    "complete" if holdings_complete else "incomplete"
+                ),
+                "open_orders_coverage": (
+                    "complete" if open_orders_complete else "incomplete"
+                ),
             },
         )
+
+    def get_broker_account_id(self, access_token: str) -> str | None:
+        """Return Alpaca's stable account id without loading holdings or orders."""
+        del access_token
+        response = self._request(
+            method="GET",
+            url=f"{_trading_base_url(self.settings)}{ALPACA_ACCOUNT_PATH}",
+        )
+        account = _dict_payload(response.payload, context="Alpaca account identity")
+        return _snapshot_identity(account.get("id"))
 
     def get_us_equity_account_snapshot(
         self,
@@ -579,22 +656,39 @@ class AlpacaBrokerAdapter:
         orders_response = self._request(
             method="GET",
             url=f"{_trading_base_url(self.settings)}{ALPACA_ORDERS_PATH}",
-            params={"status": "open", "asset_class": "us_equity", "limit": 500},
+            params={
+                "status": "open",
+                "asset_class": "us_equity",
+                "limit": ALPACA_OPEN_ORDERS_PAGE_LIMIT,
+            },
         )
         allowed = {_normalize_equity_symbol(value) for value in symbols} if symbols else None
-        holdings = [
-            _holding_from_position(item)
-            for item in _list_payload(positions_response.payload, context="Alpaca positions")
-            if _is_us_equity_position(item)
-            and (allowed is None or _normalize_equity_symbol(str(item.get("symbol") or "")) in allowed)
-        ]
-        open_orders = [
-            _open_order_from_payload(item)
-            for item in _list_payload(orders_response.payload, context="Alpaca open orders")
-            if _is_us_equity_order(item)
-            and (allowed is None or _normalize_equity_symbol(str(item.get("symbol") or "")) in allowed)
-        ]
+        holdings, holdings_parse, holdings_parse_complete = _snapshot_holdings(
+            positions_response.payload,
+            asset_class="us_equity",
+            allowed=allowed,
+        )
+        open_orders, open_orders_parse, open_orders_parse_complete = (
+            _snapshot_open_orders(
+                orders_response.payload,
+                asset_class="us_equity",
+                allowed=allowed,
+            )
+        )
+        raw_open_orders = (
+            orders_response.payload if isinstance(orders_response.payload, list) else []
+        )
+        open_orders_coverage = _open_orders_coverage_payload(raw_open_orders)
+        account_id = _snapshot_identity(account.get("id"))
+        account_identity = _account_identity_diagnostics(account_id)
+        holdings_complete = account_id is not None and holdings_parse_complete
+        open_orders_complete = (
+            account_id is not None
+            and open_orders_parse_complete
+            and open_orders_coverage["open_orders_coverage"] == "complete"
+        )
         return BrokerAccountSnapshot(
+            broker_account_id=account_id,
             available_cash=_optional_decimal(account.get("cash")),
             buying_power=_optional_decimal(account.get("non_marginable_buying_power")),
             total_asset_value=_optional_decimal(account.get("portfolio_value")),
@@ -603,11 +697,25 @@ class AlpacaBrokerAdapter:
             source=f"alpaca:{self.settings.runtime_mode}:us_equity",
             holdings=holdings,
             open_orders=open_orders,
+            holdings_complete=holdings_complete,
+            open_orders_complete=open_orders_complete,
+            diagnostics={
+                "account_identity": account_identity,
+                "holdings_parse": holdings_parse,
+                "open_orders_parse": open_orders_parse,
+            },
             payload={
                 "provider": self.provider,
                 "mode": self.settings.runtime_mode,
                 "asset_class": "us_equity",
                 "account": _redacted_account_payload(account),
+                **open_orders_coverage,
+                "holdings_coverage": (
+                    "complete" if holdings_complete else "incomplete"
+                ),
+                "open_orders_coverage": (
+                    "complete" if open_orders_complete else "incomplete"
+                ),
             },
         )
 
@@ -630,19 +738,57 @@ class AlpacaBrokerAdapter:
         *,
         exchange: str = "ALPACA",
         submitted_at: datetime | None = None,
+        expected_symbol: str | None = None,
     ) -> dict[str, Any] | None:
-        del access_token, exchange, submitted_at
+        del access_token, submitted_at
+        normalized_exchange = str(exchange or "").strip().upper()
+        normalize_reconcile_symbol = (
+            _normalize_symbol
+            if normalized_exchange == "ALPACA"
+            else _normalize_equity_symbol
+        )
         response = self._request(
             method="GET",
             url=f"{_trading_base_url(self.settings)}{ALPACA_ORDERS_PATH}/{quote(broker_order_id, safe='')}",
         )
         order = _dict_payload(response.payload, context="Alpaca order")
+        response_order_id = _snapshot_identity(order.get("id"))
+        response_symbol = _snapshot_identity(order.get("symbol"))
+        normalized_response_symbol = (
+            normalize_reconcile_symbol(response_symbol)
+            if response_symbol is not None
+            else None
+        )
+        identity_mismatch = response_order_id != broker_order_id
+        if expected_symbol is not None:
+            identity_mismatch = identity_mismatch or (
+                normalized_response_symbol is None
+                or normalized_response_symbol
+                != normalize_reconcile_symbol(expected_symbol)
+            )
+        if identity_mismatch:
+            raise BrokerAdapterError(
+                "Alpaca reconciliation response identity did not match the requested order",
+                status_code=502,
+                classification=BrokerErrorClassification.TRANSIENT,
+                retryable=True,
+                code="alpaca_reconcile_identity_mismatch",
+                response_metadata=_safe_error_payload(
+                    {
+                        "provider": self.provider,
+                        "request_id": response.headers.get("x-request-id"),
+                    }
+                ),
+                response_payload={"identity_match": False},
+                observed_at=datetime.now(UTC),
+            )
         status = _normalized_order_status(str(order.get("status") or ""))
         filled_base_quantity = _optional_decimal(order.get("filled_qty")) or Decimal("0")
         average_fill_price = _optional_decimal(order.get("filled_avg_price"))
         return {
             "provider": self.provider,
-            "broker_order_id": str(order.get("id") or broker_order_id),
+            "broker_order_id": response_order_id,
+            "symbol": normalized_response_symbol,
             "status": status.value,
             "broker_status": str(order.get("status") or ""),
             "filled_base_quantity": str(filled_base_quantity),
@@ -651,7 +797,7 @@ class AlpacaBrokerAdapter:
             "observed_at": datetime.now(UTC).isoformat(),
             "request_metadata": {
                 "provider": self.provider,
-                "exchange": "ALPACA",
+                "exchange": normalized_exchange,
                 "endpoint": f"{ALPACA_ORDERS_PATH}/{{order_id}}",
             },
             "response_metadata": {
@@ -792,7 +938,11 @@ class AlpacaBrokerAdapter:
             raise _validation_error("Alpaca limit orders require limit_price")
         if request.quote_notional is not None and not (request.side == "buy" and request.order_type == "market"):
             raise _validation_error("Alpaca quote_notional is only supported for market buys")
-        normalized_symbol = _normalize_symbol(request.symbol)
+        normalized_symbol = (
+            _normalize_symbol(request.symbol)
+            if request.asset_class == "crypto"
+            else _normalize_equity_symbol(request.symbol)
+        )
         allowed_symbols = (
             _allowed_symbols(self.settings)
             if request.asset_class == "crypto"
@@ -853,7 +1003,11 @@ def _normalize_equity_symbol(value: str) -> str:
 
 def _order_request_payload(request: BrokerOrderPlacementRequest) -> dict[str, object]:
     payload: dict[str, object] = {
-        "symbol": _normalize_symbol(request.symbol),
+        "symbol": (
+            _normalize_symbol(request.symbol)
+            if request.asset_class == "crypto"
+            else _normalize_equity_symbol(request.symbol)
+        ),
         "side": request.side,
         "type": request.order_type,
         "time_in_force": request.time_in_force,
@@ -868,12 +1022,229 @@ def _order_request_payload(request: BrokerOrderPlacementRequest) -> dict[str, ob
     return payload
 
 
-def _holding_from_position(payload: dict[str, Any]) -> BrokerAccountHolding:
+def _snapshot_identity(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    return normalized or None
+
+
+def _account_identity_diagnostics(account_id: str | None) -> dict[str, object]:
+    if account_id is not None:
+        return {"complete": True}
+    return {
+        "complete": False,
+        "reason": "missing_or_malformed_account_id",
+    }
+
+
+def _snapshot_symbol(payload: dict[str, Any], *, asset_class: str) -> str | None:
+    raw_symbol = _snapshot_identity(payload.get("symbol"))
+    if raw_symbol is None:
+        return None
+    if asset_class == "crypto":
+        return _normalize_symbol(raw_symbol)
+    return _normalize_equity_symbol(raw_symbol)
+
+
+def _snapshot_asset_class_match(
+    payload: dict[str, Any],
+    *,
+    asset_class: str,
+) -> bool | None:
+    reported_asset_class = str(payload.get("asset_class") or "").strip().lower()
+    if reported_asset_class in {"crypto", "equity", "us_equity"}:
+        reported_class = (
+            "crypto" if reported_asset_class == "crypto" else "us_equity"
+        )
+        return reported_class == asset_class
+    if "/" in str(payload.get("symbol") or ""):
+        return asset_class == "crypto"
+    return None
+
+
+def _snapshot_parse_diagnostics(
+    *,
+    raw_row_count: int,
+    parsed_identities: list[str],
+    omitted_row_count: int,
+    invalid_row_count: int,
+) -> dict[str, int]:
+    return {
+        "raw_row_count": raw_row_count,
+        "parsed_row_count": len(parsed_identities),
+        "omitted_row_count": omitted_row_count,
+        "invalid_row_count": invalid_row_count,
+        "duplicate_identity_count": len(parsed_identities)
+        - len(set(parsed_identities)),
+    }
+
+
+def _snapshot_parse_complete(
+    *,
+    response_is_list: bool,
+    diagnostics: dict[str, int],
+) -> bool:
+    return bool(
+        response_is_list
+        and diagnostics["raw_row_count"]
+        == diagnostics["parsed_row_count"] + diagnostics["omitted_row_count"]
+        + diagnostics["invalid_row_count"]
+        and diagnostics["invalid_row_count"] == 0
+        and diagnostics["duplicate_identity_count"] == 0
+    )
+
+
+def _snapshot_holdings(
+    value: object | None,
+    *,
+    asset_class: str,
+    allowed: set[str] | None,
+) -> tuple[list[BrokerAccountHolding], dict[str, int], bool]:
+    response_is_list = isinstance(value, list)
+    raw_rows = value if response_is_list else []
+    holdings: list[BrokerAccountHolding] = []
+    identities: list[str] = []
+    omitted_row_count = 0
+    invalid_row_count = 0 if response_is_list else 1
+    for raw_row in raw_rows:
+        if not isinstance(raw_row, dict):
+            invalid_row_count += 1
+            continue
+        asset_class_match = _snapshot_asset_class_match(
+            raw_row,
+            asset_class=asset_class,
+        )
+        if asset_class_match is False:
+            omitted_row_count += 1
+            continue
+        if asset_class_match is None:
+            invalid_row_count += 1
+            continue
+        symbol = _snapshot_symbol(raw_row, asset_class=asset_class)
+        quantity = _optional_decimal(raw_row.get("qty"))
+        if symbol is None or quantity is None or quantity < 0:
+            invalid_row_count += 1
+            continue
+        if quantity == 0 or (allowed is not None and symbol not in allowed):
+            omitted_row_count += 1
+            continue
+        holdings.append(
+            _holding_from_position(raw_row, asset_class=asset_class)
+        )
+        identities.append(symbol)
+    diagnostics = _snapshot_parse_diagnostics(
+        raw_row_count=len(raw_rows),
+        parsed_identities=identities,
+        omitted_row_count=omitted_row_count,
+        invalid_row_count=invalid_row_count,
+    )
+    return (
+        holdings,
+        diagnostics,
+        _snapshot_parse_complete(
+            response_is_list=response_is_list,
+            diagnostics=diagnostics,
+        ),
+    )
+
+
+_ALPACA_TERMINAL_ORDER_STATUSES = frozenset(
+    {
+        "canceled",
+        "cancelled",
+        "done_for_day",
+        "expired",
+        "filled",
+        "rejected",
+        "replaced",
+    }
+)
+
+
+def _snapshot_open_orders(
+    value: object | None,
+    *,
+    asset_class: str,
+    allowed: set[str] | None,
+) -> tuple[list[BrokerAccountOpenOrder], dict[str, int], bool]:
+    response_is_list = isinstance(value, list)
+    raw_rows = value if response_is_list else []
+    open_orders: list[BrokerAccountOpenOrder] = []
+    identities: list[str] = []
+    omitted_row_count = 0
+    invalid_row_count = 0 if response_is_list else 1
+    for raw_row in raw_rows:
+        if not isinstance(raw_row, dict):
+            invalid_row_count += 1
+            continue
+        asset_class_match = _snapshot_asset_class_match(
+            raw_row,
+            asset_class=asset_class,
+        )
+        if asset_class_match is False:
+            omitted_row_count += 1
+            continue
+        if asset_class_match is None:
+            invalid_row_count += 1
+            continue
+        status = str(raw_row.get("status") or "").strip().lower()
+        if status in _ALPACA_TERMINAL_ORDER_STATUSES:
+            omitted_row_count += 1
+            continue
+        symbol = _snapshot_symbol(raw_row, asset_class=asset_class)
+        broker_order_id = _snapshot_identity(raw_row.get("id"))
+        side = str(raw_row.get("side") or "").strip().lower()
+        quantity = _optional_decimal(raw_row.get("qty"))
+        filled_quantity = _optional_decimal(raw_row.get("filled_qty"))
+        if (
+            symbol is None
+            or broker_order_id is None
+            or side not in {"buy", "sell"}
+            or quantity is None
+            or filled_quantity is None
+            or quantity < 0
+            or filled_quantity < 0
+            or filled_quantity > quantity
+        ):
+            invalid_row_count += 1
+            continue
+        if (
+            quantity == 0
+            or filled_quantity == quantity
+            or (allowed is not None and symbol not in allowed)
+        ):
+            omitted_row_count += 1
+            continue
+        open_orders.append(
+            _open_order_from_payload(raw_row, asset_class=asset_class)
+        )
+        identities.append(broker_order_id)
+    diagnostics = _snapshot_parse_diagnostics(
+        raw_row_count=len(raw_rows),
+        parsed_identities=identities,
+        omitted_row_count=omitted_row_count,
+        invalid_row_count=invalid_row_count,
+    )
+    return (
+        open_orders,
+        diagnostics,
+        _snapshot_parse_complete(
+            response_is_list=response_is_list,
+            diagnostics=diagnostics,
+        ),
+    )
+
+
+def _holding_from_position(
+    payload: dict[str, Any],
+    *,
+    asset_class: str,
+) -> BrokerAccountHolding:
     base_quantity = _optional_decimal(payload.get("qty")) or Decimal("0")
-    asset_class = str(payload.get("asset_class") or "").lower()
     symbol = (
         _normalize_symbol(str(payload.get("symbol") or ""))
-        if asset_class == "crypto" or "/" in str(payload.get("symbol") or "")
+        if asset_class == "crypto"
         else _normalize_equity_symbol(str(payload.get("symbol") or ""))
     )
     return BrokerAccountHolding(
@@ -885,7 +1256,7 @@ def _holding_from_position(payload: dict[str, Any]) -> BrokerAccountHolding:
         unrealized_pnl_pct=_optional_decimal(payload.get("unrealized_plpc")),
         payload={
             "provider": ALPACA_PROVIDER,
-            "asset_class": asset_class or "unknown",
+            "asset_class": str(payload.get("asset_class") or "unknown").lower(),
             "base_quantity": _decimal_text(base_quantity),
             "market_value": payload.get("market_value"),
             "current_price": payload.get("current_price"),
@@ -894,12 +1265,20 @@ def _holding_from_position(payload: dict[str, Any]) -> BrokerAccountHolding:
     )
 
 
-def _open_order_from_payload(payload: dict[str, Any]) -> BrokerAccountOpenOrder:
+def _open_order_from_payload(
+    payload: dict[str, Any],
+    *,
+    asset_class: str,
+) -> BrokerAccountOpenOrder:
     base_quantity = _optional_decimal(payload.get("qty")) or Decimal("0")
     filled = _optional_decimal(payload.get("filled_qty")) or Decimal("0")
     remaining = max(base_quantity - filled, Decimal("0"))
     return BrokerAccountOpenOrder(
-        symbol=_normalize_symbol(str(payload.get("symbol") or "")),
+        symbol=(
+            _normalize_symbol(str(payload.get("symbol") or ""))
+            if asset_class == "crypto"
+            else _normalize_equity_symbol(str(payload.get("symbol") or ""))
+        ),
         side=str(payload.get("side") or "").lower(),
         quantity=0,
         remaining_quantity=0,
@@ -915,22 +1294,6 @@ def _open_order_from_payload(payload: dict[str, Any]) -> BrokerAccountOpenOrder:
             "raw": payload,
         },
     )
-
-
-def _is_crypto_position(payload: dict[str, Any]) -> bool:
-    return str(payload.get("asset_class") or "").lower() == "crypto" or "/" in str(payload.get("symbol") or "")
-
-
-def _is_crypto_order(payload: dict[str, Any]) -> bool:
-    return str(payload.get("asset_class") or "").lower() == "crypto" or "/" in str(payload.get("symbol") or "")
-
-
-def _is_us_equity_position(payload: dict[str, Any]) -> bool:
-    return str(payload.get("asset_class") or "").lower() in {"us_equity", "equity"}
-
-
-def _is_us_equity_order(payload: dict[str, Any]) -> bool:
-    return str(payload.get("asset_class") or "").lower() in {"us_equity", "equity"}
 
 
 def _validate_account_ready(account: dict[str, Any], *, require_crypto: bool = True) -> None:
@@ -1020,7 +1383,9 @@ def _alpaca_http_error(
     payload: object | None,
 ) -> BrokerAdapterError:
     body = payload if isinstance(payload, dict) else {}
-    message = str(body.get("message") or body.get("error") or f"Alpaca HTTP {status_code}")
+    raw_message = str(
+        body.get("message") or body.get("error") or f"Alpaca HTTP {status_code}"
+    )
     code = _optional_string(body.get("code"))
     if status_code in {401, 403}:
         classification = BrokerErrorClassification.AUTH
@@ -1043,14 +1408,19 @@ def _alpaca_http_error(
         retryable = False
         normalized = NormalizedBrokerOrderStatus.FAILED
     return BrokerAdapterError(
-        message,
+        safe_broker_error_message(raw_message),
         status_code=status_code,
         classification=classification,
         retryable=retryable,
-        code=code,
+        code=safe_broker_error_code(code, provider=ALPACA_PROVIDER),
         normalized_status=normalized,
-        response_metadata={"provider": ALPACA_PROVIDER, "request_id": headers.get("x-request-id")},
-        response_payload=body,
+        response_metadata=_safe_error_payload(
+            {
+                "provider": ALPACA_PROVIDER,
+                "request_id": headers.get("x-request-id"),
+            }
+        ),
+        response_payload=_safe_error_payload(body),
         observed_at=datetime.now(UTC),
     )
 
@@ -1077,22 +1447,47 @@ def _list_payload(value: object | None, *, context: str) -> list[dict[str, Any]]
     return [item for item in value if isinstance(item, dict)]
 
 
+def _open_orders_coverage_payload(
+    raw_open_orders: list[object],
+) -> dict[str, object]:
+    if len(raw_open_orders) < ALPACA_OPEN_ORDERS_PAGE_LIMIT:
+        return {"open_orders_coverage": "complete"}
+    # Alpaca's open-order response may be truncated at the requested limit.
+    # Until pagination is proven complete, consumers must reserve
+    # conservatively and block new exposure/exit orders.
+    return {
+        "open_orders_coverage": "incomplete",
+        "open_orders_error": {
+            "code": "alpaca_open_orders_page_limit_reached",
+            "degraded": True,
+            "limit": ALPACA_OPEN_ORDERS_PAGE_LIMIT,
+            "returned_count": len(raw_open_orders),
+        },
+    }
+
+
 def _parse_json(raw_body: str) -> object | None:
     if not raw_body.strip():
         return None
     try:
         return json.loads(raw_body)
     except json.JSONDecodeError:
-        return {"message": raw_body[:1000]}
+        return {"body_diagnostic": safe_broker_error_message(raw_body)}
+
+
+def _safe_error_payload(payload: object) -> dict[str, Any]:
+    sanitized = sanitize_broker_error_payload(payload)
+    return dict(sanitized) if isinstance(sanitized, dict) else {}
 
 
 def _optional_decimal(value: object) -> Decimal | None:
     if value is None or value == "":
         return None
     try:
-        return Decimal(str(value))
+        parsed = Decimal(str(value))
     except (InvalidOperation, ValueError):
         return None
+    return parsed if parsed.is_finite() else None
 
 
 def _optional_string(value: object) -> str | None:

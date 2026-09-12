@@ -19,7 +19,16 @@ def health(
 ) -> dict[str, object]:
     settings: Settings = get_settings(request)
     runtime: RuntimeMetadata = get_runtime_metadata(request)
-    payload = build_health_payload(settings=settings, runtime=runtime, db=db)
+    payload = build_health_payload(
+        settings=settings,
+        runtime=runtime,
+        db=db,
+        runtime_startup_gate=getattr(
+            request.app.state,
+            "runtime_startup_gate",
+            None,
+        ),
+    )
     dependencies = payload.get("dependencies")
     if isinstance(dependencies, dict):
         database = dependencies.get("database")

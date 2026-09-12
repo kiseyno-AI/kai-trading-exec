@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta, tzinfo
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from functools import partial
 import json
@@ -28,6 +28,7 @@ from app.broker.base import (
     BrokerAccountSnapshot,
     BrokerAdapter,
     BrokerAdapterError,
+    BrokerIntradayLiquiditySnapshot,
     NormalizedBrokerOrderStatus,
 )
 from app.core.config import Settings
@@ -46,6 +47,29 @@ from app.services.broker_auth import ensure_authenticated_broker_session
 from app.services.broker_order_state import CAPITAL_RESERVING_ORDER_STATUSES
 from app.services.fill_economics import effective_fill_quantity
 from app.services.fill_idempotency import dedupe_execution_fills
+from app.services.fifo_inventory import (
+    fifo_route_scope_from_order,
+    load_fifo_isolation_cursor,
+    replay_open_long_fill_inventory,
+)
+from app.services.execution_account_route import (
+    EXECUTION_ACCOUNT_SCOPE_KEY,
+    KIS_ACCOUNT_ROUTE_BINDING_KEY,
+    bind_kis_account_route,
+    classify_kis_account_route,
+    configured_kis_route_fingerprint,
+    execution_account_scope_binding_from_payloads,
+    kis_account_route_binding_from_payloads,
+    validate_kis_account_route,
+)
+from app.services.execution_semantics import (
+    KRX_ASSET_CLASS_ALIASES,
+    KRX_EXCHANGES,
+    WATCH_BUY_INTENTS,
+    canonical_execution_asset_class,
+    is_short_term_watch_buy_intent,
+    watch_buy_direction_from_payloads,
+)
 from app.services.reconciliation import (
     reconcile_pending_broker_orders,
     sync_execution_positions_from_broker_snapshot,
@@ -56,8 +80,18 @@ from app.services.broker_orders import (
     inspect_account_drawdown_recovery,
     place_broker_order,
 )
-from app.services.json_compaction import compact_json_object
-from app.services.plan_item_identity import serialize_plan_item_source_identity
+from app.services.json_compaction import compact_json_object, json_payload_hash
+from app.services.plan_item_identity import (
+    plan_item_entry_family_key,
+    select_plan_item_family_members,
+    serialize_plan_item_source_identity,
+)
+from app.services.position_identity import (
+    EXECUTION_SCOPE_POLICY_VERSION,
+    PositionIdentityConflictError,
+    build_position_identity,
+    position_identity_from_columns,
+)
 from app.services.risk_sizing import (
     RiskSizingRejection,
     RiskSizingResult,
@@ -66,13 +100,32 @@ from app.services.risk_sizing import (
 )
 from app.services.market_regime_guardrails import evaluate_market_regime_guardrail, market_regime_context_from_item_payloads
 from app.services.live_market_context import load_live_market_regime_context, merge_live_market_regime_context
+from app.services.monitoring_price_source import (
+    _fetch_live_market_context,
+    _is_trusted_exchange_freshness_source,
+    monitoring_orderability_key,
+    monitoring_price_from_broker_quote,
+)
 from app.services.runtime_controls import (
     automated_order_submission_allowed,
     automated_order_submission_block_reason,
     ensure_runtime_control_state,
 )
-from app.services.runtime_transitions import plan_item_status_for_broker_order_status
+from app.services.runtime_transitions import (
+    apply_plan_item_status,
+    plan_item_status_for_broker_order_status,
+)
 from app.services import trigger_time_exec_agent
+from app.services.exec_agent_approval import (
+    DELEGATED_LIQUIDITY_GATE_CODE,
+    SHORT_TERM_LIVE_MIN_NET_REWARD_RISK,
+    SHORT_TERM_LIVE_MIN_TURNOVER_KRW,
+    assess_buy_economics,
+    configured_execution_cost_evidence,
+    delegated_buy_gate_rejections,
+    is_legacy_unverified_exec_agent_sizing,
+    trusted_live_market_decimal,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -80,7 +133,9 @@ _CORE_DESIRED_MONITORING_SYMBOL_CACHE: dict[str, tuple[float, tuple[str, ...]]] 
 _CORE_DESIRED_MONITORING_SYMBOL_WARNING_AT: dict[str, float] = {}
 
 SELL_MONITORED_INTENTS = frozenset({"target_sell", "stop_sell", "max_holding_close_sell"})
-WATCH_BUY_INTENTS = frozenset({"watch_buy", "trigger_buy", "chase_buy", "tactical_buy", "intraday_watch_buy", "next_open_buy"})
+MONITORED_KIS_POSITION_EXCHANGES = tuple(
+    sorted(KRX_EXCHANGES | {"AMEX", "NASD", "NYSE"})
+)
 PRICE_TRIGGERED_MONITORED_INTENTS = WATCH_BUY_INTENTS | frozenset({"target_sell", "stop_sell"})
 MONITORED_INTENTS = SELL_MONITORED_INTENTS | WATCH_BUY_INTENTS
 AGENT_PENDING_STATUS = trigger_time_exec_agent.AGENT_PENDING_STATUS
@@ -89,6 +144,8 @@ AGENT_REJECTED_STATUS = trigger_time_exec_agent.AGENT_REJECTED_STATUS
 AGENT_APPROVED_PENDING_SUBMIT_STATUS = trigger_time_exec_agent.AGENT_APPROVED_PENDING_SUBMIT_STATUS
 AGENT_ACTIVE_STATUSES = trigger_time_exec_agent.AGENT_ACTIVE_STATUSES
 MAX_PROTECTIVE_STOP_COVERAGE_DETAILS = 20
+TRIGGER_TIME_LIQUIDITY_EVIDENCE_KEY = "exec_trigger_time_liquidity_evidence_v1"
+SELL_MONITOR_AUTHORITY_KEY = "sell_monitor_authority_v1"
 WATCH_MONITORING_STATUSES = frozenset(
     {
         "watch_monitoring_pending",
@@ -130,6 +187,26 @@ RETRYABLE_WATCH_BUY_APPROVAL_REASONS = frozenset(
         "account_snapshot_unavailable",
         "exec_agent_sizing_pending",
         "invalid_stop_distance",
+        "krx_calendar_unavailable",
+        "krx_market_closed",
+        "live_buy_orderbook_unavailable",
+        "live_buy_orderbook_identity_mismatch",
+        "live_buy_quote_untrusted",
+        "live_buy_quote_timestamp_invalid",
+        "live_buy_quote_future_skew",
+        "live_buy_quote_stale",
+        "live_buy_quote_wrong_market_date",
+        "live_buy_ordering_unavailable",
+        "live_buy_ask_unavailable",
+        "live_buy_target_missing",
+        "live_buy_stop_missing",
+        "live_buy_target_geometry_invalid",
+        "live_buy_stop_geometry_invalid",
+        "live_market_breadth_unavailable",
+        "market_breadth_risk_off",
+        "sector_weakness_reject",
+        "pre_submit_quote_stale",
+        "trigger_time_liquidity_unavailable",
     }
 )
 BLOCKED_WATCH_BUY_APPROVAL_REASONS = frozenset(
@@ -138,6 +215,7 @@ BLOCKED_WATCH_BUY_APPROVAL_REASONS = frozenset(
         "kill_switch",
         "stale_trigger_reclaim_required",
         "late_entry_cutoff",
+        "watch_buy_very_weak_liquidity",
     }
 )
 PENDING_DISPATCH_MONITORING_STATUSES = frozenset(
@@ -170,6 +248,7 @@ NON_MONITORABLE_PLAN_ITEM_STATUSES = frozenset(
         "watch_buy_rejected",
         "watch_expired",
         "watch_cancelled",
+        "manual_review_required",
     }
 )
 RETRYABLE_PROTECTIVE_STOP_STATUSES = frozenset(
@@ -212,10 +291,12 @@ MONITORING_RUNTIME_TOPOLOGY = "shared_symbol_scheduler"
 MONITORING_SELECTION_STRATEGY = "round_robin_by_symbol"
 KRX_TIMEZONE = ZoneInfo("Asia/Seoul")
 WATCH_BUY_HANDOFF_LOOKBACK_DAYS = 3
+WATCH_BUY_MIN_HARD_CALENDAR_TTL_DAYS = 7
 WATCH_BUY_EXPIRABLE_STATUSES = frozenset(
     {
         "watch_monitoring_active",
         "watch_monitoring_pending",
+        "watch_buy_triggered",
         "watch_buy_triggered_blocked",
         "watch_buy_triggered_pending_dispatch",
         AGENT_PENDING_STATUS,
@@ -242,6 +323,7 @@ class EvaluateMonitoringResult:
 class PendingMonitoringAction:
     item: ExecutionPlanItem
     observed_price: Decimal | None
+    price: MonitoringPriceRequest | None = None
     observed_at: datetime | None = None
     market_quality_context: dict[str, object] | None = None
     trigger_reason: str | None = None
@@ -279,6 +361,14 @@ class TriggerTimeAgentActionResult:
     quantity: int | None
     limit_price: Decimal | None
     result_payload: dict[str, object]
+    refreshed_price: MonitoringPriceRequest | None = None
+
+
+@dataclass(frozen=True)
+class TriggerTimeAgentClaim:
+    claim_id: str
+    previous_status: str
+    identity: tuple[object, ...]
 
 
 @dataclass(frozen=True)
@@ -334,7 +424,6 @@ PROTECTIVE_STOP_COVERAGE_STATUSES = frozenset(
         AGENT_APPROVED_PENDING_SUBMIT_STATUS,
         "broker_order_submission_pending",
         "broker_order_submitted",
-        "broker_order_retry_pending",
         "open",
         "partially_filled",
     }
@@ -379,9 +468,15 @@ def materialize_monitoring_plan_items(
     plan: ExecutionPlan,
     *,
     db: Session | None = None,
+    effective_at: datetime | None = None,
 ) -> None:
+    resolved_effective_at = effective_at or datetime.now(UTC)
     if db is not None:
-        _update_existing_sell_monitors_from_replanned_items(plan=plan, db=db)
+        _update_existing_sell_monitors_from_replanned_items(
+            plan=plan,
+            db=db,
+            effective_at=resolved_effective_at,
+        )
     for item in plan.items:
         if item.status == "superseded":
             continue
@@ -393,12 +488,33 @@ def materialize_monitoring_plan_items(
                 "watch_monitoring_pending",
             }:
                 continue
+            quantity_policy = item.quantity_policy
+            policy_kind = (
+                quantity_policy.get("kind") or quantity_policy.get("type")
+                if isinstance(quantity_policy, dict)
+                else None
+            )
+            if policy_kind == "exec_agent_sized":
+                # This is an outstanding sizing delegation, not executable
+                # quantity.  Estimated entry data may make the generic watch
+                # geometry look configured, but only the sizing worker may turn
+                # it into a share policy and scheduled order.
+                item.status = "watch_monitoring_pending"
+                continue
             if _monitoring_item_is_configured(item):
                 item.status = "watch_monitoring_active"
                 continue
             item.status = "watch_monitoring_pending"
             continue
         if item.intent not in SELL_MONITORED_INTENTS or item.status != "pending":
+            continue
+        if plan.market_date is not None and not _replanned_sell_plan_is_effective(
+            plan=plan,
+            item=item,
+            effective_at=resolved_effective_at,
+        ):
+            # A future exit belongs to its future entry/session. Persist it as
+            # dormant plan material, but never activate it against today's lot.
             continue
         if _monitoring_item_is_configured(
             item
@@ -412,6 +528,7 @@ def _update_existing_sell_monitors_from_replanned_items(
     *,
     plan: ExecutionPlan,
     db: Session,
+    effective_at: datetime,
 ) -> None:
     replanned_items = [
         item
@@ -420,6 +537,11 @@ def _update_existing_sell_monitors_from_replanned_items(
             item.side == "sell"
             and item.intent in SELL_MONITORED_INTENTS
             and item.source_plan_item_id
+            and _replanned_sell_plan_is_effective(
+                plan=plan,
+                item=item,
+                effective_at=effective_at,
+            )
         )
     ]
     if not replanned_items:
@@ -453,12 +575,16 @@ def _update_existing_sell_monitors_from_replanned_items(
                 ExecutionPlanItem.risk_context,
                 ExecutionPlanItem.source_plan_item_id,
                 ExecutionPlanItem.source_market_date,
+                ExecutionPlanItem.provider,
+                ExecutionPlanItem.venue,
+                ExecutionPlanItem.asset_class,
                 ExecutionPlanItem.updated_at,
             ),
             selectinload(ExecutionPlanItem.plan).load_only(
                 ExecutionPlan.id,
                 ExecutionPlan.mode,
                 ExecutionPlan.market_date,
+                ExecutionPlan.requested_at,
                 ExecutionPlan.accepted_at,
                 ExecutionPlan.created_at,
             ),
@@ -470,19 +596,78 @@ def _update_existing_sell_monitors_from_replanned_items(
             ExecutionPlanItem.id.desc(),
         )
     ).all()
-    existing_by_source: dict[tuple[str, str, str], ExecutionPlanItem] = {}
+    existing_by_source: dict[
+        tuple[str, str, str, tuple[str, str, str, str]],
+        ExecutionPlanItem,
+    ] = {}
     for existing in existing_items:
         if not existing.source_plan_item_id:
             continue
-        key = (existing.source_plan_item_id, existing.symbol, existing.intent)
-        if key not in existing_by_source:
+        route_key = _sell_monitor_route_key(existing)
+        if route_key is None:
+            continue
+        key = (
+            existing.source_plan_item_id,
+            existing.symbol,
+            existing.intent,
+            route_key,
+        )
+        current = existing_by_source.get(key)
+        if current is None or _sell_item_is_preferred_authority(existing, current):
             existing_by_source[key] = existing
 
     for replanned in replanned_items:
         if not replanned.source_plan_item_id:
             continue
-        existing = existing_by_source.get((replanned.source_plan_item_id, replanned.symbol, replanned.intent))
+        route_key = _sell_monitor_route_key(replanned)
+        if route_key is None:
+            continue
+        existing = existing_by_source.get(
+            (
+                replanned.source_plan_item_id,
+                replanned.symbol,
+                replanned.intent,
+                route_key,
+            )
+        )
         if existing is None or existing.id == replanned.id:
+            continue
+        authority_comparison = _compare_sell_plan_to_item_authority(plan, existing)
+        if authority_comparison < 0:
+            replanned.status = "superseded"
+            _record_monitoring_event(
+                item=replanned,
+                event={
+                    "event": "replanned_sell_monitor_rejected",
+                    "reason": "older_source_authority",
+                    "preserved_execution_plan_item_id": existing.id,
+                    "recorded_at": datetime.now(UTC).isoformat(),
+                },
+            )
+            continue
+        if authority_comparison == 0:
+            if _sell_monitor_material(replanned) != _sell_monitor_material(existing):
+                replanned.status = "manual_review_required"
+                _record_monitoring_event(
+                    item=replanned,
+                    event={
+                        "event": "replanned_sell_monitor_authority_conflict",
+                        "reason": "equal_source_authority_with_divergent_material",
+                        "preserved_execution_plan_item_id": existing.id,
+                        "recorded_at": datetime.now(UTC).isoformat(),
+                    },
+                )
+            else:
+                replanned.status = "superseded"
+                _record_monitoring_event(
+                    item=replanned,
+                    event={
+                        "event": "replanned_sell_monitor_deduplicated",
+                        "reason": "equal_source_authority_with_identical_material",
+                        "preserved_execution_plan_item_id": existing.id,
+                        "recorded_at": datetime.now(UTC).isoformat(),
+                    },
+                )
             continue
 
         prior_status = existing.status
@@ -511,6 +696,13 @@ def _update_existing_sell_monitors_from_replanned_items(
             if _monitoring_item_is_configured(existing)
             else _pending_configuration_status(existing.intent)
         )
+        existing_risk_context = dict(
+            _loaded_risk_context(existing, allow_file_backed_load=True)
+        )
+        existing_risk_context[SELL_MONITOR_AUTHORITY_KEY] = (
+            _sell_plan_authority_payload(plan)
+        )
+        existing.risk_context = compact_json_object(existing_risk_context)
         _record_monitoring_event(
             item=existing,
             event={
@@ -527,10 +719,15 @@ def _update_existing_sell_monitors_from_replanned_items(
                 "prior_decision_snapshot_id": prior_decision_snapshot_id,
                 "updated_decision_snapshot_id": existing.decision_snapshot_id,
                 "replanned_execution_plan_id": plan.id,
+                "authority_market_date": _serialize_date(plan.market_date),
+                "authority_requested_at": (
+                    _normalize_utc(plan.requested_at).isoformat()
+                    if plan.requested_at is not None
+                    else None
+                ),
                 "recorded_at": datetime.now(UTC).isoformat(),
             },
         )
-
         replanned.status = "superseded"
         _record_monitoring_event(
             item=replanned,
@@ -542,6 +739,338 @@ def _update_existing_sell_monitors_from_replanned_items(
                 "recorded_at": datetime.now(UTC).isoformat(),
             },
         )
+
+
+def _replanned_sell_plan_is_effective(
+    *,
+    plan: ExecutionPlan,
+    item: ExecutionPlanItem,
+    effective_at: datetime,
+) -> bool:
+    if plan.market_date is None:
+        return False
+    return plan.market_date <= _plan_item_market_date(
+        item=item,
+        effective_at=effective_at,
+    )
+
+
+def _plan_item_market_timezone(item: ExecutionPlanItem) -> tzinfo | None:
+    risk_context = _loaded_risk_context(item, allow_file_backed_load=True)
+    risk_exchange = (
+        str(risk_context.get("exchange") or "").strip().upper()
+        if isinstance(risk_context, dict)
+        else ""
+    )
+    venue_exchange = str(item.venue or "").strip().upper()
+    recognized_exchanges = KRX_EXCHANGES | {
+        "US",
+        "NASD",
+        "NYSE",
+        "AMEX",
+        "UPBIT",
+    }
+    exchange = next(
+        (
+            candidate
+            for candidate in (risk_exchange, venue_exchange)
+            if candidate in recognized_exchanges
+        ),
+        "",
+    )
+    asset_class = str(item.asset_class or "").strip().lower()
+    if asset_class == "crypto" or exchange == "UPBIT":
+        return UTC
+    if asset_class == "us_equity" or exchange in {"US", "NASD", "NYSE", "AMEX"}:
+        return ZoneInfo("America/New_York")
+    if (
+        asset_class in KRX_ASSET_CLASS_ALIASES
+        or exchange in KRX_EXCHANGES
+        or _is_krx_equity_symbol(item.symbol)
+    ):
+        return KRX_TIMEZONE
+    return None
+
+
+def _plan_item_market_date(
+    *,
+    item: ExecutionPlanItem,
+    effective_at: datetime,
+) -> date:
+    normalized_effective_at = _normalize_utc(effective_at)
+    market_timezone = _plan_item_market_timezone(item)
+    if market_timezone is not None:
+        return normalized_effective_at.astimezone(market_timezone).date()
+    return min(
+        normalized_effective_at.astimezone(KRX_TIMEZONE).date(),
+        normalized_effective_at.astimezone(ZoneInfo("America/New_York")).date(),
+        normalized_effective_at.date(),
+    )
+
+
+def _monitoring_item_is_effective_at(
+    *,
+    item: ExecutionPlanItem,
+    effective_at: datetime,
+) -> bool:
+    if item.plan.market_date is None:
+        return item.side == "sell"
+    return item.plan.market_date <= _plan_item_market_date(
+        item=item,
+        effective_at=effective_at,
+    )
+
+
+def _effective_monitor_plan_filter(
+    *,
+    effective_at: datetime | None,
+    current_market_date: date | None,
+):
+    if effective_at is None and current_market_date is not None:
+        return or_(
+            ExecutionPlan.market_date <= current_market_date,
+            and_(
+                ExecutionPlan.market_date.is_(None),
+                ExecutionPlanItem.side == "sell",
+            ),
+        )
+    resolved_effective_at = _normalize_utc(effective_at or datetime.now(UTC))
+    krx_date = resolved_effective_at.astimezone(KRX_TIMEZONE).date()
+    us_date = resolved_effective_at.astimezone(
+        ZoneInfo("America/New_York")
+    ).date()
+    utc_date = resolved_effective_at.date()
+    normalized_asset_class = func.lower(
+        func.trim(func.coalesce(ExecutionPlanItem.asset_class, ""))
+    )
+    risk_exchange = func.upper(
+        func.trim(
+            func.coalesce(ExecutionPlanItem.risk_context["exchange"].as_string(), "")
+        )
+    )
+    venue_exchange = func.upper(
+        func.trim(func.coalesce(ExecutionPlanItem.venue, ""))
+    )
+    recognized_exchanges = tuple(
+        sorted(KRX_EXCHANGES | {"US", "NASD", "NYSE", "AMEX", "UPBIT"})
+    )
+
+    def exchange_matches(values: tuple[str, ...]):
+        return or_(
+            risk_exchange.in_(values),
+            and_(
+                ~risk_exchange.in_(recognized_exchanges),
+                venue_exchange.in_(values),
+            ),
+        )
+
+    crypto_market = or_(
+        normalized_asset_class == "crypto",
+        exchange_matches(("UPBIT",)),
+    )
+    us_market = and_(
+        ~crypto_market,
+        or_(
+            normalized_asset_class == "us_equity",
+            exchange_matches(("US", "NASD", "NYSE", "AMEX")),
+        ),
+    )
+    krx_symbol = and_(
+        func.length(ExecutionPlanItem.symbol) == 6,
+        *(
+            func.substr(ExecutionPlanItem.symbol, index, 1).between("0", "9")
+            for index in range(1, 7)
+        ),
+    )
+    krx_market = and_(
+        ~crypto_market,
+        ~us_market,
+        or_(
+            normalized_asset_class.in_(tuple(KRX_ASSET_CLASS_ALIASES)),
+            exchange_matches(tuple(KRX_EXCHANGES)),
+            krx_symbol,
+        ),
+    )
+    unknown_market = and_(~crypto_market, ~us_market, ~krx_market)
+    return or_(
+        and_(
+            ExecutionPlan.market_date.is_(None),
+            ExecutionPlanItem.side == "sell",
+        ),
+        and_(
+            us_market,
+            ExecutionPlan.market_date <= us_date,
+        ),
+        and_(
+            crypto_market,
+            ExecutionPlan.market_date <= utc_date,
+        ),
+        and_(
+            krx_market,
+            ExecutionPlan.market_date <= krx_date,
+        ),
+        and_(
+            unknown_market,
+            ExecutionPlan.market_date <= min(krx_date, us_date, utc_date),
+        ),
+    )
+
+
+def _sell_plan_authority_payload(plan: ExecutionPlan) -> dict[str, str | None]:
+    return {
+        "market_date": _serialize_date(plan.market_date),
+        "requested_at": (
+            _normalize_utc(plan.requested_at).isoformat()
+            if plan.requested_at is not None
+            else None
+        ),
+        "accepted_at": (
+            _normalize_utc(plan.accepted_at).isoformat()
+            if plan.accepted_at is not None
+            else None
+        ),
+        "source_plan_id": str(plan.external_plan_id or plan.id or "") or None,
+    }
+
+
+def _sell_item_authority(
+    item: ExecutionPlanItem,
+) -> tuple[date, datetime | None, datetime | None]:
+    risk_context = _loaded_risk_context(item, allow_file_backed_load=True)
+    authority = (
+        risk_context.get(SELL_MONITOR_AUTHORITY_KEY)
+        if isinstance(risk_context, dict)
+        else None
+    )
+    if isinstance(authority, dict):
+        market_date = _parse_date_or_datetime(authority.get("market_date"))
+        requested_at = _parse_event_datetime(authority.get("requested_at"))
+        accepted_at = _parse_event_datetime(authority.get("accepted_at"))
+        if market_date is not None and (requested_at is not None or accepted_at is not None):
+            return market_date, requested_at, accepted_at
+    plan = item.plan
+    return (
+        plan.market_date or date.min,
+        _normalize_utc(plan.requested_at) if plan.requested_at is not None else None,
+        _normalize_utc(plan.accepted_at) if plan.accepted_at is not None else None,
+    )
+
+
+def _compare_sell_authorities(
+    candidate: tuple[date, datetime | None, datetime | None],
+    current: tuple[date, datetime | None, datetime | None],
+) -> int:
+    candidate_market_date, candidate_requested_at, candidate_accepted_at = candidate
+    current_market_date, current_requested_at, current_accepted_at = current
+    if candidate_market_date != current_market_date:
+        return 1 if candidate_market_date > current_market_date else -1
+    if candidate_requested_at is not None and current_requested_at is not None:
+        if candidate_requested_at == current_requested_at:
+            return 0
+        return 1 if candidate_requested_at > current_requested_at else -1
+    if candidate_accepted_at is None or current_accepted_at is None:
+        return 0
+    if candidate_accepted_at == current_accepted_at:
+        return 0
+    return 1 if candidate_accepted_at > current_accepted_at else -1
+
+
+def _compare_sell_plan_to_item_authority(
+    candidate: ExecutionPlan,
+    current: ExecutionPlanItem,
+) -> int:
+    return _compare_sell_authorities(
+        (
+            candidate.market_date or date.min,
+            _normalize_utc(candidate.requested_at)
+            if candidate.requested_at is not None
+            else None,
+            _normalize_utc(candidate.accepted_at)
+            if candidate.accepted_at is not None
+            else None,
+        ),
+        _sell_item_authority(current),
+    )
+
+
+def _sell_item_is_strictly_newer(
+    candidate: ExecutionPlanItem,
+    current: ExecutionPlanItem,
+) -> bool:
+    return _compare_sell_authorities(
+        _sell_item_authority(candidate),
+        _sell_item_authority(current),
+    ) > 0
+
+
+def _sell_item_is_preferred_authority(
+    candidate: ExecutionPlanItem,
+    current: ExecutionPlanItem,
+) -> bool:
+    comparison = _compare_sell_authorities(
+        _sell_item_authority(candidate),
+        _sell_item_authority(current),
+    )
+    if comparison != 0:
+        return comparison > 0
+    candidate_accepted_at = _sell_item_authority(candidate)[2]
+    current_accepted_at = _sell_item_authority(current)[2]
+    if candidate_accepted_at is not None and current_accepted_at is not None:
+        if candidate_accepted_at != current_accepted_at:
+            # Equal Core authority means arrival order cannot authorize a
+            # replacement. Preserve the first accepted incumbent.
+            return candidate_accepted_at < current_accepted_at
+    return str(candidate.id) < str(current.id)
+
+
+def _sell_monitor_material(item: ExecutionPlanItem) -> tuple[object, ...]:
+    return (
+        item.trigger_price,
+        item.limit_price,
+        item.quantity_policy,
+        item.time_in_force,
+        item.decision_agent_name,
+        item.decision_snapshot_id,
+        item.decision_run_id,
+        item.source_market_date,
+        item.provider,
+        item.venue,
+        item.asset_class,
+        item.base_quantity,
+        item.quote_notional,
+        item.quantity_precision,
+        item.price_precision,
+    )
+
+
+def _sell_monitor_route_key(
+    item: ExecutionPlanItem,
+) -> tuple[str, str, str, str] | None:
+    provider = str(item.provider or "kis").strip().lower()
+    if provider in {"korea-investment", "korea_investment"}:
+        provider = "kis"
+    exchange = _plan_item_exchange(item)
+    asset_class = str(item.asset_class or "stock").strip().lower()
+    if provider != "kis":
+        binding = execution_account_scope_binding_from_payloads(
+            _loaded_risk_context(item, allow_file_backed_load=True),
+            item.quantity_policy,
+        )
+        if binding is None or binding.get("provider") != provider:
+            return None
+        return provider, exchange, asset_class, str(binding["account_scope"])
+    binding = kis_account_route_binding_from_payloads(
+        _loaded_risk_context(item, allow_file_backed_load=True),
+        item.quantity_policy,
+    )
+    if binding is None:
+        return None
+    return (
+        provider,
+        exchange,
+        asset_class,
+        binding["configured_route_fingerprint"],
+    )
 
 
 def evaluate_monitoring(
@@ -604,6 +1133,341 @@ def _ordered_symbol_scope(symbols: list[str] | set[str] | None) -> list[str]:
     return ordered
 
 
+def _kis_plan_item_provider_filter():
+    """Select only rows owned by the KIS monitoring coordinator.
+
+    Null/blank providers are retained for pre-provider legacy plans because
+    this module historically treated them as KIS. Explicit foreign providers
+    must never be inspected or mutated by the KIS runtime.
+    """
+
+    normalized_provider = func.lower(func.trim(ExecutionPlanItem.provider))
+    return or_(
+        ExecutionPlanItem.provider.is_(None),
+        func.trim(ExecutionPlanItem.provider) == "",
+        normalized_provider.in_(("kis", "korea-investment", "korea_investment")),
+    )
+
+
+def _kis_us_plan_item_filter():
+    us_exchanges = ("US", "NASD", "NYSE", "AMEX")
+    return or_(
+        func.lower(func.trim(func.coalesce(ExecutionPlanItem.asset_class, "")))
+        == "us_equity",
+        func.upper(
+            func.trim(
+                func.coalesce(
+                    ExecutionPlanItem.risk_context["exchange"].as_string(),
+                    "",
+                )
+            )
+        ).in_(us_exchanges),
+        func.upper(func.trim(func.coalesce(ExecutionPlanItem.venue, ""))).in_(
+            us_exchanges
+        ),
+    )
+
+
+def _active_kis_position_filters(*, settings: Settings) -> tuple[object, ...]:
+    """Bind local position authority to this runtime's configured KIS account."""
+
+    try:
+        identity = build_position_identity(
+            settings=settings,
+            provider="kis",
+            exchange="KRX",
+        )
+    except PositionIdentityConflictError:
+        # A missing stable account identity must behave as no authoritative
+        # local position truth, never as permission to consume legacy rows.
+        return (ExecutionPosition.id.is_(None),)
+    return (
+        ExecutionPosition.mode == settings.runtime_mode,
+        ExecutionPosition.provider == identity.provider,
+        ExecutionPosition.account_scope == identity.account_scope,
+        ExecutionPosition.exchange.in_(MONITORED_KIS_POSITION_EXCHANGES),
+    )
+
+
+def _monitoring_checkpoint_execution_scope(
+    *,
+    settings: Settings,
+) -> dict[str, object] | None:
+    """Return the canonical account authority attached to liveness evidence."""
+
+    try:
+        identity = build_position_identity(
+            settings=settings,
+            provider="kis",
+            exchange="KRX",
+        )
+    except PositionIdentityConflictError:
+        return None
+    return {
+        "policy_version": EXECUTION_SCOPE_POLICY_VERSION,
+        "provider": identity.provider,
+        "account_scope": identity.account_scope,
+    }
+
+
+def _active_kis_order_filters(
+    *,
+    settings: Settings,
+    exchange: str | None = None,
+) -> tuple[object, ...]:
+    """Require a complete canonical order scope for the configured KIS account."""
+
+    try:
+        identity = build_position_identity(
+            settings=settings,
+            provider="kis",
+            exchange=exchange or "KRX",
+        )
+    except PositionIdentityConflictError:
+        return (BrokerOrder.id.is_(None),)
+    scope = BrokerOrder.request_metadata["execution_scope"]
+    scope_exchange = scope["exchange"].as_string()
+    filters: list[object] = [
+        BrokerOrder.mode == settings.runtime_mode,
+        BrokerOrder.broker_name == identity.provider,
+        scope["policy_version"].as_integer() == 1,
+        scope["provider"].as_string() == identity.provider,
+        scope["account_scope"].as_string() == identity.account_scope,
+        scope["venue"].as_string() == func.upper(BrokerOrder.venue),
+        scope["asset_class"].as_string() == func.lower(BrokerOrder.asset_class),
+        or_(
+            BrokerOrder.request_metadata["exchange"].as_string().is_(None),
+            BrokerOrder.request_metadata["exchange"].as_string()
+            == scope_exchange,
+        ),
+    ]
+    if exchange is None:
+        filters.append(scope_exchange.in_(MONITORED_KIS_POSITION_EXCHANGES))
+    else:
+        filters.append(scope_exchange == str(exchange).strip().upper())
+    return tuple(filters)
+
+
+def _active_kis_order_exchange(
+    *,
+    settings: Settings,
+    order: BrokerOrder,
+) -> str | None:
+    status, exchange = _kis_order_scope_classification(
+        settings=settings,
+        order=order,
+    )
+    return exchange if status == "active" else None
+
+
+def _kis_position_identity_exchange(exchange: object) -> str:
+    normalized = str(exchange or "").strip().upper()
+    return "KRX" if normalized in KRX_EXCHANGES else normalized
+
+
+def _kis_order_scope_classification(
+    *,
+    settings: Settings,
+    order: BrokerOrder,
+) -> tuple[str, str | None]:
+    try:
+        identity = build_position_identity(
+            settings=settings,
+            provider="kis",
+            exchange="KRX",
+        )
+    except PositionIdentityConflictError:
+        return "invalid", None
+    route_scope = fifo_route_scope_from_order(order)
+    if (
+        route_scope is None
+        or route_scope.provider != identity.provider
+        or route_scope.exchange not in MONITORED_KIS_POSITION_EXCHANGES
+    ):
+        return "invalid", None
+    if route_scope.account_scope != identity.account_scope:
+        return "foreign", route_scope.exchange
+    return "active", route_scope.exchange
+
+
+def _active_kis_order_matches_position(
+    *,
+    settings: Settings,
+    order: BrokerOrder,
+    position: ExecutionPosition | None,
+) -> bool:
+    if position is None:
+        return False
+    try:
+        position_identity = position_identity_from_columns(position)
+        expected_identity = build_position_identity(
+            settings=settings,
+            provider="kis",
+            exchange=(
+                position_identity.exchange if position_identity is not None else ""
+            ),
+        )
+    except PositionIdentityConflictError:
+        return False
+    return bool(
+        position_identity is not None
+        and position_identity == expected_identity
+        and _kis_position_identity_exchange(
+            _active_kis_order_exchange(settings=settings, order=order)
+        )
+        == position_identity.exchange
+    )
+
+
+def _unique_positions_by_symbol(
+    positions: list[ExecutionPosition],
+) -> dict[str, ExecutionPosition]:
+    positions_by_symbol: dict[str, ExecutionPosition] = {}
+    for position in positions:
+        if position.symbol in positions_by_symbol:
+            raise PositionIdentityConflictError(
+                "active KIS execution position route is ambiguous for symbol "
+                f"{position.symbol}"
+            )
+        positions_by_symbol[position.symbol] = position
+    return positions_by_symbol
+
+
+def _position_for_monitoring_item(
+    *,
+    settings: Settings,
+    item: ExecutionPlanItem,
+    positions_by_symbol: dict[str, ExecutionPosition],
+) -> ExecutionPosition | None:
+    position = positions_by_symbol.get(item.symbol)
+    if position is None:
+        return None
+    symbol = str(item.symbol or "").strip().upper()
+    provider = str(
+        item.provider or ("kis" if _is_krx_equity_symbol(symbol) else "")
+    ).strip().lower()
+    if provider in {"korea-investment", "korea_investment"}:
+        provider = "kis"
+    risk_context = _loaded_risk_context(item, allow_file_backed_load=True)
+    raw_exchange = risk_context.get("exchange") if isinstance(risk_context, dict) else None
+    exchange = str(raw_exchange or "").strip().upper()
+    if not exchange and _is_krx_equity_symbol(symbol):
+        exchange = "KRX"
+    if not provider or not exchange:
+        return None
+    if provider == "kis" and _kis_monitoring_route_rejection(item=item, settings=settings):
+        return None
+    identity_exchange = (
+        _kis_position_identity_exchange(exchange) if provider == "kis" else exchange
+    )
+    try:
+        expected = build_position_identity(
+            settings=settings,
+            provider=provider,
+            exchange=identity_exchange,
+        )
+        actual = position_identity_from_columns(position)
+    except PositionIdentityConflictError:
+        return None
+    return position if actual == expected else None
+
+
+def _kis_monitoring_route_rejection(
+    *,
+    settings: Settings,
+    item: ExecutionPlanItem,
+) -> tuple[str, str | None] | None:
+    provider = str(item.provider or "kis").strip().lower()
+    if provider in {"korea-investment", "korea_investment"}:
+        provider = "kis"
+    if provider != "kis":
+        return None
+    mismatch = validate_kis_account_route(
+        settings=settings,
+        provider=provider,
+        risk_context=_loaded_risk_context(item, allow_file_backed_load=True),
+        quantity_policy=item.quantity_policy,
+        require_binding=True,
+    )
+    if mismatch is not None:
+        return mismatch.reason_code, mismatch.provided_route_fingerprint
+    if (
+        configured_kis_route_fingerprint(settings) is not None
+        and kis_account_route_binding_from_payloads(
+            _loaded_risk_context(item, allow_file_backed_load=True),
+            item.quantity_policy,
+        )
+        is None
+    ):
+        return "account_route_binding_missing", None
+    return None
+
+
+def _quarantine_invalid_sell_monitor_routes(
+    *,
+    settings: Settings,
+    items: list[ExecutionPlanItem],
+    recorded_at: datetime,
+    positions_by_symbol: dict[str, ExecutionPosition] | None = None,
+) -> list[ExecutionPlanItem]:
+    eligible: list[ExecutionPlanItem] = []
+    for item in items:
+        if item.side != "sell" or item.intent not in SELL_MONITORED_INTENTS:
+            eligible.append(item)
+            continue
+        provider = str(item.provider or "kis").strip().lower()
+        if provider in {"korea-investment", "korea_investment"}:
+            provider = "kis"
+        if provider != "kis":
+            # This coordinator owns only KIS. Leave another provider's
+            # protective state untouched for its dedicated runtime.
+            continue
+        if provider == "kis" and classify_kis_account_route(
+            settings=settings,
+            provider=provider,
+            risk_context=_loaded_risk_context(
+                item,
+                allow_file_backed_load=True,
+            ),
+            quantity_policy=item.quantity_policy,
+        ) == "foreign":
+            # Another configured account owns this still-live protection.
+            # Ignore it in the current account without destroying its status.
+            continue
+        rejection = _kis_monitoring_route_rejection(settings=settings, item=item)
+        if (
+            rejection is None
+            and positions_by_symbol is not None
+            and item.symbol in positions_by_symbol
+        ):
+            if (
+                _position_for_monitoring_item(
+                    settings=settings,
+                    item=item,
+                    positions_by_symbol=positions_by_symbol,
+                )
+                is None
+            ):
+                rejection = ("position_route_mismatch", None)
+        if rejection is None:
+            eligible.append(item)
+            continue
+        reason, provided_route_fingerprint = rejection
+        prior_status = item.status
+        item.status = "manual_review_required"
+        _record_monitoring_event(
+            item=item,
+            event={
+                "event": "sell_monitor_account_route_quarantined",
+                "reason": reason,
+                "prior_status": prior_status,
+                "provided_route_fingerprint": provided_route_fingerprint,
+                "recorded_at": _normalize_utc(recorded_at).isoformat(),
+            },
+        )
+    return eligible
+
+
 def _is_krx_equity_symbol(symbol: object) -> bool:
     normalized = str(symbol or "").strip()
     return len(normalized) == 6 and normalized.isdigit()
@@ -614,17 +1478,50 @@ def list_autonomous_monitoring_symbols(
     settings: Settings,
     db: Session,
     current_market_date: date | None = None,
+    effective_at: datetime | None = None,
 ) -> list[str]:
-    resolved_market_date = current_market_date or datetime.now(KRX_TIMEZONE).date()
+    resolved_effective_at = _normalize_utc(effective_at or datetime.now(UTC))
+    resolved_market_date = current_market_date or resolved_effective_at.astimezone(
+        KRX_TIMEZONE
+    ).date()
+    effective_plan_filter = _effective_monitor_plan_filter(
+        effective_at=(
+            resolved_effective_at
+            if effective_at is not None or current_market_date is None
+            else None
+        ),
+        current_market_date=current_market_date,
+    )
     symbol_cycle_limit = resolve_monitoring_symbol_cycle_limit(settings=settings)
-    if settings.monitoring_expire_prior_market_watch_buys_enabled:
-        expired_count = expire_prior_market_date_unfilled_watch_buys(
+    changed_watch_count = 0
+    max_age_trading_sessions = _watch_buy_max_age_trading_sessions(settings)
+    if max_age_trading_sessions is not None:
+        expired_watch_count = expire_prior_market_date_unfilled_watch_buys(
             settings=settings,
             db=db,
             current_market_date=resolved_market_date,
+            effective_at=(
+                resolved_effective_at
+                if effective_at is not None or current_market_date is None
+                else None
+            ),
+            max_age_trading_sessions=max_age_trading_sessions,
         )
-        if expired_count:
-            db.commit()
+        changed_watch_count += expired_watch_count
+        if expired_watch_count:
+            db.flush()
+    changed_watch_count += supersede_duplicate_active_watch_buys(
+        settings=settings,
+        db=db,
+        current_market_date=resolved_market_date,
+        effective_at=(
+            resolved_effective_at
+            if effective_at is not None or current_market_date is None
+            else None
+        ),
+    )
+    if changed_watch_count:
+        db.commit()
 
     mode_plan_ids = select(ExecutionPlan.id).where(ExecutionPlan.mode == settings.runtime_mode)
     kis_us_symbols = {
@@ -634,8 +1531,8 @@ def list_autonomous_monitoring_symbols(
             .join(ExecutionPlanItem.plan)
             .where(
                 ExecutionPlan.mode == settings.runtime_mode,
-                ExecutionPlanItem.provider == "kis",
-                ExecutionPlanItem.asset_class == "us_equity",
+                _kis_plan_item_provider_filter(),
+                _kis_us_plan_item_filter(),
             )
         ).all()
         if _plan_item_exchange(item) in {"NASD", "NYSE", "AMEX"}
@@ -643,7 +1540,7 @@ def list_autonomous_monitoring_symbols(
     held_positions = db.scalars(
         select(ExecutionPosition)
         .where(
-            ExecutionPosition.mode == settings.runtime_mode,
+            *_active_kis_position_filters(settings=settings),
             ExecutionPosition.quantity > 0,
         )
         .order_by(ExecutionPosition.symbol.asc())
@@ -668,7 +1565,7 @@ def list_autonomous_monitoring_symbols(
         seconds=settings.exec_agent_max_account_snapshot_age_seconds
     )
     fresh_known_flat_symbols = select(ExecutionPosition.symbol).where(
-        ExecutionPosition.mode == settings.runtime_mode,
+        *_active_kis_position_filters(settings=settings),
         ExecutionPosition.quantity <= 0,
         ExecutionPosition.last_reconciled_at.is_not(None),
         ExecutionPosition.last_reconciled_at >= fresh_position_truth_after,
@@ -721,33 +1618,70 @@ def list_autonomous_monitoring_symbols(
             enforce_limit=False,
         )
 
-    if len(symbol_candidates) < symbol_cycle_limit:
-        buy_symbol_rows = list(
-            db.scalars(
-                select(distinct(ExecutionPlanItem.symbol))
-                .where(
-                    ExecutionPlanItem.execution_plan_id.in_(mode_plan_ids),
-                    ExecutionPlanItem.side == "buy",
-                    ExecutionPlanItem.intent.in_(tuple(WATCH_BUY_INTENTS)),
-                    ExecutionPlanItem.status.in_(tuple(ACTIVE_WATCH_MONITORING_STATUSES)),
-                )
-                .order_by(ExecutionPlanItem.symbol.asc())
-                .limit(symbol_cycle_limit * 8)
-            ).all()
+    active_watch_items = db.scalars(
+        select(ExecutionPlanItem)
+        .join(ExecutionPlanItem.plan)
+        .where(
+            ExecutionPlan.mode == settings.runtime_mode,
+            effective_plan_filter,
+            ExecutionPlanItem.side == "buy",
+            ExecutionPlanItem.intent.in_(tuple(WATCH_BUY_INTENTS)),
+            ExecutionPlanItem.status.in_(tuple(ACTIVE_WATCH_MONITORING_STATUSES)),
         )
-        desired_symbols = _load_core_desired_monitoring_symbols(settings=settings)
-        if desired_symbols:
-            desired_rank = {symbol: index for index, symbol in enumerate(desired_symbols)}
-            buy_symbol_rows.sort(
-                key=lambda symbol: (
-                    desired_rank.get(str(symbol), len(desired_rank)),
-                    str(symbol),
-                )
+        .options(
+            load_only(
+                ExecutionPlanItem.id,
+                ExecutionPlanItem.symbol,
+                ExecutionPlanItem.provider,
+                ExecutionPlanItem.risk_context,
+                ExecutionPlanItem.quantity_policy,
+                ExecutionPlanItem.asset_class,
+            ),
+            selectinload(ExecutionPlanItem.plan).load_only(
+                ExecutionPlan.id,
+                ExecutionPlan.market_date,
+            ),
+        )
+        .order_by(ExecutionPlanItem.symbol.asc(), ExecutionPlanItem.id.asc())
+    ).all()
+    if effective_at is not None or current_market_date is None:
+        active_watch_items = [
+            item
+            for item in active_watch_items
+            if _monitoring_item_is_effective_at(
+                item=item,
+                effective_at=resolved_effective_at,
             )
-        # Every persisted active watch item is executable work. Keep the full
-        # bounded set here and let the runtime round-robin scheduler batch it;
-        # truncating to one quote batch starves the remaining active items.
-        append_candidates(buy_symbol_rows, enforce_limit=False)
+        ]
+    buy_symbol_rows = sorted(
+        {
+            str(item.symbol)
+            for item in active_watch_items
+            if classify_kis_account_route(
+                settings=settings,
+                provider=str(item.provider or "kis").strip().lower(),
+                risk_context=_loaded_risk_context(
+                    item,
+                    allow_file_backed_load=True,
+                ),
+                quantity_policy=item.quantity_policy,
+            )
+            == "active"
+        }
+    )
+    desired_symbols = _load_core_desired_monitoring_symbols(settings=settings)
+    if desired_symbols:
+        desired_rank = {symbol: index for index, symbol in enumerate(desired_symbols)}
+        buy_symbol_rows.sort(
+            key=lambda symbol: (
+                desired_rank.get(str(symbol), len(desired_rank)),
+                str(symbol),
+            )
+        )
+    # Every persisted active watch item is executable work. Keep the full
+    # bounded set here and let the runtime round-robin scheduler batch it;
+    # truncating to one quote batch starves the remaining active items.
+    append_candidates(buy_symbol_rows, enforce_limit=False)
 
     if len(symbol_candidates) < symbol_cycle_limit:
         pending_sell_symbols = list(
@@ -890,12 +1824,16 @@ def expire_known_flat_pending_sell_monitors(
     expired_at: datetime | None = None,
 ) -> int:
     expired_at = _normalize_utc(expired_at or datetime.now(UTC))
+    effective_plan_filter = _effective_monitor_plan_filter(
+        effective_at=expired_at,
+        current_market_date=None,
+    )
     held_symbols = select(ExecutionPosition.symbol).where(
-        ExecutionPosition.mode == settings.runtime_mode,
+        *_active_kis_position_filters(settings=settings),
         ExecutionPosition.quantity > 0,
     )
     known_flat_symbols = select(ExecutionPosition.symbol).where(
-        ExecutionPosition.mode == settings.runtime_mode,
+        *_active_kis_position_filters(settings=settings),
         ExecutionPosition.quantity <= 0,
     )
     active_watch_symbols = (
@@ -906,16 +1844,18 @@ def expire_known_flat_pending_sell_monitors(
             ExecutionPlanItem.side == "buy",
             ExecutionPlanItem.intent.in_(tuple(WATCH_BUY_INTENTS)),
             ExecutionPlanItem.status.in_(tuple(WATCH_MONITORING_STATUSES)),
+            effective_plan_filter,
         )
     )
     where = [
-            ExecutionPlan.mode == settings.runtime_mode,
-            ExecutionPlanItem.side == "sell",
-            ExecutionPlanItem.intent.in_(tuple(SELL_MONITORED_INTENTS)),
-            ExecutionPlanItem.status.in_(tuple(SELL_STALE_FLAT_EXPIRABLE_STATUSES)),
-            ExecutionPlanItem.symbol.in_(known_flat_symbols),
-            ExecutionPlanItem.symbol.not_in(held_symbols),
-            ExecutionPlanItem.symbol.not_in(active_watch_symbols),
+        ExecutionPlan.mode == settings.runtime_mode,
+        ExecutionPlanItem.side == "sell",
+        ExecutionPlanItem.intent.in_(tuple(SELL_MONITORED_INTENTS)),
+        ExecutionPlanItem.status.in_(tuple(SELL_STALE_FLAT_EXPIRABLE_STATUSES)),
+        ExecutionPlanItem.symbol.in_(known_flat_symbols),
+        ExecutionPlanItem.symbol.not_in(held_symbols),
+        ExecutionPlanItem.symbol.not_in(active_watch_symbols),
+        effective_plan_filter,
     ]
     where.append(~_unexited_buy_sell_monitor_fallback_filter(settings=settings))
     candidates = db.scalars(
@@ -930,6 +1870,17 @@ def expire_known_flat_pending_sell_monitors(
             ExecutionPlanItem.id.asc(),
         )
     ).all()
+
+    candidates = [
+        item
+        for item in candidates
+        if _monitoring_item_is_effective_at(item=item, effective_at=expired_at)
+    ]
+    candidates = _quarantine_invalid_sell_monitor_routes(
+        settings=settings,
+        items=candidates,
+        recorded_at=expired_at,
+    )
 
     for item in candidates:
         prior_status = item.status
@@ -958,6 +1909,17 @@ def _evaluate_monitoring_cycle(
     update_checkpoint_if_idle: bool,
 ) -> EvaluateMonitoringResult:
     cycle_started = time.monotonic()
+    checkpoint_execution_scope = _monitoring_checkpoint_execution_scope(
+        settings=settings,
+    )
+    checkpoint_scope_status = (
+        "available" if checkpoint_execution_scope is not None else "unavailable"
+    )
+    checkpoint_scope_reason = (
+        None
+        if checkpoint_execution_scope is not None
+        else "stable_account_scope_unavailable"
+    )
 
     def _log_cycle_step(step: str, **extra: object) -> None:
         logger.info(
@@ -994,9 +1956,12 @@ def _evaluate_monitoring_cycle(
         db=db,
         exclude_pending_config=allow_persisted_triggered_without_price,
         symbols=symbols,
+        current_market_date=triggered_at.astimezone(KRX_TIMEZONE).date(),
+        effective_at=triggered_at,
     )
     _log_cycle_step("load_monitored_items", item_count=len(items))
     rearmed_protective_stop_item_ids = _reactivate_retryable_protective_stops(
+        settings=settings,
         items=items,
         db=db,
         triggered_at=triggered_at,
@@ -1064,6 +2029,8 @@ def _evaluate_monitoring_cycle(
             db=db,
             exclude_pending_config=allow_persisted_triggered_without_price,
             symbols=symbols,
+            current_market_date=triggered_at.astimezone(KRX_TIMEZONE).date(),
+            effective_at=triggered_at,
         )
     if skip_pre_cycle_broker_reconciliation:
         coverage_issues = []
@@ -1080,6 +2047,7 @@ def _evaluate_monitoring_cycle(
         settings=settings,
         db=db,
         positions_by_symbol=positions_by_symbol,
+        evaluated_at=triggered_at,
     )
     _log_cycle_step(
         "stop_coverage",
@@ -1097,6 +2065,8 @@ def _evaluate_monitoring_cycle(
             db=db,
             exclude_pending_config=allow_persisted_triggered_without_price,
             symbols=symbols,
+            current_market_date=triggered_at.astimezone(KRX_TIMEZONE).date(),
+            effective_at=triggered_at,
         )
         items = _prefer_same_cycle_cloned_stop_repairs(
             items=items,
@@ -1116,6 +2086,7 @@ def _evaluate_monitoring_cycle(
             triggered_at=triggered_at,
         )
         items = _filter_sell_items_to_held_symbols(
+            settings=settings,
             items=items,
             positions_by_symbol=positions_by_symbol,
         )
@@ -1155,7 +2126,7 @@ def _evaluate_monitoring_cycle(
             continue
 
         price = prices.get(item.symbol)
-        observed_price = price.price if price is not None else None
+        observed_price = _observed_price_for_item(price=price, item=item)
         retry_persisted_trigger = (
             allow_persisted_triggered_without_price
             and price is None
@@ -1167,10 +2138,15 @@ def _evaluate_monitoring_cycle(
         if price is None and not retry_persisted_trigger and item.intent != "max_holding_close_sell":
             continue
 
+        item_position = _position_for_monitoring_item(
+            settings=settings,
+            item=item,
+            positions_by_symbol=positions_by_symbol,
+        )
         if (
             not allow_persisted_triggered_without_price
             and not _is_watch_buy_item(item)
-            and item.symbol not in positions_by_symbol
+            and item_position is None
             and _monitoring_item_is_configured(item)
         ):
             continue
@@ -1230,7 +2206,13 @@ def _evaluate_monitoring_cycle(
                 price=price,
                 cycle_at=triggered_at,
             )
-            if quote_stale_reason is not None:
+            quote_trust_reason = _live_automated_quote_trust_reason(
+                settings=settings,
+                item=item,
+                price=price,
+            )
+            quote_rejection_reason = quote_stale_reason or quote_trust_reason
+            if quote_rejection_reason is not None:
                 blocked_item_count += 1
                 monitoring_status = _monitoring_status(item.intent)
                 if (
@@ -1246,8 +2228,12 @@ def _evaluate_monitoring_cycle(
                             if _is_watch_buy_item(item)
                             else "sell_quote_rejected"
                         ),
-                        "reason": "stale_quote",
-                        "message": quote_stale_reason,
+                        "reason": (
+                            "stale_quote"
+                            if quote_stale_reason is not None
+                            else "untrusted_quote_provenance"
+                        ),
+                        "message": quote_rejection_reason,
                         "observed_price": _serialize_decimal(observed_price),
                         "observed_at": _serialize_datetime(
                             _provided_price_observed_at(price)
@@ -1258,8 +2244,12 @@ def _evaluate_monitoring_cycle(
                 result_by_item_id[item.id] = _monitoring_result_payload(
                     item=item,
                     observed_price=observed_price,
-                    outcome="stale_quote",
-                    message=quote_stale_reason,
+                    outcome=(
+                        "stale_quote"
+                        if quote_stale_reason is not None
+                        else "untrusted_quote_provenance"
+                    ),
+                    message=quote_rejection_reason,
                 )
                 continue
 
@@ -1300,7 +2290,7 @@ def _evaluate_monitoring_cycle(
             )
         elif _is_triggered(
             item=item,
-            observed_price=price.price if price is not None else None,
+            observed_price=observed_price,
             triggered_at=triggered_at,
         ):
             trigger_reason = item.intent
@@ -1308,7 +2298,7 @@ def _evaluate_monitoring_cycle(
             profit_protection = _evaluate_profit_protection(
                 settings=settings,
                 item=item,
-                position=positions_by_symbol.get(item.symbol),
+                position=item_position,
                 observed_price=observed_price,
                 triggered_at=triggered_at,
             )
@@ -1509,8 +2499,12 @@ def _evaluate_monitoring_cycle(
             PendingMonitoringAction(
                 item=item,
                 observed_price=observed_price,
+                price=price,
                 observed_at=_price_observed_at(price, triggered_at) if price is not None else None,
-                market_quality_context=_market_quality_context_from_price(price),
+                market_quality_context=_market_quality_context_from_price(
+                    price,
+                    item=item,
+                ),
                 trigger_reason=trigger_reason,
                 trigger_metadata=trigger_metadata,
             )
@@ -1518,7 +2512,12 @@ def _evaluate_monitoring_cycle(
 
     max_broker_actions = settings.monitoring_max_broker_actions_per_cycle
     _prioritize_sell_actions_by_symbol(actions_by_symbol)
-    pending_symbols = deque(symbol_order)
+    pending_symbols = deque(
+        _prioritized_monitoring_symbol_order(
+            symbol_order=symbol_order,
+            actions_by_symbol=actions_by_symbol,
+        )
+    )
     if max_broker_actions <= 0:
         backlog_symbols: set[str] = set()
         for symbol, symbol_actions in actions_by_symbol.items():
@@ -1544,20 +2543,13 @@ def _evaluate_monitoring_cycle(
             results=results,
         )
         db.flush()
-        agent_status_counts = (
-            {
-                "watching": 0,
-                "pending_agent_decision": 0,
-                "agent_delayed": 0,
-                "agent_rejected": 0,
-                "agent_approved_submitted": 0,
-            }
-            if skip_pre_cycle_broker_reconciliation
-            else _trigger_time_agent_status_counts(settings=settings, db=db)
-        )
+        agent_status_counts = _trigger_time_agent_status_counts(items=items)
         checkpoint_details = {
             "topology": MONITORING_RUNTIME_TOPOLOGY,
             "selection_strategy": MONITORING_SELECTION_STRATEGY,
+            "execution_scope": checkpoint_execution_scope,
+            "execution_scope_status": checkpoint_scope_status,
+            "execution_scope_reason": checkpoint_scope_reason,
             "max_symbols_per_cycle": settings.monitoring_max_symbols_per_cycle,
             "max_broker_actions_per_cycle": max_broker_actions,
             "dispatch_action_count": 0,
@@ -1574,6 +2566,8 @@ def _evaluate_monitoring_cycle(
             "submitted_symbols": [],
             "backlog_item_count": deferred_item_count,
             "backlog_symbols": sorted(backlog_symbols),
+            "agent_count_scope": "selected_cycle_items",
+            "agent_count_item_count": len(items),
             "agent_watching_count": agent_status_counts["watching"],
             "agent_pending_decision_count": agent_status_counts["pending_agent_decision"],
             "agent_delayed_count": agent_status_counts["agent_delayed"],
@@ -1605,7 +2599,11 @@ def _evaluate_monitoring_cycle(
             status_code=200,
             payload={
                 "triggered_at": triggered_at.isoformat(),
-                "worker_name": checkpoint.worker_name,
+                "worker_name": (
+                    checkpoint.worker_name
+                    if checkpoint is not None
+                    else MONITORING_WORKER_NAME
+                ),
                 "evaluated_item_count": len(results),
                 "triggered_item_count": triggered_item_count,
                 "submitted_order_count": 0,
@@ -1621,6 +2619,12 @@ def _evaluate_monitoring_cycle(
             },
         )
     while pending_symbols:
+        pending_symbols = deque(
+            _prioritized_monitoring_symbol_order(
+                symbol_order=list(pending_symbols),
+                actions_by_symbol=actions_by_symbol,
+            )
+        )
         symbol = pending_symbols.popleft()
         symbol_actions = actions_by_symbol.get(symbol)
         if not symbol_actions:
@@ -1632,6 +2636,7 @@ def _evaluate_monitoring_cycle(
         ) or action.item.status in AGENT_ACTIVE_STATUSES:
             action.item.status = _monitoring_status(action.item.intent)
         is_watch_buy = _is_watch_buy_item(action.item)
+        deterministic_sell_quantity_cap: int | None = None
         limit_price_override: Decimal | None = None
         if is_watch_buy:
             action.item.status = "watch_buy_triggered"
@@ -1648,6 +2653,7 @@ def _evaluate_monitoring_cycle(
                         adapter=adapter,
                         action=action,
                         triggered_at=triggered_at,
+                        cycle_started=cycle_started,
                     )
                 else:
                     agent_result = _resolve_trigger_time_agent_action(
@@ -1656,10 +2662,17 @@ def _evaluate_monitoring_cycle(
                         adapter=adapter,
                         action=action,
                         triggered_at=triggered_at,
+                        cycle_started=cycle_started,
                         intended_quantity=None,
                         remaining_quantity=None,
                     )
                 if agent_result is not None:
+                    if agent_result.refreshed_price is not None:
+                        action = _action_with_refreshed_price(
+                            action=action,
+                            price=agent_result.refreshed_price,
+                        )
+                        prices[action.item.symbol] = agent_result.refreshed_price
                     if agent_result.quantity is None:
                         blocked_item_count += 1
                         result_by_item_id[action.item.id] = agent_result.result_payload
@@ -1675,6 +2688,7 @@ def _evaluate_monitoring_cycle(
                 item=action.item,
                 observed_price=action.observed_price,
                 price=prices.get(action.item.symbol),
+                execution_price_override=limit_price_override,
                 requested_quantity=trigger_time_agent_quantity,
                 trigger_time_agent_approved=trigger_time_agent_quantity is not None,
                 sizing_source=(
@@ -1764,6 +2778,7 @@ def _evaluate_monitoring_cycle(
                     settings=settings,
                     db=db,
                     symbol=action.item.symbol,
+                    exchange=_plan_item_exchange(action.item),
                 )
                 result_by_item_id[action.item.id] = _monitoring_result_payload(
                     item=action.item,
@@ -1783,6 +2798,7 @@ def _evaluate_monitoring_cycle(
                 if symbol_actions:
                     pending_symbols.append(symbol)
                 continue
+            deterministic_sell_quantity_cap = quantity
             if trigger_time_exec_agent.trigger_time_exec_agent_enabled(
                 settings=settings,
                 item=action.item,
@@ -1793,9 +2809,16 @@ def _evaluate_monitoring_cycle(
                     adapter=adapter,
                     action=action,
                     triggered_at=triggered_at,
+                    cycle_started=cycle_started,
                     intended_quantity=quantity,
                     remaining_quantity=remaining_quantities_by_symbol.get(action.item.symbol),
                 )
+                if agent_result.refreshed_price is not None:
+                    action = _action_with_refreshed_price(
+                        action=action,
+                        price=agent_result.refreshed_price,
+                    )
+                    prices[action.item.symbol] = agent_result.refreshed_price
                 if agent_result.quantity is None:
                     blocked_item_count += 1
                     result_by_item_id[action.item.id] = agent_result.result_payload
@@ -1816,7 +2839,11 @@ def _evaluate_monitoring_cycle(
                     _reserve_and_rearm_sell_after_success,
                     settings=settings,
                     item=action.item,
-                    position=positions_by_symbol.get(action.item.symbol),
+                    position=_position_for_monitoring_item(
+                        settings=settings,
+                        item=action.item,
+                        positions_by_symbol=positions_by_symbol,
+                    ),
                     remaining_quantities_by_symbol=remaining_quantities_by_symbol,
                     submitted_quantity=quantity,
                     recorded_at=triggered_at,
@@ -1916,6 +2943,62 @@ def _evaluate_monitoring_cycle(
                         if symbol_actions:
                             pending_symbols.append(symbol)
                         continue
+                    pre_submit_at = triggered_at + timedelta(
+                        seconds=max(0.0, time.monotonic() - cycle_started)
+                    )
+                    pre_submit_price = prices.get(action.item.symbol)
+                    pre_submit_quote_reason = (
+                        _quote_stale_reason(
+                            settings=settings,
+                            price=pre_submit_price,
+                            cycle_at=pre_submit_at,
+                        )
+                        if settings.runtime_mode == "live"
+                        else None
+                    )
+                    pre_submit_quote_reason = pre_submit_quote_reason or (
+                        _live_automated_quote_trust_reason(
+                            settings=settings,
+                            item=action.item,
+                            price=pre_submit_price,
+                        )
+                    )
+                    if pre_submit_quote_reason is not None:
+                        blocked_item_count += 1
+                        action.item.status = "watch_buy_triggered_blocked"
+                        _record_monitoring_event(
+                            item=action.item,
+                            event={
+                                "event": "watch_buy_triggered_blocked",
+                                "reason": "pre_submit_quote_stale",
+                                "message": pre_submit_quote_reason,
+                                "observed_price": _serialize_decimal(
+                                    action.observed_price
+                                ),
+                                "observed_at": _serialize_datetime(
+                                    _provided_price_observed_at(pre_submit_price)
+                                ),
+                                "retry_after_at": (
+                                    pre_submit_at
+                                    + timedelta(
+                                        seconds=settings.monitoring_watch_buy_retry_cooldown_seconds
+                                    )
+                                ).isoformat(),
+                                "recorded_at": pre_submit_at.isoformat(),
+                            },
+                        )
+                        result_by_item_id[action.item.id] = (
+                            _monitoring_result_payload(
+                                item=action.item,
+                                observed_price=action.observed_price,
+                                outcome="blocked",
+                                block_reason="pre_submit_quote_stale",
+                                message=pre_submit_quote_reason,
+                            )
+                        )
+                        if symbol_actions:
+                            pending_symbols.append(symbol)
+                        continue
                     watch_buy_cash_reservation.already_reserved_notional += candidate_notional
 
             dispatch_action_count += 1
@@ -1935,6 +3018,7 @@ def _evaluate_monitoring_cycle(
                 ),
                 limit_price_override=limit_price_override,
                 before_success_commit=before_success_commit,
+                deterministic_sell_quantity_cap=deterministic_sell_quantity_cap,
             )
             if placement.status_code == 201:
                 if is_watch_buy:
@@ -2012,6 +3096,7 @@ def _evaluate_monitoring_cycle(
                             "event": "watch_buy_triggered_blocked",
                             "reason": placement.payload.get("block_reason"),
                             "message": placement.payload.get("message"),
+                            "retry_after_at": placement.payload.get("retry_after_at"),
                             "observed_price": _serialize_decimal(action.observed_price),
                             "recorded_at": triggered_at.isoformat(),
                         },
@@ -2112,23 +3197,14 @@ def _evaluate_monitoring_cycle(
     )
     db.flush()
     _log_cycle_step("flush_results", result_count=len(results))
-    if skip_pre_cycle_broker_reconciliation:
-        agent_status_counts = {
-            "watching": 0,
-            "pending_agent_decision": 0,
-            "agent_delayed": 0,
-            "agent_rejected": 0,
-            "agent_approved_submitted": 0,
-        }
-    else:
-        agent_status_counts = _trigger_time_agent_status_counts(
-            settings=settings,
-            db=db,
-        )
+    agent_status_counts = _trigger_time_agent_status_counts(items=items)
     _log_cycle_step("agent_status_counts")
     checkpoint_details = {
         "topology": MONITORING_RUNTIME_TOPOLOGY,
         "selection_strategy": MONITORING_SELECTION_STRATEGY,
+        "execution_scope": checkpoint_execution_scope,
+        "execution_scope_status": checkpoint_scope_status,
+        "execution_scope_reason": checkpoint_scope_reason,
         "max_symbols_per_cycle": settings.monitoring_max_symbols_per_cycle,
         "max_broker_actions_per_cycle": max_broker_actions,
         "dispatch_action_count": dispatch_action_count,
@@ -2145,6 +3221,8 @@ def _evaluate_monitoring_cycle(
         "submitted_symbols": sorted(submitted_symbols),
         "backlog_item_count": deferred_item_count,
         "backlog_symbols": sorted(backlog_symbols),
+        "agent_count_scope": "selected_cycle_items",
+        "agent_count_item_count": len(items),
         "agent_watching_count": agent_status_counts["watching"],
         "agent_pending_decision_count": agent_status_counts["pending_agent_decision"],
         "agent_delayed_count": agent_status_counts["agent_delayed"],
@@ -2215,12 +3293,39 @@ def _prioritize_sell_actions_by_symbol(
         ordered_actions = sorted(
             actions,
             key=lambda action: (
-                1 if _is_watch_buy_item(action.item) else 0,
+                _monitoring_action_priority(action),
                 action.item.plan_item_index,
                 action.item.id,
             ),
         )
         actions_by_symbol[symbol] = deque(ordered_actions)
+
+
+def _monitoring_action_priority(action: PendingMonitoringAction) -> int:
+    if action.item.side == "sell" and action.item.intent == "stop_sell":
+        return 0
+    if action.item.side == "sell":
+        return 1
+    return 2
+
+
+def _prioritized_monitoring_symbol_order(
+    *,
+    symbol_order: list[str],
+    actions_by_symbol: dict[str, deque[PendingMonitoringAction]],
+) -> list[str]:
+    """Keep every protective stop ahead of other sells, and every sell ahead of buys."""
+
+    original_position = {symbol: index for index, symbol in enumerate(symbol_order)}
+    return sorted(
+        symbol_order,
+        key=lambda symbol: (
+            _monitoring_action_priority(actions_by_symbol[symbol][0])
+            if actions_by_symbol.get(symbol)
+            else 3,
+            original_position[symbol],
+        ),
+    )
 
 
 def expire_prior_market_date_unfilled_watch_buys(
@@ -2229,11 +3334,25 @@ def expire_prior_market_date_unfilled_watch_buys(
     db: Session,
     current_market_date: date,
     expired_at: datetime | None = None,
+    max_age_trading_sessions: int = 1,
+    effective_at: datetime | None = None,
 ) -> int:
     expired_at = _normalize_utc(expired_at or datetime.now(UTC))
-    expiry_market_date = func.coalesce(
-        ExecutionPlan.market_date,
-        ExecutionPlanItem.source_market_date,
+    resolved_effective_at = (
+        _normalize_utc(effective_at) if effective_at is not None else None
+    )
+    authority_projection = ExecutionPlanItem.risk_context["core_buy_authority"]
+    authority_previous = authority_projection["previous"]
+    authority_blocked_watch = and_(
+        ExecutionPlanItem.status == "watch_expired",
+        authority_projection["schema_version"].as_string()
+        == "core_buy_authority_projection_v1",
+        authority_projection["source"].as_string()
+        == "core_live_market_buy_authority",
+        authority_projection["action"].as_string() == "block_new_buy",
+        authority_previous["status"].as_string().in_(
+            tuple(WATCH_BUY_EXPIRABLE_STATUSES)
+        ),
     )
     candidates = db.scalars(
         select(ExecutionPlanItem)
@@ -2242,9 +3361,10 @@ def expire_prior_market_date_unfilled_watch_buys(
             ExecutionPlan.mode == settings.runtime_mode,
             ExecutionPlanItem.side == "buy",
             ExecutionPlanItem.intent.in_(tuple(WATCH_BUY_INTENTS)),
-            ExecutionPlanItem.status.in_(tuple(WATCH_BUY_EXPIRABLE_STATUSES)),
-            expiry_market_date.is_not(None),
-            expiry_market_date < current_market_date,
+            or_(
+                ExecutionPlanItem.status.in_(tuple(WATCH_BUY_EXPIRABLE_STATUSES)),
+                authority_blocked_watch,
+            ),
             ~ExecutionPlanItem.broker_orders.any(),
         )
         .options(
@@ -2256,6 +3376,10 @@ def expire_prior_market_date_unfilled_watch_buys(
                 ExecutionPlanItem.side,
                 ExecutionPlanItem.intent,
                 ExecutionPlanItem.status,
+                ExecutionPlanItem.provider,
+                ExecutionPlanItem.venue,
+                ExecutionPlanItem.asset_class,
+                ExecutionPlanItem.quantity_policy,
                 ExecutionPlanItem.risk_context,
                 ExecutionPlanItem.source_market_date,
             ),
@@ -2273,23 +3397,593 @@ def expire_prior_market_date_unfilled_watch_buys(
             ExecutionPlanItem.id.asc(),
         )
     ).all()
-
+    scoped_candidates: list[ExecutionPlanItem] = []
+    quarantined_route_count = 0
     for item in candidates:
+        risk_context = _loaded_risk_context(item, allow_file_backed_load=True)
+        if item.status == "watch_expired":
+            authority = (
+                risk_context.get("core_buy_authority")
+                if isinstance(risk_context, dict)
+                else None
+            )
+            previous = (
+                authority.get("previous")
+                if isinstance(authority, dict)
+                else None
+            )
+            if (
+                not isinstance(authority, dict)
+                or authority.get("schema_version")
+                != "core_buy_authority_projection_v1"
+                or authority.get("source") != "core_live_market_buy_authority"
+                or authority.get("action") != "block_new_buy"
+                or not isinstance(previous, dict)
+                or previous.get("status") not in WATCH_BUY_EXPIRABLE_STATUSES
+            ):
+                continue
+        if resolved_effective_at is not None and not _monitoring_item_is_effective_at(
+            item=item,
+            effective_at=resolved_effective_at,
+        ):
+            continue
+        provider = str(item.provider or "kis").strip().lower()
+        if provider in {"korea-investment", "korea_investment"}:
+            provider = "kis"
+        if provider != "kis":
+            continue
+        route_classification = classify_kis_account_route(
+            settings=settings,
+            provider=provider,
+            risk_context=risk_context,
+            quantity_policy=item.quantity_policy,
+        )
+        if route_classification == "active":
+            scoped_candidates.append(item)
+        elif route_classification == "indeterminate":
+            if not _quarantine_invalid_kis_watch_routes(
+                settings=settings,
+                items=[item],
+                recorded_at=expired_at,
+            ):
+                quarantined_route_count += 1
+    candidates = scoped_candidates
+    if quarantined_route_count:
+        # Session factories deliberately disable autoflush. Persist quarantine
+        # before the duplicate-selection query can observe stale active rows.
+        db.flush()
+
+    observed_market_dates = sorted(
+        market_date
+        for market_date in db.scalars(
+            select(distinct(ExecutionPlan.market_date)).where(
+                ExecutionPlan.mode == settings.runtime_mode,
+                ExecutionPlan.market_date.is_not(None),
+                ExecutionPlan.market_date <= current_market_date,
+            )
+        ).all()
+        if market_date is not None
+    )
+    hard_max_calendar_days = max(
+        WATCH_BUY_MIN_HARD_CALENDAR_TTL_DAYS,
+        max_age_trading_sessions * 4,
+    )
+    expired: list[tuple[ExecutionPlanItem, date, date, int, int, str]] = []
+    for item in candidates:
+        item_current_market_date = (
+            _plan_item_market_date(item=item, effective_at=resolved_effective_at)
+            if resolved_effective_at is not None
+            else current_market_date
+        )
+        source_market_date = _watch_buy_source_market_date(item)
+        if source_market_date >= item_current_market_date:
+            continue
+        age_trading_sessions = sum(
+            source_market_date < market_date <= item_current_market_date
+            for market_date in observed_market_dates
+        )
+        age_calendar_days = (item_current_market_date - source_market_date).days
+        if age_trading_sessions >= max_age_trading_sessions:
+            expiry_reason = "trading_session_ttl_elapsed"
+        elif age_calendar_days >= hard_max_calendar_days:
+            expiry_reason = "calendar_safety_ttl_elapsed"
+        else:
+            continue
+        expired.append(
+            (
+                item,
+                source_market_date,
+                item_current_market_date,
+                age_trading_sessions,
+                age_calendar_days,
+                expiry_reason,
+            )
+        )
+
+    for (
+        item,
+        source_market_date,
+        item_current_market_date,
+        age_trading_sessions,
+        age_calendar_days,
+        expiry_reason,
+    ) in expired:
         prior_status = item.status
         item.status = "watch_expired"
-        item_source_market_date = item.plan.market_date or item.source_market_date
+        risk_context = dict(
+            _loaded_risk_context(item, allow_file_backed_load=True)
+        )
+        authority = risk_context.get("core_buy_authority")
+        if (
+            isinstance(authority, dict)
+            and authority.get("schema_version")
+            == "core_buy_authority_projection_v1"
+            and authority.get("source") == "core_live_market_buy_authority"
+            and authority.get("action") == "block_new_buy"
+        ):
+            authority = dict(authority)
+            previous = (
+                dict(authority.get("previous"))
+                if isinstance(authority.get("previous"), dict)
+                else {}
+            )
+            previous["status"] = "watch_expired"
+            authority["previous"] = previous
+            authority["recovery"] = {
+                "status": "not_restored_terminal",
+                "reason": expiry_reason,
+                "expired_at": expired_at.isoformat(),
+            }
+            risk_context["core_buy_authority"] = authority
+            item.risk_context = risk_context
+        legacy_expiry = settings.runtime_mode != "live" and max_age_trading_sessions == 1
         _record_monitoring_event(
             item=item,
             event={
-                "event": "market_date_expired_unfilled",
-                "reason": "prior_market_date_unfilled_watch_buy",
+                "event": (
+                    "market_date_expired_unfilled"
+                    if legacy_expiry
+                    else f"watch_buy_{expiry_reason}"
+                ),
+                "reason": (
+                    "prior_market_date_unfilled_watch_buy"
+                    if legacy_expiry
+                    else expiry_reason
+                ),
                 "prior_status": prior_status,
-                "source_market_date": _serialize_date(item_source_market_date),
-                "current_market_date": current_market_date.isoformat(),
+                "source_market_date": source_market_date.isoformat(),
+                "current_market_date": item_current_market_date.isoformat(),
+                "age_trading_sessions": age_trading_sessions,
+                "max_age_trading_sessions": max_age_trading_sessions,
+                "age_calendar_days": age_calendar_days,
+                "hard_max_calendar_days": hard_max_calendar_days,
                 "recorded_at": expired_at.isoformat(),
             },
         )
-    return len(candidates)
+    return len(expired)
+
+
+def _watch_buy_max_age_trading_sessions(settings: Settings) -> int | None:
+    if settings.runtime_mode == "live":
+        return settings.monitoring_watch_buy_max_age_trading_sessions
+    if settings.monitoring_expire_prior_market_watch_buys_enabled:
+        return 1
+    return None
+
+
+def _watch_buy_source_market_date(item: ExecutionPlanItem) -> date:
+    if item.plan.market_date is not None:
+        return item.plan.market_date
+    if item.source_market_date is not None:
+        return item.source_market_date
+    accepted_at = _normalize_utc(item.plan.accepted_at)
+    return accepted_at.astimezone(KRX_TIMEZONE).date()
+
+
+def supersede_duplicate_active_watch_buys(
+    *,
+    settings: Settings,
+    db: Session,
+    superseded_at: datetime | None = None,
+    current_market_date: date | None = None,
+    effective_at: datetime | None = None,
+) -> int:
+    resolved_effective_at = _normalize_utc(effective_at or datetime.now(UTC))
+    effective_plan_filter = _effective_monitor_plan_filter(
+        effective_at=(
+            resolved_effective_at
+            if effective_at is not None or current_market_date is None
+            else None
+        ),
+        current_market_date=current_market_date,
+    )
+    candidates = db.scalars(
+        select(ExecutionPlanItem)
+        .join(ExecutionPlanItem.plan)
+        .where(
+            ExecutionPlan.mode == settings.runtime_mode,
+            effective_plan_filter,
+            ExecutionPlanItem.side == "buy",
+            ExecutionPlanItem.intent.in_(tuple(WATCH_BUY_INTENTS)),
+            ExecutionPlanItem.status.in_(tuple(ACTIVE_WATCH_MONITORING_STATUSES)),
+            ~ExecutionPlanItem.broker_orders.any(),
+        )
+        .options(
+            load_only(
+                ExecutionPlanItem.id,
+                ExecutionPlanItem.execution_plan_id,
+                ExecutionPlanItem.plan_item_index,
+                ExecutionPlanItem.symbol,
+                ExecutionPlanItem.side,
+                ExecutionPlanItem.intent,
+                ExecutionPlanItem.status,
+                ExecutionPlanItem.risk_context,
+                ExecutionPlanItem.quantity_policy,
+                ExecutionPlanItem.source_market_date,
+                ExecutionPlanItem.provider,
+                ExecutionPlanItem.asset_class,
+            ),
+            selectinload(ExecutionPlanItem.plan).load_only(
+                ExecutionPlan.id,
+                ExecutionPlan.market_date,
+                ExecutionPlan.requested_at,
+                ExecutionPlan.accepted_at,
+            ),
+        )
+    ).all()
+    if effective_at is not None or current_market_date is None:
+        candidates = [
+            item
+            for item in candidates
+            if _monitoring_item_is_effective_at(
+                item=item,
+                effective_at=resolved_effective_at,
+            )
+        ]
+    prior_statuses = {item.id: item.status for item in candidates}
+    eligible_candidates = _quarantine_invalid_kis_watch_routes(
+        settings=settings,
+        items=candidates,
+        recorded_at=_normalize_utc(superseded_at or datetime.now(UTC)),
+    )
+    quarantined_count = sum(
+        item.status != prior_statuses[item.id]
+        for item in candidates
+    )
+    ordered = sorted(eligible_candidates, key=_active_watch_recency_key, reverse=True)
+    canonical_by_route: dict[tuple[str, str, str, str], ExecutionPlanItem] = {}
+    superseded: list[tuple[ExecutionPlanItem, ExecutionPlanItem]] = []
+    for item in ordered:
+        route_key = _active_watch_route_key(item)
+        canonical = canonical_by_route.get(route_key)
+        if canonical is None:
+            canonical_by_route[route_key] = item
+            continue
+        superseded.append((item, canonical))
+
+    recorded_at = _normalize_utc(superseded_at or datetime.now(UTC)).isoformat()
+    for item, canonical in superseded:
+        prior_status = item.status
+        item.status = "superseded"
+        _record_monitoring_event(
+            item=item,
+            event={
+                "event": "duplicate_watch_buy_superseded",
+                "reason": "newer_active_watch_buy_exists",
+                "prior_status": prior_status,
+                "superseded_by_execution_plan_item_id": canonical.id,
+                "recorded_at": recorded_at,
+            },
+        )
+    return quarantined_count + len(superseded)
+
+
+def _active_watch_route_key(item: ExecutionPlanItem) -> tuple[str, str, str, str]:
+    symbol = str(item.symbol or "").strip().upper()
+    is_krx_equity = _is_krx_equity_symbol(symbol)
+    provider = str(item.provider or ("kis" if is_krx_equity else "unknown")).strip().lower()
+    if provider in {"korea-investment", "korea_investment"}:
+        provider = "kis"
+    raw_asset_class = item.asset_class or ("stock" if is_krx_equity else "unknown")
+    try:
+        asset_class = canonical_execution_asset_class(
+            raw_asset_class,
+            provider=provider,
+            exchange=_plan_item_exchange(item) if is_krx_equity else "unspecified",
+        )
+    except ValueError:
+        asset_class = str(raw_asset_class).strip().lower()
+    exchange = _plan_item_exchange(item)
+    # A single account must never carry two simultaneous new-buy authorities
+    # for the same market instrument. Entry-family identity still scopes
+    # protective exits, but it must not allow duplicate BUYs to race each other.
+    return provider, asset_class, exchange, symbol
+
+
+def _active_watch_recency_key(
+    item: ExecutionPlanItem,
+) -> tuple[str, str, str, str, int, str]:
+    market_date = item.plan.market_date or item.source_market_date or date.min
+    requested_at = item.plan.requested_at
+    accepted_at = item.plan.accepted_at
+    return (
+        market_date.isoformat(),
+        _normalize_utc(requested_at).isoformat() if requested_at is not None else "",
+        accepted_at.isoformat() if accepted_at is not None else "",
+        item.execution_plan_id,
+        -item.plan_item_index,
+        item.id,
+    )
+
+
+def _claim_trigger_time_agent_action(
+    *,
+    db: Session,
+    action: PendingMonitoringAction,
+    triggered_at: datetime,
+) -> TriggerTimeAgentClaim | TriggerTimeAgentActionResult:
+    item = action.item
+    local_risk_context = dict(_loaded_risk_context(item))
+    local_quantity_policy = item.quantity_policy
+    item_state = sa_inspect(item)
+    prior_risk_context = _attribute_value_before_local_changes(
+        item_state.attrs.risk_context.history,
+        fallback=item.risk_context,
+    )
+    prior_quantity_policy = _attribute_value_before_local_changes(
+        item_state.attrs.quantity_policy.history,
+        fallback=item.quantity_policy,
+    )
+    expected_identity = _trigger_time_agent_claim_identity(
+        item,
+        risk_context=prior_risk_context,
+        quantity_policy=prior_quantity_policy,
+    )
+    current_state = _current_buy_plan_item_state(
+        db=db,
+        item_id=item.id,
+        lock=True,
+    )
+    if current_state is None:
+        db.rollback()
+        return _trigger_time_agent_claim_lost_result(item=item, action=action)
+    current_status, _ = current_state
+    with db.no_autoflush:
+        db.refresh(
+            item,
+            attribute_names=[
+                "execution_plan_id",
+                "status",
+                "provider",
+                "venue",
+                "asset_class",
+                "symbol",
+                "side",
+                "intent",
+                "limit_price",
+                "trigger_price",
+                "time_in_force",
+                "base_quantity",
+                "quote_notional",
+                "quantity_precision",
+                "price_precision",
+                "risk_context",
+                "quantity_policy",
+            ],
+        )
+    claimable_statuses = {
+        "watch_monitoring_pending",
+        _monitoring_status(item.intent),
+        _pending_dispatch_status(item.intent),
+        "watch_buy_triggered",
+        "watch_buy_triggered_blocked",
+        AGENT_DELAY_STATUS,
+    }
+    refreshed_identity = _trigger_time_agent_claim_identity(item)
+    if (
+        current_status not in claimable_statuses
+        or refreshed_identity != expected_identity
+    ):
+        db.rollback()
+        with db.no_autoflush:
+            db.refresh(item)
+        return _trigger_time_agent_claim_lost_result(item=item, action=action)
+
+    durable_risk_context = dict(_loaded_risk_context(item))
+    durable_risk_context.update(local_risk_context)
+    durable_events = durable_risk_context.get("monitoring_events")
+    local_events = local_risk_context.get("monitoring_events")
+    combined_events: list[object] = []
+    for event in (
+        *(durable_events if isinstance(durable_events, list) else []),
+        *(local_events if isinstance(local_events, list) else []),
+    ):
+        if event not in combined_events:
+            combined_events.append(event)
+    if combined_events:
+        durable_risk_context["monitoring_events"] = combined_events[-19:]
+    item.risk_context = compact_json_object(durable_risk_context)
+    item.quantity_policy = local_quantity_policy
+    claim_id = new_id()
+    item.status = AGENT_PENDING_STATUS
+    _record_monitoring_event(
+        item=item,
+        event={
+            "event": "trigger_time_exec_agent_pending",
+            "claim_id": claim_id,
+            "previous_status": current_status,
+            "trigger_reason": action.trigger_reason or item.intent,
+            "observed_price": _serialize_decimal(action.observed_price),
+            "recorded_at": triggered_at.isoformat(),
+        },
+    )
+    db.commit()
+    return TriggerTimeAgentClaim(
+        claim_id=claim_id,
+        previous_status=current_status,
+        identity=_trigger_time_agent_claim_identity(item),
+    )
+
+
+def _trigger_time_agent_claim_is_current(
+    *,
+    db: Session,
+    item: ExecutionPlanItem,
+    claim: TriggerTimeAgentClaim,
+) -> bool:
+    current_state = _current_buy_plan_item_state(
+        db=db,
+        item_id=item.id,
+        lock=True,
+    )
+    if current_state is None:
+        db.rollback()
+        return False
+    with db.no_autoflush:
+        db.refresh(
+            item,
+            attribute_names=[
+                "execution_plan_id",
+                "status",
+                "provider",
+                "venue",
+                "asset_class",
+                "symbol",
+                "side",
+                "intent",
+                "limit_price",
+                "trigger_price",
+                "time_in_force",
+                "base_quantity",
+                "quote_notional",
+                "quantity_precision",
+                "price_precision",
+                "risk_context",
+                "quantity_policy",
+            ],
+        )
+    risk_context = dict(_loaded_risk_context(item))
+    latest_event = risk_context.get("last_monitoring_event")
+    valid = bool(
+        item.status == AGENT_PENDING_STATUS
+        and _trigger_time_agent_claim_identity(item) == claim.identity
+        and isinstance(latest_event, dict)
+        and latest_event.get("event") == "trigger_time_exec_agent_pending"
+        and latest_event.get("claim_id") == claim.claim_id
+    )
+    if valid:
+        return True
+    db.rollback()
+    with db.no_autoflush:
+        db.refresh(item)
+    return False
+
+
+_TRIGGER_TIME_IDENTITY_UNSET = object()
+
+
+def _trigger_time_agent_claim_identity(
+    item: ExecutionPlanItem,
+    *,
+    risk_context: object = _TRIGGER_TIME_IDENTITY_UNSET,
+    quantity_policy: object = _TRIGGER_TIME_IDENTITY_UNSET,
+) -> tuple[object, ...]:
+    resolved_risk_context = (
+        _loaded_risk_context(item)
+        if risk_context is _TRIGGER_TIME_IDENTITY_UNSET
+        else risk_context
+    )
+    safety_context = (
+        dict(resolved_risk_context)
+        if isinstance(resolved_risk_context, dict)
+        else {}
+    )
+    for transient_key in (
+        "monitoring_events",
+        "last_monitoring_event",
+        "watch_buy_trigger_cross",
+        "last_stale_trigger_reclaim_check",
+        "latest_live_market_context",
+    ):
+        safety_context.pop(transient_key, None)
+    resolved_quantity_policy = (
+        item.quantity_policy
+        if quantity_policy is _TRIGGER_TIME_IDENTITY_UNSET
+        else quantity_policy
+    )
+    return (
+        item.execution_plan_id,
+        item.provider,
+        item.venue,
+        item.asset_class,
+        item.symbol,
+        item.side,
+        item.intent,
+        item.limit_price,
+        item.trigger_price,
+        item.time_in_force,
+        item.base_quantity,
+        item.quote_notional,
+        item.quantity_precision,
+        item.price_precision,
+        json_payload_hash(resolved_quantity_policy),
+        json_payload_hash(safety_context),
+    )
+
+
+def _attribute_value_before_local_changes(
+    history: object,
+    *,
+    fallback: object,
+) -> object:
+    deleted = getattr(history, "deleted", ())
+    return deleted[0] if deleted else fallback
+
+
+def _trigger_time_agent_claim_lost_result(
+    *,
+    item: ExecutionPlanItem,
+    action: PendingMonitoringAction,
+) -> TriggerTimeAgentActionResult:
+    return TriggerTimeAgentActionResult(
+        quantity=None,
+        limit_price=None,
+        result_payload=_monitoring_result_payload(
+            item=item,
+            observed_price=action.observed_price,
+            outcome="blocked",
+            block_reason="trigger_time_exec_agent_claim_lost",
+            message=(
+                "trigger-time exec-agent result was discarded because the durable "
+                "plan item changed while the decision was pending"
+            ),
+            trigger_reason=action.trigger_reason,
+            trigger_metadata=action.trigger_metadata,
+        ),
+    )
+
+
+def _cycle_bounded_trigger_agent_settings(
+    *,
+    settings: Settings,
+    cycle_started: float,
+) -> Settings | None:
+    """Leave enough cycle budget to terminate a timed-out agent subprocess."""
+
+    elapsed_seconds = max(0.0, time.monotonic() - cycle_started)
+    remaining_agent_seconds = int(
+        settings.monitoring_cycle_timeout_seconds - elapsed_seconds - 2.0
+    )
+    if remaining_agent_seconds < 1:
+        return None
+    return settings.model_copy(
+        update={
+            "exec_agent_trigger_time_timeout_seconds": min(
+                settings.exec_agent_trigger_time_timeout_seconds,
+                remaining_agent_seconds,
+            )
+        }
+    )
 
 
 def _resolve_trigger_time_agent_action(
@@ -2299,22 +3993,54 @@ def _resolve_trigger_time_agent_action(
     adapter: BrokerAdapter,
     action: PendingMonitoringAction,
     triggered_at: datetime,
+    cycle_started: float,
     intended_quantity: int | None,
     remaining_quantity: int | None,
 ) -> TriggerTimeAgentActionResult:
     item = action.item
-    previous_status = item.status
-    _record_monitoring_event(
-        item=item,
-        event={
-            "event": "trigger_time_exec_agent_pending",
-            "trigger_reason": action.trigger_reason or item.intent,
-            "observed_price": _serialize_decimal(action.observed_price),
-            "recorded_at": triggered_at.isoformat(),
-        },
+    claim = _claim_trigger_time_agent_action(
+        db=db,
+        action=action,
+        triggered_at=triggered_at,
     )
-    resolution = trigger_time_exec_agent.resolve_trigger_time_exec_agent_decision(
+    if isinstance(claim, TriggerTimeAgentActionResult):
+        return claim
+    previous_status = claim.previous_status
+    if settings.runtime_mode == "live" and _requires_trigger_time_liquidity_snapshot(item):
+        action, liquidity_failure = _refresh_trigger_time_action_liquidity(
+            settings=settings,
+            db=db,
+            adapter=adapter,
+            action=action,
+            reference_at=triggered_at
+            + timedelta(seconds=max(0.0, time.monotonic() - cycle_started)),
+        )
+        if liquidity_failure is not None:
+            return _trigger_time_agent_preflight_failure(
+                settings=settings,
+                db=db,
+                claim=claim,
+                action=action,
+                previous_status=previous_status,
+                recorded_at=triggered_at,
+                reason=liquidity_failure,
+            )
+    bounded_settings = _cycle_bounded_trigger_agent_settings(
         settings=settings,
+        cycle_started=cycle_started,
+    )
+    if bounded_settings is None:
+        return _trigger_time_agent_preflight_failure(
+            settings=settings,
+            db=db,
+            claim=claim,
+            action=action,
+            previous_status=previous_status,
+            recorded_at=triggered_at,
+            reason="monitoring cycle has insufficient time remaining for an agent decision",
+        )
+    resolution = trigger_time_exec_agent.resolve_trigger_time_exec_agent_decision(
+        settings=bounded_settings,
         db=db,
         adapter=adapter,
         item=item,
@@ -2329,6 +4055,8 @@ def _resolve_trigger_time_agent_action(
     )
     decision = resolution.decision
     if decision.decision == "keep_watching":
+        if not _trigger_time_agent_claim_is_current(db=db, item=item, claim=claim):
+            return _trigger_time_agent_claim_lost_result(item=item, action=action)
         item.status = _monitoring_status(item.intent)
         _record_monitoring_event(
             item=item,
@@ -2348,6 +4076,7 @@ def _resolve_trigger_time_agent_action(
             new_status=item.status,
             recorded_at=triggered_at,
         )
+        db.commit()
         return TriggerTimeAgentActionResult(
             quantity=None,
             limit_price=None,
@@ -2362,6 +4091,8 @@ def _resolve_trigger_time_agent_action(
         )
 
     if decision.decision == "delay":
+        if not _trigger_time_agent_claim_is_current(db=db, item=item, claim=claim):
+            return _trigger_time_agent_claim_lost_result(item=item, action=action)
         item.status = AGENT_DELAY_STATUS
         _record_monitoring_event(
             item=item,
@@ -2381,6 +4112,7 @@ def _resolve_trigger_time_agent_action(
             new_status=item.status,
             recorded_at=triggered_at,
         )
+        db.commit()
         return TriggerTimeAgentActionResult(
             quantity=None,
             limit_price=None,
@@ -2396,6 +4128,8 @@ def _resolve_trigger_time_agent_action(
         )
 
     if decision.decision == "reject":
+        if not _trigger_time_agent_claim_is_current(db=db, item=item, claim=claim):
+            return _trigger_time_agent_claim_lost_result(item=item, action=action)
         item.status = AGENT_REJECTED_STATUS
         _record_monitoring_event(
             item=item,
@@ -2414,6 +4148,7 @@ def _resolve_trigger_time_agent_action(
             new_status=item.status,
             recorded_at=triggered_at,
         )
+        db.commit()
         return TriggerTimeAgentActionResult(
             quantity=None,
             limit_price=None,
@@ -2427,8 +4162,370 @@ def _resolve_trigger_time_agent_action(
             ),
         )
 
+    refreshed_price: MonitoringPriceRequest | None = None
+    post_agent_limit_adjustment: dict[str, object] | None = None
+    post_agent_market_quality_context = action.market_quality_context
+    request_market_context = resolution.request_payload.get("market_context")
+    post_agent_delegated_context = (
+        request_market_context if isinstance(request_market_context, dict) else None
+    )
+    post_agent_evaluated_at = triggered_at
+    if settings.runtime_mode == "live":
+        refresh_started_at = triggered_at + timedelta(
+            seconds=max(0.0, time.monotonic() - cycle_started)
+        )
+        refreshed_price, refresh_error = _refresh_trigger_time_market_price(
+            settings=settings,
+            db=db,
+            adapter=adapter,
+            item=item,
+            reference_at=refresh_started_at,
+            trigger_liquidity_price=action.price,
+        )
+        revalidated_at = triggered_at + timedelta(
+            seconds=max(0.0, time.monotonic() - cycle_started)
+        )
+        if refresh_error is not None or refreshed_price is None:
+            return _post_agent_revalidation_failure(
+                db=db,
+                claim=claim,
+                item=item,
+                action=action,
+                resolution=resolution,
+                previous_status=previous_status,
+                recorded_at=revalidated_at,
+                reason="post_agent_quote_unavailable",
+                message=refresh_error or "broker quote refresh returned no quote",
+                outcome="agent_delay",
+                new_status=AGENT_DELAY_STATUS,
+            )
+        fresh_quality = _market_quality_context_from_price(
+            refreshed_price,
+            item=item,
+        )
+        post_agent_market_quality_context = fresh_quality
+        fresh_market_context, stale_reason = trigger_time_exec_agent._market_context(
+            settings=settings,
+            item=item,
+            observed_price=_observed_price_for_item(price=refreshed_price, item=item),
+            observed_at=refreshed_price.observed_at,
+            triggered_at=revalidated_at,
+            trigger_reason=action.trigger_reason,
+            trigger_metadata=action.trigger_metadata,
+            live_market_context=fresh_quality,
+        )
+        post_agent_delegated_context = fresh_market_context
+        post_agent_evaluated_at = revalidated_at
+        quote_reason = _quote_stale_reason(
+            settings=settings,
+            price=refreshed_price,
+            cycle_at=revalidated_at,
+        )
+        quality_reason = _post_agent_market_quality_reason(
+            settings=settings,
+            price=refreshed_price,
+            evaluated_at=revalidated_at,
+            side=item.side,
+        )
+        if (
+            quote_reason is not None
+            or stale_reason is not None
+            or fresh_market_context.get("live_execution_context_available") is not True
+            or quality_reason is not None
+        ):
+            missing_fields = fresh_market_context.get("missing_critical_fields")
+            detail = quote_reason or stale_reason or quality_reason
+            if detail is None and isinstance(missing_fields, list):
+                detail = f"missing live market fields: {', '.join(map(str, missing_fields))}"
+            return _post_agent_revalidation_failure(
+                db=db,
+                claim=claim,
+                item=item,
+                action=action,
+                resolution=resolution,
+                previous_status=previous_status,
+                recorded_at=revalidated_at,
+                reason="post_agent_market_quality_unavailable",
+                message=detail or "fresh live market context failed the execution quality gate",
+                outcome="agent_delay",
+                new_status=AGENT_DELAY_STATUS,
+                refreshed_price=refreshed_price,
+                market_quality_gate=fresh_market_context.get("live_execution_quality_gate"),
+            )
+        if not _post_agent_trigger_still_valid(
+            item=item,
+            price=refreshed_price,
+            decision=decision,
+            triggered_at=revalidated_at,
+        ):
+            return _post_agent_revalidation_failure(
+                db=db,
+                claim=claim,
+                item=item,
+                action=action,
+                resolution=resolution,
+                previous_status=previous_status,
+                recorded_at=revalidated_at,
+                reason="post_agent_trigger_not_met",
+                message="fresh broker quote no longer satisfies the monitored trigger",
+                outcome="waiting",
+                new_status=_monitoring_status(item.intent),
+                refreshed_price=refreshed_price,
+                market_quality_gate=fresh_market_context.get("live_execution_quality_gate"),
+            )
+        if _is_watch_buy_item(item):
+            chase_limit_price = _watch_buy_chase_limit_price(item)
+            refreshed_observed_price = _observed_price_for_item(
+                price=refreshed_price,
+                item=item,
+            )
+            if (
+                chase_limit_price is not None
+                and refreshed_observed_price is not None
+                and refreshed_observed_price > chase_limit_price
+            ):
+                return _post_agent_revalidation_failure(
+                    db=db,
+                    claim=claim,
+                    item=item,
+                    action=action,
+                    resolution=resolution,
+                    previous_status=previous_status,
+                    recorded_at=revalidated_at,
+                    reason="post_agent_chase_limit_exceeded",
+                    message="fresh broker quote is above the configured chase limit",
+                    outcome="waiting",
+                    new_status=_monitoring_status(item.intent),
+                    refreshed_price=refreshed_price,
+                    market_quality_gate=fresh_market_context.get("live_execution_quality_gate"),
+                )
+            if decision.limit_price is not None and refreshed_price.ask is not None:
+                fresh_limit_cap = refreshed_price.ask
+                if chase_limit_price is not None:
+                    fresh_limit_cap = min(fresh_limit_cap, chase_limit_price)
+                if decision.limit_price > fresh_limit_cap:
+                    original_limit_price = decision.limit_price
+                    decision.limit_price = fresh_limit_cap
+                    post_agent_limit_adjustment = {
+                        "reason": "fresh_ask_limit_cap",
+                        "agent_limit_price": _serialize_decimal(original_limit_price),
+                        "fresh_ask": _serialize_decimal(refreshed_price.ask),
+                        "chase_limit_price": _serialize_decimal(chase_limit_price),
+                        "adjusted_limit_price": _serialize_decimal(fresh_limit_cap),
+                    }
+
+    geometry_reference_price = (
+        _observed_price_for_item(price=refreshed_price, item=item)
+        if refreshed_price is not None
+        else action.observed_price
+    )
+    enforced_stop = _high_volatility_chase_override_stop_to_enforce(
+        item=item,
+        decision=decision,
+    )
+    geometry_decision = decision
+    geometry_error: str | None = None
+    if enforced_stop is not None:
+        if geometry_reference_price is None or geometry_reference_price <= 0:
+            geometry_error = "buy enforced stop requires a positive fresh reference price"
+        elif enforced_stop >= geometry_reference_price:
+            geometry_error = (
+                "buy enforced stop must be below fresh reference price: "
+                f"{enforced_stop}>={geometry_reference_price}"
+            )
+        else:
+            geometry_decision = decision.model_copy(
+                update={"updated_stop_price": enforced_stop}
+            )
+    if geometry_error is None:
+        geometry_error = trigger_time_exec_agent.trigger_time_decision_geometry_error(
+            decision=geometry_decision,
+            reference_price=geometry_reference_price,
+        )
+    economics_reason: str | None = None
+    economics_message: str | None = None
+    if geometry_error is None and _is_watch_buy_item(item):
+        effective_target = (
+            decision.updated_target_price or _watch_buy_target_price(item)
+        )
+        effective_stop = (
+            enforced_stop
+            or decision.updated_stop_price
+            or _watch_buy_stop_price(item)
+        )
+        execution_geometry_decision = geometry_decision.model_copy(
+            update={
+                "updated_trigger_price": None,
+                "updated_target_price": effective_target,
+                "updated_stop_price": effective_stop,
+            }
+        )
+        if effective_target is None:
+            geometry_error = "buy effective target requires a positive price"
+        else:
+            geometry_error = (
+                trigger_time_exec_agent.trigger_time_decision_geometry_error(
+                    decision=execution_geometry_decision,
+                    reference_price=geometry_reference_price,
+                )
+            )
+        if geometry_error is None and effective_target is not None:
+            target_entry_reference = geometry_reference_price
+            if decision.limit_price is not None and (
+                target_entry_reference is None
+                or decision.limit_price > target_entry_reference
+            ):
+                target_entry_reference = decision.limit_price
+            target_geometry_decision = execution_geometry_decision.model_copy(
+                update={"limit_price": None, "updated_stop_price": None}
+            )
+            geometry_error = (
+                trigger_time_exec_agent.trigger_time_decision_geometry_error(
+                    decision=target_geometry_decision,
+                    reference_price=target_entry_reference,
+                )
+            )
+        if geometry_error is None:
+            economics_stop = effective_stop_price(
+                settings=settings,
+                entry_price=target_entry_reference,
+                upstream_stop_price=effective_stop,
+            )
+            economics = assess_buy_economics(
+                reference_price=target_entry_reference,
+                target_price=effective_target,
+                stop_price=economics_stop,
+                minimum_reward_risk=_minimum_reward_risk_for_watch_buy(
+                    settings=settings,
+                    item=item,
+                ),
+                evidence=_post_agent_live_cost_evidence(
+                    settings=settings,
+                    item=item,
+                    market_context=post_agent_market_quality_context,
+                ),
+                require_cost_evidence=settings.runtime_mode == "live",
+            )
+            if economics.reason is not None:
+                economics_reason = f"post_agent_{economics.reason}"
+                economics_message = (
+                    "trigger-time approval failed deterministic buy economics: "
+                    f"{economics.reason}; gross_reward_risk="
+                    f"{_serialize_decimal(economics.gross_reward_risk)}; "
+                    f"net_reward_risk={_serialize_decimal(economics.net_reward_risk)}; "
+                    f"minimum_reward_risk={_serialize_decimal(economics.minimum_reward_risk)}; "
+                    f"estimated_round_trip_cost_bps="
+                    f"{_serialize_decimal(economics.estimated_round_trip_cost_bps)}"
+                )
+            elif delegated_rejections := delegated_buy_gate_rejections(
+                [_loaded_risk_context(item), item.quantity_policy],
+                evaluated_at=post_agent_evaluated_at,
+                live_market_context=post_agent_delegated_context,
+                economics=economics,
+                require_live_recheck=True,
+            ):
+                economics_reason = f"post_agent_{delegated_rejections[0]}"
+                economics_message = (
+                    "trigger-time approval failed deterministic delegated entry gates: "
+                    + ",".join(delegated_rejections)
+                )
+            elif settings.runtime_mode == "live" and is_short_term_watch_buy_intent(item.intent):
+                live_turnover = trusted_live_market_decimal(
+                    post_agent_delegated_context,
+                    field="turnover",
+                    evaluated_at=post_agent_evaluated_at,
+                )
+                if live_turnover is None:
+                    economics_reason = "post_agent_short_term_live_turnover_unavailable"
+                    economics_message = (
+                        "short-term buy requires timestamped trigger-time turnover evidence"
+                    )
+                elif live_turnover < SHORT_TERM_LIVE_MIN_TURNOVER_KRW:
+                    economics_reason = "post_agent_short_term_live_turnover_below_minimum"
+                    economics_message = (
+                        "short-term buy trigger-time turnover is below the deterministic "
+                        f"{_serialize_decimal(SHORT_TERM_LIVE_MIN_TURNOVER_KRW)} KRW floor"
+                    )
+    if geometry_error is not None:
+        return _post_agent_revalidation_failure(
+            db=db,
+            claim=claim,
+            item=item,
+            action=action,
+            resolution=resolution,
+            previous_status=previous_status,
+            recorded_at=(
+                refreshed_price.observed_at
+                if refreshed_price is not None
+                and refreshed_price.observed_at is not None
+                else triggered_at
+            ),
+            reason="post_agent_invalid_target_stop_geometry",
+            message=geometry_error,
+            outcome="agent_delay",
+            new_status=AGENT_DELAY_STATUS,
+            refreshed_price=refreshed_price,
+            market_quality_gate=_trigger_time_market_quality_gate(resolution),
+        )
+    if economics_reason is not None:
+        return _post_agent_revalidation_failure(
+            db=db,
+            claim=claim,
+            item=item,
+            action=action,
+            resolution=resolution,
+            previous_status=previous_status,
+            recorded_at=(
+                refreshed_price.observed_at
+                if refreshed_price is not None
+                and refreshed_price.observed_at is not None
+                else triggered_at
+            ),
+            reason=economics_reason,
+            message=economics_message or "trigger-time approval failed deterministic buy economics",
+            outcome="agent_delay",
+            new_status=AGENT_DELAY_STATUS,
+            refreshed_price=refreshed_price,
+            market_quality_gate=_trigger_time_market_quality_gate(resolution),
+        )
+
+    if not _trigger_time_agent_claim_is_current(db=db, item=item, claim=claim):
+        return _trigger_time_agent_claim_lost_result(item=item, action=action)
+    if item.side == "sell" and decision.updated_stop_price is not None:
+        locked_stop = _locked_effective_protective_stop_price(
+            db=db,
+            item=item,
+        )
+        if locked_stop is not None and decision.updated_stop_price < locked_stop:
+            return _post_agent_revalidation_failure(
+                db=db,
+                claim=claim,
+                item=item,
+                action=action,
+                resolution=resolution,
+                previous_status=previous_status,
+                recorded_at=triggered_at,
+                reason="post_agent_protective_stop_relaxation",
+                message=(
+                    "trigger-time sell approval would loosen the current protective "
+                    f"stop: {decision.updated_stop_price}<{locked_stop}"
+                ),
+                outcome="agent_delay",
+                new_status=AGENT_DELAY_STATUS,
+                refreshed_price=refreshed_price,
+                market_quality_gate=_trigger_time_market_quality_gate(resolution),
+            )
     item.status = AGENT_APPROVED_PENDING_SUBMIT_STATUS
     _apply_trigger_time_agent_adjustments(item=item, decision=decision)
+    if refreshed_price is not None and _requires_trigger_time_liquidity_snapshot(item):
+        _persist_trigger_time_liquidity_evidence(
+            item=item,
+            price=refreshed_price,
+        )
+    if post_agent_limit_adjustment is not None:
+        risk_context = dict(_loaded_risk_context(item))
+        risk_context["trigger_time_limit_price_revalidation"] = post_agent_limit_adjustment
+        item.risk_context = compact_json_object(risk_context)
     _record_monitoring_event(
         item=item,
         event={
@@ -2439,6 +4536,15 @@ def _resolve_trigger_time_agent_action(
             "updated_target_price": _serialize_decimal(decision.updated_target_price),
             "updated_stop_price": _serialize_decimal(decision.updated_stop_price),
             "observed_price": _serialize_decimal(action.observed_price),
+            "post_agent_observed_price": _serialize_decimal(
+                _observed_price_for_item(price=refreshed_price, item=item)
+                if refreshed_price is not None
+                else None
+            ),
+            "post_agent_observed_at": _serialize_datetime(
+                refreshed_price.observed_at if refreshed_price is not None else None
+            ),
+            "post_agent_limit_adjustment": post_agent_limit_adjustment,
             "market_quality_gate": _trigger_time_market_quality_gate(resolution),
             "recorded_at": triggered_at.isoformat(),
         },
@@ -2450,10 +4556,181 @@ def _resolve_trigger_time_agent_action(
         new_status=item.status,
         recorded_at=triggered_at,
     )
+    db.commit()
     return TriggerTimeAgentActionResult(
         quantity=decision.quantity,
         limit_price=decision.limit_price,
         result_payload={},
+        refreshed_price=refreshed_price,
+    )
+
+
+def _locked_effective_protective_stop_price(
+    *,
+    db: Session,
+    item: ExecutionPlanItem,
+) -> Decimal | None:
+    terminal_statuses = {
+        "agent_rejected",
+        "broker_order_failed",
+        "canceled",
+        "cancelled",
+        "expired",
+        "failed",
+        "filled",
+        "rejected",
+        "superseded",
+    }
+    stop_items = db.scalars(
+        select(ExecutionPlanItem)
+        .where(
+            ExecutionPlanItem.execution_plan_id == item.execution_plan_id,
+            ExecutionPlanItem.symbol == item.symbol,
+            ExecutionPlanItem.intent == "stop_sell",
+            ExecutionPlanItem.status.not_in(terminal_statuses),
+        )
+        .execution_options(populate_existing=True)
+        .with_for_update()
+    ).all()
+    stop_items = select_plan_item_family_members(
+        anchor=item,
+        candidates=stop_items,
+    )
+    candidates = [
+        stop_item.trigger_price
+        for stop_item in stop_items
+        if stop_item.trigger_price is not None
+        and stop_item.trigger_price.is_finite()
+        and stop_item.trigger_price > 0
+    ]
+    for payload in (item.risk_context, item.quantity_policy):
+        if not isinstance(payload, dict):
+            continue
+        for key in ("updated_stop_price", "stop_price", "stop_loss_price"):
+            candidate = _parse_positive_decimal(payload.get(key))
+            if candidate is not None:
+                candidates.append(candidate)
+    return max(candidates) if candidates else None
+
+
+def _post_agent_live_cost_evidence(
+    *,
+    settings: Settings,
+    item: ExecutionPlanItem,
+    market_context: dict[str, object],
+) -> dict[str, object]:
+    """Build the only cost context trusted for a live trigger-time buy."""
+
+    risk_context = _loaded_risk_context(item)
+    return configured_execution_cost_evidence(
+        settings=settings,
+        provider=item.provider or "kis",
+        asset_class=item.asset_class or "stock",
+        exchange=item.venue or risk_context.get("exchange") or "KRX",
+        live_quote_spread_bps=market_context.get("spread_bps"),
+        require_live_quote_spread=settings.runtime_mode == "live",
+    )
+
+
+def _refresh_trigger_time_action_liquidity(
+    *,
+    settings: Settings,
+    db: Session,
+    adapter: BrokerAdapter,
+    action: PendingMonitoringAction,
+    reference_at: datetime,
+) -> tuple[PendingMonitoringAction, str | None]:
+    if action.price is None:
+        return action, "trigger-time price is unavailable for liquidity binding"
+    try:
+        session_state = ensure_authenticated_broker_session(
+            settings=settings,
+            db=db,
+            adapter=adapter,
+            source="trigger_time_liquidity_refresh",
+            reason=f"refresh timestamped intraday liquidity for {action.item.symbol}",
+        )
+        quote = adapter.get_current_price(
+            session_state.access_token or "",
+            symbol=action.item.symbol,
+            exchange=_plan_item_exchange(action.item),
+        )
+        if quote is None:
+            return action, "trigger-time broker current-price endpoint returned no quote"
+        if quote.symbol != action.item.symbol:
+            return action, "trigger-time broker quote symbol identity mismatch"
+        context, context_failure = _fetch_live_market_context(
+            broker_adapter=adapter,
+            access_token=session_state.access_token or "",
+            quote=quote,
+        )
+        price = monitoring_price_from_broker_quote(
+            settings=settings,
+            quote=quote,
+            context=context,
+            context_failure=context_failure,
+            side=action.item.side,
+            purpose=action.item.intent,
+        )
+        price, failure = _merge_trigger_time_liquidity_snapshot(
+            settings=settings,
+            adapter=adapter,
+            access_token=session_state.access_token or "",
+            item=action.item,
+            price=price,
+            reference_at=reference_at,
+        )
+    except Exception as exc:
+        return action, (
+            "intraday liquidity refresh failed: "
+            f"{exc.__class__.__name__}: {_bounded_text(str(exc), max_length=240)}"
+        )
+    if failure is not None:
+        return action, failure
+    return _action_with_refreshed_price(action=action, price=price), None
+
+
+def _trigger_time_agent_preflight_failure(
+    *,
+    settings: Settings,
+    db: Session,
+    claim: TriggerTimeAgentClaim,
+    action: PendingMonitoringAction,
+    previous_status: str,
+    recorded_at: datetime,
+    reason: str,
+) -> TriggerTimeAgentActionResult:
+    item = action.item
+    if not _trigger_time_agent_claim_is_current(db=db, item=item, claim=claim):
+        return _trigger_time_agent_claim_lost_result(item=item, action=action)
+    item.status = "watch_buy_triggered_blocked"
+    retry_after_at = recorded_at + timedelta(
+        seconds=settings.monitoring_watch_buy_retry_cooldown_seconds
+    )
+    _record_monitoring_event(
+        item=item,
+        event={
+            "event": "trigger_time_liquidity_unavailable",
+            "reason": "trigger_time_liquidity_unavailable",
+            "message": reason,
+            "previous_status": previous_status,
+            "retry_after_at": retry_after_at.isoformat(),
+            "recorded_at": recorded_at.isoformat(),
+        },
+    )
+    db.commit()
+    return TriggerTimeAgentActionResult(
+        quantity=None,
+        limit_price=None,
+        result_payload=_monitoring_result_payload(
+            item=item,
+            observed_price=action.observed_price,
+            outcome="blocked",
+            block_reason="trigger_time_liquidity_unavailable",
+            message=reason,
+            trigger_reason=action.trigger_reason,
+            trigger_metadata=action.trigger_metadata,
+        ),
     )
 
 
@@ -2464,6 +4741,7 @@ def _resolve_trigger_time_quality_gate_delay(
     adapter: BrokerAdapter,
     action: PendingMonitoringAction,
     triggered_at: datetime,
+    cycle_started: float,
 ) -> TriggerTimeAgentActionResult | None:
     market_context, stale_reason = trigger_time_exec_agent._market_context(
         settings=settings,
@@ -2483,6 +4761,7 @@ def _resolve_trigger_time_quality_gate_delay(
         adapter=adapter,
         action=action,
         triggered_at=triggered_at,
+        cycle_started=cycle_started,
         intended_quantity=None,
         remaining_quantity=None,
     )
@@ -2500,25 +4779,519 @@ def _price_observed_at_from_action(
 
 def _market_quality_context_from_price(
     price: MonitoringPriceRequest | None,
+    *,
+    item: ExecutionPlanItem | None = None,
 ) -> dict[str, object] | None:
     if price is None:
         return None
+    provenance = dict(price.provenance or {})
+    session_type = price.session_type
+    normal_ordering_available = price.normal_ordering_available
+    if item is not None:
+        orderability_by_item = provenance.get("orderability_by_item")
+        purpose = "protective_stop" if item.intent == "stop_sell" else item.intent
+        orderability_key = monitoring_orderability_key(
+            side=item.side,
+            purpose=purpose,
+        )
+        selected_orderability = (
+            orderability_by_item.get(orderability_key)
+            if isinstance(orderability_by_item, dict)
+            else None
+        )
+        if isinstance(selected_orderability, dict):
+            selected_session = selected_orderability.get("session_type")
+            if isinstance(selected_session, str) and selected_session.strip():
+                session_type = selected_session
+            route_available = selected_orderability.get(
+                "normal_ordering_available"
+            )
+            broker_orderability = provenance.get("broker_orderability")
+            broker_available = (
+                broker_orderability.get("normal_ordering_available")
+                if isinstance(broker_orderability, dict)
+                else None
+            )
+            if isinstance(route_available, bool):
+                normal_ordering_available = (
+                    False if broker_available is False else route_available
+                )
+            provenance["selected_orderability"] = {
+                "key": orderability_key,
+                **selected_orderability,
+            }
+    spread_bps = price.spread_bps
+    if (
+        spread_bps is None
+        and price.bid is not None
+        and price.ask is not None
+        and price.ask >= price.bid
+    ):
+        midpoint = (price.ask + price.bid) / Decimal("2")
+        if midpoint > 0:
+            spread_bps = (price.ask - price.bid) / midpoint * Decimal("10000")
     return {
         "source": "monitoring_price_request",
+        "symbol": price.symbol,
+        "observed_at": (
+            price.observed_at.isoformat() if price.observed_at is not None else None
+        ),
+        "freshness_source": price.freshness_source,
         "bid": _serialize_decimal(price.bid),
         "ask": _serialize_decimal(price.ask),
         "spread": _serialize_decimal(price.spread),
-        "spread_bps": _serialize_decimal(price.spread_bps),
+        "spread_bps": _serialize_decimal(spread_bps),
         "orderbook_depth": _serialize_decimal(price.orderbook_depth),
         "orderbook_imbalance": _serialize_decimal(price.orderbook_imbalance),
         "volume": _serialize_decimal(price.volume),
         "turnover": _serialize_decimal(price.turnover),
         "day_high": _serialize_decimal(price.day_high),
         "day_low": _serialize_decimal(price.day_low),
-        "session_type": price.session_type,
-        "normal_ordering_available": price.normal_ordering_available,
-        "provenance": price.provenance or {},
+        "session_type": session_type,
+        "normal_ordering_available": normal_ordering_available,
+        "provenance": provenance,
     }
+
+
+def _refresh_trigger_time_market_price(
+    *,
+    settings: Settings,
+    db: Session,
+    adapter: BrokerAdapter,
+    item: ExecutionPlanItem,
+    reference_at: datetime,
+    trigger_liquidity_price: MonitoringPriceRequest | None,
+) -> tuple[MonitoringPriceRequest | None, str | None]:
+    try:
+        session_state = ensure_authenticated_broker_session(
+            settings=settings,
+            db=db,
+            adapter=adapter,
+            source="trigger_time_exec_agent_post_approval",
+            reason=f"refresh broker market context for {item.side} {item.symbol}",
+        )
+        access_token = session_state.access_token or ""
+        quote = adapter.get_current_price(
+            access_token,
+            symbol=item.symbol,
+            exchange=_plan_item_exchange(item),
+        )
+        if quote is None:
+            return None, "broker current-price endpoint returned no quote"
+        if quote.symbol.strip().upper() != item.symbol.strip().upper():
+            return None, (
+                "broker current-price symbol mismatch: "
+                f"expected {item.symbol}, received {quote.symbol}"
+            )
+        context, context_failure = _fetch_live_market_context(
+            broker_adapter=adapter,
+            access_token=access_token,
+            quote=quote,
+        )
+        price = monitoring_price_from_broker_quote(
+            settings=settings,
+            quote=quote,
+            context=context,
+            context_failure=context_failure,
+            side=item.side,
+            purpose="protective_stop" if item.intent == "stop_sell" else item.intent,
+        )
+        if _requires_trigger_time_liquidity_snapshot(item):
+            if trigger_liquidity_price is None:
+                return None, "timestamped trigger-time liquidity evidence is unavailable"
+            price = _copy_trigger_time_liquidity_fields(
+                destination=price,
+                source=trigger_liquidity_price,
+            )
+        return price, None
+    except Exception as exc:
+        return None, f"{exc.__class__.__name__}: {exc}"
+
+
+def _requires_trigger_time_liquidity_snapshot(item: ExecutionPlanItem) -> bool:
+    if item.side == "buy" and is_short_term_watch_buy_intent(item.intent):
+        return True
+    for context in (_loaded_risk_context(item), item.quantity_policy):
+        if not isinstance(context, dict):
+            continue
+        codes = context.get("delegated_gate_codes")
+        if isinstance(codes, list) and DELEGATED_LIQUIDITY_GATE_CODE in codes:
+            return True
+    return False
+
+
+def _minimum_reward_risk_for_watch_buy(
+    *,
+    settings: Settings,
+    item: ExecutionPlanItem,
+) -> Decimal:
+    configured = Decimal(str(settings.exec_agent_min_reward_risk))
+    if settings.runtime_mode == "live" and is_short_term_watch_buy_intent(item.intent):
+        return max(configured, SHORT_TERM_LIVE_MIN_NET_REWARD_RISK)
+    return configured
+
+
+def _merge_trigger_time_liquidity_snapshot(
+    *,
+    settings: Settings,
+    adapter: BrokerAdapter,
+    access_token: str,
+    item: ExecutionPlanItem,
+    price: MonitoringPriceRequest,
+    reference_at: datetime,
+) -> tuple[MonitoringPriceRequest, str | None]:
+    loader = getattr(adapter, "get_intraday_liquidity_snapshot", None)
+    if not callable(loader):
+        return price, "timestamped intraday liquidity endpoint is unavailable"
+    try:
+        snapshot = loader(
+            access_token,
+            symbol=item.symbol,
+            exchange=_plan_item_exchange(item),
+            reference_at=reference_at,
+        )
+    except Exception as exc:
+        return price, f"intraday liquidity refresh failed: {exc.__class__.__name__}"
+    reason = _trigger_time_liquidity_snapshot_reason(
+        settings=settings,
+        adapter=adapter,
+        item=item,
+        snapshot=snapshot,
+        reference_at=reference_at,
+    )
+    if reason is not None:
+        return price, reason
+    assert isinstance(snapshot, BrokerIntradayLiquiditySnapshot)
+    observed_at = _normalize_utc(snapshot.observed_at)
+    payload = snapshot.payload if isinstance(snapshot.payload, dict) else {}
+    field_source = {
+        "source": "broker_intraday_liquidity_snapshot",
+        "freshness_source": snapshot.freshness_source,
+        "observed_at": observed_at.isoformat(),
+        "endpoint": payload.get("endpoint"),
+        "tr_id": payload.get("tr_id"),
+    }
+    provenance = dict(price.provenance or {})
+    field_sources = dict(provenance.get("field_sources") or {})
+    for field in ("volume", "turnover", "day_high", "day_low"):
+        field_sources[field] = dict(field_source)
+    provenance["field_sources"] = field_sources
+    provenance["intraday_liquidity"] = {
+        **field_source,
+        "symbol": snapshot.symbol,
+        "exchange": snapshot.exchange,
+    }
+    return (
+        price.model_copy(
+            update={
+                "volume": snapshot.volume,
+                "turnover": snapshot.turnover,
+                "day_high": snapshot.day_high,
+                "day_low": snapshot.day_low,
+                "provenance": provenance,
+            }
+        ),
+        None,
+    )
+
+
+def _copy_trigger_time_liquidity_fields(
+    *,
+    destination: MonitoringPriceRequest,
+    source: MonitoringPriceRequest,
+) -> MonitoringPriceRequest:
+    source_provenance = source.provenance if isinstance(source.provenance, dict) else {}
+    source_fields = source_provenance.get("field_sources")
+    intraday = source_provenance.get("intraday_liquidity")
+    if not isinstance(source_fields, dict) or not isinstance(intraday, dict):
+        return destination
+    destination_provenance = dict(destination.provenance or {})
+    destination_fields = dict(destination_provenance.get("field_sources") or {})
+    for field in ("volume", "turnover", "day_high", "day_low"):
+        field_source = source_fields.get(field)
+        if isinstance(field_source, dict):
+            destination_fields[field] = dict(field_source)
+    destination_provenance["field_sources"] = destination_fields
+    destination_provenance["intraday_liquidity"] = dict(intraday)
+    return destination.model_copy(
+        update={
+            "volume": source.volume,
+            "turnover": source.turnover,
+            "day_high": source.day_high,
+            "day_low": source.day_low,
+            "provenance": destination_provenance,
+        }
+    )
+
+
+def _trigger_time_liquidity_snapshot_reason(
+    *,
+    settings: Settings,
+    adapter: BrokerAdapter,
+    item: ExecutionPlanItem,
+    snapshot: object,
+    reference_at: datetime,
+) -> str | None:
+    if not isinstance(snapshot, BrokerIntradayLiquiditySnapshot):
+        return "timestamped intraday liquidity endpoint returned no snapshot"
+    if str(adapter.provider or "").strip().lower() != "kis":
+        return "intraday liquidity provider identity mismatch"
+    if snapshot.symbol != item.symbol:
+        return "intraday liquidity symbol identity mismatch"
+    expected_exchange = _plan_item_exchange(item).strip().upper()
+    canonical_exchange = (
+        "KRX" if expected_exchange in {"KRX", "KOSPI", "KOSDAQ"} else expected_exchange
+    )
+    if snapshot.exchange != canonical_exchange:
+        return "intraday liquidity exchange identity mismatch"
+    if snapshot.freshness_source != "kis_exchange_intraday_minute_time":
+        return "intraday liquidity lacks trusted exchange-time provenance"
+    payload = snapshot.payload if isinstance(snapshot.payload, dict) else {}
+    if (
+        payload.get("provider") != "kis"
+        or payload.get("endpoint")
+        != "/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice"
+        or payload.get("tr_id") != "FHKST03010200"
+    ):
+        return "intraday liquidity endpoint identity mismatch"
+    if snapshot.observed_at.tzinfo is None or snapshot.observed_at.utcoffset() is None:
+        return "intraday liquidity timestamp is not timezone-aware"
+    observed_at = _normalize_utc(snapshot.observed_at)
+    evaluated_at = _normalize_utc(reference_at)
+    if observed_at.astimezone(ZoneInfo(settings.market_timezone)).date() != (
+        evaluated_at.astimezone(ZoneInfo(settings.market_timezone)).date()
+    ):
+        return "intraday liquidity trading date mismatch"
+    age = evaluated_at - observed_at
+    if age > timedelta(seconds=settings.monitoring_max_quote_age_seconds):
+        return "intraday liquidity snapshot is stale"
+    if age < -timedelta(
+        seconds=settings.monitoring_max_quote_future_skew_seconds
+    ):
+        return "intraday liquidity timestamp exceeds allowed future clock skew"
+    values = (snapshot.volume, snapshot.turnover, snapshot.day_high, snapshot.day_low)
+    if any(
+        (parsed := _parse_decimal(value)) is None or parsed < 0
+        for value in values[:2]
+    ) or any(
+        (parsed := _parse_decimal(value)) is None or parsed <= 0
+        for value in values[2:]
+    ):
+        return "intraday liquidity snapshot contains invalid numeric evidence"
+    if snapshot.day_low > snapshot.day_high:
+        return "intraday liquidity day range is invalid"
+    return None
+
+
+def _persist_trigger_time_liquidity_evidence(
+    *,
+    item: ExecutionPlanItem,
+    price: MonitoringPriceRequest,
+) -> None:
+    quantity_policy = (
+        dict(item.quantity_policy) if isinstance(item.quantity_policy, dict) else {}
+    )
+    provenance = price.provenance if isinstance(price.provenance, dict) else {}
+    field_sources = provenance.get("field_sources")
+    turnover_source = (
+        field_sources.get("turnover") if isinstance(field_sources, dict) else None
+    )
+    if not isinstance(turnover_source, dict):
+        return
+    quantity_policy[TRIGGER_TIME_LIQUIDITY_EVIDENCE_KEY] = {
+        "version": 1,
+        "provider": str(item.provider or "kis").strip().lower(),
+        "asset_class": str(item.asset_class or "stock").strip().lower(),
+        "exchange": _plan_item_exchange(item).strip().upper(),
+        "symbol": item.symbol,
+        "observed_at": turnover_source.get("observed_at"),
+        "freshness_source": turnover_source.get("freshness_source"),
+        "endpoint": turnover_source.get("endpoint"),
+        "tr_id": turnover_source.get("tr_id"),
+        "volume": _serialize_decimal(price.volume),
+        "turnover": _serialize_decimal(price.turnover),
+        "day_high": _serialize_decimal(price.day_high),
+        "day_low": _serialize_decimal(price.day_low),
+    }
+    item.quantity_policy = compact_json_object(quantity_policy)
+
+
+def _post_agent_market_quality_reason(
+    *,
+    settings: Settings,
+    price: MonitoringPriceRequest,
+    evaluated_at: datetime,
+    side: str,
+) -> str | None:
+    if price.bid is not None and price.ask is not None and price.bid > price.ask:
+        return "fresh broker quote has a crossed bid/ask spread"
+    if price.orderbook_depth is not None and price.orderbook_depth <= 0:
+        return "fresh broker orderbook has no positive displayed depth"
+    provenance = price.provenance if isinstance(price.provenance, dict) else {}
+    orderbook = provenance.get("orderbook")
+    if not isinstance(orderbook, dict):
+        return "fresh broker orderbook provenance is unavailable"
+    if orderbook.get("status") == "failed":
+        return f"fresh broker orderbook refresh failed: {orderbook.get('reason') or 'unknown'}"
+    if not _is_trusted_exchange_freshness_source(
+        orderbook.get("freshness_source")
+    ):
+        return "fresh broker orderbook lacks trusted exchange-time provenance"
+    observed_at = _parse_event_datetime(orderbook.get("observed_at"))
+    if observed_at is None:
+        return "fresh broker orderbook timestamp is unavailable"
+    normalized_side = side.strip().lower()
+    executable_field = "ask" if normalized_side == "buy" else "bid"
+    executable_price = getattr(price, executable_field)
+    if executable_price is None or executable_price <= 0:
+        return f"fresh broker quote lacks a positive executable {executable_field}"
+    field_sources = provenance.get("field_sources")
+    field_source = (
+        field_sources.get(executable_field)
+        if isinstance(field_sources, dict)
+        else None
+    )
+    if not isinstance(field_source, dict) or not _is_trusted_exchange_freshness_source(
+        field_source.get("freshness_source")
+    ):
+        return (
+            f"fresh broker {executable_field} lacks trusted field-level "
+            "exchange-time provenance"
+        )
+    field_observed_at = _parse_event_datetime(field_source.get("observed_at"))
+    if field_observed_at is None:
+        return f"fresh broker {executable_field} timestamp is unavailable"
+    if _normalize_utc(field_observed_at) != _normalize_utc(observed_at):
+        return (
+            f"fresh broker {executable_field} timestamp does not match the "
+            "orderbook snapshot"
+        )
+    normalized_evaluated_at = _normalize_utc(evaluated_at)
+    future_skew = observed_at - normalized_evaluated_at
+    if future_skew > timedelta(seconds=settings.monitoring_max_quote_future_skew_seconds):
+        return "fresh broker orderbook timestamp exceeds the allowed future clock skew"
+    age = normalized_evaluated_at - observed_at
+    if age > timedelta(seconds=settings.monitoring_max_quote_age_seconds):
+        return (
+            "fresh broker orderbook is stale: "
+            f"{age.total_seconds():.3f}s>{settings.monitoring_max_quote_age_seconds}s"
+        )
+    return None
+
+
+def _post_agent_trigger_still_valid(
+    *,
+    item: ExecutionPlanItem,
+    price: MonitoringPriceRequest,
+    decision: trigger_time_exec_agent.TriggerTimeExecAgentDecision,
+    triggered_at: datetime,
+) -> bool:
+    if _is_triggered(
+        item=item,
+        observed_price=_observed_price_for_item(price=price, item=item),
+        triggered_at=triggered_at,
+    ):
+        return True
+    if not _is_watch_buy_item(item):
+        return False
+    if _watch_buy_is_pullback_strategy(item):
+        return _persisted_watch_buy_trigger_cross(item) is not None
+    updated_trigger = decision.updated_trigger_price
+    if (
+        updated_trigger is None
+        or decision.updated_target_price is None
+        or decision.updated_stop_price is None
+    ):
+        return False
+    rationale = f"{decision.reason} {' '.join(decision.risk_notes)}".lower()
+    if "pullback" not in rationale and "reclaim" not in rationale:
+        return False
+    if _watch_buy_direction(item) == "at_or_below":
+        observed_price = _observed_price_for_item(price=price, item=item)
+        return observed_price is not None and observed_price <= updated_trigger
+    observed_price = _observed_price_for_item(price=price, item=item)
+    return observed_price is not None and observed_price >= updated_trigger
+
+
+def _post_agent_revalidation_failure(
+    *,
+    db: Session,
+    claim: TriggerTimeAgentClaim,
+    item: ExecutionPlanItem,
+    action: PendingMonitoringAction,
+    resolution: trigger_time_exec_agent.TriggerTimeExecAgentResolution,
+    previous_status: str,
+    recorded_at: datetime,
+    reason: str,
+    message: str,
+    outcome: str,
+    new_status: str,
+    refreshed_price: MonitoringPriceRequest | None = None,
+    market_quality_gate: object | None = None,
+) -> TriggerTimeAgentActionResult:
+    if not _trigger_time_agent_claim_is_current(db=db, item=item, claim=claim):
+        return _trigger_time_agent_claim_lost_result(item=item, action=action)
+    item.status = new_status
+    observed_price = (
+        _observed_price_for_item(price=refreshed_price, item=item)
+        if refreshed_price is not None
+        else action.observed_price
+    )
+    event: dict[str, object] = {
+        "event": "trigger_time_exec_agent_post_approval_revalidation_failed",
+        "reason": reason,
+        "message": message,
+        "initial_observed_price": _serialize_decimal(action.observed_price),
+        "observed_price": _serialize_decimal(observed_price),
+        "observed_at": _serialize_datetime(
+            refreshed_price.observed_at if refreshed_price is not None else None
+        ),
+        "recorded_at": recorded_at.isoformat(),
+    }
+    if market_quality_gate is not None:
+        event["market_quality_gate"] = market_quality_gate
+    _record_monitoring_event(item=item, event=event)
+    trigger_time_exec_agent.record_trigger_time_exec_agent_interaction(
+        item=item,
+        resolution=resolution,
+        previous_status=previous_status,
+        new_status=item.status,
+        recorded_at=recorded_at,
+    )
+    db.commit()
+    return TriggerTimeAgentActionResult(
+        quantity=None,
+        limit_price=None,
+        result_payload=_monitoring_result_payload(
+            item=item,
+            observed_price=observed_price,
+            outcome=outcome,
+            block_reason=reason,
+            message=message,
+            trigger_reason=action.trigger_reason,
+            trigger_metadata=action.trigger_metadata,
+        ),
+        refreshed_price=refreshed_price,
+    )
+
+
+def _action_with_refreshed_price(
+    *,
+    action: PendingMonitoringAction,
+    price: MonitoringPriceRequest,
+) -> PendingMonitoringAction:
+    return PendingMonitoringAction(
+        item=action.item,
+        observed_price=_observed_price_for_item(price=price, item=action.item),
+        price=price,
+        observed_at=price.observed_at,
+        market_quality_context=_market_quality_context_from_price(
+            price,
+            item=action.item,
+        ),
+        trigger_reason=action.trigger_reason,
+        trigger_metadata=action.trigger_metadata,
+    )
 
 
 def _trigger_time_market_quality_gate(
@@ -2662,11 +5435,17 @@ def _update_sibling_trigger_price(
     plan = item.plan
     if plan is None:
         return
-    for sibling in plan.items:
-        if sibling.symbol != item.symbol or sibling.intent != intent:
-            continue
-        if sibling.status in NON_MONITORABLE_PLAN_ITEM_STATUSES:
-            continue
+    candidates = [
+        sibling
+        for sibling in plan.items
+        if sibling.symbol == item.symbol
+        and sibling.intent == intent
+        and sibling.status not in NON_MONITORABLE_PLAN_ITEM_STATUSES
+    ]
+    for sibling in select_plan_item_family_members(
+        anchor=item,
+        candidates=candidates,
+    ):
         sibling.trigger_price = trigger_price
 
 
@@ -2676,16 +5455,84 @@ def _load_monitored_items(
     db: Session,
     exclude_pending_config: bool = False,
     symbols: list[str] | set[str] | None = None,
+    current_market_date: date | None = None,
+    effective_at: datetime | None = None,
 ) -> list[ExecutionPlanItem]:
-    monitored_item_filter = _monitored_item_filter()
+    resolved_effective_at = _normalize_utc(effective_at or datetime.now(UTC))
+    use_effective_at = effective_at is not None or current_market_date is None
+    resolved_market_date = current_market_date or resolved_effective_at.astimezone(
+        KRX_TIMEZONE
+    ).date()
+    provider_filter = _kis_plan_item_provider_filter()
+    effective_plan_filter = _effective_monitor_plan_filter(
+        effective_at=resolved_effective_at if use_effective_at else None,
+        current_market_date=current_market_date,
+    )
+    monitored_item_filter = and_(
+        _monitored_item_filter(),
+        provider_filter,
+        effective_plan_filter,
+    )
     if symbols:
         monitored_item_filter = and_(
             monitored_item_filter,
             ExecutionPlanItem.symbol.in_(sorted(symbols)),
         )
+    route_candidate_where = [
+        ExecutionPlan.mode == settings.runtime_mode,
+        ExecutionPlanItem.side == "sell",
+        ExecutionPlanItem.intent.in_(tuple(SELL_MONITORED_INTENTS)),
+        ~ExecutionPlanItem.status.in_(tuple(NON_MONITORABLE_PLAN_ITEM_STATUSES)),
+        provider_filter,
+        effective_plan_filter,
+    ]
+    if symbols:
+        route_candidate_where.append(
+            ExecutionPlanItem.symbol.in_(_ordered_symbol_scope(symbols))
+        )
+    route_candidates = db.scalars(
+        select(ExecutionPlanItem)
+        .join(ExecutionPlanItem.plan)
+        .where(*route_candidate_where)
+        .options(
+            load_only(
+                ExecutionPlanItem.id,
+                ExecutionPlanItem.symbol,
+                ExecutionPlanItem.side,
+                ExecutionPlanItem.intent,
+                ExecutionPlanItem.status,
+                ExecutionPlanItem.quantity_policy,
+                ExecutionPlanItem.risk_context,
+                ExecutionPlanItem.provider,
+                ExecutionPlanItem.venue,
+                ExecutionPlanItem.asset_class,
+            )
+        )
+    ).all()
+    if use_effective_at:
+        route_candidates = [
+            item
+            for item in route_candidates
+            if _monitoring_item_is_effective_at(
+                item=item,
+                effective_at=resolved_effective_at,
+            )
+        ]
+    eligible_route_candidates = _quarantine_invalid_sell_monitor_routes(
+        settings=settings,
+        items=route_candidates,
+        positions_by_symbol=_load_positions_by_symbol(
+            settings=settings,
+            db=db,
+            symbols=symbols,
+        ),
+        recorded_at=datetime.now(UTC),
+    )
+    if len(eligible_route_candidates) != len(route_candidates):
+        db.flush()
     if exclude_pending_config:
         held_symbols = select(ExecutionPosition.symbol).where(
-            ExecutionPosition.mode == settings.runtime_mode,
+            *_active_kis_position_filters(settings=settings),
             ExecutionPosition.quantity > 0,
         )
         if symbols:
@@ -2733,6 +5580,10 @@ def _load_monitored_items(
                 ExecutionPlanItem.decision_run_id,
                 ExecutionPlanItem.source_plan_item_id,
                 ExecutionPlanItem.source_market_date,
+                ExecutionPlanItem.risk_context,
+                ExecutionPlanItem.provider,
+                ExecutionPlanItem.venue,
+                ExecutionPlanItem.asset_class,
             ),
         )
         if exclude_pending_config:
@@ -2741,13 +5592,26 @@ def _load_monitored_items(
                 sell_items.extend(
                     db.scalars(
                         select(ExecutionPlanItem)
+                        .join(ExecutionPlanItem.plan)
                         .where(
+                            ExecutionPlan.mode == settings.runtime_mode,
                             ExecutionPlanItem.symbol == symbol,
                             ExecutionPlanItem.side == "sell",
                             ExecutionPlanItem.intent.in_(tuple(SELL_MONITORED_INTENTS)),
                             ExecutionPlanItem.status.in_(tuple(sell_fast_statuses)),
+                            provider_filter,
+                            effective_plan_filter,
                         )
-                        .options(*sell_load_options)
+                        .options(
+                            *sell_load_options,
+                            selectinload(ExecutionPlanItem.plan).load_only(
+                                ExecutionPlan.id,
+                                ExecutionPlan.mode,
+                                ExecutionPlan.market_date,
+                                ExecutionPlan.requested_at,
+                                ExecutionPlan.accepted_at,
+                            ),
+                        )
                         .order_by(
                             ExecutionPlanItem.plan_item_index.asc(),
                             ExecutionPlanItem.id.asc(),
@@ -2756,11 +5620,15 @@ def _load_monitored_items(
                 )
             buy_items = db.scalars(
                 select(ExecutionPlanItem)
+                .join(ExecutionPlanItem.plan)
                 .where(
+                    ExecutionPlan.mode == settings.runtime_mode,
                     ExecutionPlanItem.symbol.in_(symbol_list),
                     ExecutionPlanItem.side == "buy",
                     ExecutionPlanItem.intent.in_(tuple(WATCH_BUY_INTENTS)),
                     ExecutionPlanItem.status.in_(tuple(WATCH_MONITORING_STATUSES)),
+                    provider_filter,
+                    effective_plan_filter,
                 )
                 .options(
                     load_only(
@@ -2781,31 +5649,48 @@ def _load_monitored_items(
                         ExecutionPlanItem.decision_run_id,
                         ExecutionPlanItem.source_plan_item_id,
                         ExecutionPlanItem.source_market_date,
-                    )
+                        ExecutionPlanItem.provider,
+                        ExecutionPlanItem.asset_class,
+                    ),
+                    selectinload(ExecutionPlanItem.plan).load_only(
+                        ExecutionPlan.id,
+                        ExecutionPlan.mode,
+                        ExecutionPlan.market_date,
+                        ExecutionPlan.requested_at,
+                        ExecutionPlan.accepted_at,
+                    ),
                 )
                 .order_by(
                     ExecutionPlanItem.symbol.asc(),
                     ExecutionPlanItem.plan_item_index.asc(),
                     ExecutionPlanItem.id.asc(),
                 )
-                .limit(settings.monitoring_max_symbols_per_cycle * 16)
             ).all()
             symbol_order = {symbol: index for index, symbol in enumerate(symbol_list)}
-            return sorted(
-                [*sell_items, *buy_items],
-                key=lambda item: (
-                    symbol_order.get(item.symbol, len(symbol_order)),
-                    item.plan_item_index,
-                    item.id,
+            return _canonicalize_loaded_active_watch_buys(
+                sorted(
+                    [*sell_items, *buy_items],
+                    key=lambda item: (
+                        symbol_order.get(item.symbol, len(symbol_order)),
+                        item.plan_item_index,
+                        item.id,
+                    ),
                 ),
+                settings=settings,
+                current_market_date=resolved_market_date,
+                effective_at=resolved_effective_at if use_effective_at else None,
             )
         sell_items = db.scalars(
             select(ExecutionPlanItem)
+            .join(ExecutionPlanItem.plan)
             .where(
+                ExecutionPlan.mode == settings.runtime_mode,
                 ExecutionPlanItem.symbol.in_(symbol_list),
                 ExecutionPlanItem.side == "sell",
                 ExecutionPlanItem.intent.in_(tuple(SELL_MONITORED_INTENTS)),
                 ExecutionPlanItem.status.in_(tuple(sell_fast_statuses)),
+                provider_filter,
+                effective_plan_filter,
             )
             .options(
                 *sell_load_options,
@@ -2813,6 +5698,7 @@ def _load_monitored_items(
                     ExecutionPlan.id,
                     ExecutionPlan.mode,
                     ExecutionPlan.market_date,
+                    ExecutionPlan.requested_at,
                     ExecutionPlan.accepted_at,
                 )
             )
@@ -2825,11 +5711,15 @@ def _load_monitored_items(
         ).all()
         buy_items = db.scalars(
             select(ExecutionPlanItem)
+            .join(ExecutionPlanItem.plan)
             .where(
+                ExecutionPlan.mode == settings.runtime_mode,
                 ExecutionPlanItem.symbol.in_(symbol_list),
                 ExecutionPlanItem.side == "buy",
                 ExecutionPlanItem.intent.in_(tuple(WATCH_BUY_INTENTS)),
                 ExecutionPlanItem.status.in_(tuple(WATCH_MONITORING_STATUSES)),
+                provider_filter,
+                effective_plan_filter,
             )
             .options(
                 load_only(
@@ -2846,11 +5736,14 @@ def _load_monitored_items(
                     ExecutionPlanItem.time_in_force,
                     ExecutionPlanItem.risk_context,
                     ExecutionPlanItem.source_market_date,
+                    ExecutionPlanItem.provider,
+                    ExecutionPlanItem.asset_class,
                 ),
                 selectinload(ExecutionPlanItem.plan).load_only(
                     ExecutionPlan.id,
                     ExecutionPlan.mode,
                     ExecutionPlan.market_date,
+                    ExecutionPlan.requested_at,
                     ExecutionPlan.accepted_at,
                 )
             )
@@ -2859,7 +5752,6 @@ def _load_monitored_items(
                 ExecutionPlanItem.plan_item_index.asc(),
                 ExecutionPlanItem.id.asc(),
             )
-            .limit(settings.monitoring_max_symbols_per_cycle * 16)
         ).all()
         symbol_order = {symbol: index for index, symbol in enumerate(symbol_list)}
         selected_items = sorted(
@@ -2870,7 +5762,12 @@ def _load_monitored_items(
                 item.id,
             ),
         )
-        return selected_items
+        return _canonicalize_loaded_active_watch_buys(
+            selected_items,
+            settings=settings,
+            current_market_date=resolved_market_date,
+            effective_at=resolved_effective_at if use_effective_at else None,
+        )
     latest_plan_candidates = (
         select(
             ExecutionPlanItem.symbol.label("symbol"),
@@ -2881,6 +5778,7 @@ def _load_monitored_items(
                 partition_by=ExecutionPlanItem.symbol,
                 order_by=(
                     ExecutionPlan.market_date.desc(),
+                    ExecutionPlan.requested_at.desc().nullslast(),
                     ExecutionPlan.accepted_at.desc(),
                     ExecutionPlan.id.desc(),
                 ),
@@ -2891,6 +5789,7 @@ def _load_monitored_items(
         .where(
             ExecutionPlan.mode == settings.runtime_mode,
             monitored_item_filter,
+            effective_plan_filter,
         )
         .subquery()
     )
@@ -2932,11 +5831,14 @@ def _load_monitored_items(
                 ExecutionPlanItem.time_in_force,
                 ExecutionPlanItem.risk_context,
                 ExecutionPlanItem.source_market_date,
+                ExecutionPlanItem.provider,
+                ExecutionPlanItem.asset_class,
             ),
             selectinload(ExecutionPlanItem.plan).load_only(
                 ExecutionPlan.id,
                 ExecutionPlan.mode,
                 ExecutionPlan.market_date,
+                ExecutionPlan.requested_at,
                 ExecutionPlan.accepted_at,
             ),
         )
@@ -2952,25 +5854,257 @@ def _load_monitored_items(
         db=db,
         selected_items=selected_items,
         symbols=symbols,
+        current_market_date=resolved_market_date,
+        effective_at=resolved_effective_at if use_effective_at else None,
     )
-    return _append_held_stop_sell_fallbacks(
+    selected_items = _append_held_stop_sell_fallbacks(
         settings=settings,
         db=db,
         monitored_item_filter=monitored_item_filter,
         selected_items=selected_items,
         symbols=symbols,
+        current_market_date=resolved_market_date,
+        effective_at=resolved_effective_at if use_effective_at else None,
     )
+    return _canonicalize_loaded_active_watch_buys(
+        selected_items,
+        settings=settings,
+        current_market_date=resolved_market_date,
+        effective_at=resolved_effective_at if use_effective_at else None,
+    )
+
+
+def _canonicalize_loaded_active_watch_buys(
+    items: list[ExecutionPlanItem],
+    *,
+    settings: Settings,
+    current_market_date: date | None = None,
+    effective_at: datetime | None = None,
+) -> list[ExecutionPlanItem]:
+    resolved_market_date = current_market_date or datetime.now(KRX_TIMEZONE).date()
+    if effective_at is not None:
+        items = [
+            item
+            for item in items
+            if _monitoring_item_is_effective_at(
+                item=item,
+                effective_at=effective_at,
+            )
+        ]
+    else:
+        items = [
+            item
+            for item in items
+            if not (
+                item.plan.market_date is not None
+                and item.plan.market_date > resolved_market_date
+            )
+            and not (
+                item.side == "buy"
+                and item.intent in WATCH_BUY_INTENTS
+                and item.plan.market_date is None
+            )
+        ]
+    items = _quarantine_invalid_sell_monitor_routes(
+        settings=settings,
+        items=items,
+        recorded_at=datetime.now(UTC),
+    )
+    items = _quarantine_invalid_kis_watch_routes(
+        settings=settings,
+        items=items,
+        recorded_at=datetime.now(UTC),
+    )
+    items = _canonicalize_loaded_sell_monitors(items)
+    canonical_by_route: dict[tuple[str, str, str, str], ExecutionPlanItem] = {}
+    for item in items:
+        if (
+            item.side != "buy"
+            or item.intent not in WATCH_BUY_INTENTS
+            or item.status not in ACTIVE_WATCH_MONITORING_STATUSES
+        ):
+            continue
+        route_key = _active_watch_route_key(item)
+        current = canonical_by_route.get(route_key)
+        if (
+            current is None
+            or _active_watch_recency_key(item) > _active_watch_recency_key(current)
+        ):
+            canonical_by_route[route_key] = item
+    canonical_ids = {item.id for item in canonical_by_route.values()}
+    return [
+        item
+        for item in items
+        if item.side != "buy"
+        or item.intent not in WATCH_BUY_INTENTS
+        or item.status not in ACTIVE_WATCH_MONITORING_STATUSES
+        or item.id in canonical_ids
+    ]
+
+
+def _canonicalize_loaded_sell_monitors(
+    items: list[ExecutionPlanItem],
+) -> list[ExecutionPlanItem]:
+    canonical_plan_by_authority: dict[
+        tuple[str, str, str, tuple[str, str, str, str]],
+        ExecutionPlanItem,
+    ] = {}
+    for item in items:
+        if item.side != "sell" or item.intent not in SELL_MONITORED_INTENTS:
+            continue
+        family_key = plan_item_entry_family_key(item)
+        if family_key is None and item.source_plan_item_id:
+            family_key = f"source:{item.source_plan_item_id}"
+        route_key = _sell_monitor_route_key(item)
+        if family_key is None or route_key is None:
+            # Unlinked legacy protection is intentionally retained; symbol-only
+            # deduplication cannot prove that two exits protect the same entry.
+            continue
+        authority_key = (item.symbol, item.intent, family_key, route_key)
+        current = canonical_plan_by_authority.get(authority_key)
+        if current is None or _sell_item_is_preferred_authority(item, current):
+            canonical_plan_by_authority[authority_key] = item
+
+    retained: list[ExecutionPlanItem] = []
+    for item in items:
+        if item.side != "sell" or item.intent not in SELL_MONITORED_INTENTS:
+            retained.append(item)
+            continue
+        family_key = plan_item_entry_family_key(item)
+        if family_key is None and item.source_plan_item_id:
+            family_key = f"source:{item.source_plan_item_id}"
+        route_key = _sell_monitor_route_key(item)
+        if family_key is None or route_key is None:
+            retained.append(item)
+            continue
+        authority_key = (item.symbol, item.intent, family_key, route_key)
+        canonical = canonical_plan_by_authority.get(authority_key)
+        if canonical is None or item.execution_plan_id == canonical.execution_plan_id:
+            retained.append(item)
+            continue
+        if _compare_sell_authorities(
+            _sell_item_authority(item),
+            _sell_item_authority(canonical),
+        ) == 0:
+            prior_status = item.status
+            if _sell_monitor_material(item) == _sell_monitor_material(canonical):
+                item.status = "superseded"
+                reason = "equal_source_authority_with_identical_material"
+            else:
+                item.status = "manual_review_required"
+                reason = "equal_source_authority_with_divergent_material"
+            _record_monitoring_event(
+                item=item,
+                event={
+                    "event": "sell_monitor_authority_conflict_resolved",
+                    "reason": reason,
+                    "prior_status": prior_status,
+                    "preserved_execution_plan_item_id": canonical.id,
+                    "recorded_at": datetime.now(UTC).isoformat(),
+                },
+            )
+    return retained
+
+
+def _record_ambiguous_entry_family_review(
+    *,
+    item: ExecutionPlanItem,
+    event: str,
+    competing_item_ids: list[str],
+    recorded_at: datetime,
+) -> None:
+    risk_context = _loaded_risk_context(item, allow_file_backed_load=True)
+    last_event = risk_context.get("last_monitoring_event")
+    if (
+        isinstance(last_event, dict)
+        and last_event.get("event") == event
+        and last_event.get("reason") == "ambiguous_entry_family"
+        and last_event.get("competing_execution_plan_item_ids")
+        == competing_item_ids
+    ):
+        return
+    _record_monitoring_event(
+        item=item,
+        event={
+            "event": event,
+            "reason": "ambiguous_entry_family",
+            "action": "manual_review",
+            "competing_execution_plan_item_ids": competing_item_ids,
+            "recorded_at": _normalize_utc(recorded_at).isoformat(),
+        },
+    )
+
+
+def _quarantine_invalid_kis_watch_routes(
+    *,
+    settings: Settings,
+    items: list[ExecutionPlanItem],
+    recorded_at: datetime,
+) -> list[ExecutionPlanItem]:
+    eligible: list[ExecutionPlanItem] = []
+    for item in items:
+        if (
+            item.side != "buy"
+            or item.intent not in WATCH_BUY_INTENTS
+            or item.status not in ACTIVE_WATCH_MONITORING_STATUSES
+        ):
+            eligible.append(item)
+            continue
+        provider = str(item.provider or "kis").strip().lower()
+        if provider in {"korea-investment", "korea_investment"}:
+            provider = "kis"
+        if provider != "kis":
+            # This coordinator owns only KIS. Another provider's active state
+            # must remain untouched for its dedicated runtime.
+            continue
+        if classify_kis_account_route(
+            settings=settings,
+            provider=provider,
+            risk_context=_loaded_risk_context(item, allow_file_backed_load=True),
+            quantity_policy=item.quantity_policy,
+        ) == "foreign":
+            # Another account owns this active entry candidate. Ignore it in
+            # the current runtime without destroying the owning route's state.
+            continue
+        rejection = _kis_monitoring_route_rejection(
+            settings=settings,
+            item=item,
+        )
+        if rejection is None:
+            eligible.append(item)
+            continue
+        reason, provided_route_fingerprint = rejection
+        prior_status = item.status
+        apply_plan_item_status(plan_item=item, status="watch_buy_rejected")
+        _record_monitoring_event(
+            item=item,
+            event={
+                "event": "watch_buy_account_route_rejected",
+                "reason": reason,
+                "prior_status": prior_status,
+                "provided_route_fingerprint": provided_route_fingerprint,
+                "recorded_at": _normalize_utc(recorded_at).isoformat(),
+            },
+        )
+    return eligible
 
 
 def _filter_sell_items_to_held_symbols(
     *,
+    settings: Settings,
     items: list[ExecutionPlanItem],
     positions_by_symbol: dict[str, ExecutionPosition],
 ) -> list[ExecutionPlanItem]:
     return [
         item
         for item in items
-        if _is_watch_buy_item(item) or item.symbol in positions_by_symbol
+        if _is_watch_buy_item(item)
+        or _position_for_monitoring_item(
+            settings=settings,
+            item=item,
+            positions_by_symbol=positions_by_symbol,
+        )
+        is not None
     ]
 
 
@@ -2982,7 +6116,7 @@ def _prepare_due_max_holding_items(
     positions_by_symbol: dict[str, ExecutionPosition],
     triggered_at: datetime,
 ) -> list[ExecutionPlanItem]:
-    """Promote one safe due max-holding exit per held symbol."""
+    """Promote one safe due max-holding exit per explicit entry family."""
     candidates_by_symbol: dict[str, list[ExecutionPlanItem]] = {}
     passthrough: list[ExecutionPlanItem] = []
     candidate_statuses = {
@@ -3005,6 +6139,30 @@ def _prepare_due_max_holding_items(
     )
     for symbol, candidates in sorted(candidates_by_symbol.items()):
         position = positions_by_symbol.get(symbol)
+        route_matched_candidates = [
+            item
+            for item in candidates
+            if _position_for_monitoring_item(
+                settings=settings,
+                item=item,
+                positions_by_symbol=positions_by_symbol,
+            )
+            is not None
+        ]
+        for item in candidates:
+            if item in route_matched_candidates:
+                continue
+            _record_max_holding_state_event(
+                db=db,
+                item=item,
+                event="max_holding_close_blocked",
+                reason="missing_exact_route_position_truth",
+                triggered_at=triggered_at,
+                position=None,
+            )
+        candidates = route_matched_candidates
+        if not candidates:
+            continue
         position_reconciled_at = (
             _normalize_utc(position.last_reconciled_at)
             if position is not None and position.last_reconciled_at is not None
@@ -3033,30 +6191,60 @@ def _prepare_due_max_holding_items(
                 )
             continue
 
-        candidates.sort(key=_max_holding_canonical_rank, reverse=True)
-        canonical = candidates[0]
-        if canonical.status != "max_holding_close_sell_monitoring":
-            canonical.status = "max_holding_close_sell_monitoring"
-            _record_max_holding_state_event(
-                db=db,
-                item=canonical,
-                event="max_holding_close_promoted",
-                reason="due_with_fresh_sellable_position",
-                triggered_at=triggered_at,
-                position=position,
-            )
-        passthrough.append(canonical)
-        for duplicate in candidates[1:]:
-            duplicate.status = "superseded"
-            _record_max_holding_state_event(
-                db=db,
-                item=duplicate,
-                event="max_holding_close_superseded",
-                reason="newer_canonical_due_exit_selected",
-                triggered_at=triggered_at,
-                position=position,
-                canonical_item_id=canonical.id,
-            )
+        candidates_by_family: dict[str, list[ExecutionPlanItem]] = {}
+        unresolved_candidates: list[ExecutionPlanItem] = []
+        for item in candidates:
+            family_key = plan_item_entry_family_key(item)
+            if family_key is None:
+                unresolved_candidates.append(item)
+            else:
+                candidates_by_family.setdefault(family_key, []).append(item)
+
+        if unresolved_candidates:
+            if len(candidates) == 1:
+                # Preserve the single-entry legacy contract. There is no
+                # competing family that could make the symbol fallback unsafe.
+                item = unresolved_candidates[0]
+                candidates_by_family[f"legacy-single:{item.id}"] = [item]
+            else:
+                # Never guess which same-symbol entry an unlinked close owns.
+                # Keep its durable status intact and leave a manual-review
+                # event instead of superseding or promoting it.
+                for item in unresolved_candidates:
+                    _record_max_holding_state_event(
+                        db=db,
+                        item=item,
+                        event="max_holding_close_blocked",
+                        reason="ambiguous_entry_family",
+                        triggered_at=triggered_at,
+                        position=position,
+                    )
+
+        for family_candidates in candidates_by_family.values():
+            family_candidates.sort(key=_max_holding_canonical_rank, reverse=True)
+            canonical = family_candidates[0]
+            if canonical.status != "max_holding_close_sell_monitoring":
+                canonical.status = "max_holding_close_sell_monitoring"
+                _record_max_holding_state_event(
+                    db=db,
+                    item=canonical,
+                    event="max_holding_close_promoted",
+                    reason="due_with_fresh_sellable_position",
+                    triggered_at=triggered_at,
+                    position=position,
+                )
+            passthrough.append(canonical)
+            for duplicate in family_candidates[1:]:
+                duplicate.status = "superseded"
+                _record_max_holding_state_event(
+                    db=db,
+                    item=duplicate,
+                    event="max_holding_close_superseded",
+                    reason="newer_canonical_due_exit_selected",
+                    triggered_at=triggered_at,
+                    position=position,
+                    canonical_item_id=canonical.id,
+                )
     return passthrough
 
 
@@ -3120,16 +6308,12 @@ def _record_max_holding_state_event(
 
 def _trigger_time_agent_status_counts(
     *,
-    settings: Settings,
-    db: Session,
+    items: list[ExecutionPlanItem],
 ) -> dict[str, int]:
-    rows = db.execute(
-        select(ExecutionPlanItem.status, func.count())
-        .join(ExecutionPlanItem.plan)
-        .where(ExecutionPlan.mode == settings.runtime_mode)
-        .group_by(ExecutionPlanItem.status)
-    ).all()
-    counts_by_status = {str(status): int(count or 0) for status, count in rows}
+    counts_by_status: dict[str, int] = {}
+    for item in items:
+        status = str(item.status)
+        counts_by_status[status] = counts_by_status.get(status, 0) + 1
     watching_statuses = (
         "watch_monitoring_pending",
         "watch_monitoring_active",
@@ -3164,31 +6348,59 @@ def _append_held_active_sell_monitor_reconciliations(
     db: Session,
     selected_items: list[ExecutionPlanItem],
     symbols: set[str] | None = None,
+    current_market_date: date | None = None,
+    effective_at: datetime | None = None,
 ) -> list[ExecutionPlanItem]:
+    resolved_market_date = current_market_date or datetime.now(KRX_TIMEZONE).date()
+    selected_items = [
+        item
+        for item in selected_items
+        if (
+            _monitoring_item_is_effective_at(item=item, effective_at=effective_at)
+            if effective_at is not None
+            else item.plan.market_date is None
+            or item.plan.market_date <= resolved_market_date
+        )
+    ]
+    requested_symbols = {item.symbol for item in selected_items}
     held_where = [
-        ExecutionPosition.mode == settings.runtime_mode,
+        *_active_kis_position_filters(settings=settings),
         ExecutionPosition.quantity > 0,
     ]
     if symbols:
         held_where.append(ExecutionPosition.symbol.in_(sorted(symbols)))
-    held_symbols = set(
-        db.scalars(
-            select(ExecutionPosition.symbol).where(*held_where)
-        ).all()
+    positions_by_symbol = _unique_positions_by_symbol(
+        db.scalars(select(ExecutionPosition).where(*held_where)).all()
     )
+    selected_items = _quarantine_invalid_sell_monitor_routes(
+        settings=settings,
+        items=selected_items,
+        positions_by_symbol=positions_by_symbol,
+        recorded_at=datetime.now(UTC),
+    )
+    held_symbols = set(positions_by_symbol)
     if not held_symbols:
         return selected_items
 
     selected_item_ids = {item.id for item in selected_items}
-    selected_symbols = {item.symbol for item in selected_items}
-    if not selected_symbols:
+    if not requested_symbols:
         return selected_items
-    selected_sell_replacements = {
-        (item.symbol, item.intent): item
-        for item in selected_items
-        if item.side == "sell" and item.intent in SELL_MONITORED_INTENTS
-    }
-    eligible_symbols = held_symbols & selected_symbols
+    selected_sell_replacements: dict[
+        tuple[str, str, str], ExecutionPlanItem
+    ] = {}
+    for item in selected_items:
+        if item.side != "sell" or item.intent not in SELL_MONITORED_INTENTS:
+            continue
+        family_key = plan_item_entry_family_key(item)
+        if family_key is None:
+            # An unlinked legacy monitor cannot prove that it replaces any
+            # other same-symbol protection row.
+            continue
+        replacement_key = (item.symbol, item.intent, family_key)
+        current = selected_sell_replacements.get(replacement_key)
+        if current is None or _sell_item_is_preferred_authority(item, current):
+            selected_sell_replacements[replacement_key] = item
+    eligible_symbols = held_symbols & requested_symbols
     if not eligible_symbols:
         return selected_items
     active_items = db.scalars(
@@ -3200,6 +6412,11 @@ def _append_held_active_sell_monitor_reconciliations(
             ExecutionPlanItem.intent.in_(tuple(SELL_MONITORED_INTENTS)),
             ExecutionPlanItem.status.in_(tuple(SELL_ACTIVE_MONITORING_STATUSES)),
             ExecutionPlanItem.symbol.in_(eligible_symbols),
+            _kis_plan_item_provider_filter(),
+            or_(
+                ExecutionPlan.market_date.is_(None),
+                ExecutionPlan.market_date <= resolved_market_date,
+            ),
         )
         .options(
             load_only(
@@ -3210,28 +6427,59 @@ def _append_held_active_sell_monitor_reconciliations(
                 ExecutionPlanItem.side,
                 ExecutionPlanItem.intent,
                 ExecutionPlanItem.status,
+                ExecutionPlanItem.quantity_policy,
+                ExecutionPlanItem.risk_context,
+                ExecutionPlanItem.provider,
+                ExecutionPlanItem.venue,
+                ExecutionPlanItem.asset_class,
             ),
             selectinload(ExecutionPlanItem.plan).load_only(
                 ExecutionPlan.id,
                 ExecutionPlan.mode,
                 ExecutionPlan.market_date,
+                ExecutionPlan.requested_at,
                 ExecutionPlan.accepted_at,
             ),
         )
         .order_by(
+            ExecutionPlan.market_date.asc(),
+            ExecutionPlan.requested_at.asc().nullsfirst(),
             ExecutionPlan.accepted_at.asc(),
             ExecutionPlan.id.asc(),
             ExecutionPlanItem.plan_item_index.asc(),
             ExecutionPlanItem.id.asc(),
         )
     ).all()
+    if effective_at is not None:
+        active_items = [
+            item
+            for item in active_items
+            if _monitoring_item_is_effective_at(
+                item=item,
+                effective_at=effective_at,
+            )
+        ]
+    active_items = _quarantine_invalid_sell_monitor_routes(
+        settings=settings,
+        items=active_items,
+        positions_by_symbol=positions_by_symbol,
+        recorded_at=datetime.now(UTC),
+    )
 
     append_items: list[ExecutionPlanItem] = []
     for item in active_items:
         if item.id in selected_item_ids:
             continue
-        replacement = selected_sell_replacements.get((item.symbol, item.intent))
-        if replacement is not None:
+        family_key = plan_item_entry_family_key(item)
+        replacement = (
+            selected_sell_replacements.get((item.symbol, item.intent, family_key))
+            if family_key is not None
+            else None
+        )
+        if replacement is not None and _sell_item_is_strictly_newer(
+            replacement,
+            item,
+        ):
             prior_status = item.status
             item.status = "superseded"
             _record_monitoring_event(
@@ -3242,16 +6490,46 @@ def _append_held_active_sell_monitor_reconciliations(
                     "prior_status": prior_status,
                     "superseded_by_execution_plan_item_id": replacement.id,
                     "superseded_by_execution_plan_id": replacement.execution_plan_id,
+                    "entry_family_key": family_key,
                     "recorded_at": datetime.now(UTC).isoformat(),
                 },
             )
             continue
         append_items.append(item)
 
+    reconciled_items = [*selected_items, *append_items]
+    active_sell_items_by_route: dict[tuple[str, str], list[ExecutionPlanItem]] = {}
+    for item in reconciled_items:
+        if (
+            item.side == "sell"
+            and item.intent in SELL_MONITORED_INTENTS
+            and item.status in SELL_ACTIVE_MONITORING_STATUSES
+        ):
+            active_sell_items_by_route.setdefault(
+                (item.symbol, item.intent), []
+            ).append(item)
+    recorded_at = datetime.now(UTC)
+    for route_items in active_sell_items_by_route.values():
+        unresolved = [
+            item
+            for item in route_items
+            if plan_item_entry_family_key(item) is None
+        ]
+        if not unresolved or len(route_items) == 1:
+            continue
+        competing_ids = sorted(str(item.id) for item in route_items)
+        for item in unresolved:
+            _record_ambiguous_entry_family_review(
+                item=item,
+                event="active_sell_monitor_manual_review",
+                competing_item_ids=competing_ids,
+                recorded_at=recorded_at,
+            )
+
     if not append_items:
         return selected_items
     return sorted(
-        [*selected_items, *append_items],
+        reconciled_items,
         key=lambda item: (
             item.plan.accepted_at,
             item.plan.id,
@@ -3268,104 +6546,174 @@ def _append_held_stop_sell_fallbacks(
     monitored_item_filter,
     selected_items: list[ExecutionPlanItem],
     symbols: set[str] | None = None,
+    current_market_date: date | None = None,
+    effective_at: datetime | None = None,
 ) -> list[ExecutionPlanItem]:
-    symbols_with_stop = {
-        item.symbol
+    resolved_market_date = current_market_date or datetime.now(KRX_TIMEZONE).date()
+    selected_items = [
+        item
         for item in selected_items
-        if item.side == "sell" and item.intent == "stop_sell"
-    }
+        if (
+            _monitoring_item_is_effective_at(item=item, effective_at=effective_at)
+            if effective_at is not None
+            else item.plan.market_date is None
+            or item.plan.market_date <= resolved_market_date
+        )
+    ]
     held_where = [
-        ExecutionPosition.mode == settings.runtime_mode,
+        *_active_kis_position_filters(settings=settings),
         ExecutionPosition.quantity > 0,
     ]
     if symbols:
         held_where.append(ExecutionPosition.symbol.in_(sorted(symbols)))
-    held_symbols = set(
-        db.scalars(
-            select(ExecutionPosition.symbol).where(*held_where)
-        ).all()
+    positions_by_symbol = _unique_positions_by_symbol(
+        db.scalars(select(ExecutionPosition).where(*held_where)).all()
     )
-    fallback_symbols = held_symbols - symbols_with_stop
-    if not fallback_symbols:
+    selected_items = _quarantine_invalid_sell_monitor_routes(
+        settings=settings,
+        items=selected_items,
+        positions_by_symbol=positions_by_symbol,
+        recorded_at=datetime.now(UTC),
+    )
+    held_symbols = set(positions_by_symbol)
+    if not held_symbols:
         return selected_items
-    fallback_symbols = sorted(fallback_symbols)
 
-    fallback_candidates = (
-        select(
-            ExecutionPlanItem.id.label("item_id"),
-            func.row_number()
-            .over(
-                partition_by=ExecutionPlanItem.symbol,
-                order_by=(
-                    ExecutionPlan.market_date.desc(),
-                    ExecutionPlan.accepted_at.desc(),
-                    ExecutionPlan.id.desc(),
-                    ExecutionPlanItem.plan_item_index.asc(),
-                    ExecutionPlanItem.id.asc(),
-                ),
-            )
-            .label("stop_rank"),
-        )
+    selected_stops_by_symbol: dict[str, list[ExecutionPlanItem]] = {}
+    selected_families_by_symbol: dict[str, set[str]] = {}
+    for item in selected_items:
+        if item.side != "sell" or item.intent != "stop_sell":
+            continue
+        selected_stops_by_symbol.setdefault(item.symbol, []).append(item)
+        family_key = plan_item_entry_family_key(item)
+        if family_key is not None:
+            selected_families_by_symbol.setdefault(item.symbol, set()).add(family_key)
+
+    selected_item_ids = {item.id for item in selected_items}
+    candidates = db.scalars(
+        select(ExecutionPlanItem)
         .join(ExecutionPlanItem.plan)
         .where(
             ExecutionPlan.mode == settings.runtime_mode,
             or_(
                 monitored_item_filter,
                 and_(
-                    ExecutionPlanItem.status.in_(tuple(FALLBACK_PROTECTIVE_STOP_STATUSES)),
+                    ExecutionPlanItem.status.in_(
+                        tuple(FALLBACK_PROTECTIVE_STOP_STATUSES)
+                    ),
                     ExecutionPlanItem.side == "sell",
                     ExecutionPlanItem.intent == "stop_sell",
                 ),
             ),
             ExecutionPlanItem.side == "sell",
             ExecutionPlanItem.intent == "stop_sell",
-            ExecutionPlanItem.symbol.in_(fallback_symbols),
+            ExecutionPlanItem.symbol.in_(sorted(held_symbols)),
+            _kis_plan_item_provider_filter(),
+            or_(
+                ExecutionPlan.market_date.is_(None),
+                ExecutionPlan.market_date <= resolved_market_date,
+            ),
         )
-        .subquery()
-    )
-    fallback_item_ids = select(fallback_candidates.c.item_id).where(
-        fallback_candidates.c.stop_rank == 1
-    )
-    selected_item_ids = {item.id for item in selected_items}
-    fallback_items = [
-        item
-        for item in db.scalars(
-            select(ExecutionPlanItem)
-            .join(ExecutionPlanItem.plan)
-            .where(
-                ExecutionPlan.mode == settings.runtime_mode,
-                ExecutionPlanItem.id.in_(fallback_item_ids),
-            )
-            .options(
-                load_only(
-                    ExecutionPlanItem.id,
-                    ExecutionPlanItem.execution_plan_id,
-                    ExecutionPlanItem.plan_item_index,
-                    ExecutionPlanItem.symbol,
-                    ExecutionPlanItem.side,
-                    ExecutionPlanItem.intent,
-                    ExecutionPlanItem.status,
-                ),
-                selectinload(ExecutionPlanItem.plan).load_only(
-                    ExecutionPlan.id,
-                    ExecutionPlan.mode,
-                    ExecutionPlan.market_date,
-                    ExecutionPlan.accepted_at,
-                ),
-            )
-            .order_by(
-                ExecutionPlan.accepted_at.asc(),
-                ExecutionPlan.id.asc(),
-                ExecutionPlanItem.plan_item_index.asc(),
-                ExecutionPlanItem.id.asc(),
-            )
-        ).all()
-        if item.id not in selected_item_ids
-        and (
-            item.status not in RETRYABLE_PROTECTIVE_STOP_STATUSES
-            or _latest_order_failure_is_retryable_session_rejection(db=db, item=item)
+        .options(
+            load_only(
+                ExecutionPlanItem.id,
+                ExecutionPlanItem.execution_plan_id,
+                ExecutionPlanItem.plan_item_index,
+                ExecutionPlanItem.symbol,
+                ExecutionPlanItem.side,
+                ExecutionPlanItem.intent,
+                ExecutionPlanItem.status,
+                ExecutionPlanItem.quantity_policy,
+                ExecutionPlanItem.risk_context,
+                ExecutionPlanItem.provider,
+                ExecutionPlanItem.venue,
+                ExecutionPlanItem.asset_class,
+            ),
+            selectinload(ExecutionPlanItem.plan).load_only(
+                ExecutionPlan.id,
+                ExecutionPlan.mode,
+                ExecutionPlan.market_date,
+                ExecutionPlan.requested_at,
+                ExecutionPlan.accepted_at,
+            ),
         )
-    ]
+        .order_by(
+            ExecutionPlan.market_date.desc(),
+            ExecutionPlan.requested_at.desc().nullslast(),
+            ExecutionPlan.accepted_at.desc(),
+            ExecutionPlan.id.desc(),
+            ExecutionPlanItem.plan_item_index.asc(),
+            ExecutionPlanItem.id.asc(),
+        )
+    ).all()
+    if effective_at is not None:
+        candidates = [
+            item
+            for item in candidates
+            if _monitoring_item_is_effective_at(
+                item=item,
+                effective_at=effective_at,
+            )
+        ]
+    candidates = _quarantine_invalid_sell_monitor_routes(
+        settings=settings,
+        items=candidates,
+        positions_by_symbol=positions_by_symbol,
+        recorded_at=datetime.now(UTC),
+    )
+    fallback_by_family: dict[tuple[str, str], ExecutionPlanItem] = {}
+    ambiguous_candidates_by_symbol: dict[str, list[ExecutionPlanItem]] = {}
+    for item in candidates:
+        if item.id in selected_item_ids:
+            continue
+        if (
+            item.status in RETRYABLE_PROTECTIVE_STOP_STATUSES
+            and not _latest_order_failure_is_retryable_session_rejection(
+                settings=settings,
+                db=db,
+                item=item,
+            )
+        ):
+            continue
+        family_key = plan_item_entry_family_key(item)
+        if family_key is None:
+            ambiguous_candidates_by_symbol.setdefault(item.symbol, []).append(item)
+            continue
+        if family_key in selected_families_by_symbol.get(item.symbol, set()):
+            continue
+        fallback_key = (item.symbol, family_key)
+        current_fallback = fallback_by_family.get(fallback_key)
+        if current_fallback is None or _sell_item_is_preferred_authority(
+            item,
+            current_fallback,
+        ):
+            fallback_by_family[fallback_key] = item
+
+    fallback_items = list(fallback_by_family.values())
+    recorded_at = datetime.now(UTC)
+    for symbol, ambiguous_candidates in ambiguous_candidates_by_symbol.items():
+        selected_stops = selected_stops_by_symbol.get(symbol, [])
+        explicit_fallbacks = [
+            item
+            for (candidate_symbol, _family_key), item in fallback_by_family.items()
+            if candidate_symbol == symbol
+        ]
+        if not selected_stops and not explicit_fallbacks and len(ambiguous_candidates) == 1:
+            # Retain the single-family legacy behavior only when there is no
+            # evidence of another same-symbol protective family.
+            fallback_items.append(ambiguous_candidates[0])
+            continue
+        competing_ids = sorted(
+            str(item.id)
+            for item in [*selected_stops, *explicit_fallbacks, *ambiguous_candidates]
+        )
+        for item in ambiguous_candidates:
+            _record_ambiguous_entry_family_review(
+                item=item,
+                event="protective_stop_fallback_manual_review",
+                competing_item_ids=competing_ids,
+                recorded_at=recorded_at,
+            )
     if not fallback_items:
         return selected_items
     return sorted(
@@ -3381,6 +6729,7 @@ def _append_held_stop_sell_fallbacks(
 
 def _reactivate_retryable_protective_stops(
     *,
+    settings: Settings,
     items: list[ExecutionPlanItem],
     db: Session,
     triggered_at: datetime,
@@ -3393,11 +6742,16 @@ def _reactivate_retryable_protective_stops(
             or item.status not in RETRYABLE_PROTECTIVE_STOP_STATUSES
         ):
             continue
-        source_order = _retryable_session_rejection_source_order(db=db, item=item)
+        source_order = _retryable_session_rejection_source_order(
+            settings=settings,
+            db=db,
+            item=item,
+        )
         if source_order is None:
             continue
         prior_status = item.status
         retry_generation = _protective_stop_retry_generation(
+            settings=settings,
             db=db,
             item=item,
             source_order=source_order,
@@ -3420,12 +6774,21 @@ def _reactivate_retryable_protective_stops(
         if _quantity_policy_requires_position_exit(item.quantity_policy):
             broker_quantity = db.scalar(
                 select(BrokerOrder.quantity)
-                .where(BrokerOrder.execution_plan_item_id == item.id)
+                .where(
+                    *_active_kis_order_filters(
+                        settings=settings,
+                        exchange=_plan_item_exchange(item),
+                    ),
+                    BrokerOrder.execution_plan_item_id == item.id,
+                )
                 .order_by(BrokerOrder.created_at.desc(), BrokerOrder.id.desc())
                 .limit(1)
             )
             if broker_quantity is not None and int(broker_quantity) > 0:
-                item.quantity_policy = {"kind": "shares", "quantity": int(broker_quantity)}
+                item.quantity_policy = _fixed_shares_quantity_policy(
+                    item=item,
+                    quantity=int(broker_quantity),
+                )
         item.status = _monitoring_status(item.intent)
         _record_monitoring_event(
             item=item,
@@ -3493,22 +6856,46 @@ def _repair_unprotected_stop_coverage(
                 ExecutionPlanItem.decision_run_id,
                 ExecutionPlanItem.source_plan_item_id,
                 ExecutionPlanItem.source_market_date,
+                ExecutionPlanItem.risk_context,
+                ExecutionPlanItem.provider,
+                ExecutionPlanItem.venue,
+                ExecutionPlanItem.asset_class,
+                ExecutionPlanItem.quantity_precision,
+                ExecutionPlanItem.price_precision,
             ),
             selectinload(ExecutionPlanItem.plan).load_only(
                 ExecutionPlan.id,
                 ExecutionPlan.mode,
                 ExecutionPlan.market_date,
+                ExecutionPlan.requested_at,
                 ExecutionPlan.accepted_at,
             ),
         )
         .order_by(
             ExecutionPlan.market_date.desc(),
+            ExecutionPlan.requested_at.desc().nullslast(),
             ExecutionPlan.accepted_at.desc(),
             ExecutionPlan.id.desc(),
             ExecutionPlanItem.plan_item_index.asc(),
             ExecutionPlanItem.id.asc(),
         )
     ).all()
+    stop_items = [
+        item
+        for item in stop_items
+        if item.plan.market_date is None
+        or _replanned_sell_plan_is_effective(
+            plan=item.plan,
+            item=item,
+            effective_at=triggered_at,
+        )
+    ]
+    stop_items = _quarantine_invalid_sell_monitor_routes(
+        settings=settings,
+        items=stop_items,
+        positions_by_symbol=positions,
+        recorded_at=triggered_at,
+    )
     items_by_symbol: dict[str, list[ExecutionPlanItem]] = {symbol: [] for symbol in positions}
     for item in stop_items:
         if (
@@ -3517,12 +6904,21 @@ def _repair_unprotected_stop_coverage(
         ):
             broker_quantity = db.scalar(
                 select(BrokerOrder.quantity)
-                .where(BrokerOrder.execution_plan_item_id == item.id)
+                .where(
+                    *_active_kis_order_filters(
+                        settings=settings,
+                        exchange=_plan_item_exchange(item),
+                    ),
+                    BrokerOrder.execution_plan_item_id == item.id,
+                )
                 .order_by(BrokerOrder.created_at.desc(), BrokerOrder.id.desc())
                 .limit(1)
             )
             if broker_quantity is not None and int(broker_quantity) > 0:
-                item.quantity_policy = {"kind": "shares", "quantity": int(broker_quantity)}
+                item.quantity_policy = _fixed_shares_quantity_policy(
+                    item=item,
+                    quantity=int(broker_quantity),
+                )
         items_by_symbol.setdefault(item.symbol, []).append(item)
 
     repaired_count = 0
@@ -3569,7 +6965,10 @@ def _repair_unprotected_stop_coverage(
                 side="sell",
                 intent="stop_sell",
                 status="stop_sell_monitoring",
-                quantity_policy={"kind": "shares", "quantity": rearm_quantity},
+                quantity_policy=_fixed_shares_quantity_policy(
+                    item=latest_item,
+                    quantity=rearm_quantity,
+                ),
                 limit_price=latest_item.limit_price,
                 trigger_price=repair_trigger_price,
                 time_in_force=latest_item.time_in_force,
@@ -3581,6 +6980,11 @@ def _repair_unprotected_stop_coverage(
                 decision_run_id=latest_item.decision_run_id,
                 source_plan_item_id=latest_item.source_plan_item_id,
                 source_market_date=latest_item.source_market_date,
+                provider=latest_item.provider,
+                venue=latest_item.venue,
+                asset_class=latest_item.asset_class,
+                quantity_precision=latest_item.quantity_precision,
+                price_precision=latest_item.price_precision,
             )
             db.add(repair_item)
             items_by_symbol.setdefault(issue.symbol, []).append(repair_item)
@@ -3588,7 +6992,10 @@ def _repair_unprotected_stop_coverage(
             cloned_repair = True
         else:
             latest_item.status = "stop_sell_monitoring"
-            latest_item.quantity_policy = {"kind": "shares", "quantity": rearm_quantity}
+            latest_item.quantity_policy = _fixed_shares_quantity_policy(
+                item=latest_item,
+                quantity=rearm_quantity,
+            )
             latest_item.trigger_price = repair_trigger_price
             rearmed_item = latest_item
             cloned_repair = False
@@ -3685,6 +7092,7 @@ def _stale_position_truth_issues(
         settings=settings,
         db=db,
         symbols=symbols,
+        evaluated_at=triggered_at,
     )
     if not evidence_by_symbol:
         return []
@@ -3695,11 +7103,11 @@ def _stale_position_truth_issues(
 
     positions = db.scalars(
         select(ExecutionPosition).where(
-            ExecutionPosition.mode == settings.runtime_mode,
+            *_active_kis_position_filters(settings=settings),
             ExecutionPosition.symbol.in_(candidate_symbols),
         )
     ).all()
-    positions_by_symbol = {position.symbol: position for position in positions}
+    positions_by_symbol = _unique_positions_by_symbol(positions)
     stale_before = triggered_at - timedelta(seconds=settings.exec_agent_max_account_snapshot_age_seconds)
     issues: list[ProtectiveStopCoverageIssue] = []
     for symbol in candidate_symbols:
@@ -3710,7 +7118,12 @@ def _stale_position_truth_issues(
         if last_reconciled_at is not None and _normalize_utc(last_reconciled_at) >= stale_before:
             continue
 
-        stop_items = _stop_items_for_symbol(settings=settings, db=db, symbol=symbol)
+        stop_items = _stop_items_for_symbol(
+            settings=settings,
+            db=db,
+            symbol=symbol,
+            evaluated_at=triggered_at,
+        )
         latest_item = _latest_stop_item(stop_items)
         active_quantity = sum(
             quantity
@@ -3743,56 +7156,128 @@ def _position_truth_evidence_by_symbol(
     settings: Settings,
     db: Session,
     symbols: set[str] | None = None,
+    evaluated_at: datetime | None = None,
 ) -> dict[str, list[str]]:
+    resolved_evaluated_at = _normalize_utc(evaluated_at or datetime.now(UTC))
     evidence_by_symbol: dict[str, set[str]] = {}
     symbol_list = sorted(symbols) if symbols else None
 
-    active_order_where = [
-        BrokerOrder.mode == settings.runtime_mode,
-        BrokerOrder.status.in_(("submitted", "open", "partially_filled")),
+    order_where = [
+        *_active_kis_order_filters(settings=settings),
+        BrokerOrder.side.in_(("buy", "sell")),
+        BrokerOrder.status.in_(("submitted", "open", "partially_filled", "filled")),
     ]
     if symbol_list:
-        active_order_where.append(BrokerOrder.symbol.in_(symbol_list))
-    active_order_rows = db.execute(
-        select(BrokerOrder.symbol, BrokerOrder.side, BrokerOrder.status)
-        .where(*active_order_where)
+        order_where.append(BrokerOrder.symbol.in_(symbol_list))
+    orders = db.scalars(
+        select(BrokerOrder).where(*order_where)
     ).all()
-    for symbol, side, status in active_order_rows:
-        evidence_by_symbol.setdefault(str(symbol), set()).add(f"broker_order:{side}:{status}")
-
-    filled_buy_where = [
-        BrokerOrder.mode == settings.runtime_mode,
-        BrokerOrder.side == "buy",
-        BrokerOrder.status == "filled",
-    ]
-    if symbol_list:
-        filled_buy_where.append(BrokerOrder.symbol.in_(symbol_list))
-    filled_buy_symbols = set(
-        db.scalars(
-            select(BrokerOrder.symbol)
-            .where(*filled_buy_where)
-            .distinct()
-        ).all()
+    order_evidence_by_route: dict[tuple[str, str], set[str]] = {}
+    for order in orders:
+        exchange = _active_kis_order_exchange(settings=settings, order=order)
+        if exchange is None:
+            continue
+        symbol = str(order.symbol)
+        route = (symbol, exchange)
+        if order.status in {"submitted", "open", "partially_filled"}:
+            order_evidence_by_route.setdefault(route, set()).add(
+                f"broker_order:{order.side}:{order.status}"
+            )
+    open_fill_routes = _unexited_buy_routes_from_fills(
+        settings=settings,
+        db=db,
+        symbols=symbol_list,
     )
-    for symbol in filled_buy_symbols:
-        if _has_unexited_buy_order_for_symbol(settings=settings, db=db, symbol=str(symbol)):
-            evidence_by_symbol.setdefault(str(symbol), set()).add("broker_order:buy:filled_unexited")
+    for route in open_fill_routes:
+        order_evidence_by_route.setdefault(route, set()).add(
+            "broker_order:buy:filled_unexited"
+        )
+    routes_by_symbol: dict[str, set[str]] = {}
+    for symbol, exchange in order_evidence_by_route:
+        routes_by_symbol.setdefault(symbol, set()).add(exchange)
+    for symbol, exchanges in routes_by_symbol.items():
+        if len(exchanges) == 1:
+            route = (symbol, next(iter(exchanges)))
+            evidence_by_symbol.setdefault(symbol, set()).update(
+                order_evidence_by_route[route]
+            )
 
     sell_where = [
         ExecutionPlan.mode == settings.runtime_mode,
+        _effective_monitor_plan_filter(
+            effective_at=resolved_evaluated_at,
+            current_market_date=None,
+        ),
         ExecutionPlanItem.side == "sell",
         ExecutionPlanItem.intent.in_(tuple(SELL_MONITORED_INTENTS)),
         ExecutionPlanItem.status.in_(tuple(SELL_STALE_FLAT_EXPIRABLE_STATUSES | {"expired"})),
     ]
     if symbol_list:
         sell_where.append(ExecutionPlanItem.symbol.in_(symbol_list))
-    sell_rows = db.execute(
-        select(ExecutionPlanItem.symbol, ExecutionPlanItem.status)
+    sell_items = db.scalars(
+        select(ExecutionPlanItem)
         .join(ExecutionPlanItem.plan)
         .where(*sell_where)
+        .options(
+            load_only(
+                ExecutionPlanItem.id,
+                ExecutionPlanItem.symbol,
+                ExecutionPlanItem.side,
+                ExecutionPlanItem.intent,
+                ExecutionPlanItem.status,
+                ExecutionPlanItem.provider,
+                ExecutionPlanItem.venue,
+                ExecutionPlanItem.asset_class,
+                ExecutionPlanItem.risk_context,
+                ExecutionPlanItem.quantity_policy,
+            ),
+            selectinload(ExecutionPlanItem.plan).load_only(
+                ExecutionPlan.id,
+                ExecutionPlan.market_date,
+            ),
+        )
     ).all()
-    for symbol, status in sell_rows:
-        evidence_by_symbol.setdefault(str(symbol), set()).add(f"sell_monitor:{status}")
+    sell_items = [
+        item
+        for item in sell_items
+        if _monitoring_item_is_effective_at(
+            item=item,
+            effective_at=resolved_evaluated_at,
+        )
+    ]
+    sell_items = _quarantine_invalid_sell_monitor_routes(
+        settings=settings,
+        items=sell_items,
+        recorded_at=datetime.now(UTC),
+    )
+    sell_evidence_by_route: dict[tuple[str, str], set[str]] = {}
+    for item in sell_items:
+        provider = str(item.provider or "kis").strip().lower()
+        if provider in {"korea-investment", "korea_investment"}:
+            provider = "kis"
+        if provider != "kis" or classify_kis_account_route(
+            settings=settings,
+            provider=provider,
+            risk_context=_loaded_risk_context(item, allow_file_backed_load=True),
+            quantity_policy=item.quantity_policy,
+        ) != "active":
+            continue
+        exchange = _plan_item_exchange(item)
+        if exchange not in MONITORED_KIS_POSITION_EXCHANGES:
+            continue
+        sell_evidence_by_route.setdefault((str(item.symbol), exchange), set()).add(
+            f"sell_monitor:{item.status}"
+        )
+    sell_routes_by_symbol: dict[str, set[str]] = {}
+    for symbol, exchange in sell_evidence_by_route:
+        sell_routes_by_symbol.setdefault(symbol, set()).add(exchange)
+    for symbol, exchanges in sell_routes_by_symbol.items():
+        if len(exchanges) != 1:
+            continue
+        route = (symbol, next(iter(exchanges)))
+        evidence_by_symbol.setdefault(symbol, set()).update(
+            sell_evidence_by_route[route]
+        )
 
     return {
         symbol: sorted(evidence)
@@ -3807,25 +7292,11 @@ def _has_unexited_buy_order_for_symbol(
     db: Session,
     symbol: str,
 ) -> bool:
-    latest_buy_order_at = db.scalar(
-        select(func.max(BrokerOrder.created_at)).where(
-            BrokerOrder.mode == settings.runtime_mode,
-            BrokerOrder.symbol == symbol,
-            BrokerOrder.side == "buy",
-            BrokerOrder.status.in_(("submitted", "open", "partially_filled", "filled")),
-        )
+    return symbol in _unexited_buy_symbols_from_fills(
+        settings=settings,
+        db=db,
+        symbols=[symbol],
     )
-    if latest_buy_order_at is None:
-        return False
-    latest_sell_order_at = db.scalar(
-        select(func.max(BrokerOrder.created_at)).where(
-            BrokerOrder.mode == settings.runtime_mode,
-            BrokerOrder.symbol == symbol,
-            BrokerOrder.side == "sell",
-            BrokerOrder.status.in_(("submitted", "open", "partially_filled", "filled")),
-        )
-    )
-    return latest_sell_order_at is None or latest_buy_order_at > latest_sell_order_at
 
 
 def _symbols_with_unexited_buy_orders(
@@ -3837,35 +7308,103 @@ def _symbols_with_unexited_buy_orders(
     if not symbols:
         return set()
     ordered_symbols = _ordered_symbol_scope(symbols)
-    active_statuses = ("submitted", "open", "partially_filled", "filled")
-    rows = db.execute(
-        select(
-            BrokerOrder.symbol,
-            BrokerOrder.side,
-            func.max(BrokerOrder.created_at),
-        )
-        .where(
-            BrokerOrder.mode == settings.runtime_mode,
-            BrokerOrder.symbol.in_(ordered_symbols),
-            BrokerOrder.side.in_(("buy", "sell")),
-            BrokerOrder.status.in_(active_statuses),
-        )
-        .group_by(BrokerOrder.symbol, BrokerOrder.side)
-    ).all()
-    latest_buy_by_symbol: dict[str, datetime] = {}
-    latest_sell_by_symbol: dict[str, datetime] = {}
-    for symbol, side, latest_created_at in rows:
-        if latest_created_at is None:
-            continue
-        if side == "buy":
-            latest_buy_by_symbol[str(symbol)] = latest_created_at
-        elif side == "sell":
-            latest_sell_by_symbol[str(symbol)] = latest_created_at
+    return _unexited_buy_symbols_from_fills(
+        settings=settings,
+        db=db,
+        symbols=ordered_symbols,
+    )
+
+
+def _unexited_buy_symbols_from_fills(
+    *,
+    settings: Settings,
+    db: Session,
+    symbols: list[str],
+) -> set[str]:
+    routes = _unexited_buy_routes_from_fills(
+        settings=settings,
+        db=db,
+        symbols=symbols,
+    )
+    exchanges_by_symbol: dict[str, set[str]] = {}
+    for symbol, exchange in routes:
+        exchanges_by_symbol.setdefault(symbol, set()).add(exchange)
     return {
         symbol
-        for symbol, latest_buy_at in latest_buy_by_symbol.items()
-        if (latest_sell_by_symbol.get(symbol) is None or latest_buy_at > latest_sell_by_symbol[symbol])
+        for symbol, _exchange in routes
+        if len(exchanges_by_symbol.get(symbol, set())) == 1
     }
+
+
+def _unexited_buy_routes_from_fills(
+    *,
+    settings: Settings,
+    db: Session,
+    symbols: list[str] | None,
+) -> set[tuple[str, str]]:
+    observed_through = datetime.now(UTC)
+    where = [
+        *_active_kis_order_filters(settings=settings),
+        ExecutionFill.filled_at <= observed_through,
+    ]
+    if symbols:
+        where.append(ExecutionFill.symbol.in_(symbols))
+    fills = db.scalars(
+        select(ExecutionFill)
+        .join(BrokerOrder, BrokerOrder.id == ExecutionFill.broker_order_pk)
+        .where(*where)
+        .options(
+            selectinload(ExecutionFill.broker_order).load_only(
+                BrokerOrder.id,
+                BrokerOrder.broker_name,
+                BrokerOrder.symbol,
+                BrokerOrder.venue,
+                BrokerOrder.asset_class,
+                BrokerOrder.request_metadata,
+            )
+        )
+        .order_by(ExecutionFill.filled_at.asc(), ExecutionFill.id.asc())
+    ).all()
+    filled_order_ids = {fill.broker_order_pk for fill in fills}
+    uncertain_order_where = [
+        *_active_kis_order_filters(settings=settings),
+        BrokerOrder.side == "buy",
+        BrokerOrder.status.in_(("filled", "partially_filled")),
+        BrokerOrder.id.not_in(filled_order_ids),
+    ]
+    if symbols:
+        uncertain_order_where.append(BrokerOrder.symbol.in_(symbols))
+    uncertain_buy_orders = db.scalars(
+        select(BrokerOrder).where(*uncertain_order_where)
+    ).all()
+    replay = replay_open_long_fill_inventory(
+        fills=fills,
+        isolation_cursor=load_fifo_isolation_cursor(
+            db=db,
+            runtime_mode=settings.runtime_mode,
+            through=observed_through,
+        ),
+        through=observed_through,
+    )
+    open_routes = {
+        (symbol, route_scope.exchange)
+        for (route_scope, symbol), quantity in replay.open_quantities.items()
+        if route_scope.provider == "kis" and quantity > 0
+    }
+    if replay.indeterminate_fill_count:
+        # Incomplete canonical history must never be interpreted as proof that
+        # a route is flat. Preserve protection for every affected fill route.
+        for fill in fills:
+            route_scope = fifo_route_scope_from_order(fill.broker_order)
+            symbol = str(fill.symbol or "").strip().upper()
+            if route_scope is not None and route_scope.provider == "kis" and symbol:
+                open_routes.add((symbol, route_scope.exchange))
+    for order in uncertain_buy_orders:
+        route_scope = fifo_route_scope_from_order(order)
+        symbol = str(order.symbol or "").strip().upper()
+        if route_scope is not None and route_scope.provider == "kis" and symbol:
+            open_routes.add((symbol, route_scope.exchange))
+    return open_routes
 
 
 def _stop_items_for_symbol(
@@ -3873,12 +7412,18 @@ def _stop_items_for_symbol(
     settings: Settings,
     db: Session,
     symbol: str,
+    evaluated_at: datetime | None = None,
 ) -> list[ExecutionPlanItem]:
-    return db.scalars(
+    resolved_evaluated_at = _normalize_utc(evaluated_at or datetime.now(UTC))
+    items = db.scalars(
         select(ExecutionPlanItem)
         .join(ExecutionPlanItem.plan)
         .where(
             ExecutionPlan.mode == settings.runtime_mode,
+            _effective_monitor_plan_filter(
+                effective_at=resolved_evaluated_at,
+                current_market_date=None,
+            ),
             ExecutionPlanItem.symbol == symbol,
             ExecutionPlanItem.side == "sell",
             ExecutionPlanItem.intent == "stop_sell",
@@ -3898,7 +7443,15 @@ def _stop_items_for_symbol(
                 ExecutionPlanItem.trigger_price,
                 ExecutionPlanItem.time_in_force,
                 ExecutionPlanItem.source_market_date,
-            )
+                ExecutionPlanItem.risk_context,
+                ExecutionPlanItem.provider,
+                ExecutionPlanItem.venue,
+                ExecutionPlanItem.asset_class,
+            ),
+            selectinload(ExecutionPlanItem.plan).load_only(
+                ExecutionPlan.id,
+                ExecutionPlan.market_date,
+            ),
         )
         .order_by(
             ExecutionPlan.market_date.desc(),
@@ -3908,6 +7461,24 @@ def _stop_items_for_symbol(
             ExecutionPlanItem.id.asc(),
         )
     ).all()
+    items = [
+        item
+        for item in items
+        if _monitoring_item_is_effective_at(
+            item=item,
+            effective_at=resolved_evaluated_at,
+        )
+    ]
+    return _quarantine_invalid_sell_monitor_routes(
+        settings=settings,
+        items=items,
+        positions_by_symbol=_load_positions_by_symbol(
+            settings=settings,
+            db=db,
+            symbols=[symbol],
+        ),
+        recorded_at=datetime.now(UTC),
+    )
 
 
 def _profit_target_coverage_issues(
@@ -3915,6 +7486,7 @@ def _profit_target_coverage_issues(
     settings: Settings,
     db: Session,
     positions_by_symbol: dict[str, ExecutionPosition],
+    evaluated_at: datetime | None = None,
 ) -> list[ProfitTargetCoverageIssue]:
     positions = {
         symbol: position
@@ -3945,6 +7517,9 @@ def _profit_target_coverage_issues(
                 ExecutionPlanItem.status,
                 ExecutionPlanItem.quantity_policy,
                 ExecutionPlanItem.trigger_price,
+                ExecutionPlanItem.risk_context,
+                ExecutionPlanItem.provider,
+                ExecutionPlanItem.asset_class,
             )
         )
         .order_by(
@@ -3955,6 +7530,23 @@ def _profit_target_coverage_issues(
             ExecutionPlanItem.id.asc(),
         )
     ).all()
+    resolved_evaluated_at = evaluated_at or datetime.now(UTC)
+    target_items = [
+        item
+        for item in target_items
+        if item.plan.market_date is None
+        or _replanned_sell_plan_is_effective(
+            plan=item.plan,
+            item=item,
+            effective_at=resolved_evaluated_at,
+        )
+    ]
+    target_items = _quarantine_invalid_sell_monitor_routes(
+        settings=settings,
+        items=target_items,
+        positions_by_symbol=positions,
+        recorded_at=datetime.now(UTC),
+    )
     items_by_symbol: dict[str, list[ExecutionPlanItem]] = {symbol: [] for symbol in positions}
     for item in target_items:
         items_by_symbol.setdefault(item.symbol, []).append(item)
@@ -3977,6 +7569,7 @@ def _profit_target_coverage_issues(
             settings=settings,
             db=db,
             symbol=symbol,
+            position=positions[symbol],
         )
         entry_target_price = (
             _watch_buy_target_price(entry_order.plan_item)
@@ -4049,6 +7642,34 @@ def _latest_rearmable_stop_item(items: list[ExecutionPlanItem]) -> ExecutionPlan
         ):
             return item
     return None
+
+
+def _fixed_shares_quantity_policy(
+    *,
+    item: ExecutionPlanItem,
+    quantity: int,
+    source: str | None = None,
+) -> dict[str, object]:
+    """Materialize shares without detaching the exit from its authority."""
+
+    prior_policy = item.quantity_policy if isinstance(item.quantity_policy, dict) else {}
+    policy: dict[str, object] = {
+        "kind": "shares",
+        "quantity": quantity,
+    }
+    linked_entry_item_key = prior_policy.get("linked_entry_item_key")
+    if isinstance(linked_entry_item_key, str) and linked_entry_item_key.strip():
+        policy["linked_entry_item_key"] = linked_entry_item_key.strip()
+    for authority_key in (
+        KIS_ACCOUNT_ROUTE_BINDING_KEY,
+        EXECUTION_ACCOUNT_SCOPE_KEY,
+    ):
+        authority = prior_policy.get(authority_key)
+        if isinstance(authority, dict):
+            policy[authority_key] = dict(authority)
+    if source is not None:
+        policy["source"] = source
+    return policy
 
 
 def _shares_quantity(quantity_policy: dict[str, object] | None) -> int | None:
@@ -4136,7 +7757,7 @@ def _protective_stop_actionability_warnings(
         if item.side != "sell" or item.intent != "stop_sell":
             continue
         price = prices.get(item.symbol)
-        observed_price = price.price if price is not None else None
+        observed_price = _observed_price_for_item(price=price, item=item)
         if observed_price is None or item.trigger_price is None or observed_price > item.trigger_price:
             continue
         result = results_by_item_id.get(item.id)
@@ -4291,6 +7912,9 @@ def _watch_buy_retry_blocked_until(
     reason = str(event.get("reason") or "")
     if reason not in RETRYABLE_WATCH_BUY_APPROVAL_REASONS:
         return None
+    retry_after_at = _parse_event_datetime(event.get("retry_after_at"))
+    if retry_after_at is not None:
+        return retry_after_at
     recorded_at = _parse_event_datetime(event.get("recorded_at"))
     if recorded_at is None:
         return None
@@ -4417,10 +8041,15 @@ def _parse_event_datetime(value: object) -> datetime | None:
 
 def _latest_order_failure_is_retryable_session_rejection(
     *,
+    settings: Settings,
     db: Session,
     item: ExecutionPlanItem,
 ) -> bool:
-    order = _latest_plan_item_submission_attempt(db=db, item=item)
+    order = _latest_plan_item_submission_attempt(
+        settings=settings,
+        db=db,
+        item=item,
+    )
     if order is None:
         return item.status in {"broker_order_retry_pending", "retry_pending"}
     return _order_is_retryable_session_rejection(order=order, item=item)
@@ -4428,6 +8057,7 @@ def _latest_order_failure_is_retryable_session_rejection(
 
 def _latest_plan_item_submission_attempt(
     *,
+    settings: Settings,
     db: Session,
     item: ExecutionPlanItem,
 ) -> BrokerOrder | None:
@@ -4443,7 +8073,13 @@ def _latest_plan_item_submission_attempt(
     order = db.scalar(
         select(BrokerOrder)
         .join(BrokerOrderEvent, BrokerOrderEvent.broker_order_pk == BrokerOrder.id)
-        .where(BrokerOrder.execution_plan_item_id == item.id)
+        .where(
+            *_active_kis_order_filters(
+                settings=settings,
+                exchange=_plan_item_exchange(item),
+            ),
+            BrokerOrder.execution_plan_item_id == item.id,
+        )
         .where(BrokerOrderEvent.event_type == "submit_requested")
         .options(
             load_only(
@@ -4472,7 +8108,13 @@ def _latest_plan_item_submission_attempt(
         return order
     return db.scalar(
         select(BrokerOrder)
-        .where(BrokerOrder.execution_plan_item_id == item.id)
+        .where(
+            *_active_kis_order_filters(
+                settings=settings,
+                exchange=_plan_item_exchange(item),
+            ),
+            BrokerOrder.execution_plan_item_id == item.id,
+        )
         .options(
             load_only(
                 BrokerOrder.id,
@@ -4528,12 +8170,17 @@ def _order_is_retryable_session_rejection(
 
 def _retryable_session_rejection_source_order(
     *,
+    settings: Settings,
     db: Session,
     item: ExecutionPlanItem,
 ) -> BrokerOrder | None:
     active_order_id = db.scalar(
         select(BrokerOrder.id)
         .where(
+            *_active_kis_order_filters(
+                settings=settings,
+                exchange=_plan_item_exchange(item),
+            ),
             BrokerOrder.execution_plan_item_id == item.id,
             BrokerOrder.status.in_(tuple(ACTIVE_PROTECTIVE_STOP_ORDER_STATUSES)),
         )
@@ -4541,7 +8188,11 @@ def _retryable_session_rejection_source_order(
     )
     if active_order_id is not None:
         return None
-    order = _latest_plan_item_submission_attempt(db=db, item=item)
+    order = _latest_plan_item_submission_attempt(
+        settings=settings,
+        db=db,
+        item=item,
+    )
     if order is None or not _order_is_retryable_session_rejection(order=order, item=item):
         return None
     return order
@@ -4549,6 +8200,7 @@ def _retryable_session_rejection_source_order(
 
 def _protective_stop_retry_generation(
     *,
+    settings: Settings,
     db: Session,
     item: ExecutionPlanItem,
     source_order: BrokerOrder,
@@ -4591,7 +8243,12 @@ def _protective_stop_retry_generation(
         if expected_key is None or current.idempotency_key != expected_key:
             break
         parent = db.get(BrokerOrder, source_order_pk)
-        if parent is None or parent.execution_plan_item_id != item.id:
+        if (
+            parent is None
+            or parent.execution_plan_item_id != item.id
+            or _active_kis_order_exchange(settings=settings, order=parent)
+            != _plan_item_exchange(item)
+        ):
             break
         generation += 1
         current = parent
@@ -4620,11 +8277,21 @@ def _position_exit_quantity_policy_filter():
 
 
 def _has_unexited_buy_order_filter(*, settings: Settings):
+    scope_exchange = BrokerOrder.request_metadata["execution_scope"][
+        "exchange"
+    ].as_string()
+    item_exchange = func.upper(
+        func.coalesce(
+            ExecutionPlanItem.risk_context["exchange"].as_string(),
+            "KRX",
+        )
+    )
     latest_buy_order_at = (
         select(func.max(BrokerOrder.created_at))
         .where(
-            BrokerOrder.mode == settings.runtime_mode,
+            *_active_kis_order_filters(settings=settings),
             BrokerOrder.symbol == ExecutionPlanItem.symbol,
+            scope_exchange == item_exchange,
             BrokerOrder.side == "buy",
             BrokerOrder.status.in_(("submitted", "open", "partially_filled", "filled")),
         )
@@ -4634,8 +8301,9 @@ def _has_unexited_buy_order_filter(*, settings: Settings):
     latest_sell_order_at = (
         select(func.max(BrokerOrder.created_at))
         .where(
-            BrokerOrder.mode == settings.runtime_mode,
+            *_active_kis_order_filters(settings=settings),
             BrokerOrder.symbol == ExecutionPlanItem.symbol,
+            scope_exchange == item_exchange,
             BrokerOrder.side == "sell",
             BrokerOrder.status.in_(("submitted", "open", "partially_filled", "filled")),
         )
@@ -4668,7 +8336,7 @@ def _has_recent_flat_position_truth_filter(*, settings: Settings):
     return (
         select(ExecutionPosition.id)
         .where(
-            ExecutionPosition.mode == settings.runtime_mode,
+            *_active_kis_position_filters(settings=settings),
             ExecutionPosition.symbol == ExecutionPlanItem.symbol,
             ExecutionPosition.quantity <= 0,
             ExecutionPosition.last_reconciled_at.is_not(None),
@@ -4691,7 +8359,7 @@ def _has_recent_flat_position_truth_for_symbol(
     return db.scalar(
         select(ExecutionPosition.id)
         .where(
-            ExecutionPosition.mode == settings.runtime_mode,
+            *_active_kis_position_filters(settings=settings),
             ExecutionPosition.symbol == symbol,
             ExecutionPosition.quantity <= 0,
             ExecutionPosition.last_reconciled_at.is_not(None),
@@ -4717,7 +8385,7 @@ def _symbols_with_recent_flat_position_truth(
         for symbol in db.scalars(
             select(ExecutionPosition.symbol)
             .where(
-                ExecutionPosition.mode == settings.runtime_mode,
+                *_active_kis_position_filters(settings=settings),
                 ExecutionPosition.symbol.in_(_ordered_symbol_scope(symbols)),
                 ExecutionPosition.quantity <= 0,
                 ExecutionPosition.last_reconciled_at.is_not(None),
@@ -4733,7 +8401,7 @@ def _load_positions_by_symbol(
     db: Session,
     symbols: list[str] | set[str] | None = None,
 ) -> dict[str, ExecutionPosition]:
-    where = [ExecutionPosition.mode == settings.runtime_mode]
+    where = list(_active_kis_position_filters(settings=settings))
     if symbols:
         where.append(ExecutionPosition.symbol.in_(_ordered_symbol_scope(symbols)))
     positions = db.scalars(
@@ -4742,8 +8410,8 @@ def _load_positions_by_symbol(
         .order_by(ExecutionPosition.symbol.asc())
     ).all()
     return {
-        position.symbol: position
-        for position in positions
+        symbol: position
+        for symbol, position in _unique_positions_by_symbol(positions).items()
         if position.quantity > 0
     }
 
@@ -4765,6 +8433,7 @@ def _maintain_post_entry_exit_monitors(
             settings=settings,
             db=db,
             symbol=symbol,
+            position=position,
         )
         if entry_order is None or entry_order.plan_item is None:
             existing_maintenance_count, requires_review = _ensure_existing_position_default_exit_monitors(
@@ -4785,7 +8454,11 @@ def _maintain_post_entry_exit_monitors(
         if entry_price is None or entry_price <= 0:
             continue
 
-        observed_price = prices.get(symbol).price if prices.get(symbol) is not None else None
+        observed_price = _observed_price_for_side(
+            price=prices.get(symbol),
+            side="sell",
+            runtime_mode=settings.runtime_mode,
+        )
         entry_date = _entry_market_date(entry_item=entry_item, entry_order=entry_order)
         holding_session = _holding_session_age_from_date(
             entry_market_date=entry_date,
@@ -4848,13 +8521,45 @@ def _latest_filled_buy_order(
     settings: Settings,
     db: Session,
     symbol: str,
+    position: ExecutionPosition,
 ) -> BrokerOrder | None:
+    try:
+        actual_identity = position_identity_from_columns(position)
+        expected_identity = build_position_identity(
+            settings=settings,
+            provider="kis",
+            exchange=actual_identity.exchange if actual_identity is not None else "",
+        )
+    except PositionIdentityConflictError:
+        return None
+    if (
+        actual_identity is None
+        or actual_identity != expected_identity
+        or actual_identity.exchange not in MONITORED_KIS_POSITION_EXCHANGES
+    ):
+        return None
+    candidate_order_exchanges = (
+        sorted(KRX_EXCHANGES)
+        if actual_identity.exchange == "KRX"
+        else [actual_identity.exchange]
+    )
+    active_order_route = or_(
+        *(
+            and_(
+                *_active_kis_order_filters(
+                    settings=settings,
+                    exchange=route_exchange,
+                )
+            )
+            for route_exchange in candidate_order_exchanges
+        )
+    )
     return db.scalar(
         select(BrokerOrder)
         .join(BrokerOrder.plan_item)
         .join(ExecutionPlanItem.plan)
         .where(
-            BrokerOrder.mode == settings.runtime_mode,
+            active_order_route,
             BrokerOrder.symbol == symbol,
             BrokerOrder.side == "buy",
             BrokerOrder.status == "filled",
@@ -4894,9 +8599,9 @@ def _latest_filled_buy_order(
             ),
         )
         .order_by(
-            BrokerOrder.submitted_at.desc(),
-            BrokerOrder.updated_at.desc(),
-            BrokerOrder.created_at.desc(),
+            BrokerOrder.submitted_at.desc().nullslast(),
+            BrokerOrder.updated_at.desc().nullslast(),
+            BrokerOrder.created_at.desc().nullslast(),
             BrokerOrder.id.desc(),
         )
     )
@@ -4925,7 +8630,12 @@ def _ensure_existing_position_default_exit_monitors(
         )
         return 0, True
     if route["asset_class"] == "us_equity" and (
-        observed_price is None or observed_price.price <= 0
+        _observed_price_for_side(
+            price=observed_price,
+            side="sell",
+            runtime_mode=settings.runtime_mode,
+        )
+        is None
     ):
         _mark_position_monitoring_manual_review(
             position=position,
@@ -4933,7 +8643,16 @@ def _ensure_existing_position_default_exit_monitors(
             triggered_at=triggered_at,
         )
         return 0, True
-    plan = _latest_runtime_plan(settings=settings, db=db)
+    market_timezone = (
+        ZoneInfo("America/New_York")
+        if route["asset_class"] == "us_equity"
+        else KRX_TIMEZONE
+    )
+    plan = _latest_runtime_plan(
+        settings=settings,
+        db=db,
+        current_market_date=_normalize_utc(triggered_at).astimezone(market_timezone).date(),
+    )
     if plan is None:
         return 0, False
 
@@ -4941,8 +8660,9 @@ def _ensure_existing_position_default_exit_monitors(
     if not _has_active_sell_monitor(
         db=db,
         settings=settings,
-        symbol=position.symbol,
+        position=position,
         intent="stop_sell",
+        evaluated_at=triggered_at,
     ):
         stop_price = (position.average_price * (Decimal("1") - settings.exec_agent_stop_loss_pct)).quantize(
             Decimal("0.0001"),
@@ -4950,6 +8670,7 @@ def _ensure_existing_position_default_exit_monitors(
         )
         db.add(
             _new_existing_position_exit_monitor(
+                settings=settings,
                 plan=plan,
                 position=position,
                 intent="stop_sell",
@@ -4966,8 +8687,9 @@ def _ensure_existing_position_default_exit_monitors(
     if not _has_active_sell_monitor(
         db=db,
         settings=settings,
-        symbol=position.symbol,
+        position=position,
         intent="target_sell",
+        evaluated_at=triggered_at,
     ):
         target_price = (position.average_price * (Decimal("1") + settings.exec_agent_first_take_profit_pct)).quantize(
             Decimal("0.0001"),
@@ -4975,6 +8697,7 @@ def _ensure_existing_position_default_exit_monitors(
         )
         db.add(
             _new_existing_position_exit_monitor(
+                settings=settings,
                 plan=plan,
                 position=position,
                 intent="target_sell",
@@ -4997,15 +8720,44 @@ def _existing_position_monitoring_route(
     db: Session,
     position: ExecutionPosition,
 ) -> dict[str, str | None]:
+    try:
+        position_identity = position_identity_from_columns(position)
+        if position_identity is None:
+            raise PositionIdentityConflictError("position route is missing")
+        expected_identity = build_position_identity(
+            settings=settings,
+            provider="kis",
+            exchange=position_identity.exchange,
+        )
+    except PositionIdentityConflictError:
+        return {
+            "exchange": None,
+            "venue": None,
+            "asset_class": None,
+            "manual_review_reason": "position_route_unknown",
+        }
+    if position_identity != expected_identity:
+        return {
+            "exchange": None,
+            "venue": None,
+            "asset_class": None,
+            "manual_review_reason": "position_route_mismatch",
+        }
+
+    exchange = position_identity.exchange
     raw_payload = position.raw_payload if isinstance(position.raw_payload, dict) else {}
     sync_context = raw_payload.get("_position_sync")
-    if isinstance(sync_context, dict) and sync_context.get("asset_class") == "us_equity":
-        exchange = str(sync_context.get("exchange") or "").strip().upper()
-        eligible = sync_context.get("monitoring_eligible") is True
-        reason = sync_context.get("manual_review_reason")
-        if exchange not in {"NASD", "NYSE", "AMEX"}:
-            reason = reason or "unsupported_overseas_exchange"
-        elif not eligible:
+    if exchange in {"NASD", "NYSE", "AMEX"}:
+        eligible = not (
+            isinstance(sync_context, dict)
+            and sync_context.get("monitoring_eligible") is False
+        )
+        reason = (
+            sync_context.get("manual_review_reason")
+            if isinstance(sync_context, dict)
+            else None
+        )
+        if not eligible:
             reason = reason or "overseas_holding_not_verified_orderable"
         return {
             "exchange": exchange,
@@ -5013,31 +8765,7 @@ def _existing_position_monitoring_route(
             "asset_class": "us_equity",
             "manual_review_reason": str(reason) if reason else None,
         }
-
-    latest_item = db.scalar(
-        select(ExecutionPlanItem)
-        .join(ExecutionPlanItem.plan)
-        .where(
-            ExecutionPlan.mode == settings.runtime_mode,
-            ExecutionPlanItem.symbol == position.symbol,
-            ExecutionPlanItem.provider == "kis",
-        )
-        .order_by(ExecutionPlanItem.created_at.desc(), ExecutionPlanItem.plan_item_index.desc())
-        .limit(1)
-    )
-    if latest_item is not None and latest_item.asset_class == "us_equity":
-        exchange = _plan_item_exchange(latest_item)
-        return {
-            "exchange": exchange,
-            "venue": "kis",
-            "asset_class": "us_equity",
-            "manual_review_reason": (
-                None
-                if exchange in {"NASD", "NYSE", "AMEX"}
-                else "missing_supported_overseas_exchange"
-            ),
-        }
-    if position.symbol.isdigit() and len(position.symbol) == 6:
+    if exchange == "KRX" and position.symbol.isdigit() and len(position.symbol) == 6:
         return {
             "exchange": "KRX",
             "venue": "krx",
@@ -5068,12 +8796,24 @@ def _mark_position_monitoring_manual_review(
     position.raw_payload = raw_payload
 
 
-def _latest_runtime_plan(*, settings: Settings, db: Session) -> ExecutionPlan | None:
+def _latest_runtime_plan(
+    *,
+    settings: Settings,
+    db: Session,
+    current_market_date: date,
+) -> ExecutionPlan | None:
     return db.scalar(
         select(ExecutionPlan)
-        .where(ExecutionPlan.mode == settings.runtime_mode)
+        .where(
+            ExecutionPlan.mode == settings.runtime_mode,
+            or_(
+                ExecutionPlan.market_date.is_(None),
+                ExecutionPlan.market_date <= current_market_date,
+            ),
+        )
         .order_by(
             ExecutionPlan.market_date.desc(),
+            ExecutionPlan.requested_at.desc().nullslast(),
             ExecutionPlan.accepted_at.desc(),
             ExecutionPlan.created_at.desc(),
             ExecutionPlan.id.desc(),
@@ -5086,8 +8826,9 @@ def _has_active_sell_monitor(
     *,
     db: Session,
     settings: Settings,
-    symbol: str,
+    position: ExecutionPosition,
     intent: str,
+    evaluated_at: datetime,
 ) -> bool:
     candidate_statuses = (
         SELL_ACTIVE_MONITORING_STATUSES
@@ -5103,7 +8844,7 @@ def _has_active_sell_monitor(
         .join(ExecutionPlanItem.plan)
         .where(
             ExecutionPlan.mode == settings.runtime_mode,
-            ExecutionPlanItem.symbol == symbol,
+            ExecutionPlanItem.symbol == position.symbol,
             ExecutionPlanItem.side == "sell",
             ExecutionPlanItem.intent == intent,
             ExecutionPlanItem.status.in_(tuple(candidate_statuses)),
@@ -5114,16 +8855,40 @@ def _has_active_sell_monitor(
                 ExecutionPlanItem.side,
                 ExecutionPlanItem.intent,
                 ExecutionPlanItem.status,
+                ExecutionPlanItem.provider,
+                ExecutionPlanItem.venue,
+                ExecutionPlanItem.asset_class,
                 ExecutionPlanItem.quantity_policy,
                 ExecutionPlanItem.trigger_price,
-            )
+                ExecutionPlanItem.risk_context,
+            ),
+            selectinload(ExecutionPlanItem.plan).load_only(
+                ExecutionPlan.id,
+                ExecutionPlan.market_date,
+            ),
         )
         .order_by(
             ExecutionPlanItem.updated_at.desc(),
             ExecutionPlanItem.id.desc(),
         )
     ).all()
-    for item in candidates:
+    candidates = [
+        item
+        for item in candidates
+        if item.plan.market_date is None
+        or _replanned_sell_plan_is_effective(
+            plan=item.plan,
+            item=item,
+            effective_at=evaluated_at,
+        )
+    ]
+    eligible_candidates = _quarantine_invalid_sell_monitor_routes(
+        settings=settings,
+        items=candidates,
+        recorded_at=datetime.now(UTC),
+        positions_by_symbol={position.symbol: position},
+    )
+    for item in eligible_candidates:
         if item.status in SELL_PENDING_CONFIG_STATUSES and _is_future_entry_exit_template(item):
             # Only a demonstrably linked future-entry template may yield to
             # broker-position fallback protection.  An explicit shares-based
@@ -5145,6 +8910,7 @@ def _is_future_entry_exit_template(item: ExecutionPlanItem) -> bool:
 
 def _new_existing_position_exit_monitor(
     *,
+    settings: Settings,
     plan: ExecutionPlan,
     position: ExecutionPosition,
     intent: str,
@@ -5155,21 +8921,9 @@ def _new_existing_position_exit_monitor(
     asset_class: str,
     triggered_at: datetime,
 ) -> ExecutionPlanItem:
-    item = ExecutionPlanItem(
-        id=new_id(),
-        plan=plan,
-        plan_item_index=_next_plan_item_index(plan),
-        symbol=position.symbol,
-        side="sell",
-        intent=intent,
-        status=_monitoring_status(intent),
-        quantity_policy={
-            "kind": "shares",
-            "quantity": position.quantity,
-            "source": source,
-        },
-        trigger_price=trigger_price,
-        time_in_force="day",
+    risk_context, quantity_policy = bind_kis_account_route(
+        settings=settings,
+        provider="kis",
         risk_context={
             "exchange": exchange,
             "post_entry_managed": True,
@@ -5178,6 +8932,24 @@ def _new_existing_position_exit_monitor(
                 "entry_quantity": position.quantity,
             },
         },
+        quantity_policy={
+            "kind": "shares",
+            "quantity": position.quantity,
+            "source": source,
+        },
+    )
+    item = ExecutionPlanItem(
+        id=new_id(),
+        plan=plan,
+        plan_item_index=_next_plan_item_index(plan),
+        symbol=position.symbol,
+        side="sell",
+        intent=intent,
+        status=_monitoring_status(intent),
+        quantity_policy=quantity_policy,
+        trigger_price=trigger_price,
+        time_in_force="day",
+        risk_context=risk_context,
         decision_agent_name="post-entry-monitor-repair",
         source_plan_item_id=f"existing-position-{position.symbol}-{intent}",
         source_market_date=triggered_at.astimezone(
@@ -5273,6 +9045,7 @@ def _ensure_post_entry_stop_monitor(
             time_in_force=entry_item.time_in_force or "day",
             risk_context={
                 "exchange": _plan_item_exchange(entry_item),
+                **_inherited_kis_account_route_context(entry_item),
                 "entry_context": _post_entry_context(
                     entry_item=entry_item,
                     entry_price=entry_price,
@@ -5286,6 +9059,9 @@ def _ensure_post_entry_stop_monitor(
             decision_run_id=entry_item.decision_run_id,
             source_plan_item_id=_derived_source_plan_item_id(entry_item, "post-entry-stop"),
             source_market_date=entry_item.source_market_date,
+            provider=entry_item.provider,
+            venue=entry_item.venue,
+            asset_class=entry_item.asset_class,
         )
         db.add(existing)
         _record_monitoring_event(
@@ -5334,6 +9110,7 @@ def _ensure_post_entry_stop_monitor(
         )
     risk_context = dict(existing.risk_context) if isinstance(existing.risk_context, dict) else {}
     risk_context.setdefault("exchange", _plan_item_exchange(entry_item))
+    risk_context.update(_inherited_kis_account_route_context(entry_item))
     risk_context.setdefault("deterministic_emergency_stop", True)
     risk_context.setdefault("post_entry_managed", True)
     risk_context["entry_context"] = _post_entry_context(
@@ -5413,6 +9190,7 @@ def _ensure_post_entry_target_monitor(
             time_in_force=entry_item.time_in_force or "day",
             risk_context={
                 "exchange": _plan_item_exchange(entry_item),
+                **_inherited_kis_account_route_context(entry_item),
                 "entry_context": _post_entry_context(
                     entry_item=entry_item,
                     entry_price=entry_price,
@@ -5425,6 +9203,9 @@ def _ensure_post_entry_target_monitor(
             decision_run_id=entry_item.decision_run_id,
             source_plan_item_id=_derived_source_plan_item_id(entry_item, "post-entry-target"),
             source_market_date=entry_item.source_market_date,
+            provider=entry_item.provider,
+            venue=entry_item.venue,
+            asset_class=entry_item.asset_class,
         )
         db.add(existing)
         _record_monitoring_event(
@@ -5479,6 +9260,7 @@ def _ensure_post_entry_target_monitor(
 
     risk_context = dict(existing.risk_context) if isinstance(existing.risk_context, dict) else {}
     risk_context.setdefault("exchange", _plan_item_exchange(entry_item))
+    risk_context.update(_inherited_kis_account_route_context(entry_item))
     risk_context.setdefault("post_entry_managed", True)
     risk_context["entry_context"] = _post_entry_context(
         entry_item=entry_item,
@@ -5542,6 +9324,7 @@ def _ensure_post_entry_max_holding_monitor(
             time_in_force=entry_item.time_in_force or "day",
             risk_context={
                 "exchange": _plan_item_exchange(entry_item),
+                **_inherited_kis_account_route_context(entry_item),
                 "close_exit_date": close_exit_date.isoformat(),
                 "max_holding_sessions": max_holding_sessions,
                 "entry_context": _post_entry_context(
@@ -5556,6 +9339,9 @@ def _ensure_post_entry_max_holding_monitor(
             decision_run_id=entry_item.decision_run_id,
             source_plan_item_id=_derived_source_plan_item_id(entry_item, "post-entry-max-holding"),
             source_market_date=entry_item.source_market_date,
+            provider=entry_item.provider,
+            venue=entry_item.venue,
+            asset_class=entry_item.asset_class,
         )
         db.add(existing)
         _record_monitoring_event(
@@ -5585,6 +9371,7 @@ def _ensure_post_entry_max_holding_monitor(
         )
         risk_context = dict(existing.risk_context) if isinstance(existing.risk_context, dict) else {}
     risk_context.setdefault("exchange", _plan_item_exchange(entry_item))
+    risk_context.update(_inherited_kis_account_route_context(entry_item))
     risk_context.setdefault("post_entry_managed", True)
     risk_context["entry_context"] = _post_entry_context(
         entry_item=entry_item,
@@ -5613,16 +9400,24 @@ def _active_sibling_monitor(
     plan = entry_item.plan
     if plan is None:
         return None
-    for sibling in plan.items:
-        if sibling.symbol != entry_item.symbol or sibling.side != "sell" or sibling.intent != intent:
-            continue
-        if sibling.status in NON_MONITORABLE_PLAN_ITEM_STATUSES:
-            continue
-        return sibling
+    candidates = [
+        sibling
+        for sibling in plan.items
+        if sibling.symbol == entry_item.symbol
+        and sibling.side == "sell"
+        and sibling.intent == intent
+        and sibling.status not in NON_MONITORABLE_PLAN_ITEM_STATUSES
+    ]
+    selected = select_plan_item_family_members(
+        anchor=entry_item,
+        candidates=candidates,
+    )
+    if selected:
+        return selected[0]
     session = sa_inspect(entry_item).session
     if session is None:
         return None
-    return session.scalar(
+    persisted_candidates = session.scalars(
         select(ExecutionPlanItem)
         .where(
             ExecutionPlanItem.execution_plan_id == entry_item.execution_plan_id,
@@ -5635,9 +9430,12 @@ def _active_sibling_monitor(
             ExecutionPlanItem.plan_item_index.asc(),
             ExecutionPlanItem.id.asc(),
         )
-        .limit(1)
+    ).all()
+    selected = select_plan_item_family_members(
+        anchor=entry_item,
+        candidates=persisted_candidates,
     )
-    return None
+    return selected[0] if selected else None
 
 
 def _is_breakeven_rearmed_stop(item: ExecutionPlanItem) -> bool:
@@ -5674,6 +9472,18 @@ def _post_entry_context(
     if entry_price is not None:
         context["entry_price"] = _serialize_decimal(entry_price)
     return context
+
+
+def _inherited_kis_account_route_context(
+    entry_item: ExecutionPlanItem,
+) -> dict[str, object]:
+    binding = kis_account_route_binding_from_payloads(
+        entry_item.risk_context,
+        entry_item.quantity_policy,
+    )
+    if binding is None:
+        return {}
+    return {KIS_ACCOUNT_ROUTE_BINDING_KEY: binding}
 
 
 def _derived_source_plan_item_id(entry_item: ExecutionPlanItem, suffix: str) -> str | None:
@@ -5780,11 +9590,12 @@ def _latest_reconciliation_error_for_symbol(
     settings: Settings,
     db: Session,
     symbol: str,
+    exchange: str,
 ) -> str | None:
     order = db.scalar(
         select(BrokerOrder)
         .where(
-            BrokerOrder.mode == settings.runtime_mode,
+            *_active_kis_order_filters(settings=settings, exchange=exchange),
             BrokerOrder.symbol == symbol,
             BrokerOrder.side == "sell",
             BrokerOrder.status.in_(("submitted", "open", "partially_filled")),
@@ -5826,6 +9637,8 @@ def _reconcile_before_monitoring(
             adapter=adapter,
             symbols=symbols,
         )
+    except PositionIdentityConflictError:
+        raise
     except Exception:
         return
 
@@ -5843,6 +9656,8 @@ def _reconcile_before_monitoring(
                 adapter=adapter,
                 symbols=symbols,
             )
+        except PositionIdentityConflictError:
+            raise
         except Exception:
             # The fill-aware reservation pass below still removes executions
             # newer than local position truth if the broker snapshot is down.
@@ -5867,6 +9682,8 @@ def _reconcile_before_monitoring(
             adapter=adapter,
             symbols=stale_symbols,
         )
+    except PositionIdentityConflictError:
+        raise
     except Exception:
         return
 
@@ -5878,7 +9695,7 @@ def _pending_broker_order_symbols(
     symbols: set[str] | None = None,
 ) -> set[str]:
     where = [
-        BrokerOrder.mode == settings.runtime_mode,
+        *_active_kis_order_filters(settings=settings),
         BrokerOrder.broker_order_id.is_not(None),
         BrokerOrder.status.in_(
             (
@@ -5912,11 +9729,11 @@ def _positions_with_stale_local_state(
     positions = db.scalars(
         select(ExecutionPosition)
         .where(
-            ExecutionPosition.mode == settings.runtime_mode,
+            *_active_kis_position_filters(settings=settings),
             ExecutionPosition.symbol.in_(sorted(symbols)),
         )
     ).all()
-    known = {position.symbol: position for position in positions}
+    known = _unique_positions_by_symbol(positions)
     stale: set[str] = set()
     stale_before = datetime.now(UTC) - timedelta(seconds=max_age_seconds)
     for symbol in symbols:
@@ -5951,7 +9768,7 @@ def _refresh_position_truth_if_stale(
         existing_symbols = set(
             db.scalars(
                 select(ExecutionPosition.symbol).where(
-                    ExecutionPosition.mode == settings.runtime_mode,
+                    *_active_kis_position_filters(settings=settings),
                     ExecutionPosition.symbol.in_(symbol_list),
                 )
             ).all()
@@ -5966,6 +9783,8 @@ def _refresh_position_truth_if_stale(
                 adapter=adapter,
                 symbols=missing_symbols,
             )
+        except PositionIdentityConflictError:
+            raise
         except Exception:
             return
         return
@@ -5986,7 +9805,7 @@ def _refresh_position_truth_if_stale(
         )
         return
     where = [
-        ExecutionPosition.mode == settings.runtime_mode,
+        *_active_kis_position_filters(settings=settings),
         ExecutionPosition.quantity > 0,
     ]
     latest_reconciled_at = db.scalar(
@@ -6029,7 +9848,7 @@ def _sync_positions_for_monitoring_routes(
             str(symbol)
             for symbol in db.scalars(
                 select(ExecutionPosition.symbol).where(
-                    ExecutionPosition.mode == settings.runtime_mode,
+                    *_active_kis_position_filters(settings=settings),
                 )
             ).all()
             if str(symbol).strip()
@@ -6053,15 +9872,16 @@ def _sync_positions_for_monitoring_routes(
     if not tracked_symbols:
         return
 
-    positions_by_symbol = {
-        position.symbol: position
-        for position in db.scalars(
-            select(ExecutionPosition).where(
-                ExecutionPosition.mode == settings.runtime_mode,
-                ExecutionPosition.symbol.in_(sorted(tracked_symbols)),
-            )
-        ).all()
-    }
+    positions_by_symbol = _unique_positions_by_symbol(
+        list(
+            db.scalars(
+                select(ExecutionPosition).where(
+                    *_active_kis_position_filters(settings=settings),
+                    ExecutionPosition.symbol.in_(sorted(tracked_symbols)),
+                )
+            ).all()
+        )
+    )
     latest_items: dict[str, ExecutionPlanItem] = {}
     rows = db.scalars(
         select(ExecutionPlanItem)
@@ -6074,25 +9894,34 @@ def _sync_positions_for_monitoring_routes(
         .order_by(ExecutionPlanItem.created_at.desc(), ExecutionPlanItem.plan_item_index.desc())
     ).all()
     for item in rows:
-        latest_items.setdefault(item.symbol, item)
+        if classify_kis_account_route(
+            settings=settings,
+            provider=item.provider,
+            risk_context=item.risk_context,
+            quantity_policy=item.quantity_policy,
+        ) == "active":
+            latest_items.setdefault(item.symbol, item)
 
     symbols_by_exchange: dict[str, set[str]] = {}
     for symbol in sorted(tracked_symbols):
+        position = positions_by_symbol.get(symbol)
+        position_exchange = _position_sync_exchange(position)
+        if position_exchange in MONITORED_KIS_POSITION_EXCHANGES:
+            symbols_by_exchange.setdefault(position_exchange, set()).add(symbol)
+            continue
+        if position is not None and position.quantity > 0:
+            _mark_position_monitoring_manual_review(
+                position=position,
+                reason="position_route_unknown",
+                triggered_at=datetime.now(UTC),
+            )
+            continue
+
         item = latest_items.get(symbol)
         if item is None:
-            exchange = _position_sync_exchange(positions_by_symbol.get(symbol))
-            if exchange in {"NASD", "NYSE", "AMEX"}:
-                pass
-            elif symbol.isdigit() and len(symbol) == 6:
+            if symbol.isdigit() and len(symbol) == 6:
                 exchange = "KRX"
             else:
-                position = positions_by_symbol.get(symbol)
-                if position is not None and position.quantity > 0:
-                    _mark_position_monitoring_manual_review(
-                        position=position,
-                        reason="position_route_unknown",
-                        triggered_at=datetime.now(UTC),
-                    )
                 continue
         elif item.asset_class == "us_equity":
             exchange = _plan_item_exchange(item)
@@ -6115,16 +9944,15 @@ def _sync_positions_for_monitoring_routes(
 
 
 def _position_sync_exchange(position: ExecutionPosition | None) -> str | None:
-    if position is None or not isinstance(position.raw_payload, dict):
+    if position is None:
         return None
-    sync_context = position.raw_payload.get("_position_sync")
-    if not isinstance(sync_context, dict):
+    try:
+        identity = position_identity_from_columns(position)
+    except PositionIdentityConflictError:
         return None
-    exchange = sync_context.get("exchange")
-    if not isinstance(exchange, str):
+    if identity is None:
         return None
-    normalized = exchange.strip().upper()
-    return normalized or None
+    return identity.exchange
 
 
 def _is_legacy_seeded_reconciliation_position(position: ExecutionPosition) -> bool:
@@ -6388,7 +10216,7 @@ def _primary_triggered_sell_symbols(
             cycle_at=triggered_at,
         ) is not None:
             continue
-        observed_price = price.price if price is not None else None
+        observed_price = _observed_price_for_item(price=price, item=item)
         if _is_triggered(
             item=item,
             observed_price=observed_price,
@@ -6540,9 +10368,10 @@ def _parse_decimal(value: object) -> Decimal | None:
     if value is None or isinstance(value, bool):
         return None
     try:
-        return Decimal(str(value))
+        parsed = Decimal(str(value))
     except (InvalidOperation, ValueError):
         return None
+    return parsed if parsed.is_finite() else None
 
 
 def _max_holding_exit_due(*, item: ExecutionPlanItem, triggered_at: datetime) -> bool:
@@ -6605,10 +10434,17 @@ def _resolve_watch_buy_order(
     item: ExecutionPlanItem,
     observed_price: Decimal | None,
     price: MonitoringPriceRequest | None = None,
+    execution_price_override: Decimal | None = None,
     requested_quantity: int | None = None,
     trigger_time_agent_approved: bool = False,
     sizing_source: str | None = None,
 ) -> WatchBuyOrderApproval:
+    if is_legacy_unverified_exec_agent_sizing(item.quantity_policy):
+        return WatchBuyOrderApproval(
+            quantity=None,
+            reason="unverified_exec_agent_sizing",
+            message="legacy inferred shares lack verified exec-agent approval provenance",
+        )
     liquidity_tier = _watch_buy_liquidity_tier(item)
     if liquidity_tier == "very_weak" and _watch_buy_liquidity_override(item) is None:
         approval = WatchBuyOrderApproval(
@@ -6659,7 +10495,12 @@ def _resolve_watch_buy_order(
             message="watch buy requires an exec-agent share quantity before order submission",
         )
 
-    entry_price = observed_price or _watch_buy_trigger_price(item) or item.limit_price
+    entry_price = (
+        execution_price_override
+        or observed_price
+        or _watch_buy_trigger_price(item)
+        or item.limit_price
+    )
     stale_reclaim_veto = _watch_buy_stale_trigger_reclaim_veto(
         settings=settings,
         item=item,
@@ -6736,7 +10577,7 @@ def _resolve_watch_buy_order(
     available_cash = _minimum_decimal(snapshot.available_cash, snapshot.buying_power)
     existing_exposure = entry_price * Decimal(
         _snapshot_symbol_quantity(snapshot=snapshot, symbol=item.symbol)
-        + _local_position_quantity(settings=settings, db=db, symbol=item.symbol)
+        + _local_position_quantity(settings=settings, db=db, item=item)
     )
     effective_stop = effective_stop_price(
         settings=settings,
@@ -6917,8 +10758,51 @@ def _live_watch_buy_submission_veto(
     market_context = market_regime_context_from_item_payloads(_loaded_risk_context(item), item.quantity_policy)
     market_context = merge_live_market_regime_context(
         market_context,
-        load_live_market_regime_context(settings=settings),
+        load_live_market_regime_context(settings=settings, now=recorded_at),
     )
+    live_market_authority, authority_reason = (
+        trigger_time_exec_agent.evaluate_live_market_buy_authority_gate(
+            settings=settings,
+            item=item,
+            live_payload=market_context,
+            session_type=price.session_type if price is not None else None,
+            evaluated_at=recorded_at,
+        )
+    )
+    if authority_reason is not None:
+        authority_reason_code = str(
+            live_market_authority.get("reason_code")
+            or "live_market_buy_authority_blocked"
+        )
+        skipped_notional = (
+            observed_price * Decimal(quantity)
+            if observed_price is not None and quantity is not None
+            else None
+        )
+        return WatchBuyOrderApproval(
+            quantity=None,
+            reason=authority_reason_code,
+            message=authority_reason,
+            details=compact_json_object(
+                {
+                    "event": LIVE_WATCH_BUY_VETO_EVENT_TYPE,
+                    "schema_version": "live_watch_buy_submission_veto_v1",
+                    "symbol": item.symbol,
+                    "execution_plan_item_id": item.id,
+                    "reasons": [authority_reason_code],
+                    "primary_reason": authority_reason_code,
+                    "runtime_mode": settings.runtime_mode,
+                    "provider": item.provider or "kis",
+                    "asset_class": item.asset_class or "stock",
+                    "venue": item.venue or _plan_item_exchange(item),
+                    "skipped_quantity": quantity,
+                    "skipped_notional_krw": _serialize_decimal(skipped_notional),
+                    "observed_price": _serialize_decimal(observed_price),
+                    "live_market_buy_authority_gate": live_market_authority,
+                    "recorded_at": recorded_at.isoformat(),
+                }
+            ),
+        )
     skipped_notional = observed_price * Decimal(quantity) if observed_price is not None and quantity is not None else None
     market_guardrail = evaluate_market_regime_guardrail(
         settings=settings,
@@ -6953,6 +10837,13 @@ def _live_watch_buy_submission_veto(
 
     if settings.watch_buy_live_market_quality_veto_enabled:
         trigger_quality = _live_watch_buy_trigger_quality(price=price)
+        quote_trust_reason = _live_automated_quote_trust_reason(
+            settings=settings,
+            item=item,
+            price=price,
+        )
+        if quote_trust_reason is not None:
+            reasons.append("untrusted_quote_provenance")
         if trigger_quality["volume"] is not None and trigger_quality["volume"] <= 0:
             reasons.append("zero_trigger_volume")
         if trigger_quality["turnover"] is not None and trigger_quality["turnover"] <= 0:
@@ -6993,6 +10884,7 @@ def _live_watch_buy_submission_veto(
             "provenance": price.provenance if price is not None else {},
         },
         "market_regime_guardrail": market_guardrail.audit,
+        "live_market_buy_authority_gate": live_market_authority,
         "market_regime_reason_code": market_guardrail.reason_code,
         "market_regime_posture": market_guardrail.posture,
         "market_regime_action": market_guardrail.action,
@@ -7008,16 +10900,79 @@ def _live_watch_buy_submission_veto(
 
 
 def _live_watch_buy_veto_applies(*, settings: Settings, item: ExecutionPlanItem) -> bool:
-    if settings.runtime_mode != "live" or not settings.automation_enabled:
+    if settings.runtime_mode != "live":
         return False
     provider = str(item.provider or "kis").strip().lower()
     if provider not in {"kis", "korea_investment", "korea-investment"}:
         return False
-    asset_class = str(item.asset_class or "stock").strip().lower()
-    if asset_class not in {"stock", "equity", "korean_equity", "kr_equity"}:
+    try:
+        asset_class = canonical_execution_asset_class(
+            item.asset_class or "stock",
+            provider=provider,
+            exchange=item.venue or _plan_item_exchange(item) or "KRX",
+        )
+    except ValueError:
+        return False
+    if asset_class != "stock":
         return False
     venue = str(item.venue or _plan_item_exchange(item) or "KRX").strip().upper()
-    return venue in {"KRX", "NXT", "KOSPI", "KOSDAQ"}
+    return venue in KRX_EXCHANGES
+
+
+def _live_automated_quote_trust_reason(
+    *,
+    settings: Settings,
+    item: ExecutionPlanItem,
+    price: MonitoringPriceRequest | None,
+) -> str | None:
+    if settings.runtime_mode != "live":
+        return None
+    if not (_is_watch_buy_item(item) or item.side == "sell"):
+        return None
+    provider = str(item.provider or "kis").strip().lower()
+    if provider not in {"kis", "korea_investment", "korea-investment"}:
+        return None
+    side = "buy" if _is_watch_buy_item(item) else "sell"
+    if price is None:
+        return f"live automated KIS {side} requires a fresh exchange quote"
+    if not _is_trusted_exchange_freshness_source(price.freshness_source):
+        return (
+            f"live automated KIS {side} quote lacks trusted exchange-time "
+            "provenance"
+        )
+    executable_field = "ask" if side == "buy" else "bid"
+    executable_price = getattr(price, executable_field)
+    if executable_price is None or executable_price <= 0:
+        return (
+            f"live automated KIS {side} quote lacks a positive executable "
+            f"{executable_field}"
+        )
+    provenance = price.provenance if isinstance(price.provenance, dict) else {}
+    field_sources = provenance.get("field_sources")
+    field_source = (
+        field_sources.get(executable_field)
+        if isinstance(field_sources, dict)
+        else None
+    )
+    if not isinstance(field_source, dict) or not _is_trusted_exchange_freshness_source(
+        field_source.get("freshness_source")
+    ):
+        return (
+            f"live automated KIS {side} {executable_field} lacks trusted "
+            "field-level exchange-time provenance"
+        )
+    field_observed_at = _parse_event_datetime(field_source.get("observed_at"))
+    if field_observed_at is None or price.observed_at is None:
+        return (
+            f"live automated KIS {side} {executable_field} lacks a verifiable "
+            "field timestamp"
+        )
+    if _normalize_utc(field_observed_at) != _normalize_utc(price.observed_at):
+        return (
+            f"live automated KIS {side} {executable_field} timestamp does not "
+            "match the quote freshness boundary"
+        )
+    return None
 
 
 def _live_watch_buy_trigger_quality(*, price: MonitoringPriceRequest | None) -> dict[str, Decimal | None]:
@@ -7276,22 +11231,18 @@ def _trigger_time_decision_confirms_fresh_pullback_reclaim(item: ExecutionPlanIt
     if not isinstance(interaction, dict):
         return False
     decision = interaction.get("decision")
-    response = interaction.get("response_payload")
     if not isinstance(decision, dict):
         return False
     if decision.get("decision") != "execute_now":
         return False
     has_updated_stop = _parse_positive_decimal(decision.get("updated_stop_price")) is not None
     has_updated_target = _parse_positive_decimal(decision.get("updated_target_price")) is not None
-    has_updated_trigger = any(
-        _parse_positive_decimal(payload.get(key)) is not None
-        for payload in (decision, response if isinstance(response, dict) else {})
-        for key in ("updated_trigger_price", "new_trigger_price", "reclaim_trigger_price")
-        if isinstance(payload, dict)
+    has_updated_trigger = (
+        _parse_positive_decimal(decision.get("updated_trigger_price")) is not None
     )
     if not (has_updated_stop and has_updated_target and has_updated_trigger):
         return False
-    text = str({"decision": decision, "response_payload": response}).lower()
+    text = str(decision).lower()
     return "pullback" in text or "reclaim" in text
 
 
@@ -7339,25 +11290,11 @@ def _watch_buy_exec_agent_sizing_fallback_allowed(
     settings: Settings,
     item: ExecutionPlanItem,
 ) -> bool:
-    risk_context = _loaded_risk_context(item)
-    quantity_policy = item.quantity_policy if isinstance(item.quantity_policy, dict) else {}
-    if (
-        quantity_policy.get("exec_agent_watch_sizing_fallback_allowed") is True
-        or risk_context.get("exec_agent_watch_sizing_fallback_allowed") is True
-    ):
-        return True
-    attempts = _parse_positive_int(
-        quantity_policy.get("exec_agent_watch_sizing_attempt_count")
-        or risk_context.get("exec_agent_watch_sizing_attempt_count")
-    ) or 0
-    max_attempts = (
-        _parse_positive_int(
-            quantity_policy.get("exec_agent_watch_sizing_max_attempts")
-            or risk_context.get("exec_agent_watch_sizing_max_attempts")
-        )
-        or settings.exec_agent_watch_sizing_max_attempts
-    )
-    return attempts >= max_attempts
+    # An exhausted agent retry budget is not approval provenance. Arithmetic
+    # budget/reference fallback previously converted delegated sizing into a
+    # live buy without a verified decision, so delegated policies stay closed.
+    del settings, item
+    return False
 
 
 def _first_payload_value(item: ExecutionPlanItem, key: str) -> object | None:
@@ -7536,6 +11473,8 @@ def _load_watch_buy_cash_reservation(
         return snapshot
     snapshot_payload = snapshot.payload if isinstance(snapshot.payload, dict) else {}
     open_orders_error = snapshot_payload.get("open_orders_error")
+    if settings.runtime_mode == "live" and not snapshot.open_orders_complete:
+        return "broker open-order truth is incomplete; live watch-buy sizing is blocked"
     if (
         settings.runtime_mode == "live"
         and isinstance(open_orders_error, dict)
@@ -7586,14 +11525,27 @@ def _local_open_buy_order_notional(
             continue
         total += snapshot_notional
         valued_snapshot_orders.append(snapshot_order)
-    orders = db.scalars(
+    candidate_orders = db.scalars(
         select(BrokerOrder).where(
             BrokerOrder.mode == settings.runtime_mode,
+            BrokerOrder.broker_name == "kis",
             BrokerOrder.side == "buy",
             BrokerOrder.status.in_(tuple(OPEN_BUY_ORDER_STATUSES)),
         )
     ).all()
     complete = True
+    orders: list[BrokerOrder] = []
+    for order in candidate_orders:
+        scope_status, _exchange = _kis_order_scope_classification(
+            settings=settings,
+            order=order,
+        )
+        if scope_status == "active":
+            orders.append(order)
+        elif scope_status == "invalid":
+            # A legacy KIS order could belong to the active account. Its
+            # reservation cannot be safely ignored in live sizing.
+            complete = False
     for order in orders:
         if any(
             _same_open_order_identity(local=order, snapshot=snapshot_order)
@@ -7724,12 +11676,20 @@ def _snapshot_symbol_quantity(*, snapshot: BrokerAccountSnapshot, symbol: str) -
     return sum(position.quantity for position in positions if position.symbol == symbol and position.quantity > 0)
 
 
-def _local_position_quantity(*, settings: Settings, db: Session, symbol: str) -> int:
-    position = db.scalar(
-        select(ExecutionPosition).where(
-            ExecutionPosition.mode == settings.runtime_mode,
-            ExecutionPosition.symbol == symbol,
-        )
+def _local_position_quantity(
+    *,
+    settings: Settings,
+    db: Session,
+    item: ExecutionPlanItem,
+) -> int:
+    position = _position_for_monitoring_item(
+        settings=settings,
+        item=item,
+        positions_by_symbol=_load_positions_by_symbol(
+            settings=settings,
+            db=db,
+            symbols={item.symbol},
+        ),
     )
     return position.quantity if position is not None and position.quantity > 0 else 0
 
@@ -7743,7 +11703,7 @@ def _load_daily_new_buy_notional(
     if market_date is None:
         return Decimal("0")
     uncertain_statuses = ("submission_pending", "manual_review_required")
-    uncertain_orders = db.scalars(
+    uncertain_order_candidates = db.scalars(
         select(BrokerOrder)
         .join(
             ExecutionPlanItem,
@@ -7753,10 +11713,21 @@ def _load_daily_new_buy_notional(
         .where(
             ExecutionPlan.mode == settings.runtime_mode,
             ExecutionPlan.market_date == market_date,
+            BrokerOrder.broker_name == "kis",
             BrokerOrder.side == "buy",
             BrokerOrder.status.in_(uncertain_statuses),
         )
     ).all()
+    # An unscoped legacy KIS order cannot be attributed to another account, so
+    # excluding it could understate committed capital. Count active and
+    # indeterminate rows conservatively; exclude only a positively identified
+    # foreign account scope.
+    uncertain_orders = [
+        order
+        for order in uncertain_order_candidates
+        if _kis_order_scope_classification(settings=settings, order=order)[0]
+        != "foreign"
+    ]
     uncertain_item_ids = {
         order.execution_plan_item_id
         for order in uncertain_orders
@@ -7794,6 +11765,8 @@ def _load_daily_new_buy_notional(
                 ExecutionPlanItem.side,
                 ExecutionPlanItem.status,
                 ExecutionPlanItem.quantity_policy,
+                ExecutionPlanItem.risk_context,
+                ExecutionPlanItem.provider,
                 ExecutionPlanItem.limit_price,
                 ExecutionPlanItem.trigger_price,
             )
@@ -7802,6 +11775,16 @@ def _load_daily_new_buy_notional(
     total = Decimal("0")
     for item in items:
         if item.id in uncertain_item_ids:
+            continue
+        if (
+            classify_kis_account_route(
+                settings=settings,
+                provider=item.provider,
+                risk_context=item.risk_context,
+                quantity_policy=item.quantity_policy,
+            )
+            == "foreign"
+        ):
             continue
         total += _approved_buy_notional(item)
     for order in uncertain_orders:
@@ -7910,8 +11893,29 @@ def _reserve_existing_exit_orders(
 ) -> None:
     if not remaining_quantities_by_symbol:
         return
+    scoped_symbols = sorted(remaining_quantities_by_symbol)
+    active_sell_candidates = db.scalars(
+        select(BrokerOrder).where(
+            BrokerOrder.mode == settings.runtime_mode,
+            BrokerOrder.broker_name == "kis",
+            BrokerOrder.side == "sell",
+            BrokerOrder.symbol.in_(scoped_symbols),
+            BrokerOrder.status.in_(tuple(CAPITAL_RESERVING_ORDER_STATUSES)),
+        )
+    ).all()
+    for order in active_sell_candidates:
+        scope_status, _exchange = _kis_order_scope_classification(
+            settings=settings,
+            order=order,
+        )
+        if scope_status == "invalid":
+            # A legacy active sell may belong to the position account. Do not
+            # submit replacement quantity until its route can be established.
+            remaining_quantities_by_symbol.pop(order.symbol, None)
+    if not remaining_quantities_by_symbol:
+        return
     where = [
-        BrokerOrder.mode == settings.runtime_mode,
+        *_active_kis_order_filters(settings=settings),
         BrokerOrder.side == "sell",
         BrokerOrder.symbol.in_(sorted(remaining_quantities_by_symbol)),
         BrokerOrder.status.in_(tuple(CAPITAL_RESERVING_ORDER_STATUSES)),
@@ -7936,15 +11940,28 @@ def _reserve_existing_exit_orders(
                 BrokerOrder.side,
                 BrokerOrder.status,
                 BrokerOrder.quantity,
+                BrokerOrder.broker_name,
+                BrokerOrder.venue,
+                BrokerOrder.asset_class,
+                BrokerOrder.request_metadata,
                 BrokerOrder.last_broker_sync_at,
                 BrokerOrder.updated_at,
             )
         )
         .order_by(BrokerOrder.updated_at.asc(), BrokerOrder.id.asc())
     ).all()
+    orders = [
+        order
+        for order in orders
+        if _active_kis_order_matches_position(
+            settings=settings,
+            order=order,
+            position=positions_by_symbol.get(order.symbol),
+        )
+    ]
     symbols = sorted(remaining_quantities_by_symbol)
     terminal_where = [
-        BrokerOrder.mode == settings.runtime_mode,
+        *_active_kis_order_filters(settings=settings),
         BrokerOrder.side == "sell",
         BrokerOrder.symbol.in_(symbols),
         BrokerOrder.status == "filled",
@@ -7975,11 +11992,24 @@ def _reserve_existing_exit_orders(
                 BrokerOrder.symbol,
                 BrokerOrder.status,
                 BrokerOrder.quantity,
+                BrokerOrder.broker_name,
+                BrokerOrder.venue,
+                BrokerOrder.asset_class,
+                BrokerOrder.request_metadata,
                 BrokerOrder.last_broker_sync_at,
                 BrokerOrder.updated_at,
             )
         )
     ).all()
+    terminal_filled_orders = [
+        order
+        for order in terminal_filled_orders
+        if _active_kis_order_matches_position(
+            settings=settings,
+            order=order,
+            position=positions_by_symbol.get(order.symbol),
+        )
+    ]
     relevant_order_ids = [
         order.id for order in [*orders, *terminal_filled_orders]
     ]
@@ -8000,7 +12030,7 @@ def _reserve_existing_exit_orders(
             select(ExecutionFill)
             .join(BrokerOrder, BrokerOrder.id == ExecutionFill.broker_order_pk)
             .where(
-                BrokerOrder.mode == settings.runtime_mode,
+                *_active_kis_order_filters(settings=settings),
                 BrokerOrder.side == "sell",
                 ExecutionFill.side == "sell",
                 or_(*fill_scope),
@@ -8008,6 +12038,15 @@ def _reserve_existing_exit_orders(
             .order_by(ExecutionFill.filled_at.asc(), ExecutionFill.id.asc())
         ).all()
     )
+    fills = [
+        fill
+        for fill in fills
+        if _active_kis_order_matches_position(
+            settings=settings,
+            order=fill.broker_order,
+            position=positions_by_symbol.get(fill.symbol),
+        )
+    ]
     filled_quantities: dict[str, Decimal] = {}
     fills_before_position_by_order: dict[str, Decimal] = {}
     unreflected_by_symbol: dict[str, Decimal] = {}
@@ -8127,17 +12166,28 @@ def _rearm_stop_after_partial_take_profit(
     if plan is None:
         return
 
-    for sibling in plan.items:
-        if sibling.symbol != item.symbol or sibling.intent != "stop_sell":
-            continue
-        if sibling.status in NON_MONITORABLE_PLAN_ITEM_STATUSES:
-            continue
+    stop_candidates = [
+        sibling
+        for sibling in plan.items
+        if sibling.symbol == item.symbol
+        and sibling.intent == "stop_sell"
+        and sibling.status not in NON_MONITORABLE_PLAN_ITEM_STATUSES
+    ]
+    for sibling in select_plan_item_family_members(
+        anchor=item,
+        candidates=stop_candidates,
+    ):
 
         prior_trigger = sibling.trigger_price
         prior_quantity_policy = sibling.quantity_policy
         if prior_trigger is None or prior_trigger < breakeven_stop:
             sibling.trigger_price = breakeven_stop
         sibling.quantity_policy = {
+            **(
+                dict(prior_quantity_policy)
+                if isinstance(prior_quantity_policy, dict)
+                else {}
+            ),
             "kind": "shares",
             "quantity": remaining_quantity,
             "source": "partial_take_profit_breakeven_rearm",
@@ -8225,7 +12275,11 @@ def _parse_positive_int(value: object) -> int | None:
         parsed = Decimal(str(value))
     except (InvalidOperation, ValueError):
         return None
-    if parsed <= 0 or parsed != parsed.to_integral_value():
+    if (
+        not parsed.is_finite()
+        or parsed <= 0
+        or parsed != parsed.to_integral_value()
+    ):
         return None
     return int(parsed)
 
@@ -8235,7 +12289,7 @@ def _parse_fraction(value: object) -> Decimal | None:
         fraction = Decimal(str(value))
     except (InvalidOperation, ValueError):
         return None
-    if fraction <= 0 or fraction > 1:
+    if not fraction.is_finite() or fraction <= 0 or fraction > 1:
         return None
     return fraction
 
@@ -8285,7 +12339,10 @@ def _watch_buy_high_risk_gate_rejection(
     if not settings.watch_buy_high_risk_gate_enabled:
         return None
     sources = []
-    live_market_context = _market_quality_context_from_price(price)
+    live_market_context = _market_quality_context_from_price(
+        price,
+        item=item,
+    )
     if live_market_context is not None:
         sources.append(live_market_context)
     sources.extend(_item_payload_sources(item))
@@ -8646,24 +12703,10 @@ def _is_retryable_watch_buy_pullback_gate(reason: object) -> bool:
 
 
 def _watch_buy_direction(item: ExecutionPlanItem) -> str:
-    for source in _item_payload_sources(item):
-        for key in ("trigger_direction", "entry_direction", "watch_direction", "direction"):
-            value = source.get(key)
-            if isinstance(value, str) and value.strip():
-                normalized = value.strip().lower()
-                if normalized in {"up", "above", "breakout", "momentum", ">=", "at_or_above"}:
-                    return "at_or_above"
-                if normalized in {"down", "below", "pullback", "dip", "<=", "at_or_below"}:
-                    return "at_or_below"
-    if _watch_buy_tactical_action(item) == "watch_for_trigger":
-        return "at_or_above"
-    monitoring = _watch_buy_monitoring_context(item)
-    direction = monitoring.get("direction")
-    if isinstance(direction, str) and direction == "at_or_above":
-        return "at_or_above"
-    if isinstance(direction, str) and direction == "at_or_below":
-        return "at_or_below"
-    return "at_or_below"
+    return watch_buy_direction_from_payloads(
+        item.quantity_policy,
+        _loaded_risk_context(item),
+    )
 
 
 def _watch_buy_tactical_action(item: ExecutionPlanItem) -> str | None:
@@ -8734,7 +12777,7 @@ def _parse_positive_decimal(value: object) -> Decimal | None:
         parsed = Decimal(str(value))
     except (InvalidOperation, ValueError):
         return None
-    return parsed if parsed > 0 else None
+    return parsed if parsed.is_finite() and parsed > 0 else None
 
 
 def _recursive_decimal_feature(payload: object, keys: set[str], *, parent_key: str | None = None) -> Decimal | None:
@@ -8843,6 +12886,43 @@ def _provided_price_observed_at(
     return _normalize_utc(price.observed_at)
 
 
+def _observed_price_for_side(
+    *,
+    price: MonitoringPriceRequest | None,
+    side: str,
+    runtime_mode: str = "live",
+) -> Decimal | None:
+    if price is None:
+        return None
+    executable_price = price.ask if side.strip().lower() == "buy" else price.bid
+    if (
+        executable_price is not None
+        and executable_price.is_finite()
+        and executable_price > 0
+    ):
+        return executable_price
+    if runtime_mode == "live":
+        return None
+    return price.price
+
+
+def _observed_price_for_item(
+    *,
+    price: MonitoringPriceRequest | None,
+    item: ExecutionPlanItem,
+    runtime_mode: str | None = None,
+) -> Decimal | None:
+    plan = getattr(item, "plan", None)
+    resolved_runtime_mode = runtime_mode or str(
+        getattr(plan, "mode", None) or "live"
+    )
+    return _observed_price_for_side(
+        price=price,
+        side=item.side,
+        runtime_mode=resolved_runtime_mode,
+    )
+
+
 def _price_observed_at(
     price: MonitoringPriceRequest | None,
     fallback: datetime,
@@ -8874,10 +12954,12 @@ def _plan_item_exchange(item: ExecutionPlanItem) -> str:
     if not isinstance(risk_context, dict):
         return "KRX"
     exchange = risk_context.get("exchange")
-    if not isinstance(exchange, str):
-        return "KRX"
-    normalized = exchange.strip().upper()
-    return normalized or "KRX"
+    if isinstance(exchange, str) and exchange.strip():
+        return exchange.strip().upper()
+    venue = str(item.venue or "").strip().upper()
+    if venue in set(MONITORED_KIS_POSITION_EXCHANGES) | {"US", "UPBIT"}:
+        return venue
+    return "KRX"
 
 
 def _update_monitoring_checkpoint(
@@ -8888,25 +12970,95 @@ def _update_monitoring_checkpoint(
     triggered_at: datetime,
     status: str,
     details: dict[str, object],
-) -> MonitoringCheckpoint:
+) -> MonitoringCheckpoint | None:
+    execution_scope = details.get("execution_scope")
+    expected_scope = _monitoring_checkpoint_execution_scope(settings=settings)
+    if (
+        expected_scope is None
+        or not isinstance(execution_scope, dict)
+        or set(execution_scope) != {
+            "policy_version",
+            "provider",
+            "account_scope",
+        }
+        or type(execution_scope.get("policy_version")) is not int
+        or execution_scope != expected_scope
+    ):
+        # Liveness without exact account authority is not safe evidence. In
+        # particular, never let an unscoped process overwrite the current
+        # account's last-known-good heartbeat.
+        return None
+    provider = str(execution_scope["provider"])
+    account_scope = str(execution_scope["account_scope"])
     checkpoint = db.scalar(
         select(MonitoringCheckpoint).where(
             MonitoringCheckpoint.worker_name == worker_name,
             MonitoringCheckpoint.mode == settings.runtime_mode,
+            MonitoringCheckpoint.provider == provider,
+            MonitoringCheckpoint.account_scope == account_scope,
         )
     )
     if checkpoint is None:
         checkpoint = MonitoringCheckpoint(
             worker_name=worker_name,
             mode=settings.runtime_mode,
+            provider=provider,
+            account_scope=account_scope,
         )
         db.add(checkpoint)
+    details = _preserve_checkpoint_retry_evidence(
+        previous_details=checkpoint.details,
+        details=details,
+        triggered_at=triggered_at,
+    )
     checkpoint.status = status
     checkpoint.last_heartbeat_at = triggered_at
     checkpoint.last_success_at = triggered_at
     checkpoint.details = details
     db.commit()
     return checkpoint
+
+
+def _preserve_checkpoint_retry_evidence(
+    *,
+    previous_details: object,
+    details: dict[str, object],
+    triggered_at: datetime,
+) -> dict[str, object]:
+    current_retry_count = _nonnegative_int_value(
+        details.get("retried_triggered_item_count")
+    )
+    merged = dict(details)
+    if current_retry_count > 0:
+        merged["last_retried_triggered_at"] = triggered_at.isoformat()
+        return merged
+    if _nonnegative_int_value(details.get("price_count")) != 0:
+        return merged
+    if not isinstance(previous_details, dict):
+        return merged
+    previous_retry_count = _nonnegative_int_value(
+        previous_details.get("retried_triggered_item_count")
+    )
+    if previous_retry_count <= 0:
+        return merged
+    merged["retried_triggered_item_count"] = previous_retry_count
+    previous_symbols = previous_details.get("retried_triggered_symbols")
+    if isinstance(previous_symbols, list) and not merged.get("retried_triggered_symbols"):
+        merged["retried_triggered_symbols"] = [
+            symbol for symbol in previous_symbols if isinstance(symbol, str)
+        ]
+    previous_retry_at = previous_details.get("last_retried_triggered_at")
+    if isinstance(previous_retry_at, str):
+        merged["last_retried_triggered_at"] = previous_retry_at
+    return merged
+
+
+def _nonnegative_int_value(value: object) -> int:
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, int) and value > 0:
+        return value
+    return 0
 
 
 def _normalize_utc(value: datetime) -> datetime:
@@ -8947,6 +13099,7 @@ def _place_monitoring_order(
     freshness_reference_at: datetime | None = None,
     limit_price_override: Decimal | None = None,
     before_success_commit: Callable[[], None] | None = None,
+    deterministic_sell_quantity_cap: int | None = None,
 ):
     is_watch_buy = _is_watch_buy_item(item)
     limit_price = (
@@ -8963,9 +13116,14 @@ def _place_monitoring_order(
         trigger_reason=trigger_reason,
         trigger_metadata=trigger_metadata,
         triggered_at=triggered_at,
+        deterministic_sell_quantity_cap=deterministic_sell_quantity_cap,
     )
     retry_source_order = (
-        _retryable_session_rejection_source_order(db=db, item=item)
+        _retryable_session_rejection_source_order(
+            settings=settings,
+            db=db,
+            item=item,
+        )
         if item.intent == "stop_sell"
         else None
     )
@@ -8994,6 +13152,14 @@ def _place_monitoring_order(
         exchange=_plan_item_exchange(item),
         metadata=order_metadata,
     )
+    authority_context = dict(_loaded_risk_context(item))
+    authority_context["monitoring_order_authority"] = {
+        "policy_version": 1,
+        "source": f"monitoring:{MONITORING_WORKER_NAME}",
+        "command": order_request.model_dump(mode="json"),
+    }
+    item.risk_context = compact_json_object(authority_context)
+    db.flush()
     return place_broker_order(
         settings=settings,
         db=db,
@@ -9030,6 +13196,7 @@ def _monitoring_order_metadata(
     trigger_reason: str | None,
     trigger_metadata: dict[str, object] | None,
     triggered_at: datetime,
+    deterministic_sell_quantity_cap: int | None,
 ) -> dict[str, object]:
     metadata: dict[str, object] = {
         "monitoring_worker": MONITORING_WORKER_NAME,
@@ -9038,6 +13205,17 @@ def _monitoring_order_metadata(
         "order_purpose": "protective_stop" if item.intent == "stop_sell" else item.intent,
         "route_now": triggered_at.isoformat(),
     }
+    if item.side == "sell":
+        metadata["deterministic_sell_quantity_cap"] = (
+            deterministic_sell_quantity_cap
+        )
+        trigger_binding = _monitoring_sell_trigger_binding(
+            item=item,
+            observed_price=observed_price,
+            trigger_reason=trigger_reason,
+        )
+        if trigger_binding is not None:
+            metadata["monitoring_sell_trigger_binding"] = trigger_binding
     risk_context = _loaded_risk_context(item)
     if isinstance(risk_context, dict):
         for key in ("nxt_eligible", "route_now"):
@@ -9046,6 +13224,41 @@ def _monitoring_order_metadata(
     if trigger_metadata is not None:
         metadata["trigger"] = trigger_metadata
     return metadata
+
+
+def _monitoring_sell_trigger_binding(
+    *,
+    item: ExecutionPlanItem,
+    observed_price: Decimal | None,
+    trigger_reason: str | None,
+) -> dict[str, object] | None:
+    reason = trigger_reason or item.intent
+    if item.intent == "stop_sell":
+        direction = "at_or_below"
+        threshold = item.trigger_price
+    elif item.intent == "target_sell":
+        if reason in PROFIT_PROTECTION_TRIGGER_REASONS:
+            # Profit-protection target rows behave as a trailing protective
+            # exit. Bind them to the crossed bid rather than treating them as
+            # an ordinary upside target at the final broker boundary.
+            direction = "at_or_below"
+            threshold = observed_price
+        else:
+            direction = "at_or_above"
+            threshold = item.trigger_price
+    else:
+        return None
+    if threshold is None or not threshold.is_finite() or threshold <= 0:
+        return None
+    return {
+        "version": 1,
+        "execution_plan_item_id": item.id,
+        "symbol": item.symbol,
+        "intent": item.intent,
+        "trigger_reason": reason,
+        "direction": direction,
+        "trigger_price": _serialize_decimal(threshold),
+    }
 
 
 def _watch_buy_limit_price(

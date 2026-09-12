@@ -1,3 +1,5 @@
+from threading import Event, Thread
+
 from sqlalchemy.engine import make_url
 
 from app.core.config import Settings, load_settings
@@ -47,6 +49,48 @@ def test_sqlite_busy_timeout_and_pool_capacity_are_configurable(tmp_path) -> Non
         assert status["checked_out"] == 0
     finally:
         engine.dispose()
+
+
+def test_in_memory_sqlite_uses_distinct_connections_with_shared_schema() -> None:
+    engine = create_db_engine(Settings(database_url="sqlite:///:memory:"))
+    with engine.begin() as setup_connection:
+        setup_connection.exec_driver_sql(
+            "CREATE TABLE concurrency_probe (id INTEGER PRIMARY KEY)"
+        )
+    first_connection = engine.connect()
+    first_driver_connection_id = id(first_connection.connection.driver_connection)
+    checkout_started = Event()
+    second_connection_acquired = Event()
+    second_driver_connection_ids: list[int] = []
+    errors: list[BaseException] = []
+
+    def use_second_connection() -> None:
+        checkout_started.set()
+        try:
+            with engine.connect() as connection:
+                second_driver_connection_ids.append(
+                    id(connection.connection.driver_connection)
+                )
+                assert connection.exec_driver_sql(
+                    "SELECT COUNT(*) FROM concurrency_probe"
+                ).scalar_one() == 0
+                second_connection_acquired.set()
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    worker = Thread(target=use_second_connection)
+    worker.start()
+    try:
+        assert checkout_started.wait(timeout=1)
+        assert second_connection_acquired.wait(timeout=1)
+    finally:
+        first_connection.close()
+        worker.join(timeout=1)
+        engine.dispose()
+
+    assert worker.is_alive() is False
+    assert errors == []
+    assert second_driver_connection_ids != [first_driver_connection_id]
 
 
 def test_sqlite_new_pool_connection_does_not_reapply_wal_under_writer_lock(tmp_path) -> None:

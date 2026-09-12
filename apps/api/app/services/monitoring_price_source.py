@@ -18,6 +18,10 @@ from app.core.config import Settings
 from app.models.runtime import ExecutionPlan, ExecutionPlanItem, ExecutionPosition
 from app.services.broker_auth import ensure_authenticated_broker_session
 from app.services.domestic_order_router import resolve_domestic_order_route
+from app.services.position_identity import (
+    PositionIdentityConflictError,
+    build_position_identity,
+)
 
 MAX_REPORTED_QUOTE_FAILURES = 10
 MAX_REPORTED_CONTEXT_FAILURES = 10
@@ -25,6 +29,35 @@ MAX_QUOTE_WORKERS = 3
 QUOTE_RETRY_ATTEMPTS = 0
 QUOTE_RETRY_DELAY_SECONDS = 0.2
 QUOTE_BATCH_TIMEOUT_BUFFER_SECONDS = 2.0
+_ROUTE_AUTHORITY_INTENTS = frozenset(
+    {
+        "target_sell",
+        "stop_sell",
+        "max_holding_close_sell",
+        "intraday_watch_buy",
+        "swing_watch_buy",
+        "next_open_buy",
+    }
+)
+_ROUTE_AUTHORITY_STATUSES = frozenset(
+    {
+        "target_sell_monitoring",
+        "stop_sell_monitoring",
+        "max_holding_close_sell_monitoring",
+        "target_sell_triggered_blocked",
+        "stop_sell_triggered_blocked",
+        "target_sell_triggered_pending_dispatch",
+        "stop_sell_triggered_pending_dispatch",
+        "watch_monitoring_pending",
+        "watch_monitoring_active",
+        "watch_buy_triggered",
+        "watch_buy_triggered_blocked",
+        "watch_buy_triggered_pending_dispatch",
+        "triggered_pending_agent",
+        "agent_delay",
+        "agent_approved_pending_submit",
+    }
+)
 
 
 class KisCurrentQuoteMonitoringPriceSource:
@@ -49,6 +82,10 @@ class KisCurrentQuoteMonitoringPriceSource:
         self._quote_executor = ThreadPoolExecutor(
             max_workers=MAX_QUOTE_WORKERS,
             thread_name_prefix="kis-monitoring-quote",
+        )
+        self._context_executor = ThreadPoolExecutor(
+            max_workers=MAX_QUOTE_WORKERS,
+            thread_name_prefix="kis-monitoring-context",
         )
 
     def describe(self) -> dict[str, object]:
@@ -121,11 +158,15 @@ class KisCurrentQuoteMonitoringPriceSource:
                     adapter=broker_adapter,
                 )
                 access_token = session_state.access_token or ""
-                exchange_by_symbol = _load_monitoring_exchange_by_symbol(
+                execution_context_by_symbol = _load_monitoring_execution_context_by_symbol(
+                    settings=settings,
                     db=db,
-                    mode=settings.runtime_mode,
                     symbols=unique_symbols,
                 )
+                exchange_by_symbol = {
+                    symbol: str(context["exchange"])
+                    for symbol, context in execution_context_by_symbol.items()
+                }
                 prices: list[MonitoringPriceRequest] = []
                 priced_symbols: list[str] = []
                 failures: list[dict[str, str]] = []
@@ -134,15 +175,39 @@ class KisCurrentQuoteMonitoringPriceSource:
                 context_failure_count = 0
 
                 def fetch_quote(symbol: str) -> tuple[str, BrokerCurrentPrice | None, Exception | None]:
-                    worker_adapter = self.broker_adapter_factory(settings)
                     try:
+                        expected_context = execution_context_by_symbol.get(symbol)
+                        if expected_context is None:
+                            return symbol, None, None
+                        expected_provider = str(expected_context.get("provider") or "")
+                        if expected_provider != broker_adapter.provider:
+                            return (
+                                symbol,
+                                None,
+                                ValueError(
+                                    "monitoring quote provider does not match active route"
+                                ),
+                            )
+                        expected_exchange = exchange_by_symbol[symbol]
+                        quote = broker_adapter.get_current_price(
+                            access_token,
+                            symbol=symbol,
+                            exchange=expected_exchange,
+                        )
+                        if quote is not None and (
+                            quote.symbol.strip().upper() != symbol
+                            or quote.exchange.strip().upper() != expected_exchange
+                        ):
+                            return (
+                                symbol,
+                                None,
+                                ValueError(
+                                    "monitoring quote identity does not match active route"
+                                ),
+                            )
                         return (
                             symbol,
-                            worker_adapter.get_current_price(
-                                access_token,
-                                symbol=symbol,
-                                exchange=exchange_by_symbol.get(symbol, "KRX"),
-                            ),
+                            quote,
                             None,
                         )
                     except Exception as exc:
@@ -203,6 +268,18 @@ class KisCurrentQuoteMonitoringPriceSource:
                             next_retry_symbols.append(symbol)
                     retry_symbols = next_retry_symbols
 
+                context_futures = {
+                    symbol: self._context_executor.submit(
+                        _fetch_live_market_context,
+                        broker_adapter=broker_adapter,
+                        access_token=access_token,
+                        quote=quote,
+                    )
+                    for symbol in unique_symbols
+                    for quote, error in [quote_results.get(symbol, (None, None))]
+                    if quote is not None and error is None
+                }
+
                 for symbol in unique_symbols:
                     quote, error = quote_results.get(symbol, (None, None))
                     if error is not None:
@@ -212,31 +289,33 @@ class KisCurrentQuoteMonitoringPriceSource:
                         continue
                     if quote is None:
                         continue
-                    context, context_failure = _fetch_live_market_context(
-                        broker_adapter=broker_adapter,
-                        access_token=access_token,
-                        quote=quote,
-                    )
+                    context, context_failure = context_futures[symbol].result()
                     if context_failure is not None:
                         context_failure_count += 1
                         if len(context_failures) < MAX_REPORTED_CONTEXT_FAILURES:
                             context_failures.append(context_failure)
                     priced_symbols.append(quote.symbol)
-                    market_quality = _market_quality_from_quote_payload(quote.payload)
-                    market_quality = _merge_live_market_context(
-                        market_quality,
-                        context=context,
-                        context_failure=context_failure,
-                        quote=quote,
-                        settings=settings,
-                    )
-                    market_quality = _sanitize_monitoring_market_quality(market_quality)
                     prices.append(
-                        MonitoringPriceRequest(
-                            symbol=quote.symbol,
-                            price=quote.price,
-                            observed_at=quote.observed_at,
-                            **market_quality,
+                        monitoring_price_from_broker_quote(
+                            settings=settings,
+                            quote=quote,
+                            context=context,
+                            context_failure=context_failure,
+                            side=str(
+                                execution_context_by_symbol.get(symbol, {}).get(
+                                    "side",
+                                    "sell",
+                                )
+                            ),
+                            purpose=str(
+                                execution_context_by_symbol.get(symbol, {}).get(
+                                    "purpose",
+                                    "protective_stop",
+                                )
+                            ),
+                            order_contexts=_order_contexts_from_execution_context(
+                                execution_context_by_symbol.get(symbol)
+                            ),
                         )
                     )
                 priced_set = set(priced_symbols)
@@ -264,6 +343,7 @@ class KisCurrentQuoteMonitoringPriceSource:
 
     def close(self) -> None:
         self._quote_executor.shutdown(wait=False, cancel_futures=True)
+        self._context_executor.shutdown(wait=False, cancel_futures=True)
 
     def _release_quote_batch_when_complete(
         self,
@@ -292,11 +372,15 @@ class KisCurrentQuoteMonitoringPriceSource:
         return dict(self._last_diagnostics)
 
 
-def _market_quality_from_quote_payload(payload: dict[str, object]) -> dict[str, object]:
+def _market_quality_from_quote_payload(
+    payload: dict[str, object],
+    *,
+    quote: BrokerCurrentPrice,
+) -> dict[str, object]:
     output = payload.get("output")
     if not isinstance(output, dict):
         output = payload
-    return {
+    values = {
         "bid": _first_value(output, "bid", "bid_price", "best_bid", "bidp", "bidp1"),
         "ask": _first_value(output, "ask", "ask_price", "best_ask", "askp", "askp1"),
         "spread": _first_value(output, "spread", "spread_price"),
@@ -309,63 +393,255 @@ def _market_quality_from_quote_payload(payload: dict[str, object]) -> dict[str, 
         "day_low": _first_value(output, "day_low", "intraday_low", "low_price", "stck_lwpr", "low"),
         "session_type": _first_value(output, "session_type", "session", "market_state"),
         "normal_ordering_available": _normal_ordering_available(output),
-        "provenance": {"source": "broker_current_price_payload"},
+    }
+    endpoint = _endpoint_from_payload(quote.payload)
+    values["provenance"] = {
+        "source": "broker_current_price_payload",
+        "field_sources": {
+            key: {
+                "source": "broker_current_price_payload",
+                "endpoint": endpoint,
+                "observed_at": quote.observed_at.isoformat(),
+                "freshness_source": quote.freshness_source,
+            }
+            for key, value in values.items()
+            if value is not None
+        },
+    }
+    return values
+
+
+def monitoring_price_from_broker_quote(
+    *,
+    settings: Settings,
+    quote: BrokerCurrentPrice,
+    context: BrokerLiveMarketContext | None,
+    context_failure: dict[str, object] | None,
+    side: str,
+    purpose: str,
+    order_contexts: list[dict[str, str]] | None = None,
+) -> MonitoringPriceRequest:
+    market_quality = _market_quality_from_quote_payload(quote.payload, quote=quote)
+    market_quality = _merge_live_market_context(
+        market_quality,
+        context=context,
+        context_failure=context_failure,
+        quote=quote,
+        settings=settings,
+        side=side,
+        purpose=purpose,
+        order_contexts=order_contexts,
+    )
+    market_quality = _sanitize_monitoring_market_quality(market_quality)
+    observed_at = quote.observed_at
+    freshness_source = quote.freshness_source
+    if (
+        settings.runtime_mode == "live"
+        and context is not None
+        and _is_trusted_exchange_freshness_source(context.freshness_source)
+    ):
+        observed_at = context.observed_at
+        freshness_source = context.freshness_source
+    return MonitoringPriceRequest(
+        symbol=quote.symbol,
+        # Keep the transport's reference/last price neutral. Monitoring picks
+        # ask for buys and bid for sells per item, so one symbol shared by
+        # opposite-side monitors never inherits the DB ordering of a context.
+        price=quote.price,
+        observed_at=observed_at,
+        freshness_source=freshness_source,
+        **market_quality,
+    )
+
+
+def _is_trusted_exchange_freshness_source(source: object) -> bool:
+    return isinstance(source, str) and source in {
+        "kis_exchange_orderbook_time",
+        "kis_exchange_intraday_minute_time",
+        "kis_overseas_exchange_bar_time",
+        "kis_overseas_exchange_orderbook_time",
+        "alpaca_exchange_trade_time",
+        "alpaca_exchange_quote_time",
+        "broker_realtime_exchange_time",
     }
 
 
 def _load_monitoring_exchange_by_symbol(
     *,
+    settings: Settings,
     db: Session,
-    mode: str,
     symbols: list[str],
 ) -> dict[str, str]:
+    return {
+        symbol: str(context["exchange"])
+        for symbol, context in _load_monitoring_execution_context_by_symbol(
+            settings=settings,
+            db=db,
+            symbols=symbols,
+        ).items()
+    }
+
+
+def _load_monitoring_execution_context_by_symbol(
+    *,
+    settings: Settings,
+    db: Session,
+    symbols: list[str],
+) -> dict[str, dict[str, object]]:
     if not symbols:
         return {}
     rows = db.scalars(
         select(ExecutionPlanItem)
         .join(ExecutionPlanItem.plan)
         .where(
-            ExecutionPlan.mode == mode,
+            ExecutionPlan.mode == settings.runtime_mode,
             ExecutionPlanItem.symbol.in_(symbols),
+            ExecutionPlanItem.intent.in_(tuple(_ROUTE_AUTHORITY_INTENTS)),
+            ExecutionPlanItem.status.in_(tuple(_ROUTE_AUTHORITY_STATUSES)),
         )
         .order_by(ExecutionPlanItem.updated_at.desc())
     ).all()
-    exchanges: dict[str, str] = {}
+    candidates: dict[str, list[tuple[str, str, str, str]]] = {}
     for item in rows:
-        if item.symbol in exchanges:
-            continue
         risk_context = item.risk_context if isinstance(item.risk_context, dict) else {}
         exchange = str(risk_context.get("exchange") or "").strip().upper()
+        resolved_exchange: str | None = None
         if (
             item.provider == "kis"
             and item.asset_class == "us_equity"
             and exchange in {"NASD", "NYSE", "AMEX"}
         ):
-            exchanges[item.symbol] = exchange
-        elif item.asset_class != "us_equity" and item.symbol.isdigit() and len(item.symbol) == 6:
-            exchanges[item.symbol] = "KRX"
-    missing_symbols = [symbol for symbol in symbols if symbol not in exchanges]
+            resolved_exchange = exchange
+        elif (
+            item.provider in {None, "kis"}
+            and item.asset_class != "us_equity"
+            and item.symbol.isdigit()
+            and len(item.symbol) == 6
+        ):
+            resolved_exchange = "KRX"
+        if resolved_exchange is None:
+            continue
+        purpose = _monitoring_order_purpose(item)
+        candidates.setdefault(item.symbol, []).append(
+            ("kis", resolved_exchange, item.side, purpose)
+        )
+    contexts: dict[str, dict[str, object]] = {}
+    for symbol, symbol_candidates in candidates.items():
+        routes = {
+            (provider, exchange)
+            for provider, exchange, _side, _purpose in symbol_candidates
+        }
+        if len(routes) != 1:
+            # Two active rows that disagree about venue are not safe quote
+            # authority. A held-position route may still resolve the symbol
+            # below; otherwise this symbol remains intentionally unpriced.
+            continue
+        provider, resolved_exchange = next(iter(routes))
+        _provider, _exchange, side, purpose = symbol_candidates[0]
+        context: dict[str, object] = {
+            "provider": provider,
+            "exchange": resolved_exchange,
+            "side": side,
+            "purpose": purpose,
+            "order_contexts": [],
+        }
+        contexts[symbol] = context
+        order_contexts = context["order_contexts"]
+        assert isinstance(order_contexts, list)
+        for (
+            _candidate_provider,
+            _candidate_exchange,
+            candidate_side,
+            candidate_purpose,
+        ) in symbol_candidates:
+            order_context = {"side": candidate_side, "purpose": candidate_purpose}
+            if order_context not in order_contexts:
+                order_contexts.append(order_context)
+    missing_symbols = [symbol for symbol in symbols if symbol not in contexts]
     if missing_symbols:
-        positions = db.scalars(
-            select(ExecutionPosition).where(
-                ExecutionPosition.mode == mode,
-                ExecutionPosition.symbol.in_(missing_symbols),
-                ExecutionPosition.quantity > 0,
+        try:
+            active_identity = build_position_identity(
+                settings=settings,
+                provider="kis",
+                exchange="KRX",
             )
-        ).all()
+        except PositionIdentityConflictError:
+            positions = []
+        else:
+            positions = db.scalars(
+                select(ExecutionPosition).where(
+                    ExecutionPosition.mode == settings.runtime_mode,
+                    ExecutionPosition.provider == active_identity.provider,
+                    ExecutionPosition.account_scope == active_identity.account_scope,
+                    ExecutionPosition.exchange.in_(("NASD", "NYSE", "AMEX")),
+                    ExecutionPosition.symbol.in_(missing_symbols),
+                    ExecutionPosition.quantity > 0,
+                )
+            ).all()
+        positions_by_symbol: dict[str, list[ExecutionPosition]] = {}
         for position in positions:
+            positions_by_symbol.setdefault(position.symbol, []).append(position)
+        for symbol, scoped_positions in positions_by_symbol.items():
+            if len(scoped_positions) != 1:
+                continue
+            position = scoped_positions[0]
             raw_payload = position.raw_payload if isinstance(position.raw_payload, dict) else {}
             sync_context = raw_payload.get("_position_sync")
             if not isinstance(sync_context, dict):
                 continue
             exchange = str(sync_context.get("exchange") or "").strip().upper()
             if (
-                sync_context.get("asset_class") == "us_equity"
+                sync_context.get("provider", "kis") == "kis"
+                and sync_context.get("asset_class") == "us_equity"
                 and sync_context.get("monitoring_eligible") is True
                 and exchange in {"NASD", "NYSE", "AMEX"}
+                and exchange == position.exchange
             ):
-                exchanges[position.symbol] = exchange
-    return exchanges
+                contexts[symbol] = {
+                    "provider": "kis",
+                    "exchange": exchange,
+                    "side": "sell",
+                    "purpose": "protective_stop",
+                    "order_contexts": [
+                        {"side": "sell", "purpose": "protective_stop"}
+                    ],
+                }
+    # A six-digit domestic security identifier is itself sufficient to bind a
+    # KIS quote to KRX. Keep that deterministic fallback for direct diagnostic
+    # quote requests; never infer a US venue from a bare symbol.
+    for symbol in symbols:
+        if symbol not in contexts and symbol.isdigit() and len(symbol) == 6:
+            contexts[symbol] = {
+                "provider": "kis",
+                "exchange": "KRX",
+                "side": "sell",
+                "purpose": "protective_stop",
+                "order_contexts": [
+                    {"side": "sell", "purpose": "protective_stop"}
+                ],
+            }
+    return contexts
+
+
+def _order_contexts_from_execution_context(
+    context: dict[str, object] | None,
+) -> list[dict[str, str]]:
+    if not isinstance(context, dict):
+        return []
+    value = context.get("order_contexts")
+    if not isinstance(value, list):
+        return []
+    return [
+        {"side": str(item["side"]), "purpose": str(item["purpose"])}
+        for item in value
+        if isinstance(item, dict)
+        and isinstance(item.get("side"), str)
+        and isinstance(item.get("purpose"), str)
+    ]
+
+
+def _monitoring_order_purpose(item: ExecutionPlanItem) -> str:
+    return "protective_stop" if item.intent == "stop_sell" else item.intent
 
 
 def _fetch_live_market_context(
@@ -382,15 +658,28 @@ def _fetch_live_market_context(
             "reason": "broker adapter does not expose live market context enrichment",
         }
     try:
-        return (
-            context_getter(
-                access_token,
-                symbol=quote.symbol,
-                exchange=quote.exchange,
-                reference_price=quote.price,
-            ),
-            None,
+        context = context_getter(
+            access_token,
+            symbol=quote.symbol,
+            exchange=quote.exchange,
+            reference_price=quote.price,
         )
+        if context is not None:
+            payload = context.payload if isinstance(context.payload, dict) else {}
+            if (
+                context.symbol.strip().upper() != quote.symbol.strip().upper()
+                or context.exchange.strip().upper() != quote.exchange.strip().upper()
+                or (
+                    payload.get("provider") is not None
+                    and payload.get("provider") != broker_adapter.provider
+                )
+            ):
+                return None, {
+                    "symbol": quote.symbol,
+                    "endpoint": "broker_live_market_context",
+                    "reason": "live market context identity does not match active quote route",
+                }
+        return context, None
     except Exception as exc:
         return None, {
             "symbol": quote.symbol,
@@ -406,12 +695,17 @@ def _merge_live_market_context(
     context_failure: dict[str, object] | None,
     quote: BrokerCurrentPrice,
     settings: Settings,
+    side: str = "sell",
+    purpose: str = "protective_stop",
+    order_contexts: list[dict[str, str]] | None = None,
 ) -> dict[str, object]:
     merged = dict(base)
     provenance = dict(merged.get("provenance") or {})
+    field_sources = dict(provenance.get("field_sources") or {})
     provenance["current_price"] = {
         "source": "broker_current_price_payload",
         "endpoint": _endpoint_from_payload(quote.payload),
+        "freshness_source": quote.freshness_source,
     }
     if context is not None:
         for key in (
@@ -427,10 +721,23 @@ def _merge_live_market_context(
             value = getattr(context, key)
             if value is not None:
                 merged[key] = value
+                field_sources[key] = {
+                    "source": "broker_live_market_context",
+                    "endpoint": _endpoint_from_payload(context.payload),
+                    "observed_at": context.observed_at.isoformat(),
+                    "freshness_source": context.freshness_source,
+                }
+            else:
+                # A live context is the authoritative orderbook snapshot. Do
+                # not retain a side or derived metric from an older current-
+                # price payload and then label it with the context timestamp.
+                merged.pop(key, None)
+                field_sources.pop(key, None)
         provenance["orderbook"] = {
             "source": "broker_live_market_context",
             "endpoint": _endpoint_from_payload(context.payload),
             "observed_at": context.observed_at.isoformat(),
+            "freshness_source": context.freshness_source,
         }
     if context_failure is not None:
         provenance["orderbook"] = {
@@ -439,12 +746,18 @@ def _merge_live_market_context(
             **context_failure,
         }
 
+    broker_orderability = {
+        "session_type": merged.get("session_type"),
+        "normal_ordering_available": merged.get("normal_ordering_available"),
+    }
     route_context = _derive_orderability_context(
         settings=settings,
         symbol=quote.symbol,
         price=quote.price,
         observed_at=quote.observed_at,
         exchange=quote.exchange,
+        side=side,
+        purpose=purpose,
     )
     for key, value in route_context.items():
         if key in {"session_type", "normal_ordering_available"} and merged.get(key) is None:
@@ -456,12 +769,48 @@ def _merge_live_market_context(
         "exchange": route_context["orderability_exchange"],
         "observed_at": quote.observed_at.isoformat(),
     }
+    provenance["broker_orderability"] = broker_orderability
+    provenance["field_sources"] = field_sources
+    contexts = [
+        {"side": side, "purpose": purpose},
+        *(order_contexts or []),
+    ]
+    orderability_by_item: dict[str, dict[str, object]] = {}
+    for order_context in contexts:
+        context_side = str(order_context.get("side") or "").strip().lower()
+        context_purpose = str(order_context.get("purpose") or "").strip().lower()
+        if context_side not in {"buy", "sell"} or not context_purpose:
+            continue
+        key = monitoring_orderability_key(
+            side=context_side,
+            purpose=context_purpose,
+        )
+        if key in orderability_by_item:
+            continue
+        orderability_by_item[key] = (
+            route_context
+            if context_side == side and context_purpose == purpose
+            else _derive_orderability_context(
+                settings=settings,
+                symbol=quote.symbol,
+                price=quote.price,
+                observed_at=quote.observed_at,
+                exchange=quote.exchange,
+                side=context_side,
+                purpose=context_purpose,
+            )
+        )
+    provenance["orderability_by_item"] = orderability_by_item
 
     missing_fields = _missing_market_quality_fields(merged)
     if missing_fields:
         provenance["missing_fields"] = missing_fields
     merged["provenance"] = provenance
     return merged
+
+
+def monitoring_orderability_key(*, side: str, purpose: str) -> str:
+    return f"{side.strip().lower()}:{purpose.strip().lower()}"
 
 
 def _sanitize_monitoring_market_quality(payload: dict[str, object]) -> dict[str, object]:
@@ -486,6 +835,8 @@ def _derive_orderability_context(
     price: Decimal,
     observed_at,
     exchange: str = "KRX",
+    side: str = "sell",
+    purpose: str = "protective_stop",
 ) -> dict[str, object]:
     normalized_exchange = str(exchange or "KRX").strip().upper()
     if normalized_exchange in {"NASD", "NYSE", "AMEX"}:
@@ -509,8 +860,8 @@ def _derive_orderability_context(
         settings=settings,
         now=observed_at,
         symbol=symbol,
-        side="sell",
-        purpose="protective_stop",
+        side=side,
+        purpose=purpose,
         desired_order_type="limit",
         limit_price=price,
         requested_exchange="KRX",

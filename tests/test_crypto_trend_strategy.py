@@ -163,6 +163,28 @@ def test_evaluate_symbol_uses_only_closed_history_and_marks_bull_trend_eligible(
     assert result.reasons == ("eligible_long_trend",)
 
 
+def test_evaluate_symbol_uses_family_specific_annualization_basis() -> None:
+    rows = _bars("AAPL", count=230)
+    as_of = rows[-1].bar_date + timedelta(days=1)
+
+    crypto_basis = evaluate_symbol(
+        "AAPL",
+        rows,
+        as_of=as_of,
+        annualization_days=Decimal("365"),
+    )
+    equity_basis = evaluate_symbol(
+        "AAPL",
+        rows,
+        as_of=as_of,
+        annualization_days=Decimal("252"),
+    )
+
+    assert crypto_basis.realized_volatility_30d is not None
+    assert equity_basis.realized_volatility_30d is not None
+    assert crypto_basis.realized_volatility_30d > equity_basis.realized_volatility_30d
+
+
 def test_evaluate_symbol_fails_closed_on_short_or_flat_history() -> None:
     short = evaluate_symbol(
         "BTC/USD",

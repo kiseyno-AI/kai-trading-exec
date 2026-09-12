@@ -40,7 +40,35 @@ export KAI_EXEC_AUTONOMOUS_RUNTIME_ENABLED=false
 export KAI_EXEC_KIS_APP_KEY=...
 export KAI_EXEC_KIS_APP_SECRET=...
 export KAI_EXEC_KIS_ACCOUNT_NUMBER=...
+export KAI_EXEC_KIS_ACCOUNT_PRODUCT_CODE=01
+export KAI_EXEC_ACCOUNT_DRAWDOWN_RECOVERY_SCOPE_SECRET=... # at least 32 UTF-8 bytes
+export KAI_EXEC_KIS_TOKEN_CACHE_DIRECTORY="$HOME/.cache/kai-trading/kis-oauth-tokens"
 ```
+
+Generate this scope secret once in the deployment secret store (for example,
+32 random bytes encoded as hex), never commit or print it, and keep it unchanged
+when broker API credentials rotate. If a provider cannot expose a stable broker
+account ID, set `KAI_EXEC_EXECUTION_POSITION_ACCOUNT_SCOPE` to a durable opaque
+non-secret label; never use an account number or credential as that label.
+
+Create the shared OAuth cache leaf once as the same OS user that runs both Core
+and Exec. Do not broaden its permissions:
+
+```bash
+install -d -m 0700 "$KAI_EXEC_KIS_TOKEN_CACHE_DIRECTORY"
+```
+
+Core and Exec must use the same cache directory, real/demo environment mapping,
+and issuance timing settings. Set Exec's
+`KAI_EXEC_KIS_TOKEN_CACHE_DIRECTORY` and Core's
+`KIS_TOKEN_CACHE_DIRECTORY` to this exact leaf; align the remaining Exec
+`KAI_EXEC_KIS_TOKEN_*` timing variables with Core's corresponding
+`KIS_TOKEN_*` variables. The default lease is 90 seconds; if timing is
+overridden, `KAI_EXEC_KIS_TOKEN_ISSUANCE_LEASE_SECONDS` and Core's
+`KIS_TOKEN_ISSUANCE_LEASE_SECONDS` must remain at least their token request
+timeout plus minimum issue interval. A corrupt cache, unresolved issuance
+attempt, or revocation tombstone is intentionally fail-closed and must not be
+worked around by copying a database token.
 
 4. Start the service:
 

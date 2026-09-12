@@ -113,6 +113,15 @@ curl http://127.0.0.1:8011/runtime/alpaca-crypto
 curl http://127.0.0.1:8011/runtime/alpaca-us-equity
 ```
 
+After the account-scope migration, any unscoped legacy strategy state, risk
+state, decision, or strategy-origin order is quarantined authority. While one
+exists, the worker returns `legacy_strategy_scope_requires_manual_review` and
+cannot create a new decision or buy. It still reconciles broker truth and runs
+protective sells first for positions whose current account, strategy family,
+fills, and stop state are all exactly attributable. Confirm those
+`protective_actions` before remediation; never assign a legacy row to the
+current account by inference.
+
 ## 5. Paper buy and sell validation
 
 Resume the runtime deliberately, then submit uniquely identified small paper

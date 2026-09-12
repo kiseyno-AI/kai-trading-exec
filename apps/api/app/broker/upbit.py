@@ -161,7 +161,18 @@ class UpbitBrokerAdapter:
             available_cash=None,
             observed_at=datetime.now(UTC),
             source="upbit:paper",
-            payload={"provider": self.provider, "mode": self.settings.runtime_mode},
+            holdings_complete=False,
+            open_orders_complete=False,
+            diagnostics={
+                "reason": "account_snapshot_not_implemented",
+                "provider": self.provider,
+            },
+            payload={
+                "provider": self.provider,
+                "mode": self.settings.runtime_mode,
+                "holdings_coverage": "incomplete",
+                "open_orders_coverage": "incomplete",
+            },
         )
 
     def reconnect_handle(self) -> BrokerReconnectHandle:

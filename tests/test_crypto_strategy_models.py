@@ -59,6 +59,8 @@ def test_crypto_strategy_tables_are_exec_owned_and_persist_decimal_state() -> No
                 CryptoStrategyState(
                     mode="paper",
                     provider="alpaca",
+                    account_scope="a" * 24,
+                    strategy_family="crypto:ALPACA",
                     strategy_version="crypto_trend_v1",
                     symbol="BTC/USD",
                     last_processed_bar_at=bar_close_at,
@@ -74,6 +76,8 @@ def test_crypto_strategy_tables_are_exec_owned_and_persist_decimal_state() -> No
                 CryptoStrategyRiskState(
                     mode="paper",
                     provider="alpaca",
+                    account_scope="a" * 24,
+                    strategy_family="crypto:ALPACA",
                     strategy_version="crypto_trend_v1",
                     daily_baseline_equity=Decimal("100000"),
                     daily_baseline_at=bar_open_at,
@@ -89,6 +93,8 @@ def test_crypto_strategy_tables_are_exec_owned_and_persist_decimal_state() -> No
                 CryptoStrategyDecision(
                     mode="paper",
                     provider="alpaca",
+                    account_scope="a" * 24,
+                    strategy_family="crypto:ALPACA",
                     strategy_version="crypto_trend_v1",
                     symbol="BTC/USD",
                     decision_bar_at=bar_close_at,
@@ -125,10 +131,17 @@ def test_crypto_strategy_decision_is_unique_per_scope_and_decision_bar() -> None
     session_factory = create_session_factory(engine)
     decision_bar_at = datetime(2026, 8, 16, tzinfo=UTC)
 
-    def decision(action: str) -> CryptoStrategyDecision:
+    def decision(
+        action: str,
+        *,
+        account_scope: str = "a" * 24,
+        strategy_family: str = "crypto:ALPACA",
+    ) -> CryptoStrategyDecision:
         return CryptoStrategyDecision(
             mode="paper",
             provider="alpaca",
+            account_scope=account_scope,
+            strategy_family=strategy_family,
             strategy_version="crypto_trend_v1",
             symbol="ETH/USD",
             decision_bar_at=decision_bar_at,
@@ -144,3 +157,37 @@ def test_crypto_strategy_decision_is_unique_per_scope_and_decision_bar() -> None
         db.add(decision("hold"))
         with pytest.raises(IntegrityError):
             db.commit()
+
+
+def test_crypto_strategy_rows_allow_same_coordinates_across_accounts_and_families() -> None:
+    settings = Settings(database_url="sqlite:///:memory:", runtime_mode="paper")
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    decision_bar_at = datetime(2026, 8, 16, tzinfo=UTC)
+
+    def decision(account_scope: str, strategy_family: str) -> CryptoStrategyDecision:
+        return CryptoStrategyDecision(
+            mode="paper",
+            provider="alpaca",
+            account_scope=account_scope,
+            strategy_family=strategy_family,
+            strategy_version="shared-v1",
+            symbol="AAPL",
+            decision_bar_at=decision_bar_at,
+            action="hold",
+            decision_status="no_action",
+            eligible=True,
+            target_fraction=Decimal("0.20"),
+        )
+
+    with session_factory() as db:
+        db.add_all(
+            [
+                decision("a" * 24, "crypto:ALPACA"),
+                decision("b" * 24, "crypto:ALPACA"),
+                decision("a" * 24, "us_equity:US"),
+            ]
+        )
+        db.commit()
+        assert db.query(CryptoStrategyDecision).count() == 3

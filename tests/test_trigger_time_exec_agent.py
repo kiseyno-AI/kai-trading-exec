@@ -2,15 +2,43 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+import json
+from pathlib import Path
+import subprocess
+from threading import Event, Thread
+import time
+from zoneinfo import ZoneInfo
 
 from fastapi.testclient import TestClient
 import pytest
+from pydantic import ValidationError
 from sqlalchemy import select
 
-from app.broker.base import BrokerAdapterError, BrokerConfig
-from app.core.config import Settings
+from app.broker.base import (
+    BrokerAccountSnapshot,
+    BrokerAdapterError,
+    BrokerConfig,
+    BrokerCurrentPrice,
+    BrokerIntradayLiquiditySnapshot,
+    BrokerLiveMarketContext,
+)
+from app.api.schemas.execution import MonitoringPriceRequest
+from app.core.config import Settings, load_settings
+from app.db.base import Base
+from app.db.session import create_db_engine, create_session_factory
 from app.models.runtime import BrokerOrder, ExecutionPlan, ExecutionPlanItem, ExecutionPosition, MonitoringCheckpoint
-from app.services import trigger_time_exec_agent
+from app.services import monitoring, trigger_time_exec_agent
+from app.services.exec_agent_approval import (
+    assess_buy_economics,
+    configured_execution_cost_evidence,
+)
+from app.services.json_compaction import json_payload_hash
+from app.services.position_identity import build_position_identity, execution_scope_payload
+from app.services.execution_account_route import bind_kis_account_route
+from openclaw_contract_test_support import (
+    matching_runtime_contract_snapshot,
+    verified_runtime_contract_proof,
+)
 from test_broker_auth import (
     KIS_PAPER_API_BASE_URL,
     StubBrokerAdapter,
@@ -20,22 +48,104 @@ from test_broker_auth import (
 )
 
 
+def _fresh_normal_core_market_context(*, now: datetime | None) -> dict[str, object]:
+    observed_at = now or datetime.now(UTC)
+    return {
+        "market_context_status": "ready",
+        "market_context_as_of": observed_at.isoformat(),
+        "market_context_fetched_at": observed_at.isoformat(),
+        "market_regime_context": {
+            "source": "kai-trading-core:/market/snapshot",
+            "markets": {
+                "KOSPI": {
+                    "market": "KOSPI",
+                    "market_date": observed_at.astimezone(
+                        ZoneInfo("Asia/Seoul")
+                    ).date().isoformat(),
+                    "observed_at": observed_at.isoformat(),
+                    "source": "kai-trading-core:/market/snapshot",
+                    "up_count": 650,
+                    "down_count": 250,
+                    "flat_count": 50,
+                    "market_symbol_count": 950,
+                    "up_ratio": "0.684211",
+                    "advance_decline_ratio": "2.600000",
+                }
+            },
+        },
+    }
+
+
 def _build_trigger_agent_app(
     *,
     monkeypatch: pytest.MonkeyPatch,
     agent_responses: list[dict[str, object]] | None = None,
     broker_adapter: StubBrokerAdapter | None = None,
     settings_overrides: dict[str, object] | None = None,
+    account_snapshot_observed_at: datetime | None = None,
 ):
     captured_requests: list[dict[str, object]] = []
     responses = list(agent_responses or [])
+    monkeypatch.setattr(
+        trigger_time_exec_agent,
+        "load_live_market_regime_context",
+        lambda **kwargs: _fresh_normal_core_market_context(now=kwargs.get("now")),
+    )
+    monkeypatch.setattr(
+        monitoring,
+        "load_live_market_regime_context",
+        lambda **kwargs: (
+            _fresh_normal_core_market_context(now=kwargs.get("now"))
+            if kwargs["settings"].runtime_mode == "live"
+            else {}
+        ),
+    )
 
     def fake_agent_request(*, settings: Settings, payload: dict[str, object]) -> dict[str, object]:
-        del settings
         captured_requests.append(payload)
         if not responses:
             raise AssertionError("unexpected trigger-time exec-agent call")
-        return responses.pop(0)
+        response = dict(responses.pop(0))
+        plan = payload.get("plan")
+        signal_context = payload.get("signal_context")
+        assert isinstance(plan, dict)
+        assert isinstance(signal_context, dict)
+        response.setdefault(
+            "version",
+            trigger_time_exec_agent.TRIGGER_TIME_EXEC_AGENT_VERSION,
+        )
+        response.setdefault("plan_id", plan["plan_id"])
+        response.setdefault(
+            "execution_plan_item_id",
+            signal_context["execution_plan_item_id"],
+        )
+        response.setdefault("symbol", signal_context["symbol"])
+        provider, model = settings.exec_agent_model.split("/", 1)
+        requested_session_key = "trigger-exec-test-requested-session"
+        reported_session_id = "trigger-exec-test-session"
+        request_sha256 = json_payload_hash(
+            trigger_time_exec_agent._json_safe(payload)
+        )
+        response.setdefault(
+            "_openclaw_runtime_provenance",
+            {
+                "metadata_status": "reported",
+                "actual_agent_id": settings.exec_agent_id,
+                "actual_provider": provider,
+                "actual_model": model,
+                "actual_model_ref": settings.exec_agent_model,
+                "session_id": reported_session_id,
+                "requested_session_key": requested_session_key,
+                "request_sha256": request_sha256,
+                "runtime_contract": verified_runtime_contract_proof(
+                    expected_model_ref=settings.exec_agent_model,
+                    requested_session_key=requested_session_key,
+                    reported_session_id=reported_session_id,
+                    request_sha256=request_sha256,
+                ),
+            },
+        )
+        return response
 
     monkeypatch.setattr(
         trigger_time_exec_agent,
@@ -52,12 +162,25 @@ def _build_trigger_agent_app(
         token_grant=build_token_grant(),
         order_placement=build_order_placement(broker_order_id="kis-trigger-agent-1"),
     )
+    if account_snapshot_observed_at is not None and adapter.account_snapshot is None:
+        adapter.account_snapshot = BrokerAccountSnapshot(
+            available_cash=Decimal("1000000.00"),
+            observed_at=account_snapshot_observed_at,
+            source="stub:account_snapshot",
+            total_asset_value=Decimal("10000000"),
+            previous_total_asset_value=Decimal("10000000"),
+            asset_change_amount=Decimal("0"),
+            unrealized_pnl=Decimal("0"),
+        )
     settings_payload: dict[str, object] = {
         "database_url": "sqlite:///:memory:",
         "runtime_mode": "paper",
         "kis_app_key": "paper-key",
         "kis_app_secret": "paper-secret",
         "kis_account_number": "12345678",
+        "account_drawdown_recovery_scope_secret": (
+            "route-binding-secret-for-trigger-tests-32-bytes"
+        ),
         "exec_agent_enabled": True,
         "exec_agent_trigger_time_enabled": True,
         "exec_agent_trigger_time_sell_enabled": True,
@@ -76,6 +199,154 @@ def _build_trigger_agent_app(
     )
     assert resume.status_code == 200
     return app, engine, client, adapter, captured_requests
+
+
+def _scoped_execution_position(app, **values: object) -> ExecutionPosition:
+    identity = build_position_identity(
+        settings=app.state.settings,
+        provider="kis",
+        exchange="KRX",
+    )
+    return ExecutionPosition(
+        provider=identity.provider,
+        account_scope=identity.account_scope,
+        exchange=identity.exchange,
+        **values,
+    )
+
+
+def _bind_plan_item_to_app_account(app, item: ExecutionPlanItem) -> None:
+    risk_context, quantity_policy = bind_kis_account_route(
+        settings=app.state.settings,
+        provider="kis",
+        risk_context=item.risk_context,
+        quantity_policy=item.quantity_policy,
+    )
+    item.provider = "kis"
+    item.risk_context = risk_context
+    item.quantity_policy = quantity_policy
+
+
+def test_peer_context_only_contains_current_account_and_exchange() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        kis_account_number="12345678",
+        kis_account_product_code="01",
+        account_drawdown_recovery_scope_secret="trigger-peer-route-secret-for-tests",
+    )
+    foreign_settings = settings.model_copy(update={"kis_account_number": "87654321"})
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    current_risk, current_policy = bind_kis_account_route(
+        settings=settings,
+        provider="kis",
+        risk_context={"exchange": "KRX"},
+        quantity_policy={"kind": "shares", "quantity": 1},
+    )
+    foreign_risk, foreign_policy = bind_kis_account_route(
+        settings=foreign_settings,
+        provider="kis",
+        risk_context={"exchange": "KRX"},
+        quantity_policy={"kind": "shares", "quantity": 1},
+    )
+    us_risk, us_policy = bind_kis_account_route(
+        settings=settings,
+        provider="kis",
+        risk_context={"exchange": "NASD"},
+        quantity_policy={"kind": "shares", "quantity": 1},
+    )
+
+    def item(
+        *,
+        item_id: str,
+        symbol: str,
+        status: str,
+        risk_context: dict[str, object] | None,
+        quantity_policy: dict[str, object] | None,
+    ) -> ExecutionPlanItem:
+        return ExecutionPlanItem(
+            id=item_id,
+            plan_item_index=0,
+            symbol=symbol,
+            side="buy",
+            intent="intraday_watch_buy",
+            status=status,
+            provider="kis",
+            asset_class="stock",
+            risk_context=risk_context,
+            quantity_policy=quantity_policy,
+        )
+
+    current = item(
+        item_id="current-trigger-item",
+        symbol="005930",
+        status=trigger_time_exec_agent.AGENT_PENDING_STATUS,
+        risk_context=current_risk,
+        quantity_policy=current_policy,
+    )
+    current_peer = item(
+        item_id="current-trigger-peer",
+        symbol="000660",
+        status=trigger_time_exec_agent.AGENT_PENDING_STATUS,
+        risk_context=current_risk,
+        quantity_policy=current_policy,
+    )
+    foreign_peer = item(
+        item_id="foreign-trigger-peer",
+        symbol="005930",
+        status=trigger_time_exec_agent.AGENT_DELAY_STATUS,
+        risk_context=foreign_risk,
+        quantity_policy=foreign_policy,
+    )
+    other_exchange_peer = item(
+        item_id="other-exchange-trigger-peer",
+        symbol="AAPL",
+        status=trigger_time_exec_agent.AGENT_PENDING_STATUS,
+        risk_context=us_risk,
+        quantity_policy=us_policy,
+    )
+    legacy_peer = item(
+        item_id="legacy-trigger-peer",
+        symbol="035420",
+        status=trigger_time_exec_agent.AGENT_PENDING_STATUS,
+        risk_context={"exchange": "KRX"},
+        quantity_policy={"kind": "shares", "quantity": 1},
+    )
+
+    try:
+        with session_factory() as db:
+            db.add(
+                ExecutionPlan(
+                    external_plan_id="trigger-peer-scope-plan",
+                    source="test",
+                    mode="paper",
+                    items=[
+                        current,
+                        current_peer,
+                        foreign_peer,
+                        other_exchange_peer,
+                        legacy_peer,
+                    ],
+                )
+            )
+            db.commit()
+
+            context = trigger_time_exec_agent._peer_context(
+                settings=settings,
+                db=db,
+                item=current,
+            )
+
+            assert context["active_candidate_count"] == 1
+            assert context["pending_agent_decision_count"] == 1
+            assert context["agent_delayed_count"] == 0
+            assert [candidate["execution_plan_item_id"] for candidate in context["active_candidates"]] == [
+                current_peer.id
+            ]
+    finally:
+        engine.dispose()
 
 
 def _high_volatility_context(
@@ -105,6 +376,7 @@ def _create_intraday_watch_buy(
     max_safe_notional_krw: str = "300000",
     risk_context_extra: dict[str, object] | None = None,
     decision_agent_name: str | None = None,
+    quantity_policy: dict[str, object] | None = None,
 ) -> str:
     risk_context = {
         "exchange": "KRX",
@@ -119,7 +391,8 @@ def _create_intraday_watch_buy(
         "symbol": "005930",
         "side": "buy",
         "intent": "intraday_watch_buy",
-        "quantity_policy": {
+        "quantity_policy": quantity_policy
+        or {
             "type": "exec_agent_sized",
             "budget_krw": "0",
             "max_safe_notional_krw": max_safe_notional_krw,
@@ -134,7 +407,7 @@ def _create_intraday_watch_buy(
         "/execution-plans",
         json={
             "plan_id": plan_id,
-            "source": "kai-trading-core",
+            "source": "test-fixture",
             "market_date": "2026-06-05",
             "items": [item],
         },
@@ -148,27 +421,103 @@ def _live_price_payload(
     *,
     day_low: str | None = None,
     day_high: str | None = None,
+    turnover: str = "88750000000",
+    observed_at: datetime | None = None,
 ) -> dict[str, object]:
+    reference = Decimal(price)
     payload: dict[str, object] = {
         "symbol": "005930",
         "price": price,
-        "bid": "71045.00",
-        "ask": "71055.00",
+        "freshness_source": "kis_exchange_orderbook_time",
+        "bid": str(reference - Decimal("5")),
+        "ask": str(reference + Decimal("5")),
         "spread": "10.00",
         "spread_bps": "1.41",
         "orderbook_depth": "450000000",
         "orderbook_imbalance": "0.08",
         "volume": "1250000",
-        "turnover": "88750000000",
+        "turnover": turnover,
         "session_type": "regular",
         "normal_ordering_available": True,
         "provenance": {"source": "test_live_market_quality"},
     }
+    if observed_at is not None:
+        serialized_observed_at = observed_at.isoformat()
+        payload["observed_at"] = serialized_observed_at
+        payload["provenance"] = {
+            "source": "test_live_market_quality",
+            "orderbook": {
+                "freshness_source": "kis_exchange_orderbook_time",
+                "observed_at": serialized_observed_at,
+            },
+            "field_sources": {
+                side: {
+                    "freshness_source": "kis_exchange_orderbook_time",
+                    "observed_at": serialized_observed_at,
+                }
+                for side in ("bid", "ask")
+            },
+        }
     if day_low is not None:
         payload["day_low"] = day_low
     if day_high is not None:
         payload["day_high"] = day_high
     return payload
+
+
+def _structured_dynamic_gate_context(
+    *,
+    observed_at: datetime,
+) -> dict[str, object]:
+    expires_at = datetime(2026, 6, 5, 15, 30, tzinfo=ZoneInfo("Asia/Seoul"))
+    codes = [
+        "short_term_liquidity_floor_block_delegated_to_exec_watch",
+        "short_term_reward_risk_ratio_block_delegated_to_exec_watch",
+        "transaction_cost_evidence_pending_live_delegated_to_exec_watch",
+    ]
+    common = {
+        "policy_version": "core_delegated_gate_policy_v1",
+        "observed_at": observed_at.isoformat(),
+        "expires_at": expires_at.isoformat(),
+    }
+    return {
+        "delegated_gate_codes": codes,
+        "delegated_gate_confirmation_required": True,
+        "delegated_gates": [
+            {
+                "code": codes[0],
+                "observed_value": "2500000000",
+                "field_path": "risk_context.validation.short_term_entry_quality.raw_trading_value_krw",
+                "comparator": "gte",
+                "threshold": "3000000000",
+                "recheck_source": "exec_trigger_time_market_liquidity",
+                **common,
+            },
+            {
+                "code": codes[1],
+                "observed_value": "1.50",
+                "field_path": "risk_context.validation.short_term_entry_quality.reward_risk_ratio",
+                "comparator": "gte",
+                "threshold": "1.80",
+                "recheck_source": "exec_trigger_time_price_geometry_and_cost_model",
+                **common,
+            },
+            {
+                "code": codes[2],
+                "observed_value": None,
+                "field_path": "risk_context.execution_feasibility_context.expected_slippage_bps",
+                "comparator": "finite_non_negative_with_basis",
+                "threshold": "0",
+                "recheck_source": "exec_trigger_time_quote_and_cost_model",
+                **common,
+            },
+        ],
+        "execution_feasibility_context": {
+            "status": "pending_live_cost_confirmation",
+            "expected_slippage_bps": None,
+            "expected_slippage_basis": "unavailable",
+        },
+    }
 
 
 def test_trigger_time_buy_agent_context_approval_quantity_drives_submission(
@@ -182,7 +531,7 @@ def test_trigger_time_buy_agent_context_approval_quantity_drives_submission(
                 "side": "buy",
                 "quantity": 3,
                 "limit_price": "71075.00",
-                "updated_target_price": "72500.00",
+                "updated_target_price": "74000.00",
                 "updated_stop_price": "69950.00",
                 "reason": "fresh trigger context supports a small buy",
                 "risk_notes": ["spread acceptable"],
@@ -205,13 +554,13 @@ def test_trigger_time_buy_agent_context_approval_quantity_drives_submission(
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["submitted_order_count"] == 1
+    assert payload["submitted_order_count"] == 1, json.dumps(payload)
     assert payload["items"][0]["outcome"] == "submitted"
     assert len(captured) == 1
     request = captured[0]
     assert request["signal_context"]["side"] == "buy"
     assert request["signal_context"]["execution_plan_item_id"] == item_id
-    assert request["market_context"]["latest_price"] == "71050.0000"
+    assert request["market_context"]["latest_price"] == "71055.0000"
     assert request["market_context"]["context_staleness_ok"] is True
     assert request["market_context"]["live_execution_context_available"] is True
     assert request["market_context"]["missing_critical_fields"] == []
@@ -235,7 +584,7 @@ def test_trigger_time_buy_agent_context_approval_quantity_drives_submission(
         assert item is not None
         assert item.status == "watch_buy_submitted"
         assert item.limit_price == Decimal("71075.0000")
-        assert item.risk_context["target_price"] == "72500.0000"
+        assert item.risk_context["target_price"] == "74000.0000"
         assert item.risk_context["stop_price"] == "69950.0000"
         approved_events = [
             event
@@ -431,7 +780,7 @@ def test_trigger_time_chase_buy_override_requires_documented_tighter_stop(
                 "side": "buy",
                 "quantity": 2,
                 "limit_price": "71060.00",
-                "updated_target_price": "72400.00",
+                "updated_target_price": "73000.00",
                 "updated_stop_price": "70550.00",
                 "reason": "override remains acceptable because live tape confirms absorption above the breakout",
                 "risk_notes": ["override includes tighter stop"],
@@ -439,6 +788,7 @@ def test_trigger_time_chase_buy_override_requires_documented_tighter_stop(
                 "context_staleness_ok": True,
             }
         ],
+        account_snapshot_observed_at=datetime(2026, 6, 5, 0, 30, tzinfo=UTC),
         settings_overrides={"watch_buy_high_volatility_chase_veto_enabled": True},
     )
     item_id = _create_intraday_watch_buy(
@@ -493,7 +843,7 @@ def test_trigger_time_chase_buy_override_stop_is_enforced_after_agent_looser_sto
                 "side": "buy",
                 "quantity": 2,
                 "limit_price": "71060.00",
-                "updated_target_price": "72400.00",
+                "updated_target_price": "73000.00",
                 "updated_stop_price": "70000.00",
                 "reason": "agent attempts to keep original looser stop",
                 "risk_notes": ["looser stop should be clamped by runtime"],
@@ -501,6 +851,7 @@ def test_trigger_time_chase_buy_override_stop_is_enforced_after_agent_looser_sto
                 "context_staleness_ok": True,
             }
         ],
+        account_snapshot_observed_at=datetime(2026, 6, 5, 0, 30, tzinfo=UTC),
         settings_overrides={"watch_buy_high_volatility_chase_veto_enabled": True},
     )
     item_id = _create_intraday_watch_buy(
@@ -564,7 +915,7 @@ def test_high_volatility_chase_rule_does_not_affect_sell_side_stop(
         "/execution-plans",
         json={
             "plan_id": "plan-sell-stop-high-volatility-context",
-            "source": "kai-trading-core",
+            "source": "test-fixture",
             "market_date": "2026-06-05",
             "items": [
                 {
@@ -583,7 +934,8 @@ def test_high_volatility_chase_rule_does_not_affect_sell_side_stop(
     stop_item_id = plan_response.json()["persisted_execution_item_ids"][0]
     with app.state.db_session_factory() as session:
         session.add(
-            ExecutionPosition(
+                _scoped_execution_position(
+                    app,
                 mode="paper",
                 symbol="005930",
                 quantity=2,
@@ -625,7 +977,7 @@ def test_trigger_time_buy_agent_is_bypassed_for_default_entry_line_buy(
         "/execution-plans",
         json={
             "plan_id": "plan-trigger-agent-default-entry-line-bypass",
-            "source": "kai-trading-core",
+            "source": "test-fixture",
             "market_date": "2026-06-05",
             "items": [
                 {
@@ -668,7 +1020,7 @@ def test_trigger_time_buy_agent_is_bypassed_for_default_entry_line_buy(
     assert len(broker_adapter.order_calls) == 1
     assert broker_adapter.order_calls[0].execution_plan_item_id == item_id
     assert broker_adapter.order_calls[0].quantity == 2
-    assert broker_adapter.order_calls[0].limit_price == Decimal("70900.00")
+    assert broker_adapter.order_calls[0].limit_price == Decimal("70905.00")
 
     engine.dispose()
 
@@ -684,6 +1036,7 @@ def test_trigger_time_buy_agent_is_bypassed_for_intraday_pullback_below_trigger(
         client,
         plan_id="plan-trigger-agent-pullback-bypass",
         risk_context_extra={"exec_agent_watch_sizing_fallback_allowed": True},
+        quantity_policy={"kind": "shares", "quantity": 2},
     )
 
     crossed = client.post(
@@ -727,7 +1080,7 @@ def test_trigger_time_buy_agent_is_bypassed_for_intraday_pullback_below_trigger(
     assert response.status_code == 200
     payload = response.json()
     assert payload["triggered_item_count"] == 1
-    assert payload["submitted_order_count"] == 1
+    assert payload["submitted_order_count"] == 1, json.dumps(payload)
     assert payload["items"][0]["outcome"] == "submitted"
     assert payload["items"][0]["trigger_reason"] == "intraday_watch_buy_day_high_cross"
     assert captured == []
@@ -736,7 +1089,7 @@ def test_trigger_time_buy_agent_is_bypassed_for_intraday_pullback_below_trigger(
     order_call = broker_adapter.order_calls[0]
     assert order_call.execution_plan_item_id == item_id
     assert order_call.side == "buy"
-    assert order_call.limit_price == Decimal("70900.00")
+    assert order_call.limit_price == Decimal("70905.00")
 
     engine.dispose()
 
@@ -753,6 +1106,7 @@ def test_stale_trigger_reclaim_blocks_cross_pullback_buy_below_threshold(
         plan_id="plan-stale-trigger-reclaim-blocked",
         risk_context_extra={"exec_agent_watch_sizing_fallback_allowed": True},
         decision_agent_name="short-term-decider",
+        quantity_policy={"kind": "shares", "quantity": 2},
     )
 
     crossed = client.post(
@@ -781,7 +1135,7 @@ def test_stale_trigger_reclaim_blocks_cross_pullback_buy_below_threshold(
             "reason": "day high crossed trigger but pulled back too far",
             "prices": [
                 _live_price_payload(
-                    price="68870.00",
+                    price="68865.00",
                     day_low="68000.00",
                     day_high="71400.00",
                 )
@@ -835,6 +1189,7 @@ def test_stale_trigger_reclaim_allows_cross_pullback_buy_within_threshold(
             "exec_agent_watch_sizing_fallback_allowed": True,
             "stop_price": "68000.00",
         },
+        quantity_policy={"kind": "shares", "quantity": 2},
     )
 
     crossed = client.post(
@@ -878,7 +1233,7 @@ def test_stale_trigger_reclaim_allows_cross_pullback_buy_within_threshold(
     assert captured == []
     assert len(broker_adapter.order_calls) == 1
     assert broker_adapter.order_calls[0].execution_plan_item_id == item_id
-    assert broker_adapter.order_calls[0].limit_price == Decimal("68900.00")
+    assert broker_adapter.order_calls[0].limit_price == Decimal("68905.00")
 
     engine.dispose()
 
@@ -898,6 +1253,7 @@ def test_stale_trigger_reclaim_allows_explicit_pullback_strategy_profile(
             "strategy_profile": "pullback_reclaim",
             "stop_price": "68000.00",
         },
+        quantity_policy={"kind": "shares", "quantity": 2},
     )
 
     crossed = client.post(
@@ -926,7 +1282,7 @@ def test_stale_trigger_reclaim_allows_explicit_pullback_strategy_profile(
             "reason": "pullback strategy is allowed to buy below old breakout line",
             "prices": [
                 _live_price_payload(
-                    price="68870.00",
+                    price="68865.00",
                     day_low="68000.00",
                     day_high="71400.00",
                 )
@@ -962,7 +1318,7 @@ def test_stale_trigger_reclaim_allows_fresh_agent_pullback_reclaim_confirmation(
                 "quantity": 3,
                 "limit_price": "68870.00",
                 "updated_trigger_price": "68870.00",
-                "updated_target_price": "70400.00",
+                "updated_target_price": "71000.00",
                 "updated_stop_price": "68100.00",
                 "reason": "fresh pullback reclaim setup confirmed with updated levels",
                 "risk_notes": ["new reclaim line is current pullback area"],
@@ -970,6 +1326,7 @@ def test_stale_trigger_reclaim_allows_fresh_agent_pullback_reclaim_confirmation(
                 "context_staleness_ok": True,
             }
         ],
+        account_snapshot_observed_at=datetime(2026, 6, 5, 0, 30, tzinfo=UTC),
     )
     item_id = _create_intraday_watch_buy(
         client,
@@ -993,7 +1350,7 @@ def test_stale_trigger_reclaim_allows_fresh_agent_pullback_reclaim_confirmation(
             "source": "test",
             "reason": "agent confirms fresh reclaim after stale trigger",
             "observed_at": "2026-06-05T00:30:00Z",
-            "prices": [_live_price_payload(price="68870.00")],
+            "prices": [_live_price_payload(price="68865.00")],
         },
     )
 
@@ -1222,6 +1579,52 @@ def test_trigger_time_buy_invalid_agent_reason_is_bounded_and_delays(
     engine.dispose()
 
 
+@pytest.mark.parametrize("spawn_error", [FileNotFoundError, PermissionError])
+def test_trigger_time_agent_spawn_oserror_delays_without_aborting_cycle(
+    monkeypatch: pytest.MonkeyPatch,
+    spawn_error: type[OSError],
+) -> None:
+    app, engine, client, broker_adapter, _captured = _build_trigger_agent_app(
+        monkeypatch=monkeypatch,
+    )
+    item_id = _create_intraday_watch_buy(
+        client,
+        plan_id=f"plan-trigger-agent-{spawn_error.__name__}",
+    )
+
+    def fail_to_spawn(**_kwargs: object) -> dict[str, object]:
+        raise spawn_error("configured OpenClaw executable is unavailable")
+
+    monkeypatch.setattr(
+        trigger_time_exec_agent,
+        "_request_exec_agent_decision",
+        fail_to_spawn,
+    )
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "agent spawn failure must stay item-local",
+            "prices": [_live_price_payload()],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["items"][0]["outcome"] == "agent_delay"
+    assert broker_adapter.order_calls == []
+    with app.state.db_session_factory() as session:
+        item = session.get(ExecutionPlanItem, item_id)
+        assert item is not None
+        assert item.status == "agent_delay"
+        interaction = item.risk_context["last_trigger_time_exec_agent_interaction"]
+        assert interaction["source"] == "exec_runtime_context_gate"
+        assert interaction["decision"]["decision"] == "delay"
+
+    engine.dispose()
+
+
 def test_trigger_time_buy_agent_quantity_is_clamped_by_deterministic_sizing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1244,6 +1647,7 @@ def test_trigger_time_buy_agent_quantity_is_clamped_by_deterministic_sizing(
         client,
         plan_id="plan-trigger-agent-buy-deterministic-clamp",
         max_safe_notional_krw="150000",
+        risk_context_extra={"target_price": "74000"},
     )
 
     response = client.post(
@@ -1299,6 +1703,7 @@ def test_trigger_time_buy_effective_risk_stop_updates_stop_monitor(
                 "side": "buy",
                 "quantity": 10,
                 "limit_price": "71075.00",
+                "updated_target_price": "76000.00",
                 "updated_stop_price": "60000.00",
                 "reason": "agent stop is too wide but buy can proceed with deterministic risk stop",
                 "risk_notes": ["deterministic sizing should tighten the actual monitor stop"],
@@ -1311,7 +1716,7 @@ def test_trigger_time_buy_effective_risk_stop_updates_stop_monitor(
         "/execution-plans",
         json={
             "plan_id": "plan-trigger-agent-effective-stop-monitor",
-            "source": "kai-trading-core",
+            "source": "test-fixture",
             "market_date": "2026-06-05",
             "items": [
                 {
@@ -1327,7 +1732,7 @@ def test_trigger_time_buy_effective_risk_stop_updates_stop_monitor(
                     "time_in_force": "day",
                     "risk_context": {
                         "exchange": "KRX",
-                        "target_price": "72420.00",
+                        "target_price": "76000.00",
                         "stop_price": "60000.00",
                         "trigger_direction": "at_or_above",
                     },
@@ -1367,8 +1772,8 @@ def test_trigger_time_buy_effective_risk_stop_updates_stop_monitor(
         stop_item = session.get(ExecutionPlanItem, stop_item_id)
         assert buy_item is not None
         assert stop_item is not None
-        assert stop_item.trigger_price == Decimal("68208.0000")
-        assert buy_item.risk_context["effective_stop_price"] == "68208.0000"
+        assert stop_item.trigger_price == Decimal("68232.0000")
+        assert buy_item.risk_context["effective_stop_price"] == "68232.0000"
         assert buy_item.risk_context["upstream_stop_price"] == "60000.0000"
         assert buy_item.risk_context["stop_monitor_adjustment"] == "raised_to_effective_risk_stop"
         sizing_events = [
@@ -1442,6 +1847,7 @@ def test_trigger_time_buy_delay_or_reject_does_not_submit_and_is_audited(
     assert payload["blocked_item_count"] == 1
     assert payload["items"][0]["outcome"] == expected_outcome
     assert broker_adapter.order_calls == []
+    assert broker_adapter.intraday_liquidity_calls == []
     assert len(captured) == 1
 
     runtime_status = client.get("/runtime/status").json()
@@ -1528,7 +1934,7 @@ def test_trigger_time_sell_agent_can_adjust_quantity_limit_and_stop(
         "/execution-plans",
         json={
             "plan_id": "plan-trigger-agent-sell-adjust",
-            "source": "kai-trading-core",
+            "source": "test-fixture",
             "items": [
                 {
                     "symbol": "005930",
@@ -1555,7 +1961,8 @@ def test_trigger_time_sell_agent_can_adjust_quantity_limit_and_stop(
     target_item_id, stop_item_id = plan_response.json()["persisted_execution_item_ids"]
     with app.state.db_session_factory() as session:
         session.add(
-            ExecutionPosition(
+                _scoped_execution_position(
+                    app,
                 mode="paper",
                 symbol="005930",
                 quantity=5,
@@ -1599,6 +2006,239 @@ def test_trigger_time_sell_agent_can_adjust_quantity_limit_and_stop(
     engine.dispose()
 
 
+def test_trigger_time_partial_target_sell_cannot_loosen_existing_protective_stop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, engine, client, broker_adapter, captured = _build_trigger_agent_app(
+        monkeypatch=monkeypatch,
+        agent_responses=[
+            {
+                "decision": "execute_now",
+                "side": "sell",
+                "quantity": 2,
+                "updated_stop_price": "60000.00",
+                "reason": "take partial profit but widen the remaining-position stop",
+                "risk_notes": ["unsafe stop relaxation"],
+                "confidence": "0.80",
+                "context_staleness_ok": True,
+            }
+        ],
+    )
+    plan_response = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-trigger-agent-sell-stop-relaxation",
+            "source": "test-fixture",
+            "items": [
+                {
+                    "symbol": "005930",
+                    "side": "sell",
+                    "intent": "target_sell",
+                    "quantity_policy": {"kind": "shares", "quantity": 4},
+                    "trigger_price": "75000.00",
+                    "time_in_force": "day",
+                    "risk_context": {
+                        "exchange": "KRX",
+                        "exit_rule": {"kind": "partial_take_profit", "stage": "first"},
+                    },
+                },
+                {
+                    "symbol": "005930",
+                    "side": "sell",
+                    "intent": "stop_sell",
+                    "quantity_policy": {"kind": "shares", "quantity": 5},
+                    "trigger_price": "70000.00",
+                    "time_in_force": "day",
+                    "risk_context": {"exchange": "KRX"},
+                },
+            ],
+        },
+    )
+    assert plan_response.status_code == 201
+    target_item_id, stop_item_id = plan_response.json()["persisted_execution_item_ids"]
+    with app.state.db_session_factory() as session:
+        session.add(
+                _scoped_execution_position(
+                    app,
+                mode="paper",
+                symbol="005930",
+                quantity=5,
+                average_price=Decimal("65000.0000"),
+                updated_from="reconciliation",
+                last_reconciled_at=datetime.now(UTC),
+                raw_payload={"source": "broker"},
+            )
+        )
+        session.commit()
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "partial target may tighten but never loosen the stop",
+            "prices": [{"symbol": "005930", "price": "75100.00"}],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["submitted_order_count"] == 0
+    assert response.json()["items"][0]["outcome"] == "agent_delay"
+    assert len(captured) == 1
+    assert broker_adapter.order_calls == []
+    with app.state.db_session_factory() as session:
+        target_item = session.get(ExecutionPlanItem, target_item_id)
+        stop_item = session.get(ExecutionPlanItem, stop_item_id)
+        assert target_item is not None
+        assert stop_item is not None
+        assert target_item.status == "agent_delay"
+        assert stop_item.trigger_price == Decimal("70000.0000")
+        interaction = target_item.risk_context["last_trigger_time_exec_agent_interaction"]
+        assert "would loosen existing protective stop" in interaction["decision"]["reason"]
+
+    engine.dispose()
+
+
+def test_trigger_time_partial_target_rechecks_concurrently_tightened_stop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, engine, client, broker_adapter, captured = _build_trigger_agent_app(
+        monkeypatch=monkeypatch,
+        agent_responses=[],
+    )
+    plan_response = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-trigger-agent-concurrent-stop-tightening",
+            "source": "test-fixture",
+            "items": [
+                {
+                    "symbol": "005930",
+                    "side": "sell",
+                    "intent": "target_sell",
+                    "quantity_policy": {"kind": "shares", "quantity": 4},
+                    "trigger_price": "75000.00",
+                    "time_in_force": "day",
+                    "risk_context": {
+                        "exchange": "KRX",
+                        "exit_rule": {"kind": "partial_take_profit", "stage": "first"},
+                    },
+                },
+                {
+                    "symbol": "005930",
+                    "side": "sell",
+                    "intent": "stop_sell",
+                    "quantity_policy": {"kind": "shares", "quantity": 5},
+                    "trigger_price": "70000.00",
+                    "time_in_force": "day",
+                    "risk_context": {"exchange": "KRX"},
+                },
+            ],
+        },
+    )
+    assert plan_response.status_code == 201
+    target_item_id, stop_item_id = plan_response.json()["persisted_execution_item_ids"]
+    with app.state.db_session_factory() as session:
+        session.add(
+                _scoped_execution_position(
+                    app,
+                mode="paper",
+                symbol="005930",
+                quantity=5,
+                average_price=Decimal("65000.0000"),
+                updated_from="reconciliation",
+                last_reconciled_at=datetime.now(UTC),
+                raw_payload={"source": "broker"},
+            )
+        )
+        session.commit()
+
+    def tighten_stop_while_agent_runs(
+        *, settings: Settings, payload: dict[str, object]
+    ) -> dict[str, object]:
+        captured.append(payload)
+        with app.state.db_session_factory() as competing_session:
+            stop_item = competing_session.get(ExecutionPlanItem, stop_item_id)
+            assert stop_item is not None
+            stop_item.trigger_price = Decimal("72000.0000")
+            competing_session.commit()
+        plan = payload["plan"]
+        signal_context = payload["signal_context"]
+        assert isinstance(plan, dict)
+        assert isinstance(signal_context, dict)
+        provider, model = settings.exec_agent_model.split("/", 1)
+        requested_session_key = "trigger-exec-concurrent-stop-requested"
+        reported_session_id = "trigger-exec-concurrent-stop-session"
+        request_sha256 = json_payload_hash(
+            trigger_time_exec_agent._json_safe(payload)
+        )
+        return {
+            "version": trigger_time_exec_agent.TRIGGER_TIME_EXEC_AGENT_VERSION,
+            "plan_id": plan["plan_id"],
+            "execution_plan_item_id": signal_context["execution_plan_item_id"],
+            "symbol": signal_context["symbol"],
+            "decision": "execute_now",
+            "side": "sell",
+            "quantity": 2,
+            # This tightens the stop the agent originally observed (70,000),
+            # but would loosen the 72,000 stop committed during its request.
+            "updated_stop_price": "71000.00",
+            "valid_until": (datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
+            "reason": "take partial profit and tighten the originally observed stop",
+            "risk_notes": ["preserve the latest sibling protection"],
+            "confidence": "0.80",
+            "context_staleness_ok": True,
+            "_openclaw_runtime_provenance": {
+                "metadata_status": "reported",
+                "actual_agent_id": settings.exec_agent_id,
+                "actual_provider": provider,
+                "actual_model": model,
+                "actual_model_ref": settings.exec_agent_model,
+                "session_id": reported_session_id,
+                "requested_session_key": requested_session_key,
+                "request_sha256": request_sha256,
+                "runtime_contract": verified_runtime_contract_proof(
+                    expected_model_ref=settings.exec_agent_model,
+                    requested_session_key=requested_session_key,
+                    reported_session_id=reported_session_id,
+                    request_sha256=request_sha256,
+                ),
+            },
+        }
+
+    monkeypatch.setattr(
+        trigger_time_exec_agent,
+        "_request_exec_agent_decision",
+        tighten_stop_while_agent_runs,
+    )
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "revalidate stop after concurrent tightening",
+            "prices": [{"symbol": "005930", "price": "75100.00"}],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["submitted_order_count"] == 0
+    assert response.json()["items"][0]["outcome"] == "agent_delay"
+    assert len(captured) == 1
+    assert broker_adapter.order_calls == []
+    with app.state.db_session_factory() as session:
+        target_item = session.get(ExecutionPlanItem, target_item_id)
+        stop_item = session.get(ExecutionPlanItem, stop_item_id)
+        assert target_item is not None
+        assert stop_item is not None
+        assert target_item.status == "agent_delay"
+        assert stop_item.trigger_price == Decimal("72000.0000")
+        event = target_item.risk_context["last_monitoring_event"]
+        assert event["reason"] == "post_agent_protective_stop_relaxation"
+
+    engine.dispose()
+
+
 def test_trigger_time_agent_always_bypasses_protective_stop_without_metadata(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1610,7 +2250,7 @@ def test_trigger_time_agent_always_bypasses_protective_stop_without_metadata(
         "/execution-plans",
         json={
             "plan_id": "plan-emergency-stop-bypass",
-            "source": "kai-trading-core",
+            "source": "test-fixture",
             "items": [
                 {
                     "symbol": "005930",
@@ -1628,7 +2268,8 @@ def test_trigger_time_agent_always_bypasses_protective_stop_without_metadata(
     stop_item_id = plan_response.json()["persisted_execution_item_ids"][0]
     with app.state.db_session_factory() as session:
         session.add(
-            ExecutionPosition(
+                _scoped_execution_position(
+                    app,
                 mode="paper",
                 symbol="005930",
                 quantity=5,
@@ -1673,13 +2314,27 @@ def test_runtime_status_exposes_trigger_time_agent_state_counts(
             source="test",
             mode="paper",
             items=[
-                ExecutionPlanItem(symbol="000001", side="buy", intent="intraday_watch_buy", status="watch_monitoring_active"),
-                ExecutionPlanItem(symbol="000002", side="buy", intent="intraday_watch_buy", status="triggered_pending_agent"),
-                ExecutionPlanItem(symbol="000003", side="buy", intent="intraday_watch_buy", status="agent_delay"),
-                ExecutionPlanItem(symbol="000004", side="buy", intent="intraday_watch_buy", status="agent_rejected"),
-                ExecutionPlanItem(symbol="000005", side="buy", intent="intraday_watch_buy", status="watch_buy_submitted"),
+                ExecutionPlanItem(
+                    symbol=symbol,
+                    side="buy",
+                    intent="intraday_watch_buy",
+                    status=status,
+                    venue="KIS",
+                    asset_class="stock",
+                    risk_context={"exchange": "KRX"},
+                    quantity_policy={"kind": "shares", "quantity": 1},
+                )
+                for symbol, status in (
+                    ("000001", "watch_monitoring_active"),
+                    ("000002", "triggered_pending_agent"),
+                    ("000003", "agent_delay"),
+                    ("000004", "agent_rejected"),
+                    ("000005", "watch_buy_submitted"),
+                )
             ],
         )
+        for item in plan.items:
+            _bind_plan_item_to_app_account(app, item)
         session.add(plan)
         session.commit()
 
@@ -1727,9 +2382,11 @@ def test_monitoring_rearms_partial_protective_stop_coverage(
                 ),
             ],
         )
+        _bind_plan_item_to_app_account(app, plan.items[0])
         session.add(plan)
         session.add(
-            ExecutionPosition(
+                _scoped_execution_position(
+                    app,
                 mode="paper",
                 symbol="005930",
                 quantity=5,
@@ -1826,9 +2483,11 @@ def test_monitoring_counts_broker_truth_live_stop_as_protective_coverage(
                 ),
             ],
         )
+        _bind_plan_item_to_app_account(app, plan.items[0])
         session.add(plan)
         session.add(
-            ExecutionPosition(
+                _scoped_execution_position(
+                    app,
                 mode="paper",
                 symbol="005930",
                 quantity=5,
@@ -1896,9 +2555,11 @@ def test_monitoring_requires_concrete_share_policy_for_protective_stop_coverage(
                 ),
             ],
         )
+        _bind_plan_item_to_app_account(app, plan.items[0])
         session.add(plan)
         session.add(
-            ExecutionPosition(
+                _scoped_execution_position(
+                    app,
                 mode="paper",
                 symbol="005930",
                 quantity=5,
@@ -1972,9 +2633,11 @@ def test_monitoring_preserves_in_flight_legacy_stop_when_repairing_coverage(
                 ),
             ],
         )
+        _bind_plan_item_to_app_account(app, plan.items[0])
         session.add(plan)
         session.add(
-            ExecutionPosition(
+                _scoped_execution_position(
+                    app,
                 mode="paper",
                 symbol="005930",
                 quantity=5,
@@ -2063,9 +2726,11 @@ def test_monitoring_reports_unprotected_position_when_stop_threshold_missing(
                 ),
             ],
         )
+        _bind_plan_item_to_app_account(app, plan.items[0])
         session.add(plan)
         session.add(
-            ExecutionPosition(
+                _scoped_execution_position(
+                    app,
                 mode="paper",
                 symbol="005930",
                 quantity=3,
@@ -2138,13 +2803,19 @@ def test_monitoring_materializes_pending_config_stop_before_crossing_is_missed(
                     quantity_policy={"kind": "shares", "quantity": 2},
                     trigger_price=Decimal("118000.00"),
                     time_in_force="day",
-                    risk_context={"exchange": "KRX", "deterministic_emergency_stop": True},
+                    risk_context={
+                        "exchange": "KRX",
+                        "account_reference": "KIS:12345678-01",
+                        "deterministic_emergency_stop": True,
+                    },
                 ),
             ],
         )
+        _bind_plan_item_to_app_account(app, plan.items[0])
         session.add(plan)
         session.add(
-            ExecutionPosition(
+                _scoped_execution_position(
+                    app,
                 mode="paper",
                 symbol="005930",
                 quantity=2,
@@ -2213,23 +2884,40 @@ def test_monitoring_flags_stale_flat_position_truth_with_broker_evidence(
                 ),
             ],
         )
+        _bind_plan_item_to_app_account(app, plan.items[0])
         session.add(plan)
         session.flush()
         session.add(
             BrokerOrder(
                 execution_plan_item_id=None,
+                broker_name="kis",
                 mode="paper",
                 idempotency_key="filled-buy-319660",
                 symbol="319660",
                 side="buy",
                 status="filled",
                 quantity=4,
+                venue="KRX",
+                asset_class="stock",
                 limit_price=Decimal("23000.00"),
                 submitted_at=stale_reconciled_at + timedelta(minutes=5),
+                request_metadata={
+                    "exchange": "KRX",
+                    "execution_scope": execution_scope_payload(
+                        identity=build_position_identity(
+                            settings=app.state.settings,
+                            provider="kis",
+                            exchange="KRX",
+                        ),
+                        venue="KRX",
+                        asset_class="stock",
+                    ),
+                },
             )
         )
         session.add(
-            ExecutionPosition(
+                _scoped_execution_position(
+                    app,
                 mode="paper",
                 symbol="319660",
                 quantity=0,
@@ -2277,4 +2965,2173 @@ def test_monitoring_flags_stale_flat_position_truth_with_broker_evidence(
         assert checkpoint is not None
         assert checkpoint.status == "degraded"
 
+    engine.dispose()
+
+
+def test_trigger_time_agent_request_file_exists_only_during_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request_paths: list[Path] = []
+
+    def fake_run(command: list[str], *, timeout_seconds: int) -> subprocess.CompletedProcess[str]:
+        del timeout_seconds
+        assert "--message" not in command
+        request_path = Path(command[command.index("--message-file") + 1])
+        assert request_path.exists()
+        prompt = request_path.read_text(encoding="utf-8")
+        assert '"symbol": "005930"' in prompt
+        assert "Read /" not in prompt
+        request_paths.append(request_path)
+        return subprocess.CompletedProcess(
+            args=command,
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "result": {
+                        "payloads": [
+                            {
+                                "text": json.dumps(
+                                    {
+                                        "decision": "delay",
+                                        "side": "buy",
+                                        "reason": "test",
+                                    }
+                                )
+                            }
+                        ]
+                    }
+                }
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(trigger_time_exec_agent, "_run_exec_agent_command", fake_run)
+    monkeypatch.setattr(
+        trigger_time_exec_agent,
+        "capture_runtime_contract",
+        lambda **_: matching_runtime_contract_snapshot(),
+    )
+
+    response = trigger_time_exec_agent._request_exec_agent_decision(
+        settings=Settings(),
+        payload={"symbol": "005930"},
+    )
+
+    assert response["decision"] == "delay"
+    assert len(request_paths) == 1
+    assert not request_paths[0].exists()
+
+
+def test_timed_out_agent_closes_pipes_without_unbounded_second_communicate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Pipe:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    class HungProcess:
+        pid = 4321
+        returncode = None
+
+        def __init__(self) -> None:
+            self.stdout = Pipe()
+            self.stderr = Pipe()
+            self.communicate_calls = 0
+            self.wait_calls = 0
+
+        def communicate(self, *, timeout=None):  # noqa: ANN001
+            self.communicate_calls += 1
+            if self.communicate_calls > 1:
+                raise AssertionError("timed-out command must not call communicate again")
+            raise subprocess.TimeoutExpired(
+                cmd=["hung-agent"],
+                timeout=timeout,
+                output="partial stdout",
+                stderr="partial stderr",
+            )
+
+        def wait(self, *, timeout=None):  # noqa: ANN001
+            self.wait_calls += 1
+            raise subprocess.TimeoutExpired(cmd=["hung-agent"], timeout=timeout)
+
+    process = HungProcess()
+    signals: list[int] = []
+    monkeypatch.setattr(
+        trigger_time_exec_agent.subprocess,
+        "Popen",
+        lambda *args, **kwargs: process,
+    )
+    monkeypatch.setattr(
+        trigger_time_exec_agent.os,
+        "killpg",
+        lambda pid, sent_signal: signals.append(sent_signal),
+    )
+
+    with pytest.raises(subprocess.TimeoutExpired) as raised:
+        trigger_time_exec_agent._run_exec_agent_command(
+            ["hung-agent"],
+            timeout_seconds=1,
+        )
+
+    assert raised.value.output == "partial stdout"
+    assert raised.value.stderr == "partial stderr"
+    assert process.communicate_calls == 1
+    assert process.wait_calls == 2
+    assert signals == [
+        trigger_time_exec_agent.signal.SIGTERM,
+        trigger_time_exec_agent.signal.SIGKILL,
+    ]
+    assert process.stdout.closed is True
+    assert process.stderr.closed is True
+
+
+@pytest.mark.parametrize(
+    ("agent_decision", "terminal_status"),
+    [
+        ("keep_watching", "watch_cancelled"),
+        ("delay", "watch_expired"),
+        ("reject", "watch_cancelled"),
+    ],
+)
+def test_concurrent_terminal_transition_wins_over_trigger_agent_decision(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    agent_decision: str,
+    terminal_status: str,
+) -> None:
+    agent_entered = Event()
+    release_agent = Event()
+    observed_at = datetime(2026, 6, 5, 0, 30, tzinfo=UTC)
+    app, engine, client, broker_adapter, _ = _build_trigger_agent_app(
+        monkeypatch=monkeypatch,
+        account_snapshot_observed_at=observed_at,
+        settings_overrides={
+            "database_url": f"sqlite:///{tmp_path / f'trigger-cas-{agent_decision}.db'}",
+        },
+    )
+    item_id = _create_intraday_watch_buy(
+        client,
+        plan_id=f"plan-trigger-cas-{agent_decision}",
+    )
+
+    def blocking_agent_request(
+        *,
+        settings: Settings,
+        payload: dict[str, object],
+    ) -> dict[str, object]:
+        del settings
+        plan = payload["plan"]
+        signal_context = payload["signal_context"]
+        assert isinstance(plan, dict)
+        assert isinstance(signal_context, dict)
+        agent_entered.set()
+        assert release_agent.wait(timeout=3)
+        return {
+            "version": trigger_time_exec_agent.TRIGGER_TIME_EXEC_AGENT_VERSION,
+            "plan_id": plan["plan_id"],
+            "execution_plan_item_id": signal_context["execution_plan_item_id"],
+            "symbol": signal_context["symbol"],
+            "side": "buy",
+            "decision": agent_decision,
+            "reason": f"fixture {agent_decision}",
+        }
+
+    monkeypatch.setattr(
+        trigger_time_exec_agent,
+        "_request_exec_agent_decision",
+        blocking_agent_request,
+    )
+    response_holder: dict[str, object] = {}
+
+    def evaluate() -> None:
+        response_holder["response"] = client.post(
+            "/monitoring/evaluate",
+            json={
+                "actor": "ops",
+                "source": "test",
+                "reason": "terminal state must win trigger-agent race",
+                "observed_at": observed_at.isoformat(),
+                "prices": [_live_price_payload()],
+            },
+        )
+
+    thread = Thread(target=evaluate)
+    thread.start()
+    assert agent_entered.wait(timeout=3), json.dumps(
+        {key: value.json() for key, value in response_holder.items()}
+    )
+    with app.state.db_session_factory() as session:
+        item = session.get(ExecutionPlanItem, item_id)
+        assert item is not None
+        risk_context = dict(item.risk_context or {})
+        terminal_event = {
+            "event": "external_terminal_transition",
+            "status": terminal_status,
+        }
+        prior_events = risk_context.get("monitoring_events")
+        risk_context["monitoring_events"] = [
+            *(prior_events if isinstance(prior_events, list) else []),
+            terminal_event,
+        ]
+        risk_context["last_monitoring_event"] = terminal_event
+        item.status = terminal_status
+        item.risk_context = risk_context
+        session.commit()
+    release_agent.set()
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+
+    response = response_holder["response"]
+    assert response.status_code == 200
+    assert response.json()["submitted_order_count"] == 0
+    assert response.json()["items"][0]["block_reason"] == (
+        "trigger_time_exec_agent_claim_lost"
+    )
+    assert broker_adapter.order_calls == []
+    with app.state.db_session_factory() as session:
+        item = session.get(ExecutionPlanItem, item_id)
+        assert item is not None
+        assert item.status == terminal_status
+        assert item.risk_context["last_monitoring_event"] == terminal_event
+        assert "last_trigger_time_exec_agent_interaction" not in item.risk_context
+    engine.dispose()
+
+
+def test_concurrent_expiry_wins_over_post_agent_quote_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent_entered = Event()
+    release_agent = Event()
+    observed_at = datetime(2026, 6, 5, 0, 30, tzinfo=UTC)
+
+    class QuoteFailsAfterAgentAdapter(StubBrokerAdapter):
+        def get_current_price(
+            self,
+            access_token: str,
+            *,
+            symbol: str,
+            exchange: str = "KRX",
+        ) -> BrokerCurrentPrice | None:
+            assert access_token
+            self.current_price_calls.append((symbol, exchange))
+            if len(self.current_price_calls) > 1:
+                return None
+            return BrokerCurrentPrice(
+                symbol=symbol,
+                exchange=exchange,
+                price=Decimal("71050"),
+                observed_at=observed_at,
+                payload={"output": {"stck_prpr": "71050"}},
+            )
+
+        def get_live_market_context(
+            self,
+            access_token: str,
+            *,
+            symbol: str,
+            exchange: str = "KRX",
+            reference_price: Decimal | None = None,
+        ) -> BrokerLiveMarketContext:
+            assert access_token
+            assert reference_price == Decimal("71050")
+            return BrokerLiveMarketContext(
+                symbol=symbol,
+                exchange=exchange,
+                observed_at=observed_at,
+                freshness_source="kis_exchange_orderbook_time",
+                bid=Decimal("71045"),
+                ask=Decimal("71055"),
+                spread=Decimal("10"),
+                spread_bps=Decimal("1.41"),
+                orderbook_depth=Decimal("450000000"),
+            )
+
+    broker_adapter = QuoteFailsAfterAgentAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="live",
+            configured=True,
+            api_base_url="https://broker.invalid",
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(broker_order_id="must-not-submit"),
+    )
+    app, engine, client, broker_adapter, _ = _build_trigger_agent_app(
+        monkeypatch=monkeypatch,
+        broker_adapter=broker_adapter,
+        account_snapshot_observed_at=observed_at,
+        settings_overrides={
+            "database_url": f"sqlite:///{tmp_path / 'trigger-cas-quote-failure.db'}",
+            "runtime_mode": "live",
+            "automation_enabled": True,
+            "monitoring_expire_prior_market_watch_buys_enabled": False,
+            "market_regime_guard_enabled": False,
+            "watch_buy_live_market_quality_veto_enabled": False,
+        },
+    )
+    item_id = _create_intraday_watch_buy(
+        client,
+        plan_id="plan-trigger-cas-quote-failure",
+    )
+
+    def blocking_agent_request(
+        *,
+        settings: Settings,
+        payload: dict[str, object],
+    ) -> dict[str, object]:
+        del settings
+        plan = payload["plan"]
+        signal_context = payload["signal_context"]
+        assert isinstance(plan, dict)
+        assert isinstance(signal_context, dict)
+        agent_entered.set()
+        assert release_agent.wait(timeout=3)
+        return {
+            "version": trigger_time_exec_agent.TRIGGER_TIME_EXEC_AGENT_VERSION,
+            "plan_id": plan["plan_id"],
+            "execution_plan_item_id": signal_context["execution_plan_item_id"],
+            "symbol": signal_context["symbol"],
+            "side": "buy",
+            "decision": "execute_now",
+            "quantity": 1,
+            "limit_price": "71050",
+            "reason": "fixture approval before unavailable quote",
+        }
+
+    monkeypatch.setattr(
+        trigger_time_exec_agent,
+        "_request_exec_agent_decision",
+        blocking_agent_request,
+    )
+    response_holder: dict[str, object] = {}
+
+    def evaluate() -> None:
+        price = _live_price_payload(observed_at=observed_at)
+        response_holder["response"] = client.post(
+            "/monitoring/evaluate",
+            json={
+                "actor": "ops",
+                "source": "test",
+                "reason": "expiry must win post-agent quote failure race",
+                "observed_at": observed_at.isoformat(),
+                "prices": [price],
+            },
+        )
+
+    thread = Thread(target=evaluate)
+    thread.start()
+    assert agent_entered.wait(timeout=3), json.dumps(
+        {key: value.json() for key, value in response_holder.items()}
+    )
+    with app.state.db_session_factory() as session:
+        item = session.get(ExecutionPlanItem, item_id)
+        assert item is not None
+        risk_context = dict(item.risk_context or {})
+        terminal_event = {
+            "event": "external_terminal_transition",
+            "status": "watch_expired",
+        }
+        risk_context["last_monitoring_event"] = terminal_event
+        item.status = "watch_expired"
+        item.risk_context = risk_context
+        session.commit()
+    release_agent.set()
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+
+    response = response_holder["response"]
+    assert response.status_code == 200
+    assert response.json()["submitted_order_count"] == 0
+    assert response.json()["items"][0]["block_reason"] == (
+        "trigger_time_exec_agent_claim_lost"
+    )
+    assert broker_adapter.order_calls == []
+    with app.state.db_session_factory() as session:
+        item = session.get(ExecutionPlanItem, item_id)
+        assert item is not None
+        assert item.status == "watch_expired"
+        assert item.risk_context["last_monitoring_event"] == terminal_event
+        assert "last_trigger_time_exec_agent_interaction" not in item.risk_context
+    engine.dispose()
+
+
+def test_live_trigger_time_approval_rechecks_trigger_with_fresh_broker_quote(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    initial_at = datetime(2026, 6, 5, 0, 30, tzinfo=UTC)
+
+    class RepricedBrokerAdapter(StubBrokerAdapter):
+        def get_current_price(
+            self,
+            access_token: str,
+            *,
+            symbol: str,
+            exchange: str = "KRX",
+        ) -> BrokerCurrentPrice | None:
+            assert access_token
+            self.current_price_calls.append((symbol, exchange))
+            return BrokerCurrentPrice(
+                symbol=symbol,
+                exchange=exchange,
+                price=Decimal("70900"),
+                observed_at=initial_at + timedelta(seconds=1),
+                payload={
+                    "output": {
+                        "stck_prpr": "70900",
+                        "acml_vol": "1250000",
+                        "acml_tr_pbmn": "88750000000",
+                        "stck_hgpr": "71100",
+                        "stck_lwpr": "70500",
+                    }
+                },
+            )
+
+        def get_live_market_context(
+            self,
+            access_token: str,
+            *,
+            symbol: str,
+            exchange: str = "KRX",
+            reference_price: Decimal | None = None,
+        ) -> BrokerLiveMarketContext | None:
+            assert access_token
+            assert reference_price == Decimal("70900")
+            return BrokerLiveMarketContext(
+                symbol=symbol,
+                exchange=exchange,
+                observed_at=initial_at + timedelta(seconds=1),
+                freshness_source="kis_exchange_orderbook_time",
+                bid=Decimal("70895"),
+                ask=Decimal("70905"),
+                spread=Decimal("10"),
+                spread_bps=Decimal("1.41"),
+                orderbook_depth=Decimal("450000000"),
+                orderbook_imbalance=Decimal("0.08"),
+            )
+
+    broker_adapter = RepricedBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="live",
+            configured=True,
+            api_base_url="https://broker.invalid",
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(broker_order_id="must-not-submit"),
+    )
+    app, engine, client, broker_adapter, captured = _build_trigger_agent_app(
+        monkeypatch=monkeypatch,
+        agent_responses=[
+            {
+                "decision": "execute_now",
+                "side": "buy",
+                "quantity": 3,
+                "reason": "initial trigger looked executable",
+                "context_staleness_ok": True,
+            }
+        ],
+        broker_adapter=broker_adapter,
+        account_snapshot_observed_at=initial_at,
+        settings_overrides={
+            "runtime_mode": "live",
+            "automation_enabled": True,
+            "monitoring_expire_prior_market_watch_buys_enabled": False,
+            "market_regime_guard_enabled": False,
+            "watch_buy_live_market_quality_veto_enabled": False,
+            "watch_buy_live_market_regime_downsize_allowed": True,
+        },
+    )
+    item_id = _create_intraday_watch_buy(
+        client,
+        plan_id="plan-live-trigger-agent-reprice",
+    )
+    initial_price = _live_price_payload(price="71050", observed_at=initial_at)
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "agent approval must be revalidated against broker truth",
+            "observed_at": initial_at.isoformat(),
+            "prices": [initial_price],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["submitted_order_count"] == 0
+    assert payload["items"][0]["outcome"] == "waiting", json.dumps(payload["items"][0])
+    assert payload["items"][0]["block_reason"] == "post_agent_trigger_not_met"
+    assert payload["items"][0]["observed_price"] == "70905.0000"
+    assert len(captured) == 1
+    assert broker_adapter.current_price_calls == [
+        ("005930", "KRX"),
+        ("005930", "KRX"),
+    ]
+    assert broker_adapter.order_calls == []
+
+    with app.state.db_session_factory() as session:
+        item = session.get(ExecutionPlanItem, item_id)
+        assert item is not None
+        assert item.status == "watch_monitoring_active"
+        assert item.risk_context["last_monitoring_event"]["event"] == (
+            "trigger_time_exec_agent_post_approval_revalidation_failed"
+        )
+        assert item.risk_context["last_monitoring_event"]["reason"] == (
+            "post_agent_trigger_not_met"
+        )
+
+    engine.dispose()
+
+
+def test_live_trigger_time_updated_trigger_cannot_put_target_below_fresh_entry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    initial_at = datetime(2026, 6, 5, 0, 30, tzinfo=UTC)
+
+    class RepricedAboveUpdatedTargetAdapter(StubBrokerAdapter):
+        def get_current_price(
+            self,
+            access_token: str,
+            *,
+            symbol: str,
+            exchange: str = "KRX",
+        ) -> BrokerCurrentPrice | None:
+            assert access_token
+            self.current_price_calls.append((symbol, exchange))
+            return BrokerCurrentPrice(
+                symbol=symbol,
+                exchange=exchange,
+                price=Decimal("72000"),
+                observed_at=initial_at + timedelta(seconds=1),
+                payload={
+                    "output": {
+                        "stck_prpr": "72000",
+                        "acml_vol": "1250000",
+                        "acml_tr_pbmn": "90000000000",
+                    }
+                },
+            )
+
+        def get_live_market_context(
+            self,
+            access_token: str,
+            *,
+            symbol: str,
+            exchange: str = "KRX",
+            reference_price: Decimal | None = None,
+        ) -> BrokerLiveMarketContext | None:
+            assert access_token
+            assert reference_price == Decimal("72000")
+            return BrokerLiveMarketContext(
+                symbol=symbol,
+                exchange=exchange,
+                observed_at=initial_at + timedelta(seconds=1),
+                freshness_source="kis_exchange_orderbook_time",
+                bid=Decimal("71995"),
+                ask=Decimal("72005"),
+                spread=Decimal("10"),
+                orderbook_depth=Decimal("450000000"),
+            )
+
+    broker_adapter = RepricedAboveUpdatedTargetAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="live",
+            configured=True,
+            api_base_url="https://broker.invalid",
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(broker_order_id="must-not-submit"),
+    )
+    app, engine, client, broker_adapter, captured = _build_trigger_agent_app(
+        monkeypatch=monkeypatch,
+        agent_responses=[
+            {
+                "decision": "execute_now",
+                "side": "buy",
+                "quantity": 2,
+                "updated_trigger_price": "71000",
+                "updated_target_price": "71500",
+                "updated_stop_price": "70000",
+                "reason": "fresh pullback reclaim remains confirmed",
+                "risk_notes": ["reclaim remains valid"],
+                "confidence": "0.72",
+                "context_staleness_ok": True,
+            }
+        ],
+        broker_adapter=broker_adapter,
+        account_snapshot_observed_at=initial_at,
+        settings_overrides={
+            "runtime_mode": "live",
+            "automation_enabled": True,
+            "monitoring_expire_prior_market_watch_buys_enabled": False,
+            "market_regime_guard_enabled": False,
+            "watch_buy_live_market_quality_veto_enabled": False,
+            "watch_buy_live_market_regime_downsize_allowed": True,
+        },
+    )
+    item_id = _create_intraday_watch_buy(
+        client,
+        plan_id="plan-live-trigger-agent-target-below-fresh-entry",
+    )
+    initial_price = _live_price_payload(
+        price="71050",
+        day_low="70000",
+        day_high="72500",
+        observed_at=initial_at,
+    )
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "updated trigger must not replace the fresh entry reference",
+            "observed_at": initial_at.isoformat(),
+            "prices": [initial_price],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["submitted_order_count"] == 0
+    assert payload["items"][0]["outcome"] == "agent_delay", json.dumps(
+        payload["items"][0]
+    )
+    assert payload["items"][0]["block_reason"] == (
+        "post_agent_invalid_target_stop_geometry"
+    )
+    assert len(captured) == 1
+    assert broker_adapter.order_calls == []
+
+    with app.state.db_session_factory() as session:
+        item = session.get(ExecutionPlanItem, item_id)
+        assert item is not None
+        assert item.status == "agent_delay"
+        assert item.risk_context["target_price"] == "72420.00"
+        assert "updated_target_price" not in item.risk_context
+        assert item.risk_context["last_monitoring_event"]["reason"] == (
+            "post_agent_invalid_target_stop_geometry"
+        )
+
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("agent_limit_price", "updated_target_price", "stored_target_price"),
+    [
+        pytest.param(
+            "72100",
+            "72002",
+            "72420.00",
+            id="fresh-ask-cap-above-last",
+        ),
+        pytest.param(
+            "71995",
+            "71998",
+            "72420.00",
+            id="fresh-last-above-resting-limit",
+        ),
+        pytest.param(
+            "71995",
+            None,
+            None,
+            id="legacy-missing-effective-target",
+        ),
+    ],
+)
+def test_live_trigger_time_requires_profitable_effective_target_above_entry(
+    monkeypatch: pytest.MonkeyPatch,
+    agent_limit_price: str,
+    updated_target_price: str | None,
+    stored_target_price: str | None,
+) -> None:
+    initial_at = datetime(2026, 6, 5, 0, 30, tzinfo=UTC)
+
+    class RepricedWithHigherAskAdapter(StubBrokerAdapter):
+        def get_current_price(
+            self,
+            access_token: str,
+            *,
+            symbol: str,
+            exchange: str = "KRX",
+        ) -> BrokerCurrentPrice | None:
+            assert access_token
+            self.current_price_calls.append((symbol, exchange))
+            return BrokerCurrentPrice(
+                symbol=symbol,
+                exchange=exchange,
+                price=Decimal("72000"),
+                observed_at=initial_at + timedelta(seconds=1),
+                payload={
+                    "output": {
+                        "stck_prpr": "72000",
+                        "acml_vol": "1250000",
+                        "acml_tr_pbmn": "90000000000",
+                    }
+                },
+            )
+
+        def get_live_market_context(
+            self,
+            access_token: str,
+            *,
+            symbol: str,
+            exchange: str = "KRX",
+            reference_price: Decimal | None = None,
+        ) -> BrokerLiveMarketContext | None:
+            assert access_token
+            assert reference_price == Decimal("72000")
+            return BrokerLiveMarketContext(
+                symbol=symbol,
+                exchange=exchange,
+                observed_at=initial_at + timedelta(seconds=1),
+                freshness_source="kis_exchange_orderbook_time",
+                bid=Decimal("71995"),
+                ask=Decimal("72005"),
+                spread=Decimal("10"),
+                orderbook_depth=Decimal("450000000"),
+            )
+
+    broker_adapter = RepricedWithHigherAskAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="live",
+            configured=True,
+            api_base_url="https://broker.invalid",
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(broker_order_id="must-not-submit"),
+    )
+    app, engine, client, broker_adapter, captured = _build_trigger_agent_app(
+        monkeypatch=monkeypatch,
+        agent_responses=[
+            {
+                "decision": "execute_now",
+                "side": "buy",
+                "quantity": 2,
+                "limit_price": agent_limit_price,
+                "updated_trigger_price": (
+                    "71000" if updated_target_price is not None else None
+                ),
+                "updated_target_price": updated_target_price,
+                "updated_stop_price": "70000",
+                "reason": "fresh execution remains acceptable",
+                "risk_notes": ["target must remain above every entry reference"],
+                "confidence": "0.72",
+                "context_staleness_ok": True,
+            }
+        ],
+        broker_adapter=broker_adapter,
+        account_snapshot_observed_at=initial_at,
+        settings_overrides={
+            "runtime_mode": "live",
+            "automation_enabled": True,
+            "monitoring_expire_prior_market_watch_buys_enabled": False,
+            "market_regime_guard_enabled": False,
+            "watch_buy_live_market_quality_veto_enabled": False,
+            "watch_buy_live_market_regime_downsize_allowed": True,
+        },
+    )
+    item_id = _create_intraday_watch_buy(
+        client,
+        plan_id=(
+            "plan-live-trigger-agent-target-below-executable-entry-"
+            f"{agent_limit_price}"
+        ),
+        risk_context_extra={"target_price": stored_target_price},
+    )
+    initial_price = _live_price_payload(
+        price="71050",
+        day_low="70000",
+        day_high="72500",
+        observed_at=initial_at,
+    )
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "target must exceed the conservative executable entry reference",
+            "observed_at": initial_at.isoformat(),
+            "prices": [initial_price],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["submitted_order_count"] == 0
+    assert payload["items"][0]["outcome"] == "agent_delay", json.dumps(
+        payload["items"][0]
+    )
+    assert payload["items"][0]["block_reason"] == (
+        "post_agent_invalid_target_stop_geometry"
+    )
+    assert len(captured) == 1
+    assert broker_adapter.order_calls == []
+
+    with app.state.db_session_factory() as session:
+        item = session.get(ExecutionPlanItem, item_id)
+        assert item is not None
+        assert item.status == "agent_delay"
+        assert item.risk_context.get("target_price") == stored_target_price
+        assert "updated_target_price" not in item.risk_context
+        assert item.risk_context["last_monitoring_event"]["reason"] == (
+            "post_agent_invalid_target_stop_geometry"
+        )
+
+    engine.dispose()
+
+
+def test_live_trigger_time_approval_rejects_stale_refreshed_orderbook(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    initial_at = datetime(2026, 6, 5, 0, 30, tzinfo=UTC)
+
+    class StaleOrderbookAdapter(StubBrokerAdapter):
+        context_call_count = 0
+
+        def get_current_price(
+            self,
+            access_token: str,
+            *,
+            symbol: str,
+            exchange: str = "KRX",
+        ) -> BrokerCurrentPrice | None:
+            assert access_token
+            return BrokerCurrentPrice(
+                symbol=symbol,
+                exchange=exchange,
+                price=Decimal("71060"),
+                observed_at=initial_at + timedelta(seconds=1),
+                payload={
+                    "output": {
+                        "stck_prpr": "71060",
+                        "acml_vol": "1250000",
+                        "acml_tr_pbmn": "88750000000",
+                    }
+                },
+            )
+
+        def get_live_market_context(
+            self,
+            access_token: str,
+            *,
+            symbol: str,
+            exchange: str = "KRX",
+            reference_price: Decimal | None = None,
+        ) -> BrokerLiveMarketContext | None:
+            assert access_token
+            assert reference_price == Decimal("71060")
+            self.context_call_count += 1
+            return BrokerLiveMarketContext(
+                symbol=symbol,
+                exchange=exchange,
+                observed_at=(
+                    initial_at + timedelta(seconds=1)
+                    if self.context_call_count == 1
+                    else initial_at - timedelta(seconds=60)
+                ),
+                freshness_source="kis_exchange_orderbook_time",
+                bid=Decimal("71055"),
+                ask=Decimal("71065"),
+                spread=Decimal("10"),
+                orderbook_depth=Decimal("450000000"),
+            )
+
+    broker_adapter = StaleOrderbookAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="live",
+            configured=True,
+            api_base_url="https://broker.invalid",
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(broker_order_id="must-not-submit"),
+    )
+    app, engine, client, broker_adapter, _captured = _build_trigger_agent_app(
+        monkeypatch=monkeypatch,
+        agent_responses=[
+            {
+                "decision": "execute_now",
+                "side": "buy",
+                "quantity": 3,
+                "reason": "initial trigger looked executable",
+                "context_staleness_ok": True,
+            }
+        ],
+        broker_adapter=broker_adapter,
+        account_snapshot_observed_at=initial_at,
+        settings_overrides={
+            "runtime_mode": "live",
+            "automation_enabled": True,
+            "monitoring_expire_prior_market_watch_buys_enabled": False,
+            "market_regime_guard_enabled": False,
+            "watch_buy_live_market_quality_veto_enabled": False,
+            "watch_buy_live_market_regime_downsize_allowed": True,
+        },
+    )
+    _create_intraday_watch_buy(
+        client,
+        plan_id="plan-live-trigger-agent-stale-orderbook",
+    )
+    initial_price = _live_price_payload(price="71050", observed_at=initial_at)
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "stale refreshed orderbook must fail closed",
+            "observed_at": initial_at.isoformat(),
+            "prices": [initial_price],
+        },
+    )
+
+    assert response.status_code == 200
+    item = response.json()["items"][0]
+    assert item["outcome"] == "agent_delay"
+    assert item["block_reason"] == "post_agent_market_quality_unavailable"
+    assert "quote is stale" in item["message"]
+    assert broker_adapter.order_calls == []
+    engine.dispose()
+
+
+def test_live_trigger_time_approval_caps_limit_and_resizes_against_final_price(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    initial_at = datetime(2026, 6, 5, 0, 30, tzinfo=UTC)
+
+    class FreshExecutableAdapter(StubBrokerAdapter):
+        def get_current_price(
+            self,
+            access_token: str,
+            *,
+            symbol: str,
+            exchange: str = "KRX",
+        ) -> BrokerCurrentPrice | None:
+            assert access_token
+            self.current_price_calls.append((symbol, exchange))
+            return BrokerCurrentPrice(
+                symbol=symbol,
+                exchange=exchange,
+                price=Decimal("71000"),
+                observed_at=initial_at + timedelta(seconds=1),
+                payload={
+                    "output": {
+                        "stck_prpr": "71000",
+                        "acml_vol": "1250000",
+                        "acml_tr_pbmn": "88750000000",
+                    }
+                },
+            )
+
+        def get_live_market_context(
+            self,
+            access_token: str,
+            *,
+            symbol: str,
+            exchange: str = "KRX",
+            reference_price: Decimal | None = None,
+        ) -> BrokerLiveMarketContext | None:
+            assert access_token
+            assert reference_price in {Decimal("71000"), Decimal("71001")}
+            return BrokerLiveMarketContext(
+                symbol=symbol,
+                exchange=exchange,
+                observed_at=initial_at + timedelta(seconds=1),
+                freshness_source="kis_exchange_orderbook_time",
+                bid=Decimal("70999"),
+                ask=Decimal("71001"),
+                spread=Decimal("2"),
+                orderbook_depth=Decimal("450000000"),
+            )
+
+    broker_adapter = FreshExecutableAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="live",
+            configured=True,
+            api_base_url="https://broker.invalid",
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(broker_order_id="fresh-limit-order"),
+    )
+    app, engine, client, broker_adapter, _captured = _build_trigger_agent_app(
+        monkeypatch=monkeypatch,
+        agent_responses=[
+            {
+                "decision": "execute_now",
+                "side": "buy",
+                "quantity": 2,
+                "limit_price": "71010",
+                "reason": "initial trigger looked executable",
+                "context_staleness_ok": True,
+            }
+        ],
+        broker_adapter=broker_adapter,
+        account_snapshot_observed_at=initial_at,
+        settings_overrides={
+            "runtime_mode": "live",
+            "automation_enabled": True,
+            "monitoring_expire_prior_market_watch_buys_enabled": False,
+            "market_regime_guard_enabled": False,
+            "watch_buy_live_market_quality_veto_enabled": False,
+            "watch_buy_live_market_regime_downsize_allowed": True,
+        },
+    )
+    item_id = _create_intraday_watch_buy(
+        client,
+        plan_id="plan-live-trigger-agent-fresh-limit",
+        max_safe_notional_krw="142000",
+        risk_context_extra={"target_price": "74500"},
+    )
+    initial_price = _live_price_payload(price="71000", observed_at=initial_at)
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "old agent limit must be bounded by fresh ask",
+            "observed_at": initial_at.isoformat(),
+            "prices": [initial_price],
+        },
+    )
+
+    assert response.status_code == 200
+    item = response.json()["items"][0]
+    assert item["outcome"] == "submitted", json.dumps(item)
+    assert item["observed_price"] == "71001.0000"
+    assert len(broker_adapter.order_calls) == 1
+    assert broker_adapter.order_calls[0].quantity == 1
+    assert broker_adapter.order_calls[0].limit_price == Decimal("71001")
+
+    with app.state.db_session_factory() as session:
+        persisted = session.get(ExecutionPlanItem, item_id)
+        assert persisted is not None
+        sizing_events = [
+            event
+            for event in persisted.risk_context["monitoring_events"]
+            if event["event"] == "watch_buy_risk_sized"
+        ]
+        assert sizing_events[-1]["approved_notional"] == "71001.0000"
+    engine.dispose()
+
+
+def test_live_trigger_time_revalidation_age_includes_refresh_latency(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    initial_at = datetime(2026, 6, 5, 0, 30, tzinfo=UTC)
+
+    class SlowContextAdapter(StubBrokerAdapter):
+        def get_current_price(
+            self,
+            access_token: str,
+            *,
+            symbol: str,
+            exchange: str = "KRX",
+        ) -> BrokerCurrentPrice | None:
+            assert access_token
+            return BrokerCurrentPrice(
+                symbol=symbol,
+                exchange=exchange,
+                price=Decimal("71060"),
+                observed_at=initial_at,
+                payload={
+                    "output": {
+                        "stck_prpr": "71060",
+                        "acml_vol": "1250000",
+                        "acml_tr_pbmn": "88750000000",
+                    }
+                },
+            )
+
+        def get_live_market_context(
+            self,
+            access_token: str,
+            *,
+            symbol: str,
+            exchange: str = "KRX",
+            reference_price: Decimal | None = None,
+        ) -> BrokerLiveMarketContext | None:
+            assert access_token
+            time.sleep(1.1)
+            return BrokerLiveMarketContext(
+                symbol=symbol,
+                exchange=exchange,
+                observed_at=initial_at,
+                freshness_source="kis_exchange_orderbook_time",
+                bid=Decimal("71055"),
+                ask=Decimal("71065"),
+                spread=Decimal("10"),
+                orderbook_depth=Decimal("450000000"),
+            )
+
+    broker_adapter = SlowContextAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="live",
+            configured=True,
+            api_base_url="https://broker.invalid",
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(broker_order_id="must-not-submit"),
+    )
+    app, engine, client, broker_adapter, _captured = _build_trigger_agent_app(
+        monkeypatch=monkeypatch,
+        agent_responses=[
+            {
+                "decision": "execute_now",
+                "side": "buy",
+                "quantity": 3,
+                "reason": "initial trigger looked executable",
+                "context_staleness_ok": True,
+            }
+        ],
+        broker_adapter=broker_adapter,
+        account_snapshot_observed_at=initial_at,
+        settings_overrides={
+            "runtime_mode": "live",
+            "automation_enabled": True,
+            "monitoring_max_quote_age_seconds": 1,
+            "monitoring_expire_prior_market_watch_buys_enabled": False,
+            "market_regime_guard_enabled": False,
+            "watch_buy_live_market_quality_veto_enabled": False,
+            "watch_buy_live_market_regime_downsize_allowed": True,
+        },
+    )
+    _create_intraday_watch_buy(
+        client,
+        plan_id="plan-live-trigger-agent-refresh-latency",
+    )
+    initial_price = _live_price_payload(price="71050", observed_at=initial_at)
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "refresh latency must count against quote freshness",
+            "observed_at": initial_at.isoformat(),
+            "prices": [initial_price],
+        },
+    )
+
+    assert response.status_code == 200
+    item = response.json()["items"][0]
+    assert item["outcome"] == "agent_delay"
+    assert item["block_reason"] == "post_agent_market_quality_unavailable"
+    assert "stale" in item["message"]
+    assert broker_adapter.order_calls == []
+    engine.dispose()
+
+
+def test_live_watch_buy_fails_closed_when_fresh_quote_ages_before_submit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    initial_at = datetime(2026, 6, 5, 0, 30, tzinfo=UTC)
+    monotonic_clock = {"value": 100.0}
+    monkeypatch.setattr(
+        monitoring.time,
+        "monotonic",
+        lambda: monotonic_clock["value"],
+    )
+
+    class SlowPostQuoteAccountAdapter(StubBrokerAdapter):
+        quote_refreshed = False
+
+        def get_current_price(
+            self,
+            access_token: str,
+            *,
+            symbol: str,
+            exchange: str = "KRX",
+        ) -> BrokerCurrentPrice | None:
+            assert access_token
+            self.current_price_calls.append((symbol, exchange))
+            self.quote_refreshed = len(self.current_price_calls) > 1
+            return BrokerCurrentPrice(
+                symbol=symbol,
+                exchange=exchange,
+                price=Decimal("71060"),
+                observed_at=initial_at + timedelta(seconds=1),
+                payload={
+                    "output": {
+                        "stck_prpr": "71060",
+                        "acml_vol": "1250000",
+                        "acml_tr_pbmn": "88750000000",
+                    }
+                },
+            )
+
+        def get_live_market_context(
+            self,
+            access_token: str,
+            *,
+            symbol: str,
+            exchange: str = "KRX",
+            reference_price: Decimal | None = None,
+        ) -> BrokerLiveMarketContext | None:
+            assert access_token
+            assert reference_price == Decimal("71060")
+            return BrokerLiveMarketContext(
+                symbol=symbol,
+                exchange=exchange,
+                observed_at=initial_at + timedelta(seconds=1),
+                freshness_source="kis_exchange_orderbook_time",
+                bid=Decimal("71055"),
+                ask=Decimal("71065"),
+                spread=Decimal("10"),
+                orderbook_depth=Decimal("450000000"),
+            )
+
+        def get_account_snapshot(self, access_token: str, **kwargs: object):
+            snapshot = super().get_account_snapshot(access_token, **kwargs)
+            if self.quote_refreshed:
+                monotonic_clock["value"] += 3.0
+                self.quote_refreshed = False
+            return snapshot
+
+    broker_adapter = SlowPostQuoteAccountAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="live",
+            configured=True,
+            api_base_url="https://broker.invalid",
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(broker_order_id="must-not-submit"),
+    )
+    app, engine, client, broker_adapter, _captured = _build_trigger_agent_app(
+        monkeypatch=monkeypatch,
+        agent_responses=[
+            {
+                "decision": "execute_now",
+                "side": "buy",
+                "quantity": 2,
+                "limit_price": "71065",
+                "updated_target_price": "74500",
+                "updated_stop_price": "70000",
+                "reason": "initial refreshed context is executable",
+                "risk_notes": ["quote must remain fresh through submission"],
+                "confidence": "0.72",
+                "context_staleness_ok": True,
+            }
+        ],
+        broker_adapter=broker_adapter,
+        account_snapshot_observed_at=initial_at,
+        settings_overrides={
+            "runtime_mode": "live",
+            "automation_enabled": True,
+            "monitoring_expire_prior_market_watch_buys_enabled": False,
+            "monitoring_max_quote_age_seconds": 1,
+            "market_regime_guard_enabled": False,
+            "watch_buy_live_market_quality_veto_enabled": False,
+            "watch_buy_live_market_regime_downsize_allowed": True,
+        },
+    )
+    item_id = _create_intraday_watch_buy(
+        client,
+        plan_id="plan-live-trigger-agent-pre-submit-stale-quote",
+    )
+    initial_price = _live_price_payload(price="71050", observed_at=initial_at)
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "account lookup latency must not outlive the accepted quote",
+            "observed_at": initial_at.isoformat(),
+            "prices": [initial_price],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["submitted_order_count"] == 0
+    assert payload["items"][0]["outcome"] == "blocked", json.dumps(
+        payload["items"][0]
+    )
+    assert payload["items"][0]["block_reason"] == "pre_submit_quote_stale"
+    assert broker_adapter.order_calls == []
+
+    with app.state.db_session_factory() as session:
+        item = session.get(ExecutionPlanItem, item_id)
+        assert item is not None
+        assert item.status == "watch_buy_triggered_blocked"
+        assert item.risk_context["last_monitoring_event"]["reason"] == (
+            "pre_submit_quote_stale"
+        )
+
+    engine.dispose()
+
+
+def test_live_trigger_time_revalidation_rejects_override_stop_above_fresh_quote(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    initial_at = datetime(2026, 6, 5, 0, 30, tzinfo=UTC)
+
+    class RepricedBelowOverrideStopAdapter(StubBrokerAdapter):
+        def get_current_price(
+            self,
+            access_token: str,
+            *,
+            symbol: str,
+            exchange: str = "KRX",
+        ) -> BrokerCurrentPrice | None:
+            assert access_token
+            self.current_price_calls.append((symbol, exchange))
+            return BrokerCurrentPrice(
+                symbol=symbol,
+                exchange=exchange,
+                price=Decimal("71010"),
+                observed_at=initial_at + timedelta(seconds=1),
+                payload={
+                    "output": {
+                        "stck_prpr": "71010",
+                        "acml_vol": "1250000",
+                        "acml_tr_pbmn": "88750000000",
+                    }
+                },
+            )
+
+        def get_live_market_context(
+            self,
+            access_token: str,
+            *,
+            symbol: str,
+            exchange: str = "KRX",
+            reference_price: Decimal | None = None,
+        ) -> BrokerLiveMarketContext | None:
+            assert access_token
+            assert reference_price == Decimal("71010")
+            return BrokerLiveMarketContext(
+                symbol=symbol,
+                exchange=exchange,
+                observed_at=initial_at + timedelta(seconds=1),
+                freshness_source="kis_exchange_orderbook_time",
+                bid=Decimal("71005"),
+                ask=Decimal("71015"),
+                spread=Decimal("10"),
+                orderbook_depth=Decimal("450000000"),
+            )
+
+    broker_adapter = RepricedBelowOverrideStopAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="live",
+            configured=True,
+            api_base_url="https://broker.invalid",
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(broker_order_id="must-not-submit"),
+    )
+    app, engine, client, broker_adapter, captured = _build_trigger_agent_app(
+        monkeypatch=monkeypatch,
+        agent_responses=[
+            {
+                "decision": "execute_now",
+                "side": "buy",
+                "quantity": 2,
+                "updated_target_price": "72400.00",
+                "updated_stop_price": "70000.00",
+                "reason": "agent attempts to retain the original looser stop",
+                "risk_notes": ["runtime must preserve the override stop"],
+                "confidence": "0.74",
+                "context_staleness_ok": True,
+            }
+        ],
+        broker_adapter=broker_adapter,
+        account_snapshot_observed_at=initial_at,
+        settings_overrides={
+            "runtime_mode": "live",
+            "automation_enabled": True,
+            "monitoring_expire_prior_market_watch_buys_enabled": False,
+            "market_regime_guard_enabled": False,
+            "watch_buy_live_market_quality_veto_enabled": False,
+            "watch_buy_live_market_regime_downsize_allowed": True,
+            "watch_buy_high_volatility_chase_veto_enabled": True,
+        },
+    )
+    item_id = _create_intraday_watch_buy(
+        client,
+        plan_id="plan-live-trigger-agent-override-stop-reprice",
+        risk_context_extra=_high_volatility_context(
+            override={
+                "enabled": True,
+                "reason": "stronger strategy signal confirms the initial breakout",
+                "tighter_stop_price": "71020.00",
+            },
+        ),
+    )
+    initial_price = _live_price_payload(
+        price="71050",
+        day_low="70000",
+        day_high="72500",
+        observed_at=initial_at,
+    )
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "fresh quote must remain above the enforced override stop",
+            "observed_at": initial_at.isoformat(),
+            "prices": [initial_price],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["submitted_order_count"] == 0
+    assert payload["items"][0]["outcome"] == "agent_delay", json.dumps(
+        payload["items"][0]
+    )
+    assert payload["items"][0]["block_reason"] == (
+        "post_agent_invalid_target_stop_geometry"
+    )
+    assert len(captured) == 1
+    assert broker_adapter.order_calls == []
+
+    with app.state.db_session_factory() as session:
+        item = session.get(ExecutionPlanItem, item_id)
+        assert item is not None
+        assert item.status == "agent_delay"
+        assert item.risk_context["target_price"] == "72420.00"
+        assert "updated_target_price" not in item.risk_context
+        assert "trigger_time_override_stop_enforcement" not in item.risk_context
+        assert item.risk_context["last_monitoring_event"]["reason"] == (
+            "post_agent_invalid_target_stop_geometry"
+        )
+
+    engine.dispose()
+
+
+def test_trigger_time_agent_cannot_approve_reward_risk_below_runtime_floor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed_at = datetime(2026, 6, 5, 0, 30, tzinfo=UTC)
+    app, engine, client, broker_adapter, _ = _build_trigger_agent_app(
+        monkeypatch=monkeypatch,
+        agent_responses=[
+            {
+                "decision": "execute_now",
+                "side": "buy",
+                "quantity": 2,
+                "updated_target_price": "71700",
+                "updated_stop_price": "70500",
+                "reason": "agent accepts a geometrically valid but low-edge trade",
+                "context_staleness_ok": True,
+            }
+        ],
+        account_snapshot_observed_at=observed_at,
+    )
+    _create_intraday_watch_buy(
+        client,
+        plan_id="plan-trigger-agent-low-reward-risk",
+        risk_context_extra={"estimated_round_trip_cost_bps": "20"},
+    )
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "deterministic economics must constrain the agent",
+            "observed_at": observed_at.isoformat(),
+            "prices": [_live_price_payload()],
+        },
+    )
+
+    item = response.json()["items"][0]
+    assert item["outcome"] == "agent_delay"
+    assert item["block_reason"] == "post_agent_reward_risk_below_minimum"
+    assert broker_adapter.order_calls == []
+    engine.dispose()
+
+
+def test_trigger_time_agent_cost_adjusted_edge_uses_only_persisted_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed_at = datetime(2026, 6, 5, 0, 30, tzinfo=UTC)
+    app, engine, client, broker_adapter, _ = _build_trigger_agent_app(
+        monkeypatch=monkeypatch,
+        agent_responses=[
+            {
+                "decision": "execute_now",
+                "side": "buy",
+                "quantity": 2,
+                "updated_target_price": "71805",
+                "updated_stop_price": "70500",
+                "reason": "agent approval cannot erase supplied transaction costs",
+                "risk_notes": ["claimed low costs are not authoritative"],
+                "context_staleness_ok": True,
+            }
+        ],
+        account_snapshot_observed_at=observed_at,
+    )
+    _create_intraday_watch_buy(
+        client,
+        plan_id="plan-trigger-agent-net-edge",
+        risk_context_extra={"fee_bps": "50"},
+    )
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "persisted costs must be deducted after agent adjustments",
+            "observed_at": observed_at.isoformat(),
+            "prices": [_live_price_payload()],
+        },
+    )
+
+    item = response.json()["items"][0]
+    assert item["outcome"] == "agent_delay"
+    assert item["block_reason"] == "post_agent_net_reward_risk_below_minimum"
+    assert broker_adapter.order_calls == []
+    engine.dispose()
+
+
+def test_trigger_time_cost_model_replaces_stale_slippage_with_fresh_spread() -> None:
+    item = ExecutionPlanItem(
+        symbol="005930",
+        side="buy",
+        intent="intraday_watch_buy",
+        risk_context={"estimated_round_trip_cost_bps": "999", "fee_bps": "4"},
+    )
+
+    evidence = monitoring._post_agent_live_cost_evidence(
+        settings=Settings(),
+        item=item,
+        market_context={"spread_bps": "6"},
+    )
+    assessment = assess_buy_economics(
+        reference_price=Decimal("100"),
+        target_price=Decimal("110"),
+        stop_price=Decimal("95"),
+        minimum_reward_risk=Decimal("1.30"),
+        evidence=evidence,
+        require_cost_evidence=True,
+    )
+
+    assert assessment.estimated_round_trip_cost_bps == Decimal("56.0000")
+    assert assessment.cost_evidence_source == (
+        "settings:kis_krx_round_trip_non_spread_cost_bps+live_quote_spread_bps"
+    )
+
+
+def test_live_cost_policy_cannot_be_reduced_by_candidate_or_agent_values() -> None:
+    evidence = configured_execution_cost_evidence(
+        settings=Settings(kis_krx_round_trip_non_spread_cost_bps=Decimal("50")),
+        provider="kis",
+        asset_class="stock",
+        exchange="KRX",
+        live_quote_spread_bps="6",
+        require_live_quote_spread=True,
+    )
+    evidence["estimated_round_trip_cost_bps"] = "0"
+    evidence["exec_agent_decision"] = {
+        "estimated_round_trip_cost_bps": "0",
+        "fee_bps": "0",
+    }
+
+    assessment = assess_buy_economics(
+        reference_price=Decimal("100"),
+        target_price=Decimal("110"),
+        stop_price=Decimal("95"),
+        minimum_reward_risk=Decimal("1.30"),
+        evidence=evidence,
+        require_cost_evidence=True,
+    )
+
+    assert assessment.estimated_round_trip_cost_bps == Decimal("56.0000")
+    assert assessment.cost_evidence_source == (
+        "settings:kis_krx_round_trip_non_spread_cost_bps+live_quote_spread_bps"
+    )
+
+
+def test_live_cost_policy_accepts_explicit_zero_plus_fresh_spread() -> None:
+    evidence = configured_execution_cost_evidence(
+        settings=Settings(alpaca_us_equity_round_trip_non_spread_cost_bps=Decimal("0")),
+        provider="alpaca",
+        asset_class="us_equity",
+        exchange="NASD",
+        live_quote_spread_bps="7.5",
+        require_live_quote_spread=True,
+    )
+    assessment = assess_buy_economics(
+        reference_price=Decimal("100"),
+        target_price=Decimal("110"),
+        stop_price=Decimal("95"),
+        minimum_reward_risk=Decimal("1.30"),
+        evidence=evidence,
+        require_cost_evidence=True,
+    )
+
+    assert assessment.reason is None
+    assert assessment.estimated_round_trip_cost_bps == Decimal("7.5000")
+    assert assessment.cost_evidence_source == (
+        "settings:alpaca_us_equity_round_trip_non_spread_cost_bps+live_quote_spread_bps"
+    )
+
+
+@pytest.mark.parametrize(
+    ("provider", "asset_class", "exchange"),
+    [
+        ("unknown", "stock", "KRX"),
+        ("kis", "us_equity", "NASD"),
+    ],
+)
+def test_live_cost_policy_fails_closed_for_unconfigured_route(
+    provider: str,
+    asset_class: str,
+    exchange: str,
+) -> None:
+    evidence = configured_execution_cost_evidence(
+        settings=Settings(kis_us_round_trip_non_spread_cost_bps=None),
+        provider=provider,
+        asset_class=asset_class,
+        exchange=exchange,
+        live_quote_spread_bps="5",
+        require_live_quote_spread=True,
+    )
+    assessment = assess_buy_economics(
+        reference_price=Decimal("100"),
+        target_price=Decimal("110"),
+        stop_price=Decimal("95"),
+        minimum_reward_risk=Decimal("1.30"),
+        evidence=evidence,
+        require_cost_evidence=True,
+    )
+
+    assert assessment.reason == "transaction_cost_evidence_missing"
+    assert assessment.cost_evidence_source is None
+
+
+def test_live_cost_policy_fails_closed_without_fresh_spread() -> None:
+    evidence = configured_execution_cost_evidence(
+        settings=Settings(),
+        provider="kis",
+        asset_class="stock",
+        exchange="KRX",
+        live_quote_spread_bps=None,
+        require_live_quote_spread=True,
+    )
+    assessment = assess_buy_economics(
+        reference_price=Decimal("100"),
+        target_price=Decimal("110"),
+        stop_price=Decimal("95"),
+        minimum_reward_risk=Decimal("1.30"),
+        evidence=evidence,
+        require_cost_evidence=True,
+    )
+
+    assert assessment.reason == "transaction_cost_evidence_invalid"
+
+
+def test_execution_cost_policy_env_override_is_validated() -> None:
+    settings = load_settings(
+        {"KAI_EXEC_KIS_KRX_ROUND_TRIP_NON_SPREAD_COST_BPS": "75"}
+    )
+    assert settings.kis_krx_round_trip_non_spread_cost_bps == Decimal("75")
+
+    with pytest.raises(ValidationError):
+        load_settings(
+            {"KAI_EXEC_KIS_KRX_ROUND_TRIP_NON_SPREAD_COST_BPS": "-0.01"}
+        )
+
+
+def test_trigger_time_agent_cannot_override_non_recomputable_core_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed_at = datetime(2026, 6, 5, 0, 30, tzinfo=UTC)
+    app, engine, client, broker_adapter, _ = _build_trigger_agent_app(
+        monkeypatch=monkeypatch,
+        agent_responses=[
+            {
+                "decision": "execute_now",
+                "side": "buy",
+                "quantity": 2,
+                "updated_target_price": "74000",
+                "updated_stop_price": "70000",
+                "reason": "agent cannot escalate a failed delegated gate",
+                "context_staleness_ok": True,
+            }
+        ],
+        account_snapshot_observed_at=observed_at,
+    )
+    _create_intraday_watch_buy(
+        client,
+        plan_id="plan-trigger-agent-delegated-gate",
+        risk_context_extra={
+            "delegated_gate_codes": [
+                "short_term_buy_quality_score_block_delegated_to_exec_watch"
+            ],
+            "delegated_gate_confirmation_required": True,
+            "validation": {
+                "short_term_entry_quality": {
+                    "schema_version": "short_term_entry_quality_v2",
+                    "buy_quality_score": "49",
+                }
+            },
+            "execution_feasibility_context": {
+                "expected_slippage_bps": "12",
+                "expected_slippage_basis": "quote_spread_bps",
+            },
+        },
+    )
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "Core delegated gates remain deterministic at submission",
+            "observed_at": observed_at.isoformat(),
+            "prices": [_live_price_payload()],
+        },
+    )
+
+    item = response.json()["items"][0]
+    assert item["outcome"] == "agent_delay"
+    assert item["block_reason"] == (
+        "post_agent_delegated_gate_unknown:"
+        "short_term_buy_quality_score_block_delegated_to_exec_watch"
+    )
+    assert broker_adapter.order_calls == []
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    (
+        "live_turnover",
+        "with_delegated_contract",
+        "expected_outcome",
+        "expected_block_reason",
+        "expected_liquidity_calls",
+    ),
+    [
+        ("3500000000", True, "submitted", None, 2),
+        (
+            "2500000000",
+            True,
+            "agent_delay",
+            "post_agent_delegated_gate_failed:"
+            "short_term_liquidity_floor_block_delegated_to_exec_watch",
+            1,
+        ),
+        (
+            "2900000000",
+            False,
+            "agent_delay",
+            "post_agent_short_term_live_turnover_below_minimum",
+            1,
+        ),
+    ],
+)
+def test_trigger_time_rechecks_structured_core_dynamic_gates(
+    monkeypatch: pytest.MonkeyPatch,
+    live_turnover: str,
+    with_delegated_contract: bool,
+    expected_outcome: str,
+    expected_block_reason: str | None,
+    expected_liquidity_calls: int,
+) -> None:
+    observed_at = datetime(2026, 6, 5, 0, 30, tzinfo=UTC)
+
+    class TimestampedLiquidityAdapter(StubBrokerAdapter):
+        def __init__(self, **kwargs: object) -> None:
+            super().__init__(**kwargs)
+            self.liquidity_calls: list[tuple[str, str, datetime]] = []
+
+        def get_current_price(
+            self,
+            access_token: str,
+            *,
+            symbol: str,
+            exchange: str = "KRX",
+        ) -> BrokerCurrentPrice:
+            assert access_token
+            self.current_price_calls.append((symbol, exchange))
+            return BrokerCurrentPrice(
+                symbol=symbol,
+                exchange=exchange,
+                price=Decimal("71050"),
+                observed_at=observed_at + timedelta(seconds=1),
+                freshness_source="transport_received_at_untrusted",
+                payload={"output": {"stck_prpr": "71050"}},
+            )
+
+        def get_live_market_context(
+            self,
+            access_token: str,
+            *,
+            symbol: str,
+            exchange: str = "KRX",
+            reference_price: Decimal | None = None,
+        ) -> BrokerLiveMarketContext:
+            del reference_price
+            assert access_token
+            return BrokerLiveMarketContext(
+                symbol=symbol,
+                exchange=exchange,
+                observed_at=observed_at + timedelta(seconds=1),
+                freshness_source="kis_exchange_orderbook_time",
+                bid=Decimal("71045"),
+                ask=Decimal("71055"),
+                spread=Decimal("10"),
+                spread_bps=Decimal("1.41"),
+                orderbook_depth=Decimal("450000000"),
+            )
+
+        def get_intraday_liquidity_snapshot(
+            self,
+            access_token: str,
+            *,
+            symbol: str,
+            exchange: str = "KRX",
+            reference_at: datetime,
+        ) -> BrokerIntradayLiquiditySnapshot:
+            assert access_token
+            self.liquidity_calls.append((symbol, exchange, reference_at))
+            return BrokerIntradayLiquiditySnapshot(
+                symbol=symbol,
+                exchange="KRX",
+                observed_at=observed_at + timedelta(seconds=1),
+                volume=Decimal("1250000"),
+                turnover=Decimal(live_turnover),
+                day_high=Decimal("71200"),
+                day_low=Decimal("70500"),
+                freshness_source="kis_exchange_intraday_minute_time",
+                payload={
+                    "provider": "kis",
+                    "endpoint": (
+                        "/uapi/domestic-stock/v1/quotations/"
+                        "inquire-time-itemchartprice"
+                    ),
+                    "tr_id": "FHKST03010200",
+                },
+            )
+
+    injected_adapter = TimestampedLiquidityAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="live",
+            configured=True,
+            api_base_url="https://broker.invalid",
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(
+            broker_order_id=f"structured-gates-{live_turnover}"
+        ),
+    )
+    app, engine, client, broker_adapter, _ = _build_trigger_agent_app(
+        monkeypatch=monkeypatch,
+        agent_responses=[
+            {
+                "decision": "execute_now",
+                "side": "buy",
+                "quantity": 2,
+                "updated_target_price": "74000",
+                "updated_stop_price": "70000",
+                "reason": "execute only after deterministic delegated recheck",
+                "context_staleness_ok": True,
+            }
+        ],
+        broker_adapter=injected_adapter,
+        account_snapshot_observed_at=observed_at,
+        settings_overrides={
+            "runtime_mode": "live",
+            "automation_enabled": True,
+            "monitoring_expire_prior_market_watch_buys_enabled": False,
+            "market_regime_guard_enabled": False,
+            "watch_buy_live_market_quality_veto_enabled": False,
+            "watch_buy_live_market_regime_downsize_allowed": True,
+        },
+    )
+    _create_intraday_watch_buy(
+        client,
+        plan_id=f"plan-trigger-dynamic-gates-{live_turnover}",
+        risk_context_extra=(
+            _structured_dynamic_gate_context(
+                observed_at=observed_at - timedelta(hours=1)
+            )
+            if with_delegated_contract
+            else None
+        ),
+    )
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "dynamic delegated gates use fresh trigger evidence",
+            "observed_at": observed_at.isoformat(),
+            # The caller-supplied value is deliberately bogus. Only the
+            # exchange-timestamped broker snapshot may satisfy this gate.
+            "prices": [
+                {
+                    **_live_price_payload(
+                        turnover="999999999999",
+                        observed_at=observed_at,
+                    ),
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    result = response.json()["items"][0]
+    assert result["outcome"] == expected_outcome
+    assert result.get("block_reason") == expected_block_reason
+    assert len(broker_adapter.order_calls) == (1 if expected_outcome == "submitted" else 0)
+    assert len(injected_adapter.liquidity_calls) == expected_liquidity_calls
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_reason"),
+    [
+        ("none", "returned no snapshot"),
+        ("stale", "snapshot is stale"),
+        ("future", "future clock skew"),
+        ("symbol", "symbol identity mismatch"),
+        ("source", "lacks trusted exchange-time provenance"),
+        ("endpoint", "endpoint identity mismatch"),
+        ("range", "day range is invalid"),
+        ("error", "refresh failed: RuntimeError"),
+    ],
+)
+def test_trigger_time_liquidity_refresh_fails_closed_on_untrusted_evidence(
+    failure: str,
+    expected_reason: str,
+) -> None:
+    reference_at = datetime(2026, 6, 5, 0, 30, tzinfo=UTC)
+    snapshot = BrokerIntradayLiquiditySnapshot(
+        symbol="OTHER" if failure == "symbol" else "005930",
+        exchange="KRX",
+        observed_at=(
+            reference_at - timedelta(seconds=2)
+            if failure == "stale"
+            else reference_at + timedelta(seconds=2)
+            if failure == "future"
+            else reference_at
+        ),
+        volume=Decimal("1250000"),
+        turnover=Decimal("3500000000"),
+        day_high=Decimal("70000") if failure == "range" else Decimal("72000"),
+        day_low=Decimal("71000") if failure == "range" else Decimal("70000"),
+        freshness_source=(
+            "transport_received_at_untrusted"
+            if failure == "source"
+            else "kis_exchange_intraday_minute_time"
+        ),
+        payload={
+            "provider": "kis",
+            "endpoint": (
+                "/wrong" if failure == "endpoint" else
+                "/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice"
+            ),
+            "tr_id": "FHKST03010200",
+        },
+    )
+
+    class Adapter:
+        provider = "kis"
+        calls = 0
+
+        def get_intraday_liquidity_snapshot(self, *_args: object, **_kwargs: object):
+            self.calls += 1
+            if failure == "error":
+                raise RuntimeError("broker unavailable")
+            return None if failure == "none" else snapshot
+
+    adapter = Adapter()
+    item = ExecutionPlanItem(
+        execution_plan_id="plan",
+        symbol="005930",
+        side="buy",
+        intent="intraday_watch_buy",
+        provider="kis",
+        asset_class="stock",
+        risk_context={"exchange": "KRX"},
+    )
+    price = MonitoringPriceRequest(
+        symbol="005930",
+        price=Decimal("71000"),
+        observed_at=reference_at,
+        freshness_source="kis_exchange_orderbook_time",
+    )
+
+    _price, reason = monitoring._merge_trigger_time_liquidity_snapshot(
+        settings=Settings(
+            runtime_mode="live",
+            monitoring_max_quote_age_seconds=1,
+            monitoring_max_quote_future_skew_seconds=1,
+        ),
+        adapter=adapter,
+        access_token="token",
+        item=item,
+        price=price,
+        reference_at=reference_at,
+    )
+
+    assert expected_reason in str(reason)
+    assert adapter.calls == 1
+
+
+@pytest.mark.parametrize(
+    ("snapshot_observed_at", "expected_reason"),
+    [
+        (
+            lambda now: now - timedelta(seconds=61),
+            "account_snapshot_stale",
+        ),
+        (
+            lambda now: now + timedelta(seconds=31),
+            "account_snapshot_future_skew",
+        ),
+    ],
+    ids=["stale", "future-skew"],
+)
+def test_trigger_time_account_snapshot_freshness_blocks_before_agent_call(
+    monkeypatch: pytest.MonkeyPatch,
+    snapshot_observed_at,
+    expected_reason: str,
+) -> None:
+    now = datetime.now(UTC)
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(broker_order_id="kis-never-used"),
+        account_snapshot=BrokerAccountSnapshot(
+            available_cash=Decimal("1000000"),
+            buying_power=Decimal("1000000"),
+            observed_at=snapshot_observed_at(now),
+            source="stub:account_snapshot",
+        ),
+    )
+    app, engine, client, broker_adapter, captured = _build_trigger_agent_app(
+        monkeypatch=monkeypatch,
+        agent_responses=[],
+        broker_adapter=broker_adapter,
+        settings_overrides={
+            "exec_agent_max_account_snapshot_age_seconds": 60,
+            "account_drawdown_recovery_max_snapshot_future_skew_seconds": 5,
+        },
+    )
+    item_id = _create_intraday_watch_buy(
+        client,
+        plan_id=f"plan-trigger-agent-account-{expected_reason}",
+    )
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "stale account truth must not reach the agent",
+            "prices": [_live_price_payload()],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["items"][0]["outcome"] == "agent_delay"
+    assert captured == []
+    assert broker_adapter.order_calls == []
+    with app.state.db_session_factory() as session:
+        item = session.get(ExecutionPlanItem, item_id)
+        assert item is not None
+        interaction = item.risk_context["last_trigger_time_exec_agent_interaction"]
+        assert interaction["request_payload"]["account_context"]["available"] is False
+        assert interaction["request_payload"]["account_context"]["reason"] == expected_reason
+    engine.dispose()
+
+
+def test_trigger_time_account_context_excludes_foreign_local_open_orders() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        execution_position_account_scope="current-account",
+    )
+    foreign_settings = settings.model_copy(
+        update={"execution_position_account_scope": "foreign-account"}
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    current_identity = build_position_identity(
+        settings=settings,
+        provider="kis",
+        exchange="KRX",
+    )
+    foreign_identity = build_position_identity(
+        settings=foreign_settings,
+        provider="kis",
+        exchange="KRX",
+    )
+
+    with session_factory() as session:
+        for suffix, identity in (("current", current_identity), ("foreign", foreign_identity)):
+            session.add(
+                BrokerOrder(
+                    id=f"trigger-{suffix}-open-buy",
+                    broker_name="kis",
+                    mode="paper",
+                    idempotency_key=f"trigger-{suffix}-open-buy",
+                    broker_order_id=f"trigger-{suffix}-open-buy",
+                    symbol="005930",
+                    side="buy",
+                    status="submitted",
+                    quantity=1,
+                    limit_price=Decimal("100000"),
+                    venue="KRX",
+                    asset_class="stock",
+                    request_metadata={
+                        "execution_scope": execution_scope_payload(
+                            identity=identity,
+                            venue="KRX",
+                            asset_class="stock",
+                        )
+                    },
+                )
+            )
+        session.commit()
+        payload = trigger_time_exec_agent._account_context_payload(
+            settings=settings,
+            db=session,
+            snapshot=BrokerAccountSnapshot(
+                available_cash=Decimal("1000000"),
+                buying_power=Decimal("1000000"),
+                observed_at=datetime.now(UTC),
+                source="stub:account_snapshot",
+            ),
+            provider="kis",
+            exchange="KRX",
+        )
+
+    assert payload["execution_account_scope"] == {
+        "provider": current_identity.provider,
+        "account_scope": current_identity.account_scope,
+    }
+    assert payload["open_order_count"] == 1
+    assert payload["open_orders"][0]["broker_order_id"] == "trigger-current-open-buy"
     engine.dispose()

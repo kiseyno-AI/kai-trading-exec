@@ -1,14 +1,16 @@
 from __future__ import annotations
 
+import hmac
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from hashlib import sha256
 
 from fastapi.testclient import TestClient
 import pytest
 from pydantic import ValidationError
-from sqlalchemy import select
+from sqlalchemy import func, select
 
-from app.api.schemas.execution import StaleBrokerOrderReconciliationRequest
+from app.api.schemas.execution import PlaceOrderRequest, StaleBrokerOrderReconciliationRequest
 from app.broker.base import (
     BrokerAccountHolding,
     BrokerAccountSnapshot,
@@ -43,9 +45,17 @@ from app.models.runtime import (
 )
 from app.services import reconciliation as reconciliation_service
 from app.services.execution_jobs import dispatch_due_execution_jobs
+from app.services.execution_account_route import bind_kis_account_route
+from app.services.execution_api import _serialize_execution_fill
 from app.services.fill_idempotency import (
     duplicate_fill_group_candidate_key,
     execution_fill_dedupe_key,
+)
+from app.services.position_identity import (
+    PositionIdentityConflictError,
+    build_position_identity,
+    execution_scope_payload,
+    payload_with_position_identity,
 )
 from app.services.reconciliation import (
     reconcile_broker_order,
@@ -61,6 +71,103 @@ from app.services.runtime_controls import ControlCommand, resume_runtime
 
 
 OBSERVED_AT = datetime(2026, 5, 13, 9, 5, tzinfo=UTC)
+
+
+def test_execution_fill_serialization_recursively_redacts_account_references() -> None:
+    order = _order(broker_order_id="redacted-fill-order")
+    fill = ExecutionFill(
+        broker_order=order,
+        broker_fill_id="redacted-fill",
+        symbol="005930",
+        side="buy",
+        quantity=1,
+        price=Decimal("71000"),
+        filled_at=OBSERVED_AT,
+        payload={
+            "nested": {
+                "CANO": "12345678",
+                "ACNT_PRDT_CD": "01",
+                "marker": "preserved",
+            }
+        },
+    )
+
+    payload = _serialize_execution_fill(fill)
+
+    persisted_text = str(payload["payload"]).lower()
+    assert "12345678" not in persisted_text
+    assert "cano" not in persisted_text
+    assert "acnt_prdt_cd" not in persisted_text
+    assert payload["payload"]["nested"]["marker"] == "preserved"
+
+
+def test_existing_fill_economics_rewrite_redacts_legacy_account_identifiers() -> None:
+    order = _order(broker_order_id="redacted-fill-revision-order")
+    fill = ExecutionFill(
+        broker_order=order,
+        broker_fill_id="redacted-fill-revision",
+        symbol="005930",
+        side="buy",
+        quantity=1,
+        price=Decimal("71000"),
+        filled_at=OBSERVED_AT,
+        payload={
+            "nested": {
+                "account_id": "raw-broker-account",
+                "ACNT_PRDT_CD": "01",
+                "marker": "preserved",
+            }
+        },
+    )
+
+    reconciliation_service._enrich_existing_fill_economics(
+        existing=fill,
+        incoming={
+            "settlement_currency": "KRW",
+            "transaction_cost": "10",
+            "transaction_cost_coverage": "complete",
+            "transaction_cost_source": "broker_payload:test",
+        },
+    )
+
+    persisted_text = str(fill.payload).lower()
+    assert "raw-broker-account" not in persisted_text
+    assert "account_id" not in persisted_text
+    assert "acnt_prdt_cd" not in persisted_text
+    assert fill.payload["nested"] == {"marker": "preserved"}
+    assert fill.payload["economics_revision"]["settlement_currency"] == "KRW"
+
+
+def test_reconciliation_metadata_cannot_replace_canonical_execution_scope() -> None:
+    canonical_scope = {
+        "policy_version": 1,
+        "provider": "kis",
+        "account_scope": "a" * 24,
+        "venue": "KIS-US",
+        "asset_class": "us_equity",
+        "exchange": "NASD",
+    }
+
+    merged = reconciliation_service._merge_reconcile_request_metadata(
+        existing={
+            "source": "post:/orders",
+            "exchange": "NASD",
+            "execution_scope": canonical_scope,
+        },
+        incoming={
+            "broker_marker": "preserved",
+            "exchange": "NYSE",
+            "execution_scope": {
+                **canonical_scope,
+                "account_scope": "b" * 24,
+                "exchange": "NYSE",
+            },
+        },
+    )
+
+    assert merged["broker_marker"] == "preserved"
+    assert merged["exchange"] == "NASD"
+    assert merged["execution_scope"] == canonical_scope
 
 
 class ReconciliationStubBroker:
@@ -91,6 +198,7 @@ class ReconciliationStubBroker:
             response_payload={"rt_cd": "0"},
         )
         self.reconcile_calls: list[tuple[str, str, datetime | None]] = []
+        self.reconcile_expected_symbols: list[str | None] = []
         self.order_calls: list[BrokerOrderPlacementRequest] = []
         self.authenticate_calls = 0
 
@@ -122,8 +230,16 @@ class ReconciliationStubBroker:
         assert access_token
         return BrokerCurrentPrice(symbol=symbol, exchange=exchange, price=Decimal("125100"), observed_at=OBSERVED_AT, payload={})
 
-    def get_account_snapshot(self, access_token: str) -> BrokerAccountSnapshot:
+    def get_account_snapshot(
+        self,
+        access_token: str,
+        *,
+        symbols: list[str] | None = None,
+        reference_prices: dict[str, Decimal] | None = None,
+        exchange: str = "KRX",
+    ) -> BrokerAccountSnapshot:
         assert access_token
+        del symbols, reference_prices, exchange
         return self.account_snapshot
 
     def reconnect_handle(self) -> BrokerReconnectHandle:
@@ -136,9 +252,11 @@ class ReconciliationStubBroker:
         *,
         exchange: str = "KRX",
         submitted_at: datetime | None = None,
+        expected_symbol: str | None = None,
     ) -> dict[str, object]:
         assert access_token
         self.reconcile_calls.append((broker_order_id, exchange, submitted_at))
+        self.reconcile_expected_symbols.append(expected_symbol)
         if not self.reconcile_payloads:
             return {"broker_order_id": broker_order_id, "status": "open", "observed_at": OBSERVED_AT.isoformat()}
         return self.reconcile_payloads[min(len(self.reconcile_calls) - 1, len(self.reconcile_payloads) - 1)]
@@ -155,11 +273,31 @@ def _session(settings: Settings):
 
 def _order(
     *,
+    settings: Settings | None = None,
     status: str = "submitted",
     broker_order_id: str = "0033196600",
     side: str = "buy",
     request_metadata: dict[str, object] | None = None,
 ) -> BrokerOrder:
+    effective_settings = settings or Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+    )
+    metadata = dict(request_metadata or {})
+    route = metadata.get("route")
+    route = route if isinstance(route, dict) else {}
+    exchange = str(metadata.get("exchange") or route.get("exchange") or "KRX").upper()
+    venue = exchange
+    asset_class = "stock"
+    metadata["execution_scope"] = execution_scope_payload(
+        identity=build_position_identity(
+            settings=effective_settings,
+            provider="kis",
+            exchange=exchange,
+        ),
+        venue=venue,
+        asset_class=asset_class,
+    )
     return BrokerOrder(
         broker_name="kis",
         mode="paper",
@@ -169,13 +307,16 @@ def _order(
         side=side,
         status=status,
         quantity=2,
+        venue=venue,
+        asset_class=asset_class,
         submitted_at=OBSERVED_AT,
-        request_metadata=request_metadata,
+        request_metadata=metadata,
     )
 
 
 def _plan_backed_order(
     *,
+    settings: Settings | None = None,
     plan_id: str,
     side: str,
     intent: str,
@@ -185,6 +326,13 @@ def _plan_backed_order(
     status: str = "submitted",
     risk_context: dict[str, object] | None = None,
 ) -> tuple[ExecutionPlan, ExecutionPlanItem, BrokerOrder]:
+    effective_settings = settings or Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+    )
+    item_risk_context = dict(risk_context or {})
+    exchange = str(item_risk_context.get("exchange") or "KRX").upper()
+    asset_class = str(item_risk_context.get("asset_class") or "stock").lower()
     plan = ExecutionPlan(
         external_plan_id=plan_id,
         source="test",
@@ -201,7 +349,7 @@ def _plan_backed_order(
         quantity_policy={"kind": "shares", "quantity": quantity},
         limit_price=Decimal("71000"),
         time_in_force="day",
-        risk_context=risk_context,
+        risk_context=item_risk_context,
     )
     order = BrokerOrder(
         broker_name="kis",
@@ -212,12 +360,23 @@ def _plan_backed_order(
         side=side,
         status=status,
         quantity=quantity,
+        venue=exchange,
+        asset_class=asset_class,
         limit_price=Decimal("71000"),
         submitted_at=OBSERVED_AT,
         request_metadata={
             "source": "test",
             "time_in_force": "day",
-            "route": {"exchange": "KRX"},
+            "route": {"exchange": exchange},
+            "execution_scope": execution_scope_payload(
+                identity=build_position_identity(
+                    settings=effective_settings,
+                    provider="kis",
+                    exchange=exchange,
+                ),
+                venue=exchange,
+                asset_class=asset_class,
+            ),
         },
     )
     order.plan_item = item
@@ -233,7 +392,7 @@ def _utc(value: datetime) -> datetime:
 def test_reconcile_full_fill_is_idempotent_and_updates_position_snapshot() -> None:
     settings = Settings(database_url="sqlite:///:memory:", runtime_mode="paper")
     engine, db = _session(settings)
-    order = _order()
+    order = _order(settings=settings)
     db.add(order)
     db.commit()
     broker = ReconciliationStubBroker(
@@ -289,6 +448,7 @@ def test_reconcile_full_fill_is_idempotent_and_updates_position_snapshot() -> No
     assert first["status"] == "filled"
     assert first["fills_added"] == 1
     assert second["fills_added"] == 0
+    assert broker.reconcile_expected_symbols == ["005930", "005930"]
     assert len(fills) == 1
     assert len(events) == 2
     assert [event.normalized_status for event in events] == ["filled", "filled"]
@@ -302,6 +462,68 @@ def test_reconcile_full_fill_is_idempotent_and_updates_position_snapshot() -> No
     assert position.quantity == 2
     assert position.average_price == Decimal("71000.0000")
     assert runtime_payload["symbols"]["positions"] == ["005930"]
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    "identity_patch",
+    [
+        {"broker_order_id": "another-order"},
+        {"provider": "alpaca"},
+        {"symbol": "000660"},
+        {"symbol": 5930},
+    ],
+)
+def test_reconcile_rejects_mismatched_top_level_broker_identity_before_mutation(
+    identity_patch: dict[str, object],
+) -> None:
+    settings = Settings(database_url="sqlite:///:memory:", runtime_mode="paper")
+    engine, db = _session(settings)
+    order = _order(settings=settings, broker_order_id="identity-guard-order")
+    db.add(order)
+    db.commit()
+    payload: dict[str, object] = {
+        "broker_order_id": "identity-guard-order",
+        "provider": "kis",
+        "symbol": "005930",
+        "status": "filled",
+        "filled_quantity": 2,
+        "remaining_quantity": 0,
+        "average_fill_price": "71000",
+        "fills": [
+            {
+                "broker_fill_id": "identity-guard-fill",
+                "symbol": "005930",
+                "side": "buy",
+                "quantity": 2,
+                "price": "71000",
+                "filled_at": OBSERVED_AT.isoformat(),
+            }
+        ],
+        "observed_at": OBSERVED_AT.isoformat(),
+    }
+    payload.update(identity_patch)
+    broker = ReconciliationStubBroker(reconcile_payloads=[payload])
+
+    result = reconcile_broker_order(
+        settings=settings,
+        db=db,
+        adapter=broker,
+        order=order,
+    )
+
+    assert result["status_code"] == 502
+    assert result["status"] == "submitted"
+    assert result["status_changed"] is False
+    assert result["fills_added"] == 0
+    assert db.scalars(select(ExecutionFill)).all() == []
+    assert db.scalar(
+        select(func.count(BrokerOrderEvent.id)).where(
+            BrokerOrderEvent.broker_order_pk == order.id,
+            BrokerOrderEvent.event_type == "reconcile_result",
+        )
+    ) == 0
+    assert broker.reconcile_expected_symbols == ["005930"]
     engine.dispose()
 
 
@@ -380,6 +602,263 @@ def test_us_holding_discovery_preserves_position_truth_across_exchange_queries()
         "exchange": "NASD",
         "monitoring_eligible": True,
     }
+    engine.dispose()
+
+
+def test_us_holding_discovery_attributes_only_reported_exchange_route() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="live",
+        kis_app_key="***",
+        kis_app_secret="***",
+        kis_account_number="12345678",
+        execution_position_account_scope="kis-primary-live",
+    )
+    engine, db = _session(settings)
+
+    class AggregateLiveSnapshotBroker(ReconciliationStubBroker):
+        def get_account_snapshot(
+            self,
+            access_token: str,
+            *,
+            symbols: list[str] | None = None,
+            exchange: str = "KRX",
+        ) -> BrokerAccountSnapshot:
+            assert access_token
+            del symbols
+            holding = BrokerAccountHolding(
+                symbol="IBM",
+                quantity=3,
+                average_price=Decimal("250"),
+                sellable_quantity=3,
+                payload={"ovrs_excg_cd": "NYSE"},
+            )
+            return BrokerAccountSnapshot(
+                available_cash=Decimal("1000"),
+                observed_at=OBSERVED_AT,
+                source=f"stub:{exchange}",
+                holdings=[holding] if exchange in {"NASD", "NYSE"} else [],
+                payload={"currency": "USD", "exchange": exchange},
+            )
+
+    broker = AggregateLiveSnapshotBroker()
+    nasdaq_result = sync_execution_positions_from_broker_snapshot(
+        settings=settings,
+        db=db,
+        adapter=broker,
+        symbols=None,
+        exchange="NASD",
+        discover_holdings_only=True,
+    )
+
+    assert nasdaq_result["created"] == 0
+    assert db.scalars(select(ExecutionPosition)).all() == []
+
+    nyse_result = sync_execution_positions_from_broker_snapshot(
+        settings=settings,
+        db=db,
+        adapter=broker,
+        symbols=None,
+        exchange="NYSE",
+        discover_holdings_only=True,
+    )
+
+    positions = db.scalars(select(ExecutionPosition)).all()
+    assert nyse_result["created"] == 1
+    assert len(positions) == 1
+    assert positions[0].symbol == "IBM"
+    assert positions[0].exchange == "NYSE"
+    assert positions[0].quantity == 3
+    engine.dispose()
+
+
+def test_us_position_sync_rejects_holding_without_exchange_proof_before_mutation() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        kis_app_key="***",
+        kis_app_secret="***",
+        kis_account_number="12345678",
+    )
+    engine, db = _session(settings)
+    broker = ReconciliationStubBroker(
+        account_snapshot=BrokerAccountSnapshot(
+            available_cash=Decimal("1000"),
+            observed_at=OBSERVED_AT,
+            source="stub:missing-exchange",
+            holdings=[
+                BrokerAccountHolding(
+                    symbol="AAPL",
+                    quantity=1,
+                    average_price=Decimal("200"),
+                    sellable_quantity=1,
+                    payload={},
+                )
+            ],
+        )
+    )
+
+    with pytest.raises(BrokerAdapterError, match="lacks broker exchange proof"):
+        sync_execution_positions_from_broker_snapshot(
+            settings=settings,
+            db=db,
+            adapter=broker,
+            symbols=None,
+            exchange="NASD",
+            discover_holdings_only=True,
+        )
+
+    assert db.scalars(select(ExecutionPosition)).all() == []
+    engine.dispose()
+
+
+def test_us_position_sync_rejects_conflicting_duplicate_holdings_before_mutation() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        kis_app_key="***",
+        kis_app_secret="***",
+        kis_account_number="12345678",
+    )
+    engine, db = _session(settings)
+    identity = build_position_identity(
+        settings=settings,
+        provider="kis",
+        exchange="NASD",
+    )
+    original = ExecutionPosition(
+        mode="paper",
+        provider=identity.provider,
+        account_scope=identity.account_scope,
+        exchange=identity.exchange,
+        symbol="AAPL",
+        quantity=5,
+        average_price=Decimal("500"),
+        updated_from="test_seed",
+        raw_payload=payload_with_position_identity(
+            {"snapshot": "trusted-before-conflict"},
+            identity=identity,
+        ),
+    )
+    db.add(original)
+    db.commit()
+    broker = ReconciliationStubBroker(
+        account_snapshot=BrokerAccountSnapshot(
+            available_cash=Decimal("1000"),
+            observed_at=OBSERVED_AT,
+            source="stub:conflicting-duplicates",
+            holdings=[
+                BrokerAccountHolding(
+                    symbol="AAPL",
+                    quantity=1,
+                    average_price=Decimal("100"),
+                    sellable_quantity=1,
+                    unrealized_pnl=Decimal("1"),
+                    unrealized_pnl_pct=Decimal("1"),
+                    payload={
+                        "ovrs_excg_cd": "NASD",
+                        "ovrs_stck_evlu_amt": "101",
+                    },
+                ),
+                BrokerAccountHolding(
+                    symbol="aapl",
+                    quantity=9,
+                    average_price=Decimal("900"),
+                    sellable_quantity=9,
+                    unrealized_pnl=Decimal("9"),
+                    unrealized_pnl_pct=Decimal("1"),
+                    payload={
+                        "ovrs_excg_cd": "nasdaq",
+                        "ovrs_stck_evlu_amt": "8109",
+                    },
+                ),
+            ],
+        )
+    )
+
+    with pytest.raises(BrokerAdapterError, match="conflicting duplicate broker holding"):
+        sync_execution_positions_from_broker_snapshot(
+            settings=settings,
+            db=db,
+            adapter=broker,
+            symbols=None,
+            exchange="NASD",
+            discover_holdings_only=True,
+        )
+
+    db.expire_all()
+    persisted = db.scalar(
+        select(ExecutionPosition).where(
+            ExecutionPosition.mode == "paper",
+            ExecutionPosition.symbol == "AAPL",
+        )
+    )
+    assert persisted is not None
+    assert persisted.quantity == 5
+    assert persisted.average_price == Decimal("500.0000")
+    assert persisted.updated_from == "test_seed"
+    assert persisted.raw_payload["snapshot"] == "trusted-before-conflict"
+    engine.dispose()
+
+
+def test_us_position_sync_dedupes_equivalent_normalized_holdings() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        kis_app_key="***",
+        kis_app_secret="***",
+        kis_account_number="12345678",
+    )
+    engine, db = _session(settings)
+    broker = ReconciliationStubBroker(
+        account_snapshot=BrokerAccountSnapshot(
+            available_cash=Decimal("1000"),
+            observed_at=OBSERVED_AT,
+            source="stub:equivalent-duplicates",
+            holdings=[
+                BrokerAccountHolding(
+                    symbol=" AAPL ",
+                    quantity=1,
+                    average_price=Decimal("100.0"),
+                    sellable_quantity=1,
+                    unrealized_pnl=Decimal("1.0"),
+                    unrealized_pnl_pct=Decimal("1.00"),
+                    payload={
+                        "ovrs_excg_cd": "NASD",
+                        "ovrs_stck_evlu_amt": "101.0",
+                    },
+                ),
+                BrokerAccountHolding(
+                    symbol="aapl",
+                    quantity=1,
+                    average_price=Decimal("100.00"),
+                    sellable_quantity=1,
+                    unrealized_pnl=Decimal("1.00"),
+                    unrealized_pnl_pct=Decimal("1.0"),
+                    payload={
+                        "ovrs_excg_cd": "nasdaq",
+                        "ovrs_stck_evlu_amt": "101.00",
+                    },
+                ),
+            ],
+        )
+    )
+
+    result = sync_execution_positions_from_broker_snapshot(
+        settings=settings,
+        db=db,
+        adapter=broker,
+        symbols=None,
+        exchange="NASD",
+        discover_holdings_only=True,
+    )
+
+    positions = db.scalars(select(ExecutionPosition)).all()
+    assert result["tracked_symbol_count"] == 1
+    assert len(positions) == 1
+    assert positions[0].symbol == "AAPL"
+    assert positions[0].quantity == 1
+    assert positions[0].average_price == Decimal("100.0000")
     engine.dispose()
 
 
@@ -581,6 +1060,14 @@ def test_account_snapshot_sync_zeroes_local_positions_absent_from_broker_snapsho
             quantity=3,
             average_price=Decimal("95000"),
             updated_from="test",
+            raw_payload=payload_with_position_identity(
+                None,
+                identity=build_position_identity(
+                    settings=settings,
+                    provider="kis",
+                    exchange="KRX",
+                ),
+            ),
         )
     )
     db.commit()
@@ -607,6 +1094,1233 @@ def test_account_snapshot_sync_zeroes_local_positions_absent_from_broker_snapsho
     assert position.quantity == 0
     assert position.last_reconciled_at is not None
     assert position.last_reconciled_at.replace(tzinfo=UTC) == OBSERVED_AT
+    engine.dispose()
+
+
+def test_reconciliation_redacts_kis_account_fields_from_persisted_payloads() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        kis_app_key="***",
+        kis_app_secret="***",
+        kis_account_number="12345678",
+    )
+    engine, db = _session(settings)
+    order = _order(settings=settings)
+    canonical_scope = order.request_metadata["execution_scope"]
+    db.add(order)
+    db.commit()
+    broker = ReconciliationStubBroker(
+        reconcile_payloads=[
+            {
+                "broker_order_id": "0033196600",
+                "status": "filled",
+                "broker_status": "체결",
+                "filled_quantity": 2,
+                "remaining_quantity": 0,
+                "average_fill_price": "71000",
+                "observed_at": OBSERVED_AT.isoformat(),
+                "request_metadata": {
+                    "route": {"CANO": "12345678", "exchange": "KRX"},
+                    "request_marker": "preserved",
+                },
+                "response_metadata": {
+                    "nested": {"ACNT_PRDT_CD": "01", "status": "ok"},
+                    "response_marker": "preserved",
+                },
+                "request_payload": {
+                    "CANO": "12345678",
+                    "nested": [{"ACNT_PRDT_CD": "01", "PDNO": "005930"}],
+                },
+                "payload": {
+                    "account_reference": "KIS:12345678-01",
+                    "output": {
+                        "cano": "12345678",
+                        "acnt_prdt_cd": "01",
+                        "odno": "0033196600",
+                    },
+                },
+            }
+        ]
+    )
+
+    reconcile_broker_order(settings=settings, db=db, adapter=broker, order=order)
+
+    db.refresh(order)
+    event = db.scalar(
+        select(BrokerOrderEvent).where(
+            BrokerOrderEvent.broker_order_pk == order.id,
+            BrokerOrderEvent.event_type == "reconcile_result",
+        )
+    )
+    assert event is not None
+    persisted_payloads = {
+        "order_request_metadata": order.request_metadata,
+        "order_response_metadata": order.response_metadata,
+        "order_raw_broker_payload": order.raw_broker_payload,
+        "event_request_payload": event.request_payload,
+        "event_response_payload": event.response_payload,
+        "event_payload": event.payload,
+    }
+    persisted_text = str(persisted_payloads).lower()
+    assert "12345678" not in persisted_text
+    assert "account_reference" not in persisted_text
+    assert "cano" not in persisted_text
+    assert "acnt_prdt_cd" not in persisted_text
+    assert order.request_metadata == {
+        "route": {"exchange": "KRX"},
+        "request_marker": "preserved",
+        "execution_scope": canonical_scope,
+    }
+    assert order.response_metadata == {
+        "nested": {"status": "ok"},
+        "response_marker": "preserved",
+    }
+    assert order.raw_broker_payload == {"output": {"odno": "0033196600"}}
+    assert event.request_payload == {"nested": [{"PDNO": "005930"}]}
+    assert event.payload["normalized_payload"] == {
+        "output": {"odno": "0033196600"}
+    }
+    engine.dispose()
+
+
+def test_reconciliation_error_redacts_kis_account_fields_from_persisted_event() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        kis_app_key="***",
+        kis_app_secret="***",
+        kis_account_number="12345678",
+    )
+    engine, db = _session(settings)
+    order = _order(settings=settings, broker_order_id="redaction-error-1")
+    db.add(order)
+    db.commit()
+
+    class FailingReconciliationBroker(ReconciliationStubBroker):
+        def reconcile_order(
+            self,
+            access_token: str,
+            broker_order_id: str,
+            *,
+            exchange: str = "KRX",
+            submitted_at: datetime | None = None,
+        ) -> dict[str, object]:
+            del access_token, broker_order_id, exchange, submitted_at
+            raise BrokerAdapterError(
+                "broker rejected reconciliation",
+                status_code=502,
+                classification=BrokerErrorClassification.BROKER_REJECTED,
+                code="RECONCILE_REJECTED",
+                request_metadata={
+                    "route": {"CANO": "12345678", "exchange": "KRX"},
+                    "request_marker": "preserved",
+                },
+                response_metadata={
+                    "nested": {"ACNT_PRDT_CD": "01", "status": "rejected"},
+                    "response_marker": "preserved",
+                },
+                request_payload={
+                    "CANO": "12345678",
+                    "nested": {"PDNO": "005930"},
+                },
+                response_payload={
+                    "account_reference": "KIS:12345678-01",
+                    "output": {"acnt_prdt_cd": "01", "msg_cd": "REJECTED"},
+                },
+                observed_at=OBSERVED_AT,
+            )
+
+    result = reconcile_broker_order(
+        settings=settings,
+        db=db,
+        adapter=FailingReconciliationBroker(),
+        order=order,
+    )
+
+    event = db.scalar(
+        select(BrokerOrderEvent).where(
+            BrokerOrderEvent.broker_order_pk == order.id,
+            BrokerOrderEvent.event_type == "reconcile_failed",
+        )
+    )
+    assert result["status_code"] == 502
+    assert event is not None
+    persisted_payloads = {
+        "order_request_metadata": order.request_metadata,
+        "order_response_metadata": order.response_metadata,
+        "order_raw_broker_payload": order.raw_broker_payload,
+        "event_request_payload": event.request_payload,
+        "event_response_payload": event.response_payload,
+        "event_payload": event.payload,
+    }
+    persisted_text = str(persisted_payloads).lower()
+    assert "12345678" not in persisted_text
+    assert "account_reference" not in persisted_text
+    assert "cano" not in persisted_text
+    assert "acnt_prdt_cd" not in persisted_text
+    assert event.request_payload == {"nested": {"PDNO": "005930"}}
+    assert event.response_payload == {"output": {"msg_cd": "REJECTED"}}
+    assert event.payload["request_metadata"]["request_marker"] == "preserved"
+    assert event.payload["response_metadata"]["response_marker"].startswith(
+        "broker_error_details_redacted["
+    )
+    engine.dispose()
+
+
+def test_absent_order_repair_redacts_kis_account_fields_from_plan_audit() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        kis_app_key="***",
+        kis_app_secret="***",
+        kis_account_number="12345678",
+        stale_broker_order_reconciliation_threshold_seconds=60,
+    )
+    engine, db = _session(settings)
+    plan, item, order = _plan_backed_order(
+        settings=settings,
+        plan_id="plan-absent-repair-redaction",
+        side="buy",
+        intent="next_open_buy",
+        broker_order_id="absent-redaction-1",
+    )
+    order.submitted_at = OBSERVED_AT - timedelta(days=1)
+    db.add_all([plan, order])
+    db.commit()
+    broker = ReconciliationStubBroker(
+        reconcile_payloads=[
+            {
+                "broker_order_id": "absent-redaction-1",
+                "status": "unknown",
+                "broker_status": "NOT_FOUND",
+                "message": "not found in broker order query",
+                "observed_at": OBSERVED_AT.isoformat(),
+                "payload": {
+                    "request": {"CANO": "12345678", "ACNT_PRDT_CD": "01"},
+                    "result_marker": "preserved",
+                },
+            }
+        ]
+    )
+
+    result = reconcile_broker_order(
+        settings=settings,
+        db=db,
+        adapter=broker,
+        order=order,
+    )
+
+    audit = db.scalar(
+        select(ExecutionPlanItemAudit).where(
+            ExecutionPlanItemAudit.execution_plan_item_id == item.id,
+            ExecutionPlanItemAudit.event_type == "execution_plan_item_status_transition",
+        )
+    )
+    assert result["status"] == "stale_terminal_unknown"
+    assert audit is not None
+    persisted_text = str(audit.payload).lower()
+    assert "12345678" not in persisted_text
+    assert "cano" not in persisted_text
+    assert "acnt_prdt_cd" not in persisted_text
+    assert audit.payload["broker_result"]["payload"]["result_marker"] == "preserved"
+    engine.dispose()
+
+
+def test_rejected_order_reconciliation_redacts_downstream_failure_context() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        kis_app_key="***",
+        kis_app_secret="***",
+        kis_account_number="12345678",
+    )
+    engine, db = _session(settings)
+    plan, _item, order = _plan_backed_order(
+        settings=settings,
+        plan_id="plan-reject-redaction",
+        side="buy",
+        intent="next_open_buy",
+        broker_order_id="reject-redaction-1",
+    )
+    db.add_all([plan, order])
+    db.commit()
+    broker = ReconciliationStubBroker(
+        reconcile_payloads=[
+            {
+                "broker_order_id": "reject-redaction-1",
+                "status": "rejected",
+                "broker_status": "INSUFFICIENT_CASH",
+                "message": "insufficient cash available for order",
+                "observed_at": OBSERVED_AT.isoformat(),
+                "request_payload": {
+                    "CANO": "12345678",
+                    "ACNT_PRDT_CD": "01",
+                    "PDNO": "005930",
+                },
+                "payload": {
+                    "account_reference": "KIS:12345678-01",
+                    "output": {
+                        "cano": "12345678",
+                        "acnt_prdt_cd": "01",
+                        "msg_cd": "INSUFFICIENT_CASH",
+                    },
+                    "result_marker": "preserved",
+                },
+            }
+        ]
+    )
+
+    reconcile_broker_order(settings=settings, db=db, adapter=broker, order=order)
+
+    failure = db.scalar(
+        select(ExecutionFailure).where(ExecutionFailure.broker_order_pk == order.id)
+    )
+    events = db.scalars(
+        select(BrokerOrderEvent).where(BrokerOrderEvent.broker_order_pk == order.id)
+    ).all()
+    assert failure is not None
+    persisted_payloads = {
+        "failure_raw_context": failure.raw_context,
+        "failure_retry_audit_context": failure.retry_audit_context,
+        "events": [
+            {
+                "request_payload": event.request_payload,
+                "response_payload": event.response_payload,
+                "payload": event.payload,
+            }
+            for event in events
+        ],
+    }
+    persisted_text = str(persisted_payloads).lower()
+    assert "12345678" not in persisted_text
+    assert "account_reference" not in persisted_text
+    assert "cano" not in persisted_text
+    assert "acnt_prdt_cd" not in persisted_text
+    assert failure.raw_context["reconcile_payload"]["payload"]["result_marker"] == (
+        "preserved"
+    )
+    engine.dispose()
+
+
+def test_position_reconciliation_redacts_kis_account_fields_from_raw_snapshot() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        kis_app_key="***",
+        kis_app_secret="***",
+        kis_account_number="12345678",
+    )
+    engine, db = _session(settings)
+    broker = ReconciliationStubBroker(
+        account_snapshot=BrokerAccountSnapshot(
+            available_cash=Decimal("1000000"),
+            observed_at=OBSERVED_AT,
+            source="stub:account_snapshot",
+            holdings=[
+                BrokerAccountHolding(
+                    symbol="005930",
+                    quantity=2,
+                    average_price=Decimal("71000"),
+                    sellable_quantity=2,
+                )
+            ],
+            payload={
+                "balance": {
+                    "request": {"CANO": "12345678", "ACNT_PRDT_CD": "01"},
+                    "output": [{"PDNO": "005930", "hldg_qty": "2"}],
+                },
+                "account_reference": "KIS:12345678-01",
+                "snapshot_marker": "preserved",
+            },
+        )
+    )
+
+    sync_execution_positions_from_broker_snapshot(
+        settings=settings,
+        db=db,
+        adapter=broker,
+        symbols={"005930"},
+    )
+
+    position = db.scalar(
+        select(ExecutionPosition).where(ExecutionPosition.symbol == "005930")
+    )
+    assert position is not None
+    persisted_text = str(position.raw_payload).lower()
+    assert "12345678" not in persisted_text
+    assert "account_reference" not in persisted_text
+    assert "cano" not in persisted_text
+    assert "acnt_prdt_cd" not in persisted_text
+    assert position.raw_payload["snapshot_marker"] == "preserved"
+    assert position.raw_payload["balance"]["output"] == [
+        {"PDNO": "005930", "hldg_qty": "2"}
+    ]
+    assert position.raw_payload["_position_identity"]["provider"] == "kis"
+    engine.dispose()
+
+
+def test_position_snapshot_from_other_provider_uses_isolated_symbol_row() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        kis_us_trading_enabled=True,
+        alpaca_us_equity_monitoring_enabled=True,
+        kis_app_key="paper-key",
+        kis_app_secret="paper-secret",
+        kis_account_number="12345678",
+        alpaca_api_key="paper-alpaca-key",
+        alpaca_api_secret="paper-alpaca-secret",
+    )
+    engine, db = _session(settings)
+    kis_broker = ReconciliationStubBroker(
+        account_snapshot=BrokerAccountSnapshot(
+            available_cash=Decimal("1000000"),
+            observed_at=OBSERVED_AT,
+            source="stub:kis",
+            holdings=[
+                BrokerAccountHolding(
+                    symbol="SHARED",
+                    quantity=2,
+                    average_price=Decimal("100"),
+                    sellable_quantity=2,
+                )
+            ],
+        )
+    )
+    sync_execution_positions_from_broker_snapshot(
+        settings=settings,
+        db=db,
+        adapter=kis_broker,
+        symbols={"SHARED"},
+    )
+
+    class AlpacaSnapshotBroker(ReconciliationStubBroker):
+        provider = "alpaca"
+
+        def describe(self) -> BrokerConfig:
+            return BrokerConfig(
+                provider="alpaca",
+                mode="paper",
+                configured=True,
+                api_base_url="https://stub.alpaca.local",
+            )
+
+    alpaca_broker = AlpacaSnapshotBroker(
+        account_snapshot=BrokerAccountSnapshot(
+            broker_account_id="alpaca-shared-account",
+            available_cash=Decimal("1000000"),
+            observed_at=OBSERVED_AT + timedelta(seconds=1),
+            source="stub:alpaca",
+            holdings=[
+                BrokerAccountHolding(
+                    symbol="SHARED",
+                    quantity=7,
+                    average_price=Decimal("200"),
+                    sellable_quantity=7,
+                )
+            ],
+        )
+    )
+
+    sync_execution_positions_from_broker_snapshot(
+        settings=settings,
+        db=db,
+        adapter=alpaca_broker,
+        symbols={"SHARED"},
+    )
+
+    positions = db.scalars(
+        select(ExecutionPosition).where(ExecutionPosition.symbol == "SHARED")
+    ).all()
+    assert len(positions) == 2
+    positions_by_provider = {position.provider: position for position in positions}
+    assert positions_by_provider["kis"].quantity == 2
+    assert positions_by_provider["kis"].average_price == Decimal("100.0000")
+    assert positions_by_provider["alpaca"].quantity == 7
+    assert positions_by_provider["alpaca"].average_price == Decimal("200.0000")
+    engine.dispose()
+
+
+def test_alpaca_position_identity_survives_rotation_and_isolates_other_account() -> None:
+    original_settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        alpaca_api_key="rotating-key-v1",
+        alpaca_api_secret="rotating-secret-v1",
+        account_drawdown_recovery_scope_secret="stable-position-scope-secret",
+    )
+    rotated_settings = original_settings.model_copy(
+        update={
+            "alpaca_api_key": "rotating-key-v2",
+            "alpaca_api_secret": "rotating-secret-v2",
+        }
+    )
+    engine, db = _session(original_settings)
+
+    class AlpacaSnapshotBroker(ReconciliationStubBroker):
+        provider = "alpaca"
+
+        def describe(self) -> BrokerConfig:
+            return BrokerConfig(
+                provider="alpaca",
+                mode="paper",
+                configured=True,
+                api_base_url="https://stub.alpaca.local",
+            )
+
+    def snapshot(*, account_id: str, quantity: int, observed_at: datetime) -> BrokerAccountSnapshot:
+        return BrokerAccountSnapshot(
+            broker_account_id=account_id,
+            available_cash=Decimal("1000"),
+            observed_at=observed_at,
+            source="stub:alpaca",
+            holdings=[
+                BrokerAccountHolding(
+                    symbol="BTC/USD",
+                    quantity=quantity,
+                    average_price=Decimal("60000"),
+                    sellable_quantity=quantity,
+                )
+            ],
+        )
+
+    first_broker = AlpacaSnapshotBroker(
+        account_snapshot=snapshot(
+            account_id="alpaca-account-stable-id",
+            quantity=2,
+            observed_at=OBSERVED_AT,
+        )
+    )
+    sync_execution_positions_from_broker_snapshot(
+        settings=original_settings,
+        db=db,
+        adapter=first_broker,
+        symbols={"BTC/USD"},
+        exchange="ALPACA",
+    )
+    position = db.scalar(
+        select(ExecutionPosition).where(ExecutionPosition.symbol == "BTC/USD")
+    )
+    assert position is not None
+    original_identity = position.raw_payload["_position_identity"]
+    assert "alpaca-account-stable-id" not in str(position.raw_payload)
+
+    rotated_broker = AlpacaSnapshotBroker(
+        account_snapshot=snapshot(
+            account_id="alpaca-account-stable-id",
+            quantity=3,
+            observed_at=OBSERVED_AT + timedelta(seconds=1),
+        )
+    )
+    result = sync_execution_positions_from_broker_snapshot(
+        settings=rotated_settings,
+        db=db,
+        adapter=rotated_broker,
+        symbols={"BTC/USD"},
+        exchange="ALPACA",
+    )
+    db.refresh(position)
+    assert result["updated"] == 1
+    assert position.quantity == 3
+    assert position.raw_payload["_position_identity"] == original_identity
+
+    other_account_broker = AlpacaSnapshotBroker(
+        account_snapshot=snapshot(
+            account_id="alpaca-other-account-id",
+            quantity=7,
+            observed_at=OBSERVED_AT + timedelta(seconds=2),
+        )
+    )
+    sync_execution_positions_from_broker_snapshot(
+        settings=rotated_settings,
+        db=db,
+        adapter=other_account_broker,
+        symbols={"BTC/USD"},
+        exchange="ALPACA",
+    )
+    db.refresh(position)
+    assert position.quantity == 3
+    assert db.scalar(
+        select(func.count()).select_from(ExecutionPosition).where(
+            ExecutionPosition.mode == "paper",
+            ExecutionPosition.symbol == "BTC/USD",
+        )
+    ) == 2
+    other_position = db.scalar(
+        select(ExecutionPosition).where(
+            ExecutionPosition.mode == "paper",
+            ExecutionPosition.symbol == "BTC/USD",
+            ExecutionPosition.account_scope != position.account_scope,
+        )
+    )
+    assert other_position is not None
+    assert other_position.quantity == 7
+    engine.dispose()
+
+
+def test_alpaca_position_sync_rejects_missing_authenticated_account_id() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        execution_position_account_scope="operator-label-is-not-account-truth",
+        account_drawdown_recovery_scope_secret="stable-position-scope-secret",
+        alpaca_api_key="paper-key",
+        alpaca_api_secret="paper-secret",
+    )
+    engine, db = _session(settings)
+
+    class AlpacaSnapshotBroker(ReconciliationStubBroker):
+        provider = "alpaca"
+
+    broker = AlpacaSnapshotBroker(
+        account_snapshot=BrokerAccountSnapshot(
+            broker_account_id=None,
+            observed_at=OBSERVED_AT,
+            source="stub:alpaca-missing-account-id",
+            holdings=[
+                BrokerAccountHolding(
+                    symbol="AAPL",
+                    quantity=1,
+                    average_price=Decimal("100"),
+                )
+            ],
+        )
+    )
+
+    with pytest.raises(
+        PositionIdentityConflictError,
+        match="authenticated broker account identity is unavailable",
+    ):
+        sync_execution_positions_from_broker_snapshot(
+            settings=settings,
+            db=db,
+            adapter=broker,
+            symbols={"AAPL"},
+            exchange="US",
+            authenticated_access_token="validated",
+        )
+
+    assert db.scalar(select(func.count()).select_from(ExecutionPosition)) == 0
+    db.rollback()
+    engine.dispose()
+
+
+def test_upbit_position_identity_uses_stable_configured_scope_not_credentials() -> None:
+    original_settings = Settings(
+        runtime_mode="paper",
+        upbit_access_key="rotating-access-v1",
+        upbit_secret_key="rotating-secret-v1",
+        execution_position_account_scope="primary-upbit-account",
+    )
+    rotated_settings = Settings(
+        runtime_mode="paper",
+        upbit_access_key="rotating-access-v2",
+        upbit_secret_key="rotating-secret-v2",
+        execution_position_account_scope="primary-upbit-account",
+    )
+    other_scope_settings = rotated_settings.model_copy(
+        update={"execution_position_account_scope": "secondary-upbit-account"}
+    )
+
+    original_identity = build_position_identity(
+        settings=original_settings,
+        provider="upbit",
+        exchange="UPBIT",
+    )
+    rotated_identity = build_position_identity(
+        settings=rotated_settings,
+        provider="upbit",
+        exchange="UPBIT",
+    )
+    other_scope_identity = build_position_identity(
+        settings=other_scope_settings,
+        provider="upbit",
+        exchange="UPBIT",
+    )
+
+    assert rotated_identity == original_identity
+    assert other_scope_identity != original_identity
+    persisted_identity = original_identity.as_payload()
+    assert "rotating-access" not in str(persisted_identity)
+    assert "rotating-secret" not in str(persisted_identity)
+    assert "primary-upbit-account" not in str(persisted_identity)
+
+
+def test_live_raw_broker_account_scope_is_hmac_keyed_and_rotation_stable() -> None:
+    stable_secret = "stable-position-scope-secret-32-bytes"
+    original_settings = Settings(
+        runtime_mode="live",
+        alpaca_api_key="rotating-key-v1",
+        alpaca_api_secret="rotating-secret-v1",
+        account_drawdown_recovery_scope_secret=stable_secret,
+    )
+    rotated_settings = original_settings.model_copy(
+        update={
+            "alpaca_api_key": "rotating-key-v2",
+            "alpaca_api_secret": "rotating-secret-v2",
+        }
+    )
+    account_id = "stable-alpaca-account-id"
+
+    original_identity = build_position_identity(
+        settings=original_settings,
+        provider="alpaca",
+        exchange="ALPACA",
+        broker_account_id=account_id,
+    )
+    rotated_identity = build_position_identity(
+        settings=rotated_settings,
+        provider="alpaca",
+        exchange="ALPACA",
+        broker_account_id=account_id,
+    )
+
+    message = (
+        "execution-position-route-v2\0alpaca\0"
+        f"broker-account-id\0{account_id}"
+    ).encode("utf-8")
+    expected_scope = hmac.new(
+        stable_secret.encode("utf-8"),
+        message,
+        sha256,
+    ).hexdigest()[:24]
+    legacy_unkeyed_scope = sha256(message).hexdigest()[:24]
+    assert original_identity == rotated_identity
+    assert original_identity.account_scope == expected_scope
+    assert original_identity.account_scope != legacy_unkeyed_scope
+    assert account_id not in str(original_identity.as_payload())
+
+
+def test_live_raw_account_identity_fails_closed_without_stable_hmac_secret() -> None:
+    settings = Settings(
+        runtime_mode="live",
+        alpaca_api_key="configured-key",
+        alpaca_api_secret="configured-secret",
+    )
+
+    with pytest.raises(
+        reconciliation_service.PositionIdentityConflictError,
+        match="ACCOUNT_DRAWDOWN_RECOVERY_SCOPE_SECRET",
+    ):
+        build_position_identity(
+            settings=settings,
+            provider="alpaca",
+            exchange="ALPACA",
+            broker_account_id="raw-account-id",
+        )
+
+
+def test_live_raw_account_identity_rejects_short_hmac_secret() -> None:
+    settings = Settings(
+        runtime_mode="live",
+        account_drawdown_recovery_scope_secret="short-secret",
+    )
+
+    with pytest.raises(
+        reconciliation_service.PositionIdentityConflictError,
+        match="32 bytes",
+    ):
+        build_position_identity(
+            settings=settings,
+            provider="alpaca",
+            exchange="NASD",
+            broker_account_id="raw-account-id",
+        )
+
+
+def test_live_kis_account_scope_is_keyed_and_requires_stable_hmac_secret() -> None:
+    account_number = "12345678"
+    product_code = "01"
+    stable_secret = "stable-kis-position-scope-secret"
+    settings = Settings(
+        runtime_mode="live",
+        kis_account_number=account_number,
+        kis_account_product_code=product_code,
+        account_drawdown_recovery_scope_secret=stable_secret,
+    )
+
+    identity = build_position_identity(
+        settings=settings,
+        provider="kis",
+        exchange="KRX",
+    )
+
+    message = (
+        "execution-position-route-v2\0kis\0configured-kis-account\0"
+        f"{account_number}\0{product_code}"
+    ).encode("utf-8")
+    assert identity.account_scope == hmac.new(
+        stable_secret.encode("utf-8"),
+        message,
+        sha256,
+    ).hexdigest()[:24]
+    assert identity.account_scope != sha256(message).hexdigest()[:24]
+    assert account_number not in str(identity.as_payload())
+
+    with pytest.raises(
+        reconciliation_service.PositionIdentityConflictError,
+        match="ACCOUNT_DRAWDOWN_RECOVERY_SCOPE_SECRET",
+    ):
+        build_position_identity(
+            settings=settings.model_copy(
+                update={"account_drawdown_recovery_scope_secret": None}
+            ),
+            provider="kis",
+            exchange="KRX",
+        )
+
+
+def test_live_kis_account_scope_prefers_account_material_over_operator_label() -> None:
+    stable_secret = "stable-kis-position-scope-secret-at-least-32-bytes"
+    shared = {
+        "runtime_mode": "live",
+        "kis_account_product_code": "01",
+        "account_drawdown_recovery_scope_secret": stable_secret,
+        "execution_position_account_scope": "primary-kis-label",
+    }
+    account_a = Settings(**shared, kis_account_number="11111111")
+    account_b = Settings(**shared, kis_account_number="22222222")
+    relabeled_a = account_a.model_copy(
+        update={"execution_position_account_scope": "renamed-kis-label"}
+    )
+
+    identity_a = build_position_identity(
+        settings=account_a,
+        provider="kis",
+        exchange="KRX",
+    )
+    identity_b = build_position_identity(
+        settings=account_b,
+        provider="kis",
+        exchange="KRX",
+    )
+    relabeled_identity_a = build_position_identity(
+        settings=relabeled_a,
+        provider="kis",
+        exchange="KRX",
+    )
+
+    assert identity_a != identity_b
+    assert relabeled_identity_a == identity_a
+    assert "11111111" not in str(identity_a.as_payload())
+    assert "primary-kis-label" not in str(identity_a.as_payload())
+
+
+def test_live_configured_non_secret_position_scope_does_not_require_hmac_key() -> None:
+    settings = Settings(
+        runtime_mode="live",
+        execution_position_account_scope="primary-upbit-account",
+    )
+
+    identity = build_position_identity(
+        settings=settings,
+        provider="upbit",
+        exchange="UPBIT",
+    )
+
+    assert len(identity.account_scope) == 24
+    assert "primary-upbit-account" not in str(identity.as_payload())
+
+
+def test_live_alpaca_authenticated_scope_rejects_short_key_despite_operator_label() -> None:
+    settings = Settings(
+        runtime_mode="live",
+        account_drawdown_recovery_scope_secret="short-secret",
+        execution_position_account_scope="primary-alpaca-account",
+    )
+
+    with pytest.raises(
+        reconciliation_service.PositionIdentityConflictError,
+        match="ACCOUNT_DRAWDOWN_RECOVERY_SCOPE_SECRET",
+    ):
+        build_position_identity(
+            settings=settings,
+            provider="alpaca",
+            exchange="NASD",
+            broker_account_id="raw-account-id",
+        )
+
+
+def test_live_alpaca_authenticated_id_is_hmac_material_when_label_is_available() -> None:
+    stable_secret = "stable-position-scope-secret-32-bytes"
+    configured_scope = "primary-alpaca-account"
+    settings = Settings(
+        runtime_mode="live",
+        account_drawdown_recovery_scope_secret=stable_secret,
+        execution_position_account_scope=configured_scope,
+    )
+
+    identity = build_position_identity(
+        settings=settings,
+        provider="alpaca",
+        exchange="NASD",
+        broker_account_id="raw-account-id",
+    )
+
+    configured_message = (
+        "execution-position-route-v2\0alpaca\0"
+        f"configured-account-scope\0{configured_scope}"
+    ).encode("utf-8")
+    raw_message = (
+        "execution-position-route-v2\0alpaca\0"
+        "broker-account-id\0raw-account-id"
+    ).encode("utf-8")
+    assert identity.account_scope == hmac.new(
+        stable_secret.encode("utf-8"),
+        raw_message,
+        sha256,
+    ).hexdigest()[:24]
+    assert identity.account_scope != hmac.new(
+        stable_secret.encode("utf-8"),
+        configured_message,
+        sha256,
+    ).hexdigest()[:24]
+
+
+def test_position_sync_uses_separate_row_for_configured_account_scope() -> None:
+    primary_settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        execution_position_account_scope="primary-upbit-account",
+    )
+    secondary_settings = primary_settings.model_copy(
+        update={"execution_position_account_scope": "secondary-upbit-account"}
+    )
+    engine, db = _session(primary_settings)
+
+    class UpbitSnapshotBroker(ReconciliationStubBroker):
+        provider = "upbit"
+
+        def describe(self) -> BrokerConfig:
+            return BrokerConfig(
+                provider="upbit",
+                mode="paper",
+                configured=True,
+                api_base_url="https://stub.upbit.local",
+            )
+
+    primary_broker = UpbitSnapshotBroker(
+        account_snapshot=BrokerAccountSnapshot(
+            observed_at=OBSERVED_AT,
+            source="stub:upbit",
+            holdings=[
+                BrokerAccountHolding(
+                    symbol="KRW-BTC",
+                    quantity=0,
+                    average_price=Decimal("100000000"),
+                    payload={"base_quantity": "0.001"},
+                )
+            ],
+        )
+    )
+    sync_execution_positions_from_broker_snapshot(
+        settings=primary_settings,
+        db=db,
+        adapter=primary_broker,
+        symbols={"KRW-BTC"},
+        exchange="UPBIT",
+    )
+
+    secondary_broker = UpbitSnapshotBroker(
+        account_snapshot=BrokerAccountSnapshot(
+            observed_at=OBSERVED_AT + timedelta(seconds=1),
+            source="stub:upbit",
+            holdings=[
+                BrokerAccountHolding(
+                    symbol="KRW-BTC",
+                    quantity=0,
+                    average_price=Decimal("110000000"),
+                    payload={"base_quantity": "0.002"},
+                )
+            ],
+        )
+    )
+    sync_execution_positions_from_broker_snapshot(
+        settings=secondary_settings,
+        db=db,
+        adapter=secondary_broker,
+        symbols={"KRW-BTC"},
+        exchange="UPBIT",
+    )
+
+    positions = db.scalars(
+        select(ExecutionPosition).where(ExecutionPosition.symbol == "KRW-BTC")
+    ).all()
+    assert {position.base_quantity for position in positions} == {
+        Decimal("0.001000000000"),
+        Decimal("0.002000000000"),
+    }
+    assert db.scalar(
+        select(func.count()).select_from(ExecutionPosition).where(
+            ExecutionPosition.mode == "paper",
+            ExecutionPosition.symbol == "KRW-BTC",
+        )
+    ) == 2
+    engine.dispose()
+
+
+def test_position_row_lookup_fails_closed_when_route_symbol_invariant_is_violated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = Settings(database_url="sqlite:///:memory:", runtime_mode="paper")
+    engine, db = _session(settings)
+    identity = build_position_identity(
+        settings=settings,
+        provider="upbit",
+        exchange="UPBIT",
+    )
+    duplicate_rows = [
+        ExecutionPosition(
+            mode="paper",
+            provider=identity.provider,
+            account_scope=identity.account_scope,
+            exchange=identity.exchange,
+            symbol="KRW-BTC",
+        ),
+        ExecutionPosition(
+            mode="paper",
+            provider=identity.provider,
+            account_scope=identity.account_scope,
+            exchange=identity.exchange,
+            symbol="KRW-BTC",
+        ),
+    ]
+
+    class DuplicateScalarResult:
+        def all(self) -> list[ExecutionPosition]:
+            return duplicate_rows
+
+    monkeypatch.setattr(db, "scalars", lambda _statement: DuplicateScalarResult())
+
+    with pytest.raises(
+        reconciliation_service.PositionIdentityConflictError,
+        match="one-row-per-route-symbol",
+    ):
+        reconciliation_service._lock_execution_position_rows(
+            db=db,
+            mode="paper",
+            symbols={"KRW-BTC"},
+            identity=identity,
+        )
+    db.rollback()
+    engine.dispose()
+
+
+def test_live_position_identity_without_broker_id_or_configured_scope_fails_closed() -> None:
+    settings = Settings(
+        runtime_mode="live",
+        upbit_access_key="live-access-key",
+        upbit_secret_key="live-secret-key",
+    )
+
+    with pytest.raises(
+        reconciliation_service.PositionIdentityConflictError,
+        match="stable broker account ID or EXECUTION_POSITION_ACCOUNT_SCOPE",
+    ):
+        build_position_identity(
+            settings=settings,
+            provider="upbit",
+            exchange="UPBIT",
+        )
+
+
+def test_older_account_snapshot_cannot_overwrite_newer_position_truth() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        kis_app_key="***",
+        kis_app_secret="***",
+        kis_account_number="12345678",
+    )
+    engine, db = _session(settings)
+    newer_observed_at = OBSERVED_AT + timedelta(minutes=1)
+    db.add(
+        ExecutionPosition(
+            mode="paper",
+            symbol="005930",
+            quantity=2,
+            average_price=Decimal("71000"),
+            updated_from="reconciliation",
+            last_reconciled_at=newer_observed_at,
+            raw_payload=payload_with_position_identity(
+                {"snapshot": "newer"},
+                identity=build_position_identity(
+                    settings=settings,
+                    provider="kis",
+                    exchange="KRX",
+                ),
+            ),
+        )
+    )
+    db.commit()
+    broker = ReconciliationStubBroker(
+        account_snapshot=BrokerAccountSnapshot(
+            available_cash=Decimal("1000000"),
+            observed_at=OBSERVED_AT,
+            source="stub:delayed_account_snapshot",
+            holdings=[],
+            payload={"snapshot": "older"},
+        )
+    )
+
+    result = sync_execution_positions_from_broker_snapshot(
+        settings=settings,
+        db=db,
+        adapter=broker,
+        symbols={"005930"},
+    )
+
+    position = db.scalar(
+        select(ExecutionPosition).where(
+            ExecutionPosition.mode == "paper",
+            ExecutionPosition.symbol == "005930",
+        )
+    )
+    assert result["zeroed"] == 0
+    assert position is not None
+    assert position.quantity == 2
+    assert position.average_price == Decimal("71000.0000")
+    assert _utc(position.last_reconciled_at) == newer_observed_at
+    assert position.raw_payload["snapshot"] == "newer"
+    assert position.raw_payload["_position_identity"]["provider"] == "kis"
+    engine.dispose()
+
+
+def test_matching_broker_values_cannot_bind_nonflat_legacy_position_to_current_account() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        kis_app_key="paper-key",
+        kis_app_secret="paper-secret",
+        kis_account_number="22222222",
+        kis_account_product_code="01",
+        account_drawdown_recovery_scope_secret="stable-position-scope-secret-at-least-32-bytes",
+    )
+    engine, db = _session(settings)
+    legacy_position = ExecutionPosition(
+        mode="paper",
+        symbol="005930",
+        quantity=1,
+        average_price=Decimal("71000"),
+        updated_from="legacy_import",
+        raw_payload={"legacy_marker": "unknown-account"},
+    )
+    db.add(legacy_position)
+    db.commit()
+    broker = ReconciliationStubBroker(
+        account_snapshot=BrokerAccountSnapshot(
+            available_cash=Decimal("1000000"),
+            observed_at=OBSERVED_AT,
+            source="stub:matching_other_account",
+            holdings=[
+                BrokerAccountHolding(
+                    symbol="005930",
+                    quantity=1,
+                    average_price=Decimal("71000"),
+                    sellable_quantity=1,
+                )
+            ],
+        )
+    )
+
+    with pytest.raises(
+        reconciliation_service.PositionIdentityConflictError,
+        match="legacy non-flat position requires explicit account mapping",
+    ):
+        sync_execution_positions_from_broker_snapshot(
+            settings=settings,
+            db=db,
+            adapter=broker,
+            symbols={"005930"},
+        )
+
+    db.rollback()
+    db.refresh(legacy_position)
+    assert legacy_position.provider is None
+    assert legacy_position.account_scope is None
+    assert legacy_position.exchange is None
+    assert legacy_position.raw_payload == {"legacy_marker": "unknown-account"}
+    assert db.scalar(
+        select(func.count()).select_from(ExecutionPosition).where(
+            ExecutionPosition.mode == "paper",
+            ExecutionPosition.symbol == "005930",
+        )
+    ) == 1
+    engine.dispose()
+
+
+def test_scoped_position_sync_cannot_ignore_parallel_nonflat_legacy_row() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        kis_app_key="paper-key",
+        kis_app_secret="paper-secret",
+        kis_account_number="22222222",
+        kis_account_product_code="01",
+        account_drawdown_recovery_scope_secret="stable-position-scope-secret-at-least-32-bytes",
+    )
+    engine, db = _session(settings)
+    identity = build_position_identity(
+        settings=settings,
+        provider="kis",
+        exchange="KRX",
+    )
+    scoped_position = ExecutionPosition(
+        mode="paper",
+        provider=identity.provider,
+        account_scope=identity.account_scope,
+        exchange=identity.exchange,
+        symbol="005930",
+        quantity=1,
+        average_price=Decimal("70000"),
+        updated_from="reconciliation",
+        raw_payload=payload_with_position_identity({}, identity=identity),
+    )
+    legacy_position = ExecutionPosition(
+        mode="paper",
+        symbol="005930",
+        quantity=2,
+        average_price=Decimal("71000"),
+        updated_from="legacy_import",
+        raw_payload={"legacy_marker": "unknown-account"},
+    )
+    db.add_all([scoped_position, legacy_position])
+    db.commit()
+    broker = ReconciliationStubBroker(
+        account_snapshot=BrokerAccountSnapshot(
+            available_cash=Decimal("1000000"),
+            observed_at=OBSERVED_AT,
+            source="stub:current_account",
+            holdings=[
+                BrokerAccountHolding(
+                    symbol="005930",
+                    quantity=3,
+                    average_price=Decimal("72000"),
+                    sellable_quantity=3,
+                )
+            ],
+        )
+    )
+
+    with pytest.raises(
+        reconciliation_service.PositionIdentityConflictError,
+        match="legacy position requires explicit account cleanup",
+    ):
+        sync_execution_positions_from_broker_snapshot(
+            settings=settings,
+            db=db,
+            adapter=broker,
+            symbols={"005930"},
+        )
+
+    db.rollback()
+    db.refresh(scoped_position)
+    db.refresh(legacy_position)
+    assert scoped_position.quantity == 1
+    assert scoped_position.average_price == Decimal("70000.0000")
+    assert legacy_position.provider is None
+    assert legacy_position.quantity == 2
     engine.dispose()
 
 
@@ -1481,6 +3195,7 @@ def test_reconcile_stale_filled_order_syncs_execution_positions() -> None:
     )
     engine, db = _session(settings)
     stale_submitted_at = datetime.now(UTC) - timedelta(days=7)
+    snapshot_observed_at = stale_submitted_at + timedelta(days=7, minutes=1)
     order = _order(broker_order_id="stale-sell-filled-1", side="sell")
     order.submitted_at = stale_submitted_at
     order.last_broker_sync_at = stale_submitted_at
@@ -1493,6 +3208,14 @@ def test_reconcile_stale_filled_order_syncs_execution_positions() -> None:
             average_price=Decimal("70000"),
             updated_from="reconciliation",
             last_reconciled_at=stale_submitted_at,
+            raw_payload=payload_with_position_identity(
+                None,
+                identity=build_position_identity(
+                    settings=settings,
+                    provider="kis",
+                    exchange="KRX",
+                ),
+            ),
         )
     )
     db.commit()
@@ -1509,7 +3232,7 @@ def test_reconcile_stale_filled_order_syncs_execution_positions() -> None:
         ],
         account_snapshot=BrokerAccountSnapshot(
             available_cash=Decimal("1000000"),
-            observed_at=OBSERVED_AT,
+            observed_at=snapshot_observed_at,
             source="stub:account_snapshot",
             holdings=[],
         ),
@@ -1532,7 +3255,95 @@ def test_reconcile_stale_filled_order_syncs_execution_positions() -> None:
     assert result["position_sync"]["zeroed"] == 1
     assert position is not None
     assert position.quantity == 0
-    assert position.last_reconciled_at == OBSERVED_AT.replace(tzinfo=None)
+    assert position.last_reconciled_at == snapshot_observed_at.replace(tzinfo=None)
+    engine.dispose()
+
+
+@pytest.mark.parametrize("order_exchange", ["NXT", "SOR"])
+def test_reconcile_stale_domestic_fill_queries_order_route_but_stores_krx_position(
+    order_exchange: str,
+) -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        stale_broker_order_reconciliation_threshold_seconds=3600,
+    )
+    engine, db = _session(settings)
+    stale_submitted_at = datetime.now(UTC) - timedelta(days=7)
+    order = _order(
+        settings=settings,
+        broker_order_id=f"stale-{order_exchange.lower()}-filled-1",
+        request_metadata={"route": {"exchange": order_exchange}},
+    )
+    order.submitted_at = stale_submitted_at
+    order.last_broker_sync_at = stale_submitted_at
+    db.add(order)
+    db.commit()
+
+    class RouteRecordingBroker(ReconciliationStubBroker):
+        def __init__(self) -> None:
+            super().__init__(
+                reconcile_payloads=[
+                    {
+                        "broker_order_id": order.broker_order_id,
+                        "status": "filled",
+                        "filled_quantity": 2,
+                        "remaining_quantity": 0,
+                        "average_fill_price": "71000",
+                        "observed_at": OBSERVED_AT.isoformat(),
+                    }
+                ],
+                account_snapshot=BrokerAccountSnapshot(
+                    available_cash=Decimal("1000000"),
+                    observed_at=OBSERVED_AT + timedelta(minutes=1),
+                    source="stub:account_snapshot",
+                    holdings=[
+                        BrokerAccountHolding(
+                            symbol="005930",
+                            quantity=2,
+                            average_price=Decimal("70000"),
+                        )
+                    ],
+                ),
+            )
+            self.snapshot_calls: list[tuple[list[str] | None, str]] = []
+
+        def get_account_snapshot(
+            self,
+            access_token: str,
+            *,
+            symbols: list[str] | None = None,
+            reference_prices: dict[str, Decimal] | None = None,
+            exchange: str = "KRX",
+        ) -> BrokerAccountSnapshot:
+            assert access_token
+            del reference_prices
+            self.snapshot_calls.append((symbols, exchange))
+            return self.account_snapshot
+
+    broker = RouteRecordingBroker()
+
+    result = reconcile_stale_nonterminal_broker_orders(
+        settings=settings,
+        db=db,
+        adapter=broker,
+    )
+
+    positions = db.scalars(
+        select(ExecutionPosition).where(
+            ExecutionPosition.mode == "paper",
+            ExecutionPosition.symbol == "005930",
+        )
+    ).all()
+    assert result["counts"]["closed"] == 1
+    assert broker.reconcile_calls == [
+        (order.broker_order_id, order_exchange, stale_submitted_at)
+    ]
+    assert broker.snapshot_calls == [(["005930"], order_exchange)]
+    assert len(positions) == 1
+    assert positions[0].exchange == "KRX"
+    assert positions[0].quantity == 2
+    assert all(position.exchange not in {"NXT", "SOR"} for position in positions)
     engine.dispose()
 
 
@@ -1880,6 +3691,11 @@ def test_runtime_and_daily_board_open_order_counts_exclude_repaired_stale_states
         "031330": "stale_terminal_unknown",
         "001450": "manual_review_required",
     }
+    identity = build_position_identity(
+        settings=settings,
+        provider="kis",
+        exchange="KRX",
+    )
     for index, (symbol, status) in enumerate(statuses_by_symbol.items()):
         item = ExecutionPlanItem(
             plan=plan,
@@ -1889,6 +3705,10 @@ def test_runtime_and_daily_board_open_order_counts_exclude_repaired_stale_states
             intent="intraday_watch_buy",
             status="watch_monitoring_active",
             quantity_policy={"kind": "shares", "quantity": 1},
+            provider="kis",
+            venue="KIS",
+            asset_class="stock",
+            risk_context={"exchange": "KRX"},
         )
         order = BrokerOrder(
             broker_name="kis",
@@ -1899,8 +3719,18 @@ def test_runtime_and_daily_board_open_order_counts_exclude_repaired_stale_states
             side="buy",
             status=status,
             quantity=1,
+            venue="KIS",
+            asset_class="stock",
             submitted_at=observed_at,
             last_broker_sync_at=observed_at,
+            request_metadata={
+                "exchange": "KRX",
+                "execution_scope": execution_scope_payload(
+                    identity=identity,
+                    venue="KIS",
+                    asset_class="stock",
+                ),
+            },
         )
         order.plan_item = item
     db.add(plan)
@@ -1935,6 +3765,16 @@ def test_runtime_status_reports_position_truth_freshness_details() -> None:
     )
     engine, db = _session(settings)
     stale_reconciled_at = datetime.now(UTC) - timedelta(hours=2)
+    identity = build_position_identity(
+        settings=settings,
+        provider="kis",
+        exchange="KRX",
+    )
+    order_scope = execution_scope_payload(
+        identity=identity,
+        venue="KRX",
+        asset_class="stock",
+    )
     db.add(
         BrokerOrder(
             broker_name="kis",
@@ -1945,17 +3785,24 @@ def test_runtime_status_reports_position_truth_freshness_details() -> None:
             side="buy",
             status="filled",
             quantity=4,
+            venue="KRX",
+            asset_class="stock",
             submitted_at=stale_reconciled_at + timedelta(minutes=5),
+            request_metadata={"execution_scope": order_scope},
         )
     )
     db.add(
         ExecutionPosition(
             mode="paper",
+            provider=identity.provider,
+            account_scope=identity.account_scope,
+            exchange=identity.exchange,
             symbol="319660",
             quantity=0,
             average_price=None,
             updated_from="reconciliation",
             last_reconciled_at=stale_reconciled_at,
+            raw_payload=payload_with_position_identity(None, identity=identity),
         )
     )
     db.commit()
@@ -1983,15 +3830,26 @@ def test_runtime_status_does_not_count_historical_flat_positions_as_stale() -> N
     )
     engine, db = _session(settings)
     stale_reconciled_at = datetime.now(UTC) - timedelta(days=30)
+    identity = build_position_identity(
+        settings=settings,
+        provider="kis",
+        exchange="KRX",
+    )
     db.add(
         ExecutionPosition(
             mode="paper",
+            provider=identity.provider,
+            account_scope=identity.account_scope,
+            exchange=identity.exchange,
             symbol="000660",
             quantity=0,
             average_price=None,
             updated_from="reconciliation",
             last_reconciled_at=stale_reconciled_at,
-            raw_payload={"source": "broker"},
+            raw_payload=payload_with_position_identity(
+                {"source": "broker"},
+                identity=identity,
+            ),
         )
     )
     db.commit()
@@ -2019,6 +3877,15 @@ def test_runtime_status_reports_actionable_stale_nonterminal_orders() -> None:
     engine, db = _session(settings)
     stale_observed_at = datetime.now(UTC) - timedelta(days=3)
     recent_observed_at = datetime.now(UTC)
+    order_scope = execution_scope_payload(
+        identity=build_position_identity(
+            settings=settings,
+            provider="kis",
+            exchange="KRX",
+        ),
+        venue="KRX",
+        asset_class="stock",
+    )
     db.add_all(
         [
             BrokerOrder(
@@ -2030,8 +3897,11 @@ def test_runtime_status_reports_actionable_stale_nonterminal_orders() -> None:
                 side="buy",
                 status="submitted",
                 quantity=1,
+                venue="KRX",
+                asset_class="stock",
                 submitted_at=stale_observed_at,
                 last_broker_sync_at=stale_observed_at,
+                request_metadata={"execution_scope": order_scope},
             ),
             BrokerOrder(
                 broker_name="kis",
@@ -2042,8 +3912,11 @@ def test_runtime_status_reports_actionable_stale_nonterminal_orders() -> None:
                 side="sell",
                 status="retry_pending",
                 quantity=2,
+                venue="KRX",
+                asset_class="stock",
                 submitted_at=stale_observed_at,
                 last_broker_sync_at=stale_observed_at,
+                request_metadata={"execution_scope": order_scope},
             ),
             BrokerOrder(
                 broker_name="kis",
@@ -2054,8 +3927,11 @@ def test_runtime_status_reports_actionable_stale_nonterminal_orders() -> None:
                 side="buy",
                 status="submitted",
                 quantity=1,
+                venue="KRX",
+                asset_class="stock",
                 submitted_at=recent_observed_at,
                 last_broker_sync_at=recent_observed_at,
+                request_metadata={"execution_scope": order_scope},
             ),
             BrokerOrder(
                 broker_name="kis",
@@ -2066,11 +3942,14 @@ def test_runtime_status_reports_actionable_stale_nonterminal_orders() -> None:
                 side="buy",
                 status="submitted",
                 quantity=1,
+                venue="KRX",
+                asset_class="stock",
                 submitted_at=recent_observed_at,
                 last_broker_sync_at=recent_observed_at,
                 last_error_classification="unknown_status",
                 last_error_code="unknown",
                 last_error_message="unrecognized broker status",
+                request_metadata={"execution_scope": order_scope},
             ),
             BrokerOrder(
                 broker_name="kis",
@@ -2125,6 +4004,15 @@ def test_runtime_status_immediately_surfaces_unknown_submit_for_manual_review() 
     )
     engine, db = _session(settings)
     observed_at = datetime.now(UTC)
+    order_scope = execution_scope_payload(
+        identity=build_position_identity(
+            settings=settings,
+            provider="kis",
+            exchange="KRX",
+        ),
+        venue="KRX",
+        asset_class="stock",
+    )
     db.add(
         BrokerOrder(
             broker_name="kis",
@@ -2135,6 +4023,8 @@ def test_runtime_status_immediately_surfaces_unknown_submit_for_manual_review() 
             side="buy",
             status="manual_review_required",
             quantity=1,
+            venue="KRX",
+            asset_class="stock",
             limit_price=Decimal("70000"),
             submitted_at=None,
             last_broker_sync_at=observed_at,
@@ -2142,6 +4032,7 @@ def test_runtime_status_immediately_surfaces_unknown_submit_for_manual_review() 
             last_error_code="SUBMIT_OUTCOME_UNKNOWN",
             last_error_message="manual broker reconciliation is required",
             last_error_retryable=False,
+            request_metadata={"execution_scope": order_scope},
         )
     )
     db.commit()
@@ -2171,6 +4062,15 @@ def test_runtime_status_reports_pnl_fill_quality_alerts() -> None:
     )
     engine, db = _session(settings)
     filled_at = datetime.now(UTC)
+    order_scope = execution_scope_payload(
+        identity=build_position_identity(
+            settings=settings,
+            provider="kis",
+            exchange="KRX",
+        ),
+        venue="KRX",
+        asset_class="stock",
+    )
     missing_fill_order = BrokerOrder(
         broker_name="kis",
         mode="paper",
@@ -2180,7 +4080,10 @@ def test_runtime_status_reports_pnl_fill_quality_alerts() -> None:
         side="buy",
         status="filled",
         quantity=1,
+        venue="KRX",
+        asset_class="stock",
         submitted_at=filled_at,
+        request_metadata={"execution_scope": dict(order_scope)},
     )
     duplicate_fill_order = BrokerOrder(
         broker_name="kis",
@@ -2191,7 +4094,10 @@ def test_runtime_status_reports_pnl_fill_quality_alerts() -> None:
         side="buy",
         status="filled",
         quantity=2,
+        venue="KRX",
+        asset_class="stock",
         submitted_at=filled_at,
+        request_metadata={"execution_scope": dict(order_scope)},
     )
     distinct_broker_fill_order = BrokerOrder(
         broker_name="kis",
@@ -2202,7 +4108,10 @@ def test_runtime_status_reports_pnl_fill_quality_alerts() -> None:
         side="buy",
         status="filled",
         quantity=2,
+        venue="KRX",
+        asset_class="stock",
         submitted_at=filled_at,
+        request_metadata={"execution_scope": dict(order_scope)},
     )
     db.add_all([missing_fill_order, duplicate_fill_order, distinct_broker_fill_order])
     db.flush()
@@ -2275,6 +4184,15 @@ def test_runtime_status_matches_duplicate_fill_reviews_by_candidate_key() -> Non
     )
     engine, db = _session(settings)
     filled_at = datetime.now(UTC)
+    order_scope = execution_scope_payload(
+        identity=build_position_identity(
+            settings=settings,
+            provider="kis",
+            exchange="KRX",
+        ),
+        venue="KRX",
+        asset_class="stock",
+    )
     order = BrokerOrder(
         broker_name="kis",
         mode="paper",
@@ -2284,7 +4202,10 @@ def test_runtime_status_matches_duplicate_fill_reviews_by_candidate_key() -> Non
         side="buy",
         status="filled",
         quantity=4,
+        venue="KRX",
+        asset_class="stock",
         submitted_at=filled_at,
+        request_metadata={"execution_scope": order_scope},
     )
     db.add(order)
     db.flush()
@@ -2421,6 +4342,15 @@ def test_missing_fill_alert_symbols_exclude_reviewed_and_ignore_sample_limit() -
     )
     engine, db = _session(settings)
     submitted_at = datetime.now(UTC)
+    order_scope = execution_scope_payload(
+        identity=build_position_identity(
+            settings=settings,
+            provider="kis",
+            exchange="KRX",
+        ),
+        venue="KRX",
+        asset_class="stock",
+    )
     reviewed_orders = [
         BrokerOrder(
             broker_name="kis",
@@ -2431,7 +4361,10 @@ def test_missing_fill_alert_symbols_exclude_reviewed_and_ignore_sample_limit() -
             side="buy",
             status="filled",
             quantity=1,
+            venue="KRX",
+            asset_class="stock",
             submitted_at=submitted_at + timedelta(minutes=index),
+            request_metadata={"execution_scope": dict(order_scope)},
         )
         for index in range(20)
     ]
@@ -2444,7 +4377,10 @@ def test_missing_fill_alert_symbols_exclude_reviewed_and_ignore_sample_limit() -
         side="buy",
         status="filled",
         quantity=1,
+        venue="KRX",
+        asset_class="stock",
         submitted_at=submitted_at - timedelta(days=1),
+        request_metadata={"execution_scope": dict(order_scope)},
     )
     db.add_all([*reviewed_orders, unreviewed_order])
     db.flush()
@@ -2546,7 +4482,11 @@ class KisReconcileHttpClient:
         timeout_seconds: float,
     ) -> JsonHttpResponse:
         self.calls.append({"url": url, "headers": headers, "params": params, "timeout_seconds": timeout_seconds})
-        return JsonHttpResponse(status_code=200, headers={}, payload=self.payload)
+        return JsonHttpResponse(
+            status_code=200,
+            headers={"tr_cont": "D"},
+            payload=self.payload,
+        )
 
     def post_json(self, **_kwargs: object) -> JsonHttpResponse:
         raise AssertionError("reconciliation must not place or post orders")
@@ -2565,9 +4505,10 @@ def test_kis_reconcile_order_reports_cumulative_quantity_without_synthetic_fill(
             "rt_cd": "0",
             "msg_cd": "MCA00000",
             "output1": [
-                {
-                    "odno": "0033196600",
-                    "pdno": "005930",
+                    {
+                        "odno": "0033196600",
+                        "pdno": "005930",
+                        "excg_id_dvsn_Cd": "KRX",
                     "sll_buy_dvsn_cd": "02",
                     "ord_qty": "2",
                     "tot_ccld_qty": "2",
@@ -2582,12 +4523,20 @@ def test_kis_reconcile_order_reports_cumulative_quantity_without_synthetic_fill(
     )
     adapter = KisBrokerAdapter(settings=settings, http_client=http_client)
 
-    payload = adapter.reconcile_order("top-secret-token", "0033196600")
+    payload = adapter.reconcile_order(
+        "top-secret-token",
+        "0033196600",
+        submitted_at=datetime(2026, 5, 13, tzinfo=UTC),
+        expected_symbol="005930",
+    )
 
     assert payload is not None
     assert payload["status"] == "filled"
     assert payload["filled_quantity"] == 2
-    assert payload["filled_at"] == "2026-05-13T00:05:01+00:00"
+    assert payload["filled_at"] == payload["observed_at"]
+    assert payload["fill_time_precision"] == "observed_upper_bound"
+    assert payload["fill_time_source"] == "reconciliation_observed_at"
+    assert payload["payload"]["order"]["ord_tmd"] == "090501"
     assert "fills" not in payload
     assert http_client.calls[0]["params"]["ODNO"] == "0033196600"
 
@@ -2605,9 +4554,10 @@ def test_kis_reconcile_order_uses_avg_prvs_as_average_fill_price() -> None:
             "rt_cd": "0",
             "msg_cd": "MCA00000",
             "output1": [
-                {
-                    "odno": "0033196600",
-                    "pdno": "005930",
+                    {
+                        "odno": "0033196600",
+                        "pdno": "005930",
+                        "excg_id_dvsn_Cd": "KRX",
                     "sll_buy_dvsn_cd": "01",
                     "ord_qty": "2",
                     "tot_ccld_qty": "2",
@@ -2623,7 +4573,12 @@ def test_kis_reconcile_order_uses_avg_prvs_as_average_fill_price() -> None:
     )
     adapter = KisBrokerAdapter(settings=settings, http_client=http_client)
 
-    payload = adapter.reconcile_order("top-secret-token", "0033196600")
+    payload = adapter.reconcile_order(
+        "top-secret-token",
+        "0033196600",
+        submitted_at=datetime(2026, 5, 13, tzinfo=UTC),
+        expected_symbol="005930",
+    )
 
     assert payload is not None
     assert payload["status"] == "filled"
@@ -2644,9 +4599,10 @@ def test_kis_reconcile_order_treats_sell_rejection_kind_as_rejected() -> None:
             "rt_cd": "0",
             "msg_cd": "MCA00000",
             "output1": [
-                {
-                    "odno": "0007266500",
-                    "pdno": "000815",
+                    {
+                        "odno": "0007266500",
+                        "pdno": "000815",
+                        "excg_id_dvsn_Cd": "KRX",
                     "sll_buy_dvsn_cd": "01",
                     "sll_buy_dvsn_cd_name": "매도거부",
                     "ord_qty": "1",
@@ -2663,7 +4619,12 @@ def test_kis_reconcile_order_treats_sell_rejection_kind_as_rejected() -> None:
     )
     adapter = KisBrokerAdapter(settings=settings, http_client=http_client)
 
-    payload = adapter.reconcile_order("top-secret-token", "0007266500")
+    payload = adapter.reconcile_order(
+        "top-secret-token",
+        "0007266500",
+        submitted_at=datetime(2026, 6, 8, tzinfo=UTC),
+        expected_symbol="000815",
+    )
 
     assert payload is not None
     assert payload["status"] == "rejected"
@@ -2680,6 +4641,8 @@ def test_kis_reconcile_order_uses_daily_ccld_endpoint_and_mode_tr_id(
     runtime_mode: str,
     expected_tr_id: str,
 ) -> None:
+    submitted_at = datetime.now(UTC)
+    submitted_krx_date = (submitted_at + timedelta(hours=9)).strftime("%Y%m%d")
     settings = Settings(
         runtime_mode=runtime_mode,
         kis_app_key="***",
@@ -2695,12 +4658,13 @@ def test_kis_reconcile_order_uses_daily_ccld_endpoint_and_mode_tr_id(
                 {
                     "odno": "0033196600",
                     "pdno": "005930",
+                    "excg_id_dvsn_Cd": "KRX",
                     "sll_buy_dvsn_cd": "02",
                     "ord_qty": "1",
                     "tot_ccld_qty": "0",
                     "rmn_qty": "1",
                     "avg_pric": "0",
-                    "ord_dt": "20260513",
+                    "ord_dt": submitted_krx_date,
                     "ord_tmd": "090501",
                     "ord_st_dvsn_cd_name": "미체결",
                 }
@@ -2709,7 +4673,12 @@ def test_kis_reconcile_order_uses_daily_ccld_endpoint_and_mode_tr_id(
     )
     adapter = KisBrokerAdapter(settings=settings, http_client=http_client)
 
-    payload = adapter.reconcile_order("top-secret-token", "0033196600")
+    payload = adapter.reconcile_order(
+        "top-secret-token",
+        "0033196600",
+        submitted_at=submitted_at,
+        expected_symbol="005930",
+    )
 
     assert payload is not None
     assert payload["status"] == "open"
@@ -2732,9 +4701,10 @@ def test_kis_reconcile_order_uses_requested_exchange() -> None:
             "rt_cd": "0",
             "msg_cd": "MCA00000",
             "output1": [
-                {
-                    "odno": "0042705600",
-                    "pdno": "034730",
+                    {
+                        "odno": "0042705600",
+                        "pdno": "034730",
+                        "excg_id_dvsn_Cd": "NXT",
                     "sll_buy_dvsn_cd": "02",
                     "ord_qty": "1",
                     "tot_ccld_qty": "1",
@@ -2753,6 +4723,8 @@ def test_kis_reconcile_order_uses_requested_exchange() -> None:
         "top-secret-token",
         "0042705600",
         exchange="NXT",
+        submitted_at=datetime(2026, 6, 2, tzinfo=UTC),
+        expected_symbol="034730",
     )
 
     assert payload is not None
@@ -2773,9 +4745,10 @@ def test_kis_reconcile_order_uses_submitted_date_as_inquiry_start() -> None:
             "rt_cd": "0",
             "msg_cd": "MCA00000",
             "output1": [
-                {
-                    "odno": "0002761000",
-                    "pdno": "105560",
+                    {
+                        "odno": "0002761000",
+                        "pdno": "105560",
+                        "excg_id_dvsn_Cd": "KRX",
                     "sll_buy_dvsn_cd": "02",
                     "ord_qty": "1",
                     "tot_ccld_qty": "1",
@@ -2794,12 +4767,13 @@ def test_kis_reconcile_order_uses_submitted_date_as_inquiry_start() -> None:
         "top-secret-token",
         "0002761000",
         submitted_at=datetime(2026, 7, 23, 9, 3, 20, tzinfo=UTC),
+        expected_symbol="105560",
     )
 
     assert payload is not None
     assert payload["status"] == "filled"
     assert http_client.calls[0]["params"]["INQR_STRT_DT"] == "20260723"
-    assert http_client.calls[0]["params"]["INQR_END_DT"] >= "20260723"
+    assert http_client.calls[0]["params"]["INQR_END_DT"] == "20260723"
 
 
 def test_reconcile_order_uses_route_exchange_from_order_metadata() -> None:
@@ -2848,7 +4822,7 @@ def test_reconcile_order_preserves_kis_us_exchange_from_plan_context() -> None:
     )
     order.asset_class = "us_equity"
     order.venue = "NASD"
-    order.request_metadata = {"source": "test"}
+    order.request_metadata = {**(order.request_metadata or {}), "source": "test"}
     db.add(plan)
     db.commit()
     broker = ReconciliationStubBroker(
@@ -2880,10 +4854,11 @@ def test_reconcile_order_fails_closed_for_us_equity_without_exchange() -> None:
 
     result = reconcile_broker_order(settings=settings, db=db, adapter=broker, order=order)
 
-    assert result["status_code"] == 503
-    assert result["status"] == "submitted"
+    assert result["status_code"] == 409
+    assert result["status"] == "manual_review_required"
+    assert result["scope_classification"] == "invalid_execution_scope"
     assert broker.reconcile_calls == []
-    assert "explicit NASD, NYSE, or AMEX" in str(result["message"])
+    assert result["message"] == "canonical_execution_scope_conflicts_with_order"
     engine.dispose()
 
 
@@ -2957,12 +4932,12 @@ def test_reconcile_repeated_identical_broker_failures_are_deduped() -> None:
     events = db.scalars(
         select(BrokerOrderEvent).where(BrokerOrderEvent.event_type == "reconcile_failed")
     ).all()
-    assert first["message"] == "KIS request failed"
-    assert second["message"] == "KIS request failed"
+    assert first["message"].startswith("broker_error_details_redacted[")
+    assert second["message"] == first["message"]
     assert len(events) == 1
     assert events[0].payload is not None
     assert events[0].payload["request_metadata"]["tr_id"] == "VTTC0081R"
-    assert order.last_error_message == "KIS request failed"
+    assert order.last_error_message == first["message"]
     engine.dispose()
 
 
@@ -2991,7 +4966,7 @@ def test_reconcile_repeated_generic_failures_are_deduped_with_unknown_classifica
     events = db.scalars(
         select(BrokerOrderEvent).where(BrokerOrderEvent.event_type == "reconcile_failed")
     ).all()
-    assert first["message"].startswith("ValueError: reconcile_order adapter returned")
+    assert first["message"].startswith("broker_error_details_redacted[")
     assert second["message"] == first["message"]
     assert len(events) == 1
     assert events[0].error_classification == "unknown"
@@ -3008,6 +4983,7 @@ def test_reconcile_kospi_circuit_breaker_sell_reject_schedules_retry() -> None:
     )
     engine, db = _session(settings)
     plan, item, order = _plan_backed_order(
+        settings=settings,
         plan_id="plan-kospi-circuit-breaker-retry",
         side="sell",
         intent="stop_sell",
@@ -3081,6 +5057,7 @@ def test_reconcile_kosdaq_sidecar_sell_reject_schedules_delayed_retry() -> None:
     )
     engine, db = _session(settings)
     plan, item, order = _plan_backed_order(
+        settings=settings,
         plan_id="plan-kosdaq-sidecar-retry",
         side="sell",
         intent="target_sell",
@@ -3135,6 +5112,7 @@ def test_reconcile_repeat_temp_reject_does_not_slide_pending_retry_job() -> None
     )
     engine, db = _session(settings)
     plan, item, order = _plan_backed_order(
+        settings=settings,
         plan_id="plan-repeat-temp-reject-stable-retry",
         side="sell",
         intent="target_sell",
@@ -3225,6 +5203,7 @@ def test_reconcile_insufficient_holdings_sell_reject_does_not_retry() -> None:
     )
     engine, db = _session(settings)
     plan, item, order = _plan_backed_order(
+        settings=settings,
         plan_id="plan-insufficient-holdings-no-retry",
         side="sell",
         intent="stop_sell",
@@ -3286,6 +5265,7 @@ def test_reconcile_insufficient_cash_buy_reject_does_not_retry() -> None:
     )
     engine, db = _session(settings)
     plan, item, order = _plan_backed_order(
+        settings=settings,
         plan_id="plan-insufficient-cash-no-retry",
         side="buy",
         intent="next_open_buy",
@@ -3336,6 +5316,7 @@ def test_reconcile_expired_buy_signal_temp_reject_does_not_retry() -> None:
     )
     engine, db = _session(settings)
     plan, item, order = _plan_backed_order(
+        settings=settings,
         plan_id="plan-expired-buy-signal-no-retry",
         side="buy",
         intent="next_open_buy",
@@ -3388,6 +5369,7 @@ def test_retry_job_dispatch_and_reconciliation_rerun_do_not_duplicate_retry_orde
     )
     engine, db = _session(settings)
     plan, item, order = _plan_backed_order(
+        settings=settings,
         plan_id="plan-retry-rerun-idempotent",
         side="sell",
         intent="stop_sell",
@@ -3395,7 +5377,54 @@ def test_retry_job_dispatch_and_reconciliation_rerun_do_not_duplicate_retry_orde
         quantity=20,
         broker_order_id="retry-rerun-source-1",
     )
+    item.risk_context, item.quantity_policy = bind_kis_account_route(
+        settings=settings,
+        provider="kis",
+        risk_context=item.risk_context,
+        quantity_policy=item.quantity_policy,
+    )
     db.add_all([plan, order])
+    db.flush()
+    canonical_source_command = PlaceOrderRequest(
+        idempotency_key=order.idempotency_key,
+        execution_plan_item_id=item.id,
+        provider="kis",
+        venue="KRX",
+        asset_class="stock",
+        symbol=order.symbol,
+        side=order.side,
+        quantity=order.quantity,
+        order_type="limit",
+        limit_price=order.limit_price,
+        time_in_force="day",
+        exchange="KRX",
+    )
+    order.request_metadata = {
+        **(order.request_metadata or {}),
+        "provider": "kis",
+        "venue": "KRX",
+        "asset_class": "stock",
+        "exchange": "KRX",
+        "time_in_force": "day",
+        "sizing": {
+            "quantity": order.quantity,
+            "base_quantity": None,
+            "quote_notional": None,
+            "limit_price": str(order.limit_price),
+            "quantity_precision": None,
+            "price_precision": None,
+        },
+    }
+    order.events.append(
+        BrokerOrderEvent(
+            event_type="submit_requested",
+            event_source="submission",
+            normalized_status="submission_pending",
+            request_payload=canonical_source_command.model_dump(mode="json"),
+            payload={"provider": "kis"},
+            observed_at=OBSERVED_AT,
+        )
+    )
     db.commit()
     retry_at = OBSERVED_AT + timedelta(minutes=1)
     broker = ReconciliationStubBroker(

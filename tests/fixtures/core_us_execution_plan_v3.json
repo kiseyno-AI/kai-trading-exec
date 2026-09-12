@@ -1,6 +1,6 @@
 {
   "plan_id": "core-us-signal-decider-20260820-kis",
-  "source": "kai-trading-core",
+  "source": "test-fixture",
   "mode": "paper",
   "market_date": "2026-08-20",
   "strategy_run_id": "us-symbol-run-2026-08-19-contract",

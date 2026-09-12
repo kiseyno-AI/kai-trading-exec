@@ -8,18 +8,25 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any, cast
 
-from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.broker.alpaca import AlpacaBrokerAdapter
 from app.broker.base import BrokerLiveMarketContext
 from app.core.config import Settings
-from app.models.runtime import MonitoringCheckpoint
 from app.services.alpaca_crypto_strategy import AlpacaCryptoStrategyService
 from app.services.broker_auth import build_broker_adapter, ensure_authenticated_broker_session
+from app.services.monitoring_checkpoint_scope import (
+    exact_monitoring_execution_scope,
+    upsert_scoped_monitoring_checkpoint,
+)
 from app.services.reconciliation import (
     reconcile_pending_broker_orders,
     sync_execution_positions_from_broker_snapshot,
+)
+from app.services.runtime_shutdown import (
+    CommitGuardedSessionFactory,
+    GuardedBrokerAdapter,
+    RuntimeCycleFence,
 )
 
 
@@ -69,6 +76,18 @@ class AlpacaUsEquityRuntimeCoordinator:
     settings: Settings
     session_factory: sessionmaker[Session]
     _task: asyncio.Task[None] | None = field(default=None, init=False)
+    _inflight_cycles: set[asyncio.Task[dict[str, object]]] = field(
+        default_factory=set,
+        init=False,
+    )
+    _lifecycle_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False)
+    _stopping: bool = field(default=False, init=False)
+    _shutdown_fence: RuntimeCycleFence = field(
+        default_factory=RuntimeCycleFence,
+        init=False,
+        repr=False,
+    )
+    _cycle_session_factory: sessionmaker[Session] = field(init=False, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False)
     _status: str = field(default="disabled", init=False)
     _last_heartbeat_at: datetime | None = field(default=None, init=False)
@@ -80,8 +99,16 @@ class AlpacaUsEquityRuntimeCoordinator:
     _last_reconciled_at: datetime | None = field(default=None, init=False)
     _market_clock: dict[str, object] = field(default_factory=dict, init=False)
     _strategy: AlpacaCryptoStrategyService = field(init=False)
+    _execution_scope: dict[str, object] | None = field(default=None, init=False)
 
     def __post_init__(self) -> None:
+        self._cycle_session_factory = cast(
+            sessionmaker[Session],
+            CommitGuardedSessionFactory(
+                self.session_factory,
+                self._shutdown_fence,
+            ),
+        )
         strategy_settings = self.settings.model_copy(
             update={
                 "alpaca_crypto_strategy_enabled": self.settings.alpaca_us_equity_strategy_enabled,
@@ -94,7 +121,7 @@ class AlpacaUsEquityRuntimeCoordinator:
         )
         self._strategy = AlpacaCryptoStrategyService(
             settings=strategy_settings,
-            session_factory=self.session_factory,
+            session_factory=self._cycle_session_factory,
             asset_class="us_equity",
             exchange="US",
             time_in_force="day",
@@ -105,14 +132,58 @@ class AlpacaUsEquityRuntimeCoordinator:
             self._status = "idle"
 
     async def start(self) -> None:
-        if self.settings.alpaca_us_equity_monitoring_enabled:
+        if not self.settings.alpaca_us_equity_monitoring_enabled:
+            return
+        if self._stopping:
+            raise RuntimeError("cannot start Alpaca US-equity runtime while shutting down")
+        async with self._lifecycle_lock:
+            if self._task is not None and not self._task.done():
+                return
+            if self._inflight_cycles:
+                raise RuntimeError(
+                    "cannot start Alpaca US-equity runtime while an in-flight "
+                    "cycle is still draining"
+                )
+            self._stopping = False
             self._task = asyncio.create_task(self._run_loop())
 
+    def mark_startup_blocked(self, reason: str) -> None:
+        if not self.settings.alpaca_us_equity_monitoring_enabled:
+            return
+        with self._lock:
+            self._status = "blocked"
+            self._last_error = reason
+
+    def begin_shutdown(self) -> None:
+        self._stopping = True
+        self._shutdown_fence.begin_shutdown()
+
     async def stop(self) -> None:
-        if self._task is not None:
-            self._task.cancel()
-            await asyncio.gather(self._task, return_exceptions=True)
-            self._task = None
+        async with self._lifecycle_lock:
+            self.begin_shutdown()
+            if self._task is not None:
+                self._task.cancel()
+                await asyncio.gather(self._task, return_exceptions=True)
+            await self._drain_inflight_cycles(
+                timeout=self._shutdown_drain_timeout_seconds()
+            )
+            self._finish_stop()
+
+    async def wait_stopped(self) -> None:
+        """Wait without a timeout so lifespan cannot outlive a worker thread."""
+
+        async with self._lifecycle_lock:
+            self.begin_shutdown()
+            if self._task is not None and not self._task.done():
+                self._task.cancel()
+                await asyncio.gather(self._task, return_exceptions=True)
+            await self._drain_inflight_cycles(timeout=None)
+            self._finish_stop()
+
+    def _finish_stop(self) -> None:
+        self._task = None
+        self._shutdown_fence.finish_shutdown()
+        self._stopping = False
 
     def snapshot(self) -> dict[str, object]:
         with self._lock:
@@ -140,11 +211,60 @@ class AlpacaUsEquityRuntimeCoordinator:
 
     async def _run_loop(self) -> None:
         try:
-            while True:
-                await asyncio.to_thread(self.run_cycle)
+            while not self._stopping:
+                await self._run_cycle_in_thread()
+                if self._stopping:
+                    return
                 await asyncio.sleep(self.settings.alpaca_us_equity_monitoring_interval_seconds)
         except asyncio.CancelledError:
             raise
+
+    async def _run_cycle_in_thread(self) -> dict[str, object]:
+        if self._stopping:
+            raise asyncio.CancelledError
+        generation = self._shutdown_fence.capture_generation()
+        task = asyncio.create_task(
+            asyncio.to_thread(
+                self._shutdown_fence.run,
+                generation,
+                self.run_cycle,
+            )
+        )
+        self._inflight_cycles.add(task)
+        task.add_done_callback(self._inflight_cycle_done)
+        return await asyncio.shield(task)
+
+    def _inflight_cycle_done(
+        self,
+        task: asyncio.Task[dict[str, object]],
+    ) -> None:
+        self._inflight_cycles.discard(task)
+        if task.cancelled():
+            return
+        task.exception()
+
+    async def _drain_inflight_cycles(self, *, timeout: float | None) -> None:
+        tasks = tuple(self._inflight_cycles)
+        if not tasks:
+            return
+        done, pending = await asyncio.wait(
+            tasks,
+            timeout=timeout,
+        )
+        if done:
+            await asyncio.gather(*done, return_exceptions=True)
+        if pending:
+            raise TimeoutError(
+                "Alpaca US-equity in-flight cycle did not drain within the "
+                "configured cycle timeout"
+            )
+
+    def _shutdown_drain_timeout_seconds(self) -> float:
+        return max(
+            float(self.settings.alpaca_request_timeout_seconds),
+            float(self.settings.monitoring_cycle_timeout_seconds)
+            * float(self.settings.monitoring_stale_cycle_exit_grace_multiplier),
+        )
 
     def run_cycle(self) -> dict[str, object]:
         observed_at = datetime.now(UTC)
@@ -152,11 +272,33 @@ class AlpacaUsEquityRuntimeCoordinator:
         try:
             result = self._execute_cycle(observed_at)
         except Exception as exc:
+            self._shutdown_fence.checkpoint()
             message = f"{type(exc).__name__}: {exc}"
             LOGGER.exception("alpaca_us_equity_cycle_failed")
+            # An incomplete cycle cannot prove that cached account authority is
+            # still current. Fail closed instead of checkpointing the old scope.
+            self._execution_scope = None
+            self._last_reconciled_at = None
             self._set_state(status="degraded", heartbeat=observed_at, error=message)
-            self._write_checkpoint("degraded", observed_at, {"error": message}, False)
+            self._write_checkpoint(
+                "degraded",
+                observed_at,
+                {
+                    "error": message,
+                    "execution_scope": self._execution_scope,
+                    "execution_scope_status": (
+                        "available" if self._execution_scope is not None else "unavailable"
+                    ),
+                    "execution_scope_source": (
+                        "authenticated_broker_account"
+                        if self._execution_scope is not None
+                        else None
+                    ),
+                },
+                False,
+            )
             return {"status": "degraded", "error": message}
+        self._shutdown_fence.checkpoint()
         status = str(result["status"])
         self._set_state(
             status=status,
@@ -173,14 +315,20 @@ class AlpacaUsEquityRuntimeCoordinator:
 
     def _execute_cycle(self, observed_at: datetime) -> dict[str, object]:
         symbols = set(_allowed_symbols(self.settings))
-        adapter = cast(AlpacaBrokerAdapter, build_broker_adapter(self.settings, provider="alpaca"))
+        adapter = cast(
+            AlpacaBrokerAdapter,
+            GuardedBrokerAdapter(
+                build_broker_adapter(self.settings, provider="alpaca"),
+                self._shutdown_fence,
+            ),
+        )
         facade = AlpacaUsEquityAdapterFacade(adapter, tuple(sorted(symbols)))
         should_reconcile = (
             self._last_reconciled_at is None
             or (observed_at - self._last_reconciled_at).total_seconds()
             >= self.settings.alpaca_us_equity_reconcile_interval_seconds
         )
-        with self.session_factory() as db:
+        with self._cycle_session_factory() as db:
             session = ensure_authenticated_broker_session(
                 settings=self.settings,
                 db=db,
@@ -201,11 +349,31 @@ class AlpacaUsEquityRuntimeCoordinator:
                     db=db,
                     adapter=facade,  # type: ignore[arg-type]
                     symbols=symbols,
+                    exchange="US",
                 )
             else:
                 reconciliation = {"skipped": 1}
-                position_sync = {"skipped": 1}
+                position_sync = {
+                    "skipped": 1,
+                    "execution_scope": self._execution_scope,
+                    "execution_scope_source": (
+                        "authenticated_broker_account"
+                        if self._execution_scope is not None
+                        else None
+                    ),
+                }
             db.commit()
+        execution_scope = (
+            exact_monitoring_execution_scope(
+                position_sync.get("execution_scope"),
+                provider="alpaca",
+            )
+            if position_sync.get("execution_scope_source")
+            == "authenticated_broker_account"
+            else None
+        )
+        if execution_scope is not None:
+            self._execution_scope = execution_scope
         if should_reconcile:
             self._last_reconciled_at = observed_at
 
@@ -234,18 +402,40 @@ class AlpacaUsEquityRuntimeCoordinator:
                 "spread_bps": _decimal(quote.spread_bps) if quote.spread_bps is not None else "",
                 "observed_at": quote.observed_at.astimezone(UTC).isoformat(),
             }
+        self._shutdown_fence.checkpoint()
         strategy = self._strategy.run_cycle(
             adapter=facade,  # type: ignore[arg-type]
             access_token=token,
             quotes=quotes,
             observed_at=observed_at,
+            execution_scope=self._execution_scope,
             market_open=market_open,
         )
         strategy_status = str(strategy.get("status") or "healthy")
-        status = "degraded" if strategy_status in {"degraded", "risk_blocked"} else "healthy"
+        if strategy.get("reason") in {
+            "authenticated_execution_scope_unavailable",
+            "authenticated_execution_scope_mismatch",
+        }:
+            self._execution_scope = None
+            self._last_reconciled_at = None
+        status = (
+            "degraded"
+            if strategy_status in {"blocked", "degraded", "risk_blocked"}
+            or self._execution_scope is None
+            else "healthy"
+        )
         return {
             "status": status,
             "observed_at": observed_at.isoformat(),
+            "execution_scope": self._execution_scope,
+            "execution_scope_status": (
+                "available" if self._execution_scope is not None else "unavailable"
+            ),
+            "execution_scope_source": (
+                "authenticated_broker_account"
+                if self._execution_scope is not None
+                else None
+            ),
             "market_clock": clock_payload,
             "prices": prices,
             "reconciliation": {"orders": reconciliation, "positions": position_sync},
@@ -260,19 +450,23 @@ class AlpacaUsEquityRuntimeCoordinator:
         succeeded: bool,
     ) -> None:
         try:
-            with self.session_factory() as db:
-                checkpoint = db.scalar(select(MonitoringCheckpoint).where(
-                    MonitoringCheckpoint.worker_name == WORKER_NAME,
-                    MonitoringCheckpoint.mode == self.settings.runtime_mode,
-                ))
+            self._shutdown_fence.checkpoint()
+            with self._cycle_session_factory() as db:
+                checkpoint = upsert_scoped_monitoring_checkpoint(
+                    db=db,
+                    worker_name=WORKER_NAME,
+                    mode=self.settings.runtime_mode,
+                    status=status,
+                    observed_at=observed_at,
+                    details=details,
+                    succeeded=succeeded,
+                    provider="alpaca",
+                )
                 if checkpoint is None:
-                    checkpoint = MonitoringCheckpoint(worker_name=WORKER_NAME, mode=self.settings.runtime_mode)
-                    db.add(checkpoint)
-                checkpoint.status = status
-                checkpoint.last_heartbeat_at = observed_at
-                if succeeded:
-                    checkpoint.last_success_at = observed_at
-                checkpoint.details = details
+                    LOGGER.warning(
+                        "alpaca_us_equity_checkpoint_scope_unavailable"
+                    )
+                    return
                 db.commit()
         except Exception:
             LOGGER.exception("alpaca_us_equity_checkpoint_write_failed")

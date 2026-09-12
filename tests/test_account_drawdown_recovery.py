@@ -6,25 +6,465 @@ import pytest
 from sqlalchemy import select
 
 from app.api.schemas.execution import PlaceOrderRequest
+from app.broker.base import BrokerAccountHolding, BrokerAccountSnapshot
 from app.core.config import Settings
-from app.models.runtime import BrokerOrder, BrokerOrderEvent, ExecutionPlanItemAudit
+from app.models.runtime import (
+    BrokerOrder,
+    BrokerOrderEvent,
+    ExecutionPlan,
+    ExecutionPlanItem,
+    ExecutionPlanItemAudit,
+)
 from app.services import broker_orders
 from app.services.account_drawdown_recovery import (
     RECOVERY_OBSERVED_EVENT_TYPE,
     RECOVERY_RELEASED_EVENT_TYPE,
     RECOVERY_RESET_EVENT_TYPE,
     record_healthy_observation,
+    record_recovery_reset,
     recovery_account_fingerprint,
     recovery_idempotency_key,
+    recovery_policy_fingerprint,
     recovery_state,
 )
-from app.services.account_drawdown_gate import AccountDrawdownDecision
+from app.services.account_drawdown_gate import (
+    AccountDrawdownDecision,
+    evaluate_account_drawdown_gate,
+    record_account_drawdown_block,
+)
 from app.services.broker_orders import _verified_exec_agent_market_notional
 from test_broker_auth import (
     _build_watch_buy_test_app,
     _create_watch_buy_candidate,
     _daily_drawdown_snapshot,
 )
+
+
+_RAW_ACCOUNT_SECRET_KEYS = {
+    "accountnumber",
+    "brokeraccountid",
+    "cano",
+    "acntprdtcd",
+    "authorization",
+    "accesstoken",
+    "refreshtoken",
+    "appkey",
+    "appsecret",
+    "apikey",
+    "apisecret",
+}
+
+
+def _assert_no_raw_account_secrets(value: object, *, secret_values: set[str]) -> None:
+    if isinstance(value, dict):
+        normalized_keys = {
+            "".join(character for character in str(key).casefold() if character.isalnum())
+            for key in value
+        }
+        assert normalized_keys.isdisjoint(_RAW_ACCOUNT_SECRET_KEYS)
+        for item in value.values():
+            _assert_no_raw_account_secrets(item, secret_values=secret_values)
+        return
+    if isinstance(value, list):
+        for item in value:
+            _assert_no_raw_account_secrets(item, secret_values=secret_values)
+        return
+    if isinstance(value, str):
+        assert value not in secret_values
+
+
+def test_drawdown_decision_and_block_audit_never_retain_raw_account_secrets() -> None:
+    app, engine, _client, _adapter = _build_watch_buy_test_app(
+        account_drawdown_gate_enabled=True,
+    )
+    with app.state.db_session_factory() as db:
+        plan = ExecutionPlan(
+            external_plan_id="plan-account-payload-redaction",
+            source="test",
+            mode=app.state.settings.runtime_mode,
+        )
+        item = ExecutionPlanItem(
+            plan=plan,
+            plan_item_index=0,
+            symbol="005930",
+            side="buy",
+            intent="next_open_buy",
+            status="watch_monitoring_active",
+        )
+        db.add(plan)
+        db.flush()
+        item_id = item.id
+        db.commit()
+    observed_at = datetime(2026, 9, 8, 12, 0, tzinfo=UTC)
+    secret_values = {
+        "87654321",
+        "02",
+        "Bearer balance-authorization-secret",
+        "holding-access-token-secret",
+        "holding-refresh-token-secret",
+        "holding-app-key-secret",
+        "holding-app-secret",
+        "holding-api-key-secret",
+        "holding-api-secret",
+    }
+    snapshot = BrokerAccountSnapshot(
+        available_cash=Decimal("5000000"),
+        buying_power=Decimal("5000000"),
+        observed_at=observed_at,
+        source="stub:account_snapshot",
+        total_asset_value=Decimal("9000000"),
+        previous_total_asset_value=Decimal("10000000"),
+        asset_change_amount=Decimal("-1000000"),
+        unrealized_pnl=Decimal("-200000"),
+        payload={
+            "balance": {
+                "output2": [
+                    {
+                        "tot_evlu_amt": "9000000",
+                        "bfdy_tot_asst_evlu_amt": "10000000",
+                        "asst_icdc_amt": "-1000000",
+                        "CANO": "87654321",
+                        "nested_auth": {
+                            "ACNT_PRDT_CD": "02",
+                            "authorization": "Bearer balance-authorization-secret",
+                        },
+                    }
+                ]
+            }
+        },
+        holdings=[
+            BrokerAccountHolding(
+                symbol="005930",
+                quantity=1,
+                average_price=Decimal("72000"),
+                unrealized_pnl=Decimal("-1000"),
+                unrealized_pnl_pct=Decimal("-1.4"),
+                payload={
+                    "broker_account_id": "87654321",
+                    "tokens": {
+                        "access_token": "holding-access-token-secret",
+                        "refresh_token": "holding-refresh-token-secret",
+                    },
+                    "credentials": {
+                        "appkey": "holding-app-key-secret",
+                        "appsecret": "holding-app-secret",
+                        "api_key": "holding-api-key-secret",
+                        "api_secret": "holding-api-secret",
+                    },
+                    "quote_currency": "KRW",
+                },
+            )
+        ],
+    )
+
+    decision = evaluate_account_drawdown_gate(
+        settings=app.state.settings,
+        snapshot=snapshot,
+        order_idempotency_key="account-payload-redaction-order",
+        execution_plan_item_id=item_id,
+        now=observed_at,
+    )
+
+    assert decision.allowed is False
+    _assert_no_raw_account_secrets(decision.summary, secret_values=secret_values)
+    _assert_no_raw_account_secrets(decision.payload, secret_values=secret_values)
+    assert decision.payload["holdings"][0]["raw"]["quote_currency"] == "KRW"
+
+    with app.state.db_session_factory() as db:
+        record_account_drawdown_block(
+            db=db,
+            execution_plan_item_id=item_id,
+            decision=decision,
+            occurred_at=observed_at,
+        )
+        db.commit()
+        audit = db.scalar(
+            select(ExecutionPlanItemAudit).where(
+                ExecutionPlanItemAudit.execution_plan_item_id == item_id,
+                ExecutionPlanItemAudit.event_type
+                == "account_drawdown_new_buy_blocked",
+            )
+        )
+        assert audit is not None
+        _assert_no_raw_account_secrets(audit.summary, secret_values=secret_values)
+        _assert_no_raw_account_secrets(audit.payload, secret_values=secret_values)
+
+    engine.dispose()
+
+
+def test_drawdown_persistence_boundaries_resanitize_tainted_decisions() -> None:
+    app, engine, _client, _adapter = _build_watch_buy_test_app(
+        account_drawdown_gate_enabled=True,
+    )
+    occurred_at = datetime(2026, 9, 8, 13, 0, tzinfo=UTC)
+    secret_values = {
+        "raw-account-number",
+        "Bearer tainted-decision-secret",
+        "tainted-access-token",
+        "tainted-refresh-token",
+        "tainted-app-key",
+        "tainted-app-secret",
+        "tainted-api-key",
+        "tainted-api-secret",
+    }
+    tainted_decision = AccountDrawdownDecision(
+        allowed=False,
+        gate_name="daily_total_asset_drawdown_pct",
+        reason="daily drawdown threshold reached",
+        current_metric=Decimal("10"),
+        threshold=Decimal("1"),
+        baseline_value=Decimal("10000000"),
+        baseline_timestamp=occurred_at.isoformat(),
+        sells_risk_reduction_allowed=True,
+        summary={
+            "gate_name": "daily_total_asset_drawdown_pct",
+            "account_number": "raw-account-number",
+            "nested": {
+                "authorization": "Bearer tainted-decision-secret",
+                "access_token": "tainted-access-token",
+            },
+        },
+        payload={
+            "raw_balance_payload": {
+                "CANO": "raw-account-number",
+                "refresh_token": "tainted-refresh-token",
+            },
+            "holdings": [
+                {
+                    "raw": {
+                        "appkey": "tainted-app-key",
+                        "appsecret": "tainted-app-secret",
+                        "api_key": "tainted-api-key",
+                        "api_secret": "tainted-api-secret",
+                    },
+                    "symbol": "005930",
+                }
+            ],
+        },
+    )
+
+    with app.state.db_session_factory() as db:
+        plan = ExecutionPlan(
+            external_plan_id="plan-account-persistence-redaction",
+            source="test",
+            mode=app.state.settings.runtime_mode,
+        )
+        item = ExecutionPlanItem(
+            plan=plan,
+            plan_item_index=0,
+            symbol="005930",
+            side="buy",
+            intent="next_open_buy",
+            status="watch_monitoring_active",
+        )
+        linked_source = BrokerOrder(
+            plan_item=item,
+            broker_name="kis",
+            mode=app.state.settings.runtime_mode,
+            idempotency_key="linked-account-persistence-redaction",
+            symbol="005930",
+            side="buy",
+            status="rejected",
+            quantity=1,
+            asset_class="stock",
+        )
+        planless_source = BrokerOrder(
+            broker_name="kis",
+            mode=app.state.settings.runtime_mode,
+            idempotency_key="planless-account-persistence-redaction",
+            symbol="000660",
+            side="buy",
+            status="rejected",
+            quantity=1,
+            asset_class="stock",
+        )
+        db.add_all([plan, item, linked_source, planless_source])
+        db.flush()
+
+        record_account_drawdown_block(
+            db=db,
+            execution_plan_item_id=item.id,
+            decision=tainted_decision,
+            occurred_at=occurred_at,
+        )
+        record_recovery_reset(
+            db=db,
+            execution_plan_item_id=item.id,
+            source_broker_order_pk=linked_source.id,
+            source_idempotency_key=linked_source.idempotency_key,
+            recovery_generation=1,
+            decision=tainted_decision,
+            settings=app.state.settings,
+            occurred_at=occurred_at,
+        )
+        record_recovery_reset(
+            db=db,
+            execution_plan_item_id=None,
+            source_broker_order_pk=planless_source.id,
+            source_idempotency_key=planless_source.idempotency_key,
+            recovery_generation=1,
+            decision=tainted_decision,
+            settings=app.state.settings,
+            occurred_at=occurred_at,
+        )
+        db.commit()
+
+        audits = db.scalars(
+            select(ExecutionPlanItemAudit).where(
+                ExecutionPlanItemAudit.execution_plan_item_id == item.id,
+                ExecutionPlanItemAudit.event_type.in_(
+                    {
+                        "account_drawdown_new_buy_blocked",
+                        RECOVERY_RESET_EVENT_TYPE,
+                    }
+                ),
+            )
+        ).all()
+        assert len(audits) == 2
+        for audit in audits:
+            _assert_no_raw_account_secrets(
+                audit.summary,
+                secret_values=secret_values,
+            )
+            _assert_no_raw_account_secrets(
+                audit.payload,
+                secret_values=secret_values,
+            )
+
+        planless_event = db.scalar(
+            select(BrokerOrderEvent).where(
+                BrokerOrderEvent.broker_order_pk == planless_source.id,
+                BrokerOrderEvent.event_type == RECOVERY_RESET_EVENT_TYPE,
+            )
+        )
+        assert planless_event is not None
+        _assert_no_raw_account_secrets(
+            planless_event.payload,
+            secret_values=secret_values,
+        )
+        _assert_no_raw_account_secrets(
+            planless_event.response_payload,
+            secret_values=secret_values,
+        )
+
+    engine.dispose()
+
+
+def test_broker_order_drawdown_block_resanitizes_a_tainted_decision() -> None:
+    app, engine, _client, adapter = _build_watch_buy_test_app(
+        account_drawdown_gate_enabled=True,
+    )
+    observed_at = datetime(2026, 9, 8, 14, 0, tzinfo=UTC)
+    secret_values = {
+        "raw-account-number",
+        "Bearer boundary-secret",
+        "boundary-access-token",
+    }
+    decision = AccountDrawdownDecision(
+        allowed=False,
+        gate_name="daily_total_asset_drawdown_pct",
+        reason="daily drawdown threshold reached",
+        current_metric=Decimal("10"),
+        threshold=Decimal("1"),
+        baseline_value=Decimal("10000000"),
+        baseline_timestamp=observed_at.isoformat(),
+        sells_risk_reduction_allowed=True,
+        summary={
+            "gate_name": "daily_total_asset_drawdown_pct",
+            "account_number": "raw-account-number",
+            "authorization": "Bearer boundary-secret",
+        },
+        payload={
+            "raw_balance_payload": {
+                "CANO": "raw-account-number",
+                "access_token": "boundary-access-token",
+            },
+            "safe_metric": "kept",
+        },
+    )
+
+    with app.state.db_session_factory() as db:
+        plan = ExecutionPlan(
+            external_plan_id="plan-broker-boundary-redaction",
+            source="test",
+            mode=app.state.settings.runtime_mode,
+        )
+        item = ExecutionPlanItem(
+            plan=plan,
+            plan_item_index=0,
+            symbol="005930",
+            side="buy",
+            intent="next_open_buy",
+            status="watch_monitoring_active",
+        )
+        db.add_all([plan, item])
+        db.flush()
+        command = PlaceOrderRequest(
+            idempotency_key="broker-boundary-redaction-order",
+            execution_plan_item_id=item.id,
+            symbol=item.symbol,
+            side="buy",
+            quantity=1,
+            order_type="limit",
+            limit_price=Decimal("70000"),
+            time_in_force="day",
+            exchange="KRX",
+        )
+
+        result = broker_orders._persist_account_gate_block(
+            settings=app.state.settings,
+            db=db,
+            adapter=adapter,
+            command=command,
+            original_command=command,
+            request_source="test",
+            plan_item=item,
+            route_decision=None,
+            decision=decision,
+            existing_order=None,
+            observed_at=observed_at,
+        )
+
+        assert result.status_code == 409
+        order = db.scalar(
+            select(BrokerOrder).where(
+                BrokerOrder.idempotency_key == command.idempotency_key
+            )
+        )
+        assert order is not None
+        _assert_no_raw_account_secrets(
+            order.request_metadata,
+            secret_values=secret_values,
+        )
+        _assert_no_raw_account_secrets(
+            order.response_metadata,
+            secret_values=secret_values,
+        )
+        _assert_no_raw_account_secrets(
+            order.raw_broker_payload,
+            secret_values=secret_values,
+        )
+        event = db.scalar(
+            select(BrokerOrderEvent).where(
+                BrokerOrderEvent.broker_order_pk == order.id,
+                BrokerOrderEvent.event_type == "submission_blocked",
+            )
+        )
+        assert event is not None
+        _assert_no_raw_account_secrets(
+            event.request_payload,
+            secret_values=secret_values,
+        )
+        _assert_no_raw_account_secrets(
+            event.response_payload,
+            secret_values=secret_values,
+        )
+        _assert_no_raw_account_secrets(
+            event.payload,
+            secret_values=secret_values,
+        )
+
+    engine.dispose()
 
 
 def test_long_recovery_idempotency_key_is_deterministic_and_bounded() -> None:
@@ -67,6 +507,60 @@ def test_account_fingerprint_uses_stable_scope_secret_across_broker_key_rotation
     )
     assert recovery_account_fingerprint(after_rotation) != recovery_account_fingerprint(
         other_account
+    )
+
+
+def test_live_recovery_fingerprint_uses_configured_scope_not_short_or_rotating_secrets() -> None:
+    shared = {
+        "runtime_mode": "live",
+        "kis_account_number": "12345678",
+        "kis_account_product_code": "01",
+        "account_drawdown_recovery_scope_secret": "too-short",
+    }
+    before_rotation = Settings(
+        **shared,
+        kis_app_secret="old-broker-secret",
+        execution_position_account_scope="opaque-account-a",
+    )
+    after_rotation = Settings(
+        **shared,
+        kis_app_secret="new-broker-secret",
+        execution_position_account_scope="opaque-account-a",
+    )
+    other_scope = Settings(
+        **shared,
+        kis_app_secret="new-broker-secret",
+        execution_position_account_scope="opaque-account-b",
+    )
+
+    assert recovery_account_fingerprint(before_rotation) == recovery_account_fingerprint(
+        after_rotation
+    )
+    assert recovery_account_fingerprint(after_rotation) != recovery_account_fingerprint(
+        other_scope
+    )
+
+
+def test_recovery_fingerprint_prefers_keyed_kis_account_over_operator_label() -> None:
+    shared = {
+        "runtime_mode": "live",
+        "kis_account_product_code": "01",
+        "account_drawdown_recovery_scope_secret": (
+            "stable-kis-recovery-scope-secret-at-least-32-bytes"
+        ),
+        "execution_position_account_scope": "primary-kis-label",
+    }
+    account_a = Settings(**shared, kis_account_number="11111111")
+    account_b = Settings(**shared, kis_account_number="22222222")
+    relabeled_a = account_a.model_copy(
+        update={"execution_position_account_scope": "renamed-kis-label"}
+    )
+
+    assert recovery_account_fingerprint(account_a) != recovery_account_fingerprint(
+        account_b
+    )
+    assert recovery_account_fingerprint(account_a) == recovery_account_fingerprint(
+        relabeled_a
     )
 
 
@@ -188,7 +682,7 @@ def test_recovery_child_keeps_verified_exec_agent_market_notional_lineage() -> N
     ) is None
 
 
-def test_recovery_state_release_wins_when_audits_share_all_timestamps() -> None:
+def test_recovery_state_release_wins_tied_occurrence_despite_storage_timestamp_order() -> None:
     app, engine, client, _adapter = _build_watch_buy_test_app()
     item_id = _create_watch_buy_candidate(
         client,
@@ -211,8 +705,8 @@ def test_recovery_state_release_wins_when_audits_share_all_timestamps() -> None:
                         "snapshot_observed_at": occurred_at.isoformat(),
                     },
                     occurred_at=occurred_at,
-                    created_at=occurred_at,
-                    updated_at=occurred_at,
+                    created_at=occurred_at + timedelta(seconds=1),
+                    updated_at=occurred_at + timedelta(seconds=1),
                 ),
                 ExecutionPlanItemAudit(
                     id="0" * 36,
@@ -516,6 +1010,7 @@ def test_buy_rechecks_loss_latch_created_while_waiting_for_advisory_lock(
         db,
         adapter,
         command,
+        execution_scope,
     ) -> None:
         call_order.append("account_lock")
         recovery_scope = broker_orders._account_drawdown_recovery_scope(
@@ -524,7 +1019,7 @@ def test_buy_rechecks_loss_latch_created_while_waiting_for_advisory_lock(
             asset_class="stock",
             exchange="KRX",
         )
-        del command
+        del command, execution_scope
         nonlocal lock_calls
         lock_calls += 1
         db.add(
@@ -673,7 +1168,10 @@ def test_broker_secret_rotation_without_scope_secret_keeps_existing_latch_closed
     engine.dispose()
 
 
-def test_stable_scope_secret_does_not_leak_latch_across_accounts() -> None:
+@pytest.mark.parametrize("scope_authority", ["stable-secret", "configured-label"])
+def test_stable_scope_authority_does_not_leak_latch_across_accounts(
+    scope_authority: str,
+) -> None:
     app, engine, client, _adapter = _build_watch_buy_test_app(
         account_drawdown_gate_enabled=True,
         account_drawdown_recovery_enabled=True,
@@ -682,13 +1180,28 @@ def test_stable_scope_secret_does_not_leak_latch_across_accounts() -> None:
         client,
         plan_id="plan-stable-secret-account-isolation",
     )
-    account_a = app.state.settings.model_copy(
-        update={
-            "kis_account_number": "11112222",
-            "account_drawdown_recovery_scope_secret": "stable-scope-secret",
-        }
-    )
-    account_b = account_a.model_copy(update={"kis_account_number": "99990000"})
+    if scope_authority == "stable-secret":
+        account_a = app.state.settings.model_copy(
+            update={
+                "kis_account_number": "11112222",
+                "execution_position_account_scope": None,
+                "account_drawdown_recovery_scope_secret": "stable-scope-secret",
+            }
+        )
+        account_b = account_a.model_copy(
+            update={"kis_account_number": "99990000"}
+        )
+    else:
+        account_a = app.state.settings.model_copy(
+            update={
+                "kis_account_number": "11112222",
+                "account_drawdown_recovery_scope_secret": None,
+                "execution_position_account_scope": "primary-kis-account",
+            }
+        )
+        account_b = account_a.model_copy(
+            update={"execution_position_account_scope": "secondary-kis-account"}
+        )
     account_a_scope = broker_orders._account_drawdown_recovery_scope(
         settings=account_a,
         provider="kis",
@@ -742,6 +1255,155 @@ def test_stable_scope_secret_does_not_leak_latch_across_accounts() -> None:
         )
 
     assert source is None
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    "release_mismatch",
+    (
+        "recovery_idempotency_key",
+        "policy_fingerprint",
+        "recovery_generation",
+        None,
+    ),
+)
+@pytest.mark.parametrize("release_storage", ("broker_event", "plan_audit"))
+def test_release_event_must_exactly_match_latch_before_distinct_buy_and_status_release(
+    release_mismatch: str | None,
+    release_storage: str,
+) -> None:
+    app, engine, client, adapter = _build_watch_buy_test_app(
+        account_drawdown_gate_enabled=True,
+        account_drawdown_recovery_enabled=True,
+        account_drawdown_recovery_cooldown_seconds=0,
+        account_drawdown_recovery_min_observation_interval_seconds=1,
+    )
+    observed_at = datetime.now(UTC)
+    source_key = (
+        f"release-source:{release_storage}:{release_mismatch or 'exact'}"
+    )
+    source_item_id = (
+        _create_watch_buy_candidate(
+            client,
+            plan_id=f"plan-{release_storage}-{release_mismatch or 'exact'}",
+            market_date=None,
+        )
+        if release_storage == "plan_audit"
+        else None
+    )
+    recovery_scope = broker_orders._account_drawdown_recovery_scope(
+        settings=app.state.settings,
+        provider="kis",
+        asset_class="stock",
+        exchange="KRX",
+    )
+    with app.state.db_session_factory() as db:
+        source = BrokerOrder(
+            broker_name="kis",
+            execution_plan_item_id=source_item_id,
+            mode="paper",
+            idempotency_key=source_key,
+            symbol="005930",
+            side="buy",
+            status="rejected",
+            quantity=1,
+            asset_class="stock",
+            venue="kis",
+            limit_price=Decimal("71000"),
+            request_metadata={
+                "account_drawdown_recovery_policy": {
+                    "policy_version": 1,
+                    "recovery_scope": recovery_scope,
+                }
+            },
+            response_metadata={
+                "account_drawdown_gate": {
+                    "blocked": True,
+                    "gate_name": "daily_total_asset_drawdown_pct",
+                }
+            },
+            last_error_classification="validation",
+            last_error_code="daily_total_asset_drawdown_pct",
+            last_error_retryable=False,
+            last_broker_sync_at=observed_at,
+        )
+        db.add(source)
+        db.flush()
+        release_summary = {
+            "source_broker_order_pk": source.id,
+            "source_idempotency_key": source_key,
+            "recovery_idempotency_key": recovery_idempotency_key(
+                base_key=source_key,
+                source_broker_order_pk=source.id,
+                generation=1,
+            ),
+            "recovery_generation": 1,
+            "healthy_observation_count": 2,
+            "policy_fingerprint": recovery_policy_fingerprint(app.state.settings),
+        }
+        if release_mismatch == "recovery_idempotency_key":
+            release_summary[release_mismatch] = "release-for-another-source"
+        elif release_mismatch == "policy_fingerprint":
+            release_summary[release_mismatch] = "stale-policy"
+        elif release_mismatch == "recovery_generation":
+            release_summary[release_mismatch] = 2
+        if source_item_id is None:
+            db.add(
+                BrokerOrderEvent(
+                    broker_order_pk=source.id,
+                    event_type=RECOVERY_RELEASED_EVENT_TYPE,
+                    event_source="system",
+                    normalized_status="rejected",
+                    payload=release_summary,
+                    observed_at=observed_at + timedelta(seconds=1),
+                )
+            )
+        else:
+            db.add(
+                ExecutionPlanItemAudit(
+                    execution_plan_item_id=source_item_id,
+                    event_type=RECOVERY_RELEASED_EVENT_TYPE,
+                    source="test",
+                    summary=release_summary,
+                    payload={},
+                    occurred_at=observed_at + timedelta(seconds=1),
+                )
+            )
+        db.commit()
+
+    adapter.account_snapshot = _daily_drawdown_snapshot(
+        drawdown_krw=Decimal("0"),
+        observed_at=observed_at + timedelta(seconds=2),
+    )
+    status = client.get("/runtime/status").json()["account_drawdown_gate"]
+    distinct = client.post(
+        "/orders",
+        json={
+            "idempotency_key": f"distinct-after-{release_mismatch or 'exact'}",
+            "provider": "kis",
+            "asset_class": "stock",
+            "symbol": "000660",
+            "side": "buy",
+            "quantity": 1,
+            "order_type": "limit",
+            "limit_price": "100000",
+            "time_in_force": "day",
+            "exchange": "KRX",
+        },
+    )
+
+    if release_mismatch is None:
+        assert status["gated"] is False
+        assert distinct.status_code == 201
+        assert len(adapter.order_calls) == 1
+    else:
+        assert status["gated"] is True
+        assert distinct.status_code == 409
+        assert distinct.json()["block_reason"] in {
+            "account_drawdown_recovery_pending",
+            "account_drawdown_recovery_state_changed",
+        }
+        assert adapter.order_calls == []
     engine.dispose()
 
 

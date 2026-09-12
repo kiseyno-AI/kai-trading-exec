@@ -25,8 +25,26 @@ from app.models.runtime import (
     RuntimeControlState,
 )
 from app.services.broker_auth import ensure_authenticated_broker_session
+from app.services.account_drawdown_recovery import (
+    account_snapshot_authority_deadline,
+    account_snapshot_freshness_failure,
+)
+from app.services.execution_account_route import (
+    execution_account_scope_binding_from_payloads,
+    KIS_ACCOUNT_ROUTE_BINDING_KEY,
+    bind_kis_account_route,
+    classify_kis_account_route,
+    kis_account_route_binding_from_payloads,
+)
 from app.services.live_market_context import load_live_market_regime_context, merge_live_market_regime_context
+from app.services.json_compaction import json_payload_hash
 from app.services.plan_item_identity import serialize_plan_item_source_identity
+from app.services.position_identity import (
+    PositionIdentity,
+    PositionIdentityConflictError,
+    build_position_identity,
+)
+from app.services.fifo_inventory import fifo_route_scope_from_order
 from app.services.risk_sizing import (
     RiskSizingRejection,
     RiskSizingResult,
@@ -49,9 +67,10 @@ EXEC_AGENT_CONTRACT_KEYS = (
     "short_term_exec_agent_decision",
 )
 EXEC_AGENT_DECISION_VERSION = "short-term-exec-agent-v1"
+EXEC_AGENT_BINDING_VERSION = "short-term-exec-agent-binding-v1"
 LOGGER = logging.getLogger(__name__)
 OPENCLAW_EXEC_AGENT_ID = "exec-agent"
-OPENCLAW_EXEC_AGENT_MODEL = "openai-codex/gpt-5.5"
+OPENCLAW_EXEC_AGENT_MODEL = "openai/gpt-5.6-sol"
 OPEN_BUY_ORDER_STATUSES = frozenset(CAPITAL_RESERVING_ORDER_STATUSES)
 UNCERTAIN_BUY_CAPITAL_STATUSES = frozenset(
     {
@@ -106,19 +125,6 @@ CONFIRMATION_SIGNAL_VALUES = frozenset(
         "deep_liquidity",
     }
 )
-RELAXED_REWARD_RISK_FLAGS = frozenset(
-    {
-        "high_confidence",
-        "liquidity_confirmed",
-        "liquidity_expansion",
-        "volume_expansion",
-        "volume_confirmed",
-        "deep_liquidity",
-        "breakout",
-        "vwap_recovery",
-        "momentum_continuation",
-    }
-)
 ENTRY_LIMIT_KEYS = (
     "chase_limit_price",
     "max_chase_limit_price",
@@ -126,6 +132,33 @@ ENTRY_LIMIT_KEYS = (
     "planned_entry_price",
     "planned_entry_limit",
 )
+
+
+class ExecAgentDecisionBinding(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    version: Literal["short-term-exec-agent-binding-v1"] = EXEC_AGENT_BINDING_VERSION
+    plan_id: str = Field(min_length=1)
+    item_id: str = Field(min_length=1)
+    symbol: str = Field(min_length=1)
+    provider: str = Field(min_length=1)
+    asset_class: str = Field(min_length=1)
+    venue: str = Field(min_length=1)
+    side: str = Field(min_length=1)
+    intent: str = Field(min_length=1)
+    candidate_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    request_context_digest: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    valid_until: datetime
+
+    @field_validator("valid_until")
+    @classmethod
+    def require_aware_expiry(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("binding valid_until must include timezone")
+        return value.astimezone(UTC)
 
 
 class ShortTermExecAgentContract(BaseModel):
@@ -150,6 +183,7 @@ class ShortTermExecAgentContract(BaseModel):
     feedback_ids: list[str] = Field(default_factory=list)
     risk_flags: list[str] = Field(default_factory=list)
     context: dict[str, Any] | None = None
+    binding: ExecAgentDecisionBinding | None = None
 
     @field_validator("reason_code", "reason")
     @classmethod
@@ -210,6 +244,7 @@ class ExecAgentSizingRequest(BaseModel):
     portfolio: dict[str, Any]
     market_data: dict[str, Any] | None = None
     risk_caps: dict[str, Any]
+    binding: ExecAgentDecisionBinding
 
 
 class ExecAgentAllocationCandidate(BaseModel):
@@ -224,6 +259,7 @@ class ExecAgentAllocationCandidate(BaseModel):
     decider_input: dict[str, Any] | None = None
     decider_output: dict[str, Any] | None = None
     market_data: dict[str, Any] | None = None
+    binding: ExecAgentDecisionBinding
 
 
 class ExecAgentBatchSizingRequest(BaseModel):
@@ -264,6 +300,7 @@ class ExecAgentSizingResponse(BaseModel):
     special_tactical_scalp: bool = False
     target_profile: TargetProfile | None = None
     explanation: dict[str, Any] | None = None
+    binding: ExecAgentDecisionBinding | None = None
 
     @field_validator("reasons", "risk_flags")
     @classmethod
@@ -356,6 +393,7 @@ class _AccountContext:
     open_orders: list[BrokerAccountOpenOrder]
     unresolved_buy_reserved_notional: Decimal
     unresolved_buy_reservation_complete: bool
+    execution_identity: PositionIdentity | None = None
 
 
 class _InvalidAgentContract(ValueError):
@@ -422,6 +460,7 @@ def apply_short_term_exec_agent_decisions(
         settings=settings,
         db=db,
         adapter=adapter,
+        candidates=candidates,
     )
     decisions: list[dict[str, object]] = []
     approved_count = 0
@@ -432,6 +471,7 @@ def apply_short_term_exec_agent_decisions(
         settings=settings,
         db=db,
         market_date=plan.market_date,
+        current_identity=account_context.execution_identity,
     )
     next_plan_item_index = _next_plan_item_index(plan)
     agent_contracts = _resolve_agent_contracts(
@@ -460,7 +500,11 @@ def apply_short_term_exec_agent_decisions(
             reserved_total_budget += approved_notional
             reserved_cash_budget += approved_notional
             reserved_daily_buy_notional += approved_notional
-            _apply_approved_decision(item=item, decision=decision)
+            _apply_approved_decision(
+                settings=settings,
+                item=item,
+                decision=decision,
+            )
             next_plan_item_index = _append_monitoring_items(
                 settings=settings,
                 plan=plan,
@@ -498,6 +542,7 @@ def _is_short_term_buy_candidate(item: ExecutionPlanItem) -> bool:
     agent_name = (item.decision_agent_name or "").strip().lower()
     return (
         agent_name == SHORT_TERM_DECIDER_NAME
+        and str(item.provider or "kis").strip().lower() == "kis"
         and item.side == "buy"
         and item.intent in SUPPORTED_SHORT_TERM_BUY_INTENTS
         and item.status in {"pending", "short_term_watcher_pending"}
@@ -522,6 +567,7 @@ def _load_account_context(
     settings: Settings,
     db: Session,
     adapter: BrokerAdapter | None,
+    candidates: list[ExecutionPlanItem],
 ) -> _AccountContext:
     observed_at = datetime.now(UTC)
     if adapter is None:
@@ -529,6 +575,17 @@ def _load_account_context(
             observed_at=observed_at,
             reason="broker adapter is unavailable",
         )
+
+    candidate_route = _single_candidate_account_route(
+        adapter=adapter,
+        candidates=candidates,
+    )
+    if candidate_route is None:
+        return _unavailable_account_context(
+            observed_at=observed_at,
+            reason="candidate broker account route is ambiguous or unavailable",
+        )
+    provider, exchange = candidate_route
 
     try:
         session_state = ensure_authenticated_broker_session(
@@ -538,8 +595,43 @@ def _load_account_context(
             source="exec_agent_sizing",
             reason="fetch account snapshot before short-term candidate sizing",
         )
-        snapshot = adapter.get_account_snapshot(session_state.access_token or "")
-    except (BrokerAdapterError, AttributeError, NotImplementedError, RuntimeError, ValueError) as exc:
+        snapshot = adapter.get_account_snapshot(
+            session_state.access_token or "",
+            exchange=exchange,
+        )
+        if (
+            not snapshot.holdings_complete
+            or not snapshot.open_orders_complete
+        ):
+            incomplete_components = [
+                component
+                for component, complete in (
+                    ("holdings", snapshot.holdings_complete),
+                    ("open_orders", snapshot.open_orders_complete),
+                )
+                if not complete
+            ]
+            return _unavailable_account_context(
+                observed_at=snapshot.observed_at,
+                reason=(
+                    "broker account snapshot is incomplete for exec-agent sizing: "
+                    + ",".join(incomplete_components)
+                ),
+            )
+        identity = build_position_identity(
+            settings=settings,
+            provider=provider,
+            exchange=exchange,
+            broker_account_id=snapshot.broker_account_id,
+        )
+    except (
+        BrokerAdapterError,
+        AttributeError,
+        NotImplementedError,
+        PositionIdentityConflictError,
+        RuntimeError,
+        ValueError,
+    ) as exc:
         return _unavailable_account_context(
             observed_at=observed_at,
             reason=f"{exc.__class__.__name__}: {exc}",
@@ -550,7 +642,13 @@ def _load_account_context(
         for holding in snapshot.holdings
         if holding.quantity > 0
     }
-    for position in _load_local_positions(settings=settings, db=db):
+    for position in _load_local_positions(
+        settings=settings,
+        db=db,
+        provider=provider,
+        exchange=exchange,
+        broker_account_id=snapshot.broker_account_id,
+    ):
         if position.quantity <= 0:
             continue
         holdings_by_symbol[position.symbol] = max(
@@ -558,9 +656,18 @@ def _load_account_context(
             position.quantity,
         )
 
-    local_open_orders = _load_local_open_orders(settings=settings, db=db)
+    local_open_orders = _load_local_open_orders(
+        settings=settings,
+        db=db,
+        provider=provider,
+        exchange=exchange,
+        broker_account_id=snapshot.broker_account_id,
+    )
     unresolved_reserved_notional, unresolved_reservation_complete = (
         _unresolved_local_buy_reservation(local_open_orders)
+    )
+    unresolved_reservation_complete = (
+        unresolved_reservation_complete and snapshot.open_orders_complete
     )
     snapshot_payload = _serialize_account_snapshot(snapshot)
     snapshot_payload["local_unresolved_buy_reservation"] = {
@@ -576,7 +683,44 @@ def _load_account_context(
         open_orders=[*snapshot.open_orders, *local_open_orders],
         unresolved_buy_reserved_notional=unresolved_reserved_notional,
         unresolved_buy_reservation_complete=unresolved_reservation_complete,
+        execution_identity=identity,
     )
+
+
+def _single_candidate_account_route(
+    *,
+    adapter: BrokerAdapter,
+    candidates: list[ExecutionPlanItem],
+) -> tuple[str, str] | None:
+    adapter_provider = str(getattr(adapter, "provider", "") or "").strip().lower()
+    routes: set[tuple[str, str]] = set()
+    for item in candidates:
+        provider = str(item.provider or "kis").strip().lower()
+        risk_context = item.risk_context if isinstance(item.risk_context, dict) else {}
+        raw_exchange = risk_context.get("exchange")
+        exchange = (
+            str(raw_exchange).strip().upper()
+            if isinstance(raw_exchange, str) and raw_exchange.strip()
+            else _default_item_exchange(provider=provider, venue=item.venue)
+        )
+        if not provider or not exchange:
+            return None
+        routes.add((provider, exchange))
+    if len(routes) != 1:
+        return None
+    route = next(iter(routes))
+    if route[0] != adapter_provider:
+        return None
+    return route
+
+
+def _default_item_exchange(*, provider: str, venue: str | None) -> str:
+    normalized_venue = str(venue or "").strip().upper()
+    if provider == "kis" and normalized_venue in {"", "KIS", "KRX"}:
+        return "KRX"
+    if normalized_venue:
+        return normalized_venue
+    return {"alpaca": "ALPACA", "upbit": "UPBIT"}.get(provider, "")
 
 
 def _unavailable_account_context(
@@ -604,9 +748,23 @@ def _load_local_positions(
     *,
     settings: Settings,
     db: Session,
+    provider: str,
+    exchange: str,
+    broker_account_id: str | None,
 ) -> list[ExecutionPosition]:
+    identity = build_position_identity(
+        settings=settings,
+        provider=provider,
+        exchange=exchange,
+        broker_account_id=broker_account_id,
+    )
     return db.scalars(
-        select(ExecutionPosition).where(ExecutionPosition.mode == settings.runtime_mode)
+        select(ExecutionPosition).where(
+            ExecutionPosition.mode == settings.runtime_mode,
+            ExecutionPosition.provider == identity.provider,
+            ExecutionPosition.account_scope == identity.account_scope,
+            ExecutionPosition.exchange == identity.exchange,
+        )
     ).all()
 
 
@@ -614,7 +772,16 @@ def _load_local_open_orders(
     *,
     settings: Settings,
     db: Session,
+    provider: str,
+    exchange: str,
+    broker_account_id: str | None,
 ) -> list[BrokerAccountOpenOrder]:
+    identity = build_position_identity(
+        settings=settings,
+        provider=provider,
+        exchange=exchange,
+        broker_account_id=broker_account_id,
+    )
     orders = db.scalars(
         select(BrokerOrder).where(
             *active_local_broker_order_filters(
@@ -626,6 +793,16 @@ def _load_local_open_orders(
     ).all()
     normalized_orders: list[BrokerAccountOpenOrder] = []
     for order in orders:
+        route_scope = fifo_route_scope_from_order(order)
+        if (
+            route_scope is not None
+            and (
+                route_scope.provider != identity.provider
+                or route_scope.account_scope != identity.account_scope
+                or route_scope.exchange != identity.exchange
+            )
+        ):
+            continue
         reserved_notional = _broker_order_reserved_notional(order)
         normalized_orders.append(
             BrokerAccountOpenOrder(
@@ -693,10 +870,16 @@ def _load_daily_new_buy_notional(
     settings: Settings,
     db: Session,
     market_date: date | None,
+    current_identity: PositionIdentity | None = None,
 ) -> Decimal:
     if market_date is None:
         return Decimal("0")
-    uncertain_orders = db.scalars(
+    current_identity = current_identity or build_position_identity(
+        settings=settings,
+        provider="kis",
+        exchange="KRX",
+    )
+    uncertain_order_candidates = db.scalars(
         select(BrokerOrder)
         .join(
             ExecutionPlanItem,
@@ -710,6 +893,18 @@ def _load_daily_new_buy_notional(
             BrokerOrder.status.in_(tuple(UNCERTAIN_BUY_CAPITAL_STATUSES)),
         )
     ).all()
+    uncertain_orders: list[BrokerOrder] = []
+    for order in uncertain_order_candidates:
+        route_scope = fifo_route_scope_from_order(order)
+        if route_scope is None:
+            uncertain_orders.append(order)
+            continue
+        if (
+            route_scope.provider == current_identity.provider
+            and route_scope.account_scope == current_identity.account_scope
+            and route_scope.exchange == current_identity.exchange
+        ):
+            uncertain_orders.append(order)
     uncertain_item_ids = {
         order.execution_plan_item_id
         for order in uncertain_orders
@@ -744,6 +939,27 @@ def _load_daily_new_buy_notional(
     for item in items:
         if item.id in uncertain_item_ids:
             continue
+        if current_identity.provider == "kis":
+            if (
+                classify_kis_account_route(
+                    settings=settings,
+                    provider=item.provider,
+                    risk_context=item.risk_context,
+                    quantity_policy=item.quantity_policy,
+                )
+                == "foreign"
+            ):
+                continue
+        else:
+            binding = execution_account_scope_binding_from_payloads(
+                item.risk_context,
+                item.quantity_policy,
+            )
+            if binding is not None and (
+                binding.get("provider") != current_identity.provider
+                or binding.get("account_scope") != current_identity.account_scope
+            ):
+                continue
         total += _approved_notional_from_item(item)
     for order in uncertain_orders:
         reserved_notional = _broker_order_reserved_notional(order)
@@ -785,7 +1001,7 @@ def _parse_positive_decimal(value: object) -> Decimal | None:
         parsed = Decimal(str(value))
     except (InvalidOperation, ValueError):
         return None
-    if parsed <= 0 or not parsed.is_finite():
+    if not parsed.is_finite() or parsed <= 0:
         return None
     return parsed
 
@@ -1079,7 +1295,6 @@ def _decide_candidate(
     existing_symbol_exposure = sizing_price * Decimal(existing_holding)
     account_basis = _minimum_decimal(account_context.available_cash, account_context.buying_power) or available_cash
     market_regime_context = market_regime_context_from_item_payloads(
-        agent_contract.context,
         item.risk_context,
         item.quantity_policy,
     )
@@ -1299,11 +1514,11 @@ def _candidate_conviction(
     item: ExecutionPlanItem,
     agent_contract: ShortTermExecAgentContract,
 ) -> str | None:
-    for source in (
-        agent_contract.context,
-        item.risk_context,
-        item.quantity_policy,
-    ):
+    # Agent output may lower or reject an allocation, but it cannot manufacture
+    # the deterministic evidence used to increase one.  Conviction must already
+    # be present on the persisted candidate handed to the agent.
+    del agent_contract
+    for source in _trusted_item_evidence_sources(item):
         if not isinstance(source, dict):
             continue
         value = source.get("conviction")
@@ -1474,7 +1689,8 @@ def _first_decimal_from_sources(
     agent_contract: ShortTermExecAgentContract,
     keys: tuple[str, ...],
 ) -> Decimal | None:
-    for source in (agent_contract.context, item.risk_context, item.quantity_policy):
+    del agent_contract
+    for source in _trusted_item_evidence_sources(item):
         value = _first_decimal(source, keys)
         if value is not None:
             return value
@@ -1488,7 +1704,8 @@ def _vol_corr_context(
     account_context: _AccountContext,
 ) -> dict[str, object]:
     context: dict[str, object] = {}
-    for source in (agent_contract.context, item.risk_context, item.quantity_policy):
+    del agent_contract
+    for source in _trusted_item_evidence_sources(item):
         if not isinstance(source, dict):
             continue
         for key in (
@@ -1586,37 +1803,14 @@ def _reward_risk_threshold(
     reference_price: Decimal,
     target_price: Decimal | None,
 ) -> Decimal:
-    normal_threshold = _settings_decimal(
+    # LLM confidence, flags, and tactical labels are not deterministic evidence
+    # and therefore cannot relax the configured profitability floor.
+    del agent_contract, reference_price, target_price
+    return _settings_decimal(
         settings,
         "exec_agent_min_reward_risk",
         Decimal("1.30"),
     )
-    relaxed_threshold = _settings_decimal(
-        settings,
-        "exec_agent_relaxed_min_reward_risk",
-        Decimal("1.10"),
-    )
-    if _allows_special_tactical_scalp(
-        settings=settings,
-        agent_contract=agent_contract,
-        reference_price=reference_price,
-        target_price=target_price,
-    ):
-        return min(
-            normal_threshold,
-            relaxed_threshold,
-            _settings_decimal(settings, "exec_agent_absolute_min_reward_risk", Decimal("1.00")),
-        )
-    if _uses_relaxed_reward_risk_threshold(agent_contract=agent_contract):
-        return min(normal_threshold, relaxed_threshold)
-    return normal_threshold
-
-
-def _uses_relaxed_reward_risk_threshold(*, agent_contract: ShortTermExecAgentContract) -> bool:
-    if agent_contract.confidence >= Decimal("0.80"):
-        return True
-    risk_flags = _all_risk_flags(agent_contract=agent_contract)
-    return bool(risk_flags.intersection(RELAXED_REWARD_RISK_FLAGS))
 
 
 def _reward_risk_below_floor(
@@ -1626,15 +1820,9 @@ def _reward_risk_below_floor(
     reward_risk: Decimal,
     reference_price: Decimal,
 ) -> bool:
+    del agent_contract, reference_price
     floor = _settings_decimal(settings, "exec_agent_absolute_min_reward_risk", Decimal("1.00"))
-    if reward_risk >= floor:
-        return False
-    return not _allows_special_tactical_scalp(
-        settings=settings,
-        agent_contract=agent_contract,
-        reference_price=reference_price,
-        target_price=agent_contract.target_price,
-    )
+    return reward_risk < floor
 
 
 def _allows_special_tactical_scalp(
@@ -1694,12 +1882,13 @@ def _confirmation_signal(
     item: ExecutionPlanItem,
     agent_contract: ShortTermExecAgentContract,
 ) -> str | None:
-    for flag in _all_risk_flags(agent_contract=agent_contract):
+    del agent_contract
+    for flag in _trusted_item_risk_flags(item):
         normalized = _normalize_signal_text(flag)
         if normalized in CONFIRMATION_SIGNAL_VALUES:
             return normalized
 
-    for source in _confirmation_sources(item=item, agent_contract=agent_contract):
+    for source in _trusted_item_evidence_sources(item):
         for key in CONFIRMATION_SIGNAL_KEYS:
             signal = _signal_from_source(source, key)
             if signal is not None:
@@ -1707,13 +1896,9 @@ def _confirmation_signal(
     return None
 
 
-def _confirmation_sources(
-    *,
-    item: ExecutionPlanItem,
-    agent_contract: ShortTermExecAgentContract,
-) -> list[object]:
-    sources: list[object] = [agent_contract.context, item.risk_context, item.quantity_policy]
-    for source in (agent_contract.context, item.risk_context, item.quantity_policy):
+def _trusted_item_evidence_sources(item: ExecutionPlanItem) -> list[object]:
+    sources: list[object] = [item.risk_context, item.quantity_policy]
+    for source in (item.risk_context, item.quantity_policy):
         if not isinstance(source, dict):
             continue
         sources.extend(
@@ -1722,6 +1907,21 @@ def _confirmation_sources(
             if isinstance(source.get(key), dict)
         )
     return sources
+
+
+def _trusted_item_risk_flags(item: ExecutionPlanItem) -> set[str]:
+    flags: set[str] = set()
+    for source in _trusted_item_evidence_sources(item):
+        if not isinstance(source, dict):
+            continue
+        raw_flags = source.get("risk_flags")
+        if isinstance(raw_flags, list):
+            flags.update(
+                _normalize_signal_text(flag)
+                for flag in raw_flags
+                if isinstance(flag, str) and flag.strip()
+            )
+    return flags
 
 
 def _signal_from_source(source: object, key: str) -> str | None:
@@ -1810,7 +2010,10 @@ def _resolve_agent_contracts(
 
     for item in candidates:
         try:
-            precomputed_contracts[item.id] = _load_agent_contract(item)
+            precomputed_contracts[item.id] = _load_agent_contract(
+                item,
+                plan=plan,
+            )
         except _MissingAgentContract:
             missing_contract_items.append(item)
         except _InvalidAgentContract as exc:
@@ -1881,7 +2084,7 @@ def _request_batch_agent_contracts(
             response = ExecAgentBatchSizingResponse.model_validate(response)
         except ValidationError as exc:
             raise _InvalidAgentContract(_validation_error_message(exc)) from exc
-    return _contracts_from_batch_response(response=response, candidates=candidates)
+    return _contracts_from_batch_response(response=response, request=request)
 
 
 def _call_batch_sizing_client(
@@ -1902,6 +2105,10 @@ def _call_batch_sizing_client(
         raise ExecAgentUnavailable("OpenClaw exec-agent client does not expose batch sizing")
 
     decisions: list[ExecAgentAllocationDecision] = []
+    requested_candidates = {
+        candidate.execution_plan_item_id: candidate
+        for candidate in request.candidates
+    }
     for item in candidates:
         try:
             response = legacy_sizer(
@@ -1911,6 +2118,7 @@ def _call_batch_sizing_client(
                     item=item,
                     account_context=account_context,
                     source_identity=serialize_plan_item_source_identity(item),
+                    binding=requested_candidates[item.id].binding,
                 )
             )
         except Exception as exc:
@@ -1934,9 +2142,13 @@ def _call_batch_sizing_client(
 def _contracts_from_batch_response(
     *,
     response: ExecAgentBatchSizingResponse,
-    candidates: list[ExecutionPlanItem],
+    request: ExecAgentBatchSizingRequest,
 ) -> dict[str, ShortTermExecAgentContract]:
-    expected_ids = {item.id for item in candidates}
+    expected_candidates = {
+        candidate.execution_plan_item_id: candidate
+        for candidate in request.candidates
+    }
+    expected_ids = set(expected_candidates)
     contracts: dict[str, ShortTermExecAgentContract] = {}
     for decision in response.decisions:
         item_id = decision.execution_plan_item_id
@@ -1948,7 +2160,13 @@ def _contracts_from_batch_response(
             raise _InvalidAgentContract(
                 f"batch response included duplicate execution_plan_item_id {item_id}"
             )
-        response_payload = decision.model_dump(exclude={"execution_plan_item_id"})
+        _validate_agent_response_binding(
+            supplied=decision.binding,
+            expected=expected_candidates[item_id].binding,
+        )
+        response_payload = decision.model_dump(
+            exclude={"execution_plan_item_id"}
+        )
         contracts[item_id] = _contract_from_agent_response(
             ExecAgentSizingResponse.model_validate(response_payload)
         )
@@ -1968,10 +2186,31 @@ def _build_batch_agent_request(
     plan: ExecutionPlan,
     candidates: list[ExecutionPlanItem],
     account_context: _AccountContext,
+    request_started_at: datetime | None = None,
 ) -> ExecAgentBatchSizingRequest:
+    valid_until = _new_agent_binding_expiry(
+        settings,
+        account_context=account_context,
+        request_started_at=request_started_at,
+    )
+    account = _agent_account_payload(account_context)
+    portfolio = _agent_portfolio_payload(account_context)
+    risk_caps = _agent_risk_caps(settings)
+    agent_id = getattr(settings, "exec_agent_id", OPENCLAW_EXEC_AGENT_ID)
+    model = getattr(settings, "exec_agent_model", OPENCLAW_EXEC_AGENT_MODEL)
+    request_context_digest = json_payload_hash(
+        {
+            "version": EXEC_AGENT_DECISION_VERSION,
+            "agent_id": agent_id,
+            "model": model,
+            "account": account,
+            "portfolio": portfolio,
+            "risk_caps": risk_caps,
+        }
+    )
     return ExecAgentBatchSizingRequest(
-        agent_id=getattr(settings, "exec_agent_id", OPENCLAW_EXEC_AGENT_ID),
-        model=getattr(settings, "exec_agent_model", OPENCLAW_EXEC_AGENT_MODEL),
+        agent_id=agent_id,
+        model=model,
         plan_id=plan.external_plan_id,
         market_date=plan.market_date.isoformat() if plan.market_date else None,
         strategy_run_id=plan.strategy_run_id,
@@ -1980,12 +2219,14 @@ def _build_batch_agent_request(
                 plan=plan,
                 item=item,
                 source_identity=serialize_plan_item_source_identity(item),
+                valid_until=valid_until,
+                request_context_digest=request_context_digest,
             )
             for item in candidates
         ],
-        account=_agent_account_payload(account_context),
-        portfolio=_agent_portfolio_payload(account_context),
-        risk_caps=_agent_risk_caps(settings),
+        account=account,
+        portfolio=portfolio,
+        risk_caps=risk_caps,
     )
 
 
@@ -1996,12 +2237,23 @@ def _build_agent_request(
     item: ExecutionPlanItem,
     account_context: _AccountContext,
     source_identity: dict[str, object],
+    binding: ExecAgentDecisionBinding | None = None,
 ) -> ExecAgentSizingRequest:
     candidate = _build_agent_candidate(
         plan=plan,
         item=item,
         source_identity=source_identity,
+        valid_until=(
+            binding.valid_until
+            if binding is not None
+            else _new_agent_binding_expiry(settings, account_context=account_context)
+        ),
+        request_context_digest=(
+            binding.request_context_digest if binding is not None else None
+        ),
     )
+    if binding is not None and candidate.binding != binding:
+        raise _InvalidAgentContract("single-candidate request binding mismatch")
     return ExecAgentSizingRequest(
         agent_id=getattr(settings, "exec_agent_id", OPENCLAW_EXEC_AGENT_ID),
         model=getattr(settings, "exec_agent_model", OPENCLAW_EXEC_AGENT_MODEL),
@@ -2018,6 +2270,7 @@ def _build_agent_request(
         portfolio=_agent_portfolio_payload(account_context),
         market_data=candidate.market_data,
         risk_caps=_agent_risk_caps(settings),
+        binding=candidate.binding,
     )
 
 
@@ -2026,18 +2279,19 @@ def _build_agent_candidate(
     plan: ExecutionPlan,
     item: ExecutionPlanItem,
     source_identity: dict[str, object],
+    valid_until: datetime,
+    request_context_digest: str | None,
 ) -> ExecAgentAllocationCandidate:
     risk_context = item.risk_context if isinstance(item.risk_context, dict) else {}
-    quantity_policy = item.quantity_policy if isinstance(item.quantity_policy, dict) else {}
-    candidate_context = {
-        "risk_context": risk_context,
-        "quantity_policy": quantity_policy,
-        "limit_price": _serialize_decimal(item.limit_price),
-        "trigger_price": _serialize_decimal(item.trigger_price),
-        "time_in_force": item.time_in_force,
-        "market_date": plan.market_date.isoformat() if plan.market_date else None,
-        "strategy_run_id": plan.strategy_run_id,
-    }
+    candidate_context = _agent_candidate_context(plan=plan, item=item)
+    binding = _build_agent_decision_binding(
+        plan=plan,
+        item=item,
+        source_identity=source_identity,
+        candidate_context=candidate_context,
+        valid_until=valid_until,
+        request_context_digest=request_context_digest,
+    )
     return ExecAgentAllocationCandidate(
         execution_plan_item_id=item.id,
         symbol=item.symbol,
@@ -2050,7 +2304,216 @@ def _build_agent_candidate(
         market_data=_dict_or_none(risk_context.get("market_data"))
         or _dict_or_none(risk_context.get("quote"))
         or _dict_or_none(risk_context.get("orderbook")),
+        binding=binding,
     )
+
+
+def _agent_candidate_context(
+    *,
+    plan: ExecutionPlan,
+    item: ExecutionPlanItem,
+) -> dict[str, object]:
+    risk_context = item.risk_context if isinstance(item.risk_context, dict) else {}
+    quantity_policy = item.quantity_policy if isinstance(item.quantity_policy, dict) else {}
+    return {
+        "risk_context": risk_context,
+        "quantity_policy": quantity_policy,
+        "limit_price": _serialize_decimal(item.limit_price),
+        "trigger_price": _serialize_decimal(item.trigger_price),
+        "time_in_force": item.time_in_force,
+        "market_date": plan.market_date.isoformat() if plan.market_date else None,
+        "strategy_run_id": plan.strategy_run_id,
+    }
+
+
+def _new_agent_binding_expiry(
+    settings: Settings,
+    *,
+    account_context: _AccountContext,
+    request_started_at: datetime | None = None,
+    enclosing_deadline: datetime | None = None,
+) -> datetime:
+    return account_snapshot_authority_deadline(
+        observed_at=account_context.observed_at,
+        request_started_at=request_started_at or datetime.now(UTC),
+        settings=settings,
+        agent_sla_seconds=settings.exec_agent_watch_sizing_timeout_seconds,
+        enclosing_deadline=enclosing_deadline,
+    )
+
+
+def _build_agent_decision_binding(
+    *,
+    plan: ExecutionPlan,
+    item: ExecutionPlanItem,
+    source_identity: dict[str, object],
+    candidate_context: dict[str, object],
+    valid_until: datetime,
+    request_context_digest: str | None,
+) -> ExecAgentDecisionBinding:
+    del source_identity
+    risk_context = item.risk_context if isinstance(item.risk_context, dict) else {}
+    provider = str(item.provider or "kis").strip().lower()
+    asset_class = str(item.asset_class or "stock").strip().lower()
+    venue = str(
+        item.venue
+        or risk_context.get("exchange")
+        or ("KRX" if provider == "kis" and asset_class == "stock" else "unspecified")
+    ).strip().upper()
+    item_id = str(item.source_plan_item_id or item.id)
+    return _decision_binding_from_values(
+        plan_id=plan.external_plan_id,
+        item_id=item_id,
+        symbol=item.symbol,
+        provider=provider,
+        asset_class=asset_class,
+        venue=venue,
+        side=item.side,
+        intent=item.intent,
+        candidate_context=candidate_context,
+        valid_until=valid_until,
+        request_context_digest=request_context_digest,
+    )
+
+
+def _decision_binding_from_values(
+    *,
+    plan_id: str,
+    item_id: str,
+    symbol: str,
+    provider: str,
+    asset_class: str,
+    venue: str,
+    side: str,
+    intent: str,
+    candidate_context: dict[str, object],
+    valid_until: datetime,
+    request_context_digest: str | None,
+) -> ExecAgentDecisionBinding:
+    digest_payload = {
+        "version": EXEC_AGENT_BINDING_VERSION,
+        "plan_id": plan_id,
+        "item_id": item_id,
+        "symbol": symbol,
+        "provider": provider,
+        "asset_class": asset_class,
+        "venue": venue,
+        "side": side,
+        "intent": intent,
+        "candidate_context": _without_exec_agent_contracts(candidate_context),
+    }
+    return ExecAgentDecisionBinding(
+        plan_id=plan_id,
+        item_id=item_id,
+        symbol=symbol,
+        provider=provider,
+        asset_class=asset_class,
+        venue=venue,
+        side=side,
+        intent=intent,
+        candidate_digest=json_payload_hash(digest_payload),
+        request_context_digest=request_context_digest,
+        valid_until=valid_until,
+    )
+
+
+def build_precomputed_exec_agent_binding(
+    *,
+    plan_id: str,
+    market_date: str | None,
+    strategy_run_id: str | None,
+    item_payload: dict[str, object],
+    valid_until: datetime,
+) -> dict[str, object]:
+    """Build the portable binding envelope required for precomputed decisions."""
+
+    risk_context = dict(
+        item_payload.get("risk_context")
+        if isinstance(item_payload.get("risk_context"), dict)
+        else {}
+    )
+    for key in ("market", "exchange", "currency", "broker", "session_policy"):
+        value = item_payload.get(key)
+        if value is not None and key not in risk_context:
+            risk_context[key] = value
+    quantity_policy = (
+        item_payload.get("quantity_policy")
+        if isinstance(item_payload.get("quantity_policy"), dict)
+        else {}
+    )
+    provider = str(
+        item_payload.get("provider") or item_payload.get("broker") or "kis"
+    ).strip().lower()
+    asset_class = str(item_payload.get("asset_class") or "stock").strip().lower()
+    symbol = str(item_payload.get("symbol") or "").strip().upper()
+    if (
+        provider == "kis"
+        and symbol.isdigit()
+        and len(symbol) == 6
+        and not str(risk_context.get("exchange") or "").strip()
+    ):
+        risk_context["market"] = risk_context.get("market") or "KRX"
+        risk_context["exchange"] = "KRX"
+        risk_context["currency"] = risk_context.get("currency") or "KRW"
+    venue = str(
+        item_payload.get("venue")
+        or risk_context.get("exchange")
+        or ("KRX" if provider == "kis" and asset_class == "stock" else "unspecified")
+    ).strip().upper()
+    item_id = str(
+        item_payload.get("source_plan_item_id")
+        or risk_context.get("core_plan_item_id")
+        or ""
+    )
+    if not item_id:
+        raise ValueError("precomputed exec-agent binding requires source_plan_item_id")
+    candidate_context = {
+        "risk_context": risk_context,
+        "quantity_policy": quantity_policy,
+        "limit_price": _serialize_decimal(_parse_positive_decimal(item_payload.get("limit_price"))),
+        "trigger_price": _serialize_decimal(_parse_positive_decimal(item_payload.get("trigger_price"))),
+        "time_in_force": item_payload.get("time_in_force"),
+        "market_date": market_date,
+        "strategy_run_id": strategy_run_id,
+    }
+    return _decision_binding_from_values(
+        plan_id=plan_id,
+        item_id=item_id,
+        symbol=symbol,
+        provider=provider,
+        asset_class=asset_class,
+        venue=venue,
+        side=str(item_payload.get("side") or "").strip().lower(),
+        intent=str(item_payload.get("intent") or "").strip().lower(),
+        candidate_context=candidate_context,
+        valid_until=valid_until,
+        request_context_digest=None,
+    ).model_dump(mode="json")
+
+
+def _without_exec_agent_contracts(value: object) -> object:
+    if isinstance(value, dict):
+        return {
+            str(key): _without_exec_agent_contracts(nested)
+            for key, nested in value.items()
+            if key not in EXEC_AGENT_CONTRACT_KEYS and key != "account_reference"
+        }
+    if isinstance(value, list):
+        return [_without_exec_agent_contracts(nested) for nested in value]
+    return value
+
+
+def _validate_agent_response_binding(
+    *,
+    supplied: ExecAgentDecisionBinding | None,
+    expected: ExecAgentDecisionBinding,
+) -> None:
+    if supplied is None:
+        raise _InvalidAgentContract("exec-agent response binding is missing")
+    if supplied.valid_until < datetime.now(UTC):
+        raise _InvalidAgentContract("exec-agent response binding expired")
+    if supplied != expected:
+        raise _InvalidAgentContract("exec-agent response binding mismatch")
 
 
 def _agent_account_payload(account_context: _AccountContext) -> dict[str, object]:
@@ -2143,6 +2606,7 @@ def _contract_from_agent_response(response: ExecAgentSizingResponse) -> ShortTer
                 "risk_flags": response.risk_flags,
                 "explanation": response.explanation,
             },
+            binding=response.binding,
         )
     assert response.final_budget is not None
     assert response.reference_price is not None
@@ -2171,6 +2635,7 @@ def _contract_from_agent_response(response: ExecAgentSizingResponse) -> ShortTer
             "risk_flags": response.risk_flags,
             "explanation": response.explanation,
         },
+        binding=response.binding,
     )
 
 
@@ -2181,12 +2646,19 @@ def _dict_or_none(value: object) -> dict[str, Any] | None:
 def _account_snapshot_is_stale(*, settings: Settings, observed_at: datetime) -> bool:
     if not getattr(settings, "exec_agent_enabled", False):
         return False
-    observed = observed_at if observed_at.tzinfo else observed_at.replace(tzinfo=UTC)
-    max_age = timedelta(seconds=getattr(settings, "exec_agent_max_account_snapshot_age_seconds", 300))
-    return datetime.now(UTC) - observed.astimezone(UTC) > max_age
+    return account_snapshot_freshness_failure(
+        observed_at=observed_at,
+        now=datetime.now(UTC),
+        settings=settings,
+    ) is not None
 
 
-def _load_agent_contract(item: ExecutionPlanItem) -> ShortTermExecAgentContract:
+def _load_agent_contract(
+    item: ExecutionPlanItem,
+    *,
+    plan: ExecutionPlan,
+) -> ShortTermExecAgentContract:
+    contracts: list[ShortTermExecAgentContract] = []
     for payload in (item.risk_context, item.quantity_policy):
         if not isinstance(payload, dict):
             continue
@@ -2197,12 +2669,41 @@ def _load_agent_contract(item: ExecutionPlanItem) -> ShortTermExecAgentContract:
             if not isinstance(raw_contract, dict):
                 raise _InvalidAgentContract(f"{key} must be an object")
             try:
-                return ShortTermExecAgentContract.model_validate(raw_contract)
+                contracts.append(ShortTermExecAgentContract.model_validate(raw_contract))
             except ValidationError as exc:
                 raise _InvalidAgentContract(_validation_error_message(exc)) from exc
-    raise _MissingAgentContract(
-        "missing strict exec_agent_decision contract in risk_context or quantity_policy"
+    if not contracts:
+        raise _MissingAgentContract(
+            "missing strict exec_agent_decision contract in risk_context or quantity_policy"
+        )
+    canonical_contracts = {
+        json_payload_hash(contract.model_dump(mode="json"))
+        for contract in contracts
+    }
+    if len(canonical_contracts) != 1:
+        raise _InvalidAgentContract(
+            "conflicting precomputed exec-agent contracts across item payloads"
+        )
+    contract = contracts[0]
+    if contract.binding is None:
+        raise _InvalidAgentContract("precomputed exec-agent binding is missing")
+    if plan.mode == "live" and contract.binding.request_context_digest is None:
+        raise _InvalidAgentContract(
+            "precomputed exec-agent binding lacks authoritative request context"
+        )
+    expected_binding = _build_agent_decision_binding(
+        plan=plan,
+        item=item,
+        source_identity=serialize_plan_item_source_identity(item),
+        candidate_context=_agent_candidate_context(plan=plan, item=item),
+        valid_until=contract.binding.valid_until,
+        request_context_digest=contract.binding.request_context_digest,
     )
+    _validate_agent_response_binding(
+        supplied=contract.binding,
+        expected=expected_binding,
+    )
+    return contract
 
 
 def _validation_error_message(exc: ValidationError) -> str:
@@ -2256,11 +2757,22 @@ def _reject(
 
 def _apply_approved_decision(
     *,
+    settings: Settings,
     item: ExecutionPlanItem,
     decision: dict[str, object],
 ) -> None:
-    existing_risk_context = dict(item.risk_context or {})
+    existing_risk_context, previous_quantity_policy = bind_kis_account_route(
+        settings=settings,
+        provider=item.provider,
+        risk_context=item.risk_context,
+        quantity_policy=item.quantity_policy,
+    )
+    existing_risk_context = dict(existing_risk_context or {})
     existing_risk_context["exec_agent_decision"] = decision
+    for key in ("target_price", "stop_price"):
+        value = decision.get(key)
+        if value is not None:
+            existing_risk_context[key] = value
     item.risk_context = existing_risk_context
     item.quantity_policy = {
         "kind": "shares",
@@ -2437,30 +2949,53 @@ def _new_monitoring_item(
 ) -> ExecutionPlanItem:
     buy_market_date = buy_item.source_market_date or plan.market_date
     close_exit_date = _add_trading_sessions(buy_market_date, max_sessions + 1) if buy_market_date else None
+    provider = str(buy_item.provider or "kis").strip().lower()
+    if provider != "kis":
+        raise PositionIdentityConflictError(
+            "short-term exec-agent monitoring is KIS-only"
+        )
+    source_risk_context = (
+        buy_item.risk_context if isinstance(buy_item.risk_context, dict) else {}
+    )
+    raw_exchange = source_risk_context.get("exchange")
+    exchange = (
+        str(raw_exchange).strip().upper()
+        if isinstance(raw_exchange, str) and raw_exchange.strip()
+        else _default_item_exchange(provider=provider, venue=buy_item.venue)
+    )
+    quantity_policy: dict[str, object] | None = {
+        "kind": "shares",
+        "quantity": quantity,
+        "source": "exec_agent_monitoring",
+        "parent_idempotency_key": decision["idempotency_key"],
+    }
+    risk_context: dict[str, object] | None = {
+        "generated_by": EXEC_AGENT_DECISION_VERSION,
+        "parent_source_identity": serialize_plan_item_source_identity(buy_item),
+        "parent_idempotency_key": decision["idempotency_key"],
+        "exit_rule": exit_rule,
+        "confidence": decision.get("confidence"),
+        "max_holding_trading_sessions": max_sessions,
+        "close_exit_date": close_exit_date.isoformat() if close_exit_date else None,
+        "close_exit_policy": "market_on_or_after_close_exit_date",
+        **({"exchange": exchange} if exchange else {}),
+    }
+    route_binding = kis_account_route_binding_from_payloads(
+        buy_item.risk_context,
+        buy_item.quantity_policy,
+    )
+    if route_binding is not None:
+        risk_context[KIS_ACCOUNT_ROUTE_BINDING_KEY] = route_binding
     return ExecutionPlanItem(
         plan_item_index=next_plan_item_index,
         symbol=buy_item.symbol,
         side="sell",
         intent=intent,
         status="pending",
-        quantity_policy={
-            "kind": "shares",
-            "quantity": quantity,
-            "source": "exec_agent_monitoring",
-            "parent_idempotency_key": decision["idempotency_key"],
-        },
+        quantity_policy=quantity_policy,
         trigger_price=trigger_price,
         time_in_force=buy_item.time_in_force or "day",
-        risk_context={
-            "generated_by": EXEC_AGENT_DECISION_VERSION,
-            "parent_source_identity": serialize_plan_item_source_identity(buy_item),
-            "parent_idempotency_key": decision["idempotency_key"],
-            "exit_rule": exit_rule,
-            "confidence": decision.get("confidence"),
-            "max_holding_trading_sessions": max_sessions,
-            "close_exit_date": close_exit_date.isoformat() if close_exit_date else None,
-            "close_exit_policy": "market_on_or_after_close_exit_date",
-        },
+        risk_context=risk_context,
         decision_agent_name=buy_item.decision_agent_name,
         decision_snapshot_id=buy_item.decision_snapshot_id,
         decision_run_id=buy_item.decision_run_id,
@@ -2469,6 +3004,9 @@ def _new_monitoring_item(
             f"{intent}:{exit_rule.get('stage') or exit_rule.get('kind') or 'default'}",
         ),
         source_market_date=buy_market_date,
+        provider=provider,
+        venue=buy_item.venue,
+        asset_class=buy_item.asset_class,
     )
 
 
@@ -2573,6 +3111,9 @@ def _serialize_account_snapshot(snapshot: BrokerAccountSnapshot) -> dict[str, ob
         "available": True,
         "source": snapshot.source,
         "observed_at": snapshot.observed_at.isoformat(),
+        "holdings_complete": snapshot.holdings_complete,
+        "open_orders_complete": snapshot.open_orders_complete,
+        "diagnostics": dict(snapshot.diagnostics),
         "available_cash": _serialize_decimal(snapshot.available_cash),
         "buying_power": _serialize_decimal(snapshot.buying_power),
         "holding_count": len(snapshot.holdings),
@@ -2601,7 +3142,6 @@ def _serialize_open_order(order: BrokerAccountOpenOrder) -> dict[str, object]:
         "idempotency_key": order.idempotency_key,
         "source_candidate_id": order.source_candidate_id,
         "limit_price": _serialize_decimal(order.limit_price),
-        "payload": order.payload,
     }
 
 

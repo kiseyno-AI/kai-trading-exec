@@ -1,20 +1,29 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
-from inspect import signature
+from inspect import Parameter, signature
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sqlalchemy import func, select
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session, selectinload
 
 from app.broker.base import (
     BrokerAccountHolding,
     BrokerAdapter,
     BrokerAdapterError,
+    BrokerErrorClassification,
     BrokerEventSource,
     NormalizedBrokerOrderStatus,
+)
+from app.broker.error_safety import (
+    safe_broker_error_code,
+    safe_broker_error_message,
+    sanitize_broker_error_payload,
 )
 from app.core.config import Settings
 from app.models.runtime import (
@@ -23,16 +32,17 @@ from app.models.runtime import (
     ExecutionFailure,
     ExecutionFill,
     ExecutionPosition,
+    new_id,
 )
 from app.services.broker_auth import ensure_authenticated_broker_session
 from app.services.broker_order_state import (
     NONTERMINAL_ORDER_STATUSES,
     broker_order_observed_at_expr,
 )
-from app.services.fill_idempotency import (
-    dedupe_execution_fills,
-    execution_fill_dedupe_key,
-    execution_fill_idempotency_key,
+from app.services.execution_account_route import redact_account_references
+from app.services.execution_failures import (
+    record_actionable_execution_failure,
+    resolve_execution_failure_for_order,
 )
 from app.services.fill_economics import (
     COST_COVERAGE_COMPLETE,
@@ -42,9 +52,21 @@ from app.services.fill_economics import (
     execution_fill_economics,
     normalize_fill_economics,
 )
-from app.services.execution_failures import (
-    record_actionable_execution_failure,
-    resolve_execution_failure_for_order,
+from app.services.fill_idempotency import (
+    dedupe_execution_fills,
+    execution_fill_dedupe_key,
+    execution_fill_idempotency_key,
+)
+from app.services.fifo_inventory import fifo_route_scope_from_order
+from app.services.position_identity import (
+    EXECUTION_SCOPE_POLICY_VERSION,
+    PositionIdentity,
+    PositionIdentityConflictError,
+    build_authenticated_broker_position_identity,
+    build_position_identity,
+    payload_with_position_identity,
+    position_identity_from_columns,
+    position_identity_from_payload,
 )
 from app.services.rejected_order_retries import handle_reconciled_rejected_order
 from app.services.runtime_transitions import (
@@ -63,6 +85,8 @@ def reconcile_broker_orders(
 ) -> dict[str, int]:
     reconciled = 0
     fills_added = 0
+    scope_rejected = 0
+    scope_quarantined = 0
     for order in orders:
         result = reconcile_broker_order(
             settings=settings,
@@ -73,10 +97,17 @@ def reconcile_broker_orders(
         if result["status_changed"] is True:
             reconciled += 1
         fills_added += int(result["fills_added"])
+        scope_classification = result.get("scope_classification")
+        if scope_classification is not None:
+            scope_rejected += 1
+        if scope_classification == "invalid_execution_scope":
+            scope_quarantined += 1
     return {
         "candidate_order_count": len(orders),
         "reconciled_order_count": reconciled,
         "fills_added": fills_added,
+        "scope_rejected_order_count": scope_rejected,
+        "scope_quarantined_order_count": scope_quarantined,
     }
 
 
@@ -92,6 +123,23 @@ def reconcile_broker_order(
     order_status_before = order.status
     event_time = _observation_time()
     fills_added = 0
+
+    scope_rejection = _order_reconciliation_scope_rejection(
+        settings=settings,
+        adapter=adapter,
+        order=order,
+        allow_deferred_authenticated_scope=True,
+    )
+    if scope_rejection is not None:
+        return _reject_order_reconciliation_scope(
+            db=db,
+            order=order,
+            classification=scope_rejection[0],
+            reason=scope_rejection[1],
+            observed_at=event_time,
+            actor=actor,
+            operator_reason=operator_reason,
+        )
 
     if not order.broker_order_id:
         return {
@@ -113,6 +161,22 @@ def reconcile_broker_order(
             source="reconciliation",
             reason="refresh broker order state before reconciliation",
         )
+        authenticated_scope_rejection = _order_reconciliation_scope_rejection(
+            settings=settings,
+            adapter=adapter,
+            order=order,
+            access_token=session_state.access_token or "",
+        )
+        if authenticated_scope_rejection is not None:
+            return _reject_order_reconciliation_scope(
+                db=db,
+                order=order,
+                classification=authenticated_scope_rejection[0],
+                reason=authenticated_scope_rejection[1],
+                observed_at=event_time,
+                actor=actor,
+                operator_reason=operator_reason,
+            )
         payload = _call_reconcile_order(
             adapter=adapter,
             access_token=session_state.access_token or "",
@@ -120,6 +184,11 @@ def reconcile_broker_order(
         )
         if not isinstance(payload, dict):
             raise ValueError("reconcile_order adapter returned non-dictionary payload")
+        _validate_reconcile_payload_identity(
+            payload=payload,
+            adapter=adapter,
+            order=order,
+        )
     except (BrokerAdapterError, Exception) as exc:  # broad except to keep reconcile cycle durable
         return _reconcile_adapter_error(
             exc=exc,
@@ -280,11 +349,14 @@ def reconcile_broker_order(
 
     retry_failure = None
     if normalized_status == NormalizedBrokerOrderStatus.REJECTED.value:
+        redacted_retry_payload = redact_account_references(payload)
+        if not isinstance(redacted_retry_payload, dict):
+            redacted_retry_payload = {}
         retry_failure = handle_reconciled_rejected_order(
             settings=settings,
             db=db,
             order=order,
-            payload=payload,
+            payload=redacted_retry_payload,
             observed_at=event_time,
         )
     else:
@@ -331,24 +403,292 @@ def reconcile_broker_order(
     }
 
 
+_CANONICAL_EXECUTION_SCOPE_KEYS = frozenset(
+    {
+        "policy_version",
+        "provider",
+        "account_scope",
+        "venue",
+        "asset_class",
+        "exchange",
+    }
+)
+
+
+def _order_reconciliation_scope_rejection(
+    *,
+    settings: Settings,
+    adapter: BrokerAdapter,
+    order: BrokerOrder,
+    access_token: str | None = None,
+    allow_deferred_authenticated_scope: bool = False,
+) -> tuple[str, str] | None:
+    metadata = order.request_metadata if isinstance(order.request_metadata, dict) else {}
+    raw_scope = metadata.get("execution_scope")
+    if not isinstance(raw_scope, dict):
+        return "invalid_execution_scope", "canonical_execution_scope_missing"
+    if set(raw_scope) != _CANONICAL_EXECUTION_SCOPE_KEYS:
+        return "invalid_execution_scope", "canonical_execution_scope_malformed"
+    if raw_scope.get("policy_version") != EXECUTION_SCOPE_POLICY_VERSION:
+        return "invalid_execution_scope", "canonical_execution_scope_version_invalid"
+    route_scope = fifo_route_scope_from_order(order)
+    if route_scope is None:
+        return "invalid_execution_scope", "canonical_execution_scope_conflicts_with_order"
+
+    adapter_provider = str(adapter.provider or "").strip().lower()
+    if (
+        order.mode != settings.runtime_mode
+        or route_scope.provider != adapter_provider
+        or str(order.broker_name or "").strip().lower() != adapter_provider
+    ):
+        return "foreign_execution_scope", "broker_or_runtime_scope_mismatch"
+
+    broker_account_id: str | None = None
+    if adapter_provider == "alpaca":
+        if access_token is None:
+            if allow_deferred_authenticated_scope:
+                return None
+            return (
+                "authenticated_execution_scope_unavailable",
+                "dry_run_cannot_verify_authenticated_account_identity",
+            )
+        account_id_loader = getattr(adapter, "get_broker_account_id", None)
+        if not callable(account_id_loader):
+            return (
+                "authenticated_execution_scope_unavailable",
+                "authenticated_account_identity_unavailable",
+            )
+        try:
+            loaded_account_id = account_id_loader(access_token)
+        except Exception:
+            return (
+                "authenticated_execution_scope_unavailable",
+                "authenticated_account_identity_unavailable",
+            )
+        broker_account_id = (
+            loaded_account_id.strip()
+            if isinstance(loaded_account_id, str) and loaded_account_id.strip()
+            else None
+        )
+        if broker_account_id is None:
+            return (
+                "authenticated_execution_scope_unavailable",
+                "authenticated_account_identity_unavailable",
+            )
+    try:
+        current_identity = build_position_identity(
+            settings=settings,
+            provider=adapter_provider,
+            exchange=route_scope.exchange,
+            broker_account_id=broker_account_id,
+        )
+    except PositionIdentityConflictError:
+        return (
+            "authenticated_execution_scope_unavailable",
+            "authenticated_account_identity_unavailable",
+        )
+    if (
+        route_scope.provider != current_identity.provider
+        or route_scope.account_scope != current_identity.account_scope
+        or route_scope.exchange != current_identity.exchange
+    ):
+        return "foreign_execution_scope", "authenticated_account_scope_mismatch"
+    return None
+
+
+def _reject_order_reconciliation_scope(
+    *,
+    db: Session,
+    order: BrokerOrder,
+    classification: str,
+    reason: str,
+    observed_at: datetime,
+    actor: str | None,
+    operator_reason: str | None,
+) -> dict[str, object]:
+    status_before = order.status
+    if classification == "invalid_execution_scope":
+        apply_broker_order_status(
+            order=order,
+            status=NormalizedBrokerOrderStatus.MANUAL_REVIEW_REQUIRED.value,
+        )
+        order.last_error_classification = classification
+        order.last_error_code = reason
+        order.last_error_message = (
+            "broker reconciliation blocked because canonical execution scope "
+            "is unavailable or invalid"
+        )
+        order.last_error_retryable = False
+        if order.plan_item is not None:
+            set_plan_item_status(
+                db=db,
+                plan_item=order.plan_item,
+                status="broker_order_failed",
+                source="reconciliation",
+                reason=reason,
+                payload={
+                    "broker_order_pk": order.id,
+                    "status_before": status_before,
+                    "status": order.status,
+                    "classification": classification,
+                },
+                occurred_at=observed_at,
+            )
+    prior_event_id = db.scalar(
+        select(BrokerOrderEvent.id)
+        .where(
+            BrokerOrderEvent.broker_order_pk == order.id,
+            BrokerOrderEvent.event_type == "reconcile_scope_rejected",
+            BrokerOrderEvent.error_classification == classification,
+            BrokerOrderEvent.message == reason,
+        )
+        .limit(1)
+    )
+    if prior_event_id is None:
+        db.add(
+            BrokerOrderEvent(
+                broker_order_pk=order.id,
+                event_type="reconcile_scope_rejected",
+                event_source=BrokerEventSource.RECONCILIATION.value,
+                normalized_status=order.status,
+                error_classification=classification,
+                retryable=False,
+                message=reason,
+                payload={
+                    "classification": classification,
+                    "reason": reason,
+                    "actor": actor,
+                    "operator_reason": operator_reason,
+                },
+                observed_at=observed_at,
+            )
+        )
+    db.commit()
+    db.refresh(order)
+    return {
+        "status_code": 409,
+        "broker_order_id": order.broker_order_id,
+        "status": order.status,
+        "status_before": status_before,
+        "status_changed": order.status != status_before,
+        "fills_added": 0,
+        "filled_delta": 0,
+        "message": reason,
+        "scope_classification": classification,
+    }
+
+
 def _call_reconcile_order(
     *,
     adapter: BrokerAdapter,
     access_token: str,
     order: BrokerOrder,
 ) -> dict[str, Any] | None:
-    kwargs: dict[str, object] = {"exchange": _order_reconciliation_exchange(order)}
+    optional_kwargs: dict[str, object] = {
+        "exchange": _order_reconciliation_exchange(order),
+        "submitted_at": order.submitted_at,
+        "expected_symbol": order.symbol,
+    }
     try:
         parameters = signature(adapter.reconcile_order).parameters
     except (TypeError, ValueError):
-        parameters = {}
-    if "submitted_at" in parameters:
-        kwargs["submitted_at"] = order.submitted_at
+        # The protocol's long-standing exchange argument is the only safe
+        # fallback when a callable does not expose an inspectable signature.
+        kwargs = {"exchange": optional_kwargs["exchange"]}
+    else:
+        accepts_extra_keywords = any(
+            parameter.kind is Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        )
+        kwargs = {
+            name: value
+            for name, value in optional_kwargs.items()
+            if accepts_extra_keywords or name in parameters
+        }
     return adapter.reconcile_order(
         access_token,
         order.broker_order_id or "",
         **kwargs,
     )
+
+
+def _validate_reconcile_payload_identity(
+    *,
+    payload: dict[str, Any],
+    adapter: BrokerAdapter,
+    order: BrokerOrder,
+) -> None:
+    mismatches: list[str] = []
+    route_scope = fifo_route_scope_from_order(order)
+    identity_provider = str(adapter.provider or "").strip().casefold()
+    identity_asset_class = (
+        route_scope.asset_class
+        if route_scope is not None
+        else str(order.asset_class or "").strip().lower()
+    )
+    identity_exchange = (
+        route_scope.exchange
+        if route_scope is not None
+        else str(order.venue or "").strip().upper()
+    )
+    expected_identities = {
+        "broker_order_id": str(order.broker_order_id or "").strip(),
+        "provider": identity_provider,
+        "symbol": _canonical_reconcile_symbol(
+            order.symbol,
+            provider=identity_provider,
+            asset_class=identity_asset_class,
+            exchange=identity_exchange,
+        ),
+    }
+    for key, expected in expected_identities.items():
+        if key not in payload:
+            continue
+        observed = payload.get(key)
+        if not isinstance(observed, str) or not observed.strip():
+            mismatches.append(key)
+            continue
+        normalized_observed = observed.strip()
+        if key == "provider":
+            normalized_observed = normalized_observed.casefold()
+        elif key == "symbol":
+            normalized_observed = _canonical_reconcile_symbol(
+                normalized_observed,
+                provider=identity_provider,
+                asset_class=identity_asset_class,
+                exchange=identity_exchange,
+            )
+        if normalized_observed != expected:
+            mismatches.append(key)
+    if not mismatches:
+        return
+    raise BrokerAdapterError(
+        "broker reconciliation response identity did not match the persisted order",
+        status_code=502,
+        classification=BrokerErrorClassification.UNKNOWN,
+        retryable=True,
+        code="reconcile_identity_mismatch",
+        response_payload={
+            "mismatched_fields": mismatches,
+            "payload": payload,
+        },
+        observed_at=_observation_time(),
+    )
+
+
+def _canonical_reconcile_symbol(
+    value: object,
+    *,
+    provider: str,
+    asset_class: str,
+    exchange: str,
+) -> str:
+    normalized = str(value or "").strip().upper()
+    if provider == "alpaca" and asset_class == "crypto" and exchange == "ALPACA":
+        normalized = normalized.replace("-", "/")
+        if "/" not in normalized and normalized.endswith("USD") and len(normalized) > 3:
+            normalized = f"{normalized[:-3]}/USD"
+    return normalized
 
 
 def reconcile_pending_broker_orders(
@@ -418,6 +758,9 @@ def reconcile_stale_nonterminal_broker_orders(
         error_classification_before = order.last_error_classification
         reason: str | None = None
         result: dict[str, object] | None = None
+        scope_classification: str | None = None
+        scope_quarantined = False
+        scope_would_quarantine = False
         if not order.broker_order_id:
             classification = "failed_to_reconcile"
             reason = "missing_broker_order_id"
@@ -428,7 +771,21 @@ def reconcile_stale_nonterminal_broker_orders(
                 order.last_broker_sync_at = classification_observed_at
         else:
             if dry_run:
-                result = _stale_order_dry_run_result(order=order)
+                scope_rejection = _order_reconciliation_scope_rejection(
+                    settings=settings,
+                    adapter=adapter,
+                    order=order,
+                )
+                if scope_rejection is None:
+                    result = _stale_order_dry_run_result(order=order)
+                else:
+                    scope_classification, reason = scope_rejection
+                    result = {
+                        **_stale_order_dry_run_result(order=order),
+                        "status_code": 409,
+                        "message": reason,
+                        "scope_classification": scope_classification,
+                    }
             else:
                 result = reconcile_broker_order(
                     settings=settings,
@@ -438,24 +795,53 @@ def reconcile_stale_nonterminal_broker_orders(
                     actor=actor,
                     operator_reason=operator_reason,
                 )
-            classification, reason = _stale_order_reconciliation_classification(
-                status=str(result.get("status") or order.status),
-                status_code=int(result.get("status_code") or 200),
-                message=result.get("message"),
-            )
+                raw_scope_classification = result.get("scope_classification")
+                scope_classification = (
+                    str(raw_scope_classification)
+                    if raw_scope_classification is not None
+                    else None
+                )
+            if scope_classification == "invalid_execution_scope":
+                classification = "manual_review_required"
+                reason = _optional_str(result.get("message")) or reason
+                if dry_run:
+                    scope_would_quarantine = True
+                else:
+                    scope_quarantined = True
+            elif scope_classification is not None:
+                classification = "failed_to_reconcile"
+                reason = _optional_str(result.get("message")) or reason
+            else:
+                classification, reason = _stale_order_reconciliation_classification(
+                    status=str(result.get("status") or order.status),
+                    status_code=int(result.get("status_code") or 200),
+                    message=result.get("message"),
+                )
             if int(result.get("fills_added") or 0) > 0 or str(result.get("status") or "") == "filled":
                 exchange = _order_reconciliation_exchange(order)
                 position_sync_symbols.setdefault(exchange, set()).add(order.symbol)
 
-        repair = _stale_order_repair_decision(
-            order=order,
-            status_before=status_before,
-            classification=classification,
-            reason=reason,
-            result=result,
-            error_code_before=error_code_before,
-            error_classification_before=error_classification_before,
-        )
+        if scope_would_quarantine:
+            repair = {
+                "status_after": NormalizedBrokerOrderStatus.MANUAL_REVIEW_REQUIRED.value,
+                "classification": "manual_review_required",
+                "reason": reason or "canonical_execution_scope_invalid",
+                "observed_broker_code": "invalid_execution_scope",
+            }
+        elif scope_quarantined:
+            repair = None
+        else:
+            repair = _stale_order_repair_decision(
+                order=order,
+                status_before=status_before,
+                classification=classification,
+                reason=reason,
+                result=result,
+                error_code_before=error_code_before,
+                error_classification_before=error_classification_before,
+            )
+        if scope_quarantined:
+            repaired_count += 1
         if repair is not None:
             repaired_count += 1
             classification, reason = repair["classification"], repair["reason"]
@@ -561,7 +947,17 @@ def reconcile_stale_nonterminal_broker_orders(
                 "status_after": repair["status_after"] if repair is not None else order.status,
                 "classification": classification.replace("_", "-"),
                 "reason": reason,
-                "repair_action": "would_repair" if dry_run and repair is not None else "repaired" if repair is not None else "none",
+                "repair_action": (
+                    "would_quarantine"
+                    if scope_would_quarantine
+                    else "quarantined"
+                    if scope_quarantined
+                    else "would_repair"
+                    if dry_run and repair is not None
+                    else "repaired"
+                    if repair is not None
+                    else "none"
+                ),
                 "observed_broker_code": (
                     repair["observed_broker_code"]
                     if repair is not None
@@ -1066,7 +1462,7 @@ def sync_execution_positions_from_broker_snapshot(
     discover_holdings_only: bool = False,
     commit: bool = True,
     authenticated_access_token: str | None = None,
-) -> dict[str, int]:
+) -> dict[str, object]:
     normalized_symbols = _normalize_symbols(symbols)
     if authenticated_access_token is None:
         if not commit:
@@ -1083,80 +1479,140 @@ def sync_execution_positions_from_broker_snapshot(
         access_token = session_state.access_token or ""
     else:
         access_token = authenticated_access_token
-    try:
-        snapshot = adapter.get_account_snapshot(
-            access_token,
-            symbols=sorted(normalized_symbols) if normalized_symbols is not None else None,
-            exchange=exchange,
+    snapshot = adapter.get_account_snapshot(
+        access_token,
+        symbols=sorted(normalized_symbols) if normalized_symbols is not None else None,
+        exchange=exchange,
+    )
+    if not snapshot.holdings_complete:
+        raise BrokerAdapterError(
+            "broker account snapshot holdings coverage is incomplete; position sync blocked",
+            status_code=502,
+            classification=BrokerErrorClassification.UNKNOWN,
+            response_payload={"diagnostics": snapshot.diagnostics},
+            observed_at=snapshot.observed_at,
         )
-    except TypeError:
-        snapshot = adapter.get_account_snapshot(access_token)
+    normalized_provider = str(adapter.provider or "").strip().lower()
+    identity_exchange = _position_sync_identity_exchange(
+        provider=normalized_provider,
+        requested_exchange=exchange,
+    )
+    position_identity = (
+        build_authenticated_broker_position_identity(
+            settings=settings,
+            provider=normalized_provider,
+            exchange=identity_exchange,
+            broker_account_id=snapshot.broker_account_id or "",
+        )
+        if normalized_provider == "alpaca"
+        else build_position_identity(
+            settings=settings,
+            provider=normalized_provider,
+            exchange=identity_exchange,
+            broker_account_id=snapshot.broker_account_id,
+        )
+    )
+    routed_holdings = _position_sync_holdings_for_route(
+        holdings=snapshot.holdings,
+        provider=normalized_provider,
+        exchange=identity_exchange,
+        observed_at=snapshot.observed_at,
+    )
+    execution_scope = {
+        "policy_version": EXECUTION_SCOPE_POLICY_VERSION,
+        "provider": position_identity.provider,
+        "account_scope": position_identity.account_scope,
+    }
+    execution_scope_source = (
+        "authenticated_broker_account"
+        if snapshot.broker_account_id
+        else "configured_account_route"
+    )
     if discover_holdings_only:
         if normalized_symbols is not None:
             raise ValueError("holdings-only discovery requires symbols=None")
-        tracked_symbols = {holding.symbol for holding in snapshot.holdings}
+        tracked_symbols = {holding.symbol for holding in routed_holdings}
     elif normalized_symbols is not None:
         tracked_symbols = normalized_symbols
     else:
-        local_symbols = set(
-            db.scalars(
-                select(ExecutionPosition.symbol).where(
+        local_symbols = {
+            position.symbol
+            for position in db.scalars(
+                select(ExecutionPosition).where(
                     ExecutionPosition.mode == settings.runtime_mode,
                 )
             ).all()
-        )
-        tracked_symbols = local_symbols | {holding.symbol for holding in snapshot.holdings}
+            if _position_belongs_to_sync_scope(
+                position=position,
+                identity=position_identity,
+            )
+        }
+        tracked_symbols = local_symbols | {holding.symbol for holding in routed_holdings}
     if not tracked_symbols:
         return {
             "tracked_symbol_count": 0,
             "created": 0,
             "updated": 0,
             "zeroed": 0,
+            "execution_scope": execution_scope,
+            "execution_scope_source": execution_scope_source,
         }
 
-    position_by_symbol = {
-        position.symbol: position
-        for position in db.scalars(
-            select(ExecutionPosition).where(
-                ExecutionPosition.mode == settings.runtime_mode,
-                ExecutionPosition.symbol.in_(sorted(tracked_symbols)),
-            )
-        ).all()
-    }
     holding_by_symbol = {
         holding.symbol: holding
-        for holding in snapshot.holdings
+        for holding in routed_holdings
         if holding.symbol in tracked_symbols
     }
+    position_by_symbol, created_symbols = _lock_execution_position_rows(
+        db=db,
+        mode=settings.runtime_mode,
+        symbols=tracked_symbols,
+        identity=position_identity,
+        holdings_by_symbol=holding_by_symbol,
+    )
     observed_at = snapshot.observed_at
 
-    created = 0
+    legacy_positions_to_bind: list[ExecutionPosition] = []
+    for symbol in sorted(tracked_symbols):
+        position = position_by_symbol[symbol]
+        stored_identity = position_identity_from_payload(position.raw_payload)
+        if stored_identity is not None:
+            if stored_identity != position_identity:
+                raise PositionIdentityConflictError(
+                    "position route conflicts with the broker snapshot route"
+                )
+            continue
+        if (
+            position.last_reconciled_at is not None
+            and _utc_naive(observed_at) < _utc_naive(position.last_reconciled_at)
+        ):
+            continue
+        if not _legacy_position_is_empty_and_safe_to_bind(position=position):
+            raise PositionIdentityConflictError(
+                "legacy non-flat position requires explicit account mapping"
+            )
+        legacy_positions_to_bind.append(position)
+
+    for position in legacy_positions_to_bind:
+        position.raw_payload = payload_with_position_identity(
+            position.raw_payload,
+            identity=position_identity,
+        )
+
+    created = len(created_symbols)
     updated = 0
     zeroed = 0
     for symbol in sorted(tracked_symbols):
         holding = holding_by_symbol.get(symbol)
         position = position_by_symbol.get(symbol)
+        assert position is not None
+        if (
+            position.last_reconciled_at is not None
+            and _utc_naive(observed_at)
+            < _utc_naive(position.last_reconciled_at)
+        ):
+            continue
         if holding is None:
-            if position is None:
-                db.add(
-                    ExecutionPosition(
-                        mode=settings.runtime_mode,
-                        symbol=symbol,
-                        quantity=0,
-                        base_quantity=Decimal("0"),
-                        average_price=None,
-                        updated_from="reconciliation",
-                        last_reconciled_at=observed_at,
-                        raw_payload=_position_snapshot_payload(
-                            snapshot_payload=snapshot.payload,
-                            holding=None,
-                            exchange=exchange,
-                        ),
-                    )
-                )
-                created += 1
-                continue
-
             changed = False
             if position.quantity != 0:
                 position.quantity = 0
@@ -1171,31 +1627,12 @@ def sync_execution_positions_from_broker_snapshot(
             position.raw_payload = _position_snapshot_payload(
                 snapshot_payload=snapshot.payload,
                 holding=None,
-                exchange=exchange,
+                exchange=identity_exchange,
+                identity=position_identity,
             )
             continue
 
         holding_base_quantity = _holding_base_quantity(holding.payload)
-        if position is None:
-            db.add(
-                ExecutionPosition(
-                    mode=settings.runtime_mode,
-                    symbol=symbol,
-                    quantity=0 if holding_base_quantity is not None else holding.quantity,
-                    base_quantity=holding_base_quantity,
-                    average_price=holding.average_price,
-                    updated_from="reconciliation",
-                    last_reconciled_at=observed_at,
-                    raw_payload=_position_snapshot_payload(
-                        snapshot_payload=snapshot.payload,
-                        holding=holding,
-                        exchange=exchange,
-                    ),
-                )
-            )
-            created += 1
-            continue
-
         changed = False
         expected_quantity = 0 if holding_base_quantity is not None else holding.quantity
         if position.quantity != expected_quantity:
@@ -1204,7 +1641,7 @@ def sync_execution_positions_from_broker_snapshot(
         if holding_base_quantity is not None and position.base_quantity != holding_base_quantity:
             position.base_quantity = holding_base_quantity
             changed = True
-        if holding_base_quantity is None and position.base_quantity not in {None, Decimal("0")}:
+        if holding_base_quantity is None and position.base_quantity is not None:
             position.base_quantity = None
             changed = True
         if position.average_price != holding.average_price:
@@ -1217,9 +1654,10 @@ def sync_execution_positions_from_broker_snapshot(
         position.raw_payload = _position_snapshot_payload(
             snapshot_payload=snapshot.payload,
             holding=holding,
-            exchange=exchange,
+            exchange=identity_exchange,
+            identity=position_identity,
         )
-        if changed:
+        if changed and symbol not in created_symbols:
             updated += 1
 
     if commit:
@@ -1229,7 +1667,330 @@ def sync_execution_positions_from_broker_snapshot(
         "created": created,
         "updated": updated,
         "zeroed": zeroed,
+        "execution_scope": execution_scope,
+        "execution_scope_source": execution_scope_source,
     }
+
+
+def _position_sync_identity_exchange(
+    *,
+    provider: str,
+    requested_exchange: str,
+) -> str:
+    normalized_exchange = str(requested_exchange or "").strip().upper()
+    if provider == "kis" and normalized_exchange in {
+        "KRX",
+        "KOSPI",
+        "KOSDAQ",
+        "NXT",
+        "SOR",
+    }:
+        return "KRX"
+    return normalized_exchange
+
+
+def _position_sync_holdings_for_route(
+    *,
+    holdings: list[BrokerAccountHolding],
+    provider: str,
+    exchange: str,
+    observed_at: datetime,
+) -> list[BrokerAccountHolding]:
+    """Keep holdings on their proven route and reject ambiguous position truth."""
+
+    routed = list(holdings)
+    if provider == "kis" and exchange in {"NASD", "NYSE", "AMEX"}:
+        routed = []
+        for holding in holdings:
+            reported_exchange = _holding_reported_exchange(holding.payload)
+            if reported_exchange is None:
+                raise BrokerAdapterError(
+                    "KIS US holding lacks broker exchange proof; position sync blocked",
+                    status_code=502,
+                    classification=BrokerErrorClassification.UNKNOWN,
+                    response_payload={
+                        "requested_exchange": exchange,
+                        "holding_symbol": holding.symbol,
+                    },
+                    observed_at=observed_at,
+                )
+            if reported_exchange not in {"NASD", "NYSE", "AMEX"}:
+                raise BrokerAdapterError(
+                    "KIS US holding reports an unsupported exchange; position sync blocked",
+                    status_code=502,
+                    classification=BrokerErrorClassification.UNKNOWN,
+                    response_payload={
+                        "requested_exchange": exchange,
+                        "reported_exchange": reported_exchange,
+                        "holding_symbol": holding.symbol,
+                    },
+                    observed_at=observed_at,
+                )
+            if reported_exchange == exchange:
+                routed.append(holding)
+    return _dedupe_position_sync_holdings(
+        holdings=routed,
+        provider=provider,
+        exchange=exchange,
+        observed_at=observed_at,
+    )
+
+
+def _dedupe_position_sync_holdings(
+    *,
+    holdings: list[BrokerAccountHolding],
+    provider: str,
+    exchange: str,
+    observed_at: datetime,
+) -> list[BrokerAccountHolding]:
+    holdings_by_symbol: dict[str, BrokerAccountHolding] = {}
+    for holding in holdings:
+        normalized_symbol = str(holding.symbol or "").strip().upper()
+        normalized_holding = replace(holding, symbol=normalized_symbol)
+        existing = holdings_by_symbol.get(normalized_symbol)
+        if existing is None:
+            holdings_by_symbol[normalized_symbol] = normalized_holding
+            continue
+        existing_values = _position_sync_holding_values(existing)
+        incoming_values = _position_sync_holding_values(normalized_holding)
+        conflicting_fields = sorted(
+            field
+            for field, existing_value in existing_values.items()
+            if existing_value != incoming_values[field]
+        )
+        if conflicting_fields:
+            raise BrokerAdapterError(
+                "conflicting duplicate broker holding; position sync blocked",
+                status_code=502,
+                classification=BrokerErrorClassification.UNKNOWN,
+                response_payload={
+                    "provider": provider,
+                    "exchange": exchange,
+                    "holding_symbol": normalized_symbol,
+                    "conflicting_fields": conflicting_fields,
+                },
+                observed_at=observed_at,
+            )
+    return list(holdings_by_symbol.values())
+
+
+def _position_sync_holding_values(
+    holding: BrokerAccountHolding,
+) -> dict[str, object]:
+    return {
+        "quantity": _normalized_position_holding_decimal(holding.quantity),
+        "base_quantity": _position_holding_payload_decimal(
+            holding.payload,
+            ("base_quantity",),
+        ),
+        "average_price": _normalized_position_holding_decimal(
+            holding.average_price
+        ),
+        "sellable_quantity": _normalized_position_holding_decimal(
+            holding.sellable_quantity
+        ),
+        "unrealized_pnl": _normalized_position_holding_decimal(
+            holding.unrealized_pnl
+        ),
+        "unrealized_pnl_pct": _normalized_position_holding_decimal(
+            holding.unrealized_pnl_pct
+        ),
+        "valuation": _position_holding_payload_decimal(
+            holding.payload,
+            ("ovrs_stck_evlu_amt", "market_value", "evaluation_amount"),
+        ),
+    }
+
+
+def _normalized_position_holding_decimal(value: object) -> object:
+    if value is None:
+        return None
+    parsed = _parse_decimal_candidate(value)
+    if parsed is None or not parsed.is_finite():
+        # A malformed numeric value cannot prove duplicate equivalence.
+        return object()
+    return parsed.normalize()
+
+
+def _position_holding_payload_decimal(
+    payload: object,
+    keys: tuple[str, ...],
+) -> object:
+    if not isinstance(payload, dict):
+        return None
+    for key in keys:
+        if key not in payload or payload.get(key) is None:
+            continue
+        return _normalized_position_holding_decimal(payload.get(key))
+    return None
+
+
+def _lock_execution_position_rows(
+    *,
+    db: Session,
+    mode: str,
+    symbols: set[str],
+    identity: PositionIdentity,
+    holdings_by_symbol: dict[str, BrokerAccountHolding] | None = None,
+) -> tuple[dict[str, ExecutionPosition], set[str]]:
+    created_symbols: set[str] = set()
+    dialect_name = db.get_bind().dialect.name
+    for symbol in sorted(symbols):
+        existing_rows = db.scalars(
+            select(ExecutionPosition)
+            .where(
+                ExecutionPosition.mode == mode,
+                ExecutionPosition.symbol == symbol,
+            )
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        ).all()
+        rows_by_identity: dict[PositionIdentity, ExecutionPosition] = {}
+        unscoped_rows: list[ExecutionPosition] = []
+        for position in existing_rows:
+            column_identity = _position_column_identity(position)
+            stored_identity = position_identity_from_payload(position.raw_payload)
+            if column_identity is None and stored_identity is None:
+                unscoped_rows.append(position)
+                continue
+            resolved_identity = column_identity or stored_identity
+            assert resolved_identity is not None
+            if column_identity is not None and stored_identity not in {
+                None,
+                column_identity,
+            }:
+                raise PositionIdentityConflictError(
+                    "execution position columns conflict with stored identity"
+                )
+            if resolved_identity in rows_by_identity:
+                raise PositionIdentityConflictError(
+                    "execution position one-row-per-route-symbol invariant is violated"
+                )
+            rows_by_identity[resolved_identity] = position
+            if column_identity is None:
+                _bind_position_route(position=position, identity=resolved_identity)
+            if stored_identity is None:
+                position.raw_payload = payload_with_position_identity(
+                    position.raw_payload,
+                    identity=resolved_identity,
+                )
+
+        if len(unscoped_rows) > 1:
+            raise PositionIdentityConflictError(
+                "execution position legacy one-row-per-symbol invariant is violated"
+            )
+        if unscoped_rows and identity in rows_by_identity:
+            raise PositionIdentityConflictError(
+                "parallel legacy position requires explicit account cleanup"
+            )
+        if identity not in rows_by_identity and unscoped_rows:
+            legacy_position = unscoped_rows[0]
+            if not _legacy_position_is_empty_and_safe_to_bind(
+                position=legacy_position,
+            ):
+                raise PositionIdentityConflictError(
+                    "legacy non-flat position requires explicit account mapping"
+                )
+            _bind_position_route(position=legacy_position, identity=identity)
+            legacy_position.raw_payload = payload_with_position_identity(
+                legacy_position.raw_payload,
+                identity=identity,
+            )
+            rows_by_identity[identity] = legacy_position
+
+        if identity in rows_by_identity:
+            continue
+
+        values = {
+            "id": new_id(),
+            "mode": mode,
+            "provider": identity.provider,
+            "account_scope": identity.account_scope,
+            "exchange": identity.exchange,
+            "symbol": symbol,
+            "quantity": 0,
+            "base_quantity": Decimal("0"),
+            "updated_from": "reconciliation_pending",
+            "raw_payload": payload_with_position_identity(
+                None,
+                identity=identity,
+            ),
+        }
+        if dialect_name == "sqlite":
+            statement = sqlite_insert(ExecutionPosition).values(**values)
+            result = db.execute(
+                statement.on_conflict_do_nothing(
+                    index_elements=[
+                        ExecutionPosition.mode,
+                        ExecutionPosition.provider,
+                        ExecutionPosition.account_scope,
+                        ExecutionPosition.exchange,
+                        ExecutionPosition.symbol,
+                    ]
+                )
+            )
+        elif dialect_name == "postgresql":
+            statement = postgresql_insert(ExecutionPosition).values(**values)
+            result = db.execute(
+                statement.on_conflict_do_nothing(
+                    index_elements=[
+                        ExecutionPosition.mode,
+                        ExecutionPosition.provider,
+                        ExecutionPosition.account_scope,
+                        ExecutionPosition.exchange,
+                        ExecutionPosition.symbol,
+                    ]
+                )
+            )
+        else:
+            raise RuntimeError(
+                "position reconciliation requires SQLite or PostgreSQL locking support"
+            )
+        if result.rowcount == 1:
+            created_symbols.add(symbol)
+
+    # Route-column backfills must be visible to the exact scoped query below.
+    db.flush()
+    positions = db.scalars(
+        select(ExecutionPosition)
+        .where(
+            ExecutionPosition.mode == mode,
+            ExecutionPosition.provider == identity.provider,
+            ExecutionPosition.account_scope == identity.account_scope,
+            ExecutionPosition.exchange == identity.exchange,
+            ExecutionPosition.symbol.in_(sorted(symbols)),
+        )
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    ).all()
+    position_by_symbol: dict[str, ExecutionPosition] = {}
+    for position in positions:
+        if position.symbol not in symbols or position.symbol in position_by_symbol:
+            raise PositionIdentityConflictError(
+                "execution position one-row-per-route-symbol invariant is violated"
+            )
+        position_by_symbol[position.symbol] = position
+    if set(position_by_symbol) != symbols:
+        raise PositionIdentityConflictError(
+            "execution position one-row-per-route-symbol invariant is violated"
+        )
+    return position_by_symbol, created_symbols
+
+
+def _position_column_identity(
+    position: ExecutionPosition,
+) -> PositionIdentity | None:
+    return position_identity_from_columns(position)
+
+
+def _bind_position_route(
+    *,
+    position: ExecutionPosition,
+    identity: PositionIdentity,
+) -> None:
+    position.provider = identity.provider
+    position.account_scope = identity.account_scope
+    position.exchange = identity.exchange
 
 
 def _holding_base_quantity(payload: object) -> Decimal | None:
@@ -1247,7 +2008,7 @@ def _snapshot_payload(payload: dict[str, Any] | None) -> dict[str, Any] | None:
         return None
     if not isinstance(payload, dict):
         return None
-    return payload
+    return _json_safe_dict(payload)
 
 
 def _position_snapshot_payload(
@@ -1255,6 +2016,7 @@ def _position_snapshot_payload(
     snapshot_payload: dict[str, Any] | None,
     holding: BrokerAccountHolding | None,
     exchange: str,
+    identity: PositionIdentity,
 ) -> dict[str, Any] | None:
     payload = _snapshot_payload(snapshot_payload)
     if payload is None:
@@ -1262,8 +2024,9 @@ def _position_snapshot_payload(
     else:
         payload = dict(payload)
     normalized_exchange = str(exchange or "").strip().upper()
+    payload = payload_with_position_identity(payload, identity=identity)
     if holding is None or normalized_exchange not in {"NASD", "NYSE", "AMEX"}:
-        return payload or None
+        return payload
 
     reported_exchange = _holding_reported_exchange(holding.payload) or normalized_exchange
     monitoring_eligible = (
@@ -1285,6 +2048,40 @@ def _position_snapshot_payload(
         )
     payload["_position_sync"] = position_sync
     return payload
+
+
+def _position_belongs_to_sync_scope(
+    *,
+    position: ExecutionPosition,
+    identity: PositionIdentity,
+) -> bool:
+    column_identity = _position_column_identity(position)
+    stored_identity = position_identity_from_payload(position.raw_payload)
+    if (
+        column_identity is not None
+        and stored_identity is not None
+        and column_identity != stored_identity
+    ):
+        raise PositionIdentityConflictError(
+            "execution position columns conflict with stored identity"
+        )
+    resolved_identity = column_identity or stored_identity
+    return resolved_identity is None or resolved_identity == identity
+
+
+def _legacy_position_is_empty_and_safe_to_bind(
+    *,
+    position: ExecutionPosition,
+) -> bool:
+    """Bind only an unused placeholder; broker-value equality proves no account identity."""
+    return (
+        position.quantity == 0
+        and (position.base_quantity is None or position.base_quantity == 0)
+        and position.average_price is None
+        and position.last_reconciled_at is None
+        and not position.raw_payload
+        and position.updated_from in {"bootstrap", "reconciliation_pending"}
+    )
 
 
 def _holding_reported_exchange(payload: object) -> str | None:
@@ -1311,7 +2108,11 @@ def _reconcilable_order_statuses() -> tuple[str, ...]:
 def _normalize_symbols(symbols: set[str] | None) -> set[str] | None:
     if symbols is None:
         return None
-    return {symbol.upper() for symbol in symbols}
+    return {
+        normalized
+        for symbol in symbols
+        if (normalized := str(symbol or "").strip().upper())
+    }
 
 
 def _reconcile_adapter_error(
@@ -1327,10 +2128,18 @@ def _reconcile_adapter_error(
     operator_reason: str | None = None,
 ) -> dict[str, object]:
     if isinstance(exc, BrokerAdapterError):
-        message = str(exc)
+        message = safe_broker_error_message(exc)
         status_code = exc.status_code or 503
+        safe_error_code = safe_broker_error_code(
+            exc.code,
+            provider=adapter.provider,
+        )
+        safe_request_metadata = _safe_payload(exc.request_metadata)
+        safe_response_metadata = _safe_broker_error_payload(exc.response_metadata)
+        safe_request_payload = _safe_payload(exc.request_payload)
+        safe_response_payload = _safe_broker_error_payload(exc.response_payload)
         order.last_error_classification = exc.classification.value
-        order.last_error_code = exc.code
+        order.last_error_code = safe_error_code
         order.last_error_message = message
         order.last_error_retryable = exc.retryable
         order.last_broker_sync_at = exc.observed_at or event_time
@@ -1340,12 +2149,12 @@ def _reconcile_adapter_error(
                 "provider": adapter.provider,
                 "broker_order_id": requested_broker_order_id,
                 "status": None,
-                "broker_status": exc.code,
+                "broker_status": safe_error_code,
                 "observed_at": _serialize_datetime(order.last_broker_sync_at),
-                "request_metadata": exc.request_metadata,
-                "response_metadata": exc.response_metadata,
-                "request_payload": exc.request_payload,
-                "payload": exc.response_payload,
+                "request_metadata": safe_request_metadata,
+                "response_metadata": safe_response_metadata,
+                "request_payload": safe_request_payload,
+                "payload": safe_response_payload,
                 "message": message,
             },
         )
@@ -1353,7 +2162,7 @@ def _reconcile_adapter_error(
             db=db,
             order=order,
             message=message,
-            broker_status=exc.code,
+            broker_status=safe_error_code,
             error_classification=exc.classification.value,
             observed_at=order.last_broker_sync_at,
         ):
@@ -1362,13 +2171,13 @@ def _reconcile_adapter_error(
                     "provider": adapter.provider,
                     "broker_order_id": requested_broker_order_id,
                     "status": None,
-                    "broker_status": exc.code,
+                    "broker_status": safe_error_code,
                     "observed_at": _serialize_datetime(order.last_broker_sync_at),
                     "message": message,
-                    "request_metadata": exc.request_metadata,
-                    "response_metadata": exc.response_metadata,
-                    "request_payload": exc.request_payload,
-                    "payload": exc.response_payload,
+                    "request_metadata": safe_request_metadata,
+                    "response_metadata": safe_response_metadata,
+                    "request_payload": safe_request_payload,
+                    "payload": safe_response_payload,
                 },
                 adapter=adapter,
             )
@@ -1381,12 +2190,12 @@ def _reconcile_adapter_error(
                     event_type="reconcile_failed",
                     event_source=BrokerEventSource.RECONCILIATION.value,
                     normalized_status=order.status,
-                    broker_status=exc.code,
+                    broker_status=safe_error_code,
                     error_classification=exc.classification.value,
                     retryable=exc.retryable,
                     message=message,
-                    request_payload=exc.request_payload,
-                    response_payload=exc.response_payload,
+                    request_payload=safe_request_payload,
+                    response_payload=safe_response_payload,
                     payload=event_payload,
                     observed_at=order.last_broker_sync_at,
                 )
@@ -1405,7 +2214,7 @@ def _reconcile_adapter_error(
         }
 
     observed_at = _observation_time()
-    message = f"{exc.__class__.__name__}: {exc}"
+    message = safe_broker_error_message(exc)
     order.last_error_classification = "unknown"
     order.last_error_code = None
     order.last_error_message = message
@@ -1578,7 +2387,7 @@ def _build_reconcile_event_payload(
     payload: dict[str, Any],
     adapter: BrokerAdapter,
 ) -> dict[str, object]:
-    return {
+    event_payload: dict[str, object] = {
         "provider": adapter.provider,
         "event_source": BrokerEventSource.RECONCILIATION.value,
         "observed_at": payload.get("observed_at"),
@@ -1589,6 +2398,15 @@ def _build_reconcile_event_payload(
         or _dict_or_none(payload.get("response_payload")),
         "request_metadata": _dict_or_none(payload.get("request_metadata")),
     }
+    for key in (
+        "requested_quantity",
+        "filled_quantity",
+        "remaining_quantity",
+        "filled_base_quantity",
+    ):
+        if payload.get(key) is not None:
+            event_payload[key] = _json_safe_value(payload[key])
+    return event_payload
 
 
 def _raw_status_details(payload: dict[str, Any]) -> dict[str, object]:
@@ -1606,7 +2424,15 @@ def _safe_payload(payload: object) -> dict[str, Any] | None:
     return None
 
 
+def _safe_broker_error_payload(payload: object) -> dict[str, Any] | None:
+    sanitized = sanitize_broker_error_payload(payload)
+    return dict(sanitized) if isinstance(sanitized, dict) else None
+
+
 def _order_reconciliation_exchange(order: BrokerOrder) -> str:
+    canonical_scope = fifo_route_scope_from_order(order)
+    if canonical_scope is not None:
+        return canonical_scope.exchange
     for payload in (order.request_metadata, order.response_metadata, order.raw_broker_payload):
         exchange = _exchange_from_payload(payload)
         if exchange is not None:
@@ -1684,12 +2510,29 @@ def _parse_fills_from_payload(
     order: BrokerOrder,
     observed_at: datetime,
 ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    fill_time_metadata = _fill_time_metadata(payload)
     fills_payload = payload.get("fills")
     if isinstance(fills_payload, list) and fills_payload:
         result: list[dict[str, object]] = []
+        anomalies: list[dict[str, object]] = []
         inherited_cost_scope = _transaction_cost_scope(payload)
-        for fill_item in fills_payload:
+        for fill_index, fill_item in enumerate(fills_payload):
             if not isinstance(fill_item, dict):
+                continue
+            integrity_reason = _fill_payload_integrity_reason(
+                fill=fill_item,
+                order=order,
+            )
+            if integrity_reason is not None:
+                anomalies.append(
+                    {
+                        "reason": integrity_reason,
+                        "fill_index": fill_index,
+                        "broker_order_id": order.broker_order_id,
+                        "symbol": order.symbol,
+                        "side": order.side,
+                    }
+                )
                 continue
             parsed_fill = _normalize_fill_payload(
                 fill_item=fill_item,
@@ -1699,8 +2542,9 @@ def _parse_fills_from_payload(
             )
             if parsed_fill is None:
                 continue
+            parsed_fill.update(fill_time_metadata)
             result.append(parsed_fill)
-        return result, []
+        return result, anomalies
 
     existing_fills = dedupe_execution_fills(order.fills)
     total_filled_base = _parse_decimal(payload.get("filled_base_quantity"))
@@ -1719,7 +2563,10 @@ def _parse_fills_from_payload(
             existing_fills=existing_fills,
         )
         if delta_result["status"] == "noop":
-            return _cumulative_cost_revision_rows(payload=payload, order=order), []
+            return _cumulative_existing_fill_revision_rows(
+                payload=payload,
+                order=order,
+            ), []
         if delta_result["status"] != "ok":
             anomalies = delta_result["anomalies"]
             return [], anomalies if isinstance(anomalies, list) else []
@@ -1749,6 +2596,7 @@ def _parse_fills_from_payload(
             "previous_base_quantity": existing_total_base,
             "previous_quote_notional": delta_result["previous_cumulative_notional"],
             **economics,
+            **fill_time_metadata,
         }], []
 
     total_filled = _parse_int(payload.get("filled_quantity"))
@@ -1766,7 +2614,10 @@ def _parse_fills_from_payload(
         existing_fills=existing_fills,
     )
     if delta_result["status"] == "noop":
-        return _cumulative_cost_revision_rows(payload=payload, order=order), []
+        return _cumulative_existing_fill_revision_rows(
+            payload=payload,
+            order=order,
+        ), []
     if delta_result["status"] != "ok":
         anomalies = delta_result["anomalies"]
         return [], anomalies if isinstance(anomalies, list) else []
@@ -1794,8 +2645,20 @@ def _parse_fills_from_payload(
             "previous_quantity": existing_total,
             "previous_quote_notional": delta_result["previous_cumulative_notional"],
             **economics,
+            **fill_time_metadata,
         }
     ], []
+
+
+def _fill_time_metadata(payload: dict[str, object]) -> dict[str, str]:
+    precision = _optional_str(payload.get("fill_time_precision"))
+    if precision not in {"exact", "observed_upper_bound"}:
+        return {}
+    source = _optional_str(payload.get("fill_time_source"))
+    result = {"fill_time_precision": precision}
+    if source is not None:
+        result["fill_time_source"] = source
+    return result
 
 
 def _cumulative_fill_economics(
@@ -1976,6 +2839,88 @@ def _cumulative_cost_revision_rows(
     return rows
 
 
+def _cumulative_existing_fill_revision_rows(
+    *,
+    payload: dict[str, object],
+    order: BrokerOrder,
+) -> list[dict[str, object]]:
+    """Enrich a cumulative no-op without inventing another execution fill."""
+
+    rows = _cumulative_cost_revision_rows(payload=payload, order=order)
+    time_metadata = _fill_time_metadata(payload)
+    if time_metadata.get("fill_time_precision") != "observed_upper_bound":
+        return rows
+
+    rows_by_signature = {
+        signature: row
+        for row in rows
+        if (signature := _fill_signature_candidate(order=order, fill=row))
+        is not None
+    }
+    for fill in dedupe_execution_fills(order.fills):
+        persisted_payload = (
+            fill.payload if isinstance(fill.payload, dict) else {}
+        )
+        if not _is_cumulative_reconciliation_fill_payload(persisted_payload):
+            continue
+        persisted_precision = _optional_str(
+            persisted_payload.get("fill_time_precision")
+        )
+        persisted_source = _optional_str(persisted_payload.get("fill_time_source"))
+        incoming_source = time_metadata.get("fill_time_source")
+        if persisted_precision == "exact" or (
+            persisted_precision == "observed_upper_bound"
+            and (persisted_source is not None or incoming_source is None)
+        ):
+            continue
+        revision = {
+            "broker_fill_id": fill.broker_fill_id,
+            "quantity": fill.quantity,
+            "base_quantity": fill.base_quantity,
+            "quote_notional": fill.quote_notional,
+            "price": fill.price,
+            "filled_at": _parse_timestamp(
+                fill.filled_at,
+                fallback=_observation_time(),
+            ).isoformat(),
+            "symbol": fill.symbol,
+            "side": fill.side,
+            **time_metadata,
+        }
+        signature = _fill_signature_candidate(order=order, fill=revision)
+        if signature is not None and signature in rows_by_signature:
+            rows_by_signature[signature].update(time_metadata)
+        else:
+            rows.append(revision)
+            if signature is not None:
+                rows_by_signature[signature] = revision
+    return rows
+
+
+def _is_cumulative_reconciliation_fill_payload(payload: dict[str, object]) -> bool:
+    return (
+        payload.get("price_derivation") == "cumulative_notional_delta"
+        or any(
+            key in payload
+            for key in (
+                "cumulative_quantity",
+                "cumulative_base_quantity",
+                "cumulative_quote_notional",
+            )
+        )
+        or _is_legacy_order_time_repair_payload(payload)
+    )
+
+
+def _is_legacy_order_time_repair_payload(payload: dict[str, object]) -> bool:
+    """Treat every pre-contract operator repair as chronology-unproven."""
+
+    return (
+        payload.get("source") == "operator_fill_evidence_repair"
+        and payload.get("fill_time_precision") != "exact"
+    )
+
+
 def _sum_fill_quantities(fills: list[ExecutionFill]) -> int:
     return sum(fill.quantity for fill in fills)
 
@@ -2138,10 +3083,68 @@ def _normalize_fill_payload(
         "quote_notional": _parse_decimal(fill_item.get("quote_notional")),
         "price": price,
         "filled_at": filled_at.isoformat(),
-        "symbol": _optional_str(fill_item.get("symbol")) or order.symbol,
-        "side": _optional_str(fill_item.get("side")) or order.side,
+        "symbol": _normalized_fill_symbol(order.symbol),
+        "side": _normalized_fill_side(order.side),
         **economics_payload(economics),
     }
+
+
+def _fill_payload_integrity_reason(
+    *,
+    fill: dict[str, object],
+    order: BrokerOrder,
+) -> str | None:
+    order_symbol = _normalized_fill_symbol(order.symbol)
+    fill_symbol = _optional_str(fill.get("symbol"))
+    if fill_symbol is not None and _normalized_fill_symbol(fill_symbol) != order_symbol:
+        return "fill_symbol_mismatch"
+
+    order_side = _normalized_fill_side(order.side)
+    fill_side = _optional_str(fill.get("side"))
+    if fill_side is not None and _normalized_fill_side(fill_side) != order_side:
+        return "fill_side_mismatch"
+
+    price = _parse_decimal_candidate(fill.get("price"))
+    if price is None:
+        return "invalid_fill_price"
+    if not price.is_finite():
+        return "non_finite_fill_price"
+    if price <= 0:
+        return "non_positive_fill_price"
+
+    raw_quantity = fill.get("quantity")
+    quantity = (
+        Decimal("0")
+        if raw_quantity is None
+        else _parse_decimal_candidate(raw_quantity)
+    )
+    raw_base_quantity = fill.get("base_quantity")
+    base_quantity = (
+        None
+        if raw_base_quantity is None
+        else _parse_decimal_candidate(raw_base_quantity)
+    )
+    if quantity is None or base_quantity is None and raw_base_quantity is not None:
+        return "invalid_fill_quantity"
+    if not quantity.is_finite() or (
+        base_quantity is not None and not base_quantity.is_finite()
+    ):
+        return "non_finite_fill_quantity"
+    if quantity != quantity.to_integral_value():
+        return "invalid_fill_quantity"
+    if quantity < 0 or (base_quantity is not None and base_quantity < 0):
+        return "non_positive_fill_quantity"
+    if quantity <= 0 and (base_quantity is None or base_quantity <= 0):
+        return "non_positive_fill_quantity"
+    return None
+
+
+def _normalized_fill_symbol(value: object) -> str:
+    return str(value or "").strip().upper()
+
+
+def _normalized_fill_side(value: object) -> str:
+    return str(value or "").strip().lower()
 
 
 def _upsert_order_fills(
@@ -2159,6 +3162,8 @@ def _upsert_order_fills(
 
     added = 0
     for fill in fills:
+        if _fill_payload_integrity_reason(fill=fill, order=order) is not None:
+            continue
         fill_signature = _fill_signature_candidate(order=order, fill=fill)
         if fill_signature is None:
             continue
@@ -2171,8 +3176,8 @@ def _upsert_order_fills(
             idempotency_key=fill_signature,
             broker_order_pk=order.id,
             broker_fill_id=_optional_str(fill.get("broker_fill_id")),
-            symbol=str(fill["symbol"]),
-            side=str(fill["side"]),
+            symbol=_normalized_fill_symbol(order.symbol),
+            side=_normalized_fill_side(order.side),
             quantity=int(fill["quantity"]),
             base_quantity=_parse_decimal(fill.get("base_quantity")),
             quote_notional=_parse_decimal(fill.get("quote_notional")),
@@ -2243,10 +3248,31 @@ def _enrich_existing_fill_economics(
         existing.transaction_cost_coverage = incoming_coverage
         existing.transaction_cost_source = incoming_source
 
+    chronology_updated = False
+    incoming_time_precision = _optional_str(incoming.get("fill_time_precision"))
+    incoming_time_source = _optional_str(incoming.get("fill_time_source"))
+    existing_time_precision = _optional_str(
+        existing_payload.get("fill_time_precision")
+    )
+    if (
+        incoming_time_precision == "observed_upper_bound"
+        and existing_time_precision != "exact"
+    ):
+        if existing_time_precision != "observed_upper_bound":
+            existing_payload["fill_time_precision"] = "observed_upper_bound"
+            chronology_updated = True
+        if (
+            incoming_time_source is not None
+            and _optional_str(existing_payload.get("fill_time_source")) is None
+        ):
+            existing_payload["fill_time_source"] = incoming_time_source
+            chronology_updated = True
+
     if (
         incoming_currency_conflict
         or incoming_currency is not None
         or should_update_cost
+        or chronology_updated
     ):
         existing_payload["economics_revision"] = _copy_payload(
             {
@@ -2257,7 +3283,7 @@ def _enrich_existing_fill_economics(
                 "transaction_cost_source": incoming_source,
             }
         )
-        existing.payload = existing_payload
+        existing.payload = _copy_payload(existing_payload)
 
 
 def _fill_signature_candidate(
@@ -2265,12 +3291,14 @@ def _fill_signature_candidate(
     order: BrokerOrder,
     fill: dict[str, object],
 ) -> str | None:
+    if _fill_payload_integrity_reason(fill=fill, order=order) is not None:
+        return None
     broker_fill_id = _optional_str(fill.get("broker_fill_id"))
     quantity = _parse_int(fill.get("quantity")) or 0
     base_quantity = _parse_decimal(fill.get("base_quantity"))
     price = _parse_decimal(fill.get("price"))
-    symbol = _optional_str(fill.get("symbol"))
-    side = _optional_str(fill.get("side"))
+    symbol = _normalized_fill_symbol(order.symbol)
+    side = _normalized_fill_side(order.side)
     if (
         (quantity <= 0 and (base_quantity is None or base_quantity <= 0))
         or price is None
@@ -2339,6 +3367,9 @@ def _merge_reconcile_request_metadata(
     for key in ("source", "metadata", "route", "time_in_force"):
         if key in existing and key not in merged:
             merged[key] = _json_safe_value(existing[key])
+    for key in ("exchange", "execution_scope"):
+        if key in existing:
+            merged[key] = _json_safe_value(existing[key])
     return merged
 
 
@@ -2356,10 +3387,20 @@ def _order_status_to_plan_item_status(order_status: str) -> str | None:
 
 
 def _parse_decimal(value: object) -> Decimal | None:
+    parsed = _parse_decimal_candidate(value)
+    return parsed if parsed is not None and parsed.is_finite() else None
+
+
+def _parse_decimal_candidate(value: object) -> Decimal | None:
     if isinstance(value, Decimal):
         return value
+    if isinstance(value, bool):
+        return None
     if isinstance(value, int | float):
-        return Decimal(str(value))
+        try:
+            return Decimal(str(value))
+        except (InvalidOperation, ValueError):
+            return None
     if isinstance(value, str):
         try:
             return Decimal(value)
@@ -2371,14 +3412,17 @@ def _parse_decimal(value: object) -> Decimal | None:
 def _parse_int(value: object) -> int | None:
     if isinstance(value, bool):
         return None
-    if isinstance(value, int):
-        return value
-    if isinstance(value, str):
-        try:
-            return int(Decimal(value))
-        except (InvalidOperation, ValueError):
-            return None
-    return None
+    parsed = _parse_decimal_candidate(value)
+    if (
+        parsed is None
+        or not parsed.is_finite()
+        or parsed != parsed.to_integral_value()
+    ):
+        return None
+    try:
+        return int(parsed)
+    except (OverflowError, ValueError):
+        return None
 
 
 def _optional_str(value: object) -> str | None:
@@ -2392,9 +3436,12 @@ def _copy_payload(payload: dict[str, object]) -> dict[str, object]:
 
 
 def _json_safe_dict(payload: dict[str, Any]) -> dict[str, Any]:
+    redacted = redact_account_references(payload)
+    if not isinstance(redacted, dict):
+        return {}
     return {
         str(key): _json_safe_value(value)
-        for key, value in payload.items()
+        for key, value in redacted.items()
     }
 
 

@@ -20,6 +20,7 @@ from app.db.session import create_db_engine, create_session_factory
 from app.models.runtime import ExecutionPlan, ExecutionPlanItem, ExecutionPosition
 from app.services import monitoring
 from app.services.monitoring_price_source import _load_monitoring_exchange_by_symbol
+from app.services.position_identity import build_position_identity
 
 
 def _session():
@@ -161,11 +162,73 @@ def test_kis_monitoring_position_discovery_can_scope_to_krx(monkeypatch) -> None
     engine.dispose()
 
 
+def test_kis_monitoring_loader_ignores_foreign_provider_stop_without_mutating_it() -> None:
+    settings, engine, db = _session()
+    kis_identity = build_position_identity(
+        settings=settings,
+        provider="kis",
+        exchange="NASD",
+    )
+    foreign_stop = ExecutionPlanItem(
+        id="alpaca-aapl-stop-owned-by-foreign-coordinator",
+        plan_item_index=0,
+        symbol="AAPL",
+        side="sell",
+        intent="stop_sell",
+        status="stop_sell_monitoring",
+        provider="alpaca",
+        venue="alpaca",
+        asset_class="us_equity",
+        trigger_price=Decimal("190"),
+        quantity_policy={"kind": "shares", "quantity": 1},
+        risk_context={"exchange": "US"},
+    )
+    db.add_all(
+        [
+            ExecutionPlan(
+                external_plan_id="foreign-alpaca-monitoring-plan",
+                source="alpaca_us_equity_strategy",
+                mode="paper",
+                status="accepted",
+                items=[foreign_stop],
+            ),
+            ExecutionPosition(
+                mode="paper",
+                provider=kis_identity.provider,
+                account_scope=kis_identity.account_scope,
+                exchange=kis_identity.exchange,
+                symbol="AAPL",
+                quantity=1,
+                average_price=Decimal("200"),
+                updated_from="reconciliation",
+            ),
+        ]
+    )
+    db.commit()
+
+    loaded = monitoring._load_monitored_items(
+        settings=settings,
+        db=db,
+        symbols=["AAPL"],
+    )
+
+    assert loaded == []
+    db.refresh(foreign_stop)
+    assert foreign_stop.status == "stop_sell_monitoring"
+    assert "last_monitoring_event" not in (foreign_stop.risk_context or {})
+    db.close()
+    engine.dispose()
+
+
 def test_kis_krx_discovery_zeroes_preexisting_broker_absent_holding() -> None:
     settings, engine, db = _session()
+    identity = build_position_identity(settings=settings, provider="kis", exchange="KRX")
     db.add(
         ExecutionPosition(
             mode="paper",
+            provider=identity.provider,
+            account_scope=identity.account_scope,
+            exchange=identity.exchange,
             symbol="005930",
             quantity=7,
             average_price=Decimal("70000"),
@@ -295,9 +358,13 @@ def test_live_position_truth_refresh_propagates_snapshot_sync_failure(
 
 def test_kis_monitoring_routes_existing_us_position_from_broker_truth(monkeypatch) -> None:
     settings, engine, db = _session()
+    identity = build_position_identity(settings=settings, provider="kis", exchange="NASD")
     db.add(
         ExecutionPosition(
             mode="paper",
+            provider=identity.provider,
+            account_scope=identity.account_scope,
+            exchange=identity.exchange,
             symbol="AAPL",
             quantity=2,
             average_price=Decimal("200"),
@@ -333,11 +400,62 @@ def test_kis_monitoring_routes_existing_us_position_from_broker_truth(monkeypatc
     engine.dispose()
 
 
-def test_kis_quote_route_uses_verified_position_exchange_without_plan() -> None:
+def test_kis_monitoring_position_sync_prefers_exact_position_exchange_over_newer_plan(
+    monkeypatch,
+) -> None:
     settings, engine, db = _session()
+    identity = build_position_identity(settings=settings, provider="kis", exchange="NASD")
     db.add(
         ExecutionPosition(
             mode="paper",
+            provider=identity.provider,
+            account_scope=identity.account_scope,
+            exchange=identity.exchange,
+            symbol="ROUTE",
+            quantity=2,
+            average_price=Decimal("200"),
+            updated_from="reconciliation",
+        )
+    )
+    _add_item(
+        db,
+        symbol="ROUTE",
+        asset_class="us_equity",
+        risk_context={"exchange": "NYSE"},
+    )
+    calls: list[tuple[str, set[str]]] = []
+
+    monkeypatch.setattr(
+        monitoring,
+        "sync_execution_positions_from_broker_snapshot",
+        lambda **kwargs: calls.append((kwargs["exchange"], kwargs["symbols"])),
+    )
+
+    monitoring._sync_positions_for_monitoring_routes(
+        settings=settings,
+        db=db,
+        adapter=type("Adapter", (), {"provider": "kis"})(),
+        symbols={"ROUTE"},
+    )
+
+    assert calls == [("NASD", {"ROUTE"})]
+    db.close()
+    engine.dispose()
+
+
+def test_kis_quote_route_uses_verified_position_exchange_without_plan() -> None:
+    settings, engine, db = _session()
+    identity = build_position_identity(
+        settings=settings,
+        provider="kis",
+        exchange="NASD",
+    )
+    db.add(
+        ExecutionPosition(
+            mode="paper",
+            provider=identity.provider,
+            account_scope=identity.account_scope,
+            exchange=identity.exchange,
             symbol="AAPL",
             quantity=2,
             average_price=Decimal("200"),
@@ -354,8 +472,8 @@ def test_kis_quote_route_uses_verified_position_exchange_without_plan() -> None:
     db.commit()
 
     assert _load_monitoring_exchange_by_symbol(
+        settings=settings,
         db=db,
-        mode=settings.runtime_mode,
         symbols=["AAPL"],
     ) == {"AAPL": "NASD"}
 
@@ -366,8 +484,16 @@ def test_kis_quote_route_uses_verified_position_exchange_without_plan() -> None:
 def test_supported_existing_us_holding_gets_us_target_and_stop_monitoring() -> None:
     settings, engine, db = _session()
     _add_item(db, symbol="AAPL", asset_class="us_equity", risk_context={"exchange": "NASD"})
+    identity = build_position_identity(
+        settings=settings,
+        provider="kis",
+        exchange="NASD",
+    )
     position = ExecutionPosition(
         mode="paper",
+        provider=identity.provider,
+        account_scope=identity.account_scope,
+        exchange=identity.exchange,
         symbol="AAPL",
         quantity=2,
         average_price=Decimal("200"),

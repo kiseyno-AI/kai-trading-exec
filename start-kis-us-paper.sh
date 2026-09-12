@@ -43,6 +43,7 @@ export KAI_EXEC_API_PORT="$PORT"
 # KIS US paper uses the KIS autonomous coordinator, whose monitoring state is
 # not provider-scoped.  Keep it in a dedicated process and database.
 export KAI_EXEC_RUNTIME_MODE="paper"
+export KAI_EXEC_RUNTIME_BROKER_PROVIDER="kis"
 export KAI_EXEC_DATABASE_URL="sqlite:///$ROOT_DIR/var/kis_us_paper_exec.db"
 export KAI_EXEC_SQLITE_WAL_AUTOCHECKPOINT_PAGES="1000"
 export KAI_EXEC_AUTONOMOUS_RUNTIME_ENABLED="true"

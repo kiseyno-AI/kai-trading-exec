@@ -5,6 +5,7 @@ from uuid import uuid4
 
 from sqlalchemy import (
     Boolean,
+    CheckConstraint,
     Date,
     DateTime,
     ForeignKey,
@@ -16,6 +17,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -111,6 +113,74 @@ class RuntimeControlEvent(TimestampMixin, Base):
     control_state: Mapped[RuntimeControlState] = relationship(back_populates="events")
 
 
+class CoreBuyAuthorityState(TimestampMixin, Base):
+    __tablename__ = "core_buy_authority_states"
+    __table_args__ = (
+        UniqueConstraint(
+            "provider",
+            "market",
+            "currency",
+            "runtime_mode",
+            "account_scope",
+            name="uq_core_buy_authority_states_scope",
+        ),
+        CheckConstraint(
+            "provider = 'kis' AND market = 'KRX' AND currency = 'KRW'",
+            name="ck_core_buy_authority_states_krx_scope",
+        ),
+    )
+
+    scope_fingerprint: Mapped[str] = mapped_column(String(64), primary_key=True)
+    provider: Mapped[str] = mapped_column(String(32), nullable=False)
+    market: Mapped[str] = mapped_column(String(32), nullable=False)
+    currency: Mapped[str] = mapped_column(String(16), nullable=False)
+    runtime_mode: Mapped[str] = mapped_column(String(16), nullable=False)
+    account_scope: Mapped[str] = mapped_column(String(64), nullable=False)
+    fence_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    epoch: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    delivery_status: Mapped[str] = mapped_column(String(32), nullable=False)
+    projection_pending: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    healthy_observation_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_observation_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    last_material_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    last_action: Mapped[str] = mapped_column(String(32), nullable=False)
+    market_date: Mapped[date] = mapped_column(Date, nullable=False)
+    source_observed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_healthy_source_observed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    last_block_source_observed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    last_blocked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    context: Mapped[dict[str, Any] | None] = mapped_column(JSON, deferred=True)
+
+
+class CoreBuyAuthorityObservation(TimestampMixin, Base):
+    __tablename__ = "core_buy_authority_observations"
+    __table_args__ = (
+        Index(
+            "ix_core_buy_authority_observations_scope_received",
+            "scope_fingerprint",
+            "received_at",
+        ),
+    )
+
+    observation_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    scope_fingerprint: Mapped[str] = mapped_column(
+        ForeignKey("core_buy_authority_states.scope_fingerprint"),
+        nullable=False,
+    )
+    material_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    action: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    source_observed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    ack_payload: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+
+
 class BrokerSession(TimestampMixin, Base):
     __tablename__ = "broker_sessions"
 
@@ -121,6 +191,8 @@ class BrokerSession(TimestampMixin, Base):
     token_type: Mapped[str | None] = mapped_column(String(32))
     access_token: Mapped[str | None] = mapped_column(Text, deferred=True)
     access_token_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    generation: Mapped[str | None] = mapped_column(String(36))
+    refresh_after: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     refresh_token: Mapped[str | None] = mapped_column(Text, deferred=True)
     refresh_token_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     approval_key: Mapped[str | None] = mapped_column(Text, deferred=True)
@@ -272,6 +344,13 @@ class ExecutionPlanItemAudit(TimestampMixin, Base):
 
 class ExecutionJob(TimestampMixin, Base):
     __tablename__ = "execution_jobs"
+    __table_args__ = (
+        UniqueConstraint(
+            "execution_plan_item_id",
+            "job_type",
+            name="uq_execution_jobs_plan_item_job_type",
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     execution_plan_item_id: Mapped[str] = mapped_column(
@@ -514,20 +593,58 @@ class FifoInventoryIsolation(TimestampMixin, Base):
     __table_args__ = (
         UniqueConstraint(
             "mode",
+            "provider",
+            "account_scope",
+            "venue",
+            "asset_class",
+            "exchange",
             "symbol",
             "broker_reconciled_at",
-            name="uq_fifo_inventory_isolations_mode_symbol_reconciled",
+            name="uq_fifo_inventory_isolations_route_symbol_reconciled",
+        ),
+        CheckConstraint(
+            "(provider IS NULL AND account_scope IS NULL AND venue IS NULL "
+            "AND asset_class IS NULL AND exchange IS NULL) OR "
+            "(provider IS NOT NULL AND account_scope IS NOT NULL "
+            "AND venue IS NOT NULL AND asset_class IS NOT NULL "
+            "AND exchange IS NOT NULL)",
+            name="ck_fifo_inventory_isolations_scope_complete",
         ),
         Index(
-            "ix_fifo_inventory_isolations_mode_symbol_isolated_at",
+            "ix_fifo_inventory_isolations_route_symbol_isolated_at",
             "mode",
+            "provider",
+            "account_scope",
+            "venue",
+            "asset_class",
+            "exchange",
             "symbol",
             "isolated_through_at",
+        ),
+        Index(
+            "uq_fifo_inventory_isolations_legacy_mode_symbol_reconciled",
+            "mode",
+            "symbol",
+            "broker_reconciled_at",
+            unique=True,
+            sqlite_where=text(
+                "provider IS NULL AND account_scope IS NULL AND venue IS NULL "
+                "AND asset_class IS NULL AND exchange IS NULL"
+            ),
+            postgresql_where=text(
+                "provider IS NULL AND account_scope IS NULL AND venue IS NULL "
+                "AND asset_class IS NULL AND exchange IS NULL"
+            ),
         ),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     mode: Mapped[str] = mapped_column(String(16), nullable=False)
+    provider: Mapped[str | None] = mapped_column(String(32))
+    account_scope: Mapped[str | None] = mapped_column(String(128))
+    venue: Mapped[str | None] = mapped_column(String(32))
+    asset_class: Mapped[str | None] = mapped_column(String(32))
+    exchange: Mapped[str | None] = mapped_column(String(32))
     symbol: Mapped[str] = mapped_column(String(32), nullable=False)
     residual_quantity: Mapped[Decimal] = mapped_column(Numeric(28, 12), nullable=False)
     last_local_fill_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
@@ -549,14 +666,46 @@ class ExecutionPosition(TimestampMixin, Base):
     __tablename__ = "execution_positions"
     __table_args__ = (
         UniqueConstraint(
-            "symbol",
             "mode",
-            name="uq_execution_positions_symbol_mode",
+            "provider",
+            "account_scope",
+            "exchange",
+            "symbol",
+            name="uq_execution_positions_route_symbol",
+        ),
+        CheckConstraint(
+            "(provider IS NULL AND account_scope IS NULL AND exchange IS NULL) "
+            "OR (provider IS NOT NULL AND account_scope IS NOT NULL "
+            "AND exchange IS NOT NULL)",
+            name="ck_execution_positions_scope_complete",
+        ),
+        Index(
+            "uq_execution_positions_legacy_symbol_mode",
+            "mode",
+            "symbol",
+            unique=True,
+            sqlite_where=text(
+                "provider IS NULL AND account_scope IS NULL AND exchange IS NULL"
+            ),
+            postgresql_where=text(
+                "provider IS NULL AND account_scope IS NULL AND exchange IS NULL"
+            ),
+        ),
+        Index(
+            "ix_execution_positions_mode_route_symbol",
+            "mode",
+            "provider",
+            "account_scope",
+            "exchange",
+            "symbol",
         ),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     mode: Mapped[str] = mapped_column(String(16), nullable=False, default="mock")
+    provider: Mapped[str | None] = mapped_column(String(32))
+    account_scope: Mapped[str | None] = mapped_column(String(128))
+    exchange: Mapped[str | None] = mapped_column(String(32))
     symbol: Mapped[str] = mapped_column(String(32), nullable=False)
     quantity: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     base_quantity: Mapped[Decimal | None] = mapped_column(Numeric(28, 12))
@@ -607,15 +756,40 @@ class CryptoStrategyState(TimestampMixin, Base):
         UniqueConstraint(
             "mode",
             "provider",
+            "account_scope",
+            "strategy_family",
             "strategy_version",
             "symbol",
-            name="uq_crypto_strategy_states_mode_provider_version_symbol",
+            name="uq_crypto_strategy_states_scoped_symbol",
+        ),
+        CheckConstraint(
+            "(account_scope IS NULL AND strategy_family IS NULL) OR "
+            "(account_scope IS NOT NULL AND strategy_family IS NOT NULL)",
+            name="ck_crypto_strategy_states_scope_complete",
+        ),
+        Index(
+            "uq_crypto_strategy_states_legacy_mode_provider_version_symbol",
+            "mode",
+            "provider",
+            "strategy_version",
+            "symbol",
+            unique=True,
+            sqlite_where=text(
+                "account_scope IS NULL AND strategy_family IS NULL"
+            ),
+            postgresql_where=text(
+                "account_scope IS NULL AND strategy_family IS NULL"
+            ),
         ),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     mode: Mapped[str] = mapped_column(String(16), nullable=False)
     provider: Mapped[str] = mapped_column(String(32), nullable=False)
+    # NULL/NULL identifies quarantined pre-scope rows. Runtime strategy code
+    # only reads rows with both exact values and never auto-binds legacy state.
+    account_scope: Mapped[str | None] = mapped_column(String(128))
+    strategy_family: Mapped[str | None] = mapped_column(String(64))
     strategy_version: Mapped[str] = mapped_column(String(64), nullable=False)
     symbol: Mapped[str] = mapped_column(String(32), nullable=False)
     last_processed_bar_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -643,14 +817,36 @@ class CryptoStrategyRiskState(TimestampMixin, Base):
         UniqueConstraint(
             "mode",
             "provider",
+            "account_scope",
+            "strategy_family",
             "strategy_version",
-            name="uq_crypto_strategy_risk_states_mode_provider_version",
+            name="uq_crypto_strategy_risk_states_scope",
+        ),
+        CheckConstraint(
+            "(account_scope IS NULL AND strategy_family IS NULL) OR "
+            "(account_scope IS NOT NULL AND strategy_family IS NOT NULL)",
+            name="ck_crypto_strategy_risk_states_scope_complete",
+        ),
+        Index(
+            "uq_crypto_strategy_risk_states_legacy_mode_provider_version",
+            "mode",
+            "provider",
+            "strategy_version",
+            unique=True,
+            sqlite_where=text(
+                "account_scope IS NULL AND strategy_family IS NULL"
+            ),
+            postgresql_where=text(
+                "account_scope IS NULL AND strategy_family IS NULL"
+            ),
         ),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     mode: Mapped[str] = mapped_column(String(16), nullable=False)
     provider: Mapped[str] = mapped_column(String(32), nullable=False)
+    account_scope: Mapped[str | None] = mapped_column(String(128))
+    strategy_family: Mapped[str | None] = mapped_column(String(64))
     strategy_version: Mapped[str] = mapped_column(String(64), nullable=False)
     daily_baseline_equity: Mapped[Decimal | None] = mapped_column(Numeric(28, 4))
     daily_baseline_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -666,7 +862,7 @@ class CryptoStrategyRiskState(TimestampMixin, Base):
 
 
 class CryptoStrategyDecision(Base):
-    """Append-only record of one strategy decision for a closed decision bar."""
+    """Durable record of one strategy decision for a closed decision bar."""
 
     __tablename__ = "crypto_strategy_decisions"
     __table_args__ = (
@@ -678,16 +874,40 @@ class CryptoStrategyDecision(Base):
         UniqueConstraint(
             "mode",
             "provider",
+            "account_scope",
+            "strategy_family",
             "strategy_version",
             "symbol",
             "decision_bar_at",
-            name="uq_crypto_strategy_decisions_scope_bar",
+            name="uq_crypto_strategy_decisions_account_family_bar",
+        ),
+        CheckConstraint(
+            "(account_scope IS NULL AND strategy_family IS NULL) OR "
+            "(account_scope IS NOT NULL AND strategy_family IS NOT NULL)",
+            name="ck_crypto_strategy_decisions_scope_complete",
+        ),
+        Index(
+            "uq_crypto_strategy_decisions_legacy_scope_bar",
+            "mode",
+            "provider",
+            "strategy_version",
+            "symbol",
+            "decision_bar_at",
+            unique=True,
+            sqlite_where=text(
+                "account_scope IS NULL AND strategy_family IS NULL"
+            ),
+            postgresql_where=text(
+                "account_scope IS NULL AND strategy_family IS NULL"
+            ),
         ),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     mode: Mapped[str] = mapped_column(String(16), nullable=False)
     provider: Mapped[str] = mapped_column(String(32), nullable=False)
+    account_scope: Mapped[str | None] = mapped_column(String(128))
+    strategy_family: Mapped[str | None] = mapped_column(String(64))
     strategy_version: Mapped[str] = mapped_column(String(64), nullable=False)
     symbol: Mapped[str] = mapped_column(String(32), nullable=False)
     decision_bar_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
@@ -723,13 +943,30 @@ class MonitoringCheckpoint(TimestampMixin, Base):
         UniqueConstraint(
             "worker_name",
             "mode",
-            name="uq_monitoring_checkpoints_worker_name_mode",
+            "provider",
+            "account_scope",
+            name="uq_monitoring_checkpoints_worker_mode_provider_account_scope",
+        ),
+        CheckConstraint(
+            "(provider IS NULL AND account_scope IS NULL) OR "
+            "(provider IS NOT NULL AND account_scope IS NOT NULL)",
+            name="ck_monitoring_checkpoints_scope_complete",
+        ),
+        Index(
+            "uq_monitoring_checkpoints_legacy_worker_mode",
+            "worker_name",
+            "mode",
+            unique=True,
+            sqlite_where=text("provider IS NULL AND account_scope IS NULL"),
+            postgresql_where=text("provider IS NULL AND account_scope IS NULL"),
         ),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     worker_name: Mapped[str] = mapped_column(String(64), nullable=False)
     mode: Mapped[str] = mapped_column(String(16), nullable=False, default="mock")
+    provider: Mapped[str | None] = mapped_column(String(32))
+    account_scope: Mapped[str | None] = mapped_column(String(128))
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="not_started")
     last_heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_success_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

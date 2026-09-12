@@ -1,5 +1,10 @@
 # Issue #265 live evidence remediation
 
+> Historical evidence only. This records the schema and deployment state at the
+> time Issue 265 was closed; it is not the current migration or deployment
+> runbook. Use [README.md](../../README.md), [docs/API.md](../API.md), and
+> [docs/DEPLOYMENT.md](../DEPLOYMENT.md) for the current contract.
+
 Date: 2026-09-07 KST
 
 Operator: Peter
@@ -44,7 +49,9 @@ recency blocker.
   account-snapshot inquiry only for KRX/NASD/NYSE/AMEX routes.
 - Added Peter/reason metadata to applied stale-order reconciliation audits and
   made those fields mandatory at the HTTP apply boundary.
-- Live remediation tools fail closed unless `--database-url` is explicit.
+- Live remediation tools fail closed unless an explicit database source is
+  present. Current tooling requires credential-bearing URLs in
+  `KAI_EXEC_DATABASE_URL`; only non-secret URLs may be supplied in argv.
 
 ## Live evidence decisions
 
@@ -133,8 +140,10 @@ returned healthy database/schema status with no missing tables.
 
 ## Secret-safe command record
 
-The live URL was sourced from the service `.env`, never printed, and passed
-explicitly to every database script.
+The live URL was sourced from the service `.env` and never printed. The old
+backup invocation expanded it into a process argument; that unsafe historical
+command is intentionally omitted below and must not be repeated. Current
+database scripts inherit `KAI_EXEC_DATABASE_URL` without copying it into argv.
 
 ```bash
 set -a
@@ -143,10 +152,8 @@ set +a
 test "$KAI_EXEC_RUNTIME_MODE" = live
 test -n "$KAI_EXEC_DATABASE_URL"
 
-pg_url="postgresql://${KAI_EXEC_DATABASE_URL#postgresql+psycopg://}"
-pg_dump --format=custom --no-owner --no-acl \
-  --file=var/issue-265/pre-write-20260906.pgcustom "$pg_url"
-unset pg_url
+# Historical pg_dump connection argument omitted: use the current deployment
+# runbook and a protected libpq service/password source instead of argv.
 
 PYTHONPATH=apps/api KAI_EXEC_DATABASE_URL="$KAI_EXEC_DATABASE_URL" \
   .venv/bin/alembic upgrade head
@@ -160,33 +167,33 @@ curl --fail http://127.0.0.1:8010/runtime/daily-board | \
   jq '{generated_at,market_date,mode,totals,runtime:{ready:.runtime.ready,counts:.runtime.counts,freshness:.runtime.freshness}}'
 
 .venv/bin/python scripts/repair_execution_fill_evidence.py \
-  --database-url "$KAI_EXEC_DATABASE_URL" --runtime-mode live \
+  --runtime-mode live \
   --scope fill-evidence
 
 .venv/bin/python scripts/repair_execution_fill_evidence.py \
-  --database-url "$KAI_EXEC_DATABASE_URL" --runtime-mode live \
+  --runtime-mode live \
   --scope fifo-residuals
 
 .venv/bin/python scripts/refresh_execution_position_truth.py \
-  --database-url "$KAI_EXEC_DATABASE_URL" --runtime-mode live
+  --runtime-mode live
 
 .venv/bin/python scripts/repair_execution_fill_evidence.py \
-  --database-url "$KAI_EXEC_DATABASE_URL" --runtime-mode live \
+  --runtime-mode live \
   --scope fill-evidence --apply --actor Peter \
   --reason 'issue #265: no authoritative persisted broker fill evidence; record manual review without fabricating or deleting fills'
 
 .venv/bin/python scripts/repair_execution_fill_evidence.py \
-  --database-url "$KAI_EXEC_DATABASE_URL" --runtime-mode live \
+  --runtime-mode live \
   --scope fifo-residuals --apply --actor Peter \
   --reason 'issue #265: broker-flat evidence predates the last local fill; leave FIFO unchanged for manual review'
 
 .venv/bin/python scripts/refresh_execution_position_truth.py \
-  --database-url "$KAI_EXEC_DATABASE_URL" --runtime-mode live \
+  --runtime-mode live \
   --apply --actor Peter \
   --reason 'issue #265: refresh stale position truth through read-only broker account inquiry; unsupported routes require manual review'
 
 .venv/bin/python scripts/refresh_execution_position_truth.py \
-  --database-url "$KAI_EXEC_DATABASE_URL" --runtime-mode live \
+  --runtime-mode live \
   --apply --actor Peter \
   --reason 'issue #265: final post-deploy position truth refresh through read-only broker account inquiry; unsupported routes require manual review'
 
@@ -199,7 +206,7 @@ curl --fail -H 'content-type: application/json' \
   http://127.0.0.1:8010/orders/reconcile-stale
 
 .venv/bin/python scripts/export_weekly_trade_review.py \
-  --database-url "$KAI_EXEC_DATABASE_URL" --runtime-mode live \
+  --runtime-mode live \
   --require-runtime-mode live --timeout-seconds 60 \
   --output-dir var/issue-265/after/weekly \
   --start-at 2026-08-31T00:00:00+09:00 \

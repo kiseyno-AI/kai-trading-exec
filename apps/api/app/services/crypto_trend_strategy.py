@@ -225,8 +225,9 @@ def evaluate_symbol(
     bars: Iterable[DailyBar],
     *,
     as_of: date | datetime,
+    annualization_days: Decimal = CRYPTO_ANNUALIZATION_DAYS,
 ) -> TrendFeatures:
-    """Evaluate the V1 long/cash trend rule from closed UTC daily bars only."""
+    """Evaluate the V1 long/cash trend rule from closed daily bars only."""
 
     normalized_symbol = symbol.strip().upper()
     closed = filter_closed_bars(bars, as_of=as_of, symbol=normalized_symbol)
@@ -235,7 +236,11 @@ def evaluate_symbol(
     ema200 = ema(closes, 200)
     return90 = total_return(closes, 90)
     atr14 = atr(closed, 14)
-    volatility30 = annualized_realized_volatility(closes, periods=30)
+    volatility30 = annualized_realized_volatility(
+        closes,
+        periods=30,
+        annualization_days=annualization_days,
+    )
 
     reasons: list[str] = []
     if len(closed) < 200:

@@ -1,4 +1,4 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 from fastapi.testclient import TestClient
@@ -11,6 +11,7 @@ from app.broker.base import (
     NormalizedBrokerOrderStatus,
 )
 from app.broker.kis import KisBrokerAdapter
+from app.broker.upbit import UpbitBrokerAdapter
 from app.core.config import Settings
 from app.db.base import Base
 from app.db.session import create_db_engine, create_session_factory
@@ -45,6 +46,28 @@ def resume_runtime(client: TestClient) -> None:
     assert response.status_code == 200
 
 
+def assert_digest_only(value: object) -> None:
+    assert isinstance(value, str)
+    assert value.startswith("broker_error_details_redacted[sha256=")
+
+
+def test_upbit_stub_snapshot_never_claims_authoritative_empty_truth() -> None:
+    adapter = UpbitBrokerAdapter(
+        settings=Settings(database_url="sqlite:///:memory:", runtime_mode="paper")
+    )
+
+    snapshot = adapter.get_account_snapshot("paper-token")
+
+    assert snapshot.holdings == []
+    assert snapshot.open_orders == []
+    assert snapshot.holdings_complete is False
+    assert snapshot.open_orders_complete is False
+    assert snapshot.diagnostics == {
+        "reason": "account_snapshot_not_implemented",
+        "provider": "upbit",
+    }
+
+
 def test_upbit_paper_market_buy_preserves_krw_quote_notional() -> None:
     app, engine = build_test_app(
         Settings(database_url="sqlite:///:memory:", runtime_mode="paper", automation_enabled=True)
@@ -77,6 +100,11 @@ def test_upbit_paper_market_buy_preserves_krw_quote_notional() -> None:
     assert order["quote_notional"] == "50000.1234"
     assert order["asset_class"] == "crypto"
     assert order["request_metadata"]["sizing"]["quote_notional"] == "50000.1234"
+    assert order["request_metadata"]["execution_scope"]["provider"] == "upbit"
+    assert order["request_metadata"]["execution_scope"]["venue"] == "UPBIT"
+    assert order["request_metadata"]["execution_scope"]["asset_class"] == "crypto"
+    assert order["request_metadata"]["execution_scope"]["exchange"] == "UPBIT"
+    assert len(order["request_metadata"]["execution_scope"]["account_scope"]) == 24
     assert order["events"][0]["request_payload"]["quote_notional"] == "50000.1234"
     assert order["events"][1]["request_payload"]["price"] == "50000.1234"
 
@@ -84,6 +112,51 @@ def test_upbit_paper_market_buy_preserves_krw_quote_notional() -> None:
         persisted = session.query(BrokerOrder).filter_by(idempotency_key="upbit-quote-buy-1").one()
         assert persisted.quantity is None
         assert persisted.quote_notional == Decimal("50000.1234")
+
+
+def test_upbit_paper_buys_reserve_configured_total_budget_across_symbols() -> None:
+    app, engine = build_test_app(
+        Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            automation_enabled=True,
+            exec_agent_max_symbol_budget=Decimal("60000"),
+            exec_agent_max_total_budget=Decimal("75000"),
+        )
+    )
+    client = TestClient(app)
+    resume_runtime(client)
+
+    def payload(*, symbol: str, key: str) -> dict[str, object]:
+        return {
+            "idempotency_key": key,
+            "provider": "upbit",
+            "asset_class": "crypto",
+            "venue": "upbit",
+            "symbol": symbol,
+            "side": "buy",
+            "order_type": "market",
+            "time_in_force": "day",
+            "exchange": "UPBIT",
+            "quote_notional": "50000",
+            "price_precision": 0,
+        }
+
+    first = client.post(
+        "/orders",
+        json=payload(symbol="KRW-BTC", key="upbit-budget-first"),
+    )
+    second = client.post(
+        "/orders",
+        json=payload(symbol="KRW-ETH", key="upbit-budget-second"),
+    )
+
+    assert first.status_code == 201
+    assert second.status_code == 409
+    assert second.json()["block_reason"] == "buy_capital_reservation"
+    with create_session_factory(engine)() as session:
+        assert session.query(BrokerOrder).filter_by(status="submitted").count() == 1
+    engine.dispose()
 
 
 def test_paused_runtime_blocks_direct_order_without_persisting_broker_action() -> None:
@@ -347,7 +420,11 @@ def test_runtime_status_reports_upbit_readiness_separately() -> None:
 
 def test_execution_plan_accepts_crypto_sizing_fields() -> None:
     app, engine = build_test_app(
-        Settings(database_url="sqlite:///:memory:", runtime_mode="paper")
+        Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            execution_position_account_scope="test-upbit-paper-account",
+        )
     )
     client = TestClient(app)
 
@@ -385,7 +462,12 @@ def test_execution_plan_accepts_crypto_sizing_fields() -> None:
 
 def test_crypto_paper_plan_dispatch_simulates_fill_and_position() -> None:
     app, engine = build_test_app(
-        Settings(database_url="sqlite:///:memory:", runtime_mode="paper", automation_enabled=True)
+        Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            automation_enabled=True,
+            execution_position_account_scope="test-upbit-paper-account",
+        )
     )
     client = TestClient(app)
     resume_runtime(client)
@@ -476,6 +558,7 @@ def test_crypto_paper_dispatch_fails_permanent_budget_guardrail() -> None:
             runtime_mode="paper",
             automation_enabled=True,
             exec_agent_max_symbol_budget=Decimal("100000"),
+            execution_position_account_scope="test-upbit-paper-account",
         )
     )
     client = TestClient(app)
@@ -580,6 +663,7 @@ def test_crypto_paper_dispatch_blocked_by_pause() -> None:
             kis_app_key="paper-key",
             kis_app_secret="paper-secret",
             kis_account_number="12345678",
+            execution_position_account_scope="test-upbit-paper-account",
         )
     )
     client = TestClient(app)
@@ -616,7 +700,12 @@ def test_crypto_paper_dispatch_blocked_by_pause() -> None:
 
 def test_crypto_paper_plan_rejects_unwhitelisted_symbol() -> None:
     app, _engine = build_test_app(
-        Settings(database_url="sqlite:///:memory:", runtime_mode="paper", automation_enabled=True)
+        Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            automation_enabled=True,
+            execution_position_account_scope="test-upbit-paper-account",
+        )
     )
     client = TestClient(app)
     resume_runtime(client)
@@ -685,15 +774,19 @@ def test_crypto_paper_order_rejects_budget_breach() -> None:
     assert "block_reason" not in payload
 
 
-def test_kis_stock_order_preserves_integer_quantity_on_adapter_rejection(monkeypatch) -> None:
+def test_kis_stock_order_preserves_integer_quantity_on_adapter_rejection(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    sensitive_value = "nested-error-account-value"
     monkeypatch.setattr(
         KisBrokerAdapter,
         "authenticate",
-        lambda _self: BrokerTokenGrant(
-            access_token="test-token",
-            token_type="Bearer",
-            access_token_expires_at=datetime(2099, 1, 1, tzinfo=UTC),
-        ),
+            lambda _self: BrokerTokenGrant(
+                access_token="test-token",
+                token_type="Bearer",
+                access_token_expires_at=datetime.now(UTC) + timedelta(hours=1),
+            ),
     )
     monkeypatch.setattr(
         KisBrokerAdapter,
@@ -712,10 +805,34 @@ def test_kis_stock_order_preserves_integer_quantity_on_adapter_rejection(monkeyp
             status_code=422,
             classification=BrokerErrorClassification.VALIDATION,
             normalized_status=NormalizedBrokerOrderStatus.REJECTED,
+            request_metadata={
+                "adapter_marker": "preserved",
+                "nested": {"CANO": sensitive_value, "safe_request_marker": "kept"},
+                "execution_scope": {
+                    "policy_version": 1,
+                    "provider": "attacker",
+                    "account_scope": "f" * 24,
+                    "venue": "OTHER",
+                    "asset_class": "other",
+                    "exchange": "OTHER",
+                },
+            },
+            response_metadata={
+                "nested": {
+                    "ACNT_PRDT_CD": sensitive_value,
+                    "safe_response_marker": "kept",
+                }
+            },
+            request_payload={
+                "nested": {"account_number": sensitive_value, "safe_request_payload": "kept"}
+            },
+            response_payload={
+                "nested": {"acct_id": sensitive_value, "safe_broker_payload": "kept"}
+            },
         )
 
     monkeypatch.setattr(KisBrokerAdapter, "place_order", reject_order)
-    app, _engine = build_test_app(
+    app, engine = build_test_app(
         Settings(
             database_url="sqlite:///:memory:",
             runtime_mode="paper",
@@ -724,6 +841,7 @@ def test_kis_stock_order_preserves_integer_quantity_on_adapter_rejection(monkeyp
             kis_app_key="paper-key",
             kis_app_secret="paper-secret",
             kis_account_number="12345678",
+            kis_token_cache_directory=str(tmp_path / "kis-token-cache"),
         )
     )
     client = TestClient(app)
@@ -750,6 +868,59 @@ def test_kis_stock_order_preserves_integer_quantity_on_adapter_rejection(monkeyp
     assert order["quantity"] == 1
     assert order["base_quantity"] is None
     assert order["quote_notional"] is None
+    assert order["request_metadata"]["adapter_marker"] == "preserved"
+    assert order["request_metadata"]["execution_scope"]["provider"] == "kis"
+    assert order["request_metadata"]["execution_scope"]["venue"] == "KIS"
+    assert order["request_metadata"]["execution_scope"]["asset_class"] == "stock"
+    assert order["request_metadata"]["execution_scope"]["exchange"] == "KRX"
+    assert len(order["request_metadata"]["execution_scope"]["account_scope"]) == 24
+    assert order["request_metadata"]["nested"] == {"safe_request_marker": "kept"}
+    assert_digest_only(
+        order["response_metadata"]["nested"]["safe_response_marker"]
+    )
+    assert_digest_only(
+        order["raw_broker_payload"]["nested"]["safe_broker_payload"]
+    )
+    failure_event = order["events"][-1]
+    assert failure_event["request_payload"]["nested"] == {
+        "safe_request_payload": "kept"
+    }
+    assert_digest_only(
+        failure_event["response_payload"]["nested"]["safe_broker_payload"]
+    )
+    assert sensitive_value not in str(order)
+    assert "12345678" not in str(order["request_metadata"])
+    with create_session_factory(engine)() as session:
+        persisted = session.query(BrokerOrder).filter_by(
+            idempotency_key="kis-stock-int-quantity-1"
+        ).one()
+        persisted_event = session.query(BrokerOrderEvent).filter_by(
+            broker_order_pk=persisted.id,
+            event_type="submit_failed",
+        ).one()
+        assert persisted.request_metadata["nested"] == {"safe_request_marker": "kept"}
+        assert_digest_only(
+            persisted.response_metadata["nested"]["safe_response_marker"]
+        )
+        assert_digest_only(
+            persisted.raw_broker_payload["nested"]["safe_broker_payload"]
+        )
+        assert persisted_event.request_payload["nested"] == {
+            "safe_request_payload": "kept"
+        }
+        assert_digest_only(
+            persisted_event.response_payload["nested"]["safe_broker_payload"]
+        )
+        assert sensitive_value not in str(
+            {
+                "request_metadata": persisted.request_metadata,
+                "response_metadata": persisted.response_metadata,
+                "raw_broker_payload": persisted.raw_broker_payload,
+                "event_request": persisted_event.request_payload,
+                "event_response": persisted_event.response_payload,
+                "event_payload": persisted_event.payload,
+            }
+        )
 
 
 def test_stock_order_still_requires_integer_quantity() -> None:

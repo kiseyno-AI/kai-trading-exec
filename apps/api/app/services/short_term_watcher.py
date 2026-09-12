@@ -15,6 +15,12 @@ from app.models.runtime import BrokerOrder, ExecutionPlan, ExecutionPlanItem, Ex
 from app.services.broker_auth import ensure_authenticated_broker_session
 from app.services.broker_orders import place_broker_order
 from app.services.execution_api import serialize_broker_order
+from app.services.execution_account_route import (
+    KIS_ACCOUNT_ROUTE_BINDING_KEY,
+    kis_account_route_binding_from_payloads,
+    validate_kis_account_route,
+)
+from app.services.fifo_inventory import fifo_route_scope_from_order
 from app.services.live_market_context import load_live_market_regime_context, merge_live_market_regime_context
 from app.services.market_regime_guardrails import evaluate_market_regime_guardrail, market_regime_context_from_item_payloads
 from app.services.broker_order_state import (
@@ -27,6 +33,10 @@ from app.services.runtime_controls import (
     ensure_runtime_control_state,
     runtime_safety_payload,
 )
+from app.services.position_identity import (
+    PositionIdentityConflictError,
+    build_position_identity,
+)
 
 OPEN_ORDER_STATUSES = frozenset(CAPITAL_RESERVING_ORDER_STATUSES)
 SUPPORTED_SHORT_TERM_BUY_INTENTS = frozenset({"next_open_buy", "intraday_watch_buy"})
@@ -38,6 +48,12 @@ MAX_APPROVED_NOTIONAL = Decimal("10000000")
 class ShortTermWatcherDecisionResult:
     status_code: int
     payload: dict[str, object]
+
+
+class InvalidEntryRouteError(ValueError):
+    def __init__(self, reason_code: str) -> None:
+        self.reason_code = reason_code
+        super().__init__(reason_code)
 
 
 def evaluate_short_term_watcher_decision(
@@ -54,9 +70,14 @@ def evaluate_short_term_watcher_decision(
 
     safety_state = ensure_runtime_control_state(settings=settings, db=db)
     safety = runtime_safety_payload(safety_state)
+    candidate_rejection = _validate_candidate(item=item)
     account_context = command.account_context
     broker_account_snapshot = None
-    if not command.dry_run and automated_order_submission_allowed(safety_state):
+    if (
+        candidate_rejection is None
+        and not command.dry_run
+        and automated_order_submission_allowed(safety_state)
+    ):
         try:
             session_state = ensure_authenticated_broker_session(
                 settings=settings,
@@ -66,6 +87,31 @@ def evaluate_short_term_watcher_decision(
                 reason=f"load live account context for {item.id}",
             )
             broker_account_snapshot = adapter.get_account_snapshot(session_state.access_token or "")
+            if (
+                not broker_account_snapshot.holdings_complete
+                or not broker_account_snapshot.open_orders_complete
+            ):
+                return ShortTermWatcherDecisionResult(
+                    status_code=503,
+                    payload={
+                        "approved": False,
+                        "dry_run": command.dry_run,
+                        "reason_code": "broker_account_context_incomplete",
+                        "message": (
+                            "broker holdings and open-order truth must be complete "
+                            "before a live watcher decision"
+                        ),
+                        "candidate": _candidate_payload(item),
+                        "safety": safety,
+                        "account_snapshot": {
+                            "source": broker_account_snapshot.source,
+                            "observed_at": broker_account_snapshot.observed_at.isoformat(),
+                            "holdings_complete": broker_account_snapshot.holdings_complete,
+                            "open_orders_complete": broker_account_snapshot.open_orders_complete,
+                            "diagnostics": dict(broker_account_snapshot.diagnostics),
+                        },
+                    },
+                )
             account_context = command.account_context_from_snapshot(broker_account_snapshot)
         except AttributeError:
             broker_account_snapshot = None
@@ -92,7 +138,7 @@ def evaluate_short_term_watcher_decision(
     )
     context["allowed_action_envelope"] = _allowed_action_envelope(settings=settings, context=context, command=command)
 
-    rejection = _validate_candidate(item=item)
+    rejection = candidate_rejection
     if rejection is None:
         rejection = _validate_agent_output(command=command)
     if rejection is None:
@@ -135,7 +181,12 @@ def evaluate_short_term_watcher_decision(
     if isinstance(envelope, dict):
         quantity = min(int(quantity or 0), int(envelope.get("max_quantity") or 0))
     assert quantity is not None
-    order_preview = _order_preview(item=item, command=command, quantity=quantity)
+    order_preview = _order_preview(
+        item=item,
+        command=command,
+        quantity=quantity,
+        reference_price=Decimal(str(context["reference_price"])),
+    )
     monitoring_preview = _monitoring_preview(item=item, command=command, quantity=quantity)
 
     if command.dry_run:
@@ -155,11 +206,66 @@ def evaluate_short_term_watcher_decision(
             },
         )
 
+    try:
+        inherited_exit_route = _validated_entry_route_context(
+            settings=settings,
+            item=item,
+        )
+    except InvalidEntryRouteError as exc:
+        message = (
+            "KIS entry route binding is unavailable; regenerate the candidate "
+            "before submission"
+        )
+        _persist_audit(
+            item=item,
+            audit={
+                **audit,
+                "outcome": "rejected",
+                "reason_code": exc.reason_code,
+                "message": message,
+            },
+        )
+        db.commit()
+        return ShortTermWatcherDecisionResult(
+            status_code=409,
+            payload={
+                "approved": False,
+                "dry_run": False,
+                "reason_code": exc.reason_code,
+                "message": message,
+                "candidate": _candidate_payload(item),
+                "context": context,
+                "safety": safety,
+            },
+        )
+
+    # Persist the already-validated agent geometry before the broker service
+    # establishes its durable order intent. The final live-buy boundary reloads
+    # this row under lock and must never depend on ephemeral request state.
+    risk_context = item.risk_context if isinstance(item.risk_context, dict) else {}
+    order_command = PlaceOrderRequest(**order_preview)
+    item.risk_context = {
+        **risk_context,
+        "target_price": str(command.agent_output.target_price),
+        "stop_price": str(command.agent_output.stop_price),
+        "short_term_watcher_entry_geometry": {
+            "source": "validated_short_term_watcher_agent_output",
+            "target_price": str(command.agent_output.target_price),
+            "stop_price": str(command.agent_output.stop_price),
+            "validated_at": now.isoformat(),
+        },
+        "short_term_watcher_order_authority": {
+            "policy_version": 1,
+            "source": "short-term-watcher:decision",
+            "command": order_command.model_dump(mode="json"),
+        },
+    }
+    db.flush()
     order_result = place_broker_order(
         settings=settings,
         db=db,
         adapter=adapter,
-        command=PlaceOrderRequest(**order_preview),
+        command=order_command,
         request_source="short-term-watcher:decision",
     )
     result_order = order_result.payload.get("order")
@@ -174,7 +280,12 @@ def evaluate_short_term_watcher_decision(
         db=db,
         idempotency_key=result_order_key or order_preview["idempotency_key"],
     )
-    refreshed_item = db.get(ExecutionPlanItem, item.id, options=[selectinload(ExecutionPlanItem.plan)]) or item
+    refreshed_item = db.get(
+        ExecutionPlanItem,
+        item.id,
+        options=[selectinload(ExecutionPlanItem.plan)],
+        populate_existing=True,
+    ) or item
     submission_accepted = _order_submission_accepted(order_result=order_result, order=persisted_order)
     materialized_monitoring = []
     outcome = "submitted" if submission_accepted else "submission_not_accepted"
@@ -184,6 +295,7 @@ def evaluate_short_term_watcher_decision(
             item=refreshed_item,
             command=command,
             quantity=quantity,
+            inherited_route=inherited_exit_route,
         )
     _persist_audit(
         item=refreshed_item,
@@ -229,6 +341,17 @@ def _validate_candidate(*, item: ExecutionPlanItem) -> tuple[str, str] | None:
         )
     if (item.decision_agent_name or "").strip().lower() != SHORT_TERM_DECIDER_NAME:
         return "unsupported_decider", "candidate is not owned by short-term-decider"
+    risk_context = item.risk_context if isinstance(item.risk_context, dict) else {}
+    exchange = str(risk_context.get("exchange") or "KRX").strip().upper()
+    if (
+        str(item.provider or "kis").strip().lower() != "kis"
+        or str(item.asset_class or "stock").strip().lower() != "stock"
+        or exchange != "KRX"
+    ):
+        return (
+            "unsupported_execution_route",
+            "short-term watcher decisions support only KIS KRX equities",
+        )
     return None
 
 
@@ -300,17 +423,26 @@ def _candidate_context(
         reference_price = account_context.last_price
     quantity = _resolve_quantity(command=command, reference_price=reference_price)
     requested_notional = (reference_price * Decimal(quantity or 0)).quantize(Decimal("0.0001"))
-    position = db.scalar(select(ExecutionPosition).where(ExecutionPosition.mode == settings.runtime_mode, ExecutionPosition.symbol == item.symbol))
-    open_orders = db.scalars(
-        select(BrokerOrder).where(
-            *active_local_broker_order_filters(
-                settings=settings,
-                statuses=OPEN_ORDER_STATUSES,
-            ),
-            BrokerOrder.symbol == item.symbol,
-            BrokerOrder.side == "buy",
-        )
-    ).all()
+    position = _load_route_scoped_position(
+        settings=settings,
+        db=db,
+        item=item,
+        broker_account_id=(
+            broker_account_snapshot.broker_account_id
+            if broker_account_snapshot is not None
+            else None
+        ),
+    )
+    open_orders = _load_route_scoped_open_buy_orders(
+        settings=settings,
+        db=db,
+        item=item,
+        broker_account_id=(
+            broker_account_snapshot.broker_account_id
+            if broker_account_snapshot is not None
+            else None
+        ),
+    )
     return {
         "symbol": item.symbol,
         "reference_price": str(reference_price),
@@ -328,6 +460,89 @@ def _candidate_context(
         ),
         "market_date": item.plan.market_date.isoformat() if item.plan is not None and item.plan.market_date else None,
     }
+
+
+def _load_route_scoped_position(
+    *,
+    settings: Settings,
+    db: Session,
+    item: ExecutionPlanItem,
+    broker_account_id: str | None,
+) -> ExecutionPosition | None:
+    identity = _entry_route_identity(
+        settings=settings,
+        item=item,
+        broker_account_id=broker_account_id,
+    )
+    return db.scalar(
+        select(ExecutionPosition).where(
+            ExecutionPosition.mode == settings.runtime_mode,
+            ExecutionPosition.provider == identity.provider,
+            ExecutionPosition.account_scope == identity.account_scope,
+            ExecutionPosition.exchange == identity.exchange,
+            ExecutionPosition.symbol == item.symbol,
+        )
+    )
+
+
+def _load_route_scoped_open_buy_orders(
+    *,
+    settings: Settings,
+    db: Session,
+    item: ExecutionPlanItem,
+    broker_account_id: str | None,
+) -> list[BrokerOrder]:
+    identity = _entry_route_identity(
+        settings=settings,
+        item=item,
+        broker_account_id=broker_account_id,
+    )
+    candidates = db.scalars(
+        select(BrokerOrder).where(
+            *active_local_broker_order_filters(
+                settings=settings,
+                statuses=OPEN_ORDER_STATUSES,
+            ),
+            BrokerOrder.symbol == item.symbol,
+            BrokerOrder.side == "buy",
+        )
+    ).all()
+    scoped_orders: list[BrokerOrder] = []
+    for order in candidates:
+        route_scope = fifo_route_scope_from_order(order)
+        if (
+            route_scope is None
+            or (
+                route_scope.provider == identity.provider
+                and route_scope.account_scope == identity.account_scope
+                and route_scope.exchange == identity.exchange
+            )
+        ):
+            scoped_orders.append(order)
+    return scoped_orders
+
+
+def _entry_route_identity(
+    *,
+    settings: Settings,
+    item: ExecutionPlanItem,
+    broker_account_id: str | None,
+):
+    risk_context = item.risk_context if isinstance(item.risk_context, dict) else {}
+    raw_exchange = risk_context.get("exchange")
+    exchange = str(raw_exchange or "").strip().upper()
+    if not exchange and item.symbol.isdigit() and len(item.symbol) == 6:
+        exchange = "KRX"
+    if not exchange:
+        raise PositionIdentityConflictError(
+            "short-term watcher position lookup requires an exact exchange"
+        )
+    return build_position_identity(
+        settings=settings,
+        provider=str(item.provider or "kis"),
+        exchange=exchange,
+        broker_account_id=broker_account_id,
+    )
 
 
 def _allowed_action_envelope(*, settings: Settings, context: dict[str, Any], command: ShortTermWatcherDecisionRequest) -> dict[str, Any]:
@@ -395,20 +610,37 @@ def _resolve_quantity(*, command: ShortTermWatcherDecisionRequest, reference_pri
     return quantity if quantity > 0 else None
 
 
-def _order_preview(*, item: ExecutionPlanItem, command: ShortTermWatcherDecisionRequest, quantity: int) -> dict[str, object]:
+def _order_preview(
+    *,
+    item: ExecutionPlanItem,
+    command: ShortTermWatcherDecisionRequest,
+    quantity: int,
+    reference_price: Decimal,
+) -> dict[str, object]:
     exchange = "KRX"
     if isinstance(item.risk_context, dict) and isinstance(item.risk_context.get("exchange"), str):
         exchange = item.risk_context["exchange"].strip().upper() or "KRX"
     return {
         "idempotency_key": f"short-term-watcher:buy:{item.id}",
         "execution_plan_item_id": item.id,
+        "provider": item.provider or "kis",
+        "asset_class": item.asset_class or "stock",
+        "venue": item.venue,
         "symbol": item.symbol,
         "side": "buy",
         "quantity": quantity,
-        "order_type": command.agent_output.order_type,
-        "limit_price": None,
-        "time_in_force": item.time_in_force or "day",
+        # The agent may express immediate-execution intent as ``market``, but
+        # the executable order is always capped.  In live mode the broker
+        # boundary refreshes this cap to the current ask only when that ask is
+        # no worse than this already risk-checked reference.
+        "order_type": "limit",
+        "limit_price": str(reference_price),
+        "time_in_force": "ioc",
         "exchange": exchange,
+        "metadata": {
+            "agent_order_intent": command.agent_output.order_type,
+            "entry_price_cap_source": "validated_decision_reference_price",
+        },
     }
 
 
@@ -442,7 +674,14 @@ def _order_submission_accepted(*, order_result: object, order: BrokerOrder | Non
     return order.status in ACCEPTED_ORDER_STATUSES
 
 
-def _materialize_monitoring_items(*, db: Session, item: ExecutionPlanItem, command: ShortTermWatcherDecisionRequest, quantity: int) -> list[dict[str, object]]:
+def _materialize_monitoring_items(
+    *,
+    db: Session,
+    item: ExecutionPlanItem,
+    command: ShortTermWatcherDecisionRequest,
+    quantity: int,
+    inherited_route: dict[str, object],
+) -> list[dict[str, object]]:
     existing = db.scalars(
         select(ExecutionPlanItem).where(
             ExecutionPlanItem.execution_plan_id == item.execution_plan_id,
@@ -452,7 +691,16 @@ def _materialize_monitoring_items(*, db: Session, item: ExecutionPlanItem, comma
         )
     ).all()
     existing_intents = {existing_item.intent for existing_item in existing}
-    next_index = max((plan_item.plan_item_index for plan_item in item.plan.items), default=0) + 1
+    next_index = (
+        max((plan_item.plan_item_index for plan_item in item.plan.items), default=0)
+        + 1
+    )
+    for existing_item in existing:
+        _apply_entry_execution_route(
+            monitor=existing_item,
+            entry=item,
+            inherited_route=inherited_route,
+        )
     materialized: list[dict[str, object]] = []
     for preview in _monitoring_preview(item=item, command=command, quantity=quantity):
         if preview["intent"] in existing_intents:
@@ -467,18 +715,81 @@ def _materialize_monitoring_items(*, db: Session, item: ExecutionPlanItem, comma
             quantity_policy=preview["quantity_policy"],
             trigger_price=_decimal(preview["trigger_price"]),
             time_in_force=item.time_in_force,
-            risk_context={"materialized_from": "short_term_watcher", "entry_plan_item_id": item.id},
+            risk_context={
+                "materialized_from": "short_term_watcher",
+                "entry_plan_item_id": item.id,
+            },
             decision_agent_name=item.decision_agent_name,
             decision_snapshot_id=item.decision_snapshot_id,
             decision_run_id=item.decision_run_id,
             source_plan_item_id=item.source_plan_item_id,
             source_market_date=item.source_market_date,
         )
+        _apply_entry_execution_route(
+            monitor=monitoring_item,
+            entry=item,
+            inherited_route=inherited_route,
+        )
         db.add(monitoring_item)
         db.flush()
         materialized.append(_monitoring_item_payload(monitoring_item))
         next_index += 1
     return materialized
+
+
+def _validated_entry_route_context(
+    *,
+    settings: Settings,
+    item: ExecutionPlanItem,
+) -> dict[str, object]:
+    risk_context = item.risk_context if isinstance(item.risk_context, dict) else {}
+    inherited: dict[str, object] = {}
+    exchange = risk_context.get("exchange")
+    if isinstance(exchange, str) and exchange.strip():
+        inherited["exchange"] = exchange.strip().upper()
+
+    if str(item.provider or "kis").strip().lower() != "kis":
+        return inherited
+    mismatch = validate_kis_account_route(
+        settings=settings,
+        provider=item.provider,
+        risk_context=item.risk_context,
+        quantity_policy=item.quantity_policy,
+        require_binding=True,
+    )
+    binding = kis_account_route_binding_from_payloads(
+        item.risk_context,
+        item.quantity_policy,
+    )
+    if mismatch is not None or binding is None:
+        # Entry and derived exits must share one already persisted account
+        # identity. Never fabricate a replacement binding from current settings.
+        reason = (
+            mismatch.reason_code
+            if mismatch is not None
+            else "account_route_binding_missing"
+        )
+        raise InvalidEntryRouteError(reason)
+    inherited[KIS_ACCOUNT_ROUTE_BINDING_KEY] = binding
+    return inherited
+
+
+def _apply_entry_execution_route(
+    *,
+    monitor: ExecutionPlanItem,
+    entry: ExecutionPlanItem,
+    inherited_route: dict[str, object],
+) -> None:
+    monitor.provider = entry.provider
+    monitor.venue = entry.venue
+    monitor.asset_class = entry.asset_class
+    risk_context = (
+        dict(monitor.risk_context)
+        if isinstance(monitor.risk_context, dict)
+        else {}
+    )
+    risk_context.update(inherited_route)
+    monitor.risk_context = risk_context
 
 
 def _monitoring_item_payload(item: ExecutionPlanItem) -> dict[str, object]:

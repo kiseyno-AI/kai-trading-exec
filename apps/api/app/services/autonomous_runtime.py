@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
+import json
 import logging
 import os
 import sqlite3
@@ -8,19 +10,24 @@ import threading
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, time
 from decimal import Decimal
-from typing import Callable, Iterable
+from typing import Any, Callable, Iterable, TypeVar
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import distinct, select
+from sqlalchemy import func, select
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.api.schemas.execution import MonitoringPriceRequest
 from app.broker.base import BrokerAdapter
 from app.core.config import Settings
-from app.models.runtime import BrokerOrder, ExecutionFill
-from app.models.runtime import ExecutionPlanItem, ExecutionPosition
+from app.models.runtime import BrokerOrder
+from app.models.runtime import ExecutionPlan, ExecutionPlanItem, ExecutionPosition
 from app.services.execution_jobs import dispatch_due_execution_jobs
+from app.services.execution_account_route import classify_kis_account_route
+from app.services.execution_semantics import (
+    KRX_EXCHANGES,
+    watch_buy_direction_from_payloads,
+)
 from app.services.monitoring import (
     ACTIVE_WATCH_MONITORING_STATUSES,
     BLOCKED_MONITORING_STATUSES,
@@ -28,6 +35,7 @@ from app.services.monitoring import (
     SELL_ACTIVE_MONITORING_STATUSES,
     SELL_MONITORED_INTENTS,
     WATCH_BUY_INTENTS,
+    _active_kis_position_filters,
     _load_positions_by_symbol,
     _maintain_post_entry_exit_monitors,
     _sync_positions_for_monitoring_routes,
@@ -36,7 +44,21 @@ from app.services.monitoring import (
     _load_core_desired_monitoring_symbols,
 )
 from app.services.nxt_eligibility import refresh_nxt_eligible_symbols
+from app.services.position_identity import (
+    EXECUTION_SCOPE_POLICY_VERSION,
+    PositionIdentityConflictError,
+    build_position_identity,
+)
 from app.services.reconciliation import reconcile_pending_broker_orders
+from app.services.runtime_shutdown import (
+    CommitGuardedSessionFactory,
+    GuardedBrokerAdapter,
+    RuntimeCycleFence,
+)
+from app.services.trade_outcome_feedback import (
+    REPORT_VERSION as TRADE_OUTCOME_FEEDBACK_VERSION,
+    ensure_fresh_trade_outcome_feedback,
+)
 from app.services.watch_exec_agent_sizing import run_due_watch_exec_agent_sizing
 
 LOGGER = logging.getLogger(__name__)
@@ -47,6 +69,124 @@ WATCH_EXEC_AGENT_SIZING_WORKER_NAME = "watch_exec_agent_sizing_loop"
 NXT_ELIGIBLE_SYNC_WORKER_NAME = "nxt_eligible_sync_loop"
 MAX_STATUS_DETAIL_ITEMS = 20
 KRX_TIMEZONE = ZoneInfo("Asia/Seoul")
+_CACHED_KIS_ROUTE_EXCHANGES = KRX_EXCHANGES | frozenset({"NASD", "NYSE", "AMEX"})
+_CycleResult = TypeVar("_CycleResult")
+
+
+def _active_kis_position_scope(settings: Settings) -> tuple[str, str] | None:
+    try:
+        identity = build_position_identity(
+            settings=settings,
+            provider="kis",
+            exchange="KRX",
+        )
+    except PositionIdentityConflictError:
+        return None
+    return identity.provider, identity.account_scope
+
+
+def _active_kis_execution_scope_payload(
+    settings: Settings,
+) -> dict[str, object] | None:
+    active_scope = _active_kis_position_scope(settings)
+    if active_scope is None:
+        return None
+    provider, account_scope = active_scope
+    return {
+        "policy_version": EXECUTION_SCOPE_POLICY_VERSION,
+        "provider": provider,
+        "account_scope": account_scope,
+    }
+
+
+def _cached_positions_by_symbol(
+    rows: list[tuple[object, ...]],
+) -> dict[str, CachedMonitoringPosition]:
+    grouped: dict[str, list[CachedMonitoringPosition]] = {}
+    for row in rows:
+        symbol = str(row[0] or "").strip()
+        quantity = int(row[1] or 0)
+        if symbol and quantity > 0:
+            grouped.setdefault(symbol, []).append(
+                CachedMonitoringPosition(
+                    symbol=symbol,
+                    quantity=quantity,
+                    exchange=str(row[2] or "").strip().upper() or None,
+                    provider=str(row[3] or "").strip().lower() or None,
+                )
+            )
+    return {
+        symbol: positions[0]
+        for symbol, positions in grouped.items()
+        if len(positions) == 1
+    }
+
+
+def _cached_item_exchange(*, symbol: str, risk_context: object) -> str | None:
+    context = _cached_json_object(risk_context)
+    exchange = str(context.get("exchange") or "").strip().upper()
+    if exchange:
+        return exchange
+    return "KRX" if _is_krx_symbol(symbol) else None
+
+
+def _cached_item_matches_active_kis_route(
+    *,
+    settings: Settings,
+    symbol: str,
+    provider: object,
+    risk_context: object,
+    quantity_policy: object,
+) -> bool:
+    if _active_kis_position_scope(settings) is None:
+        return False
+    normalized_provider = str(provider or ("kis" if _is_krx_symbol(symbol) else "")).strip().lower()
+    if normalized_provider in {"korea-investment", "korea_investment"}:
+        normalized_provider = "kis"
+    exchange = _cached_item_exchange(symbol=symbol, risk_context=risk_context)
+    return bool(
+        normalized_provider == "kis"
+        and exchange in _CACHED_KIS_ROUTE_EXCHANGES
+        and classify_kis_account_route(
+            settings=settings,
+            provider=normalized_provider,
+            risk_context=_cached_json_object(risk_context),
+            quantity_policy=_cached_json_object(quantity_policy),
+        )
+        == "active"
+    )
+
+
+def _cached_item_matches_position_route(
+    *,
+    item: CachedMonitoringItem,
+    position: CachedMonitoringPosition,
+) -> bool:
+    item_provider = str(
+        item.provider or ("kis" if _is_krx_symbol(item.symbol) else "")
+    ).strip().lower()
+    position_provider = str(position.provider or "").strip().lower()
+    item_exchange = _cached_position_identity_exchange(
+        provider=item_provider,
+        exchange=item.exchange or ("KRX" if _is_krx_symbol(item.symbol) else ""),
+    )
+    position_exchange = _cached_position_identity_exchange(
+        provider=position_provider,
+        exchange=position.exchange,
+    )
+    return bool(
+        item_provider
+        and item_exchange
+        and item_provider == position_provider
+        and item_exchange == position_exchange
+    )
+
+
+def _cached_position_identity_exchange(*, provider: str, exchange: object) -> str:
+    normalized_exchange = str(exchange or "").strip().upper()
+    if provider == "kis" and normalized_exchange in KRX_EXCHANGES:
+        return "KRX"
+    return normalized_exchange
 
 
 @dataclass
@@ -111,6 +251,8 @@ class MonitoringPriceSourceState:
 class CachedMonitoringPosition:
     symbol: str
     quantity: int
+    provider: str | None = None
+    exchange: str | None = None
 
 
 @dataclass(frozen=True)
@@ -120,6 +262,9 @@ class CachedMonitoringItem:
     intent: str
     status: str
     trigger_price: Decimal | None
+    trigger_direction: str | None = None
+    provider: str | None = None
+    exchange: str | None = None
 
 
 @dataclass(frozen=True)
@@ -129,6 +274,7 @@ class MonitoringRuntimeSnapshot:
     positions_by_symbol: dict[str, CachedMonitoringPosition]
     items: list[CachedMonitoringItem]
     filled_today_symbols: list[str]
+    execution_scope: dict[str, object] | None = None
 
     def snapshot(self) -> dict[str, object]:
         return {
@@ -138,6 +284,11 @@ class MonitoringRuntimeSnapshot:
             "item_count": len(self.items),
             "position_count": len(self.positions_by_symbol),
             "filled_today_symbols": list(self.filled_today_symbols),
+            "execution_scope": (
+                dict(self.execution_scope)
+                if isinstance(self.execution_scope, dict)
+                else None
+            ),
         }
 
 
@@ -152,6 +303,15 @@ class AutonomousRuntimeCoordinator:
     _daily_krx_position_discovery_task: asyncio.Task[None] | None = field(default=None, init=False)
     _watch_exec_agent_sizing_task: asyncio.Task[None] | None = field(default=None, init=False)
     _nxt_eligible_sync_task: asyncio.Task[None] | None = field(default=None, init=False)
+    _inflight_cycles: set[asyncio.Future[Any]] = field(default_factory=set, init=False)
+    _lifecycle_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False)
+    _stopping: bool = field(default=False, init=False)
+    _shutdown_fence: RuntimeCycleFence = field(
+        default_factory=RuntimeCycleFence,
+        init=False,
+        repr=False,
+    )
+    _cycle_session_factory: sessionmaker[Session] = field(init=False, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False)
     _dispatch_state: AutonomousWorkerState = field(init=False)
     _monitoring_state: AutonomousWorkerState = field(init=False)
@@ -163,9 +323,18 @@ class AutonomousRuntimeCoordinator:
     _monitoring_order_reconcile_last_at: datetime | None = field(default=None, init=False)
     _monitoring_cycle_mutex: threading.Lock = field(default_factory=threading.Lock, init=False)
     _monitoring_cycle_mutex_started_at: datetime | None = field(default=None, init=False)
+    _monitoring_reconciliation_mutex: threading.Lock = field(
+        default_factory=threading.Lock,
+        init=False,
+    )
     _monitoring_symbol_cursor: int = field(default=0, init=False)
+    _price_source_closed: bool = field(default=False, init=False)
 
     def __post_init__(self) -> None:
+        self._cycle_session_factory = CommitGuardedSessionFactory(  # type: ignore[assignment]
+            self.session_factory,
+            self._shutdown_fence,
+        )
         self._dispatch_state = AutonomousWorkerState(
             worker_name=DISPATCH_LOOP_WORKER_NAME,
             poll_interval_seconds=self.settings.dispatch_loop_interval_seconds,
@@ -200,71 +369,131 @@ class AutonomousRuntimeCoordinator:
     async def start(self) -> None:
         if not self.settings.autonomous_runtime_enabled:
             return
-        self._dispatch_task = asyncio.create_task(
-            self._run_periodic_loop(
-                worker_key="dispatch",
-                interval_seconds=self.settings.dispatch_loop_interval_seconds,
-                cycle=self._run_dispatch_cycle,
-            )
-        )
-        self._monitoring_task = asyncio.create_task(
-            self._run_periodic_loop(
-                worker_key="monitoring",
-                interval_seconds=self.settings.monitoring_loop_interval_seconds,
-                cycle=self._run_monitoring_cycle,
-                # Let startup/control initialization finish before the first
-                # DB-backed cycle. A one-interval delay also prevents an
-                # in-memory SQLite test/runtime from sharing one connection
-                # with the first operator request.
-                run_immediately=False,
-            )
-        )
-        if self.settings.runtime_mode == "live":
-            self._daily_krx_position_discovery_task = asyncio.create_task(
-                self._run_daily_krx_position_discovery_loop()
-            )
-        if self.settings.exec_agent_watch_sizing_enabled:
-            self._watch_exec_agent_sizing_task = asyncio.create_task(
+        if self._stopping:
+            raise RuntimeError("cannot start autonomous runtime while shutting down")
+        async with self._lifecycle_lock:
+            if any(task is not None and not task.done() for task in self._loop_tasks()):
+                return
+            if self._inflight_cycles:
+                raise RuntimeError(
+                    "cannot start autonomous runtime while an in-flight cycle is "
+                    "still draining"
+                )
+            self._stopping = False
+            self._dispatch_task = asyncio.create_task(
                 self._run_periodic_loop(
-                    worker_key="watch_exec_agent_sizing",
-                    interval_seconds=self.settings.exec_agent_watch_sizing_loop_interval_seconds,
-                    cycle=self._run_watch_exec_agent_sizing_cycle,
+                    worker_key="dispatch",
+                    interval_seconds=self.settings.dispatch_loop_interval_seconds,
+                    cycle=self._run_dispatch_cycle,
                 )
             )
-        if self.settings.nxt_eligible_sync_enabled:
-            self._nxt_eligible_sync_task = asyncio.create_task(
+            self._monitoring_task = asyncio.create_task(
                 self._run_periodic_loop(
-                    worker_key="nxt_eligible_sync",
-                    interval_seconds=self.settings.nxt_eligible_source_ttl_seconds,
-                    cycle=self._run_nxt_eligible_sync_cycle,
-                    run_immediately=True,
+                    worker_key="monitoring",
+                    interval_seconds=self.settings.monitoring_loop_interval_seconds,
+                    cycle=self._run_monitoring_cycle,
+                    # Let startup/control initialization finish before the first
+                    # DB-backed cycle. A one-interval delay also prevents an
+                    # in-memory SQLite test/runtime from sharing one connection
+                    # with the first operator request.
+                    run_immediately=False,
                 )
             )
+            if self.settings.runtime_mode == "live":
+                self._daily_krx_position_discovery_task = asyncio.create_task(
+                    self._run_daily_krx_position_discovery_loop()
+                )
+            if self.settings.exec_agent_watch_sizing_enabled:
+                self._watch_exec_agent_sizing_task = asyncio.create_task(
+                    self._run_periodic_loop(
+                        worker_key="watch_exec_agent_sizing",
+                        interval_seconds=self.settings.exec_agent_watch_sizing_loop_interval_seconds,
+                        cycle=self._run_watch_exec_agent_sizing_cycle,
+                    )
+                )
+            if self.settings.nxt_eligible_sync_enabled:
+                self._nxt_eligible_sync_task = asyncio.create_task(
+                    self._run_periodic_loop(
+                        worker_key="nxt_eligible_sync",
+                        interval_seconds=self.settings.nxt_eligible_source_ttl_seconds,
+                        cycle=self._run_nxt_eligible_sync_cycle,
+                        run_immediately=True,
+                    )
+                )
+
+    def mark_startup_blocked(self, reason: str) -> None:
+        with self._lock:
+            for state in (
+                self._dispatch_state,
+                self._monitoring_state,
+                self._watch_exec_agent_sizing_state,
+                self._nxt_eligible_sync_state,
+            ):
+                if state.status == "disabled":
+                    continue
+                state.status = "blocked"
+                state.last_error = reason
+
+    def begin_shutdown(self) -> None:
+        self._stopping = True
+        self._shutdown_fence.begin_shutdown()
 
     async def stop(self) -> None:
-        tasks = [
-            task
-            for task in (
-                self._dispatch_task,
-                self._monitoring_task,
-                self._daily_krx_position_discovery_task,
-                self._watch_exec_agent_sizing_task,
-                self._nxt_eligible_sync_task,
+        async with self._lifecycle_lock:
+            self.begin_shutdown()
+            tasks = [task for task in self._loop_tasks() if task is not None]
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            await self._drain_inflight_cycles(
+                timeout=self._shutdown_drain_timeout_seconds()
             )
-            if task is not None
-        ]
-        for task in tasks:
-            task.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-        close_price_source = getattr(self.monitoring_price_source, "close", None)
-        if callable(close_price_source):
-            close_price_source()
+            self._finish_stop()
+
+    async def wait_stopped(self) -> None:
+        """Wait without a timeout so lifespan cannot outlive a worker thread."""
+
+        async with self._lifecycle_lock:
+            self.begin_shutdown()
+            tasks = [task for task in self._loop_tasks() if task is not None]
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            await self._drain_inflight_cycles(timeout=None)
+            self._finish_stop()
+
+    def _finish_stop(self) -> None:
+        self._dispatch_task = None
+        self._monitoring_task = None
+        self._daily_krx_position_discovery_task = None
+        self._watch_exec_agent_sizing_task = None
+        self._nxt_eligible_sync_task = None
+        if not self._price_source_closed:
+            close_price_source = getattr(self.monitoring_price_source, "close", None)
+            if callable(close_price_source):
+                close_price_source()
+            self._price_source_closed = True
+        self._shutdown_fence.finish_shutdown()
+        self._stopping = False
+
+    def _loop_tasks(self) -> tuple[asyncio.Task[None] | None, ...]:
+        return (
+            self._dispatch_task,
+            self._monitoring_task,
+            self._daily_krx_position_discovery_task,
+            self._watch_exec_agent_sizing_task,
+            self._nxt_eligible_sync_task,
+        )
 
     def snapshot(self) -> dict[str, object]:
         with self._lock:
             return {
                 "enabled": self.settings.autonomous_runtime_enabled,
+                "execution_scope": _active_kis_execution_scope_payload(self.settings),
                 "dispatch": self._dispatch_state.snapshot(),
                 "monitoring": {
                     **self._monitoring_state.snapshot(),
@@ -290,12 +519,14 @@ class AutonomousRuntimeCoordinator:
     ) -> None:
         try:
             first_cycle = True
-            while True:
+            while not self._stopping:
                 if first_cycle and run_immediately:
                     first_cycle = False
                 else:
                     await asyncio.sleep(interval_seconds)
                     first_cycle = False
+                if self._stopping:
+                    return
                 started_at = datetime.now(UTC)
                 self._mark_cycle_started(worker_key=worker_key, started_at=started_at)
                 try:
@@ -346,7 +577,7 @@ class AutonomousRuntimeCoordinator:
         if worker_key != "monitoring":
             return await awaitable
 
-        task = asyncio.ensure_future(awaitable)
+        task = self._track_inflight_cycle(asyncio.ensure_future(awaitable))
         done, _ = await asyncio.wait(
             {task},
             timeout=self.settings.monitoring_cycle_timeout_seconds,
@@ -398,11 +629,11 @@ class AutonomousRuntimeCoordinator:
         return None
 
     async def _run_dispatch_cycle(self, started_at: datetime) -> dict[str, object]:
-        return await asyncio.to_thread(self._dispatch_cycle_sync, started_at)
+        return await self._run_in_thread(self._dispatch_cycle_sync, started_at)
 
     def _dispatch_cycle_sync(self, started_at: datetime) -> dict[str, object]:
-        with self.session_factory() as db:
-            adapter = self.broker_adapter_factory(self.settings)
+        with self._cycle_session_factory() as db:
+            adapter = self._broker_adapter_for_cycle()
             result = dispatch_due_execution_jobs(
                 settings=self.settings,
                 db=db,
@@ -423,7 +654,7 @@ class AutonomousRuntimeCoordinator:
             return payload
 
     async def _run_monitoring_cycle(self, started_at: datetime) -> dict[str, object]:
-        return await asyncio.to_thread(self._monitoring_cycle_sync_guarded, started_at)
+        return await self._run_in_thread(self._monitoring_cycle_sync_guarded, started_at)
 
     def _monitoring_cycle_sync_guarded(self, started_at: datetime) -> dict[str, object]:
         acquired_lock = self._monitoring_cycle_mutex
@@ -480,21 +711,107 @@ class AutonomousRuntimeCoordinator:
         os._exit(75)
 
     async def _run_watch_exec_agent_sizing_cycle(self, started_at: datetime) -> dict[str, object]:
-        return await asyncio.to_thread(self._watch_exec_agent_sizing_cycle_sync, started_at)
+        return await self._run_in_thread(self._watch_exec_agent_sizing_cycle_sync, started_at)
 
     async def _run_nxt_eligible_sync_cycle(self, started_at: datetime) -> dict[str, object]:
-        return await asyncio.to_thread(self._nxt_eligible_sync_cycle_sync, started_at)
+        return await self._run_in_thread(self._nxt_eligible_sync_cycle_sync, started_at)
+
+    async def _run_in_thread(
+        self,
+        cycle: Callable[..., _CycleResult],
+        *args: object,
+    ) -> _CycleResult:
+        if self._stopping:
+            raise asyncio.CancelledError
+        generation = self._shutdown_fence.capture_generation()
+        task = self._track_inflight_cycle(
+            asyncio.create_task(
+                asyncio.to_thread(
+                    self._shutdown_fence.run,
+                    generation,
+                    cycle,
+                    *args,
+                )
+            )
+        )
+        return await asyncio.shield(task)
+
+    def _broker_adapter_for_cycle(self) -> BrokerAdapter:
+        return GuardedBrokerAdapter(  # type: ignore[return-value]
+            self.broker_adapter_factory(self.settings),
+            self._shutdown_fence,
+        )
+
+    def _track_inflight_cycle(
+        self,
+        task: asyncio.Future[_CycleResult],
+    ) -> asyncio.Future[_CycleResult]:
+        self._inflight_cycles.add(task)
+        task.add_done_callback(self._inflight_cycle_done)
+        return task
+
+    def _inflight_cycle_done(self, task: asyncio.Future[Any]) -> None:
+        self._inflight_cycles.discard(task)
+        if task.cancelled():
+            return
+        task.exception()
+
+    async def _drain_inflight_cycles(self, *, timeout: float | None) -> None:
+        tasks = tuple(self._inflight_cycles)
+        if not tasks:
+            return
+        done, pending = await asyncio.wait(
+            tasks,
+            timeout=timeout,
+        )
+        if done:
+            await asyncio.gather(*done, return_exceptions=True)
+        if pending:
+            raise TimeoutError(
+                "autonomous runtime in-flight cycle did not drain within the "
+                "configured operation timeout"
+            )
+
+    def _shutdown_drain_timeout_seconds(self) -> float:
+        return max(
+            float(self.settings.monitoring_cycle_timeout_seconds)
+            * float(self.settings.monitoring_stale_cycle_exit_grace_multiplier),
+            float(self.settings.exec_agent_trigger_time_timeout_seconds),
+            float(self.settings.exec_agent_watch_sizing_timeout_seconds),
+            float(self.settings.nxt_eligible_source_timeout_seconds),
+            float(self.settings.kis_request_timeout_seconds),
+            float(self.settings.kis_token_request_timeout_seconds),
+        )
 
     def _watch_exec_agent_sizing_cycle_sync(self, started_at: datetime) -> dict[str, object]:
-        adapter = self.broker_adapter_factory(self.settings)
+        active_scope = _active_kis_position_scope(self.settings)
+        if active_scope is None:
+            feedback_status = {
+                "status": "unavailable",
+                "version": TRADE_OUTCOME_FEEDBACK_VERSION,
+                "reason": "active_kis_account_scope_unavailable",
+            }
+        else:
+            provider, account_scope = active_scope
+            with self._cycle_session_factory() as db:
+                feedback_status = ensure_fresh_trade_outcome_feedback(
+                    settings=self.settings,
+                    db=db,
+                    now=started_at,
+                    provider=provider,
+                    account_scope=account_scope,
+                    exchange=None,
+                )
+        adapter = self._broker_adapter_for_cycle()
         result = run_due_watch_exec_agent_sizing(
             settings=self.settings,
-            session_factory=self.session_factory,
+            session_factory=self._cycle_session_factory,
             adapter=adapter,
             now=started_at,
         )
         payload = {
             "status_code": result.status_code,
+            "trade_outcome_feedback": feedback_status,
             **result.payload,
         }
         self._store_cycle_payload(worker_key="watch_exec_agent_sizing", payload=payload)
@@ -511,11 +828,14 @@ class AutonomousRuntimeCoordinator:
                 raise RuntimeError("live broker position reconciliation failed")
         core_desired_symbols = _load_core_desired_monitoring_symbols(settings=self.settings)
         local_desired_symbols = self._load_local_desired_monitoring_symbols()
-        desired_symbols = (
-            local_desired_symbols
-            if local_desired_symbols
-            else [symbol for symbol in core_desired_symbols if _is_krx_symbol(symbol)]
-        )
+        if local_desired_symbols:
+            local_symbol_set = set(local_desired_symbols)
+            desired_symbols = _merge_symbol_priority(
+                [symbol for symbol in core_desired_symbols if symbol in local_symbol_set],
+                local_desired_symbols,
+            )
+        else:
+            desired_symbols = [symbol for symbol in core_desired_symbols if _is_krx_symbol(symbol)]
         if desired_symbols:
             desired_symbol_set = set(desired_symbols)
             position_symbols = {
@@ -545,6 +865,7 @@ class AutonomousRuntimeCoordinator:
                     positions_by_symbol={},
                     items=[],
                     filled_today_symbols=[],
+                    execution_scope=_active_kis_execution_scope_payload(self.settings),
                 )
                 with self._lock:
                     self._monitoring_runtime_snapshot = runtime_snapshot
@@ -677,8 +998,8 @@ class AutonomousRuntimeCoordinator:
             # Empty/failed quote cycles still have work to do: persist a
             # checkpoint, surface coverage degradation, and retry previously
             # latched pending-dispatch exits that no longer require a quote.
-            with self.session_factory() as db:
-                adapter = self.broker_adapter_factory(self.settings)
+            with self._cycle_session_factory() as db:
+                adapter = self._broker_adapter_for_cycle()
                 result = run_autonomous_monitoring_cycle(
                     settings=self.settings,
                     db=db,
@@ -743,8 +1064,8 @@ class AutonomousRuntimeCoordinator:
             ]
             symbols = ordered_triggered_symbols
             prices = [price for price in prices if price.symbol in set(ordered_triggered_symbols)]
-            with self.session_factory() as db:
-                adapter = self.broker_adapter_factory(self.settings)
+            with self._cycle_session_factory() as db:
+                adapter = self._broker_adapter_for_cycle()
                 result = run_autonomous_monitoring_cycle(
                 settings=self.settings,
                 db=db,
@@ -811,8 +1132,8 @@ class AutonomousRuntimeCoordinator:
     ) -> MonitoringRuntimeSnapshot:
         broker_reconciliation_succeeded = False
         if reconcile_broker and self.settings.runtime_mode == "live":
-            adapter = self.broker_adapter_factory(self.settings)
-            with self.session_factory() as db:
+            adapter = self._broker_adapter_for_cycle()
+            with self._cycle_session_factory() as db:
                 try:
                     _sync_positions_for_monitoring_routes(
                         settings=self.settings,
@@ -851,21 +1172,22 @@ class AutonomousRuntimeCoordinator:
         return snapshot
 
     def _reconcile_and_refresh_monitoring_snapshot_if_due(self, now: datetime) -> bool:
-        last_reconciled_at = self._monitoring_snapshot_last_reconciled_at
-        if last_reconciled_at is not None:
-            elapsed = (now - last_reconciled_at).total_seconds()
-            if elapsed < self.settings.exec_agent_max_account_snapshot_age_seconds:
-                return True
-        self._refresh_monitoring_runtime_snapshot(
-            loaded_at=now,
-            reason="periodic_broker_truth_refresh",
-            reconcile_broker=True,
-        )
-        reconciled_at = self._monitoring_snapshot_last_reconciled_at
-        return reconciled_at is not None and reconciled_at >= now
+        with self._monitoring_reconciliation_mutex:
+            last_reconciled_at = self._monitoring_snapshot_last_reconciled_at
+            if last_reconciled_at is not None:
+                elapsed = (now - last_reconciled_at).total_seconds()
+                if elapsed < self.settings.exec_agent_max_account_snapshot_age_seconds:
+                    return True
+            self._refresh_monitoring_runtime_snapshot(
+                loaded_at=now,
+                reason="periodic_broker_truth_refresh",
+                reconcile_broker=True,
+            )
+            reconciled_at = self._monitoring_snapshot_last_reconciled_at
+            return reconciled_at is not None and reconciled_at >= now
 
     async def _run_daily_krx_position_discovery_loop(self) -> None:
-        while True:
+        while not self._stopping:
             now = datetime.now(UTC)
             if _is_regular_market_session(
                 now=now,
@@ -874,10 +1196,12 @@ class AutonomousRuntimeCoordinator:
                 self._monitoring_state.last_success_at is not None
                 and not self._broker_positions_reconciled_on_market_date(now)
             ):
-                await asyncio.to_thread(
+                await self._run_in_thread(
                     self._reconcile_and_refresh_monitoring_snapshot_if_due,
                     now,
                 )
+            if self._stopping:
+                return
             await asyncio.sleep(30)
 
     def _broker_positions_reconciled_on_market_date(self, now: datetime) -> bool:
@@ -894,7 +1218,7 @@ class AutonomousRuntimeCoordinator:
             snapshot = self._monitoring_runtime_snapshot
         if snapshot is None:
             return
-        with self.session_factory() as db:
+        with self._cycle_session_factory() as db:
             filled_today_symbols = _load_filled_today_symbols(
                 settings=self.settings,
                 db=db,
@@ -924,8 +1248,8 @@ class AutonomousRuntimeCoordinator:
             elapsed = (now - self._monitoring_order_reconcile_last_at).total_seconds()
             if elapsed < max(60, self.settings.monitoring_loop_interval_seconds):
                 return
-        adapter = self.broker_adapter_factory(self.settings)
-        with self.session_factory() as db:
+        adapter = self._broker_adapter_for_cycle()
+        with self._cycle_session_factory() as db:
             try:
                 result = reconcile_pending_broker_orders(
                     settings=self.settings,
@@ -964,7 +1288,7 @@ class AutonomousRuntimeCoordinator:
         if not runtime_snapshot.positions_by_symbol:
             return 0
         prices_by_symbol = {price.symbol: price for price in prices}
-        with self.session_factory() as db:
+        with self._cycle_session_factory() as db:
             positions_by_symbol = _load_positions_by_symbol(
                 settings=self.settings,
                 db=db,
@@ -982,10 +1306,11 @@ class AutonomousRuntimeCoordinator:
             return maintenance_count
 
     def _load_monitoring_runtime_snapshot(self, loaded_at: datetime) -> MonitoringRuntimeSnapshot:
-        with self.session_factory() as db:
+        with self._cycle_session_factory() as db:
             symbols = list_autonomous_monitoring_symbols(
                 settings=self.settings,
                 db=db,
+                effective_at=loaded_at,
             )
             return self._load_monitoring_runtime_snapshot_for_symbols_with_session(
                 db=db,
@@ -1005,7 +1330,7 @@ class AutonomousRuntimeCoordinator:
         )
         if raw_snapshot is not None:
             return raw_snapshot
-        with self.session_factory() as db:
+        with self._cycle_session_factory() as db:
             return self._load_monitoring_runtime_snapshot_for_symbols_with_session(
                 db=db,
                 loaded_at=loaded_at,
@@ -1031,6 +1356,7 @@ class AutonomousRuntimeCoordinator:
                 positions_by_symbol={},
                 items=[],
                 filled_today_symbols=[],
+                execution_scope=_active_kis_execution_scope_payload(self.settings),
             )
         symbol_placeholders = ",".join("?" for _ in symbols)
         watch_status_placeholders = ",".join("?" for _ in ACTIVE_WATCH_MONITORING_STATUSES)
@@ -1042,37 +1368,70 @@ class AutonomousRuntimeCoordinator:
         )
         sell_status_placeholders = ",".join("?" for _ in sell_statuses)
         sell_intent_placeholders = ",".join("?" for _ in SELL_MONITORED_INTENTS)
+        active_scope = _active_kis_position_scope(self.settings)
         try:
             with sqlite3.connect(f"file:{url.database}?mode=ro", uri=True, timeout=5) as conn:
-                position_rows = conn.execute(
-                    f"""
-                    select symbol, quantity
-                    from execution_positions
-                    where mode = ? and quantity > 0 and symbol in ({symbol_placeholders})
-                    """,
-                    [self.settings.runtime_mode, *symbols],
-                ).fetchall()
+                position_rows = (
+                    conn.execute(
+                        f"""
+                        select symbol, quantity, exchange, provider
+                        from execution_positions
+                        where mode = ?
+                          and provider = ?
+                          and account_scope = ?
+                          and exchange in ('KRX', 'NASD', 'NYSE', 'AMEX')
+                          and quantity > 0
+                          and symbol in ({symbol_placeholders})
+                        """,
+                        [
+                            self.settings.runtime_mode,
+                            active_scope[0],
+                            active_scope[1],
+                            *symbols,
+                        ],
+                    ).fetchall()
+                    if active_scope is not None
+                    else []
+                )
                 buy_item_rows = conn.execute(
                     f"""
-                    select id, symbol, intent, status, trigger_price
-                    from execution_plan_items
-                    where side = 'buy'
-                      and status in ({watch_status_placeholders})
-                      and intent in ({watch_intent_placeholders})
-                      and symbol in ({symbol_placeholders})
+                    select i.id, i.symbol, i.intent, i.status, i.trigger_price,
+                           i.risk_context, i.quantity_policy, i.provider
+                    from execution_plan_items i
+                    join execution_plans p on p.id = i.execution_plan_id
+                    where p.mode = ?
+                      and p.market_date <= ?
+                      and i.side = 'buy'
+                      and i.status in ({watch_status_placeholders})
+                      and i.intent in ({watch_intent_placeholders})
+                      and i.symbol in ({symbol_placeholders})
                     """,
-                    [*ACTIVE_WATCH_MONITORING_STATUSES, *WATCH_BUY_INTENTS, *symbols],
+                    [
+                        self.settings.runtime_mode,
+                        loaded_at.astimezone(KRX_TIMEZONE).date().isoformat(),
+                        *ACTIVE_WATCH_MONITORING_STATUSES,
+                        *WATCH_BUY_INTENTS,
+                        *symbols,
+                    ],
                 ).fetchall()
                 sell_item_rows = conn.execute(
                     f"""
-                    select id, symbol, intent, status, trigger_price
-                    from execution_plan_items
-                    where side = 'sell'
-                      and status in ({sell_status_placeholders})
-                      and intent in ({sell_intent_placeholders})
-                      and symbol in ({symbol_placeholders})
+                    select i.id, i.symbol, i.intent, i.status, i.trigger_price,
+                           i.risk_context, i.quantity_policy, i.provider
+                    from execution_plan_items i
+                    join execution_plans p on p.id = i.execution_plan_id
+                    where p.mode = ?
+                      and i.side = 'sell'
+                      and i.status in ({sell_status_placeholders})
+                      and i.intent in ({sell_intent_placeholders})
+                      and i.symbol in ({symbol_placeholders})
                     """,
-                    [*sell_statuses, *SELL_MONITORED_INTENTS, *symbols],
+                    [
+                        self.settings.runtime_mode,
+                        *sell_statuses,
+                        *SELL_MONITORED_INTENTS,
+                        *symbols,
+                    ],
                 ).fetchall()
         except sqlite3.Error:
             LOGGER.exception(
@@ -1080,6 +1439,17 @@ class AutonomousRuntimeCoordinator:
                 extra={"runtime_mode": self.settings.runtime_mode, "symbol_count": len(symbols)},
             )
             return None
+        scoped_item_rows = [
+            row
+            for row in [*buy_item_rows, *sell_item_rows]
+            if _cached_item_matches_active_kis_route(
+                settings=self.settings,
+                symbol=str(row[1]),
+                provider=row[7],
+                risk_context=row[5],
+                quantity_policy=row[6],
+            )
+        ]
         cached_items = [
             CachedMonitoringItem(
                 id=str(row[0]),
@@ -1087,19 +1457,29 @@ class AutonomousRuntimeCoordinator:
                 intent=str(row[2]),
                 status=str(row[3]),
                 trigger_price=Decimal(str(row[4])) if row[4] is not None else None,
+                trigger_direction=(
+                    watch_buy_direction_from_payloads(
+                        _cached_json_object(row[6]),
+                        _cached_json_object(row[5]),
+                    )
+                    if str(row[2]) in WATCH_BUY_INTENTS
+                    else None
+                ),
+                provider=str(row[7] or "").strip().lower() or None,
+                exchange=_cached_item_exchange(
+                    symbol=str(row[1]),
+                    risk_context=row[5],
+                ),
             )
-            for row in [*buy_item_rows, *sell_item_rows]
+            for row in scoped_item_rows
         ]
         return MonitoringRuntimeSnapshot(
             loaded_at=loaded_at,
             symbols=symbols,
-            positions_by_symbol={
-                str(row[0]): CachedMonitoringPosition(symbol=str(row[0]), quantity=int(row[1]))
-                for row in position_rows
-                if row[1] > 0
-            },
+            positions_by_symbol=_cached_positions_by_symbol(position_rows),
             items=cached_items,
             filled_today_symbols=[],
+            execution_scope=_active_kis_execution_scope_payload(self.settings),
         )
 
     def _load_local_desired_monitoring_symbols_from_sqlite(self) -> list[str]:
@@ -1114,44 +1494,53 @@ class AutonomousRuntimeCoordinator:
         # KRX-only so it cannot absorb Alpaca positions from a shared database.
         if self.settings.kis_us_trading_enabled:
             return []
-        configured_limit = int(self.settings.monitoring_max_symbols_per_cycle or 0)
-        limit = max(configured_limit * 4, 128) if configured_limit > 0 else 128
         buy_statuses = tuple(ACTIVE_WATCH_MONITORING_STATUSES)
         buy_status_placeholders = ",".join("?" for _ in buy_statuses)
         buy_intent_placeholders = ",".join("?" for _ in WATCH_BUY_INTENTS)
+        active_scope = _active_kis_position_scope(self.settings)
         try:
             with sqlite3.connect(f"file:{url.database}?mode=ro", uri=True, timeout=5) as conn:
-                position_rows = conn.execute(
-                    """
-                    select symbol
-                    from execution_positions
-                    where mode = ? and quantity > 0
-                    order by symbol asc
-                    """,
-                    [self.settings.runtime_mode],
-                ).fetchall()
+                position_rows = (
+                    conn.execute(
+                        """
+                        select symbol
+                        from execution_positions
+                        where mode = ?
+                          and provider = ?
+                          and account_scope = ?
+                          and exchange = 'KRX'
+                          and quantity > 0
+                        order by symbol asc
+                        """,
+                        [self.settings.runtime_mode, *active_scope],
+                    ).fetchall()
+                    if active_scope is not None
+                    else []
+                )
                 item_rows = conn.execute(
                     f"""
                     select
                         i.symbol,
-                        max(p.market_date) as latest_market_date,
-                        max(p.accepted_at) as latest_accepted_at,
-                        max(i.updated_at) as latest_updated_at
+                        p.market_date,
+                        p.accepted_at,
+                        i.updated_at,
+                        i.risk_context,
+                        i.quantity_policy,
+                        i.provider
                     from execution_plan_items i
                     join execution_plans p on p.id = i.execution_plan_id
                     where p.mode = ?
+                      and p.market_date <= ?
                       and i.side = 'buy'
                       and i.status in ({buy_status_placeholders})
                       and i.intent in ({buy_intent_placeholders})
-                    group by i.symbol
-                    order by latest_market_date desc, latest_accepted_at desc, latest_updated_at desc, i.symbol asc
-                    limit ?
+                    order by p.market_date desc, p.accepted_at desc, i.updated_at desc, i.symbol asc
                     """,
                     [
                         self.settings.runtime_mode,
+                        datetime.now(KRX_TIMEZONE).date().isoformat(),
                         *buy_statuses,
                         *WATCH_BUY_INTENTS,
-                        limit,
                     ],
                 ).fetchall()
         except sqlite3.Error:
@@ -1168,21 +1557,23 @@ class AutonomousRuntimeCoordinator:
                 continue
             ordered.append(symbol)
             seen.add(symbol)
-        local_limit = (
-            max(configured_limit, len(ordered))
-            if configured_limit > 0
-            else limit
-        )
         for row in item_rows:
-            if len(ordered) >= local_limit:
-                break
             symbol = str(row[0] or "").strip()
-            if not _is_krx_symbol(symbol) or symbol in seen:
+            if (
+                not _is_krx_symbol(symbol)
+                or symbol in seen
+                or not _cached_item_matches_active_kis_route(
+                    settings=self.settings,
+                    symbol=symbol,
+                    provider=row[6],
+                    risk_context=row[4],
+                    quantity_policy=row[5],
+                )
+                or _cached_item_exchange(symbol=symbol, risk_context=row[4]) != "KRX"
+            ):
                 continue
             ordered.append(symbol)
             seen.add(symbol)
-            if len(ordered) >= local_limit:
-                break
         return ordered
 
     def _load_local_position_symbols_from_sqlite(self) -> list[str]:
@@ -1192,16 +1583,25 @@ class AutonomousRuntimeCoordinator:
             return []
         if not url.drivername.startswith("sqlite") or not url.database or url.database == ":memory:":
             return []
+        active_scope = _active_kis_position_scope(self.settings)
+        if active_scope is None:
+            return []
         try:
             with sqlite3.connect(f"file:{url.database}?mode=ro", uri=True, timeout=5) as conn:
                 rows = conn.execute(
                     """
                     select symbol
                     from execution_positions
-                    where mode = ? and quantity > 0
+                    where mode = ?
+                      and provider = ?
+                      and account_scope = ?
+                      and exchange in ('KRX', 'NASD', 'NYSE', 'AMEX')
+                      and quantity > 0
+                    group by symbol
+                    having count(*) = 1
                     order by symbol asc
                     """,
-                    [self.settings.runtime_mode],
+                    [self.settings.runtime_mode, *active_scope],
                 ).fetchall()
         except sqlite3.Error:
             LOGGER.exception(
@@ -1217,12 +1617,16 @@ class AutonomousRuntimeCoordinator:
             return sqlite_symbols
         if self.session_factory is None:
             return []
-        with self.session_factory() as db:
+        with self._cycle_session_factory() as db:
             rows = db.execute(
-                select(ExecutionPosition.symbol).where(
-                    ExecutionPosition.mode == self.settings.runtime_mode,
+                select(ExecutionPosition.symbol)
+                .where(
+                    *_active_kis_position_filters(settings=self.settings),
                     ExecutionPosition.quantity > 0,
-                ).order_by(ExecutionPosition.symbol.asc())
+                )
+                .group_by(ExecutionPosition.symbol)
+                .having(func.count(ExecutionPosition.id) == 1)
+                .order_by(ExecutionPosition.symbol.asc())
             ).scalars()
             return [str(symbol).strip() for symbol in rows if str(symbol or "").strip()]
 
@@ -1230,7 +1634,7 @@ class AutonomousRuntimeCoordinator:
         sqlite_symbols = self._load_local_desired_monitoring_symbols_from_sqlite()
         if sqlite_symbols:
             return sqlite_symbols
-        with self.session_factory() as db:
+        with self._cycle_session_factory() as db:
             return list_autonomous_monitoring_symbols(
                 settings=self.settings,
                 db=db,
@@ -1243,68 +1647,113 @@ class AutonomousRuntimeCoordinator:
         loaded_at: datetime,
         symbols: list[str],
     ) -> MonitoringRuntimeSnapshot:
-            position_rows = db.execute(
-                select(ExecutionPosition.symbol, ExecutionPosition.quantity).where(
-                    ExecutionPosition.mode == self.settings.runtime_mode,
-                    ExecutionPosition.quantity > 0,
-                    ExecutionPosition.symbol.in_(symbols or [""]),
-                )
-            ).all()
-            buy_item_rows = db.execute(
-                select(
-                    ExecutionPlanItem.id,
-                    ExecutionPlanItem.symbol,
-                    ExecutionPlanItem.intent,
-                    ExecutionPlanItem.status,
-                    ExecutionPlanItem.trigger_price,
-                ).where(
-                    ExecutionPlanItem.side == "buy",
-                    ExecutionPlanItem.status.in_(tuple(ACTIVE_WATCH_MONITORING_STATUSES)),
-                    ExecutionPlanItem.intent.in_(tuple(WATCH_BUY_INTENTS)),
-                    ExecutionPlanItem.symbol.in_(symbols or [""]),
-                )
-            ).all()
-            sell_item_rows = db.execute(
-                select(
-                    ExecutionPlanItem.id,
-                    ExecutionPlanItem.symbol,
-                    ExecutionPlanItem.intent,
-                    ExecutionPlanItem.status,
-                    ExecutionPlanItem.trigger_price,
-                ).where(
-                    ExecutionPlanItem.side == "sell",
-                    ExecutionPlanItem.status.in_(
-                        tuple(
-                            SELL_ACTIVE_MONITORING_STATUSES
-                            | BLOCKED_MONITORING_STATUSES
-                            | PENDING_DISPATCH_MONITORING_STATUSES
-                        )
-                    ),
-                    ExecutionPlanItem.intent.in_(tuple(SELL_MONITORED_INTENTS)),
-                    ExecutionPlanItem.symbol.in_(symbols or [""]),
-                )
-            ).all()
-            item_rows = [*buy_item_rows, *sell_item_rows]
-            cached_items = [
-                CachedMonitoringItem(
-                    id=str(item.id),
+        position_rows = db.execute(
+            select(
+                ExecutionPosition.symbol,
+                ExecutionPosition.quantity,
+                ExecutionPosition.exchange,
+                ExecutionPosition.provider,
+            ).where(
+                *_active_kis_position_filters(settings=self.settings),
+                ExecutionPosition.quantity > 0,
+                ExecutionPosition.symbol.in_(symbols or [""]),
+            )
+        ).all()
+        buy_item_rows = db.execute(
+            select(
+                ExecutionPlanItem.id,
+                ExecutionPlanItem.symbol,
+                ExecutionPlanItem.intent,
+                ExecutionPlanItem.status,
+                ExecutionPlanItem.trigger_price,
+                ExecutionPlanItem.risk_context,
+                ExecutionPlanItem.quantity_policy,
+                ExecutionPlanItem.provider,
+            )
+            .join(ExecutionPlanItem.plan)
+            .where(
+                ExecutionPlan.mode == self.settings.runtime_mode,
+                ExecutionPlan.market_date
+                <= loaded_at.astimezone(KRX_TIMEZONE).date(),
+                ExecutionPlanItem.side == "buy",
+                ExecutionPlanItem.status.in_(
+                    tuple(ACTIVE_WATCH_MONITORING_STATUSES)
+                ),
+                ExecutionPlanItem.intent.in_(tuple(WATCH_BUY_INTENTS)),
+                ExecutionPlanItem.symbol.in_(symbols or [""]),
+            )
+        ).all()
+        sell_item_rows = db.execute(
+            select(
+                ExecutionPlanItem.id,
+                ExecutionPlanItem.symbol,
+                ExecutionPlanItem.intent,
+                ExecutionPlanItem.status,
+                ExecutionPlanItem.trigger_price,
+                ExecutionPlanItem.risk_context,
+                ExecutionPlanItem.quantity_policy,
+                ExecutionPlanItem.provider,
+            )
+            .join(ExecutionPlanItem.plan)
+            .where(
+                ExecutionPlan.mode == self.settings.runtime_mode,
+                ExecutionPlanItem.side == "sell",
+                ExecutionPlanItem.status.in_(
+                    tuple(
+                        SELL_ACTIVE_MONITORING_STATUSES
+                        | BLOCKED_MONITORING_STATUSES
+                        | PENDING_DISPATCH_MONITORING_STATUSES
+                    )
+                ),
+                ExecutionPlanItem.intent.in_(tuple(SELL_MONITORED_INTENTS)),
+                ExecutionPlanItem.symbol.in_(symbols or [""]),
+            )
+        ).all()
+        item_rows = [
+            item
+            for item in [*buy_item_rows, *sell_item_rows]
+            if _cached_item_matches_active_kis_route(
+                settings=self.settings,
+                symbol=str(item.symbol),
+                provider=item.provider,
+                risk_context=item.risk_context,
+                quantity_policy=item.quantity_policy,
+            )
+        ]
+        cached_items = [
+            CachedMonitoringItem(
+                id=str(item.id),
+                symbol=str(item.symbol),
+                intent=str(item.intent),
+                status=str(item.status),
+                trigger_price=item.trigger_price,
+                trigger_direction=(
+                    watch_buy_direction_from_payloads(
+                        item.quantity_policy,
+                        item.risk_context,
+                    )
+                    if str(item.intent) in WATCH_BUY_INTENTS
+                    else None
+                ),
+                provider=(
+                    str(item.provider).strip().lower()
+                    if item.provider is not None
+                    else None
+                ),
+                exchange=_cached_item_exchange(
                     symbol=str(item.symbol),
-                    intent=str(item.intent),
-                    status=str(item.status),
-                    trigger_price=item.trigger_price,
-                )
-                for item in item_rows
-            ]
-            return MonitoringRuntimeSnapshot(
+                    risk_context=item.risk_context,
+                ),
+            )
+            for item in item_rows
+        ]
+        return MonitoringRuntimeSnapshot(
             loaded_at=loaded_at,
             symbols=symbols,
-            positions_by_symbol={
-                str(row.symbol): CachedMonitoringPosition(symbol=str(row.symbol), quantity=int(row.quantity))
-                for row in position_rows
-                if row.quantity > 0
-            },
+            positions_by_symbol=_cached_positions_by_symbol(position_rows),
             items=cached_items,
             filled_today_symbols=[],
+            execution_scope=_active_kis_execution_scope_payload(self.settings),
         )
 
     def _evaluate_cached_monitoring_cycle(
@@ -1325,13 +1774,24 @@ class AutonomousRuntimeCoordinator:
         triggered_buy_symbols: set[str] = set()
         results: list[dict[str, object]] = []
         for item in runtime_snapshot.items:
+            position = runtime_snapshot.positions_by_symbol.get(item.symbol)
             if (
                 item.intent not in WATCH_BUY_INTENTS
-                and item.symbol not in runtime_snapshot.positions_by_symbol
+                and (
+                    position is None
+                    or not _cached_item_matches_position_route(
+                        item=item,
+                        position=position,
+                    )
+                )
             ):
                 continue
             price = prices_by_symbol.get(item.symbol)
-            observed_price = price.price if price is not None else None
+            observed_price = _cached_executable_price(
+                price=price,
+                item=item,
+                runtime_mode=self.settings.runtime_mode,
+            )
             if price is None and item.intent != "max_holding_close_sell":
                 continue
             evaluated_item_count += 1
@@ -1488,7 +1948,7 @@ class AutonomousRuntimeCoordinator:
             state.last_heartbeat_at = heartbeat_at
             state.last_success_at = heartbeat_at
             state.last_error = None
-            state.last_cycle = payload
+            state.last_cycle = self._scope_cycle_payload(payload)
 
     def _mark_cycle_busy(
         self,
@@ -1502,7 +1962,7 @@ class AutonomousRuntimeCoordinator:
             state.status = "running"
             state.last_heartbeat_at = heartbeat_at
             state.last_error = str(payload.get("reason") or "cycle skipped")
-            state.last_cycle = payload
+            state.last_cycle = self._scope_cycle_payload(payload)
 
     def _mark_cycle_failed(
         self,
@@ -1525,7 +1985,16 @@ class AutonomousRuntimeCoordinator:
     ) -> None:
         with self._lock:
             state = self._state_for(worker_key)
-            state.last_cycle = payload
+            state.last_cycle = self._scope_cycle_payload(payload)
+
+    def _scope_cycle_payload(
+        self,
+        payload: dict[str, object],
+    ) -> dict[str, object]:
+        return {
+            **payload,
+            "execution_scope": _active_kis_execution_scope_payload(self.settings),
+        }
 
     def _state_for(self, worker_key: str) -> AutonomousWorkerState:
         if worker_key == "dispatch":
@@ -1647,13 +2116,28 @@ def _call_price_source(
     observed_at: datetime,
     settings: Settings,
 ) -> object:
+    call_candidates = (
+        ((), {"symbols": symbols, "observed_at": observed_at, "settings": settings}),
+        ((symbols, observed_at, settings), {}),
+        ((symbols,), {}),
+    )
     try:
-        return source(symbols=symbols, observed_at=observed_at, settings=settings)
-    except TypeError:
+        source_signature = inspect.signature(source)
+    except (TypeError, ValueError):
+        args, kwargs = call_candidates[0]
+        return source(*args, **kwargs)
+
+    for args, kwargs in call_candidates:
         try:
-            return source(symbols, observed_at, settings)
+            source_signature.bind(*args, **kwargs)
         except TypeError:
-            return source(symbols)
+            continue
+        return source(*args, **kwargs)
+
+    raise TypeError(
+        "monitoring_price_source must accept (symbols, observed_at, settings) "
+        "or the legacy (symbols) signature"
+    )
 
 
 def _source_identity(source: object) -> tuple[str | None, str | None]:
@@ -1760,7 +2244,35 @@ def _cached_watch_buy_trigger_price(item: CachedMonitoringItem) -> Decimal | Non
 
 
 def _cached_watch_buy_direction(item: CachedMonitoringItem) -> str:
-    return "at_or_above"
+    return item.trigger_direction or "at_or_below"
+
+
+def _cached_executable_price(
+    *,
+    price: MonitoringPriceRequest | None,
+    item: CachedMonitoringItem,
+    runtime_mode: str,
+) -> Decimal | None:
+    if price is None:
+        return None
+    executable = price.ask if item.intent in WATCH_BUY_INTENTS else price.bid
+    if executable is not None and executable.is_finite() and executable > 0:
+        return executable
+    if runtime_mode == "live":
+        return None
+    return price.price
+
+
+def _cached_json_object(value: object) -> dict[str, object]:
+    if isinstance(value, dict):
+        return value
+    if not isinstance(value, str):
+        return {}
+    try:
+        parsed = json.loads(value)
+    except (TypeError, ValueError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
 
 
 def _triggered_symbols_from_cached_payload(
@@ -1828,17 +2340,17 @@ def _load_filled_today_symbols(
     now: datetime,
 ) -> list[str]:
     today_start_utc, tomorrow_start_utc = _current_krx_day_utc_bounds(now)
-    symbols = db.scalars(
-        select(distinct(ExecutionFill.symbol))
-        .select_from(ExecutionFill)
-        .join(ExecutionFill.broker_order)
-        .where(
-            BrokerOrder.mode == settings.runtime_mode,
-            ExecutionFill.filled_at >= today_start_utc,
-            ExecutionFill.filled_at < tomorrow_start_utc,
-        )
-    ).all()
-    return sorted(str(symbol) for symbol in symbols)
+    # Import lazily to avoid a module cycle while sharing the exact canonical
+    # execution-scope classifier used by runtime status.
+    from app.services.runtime import runtime_filled_today_symbols
+
+    return runtime_filled_today_symbols(
+        settings=settings,
+        db=db,
+        provider="kis",
+        today_start_utc=today_start_utc,
+        tomorrow_start_utc=tomorrow_start_utc,
+    )
 
 
 def _current_krx_day_utc_bounds(now: datetime | None = None) -> tuple[datetime, datetime]:

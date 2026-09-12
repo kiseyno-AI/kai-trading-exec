@@ -1,3 +1,5 @@
+from typing import Literal
+
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
@@ -18,3 +20,20 @@ class BrokerSessionActionRequest(BaseModel):
         if not normalized:
             raise ValueError("field must not be empty")
         return normalized
+
+
+class BrokerSessionActionResponse(BaseModel):
+    """Public result contract for broker authentication and revocation actions."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    action: Literal["authenticate", "revoke"]
+    outcome: Literal["applied", "noop", "rejected"]
+    changed: bool
+    message: str
+    event_id: str
+    session: dict[str, object]
+    outcome_unknown: bool = False
+    retry_required: bool = False
+    error_code: str | None = None
+    session_authoritative: bool = True

@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import json
+import re
 import ssl
 import threading
 import time
-from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta, timezone
+from calendar import monthrange
+from dataclasses import dataclass, field
+from datetime import UTC, date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 from urllib.parse import urlencode
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -23,6 +25,7 @@ from app.broker.base import (
     BrokerConfig,
     BrokerCurrentPrice,
     BrokerErrorClassification,
+    BrokerIntradayLiquiditySnapshot,
     BrokerLiveMarketContext,
     BrokerOrderPlacement,
     BrokerOrderPlacementRequest,
@@ -33,8 +36,18 @@ from app.broker.base import (
     NormalizedBrokerOrderStatus,
 )
 from app.core.config import Settings
+from app.broker.kis_token_coordinator import (
+    invalidate_shared_kis_token,
+)
+from app.broker.error_safety import (
+    safe_broker_error_code,
+    safe_broker_error_message,
+    sanitize_broker_error_payload,
+)
 
 KIS_PROVIDER = "kis"
+KIS_DOMESTIC_EXCHANGES = frozenset({"KRX", "KOSPI", "KOSDAQ", "NXT", "SOR"})
+KIS_US_EXCHANGES = frozenset({"NASD", "NYSE", "AMEX"})
 KIS_LIVE_API_BASE_URL = "https://openapi.koreainvestment.com:9443"
 KIS_PAPER_API_BASE_URL = "https://openapivts.koreainvestment.com:29443"
 KIS_WEBSOCKET_APPROVAL_PATH = "/oauth2/Approval"
@@ -47,17 +60,34 @@ KIS_BALANCE_PATH = "/uapi/domestic-stock/v1/trading/inquire-balance"
 KIS_OPEN_ORDERS_PATH = "/uapi/domestic-stock/v1/trading/inquire-daily-ccld"
 KIS_DAILY_CCLD_PATH = "/uapi/domestic-stock/v1/trading/inquire-daily-ccld"
 KIS_ASKING_PRICE_PATH = "/uapi/domestic-stock/v1/quotations/inquire-asking-price-exp-ccn"
+KIS_INTRADAY_MINUTE_PRICE_PATH = (
+    "/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice"
+)
+KIS_HOLIDAY_CALENDAR_PATH = "/uapi/domestic-stock/v1/quotations/chk-holiday"
 KIS_OVERSEAS_ORDER_PATH = "/uapi/overseas-stock/v1/trading/order"
-KIS_OVERSEAS_CURRENT_PRICE_PATH = "/uapi/overseas-price/v1/quotations/price"
+KIS_OVERSEAS_MINUTE_PRICE_PATH = (
+    "/uapi/overseas-price/v1/quotations/inquire-time-itemchartprice"
+)
+KIS_OVERSEAS_ASKING_PRICE_PATH = (
+    "/uapi/overseas-price/v1/quotations/inquire-asking-price"
+)
+# Backward-compatible name for callers that treat this as the adapter's
+# current-price endpoint. The canonical implementation requires timestamped
+# minute data rather than the untimestamped legacy `/price` response.
+KIS_OVERSEAS_CURRENT_PRICE_PATH = KIS_OVERSEAS_MINUTE_PRICE_PATH
 KIS_OVERSEAS_BALANCE_PATH = "/uapi/overseas-stock/v1/trading/inquire-balance"
 KIS_OVERSEAS_OPEN_ORDERS_PATH = "/uapi/overseas-stock/v1/trading/inquire-nccs"
 KIS_OVERSEAS_CCLD_PATH = "/uapi/overseas-stock/v1/trading/inquire-ccnl"
 KIS_OVERSEAS_BUYING_POWER_PATH = "/uapi/overseas-stock/v1/trading/inquire-psamount"
 KIS_CURRENT_PRICE_TR_ID = "FHKST01010100"
 KIS_ASKING_PRICE_TR_ID = "FHKST01010200"
-KIS_OVERSEAS_CURRENT_PRICE_TR_ID = "HHDFS00000300"
+KIS_INTRADAY_MINUTE_PRICE_TR_ID = "FHKST03010200"
+KIS_HOLIDAY_CALENDAR_TR_ID = "CTCA0903R"
+KIS_OVERSEAS_MINUTE_PRICE_TR_ID = "HHDFS76950200"
+KIS_OVERSEAS_ASKING_PRICE_TR_ID = "HHDFS76200100"
 KIS_TIMEZONE = timezone(timedelta(hours=9))
 US_EASTERN_TIMEZONE = ZoneInfo("America/New_York")
+_KIS_TOKEN_EXPIRY_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}")
 _DEFAULT_SSL_CONTEXT: ssl.SSLContext | None = None
 _DEFAULT_SSL_CONTEXT_LOCK = threading.Lock()
 
@@ -77,6 +107,7 @@ class JsonHttpResponse:
     status_code: int
     headers: dict[str, str]
     payload: dict[str, object]
+    pagination: dict[str, object] = field(default_factory=dict)
 
 
 class JsonHttpClient(Protocol):
@@ -179,7 +210,7 @@ class UrllibJsonHttpClient:
             ) from exc
         except URLError as exc:
             raise BrokerAdapterError(
-                f"KIS request failed: {exc.reason}",
+                safe_broker_error_message(exc.reason),
                 status_code=503,
                 classification=BrokerErrorClassification.NETWORK,
                 retryable=True,
@@ -202,6 +233,42 @@ class UrllibJsonHttpClient:
             self._last_request_started_at = now
 
 
+class _TokenInvalidatingJsonHttpClient:
+    def __init__(self, *, settings: Settings, delegate: JsonHttpClient) -> None:
+        self._settings = settings
+        self._delegate = delegate
+
+    def get_json(self, **kwargs: object) -> JsonHttpResponse:
+        return self._request(self._delegate.get_json, kwargs)
+
+    def post_json(self, **kwargs: object) -> JsonHttpResponse:
+        return self._request(self._delegate.post_json, kwargs)
+
+    def _request(self, operation, kwargs: dict[str, object]) -> JsonHttpResponse:
+        headers = kwargs.get("headers")
+        access_token = _bearer_token(headers if isinstance(headers, dict) else {})
+        try:
+            response = operation(**kwargs)
+        except BrokerAdapterError as exc:
+            raw_status = exc.response_metadata.get("status_code")
+            if access_token is not None and raw_status == 401:
+                invalidate_shared_kis_token(
+                    settings=self._settings,
+                    access_token=access_token,
+                )
+            raise
+        if (
+            access_token is not None
+            and response.status_code == 200
+            and response.payload.get("msg_cd") == "EGW00123"
+        ):
+            invalidate_shared_kis_token(
+                settings=self._settings,
+                access_token=access_token,
+            )
+        return response
+
+
 class KisBrokerAdapter(BrokerAdapter):
     provider = KIS_PROVIDER
 
@@ -212,9 +279,15 @@ class KisBrokerAdapter(BrokerAdapter):
         http_client: JsonHttpClient | None = None,
     ) -> None:
         self.settings = settings
-        self.http_client = http_client or UrllibJsonHttpClient(
+        delegate = http_client or UrllibJsonHttpClient(
             min_request_interval_seconds=settings.kis_min_request_interval_seconds,
         )
+        self.http_client = _TokenInvalidatingJsonHttpClient(
+            settings=settings,
+            delegate=delegate,
+        )
+        self._krx_calendar_cache: dict[date, tuple[bool, datetime]] = {}
+        self._krx_calendar_cache_lock = threading.Lock()
 
     def describe(self) -> BrokerConfig:
         api_base_url = _resolve_api_base_url(self.settings)
@@ -248,6 +321,7 @@ class KisBrokerAdapter(BrokerAdapter):
 
     def authenticate(self) -> BrokerTokenGrant:
         config = self._configured()
+        issuance_started_at = datetime.now(UTC)
         response = self.http_client.post_json(
             url=f"{config.api_base_url}{KIS_TOKEN_PATH}",
             headers=_json_headers(),
@@ -256,13 +330,15 @@ class KisBrokerAdapter(BrokerAdapter):
                 "appkey": self.settings.kis_app_key or "",
                 "appsecret": self.settings.kis_app_secret or "",
             },
-            timeout_seconds=self.settings.kis_request_timeout_seconds,
+            timeout_seconds=self.settings.kis_token_request_timeout_seconds,
         )
         access_token = _required_string(response.payload, "access_token")
         token_type = str(response.payload.get("token_type") or "Bearer")
         access_token_expires_at = _parse_expiration(
             response.payload.get("access_token_token_expired"),
             response.payload.get("expires_in"),
+            reference_at=issuance_started_at,
+            require_seconds=True,
         )
         refresh_token = _optional_string(response.payload.get("refresh_token"))
         refresh_token_expires_at = _parse_optional_expiration(
@@ -331,7 +407,11 @@ class KisBrokerAdapter(BrokerAdapter):
             "CANO": self.settings.kis_account_number or "",
             "ACNT_PRDT_CD": self.settings.kis_account_product_code,
             "PDNO": request.symbol,
-            "ORD_DVSN": _order_division(request.order_type, request.order_division),
+            "ORD_DVSN": _order_division(
+                request.order_type,
+                request.order_division,
+                request.time_in_force,
+            ),
             "ORD_QTY": str(request.quantity),
             "ORD_UNPR": _order_price(
                 request.order_type,
@@ -405,7 +485,7 @@ class KisBrokerAdapter(BrokerAdapter):
                 classification=BrokerErrorClassification.UNKNOWN,
                 request_metadata=request_metadata,
                 request_payload=request_payload,
-                response_payload=body,
+                response_payload=_safe_error_payload(body),
             )
 
         observed_at = datetime.now(UTC)
@@ -509,7 +589,7 @@ class KisBrokerAdapter(BrokerAdapter):
                 status_code=502,
                 request_metadata=request_metadata,
                 request_payload=request_payload,
-                response_payload=body,
+                response_payload=_safe_error_payload(body),
             )
         observed_at = datetime.now(UTC)
         return BrokerOrderPlacement(
@@ -624,18 +704,22 @@ class KisBrokerAdapter(BrokerAdapter):
 
         body = response.payload
         if _optional_string(body.get("rt_cd")) != "0":
+            raw_error_message = _error_message(body)
             raise BrokerAdapterError(
-                _error_message(body),
+                safe_broker_error_message(raw_error_message),
                 status_code=422,
                 classification=_classify_error(
                     status_code=400,
                     code=_optional_string(body.get("msg_cd")),
-                    message=_error_message(body),
+                    message=raw_error_message,
                 ),
                 retryable=False,
-                code=_optional_string(body.get("msg_cd")),
+                code=safe_broker_error_code(
+                    body.get("msg_cd"),
+                    provider=KIS_PROVIDER,
+                ),
                 request_metadata=request_metadata,
-                response_payload=body,
+                response_payload=_safe_error_payload(body),
                 observed_at=datetime.now(UTC),
             )
 
@@ -646,19 +730,81 @@ class KisBrokerAdapter(BrokerAdapter):
                 status_code=502,
                 classification=BrokerErrorClassification.UNKNOWN,
                 request_metadata=request_metadata,
-                response_payload=body,
+                response_payload=_safe_error_payload(body),
             )
 
         price = _parse_decimal(output.get("stck_prpr"))
         if price is None or price <= 0:
             return None
+        received_at = datetime.now(UTC)
         return BrokerCurrentPrice(
             symbol=symbol,
             exchange=exchange,
             price=price,
-            observed_at=datetime.now(UTC),
+            observed_at=received_at,
             payload=body,
+            freshness_source="transport_received_at_untrusted",
         )
+
+    def is_krx_trading_day(
+        self,
+        access_token: str,
+        *,
+        market_date: date,
+    ) -> bool | None:
+        now = datetime.now(UTC)
+        with self._krx_calendar_cache_lock:
+            cached = self._krx_calendar_cache.get(market_date)
+            if cached is not None and cached[1] > now:
+                return cached[0]
+        config = self._configured()
+        response = self.http_client.get_json(
+            url=f"{config.api_base_url}{KIS_HOLIDAY_CALENDAR_PATH}",
+            headers=self.build_headers(
+                access_token,
+                transaction_id=KIS_HOLIDAY_CALENDAR_TR_ID,
+            ),
+            params={
+                "BASS_DT": market_date.strftime("%Y%m%d"),
+                "CTX_AREA_NK": "",
+                "CTX_AREA_FK": "",
+            },
+            timeout_seconds=self.settings.kis_request_timeout_seconds,
+        )
+        _raise_if_business_error(response.payload)
+        output = response.payload.get("output")
+        rows = output if isinstance(output, list) else [output]
+        expected_date = market_date.strftime("%Y%m%d")
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            row_date = _optional_string(
+                row.get("bass_dt")
+                or row.get("BASS_DT")
+                or row.get("base_dt")
+                or row.get("BASE_DT")
+            )
+            if row_date != expected_date:
+                continue
+            open_flag = _optional_string(row.get("opnd_yn") or row.get("OPND_YN"))
+            if open_flag is None:
+                return None
+            normalized = open_flag.strip().upper()
+            if normalized in {"Y", "YES", "TRUE", "1"}:
+                result = True
+                break
+            if normalized in {"N", "NO", "FALSE", "0"}:
+                result = False
+                break
+            return None
+        else:
+            return None
+        with self._krx_calendar_cache_lock:
+            self._krx_calendar_cache[market_date] = (
+                result,
+                now + timedelta(hours=6),
+            )
+        return result
 
     def _get_us_equity_current_price(
         self,
@@ -668,34 +814,48 @@ class KisBrokerAdapter(BrokerAdapter):
         exchange: str,
     ) -> BrokerCurrentPrice | None:
         config = self._configured()
-        params = {"AUTH": "", "EXCD": _overseas_quote_exchange(exchange), "SYMB": symbol}
+        params = {
+            "AUTH": "",
+            "EXCD": _overseas_quote_exchange(exchange),
+            "SYMB": symbol,
+            "NMIN": "1",
+            "PINC": "0",
+            "NEXT": "",
+            "NREC": "1",
+            "FILL": "",
+            "KEYB": "",
+        }
         response = self.http_client.get_json(
-            url=f"{config.api_base_url}{KIS_OVERSEAS_CURRENT_PRICE_PATH}",
+            url=f"{config.api_base_url}{KIS_OVERSEAS_MINUTE_PRICE_PATH}",
             headers=self.build_headers(
                 access_token,
-                transaction_id=KIS_OVERSEAS_CURRENT_PRICE_TR_ID,
+                transaction_id=KIS_OVERSEAS_MINUTE_PRICE_TR_ID,
             ),
             params=params,
             timeout_seconds=self.settings.kis_request_timeout_seconds,
         )
         _raise_if_business_error(response.payload)
-        output = _first_payload_object(response.payload, "output", "output1")
-        if output is None:
+        output_rows = _payload_rows(response.payload.get("output2"))
+        if not output_rows:
             raise BrokerAdapterError(
-                "KIS overseas price response is missing output payload",
+                "KIS overseas minute price response is missing output2 payload",
                 status_code=502,
                 response_payload=response.payload,
             )
-        price = _first_decimal(output, "last", "stck_prpr", "clos")
-        if price is None or price <= 0:
-            return None
-        return BrokerCurrentPrice(
-            symbol=symbol,
-            exchange=exchange,
-            price=price,
-            observed_at=datetime.now(UTC),
-            payload=response.payload,
-        )
+        for output in output_rows:
+            price = _first_decimal(output, "last", "stck_prpr", "clos")
+            observed_at = _parse_overseas_bar_observed_at(output, exchange=exchange)
+            if price is None or price <= 0 or observed_at is None:
+                continue
+            return BrokerCurrentPrice(
+                symbol=symbol,
+                exchange=exchange,
+                price=price,
+                observed_at=observed_at,
+                payload=response.payload,
+                freshness_source="kis_overseas_exchange_bar_time",
+            )
+        return None
 
     def get_live_market_context(
         self,
@@ -705,6 +865,13 @@ class KisBrokerAdapter(BrokerAdapter):
         exchange: str = "KRX",
         reference_price: Decimal | None = None,
     ) -> BrokerLiveMarketContext | None:
+        if exchange.strip().upper() in {"NASD", "NYSE", "AMEX"}:
+            return self._get_us_equity_live_market_context(
+                access_token,
+                symbol=symbol,
+                exchange=exchange.strip().upper(),
+                reference_price=reference_price,
+            )
         config = self._configured()
         request_metadata = {
             "provider": self.provider,
@@ -744,18 +911,22 @@ class KisBrokerAdapter(BrokerAdapter):
 
         body = response.payload
         if _optional_string(body.get("rt_cd")) != "0":
+            raw_error_message = _error_message(body)
             raise BrokerAdapterError(
-                _error_message(body),
+                safe_broker_error_message(raw_error_message),
                 status_code=422,
                 classification=_classify_error(
                     status_code=400,
                     code=_optional_string(body.get("msg_cd")),
-                    message=_error_message(body),
+                    message=raw_error_message,
                 ),
                 retryable=False,
-                code=_optional_string(body.get("msg_cd")),
+                code=safe_broker_error_code(
+                    body.get("msg_cd"),
+                    provider=KIS_PROVIDER,
+                ),
                 request_metadata=request_metadata,
-                response_payload=body,
+                response_payload=_safe_error_payload(body),
                 observed_at=datetime.now(UTC),
             )
 
@@ -766,13 +937,18 @@ class KisBrokerAdapter(BrokerAdapter):
                 status_code=502,
                 classification=BrokerErrorClassification.UNKNOWN,
                 request_metadata=request_metadata,
-                response_payload=body,
+                response_payload=_safe_error_payload(body),
             )
 
         bid = _first_decimal(output, "bid", "bid_price", "best_bid", "bidp1", "bidp")
         ask = _first_decimal(output, "ask", "ask_price", "best_ask", "askp1", "askp")
         if bid is None and ask is None:
             return None
+        received_at = datetime.now(UTC)
+        exchange_observed_at = _parse_krx_orderbook_observed_at(
+            output,
+            received_at=received_at,
+        )
         spread = _spread(bid=bid, ask=ask)
         mid_price = _mid_price(bid=bid, ask=ask) or reference_price
         ask_depth = _first_decimal(output, "total_askp_rsqn", "askp_rsqn_tvol", "ask_depth")
@@ -785,7 +961,7 @@ class KisBrokerAdapter(BrokerAdapter):
         return BrokerLiveMarketContext(
             symbol=symbol,
             exchange=exchange,
-            observed_at=datetime.now(UTC),
+            observed_at=exchange_observed_at or received_at,
             bid=bid,
             ask=ask,
             spread=spread,
@@ -796,14 +972,237 @@ class KisBrokerAdapter(BrokerAdapter):
                 "provider": self.provider,
                 "endpoint": KIS_ASKING_PRICE_PATH,
                 "tr_id": KIS_ASKING_PRICE_TR_ID,
+                "field_sources": {
+                    "bid": {
+                        "field": _first_present_key(
+                            output, "bid", "bid_price", "best_bid", "bidp1", "bidp"
+                        ),
+                        "endpoint": KIS_ASKING_PRICE_PATH,
+                        "tr_id": KIS_ASKING_PRICE_TR_ID,
+                    },
+                    "ask": {
+                        "field": _first_present_key(
+                            output, "ask", "ask_price", "best_ask", "askp1", "askp"
+                        ),
+                        "endpoint": KIS_ASKING_PRICE_PATH,
+                        "tr_id": KIS_ASKING_PRICE_TR_ID,
+                    },
+                },
                 "response_metadata": {
                     "status_code": response.status_code,
                     "msg_cd": _optional_string(body.get("msg_cd")),
                     "msg1": _optional_string(body.get("msg1")),
-                    "received_at": datetime.now(UTC).isoformat(),
+                    "received_at": received_at.isoformat(),
                 },
                 "output": output,
             },
+            freshness_source=(
+                "kis_exchange_orderbook_time"
+                if exchange_observed_at is not None
+                else "transport_received_at_untrusted"
+            ),
+        )
+
+    def _get_us_equity_live_market_context(
+        self,
+        access_token: str,
+        *,
+        symbol: str,
+        exchange: str,
+        reference_price: Decimal | None,
+    ) -> BrokerLiveMarketContext | None:
+        config = self._configured()
+        quote_exchange = _overseas_quote_exchange(exchange)
+        response = self.http_client.get_json(
+            url=f"{config.api_base_url}{KIS_OVERSEAS_ASKING_PRICE_PATH}",
+            headers=self.build_headers(
+                access_token,
+                transaction_id=KIS_OVERSEAS_ASKING_PRICE_TR_ID,
+            ),
+            params={"AUTH": "", "EXCD": quote_exchange, "SYMB": symbol},
+            timeout_seconds=self.settings.kis_request_timeout_seconds,
+        )
+        _raise_if_business_error(response.payload)
+        rows = [
+            row
+            for key in ("output1", "output2", "output3", "output")
+            for row in _payload_rows(response.payload.get(key))
+        ]
+        expected_symbol = symbol.strip().upper()
+        expected_rsym = f"D{quote_exchange}{expected_symbol}"
+        identified_rows = [
+            row
+            for row in rows
+            if _optional_string(row.get("code") or row.get("CODE")) is not None
+            or _optional_string(row.get("rsym") or row.get("RSYM")) is not None
+        ]
+        identity_rows = [
+            row
+            for row in identified_rows
+            if (
+                (code := _optional_string(row.get("code") or row.get("CODE")))
+                is None
+                or code.strip().upper() == expected_symbol
+            )
+            and (
+                (rsym := _optional_string(row.get("rsym") or row.get("RSYM")))
+                is None
+                or rsym.strip().upper() == expected_rsym
+            )
+        ]
+        if not identity_rows or len(identity_rows) != len(identified_rows):
+            return None
+        bid, bid_field = _first_decimal_from_rows(
+            rows, "pbid1", "PBID1", "bidp1", "BIDP1"
+        )
+        ask, ask_field = _first_decimal_from_rows(
+            rows, "pask1", "PASK1", "askp1", "ASKP1"
+        )
+        observed_at = next(
+            (
+                parsed
+                for row in identity_rows
+                if (parsed := _parse_overseas_orderbook_observed_at(row, exchange=exchange))
+                is not None
+            ),
+            None,
+        )
+        if observed_at is None or (bid is None and ask is None):
+            return None
+        spread = _spread(bid=bid, ask=ask)
+        mid_price = _mid_price(bid=bid, ask=ask) or reference_price
+        local_observed = observed_at.astimezone(US_EASTERN_TIMEZONE)
+        local_time = local_observed.time()
+        normal_ordering_available = bool(
+            local_observed.weekday() < 5
+            and local_time >= datetime.min.time().replace(hour=9, minute=30)
+            and local_time < datetime.min.time().replace(hour=16)
+        )
+        return BrokerLiveMarketContext(
+            symbol=expected_symbol,
+            exchange=exchange,
+            observed_at=observed_at,
+            bid=bid,
+            ask=ask,
+            spread=spread,
+            spread_bps=_spread_bps(spread=spread, mid_price=mid_price),
+            normal_ordering_available=normal_ordering_available,
+            payload={
+                "provider": self.provider,
+                "endpoint": KIS_OVERSEAS_ASKING_PRICE_PATH,
+                "tr_id": KIS_OVERSEAS_ASKING_PRICE_TR_ID,
+                "requested_exchange": exchange,
+                "quote_exchange": quote_exchange,
+                "field_sources": {
+                    "bid": {
+                        "field": bid_field,
+                        "endpoint": KIS_OVERSEAS_ASKING_PRICE_PATH,
+                        "tr_id": KIS_OVERSEAS_ASKING_PRICE_TR_ID,
+                    },
+                    "ask": {
+                        "field": ask_field,
+                        "endpoint": KIS_OVERSEAS_ASKING_PRICE_PATH,
+                        "tr_id": KIS_OVERSEAS_ASKING_PRICE_TR_ID,
+                    },
+                },
+                "response_metadata": {
+                    "status_code": response.status_code,
+                    "msg_cd": _optional_string(response.payload.get("msg_cd")),
+                    "msg1": _optional_string(response.payload.get("msg1")),
+                },
+                "output1": response.payload.get("output1"),
+                "output2": response.payload.get("output2"),
+                "output3": response.payload.get("output3"),
+            },
+            freshness_source="kis_overseas_exchange_orderbook_time",
+        )
+
+    def get_intraday_liquidity_snapshot(
+        self,
+        access_token: str,
+        *,
+        symbol: str,
+        exchange: str = "KRX",
+        reference_at: datetime,
+    ) -> BrokerIntradayLiquiditySnapshot | None:
+        normalized_exchange = exchange.strip().upper()
+        if normalized_exchange not in {"KRX", "KOSPI", "KOSDAQ"}:
+            return None
+        reference_utc = (
+            reference_at.astimezone(UTC)
+            if reference_at.tzinfo is not None and reference_at.utcoffset() is not None
+            else None
+        )
+        if reference_utc is None:
+            return None
+        local_reference = reference_utc.astimezone(KIS_TIMEZONE)
+        config = self._configured()
+        response = self.http_client.get_json(
+            url=f"{config.api_base_url}{KIS_INTRADAY_MINUTE_PRICE_PATH}",
+            headers=self.build_headers(
+                access_token,
+                transaction_id=KIS_INTRADAY_MINUTE_PRICE_TR_ID,
+            ),
+            params={
+                "FID_COND_MRKT_DIV_CODE": "J",
+                "FID_INPUT_ISCD": symbol,
+                "FID_INPUT_HOUR_1": local_reference.strftime("%H%M%S"),
+                "FID_PW_DATA_INCU_YN": "N",
+                "FID_ETC_CLS_CODE": "",
+            },
+            timeout_seconds=self.settings.kis_request_timeout_seconds,
+        )
+        _raise_if_business_error(response.payload)
+        output1 = _first_payload_object(response.payload, "output1")
+        output2 = _payload_rows(response.payload.get("output2"))
+        if output1 is None or not output2 or not isinstance(output2[0], dict):
+            return None
+        latest = output2[0]
+        observed_at = _parse_krx_dated_observed_at(
+            latest.get("stck_bsop_date") or latest.get("STCK_BSOP_DATE"),
+            latest.get("stck_cntg_hour") or latest.get("STCK_CNTG_HOUR"),
+        )
+        if (
+            observed_at is None
+            or observed_at.astimezone(KIS_TIMEZONE).date() != local_reference.date()
+        ):
+            return None
+        minute_volume = _parse_decimal(latest.get("cntg_vol"))
+        turnover = _parse_decimal(latest.get("acml_tr_pbmn"))
+        volume = _parse_decimal(output1.get("acml_vol"))
+        day_high = _parse_decimal(output1.get("stck_hgpr"))
+        day_low = _parse_decimal(output1.get("stck_lwpr"))
+        if any(
+            value is None or value < 0
+            for value in (minute_volume, turnover, volume)
+        ) or any(
+            value is None or value <= 0
+            for value in (day_high, day_low)
+        ):
+            return None
+        if day_low > day_high:
+            return None
+        assert turnover is not None
+        assert volume is not None
+        assert day_high is not None
+        assert day_low is not None
+        return BrokerIntradayLiquiditySnapshot(
+            symbol=symbol,
+            exchange="KRX",
+            observed_at=observed_at,
+            volume=volume,
+            turnover=turnover,
+            day_high=day_high,
+            day_low=day_low,
+            payload={
+                "provider": self.provider,
+                "endpoint": KIS_INTRADAY_MINUTE_PRICE_PATH,
+                "tr_id": KIS_INTRADAY_MINUTE_PRICE_TR_ID,
+                "response_metadata": {
+                    "status_code": response.status_code,
+                },
+            },
+            freshness_source="kis_exchange_intraday_minute_time",
         )
 
     def get_account_snapshot(
@@ -814,15 +1213,16 @@ class KisBrokerAdapter(BrokerAdapter):
         reference_prices: dict[str, Decimal] | None = None,
         exchange: str = "KRX",
     ) -> BrokerAccountSnapshot:
-        if exchange in {"NASD", "NYSE", "AMEX"}:
+        normalized_exchange = exchange.strip().upper()
+        if normalized_exchange in KIS_US_EXCHANGES:
             return self._get_us_equity_account_snapshot(
                 access_token,
                 symbols=symbols,
                 reference_prices=reference_prices,
-                exchange=exchange,
+                exchange=normalized_exchange,
             )
         del symbols, reference_prices
-        if exchange != "KRX":
+        if normalized_exchange not in KIS_DOMESTIC_EXCHANGES:
             raise BrokerAdapterError(
                 f"unsupported exchange for account snapshot: {exchange}",
                 status_code=422,
@@ -837,7 +1237,8 @@ class KisBrokerAdapter(BrokerAdapter):
             )
 
         observed_at = datetime.now(UTC)
-        balance_response = self.http_client.get_json(
+        balance_response = _get_domestic_paginated_json(
+            http_client=self.http_client,
             url=f"{config.api_base_url}{KIS_BALANCE_PATH}",
             headers=self.build_headers(
                 access_token,
@@ -845,21 +1246,25 @@ class KisBrokerAdapter(BrokerAdapter):
             ),
             params=_balance_params(self.settings),
             timeout_seconds=self.settings.kis_request_timeout_seconds,
+            row_keys=("output1", "output2"),
         )
-        open_orders_response = self.http_client.get_json(
-            url=f"{config.api_base_url}{KIS_OPEN_ORDERS_PATH}",
-            headers=self.build_headers(
-                access_token,
-                transaction_id=_open_orders_transaction_id(self.settings.runtime_mode),
-            ),
-            params=_open_orders_params(self.settings, observed_at),
-            timeout_seconds=self.settings.kis_request_timeout_seconds,
-        )
-
         _raise_if_business_error(balance_response.payload)
         open_orders_error = None
         try:
-            _raise_if_business_error(open_orders_response.payload)
+            open_orders_response = _get_domestic_paginated_json(
+                http_client=self.http_client,
+                url=f"{config.api_base_url}{KIS_OPEN_ORDERS_PATH}",
+                headers=self.build_headers(
+                    access_token,
+                    transaction_id=_open_orders_transaction_id(self.settings.runtime_mode),
+                ),
+                params=_open_orders_params(
+                    self.settings,
+                    observed_at,
+                ),
+                timeout_seconds=self.settings.kis_request_timeout_seconds,
+                row_keys=("output1",),
+            )
         except BrokerAdapterError as exc:
             # KIS can reject the same-day open-order lookup with KIER2570 even
             # while the balance endpoint is healthy. Holdings and sellable
@@ -872,6 +1277,17 @@ class KisBrokerAdapter(BrokerAdapter):
                 "message": str(exc),
                 "degraded": True,
             }
+            open_orders_response = JsonHttpResponse(
+                status_code=exc.status_code or 422,
+                headers={},
+                payload=dict(exc.response_payload),
+                pagination={
+                    "complete": False,
+                    "page_count": None,
+                    "cursor_width": 100,
+                    "reason": "broker_rejected_daily_order_query",
+                },
+            )
         available_cash = _parse_available_cash(balance_response.payload)
         if available_cash is None:
             raise BrokerAdapterError(
@@ -883,6 +1299,40 @@ class KisBrokerAdapter(BrokerAdapter):
             )
 
         balance_summary = _parse_balance_summary(balance_response.payload)
+        holdings = _parse_holdings(balance_response.payload)
+        open_orders = (
+            []
+            if open_orders_error is not None
+            else _parse_open_orders(open_orders_response.payload)
+        )
+        holdings_parse = _collection_parse_diagnostics(
+            payload=balance_response.payload,
+            row_key="output1",
+            parsed_identities=[holding.symbol for holding in holdings],
+            assess_row=_assess_domestic_holding_row,
+        )
+        open_orders_parse = _collection_parse_diagnostics(
+            payload=open_orders_response.payload,
+            row_key="output1",
+            parsed_identities=[order.broker_order_id for order in open_orders],
+            assess_row=_assess_domestic_open_order_row,
+        )
+        holdings_complete = bool(
+            balance_response.pagination.get("complete") is True
+        ) and _collection_parse_complete(
+            payload=balance_response.payload,
+            row_key="output1",
+            diagnostics=holdings_parse,
+        )
+        open_orders_complete = (
+            open_orders_error is None
+            and open_orders_response.pagination.get("complete") is True
+            and _collection_parse_complete(
+                payload=open_orders_response.payload,
+                row_key="output1",
+                diagnostics=open_orders_parse,
+            )
+        )
         return BrokerAccountSnapshot(
             available_cash=available_cash,
             observed_at=observed_at,
@@ -891,16 +1341,28 @@ class KisBrokerAdapter(BrokerAdapter):
             previous_total_asset_value=balance_summary.get("previous_total_asset_value"),
             asset_change_amount=balance_summary.get("asset_change_amount"),
             unrealized_pnl=balance_summary.get("unrealized_pnl"),
-            holdings=_parse_holdings(balance_response.payload),
-            open_orders=(
-                []
-                if open_orders_error is not None
-                else _parse_open_orders(open_orders_response.payload)
-            ),
+            holdings=holdings,
+            open_orders=open_orders,
+            holdings_complete=holdings_complete,
+            open_orders_complete=open_orders_complete,
+            diagnostics={
+                "requested_exchange": normalized_exchange,
+                "holdings_pagination": dict(balance_response.pagination),
+                "open_orders_pagination": dict(open_orders_response.pagination),
+                "holdings_parse": holdings_parse,
+                "open_orders_parse": open_orders_parse,
+            },
             payload={
+                "exchange": normalized_exchange,
                 "balance": balance_response.payload,
                 "open_orders": open_orders_response.payload,
                 "open_orders_error": open_orders_error,
+                "holdings_coverage": (
+                    "complete" if holdings_complete else "incomplete"
+                ),
+                "open_orders_coverage": (
+                    "complete" if open_orders_complete else "incomplete"
+                ),
                 "account_number_masked": _mask_account(self.settings.kis_account_number),
             },
         )
@@ -966,7 +1428,10 @@ class KisBrokerAdapter(BrokerAdapter):
                 ),
                 timeout_seconds=self.settings.kis_request_timeout_seconds,
             )
-            _raise_if_business_error(buying_power_response.payload)
+            _require_kis_business_success(
+                buying_power_response.payload,
+                context="overseas account buying-power inquiry",
+            )
             buying_power = _parse_overseas_buying_power(symbol, buying_power_response.payload)
             if buying_power is not None:
                 symbol_buying_power[symbol] = buying_power
@@ -980,6 +1445,33 @@ class KisBrokerAdapter(BrokerAdapter):
             _parse_overseas_available_cash(balance_response.payload),
         )
         holdings = _parse_overseas_holdings(balance_response.payload)
+        open_orders = _parse_overseas_open_orders(open_orders_response.payload)
+        holdings_parse = _collection_parse_diagnostics(
+            payload=balance_response.payload,
+            row_key="output1",
+            parsed_identities=[holding.symbol for holding in holdings],
+            assess_row=_assess_overseas_holding_row,
+        )
+        open_orders_parse = _collection_parse_diagnostics(
+            payload=open_orders_response.payload,
+            row_key="output",
+            parsed_identities=[order.broker_order_id for order in open_orders],
+            assess_row=_assess_overseas_open_order_row,
+        )
+        holdings_complete = bool(
+            balance_response.pagination.get("complete") is True
+        ) and _collection_parse_complete(
+            payload=balance_response.payload,
+            row_key="output1",
+            diagnostics=holdings_parse,
+        )
+        open_orders_complete = bool(
+            open_orders_response.pagination.get("complete") is True
+        ) and _collection_parse_complete(
+            payload=open_orders_response.payload,
+            row_key="output",
+            diagnostics=open_orders_parse,
+        )
         unrealized_pnl = (
             None
             if any(holding.unrealized_pnl is None for holding in holdings)
@@ -1004,13 +1496,27 @@ class KisBrokerAdapter(BrokerAdapter):
             observed_at=observed_at,
             source=f"{self.provider}:us_equity_account_snapshot",
             holdings=holdings,
-            open_orders=_parse_overseas_open_orders(open_orders_response.payload),
+            open_orders=open_orders,
             symbol_buying_power=symbol_buying_power,
+            holdings_complete=holdings_complete,
+            open_orders_complete=open_orders_complete,
+            diagnostics={
+                "holdings_pagination": dict(balance_response.pagination),
+                "open_orders_pagination": dict(open_orders_response.pagination),
+                "holdings_parse": holdings_parse,
+                "open_orders_parse": open_orders_parse,
+            },
             payload={
                 "currency": "USD",
                 "exchange": exchange,
                 "balance": balance_response.payload,
                 "open_orders": open_orders_response.payload,
+                "holdings_coverage": (
+                    "complete" if holdings_complete else "incomplete"
+                ),
+                "open_orders_coverage": (
+                    "complete" if open_orders_complete else "incomplete"
+                ),
                 "account_number_masked": _mask_account(self.settings.kis_account_number),
             },
         )
@@ -1032,23 +1538,37 @@ class KisBrokerAdapter(BrokerAdapter):
         *,
         exchange: str = "KRX",
         submitted_at: datetime | None = None,
+        expected_symbol: str | None = None,
     ) -> dict[str, Any] | None:
+        normalized_submitted_at = (
+            _normalize_utc_datetime(submitted_at)
+            if submitted_at is not None
+            else None
+        )
         if exchange in {"NASD", "NYSE", "AMEX"}:
             return self._reconcile_us_equity_order(
                 access_token,
                 broker_order_id,
                 exchange=exchange,
-                submitted_at=submitted_at,
+                submitted_at=normalized_submitted_at,
+                expected_symbol=expected_symbol,
             )
         config = self._configured()
         observed_at = datetime.now(UTC)
-        transaction_id = _daily_ccld_transaction_id(self.settings.runtime_mode)
+        transaction_id = _daily_ccld_transaction_id(
+            self.settings.runtime_mode,
+            period_division=_daily_ccld_period_division(
+                submitted_at=normalized_submitted_at,
+                observed_at=observed_at,
+            ),
+        )
         params = _reconcile_order_params(
             self.settings,
             broker_order_id,
             observed_at,
             exchange=exchange,
-            submitted_at=submitted_at,
+            submitted_at=normalized_submitted_at,
+            expected_symbol=expected_symbol,
         )
         request_metadata = {
             "provider": self.provider,
@@ -1057,7 +1577,8 @@ class KisBrokerAdapter(BrokerAdapter):
             "params": params,
         }
         try:
-            response = self.http_client.get_json(
+            response = _get_domestic_paginated_json(
+                http_client=self.http_client,
                 url=f"{config.api_base_url}{KIS_DAILY_CCLD_PATH}",
                 headers=self.build_headers(
                     access_token,
@@ -1065,21 +1586,29 @@ class KisBrokerAdapter(BrokerAdapter):
                 ),
                 params=params,
                 timeout_seconds=self.settings.kis_request_timeout_seconds,
+                row_keys=("output1",),
             )
-            _raise_if_business_error(response.payload)
         except BrokerAdapterError as exc:
-            if exc.request_metadata is None:
+            if not exc.request_metadata:
                 exc.request_metadata = request_metadata
             raise
         normalized_order = _normalize_reconcile_order(
             response.payload,
             broker_order_id,
             observed_at=observed_at,
+            expected_symbol=expected_symbol,
+            expected_submitted_date=(
+                normalized_submitted_at.astimezone(KIS_TIMEZONE).date()
+                if normalized_submitted_at is not None
+                else observed_at.astimezone(KIS_TIMEZONE).date()
+            ),
+            expected_exchange=exchange,
         )
         if normalized_order is None:
             return {
                 "provider": self.provider,
                 "broker_order_id": broker_order_id,
+                "symbol": expected_symbol,
                 "status": "unknown",
                 "broker_status": "unknown",
                 "observed_at": observed_at.isoformat(),
@@ -1096,6 +1625,7 @@ class KisBrokerAdapter(BrokerAdapter):
         return {
             "provider": self.provider,
             "broker_order_id": broker_order_id,
+            "symbol": normalized_order["symbol"],
             "status": normalized_order["status"],
             "broker_status": normalized_order["broker_status"],
             "requested_quantity": normalized_order["requested_quantity"],
@@ -1103,6 +1633,8 @@ class KisBrokerAdapter(BrokerAdapter):
             "filled_quantity": normalized_order["filled_quantity"],
             "average_fill_price": normalized_order["average_fill_price"],
             "filled_at": normalized_order["filled_at"].isoformat(),
+            "fill_time_precision": normalized_order["fill_time_precision"],
+            "fill_time_source": normalized_order["fill_time_source"],
             "observed_at": normalized_order["observed_at"].isoformat(),
             "request_metadata": request_metadata,
             "response_metadata": {
@@ -1123,6 +1655,7 @@ class KisBrokerAdapter(BrokerAdapter):
         *,
         exchange: str,
         submitted_at: datetime | None,
+        expected_symbol: str | None,
     ) -> dict[str, Any]:
         config = self._configured()
         observed_at = datetime.now(UTC)
@@ -1148,15 +1681,28 @@ class KisBrokerAdapter(BrokerAdapter):
             row_key="output",
         )
         _raise_if_business_error(response.payload)
+        normalized_submitted_at = (
+            _normalize_utc_datetime(submitted_at)
+            if submitted_at is not None
+            else None
+        )
         normalized_order = _normalize_overseas_reconcile_order(
             response.payload,
             broker_order_id,
             observed_at=observed_at,
+            expected_symbol=expected_symbol,
+            expected_submitted_date=(
+                normalized_submitted_at.astimezone(US_EASTERN_TIMEZONE).date()
+                if normalized_submitted_at is not None
+                else observed_at.astimezone(US_EASTERN_TIMEZONE).date()
+            ),
+            expected_exchange=exchange,
         )
         if normalized_order is None:
             return {
                 "provider": self.provider,
                 "broker_order_id": broker_order_id,
+                "symbol": expected_symbol,
                 "status": "unknown",
                 "broker_status": "unknown",
                 "observed_at": observed_at.isoformat(),
@@ -1168,6 +1714,7 @@ class KisBrokerAdapter(BrokerAdapter):
         return {
             "provider": self.provider,
             "broker_order_id": broker_order_id,
+            "symbol": normalized_order["symbol"],
             "status": normalized_order["status"],
             "broker_status": normalized_order["broker_status"],
             "requested_quantity": normalized_order["requested_quantity"],
@@ -1175,6 +1722,8 @@ class KisBrokerAdapter(BrokerAdapter):
             "filled_quantity": normalized_order["filled_quantity"],
             "average_fill_price": normalized_order["average_fill_price"],
             "filled_at": normalized_order["filled_at"].isoformat(),
+            "fill_time_precision": normalized_order["fill_time_precision"],
+            "fill_time_source": normalized_order["fill_time_source"],
             "observed_at": observed_at.isoformat(),
             "request_metadata": request_metadata,
             "response_metadata": {"status_code": response.status_code},
@@ -1244,23 +1793,22 @@ def _reconcile_order_params(
     *,
     exchange: str = "KRX",
     submitted_at: datetime | None = None,
+    expected_symbol: str | None = None,
 ) -> dict[str, object]:
-    inquiry_end_date = observed_at.astimezone(KIS_TIMEZONE).date()
-    inquiry_start_date = (
-        submitted_at.astimezone(KIS_TIMEZONE).date()
+    inquiry_date = (
+        _normalize_utc_datetime(submitted_at).astimezone(KIS_TIMEZONE).date()
         if submitted_at is not None
-        else inquiry_end_date
+        else observed_at.astimezone(KIS_TIMEZONE).date()
     )
-    if inquiry_start_date > inquiry_end_date:
-        inquiry_start_date = inquiry_end_date
     normalized_exchange = exchange.strip().upper() or "KRX"
+    normalized_symbol = (expected_symbol or "").strip().upper()
     return {
         "CANO": settings.kis_account_number or "",
         "ACNT_PRDT_CD": settings.kis_account_product_code,
-        "INQR_STRT_DT": inquiry_start_date.strftime("%Y%m%d"),
-        "INQR_END_DT": inquiry_end_date.strftime("%Y%m%d"),
+        "INQR_STRT_DT": inquiry_date.strftime("%Y%m%d"),
+        "INQR_END_DT": inquiry_date.strftime("%Y%m%d"),
         "SLL_BUY_DVSN_CD": "00",
-        "PDNO": "",
+        "PDNO": normalized_symbol,
         "CCLD_DVSN": "00",
         "INQR_DVSN": "00",
         "INQR_DVSN_3": "00",
@@ -1278,15 +1826,36 @@ def _normalize_reconcile_order(
     broker_order_id: str,
     *,
     observed_at: datetime,
+    expected_symbol: str | None,
+    expected_submitted_date: date,
+    expected_exchange: str,
 ) -> dict[str, object] | None:
     rows = _payload_rows(payload.get("output1"))
+    normalized_expected_symbol = (expected_symbol or "").strip().upper()
+    normalized_expected_exchange = expected_exchange.strip().upper()
+    expected_date = expected_submitted_date.strftime("%Y%m%d")
+    if not normalized_expected_symbol or not normalized_expected_exchange:
+        return None
     for row in rows:
-        row_order_id = _optional_string(row.get("odno")) or _optional_string(
-            row.get("ord_no")
+        row_order_id = _optional_string(
+            _case_insensitive_value(row, "odno", "ord_no")
         )
         if row_order_id != broker_order_id:
             continue
-        return _extract_reconcile_order_info(
+        row_symbol = _optional_string(_case_insensitive_value(row, "pdno"))
+        row_date = _optional_string(_case_insensitive_value(row, "ord_dt"))
+        row_exchange = _optional_string(
+            _case_insensitive_value(row, "excg_id_dvsn_cd")
+        )
+        if (
+            row_symbol is None
+            or row_symbol.strip().upper() != normalized_expected_symbol
+            or row_date != expected_date
+            or row_exchange is None
+            or row_exchange.strip().upper() != normalized_expected_exchange
+        ):
+            continue
+        normalized = _extract_reconcile_order_info(
             row,
             observed_at=observed_at,
             raw_status=(
@@ -1296,6 +1865,14 @@ def _normalize_reconcile_order(
                 or _optional_string(row.get("ord_sts_name"))
             ),
         )
+        if normalized is None:
+            return None
+        return {
+            **normalized,
+            "symbol": row_symbol.strip().upper(),
+            "exchange": row_exchange.strip().upper(),
+            "submitted_date": row_date,
+        }
     return None
 
 
@@ -1304,18 +1881,47 @@ def _normalize_overseas_reconcile_order(
     broker_order_id: str,
     *,
     observed_at: datetime,
+    expected_symbol: str | None,
+    expected_submitted_date: date,
+    expected_exchange: str,
 ) -> dict[str, object] | None:
+    normalized_expected_symbol = (expected_symbol or "").strip().upper()
+    normalized_expected_exchange = _normalized_kis_us_exchange(expected_exchange)
+    expected_date = expected_submitted_date.strftime("%Y%m%d")
+    if not normalized_expected_symbol or normalized_expected_exchange is None:
+        return None
     for row in _payload_rows(payload.get("output")):
-        row_order_id = _optional_string(row.get("odno")) or _optional_string(row.get("ord_no"))
+        row_order_id = _optional_string(
+            _case_insensitive_value(row, "odno", "ord_no")
+        )
         if row_order_id != broker_order_id:
             continue
-        requested_quantity = _parse_int(row.get("ft_ord_qty")) or _parse_int(row.get("ord_qty"))
-        if requested_quantity is None or requested_quantity <= 0:
+        row_symbol = _optional_string(_case_insensitive_value(row, "pdno"))
+        row_date = _optional_string(_case_insensitive_value(row, "ord_dt"))
+        row_exchange = _normalized_kis_us_exchange(
+            _case_insensitive_value(
+                row,
+                "ovrs_excg_cd",
+                "excg_cd",
+                "excg_id_dvsn_cd",
+            )
+        )
+        if (
+            row_symbol is None
+            or row_symbol.strip().upper() != normalized_expected_symbol
+            or row_date != expected_date
+            or row_exchange != normalized_expected_exchange
+        ):
+            continue
+        quantities = _extract_reconcile_quantities(
+            row,
+            requested_keys=("ft_ord_qty", "ord_qty"),
+            filled_keys=("ft_ccld_qty",),
+            remaining_keys=("nccs_qty",),
+        )
+        if quantities is None:
             return None
-        filled_quantity = _parse_int(row.get("ft_ccld_qty")) or 0
-        remaining_quantity = _parse_int(row.get("nccs_qty"))
-        if remaining_quantity is None:
-            remaining_quantity = max(requested_quantity - filled_quantity, 0)
+        requested_quantity, filled_quantity, remaining_quantity = quantities
         raw_status = (
             _rejection_status_from_order_kind(row)
             or _optional_string(row.get("prcs_stat_name"))
@@ -1327,7 +1933,17 @@ def _normalize_overseas_reconcile_order(
             remaining_quantity=remaining_quantity,
             filled_quantity=filled_quantity,
         )
+        if not _reconcile_status_matches_quantities(
+            status=status,
+            requested_quantity=requested_quantity,
+            filled_quantity=filled_quantity,
+            remaining_quantity=remaining_quantity,
+        ):
+            return None
         return {
+            "symbol": row_symbol.strip().upper(),
+            "exchange": row_exchange,
+            "submitted_date": row_date,
             "status": status,
             "broker_status": raw_status or status,
             "requested_quantity": requested_quantity,
@@ -1339,12 +1955,29 @@ def _normalize_overseas_reconcile_order(
                 "avg_pric",
                 "ft_ord_unpr3",
             ),
-            "filled_at": _reconcile_filled_timestamp(row, observed_at=observed_at),
+            # This cumulative order row exposes order time, not execution time.
+            # Use the poll timestamp as an upper bound and preserve the weaker
+            # chronology explicitly so risk gates cannot treat it as exact.
+            "filled_at": observed_at,
+            "fill_time_precision": "observed_upper_bound",
+            "fill_time_source": "reconciliation_observed_at",
             "raw": _safe_reconcile_payload(row),
             "observed_at": observed_at,
             "message": None,
         }
     return None
+
+
+def _normalized_kis_us_exchange(value: object) -> str | None:
+    normalized = str(value or "").strip().upper()
+    canonical = {
+        "NAS": "NASD",
+        "NASDAQ": "NASD",
+        "NYS": "NYSE",
+        "NEWYORK": "NYSE",
+        "AMS": "AMEX",
+    }.get(normalized, normalized)
+    return canonical if canonical in KIS_US_EXCHANGES else None
 
 
 def _extract_reconcile_order_info(
@@ -1353,17 +1986,28 @@ def _extract_reconcile_order_info(
     observed_at: datetime,
     raw_status: str | None,
 ) -> dict[str, object] | None:
-    requested_quantity = _parse_int(row.get("ord_qty"))
-    if requested_quantity is None or requested_quantity <= 0:
+    quantities = _extract_reconcile_quantities(
+        row,
+        requested_keys=("ord_qty",),
+        filled_keys=("tot_ccld_qty",),
+        remaining_keys=("rmn_qty", "ord_uncc_qty", "nccs_qty"),
+    )
+    if quantities is None:
         return None
-    filled_quantity = _parse_int(row.get("tot_ccld_qty")) or 0
-    remaining_quantity = _remaining_order_quantity(row, requested_quantity)
+    requested_quantity, filled_quantity, remaining_quantity = quantities
     status = _normalize_reconcile_status(
         raw_status=raw_status,
         requested_quantity=requested_quantity,
         remaining_quantity=remaining_quantity,
         filled_quantity=filled_quantity,
     )
+    if not _reconcile_status_matches_quantities(
+        status=status,
+        requested_quantity=requested_quantity,
+        filled_quantity=filled_quantity,
+        remaining_quantity=remaining_quantity,
+    ):
+        return None
     average_fill_price = (
         _parse_decimal(row.get("avg_upr"))
         or _parse_decimal(row.get("trd_prc"))
@@ -1371,7 +2015,6 @@ def _extract_reconcile_order_info(
         or _parse_decimal(row.get("avg_prvs"))
         or _parse_decimal(row.get("ord_unpr"))
     )
-    filled_at = _reconcile_filled_timestamp(row, observed_at=observed_at)
     return {
         "status": status,
         "broker_status": raw_status or status,
@@ -1379,11 +2022,80 @@ def _extract_reconcile_order_info(
         "remaining_quantity": remaining_quantity,
         "filled_quantity": filled_quantity,
         "average_fill_price": average_fill_price,
-        "filled_at": filled_at,
+        # KIS daily cumulative order history does not prove individual fill
+        # time. ord_tmd/ord_dt describe submission and remain only in raw.
+        "filled_at": observed_at,
+        "fill_time_precision": "observed_upper_bound",
+        "fill_time_source": "reconciliation_observed_at",
         "raw": _safe_reconcile_payload(row),
         "observed_at": observed_at,
         "message": None,
     }
+
+
+def _extract_reconcile_quantities(
+    row: dict[str, object],
+    *,
+    requested_keys: tuple[str, ...],
+    filled_keys: tuple[str, ...],
+    remaining_keys: tuple[str, ...],
+) -> tuple[int, int, int] | None:
+    requested_quantity, requested_supplied = _first_integral_evidence(
+        row,
+        requested_keys,
+    )
+    if (
+        not requested_supplied
+        or requested_quantity is None
+        or requested_quantity <= 0
+    ):
+        return None
+
+    filled_quantity, filled_supplied = _first_integral_evidence(row, filled_keys)
+    if filled_supplied and filled_quantity is None:
+        return None
+    if filled_quantity is None:
+        filled_quantity = 0
+
+    remaining_quantity, remaining_supplied = _first_integral_evidence(
+        row,
+        remaining_keys,
+    )
+    if remaining_supplied and remaining_quantity is None:
+        return None
+    if remaining_quantity is None:
+        remaining_quantity = requested_quantity - filled_quantity
+
+    if not (
+        0 <= filled_quantity <= requested_quantity
+        and 0 <= remaining_quantity <= requested_quantity
+        and filled_quantity + remaining_quantity <= requested_quantity
+    ):
+        return None
+    return requested_quantity, filled_quantity, remaining_quantity
+
+
+def _reconcile_status_matches_quantities(
+    *,
+    status: str,
+    requested_quantity: int,
+    filled_quantity: int,
+    remaining_quantity: int,
+) -> bool:
+    if status == "filled":
+        return filled_quantity == requested_quantity and remaining_quantity == 0
+    if status == "partially_filled":
+        return (
+            0 < filled_quantity < requested_quantity
+            and filled_quantity + remaining_quantity == requested_quantity
+        )
+    if status == "open":
+        return filled_quantity == 0 and remaining_quantity == requested_quantity
+    if status in {"submission_pending", "retry_pending"}:
+        return filled_quantity == 0 and remaining_quantity == requested_quantity
+    if status in {"canceled", "rejected", "failed", "expired"}:
+        return remaining_quantity == 0
+    return False
 
 
 def _normalize_reconcile_status(
@@ -1448,62 +2160,6 @@ def _rejection_status_from_order_kind(row: dict[str, object]) -> str | None:
     return None
 
 
-def _reconcile_filled_timestamp(
-    row: dict[str, object],
-    *,
-    observed_at: datetime,
-) -> datetime:
-    for time_value, date_value in (
-        (row.get("ord_tmd"), row.get("ord_dt")),
-        (row.get("ord_time"), row.get("ord_dt")),
-        (row.get("ord_dtm"), None),
-        (row.get("trad_dt"), row.get("ord_dt")),
-    ):
-        if not isinstance(time_value, str):
-            continue
-        timestamp = _parse_reconcile_datetime(
-            time_value=time_value,
-            date_value=_optional_string(date_value),
-            observed_at=observed_at,
-        )
-        if timestamp is not None:
-            return timestamp
-    return observed_at
-
-
-def _parse_reconcile_datetime(
-    *,
-    time_value: str,
-    date_value: str | None,
-    observed_at: datetime,
-) -> datetime | None:
-    normalized_time = time_value.replace(":", "").replace("-", "").replace(" ", "")
-    if date_value is not None:
-        candidate = f"{date_value}{normalized_time}".replace(" ", "")
-        for fmt in ("%Y%m%d%H%M%S", "%Y%m%d%H%M%S%f"):
-            try:
-                return (
-                    datetime.strptime(candidate, fmt)
-                    .replace(tzinfo=KIS_TIMEZONE)
-                    .astimezone(UTC)
-                )
-            except ValueError:
-                pass
-    for fmt in ("%H%M%S", "%H%M%S%f"):
-        try:
-            parsed = datetime.strptime(normalized_time, fmt)
-            observed_local = observed_at.astimezone(KIS_TIMEZONE)
-            return observed_local.replace(
-                hour=parsed.hour,
-                minute=parsed.minute,
-                second=parsed.second,
-                microsecond=parsed.microsecond,
-            ).astimezone(UTC)
-        except ValueError:
-            pass
-    return None
-
-
 def _safe_reconcile_payload(payload: object) -> dict[str, object]:
     if not isinstance(payload, dict):
         return {}
@@ -1530,6 +2186,21 @@ def _json_headers() -> dict[str, str]:
     }
 
 
+def _bearer_token(headers: dict[str, object]) -> str | None:
+    authorization = next(
+        (
+            value
+            for key, value in headers.items()
+            if str(key).lower() == "authorization"
+        ),
+        None,
+    )
+    if not isinstance(authorization, str) or not authorization.startswith("Bearer "):
+        return None
+    token = authorization.removeprefix("Bearer ")
+    return token or None
+
+
 def _required_string(payload: dict[str, object], key: str) -> str:
     value = payload.get(key)
     if not isinstance(value, str) or not value.strip():
@@ -1543,20 +2214,212 @@ def _optional_string(value: object) -> str | None:
     return None
 
 
+def _case_insensitive_value(
+    payload: dict[str, object],
+    *expected_keys: str,
+) -> object | None:
+    expected = {key.casefold() for key in expected_keys}
+    matches = [
+        value
+        for key, value in payload.items()
+        if str(key).casefold() in expected
+    ]
+    if not matches or any(value != matches[0] for value in matches[1:]):
+        return None
+    return matches[0]
+
+
+def _parse_krx_orderbook_observed_at(
+    output: dict[str, object],
+    *,
+    received_at: datetime,
+) -> datetime | None:
+    raw_time = _optional_string(
+        output.get("aspr_acpt_hour") or output.get("ASPR_ACPT_HOUR")
+    )
+    if (
+        raw_time is None
+        or len(raw_time) != 6
+        or not raw_time.isascii()
+        or not raw_time.isdigit()
+    ):
+        return None
+    try:
+        parsed_time = datetime.strptime(raw_time, "%H%M%S").time()
+    except ValueError:
+        return None
+    normalized_received_at = (
+        received_at if received_at.tzinfo is not None else received_at.replace(tzinfo=UTC)
+    )
+    krx_date = normalized_received_at.astimezone(KIS_TIMEZONE).date()
+    return datetime.combine(
+        krx_date,
+        parsed_time,
+        tzinfo=KIS_TIMEZONE,
+    ).astimezone(UTC)
+
+
+def _parse_krx_dated_observed_at(
+    raw_date: object,
+    raw_time: object,
+) -> datetime | None:
+    if (
+        not isinstance(raw_date, str)
+        or not isinstance(raw_time, str)
+        or len(raw_date) != 8
+        or len(raw_time) != 6
+        or not raw_date.isascii()
+        or not raw_time.isascii()
+        or not raw_date.isdigit()
+        or not raw_time.isdigit()
+    ):
+        return None
+    try:
+        local = datetime.strptime(
+            f"{raw_date}{raw_time}",
+            "%Y%m%d%H%M%S",
+        ).replace(tzinfo=KIS_TIMEZONE)
+    except ValueError:
+        return None
+    return local.astimezone(UTC)
+
+
+def _parse_overseas_bar_observed_at(
+    output: dict[str, object],
+    *,
+    exchange: str,
+) -> datetime | None:
+    raw_date = _optional_string(output.get("xymd") or output.get("XYMD"))
+    raw_time = _optional_string(output.get("xhms") or output.get("XHMS"))
+    if raw_date is None or raw_time is None:
+        return None
+    if (
+        len(raw_date) != 8
+        or not raw_date.isascii()
+        or not raw_date.isdigit()
+        or len(raw_time) != 6
+        or not raw_time.isascii()
+        or not raw_time.isdigit()
+    ):
+        return None
+    try:
+        local = datetime.strptime(
+            f"{raw_date}{raw_time}",
+            "%Y%m%d%H%M%S",
+        ).replace(tzinfo=US_EASTERN_TIMEZONE)
+    except ValueError:
+        return None
+    if exchange not in {"NASD", "NYSE", "AMEX"}:
+        return None
+    return local.astimezone(UTC)
+
+
+def _parse_overseas_orderbook_observed_at(
+    output: dict[str, object],
+    *,
+    exchange: str,
+) -> datetime | None:
+    if exchange not in {"NASD", "NYSE", "AMEX"}:
+        return None
+    raw_date = _optional_string(output.get("dymd") or output.get("DYMD"))
+    raw_time = _optional_string(output.get("dhms") or output.get("DHMS"))
+    if (
+        raw_date is None
+        or raw_time is None
+        or len(raw_date) != 8
+        or len(raw_time) != 6
+        or not raw_date.isascii()
+        or not raw_time.isascii()
+        or not raw_date.isdigit()
+        or not raw_time.isdigit()
+    ):
+        return None
+    try:
+        local = datetime.strptime(
+            f"{raw_date}{raw_time}",
+            "%Y%m%d%H%M%S",
+        ).replace(tzinfo=US_EASTERN_TIMEZONE)
+    except ValueError:
+        return None
+    return local.astimezone(UTC)
+
+
 def _parse_optional_expiration(explicit: object, seconds: object) -> datetime | None:
     if explicit is None and seconds is None:
         return None
     return _parse_expiration(explicit, seconds)
 
 
-def _parse_expiration(explicit: object, seconds: object) -> datetime:
-    if isinstance(explicit, str) and explicit.strip():
-        return datetime.strptime(explicit, "%Y-%m-%d %H:%M:%S").replace(tzinfo=KIS_TIMEZONE)
+def _parse_expiration(
+    explicit: object,
+    seconds: object,
+    *,
+    reference_at: datetime | None = None,
+    require_seconds: bool = False,
+) -> datetime:
+    parsed_seconds = _parse_token_expiry_seconds(seconds)
+    if require_seconds and parsed_seconds is None:
+        raise BrokerAdapterError(
+            "KIS response contains invalid access token expiry metadata",
+            status_code=502,
+        )
+    expires_at = (
+        _as_utc_datetime(reference_at or datetime.now(UTC))
+        + timedelta(seconds=parsed_seconds)
+        if parsed_seconds is not None
+        else None
+    )
+    if explicit is not None:
+        parsed = _parse_kis_token_expiry(explicit)
+        if parsed is None:
+            raise BrokerAdapterError(
+                "KIS response contains invalid access token expiry metadata",
+                status_code=502,
+            )
+        expires_at = parsed if expires_at is None else min(expires_at, parsed)
 
-    if isinstance(seconds, (int, float)):
-        return datetime.now(UTC) + timedelta(seconds=float(seconds))
+    if expires_at is not None:
+        return expires_at
 
     raise BrokerAdapterError("KIS response is missing access token expiry metadata", status_code=502)
+
+
+def _parse_token_expiry_seconds(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        parsed = value
+    elif (
+        isinstance(value, str)
+        and len(value) <= 6
+        and value.isascii()
+        and value.isdigit()
+    ):
+        parsed = int(value)
+    else:
+        return None
+    return parsed if 0 < parsed <= 172_800 else None
+
+
+def _parse_kis_token_expiry(value: object) -> datetime | None:
+    if (
+        not isinstance(value, str)
+        or _KIS_TOKEN_EXPIRY_PATTERN.fullmatch(value) is None
+    ):
+        return None
+    try:
+        parsed = datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+    except (OverflowError, ValueError):
+        return None
+    if parsed.strftime("%Y-%m-%d %H:%M:%S") != value:
+        return None
+    return parsed.replace(tzinfo=KIS_TIMEZONE).astimezone(UTC)
+
+
+def _as_utc_datetime(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
 
 
 def _parse_json_payload(raw_body: str) -> dict[str, object]:
@@ -1584,10 +2447,11 @@ def _http_error(
     raw_body: str,
 ) -> BrokerAdapterError:
     payload = _parse_http_payload(raw_body)
+    raw_error_message = _error_message(payload)
     classification = _classify_error(
         status_code=status_code,
-        code=_optional_string(payload.get("msg_cd")),
-        message=_error_message(payload),
+        code=safe_broker_error_code(payload.get("msg_cd"), provider=KIS_PROVIDER),
+        message=raw_error_message,
     )
     retryable = classification in {
         BrokerErrorClassification.NETWORK,
@@ -1600,17 +2464,19 @@ def _http_error(
         else NormalizedBrokerOrderStatus.REJECTED
     )
     return BrokerAdapterError(
-        _error_message(payload),
+        safe_broker_error_message(raw_error_message),
         status_code=503 if retryable else 422,
         classification=classification,
         retryable=retryable,
-        code=_optional_string(payload.get("msg_cd")),
+        code=safe_broker_error_code(payload.get("msg_cd"), provider=KIS_PROVIDER),
         normalized_status=normalized_status,
-        response_metadata={
-            "status_code": status_code,
-            "headers": _sanitize_headers(headers),
-        },
-        response_payload=payload,
+        response_metadata=_safe_error_payload(
+            {
+                "status_code": status_code,
+                "headers": _sanitize_headers(headers),
+            }
+        ),
+        response_payload=_safe_error_payload(payload),
         observed_at=datetime.now(UTC),
     )
 
@@ -1621,10 +2487,15 @@ def _parse_http_payload(raw_body: str) -> dict[str, object]:
     try:
         parsed = json.loads(raw_body)
     except json.JSONDecodeError:
-        return {"detail": raw_body}
+        return {"body_diagnostic": safe_broker_error_message(raw_body)}
     if isinstance(parsed, dict):
         return parsed
-    return {"detail": raw_body}
+    return {"body_diagnostic": safe_broker_error_message(raw_body)}
+
+
+def _safe_error_payload(payload: object) -> dict[str, object]:
+    sanitized = sanitize_broker_error_payload(payload)
+    return dict(sanitized) if isinstance(sanitized, dict) else {}
 
 
 def _classify_error(
@@ -1668,9 +2539,17 @@ def _classify_error(
     return BrokerErrorClassification.UNKNOWN
 
 
-def _order_division(order_type: str, order_division: str | None = None) -> str:
+def _order_division(
+    order_type: str,
+    order_division: str | None = None,
+    time_in_force: str = "day",
+) -> str:
     if order_division is not None:
         return order_division
+    if order_type == "limit" and time_in_force == "ioc":
+        # KIS domestic cash-order contract: 11 = IOC limit
+        # (immediate execution, cancel any remainder).
+        return "11"
     if order_type == "limit":
         return "00"
     if order_type == "market":
@@ -1722,6 +2601,26 @@ def _first_decimal(payload: dict[str, object], *keys: str) -> Decimal | None:
         if value is not None:
             return value
     return None
+
+
+def _first_present_key(payload: dict[str, object], *keys: str) -> str | None:
+    for key in keys:
+        value = payload.get(key)
+        if key in payload and value is not None and value != "":
+            return key
+    return None
+
+
+def _first_decimal_from_rows(
+    rows: list[dict[str, object]],
+    *keys: str,
+) -> tuple[Decimal | None, str | None]:
+    for row in rows:
+        for key in keys:
+            value = _parse_decimal(row.get(key))
+            if value is not None:
+                return value, key
+    return None, None
 
 
 def _sum_numbered_decimal(payload: dict[str, object], prefix: str, levels: int) -> Decimal | None:
@@ -1784,9 +2683,10 @@ def _parse_decimal(value: object) -> Decimal | None:
     if value is None:
         return None
     try:
-        return Decimal(str(value))
+        parsed = Decimal(str(value))
     except (InvalidOperation, ValueError):
         return None
+    return parsed if parsed.is_finite() else None
 
 
 def _transaction_id(runtime_mode: str, side: str) -> str:
@@ -1853,6 +2753,128 @@ def _overseas_open_orders_transaction_id(runtime_mode: str) -> str:
     return "TTTS3018R" if runtime_mode == "live" else "VTTS3018R"
 
 
+def _get_kis_paginated_json(
+    *,
+    http_client: JsonHttpClient,
+    url: str,
+    headers: dict[str, str],
+    params: dict[str, object],
+    timeout_seconds: int,
+    row_keys: tuple[str, ...],
+    cursor_width: int,
+    market_label: str,
+    max_pages: int = 20,
+) -> JsonHttpResponse:
+    request_params = dict(params)
+    request_headers = dict(headers)
+    aggregate: dict[str, object] | None = None
+    last_response: JsonHttpResponse | None = None
+    seen_cursors: set[tuple[str, str]] = set()
+    for page_index in range(max_pages):
+        response = http_client.get_json(
+            url=url,
+            headers=request_headers,
+            params=request_params,
+            timeout_seconds=timeout_seconds,
+        )
+        _require_kis_business_success(
+            response.payload,
+            context=f"{market_label} paginated inquiry",
+        )
+        last_response = response
+        if aggregate is None:
+            aggregate = dict(response.payload)
+        else:
+            for row_key in row_keys:
+                page_rows = _payload_collection_items(response.payload.get(row_key))
+                if not page_rows:
+                    continue
+                existing_rows = _payload_collection_items(aggregate.get(row_key))
+                aggregate[row_key] = [*existing_rows, *page_rows]
+
+        continuation = str(
+            response.headers.get("tr_cont")
+            or response.headers.get("TR_CONT")
+            or ""
+        ).strip().upper()
+        if continuation in {"D", "E"}:
+            return JsonHttpResponse(
+                status_code=response.status_code,
+                headers=response.headers,
+                payload=aggregate,
+                pagination={
+                    "complete": True,
+                    "page_count": page_index + 1,
+                    "cursor_width": cursor_width,
+                },
+            )
+        if continuation not in {"F", "M"}:
+            continuation_label = continuation or "missing"
+            raise BrokerAdapterError(
+                f"KIS {market_label} pagination invalid continuation state: "
+                f"{continuation_label}",
+                status_code=502,
+                classification=BrokerErrorClassification.UNKNOWN,
+                response_payload=response.payload,
+            )
+        cursor = _pagination_cursor(response.payload, cursor_width=cursor_width)
+        if cursor is None:
+            raise BrokerAdapterError(
+                f"KIS {market_label} response requested continuation without cursor fields",
+                status_code=502,
+                classification=BrokerErrorClassification.UNKNOWN,
+                response_payload=response.payload,
+            )
+        if cursor in seen_cursors:
+            raise BrokerAdapterError(
+                f"KIS {market_label} pagination repeated continuation cursor",
+                status_code=502,
+                classification=BrokerErrorClassification.UNKNOWN,
+                response_payload=response.payload,
+            )
+        seen_cursors.add(cursor)
+        request_params[f"CTX_AREA_FK{cursor_width}"], request_params[
+            f"CTX_AREA_NK{cursor_width}"
+        ] = cursor
+        request_headers["tr_cont"] = "N"
+        if page_index == max_pages - 1:
+            raise BrokerAdapterError(
+                f"KIS {market_label} pagination exceeded {max_pages} pages",
+                status_code=502,
+                classification=BrokerErrorClassification.UNKNOWN,
+            )
+    if aggregate is None or last_response is None:
+        raise BrokerAdapterError(
+            f"KIS {market_label} pagination returned no response",
+            status_code=502,
+            classification=BrokerErrorClassification.UNKNOWN,
+        )
+    return JsonHttpResponse(last_response.status_code, last_response.headers, aggregate)
+
+
+def _get_domestic_paginated_json(
+    *,
+    http_client: JsonHttpClient,
+    url: str,
+    headers: dict[str, str],
+    params: dict[str, object],
+    timeout_seconds: int,
+    row_keys: tuple[str, ...],
+    max_pages: int = 20,
+) -> JsonHttpResponse:
+    return _get_kis_paginated_json(
+        http_client=http_client,
+        url=url,
+        headers=headers,
+        params=params,
+        timeout_seconds=timeout_seconds,
+        row_keys=row_keys,
+        cursor_width=100,
+        market_label="domestic",
+        max_pages=max_pages,
+    )
+
+
 def _get_overseas_paginated_json(
     *,
     http_client: JsonHttpClient,
@@ -1863,65 +2885,24 @@ def _get_overseas_paginated_json(
     row_key: str,
     max_pages: int = 20,
 ) -> JsonHttpResponse:
-    request_params = dict(params)
-    request_headers = dict(headers)
-    aggregate: dict[str, object] | None = None
-    last_response: JsonHttpResponse | None = None
-    for page_index in range(max_pages):
-        response = http_client.get_json(
-            url=url,
-            headers=request_headers,
-            params=request_params,
-            timeout_seconds=timeout_seconds,
-        )
-        _raise_if_business_error(response.payload)
-        last_response = response
-        if aggregate is None:
-            aggregate = dict(response.payload)
-        elif isinstance(response.payload.get(row_key), list):
-            existing = aggregate.get(row_key)
-            if not isinstance(existing, list):
-                existing = []
-                aggregate[row_key] = existing
-            existing.extend(response.payload[row_key])
-
-        continuation = str(
-            response.headers.get("tr_cont")
-            or response.headers.get("TR_CONT")
-            or ""
-        ).strip().upper()
-        if continuation not in {"F", "M"}:
-            return JsonHttpResponse(
-                status_code=response.status_code,
-                headers=response.headers,
-                payload=aggregate,
-            )
-        cursor = _overseas_cursor(response.payload)
-        if cursor is None:
-            raise BrokerAdapterError(
-                "KIS overseas response requested continuation without cursor fields",
-                status_code=502,
-                classification=BrokerErrorClassification.UNKNOWN,
-                response_payload=response.payload,
-            )
-        request_params["CTX_AREA_FK200"], request_params["CTX_AREA_NK200"] = cursor
-        request_headers["tr_cont"] = "N"
-        if page_index == max_pages - 1:
-            raise BrokerAdapterError(
-                f"KIS overseas pagination exceeded {max_pages} pages",
-                status_code=502,
-                classification=BrokerErrorClassification.UNKNOWN,
-            )
-    if aggregate is None or last_response is None:
-        raise BrokerAdapterError(
-            "KIS overseas pagination returned no response",
-            status_code=502,
-            classification=BrokerErrorClassification.UNKNOWN,
-        )
-    return JsonHttpResponse(last_response.status_code, last_response.headers, aggregate)
+    return _get_kis_paginated_json(
+        http_client=http_client,
+        url=url,
+        headers=headers,
+        params=params,
+        timeout_seconds=timeout_seconds,
+        row_keys=(row_key,),
+        cursor_width=200,
+        market_label="overseas",
+        max_pages=max_pages,
+    )
 
 
-def _overseas_cursor(payload: dict[str, object]) -> tuple[str, str] | None:
+def _pagination_cursor(
+    payload: dict[str, object],
+    *,
+    cursor_width: int,
+) -> tuple[str, str] | None:
     candidates: list[dict[str, object]] = [payload]
     for value in payload.values():
         if isinstance(value, dict):
@@ -1930,18 +2911,26 @@ def _overseas_cursor(payload: dict[str, object]) -> tuple[str, str] | None:
             candidates.extend(row for row in value if isinstance(row, dict))
     for candidate in candidates:
         lowered = {str(key).lower(): value for key, value in candidate.items()}
-        fk = str(lowered.get("ctx_area_fk200") or "").strip()
-        nk = str(lowered.get("ctx_area_nk200") or "").strip()
+        fk = str(lowered.get(f"ctx_area_fk{cursor_width}") or "").strip()
+        nk = str(lowered.get(f"ctx_area_nk{cursor_width}") or "").strip()
         if fk or nk:
             return fk, nk
     return None
 
 
 def _overseas_balance_params(settings: Settings, exchange: str) -> dict[str, object]:
+    # KIS assigns different meanings to NASD on the live balance endpoint:
+    # live NASD is an aggregate of all US markets, while NAS is Nasdaq-only.
+    # Keep canonical order/quote routing as NASD and narrow only this inquiry.
+    balance_exchange = (
+        "NAS"
+        if settings.runtime_mode == "live" and exchange.strip().upper() == "NASD"
+        else exchange
+    )
     return {
         "CANO": settings.kis_account_number or "",
         "ACNT_PRDT_CD": settings.kis_account_product_code,
-        "OVRS_EXCG_CD": exchange,
+        "OVRS_EXCG_CD": balance_exchange,
         "TR_CRCY_CD": "USD",
         "CTX_AREA_FK200": "",
         "CTX_AREA_NK200": "",
@@ -1983,7 +2972,13 @@ def _overseas_reconcile_params(
     observed_at: datetime,
 ) -> dict[str, object]:
     end_date = observed_at.astimezone(US_EASTERN_TIMEZONE).date()
-    start_date = submitted_at.astimezone(US_EASTERN_TIMEZONE).date() if submitted_at else end_date
+    start_date = (
+        _normalize_utc_datetime(submitted_at)
+        .astimezone(US_EASTERN_TIMEZONE)
+        .date()
+        if submitted_at
+        else end_date
+    )
     if start_date > end_date:
         start_date = end_date
     is_paper = settings.runtime_mode != "live"
@@ -2010,7 +3005,7 @@ def _balance_transaction_id(runtime_mode: str) -> str:
 
 
 def _open_orders_transaction_id(runtime_mode: str) -> str:
-    return "TTTC8001R" if runtime_mode == "live" else "VTTC8001R"
+    return "TTTC0081R" if runtime_mode == "live" else "VTTC0081R"
 
 
 def _daily_ccld_transaction_id(runtime_mode: str, *, period_division: str = "inner") -> str:
@@ -2020,10 +3015,44 @@ def _daily_ccld_transaction_id(runtime_mode: str, *, period_division: str = "inn
     return "VTSC9215R" if before_period else "VTTC0081R"
 
 
+def _daily_ccld_period_division(
+    *,
+    submitted_at: datetime | None,
+    observed_at: datetime,
+) -> str:
+    if submitted_at is None:
+        return "inner"
+    submitted_date = (
+        _normalize_utc_datetime(submitted_at).astimezone(KIS_TIMEZONE).date()
+    )
+    observed_date = observed_at.astimezone(KIS_TIMEZONE).date()
+    # KIS documents this split as "3 months" rather than a fixed day count.
+    # Interpreting that as calendar months is deliberate; month-end dates clamp
+    # to the final day of the target month so the boundary itself stays inner.
+    inner_period_start = _subtract_calendar_months(observed_date, months=3)
+    return "before" if submitted_date < inner_period_start else "inner"
+
+
+def _subtract_calendar_months(value: date, *, months: int) -> date:
+    month_index = value.year * 12 + value.month - 1 - months
+    target_year, zero_based_month = divmod(month_index, 12)
+    target_month = zero_based_month + 1
+    target_day = min(value.day, monthrange(target_year, target_month)[1])
+    return date(target_year, target_month, target_day)
+
+
+def _normalize_utc_datetime(value: datetime) -> datetime:
+    if value.tzinfo is None or value.utcoffset() is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
+
+
 def _balance_params(settings: Settings) -> dict[str, object]:
     return {
         "CANO": settings.kis_account_number or "",
         "ACNT_PRDT_CD": settings.kis_account_product_code,
+        # This endpoint returns account-wide domestic inventory. ``X`` only
+        # changes the valuation-price source to NXT; it does not filter lots.
         "AFHR_FLPR_YN": "N",
         "OFL_YN": "",
         "INQR_DVSN": "02",
@@ -2036,8 +3065,14 @@ def _balance_params(settings: Settings) -> dict[str, object]:
     }
 
 
-def _open_orders_params(settings: Settings, observed_at: datetime) -> dict[str, object]:
+def _open_orders_params(
+    settings: Settings,
+    observed_at: datetime,
+) -> dict[str, object]:
     inquiry_date = observed_at.astimezone(KIS_TIMEZONE).strftime("%Y%m%d")
+    # Capital reservation must see every domestic venue in live trading.
+    # The paper API only supports KRX for this inquiry contract.
+    query_exchange = "ALL" if settings.runtime_mode == "live" else "KRX"
     return {
         "CANO": settings.kis_account_number or "",
         "ACNT_PRDT_CD": settings.kis_account_product_code,
@@ -2053,25 +3088,46 @@ def _open_orders_params(settings: Settings, observed_at: datetime) -> dict[str, 
         "INQR_DVSN_1": "",
         "CTX_AREA_FK100": "",
         "CTX_AREA_NK100": "",
+        "EXCG_ID_DVSN_CD": query_exchange,
     }
 
 
 def _raise_if_business_error(payload: dict[str, object]) -> None:
     if _optional_string(payload.get("rt_cd")) in {None, "0"}:
         return
+    raw_error_message = _error_message(payload)
     raise BrokerAdapterError(
-        _error_message(payload),
+        safe_broker_error_message(raw_error_message),
         status_code=422,
         classification=_classify_error(
             status_code=400,
             code=_optional_string(payload.get("msg_cd")),
-            message=_error_message(payload),
+            message=raw_error_message,
         ),
         retryable=False,
-        code=_optional_string(payload.get("msg_cd")),
-        response_payload=payload,
+        code=safe_broker_error_code(payload.get("msg_cd"), provider=KIS_PROVIDER),
+        response_payload=_safe_error_payload(payload),
         observed_at=datetime.now(UTC),
     )
+
+
+def _require_kis_business_success(
+    payload: dict[str, object],
+    *,
+    context: str,
+) -> None:
+    raw_code = payload.get("rt_cd")
+    if not isinstance(raw_code, str) or not raw_code.strip():
+        raise BrokerAdapterError(
+            f"KIS {context} response is missing a valid string rt_cd",
+            status_code=502,
+            classification=BrokerErrorClassification.UNKNOWN,
+            retryable=True,
+            code="kis_response_business_code_invalid",
+            response_payload=_safe_error_payload(payload),
+            observed_at=datetime.now(UTC),
+        )
+    _raise_if_business_error(payload)
 
 
 def _parse_available_cash(payload: dict[str, object]) -> Decimal | None:
@@ -2106,21 +3162,16 @@ def _parse_balance_summary(payload: dict[str, object]) -> dict[str, Decimal | No
     }
 
 
-def _first_decimal(row: dict[str, object], *keys: str) -> Decimal | None:
-    for key in keys:
-        parsed = _parse_decimal(row.get(key))
-        if parsed is not None:
-            return parsed
-    return None
-
-
 def _parse_holdings(payload: dict[str, object]) -> list[BrokerAccountHolding]:
     holdings: list[BrokerAccountHolding] = []
     for row in _payload_rows(payload.get("output1")):
+        assessment, _identity = _assess_domestic_holding_row(row)
+        if assessment != "parsed":
+            continue
         symbol = _optional_string(row.get("pdno"))
         quantity = _parse_int(row.get("hldg_qty"))
-        if symbol is None or quantity is None or quantity <= 0:
-            continue
+        assert symbol is not None
+        assert quantity is not None and quantity > 0
         holdings.append(
             BrokerAccountHolding(
                 symbol=symbol.strip().upper(),
@@ -2138,11 +3189,20 @@ def _parse_holdings(payload: dict[str, object]) -> list[BrokerAccountHolding]:
 def _parse_open_orders(payload: dict[str, object]) -> list[BrokerAccountOpenOrder]:
     open_orders: list[BrokerAccountOpenOrder] = []
     for row in _payload_rows(payload.get("output1")):
-        symbol = _optional_string(row.get("pdno"))
-        quantity = _parse_int(row.get("ord_qty"))
-        remaining_quantity = _remaining_order_quantity(row, quantity)
-        if symbol is None or quantity is None or quantity <= 0 or remaining_quantity <= 0:
+        assessment, _identity = _assess_domestic_open_order_row(row)
+        if assessment != "parsed":
             continue
+        symbol = _optional_string(row.get("pdno"))
+        quantity = _snapshot_integer(row, ("ord_qty",))
+        remaining_quantity = _snapshot_remaining_quantity(
+            row,
+            quantity=quantity,
+            remaining_keys=("rmn_qty", "ord_uncc_qty", "nccs_qty"),
+            filled_keys=("tot_ccld_qty",),
+        )
+        assert symbol is not None
+        assert quantity is not None
+        assert remaining_quantity is not None
         open_orders.append(
             BrokerAccountOpenOrder(
                 symbol=symbol.strip().upper(),
@@ -2150,7 +3210,10 @@ def _parse_open_orders(payload: dict[str, object]) -> list[BrokerAccountOpenOrde
                 quantity=quantity,
                 remaining_quantity=remaining_quantity,
                 status=_optional_string(row.get("ord_ccld_status_name")) or "open",
-                broker_order_id=_optional_string(row.get("odno")),
+                broker_order_id=(
+                    _optional_string(row.get("odno"))
+                    or _optional_string(row.get("ord_no"))
+                ),
                 limit_price=_parse_decimal(row.get("ord_unpr")),
                 payload=dict(row),
             )
@@ -2161,10 +3224,13 @@ def _parse_open_orders(payload: dict[str, object]) -> list[BrokerAccountOpenOrde
 def _parse_overseas_holdings(payload: dict[str, object]) -> list[BrokerAccountHolding]:
     holdings: list[BrokerAccountHolding] = []
     for row in _payload_rows(payload.get("output1")):
+        assessment, _identity = _assess_overseas_holding_row(row)
+        if assessment != "parsed":
+            continue
         symbol = _optional_string(row.get("ovrs_pdno")) or _optional_string(row.get("pdno"))
         quantity = _parse_int(row.get("ovrs_cblc_qty"))
-        if symbol is None or quantity is None or quantity <= 0:
-            continue
+        assert symbol is not None
+        assert quantity is not None and quantity > 0
         holdings.append(
             BrokerAccountHolding(
                 symbol=symbol.strip().upper(),
@@ -2182,15 +3248,22 @@ def _parse_overseas_holdings(payload: dict[str, object]) -> list[BrokerAccountHo
 def _parse_overseas_open_orders(payload: dict[str, object]) -> list[BrokerAccountOpenOrder]:
     open_orders: list[BrokerAccountOpenOrder] = []
     for row in _payload_rows(payload.get("output")):
-        symbol = _optional_string(row.get("pdno"))
-        quantity = _parse_int(row.get("ft_ord_qty")) or _parse_int(row.get("ord_qty"))
-        remaining_quantity = _parse_int(row.get("nccs_qty"))
-        if symbol is None or quantity is None or quantity <= 0:
+        assessment, _identity = _assess_overseas_open_order_row(row)
+        if assessment != "parsed":
             continue
-        if remaining_quantity is None:
-            remaining_quantity = max(quantity - (_parse_int(row.get("ft_ccld_qty")) or 0), 0)
-        if remaining_quantity <= 0:
-            continue
+        symbol = _optional_string(row.get("pdno")) or _optional_string(
+            row.get("ovrs_pdno")
+        )
+        quantity = _snapshot_integer(row, ("ft_ord_qty", "ord_qty"))
+        remaining_quantity = _snapshot_remaining_quantity(
+            row,
+            quantity=quantity,
+            remaining_keys=("nccs_qty",),
+            filled_keys=("ft_ccld_qty",),
+        )
+        assert symbol is not None
+        assert quantity is not None
+        assert remaining_quantity is not None
         open_orders.append(
             BrokerAccountOpenOrder(
                 symbol=symbol.strip().upper(),
@@ -2198,7 +3271,10 @@ def _parse_overseas_open_orders(payload: dict[str, object]) -> list[BrokerAccoun
                 quantity=quantity,
                 remaining_quantity=remaining_quantity,
                 status=_optional_string(row.get("prcs_stat_name")) or "open",
-                broker_order_id=_optional_string(row.get("odno")),
+                broker_order_id=(
+                    _optional_string(row.get("odno"))
+                    or _optional_string(row.get("ord_no"))
+                ),
                 limit_price=_first_decimal(row, "ft_ord_unpr3", "ovrs_ord_unpr"),
                 payload=dict(row),
             )
@@ -2254,6 +3330,239 @@ def _payload_rows(value: object) -> list[dict[str, object]]:
     return []
 
 
+def _payload_collection_items(value: object) -> list[object]:
+    if isinstance(value, list):
+        return list(value)
+    if isinstance(value, dict):
+        return [value]
+    if value is None:
+        return []
+    return [value]
+
+
+def _snapshot_integer(
+    row: dict[str, object],
+    keys: tuple[str, ...],
+) -> int | None:
+    for key in keys:
+        if key not in row:
+            continue
+        raw_value = row.get(key)
+        if raw_value is None or (
+            isinstance(raw_value, str) and not raw_value.strip()
+        ):
+            continue
+        return _parse_int(raw_value)
+    return None
+
+
+def _first_integral_evidence(
+    row: dict[str, object],
+    keys: tuple[str, ...],
+) -> tuple[int | None, bool]:
+    for key in keys:
+        if key not in row:
+            continue
+        raw_value = row.get(key)
+        if raw_value is None or (
+            isinstance(raw_value, str) and not raw_value.strip()
+        ):
+            continue
+        return _parse_int(raw_value), True
+    return None, False
+
+
+def _snapshot_remaining_quantity(
+    row: dict[str, object],
+    *,
+    quantity: int | None,
+    remaining_keys: tuple[str, ...],
+    filled_keys: tuple[str, ...],
+) -> int | None:
+    remaining = _snapshot_integer(row, remaining_keys)
+    if remaining is not None:
+        return remaining
+    filled = _snapshot_integer(row, filled_keys)
+    if quantity is None or filled is None:
+        return None
+    return quantity - filled
+
+
+def _assess_holding_row(
+    row: dict[str, object],
+    *,
+    symbol_keys: tuple[str, ...],
+    quantity_keys: tuple[str, ...],
+    sellable_quantity_keys: tuple[str, ...],
+) -> tuple[str, str | None]:
+    symbol = next(
+        (
+            candidate
+            for key in symbol_keys
+            if (candidate := _optional_string(row.get(key))) is not None
+        ),
+        None,
+    )
+    quantity = _snapshot_integer(row, quantity_keys)
+    if symbol is None or quantity is None or quantity < 0:
+        return "invalid", None
+    sellable_quantity, sellable_quantity_supplied = _first_integral_evidence(
+        row,
+        sellable_quantity_keys,
+    )
+    if sellable_quantity_supplied and (
+        sellable_quantity is None
+        or sellable_quantity < 0
+        or sellable_quantity > quantity
+    ):
+        return "invalid", None
+    identity = symbol.strip().upper()
+    if quantity == 0:
+        return "omitted", identity
+    return "parsed", identity
+
+
+def _assess_domestic_holding_row(row: dict[str, object]) -> tuple[str, str | None]:
+    return _assess_holding_row(
+        row,
+        symbol_keys=("pdno",),
+        quantity_keys=("hldg_qty",),
+        sellable_quantity_keys=("ord_psbl_qty",),
+    )
+
+
+def _assess_overseas_holding_row(row: dict[str, object]) -> tuple[str, str | None]:
+    return _assess_holding_row(
+        row,
+        symbol_keys=("ovrs_pdno", "pdno"),
+        quantity_keys=("ovrs_cblc_qty",),
+        sellable_quantity_keys=("ord_psbl_qty",),
+    )
+
+
+def _assess_open_order_row(
+    row: dict[str, object],
+    *,
+    symbol_keys: tuple[str, ...],
+    quantity_keys: tuple[str, ...],
+    remaining_keys: tuple[str, ...],
+    filled_keys: tuple[str, ...],
+) -> tuple[str, str | None]:
+    symbol = next(
+        (
+            candidate
+            for key in symbol_keys
+            if (candidate := _optional_string(row.get(key))) is not None
+        ),
+        None,
+    )
+    broker_order_id = _optional_string(row.get("odno")) or _optional_string(
+        row.get("ord_no")
+    )
+    side = _parse_order_side(row)
+    quantity = _snapshot_integer(row, quantity_keys)
+    if (
+        symbol is None
+        or broker_order_id is None
+        or side not in {"buy", "sell"}
+        or quantity is None
+        or quantity < 0
+    ):
+        return "invalid", None
+    if quantity == 0:
+        return "omitted", broker_order_id
+    remaining = _snapshot_remaining_quantity(
+        row,
+        quantity=quantity,
+        remaining_keys=remaining_keys,
+        filled_keys=filled_keys,
+    )
+    if remaining is None or remaining < 0 or remaining > quantity:
+        return "invalid", None
+    if remaining == 0:
+        return "omitted", broker_order_id
+    return "parsed", broker_order_id
+
+
+def _assess_domestic_open_order_row(
+    row: dict[str, object],
+) -> tuple[str, str | None]:
+    return _assess_open_order_row(
+        row,
+        symbol_keys=("pdno",),
+        quantity_keys=("ord_qty",),
+        remaining_keys=("rmn_qty", "ord_uncc_qty", "nccs_qty"),
+        filled_keys=("tot_ccld_qty",),
+    )
+
+
+def _assess_overseas_open_order_row(
+    row: dict[str, object],
+) -> tuple[str, str | None]:
+    return _assess_open_order_row(
+        row,
+        symbol_keys=("pdno", "ovrs_pdno"),
+        quantity_keys=("ft_ord_qty", "ord_qty"),
+        remaining_keys=("nccs_qty",),
+        filled_keys=("ft_ccld_qty",),
+    )
+
+
+def _collection_parse_diagnostics(
+    *,
+    payload: dict[str, object],
+    row_key: str,
+    parsed_identities: list[str | None],
+    assess_row: Callable[[dict[str, object]], tuple[str, str | None]],
+) -> dict[str, int]:
+    raw_items = _payload_collection_items(payload.get(row_key))
+    invalid_row_count = 0
+    omitted_row_count = 0
+    expected_parsed_identities: list[str] = []
+    for item in raw_items:
+        if not isinstance(item, dict):
+            invalid_row_count += 1
+            continue
+        assessment, identity = assess_row(item)
+        if assessment == "invalid":
+            invalid_row_count += 1
+        elif assessment == "omitted":
+            omitted_row_count += 1
+        elif identity is not None:
+            expected_parsed_identities.append(identity)
+        else:
+            invalid_row_count += 1
+    identities = [identity for identity in parsed_identities if identity]
+    if expected_parsed_identities != identities:
+        invalid_row_count += max(
+            abs(len(expected_parsed_identities) - len(identities)),
+            1,
+        )
+    return {
+        "raw_row_count": len(raw_items),
+        "parsed_row_count": len(parsed_identities),
+        "omitted_row_count": omitted_row_count,
+        "invalid_row_count": invalid_row_count,
+        "duplicate_identity_count": len(identities) - len(set(identities)),
+    }
+
+
+def _collection_parse_complete(
+    *,
+    payload: dict[str, object],
+    row_key: str,
+    diagnostics: dict[str, int],
+) -> bool:
+    return bool(
+        row_key in payload
+        and isinstance(payload.get(row_key), (dict, list))
+        and diagnostics["raw_row_count"]
+        == diagnostics["parsed_row_count"] + diagnostics["omitted_row_count"]
+        and diagnostics["invalid_row_count"] == 0
+        and diagnostics["duplicate_identity_count"] == 0
+    )
+
+
 def _parse_int(value: object) -> int | None:
     if isinstance(value, bool):
         return None
@@ -2261,21 +3570,13 @@ def _parse_int(value: object) -> int | None:
         return value
     if isinstance(value, str) and value.strip():
         try:
-            return int(Decimal(value.replace(",", "")))
-        except (InvalidOperation, ValueError):
+            parsed = Decimal(value.replace(",", ""))
+            if not parsed.is_finite() or parsed != parsed.to_integral_value():
+                return None
+            return int(parsed)
+        except (InvalidOperation, OverflowError, ValueError):
             return None
     return None
-
-
-def _remaining_order_quantity(row: dict[str, object], quantity: int | None) -> int:
-    for key in ("rmn_qty", "ord_uncc_qty", "nccs_qty"):
-        value = _parse_int(row.get(key))
-        if value is not None:
-            return max(value, 0)
-    filled = _parse_int(row.get("tot_ccld_qty"))
-    if quantity is not None and filled is not None:
-        return max(quantity - filled, 0)
-    return quantity or 0
 
 
 def _parse_order_side(row: dict[str, object]) -> str:
@@ -2322,7 +3623,24 @@ def _sanitize_headers(headers: dict[str, str]) -> dict[str, str]:
     sanitized: dict[str, str] = {}
     for key, value in headers.items():
         key_lower = key.lower()
-        if key_lower in {"authorization", "appsecret", "hashkey"}:
+        normalized_key = "".join(
+            character for character in key_lower if character.isalnum()
+        )
+        if key_lower in {"authorization", "appsecret", "hashkey"} or any(
+            normalized_key.endswith(suffix)
+            for suffix in (
+                "authorization",
+                "cookie",
+                "cookieheader",
+                "sessionid",
+                "token",
+                "secret",
+                "credential",
+                "hashkey",
+                "appkey",
+                "apikey",
+            )
+        ):
             continue
         sanitized[key_lower] = value
     return sanitized
@@ -2335,18 +3653,22 @@ def _business_error(
     request_payload: dict[str, object],
 ) -> BrokerAdapterError:
     code = _optional_string(payload.get("msg_cd"))
-    message = _error_message(payload)
-    classification = _classify_error(status_code=400, code=code, message=message)
+    raw_error_message = _error_message(payload)
+    classification = _classify_error(
+        status_code=400,
+        code=code,
+        message=raw_error_message,
+    )
     retryable = classification in {
         BrokerErrorClassification.RATE_LIMIT,
         BrokerErrorClassification.TRANSIENT,
     }
     return BrokerAdapterError(
-        message,
+        safe_broker_error_message(raw_error_message),
         status_code=503 if retryable else 422,
         classification=classification,
         retryable=retryable,
-        code=code,
+        code=safe_broker_error_code(code, provider=KIS_PROVIDER),
         normalized_status=(
             NormalizedBrokerOrderStatus.RETRY_PENDING
             if retryable
@@ -2354,6 +3676,6 @@ def _business_error(
         ),
         request_metadata=dict(request_metadata),
         request_payload=dict(request_payload),
-        response_payload=dict(payload),
+        response_payload=_safe_error_payload(payload),
         observed_at=datetime.now(UTC),
     )

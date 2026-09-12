@@ -18,15 +18,29 @@ EXECUTION_JOB_STATUSES = frozenset(
         "retrying",
         "completed",
         "failed",
+        "expired",
     }
 )
 
 PLAN_ITEM_STATUSES = frozenset(
     {
         "accepted",
+        "agent_approved_pending_submit",
+        "agent_delay",
+        "agent_rejected",
         "cancel_pending",
         "canceled",
         "pending",
+        "pending_configuration",
+        "rejected",
+        "short_term_watch_blocked",
+        "short_term_watcher_pending",
+        "superseded",
+        "target_sell_pending_configuration",
+        "target_sell_monitoring",
+        "target_sell_triggered_pending_dispatch",
+        "triggered_pending_agent",
+        "unsupported_semantics",
         "broker_order_submission_pending",
         "broker_order_submitted",
         "broker_order_open",
@@ -43,16 +57,26 @@ PLAN_ITEM_STATUSES = frozenset(
         "expired",
         "exec_agent_rejected",
         "filled",
+        "manual_review_required",
         "new_buy_blocked",
         "open",
         "partially_filled",
         "next_open_buy_dispatching",
         "next_open_buy_failed",
+        "next_open_buy_expired",
         "next_open_buy_pending_configuration",
         "next_open_buy_retry_pending",
         "next_open_buy_retrying",
         "next_open_buy_scheduled",
         "stop_sell_monitoring",
+        "stop_sell_pending_configuration",
+        "stop_sell_triggered_pending_dispatch",
+        "max_holding_close_sell_monitoring",
+        "max_holding_close_sell_triggered_pending_dispatch",
+        "watch_cancelled",
+        "watch_monitoring_active",
+        "watch_monitoring_pending",
+        "watch_buy_submitted",
         "watch_buy_dispatching",
         "watch_buy_rejected",
         "watch_buy_retrying",
@@ -112,17 +136,13 @@ def set_plan_item_status(
     payload: dict[str, Any] | None = None,
     occurred_at: datetime | None = None,
 ) -> bool:
-    _ensure_known_status(
-        domain="execution plan item",
-        status=status,
-        allowed=PLAN_ITEM_STATUSES,
-    )
+    _ensure_known_status(domain="execution plan item", status=status, allowed=PLAN_ITEM_STATUSES)
     previous_status = plan_item.status
     if previous_status == status:
         return False
 
     observed_at = occurred_at or datetime.now(UTC)
-    plan_item.status = status
+    apply_plan_item_status(plan_item=plan_item, status=status)
     db.add(
         ExecutionPlanItemAudit(
             execution_plan_item_id=plan_item.id,
@@ -139,6 +159,17 @@ def set_plan_item_status(
         )
     )
     return True
+
+
+def apply_plan_item_status(*, plan_item: ExecutionPlanItem, status: str) -> None:
+    """Assign a plan-item status only after enforcing the shared catalogue."""
+
+    _ensure_known_status(
+        domain="execution plan item",
+        status=status,
+        allowed=PLAN_ITEM_STATUSES,
+    )
+    plan_item.status = status
 
 
 def set_execution_job_status(

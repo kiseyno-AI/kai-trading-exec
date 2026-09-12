@@ -4,10 +4,19 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from sqlalchemy.orm import Session
 
 from app.api.dependencies import get_broker_adapter, get_db_session, get_runtime_metadata, get_settings
+from app.api.schemas.buy_authority import (
+    CoreBuyAuthorityAckV1,
+    CoreBuyAuthorityObservationV1,
+)
 from app.broker.base import BrokerAdapter
 from app.core.config import Settings
 from app.services.portfolio_risk import build_portfolio_risk_snapshot
 from app.services.plan_judgment_actions import apply_hourly_plan_judgment_action
+from app.services.core_buy_authority import (
+    CoreBuyAuthorityConflictError,
+    CoreBuyAuthorityScopeError,
+    apply_core_buy_authority_observation,
+)
 from app.services.runtime import (
     RuntimeMetadata,
     build_runtime_daily_board,
@@ -32,6 +41,7 @@ def alpaca_us_equity_runtime_status(request: Request) -> dict[str, object]:
 def runtime_status(
     request: Request,
     db: Annotated[Session, Depends(get_db_session)],
+    adapter: Annotated[BrokerAdapter, Depends(get_broker_adapter)],
 ) -> dict[str, object]:
     settings: Settings = get_settings(request)
     runtime: RuntimeMetadata = get_runtime_metadata(request)
@@ -42,8 +52,14 @@ def runtime_status(
         settings=settings,
         runtime=runtime,
         db=db,
+        broker_adapter=adapter,
         autonomous_runtime=autonomous_runtime,
         include_expensive_sections=not settings.autonomous_runtime_enabled,
+        runtime_startup_gate=getattr(
+            request.app.state,
+            "runtime_startup_gate",
+            None,
+        ),
     )
 
 
@@ -60,6 +76,7 @@ def runtime_safety(
 def runtime_daily_board(
     request: Request,
     db: Annotated[Session, Depends(get_db_session)],
+    adapter: Annotated[BrokerAdapter, Depends(get_broker_adapter)],
 ) -> dict[str, object]:
     settings: Settings = get_settings(request)
     runtime: RuntimeMetadata = get_runtime_metadata(request)
@@ -70,7 +87,13 @@ def runtime_daily_board(
         settings=settings,
         runtime=runtime,
         db=db,
+        broker_adapter=adapter,
         autonomous_runtime=autonomous_runtime,
+        runtime_startup_gate=getattr(
+            request.app.state,
+            "runtime_startup_gate",
+            None,
+        ),
     )
 
 
@@ -91,7 +114,7 @@ def runtime_portfolio_risk(
 
 
 @router.post("/plan-judgment/action")
-async def runtime_plan_judgment_action(
+def runtime_plan_judgment_action(
     request: Request,
     db: Annotated[Session, Depends(get_db_session)],
     payload: dict[str, object] = Body(...),
@@ -112,3 +135,23 @@ async def runtime_plan_judgment_action(
     if result.get("status") == "retry_required":
         raise HTTPException(status_code=503, detail=result)
     return result
+
+
+@router.post(
+    "/core-buy-authority/observations",
+    response_model=CoreBuyAuthorityAckV1,
+)
+def runtime_core_buy_authority_observation(
+    request: Request,
+    command: CoreBuyAuthorityObservationV1,
+    db: Annotated[Session, Depends(get_db_session)],
+) -> CoreBuyAuthorityAckV1:
+    settings: Settings = get_settings(request)
+    try:
+        return apply_core_buy_authority_observation(
+            settings=settings,
+            db=db,
+            command=command,
+        )
+    except (CoreBuyAuthorityConflictError, CoreBuyAuthorityScopeError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
