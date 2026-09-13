@@ -576,6 +576,67 @@ def test_schema_check_validation_accepts_postgres_truncated_constraint_name() ->
     )
 
 
+def test_schema_check_validation_accepts_postgres_text_casts() -> None:
+    expression = schema_service.REQUIRED_CHECK_CONSTRAINTS[
+        "core_buy_authority_states"
+    ]["ck_core_buy_authority_states_krx_scope"]
+
+    assert schema_service._has_check_constraint(
+        [
+            {
+                "name": "ck_core_buy_authority_states_krx_scope",
+                "sqltext": (
+                    "(provider)::text = 'kis'::text "
+                    "AND (market)::text = 'KRX'::text "
+                    "AND (currency)::text = 'KRW'::text"
+                ),
+            }
+        ],
+        expression=expression,
+    )
+
+
+def test_schema_check_validation_preserves_cast_like_text_inside_literal() -> None:
+    assert not schema_service._has_check_constraint(
+        [
+            {
+                "name": "different-provider-check",
+                "sqltext": "provider::text = 'ki::texts'::text",
+            }
+        ],
+        expression="provider = 'kis'",
+    )
+
+
+@pytest.mark.parametrize(
+    "sqltext",
+    [
+        (
+            "provider::text = 'KIS'::text "
+            "AND market::text = 'KRX'::text "
+            "AND currency::text = 'KRW'::text"
+        ),
+        "provider::text = 'kis'::text AND market::text = 'KRX'::text",
+        (
+            "provider::text = 'kis'::text "
+            "AND market::text = 'KRX'::text "
+            "AND currency::text = 'USD'::text"
+        ),
+    ],
+)
+def test_schema_check_validation_rejects_semantically_different_casted_checks(
+    sqltext: str,
+) -> None:
+    expression = schema_service.REQUIRED_CHECK_CONSTRAINTS[
+        "core_buy_authority_states"
+    ]["ck_core_buy_authority_states_krx_scope"]
+
+    assert not schema_service._has_check_constraint(
+        [{"name": "different-scope-check", "sqltext": sqltext}],
+        expression=expression,
+    )
+
+
 def test_runtime_schema_required_head_matches_alembic_script_head() -> None:
     config = Config(str(Path(__file__).resolve().parents[1] / "alembic.ini"))
     script = ScriptDirectory.from_config(config)
@@ -748,6 +809,7 @@ def test_lifespan_blocks_workers_for_unattributed_non_flat_position(
 
     with TestClient(app) as client:
         health = client.get("/health").json()
+        runtime_status = client.get("/runtime/status").json()
 
         assert starts == []
         runtime_schema = health["dependencies"]["runtime_schema"]
@@ -782,6 +844,27 @@ def test_lifespan_blocks_workers_for_unattributed_non_flat_position(
             ),
             "restart_required": True,
         }
+        assert runtime_status["runtime_startup_gate"] == {
+            "status": "blocked",
+            "reason": "non_flat_execution_position_scope_attribution_required",
+            "runtime_schema_status": "blocked",
+            "alembic_status": "ok",
+            "remediation": (
+                "kis_legacy_position_attribution_dry_run_apply_then_restart"
+            ),
+            "restart_required": True,
+        }
+        assert runtime_status["safety"]["readiness_reason"] == (
+            "non_flat_execution_position_scope_attribution_required; "
+            "remediation=kis_legacy_position_attribution_dry_run_apply_then_restart; "
+            "restart_required=true"
+        )
+        readiness_reasons = " ".join(runtime_status["readiness"]["reasons"])
+        assert "kis_legacy_position_attribution_dry_run_apply_then_restart" in (
+            readiness_reasons
+        )
+        assert "restart_required=true" in readiness_reasons
+        assert "migrat" not in readiness_reasons.casefold()
 
     engine.dispose()
 

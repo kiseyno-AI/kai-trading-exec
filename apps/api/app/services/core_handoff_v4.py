@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
+import hmac
 from typing import Any
 
 from pydantic import ValidationError
@@ -11,11 +12,16 @@ from sqlalchemy.orm import Session, selectinload
 
 from app.api.schemas.execution import (
     CORE_V4_UNFULFILLED_BUY_EXECUTABLE_FIELDS,
+    CORE_EXECUTION_ACTIVATION_BINDING_KEY,
+    CORE_EXECUTION_ACTIVATION_BINDING_SCHEMA_VERSION,
+    CORE_EXECUTION_ACTIVATION_CAPABILITY,
+    CORE_EXECUTION_ACTIVATION_SCHEMA_VERSION,
     CORE_EXECUTION_HANDOFF_CONTRACT_VERSION,
     CORE_EXECUTION_PLAN_ACK_SCHEMA_VERSION,
     CORE_EXECUTION_PLAN_CAPABILITY,
     CORE_EXECUTION_REVOCATION_CAPABILITY,
     CORE_EXECUTION_REVOCATION_SCHEMA_VERSION,
+    CoreExecutionActivationRequestV4,
     CoreExecutionPlanRequestV4,
     CoreExecutionRevocationRequestV4,
     ExecutionPlanRequest,
@@ -41,6 +47,8 @@ ENTRY_INTENTS = frozenset({"next_open_buy", "intraday_watch_buy"})
 SAFE_LOCAL_PRE_SUBMISSION_ORDER_STATUSES = frozenset({"rejected", "failed"})
 CORE_V4_PERSISTED_BINDING_KEY = "_core_v4_contract_binding"
 CORE_V4_PERSISTED_BINDING_VERSION = "core-v4-persisted-binding-v1"
+CORE_V4_ACTIVATION_STATE_KEY = "_core_activation_state"
+CORE_V4_ACTIVATION_STATE_VERSION = "core-exec-activation-state-v1"
 CORE_V4_ACTION_FIELDS = (
     "handoff_intent",
     "raw_action",
@@ -258,6 +266,7 @@ def create_core_execution_plan_v4(
                 "runtime": {"mode": settings.runtime_mode},
             },
         )
+    _hold_core_confirmed_buy_activation(db=db, plan=plan, command=command)
     db.commit()
     return CreateExecutionPlanResult(
         status_code=201,
@@ -269,6 +278,401 @@ def create_core_execution_plan_v4(
             **contract_payload,
         },
     )
+
+
+def _core_activation_authority_generation(
+    command: CoreExecutionPlanRequestV4,
+) -> str | None:
+    authority_generation: str | None = None
+    for item in command.items:
+        risk_context = item.risk_context
+        binding = risk_context.get(CORE_EXECUTION_ACTIVATION_BINDING_KEY)
+        if binding is None:
+            return None
+        if (
+            not isinstance(binding, dict)
+            or set(binding)
+            != {
+                "schema_version",
+                "mode",
+                "authority_generation_fingerprint",
+            }
+            or binding.get("schema_version")
+            != CORE_EXECUTION_ACTIVATION_BINDING_SCHEMA_VERSION
+            or binding.get("mode") != "core_confirmed"
+        ):
+            return None
+        item_generation = binding.get("authority_generation_fingerprint")
+        if (
+            not isinstance(item_generation, str)
+            or len(item_generation) != 64
+            or any(character not in "0123456789abcdef" for character in item_generation)
+        ):
+            return None
+        if authority_generation is None:
+            authority_generation = item_generation
+        elif authority_generation != item_generation:
+            return None
+    return authority_generation
+
+
+def _hold_core_confirmed_buy_activation(
+    *,
+    db: Session,
+    plan: ExecutionPlan,
+    command: CoreExecutionPlanRequestV4,
+) -> None:
+    authority_generation = _core_activation_authority_generation(command)
+    if authority_generation is None:
+        return
+    for item in plan.items:
+        if item.side != "buy" or item.intent not in ENTRY_INTENTS:
+            continue
+        prior_status = item.status
+        risk_context = (
+            dict(item.risk_context)
+            if isinstance(item.risk_context, dict)
+            else {}
+        )
+        risk_context[CORE_V4_ACTIVATION_STATE_KEY] = {
+            "version": CORE_V4_ACTIVATION_STATE_VERSION,
+            "status": "pending",
+            "prior_status": prior_status,
+            "dispatch_material_fingerprint": (
+                command.metadata.dispatch_material_fingerprint
+            ),
+            "authority_generation_fingerprint": authority_generation,
+        }
+        item.risk_context = risk_context
+        item.status = "core_activation_pending"
+        plan_item_id = _nonempty_text(item.id)
+        if plan_item_id is not None:
+            # The plan and items have already been flushed, so this audit is
+            # committed atomically with the non-claimable status.
+            db.add(
+                ExecutionPlanItemAudit(
+                    id=new_id(),
+                    execution_plan_item_id=plan_item_id,
+                    event_type="core_activation_pending",
+                    source="kai-trading-exec",
+                    summary={"prior_status": prior_status},
+                    payload={
+                        "schema_version": (
+                            CORE_EXECUTION_ACTIVATION_BINDING_SCHEMA_VERSION
+                        ),
+                        "authority_generation_fingerprint": authority_generation,
+                    },
+                )
+            )
+    plan.status = "activation_pending"
+
+
+def activate_core_execution_plan_v4(
+    *,
+    settings: Settings,
+    db: Session,
+    command: CoreExecutionActivationRequestV4,
+) -> CreateExecutionPlanResult:
+    plan = db.scalar(
+        select(ExecutionPlan)
+        .where(
+            ExecutionPlan.id == command.execution_plan_id,
+            ExecutionPlan.external_plan_id == command.plan_id,
+            ExecutionPlan.mode == settings.runtime_mode,
+        )
+        .with_for_update()
+        .options(selectinload(ExecutionPlan.items))
+    )
+    if plan is None:
+        db.rollback()
+        return _activation_failure(
+            command=command,
+            status_code=404,
+            reason_code="execution_plan_not_found",
+        )
+
+    locked_items = db.scalars(
+        select(ExecutionPlanItem)
+        .where(ExecutionPlanItem.execution_plan_id == plan.id)
+        .order_by(ExecutionPlanItem.plan_item_index.asc())
+        .with_for_update()
+    ).all()
+    item_ids = {item.id for item in locked_items}
+    db.scalars(
+        select(ExecutionJob)
+        .where(ExecutionJob.execution_plan_item_id.in_(item_ids))
+        .order_by(ExecutionJob.id.asc())
+        .with_for_update()
+    ).all()
+
+    contract_ack = persisted_core_plan_contract_ack(plan)
+    if contract_ack is None:
+        db.rollback()
+        return _activation_failure(
+            command=command,
+            status_code=409,
+            reason_code="persisted_v4_contract_not_proven",
+            execution_plan_id=plan.id,
+        )
+    persisted_contract = contract_ack.get("contract_ack")
+    stored_dispatch_fingerprint = (
+        persisted_contract.get("dispatch_material_fingerprint")
+        if isinstance(persisted_contract, dict)
+        else None
+    )
+    if (
+        not isinstance(stored_dispatch_fingerprint, str)
+        or not hmac.compare_digest(
+            stored_dispatch_fingerprint,
+            command.dispatch_material_fingerprint,
+        )
+    ):
+        db.rollback()
+        return _activation_failure(
+            command=command,
+            status_code=409,
+            reason_code="activation_dispatch_material_mismatch",
+            execution_plan_id=plan.id,
+        )
+
+    stored_command = CoreExecutionPlanRequestV4.model_validate(
+        plan.raw_payload,
+        context={
+            _SKIP_DISPATCH_MATERIAL_FINGERPRINT_CONTEXT_KEY: True,
+        },
+    )
+    stored_authority_generation = _core_activation_authority_generation(
+        stored_command
+    )
+    if (
+        stored_authority_generation is None
+        or not hmac.compare_digest(
+            stored_authority_generation,
+            command.authority_generation_fingerprint,
+        )
+    ):
+        db.rollback()
+        return _activation_failure(
+            command=command,
+            status_code=409,
+            reason_code="activation_authority_generation_mismatch",
+            execution_plan_id=plan.id,
+        )
+
+    requested_by_key = {item.core_item_key: item for item in command.items}
+    locked_by_key = {
+        str(item.source_plan_item_id): item
+        for item in locked_items
+        if item.source_plan_item_id is not None
+    }
+    exact_bindings = bool(
+        len(locked_items) == len(command.items)
+        and set(locked_by_key) == set(requested_by_key)
+        and all(
+            locked_by_key[key].id == request.execution_plan_item_id
+            and locked_by_key[key].decision_snapshot_id
+            == request.decision_snapshot_id
+            for key, request in requested_by_key.items()
+        )
+    )
+    if not exact_bindings:
+        db.rollback()
+        return _activation_failure(
+            command=command,
+            status_code=409,
+            reason_code="activation_item_binding_mismatch",
+            execution_plan_id=plan.id,
+        )
+
+    buy_items = [
+        item
+        for item in locked_items
+        if item.side == "buy" and item.intent in ENTRY_INTENTS
+    ]
+    states = {
+        item.id: _core_activation_state(item)
+        for item in buy_items
+    }
+    replay = bool(
+        plan.status == "accepted"
+        and states
+        and all(
+            state is not None and state.get("status") == "activated"
+            for state in states.values()
+        )
+    )
+    if replay:
+        db.commit()
+        return _activation_success(
+            command=command,
+            execution_plan_id=plan.id,
+            idempotent_replay=True,
+        )
+
+    pending_state_is_exact = bool(
+        plan.status == "activation_pending"
+        and buy_items
+        and all(item.status == "core_activation_pending" for item in buy_items)
+        and all(
+            _pending_activation_state_matches(
+                state=states[item.id],
+                dispatch_material_fingerprint=(
+                    command.dispatch_material_fingerprint
+                ),
+                authority_generation_fingerprint=(
+                    command.authority_generation_fingerprint
+                ),
+            )
+            for item in buy_items
+        )
+    )
+    if not pending_state_is_exact:
+        db.rollback()
+        return _activation_failure(
+            command=command,
+            status_code=409,
+            reason_code="activation_state_not_pending",
+            execution_plan_id=plan.id,
+        )
+
+    activated_at = datetime.now(UTC)
+    for item in buy_items:
+        state = states[item.id]
+        assert state is not None
+        prior_status = str(state["prior_status"])
+        risk_context = dict(item.risk_context or {})
+        risk_context[CORE_V4_ACTIVATION_STATE_KEY] = {
+            **state,
+            "status": "activated",
+            "activated_at": activated_at.isoformat(),
+            "activation_requested_at": command.requested_at.isoformat(),
+        }
+        item.risk_context = risk_context
+        item.status = prior_status
+        db.add(
+            ExecutionPlanItemAudit(
+                id=new_id(),
+                execution_plan_item_id=item.id,
+                event_type="core_activation_confirmed",
+                source="kai-trading-core",
+                summary={
+                    "prior_status": "core_activation_pending",
+                    "restored_status": prior_status,
+                },
+                payload={
+                    "schema_version": command.schema_version,
+                    "contract_version": command.contract_version,
+                    "required_capability": command.required_capability,
+                    "authority_generation_fingerprint": (
+                        command.authority_generation_fingerprint
+                    ),
+                    "dispatch_material_fingerprint": (
+                        command.dispatch_material_fingerprint
+                    ),
+                    "requested_at": command.requested_at.isoformat(),
+                },
+            )
+        )
+    plan.status = "accepted"
+    db.commit()
+    return _activation_success(
+        command=command,
+        execution_plan_id=plan.id,
+        idempotent_replay=False,
+    )
+
+
+def _core_activation_state(
+    item: ExecutionPlanItem,
+) -> dict[str, object] | None:
+    risk_context = item.risk_context if isinstance(item.risk_context, dict) else {}
+    state = risk_context.get(CORE_V4_ACTIVATION_STATE_KEY)
+    return dict(state) if isinstance(state, dict) else None
+
+
+def _pending_activation_state_matches(
+    *,
+    state: dict[str, object] | None,
+    dispatch_material_fingerprint: str,
+    authority_generation_fingerprint: str,
+) -> bool:
+    return bool(
+        isinstance(state, dict)
+        and set(state)
+        == {
+            "version",
+            "status",
+            "prior_status",
+            "dispatch_material_fingerprint",
+            "authority_generation_fingerprint",
+        }
+        and state.get("version") == CORE_V4_ACTIVATION_STATE_VERSION
+        and state.get("status") == "pending"
+        and _nonempty_text(state.get("prior_status")) is not None
+        and state.get("prior_status") != "core_activation_pending"
+        and state.get("dispatch_material_fingerprint")
+        == dispatch_material_fingerprint
+        and state.get("authority_generation_fingerprint")
+        == authority_generation_fingerprint
+    )
+
+
+def _activation_success(
+    *,
+    command: CoreExecutionActivationRequestV4,
+    execution_plan_id: str,
+    idempotent_replay: bool,
+) -> CreateExecutionPlanResult:
+    return CreateExecutionPlanResult(
+        status_code=200,
+        payload={
+            "plan_id": command.plan_id,
+            "execution_plan_id": execution_plan_id,
+            "contract_ack": {
+                "schema_version": CORE_EXECUTION_ACTIVATION_SCHEMA_VERSION,
+                "contract_version": CORE_EXECUTION_HANDOFF_CONTRACT_VERSION,
+                "capability": CORE_EXECUTION_ACTIVATION_CAPABILITY,
+                "plan_id": command.plan_id,
+                "status": "activated",
+                "dispatch_material_fingerprint": (
+                    command.dispatch_material_fingerprint
+                ),
+                "authority_generation_fingerprint": (
+                    command.authority_generation_fingerprint
+                ),
+            },
+            "item_acks": [
+                {
+                    "core_item_key": item.core_item_key,
+                    "execution_plan_item_id": item.execution_plan_item_id,
+                    "decision_snapshot_id": item.decision_snapshot_id,
+                    "status": "activated",
+                    "execution_plan_id": execution_plan_id,
+                }
+                for item in command.items
+            ],
+            "activated_item_count": len(command.items),
+            "idempotent_replay": idempotent_replay,
+        },
+    )
+
+
+def _activation_failure(
+    *,
+    command: CoreExecutionActivationRequestV4,
+    status_code: int,
+    reason_code: str,
+    execution_plan_id: str | None = None,
+) -> CreateExecutionPlanResult:
+    payload: dict[str, object] = {
+        "plan_id": command.plan_id,
+        "reason_code": reason_code,
+        "activated_item_count": 0,
+        "item_acks": [],
+    }
+    if execution_plan_id is not None:
+        payload["execution_plan_id"] = execution_plan_id
+    return CreateExecutionPlanResult(status_code=status_code, payload=payload)
 
 
 def _protected_entry_family_failure(

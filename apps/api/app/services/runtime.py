@@ -86,7 +86,7 @@ from app.services.execution_account_route import (
     validate_execution_account_scope,
 )
 from app.services.execution_semantics import KRX_EXCHANGES, WATCH_BUY_INTENTS
-from app.services.schema import check_runtime_schema
+from app.services.schema import check_runtime_schema, execution_position_readiness
 from app.services.runtime_controls import (
     ensure_runtime_control_state,
     runtime_safety_payload,
@@ -2755,6 +2755,16 @@ def exec_agent_runtime_configuration(settings: Settings) -> dict[str, object]:
     }
 
 
+def _blocking_readiness_reason(blocker: dict[str, object]) -> str:
+    parts = [str(blocker.get("reason") or "runtime_schema_not_ready")]
+    remediation = str(blocker.get("remediation") or "").strip()
+    if remediation:
+        parts.append(f"remediation={remediation}")
+    if blocker.get("restart_required") is True:
+        parts.append("restart_required=true")
+    return "; ".join(parts)
+
+
 def build_runtime_status(
     *,
     settings: Settings,
@@ -2800,11 +2810,17 @@ def build_runtime_status(
         else {"status": "not_reported", "reason": None}
     )
     startup_gate_blocked = startup_gate_payload.get("status") == "blocked"
-    startup_gate_reasons = (
-        ["automated runtime startup is blocked; migrate if needed and restart"]
-        if startup_gate_blocked
-        else []
-    )
+    if startup_gate_blocked and startup_gate_payload.get("remediation"):
+        startup_gate_reasons = [
+            "automated runtime startup is blocked: "
+            f"{_blocking_readiness_reason(startup_gate_payload)}"
+        ]
+    elif startup_gate_blocked:
+        startup_gate_reasons = [
+            "automated runtime startup is blocked; migrate if needed and restart"
+        ]
+    else:
+        startup_gate_reasons = []
     if isinstance(runtime_startup_gate, dict):
         dependencies["automated_runtime_startup"] = (
             "blocked" if startup_gate_blocked else "ok"
@@ -3114,9 +3130,12 @@ def build_runtime_status(
     dependencies["runtime_schema"] = str(schema["status"])
     if schema["status"] != "ok":
         counts_available = False
+        position_readiness = execution_position_readiness(schema)
         missing_tables = schema.get("missing_tables") or []
         missing_columns = schema.get("missing_columns") or {}
-        if missing_tables:
+        if position_readiness is not None:
+            schema_reason = _blocking_readiness_reason(position_readiness)
+        elif missing_tables:
             schema_reason = (
                 "runtime schema incomplete: "
                 f"missing {', '.join(str(table) for table in missing_tables)}; run migrations"

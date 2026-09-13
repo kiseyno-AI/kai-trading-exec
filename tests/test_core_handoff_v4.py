@@ -24,7 +24,7 @@ from app.models.runtime import (
     ExecutionPlanItemAudit,
 )
 from app.services import core_handoff_v4
-from app.services.execution_jobs import _lock_job_for_broker_submission
+from app.services.execution_jobs import _claim_job, _lock_job_for_broker_submission
 from app.services.watch_exec_agent_sizing import _apply_decisions
 from openclaw_contract_test_support import verified_runtime_provenance
 
@@ -35,6 +35,10 @@ PLAN_CAPABILITY = "delegated_final_full_cost_gate_recheck_v1"
 PLAN_ACK_SCHEMA_VERSION = "execution_handoff_ack_v4"
 REVOCATION_SCHEMA_VERSION = "execution_handoff_revocation_v4"
 REVOCATION_CAPABILITY = "atomic_pre_submission_revocation_v1"
+ACTIVATION_SCHEMA_VERSION = "execution_handoff_activation_v1"
+ACTIVATION_CAPABILITY = "core_confirmed_activation_v1"
+ACTIVATION_BINDING_SCHEMA_VERSION = "core_execution_activation_binding_v1"
+AUTHORITY_GENERATION_FINGERPRINT = "a" * 64
 
 
 def _refresh_material_fingerprint(payload: dict[str, object]) -> None:
@@ -151,6 +155,24 @@ def _plan_payload(*, plan_id: str = "core-v4-plan") -> dict[str, object]:
     return payload
 
 
+def _activation_bound_plan_payload(
+    *,
+    plan_id: str = "core-v4-activation-bound-plan",
+    authority_generation_fingerprint: str = AUTHORITY_GENERATION_FINGERPRINT,
+) -> dict[str, object]:
+    payload = _plan_payload(plan_id=plan_id)
+    for item in payload["items"]:
+        item["risk_context"]["_core_activation"] = {
+            "schema_version": ACTIVATION_BINDING_SCHEMA_VERSION,
+            "mode": "core_confirmed",
+            "authority_generation_fingerprint": (
+                authority_generation_fingerprint
+            ),
+        }
+    _refresh_material_fingerprint(payload)
+    return payload
+
+
 def _revocation_payload(
     create_payload: dict[str, object],
     item_acks: list[dict[str, object]],
@@ -171,6 +193,43 @@ def _revocation_payload(
                 "core_item_key": ack["core_item_key"],
                 "execution_plan_item_id": ack["execution_plan_item_id"],
                 "decision_snapshot_id": "101",
+            }
+            for ack in item_acks
+        ],
+    }
+
+
+def _activation_payload(
+    create_payload: dict[str, object],
+    create_response: dict[str, object],
+    *,
+    authority_generation_fingerprint: str = AUTHORITY_GENERATION_FINGERPRINT,
+) -> dict[str, object]:
+    item_acks = create_response["item_acks"]
+    decision_snapshot_by_key = {
+        item["core_item_key"]: item["decision_snapshot_id"]
+        for item in create_payload["items"]
+    }
+    return {
+        "schema_version": ACTIVATION_SCHEMA_VERSION,
+        "contract_version": CONTRACT_VERSION,
+        "required_capability": ACTIVATION_CAPABILITY,
+        "plan_id": create_payload["plan_id"],
+        "execution_plan_id": create_response["execution_plan_id"],
+        "dispatch_material_fingerprint": create_payload["metadata"][
+            "dispatch_material_fingerprint"
+        ],
+        "authority_generation_fingerprint": (
+            authority_generation_fingerprint
+        ),
+        "requested_at": "2026-09-09T12:05:00Z",
+        "items": [
+            {
+                "core_item_key": ack["core_item_key"],
+                "execution_plan_item_id": ack["execution_plan_item_id"],
+                "decision_snapshot_id": decision_snapshot_by_key[
+                    ack["core_item_key"]
+                ],
             }
             for ack in item_acks
         ],
@@ -265,6 +324,16 @@ def test_v4_intake_requires_exact_contract_and_returns_one_to_one_durable_ack() 
     assert all(item["execution_plan_item_id"] for item in body["item_acks"])
     assert len({item["execution_plan_item_id"] for item in body["item_acks"]}) == 3
 
+    with app.state.db_session_factory() as session:
+        plan = session.scalar(
+            select(ExecutionPlan).options(selectinload(ExecutionPlan.items))
+        )
+        assert plan is not None
+        assert plan.status == "accepted"
+        assert all(
+            item.status != "core_activation_pending" for item in plan.items
+        )
+
     readback = client.get(
         "/v4/execution-plans",
         params={"external_plan_id": "core-v4-strict-plan"},
@@ -276,6 +345,281 @@ def test_v4_intake_requires_exact_contract_and_returns_one_to_one_durable_ack() 
     duplicate = client.post("/v4/execution-plans", json=v4_payload)
     assert duplicate.status_code == 409
     assert "contract_ack" not in duplicate.json()
+    engine.dispose()
+
+
+def test_v4_core_confirmed_plan_is_nonclaimable_until_activation() -> None:
+    app, engine = _build_test_app()
+    client = TestClient(app)
+    payload = _activation_bound_plan_payload()
+
+    response = client.post("/v4/execution-plans", json=payload)
+
+    assert response.status_code == 201, response.json()
+    assert response.json()["contract_ack"]["status"] == "accepted"
+    with app.state.db_session_factory() as session:
+        plan = session.scalar(
+            select(ExecutionPlan).options(selectinload(ExecutionPlan.items))
+        )
+        assert plan is not None
+        assert plan.status == "activation_pending"
+        buy = next(item for item in plan.items if item.side == "buy")
+        assert buy.status == "core_activation_pending"
+        assert buy.risk_context["_core_activation_state"]["prior_status"] == (
+            "watch_monitoring_pending"
+        )
+        job = ExecutionJob(
+            id="core-activation-pending-job",
+            execution_plan_item_id=buy.id,
+            job_type="next_open_buy",
+            status="scheduled",
+            scheduled_for=datetime(2026, 9, 10, 0, 0, tzinfo=UTC),
+        )
+        session.add(job)
+        session.commit()
+
+        assert not _claim_job(
+            db=session,
+            job=job,
+            triggered_at=datetime(2026, 9, 10, 0, 1, tzinfo=UTC),
+        )
+        session.refresh(job)
+        assert job.status == "scheduled"
+        assert job.locked_at is None
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    "mutate_binding",
+    [
+        lambda payload: payload["items"][0]["risk_context"].pop(
+            "_core_activation"
+        ),
+        lambda payload: payload["items"][0]["risk_context"][
+            "_core_activation"
+        ].update({"unexpected": True}),
+        lambda payload: payload["items"][0]["risk_context"][
+            "_core_activation"
+        ].update({"authority_generation_fingerprint": "b" * 64}),
+    ],
+)
+def test_v4_activation_binding_must_be_exact_and_plan_wide(
+    mutate_binding,
+) -> None:
+    app, engine = _build_test_app()
+    client = TestClient(app)
+    payload = _activation_bound_plan_payload(
+        plan_id="core-v4-invalid-activation-binding"
+    )
+    mutate_binding(payload)
+    _refresh_material_fingerprint(payload)
+
+    response = client.post("/v4/execution-plans", json=payload)
+
+    assert response.status_code == 422
+    with app.state.db_session_factory() as session:
+        assert session.scalar(select(ExecutionPlan)) is None
+    engine.dispose()
+
+
+def test_v4_exact_activation_restores_buy_and_replay_is_idempotent() -> None:
+    app, engine = _build_test_app()
+    client = TestClient(app)
+    create_payload = _activation_bound_plan_payload(
+        plan_id="core-v4-exact-activation"
+    )
+    created = client.post("/v4/execution-plans", json=create_payload)
+    assert created.status_code == 201, created.json()
+    activation_payload = _activation_payload(create_payload, created.json())
+
+    activated = client.post(
+        "/v4/execution-plans/activations",
+        json=activation_payload,
+    )
+
+    assert activated.status_code == 200, activated.json()
+    assert activated.json() == {
+        "plan_id": create_payload["plan_id"],
+        "execution_plan_id": created.json()["execution_plan_id"],
+        "contract_ack": {
+            "schema_version": ACTIVATION_SCHEMA_VERSION,
+            "contract_version": CONTRACT_VERSION,
+            "capability": ACTIVATION_CAPABILITY,
+            "plan_id": create_payload["plan_id"],
+            "status": "activated",
+            "dispatch_material_fingerprint": create_payload["metadata"][
+                "dispatch_material_fingerprint"
+            ],
+            "authority_generation_fingerprint": (
+                AUTHORITY_GENERATION_FINGERPRINT
+            ),
+        },
+        "item_acks": [
+            {
+                **item,
+                "status": "activated",
+                "execution_plan_id": created.json()["execution_plan_id"],
+            }
+            for item in activation_payload["items"]
+        ],
+        "activated_item_count": 3,
+        "idempotent_replay": False,
+    }
+    with app.state.db_session_factory() as session:
+        plan = session.scalar(
+            select(ExecutionPlan).options(selectinload(ExecutionPlan.items))
+        )
+        assert plan is not None
+        assert plan.status == "accepted"
+        buy = next(item for item in plan.items if item.side == "buy")
+        assert buy.status == "watch_monitoring_pending"
+        assert buy.risk_context["_core_activation_state"]["status"] == (
+            "activated"
+        )
+        activation_audits_before_replay = session.scalars(
+            select(ExecutionPlanItemAudit).where(
+                ExecutionPlanItemAudit.event_type
+                == "core_activation_confirmed"
+            )
+        ).all()
+        assert len(activation_audits_before_replay) == 1
+
+    replay = client.post(
+        "/v4/execution-plans/activations",
+        json=activation_payload,
+    )
+
+    assert replay.status_code == 200, replay.json()
+    assert replay.json()["idempotent_replay"] is True
+    with app.state.db_session_factory() as session:
+        activation_audits_after_replay = session.scalars(
+            select(ExecutionPlanItemAudit).where(
+                ExecutionPlanItemAudit.event_type
+                == "core_activation_confirmed"
+            )
+        ).all()
+        assert len(activation_audits_after_replay) == 1
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("mismatch", "expected_status"),
+    [
+        ("plan_id", 404),
+        ("execution_plan_id", 404),
+        ("dispatch_material_fingerprint", 409),
+        ("authority_generation_fingerprint", 409),
+        ("core_item_key", 409),
+        ("execution_plan_item_id", 409),
+        ("decision_snapshot_id", 409),
+        ("incomplete_items", 409),
+    ],
+)
+def test_v4_activation_mismatch_leaves_the_entire_plan_pending(
+    mismatch: str,
+    expected_status: int,
+) -> None:
+    app, engine = _build_test_app()
+    client = TestClient(app)
+    create_payload = _activation_bound_plan_payload(
+        plan_id=f"core-v4-activation-mismatch-{mismatch}"
+    )
+    created = client.post("/v4/execution-plans", json=create_payload)
+    assert created.status_code == 201, created.json()
+    activation_payload = _activation_payload(create_payload, created.json())
+    if mismatch == "plan_id":
+        activation_payload["plan_id"] = "other-plan"
+    elif mismatch == "execution_plan_id":
+        activation_payload["execution_plan_id"] = "other-execution-plan"
+    elif mismatch == "dispatch_material_fingerprint":
+        activation_payload["dispatch_material_fingerprint"] = "b" * 64
+    elif mismatch == "authority_generation_fingerprint":
+        activation_payload["authority_generation_fingerprint"] = "b" * 64
+    elif mismatch == "incomplete_items":
+        activation_payload["items"].pop()
+    else:
+        activation_payload["items"][0][mismatch] = f"other-{mismatch}"
+
+    response = client.post(
+        "/v4/execution-plans/activations",
+        json=activation_payload,
+    )
+
+    assert response.status_code == expected_status, response.json()
+    assert response.json()["activated_item_count"] == 0
+    with app.state.db_session_factory() as session:
+        plan = session.scalar(
+            select(ExecutionPlan).options(selectinload(ExecutionPlan.items))
+        )
+        assert plan is not None
+        assert plan.status == "activation_pending"
+        assert all(
+            item.status == "core_activation_pending"
+            for item in plan.items
+            if item.side == "buy"
+        )
+        confirmed_audits = session.scalars(
+            select(ExecutionPlanItemAudit).where(
+                ExecutionPlanItemAudit.event_type
+                == "core_activation_confirmed"
+            )
+        ).all()
+        assert confirmed_audits == []
+    engine.dispose()
+
+
+def test_v4_preactivation_revocation_cannot_be_reactivated() -> None:
+    app, engine = _build_test_app()
+    client = TestClient(app)
+    create_payload = _activation_bound_plan_payload(
+        plan_id="core-v4-revoked-before-activation"
+    )
+    created = client.post("/v4/execution-plans", json=create_payload)
+    assert created.status_code == 201, created.json()
+    item_acks = created.json()["item_acks"]
+    activation_payload = _activation_payload(create_payload, created.json())
+    with app.state.db_session_factory() as session:
+        session.add(
+            ExecutionJob(
+                id="core-preactivation-revocation-job",
+                execution_plan_item_id=item_acks[0][
+                    "execution_plan_item_id"
+                ],
+                job_type="next_open_buy",
+                status="scheduled",
+                scheduled_for=datetime(2026, 9, 10, 0, 0, tzinfo=UTC),
+            )
+        )
+        session.commit()
+
+    revoked = client.post(
+        "/v4/execution-plans/revocations",
+        json=_revocation_payload(create_payload, item_acks),
+    )
+    reactivation = client.post(
+        "/v4/execution-plans/activations",
+        json=activation_payload,
+    )
+
+    assert revoked.status_code == 200, revoked.json()
+    assert reactivation.status_code == 409, reactivation.json()
+    assert reactivation.json()["reason_code"] == "activation_state_not_pending"
+    with app.state.db_session_factory() as session:
+        plan = session.scalar(
+            select(ExecutionPlan).options(selectinload(ExecutionPlan.items))
+        )
+        assert plan is not None
+        assert plan.status == "revoked"
+        assert all(item.status == "revoked" for item in plan.items)
+        job = session.get(ExecutionJob, "core-preactivation-revocation-job")
+        assert job is not None
+        assert job.status == "revoked"
+        assert session.scalars(
+            select(ExecutionPlanItemAudit).where(
+                ExecutionPlanItemAudit.event_type
+                == "core_activation_confirmed"
+            )
+        ).all() == []
     engine.dispose()
 
 

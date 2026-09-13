@@ -217,6 +217,12 @@ CORE_EXECUTION_PLAN_CAPABILITY = "delegated_final_full_cost_gate_recheck_v1"
 CORE_EXECUTION_PLAN_ACK_SCHEMA_VERSION = "execution_handoff_ack_v4"
 CORE_EXECUTION_REVOCATION_SCHEMA_VERSION = "execution_handoff_revocation_v4"
 CORE_EXECUTION_REVOCATION_CAPABILITY = "atomic_pre_submission_revocation_v1"
+CORE_EXECUTION_ACTIVATION_BINDING_KEY = "_core_activation"
+CORE_EXECUTION_ACTIVATION_BINDING_SCHEMA_VERSION = (
+    "core_execution_activation_binding_v1"
+)
+CORE_EXECUTION_ACTIVATION_SCHEMA_VERSION = "execution_handoff_activation_v1"
+CORE_EXECUTION_ACTIVATION_CAPABILITY = "core_confirmed_activation_v1"
 _DISPATCH_MATERIAL_FINGERPRINT_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _SKIP_DISPATCH_MATERIAL_FINGERPRINT_CONTEXT_KEY = (
     "skip_dispatch_material_fingerprint_validation"
@@ -466,6 +472,51 @@ class CoreExecutionPlanRequestV4(BaseModel):
             raise ValueError("requested_at must equal metadata.requested_at")
         if any(item.decision_agent_name != self.metadata.decision_agent_name for item in self.items):
             raise ValueError("all items must match metadata.decision_agent_name")
+        activation_bindings_present = [
+            CORE_EXECUTION_ACTIVATION_BINDING_KEY in item.risk_context
+            for item in self.items
+        ]
+        if any(activation_bindings_present):
+            if not all(activation_bindings_present):
+                raise ValueError(
+                    "_core_activation must be present on every v4 plan item"
+                )
+            authority_generations: set[str] = set()
+            for item in self.items:
+                activation_binding = item.risk_context.get(
+                    CORE_EXECUTION_ACTIVATION_BINDING_KEY
+                )
+                if (
+                    not isinstance(activation_binding, dict)
+                    or set(activation_binding)
+                    != {
+                        "schema_version",
+                        "mode",
+                        "authority_generation_fingerprint",
+                    }
+                    or activation_binding.get("schema_version")
+                    != CORE_EXECUTION_ACTIVATION_BINDING_SCHEMA_VERSION
+                    or activation_binding.get("mode") != "core_confirmed"
+                ):
+                    raise ValueError("_core_activation binding is invalid")
+                authority_generation = activation_binding.get(
+                    "authority_generation_fingerprint"
+                )
+                if (
+                    not isinstance(authority_generation, str)
+                    or _DISPATCH_MATERIAL_FINGERPRINT_PATTERN.fullmatch(
+                        authority_generation
+                    )
+                    is None
+                ):
+                    raise ValueError(
+                        "_core_activation authority generation is invalid"
+                    )
+                authority_generations.add(authority_generation)
+            if len(authority_generations) != 1:
+                raise ValueError(
+                    "all _core_activation bindings must share one authority generation"
+                )
         keys = [item.core_item_key for item in self.items]
         if len(keys) != len(set(keys)):
             raise ValueError("core_item_key values must be unique")
@@ -543,6 +594,43 @@ class CoreExecutionRevocationRequestV4(BaseModel):
         item_ids = [item.execution_plan_item_id for item in self.items]
         if len(keys) != len(set(keys)) or len(item_ids) != len(set(item_ids)):
             raise ValueError("revocation item bindings must be one-to-one")
+        return self
+
+
+class CoreExecutionActivationItemV4(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    core_item_key: str = Field(min_length=1, max_length=128)
+    execution_plan_item_id: str = Field(min_length=1, max_length=36)
+    decision_snapshot_id: str = Field(min_length=1, max_length=128)
+
+
+class CoreExecutionActivationRequestV4(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal[CORE_EXECUTION_ACTIVATION_SCHEMA_VERSION]
+    contract_version: Literal[CORE_EXECUTION_HANDOFF_CONTRACT_VERSION]
+    required_capability: Literal[CORE_EXECUTION_ACTIVATION_CAPABILITY]
+    plan_id: str = Field(min_length=1, max_length=128)
+    execution_plan_id: str = Field(min_length=1, max_length=36)
+    dispatch_material_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    authority_generation_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    requested_at: datetime
+    items: list[CoreExecutionActivationItemV4] = Field(min_length=1)
+
+    @field_validator("requested_at")
+    @classmethod
+    def require_timezone_aware_requested_at(cls, value: datetime) -> datetime:
+        return _require_timezone_aware_datetime(value)
+
+    @model_validator(mode="after")
+    def require_unique_activation_bindings(
+        self,
+    ) -> "CoreExecutionActivationRequestV4":
+        keys = [item.core_item_key for item in self.items]
+        item_ids = [item.execution_plan_item_id for item in self.items]
+        if len(keys) != len(set(keys)) or len(item_ids) != len(set(item_ids)):
+            raise ValueError("activation item bindings must be one-to-one")
         return self
 
 
