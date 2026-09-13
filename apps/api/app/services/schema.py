@@ -344,6 +344,20 @@ def check_runtime_schema(db: Session) -> dict[str, object]:
     }
 
 
+def execution_position_readiness(
+    runtime_schema: dict[str, object],
+) -> dict[str, object] | None:
+    if runtime_schema.get("status") != "blocked":
+        return None
+    blocking_data = runtime_schema.get("blocking_data")
+    if not isinstance(blocking_data, dict):
+        return None
+    position_readiness = blocking_data.get("execution_positions")
+    if not isinstance(position_readiness, dict):
+        return None
+    return {**position_readiness, "restart_required": True}
+
+
 def _count_unattributed_non_flat_positions(db: Session) -> int:
     count = db.scalar(
         text(
@@ -498,8 +512,56 @@ def _has_check_constraint(
 
 
 def _normalize_check_expression(value: str) -> str:
-    return "".join(
-        character
-        for character in value.casefold()
-        if not character.isspace() and character not in {'(', ')', '"', '`'}
-    )
+    value = _strip_postgresql_noop_text_casts(value)
+    normalized: list[str] = []
+    index = 0
+    inside_literal = False
+    while index < len(value):
+        character = value[index]
+        if character == "'":
+            normalized.append(character)
+            if inside_literal and index + 1 < len(value) and value[index + 1] == "'":
+                normalized.append("'")
+                index += 2
+                continue
+            inside_literal = not inside_literal
+        elif inside_literal:
+            # SQL string values are case- and whitespace-sensitive. Only the
+            # surrounding expression syntax is normalized for comparison.
+            normalized.append(character)
+        elif not character.isspace() and character not in {'(', ')', '"', '`'}:
+            normalized.append(character.casefold())
+        index += 1
+    return "".join(normalized)
+
+
+def _strip_postgresql_noop_text_casts(value: str) -> str:
+    normalized: list[str] = []
+    index = 0
+    inside_literal = False
+    while index < len(value):
+        character = value[index]
+        if character == "'":
+            normalized.append(character)
+            if inside_literal and index + 1 < len(value) and value[index + 1] == "'":
+                normalized.append("'")
+                index += 2
+                continue
+            inside_literal = not inside_literal
+            index += 1
+            continue
+        if not inside_literal and value.startswith("::", index):
+            type_start = index + 2
+            while type_start < len(value) and value[type_start].isspace():
+                type_start += 1
+            type_end = type_start + len("text")
+            next_character = value[type_end : type_end + 1]
+            if (
+                value[type_start:type_end].casefold() == "text"
+                and not (next_character.isalnum() or next_character == "_")
+            ):
+                index = type_end
+                continue
+        normalized.append(character)
+        index += 1
+    return "".join(normalized)

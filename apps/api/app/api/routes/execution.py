@@ -11,6 +11,7 @@ from app.api.dependencies import (
     get_settings,
 )
 from app.api.schemas.execution import (
+    CoreExecutionActivationRequestV4,
     CoreExecutionPlanRequestV4,
     CoreExecutionRevocationRequestV4,
     ExecutionFailureStatusUpdateRequest,
@@ -35,6 +36,7 @@ from app.services.execution_api import (
     preview_execution_plan,
 )
 from app.services.core_handoff_v4 import (
+    activate_core_execution_plan_v4,
     create_core_execution_plan_v4,
     list_core_execution_plans_v4,
     revoke_core_execution_plan_v4,
@@ -173,6 +175,27 @@ def revoke_core_execution_plan_v4_handler(
         if runtime is not None:
             runtime.invalidate_monitoring_runtime_snapshot(
                 reason="core_execution_plan_v4_revoked"
+            )
+    return JSONResponse(status_code=result.status_code, content=result.payload)
+
+
+@router.post("/v4/execution-plans/activations")
+def activate_core_execution_plan_v4_handler(
+    request: Request,
+    db: Annotated[Session, Depends(get_db_session)],
+    payload: CoreExecutionActivationRequestV4 = Body(...),
+) -> JSONResponse:
+    settings: Settings = get_settings(request)
+    result = activate_core_execution_plan_v4(
+        settings=settings,
+        db=db,
+        command=payload,
+    )
+    if result.status_code == 200:
+        runtime = getattr(request.app.state, "autonomous_runtime", None)
+        if runtime is not None:
+            runtime.invalidate_monitoring_runtime_snapshot(
+                reason="core_execution_plan_v4_activated"
             )
     return JSONResponse(status_code=result.status_code, content=result.payload)
 

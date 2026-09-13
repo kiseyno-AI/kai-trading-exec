@@ -7814,6 +7814,8 @@ def _build_watch_buy_test_app(
     *,
     order_id: str = "kis-watch-buy-100",
     resume: bool = True,
+    database_url: str = "sqlite:///:memory:",
+    token_cache_directory: str | None = None,
     max_quote_age_seconds: int = 30,
     retry_cooldown_seconds: int = 5,
     account_drawdown_gate_enabled: bool = False,
@@ -7834,9 +7836,14 @@ def _build_watch_buy_test_app(
         token_grant=build_token_grant(),
         order_placement=build_order_placement(broker_order_id=order_id),
     )
+    settings_overrides = (
+        {"kis_token_cache_directory": token_cache_directory}
+        if token_cache_directory is not None
+        else {}
+    )
     app, engine = build_test_app(
         settings=Settings(
-            database_url="sqlite:///:memory:",
+            database_url=database_url,
             runtime_mode="paper",
             kis_app_key="paper-key",
             kis_app_secret="paper-secret",
@@ -7857,6 +7864,7 @@ def _build_watch_buy_test_app(
                 account_drawdown_recovery_min_observation_interval_seconds
             ),
             watch_buy_late_entry_mode=late_entry_mode,
+            **settings_overrides,
         ),
         broker_adapter=broker_adapter,
     )
@@ -8693,25 +8701,30 @@ def _create_watch_buy_candidate(
 
 
 @pytest.mark.parametrize(
-    "terminal_status",
-    ("revoked", "manual_review_required", "contract_quarantined"),
+    "nonclaimable_status",
+    (
+        "revoked",
+        "manual_review_required",
+        "contract_quarantined",
+        "core_activation_pending",
+    ),
 )
 @pytest.mark.parametrize("entrypoint", ("direct", "monitoring"))
 def test_nonclaimable_buy_plan_item_never_reaches_broker(
-    terminal_status: str,
+    nonclaimable_status: str,
     entrypoint: str,
 ) -> None:
     app, engine, client, broker_adapter = _build_watch_buy_test_app(
-        order_id=f"must-not-submit-{entrypoint}-{terminal_status}",
+        order_id=f"must-not-submit-{entrypoint}-{nonclaimable_status}",
     )
     item_id = _create_watch_buy_candidate(
         client,
-        plan_id=f"plan-{entrypoint}-{terminal_status}",
+        plan_id=f"plan-{entrypoint}-{nonclaimable_status}",
     )
     with app.state.db_session_factory() as session:
         item = session.get(ExecutionPlanItem, item_id)
         assert item is not None
-        item.status = terminal_status
+        item.status = nonclaimable_status
         session.commit()
 
     order_payload = {
@@ -8749,11 +8762,216 @@ def test_nonclaimable_buy_plan_item_never_reaches_broker(
     with app.state.db_session_factory() as session:
         item = session.get(ExecutionPlanItem, item_id)
         assert item is not None
-        assert item.status == terminal_status
+        assert item.status == nonclaimable_status
         assert session.scalar(
             select(BrokerOrder).where(
                 BrokerOrder.execution_plan_item_id == item_id,
             )
+        ) is None
+    engine.dispose()
+
+
+def test_monitoring_order_cannot_overwrite_concurrent_core_activation_pending(
+    tmp_path,
+) -> None:
+    app, engine, client, broker_adapter = _build_watch_buy_test_app(
+        order_id="must-not-submit-before-core-activation",
+        database_url=f"sqlite:///{tmp_path / 'monitoring-core-activation.db'}",
+        token_cache_directory=str(tmp_path / "monitoring-core-activation-token-cache"),
+    )
+    item_id = _create_watch_buy_candidate(
+        client,
+        plan_id="plan-monitoring-core-activation-pending",
+        market_date="2024-01-03",
+    )
+    triggered_at = datetime(2024, 1, 3, 1, 0, tzinfo=UTC)
+
+    with app.state.db_session_factory() as monitoring_session:
+        stale_item = monitoring_session.get(ExecutionPlanItem, item_id)
+        assert stale_item is not None
+        # Match the real monitoring cycle's in-memory transition immediately
+        # before _place_monitoring_order persists its command authority.
+        stale_item.status = "watch_buy_triggered"
+
+        with app.state.db_session_factory() as activation_session:
+            pending_item = activation_session.get(ExecutionPlanItem, item_id)
+            assert pending_item is not None
+            pending_context = dict(pending_item.risk_context or {})
+            pending_context["_core_activation_state"] = {
+                "status": "pending",
+                "sentinel": "must-survive-stale-monitoring",
+            }
+            pending_item.risk_context = pending_context
+            pending_item.status = "core_activation_pending"
+            activation_session.commit()
+
+        placement = monitoring_service._place_monitoring_order(
+            settings=app.state.settings,
+            db=monitoring_session,
+            adapter=broker_adapter,
+            item=stale_item,
+            quantity=2,
+            observed_price=Decimal("71000.00"),
+            trigger_reason="watch_price_triggered",
+            trigger_metadata=None,
+            triggered_at=triggered_at,
+        )
+
+    assert placement.status_code == 409
+    assert placement.payload["block_reason"] == "execution_plan_item_state_changed"
+    assert placement.payload["preserve_plan_item_status"] is True
+    assert broker_adapter.order_calls == []
+    with app.state.db_session_factory() as session:
+        item = session.get(ExecutionPlanItem, item_id)
+        assert item is not None
+        assert item.status == "core_activation_pending"
+        assert item.risk_context["_core_activation_state"] == {
+            "status": "pending",
+            "sentinel": "must-survive-stale-monitoring",
+        }
+        assert session.scalar(
+            select(BrokerOrder).where(BrokerOrder.execution_plan_item_id == item_id)
+        ) is None
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    "concurrent_status",
+    ("watch_buy_triggered_blocked", "watch_monitoring_active"),
+    ids=("claimable-status-changed", "claimable-risk-revision-changed"),
+)
+def test_monitoring_order_requires_exact_claimable_state_revision(
+    tmp_path,
+    concurrent_status: str,
+) -> None:
+    app, engine, client, broker_adapter = _build_watch_buy_test_app(
+        order_id=f"must-not-submit-after-{concurrent_status}",
+        database_url=f"sqlite:///{tmp_path / f'claimable-{concurrent_status}.db'}",
+        token_cache_directory=str(tmp_path / f"claimable-{concurrent_status}-tokens"),
+    )
+    item_id = _create_watch_buy_candidate(
+        client,
+        plan_id=f"plan-concurrent-{concurrent_status}",
+        market_date="2024-01-03",
+    )
+    triggered_at = datetime(2024, 1, 3, 1, 0, tzinfo=UTC)
+
+    with app.state.db_session_factory() as monitoring_session:
+        stale_item = monitoring_session.get(ExecutionPlanItem, item_id)
+        assert stale_item is not None
+        # The production selector eagerly loads risk_context. Keep that stale
+        # snapshot so this test exercises the actual lost-update shape.
+        assert isinstance(stale_item.risk_context, dict)
+        stale_item.status = "watch_buy_triggered"
+
+        with app.state.db_session_factory() as concurrent_session:
+            concurrent_item = concurrent_session.get(ExecutionPlanItem, item_id)
+            assert concurrent_item is not None
+            concurrent_context = dict(concurrent_item.risk_context or {})
+            concurrent_context["concurrent_claimable_revision"] = {
+                "sentinel": "must-survive-stale-monitoring",
+            }
+            concurrent_item.risk_context = concurrent_context
+            concurrent_item.status = concurrent_status
+            concurrent_session.commit()
+
+        placement = monitoring_service._place_monitoring_order(
+            settings=app.state.settings,
+            db=monitoring_session,
+            adapter=broker_adapter,
+            item=stale_item,
+            quantity=2,
+            observed_price=Decimal("71000.00"),
+            trigger_reason="watch_price_triggered",
+            trigger_metadata=None,
+            triggered_at=triggered_at,
+        )
+
+    assert placement.status_code == 409
+    assert placement.payload["block_reason"] == "execution_plan_item_state_changed"
+    assert placement.payload["preserve_plan_item_status"] is True
+    assert broker_adapter.order_calls == []
+    with app.state.db_session_factory() as session:
+        item = session.get(ExecutionPlanItem, item_id)
+        assert item is not None
+        assert item.status == concurrent_status
+        assert item.risk_context["concurrent_claimable_revision"] == {
+            "sentinel": "must-survive-stale-monitoring",
+        }
+        assert session.scalar(
+            select(BrokerOrder).where(BrokerOrder.execution_plan_item_id == item_id)
+        ) is None
+    engine.dispose()
+
+
+def test_monitoring_cycle_does_not_write_after_preserved_state_change(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    app, engine, client, broker_adapter = _build_watch_buy_test_app(
+        order_id="must-not-submit-during-preserved-cycle",
+        database_url=f"sqlite:///{tmp_path / 'preserved-cycle.db'}",
+        token_cache_directory=str(tmp_path / "preserved-cycle-tokens"),
+    )
+    item_id = _create_watch_buy_candidate(
+        client,
+        plan_id="plan-preserved-monitoring-cycle",
+        market_date="2024-01-03",
+    )
+    original_place_monitoring_order = monitoring_service._place_monitoring_order
+
+    def place_after_core_hold(**kwargs):
+        with app.state.db_session_factory() as activation_session:
+            pending_item = activation_session.get(ExecutionPlanItem, item_id)
+            assert pending_item is not None
+            pending_context = dict(pending_item.risk_context or {})
+            pending_context["_core_activation_state"] = {
+                "status": "pending",
+                "sentinel": "caller-must-not-rewrite",
+            }
+            pending_item.risk_context = pending_context
+            pending_item.status = "core_activation_pending"
+            activation_session.commit()
+        return original_place_monitoring_order(**kwargs)
+
+    monkeypatch.setattr(
+        monitoring_service,
+        "_place_monitoring_order",
+        place_after_core_hold,
+    )
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "observed_at": "2024-01-03T01:00:00Z",
+            "prices": [
+                {
+                    "symbol": "005930",
+                    "price": "71000.00",
+                    "observed_at": "2024-01-03T01:00:00Z",
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["items"][0]["outcome"] == "blocked"
+    assert (
+        response.json()["items"][0]["block_reason"]
+        == "execution_plan_item_state_changed"
+    )
+    assert broker_adapter.order_calls == []
+    with app.state.db_session_factory() as session:
+        item = session.get(ExecutionPlanItem, item_id)
+        assert item is not None
+        assert item.status == "core_activation_pending"
+        assert item.risk_context["_core_activation_state"] == {
+            "status": "pending",
+            "sentinel": "caller-must-not-rewrite",
+        }
+        assert session.scalar(
+            select(BrokerOrder).where(BrokerOrder.execution_plan_item_id == item_id)
         ) is None
     engine.dispose()
 

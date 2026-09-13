@@ -33,7 +33,7 @@ from app.services.runtime_controls import (
     ensure_runtime_control_state,
     pause_runtime,
 )
-from app.services.schema import check_runtime_schema
+from app.services.schema import check_runtime_schema, execution_position_readiness
 
 LOGGER = logging.getLogger(__name__)
 
@@ -119,7 +119,7 @@ def create_app(
                 }
         schema_ready = runtime_schema.get("status") == "ok"
         if automated_runtime_requested and not schema_ready:
-            position_readiness = _execution_position_readiness(runtime_schema)
+            position_readiness = execution_position_readiness(runtime_schema)
             reason = (
                 str(position_readiness["reason"])
                 if position_readiness is not None
@@ -141,7 +141,7 @@ def create_app(
                 startup_gate.update(
                     {
                         "remediation": position_readiness.get("remediation"),
-                        "restart_required": True,
+                        "restart_required": position_readiness["restart_required"],
                     }
                 )
             app.state.runtime_startup_gate = startup_gate
@@ -263,18 +263,6 @@ def _automated_runtime_requested(settings: Settings) -> bool:
         or settings.alpaca_crypto_monitoring_enabled
         or settings.alpaca_us_equity_monitoring_enabled
     )
-
-
-def _execution_position_readiness(
-    runtime_schema: dict[str, object],
-) -> dict[str, object] | None:
-    if runtime_schema.get("status") != "blocked":
-        return None
-    blocking_data = runtime_schema.get("blocking_data")
-    if not isinstance(blocking_data, dict):
-        return None
-    position_readiness = blocking_data.get("execution_positions")
-    return position_readiness if isinstance(position_readiness, dict) else None
 
 
 async def _stop_runtime_coordinators(
