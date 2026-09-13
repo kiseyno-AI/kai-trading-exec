@@ -176,6 +176,7 @@ PLAN_ITEM_NONCLAIMABLE_STATUSES = (
     ACCOUNT_DRAWDOWN_RECOVERY_INELIGIBLE_PLAN_STATUSES
     | frozenset(
         {
+            "core_activation_pending",
             "contract_quarantined",
             "manual_review_required",
             "revoked",

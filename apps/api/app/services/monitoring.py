@@ -14,9 +14,10 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import and_, distinct, func, or_, select, tuple_
+from sqlalchemy import and_, distinct, func, or_, select, tuple_, update
 from sqlalchemy import inspect as sa_inspect
 from sqlalchemy.orm import Session, load_only, selectinload
+from sqlalchemy.orm.attributes import set_committed_value
 
 from app.api.schemas.execution import (
     MonitoringEvaluationRequest,
@@ -76,7 +77,9 @@ from app.services.reconciliation import (
 )
 from app.services.broker_orders import (
     ACCOUNT_DRAWDOWN_RECOVERY_INELIGIBLE_PLAN_STATUSES,
+    PLAN_ITEM_NONCLAIMABLE_STATUSES,
     _current_buy_plan_item_state,
+    _plan_item_state_changed_result,
     inspect_account_drawdown_recovery,
     place_broker_order,
 )
@@ -3070,6 +3073,9 @@ def _evaluate_monitoring_cycle(
                 )
             elif placement.status_code == 409 and "block_reason" in placement.payload:
                 blocked_item_count += 1
+                preserve_current_plan_status = (
+                    _placement_preserves_current_plan_status(placement.payload)
+                )
                 hourly_risk_off_blocked = (
                     placement.payload.get("block_reason") == "hourly_plan_risk_off"
                 )
@@ -3081,7 +3087,7 @@ def _evaluate_monitoring_cycle(
                             if is_watch_buy
                             else f"{action.item.intent}_triggered_blocked"
                         )
-                elif _placement_preserves_current_plan_status(placement.payload):
+                elif preserve_current_plan_status:
                     db.refresh(action.item, attribute_names=["status", "risk_context"])
                 else:
                     action.item.status = (
@@ -3089,7 +3095,7 @@ def _evaluate_monitoring_cycle(
                         if is_watch_buy
                         else f"{action.item.intent}_triggered_blocked"
                     )
-                if is_watch_buy:
+                if is_watch_buy and not preserve_current_plan_status:
                     _record_monitoring_event(
                         item=action.item,
                         event={
@@ -13101,6 +13107,20 @@ def _place_monitoring_order(
     before_success_commit: Callable[[], None] | None = None,
     deterministic_sell_quantity_cap: int | None = None,
 ):
+    item_state = sa_inspect(item)
+    expected_status = str(
+        _attribute_value_before_local_changes(
+            item_state.attrs.status.history,
+            fallback=item.status,
+        )
+    )
+    expected_risk_context = dict(
+        _attribute_value_before_local_changes(
+            item_state.attrs.risk_context.history,
+            fallback=_loaded_risk_context(item, allow_file_backed_load=True),
+        )
+        or {}
+    )
     is_watch_buy = _is_watch_buy_item(item)
     limit_price = (
         limit_price_override
@@ -13159,7 +13179,75 @@ def _place_monitoring_order(
         "command": order_request.model_dump(mode="json"),
     }
     item.risk_context = compact_json_object(authority_context)
-    db.flush()
+    # The cycle has already staged a trigger status on this ORM item. Persist
+    # that status and its command authority only while the durable row remains
+    # claimable; an unconditional flush can resurrect a stale item over a Core
+    # activation hold or operator terminal transition committed after selection.
+    with db.no_autoflush:
+        guarded_update = db.execute(
+            update(ExecutionPlanItem)
+            .where(
+                ExecutionPlanItem.id == item.id,
+                ExecutionPlanItem.status == expected_status,
+                ExecutionPlanItem.status.not_in(
+                    tuple(PLAN_ITEM_NONCLAIMABLE_STATUSES)
+                ),
+            )
+            .values(
+                status=item.status,
+            )
+            .execution_options(synchronize_session=False)
+        )
+    if guarded_update.rowcount != 1:
+        current_plan_state = _current_buy_plan_item_state(
+            db=db,
+            item_id=item.id,
+            lock=False,
+        )
+        if current_plan_state is not None:
+            set_committed_value(item, "status", current_plan_state[0])
+            set_committed_value(item, "risk_context", current_plan_state[1])
+        return _plan_item_state_changed_result(side=order_request.side)
+    current_plan_state = _current_buy_plan_item_state(
+        db=db,
+        item_id=item.id,
+        lock=False,
+    )
+    if (
+        current_plan_state is None
+        or current_plan_state[1] != expected_risk_context
+    ):
+        if current_plan_state is not None:
+            restored_update = db.execute(
+                update(ExecutionPlanItem)
+                .where(
+                    ExecutionPlanItem.id == item.id,
+                    ExecutionPlanItem.status == item.status,
+                )
+                .values(status=expected_status)
+                .execution_options(synchronize_session=False)
+            )
+            if restored_update.rowcount == 1:
+                set_committed_value(item, "status", expected_status)
+                set_committed_value(
+                    item,
+                    "risk_context",
+                    current_plan_state[1],
+                )
+        return _plan_item_state_changed_result(side=order_request.side)
+    persisted_risk_context = db.execute(
+        update(ExecutionPlanItem)
+        .where(
+            ExecutionPlanItem.id == item.id,
+            ExecutionPlanItem.status == item.status,
+        )
+        .values(risk_context=item.risk_context)
+        .execution_options(synchronize_session=False)
+    )
+    if persisted_risk_context.rowcount != 1:
+        return _plan_item_state_changed_result(side=order_request.side)
+    set_committed_value(item, "status", item.status)
+    set_committed_value(item, "risk_context", item.risk_context)
     return place_broker_order(
         settings=settings,
         db=db,
