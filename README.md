@@ -36,6 +36,7 @@ curl http://127.0.0.1:8010/health
 curl http://127.0.0.1:8010/runtime/status
 curl http://127.0.0.1:8010/runtime/safety
 curl http://127.0.0.1:8010/runtime/daily-board
+curl http://127.0.0.1:8010/runtime/monitored-symbol-membership
 curl http://127.0.0.1:8010/runtime/portfolio-risk
 ```
 
@@ -61,6 +62,7 @@ attribution procedure, and rollback limits are in
 - The idempotency intent is committed before the broker call. An unexpected pre-call failure is persisted as `failed`; if submission has started and no acknowledgement is available, the order becomes `manual_review_required` with a `submit_outcome_unknown` event. Its cash or sell quantity remains reserved across sessions, and no replacement order should be created until an operator records terminal broker truth. Raw exception details are not returned.
 - Rejected-order retries remain bound to the persisted provider, opaque account scope, venue, asset class, exchange, plan item, failure/attempt, and idempotency lineage. A later session route change creates no replacement order and moves the source to manual review. Only a conclusive pre-submit replay may exclude its own reservation; unrelated pending, unknown-outcome, and open orders still reserve funds or holdings. Alpaca `buying_power` is already net of broker-visible open orders, so those orders are not subtracted twice, while local intents the broker has not seen remain reserved.
 - `/runtime/portfolio-risk` is an advisory read model. It does not place, amend, cancel, or reconcile orders.
+- `/runtime/monitored-symbol-membership` is a read-only KRX membership snapshot for Core. Consumers may remove a previously observed symbol only when `membership_complete` is `true`; partial or unavailable snapshots are additive evidence only.
 - Never commit `.env`, `.env.paper`, broker credentials, account identifiers, database files, or runtime logs.
 
 Example authenticated non-loopback configuration:
@@ -659,7 +661,7 @@ Interactive OpenAPI is available at `/docs` and `/redoc`.
 
 | Area | Endpoints |
 | --- | --- |
-| Health/runtime | `GET /health`, `/runtime/status`, `/runtime/safety`, `/runtime/daily-board`, `/runtime/portfolio-risk` (`market=all|krx|us`), `/runtime/alpaca-crypto`, `/runtime/alpaca-us-equity`; `POST /runtime/plan-judgment/action` |
+| Health/runtime | `GET /health`, `/runtime/status`, `/runtime/safety`, `/runtime/daily-board`, `/runtime/monitored-symbol-membership`, `/runtime/portfolio-risk` (`market=all|krx|us`), `/runtime/alpaca-crypto`, `/runtime/alpaca-us-equity`; `POST /runtime/plan-judgment/action` |
 | Broker session | `GET /broker/session`, `POST /broker/session/authenticate`, `POST /broker/session/revoke` |
 | Controls | `POST /controls/pause`, `/controls/resume`, `/controls/kill-switch` |
 | Core v4 delegation | `GET/POST /v4/execution-plans`, `POST /v4/execution-plans/revocations` |
