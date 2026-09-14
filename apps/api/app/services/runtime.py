@@ -6,7 +6,14 @@ from zoneinfo import ZoneInfo
 
 from sqlalchemy import and_, distinct, func, literal, or_, select
 from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.orm import Session, load_only, selectinload, undefer
+from sqlalchemy.orm import (
+    Session,
+    aliased,
+    contains_eager,
+    load_only,
+    selectinload,
+    undefer,
+)
 
 from app.broker.base import BrokerAdapter
 from app.core.config import Settings
@@ -62,6 +69,12 @@ from app.services.monitoring import (
     PENDING_DISPATCH_MONITORING_STATUSES,
     SELL_ACTIVE_MONITORING_STATUSES,
     SELL_PENDING_CONFIG_STATUSES,
+    _effective_monitor_plan_filter,
+    _is_krx_equity_symbol,
+    _monitoring_item_is_effective_at,
+    _symbols_with_recent_flat_position_truth,
+    _symbols_with_unexited_buy_orders,
+    resolve_monitoring_symbol_cycle_limit,
 )
 from app.services.trigger_time_exec_agent import (
     AGENT_APPROVED_PENDING_SUBMIT_STATUS,
@@ -98,6 +111,9 @@ MONITORED_INTENTS = ("target_sell", "stop_sell")
 SELL_MONITORED_INTENTS = ("target_sell", "stop_sell", "max_holding_close_sell")
 WATCH_BUY_INTENTS = tuple(sorted(WATCH_BUY_INTENTS))
 KIS_US_EXCHANGES = frozenset({"AMEX", "NASD", "NYSE"})
+RUNTIME_MONITORED_SYMBOL_MEMBERSHIP_SCHEMA_VERSION = (
+    "runtime_monitored_symbol_membership_v1"
+)
 RUNTIME_PROVIDER_EXCHANGES = {
     "alpaca": ("ALPACA", "US"),
     "kis": tuple(sorted(KRX_EXCHANGES | KIS_US_EXCHANGES)),
@@ -2190,6 +2206,10 @@ def runtime_monitored_symbols(
     today_start_utc: datetime | None = None,
     provider: str = "kis",
     runtime_scope: RuntimeExecutionScope | None = None,
+    allowed_exchanges: frozenset[str] | None = None,
+    include_held_positions: bool = False,
+    effective_at: datetime | None = None,
+    include_pending_sell_fallback: bool = False,
 ) -> list[str]:
     if today_start_utc is None:
         today_start_utc, _ = _runtime_today_utc_bounds(
@@ -2197,58 +2217,156 @@ def runtime_monitored_symbols(
             provider=provider,
             runtime_scope=runtime_scope,
         )
-    held_position_routes = {
-        (str(symbol), str(exchange).strip().upper())
-        for symbol, exchange in db.execute(
-            select(ExecutionPosition.symbol, ExecutionPosition.exchange).where(
-                *_active_runtime_position_filters(
-                    settings=settings,
-                    provider=provider,
-                    runtime_scope=runtime_scope,
-                ),
+    held_position_routes: set[tuple[str, str]] = set()
+    held_position_symbols: set[str] = set()
+    held_positions = db.execute(
+        select(ExecutionPosition.symbol, ExecutionPosition.exchange).where(
+            *_active_runtime_position_filters(
+                settings=settings,
+                provider=provider,
+                runtime_scope=runtime_scope,
+            ),
+            or_(
                 ExecutionPosition.quantity > 0,
+                ExecutionPosition.base_quantity > 0,
+            ),
+        )
+    ).all()
+    for symbol, raw_exchange in held_positions:
+        exchange = str(raw_exchange or "").strip().upper()
+        if allowed_exchanges is not None and exchange not in allowed_exchanges:
+            continue
+        normalized_symbol = str(symbol)
+        held_position_symbols.add(normalized_symbol)
+        held_position_routes.add(
+            (
+                normalized_symbol,
+                _runtime_membership_identity_exchange(
+                    provider=provider,
+                    exchange=exchange,
+                ),
             )
-        ).all()
-    }
+        )
     sell_statuses = tuple(
         SELL_ACTIVE_MONITORING_STATUSES
         | SELL_PENDING_CONFIG_STATUSES
         | BLOCKED_MONITORING_STATUSES
         | PENDING_DISPATCH_MONITORING_STATUSES
     )
+    pending_sell_symbol_query = None
+    if include_pending_sell_fallback:
+        # The scheduler deliberately lets pending protection survive a future
+        # plan date. Keep that branch outside the active-watch date predicate.
+        fresh_position_truth_after = datetime.now(UTC) - timedelta(
+            seconds=settings.exec_agent_max_account_snapshot_age_seconds
+        )
+        fresh_known_flat_symbols = select(ExecutionPosition.symbol).where(
+            *_active_runtime_position_filters(
+                settings=settings,
+                provider=provider,
+                runtime_scope=runtime_scope,
+            ),
+            ExecutionPosition.quantity <= 0,
+            ExecutionPosition.last_reconciled_at.is_not(None),
+            ExecutionPosition.last_reconciled_at >= fresh_position_truth_after,
+        )
+        pending_item = aliased(ExecutionPlanItem)
+        pending_plan = aliased(ExecutionPlan)
+        pending_sell_symbol_query = (
+            select(distinct(pending_item.symbol))
+            .join(pending_plan, pending_item.execution_plan_id == pending_plan.id)
+            .where(
+                pending_plan.mode == settings.runtime_mode,
+                pending_item.side == "sell",
+                pending_item.intent.in_(SELL_MONITORED_INTENTS),
+                pending_item.status.in_(tuple(SELL_PENDING_CONFIG_STATUSES)),
+                pending_item.symbol.not_in(fresh_known_flat_symbols),
+            )
+            .order_by(pending_item.symbol.asc())
+            .limit(resolve_monitoring_symbol_cycle_limit(settings=settings) * 4)
+        )
+    active_watch_filter = and_(
+        ExecutionPlanItem.side == "buy",
+        ExecutionPlanItem.intent.in_(WATCH_BUY_INTENTS),
+        ExecutionPlanItem.status.in_(tuple(ACTIVE_WATCH_MONITORING_STATUSES)),
+    )
+    standard_monitored_filter = (
+        active_watch_filter
+        if include_pending_sell_fallback
+        else or_(
+            and_(
+                ExecutionPlanItem.side == "sell",
+                ExecutionPlanItem.intent.in_(SELL_MONITORED_INTENTS),
+                ExecutionPlanItem.status.in_(sell_statuses),
+            ),
+            active_watch_filter,
+        )
+    )
+    if effective_at is not None:
+        standard_monitored_filter = and_(
+            _effective_monitor_plan_filter(
+                effective_at=effective_at,
+                current_market_date=None,
+            ),
+            standard_monitored_filter,
+        )
+    monitored_filter = standard_monitored_filter
+    if pending_sell_symbol_query is not None:
+        monitored_filter = or_(
+            standard_monitored_filter,
+            and_(
+                ExecutionPlanItem.side == "sell",
+                ExecutionPlanItem.intent.in_(SELL_MONITORED_INTENTS),
+                ExecutionPlanItem.status.in_(tuple(SELL_PENDING_CONFIG_STATUSES)),
+                ExecutionPlanItem.symbol.in_(pending_sell_symbol_query),
+            ),
+        )
     monitored_items = db.scalars(
         select(ExecutionPlanItem)
         .join(ExecutionPlanItem.plan)
         .where(
             ExecutionPlan.mode == settings.runtime_mode,
-            or_(
-                and_(
-                    ExecutionPlanItem.side == "sell",
-                    ExecutionPlanItem.intent.in_(SELL_MONITORED_INTENTS),
-                    ExecutionPlanItem.status.in_(sell_statuses),
-                ),
-                and_(
-                    ExecutionPlanItem.side == "buy",
-                    ExecutionPlanItem.intent.in_(WATCH_BUY_INTENTS),
-                    ExecutionPlanItem.status.in_(
-                        tuple(ACTIVE_WATCH_MONITORING_STATUSES)
-                    ),
-                ),
-            ),
+            monitored_filter,
         )
         .options(
             load_only(
                 ExecutionPlanItem.symbol,
                 ExecutionPlanItem.side,
+                ExecutionPlanItem.status,
                 ExecutionPlanItem.provider,
                 ExecutionPlanItem.venue,
+                ExecutionPlanItem.asset_class,
                 ExecutionPlanItem.risk_context,
                 ExecutionPlanItem.quantity_policy,
-            )
+            ),
+            contains_eager(ExecutionPlanItem.plan).load_only(
+                ExecutionPlan.id,
+                ExecutionPlan.market_date,
+            ),
         )
     ).all()
-    monitored_symbols: set[str] = set()
+    monitored_symbols = (
+        set(held_position_symbols) if include_held_positions else set()
+    )
+    pending_sell_symbols: set[str] = set()
     for item in monitored_items:
+        if (
+            include_pending_sell_fallback
+            and item.side == "sell"
+            and item.status in SELL_PENDING_CONFIG_STATUSES
+        ):
+            if _is_krx_equity_symbol(item.symbol):
+                pending_sell_symbols.add(str(item.symbol))
+            continue
+        if (
+            effective_at is not None
+            and item.side == "buy"
+            and not _monitoring_item_is_effective_at(
+                item=item,
+                effective_at=effective_at,
+            )
+        ):
+            continue
         exchange = _active_runtime_plan_item_exchange(
             settings=settings,
             item=item,
@@ -2257,14 +2375,216 @@ def runtime_monitored_symbols(
         )
         if exchange is None:
             continue
+        if allowed_exchanges is not None and exchange not in allowed_exchanges:
+            continue
         if (
             item.side == "sell"
             and settings.runtime_mode == "live"
-            and (item.symbol, exchange) not in held_position_routes
+            and (
+                item.symbol,
+                _runtime_membership_identity_exchange(
+                    provider=provider,
+                    exchange=exchange,
+                ),
+            )
+            not in held_position_routes
         ):
             continue
         monitored_symbols.add(item.symbol)
+    if include_pending_sell_fallback:
+        monitored_symbols.update(
+            _runtime_pending_sell_fallback_symbols(
+                settings=settings,
+                db=db,
+                pending_sell_symbols=sorted(pending_sell_symbols),
+                existing_symbols=monitored_symbols,
+            )
+        )
     return sorted(monitored_symbols)
+
+
+def _runtime_pending_sell_fallback_symbols(
+    *,
+    settings: Settings,
+    db: Session,
+    pending_sell_symbols: list[str],
+    existing_symbols: set[str],
+) -> list[str]:
+    symbol_cycle_limit = resolve_monitoring_symbol_cycle_limit(settings=settings)
+    if len(existing_symbols) >= symbol_cycle_limit:
+        return []
+    flat_symbols = (
+        _symbols_with_recent_flat_position_truth(
+            settings=settings,
+            db=db,
+            symbols=pending_sell_symbols,
+        )
+        if settings.runtime_mode == "live"
+        else set()
+    )
+    unexited_buy_order_symbols = _symbols_with_unexited_buy_orders(
+        settings=settings,
+        db=db,
+        symbols=pending_sell_symbols,
+    )
+    fallback_symbols: list[str] = []
+    for symbol in pending_sell_symbols:
+        if symbol in existing_symbols or symbol in flat_symbols:
+            continue
+        if symbol in unexited_buy_order_symbols:
+            fallback_symbols.append(symbol)
+        if len(existing_symbols) + len(fallback_symbols) >= symbol_cycle_limit:
+            break
+    return fallback_symbols
+
+
+def _runtime_membership_identity_exchange(*, provider: str, exchange: str) -> str:
+    normalized_exchange = str(exchange or "").strip().upper()
+    if (
+        _normalize_runtime_provider(provider) == "kis"
+        and normalized_exchange in KRX_EXCHANGES
+    ):
+        return "KRX"
+    return normalized_exchange
+
+
+def _runtime_is_ascii_krx_symbol(symbol: object) -> bool:
+    text = str(symbol or "")
+    return len(text) == 6 and all("0" <= character <= "9" for character in text)
+
+
+def _runtime_membership_indeterminate_position_count(
+    *,
+    settings: Settings,
+    db: Session,
+    provider: str,
+    exchanges: frozenset[str],
+) -> int:
+    provider_names = RUNTIME_PROVIDER_BROKER_NAMES.get(provider, (provider,))
+    count = db.scalar(
+        select(func.count(ExecutionPosition.id)).where(
+            ExecutionPosition.mode == settings.runtime_mode,
+            or_(
+                ExecutionPosition.quantity != 0,
+                func.coalesce(ExecutionPosition.base_quantity, 0) != 0,
+            ),
+            or_(
+                ExecutionPosition.provider.is_(None),
+                func.lower(ExecutionPosition.provider).in_(provider_names),
+            ),
+            or_(
+                ExecutionPosition.exchange.is_(None),
+                func.upper(ExecutionPosition.exchange).in_(tuple(exchanges)),
+            ),
+            or_(
+                ExecutionPosition.provider.is_(None),
+                ExecutionPosition.account_scope.is_(None),
+                ExecutionPosition.exchange.is_(None),
+            ),
+        )
+    )
+    return int(count or 0)
+
+
+def build_runtime_monitored_symbol_membership(
+    *,
+    settings: Settings,
+    db: Session,
+) -> dict[str, object]:
+    generated_at = datetime.now(UTC)
+    provider = _normalize_runtime_provider(settings.runtime_broker_provider)
+    runtime_scope = _resolve_runtime_execution_scope(
+        settings=settings,
+        provider=provider,
+    )
+    execution_scope = _runtime_execution_scope_payload(runtime_scope)
+    membership_exchanges = frozenset(KRX_EXCHANGES)
+
+    def payload(
+        *,
+        symbols: list[str],
+        membership_complete: bool,
+        reason: str | None,
+    ) -> dict[str, object]:
+        return {
+            "schema_version": RUNTIME_MONITORED_SYMBOL_MEMBERSHIP_SCHEMA_VERSION,
+            "market_date": generated_at.astimezone(KRX_TIMEZONE).date().isoformat(),
+            "generated_at": generated_at.isoformat(),
+            "membership_complete": membership_complete,
+            "symbols": symbols,
+            "membership_scope": {
+                "market": "KRX",
+                "exchanges": sorted(membership_exchanges),
+            },
+            "coverage": {
+                "status": "complete" if membership_complete else "unavailable",
+                "reason": reason,
+                "provider": provider,
+                "runtime_mode": settings.runtime_mode,
+                "execution_scope": execution_scope,
+            },
+        }
+
+    if provider != "kis":
+        return payload(
+            symbols=[],
+            membership_complete=False,
+            reason="runtime_membership_provider_unsupported",
+        )
+
+    if not runtime_scope.available:
+        return payload(
+            symbols=[],
+            membership_complete=False,
+            reason="runtime_execution_scope_unavailable",
+        )
+
+    try:
+        symbols = runtime_monitored_symbols(
+            settings=settings,
+            db=db,
+            provider=provider,
+            runtime_scope=runtime_scope,
+            allowed_exchanges=membership_exchanges,
+            include_held_positions=True,
+            effective_at=generated_at,
+            include_pending_sell_fallback=True,
+        )
+        invalid_krx_symbols = [
+            symbol for symbol in symbols if not _runtime_is_ascii_krx_symbol(symbol)
+        ]
+        symbols = [
+            symbol for symbol in symbols if _runtime_is_ascii_krx_symbol(symbol)
+        ]
+        indeterminate_position_count = (
+            _runtime_membership_indeterminate_position_count(
+                settings=settings,
+                db=db,
+                provider=provider,
+                exchanges=membership_exchanges,
+            )
+        )
+    except SQLAlchemyError:
+        db.rollback()
+        return payload(
+            symbols=[],
+            membership_complete=False,
+            reason="runtime_membership_query_unavailable",
+        )
+
+    if invalid_krx_symbols:
+        return payload(
+            symbols=symbols,
+            membership_complete=False,
+            reason="runtime_membership_invalid_krx_symbol",
+        )
+    if indeterminate_position_count:
+        return payload(
+            symbols=symbols,
+            membership_complete=False,
+            reason="runtime_membership_scope_blocked",
+        )
+    return payload(symbols=symbols, membership_complete=True, reason=None)
 
 
 def runtime_filled_today_summary(

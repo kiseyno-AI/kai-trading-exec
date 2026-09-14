@@ -19,6 +19,7 @@ from app.services.core_buy_authority import (
 )
 from app.services.runtime import (
     RuntimeMetadata,
+    build_runtime_monitored_symbol_membership,
     build_runtime_daily_board,
     build_runtime_safety,
     build_runtime_status,
@@ -61,6 +62,15 @@ def runtime_status(
             None,
         ),
     )
+
+
+@router.get("/monitored-symbol-membership")
+def runtime_monitored_symbol_membership(
+    request: Request,
+    db: Annotated[Session, Depends(get_db_session)],
+) -> dict[str, object]:
+    settings: Settings = get_settings(request)
+    return build_runtime_monitored_symbol_membership(settings=settings, db=db)
 
 
 @router.get("/safety")
