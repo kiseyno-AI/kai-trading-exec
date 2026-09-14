@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 from fastapi.testclient import TestClient
 import pytest
 from sqlalchemy import event, select
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.api.schemas.execution import PlaceOrderRequest
@@ -67,6 +68,7 @@ from app.services import broker_auth as broker_auth_service
 from app.services import broker_orders as broker_orders_service
 from app.services import execution_jobs as execution_jobs_service
 from app.services import monitoring as monitoring_service
+from app.services import order_intent_serialization as order_intent_serialization_service
 from app.services import plan_judgment_actions
 from app.services import runtime as runtime_service
 from app.services.account_drawdown_recovery import recovery_idempotency_key
@@ -4451,7 +4453,11 @@ def test_sqlite_order_intent_lock_file_is_private_and_not_a_symlink(
         time_in_force="day",
         exchange="KRX",
     )
-    monkeypatch.setattr(broker_orders_service, "gettempdir", lambda: str(tmp_path))
+    monkeypatch.setattr(
+        order_intent_serialization_service,
+        "gettempdir",
+        lambda: str(tmp_path),
+    )
 
     with broker_orders_service._serialized_order_intent_scope(
         settings=settings,
@@ -19424,8 +19430,11 @@ def test_final_broker_command_is_durable_before_process_loss_at_broker_boundary(
     assert replay.status_code == 200
     assert replay.payload["duplicate"] is True
     assert len(adapter.order_calls) == 1
-    assert len(advisory_lock_calls) == 2
-    assert advisory_lock_calls[0] == advisory_lock_calls[1]
+    assert len(advisory_lock_calls) == 3
+    assert all(
+        call == advisory_lock_calls[0]
+        for call in advisory_lock_calls[1:]
+    )
     engine.dispose()
 
 
@@ -19728,6 +19737,320 @@ def test_live_kis_us_sell_boundary_rejects_future_new_york_plan() -> None:
     )
 
 
+def _live_kis_us_next_open_order_case(
+    *,
+    case_name: str,
+    database_url: str = "sqlite:///:memory:",
+):
+    observed_at = datetime(2026, 9, 11, 13, 30, 1, tzinfo=UTC)
+
+    class TrustedUsAskAdapter(StubBrokerAdapter):
+        before_market_context = None
+
+        def get_live_market_context(self, access_token: str, **kwargs: object):
+            assert access_token
+            callback = self.before_market_context
+            self.before_market_context = None
+            if callable(callback):
+                callback()
+            endpoint = (
+                "/uapi/overseas-price/v1/quotations/inquire-asking-price"
+            )
+            return BrokerLiveMarketContext(
+                symbol=str(kwargs["symbol"]),
+                exchange=str(kwargs["exchange"]),
+                observed_at=observed_at,
+                bid=Decimal("99.90"),
+                ask=Decimal("100"),
+                normal_ordering_available=True,
+                payload={
+                    "provider": "kis",
+                    "endpoint": endpoint,
+                    "tr_id": "HHDFS76200100",
+                    "field_sources": {
+                        "ask": {
+                            "field": "pask1",
+                            "endpoint": endpoint,
+                            "tr_id": "HHDFS76200100",
+                        }
+                    },
+                },
+                freshness_source="kis_overseas_exchange_orderbook_time",
+            )
+
+    settings = Settings(
+        database_url=database_url,
+        runtime_mode="live",
+        automation_enabled=False,
+        kis_app_key="live-key",
+        kis_app_secret="live-secret",
+        kis_account_number="12345678",
+        kis_us_trading_enabled=True,
+        kis_us_live_trading_enabled=True,
+        kis_us_live_confirmation_token="ENABLE_KIS_US_LIVE",
+        kis_us_account_allowlist="12345678",
+        kis_us_round_trip_non_spread_cost_bps=Decimal("10"),
+        account_drawdown_recovery_scope_secret=(
+            "test-stable-route-secret-at-least-32-bytes"
+        ),
+        account_drawdown_gate_enabled=False,
+    )
+    adapter = TrustedUsAskAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="live",
+            configured=True,
+            api_base_url=KIS_LIVE_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(
+            broker_order_id=f"broker-{case_name}"
+        ),
+        account_snapshot=BrokerAccountSnapshot(
+            available_cash=Decimal("10000"),
+            buying_power=Decimal("10000"),
+            observed_at=observed_at,
+            source=f"stub:{case_name}",
+            total_asset_value=Decimal("10000"),
+            previous_total_asset_value=Decimal("10000"),
+            asset_change_amount=Decimal("0"),
+            unrealized_pnl=Decimal("0"),
+        ),
+    )
+    app, engine = build_test_app(settings=settings, broker_adapter=adapter)
+    client = TestClient(app)
+    assert client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "test", "reason": case_name},
+    ).status_code == 200
+    plan_response = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": f"plan-{case_name}",
+            "source": "test-fixture",
+            "market_date": "2026-09-11",
+            "items": [
+                {
+                    "symbol": "AAPL",
+                    "side": "buy",
+                    "intent": "next_open_buy",
+                    "quantity_policy": {"kind": "shares", "quantity": 1},
+                    "risk_context": {
+                        "target_price": "120",
+                        "stop_price": "90",
+                    },
+                    "provider": "kis",
+                    "venue": "kis",
+                    "asset_class": "us_equity",
+                    "exchange": "NASD",
+                    "currency": "USD",
+                    "source_plan_item_id": f"{case_name}:AAPL:buy",
+                    "limit_price": "100",
+                    "time_in_force": "day",
+                }
+            ],
+        },
+    )
+    assert plan_response.status_code == 201, plan_response.text
+    item_id = plan_response.json()["persisted_execution_item_ids"][0]
+    command = PlaceOrderRequest(
+        idempotency_key=f"order-{case_name}",
+        execution_plan_item_id=item_id,
+        provider="kis",
+        asset_class="us_equity",
+        venue="kis",
+        symbol="AAPL",
+        side="buy",
+        quantity=1,
+        order_type="limit",
+        limit_price=Decimal("100"),
+        time_in_force="day",
+        exchange="NASD",
+        metadata={"route_now": observed_at.isoformat()},
+    )
+    return app, engine, adapter, command, observed_at
+
+
+def test_kis_us_buy_is_blocked_by_initial_same_account_otc_quarantine() -> None:
+    app, engine, adapter, command, observed_at = _live_kis_us_next_open_order_case(
+        case_name="initial-otc-quarantine"
+    )
+    identity = build_position_identity(
+        settings=app.state.settings,
+        provider="kis",
+        exchange="OTCB",
+    )
+    with app.state.db_session_factory() as db:
+        db.add(
+            ExecutionPosition(
+                mode="live",
+                provider=identity.provider,
+                account_scope=f" {identity.account_scope.upper()} ",
+                exchange="OTCB",
+                symbol="AFIB",
+                quantity=4,
+                average_price=Decimal("1.25"),
+                updated_from="legacy_position_attribution",
+            )
+        )
+        db.commit()
+        result = broker_orders_service.place_broker_order(
+            settings=app.state.settings,
+            db=db,
+            adapter=adapter,
+            command=command,
+            request_source="execution-job:initial-otc-quarantine",
+            now=observed_at,
+            freshness_reference_at=observed_at,
+        )
+
+    assert result.status_code == 409
+    assert result.payload["block_reason"] == (
+        "kis_us_otc_position_quarantine_active"
+    )
+    assert result.payload["quarantined_position_count"] == 1
+    assert adapter.order_calls == []
+    with app.state.db_session_factory() as db:
+        assert db.scalars(select(BrokerOrder)).all() == []
+    engine.dispose()
+
+
+def test_kis_us_buy_final_boundary_persists_new_otc_quarantine_fence(
+    tmp_path,
+) -> None:
+    app, engine, adapter, command, observed_at = _live_kis_us_next_open_order_case(
+        case_name="late-otc-quarantine",
+        database_url=f"sqlite:///{tmp_path / 'late-otc-quarantine.db'}",
+    )
+    identity = build_position_identity(
+        settings=app.state.settings,
+        provider="kis",
+        exchange="OOTC",
+    )
+
+    def insert_quarantine_while_market_evidence_loads() -> None:
+        with app.state.db_session_factory() as db:
+            db.add(
+                ExecutionPosition(
+                    mode="live",
+                    provider=identity.provider,
+                    account_scope=identity.account_scope,
+                    exchange="OOTC",
+                    symbol="OTRQQ",
+                    quantity=2,
+                    average_price=Decimal("3.50"),
+                    updated_from="legacy_position_attribution",
+                )
+            )
+            db.commit()
+
+    adapter.before_market_context = insert_quarantine_while_market_evidence_loads
+    with app.state.db_session_factory() as db:
+        result = broker_orders_service.place_broker_order(
+            settings=app.state.settings,
+            db=db,
+            adapter=adapter,
+            command=command,
+            request_source="execution-job:late-otc-quarantine",
+            now=observed_at,
+            freshness_reference_at=observed_at,
+        )
+
+    assert result.status_code == 409
+    assert result.payload["block_reason"] == (
+        "kis_us_otc_position_quarantine_active"
+    )
+    assert result.payload["quarantined_position_count"] == 1
+    assert adapter.order_calls == []
+    with app.state.db_session_factory() as db:
+        order = db.scalar(
+            select(BrokerOrder).where(
+                BrokerOrder.idempotency_key == command.idempotency_key
+            )
+        )
+        assert order is not None
+        assert order.status == "rejected"
+        assert order.last_error_code == "kis_us_otc_position_quarantine_active"
+        assert order.request_metadata["runtime_safety_fence"]["block_reason"] == (
+            "kis_us_otc_position_quarantine_active"
+        )
+        event = db.scalar(
+            select(BrokerOrderEvent).where(
+                BrokerOrderEvent.broker_order_pk == order.id,
+                BrokerOrderEvent.event_type == "submission_blocked",
+            )
+        )
+        assert event is not None
+        assert event.broker_status == "kis_us_otc_position_quarantine_active"
+    engine.dispose()
+
+
+def test_kis_us_buy_nowait_conflict_persists_explicit_unavailable_fence(
+    monkeypatch,
+) -> None:
+    app, engine, adapter, command, observed_at = _live_kis_us_next_open_order_case(
+        case_name="otc-quarantine-lock-conflict"
+    )
+    original_check = broker_orders_service._kis_us_otc_quarantine_block
+    check_count = 0
+
+    def fail_final_quarantine_lock(**kwargs: object):
+        nonlocal check_count
+        check_count += 1
+        if check_count == 1:
+            return original_check(**kwargs)
+        db = kwargs["db"]
+        original_scalars = db.scalars
+
+        def raise_lock_error(*_args: object, **_kwargs: object):
+            raise DBAPIError("SELECT", {}, RuntimeError("lock unavailable"))
+
+        db.scalars = raise_lock_error
+        try:
+            return original_check(**kwargs)
+        finally:
+            db.scalars = original_scalars
+
+    monkeypatch.setattr(
+        broker_orders_service,
+        "_kis_us_otc_quarantine_block",
+        fail_final_quarantine_lock,
+    )
+    with app.state.db_session_factory() as db:
+        result = broker_orders_service.place_broker_order(
+            settings=app.state.settings,
+            db=db,
+            adapter=adapter,
+            command=command,
+            request_source="execution-job:otc-quarantine-lock-conflict",
+            now=observed_at,
+            freshness_reference_at=observed_at,
+        )
+
+    assert check_count == 2
+    assert result.status_code == 409
+    assert result.payload["block_reason"] == (
+        "kis_us_otc_position_quarantine_state_unavailable"
+    )
+    assert result.payload["quarantined_position_count"] is None
+    assert adapter.order_calls == []
+    with app.state.db_session_factory() as db:
+        order = db.scalar(
+            select(BrokerOrder).where(
+                BrokerOrder.idempotency_key == command.idempotency_key
+            )
+        )
+        assert order is not None
+        assert order.status == "rejected"
+        assert order.last_error_code == (
+            "kis_us_otc_position_quarantine_state_unavailable"
+        )
+        assert order.request_metadata["runtime_safety_fence"]["block_reason"] == (
+            "kis_us_otc_position_quarantine_state_unavailable"
+        )
+    engine.dispose()
+
+
 @pytest.mark.parametrize(
     ("valid_until", "expected_reason"),
     [
@@ -19764,7 +20087,7 @@ def test_live_sell_boundary_enforces_trigger_agent_valid_until(
     assert (failure[0] if failure is not None else None) == expected_reason
 
 
-def test_live_kis_us_held_stop_uses_fresh_timestamped_executable_bid() -> None:
+def test_live_kis_us_held_stop_ignores_buy_only_otc_quarantine() -> None:
     observed_at = datetime(2026, 9, 9, 14, 0, tzinfo=UTC)
     final_bid = Decimal("223.75")
 
@@ -19843,6 +20166,23 @@ def test_live_kis_us_held_stop_uses_fresh_timestamped_executable_bid() -> None:
         json={"actor": "ops", "source": "test", "reason": "run US stop"},
     ).status_code == 200
     with app.state.db_session_factory() as db:
+        quarantine_identity = build_position_identity(
+            settings=app.state.settings,
+            provider="kis",
+            exchange="OTCB",
+        )
+        db.add(
+            ExecutionPosition(
+                mode="live",
+                provider=quarantine_identity.provider,
+                account_scope=quarantine_identity.account_scope,
+                exchange="OTCB",
+                symbol="AFIB",
+                quantity=4,
+                average_price=Decimal("1.25"),
+                updated_from="legacy_position_attribution",
+            )
+        )
         risk_context, quantity_policy = _bound_kis_item_payloads(
             settings=settings,
             risk_context={"exchange": "NASD"},

@@ -27,6 +27,7 @@ class _SettingsStub:
     def __init__(self) -> None:
         self.database_url = ""
         self.runtime_mode = ""
+        self.account_drawdown_recovery_scope_secret = "s" * 32
 
     def model_copy(self, *, update: dict[str, str]) -> _SettingsStub:
         self.database_url = update["database_url"]
@@ -113,6 +114,101 @@ def test_legacy_attribution_exchange_routes_dry_run_without_mutation(
     ]
     assert '"mode": "dry-run"' in capsys.readouterr().out
     assert engine.disposed is True
+
+
+@pytest.mark.parametrize("exchange", ["OTCB", "OOTC"])
+def test_legacy_quarantine_attribution_routes_one_exact_exchange(
+    monkeypatch: pytest.MonkeyPatch,
+    exchange: str,
+) -> None:
+    db, engine = _stub_runtime(monkeypatch)
+    adapter = object()
+    calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(cli, "KisBrokerAdapter", lambda *, settings: adapter)
+    monkeypatch.setattr(
+        cli,
+        "analyze_legacy_position_attribution",
+        lambda **kwargs: calls.append(kwargs) or {"mode": "dry-run"},
+    )
+
+    assert (
+        cli.main(
+            [
+                "--database-url",
+                "sqlite:///test.db",
+                "--runtime-mode",
+                "live",
+                "--legacy-attribution-exchange",
+                exchange,
+            ]
+        )
+        == 0
+    )
+
+    assert calls == [
+        {
+            "settings": ANY,
+            "db": db,
+            "auth_session_factory": ANY,
+            "adapter": adapter,
+            "exchange": exchange,
+        }
+    ]
+    assert engine.disposed is True
+
+
+@pytest.mark.parametrize("runtime_mode", ["mock", "paper"])
+def test_legacy_quarantine_rejects_non_live_mode_before_settings_or_db_open(
+    monkeypatch: pytest.MonkeyPatch,
+    runtime_mode: str,
+) -> None:
+    monkeypatch.setattr(
+        cli,
+        "load_settings",
+        lambda: pytest.fail("non-live OTC attribution loaded settings"),
+    )
+    monkeypatch.setattr(
+        cli,
+        "create_db_engine",
+        lambda settings: pytest.fail("non-live OTC attribution opened database"),
+    )
+
+    with pytest.raises(SystemExit, match="requires --runtime-mode live"):
+        cli.main(
+            [
+                "--database-url",
+                "sqlite:///must-not-open.db",
+                "--runtime-mode",
+                runtime_mode,
+                "--legacy-attribution-exchange",
+                "OTCB",
+            ]
+        )
+
+
+def test_live_legacy_quarantine_requires_stable_scope_secret_before_db_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _SettingsStub()
+    settings.account_drawdown_recovery_scope_secret = "short"
+    monkeypatch.setattr(cli, "load_settings", lambda: settings)
+    monkeypatch.setattr(
+        cli,
+        "create_db_engine",
+        lambda _settings: pytest.fail("unsafe live OTC scope opened database"),
+    )
+
+    with pytest.raises(SystemExit, match="stable account scope secret"):
+        cli.main(
+            [
+                "--database-url",
+                "sqlite:///must-not-open.db",
+                "--runtime-mode",
+                "live",
+                "--legacy-attribution-exchange",
+                "OTCB",
+            ]
+        )
 
 
 def test_legacy_attribution_apply_routes_explicit_approvals_and_audit_metadata(
@@ -353,7 +449,7 @@ def test_legacy_attribution_rejects_unsafe_mode_combinations_before_db_open(
         )
 
 
-@pytest.mark.parametrize("exchange", ["krx", "OTCB", "ALL"])
+@pytest.mark.parametrize("exchange", ["krx", "otcb", "ALL"])
 def test_legacy_attribution_requires_an_exact_supported_exchange_before_db_open(
     monkeypatch: pytest.MonkeyPatch,
     exchange: str,

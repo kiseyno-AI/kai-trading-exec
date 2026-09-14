@@ -156,6 +156,39 @@ allowed, but the runtime remains blocked while even one non-flat unscoped row
 remains. Apply re-fetches complete broker holdings, compares the fingerprint in
 constant time, locks every target row, rechecks its digest/quantity/average price,
 and rolls back all changes if evidence drifted or an identity collision exists.
+Apply also shares the KIS account/currency process lock (and the file lock for
+file-backed SQLite) with order admission. SQLite reserves the database writer
+before the final collision recheck; PostgreSQL uses a non-waiting exact account
+advisory/table lock for the same boundary.
+
+`OTCB` and `OOTC` are attribution-only exceptions, not trading exchanges. In
+live mode their dry-run uses the fully paginated KIS all-US balance endpoint
+through a holdings-only adapter; it does not query orders, quotes, or buying
+power. A row receives a fingerprint only when the broker holding has the exact
+requested exchange, symbol, positive quantity, and average price, with no
+duplicate or target-route collision. Set a stable
+`KAI_EXEC_ACCOUNT_DRAWDOWN_RECOVERY_SCOPE_SECRET` of at least 32 UTF-8 bytes;
+the command exits before opening the database if this proof is unavailable.
+Run each exchange separately, for example:
+
+```bash
+.venv/bin/python scripts/refresh_execution_position_truth.py \
+  --runtime-mode live \
+  --legacy-attribution-exchange OTCB
+```
+
+An approved OTCB/OOTC row is stored as `account_attributed_quarantine` with
+`trade_eligible=false`, `monitoring_eligible=false`, and manual review required.
+This can remove the null-scope startup blocker after every legacy row is handled,
+but it does not enable OTC order routing, quotes, monitoring, or reconciliation.
+Manage any eventual exit directly with the broker until a separately reviewed
+execution route exists.
+
+For OTCB/OOTC dry runs, `quarantined_on_apply_count` is the number of exact,
+eligible matches that can be explicitly approved. `manual_review_count` includes
+all rows that remain manual-review-required, including those eligible quarantine
+matches and any ineligible candidates. After apply, `quarantined_count` is the
+number of approved rows actually written.
 
 After every real exchange is processed:
 

@@ -48,6 +48,7 @@ from app.broker.error_safety import (
 KIS_PROVIDER = "kis"
 KIS_DOMESTIC_EXCHANGES = frozenset({"KRX", "KOSPI", "KOSDAQ", "NXT", "SOR"})
 KIS_US_EXCHANGES = frozenset({"NASD", "NYSE", "AMEX"})
+KIS_LEGACY_US_HOLDINGS_QUERY_SCOPE = "kis_us_all_holdings_only_v1"
 KIS_LIVE_API_BASE_URL = "https://openapi.koreainvestment.com:9443"
 KIS_PAPER_API_BASE_URL = "https://openapivts.koreainvestment.com:29443"
 KIS_WEBSOCKET_APPROVAL_PATH = "/oauth2/Approval"
@@ -1364,6 +1365,84 @@ class KisBrokerAdapter(BrokerAdapter):
                     "complete" if open_orders_complete else "incomplete"
                 ),
                 "account_number_masked": _mask_account(self.settings.kis_account_number),
+            },
+        )
+
+    def get_legacy_us_holdings_snapshot(
+        self,
+        access_token: str,
+    ) -> BrokerAccountSnapshot:
+        """Read the complete all-US balance without opening trading surfaces."""
+        config = self._configured()
+        if self.settings.runtime_mode != "live":
+            raise BrokerAdapterError(
+                "KIS all-US holdings evidence is available only in live mode",
+                status_code=422,
+                classification=BrokerErrorClassification.VALIDATION,
+            )
+        if not self.settings.kis_account_number:
+            raise BrokerAdapterError(
+                "KIS account number is not configured",
+                status_code=409,
+                classification=BrokerErrorClassification.VALIDATION,
+            )
+
+        params = _overseas_balance_params(self.settings, "NASD")
+        params["OVRS_EXCG_CD"] = "NASD"
+        balance_response = _get_overseas_paginated_json(
+            http_client=self.http_client,
+            url=f"{config.api_base_url}{KIS_OVERSEAS_BALANCE_PATH}",
+            headers=self.build_headers(
+                access_token,
+                transaction_id=_overseas_balance_transaction_id(
+                    self.settings.runtime_mode
+                ),
+            ),
+            params=params,
+            timeout_seconds=self.settings.kis_request_timeout_seconds,
+            row_key="output1",
+        )
+        _raise_if_business_error(balance_response.payload)
+        holdings = _parse_overseas_holdings(balance_response.payload)
+        holdings_parse = _collection_parse_diagnostics(
+            payload=balance_response.payload,
+            row_key="output1",
+            parsed_identities=[holding.symbol for holding in holdings],
+            assess_row=_assess_overseas_holding_row,
+        )
+        holdings_complete = bool(
+            balance_response.pagination.get("complete") is True
+        ) and _collection_parse_complete(
+            payload=balance_response.payload,
+            row_key="output1",
+            diagnostics=holdings_parse,
+        )
+        observed_at = datetime.now(UTC)
+        return BrokerAccountSnapshot(
+            observed_at=observed_at,
+            source=f"{self.provider}:legacy_us_holdings_snapshot",
+            holdings=holdings,
+            open_orders=[],
+            holdings_complete=holdings_complete,
+            open_orders_complete=False,
+            diagnostics={
+                "query_scope": KIS_LEGACY_US_HOLDINGS_QUERY_SCOPE,
+                "holdings_pagination": dict(balance_response.pagination),
+                "holdings_parse": holdings_parse,
+            },
+            payload={
+                "currency": "USD",
+                "exchange": "US_ALL",
+                "query_scope": KIS_LEGACY_US_HOLDINGS_QUERY_SCOPE,
+                "evidence_type": "holdings_only",
+                "balance": balance_response.payload,
+                "holdings_coverage": (
+                    "complete" if holdings_complete else "incomplete"
+                ),
+                "open_orders_coverage": "not_queried",
+                "account_number_masked": _mask_account(
+                    self.settings.kis_account_number
+                ),
             },
         )
 

@@ -579,3 +579,9 @@ def test_unsupported_unpriced_legacy_us_holding_is_visible_but_requires_manual_r
     assert position.raw_payload["_position_sync"]["manual_review_required"] is True
     db.close()
     engine.dispose()
+
+
+def test_quarantine_attribution_does_not_expand_monitoring_exchanges() -> None:
+    assert set(monitoring.MONITORED_KIS_POSITION_EXCHANGES).isdisjoint(
+        {"OTCB", "OOTC"}
+    )

@@ -956,6 +956,47 @@ def test_runtime_schema_blocks_partial_non_flat_position_scope() -> None:
     engine.dispose()
 
 
+def test_runtime_schema_accepts_fully_attributed_quarantine_position() -> None:
+    app, engine = build_test_app()
+    settings = app.state.settings
+    identity = build_position_identity(
+        settings=settings,
+        provider="kis",
+        exchange="OTCB",
+    )
+    with app.state.db_session_factory() as db:
+        payload = payload_with_position_identity({}, identity=identity)
+        payload["_position_sync"] = {
+            "asset_class": "us_equity",
+            "exchange": "OTCB",
+            "monitoring_eligible": False,
+            "trade_eligible": False,
+            "manual_review_required": True,
+            "manual_review_reason": "unsupported_overseas_exchange",
+            "route_disposition": "account_attributed_quarantine",
+        }
+        db.add(
+            ExecutionPosition(
+                id="attributed-quarantine-position",
+                mode=settings.runtime_mode,
+                provider=identity.provider,
+                account_scope=identity.account_scope,
+                exchange=identity.exchange,
+                symbol="AFIB",
+                quantity=4,
+                average_price=Decimal("1.25"),
+                updated_from="legacy_position_import",
+                raw_payload=payload,
+            )
+        )
+        db.commit()
+        runtime_schema = schema_service.check_runtime_schema(db)
+
+    assert runtime_schema["status"] == "ok"
+    assert runtime_schema["blocking_data"] == {}
+    engine.dispose()
+
+
 def test_lifespan_allows_flat_legacy_position(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

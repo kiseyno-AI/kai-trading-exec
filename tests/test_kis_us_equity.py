@@ -9,7 +9,9 @@ from types import SimpleNamespace
 import pytest
 from pydantic import ValidationError
 from sqlalchemy import select
+from sqlalchemy.exc import DBAPIError
 
+from app.broker import kis as kis_module
 from app.api.schemas.execution import ExecutionPlanRequest, PlaceOrderRequest
 from app.broker.base import (
     BrokerAccountHolding,
@@ -26,6 +28,7 @@ from app.broker.kis import (
     KIS_OVERSEAS_CURRENT_PRICE_PATH,
     KIS_OVERSEAS_OPEN_ORDERS_PATH,
     KIS_OVERSEAS_ORDER_PATH,
+    KIS_US_EXCHANGES,
     JsonHttpResponse,
     KisBrokerAdapter,
     _classify_error,
@@ -33,7 +36,7 @@ from app.broker.kis import (
 from app.core.config import Settings
 from app.db.base import Base
 from app.db.session import create_db_engine, create_session_factory
-from app.models.runtime import BrokerOrder, ExecutionFill
+from app.models.runtime import BrokerOrder, ExecutionFill, ExecutionPosition
 from app.services import broker_orders as broker_orders_module
 from app.services.account_drawdown_gate import evaluate_us_equity_account_gate
 from app.services.account_drawdown_recovery import recovery_account_fingerprint
@@ -310,6 +313,142 @@ def test_kis_us_equity_live_balance_uses_nasdaq_specific_inquiry_code() -> None:
     assert http.get_calls[1]["params"]["OVRS_EXCG_CD"] == "NASD"
 
 
+def test_kis_legacy_us_holdings_snapshot_uses_complete_all_us_balance_only() -> None:
+    http = QueueHttpClient(
+        get_payloads=[
+            JsonHttpResponse(
+                status_code=200,
+                headers={"tr_cont": "F"},
+                payload={
+                    "rt_cd": "0",
+                    "output1": [
+                        {
+                            "ovrs_pdno": "AFIB",
+                            "ovrs_cblc_qty": "4",
+                            "ord_psbl_qty": "4",
+                            "pchs_avg_pric": "1.25",
+                            "ovrs_excg_cd": "OTCB",
+                        }
+                    ],
+                    "ctx_area_fk200": "legacy-fk",
+                    "ctx_area_nk200": "legacy-nk",
+                },
+            ),
+            JsonHttpResponse(
+                status_code=200,
+                headers={"tr_cont": "D"},
+                payload={
+                    "rt_cd": "0",
+                    "output1": [
+                        {
+                            "ovrs_pdno": "OTRQQ",
+                            "ovrs_cblc_qty": "2",
+                            "ord_psbl_qty": "2",
+                            "pchs_avg_pric": "3.50",
+                            "ovrs_excg_cd": "OOTC",
+                        }
+                    ],
+                },
+            ),
+        ]
+    )
+    adapter = KisBrokerAdapter(settings=_settings(runtime_mode="live"), http_client=http)
+
+    snapshot = adapter.get_legacy_us_holdings_snapshot("token")
+
+    assert [holding.symbol for holding in snapshot.holdings] == ["AFIB", "OTRQQ"]
+    assert snapshot.holdings_complete is True
+    assert snapshot.open_orders == []
+    assert snapshot.open_orders_complete is False
+    assert snapshot.payload["query_scope"] == "kis_us_all_holdings_only_v1"
+    assert snapshot.payload["evidence_type"] == "holdings_only"
+    assert [call["url"] for call in http.get_calls] == [
+        f"https://openapi.koreainvestment.com:9443{KIS_OVERSEAS_BALANCE_PATH}",
+        f"https://openapi.koreainvestment.com:9443{KIS_OVERSEAS_BALANCE_PATH}",
+    ]
+    assert all(
+        call["params"]["OVRS_EXCG_CD"] == "NASD" for call in http.get_calls
+    )
+    assert http.get_calls[1]["params"]["CTX_AREA_FK200"] == "legacy-fk"
+    assert http.get_calls[1]["params"]["CTX_AREA_NK200"] == "legacy-nk"
+
+
+def test_kis_legacy_holdings_observed_at_is_captured_after_pagination(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started_at = datetime(2026, 9, 12, 1, 0, tzinfo=UTC)
+    completed_at = started_at + timedelta(seconds=2)
+    http = QueueHttpClient(
+        get_payloads=[
+            JsonHttpResponse(
+                status_code=200,
+                headers={"tr_cont": "F"},
+                payload={
+                    "rt_cd": "0",
+                    "output1": [],
+                    "ctx_area_fk200": "legacy-fk",
+                    "ctx_area_nk200": "legacy-nk",
+                },
+            ),
+            JsonHttpResponse(
+                status_code=200,
+                headers={"tr_cont": "D"},
+                payload={"rt_cd": "0", "output1": []},
+            ),
+        ]
+    )
+
+    class BrokerClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            value = completed_at if len(http.get_calls) == 2 else started_at
+            return value if tz is None else value.astimezone(tz)
+
+    monkeypatch.setattr(kis_module, "datetime", BrokerClock)
+    adapter = KisBrokerAdapter(settings=_settings(runtime_mode="live"), http_client=http)
+
+    snapshot = adapter.get_legacy_us_holdings_snapshot("token")
+
+    assert snapshot.observed_at == completed_at
+
+
+def test_legacy_holdings_evidence_does_not_expand_kis_trading_exchanges() -> None:
+    assert KIS_US_EXCHANGES == frozenset({"NASD", "NYSE", "AMEX"})
+
+
+def test_kis_legacy_us_holdings_snapshot_marks_duplicate_evidence_incomplete() -> None:
+    http = QueueHttpClient(
+        get_payloads=[
+            {
+                "rt_cd": "0",
+                "output1": [
+                    {
+                        "ovrs_pdno": "AFIB",
+                        "ovrs_cblc_qty": "4",
+                        "ord_psbl_qty": "4",
+                        "pchs_avg_pric": "1.25",
+                        "ovrs_excg_cd": "OTCB",
+                    },
+                    {
+                        "ovrs_pdno": "afib",
+                        "ovrs_cblc_qty": "4",
+                        "ord_psbl_qty": "4",
+                        "pchs_avg_pric": "1.25",
+                        "ovrs_excg_cd": "OTCB",
+                    },
+                ],
+            }
+        ]
+    )
+    adapter = KisBrokerAdapter(settings=_settings(runtime_mode="live"), http_client=http)
+
+    snapshot = adapter.get_legacy_us_holdings_snapshot("token")
+
+    assert snapshot.holdings_complete is False
+    assert snapshot.payload["holdings_coverage"] == "incomplete"
+    assert snapshot.diagnostics["holdings_parse"]["duplicate_identity_count"] == 1
+
+
 def test_kis_us_equity_balance_follows_official_continuation_cursor() -> None:
     http = QueueHttpClient(
         get_payloads=[
@@ -547,6 +686,191 @@ def test_kis_us_equity_guard_is_disabled_by_default_and_caps_usd_notional() -> N
         command=sell,
         plan_item=plan_item,
     ) is None
+
+
+def test_same_account_otc_quarantine_blocks_kis_us_buys_but_not_sells() -> None:
+    settings = _settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="live",
+        account_drawdown_recovery_scope_secret="s" * 32,
+        kis_us_trading_enabled=True,
+        kis_us_live_trading_enabled=True,
+        kis_us_live_confirmation_token="ENABLE_KIS_US_LIVE",
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    db = create_session_factory(engine)()
+    active_identity = build_position_identity(
+        settings=settings,
+        provider="kis",
+        exchange="OTCB",
+    )
+    foreign_identity = build_position_identity(
+        settings=settings.model_copy(
+            update={"account_drawdown_recovery_scope_secret": "f" * 32}
+        ),
+        provider="kis",
+        exchange="OTCB",
+    )
+    db.add_all(
+        [
+            ExecutionPosition(
+                mode="live",
+                provider="kis",
+                account_scope=active_identity.account_scope,
+                exchange="OTCB",
+                symbol="AFIB",
+                quantity=4,
+                average_price=Decimal("1.25"),
+                updated_from="legacy_position_attribution",
+            ),
+            ExecutionPosition(
+                mode="live",
+                provider="kis",
+                account_scope=active_identity.account_scope,
+                exchange=" ootc ",
+                symbol="LEGACYQ",
+                quantity=0,
+                base_quantity=Decimal("0.5"),
+                average_price=Decimal("4"),
+                updated_from="legacy_position_attribution",
+            ),
+            ExecutionPosition(
+                mode="live",
+                provider="kis",
+                account_scope=active_identity.account_scope,
+                exchange="OOTC",
+                symbol="FLATQ",
+                quantity=0,
+                average_price=Decimal("2"),
+                updated_from="legacy_position_attribution",
+            ),
+            ExecutionPosition(
+                mode="live",
+                provider="kis",
+                account_scope=foreign_identity.account_scope,
+                exchange="OTCB",
+                symbol="OTHERQ",
+                quantity=8,
+                average_price=Decimal("3"),
+                updated_from="legacy_position_attribution",
+            ),
+        ]
+    )
+    db.commit()
+    buy = PlaceOrderRequest(
+        idempotency_key="otc-quarantine-buy",
+        provider="kis",
+        asset_class="us_equity",
+        venue="kis",
+        symbol="AAPL",
+        side="buy",
+        quantity=1,
+        order_type="limit",
+        limit_price=Decimal("200"),
+        exchange="NASD",
+    )
+    sell = buy.model_copy(
+        update={"idempotency_key": "otc-quarantine-sell", "side": "sell"}
+    )
+    execution_scope = {
+        "policy_version": 1,
+        "provider": "kis",
+        "account_scope": active_identity.account_scope,
+        "venue": "KIS",
+        "asset_class": "us_equity",
+        "exchange": "NASD",
+    }
+
+    blocked = broker_orders_module._kis_us_otc_quarantine_block(
+        settings=settings,
+        db=db,
+        adapter=SimpleNamespace(provider="kis"),
+        command=buy,
+        execution_scope=execution_scope,
+    )
+
+    assert blocked == {
+        "block_reason": "kis_us_otc_position_quarantine_active",
+        "message": (
+            "new KIS US-equity buys are blocked while this account has a "
+            "non-flat OTCB/OOTC quarantine position"
+        ),
+        "quarantined_position_count": 2,
+    }
+    assert broker_orders_module._kis_us_otc_quarantine_block(
+        settings=settings,
+        db=db,
+        adapter=SimpleNamespace(provider="kis"),
+        command=sell,
+        execution_scope=execution_scope,
+    ) is None
+    db.close()
+    engine.dispose()
+
+
+def test_otc_quarantine_nowait_failure_rolls_back_savepoint_before_blocking() -> None:
+    class LockFailingSession:
+        def __init__(self) -> None:
+            self.transaction_aborted = False
+            self.nested_transaction_count = 0
+
+        def begin_nested(self):
+            session = self
+
+            class NestedTransaction:
+                def __enter__(self):
+                    session.nested_transaction_count += 1
+                    return self
+
+                def __exit__(self, exc_type, _exc, _traceback):
+                    if exc_type is not None:
+                        session.transaction_aborted = False
+                    return False
+
+            return NestedTransaction()
+
+        def scalars(self, _query):
+            self.transaction_aborted = True
+            raise DBAPIError("SELECT", {}, RuntimeError("lock unavailable"))
+
+    settings = _settings(runtime_mode="live")
+    db = LockFailingSession()
+    buy = PlaceOrderRequest(
+        idempotency_key="otc-quarantine-lock-contention",
+        provider="kis",
+        asset_class="us_equity",
+        venue="kis",
+        symbol="AAPL",
+        side="buy",
+        quantity=1,
+        order_type="limit",
+        limit_price=Decimal("200"),
+        exchange="NASD",
+    )
+
+    blocked = broker_orders_module._kis_us_otc_quarantine_block(
+        settings=settings,
+        db=db,
+        adapter=SimpleNamespace(provider="kis"),
+        command=buy,
+        execution_scope={
+            "policy_version": 1,
+            "provider": "kis",
+            "account_scope": "a" * 24,
+            "venue": "KIS",
+            "asset_class": "us_equity",
+            "exchange": "NASD",
+        },
+        lock=True,
+    )
+
+    assert blocked is not None
+    assert blocked["block_reason"] == (
+        "kis_us_otc_position_quarantine_state_unavailable"
+    )
+    assert db.nested_transaction_count == 1
+    assert db.transaction_aborted is False
 
 
 def test_kis_us_equity_account_gate_blocks_projected_usd_exposure() -> None:

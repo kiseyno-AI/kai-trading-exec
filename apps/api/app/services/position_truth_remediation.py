@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+from contextlib import ExitStack
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 import hashlib
 import hmac
 import json
-from datetime import UTC, datetime, timedelta
-from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import and_, or_, select
+from sqlalchemy import and_, func, or_, select, text
+from sqlalchemy.engine import make_url
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.broker.base import (
@@ -16,6 +19,7 @@ from app.broker.base import (
     BrokerAdapterError,
     BrokerErrorClassification,
 )
+from app.broker.kis import KIS_LEGACY_US_HOLDINGS_QUERY_SCOPE
 from app.core.config import Settings
 from app.models.runtime import (
     BrokerOrder,
@@ -23,16 +27,24 @@ from app.models.runtime import (
     ExecutionPosition,
     RuntimeRemediationEvent,
 )
+from app.services.account_drawdown_recovery import recovery_account_fingerprint
 from app.services.broker_auth import ensure_authenticated_broker_session
 from app.services.broker_order_state import ACTIONABLE_OPEN_ORDER_STATUSES
 from app.services.fifo_inventory import fifo_route_scope_from_order
+from app.services.order_intent_serialization import (
+    order_intent_file_lock,
+    order_intent_process_lock,
+    order_intent_scope_key_for_account,
+)
 from app.services.position_identity import (
+    KIS_US_POSITION_QUARANTINE_EXCHANGES,
     POSITION_IDENTITY_KEY,
     PositionIdentity,
     PositionIdentityConflictError,
     build_position_identity,
     payload_with_position_identity,
     position_identity_from_columns,
+    stable_account_scope_hmac_key,
 )
 from app.services.reconciliation import sync_execution_positions_from_broker_snapshot
 from app.services.runtime import position_truth_freshness_payload
@@ -41,7 +53,16 @@ from app.services.runtime import position_truth_freshness_payload
 POSITION_CANDIDATE_TYPE = "stale_position_truth"
 LEGACY_POSITION_ATTRIBUTION_CANDIDATE_TYPE = "legacy_position_attribution"
 SUPPORTED_POSITION_EXCHANGES = {"KRX", "NASD", "NYSE", "AMEX"}
+LEGACY_QUARANTINE_ATTRIBUTION_EXCHANGES = KIS_US_POSITION_QUARANTINE_EXCHANGES
+LEGACY_QUARANTINE_ROUTE_DISPOSITION = "account_attributed_quarantine"
+LEGACY_ATTRIBUTION_SAFETY_POLICY_VERSION = (
+    "legacy-position-attribution-safety-v2"
+)
 POSITION_EVIDENCE_ORDER_STATUSES = (*ACTIONABLE_OPEN_ORDER_STATUSES, "filled")
+
+
+def _real_utc_now() -> datetime:
+    return datetime.now(UTC)
 
 
 def analyze_legacy_position_attribution(
@@ -56,6 +77,16 @@ def analyze_legacy_position_attribution(
     """Prove, without mutating, which legacy positions match current account truth."""
     evaluated_at = now or datetime.now(UTC)
     normalized_exchange = _supported_attribution_exchange(exchange)
+    quarantine_attribution = (
+        normalized_exchange in LEGACY_QUARANTINE_ATTRIBUTION_EXCHANGES
+    )
+    if quarantine_attribution and settings.runtime_mode != "live":
+        raise ValueError("legacy quarantine attribution requires live mode")
+    if quarantine_attribution and stable_account_scope_hmac_key(settings) is None:
+        raise PositionIdentityConflictError(
+            "legacy quarantine attribution requires a stable account scope secret "
+            "of at least 32 bytes"
+        )
     provider = str(adapter.provider or "").strip().lower()
     if not provider or provider == "unknown":
         raise PositionIdentityConflictError(
@@ -100,11 +131,21 @@ def analyze_legacy_position_attribution(
         adapter=adapter,
     )
     requested_symbols = sorted(normalized_legacy_symbols)
-    snapshot = adapter.get_account_snapshot(
-        access_token,
-        symbols=requested_symbols,
-        exchange=normalized_exchange,
-    )
+    if quarantine_attribution:
+        snapshot_loader = getattr(adapter, "get_legacy_us_holdings_snapshot", None)
+        if not callable(snapshot_loader):
+            raise PositionIdentityConflictError(
+                "legacy quarantine attribution requires a KIS holdings-only adapter"
+            )
+        snapshot = snapshot_loader(access_token)
+        query_scope = _require_legacy_quarantine_snapshot(snapshot)
+    else:
+        snapshot = adapter.get_account_snapshot(
+            access_token,
+            symbols=requested_symbols,
+            exchange=normalized_exchange,
+        )
+        query_scope = f"kis_exact_exchange_account_snapshot:{normalized_exchange}"
     _require_current_attribution_snapshot(
         settings=settings,
         evaluated_at=evaluated_at,
@@ -119,19 +160,17 @@ def analyze_legacy_position_attribution(
             response_payload={"diagnostics": snapshot.diagnostics},
             observed_at=snapshot.observed_at,
         )
-    snapshot_exchange = _reported_attribution_exchange(snapshot.payload)
-    if snapshot_exchange is None:
-        raise PositionIdentityConflictError(
-            "legacy position attribution snapshot exchange proof is unavailable"
-        )
-    if (
-        snapshot_exchange is not None
-        and snapshot_exchange != normalized_exchange
-    ):
-        raise PositionIdentityConflictError(
-            "legacy position attribution snapshot exchange does not match "
-            "the requested exchange"
-        )
+    if not quarantine_attribution:
+        snapshot_exchange = _reported_attribution_exchange(snapshot.payload)
+        if snapshot_exchange is None:
+            raise PositionIdentityConflictError(
+                "legacy position attribution snapshot exchange proof is unavailable"
+            )
+        if snapshot_exchange != normalized_exchange:
+            raise PositionIdentityConflictError(
+                "legacy position attribution snapshot exchange does not match "
+                "the requested exchange"
+            )
     identity = build_position_identity(
         settings=settings,
         provider=provider,
@@ -149,16 +188,26 @@ def analyze_legacy_position_attribution(
         holdings_by_symbol[holding_symbol] = holding
     scoped_symbols = set(
         db.scalars(
-            select(ExecutionPosition.symbol).where(
-                ExecutionPosition.mode == settings.runtime_mode,
-                ExecutionPosition.provider == identity.provider,
-                ExecutionPosition.account_scope == identity.account_scope,
-                ExecutionPosition.exchange == identity.exchange,
-                ExecutionPosition.symbol.in_(
-                    [position.symbol for position in legacy_positions]
+            select(func.upper(func.trim(ExecutionPosition.symbol))).where(
+                func.lower(func.trim(ExecutionPosition.mode))
+                == settings.runtime_mode.strip().lower(),
+                func.lower(func.trim(ExecutionPosition.provider))
+                == identity.provider.strip().lower(),
+                func.lower(func.trim(ExecutionPosition.account_scope))
+                == identity.account_scope.strip().lower(),
+                func.upper(func.trim(ExecutionPosition.symbol)).in_(
+                    normalized_legacy_symbols
                 ),
             )
         ).all()
+    )
+    snapshot_proof_digest = _legacy_snapshot_proof_digest(
+        snapshot=snapshot,
+        exchange=normalized_exchange,
+        query_scope=query_scope,
+    )
+    safety_invariants = _legacy_attribution_safety_invariants(
+        quarantine_attribution=quarantine_attribution,
     )
     items = [
         _legacy_attribution_item(
@@ -170,7 +219,13 @@ def analyze_legacy_position_attribution(
             provider=identity.provider,
             account_scope=identity.account_scope,
             exchange=identity.exchange,
-            scoped_route_exists=position.symbol in scoped_symbols,
+            scoped_route_exists=(
+                _normalized_position_symbol(position.symbol) in scoped_symbols
+            ),
+            query_scope=query_scope,
+            quarantine_attribution=quarantine_attribution,
+            snapshot_proof_digest=snapshot_proof_digest,
+            safety_invariants=safety_invariants,
         )
         for position in legacy_positions
     ]
@@ -204,6 +259,7 @@ def apply_legacy_position_attribution(
         raise ValueError("legacy position attribution requires actor and reason")
 
     evaluated_at = now or datetime.now(UTC)
+    serialization = None
     try:
         current = analyze_legacy_position_attribution(
             settings=settings,
@@ -240,23 +296,51 @@ def apply_legacy_position_attribution(
             approved_items.append(item)
 
         approved_ids = sorted(normalized_approvals)
-        locked_positions = db.scalars(
-            select(ExecutionPosition)
-            .where(
-                ExecutionPosition.id.in_(approved_ids),
-                ExecutionPosition.mode == settings.runtime_mode,
-                ExecutionPosition.provider.is_(None),
-                ExecutionPosition.account_scope.is_(None),
-                ExecutionPosition.exchange.is_(None),
-            )
-            .with_for_update()
-            .execution_options(populate_existing=True)
-        ).all()
+        # Analysis is intentionally read-only. End its implicit transaction so
+        # SQLite can take a write reservation before target/collision rechecks,
+        # and PostgreSQL can start the apply locks from a fresh transaction.
+        db.rollback()
+        serialization = _acquire_legacy_attribution_apply_serialization(
+            settings=settings,
+            db=db,
+            provider=str(approved_items[0]["provider"]),
+            account_scope=str(approved_items[0]["account_scope"]),
+            exchange=str(approved_items[0]["exchange"]),
+        )
+        try:
+            locked_positions = db.scalars(
+                select(ExecutionPosition)
+                .where(
+                    ExecutionPosition.id.in_(approved_ids),
+                    ExecutionPosition.mode == settings.runtime_mode,
+                    ExecutionPosition.provider.is_(None),
+                    ExecutionPosition.account_scope.is_(None),
+                    ExecutionPosition.exchange.is_(None),
+                )
+                .with_for_update(nowait=True)
+                .execution_options(populate_existing=True)
+            ).all()
+        except DBAPIError as exc:
+            raise PositionIdentityConflictError(
+                "legacy position attribution rows are busy; retry from a new dry-run"
+            ) from exc
         locked_by_id = {position.id: position for position in locked_positions}
         if set(locked_by_id) != set(approved_ids):
             raise PositionIdentityConflictError(
                 "approved legacy position is missing or already attributed"
             )
+        _reject_locked_scoped_symbol_collisions(
+            settings=settings,
+            db=db,
+            approved_items=approved_items,
+            approved_ids=approved_ids,
+        )
+        snapshot_observed_at = _required_attribution_snapshot_observed_at(current)
+        _require_current_attribution_snapshot(
+            settings=settings,
+            evaluated_at=_real_utc_now(),
+            snapshot_observed_at=snapshot_observed_at,
+        )
 
         for item in approved_items:
             position_id = str(item["position_id"])
@@ -288,43 +372,66 @@ def apply_legacy_position_attribution(
             position.provider = identity.provider
             position.account_scope = identity.account_scope
             position.exchange = identity.exchange
-            position.raw_payload = payload_with_position_identity(
-                position.raw_payload,
-                identity=identity,
+            quarantine_attribution = (
+                item.get("disposition") == LEGACY_QUARANTINE_ROUTE_DISPOSITION
             )
+            attributed_payload = _attributed_position_payload(
+                payload=position.raw_payload,
+                identity=identity,
+                quarantine_attribution=quarantine_attribution,
+            )
+            position.raw_payload = attributed_payload
+            outcome = (
+                "position_route_attributed_quarantine"
+                if quarantine_attribution
+                else "position_route_attributed"
+            )
+            evidence_summary = {
+                "symbol": position.symbol,
+                "provider": identity.provider,
+                "account_scope": identity.account_scope,
+                "exchange": identity.exchange,
+                "updated_from": item["updated_from"],
+                "last_reconciled_at": item["last_reconciled_at"],
+                "legacy_payload_digest": item["legacy_payload_digest"],
+                "legacy_integer_quantity": item[
+                    "legacy_integer_quantity"
+                ],
+                "legacy_base_quantity": item["legacy_base_quantity"],
+                "legacy_quantity": item["legacy_quantity"],
+                "legacy_average_price": item["legacy_average_price"],
+                "broker_quantity": item["broker_quantity"],
+                "broker_average_price": item["broker_average_price"],
+                "broker_snapshot_observed_at": current[
+                    "broker_snapshot_observed_at"
+                ],
+                "evidence_fingerprint": item["evidence_fingerprint"],
+                "safety_policy_version": item["safety_policy_version"],
+                "safety_invariants": item["safety_invariants"],
+                "snapshot_proof_digest": item["snapshot_proof_digest"],
+                "orders_submitted": 0,
+                "orders_amended": 0,
+                "orders_canceled": 0,
+            }
+            if quarantine_attribution:
+                evidence_summary.update(
+                    {
+                        "query_scope": item["query_scope"],
+                        "route_disposition": item["disposition"],
+                        "trading_eligible": item["trading_eligible"],
+                        "monitoring_eligible": item["monitoring_eligible"],
+                    }
+                )
             db.add(
                 RuntimeRemediationEvent(
                     mode=settings.runtime_mode,
                     candidate_type=LEGACY_POSITION_ATTRIBUTION_CANDIDATE_TYPE,
                     candidate_key=position.id,
                     subject_id=position.id,
-                    outcome="position_route_attributed",
+                    outcome=outcome,
                     actor=normalized_actor,
                     reason=normalized_reason,
-                    evidence_summary={
-                        "symbol": position.symbol,
-                        "provider": identity.provider,
-                        "account_scope": identity.account_scope,
-                        "exchange": identity.exchange,
-                        "updated_from": item["updated_from"],
-                        "last_reconciled_at": item["last_reconciled_at"],
-                        "legacy_payload_digest": item["legacy_payload_digest"],
-                        "legacy_integer_quantity": item[
-                            "legacy_integer_quantity"
-                        ],
-                        "legacy_base_quantity": item["legacy_base_quantity"],
-                        "legacy_quantity": item["legacy_quantity"],
-                        "legacy_average_price": item["legacy_average_price"],
-                        "broker_quantity": item["broker_quantity"],
-                        "broker_average_price": item["broker_average_price"],
-                        "broker_snapshot_observed_at": current[
-                            "broker_snapshot_observed_at"
-                        ],
-                        "evidence_fingerprint": item["evidence_fingerprint"],
-                        "orders_submitted": 0,
-                        "orders_amended": 0,
-                        "orders_canceled": 0,
-                    },
+                    evidence_summary=evidence_summary,
                     occurred_at=evaluated_at,
                 )
             )
@@ -332,7 +439,21 @@ def apply_legacy_position_attribution(
     except Exception:
         db.rollback()
         raise
+    finally:
+        if serialization is not None:
+            serialization.close()
 
+    quarantined_count = sum(
+        item.get("disposition") == LEGACY_QUARANTINE_ROUTE_DISPOSITION
+        for item in approved_items
+    )
+    summary = {
+        "approved_count": len(approved_items),
+        "attributed_count": len(approved_items),
+        "manual_review_count": quarantined_count,
+    }
+    if quarantined_count:
+        summary["quarantined_count"] = quarantined_count
     return {
         "mode": "apply",
         "runtime_mode": settings.runtime_mode,
@@ -340,16 +461,201 @@ def apply_legacy_position_attribution(
         "exchange": approved_items[0]["exchange"],
         "generated_at": _serialize_datetime(evaluated_at),
         "broker_snapshot_observed_at": current["broker_snapshot_observed_at"],
-        "summary": {
-            "approved_count": len(approved_items),
-            "attributed_count": len(approved_items),
-            "manual_review_count": 0,
-        },
+        "summary": summary,
         "items": [
-            {**item, "outcome": "position_route_attributed"}
+            {
+                **item,
+                "outcome": (
+                    "position_route_attributed_quarantine"
+                    if item.get("disposition")
+                    == LEGACY_QUARANTINE_ROUTE_DISPOSITION
+                    else "position_route_attributed"
+                ),
+            }
             for item in approved_items
         ],
     }
+
+
+def _acquire_legacy_attribution_apply_serialization(
+    *,
+    settings: Settings,
+    db: Session,
+    provider: str,
+    account_scope: str,
+    exchange: str,
+) -> ExitStack:
+    market = "KRW" if exchange == "KRX" else "USD"
+    normalized_provider = str(provider).strip().lower()
+    pre_auth_account_scope = (
+        recovery_account_fingerprint(settings)
+        if normalized_provider == "kis"
+        else str(account_scope).strip().lower()
+    )
+    local_scope = order_intent_scope_key_for_account(
+        provider=normalized_provider,
+        runtime_mode=settings.runtime_mode,
+        account_scope=pre_auth_account_scope,
+        market=market,
+    )
+    exact_scope = order_intent_scope_key_for_account(
+        provider=provider,
+        runtime_mode=settings.runtime_mode,
+        account_scope=account_scope,
+        market=market,
+    )
+    serialization = ExitStack()
+    process_lock = order_intent_process_lock(local_scope)
+    if not process_lock.acquire(blocking=False):
+        raise PositionIdentityConflictError(
+            "legacy position attribution scope is busy; retry from a new dry-run"
+        )
+    serialization.callback(process_lock.release)
+    try:
+        database = make_url(settings.database_url)
+        if (
+            database.drivername.startswith("sqlite")
+            and database.database
+            and database.database != ":memory:"
+        ):
+            try:
+                serialization.enter_context(
+                    order_intent_file_lock(local_scope, blocking=False)
+                )
+            except OSError as exc:
+                raise PositionIdentityConflictError(
+                    "legacy position attribution lock is busy; "
+                    "retry from a new dry-run"
+                ) from exc
+        if database.drivername.startswith("sqlite"):
+            # SQLite ignores SELECT ... FOR UPDATE. Reserve the one writer slot
+            # before target and collision reads so an uncoordinated position
+            # writer cannot create a cross-exchange duplicate before commit.
+            db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        bind = db.get_bind()
+        if bind is not None and bind.dialect.name == "postgresql":
+            acquired = db.scalar(
+                text("SELECT pg_try_advisory_xact_lock(hashtext(:scope))"),
+                {"scope": exact_scope},
+            )
+            if acquired is not True:
+                raise PositionIdentityConflictError(
+                    "legacy position attribution scope is busy; retry from a new dry-run"
+                )
+            db.execute(
+                text(
+                    "LOCK TABLE execution_positions "
+                    "IN SHARE ROW EXCLUSIVE MODE NOWAIT"
+                )
+            )
+    except DBAPIError as exc:
+        serialization.close()
+        raise PositionIdentityConflictError(
+            "legacy position attribution lock is busy; retry from a new dry-run"
+        ) from exc
+    except Exception:
+        serialization.close()
+        raise
+    return serialization
+
+
+def _reject_locked_scoped_symbol_collisions(
+    *,
+    settings: Settings,
+    db: Session,
+    approved_items: list[dict[str, object]],
+    approved_ids: list[str],
+) -> None:
+    provider = str(approved_items[0]["provider"])
+    account_scope = str(approved_items[0]["account_scope"])
+    symbols = sorted(
+        {_normalized_position_symbol(item["symbol"]) for item in approved_items}
+    )
+    try:
+        collisions = db.scalars(
+            select(ExecutionPosition.id)
+            .where(
+                ExecutionPosition.id.not_in(approved_ids),
+                func.lower(func.trim(ExecutionPosition.mode))
+                == settings.runtime_mode.strip().lower(),
+                func.lower(func.trim(ExecutionPosition.provider))
+                == provider.strip().lower(),
+                func.lower(func.trim(ExecutionPosition.account_scope))
+                == account_scope.strip().lower(),
+                func.upper(func.trim(ExecutionPosition.symbol)).in_(symbols),
+            )
+            .order_by(ExecutionPosition.id.asc())
+            .with_for_update(nowait=True)
+        ).all()
+    except DBAPIError as exc:
+        raise PositionIdentityConflictError(
+            "legacy position attribution collision check is busy; "
+            "retry from a new dry-run"
+        ) from exc
+    if collisions:
+        raise PositionIdentityConflictError(
+            "legacy position attribution found a scoped route symbol collision"
+        )
+
+
+def _required_attribution_snapshot_observed_at(
+    payload: dict[str, object],
+) -> datetime:
+    raw_value = payload.get("broker_snapshot_observed_at")
+    if not isinstance(raw_value, str) or not raw_value.strip():
+        raise PositionIdentityConflictError(
+            "legacy position attribution snapshot timestamp is unavailable"
+        )
+    try:
+        parsed = datetime.fromisoformat(raw_value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise PositionIdentityConflictError(
+            "legacy position attribution snapshot timestamp is invalid"
+        ) from exc
+    return parsed
+
+
+def _attributed_position_payload(
+    *,
+    payload: object,
+    identity: PositionIdentity,
+    quarantine_attribution: bool,
+) -> dict[str, object]:
+    if not isinstance(payload, dict):
+        raise PositionIdentityConflictError(
+            "legacy position attribution payload is not a mapping"
+        )
+    attributed_payload = payload_with_position_identity(
+        payload,
+        identity=identity,
+    )
+    if not quarantine_attribution:
+        return attributed_payload
+
+    if "_position_sync" in attributed_payload:
+        prior_sync = attributed_payload.pop("_position_sync")
+        if prior_sync is not None and not isinstance(prior_sync, dict):
+            raise PositionIdentityConflictError(
+                "legacy position sync evidence is not a mapping"
+            )
+        if (
+            "legacy_position_sync" in attributed_payload
+            and attributed_payload["legacy_position_sync"] != prior_sync
+        ):
+            raise PositionIdentityConflictError(
+                "legacy position attribution cannot preserve conflicting sync evidence"
+            )
+        attributed_payload["legacy_position_sync"] = prior_sync
+    attributed_payload["_position_sync"] = {
+        "asset_class": "us_equity",
+        "exchange": identity.exchange,
+        "monitoring_eligible": False,
+        "trade_eligible": False,
+        "manual_review_required": True,
+        "manual_review_reason": "unsupported_overseas_exchange",
+        "route_disposition": LEGACY_QUARANTINE_ROUTE_DISPOSITION,
+    }
+    return attributed_payload
 
 
 def _validated_legacy_attribution_approvals(
@@ -375,11 +681,29 @@ def _validated_legacy_attribution_approvals(
 
 def _supported_attribution_exchange(exchange: str) -> str:
     normalized = str(exchange or "").strip().upper()
-    if normalized not in SUPPORTED_POSITION_EXCHANGES:
+    if normalized not in (
+        SUPPORTED_POSITION_EXCHANGES | LEGACY_QUARANTINE_ATTRIBUTION_EXCHANGES
+    ):
         raise ValueError(
             "legacy position attribution requires a supported exact exchange"
         )
     return normalized
+
+
+def _require_legacy_quarantine_snapshot(snapshot: object) -> str:
+    payload = getattr(snapshot, "payload", None)
+    if (
+        not isinstance(payload, dict)
+        or payload.get("query_scope") != KIS_LEGACY_US_HOLDINGS_QUERY_SCOPE
+        or payload.get("evidence_type") != "holdings_only"
+        or payload.get("exchange") != "US_ALL"
+        or getattr(snapshot, "open_orders", None) != []
+        or getattr(snapshot, "open_orders_complete", None) is not False
+    ):
+        raise PositionIdentityConflictError(
+            "legacy quarantine attribution holdings-only query proof is unavailable"
+        )
+    return KIS_LEGACY_US_HOLDINGS_QUERY_SCOPE
 
 
 def _require_current_attribution_snapshot(
@@ -450,6 +774,10 @@ def _legacy_attribution_item(
     account_scope: str,
     exchange: str,
     scoped_route_exists: bool,
+    query_scope: str,
+    quarantine_attribution: bool,
+    snapshot_proof_digest: str,
+    safety_invariants: dict[str, object],
 ) -> dict[str, object]:
     legacy_quantity = _position_quantity(position)
     broker_quantity = _attribution_holding_quantity(holding)
@@ -468,7 +796,9 @@ def _legacy_attribution_item(
         isinstance(position.raw_payload, dict)
         and POSITION_IDENTITY_KEY in position.raw_payload
     )
-    if str(position.symbol or "").strip() != _normalized_position_symbol(
+    if not isinstance(position.raw_payload, dict):
+        reason = "legacy_payload_invalid"
+    elif str(position.symbol or "").strip() != _normalized_position_symbol(
         position.symbol
     ):
         reason = "legacy_symbol_not_canonical"
@@ -507,6 +837,9 @@ def _legacy_attribution_item(
 
     eligible = reason == "exact_broker_holding_match"
     evidence = {
+        "safety_policy_version": LEGACY_ATTRIBUTION_SAFETY_POLICY_VERSION,
+        "safety_invariants": safety_invariants,
+        "snapshot_proof_digest": snapshot_proof_digest,
         "mode": settings.runtime_mode,
         "position_id": position.id,
         "symbol": _normalized_position_symbol(position.symbol),
@@ -523,6 +856,13 @@ def _legacy_attribution_item(
         "account_scope": account_scope,
         "exchange": exchange,
     }
+    if quarantine_attribution:
+        evidence.update(
+            {
+                "query_scope": query_scope,
+                "disposition": LEGACY_QUARANTINE_ROUTE_DISPOSITION,
+            }
+        )
     evidence_fingerprint = (
         hashlib.sha256(
             json.dumps(
@@ -534,7 +874,7 @@ def _legacy_attribution_item(
         if eligible
         else None
     )
-    return {
+    item = {
         "position_id": position.id,
         "symbol": position.symbol,
         "updated_from": evidence["updated_from"],
@@ -552,7 +892,90 @@ def _legacy_attribution_item(
         "eligible": eligible,
         "reason": reason,
         "evidence_fingerprint": evidence_fingerprint,
+        "safety_policy_version": LEGACY_ATTRIBUTION_SAFETY_POLICY_VERSION,
+        "safety_invariants": dict(safety_invariants),
+        "snapshot_proof_digest": snapshot_proof_digest,
     }
+    if quarantine_attribution:
+        item.update(
+            {
+                "attribution_eligible": eligible,
+                "trading_eligible": False,
+                "monitoring_eligible": False,
+                "manual_review_required": True,
+                "disposition": LEGACY_QUARANTINE_ROUTE_DISPOSITION,
+                "query_scope": query_scope,
+            }
+        )
+    return item
+
+
+def _legacy_attribution_safety_invariants(
+    *,
+    quarantine_attribution: bool,
+) -> dict[str, object]:
+    return {
+        "account_scope_source": (
+            "stable_hmac" if quarantine_attribution else "position_identity_policy"
+        ),
+        "broker_actions_allowed": False,
+        "collision_scope": "mode_provider_account_symbol_any_exchange",
+        "manual_review_required": quarantine_attribution,
+        "monitoring_allowed": not quarantine_attribution,
+        "route_disposition": (
+            LEGACY_QUARANTINE_ROUTE_DISPOSITION
+            if quarantine_attribution
+            else "account_attributed_supported_route"
+        ),
+    }
+
+
+def _legacy_snapshot_proof_digest(
+    *,
+    snapshot: object,
+    exchange: str,
+    query_scope: str,
+) -> str:
+    holdings = getattr(snapshot, "holdings", None)
+    if not isinstance(holdings, list):
+        holdings = []
+    canonical_holdings = sorted(
+        (
+            {
+                "symbol": _normalized_position_symbol(holding.symbol),
+                "quantity": _canonical_attribution_decimal(
+                    _attribution_holding_quantity(holding)
+                ),
+                "average_price": _canonical_attribution_decimal(
+                    holding.average_price
+                ),
+                "exchange": _reported_holding_exchange(holding),
+            }
+            for holding in holdings
+        ),
+        key=lambda item: (
+            str(item["symbol"]),
+            str(item["exchange"] or ""),
+        ),
+    )
+    material = {
+        "proof_version": 1,
+        "source": str(getattr(snapshot, "source", "") or ""),
+        "query_scope": query_scope,
+        "requested_exchange": exchange,
+        "reported_exchange": _reported_attribution_exchange(
+            getattr(snapshot, "payload", None)
+        ),
+        "holdings_complete": getattr(snapshot, "holdings_complete", None) is True,
+        "holdings": canonical_holdings,
+    }
+    return hashlib.sha256(
+        json.dumps(
+            material,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
 
 
 def _symbol_matches_attribution_exchange(*, symbol: str, exchange: str) -> bool:
@@ -626,6 +1049,24 @@ def _legacy_attribution_payload(
     items: list[dict[str, object]],
 ) -> dict[str, object]:
     eligible_count = sum(item["eligible"] is True for item in items)
+    quarantine_candidate = exchange in LEGACY_QUARANTINE_ATTRIBUTION_EXCHANGES
+    quarantined_on_apply_count = sum(
+        item["eligible"] is True
+        and item.get("disposition") == LEGACY_QUARANTINE_ROUTE_DISPOSITION
+        for item in items
+    )
+    manual_review_count = sum(
+        item["eligible"] is not True
+        or item.get("manual_review_required") is True
+        for item in items
+    )
+    summary = {
+        "candidate_count": len(items),
+        "eligible_count": eligible_count,
+        "manual_review_count": manual_review_count,
+    }
+    if quarantine_candidate:
+        summary["quarantined_on_apply_count"] = quarantined_on_apply_count
     return {
         "mode": mode,
         "runtime_mode": settings.runtime_mode,
@@ -633,11 +1074,7 @@ def _legacy_attribution_payload(
         "exchange": exchange,
         "generated_at": _serialize_datetime(evaluated_at),
         "broker_snapshot_observed_at": _serialize_datetime(snapshot_observed_at),
-        "summary": {
-            "candidate_count": len(items),
-            "eligible_count": eligible_count,
-            "manual_review_count": len(items) - eligible_count,
-        },
+        "summary": summary,
         "items": items,
     }
 
