@@ -19,12 +19,14 @@ from app.services.database_cli_security import (  # noqa: E402
     reject_secret_database_url_argument,
 )
 from app.services.position_truth_remediation import (  # noqa: E402
+    LEGACY_QUARANTINE_ATTRIBUTION_EXCHANGES,
     SUPPORTED_POSITION_EXCHANGES,
     analyze_legacy_position_attribution,
     analyze_position_truth_remediation,
     apply_legacy_position_attribution,
     apply_position_truth_remediation,
 )
+from app.services.position_identity import stable_account_scope_hmac_key  # noqa: E402
 
 
 def _approved_position_evidence(values: list[str]) -> dict[str, str]:
@@ -63,8 +65,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--runtime-mode", choices=("mock", "paper", "live"), default=None)
     parser.add_argument(
         "--legacy-attribution-exchange",
-        choices=tuple(sorted(SUPPORTED_POSITION_EXCHANGES)),
-        help="Analyze legacy unscoped positions against one exact KIS exchange.",
+        choices=tuple(
+            sorted(
+                SUPPORTED_POSITION_EXCHANGES
+                | LEGACY_QUARANTINE_ATTRIBUTION_EXCHANGES
+            )
+        ),
+        help=(
+            "Analyze legacy unscoped positions against one exact KIS exchange. "
+            "OTCB/OOTC use live all-US holdings evidence and remain quarantined."
+        ),
     )
     parser.add_argument("--apply", action="store_true")
     parser.add_argument(
@@ -79,6 +89,14 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     runtime_mode = args.runtime_mode or os.getenv("KAI_EXEC_RUNTIME_MODE") or "mock"
+    quarantine_attribution = (
+        args.legacy_attribution_exchange
+        in LEGACY_QUARANTINE_ATTRIBUTION_EXCHANGES
+    )
+    if quarantine_attribution and runtime_mode != "live":
+        raise SystemExit(
+            "legacy OTC quarantine attribution requires --runtime-mode live"
+        )
     reject_secret_database_url_argument(args.database_url)
     environment_database_url = (os.getenv("KAI_EXEC_DATABASE_URL") or "").strip()
     database_url = args.database_url or environment_database_url or None
@@ -106,6 +124,11 @@ def main(argv: list[str] | None = None) -> int:
     settings = load_settings().model_copy(
         update={"database_url": database_url, "runtime_mode": runtime_mode}
     )
+    if quarantine_attribution and stable_account_scope_hmac_key(settings) is None:
+        raise SystemExit(
+            "legacy OTC quarantine attribution requires a stable account scope secret "
+            "of at least 32 bytes"
+        )
     engine = create_db_engine(settings)
     session_factory = create_session_factory(engine)
     try:

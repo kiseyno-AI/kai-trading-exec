@@ -11,6 +11,7 @@ POSITION_IDENTITY_KEY = "_position_identity"
 POSITION_IDENTITY_VERSION = "execution-position-route-v2"
 EXECUTION_SCOPE_POLICY_VERSION = 1
 ACCOUNT_SCOPE_HMAC_MIN_KEY_BYTES = 32
+KIS_US_POSITION_QUARANTINE_EXCHANGES = frozenset({"OTCB", "OOTC"})
 
 
 class PositionIdentityConflictError(RuntimeError):

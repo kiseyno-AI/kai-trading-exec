@@ -824,11 +824,24 @@ after the final attribution because startup readiness is latched per process.
 See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for the complete backup,
 verification, rollback, and exchange-by-exchange runbook.
 
+Legacy `OTCB` and `OOTC` rows may use the same explicit two-pass command only in
+live mode. Their evidence comes from a complete KIS all-US holdings-only read;
+orders, quotes, and buying power are not queried. Exact matches are attributed to
+the account but remain permanently marked `account_attributed_quarantine`,
+non-trading, non-monitoring, and manual-review-required. This attribution does
+not add OTCB/OOTC to any order, quote, monitoring, or reconciliation allowlist.
+The command rejects OTCB/OOTC before opening the database unless the live
+deployment has a stable account-scope HMAC secret of at least 32 UTF-8 bytes.
+In dry-run output, `quarantined_on_apply_count` counts only exact matches that can
+be approved into quarantine, while `manual_review_count` counts every row that
+still requires operator review. Apply output reports the approved rows actually
+written as `quarantined_count`.
+
 Both remediation modes require `--actor` and `--reason` when applying. Supported
 KRX/NASD/NYSE/AMEX routes use broker account-snapshot reads and update
-`execution_positions`; unknown or unsupported routes receive durable
-manual-review events. This command imports no order placement service and never
-places, amends, or cancels orders.
+`execution_positions`; OTCB/OOTC use the isolated attribution-only quarantine
+path; all other routes remain unsupported. This command invokes no order
+placement path and never places, amends, or cancels orders.
 
 ## Tests and quality gates
 

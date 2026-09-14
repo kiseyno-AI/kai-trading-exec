@@ -5,20 +5,15 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, DecimalException, ROUND_DOWN
-import fcntl
 from hashlib import sha256
 import hmac
-import os
-from pathlib import Path
-from tempfile import gettempdir
-from threading import Lock, RLock
 from time import monotonic
 from typing import Iterator
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import case, exists, or_, select, text, update
+from sqlalchemy import case, exists, func, or_, select, text, update
 from sqlalchemy.engine import make_url
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.orm import Session, selectinload, undefer
 
 from app.api.schemas.execution import PlaceOrderRequest
@@ -114,10 +109,16 @@ from app.services.fill_economics import COST_COVERAGE_UNKNOWN, settlement_curren
 from app.services.fifo_inventory import FifoRouteScope, fifo_route_scope_from_order
 from app.services.json_compaction import PLAN_ITEM_SUBMISSION_RISK_KEYS, json_payload_hash
 from app.services.monitoring_price_source import is_us_regular_session, next_us_regular_open
+from app.services.order_intent_serialization import (
+    order_intent_file_lock,
+    order_intent_process_lock,
+    order_intent_scope_key_for_account,
+)
 from app.services.plan_item_identity import select_plan_item_family_members
 from app.services.plan_judgment_actions import project_buy_plan_item_for_hourly_risk_off
 from app.services.position_identity import (
     EXECUTION_SCOPE_POLICY_VERSION,
+    KIS_US_POSITION_QUARANTINE_EXCHANGES,
     PositionIdentityConflictError,
     build_authenticated_broker_position_identity,
     build_position_identity,
@@ -188,10 +189,6 @@ ACCOUNT_DRAWDOWN_RECOVERY_AUTOMATED_SOURCE_PREFIXES = (
     "execution-job:",
     "short-term-watcher:",
 )
-_ORDER_SCOPE_LOCKS: dict[str, RLock] = {}
-_ORDER_SCOPE_LOCKS_GUARD = Lock()
-
-
 @dataclass(frozen=True)
 class PlaceBrokerOrderResult:
     status_code: int
@@ -371,8 +368,7 @@ def _serialized_order_intent_scope(
         adapter=adapter,
         command=command,
     )
-    with _ORDER_SCOPE_LOCKS_GUARD:
-        process_lock = _ORDER_SCOPE_LOCKS.setdefault(scope, RLock())
+    process_lock = order_intent_process_lock(scope)
     with process_lock:
         database = make_url(settings.database_url)
         if database.drivername.startswith("postgresql"):
@@ -386,19 +382,8 @@ def _serialized_order_intent_scope(
             and database.database
             and database.database != ":memory:"
         ):
-            digest = sha256(scope.encode("utf-8")).hexdigest()[:24]
-            lock_path = Path(gettempdir()) / f"kai-exec-order-intent-{digest}.lock"
-            flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC
-            if hasattr(os, "O_NOFOLLOW"):
-                flags |= os.O_NOFOLLOW
-            descriptor = os.open(lock_path, flags, 0o600)
-            os.fchmod(descriptor, 0o600)
-            with os.fdopen(descriptor, "a+", encoding="utf-8") as lock_file:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-                try:
-                    yield
-                finally:
-                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            with order_intent_file_lock(scope):
+                yield
             return
         yield
 
@@ -439,8 +424,11 @@ def _order_intent_scope_key(
             provider=provider,
         )
     )
-    return ":".join(
-        ("broker-order-intent", provider, settings.runtime_mode, account_fingerprint, market)
+    return order_intent_scope_key_for_account(
+        provider=provider,
+        runtime_mode=settings.runtime_mode,
+        account_scope=account_fingerprint,
+        market=market,
     )
 
 
@@ -1438,6 +1426,24 @@ def _place_broker_order_serialized(
         command=routed_command,
         execution_scope=prepared_execution_scope,
     )
+    quarantine_block = _kis_us_otc_quarantine_block(
+        settings=settings,
+        db=db,
+        adapter=adapter,
+        command=routed_command,
+        execution_scope=prepared_execution_scope,
+        lock=True,
+    )
+    if quarantine_block is not None:
+        return PlaceBrokerOrderResult(
+            status_code=409,
+            payload={
+                "duplicate": retryable_safety_fenced_order is not None,
+                "blocked": True,
+                "permanent_rejection": False,
+                **quarantine_block,
+            },
+        )
 
     if plan_item is not None:
         pending_risk_context = _json_dict(plan_item.risk_context)
@@ -2213,6 +2219,16 @@ def _place_broker_order_serialized(
             command=routed_command,
             plan_item=plan_item,
             request_source=request_source,
+        )
+        # Loading broker evidence happens after the durable intent commit,
+        # which releases transaction-scoped PostgreSQL locks. Reacquire the
+        # exact account/currency scope before any final authority checks.
+        _acquire_cross_process_order_intent_lock(
+            settings=settings,
+            db=db,
+            adapter=adapter,
+            command=routed_command,
+            execution_scope=prepared_execution_scope,
         )
         control_state = _lock_runtime_control_for_broker_boundary(
             db=db,
@@ -3025,6 +3041,34 @@ def _place_broker_order_serialized(
                         else None
                     ),
                 )
+        quarantine_block = _kis_us_otc_quarantine_block(
+            settings=settings,
+            db=db,
+            adapter=adapter,
+            command=routed_command,
+            execution_scope=current_execution_scope,
+            lock=True,
+        )
+        if quarantine_block is not None:
+            fenced = _persist_runtime_safety_fence(
+                settings=settings,
+                db=db,
+                order=order,
+                plan_item=plan_item,
+                command=routed_command,
+                control_state=control_state,
+                block_reason_override=str(quarantine_block["block_reason"]),
+                message_override=str(quarantine_block["message"]),
+            )
+            return PlaceBrokerOrderResult(
+                status_code=fenced.status_code,
+                payload={
+                    **fenced.payload,
+                    "quarantined_position_count": quarantine_block[
+                        "quarantined_position_count"
+                    ],
+                },
+            )
         broker_call_started = True
         placement = adapter.place_order(
             session_state.access_token or "",
@@ -8177,6 +8221,83 @@ def _is_new_buy_order(
     # caller metadata or durable intent labels. A future hedge/cover order must
     # use a separately proven position-direction authority, not this escape hatch.
     return command.side == "buy"
+
+
+def _kis_us_otc_quarantine_block(
+    *,
+    settings: Settings,
+    db: Session,
+    adapter: BrokerAdapter,
+    command: PlaceOrderRequest,
+    execution_scope: dict[str, object] | None,
+    lock: bool = False,
+) -> dict[str, object] | None:
+    if (
+        str(getattr(adapter, "provider", None) or command.provider or "")
+        .strip()
+        .lower()
+        != "kis"
+        or command.asset_class != "us_equity"
+        or command.side != "buy"
+    ):
+        return None
+    account_scope = (
+        str(execution_scope.get("account_scope") or "").strip()
+        if isinstance(execution_scope, dict)
+        and str(execution_scope.get("provider") or "").strip().lower() == "kis"
+        else ""
+    )
+    if not account_scope:
+        return {
+            "block_reason": "kis_us_otc_position_quarantine_state_unavailable",
+            "message": (
+                "new KIS US-equity buys require an exact account scope before "
+                "OTCB/OOTC quarantine state can be checked"
+            ),
+            "quarantined_position_count": None,
+        }
+    query = (
+        select(ExecutionPosition.id)
+        .where(
+            func.lower(func.trim(ExecutionPosition.mode))
+            == settings.runtime_mode.strip().lower(),
+            func.lower(func.trim(ExecutionPosition.provider)) == "kis",
+            func.lower(func.trim(ExecutionPosition.account_scope))
+            == account_scope.lower(),
+            func.upper(func.trim(ExecutionPosition.exchange)).in_(
+                tuple(sorted(KIS_US_POSITION_QUARANTINE_EXCHANGES))
+            ),
+            or_(
+                ExecutionPosition.quantity != 0,
+                ExecutionPosition.base_quantity != Decimal("0"),
+            ),
+        )
+        .order_by(ExecutionPosition.id.asc())
+    )
+    if lock:
+        query = query.with_for_update(nowait=True)
+    try:
+        with db.begin_nested():
+            position_ids = db.scalars(query).all()
+    except DBAPIError:
+        return {
+            "block_reason": "kis_us_otc_position_quarantine_state_unavailable",
+            "message": (
+                "new KIS US-equity buys are blocked because OTCB/OOTC "
+                "quarantine state could not be locked"
+            ),
+            "quarantined_position_count": None,
+        }
+    if not position_ids:
+        return None
+    return {
+        "block_reason": "kis_us_otc_position_quarantine_active",
+        "message": (
+            "new KIS US-equity buys are blocked while this account has a "
+            "non-flat OTCB/OOTC quarantine position"
+        ),
+        "quarantined_position_count": len(position_ids),
+    }
 
 
 def _persist_account_gate_block(

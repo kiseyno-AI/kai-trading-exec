@@ -1,13 +1,19 @@
 from __future__ import annotations
 
+import fcntl
+import hashlib
+import json
 import os
 import subprocess
 import sys
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from threading import Event, Thread
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import select
+from sqlalchemy.exc import DBAPIError
 
 from app.broker.base import (
     BrokerAccountHolding,
@@ -30,7 +36,10 @@ from app.models.runtime import (
     ExecutionPosition,
     RuntimeRemediationEvent,
 )
+from app.services import broker_orders as broker_orders_service
+from app.services import order_intent_serialization as order_intent_serialization_service
 from app.services import position_truth_remediation as remediation_service
+from app.services.account_drawdown_recovery import recovery_account_fingerprint
 from app.services.position_truth_remediation import (
     analyze_position_truth_remediation,
     apply_position_truth_remediation,
@@ -125,6 +134,15 @@ class LegacyAttributionAdapter(PositionInquiryAdapter):
 
     def get_account_snapshot(self, access_token: str, *, symbols=None, exchange="KRX"):
         self.snapshot_requests.append((symbols, exchange))
+        return self.snapshot
+
+
+class LegacyQuarantineAttributionAdapter(LegacyAttributionAdapter):
+    def get_account_snapshot(self, access_token: str, *, symbols=None, exchange="KRX"):
+        raise AssertionError("quarantine attribution must not open account trading reads")
+
+    def get_legacy_us_holdings_snapshot(self, access_token: str):
+        self.snapshot_requests.append((None, "US_ALL_HOLDINGS_ONLY"))
         return self.snapshot
 
 
@@ -1122,7 +1140,34 @@ def test_legacy_position_attribution_dry_run_proves_exact_matches_without_mutati
     }
     by_symbol = {item["symbol"]: item for item in result["items"]}
     assert by_symbol["003550"]["reason"] == "exact_broker_holding_match"
-    assert by_symbol["003550"]["evidence_fingerprint"]
+    exact_item = by_symbol["003550"]
+    existing_fingerprint_material = {
+        "safety_policy_version": exact_item["safety_policy_version"],
+        "safety_invariants": exact_item["safety_invariants"],
+        "snapshot_proof_digest": exact_item["snapshot_proof_digest"],
+        "mode": settings.runtime_mode,
+        "position_id": exact.id,
+        "symbol": "003550",
+        "updated_from": exact_item["updated_from"],
+        "last_reconciled_at": exact_item["last_reconciled_at"],
+        "legacy_payload_digest": exact_item["legacy_payload_digest"],
+        "legacy_integer_quantity": "10",
+        "legacy_base_quantity": None,
+        "legacy_quantity": "10",
+        "legacy_average_price": "250000",
+        "broker_quantity": "10",
+        "broker_average_price": "250000",
+        "provider": "kis",
+        "account_scope": exact_item["account_scope"],
+        "exchange": "KRX",
+    }
+    assert exact_item["evidence_fingerprint"] == hashlib.sha256(
+        json.dumps(
+            existing_fingerprint_material,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
     assert by_symbol["005930"]["reason"] == "exact_broker_holding_match"
     assert by_symbol["000660"]["reason"] == "quantity_mismatch"
     assert by_symbol["000660"]["evidence_fingerprint"] is None
@@ -1139,6 +1184,863 @@ def test_legacy_position_attribution_dry_run_proves_exact_matches_without_mutati
     assert db.scalars(select(RuntimeRemediationEvent)).all() == []
     db.close()
     engine.dispose()
+
+
+def test_legacy_otc_attribution_dry_run_is_holdings_only_and_quarantined(
+    monkeypatch,
+) -> None:
+    settings, engine, session_factory, db = _session()
+    settings = settings.model_copy(
+        update={
+            "runtime_mode": "live",
+            "account_drawdown_recovery_scope_secret": "s" * 32,
+            "execution_position_account_scope": "test-live-account",
+        }
+    )
+    position = _legacy_position(symbol="AFIB", quantity=4, average_price="1.25")
+    position.mode = "live"
+    unmatched = _legacy_position(
+        symbol="MISSINGQ",
+        quantity=1,
+        average_price="2.50",
+    )
+    unmatched.mode = "live"
+    db.add_all([position, unmatched])
+    db.commit()
+    before = {
+        "positions": db.query(ExecutionPosition).count(),
+        "orders": db.query(BrokerOrder).count(),
+        "fills": db.query(ExecutionFill).count(),
+        "remediation_events": db.query(RuntimeRemediationEvent).count(),
+        "raw_payload": dict(position.raw_payload),
+    }
+    adapter = LegacyQuarantineAttributionAdapter(
+        BrokerAccountSnapshot(
+            observed_at=NOW,
+            source="kis:legacy_us_holdings_snapshot",
+            holdings=[
+                BrokerAccountHolding(
+                    symbol="AFIB",
+                    quantity=4,
+                    average_price=Decimal("1.25"),
+                    payload={"ovrs_excg_cd": "OTCB"},
+                )
+            ],
+            open_orders=[],
+            open_orders_complete=False,
+            payload={
+                "exchange": "US_ALL",
+                "query_scope": "kis_us_all_holdings_only_v1",
+                "evidence_type": "holdings_only",
+            },
+        )
+    )
+    monkeypatch.setattr(
+        "app.services.position_truth_remediation.ensure_authenticated_broker_session",
+        lambda **kwargs: type("SessionState", (), {"access_token": "test-token"})(),
+    )
+
+    result = remediation_service.analyze_legacy_position_attribution(
+        settings=settings,
+        db=db,
+        auth_session_factory=session_factory,
+        adapter=adapter,
+        exchange="OTCB",
+        now=NOW,
+    )
+
+    assert result["summary"] == {
+        "candidate_count": 2,
+        "eligible_count": 1,
+        "quarantined_on_apply_count": 1,
+        "manual_review_count": 2,
+    }
+    item = result["items"][0]
+    assert item["eligible"] is True
+    assert item["attribution_eligible"] is True
+    assert item["trading_eligible"] is False
+    assert item["monitoring_eligible"] is False
+    assert item["manual_review_required"] is True
+    assert item["disposition"] == "account_attributed_quarantine"
+    assert item["query_scope"] == "kis_us_all_holdings_only_v1"
+    assert item["safety_policy_version"] == (
+        "legacy-position-attribution-safety-v2"
+    )
+    assert item["safety_invariants"] == {
+        "account_scope_source": "stable_hmac",
+        "broker_actions_allowed": False,
+        "collision_scope": "mode_provider_account_symbol_any_exchange",
+        "manual_review_required": True,
+        "monitoring_allowed": False,
+        "route_disposition": "account_attributed_quarantine",
+    }
+    assert len(item["snapshot_proof_digest"]) == 64
+    fingerprint_material = {
+        "safety_policy_version": item["safety_policy_version"],
+        "safety_invariants": item["safety_invariants"],
+        "snapshot_proof_digest": item["snapshot_proof_digest"],
+        "mode": settings.runtime_mode,
+        "position_id": position.id,
+        "symbol": "AFIB",
+        "updated_from": item["updated_from"],
+        "last_reconciled_at": item["last_reconciled_at"],
+        "legacy_payload_digest": item["legacy_payload_digest"],
+        "legacy_integer_quantity": "4",
+        "legacy_base_quantity": None,
+        "legacy_quantity": "4",
+        "legacy_average_price": "1.25",
+        "broker_quantity": "4",
+        "broker_average_price": "1.25",
+        "provider": "kis",
+        "account_scope": item["account_scope"],
+        "exchange": "OTCB",
+        "query_scope": "kis_us_all_holdings_only_v1",
+        "disposition": "account_attributed_quarantine",
+    }
+    assert item["evidence_fingerprint"] == hashlib.sha256(
+        json.dumps(
+            fingerprint_material,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    assert adapter.snapshot_requests == [(None, "US_ALL_HOLDINGS_ONLY")]
+    db.expire_all()
+    assert {
+        "positions": db.query(ExecutionPosition).count(),
+        "orders": db.query(BrokerOrder).count(),
+        "fills": db.query(ExecutionFill).count(),
+        "remediation_events": db.query(RuntimeRemediationEvent).count(),
+        "raw_payload": dict(db.get(ExecutionPosition, position.id).raw_payload),
+    } == before
+    db.close()
+    engine.dispose()
+
+
+def test_legacy_otc_attribution_apply_persists_non_trading_quarantine(
+    monkeypatch,
+) -> None:
+    settings, engine, session_factory, db = _session()
+    settings = settings.model_copy(
+        update={
+            "runtime_mode": "live",
+            "account_drawdown_recovery_scope_secret": "s" * 32,
+            "execution_position_account_scope": "test-live-account",
+        }
+    )
+    position = _legacy_position(symbol="OTRQQ", quantity=2, average_price="3.50")
+    position.mode = "live"
+    position.raw_payload["_position_sync"] = {
+        "source": "legacy-import",
+        "exchange": "OOTC",
+    }
+    db.add(position)
+    db.commit()
+    adapter = LegacyQuarantineAttributionAdapter(
+        BrokerAccountSnapshot(
+            observed_at=NOW,
+            source="kis:legacy_us_holdings_snapshot",
+            holdings=[
+                BrokerAccountHolding(
+                    symbol="OTRQQ",
+                    quantity=2,
+                    average_price=Decimal("3.50"),
+                    payload={"ovrs_excg_cd": "OOTC"},
+                )
+            ],
+            open_orders=[],
+            open_orders_complete=False,
+            payload={
+                "exchange": "US_ALL",
+                "query_scope": "kis_us_all_holdings_only_v1",
+                "evidence_type": "holdings_only",
+            },
+        )
+    )
+    monkeypatch.setattr(
+        "app.services.position_truth_remediation.ensure_authenticated_broker_session",
+        lambda **kwargs: type("SessionState", (), {"access_token": "test-token"})(),
+    )
+    monkeypatch.setattr(remediation_service, "_real_utc_now", lambda: NOW)
+    dry_run = remediation_service.analyze_legacy_position_attribution(
+        settings=settings,
+        db=db,
+        auth_session_factory=session_factory,
+        adapter=adapter,
+        exchange="OOTC",
+        now=NOW,
+    )
+    fingerprint = str(dry_run["items"][0]["evidence_fingerprint"])
+
+    result = remediation_service.apply_legacy_position_attribution(
+        settings=settings,
+        db=db,
+        auth_session_factory=session_factory,
+        adapter=adapter,
+        exchange="OOTC",
+        approved_evidence={position.id: fingerprint},
+        actor="operator",
+        reason="exact live KIS holdings evidence reviewed",
+        now=NOW,
+    )
+
+    db.expire_all()
+    persisted = db.get(ExecutionPosition, position.id)
+    assert persisted is not None
+    assert persisted.provider == "kis"
+    assert persisted.account_scope == dry_run["items"][0]["account_scope"]
+    assert persisted.exchange == "OOTC"
+    assert persisted.raw_payload["_position_sync"] == {
+        "asset_class": "us_equity",
+        "exchange": "OOTC",
+        "monitoring_eligible": False,
+        "trade_eligible": False,
+        "manual_review_required": True,
+        "manual_review_reason": "unsupported_overseas_exchange",
+        "route_disposition": "account_attributed_quarantine",
+    }
+    assert persisted.raw_payload["legacy_position_sync"] == {
+        "source": "legacy-import",
+        "exchange": "OOTC",
+    }
+    event = db.scalar(select(RuntimeRemediationEvent))
+    assert event is not None
+    assert event.outcome == "position_route_attributed_quarantine"
+    assert event.evidence_summary["query_scope"] == "kis_us_all_holdings_only_v1"
+    assert event.evidence_summary["route_disposition"] == (
+        "account_attributed_quarantine"
+    )
+    assert event.evidence_summary["trading_eligible"] is False
+    assert event.evidence_summary["monitoring_eligible"] is False
+    assert result["items"][0]["outcome"] == "position_route_attributed_quarantine"
+    assert result["summary"] == {
+        "approved_count": 1,
+        "attributed_count": 1,
+        "quarantined_count": 1,
+        "manual_review_count": 1,
+    }
+    assert db.query(BrokerOrder).count() == 0
+    assert db.query(ExecutionFill).count() == 0
+    db.close()
+    engine.dispose()
+
+
+def test_legacy_otc_attribution_requires_exact_holdings_only_query_proof(
+    monkeypatch,
+) -> None:
+    settings, engine, session_factory, db = _session()
+    settings = settings.model_copy(
+        update={
+            "runtime_mode": "live",
+            "account_drawdown_recovery_scope_secret": "s" * 32,
+            "execution_position_account_scope": "test-live-account",
+        }
+    )
+    position = _legacy_position(symbol="AFIB", quantity=4, average_price="1.25")
+    position.mode = "live"
+    db.add(position)
+    db.commit()
+    adapter = LegacyQuarantineAttributionAdapter(
+        BrokerAccountSnapshot(
+            observed_at=NOW,
+            source="kis:us_equity_account_snapshot",
+            holdings=[
+                BrokerAccountHolding(
+                    symbol="AFIB",
+                    quantity=4,
+                    average_price=Decimal("1.25"),
+                    payload={"ovrs_excg_cd": "OTCB"},
+                )
+            ],
+            payload={"exchange": "OTCB"},
+        )
+    )
+    monkeypatch.setattr(
+        "app.services.position_truth_remediation.ensure_authenticated_broker_session",
+        lambda **kwargs: type("SessionState", (), {"access_token": "test-token"})(),
+    )
+
+    with pytest.raises(
+        PositionIdentityConflictError,
+        match="holdings-only query proof is unavailable",
+    ):
+        remediation_service.analyze_legacy_position_attribution(
+            settings=settings,
+            db=db,
+            auth_session_factory=session_factory,
+            adapter=adapter,
+            exchange="OTCB",
+            now=NOW,
+        )
+
+    db.expire_all()
+    persisted = db.get(ExecutionPosition, position.id)
+    assert persisted is not None
+    assert persisted.provider is None
+    assert persisted.account_scope is None
+    assert persisted.exchange is None
+    assert db.scalars(select(RuntimeRemediationEvent)).all() == []
+    db.close()
+    engine.dispose()
+
+
+def test_legacy_otc_attribution_rejects_non_live_mode_before_authentication(
+    monkeypatch,
+) -> None:
+    settings, engine, session_factory, db = _session()
+    db.add(_legacy_position(symbol="AFIB", quantity=4, average_price="1.25"))
+    db.commit()
+    adapter = LegacyQuarantineAttributionAdapter(
+        BrokerAccountSnapshot(
+            observed_at=NOW,
+            source="kis:legacy_us_holdings_snapshot",
+            open_orders_complete=False,
+            payload={
+                "exchange": "US_ALL",
+                "query_scope": "kis_us_all_holdings_only_v1",
+                "evidence_type": "holdings_only",
+            },
+        )
+    )
+    monkeypatch.setattr(
+        "app.services.position_truth_remediation.ensure_authenticated_broker_session",
+        lambda **kwargs: pytest.fail("non-live OTC attribution attempted authentication"),
+    )
+
+    with pytest.raises(ValueError, match="requires live mode"):
+        remediation_service.analyze_legacy_position_attribution(
+            settings=settings,
+            db=db,
+            auth_session_factory=session_factory,
+            adapter=adapter,
+            exchange="OTCB",
+            now=NOW,
+        )
+
+    assert adapter.snapshot_requests == []
+    db.close()
+    engine.dispose()
+
+
+def test_legacy_otc_attribution_requires_stable_hmac_scope_secret_before_db_read(
+    monkeypatch,
+) -> None:
+    settings, engine, session_factory, db = _session()
+    settings = settings.model_copy(
+        update={
+            "runtime_mode": "live",
+            "execution_position_account_scope": "label-is-not-hmac-proof",
+            "account_drawdown_recovery_scope_secret": "too-short",
+        }
+    )
+    monkeypatch.setattr(
+        db,
+        "scalars",
+        lambda *_args, **_kwargs: pytest.fail("unsafe scope opened position rows"),
+    )
+
+    with pytest.raises(
+        PositionIdentityConflictError,
+        match="stable account scope secret",
+    ):
+        remediation_service.analyze_legacy_position_attribution(
+            settings=settings,
+            db=db,
+            auth_session_factory=session_factory,
+            adapter=LegacyQuarantineAttributionAdapter(
+                BrokerAccountSnapshot(observed_at=NOW, source="test")
+            ),
+            exchange="OTCB",
+            now=NOW,
+        )
+
+    db.close()
+    engine.dispose()
+
+
+def test_legacy_otc_empty_dry_run_keeps_quarantine_summary_shape() -> None:
+    settings, engine, session_factory, db = _session()
+    settings = settings.model_copy(
+        update={
+            "runtime_mode": "live",
+            "account_drawdown_recovery_scope_secret": "s" * 32,
+            "execution_position_account_scope": "test-live-account",
+        }
+    )
+
+    result = remediation_service.analyze_legacy_position_attribution(
+        settings=settings,
+        db=db,
+        auth_session_factory=session_factory,
+        adapter=LegacyQuarantineAttributionAdapter(
+            BrokerAccountSnapshot(observed_at=NOW, source="unused")
+        ),
+        exchange="OTCB",
+        now=NOW,
+    )
+
+    assert result["summary"] == {
+        "candidate_count": 0,
+        "eligible_count": 0,
+        "manual_review_count": 0,
+        "quarantined_on_apply_count": 0,
+    }
+    assert result["items"] == []
+    db.close()
+    engine.dispose()
+
+
+def test_legacy_attribution_rejects_normalized_same_account_symbol_collision_across_exchange(
+    monkeypatch,
+) -> None:
+    settings, engine, session_factory, db = _session()
+    settings = settings.model_copy(
+        update={
+            "runtime_mode": "live",
+            "account_drawdown_recovery_scope_secret": "s" * 32,
+            "execution_position_account_scope": "test-live-account",
+        }
+    )
+    identity = build_position_identity(
+        settings=settings,
+        provider="kis",
+        exchange="NYSE",
+    )
+    legacy = _legacy_position(symbol="AFIB", quantity=4, average_price="1.25")
+    legacy.mode = "live"
+    db.add_all(
+        [
+            legacy,
+            ExecutionPosition(
+                mode=" LIVE ",
+                provider=" KIS ",
+                account_scope=f" {identity.account_scope.upper()} ",
+                exchange="NYSE",
+                symbol=" afib ",
+                quantity=4,
+                average_price=Decimal("1.25"),
+                updated_from="reconciliation",
+            ),
+        ]
+    )
+    db.commit()
+    adapter = LegacyQuarantineAttributionAdapter(
+        BrokerAccountSnapshot(
+            observed_at=NOW,
+            source="kis:legacy_us_holdings_snapshot",
+            holdings=[
+                BrokerAccountHolding(
+                    symbol="AFIB",
+                    quantity=4,
+                    average_price=Decimal("1.25"),
+                    payload={"ovrs_excg_cd": "OTCB"},
+                )
+            ],
+            open_orders=[],
+            open_orders_complete=False,
+            payload={
+                "exchange": "US_ALL",
+                "query_scope": "kis_us_all_holdings_only_v1",
+                "evidence_type": "holdings_only",
+            },
+        )
+    )
+    monkeypatch.setattr(
+        "app.services.position_truth_remediation.ensure_authenticated_broker_session",
+        lambda **kwargs: type("SessionState", (), {"access_token": "test-token"})(),
+    )
+
+    result = remediation_service.analyze_legacy_position_attribution(
+        settings=settings,
+        db=db,
+        auth_session_factory=session_factory,
+        adapter=adapter,
+        exchange="OTCB",
+        now=NOW,
+    )
+
+    assert result["items"][0]["eligible"] is False
+    assert result["items"][0]["reason"] == "scoped_route_symbol_collision"
+    db.close()
+    engine.dispose()
+
+
+def test_legacy_quarantine_attribution_rejects_non_mapping_payload(
+    monkeypatch,
+) -> None:
+    settings, engine, session_factory, db = _session()
+    settings = settings.model_copy(
+        update={
+            "runtime_mode": "live",
+            "account_drawdown_recovery_scope_secret": "s" * 32,
+            "execution_position_account_scope": "test-live-account",
+        }
+    )
+    position = _legacy_position(symbol="AFIB", quantity=4, average_price="1.25")
+    position.mode = "live"
+    position.raw_payload = ["legacy", "payload"]
+    db.add(position)
+    db.commit()
+    adapter = LegacyQuarantineAttributionAdapter(
+        BrokerAccountSnapshot(
+            observed_at=NOW,
+            source="kis:legacy_us_holdings_snapshot",
+            holdings=[
+                BrokerAccountHolding(
+                    symbol="AFIB",
+                    quantity=4,
+                    average_price=Decimal("1.25"),
+                    payload={"ovrs_excg_cd": "OTCB"},
+                )
+            ],
+            open_orders=[],
+            open_orders_complete=False,
+            payload={
+                "exchange": "US_ALL",
+                "query_scope": "kis_us_all_holdings_only_v1",
+                "evidence_type": "holdings_only",
+            },
+        )
+    )
+    monkeypatch.setattr(
+        "app.services.position_truth_remediation.ensure_authenticated_broker_session",
+        lambda **kwargs: type("SessionState", (), {"access_token": "test-token"})(),
+    )
+
+    result = remediation_service.analyze_legacy_position_attribution(
+        settings=settings,
+        db=db,
+        auth_session_factory=session_factory,
+        adapter=adapter,
+        exchange="OTCB",
+        now=NOW,
+    )
+
+    assert result["items"][0]["eligible"] is False
+    assert result["items"][0]["reason"] == "legacy_payload_invalid"
+    db.close()
+    engine.dispose()
+
+
+def test_legacy_quarantine_support_is_separate_from_position_refresh_routes() -> None:
+    assert remediation_service.SUPPORTED_POSITION_EXCHANGES == {
+        "KRX",
+        "NASD",
+        "NYSE",
+        "AMEX",
+    }
+    assert remediation_service.LEGACY_QUARANTINE_ATTRIBUTION_EXCHANGES == {
+        "OTCB",
+        "OOTC",
+    }
+
+
+def test_legacy_attribution_serializes_with_kis_order_pre_auth_scope() -> None:
+    settings, engine, _session_factory, db = _session()
+    settings = settings.model_copy(
+        update={
+            "runtime_mode": "live",
+            "kis_account_number": "12345678",
+            "kis_account_product_code": "01",
+            "account_drawdown_recovery_scope_secret": "s" * 32,
+        }
+    )
+    identity = build_position_identity(
+        settings=settings,
+        provider="kis",
+        exchange="OTCB",
+    )
+    order_scope = broker_orders_service.order_intent_scope_key_for_account(
+        provider="kis",
+        runtime_mode=settings.runtime_mode,
+        account_scope=recovery_account_fingerprint(settings),
+        market="USD",
+    )
+    order_lock = broker_orders_service.order_intent_process_lock(order_scope)
+    lock_acquired = Event()
+    release_lock = Event()
+
+    def hold_order_scope() -> None:
+        with order_lock:
+            lock_acquired.set()
+            assert release_lock.wait(timeout=2)
+
+    holder = Thread(target=hold_order_scope)
+    holder.start()
+    assert lock_acquired.wait(timeout=2)
+    serialization = None
+    try:
+        with pytest.raises(
+            PositionIdentityConflictError,
+            match="scope is busy",
+        ):
+            serialization = remediation_service._acquire_legacy_attribution_apply_serialization(
+                settings=settings,
+                db=db,
+                provider="kis",
+                account_scope=identity.account_scope,
+                exchange="OTCB",
+            )
+    finally:
+        if serialization is not None:
+            serialization.release()
+        release_lock.set()
+        holder.join(timeout=2)
+
+    assert not holder.is_alive()
+    db.close()
+    engine.dispose()
+
+
+def test_legacy_attribution_fails_closed_when_sqlite_order_file_scope_is_busy(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'attribution-lock.db'}",
+        runtime_mode="live",
+        kis_account_number="12345678",
+        kis_account_product_code="01",
+        account_drawdown_recovery_scope_secret="s" * 32,
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    db = create_session_factory(engine)()
+    identity = build_position_identity(
+        settings=settings,
+        provider="kis",
+        exchange="OTCB",
+    )
+    order_scope = broker_orders_service.order_intent_scope_key_for_account(
+        provider="kis",
+        runtime_mode=settings.runtime_mode,
+        account_scope=recovery_account_fingerprint(settings),
+        market="USD",
+    )
+    digest = hashlib.sha256(order_scope.encode("utf-8")).hexdigest()[:24]
+    lock_path = tmp_path / f"kai-exec-order-intent-{digest}.lock"
+    monkeypatch.setattr(
+        order_intent_serialization_service,
+        "gettempdir",
+        lambda: str(tmp_path),
+    )
+
+    descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    serialization = None
+    try:
+        with os.fdopen(descriptor, "a+", encoding="utf-8") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            with pytest.raises(
+                PositionIdentityConflictError,
+                match="lock is busy",
+            ):
+                serialization = remediation_service._acquire_legacy_attribution_apply_serialization(
+                    settings=settings,
+                    db=db,
+                    provider="kis",
+                    account_scope=identity.account_scope,
+                    exchange="OTCB",
+                )
+    finally:
+        if serialization is not None:
+            serialization.release()
+        db.close()
+        engine.dispose()
+
+
+def test_legacy_attribution_reserves_sqlite_writer_before_collision_recheck(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'attribution-write-reservation.db'}",
+        runtime_mode="live",
+        kis_account_number="12345678",
+        kis_account_product_code="01",
+        account_drawdown_recovery_scope_secret="s" * 32,
+        sqlite_busy_timeout_seconds=1,
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    db = session_factory()
+    identity = build_position_identity(
+        settings=settings,
+        provider="kis",
+        exchange="OTCB",
+    )
+    monkeypatch.setattr(
+        order_intent_serialization_service,
+        "gettempdir",
+        lambda: str(tmp_path),
+    )
+    serialization = remediation_service._acquire_legacy_attribution_apply_serialization(
+        settings=settings,
+        db=db,
+        provider="kis",
+        account_scope=identity.account_scope,
+        exchange="OTCB",
+    )
+
+    try:
+        with session_factory() as concurrent_db:
+            concurrent_db.connection().exec_driver_sql("PRAGMA busy_timeout=0")
+            concurrent_db.add(
+                ExecutionPosition(
+                    mode="live",
+                    provider="kis",
+                    account_scope=identity.account_scope,
+                    exchange="NYSE",
+                    symbol="AFIB",
+                    quantity=1,
+                    average_price=Decimal("2"),
+                    updated_from="concurrent_reconciliation",
+                )
+            )
+            with pytest.raises(DBAPIError, match="database is locked"):
+                concurrent_db.commit()
+            concurrent_db.rollback()
+    finally:
+        db.rollback()
+        serialization.close()
+        db.close()
+        engine.dispose()
+
+
+def test_legacy_attribution_uses_non_waiting_exact_postgres_apply_locks() -> None:
+    settings = Settings(
+        database_url="postgresql+psycopg://localhost/kai_exec_test",
+        runtime_mode="live",
+        kis_account_number="12345678",
+        kis_account_product_code="01",
+        account_drawdown_recovery_scope_secret="s" * 32,
+    )
+    identity = build_position_identity(
+        settings=settings,
+        provider="kis",
+        exchange="OTCB",
+    )
+    scalar_calls: list[tuple[str, dict[str, str]]] = []
+    execute_calls: list[str] = []
+
+    class PostgresSessionStub:
+        def get_bind(self):
+            return SimpleNamespace(dialect=SimpleNamespace(name="postgresql"))
+
+        def scalar(self, statement, params):
+            scalar_calls.append((str(statement), params))
+            return True
+
+        def execute(self, statement):
+            execute_calls.append(str(statement))
+
+    serialization = remediation_service._acquire_legacy_attribution_apply_serialization(
+        settings=settings,
+        db=PostgresSessionStub(),
+        provider="kis",
+        account_scope=identity.account_scope,
+        exchange="OTCB",
+    )
+    serialization.close()
+
+    assert scalar_calls == [
+        (
+            "SELECT pg_try_advisory_xact_lock(hashtext(:scope))",
+            {
+                "scope": broker_orders_service.order_intent_scope_key_for_account(
+                    provider="kis",
+                    runtime_mode="live",
+                    account_scope=identity.account_scope,
+                    market="USD",
+                )
+            },
+        )
+    ]
+    assert len(execute_calls) == 1
+    assert "LOCK TABLE execution_positions" in execute_calls[0]
+    assert "NOWAIT" in execute_calls[0]
+
+
+def test_quarantine_attribution_preserves_explicit_null_position_sync() -> None:
+    settings = Settings(runtime_mode="paper")
+    identity = build_position_identity(
+        settings=settings,
+        provider="kis",
+        exchange="OTCB",
+    )
+
+    payload = remediation_service._attributed_position_payload(
+        payload={"_position_sync": None},
+        identity=identity,
+        quarantine_attribution=True,
+    )
+
+    assert "legacy_position_sync" in payload
+    assert payload["legacy_position_sync"] is None
+    assert payload["_position_sync"]["route_disposition"] == (
+        "account_attributed_quarantine"
+    )
+
+
+def test_quarantine_attribution_rejects_non_mapping_position_sync() -> None:
+    settings = Settings(runtime_mode="paper")
+    identity = build_position_identity(
+        settings=settings,
+        provider="kis",
+        exchange="OTCB",
+    )
+
+    with pytest.raises(
+        PositionIdentityConflictError,
+        match="position sync evidence is not a mapping",
+    ):
+        remediation_service._attributed_position_payload(
+            payload={"_position_sync": "unstructured-legacy-value"},
+            identity=identity,
+            quarantine_attribution=True,
+        )
+
+
+def test_legacy_snapshot_proof_digest_binds_holdings_not_observation_time() -> None:
+    def snapshot(*, observed_at: datetime, quantity: int) -> BrokerAccountSnapshot:
+        return BrokerAccountSnapshot(
+            observed_at=observed_at,
+            source="kis:legacy_us_holdings_snapshot",
+            holdings=[
+                BrokerAccountHolding(
+                    symbol="AFIB",
+                    quantity=quantity,
+                    average_price=Decimal("1.25"),
+                    payload={"ovrs_excg_cd": "OTCB"},
+                )
+            ],
+            open_orders=[],
+            open_orders_complete=False,
+            payload={
+                "exchange": "US_ALL",
+                "query_scope": "kis_us_all_holdings_only_v1",
+                "evidence_type": "holdings_only",
+            },
+        )
+
+    first = remediation_service._legacy_snapshot_proof_digest(
+        snapshot=snapshot(observed_at=NOW, quantity=4),
+        exchange="OTCB",
+        query_scope="kis_us_all_holdings_only_v1",
+    )
+    later = remediation_service._legacy_snapshot_proof_digest(
+        snapshot=snapshot(observed_at=NOW + timedelta(seconds=30), quantity=4),
+        exchange="OTCB",
+        query_scope="kis_us_all_holdings_only_v1",
+    )
+    changed = remediation_service._legacy_snapshot_proof_digest(
+        snapshot=snapshot(observed_at=NOW + timedelta(seconds=30), quantity=5),
+        exchange="OTCB",
+        query_scope="kis_us_all_holdings_only_v1",
+    )
+
+    assert first == later
+    assert first != changed
 
 
 @pytest.mark.parametrize(
@@ -1895,6 +2797,7 @@ def test_legacy_position_attribution_apply_binds_only_explicitly_approved_match(
         "app.services.position_truth_remediation.ensure_authenticated_broker_session",
         lambda **kwargs: type("SessionState", (), {"access_token": "test-token"})(),
     )
+    monkeypatch.setattr(remediation_service, "_real_utc_now", lambda: NOW)
     dry_run = remediation_service.analyze_legacy_position_attribution(
         settings=settings,
         db=db,
@@ -1964,6 +2867,173 @@ def test_legacy_position_attribution_apply_binds_only_explicitly_approved_match(
     assert events[0].evidence_summary["evidence_fingerprint"] == approved_item[
         "evidence_fingerprint"
     ]
+    db.close()
+    engine.dispose()
+
+
+def test_legacy_attribution_apply_rechecks_cross_exchange_collision_after_analysis(
+    monkeypatch,
+) -> None:
+    settings, engine, session_factory, db = _session()
+    settings = settings.model_copy(
+        update={
+            "runtime_mode": "live",
+            "account_drawdown_recovery_scope_secret": "s" * 32,
+            "execution_position_account_scope": "test-live-account",
+        }
+    )
+    position = _legacy_position(symbol="AFIB", quantity=4, average_price="1.25")
+    position.mode = "live"
+    db.add(position)
+    db.commit()
+    snapshot = BrokerAccountSnapshot(
+        observed_at=NOW,
+        source="kis:legacy_us_holdings_snapshot",
+        holdings=[
+            BrokerAccountHolding(
+                symbol="AFIB",
+                quantity=4,
+                average_price=Decimal("1.25"),
+                payload={"ovrs_excg_cd": "OTCB"},
+            )
+        ],
+        open_orders=[],
+        open_orders_complete=False,
+        payload={
+            "exchange": "US_ALL",
+            "query_scope": "kis_us_all_holdings_only_v1",
+            "evidence_type": "holdings_only",
+        },
+    )
+    adapter = LegacyQuarantineAttributionAdapter(snapshot)
+    monkeypatch.setattr(
+        "app.services.position_truth_remediation.ensure_authenticated_broker_session",
+        lambda **kwargs: type("SessionState", (), {"access_token": "test-token"})(),
+    )
+    monkeypatch.setattr(remediation_service, "_real_utc_now", lambda: NOW)
+    dry_run = remediation_service.analyze_legacy_position_attribution(
+        settings=settings,
+        db=db,
+        auth_session_factory=session_factory,
+        adapter=adapter,
+        exchange="OTCB",
+        now=NOW,
+    )
+    fingerprint = str(dry_run["items"][0]["evidence_fingerprint"])
+    original_analyze = remediation_service.analyze_legacy_position_attribution
+
+    def analyze_then_insert_collision(**kwargs):
+        result = original_analyze(**kwargs)
+        identity = build_position_identity(
+            settings=settings,
+            provider="kis",
+            exchange="NYSE",
+        )
+        db.add(
+            ExecutionPosition(
+                mode=" LIVE ",
+                provider=" KIS ",
+                account_scope=f" {identity.account_scope.upper()} ",
+                exchange="NYSE",
+                symbol=" afib ",
+                quantity=1,
+                average_price=Decimal("2"),
+                updated_from="concurrent_reconciliation",
+            )
+        )
+        db.commit()
+        return result
+
+    monkeypatch.setattr(
+        remediation_service,
+        "analyze_legacy_position_attribution",
+        analyze_then_insert_collision,
+    )
+
+    with pytest.raises(
+        PositionIdentityConflictError,
+        match="scoped route symbol collision",
+    ):
+        remediation_service.apply_legacy_position_attribution(
+            settings=settings,
+            db=db,
+            auth_session_factory=session_factory,
+            adapter=adapter,
+            exchange="OTCB",
+            approved_evidence={position.id: fingerprint},
+            actor="operator",
+            reason="race must fail closed",
+            now=NOW,
+        )
+
+    db.expire_all()
+    persisted = db.get(ExecutionPosition, position.id)
+    assert persisted is not None and persisted.provider is None
+    assert db.scalars(select(RuntimeRemediationEvent)).all() == []
+    db.close()
+    engine.dispose()
+
+
+def test_legacy_attribution_apply_rechecks_snapshot_freshness_after_lock_with_real_time(
+    monkeypatch,
+) -> None:
+    settings, engine, session_factory, db = _session()
+    settings = settings.model_copy(
+        update={"account_drawdown_recovery_scope_secret": "s" * 32}
+    )
+    position = _legacy_position(symbol="003550", quantity=10, average_price="250000")
+    db.add(position)
+    db.commit()
+    adapter = LegacyAttributionAdapter(
+        BrokerAccountSnapshot(
+            observed_at=NOW,
+            source="kis:account_snapshot",
+            holdings=[
+                BrokerAccountHolding(
+                    symbol="003550",
+                    quantity=10,
+                    average_price=Decimal("250000"),
+                )
+            ],
+            payload={"exchange": "KRX"},
+        )
+    )
+    monkeypatch.setattr(
+        "app.services.position_truth_remediation.ensure_authenticated_broker_session",
+        lambda **kwargs: type("SessionState", (), {"access_token": "test-token"})(),
+    )
+    dry_run = remediation_service.analyze_legacy_position_attribution(
+        settings=settings,
+        db=db,
+        auth_session_factory=session_factory,
+        adapter=adapter,
+        exchange="KRX",
+        now=NOW,
+    )
+    monkeypatch.setattr(
+        remediation_service,
+        "_real_utc_now",
+        lambda: NOW + timedelta(minutes=10),
+        raising=False,
+    )
+
+    with pytest.raises(BrokerAdapterError, match="snapshot is not current"):
+        remediation_service.apply_legacy_position_attribution(
+            settings=settings,
+            db=db,
+            auth_session_factory=session_factory,
+            adapter=adapter,
+            exchange="KRX",
+            approved_evidence={
+                position.id: str(dry_run["items"][0]["evidence_fingerprint"])
+            },
+            actor="operator",
+            reason="stale after serialization",
+            now=NOW,
+        )
+
+    db.expire_all()
+    assert db.get(ExecutionPosition, position.id).provider is None
     db.close()
     engine.dispose()
 
