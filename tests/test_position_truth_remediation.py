@@ -1264,7 +1264,7 @@ def test_legacy_otc_attribution_dry_run_is_holdings_only_and_quarantined(
     assert item["disposition"] == "account_attributed_quarantine"
     assert item["query_scope"] == "kis_us_all_holdings_only_v1"
     assert item["safety_policy_version"] == (
-        "legacy-position-attribution-safety-v2"
+        "legacy-position-attribution-safety-v3"
     )
     assert item["safety_invariants"] == {
         "account_scope_source": "stable_hmac",
@@ -1324,7 +1324,7 @@ def test_legacy_otc_attribution_apply_persists_non_trading_quarantine(
     settings = settings.model_copy(
         update={
             "runtime_mode": "live",
-            "account_drawdown_recovery_scope_secret": "s" * 32,
+            "account_drawdown_recovery_scope_secret": None,
             "execution_position_account_scope": "test-live-account",
         }
     )
@@ -1369,6 +1369,21 @@ def test_legacy_otc_attribution_apply_persists_non_trading_quarantine(
         adapter=adapter,
         exchange="OOTC",
         now=NOW,
+    )
+    expected_identity = build_position_identity(
+        settings=settings,
+        provider="kis",
+        exchange="OOTC",
+    )
+    active_us_identity = build_position_identity(
+        settings=settings,
+        provider="kis",
+        exchange="NASD",
+    )
+    assert dry_run["items"][0]["account_scope"] == expected_identity.account_scope
+    assert expected_identity.account_scope == active_us_identity.account_scope
+    assert dry_run["items"][0]["safety_invariants"]["account_scope_source"] == (
+        "configured_route_label"
     )
     fingerprint = str(dry_run["items"][0]["evidence_fingerprint"])
 
@@ -1522,14 +1537,14 @@ def test_legacy_otc_attribution_rejects_non_live_mode_before_authentication(
     engine.dispose()
 
 
-def test_legacy_otc_attribution_requires_stable_hmac_scope_secret_before_db_read(
+def test_legacy_otc_attribution_requires_canonical_account_scope_before_db_read(
     monkeypatch,
 ) -> None:
     settings, engine, session_factory, db = _session()
     settings = settings.model_copy(
         update={
             "runtime_mode": "live",
-            "execution_position_account_scope": "label-is-not-hmac-proof",
+            "execution_position_account_scope": None,
             "account_drawdown_recovery_scope_secret": "too-short",
         }
     )
@@ -1541,7 +1556,7 @@ def test_legacy_otc_attribution_requires_stable_hmac_scope_secret_before_db_read
 
     with pytest.raises(
         PositionIdentityConflictError,
-        match="stable account scope secret",
+        match="stable canonical account scope",
     ):
         remediation_service.analyze_legacy_position_attribution(
             settings=settings,

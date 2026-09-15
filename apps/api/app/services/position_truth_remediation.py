@@ -56,7 +56,7 @@ SUPPORTED_POSITION_EXCHANGES = {"KRX", "NASD", "NYSE", "AMEX"}
 LEGACY_QUARANTINE_ATTRIBUTION_EXCHANGES = KIS_US_POSITION_QUARANTINE_EXCHANGES
 LEGACY_QUARANTINE_ROUTE_DISPOSITION = "account_attributed_quarantine"
 LEGACY_ATTRIBUTION_SAFETY_POLICY_VERSION = (
-    "legacy-position-attribution-safety-v2"
+    "legacy-position-attribution-safety-v3"
 )
 POSITION_EVIDENCE_ORDER_STATUSES = (*ACTIONABLE_OPEN_ORDER_STATUSES, "filled")
 
@@ -82,10 +82,14 @@ def analyze_legacy_position_attribution(
     )
     if quarantine_attribution and settings.runtime_mode != "live":
         raise ValueError("legacy quarantine attribution requires live mode")
-    if quarantine_attribution and stable_account_scope_hmac_key(settings) is None:
+    if (
+        quarantine_attribution
+        and legacy_attribution_account_scope_source(settings=settings) is None
+    ):
         raise PositionIdentityConflictError(
-            "legacy quarantine attribution requires a stable account scope secret "
-            "of at least 32 bytes"
+            "legacy quarantine attribution requires a stable canonical account "
+            "scope from ACCOUNT_DRAWDOWN_RECOVERY_SCOPE_SECRET of at least 32 "
+            "bytes or EXECUTION_POSITION_ACCOUNT_SCOPE"
         )
     provider = str(adapter.provider or "").strip().lower()
     if not provider or provider == "unknown":
@@ -207,6 +211,7 @@ def analyze_legacy_position_attribution(
         query_scope=query_scope,
     )
     safety_invariants = _legacy_attribution_safety_invariants(
+        settings=settings,
         quarantine_attribution=quarantine_attribution,
     )
     items = [
@@ -912,11 +917,14 @@ def _legacy_attribution_item(
 
 def _legacy_attribution_safety_invariants(
     *,
+    settings: Settings,
     quarantine_attribution: bool,
 ) -> dict[str, object]:
     return {
         "account_scope_source": (
-            "stable_hmac" if quarantine_attribution else "position_identity_policy"
+            legacy_attribution_account_scope_source(settings=settings)
+            if quarantine_attribution
+            else "position_identity_policy"
         ),
         "broker_actions_allowed": False,
         "collision_scope": "mode_provider_account_symbol_any_exchange",
@@ -928,6 +936,17 @@ def _legacy_attribution_safety_invariants(
             else "account_attributed_supported_route"
         ),
     }
+
+
+def legacy_attribution_account_scope_source(
+    *,
+    settings: Settings,
+) -> str | None:
+    if stable_account_scope_hmac_key(settings) is not None:
+        return "stable_hmac"
+    if str(settings.execution_position_account_scope or "").strip():
+        return "configured_route_label"
+    return None
 
 
 def _legacy_snapshot_proof_digest(
