@@ -166,9 +166,13 @@ live mode their dry-run uses the fully paginated KIS all-US balance endpoint
 through a holdings-only adapter; it does not query orders, quotes, or buying
 power. A row receives a fingerprint only when the broker holding has the exact
 requested exchange, symbol, positive quantity, and average price, with no
-duplicate or target-route collision. Set a stable
-`KAI_EXEC_ACCOUNT_DRAWDOWN_RECOVERY_SCOPE_SECRET` of at least 32 UTF-8 bytes;
-the command exits before opening the database if this proof is unavailable.
+duplicate or target-route collision. Use the deployment's canonical KIS account
+scope: either `KAI_EXEC_ACCOUNT_DRAWDOWN_RECOVERY_SCOPE_SECRET` with at least 32
+UTF-8 bytes or the same non-secret
+`KAI_EXEC_EXECUTION_POSITION_ACCOUNT_SCOPE` route label used by the active
+runtime. The command exits before opening the database if neither is available.
+Do not switch scope sources between dry-run, apply, and restart; doing so would
+separate the quarantine rows from the US-buy safety fence.
 Run each exchange separately, for example:
 
 ```bash

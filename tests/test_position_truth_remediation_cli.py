@@ -28,6 +28,7 @@ class _SettingsStub:
         self.database_url = ""
         self.runtime_mode = ""
         self.account_drawdown_recovery_scope_secret = "s" * 32
+        self.execution_position_account_scope: str | None = None
 
     def model_copy(self, *, update: dict[str, str]) -> _SettingsStub:
         self.database_url = update["database_url"]
@@ -186,7 +187,7 @@ def test_legacy_quarantine_rejects_non_live_mode_before_settings_or_db_open(
         )
 
 
-def test_live_legacy_quarantine_requires_stable_scope_secret_before_db_open(
+def test_live_legacy_quarantine_requires_canonical_scope_before_db_open(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     settings = _SettingsStub()
@@ -198,7 +199,7 @@ def test_live_legacy_quarantine_requires_stable_scope_secret_before_db_open(
         lambda _settings: pytest.fail("unsafe live OTC scope opened database"),
     )
 
-    with pytest.raises(SystemExit, match="stable account scope secret"):
+    with pytest.raises(SystemExit, match="stable canonical account scope"):
         cli.main(
             [
                 "--database-url",
@@ -209,6 +210,48 @@ def test_live_legacy_quarantine_requires_stable_scope_secret_before_db_open(
                 "OTCB",
             ]
         )
+
+
+def test_live_legacy_quarantine_accepts_configured_canonical_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db, engine = _stub_runtime(monkeypatch)
+    settings = _SettingsStub()
+    settings.account_drawdown_recovery_scope_secret = None
+    settings.execution_position_account_scope = "primary-kis-live"
+    adapter = object()
+    calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(cli, "load_settings", lambda: settings)
+    monkeypatch.setattr(cli, "KisBrokerAdapter", lambda *, settings: adapter)
+    monkeypatch.setattr(
+        cli,
+        "analyze_legacy_position_attribution",
+        lambda **kwargs: calls.append(kwargs) or {"mode": "dry-run"},
+    )
+
+    assert (
+        cli.main(
+            [
+                "--database-url",
+                "sqlite:///label-scoped.db",
+                "--runtime-mode",
+                "live",
+                "--legacy-attribution-exchange",
+                "OTCB",
+            ]
+        )
+        == 0
+    )
+    assert calls == [
+        {
+            "settings": settings,
+            "db": db,
+            "auth_session_factory": ANY,
+            "adapter": adapter,
+            "exchange": "OTCB",
+        }
+    ]
+    assert engine.disposed is True
 
 
 def test_legacy_attribution_apply_routes_explicit_approvals_and_audit_metadata(

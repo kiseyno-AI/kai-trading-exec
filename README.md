@@ -833,7 +833,12 @@ the account but remain permanently marked `account_attributed_quarantine`,
 non-trading, non-monitoring, and manual-review-required. This attribution does
 not add OTCB/OOTC to any order, quote, monitoring, or reconciliation allowlist.
 The command rejects OTCB/OOTC before opening the database unless the live
-deployment has a stable account-scope HMAC secret of at least 32 UTF-8 bytes.
+deployment has a canonical account scope: either a stable account-scope HMAC
+secret of at least 32 UTF-8 bytes or the same non-secret
+`KAI_EXEC_EXECUTION_POSITION_ACCOUNT_SCOPE` route label used by the active KIS
+runtime. The dry-run records which source was used. Keep that setting unchanged
+through dry-run, apply, restart, and later remediation so quarantined rows remain
+in the same account scope as the US-buy safety fence.
 In dry-run output, `quarantined_on_apply_count` counts only exact matches that can
 be approved into quarantine, while `manual_review_count` counts every row that
 still requires operator review. Apply output reports the approved rows actually

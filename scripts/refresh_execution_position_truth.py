@@ -25,8 +25,8 @@ from app.services.position_truth_remediation import (  # noqa: E402
     analyze_position_truth_remediation,
     apply_legacy_position_attribution,
     apply_position_truth_remediation,
+    legacy_attribution_account_scope_source,
 )
-from app.services.position_identity import stable_account_scope_hmac_key  # noqa: E402
 
 
 def _approved_position_evidence(values: list[str]) -> dict[str, str]:
@@ -124,10 +124,14 @@ def main(argv: list[str] | None = None) -> int:
     settings = load_settings().model_copy(
         update={"database_url": database_url, "runtime_mode": runtime_mode}
     )
-    if quarantine_attribution and stable_account_scope_hmac_key(settings) is None:
+    if (
+        quarantine_attribution
+        and legacy_attribution_account_scope_source(settings=settings) is None
+    ):
         raise SystemExit(
-            "legacy OTC quarantine attribution requires a stable account scope secret "
-            "of at least 32 bytes"
+            "legacy OTC quarantine attribution requires a stable canonical account "
+            "scope from ACCOUNT_DRAWDOWN_RECOVERY_SCOPE_SECRET of at least 32 "
+            "bytes or EXECUTION_POSITION_ACCOUNT_SCOPE"
         )
     engine = create_db_engine(settings)
     session_factory = create_session_factory(engine)
