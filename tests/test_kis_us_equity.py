@@ -17,6 +17,7 @@ from app.broker.base import (
     BrokerAccountHolding,
     BrokerAccountOpenOrder,
     BrokerAccountSnapshot,
+    BrokerAdapterError,
     BrokerErrorClassification,
     BrokerOrderPlacementRequest,
 )
@@ -28,6 +29,7 @@ from app.broker.kis import (
     KIS_OVERSEAS_CURRENT_PRICE_PATH,
     KIS_OVERSEAS_OPEN_ORDERS_PATH,
     KIS_OVERSEAS_ORDER_PATH,
+    KIS_OVERSEAS_QUOTE_EMPTY_CODE,
     KIS_US_EXCHANGES,
     JsonHttpResponse,
     KisBrokerAdapter,
@@ -218,6 +220,31 @@ def test_kis_us_equity_quote_maps_order_exchange_to_quote_exchange() -> None:
         "FILL": "",
         "KEYB": "",
     }
+
+
+def test_kis_us_equity_empty_minute_response_has_durable_quote_code() -> None:
+    http = QueueHttpClient(
+        get_payloads=[{"rt_cd": "0", "output2": []}],
+    )
+    adapter = KisBrokerAdapter(settings=_settings(), http_client=http)
+
+    with pytest.raises(BrokerAdapterError) as exc_info:
+        adapter.get_current_price("token", symbol="OLDCO", exchange="NASD")
+
+    assert exc_info.value.code == KIS_OVERSEAS_QUOTE_EMPTY_CODE
+    assert exc_info.value.retryable is False
+    assert exc_info.value.observed_at is not None
+
+
+def test_kis_us_equity_missing_minute_payload_is_not_durable_quote_evidence() -> None:
+    http = QueueHttpClient(get_payloads=[{"rt_cd": "0"}])
+    adapter = KisBrokerAdapter(settings=_settings(), http_client=http)
+
+    with pytest.raises(BrokerAdapterError) as exc_info:
+        adapter.get_current_price("token", symbol="OLDCO", exchange="NASD")
+
+    assert exc_info.value.code is None
+    assert exc_info.value.observed_at is not None
 
 
 def test_kis_us_equity_account_snapshot_combines_balance_orders_and_buying_power() -> None:

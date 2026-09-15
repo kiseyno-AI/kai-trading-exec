@@ -1345,6 +1345,8 @@ def _position_for_monitoring_item(
     position = positions_by_symbol.get(item.symbol)
     if position is None:
         return None
+    if _position_monitoring_is_disabled(position):
+        return None
     symbol = str(item.symbol or "").strip().upper()
     provider = str(
         item.provider or ("kis" if _is_krx_equity_symbol(symbol) else "")
@@ -1548,6 +1550,11 @@ def list_autonomous_monitoring_symbols(
         )
         .order_by(ExecutionPosition.symbol.asc())
     ).all()
+    monitoring_disabled_held_symbols = {
+        position.symbol
+        for position in held_positions
+        if _position_monitoring_is_disabled(position)
+    }
     for position in held_positions:
         raw_payload = position.raw_payload if isinstance(position.raw_payload, dict) else {}
         sync_context = raw_payload.get("_position_sync")
@@ -1562,7 +1569,11 @@ def list_autonomous_monitoring_symbols(
     held_symbols = {
         position.symbol
         for position in held_positions
-        if _is_krx_equity_symbol(position.symbol) or position.symbol in kis_us_symbols
+        if position.symbol not in monitoring_disabled_held_symbols
+        and (
+            _is_krx_equity_symbol(position.symbol)
+            or position.symbol in kis_us_symbols
+        )
     }
     fresh_position_truth_after = datetime.now(UTC) - timedelta(
         seconds=settings.exec_agent_max_account_snapshot_age_seconds
@@ -1577,6 +1588,8 @@ def list_autonomous_monitoring_symbols(
 
     def append_candidates(rows: list[str], *, enforce_limit: bool = True) -> None:
         for symbol in rows:
+            if symbol in monitoring_disabled_held_symbols:
+                continue
             if not _is_krx_equity_symbol(symbol) and symbol not in kis_us_symbols:
                 continue
             if enforce_limit and len(symbol_candidates) >= symbol_cycle_limit:
@@ -2126,6 +2139,10 @@ def _evaluate_monitoring_cycle(
 
     for item in items:
         if item.status in NON_MONITORABLE_PLAN_ITEM_STATUSES:
+            continue
+        if _is_watch_buy_item(item) and _position_monitoring_is_disabled(
+            positions_by_symbol.get(item.symbol)
+        ):
             continue
 
         price = prices.get(item.symbol)
@@ -8406,15 +8423,19 @@ def _load_positions_by_symbol(
     settings: Settings,
     db: Session,
     symbols: list[str] | set[str] | None = None,
+    lock_for_update: bool = False,
 ) -> dict[str, ExecutionPosition]:
     where = list(_active_kis_position_filters(settings=settings))
     if symbols:
         where.append(ExecutionPosition.symbol.in_(_ordered_symbol_scope(symbols)))
-    positions = db.scalars(
+    statement = (
         select(ExecutionPosition)
         .where(*where)
         .order_by(ExecutionPosition.symbol.asc())
-    ).all()
+    )
+    if lock_for_update:
+        statement = statement.with_for_update().execution_options(populate_existing=True)
+    positions = db.scalars(statement).all()
     return {
         symbol: position
         for symbol, position in _unique_positions_by_symbol(positions).items()
@@ -8429,6 +8450,7 @@ def _maintain_post_entry_exit_monitors(
     positions_by_symbol: dict[str, ExecutionPosition],
     prices: dict[str, MonitoringPriceRequest],
     triggered_at: datetime,
+    durably_unquoteable_symbols: set[str] | None = None,
 ) -> tuple[int, int]:
     maintenance_count = 0
     review_count = 0
@@ -8448,6 +8470,9 @@ def _maintain_post_entry_exit_monitors(
                 position=position,
                 observed_price=prices.get(symbol),
                 triggered_at=triggered_at,
+                quote_unavailable_is_durable=(
+                    symbol in (durably_unquoteable_symbols or set())
+                ),
             )
             maintenance_count += existing_maintenance_count
             if requires_review:
@@ -8620,6 +8645,7 @@ def _ensure_existing_position_default_exit_monitors(
     position: ExecutionPosition,
     observed_price: MonitoringPriceRequest | None,
     triggered_at: datetime,
+    quote_unavailable_is_durable: bool = False,
 ) -> tuple[int, bool]:
     if position.quantity <= 0 or position.average_price is None or position.average_price <= 0:
         return 0, False
@@ -8643,6 +8669,8 @@ def _ensure_existing_position_default_exit_monitors(
         )
         is None
     ):
+        if not quote_unavailable_is_durable:
+            return 0, False
         _mark_position_monitoring_manual_review(
             position=position,
             reason="unpriced_overseas_holding",
@@ -8800,6 +8828,17 @@ def _mark_position_monitoring_manual_review(
     sync_context["manual_review_recorded_at"] = triggered_at.isoformat()
     raw_payload["_position_sync"] = sync_context
     position.raw_payload = raw_payload
+
+
+def _position_monitoring_is_disabled(position: ExecutionPosition | None) -> bool:
+    if position is None:
+        return False
+    raw_payload = position.raw_payload if isinstance(position.raw_payload, dict) else {}
+    sync_context = raw_payload.get("_position_sync")
+    return bool(
+        isinstance(sync_context, dict)
+        and sync_context.get("monitoring_eligible") is False
+    )
 
 
 def _latest_runtime_plan(

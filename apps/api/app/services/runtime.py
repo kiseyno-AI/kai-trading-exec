@@ -1521,6 +1521,27 @@ def position_truth_freshness_payload(
         for position in positions
         if _position_has_quantity(position)
     }
+    manual_review_reasons: dict[str, str] = {}
+    for position in sorted(
+        positions,
+        key=lambda item: (item.symbol, str(item.exchange or ""), item.id),
+    ):
+        if not _position_has_quantity(position):
+            continue
+        raw_payload = position.raw_payload if isinstance(position.raw_payload, dict) else {}
+        sync_context = raw_payload.get("_position_sync")
+        if not (
+            isinstance(sync_context, dict)
+            and sync_context.get("monitoring_eligible") is False
+        ):
+            continue
+        manual_review_reasons.setdefault(
+            position.symbol,
+            str(
+                sync_context.get("manual_review_reason")
+                or "position_monitoring_not_eligible"
+            ),
+        )
     candidate_symbols = nonzero_position_symbols | evidence_symbols
     trusted_flat_count = sum(
         1
@@ -1593,6 +1614,12 @@ def position_truth_freshness_payload(
         "tracked_symbol_count": len(candidate_symbols),
         "evidence_symbol_count": len(evidence_symbols),
         "nonzero_position_count": len(nonzero_position_symbols),
+        "manual_review_count": len(manual_review_reasons),
+        "manual_review_symbols": sorted(manual_review_reasons),
+        "manual_review_reasons": {
+            symbol: manual_review_reasons[symbol]
+            for symbol in sorted(manual_review_reasons)
+        },
         "trusted_flat_count": trusted_flat_count,
     }
 
@@ -1817,6 +1844,20 @@ def runtime_actionable_alerts_payload(
                     "count": stale_count,
                     "symbols": position_truth.get("stale_symbols") or [],
                     "message": "execution position truth is stale or missing for symbols with live evidence",
+                }
+            )
+        manual_review_count = int(position_truth.get("manual_review_count") or 0)
+        if manual_review_count > 0:
+            alerts.append(
+                {
+                    "kind": "position_monitoring_manual_review_required",
+                    "severity": "critical",
+                    "count": manual_review_count,
+                    "symbols": position_truth.get("manual_review_symbols") or [],
+                    "message": (
+                        "held positions cannot be protected automatically until their "
+                        "quote and execution route are reviewed"
+                    ),
                 }
             )
 
@@ -3246,6 +3287,9 @@ def build_runtime_status(
             "tracked_symbol_count": 0,
             "evidence_symbol_count": 0,
             "nonzero_position_count": 0,
+            "manual_review_count": 0,
+            "manual_review_symbols": [],
+            "manual_review_reasons": {},
             "trusted_flat_count": 0,
         },
         "broker_orders": {
@@ -3332,6 +3376,12 @@ def build_runtime_status(
             "monitored": cycle_symbols,
             "monitoring_cycle_batch": cycle_symbols,
         }
+        freshness["position_truth"] = position_truth_freshness_payload(
+            settings=settings,
+            db=db,
+            provider=runtime_provider,
+            runtime_scope=active_runtime_scope,
+        )
         freshness["summary_source"] = "fast_autonomous_runtime_snapshot"
         monitoring_reasons = _monitoring_price_source_readiness_reasons(
             autonomous=autonomous,

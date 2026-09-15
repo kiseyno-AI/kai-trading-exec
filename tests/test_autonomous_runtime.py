@@ -1200,13 +1200,303 @@ def test_cached_cycle_repairs_held_position_monitors_with_desired_symbols(monkey
     monkeypatch.setattr(
         coordinator,
         "_repair_post_entry_exit_monitors_for_cached_cycle",
-        lambda **kwargs: maintenance_calls.append("called") or 0,
+        lambda **kwargs: maintenance_calls.append("called") or (0, 0),
     )
 
     payload = coordinator._monitoring_cycle_sync(started_at)
 
     assert payload["status_code"] == 200
     assert maintenance_calls == ["called"]
+
+
+def test_cached_cycle_persists_review_only_unpriced_us_position_state() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        execution_position_account_scope="cached-review-test",
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    identity = build_position_identity(
+        settings=settings,
+        provider="kis",
+        exchange="NASD",
+    )
+    with session_factory() as session:
+        session.add(
+            ExecutionPosition(
+                mode=settings.runtime_mode,
+                provider=identity.provider,
+                account_scope=identity.account_scope,
+                exchange=identity.exchange,
+                symbol="OLDCO",
+                quantity=7,
+                average_price=Decimal("12.50"),
+                updated_from="reconciliation",
+                raw_payload={
+                    "_position_sync": {
+                        "asset_class": "us_equity",
+                        "exchange": "NASD",
+                        "monitoring_eligible": True,
+                    }
+                },
+            )
+        )
+        session.commit()
+
+    coordinator = AutonomousRuntimeCoordinator(
+        settings=settings,
+        session_factory=session_factory,
+        broker_adapter_factory=lambda settings: None,  # type: ignore[arg-type,return-value]
+    )
+    started_at = datetime(2026, 9, 15, 4, 0, tzinfo=UTC)
+    snapshot = MonitoringRuntimeSnapshot(
+        loaded_at=started_at,
+        symbols=["OLDCO"],
+        positions_by_symbol={
+            "OLDCO": CachedMonitoringPosition(
+                symbol="OLDCO",
+                quantity=7,
+                provider="kis",
+                exchange="NASD",
+            )
+        },
+        items=[],
+        filled_today_symbols=[],
+    )
+
+    result = coordinator._repair_post_entry_exit_monitors_for_cached_cycle(
+        runtime_snapshot=snapshot,
+        prices=[MonitoringPriceRequest(symbol="005930", price=Decimal("70000"))],
+        started_at=started_at,
+        durably_unquoteable_symbols={"OLDCO"},
+    )
+
+    assert result == (0, 1)
+    with session_factory() as session:
+        position = session.query(ExecutionPosition).filter_by(symbol="OLDCO").one()
+        assert position.raw_payload["_position_sync"] == {
+            "asset_class": "us_equity",
+            "exchange": "NASD",
+            "monitoring_eligible": False,
+            "manual_review_required": True,
+            "manual_review_reason": "unpriced_overseas_holding",
+            "manual_review_recorded_at": started_at.isoformat(),
+        }
+    engine.dispose()
+
+
+def test_cached_cycle_removes_reviewed_position_from_reported_monitoring_set(
+    monkeypatch,
+) -> None:
+    settings = Settings(database_url="sqlite:///:memory:", runtime_mode="paper")
+    coordinator = AutonomousRuntimeCoordinator(
+        settings=settings,
+        session_factory=None,  # type: ignore[arg-type]
+        broker_adapter_factory=lambda settings: None,  # type: ignore[arg-type,return-value]
+    )
+    started_at = datetime(2026, 9, 15, 4, 0, tzinfo=UTC)
+    initial_snapshot = MonitoringRuntimeSnapshot(
+        loaded_at=started_at,
+        symbols=["005930", "OLDCO"],
+        positions_by_symbol={
+            "005930": CachedMonitoringPosition(symbol="005930", quantity=1),
+            "OLDCO": CachedMonitoringPosition(symbol="OLDCO", quantity=7),
+        },
+        items=[],
+        filled_today_symbols=[],
+    )
+    reviewed_snapshot = MonitoringRuntimeSnapshot(
+        loaded_at=started_at,
+        symbols=["005930"],
+        positions_by_symbol={
+            "005930": CachedMonitoringPosition(symbol="005930", quantity=1),
+        },
+        items=[],
+        filled_today_symbols=[],
+    )
+
+    monkeypatch.setattr(
+        "app.services.autonomous_runtime._load_core_desired_monitoring_symbols",
+        lambda settings: [],
+    )
+    monkeypatch.setattr(
+        coordinator,
+        "_load_local_desired_monitoring_symbols",
+        lambda: ["005930", "OLDCO"],
+    )
+    monkeypatch.setattr(
+        coordinator,
+        "_load_monitoring_runtime_snapshot_for_symbols",
+        lambda **kwargs: initial_snapshot,
+    )
+    monkeypatch.setattr(
+        coordinator,
+        "_refresh_monitoring_snapshot_filled_today",
+        lambda now: None,
+    )
+    monkeypatch.setattr(
+        coordinator,
+        "_load_monitoring_prices",
+        lambda **kwargs: [
+            MonitoringPriceRequest(symbol="005930", price=Decimal("70000"))
+        ],
+    )
+    monkeypatch.setattr(
+        coordinator,
+        "_repair_post_entry_exit_monitors_for_cached_cycle",
+        lambda **kwargs: (0, 1),
+    )
+    monkeypatch.setattr(
+        coordinator,
+        "_refresh_monitoring_runtime_snapshot",
+        lambda **kwargs: (
+            setattr(coordinator, "_monitoring_runtime_snapshot", reviewed_snapshot)
+            or reviewed_snapshot
+        ),
+    )
+
+    payload = coordinator._monitoring_cycle_sync(started_at)
+
+    assert payload["monitored_symbols"] == ["005930"]
+    assert payload["price_count"] == 1
+    assert payload["runtime_snapshot"]["position_count"] == 1
+    assert payload["post_entry_review_count"] == 1
+
+
+def test_cached_cycle_returns_review_transition_when_every_symbol_is_removed(
+    monkeypatch,
+) -> None:
+    settings = Settings(database_url="sqlite:///:memory:", runtime_mode="paper")
+
+    class DurableEmptyPriceSource:
+        def get_last_diagnostics(self) -> dict[str, object]:
+            return {"durably_unquoteable_symbols": ["OLDCO"]}
+
+    coordinator = AutonomousRuntimeCoordinator(
+        settings=settings,
+        session_factory=None,  # type: ignore[arg-type]
+        broker_adapter_factory=lambda settings: None,  # type: ignore[arg-type,return-value]
+        monitoring_price_source=DurableEmptyPriceSource(),
+    )
+    started_at = datetime(2026, 9, 15, 4, 0, tzinfo=UTC)
+    initial_snapshot = MonitoringRuntimeSnapshot(
+        loaded_at=started_at,
+        symbols=["OLDCO"],
+        positions_by_symbol={
+            "OLDCO": CachedMonitoringPosition(
+                symbol="OLDCO",
+                quantity=7,
+                provider="kis",
+                exchange="NASD",
+            )
+        },
+        items=[],
+        filled_today_symbols=[],
+    )
+    reviewed_snapshot = MonitoringRuntimeSnapshot(
+        loaded_at=started_at,
+        symbols=[],
+        positions_by_symbol={},
+        items=[],
+        filled_today_symbols=[],
+    )
+    monkeypatch.setattr(
+        "app.services.autonomous_runtime._load_core_desired_monitoring_symbols",
+        lambda settings: [],
+    )
+    monkeypatch.setattr(
+        coordinator,
+        "_load_local_desired_monitoring_symbols",
+        lambda: ["OLDCO"],
+    )
+    monkeypatch.setattr(
+        coordinator,
+        "_load_local_position_symbols",
+        lambda: ["OLDCO"],
+    )
+    monkeypatch.setattr(
+        coordinator,
+        "_load_monitoring_runtime_snapshot_for_symbols",
+        lambda **kwargs: initial_snapshot,
+    )
+    monkeypatch.setattr(
+        coordinator,
+        "_refresh_monitoring_snapshot_filled_today",
+        lambda now: None,
+    )
+    monkeypatch.setattr(
+        coordinator,
+        "_load_monitoring_prices",
+        lambda **kwargs: [],
+    )
+    monkeypatch.setattr(
+        coordinator,
+        "_repair_post_entry_exit_monitors_for_cached_cycle",
+        lambda **kwargs: (0, 1),
+    )
+    monkeypatch.setattr(
+        coordinator,
+        "_refresh_monitoring_runtime_snapshot",
+        lambda **kwargs: (
+            setattr(coordinator, "_monitoring_runtime_snapshot", reviewed_snapshot)
+            or reviewed_snapshot
+        ),
+    )
+
+    payload = coordinator._monitoring_cycle_sync(started_at)
+
+    assert payload["idle"] is True
+    assert payload["monitored_symbols"] == []
+    assert payload["price_count"] == 0
+    assert payload["post_entry_review_count"] == 1
+    assert payload["submitted_order_count"] == 0
+
+
+def test_cached_evaluation_skips_monitoring_disabled_held_position() -> None:
+    settings = Settings(database_url="sqlite:///:memory:", runtime_mode="paper")
+    coordinator = AutonomousRuntimeCoordinator(
+        settings=settings,
+        session_factory=None,  # type: ignore[arg-type]
+        broker_adapter_factory=lambda settings: None,  # type: ignore[arg-type,return-value]
+    )
+    started_at = datetime(2026, 9, 15, 4, 0, tzinfo=UTC)
+    snapshot = MonitoringRuntimeSnapshot(
+        loaded_at=started_at,
+        symbols=["OLDCO"],
+        positions_by_symbol={
+            "OLDCO": CachedMonitoringPosition(
+                symbol="OLDCO",
+                quantity=7,
+                provider="kis",
+                exchange="NASD",
+                monitoring_eligible=False,
+            )
+        },
+        items=[
+            CachedMonitoringItem(
+                id="stop-oldco",
+                symbol="OLDCO",
+                intent="stop_sell",
+                status="stop_monitoring",
+                trigger_price=Decimal("10"),
+                provider="kis",
+                exchange="NASD",
+            )
+        ],
+        filled_today_symbols=[],
+    )
+
+    payload = coordinator._evaluate_cached_monitoring_cycle(
+        runtime_snapshot=snapshot,
+        prices=[MonitoringPriceRequest(symbol="OLDCO", price=Decimal("5"))],
+        started_at=started_at,
+    )
+
+    assert payload["evaluated_item_count"] == 0
+    assert payload["triggered_item_count"] == 0
+    assert payload["submitted_order_count"] == 0
 
 
 def test_cached_monitoring_prefilter_uses_executable_quotes_and_watch_direction() -> None:
@@ -1331,7 +1621,7 @@ def test_live_cycle_monitors_local_holdings_without_waiting_for_broker_discovery
     monkeypatch.setattr(
         coordinator,
         "_repair_post_entry_exit_monitors_for_cached_cycle",
-        lambda **kwargs: 0,
+        lambda **kwargs: (0, 0),
     )
 
     payload = coordinator._monitoring_cycle_sync(started_at)
