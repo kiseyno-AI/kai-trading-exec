@@ -13,7 +13,13 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.api.schemas.execution import MonitoringPriceRequest
-from app.broker.base import BrokerAdapter, BrokerCurrentPrice, BrokerLiveMarketContext
+from app.broker.base import (
+    BrokerAdapter,
+    BrokerAdapterError,
+    BrokerCurrentPrice,
+    BrokerLiveMarketContext,
+)
+from app.broker.kis import KIS_OVERSEAS_QUOTE_EMPTY_CODE
 from app.core.config import Settings
 from app.models.runtime import ExecutionPlan, ExecutionPlanItem, ExecutionPosition
 from app.services.broker_auth import ensure_authenticated_broker_session
@@ -29,6 +35,7 @@ MAX_QUOTE_WORKERS = 3
 QUOTE_RETRY_ATTEMPTS = 0
 QUOTE_RETRY_DELAY_SECONDS = 0.2
 QUOTE_BATCH_TIMEOUT_BUFFER_SECONDS = 2.0
+DURABLE_EMPTY_QUOTE_OBSERVATION_COUNT = 3
 _ROUTE_AUTHORITY_INTENTS = frozenset(
     {
         "target_sell",
@@ -74,6 +81,7 @@ class KisCurrentQuoteMonitoringPriceSource:
         self.session_factory = session_factory
         self.broker_adapter_factory = broker_adapter_factory
         self._last_diagnostics: dict[str, object] = {}
+        self._empty_quote_counts: dict[str, int] = {}
         self._quote_batch_lock = threading.Lock()
         self._quote_batch_state_lock = threading.Lock()
         self._quote_batch_futures: set[
@@ -118,13 +126,18 @@ class KisCurrentQuoteMonitoringPriceSource:
             "quote_failures": [],
             "quote_failure_count": 0,
             "quote_failures_truncated": False,
+            "durably_unquoteable_symbols": [],
+            "empty_quote_consecutive_counts": {},
             "context_failures": [],
             "context_failure_count": 0,
             "context_failures_truncated": False,
         }
         if not unique_symbols:
+            self._empty_quote_counts.clear()
             return []
         if not self._quote_batch_lock.acquire(blocking=False):
+            for symbol in unique_symbols:
+                self._empty_quote_counts.pop(symbol, None)
             self._last_diagnostics = {
                 "requested_symbol_count": len(unique_symbols),
                 "requested_symbols": unique_symbols,
@@ -141,6 +154,8 @@ class KisCurrentQuoteMonitoringPriceSource:
                 ],
                 "quote_failure_count": len(unique_symbols),
                 "quote_failures_truncated": len(unique_symbols) > MAX_REPORTED_QUOTE_FAILURES,
+                "durably_unquoteable_symbols": [],
+                "empty_quote_consecutive_counts": {},
                 "context_failures": [],
                 "context_failure_count": 0,
                 "context_failures_truncated": False,
@@ -151,6 +166,10 @@ class KisCurrentQuoteMonitoringPriceSource:
         broker_adapter = self.broker_adapter_factory(settings)
         release_quote_batch_lock = True
         try:
+            requested_symbol_set = set(unique_symbols)
+            for symbol in list(self._empty_quote_counts):
+                if symbol not in requested_symbol_set:
+                    self._empty_quote_counts.pop(symbol, None)
             with self.session_factory() as db:
                 session_state = _ensure_authenticated_broker_session_with_retry(
                     settings=settings,
@@ -169,10 +188,11 @@ class KisCurrentQuoteMonitoringPriceSource:
                 }
                 prices: list[MonitoringPriceRequest] = []
                 priced_symbols: list[str] = []
-                failures: list[dict[str, str]] = []
+                failures: list[dict[str, object]] = []
                 context_failures: list[dict[str, object]] = []
                 failure_count = 0
                 context_failure_count = 0
+                durably_unquoteable_symbols: list[str] = []
 
                 def fetch_quote(symbol: str) -> tuple[str, BrokerCurrentPrice | None, Exception | None]:
                     try:
@@ -283,12 +303,30 @@ class KisCurrentQuoteMonitoringPriceSource:
                 for symbol in unique_symbols:
                     quote, error = quote_results.get(symbol, (None, None))
                     if error is not None:
+                        if (
+                            isinstance(error, BrokerAdapterError)
+                            and error.code == KIS_OVERSEAS_QUOTE_EMPTY_CODE
+                        ):
+                            empty_count = self._empty_quote_counts.get(symbol, 0) + 1
+                            self._empty_quote_counts[symbol] = empty_count
+                            if empty_count >= DURABLE_EMPTY_QUOTE_OBSERVATION_COUNT:
+                                durably_unquoteable_symbols.append(symbol)
+                        else:
+                            self._empty_quote_counts.pop(symbol, None)
                         failure_count += 1
                         if len(failures) < MAX_REPORTED_QUOTE_FAILURES:
-                            failures.append({"symbol": symbol, "error": str(error)})
+                            failure: dict[str, object] = {
+                                "symbol": symbol,
+                                "error": str(error),
+                            }
+                            if isinstance(error, BrokerAdapterError) and error.code:
+                                failure["code"] = error.code
+                            failures.append(failure)
                         continue
                     if quote is None:
+                        self._empty_quote_counts.pop(symbol, None)
                         continue
+                    self._empty_quote_counts.pop(symbol, None)
                     context, context_failure = context_futures[symbol].result()
                     if context_failure is not None:
                         context_failure_count += 1
@@ -330,6 +368,12 @@ class KisCurrentQuoteMonitoringPriceSource:
                     "quote_failures": failures,
                     "quote_failure_count": failure_count,
                     "quote_failures_truncated": failure_count > len(failures),
+                    "durably_unquoteable_symbols": durably_unquoteable_symbols,
+                    "empty_quote_consecutive_counts": {
+                        symbol: self._empty_quote_counts[symbol]
+                        for symbol in unique_symbols
+                        if symbol in self._empty_quote_counts
+                    },
                     "context_failures": context_failures,
                     "context_failure_count": context_failure_count,
                     "context_failures_truncated": context_failure_count > len(context_failures),
@@ -337,6 +381,10 @@ class KisCurrentQuoteMonitoringPriceSource:
                     "exchange_by_symbol": exchange_by_symbol,
                 }
                 return prices
+        except Exception:
+            for symbol in unique_symbols:
+                self._empty_quote_counts.pop(symbol, None)
+            raise
         finally:
             if release_quote_batch_lock:
                 self._quote_batch_lock.release()

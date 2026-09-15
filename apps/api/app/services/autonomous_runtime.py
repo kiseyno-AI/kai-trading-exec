@@ -106,6 +106,12 @@ def _cached_positions_by_symbol(
     for row in rows:
         symbol = str(row[0] or "").strip()
         quantity = int(row[1] or 0)
+        raw_payload = _cached_json_object(row[4]) if len(row) > 4 else {}
+        sync_context = raw_payload.get("_position_sync")
+        monitoring_eligible = not (
+            isinstance(sync_context, dict)
+            and sync_context.get("monitoring_eligible") is False
+        )
         if symbol and quantity > 0:
             grouped.setdefault(symbol, []).append(
                 CachedMonitoringPosition(
@@ -113,6 +119,7 @@ def _cached_positions_by_symbol(
                     quantity=quantity,
                     exchange=str(row[2] or "").strip().upper() or None,
                     provider=str(row[3] or "").strip().lower() or None,
+                    monitoring_eligible=monitoring_eligible,
                 )
             )
     return {
@@ -253,6 +260,7 @@ class CachedMonitoringPosition:
     quantity: int
     provider: str | None = None
     exchange: str | None = None
+    monitoring_eligible: bool = True
 
 
 @dataclass(frozen=True)
@@ -951,6 +959,9 @@ class AutonomousRuntimeCoordinator:
             symbols=symbols,
             observed_at=started_at,
         )
+        durably_unquoteable_symbols = _durably_unquoteable_symbols(
+            self.monitoring_price_source
+        )
         monitored_symbols = list(symbols)
         monitored_price_count = len(prices)
         cached_payload = self._evaluate_cached_monitoring_cycle(
@@ -959,26 +970,52 @@ class AutonomousRuntimeCoordinator:
             started_at=started_at,
         )
         post_entry_maintenance_count = 0
-        if prices:
-            post_entry_maintenance_count = self._repair_post_entry_exit_monitors_for_cached_cycle(
+        post_entry_review_count = 0
+        if prices or durably_unquoteable_symbols:
+            (
+                post_entry_maintenance_count,
+                post_entry_review_count,
+            ) = self._repair_post_entry_exit_monitors_for_cached_cycle(
                 runtime_snapshot=runtime_snapshot,
                 prices=prices,
                 started_at=started_at,
+                durably_unquoteable_symbols=durably_unquoteable_symbols,
             )
-            if post_entry_maintenance_count:
+            if post_entry_maintenance_count or post_entry_review_count:
                 runtime_snapshot = self._refresh_monitoring_runtime_snapshot(
                     loaded_at=started_at,
-                    reason="cached_monitoring_post_entry_maintenance",
+                    reason="cached_monitoring_post_entry_state_change",
                     reconcile_broker=False,
                 )
                 self._refresh_monitoring_snapshot_filled_today(started_at)
                 runtime_snapshot = self._ensure_monitoring_runtime_snapshot(started_at)
                 symbols = runtime_snapshot.symbols
+                prices = [price for price in prices if price.symbol in set(symbols)]
+                monitored_symbols = list(symbols)
+                monitored_price_count = len(prices)
                 cached_payload = self._evaluate_cached_monitoring_cycle(
                     runtime_snapshot=runtime_snapshot,
                     prices=prices,
                     started_at=started_at,
                 )
+                if not symbols:
+                    payload = {
+                        "status_code": 200,
+                        "price_source_configured": (
+                            self._monitoring_price_source_state.configured
+                        ),
+                        "price_source": self._monitoring_price_source_state.snapshot(),
+                        "runtime_snapshot": runtime_snapshot.snapshot(),
+                        **cached_payload,
+                        "monitored_symbols": [],
+                        "price_count": 0,
+                        "broker_action_symbols": [],
+                        "broker_action_price_count": 0,
+                        "post_entry_review_count": post_entry_review_count,
+                        "idle": True,
+                    }
+                    self._store_cycle_payload(worker_key="monitoring", payload=payload)
+                    return payload
         if cached_payload["triggered_item_count"] == 0 and prices:
             payload = {
                 "status_code": 200,
@@ -991,6 +1028,8 @@ class AutonomousRuntimeCoordinator:
             }
             if post_entry_maintenance_count:
                 payload["post_entry_maintenance_count"] = post_entry_maintenance_count
+            if post_entry_review_count:
+                payload["post_entry_review_count"] = post_entry_review_count
             self._store_cycle_payload(worker_key="monitoring", payload=payload)
             return payload
 
@@ -1019,6 +1058,12 @@ class AutonomousRuntimeCoordinator:
                 "broker_action_symbols": symbols,
                 "broker_action_price_count": 0,
             }
+            if post_entry_maintenance_count:
+                payload["pre_cached_post_entry_maintenance_count"] = (
+                    post_entry_maintenance_count
+                )
+            if post_entry_review_count:
+                payload["pre_cached_post_entry_review_count"] = post_entry_review_count
             self._store_cycle_payload(worker_key="monitoring", payload=payload)
             return payload
 
@@ -1087,6 +1132,8 @@ class AutonomousRuntimeCoordinator:
             }
             if post_entry_maintenance_count:
                 payload["pre_cached_post_entry_maintenance_count"] = post_entry_maintenance_count
+            if post_entry_review_count:
+                payload["pre_cached_post_entry_review_count"] = post_entry_review_count
             self._store_cycle_payload(worker_key="monitoring", payload=payload)
             if int(result.payload.get("submitted_order_count") or 0) > 0:
                 self._reconcile_monitoring_orders_if_due(
@@ -1284,26 +1331,29 @@ class AutonomousRuntimeCoordinator:
         runtime_snapshot: MonitoringRuntimeSnapshot,
         prices: list[MonitoringPriceRequest],
         started_at: datetime,
-    ) -> int:
+        durably_unquoteable_symbols: set[str] | None = None,
+    ) -> tuple[int, int]:
         if not runtime_snapshot.positions_by_symbol:
-            return 0
+            return 0, 0
         prices_by_symbol = {price.symbol: price for price in prices}
         with self._cycle_session_factory() as db:
             positions_by_symbol = _load_positions_by_symbol(
                 settings=self.settings,
                 db=db,
                 symbols=set(runtime_snapshot.positions_by_symbol),
+                lock_for_update=True,
             )
-            maintenance_count, _review_count = _maintain_post_entry_exit_monitors(
+            maintenance_count, review_count = _maintain_post_entry_exit_monitors(
                 settings=self.settings,
                 db=db,
                 positions_by_symbol=positions_by_symbol,
                 prices=prices_by_symbol,
                 triggered_at=started_at,
+                durably_unquoteable_symbols=durably_unquoteable_symbols,
             )
-            if maintenance_count:
+            if maintenance_count or review_count:
                 db.commit()
-            return maintenance_count
+            return maintenance_count, review_count
 
     def _load_monitoring_runtime_snapshot(self, loaded_at: datetime) -> MonitoringRuntimeSnapshot:
         with self._cycle_session_factory() as db:
@@ -1374,7 +1424,7 @@ class AutonomousRuntimeCoordinator:
                 position_rows = (
                     conn.execute(
                         f"""
-                        select symbol, quantity, exchange, provider
+                        select symbol, quantity, exchange, provider, raw_payload
                         from execution_positions
                         where mode = ?
                           and provider = ?
@@ -1653,6 +1703,7 @@ class AutonomousRuntimeCoordinator:
                 ExecutionPosition.quantity,
                 ExecutionPosition.exchange,
                 ExecutionPosition.provider,
+                ExecutionPosition.raw_payload,
             ).where(
                 *_active_kis_position_filters(settings=self.settings),
                 ExecutionPosition.quantity > 0,
@@ -1775,6 +1826,8 @@ class AutonomousRuntimeCoordinator:
         results: list[dict[str, object]] = []
         for item in runtime_snapshot.items:
             position = runtime_snapshot.positions_by_symbol.get(item.symbol)
+            if position is not None and not position.monitoring_eligible:
+                continue
             if (
                 item.intent not in WATCH_BUY_INTENTS
                 and (
@@ -2162,6 +2215,20 @@ def _price_source_diagnostics(source: object) -> dict[str, object]:
     if not isinstance(diagnostics, dict):
         return {}
     return dict(diagnostics)
+
+
+def _durably_unquoteable_symbols(source: object | None) -> set[str]:
+    if source is None:
+        return set()
+    diagnostics = _price_source_diagnostics(source)
+    raw_symbols = diagnostics.get("durably_unquoteable_symbols")
+    if not isinstance(raw_symbols, list):
+        return set()
+    return {
+        str(symbol).strip().upper()
+        for symbol in raw_symbols
+        if str(symbol).strip()
+    }
 
 
 def _first_quote_failure_error(diagnostics: dict[str, object]) -> str | None:

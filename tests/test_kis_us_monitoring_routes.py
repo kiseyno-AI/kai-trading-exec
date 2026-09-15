@@ -535,6 +535,104 @@ def test_supported_existing_us_holding_gets_us_target_and_stop_monitoring() -> N
     engine.dispose()
 
 
+def test_transiently_unpriced_supported_us_holding_is_not_quarantined() -> None:
+    settings, engine, db = _session()
+    identity = build_position_identity(
+        settings=settings,
+        provider="kis",
+        exchange="NASD",
+    )
+    position = ExecutionPosition(
+        mode="paper",
+        provider=identity.provider,
+        account_scope=identity.account_scope,
+        exchange=identity.exchange,
+        symbol="AAPL",
+        quantity=2,
+        average_price=Decimal("200"),
+        updated_from="reconciliation",
+        raw_payload={
+            "_position_sync": {
+                "asset_class": "us_equity",
+                "exchange": "NASD",
+                "monitoring_eligible": True,
+            },
+        },
+    )
+    db.add(position)
+    db.commit()
+
+    maintenance_count, review_count = monitoring._maintain_post_entry_exit_monitors(
+        settings=settings,
+        db=db,
+        positions_by_symbol={"AAPL": position},
+        prices={},
+        triggered_at=datetime(2026, 9, 15, 4, 0, tzinfo=UTC),
+    )
+
+    assert maintenance_count == 0
+    assert review_count == 0
+    assert position.raw_payload["_position_sync"] == {
+        "asset_class": "us_equity",
+        "exchange": "NASD",
+        "monitoring_eligible": True,
+    }
+    db.close()
+    engine.dispose()
+
+
+def test_manual_review_us_holding_stays_out_of_monitoring_despite_plan_history() -> None:
+    settings, engine, db = _session()
+    _add_item(
+        db,
+        symbol="OLDCO",
+        asset_class="us_equity",
+        risk_context={"exchange": "NASD"},
+    )
+    identity = build_position_identity(
+        settings=settings,
+        provider="kis",
+        exchange="NASD",
+    )
+    position = ExecutionPosition(
+        mode=settings.runtime_mode,
+        provider=identity.provider,
+        account_scope=identity.account_scope,
+        exchange=identity.exchange,
+        symbol="OLDCO",
+        quantity=7,
+        average_price=Decimal("12.50"),
+        updated_from="reconciliation",
+        raw_payload={
+            "_position_sync": {
+                "asset_class": "us_equity",
+                "exchange": "NASD",
+                "monitoring_eligible": False,
+                "manual_review_required": True,
+                "manual_review_reason": "unpriced_overseas_holding",
+            }
+        },
+    )
+    db.add(position)
+    db.commit()
+
+    assert monitoring.list_autonomous_monitoring_symbols(
+        settings=settings,
+        db=db,
+    ) == []
+    historical_item = db.scalar(
+        select(ExecutionPlanItem).where(ExecutionPlanItem.symbol == "OLDCO")
+    )
+    assert historical_item is not None
+    assert monitoring._position_for_monitoring_item(
+        settings=settings,
+        item=historical_item,
+        positions_by_symbol={"OLDCO": position},
+    ) is None
+    db.close()
+    engine.dispose()
+
+
 def test_unsupported_unpriced_legacy_us_holding_is_visible_but_requires_manual_review() -> None:
     settings, engine, db = _session()
     _add_item(db, symbol="AAPL", asset_class="us_equity", risk_context={"exchange": "NASD"})

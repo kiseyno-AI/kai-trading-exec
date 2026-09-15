@@ -6489,6 +6489,65 @@ def test_fast_runtime_status_honors_durable_paused_state() -> None:
     engine.dispose()
 
 
+def test_fast_runtime_status_surfaces_manual_review_position_monitoring_gap() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        automation_enabled=True,
+        autonomous_runtime_enabled=True,
+        execution_position_account_scope="fast-status-manual-review-test",
+    )
+    app, engine = build_test_app(
+        settings=settings,
+        autonomous_runtime_enabled=True,
+    )
+    identity = build_position_identity(
+        settings=app.state.settings,
+        provider="kis",
+        exchange="NASD",
+    )
+    now = datetime.now(UTC)
+    with app.state.db_session_factory() as session:
+        session.add(
+            ExecutionPosition(
+                mode=app.state.settings.runtime_mode,
+                provider=identity.provider,
+                account_scope=identity.account_scope,
+                exchange=identity.exchange,
+                symbol="OLDCO",
+                quantity=7,
+                average_price=Decimal("12.50"),
+                updated_from="reconciliation",
+                last_reconciled_at=now,
+                raw_payload={
+                    "_position_sync": {
+                        "asset_class": "us_equity",
+                        "exchange": "NASD",
+                        "monitoring_eligible": False,
+                        "manual_review_required": True,
+                        "manual_review_reason": "unpriced_overseas_holding",
+                    }
+                },
+            )
+        )
+        session.commit()
+
+    payload = TestClient(app).get("/runtime/status").json()
+
+    assert payload["freshness"]["summary_source"] == "fast_autonomous_runtime_snapshot"
+    assert payload["freshness"]["position_truth"]["manual_review_count"] == 1
+    assert payload["freshness"]["position_truth"]["manual_review_symbols"] == [
+        "OLDCO"
+    ]
+    assert any(
+        alert["kind"] == "position_monitoring_manual_review_required"
+        and alert["severity"] == "critical"
+        and alert["symbols"] == ["OLDCO"]
+        for alert in payload["actionable_alerts"]["alerts"]
+    )
+    engine.dispose()
+
+
 def test_fast_runtime_status_reports_durable_account_drawdown_gate(monkeypatch) -> None:
     expected_gate = {
         "available": True,

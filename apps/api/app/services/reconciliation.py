@@ -1656,6 +1656,7 @@ def sync_execution_positions_from_broker_snapshot(
             holding=holding,
             exchange=identity_exchange,
             identity=position_identity,
+            prior_payload=position.raw_payload,
         )
         if changed and symbol not in created_symbols:
             updated += 1
@@ -2017,6 +2018,7 @@ def _position_snapshot_payload(
     holding: BrokerAccountHolding | None,
     exchange: str,
     identity: PositionIdentity,
+    prior_payload: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     payload = _snapshot_payload(snapshot_payload)
     if payload is None:
@@ -2046,6 +2048,26 @@ def _position_snapshot_payload(
             if reported_exchange in {"NASD", "NYSE", "AMEX"}
             else "unsupported_overseas_exchange"
         )
+    prior_sync = (
+        prior_payload.get("_position_sync")
+        if isinstance(prior_payload, dict)
+        else None
+    )
+    if (
+        isinstance(prior_sync, dict)
+        and prior_sync.get("monitoring_eligible") is False
+        and prior_sync.get("manual_review_required") is True
+    ):
+        position_sync["monitoring_eligible"] = False
+        for key in (
+            "trade_eligible",
+            "manual_review_required",
+            "manual_review_reason",
+            "manual_review_recorded_at",
+            "route_disposition",
+        ):
+            if key in prior_sync:
+                position_sync[key] = prior_sync[key]
     payload["_position_sync"] = position_sync
     return payload
 

@@ -488,6 +488,73 @@ def test_position_truth_replays_fill_quantity_and_chronology_for_reentry() -> No
     engine.dispose()
 
 
+def test_position_truth_surfaces_manual_review_position_monitoring_gap() -> None:
+    settings = _settings()
+    engine, _factory, db = _session(settings)
+    now = datetime(2026, 9, 15, 4, 0, tzinfo=UTC)
+    identity = build_position_identity(
+        settings=settings,
+        provider="kis",
+        exchange="NASD",
+    )
+    db.add(
+        ExecutionPosition(
+            mode=settings.runtime_mode,
+            provider=identity.provider,
+            account_scope=identity.account_scope,
+            exchange=identity.exchange,
+            symbol="OLDCO",
+            quantity=7,
+            average_price=Decimal("12.50"),
+            updated_from="reconciliation",
+            last_reconciled_at=now,
+            raw_payload={
+                "_position_sync": {
+                    "asset_class": "us_equity",
+                    "exchange": "NASD",
+                    "monitoring_eligible": False,
+                    "manual_review_required": True,
+                    "manual_review_reason": "unpriced_overseas_holding",
+                }
+            },
+        )
+    )
+    db.commit()
+
+    position_truth = runtime_service.position_truth_freshness_payload(
+        settings=settings,
+        db=db,
+        now=now,
+    )
+    alerts = runtime_service.runtime_actionable_alerts_payload(
+        monitoring={},
+        freshness={"position_truth": position_truth},
+    )
+
+    assert position_truth["manual_review_count"] == 1
+    assert position_truth["manual_review_symbols"] == ["OLDCO"]
+    assert position_truth["manual_review_reasons"] == {
+        "OLDCO": "unpriced_overseas_holding"
+    }
+    assert alerts["status"] == "needs_attention"
+    assert next(
+        alert
+        for alert in alerts["alerts"]
+        if alert["kind"] == "position_monitoring_manual_review_required"
+    ) == {
+        "kind": "position_monitoring_manual_review_required",
+        "severity": "critical",
+        "count": 1,
+        "symbols": ["OLDCO"],
+        "message": (
+            "held positions cannot be protected automatically until their "
+            "quote and execution route are reviewed"
+        ),
+    }
+    db.close()
+    engine.dispose()
+
+
 def test_position_truth_keeps_incomplete_filled_order_detail_as_exposure_evidence() -> None:
     settings = _settings()
     engine, _factory, db = _session(settings)

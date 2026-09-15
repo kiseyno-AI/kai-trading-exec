@@ -13,6 +13,7 @@ from app.broker.base import (
 )
 from app.core.config import Settings
 from app.models.runtime import ExecutionPlan, ExecutionPlanItem, ExecutionPosition
+from app.broker.kis import KIS_OVERSEAS_QUOTE_EMPTY_CODE
 from app.services import monitoring_price_source as monitoring_price_source_module
 from app.services.monitoring_price_source import KisCurrentQuoteMonitoringPriceSource
 from app.services.monitoring_price_source import _derive_orderability_context
@@ -322,6 +323,146 @@ def test_kis_price_source_enriches_monitoring_price_with_live_market_context() -
     )
     assert price_source.get_last_diagnostics()["context_failure_count"] == 0
     assert broker_adapter.live_context_calls == [("073560", "KRX")]
+    engine.dispose()
+
+
+def test_kis_price_source_requires_repeated_empty_quotes_before_durable_review() -> None:
+    observed_at = datetime(2026, 9, 15, 4, 0, tzinfo=UTC)
+    broker_adapter = SymbolScopedQuoteErrorAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        current_prices={},
+        current_price_errors={
+            "OLDCO": BrokerAdapterError(
+                "KIS overseas minute price response is missing output2 payload",
+                status_code=502,
+                code=KIS_OVERSEAS_QUOTE_EMPTY_CODE,
+            ),
+            "RETRY": BrokerAdapterError(
+                "temporary rate limit",
+                status_code=429,
+                classification=BrokerErrorClassification.RATE_LIMIT,
+                retryable=True,
+                code="EGW00201",
+            ),
+        },
+    )
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        kis_app_key="paper-key",
+        kis_app_secret="paper-secret",
+        kis_account_number="12345678",
+        execution_position_account_scope="durable-empty-quote-test",
+    )
+    app, engine = build_test_app(settings=settings, broker_adapter=broker_adapter)
+    identity = build_position_identity(
+        settings=settings,
+        provider="kis",
+        exchange="NASD",
+    )
+    with app.state.db_session_factory() as db:
+        for symbol in ("OLDCO", "RETRY"):
+            db.add(
+                ExecutionPosition(
+                    mode=settings.runtime_mode,
+                    provider=identity.provider,
+                    account_scope=identity.account_scope,
+                    exchange=identity.exchange,
+                    symbol=symbol,
+                    quantity=1,
+                    average_price=Decimal("1.00"),
+                    updated_from="reconciliation",
+                    raw_payload={
+                        "_position_sync": {
+                            "asset_class": "us_equity",
+                            "exchange": "NASD",
+                            "monitoring_eligible": True,
+                        }
+                    },
+                )
+            )
+        db.commit()
+    price_source = KisCurrentQuoteMonitoringPriceSource(
+        settings=settings,
+        session_factory=app.state.db_session_factory,
+        broker_adapter_factory=lambda _settings: broker_adapter,
+    )
+
+    assert price_source.get_prices(
+        symbols=["OLDCO", "RETRY"],
+        observed_at=observed_at,
+        settings=settings,
+    ) == []
+    assert price_source.get_last_diagnostics()[
+        "empty_quote_consecutive_counts"
+    ] == {"OLDCO": 1}
+
+    broker_adapter.current_price_errors["OLDCO"] = BrokerAdapterError(
+        "temporary rate limit",
+        status_code=429,
+        classification=BrokerErrorClassification.RATE_LIMIT,
+        retryable=True,
+        code="EGW00201",
+    )
+    assert price_source.get_prices(
+        symbols=["OLDCO", "RETRY"],
+        observed_at=observed_at,
+        settings=settings,
+    ) == []
+    assert price_source.get_last_diagnostics()[
+        "empty_quote_consecutive_counts"
+    ] == {}
+
+    broker_adapter.current_price_errors["OLDCO"] = BrokerAdapterError(
+        "KIS overseas minute price response contains no output2 rows",
+        status_code=502,
+        code=KIS_OVERSEAS_QUOTE_EMPTY_CODE,
+    )
+    for expected_count in (1, 2):
+        assert price_source.get_prices(
+            symbols=["OLDCO", "RETRY"],
+            observed_at=observed_at,
+            settings=settings,
+        ) == []
+        diagnostics = price_source.get_last_diagnostics()
+        assert diagnostics["durably_unquoteable_symbols"] == []
+        assert diagnostics["empty_quote_consecutive_counts"] == {
+            "OLDCO": expected_count
+        }
+    assert price_source.get_prices(
+        symbols=["OLDCO", "RETRY"],
+        observed_at=observed_at,
+        settings=settings,
+    ) == []
+    diagnostics = price_source.get_last_diagnostics()
+    assert diagnostics["durably_unquoteable_symbols"] == ["OLDCO"]
+    assert diagnostics["empty_quote_consecutive_counts"] == {"OLDCO": 3}
+    assert next(
+        failure
+        for failure in diagnostics["quote_failures"]
+        if failure["symbol"] == "OLDCO"
+    )["code"] == KIS_OVERSEAS_QUOTE_EMPTY_CODE
+
+    broker_adapter.current_price_errors.pop("OLDCO")
+    broker_adapter.current_prices["OLDCO"] = Decimal("1.25")
+    assert [
+        price.symbol
+        for price in price_source.get_prices(
+            symbols=["OLDCO"],
+            observed_at=observed_at,
+            settings=settings,
+        )
+    ] == ["OLDCO"]
+    diagnostics = price_source.get_last_diagnostics()
+    assert diagnostics["durably_unquoteable_symbols"] == []
+    assert diagnostics["empty_quote_consecutive_counts"] == {}
+    price_source.close()
     engine.dispose()
 
 

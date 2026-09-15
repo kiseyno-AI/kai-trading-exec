@@ -605,6 +605,126 @@ def test_us_holding_discovery_preserves_position_truth_across_exchange_queries()
     engine.dispose()
 
 
+def test_us_position_sync_preserves_durable_monitoring_manual_review() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        execution_position_account_scope="manual-review-sync-test",
+    )
+    engine, db = _session(settings)
+    identity = build_position_identity(
+        settings=settings,
+        provider="kis",
+        exchange="NASD",
+    )
+    raw_payload = payload_with_position_identity({}, identity=identity)
+    raw_payload["_position_sync"] = {
+        "asset_class": "us_equity",
+        "exchange": "NASD",
+        "monitoring_eligible": False,
+        "manual_review_required": True,
+        "manual_review_reason": "unpriced_overseas_holding",
+        "manual_review_recorded_at": "2026-09-15T03:55:00+00:00",
+    }
+    db.add(
+        ExecutionPosition(
+            mode=settings.runtime_mode,
+            provider=identity.provider,
+            account_scope=identity.account_scope,
+            exchange=identity.exchange,
+            symbol="OLDCO",
+            quantity=7,
+            average_price=Decimal("12.50"),
+            updated_from="reconciliation",
+            raw_payload=raw_payload,
+        )
+    )
+    db.commit()
+    broker = ReconciliationStubBroker(
+        account_snapshot=BrokerAccountSnapshot(
+            available_cash=Decimal("1000"),
+            observed_at=OBSERVED_AT,
+            source="stub:nasd",
+            holdings=[
+                BrokerAccountHolding(
+                    symbol="OLDCO",
+                    quantity=7,
+                    average_price=Decimal("12.25"),
+                    sellable_quantity=7,
+                    payload={"ovrs_excg_cd": "NASD"},
+                )
+            ],
+            payload={"currency": "USD", "exchange": "NASD"},
+        )
+    )
+
+    sync_execution_positions_from_broker_snapshot(
+        settings=settings,
+        db=db,
+        adapter=broker,
+        symbols=None,
+        exchange="NASD",
+        discover_holdings_only=True,
+        authenticated_access_token="access-token",
+    )
+
+    position = db.scalar(
+        select(ExecutionPosition).where(ExecutionPosition.symbol == "OLDCO")
+    )
+    assert position is not None
+    assert position.average_price == Decimal("12.2500")
+    assert position.raw_payload["currency"] == "USD"
+    assert position.raw_payload["_position_sync"] == {
+        "asset_class": "us_equity",
+        "exchange": "NASD",
+        "monitoring_eligible": False,
+        "manual_review_required": True,
+        "manual_review_reason": "unpriced_overseas_holding",
+        "manual_review_recorded_at": "2026-09-15T03:55:00+00:00",
+    }
+    engine.dispose()
+
+
+def test_us_position_sync_does_not_preserve_non_durable_monitoring_disable() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        execution_position_account_scope="non-durable-review-sync-test",
+    )
+    identity = build_position_identity(
+        settings=settings,
+        provider="kis",
+        exchange="NASD",
+    )
+    payload = reconciliation_service._position_snapshot_payload(
+        snapshot_payload={"currency": "USD"},
+        holding=BrokerAccountHolding(
+            symbol="AAPL",
+            quantity=1,
+            average_price=Decimal("200"),
+            sellable_quantity=1,
+            payload={"ovrs_excg_cd": "NASD"},
+        ),
+        exchange="NASD",
+        identity=identity,
+        prior_payload={
+            "_position_sync": {
+                "asset_class": "us_equity",
+                "exchange": "NASD",
+                "monitoring_eligible": False,
+                "manual_review_reason": "transient_quote_failure",
+            }
+        },
+    )
+
+    assert payload is not None
+    assert payload["_position_sync"] == {
+        "asset_class": "us_equity",
+        "exchange": "NASD",
+        "monitoring_eligible": True,
+    }
+
+
 def test_us_holding_discovery_attributes_only_reported_exchange_route() -> None:
     settings = Settings(
         database_url="sqlite:///:memory:",

@@ -86,6 +86,7 @@ KIS_INTRADAY_MINUTE_PRICE_TR_ID = "FHKST03010200"
 KIS_HOLIDAY_CALENDAR_TR_ID = "CTCA0903R"
 KIS_OVERSEAS_MINUTE_PRICE_TR_ID = "HHDFS76950200"
 KIS_OVERSEAS_ASKING_PRICE_TR_ID = "HHDFS76200100"
+KIS_OVERSEAS_QUOTE_EMPTY_CODE = "KIS_OVERSEAS_QUOTE_EMPTY"
 KIS_TIMEZONE = timezone(timedelta(hours=9))
 US_EASTERN_TIMEZONE = ZoneInfo("America/New_York")
 _KIS_TOKEN_EXPIRY_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}")
@@ -836,12 +837,22 @@ class KisBrokerAdapter(BrokerAdapter):
             timeout_seconds=self.settings.kis_request_timeout_seconds,
         )
         _raise_if_business_error(response.payload)
-        output_rows = _payload_rows(response.payload.get("output2"))
+        raw_output_rows = response.payload.get("output2")
+        output_rows = _payload_rows(raw_output_rows)
+        if raw_output_rows == []:
+            raise BrokerAdapterError(
+                "KIS overseas minute price response contains no output2 rows",
+                status_code=502,
+                code=KIS_OVERSEAS_QUOTE_EMPTY_CODE,
+                response_payload=response.payload,
+                observed_at=datetime.now(UTC),
+            )
         if not output_rows:
             raise BrokerAdapterError(
                 "KIS overseas minute price response is missing output2 payload",
                 status_code=502,
                 response_payload=response.payload,
+                observed_at=datetime.now(UTC),
             )
         for output in output_rows:
             price = _first_decimal(output, "last", "stck_prpr", "clos")
