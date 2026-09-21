@@ -7,7 +7,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import select, text, update
+from sqlalchemy import and_, or_, select, text, update
 from sqlalchemy.orm import Session, undefer
 
 from app.api.schemas.buy_authority import (
@@ -677,6 +677,24 @@ def _project_scope(
         return 0
     if db.get_bind().dialect.name == "postgresql":
         db.execute(text("LOCK TABLE execution_plan_items IN EXCLUSIVE MODE"))
+    authority_projection = ExecutionPlanItem.risk_context[ADJUSTMENT_KEY]
+    authority_marker = (
+        authority_projection["source"].as_string() == SOURCE
+    )
+    if mode == "block":
+        projection_candidate = or_(
+            ExecutionPlanItem.status.in_(RISK_OFF_EXPIRABLE_STATUSES),
+            authority_marker,
+        )
+    elif mode == "observe":
+        projection_candidate = authority_marker
+    else:
+        projection_candidate = and_(
+            authority_marker,
+            authority_projection["schema_version"].as_string()
+            == "core_buy_authority_projection_v1",
+            authority_projection["action"].as_string() == "block_new_buy",
+        )
     items = list(
         db.scalars(
             select(ExecutionPlanItem)
@@ -687,6 +705,7 @@ def _project_scope(
                 ExecutionPlanItem.provider == "kis",
                 ExecutionPlanItem.side == "buy",
                 ExecutionPlanItem.intent.in_(BUY_WATCH_INTENTS),
+                projection_candidate,
             )
             .order_by(ExecutionPlanItem.id)
             .with_for_update()
