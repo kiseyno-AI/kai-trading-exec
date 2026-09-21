@@ -2216,19 +2216,12 @@ def runtime_symbol_summary(
             is not None
         }
     )
-    position_symbols = db.scalars(
-        select(distinct(ExecutionPosition.symbol)).where(
-            *_active_runtime_position_filters(
-                settings=settings,
-                provider=provider,
-                runtime_scope=runtime_scope,
-            ),
-            or_(
-                ExecutionPosition.quantity > 0,
-                ExecutionPosition.base_quantity > 0,
-            ),
-        )
-    ).all()
+    position_symbols = _runtime_position_symbols(
+        settings=settings,
+        db=db,
+        provider=provider,
+        runtime_scope=runtime_scope,
+    )
     return {
         "monitored": monitored_symbols,
         "scheduled_today": scheduled_today,
@@ -2236,8 +2229,32 @@ def runtime_symbol_summary(
         "filled_today_by_side": filled_summary["by_side"],
         "filled_today_counts": filled_summary["counts"],
         "failed_today": failed_today,
-        "positions": sorted(position_symbols),
+        "positions": position_symbols,
     }
+
+
+def _runtime_position_symbols(
+    *,
+    settings: Settings,
+    db: Session,
+    provider: str,
+    runtime_scope: RuntimeExecutionScope | None,
+) -> list[str]:
+    return sorted(
+        db.scalars(
+            select(distinct(ExecutionPosition.symbol)).where(
+                *_active_runtime_position_filters(
+                    settings=settings,
+                    provider=provider,
+                    runtime_scope=runtime_scope,
+                ),
+                or_(
+                    ExecutionPosition.quantity > 0,
+                    ExecutionPosition.base_quantity > 0,
+                ),
+            )
+        ).all()
+    )
 
 
 def runtime_monitored_symbols(
@@ -5158,7 +5175,7 @@ def build_runtime_daily_board(
         db=db,
         broker_adapter=broker_adapter,
         autonomous_runtime=autonomous_runtime,
-        include_expensive_sections=True,
+        include_expensive_sections=not settings.autonomous_runtime_enabled,
         runtime_scope=runtime_scope,
         runtime_startup_gate=runtime_startup_gate,
     )
@@ -5173,6 +5190,15 @@ def build_runtime_daily_board(
                     values = status_symbols.get(key, [])
                     if isinstance(values, list):
                         normalized_symbols.update(str(symbol) for symbol in values)
+                if settings.autonomous_runtime_enabled:
+                    normalized_symbols.update(
+                        _runtime_position_symbols(
+                            settings=settings,
+                            db=db,
+                            provider=runtime_scope.provider,
+                            runtime_scope=runtime_scope,
+                        )
+                    )
                 vetoes = runtime_status.get("watch_buy_vetoes", {})
                 if isinstance(vetoes, dict) and isinstance(vetoes.get("today_symbols"), list):
                     normalized_symbols.update(str(symbol) for symbol in vetoes["today_symbols"])

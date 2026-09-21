@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app.broker.alpaca import AlpacaBrokerAdapter, AlpacaHttpResponse
@@ -2590,3 +2591,66 @@ def test_runtime_daily_board_route_uses_injected_broker_provider() -> None:
     assert response.status_code == 200
     assert response.json()["runtime"]["execution_scope"]["provider"] == "upbit"
     engine.dispose()
+
+
+def test_autonomous_daily_board_uses_fast_status_and_keeps_uncached_positions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings().model_copy(update={"autonomous_runtime_enabled": True})
+    status_calls: list[bool | None] = []
+    listed_symbol_sets: list[set[str]] = []
+
+    def fake_status(**kwargs: object) -> dict[str, object]:
+        status_calls.append(kwargs.get("include_expensive_sections"))
+        return {
+            "mode": settings.runtime_mode,
+            "dependencies": {"database": "ok", "runtime_schema": "ok"},
+            "symbols": {
+                "monitored": ["027710"],
+                "scheduled_today": [],
+                "filled_today": [],
+                "failed_today": [],
+                "positions": [],
+            },
+            "watch_buy_vetoes": {"today_count": 0, "today_symbols": []},
+        }
+
+    def fake_symbol_rows(
+        *, symbols: set[str], **_kwargs: object
+    ) -> list[dict[str, object]]:
+        listed_symbol_sets.append(set(symbols))
+        return [
+            {
+                "symbol": symbol,
+                "monitored": symbol == "027710",
+                "open_order_count": 0,
+                "fill_count": 0,
+                "position_quantity": 1 if symbol == "APTX" else 0,
+                "position_base_quantity": None,
+            }
+            for symbol in sorted(symbols)
+        ]
+
+    monkeypatch.setattr(runtime_service, "build_runtime_status", fake_status)
+    monkeypatch.setattr(runtime_service, "list_runtime_symbols", fake_symbol_rows)
+    monkeypatch.setattr(
+        runtime_service,
+        "_runtime_position_symbols",
+        lambda **_kwargs: ["APTX"],
+    )
+    monkeypatch.setattr(
+        runtime_service,
+        "_runtime_account_drawdown_gate_state",
+        lambda **_kwargs: {"available": False},
+    )
+
+    payload = runtime_service.build_runtime_daily_board(
+        settings=settings,
+        runtime=runtime_service.RuntimeMetadata(started_at=datetime.now(UTC)),
+        db=object(),
+    )
+
+    assert status_calls == [False]
+    assert listed_symbol_sets == [{"027710", "APTX"}]
+    assert [row["symbol"] for row in payload["symbols"]] == ["027710", "APTX"]
+    assert payload["totals"]["position_symbol_count"] == 1
