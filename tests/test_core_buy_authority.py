@@ -7,7 +7,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 from pydantic import ValidationError
-from sqlalchemy import select
+from sqlalchemy import event, select
 
 from app.api.schemas.buy_authority import (
     CoreBuyAuthorityObservationV1,
@@ -236,6 +236,117 @@ def test_block_projects_only_exact_core_v4_krx_scope() -> None:
         assert us_item.status == "next_open_buy_scheduled"
         assert paper_item.status == "next_open_buy_scheduled"
         assert legacy_item.status == "next_open_buy_scheduled"
+    engine.dispose()
+
+
+def test_block_projection_does_not_hydrate_terminal_plan_payloads() -> None:
+    settings = _settings()
+    engine, session_factory = _db(settings)
+    now = datetime(2026, 9, 11, 0, 1, tzinfo=UTC)
+    active_plan, active_item = _plan_item(status="watch_monitoring_active")
+    terminal_plan, terminal_item = _plan_item(status="manual_review_required")
+    terminal_plan.external_plan_id = "terminal-plan-history"
+    terminal_item.symbol = "000660"
+
+    with session_factory() as db:
+        db.add_all([active_plan, terminal_plan])
+        db.commit()
+        active_item_id = active_item.id
+        terminal_item_id = terminal_item.id
+
+    loaded_item_ids: set[str] = set()
+
+    def record_loaded_item(item: ExecutionPlanItem, _context: object) -> None:
+        loaded_item_ids.add(item.id)
+
+    event.listen(ExecutionPlanItem, "load", record_loaded_item)
+    try:
+        with session_factory() as db:
+            ack = apply_core_buy_authority_observation(
+                settings=settings,
+                db=db,
+                command=_command(
+                    action="block_new_buy",
+                    source_observed_at=now,
+                    evaluated_at=now,
+                ),
+                now=now,
+            )
+    finally:
+        event.remove(ExecutionPlanItem, "load", record_loaded_item)
+
+    assert ack.changed_item_count == 1
+    assert active_item_id in loaded_item_ids
+    assert terminal_item_id not in loaded_item_ids
+
+    with session_factory() as db:
+        assert db.get(ExecutionPlanItem, active_item_id).status == "watch_expired"
+        assert (
+            db.get(ExecutionPlanItem, terminal_item_id).status
+            == "manual_review_required"
+        )
+    engine.dispose()
+
+
+def test_projection_keeps_authority_metadata_current_on_terminal_history() -> None:
+    settings = _settings()
+    engine, session_factory = _db(settings)
+    blocked_at = datetime(2026, 9, 11, 0, 1, tzinfo=UTC)
+    observed_at = blocked_at + timedelta(seconds=2)
+    terminal_plan, terminal_item = _plan_item(status="manual_review_required")
+    terminal_item.risk_context = {
+        **terminal_item.risk_context,
+        "core_buy_authority": {
+            "schema_version": "core_buy_authority_projection_v1",
+            "source": "core_live_market_buy_authority",
+            "action": "recovered",
+            "observation_id": "buy-authority-v1:prior-cycle",
+            "recovery": {"status": "resumed", "healthy_observation_count": 2},
+        },
+    }
+
+    with session_factory() as db:
+        db.add(terminal_plan)
+        db.commit()
+        terminal_item_id = terminal_item.id
+
+        blocked = _command(
+            action="block_new_buy",
+            source_observed_at=blocked_at,
+            evaluated_at=blocked_at,
+        )
+        block_ack = apply_core_buy_authority_observation(
+            settings=settings,
+            db=db,
+            command=blocked,
+            now=blocked_at,
+        )
+
+        db.refresh(terminal_item)
+        projection = terminal_item.risk_context["core_buy_authority"]
+        assert block_ack.changed_item_count == 0
+        assert terminal_item.status == "manual_review_required"
+        assert projection["action"] == "block_new_buy"
+        assert projection["observation_id"] == blocked.observation_id
+        assert projection["recovery"]["status"] == "blocked"
+
+        apply_core_buy_authority_observation(
+            settings=settings,
+            db=db,
+            command=_command(
+                action="allow",
+                source_observed_at=observed_at,
+                evaluated_at=observed_at,
+            ),
+            now=observed_at,
+        )
+
+        db.expire_all()
+        terminal_item = db.get(ExecutionPlanItem, terminal_item_id)
+        assert terminal_item is not None
+        recovery = terminal_item.risk_context["core_buy_authority"]["recovery"]
+        assert recovery["status"] == "observing"
+        assert recovery["healthy_observation_count"] == 1
     engine.dispose()
 
 
