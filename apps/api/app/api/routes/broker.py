@@ -57,6 +57,11 @@ def authenticate_broker_session_handler(
         ),
         adapter=adapter,
     )
+    if result.status_code == 200:
+        _invalidate_monitoring_price_context(
+            request,
+            reason="broker_session_authenticated",
+        )
     response_payload = BrokerSessionActionResponse.model_validate(result.payload)
     return JSONResponse(
         status_code=result.status_code,
@@ -86,8 +91,28 @@ def revoke_broker_session_handler(
         ),
         adapter=adapter,
     )
+    if result.status_code == 200:
+        _invalidate_monitoring_price_context(
+            request,
+            reason="broker_session_revoked",
+        )
     response_payload = BrokerSessionActionResponse.model_validate(result.payload)
     return JSONResponse(
         status_code=result.status_code,
         content=response_payload.model_dump(mode="json"),
     )
+
+
+def _invalidate_monitoring_price_context(
+    request: Request,
+    *,
+    reason: str,
+) -> None:
+    runtime = getattr(request.app.state, "autonomous_runtime", None)
+    invalidate = getattr(
+        runtime,
+        "invalidate_monitoring_price_runtime_context",
+        None,
+    )
+    if callable(invalidate):
+        invalidate(reason=reason)

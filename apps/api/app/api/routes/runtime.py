@@ -144,6 +144,11 @@ def runtime_plan_judgment_action(
     )
     if result.get("status") == "retry_required":
         raise HTTPException(status_code=503, detail=result)
+    if result.get("status") == "applied":
+        _invalidate_execution_runtime(
+            request,
+            reason="runtime_plan_judgment_applied",
+        )
     return result
 
 
@@ -158,10 +163,36 @@ def runtime_core_buy_authority_observation(
 ) -> CoreBuyAuthorityAckV1:
     settings: Settings = get_settings(request)
     try:
-        return apply_core_buy_authority_observation(
+        result = apply_core_buy_authority_observation(
             settings=settings,
             db=db,
             command=command,
         )
     except (CoreBuyAuthorityConflictError, CoreBuyAuthorityScopeError) as exc:
+        _invalidate_execution_runtime(
+            request,
+            reason="core_buy_authority_conflict",
+        )
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if result.changed_item_count > 0:
+        _invalidate_execution_runtime(
+            request,
+            reason="core_buy_authority_projection_changed",
+        )
+    return result
+
+
+def _invalidate_execution_runtime(request: Request, *, reason: str) -> None:
+    runtime = getattr(request.app.state, "autonomous_runtime", None)
+    if runtime is None:
+        return
+    invalidate_monitoring = getattr(
+        runtime,
+        "invalidate_monitoring_runtime_snapshot",
+        None,
+    )
+    if callable(invalidate_monitoring):
+        invalidate_monitoring(reason=reason)
+    invalidate_dispatch = getattr(runtime, "invalidate_dispatch_schedule", None)
+    if callable(invalidate_dispatch):
+        invalidate_dispatch(reason=reason)

@@ -34,7 +34,7 @@ def _settings() -> Settings:
     )
 
 
-def test_core_monitoring_symbol_read_requests_refresh(monkeypatch) -> None:
+def test_core_monitoring_symbol_read_uses_cached_handoff(monkeypatch) -> None:
     monitoring._CORE_DESIRED_MONITORING_SYMBOL_CACHE.clear()
     requested_urls: list[str] = []
 
@@ -50,7 +50,7 @@ def test_core_monitoring_symbol_read_requests_refresh(monkeypatch) -> None:
     symbols = monitoring._load_core_desired_monitoring_symbols(settings=_settings())
 
     assert symbols == ["005930", "000660"]
-    assert requested_urls == ["http://core.test/execution/runtime/monitored-symbols?refresh=true"]
+    assert requested_urls == ["http://core.test/execution/runtime/monitored-symbols?refresh=false"]
 
 
 def test_core_monitoring_symbol_read_uses_recent_success_on_transient_failure(monkeypatch) -> None:

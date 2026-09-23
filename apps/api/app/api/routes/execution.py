@@ -115,9 +115,12 @@ def create_execution_plan_handler(
         command=payload,
     )
     if result.status_code == 201 and result.payload.get("accepted_item_count"):
-        runtime = getattr(request.app.state, "autonomous_runtime", None)
-        if runtime is not None:
-            runtime.invalidate_monitoring_runtime_snapshot(reason="execution_plan_created")
+        _invalidate_execution_runtime(
+            request,
+            reason="execution_plan_created",
+            monitoring=True,
+            dispatch=True,
+        )
     return JSONResponse(status_code=result.status_code, content=result.payload)
 
 
@@ -150,11 +153,11 @@ def create_core_execution_plan_v4_handler(
         command=payload,
     )
     if result.status_code == 201 and result.payload.get("item_acks"):
-        runtime = getattr(request.app.state, "autonomous_runtime", None)
-        if runtime is not None:
-            runtime.invalidate_monitoring_runtime_snapshot(
-                reason="core_execution_plan_v4_created"
-            )
+        _invalidate_execution_runtime(
+            request,
+            reason="core_execution_plan_v4_created",
+            monitoring=True,
+        )
     return JSONResponse(status_code=result.status_code, content=result.payload)
 
 
@@ -171,11 +174,12 @@ def revoke_core_execution_plan_v4_handler(
         command=payload,
     )
     if result.status_code == 200:
-        runtime = getattr(request.app.state, "autonomous_runtime", None)
-        if runtime is not None:
-            runtime.invalidate_monitoring_runtime_snapshot(
-                reason="core_execution_plan_v4_revoked"
-            )
+        _invalidate_execution_runtime(
+            request,
+            reason="core_execution_plan_v4_revoked",
+            monitoring=True,
+            dispatch=True,
+        )
     return JSONResponse(status_code=result.status_code, content=result.payload)
 
 
@@ -192,11 +196,12 @@ def activate_core_execution_plan_v4_handler(
         command=payload,
     )
     if result.status_code == 200:
-        runtime = getattr(request.app.state, "autonomous_runtime", None)
-        if runtime is not None:
-            runtime.invalidate_monitoring_runtime_snapshot(
-                reason="core_execution_plan_v4_activated"
-            )
+        _invalidate_execution_runtime(
+            request,
+            reason="core_execution_plan_v4_activated",
+            monitoring=True,
+            dispatch=True,
+        )
     return JSONResponse(status_code=result.status_code, content=result.payload)
 
 
@@ -244,6 +249,13 @@ def dispatch_execution_jobs(
         db=db,
         adapter=adapter,
     )
+    if result.payload.get("jobs"):
+        _invalidate_execution_runtime(
+            request,
+            reason="manual_execution_job_dispatch",
+            monitoring=True,
+            dispatch=True,
+        )
     return JSONResponse(status_code=result.status_code, content=result.payload)
 
 
@@ -261,6 +273,15 @@ def short_term_watcher_decision(
         adapter=adapter,
         command=payload,
     )
+    if not payload.dry_run and result.payload.get("reason_code") in {
+        "submitted",
+        "submission_not_accepted",
+    }:
+        _invalidate_execution_runtime(
+            request,
+            reason="short_term_watcher_decision",
+            monitoring=True,
+        )
     return JSONResponse(status_code=result.status_code, content=result.payload)
 
 
@@ -278,6 +299,12 @@ def monitoring_evaluate(
         adapter=adapter,
         command=payload,
     )
+    if result.status_code < 500:
+        _invalidate_execution_runtime(
+            request,
+            reason="manual_monitoring_evaluation",
+            monitoring=True,
+        )
     return JSONResponse(status_code=result.status_code, content=result.payload)
 
 
@@ -294,6 +321,11 @@ def place_order_handler(
         db=db,
         adapter=adapter,
         command=payload,
+    )
+    _invalidate_execution_runtime(
+        request,
+        reason="manual_order_submission",
+        monitoring=True,
     )
     return JSONResponse(status_code=result.status_code, content=result.payload)
 
@@ -328,7 +360,7 @@ def reconcile_stale_orders(
             status_code=422,
             detail="stale reconciliation apply requires actor and reason",
         )
-    return reconcile_stale_nonterminal_broker_orders(
+    result = reconcile_stale_nonterminal_broker_orders(
         settings=settings,
         db=db,
         adapter=adapter,
@@ -338,6 +370,14 @@ def reconcile_stale_orders(
         actor=command.actor,
         operator_reason=command.reason,
     )
+    if not command.dry_run:
+        _invalidate_execution_runtime(
+            request,
+            reason="stale_order_reconciliation",
+            monitoring=True,
+            dispatch=True,
+        )
+    return result
 
 
 @router.get("/execution-failures")
@@ -452,3 +492,27 @@ def _parse_symbols_filter(value: str | None) -> set[str] | None:
         if item.strip()
     }
     return symbols or None
+
+
+def _invalidate_execution_runtime(
+    request: Request,
+    *,
+    reason: str,
+    monitoring: bool = False,
+    dispatch: bool = False,
+) -> None:
+    runtime = getattr(request.app.state, "autonomous_runtime", None)
+    if runtime is None:
+        return
+    if monitoring:
+        invalidate_monitoring = getattr(
+            runtime,
+            "invalidate_monitoring_runtime_snapshot",
+            None,
+        )
+        if callable(invalidate_monitoring):
+            invalidate_monitoring(reason=reason)
+    if dispatch:
+        invalidate_dispatch = getattr(runtime, "invalidate_dispatch_schedule", None)
+        if callable(invalidate_dispatch):
+            invalidate_dispatch(reason=reason)

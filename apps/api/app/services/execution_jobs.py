@@ -7,7 +7,7 @@ from decimal import Decimal
 from time import monotonic
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import select, update
+from sqlalchemy import or_, select, update
 from sqlalchemy.orm import Session, selectinload
 
 from app.api.schemas.execution import PlaceOrderRequest
@@ -268,6 +268,7 @@ def dispatch_due_execution_jobs(
                 "failed_job_count": 0,
                 "jobs": [],
                 "safety": safety,
+                "next_dispatch_at": None,
             },
         )
 
@@ -284,13 +285,17 @@ def dispatch_due_execution_jobs(
             ExecutionPlan.mode == settings.runtime_mode,
             ExecutionJob.status.in_(DISPATCHABLE_JOB_STATUSES),
             ExecutionPlanItem.status.in_(CLAIMABLE_PLAN_ITEM_STATUSES),
+            or_(
+                ExecutionJob.scheduled_for.is_(None),
+                ExecutionJob.scheduled_for <= triggered_at,
+            ),
         )
         .options(
             selectinload(ExecutionJob.plan_item).selectinload(ExecutionPlanItem.plan),
         )
         .order_by(ExecutionJob.scheduled_for.asc(), ExecutionJob.created_at.asc())
     ).all()
-    due_jobs = [job for job in jobs if _is_due(job, triggered_at)]
+    due_jobs = jobs
 
     completed = 0
     retrying = 0
@@ -344,6 +349,11 @@ def dispatch_due_execution_jobs(
         elif result == "failed":
             failed += 1
 
+    next_dispatch_at = _next_dispatchable_job_at(
+        settings=settings,
+        db=db,
+        triggered_at=triggered_at,
+    )
     return DispatchExecutionJobsResult(
         status_code=200,
         payload={
@@ -356,6 +366,7 @@ def dispatch_due_execution_jobs(
             "failed_job_count": failed,
             "jobs": serialized_jobs,
             "safety": safety,
+            "next_dispatch_at": _serialize_datetime(next_dispatch_at),
         },
     )
 
@@ -1691,6 +1702,36 @@ def _is_due(job: ExecutionJob, triggered_at: datetime) -> bool:
     if scheduled_for is None:
         return True
     return _normalize_utc(scheduled_for) <= triggered_at
+
+
+def _next_dispatchable_job_at(
+    *,
+    settings: Settings,
+    db: Session,
+    triggered_at: datetime,
+) -> datetime | None:
+    row = db.execute(
+        select(ExecutionJob.id, ExecutionJob.scheduled_for)
+        .join(ExecutionJob.plan_item)
+        .join(ExecutionPlanItem.plan)
+        .where(
+            ExecutionPlan.mode == settings.runtime_mode,
+            ExecutionJob.status.in_(DISPATCHABLE_JOB_STATUSES),
+            ExecutionPlanItem.status.in_(CLAIMABLE_PLAN_ITEM_STATUSES),
+        )
+        .order_by(
+            ExecutionJob.scheduled_for.is_not(None).asc(),
+            ExecutionJob.scheduled_for.asc(),
+            ExecutionJob.created_at.asc(),
+            ExecutionJob.id.asc(),
+        )
+        .limit(1)
+    ).first()
+    if row is None:
+        return None
+    if row.scheduled_for is None:
+        return triggered_at
+    return _normalize_utc(row.scheduled_for)
 
 
 def _guard_initial_next_open_submission(

@@ -5283,6 +5283,11 @@ def _monitoring_payload_from_autonomous(
     return {
         "status": status,
         "topology": MONITORING_RUNTIME_TOPOLOGY,
+        "cadence_mode": autonomous_monitoring.get("cadence_mode") or "configured",
+        "effective_poll_interval_seconds": autonomous_monitoring.get(
+            "effective_poll_interval_seconds"
+        ),
+        "next_wake_at": autonomous_monitoring.get("next_wake_at"),
         "scheduler": {
             "selection_strategy": MONITORING_SELECTION_STRATEGY,
             "max_symbols_per_cycle": settings.monitoring_max_symbols_per_cycle,
@@ -5304,6 +5309,12 @@ def _monitoring_payload_from_autonomous(
             {
                 "name": autonomous_monitoring.get("worker_name") or "monitoring_dispatch_loop",
                 "status": status,
+                "cadence_mode": autonomous_monitoring.get("cadence_mode")
+                or "configured",
+                "effective_poll_interval_seconds": autonomous_monitoring.get(
+                    "effective_poll_interval_seconds"
+                ),
+                "next_wake_at": autonomous_monitoring.get("next_wake_at"),
                 "last_heartbeat_at": autonomous_monitoring.get("last_heartbeat_at"),
                 "last_success_at": autonomous_monitoring.get("last_success_at"),
             }
@@ -5384,6 +5395,9 @@ def _default_autonomous_runtime_payload(settings: Settings) -> dict[str, object]
             "worker_name": "execution_job_dispatch_loop",
             "status": default_status,
             "poll_interval_seconds": settings.dispatch_loop_interval_seconds,
+            "cadence_mode": "configured",
+            "effective_poll_interval_seconds": settings.dispatch_loop_interval_seconds,
+            "next_wake_at": None,
             "last_started_at": None,
             "last_heartbeat_at": None,
             "last_success_at": None,
@@ -5394,6 +5408,9 @@ def _default_autonomous_runtime_payload(settings: Settings) -> dict[str, object]
             "worker_name": "monitoring_dispatch_loop",
             "status": default_status,
             "poll_interval_seconds": settings.monitoring_loop_interval_seconds,
+            "cadence_mode": "configured",
+            "effective_poll_interval_seconds": settings.monitoring_loop_interval_seconds,
+            "next_wake_at": None,
             "last_started_at": None,
             "last_heartbeat_at": None,
             "last_success_at": None,

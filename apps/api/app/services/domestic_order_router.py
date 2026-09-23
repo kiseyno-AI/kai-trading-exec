@@ -37,7 +37,7 @@ def resolve_domestic_order_route(
 ) -> RouteDecision:
     local_now = _localize(now)
     metadata = metadata or {}
-    session = _session_for(local_now)
+    session = domestic_market_session(local_now)
     nxt_eligible = _is_nxt_eligible(settings=settings, symbol=symbol, metadata=metadata)
     route_preference = settings.nxt_order_route_preference.strip().lower()
     protective = purpose in {"protective_stop", "stop_sell"}
@@ -194,8 +194,8 @@ def resolve_domestic_order_route(
     )
 
 
-def _session_for(now: datetime) -> str:
-    local_time = now.timetz().replace(tzinfo=None)
+def domestic_market_session(now: datetime) -> str:
+    local_time = _localize(now).timetz().replace(tzinfo=None)
     if time(8, 0) <= local_time < time(8, 30):
         return "nxt_pre"
     if time(8, 30) <= local_time < time(8, 40):
@@ -215,6 +215,51 @@ def _session_for(now: datetime) -> str:
     if time(18, 0) <= local_time < time(20, 0):
         return "nxt_after_late"
     return "closed"
+
+
+def domestic_session_has_enabled_route(*, settings: Settings, session: str) -> bool:
+    """Return whether any configured domestic route can act in ``session``.
+
+    This is intentionally conservative and symbol-agnostic. The order router
+    still performs the exact symbol, side, and NXT-eligibility checks before a
+    broker submission.
+    """
+
+    regular_krx_session = session in {"krx_opening_call_auction", "krx_regular"}
+    if not settings.domestic_order_session_routing_enabled:
+        return regular_krx_session
+    if regular_krx_session:
+        return True
+    if session == "nxt_pre":
+        return settings.allow_nxt_pre_orders
+    if session == "krx_preopen_close":
+        return bool(
+            settings.allow_krx_pre_open_offhours_orders
+            or (
+                settings.allow_nxt_pre_orders
+                and _prefer_nxt(settings.nxt_order_route_preference.strip().lower())
+            )
+        )
+
+    after_hours_side_enabled = bool(
+        settings.allow_after_hours_buy_orders
+        or settings.allow_after_hours_sell_orders
+    )
+    if not after_hours_side_enabled:
+        return False
+    if session in {"nxt_after_acceptance", "nxt_after_late"}:
+        return settings.allow_nxt_after_orders
+    if session == "nxt_after":
+        return bool(
+            settings.allow_nxt_after_orders
+            or settings.allow_krx_after_hours_closing_orders
+        )
+    if session == "krx_after_single_price":
+        return bool(
+            settings.allow_nxt_after_orders
+            or settings.allow_krx_after_hours_single_price_orders
+        )
+    return False
 
 
 def _submit(

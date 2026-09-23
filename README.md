@@ -279,8 +279,35 @@ KAI_EXEC_KIS_ACCOUNT_NUMBER=12345678
 | `KAI_EXEC_DATABASE_URL` | default `sqlite:///./var/kai_trading_exec.db` |
 | `KAI_EXEC_AUTOMATION_ENABLED` | global order automation gate; default `false` |
 | `KAI_EXEC_AUTONOMOUS_RUNTIME_ENABLED` | dispatch/monitoring worker gate; default `false` |
+| `KAI_EXEC_DISPATCH_LOOP_INTERVAL_SECONDS` | active-session dispatch cadence; default `1` second |
+| `KAI_EXEC_MONITORING_LOOP_INTERVAL_SECONDS` | active-session monitoring cadence; default `1` second |
+| `KAI_EXEC_DOMESTIC_CLOSED_MARKET_IDLE_INTERVAL_SECONDS` | KIS domestic-only cadence when every enabled domestic route is closed; default `60` seconds |
 
 Pool controls are `KAI_EXEC_DB_POOL_SIZE` (`10`), `KAI_EXEC_DB_MAX_OVERFLOW` (`10`), `KAI_EXEC_DB_POOL_TIMEOUT_SECONDS` (`5`), `KAI_EXEC_DB_POOL_RECYCLE_SECONDS` (`900`), `KAI_EXEC_DB_POOL_USE_LIFO` (`true`), `KAI_EXEC_DB_CONNECT_TIMEOUT_SECONDS` (`5`), `KAI_EXEC_DB_LONG_CHECKOUT_WARNING_SECONDS` (`10`), and `KAI_EXEC_SQLITE_BUSY_TIMEOUT_SECONDS` (`30`). Database health checks are single-flight per process.
+
+### Runtime database access model
+
+Exec loads the complete local monitoring workset into compact process memory and
+round-robins quote batches from that snapshot. The normal no-trigger quote cycle
+does not reopen the database. The workset, filled-today set, KIS route context,
+and token lease refresh together at the broker-truth age limit
+(`KAI_EXEC_EXEC_AGENT_MAX_ACCOUNT_SNAPSHOT_AGE_SECONDS`, default `300`), and a
+committed plan, order, fill, sizing, authority, or broker-session change
+invalidates the affected cache immediately. Core supplies only cached symbol
+priority; Exec does not force Core to rebuild that read model on every refresh.
+
+An empty dispatch queue is rescanned at most once per 60 seconds unless a local
+write makes it dirty or a known scheduled job becomes due. Repeated no-price
+monitoring cycles likewise write one checkpoint and then suppress redundant DB
+work for 60 seconds; pending-dispatch exits still bypass that suppression so
+restart recovery is not delayed.
+
+This optimization applies only to read-mostly scheduling and evaluation. Broker
+intent is still committed before submission, and acknowledgements, unknown
+outcomes, fills, positions, protective exits, risk fences, and reconciliation
+results remain immediate durable writes. Do not replace those transitions with
+an end-of-day memory flush: a restart could otherwise duplicate an order or lose
+protection for an open position.
 
 ### KIS
 
@@ -695,7 +722,7 @@ curl -X POST http://127.0.0.1:8010/monitoring/evaluate \
   -d '{"prices":[{"symbol":"005930","price":"125100.00"}]}'
 ```
 
-The autonomous loops persist dispatch backlog, retry eligible failures, cap work per cycle, and update liveness checkpoints. Short-term buys fail closed when account state, buying power, exposure, target/stop context, or reward/risk requirements are unresolved.
+The autonomous loops persist dispatch backlog, retry eligible failures, cap work per cycle, and update liveness checkpoints. A live KIS runtime with US trading disabled uses the configured active cadence while any enabled KRX/NXT route can act, then reduces dispatch and monitoring to the closed-market idle cadence for low-frequency reconciliation. The scheduler shortens its sleep at the next enabled domestic-session boundary, so it resumes without a restart. It checks the KIS trading calendar once per market date (with a bounded retry on calendar errors), and explicit `KAI_EXEC_KRX_MARKET_HOLIDAY_DATES` entries remain closed overrides. KIS US and non-KIS runtimes are not throttled by the Korean-market schedule. Short-term buys fail closed when account state, buying power, exposure, target/stop context, or reward/risk requirements are unresolved.
 
 ### Korean after-hours routing
 

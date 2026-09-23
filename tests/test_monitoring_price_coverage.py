@@ -1,4 +1,4 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 import threading
 
@@ -16,6 +16,7 @@ from app.models.runtime import ExecutionPlan, ExecutionPlanItem, ExecutionPositi
 from app.broker.kis import KIS_OVERSEAS_QUOTE_EMPTY_CODE
 from app.services import monitoring_price_source as monitoring_price_source_module
 from app.services.monitoring_price_source import KisCurrentQuoteMonitoringPriceSource
+from app.services.monitoring_price_source import _KisMonitoringRuntimeContext
 from app.services.monitoring_price_source import _derive_orderability_context
 from app.services.monitoring_price_source import monitoring_price_from_broker_quote
 from app.services.monitoring_price_source import next_us_regular_open
@@ -324,6 +325,174 @@ def test_kis_price_source_enriches_monitoring_price_with_live_market_context() -
     assert price_source.get_last_diagnostics()["context_failure_count"] == 0
     assert broker_adapter.live_context_calls == [("073560", "KRX")]
     engine.dispose()
+
+
+def test_kis_price_source_reuses_primed_runtime_context_without_db_checkout() -> None:
+    observed_at = datetime(2026, 9, 23, 1, 5, tzinfo=UTC)
+    broker_adapter = LiveMarketContextAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        current_prices={"005930": Decimal("70000")},
+        current_price_observed_at=observed_at,
+    )
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        kis_app_key="paper-key",
+        kis_app_secret="paper-secret",
+        kis_account_number="12345678",
+    )
+    app, engine = build_test_app(settings=settings, broker_adapter=broker_adapter)
+    price_source = KisCurrentQuoteMonitoringPriceSource(
+        settings=settings,
+        session_factory=app.state.db_session_factory,
+        broker_adapter_factory=lambda _settings: broker_adapter,
+    )
+    with app.state.db_session_factory() as db:
+        price_source.prime_runtime_context(
+            db=db,
+            symbols=["005930"],
+            loaded_at=observed_at,
+        )
+
+    def fail_session_checkout():
+        raise AssertionError("primed quote cycles must not open a DB session")
+
+    price_source.session_factory = fail_session_checkout  # type: ignore[assignment]
+
+    first = price_source.get_prices(
+        symbols=["005930"],
+        observed_at=observed_at,
+        settings=settings,
+    )
+    second = price_source.get_prices(
+        symbols=["005930"],
+        observed_at=observed_at + timedelta(seconds=1),
+        settings=settings,
+    )
+
+    assert [price.symbol for price in first] == ["005930"]
+    assert [price.symbol for price in second] == ["005930"]
+    assert broker_adapter.current_price_calls == [
+        ("005930", "KRX"),
+        ("005930", "KRX"),
+    ]
+    price_source.close()
+    engine.dispose()
+
+
+def test_kis_price_source_discards_cached_context_after_auth_rejection() -> None:
+    observed_at = datetime(2026, 9, 23, 1, 5, tzinfo=UTC)
+    broker_adapter = SymbolScopedQuoteErrorAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        current_price_errors={
+            "005930": BrokerAdapterError(
+                "token rejected",
+                status_code=422,
+                classification=BrokerErrorClassification.AUTH,
+                response_metadata={"status_code": 401},
+            )
+        },
+    )
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        kis_app_key="paper-key",
+        kis_app_secret="paper-secret",
+        kis_account_number="12345678",
+    )
+    app, engine = build_test_app(settings=settings, broker_adapter=broker_adapter)
+    price_source = KisCurrentQuoteMonitoringPriceSource(
+        settings=settings,
+        session_factory=app.state.db_session_factory,
+        broker_adapter_factory=lambda _settings: broker_adapter,
+    )
+    with app.state.db_session_factory() as db:
+        price_source.prime_runtime_context(
+            db=db,
+            symbols=["005930"],
+            loaded_at=observed_at,
+        )
+
+    assert price_source.get_prices(
+        symbols=["005930"],
+        observed_at=observed_at,
+        settings=settings,
+    ) == []
+    assert price_source._cached_runtime_context(symbols=["005930"]) is None
+
+    price_source.close()
+    engine.dispose()
+
+
+def test_kis_price_source_invalidation_wins_over_inflight_prime(monkeypatch) -> None:
+    loaded_at = datetime(2026, 9, 23, 1, 5, tzinfo=UTC)
+    broker_adapter = LiveMarketContextAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+    )
+    settings = Settings(database_url="sqlite:///:memory:", runtime_mode="paper")
+    price_source = KisCurrentQuoteMonitoringPriceSource(
+        settings=settings,
+        session_factory=lambda: None,  # type: ignore[arg-type]
+        broker_adapter_factory=lambda _settings: broker_adapter,
+    )
+    entered = threading.Event()
+    release = threading.Event()
+    errors: list[Exception] = []
+
+    def build_context(**kwargs) -> _KisMonitoringRuntimeContext:
+        del kwargs
+        entered.set()
+        assert release.wait(timeout=2)
+        return _KisMonitoringRuntimeContext(
+            cached_at=loaded_at,
+            refresh_before=loaded_at + timedelta(minutes=5),
+            access_token="stale-token",
+            covered_symbols=frozenset({"005930"}),
+            execution_context_by_symbol={},
+        )
+
+    monkeypatch.setattr(price_source, "_build_runtime_context", build_context)
+
+    def prime() -> None:
+        try:
+            price_source.prime_runtime_context(
+                db=object(),  # type: ignore[arg-type]
+                symbols=["005930"],
+                loaded_at=loaded_at,
+            )
+        except Exception as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=prime)
+    worker.start()
+    assert entered.wait(timeout=2)
+    price_source.invalidate_runtime_context(reason="plan_route_changed")
+    release.set()
+    worker.join(timeout=2)
+
+    assert not worker.is_alive()
+    assert len(errors) == 1
+    assert "invalidated during refresh" in str(errors[0])
+    assert price_source._cached_runtime_context(symbols=["005930"]) is None
+    price_source.close()
 
 
 def test_kis_price_source_requires_repeated_empty_quotes_before_durable_review() -> None:

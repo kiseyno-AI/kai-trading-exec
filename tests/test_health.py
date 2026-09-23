@@ -355,6 +355,7 @@ def test_settings_load_from_environment() -> None:
             "KAI_EXEC_DATABASE_URL": "sqlite:////tmp/kai-exec-test.db",
             "KAI_EXEC_API_PORT": "8022",
             "KAI_EXEC_AUTOMATION_ENABLED": "true",
+            "KAI_EXEC_DOMESTIC_CLOSED_MARKET_IDLE_INTERVAL_SECONDS": "75",
             "KAI_EXEC_LOG_LEVEL": "debug",
         },
     )
@@ -364,6 +365,7 @@ def test_settings_load_from_environment() -> None:
     assert settings.database_url == "sqlite:////tmp/kai-exec-test.db"
     assert settings.api_port == 8022
     assert settings.automation_enabled is True
+    assert settings.domestic_closed_market_idle_interval_seconds == 75
     assert settings.log_level == "DEBUG"
 
 
@@ -6334,7 +6336,11 @@ def test_fast_runtime_status_uses_autonomous_snapshot_for_monitored_symbols() ->
         ),
         autonomous_runtime_enabled=True,
     )
-    app.state.autonomous_runtime._monitoring_state.status = "running"
+    monitoring_state = app.state.autonomous_runtime._monitoring_state
+    monitoring_state.status = "running"
+    monitoring_state.cadence_mode = "domestic_market_closed"
+    monitoring_state.effective_poll_interval_seconds = 60.0
+    monitoring_state.next_wake_at = datetime(2026, 9, 23, 11, 2, tzinfo=UTC)
     identity = build_position_identity(
         settings=app.state.settings,
         provider="kis",
@@ -6432,6 +6438,12 @@ def test_fast_runtime_status_uses_autonomous_snapshot_for_monitored_symbols() ->
     assert response.status_code == 200
     payload = response.json()
     assert payload["freshness"]["summary_source"] == "fast_autonomous_runtime_snapshot"
+    assert payload["liveness"]["monitoring"]["cadence_mode"] == "domestic_market_closed"
+    assert payload["liveness"]["monitoring"]["effective_poll_interval_seconds"] == 60.0
+    assert payload["liveness"]["monitoring"]["next_wake_at"] == "2026-09-23T11:02:00+00:00"
+    assert payload["liveness"]["monitoring"]["workers"][0]["cadence_mode"] == (
+        "domestic_market_closed"
+    )
     assert payload["symbols"]["monitored"] == ["000660", "005930"]
     assert payload["symbols"]["monitoring_cycle_batch"] == ["000660", "005930"]
     assert payload["symbols"]["filled_today"] == ["282330"]
