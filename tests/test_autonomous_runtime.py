@@ -217,6 +217,47 @@ def test_watch_sizing_cycle_refreshes_trade_feedback_before_agent_sizing(
     assert payload["trade_outcome_feedback"]["status"] == "generated"
 
 
+def test_watch_sizing_cycle_skips_database_feedback_outside_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="live",
+        exec_agent_enabled=True,
+        exec_agent_watch_sizing_enabled=True,
+        kis_account_number="12345678",
+        kis_account_product_code="01",
+        account_drawdown_recovery_scope_secret=(
+            "watch-sizing-closed-window-secret-at-least-32-bytes"
+        ),
+    )
+    coordinator = AutonomousRuntimeCoordinator(
+        settings=settings,
+        session_factory=None,  # type: ignore[arg-type]
+        broker_adapter_factory=lambda settings: None,  # type: ignore[arg-type,return-value]
+    )
+
+    monkeypatch.setattr(
+        autonomous_runtime,
+        "ensure_fresh_trade_outcome_feedback",
+        lambda **_: (_ for _ in ()).throw(
+            AssertionError("closed-window sizing must not access feedback storage")
+        ),
+    )
+
+    payload = coordinator._watch_exec_agent_sizing_cycle_sync(
+        datetime(2026, 9, 22, 18, 1, tzinfo=UTC)
+    )
+
+    assert payload["idle"] is True
+    assert payload["reason"] == "outside_sizing_window"
+    assert payload["trade_outcome_feedback"] == {
+        "status": "skipped",
+        "version": "trade-outcome-feedback-v2",
+        "reason": "outside_sizing_window",
+    }
+
+
 def test_coordinator_snapshot_stores_exact_canonical_execution_scope() -> None:
     settings = Settings(
         database_url="sqlite:///:memory:",
@@ -358,6 +399,414 @@ def test_monitoring_cycle_does_not_mix_core_universe_into_active_local_work(
     coordinator._monitoring_cycle_sync(datetime(2026, 8, 26, 1, 0, tzinfo=UTC))
 
     assert requested == ["005930", "AAPL"]
+
+
+@pytest.mark.parametrize(
+    (
+        "worker_key",
+        "settings_updates",
+        "now",
+        "expected_mode",
+        "expected_delay",
+        "expected_next_active",
+    ),
+    [
+        (
+            "monitoring",
+            {"domestic_closed_market_idle_interval_seconds": 75.0},
+            datetime(2026, 9, 22, 11, 1, tzinfo=UTC),
+            "domestic_market_closed",
+            75.0,
+            datetime(2026, 9, 22, 23, 50, tzinfo=UTC),
+        ),
+        (
+            "monitoring",
+            {},
+            datetime(2026, 9, 23, 1, 0, tzinfo=UTC),
+            "market_active",
+            1.0,
+            None,
+        ),
+        (
+            "monitoring",
+            {},
+            datetime(2026, 9, 22, 23, 49, 55, tzinfo=UTC),
+            "domestic_market_closed",
+            5.0,
+            datetime(2026, 9, 22, 23, 50, tzinfo=UTC),
+        ),
+        (
+            "monitoring",
+            {
+                "domestic_order_session_routing_enabled": True,
+                "allow_krx_after_hours_single_price_orders": True,
+            },
+            datetime(2026, 9, 23, 8, 0, tzinfo=UTC),
+            "market_active",
+            1.0,
+            None,
+        ),
+        (
+            "monitoring",
+            {
+                "domestic_order_session_routing_enabled": True,
+                "allow_nxt_after_orders": True,
+            },
+            datetime(2026, 9, 23, 9, 1, tzinfo=UTC),
+            "market_active",
+            1.0,
+            None,
+        ),
+        (
+            "monitoring",
+            {
+                "domestic_order_session_routing_enabled": True,
+                "allow_nxt_after_orders": True,
+                "allow_after_hours_buy_orders": False,
+                "allow_after_hours_sell_orders": False,
+            },
+            datetime(2026, 9, 23, 9, 1, tzinfo=UTC),
+            "domestic_market_closed",
+            60.0,
+            datetime(2026, 9, 23, 23, 50, tzinfo=UTC),
+        ),
+        (
+            "monitoring",
+            {"allow_krx_after_hours_single_price_orders": True},
+            datetime(2026, 9, 23, 8, 0, tzinfo=UTC),
+            "domestic_market_closed",
+            60.0,
+            datetime(2026, 9, 23, 23, 50, tzinfo=UTC),
+        ),
+        (
+            "monitoring",
+            {
+                "domestic_order_session_routing_enabled": True,
+                "allow_nxt_pre_orders": True,
+            },
+            datetime(2026, 9, 22, 22, 59, 55, tzinfo=UTC),
+            "domestic_market_closed",
+            5.0,
+            datetime(2026, 9, 22, 23, 0, tzinfo=UTC),
+        ),
+        (
+            "monitoring",
+            {
+                "domestic_order_session_routing_enabled": True,
+                "allow_nxt_pre_orders": True,
+                "nxt_order_route_preference": "krx_when_regular",
+            },
+            datetime(2026, 9, 22, 23, 35, tzinfo=UTC),
+            "domestic_market_closed",
+            60.0,
+            datetime(2026, 9, 22, 23, 40, tzinfo=UTC),
+        ),
+        (
+            "monitoring",
+            {
+                "domestic_order_session_routing_enabled": True,
+                "allow_krx_pre_open_offhours_orders": True,
+            },
+            datetime(2026, 9, 22, 23, 35, tzinfo=UTC),
+            "market_active",
+            1.0,
+            None,
+        ),
+        (
+            "monitoring",
+            {
+                "domestic_order_session_routing_enabled": True,
+                "allow_krx_after_hours_closing_orders": True,
+            },
+            datetime(2026, 9, 23, 6, 45, tzinfo=UTC),
+            "market_active",
+            1.0,
+            None,
+        ),
+        (
+            "monitoring",
+            {"kis_us_trading_enabled": True},
+            datetime(2026, 9, 22, 11, 1, tzinfo=UTC),
+            "configured",
+            1.0,
+            None,
+        ),
+        (
+            "monitoring",
+            {"runtime_mode": "live", "runtime_broker_provider": "alpaca"},
+            datetime(2026, 9, 22, 11, 1, tzinfo=UTC),
+            "configured",
+            1.0,
+            None,
+        ),
+        (
+            "monitoring",
+            {"runtime_mode": "paper"},
+            datetime(2026, 9, 22, 11, 1, tzinfo=UTC),
+            "configured",
+            1.0,
+            None,
+        ),
+        (
+            "monitoring",
+            {"market_timezone": "America/New_York"},
+            datetime(2026, 9, 23, 11, 30, tzinfo=UTC),
+            "domestic_market_closed",
+            60.0,
+            datetime(2026, 9, 23, 23, 50, tzinfo=UTC),
+        ),
+        (
+            "dispatch",
+            {"krx_market_holiday_dates": "2026-09-23"},
+            datetime(2026, 9, 23, 1, 0, tzinfo=UTC),
+            "domestic_market_closed",
+            60.0,
+            datetime(2026, 9, 23, 23, 50, tzinfo=UTC),
+        ),
+        (
+            "dispatch",
+            {},
+            datetime(2026, 9, 26, 1, 0, tzinfo=UTC),
+            "domestic_market_closed",
+            60.0,
+            datetime(2026, 9, 27, 23, 50, tzinfo=UTC),
+        ),
+    ],
+    ids=[
+        "closed",
+        "regular",
+        "opening-boundary",
+        "krx-after-hours",
+        "nxt-late",
+        "after-hours-side-disabled",
+        "routing-disabled",
+        "nxt-pre-boundary",
+        "nxt-pre-krx-preference",
+        "krx-preopen-close",
+        "krx-after-close",
+        "kis-us",
+        "live-alpaca",
+        "paper-kis",
+        "krx-timezone-is-fixed",
+        "holiday",
+        "weekend",
+    ],
+)
+def test_autonomous_runtime_uses_session_aware_cadence(
+    worker_key: str,
+    settings_updates: dict[str, object],
+    now: datetime,
+    expected_mode: str,
+    expected_delay: float,
+    expected_next_active: datetime | None,
+) -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="live",
+        runtime_broker_provider="kis",
+    ).model_copy(update=settings_updates)
+    coordinator = AutonomousRuntimeCoordinator(
+        settings=settings,
+        session_factory=None,  # type: ignore[arg-type]
+        broker_adapter_factory=lambda settings: None,  # type: ignore[arg-type,return-value]
+    )
+
+    schedule = coordinator._periodic_loop_schedule(
+        worker_key=worker_key,
+        configured_interval_seconds=1.0,
+        now=now,
+    )
+
+    assert schedule.cadence_mode == expected_mode
+    assert schedule.delay_seconds == expected_delay
+    assert schedule.next_market_active_at == expected_next_active
+    assert schedule.next_wake_at == now + timedelta(seconds=expected_delay)
+
+
+def test_closed_market_cadence_never_runs_faster_than_configured_interval() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="live",
+        runtime_broker_provider="kis",
+        domestic_closed_market_idle_interval_seconds=0.5,
+    )
+    coordinator = AutonomousRuntimeCoordinator(
+        settings=settings,
+        session_factory=None,  # type: ignore[arg-type]
+        broker_adapter_factory=lambda settings: None,  # type: ignore[arg-type,return-value]
+    )
+
+    schedule = coordinator._periodic_loop_schedule(
+        worker_key="monitoring",
+        configured_interval_seconds=300.0,
+        now=datetime(2026, 9, 22, 11, 1, tzinfo=UTC),
+    )
+
+    assert schedule.cadence_mode == "domestic_market_closed"
+    assert schedule.delay_seconds == 300.0
+
+
+def test_authoritative_krx_holiday_closes_session_aware_cadence() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="live",
+        runtime_broker_provider="kis",
+    )
+    coordinator = AutonomousRuntimeCoordinator(
+        settings=settings,
+        session_factory=None,  # type: ignore[arg-type]
+        broker_adapter_factory=lambda settings: None,  # type: ignore[arg-type,return-value]
+    )
+    coordinator._krx_trading_days[date(2026, 9, 23)] = False
+
+    schedule = coordinator._periodic_loop_schedule(
+        worker_key="monitoring",
+        configured_interval_seconds=1.0,
+        now=datetime(2026, 9, 23, 1, 0, tzinfo=UTC),
+    )
+
+    assert schedule.cadence_mode == "domestic_market_closed"
+    assert schedule.next_market_active_at == datetime(2026, 9, 23, 23, 50, tzinfo=UTC)
+
+
+def test_krx_calendar_refresh_caches_authoritative_broker_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="live",
+        runtime_broker_provider="kis",
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+
+    class CalendarAdapter:
+        def is_krx_trading_day(self, access_token: str, *, market_date: date) -> bool:
+            assert access_token == "calendar-token"
+            assert market_date == date(2026, 9, 23)
+            return False
+
+    monkeypatch.setattr(
+        autonomous_runtime,
+        "ensure_authenticated_broker_session",
+        lambda **_: SimpleNamespace(access_token="calendar-token"),
+    )
+    coordinator = AutonomousRuntimeCoordinator(
+        settings=settings,
+        session_factory=session_factory,
+        broker_adapter_factory=lambda settings: CalendarAdapter(),  # type: ignore[arg-type,return-value]
+    )
+    try:
+        coordinator._refresh_current_krx_trading_day(
+            datetime(2026, 9, 23, 0, 1, tzinfo=UTC)
+        )
+
+        assert coordinator._krx_trading_days == {date(2026, 9, 23): False}
+        assert coordinator._krx_calendar_sources == {
+            date(2026, 9, 23): "kis_chk_holiday"
+        }
+    finally:
+        engine.dispose()
+
+
+def test_unknown_krx_calendar_result_fails_open_and_throttles_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="live",
+        runtime_broker_provider="kis",
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+
+    class UnknownCalendarAdapter:
+        def is_krx_trading_day(
+            self, access_token: str, *, market_date: date
+        ) -> None:
+            return None
+
+    monkeypatch.setattr(
+        autonomous_runtime,
+        "ensure_authenticated_broker_session",
+        lambda **_: SimpleNamespace(access_token="calendar-token"),
+    )
+    coordinator = AutonomousRuntimeCoordinator(
+        settings=settings,
+        session_factory=session_factory,
+        broker_adapter_factory=lambda settings: UnknownCalendarAdapter(),  # type: ignore[arg-type,return-value]
+    )
+    checked_at = datetime(2026, 9, 23, 0, 1, tzinfo=UTC)
+    try:
+        coordinator._refresh_current_krx_trading_day(checked_at)
+
+        assert coordinator._krx_trading_days == {}
+        assert coordinator._krx_calendar_refresh_due(
+            checked_at + timedelta(seconds=59)
+        ) is False
+        assert coordinator._krx_calendar_refresh_due(
+            checked_at + timedelta(seconds=60)
+        ) is True
+    finally:
+        engine.dispose()
+
+
+def test_periodic_loop_uses_session_aware_schedule(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        settings = Settings(
+            database_url="sqlite:///:memory:",
+            autonomous_runtime_enabled=True,
+            runtime_mode="live",
+            runtime_broker_provider="kis",
+            monitoring_loop_interval_seconds=1.0,
+        )
+        coordinator = AutonomousRuntimeCoordinator(
+            settings=settings,
+            session_factory=None,  # type: ignore[arg-type]
+            broker_adapter_factory=lambda settings: None,  # type: ignore[arg-type,return-value]
+        )
+        sleep_delays: list[float] = []
+        cycle_calls = 0
+
+        async def cycle(_started_at: datetime) -> dict[str, object]:
+            nonlocal cycle_calls
+            cycle_calls += 1
+            if cycle_calls == 2:
+                coordinator._stopping = True
+            return {"status_code": 200}
+
+        scheduled_wake = datetime(2026, 9, 22, 11, 2, tzinfo=UTC)
+        coordinator._periodic_loop_schedule = (  # type: ignore[method-assign]
+            lambda **_: SimpleNamespace(
+                delay_seconds=60.0,
+                cadence_mode="domestic_market_closed",
+                next_wake_at=scheduled_wake,
+                next_market_active_at=datetime(2026, 9, 22, 23, 50, tzinfo=UTC),
+            )
+        )
+
+        async def fake_sleep(delay: float) -> None:
+            sleep_delays.append(delay)
+
+        monkeypatch.setattr(autonomous_runtime.asyncio, "sleep", fake_sleep)
+        await coordinator._run_periodic_loop(
+            worker_key="monitoring",
+            interval_seconds=settings.monitoring_loop_interval_seconds,
+            cycle=cycle,
+        )
+
+        assert sleep_delays == [1.0, 60.0]
+        assert cycle_calls == 2
+        snapshot = coordinator.snapshot()["monitoring"]
+        assert snapshot["cadence_mode"] == "domestic_market_closed"
+        assert snapshot["effective_poll_interval_seconds"] == 60.0
+        assert snapshot["next_wake_at"] == scheduled_wake.isoformat()
+
+    asyncio.run(scenario())
 
 
 def test_monitoring_timeout_does_not_block_next_scheduler_tick() -> None:
@@ -719,6 +1168,55 @@ def test_stop_drains_daily_krx_position_discovery(
             if stop_task is not None:
                 await asyncio.gather(stop_task, return_exceptions=True)
             await coordinator.stop()
+
+    asyncio.run(scenario())
+
+
+def test_daily_position_discovery_skips_authoritative_krx_holiday(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        settings = Settings(
+            database_url="sqlite:///:memory:",
+            autonomous_runtime_enabled=True,
+            runtime_mode="live",
+            runtime_broker_provider="kis",
+        )
+        coordinator = AutonomousRuntimeCoordinator(
+            settings=settings,
+            session_factory=None,  # type: ignore[arg-type]
+            broker_adapter_factory=lambda settings: None,  # type: ignore[arg-type,return-value]
+        )
+        current_market_date = datetime.now(UTC).astimezone(
+            autonomous_runtime.KRX_TIMEZONE
+        ).date()
+        coordinator._krx_trading_days.update(
+            {
+                current_market_date - timedelta(days=1): False,
+                current_market_date: False,
+                current_market_date + timedelta(days=1): False,
+            }
+        )
+        coordinator._monitoring_state.last_success_at = datetime.now(UTC)
+        reconciliation_calls = 0
+
+        def reconcile(_now: datetime) -> bool:
+            nonlocal reconciliation_calls
+            reconciliation_calls += 1
+            return True
+
+        async def fake_sleep(_delay: float) -> None:
+            coordinator._stopping = True
+
+        monkeypatch.setattr(autonomous_runtime, "_is_regular_market_session", lambda **_: True)
+        monkeypatch.setattr(autonomous_runtime.asyncio, "sleep", fake_sleep)
+        coordinator._reconcile_and_refresh_monitoring_snapshot_if_due = (  # type: ignore[method-assign]
+            reconcile
+        )
+
+        await coordinator._run_daily_krx_position_discovery_loop()
+
+        assert reconciliation_calls == 0
 
     asyncio.run(scenario())
 

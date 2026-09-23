@@ -40,6 +40,11 @@ class Settings(BaseModel):
     autonomous_runtime_enabled: bool = False
     dispatch_loop_interval_seconds: float = Field(default=1.0, gt=0, le=3600)
     monitoring_loop_interval_seconds: float = Field(default=1.0, gt=0, le=3600)
+    domestic_closed_market_idle_interval_seconds: float = Field(
+        default=60.0,
+        gt=0,
+        le=3600,
+    )
     monitoring_cycle_timeout_seconds: float = Field(default=20.0, gt=0, le=3600)
     monitoring_expire_prior_market_watch_buys_enabled: bool = True
     monitoring_watch_buy_max_age_trading_sessions: int = Field(default=2, ge=1, le=10)
@@ -513,6 +518,7 @@ _ENV_FIELDS = {
     "AUTONOMOUS_RUNTIME_ENABLED": "autonomous_runtime_enabled",
     "DISPATCH_LOOP_INTERVAL_SECONDS": "dispatch_loop_interval_seconds",
     "MONITORING_LOOP_INTERVAL_SECONDS": "monitoring_loop_interval_seconds",
+    "DOMESTIC_CLOSED_MARKET_IDLE_INTERVAL_SECONDS": "domestic_closed_market_idle_interval_seconds",
     "MONITORING_CYCLE_TIMEOUT_SECONDS": "monitoring_cycle_timeout_seconds",
     "MONITORING_EXPIRE_PRIOR_MARKET_WATCH_BUYS_ENABLED": "monitoring_expire_prior_market_watch_buys_enabled",
     "MONITORING_WATCH_BUY_MAX_AGE_TRADING_SESSIONS": "monitoring_watch_buy_max_age_trading_sessions",

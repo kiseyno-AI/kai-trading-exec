@@ -8,7 +8,7 @@ import os
 import sqlite3
 import threading
 from dataclasses import dataclass, field, replace
-from datetime import UTC, date, datetime, time
+from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 from typing import Any, Callable, Iterable, TypeVar
 from zoneinfo import ZoneInfo
@@ -22,6 +22,11 @@ from app.broker.base import BrokerAdapter
 from app.core.config import Settings
 from app.models.runtime import BrokerOrder
 from app.models.runtime import ExecutionPlan, ExecutionPlanItem, ExecutionPosition
+from app.services.broker_auth import ensure_authenticated_broker_session
+from app.services.domestic_order_router import (
+    domestic_market_session,
+    domestic_session_has_enabled_route,
+)
 from app.services.execution_jobs import dispatch_due_execution_jobs
 from app.services.execution_account_route import classify_kis_account_route
 from app.services.execution_semantics import (
@@ -59,7 +64,10 @@ from app.services.trade_outcome_feedback import (
     REPORT_VERSION as TRADE_OUTCOME_FEEDBACK_VERSION,
     ensure_fresh_trade_outcome_feedback,
 )
-from app.services.watch_exec_agent_sizing import run_due_watch_exec_agent_sizing
+from app.services.watch_exec_agent_sizing import (
+    _inside_sizing_window,
+    run_due_watch_exec_agent_sizing,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -69,6 +77,18 @@ WATCH_EXEC_AGENT_SIZING_WORKER_NAME = "watch_exec_agent_sizing_loop"
 NXT_ELIGIBLE_SYNC_WORKER_NAME = "nxt_eligible_sync_loop"
 MAX_STATUS_DETAIL_ITEMS = 20
 KRX_TIMEZONE = ZoneInfo("Asia/Seoul")
+DOMESTIC_SESSION_BOUNDARIES = (
+    time(8, 0),
+    time(8, 30),
+    time(8, 40),
+    time(8, 50),
+    time(9, 0),
+    time(15, 30),
+    time(15, 40),
+    time(16, 0),
+    time(18, 0),
+)
+KRX_CALENDAR_RETRY_INTERVAL = timedelta(seconds=60)
 _CACHED_KIS_ROUTE_EXCHANGES = KRX_EXCHANGES | frozenset({"NASD", "NYSE", "AMEX"})
 _CycleResult = TypeVar("_CycleResult")
 
@@ -201,6 +221,9 @@ class AutonomousWorkerState:
     worker_name: str
     poll_interval_seconds: float
     status: str = "idle"
+    cadence_mode: str = "configured"
+    effective_poll_interval_seconds: float | None = None
+    next_wake_at: datetime | None = None
     last_started_at: datetime | None = None
     last_heartbeat_at: datetime | None = None
     last_success_at: datetime | None = None
@@ -212,12 +235,27 @@ class AutonomousWorkerState:
             "worker_name": self.worker_name,
             "status": self.status,
             "poll_interval_seconds": self.poll_interval_seconds,
+            "cadence_mode": self.cadence_mode,
+            "effective_poll_interval_seconds": (
+                self.effective_poll_interval_seconds
+                if self.effective_poll_interval_seconds is not None
+                else self.poll_interval_seconds
+            ),
+            "next_wake_at": _serialize_datetime(self.next_wake_at),
             "last_started_at": _serialize_datetime(self.last_started_at),
             "last_heartbeat_at": _serialize_datetime(self.last_heartbeat_at),
             "last_success_at": _serialize_datetime(self.last_success_at),
             "last_error": self.last_error,
             "last_cycle": _compact_cycle_payload(self.last_cycle),
         }
+
+
+@dataclass(frozen=True)
+class PeriodicLoopSchedule:
+    delay_seconds: float
+    cadence_mode: str
+    next_wake_at: datetime
+    next_market_active_at: datetime | None = None
 
 
 @dataclass
@@ -337,6 +375,11 @@ class AutonomousRuntimeCoordinator:
     )
     _monitoring_symbol_cursor: int = field(default=0, init=False)
     _price_source_closed: bool = field(default=False, init=False)
+    _krx_trading_days: dict[date, bool] = field(default_factory=dict, init=False)
+    _krx_calendar_sources: dict[date, str] = field(default_factory=dict, init=False)
+    _krx_calendar_attempts: dict[date, datetime] = field(default_factory=dict, init=False)
+    _krx_calendar_last_checked_at: datetime | None = field(default=None, init=False)
+    _krx_calendar_last_error: str | None = field(default=None, init=False)
 
     def __post_init__(self) -> None:
         self._cycle_session_factory = CommitGuardedSessionFactory(  # type: ignore[assignment]
@@ -498,6 +541,7 @@ class AutonomousRuntimeCoordinator:
         )
 
     def snapshot(self) -> dict[str, object]:
+        krx_calendar = self._krx_calendar_snapshot()
         with self._lock:
             return {
                 "enabled": self.settings.autonomous_runtime_enabled,
@@ -515,6 +559,7 @@ class AutonomousRuntimeCoordinator:
                 },
                 "watch_exec_agent_sizing": self._watch_exec_agent_sizing_state.snapshot(),
                 "nxt_eligible_sync": self._nxt_eligible_sync_state.snapshot(),
+                "krx_calendar": krx_calendar,
             }
 
     async def _run_periodic_loop(
@@ -528,10 +573,29 @@ class AutonomousRuntimeCoordinator:
         try:
             first_cycle = True
             while not self._stopping:
+                schedule: PeriodicLoopSchedule | None = None
                 if first_cycle and run_immediately:
                     first_cycle = False
                 else:
-                    await asyncio.sleep(interval_seconds)
+                    schedule_now = datetime.now(UTC)
+                    if first_cycle:
+                        schedule = PeriodicLoopSchedule(
+                            delay_seconds=float(interval_seconds),
+                            cadence_mode="startup",
+                            next_wake_at=schedule_now
+                            + timedelta(seconds=float(interval_seconds)),
+                        )
+                    else:
+                        schedule = self._periodic_loop_schedule(
+                            worker_key=worker_key,
+                            configured_interval_seconds=interval_seconds,
+                            now=schedule_now,
+                        )
+                    self._record_worker_schedule(
+                        worker_key=worker_key,
+                        schedule=schedule,
+                    )
+                    await asyncio.sleep(schedule.delay_seconds)
                     first_cycle = False
                 if self._stopping:
                     return
@@ -575,6 +639,61 @@ class AutonomousRuntimeCoordinator:
                     )
         except asyncio.CancelledError:
             return
+
+    def _periodic_loop_schedule(
+        self,
+        *,
+        worker_key: str,
+        configured_interval_seconds: float,
+        now: datetime,
+    ) -> PeriodicLoopSchedule:
+        delay_seconds = float(configured_interval_seconds)
+        cadence_mode = "configured"
+        next_market_active_at: datetime | None = None
+        if (
+            worker_key in {"dispatch", "monitoring"}
+            and _domestic_only_live_runtime(self.settings)
+        ):
+            next_market_active_at = _next_enabled_domestic_session_start(
+                settings=self.settings,
+                now=now,
+                trading_days=self._krx_trading_days_snapshot(),
+            )
+            if next_market_active_at is None:
+                cadence_mode = "market_active"
+            else:
+                cadence_mode = "domestic_market_closed"
+                seconds_until_active = max(
+                    (next_market_active_at - now.astimezone(UTC)).total_seconds(),
+                    0.001,
+                )
+                closed_market_interval = max(
+                    float(configured_interval_seconds),
+                    float(self.settings.domestic_closed_market_idle_interval_seconds),
+                )
+                delay_seconds = min(
+                    closed_market_interval,
+                    seconds_until_active,
+                )
+        next_wake_at = now.astimezone(UTC) + timedelta(seconds=delay_seconds)
+        return PeriodicLoopSchedule(
+            delay_seconds=delay_seconds,
+            cadence_mode=cadence_mode,
+            next_wake_at=next_wake_at,
+            next_market_active_at=next_market_active_at,
+        )
+
+    def _record_worker_schedule(
+        self,
+        *,
+        worker_key: str,
+        schedule: PeriodicLoopSchedule,
+    ) -> None:
+        with self._lock:
+            state = self._state_for(worker_key)
+            state.cadence_mode = schedule.cadence_mode
+            state.effective_poll_interval_seconds = schedule.delay_seconds
+            state.next_wake_at = schedule.next_wake_at
 
     async def _await_cycle_payload(
         self,
@@ -792,6 +911,30 @@ class AutonomousRuntimeCoordinator:
         )
 
     def _watch_exec_agent_sizing_cycle_sync(self, started_at: datetime) -> dict[str, object]:
+        if (
+            self.settings.exec_agent_watch_sizing_enabled
+            and self.settings.exec_agent_enabled
+            and not _inside_sizing_window(settings=self.settings, now=started_at)
+        ):
+            result = run_due_watch_exec_agent_sizing(
+                settings=self.settings,
+                session_factory=self._cycle_session_factory,
+                now=started_at,
+            )
+            payload = {
+                "status_code": result.status_code,
+                "trade_outcome_feedback": {
+                    "status": "skipped",
+                    "version": TRADE_OUTCOME_FEEDBACK_VERSION,
+                    "reason": "outside_sizing_window",
+                },
+                **result.payload,
+            }
+            self._store_cycle_payload(
+                worker_key="watch_exec_agent_sizing",
+                payload=payload,
+            )
+            return payload
         active_scope = _active_kis_position_scope(self.settings)
         if active_scope is None:
             feedback_status = {
@@ -1236,10 +1379,20 @@ class AutonomousRuntimeCoordinator:
     async def _run_daily_krx_position_discovery_loop(self) -> None:
         while not self._stopping:
             now = datetime.now(UTC)
+            if (
+                _domestic_only_live_runtime(self.settings)
+                and self._krx_calendar_refresh_due(now)
+            ):
+                await self._run_in_thread(
+                    self._refresh_current_krx_trading_day,
+                    now,
+                )
             if _is_regular_market_session(
                 now=now,
-                market_timezone=self.settings.market_timezone,
-            ) and (
+                market_timezone=str(KRX_TIMEZONE),
+            ) and self._krx_trading_days_snapshot().get(
+                now.astimezone(KRX_TIMEZONE).date()
+            ) is not False and (
                 self._monitoring_state.last_success_at is not None
                 and not self._broker_positions_reconciled_on_market_date(now)
             ):
@@ -1251,13 +1404,138 @@ class AutonomousRuntimeCoordinator:
                 return
             await asyncio.sleep(30)
 
+    def _krx_calendar_refresh_due(self, now: datetime) -> bool:
+        market_date = now.astimezone(KRX_TIMEZONE).date()
+        if market_date.weekday() >= 5:
+            return False
+        with self._lock:
+            if market_date in self._krx_trading_days:
+                return False
+            last_attempt = self._krx_calendar_attempts.get(market_date)
+        return bool(
+            last_attempt is None
+            or now.astimezone(UTC) - last_attempt >= KRX_CALENDAR_RETRY_INTERVAL
+        )
+
+    def _refresh_current_krx_trading_day(self, now: datetime) -> None:
+        checked_at = now.astimezone(UTC)
+        market_date = checked_at.astimezone(KRX_TIMEZONE).date()
+        if market_date.weekday() >= 5:
+            return
+        configured_holidays = _configured_krx_market_holidays(
+            self.settings.krx_market_holiday_dates
+        )
+        with self._lock:
+            self._krx_trading_days = {
+                cached_date: is_open
+                for cached_date, is_open in self._krx_trading_days.items()
+                if cached_date == market_date
+            }
+            self._krx_calendar_sources = {
+                cached_date: source
+                for cached_date, source in self._krx_calendar_sources.items()
+                if cached_date == market_date
+            }
+            self._krx_calendar_attempts = {
+                cached_date: attempted_at
+                for cached_date, attempted_at in self._krx_calendar_attempts.items()
+                if cached_date == market_date
+            }
+            if market_date in self._krx_trading_days:
+                return
+            last_attempt = self._krx_calendar_attempts.get(market_date)
+            if (
+                last_attempt is not None
+                and checked_at - last_attempt < KRX_CALENDAR_RETRY_INTERVAL
+            ):
+                return
+            self._krx_calendar_attempts[market_date] = checked_at
+        if market_date in configured_holidays:
+            with self._lock:
+                self._krx_trading_days[market_date] = False
+                self._krx_calendar_sources[market_date] = "configured_override"
+                self._krx_calendar_last_checked_at = checked_at
+                self._krx_calendar_last_error = None
+            return
+
+        try:
+            adapter = self._broker_adapter_for_cycle()
+            calendar_checker = getattr(adapter, "is_krx_trading_day", None)
+            if not callable(calendar_checker):
+                raise RuntimeError("broker adapter does not expose the KRX calendar")
+            with self._cycle_session_factory() as db:
+                broker_session = ensure_authenticated_broker_session(
+                    settings=self.settings,
+                    db=db,
+                    adapter=adapter,
+                    source="autonomous_runtime_krx_calendar",
+                    reason="resolve the domestic runtime cadence for today's KRX session",
+                )
+                is_open = calendar_checker(
+                    broker_session.access_token or "",
+                    market_date=market_date,
+                )
+            if not isinstance(is_open, bool):
+                raise RuntimeError("KIS KRX calendar returned an unknown session state")
+        except Exception as exc:
+            with self._lock:
+                self._krx_calendar_last_checked_at = checked_at
+                self._krx_calendar_last_error = str(exc)
+            LOGGER.warning(
+                "autonomous_runtime_krx_calendar_unavailable",
+                extra={"market_date": market_date.isoformat(), "error": str(exc)},
+            )
+            return
+
+        with self._lock:
+            self._krx_trading_days[market_date] = is_open
+            self._krx_calendar_sources[market_date] = "kis_chk_holiday"
+            self._krx_calendar_last_checked_at = checked_at
+            self._krx_calendar_last_error = None
+
+    def _krx_trading_days_snapshot(self) -> dict[date, bool]:
+        with self._lock:
+            return dict(self._krx_trading_days)
+
+    def _krx_calendar_snapshot(self) -> dict[str, object]:
+        market_date = datetime.now(UTC).astimezone(KRX_TIMEZONE).date()
+        with self._lock:
+            is_open = self._krx_trading_days.get(market_date)
+            source = self._krx_calendar_sources.get(market_date)
+            attempted_today = market_date in self._krx_calendar_attempts
+            last_checked_at = (
+                self._krx_calendar_last_checked_at if attempted_today else None
+            )
+            last_error = self._krx_calendar_last_error if attempted_today else None
+        if market_date.weekday() >= 5:
+            state = "closed"
+            source = "weekend"
+        elif market_date in _configured_krx_market_holidays(
+            self.settings.krx_market_holiday_dates
+        ):
+            state = "closed"
+            source = source or "configured_override"
+        elif is_open is True:
+            state = "open"
+        elif is_open is False:
+            state = "closed"
+        else:
+            state = "unknown"
+            source = source or "unknown"
+        return {
+            "market_date": market_date.isoformat(),
+            "state": state,
+            "source": source,
+            "last_checked_at": _serialize_datetime(last_checked_at),
+            "last_error": last_error,
+        }
+
     def _broker_positions_reconciled_on_market_date(self, now: datetime) -> bool:
         reconciled_at = self._monitoring_snapshot_last_reconciled_at
         if reconciled_at is None:
             return False
-        market_timezone = ZoneInfo(self.settings.market_timezone)
-        return reconciled_at.astimezone(market_timezone).date() == now.astimezone(
-            market_timezone
+        return reconciled_at.astimezone(KRX_TIMEZONE).date() == now.astimezone(
+            KRX_TIMEZONE
         ).date()
 
     def _refresh_monitoring_snapshot_filled_today(self, now: datetime) -> None:
@@ -2388,6 +2666,89 @@ def _parse_decimal(value: object) -> Decimal | None:
         return Decimal(str(value))
     except Exception:
         return None
+
+
+def _domestic_only_live_runtime(settings: Settings) -> bool:
+    return bool(
+        settings.runtime_mode == "live"
+        and settings.runtime_broker_provider == "kis"
+        and not settings.kis_us_trading_enabled
+    )
+
+
+def _next_enabled_domestic_session_start(
+    *,
+    settings: Settings,
+    now: datetime,
+    trading_days: dict[date, bool] | None = None,
+) -> datetime | None:
+    local_now = now.astimezone(KRX_TIMEZONE)
+    holidays = _configured_krx_market_holidays(settings.krx_market_holiday_dates)
+    authoritative_trading_days = trading_days or {}
+    if _is_enabled_domestic_session(
+        settings=settings,
+        local_now=local_now,
+        holidays=holidays,
+        trading_days=authoritative_trading_days,
+    ):
+        return None
+
+    for day_offset in range(8):
+        market_date = local_now.date() + timedelta(days=day_offset)
+        if (
+            market_date.weekday() >= 5
+            or market_date in holidays
+            or authoritative_trading_days.get(market_date) is False
+        ):
+            continue
+        for boundary in DOMESTIC_SESSION_BOUNDARIES:
+            candidate = datetime.combine(
+                market_date,
+                boundary,
+                tzinfo=KRX_TIMEZONE,
+            )
+            if candidate <= local_now:
+                continue
+            if domestic_session_has_enabled_route(
+                settings=settings,
+                session=domestic_market_session(candidate),
+            ):
+                return candidate.astimezone(UTC)
+    # The eight-day search always contains a weekday. If an operator marks
+    # every candidate as a configured holiday, keep the fast cadence rather
+    # than risk sleeping through an unknown reopening.
+    return None
+
+
+def _is_enabled_domestic_session(
+    *,
+    settings: Settings,
+    local_now: datetime,
+    holidays: set[date],
+    trading_days: dict[date, bool],
+) -> bool:
+    if (
+        local_now.weekday() >= 5
+        or local_now.date() in holidays
+        or trading_days.get(local_now.date()) is False
+    ):
+        return False
+    return domestic_session_has_enabled_route(
+        settings=settings,
+        session=domestic_market_session(local_now),
+    )
+
+
+def _configured_krx_market_holidays(raw_dates: str) -> set[date]:
+    holidays: set[date] = set()
+    for raw_date in str(raw_dates or "").replace(",", " ").split():
+        try:
+            holidays.add(date.fromisoformat(raw_date))
+        except ValueError:
+            # Invalid optional calendar hints fail open: the runtime keeps its
+            # normal cadence instead of assuming the market is closed.
+            continue
+    return holidays
 
 
 def _is_regular_market_session(*, now: datetime, market_timezone: str) -> bool:
