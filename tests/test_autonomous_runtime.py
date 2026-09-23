@@ -16,7 +16,7 @@ from app.api.schemas.execution import MonitoringPriceRequest
 from app.core.config import Settings
 from app.db.base import Base
 from app.db.session import create_db_engine, create_session_factory
-from app.models.runtime import ExecutionPlan, ExecutionPlanItem, ExecutionPosition
+from app.models.runtime import BrokerOrder, ExecutionPlan, ExecutionPlanItem, ExecutionPosition
 from app.services.autonomous_runtime import (
     AutonomousRuntimeCoordinator,
     CachedMonitoringItem,
@@ -2191,6 +2191,11 @@ def test_due_cached_max_holding_exit_reaches_db_backed_monitoring_cycle(
         ],
     )
     monkeypatch.setattr(
+        coordinator,
+        "_repair_post_entry_exit_monitors_for_cached_cycle",
+        lambda **kwargs: (0, 0),
+    )
+    monkeypatch.setattr(
         autonomous_runtime,
         "run_autonomous_monitoring_cycle",
         lambda **kwargs: (
@@ -2360,8 +2365,185 @@ def test_fresh_monitoring_workset_rotates_without_database_access(monkeypatch) -
     assert first["monitored_symbols"] == ["005930", "000660"]
     assert second["monitored_symbols"] == ["005930", "035420"]
     assert selected_batches == [["005930", "000660"], ["005930", "035420"]]
-    assert maintenance_calls == [["005930", "000660"]]
+    assert maintenance_calls == [["005930", "000660"], ["005930", "035420"]]
     assert coordinator._monitoring_runtime_snapshot is snapshot
+
+
+def test_cached_cycle_tightens_day_two_stop_on_price_crossing_inside_snapshot_ttl(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'cached-cycle-stop-tightening.db'}",
+        runtime_mode="paper",
+        monitoring_max_symbols_per_cycle=1,
+        exec_agent_max_account_snapshot_age_seconds=300,
+        exec_agent_max_holding_trading_sessions=5,
+        kis_account_number="12345678",
+        kis_account_product_code="01",
+        account_drawdown_recovery_scope_secret=(
+            "cached-cycle-stop-tightening-secret-32-bytes"
+        ),
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    identity = build_position_identity(
+        settings=settings,
+        provider="kis",
+        exchange="KRX",
+    )
+    risk_context, quantity_policy = bind_kis_account_route(
+        settings=settings,
+        provider=identity.provider,
+        risk_context={
+            "exchange": "KRX",
+            "target_price": "110.0000",
+            "stop_price": "80.0000",
+        },
+        quantity_policy={"kind": "shares", "quantity": 1},
+    )
+    started_at = datetime(2026, 9, 15, 0, 0, tzinfo=UTC)
+
+    try:
+        with session_factory() as session:
+            plan = ExecutionPlan(
+                id="cached-cycle-stop-tightening-plan",
+                external_plan_id="cached-cycle-stop-tightening-plan",
+                source="kai-trading-core",
+                market_date=date(2026, 9, 14),
+                mode=settings.runtime_mode,
+                status="accepted",
+                accepted_at=started_at - timedelta(days=1),
+                items=[
+                    ExecutionPlanItem(
+                        id="cached-cycle-stop-tightening-entry",
+                        plan_item_index=0,
+                        symbol="005930",
+                        side="buy",
+                        intent="intraday_watch_buy",
+                        status="broker_order_submitted",
+                        quantity_policy=quantity_policy,
+                        trigger_price=Decimal("100.0000"),
+                        limit_price=Decimal("100.0000"),
+                        time_in_force="day",
+                        risk_context=risk_context,
+                        source_plan_item_id="cached-cycle-stop-tightening-entry",
+                        source_market_date=date(2026, 9, 14),
+                        provider=identity.provider,
+                        venue="KRX",
+                        asset_class="stock",
+                    )
+                ],
+            )
+            session.add(plan)
+            session.add(
+                ExecutionPosition(
+                    mode=settings.runtime_mode,
+                    provider=identity.provider,
+                    account_scope=identity.account_scope,
+                    exchange=identity.exchange,
+                    symbol="005930",
+                    quantity=1,
+                    average_price=Decimal("100.0000"),
+                    updated_from="reconciliation",
+                )
+            )
+            session.add(
+                BrokerOrder(
+                    execution_plan_item_id="cached-cycle-stop-tightening-entry",
+                    broker_name=identity.provider,
+                    mode=settings.runtime_mode,
+                    idempotency_key="cached-cycle-stop-tightening-entry-order",
+                    broker_order_id="cached-cycle-stop-tightening-entry-order",
+                    symbol="005930",
+                    side="buy",
+                    status="filled",
+                    quantity=1,
+                    venue="KRX",
+                    asset_class="stock",
+                    limit_price=Decimal("100.0000"),
+                    submitted_at=started_at - timedelta(days=1),
+                    request_metadata={
+                        "exchange": "KRX",
+                        "execution_scope": {
+                            "policy_version": 1,
+                            "provider": identity.provider,
+                            "account_scope": identity.account_scope,
+                            "venue": "KRX",
+                            "asset_class": "stock",
+                            "exchange": identity.exchange,
+                        },
+                    },
+                )
+            )
+            session.commit()
+
+        coordinator = AutonomousRuntimeCoordinator(
+            settings=settings,
+            session_factory=session_factory,
+            broker_adapter_factory=lambda settings: None,  # type: ignore[arg-type,return-value]
+        )
+        snapshot = MonitoringRuntimeSnapshot(
+            loaded_at=started_at,
+            symbols=["005930"],
+            positions_by_symbol={
+                "005930": CachedMonitoringPosition(
+                    symbol="005930",
+                    quantity=1,
+                    provider=identity.provider,
+                    exchange=identity.exchange,
+                )
+            },
+            items=[],
+            filled_today_symbols=[],
+            execution_scope={
+                "policy_version": 1,
+                "provider": identity.provider,
+                "account_scope": identity.account_scope,
+            },
+        )
+        coordinator._monitoring_runtime_snapshot = snapshot
+        observed_prices = iter(
+            [
+                [MonitoringPriceRequest(symbol="005930", price=Decimal("101.0000"))],
+                [MonitoringPriceRequest(symbol="005930", price=Decimal("100.0000"))],
+            ]
+        )
+
+        monkeypatch.setattr(
+            coordinator,
+            "_reconcile_monitoring_orders_if_due",
+            lambda **kwargs: False,
+        )
+        monkeypatch.setattr(
+            coordinator,
+            "_load_monitoring_prices",
+            lambda **kwargs: next(observed_prices),
+        )
+        monkeypatch.setattr(
+            coordinator,
+            "_refresh_monitoring_runtime_snapshot",
+            lambda **kwargs: snapshot,
+        )
+
+        first = coordinator._monitoring_cycle_sync(started_at)
+        second = coordinator._monitoring_cycle_sync(started_at + timedelta(seconds=1))
+
+        assert first["post_entry_maintenance_count"] >= 1
+        assert second["post_entry_maintenance_count"] >= 1
+        with session_factory() as session:
+            stop_item = session.query(ExecutionPlanItem).filter_by(
+                symbol="005930",
+                side="sell",
+                intent="stop_sell",
+            ).one()
+            assert stop_item.trigger_price == Decimal("99.0000")
+            assert stop_item.risk_context["post_entry_review"]["reasons"] == [
+                "next_day_no_progress"
+            ]
+    finally:
+        engine.dispose()
 
 
 def test_monitoring_snapshot_refreshes_once_when_cache_ttl_expires(monkeypatch) -> None:

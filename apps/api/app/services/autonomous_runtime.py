@@ -1166,9 +1166,7 @@ class AutonomousRuntimeCoordinator:
         )
         post_entry_maintenance_count = 0
         post_entry_review_count = 0
-        if (prices or durably_unquoteable_symbols) and self._monitoring_maintenance_due(
-            workset_snapshot
-        ):
+        if prices or durably_unquoteable_symbols:
             (
                 post_entry_maintenance_count,
                 post_entry_review_count,
