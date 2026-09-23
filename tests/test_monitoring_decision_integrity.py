@@ -20,6 +20,7 @@ from app.services.autonomous_runtime import (
     AutonomousRuntimeCoordinator,
     CachedMonitoringItem,
     CachedMonitoringPosition,
+    MonitoringRuntimeSnapshot,
 )
 from app.services.execution_account_route import bind_kis_account_route
 from app.services.exec_agent_approval import delegated_buy_gate_rejections
@@ -4779,7 +4780,9 @@ def test_sqlite_fast_path_returns_every_watch_symbol_for_downstream_round_robin(
         engine.dispose()
 
 
-def test_monitoring_cycle_applies_core_priority_before_round_robin(monkeypatch) -> None:
+def test_monitoring_cycle_preserves_cached_core_priority_before_round_robin(
+    monkeypatch,
+) -> None:
     settings = Settings(
         database_url="sqlite:///:memory:",
         runtime_mode="paper",
@@ -4791,23 +4794,19 @@ def test_monitoring_cycle_applies_core_priority_before_round_robin(monkeypatch) 
         session_factory=None,  # type: ignore[arg-type]
         broker_adapter_factory=lambda settings: None,  # type: ignore[arg-type,return-value]
     )
+    coordinator._monitoring_runtime_snapshot = MonitoringRuntimeSnapshot(
+        loaded_at=datetime(2026, 9, 8, 1, tzinfo=UTC),
+        symbols=["999999", "000001", "000002"],
+        positions_by_symbol={},
+        items=[],
+        filled_today_symbols=[],
+    )
     requested_symbols: list[str] = []
-    monkeypatch.setattr(
-        "app.services.autonomous_runtime._load_core_desired_monitoring_symbols",
-        lambda settings: ["999999"],
-    )
-    monkeypatch.setattr(
-        coordinator,
-        "_load_local_desired_monitoring_symbols",
-        lambda: ["000001", "999999", "000002"],
-    )
-    monkeypatch.setattr(coordinator, "_load_local_position_symbols", lambda: [])
     monkeypatch.setattr(
         coordinator,
         "_load_monitoring_prices",
         lambda **kwargs: requested_symbols.extend(kwargs["symbols"]) or [],
     )
-    monkeypatch.setattr(coordinator, "_refresh_monitoring_snapshot_filled_today", lambda now: None)
 
     payload = coordinator._monitoring_cycle_sync(datetime(2026, 9, 8, 1, tzinfo=UTC))
 

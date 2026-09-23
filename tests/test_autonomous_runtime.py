@@ -4,6 +4,7 @@ import subprocess
 import sys
 import threading
 import time
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
@@ -377,6 +378,13 @@ def test_monitoring_cycle_does_not_mix_core_universe_into_active_local_work(
         settings=settings,
         session_factory=None,  # type: ignore[arg-type]
         broker_adapter_factory=lambda settings: None,  # type: ignore[arg-type,return-value]
+    )
+    coordinator._monitoring_runtime_snapshot = MonitoringRuntimeSnapshot(
+        loaded_at=datetime(2026, 8, 26, 1, 0, tzinfo=UTC),
+        symbols=["005930", "AAPL"],
+        positions_by_symbol={},
+        items=[],
+        filled_today_symbols=[],
     )
     requested: list[str] = []
     monkeypatch.setattr(
@@ -1679,6 +1687,7 @@ def test_cached_cycle_repairs_held_position_monitors_with_desired_symbols(monkey
         items=[],
         filled_today_symbols=[],
     )
+    coordinator._monitoring_runtime_snapshot = snapshot
     prices = [MonitoringPriceRequest(symbol="005930", price=Decimal("70000"))]
     maintenance_calls: list[str] = []
 
@@ -1814,6 +1823,7 @@ def test_cached_cycle_removes_reviewed_position_from_reported_monitoring_set(
         items=[],
         filled_today_symbols=[],
     )
+    coordinator._monitoring_runtime_snapshot = initial_snapshot
 
     monkeypatch.setattr(
         "app.services.autonomous_runtime._load_core_desired_monitoring_symbols",
@@ -1900,6 +1910,7 @@ def test_cached_cycle_returns_review_transition_when_every_symbol_is_removed(
         items=[],
         filled_today_symbols=[],
     )
+    coordinator._monitoring_runtime_snapshot = initial_snapshot
     monkeypatch.setattr(
         "app.services.autonomous_runtime._load_core_desired_monitoring_symbols",
         lambda settings: [],
@@ -1985,7 +1996,6 @@ def test_cached_evaluation_skips_monitoring_disabled_held_position() -> None:
         ],
         filled_today_symbols=[],
     )
-
     payload = coordinator._evaluate_cached_monitoring_cycle(
         runtime_snapshot=snapshot,
         prices=[MonitoringPriceRequest(symbol="OLDCO", price=Decimal("5"))],
@@ -2071,6 +2081,142 @@ def test_cached_monitoring_prefilter_uses_executable_quotes_and_watch_direction(
     assert payload["triggered_sell_symbols"] == ["333333"]
 
 
+def test_cached_max_holding_exit_triggers_only_on_close_exit_date() -> None:
+    settings = Settings(database_url="sqlite:///:memory:", runtime_mode="paper")
+    coordinator = AutonomousRuntimeCoordinator(
+        settings=settings,
+        session_factory=None,  # type: ignore[arg-type]
+        broker_adapter_factory=lambda settings: None,  # type: ignore[arg-type,return-value]
+    )
+    close_exit_date = date(2026, 9, 24)
+    snapshot = MonitoringRuntimeSnapshot(
+        loaded_at=datetime(2026, 9, 23, 1, 0, tzinfo=UTC),
+        symbols=["005930"],
+        positions_by_symbol={
+            "005930": CachedMonitoringPosition(
+                symbol="005930",
+                quantity=1,
+                provider="kis",
+                exchange="KRX",
+            )
+        },
+        items=[
+            CachedMonitoringItem(
+                id="max-holding-exit",
+                symbol="005930",
+                intent="max_holding_close_sell",
+                status="max_holding_close_sell_monitoring",
+                trigger_price=None,
+                close_exit_date=close_exit_date,
+                provider="kis",
+                exchange="KRX",
+            )
+        ],
+        filled_today_symbols=[],
+    )
+
+    before_due = coordinator._evaluate_cached_monitoring_cycle(
+        runtime_snapshot=snapshot,
+        prices=[MonitoringPriceRequest(symbol="005930", price=Decimal("70000"))],
+        started_at=datetime(2026, 9, 23, 23, 59, tzinfo=UTC),
+    )
+    due = coordinator._evaluate_cached_monitoring_cycle(
+        runtime_snapshot=snapshot,
+        prices=[MonitoringPriceRequest(symbol="005930", price=Decimal("70000"))],
+        started_at=datetime(2026, 9, 24, 0, 0, tzinfo=UTC),
+    )
+
+    assert before_due["triggered_item_count"] == 0
+    assert before_due["triggered_sell_symbols"] == []
+    assert due["triggered_item_count"] == 1
+    assert due["triggered_sell_symbols"] == ["005930"]
+
+
+def test_due_cached_max_holding_exit_reaches_db_backed_monitoring_cycle(
+    monkeypatch,
+) -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        monitoring_max_broker_actions_per_cycle=1,
+    )
+    coordinator = AutonomousRuntimeCoordinator(
+        settings=settings,
+        session_factory=None,  # type: ignore[arg-type]
+        broker_adapter_factory=lambda settings: object(),
+    )
+    started_at = datetime(2026, 9, 24, 1, 0, tzinfo=UTC)
+    snapshot = MonitoringRuntimeSnapshot(
+        loaded_at=started_at,
+        symbols=["005930"],
+        positions_by_symbol={
+            "005930": CachedMonitoringPosition(
+                symbol="005930",
+                quantity=1,
+                provider="kis",
+                exchange="KRX",
+            )
+        },
+        items=[
+            CachedMonitoringItem(
+                id="due-max-holding-exit",
+                symbol="005930",
+                intent="max_holding_close_sell",
+                status="max_holding_close_sell_monitoring",
+                trigger_price=None,
+                close_exit_date=started_at.date(),
+                provider="kis",
+                exchange="KRX",
+            )
+        ],
+        filled_today_symbols=[],
+    )
+    coordinator._monitoring_runtime_snapshot = snapshot
+    coordinator._monitoring_maintenance_snapshot_loaded_at = snapshot.loaded_at
+    db_calls: list[list[str]] = []
+
+    class DummySessionContext:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, exc_type, exc, traceback) -> None:
+            del exc_type, exc, traceback
+
+    coordinator._cycle_session_factory = lambda: DummySessionContext()  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        coordinator,
+        "_load_monitoring_prices",
+        lambda **kwargs: [
+            MonitoringPriceRequest(symbol="005930", price=Decimal("70000"))
+        ],
+    )
+    monkeypatch.setattr(
+        autonomous_runtime,
+        "run_autonomous_monitoring_cycle",
+        lambda **kwargs: (
+            db_calls.append(list(kwargs["symbols"]))
+            or SimpleNamespace(
+                status_code=200,
+                payload={
+                    "triggered_item_count": 1,
+                    "submitted_order_count": 0,
+                    "items": [],
+                },
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        coordinator,
+        "_refresh_monitoring_runtime_snapshot",
+        lambda **kwargs: snapshot,
+    )
+
+    payload = coordinator._monitoring_cycle_sync(started_at)
+
+    assert db_calls == [["005930"]]
+    assert payload["broker_action_symbols"] == ["005930"]
+
+
 def test_live_cycle_monitors_local_holdings_without_waiting_for_broker_discovery(
     monkeypatch,
 ) -> None:
@@ -2090,6 +2236,7 @@ def test_live_cycle_monitors_local_holdings_without_waiting_for_broker_discovery
         items=[],
         filled_today_symbols=[],
     )
+    coordinator._monitoring_runtime_snapshot = snapshot
 
     def load_local_symbols() -> list[str]:
         return ["005930"]
@@ -2126,6 +2273,466 @@ def test_live_cycle_monitors_local_holdings_without_waiting_for_broker_discovery
 
     assert payload["monitored_symbols"] == ["005930"]
     assert payload["runtime_snapshot"]["position_count"] == 1
+
+
+def test_fresh_monitoring_workset_rotates_without_database_access(monkeypatch) -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="live",
+        monitoring_max_symbols_per_cycle=1,
+        exec_agent_max_account_snapshot_age_seconds=300,
+    )
+    coordinator = AutonomousRuntimeCoordinator(
+        settings=settings,
+        session_factory=None,  # type: ignore[arg-type]
+        broker_adapter_factory=lambda settings: None,  # type: ignore[arg-type,return-value]
+    )
+    started_at = datetime(2026, 9, 23, 1, 0, tzinfo=UTC)
+    snapshot = MonitoringRuntimeSnapshot(
+        loaded_at=started_at,
+        symbols=["005930", "000660", "035420"],
+        positions_by_symbol={
+            "005930": CachedMonitoringPosition(
+                symbol="005930",
+                quantity=1,
+                provider="kis",
+                exchange="KRX",
+            )
+        },
+        items=[],
+        filled_today_symbols=[],
+    )
+    coordinator._monitoring_runtime_snapshot = snapshot
+    coordinator._monitoring_snapshot_last_reconciled_at = started_at
+    coordinator._monitoring_order_reconcile_last_at = started_at
+    selected_batches: list[list[str]] = []
+    maintenance_calls: list[list[str]] = []
+
+    monkeypatch.setattr(
+        "app.services.autonomous_runtime._load_core_desired_monitoring_symbols",
+        lambda settings: (_ for _ in ()).throw(
+            AssertionError("fresh workset must not call Core")
+        ),
+    )
+    monkeypatch.setattr(
+        coordinator,
+        "_load_local_desired_monitoring_symbols",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("fresh workset must not query local desired symbols")
+        ),
+    )
+    monkeypatch.setattr(
+        coordinator,
+        "_load_local_position_symbols",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("fresh workset must not query local positions")
+        ),
+    )
+    monkeypatch.setattr(
+        coordinator,
+        "_load_monitoring_runtime_snapshot_for_symbols",
+        lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("fresh workset must not reload plan items")
+        ),
+    )
+
+    def load_prices(*, symbols: list[str], observed_at: datetime) -> list[MonitoringPriceRequest]:
+        del observed_at
+        selected_batches.append(list(symbols))
+        return [
+            MonitoringPriceRequest(symbol=symbol, price=Decimal("70000"))
+            for symbol in symbols
+        ]
+
+    monkeypatch.setattr(coordinator, "_load_monitoring_prices", load_prices)
+    monkeypatch.setattr(
+        coordinator,
+        "_repair_post_entry_exit_monitors_for_cached_cycle",
+        lambda **kwargs: (
+            maintenance_calls.append(list(kwargs["runtime_snapshot"].symbols))
+            or (0, 0)
+        ),
+    )
+
+    first = coordinator._monitoring_cycle_sync(started_at)
+    second = coordinator._monitoring_cycle_sync(started_at + timedelta(seconds=1))
+
+    assert first["monitored_symbols"] == ["005930", "000660"]
+    assert second["monitored_symbols"] == ["005930", "035420"]
+    assert selected_batches == [["005930", "000660"], ["005930", "035420"]]
+    assert maintenance_calls == [["005930", "000660"]]
+    assert coordinator._monitoring_runtime_snapshot is snapshot
+
+
+def test_monitoring_snapshot_refreshes_once_when_cache_ttl_expires(monkeypatch) -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        exec_agent_max_account_snapshot_age_seconds=300,
+    )
+    coordinator = AutonomousRuntimeCoordinator(
+        settings=settings,
+        session_factory=None,  # type: ignore[arg-type]
+        broker_adapter_factory=lambda settings: None,  # type: ignore[arg-type,return-value]
+    )
+    loaded_at = datetime(2026, 9, 23, 1, 0, tzinfo=UTC)
+    initial = MonitoringRuntimeSnapshot(
+        loaded_at=loaded_at,
+        symbols=["005930"],
+        positions_by_symbol={},
+        items=[],
+        filled_today_symbols=[],
+    )
+    coordinator._monitoring_runtime_snapshot = initial
+    refreshes: list[tuple[datetime, str]] = []
+
+    def refresh(*, loaded_at: datetime, reason: str, reconcile_broker: bool):
+        assert reconcile_broker is False
+        refreshes.append((loaded_at, reason))
+        refreshed = replace(initial, loaded_at=loaded_at, symbols=["000660"])
+        coordinator._monitoring_runtime_snapshot = refreshed
+        return refreshed
+
+    monkeypatch.setattr(coordinator, "_refresh_monitoring_runtime_snapshot", refresh)
+
+    assert coordinator._ensure_monitoring_runtime_snapshot(
+        loaded_at + timedelta(seconds=299)
+    ) is initial
+    refreshed = coordinator._ensure_monitoring_runtime_snapshot(
+        loaded_at + timedelta(seconds=300)
+    )
+    reused = coordinator._ensure_monitoring_runtime_snapshot(
+        loaded_at + timedelta(seconds=301)
+    )
+
+    assert refreshed.symbols == ["000660"]
+    assert reused is refreshed
+    assert refreshes == [
+        (
+            loaded_at + timedelta(seconds=300),
+            "monitoring_snapshot_ttl_expired",
+        )
+    ]
+
+
+def test_monitoring_snapshot_invalidation_forces_one_reload_inside_ttl(monkeypatch) -> None:
+    settings = Settings(database_url="sqlite:///:memory:", runtime_mode="paper")
+    coordinator = AutonomousRuntimeCoordinator(
+        settings=settings,
+        session_factory=None,  # type: ignore[arg-type]
+        broker_adapter_factory=lambda settings: None,  # type: ignore[arg-type,return-value]
+    )
+    loaded_at = datetime(2026, 9, 23, 1, 0, tzinfo=UTC)
+    coordinator._monitoring_runtime_snapshot = MonitoringRuntimeSnapshot(
+        loaded_at=loaded_at,
+        symbols=["005930"],
+        positions_by_symbol={},
+        items=[],
+        filled_today_symbols=[],
+    )
+    refresh_count = 0
+
+    def refresh(*, loaded_at: datetime, reason: str, reconcile_broker: bool):
+        nonlocal refresh_count
+        assert reason == "monitoring_snapshot_missing"
+        assert reconcile_broker is False
+        refresh_count += 1
+        refreshed = MonitoringRuntimeSnapshot(
+            loaded_at=loaded_at,
+            symbols=["005930", "000660"],
+            positions_by_symbol={},
+            items=[],
+            filled_today_symbols=[],
+        )
+        coordinator._monitoring_runtime_snapshot = refreshed
+        return refreshed
+
+    monkeypatch.setattr(coordinator, "_refresh_monitoring_runtime_snapshot", refresh)
+
+    coordinator.invalidate_monitoring_runtime_snapshot(reason="test_plan_change")
+    first = coordinator._ensure_monitoring_runtime_snapshot(
+        loaded_at + timedelta(seconds=1)
+    )
+    second = coordinator._ensure_monitoring_runtime_snapshot(
+        loaded_at + timedelta(seconds=2)
+    )
+
+    assert first.symbols == ["005930", "000660"]
+    assert second is first
+    assert refresh_count == 1
+
+
+def test_monitoring_snapshot_refreshes_publish_in_db_observation_order(
+    monkeypatch,
+) -> None:
+    settings = Settings(database_url="sqlite:///:memory:", runtime_mode="paper")
+    coordinator = AutonomousRuntimeCoordinator(
+        settings=settings,
+        session_factory=None,  # type: ignore[arg-type]
+        broker_adapter_factory=lambda settings: None,  # type: ignore[arg-type,return-value]
+    )
+    first_load_entered = threading.Event()
+    release_first_load = threading.Event()
+    state_lock = threading.Lock()
+    database_version = 0
+    load_count = 0
+    errors: list[Exception] = []
+
+    def load_snapshot(loaded_at: datetime) -> MonitoringRuntimeSnapshot:
+        nonlocal load_count
+        with state_lock:
+            observed_version = database_version
+            load_count += 1
+            current_load = load_count
+        if current_load == 1:
+            first_load_entered.set()
+            assert release_first_load.wait(timeout=2)
+        return MonitoringRuntimeSnapshot(
+            loaded_at=loaded_at,
+            symbols=[f"version-{observed_version}"],
+            positions_by_symbol={},
+            items=[],
+            filled_today_symbols=[],
+        )
+
+    monkeypatch.setattr(
+        coordinator,
+        "_load_monitoring_runtime_snapshot",
+        load_snapshot,
+    )
+
+    def refresh(loaded_at: datetime) -> None:
+        try:
+            coordinator._refresh_monitoring_runtime_snapshot(
+                loaded_at=loaded_at,
+                reason="concurrent_refresh_test",
+                reconcile_broker=False,
+            )
+        except Exception as exc:
+            errors.append(exc)
+
+    later_cycle = datetime(2026, 9, 23, 1, 1, tzinfo=UTC)
+    earlier_cycle = later_cycle - timedelta(minutes=1)
+    stale_refresh = threading.Thread(target=refresh, args=(later_cycle,))
+    fresh_refresh = threading.Thread(target=refresh, args=(earlier_cycle,))
+
+    stale_refresh.start()
+    assert first_load_entered.wait(timeout=2)
+    with state_lock:
+        database_version = 1
+    fresh_refresh.start()
+    release_first_load.set()
+    stale_refresh.join(timeout=2)
+    fresh_refresh.join(timeout=2)
+
+    assert not stale_refresh.is_alive()
+    assert not fresh_refresh.is_alive()
+    assert errors == []
+    assert load_count == 2
+    assert coordinator._monitoring_runtime_snapshot is not None
+    assert coordinator._monitoring_runtime_snapshot.symbols == ["version-1"]
+
+
+def test_dispatch_skips_database_until_idle_rescan_deadline(monkeypatch) -> None:
+    settings = Settings(database_url="sqlite:///:memory:", runtime_mode="paper")
+    coordinator = AutonomousRuntimeCoordinator(
+        settings=settings,
+        session_factory=None,  # type: ignore[arg-type]
+        broker_adapter_factory=lambda settings: object(),
+    )
+    started_at = datetime(2026, 9, 23, 1, 0, tzinfo=UTC)
+    session_open_count = 0
+
+    class DummySessionContext:
+        def __enter__(self):
+            nonlocal session_open_count
+            session_open_count += 1
+            return object()
+
+        def __exit__(self, exc_type, exc, traceback) -> None:
+            del exc_type, exc, traceback
+
+    coordinator._cycle_session_factory = lambda: DummySessionContext()  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        "app.services.autonomous_runtime.dispatch_due_execution_jobs",
+        lambda **kwargs: SimpleNamespace(
+            status_code=200,
+            payload={
+                "blocked": False,
+                "due_job_count": 0,
+                "completed_job_count": 0,
+                "retrying_job_count": 0,
+                "failed_job_count": 0,
+                "jobs": [],
+                "next_dispatch_at": None,
+            },
+        ),
+    )
+
+    first = coordinator._dispatch_cycle_sync(started_at)
+    cached = coordinator._dispatch_cycle_sync(started_at + timedelta(seconds=1))
+    rescanned = coordinator._dispatch_cycle_sync(started_at + timedelta(seconds=60))
+
+    assert first["due_job_count"] == 0
+    assert cached["db_scan_skipped"] is True
+    assert cached["due_job_count"] == 0
+    assert rescanned["due_job_count"] == 0
+    assert session_open_count == 2
+
+
+def test_dispatch_reopens_database_when_known_scheduled_job_becomes_due(
+    monkeypatch,
+) -> None:
+    settings = Settings(database_url="sqlite:///:memory:", runtime_mode="paper")
+    coordinator = AutonomousRuntimeCoordinator(
+        settings=settings,
+        session_factory=None,  # type: ignore[arg-type]
+        broker_adapter_factory=lambda settings: object(),
+    )
+    started_at = datetime(2026, 9, 23, 1, 0, tzinfo=UTC)
+    scheduled_for = started_at + timedelta(seconds=30)
+    session_open_count = 0
+
+    class DummySessionContext:
+        def __enter__(self):
+            nonlocal session_open_count
+            session_open_count += 1
+            return object()
+
+        def __exit__(self, exc_type, exc, traceback) -> None:
+            del exc_type, exc, traceback
+
+    coordinator._cycle_session_factory = lambda: DummySessionContext()  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        "app.services.autonomous_runtime.dispatch_due_execution_jobs",
+        lambda **kwargs: SimpleNamespace(
+            status_code=200,
+            payload={
+                "blocked": False,
+                "due_job_count": 0,
+                "completed_job_count": 0,
+                "retrying_job_count": 0,
+                "failed_job_count": 0,
+                "jobs": [],
+                "next_dispatch_at": scheduled_for.isoformat(),
+            },
+        ),
+    )
+
+    coordinator._dispatch_cycle_sync(started_at)
+    cached = coordinator._dispatch_cycle_sync(started_at + timedelta(seconds=29))
+    coordinator._dispatch_cycle_sync(scheduled_for)
+
+    assert cached["db_scan_skipped"] is True
+    assert cached["next_db_check_at"] == scheduled_for.isoformat()
+    assert session_open_count == 2
+
+
+def test_repeated_no_price_cycles_skip_database_after_first_checkpoint(
+    monkeypatch,
+) -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        exec_agent_max_account_snapshot_age_seconds=300,
+    )
+    coordinator = AutonomousRuntimeCoordinator(
+        settings=settings,
+        session_factory=None,  # type: ignore[arg-type]
+        broker_adapter_factory=lambda settings: object(),
+    )
+    started_at = datetime(2026, 9, 23, 1, 0, tzinfo=UTC)
+    coordinator._monitoring_runtime_snapshot = MonitoringRuntimeSnapshot(
+        loaded_at=started_at,
+        symbols=["005930"],
+        positions_by_symbol={},
+        items=[],
+        filled_today_symbols=[],
+    )
+    session_open_count = 0
+
+    class DummySessionContext:
+        def __enter__(self):
+            nonlocal session_open_count
+            session_open_count += 1
+            return object()
+
+        def __exit__(self, exc_type, exc, traceback) -> None:
+            del exc_type, exc, traceback
+
+    coordinator._cycle_session_factory = lambda: DummySessionContext()  # type: ignore[method-assign]
+    monkeypatch.setattr(coordinator, "_load_monitoring_prices", lambda **kwargs: [])
+    monkeypatch.setattr(
+        "app.services.autonomous_runtime.run_autonomous_monitoring_cycle",
+        lambda **kwargs: SimpleNamespace(
+            status_code=200,
+            payload={
+                "triggered_at": kwargs["now"].isoformat(),
+                "worker_name": "intraday_target_stop_monitor",
+                "evaluated_item_count": 0,
+                "triggered_item_count": 0,
+                "submitted_order_count": 0,
+                "blocked_item_count": 0,
+                "deferred_item_count": 0,
+                "evaluated_symbol_count": 0,
+                "triggered_symbol_count": 0,
+                "submitted_symbols": [],
+                "items": [],
+            },
+        ),
+    )
+
+    first = coordinator._monitoring_cycle_sync(started_at)
+    cached = coordinator._monitoring_cycle_sync(
+        started_at + timedelta(seconds=1)
+    )
+
+    assert first.get("db_scan_skipped") is not True
+    assert cached["db_scan_skipped"] is True
+    assert session_open_count == 1
+
+
+def test_dirty_dispatch_schedule_reloads_before_idle_rescan_deadline(monkeypatch) -> None:
+    settings = Settings(database_url="sqlite:///:memory:", runtime_mode="paper")
+    coordinator = AutonomousRuntimeCoordinator(
+        settings=settings,
+        session_factory=None,  # type: ignore[arg-type]
+        broker_adapter_factory=lambda settings: object(),
+    )
+    started_at = datetime(2026, 9, 23, 1, 0, tzinfo=UTC)
+    session_open_count = 0
+
+    class DummySessionContext:
+        def __enter__(self):
+            nonlocal session_open_count
+            session_open_count += 1
+            return object()
+
+        def __exit__(self, exc_type, exc, traceback) -> None:
+            del exc_type, exc, traceback
+
+    coordinator._cycle_session_factory = lambda: DummySessionContext()  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        "app.services.autonomous_runtime.dispatch_due_execution_jobs",
+        lambda **kwargs: SimpleNamespace(
+            status_code=200,
+            payload={
+                "blocked": False,
+                "due_job_count": 0,
+                "completed_job_count": 0,
+                "retrying_job_count": 0,
+                "failed_job_count": 0,
+                "jobs": [],
+                "next_dispatch_at": None,
+            },
+        ),
+    )
+
+    coordinator._dispatch_cycle_sync(started_at)
+    coordinator.invalidate_dispatch_schedule(reason="execution_plan_created")
+    coordinator._dispatch_cycle_sync(started_at + timedelta(seconds=1))
+
+    assert session_open_count == 2
 
 
 def test_non_broker_snapshot_refresh_does_not_suppress_future_position_reconciliation(
@@ -2365,6 +2972,34 @@ def test_live_snapshot_refresh_discovers_enabled_kis_us_holdings(monkeypatch) ->
 
     assert calls[0]["discover_krx_holdings"] is True
     assert calls[0]["discover_us_holdings"] is True
+    engine.dispose()
+
+
+def test_disabled_kis_us_monitoring_skips_us_plan_scan(monkeypatch) -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        kis_us_trading_enabled=False,
+        monitoring_expire_prior_market_watch_buys_enabled=False,
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    monkeypatch.setattr(
+        "app.services.monitoring._kis_us_plan_item_filter",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("US plan scan must be disabled with KIS US trading")
+        ),
+    )
+
+    with session_factory() as db:
+        assert list_autonomous_monitoring_symbols(
+            settings=settings,
+            db=db,
+            effective_at=datetime(2026, 9, 23, 1, 0, tzinfo=UTC),
+            include_kis_us_symbols=False,
+        ) == []
+
     engine.dispose()
 
 

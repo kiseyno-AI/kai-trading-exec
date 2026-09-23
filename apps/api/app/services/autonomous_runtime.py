@@ -89,6 +89,8 @@ DOMESTIC_SESSION_BOUNDARIES = (
     time(18, 0),
 )
 KRX_CALENDAR_RETRY_INTERVAL = timedelta(seconds=60)
+DISPATCH_IDLE_DB_RESCAN_INTERVAL = timedelta(seconds=60)
+MONITORING_NO_PRICE_DB_RESCAN_INTERVAL = timedelta(seconds=60)
 _CACHED_KIS_ROUTE_EXCHANGES = KRX_EXCHANGES | frozenset({"NASD", "NYSE", "AMEX"})
 _CycleResult = TypeVar("_CycleResult")
 
@@ -309,6 +311,7 @@ class CachedMonitoringItem:
     status: str
     trigger_price: Decimal | None
     trigger_direction: str | None = None
+    close_exit_date: date | None = None
     provider: str | None = None
     exchange: str | None = None
 
@@ -365,6 +368,15 @@ class AutonomousRuntimeCoordinator:
     _nxt_eligible_sync_state: AutonomousWorkerState = field(init=False)
     _monitoring_price_source_state: MonitoringPriceSourceState = field(init=False)
     _monitoring_runtime_snapshot: MonitoringRuntimeSnapshot | None = field(default=None, init=False)
+    _monitoring_snapshot_generation: int = field(default=0, init=False)
+    _monitoring_snapshot_refresh_mutex: threading.Lock = field(
+        default_factory=threading.Lock,
+        init=False,
+    )
+    _monitoring_maintenance_snapshot_loaded_at: datetime | None = field(
+        default=None,
+        init=False,
+    )
     _monitoring_snapshot_last_reconciled_at: datetime | None = field(default=None, init=False)
     _monitoring_order_reconcile_last_at: datetime | None = field(default=None, init=False)
     _monitoring_cycle_mutex: threading.Lock = field(default_factory=threading.Lock, init=False)
@@ -374,6 +386,12 @@ class AutonomousRuntimeCoordinator:
         init=False,
     )
     _monitoring_symbol_cursor: int = field(default=0, init=False)
+    _monitoring_next_no_price_db_check_at: datetime | None = field(
+        default=None,
+        init=False,
+    )
+    _dispatch_next_db_check_at: datetime | None = field(default=None, init=False)
+    _dispatch_schedule_generation: int = field(default=0, init=False)
     _price_source_closed: bool = field(default=False, init=False)
     _krx_trading_days: dict[date, bool] = field(default_factory=dict, init=False)
     _krx_calendar_sources: dict[date, str] = field(default_factory=dict, init=False)
@@ -759,6 +777,40 @@ class AutonomousRuntimeCoordinator:
         return await self._run_in_thread(self._dispatch_cycle_sync, started_at)
 
     def _dispatch_cycle_sync(self, started_at: datetime) -> dict[str, object]:
+        with self._lock:
+            next_db_check_at = self._dispatch_next_db_check_at
+            schedule_generation = self._dispatch_schedule_generation
+            previous_payload = self._dispatch_state.last_cycle
+        if next_db_check_at is not None and started_at < next_db_check_at:
+            payload = {
+                "status_code": 200,
+                "blocked": bool(
+                    previous_payload.get("blocked")
+                    if isinstance(previous_payload, dict)
+                    else False
+                ),
+                "block_reason": (
+                    previous_payload.get("block_reason")
+                    if isinstance(previous_payload, dict)
+                    else None
+                ),
+                "triggered_at": started_at.isoformat(),
+                "due_job_count": 0,
+                "completed_job_count": 0,
+                "retrying_job_count": 0,
+                "failed_job_count": 0,
+                "jobs": [],
+                "safety": (
+                    previous_payload.get("safety")
+                    if isinstance(previous_payload, dict)
+                    else None
+                ),
+                "db_scan_skipped": True,
+                "next_db_check_at": next_db_check_at.isoformat(),
+            }
+            self._store_cycle_payload(worker_key="dispatch", payload=payload)
+            return payload
+
         with self._cycle_session_factory() as db:
             adapter = self._broker_adapter_for_cycle()
             result = dispatch_due_execution_jobs(
@@ -771,14 +823,34 @@ class AutonomousRuntimeCoordinator:
                 "status_code": result.status_code,
                 **result.payload,
             }
-            if _dispatch_payload_changed_runtime_state(payload):
-                self._refresh_monitoring_runtime_snapshot(
-                    loaded_at=started_at,
-                    reason="dispatch_cycle_changed_runtime_state",
-                    reconcile_broker=False,
-                )
-            self._store_cycle_payload(worker_key="dispatch", payload=payload)
-            return payload
+        next_dispatch_at = _payload_datetime(payload.get("next_dispatch_at"))
+        fallback_check_at = started_at + DISPATCH_IDLE_DB_RESCAN_INTERVAL
+        next_check_at = (
+            min(next_dispatch_at, fallback_check_at)
+            if next_dispatch_at is not None
+            else fallback_check_at
+        )
+        with self._lock:
+            if self._dispatch_schedule_generation == schedule_generation:
+                self._dispatch_next_db_check_at = next_check_at
+        payload["next_db_check_at"] = next_check_at.isoformat()
+        if _dispatch_payload_changed_runtime_state(payload):
+            self._refresh_monitoring_runtime_snapshot(
+                loaded_at=started_at,
+                reason="dispatch_cycle_changed_runtime_state",
+                reconcile_broker=False,
+            )
+        self._store_cycle_payload(worker_key="dispatch", payload=payload)
+        return payload
+
+    def invalidate_dispatch_schedule(self, *, reason: str) -> None:
+        with self._lock:
+            self._dispatch_schedule_generation += 1
+            self._dispatch_next_db_check_at = None
+        LOGGER.info(
+            "dispatch_schedule_invalidated",
+            extra={"reason": reason, "runtime_mode": self.settings.runtime_mode},
+        )
 
     async def _run_monitoring_cycle(self, started_at: datetime) -> dict[str, object]:
         return await self._run_in_thread(self._monitoring_cycle_sync_guarded, started_at)
@@ -965,6 +1037,15 @@ class AutonomousRuntimeCoordinator:
             "trade_outcome_feedback": feedback_status,
             **result.payload,
         }
+        if int(payload.get("approved") or 0) > 0 or int(
+            payload.get("rejected") or 0
+        ) > 0:
+            self.invalidate_monitoring_runtime_snapshot(
+                reason="watch_exec_agent_sizing_changed_plan_items"
+            )
+            self.invalidate_dispatch_schedule(
+                reason="watch_exec_agent_sizing_changed_plan_items"
+            )
         self._store_cycle_payload(worker_key="watch_exec_agent_sizing", payload=payload)
         return payload
 
@@ -977,131 +1058,102 @@ class AutonomousRuntimeCoordinator:
         if self.settings.runtime_mode == "live" and self.session_factory is not None:
             if not self._reconcile_and_refresh_monitoring_snapshot_if_due(started_at):
                 raise RuntimeError("live broker position reconciliation failed")
-        core_desired_symbols = _load_core_desired_monitoring_symbols(settings=self.settings)
-        local_desired_symbols = self._load_local_desired_monitoring_symbols()
-        if local_desired_symbols:
-            local_symbol_set = set(local_desired_symbols)
-            desired_symbols = _merge_symbol_priority(
-                [symbol for symbol in core_desired_symbols if symbol in local_symbol_set],
-                local_desired_symbols,
-            )
-        else:
-            desired_symbols = [symbol for symbol in core_desired_symbols if _is_krx_symbol(symbol)]
-        if desired_symbols:
-            desired_symbol_set = set(desired_symbols)
-            position_symbols = {
-                symbol
-                for symbol in self._load_local_position_symbols()
-                if symbol in desired_symbol_set
-            }
+        workset_snapshot = self._ensure_monitoring_runtime_snapshot(started_at)
+        desired_symbols = list(workset_snapshot.symbols)
+        position_symbols = set(workset_snapshot.positions_by_symbol)
+        symbols, self._monitoring_symbol_cursor = _select_monitoring_symbol_batch(
+            desired_symbols=desired_symbols,
+            priority_symbols=position_symbols,
+            batch_size=max(int(self.settings.monitoring_max_symbols_per_cycle or 0), 1),
+            cursor=self._monitoring_symbol_cursor,
+        )
+        if self.session_factory is not None and self._reconcile_monitoring_orders_if_due(
+            now=started_at,
+            symbols=set(symbols),
+        ):
+            workset_snapshot = self._ensure_monitoring_runtime_snapshot(started_at)
+            desired_symbols = list(workset_snapshot.symbols)
+            position_symbols = set(workset_snapshot.positions_by_symbol)
             symbols, self._monitoring_symbol_cursor = _select_monitoring_symbol_batch(
                 desired_symbols=desired_symbols,
                 priority_symbols=position_symbols,
-                batch_size=max(int(self.settings.monitoring_max_symbols_per_cycle or 0), 1),
+                batch_size=max(
+                    int(self.settings.monitoring_max_symbols_per_cycle or 0),
+                    1,
+                ),
                 cursor=self._monitoring_symbol_cursor,
             )
-            if self.session_factory is not None:
-                self._reconcile_monitoring_orders_if_due(
-                    now=started_at,
-                    symbols=set(symbols),
-                )
-            if self.settings.monitoring_max_broker_actions_per_cycle <= 0:
-                prices = self._load_monitoring_prices(
-                    symbols=symbols,
-                    observed_at=started_at,
-                )
-                runtime_snapshot = MonitoringRuntimeSnapshot(
-                    loaded_at=started_at,
-                    symbols=symbols,
-                    positions_by_symbol={},
-                    items=[],
-                    filled_today_symbols=[],
-                    execution_scope=_active_kis_execution_scope_payload(self.settings),
-                )
-                with self._lock:
-                    self._monitoring_runtime_snapshot = runtime_snapshot
-                self._refresh_monitoring_snapshot_filled_today(started_at)
-                runtime_snapshot = self._ensure_monitoring_runtime_snapshot(started_at)
-                payload = {
-                    "status_code": 200,
-                    "monitored_symbols": symbols,
-                    "price_count": len(prices),
-                    "price_source_configured": self._monitoring_price_source_state.configured,
-                    "price_source": self._monitoring_price_source_state.snapshot(),
-                    "runtime_snapshot": runtime_snapshot.snapshot(),
-                    "broker_actions_disabled": True,
-                    "triggered_at": started_at.isoformat(),
-                    "worker_name": MONITORING_LOOP_WORKER_NAME,
-                    "evaluated_item_count": 0,
-                    "triggered_item_count": 0,
-                    "submitted_order_count": 0,
-                    "blocked_item_count": 0,
-                    "deferred_item_count": 0,
-                    "evaluated_symbol_count": len(symbols),
-                    "triggered_symbol_count": 0,
-                    "submitted_symbols": [],
-                    "protective_stop_coverage": {
-                        "status": "disabled",
-                        "unprotected_position_count": 0,
-                        "position_truth_stale_count": 0,
-                        "repaired_stop_coverage_count": 0,
-                        "affected_symbols": [],
-                        "affected_symbols_count": 0,
-                        "affected_symbols_truncated": False,
-                        "missing_quantities": {},
-                        "issues": [],
-                        "issues_count": 0,
-                        "issues_truncated": False,
-                    },
-                    "profit_target_coverage": {
-                        "status": "disabled",
-                        "missing_target_coverage_count": 0,
-                        "affected_symbols": [],
-                        "affected_symbols_count": 0,
-                        "affected_symbols_truncated": False,
-                        "missing_quantities": {},
-                        "issues": [],
-                        "issues_count": 0,
-                        "issues_truncated": False,
-                    },
-                    "items": [],
-                    "core_desired_symbols_fast_path": True,
-                }
-                self._store_cycle_payload(worker_key="monitoring", payload=payload)
-                return payload
-            runtime_snapshot = self._load_monitoring_runtime_snapshot_for_symbols(
-                loaded_at=started_at,
-                symbols=symbols,
-            )
-            with self._lock:
-                self._monitoring_runtime_snapshot = runtime_snapshot
-            self._refresh_monitoring_snapshot_filled_today(started_at)
-            runtime_snapshot = self._ensure_monitoring_runtime_snapshot(started_at)
-        else:
-            runtime_snapshot = self._refresh_monitoring_runtime_snapshot(
-                loaded_at=started_at,
-                reason="monitoring_cycle_refresh",
-                reconcile_broker=False,
-            )
-        if not desired_symbols:
-            self._refresh_monitoring_snapshot_filled_today(started_at)
-            runtime_snapshot = self._ensure_monitoring_runtime_snapshot(started_at)
-        symbols = runtime_snapshot.symbols
         if not symbols:
-            return {
+            payload = {
                 "status_code": 200,
                 "monitored_symbols": [],
                 "price_count": 0,
                 "price_source_configured": self._monitoring_price_source_state.configured,
                 "price_source": self._monitoring_price_source_state.snapshot(),
-                "runtime_snapshot": runtime_snapshot.snapshot(),
+                "runtime_snapshot": workset_snapshot.snapshot(),
                 "idle": True,
             }
+            self._store_cycle_payload(worker_key="monitoring", payload=payload)
+            return payload
+
+        runtime_snapshot = _monitoring_snapshot_for_symbols(
+            workset_snapshot,
+            symbols=symbols,
+        )
 
         prices = self._load_monitoring_prices(
             symbols=symbols,
             observed_at=started_at,
         )
+        if self.settings.monitoring_max_broker_actions_per_cycle <= 0:
+            payload = {
+                "status_code": 200,
+                "monitored_symbols": symbols,
+                "price_count": len(prices),
+                "price_source_configured": self._monitoring_price_source_state.configured,
+                "price_source": self._monitoring_price_source_state.snapshot(),
+                "runtime_snapshot": workset_snapshot.snapshot(),
+                "broker_actions_disabled": True,
+                "triggered_at": started_at.isoformat(),
+                "worker_name": MONITORING_LOOP_WORKER_NAME,
+                "evaluated_item_count": 0,
+                "triggered_item_count": 0,
+                "submitted_order_count": 0,
+                "blocked_item_count": 0,
+                "deferred_item_count": 0,
+                "evaluated_symbol_count": len(symbols),
+                "triggered_symbol_count": 0,
+                "submitted_symbols": [],
+                "protective_stop_coverage": {
+                    "status": "disabled",
+                    "unprotected_position_count": 0,
+                    "position_truth_stale_count": 0,
+                    "repaired_stop_coverage_count": 0,
+                    "affected_symbols": [],
+                    "affected_symbols_count": 0,
+                    "affected_symbols_truncated": False,
+                    "missing_quantities": {},
+                    "issues": [],
+                    "issues_count": 0,
+                    "issues_truncated": False,
+                },
+                "profit_target_coverage": {
+                    "status": "disabled",
+                    "missing_target_coverage_count": 0,
+                    "affected_symbols": [],
+                    "affected_symbols_count": 0,
+                    "affected_symbols_truncated": False,
+                    "missing_quantities": {},
+                    "issues": [],
+                    "issues_count": 0,
+                    "issues_truncated": False,
+                },
+                "items": [],
+                "memory_workset_fast_path": True,
+            }
+            self._store_cycle_payload(worker_key="monitoring", payload=payload)
+            return payload
+
         durably_unquoteable_symbols = _durably_unquoteable_symbols(
             self.monitoring_price_source
         )
@@ -1114,7 +1166,9 @@ class AutonomousRuntimeCoordinator:
         )
         post_entry_maintenance_count = 0
         post_entry_review_count = 0
-        if prices or durably_unquoteable_symbols:
+        if (prices or durably_unquoteable_symbols) and self._monitoring_maintenance_due(
+            workset_snapshot
+        ):
             (
                 post_entry_maintenance_count,
                 post_entry_review_count,
@@ -1124,16 +1178,32 @@ class AutonomousRuntimeCoordinator:
                 started_at=started_at,
                 durably_unquoteable_symbols=durably_unquoteable_symbols,
             )
+            self._mark_monitoring_maintenance_complete(workset_snapshot)
             if post_entry_maintenance_count or post_entry_review_count:
-                runtime_snapshot = self._refresh_monitoring_runtime_snapshot(
+                workset_snapshot = self._refresh_monitoring_runtime_snapshot(
                     loaded_at=started_at,
                     reason="cached_monitoring_post_entry_state_change",
                     reconcile_broker=False,
                 )
-                self._refresh_monitoring_snapshot_filled_today(started_at)
-                runtime_snapshot = self._ensure_monitoring_runtime_snapshot(started_at)
-                symbols = runtime_snapshot.symbols
-                prices = [price for price in prices if price.symbol in set(symbols)]
+                self._mark_monitoring_maintenance_complete(workset_snapshot)
+                workset_symbol_set = set(workset_snapshot.symbols)
+                symbols = [symbol for symbol in symbols if symbol in workset_symbol_set]
+                if not symbols and workset_snapshot.symbols:
+                    symbols, self._monitoring_symbol_cursor = _select_monitoring_symbol_batch(
+                        desired_symbols=list(workset_snapshot.symbols),
+                        priority_symbols=set(workset_snapshot.positions_by_symbol),
+                        batch_size=max(
+                            int(self.settings.monitoring_max_symbols_per_cycle or 0),
+                            1,
+                        ),
+                        cursor=self._monitoring_symbol_cursor,
+                    )
+                runtime_snapshot = _monitoring_snapshot_for_symbols(
+                    workset_snapshot,
+                    symbols=symbols,
+                )
+                symbol_set = set(symbols)
+                prices = [price for price in prices if price.symbol in symbol_set]
                 monitored_symbols = list(symbols)
                 monitored_price_count = len(prices)
                 cached_payload = self._evaluate_cached_monitoring_cycle(
@@ -1148,7 +1218,7 @@ class AutonomousRuntimeCoordinator:
                             self._monitoring_price_source_state.configured
                         ),
                         "price_source": self._monitoring_price_source_state.snapshot(),
-                        "runtime_snapshot": runtime_snapshot.snapshot(),
+                        "runtime_snapshot": workset_snapshot.snapshot(),
                         **cached_payload,
                         "monitored_symbols": [],
                         "price_count": 0,
@@ -1166,7 +1236,7 @@ class AutonomousRuntimeCoordinator:
                 "price_count": len(prices),
                 "price_source_configured": self._monitoring_price_source_state.configured,
                 "price_source": self._monitoring_price_source_state.snapshot(),
-                "runtime_snapshot": runtime_snapshot.snapshot(),
+                "runtime_snapshot": workset_snapshot.snapshot(),
                 **cached_payload,
             }
             if post_entry_maintenance_count:
@@ -1180,6 +1250,36 @@ class AutonomousRuntimeCoordinator:
             # Empty/failed quote cycles still have work to do: persist a
             # checkpoint, surface coverage degradation, and retry previously
             # latched pending-dispatch exits that no longer require a quote.
+            pending_without_quote = any(
+                item.status in PENDING_DISPATCH_MONITORING_STATUSES
+                for item in runtime_snapshot.items
+            ) or int(cached_payload.get("triggered_item_count") or 0) > 0
+            with self._lock:
+                next_no_price_db_check_at = (
+                    self._monitoring_next_no_price_db_check_at
+                )
+            if (
+                not pending_without_quote
+                and next_no_price_db_check_at is not None
+                and started_at < next_no_price_db_check_at
+            ):
+                payload = {
+                    "status_code": 200,
+                    "price_source_configured": (
+                        self._monitoring_price_source_state.configured
+                    ),
+                    "price_source": self._monitoring_price_source_state.snapshot(),
+                    "runtime_snapshot": workset_snapshot.snapshot(),
+                    **cached_payload,
+                    "monitored_symbols": monitored_symbols,
+                    "price_count": 0,
+                    "broker_action_symbols": [],
+                    "broker_action_price_count": 0,
+                    "db_scan_skipped": True,
+                    "next_db_check_at": next_no_price_db_check_at.isoformat(),
+                }
+                self._store_cycle_payload(worker_key="monitoring", payload=payload)
+                return payload
             with self._cycle_session_factory() as db:
                 adapter = self._broker_adapter_for_cycle()
                 result = run_autonomous_monitoring_cycle(
@@ -1190,11 +1290,15 @@ class AutonomousRuntimeCoordinator:
                     symbols=symbols,
                     now=started_at,
                 )
+            with self._lock:
+                self._monitoring_next_no_price_db_check_at = (
+                    started_at + MONITORING_NO_PRICE_DB_RESCAN_INTERVAL
+                )
             payload = {
                 "status_code": result.status_code,
                 "price_source_configured": self._monitoring_price_source_state.configured,
                 "price_source": self._monitoring_price_source_state.snapshot(),
-                "runtime_snapshot": runtime_snapshot.snapshot(),
+                "runtime_snapshot": workset_snapshot.snapshot(),
                 **result.payload,
                 "monitored_symbols": monitored_symbols,
                 "price_count": 0,
@@ -1208,6 +1312,12 @@ class AutonomousRuntimeCoordinator:
             if post_entry_review_count:
                 payload["pre_cached_post_entry_review_count"] = post_entry_review_count
             self._store_cycle_payload(worker_key="monitoring", payload=payload)
+            if int(result.payload.get("submitted_order_count") or 0) > 0:
+                self._refresh_monitoring_runtime_snapshot(
+                    loaded_at=started_at,
+                    reason="monitoring_no_price_runtime_state_change",
+                    reconcile_broker=False,
+                )
             return payload
 
         triggered_sell_symbols = _triggered_symbols_from_cached_payload(
@@ -1228,7 +1338,7 @@ class AutonomousRuntimeCoordinator:
                 "price_count": len(prices),
                 "price_source_configured": self._monitoring_price_source_state.configured,
                 "price_source": self._monitoring_price_source_state.snapshot(),
-                "runtime_snapshot": runtime_snapshot.snapshot(),
+                "runtime_snapshot": workset_snapshot.snapshot(),
                 "broker_actions_disabled": True,
                 **cached_payload,
             }
@@ -1266,7 +1376,7 @@ class AutonomousRuntimeCoordinator:
                 "status_code": result.status_code,
                 "price_source_configured": self._monitoring_price_source_state.configured,
                 "price_source": self._monitoring_price_source_state.snapshot(),
-                "runtime_snapshot": runtime_snapshot.snapshot(),
+                "runtime_snapshot": workset_snapshot.snapshot(),
                 **result.payload,
                 "monitored_symbols": monitored_symbols,
                 "price_count": monitored_price_count,
@@ -1278,13 +1388,14 @@ class AutonomousRuntimeCoordinator:
             if post_entry_review_count:
                 payload["pre_cached_post_entry_review_count"] = post_entry_review_count
             self._store_cycle_payload(worker_key="monitoring", payload=payload)
+            snapshot_refreshed = False
             if int(result.payload.get("submitted_order_count") or 0) > 0:
-                self._reconcile_monitoring_orders_if_due(
+                snapshot_refreshed = self._reconcile_monitoring_orders_if_due(
                     now=datetime.now(UTC),
                     symbols=set(symbols),
                     force=True,
                 )
-            if not desired_symbols:
+            if not snapshot_refreshed:
                 self._refresh_monitoring_runtime_snapshot(
                     loaded_at=started_at,
                     reason="monitoring_triggered_runtime_state_path",
@@ -1293,18 +1404,39 @@ class AutonomousRuntimeCoordinator:
             return payload
 
     def _ensure_monitoring_runtime_snapshot(self, now: datetime) -> MonitoringRuntimeSnapshot:
-        if self._monitoring_runtime_snapshot is None:
+        with self._lock:
+            snapshot = self._monitoring_runtime_snapshot
+        refresh_reason: str | None = None
+        if snapshot is None:
+            refresh_reason = "monitoring_snapshot_missing"
+        else:
+            max_age_seconds = max(
+                int(self.settings.exec_agent_max_account_snapshot_age_seconds),
+                1,
+            )
+            age_seconds = (
+                _coerce_utc_datetime(now) - _coerce_utc_datetime(snapshot.loaded_at)
+            ).total_seconds()
+            if age_seconds >= max_age_seconds:
+                refresh_reason = "monitoring_snapshot_ttl_expired"
+        if refresh_reason is not None:
             self._refresh_monitoring_runtime_snapshot(
                 loaded_at=now,
-                reason="monitoring_snapshot_missing",
+                reason=refresh_reason,
                 reconcile_broker=False,
             )
-        assert self._monitoring_runtime_snapshot is not None
-        return self._monitoring_runtime_snapshot
+        with self._lock:
+            snapshot = self._monitoring_runtime_snapshot
+        assert snapshot is not None
+        return snapshot
 
     def invalidate_monitoring_runtime_snapshot(self, *, reason: str) -> None:
         with self._lock:
+            self._monitoring_snapshot_generation += 1
             self._monitoring_runtime_snapshot = None
+            self._monitoring_maintenance_snapshot_loaded_at = None
+            self._monitoring_next_no_price_db_check_at = None
+        self.invalidate_monitoring_price_runtime_context(reason=reason)
         LOGGER.info(
             "monitoring_runtime_snapshot_invalidated",
             extra={
@@ -1313,6 +1445,30 @@ class AutonomousRuntimeCoordinator:
             },
         )
 
+    def invalidate_monitoring_price_runtime_context(self, *, reason: str) -> None:
+        invalidate = getattr(
+            self.monitoring_price_source,
+            "invalidate_runtime_context",
+            None,
+        )
+        if callable(invalidate):
+            invalidate(reason=reason)
+
+    def _monitoring_maintenance_due(
+        self,
+        snapshot: MonitoringRuntimeSnapshot,
+    ) -> bool:
+        with self._lock:
+            return self._monitoring_maintenance_snapshot_loaded_at != snapshot.loaded_at
+
+    def _mark_monitoring_maintenance_complete(
+        self,
+        snapshot: MonitoringRuntimeSnapshot,
+    ) -> None:
+        with self._lock:
+            if self._monitoring_runtime_snapshot is snapshot:
+                self._monitoring_maintenance_snapshot_loaded_at = snapshot.loaded_at
+
     def _refresh_monitoring_runtime_snapshot(
         self,
         *,
@@ -1320,6 +1476,22 @@ class AutonomousRuntimeCoordinator:
         reason: str,
         reconcile_broker: bool,
     ) -> MonitoringRuntimeSnapshot:
+        with self._monitoring_snapshot_refresh_mutex:
+            return self._refresh_monitoring_runtime_snapshot_serialized(
+                loaded_at=loaded_at,
+                reason=reason,
+                reconcile_broker=reconcile_broker,
+            )
+
+    def _refresh_monitoring_runtime_snapshot_serialized(
+        self,
+        *,
+        loaded_at: datetime,
+        reason: str,
+        reconcile_broker: bool,
+    ) -> MonitoringRuntimeSnapshot:
+        with self._lock:
+            refresh_generation = self._monitoring_snapshot_generation
         broker_reconciliation_succeeded = False
         if reconcile_broker and self.settings.runtime_mode == "live":
             adapter = self._broker_adapter_for_cycle()
@@ -1344,7 +1516,16 @@ class AutonomousRuntimeCoordinator:
                     broker_reconciliation_succeeded = True
         snapshot = self._load_monitoring_runtime_snapshot(loaded_at)
         with self._lock:
+            if self._monitoring_snapshot_generation != refresh_generation:
+                self.invalidate_monitoring_price_runtime_context(
+                    reason="monitoring_snapshot_refresh_superseded"
+                )
+                raise RuntimeError(
+                    "monitoring snapshot was invalidated while it was being refreshed"
+                )
             self._monitoring_runtime_snapshot = snapshot
+            self._monitoring_maintenance_snapshot_loaded_at = None
+            self._monitoring_next_no_price_db_check_at = None
             if broker_reconciliation_succeeded:
                 self._monitoring_snapshot_last_reconciled_at = loaded_at
         LOGGER.info(
@@ -1564,15 +1745,15 @@ class AutonomousRuntimeCoordinator:
         now: datetime,
         symbols: set[str],
         force: bool = False,
-    ) -> None:
+    ) -> bool:
         if self.settings.runtime_mode != "live":
-            return
+            return False
         if not symbols:
-            return
+            return False
         if not force and self._monitoring_order_reconcile_last_at is not None:
             elapsed = (now - self._monitoring_order_reconcile_last_at).total_seconds()
             if elapsed < max(60, self.settings.monitoring_loop_interval_seconds):
-                return
+                return False
         adapter = self._broker_adapter_for_cycle()
         with self._cycle_session_factory() as db:
             try:
@@ -1599,9 +1780,26 @@ class AutonomousRuntimeCoordinator:
                         "force": force,
                     },
                 )
-                return
+                return False
         self._monitoring_order_reconcile_last_at = now
-        self._refresh_monitoring_snapshot_filled_today(now)
+        state_changed = any(
+            int(result.get(key) or 0) > 0
+            for key in (
+                "reconciled_order_count",
+                "fills_added",
+                "scope_quarantined_order_count",
+            )
+        )
+        if state_changed:
+            self.invalidate_dispatch_schedule(
+                reason="monitoring_order_reconciliation_changed_state"
+            )
+            self._refresh_monitoring_runtime_snapshot(
+                loaded_at=now,
+                reason="monitoring_order_reconciliation_changed_state",
+                reconcile_broker=False,
+            )
+        return state_changed
 
     def _repair_post_entry_exit_monitors_for_cached_cycle(
         self,
@@ -1634,17 +1832,45 @@ class AutonomousRuntimeCoordinator:
             return maintenance_count, review_count
 
     def _load_monitoring_runtime_snapshot(self, loaded_at: datetime) -> MonitoringRuntimeSnapshot:
+        desired_symbol_priority = _load_core_desired_monitoring_symbols(
+            settings=self.settings
+        )
         with self._cycle_session_factory() as db:
             symbols = list_autonomous_monitoring_symbols(
                 settings=self.settings,
                 db=db,
                 effective_at=loaded_at,
+                desired_symbol_priority=desired_symbol_priority,
+                include_kis_us_symbols=self.settings.kis_us_trading_enabled,
             )
-            return self._load_monitoring_runtime_snapshot_for_symbols_with_session(
+            snapshot = self._load_monitoring_runtime_snapshot_for_symbols_with_session(
                 db=db,
                 loaded_at=loaded_at,
                 symbols=symbols,
             )
+        prime_runtime_context = getattr(
+            self.monitoring_price_source,
+            "prime_runtime_context",
+            None,
+        )
+        if symbols and callable(prime_runtime_context):
+            with self._cycle_session_factory() as db:
+                try:
+                    prime_runtime_context(
+                        db=db,
+                        symbols=symbols,
+                        loaded_at=loaded_at,
+                    )
+                except Exception:
+                    LOGGER.warning(
+                        "monitoring_price_runtime_context_prime_failed",
+                        extra={
+                            "runtime_mode": self.settings.runtime_mode,
+                            "symbol_count": len(symbols),
+                        },
+                        exc_info=True,
+                    )
+        return snapshot
 
     def _load_monitoring_runtime_snapshot_for_symbols(
         self,
@@ -1793,6 +2019,7 @@ class AutonomousRuntimeCoordinator:
                     if str(row[2]) in WATCH_BUY_INTENTS
                     else None
                 ),
+                close_exit_date=_cached_close_exit_date(row[5]),
                 provider=str(row[7] or "").strip().lower() or None,
                 exchange=_cached_item_exchange(
                     symbol=str(row[1]),
@@ -2064,6 +2291,7 @@ class AutonomousRuntimeCoordinator:
                     if str(item.intent) in WATCH_BUY_INTENTS
                     else None
                 ),
+                close_exit_date=_cached_close_exit_date(item.risk_context),
                 provider=(
                     str(item.provider).strip().lower()
                     if item.provider is not None
@@ -2081,7 +2309,11 @@ class AutonomousRuntimeCoordinator:
             symbols=symbols,
             positions_by_symbol=_cached_positions_by_symbol(position_rows),
             items=cached_items,
-            filled_today_symbols=[],
+            filled_today_symbols=_load_filled_today_symbols(
+                settings=self.settings,
+                db=db,
+                now=loaded_at,
+            ),
             execution_scope=_active_kis_execution_scope_payload(self.settings),
         )
 
@@ -2096,7 +2328,6 @@ class AutonomousRuntimeCoordinator:
         evaluated_item_count = 0
         triggered_item_count = 0
         blocked_item_count = 0
-        deferred_item_count = 0
         evaluated_symbols: set[str] = set()
         triggered_symbols: set[str] = set()
         triggered_sell_symbols: set[str] = set()
@@ -2135,9 +2366,6 @@ class AutonomousRuntimeCoordinator:
             if item.status.startswith("triggered_pending_agent"):
                 blocked_item_count += 1
                 outcome = "agent_pending"
-            elif triggered and item.intent == "max_holding_close_sell":
-                deferred_item_count += 1
-                outcome = "deferred"
             elif triggered:
                 triggered_item_count += 1
                 triggered_symbols.add(item.symbol)
@@ -2166,7 +2394,7 @@ class AutonomousRuntimeCoordinator:
             "triggered_item_count": triggered_item_count,
             "submitted_order_count": 0,
             "blocked_item_count": blocked_item_count,
-            "deferred_item_count": deferred_item_count,
+            "deferred_item_count": 0,
             "evaluated_symbol_count": len(evaluated_symbols),
             "triggered_symbol_count": len(triggered_symbols),
             "triggered_symbols": sorted(triggered_symbols),
@@ -2567,7 +2795,10 @@ def _cached_monitoring_item_triggered(
     triggered_at: datetime,
 ) -> bool:
     if item.intent == "max_holding_close_sell":
-        return True
+        return bool(
+            item.close_exit_date is not None
+            and triggered_at.astimezone(UTC).date() >= item.close_exit_date
+        )
     if item.intent in WATCH_BUY_INTENTS:
         trigger_price = _cached_watch_buy_trigger_price(item)
         if trigger_price is None or observed_price is None:
@@ -2618,6 +2849,16 @@ def _cached_json_object(value: object) -> dict[str, object]:
     except (TypeError, ValueError):
         return {}
     return parsed if isinstance(parsed, dict) else {}
+
+
+def _cached_close_exit_date(risk_context: object) -> date | None:
+    raw_close_exit_date = _cached_json_object(risk_context).get("close_exit_date")
+    if not isinstance(raw_close_exit_date, str):
+        return None
+    try:
+        return datetime.strptime(raw_close_exit_date, "%Y-%m-%d").date()
+    except ValueError:
+        return None
 
 
 def _triggered_symbols_from_cached_payload(
@@ -2794,6 +3035,27 @@ def _serialize_datetime(value: datetime | None) -> str | None:
     return value.isoformat()
 
 
+def _payload_datetime(value: object) -> datetime | None:
+    if isinstance(value, datetime):
+        return _coerce_utc_datetime(value)
+    if not isinstance(value, str) or not value.strip():
+        return None
+    normalized = value.strip()
+    if normalized.endswith("Z"):
+        normalized = f"{normalized[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    return _coerce_utc_datetime(parsed)
+
+
+def _coerce_utc_datetime(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
+
+
 def _merge_symbol_priority(*symbol_groups: Iterable[str]) -> list[str]:
     ordered: list[str] = []
     seen: set[str] = set()
@@ -2805,6 +3067,27 @@ def _merge_symbol_priority(*symbol_groups: Iterable[str]) -> list[str]:
             ordered.append(symbol)
             seen.add(symbol)
     return ordered
+
+
+def _monitoring_snapshot_for_symbols(
+    snapshot: MonitoringRuntimeSnapshot,
+    *,
+    symbols: list[str],
+) -> MonitoringRuntimeSnapshot:
+    selected_symbols = list(dict.fromkeys(symbols))
+    selected_symbol_set = set(selected_symbols)
+    return replace(
+        snapshot,
+        symbols=selected_symbols,
+        positions_by_symbol={
+            symbol: position
+            for symbol, position in snapshot.positions_by_symbol.items()
+            if symbol in selected_symbol_set
+        },
+        items=[
+            item for item in snapshot.items if item.symbol in selected_symbol_set
+        ],
+    )
 
 
 def _is_krx_symbol(symbol: str) -> bool:

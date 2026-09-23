@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed
+from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import UTC, date, datetime, time as datetime_time, timedelta
 from decimal import Decimal
 import threading
@@ -17,6 +19,7 @@ from app.broker.base import (
     BrokerAdapter,
     BrokerAdapterError,
     BrokerCurrentPrice,
+    BrokerErrorClassification,
     BrokerLiveMarketContext,
 )
 from app.broker.kis import KIS_OVERSEAS_QUOTE_EMPTY_CODE
@@ -36,6 +39,8 @@ QUOTE_RETRY_ATTEMPTS = 0
 QUOTE_RETRY_DELAY_SECONDS = 0.2
 QUOTE_BATCH_TIMEOUT_BUFFER_SECONDS = 2.0
 DURABLE_EMPTY_QUOTE_OBSERVATION_COUNT = 3
+TOKEN_REUSE_MARGIN = timedelta(minutes=5)
+RUNTIME_CONTEXT_RETRY_INTERVAL = timedelta(seconds=60)
 _ROUTE_AUTHORITY_INTENTS = frozenset(
     {
         "target_sell",
@@ -67,6 +72,15 @@ _ROUTE_AUTHORITY_STATUSES = frozenset(
 )
 
 
+@dataclass(frozen=True)
+class _KisMonitoringRuntimeContext:
+    cached_at: datetime
+    refresh_before: datetime
+    access_token: str
+    covered_symbols: frozenset[str]
+    execution_context_by_symbol: dict[str, dict[str, object]]
+
+
 class KisCurrentQuoteMonitoringPriceSource:
     source_name = "kis_current_quote_rest"
 
@@ -82,6 +96,10 @@ class KisCurrentQuoteMonitoringPriceSource:
         self.broker_adapter_factory = broker_adapter_factory
         self._last_diagnostics: dict[str, object] = {}
         self._empty_quote_counts: dict[str, int] = {}
+        self._runtime_context_lock = threading.Lock()
+        self._runtime_context: _KisMonitoringRuntimeContext | None = None
+        self._runtime_context_retry_at: datetime | None = None
+        self._runtime_context_generation = 0
         self._quote_batch_lock = threading.Lock()
         self._quote_batch_state_lock = threading.Lock()
         self._quote_batch_futures: set[
@@ -106,6 +124,148 @@ class KisCurrentQuoteMonitoringPriceSource:
             "configured": config.configured,
             "mode": config.mode,
         }
+
+    def prime_runtime_context(
+        self,
+        *,
+        db: Session,
+        symbols: list[str],
+        loaded_at: datetime,
+    ) -> None:
+        with self._runtime_context_lock:
+            refresh_generation = self._runtime_context_generation
+        try:
+            runtime_context = self._build_runtime_context(
+                db=db,
+                symbols=symbols,
+                loaded_at=loaded_at,
+            )
+        except Exception:
+            with self._runtime_context_lock:
+                current_context = self._runtime_context
+                if (
+                    self._runtime_context_generation == refresh_generation
+                    and current_context is None
+                ):
+                    self._runtime_context = None
+                    self._runtime_context_retry_at = (
+                        datetime.now(UTC) + RUNTIME_CONTEXT_RETRY_INTERVAL
+                    )
+            raise
+        with self._runtime_context_lock:
+            if self._runtime_context_generation != refresh_generation:
+                raise RuntimeError(
+                    "monitoring runtime context was invalidated during refresh"
+                )
+            current_context = self._runtime_context
+            if (
+                current_context is not None
+                and current_context.cached_at > runtime_context.cached_at
+            ):
+                return
+            self._runtime_context = runtime_context
+            self._runtime_context_retry_at = None
+
+    def _build_runtime_context(
+        self,
+        *,
+        db: Session,
+        symbols: list[str],
+        loaded_at: datetime,
+    ) -> _KisMonitoringRuntimeContext:
+        unique_symbols = list(
+            dict.fromkeys(symbol.strip().upper() for symbol in symbols if symbol.strip())
+        )
+        broker_adapter = self.broker_adapter_factory(self.settings)
+        session_state = _ensure_authenticated_broker_session_with_retry(
+            settings=self.settings,
+            db=db,
+            adapter=broker_adapter,
+        )
+        access_token = str(session_state.access_token or "")
+        if not access_token:
+            raise BrokerAdapterError(
+                "monitoring price source requires an active broker token",
+                status_code=503,
+            )
+        cached_at = datetime.now(UTC)
+        token_expires_at = _as_utc(session_state.access_token_expires_at)
+        refresh_after = _as_utc(session_state.refresh_after)
+        if refresh_after is None and token_expires_at is not None:
+            refresh_after = token_expires_at - TOKEN_REUSE_MARGIN
+        snapshot_refresh_at = cached_at + timedelta(
+            seconds=self.settings.exec_agent_max_account_snapshot_age_seconds
+        )
+        refresh_candidates = [
+            value
+            for value in (refresh_after, token_expires_at, snapshot_refresh_at)
+            if value is not None
+        ]
+        refresh_before = min(refresh_candidates, default=cached_at)
+        execution_context_by_symbol = _load_monitoring_execution_context_by_symbol(
+            settings=self.settings,
+            db=db,
+            symbols=unique_symbols,
+        )
+        return _KisMonitoringRuntimeContext(
+            cached_at=cached_at,
+            refresh_before=refresh_before,
+            access_token=access_token,
+            covered_symbols=frozenset(unique_symbols),
+            execution_context_by_symbol={
+                symbol: _copy_execution_context(context)
+                for symbol, context in execution_context_by_symbol.items()
+            },
+        )
+
+    def invalidate_runtime_context(self, *, reason: str) -> None:
+        del reason
+        with self._runtime_context_lock:
+            self._runtime_context_generation += 1
+            self._runtime_context = None
+            self._runtime_context_retry_at = None
+
+    @contextmanager
+    def _runtime_context_scope(
+        self,
+        *,
+        symbols: list[str],
+    ):
+        runtime_context = self._cached_runtime_context(symbols=symbols)
+        if runtime_context is None:
+            with self._runtime_context_lock:
+                retry_at = self._runtime_context_retry_at
+            if retry_at is not None and datetime.now(UTC) < retry_at:
+                raise RuntimeError(
+                    "monitoring runtime context refresh is in retry backoff"
+                )
+            with self.session_factory() as db:
+                self.prime_runtime_context(
+                    db=db,
+                    symbols=symbols,
+                    loaded_at=datetime.now(UTC),
+                )
+            runtime_context = self._cached_runtime_context(symbols=symbols)
+        if runtime_context is None:
+            raise RuntimeError("monitoring runtime context cache was not populated")
+        yield runtime_context
+
+    def _cached_runtime_context(
+        self,
+        *,
+        symbols: list[str],
+    ) -> _KisMonitoringRuntimeContext | None:
+        requested_symbols = frozenset(symbols)
+        now = datetime.now(UTC)
+        with self._runtime_context_lock:
+            runtime_context = self._runtime_context
+            if (
+                runtime_context is None
+                or now >= runtime_context.refresh_before
+                or not requested_symbols.issubset(runtime_context.covered_symbols)
+            ):
+                return None
+            return runtime_context
 
     def get_prices(
         self,
@@ -170,18 +330,9 @@ class KisCurrentQuoteMonitoringPriceSource:
             for symbol in list(self._empty_quote_counts):
                 if symbol not in requested_symbol_set:
                     self._empty_quote_counts.pop(symbol, None)
-            with self.session_factory() as db:
-                session_state = _ensure_authenticated_broker_session_with_retry(
-                    settings=settings,
-                    db=db,
-                    adapter=broker_adapter,
-                )
-                access_token = session_state.access_token or ""
-                execution_context_by_symbol = _load_monitoring_execution_context_by_symbol(
-                    settings=settings,
-                    db=db,
-                    symbols=unique_symbols,
-                )
+            with self._runtime_context_scope(symbols=unique_symbols) as runtime_context:
+                access_token = runtime_context.access_token
+                execution_context_by_symbol = runtime_context.execution_context_by_symbol
                 exchange_by_symbol = {
                     symbol: str(context["exchange"])
                     for symbol, context in execution_context_by_symbol.items()
@@ -288,6 +439,12 @@ class KisCurrentQuoteMonitoringPriceSource:
                             next_retry_symbols.append(symbol)
                     retry_symbols = next_retry_symbols
 
+                if any(
+                    _is_broker_auth_rejection(error)
+                    for _quote, error in quote_results.values()
+                ):
+                    self.invalidate_runtime_context(reason="broker_quote_auth_rejected")
+
                 context_futures = {
                     symbol: self._context_executor.submit(
                         _fetch_live_market_context,
@@ -390,6 +547,7 @@ class KisCurrentQuoteMonitoringPriceSource:
                 self._quote_batch_lock.release()
 
     def close(self) -> None:
+        self.invalidate_runtime_context(reason="price_source_closed")
         self._quote_executor.shutdown(wait=False, cancel_futures=True)
         self._context_executor.shutdown(wait=False, cancel_futures=True)
 
@@ -528,6 +686,35 @@ def _load_monitoring_exchange_by_symbol(
             symbols=symbols,
         ).items()
     }
+
+
+def _as_utc(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
+
+
+def _is_broker_auth_rejection(error: Exception | None) -> bool:
+    return bool(
+        isinstance(error, BrokerAdapterError)
+        and (
+            error.classification == BrokerErrorClassification.AUTH
+            or error.status_code in {401, 403}
+            or error.response_metadata.get("status_code") in {401, 403}
+        )
+    )
+
+
+def _copy_execution_context(context: dict[str, object]) -> dict[str, object]:
+    copied = dict(context)
+    order_contexts = context.get("order_contexts")
+    if isinstance(order_contexts, list):
+        copied["order_contexts"] = [
+            dict(item) for item in order_contexts if isinstance(item, dict)
+        ]
+    return copied
 
 
 def _load_monitoring_execution_context_by_symbol(

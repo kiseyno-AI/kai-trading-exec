@@ -285,6 +285,30 @@ KAI_EXEC_KIS_ACCOUNT_NUMBER=12345678
 
 Pool controls are `KAI_EXEC_DB_POOL_SIZE` (`10`), `KAI_EXEC_DB_MAX_OVERFLOW` (`10`), `KAI_EXEC_DB_POOL_TIMEOUT_SECONDS` (`5`), `KAI_EXEC_DB_POOL_RECYCLE_SECONDS` (`900`), `KAI_EXEC_DB_POOL_USE_LIFO` (`true`), `KAI_EXEC_DB_CONNECT_TIMEOUT_SECONDS` (`5`), `KAI_EXEC_DB_LONG_CHECKOUT_WARNING_SECONDS` (`10`), and `KAI_EXEC_SQLITE_BUSY_TIMEOUT_SECONDS` (`30`). Database health checks are single-flight per process.
 
+### Runtime database access model
+
+Exec loads the complete local monitoring workset into compact process memory and
+round-robins quote batches from that snapshot. The normal no-trigger quote cycle
+does not reopen the database. The workset, filled-today set, KIS route context,
+and token lease refresh together at the broker-truth age limit
+(`KAI_EXEC_EXEC_AGENT_MAX_ACCOUNT_SNAPSHOT_AGE_SECONDS`, default `300`), and a
+committed plan, order, fill, sizing, authority, or broker-session change
+invalidates the affected cache immediately. Core supplies only cached symbol
+priority; Exec does not force Core to rebuild that read model on every refresh.
+
+An empty dispatch queue is rescanned at most once per 60 seconds unless a local
+write makes it dirty or a known scheduled job becomes due. Repeated no-price
+monitoring cycles likewise write one checkpoint and then suppress redundant DB
+work for 60 seconds; pending-dispatch exits still bypass that suppression so
+restart recovery is not delayed.
+
+This optimization applies only to read-mostly scheduling and evaluation. Broker
+intent is still committed before submission, and acknowledgements, unknown
+outcomes, fills, positions, protective exits, risk fences, and reconciliation
+results remain immediate durable writes. Do not replace those transitions with
+an end-of-day memory flush: a restart could otherwise duplicate an order or lose
+protection for an open position.
+
 ### KIS
 
 Common authentication/session settings:

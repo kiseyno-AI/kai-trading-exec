@@ -1484,6 +1484,8 @@ def list_autonomous_monitoring_symbols(
     db: Session,
     current_market_date: date | None = None,
     effective_at: datetime | None = None,
+    desired_symbol_priority: list[str] | None = None,
+    include_kis_us_symbols: bool = True,
 ) -> list[str]:
     resolved_effective_at = _normalize_utc(effective_at or datetime.now(UTC))
     resolved_market_date = current_market_date or resolved_effective_at.astimezone(
@@ -1529,19 +1531,21 @@ def list_autonomous_monitoring_symbols(
         db.commit()
 
     mode_plan_ids = select(ExecutionPlan.id).where(ExecutionPlan.mode == settings.runtime_mode)
-    kis_us_symbols = {
-        item.symbol
-        for item in db.scalars(
-            select(ExecutionPlanItem)
-            .join(ExecutionPlanItem.plan)
-            .where(
-                ExecutionPlan.mode == settings.runtime_mode,
-                _kis_plan_item_provider_filter(),
-                _kis_us_plan_item_filter(),
-            )
-        ).all()
-        if _plan_item_exchange(item) in {"NASD", "NYSE", "AMEX"}
-    }
+    kis_us_symbols: set[str] = set()
+    if include_kis_us_symbols:
+        kis_us_symbols = {
+            item.symbol
+            for item in db.scalars(
+                select(ExecutionPlanItem)
+                .join(ExecutionPlanItem.plan)
+                .where(
+                    ExecutionPlan.mode == settings.runtime_mode,
+                    _kis_plan_item_provider_filter(),
+                    _kis_us_plan_item_filter(),
+                )
+            ).all()
+            if _plan_item_exchange(item) in {"NASD", "NYSE", "AMEX"}
+        }
     held_positions = db.scalars(
         select(ExecutionPosition)
         .where(
@@ -1685,7 +1689,11 @@ def list_autonomous_monitoring_symbols(
             == "active"
         }
     )
-    desired_symbols = _load_core_desired_monitoring_symbols(settings=settings)
+    desired_symbols = (
+        _load_core_desired_monitoring_symbols(settings=settings)
+        if desired_symbol_priority is None
+        else list(desired_symbol_priority)
+    )
     if desired_symbols:
         desired_rank = {symbol: index for index, symbol in enumerate(desired_symbols)}
         buy_symbol_rows.sort(
@@ -1757,7 +1765,10 @@ def _load_core_desired_monitoring_symbols(*, settings: Settings) -> list[str]:
     if not settings.market_context_enabled or not settings.market_context_base_url:
         return []
     base_url = str(settings.market_context_base_url).rstrip("/")
-    request = Request(f"{base_url}/execution/runtime/monitored-symbols?refresh=true")
+    # Core owns the daily read model. Exec only consumes the cached handoff here;
+    # forcing a rebuild on every workset refresh turns a priority hint into a
+    # cross-service DB polling loop.
+    request = Request(f"{base_url}/execution/runtime/monitored-symbols?refresh=false")
     if settings.market_context_bearer_token:
         request.add_header("Authorization", f"Bearer {settings.market_context_bearer_token}")
     try:

@@ -44,6 +44,15 @@ def resume_control(
         db=db,
         command=_command(command),
     )
+    if result.changed:
+        runtime = getattr(request.app.state, "autonomous_runtime", None)
+        invalidate_dispatch = getattr(
+            runtime,
+            "invalidate_dispatch_schedule",
+            None,
+        )
+        if callable(invalidate_dispatch):
+            invalidate_dispatch(reason="runtime_resumed")
     return JSONResponse(status_code=result.status_code, content=result.payload())
 
 
