@@ -689,6 +689,40 @@ def test_v4_persists_a_strictly_revalidatable_contract_payload() -> None:
     engine.dispose()
 
 
+def test_v4_canonicalizes_inherited_entry_actions_out_of_protective_exits() -> None:
+    app, engine = _build_test_app()
+    client = TestClient(app)
+    payload = _plan_payload(plan_id="core-v4-inherited-exit-actions")
+    inherited_entry_actions = {
+        "handoff_intent": "intraday_watch_buy",
+        "raw_action": "watch_for_trigger",
+        "tactical_action": "watch_for_trigger",
+        "generic_action": "monitor_candidate",
+    }
+    for exit_item in payload["items"][1:]:
+        exit_item["risk_context"].update(inherited_entry_actions)
+        assert all(field not in exit_item for field in inherited_entry_actions)
+    _refresh_material_fingerprint(payload)
+
+    response = client.post("/v4/execution-plans", json=payload)
+
+    assert response.status_code == 201, response.json()
+    assert response.json()["accepted_item_count"] == 3
+    with app.state.db_session_factory() as session:
+        plan = session.scalar(
+            select(ExecutionPlan).options(selectinload(ExecutionPlan.items))
+        )
+        assert plan is not None
+        exits = [item for item in plan.items if item.side == "sell"]
+        assert len(exits) == 2
+        assert all(
+            all(field not in item.risk_context for field in inherited_entry_actions)
+            for item in exits
+        )
+        assert core_handoff_v4.persisted_core_plan_contract_ack(plan) is not None
+    engine.dispose()
+
+
 @pytest.mark.parametrize(
     ("field_name", "corrupt_value"),
     [
