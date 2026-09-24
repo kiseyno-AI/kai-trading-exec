@@ -808,6 +808,9 @@ def _bind_persisted_core_contract(
             if isinstance(item.risk_context, dict)
             else {}
         )
+        for field_name in CORE_V4_ACTION_FIELDS:
+            if field_name not in raw_risk:
+                risk_context.pop(field_name, None)
         risk_context.update(raw_risk)
         risk_context[CORE_V4_PERSISTED_BINDING_KEY] = {
             "version": CORE_V4_PERSISTED_BINDING_VERSION,
