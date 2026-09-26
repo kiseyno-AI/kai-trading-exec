@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta, tzinfo
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from functools import partial
+from hashlib import sha256
+import hmac
 import json
 import logging
 import os
@@ -94,6 +96,7 @@ from app.services.position_identity import (
     PositionIdentityConflictError,
     build_position_identity,
     position_identity_from_columns,
+    stable_account_scope_hmac_key,
 )
 from app.services.risk_sizing import (
     RiskSizingRejection,
@@ -150,6 +153,9 @@ AGENT_ACTIVE_STATUSES = trigger_time_exec_agent.AGENT_ACTIVE_STATUSES
 MAX_PROTECTIVE_STOP_COVERAGE_DETAILS = 20
 TRIGGER_TIME_LIQUIDITY_EVIDENCE_KEY = "exec_trigger_time_liquidity_evidence_v1"
 TRIGGER_TIME_FULL_COST_ECONOMICS_KEY = "exec_trigger_time_full_cost_economics_v1"
+TRIGGER_TIME_FULL_COST_ECONOMICS_PROVENANCE_VERSION = (
+    "exec-trigger-time-full-cost-economics-provenance-v1"
+)
 SELL_MONITOR_AUTHORITY_KEY = "sell_monitor_authority_v1"
 WATCH_MONITORING_STATUSES = frozenset(
     {
@@ -1937,6 +1943,13 @@ def _watch_buy_queue_full_cost_rr(
         evaluated_at=evaluated_at,
     ):
         return None, None
+    if not _trigger_time_full_cost_economics_provenance_is_valid(
+        settings=settings,
+        item=item,
+        evidence=evidence,
+        evaluated_at=evaluated_at,
+    ):
+        return None, None
     net_reward_risk = _parse_decimal(evidence.get("net_reward_risk"))
     minimum_reward_risk = _parse_decimal(evidence.get("minimum_reward_risk"))
     round_trip_cost_bps = _parse_decimal(
@@ -1964,6 +1977,187 @@ def _watch_buy_queue_full_cost_rr(
     ):
         return None, None
     return net_reward_risk, observed_at
+
+
+def _trigger_time_full_cost_economics_provenance_is_valid(
+    *,
+    settings: Settings,
+    item: ExecutionPlanItem,
+    evidence: dict[str, object],
+    evaluated_at: datetime,
+) -> bool:
+    provenance = evidence.get("provenance")
+    if not isinstance(provenance, dict):
+        return False
+    if set(provenance) != {
+        "version",
+        "source",
+        "route_fingerprint",
+        "liquidity_evidence_hash",
+        "material_hash",
+        "binding",
+    }:
+        return False
+    if (
+        provenance.get("version")
+        != TRIGGER_TIME_FULL_COST_ECONOMICS_PROVENANCE_VERSION
+        or provenance.get("source") != "kai-trading-exec.monitoring"
+    ):
+        return False
+    route_fingerprint = configured_kis_route_fingerprint(settings)
+    if not isinstance(route_fingerprint, str) or not hmac.compare_digest(
+        str(provenance.get("route_fingerprint") or ""),
+        route_fingerprint,
+    ):
+        return False
+    key = stable_account_scope_hmac_key(settings)
+    if key is None:
+        return False
+    verified_turnover, _ = _watch_buy_queue_verified_turnover(
+        settings=settings,
+        item=item,
+        evaluated_at=evaluated_at,
+    )
+    if verified_turnover is None:
+        return False
+    liquidity_evidence = _trigger_time_liquidity_evidence_payload(item)
+    if liquidity_evidence is None:
+        return False
+    liquidity_hash = json_payload_hash(
+        _trigger_time_liquidity_binding_material(liquidity_evidence)
+    )
+    if not hmac.compare_digest(
+        str(provenance.get("liquidity_evidence_hash") or ""),
+        liquidity_hash,
+    ):
+        return False
+    material = _trigger_time_full_cost_economics_binding_material(
+        item=item,
+        evidence=evidence,
+        route_fingerprint=route_fingerprint,
+        liquidity_evidence_hash=liquidity_hash,
+    )
+    material_hash = json_payload_hash(material)
+    if not hmac.compare_digest(
+        str(provenance.get("material_hash") or ""),
+        material_hash,
+    ):
+        return False
+    expected_binding = hmac.new(
+        key,
+        material_hash.encode("utf-8"),
+        sha256,
+    ).hexdigest()
+    binding = provenance.get("binding")
+    return isinstance(binding, str) and hmac.compare_digest(
+        binding,
+        expected_binding,
+    )
+
+
+def _trigger_time_full_cost_economics_provenance(
+    *,
+    settings: Settings,
+    item: ExecutionPlanItem,
+    evidence: dict[str, object],
+) -> dict[str, object] | None:
+    route_fingerprint = configured_kis_route_fingerprint(settings)
+    key = stable_account_scope_hmac_key(settings)
+    liquidity_evidence = _trigger_time_liquidity_evidence_payload(item)
+    if (
+        not isinstance(route_fingerprint, str)
+        or key is None
+        or liquidity_evidence is None
+    ):
+        return None
+    liquidity_hash = json_payload_hash(
+        _trigger_time_liquidity_binding_material(liquidity_evidence)
+    )
+    material = _trigger_time_full_cost_economics_binding_material(
+        item=item,
+        evidence=evidence,
+        route_fingerprint=route_fingerprint,
+        liquidity_evidence_hash=liquidity_hash,
+    )
+    material_hash = json_payload_hash(material)
+    return {
+        "version": TRIGGER_TIME_FULL_COST_ECONOMICS_PROVENANCE_VERSION,
+        "source": "kai-trading-exec.monitoring",
+        "route_fingerprint": route_fingerprint,
+        "liquidity_evidence_hash": liquidity_hash,
+        "material_hash": material_hash,
+        "binding": hmac.new(
+            key,
+            material_hash.encode("utf-8"),
+            sha256,
+        ).hexdigest(),
+    }
+
+
+def _trigger_time_full_cost_economics_binding_material(
+    *,
+    item: ExecutionPlanItem,
+    evidence: dict[str, object],
+    route_fingerprint: str,
+    liquidity_evidence_hash: str,
+) -> dict[str, object]:
+    return {
+        "version": TRIGGER_TIME_FULL_COST_ECONOMICS_PROVENANCE_VERSION,
+        "source": "kai-trading-exec.monitoring",
+        "execution_plan_id": str(item.execution_plan_id or ""),
+        "execution_plan_item_id": str(item.id or ""),
+        "plan_item_index": item.plan_item_index,
+        "provider": str(item.provider or "kis").strip().lower(),
+        "venue": str(item.venue or "").strip().upper(),
+        "asset_class": str(item.asset_class or "stock").strip().lower(),
+        "exchange": _plan_item_exchange(item).strip().upper(),
+        "symbol": str(item.symbol or "").strip().upper(),
+        "intent": str(item.intent or "").strip(),
+        "side": str(item.side or "").strip().lower(),
+        "route_fingerprint": route_fingerprint,
+        "liquidity_evidence_hash": liquidity_evidence_hash,
+        "evaluated_at": str(evidence.get("evaluated_at") or ""),
+        "gross_reward_risk": str(evidence.get("gross_reward_risk") or ""),
+        "net_reward_risk": str(evidence.get("net_reward_risk") or ""),
+        "minimum_reward_risk": str(evidence.get("minimum_reward_risk") or ""),
+        "estimated_round_trip_cost_bps": str(
+            evidence.get("estimated_round_trip_cost_bps") or ""
+        ),
+        "cost_evidence_source": str(evidence.get("cost_evidence_source") or ""),
+        "assessment_reason": (
+            None
+            if evidence.get("assessment_reason") is None
+            else str(evidence.get("assessment_reason"))
+        ),
+    }
+
+
+def _trigger_time_liquidity_evidence_payload(
+    item: ExecutionPlanItem,
+) -> dict[str, object] | None:
+    policy = item.quantity_policy if isinstance(item.quantity_policy, dict) else {}
+    evidence = policy.get(TRIGGER_TIME_LIQUIDITY_EVIDENCE_KEY)
+    return evidence if isinstance(evidence, dict) else None
+
+
+def _trigger_time_liquidity_binding_material(
+    evidence: dict[str, object],
+) -> dict[str, object]:
+    return {
+        "version": evidence.get("version"),
+        "provider": str(evidence.get("provider") or "").strip().lower(),
+        "asset_class": str(evidence.get("asset_class") or "").strip().lower(),
+        "exchange": str(evidence.get("exchange") or "").strip().upper(),
+        "symbol": str(evidence.get("symbol") or "").strip().upper(),
+        "observed_at": str(evidence.get("observed_at") or ""),
+        "freshness_source": str(evidence.get("freshness_source") or ""),
+        "endpoint": str(evidence.get("endpoint") or ""),
+        "tr_id": str(evidence.get("tr_id") or ""),
+        "volume": str(evidence.get("volume") or ""),
+        "turnover": str(evidence.get("turnover") or ""),
+        "day_high": str(evidence.get("day_high") or ""),
+        "day_low": str(evidence.get("day_low") or ""),
+    }
 
 
 def _watch_queue_evidence_is_fresh(
@@ -4555,6 +4749,7 @@ def _resolve_trigger_time_agent_action(
         )
         if refresh_error is not None or refreshed_price is None:
             return _post_agent_revalidation_failure(
+                settings=settings,
                 db=db,
                 claim=claim,
                 item=item,
@@ -4606,6 +4801,7 @@ def _resolve_trigger_time_agent_action(
             if detail is None and isinstance(missing_fields, list):
                 detail = f"missing live market fields: {', '.join(map(str, missing_fields))}"
             return _post_agent_revalidation_failure(
+                settings=settings,
                 db=db,
                 claim=claim,
                 item=item,
@@ -4627,6 +4823,7 @@ def _resolve_trigger_time_agent_action(
             triggered_at=revalidated_at,
         ):
             return _post_agent_revalidation_failure(
+                settings=settings,
                 db=db,
                 claim=claim,
                 item=item,
@@ -4653,6 +4850,7 @@ def _resolve_trigger_time_agent_action(
                 and refreshed_observed_price > chase_limit_price
             ):
                 return _post_agent_revalidation_failure(
+                    settings=settings,
                     db=db,
                     claim=claim,
                     item=item,
@@ -4817,6 +5015,7 @@ def _resolve_trigger_time_agent_action(
                     )
     if geometry_error is not None:
         return _post_agent_revalidation_failure(
+            settings=settings,
             db=db,
             claim=claim,
             item=item,
@@ -4840,6 +5039,7 @@ def _resolve_trigger_time_agent_action(
         )
     if economics_reason is not None:
         return _post_agent_revalidation_failure(
+            settings=settings,
             db=db,
             claim=claim,
             item=item,
@@ -4871,6 +5071,7 @@ def _resolve_trigger_time_agent_action(
         )
         if locked_stop is not None and decision.updated_stop_price < locked_stop:
             return _post_agent_revalidation_failure(
+                settings=settings,
                 db=db,
                 claim=claim,
                 item=item,
@@ -4897,6 +5098,7 @@ def _resolve_trigger_time_agent_action(
         )
     if economics is not None:
         _persist_trigger_time_full_cost_economics(
+            settings=settings,
             item=item,
             economics=economics,
             evaluated_at=post_agent_evaluated_at,
@@ -5515,12 +5717,13 @@ def _persist_trigger_time_liquidity_evidence(
 
 def _persist_trigger_time_full_cost_economics(
     *,
+    settings: Settings,
     item: ExecutionPlanItem,
     economics: BuyEconomicsAssessment,
     evaluated_at: datetime,
 ) -> None:
     risk_context = dict(_loaded_risk_context(item))
-    risk_context[TRIGGER_TIME_FULL_COST_ECONOMICS_KEY] = {
+    evidence = {
         "version": 1,
         "symbol": item.symbol,
         "evaluated_at": _normalize_utc(evaluated_at).isoformat(),
@@ -5535,6 +5738,14 @@ def _persist_trigger_time_full_cost_economics(
         "cost_evidence_source": economics.cost_evidence_source,
         "assessment_reason": economics.reason,
     }
+    provenance = _trigger_time_full_cost_economics_provenance(
+        settings=settings,
+        item=item,
+        evidence=evidence,
+    )
+    if provenance is not None:
+        evidence["provenance"] = provenance
+    risk_context[TRIGGER_TIME_FULL_COST_ECONOMICS_KEY] = evidence
     item.risk_context = compact_json_object(risk_context)
     if isinstance(item.quantity_policy, dict):
         item.quantity_policy = compact_json_object(item.quantity_policy)
@@ -5639,6 +5850,7 @@ def _post_agent_trigger_still_valid(
 
 def _post_agent_revalidation_failure(
     *,
+    settings: Settings,
     db: Session,
     claim: TriggerTimeAgentClaim,
     item: ExecutionPlanItem,
@@ -5667,6 +5879,7 @@ def _post_agent_revalidation_failure(
         )
     if economics is not None:
         _persist_trigger_time_full_cost_economics(
+            settings=settings,
             item=item,
             economics=economics,
             evaluated_at=recorded_at,

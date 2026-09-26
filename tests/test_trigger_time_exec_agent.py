@@ -5037,6 +5037,10 @@ def test_trigger_time_rechecks_structured_core_dynamic_gates(
         ]
         assert economics_evidence["minimum_reward_risk"] == "1.8000"
         assert Decimal(economics_evidence["net_reward_risk"]) > Decimal("1.80")
+        assert economics_evidence["provenance"]["source"] == (
+            "kai-trading-exec.monitoring"
+        )
+        assert economics_evidence["provenance"]["binding"]
     engine.dispose()
 
 

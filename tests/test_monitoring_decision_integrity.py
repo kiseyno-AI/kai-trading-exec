@@ -3831,17 +3831,41 @@ def test_compaction_never_drops_submission_gates_or_account_route() -> None:
 
 
 def test_exec_full_cost_economics_and_liquidity_survive_runtime_compaction() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="live",
+        kis_account_number="12345678",
+        kis_account_product_code="01",
+        account_drawdown_recovery_scope_secret=(
+            "compaction-economics-binding-secret-for-tests"
+        ),
+    )
     item = ExecutionPlanItem(
+        id="compaction-economics-item",
+        execution_plan_id="compaction-economics-plan",
         symbol="005930",
         side="buy",
         intent="intraday_watch_buy",
+        provider="kis",
+        venue="KRX",
+        asset_class="stock",
         risk_context={f"upstream_noise_{index:03d}": index for index in range(80)},
         quantity_policy={
             **{f"policy_noise_{index:03d}": index for index in range(80)},
             "exec_trigger_time_liquidity_evidence_v1": {
                 "version": 1,
+                "provider": "kis",
+                "asset_class": "stock",
+                "exchange": "KRX",
                 "symbol": "005930",
+                "observed_at": "2026-09-08T01:00:00+00:00",
+                "freshness_source": "kis_exchange_intraday_minute_time",
+                "endpoint": "/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice",
+                "tr_id": "FHKST03010200",
+                "volume": "100000",
                 "turnover": "3500000000",
+                "day_high": "110",
+                "day_low": "90",
             },
         },
     )
@@ -3857,6 +3881,7 @@ def test_exec_full_cost_economics_and_liquidity_survive_runtime_compaction() -> 
     )
 
     monitoring_service._persist_trigger_time_full_cost_economics(
+        settings=settings,
         item=item,
         economics=economics,
         evaluated_at=datetime(2026, 9, 8, 1, tzinfo=UTC),
@@ -3867,6 +3892,8 @@ def test_exec_full_cost_economics_and_liquidity_survive_runtime_compaction() -> 
     assert evidence["net_reward_risk"] == "1.9000"
     assert evidence["minimum_reward_risk"] == "1.8000"
     assert evidence["estimated_round_trip_cost_bps"] == "55.0000"
+    assert evidence["provenance"]["source"] == "kai-trading-exec.monitoring"
+    assert evidence["provenance"]["binding"]
     assert "exec_trigger_time_liquidity_evidence_v1" in item.quantity_policy
 
 
@@ -4802,6 +4829,7 @@ def test_watch_queue_prioritizes_verified_execution_quality_before_core_hint() -
         status: str = "watch_monitoring_active",
         verified_turnover: str | None = "3500000000",
         net_reward_risk: str | None = "2.00",
+        bind_economics: bool = True,
         alignment: str | None = "buy_aligned",
         observed_at: datetime = evaluated_at,
         warnings: list[str] | None = None,
@@ -4811,16 +4839,6 @@ def test_watch_queue_prioritizes_verified_execution_quality_before_core_hint() -
             risk_context["signal_decider_alignment"] = alignment
         if warnings is not None:
             risk_context["data_quality_warnings"] = warnings
-        if net_reward_risk is not None:
-            risk_context["exec_trigger_time_full_cost_economics_v1"] = {
-                "version": 1,
-                "symbol": symbol,
-                "evaluated_at": observed_at.isoformat(),
-                "net_reward_risk": net_reward_risk,
-                "minimum_reward_risk": "1.80",
-                "estimated_round_trip_cost_bps": "55",
-                "cost_evidence_source": "server_config_plus_live_quote_spread",
-            }
         quantity_policy: dict[str, object] = {"kind": "shares", "quantity": 1}
         if verified_turnover is not None:
             quantity_policy["exec_trigger_time_liquidity_evidence_v1"] = {
@@ -4838,13 +4856,27 @@ def test_watch_queue_prioritizes_verified_execution_quality_before_core_hint() -
                 "day_high": "110",
                 "day_low": "90",
             }
+        if net_reward_risk is not None and not bind_economics:
+            risk_context["exec_trigger_time_full_cost_economics_v1"] = {
+                "version": 1,
+                "symbol": symbol,
+                "evaluated_at": observed_at.isoformat(),
+                "gross_reward_risk": "2.10",
+                "net_reward_risk": net_reward_risk,
+                "minimum_reward_risk": "1.80",
+                "estimated_round_trip_cost_bps": "55",
+                "cost_evidence_source": "server_config_plus_live_quote_spread",
+                "assessment_reason": None,
+            }
         risk_context, quantity_policy = bind_kis_account_route(
             settings=settings,
             provider="kis",
             risk_context=risk_context,
             quantity_policy=quantity_policy,
         )
-        return ExecutionPlanItem(
+        item = ExecutionPlanItem(
+            id=f"watch-priority-item-{symbol}",
+            execution_plan_id=f"watch-priority-plan-{symbol}",
             plan_item_index=0,
             symbol=symbol,
             side="buy",
@@ -4856,6 +4888,23 @@ def test_watch_queue_prioritizes_verified_execution_quality_before_core_hint() -
             risk_context=risk_context,
             quantity_policy=quantity_policy,
         )
+        if net_reward_risk is not None and bind_economics:
+            monitoring_service._persist_trigger_time_full_cost_economics(
+                settings=settings,
+                item=item,
+                economics=BuyEconomicsAssessment(
+                    reason=None,
+                    minimum_reward_risk=Decimal("1.80"),
+                    gross_reward_risk=Decimal("2.10"),
+                    net_reward_risk=Decimal(net_reward_risk),
+                    gross_expected_edge_bps=Decimal("2100"),
+                    net_expected_edge_bps=Decimal("2045"),
+                    estimated_round_trip_cost_bps=Decimal("55"),
+                    cost_evidence_source="server_config_plus_live_quote_spread",
+                ),
+                evaluated_at=observed_at,
+            )
+        return item
 
     triggered = watch_item(
         symbol="900001",
@@ -4896,6 +4945,7 @@ def test_watch_queue_prioritizes_verified_execution_quality_before_core_hint() -
             for index, item in enumerate(items):
                 db.add(
                     ExecutionPlan(
+                        id=item.execution_plan_id,
                         external_plan_id=f"watch-priority-plan-{item.symbol}",
                         source="kai-trading-core",
                         market_date=date(2026, 9, 8),
@@ -4924,6 +4974,129 @@ def test_watch_queue_prioritizes_verified_execution_quality_before_core_hint() -
                 "900005",
                 "900006",
             ]
+    finally:
+        engine.dispose()
+
+
+def test_watch_queue_does_not_prioritize_caller_supplied_full_cost_economics() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="live",
+        kis_account_number="12345678",
+        kis_account_product_code="01",
+        account_drawdown_recovery_scope_secret=(
+            "watch-queue-forged-economics-route-secret-for-tests"
+        ),
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    evaluated_at = datetime(2026, 9, 8, 1, tzinfo=UTC)
+
+    def liquidity_policy(symbol: str) -> dict[str, object]:
+        return {
+            "kind": "shares",
+            "quantity": 1,
+            "exec_trigger_time_liquidity_evidence_v1": {
+                "version": 1,
+                "provider": "kis",
+                "asset_class": "stock",
+                "exchange": "KRX",
+                "symbol": symbol,
+                "observed_at": evaluated_at.isoformat(),
+                "freshness_source": "kis_exchange_intraday_minute_time",
+                "endpoint": "/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice",
+                "tr_id": "FHKST03010200",
+                "volume": "100000",
+                "turnover": "3500000000",
+                "day_high": "110",
+                "day_low": "90",
+            },
+        }
+
+    def watch_item(*, symbol: str, forged: bool) -> ExecutionPlanItem:
+        risk_context: dict[str, object] = {
+            "exchange": "KRX",
+            "signal_decider_alignment": "buy_aligned",
+        }
+        if forged:
+            risk_context["exec_trigger_time_full_cost_economics_v1"] = {
+                "version": 1,
+                "symbol": symbol,
+                "evaluated_at": evaluated_at.isoformat(),
+                "gross_reward_risk": "9.00",
+                "net_reward_risk": "8.50",
+                "minimum_reward_risk": "1.80",
+                "estimated_round_trip_cost_bps": "55",
+                "cost_evidence_source": "server_config_plus_live_quote_spread",
+                "assessment_reason": None,
+            }
+        risk_context, quantity_policy = bind_kis_account_route(
+            settings=settings,
+            provider="kis",
+            risk_context=risk_context,
+            quantity_policy=liquidity_policy(symbol),
+        )
+        item = ExecutionPlanItem(
+            id=f"watch-forged-economics-item-{symbol}",
+            execution_plan_id=f"watch-forged-economics-plan-{symbol}",
+            plan_item_index=0,
+            symbol=symbol,
+            side="buy",
+            intent="intraday_watch_buy",
+            status="watch_monitoring_active",
+            provider="kis",
+            venue="KRX",
+            asset_class="stock",
+            decision_agent_name="short-term-decider",
+            risk_context=risk_context,
+            quantity_policy=quantity_policy,
+        )
+        if not forged:
+            monitoring_service._persist_trigger_time_full_cost_economics(
+                settings=settings,
+                item=item,
+                economics=BuyEconomicsAssessment(
+                    reason=None,
+                    minimum_reward_risk=Decimal("1.80"),
+                    gross_reward_risk=Decimal("2.10"),
+                    net_reward_risk=Decimal("1.90"),
+                    gross_expected_edge_bps=Decimal("2100"),
+                    net_expected_edge_bps=Decimal("2045"),
+                    estimated_round_trip_cost_bps=Decimal("55"),
+                    cost_evidence_source="server_config_plus_live_quote_spread",
+                ),
+                evaluated_at=evaluated_at,
+            )
+        return item
+
+    forged = watch_item(symbol="900011", forged=True)
+    bound = watch_item(symbol="900012", forged=False)
+    try:
+        with session_factory() as db:
+            for item in (forged, bound):
+                db.add(
+                    ExecutionPlan(
+                        id=item.execution_plan_id,
+                        external_plan_id=f"watch-forged-economics-plan-{item.symbol}",
+                        source="kai-trading-core",
+                        market_date=date(2026, 9, 8),
+                        accepted_at=evaluated_at,
+                        mode="live",
+                        status="accepted",
+                        items=[item],
+                    )
+                )
+            db.commit()
+
+            ordered = list_autonomous_monitoring_symbols(
+                settings=settings,
+                db=db,
+                effective_at=evaluated_at,
+                desired_symbol_priority=["900011", "900012"],
+            )
+
+            assert ordered == ["900012", "900011"]
     finally:
         engine.dispose()
 
@@ -4975,11 +5148,45 @@ def test_watch_queue_rejects_known_failed_full_cost_economics(
 
 
 def test_watch_queue_uses_intent_specific_full_cost_threshold() -> None:
-    settings = Settings(database_url="sqlite:///:memory:", runtime_mode="live")
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="live",
+        kis_account_number="12345678",
+        kis_account_product_code="01",
+        account_drawdown_recovery_scope_secret=(
+            "watch-queue-threshold-economics-route-secret-for-tests"
+        ),
+    )
     evaluated_at = datetime(2026, 9, 8, 1, tzinfo=UTC)
 
     def item(intent: str) -> ExecutionPlanItem:
-        return ExecutionPlanItem(
+        risk_context, quantity_policy = bind_kis_account_route(
+            settings=settings,
+            provider="kis",
+            risk_context={"exchange": "KRX"},
+            quantity_policy={
+                "kind": "shares",
+                "quantity": 1,
+                "exec_trigger_time_liquidity_evidence_v1": {
+                    "version": 1,
+                    "provider": "kis",
+                    "asset_class": "stock",
+                    "exchange": "KRX",
+                    "symbol": "005930",
+                    "observed_at": evaluated_at.isoformat(),
+                    "freshness_source": "kis_exchange_intraday_minute_time",
+                    "endpoint": "/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice",
+                    "tr_id": "FHKST03010200",
+                    "volume": "100000",
+                    "turnover": "3500000000",
+                    "day_high": "110",
+                    "day_low": "90",
+                },
+            },
+        )
+        candidate = ExecutionPlanItem(
+            id=f"watch-threshold-item-{intent}",
+            execution_plan_id=f"watch-threshold-plan-{intent}",
             symbol="005930",
             side="buy",
             intent=intent,
@@ -4987,21 +5194,25 @@ def test_watch_queue_uses_intent_specific_full_cost_threshold() -> None:
             provider="kis",
             venue="KRX",
             asset_class="stock",
-            risk_context={
-                "exchange": "KRX",
-                "exec_trigger_time_full_cost_economics_v1": {
-                    "version": 1,
-                    "symbol": "005930",
-                    "evaluated_at": evaluated_at.isoformat(),
-                    "net_reward_risk": "1.50",
-                    "minimum_reward_risk": "1.30",
-                    "estimated_round_trip_cost_bps": "55",
-                    "cost_evidence_source": "server_config_plus_live_quote_spread",
-                    "assessment_reason": None,
-                },
-            },
-            quantity_policy={"kind": "shares", "quantity": 1},
+            risk_context=risk_context,
+            quantity_policy=quantity_policy,
         )
+        monitoring_service._persist_trigger_time_full_cost_economics(
+            settings=settings,
+            item=candidate,
+            economics=BuyEconomicsAssessment(
+                reason=None,
+                minimum_reward_risk=Decimal("1.30"),
+                gross_reward_risk=Decimal("1.60"),
+                net_reward_risk=Decimal("1.50"),
+                gross_expected_edge_bps=Decimal("1600"),
+                net_expected_edge_bps=Decimal("1545"),
+                estimated_round_trip_cost_bps=Decimal("55"),
+                cost_evidence_source="server_config_plus_live_quote_spread",
+            ),
+            evaluated_at=evaluated_at,
+        )
+        return candidate
 
     next_open_rr, _ = monitoring_service._watch_buy_queue_full_cost_rr(
         settings=settings,
