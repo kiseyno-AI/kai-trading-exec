@@ -68,6 +68,8 @@ PLAN_ITEM_SUBMISSION_RISK_KEYS = (
 EXECUTION_SAFETY_PRIORITY_KEYS = (
     *PLAN_ITEM_SUBMISSION_RISK_KEYS,
     "execution_account_route",
+    "exec_trigger_time_liquidity_evidence_v1",
+    "exec_trigger_time_full_cost_economics_v1",
 )
 
 DEFAULT_PRIORITY_KEYS = tuple(dict.fromkeys((

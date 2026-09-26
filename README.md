@@ -565,7 +565,7 @@ The shared market-regime guardrail **downsizes** risk-off and caution buys using
 
 High-volatility chase vetoes are enabled by default. Fresh ATR and five-day return context can reject extended buys; confirmed pullbacks continue through pullback and live-market-quality checks.
 
-Core market context is advisory ordering context. If Core is temporarily unavailable, Exec retains the last successful priority list for its configured TTL, while the Exec-local plan remains the durable monitoring source of truth. Live watches also have a trading-session TTL plus a calendar safety cap, and the monitoring scheduler supersedes older duplicate routes before allocating its rotating symbol budget. This prevents stale or duplicate watches from permanently starving newer actionable symbols.
+Core market context is advisory ordering context. If Core is temporarily unavailable, Exec retains the last successful priority list for its configured TTL, while the Exec-local plan remains the durable monitoring source of truth. Within the domestic queue, triggered work is considered first and fresh, provider-bound trigger-time turnover plus full-cost reward/risk evidence outranks missing or failing evidence; Core's desired order remains the final advisory tie-breaker. US symbols keep their existing relative order. Domestic short-term watches are authorized only for their target KRX date and expire at that session's 15:30 KST close, while the broader trading-session TTL and calendar safety cap remain recovery guards for other watches. The monitoring scheduler also supersedes older duplicate routes before allocating its rotating symbol budget. This prevents stale, low-quality, or duplicate watches from permanently starving newer actionable symbols.
 
 ### Account drawdown stop and automatic recovery
 
@@ -785,7 +785,7 @@ python3.12 scripts/export_weekly_trade_review.py \
   --end-at 2026-08-08T00:00:00+09:00
 ```
 
-Weekly artifacts default to `var/analytics/weekly_trade_review/`. They include FIFO-based realized P/L, gross and eligible net results, transaction-cost coverage, currency-separated summaries, and lot-level evidence. Use explicit timezone offsets for trading-date boundaries and load stored JSON payloads only for deliberate deep dives.
+Weekly artifacts default to `var/analytics/weekly_trade_review/`. They include FIFO-based realized P/L, gross and eligible net results, transaction-cost coverage, currency-separated summaries, lot-level evidence, and explicit fill-to-plan/decision attribution coverage. Missing local plan or decision identity is reported as incomplete coverage instead of silently disappearing through an inner join; Core-linked fills additionally require the item decision run to match the plan strategy run. Use explicit timezone offsets for trading-date boundaries and load stored JSON payloads only for deliberate deep dives.
 
 ### Fill evidence repair
 

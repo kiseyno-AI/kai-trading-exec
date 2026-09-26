@@ -5861,7 +5861,15 @@ def _automated_kis_buy_market_evidence_failure(
             plan_item.plan.market_date if plan_item.plan is not None else None
         )
         current_market_date = evaluated_at.astimezone(market_timezone).date()
-        if plan_market_date is None or plan_market_date > current_market_date:
+        if (
+            plan_market_date is None
+            or plan_market_date > current_market_date
+            or (
+                is_domestic
+                and is_short_term_watch_buy_intent(plan_item.intent)
+                and plan_market_date != current_market_date
+            )
+        ):
             return (
                 "live_buy_plan_market_date_mismatch",
                 "automated KIS buy plan is not authorized for the current market date",

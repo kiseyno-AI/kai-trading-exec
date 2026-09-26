@@ -23,7 +23,10 @@ from app.services.autonomous_runtime import (
     MonitoringRuntimeSnapshot,
 )
 from app.services.execution_account_route import bind_kis_account_route
-from app.services.exec_agent_approval import delegated_buy_gate_rejections
+from app.services.exec_agent_approval import (
+    BuyEconomicsAssessment,
+    delegated_buy_gate_rejections,
+)
 from app.services.json_compaction import compact_json_object, json_payload_hash
 from app.services import monitoring as monitoring_service
 from app.services import monitoring_price_source
@@ -3827,6 +3830,46 @@ def test_compaction_never_drops_submission_gates_or_account_route() -> None:
     ) == [f"delegated_gate_failed:{code}" for code in codes]
 
 
+def test_exec_full_cost_economics_and_liquidity_survive_runtime_compaction() -> None:
+    item = ExecutionPlanItem(
+        symbol="005930",
+        side="buy",
+        intent="intraday_watch_buy",
+        risk_context={f"upstream_noise_{index:03d}": index for index in range(80)},
+        quantity_policy={
+            **{f"policy_noise_{index:03d}": index for index in range(80)},
+            "exec_trigger_time_liquidity_evidence_v1": {
+                "version": 1,
+                "symbol": "005930",
+                "turnover": "3500000000",
+            },
+        },
+    )
+    economics = BuyEconomicsAssessment(
+        reason=None,
+        minimum_reward_risk=Decimal("1.8000"),
+        gross_reward_risk=Decimal("2.0000"),
+        net_reward_risk=Decimal("1.9000"),
+        gross_expected_edge_bps=Decimal("2000.0000"),
+        net_expected_edge_bps=Decimal("1945.0000"),
+        estimated_round_trip_cost_bps=Decimal("55.0000"),
+        cost_evidence_source="server_config_plus_live_quote_spread",
+    )
+
+    monitoring_service._persist_trigger_time_full_cost_economics(
+        item=item,
+        economics=economics,
+        evaluated_at=datetime(2026, 9, 8, 1, tzinfo=UTC),
+    )
+
+    evidence = item.risk_context["exec_trigger_time_full_cost_economics_v1"]
+    assert evidence["symbol"] == "005930"
+    assert evidence["net_reward_risk"] == "1.9000"
+    assert evidence["minimum_reward_risk"] == "1.8000"
+    assert evidence["estimated_round_trip_cost_bps"] == "55.0000"
+    assert "exec_trigger_time_liquidity_evidence_v1" in item.quantity_policy
+
+
 @pytest.mark.parametrize(
     "authority_key",
     ("monitoring_order_authority", "short_term_watcher_order_authority"),
@@ -4150,7 +4193,7 @@ def test_watch_candidate_listing_supersedes_older_duplicate_active_item() -> Non
         plan_item_index=0,
         symbol="005930",
         side="buy",
-        intent="intraday_watch_buy",
+        intent="next_open_buy",
         status="watch_monitoring_active",
         source_plan_item_id="same-watch-family",
     )
@@ -4159,7 +4202,7 @@ def test_watch_candidate_listing_supersedes_older_duplicate_active_item() -> Non
         plan_item_index=0,
         symbol="005930",
         side="buy",
-        intent="intraday_watch_buy",
+        intent="next_open_buy",
         status="watch_monitoring_active",
         provider="kis",
         asset_class="stock",
@@ -4336,7 +4379,7 @@ def test_newer_legacy_mismatched_account_watch_cannot_supersede_valid_watch() ->
         plan_item_index=0,
         symbol="005930",
         side="buy",
-        intent="intraday_watch_buy",
+        intent="next_open_buy",
         status="watch_monitoring_active",
         provider="kis",
         asset_class="stock",
@@ -4347,7 +4390,7 @@ def test_newer_legacy_mismatched_account_watch_cannot_supersede_valid_watch() ->
         plan_item_index=0,
         symbol="005930",
         side="buy",
-        intent="intraday_watch_buy",
+        intent="next_open_buy",
         status="watch_monitoring_active",
         provider="kis",
         asset_class="stock",
@@ -4358,7 +4401,7 @@ def test_newer_legacy_mismatched_account_watch_cannot_supersede_valid_watch() ->
         plan_item_index=0,
         symbol="005930",
         side="buy",
-        intent="intraday_watch_buy",
+        intent="next_open_buy",
         status="watch_monitoring_active",
         provider="kis",
         asset_class="stock",
@@ -4601,7 +4644,7 @@ def test_watch_candidate_ttl_spans_two_trading_sessions_then_expires() -> None:
                 plan_item_index=0,
                 symbol="005930",
                 side="buy",
-                intent="intraday_watch_buy",
+                intent="next_open_buy",
                 status="watch_monitoring_active",
             )
             db.add(
@@ -4655,6 +4698,408 @@ def test_watch_candidate_ttl_spans_two_trading_sessions_then_expires() -> None:
             assert event["event"] == "watch_buy_trading_session_ttl_elapsed"
             assert event["age_trading_sessions"] == 2
             assert event["max_age_trading_sessions"] == 2
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.parametrize(
+    "decision_agent_name",
+    ("short-term-decider", "signal-decider"),
+)
+def test_short_term_watch_expires_when_holiday_normalized_target_session_ends(
+    decision_agent_name: str,
+) -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="live",
+        kis_account_number="12345678",
+        kis_account_product_code="01",
+        account_drawdown_recovery_scope_secret=(
+            "target-session-expiry-route-secret-for-tests"
+        ),
+        monitoring_watch_buy_max_age_trading_sessions=2,
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    risk_context, quantity_policy = bind_kis_account_route(
+        settings=settings,
+        provider="kis",
+        risk_context={"exchange": "KRX"},
+        quantity_policy={"kind": "shares", "quantity": 1},
+    )
+    target_market_date = date(2026, 9, 28)
+
+    try:
+        with session_factory() as db:
+            item = ExecutionPlanItem(
+                id="holiday-normalized-short-term-watch",
+                plan_item_index=0,
+                symbol="005930",
+                side="buy",
+                intent="intraday_watch_buy",
+                status="watch_monitoring_active",
+                provider="kis",
+                asset_class="stock",
+                decision_agent_name=decision_agent_name,
+                source_market_date=date(2026, 9, 23),
+                risk_context=risk_context,
+                quantity_policy=quantity_policy,
+            )
+            db.add(
+                ExecutionPlan(
+                    id="holiday-normalized-short-term-plan",
+                    external_plan_id="holiday-normalized-short-term-plan",
+                    source="kai-trading-core",
+                    market_date=target_market_date,
+                    accepted_at=datetime(2026, 9, 24, 5, tzinfo=UTC),
+                    mode="live",
+                    status="accepted",
+                    items=[item],
+                )
+            )
+            db.commit()
+
+            assert list_autonomous_monitoring_symbols(
+                settings=settings,
+                db=db,
+                effective_at=datetime(2026, 9, 28, 6, 29, tzinfo=UTC),
+            ) == ["005930"]
+            assert item.status == "watch_monitoring_active"
+
+            assert list_autonomous_monitoring_symbols(
+                settings=settings,
+                db=db,
+                effective_at=datetime(2026, 9, 28, 6, 30, tzinfo=UTC),
+            ) == []
+            assert item.status == "watch_expired"
+            event = item.risk_context["last_monitoring_event"]
+            assert event["event"] == "watch_buy_target_session_elapsed"
+            assert event["target_market_date"] == "2026-09-28"
+            assert event["source_market_date"] == "2026-09-28"
+    finally:
+        engine.dispose()
+
+
+def test_watch_queue_prioritizes_verified_execution_quality_before_core_hint() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="live",
+        kis_account_number="12345678",
+        kis_account_product_code="01",
+        account_drawdown_recovery_scope_secret=(
+            "watch-queue-priority-route-secret-for-tests"
+        ),
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    evaluated_at = datetime(2026, 9, 8, 1, tzinfo=UTC)
+
+    def watch_item(
+        *,
+        symbol: str,
+        status: str = "watch_monitoring_active",
+        verified_turnover: str | None = "3500000000",
+        net_reward_risk: str | None = "2.00",
+        alignment: str | None = "buy_aligned",
+        observed_at: datetime = evaluated_at,
+        warnings: list[str] | None = None,
+    ) -> ExecutionPlanItem:
+        risk_context: dict[str, object] = {"exchange": "KRX"}
+        if alignment is not None:
+            risk_context["signal_decider_alignment"] = alignment
+        if warnings is not None:
+            risk_context["data_quality_warnings"] = warnings
+        if net_reward_risk is not None:
+            risk_context["exec_trigger_time_full_cost_economics_v1"] = {
+                "version": 1,
+                "symbol": symbol,
+                "evaluated_at": observed_at.isoformat(),
+                "net_reward_risk": net_reward_risk,
+                "minimum_reward_risk": "1.80",
+                "estimated_round_trip_cost_bps": "55",
+                "cost_evidence_source": "server_config_plus_live_quote_spread",
+            }
+        quantity_policy: dict[str, object] = {"kind": "shares", "quantity": 1}
+        if verified_turnover is not None:
+            quantity_policy["exec_trigger_time_liquidity_evidence_v1"] = {
+                "version": 1,
+                "provider": "kis",
+                "asset_class": "stock",
+                "exchange": "KRX",
+                "symbol": symbol,
+                "observed_at": observed_at.isoformat(),
+                "freshness_source": "kis_exchange_intraday_minute_time",
+                "endpoint": "/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice",
+                "tr_id": "FHKST03010200",
+                "volume": "100000",
+                "turnover": verified_turnover,
+                "day_high": "110",
+                "day_low": "90",
+            }
+        risk_context, quantity_policy = bind_kis_account_route(
+            settings=settings,
+            provider="kis",
+            risk_context=risk_context,
+            quantity_policy=quantity_policy,
+        )
+        return ExecutionPlanItem(
+            plan_item_index=0,
+            symbol=symbol,
+            side="buy",
+            intent="intraday_watch_buy",
+            status=status,
+            provider="kis",
+            asset_class="stock",
+            decision_agent_name="short-term-decider",
+            risk_context=risk_context,
+            quantity_policy=quantity_policy,
+        )
+
+    triggered = watch_item(
+        symbol="900001",
+        status="watch_buy_triggered",
+        verified_turnover=None,
+        net_reward_risk=None,
+        alignment=None,
+    )
+    aligned_fresh = watch_item(symbol="900002")
+    aligned_stale_warning = watch_item(
+        symbol="900003",
+        observed_at=evaluated_at - timedelta(seconds=5),
+        warnings=["advisory data warning"],
+    )
+    alignment_conflict = watch_item(
+        symbol="900004",
+        alignment="wait_conflict_block",
+    )
+    no_full_cost_rr = watch_item(
+        symbol="900005",
+        net_reward_risk=None,
+    )
+    no_verified_liquidity = watch_item(
+        symbol="900006",
+        verified_turnover=None,
+    )
+    items = [
+        triggered,
+        aligned_fresh,
+        aligned_stale_warning,
+        alignment_conflict,
+        no_full_cost_rr,
+        no_verified_liquidity,
+    ]
+
+    try:
+        with session_factory() as db:
+            for index, item in enumerate(items):
+                db.add(
+                    ExecutionPlan(
+                        external_plan_id=f"watch-priority-plan-{item.symbol}",
+                        source="kai-trading-core",
+                        market_date=date(2026, 9, 8),
+                        accepted_at=evaluated_at - timedelta(minutes=index),
+                        mode="live",
+                        status="accepted",
+                        items=[item],
+                    )
+                )
+            db.commit()
+
+            ordered = list_autonomous_monitoring_symbols(
+                settings=settings,
+                db=db,
+                effective_at=evaluated_at,
+                desired_symbol_priority=list(
+                    reversed([item.symbol for item in items])
+                ),
+            )
+
+            assert ordered == [
+                "900001",
+                "900002",
+                "900003",
+                "900004",
+                "900005",
+                "900006",
+            ]
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("minimum_reward_risk", "assessment_reason"),
+    [
+        ("2.50", None),
+        ("1.80", "net_reward_risk_below_minimum"),
+    ],
+)
+def test_watch_queue_rejects_known_failed_full_cost_economics(
+    minimum_reward_risk: str,
+    assessment_reason: str | None,
+) -> None:
+    evaluated_at = datetime(2026, 9, 8, 1, tzinfo=UTC)
+    item = ExecutionPlanItem(
+        symbol="005930",
+        side="buy",
+        intent="intraday_watch_buy",
+        status="watch_buy_triggered",
+        provider="kis",
+        venue="KRX",
+        asset_class="stock",
+        risk_context={
+            "exchange": "KRX",
+            "exec_trigger_time_full_cost_economics_v1": {
+                "version": 1,
+                "symbol": "005930",
+                "evaluated_at": evaluated_at.isoformat(),
+                "net_reward_risk": "2.00",
+                "minimum_reward_risk": minimum_reward_risk,
+                "estimated_round_trip_cost_bps": "55",
+                "cost_evidence_source": "server_config_plus_live_quote_spread",
+                "assessment_reason": assessment_reason,
+            },
+        },
+        quantity_policy={"kind": "shares", "quantity": 1},
+    )
+
+    reward_risk, observed_at = monitoring_service._watch_buy_queue_full_cost_rr(
+        settings=Settings(database_url="sqlite:///:memory:", runtime_mode="live"),
+        item=item,
+        evaluated_at=evaluated_at,
+    )
+
+    assert reward_risk is None
+    assert observed_at is None
+
+
+def test_watch_queue_uses_intent_specific_full_cost_threshold() -> None:
+    settings = Settings(database_url="sqlite:///:memory:", runtime_mode="live")
+    evaluated_at = datetime(2026, 9, 8, 1, tzinfo=UTC)
+
+    def item(intent: str) -> ExecutionPlanItem:
+        return ExecutionPlanItem(
+            symbol="005930",
+            side="buy",
+            intent=intent,
+            status="watch_buy_triggered",
+            provider="kis",
+            venue="KRX",
+            asset_class="stock",
+            risk_context={
+                "exchange": "KRX",
+                "exec_trigger_time_full_cost_economics_v1": {
+                    "version": 1,
+                    "symbol": "005930",
+                    "evaluated_at": evaluated_at.isoformat(),
+                    "net_reward_risk": "1.50",
+                    "minimum_reward_risk": "1.30",
+                    "estimated_round_trip_cost_bps": "55",
+                    "cost_evidence_source": "server_config_plus_live_quote_spread",
+                    "assessment_reason": None,
+                },
+            },
+            quantity_policy={"kind": "shares", "quantity": 1},
+        )
+
+    next_open_rr, _ = monitoring_service._watch_buy_queue_full_cost_rr(
+        settings=settings,
+        item=item("next_open_buy"),
+        evaluated_at=evaluated_at,
+    )
+    intraday_rr, intraday_observed_at = (
+        monitoring_service._watch_buy_queue_full_cost_rr(
+            settings=settings,
+            item=item("intraday_watch_buy"),
+            evaluated_at=evaluated_at,
+        )
+    )
+
+    assert next_open_rr == Decimal("1.50")
+    assert intraday_rr is None
+    assert intraday_observed_at is None
+
+
+def test_watch_queue_keeps_prior_desired_order_for_us_equities() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="live",
+        kis_account_number="12345678",
+        kis_account_product_code="01",
+        account_drawdown_recovery_scope_secret=(
+            "watch-queue-us-order-route-secret-for-tests"
+        ),
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    evaluated_at = datetime(2026, 9, 8, 14, tzinfo=UTC)
+
+    def us_watch(*, symbol: str, status: str, alignment: str) -> ExecutionPlanItem:
+        risk_context, quantity_policy = bind_kis_account_route(
+            settings=settings,
+            provider="kis",
+            risk_context={
+                "exchange": "NASD",
+                "signal_decider_alignment": alignment,
+            },
+            quantity_policy={"kind": "shares", "quantity": 1},
+        )
+        return ExecutionPlanItem(
+            symbol=symbol,
+            side="buy",
+            intent="intraday_watch_buy",
+            status=status,
+            provider="kis",
+            venue="NASD",
+            asset_class="us_equity",
+            risk_context=risk_context,
+            quantity_policy=quantity_policy,
+        )
+
+    first = us_watch(
+        symbol="AAPL",
+        status="watch_monitoring_active",
+        alignment="wait_conflict_block",
+    )
+    second = us_watch(
+        symbol="MSFT",
+        status="watch_buy_triggered",
+        alignment="buy_aligned",
+    )
+    try:
+        with session_factory() as db:
+            db.add_all(
+                [
+                    ExecutionPlan(
+                        external_plan_id="us-watch-priority-aapl",
+                        source="test",
+                        market_date=date(2026, 9, 8),
+                        accepted_at=evaluated_at,
+                        mode="live",
+                        status="accepted",
+                        items=[first],
+                    ),
+                    ExecutionPlan(
+                        external_plan_id="us-watch-priority-msft",
+                        source="test",
+                        market_date=date(2026, 9, 8),
+                        accepted_at=evaluated_at,
+                        mode="live",
+                        status="accepted",
+                        items=[second],
+                    ),
+                ]
+            )
+            db.commit()
+
+            assert list_autonomous_monitoring_symbols(
+                settings=settings,
+                db=db,
+                effective_at=evaluated_at,
+                desired_symbol_priority=["AAPL", "MSFT"],
+            ) == ["AAPL", "MSFT"]
     finally:
         engine.dispose()
 
@@ -4879,7 +5324,7 @@ def test_watch_ttl_counts_observed_market_sessions_not_weekends_or_closures() ->
                 plan_item_index=0,
                 symbol="005930",
                 side="buy",
-                intent="intraday_watch_buy",
+                intent="next_open_buy",
                 status="watch_monitoring_active",
             )
             db.add_all(

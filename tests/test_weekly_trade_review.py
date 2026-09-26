@@ -27,6 +27,8 @@ from app.models.runtime import (
 from app.services.weekly_trade_review import (
     WeeklyTradeReviewTimeoutError,
     _weekly_closed_trades,
+    _weekly_fill_attribution_coverage,
+    _weekly_fills,
     generate_weekly_trade_review,
 )
 from app.services.runtime import runtime_counts
@@ -64,6 +66,151 @@ def _assert_mapping_contains(actual: object, expected: dict[str, object]) -> Non
             _assert_mapping_contains(actual[key], expected_value)
         else:
             assert actual[key] == expected_value
+
+
+def test_weekly_fills_expose_decision_linkage_and_explicit_unknown_coverage() -> None:
+    settings = Settings(database_url="sqlite:///:memory:", runtime_mode="paper")
+    engine, db = _build_db(settings)
+    start_at = datetime(2026, 9, 1, tzinfo=UTC)
+    end_at = datetime(2026, 9, 8, tzinfo=UTC)
+    plan = ExecutionPlan(
+        id="linked-fill-plan",
+        external_plan_id="linked-fill-plan",
+        source="kai-trading-core",
+        market_date=datetime(2026, 9, 2, tzinfo=UTC).date(),
+        strategy_run_id="decision-run-101",
+        mode="paper",
+        status="accepted",
+    )
+    item = ExecutionPlanItem(
+        id="linked-fill-item",
+        plan=plan,
+        plan_item_index=0,
+        symbol="005930",
+        side="buy",
+        intent="intraday_watch_buy",
+        status="filled",
+        decision_agent_name="short-term-decider",
+        decision_snapshot_id="snapshot-101",
+        decision_run_id="decision-run-101",
+        source_market_date=datetime(2026, 9, 1, tzinfo=UTC).date(),
+    )
+    linked_order = BrokerOrder(
+        id="linked-fill-order",
+        plan_item=item,
+        broker_name="kis",
+        mode="paper",
+        idempotency_key="linked-fill-order",
+        symbol="005930",
+        side="buy",
+        status="filled",
+        quantity=1,
+    )
+    unknown_order = BrokerOrder(
+        id="unknown-fill-order",
+        broker_name="kis",
+        mode="paper",
+        idempotency_key="unknown-fill-order",
+        symbol="000660",
+        side="buy",
+        status="filled",
+        quantity=1,
+    )
+    db.add_all(
+        [
+            plan,
+            linked_order,
+            unknown_order,
+            ExecutionFill(
+                id="linked-fill",
+                broker_order=linked_order,
+                symbol="005930",
+                side="buy",
+                quantity=1,
+                price=Decimal("70000"),
+                filled_at=start_at + timedelta(hours=1),
+            ),
+            ExecutionFill(
+                id="unknown-fill",
+                broker_order=unknown_order,
+                symbol="000660",
+                side="buy",
+                quantity=1,
+                price=Decimal("120000"),
+                filled_at=start_at + timedelta(hours=2),
+            ),
+        ]
+    )
+    db.commit()
+
+    rows, truncated = _weekly_fills(
+        db=db,
+        mode="paper",
+        start_at=start_at,
+        end_at=end_at,
+        include_json_payloads=False,
+        max_rows=20,
+    )
+    rows_by_id = {row["id"]: row for row in rows}
+
+    assert truncated is False
+    _assert_mapping_contains(
+        rows_by_id["linked-fill"],
+        {
+            "execution_plan_item_id": "linked-fill-item",
+            "execution_plan_item_intent": "intraday_watch_buy",
+            "decision_agent_name": "short-term-decider",
+            "decision_snapshot_id": "snapshot-101",
+            "decision_run_id": "decision-run-101",
+            "source_market_date": datetime(2026, 9, 1, tzinfo=UTC).date(),
+            "target_market_date": datetime(2026, 9, 2, tzinfo=UTC).date(),
+            "execution_plan_source": "kai-trading-core",
+            "strategy_run_id": "decision-run-101",
+        },
+    )
+    assert rows_by_id["unknown-fill"]["execution_plan_item_id"] is None
+    assert rows_by_id["unknown-fill"]["decision_snapshot_id"] is None
+    assert _weekly_fill_attribution_coverage(rows, truncated=False) == {
+        "status": "incomplete",
+        "truncated": False,
+        "total_fill_rows": 2,
+        "execution_plan_item_linked_fill_rows": 1,
+        "execution_plan_item_unlinked_fill_rows": 1,
+        "decision_identity_linked_fill_rows": 1,
+        "decision_identity_missing_fill_rows": 1,
+        "decision_run_mismatch_fill_rows": 0,
+        "unlinked_fill_ids": ["unknown-fill"],
+        "decision_identity_missing_fill_ids": ["unknown-fill"],
+        "decision_run_mismatch_fill_ids": [],
+    }
+    db.close()
+    engine.dispose()
+
+
+def test_weekly_fill_attribution_rejects_core_decision_run_mismatch() -> None:
+    coverage = _weekly_fill_attribution_coverage(
+        [
+            {
+                "id": "mismatched-core-fill",
+                "execution_plan_item_id": "item-1",
+                "decision_agent_name": "short-term-decider",
+                "decision_snapshot_id": "snapshot-1",
+                "decision_run_id": "decision-run-1",
+                "execution_plan_source": "kai-trading-core",
+                "strategy_run_id": "strategy-run-2",
+            }
+        ],
+        truncated=False,
+    )
+
+    assert coverage["status"] == "incomplete"
+    assert coverage["decision_identity_linked_fill_rows"] == 0
+    assert coverage["decision_identity_missing_fill_ids"] == [
+        "mismatched-core-fill"
+    ]
+    assert coverage["decision_run_mismatch_fill_ids"] == [
+        "mismatched-core-fill"
+    ]
 
 
 def test_weekly_fifo_never_pairs_same_symbol_across_execution_routes() -> None:
