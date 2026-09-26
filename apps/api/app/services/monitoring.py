@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta, tzinfo
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from functools import partial
+from hashlib import sha256
+import hmac
 import json
 import logging
 import os
@@ -94,6 +96,7 @@ from app.services.position_identity import (
     PositionIdentityConflictError,
     build_position_identity,
     position_identity_from_columns,
+    stable_account_scope_hmac_key,
 )
 from app.services.risk_sizing import (
     RiskSizingRejection,
@@ -120,6 +123,7 @@ from app.services.runtime_transitions import (
 )
 from app.services import trigger_time_exec_agent
 from app.services.exec_agent_approval import (
+    BuyEconomicsAssessment,
     DELEGATED_LIQUIDITY_GATE_CODE,
     SHORT_TERM_LIVE_MIN_NET_REWARD_RISK,
     SHORT_TERM_LIVE_MIN_TURNOVER_KRW,
@@ -148,6 +152,10 @@ AGENT_APPROVED_PENDING_SUBMIT_STATUS = trigger_time_exec_agent.AGENT_APPROVED_PE
 AGENT_ACTIVE_STATUSES = trigger_time_exec_agent.AGENT_ACTIVE_STATUSES
 MAX_PROTECTIVE_STOP_COVERAGE_DETAILS = 20
 TRIGGER_TIME_LIQUIDITY_EVIDENCE_KEY = "exec_trigger_time_liquidity_evidence_v1"
+TRIGGER_TIME_FULL_COST_ECONOMICS_KEY = "exec_trigger_time_full_cost_economics_v1"
+TRIGGER_TIME_FULL_COST_ECONOMICS_PROVENANCE_VERSION = (
+    "exec-trigger-time-full-cost-economics-provenance-v1"
+)
 SELL_MONITOR_AUTHORITY_KEY = "sell_monitor_authority_v1"
 WATCH_MONITORING_STATUSES = frozenset(
     {
@@ -1652,7 +1660,9 @@ def list_autonomous_monitoring_symbols(
             load_only(
                 ExecutionPlanItem.id,
                 ExecutionPlanItem.symbol,
+                ExecutionPlanItem.status,
                 ExecutionPlanItem.provider,
+                ExecutionPlanItem.venue,
                 ExecutionPlanItem.risk_context,
                 ExecutionPlanItem.quantity_policy,
                 ExecutionPlanItem.asset_class,
@@ -1673,35 +1683,56 @@ def list_autonomous_monitoring_symbols(
                 effective_at=resolved_effective_at,
             )
         ]
-    buy_symbol_rows = sorted(
-        {
-            str(item.symbol)
-            for item in active_watch_items
-            if classify_kis_account_route(
-                settings=settings,
-                provider=str(item.provider or "kis").strip().lower(),
-                risk_context=_loaded_risk_context(
-                    item,
-                    allow_file_backed_load=True,
-                ),
-                quantity_policy=item.quantity_policy,
-            )
-            == "active"
-        }
-    )
+    active_watch_items = [
+        item
+        for item in active_watch_items
+        if classify_kis_account_route(
+            settings=settings,
+            provider=str(item.provider or "kis").strip().lower(),
+            risk_context=_loaded_risk_context(
+                item,
+                allow_file_backed_load=True,
+            ),
+            quantity_policy=item.quantity_policy,
+        )
+        == "active"
+    ]
     desired_symbols = (
         _load_core_desired_monitoring_symbols(settings=settings)
         if desired_symbol_priority is None
         else list(desired_symbol_priority)
     )
-    if desired_symbols:
-        desired_rank = {symbol: index for index, symbol in enumerate(desired_symbols)}
-        buy_symbol_rows.sort(
-            key=lambda symbol: (
-                desired_rank.get(str(symbol), len(desired_rank)),
-                str(symbol),
-            )
-        )
+    desired_rank = {symbol: index for index, symbol in enumerate(desired_symbols)}
+    base_ordered_watch_items = sorted(
+        active_watch_items,
+        key=lambda item: (
+            desired_rank.get(str(item.symbol), len(desired_rank)),
+            str(item.symbol),
+            str(item.id),
+        ),
+    )
+    domestic_positions = [
+        index
+        for index, item in enumerate(base_ordered_watch_items)
+        if _plan_item_market_timezone(item) == KRX_TIMEZONE
+    ]
+    domestic_watch_items = sorted(
+        (base_ordered_watch_items[index] for index in domestic_positions),
+        key=lambda item: _watch_buy_queue_priority_key(
+            settings=settings,
+            item=item,
+            evaluated_at=resolved_effective_at,
+            desired_rank=desired_rank.get(str(item.symbol), len(desired_rank)),
+        ),
+    )
+    ordered_watch_items = list(base_ordered_watch_items)
+    for index, item in zip(domestic_positions, domestic_watch_items, strict=True):
+        ordered_watch_items[index] = item
+    buy_symbol_rows: list[str] = []
+    for item in ordered_watch_items:
+        symbol = str(item.symbol)
+        if symbol not in buy_symbol_rows:
+            buy_symbol_rows.append(symbol)
     # Every persisted active watch item is executable work. Keep the full
     # bounded set here and let the runtime round-robin scheduler batch it;
     # truncating to one quote batch starves the remaining active items.
@@ -1756,6 +1787,448 @@ def resolve_monitoring_symbol_cycle_limit(*, settings: Settings) -> int:
     quote_workers = 3
     estimated_limit = int((target_seconds / request_timeout) * quote_workers)
     return max(3, min(20, estimated_limit))
+
+
+def _watch_buy_queue_priority_key(
+    *,
+    settings: Settings,
+    item: ExecutionPlanItem,
+    evaluated_at: datetime,
+    desired_rank: int,
+) -> tuple[object, ...]:
+    trigger_rank = _watch_buy_queue_trigger_rank(item)
+    turnover, liquidity_observed_at = _watch_buy_queue_verified_turnover(
+        settings=settings,
+        item=item,
+        evaluated_at=evaluated_at,
+    )
+    if turnover is None:
+        liquidity_rank = 1
+    elif turnover >= SHORT_TERM_LIVE_MIN_TURNOVER_KRW:
+        liquidity_rank = 0
+    else:
+        liquidity_rank = 2
+
+    net_reward_risk, economics_observed_at = _watch_buy_queue_full_cost_rr(
+        settings=settings,
+        item=item,
+        evaluated_at=evaluated_at,
+    )
+    required_reward_risk = _minimum_reward_risk_for_watch_buy(
+        settings=settings,
+        item=item,
+    )
+    if net_reward_risk is None:
+        reward_risk_rank = 1
+    elif net_reward_risk >= required_reward_risk:
+        reward_risk_rank = 0
+    else:
+        reward_risk_rank = 2
+
+    evidence_times = [
+        observed_at
+        for observed_at in (liquidity_observed_at, economics_observed_at)
+        if observed_at is not None
+    ]
+    oldest_evidence_age = max(
+        (
+            max(
+                0.0,
+                (_normalize_utc(evaluated_at) - observed_at).total_seconds(),
+            )
+            for observed_at in evidence_times
+        ),
+        default=float("inf"),
+    )
+    risk_context = _loaded_risk_context(item, allow_file_backed_load=True)
+    return (
+        trigger_rank,
+        liquidity_rank,
+        reward_risk_rank,
+        _watch_buy_queue_alignment_rank(risk_context),
+        oldest_evidence_age,
+        _watch_buy_queue_warning_count(risk_context),
+        -(turnover or Decimal("0")),
+        -(net_reward_risk or Decimal("0")),
+        desired_rank,
+        str(item.symbol),
+        str(item.id),
+    )
+
+
+def _watch_buy_queue_trigger_rank(item: ExecutionPlanItem) -> int:
+    if item.status in {
+        "watch_buy_triggered_pending_dispatch",
+        AGENT_APPROVED_PENDING_SUBMIT_STATUS,
+    }:
+        return 0
+    if item.status in {
+        "watch_buy_triggered",
+        "watch_buy_triggered_blocked",
+        AGENT_PENDING_STATUS,
+        AGENT_DELAY_STATUS,
+    } or _persisted_watch_buy_trigger_cross(item) is not None:
+        return 1
+    if item.status == "watch_monitoring_active":
+        return 2
+    return 3
+
+
+def _watch_buy_queue_verified_turnover(
+    *,
+    settings: Settings,
+    item: ExecutionPlanItem,
+    evaluated_at: datetime,
+) -> tuple[Decimal | None, datetime | None]:
+    policy = item.quantity_policy if isinstance(item.quantity_policy, dict) else {}
+    evidence = policy.get(TRIGGER_TIME_LIQUIDITY_EVIDENCE_KEY)
+    if not isinstance(evidence, dict) or evidence.get("version") != 1:
+        return None, None
+    if (
+        str(evidence.get("provider") or "").strip().lower() != "kis"
+        or str(evidence.get("asset_class") or "").strip().lower() != "stock"
+        or str(evidence.get("exchange") or "").strip().upper()
+        != _plan_item_exchange(item).strip().upper()
+        or str(evidence.get("symbol") or "").strip().upper()
+        != str(item.symbol).strip().upper()
+        or evidence.get("freshness_source") != "kis_exchange_intraday_minute_time"
+        or evidence.get("endpoint")
+        != "/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice"
+        or evidence.get("tr_id") != "FHKST03010200"
+    ):
+        return None, None
+    observed_at = _strict_queue_evidence_datetime(evidence.get("observed_at"))
+    if not _watch_queue_evidence_is_fresh(
+        settings=settings,
+        observed_at=observed_at,
+        evaluated_at=evaluated_at,
+    ):
+        return None, None
+    turnover = _parse_decimal(evidence.get("turnover"))
+    volume = _parse_decimal(evidence.get("volume"))
+    day_high = _parse_decimal(evidence.get("day_high"))
+    day_low = _parse_decimal(evidence.get("day_low"))
+    if (
+        turnover is None
+        or turnover < 0
+        or volume is None
+        or volume < 0
+        or day_high is None
+        or day_high <= 0
+        or day_low is None
+        or day_low <= 0
+        or day_low > day_high
+    ):
+        return None, None
+    return turnover, observed_at
+
+
+def _watch_buy_queue_full_cost_rr(
+    *,
+    settings: Settings,
+    item: ExecutionPlanItem,
+    evaluated_at: datetime,
+) -> tuple[Decimal | None, datetime | None]:
+    risk_context = _loaded_risk_context(item, allow_file_backed_load=True)
+    evidence = risk_context.get(TRIGGER_TIME_FULL_COST_ECONOMICS_KEY)
+    if not isinstance(evidence, dict) or evidence.get("version") != 1:
+        return None, None
+    evidence_symbol = str(evidence.get("symbol") or "").strip().upper()
+    if evidence_symbol != str(item.symbol).strip().upper():
+        return None, None
+    observed_at = _strict_queue_evidence_datetime(evidence.get("evaluated_at"))
+    if not _watch_queue_evidence_is_fresh(
+        settings=settings,
+        observed_at=observed_at,
+        evaluated_at=evaluated_at,
+    ):
+        return None, None
+    if not _trigger_time_full_cost_economics_provenance_is_valid(
+        settings=settings,
+        item=item,
+        evidence=evidence,
+        evaluated_at=evaluated_at,
+    ):
+        return None, None
+    net_reward_risk = _parse_decimal(evidence.get("net_reward_risk"))
+    minimum_reward_risk = _parse_decimal(evidence.get("minimum_reward_risk"))
+    round_trip_cost_bps = _parse_decimal(
+        evidence.get("estimated_round_trip_cost_bps")
+    )
+    assessment_reason = evidence.get("assessment_reason")
+    required_minimum_reward_risk = max(
+        minimum_reward_risk or Decimal("0"),
+        _minimum_reward_risk_for_watch_buy(settings=settings, item=item),
+    )
+    if (
+        net_reward_risk is None
+        or net_reward_risk < 0
+        or minimum_reward_risk is None
+        or minimum_reward_risk
+        < _minimum_reward_risk_for_watch_buy(settings=settings, item=item)
+        or net_reward_risk < required_minimum_reward_risk
+        or round_trip_cost_bps is None
+        or round_trip_cost_bps < 0
+        or not str(evidence.get("cost_evidence_source") or "").strip()
+        or (
+            assessment_reason is not None
+            and str(assessment_reason).strip()
+        )
+    ):
+        return None, None
+    return net_reward_risk, observed_at
+
+
+def _trigger_time_full_cost_economics_provenance_is_valid(
+    *,
+    settings: Settings,
+    item: ExecutionPlanItem,
+    evidence: dict[str, object],
+    evaluated_at: datetime,
+) -> bool:
+    provenance = evidence.get("provenance")
+    if not isinstance(provenance, dict):
+        return False
+    if set(provenance) != {
+        "version",
+        "source",
+        "route_fingerprint",
+        "liquidity_evidence_hash",
+        "material_hash",
+        "binding",
+    }:
+        return False
+    if (
+        provenance.get("version")
+        != TRIGGER_TIME_FULL_COST_ECONOMICS_PROVENANCE_VERSION
+        or provenance.get("source") != "kai-trading-exec.monitoring"
+    ):
+        return False
+    route_fingerprint = configured_kis_route_fingerprint(settings)
+    if not isinstance(route_fingerprint, str) or not hmac.compare_digest(
+        str(provenance.get("route_fingerprint") or ""),
+        route_fingerprint,
+    ):
+        return False
+    key = stable_account_scope_hmac_key(settings)
+    if key is None:
+        return False
+    verified_turnover, _ = _watch_buy_queue_verified_turnover(
+        settings=settings,
+        item=item,
+        evaluated_at=evaluated_at,
+    )
+    if verified_turnover is None:
+        return False
+    liquidity_evidence = _trigger_time_liquidity_evidence_payload(item)
+    if liquidity_evidence is None:
+        return False
+    liquidity_hash = json_payload_hash(
+        _trigger_time_liquidity_binding_material(liquidity_evidence)
+    )
+    if not hmac.compare_digest(
+        str(provenance.get("liquidity_evidence_hash") or ""),
+        liquidity_hash,
+    ):
+        return False
+    material = _trigger_time_full_cost_economics_binding_material(
+        item=item,
+        evidence=evidence,
+        route_fingerprint=route_fingerprint,
+        liquidity_evidence_hash=liquidity_hash,
+    )
+    material_hash = json_payload_hash(material)
+    if not hmac.compare_digest(
+        str(provenance.get("material_hash") or ""),
+        material_hash,
+    ):
+        return False
+    expected_binding = hmac.new(
+        key,
+        material_hash.encode("utf-8"),
+        sha256,
+    ).hexdigest()
+    binding = provenance.get("binding")
+    return isinstance(binding, str) and hmac.compare_digest(
+        binding,
+        expected_binding,
+    )
+
+
+def _trigger_time_full_cost_economics_provenance(
+    *,
+    settings: Settings,
+    item: ExecutionPlanItem,
+    evidence: dict[str, object],
+) -> dict[str, object] | None:
+    route_fingerprint = configured_kis_route_fingerprint(settings)
+    key = stable_account_scope_hmac_key(settings)
+    liquidity_evidence = _trigger_time_liquidity_evidence_payload(item)
+    if (
+        not isinstance(route_fingerprint, str)
+        or key is None
+        or liquidity_evidence is None
+    ):
+        return None
+    liquidity_hash = json_payload_hash(
+        _trigger_time_liquidity_binding_material(liquidity_evidence)
+    )
+    material = _trigger_time_full_cost_economics_binding_material(
+        item=item,
+        evidence=evidence,
+        route_fingerprint=route_fingerprint,
+        liquidity_evidence_hash=liquidity_hash,
+    )
+    material_hash = json_payload_hash(material)
+    return {
+        "version": TRIGGER_TIME_FULL_COST_ECONOMICS_PROVENANCE_VERSION,
+        "source": "kai-trading-exec.monitoring",
+        "route_fingerprint": route_fingerprint,
+        "liquidity_evidence_hash": liquidity_hash,
+        "material_hash": material_hash,
+        "binding": hmac.new(
+            key,
+            material_hash.encode("utf-8"),
+            sha256,
+        ).hexdigest(),
+    }
+
+
+def _trigger_time_full_cost_economics_binding_material(
+    *,
+    item: ExecutionPlanItem,
+    evidence: dict[str, object],
+    route_fingerprint: str,
+    liquidity_evidence_hash: str,
+) -> dict[str, object]:
+    return {
+        "version": TRIGGER_TIME_FULL_COST_ECONOMICS_PROVENANCE_VERSION,
+        "source": "kai-trading-exec.monitoring",
+        "execution_plan_id": str(item.execution_plan_id or ""),
+        "execution_plan_item_id": str(item.id or ""),
+        "plan_item_index": item.plan_item_index,
+        "provider": str(item.provider or "kis").strip().lower(),
+        "venue": str(item.venue or "").strip().upper(),
+        "asset_class": str(item.asset_class or "stock").strip().lower(),
+        "exchange": _plan_item_exchange(item).strip().upper(),
+        "symbol": str(item.symbol or "").strip().upper(),
+        "intent": str(item.intent or "").strip(),
+        "side": str(item.side or "").strip().lower(),
+        "route_fingerprint": route_fingerprint,
+        "liquidity_evidence_hash": liquidity_evidence_hash,
+        "evaluated_at": str(evidence.get("evaluated_at") or ""),
+        "gross_reward_risk": str(evidence.get("gross_reward_risk") or ""),
+        "net_reward_risk": str(evidence.get("net_reward_risk") or ""),
+        "minimum_reward_risk": str(evidence.get("minimum_reward_risk") or ""),
+        "estimated_round_trip_cost_bps": str(
+            evidence.get("estimated_round_trip_cost_bps") or ""
+        ),
+        "cost_evidence_source": str(evidence.get("cost_evidence_source") or ""),
+        "assessment_reason": (
+            None
+            if evidence.get("assessment_reason") is None
+            else str(evidence.get("assessment_reason"))
+        ),
+    }
+
+
+def _trigger_time_liquidity_evidence_payload(
+    item: ExecutionPlanItem,
+) -> dict[str, object] | None:
+    policy = item.quantity_policy if isinstance(item.quantity_policy, dict) else {}
+    evidence = policy.get(TRIGGER_TIME_LIQUIDITY_EVIDENCE_KEY)
+    return evidence if isinstance(evidence, dict) else None
+
+
+def _trigger_time_liquidity_binding_material(
+    evidence: dict[str, object],
+) -> dict[str, object]:
+    return {
+        "version": evidence.get("version"),
+        "provider": str(evidence.get("provider") or "").strip().lower(),
+        "asset_class": str(evidence.get("asset_class") or "").strip().lower(),
+        "exchange": str(evidence.get("exchange") or "").strip().upper(),
+        "symbol": str(evidence.get("symbol") or "").strip().upper(),
+        "observed_at": str(evidence.get("observed_at") or ""),
+        "freshness_source": str(evidence.get("freshness_source") or ""),
+        "endpoint": str(evidence.get("endpoint") or ""),
+        "tr_id": str(evidence.get("tr_id") or ""),
+        "volume": str(evidence.get("volume") or ""),
+        "turnover": str(evidence.get("turnover") or ""),
+        "day_high": str(evidence.get("day_high") or ""),
+        "day_low": str(evidence.get("day_low") or ""),
+    }
+
+
+def _watch_queue_evidence_is_fresh(
+    *,
+    settings: Settings,
+    observed_at: datetime | None,
+    evaluated_at: datetime,
+) -> bool:
+    if observed_at is None:
+        return False
+    evaluated_at = _normalize_utc(evaluated_at)
+    if observed_at.astimezone(KRX_TIMEZONE).date() != evaluated_at.astimezone(
+        KRX_TIMEZONE
+    ).date():
+        return False
+    age = evaluated_at - observed_at
+    return (
+        age <= timedelta(seconds=settings.monitoring_max_quote_age_seconds)
+        and age
+        >= -timedelta(seconds=settings.monitoring_max_quote_future_skew_seconds)
+    )
+
+
+def _strict_queue_evidence_datetime(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed.astimezone(UTC)
+
+
+def _watch_buy_queue_alignment_rank(risk_context: dict[str, object]) -> int:
+    gate = risk_context.get("alignment_gate")
+    gate = gate if isinstance(gate, dict) else {}
+    values = [
+        risk_context.get("signal_decider_alignment"),
+        risk_context.get("alignment_gate_action"),
+        gate.get("signal_decider_alignment"),
+        gate.get("alignment_gate_action"),
+        gate.get("signal_decider_action"),
+    ]
+    normalized = " ".join(
+        str(value).strip().lower()
+        for value in values
+        if isinstance(value, str) and value.strip()
+    )
+    if any(marker in normalized for marker in ("conflict", "block", "reject", "wait")):
+        return 2
+    if any(marker in normalized for marker in ("buy_aligned", "aligned_buy", "confirm", "support")):
+        return 0
+    return 1
+
+
+def _watch_buy_queue_warning_count(risk_context: dict[str, object]) -> int:
+    warnings = risk_context.get("data_quality_warnings")
+    count = len(warnings) if isinstance(warnings, list) else 0
+    gate = risk_context.get("alignment_gate")
+    if isinstance(gate, dict):
+        signal_context = gate.get("signal_decider_context")
+        nested = (
+            signal_context.get("data_quality_warnings")
+            if isinstance(signal_context, dict)
+            else None
+        )
+        if isinstance(nested, list):
+            count += len(nested)
+    return count
 
 
 def _load_core_desired_monitoring_symbols(*, settings: Settings) -> list[str]:
@@ -3510,14 +3983,20 @@ def expire_prior_market_date_unfilled_watch_buys(
             else current_market_date
         )
         source_market_date = _watch_buy_source_market_date(item)
-        if source_market_date >= item_current_market_date:
-            continue
         age_trading_sessions = sum(
             source_market_date < market_date <= item_current_market_date
             for market_date in observed_market_dates
         )
         age_calendar_days = (item_current_market_date - source_market_date).days
-        if age_trading_sessions >= max_age_trading_sessions:
+        if _short_term_watch_target_session_elapsed(
+            item=item,
+            current_market_date=item_current_market_date,
+            effective_at=resolved_effective_at,
+        ):
+            expiry_reason = "target_session_elapsed"
+        elif source_market_date >= item_current_market_date:
+            continue
+        elif age_trading_sessions >= max_age_trading_sessions:
             expiry_reason = "trading_session_ttl_elapsed"
         elif age_calendar_days >= hard_max_calendar_days:
             expiry_reason = "calendar_safety_ttl_elapsed"
@@ -3570,7 +4049,11 @@ def expire_prior_market_date_unfilled_watch_buys(
             }
             risk_context["core_buy_authority"] = authority
             item.risk_context = risk_context
-        legacy_expiry = settings.runtime_mode != "live" and max_age_trading_sessions == 1
+        legacy_expiry = (
+            settings.runtime_mode != "live"
+            and max_age_trading_sessions == 1
+            and expiry_reason == "trading_session_ttl_elapsed"
+        )
         _record_monitoring_event(
             item=item,
             event={
@@ -3586,6 +4069,11 @@ def expire_prior_market_date_unfilled_watch_buys(
                 ),
                 "prior_status": prior_status,
                 "source_market_date": source_market_date.isoformat(),
+                "target_market_date": (
+                    item.plan.market_date.isoformat()
+                    if item.plan.market_date is not None
+                    else None
+                ),
                 "current_market_date": item_current_market_date.isoformat(),
                 "age_trading_sessions": age_trading_sessions,
                 "max_age_trading_sessions": max_age_trading_sessions,
@@ -3603,6 +4091,31 @@ def _watch_buy_max_age_trading_sessions(settings: Settings) -> int | None:
     if settings.monitoring_expire_prior_market_watch_buys_enabled:
         return 1
     return None
+
+
+def _short_term_watch_target_session_elapsed(
+    *,
+    item: ExecutionPlanItem,
+    current_market_date: date,
+    effective_at: datetime | None,
+) -> bool:
+    target_market_date = item.plan.market_date
+    if (
+        target_market_date is None
+        or not is_short_term_watch_buy_intent(item.intent)
+        or _plan_item_market_timezone(item) != KRX_TIMEZONE
+    ):
+        return False
+    if current_market_date > target_market_date:
+        return True
+    if current_market_date < target_market_date or effective_at is None:
+        return False
+    target_session_close = datetime.combine(
+        target_market_date,
+        datetime.min.time().replace(hour=15, minute=30),
+        tzinfo=KRX_TIMEZONE,
+    )
+    return _normalize_utc(effective_at) >= target_session_close.astimezone(UTC)
 
 
 def _watch_buy_source_market_date(item: ExecutionPlanItem) -> date:
@@ -4091,6 +4604,11 @@ def _resolve_trigger_time_agent_action(
     if decision.decision == "keep_watching":
         if not _trigger_time_agent_claim_is_current(db=db, item=item, claim=claim):
             return _trigger_time_agent_claim_lost_result(item=item, action=action)
+        _persist_pre_agent_liquidity_evidence(
+            settings=settings,
+            item=item,
+            action=action,
+        )
         item.status = _monitoring_status(item.intent)
         _record_monitoring_event(
             item=item,
@@ -4127,6 +4645,11 @@ def _resolve_trigger_time_agent_action(
     if decision.decision == "delay":
         if not _trigger_time_agent_claim_is_current(db=db, item=item, claim=claim):
             return _trigger_time_agent_claim_lost_result(item=item, action=action)
+        _persist_pre_agent_liquidity_evidence(
+            settings=settings,
+            item=item,
+            action=action,
+        )
         item.status = AGENT_DELAY_STATUS
         _record_monitoring_event(
             item=item,
@@ -4164,6 +4687,11 @@ def _resolve_trigger_time_agent_action(
     if decision.decision == "reject":
         if not _trigger_time_agent_claim_is_current(db=db, item=item, claim=claim):
             return _trigger_time_agent_claim_lost_result(item=item, action=action)
+        _persist_pre_agent_liquidity_evidence(
+            settings=settings,
+            item=item,
+            action=action,
+        )
         item.status = AGENT_REJECTED_STATUS
         _record_monitoring_event(
             item=item,
@@ -4221,6 +4749,7 @@ def _resolve_trigger_time_agent_action(
         )
         if refresh_error is not None or refreshed_price is None:
             return _post_agent_revalidation_failure(
+                settings=settings,
                 db=db,
                 claim=claim,
                 item=item,
@@ -4272,6 +4801,7 @@ def _resolve_trigger_time_agent_action(
             if detail is None and isinstance(missing_fields, list):
                 detail = f"missing live market fields: {', '.join(map(str, missing_fields))}"
             return _post_agent_revalidation_failure(
+                settings=settings,
                 db=db,
                 claim=claim,
                 item=item,
@@ -4293,6 +4823,7 @@ def _resolve_trigger_time_agent_action(
             triggered_at=revalidated_at,
         ):
             return _post_agent_revalidation_failure(
+                settings=settings,
                 db=db,
                 claim=claim,
                 item=item,
@@ -4319,6 +4850,7 @@ def _resolve_trigger_time_agent_action(
                 and refreshed_observed_price > chase_limit_price
             ):
                 return _post_agent_revalidation_failure(
+                    settings=settings,
                     db=db,
                     claim=claim,
                     item=item,
@@ -4378,6 +4910,7 @@ def _resolve_trigger_time_agent_action(
         )
     economics_reason: str | None = None
     economics_message: str | None = None
+    economics: BuyEconomicsAssessment | None = None
     if geometry_error is None and _is_watch_buy_item(item):
         effective_target = (
             decision.updated_target_price or _watch_buy_target_price(item)
@@ -4482,6 +5015,7 @@ def _resolve_trigger_time_agent_action(
                     )
     if geometry_error is not None:
         return _post_agent_revalidation_failure(
+            settings=settings,
             db=db,
             claim=claim,
             item=item,
@@ -4500,9 +5034,12 @@ def _resolve_trigger_time_agent_action(
             new_status=AGENT_DELAY_STATUS,
             refreshed_price=refreshed_price,
             market_quality_gate=_trigger_time_market_quality_gate(resolution),
+            liquidity_evidence_price=refreshed_price,
+            economics=economics,
         )
     if economics_reason is not None:
         return _post_agent_revalidation_failure(
+            settings=settings,
             db=db,
             claim=claim,
             item=item,
@@ -4521,6 +5058,8 @@ def _resolve_trigger_time_agent_action(
             new_status=AGENT_DELAY_STATUS,
             refreshed_price=refreshed_price,
             market_quality_gate=_trigger_time_market_quality_gate(resolution),
+            liquidity_evidence_price=refreshed_price,
+            economics=economics,
         )
 
     if not _trigger_time_agent_claim_is_current(db=db, item=item, claim=claim):
@@ -4532,6 +5071,7 @@ def _resolve_trigger_time_agent_action(
         )
         if locked_stop is not None and decision.updated_stop_price < locked_stop:
             return _post_agent_revalidation_failure(
+                settings=settings,
                 db=db,
                 claim=claim,
                 item=item,
@@ -4555,6 +5095,13 @@ def _resolve_trigger_time_agent_action(
         _persist_trigger_time_liquidity_evidence(
             item=item,
             price=refreshed_price,
+        )
+    if economics is not None:
+        _persist_trigger_time_full_cost_economics(
+            settings=settings,
+            item=item,
+            economics=economics,
+            evaluated_at=post_agent_evaluated_at,
         )
     if post_agent_limit_adjustment is not None:
         risk_context = dict(_loaded_risk_context(item))
@@ -5117,6 +5664,24 @@ def _trigger_time_liquidity_snapshot_reason(
     return None
 
 
+def _persist_pre_agent_liquidity_evidence(
+    *,
+    settings: Settings,
+    item: ExecutionPlanItem,
+    action: PendingMonitoringAction,
+) -> None:
+    if (
+        settings.runtime_mode != "live"
+        or action.price is None
+        or not _requires_trigger_time_liquidity_snapshot(item)
+    ):
+        return
+    _persist_trigger_time_liquidity_evidence(
+        item=item,
+        price=action.price,
+    )
+
+
 def _persist_trigger_time_liquidity_evidence(
     *,
     item: ExecutionPlanItem,
@@ -5148,6 +5713,42 @@ def _persist_trigger_time_liquidity_evidence(
         "day_low": _serialize_decimal(price.day_low),
     }
     item.quantity_policy = compact_json_object(quantity_policy)
+
+
+def _persist_trigger_time_full_cost_economics(
+    *,
+    settings: Settings,
+    item: ExecutionPlanItem,
+    economics: BuyEconomicsAssessment,
+    evaluated_at: datetime,
+) -> None:
+    risk_context = dict(_loaded_risk_context(item))
+    evidence = {
+        "version": 1,
+        "symbol": item.symbol,
+        "evaluated_at": _normalize_utc(evaluated_at).isoformat(),
+        "gross_reward_risk": _serialize_decimal(economics.gross_reward_risk),
+        "net_reward_risk": _serialize_decimal(economics.net_reward_risk),
+        "minimum_reward_risk": _serialize_decimal(
+            economics.minimum_reward_risk
+        ),
+        "estimated_round_trip_cost_bps": _serialize_decimal(
+            economics.estimated_round_trip_cost_bps
+        ),
+        "cost_evidence_source": economics.cost_evidence_source,
+        "assessment_reason": economics.reason,
+    }
+    provenance = _trigger_time_full_cost_economics_provenance(
+        settings=settings,
+        item=item,
+        evidence=evidence,
+    )
+    if provenance is not None:
+        evidence["provenance"] = provenance
+    risk_context[TRIGGER_TIME_FULL_COST_ECONOMICS_KEY] = evidence
+    item.risk_context = compact_json_object(risk_context)
+    if isinstance(item.quantity_policy, dict):
+        item.quantity_policy = compact_json_object(item.quantity_policy)
 
 
 def _post_agent_market_quality_reason(
@@ -5249,6 +5850,7 @@ def _post_agent_trigger_still_valid(
 
 def _post_agent_revalidation_failure(
     *,
+    settings: Settings,
     db: Session,
     claim: TriggerTimeAgentClaim,
     item: ExecutionPlanItem,
@@ -5262,9 +5864,26 @@ def _post_agent_revalidation_failure(
     new_status: str,
     refreshed_price: MonitoringPriceRequest | None = None,
     market_quality_gate: object | None = None,
+    liquidity_evidence_price: MonitoringPriceRequest | None = None,
+    economics: BuyEconomicsAssessment | None = None,
 ) -> TriggerTimeAgentActionResult:
     if not _trigger_time_agent_claim_is_current(db=db, item=item, claim=claim):
         return _trigger_time_agent_claim_lost_result(item=item, action=action)
+    if (
+        liquidity_evidence_price is not None
+        and _requires_trigger_time_liquidity_snapshot(item)
+    ):
+        _persist_trigger_time_liquidity_evidence(
+            item=item,
+            price=liquidity_evidence_price,
+        )
+    if economics is not None:
+        _persist_trigger_time_full_cost_economics(
+            settings=settings,
+            item=item,
+            economics=economics,
+            evaluated_at=recorded_at,
+        )
     item.status = new_status
     observed_price = (
         _observed_price_for_item(price=refreshed_price, item=item)

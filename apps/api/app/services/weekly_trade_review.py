@@ -124,6 +124,10 @@ def generate_weekly_trade_review(
         include_json_payloads=include_json_payloads,
         max_rows=max_fills,
     )
+    fill_attribution_coverage = _weekly_fill_attribution_coverage(
+        fills,
+        truncated=fills_truncated,
+    )
     progress("weekly_fills", row_count=len(fills), truncated=fills_truncated)
     broker_order_pks = sorted(
         {
@@ -249,7 +253,10 @@ def generate_weekly_trade_review(
             "include_json_payloads": include_json_payloads,
         },
         "query_shape": {
-            "fills": "execution_fills.filled_at range joined to broker_orders.mode",
+            "fills": (
+                "execution_fills.filled_at range joined to broker_orders.mode with "
+                "optional local execution_plan_item/decision identity"
+            ),
             "linked_orders": "broker_orders.id IN weekly fill broker_order_pk",
             "linked_events": "broker_order_events.broker_order_pk IN weekly fill broker_order_pk",
             "weekly_orders": "broker_orders.mode/submitted_at range",
@@ -260,6 +267,15 @@ def generate_weekly_trade_review(
         },
         "counts": {
             "fill_count": len(fills),
+            "decision_linked_fill_count": fill_attribution_coverage[
+                "decision_identity_linked_fill_rows"
+            ],
+            "decision_identity_missing_fill_count": fill_attribution_coverage[
+                "decision_identity_missing_fill_rows"
+            ],
+            "decision_run_mismatch_fill_count": fill_attribution_coverage[
+                "decision_run_mismatch_fill_rows"
+            ],
             "linked_broker_order_count": len(linked_orders),
             "linked_broker_order_event_count": len(linked_events),
             "weekly_order_sample_count": len(weekly_orders),
@@ -285,6 +301,7 @@ def generate_weekly_trade_review(
             "stale_fifo_inventory_alerts": stale_fifo_inventory_alerts_truncated,
         },
         "fills": fills,
+        "fill_attribution_coverage": fill_attribution_coverage,
         "linked_broker_orders": linked_orders,
         "linked_broker_order_events": linked_events,
         "weekly_order_status_counts": weekly_order_counts,
@@ -338,12 +355,29 @@ def _weekly_fills(
         BrokerOrder.status.label("broker_order_status"),
         BrokerOrder.submitted_at.label("broker_order_submitted_at"),
         BrokerOrder.idempotency_key,
+        BrokerOrder.execution_plan_item_id,
+        ExecutionPlanItem.intent.label("execution_plan_item_intent"),
+        ExecutionPlanItem.decision_agent_name,
+        ExecutionPlanItem.decision_snapshot_id,
+        ExecutionPlanItem.decision_run_id,
+        ExecutionPlanItem.source_market_date,
+        ExecutionPlan.market_date.label("target_market_date"),
+        ExecutionPlan.source.label("execution_plan_source"),
+        ExecutionPlan.strategy_run_id,
     ]
     if include_json_payloads:
         columns.append(ExecutionFill.payload)
     rows = db.execute(
         select(*columns)
         .join(BrokerOrder, ExecutionFill.broker_order_pk == BrokerOrder.id)
+        .outerjoin(
+            ExecutionPlanItem,
+            BrokerOrder.execution_plan_item_id == ExecutionPlanItem.id,
+        )
+        .outerjoin(
+            ExecutionPlan,
+            ExecutionPlanItem.execution_plan_id == ExecutionPlan.id,
+        )
         .where(
             BrokerOrder.mode == mode,
             ExecutionFill.filled_at >= start_at,
@@ -353,6 +387,56 @@ def _weekly_fills(
         .limit(max_rows + 1)
     ).all()
     return _bounded_rows(rows, max_rows)
+
+
+def _weekly_fill_attribution_coverage(
+    fills: Sequence[dict[str, object]],
+    *,
+    truncated: bool,
+) -> dict[str, object]:
+    unlinked_fill_ids = sorted(
+        str(row["id"])
+        for row in fills
+        if row.get("execution_plan_item_id") is None
+    )
+    decision_run_mismatch_ids = sorted(
+        str(row["id"])
+        for row in fills
+        if row.get("execution_plan_source") == "kai-trading-core"
+        and (
+            row.get("strategy_run_id") is None
+            or row.get("decision_run_id") != row.get("strategy_run_id")
+        )
+    )
+    missing_decision_ids = sorted(
+        str(row["id"])
+        for row in fills
+        if row.get("decision_snapshot_id") is None
+        or row.get("decision_agent_name") is None
+        or row.get("decision_run_id") is None
+        or str(row["id"]) in decision_run_mismatch_ids
+    )
+    if truncated:
+        status = "truncated"
+    elif not fills:
+        status = "empty"
+    elif not unlinked_fill_ids and not missing_decision_ids:
+        status = "complete"
+    else:
+        status = "incomplete"
+    return {
+        "status": status,
+        "truncated": truncated,
+        "total_fill_rows": len(fills),
+        "execution_plan_item_linked_fill_rows": len(fills) - len(unlinked_fill_ids),
+        "execution_plan_item_unlinked_fill_rows": len(unlinked_fill_ids),
+        "decision_identity_linked_fill_rows": len(fills) - len(missing_decision_ids),
+        "decision_identity_missing_fill_rows": len(missing_decision_ids),
+        "decision_run_mismatch_fill_rows": len(decision_run_mismatch_ids),
+        "unlinked_fill_ids": unlinked_fill_ids,
+        "decision_identity_missing_fill_ids": missing_decision_ids,
+        "decision_run_mismatch_fill_ids": decision_run_mismatch_ids,
+    }
 
 
 def _linked_broker_orders(

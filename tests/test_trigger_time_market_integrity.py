@@ -670,6 +670,71 @@ def test_intraday_buy_final_gate_rejects_future_plan_market_date() -> None:
     )
 
 
+def test_intraday_buy_final_gate_rejects_expired_plan_market_date() -> None:
+    local_market_date = EVALUATED_AT.astimezone(ZoneInfo("Asia/Seoul")).date()
+    plan = ExecutionPlan(
+        id="expired-intraday-plan",
+        external_plan_id="expired-intraday-plan",
+        source="kai-trading-core",
+        mode="live",
+        market_date=local_market_date - timedelta(days=1),
+    )
+    item = ExecutionPlanItem(
+        id="expired-intraday-item",
+        execution_plan_id=plan.id,
+        plan=plan,
+        symbol="005930",
+        side="buy",
+        intent="intraday_watch_buy",
+        provider="kis",
+        asset_class="stock",
+        trigger_price=Decimal("100"),
+        risk_context={
+            "trigger_direction": "at_or_above",
+            "target_price": "120",
+            "stop_price": "90",
+        },
+    )
+    command = PlaceOrderRequest(
+        idempotency_key="expired-intraday-final-gate",
+        execution_plan_item_id=item.id,
+        provider="kis",
+        asset_class="stock",
+        exchange="KRX",
+        symbol="005930",
+        side="buy",
+        quantity=1,
+        order_type="limit",
+        limit_price="100",
+    )
+    evidence = broker_orders.AutomatedKisBuyMarketEvidence(
+        is_domestic=True,
+        context=BrokerLiveMarketContext(
+            symbol="005930",
+            exchange="KRX",
+            observed_at=EVALUATED_AT,
+            bid=Decimal("99.99"),
+            ask=Decimal("100"),
+            normal_ordering_available=True,
+            freshness_source="kis_exchange_orderbook_time",
+        ),
+        liquidity_snapshot=None,
+    )
+
+    failure = broker_orders._automated_kis_buy_market_evidence_failure(
+        settings=Settings(runtime_mode="live"),
+        command=command,
+        plan_item=item,
+        evidence=evidence,
+        reference_at=EVALUATED_AT,
+    )
+
+    assert failure == (
+        "live_buy_plan_market_date_mismatch",
+        "automated KIS buy plan is not authorized for the current market date",
+    )
+
+
 def test_kis_us_buy_final_gate_rejects_future_new_york_market_date() -> None:
     evaluated_at = datetime(2026, 9, 11, 15, 30, tzinfo=UTC)
     plan = ExecutionPlan(

@@ -1864,6 +1864,127 @@ def test_trigger_time_buy_delay_or_reject_does_not_submit_and_is_audited(
     engine.dispose()
 
 
+@pytest.mark.parametrize(
+    ("decision", "expected_status", "expected_outcome"),
+    [
+        ("keep_watching", "watch_monitoring_active", "waiting"),
+        ("delay", "agent_delay", "agent_delay"),
+        ("reject", "agent_rejected", "rejected"),
+    ],
+)
+def test_live_pre_agent_liquidity_evidence_is_kept_for_no_submit_decisions(
+    monkeypatch: pytest.MonkeyPatch,
+    decision: str,
+    expected_status: str,
+    expected_outcome: str,
+) -> None:
+    observed_at = datetime(2026, 6, 5, 0, 30, tzinfo=UTC)
+
+    class LiveLiquidityAdapter(StubBrokerAdapter):
+        def get_current_price(
+            self,
+            access_token: str,
+            *,
+            symbol: str,
+            exchange: str = "KRX",
+        ) -> BrokerCurrentPrice:
+            assert access_token
+            self.current_price_calls.append((symbol, exchange))
+            return BrokerCurrentPrice(
+                symbol=symbol,
+                exchange=exchange,
+                price=Decimal("71050"),
+                observed_at=observed_at,
+                freshness_source="kis_exchange_orderbook_time",
+                payload={"output": {"stck_prpr": "71050"}},
+            )
+
+        def get_live_market_context(
+            self,
+            access_token: str,
+            *,
+            symbol: str,
+            exchange: str = "KRX",
+            reference_price: Decimal | None = None,
+        ) -> BrokerLiveMarketContext:
+            del reference_price
+            assert access_token
+            return BrokerLiveMarketContext(
+                symbol=symbol,
+                exchange=exchange,
+                observed_at=observed_at,
+                freshness_source="kis_exchange_orderbook_time",
+                bid=Decimal("71045"),
+                ask=Decimal("71055"),
+                spread=Decimal("10"),
+                spread_bps=Decimal("1.41"),
+                orderbook_depth=Decimal("450000000"),
+            )
+
+    adapter = LiveLiquidityAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="live",
+            configured=True,
+            api_base_url="https://broker.invalid",
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(broker_order_id="unused"),
+    )
+    app, engine, client, broker_adapter, _ = _build_trigger_agent_app(
+        monkeypatch=monkeypatch,
+        agent_responses=[
+            {
+                "decision": decision,
+                "side": "buy",
+                "reason": "retain verified liquidity for queue and audit",
+                "context_staleness_ok": True,
+            }
+        ],
+        broker_adapter=adapter,
+        account_snapshot_observed_at=observed_at,
+        settings_overrides={
+            "runtime_mode": "live",
+            "automation_enabled": True,
+            "monitoring_expire_prior_market_watch_buys_enabled": False,
+            "market_regime_guard_enabled": False,
+            "watch_buy_live_market_quality_veto_enabled": False,
+        },
+    )
+    item_id = _create_intraday_watch_buy(
+        client,
+        plan_id=f"plan-pre-agent-liquidity-{decision}",
+    )
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "verified pre-agent liquidity survives no-submit decision",
+            "observed_at": observed_at.isoformat(),
+            "prices": [_live_price_payload(observed_at=observed_at)],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["items"][0]["outcome"] == expected_outcome
+    assert broker_adapter.order_calls == []
+    assert len(broker_adapter.intraday_liquidity_calls) == 1
+    with app.state.db_session_factory() as session:
+        item = session.get(ExecutionPlanItem, item_id)
+        assert item is not None
+        assert item.status == expected_status
+        evidence = item.quantity_policy["exec_trigger_time_liquidity_evidence_v1"]
+        assert evidence["provider"] == "kis"
+        assert evidence["exchange"] == "KRX"
+        assert evidence["symbol"] == "005930"
+        assert evidence["freshness_source"] == "kis_exchange_intraday_minute_time"
+        assert Decimal(evidence["turnover"]) == Decimal("88750000000")
+
+    engine.dispose()
+
+
 def test_trigger_time_missing_account_context_delays_without_agent_call(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -4899,6 +5020,27 @@ def test_trigger_time_rechecks_structured_core_dynamic_gates(
     assert result.get("block_reason") == expected_block_reason
     assert len(broker_adapter.order_calls) == (1 if expected_outcome == "submitted" else 0)
     assert len(injected_adapter.liquidity_calls) == expected_liquidity_calls
+    with app.state.db_session_factory() as session:
+        item = session.scalar(
+            select(ExecutionPlanItem).where(ExecutionPlanItem.symbol == "005930")
+        )
+        assert item is not None
+        liquidity_evidence = item.quantity_policy[
+            "exec_trigger_time_liquidity_evidence_v1"
+        ]
+        assert Decimal(liquidity_evidence["turnover"]) == Decimal(live_turnover)
+        assert liquidity_evidence["freshness_source"] == (
+            "kis_exchange_intraday_minute_time"
+        )
+        economics_evidence = item.risk_context[
+            "exec_trigger_time_full_cost_economics_v1"
+        ]
+        assert economics_evidence["minimum_reward_risk"] == "1.8000"
+        assert Decimal(economics_evidence["net_reward_risk"]) > Decimal("1.80")
+        assert economics_evidence["provenance"]["source"] == (
+            "kai-trading-exec.monitoring"
+        )
+        assert economics_evidence["provenance"]["binding"]
     engine.dispose()
 
 
