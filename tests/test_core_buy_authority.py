@@ -110,6 +110,7 @@ def _plan_item(
     currency: str = "KRW",
     core_v4: bool = True,
     status: str = "next_open_buy_scheduled",
+    intent: str = "next_open_buy",
 ) -> tuple[ExecutionPlan, ExecutionPlanItem]:
     route_settings = _settings()
     risk_context, quantity_policy = bind_kis_account_route(
@@ -142,7 +143,7 @@ def _plan_item(
         plan=plan,
         symbol="005930" if exchange == "KRX" else "AAPL",
         side="buy",
-        intent="next_open_buy",
+        intent=intent,
         status=status,
         provider="kis",
         venue="kis",
@@ -210,8 +211,10 @@ def test_block_projects_only_exact_core_v4_krx_scope() -> None:
     us_plan, us_item = _plan_item(exchange="NASD", currency="USD")
     paper_plan, paper_item = _plan_item(mode="paper")
     legacy_plan, legacy_item = _plan_item(core_v4=False)
+    watch_plan, watch_item = _plan_item(intent="intraday_watch_buy")
+    watch_plan.external_plan_id = "intraday-watch-plan"
     with session_factory() as db:
-        db.add_all([matching_plan, us_plan, paper_plan, legacy_plan])
+        db.add_all([matching_plan, us_plan, paper_plan, legacy_plan, watch_plan])
         db.commit()
 
         ack = apply_core_buy_authority_observation(
@@ -231,11 +234,13 @@ def test_block_projects_only_exact_core_v4_krx_scope() -> None:
         db.refresh(us_item)
         db.refresh(paper_item)
         db.refresh(legacy_item)
+        db.refresh(watch_item)
         assert matching.status == "watch_expired"
         assert matching.risk_context["core_buy_authority"]["action"] == "block_new_buy"
         assert us_item.status == "next_open_buy_scheduled"
         assert paper_item.status == "next_open_buy_scheduled"
         assert legacy_item.status == "next_open_buy_scheduled"
+        assert watch_item.status == "next_open_buy_scheduled"
     engine.dispose()
 
 
@@ -966,6 +971,14 @@ def test_core_v4_krx_buy_requires_current_exact_scope_authority() -> None:
             plan_item=item,
             now=now,
         ) == "core_buy_authority_missing"
+
+        _, watch_item = _plan_item(intent="intraday_watch_buy")
+        assert core_buy_authority_block_reason(
+            settings=settings,
+            db=db,
+            plan_item=watch_item,
+            now=now,
+        ) is None
 
         apply_core_buy_authority_observation(
             settings=settings,

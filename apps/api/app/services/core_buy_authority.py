@@ -705,6 +705,7 @@ def _project_scope(
                 ExecutionPlanItem.provider == "kis",
                 ExecutionPlanItem.side == "buy",
                 ExecutionPlanItem.intent.in_(BUY_WATCH_INTENTS),
+                ExecutionPlanItem.intent != "intraday_watch_buy",
                 projection_candidate,
             )
             .order_by(ExecutionPlanItem.id)
@@ -945,6 +946,13 @@ def core_buy_authority_block_reason(
     lock: bool = False,
 ) -> str | None:
     if plan_item is None or not _item_matches_scope(settings=settings, item=plan_item):
+        return None
+    # A watch entry has no immediate market-order authority: monitoring still
+    # requires the symbol quote to enter its trigger/limit range before the
+    # broker-order path can run.  Do not let incomplete route-level breadth
+    # evidence disable that per-symbol watch.  Account, runtime, kill-switch,
+    # sizing, and order-level controls remain enforced by their own gates.
+    if plan_item.intent == "intraday_watch_buy":
         return None
     observed_at = _utc(now or datetime.now(UTC))
     identity = build_position_identity(
