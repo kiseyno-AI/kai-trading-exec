@@ -70,6 +70,15 @@ UNSIZED_NEXT_OPEN_STATUSES = frozenset({"pending", "next_open_buy_pending_config
 WATCH_EXEC_AGENT_BATCH_SIZE = 10
 WATCH_EXEC_AGENT_RESPONSE_VERSION = "manual-exec-agent-watch-sizing-v1"
 WATCH_EXEC_AGENT_BINDING_VERSION = "watch-exec-agent-binding-v1"
+WATCH_EXEC_AGENT_DEFER_KEY = "watch_exec_agent_deferred"
+WATCH_EXEC_AGENT_DEFER_SECONDS = 300
+RETRYABLE_REJECTION_REASON_CODES = frozenset({
+    "trigger_confirmation_and_cost_evidence_missing",
+    "trigger_confirmation_missing",
+    "fresh_quote_missing",
+    "spread_evidence_missing",
+    "transaction_cost_evidence_missing",
+})
 
 
 @dataclass(frozen=True)
@@ -1012,6 +1021,8 @@ def _unsized_watch_items(plan: ExecutionPlan) -> list[ExecutionPlanItem]:
             continue
         if not _eligible_unsized_item_status(item):
             continue
+        if _watch_exec_agent_defer_is_active(item):
+            continue
         if _has_exec_agent_decision(item):
             continue
         if _quantity_is_shares(item.quantity_policy):
@@ -1021,6 +1032,23 @@ def _unsized_watch_items(plan: ExecutionPlan) -> list[ExecutionPlanItem]:
         items,
         key=lambda item: _sizing_candidate_priority_key(_candidate_payload(item)),
     )
+
+
+def _watch_exec_agent_defer_is_active(
+    item: ExecutionPlanItem,
+    *,
+    now: datetime | None = None,
+) -> bool:
+    context = item.risk_context if isinstance(item.risk_context, dict) else {}
+    deferred = context.get(WATCH_EXEC_AGENT_DEFER_KEY)
+    if not isinstance(deferred, dict):
+        return False
+    retry_after = _strict_aware_datetime(deferred.get("retry_after"))
+    return retry_after is not None and retry_after > _utc_datetime(now or datetime.now(UTC))
+
+
+def _retryable_watch_rejection(decision: dict[str, object]) -> bool:
+    return str(decision.get("reason_code") or "").strip() in RETRYABLE_REJECTION_REASON_CODES
 
 
 def _eligible_unsized_item_status(item: ExecutionPlanItem) -> bool:
@@ -2694,6 +2722,33 @@ def _apply_decisions(
                 },
             )
         elif action == "reject":
+            if _retryable_watch_rejection(decision):
+                retry_after = decision_at + timedelta(seconds=WATCH_EXEC_AGENT_DEFER_SECONDS)
+                risk_context = (
+                    dict(item.risk_context)
+                    if isinstance(item.risk_context, dict)
+                    else {}
+                )
+                risk_context[WATCH_EXEC_AGENT_DEFER_KEY] = {
+                    "reason_code": decision.get("reason_code"),
+                    "reason": decision.get("reason"),
+                    "deferred_at": decision_at.isoformat(),
+                    "retry_after": retry_after.isoformat(),
+                }
+                item.risk_context = compact_json_object(risk_context)
+                item.status = "watch_monitoring_pending"
+                _add_plan_item_audit(
+                    db=db,
+                    item=item,
+                    event_type="watch_exec_agent_sizing_deferred",
+                    summary={
+                        "symbol": item.symbol,
+                        "reason_code": decision.get("reason_code"),
+                        "retry_after": retry_after.isoformat(),
+                    },
+                    payload={"decision": _decision_summary(record)},
+                )
+                continue
             previous_policy = item.quantity_policy if isinstance(item.quantity_policy, dict) else None
             item.quantity_policy = compact_json_object({
                 "kind": "exec_agent_rejected",

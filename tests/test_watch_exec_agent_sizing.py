@@ -43,6 +43,8 @@ from openclaw_contract_test_support import (
     matching_runtime_contract_snapshot,
     verified_runtime_contract_proof,
 )
+
+
 from app.services.exec_agent_approval import (
     assess_buy_economics,
     configured_execution_cost_evidence,
@@ -149,6 +151,31 @@ class WatchSizingBrokerStub:
 
     def build_headers(self, access_token: str, *, transaction_id: str | None = None, hashkey: str | None = None) -> dict[str, str]:
         return {"authorization": f"Bearer {access_token}"}
+
+
+def test_retryable_watch_rejection_is_deferred_not_terminal() -> None:
+    assert watch_sizing._retryable_watch_rejection(
+        {"reason_code": "trigger_confirmation_and_cost_evidence_missing"}
+    )
+    assert not watch_sizing._retryable_watch_rejection(
+        {"reason_code": "reward_risk_below_minimum"}
+    )
+
+
+def test_watch_exec_agent_defer_expires() -> None:
+    now = datetime(2026, 10, 1, 4, 0, tzinfo=UTC)
+    item = ExecutionPlanItem(
+        risk_context={
+            watch_sizing.WATCH_EXEC_AGENT_DEFER_KEY: {
+                "retry_after": (now + timedelta(minutes=5)).isoformat()
+            }
+        }
+    )
+    assert watch_sizing._watch_exec_agent_defer_is_active(item, now=now)
+    assert not watch_sizing._watch_exec_agent_defer_is_active(
+        item,
+        now=now + timedelta(minutes=6),
+    )
 
 
 def _watch_item(
