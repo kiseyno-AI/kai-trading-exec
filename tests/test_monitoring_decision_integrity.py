@@ -107,6 +107,10 @@ def test_monitoring_event_preserves_complete_core_v4_contract_payload() -> None:
         source_plan_item_id=raw_item["core_item_key"],
         risk_context={
             **raw_risk,
+            "exchange": "KRX",
+            "currency": "KRW",
+            "session_policy": {"session": "regular"},
+            "handoff_intent": "intraday_watch_buy",
             "_core_v4_contract_binding": {"version": "v1"},
             "_core_activation_state": {"status": "activated"},
         },
@@ -123,6 +127,8 @@ def test_monitoring_event_preserves_complete_core_v4_contract_payload() -> None:
     assert item.risk_context["session_policy"] == {"session": "regular"}
     assert item.risk_context["_core_v4_contract_binding"] == {"version": "v1"}
     assert item.risk_context["_core_activation_state"] == {"status": "activated"}
+    assert item.risk_context["validation"] == raw_risk["validation"]
+    assert item.risk_context["decider_handoff_context"] == raw_risk["decider_handoff_context"]
 
 
 def _monitoring_order(
