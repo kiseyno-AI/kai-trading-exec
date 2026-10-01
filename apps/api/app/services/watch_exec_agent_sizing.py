@@ -1047,8 +1047,43 @@ def _watch_exec_agent_defer_is_active(
     return retry_after is not None and retry_after > _utc_datetime(now or datetime.now(UTC))
 
 
-def _retryable_watch_rejection(decision: dict[str, object]) -> bool:
-    return str(decision.get("reason_code") or "").strip() in RETRYABLE_REJECTION_REASON_CODES
+def _reward_risk_rejection_price_cap(
+    *,
+    settings: Settings,
+    item: ExecutionPlanItem,
+) -> Decimal | None:
+    context = item.risk_context if isinstance(item.risk_context, dict) else {}
+    trigger = _decimal_value(item.trigger_price)
+    target = _decimal_value(context.get("target_price"))
+    stop = _decimal_value(context.get("stop_loss_price") or context.get("stop_price"))
+    minimum = max(
+        Decimal(str(settings.exec_agent_min_reward_risk)),
+        SHORT_TERM_LIVE_MIN_NET_REWARD_RISK,
+    )
+    if (
+        trigger is None
+        or target is None
+        or stop is None
+        or not stop < trigger < target
+    ):
+        return None
+    reward_risk = (target - trigger) / (trigger - stop)
+    return trigger if reward_risk >= minimum else None
+
+
+def _retryable_watch_rejection(
+    decision: dict[str, object],
+    *,
+    settings: Settings,
+    item: ExecutionPlanItem,
+) -> bool:
+    reason_code = str(decision.get("reason_code") or "").strip()
+    if reason_code in RETRYABLE_REJECTION_REASON_CODES:
+        return True
+    return bool(
+        reason_code == "reward_risk_below_minimum"
+        and _reward_risk_rejection_price_cap(settings=settings, item=item) is not None
+    )
 
 
 def _eligible_unsized_item_status(item: ExecutionPlanItem) -> bool:
@@ -1126,6 +1161,14 @@ def _candidate_payload(item: ExecutionPlanItem) -> dict[str, object]:
         _decimal_value(quantity_policy.get("estimated_reference_price"))
         or _decimal_value(risk_context.get("estimated_reference_price"))
     )
+    chase_limit_price = _decimal_value(item.limit_price)
+    reward_risk_cap = _decimal_value(risk_context.get("reward_risk_max_entry_price"))
+    if reward_risk_cap is not None:
+        chase_limit_price = (
+            min(chase_limit_price, reward_risk_cap)
+            if chase_limit_price is not None
+            else reward_risk_cap
+        )
     payload: dict[str, object] = {
         "execution_plan_item_id": item.id,
         "symbol": item.symbol,
@@ -1145,7 +1188,7 @@ def _candidate_payload(item: ExecutionPlanItem) -> dict[str, object]:
         "side": item.side,
         "status": item.status,
         "trigger_price": _json_decimal(item.trigger_price),
-        "chase_limit_price": _json_decimal(item.limit_price),
+        "chase_limit_price": _json_decimal(chase_limit_price),
         "estimated_reference_price": _json_decimal(estimated_reference_price),
         "entry_reference_price": _json_decimal(entry_reference_price),
         "entry_reference_source": entry_reference_source,
@@ -2722,7 +2765,11 @@ def _apply_decisions(
                 },
             )
         elif action == "reject":
-            if _retryable_watch_rejection(decision):
+            if _retryable_watch_rejection(
+                decision,
+                settings=settings,
+                item=item,
+            ):
                 retry_after = decision_at + timedelta(seconds=WATCH_EXEC_AGENT_DEFER_SECONDS)
                 risk_context = (
                     dict(item.risk_context)
@@ -2735,6 +2782,14 @@ def _apply_decisions(
                     "deferred_at": decision_at.isoformat(),
                     "retry_after": retry_after.isoformat(),
                 }
+                reward_risk_cap = _reward_risk_rejection_price_cap(
+                    settings=settings,
+                    item=item,
+                )
+                if reward_risk_cap is not None:
+                    risk_context["reward_risk_max_entry_price"] = _decimal_text(
+                        reward_risk_cap
+                    )
                 item.risk_context = compact_json_object(risk_context)
                 item.status = "watch_monitoring_pending"
                 _add_plan_item_audit(

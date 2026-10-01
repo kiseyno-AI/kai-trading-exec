@@ -12995,10 +12995,15 @@ def _watch_buy_trigger_price(item: ExecutionPlanItem) -> Decimal | None:
 
 
 def _watch_buy_chase_limit_price(item: ExecutionPlanItem) -> Decimal | None:
-    return _first_positive_decimal_from_item(
+    configured = _first_positive_decimal_from_item(
         item,
         ("chase_limit_price", "max_chase_limit_price", "entry_limit_price", "original_watch_chase_limit_price"),
     )
+    context = item.risk_context if isinstance(item.risk_context, dict) else {}
+    reward_risk_cap = _parse_decimal(context.get("reward_risk_max_entry_price"))
+    if reward_risk_cap is None or reward_risk_cap <= 0:
+        return configured
+    return min(configured, reward_risk_cap) if configured is not None else reward_risk_cap
 
 
 def _watch_buy_high_risk_gate_rejection(

@@ -154,11 +154,31 @@ class WatchSizingBrokerStub:
 
 
 def test_retryable_watch_rejection_is_deferred_not_terminal() -> None:
+    settings = Settings(runtime_mode="live", exec_agent_min_reward_risk=Decimal("1.8"))
+    item = _watch_item(
+        risk_context={"target_price": "7090", "stop_loss_price": "6090"},
+        trigger_price="6440",
+        limit_price="6550",
+    )
     assert watch_sizing._retryable_watch_rejection(
-        {"reason_code": "trigger_confirmation_and_cost_evidence_missing"}
+        {"reason_code": "trigger_confirmation_and_cost_evidence_missing"},
+        settings=settings,
+        item=item,
+    )
+    assert watch_sizing._retryable_watch_rejection(
+        {"reason_code": "reward_risk_below_minimum"},
+        settings=settings,
+        item=item,
+    )
+    structural_item = _watch_item(
+        risk_context={"target_price": "61000", "stop_loss_price": "55000"},
+        trigger_price="57300",
+        limit_price="58000",
     )
     assert not watch_sizing._retryable_watch_rejection(
-        {"reason_code": "reward_risk_below_minimum"}
+        {"reason_code": "reward_risk_below_minimum"},
+        settings=settings,
+        item=structural_item,
     )
 
 
