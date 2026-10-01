@@ -13634,6 +13634,15 @@ def _record_monitoring_event(
     # trail to survive the rest of that same decision cycle.
     risk_context["monitoring_events"] = [*monitoring_events[-19:], event]
     risk_context["last_monitoring_event"] = event
+    if core_v4_proof.get("_core_v4_contract_binding") is not None:
+        # A Core v4 item is itself a persisted cryptographic contract.  The
+        # complete pre-existing context can participate in later validation,
+        # including runtime sizing fields not present in the original command.
+        # Compacting the whole object is therefore unsafe.  History is already
+        # bounded above, so retain the contract verbatim and only add the
+        # bounded monitoring fields.
+        item.risk_context = risk_context
+        return
     compacted = compact_json_object(risk_context)
     # These fields are executable-authority proofs, not optional diagnostic
     # detail. JSON compaction may discard deep underscore-prefixed objects;
