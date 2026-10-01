@@ -1600,17 +1600,24 @@ def latest_account_drawdown_gate_state(
             order_decision,
         )
 
+    legacy_decision_is_current = bool(
+        legacy_decision is not None
+        and (
+            not legacy_decision[1]
+            or _legacy_drawdown_block_is_current(
+                settings=settings,
+                occurred_at=legacy_decision[0],
+                decision=legacy_decision[2],
+            )
+        )
+    )
     gated_decisions: list[tuple[datetime, dict[str, object]]] = []
     if latest_active_recovery is not None:
         gated_decisions.append(latest_active_recovery)
     if (
         legacy_decision is not None
         and legacy_decision[1]
-        and _legacy_drawdown_block_is_current(
-            settings=settings,
-            occurred_at=legacy_decision[0],
-            decision=legacy_decision[2],
-        )
+        and legacy_decision_is_current
     ):
         gated_decisions.append((legacy_decision[0], legacy_decision[2]))
     if gated_decisions:
@@ -1629,7 +1636,11 @@ def latest_account_drawdown_gate_state(
         }
 
     informational_decisions: list[tuple[datetime, dict[str, object]]] = []
-    if legacy_decision is not None:
+    # Do not expose an expired blocked decision as informational "latest"
+    # state. Some consumers summarize latest_decision independently of the
+    # gated boolean; retaining it would allow the stale gate to influence a
+    # later execution decision through a secondary path.
+    if legacy_decision is not None and legacy_decision_is_current:
         informational_decisions.append((legacy_decision[0], legacy_decision[2]))
     if latest_release is not None:
         informational_decisions.append(

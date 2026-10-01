@@ -40,6 +40,12 @@ def test_legacy_daily_drawdown_block_expires_at_next_market_day() -> None:
         decision=decision,
         now=datetime(2026, 10, 1, 3, 40, tzinfo=UTC),
     )
+    assert _legacy_drawdown_block_is_current(
+        settings=settings,
+        occurred_at=datetime(2026, 10, 1, 1, 0, tzinfo=UTC),
+        decision=decision,
+        now=datetime(2026, 10, 1, 3, 40, tzinfo=UTC),
+    )
 from app.services.account_drawdown_recovery import (
     recovery_account_fingerprint,
     recovery_idempotency_key,
