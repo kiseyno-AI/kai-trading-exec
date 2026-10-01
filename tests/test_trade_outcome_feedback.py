@@ -24,7 +24,22 @@ from app.services.trade_outcome_feedback import (
     generate_trade_outcome_feedback,
     load_latest_trade_outcome_feedback_snippet,
 )
-from app.services.account_drawdown_gate import latest_account_drawdown_gate_state
+from app.services.account_drawdown_gate import (
+    _legacy_drawdown_block_is_current,
+    latest_account_drawdown_gate_state,
+)
+
+
+def test_legacy_daily_drawdown_block_expires_at_next_market_day() -> None:
+    settings = Settings(market_timezone="Asia/Seoul")
+    decision = {"summary": {"gate_name": "daily_total_asset_drawdown_krw"}}
+
+    assert not _legacy_drawdown_block_is_current(
+        settings=settings,
+        occurred_at=datetime(2026, 9, 8, 6, 11, tzinfo=UTC),
+        decision=decision,
+        now=datetime(2026, 10, 1, 3, 40, tzinfo=UTC),
+    )
 from app.services.account_drawdown_recovery import (
     recovery_account_fingerprint,
     recovery_idempotency_key,

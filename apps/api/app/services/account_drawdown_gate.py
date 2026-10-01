@@ -1603,7 +1603,15 @@ def latest_account_drawdown_gate_state(
     gated_decisions: list[tuple[datetime, dict[str, object]]] = []
     if latest_active_recovery is not None:
         gated_decisions.append(latest_active_recovery)
-    if legacy_decision is not None and legacy_decision[1]:
+    if (
+        legacy_decision is not None
+        and legacy_decision[1]
+        and _legacy_drawdown_block_is_current(
+            settings=settings,
+            occurred_at=legacy_decision[0],
+            decision=legacy_decision[2],
+        )
+    ):
         gated_decisions.append((legacy_decision[0], legacy_decision[2]))
     if gated_decisions:
         latest_decision = max(
@@ -1669,6 +1677,33 @@ def latest_account_drawdown_gate_state(
         "active_recovery_scopes": active_recovery_scopes,
         "reason": None,
     }
+
+
+def _legacy_drawdown_block_is_current(
+    *,
+    settings: Settings,
+    occurred_at: datetime,
+    decision: dict[str, object],
+    now: datetime | None = None,
+) -> bool:
+    """Prevent an unaudited legacy period gate from surviving its period.
+
+    Recovery-scoped gates are handled separately and remain active until their
+    explicit release. Legacy daily/weekly observations have no such lifecycle,
+    so carrying them into a later day/week incorrectly blocks fresh orders.
+    """
+    summary = decision.get("summary")
+    gate_name = str(
+        summary.get("gate_name") if isinstance(summary, dict) else ""
+    )
+    timezone = ZoneInfo(settings.market_timezone)
+    observed = occurred_at.astimezone(timezone)
+    current = (now or datetime.now(UTC)).astimezone(timezone)
+    if gate_name.startswith("daily_"):
+        return observed.date() == current.date()
+    if gate_name.startswith("weekly_"):
+        return observed.date().isocalendar()[:2] == current.date().isocalendar()[:2]
+    return True
 
 
 def _broker_order_gate_state(
