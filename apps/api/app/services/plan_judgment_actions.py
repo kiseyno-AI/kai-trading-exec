@@ -47,6 +47,10 @@ SOURCE = "hourly_runtime_check"
 MAX_MUTATIONS_PER_RUN = 20
 
 
+def _is_core_v4_bound(risk_context: dict[str, object]) -> bool:
+    return isinstance(risk_context.get("_core_v4_contract_binding"), dict)
+
+
 def _database_path(settings: Settings) -> str:
     parsed = urlparse(settings.database_url)
     if parsed.scheme not in {"sqlite", "sqlite+pysqlite"}:
@@ -1563,6 +1567,12 @@ def _apply_hourly_plan_judgment_action_session(
                 break
             for item in items:
                 risk_context = _json_object(item.risk_context)
+                # Core v4 trigger/limit values are covered by the persisted
+                # authority contract.  Hourly caution may report the risk but
+                # must not rewrite those immutable prices; doing so causes the
+                # safety validator to quarantine the entire plan.
+                if _is_core_v4_bound(risk_context):
+                    continue
                 existing = risk_context.get(ADJUSTMENT_KEY)
                 if isinstance(existing, dict) and existing.get("action") == action:
                     continue
@@ -1779,6 +1789,8 @@ def _adjust_buy_watch_prices(
             break
         for item in items:
             risk_context = _json_object(item["risk_context"])
+            if _is_core_v4_bound(risk_context):
+                continue
             existing = risk_context.get(ADJUSTMENT_KEY)
             if isinstance(existing, dict) and existing.get("action") == "conservative_price_adjust":
                 continue
