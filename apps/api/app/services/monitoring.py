@@ -13613,6 +13613,10 @@ def _record_monitoring_event(
     event: dict[str, object],
 ) -> None:
     risk_context = dict(_loaded_risk_context(item))
+    core_v4_contract = _core_v4_monitoring_contract_fields(
+        item=item,
+        risk_context=risk_context,
+    )
     core_v4_proof = {
         key: risk_context[key]
         for key in (
@@ -13635,8 +13639,64 @@ def _record_monitoring_event(
     # detail. JSON compaction may discard deep underscore-prefixed objects;
     # losing one after a routine monitoring event makes a valid v4 plan look
     # legacy and causes the safety fence to quarantine the BUY watch.
+    compacted.update(core_v4_contract)
     compacted.update(core_v4_proof)
     item.risk_context = compacted
+
+
+def _core_v4_monitoring_contract_fields(
+    *,
+    item: ExecutionPlanItem,
+    risk_context: dict[str, object],
+) -> dict[str, object]:
+    """Return the immutable v4 payload fields that monitoring must not compact.
+
+    The persisted-contract validator proves the complete original risk payload,
+    not only the binding and activation markers.  Rebuild that immutable slice
+    from the plan command so runtime monitoring fields may still be compacted
+    without turning a valid watch into a legacy/unproven contract.
+    """
+    if not isinstance(risk_context.get("_core_v4_contract_binding"), dict):
+        return {}
+    try:
+        raw_payload = item.plan.raw_payload
+    except (AttributeError, RuntimeError):
+        return {}
+    if not isinstance(raw_payload, dict):
+        return {}
+    raw_items = raw_payload.get("items")
+    if not isinstance(raw_items, list):
+        return {}
+    source_key = str(item.source_plan_item_id or "").strip()
+    raw_item = next(
+        (
+            candidate
+            for candidate in raw_items
+            if isinstance(candidate, dict)
+            and candidate.get("core_item_key") == source_key
+        ),
+        None,
+    )
+    if not isinstance(raw_item, dict):
+        return {}
+    raw_risk = raw_item.get("risk_context")
+    if not isinstance(raw_risk, dict):
+        return {}
+    preserved = dict(raw_risk)
+    for key in (
+        "market",
+        "exchange",
+        "currency",
+        "broker",
+        "session_policy",
+        "handoff_intent",
+        "raw_action",
+        "tactical_action",
+        "generic_action",
+    ):
+        if key in raw_item:
+            preserved[key] = raw_item[key]
+    return preserved
 
 
 def _plan_item_exchange(item: ExecutionPlanItem) -> str:
