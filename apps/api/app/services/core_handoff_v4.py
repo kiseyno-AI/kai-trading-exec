@@ -1307,6 +1307,12 @@ def _quantity_policy_matches(
         return False
     if quantity_policy == raw_policy:
         return True
+    if side == "buy" and _watch_rejection_policy_matches(
+        raw_policy=raw_policy,
+        quantity_policy=quantity_policy,
+        item=item,
+    ):
+        return True
     if _watch_attempt_policy_matches(
         raw_policy=raw_policy,
         quantity_policy=quantity_policy,
@@ -1351,6 +1357,39 @@ def _quantity_policy_matches(
         risk_context=risk_context,
         item=item,
         linked_entry=linked_entry,
+    )
+
+
+def _watch_rejection_policy_matches(
+    *,
+    raw_policy: dict[str, object],
+    quantity_policy: dict[str, object],
+    item: ExecutionPlanItem,
+) -> bool:
+    expected_keys = {
+        "kind",
+        "source",
+        "reason",
+        "reason_code",
+        "exec_agent_decision",
+        "short_term_exec_agent_decision",
+        "exec_agent_decision_audit",
+        "previous_policy",
+    }
+    decision = quantity_policy.get("exec_agent_decision")
+    return bool(
+        set(quantity_policy) == expected_keys
+        and quantity_policy.get("kind") == "exec_agent_rejected"
+        and quantity_policy.get("source") == "exec_agent_watch_sizing"
+        and quantity_policy.get("previous_policy") == raw_policy
+        and isinstance(decision, dict)
+        and decision == quantity_policy.get("short_term_exec_agent_decision")
+        and decision.get("source") == "openclaw_exec_agent_watch_sizing"
+        and decision.get("action") == "reject"
+        and decision.get("decision") == "rejected"
+        and decision.get("execution_plan_item_id") == item.id
+        and decision.get("quantity") == 0
+        and decision.get("approved_quantity") == 0
     )
 
 

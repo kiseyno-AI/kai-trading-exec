@@ -24,6 +24,35 @@ from app.models.runtime import (
     ExecutionPlanItemAudit,
 )
 from app.services import core_handoff_v4
+
+
+def test_watch_rejection_policy_is_valid_terminal_core_v4_transition() -> None:
+    raw_policy = {"type": "exec_agent_sized", "budget_krw": "1000000"}
+    item = ExecutionPlanItem(id="item-1", symbol="005930")
+    decision = {
+        "source": "openclaw_exec_agent_watch_sizing",
+        "action": "reject",
+        "decision": "rejected",
+        "execution_plan_item_id": item.id,
+        "quantity": 0,
+        "approved_quantity": 0,
+    }
+    policy = {
+        "kind": "exec_agent_rejected",
+        "source": "exec_agent_watch_sizing",
+        "reason": "hard gate",
+        "reason_code": "hard_gate",
+        "exec_agent_decision": decision,
+        "short_term_exec_agent_decision": decision,
+        "exec_agent_decision_audit": {"event_type": "watch_exec_agent_sizing_decision"},
+        "previous_policy": raw_policy,
+    }
+
+    assert core_handoff_v4._watch_rejection_policy_matches(
+        raw_policy=raw_policy,
+        quantity_policy=policy,
+        item=item,
+    )
 from app.services.execution_jobs import _claim_job, _lock_job_for_broker_submission
 from app.services.watch_exec_agent_sizing import _apply_decisions
 from openclaw_contract_test_support import verified_runtime_provenance
