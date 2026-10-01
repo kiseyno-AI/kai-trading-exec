@@ -85,6 +85,46 @@ def test_monitoring_event_preserves_core_v4_authority_proofs() -> None:
         assert item.risk_context[key] == value
 
 
+def test_monitoring_event_preserves_complete_core_v4_contract_payload() -> None:
+    raw_risk = {
+        "market": "KRX",
+        "broker": "kis",
+        "validation": {"evidence": "v" * 4000},
+        "decider_handoff_context": {"context": "c" * 4000},
+        "_core_activation": {"mode": "core_confirmed"},
+    }
+    raw_item = {
+        "core_item_key": "core-plan-1:intraday_watch_buy",
+        "market": "KRX",
+        "exchange": "KRX",
+        "currency": "KRW",
+        "broker": "kis",
+        "session_policy": {"session": "regular"},
+        "handoff_intent": "intraday_watch_buy",
+        "risk_context": raw_risk,
+    }
+    item = ExecutionPlanItem(
+        source_plan_item_id=raw_item["core_item_key"],
+        risk_context={
+            **raw_risk,
+            "_core_v4_contract_binding": {"version": "v1"},
+            "_core_activation_state": {"status": "activated"},
+        },
+    )
+    item.plan = ExecutionPlan(raw_payload={"items": [raw_item]})
+
+    monitoring_service._record_monitoring_event(
+        item=item,
+        event={"event": "watch_buy_triggered_blocked"},
+    )
+
+    for key, value in raw_risk.items():
+        assert item.risk_context[key] == value
+    assert item.risk_context["session_policy"] == {"session": "regular"}
+    assert item.risk_context["_core_v4_contract_binding"] == {"version": "v1"}
+    assert item.risk_context["_core_activation_state"] == {"status": "activated"}
+
+
 def _monitoring_order(
     settings: Settings,
     *,
