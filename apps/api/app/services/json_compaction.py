@@ -121,6 +121,15 @@ def compact_json_payload(
 
 
 def compact_json_object(value: Any, **kwargs: Any) -> dict[str, Any]:
+    if isinstance(value, dict) and isinstance(
+        value.get("_core_v4_contract_binding"), dict
+    ):
+        # This object is part of the persisted Core v4 contract.  Callers use
+        # the complete original payload for authority validation, so generic
+        # lossy compaction would silently invalidate executable authority.
+        # Monitoring histories are bounded by their writers; keep the contract
+        # object intact at every compaction call site.
+        return dict(value)
     compacted = compact_json_payload(value, **kwargs)
     return compacted if isinstance(compacted, dict) else {}
 

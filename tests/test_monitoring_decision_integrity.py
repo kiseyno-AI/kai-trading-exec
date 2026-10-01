@@ -131,6 +131,16 @@ def test_monitoring_event_preserves_complete_core_v4_contract_payload() -> None:
     assert item.risk_context["decider_handoff_context"] == raw_risk["decider_handoff_context"]
 
 
+def test_generic_compaction_never_discards_bound_core_v4_contract() -> None:
+    payload = {
+        "_core_v4_contract_binding": {"version": "core-v4-persisted-binding-v1"},
+        "validation": {"evidence": "v" * 4000},
+        "decider_handoff_context": {"context": "c" * 4000},
+    }
+
+    assert compact_json_object(payload) == payload
+
+
 def _monitoring_order(
     settings: Settings,
     *,
