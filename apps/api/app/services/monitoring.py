@@ -13613,6 +13613,15 @@ def _record_monitoring_event(
     event: dict[str, object],
 ) -> None:
     risk_context = dict(_loaded_risk_context(item))
+    core_v4_proof = {
+        key: risk_context[key]
+        for key in (
+            "_core_v4_contract_binding",
+            "_core_activation",
+            "_core_activation_state",
+        )
+        if key in risk_context
+    }
     monitoring_events = risk_context.get("monitoring_events")
     if not isinstance(monitoring_events, list):
         monitoring_events = []
@@ -13621,7 +13630,13 @@ def _record_monitoring_event(
     # trail to survive the rest of that same decision cycle.
     risk_context["monitoring_events"] = [*monitoring_events[-19:], event]
     risk_context["last_monitoring_event"] = event
-    item.risk_context = compact_json_object(risk_context)
+    compacted = compact_json_object(risk_context)
+    # These fields are executable-authority proofs, not optional diagnostic
+    # detail. JSON compaction may discard deep underscore-prefixed objects;
+    # losing one after a routine monitoring event makes a valid v4 plan look
+    # legacy and causes the safety fence to quarantine the BUY watch.
+    compacted.update(core_v4_proof)
+    item.risk_context = compacted
 
 
 def _plan_item_exchange(item: ExecutionPlanItem) -> str:

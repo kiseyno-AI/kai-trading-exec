@@ -50,6 +50,41 @@ from app.services.position_identity import (
 )
 
 
+def test_monitoring_event_preserves_core_v4_authority_proofs() -> None:
+    proofs = {
+        "_core_v4_contract_binding": {
+            "version": "core-v4-persisted-binding-v1",
+            "plan_payload_sha256": "a" * 64,
+            "core_item_key": "core-plan-1:intraday_watch_buy",
+            "plan_item_index": 0,
+        },
+        "_core_activation": {
+            "schema_version": "core_execution_activation_binding_v1",
+            "mode": "core_confirmed",
+            "authority_generation_fingerprint": "b" * 64,
+        },
+        "_core_activation_state": {
+            "version": "core-exec-activation-state-v1",
+            "status": "activated",
+            "prior_status": "watch_monitoring_pending",
+        },
+    }
+    item = ExecutionPlanItem(
+        risk_context={
+            **proofs,
+            "large_context": {str(i): i for i in range(500)},
+        }
+    )
+
+    monitoring_service._record_monitoring_event(
+        item=item,
+        event={"event": "watch_buy_triggered_blocked"},
+    )
+
+    for key, value in proofs.items():
+        assert item.risk_context[key] == value
+
+
 def _monitoring_order(
     settings: Settings,
     *,
