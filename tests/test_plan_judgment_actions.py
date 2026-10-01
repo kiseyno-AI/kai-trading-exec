@@ -1417,6 +1417,41 @@ def test_postgres_caution_processes_unadjusted_watch_after_limit_of_adjusted_row
     engine.dispose()
 
 
+def test_postgres_caution_does_not_mutate_core_v4_bound_watch() -> None:
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    settings = Settings(runtime_mode="live", database_url="postgresql+psycopg://unused/test")
+    with Session(engine) as db:
+        plan = ExecutionPlan(external_plan_id="plan-core-v4-caution", source="core", mode="live")
+        item = ExecutionPlanItem(
+            plan=plan,
+            plan_item_index=0,
+            symbol="123456",
+            side="buy",
+            intent="intraday_watch_buy",
+            status="watch_monitoring_pending",
+            trigger_price=100,
+            limit_price=101,
+            risk_context={"_core_v4_contract_binding": {"version": "v1"}},
+        )
+        db.add(item)
+        db.commit()
+
+        result = apply_hourly_plan_judgment_action(
+            settings=settings,
+            db=db,
+            risk_flags=1,
+            risk_reasons=["caution"],
+        )
+
+        db.refresh(item)
+        assert result["changed_count"] == 0
+        assert str(item.trigger_price) == "100.0000"
+        assert str(item.limit_price) == "101.0000"
+        assert ADJUSTMENT_KEY not in item.risk_context
+    engine.dispose()
+
+
 def test_postgres_restore_processes_adjusted_watch_after_limit_of_unadjusted_rows() -> None:
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)
