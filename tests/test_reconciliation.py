@@ -8,7 +8,7 @@ from hashlib import sha256
 from fastapi.testclient import TestClient
 import pytest
 from pydantic import ValidationError
-from sqlalchemy import func, select
+from sqlalchemy import event, func, select
 
 from app.api.schemas.execution import PlaceOrderRequest, StaleBrokerOrderReconciliationRequest
 from app.broker.base import (
@@ -44,6 +44,7 @@ from app.models.runtime import (
     RuntimeRemediationEvent,
 )
 from app.services import reconciliation as reconciliation_service
+from app.services import monitoring as monitoring_service
 from app.services.execution_jobs import dispatch_due_execution_jobs
 from app.services.execution_account_route import bind_kis_account_route
 from app.services.execution_api import _serialize_execution_fill
@@ -68,6 +69,7 @@ from app.services.runtime import (
     build_runtime_status,
 )
 from app.services.runtime_controls import ControlCommand, resume_runtime
+from app.services.watch_exec_agent_sizing import _reconcile_stale_sizing_orders
 
 
 OBSERVED_AT = datetime(2026, 5, 13, 9, 5, tzinfo=UTC)
@@ -200,6 +202,7 @@ class ReconciliationStubBroker:
         self.reconcile_calls: list[tuple[str, str, datetime | None]] = []
         self.reconcile_expected_symbols: list[str | None] = []
         self.order_calls: list[BrokerOrderPlacementRequest] = []
+        self.account_snapshot_calls: list[tuple[list[str] | None, str]] = []
         self.authenticate_calls = 0
 
     def describe(self) -> BrokerConfig:
@@ -239,7 +242,8 @@ class ReconciliationStubBroker:
         exchange: str = "KRX",
     ) -> BrokerAccountSnapshot:
         assert access_token
-        del symbols, reference_prices, exchange
+        self.account_snapshot_calls.append((symbols, exchange))
+        del reference_prices
         return self.account_snapshot
 
     def reconnect_handle(self) -> BrokerReconnectHandle:
@@ -683,6 +687,455 @@ def test_us_position_sync_preserves_durable_monitoring_manual_review() -> None:
         "manual_review_recorded_at": "2026-09-15T03:55:00+00:00",
     }
     engine.dispose()
+
+
+def test_us_position_sync_preserves_unpriced_latch_when_holding_is_absent() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        execution_position_account_scope="missing-holding-latch-test",
+    )
+    engine, db = _session(settings)
+    identity = build_position_identity(
+        settings=settings,
+        provider="kis",
+        exchange="NASD",
+    )
+    raw_payload = payload_with_position_identity({}, identity=identity)
+    raw_payload["_position_sync"] = {
+        "asset_class": "us_equity",
+        "exchange": "NASD",
+        "monitoring_eligible": False,
+        "manual_review_required": True,
+        "manual_review_reason": "unpriced_overseas_holding",
+        "manual_review_recorded_at": "2026-09-15T03:55:00+00:00",
+    }
+    position = ExecutionPosition(
+        mode=settings.runtime_mode,
+        provider=identity.provider,
+        account_scope=identity.account_scope,
+        exchange=identity.exchange,
+        symbol="WWBLCM",
+        quantity=75,
+        average_price=Decimal("0.9164"),
+        updated_from="reconciliation",
+        raw_payload=raw_payload,
+    )
+    db.add(position)
+    db.commit()
+    broker = ReconciliationStubBroker(
+        account_snapshot=BrokerAccountSnapshot(
+            observed_at=datetime.now(UTC),
+            source="kis:us_equity_account_snapshot",
+            holdings=[],
+            holdings_complete=True,
+            open_orders_complete=True,
+            payload={"currency": "USD", "exchange": "NASD"},
+        )
+    )
+
+    result = sync_execution_positions_from_broker_snapshot(
+        settings=settings,
+        db=db,
+        adapter=broker,
+        symbols={"WWBLCM"},
+        exchange="NASD",
+        authenticated_access_token="access-token",
+    )
+
+    db.refresh(position)
+    assert result["zeroed"] == 1
+    assert result["monitoring_recovered_count"] == 0
+    assert position.quantity == 0
+    assert position.raw_payload["_position_sync"] == {
+        "asset_class": "us_equity",
+        "exchange": "NASD",
+        "monitoring_eligible": False,
+        "manual_review_required": True,
+        "manual_review_reason": "unpriced_overseas_holding",
+        "manual_review_recorded_at": "2026-09-15T03:55:00+00:00",
+    }
+    assert db.scalars(select(RuntimeRemediationEvent)).all() == []
+    engine.dispose()
+
+
+def test_us_position_sync_recovers_unpriced_holding_from_fresh_complete_broker_evidence() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        execution_position_account_scope="manual-review-recovery-test",
+    )
+    engine, db = _session(settings)
+    identity = build_position_identity(
+        settings=settings,
+        provider="kis",
+        exchange="NASD",
+    )
+    raw_payload = payload_with_position_identity({}, identity=identity)
+    raw_payload["_position_sync"] = {
+        "asset_class": "us_equity",
+        "exchange": "NASD",
+        "monitoring_eligible": False,
+        "manual_review_required": True,
+        "manual_review_reason": "unpriced_overseas_holding",
+        "manual_review_recorded_at": "2026-09-15T03:55:00+00:00",
+    }
+    position = ExecutionPosition(
+        mode=settings.runtime_mode,
+        provider=identity.provider,
+        account_scope=identity.account_scope,
+        exchange=identity.exchange,
+        symbol="APTX",
+        quantity=377,
+        average_price=Decimal("0.0963"),
+        updated_from="reconciliation",
+        raw_payload=raw_payload,
+    )
+    db.add(position)
+    db.commit()
+    observed_at = datetime.now(UTC) - timedelta(seconds=5)
+    broker = ReconciliationStubBroker(
+        account_snapshot=BrokerAccountSnapshot(
+            available_cash=Decimal("1000"),
+            observed_at=observed_at,
+            source="kis:us_equity_account_snapshot",
+            holdings_complete=True,
+            open_orders_complete=True,
+            holdings=[
+                BrokerAccountHolding(
+                    symbol="APTX",
+                    quantity=377,
+                    average_price=Decimal("0.0963"),
+                    sellable_quantity=377,
+                    payload={"ovrs_excg_cd": "NASD", "now_pric2": "0.061"},
+                )
+            ],
+            payload={"currency": "USD", "exchange": "NASD"},
+        )
+    )
+
+    result = sync_execution_positions_from_broker_snapshot(
+        settings=settings,
+        db=db,
+        adapter=broker,
+        symbols=None,
+        exchange="NASD",
+        discover_holdings_only=True,
+        authenticated_access_token="access-token",
+    )
+
+    db.refresh(position)
+    event = db.scalar(
+        select(RuntimeRemediationEvent).where(
+            RuntimeRemediationEvent.candidate_type
+            == "position_monitoring_manual_review",
+            RuntimeRemediationEvent.subject_id == position.id,
+            RuntimeRemediationEvent.outcome == "monitoring_reenabled",
+        )
+    )
+    assert result["monitoring_recovered_count"] == 1
+    assert position.raw_payload["_position_sync"] == {
+        "asset_class": "us_equity",
+        "exchange": "NASD",
+        "monitoring_eligible": True,
+    }
+    assert event is not None
+    assert event.actor == "system"
+    assert event.reason == "fresh_complete_kis_holding_is_priceable_and_sellable"
+    assert event.evidence_summary["snapshot_source"] == "kis:us_equity_account_snapshot"
+    assert event.evidence_summary["current_price"] == "0.061"
+    assert event.evidence_summary["sellable_quantity"] == 377
+    assert event.evidence_summary["prior_manual_review_reason"] == (
+        "unpriced_overseas_holding"
+    )
+    assert event.evidence_summary["manual_review_recorded_at"] == (
+        "2026-09-15T03:55:00+00:00"
+    )
+    assert event.evidence_summary["orders_submitted"] == 0
+    assert "APTX" in monitoring_service.list_autonomous_monitoring_symbols(
+        settings=settings,
+        db=db,
+        effective_at=observed_at,
+    )
+    relatched_at = observed_at + timedelta(seconds=1)
+    monitoring_service._mark_position_monitoring_manual_review(
+        position=position,
+        reason="unpriced_overseas_holding",
+        triggered_at=relatched_at,
+    )
+    db.commit()
+    assert position.raw_payload["_position_sync"]["monitoring_eligible"] is False
+    assert position.raw_payload["_position_sync"]["manual_review_recorded_at"] == (
+        relatched_at.isoformat()
+    )
+    assert "APTX" not in monitoring_service.list_autonomous_monitoring_symbols(
+        settings=settings,
+        db=db,
+        effective_at=relatched_at,
+    )
+    broker.account_snapshot = BrokerAccountSnapshot(
+        available_cash=Decimal("1000"),
+        observed_at=relatched_at + timedelta(seconds=1),
+        source="kis:us_equity_account_snapshot",
+        holdings_complete=True,
+        open_orders_complete=True,
+        holdings=broker.account_snapshot.holdings,
+        payload={"currency": "USD", "exchange": "NASD"},
+    )
+    second_recovery = sync_execution_positions_from_broker_snapshot(
+        settings=settings,
+        db=db,
+        adapter=broker,
+        symbols=None,
+        exchange="NASD",
+        discover_holdings_only=True,
+        authenticated_access_token="access-token",
+    )
+    recovery_events = db.scalars(
+        select(RuntimeRemediationEvent).where(
+            RuntimeRemediationEvent.candidate_type
+            == "position_monitoring_manual_review",
+            RuntimeRemediationEvent.subject_id == position.id,
+            RuntimeRemediationEvent.outcome == "monitoring_reenabled",
+        )
+    ).all()
+    db.refresh(position)
+    assert second_recovery["monitoring_recovered_count"] == 1
+    assert position.raw_payload["_position_sync"]["monitoring_eligible"] is True
+    assert len(recovery_events) == 2
+    engine.dispose()
+
+
+def test_unpriced_holding_recovery_preserves_independent_trade_quarantine() -> None:
+    settings = Settings(database_url="sqlite:///:memory:", runtime_mode="paper")
+    observed_at = datetime.now(UTC)
+    snapshot = BrokerAccountSnapshot(
+        observed_at=observed_at,
+        source="kis:us_equity_account_snapshot",
+        holdings_complete=True,
+        open_orders_complete=True,
+        payload={"exchange": "NASD"},
+    )
+    holding = BrokerAccountHolding(
+        symbol="APTX",
+        quantity=377,
+        average_price=Decimal("0.0963"),
+        sellable_quantity=377,
+        payload={"ovrs_excg_cd": "NASD", "now_pric2": "0.061"},
+    )
+
+    evidence = reconciliation_service._unpriced_kis_us_holding_recovery_evidence(
+        settings=settings,
+        snapshot=snapshot,
+        holding=holding,
+        exchange="NASD",
+        prior_payload={
+            "_position_sync": {
+                "asset_class": "us_equity",
+                "exchange": "NASD",
+                "monitoring_eligible": False,
+                "manual_review_required": True,
+                "manual_review_reason": "unpriced_overseas_holding",
+                "manual_review_recorded_at": "2026-09-15T03:55:00+00:00",
+                "trade_eligible": False,
+                "route_disposition": "manual_review",
+            }
+        },
+        evaluated_at=observed_at,
+    )
+
+    assert evidence is None
+
+
+def test_us_position_sync_preserves_unpriced_latch_for_zero_current_price() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        execution_position_account_scope="zero-price-latch-test",
+    )
+    engine, db = _session(settings)
+    identity = build_position_identity(
+        settings=settings,
+        provider="kis",
+        exchange="NASD",
+    )
+    recorded_at = "2026-09-15T03:55:00+00:00"
+    raw_payload = payload_with_position_identity({}, identity=identity)
+    raw_payload["_position_sync"] = {
+        "asset_class": "us_equity",
+        "exchange": "NASD",
+        "monitoring_eligible": False,
+        "manual_review_required": True,
+        "manual_review_reason": "unpriced_overseas_holding",
+        "manual_review_recorded_at": recorded_at,
+    }
+    position = ExecutionPosition(
+        mode=settings.runtime_mode,
+        provider=identity.provider,
+        account_scope=identity.account_scope,
+        exchange=identity.exchange,
+        symbol="WWBLCM",
+        quantity=75,
+        average_price=Decimal("0.9164"),
+        updated_from="reconciliation",
+        raw_payload=raw_payload,
+    )
+    db.add(position)
+    db.commit()
+    broker = ReconciliationStubBroker(
+        account_snapshot=BrokerAccountSnapshot(
+            observed_at=datetime.now(UTC) - timedelta(seconds=1),
+            source="kis:us_equity_account_snapshot",
+            holdings_complete=True,
+            open_orders_complete=True,
+            holdings=[
+                BrokerAccountHolding(
+                    symbol="WWBLCM",
+                    quantity=75,
+                    average_price=Decimal("0.9164"),
+                    sellable_quantity=75,
+                    payload={"ovrs_excg_cd": "NASD", "now_pric2": "0"},
+                )
+            ],
+            payload={"currency": "USD", "exchange": "NASD"},
+        )
+    )
+
+    result = sync_execution_positions_from_broker_snapshot(
+        settings=settings,
+        db=db,
+        adapter=broker,
+        symbols={"WWBLCM"},
+        exchange="NASD",
+        authenticated_access_token="access-token",
+    )
+
+    db.refresh(position)
+    sync_payload = position.raw_payload["_position_sync"]
+    assert result["monitoring_recovered_count"] == 0
+    assert sync_payload["monitoring_eligible"] is False
+    assert sync_payload["manual_review_required"] is True
+    assert sync_payload["manual_review_reason"] == "unpriced_overseas_holding"
+    assert sync_payload["manual_review_recorded_at"] == recorded_at
+    assert db.scalars(select(RuntimeRemediationEvent)).all() == []
+    engine.dispose()
+
+
+def test_unpriced_holding_recovery_rejects_missing_average_price() -> None:
+    settings = Settings(database_url="sqlite:///:memory:", runtime_mode="paper")
+    observed_at = datetime.now(UTC)
+
+    evidence = reconciliation_service._unpriced_kis_us_holding_recovery_evidence(
+        settings=settings,
+        snapshot=BrokerAccountSnapshot(
+            observed_at=observed_at,
+            source="kis:us_equity_account_snapshot",
+            holdings_complete=True,
+            open_orders_complete=True,
+            payload={"exchange": "NASD"},
+        ),
+        holding=BrokerAccountHolding(
+            symbol="APTX",
+            quantity=377,
+            average_price=None,
+            sellable_quantity=377,
+            payload={"ovrs_excg_cd": "NASD", "now_pric2": "0.061"},
+        ),
+        exchange="NASD",
+        prior_payload={
+            "_position_sync": {
+                "asset_class": "us_equity",
+                "exchange": "NASD",
+                "monitoring_eligible": False,
+                "manual_review_required": True,
+                "manual_review_reason": "unpriced_overseas_holding",
+                "manual_review_recorded_at": "2026-09-15T03:55:00+00:00",
+            }
+        },
+        evaluated_at=observed_at,
+    )
+
+    assert evidence is None
+
+
+def test_unpriced_holding_recovery_rejects_conflicting_current_price_fields() -> None:
+    settings = Settings(database_url="sqlite:///:memory:", runtime_mode="paper")
+    observed_at = datetime.now(UTC)
+
+    evidence = reconciliation_service._unpriced_kis_us_holding_recovery_evidence(
+        settings=settings,
+        snapshot=BrokerAccountSnapshot(
+            observed_at=observed_at,
+            source="kis:us_equity_account_snapshot",
+            holdings_complete=True,
+            open_orders_complete=True,
+            payload={"exchange": "NASD"},
+        ),
+        holding=BrokerAccountHolding(
+            symbol="APTX",
+            quantity=377,
+            average_price=Decimal("0.0963"),
+            sellable_quantity=377,
+            payload={
+                "ovrs_excg_cd": "NASD",
+                "now_pric2": "0.061",
+                "current_price": "0",
+            },
+        ),
+        exchange="NASD",
+        prior_payload={
+            "_position_sync": {
+                "asset_class": "us_equity",
+                "exchange": "NASD",
+                "monitoring_eligible": False,
+                "manual_review_required": True,
+                "manual_review_reason": "unpriced_overseas_holding",
+                "manual_review_recorded_at": "2026-09-15T03:55:00+00:00",
+            }
+        },
+        evaluated_at=observed_at,
+    )
+
+    assert evidence is None
+
+
+def test_unpriced_holding_recovery_requires_snapshot_newer_than_current_latch() -> None:
+    settings = Settings(database_url="sqlite:///:memory:", runtime_mode="paper")
+    observed_at = datetime.now(UTC)
+
+    evidence = reconciliation_service._unpriced_kis_us_holding_recovery_evidence(
+        settings=settings,
+        snapshot=BrokerAccountSnapshot(
+            observed_at=observed_at,
+            source="kis:us_equity_account_snapshot",
+            holdings_complete=True,
+            open_orders_complete=True,
+            payload={"exchange": "NASD"},
+        ),
+        holding=BrokerAccountHolding(
+            symbol="APTX",
+            quantity=377,
+            average_price=Decimal("0.0963"),
+            sellable_quantity=377,
+            payload={"ovrs_excg_cd": "NASD", "now_pric2": "0.061"},
+        ),
+        exchange="NASD",
+        prior_payload={
+            "_position_sync": {
+                "asset_class": "us_equity",
+                "exchange": "NASD",
+                "monitoring_eligible": False,
+                "manual_review_required": True,
+                "manual_review_reason": "unpriced_overseas_holding",
+                "manual_review_recorded_at": (
+                    observed_at + timedelta(seconds=1)
+                ).isoformat(),
+            }
+        },
+        evaluated_at=observed_at + timedelta(seconds=2),
+    )
+
+    assert evidence is None
 
 
 def test_us_position_sync_does_not_preserve_non_durable_monitoring_disable() -> None:
@@ -3669,6 +4122,1652 @@ def test_reconcile_stale_orders_dry_run_summarizes_repairs_without_mutating() ->
     engine.dispose()
 
 
+def test_reconcile_stale_dry_run_surfaces_fingerprinted_legacy_manual_review_candidate() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="live",
+        kis_app_key="test-app-key",
+        kis_app_secret="test-app-secret",
+        kis_account_number="12342504",
+        kis_account_product_code="01",
+        stale_broker_order_reconciliation_threshold_seconds=3600,
+    )
+    engine, db = _session(settings)
+    stale_at = datetime.now(UTC) - timedelta(days=45)
+    order = BrokerOrder(
+        broker_name="kis",
+        mode="live",
+        idempotency_key="legacy-manual-review-dry-run",
+        broker_order_id=None,
+        symbol="052420",
+        side="buy",
+        status="manual_review_required",
+        quantity=2,
+        created_at=stale_at,
+        submitted_at=None,
+        last_broker_sync_at=stale_at,
+        last_error_classification="missing_broker_order_id",
+        last_error_code="IGW00007",
+        request_metadata={
+            "provider": "kis",
+            "endpoint": "/uapi/domestic-stock/v1/trading/order-cash",
+            "method": "POST",
+            "tr_id": "TTTC0012U",
+            "account_number_masked": "****2504",
+            "route": {"exchange": "KRX"},
+        },
+    )
+    db.add(order)
+    db.commit()
+    broker = ReconciliationStubBroker(
+        account_snapshot=BrokerAccountSnapshot(
+            available_cash=Decimal("1000000"),
+            observed_at=datetime.now(UTC),
+            source="kis:account_snapshot",
+            holdings=[],
+            open_orders=[],
+            holdings_complete=True,
+            open_orders_complete=True,
+            payload={
+                "exchange": "KRX",
+                "account_number_masked": "****2504",
+            },
+        )
+    )
+
+    result = reconcile_stale_nonterminal_broker_orders(
+        settings=settings,
+        db=db,
+        adapter=broker,
+        dry_run=True,
+        include_legacy_manual_review=True,
+    )
+
+    db.refresh(order)
+    resolution = result["legacy_manual_review_resolution"]
+    assert resolution["candidate_order_count"] == 1
+    assert resolution["eligible_order_count"] == 1
+    assert resolution["would_resolve_order_count"] == 1
+    assert resolution["resolved_order_count"] == 0
+    assert len(resolution["items"][0]["evidence_fingerprint"]) == 64
+    assert resolution["items"][0]["repair_action"] == "approval_required"
+    assert resolution["items"][0]["broker_position_match"] is False
+    assert resolution["items"][0]["broker_open_order_match"] is False
+    assert resolution["items"][0]["account_product_code_proof"] == (
+        "legacy_missing"
+    )
+    assert resolution["items"][0]["snapshot_route_product_code"] == "01"
+    assert order.status == "manual_review_required"
+    assert db.scalars(select(BrokerOrderEvent)).all() == []
+    assert broker.order_calls == []
+    engine.dispose()
+
+
+def test_reconcile_stale_never_surfaces_legacy_manual_review_younger_than_thirty_days() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="live",
+        kis_app_key="test-app-key",
+        kis_app_secret="test-app-secret",
+        kis_account_number="12342504",
+        kis_account_product_code="01",
+        stale_broker_order_reconciliation_threshold_seconds=60,
+    )
+    engine, db = _session(settings)
+    order = BrokerOrder(
+        broker_name="kis",
+        mode="live",
+        idempotency_key="legacy-manual-review-too-young",
+        broker_order_id=None,
+        symbol="052420",
+        side="buy",
+        status="manual_review_required",
+        quantity=2,
+        created_at=datetime.now(UTC) - timedelta(days=29),
+        last_error_classification="missing_broker_order_id",
+        request_metadata={
+            "provider": "kis",
+            "endpoint": "/uapi/domestic-stock/v1/trading/order-cash",
+            "method": "POST",
+            "tr_id": "TTTC0012U",
+            "account_number_masked": "****2504",
+            "route": {"exchange": "KRX"},
+        },
+    )
+    db.add(order)
+    db.commit()
+    broker = ReconciliationStubBroker()
+
+    result = reconcile_stale_nonterminal_broker_orders(
+        settings=settings,
+        db=db,
+        adapter=broker,
+        older_than_seconds=60,
+        dry_run=True,
+        include_legacy_manual_review=True,
+    )
+
+    resolution = result["legacy_manual_review_resolution"]
+    assert resolution["minimum_age_seconds"] == 30 * 24 * 60 * 60
+    assert resolution["candidate_order_count"] == 0
+    assert broker.account_snapshot_calls == []
+    engine.dispose()
+
+
+def test_sizing_stale_reconciliation_never_discovers_legacy_manual_review() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="live",
+        kis_app_key="test-app-key",
+        kis_app_secret="test-app-secret",
+        kis_account_number="12342504",
+        kis_account_product_code="01",
+        stale_broker_order_reconciliation_threshold_seconds=3600,
+    )
+    engine, db = _session(settings)
+    db.add(
+        BrokerOrder(
+            broker_name="kis",
+            mode="live",
+            idempotency_key="legacy-manual-review-must-not-run-during-sizing",
+            broker_order_id=None,
+            symbol="052420",
+            side="buy",
+            status="manual_review_required",
+            quantity=1,
+            created_at=datetime.now(UTC) - timedelta(days=45),
+            last_error_classification="missing_broker_order_id",
+            request_metadata={
+                "provider": "kis",
+                "endpoint": "/uapi/domestic-stock/v1/trading/order-cash",
+                "method": "POST",
+                "tr_id": "TTTC0012U",
+                "account_number_masked": "****2504",
+                "route": {"exchange": "KRX"},
+            },
+        )
+    )
+    db.commit()
+    broker = ReconciliationStubBroker()
+
+    result = _reconcile_stale_sizing_orders(
+        settings=settings,
+        db=db,
+        adapter=broker,
+        symbols={"052420"},
+    )
+
+    assert result["legacy_manual_review_resolution"]["candidate_order_count"] == 0
+    assert broker.account_snapshot_calls == []
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("submitted_at", datetime(2026, 6, 1, tzinfo=UTC)),
+        ("venue", "KRX"),
+        ("asset_class", "stock"),
+    ],
+)
+def test_reconcile_stale_excludes_nonlegacy_manual_review_shape_and_rejects_approval(
+    field: str,
+    value: object,
+) -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="live",
+        stale_broker_order_reconciliation_threshold_seconds=3600,
+    )
+    engine, db = _session(settings)
+    stale_at = datetime.now(UTC) - timedelta(days=45)
+    order = BrokerOrder(
+        broker_name="kis",
+        mode="live",
+        idempotency_key=f"legacy-shape-exclusion-{field}",
+        broker_order_id=None,
+        symbol="052420",
+        side="buy",
+        status="manual_review_required",
+        quantity=1,
+        created_at=stale_at,
+        last_error_classification="missing_broker_order_id",
+        request_metadata={
+            "provider": "kis",
+            "endpoint": "/uapi/domestic-stock/v1/trading/order-cash",
+            "method": "POST",
+            "tr_id": "TTTC0012U",
+            "account_number_masked": "****2504",
+            "route": {"exchange": "KRX"},
+        },
+        **{field: value},
+    )
+    db.add(order)
+    db.commit()
+    broker = ReconciliationStubBroker()
+
+    dry_run = reconcile_stale_nonterminal_broker_orders(
+        settings=settings,
+        db=db,
+        adapter=broker,
+        dry_run=True,
+        include_legacy_manual_review=True,
+    )
+
+    assert dry_run["legacy_manual_review_resolution"]["candidate_order_count"] == 0
+    assert broker.account_snapshot_calls == []
+    with pytest.raises(
+        reconciliation_service.LegacyManualReviewApprovalConflictError,
+        match="target is no longer a candidate",
+    ):
+        reconcile_stale_nonterminal_broker_orders(
+            settings=settings,
+            db=db,
+            adapter=broker,
+            actor="ops-desk",
+            operator_reason="stale excluded-shape approval",
+            manual_review_approvals={order.id: "a" * 64},
+            include_legacy_manual_review=True,
+        )
+    db.rollback()
+    db.refresh(order)
+    assert order.status == "manual_review_required"
+    assert db.scalars(select(BrokerOrderEvent)).all() == []
+    engine.dispose()
+
+
+def test_reconcile_stale_blocks_conflicting_legacy_account_product_code() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="live",
+        kis_app_key="test-app-key",
+        kis_app_secret="test-app-secret",
+        kis_account_number="12342504",
+        kis_account_product_code="01",
+        stale_broker_order_reconciliation_threshold_seconds=3600,
+    )
+    engine, db = _session(settings)
+    order = BrokerOrder(
+        broker_name="kis",
+        mode="live",
+        idempotency_key="legacy-account-product-code-mismatch",
+        broker_order_id=None,
+        symbol="052420",
+        side="buy",
+        status="manual_review_required",
+        quantity=1,
+        created_at=datetime.now(UTC) - timedelta(days=45),
+        last_error_classification="missing_broker_order_id",
+        request_metadata={
+            "provider": "kis",
+            "endpoint": "/uapi/domestic-stock/v1/trading/order-cash",
+            "method": "POST",
+            "tr_id": "TTTC0012U",
+            "account_number_masked": "****2504",
+            "account_product_code": "02",
+            "route": {"exchange": "KRX"},
+        },
+    )
+    db.add(order)
+    db.commit()
+    broker = ReconciliationStubBroker(
+        account_snapshot=BrokerAccountSnapshot(
+            observed_at=datetime.now(UTC),
+            source="kis:account_snapshot",
+            holdings_complete=True,
+            open_orders_complete=True,
+            payload={
+                "exchange": "KRX",
+                "account_number_masked": "****2504",
+            },
+        )
+    )
+
+    result = reconcile_stale_nonterminal_broker_orders(
+        settings=settings,
+        db=db,
+        adapter=broker,
+        dry_run=True,
+        include_legacy_manual_review=True,
+    )
+
+    item = result["legacy_manual_review_resolution"]["items"][0]
+    assert item["eligible"] is False
+    assert item["reason"] == "legacy_account_product_code_proof_invalid"
+    assert item["account_product_code_proof"] is None
+    assert item["snapshot_route_product_code"] == "01"
+    assert item["evidence_fingerprint"] is None
+    engine.dispose()
+
+
+def test_reconcile_stale_applies_explicit_legacy_manual_review_approval_without_broker_mutation() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="live",
+        kis_app_key="test-app-key",
+        kis_app_secret="test-app-secret",
+        kis_account_number="12342504",
+        kis_account_product_code="01",
+        stale_broker_order_reconciliation_threshold_seconds=3600,
+    )
+    engine, db = _session(settings)
+    stale_at = datetime.now(UTC) - timedelta(days=45)
+    order = BrokerOrder(
+        broker_name="kis",
+        mode="live",
+        idempotency_key="legacy-manual-review-apply",
+        broker_order_id=None,
+        symbol="033530",
+        side="sell",
+        status="manual_review_required",
+        quantity=5,
+        created_at=stale_at,
+        last_broker_sync_at=stale_at,
+        last_error_classification="missing_broker_order_id",
+        last_error_code="APBK0918",
+        last_error_message="legacy broker submission outcome unknown",
+        last_error_retryable=False,
+        request_metadata={
+            "provider": "kis",
+            "endpoint": "/uapi/domestic-stock/v1/trading/order-cash",
+            "method": "POST",
+            "tr_id": "TTTC0011U",
+            "account_number_masked": "****2504",
+            "account_product_code": "01",
+            "route": {"exchange": "KRX"},
+        },
+        response_metadata={"status_code": 500, "rt_cd": "7"},
+        raw_broker_payload={"rt_cd": "7", "msg_cd": "APBK0918"},
+    )
+    db.add(order)
+    db.commit()
+    broker = ReconciliationStubBroker(
+        account_snapshot=BrokerAccountSnapshot(
+            observed_at=datetime.now(UTC),
+            source="kis:account_snapshot",
+            holdings=[],
+            open_orders=[],
+            holdings_complete=True,
+            open_orders_complete=True,
+            payload={
+                "exchange": "KRX",
+                "account_number_masked": "****2504",
+            },
+        )
+    )
+    dry_run = reconcile_stale_nonterminal_broker_orders(
+        settings=settings,
+        db=db,
+        adapter=broker,
+        dry_run=True,
+        include_legacy_manual_review=True,
+    )
+    item = dry_run["legacy_manual_review_resolution"]["items"][0]
+
+    result = reconcile_stale_nonterminal_broker_orders(
+        settings=settings,
+        db=db,
+        adapter=broker,
+        dry_run=False,
+        actor="ops-desk",
+        operator_reason="verified absent from complete broker truth",
+        manual_review_approvals={order.id: item["evidence_fingerprint"]},
+        include_legacy_manual_review=True,
+    )
+
+    db.refresh(order)
+    repair = db.scalar(
+        select(BrokerOrderEvent).where(
+            BrokerOrderEvent.broker_order_pk == order.id,
+            BrokerOrderEvent.event_type == "stale_order_repair",
+        )
+    )
+    remediation = db.scalar(
+        select(RuntimeRemediationEvent).where(
+            RuntimeRemediationEvent.candidate_type
+            == "legacy_manual_review_order",
+            RuntimeRemediationEvent.subject_id == order.id,
+            RuntimeRemediationEvent.outcome == "stale_terminal_unknown",
+        )
+    )
+    resolution = result["legacy_manual_review_resolution"]
+    assert resolution["resolved_order_count"] == 1
+    assert resolution["items"][0]["repair_action"] == "repaired"
+    assert order.status == "stale_terminal_unknown"
+    assert order.last_error_classification == "missing_broker_order_id"
+    assert order.last_error_code == "APBK0918"
+    assert order.last_error_message == "legacy broker submission outcome unknown"
+    assert order.last_error_retryable is False
+    assert order.last_broker_sync_at == stale_at.replace(tzinfo=None)
+    assert order.response_metadata == {"status_code": 500, "rt_cd": "7"}
+    assert order.raw_broker_payload == {"rt_cd": "7", "msg_cd": "APBK0918"}
+    assert order.fills == []
+    assert broker.order_calls == []
+    assert repair is not None
+    assert repair.payload["actor"] == "ops-desk"
+    assert repair.payload["operator_reason"] == (
+        "verified absent from complete broker truth"
+    )
+    assert repair.payload["result"]["evidence_fingerprint"] == item[
+        "evidence_fingerprint"
+    ]
+    assert repair.payload["result"]["broker_mutations"] == 0
+    assert repair.payload["result"]["fills_written"] == 0
+    assert repair.payload["result"]["account_product_code_proof"] == (
+        "exact_match"
+    )
+    assert repair.payload["result"]["snapshot_route_product_code"] == "01"
+    assert remediation is not None
+    assert remediation.actor == "ops-desk"
+    assert remediation.reason == "verified absent from complete broker truth"
+    assert remediation.evidence_summary["evidence_fingerprint"] == item[
+        "evidence_fingerprint"
+    ]
+    assert remediation.evidence_summary["account_product_code_proof"] == (
+        "exact_match"
+    )
+    assert remediation.evidence_summary["snapshot_route_product_code"] == "01"
+    assert broker.account_snapshot_calls == [
+        (None, "KRX"),
+        (None, "KRX"),
+        (None, "KRX"),
+    ]
+    engine.dispose()
+
+
+def test_reconcile_stale_api_rejects_stale_manual_review_fingerprint_after_row_drift() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="live",
+        kis_app_key="test-app-key",
+        kis_app_secret="test-app-secret",
+        kis_account_number="12342504",
+        kis_account_product_code="01",
+        stale_broker_order_reconciliation_threshold_seconds=3600,
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    stale_at = datetime.now(UTC) - timedelta(days=45)
+    with session_factory() as db:
+        order = BrokerOrder(
+            broker_name="kis",
+            mode="live",
+            idempotency_key="legacy-manual-review-drift",
+            broker_order_id=None,
+            symbol="069960",
+            side="sell",
+            status="manual_review_required",
+            quantity=1,
+            created_at=stale_at,
+            last_broker_sync_at=stale_at,
+            last_error_classification="missing_broker_order_id",
+            request_metadata={
+                "provider": "kis",
+                "endpoint": "/uapi/domestic-stock/v1/trading/order-cash",
+                "method": "POST",
+                "tr_id": "TTTC0011U",
+                "account_number_masked": "****2504",
+                "route": {"exchange": "KRX"},
+            },
+        )
+        db.add(order)
+        db.commit()
+        order_id = order.id
+    broker = ReconciliationStubBroker(
+        account_snapshot=BrokerAccountSnapshot(
+            observed_at=datetime.now(UTC),
+            source="kis:account_snapshot",
+            holdings_complete=True,
+            open_orders_complete=True,
+            payload={
+                "exchange": "KRX",
+                "account_number_masked": "****2504",
+            },
+        )
+    )
+    app = create_app(
+        settings=settings,
+        engine=engine,
+        session_factory=session_factory,
+        broker_adapter_factory=lambda _settings: broker,
+    )
+    client = TestClient(app)
+    dry_run = client.post("/orders/reconcile-stale", json={"dry_run": True})
+    fingerprint = dry_run.json()["legacy_manual_review_resolution"]["items"][0][
+        "evidence_fingerprint"
+    ]
+    with session_factory() as db:
+        persisted = db.get(BrokerOrder, order_id)
+        assert persisted is not None
+        persisted.response_metadata = {"status_code": 500, "rt_cd": "7"}
+        db.commit()
+
+    response = client.post(
+        "/orders/reconcile-stale",
+        json={
+            "actor": "ops-desk",
+            "reason": "approve exact reviewed row",
+            "manual_review_approvals": {order_id: fingerprint},
+        },
+    )
+
+    assert response.status_code == 409
+    assert "fingerprint is stale" in response.json()["detail"]
+    with session_factory() as db:
+        persisted = db.get(BrokerOrder, order_id)
+        repair_events = db.scalars(
+            select(BrokerOrderEvent).where(
+                BrokerOrderEvent.broker_order_pk == order_id,
+                BrokerOrderEvent.event_type == "stale_order_repair",
+            )
+        ).all()
+        assert persisted is not None
+        assert persisted.status == "manual_review_required"
+        assert repair_events == []
+    engine.dispose()
+
+
+def test_reconcile_stale_requires_atomic_approval_for_manual_review_siblings() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="live",
+        kis_app_key="test-app-key",
+        kis_app_secret="test-app-secret",
+        kis_account_number="12342504",
+        kis_account_product_code="01",
+        stale_broker_order_reconciliation_threshold_seconds=3600,
+    )
+    engine, db = _session(settings)
+    stale_at = datetime.now(UTC) - timedelta(days=45)
+    plan = ExecutionPlan(
+        external_plan_id="legacy-sibling-plan",
+        source="test",
+        mode="live",
+        market_date=stale_at.date(),
+    )
+    plan_item = ExecutionPlanItem(
+        plan=plan,
+        plan_item_index=0,
+        symbol="033530",
+        side="sell",
+        intent="stop_sell",
+        status="manual_review_required",
+        quantity_policy={"kind": "shares", "quantity": 5},
+    )
+
+    def sibling(suffix: str) -> BrokerOrder:
+        return BrokerOrder(
+            plan_item=plan_item,
+            broker_name="kis",
+            mode="live",
+            idempotency_key=f"legacy-manual-review-sibling-{suffix}",
+            broker_order_id=None,
+            symbol="033530",
+            side="sell",
+            status="manual_review_required",
+            quantity=5,
+            created_at=stale_at,
+            last_broker_sync_at=stale_at,
+            last_error_classification="missing_broker_order_id",
+            request_metadata={
+                "provider": "kis",
+                "endpoint": "/uapi/domestic-stock/v1/trading/order-cash",
+                "method": "POST",
+                "tr_id": "TTTC0011U",
+                "account_number_masked": "****2504",
+                "route": {"exchange": "KRX"},
+            },
+        )
+
+    first = sibling("first")
+    second = sibling("second")
+    db.add_all([plan, first, second])
+    db.commit()
+    broker = ReconciliationStubBroker(
+        account_snapshot=BrokerAccountSnapshot(
+            observed_at=datetime.now(UTC),
+            source="kis:account_snapshot",
+            holdings_complete=True,
+            open_orders_complete=True,
+            payload={
+                "exchange": "KRX",
+                "account_number_masked": "****2504",
+            },
+        )
+    )
+    dry_run = reconcile_stale_nonterminal_broker_orders(
+        settings=settings,
+        db=db,
+        adapter=broker,
+        dry_run=True,
+        include_legacy_manual_review=True,
+    )
+    approvals = {
+        item["broker_order_pk"]: item["evidence_fingerprint"]
+        for item in dry_run["legacy_manual_review_resolution"]["items"]
+    }
+
+    with pytest.raises(
+        reconciliation_service.LegacyManualReviewApprovalConflictError,
+        match="sibling group requires atomic approval",
+    ):
+        reconcile_stale_nonterminal_broker_orders(
+            settings=settings,
+            db=db,
+            adapter=broker,
+            actor="ops-desk",
+            operator_reason="approve reviewed sibling",
+            manual_review_approvals={first.id: approvals[first.id]},
+            include_legacy_manual_review=True,
+        )
+    db.rollback()
+    db.refresh(first)
+    db.refresh(second)
+    assert first.status == "manual_review_required"
+    assert second.status == "manual_review_required"
+    assert plan_item.status == "manual_review_required"
+
+    result = reconcile_stale_nonterminal_broker_orders(
+        settings=settings,
+        db=db,
+        adapter=broker,
+        actor="ops-desk",
+        operator_reason="approve complete reviewed sibling group",
+        manual_review_approvals=approvals,
+        include_legacy_manual_review=True,
+    )
+
+    db.refresh(first)
+    db.refresh(second)
+    db.refresh(plan_item)
+    audits = db.scalars(
+        select(ExecutionPlanItemAudit).where(
+            ExecutionPlanItemAudit.execution_plan_item_id == plan_item.id,
+            ExecutionPlanItemAudit.source == "operator_remediation",
+        )
+    ).all()
+    assert result["legacy_manual_review_resolution"]["resolved_order_count"] == 2
+    assert first.status == "stale_terminal_unknown"
+    assert second.status == "stale_terminal_unknown"
+    assert plan_item.status == "broker_order_failed"
+    assert len(audits) == 1
+    engine.dispose()
+
+
+def test_reconcile_stale_blocks_legacy_manual_review_with_failure_or_active_job() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="live",
+        kis_app_key="test-app-key",
+        kis_app_secret="test-app-secret",
+        kis_account_number="12342504",
+        kis_account_product_code="01",
+        stale_broker_order_reconciliation_threshold_seconds=3600,
+    )
+    engine, db = _session(settings)
+    stale_at = datetime.now(UTC) - timedelta(days=45)
+    plan = ExecutionPlan(
+        external_plan_id="legacy-active-job-plan",
+        source="test",
+        mode="live",
+        market_date=stale_at.date(),
+    )
+    plan_item = ExecutionPlanItem(
+        plan=plan,
+        plan_item_index=0,
+        symbol="073560",
+        side="sell",
+        intent="stop_sell",
+        status="broker_order_failed",
+        quantity_policy={"kind": "shares", "quantity": 1},
+    )
+    job = ExecutionJob(
+        plan_item=plan_item,
+        job_type="broker_order_submit",
+        status="queued",
+    )
+
+    def legacy_order(symbol: str, suffix: str) -> BrokerOrder:
+        return BrokerOrder(
+            broker_name="kis",
+            mode="live",
+            idempotency_key=f"legacy-manual-review-blocked-{suffix}",
+            broker_order_id=None,
+            symbol=symbol,
+            side="sell",
+            status="manual_review_required",
+            quantity=1,
+            created_at=stale_at,
+            last_broker_sync_at=stale_at,
+            last_error_classification="missing_broker_order_id",
+            request_metadata={
+                "provider": "kis",
+                "endpoint": "/uapi/domestic-stock/v1/trading/order-cash",
+                "method": "POST",
+                "tr_id": "TTTC0011U",
+                "account_number_masked": "****2504",
+                "route": {"exchange": "KRX"},
+            },
+        )
+
+    job_order = legacy_order("073560", "job")
+    job_order.plan_item = plan_item
+    failure_order = legacy_order("069960", "failure")
+    db.add_all([plan, job, job_order, failure_order])
+    db.commit()
+    db.add(
+        ExecutionFailure(
+            mode="live",
+            broker_order_pk=failure_order.id,
+            broker_name="kis",
+            idempotency_key=failure_order.idempotency_key,
+            symbol=failure_order.symbol,
+            side=failure_order.side,
+            requested_quantity=1,
+            classification="legacy_submission_unknown",
+            broker_error_message="legacy broker submission outcome unknown",
+            retryable=False,
+            status="resolved",
+            first_failed_at=stale_at,
+            latest_failed_at=stale_at,
+        )
+    )
+    db.commit()
+    broker = ReconciliationStubBroker(
+        account_snapshot=BrokerAccountSnapshot(
+            observed_at=datetime.now(UTC),
+            source="kis:account_snapshot",
+            holdings_complete=True,
+            open_orders_complete=True,
+            payload={
+                "exchange": "KRX",
+                "account_number_masked": "****2504",
+            },
+        )
+    )
+
+    result = reconcile_stale_nonterminal_broker_orders(
+        settings=settings,
+        db=db,
+        adapter=broker,
+        dry_run=True,
+        include_legacy_manual_review=True,
+    )
+
+    items = {
+        item["symbol"]: item
+        for item in result["legacy_manual_review_resolution"]["items"]
+    }
+    assert items["069960"]["reason"] == "linked_execution_failure_present"
+    assert items["069960"]["linked_execution_failure_count"] == 1
+    assert items["069960"]["evidence_fingerprint"] is None
+    assert items["073560"]["reason"] == "active_execution_job_present"
+    assert items["073560"]["active_execution_job_count"] == 1
+    assert items["073560"]["evidence_fingerprint"] is None
+    engine.dispose()
+
+
+def test_legacy_manual_review_job_lock_query_reads_all_plan_jobs() -> None:
+    settings = Settings(database_url="sqlite:///:memory:", runtime_mode="live")
+    engine, db = _session(settings)
+    plan = ExecutionPlan(
+        external_plan_id="legacy-all-job-lock-plan",
+        source="test",
+        mode="live",
+        market_date=datetime.now(UTC).date(),
+    )
+    plan_item = ExecutionPlanItem(
+        plan=plan,
+        plan_item_index=0,
+        symbol="073560",
+        side="sell",
+        intent="stop_sell",
+        status="broker_order_failed",
+        quantity_policy={"kind": "shares", "quantity": 1},
+    )
+    completed_job = ExecutionJob(
+        plan_item=plan_item,
+        job_type="completed_submit",
+        status="completed",
+    )
+    queued_job = ExecutionJob(
+        plan_item=plan_item,
+        job_type="queued_submit",
+        status="queued",
+    )
+    db.add_all([plan, completed_job, queued_job])
+    db.commit()
+    statements: list[str] = []
+
+    def capture_statement(
+        _connection,
+        _cursor,
+        statement: str,
+        _parameters,
+        _context,
+        _executemany,
+    ) -> None:
+        statements.append(statement)
+
+    event.listen(engine, "before_cursor_execute", capture_statement)
+    try:
+        jobs_by_item = (
+            reconciliation_service._load_legacy_manual_review_active_jobs(
+                db=db,
+                plan_item_ids={plan_item.id},
+                for_update=True,
+            )
+        )
+    finally:
+        event.remove(engine, "before_cursor_execute", capture_statement)
+
+    job_selects = [
+        statement.lower()
+        for statement in statements
+        if "from execution_jobs" in statement.lower()
+    ]
+    assert len(job_selects) == 1
+    assert "execution_jobs.status in" not in job_selects[0]
+    assert [job.id for job in jobs_by_item[plan_item.id]] == [queued_job.id]
+    engine.dispose()
+
+
+def test_legacy_manual_review_postgres_position_truth_fence_blocks_dml() -> None:
+    class PostgreSQLDialect:
+        name = "postgresql"
+
+    class PostgreSQLBind:
+        dialect = PostgreSQLDialect()
+
+    class RecordingSession:
+        def __init__(self) -> None:
+            self.statements: list[str] = []
+
+        def get_bind(self):
+            return PostgreSQLBind()
+
+        def execute(self, statement):
+            self.statements.append(str(statement))
+
+    db = RecordingSession()
+
+    reconciliation_service._acquire_legacy_manual_review_position_truth_fence(
+        db=db,
+    )
+
+    assert db.statements == [
+        "LOCK TABLE execution_positions IN SHARE MODE NOWAIT"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("sibling_status", "with_fill", "sibling_broker", "sibling_mode"),
+    [
+        ("filled", False, "kis", "live"),
+        ("partially_filled", False, "kis", "live"),
+        ("failed", True, "alpaca", "paper"),
+    ],
+)
+def test_reconcile_stale_blocks_plan_group_with_outcome_bearing_sibling(
+    sibling_status: str,
+    with_fill: bool,
+    sibling_broker: str,
+    sibling_mode: str,
+) -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="live",
+        kis_app_key="test-app-key",
+        kis_app_secret="test-app-secret",
+        kis_account_number="12342504",
+        kis_account_product_code="01",
+        stale_broker_order_reconciliation_threshold_seconds=3600,
+    )
+    engine, db = _session(settings)
+    stale_at = datetime.now(UTC) - timedelta(days=45)
+    plan = ExecutionPlan(
+        external_plan_id=f"legacy-outcome-sibling-{sibling_status}-{with_fill}",
+        source="test",
+        mode="live",
+        market_date=stale_at.date(),
+    )
+    plan_item = ExecutionPlanItem(
+        plan=plan,
+        plan_item_index=0,
+        symbol="033530",
+        side="sell",
+        intent="stop_sell",
+        status="manual_review_required",
+        quantity_policy={"kind": "shares", "quantity": 1},
+    )
+    candidate = BrokerOrder(
+        plan_item=plan_item,
+        broker_name="kis",
+        mode="live",
+        idempotency_key=f"legacy-outcome-candidate-{sibling_status}-{with_fill}",
+        broker_order_id=None,
+        symbol="033530",
+        side="sell",
+        status="manual_review_required",
+        quantity=1,
+        created_at=stale_at,
+        last_error_classification="missing_broker_order_id",
+        request_metadata={
+            "provider": "kis",
+            "endpoint": "/uapi/domestic-stock/v1/trading/order-cash",
+            "method": "POST",
+            "tr_id": "TTTC0011U",
+            "account_number_masked": "****2504",
+            "route": {"exchange": "KRX"},
+        },
+    )
+    sibling = BrokerOrder(
+        plan_item=plan_item,
+        broker_name=sibling_broker,
+        mode=sibling_mode,
+        idempotency_key=f"legacy-outcome-sibling-order-{sibling_status}-{with_fill}",
+        broker_order_id="historical-outcome-sibling",
+        symbol="033530",
+        side="sell",
+        status=sibling_status,
+        quantity=1,
+        created_at=stale_at,
+        submitted_at=datetime.now(UTC),
+        last_broker_sync_at=datetime.now(UTC),
+    )
+    if with_fill:
+        sibling.fills.append(
+            ExecutionFill(
+                broker_fill_id="historical-outcome-fill",
+                symbol="033530",
+                side="sell",
+                quantity=1,
+                price=Decimal("1000"),
+                filled_at=stale_at,
+            )
+        )
+    db.add_all([plan, candidate, sibling])
+    db.commit()
+    broker = ReconciliationStubBroker(
+        account_snapshot=BrokerAccountSnapshot(
+            observed_at=datetime.now(UTC),
+            source="kis:account_snapshot",
+            holdings_complete=True,
+            open_orders_complete=True,
+            payload={
+                "exchange": "KRX",
+                "account_number_masked": "****2504",
+            },
+        )
+    )
+
+    dry_run = reconcile_stale_nonterminal_broker_orders(
+        settings=settings,
+        db=db,
+        adapter=broker,
+        dry_run=True,
+        include_legacy_manual_review=True,
+    )
+
+    item = dry_run["legacy_manual_review_resolution"]["items"][0]
+    assert item["broker_order_pk"] == candidate.id
+    assert item["eligible"] is False
+    assert item["reason"] == "outcome_bearing_plan_sibling_present"
+    assert item["outcome_bearing_sibling_count"] == 1
+    assert item["evidence_fingerprint"] is None
+    with pytest.raises(
+        reconciliation_service.LegacyManualReviewApprovalConflictError,
+        match="fingerprint is stale or ineligible",
+    ):
+        reconcile_stale_nonterminal_broker_orders(
+            settings=settings,
+            db=db,
+            adapter=broker,
+            actor="ops-desk",
+            operator_reason="must not overwrite historical outcome",
+            manual_review_approvals={candidate.id: "a" * 64},
+            include_legacy_manual_review=True,
+        )
+    db.rollback()
+    db.refresh(candidate)
+    db.refresh(plan_item)
+    assert candidate.status == "manual_review_required"
+    assert plan_item.status == "manual_review_required"
+    assert db.scalars(select(RuntimeRemediationEvent)).all() == []
+    engine.dispose()
+
+
+def test_reconcile_stale_rejects_approval_when_job_appears_before_post_lock_reload(
+    tmp_path,
+) -> None:
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'legacy-job-drift.db'}",
+        runtime_mode="live",
+        kis_app_key="test-app-key",
+        kis_app_secret="test-app-secret",
+        kis_account_number="12342504",
+        kis_account_product_code="01",
+        stale_broker_order_reconciliation_threshold_seconds=3600,
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    stale_at = datetime.now(UTC) - timedelta(days=45)
+    with session_factory() as setup_db:
+        plan = ExecutionPlan(
+            external_plan_id="legacy-job-drift-plan",
+            source="test",
+            mode="live",
+            market_date=stale_at.date(),
+        )
+        plan_item = ExecutionPlanItem(
+            plan=plan,
+            plan_item_index=0,
+            symbol="073560",
+            side="sell",
+            intent="stop_sell",
+            status="manual_review_required",
+            quantity_policy={"kind": "shares", "quantity": 1},
+        )
+        order = BrokerOrder(
+            plan_item=plan_item,
+            broker_name="kis",
+            mode="live",
+            idempotency_key="legacy-job-drift-order",
+            broker_order_id=None,
+            symbol="073560",
+            side="sell",
+            status="manual_review_required",
+            quantity=1,
+            created_at=stale_at,
+            last_error_classification="missing_broker_order_id",
+            request_metadata={
+                "provider": "kis",
+                "endpoint": "/uapi/domestic-stock/v1/trading/order-cash",
+                "method": "POST",
+                "tr_id": "TTTC0011U",
+                "account_number_masked": "****2504",
+                "route": {"exchange": "KRX"},
+            },
+        )
+        setup_db.add_all([plan, order])
+        setup_db.commit()
+        order_id = order.id
+        plan_item_id = plan_item.id
+
+    snapshot = BrokerAccountSnapshot(
+        observed_at=datetime.now(UTC),
+        source="kis:account_snapshot",
+        holdings_complete=True,
+        open_orders_complete=True,
+        payload={
+            "exchange": "KRX",
+            "account_number_masked": "****2504",
+        },
+    )
+
+    class JobDriftBroker(ReconciliationStubBroker):
+        def get_account_snapshot(
+            self,
+            access_token: str,
+            *,
+            symbols: list[str] | None = None,
+            reference_prices: dict[str, Decimal] | None = None,
+            exchange: str = "KRX",
+        ) -> BrokerAccountSnapshot:
+            result = super().get_account_snapshot(
+                access_token,
+                symbols=symbols,
+                reference_prices=reference_prices,
+                exchange=exchange,
+            )
+            if len(self.account_snapshot_calls) == 2:
+                with session_factory() as concurrent_db:
+                    concurrent_db.add(
+                        ExecutionJob(
+                            execution_plan_item_id=plan_item_id,
+                            job_type="broker_order_submit",
+                            status="queued",
+                        )
+                    )
+                    concurrent_db.commit()
+            return result
+
+    broker = JobDriftBroker(account_snapshot=snapshot)
+    with session_factory() as db:
+        dry_run = reconcile_stale_nonterminal_broker_orders(
+            settings=settings,
+            db=db,
+            adapter=broker,
+            dry_run=True,
+            include_legacy_manual_review=True,
+        )
+        fingerprint = dry_run["legacy_manual_review_resolution"]["items"][0][
+            "evidence_fingerprint"
+        ]
+
+        with pytest.raises(
+            reconciliation_service.LegacyManualReviewApprovalConflictError,
+            match="fingerprint is stale or ineligible",
+        ):
+            reconcile_stale_nonterminal_broker_orders(
+                settings=settings,
+                db=db,
+                adapter=broker,
+                actor="ops-desk",
+                operator_reason="reject concurrent job drift",
+                manual_review_approvals={order_id: fingerprint},
+                include_legacy_manual_review=True,
+            )
+        db.rollback()
+        persisted = db.get(BrokerOrder, order_id)
+        assert persisted is not None
+        assert persisted.status == "manual_review_required"
+        assert db.scalars(select(RuntimeRemediationEvent)).all() == []
+    assert broker.account_snapshot_calls == [
+        (None, "KRX"),
+        (None, "KRX"),
+        (None, "KRX"),
+    ]
+    engine.dispose()
+
+
+def test_reconcile_stale_rejects_approval_when_plan_item_outcome_status_drifts() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="live",
+        kis_app_key="test-app-key",
+        kis_app_secret="test-app-secret",
+        kis_account_number="12342504",
+        kis_account_product_code="01",
+        stale_broker_order_reconciliation_threshold_seconds=3600,
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    stale_at = datetime.now(UTC) - timedelta(days=45)
+    with session_factory() as db:
+        plan = ExecutionPlan(
+            external_plan_id="legacy-plan-item-outcome-drift",
+            source="test",
+            mode="live",
+            market_date=stale_at.date(),
+        )
+        plan_item = ExecutionPlanItem(
+            plan=plan,
+            plan_item_index=0,
+            symbol="073560",
+            side="sell",
+            intent="stop_sell",
+            status="manual_review_required",
+            quantity_policy={"kind": "shares", "quantity": 1},
+        )
+        order = BrokerOrder(
+            plan_item=plan_item,
+            broker_name="kis",
+            mode="live",
+            idempotency_key="legacy-plan-item-outcome-drift-order",
+            broker_order_id=None,
+            symbol="073560",
+            side="sell",
+            status="manual_review_required",
+            quantity=1,
+            created_at=stale_at,
+            last_error_classification="missing_broker_order_id",
+            request_metadata={
+                "provider": "kis",
+                "endpoint": "/uapi/domestic-stock/v1/trading/order-cash",
+                "method": "POST",
+                "tr_id": "TTTC0011U",
+                "account_number_masked": "****2504",
+                "route": {"exchange": "KRX"},
+            },
+        )
+        db.add_all([plan, order])
+        db.commit()
+        order_id = order.id
+        plan_item_id = plan_item.id
+    broker = ReconciliationStubBroker(
+        account_snapshot=BrokerAccountSnapshot(
+            observed_at=datetime.now(UTC),
+            source="kis:account_snapshot",
+            holdings_complete=True,
+            open_orders_complete=True,
+            payload={
+                "exchange": "KRX",
+                "account_number_masked": "****2504",
+            },
+        )
+    )
+    app = create_app(
+        settings=settings,
+        engine=engine,
+        session_factory=session_factory,
+        broker_adapter_factory=lambda _settings: broker,
+    )
+    client = TestClient(app)
+    dry_run = client.post("/orders/reconcile-stale", json={"dry_run": True})
+    assert dry_run.status_code == 200
+    item = dry_run.json()["legacy_manual_review_resolution"]["items"][0]
+    assert item["plan_item_status"] == "manual_review_required"
+    fingerprint = item["evidence_fingerprint"]
+    with session_factory() as db:
+        persisted_plan_item = db.get(ExecutionPlanItem, plan_item_id)
+        assert persisted_plan_item is not None
+        persisted_plan_item.status = "filled"
+        db.commit()
+
+    response = client.post(
+        "/orders/reconcile-stale",
+        json={
+            "actor": "ops-desk",
+            "reason": "reject plan outcome drift",
+            "manual_review_approvals": {order_id: fingerprint},
+        },
+    )
+
+    assert response.status_code == 409
+    assert "fingerprint is stale or ineligible" in response.json()["detail"]
+    with session_factory() as db:
+        persisted_order = db.get(BrokerOrder, order_id)
+        persisted_plan_item = db.get(ExecutionPlanItem, plan_item_id)
+        assert persisted_order is not None
+        assert persisted_plan_item is not None
+        assert persisted_order.status == "manual_review_required"
+        assert persisted_plan_item.status == "filled"
+        assert db.scalars(select(RuntimeRemediationEvent)).all() == []
+    engine.dispose()
+
+
+def test_reconcile_stale_sqlite_apply_fails_closed_on_competing_writer(
+    tmp_path,
+) -> None:
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'legacy-writer-reservation.db'}",
+        runtime_mode="live",
+        kis_app_key="test-app-key",
+        kis_app_secret="test-app-secret",
+        kis_account_number="12342504",
+        kis_account_product_code="01",
+        stale_broker_order_reconciliation_threshold_seconds=3600,
+        sqlite_busy_timeout_seconds=1,
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    stale_at = datetime.now(UTC) - timedelta(days=45)
+    with session_factory() as setup_db:
+        order = BrokerOrder(
+            broker_name="kis",
+            mode="live",
+            idempotency_key="legacy-sqlite-writer-reservation",
+            broker_order_id=None,
+            symbol="052420",
+            side="buy",
+            status="manual_review_required",
+            quantity=1,
+            created_at=stale_at,
+            last_error_classification="missing_broker_order_id",
+            request_metadata={
+                "provider": "kis",
+                "endpoint": "/uapi/domestic-stock/v1/trading/order-cash",
+                "method": "POST",
+                "tr_id": "TTTC0012U",
+                "account_number_masked": "****2504",
+                "route": {"exchange": "KRX"},
+            },
+        )
+        setup_db.add(order)
+        setup_db.commit()
+        order_id = order.id
+
+    broker = ReconciliationStubBroker(
+        account_snapshot=BrokerAccountSnapshot(
+            observed_at=datetime.now(UTC),
+            source="kis:account_snapshot",
+            holdings_complete=True,
+            open_orders_complete=True,
+            payload={
+                "exchange": "KRX",
+                "account_number_masked": "****2504",
+            },
+        )
+    )
+    with session_factory() as dry_run_db:
+        dry_run = reconcile_stale_nonterminal_broker_orders(
+            settings=settings,
+            db=dry_run_db,
+            adapter=broker,
+            dry_run=True,
+            include_legacy_manual_review=True,
+        )
+        fingerprint = dry_run["legacy_manual_review_resolution"]["items"][0][
+            "evidence_fingerprint"
+        ]
+        dry_run_db.commit()
+
+    with session_factory() as competing_db:
+        competing_order = competing_db.get(BrokerOrder, order_id)
+        assert competing_order is not None
+        competing_order.last_error_message = "uncommitted competing writer"
+        competing_db.flush()
+
+        with session_factory() as apply_db:
+            with pytest.raises(
+                reconciliation_service.LegacyManualReviewApprovalConflictError,
+                match="database is locked",
+            ):
+                reconcile_stale_nonterminal_broker_orders(
+                    settings=settings,
+                    db=apply_db,
+                    adapter=broker,
+                    actor="ops-desk",
+                    operator_reason="require exclusive sqlite writer reservation",
+                    manual_review_approvals={order_id: fingerprint},
+                    include_legacy_manual_review=True,
+                )
+            apply_db.rollback()
+        competing_db.rollback()
+
+    with session_factory() as verify_db:
+        persisted = verify_db.get(BrokerOrder, order_id)
+        assert persisted is not None
+        assert persisted.status == "manual_review_required"
+        assert persisted.last_error_message is None
+        assert verify_db.scalars(select(RuntimeRemediationEvent)).all() == []
+    assert broker.account_snapshot_calls == [(None, "KRX"), (None, "KRX")]
+    engine.dispose()
+
+
+def test_reconcile_stale_sqlite_preserves_ordinary_repair_with_legacy_approval() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="live",
+        kis_app_key="test-app-key",
+        kis_app_secret="test-app-secret",
+        kis_account_number="12342504",
+        kis_account_product_code="01",
+        stale_broker_order_reconciliation_threshold_seconds=3600,
+    )
+    engine, db = _session(settings)
+    now = datetime.now(UTC)
+    ordinary = BrokerOrder(
+        broker_name="kis",
+        mode="live",
+        idempotency_key="ordinary-stale-repair-before-legacy-reservation",
+        broker_order_id=None,
+        symbol="031330",
+        side="buy",
+        status="retry_pending",
+        quantity=1,
+        created_at=now - timedelta(days=5),
+        submitted_at=now - timedelta(days=5),
+        last_broker_sync_at=now - timedelta(days=5),
+    )
+    legacy = BrokerOrder(
+        broker_name="kis",
+        mode="live",
+        idempotency_key="legacy-approval-after-ordinary-stale-repair",
+        broker_order_id=None,
+        symbol="052420",
+        side="buy",
+        status="manual_review_required",
+        quantity=1,
+        created_at=now - timedelta(days=45),
+        last_error_classification="missing_broker_order_id",
+        request_metadata={
+            "provider": "kis",
+            "endpoint": "/uapi/domestic-stock/v1/trading/order-cash",
+            "method": "POST",
+            "tr_id": "TTTC0012U",
+            "account_number_masked": "****2504",
+            "route": {"exchange": "KRX"},
+        },
+    )
+    db.add_all([ordinary, legacy])
+    db.commit()
+    broker = ReconciliationStubBroker(
+        account_snapshot=BrokerAccountSnapshot(
+            observed_at=datetime.now(UTC),
+            source="kis:account_snapshot",
+            holdings_complete=True,
+            open_orders_complete=True,
+            payload={
+                "exchange": "KRX",
+                "account_number_masked": "****2504",
+            },
+        )
+    )
+    dry_run = reconcile_stale_nonterminal_broker_orders(
+        settings=settings,
+        db=db,
+        adapter=broker,
+        dry_run=True,
+        include_legacy_manual_review=True,
+    )
+    fingerprint = dry_run["legacy_manual_review_resolution"]["items"][0][
+        "evidence_fingerprint"
+    ]
+
+    result = reconcile_stale_nonterminal_broker_orders(
+        settings=settings,
+        db=db,
+        adapter=broker,
+        actor="ops-desk",
+        operator_reason="preserve ordinary and legacy repairs atomically",
+        manual_review_approvals={legacy.id: fingerprint},
+        include_legacy_manual_review=True,
+    )
+
+    db.refresh(ordinary)
+    db.refresh(legacy)
+    ordinary_repairs = db.scalars(
+        select(BrokerOrderEvent).where(
+            BrokerOrderEvent.broker_order_pk == ordinary.id,
+            BrokerOrderEvent.event_type == "stale_order_repair",
+        )
+    ).all()
+    assert result["repaired_order_count"] == 1
+    assert ordinary.status == "manual_review_required"
+    assert ordinary.last_error_classification == "missing_broker_order_id"
+    assert len(ordinary_repairs) == 1
+    assert legacy.status == "stale_terminal_unknown"
+    engine.dispose()
+
+
+def test_legacy_manual_review_locked_reload_refreshes_relationship_drift(tmp_path) -> None:
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'legacy-relationship-drift.db'}",
+        runtime_mode="live",
+        stale_broker_order_reconciliation_threshold_seconds=3600,
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    stale_at = datetime.now(UTC) - timedelta(days=45)
+    with session_factory() as db:
+        order = BrokerOrder(
+            broker_name="kis",
+            mode="live",
+            idempotency_key="legacy-manual-review-relationship-drift",
+            broker_order_id=None,
+            symbol="069960",
+            side="sell",
+            status="manual_review_required",
+            quantity=1,
+            created_at=stale_at,
+            last_error_classification="missing_broker_order_id",
+        )
+        db.add(order)
+        db.commit()
+        order_id = order.id
+
+    cutoff = datetime.now(UTC) - timedelta(days=30)
+    with session_factory() as primary_db:
+        initially_loaded = reconciliation_service._load_legacy_manual_review_orders(
+            settings=settings,
+            db=primary_db,
+            broker_name="kis",
+            stale_before=cutoff,
+            symbols=None,
+            for_update=False,
+        )
+        assert len(initially_loaded) == 1
+        assert initially_loaded[0].execution_failure is None
+        with session_factory() as concurrent_db:
+            concurrent_db.add(
+                ExecutionFailure(
+                    mode="live",
+                    broker_order_pk=order_id,
+                    broker_name="kis",
+                    idempotency_key="legacy-manual-review-relationship-drift",
+                    symbol="069960",
+                    side="sell",
+                    requested_quantity=1,
+                    classification="legacy_submission_unknown",
+                    broker_error_message="concurrent failure evidence",
+                    retryable=False,
+                    status="open",
+                    first_failed_at=stale_at,
+                    latest_failed_at=stale_at,
+                )
+            )
+            concurrent_db.commit()
+
+        locked_reload = reconciliation_service._load_legacy_manual_review_orders(
+            settings=settings,
+            db=primary_db,
+            broker_name="kis",
+            stale_before=cutoff,
+            symbols=None,
+            for_update=True,
+        )
+
+        assert locked_reload[0] is initially_loaded[0]
+        assert locked_reload[0].execution_failure is not None
+        assert locked_reload[0].execution_failure.status == "open"
+    engine.dispose()
+
+
+def test_reconcile_stale_rejects_approval_when_post_lock_broker_truth_drifts() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="live",
+        kis_app_key="test-app-key",
+        kis_app_secret="test-app-secret",
+        kis_account_number="12342504",
+        kis_account_product_code="01",
+        stale_broker_order_reconciliation_threshold_seconds=3600,
+    )
+    engine, db = _session(settings)
+    stale_at = datetime.now(UTC) - timedelta(days=45)
+    order = BrokerOrder(
+        broker_name="kis",
+        mode="live",
+        idempotency_key="legacy-manual-review-broker-drift",
+        broker_order_id=None,
+        symbol="052420",
+        side="buy",
+        status="manual_review_required",
+        quantity=2,
+        created_at=stale_at,
+        last_error_classification="missing_broker_order_id",
+        request_metadata={
+            "provider": "kis",
+            "endpoint": "/uapi/domestic-stock/v1/trading/order-cash",
+            "method": "POST",
+            "tr_id": "TTTC0012U",
+            "account_number_masked": "****2504",
+            "route": {"exchange": "KRX"},
+        },
+    )
+    db.add(order)
+    db.commit()
+
+    def snapshot(*, with_holding: bool) -> BrokerAccountSnapshot:
+        return BrokerAccountSnapshot(
+            observed_at=datetime.now(UTC),
+            source="kis:account_snapshot",
+            holdings=(
+                [
+                    BrokerAccountHolding(
+                        symbol="052420",
+                        quantity=2,
+                        average_price=Decimal("5000"),
+                        sellable_quantity=2,
+                    )
+                ]
+                if with_holding
+                else []
+            ),
+            holdings_complete=True,
+            open_orders_complete=True,
+            payload={
+                "exchange": "KRX",
+                "account_number_masked": "****2504",
+            },
+        )
+
+    class DriftingSnapshotBroker(ReconciliationStubBroker):
+        def __init__(self) -> None:
+            super().__init__(account_snapshot=snapshot(with_holding=False))
+            self.snapshots = [
+                snapshot(with_holding=False),
+                snapshot(with_holding=False),
+                snapshot(with_holding=True),
+            ]
+
+        def get_account_snapshot(
+            self,
+            access_token: str,
+            *,
+            symbols: list[str] | None = None,
+            reference_prices: dict[str, Decimal] | None = None,
+            exchange: str = "KRX",
+        ) -> BrokerAccountSnapshot:
+            assert access_token
+            del reference_prices
+            self.account_snapshot_calls.append((symbols, exchange))
+            return self.snapshots[len(self.account_snapshot_calls) - 1]
+
+    broker = DriftingSnapshotBroker()
+    dry_run = reconcile_stale_nonterminal_broker_orders(
+        settings=settings,
+        db=db,
+        adapter=broker,
+        dry_run=True,
+        include_legacy_manual_review=True,
+    )
+    fingerprint = dry_run["legacy_manual_review_resolution"]["items"][0][
+        "evidence_fingerprint"
+    ]
+
+    with pytest.raises(
+        reconciliation_service.LegacyManualReviewApprovalConflictError,
+        match="fingerprint is stale or ineligible",
+    ):
+        reconcile_stale_nonterminal_broker_orders(
+            settings=settings,
+            db=db,
+            adapter=broker,
+            actor="ops-desk",
+            operator_reason="approve reviewed broker absence",
+            manual_review_approvals={order.id: fingerprint},
+            include_legacy_manual_review=True,
+        )
+
+    db.rollback()
+    db.refresh(order)
+    assert order.status == "manual_review_required"
+    assert broker.account_snapshot_calls == [
+        (None, "KRX"),
+        (None, "KRX"),
+        (None, "KRX"),
+    ]
+    engine.dispose()
+
+
 def test_reconcile_adapter_error_event_keeps_attribution_after_outer_interruption(
     tmp_path, monkeypatch
 ) -> None:
@@ -3761,6 +5860,31 @@ def test_stale_reconciliation_schema_strips_and_rejects_whitespace_audit_fields(
 
     assert command.actor == "operator"
     assert command.reason == "reconcile broker truth"
+
+
+def test_stale_reconciliation_schema_normalizes_and_validates_manual_review_approvals() -> None:
+    command = StaleBrokerOrderReconciliationRequest.model_validate(
+        {"manual_review_approvals": {"  order-id  ": "A" * 64}}
+    )
+
+    assert command.manual_review_approvals == {"order-id": "a" * 64}
+    with pytest.raises(ValidationError, match="64-character hexadecimal"):
+        StaleBrokerOrderReconciliationRequest.model_validate(
+            {"manual_review_approvals": {"order-id": "not-a-fingerprint"}}
+        )
+    for prefixed_fingerprint in ("+" + "a" * 63, "0x" + "a" * 62):
+        with pytest.raises(ValidationError, match="64-character hexadecimal"):
+            StaleBrokerOrderReconciliationRequest.model_validate(
+                {
+                    "manual_review_approvals": {
+                        "order-id": prefixed_fingerprint
+                    }
+                }
+            )
+    with pytest.raises(ValidationError, match="order id must not be empty"):
+        StaleBrokerOrderReconciliationRequest.model_validate(
+            {"manual_review_approvals": {"   ": "a" * 64}}
+        )
 
 
 @pytest.mark.parametrize("field", ["actor", "reason"])

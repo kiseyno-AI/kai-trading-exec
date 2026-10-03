@@ -943,6 +943,7 @@ class StaleBrokerOrderReconciliationRequest(BaseModel):
     dry_run: bool = False
     actor: str | None = Field(default=None, min_length=1, max_length=128)
     reason: str | None = Field(default=None, min_length=1, max_length=2000)
+    manual_review_approvals: dict[str, str] = Field(default_factory=dict)
 
     @field_validator("actor", "reason")
     @classmethod
@@ -965,6 +966,31 @@ class StaleBrokerOrderReconciliationRequest(BaseModel):
             if not normalized_symbol:
                 raise ValueError("symbol must not be empty")
             normalized.append(normalized_symbol)
+        return normalized
+
+    @field_validator("manual_review_approvals")
+    @classmethod
+    def normalize_manual_review_approvals(
+        cls,
+        value: dict[str, str],
+    ) -> dict[str, str]:
+        normalized: dict[str, str] = {}
+        for raw_order_id, raw_fingerprint in value.items():
+            order_id = str(raw_order_id).strip()
+            if not order_id:
+                raise ValueError("manual-review approval order id must not be empty")
+            fingerprint = str(raw_fingerprint).strip().lower()
+            valid_hex = len(fingerprint) == 64 and all(
+                character in "0123456789abcdef"
+                for character in fingerprint
+            )
+            if not valid_hex:
+                raise ValueError(
+                    "manual-review approval fingerprint must be a 64-character hexadecimal value"
+                )
+            if order_id in normalized:
+                raise ValueError("manual-review approval order id must be unique")
+            normalized[order_id] = fingerprint
         return normalized
 
 

@@ -68,6 +68,7 @@ class PortfolioRiskStubAdapter:
         self.snapshot = snapshot
         self.snapshot_error = snapshot_error
         self.snapshot_calls = 0
+        self.snapshot_kwargs: list[dict[str, object]] = []
         self.broker_account_id = broker_account_id
         self.account_id_calls = 0
 
@@ -96,9 +97,10 @@ class PortfolioRiskStubAdapter:
     ) -> BrokerOrderPlacement:
         raise AssertionError("portfolio risk snapshot must not place orders")
 
-    def get_account_snapshot(self, access_token: str, **_kwargs: object) -> BrokerAccountSnapshot:
+    def get_account_snapshot(self, access_token: str, **kwargs: object) -> BrokerAccountSnapshot:
         assert access_token == "stored-token"
         self.snapshot_calls += 1
+        self.snapshot_kwargs.append(dict(kwargs))
         if self.snapshot_error is not None:
             raise self.snapshot_error
         return self.snapshot or BrokerAccountSnapshot(
@@ -122,14 +124,20 @@ class PortfolioRiskStubAdapter:
         return {}
 
 
-def _add_broker_session(db, *, expires_at: datetime | None = None) -> None:
+def _add_broker_session(
+    db,
+    *,
+    expires_at: datetime | None = None,
+    provider: str = "kis",
+    token_type: str = "Bearer",
+) -> None:
     db.add(
         BrokerSession(
-            id="kis:paper",
-            provider="kis",
+            id=f"{provider}:paper",
+            provider=provider,
             mode="paper",
             access_token="stored-token",
-            token_type="Bearer",
+            token_type=token_type,
             access_token_expires_at=expires_at or datetime(2026, 6, 21, tzinfo=UTC),
         )
     )
@@ -249,6 +257,40 @@ def _execution_position(
             identity=identity,
         ),
         **values,
+    )
+
+
+def _authenticated_alpaca_position(
+    settings: Settings,
+    *,
+    broker_account_id: str,
+    symbol: str,
+    exchange: str,
+    base_quantity: Decimal,
+    average_price: Decimal,
+    now: datetime,
+) -> ExecutionPosition:
+    identity = build_authenticated_broker_position_identity(
+        settings=settings,
+        provider="alpaca",
+        exchange=exchange,
+        broker_account_id=broker_account_id,
+    )
+    return ExecutionPosition(
+        mode=settings.runtime_mode,
+        symbol=symbol,
+        quantity=0,
+        base_quantity=base_quantity,
+        average_price=average_price,
+        provider=identity.provider,
+        account_scope=identity.account_scope,
+        exchange=identity.exchange,
+        updated_from="reconciliation",
+        last_reconciled_at=now,
+        raw_payload=payload_with_position_identity(
+            {"asset_class": "us_equity" if exchange == "US" else "crypto"},
+            identity=identity,
+        ),
     )
 
 
@@ -596,6 +638,170 @@ def test_portfolio_risk_snapshot_includes_upbit_paper_base_quantity_position() -
     assert holding["symbol"] == "KRW-BTC"
     assert holding["base_quantity"] == "0.1250"
     assert holding["market_value"] == "10000000.0000"
+    engine.dispose()
+
+
+def test_portfolio_risk_alpaca_us_scope_keeps_fractional_equity_holdings() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        account_drawdown_recovery_scope_secret=(
+            "portfolio-account-scope-secret-at-least-32-bytes"
+        ),
+    )
+    engine, _factory, db = _session(settings)
+    now = datetime(2026, 10, 3, 16, 0, tzinfo=UTC)
+    account_id = "alpaca-paper-fractional-account"
+    _add_broker_session(
+        db,
+        expires_at=datetime.now(UTC) + timedelta(hours=1),
+        provider="alpaca",
+        token_type="ApiKey",
+    )
+    db.add_all(
+        [
+            _authenticated_alpaca_position(
+                settings,
+                broker_account_id=account_id,
+                symbol="QQQ",
+                exchange="US",
+                base_quantity=Decimal("0.140248264"),
+                average_price=Decimal("712.95"),
+                now=now,
+            ),
+            _authenticated_alpaca_position(
+                settings,
+                broker_account_id=account_id,
+                symbol="SPY",
+                exchange="US",
+                base_quantity=Decimal("0.131786004"),
+                average_price=Decimal("766.2422"),
+                now=now,
+            ),
+            _authenticated_alpaca_position(
+                settings,
+                broker_account_id=account_id,
+                symbol="BTC/USD",
+                exchange="ALPACA",
+                base_quantity=Decimal("0.0025"),
+                average_price=Decimal("65000"),
+                now=now,
+            ),
+        ]
+    )
+    db.commit()
+
+    adapter = PortfolioRiskStubAdapter(
+        provider="alpaca",
+        broker_account_id=account_id,
+        snapshot=BrokerAccountSnapshot(
+            broker_account_id=account_id,
+            observed_at=now,
+            source="alpaca:paper:us",
+            holdings=[
+                BrokerAccountHolding(
+                    symbol="QQQ",
+                    quantity=0,
+                    average_price=Decimal("712.95"),
+                    payload={
+                        "provider": "alpaca",
+                        "asset_class": "us_equity",
+                        "base_quantity": "0.140248264",
+                    },
+                ),
+                BrokerAccountHolding(
+                    symbol="SPY",
+                    quantity=0,
+                    average_price=Decimal("766.242213"),
+                    payload={
+                        "provider": "alpaca",
+                        "asset_class": "us_equity",
+                        "base_quantity": "0.131786004",
+                    },
+                ),
+            ],
+        ),
+    )
+    payload = build_portfolio_risk_snapshot(
+        settings=settings,
+        db=db,
+        adapter=adapter,
+        now=now,
+        market_scope="us",
+    )
+
+    assert adapter.snapshot_kwargs == [
+        {"symbols": ["QQQ", "SPY"], "exchange": "US"}
+    ]
+    assert payload["holdings"]["open_count"] == 2
+    holdings = {
+        row["symbol"]: row for row in payload["holdings"]["top_by_market_value"]
+    }
+    assert set(holdings) == {"QQQ", "SPY"}
+    assert holdings["QQQ"]["base_quantity"] == "0.1402"
+    assert holdings["SPY"]["base_quantity"] == "0.1318"
+    engine.dispose()
+
+
+def test_portfolio_risk_alpaca_all_scope_preserves_mixed_asset_holdings() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        account_drawdown_recovery_scope_secret=(
+            "portfolio-account-scope-secret-at-least-32-bytes"
+        ),
+    )
+    engine, _factory, db = _session(settings)
+    now = datetime(2026, 10, 3, 16, 0, tzinfo=UTC)
+    account_id = "alpaca-paper-mixed-account"
+    _add_broker_session(
+        db,
+        expires_at=datetime.now(UTC) + timedelta(hours=1),
+        provider="alpaca",
+        token_type="ApiKey",
+    )
+    db.add_all(
+        [
+            _authenticated_alpaca_position(
+                settings,
+                broker_account_id=account_id,
+                symbol="BTC/USD",
+                exchange="ALPACA",
+                base_quantity=Decimal("0.0025"),
+                average_price=Decimal("65000"),
+                now=now,
+            ),
+            _authenticated_alpaca_position(
+                settings,
+                broker_account_id=account_id,
+                symbol="QQQ",
+                exchange="US",
+                base_quantity=Decimal("0.140248264"),
+                average_price=Decimal("712.95"),
+                now=now,
+            ),
+        ]
+    )
+    db.commit()
+
+    adapter = PortfolioRiskStubAdapter(
+        provider="alpaca",
+        broker_account_id=account_id,
+    )
+    payload = build_portfolio_risk_snapshot(
+        settings=settings,
+        db=db,
+        adapter=adapter,
+        now=now,
+        market_scope="all",
+    )
+
+    assert adapter.snapshot_calls == 0
+    assert payload["account"]["snapshot_status"] == "incomplete_scope"
+    assert payload["holdings"]["open_count"] == 2
+    assert {
+        row["symbol"] for row in payload["holdings"]["top_by_market_value"]
+    } == {"BTC/USD", "QQQ"}
     engine.dispose()
 
 

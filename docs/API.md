@@ -710,6 +710,45 @@ Request body:
   without mutating `broker_orders` or writing `broker_order_events`
 - `actor` and `reason`: required for an applied run and persisted in repair and
   classification audit payloads
+- `manual_review_approvals` (optional object): maps an exact `broker_order_pk`
+  from the immediately preceding dry-run to that row's 64-character
+  `evidence_fingerprint`
+
+The response includes a separate `legacy_manual_review_resolution` section.
+Legacy discovery is an explicit API-route opt-in; internal stale reconciliation
+used during watch sizing leaves this section empty and never authenticates or
+loads a full KRX snapshot for historical manual-review rows.
+Its dry-run `items` expose a fingerprint only for legacy KIS rows at least 30
+days old (the endpoint threshold can make this stricter, never looser) whose
+immutable `created_at`, null `submitted_at`/`venue`/`asset_class`, stored KRX
+route/provider/endpoint/TR-ID, and masked account all agree with a fresh
+authenticated snapshot. A stored KIS account product code must exactly match
+the configured snapshot route; only the exact historical cohort that predates
+that metadata may report `account_product_code_proof=legacy_missing`. Both
+holdings and open-order coverage must be complete, and the exact symbol must
+have no broker holding, broker open order, local position, fill, linked
+execution failure, active execution job, or outcome-bearing plan sibling.
+Rows without a fingerprint remain blocked.
+
+Applying one of these legacy rows requires the exact row fingerprint plus
+`actor` and `reason`. Every unresolved sibling on the same execution-plan item
+must be approved in the same request. The service locks the plan item and all
+siblings, directly reloads and locks their fills and execution jobs, fetches
+and validates broker truth again after the lock, and rejects stale
+fingerprints or evidence drift with HTTP 409. A filled/partially-filled sibling
+or any sibling fill evidence blocks the entire plan-item group, as does a
+filled/partially-filled outcome status on the locked plan item. SQLite apply
+first acquires a conditional no-op writer reservation over the exact approved
+candidate IDs; a lock conflict or row-set drift fails closed with HTTP 409
+before the second snapshot. PostgreSQL apply takes a NOWAIT `SHARE` table lock
+on `execution_positions` before proving local-position absence, so concurrent
+position inserts/updates cannot cross the absence read; a busy fence also
+fails closed. A successful apply moves only the approved rows to
+`stale_terminal_unknown`; it preserves their prior error and raw broker
+evidence, does not attribute an account scope, infer a fill/outcome/P&L, or
+call a mutating broker endpoint. It appends both `stale_order_repair` and
+`runtime_remediation_events` audit evidence. Existing `manual_review_required`
+rows remain capital-reserving unless this explicit per-row path succeeds.
 
 Applied repair writes `broker_order_events` with event type
 `stale_order_repair`, including previous status, repaired status, observed
@@ -727,6 +766,19 @@ age exceeds `KAI_EXEC_STALE_BROKER_ORDER_RECONCILIATION_THRESHOLD_SECONDS`, the
 order moves to `stale_terminal_unknown`. The `stale_order_repair` event records
 the before/after status, broker result/code, and reason. This is a terminal
 attention state only: reconciliation does not infer a fill or realized P/L.
+
+KIS U.S. positions durably latched with exactly
+`manual_review_reason=unpriced_overseas_holding` can re-enter monitoring during
+position synchronization only from a newer, fresh
+`kis:us_equity_account_snapshot`. Holdings and open-order coverage must be
+complete; the NASD/NYSE/AMEX route and symbol must match exactly; average price,
+`now_pric2`, quantity, and sellable quantity must all be positive and finite.
+Independent trade/route quarantine remains sticky. Zero, missing, conflicting,
+stale, incomplete, or wrong-route price evidence preserves the latch (so a
+zero-priced holding such as WWBLCM stays blocked). A successful transition
+appends a `position_monitoring_manual_review` remediation event. A later durable
+quote failure can latch the position again, and only a snapshot newer than that
+new latch may release it.
 
 ### FIFO residual isolation repair
 
