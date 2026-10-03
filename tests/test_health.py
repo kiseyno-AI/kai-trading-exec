@@ -833,7 +833,7 @@ def test_lifespan_blocks_workers_for_unattributed_non_flat_position(
             "reason": "non_flat_execution_position_scope_attribution_required",
             "blocking_row_count": 1,
             "remediation": (
-                "kis_legacy_position_attribution_dry_run_apply_then_restart"
+                "broker_legacy_position_attribution_dry_run_apply_then_restart"
             ),
         }
         startup_dependency = health["dependencies"]["automated_runtime_startup"]
@@ -844,7 +844,7 @@ def test_lifespan_blocks_workers_for_unattributed_non_flat_position(
             "runtime_schema_status": "blocked",
             "alembic_status": "ok",
             "remediation": (
-                "kis_legacy_position_attribution_dry_run_apply_then_restart"
+                "broker_legacy_position_attribution_dry_run_apply_then_restart"
             ),
             "restart_required": True,
         }
@@ -854,7 +854,7 @@ def test_lifespan_blocks_workers_for_unattributed_non_flat_position(
             "runtime_schema_status": "blocked",
             "alembic_status": "ok",
             "remediation": (
-                "kis_legacy_position_attribution_dry_run_apply_then_restart"
+                "broker_legacy_position_attribution_dry_run_apply_then_restart"
             ),
             "restart_required": True,
         }
@@ -864,17 +864,17 @@ def test_lifespan_blocks_workers_for_unattributed_non_flat_position(
             "runtime_schema_status": "blocked",
             "alembic_status": "ok",
             "remediation": (
-                "kis_legacy_position_attribution_dry_run_apply_then_restart"
+                "broker_legacy_position_attribution_dry_run_apply_then_restart"
             ),
             "restart_required": True,
         }
         assert runtime_status["safety"]["readiness_reason"] == (
             "non_flat_execution_position_scope_attribution_required; "
-            "remediation=kis_legacy_position_attribution_dry_run_apply_then_restart; "
+            "remediation=broker_legacy_position_attribution_dry_run_apply_then_restart; "
             "restart_required=true"
         )
         readiness_reasons = " ".join(runtime_status["readiness"]["reasons"])
-        assert "kis_legacy_position_attribution_dry_run_apply_then_restart" in (
+        assert "broker_legacy_position_attribution_dry_run_apply_then_restart" in (
             readiness_reasons
         )
         assert "restart_required=true" in readiness_reasons

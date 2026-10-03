@@ -14,7 +14,7 @@ EXECUTION_POSITION_SCOPE_REMEDIATION_REASON = (
     "non_flat_execution_position_scope_attribution_required"
 )
 EXECUTION_POSITION_SCOPE_REMEDIATION = (
-    "kis_legacy_position_attribution_dry_run_apply_then_restart"
+    "broker_legacy_position_attribution_dry_run_apply_then_restart"
 )
 
 REQUIRED_RUNTIME_COLUMNS = {

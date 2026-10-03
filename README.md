@@ -853,6 +853,14 @@ after the final attribution because startup readiness is latched per process.
 See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for the complete backup,
 verification, rollback, and exchange-by-exchange runbook.
 
+The isolated Alpaca paper runtime uses the same two-pass workflow. Export
+`KAI_EXEC_RUNTIME_BROKER_PROVIDER=alpaca`, then pass `--runtime-mode paper
+--legacy-attribution-exchange US`; the paper launcher normally forces the
+provider only for its own process. A current complete
+broker-authenticated US-equity snapshot must exactly match each row's symbol,
+fractional `base_quantity`, and average price. Alpaca live attribution and
+inferred `NASD`/`NYSE`/`AMEX` routes remain fail-closed.
+
 Legacy `OTCB` and `OOTC` rows may use the same explicit two-pass command only in
 live mode. Their evidence comes from a complete KIS all-US holdings-only read;
 orders, quotes, and buying power are not queried. Exact matches are attributed to
@@ -872,10 +880,11 @@ still requires operator review. Apply output reports the approved rows actually
 written as `quarantined_count`.
 
 Both remediation modes require `--actor` and `--reason` when applying. Supported
-KRX/NASD/NYSE/AMEX routes use broker account-snapshot reads and update
-`execution_positions`; OTCB/OOTC use the isolated attribution-only quarantine
-path; all other routes remain unsupported. This command invokes no order
-placement path and never places, amends, or cancels orders.
+KIS KRX/NASD/NYSE/AMEX routes and the Alpaca paper `US` route use broker
+account-snapshot reads and update `execution_positions`; OTCB/OOTC use the
+isolated attribution-only quarantine path; all other routes remain unsupported.
+This command invokes no order placement path and never places, amends, or
+cancels orders.
 
 ## Tests and quality gates
 

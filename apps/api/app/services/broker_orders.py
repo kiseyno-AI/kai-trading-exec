@@ -110,6 +110,7 @@ from app.services.fifo_inventory import FifoRouteScope, fifo_route_scope_from_or
 from app.services.json_compaction import PLAN_ITEM_SUBMISSION_RISK_KEYS, json_payload_hash
 from app.services.monitoring_price_source import is_us_regular_session, next_us_regular_open
 from app.services.order_intent_serialization import (
+    alpaca_pre_auth_order_intent_account_scope,
     order_intent_file_lock,
     order_intent_process_lock,
     order_intent_scope_key_for_account,
@@ -447,8 +448,9 @@ def _order_intent_account_fingerprint(
         # workers, so serialize the pre-auth provider conservatively. The
         # PostgreSQL transaction lock is narrowed to the authenticated opaque
         # account scope after authentication.
-        material = f"alpaca\0{settings.runtime_mode}\0pre-auth-provider-scope"
-        return sha256(material.encode("utf-8")).hexdigest()[:24]
+        return alpaca_pre_auth_order_intent_account_scope(
+            runtime_mode=settings.runtime_mode,
+        )
     credential_material = (
         settings.upbit_access_key
         if provider == "upbit"

@@ -785,7 +785,10 @@ database URL.
 Legacy non-flat positions whose provider/account/exchange fields are still null
 are intentionally excluded from the ordinary stale-truth apply path. After all
 writers are drained, run `--legacy-attribution-exchange` for exactly one of
-`KRX`, `NASD`, `NYSE`, or `AMEX`. The default is a broker-read-only dry-run. An
+`KRX`, `NASD`, `NYSE`, or `AMEX` for KIS, or `US` for the isolated Alpaca paper
+runtime. The Alpaca path rejects live mode and requires a complete,
+broker-authenticated US-equity snapshot with exact fractional quantity and
+average-price evidence. The default is a broker-read-only dry-run. An
 apply requires one or more exact `--approve-position POSITION_ID=64HEX`
 fingerprints copied from that dry-run plus `--actor` and `--reason`. The service
 re-reads complete broker holdings, verifies exact account/exchange/quantity/

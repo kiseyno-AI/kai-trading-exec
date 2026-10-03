@@ -12,13 +12,16 @@ API_ROOT = REPO_ROOT / "apps" / "api"
 if str(API_ROOT) not in sys.path:
     sys.path.insert(0, str(API_ROOT))
 
+from app.broker.alpaca import AlpacaBrokerAdapter  # noqa: E402
+from app.broker.base import BrokerAdapter, BrokerTokenGrant  # noqa: E402
 from app.broker.kis import KisBrokerAdapter  # noqa: E402
-from app.core.config import load_settings  # noqa: E402
+from app.core.config import Settings, load_settings  # noqa: E402
 from app.db.session import create_db_engine, create_session_factory  # noqa: E402
 from app.services.database_cli_security import (  # noqa: E402
     reject_secret_database_url_argument,
 )
 from app.services.position_truth_remediation import (  # noqa: E402
+    ALPACA_PAPER_LEGACY_ATTRIBUTION_EXCHANGES,
     LEGACY_QUARANTINE_ATTRIBUTION_EXCHANGES,
     SUPPORTED_POSITION_EXCHANGES,
     analyze_legacy_position_attribution,
@@ -27,6 +30,31 @@ from app.services.position_truth_remediation import (  # noqa: E402
     apply_position_truth_remediation,
     legacy_attribution_account_scope_source,
 )
+
+
+class _AlpacaPaperUsEquityAttributionAdapter(AlpacaBrokerAdapter):
+    """Authenticate the exact US-equity lane used by legacy attribution."""
+
+    def authenticate(self) -> BrokerTokenGrant:
+        return self.authenticate_us_equity()
+
+
+def _legacy_attribution_adapter(settings: Settings) -> BrokerAdapter:
+    provider = (
+        str(getattr(settings, "runtime_broker_provider", "kis") or "kis")
+        .strip()
+        .lower()
+    )
+    if provider == "kis":
+        return KisBrokerAdapter(settings=settings)
+    if (
+        provider == "alpaca"
+        and settings.runtime_mode == "paper"
+    ):
+        return _AlpacaPaperUsEquityAttributionAdapter(settings=settings)
+    raise SystemExit(
+        "legacy attribution supports KIS routes or the isolated Alpaca paper route"
+    )
 
 
 def _approved_position_evidence(values: list[str]) -> dict[str, str]:
@@ -68,12 +96,14 @@ def main(argv: list[str] | None = None) -> int:
         choices=tuple(
             sorted(
                 SUPPORTED_POSITION_EXCHANGES
+                | ALPACA_PAPER_LEGACY_ATTRIBUTION_EXCHANGES
                 | LEGACY_QUARANTINE_ATTRIBUTION_EXCHANGES
             )
         ),
         help=(
-            "Analyze legacy unscoped positions against one exact KIS exchange. "
-            "OTCB/OOTC use live all-US holdings evidence and remain quarantined."
+            "Analyze legacy unscoped positions against one exact broker route. "
+            "US is the isolated Alpaca paper US-equity route; OTCB/OOTC use "
+            "live KIS all-US holdings evidence and remain quarantined."
         ),
     )
     parser.add_argument("--apply", action="store_true")
@@ -137,12 +167,17 @@ def main(argv: list[str] | None = None) -> int:
     session_factory = create_session_factory(engine)
     try:
         with session_factory() as db:
+            legacy_adapter = (
+                _legacy_attribution_adapter(settings)
+                if args.legacy_attribution_exchange
+                else None
+            )
             if args.legacy_attribution_exchange and args.apply:
                 payload = apply_legacy_position_attribution(
                     settings=settings,
                     db=db,
                     auth_session_factory=session_factory,
-                    adapter=KisBrokerAdapter(settings=settings),
+                    adapter=legacy_adapter,
                     exchange=args.legacy_attribution_exchange,
                     approved_evidence=approved_evidence,
                     actor=actor,
@@ -153,7 +188,7 @@ def main(argv: list[str] | None = None) -> int:
                     settings=settings,
                     db=db,
                     auth_session_factory=session_factory,
-                    adapter=KisBrokerAdapter(settings=settings),
+                    adapter=legacy_adapter,
                     exchange=args.legacy_attribution_exchange,
                 )
             elif args.apply:
