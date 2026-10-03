@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from contextlib import ExitStack
 from datetime import UTC, datetime, timedelta
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import hashlib
 import hmac
 import json
@@ -58,7 +58,16 @@ ALPACA_PAPER_LEGACY_ATTRIBUTION_EXCHANGES = frozenset({"US"})
 LEGACY_QUARANTINE_ATTRIBUTION_EXCHANGES = KIS_US_POSITION_QUARANTINE_EXCHANGES
 LEGACY_QUARANTINE_ROUTE_DISPOSITION = "account_attributed_quarantine"
 LEGACY_ATTRIBUTION_SAFETY_POLICY_VERSION = (
-    "legacy-position-attribution-safety-v4"
+    "legacy-position-attribution-safety-v5"
+)
+EXECUTION_POSITION_AVERAGE_PRICE_SCALE = int(
+    ExecutionPosition.__table__.c.average_price.type.scale
+)
+EXECUTION_POSITION_AVERAGE_PRICE_QUANTUM = Decimal(1).scaleb(
+    -EXECUTION_POSITION_AVERAGE_PRICE_SCALE
+)
+ALPACA_AVERAGE_PRICE_MATCH_POLICY = (
+    "numeric_18_4_round_half_up_strict_storage_bucket_v1"
 )
 POSITION_EVIDENCE_ORDER_STATUSES = (*ACTIONABLE_OPEN_ORDER_STATUSES, "filled")
 
@@ -906,14 +915,16 @@ def _legacy_attribution_item(
         reason = "broker_holding_exchange_mismatch"
     elif broker_quantity != legacy_quantity:
         reason = "quantity_mismatch"
-    elif (
-        legacy_average_price is None
-        or legacy_average_price <= 0
-        or broker_average_price is None
-        or broker_average_price <= 0
+    elif not (
+        _positive_finite_attribution_decimal(legacy_average_price)
+        and _positive_finite_attribution_decimal(broker_average_price)
     ):
         reason = "average_price_missing"
-    elif broker_average_price != legacy_average_price:
+    elif not _legacy_average_price_matches(
+        provider=provider,
+        legacy_average_price=legacy_average_price,
+        broker_average_price=broker_average_price,
+    ):
         reason = "average_price_mismatch"
     else:
         reason = "exact_broker_holding_match"
@@ -1009,6 +1020,11 @@ def _legacy_attribution_safety_invariants(
         "collision_scope": "mode_provider_account_symbol_any_exchange",
         "provider": provider,
         "fractional_quantity_allowed": provider == "alpaca",
+        "average_price_match_policy": (
+            ALPACA_AVERAGE_PRICE_MATCH_POLICY
+            if provider == "alpaca"
+            else "exact_decimal_v1"
+        ),
         "manual_review_required": quarantine_attribution,
         "monitoring_allowed": not quarantine_attribution,
         "route_disposition": (
@@ -1031,6 +1047,37 @@ def _legacy_quantity_representation_is_supported(
         return False
     base_quantity = Decimal(position.base_quantity)
     return base_quantity.is_finite() and base_quantity > 0
+
+
+def _positive_finite_attribution_decimal(value: Decimal | None) -> bool:
+    return value is not None and value.is_finite() and value > 0
+
+
+def _legacy_average_price_matches(
+    *,
+    provider: str,
+    legacy_average_price: Decimal,
+    broker_average_price: Decimal,
+) -> bool:
+    if provider != "alpaca":
+        return broker_average_price == legacy_average_price
+    try:
+        stored_legacy = legacy_average_price.quantize(
+            EXECUTION_POSITION_AVERAGE_PRICE_QUANTUM,
+            rounding=ROUND_HALF_UP,
+        )
+        stored_broker = broker_average_price.quantize(
+            EXECUTION_POSITION_AVERAGE_PRICE_QUANTUM,
+            rounding=ROUND_HALF_UP,
+        )
+    except InvalidOperation:
+        return False
+    half_quantum = EXECUTION_POSITION_AVERAGE_PRICE_QUANTUM / 2
+    return (
+        legacy_average_price == stored_legacy
+        and stored_broker == stored_legacy
+        and abs(broker_average_price - legacy_average_price) < half_quantum
+    )
 
 
 def _alpaca_us_equity_holding_provenance_is_valid(
