@@ -56,6 +56,34 @@ def _stub_runtime(monkeypatch: pytest.MonkeyPatch) -> tuple[object, _EngineStub]
     return db, engine
 
 
+def test_alpaca_legacy_cli_adapter_authenticates_the_us_equity_lane(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+    grant = object()
+
+    def authenticate_us_equity(self):
+        calls.append("us_equity")
+        return grant
+
+    monkeypatch.setattr(
+        cli.AlpacaBrokerAdapter,
+        "authenticate_us_equity",
+        authenticate_us_equity,
+    )
+    adapter = cli._legacy_attribution_adapter(
+        cli.Settings(
+            runtime_mode="paper",
+            runtime_broker_provider="alpaca",
+            alpaca_api_key="paper-key",
+            alpaca_api_secret="paper-secret",
+        )
+    )
+
+    assert adapter.authenticate() is grant
+    assert calls == ["us_equity"]
+
+
 def test_legacy_attribution_exchange_routes_dry_run_without_mutation(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],

@@ -1409,14 +1409,36 @@ def test_runtime_safety_controls_still_block_live_short_term_order_submission() 
 
     plan_response = client.post("/execution-plans", json=short_term_plan_payload())
     assert plan_response.status_code == 201
+    authenticate_calls_before_dispatch = adapter.authenticate_calls
+    snapshot_calls_before_dispatch = adapter.snapshot_calls
 
-    dispatch = client.post("/execution-jobs/dispatch")
+    dispatch = dispatch_short_term_jobs_at_the_planned_open(app, adapter)
 
     assert dispatch.status_code == 200
-    assert dispatch.json()["blocked"] is True
-    assert dispatch.json()["block_reason"] == "paused"
+    assert dispatch.payload["blocked"] is True
+    assert dispatch.payload["block_reason"] == "paused"
+    assert dispatch.payload["safety"]["automated_order_submission_allowed"] is True
+    assert dispatch.payload["safety"]["automated_order_submission_block_reason"] is None
+    assert dispatch.payload["safety"]["automated_buy_submission_allowed"] is False
+    assert dispatch.payload["safety"]["automated_buy_submission_block_reason"] == (
+        "paused"
+    )
+    assert dispatch.payload["due_job_count"] == 1
+    assert dispatch.payload["blocked_buy_job_count"] == 1
+    assert dispatch.payload["jobs"][0]["status"] == "scheduled"
+    assert dispatch.payload["jobs"][0]["last_error"] is None
+    assert adapter.authenticate_calls == authenticate_calls_before_dispatch
+    assert adapter.snapshot_calls == snapshot_calls_before_dispatch
     assert adapter.order_calls == []
     assert client.get("/orders").json() == []
+    with app.state.db_session_factory() as session:
+        job = session.scalar(select(ExecutionJob))
+        assert job is not None
+        assert job.status == "scheduled"
+        assert job.last_error is None
+        item = session.get(ExecutionPlanItem, job.execution_plan_item_id)
+        assert item is not None
+        assert item.status == "next_open_buy_scheduled"
 
     engine.dispose()
 
@@ -2094,7 +2116,7 @@ def test_signal_decider_exec_agent_sized_buy_waits_for_local_watch_sizing() -> N
         for item in response_payload["items"]
         if item["intent"] == "next_open_buy"
     )
-    assert buy_item["status"] == "watch_monitoring_pending"
+    assert buy_item["status"] == "watch_sizing_pending"
     assert buy_item["quantity_policy"]["type"] == "exec_agent_sized"
     assert "kind" not in buy_item["quantity_policy"]
     assert response_payload["execution_jobs"] == []

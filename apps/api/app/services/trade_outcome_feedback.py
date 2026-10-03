@@ -213,7 +213,11 @@ def generate_trade_outcome_feedback(
         as_of=now,
         requested_scope=requested_scope,
     )
-    account_drawdown_gate = latest_account_drawdown_gate_state(settings=settings, db=db)
+    account_drawdown_gate = latest_account_drawdown_gate_state(
+        settings=settings,
+        db=db,
+        as_of=now,
+    )
     candidate_rule_replay = _candidate_rule_replay(settings=settings, closed_trades=closed_trades)
     snippet = _snippet(
         summary=summary,

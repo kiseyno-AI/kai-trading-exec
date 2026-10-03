@@ -15,6 +15,7 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.exc import DBAPIError
 
+from app.api.schemas.execution import PlaceOrderRequest
 from app.broker.base import (
     BrokerAccountHolding,
     BrokerAccountSnapshot,
@@ -49,6 +50,7 @@ from app.services.position_identity import (
     build_position_identity,
     execution_scope_payload,
 )
+from app.services.reconciliation import sync_execution_positions_from_broker_snapshot
 
 
 NOW = datetime(2026, 9, 6, 18, 0, tzinfo=UTC)
@@ -186,6 +188,64 @@ def _legacy_position(*, symbol: str, quantity: int, average_price: str) -> Execu
         updated_from="reconciliation",
         last_reconciled_at=NOW - timedelta(minutes=10),
         raw_payload={"legacy_snapshot": True},
+    )
+
+
+def _legacy_fractional_position(
+    *,
+    symbol: str,
+    base_quantity: str,
+    average_price: str,
+) -> ExecutionPosition:
+    return ExecutionPosition(
+        mode="paper",
+        symbol=symbol,
+        quantity=0,
+        base_quantity=Decimal(base_quantity),
+        average_price=Decimal(average_price),
+        updated_from="reconciliation",
+        last_reconciled_at=NOW - timedelta(minutes=10),
+        raw_payload={
+            "provider": "alpaca",
+            "mode": "paper",
+            "asset_class": "us_equity",
+            "legacy_snapshot": True,
+        },
+    )
+
+
+def _alpaca_paper_us_snapshot(
+    *,
+    account_id: str | None = "alpaca-paper-account-id",
+    base_quantity: str = "0.125",
+    holding_payload: dict[str, object] | None = None,
+) -> BrokerAccountSnapshot:
+    return BrokerAccountSnapshot(
+        broker_account_id=account_id,
+        observed_at=NOW,
+        source="alpaca:paper:us_equity",
+        holdings=[
+            BrokerAccountHolding(
+                symbol="QQQ",
+                quantity=0,
+                average_price=Decimal("481.25"),
+                payload=(
+                    holding_payload
+                    if holding_payload is not None
+                    else {
+                        "provider": "alpaca",
+                        "asset_class": "us_equity",
+                        "base_quantity": base_quantity,
+                    }
+                ),
+            )
+        ],
+        payload={
+            "provider": "alpaca",
+            "mode": "paper",
+            "asset_class": "us_equity",
+            "holdings_coverage": "complete",
+        },
     )
 
 
@@ -1071,6 +1131,47 @@ def test_position_remediation_trims_applied_audit_metadata(tmp_path) -> None:
     engine.dispose()
 
 
+def test_position_remediation_cli_routes_us_legacy_dry_run_to_alpaca_paper(
+    tmp_path,
+) -> None:
+    database_url = f"sqlite:///{tmp_path / 'alpaca-paper-attribution.db'}"
+    settings = Settings(database_url=database_url, runtime_mode="paper")
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    engine.dispose()
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "scripts/refresh_execution_position_truth.py",
+            "--database-url",
+            database_url,
+            "--runtime-mode",
+            "paper",
+            "--legacy-attribution-exchange",
+            "US",
+        ],
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "KAI_EXEC_RUNTIME_BROKER_PROVIDER": "alpaca",
+            "KAI_EXEC_ALPACA_API_KEY": "paper-key",
+            "KAI_EXEC_ALPACA_API_SECRET": "paper-secret",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["runtime_mode"] == "paper"
+    assert payload["exchange"] == "US"
+    assert payload["summary"] == {
+        "candidate_count": 0,
+        "eligible_count": 0,
+        "manual_review_count": 0,
+    }
+
+
 def test_legacy_position_attribution_dry_run_proves_exact_matches_without_mutation(
     monkeypatch,
 ) -> None:
@@ -1186,6 +1287,422 @@ def test_legacy_position_attribution_dry_run_proves_exact_matches_without_mutati
     engine.dispose()
 
 
+def test_alpaca_paper_fractional_legacy_attribution_requires_exact_approved_truth(
+    monkeypatch,
+) -> None:
+    settings, engine, session_factory, db = _session()
+    settings = settings.model_copy(
+        update={
+            "runtime_broker_provider": "alpaca",
+            "alpaca_api_secret": "paper-scope-secret",
+        }
+    )
+    qqq = _legacy_fractional_position(
+        symbol="QQQ",
+        base_quantity="0.125",
+        average_price="481.25",
+    )
+    spy = _legacy_fractional_position(
+        symbol="SPY",
+        base_quantity="0.375",
+        average_price="598.50",
+    )
+    db.add_all([qqq, spy])
+    db.commit()
+    adapter = LegacyAttributionAdapter(
+        BrokerAccountSnapshot(
+            broker_account_id="alpaca-paper-account-id",
+            observed_at=NOW,
+            source="alpaca:paper:us_equity",
+            holdings=[
+                BrokerAccountHolding(
+                    symbol="QQQ",
+                    quantity=0,
+                    average_price=Decimal("481.25"),
+                    payload={
+                        "provider": "alpaca",
+                        "asset_class": "us_equity",
+                        "base_quantity": "0.125",
+                    },
+                ),
+                BrokerAccountHolding(
+                    symbol="SPY",
+                    quantity=0,
+                    average_price=Decimal("598.50"),
+                    payload={
+                        "provider": "alpaca",
+                        "asset_class": "us_equity",
+                        "base_quantity": "0.375",
+                    },
+                ),
+            ],
+            payload={
+                "provider": "alpaca",
+                "mode": "paper",
+                "asset_class": "us_equity",
+                "holdings_coverage": "complete",
+            },
+        )
+    )
+    adapter.provider = "alpaca"
+    monkeypatch.setattr(
+        "app.services.position_truth_remediation.ensure_authenticated_broker_session",
+        lambda **kwargs: type("SessionState", (), {"access_token": "test-token"})(),
+    )
+    monkeypatch.setattr(remediation_service, "_real_utc_now", lambda: NOW)
+
+    dry_run = remediation_service.analyze_legacy_position_attribution(
+        settings=settings,
+        db=db,
+        auth_session_factory=session_factory,
+        adapter=adapter,
+        exchange="US",
+        now=NOW,
+    )
+
+    assert dry_run["provider"] == "alpaca"
+    assert dry_run["exchange"] == "US"
+    assert dry_run["summary"] == {
+        "candidate_count": 2,
+        "eligible_count": 2,
+        "manual_review_count": 0,
+    }
+    assert {item["legacy_quantity"] for item in dry_run["items"]} == {
+        "0.125",
+        "0.375",
+    }
+    assert all(
+        item["reason"] == "exact_broker_holding_match"
+        and isinstance(item["evidence_fingerprint"], str)
+        for item in dry_run["items"]
+    )
+    assert all(position.provider is None for position in (qqq, spy))
+
+    result = remediation_service.apply_legacy_position_attribution(
+        settings=settings,
+        db=db,
+        auth_session_factory=session_factory,
+        adapter=adapter,
+        exchange="US",
+        approved_evidence={
+            str(item["position_id"]): str(item["evidence_fingerprint"])
+            for item in dry_run["items"]
+        },
+        actor="paper-operator",
+        reason="broker paper holdings reviewed",
+        now=NOW,
+    )
+
+    assert result["summary"] == {
+        "approved_count": 2,
+        "attributed_count": 2,
+        "manual_review_count": 0,
+    }
+    db.expire_all()
+    persisted = db.scalars(
+        select(ExecutionPosition).order_by(ExecutionPosition.symbol.asc())
+    ).all()
+    assert [(row.symbol, row.quantity, row.base_quantity) for row in persisted] == [
+        ("QQQ", 0, Decimal("0.125000000000")),
+        ("SPY", 0, Decimal("0.375000000000")),
+    ]
+    assert all(
+        row.provider == "alpaca"
+        and row.exchange == "US"
+        and len(str(row.account_scope)) == 24
+        and row.raw_payload["_position_identity"]["provider"] == "alpaca"
+        and row.raw_payload["_position_identity"]["exchange"] == "US"
+        for row in persisted
+    )
+    events = db.scalars(select(RuntimeRemediationEvent)).all()
+    assert len(events) == 2
+    assert all(event.outcome == "position_route_attributed" for event in events)
+    sync_execution_positions_from_broker_snapshot(
+        settings=settings,
+        db=db,
+        adapter=adapter,
+        symbols={"QQQ", "SPY"},
+        exchange="US",
+        authenticated_access_token="test-token",
+    )
+    assert db.query(ExecutionPosition).count() == 2
+    assert adapter.snapshot_requests == [
+        (["QQQ", "SPY"], "US"),
+        (["QQQ", "SPY"], "US"),
+        (["QQQ", "SPY"], "US"),
+    ]
+    db.close()
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("settings_update", "snapshot_payload", "expected_error"),
+    [
+        (
+            {"runtime_broker_provider": "kis"},
+            {"provider": "alpaca", "mode": "paper", "asset_class": "us_equity"},
+            "requires runtime broker provider alpaca",
+        ),
+        (
+            {"runtime_broker_provider": "alpaca", "runtime_mode": "live"},
+            {"provider": "alpaca", "mode": "live", "asset_class": "us_equity"},
+            "supports only paper mode",
+        ),
+        (
+            {"runtime_broker_provider": "alpaca"},
+            {"provider": "alpaca", "mode": "paper", "asset_class": "crypto"},
+            "US-equity snapshot proof is unavailable",
+        ),
+    ],
+)
+def test_alpaca_legacy_attribution_fails_closed_without_exact_route_proof(
+    monkeypatch,
+    settings_update: dict[str, str],
+    snapshot_payload: dict[str, str],
+    expected_error: str,
+) -> None:
+    settings, engine, session_factory, db = _session()
+    settings = settings.model_copy(
+        update={
+            "alpaca_api_secret": "paper-scope-secret",
+            **settings_update,
+        }
+    )
+    db.add(
+        _legacy_fractional_position(
+            symbol="QQQ",
+            base_quantity="0.125",
+            average_price="481.25",
+        )
+    )
+    db.commit()
+    adapter = LegacyAttributionAdapter(
+        BrokerAccountSnapshot(
+            broker_account_id="alpaca-paper-account-id",
+            observed_at=NOW,
+            source=f"alpaca:{settings.runtime_mode}:us_equity",
+            holdings=[
+                BrokerAccountHolding(
+                    symbol="QQQ",
+                    quantity=0,
+                    average_price=Decimal("481.25"),
+                    payload={
+                        "provider": "alpaca",
+                        "asset_class": "us_equity",
+                        "base_quantity": "0.125",
+                    },
+                )
+            ],
+            payload=snapshot_payload,
+        )
+    )
+    adapter.provider = "alpaca"
+    monkeypatch.setattr(
+        "app.services.position_truth_remediation.ensure_authenticated_broker_session",
+        lambda **kwargs: type("SessionState", (), {"access_token": "test-token"})(),
+    )
+
+    with pytest.raises(PositionIdentityConflictError, match=expected_error):
+        remediation_service.analyze_legacy_position_attribution(
+            settings=settings,
+            db=db,
+            auth_session_factory=session_factory,
+            adapter=adapter,
+            exchange="US",
+            now=NOW,
+        )
+
+    assert db.scalar(select(ExecutionPosition)).provider is None
+    db.close()
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("legacy_payload", "holding_payload", "expected_reason"),
+    [
+        (
+            {"legacy_snapshot": True},
+            {
+                "provider": "alpaca",
+                "asset_class": "us_equity",
+                "base_quantity": "0.125",
+            },
+            "legacy_route_proof_missing",
+        ),
+        (
+            {
+                "provider": "alpaca",
+                "mode": "paper",
+                "asset_class": "us_equity",
+            },
+            {"provider": "alpaca", "asset_class": "us_equity"},
+            "broker_holding_route_proof_missing",
+        ),
+    ],
+)
+def test_alpaca_legacy_attribution_rejects_missing_row_or_fractional_provenance(
+    monkeypatch,
+    legacy_payload: dict[str, object],
+    holding_payload: dict[str, object],
+    expected_reason: str,
+) -> None:
+    settings, engine, session_factory, db = _session()
+    settings = settings.model_copy(
+        update={
+            "runtime_broker_provider": "alpaca",
+            "alpaca_api_secret": "paper-scope-secret",
+        }
+    )
+    position = _legacy_fractional_position(
+        symbol="QQQ",
+        base_quantity="0.125",
+        average_price="481.25",
+    )
+    position.raw_payload = legacy_payload
+    db.add(position)
+    db.commit()
+    adapter = LegacyAttributionAdapter(
+        _alpaca_paper_us_snapshot(holding_payload=holding_payload)
+    )
+    adapter.provider = "alpaca"
+    monkeypatch.setattr(
+        "app.services.position_truth_remediation.ensure_authenticated_broker_session",
+        lambda **kwargs: type("SessionState", (), {"access_token": "test-token"})(),
+    )
+
+    result = remediation_service.analyze_legacy_position_attribution(
+        settings=settings,
+        db=db,
+        auth_session_factory=session_factory,
+        adapter=adapter,
+        exchange="US",
+        now=NOW,
+    )
+
+    assert result["summary"]["eligible_count"] == 0
+    assert result["items"][0]["reason"] == expected_reason
+    assert result["items"][0]["evidence_fingerprint"] is None
+    assert db.get(ExecutionPosition, position.id).provider is None
+    db.close()
+    engine.dispose()
+
+
+def test_alpaca_legacy_attribution_rejects_missing_authenticated_account_id(
+    monkeypatch,
+) -> None:
+    settings, engine, session_factory, db = _session()
+    settings = settings.model_copy(
+        update={
+            "runtime_broker_provider": "alpaca",
+            "alpaca_api_secret": "paper-scope-secret",
+        }
+    )
+    db.add(
+        _legacy_fractional_position(
+            symbol="QQQ",
+            base_quantity="0.125",
+            average_price="481.25",
+        )
+    )
+    db.commit()
+    adapter = LegacyAttributionAdapter(
+        _alpaca_paper_us_snapshot(account_id=None)
+    )
+    adapter.provider = "alpaca"
+    monkeypatch.setattr(
+        "app.services.position_truth_remediation.ensure_authenticated_broker_session",
+        lambda **kwargs: type("SessionState", (), {"access_token": "test-token"})(),
+    )
+
+    with pytest.raises(
+        PositionIdentityConflictError,
+        match="US-equity snapshot proof is unavailable",
+    ):
+        remediation_service.analyze_legacy_position_attribution(
+            settings=settings,
+            db=db,
+            auth_session_factory=session_factory,
+            adapter=adapter,
+            exchange="US",
+            now=NOW,
+        )
+
+    assert db.scalar(select(ExecutionPosition)).provider is None
+    db.close()
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    "drifted_snapshot",
+    [
+        _alpaca_paper_us_snapshot(
+            account_id="rotated-alpaca-paper-account-id"
+        ),
+        _alpaca_paper_us_snapshot(base_quantity="0.126"),
+    ],
+)
+def test_alpaca_legacy_attribution_apply_rejects_account_or_quantity_drift(
+    monkeypatch,
+    drifted_snapshot: BrokerAccountSnapshot,
+) -> None:
+    settings, engine, session_factory, db = _session()
+    settings = settings.model_copy(
+        update={
+            "runtime_broker_provider": "alpaca",
+            "alpaca_api_secret": "paper-scope-secret",
+        }
+    )
+    position = _legacy_fractional_position(
+        symbol="QQQ",
+        base_quantity="0.125",
+        average_price="481.25",
+    )
+    db.add(position)
+    db.commit()
+    adapter = LegacyAttributionAdapter(_alpaca_paper_us_snapshot())
+    adapter.provider = "alpaca"
+    monkeypatch.setattr(
+        "app.services.position_truth_remediation.ensure_authenticated_broker_session",
+        lambda **kwargs: type("SessionState", (), {"access_token": "test-token"})(),
+    )
+
+    dry_run = remediation_service.analyze_legacy_position_attribution(
+        settings=settings,
+        db=db,
+        auth_session_factory=session_factory,
+        adapter=adapter,
+        exchange="US",
+        now=NOW,
+    )
+    approved_fingerprint = str(dry_run["items"][0]["evidence_fingerprint"])
+    adapter.snapshot = drifted_snapshot
+
+    with pytest.raises(
+        PositionIdentityConflictError,
+        match="approved legacy position evidence no longer matches",
+    ):
+        remediation_service.apply_legacy_position_attribution(
+            settings=settings,
+            db=db,
+            auth_session_factory=session_factory,
+            adapter=adapter,
+            exchange="US",
+            approved_evidence={position.id: approved_fingerprint},
+            actor="paper-operator",
+            reason="broker paper holdings reviewed",
+            now=NOW,
+        )
+
+    db.expire_all()
+    persisted = db.get(ExecutionPosition, position.id)
+    assert persisted.provider is None
+    assert persisted.account_scope is None
+    assert persisted.exchange is None
+    assert db.scalars(select(RuntimeRemediationEvent)).all() == []
+    db.close()
+    engine.dispose()
+
+
 def test_legacy_otc_attribution_dry_run_is_holdings_only_and_quarantined(
     monkeypatch,
 ) -> None:
@@ -1264,14 +1781,16 @@ def test_legacy_otc_attribution_dry_run_is_holdings_only_and_quarantined(
     assert item["disposition"] == "account_attributed_quarantine"
     assert item["query_scope"] == "kis_us_all_holdings_only_v1"
     assert item["safety_policy_version"] == (
-        "legacy-position-attribution-safety-v3"
+        "legacy-position-attribution-safety-v4"
     )
     assert item["safety_invariants"] == {
         "account_scope_source": "stable_hmac",
         "broker_actions_allowed": False,
         "collision_scope": "mode_provider_account_symbol_any_exchange",
+        "fractional_quantity_allowed": False,
         "manual_review_required": True,
         "monitoring_allowed": False,
+        "provider": "kis",
         "route_disposition": "account_attributed_quarantine",
     }
     assert len(item["snapshot_proof_digest"]) == 64
@@ -1807,6 +2326,75 @@ def test_legacy_attribution_serializes_with_kis_order_pre_auth_scope() -> None:
     engine.dispose()
 
 
+def test_alpaca_legacy_attribution_serializes_with_order_pre_auth_scope() -> None:
+    settings, engine, _session_factory, db = _session()
+    settings = settings.model_copy(
+        update={
+            "runtime_broker_provider": "alpaca",
+            "alpaca_api_key": "paper-key",
+            "alpaca_api_secret": "paper-secret",
+        }
+    )
+    identity = build_position_identity(
+        settings=settings,
+        provider="alpaca",
+        exchange="US",
+        broker_account_id="alpaca-paper-account-id",
+    )
+    command = PlaceOrderRequest(
+        idempotency_key="alpaca-attribution-pre-auth-lock",
+        provider="alpaca",
+        venue="alpaca",
+        asset_class="us_equity",
+        symbol="QQQ",
+        side="sell",
+        base_quantity=Decimal("0.125"),
+        order_type="market",
+        time_in_force="day",
+        exchange="US",
+    )
+    order_scope = broker_orders_service._order_intent_scope_key(
+        settings=settings,
+        adapter=SimpleNamespace(provider="alpaca"),
+        command=command,
+    )
+    order_lock = broker_orders_service.order_intent_process_lock(order_scope)
+    lock_acquired = Event()
+    release_lock = Event()
+
+    def hold_order_scope() -> None:
+        with order_lock:
+            lock_acquired.set()
+            assert release_lock.wait(timeout=2)
+
+    holder = Thread(target=hold_order_scope)
+    holder.start()
+    assert lock_acquired.wait(timeout=2)
+    serialization = None
+    try:
+        with pytest.raises(
+            PositionIdentityConflictError,
+            match="scope is busy",
+        ):
+            serialization = remediation_service._acquire_legacy_attribution_apply_serialization(
+                settings=settings,
+                db=db,
+                provider="alpaca",
+                account_scope=identity.account_scope,
+                exchange="US",
+            )
+    finally:
+        if serialization is not None:
+            serialization.close()
+        release_lock.set()
+        holder.join(timeout=2)
+
+    assert not holder.is_alive()
+    assert order_scope.endswith(":ACCOUNT")
+    db.close()
+    engine.dispose()
+
+
 def test_legacy_attribution_fails_closed_when_sqlite_order_file_scope_is_busy(
     tmp_path,
     monkeypatch,
@@ -1974,6 +2562,71 @@ def test_legacy_attribution_uses_non_waiting_exact_postgres_apply_locks() -> Non
     assert len(execute_calls) == 1
     assert "LOCK TABLE execution_positions" in execute_calls[0]
     assert "NOWAIT" in execute_calls[0]
+
+
+def test_alpaca_legacy_attribution_uses_exact_order_account_lock_scope() -> None:
+    settings = Settings(
+        database_url="postgresql+psycopg://localhost/kai_exec_test",
+        runtime_mode="paper",
+        runtime_broker_provider="alpaca",
+        alpaca_api_key="paper-key",
+        alpaca_api_secret="paper-secret",
+    )
+    identity = build_position_identity(
+        settings=settings,
+        provider="alpaca",
+        exchange="US",
+        broker_account_id="alpaca-paper-account-id",
+    )
+    command = PlaceOrderRequest(
+        idempotency_key="alpaca-attribution-lock-scope",
+        provider="alpaca",
+        venue="alpaca",
+        asset_class="us_equity",
+        symbol="QQQ",
+        side="sell",
+        base_quantity=Decimal("0.125"),
+        order_type="market",
+        time_in_force="day",
+        exchange="US",
+    )
+    expected_scope = broker_orders_service._order_intent_scope_key(
+        settings=settings,
+        adapter=SimpleNamespace(provider="alpaca"),
+        command=command,
+        execution_scope=execution_scope_payload(
+            identity=identity,
+            venue="ALPACA",
+            asset_class="us_equity",
+        ),
+    )
+    scalar_calls: list[dict[str, str]] = []
+
+    class PostgresSessionStub:
+        def get_bind(self):
+            return SimpleNamespace(dialect=SimpleNamespace(name="postgresql"))
+
+        def scalar(self, _statement, params):
+            scalar_calls.append(params)
+            return True
+
+        def execute(self, _statement):
+            return None
+
+    serialization = remediation_service._acquire_legacy_attribution_apply_serialization(
+        settings=settings,
+        db=PostgresSessionStub(),
+        provider="alpaca",
+        account_scope=identity.account_scope,
+        exchange="US",
+    )
+    serialization.close()
+
+    assert scalar_calls == [{"scope": expected_scope}]
+    assert expected_scope == (
+        "broker-order-intent:alpaca:paper:"
+        f"{identity.account_scope}:ACCOUNT"
+    )
 
 
 def test_quarantine_attribution_preserves_explicit_null_position_sync() -> None:
@@ -2331,12 +2984,15 @@ def test_legacy_position_attribution_rejects_missing_broker_provider(
     engine.dispose()
 
 
-def test_legacy_position_attribution_rejects_non_kis_route_semantics(
+def test_alpaca_legacy_position_attribution_rejects_noncanonical_exchange(
     monkeypatch,
 ) -> None:
     settings, engine, session_factory, db = _session()
     settings = settings.model_copy(
-        update={"account_drawdown_recovery_scope_secret": "s" * 32}
+        update={
+            "account_drawdown_recovery_scope_secret": "s" * 32,
+            "runtime_broker_provider": "alpaca",
+        }
     )
     db.add(_legacy_position(symbol="AAPL", quantity=2, average_price="200"))
     db.commit()
@@ -2363,7 +3019,7 @@ def test_legacy_position_attribution_rejects_non_kis_route_semantics(
 
     with pytest.raises(
         PositionIdentityConflictError,
-        match="supports only KIS",
+        match="requires exchange US",
     ):
         remediation_service.analyze_legacy_position_attribution(
             settings=settings,

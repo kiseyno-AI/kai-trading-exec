@@ -395,7 +395,7 @@ def test_v4_core_confirmed_plan_is_nonclaimable_until_activation() -> None:
         buy = next(item for item in plan.items if item.side == "buy")
         assert buy.status == "core_activation_pending"
         assert buy.risk_context["_core_activation_state"]["prior_status"] == (
-            "watch_monitoring_pending"
+            "watch_sizing_pending"
         )
         job = ExecutionJob(
             id="core-activation-pending-job",
@@ -501,7 +501,7 @@ def test_v4_exact_activation_restores_buy_and_replay_is_idempotent() -> None:
         assert plan is not None
         assert plan.status == "accepted"
         buy = next(item for item in plan.items if item.side == "buy")
-        assert buy.status == "watch_monitoring_pending"
+        assert buy.status == "watch_sizing_pending"
         assert buy.risk_context["_core_activation_state"]["status"] == (
             "activated"
         )
@@ -1729,6 +1729,79 @@ def test_v4_revocation_accepts_current_live_market_buy_recall_authority(
             select(ExecutionPlanItem).order_by(ExecutionPlanItem.plan_item_index.asc())
         ).all()
         assert [item.status for item in items] == ["revoked", "revoked", "revoked"]
+    engine.dispose()
+
+
+def test_v4_revocation_contract_proof_failure_keeps_exact_plan_identity(
+    monkeypatch,
+) -> None:
+    app, engine = _build_test_app()
+    client = TestClient(app)
+    create_payload = _plan_payload(plan_id="revocation-contract-proof-plan")
+    created = client.post("/v4/execution-plans", json=create_payload)
+    assert created.status_code == 201
+    created_body = created.json()
+
+    monkeypatch.setattr(
+        core_handoff_v4,
+        "persisted_core_plan_contract_ack",
+        lambda _plan: None,
+    )
+    response = client.post(
+        "/v4/execution-plans/revocations",
+        json=_revocation_payload(
+            create_payload,
+            created_body["item_acks"],
+            reason_code="current_live_market_evidence_unavailable",
+        ),
+    )
+
+    assert response.status_code == 409
+    body = response.json()
+    assert body["reason_code"] == "persisted_v4_contract_not_proven"
+    assert body["execution_plan_id"] == created_body["execution_plan_id"]
+    assert all(
+        item["execution_plan_id"] == created_body["execution_plan_id"]
+        for item in body["item_acks"]
+    )
+    assert {
+        item["core_item_key"]: item["execution_plan_item_id"]
+        for item in body["item_acks"]
+    } == {
+        item["core_item_key"]: item["execution_plan_item_id"]
+        for item in created_body["item_acks"]
+    }
+    engine.dispose()
+
+
+def test_v4_revocation_binding_failure_keeps_exact_plan_identity() -> None:
+    app, engine = _build_test_app()
+    client = TestClient(app)
+    create_payload = _plan_payload(plan_id="revocation-binding-failure-plan")
+    created = client.post("/v4/execution-plans", json=create_payload)
+    assert created.status_code == 201
+    created_body = created.json()
+    revocation_payload = _revocation_payload(
+        create_payload,
+        created_body["item_acks"],
+        reason_code="current_live_market_evidence_unavailable",
+    )
+    revocation_payload["items"][0]["execution_plan_item_id"] = "wrong-item-id"
+
+    response = client.post(
+        "/v4/execution-plans/revocations",
+        json=revocation_payload,
+    )
+
+    assert response.status_code == 409
+    body = response.json()
+    assert body["reason_code"] == "revocation_item_binding_mismatch"
+    assert body["execution_plan_id"] == created_body["execution_plan_id"]
+    assert all(
+        item["execution_plan_id"] == created_body["execution_plan_id"]
+        for item in body["item_acks"]
+    )
+    assert body["item_acks"][0]["execution_plan_item_id"] == "wrong-item-id"
     engine.dispose()
 
 

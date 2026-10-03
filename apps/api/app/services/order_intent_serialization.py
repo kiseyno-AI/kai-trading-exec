@@ -14,6 +14,14 @@ _ORDER_SCOPE_LOCKS: dict[str, RLock] = {}
 _ORDER_SCOPE_LOCKS_GUARD = Lock()
 
 
+def alpaca_pre_auth_order_intent_account_scope(*, runtime_mode: str) -> str:
+    """Return the provider-wide scope held before Alpaca account authentication."""
+    material = (
+        f"alpaca\0{str(runtime_mode).strip().lower()}\0pre-auth-provider-scope"
+    )
+    return sha256(material.encode("utf-8")).hexdigest()[:24]
+
+
 def order_intent_scope_key_for_account(
     *,
     provider: str,

@@ -29,9 +29,8 @@ from app.services.broker_auth import build_broker_adapter
 from app.services.monitoring_price_source import build_default_monitoring_price_source
 from app.services.runtime import RuntimeMetadata
 from app.services.runtime_controls import (
-    ControlCommand,
     ensure_runtime_control_state,
-    pause_runtime,
+    recover_legacy_lifespan_shutdown_pause,
 )
 from app.services.schema import check_runtime_schema, execution_position_readiness
 
@@ -165,11 +164,15 @@ def create_app(
             }
         try:
             if automated_runtime_requested and schema_ready:
-                if app_settings.autonomous_runtime_enabled:
-                    # Bootstrap the fail-closed control row before any background
-                    # worker can race an operator request for the same singleton.
-                    with db_session_factory() as db:
-                        ensure_runtime_control_state(settings=app_settings, db=db)
+                # Repair only the exact legacy pause written by the retired
+                # lifespan-shutdown path, then bootstrap the singleton before
+                # any background worker can race an operator request.
+                with db_session_factory() as db:
+                    recover_legacy_lifespan_shutdown_pause(
+                        settings=app_settings,
+                        db=db,
+                    )
+                    ensure_runtime_control_state(settings=app_settings, db=db)
                 await autonomous_runtime.start()
                 await alpaca_crypto_runtime.start()
                 await alpaca_us_equity_runtime.start()
@@ -182,8 +185,6 @@ def create_app(
             )
             if automated_runtime_requested and schema_ready:
                 await _shutdown_runtime_coordinators(
-                    settings=app_settings,
-                    session_factory=db_session_factory,
                     coordinators=coordinators,
                 )
             else:
@@ -341,35 +342,11 @@ async def _stop_runtime_coordinators(
         raise ExceptionGroup("runtime coordinator shutdown failed", shutdown_errors)
 
 
-async def _pause_runtime_for_shutdown(
-    *,
-    settings: Settings,
-    session_factory: sessionmaker[Session],
-) -> None:
-    """Serialize a durable shutdown pause against the final broker boundary."""
-
-    def pause() -> None:
-        with session_factory() as db:
-            pause_runtime(
-                settings=settings,
-                db=db,
-                command=ControlCommand(
-                    actor=settings.service_name,
-                    source="lifespan_shutdown",
-                    reason="service lifespan shutdown started",
-                ),
-            )
-
-    await asyncio.to_thread(pause)
-
-
 async def _shutdown_runtime_coordinators(
     *,
-    settings: Settings,
-    session_factory: sessionmaker[Session],
     coordinators: tuple[tuple[str, object], ...],
 ) -> None:
-    """Close broker admission, persist the pause, and drain every coordinator."""
+    """Close broker admission and drain every coordinator without changing operator state."""
 
     admission_error: BaseException | None = None
     try:
@@ -381,45 +358,16 @@ async def _shutdown_runtime_coordinators(
             exc_info=(type(exc), exc, exc.__traceback__),
         )
 
-    # In-memory SQLite uses one connection for every thread. Letting the
-    # shutdown pause overlap an in-flight worker transaction can make either
-    # session roll back the other's work. The database cannot survive process
-    # exit anyway, so drain after closing admission before writing its pause.
-    drain_before_pause = _shutdown_pause_requires_coordinator_drain(session_factory)
-    stop_cancellation: asyncio.CancelledError | None = None
-    stop_error: BaseException | None = None
-    if drain_before_pause:
-        stop_cancellation, stop_error = await _complete_shutdown_step(
-            _stop_runtime_coordinators(coordinators)
-        )
-
-    pause_cancellation, pause_error = await _complete_shutdown_step(
-        _pause_runtime_for_shutdown(
-            settings=settings,
-            session_factory=session_factory,
-        )
+    stop_cancellation, stop_error = await _complete_shutdown_step(
+        _stop_runtime_coordinators(coordinators)
     )
-    if pause_error is not None:
-        LOGGER.error(
-            "runtime_shutdown_pause_failed",
-            exc_info=(
-                type(pause_error),
-                pause_error,
-                pause_error.__traceback__,
-            ),
-        )
-
-    if not drain_before_pause:
-        stop_cancellation, stop_error = await _complete_shutdown_step(
-            _stop_runtime_coordinators(coordinators)
-        )
 
     failures = [
         failure
-        for failure in (admission_error, pause_error, stop_error)
+        for failure in (admission_error, stop_error)
         if failure is not None
     ]
-    cancellation = pause_cancellation or stop_cancellation
+    cancellation = stop_cancellation
     if not failures and cancellation is None:
         return
     non_cancellation_failures = [
@@ -433,17 +381,6 @@ async def _shutdown_runtime_coordinators(
             )
         raise cancellation
     raise ExceptionGroup("runtime shutdown failed", non_cancellation_failures)
-
-
-def _shutdown_pause_requires_coordinator_drain(
-    session_factory: sessionmaker[Session],
-) -> bool:
-    """Avoid overlapping transactions on a single shared SQLite connection."""
-
-    factory_options = getattr(session_factory, "kw", None)
-    bind = factory_options.get("bind") if isinstance(factory_options, dict) else None
-    database = getattr(getattr(bind, "url", None), "database", None)
-    return database == ":memory:"
 
 
 def _begin_runtime_coordinator_shutdown(

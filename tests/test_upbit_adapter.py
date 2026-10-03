@@ -221,6 +221,23 @@ def test_kill_switch_blocks_resume_and_direct_order_without_broker_action() -> N
             "price_precision": 0,
         },
     )
+    sell_order = client.post(
+        "/orders",
+        json={
+            "idempotency_key": "upbit-kill-switch-direct-sell-1",
+            "provider": "upbit",
+            "asset_class": "crypto",
+            "venue": "upbit",
+            "symbol": "KRW-BTC",
+            "side": "sell",
+            "base_quantity": "0.001",
+            "order_type": "market",
+            "time_in_force": "day",
+            "exchange": "UPBIT",
+            "quantity_precision": 8,
+            "price_precision": 0,
+        },
+    )
 
     assert kill.status_code == 200
     assert kill.json()["safety"]["kill_switch_enabled"] is True
@@ -228,6 +245,8 @@ def test_kill_switch_blocks_resume_and_direct_order_without_broker_action() -> N
     assert resume.json()["outcome"] == "rejected"
     assert order.status_code == 409
     assert order.json()["block_reason"] == "kill_switch"
+    assert sell_order.status_code == 409
+    assert sell_order.json()["block_reason"] == "kill_switch"
     with create_session_factory(engine)() as session:
         assert session.query(BrokerOrder).count() == 0
         assert session.query(BrokerOrderEvent).count() == 0
@@ -654,7 +673,7 @@ def test_crypto_paper_position_preserves_weighted_average_cost() -> None:
         assert position.average_price == Decimal("15000.0000")
 
 
-def test_crypto_paper_dispatch_blocked_by_pause() -> None:
+def test_crypto_paper_buy_dispatch_is_entry_blocked_by_pause() -> None:
     app, _engine = build_test_app(
         Settings(
             database_url="sqlite:///:memory:",
@@ -695,6 +714,16 @@ def test_crypto_paper_dispatch_blocked_by_pause() -> None:
     payload = dispatch_response.json()
     assert payload["blocked"] is True
     assert payload["block_reason"] == "paused"
+    assert payload["safety"]["automated_order_submission_allowed"] is True
+    assert payload["safety"]["automated_buy_submission_allowed"] is False
+    assert payload["safety"]["automated_buy_submission_block_reason"] == "paused"
+    assert payload["due_job_count"] == 1
+    assert payload["blocked_buy_job_count"] == 1
+    assert payload["jobs"][0]["status"] == "queued"
+    assert payload["jobs"][0]["attempts"] == 0
+    assert payload["jobs"][0]["locked_at"] is None
+    assert payload["jobs"][0]["last_error"] is None
+
     assert client.get("/orders").json() == []
 
 

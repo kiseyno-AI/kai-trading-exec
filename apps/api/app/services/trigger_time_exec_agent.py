@@ -59,6 +59,11 @@ from app.services.json_compaction import compact_json_object, compact_json_paylo
 from app.services.trade_outcome_feedback import load_latest_trade_outcome_feedback_snippet
 from app.services.position_identity import PositionIdentity, build_position_identity
 from app.services.fifo_inventory import fifo_route_scope_from_order
+from app.services.runtime_transitions import (
+    ACTIVE_SELL_MONITORING_STATUSES,
+    ACTIVE_WATCH_MONITORING_STATUSES,
+    AGENT_ACTIVE_MONITORING_STATUSES,
+)
 
 TRIGGER_TIME_EXEC_AGENT_VERSION = "trigger-time-exec-agent-v1"
 TRIGGER_TIME_REASON_MAX_LENGTH = 1000
@@ -74,12 +79,9 @@ _KIS_INTRADAY_ENDPOINT = (
     "/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice"
 )
 _KIS_INTRADAY_TR_ID = "FHKST03010200"
-AGENT_ACTIVE_STATUSES = frozenset(
-    {
-        AGENT_PENDING_STATUS,
-        AGENT_DELAY_STATUS,
-        AGENT_APPROVED_PENDING_SUBMIT_STATUS,
-    }
+AGENT_ACTIVE_STATUSES = AGENT_ACTIVE_MONITORING_STATUSES
+ACTIVE_PEER_MONITORING_STATUSES = (
+    ACTIVE_SELL_MONITORING_STATUSES | ACTIVE_WATCH_MONITORING_STATUSES
 )
 
 
@@ -734,8 +736,19 @@ def _signal_context(*, item: ExecutionPlanItem, side: Literal["buy", "sell"]) ->
         "risks": risk_context.get("decision_risks") or risk_context.get("risk_flags"),
         "decider_input_hash": _payload_hash_or_none(risk_context.get("decider_input")),
         "decider_output_hash": _payload_hash_or_none(risk_context.get("decider_output")),
-        "decider_handoff_context_hash": _payload_hash_or_none(risk_context.get("decider_handoff_context")),
+        "decider_handoff_context_hash": _decider_handoff_context_hash(risk_context),
     }
+
+
+def _decider_handoff_context_hash(risk_context: dict[str, object]) -> str | None:
+    supplied_digest = risk_context.get("decider_handoff_context_digest")
+    if (
+        isinstance(supplied_digest, str)
+        and len(supplied_digest) == 64
+        and all(character in "0123456789abcdef" for character in supplied_digest)
+    ):
+        return supplied_digest
+    return _payload_hash_or_none(risk_context.get("decider_handoff_context"))
 
 
 def _payload_hash_or_none(value: object) -> str | None:
@@ -1477,18 +1490,6 @@ def _open_order_payload(order: BrokerAccountOpenOrder) -> dict[str, object]:
 
 
 def _peer_context(*, settings: Settings, db: Session, item: ExecutionPlanItem) -> dict[str, object]:
-    active_statuses = (
-        "watch_monitoring_pending",
-        "watch_monitoring_active",
-        "target_sell_monitoring",
-        "stop_sell_monitoring",
-        AGENT_PENDING_STATUS,
-        AGENT_DELAY_STATUS,
-        AGENT_APPROVED_PENDING_SUBMIT_STATUS,
-        "watch_buy_triggered_pending_dispatch",
-        "target_sell_triggered_pending_dispatch",
-        "stop_sell_triggered_pending_dispatch",
-    )
     def scoped_route(candidate: ExecutionPlanItem) -> tuple[str, str] | None:
         provider = str(candidate.provider or "kis").strip().lower()
         if provider in {"korea-investment", "korea_investment"}:
@@ -1516,7 +1517,7 @@ def _peer_context(*, settings: Settings, db: Session, item: ExecutionPlanItem) -
         .where(
             ExecutionPlan.mode == settings.runtime_mode,
             ExecutionPlanItem.id != item.id,
-            ExecutionPlanItem.status.in_(active_statuses),
+            ExecutionPlanItem.status.in_(tuple(ACTIVE_PEER_MONITORING_STATUSES)),
         )
         .order_by(ExecutionPlanItem.updated_at.desc(), ExecutionPlanItem.id.asc())
     ).all()

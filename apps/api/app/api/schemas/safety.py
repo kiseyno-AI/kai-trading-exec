@@ -5,3 +5,7 @@ class SafetyControlRequest(BaseModel):
     actor: str | None = Field(default=None, max_length=128)
     source: str = Field(default="operator", min_length=1, max_length=64)
     reason: str | None = Field(default=None, max_length=500)
+
+
+class KillSwitchResetRequest(SafetyControlRequest):
+    expected_current_event_id: str = Field(min_length=1, max_length=36)

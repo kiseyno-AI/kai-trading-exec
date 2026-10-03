@@ -227,6 +227,38 @@ def _bind_plan_item_to_app_account(app, item: ExecutionPlanItem) -> None:
     item.quantity_policy = quantity_policy
 
 
+def test_signal_context_prefers_compact_handoff_digest_and_hashes_legacy_payload() -> None:
+    supplied_digest = "ab" * 32
+    legacy_handoff = {"nested": {"candidate": "005930", "score": 8}}
+    item = ExecutionPlanItem(
+        id="trigger-context-digest-item",
+        plan_item_index=0,
+        symbol="005930",
+        side="buy",
+        intent="intraday_watch_buy",
+        risk_context={
+            "decider_handoff_context_digest": supplied_digest,
+        },
+        quantity_policy={"kind": "shares", "quantity": 1},
+    )
+
+    compact_context = trigger_time_exec_agent._signal_context(item=item, side="buy")
+
+    assert compact_context["decider_handoff_context_hash"] == supplied_digest
+
+    item.risk_context = {"decider_handoff_context": legacy_handoff}
+    legacy_context = trigger_time_exec_agent._signal_context(item=item, side="buy")
+
+    assert legacy_context["decider_handoff_context_hash"] == json_payload_hash(
+        legacy_handoff
+    )
+
+    item.risk_context = {"decider_handoff_context_digest": supplied_digest.upper()}
+    invalid_context = trigger_time_exec_agent._signal_context(item=item, side="buy")
+
+    assert invalid_context["decider_handoff_context_hash"] is None
+
+
 def test_peer_context_only_contains_current_account_and_exchange() -> None:
     settings = Settings(
         database_url="sqlite:///:memory:",
@@ -393,7 +425,7 @@ def _create_intraday_watch_buy(
         "intent": "intraday_watch_buy",
         "quantity_policy": quantity_policy
         or {
-            "type": "exec_agent_sized",
+            "type": "trigger_time_exec_agent_sized",
             "budget_krw": "0",
             "max_safe_notional_krw": max_safe_notional_krw,
         },
@@ -1724,7 +1756,7 @@ def test_trigger_time_buy_effective_risk_stop_updates_stop_monitor(
                     "side": "buy",
                     "intent": "intraday_watch_buy",
                     "quantity_policy": {
-                        "type": "exec_agent_sized",
+                        "type": "trigger_time_exec_agent_sized",
                         "budget_krw": "0",
                         "max_safe_notional_krw": "300000",
                     },
@@ -2127,6 +2159,156 @@ def test_trigger_time_sell_agent_can_adjust_quantity_limit_and_stop(
     engine.dispose()
 
 
+@pytest.mark.parametrize(
+    ("agent_status", "stale_agent_context", "expected_recovery_reason"),
+    [
+        (
+            "triggered_pending_agent",
+            {
+                "last_monitoring_event": {
+                    "event": "trigger_time_exec_agent_pending",
+                    "recorded_at": "2026-06-05T00:28:00Z",
+                },
+            },
+            "trigger_time_exec_agent_pending_timeout",
+        ),
+        (
+            "agent_delay",
+            {
+                "last_monitoring_event": {
+                    "event": "trigger_time_exec_agent_delay",
+                    "recorded_at": "2026-06-05T00:28:00Z",
+                },
+                "last_trigger_time_exec_agent_interaction": {
+                    "recorded_at": "2026-06-05T00:28:00Z",
+                    "decision": {
+                        "decision": "delay",
+                        "valid_until": "2026-06-05T00:29:00Z",
+                    },
+                },
+            },
+            "trigger_time_exec_agent_delay_expired",
+        ),
+        (
+            "agent_approved_pending_submit",
+            {
+                "last_monitoring_event": {
+                    "event": "trigger_time_exec_agent_approved",
+                    "recorded_at": "2026-06-05T00:28:00Z",
+                },
+                "last_trigger_time_exec_agent_interaction": {
+                    "recorded_at": "2026-06-05T00:28:00Z",
+                    "decision": {"decision": "execute_now"},
+                },
+            },
+            "trigger_time_exec_agent_approved_pending_submit_timeout",
+        ),
+    ],
+)
+def test_expired_agent_active_target_sell_is_recovered_and_reapproved(
+    monkeypatch: pytest.MonkeyPatch,
+    agent_status: str,
+    stale_agent_context: dict[str, object],
+    expected_recovery_reason: str,
+) -> None:
+    app, engine, client, broker_adapter, captured = _build_trigger_agent_app(
+        monkeypatch=monkeypatch,
+        agent_responses=[
+            {
+                "decision": "execute_now",
+                "side": "sell",
+                "quantity": 2,
+                "reason": "fresh agent pass approves the recovered target",
+                "risk_notes": ["recovered stale durable state"],
+                "confidence": "0.80",
+                "context_staleness_ok": True,
+            }
+        ],
+        settings_overrides={"exec_agent_trigger_time_timeout_seconds": 90},
+        account_snapshot_observed_at=datetime(2026, 6, 5, 0, 30, tzinfo=UTC),
+    )
+    plan_response = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": f"plan-recover-{agent_status}",
+            "source": "test-fixture",
+            "items": [
+                {
+                    "symbol": "005930",
+                    "side": "sell",
+                    "intent": "target_sell",
+                    "quantity_policy": {"kind": "shares", "quantity": 5},
+                    "trigger_price": "125000.00",
+                    "time_in_force": "day",
+                    "risk_context": {"exchange": "KRX"},
+                },
+                {
+                    "symbol": "005930",
+                    "side": "sell",
+                    "intent": "stop_sell",
+                    "quantity_policy": {"kind": "shares", "quantity": 5},
+                    "trigger_price": "118000.00",
+                    "time_in_force": "day",
+                    "risk_context": {"exchange": "KRX"},
+                },
+            ],
+        },
+    )
+    assert plan_response.status_code == 201
+    target_item_id = plan_response.json()["persisted_execution_item_ids"][0]
+    with app.state.db_session_factory() as session:
+        target_item = session.get(ExecutionPlanItem, target_item_id)
+        assert target_item is not None
+        target_item.status = agent_status
+        target_item.risk_context = {
+            **dict(target_item.risk_context or {}),
+            **stale_agent_context,
+        }
+        session.add(
+            _scoped_execution_position(
+                app,
+                mode="paper",
+                symbol="005930",
+                quantity=5,
+                average_price=Decimal("120000.0000"),
+                updated_from="reconciliation",
+                last_reconciled_at=datetime(2026, 6, 5, 0, 29, tzinfo=UTC),
+                raw_payload={"source": "broker"},
+            )
+        )
+        session.commit()
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "recover expired trigger-time agent state",
+            "observed_at": "2026-06-05T00:30:00Z",
+            "prices": [{"symbol": "005930", "price": "125100.00"}],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["submitted_order_count"] == 1, json.dumps(response.json())
+    assert len(captured) == 1
+    assert len(broker_adapter.order_calls) == 1
+    assert broker_adapter.order_calls[0].execution_plan_item_id == target_item_id
+    with app.state.db_session_factory() as session:
+        target_item = session.get(ExecutionPlanItem, target_item_id)
+        assert target_item is not None
+        assert target_item.status == "broker_order_submitted"
+        recovery_events = [
+            event
+            for event in target_item.risk_context["monitoring_events"]
+            if event.get("reason") == expected_recovery_reason
+        ]
+        assert recovery_events[-1]["previous_status"] == agent_status
+        assert recovery_events[-1]["reason"] == expected_recovery_reason
+
+    engine.dispose()
+
+
 def test_trigger_time_partial_target_sell_cannot_loosen_existing_protective_stop(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2451,6 +2633,7 @@ def test_runtime_status_exposes_trigger_time_agent_state_counts(
                     ("000003", "agent_delay"),
                     ("000004", "agent_rejected"),
                     ("000005", "watch_buy_submitted"),
+                    ("000006", "watch_sizing_pending"),
                 )
             ],
         )
@@ -2465,6 +2648,7 @@ def test_runtime_status_exposes_trigger_time_agent_state_counts(
     counts = response.json()["liveness"]["monitoring"]["agent_decisions"]
     assert counts == {
         "watching": 1,
+        "pending_pre_monitor_sizing": 1,
         "pending_agent_decision": 1,
         "agent_delayed": 1,
         "agent_rejected": 1,

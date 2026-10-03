@@ -19,20 +19,19 @@ database.
    read-only and never prints the contract body. Contract location precedence is
    explicit `--openclaw-home`, `OPENCLAW_STATE_DIR`, then `~/.openclaw`.
 5. Start the API with `start-api-no-migrate.sh`. Confirm `/health` reports the
-   expected single Alembic head (`202609110003` for this release), all schema
+   expected single Alembic head (`202610020002` for this release), all schema
    invariants, and a ready startup gate.
 6. Start dispatchers and monitoring only after health is ready. Keep the runtime
    paused until account scope, open orders, positions, and risk fences have been
    reviewed.
 
-When an automated runtime was requested and the schema startup gate is ready, a
-clean service shutdown writes a durable `lifespan_shutdown` pause before the
-workers drain. Other startup modes do not rely on that pause, so the explicit
-pre-deploy pause in step 1 remains mandatory. A recorded shutdown pause is
-retained across restart. Review the same evidence above and issue an explicit
-operator resume only when existing risk-off, kill-switch, and Core buy-authority
-fences also permit it; deployment must never infer that restart means permission
-to buy.
+A clean service shutdown closes the process-local broker admission fence before
+workers drain, but it does not rewrite durable operator controls. Startup repairs
+only a legacy pause whose linked applied event exactly matches the retired
+`lifespan_shutdown` transition. Operator pauses and kill switches remain in
+force. Review the same evidence above and issue an explicit operator resume only
+when existing risk-off, kill-switch, and Core buy-authority fences also permit
+it; deployment must never infer that restart means permission to buy.
 
 `start-api.sh` combines migration and startup and is suitable only when the
 target database is already drained and that process is the sole migration owner.
@@ -58,10 +57,15 @@ response cannot mint its own authorization evidence.
 
 PostgreSQL revisions `202609080002`, `202609090001`, `202609090002`,
 `202609090003`, `202609090004`, `202609110001`, `202609110002`, and
-`202609110003` require the drain above. They add execution-job uniqueness,
-shared KIS token generations, exact FIFO/position route scope, legacy JSON
-redaction, monitoring/crypto account scope, and scoped Core buy-authority state.
-Some revisions take exclusive table locks.
+`202609110003`, plus `202610020001` and `202610020002` require the drain above.
+They add execution-job uniqueness, shared KIS token generations, exact
+FIFO/position route scope, legacy JSON redaction, monitoring/crypto account
+scope, and scoped Core buy-authority state. The latest revision removes the
+redundant persisted `automation_enabled` value; the API compatibility field is
+derived from pause and kill-switch state. The latest data revision reclassifies
+unsized Core signal/short-term watches as sizing-pending so they cannot enter
+monitoring before a verified quantity exists. Some revisions take exclusive
+table locks.
 
 Legacy rows whose owner cannot be proved remain null-scoped and quarantined.
 The partial unique indexes intentionally preserve only the legacy key for those
@@ -124,8 +128,9 @@ uncoordinated token, or manually replay the failed broker request.
 ## Legacy position attribution
 
 Use this only for non-flat `execution_positions` blocked at startup because their
-provider/account/exchange attribution is null. It is KIS-only and performs no
-order submission, amendment, or cancellation.
+provider/account/exchange attribution is null. Supported paths are KIS exact
+exchange attribution and the isolated Alpaca paper `US` equity route. Neither
+path submits, amends, or cancels orders.
 
 Keep every writer drained and repeat the following separately for each actual
 exchange. Never use `ALL`, guess an exchange, or copy a fingerprint between
@@ -156,10 +161,31 @@ allowed, but the runtime remains blocked while even one non-flat unscoped row
 remains. Apply re-fetches complete broker holdings, compares the fingerprint in
 constant time, locks every target row, rechecks its digest/quantity/average price,
 and rolls back all changes if evidence drifted or an identity collision exists.
-Apply also shares the KIS account/currency process lock (and the file lock for
-file-backed SQLite) with order admission. SQLite reserves the database writer
-before the final collision recheck; PostgreSQL uses a non-waiting exact account
-advisory/table lock for the same boundary.
+Apply also shares the order-admission lock namespace. KIS uses its
+account/currency scope. Alpaca uses the provider-wide pre-auth `ACCOUNT` scope
+for the local and file locks, then the authenticated account's exact `ACCOUNT`
+scope for the PostgreSQL transaction lock. File-backed SQLite takes the matching
+file lock before reserving the database writer; PostgreSQL also takes a
+non-waiting table lock for the final collision boundary.
+
+For an Alpaca paper database, load the same paper environment used by the 8011
+service and use the canonical `US` route:
+
+```bash
+export KAI_EXEC_RUNTIME_BROKER_PROVIDER=alpaca
+.venv/bin/python scripts/refresh_execution_position_truth.py \
+  --runtime-mode paper \
+  --legacy-attribution-exchange US
+```
+
+This path is rejected outside paper mode or when
+`KAI_EXEC_RUNTIME_BROKER_PROVIDER` is not `alpaca`. A row receives an approval
+fingerprint only when a current, complete, broker-authenticated Alpaca
+US-equity snapshot proves the exact account, symbol, positive fractional
+`base_quantity`, and average price. Apply still requires each dry-run position
+ID and fingerprint separately, re-fetches broker truth under the same locks,
+and rolls back on any drift. `NASD`/`NYSE`/`AMEX` must not be guessed for Alpaca;
+its execution and reconciliation route is exactly `US`.
 
 `OTCB` and `OOTC` are attribution-only exceptions, not trading exchanges. In
 live mode their dry-run uses the fully paginated KIS all-US balance endpoint

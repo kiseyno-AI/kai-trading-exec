@@ -32,6 +32,7 @@ from app.services.broker_auth import ensure_authenticated_broker_session
 from app.services.broker_order_state import ACTIONABLE_OPEN_ORDER_STATUSES
 from app.services.fifo_inventory import fifo_route_scope_from_order
 from app.services.order_intent_serialization import (
+    alpaca_pre_auth_order_intent_account_scope,
     order_intent_file_lock,
     order_intent_process_lock,
     order_intent_scope_key_for_account,
@@ -53,10 +54,11 @@ from app.services.runtime import position_truth_freshness_payload
 POSITION_CANDIDATE_TYPE = "stale_position_truth"
 LEGACY_POSITION_ATTRIBUTION_CANDIDATE_TYPE = "legacy_position_attribution"
 SUPPORTED_POSITION_EXCHANGES = {"KRX", "NASD", "NYSE", "AMEX"}
+ALPACA_PAPER_LEGACY_ATTRIBUTION_EXCHANGES = frozenset({"US"})
 LEGACY_QUARANTINE_ATTRIBUTION_EXCHANGES = KIS_US_POSITION_QUARANTINE_EXCHANGES
 LEGACY_QUARANTINE_ROUTE_DISPOSITION = "account_attributed_quarantine"
 LEGACY_ATTRIBUTION_SAFETY_POLICY_VERSION = (
-    "legacy-position-attribution-safety-v3"
+    "legacy-position-attribution-safety-v4"
 )
 POSITION_EVIDENCE_ORDER_STATUSES = (*ACTIONABLE_OPEN_ORDER_STATUSES, "filled")
 
@@ -96,9 +98,28 @@ def analyze_legacy_position_attribution(
         raise PositionIdentityConflictError(
             "legacy position attribution broker provider is unavailable"
         )
-    if provider != "kis":
+    if provider == "alpaca":
+        if settings.runtime_mode != "paper":
+            raise PositionIdentityConflictError(
+                "Alpaca legacy position attribution supports only paper mode"
+            )
+        if settings.runtime_broker_provider != "alpaca":
+            raise PositionIdentityConflictError(
+                "Alpaca legacy position attribution requires runtime broker "
+                "provider alpaca"
+            )
+        if normalized_exchange not in ALPACA_PAPER_LEGACY_ATTRIBUTION_EXCHANGES:
+            raise PositionIdentityConflictError(
+                "Alpaca paper legacy position attribution requires exchange US"
+            )
+    elif provider != "kis":
         raise PositionIdentityConflictError(
-            "legacy position attribution supports only KIS route semantics"
+            "legacy position attribution supports only KIS or Alpaca paper "
+            "route semantics"
+        )
+    elif normalized_exchange in ALPACA_PAPER_LEGACY_ATTRIBUTION_EXCHANGES:
+        raise PositionIdentityConflictError(
+            "KIS legacy position attribution does not support exchange US"
         )
     legacy_positions = db.scalars(
         select(ExecutionPosition)
@@ -149,7 +170,11 @@ def analyze_legacy_position_attribution(
             symbols=requested_symbols,
             exchange=normalized_exchange,
         )
-        query_scope = f"kis_exact_exchange_account_snapshot:{normalized_exchange}"
+        query_scope = (
+            f"alpaca_exact_us_equity_account_snapshot:{normalized_exchange}"
+            if provider == "alpaca"
+            else f"kis_exact_exchange_account_snapshot:{normalized_exchange}"
+        )
     _require_current_attribution_snapshot(
         settings=settings,
         evaluated_at=evaluated_at,
@@ -164,7 +189,12 @@ def analyze_legacy_position_attribution(
             response_payload={"diagnostics": snapshot.diagnostics},
             observed_at=snapshot.observed_at,
         )
-    if not quarantine_attribution:
+    if provider == "alpaca":
+        _require_alpaca_paper_us_equity_snapshot(
+            settings=settings,
+            snapshot=snapshot,
+        )
+    elif not quarantine_attribution:
         snapshot_exchange = _reported_attribution_exchange(snapshot.payload)
         if snapshot_exchange is None:
             raise PositionIdentityConflictError(
@@ -212,6 +242,7 @@ def analyze_legacy_position_attribution(
     )
     safety_invariants = _legacy_attribution_safety_invariants(
         settings=settings,
+        provider=provider,
         quarantine_attribution=quarantine_attribution,
     )
     items = [
@@ -490,13 +521,22 @@ def _acquire_legacy_attribution_apply_serialization(
     account_scope: str,
     exchange: str,
 ) -> ExitStack:
-    market = "KRW" if exchange == "KRX" else "USD"
     normalized_provider = str(provider).strip().lower()
-    pre_auth_account_scope = (
-        recovery_account_fingerprint(settings)
-        if normalized_provider == "kis"
-        else str(account_scope).strip().lower()
+    market = (
+        "ACCOUNT"
+        if normalized_provider == "alpaca"
+        else "KRW"
+        if exchange == "KRX"
+        else "USD"
     )
+    if normalized_provider == "kis":
+        pre_auth_account_scope = recovery_account_fingerprint(settings)
+    elif normalized_provider == "alpaca":
+        pre_auth_account_scope = alpaca_pre_auth_order_intent_account_scope(
+            runtime_mode=settings.runtime_mode,
+        )
+    else:
+        pre_auth_account_scope = str(account_scope).strip().lower()
     local_scope = order_intent_scope_key_for_account(
         provider=normalized_provider,
         runtime_mode=settings.runtime_mode,
@@ -687,12 +727,32 @@ def _validated_legacy_attribution_approvals(
 def _supported_attribution_exchange(exchange: str) -> str:
     normalized = str(exchange or "").strip().upper()
     if normalized not in (
-        SUPPORTED_POSITION_EXCHANGES | LEGACY_QUARANTINE_ATTRIBUTION_EXCHANGES
+        SUPPORTED_POSITION_EXCHANGES
+        | ALPACA_PAPER_LEGACY_ATTRIBUTION_EXCHANGES
+        | LEGACY_QUARANTINE_ATTRIBUTION_EXCHANGES
     ):
         raise ValueError(
             "legacy position attribution requires a supported exact exchange"
         )
     return normalized
+
+
+def _require_alpaca_paper_us_equity_snapshot(
+    *,
+    settings: Settings,
+    snapshot: object,
+) -> None:
+    payload = getattr(snapshot, "payload", None)
+    if (
+        not isinstance(payload, dict)
+        or payload.get("provider") != "alpaca"
+        or payload.get("mode") != settings.runtime_mode
+        or payload.get("asset_class") != "us_equity"
+        or not str(getattr(snapshot, "broker_account_id", "") or "").strip()
+    ):
+        raise PositionIdentityConflictError(
+            "Alpaca paper US-equity snapshot proof is unavailable"
+        )
 
 
 def _require_legacy_quarantine_snapshot(snapshot: object) -> str:
@@ -803,6 +863,11 @@ def _legacy_attribution_item(
     )
     if not isinstance(position.raw_payload, dict):
         reason = "legacy_payload_invalid"
+    elif (
+        provider == "alpaca"
+        and not _alpaca_paper_legacy_position_provenance_is_valid(position)
+    ):
+        reason = "legacy_route_proof_missing"
     elif str(position.symbol or "").strip() != _normalized_position_symbol(
         position.symbol
     ):
@@ -816,15 +881,28 @@ def _legacy_attribution_item(
         reason = "stored_route_identity_present"
     elif scoped_route_exists:
         reason = "scoped_route_symbol_collision"
-    elif position.base_quantity is not None:
+    elif not _legacy_quantity_representation_is_supported(
+        position=position,
+        provider=provider,
+        exchange=exchange,
+    ):
         reason = "unsupported_quantity_representation"
     elif legacy_quantity <= 0:
         reason = "legacy_position_not_positive"
     elif holding is None:
         reason = "broker_holding_missing"
-    elif exchange != "KRX" and holding_exchange is None:
+    elif (
+        provider == "alpaca"
+        and not _alpaca_us_equity_holding_provenance_is_valid(holding)
+    ):
+        reason = "broker_holding_route_proof_missing"
+    elif provider == "kis" and exchange != "KRX" and holding_exchange is None:
         reason = "broker_holding_exchange_missing"
-    elif holding_exchange is not None and holding_exchange != exchange:
+    elif (
+        provider == "kis"
+        and holding_exchange is not None
+        and holding_exchange != exchange
+    ):
         reason = "broker_holding_exchange_mismatch"
     elif broker_quantity != legacy_quantity:
         reason = "quantity_mismatch"
@@ -918,6 +996,7 @@ def _legacy_attribution_item(
 def _legacy_attribution_safety_invariants(
     *,
     settings: Settings,
+    provider: str,
     quarantine_attribution: bool,
 ) -> dict[str, object]:
     return {
@@ -928,6 +1007,8 @@ def _legacy_attribution_safety_invariants(
         ),
         "broker_actions_allowed": False,
         "collision_scope": "mode_provider_account_symbol_any_exchange",
+        "provider": provider,
+        "fractional_quantity_allowed": provider == "alpaca",
         "manual_review_required": quarantine_attribution,
         "monitoring_allowed": not quarantine_attribution,
         "route_disposition": (
@@ -936,6 +1017,43 @@ def _legacy_attribution_safety_invariants(
             else "account_attributed_supported_route"
         ),
     }
+
+
+def _legacy_quantity_representation_is_supported(
+    *,
+    position: ExecutionPosition,
+    provider: str,
+    exchange: str,
+) -> bool:
+    if provider != "alpaca":
+        return position.base_quantity is None
+    if exchange != "US" or position.quantity != 0 or position.base_quantity is None:
+        return False
+    base_quantity = Decimal(position.base_quantity)
+    return base_quantity.is_finite() and base_quantity > 0
+
+
+def _alpaca_us_equity_holding_provenance_is_valid(
+    holding: BrokerAccountHolding,
+) -> bool:
+    payload = holding.payload if isinstance(holding.payload, dict) else {}
+    return (
+        payload.get("provider") == "alpaca"
+        and payload.get("asset_class") == "us_equity"
+        and holding.quantity == 0
+        and payload.get("base_quantity") is not None
+    )
+
+
+def _alpaca_paper_legacy_position_provenance_is_valid(
+    position: ExecutionPosition,
+) -> bool:
+    payload = position.raw_payload if isinstance(position.raw_payload, dict) else {}
+    return (
+        payload.get("provider") == "alpaca"
+        and payload.get("mode") == "paper"
+        and payload.get("asset_class") == "us_equity"
+    )
 
 
 def legacy_attribution_account_scope_source(
@@ -982,6 +1100,21 @@ def _legacy_snapshot_proof_digest(
         "source": str(getattr(snapshot, "source", "") or ""),
         "query_scope": query_scope,
         "requested_exchange": exchange,
+        "provider": (
+            getattr(snapshot, "payload", {}).get("provider")
+            if isinstance(getattr(snapshot, "payload", None), dict)
+            else None
+        ),
+        "runtime_mode": (
+            getattr(snapshot, "payload", {}).get("mode")
+            if isinstance(getattr(snapshot, "payload", None), dict)
+            else None
+        ),
+        "asset_class": (
+            getattr(snapshot, "payload", {}).get("asset_class")
+            if isinstance(getattr(snapshot, "payload", None), dict)
+            else None
+        ),
         "reported_exchange": _reported_attribution_exchange(
             getattr(snapshot, "payload", None)
         ),

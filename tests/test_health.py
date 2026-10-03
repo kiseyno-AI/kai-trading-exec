@@ -1,7 +1,7 @@
 import asyncio
 import threading
 import time
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -55,15 +55,27 @@ from app.services.position_identity import (
 )
 from app.services.autonomous_runtime import MonitoringRuntimeSnapshot, _is_regular_market_session, _merge_symbol_priority
 from app.services.monitoring import (
+    NON_MONITORABLE_PLAN_ITEM_STATUSES,
+    PROFIT_TARGET_COVERAGE_STATUSES,
+    PROTECTIVE_STOP_COVERAGE_STATUSES,
+    _active_sibling_monitor,
+    _ensure_post_entry_stop_monitor,
+    _ensure_post_entry_target_monitor,
     _maintain_post_entry_exit_monitors,
     _load_monitored_items,
     _monitoring_item_is_configured,
     _pending_broker_order_symbols,
     _plan_item_exchange,
     _resolve_sell_quantity,
+    _update_sibling_trigger_price,
     expire_known_flat_pending_sell_monitors,
     list_autonomous_monitoring_symbols,
+    materialize_monitoring_plan_items,
     run_autonomous_monitoring_cycle,
+)
+from app.services.runtime_transitions import (
+    ACTIVE_SELL_MONITORING_STATUSES,
+    SELL_AGENT_ACTIVE_STATUSES,
 )
 
 
@@ -662,7 +674,7 @@ def test_health_degrades_when_alembic_revision_is_behind_head() -> None:
     assert runtime_schema["status"] == "missing"
     assert runtime_schema["alembic"] == {
         "status": "behind",
-        "expected_heads": ["202609110003"],
+        "expected_heads": ["202610020002"],
         "current_heads": ["202609110001"],
     }
     engine.dispose()
@@ -680,7 +692,7 @@ def test_health_degrades_when_alembic_version_table_is_missing() -> None:
     assert runtime_schema["status"] == "missing"
     assert runtime_schema["alembic"] == {
         "status": "missing",
-        "expected_heads": ["202609110003"],
+        "expected_heads": ["202610020002"],
         "current_heads": [],
     }
     engine.dispose()
@@ -755,7 +767,7 @@ def test_lifespan_keeps_automated_workers_stopped_when_schema_is_behind(
 
         with engine.begin() as connection:
             connection.exec_driver_sql(
-                "UPDATE alembic_version SET version_num = '202609110003'"
+                "UPDATE alembic_version SET version_num = '202610020002'"
             )
 
         repaired_health = client.get("/health").json()
@@ -821,7 +833,7 @@ def test_lifespan_blocks_workers_for_unattributed_non_flat_position(
             "reason": "non_flat_execution_position_scope_attribution_required",
             "blocking_row_count": 1,
             "remediation": (
-                "kis_legacy_position_attribution_dry_run_apply_then_restart"
+                "broker_legacy_position_attribution_dry_run_apply_then_restart"
             ),
         }
         startup_dependency = health["dependencies"]["automated_runtime_startup"]
@@ -832,7 +844,7 @@ def test_lifespan_blocks_workers_for_unattributed_non_flat_position(
             "runtime_schema_status": "blocked",
             "alembic_status": "ok",
             "remediation": (
-                "kis_legacy_position_attribution_dry_run_apply_then_restart"
+                "broker_legacy_position_attribution_dry_run_apply_then_restart"
             ),
             "restart_required": True,
         }
@@ -842,7 +854,7 @@ def test_lifespan_blocks_workers_for_unattributed_non_flat_position(
             "runtime_schema_status": "blocked",
             "alembic_status": "ok",
             "remediation": (
-                "kis_legacy_position_attribution_dry_run_apply_then_restart"
+                "broker_legacy_position_attribution_dry_run_apply_then_restart"
             ),
             "restart_required": True,
         }
@@ -852,17 +864,17 @@ def test_lifespan_blocks_workers_for_unattributed_non_flat_position(
             "runtime_schema_status": "blocked",
             "alembic_status": "ok",
             "remediation": (
-                "kis_legacy_position_attribution_dry_run_apply_then_restart"
+                "broker_legacy_position_attribution_dry_run_apply_then_restart"
             ),
             "restart_required": True,
         }
         assert runtime_status["safety"]["readiness_reason"] == (
             "non_flat_execution_position_scope_attribution_required; "
-            "remediation=kis_legacy_position_attribution_dry_run_apply_then_restart; "
+            "remediation=broker_legacy_position_attribution_dry_run_apply_then_restart; "
             "restart_required=true"
         )
         readiness_reasons = " ".join(runtime_status["readiness"]["reasons"])
-        assert "kis_legacy_position_attribution_dry_run_apply_then_restart" in (
+        assert "broker_legacy_position_attribution_dry_run_apply_then_restart" in (
             readiness_reasons
         )
         assert "restart_required=true" in readiness_reasons
@@ -1362,8 +1374,8 @@ def test_runtime_status_reports_readiness_and_default_safety() -> None:
     assert "runtime is paused" in payload["readiness"]["reasons"]
     assert payload["safety"]["paused"] is True
     assert payload["safety"]["kill_switch_enabled"] is False
-    assert payload["safety"]["automated_order_submission_allowed"] is False
-    assert payload["safety"]["automated_order_submission_block_reason"] == "paused"
+    assert payload["safety"]["automated_order_submission_allowed"] is True
+    assert payload["safety"]["automated_order_submission_block_reason"] is None
     assert payload["safety"]["automated_buy_submission_allowed"] is False
     assert payload["safety"]["automated_buy_submission_block_reason"] == "paused"
     assert payload["exec_agent"] == {
@@ -2063,6 +2075,9 @@ def test_metadata_matches_exec_owned_table_boundary() -> None:
     inspector = inspect(engine)
 
     assert set(EXEC_OWNED_TABLES).issubset(set(inspector.get_table_names()))
+    assert "automation_enabled" not in {
+        column["name"] for column in inspector.get_columns("runtime_control_state")
+    }
 
     app.state.db_engine.dispose()
 
@@ -2095,8 +2110,10 @@ def test_runtime_safety_endpoint_reports_bootstrap_metadata() -> None:
     assert payload["paused"] is True
     assert payload["kill_switch_enabled"] is False
     assert payload["automation_enabled"] is False
-    assert payload["automated_order_submission_allowed"] is False
-    assert payload["automated_order_submission_block_reason"] == "paused"
+    assert payload["automated_order_submission_allowed"] is True
+    assert payload["automated_order_submission_block_reason"] is None
+    assert payload["automated_buy_submission_allowed"] is False
+    assert payload["automated_buy_submission_block_reason"] == "paused"
     assert payload["last_change"]["action"] == "bootstrap"
     assert payload["last_change"]["source"] == "system"
     assert payload["last_change"]["event_id"] is None
@@ -2208,7 +2225,11 @@ def test_runtime_control_endpoints_record_transitions_and_audit() -> None:
     assert pause_payload["outcome"] == "applied"
     assert pause_payload["changed"] is True
     assert pause_payload["safety"]["paused"] is True
-    assert pause_payload["safety"]["automated_order_submission_block_reason"] == "paused"
+    assert pause_payload["safety"]["automation_enabled"] is False
+    assert pause_payload["safety"]["automated_order_submission_allowed"] is True
+    assert pause_payload["safety"]["automated_order_submission_block_reason"] is None
+    assert pause_payload["safety"]["automated_buy_submission_allowed"] is False
+    assert pause_payload["safety"]["automated_buy_submission_block_reason"] == "paused"
 
     pause_again_response = client.post(
         "/controls/pause",
@@ -2275,12 +2296,60 @@ def test_runtime_control_endpoints_record_transitions_and_audit() -> None:
     assert blocked_resume_payload["safety"]["kill_switch_enabled"] is True
     assert blocked_resume_payload["safety"]["last_change"]["action"] == "kill_switch"
 
+    missing_expected_event = client.post(
+        "/controls/kill-switch/reset",
+        json={"actor": "ops", "source": "console", "reason": "missing CAS token"},
+    )
+    assert missing_expected_event.status_code == 422
+
+    stale_reset_response = client.post(
+        "/controls/kill-switch/reset",
+        json={
+            "actor": "ops",
+            "source": "console",
+            "reason": "stale reset must fail",
+            "expected_current_event_id": kill_switch_again_payload["event_id"],
+        },
+    )
+    assert stale_reset_response.status_code == 409
+    stale_reset_payload = stale_reset_response.json()
+    assert stale_reset_payload["action"] == "kill_switch_reset"
+    assert stale_reset_payload["outcome"] == "rejected"
+    assert stale_reset_payload["safety"]["kill_switch_enabled"] is True
+    assert stale_reset_payload["safety"]["last_change"]["event_id"] == (
+        kill_switch_payload["event_id"]
+    )
+
+    reset_response = client.post(
+        "/controls/kill-switch/reset",
+        json={
+            "actor": "ops",
+            "source": "console",
+            "reason": "reviewed reset",
+            "expected_current_event_id": kill_switch_payload["event_id"],
+        },
+    )
+    assert reset_response.status_code == 200
+    reset_payload = reset_response.json()
+    assert reset_payload["action"] == "kill_switch_reset"
+    assert reset_payload["outcome"] == "applied"
+    assert reset_payload["changed"] is True
+    assert reset_payload["safety"]["kill_switch_enabled"] is False
+    assert reset_payload["safety"]["paused"] is True
+    assert reset_payload["safety"]["automation_enabled"] is False
+    assert reset_payload["safety"]["automated_order_submission_allowed"] is True
+    assert reset_payload["safety"]["automated_order_submission_block_reason"] is None
+    assert reset_payload["safety"]["automated_buy_submission_allowed"] is False
+    assert reset_payload["safety"]["automated_buy_submission_block_reason"] == "paused"
+    assert reset_payload["safety"]["last_change"]["action"] == "kill_switch_reset"
+
     with app.state.db_session_factory() as session:
         state = session.get(RuntimeControlState, "global")
         assert state is not None
-        assert state.kill_switch_enabled is True
-        assert state.last_transition_action == "kill_switch"
-        assert state.last_transition_event_id == kill_switch_payload["event_id"]
+        assert state.kill_switch_enabled is False
+        assert state.paused is True
+        assert state.last_transition_action == "kill_switch_reset"
+        assert state.last_transition_event_id == reset_payload["event_id"]
 
         events = session.scalars(
             select(RuntimeControlEvent).order_by(RuntimeControlEvent.occurred_at)
@@ -2292,8 +2361,36 @@ def test_runtime_control_endpoints_record_transitions_and_audit() -> None:
             ("kill_switch", "applied"),
             ("kill_switch", "noop"),
             ("resume", "rejected"),
+            ("kill_switch_reset", "rejected"),
+            ("kill_switch_reset", "applied"),
         ]
 
+    engine.dispose()
+
+
+def test_public_pause_rejects_reserved_legacy_shutdown_source() -> None:
+    app, engine = build_test_app()
+    client = TestClient(app)
+    assert client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "test", "reason": "prepare running state"},
+    ).status_code == 200
+
+    response = client.post(
+        "/controls/pause",
+        json={
+            "actor": app.state.settings.service_name,
+            "source": "lifespan_shutdown",
+            "reason": "service lifespan shutdown started",
+        },
+    )
+
+    assert response.status_code == 422
+    with app.state.db_session_factory() as db:
+        state = db.get(RuntimeControlState, "global")
+        assert state is not None
+        assert state.paused is False
+        assert state.last_transition_action == "resume"
     engine.dispose()
 
 
@@ -2361,6 +2458,91 @@ def test_kill_switch_transition_is_serialized_under_concurrent_requests(
             .order_by(RuntimeControlEvent.occurred_at)
         ).all()
         assert [event.outcome for event in events] == ["applied", "noop"]
+
+    engine.dispose()
+
+
+def test_kill_switch_reset_compare_and_swap_allows_only_one_concurrent_reset(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    settings = Settings(database_url=f"sqlite:///{tmp_path / 'runtime-reset-race.db'}")
+    app, engine = build_test_app(settings)
+
+    with app.state.db_session_factory() as session:
+        runtime_controls.ensure_runtime_control_state(settings=settings, db=session)
+        kill_result = runtime_controls.enable_kill_switch(
+            settings=settings,
+            db=session,
+            command=runtime_controls.ControlCommand(
+                actor="ops",
+                source="test",
+                reason="prepare concurrent reset",
+            ),
+        )
+    assert kill_result.outcome == "applied"
+
+    barrier = threading.Barrier(2)
+    original_state_snapshot = runtime_controls._state_snapshot
+
+    def synchronized_state_snapshot(state: RuntimeControlState) -> dict[str, object]:
+        snapshot = original_state_snapshot(state)
+        if (
+            state.kill_switch_enabled
+            and state.last_transition_event_id == kill_result.event_id
+        ):
+            barrier.wait(timeout=5)
+        return snapshot
+
+    monkeypatch.setattr(runtime_controls, "_state_snapshot", synchronized_state_snapshot)
+    results = []
+
+    def worker(actor: str) -> None:
+        with app.state.db_session_factory() as session:
+            results.append(
+                runtime_controls.reset_kill_switch(
+                    settings=settings,
+                    db=session,
+                    command=runtime_controls.ControlCommand(
+                        actor=actor,
+                        source="test",
+                        reason="concurrent kill switch reset",
+                    ),
+                    expected_current_event_id=kill_result.event_id,
+                )
+            )
+
+    threads = [
+        threading.Thread(target=worker, args=("alpha",)),
+        threading.Thread(target=worker, args=("beta",)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert sorted(result.outcome for result in results) == ["applied", "rejected"]
+    applied_result = next(result for result in results if result.outcome == "applied")
+    rejected_result = next(result for result in results if result.outcome == "rejected")
+    assert rejected_result.safety["kill_switch_enabled"] is False
+    assert rejected_result.safety["paused"] is True
+    assert rejected_result.safety["last_change"]["event_id"] == applied_result.event_id
+
+    with app.state.db_session_factory() as session:
+        state = session.get(RuntimeControlState, "global")
+        assert state is not None
+        assert state.kill_switch_enabled is False
+        assert state.paused is True
+        assert state.last_transition_event_id == applied_result.event_id
+        reset_events = session.scalars(
+            select(RuntimeControlEvent).where(
+                RuntimeControlEvent.action == "kill_switch_reset"
+            )
+        ).all()
+        assert sorted(event.outcome for event in reset_events) == [
+            "applied",
+            "rejected",
+        ]
 
     engine.dispose()
 
@@ -2745,6 +2927,145 @@ def test_position_exit_pending_sell_is_autonomous_monitored_when_position_exists
     engine.dispose()
 
 
+def test_default_monitor_loader_allows_only_live_or_pending_sell_states() -> None:
+    app, engine = build_test_app(
+        Settings(database_url="sqlite:///:memory:", runtime_mode="paper")
+    )
+    live_status_intents = {
+        "target_sell_monitoring": "target_sell",
+        "target_sell_triggered_blocked": "target_sell",
+        "target_sell_triggered_pending_dispatch": "target_sell",
+        "stop_sell_monitoring": "stop_sell",
+        "stop_sell_triggered_blocked": "stop_sell",
+        "stop_sell_triggered_pending_dispatch": "stop_sell",
+        "max_holding_close_sell_monitoring": "max_holding_close_sell",
+        "max_holding_close_sell_triggered_blocked": "max_holding_close_sell",
+        "max_holding_close_sell_triggered_pending_dispatch": (
+            "max_holding_close_sell"
+        ),
+        "triggered_pending_agent": "target_sell",
+        "agent_delay": "stop_sell",
+        "agent_approved_pending_submit": "max_holding_close_sell",
+    }
+    assert set(live_status_intents) == ACTIVE_SELL_MONITORING_STATUSES
+    excluded_statuses = (
+        "revoked",
+        "contract_quarantined",
+        "core_activation_pending",
+        "cancelled",
+    )
+
+    with app.state.db_session_factory() as session:
+        items = [
+            ExecutionPlanItem(
+                id=f"live-sell-{index}",
+                plan_item_index=index,
+                symbol=f"{100000 + index:06d}",
+                side="sell",
+                intent=intent,
+                status=status,
+                trigger_price=Decimal("100"),
+                quantity_policy={"kind": "shares", "quantity": 1},
+                risk_context={"exchange": "KRX"},
+            )
+            for index, (status, intent) in enumerate(live_status_intents.items())
+        ]
+        pending_id = "pending-sell-materialization"
+        items.append(
+            ExecutionPlanItem(
+                id=pending_id,
+                plan_item_index=len(items),
+                symbol="200000",
+                side="sell",
+                intent="target_sell",
+                status="target_sell_pending_config",
+                trigger_price=Decimal("100"),
+                quantity_policy={"type": "position_exit_from_entry"},
+                risk_context={"exchange": "KRX"},
+            )
+        )
+        excluded_ids: set[str] = set()
+        for status in excluded_statuses:
+            item_id = f"excluded-sell-{status}"
+            excluded_ids.add(item_id)
+            items.append(
+                ExecutionPlanItem(
+                    id=item_id,
+                    plan_item_index=len(items),
+                    symbol=f"{300000 + len(excluded_ids):06d}",
+                    side="sell",
+                    intent="target_sell",
+                    status=status,
+                    trigger_price=Decimal("100"),
+                    quantity_policy={"kind": "shares", "quantity": 1},
+                    risk_context={"exchange": "KRX"},
+                )
+            )
+        session.add(
+            ExecutionPlan(
+                external_plan_id="sell-monitor-liveness-statuses",
+                source="test-fixture",
+                mode="paper",
+                status="accepted",
+                items=items,
+            )
+        )
+        session.commit()
+
+        loaded_ids = {
+            item.id
+            for item in _load_monitored_items(
+                settings=app.state.settings,
+                db=session,
+            )
+        }
+
+    expected_live_ids = {f"live-sell-{index}" for index in range(len(live_status_intents))}
+    assert loaded_ids == expected_live_ids | {pending_id}
+    assert loaded_ids.isdisjoint(excluded_ids)
+    engine.dispose()
+
+
+def test_runtime_monitoring_backlog_includes_max_holding_pending_dispatch() -> None:
+    app, engine = build_test_app(
+        Settings(database_url="sqlite:///:memory:", runtime_mode="paper")
+    )
+
+    with app.state.db_session_factory() as session:
+        session.add(
+            ExecutionPlan(
+                external_plan_id="max-holding-runtime-backlog",
+                source="test-fixture",
+                mode="paper",
+                status="accepted",
+                items=[
+                    ExecutionPlanItem(
+                        id="max-holding-runtime-backlog-item",
+                        plan_item_index=0,
+                        symbol="005930",
+                        side="sell",
+                        intent="max_holding_close_sell",
+                        status=(
+                            "max_holding_close_sell_triggered_pending_dispatch"
+                        ),
+                        quantity_policy={"kind": "shares", "quantity": 1},
+                        risk_context={"exchange": "KRX"},
+                    )
+                ],
+            )
+        )
+        session.commit()
+
+        monitoring = runtime_service.monitoring_payload(
+            settings=app.state.settings,
+            db=session,
+        )
+
+    assert monitoring["dispatcher"]["backlog_item_count"] == 1
+    assert monitoring["dispatcher"]["backlog_symbols"] == ["005930"]
+    engine.dispose()
+
+
 def test_autonomous_runtime_prefers_local_latest_watch_symbols_over_stale_core_desired(
     tmp_path,
     monkeypatch,
@@ -2886,6 +3207,78 @@ def test_weekend_handoff_watch_buy_is_monitored_on_target_market_date() -> None:
             db=session,
             today_start_utc=datetime(2026, 8, 2, 15, tzinfo=UTC),
         ) == ["011300"]
+
+    engine.dispose()
+
+
+def test_exec_agent_sizing_pending_watch_is_not_monitorable_until_quantity_exists() -> None:
+    app, engine = build_test_app(
+        Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+        )
+    )
+    market_date = datetime(2026, 10, 2).date()
+
+    with app.state.db_session_factory() as session:
+        plan = ExecutionPlan(
+            id="sizing-pending-watch-plan",
+            external_plan_id="sizing-pending-watch-plan",
+            source="kai-trading-core",
+            market_date=market_date,
+            mode="paper",
+            status="accepted",
+            accepted_at=datetime(2026, 10, 2, 0, 0, tzinfo=UTC),
+        )
+        item = ExecutionPlanItem(
+            id="sizing-pending-watch-item",
+            plan=plan,
+            plan_item_index=0,
+            symbol="005930",
+            side="buy",
+            intent="intraday_watch_buy",
+            status="pending",
+            decision_agent_name="signal-decider",
+            trigger_price=Decimal("71000"),
+            quantity_policy={
+                "type": "exec_agent_sized",
+                "budget_krw": "150000",
+            },
+        )
+        item.risk_context, item.quantity_policy = bind_kis_account_route(
+            settings=app.state.settings,
+            provider="kis",
+            risk_context={"exchange": "KRX"},
+            quantity_policy=item.quantity_policy,
+        )
+        item.provider = "kis"
+        session.add(plan)
+
+        materialize_monitoring_plan_items(plan, db=session)
+        session.commit()
+
+        assert item.status == "watch_sizing_pending"
+        assert list_autonomous_monitoring_symbols(
+            settings=app.state.settings,
+            db=session,
+            current_market_date=market_date,
+        ) == []
+
+        item.quantity_policy = {
+            **item.quantity_policy,
+            "kind": "shares",
+            "type": "shares",
+            "quantity": 2,
+        }
+        materialize_monitoring_plan_items(plan, db=session)
+        session.commit()
+
+        assert item.status == "watch_monitoring_active"
+        assert list_autonomous_monitoring_symbols(
+            settings=app.state.settings,
+            db=session,
+            current_market_date=market_date,
+        ) == ["005930"]
 
     engine.dispose()
 
@@ -3993,6 +4386,144 @@ def test_autonomous_monitoring_expires_known_flat_active_sell_monitors() -> None
     engine.dispose()
 
 
+def test_terminal_watch_does_not_keep_known_flat_sell_monitor_alive() -> None:
+    app, engine = build_test_app(
+        Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+        )
+    )
+    expired_at = datetime(2026, 10, 2, 2, 0, tzinfo=UTC)
+
+    with app.state.db_session_factory() as session:
+        plan = ExecutionPlan(
+            id="terminal-watch-flat-sell-plan",
+            external_plan_id="terminal-watch-flat-sell-plan",
+            source="test",
+            market_date=expired_at.astimezone(ZoneInfo("Asia/Seoul")).date(),
+            mode="paper",
+            status="accepted",
+            accepted_at=expired_at - timedelta(hours=1),
+        )
+        sell_item = ExecutionPlanItem(
+            id="terminal-watch-flat-sell",
+            plan=plan,
+            plan_item_index=0,
+            symbol="000660",
+            side="sell",
+            intent="target_sell",
+            status="target_sell_monitoring",
+            trigger_price=Decimal("120000"),
+            quantity_policy={
+                "type": "position_exit_from_entry",
+                "linked_entry_item_key": "terminal-watch-buy",
+            },
+        )
+        terminal_watch = ExecutionPlanItem(
+            id="terminal-watch-buy",
+            plan=plan,
+            plan_item_index=1,
+            symbol="000660",
+            side="buy",
+            intent="intraday_watch_buy",
+            status="watch_buy_rejected",
+            trigger_price=Decimal("110000"),
+            quantity_policy={"kind": "shares", "quantity": 1},
+        )
+        session.add(
+            _scoped_execution_position(
+                app.state.settings,
+                symbol="000660",
+                quantity=0,
+                average_price=Decimal("0"),
+                updated_from="reconciliation",
+                last_reconciled_at=expired_at,
+            )
+        )
+        session.add_all([plan, sell_item, terminal_watch])
+        session.commit()
+
+        expired_count = expire_known_flat_pending_sell_monitors(
+            settings=app.state.settings,
+            db=session,
+            expired_at=expired_at,
+        )
+
+        assert expired_count == 1
+        assert sell_item.status == "expired"
+
+    engine.dispose()
+
+
+def test_sizing_pending_entry_keeps_future_sell_templates_alive() -> None:
+    app, engine = build_test_app(
+        Settings(database_url="sqlite:///:memory:", runtime_mode="paper")
+    )
+    checked_at = datetime(2026, 10, 2, 2, 0, tzinfo=UTC)
+
+    with app.state.db_session_factory() as session:
+        plan = ExecutionPlan(
+            id="sizing-entry-sell-template-plan",
+            external_plan_id="sizing-entry-sell-template-plan",
+            source="kai-trading-core",
+            market_date=checked_at.astimezone(ZoneInfo("Asia/Seoul")).date(),
+            mode="paper",
+            status="accepted",
+            accepted_at=checked_at - timedelta(hours=1),
+        )
+        entry = ExecutionPlanItem(
+            id="sizing-entry",
+            plan=plan,
+            plan_item_index=0,
+            symbol="000660",
+            side="buy",
+            intent="intraday_watch_buy",
+            status="watch_sizing_pending",
+            source_plan_item_id="core-entry",
+            decision_agent_name="signal-decider",
+            trigger_price=Decimal("110000"),
+            quantity_policy={"type": "exec_agent_sized", "budget_krw": "200000"},
+        )
+        sell_template = ExecutionPlanItem(
+            id="sizing-entry-target",
+            plan=plan,
+            plan_item_index=1,
+            symbol="000660",
+            side="sell",
+            intent="target_sell",
+            status="target_sell_monitoring",
+            source_plan_item_id="core-target",
+            trigger_price=Decimal("120000"),
+            quantity_policy={
+                "type": "position_exit_from_entry",
+                "linked_entry_item_key": "core-entry",
+            },
+        )
+        session.add(
+            _scoped_execution_position(
+                app.state.settings,
+                symbol="000660",
+                quantity=0,
+                average_price=Decimal("0"),
+                updated_from="reconciliation",
+                last_reconciled_at=checked_at,
+            )
+        )
+        session.add_all([plan, entry, sell_template])
+        session.commit()
+
+        expired_count = expire_known_flat_pending_sell_monitors(
+            settings=app.state.settings,
+            db=session,
+            expired_at=checked_at,
+        )
+
+        assert expired_count == 0
+        assert sell_template.status == "target_sell_monitoring"
+
+    engine.dispose()
+
+
 def test_stale_sell_monitor_expiry_preserves_only_active_protection_for_held_position() -> None:
     app, engine = build_test_app(
         Settings(
@@ -4888,6 +5419,180 @@ def test_post_entry_maintenance_promotes_pending_target_sell_monitor() -> None:
         assert target_item_id in {item.id for item in autonomous_items}
 
     engine.dispose()
+
+
+@pytest.mark.parametrize(
+    "agent_status",
+    [
+        "triggered_pending_agent",
+        "agent_delay",
+        "agent_approved_pending_submit",
+    ],
+)
+@pytest.mark.parametrize("intent", ["stop_sell", "target_sell"])
+def test_post_entry_maintenance_preserves_active_sell_agent_state(
+    agent_status: str,
+    intent: str,
+) -> None:
+    app, engine = build_test_app(
+        Settings(database_url="sqlite:///:memory:", runtime_mode="paper")
+    )
+
+    with app.state.db_session_factory() as session:
+        entry_item = ExecutionPlanItem(
+            id=f"entry-{intent}-{agent_status}",
+            plan_item_index=0,
+            symbol="002380",
+            side="buy",
+            intent="intraday_watch_buy",
+            status="broker_order_submitted",
+            source_plan_item_id="entry-family",
+            quantity_policy={"kind": "shares", "quantity": 3},
+            trigger_price=Decimal("100"),
+            limit_price=Decimal("100"),
+            risk_context={
+                "exchange": "KRX",
+                "target_price": "110",
+                "stop_price": "95",
+            },
+        )
+        sell_item = ExecutionPlanItem(
+            id=f"{intent}-{agent_status}",
+            plan_item_index=1,
+            symbol="002380",
+            side="sell",
+            intent=intent,
+            status=agent_status,
+            quantity_policy={
+                "kind": "shares",
+                "quantity": 3,
+                "linked_entry_item_key": "entry-family",
+            },
+            trigger_price=Decimal("95" if intent == "stop_sell" else "110"),
+            risk_context={"exchange": "KRX"},
+        )
+        session.add(
+            ExecutionPlan(
+                external_plan_id=f"post-entry-{intent}-{agent_status}",
+                source="test-fixture",
+                market_date=date(2026, 6, 8),
+                mode="paper",
+                status="accepted",
+                items=[entry_item, sell_item],
+            )
+        )
+        session.commit()
+
+        if intent == "stop_sell":
+            maintained, _ = _ensure_post_entry_stop_monitor(
+                db=session,
+                entry_item=entry_item,
+                quantity=3,
+                stop_price=Decimal("95"),
+                entry_price=Decimal("100"),
+                triggered_at=datetime(2026, 6, 8, 1, 5, tzinfo=UTC),
+            )
+        else:
+            maintained, _ = _ensure_post_entry_target_monitor(
+                settings=app.state.settings,
+                db=session,
+                entry_item=entry_item,
+                quantity=3,
+                entry_price=Decimal("100"),
+                triggered_at=datetime(2026, 6, 8, 1, 5, tzinfo=UTC),
+            )
+
+        assert maintained is sell_item
+        assert maintained.status == agent_status
+
+    engine.dispose()
+
+
+def test_sell_coverage_statuses_include_every_canonical_live_target_and_stop_state() -> None:
+    live_stop_statuses = SELL_AGENT_ACTIVE_STATUSES | frozenset(
+        status
+        for status in ACTIVE_SELL_MONITORING_STATUSES
+        if status.startswith("stop_sell_")
+    )
+    live_target_statuses = SELL_AGENT_ACTIVE_STATUSES | frozenset(
+        status
+        for status in ACTIVE_SELL_MONITORING_STATUSES
+        if status.startswith("target_sell_")
+    )
+
+    assert live_stop_statuses <= PROTECTIVE_STOP_COVERAGE_STATUSES
+    assert live_target_statuses <= PROFIT_TARGET_COVERAGE_STATUSES
+
+
+@pytest.mark.parametrize(
+    "terminal_status",
+    ["revoked", "contract_quarantined", "core_activation_pending", "cancelled"],
+)
+@pytest.mark.parametrize(
+    ("intent", "original_trigger", "updated_trigger"),
+    [
+        ("stop_sell", Decimal("95"), Decimal("96")),
+        ("target_sell", Decimal("110"), Decimal("111")),
+        ("max_holding_close_sell", None, Decimal("112")),
+    ],
+)
+def test_terminal_sell_sibling_is_never_selected_or_updated(
+    terminal_status: str,
+    intent: str,
+    original_trigger: Decimal | None,
+    updated_trigger: Decimal,
+) -> None:
+    entry_item = ExecutionPlanItem(
+        id=f"entry-{intent}-{terminal_status}",
+        plan_item_index=0,
+        symbol="002380",
+        side="buy",
+        intent="intraday_watch_buy",
+        status="broker_order_submitted",
+        source_plan_item_id="entry-family",
+        quantity_policy={"kind": "shares", "quantity": 3},
+        trigger_price=Decimal("100"),
+        risk_context={"exchange": "KRX"},
+    )
+    terminal_sibling = ExecutionPlanItem(
+        id=f"{intent}-{terminal_status}",
+        plan_item_index=1,
+        symbol="002380",
+        side="sell",
+        intent=intent,
+        status=terminal_status,
+        source_plan_item_id="entry-family",
+        quantity_policy={
+            "kind": "shares",
+            "quantity": 3,
+            "linked_entry_item_key": "entry-family",
+        },
+        trigger_price=original_trigger,
+        risk_context={"exchange": "KRX", "terminal_marker": True},
+    )
+    ExecutionPlan(
+        external_plan_id=f"terminal-sibling-{intent}-{terminal_status}",
+        source="test-fixture",
+        mode="paper",
+        status="accepted",
+        items=[entry_item, terminal_sibling],
+    )
+
+    assert terminal_status in NON_MONITORABLE_PLAN_ITEM_STATUSES
+    assert _active_sibling_monitor(entry_item=entry_item, intent=intent) is None
+
+    _update_sibling_trigger_price(
+        item=entry_item,
+        intent=intent,
+        trigger_price=updated_trigger,
+    )
+
+    assert terminal_sibling.status == terminal_status
+    assert terminal_sibling.trigger_price == original_trigger
+    assert terminal_sibling.risk_context == {
+        "exchange": "KRX",
+        "terminal_marker": True,
+    }
 
 
 def test_cached_autonomous_monitoring_repairs_targets_before_idle_exit() -> None:
@@ -6495,8 +7200,10 @@ def test_fast_runtime_status_honors_durable_paused_state() -> None:
     assert "runtime is paused" in payload["readiness"]["reasons"]
     assert payload["safety"]["paused"] is True
     assert payload["safety"]["kill_switch_enabled"] is False
-    assert payload["safety"]["automated_order_submission_allowed"] is False
-    assert payload["safety"]["automated_order_submission_block_reason"] == "paused"
+    assert payload["safety"]["automated_order_submission_allowed"] is True
+    assert payload["safety"]["automated_order_submission_block_reason"] is None
+    assert payload["safety"]["automated_buy_submission_allowed"] is False
+    assert payload["safety"]["automated_buy_submission_block_reason"] == "paused"
 
     engine.dispose()
 

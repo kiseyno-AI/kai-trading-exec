@@ -10,6 +10,71 @@ from app.models.runtime import BrokerOrder, ExecutionJob, ExecutionPlanItem, Exe
 
 BROKER_ORDER_STATUSES = frozenset(status.value for status in NormalizedBrokerOrderStatus)
 
+WATCH_SIZING_PENDING_STATUS = "watch_sizing_pending"
+AGENT_ACTIVE_MONITORING_STATUSES = frozenset(
+    {
+        "triggered_pending_agent",
+        "agent_delay",
+        "agent_approved_pending_submit",
+    }
+)
+ACTIVE_WATCH_MONITORING_STATUSES = frozenset(
+    {
+        "watch_monitoring_pending",
+        "watch_monitoring_active",
+        "watch_buy_triggered",
+        "watch_buy_triggered_blocked",
+        "watch_buy_triggered_pending_dispatch",
+    }
+) | AGENT_ACTIVE_MONITORING_STATUSES
+LIVE_WATCH_ENTRY_STATUSES = ACTIVE_WATCH_MONITORING_STATUSES | {
+    WATCH_SIZING_PENDING_STATUS
+}
+TERMINAL_WATCH_MONITORING_STATUSES = frozenset(
+    {
+        "watch_buy_submitted",
+        "watch_buy_rejected",
+        "watch_expired",
+        "watch_cancelled",
+    }
+)
+WATCH_MONITORING_STATUSES = (
+    ACTIVE_WATCH_MONITORING_STATUSES | TERMINAL_WATCH_MONITORING_STATUSES
+)
+WATCH_LIFECYCLE_STATUSES = WATCH_MONITORING_STATUSES | {
+    WATCH_SIZING_PENDING_STATUS,
+    "watch_buy_dispatching",
+    "watch_buy_retrying",
+}
+SELL_ACTIVE_MONITORING_STATUSES = frozenset(
+    {
+        "target_sell_monitoring",
+        "stop_sell_monitoring",
+        "max_holding_close_sell_monitoring",
+    }
+)
+SELL_TRIGGERED_BLOCKED_STATUSES = frozenset(
+    {
+        "target_sell_triggered_blocked",
+        "stop_sell_triggered_blocked",
+        "max_holding_close_sell_triggered_blocked",
+    }
+)
+SELL_TRIGGERED_PENDING_DISPATCH_STATUSES = frozenset(
+    {
+        "target_sell_triggered_pending_dispatch",
+        "stop_sell_triggered_pending_dispatch",
+        "max_holding_close_sell_triggered_pending_dispatch",
+    }
+)
+SELL_AGENT_ACTIVE_STATUSES = AGENT_ACTIVE_MONITORING_STATUSES
+ACTIVE_SELL_MONITORING_STATUSES = (
+    SELL_ACTIVE_MONITORING_STATUSES
+    | SELL_TRIGGERED_BLOCKED_STATUSES
+    | SELL_TRIGGERED_PENDING_DISPATCH_STATUSES
+    | SELL_AGENT_ACTIVE_STATUSES
+)
+
 EXECUTION_JOB_STATUSES = frozenset(
     {
         "queued",
@@ -19,6 +84,8 @@ EXECUTION_JOB_STATUSES = frozenset(
         "completed",
         "failed",
         "expired",
+        "revoked",
+        "superseded",
     }
 )
 
@@ -30,6 +97,9 @@ PLAN_ITEM_STATUSES = frozenset(
         "agent_rejected",
         "cancel_pending",
         "canceled",
+        "cancelled",
+        "contract_quarantined",
+        "core_activation_pending",
         "pending",
         "pending_configuration",
         "rejected",
@@ -69,13 +139,21 @@ PLAN_ITEM_STATUSES = frozenset(
         "next_open_buy_retrying",
         "next_open_buy_scheduled",
         "stop_sell_monitoring",
+        "stop_sell_pending_config",
         "stop_sell_pending_configuration",
+        "stop_sell_triggered_blocked",
         "stop_sell_triggered_pending_dispatch",
         "max_holding_close_sell_monitoring",
+        "max_holding_close_sell_pending_config",
+        "max_holding_close_sell_triggered_blocked",
         "max_holding_close_sell_triggered_pending_dispatch",
+        "revoked",
+        "target_sell_pending_config",
+        "target_sell_triggered_blocked",
         "watch_cancelled",
         "watch_monitoring_active",
         "watch_monitoring_pending",
+        WATCH_SIZING_PENDING_STATUS,
         "watch_buy_submitted",
         "watch_buy_dispatching",
         "watch_buy_rejected",
@@ -136,7 +214,11 @@ def set_plan_item_status(
     payload: dict[str, Any] | None = None,
     occurred_at: datetime | None = None,
 ) -> bool:
-    _ensure_known_status(domain="execution plan item", status=status, allowed=PLAN_ITEM_STATUSES)
+    _ensure_known_status(
+        domain="execution plan item",
+        status=status,
+        allowed=PLAN_ITEM_STATUSES,
+    )
     previous_status = plan_item.status
     if previous_status == status:
         return False

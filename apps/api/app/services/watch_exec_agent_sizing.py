@@ -32,7 +32,10 @@ from app.services.execution_account_route import (
     bind_kis_account_route,
     validate_kis_account_route,
 )
-from app.services.execution_semantics import WATCH_BUY_INTENTS
+from app.services.execution_semantics import (
+    WATCH_BUY_INTENTS,
+    is_exec_agent_sizing_policy,
+)
 from app.services.exec_agent_approval import (
     SHORT_TERM_LIVE_MIN_NET_REWARD_RISK,
     assess_buy_economics,
@@ -51,7 +54,10 @@ from app.services.openclaw_runtime_contract import (
 )
 from app.services.reconciliation import reconcile_stale_nonterminal_broker_orders
 from app.services.risk_sizing import apply_vol_corr_quantity_cap
-from app.services.runtime_transitions import apply_plan_item_status
+from app.services.runtime_transitions import (
+    WATCH_SIZING_PENDING_STATUS,
+    apply_plan_item_status,
+)
 from app.services.trade_outcome_feedback import load_latest_trade_outcome_feedback_snippet
 from app.services.position_identity import (
     PositionIdentityConflictError,
@@ -60,7 +66,8 @@ from app.services.position_identity import (
 
 LOGGER = logging.getLogger(__name__)
 
-SIZED_WATCH_STATUSES = frozenset({
+SIZING_ELIGIBLE_WATCH_STATUSES = frozenset({
+    WATCH_SIZING_PENDING_STATUS,
     "watch_monitoring_pending",
     "watch_monitoring_active",
     "watch_buy_triggered_blocked",
@@ -578,12 +585,10 @@ def _is_untriggered_next_open_sizing_item(item: ExecutionPlanItem) -> bool:
     converted into a scheduled next-open job by this worker.
     """
 
-    quantity_policy = item.quantity_policy if isinstance(item.quantity_policy, dict) else {}
     return (
         item.intent == "next_open_buy"
         and item.trigger_price is None
-        and (quantity_policy.get("type") or quantity_policy.get("kind"))
-        == "exec_agent_sized"
+        and is_exec_agent_sizing_policy(item.quantity_policy)
     )
 
 
@@ -831,7 +836,7 @@ def _load_candidate_plans(*, settings: Settings, db: Session, market_date) -> li
             ExecutionPlan.items.any(
                 (ExecutionPlanItem.intent.in_(tuple(WATCH_BUY_INTENTS)))
                 & (
-                    ExecutionPlanItem.status.in_(tuple(SIZED_WATCH_STATUSES))
+                    ExecutionPlanItem.status.in_(tuple(SIZING_ELIGIBLE_WATCH_STATUSES))
                     | and_(
                         ExecutionPlanItem.intent == "next_open_buy",
                         ExecutionPlanItem.status.in_(tuple(UNSIZED_NEXT_OPEN_STATUSES)),
@@ -1087,12 +1092,14 @@ def _retryable_watch_rejection(
 
 
 def _eligible_unsized_item_status(item: ExecutionPlanItem) -> bool:
-    if item.status in SIZED_WATCH_STATUSES:
-        return True
-    if item.intent != "next_open_buy" or item.status not in UNSIZED_NEXT_OPEN_STATUSES:
+    if not is_exec_agent_sizing_policy(item.quantity_policy):
         return False
-    policy = item.quantity_policy if isinstance(item.quantity_policy, dict) else {}
-    return (policy.get("type") or policy.get("kind")) == "exec_agent_sized"
+    if item.status in SIZING_ELIGIBLE_WATCH_STATUSES:
+        return True
+    return (
+        item.intent == "next_open_buy"
+        and item.status in UNSIZED_NEXT_OPEN_STATUSES
+    )
 
 
 def _sizing_candidate_priority_key(candidate: dict[str, object]) -> tuple[object, ...]:
@@ -2791,7 +2798,7 @@ def _apply_decisions(
                         reward_risk_cap
                     )
                 item.risk_context = compact_json_object(risk_context)
-                item.status = "watch_monitoring_pending"
+                item.status = WATCH_SIZING_PENDING_STATUS
                 _add_plan_item_audit(
                     db=db,
                     item=item,

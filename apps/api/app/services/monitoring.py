@@ -70,6 +70,8 @@ from app.services.execution_semantics import (
     KRX_EXCHANGES,
     WATCH_BUY_INTENTS,
     canonical_execution_asset_class,
+    is_delegated_exec_agent_sizing_policy,
+    is_exec_agent_sizing_policy,
     is_short_term_watch_buy_intent,
     watch_buy_direction_from_payloads,
 )
@@ -113,11 +115,19 @@ from app.services.monitoring_price_source import (
     monitoring_price_from_broker_quote,
 )
 from app.services.runtime_controls import (
-    automated_order_submission_allowed,
-    automated_order_submission_block_reason,
+    automated_buy_submission_allowed,
+    automated_buy_submission_block_reason,
     ensure_runtime_control_state,
 )
 from app.services.runtime_transitions import (
+    ACTIVE_SELL_MONITORING_STATUSES,
+    ACTIVE_WATCH_MONITORING_STATUSES,
+    LIVE_WATCH_ENTRY_STATUSES,
+    SELL_ACTIVE_MONITORING_STATUSES,
+    SELL_TRIGGERED_BLOCKED_STATUSES,
+    SELL_TRIGGERED_PENDING_DISPATCH_STATUSES,
+    WATCH_LIFECYCLE_STATUSES,
+    WATCH_SIZING_PENDING_STATUS,
     apply_plan_item_status,
     plan_item_status_for_broker_order_status,
 )
@@ -157,38 +167,8 @@ TRIGGER_TIME_FULL_COST_ECONOMICS_PROVENANCE_VERSION = (
     "exec-trigger-time-full-cost-economics-provenance-v1"
 )
 SELL_MONITOR_AUTHORITY_KEY = "sell_monitor_authority_v1"
-WATCH_MONITORING_STATUSES = frozenset(
+BLOCKED_MONITORING_STATUSES = SELL_TRIGGERED_BLOCKED_STATUSES | frozenset(
     {
-        "watch_monitoring_pending",
-        "watch_monitoring_active",
-        "watch_buy_triggered",
-        "watch_buy_submitted",
-        "watch_buy_rejected",
-        "watch_expired",
-        "watch_cancelled",
-        "watch_buy_triggered_blocked",
-        "watch_buy_triggered_pending_dispatch",
-        AGENT_PENDING_STATUS,
-        AGENT_DELAY_STATUS,
-        AGENT_APPROVED_PENDING_SUBMIT_STATUS,
-    }
-)
-ACTIVE_WATCH_MONITORING_STATUSES = frozenset(
-    {
-        "watch_monitoring_pending",
-        "watch_monitoring_active",
-        "watch_buy_triggered",
-        "watch_buy_triggered_blocked",
-        "watch_buy_triggered_pending_dispatch",
-        AGENT_PENDING_STATUS,
-        AGENT_DELAY_STATUS,
-        AGENT_APPROVED_PENDING_SUBMIT_STATUS,
-    }
-)
-BLOCKED_MONITORING_STATUSES = frozenset(
-    {
-        "target_sell_triggered_blocked",
-        "stop_sell_triggered_blocked",
         "watch_buy_triggered_blocked",
         "watch_cancelled",
     }
@@ -224,17 +204,19 @@ BLOCKED_WATCH_BUY_APPROVAL_REASONS = frozenset(
     {
         "paused",
         "kill_switch",
+        "hourly_plan_risk_off",
         "stale_trigger_reclaim_required",
         "late_entry_cutoff",
         "watch_buy_very_weak_liquidity",
     }
 )
-PENDING_DISPATCH_MONITORING_STATUSES = frozenset(
-    {
-        "target_sell_triggered_pending_dispatch",
-        "stop_sell_triggered_pending_dispatch",
-        "watch_buy_triggered_pending_dispatch",
-    }
+PENDING_DISPATCH_MONITORING_STATUSES = (
+    SELL_TRIGGERED_PENDING_DISPATCH_STATUSES
+    | frozenset(
+        {
+            "watch_buy_triggered_pending_dispatch",
+        }
+    )
 )
 NON_MONITORABLE_PLAN_ITEM_STATUSES = frozenset(
     {
@@ -250,9 +232,13 @@ NON_MONITORABLE_PLAN_ITEM_STATUSES = frozenset(
         "filled",
         "cancel_pending",
         "canceled",
+        "cancelled",
+        "contract_quarantined",
+        "core_activation_pending",
         "expired",
         "retry_pending",
         "rejected",
+        "revoked",
         "failed",
         "superseded",
         "watch_buy_submitted",
@@ -285,16 +271,14 @@ ACTIVE_PROTECTIVE_STOP_ORDER_STATUSES = frozenset(CAPITAL_RESERVING_ORDER_STATUS
 SELL_PENDING_CONFIG_STATUSES = frozenset(
     {
         "target_sell_pending_config",
+        "target_sell_pending_configuration",
         "stop_sell_pending_config",
+        "stop_sell_pending_configuration",
         "max_holding_close_sell_pending_config",
     }
 )
-SELL_ACTIVE_MONITORING_STATUSES = frozenset(
-    {
-        "target_sell_monitoring",
-        "stop_sell_monitoring",
-        "max_holding_close_sell_monitoring",
-    }
+LOADABLE_SELL_MONITORING_STATUSES = (
+    ACTIVE_SELL_MONITORING_STATUSES | SELL_PENDING_CONFIG_STATUSES
 )
 SELL_STALE_FLAT_EXPIRABLE_STATUSES = SELL_PENDING_CONFIG_STATUSES | SELL_ACTIVE_MONITORING_STATUSES
 MONITORING_WORKER_NAME = "intraday_target_stop_monitor"
@@ -305,6 +289,7 @@ WATCH_BUY_HANDOFF_LOOKBACK_DAYS = 3
 WATCH_BUY_MIN_HARD_CALENDAR_TTL_DAYS = 7
 WATCH_BUY_EXPIRABLE_STATUSES = frozenset(
     {
+        WATCH_SIZING_PENDING_STATUS,
         "watch_monitoring_active",
         "watch_monitoring_pending",
         "watch_buy_triggered",
@@ -428,11 +413,11 @@ PROFIT_PROTECTION_TRIGGER_REASONS = frozenset(
     {"profit_protection_trailing_stop", "aged_position_profit_protection"}
 )
 PROTECTIVE_STOP_COVERAGE_STATUSES = frozenset(
+    status
+    for status in ACTIVE_SELL_MONITORING_STATUSES
+    if status in AGENT_ACTIVE_STATUSES or status.startswith("stop_sell_")
+) | frozenset(
     {
-        "stop_sell_monitoring",
-        "stop_sell_triggered_pending_dispatch",
-        AGENT_PENDING_STATUS,
-        AGENT_APPROVED_PENDING_SUBMIT_STATUS,
         "broker_order_submission_pending",
         "broker_order_submitted",
         "open",
@@ -446,11 +431,11 @@ PROTECTIVE_STOP_REPAIR_CANDIDATE_STATUSES = (
     | {"stop_sell_pending_config"}
 )
 PROFIT_TARGET_COVERAGE_STATUSES = frozenset(
+    status
+    for status in ACTIVE_SELL_MONITORING_STATUSES
+    if status in AGENT_ACTIVE_STATUSES or status.startswith("target_sell_")
+) | frozenset(
     {
-        "target_sell_monitoring",
-        "target_sell_triggered_pending_dispatch",
-        AGENT_PENDING_STATUS,
-        AGENT_APPROVED_PENDING_SUBMIT_STATUS,
         "broker_order_submission_pending",
         "broker_order_submitted",
         "broker_order_retry_pending",
@@ -497,20 +482,16 @@ def materialize_monitoring_plan_items(
                 "pending_configuration",
                 "next_open_buy_pending_configuration",
                 "watch_monitoring_pending",
+                WATCH_SIZING_PENDING_STATUS,
             }:
                 continue
             quantity_policy = item.quantity_policy
-            policy_kind = (
-                quantity_policy.get("kind") or quantity_policy.get("type")
-                if isinstance(quantity_policy, dict)
-                else None
-            )
-            if policy_kind == "exec_agent_sized":
+            if is_exec_agent_sizing_policy(quantity_policy):
                 # This is an outstanding sizing delegation, not executable
                 # quantity.  Estimated entry data may make the generic watch
                 # geometry look configured, but only the sizing worker may turn
                 # it into a share policy and scheduled order.
-                item.status = "watch_monitoring_pending"
+                item.status = WATCH_SIZING_PENDING_STATUS
                 continue
             if _monitoring_item_is_configured(item):
                 item.status = "watch_monitoring_active"
@@ -1624,14 +1605,7 @@ def list_autonomous_monitoring_symbols(
                 ExecutionPlanItem.symbol.in_(sorted(held_symbols)),
                 ExecutionPlanItem.side == "sell",
                 ExecutionPlanItem.intent.in_(tuple(SELL_MONITORED_INTENTS)),
-                ExecutionPlanItem.status.in_(
-                    tuple(
-                        SELL_ACTIVE_MONITORING_STATUSES
-                        | SELL_PENDING_CONFIG_STATUSES
-                        | BLOCKED_MONITORING_STATUSES
-                        | PENDING_DISPATCH_MONITORING_STATUSES
-                    )
-                ),
+                ExecutionPlanItem.status.in_(tuple(LOADABLE_SELL_MONITORING_STATUSES)),
             )
             .group_by(ExecutionPlanItem.symbol)
             .order_by(
@@ -1663,6 +1637,7 @@ def list_autonomous_monitoring_symbols(
                 ExecutionPlanItem.status,
                 ExecutionPlanItem.provider,
                 ExecutionPlanItem.venue,
+                ExecutionPlanItem.decision_agent_name,
                 ExecutionPlanItem.risk_context,
                 ExecutionPlanItem.quantity_policy,
                 ExecutionPlanItem.asset_class,
@@ -1686,7 +1661,8 @@ def list_autonomous_monitoring_symbols(
     active_watch_items = [
         item
         for item in active_watch_items
-        if classify_kis_account_route(
+        if not is_exec_agent_sizing_policy(item.quantity_policy)
+        and classify_kis_account_route(
             settings=settings,
             provider=str(item.provider or "kis").strip().lower(),
             risk_context=_loaded_risk_context(
@@ -2343,7 +2319,7 @@ def expire_known_flat_pending_sell_monitors(
             ExecutionPlan.mode == settings.runtime_mode,
             ExecutionPlanItem.side == "buy",
             ExecutionPlanItem.intent.in_(tuple(WATCH_BUY_INTENTS)),
-            ExecutionPlanItem.status.in_(tuple(WATCH_MONITORING_STATUSES)),
+            ExecutionPlanItem.status.in_(tuple(LIVE_WATCH_ENTRY_STATUSES)),
             effective_plan_filter,
         )
     )
@@ -2704,6 +2680,44 @@ def _evaluate_monitoring_cycle(
             )
             continue
 
+        agent_recovery_reason = _trigger_time_agent_recovery_reason(
+            settings=settings,
+            item=item,
+            now=triggered_at,
+            delay_until=agent_delay_until,
+        )
+        if agent_recovery_reason is not None:
+            previous_status = item.status
+            item.status = _monitoring_status(item.intent)
+            _record_monitoring_event(
+                item=item,
+                event={
+                    "event": (
+                        "trigger_time_exec_agent_pending_recovered"
+                        if previous_status == AGENT_PENDING_STATUS
+                        else "trigger_time_exec_agent_state_recovered"
+                    ),
+                    "reason": agent_recovery_reason,
+                    "message": (
+                        "expired trigger-time exec-agent state was returned to monitoring "
+                        "for a fresh decision"
+                    ),
+                    "previous_status": previous_status,
+                    "recorded_at": triggered_at.isoformat(),
+                },
+            )
+
+        if item.status in AGENT_ACTIVE_STATUSES:
+            blocked_item_count += 1
+            result_by_item_id[item.id] = _monitoring_result_payload(
+                item=item,
+                observed_price=observed_price,
+                outcome="agent_pending",
+                block_reason="trigger_time_exec_agent_active",
+                message="trigger-time exec-agent decision is already pending for this item",
+            )
+            continue
+
         if item.intent in PRICE_TRIGGERED_MONITORED_INTENTS and not retry_persisted_trigger:
             quote_stale_reason = _quote_stale_reason(
                 settings=settings,
@@ -2845,7 +2859,7 @@ def _evaluate_monitoring_cycle(
                 item.status
                 in (BLOCKED_MONITORING_STATUSES | PENDING_DISPATCH_MONITORING_STATUSES)
                 and item.status != "watch_buy_triggered_blocked"
-            ) or item.status in AGENT_ACTIVE_STATUSES:
+            ):
                 item.status = _monitoring_status(item.intent)
             result_by_item_id[item.id] = _monitoring_result_payload(
                 item=item,
@@ -2964,35 +2978,6 @@ def _evaluate_monitoring_cycle(
         if retry_persisted_trigger:
             retried_triggered_item_count += 1
             retried_triggered_symbols.add(item.symbol)
-
-        if item.status == AGENT_PENDING_STATUS and _trigger_time_agent_pending_is_stale(
-            settings=settings,
-            item=item,
-            now=triggered_at,
-        ):
-            item.status = _monitoring_status(item.intent)
-            _record_monitoring_event(
-                item=item,
-                event={
-                    "event": "trigger_time_exec_agent_pending_recovered",
-                    "reason": "trigger_time_exec_agent_pending_timeout",
-                    "message": "stale trigger-time exec-agent pending state was returned to monitoring",
-                    "recorded_at": triggered_at.isoformat(),
-                },
-            )
-
-        if item.status in AGENT_ACTIVE_STATUSES:
-            blocked_item_count += 1
-            result_by_item_id[item.id] = _monitoring_result_payload(
-                item=item,
-                observed_price=observed_price,
-                outcome="agent_pending",
-                block_reason="trigger_time_exec_agent_active",
-                message="trigger-time exec-agent decision is already pending for this item",
-                trigger_reason=trigger_reason,
-                trigger_metadata=trigger_metadata,
-            )
-            continue
 
         triggered_item_count += 1
         triggered_symbols.add(item.symbol)
@@ -3137,70 +3122,100 @@ def _evaluate_monitoring_cycle(
         action = symbol_actions.popleft()
         if action.item.status in (
             BLOCKED_MONITORING_STATUSES | PENDING_DISPATCH_MONITORING_STATUSES
-        ) or action.item.status in AGENT_ACTIVE_STATUSES:
+        ):
             action.item.status = _monitoring_status(action.item.intent)
+        if action.item.status in AGENT_ACTIVE_STATUSES:
+            blocked_item_count += 1
+            result_by_item_id[action.item.id] = _monitoring_result_payload(
+                item=action.item,
+                observed_price=action.observed_price,
+                outcome="agent_pending",
+                block_reason="trigger_time_exec_agent_active",
+                message="trigger-time exec-agent decision is already pending for this item",
+                trigger_reason=action.trigger_reason,
+                trigger_metadata=action.trigger_metadata,
+            )
+            if symbol_actions:
+                pending_symbols.append(symbol)
+            continue
         is_watch_buy = _is_watch_buy_item(action.item)
         deterministic_sell_quantity_cap: int | None = None
         limit_price_override: Decimal | None = None
         if is_watch_buy:
             action.item.status = "watch_buy_triggered"
             trigger_time_agent_quantity: int | None = None
-            trigger_time_agent_enabled = trigger_time_exec_agent.trigger_time_exec_agent_enabled(
-                settings=settings,
-                item=action.item,
-            )
-            if trigger_time_agent_enabled and not _watch_buy_entry_line_bypasses_agent(action):
-                if _watch_buy_trigger_cross_pullback_bypasses_agent(action):
-                    agent_result = _resolve_trigger_time_quality_gate_delay(
+            control_state = ensure_runtime_control_state(settings=settings, db=db)
+            entry_block_reason = automated_buy_submission_block_reason(control_state)
+            if entry_block_reason is not None:
+                approval = WatchBuyOrderApproval(
+                    quantity=None,
+                    reason=entry_block_reason,
+                    message=(
+                        "automated buy submission is blocked by runtime safety controls"
+                    ),
+                )
+            else:
+                trigger_time_agent_enabled = (
+                    trigger_time_exec_agent.trigger_time_exec_agent_enabled(
                         settings=settings,
-                        db=db,
-                        adapter=adapter,
-                        action=action,
-                        triggered_at=triggered_at,
-                        cycle_started=cycle_started,
+                        item=action.item,
                     )
-                else:
-                    agent_result = _resolve_trigger_time_agent_action(
-                        settings=settings,
-                        db=db,
-                        adapter=adapter,
-                        action=action,
-                        triggered_at=triggered_at,
-                        cycle_started=cycle_started,
-                        intended_quantity=None,
-                        remaining_quantity=None,
-                    )
-                if agent_result is not None:
-                    if agent_result.refreshed_price is not None:
-                        action = _action_with_refreshed_price(
+                )
+                if (
+                    trigger_time_agent_enabled
+                    and not _watch_buy_entry_line_bypasses_agent(action)
+                ):
+                    if _watch_buy_trigger_cross_pullback_bypasses_agent(action):
+                        agent_result = _resolve_trigger_time_quality_gate_delay(
+                            settings=settings,
+                            db=db,
+                            adapter=adapter,
                             action=action,
-                            price=agent_result.refreshed_price,
+                            triggered_at=triggered_at,
+                            cycle_started=cycle_started,
                         )
-                        prices[action.item.symbol] = agent_result.refreshed_price
-                    if agent_result.quantity is None:
-                        blocked_item_count += 1
-                        result_by_item_id[action.item.id] = agent_result.result_payload
-                        if symbol_actions:
-                            pending_symbols.append(symbol)
-                        continue
-                    trigger_time_agent_quantity = agent_result.quantity
-                    limit_price_override = agent_result.limit_price
-            approval = _resolve_watch_buy_order(
-                settings=settings,
-                db=db,
-                adapter=adapter,
-                item=action.item,
-                observed_price=action.observed_price,
-                price=prices.get(action.item.symbol),
-                execution_price_override=limit_price_override,
-                requested_quantity=trigger_time_agent_quantity,
-                trigger_time_agent_approved=trigger_time_agent_quantity is not None,
-                sizing_source=(
-                    "trigger_time_exec_agent_approval"
-                    if trigger_time_agent_quantity is not None
-                    else None
-                ),
-            )
+                    else:
+                        agent_result = _resolve_trigger_time_agent_action(
+                            settings=settings,
+                            db=db,
+                            adapter=adapter,
+                            action=action,
+                            triggered_at=triggered_at,
+                            cycle_started=cycle_started,
+                            intended_quantity=None,
+                            remaining_quantity=None,
+                        )
+                    if agent_result is not None:
+                        if agent_result.refreshed_price is not None:
+                            action = _action_with_refreshed_price(
+                                action=action,
+                                price=agent_result.refreshed_price,
+                            )
+                            prices[action.item.symbol] = agent_result.refreshed_price
+                        if agent_result.quantity is None:
+                            blocked_item_count += 1
+                            result_by_item_id[action.item.id] = agent_result.result_payload
+                            if symbol_actions:
+                                pending_symbols.append(symbol)
+                            continue
+                        trigger_time_agent_quantity = agent_result.quantity
+                        limit_price_override = agent_result.limit_price
+                approval = _resolve_watch_buy_order(
+                    settings=settings,
+                    db=db,
+                    adapter=adapter,
+                    item=action.item,
+                    observed_price=action.observed_price,
+                    price=prices.get(action.item.symbol),
+                    execution_price_override=limit_price_override,
+                    requested_quantity=trigger_time_agent_quantity,
+                    trigger_time_agent_approved=trigger_time_agent_quantity is not None,
+                    sizing_source=(
+                        "trigger_time_exec_agent_approval"
+                        if trigger_time_agent_quantity is not None
+                        else None
+                    ),
+                )
             quantity = approval.quantity
             if quantity is None:
                 blocked_item_count += 1
@@ -3354,7 +3369,7 @@ def _evaluate_monitoring_cycle(
                 )
             else:
                 control_state = ensure_runtime_control_state(settings=settings, db=db)
-                if automated_order_submission_allowed(control_state):
+                if automated_buy_submission_allowed(control_state):
                     if watch_buy_cash_reservation is None:
                         watch_buy_cash_reservation = _load_watch_buy_cash_reservation(
                             settings=settings,
@@ -4152,7 +4167,7 @@ def supersede_duplicate_active_watch_buys(
             effective_plan_filter,
             ExecutionPlanItem.side == "buy",
             ExecutionPlanItem.intent.in_(tuple(WATCH_BUY_INTENTS)),
-            ExecutionPlanItem.status.in_(tuple(ACTIVE_WATCH_MONITORING_STATUSES)),
+            ExecutionPlanItem.status.in_(tuple(LIVE_WATCH_ENTRY_STATUSES)),
             ~ExecutionPlanItem.broker_orders.any(),
         )
         .options(
@@ -4270,6 +4285,7 @@ def _claim_trigger_time_agent_action(
     triggered_at: datetime,
 ) -> TriggerTimeAgentClaim | TriggerTimeAgentActionResult:
     item = action.item
+    local_status = item.status
     local_risk_context = dict(_loaded_risk_context(item))
     local_quantity_policy = item.quantity_policy
     item_state = sa_inspect(item)
@@ -4294,7 +4310,7 @@ def _claim_trigger_time_agent_action(
     if current_state is None:
         db.rollback()
         return _trigger_time_agent_claim_lost_result(item=item, action=action)
-    current_status, _ = current_state
+    current_status, current_risk_context = current_state
     with db.no_autoflush:
         db.refresh(
             item,
@@ -4324,11 +4340,29 @@ def _claim_trigger_time_agent_action(
         _pending_dispatch_status(item.intent),
         "watch_buy_triggered",
         "watch_buy_triggered_blocked",
-        AGENT_DELAY_STATUS,
     }
+    local_recovery_event = local_risk_context.get("last_monitoring_event")
+    recovered_agent_state_is_claimable = bool(
+        current_status in AGENT_ACTIVE_STATUSES
+        and local_status == _monitoring_status(item.intent)
+        and isinstance(local_recovery_event, dict)
+        and local_recovery_event.get("event")
+        in {
+            "trigger_time_exec_agent_pending_recovered",
+            "trigger_time_exec_agent_state_recovered",
+        }
+        and local_recovery_event.get("previous_status") == current_status
+        and json_payload_hash(current_risk_context)
+        == json_payload_hash(
+            prior_risk_context if isinstance(prior_risk_context, dict) else {}
+        )
+    )
     refreshed_identity = _trigger_time_agent_claim_identity(item)
     if (
-        current_status not in claimable_statuses
+        (
+            current_status not in claimable_statuses
+            and not recovered_agent_state_is_claimable
+        )
         or refreshed_identity != expected_identity
     ):
         db.rollback()
@@ -6135,7 +6169,7 @@ def _load_monitored_items(
         ExecutionPlan.mode == settings.runtime_mode,
         ExecutionPlanItem.side == "sell",
         ExecutionPlanItem.intent.in_(tuple(SELL_MONITORED_INTENTS)),
-        ~ExecutionPlanItem.status.in_(tuple(NON_MONITORABLE_PLAN_ITEM_STATUSES)),
+        ExecutionPlanItem.status.in_(tuple(LOADABLE_SELL_MONITORING_STATUSES)),
         provider_filter,
         effective_plan_filter,
     ]
@@ -6203,12 +6237,7 @@ def _load_monitored_items(
         )
     if symbols:
         symbol_list = _ordered_symbol_scope(symbols)
-        sell_fast_statuses = (
-            SELL_ACTIVE_MONITORING_STATUSES
-            | BLOCKED_MONITORING_STATUSES
-            | PENDING_DISPATCH_MONITORING_STATUSES
-            | AGENT_ACTIVE_STATUSES
-        )
+        sell_fast_statuses = ACTIVE_SELL_MONITORING_STATUSES
         if exclude_pending_config:
             sell_fast_statuses = sell_fast_statuses | {
                 "max_holding_close_sell_pending_config"
@@ -6279,7 +6308,7 @@ def _load_monitored_items(
                     ExecutionPlanItem.symbol.in_(symbol_list),
                     ExecutionPlanItem.side == "buy",
                     ExecutionPlanItem.intent.in_(tuple(WATCH_BUY_INTENTS)),
-                    ExecutionPlanItem.status.in_(tuple(WATCH_MONITORING_STATUSES)),
+                    ExecutionPlanItem.status.in_(tuple(ACTIVE_WATCH_MONITORING_STATUSES)),
                     provider_filter,
                     effective_plan_filter,
                 )
@@ -6370,7 +6399,7 @@ def _load_monitored_items(
                 ExecutionPlanItem.symbol.in_(symbol_list),
                 ExecutionPlanItem.side == "buy",
                 ExecutionPlanItem.intent.in_(tuple(WATCH_BUY_INTENTS)),
-                ExecutionPlanItem.status.in_(tuple(WATCH_MONITORING_STATUSES)),
+                ExecutionPlanItem.status.in_(tuple(ACTIVE_WATCH_MONITORING_STATUSES)),
                 provider_filter,
                 effective_plan_filter,
             )
@@ -6388,6 +6417,7 @@ def _load_monitored_items(
                     ExecutionPlanItem.trigger_price,
                     ExecutionPlanItem.time_in_force,
                     ExecutionPlanItem.risk_context,
+                    ExecutionPlanItem.decision_agent_name,
                     ExecutionPlanItem.source_market_date,
                     ExecutionPlanItem.provider,
                     ExecutionPlanItem.asset_class,
@@ -6483,6 +6513,7 @@ def _load_monitored_items(
                 ExecutionPlanItem.trigger_price,
                 ExecutionPlanItem.time_in_force,
                 ExecutionPlanItem.risk_context,
+                ExecutionPlanItem.decision_agent_name,
                 ExecutionPlanItem.source_market_date,
                 ExecutionPlanItem.provider,
                 ExecutionPlanItem.asset_class,
@@ -6534,6 +6565,15 @@ def _canonicalize_loaded_active_watch_buys(
     current_market_date: date | None = None,
     effective_at: datetime | None = None,
 ) -> list[ExecutionPlanItem]:
+    items = [
+        item
+        for item in items
+        if not (
+            item.side == "buy"
+            and item.intent in WATCH_BUY_INTENTS
+            and is_exec_agent_sizing_policy(item.quantity_policy)
+        )
+    ]
     resolved_market_date = current_market_date or datetime.now(KRX_TIMEZONE).date()
     if effective_at is not None:
         items = [
@@ -7063,7 +7103,7 @@ def _append_held_active_sell_monitor_reconciliations(
             ExecutionPlan.mode == settings.runtime_mode,
             ExecutionPlanItem.side == "sell",
             ExecutionPlanItem.intent.in_(tuple(SELL_MONITORED_INTENTS)),
-            ExecutionPlanItem.status.in_(tuple(SELL_ACTIVE_MONITORING_STATUSES)),
+            ExecutionPlanItem.status.in_(tuple(ACTIVE_SELL_MONITORING_STATUSES)),
             ExecutionPlanItem.symbol.in_(eligible_symbols),
             _kis_plan_item_provider_filter(),
             or_(
@@ -7156,7 +7196,7 @@ def _append_held_active_sell_monitor_reconciliations(
         if (
             item.side == "sell"
             and item.intent in SELL_MONITORED_INTENTS
-            and item.status in SELL_ACTIVE_MONITORING_STATUSES
+            and item.status in ACTIVE_SELL_MONITORING_STATUSES
         ):
             active_sell_items_by_route.setdefault(
                 (item.symbol, item.intent), []
@@ -8624,6 +8664,53 @@ def _trigger_time_agent_pending_is_stale(
     return now >= recorded_at + timedelta(seconds=timeout_seconds)
 
 
+def _trigger_time_agent_approved_is_stale(
+    *,
+    settings: Settings,
+    item: ExecutionPlanItem,
+    now: datetime,
+) -> bool:
+    if item.status != AGENT_APPROVED_PENDING_SUBMIT_STATUS:
+        return False
+    risk_context = _loaded_risk_context(item)
+    interaction = risk_context.get("last_trigger_time_exec_agent_interaction")
+    recorded_at = None
+    if isinstance(interaction, dict):
+        recorded_at = _parse_event_datetime(interaction.get("recorded_at"))
+    if recorded_at is None:
+        latest_event = risk_context.get("last_monitoring_event")
+        if (
+            isinstance(latest_event, dict)
+            and latest_event.get("event") == "trigger_time_exec_agent_approved"
+        ):
+            recorded_at = _parse_event_datetime(latest_event.get("recorded_at"))
+    if recorded_at is None:
+        return True
+    timeout_seconds = int(getattr(settings, "exec_agent_trigger_time_timeout_seconds", 90))
+    return now >= recorded_at + timedelta(seconds=timeout_seconds)
+
+
+def _trigger_time_agent_recovery_reason(
+    *,
+    settings: Settings,
+    item: ExecutionPlanItem,
+    now: datetime,
+    delay_until: datetime | None,
+) -> str | None:
+    if item.status == AGENT_PENDING_STATUS:
+        if _trigger_time_agent_pending_is_stale(settings=settings, item=item, now=now):
+            return "trigger_time_exec_agent_pending_timeout"
+        return None
+    if item.status == AGENT_DELAY_STATUS:
+        if delay_until is None or now >= delay_until:
+            return "trigger_time_exec_agent_delay_expired"
+        return None
+    if item.status == AGENT_APPROVED_PENDING_SUBMIT_STATUS:
+        if _trigger_time_agent_approved_is_stale(settings=settings, item=item, now=now):
+            return "trigger_time_exec_agent_approved_pending_submit_timeout"
+    return None
+
+
 def _latest_monitoring_event(item: ExecutionPlanItem) -> dict[str, object] | None:
     risk_context = _loaded_risk_context(item)
     if not isinstance(risk_context, dict):
@@ -8909,15 +8996,16 @@ def _protective_stop_retry_generation(
 
 
 def _monitored_item_filter():
-    return and_(
-        ~ExecutionPlanItem.status.in_(tuple(NON_MONITORABLE_PLAN_ITEM_STATUSES)),
-        or_(
+    return or_(
+        and_(
+            ExecutionPlanItem.side == "sell",
             ExecutionPlanItem.intent.in_(tuple(SELL_MONITORED_INTENTS)),
-            and_(
-                ExecutionPlanItem.side == "buy",
-                ExecutionPlanItem.intent.in_(tuple(WATCH_BUY_INTENTS)),
-                ExecutionPlanItem.status.in_(tuple(WATCH_MONITORING_STATUSES)),
-            ),
+            ExecutionPlanItem.status.in_(tuple(LOADABLE_SELL_MONITORING_STATUSES)),
+        ),
+        and_(
+            ExecutionPlanItem.side == "buy",
+            ExecutionPlanItem.intent.in_(tuple(WATCH_BUY_INTENTS)),
+            ExecutionPlanItem.status.in_(tuple(ACTIVE_WATCH_MONITORING_STATUSES)),
         ),
     )
 
@@ -9506,9 +9594,7 @@ def _has_active_sell_monitor(
     evaluated_at: datetime,
 ) -> bool:
     candidate_statuses = (
-        SELL_ACTIVE_MONITORING_STATUSES
-        | BLOCKED_MONITORING_STATUSES
-        | PENDING_DISPATCH_MONITORING_STATUSES
+        ACTIVE_SELL_MONITORING_STATUSES
         | IN_FLIGHT_BROKER_ORDER_ITEM_STATUSES
         | SELL_PENDING_CONFIG_STATUSES
     )
@@ -9805,7 +9891,10 @@ def _ensure_post_entry_stop_monitor(
             "source": "post_entry_position_sync",
         }
         maintenance_count += 1
-    if existing.status != "stop_sell_monitoring" and _monitoring_item_is_configured(existing):
+    if (
+        existing.status in SELL_PENDING_CONFIG_STATUSES
+        and _monitoring_item_is_configured(existing)
+    ):
         prior_status = existing.status
         existing.status = "stop_sell_monitoring"
         maintenance_count += 1
@@ -9918,7 +10007,10 @@ def _ensure_post_entry_target_monitor(
             "source": "post_entry_position_sync",
         }
         maintenance_count += 1
-    if existing.status != "target_sell_monitoring" and _monitoring_item_is_configured(existing):
+    if (
+        existing.status in SELL_PENDING_CONFIG_STATUSES
+        and _monitoring_item_is_configured(existing)
+    ):
         prior_status = existing.status
         existing.status = "target_sell_monitoring"
         maintenance_count += 1
@@ -11213,20 +11305,12 @@ def _resolve_watch_buy_order(
         return live_veto
 
     control_state = ensure_runtime_control_state(settings=settings, db=db)
-    if not automated_order_submission_allowed(control_state):
-        if quantity is not None:
-            return WatchBuyOrderApproval(quantity=quantity)
-        if _watch_buy_candidate_budget(item) is not None:
-            block_reason = automated_order_submission_block_reason(control_state)
-            return WatchBuyOrderApproval(
-                quantity=None,
-                reason=block_reason,
-                message="automated order submission is blocked by runtime safety controls",
-            )
+    block_reason = automated_buy_submission_block_reason(control_state)
+    if block_reason is not None:
         return WatchBuyOrderApproval(
             quantity=None,
-            reason="missing_quantity",
-            message="watch buy requires a positive share quantity while runtime is blocked",
+            reason=block_reason,
+            message="automated buy submission is blocked by runtime safety controls",
         )
 
     stop_price = _watch_buy_stop_price(item)
@@ -11950,14 +12034,7 @@ def _parse_buy_quantity(quantity_policy: dict[str, object] | None) -> int | None
 
 
 def _watch_buy_requires_exec_agent_sizing(item: ExecutionPlanItem) -> bool:
-    quantity_policy = item.quantity_policy
-    if not isinstance(quantity_policy, dict):
-        return False
-    for key in ("kind", "type"):
-        value = quantity_policy.get(key)
-        if isinstance(value, str) and value.strip().lower() == "exec_agent_sized":
-            return True
-    return False
+    return is_delegated_exec_agent_sizing_policy(item.quantity_policy)
 
 
 def _watch_buy_exec_agent_sizing_fallback_allowed(
@@ -12971,7 +13048,7 @@ def _parse_fraction(value: object) -> Decimal | None:
 
 def _is_watch_buy_item(item: ExecutionPlanItem) -> bool:
     return item.side == "buy" and (
-        item.intent in WATCH_BUY_INTENTS or item.status in WATCH_MONITORING_STATUSES
+        item.intent in WATCH_BUY_INTENTS or item.status in WATCH_LIFECYCLE_STATUSES
     )
 
 

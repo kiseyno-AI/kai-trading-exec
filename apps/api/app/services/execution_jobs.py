@@ -29,6 +29,7 @@ from app.models.runtime import (
 from app.services.broker_orders import place_broker_order
 from app.services.exec_agent_approval import is_legacy_unverified_exec_agent_sizing
 from app.services.broker_auth import build_broker_adapter, ensure_authenticated_broker_session
+from app.services.execution_semantics import is_delegated_exec_agent_sizing_policy
 from app.services.json_compaction import compact_json_object
 from app.services.monitoring_price_source import (
     _is_trusted_exchange_freshness_source,
@@ -46,9 +47,11 @@ from app.services.rejected_order_retries import (
 )
 from app.services.runtime_controls import (
     RUNTIME_CONTROL_ID,
+    automated_buy_submission_block_reason,
     automated_order_submission_allowed,
     automated_order_submission_block_reason,
     ensure_runtime_control_state,
+    hourly_risk_off_retry_after_at,
     runtime_safety_payload,
 )
 from app.services.runtime_transitions import set_execution_job_status
@@ -300,10 +303,16 @@ def dispatch_due_execution_jobs(
     completed = 0
     retrying = 0
     failed = 0
+    blocked_buy_job_count = 0
     serialized_jobs: list[dict[str, object]] = []
     krx_calendar_state_by_date: dict[date, bool | None] = {}
+    buy_block_reason = automated_buy_submission_block_reason(control_state)
 
     for job in due_jobs:
+        if buy_block_reason is not None and job.plan_item.side == "buy":
+            blocked_buy_job_count += 1
+            serialized_jobs.append(serialize_execution_job(job))
+            continue
         initial_next_open_guard = _guard_initial_next_open_submission(
             settings=settings,
             db=db,
@@ -353,14 +362,31 @@ def dispatch_due_execution_jobs(
         settings=settings,
         db=db,
         triggered_at=triggered_at,
+        include_buys=buy_block_reason is None,
+    )
+    if buy_block_reason == "hourly_plan_risk_off":
+        buy_retry_after_at = hourly_risk_off_retry_after_at(
+            settings=settings,
+            state=control_state,
+            now=triggered_at,
+        )
+        if buy_retry_after_at is not None:
+            next_dispatch_at = (
+                min(next_dispatch_at, buy_retry_after_at)
+                if next_dispatch_at is not None
+                else buy_retry_after_at
+            )
+    all_due_jobs_buy_blocked = bool(
+        due_jobs and blocked_buy_job_count == len(due_jobs)
     )
     return DispatchExecutionJobsResult(
         status_code=200,
         payload={
-            "blocked": False,
-            "block_reason": None,
+            "blocked": all_due_jobs_buy_blocked,
+            "block_reason": buy_block_reason if all_due_jobs_buy_blocked else None,
             "triggered_at": triggered_at.isoformat(),
             "due_job_count": len(due_jobs),
+            "blocked_buy_job_count": blocked_buy_job_count,
             "completed_job_count": completed,
             "retrying_job_count": retrying,
             "failed_job_count": failed,
@@ -1569,12 +1595,12 @@ def _next_open_buy_quantity(plan_item: ExecutionPlanItem) -> int | None:
     if not isinstance(quantity_policy, dict):
         return None
 
+    if is_delegated_exec_agent_sizing_policy(quantity_policy):
+        return None
+
     kind = quantity_policy.get("kind") or quantity_policy.get("type")
     if kind in {"shares", "fixed_quantity"}:
         return _parse_positive_int(quantity_policy.get("quantity"))
-
-    if kind == "exec_agent_sized":
-        return None
 
     return None
 
@@ -1709,8 +1735,9 @@ def _next_dispatchable_job_at(
     settings: Settings,
     db: Session,
     triggered_at: datetime,
+    include_buys: bool = True,
 ) -> datetime | None:
-    row = db.execute(
+    query = (
         select(ExecutionJob.id, ExecutionJob.scheduled_for)
         .join(ExecutionJob.plan_item)
         .join(ExecutionPlanItem.plan)
@@ -1719,14 +1746,19 @@ def _next_dispatchable_job_at(
             ExecutionJob.status.in_(DISPATCHABLE_JOB_STATUSES),
             ExecutionPlanItem.status.in_(CLAIMABLE_PLAN_ITEM_STATUSES),
         )
-        .order_by(
+    )
+    if not include_buys:
+        query = query.where(ExecutionPlanItem.side != "buy")
+    query = (
+        query.order_by(
             ExecutionJob.scheduled_for.is_not(None).asc(),
             ExecutionJob.scheduled_for.asc(),
             ExecutionJob.created_at.asc(),
             ExecutionJob.id.asc(),
         )
         .limit(1)
-    ).first()
+    )
+    row = db.execute(query).first()
     if row is None:
         return None
     if row.scheduled_for is None:

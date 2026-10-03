@@ -125,9 +125,10 @@ Expected signal: `status: "active"` with an access-token expiry timestamp.
 
 ## Optional single live order cycle
 
-Use this section only when the operator has an approved minimal live order to
-submit. The runtime must be resumed immediately before the order because
-`POST /orders` is blocked while paused.
+Use this section only when the operator has an approved minimal live buy to
+submit. The runtime must be resumed immediately before the order because new or
+increasing buys are blocked while paused. Protective and risk-reducing sells
+remain eligible; the kill switch blocks both sides.
 
 1. Resume automated actions:
 

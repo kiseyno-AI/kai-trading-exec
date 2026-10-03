@@ -7,7 +7,9 @@ from app.api.schemas.execution import ExecutionPlanItemRequest, PlaceOrderReques
 from app.services.execution_semantics import (
     INTRADAY_WATCH_BUY_INTENTS,
     canonical_krx_asset_class,
+    is_exec_agent_sizing_policy,
     is_short_term_watch_buy_intent,
+    is_trigger_time_exec_agent_sizing_policy,
     watch_buy_direction_from_payloads,
 )
 from app.core.config import Settings
@@ -91,6 +93,16 @@ def test_watch_buy_direction_is_resolved_consistently_from_persisted_payloads(
     expected: str,
 ) -> None:
     assert watch_buy_direction_from_payloads(payload) == expected
+
+
+def test_pre_monitor_sizing_wins_over_conflicting_trigger_time_alias() -> None:
+    policy = {
+        "type": "trigger_time_exec_agent_sized",
+        "kind": "exec_agent_sized",
+    }
+
+    assert is_exec_agent_sizing_policy(policy) is True
+    assert is_trigger_time_exec_agent_sizing_policy(policy) is False
 
 
 @pytest.mark.parametrize(

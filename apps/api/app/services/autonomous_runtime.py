@@ -35,9 +35,7 @@ from app.services.execution_semantics import (
 )
 from app.services.monitoring import (
     ACTIVE_WATCH_MONITORING_STATUSES,
-    BLOCKED_MONITORING_STATUSES,
     PENDING_DISPATCH_MONITORING_STATUSES,
-    SELL_ACTIVE_MONITORING_STATUSES,
     SELL_MONITORED_INTENTS,
     WATCH_BUY_INTENTS,
     _active_kis_position_filters,
@@ -47,6 +45,10 @@ from app.services.monitoring import (
     list_autonomous_monitoring_symbols,
     run_autonomous_monitoring_cycle,
     _load_core_desired_monitoring_symbols,
+)
+from app.services.runtime_transitions import (
+    ACTIVE_SELL_MONITORING_STATUSES,
+    AGENT_ACTIVE_MONITORING_STATUSES,
 )
 from app.services.nxt_eligibility import refresh_nxt_eligible_symbols
 from app.services.position_identity import (
@@ -1913,11 +1915,7 @@ class AutonomousRuntimeCoordinator:
         symbol_placeholders = ",".join("?" for _ in symbols)
         watch_status_placeholders = ",".join("?" for _ in ACTIVE_WATCH_MONITORING_STATUSES)
         watch_intent_placeholders = ",".join("?" for _ in WATCH_BUY_INTENTS)
-        sell_statuses = (
-            SELL_ACTIVE_MONITORING_STATUSES
-            | BLOCKED_MONITORING_STATUSES
-            | PENDING_DISPATCH_MONITORING_STATUSES
-        )
+        sell_statuses = ACTIVE_SELL_MONITORING_STATUSES
         sell_status_placeholders = ",".join("?" for _ in sell_statuses)
         sell_intent_placeholders = ",".join("?" for _ in SELL_MONITORED_INTENTS)
         active_scope = _active_kis_position_scope(self.settings)
@@ -2253,11 +2251,7 @@ class AutonomousRuntimeCoordinator:
                 ExecutionPlan.mode == self.settings.runtime_mode,
                 ExecutionPlanItem.side == "sell",
                 ExecutionPlanItem.status.in_(
-                    tuple(
-                        SELL_ACTIVE_MONITORING_STATUSES
-                        | BLOCKED_MONITORING_STATUSES
-                        | PENDING_DISPATCH_MONITORING_STATUSES
-                    )
+                    tuple(ACTIVE_SELL_MONITORING_STATUSES)
                 ),
                 ExecutionPlanItem.intent.in_(tuple(SELL_MONITORED_INTENTS)),
                 ExecutionPlanItem.symbol.in_(symbols or [""]),
@@ -2361,7 +2355,7 @@ class AutonomousRuntimeCoordinator:
                 observed_price=observed_price,
                 triggered_at=started_at,
             )
-            if item.status.startswith("triggered_pending_agent"):
+            if item.status in AGENT_ACTIVE_MONITORING_STATUSES:
                 blocked_item_count += 1
                 outcome = "agent_pending"
             elif triggered:

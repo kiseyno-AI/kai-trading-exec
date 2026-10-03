@@ -28,8 +28,8 @@ from app.services.broker_order_state import (
     active_local_broker_order_filters,
 )
 from app.services.runtime_controls import (
-    automated_order_submission_allowed,
-    automated_order_submission_block_reason,
+    automated_buy_submission_allowed,
+    automated_buy_submission_block_reason,
     ensure_runtime_control_state,
     runtime_safety_payload,
 )
@@ -76,7 +76,7 @@ def evaluate_short_term_watcher_decision(
     if (
         candidate_rejection is None
         and not command.dry_run
-        and automated_order_submission_allowed(safety_state)
+        and automated_buy_submission_allowed(safety_state)
     ):
         try:
             session_state = ensure_authenticated_broker_session(
@@ -145,8 +145,12 @@ def evaluate_short_term_watcher_decision(
         rejection = _validate_account_context(context=context)
     if rejection is None:
         rejection = _validate_risk_rails(command=command, context=context)
-    if rejection is None and not command.dry_run and not automated_order_submission_allowed(safety_state):
-        block_reason = automated_order_submission_block_reason(safety_state)
+    if (
+        rejection is None
+        and not command.dry_run
+        and not automated_buy_submission_allowed(safety_state)
+    ):
+        block_reason = automated_buy_submission_block_reason(safety_state)
         rejection = ("runtime_safety_blocked", str(block_reason))
 
     audit = {

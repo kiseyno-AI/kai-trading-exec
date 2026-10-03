@@ -259,6 +259,12 @@ Current response includes:
   - `changed_at`
   - `event_id`
 
+`automation_enabled` remains a compatibility field and is derived as
+`not paused and not kill_switch_enabled`; it is not stored independently.
+`automated_order_submission_allowed` represents the all-side kill-switch gate.
+`automated_buy_submission_allowed` additionally reflects the entry pause and
+hourly buy risk-off gate.
+
 If the runtime-control schema cannot be read, both automated submission flags
 fail closed. In that fallback payload `hourly_risk_off.available` is `false`
 and its state fields are `null`, so clients do not mistake missing fence truth
@@ -405,7 +411,7 @@ controls, and reconciliation; those services should use the transition helpers
 when changing broker order, execution job, or execution plan item status.
 
 High-risk transitions also append durable evidence:
-- runtime pause/resume/kill-switch changes write `runtime_control_events`
+- runtime pause/resume/kill-switch/reset changes write `runtime_control_events`
 - broker submissions and reconciliation write `broker_order_events`
 - plan item status changes made through the transition service write
   `execution_plan_item_audits`
@@ -779,7 +785,10 @@ database URL.
 Legacy non-flat positions whose provider/account/exchange fields are still null
 are intentionally excluded from the ordinary stale-truth apply path. After all
 writers are drained, run `--legacy-attribution-exchange` for exactly one of
-`KRX`, `NASD`, `NYSE`, or `AMEX`. The default is a broker-read-only dry-run. An
+`KRX`, `NASD`, `NYSE`, or `AMEX` for KIS, or `US` for the isolated Alpaca paper
+runtime. The Alpaca path rejects live mode and requires a complete,
+broker-authenticated US-equity snapshot with exact fractional quantity and
+average-price evidence. The default is a broker-read-only dry-run. An
 apply requires one or more exact `--approve-position POSITION_ID=64HEX`
 fingerprints copied from that dry-run plus `--actor` and `--reason`. The service
 re-reads complete broker holdings, verifies exact account/exchange/quantity/
@@ -1073,7 +1082,8 @@ Return exec-runtime position view used for monitoring logic.
 ## Control APIs
 
 ### `POST /controls/pause`
-Pause new automated execution actions but keep monitoring alive.
+Pause new or increasing buy entries while keeping monitoring and protective or
+risk-reducing sells active.
 
 Suggested body shape:
 - `actor`
@@ -1088,6 +1098,13 @@ explicit reset flow outside the resume endpoint.
 
 ### `POST /controls/kill-switch`
 Durably disable all automated order submission until explicit operator reset.
+
+### `POST /controls/kill-switch/reset`
+Clear the active kill switch with compare-and-swap protection. The request must
+include `expected_current_event_id` equal to the current applied kill-switch
+event ID. A stale or missing ID cannot clear the switch. A successful reset
+keeps the runtime paused; a separate reviewed `POST /controls/resume` is required
+before new entries can run.
 
 Current control responses include:
 - `action`

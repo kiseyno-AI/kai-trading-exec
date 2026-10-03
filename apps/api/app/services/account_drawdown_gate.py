@@ -1218,6 +1218,7 @@ def latest_account_drawdown_gate_state(
     *,
     settings: Settings,
     db: Session,
+    as_of: datetime | None = None,
 ) -> dict[str, object]:
     if not settings.account_drawdown_gate_enabled:
         return {
@@ -1608,6 +1609,7 @@ def latest_account_drawdown_gate_state(
                 settings=settings,
                 occurred_at=legacy_decision[0],
                 decision=legacy_decision[2],
+                now=as_of,
             )
         )
     )

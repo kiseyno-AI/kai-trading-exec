@@ -1547,6 +1547,90 @@ def test_sqlite_monitoring_snapshot_excludes_terminal_watch_items(tmp_path) -> N
         engine.dispose()
 
 
+def test_monitoring_snapshots_include_live_max_holding_transition_states(
+    tmp_path,
+) -> None:
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'monitoring-max-holding-items.db'}",
+        runtime_mode="paper",
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    coordinator = AutonomousRuntimeCoordinator(
+        settings=settings,
+        session_factory=session_factory,
+        broker_adapter_factory=lambda settings: None,  # type: ignore[arg-type,return-value]
+    )
+    statuses = (
+        "max_holding_close_sell_triggered_blocked",
+        "max_holding_close_sell_triggered_pending_dispatch",
+    )
+    terminal_rows = (
+        ("target_sell", "filled"),
+        ("stop_sell", "expired"),
+        ("max_holding_close_sell", "cancelled"),
+    )
+
+    try:
+        with session_factory() as session:
+            session.add(
+                ExecutionPlan(
+                    external_plan_id="live-max-holding-transition-items",
+                    source="test-fixture",
+                    market_date=date(2026, 9, 23),
+                    mode="paper",
+                    status="accepted",
+                    items=[
+                        ExecutionPlanItem(
+                            id=f"max-holding-{index}",
+                            plan_item_index=index,
+                            symbol=f"{5930 + index:06d}",
+                            side="sell",
+                            intent="max_holding_close_sell",
+                            status=status,
+                            quantity_policy={"kind": "shares", "quantity": 1},
+                            risk_context={"exchange": "KRX"},
+                        )
+                        for index, status in enumerate(statuses)
+                    ]
+                    + [
+                        ExecutionPlanItem(
+                            id=f"terminal-sell-{index}",
+                            plan_item_index=len(statuses) + index,
+                            symbol=f"{6930 + index:06d}",
+                            side="sell",
+                            intent=intent,
+                            status=status,
+                            quantity_policy={"kind": "shares", "quantity": 1},
+                            risk_context={"exchange": "KRX"},
+                        )
+                        for index, (intent, status) in enumerate(terminal_rows)
+                    ],
+                )
+            )
+            session.commit()
+            symbols = ["005930", "005931", "006930", "006931", "006932"]
+
+            raw_snapshot = (
+                coordinator._load_monitoring_runtime_snapshot_for_symbols_from_sqlite(
+                    loaded_at=datetime(2026, 9, 23, 1, tzinfo=UTC),
+                    symbols=symbols,
+                )
+            )
+            orm_snapshot = coordinator._load_monitoring_runtime_snapshot_for_symbols_with_session(
+                db=session,
+                loaded_at=datetime(2026, 9, 23, 1, tzinfo=UTC),
+                symbols=symbols,
+            )
+
+        assert raw_snapshot is not None
+        assert {item.status for item in raw_snapshot.items} == set(statuses)
+        assert {item.status for item in orm_snapshot.items} == set(statuses)
+    finally:
+        engine.dispose()
+
+
 def test_cached_monitoring_loaders_exclude_foreign_and_other_mode_watch_buys(
     tmp_path,
 ) -> None:
@@ -2872,6 +2956,121 @@ def test_repeated_no_price_cycles_skip_database_after_first_checkpoint(
     assert first.get("db_scan_skipped") is not True
     assert cached["db_scan_skipped"] is True
     assert session_open_count == 1
+
+
+def test_no_price_cycle_retries_max_holding_pending_dispatch_without_idle_wait(
+    monkeypatch,
+) -> None:
+    settings = Settings(database_url="sqlite:///:memory:", runtime_mode="paper")
+    coordinator = AutonomousRuntimeCoordinator(
+        settings=settings,
+        session_factory=None,  # type: ignore[arg-type]
+        broker_adapter_factory=lambda settings: object(),
+    )
+    started_at = datetime(2026, 9, 23, 1, 0, tzinfo=UTC)
+    coordinator._monitoring_runtime_snapshot = MonitoringRuntimeSnapshot(
+        loaded_at=started_at,
+        symbols=["005930"],
+        positions_by_symbol={},
+        items=[
+            CachedMonitoringItem(
+                id="max-holding-pending-dispatch",
+                symbol="005930",
+                intent="max_holding_close_sell",
+                status="max_holding_close_sell_triggered_pending_dispatch",
+                trigger_price=None,
+            )
+        ],
+        filled_today_symbols=[],
+    )
+    coordinator._monitoring_next_no_price_db_check_at = started_at + timedelta(
+        seconds=60
+    )
+    session_open_count = 0
+
+    class DummySessionContext:
+        def __enter__(self):
+            nonlocal session_open_count
+            session_open_count += 1
+            return object()
+
+        def __exit__(self, exc_type, exc, traceback) -> None:
+            del exc_type, exc, traceback
+
+    coordinator._cycle_session_factory = lambda: DummySessionContext()  # type: ignore[method-assign]
+    monkeypatch.setattr(coordinator, "_load_monitoring_prices", lambda **kwargs: [])
+    monkeypatch.setattr(
+        "app.services.autonomous_runtime.run_autonomous_monitoring_cycle",
+        lambda **kwargs: SimpleNamespace(
+            status_code=200,
+            payload={
+                "triggered_at": kwargs["now"].isoformat(),
+                "worker_name": "intraday_target_stop_monitor",
+                "evaluated_item_count": 1,
+                "triggered_item_count": 0,
+                "submitted_order_count": 0,
+                "blocked_item_count": 0,
+                "deferred_item_count": 1,
+                "evaluated_symbol_count": 1,
+                "triggered_symbol_count": 0,
+                "submitted_symbols": [],
+                "items": [],
+            },
+        ),
+    )
+
+    payload = coordinator._monitoring_cycle_sync(started_at)
+
+    assert payload.get("db_scan_skipped") is not True
+    assert session_open_count == 1
+
+
+def test_no_price_cycle_does_not_retry_terminal_sell_before_idle_rescan(
+    monkeypatch,
+) -> None:
+    settings = Settings(database_url="sqlite:///:memory:", runtime_mode="paper")
+    coordinator = AutonomousRuntimeCoordinator(
+        settings=settings,
+        session_factory=None,  # type: ignore[arg-type]
+        broker_adapter_factory=lambda settings: object(),
+    )
+    started_at = datetime(2026, 9, 23, 1, 0, tzinfo=UTC)
+    coordinator._monitoring_runtime_snapshot = MonitoringRuntimeSnapshot(
+        loaded_at=started_at,
+        symbols=["005930"],
+        positions_by_symbol={},
+        items=[
+            CachedMonitoringItem(
+                id="terminal-max-holding",
+                symbol="005930",
+                intent="max_holding_close_sell",
+                status="cancelled",
+                trigger_price=None,
+            )
+        ],
+        filled_today_symbols=[],
+    )
+    next_scan_at = started_at + timedelta(seconds=60)
+    coordinator._monitoring_next_no_price_db_check_at = next_scan_at
+    session_open_count = 0
+
+    class DummySessionContext:
+        def __enter__(self):
+            nonlocal session_open_count
+            session_open_count += 1
+            return object()
+
+        def __exit__(self, exc_type, exc, traceback) -> None:
+            del exc_type, exc, traceback
+
+    coordinator._cycle_session_factory = lambda: DummySessionContext()  # type: ignore[method-assign]
+    monkeypatch.setattr(coordinator, "_load_monitoring_prices", lambda **kwargs: [])
+
+    payload = coordinator._monitoring_cycle_sync(started_at)
+
+    assert payload["db_scan_skipped"] is True
+    assert payload["next_db_check_at"] == next_scan_at.isoformat()
+    assert session_open_count == 0
 
 
 def test_dirty_dispatch_schedule_reloads_before_idle_rescan_deadline(monkeypatch) -> None:

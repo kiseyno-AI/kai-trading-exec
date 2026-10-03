@@ -35,7 +35,11 @@ from app.services.position_identity import (
     build_authenticated_broker_position_identity,
     build_position_identity,
 )
-from app.services.runtime_transitions import apply_broker_order_status, set_plan_item_status
+from app.services.runtime_transitions import (
+    SELL_TRIGGERED_BLOCKED_STATUSES,
+    apply_broker_order_status,
+    set_plan_item_status,
+)
 
 BROKER_ORDER_RETRY_JOB_TYPE = "broker_order_retry"
 TEMPORARY_MARKET_REJECT_CLASSIFICATION = "temporary_market_state"
@@ -62,21 +66,22 @@ ACTIVE_ORDER_STATUSES = frozenset(
 DUPLICATE_BLOCKING_ORDER_STATUSES = ACTIVE_ORDER_STATUSES - {
     NormalizedBrokerOrderStatus.RETRY_PENDING.value
 }
-RETRY_COMPATIBLE_PLAN_ITEM_STATUSES = frozenset(
-    {
-        "broker_order_rejected",
-        "broker_order_retry_pending",
-        "broker_order_failed",
-        "retry_pending",
-        "rejected",
-        "failed",
-        "target_sell_triggered_blocked",
-        "stop_sell_triggered_blocked",
-        "watch_buy_triggered_blocked",
-        "watch_buy_triggered_pending_dispatch",
-        "next_open_buy_retry_pending",
-        "next_open_buy_failed",
-    }
+RETRY_COMPATIBLE_PLAN_ITEM_STATUSES = (
+    frozenset(
+        {
+            "broker_order_rejected",
+            "broker_order_retry_pending",
+            "broker_order_failed",
+            "retry_pending",
+            "rejected",
+            "failed",
+            "watch_buy_triggered_blocked",
+            "watch_buy_triggered_pending_dispatch",
+            "next_open_buy_retry_pending",
+            "next_open_buy_failed",
+        }
+    )
+    | SELL_TRIGGERED_BLOCKED_STATUSES
 )
 NO_RETRY_PLAN_ITEM_STATUSES = frozenset(
     {

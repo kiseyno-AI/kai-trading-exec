@@ -62,6 +62,7 @@ from app.models.runtime import (
     ExecutionPlanItem,
     ExecutionPosition,
     MonitoringCheckpoint,
+    RuntimeControlState,
 )
 from app.services import autonomous_runtime as autonomous_runtime_service
 from app.services import broker_auth as broker_auth_service
@@ -7831,6 +7832,7 @@ def _build_watch_buy_test_app(
     account_drawdown_recovery_cooldown_seconds: int = 300,
     account_drawdown_recovery_min_observation_interval_seconds: int = 1,
     late_entry_mode: str = "shadow",
+    exec_agent_enabled: bool = False,
 ):
     broker_adapter = StubBrokerAdapter(
         config=BrokerConfig(
@@ -7870,6 +7872,7 @@ def _build_watch_buy_test_app(
                 account_drawdown_recovery_min_observation_interval_seconds
             ),
             watch_buy_late_entry_mode=late_entry_mode,
+            exec_agent_enabled=exec_agent_enabled,
             **settings_overrides,
         ),
         broker_adapter=broker_adapter,
@@ -8681,7 +8684,7 @@ def _create_watch_buy_candidate(
         expected_status = "pending_configuration"
     else:
         expected_status = (
-            "watch_monitoring_pending"
+            "watch_sizing_pending"
             if (quantity_policy or {}).get("type") == "exec_agent_sized"
             else "watch_monitoring_active"
         )
@@ -11397,7 +11400,7 @@ def test_exec_agent_sized_watch_buy_waits_for_agent_quantity_without_submitting(
     with app.state.db_session_factory() as session:
         pending_item = session.get(ExecutionPlanItem, item_id)
         assert pending_item is not None
-        assert pending_item.status == "watch_monitoring_pending"
+        assert pending_item.status == "watch_sizing_pending"
         assert pending_item.quantity_policy["type"] == "exec_agent_sized"
         assert "kind" not in pending_item.quantity_policy
 
@@ -11413,18 +11416,17 @@ def test_exec_agent_sized_watch_buy_waits_for_agent_quantity_without_submitting(
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["triggered_item_count"] == 1
+    assert payload["triggered_item_count"] == 0
     assert payload["submitted_order_count"] == 0
-    assert payload["blocked_item_count"] == 1
-    assert payload["items"][0]["outcome"] == "blocked"
-    assert payload["items"][0]["block_reason"] == "exec_agent_sizing_pending"
+    assert payload["blocked_item_count"] == 0
+    assert payload["items"] == []
     assert broker_adapter.order_calls == []
 
     with app.state.db_session_factory() as session:
         item = session.get(ExecutionPlanItem, item_id)
         assert item is not None
-        assert item.status == "watch_buy_triggered_blocked"
-        assert item.risk_context["last_monitoring_event"]["reason"] == "exec_agent_sizing_pending"
+        assert item.status == "watch_sizing_pending"
+        assert "last_monitoring_event" not in item.risk_context
 
     engine.dispose()
 
@@ -11754,7 +11756,9 @@ def test_watch_buy_safety_pause_keeps_trigger_retryable() -> None:
     assert payload["items"][0]["block_reason"] == "paused"
     assert payload["items"][0]["status"] == "watch_buy_triggered_blocked"
     assert broker_adapter.authenticate_calls == 0
+    assert broker_adapter.account_snapshot_calls == 0
     assert broker_adapter.order_calls == []
+    assert client.get("/orders").json() == []
 
     with app.state.db_session_factory() as session:
         item = session.get(ExecutionPlanItem, item_id)
@@ -11790,6 +11794,95 @@ def test_watch_buy_safety_pause_keeps_trigger_retryable() -> None:
     assert retry_payload["items"][0]["status"] == "watch_buy_submitted"
     assert len(broker_adapter.order_calls) == 1
 
+    engine.dispose()
+
+
+def test_paused_watch_buy_skips_trigger_time_agent_and_broker_io(monkeypatch) -> None:
+    app, engine, client, broker_adapter = _build_watch_buy_test_app(
+        resume=False,
+        exec_agent_enabled=True,
+    )
+    _create_watch_buy_candidate(
+        client,
+        plan_id="plan-watch-buy-paused-before-agent-1",
+        risk_context={
+            "exchange": "KRX",
+            "stop_price": "70000.00",
+            "trigger_direction": "at_or_above",
+        },
+    )
+
+    def fail_if_trigger_time_agent_runs(**_kwargs):
+        pytest.fail("paused watch buy reached trigger-time exec-agent I/O")
+
+    monkeypatch.setattr(
+        monitoring_service,
+        "_resolve_trigger_time_agent_action",
+        fail_if_trigger_time_agent_runs,
+    )
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "paused runtime must gate before trigger-time agent",
+            "prices": [{"symbol": "005930", "price": "71050.00"}],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["items"][0]["outcome"] == "blocked"
+    assert payload["items"][0]["block_reason"] == "paused"
+    assert broker_adapter.authenticate_calls == 0
+    assert broker_adapter.account_snapshot_calls == 0
+    assert broker_adapter.order_calls == []
+    assert client.get("/orders").json() == []
+    engine.dispose()
+
+
+def test_hourly_risk_off_blocks_known_quantity_watch_buy_before_broker_io() -> None:
+    app, engine, client, broker_adapter = _build_watch_buy_test_app()
+    _create_watch_buy_candidate(
+        client,
+        plan_id="plan-watch-buy-hourly-risk-off-1",
+        risk_context={
+            "exchange": "KRX",
+            "stop_price": "70000.00",
+            "trigger_direction": "at_or_above",
+        },
+    )
+    with app.state.db_session_factory() as session:
+        control_state = session.get(RuntimeControlState, "global")
+        assert control_state is not None
+        control_state.hourly_risk_off_active = True
+        control_state.hourly_risk_off_epoch = 1
+        control_state.hourly_risk_off_context = {"reason": "test_hourly_risk_off"}
+        session.commit()
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "hourly risk-off must gate before broker I/O",
+            "prices": [{"symbol": "005930", "price": "71050.00"}],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["triggered_item_count"] == 1
+    assert payload["submitted_order_count"] == 0
+    assert payload["blocked_item_count"] == 1
+    assert payload["items"][0]["outcome"] == "blocked"
+    assert payload["items"][0]["block_reason"] == "hourly_plan_risk_off"
+    assert payload["items"][0]["status"] == "watch_buy_triggered_blocked"
+    assert broker_adapter.authenticate_calls == 0
+    assert broker_adapter.account_snapshot_calls == 0
+    assert broker_adapter.order_calls == []
+    assert client.get("/orders").json() == []
     engine.dispose()
 
 
@@ -11944,7 +12037,6 @@ def test_budget_only_watch_buy_safety_block_keeps_trigger_retryable(
     assert payload["items"][0]["outcome"] == "blocked"
     assert payload["items"][0]["block_reason"] == expected_block_reason
     assert payload["items"][0]["status"] == "watch_buy_triggered_blocked"
-    assert broker_adapter.authenticate_calls == 0
     assert broker_adapter.order_calls == []
 
     with app.state.db_session_factory() as session:
@@ -12950,6 +13042,7 @@ def test_short_term_watcher_live_submission_respects_runtime_safety_guards() -> 
 
     assert blocked.status_code == 200
     assert blocked.json()["reason_code"] == "runtime_safety_blocked"
+    assert broker_adapter.authenticate_calls == 0
     assert broker_adapter.order_calls == []
     assert client.get("/orders").json() == []
     engine.dispose()
@@ -15489,7 +15582,10 @@ def test_monitoring_evaluate_blocks_aged_profit_protection_for_small_current_pro
     engine.dispose()
 
 
-def test_monitoring_evaluate_reports_blocked_stop_sell_trigger_when_runtime_is_paused() -> None:
+@pytest.mark.parametrize("entry_fence", ("paused", "hourly_risk_off"))
+def test_monitoring_evaluate_submits_protective_stop_while_entries_are_blocked(
+    entry_fence: str,
+) -> None:
     broker_adapter = StubBrokerAdapter(
         config=BrokerConfig(
             provider="kis",
@@ -15511,6 +15607,21 @@ def test_monitoring_evaluate_reports_blocked_stop_sell_trigger_when_runtime_is_p
         broker_adapter=broker_adapter,
     )
     client = TestClient(app)
+
+    if entry_fence == "hourly_risk_off":
+        assert client.post(
+            "/controls/resume",
+            json={"actor": "ops", "source": "test", "reason": "enable exits"},
+        ).status_code == 200
+        with app.state.db_session_factory() as session:
+            control_state = session.get(RuntimeControlState, "global")
+            assert control_state is not None
+            control_state.hourly_risk_off_active = True
+            control_state.hourly_risk_off_epoch = 1
+            control_state.hourly_risk_off_context = {
+                "reason": "protective_sell_regression"
+            }
+            session.commit()
 
     plan_response = client.post(
         "/execution-plans",
@@ -15551,7 +15662,7 @@ def test_monitoring_evaluate_reports_blocked_stop_sell_trigger_when_runtime_is_p
         json={
             "actor": "ops",
             "source": "test",
-            "reason": "paused trigger check",
+            "reason": f"{entry_fence} trigger check",
             "prices": [
                 {
                     "symbol": "005930",
@@ -15565,37 +15676,35 @@ def test_monitoring_evaluate_reports_blocked_stop_sell_trigger_when_runtime_is_p
     payload = response.json()
     assert payload["evaluated_item_count"] == 2
     assert payload["triggered_item_count"] == 1
-    assert payload["submitted_order_count"] == 0
-    assert payload["blocked_item_count"] == 1
-    original_item = next(
+    assert payload["submitted_order_count"] == 1
+    assert payload["blocked_item_count"] == 0
+    submitted_item = next(
         item
         for item in payload["items"]
-        if item["intent"] == "stop_sell" and item["outcome"] == "blocked"
+        if item["intent"] == "stop_sell" and item["outcome"] == "submitted"
     )
-    assert original_item["outcome"] == "blocked"
-    assert original_item["block_reason"] == "paused"
-    blocked_item_id = original_item["execution_plan_item_id"]
+    assert submitted_item["execution_plan_item_id"] == plan_item_id
 
-    assert broker_adapter.authenticate_calls == 0
-    assert broker_adapter.order_calls == []
+    assert broker_adapter.authenticate_calls == 1
+    assert len(broker_adapter.order_calls) == 1
+    assert broker_adapter.order_calls[0].execution_plan_item_id == plan_item_id
+    assert broker_adapter.order_calls[0].side == "sell"
+    assert broker_adapter.order_calls[0].quantity == 3
 
     runtime_status = client.get("/runtime/status")
     assert runtime_status.status_code == 200
-    assert runtime_status.json()["liveness"]["monitoring"]["status"] == "running"
+    assert runtime_status.json()["liveness"]["monitoring"]["status"] == "degraded"
 
     with app.state.db_session_factory() as session:
         plan_item = session.get(ExecutionPlanItem, plan_item_id)
-        blocked_item = session.get(ExecutionPlanItem, blocked_item_id)
         assert plan_item is not None
-        assert blocked_item is not None
-        assert blocked_item_id == plan_item_id
-        assert plan_item.status == "stop_sell_triggered_blocked"
-        assert blocked_item.status == "stop_sell_triggered_blocked"
+        assert plan_item.status == "broker_order_submitted"
 
         order = session.scalar(
             select(BrokerOrder).where(BrokerOrder.execution_plan_item_id == plan_item_id)
         )
-        assert order is None
+        assert order is not None
+        assert order.status == "submitted"
 
         checkpoint = session.scalar(
             select(MonitoringCheckpoint).where(
@@ -15603,7 +15712,7 @@ def test_monitoring_evaluate_reports_blocked_stop_sell_trigger_when_runtime_is_p
             )
         )
         assert checkpoint is not None
-        assert checkpoint.status == "running"
+        assert checkpoint.status == "degraded"
         assert checkpoint.last_heartbeat_at is not None
 
     engine.dispose()
@@ -15851,15 +15960,17 @@ def test_monitoring_warns_when_crossed_stop_has_no_actionable_outcome() -> None:
 
 
 @pytest.mark.parametrize(
-    ("agent_status", "item_id"),
+    ("agent_status", "item_id", "expected_outcome"),
     [
-        ("triggered_pending_agent", "agent-pending-stop"),
-        ("agent_approved_pending_submit", "agent-approved-stop"),
+        ("triggered_pending_agent", "agent-pending-stop", "agent_pending"),
+        ("agent_delay", "agent-delay-stop", "agent_delay"),
+        ("agent_approved_pending_submit", "agent-approved-stop", "agent_pending"),
     ],
 )
 def test_monitoring_treats_agent_pending_crossed_stop_as_actionable(
     agent_status: str,
     item_id: str,
+    expected_outcome: str,
 ) -> None:
     broker_adapter = StubBrokerAdapter(
         config=BrokerConfig(
@@ -15882,15 +15993,34 @@ def test_monitoring_treats_agent_pending_crossed_stop_as_actionable(
         broker_adapter=broker_adapter,
     )
     client = TestClient(app)
+    agent_event = {
+        "event": {
+            "triggered_pending_agent": "trigger_time_exec_agent_pending",
+            "agent_delay": "trigger_time_exec_agent_delay",
+            "agent_approved_pending_submit": "trigger_time_exec_agent_approved",
+        }[agent_status],
+        "recorded_at": "2026-08-07T02:00:00Z",
+    }
+    agent_risk_context: dict[str, object] = {
+        "exchange": "KRX",
+        "last_monitoring_event": agent_event,
+    }
+    if agent_status == "agent_delay":
+        agent_risk_context["last_trigger_time_exec_agent_interaction"] = {
+            "recorded_at": "2026-08-07T02:00:00Z",
+            "decision": {
+                "decision": "delay",
+                "valid_until": "2026-08-07T02:05:00Z",
+            },
+        }
+    elif agent_status == "agent_approved_pending_submit":
+        agent_risk_context["last_trigger_time_exec_agent_interaction"] = {
+            "recorded_at": "2026-08-07T02:00:00Z",
+            "decision": {"decision": "execute_now"},
+        }
     route_risk, route_policy = _bound_kis_item_payloads(
         settings=app.state.settings,
-        risk_context={
-            "exchange": "KRX",
-            "last_monitoring_event": {
-                "event": "trigger_time_exec_agent_pending",
-                "recorded_at": "2026-08-07T02:00:00Z",
-            },
-        },
+        risk_context=agent_risk_context,
         quantity_policy={"kind": "shares", "quantity": 10},
     )
 
@@ -15953,7 +16083,7 @@ def test_monitoring_treats_agent_pending_crossed_stop_as_actionable(
     assert payload["protective_stop_actionability"]["warnings"] == []
     assert payload["items"][0]["execution_plan_item_id"] == item_id
     assert payload["items"][0]["status"] == agent_status
-    assert payload["items"][0]["outcome"] == "agent_pending"
+    assert payload["items"][0]["outcome"] == expected_outcome
 
     runtime_status = client.get("/runtime/status")
     assert runtime_status.status_code == 200
@@ -15972,6 +16102,108 @@ def test_monitoring_treats_agent_pending_crossed_stop_as_actionable(
         assert checkpoint.details["protective_stop_actionability"]["warnings"] == []
 
     assert broker_adapter.order_calls == []
+    engine.dispose()
+
+
+def test_monitoring_recovers_stale_agent_pending_stop_and_submits() -> None:
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(
+            broker_order_id="kis-stale-agent-pending-stop"
+        ),
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+            exec_agent_trigger_time_timeout_seconds=90,
+        ),
+        broker_adapter=broker_adapter,
+    )
+    client = TestClient(app)
+    route_risk, route_policy = _bound_kis_item_payloads(
+        settings=app.state.settings,
+        risk_context={
+            "exchange": "KRX",
+            "last_monitoring_event": {
+                "event": "trigger_time_exec_agent_pending",
+                "recorded_at": "2026-08-07T01:58:00Z",
+            },
+        },
+        quantity_policy={"kind": "shares", "quantity": 10},
+    )
+    item_id = "stale-agent-pending-stop"
+
+    with app.state.db_session_factory() as session:
+        plan = ExecutionPlan(
+            id="plan-stale-agent-pending-stop",
+            external_plan_id="plan-stale-agent-pending-stop",
+            source="test",
+            mode="paper",
+            status="accepted",
+            accepted_at=datetime(2026, 8, 7, 1, 0, tzinfo=UTC),
+        )
+        session.add(plan)
+        session.add(
+            ExecutionPosition(
+                mode="paper",
+                symbol="496120",
+                quantity=10,
+                average_price=Decimal("33000.00"),
+                updated_from="test",
+                last_reconciled_at=datetime(2026, 8, 7, 1, 55, tzinfo=UTC),
+            )
+        )
+        session.add(
+            ExecutionPlanItem(
+                id=item_id,
+                plan=plan,
+                plan_item_index=0,
+                symbol="496120",
+                side="sell",
+                intent="stop_sell",
+                status="triggered_pending_agent",
+                provider="kis",
+                asset_class="stock",
+                quantity_policy=route_policy,
+                trigger_price=Decimal("32077.5000"),
+                time_in_force="day",
+                risk_context=route_risk,
+            )
+        )
+        session.commit()
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "recover stale crossed stop pending agent",
+            "observed_at": "2026-08-07T02:00:00Z",
+            "prices": [{"symbol": "496120", "price": "31330.00"}],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["submitted_order_count"] == 1
+    assert payload["items"][0]["execution_plan_item_id"] == item_id
+    assert payload["items"][0]["outcome"] == "submitted"
+    assert len(broker_adapter.order_calls) == 1
+    with app.state.db_session_factory() as session:
+        item = session.get(ExecutionPlanItem, item_id)
+        assert item is not None
+        assert item.status == "broker_order_submitted"
+
     engine.dispose()
 
 
@@ -22500,7 +22732,7 @@ def test_monitoring_quarantines_legacy_unverified_exec_agent_sized_shares() -> N
     engine.dispose()
 
 
-def test_exec_agent_sized_watch_buy_stays_blocked_after_agent_attempts_exhausted() -> None:
+def test_exec_agent_sized_watch_buy_stays_pre_monitor_after_agent_attempts_exhausted() -> None:
     app, engine, client, broker_adapter = _build_watch_buy_test_app(
         order_id="kis-watch-buy-agent-fallback-1"
     )
@@ -22531,12 +22763,13 @@ def test_exec_agent_sized_watch_buy_stays_blocked_after_agent_attempts_exhausted
     )
     assert first_response.status_code == 200
     assert first_response.json()["submitted_order_count"] == 0
+    assert first_response.json()["items"] == []
     assert broker_adapter.order_calls == []
 
     with app.state.db_session_factory() as session:
         item = session.get(ExecutionPlanItem, item_id)
         assert item is not None
-        item.status = "watch_monitoring_active"
+        assert item.status == "watch_sizing_pending"
         risk_context = dict(item.risk_context or {})
         risk_context["exec_agent_watch_sizing_attempt_count"] = 3
         risk_context["exec_agent_watch_sizing_max_attempts"] = 3
@@ -22557,15 +22790,15 @@ def test_exec_agent_sized_watch_buy_stays_blocked_after_agent_attempts_exhausted
     assert fallback_response.status_code == 200
     payload = fallback_response.json()
     assert payload["submitted_order_count"] == 0
-    assert payload["items"][0]["outcome"] == "blocked"
-    assert payload["items"][0]["block_reason"] == "exec_agent_sizing_pending"
+    assert payload["evaluated_item_count"] == 0
+    assert payload["items"] == []
     assert broker_adapter.order_calls == []
 
     with app.state.db_session_factory() as session:
         item = session.get(ExecutionPlanItem, item_id)
         assert item is not None
-        event = item.risk_context["last_monitoring_event"]
-        assert event["reason"] == "exec_agent_sizing_pending"
+        assert item.status == "watch_sizing_pending"
+        assert item.risk_context["exec_agent_watch_sizing_attempt_count"] == 3
 
     engine.dispose()
 
@@ -22761,7 +22994,7 @@ def test_exec_agent_sized_next_open_buy_waits_for_verified_agent_decision(
 
     plans_payload = client.get("/execution-plans").json()
     item = plans_payload[0]["items"][0]
-    assert item["status"] == "watch_monitoring_pending"
+    assert item["status"] == "watch_sizing_pending"
     assert item["quantity_policy"]["type"] == "exec_agent_sized"
 
     jobs_payload = client.get("/execution-jobs").json()

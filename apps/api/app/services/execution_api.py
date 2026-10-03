@@ -44,7 +44,15 @@ from app.services.fifo_inventory import fifo_route_scope_from_order
 from app.services.execution_semantics import (
     INTRADAY_WATCH_BUY_INTENTS,
     WATCH_BUY_INTENTS as EXECUTION_WATCH_BUY_INTENTS,
+    is_delegated_exec_agent_sizing_policy,
+    is_exec_agent_sizing_policy,
     watch_buy_direction_from_payloads,
+)
+from app.services.runtime_transitions import (
+    ACTIVE_SELL_MONITORING_STATUSES,
+    ACTIVE_WATCH_MONITORING_STATUSES,
+    WATCH_LIFECYCLE_STATUSES,
+    WATCH_SIZING_PENDING_STATUS,
 )
 from app.services.plan_item_identity import (
     select_plan_item_family_members,
@@ -52,19 +60,8 @@ from app.services.plan_item_identity import (
     serialize_symbol_source_identities,
 )
 
-MONITORED_INTENTS = frozenset({"target_sell", "stop_sell"})
 WATCH_BUY_INTENTS = EXECUTION_WATCH_BUY_INTENTS - {"next_open_buy"}
-WATCH_MONITORING_STATUSES = frozenset(
-    {
-        "watch_monitoring_pending",
-        "watch_monitoring_active",
-        "watch_buy_triggered",
-        "watch_buy_submitted",
-        "watch_buy_rejected",
-        "watch_expired",
-        "watch_cancelled",
-    }
-)
+WATCH_PLAN_ITEM_STATUSES = WATCH_LIFECYCLE_STATUSES
 UNDATED_AUTOMATED_BUY_GUARDED_STATUSES = frozenset(
     {
         "pending",
@@ -73,16 +70,10 @@ UNDATED_AUTOMATED_BUY_GUARDED_STATUSES = frozenset(
         "next_open_buy_pending_configuration",
         "watch_monitoring_pending",
         "watch_monitoring_active",
+        WATCH_SIZING_PENDING_STATUS,
     }
 )
 AUTOMATED_BUY_MARKET_DATE_REQUIRED_REASON = "automated_buy_market_date_required"
-AGENT_RUNTIME_MONITORING_STATUSES = frozenset(
-    {
-        "triggered_pending_agent",
-        "agent_delay",
-        "agent_approved_pending_submit",
-    }
-)
 OPEN_ORDER_STATUSES = frozenset({"submitted", "open", "partially_filled"})
 RUNTIME_EXECUTION_SCOPE_KEYS = frozenset(
     {
@@ -1561,6 +1552,8 @@ def _initial_plan_item_status(item: ExecutionPlanItemRequest) -> str:
     if _decision_agent_name(item) == SHORT_TERM_DECIDER_NAME and tactical_action in INACTIVE_SHORT_TERM_TACTICAL_ACTIONS:
         return "short_term_watch_blocked"
     if _is_watch_buy_request(item):
+        if is_exec_agent_sizing_policy(item.quantity_policy):
+            return WATCH_SIZING_PENDING_STATUS
         if _watch_buy_trigger_price(item) is not None:
             return "watch_monitoring_pending"
         return "pending_configuration"
@@ -1650,7 +1643,13 @@ def _normalize_watch_buy_handoff_items(plan: ExecutionPlan) -> None:
 
         item.quantity_policy = quantity_policy or item.quantity_policy
         if (
-            item.status in {"pending", "pending_configuration", "next_open_buy_pending_configuration"}
+            item.status
+            in {
+                "pending",
+                "pending_configuration",
+                "next_open_buy_pending_configuration",
+                WATCH_SIZING_PENDING_STATUS,
+            }
             and item.side == "buy"
             and item.trigger_price is not None
             and _watch_buy_handoff_quantity(item.quantity_policy) is not None
@@ -1662,7 +1661,7 @@ def _is_watch_buy_plan_item(item: ExecutionPlanItem) -> bool:
     return item.side == "buy" and (
         item.intent in WATCH_BUY_INTENTS
         or item.intent == "next_open_buy"
-        or item.status in WATCH_MONITORING_STATUSES
+        or item.status in WATCH_PLAN_ITEM_STATUSES
     )
 
 
@@ -1673,7 +1672,7 @@ def _watch_buy_handoff_quantity(quantity_policy: dict[str, object] | None) -> in
     # Delegated sizing remains unfulfilled even if a contradictory legacy
     # payload also carries a fixed-quantity alias. Only an audited Exec sizing
     # transition may replace this policy with an executable shares policy.
-    if policy_type == "exec_agent_sized":
+    if is_delegated_exec_agent_sizing_policy(quantity_policy):
         return None
     kind = quantity_policy.get("kind") or policy_type
     if kind in {"shares", "fixed_quantity"}:
@@ -1742,9 +1741,7 @@ def _parse_positive_int(value: object) -> int | None:
 
 
 def _short_term_exec_agent_sizing_requested(quantity_policy: dict[str, object] | None) -> bool:
-    if not isinstance(quantity_policy, dict):
-        return False
-    return (quantity_policy.get("kind") or quantity_policy.get("type")) == "exec_agent_sized"
+    return is_exec_agent_sizing_policy(quantity_policy)
 
 
 def _item_has_buy_chase_or_trigger_fields(item: ExecutionPlanItemRequest) -> bool:
@@ -1966,7 +1963,7 @@ def _json_scalar(value: object) -> object:
 
 def _is_runtime_monitored_item(item: ExecutionPlanItem) -> bool:
     return (
-        item.intent in MONITORED_INTENTS
-        or item.status in WATCH_MONITORING_STATUSES
-        or item.status in AGENT_RUNTIME_MONITORING_STATUSES
+        item.side == "buy" and item.status in ACTIVE_WATCH_MONITORING_STATUSES
+    ) or (
+        item.side == "sell" and item.status in ACTIVE_SELL_MONITORING_STATUSES
     )
