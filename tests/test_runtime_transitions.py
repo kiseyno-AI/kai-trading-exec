@@ -41,6 +41,21 @@ def test_open_broker_placements_map_to_existing_non_monitorable_plan_item_status
         assert plan_item_status in NON_MONITORABLE_PLAN_ITEM_STATUSES
 
 
+def test_cancel_broker_statuses_map_to_explicit_plan_item_statuses() -> None:
+    assert (
+        plan_item_status_for_broker_order_status(
+            NormalizedBrokerOrderStatus.CANCEL_PENDING.value
+        )
+        == "cancel_pending"
+    )
+    assert (
+        plan_item_status_for_broker_order_status(
+            NormalizedBrokerOrderStatus.CANCELED.value
+        )
+        == "canceled"
+    )
+
+
 def test_plan_item_status_catalogue_covers_runtime_monitoring_and_core_states() -> None:
     emitted_statuses = {
         "core_activation_pending",
