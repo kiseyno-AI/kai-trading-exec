@@ -62,12 +62,10 @@ from app.services.position_identity import (
 from app.services.late_entry_actionability import LATE_ENTRY_GATE_EVENT_TYPE
 from app.services.monitoring import (
     ACTIVE_WATCH_MONITORING_STATUSES,
-    BLOCKED_MONITORING_STATUSES,
     LIVE_WATCH_BUY_VETO_EVENT_TYPE,
     MONITORING_RUNTIME_TOPOLOGY,
     MONITORING_SELECTION_STRATEGY,
     PENDING_DISPATCH_MONITORING_STATUSES,
-    SELL_ACTIVE_MONITORING_STATUSES,
     SELL_PENDING_CONFIG_STATUSES,
     _effective_monitor_plan_filter,
     _is_krx_equity_symbol,
@@ -81,6 +79,10 @@ from app.services.trigger_time_exec_agent import (
     AGENT_DELAY_STATUS,
     AGENT_PENDING_STATUS,
     AGENT_REJECTED_STATUS,
+)
+from app.services.runtime_transitions import (
+    ACTIVE_SELL_MONITORING_STATUSES,
+    WATCH_SIZING_PENDING_STATUS,
 )
 from app.services.broker_auth import build_broker_adapter, build_broker_session_summary
 from app.services.account_drawdown_gate import latest_account_drawdown_gate_state
@@ -143,16 +145,7 @@ RUNTIME_EXECUTION_SCOPE_KEYS = frozenset(
         "exchange",
     }
 )
-WATCH_BUY_STATUSES = (
-    "watch_monitoring_pending",
-    "watch_monitoring_active",
-    "watch_buy_triggered",
-    "watch_buy_triggered_blocked",
-    "watch_buy_triggered_pending_dispatch",
-    AGENT_PENDING_STATUS,
-    AGENT_DELAY_STATUS,
-    AGENT_APPROVED_PENDING_SUBMIT_STATUS,
-)
+WATCH_BUY_STATUSES = tuple(ACTIVE_WATCH_MONITORING_STATUSES)
 WATCHING_AGENT_COUNT_STATUSES = (
     "watch_monitoring_pending",
     "watch_monitoring_active",
@@ -2306,10 +2299,7 @@ def runtime_monitored_symbols(
             )
         )
     sell_statuses = tuple(
-        SELL_ACTIVE_MONITORING_STATUSES
-        | SELL_PENDING_CONFIG_STATUSES
-        | BLOCKED_MONITORING_STATUSES
-        | PENDING_DISPATCH_MONITORING_STATUSES
+        ACTIVE_SELL_MONITORING_STATUSES | SELL_PENDING_CONFIG_STATUSES
     )
     pending_sell_symbol_query = None
     if include_pending_sell_fallback:
@@ -2961,6 +2951,10 @@ def monitoring_agent_decision_counts(
     )
     return {
         "watching": watching,
+        "pending_pre_monitor_sizing": counts_by_status.get(
+            WATCH_SIZING_PENDING_STATUS,
+            0,
+        ),
         "pending_agent_decision": pending,
         "agent_delayed": delayed,
         "agent_rejected": rejected,
@@ -2987,11 +2981,7 @@ def monitoring_segments(
         for item in items
         if item.side == "sell"
         and item.intent in SELL_MONITORED_INTENTS
-        and (
-            item.status.endswith("_monitoring")
-            or item.status.endswith("_pending_dispatch")
-            or item.status.endswith("_triggered_blocked")
-        )
+        and item.status in ACTIVE_SELL_MONITORING_STATUSES
     ]
     short_term_watch = [
         item
@@ -3000,6 +2990,14 @@ def monitoring_segments(
         and item.side == "buy"
         and item.intent in WATCH_BUY_INTENTS
         and item.status in WATCH_BUY_STATUSES
+    ]
+    short_term_sizing_pending = [
+        item
+        for item in items
+        if _is_short_term_decider_item(item)
+        and item.side == "buy"
+        and item.intent in WATCH_BUY_INTENTS
+        and item.status == WATCH_SIZING_PENDING_STATUS
     ]
     signal_next_open = [
         item
@@ -3023,6 +3021,9 @@ def monitoring_segments(
     return {
         "held_position_sell_monitoring": _segment_payload(held_sell),
         "short_term_buy_watch_monitoring": _segment_payload(short_term_watch),
+        "short_term_buy_sizing_pending": _segment_payload(
+            short_term_sizing_pending
+        ),
         "signal_decider_next_open_market_buys": _segment_payload(signal_next_open),
         "blocked_short_term_candidates": _segment_payload(blocked_short_term, include_blockers=True),
     }

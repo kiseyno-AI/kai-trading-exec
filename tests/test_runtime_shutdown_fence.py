@@ -12,15 +12,18 @@ from app.core.config import Settings
 from app.db.base import Base
 from app.db.session import create_db_engine, create_session_factory
 from app.main import (
-    _pause_runtime_for_shutdown,
     _shutdown_runtime_coordinators,
     _stop_runtime_coordinators,
 )
 from app.models.runtime import RuntimeControlEvent, RuntimeControlState
+from app.services import runtime_controls as runtime_controls_service
 from app.services.runtime_controls import (
     ControlCommand,
     enable_kill_switch,
     ensure_runtime_control_state,
+    pause_runtime,
+    recover_legacy_lifespan_shutdown_pause,
+    reset_kill_switch,
     resume_runtime,
 )
 from app.services.alpaca_crypto_runtime import AlpacaCryptoRuntimeCoordinator
@@ -32,9 +35,10 @@ from app.services.runtime_shutdown import (
     RuntimeCycleFence,
 )
 from app.services.position_identity import EXECUTION_SCOPE_POLICY_VERSION
+from app.services.plan_judgment_actions import apply_hourly_plan_judgment_action
 
 
-def test_lifespan_shutdown_durably_pauses_automation_with_audit_source(
+def test_lifespan_shutdown_preserves_resumed_runtime_control_state(
     tmp_path,
 ) -> None:
     settings = Settings(
@@ -44,6 +48,15 @@ def test_lifespan_shutdown_durably_pauses_automation_with_audit_source(
     engine = create_db_engine(settings)
     Base.metadata.create_all(engine)
     session_factory = create_session_factory(engine)
+    calls: list[str] = []
+
+    class Coordinator:
+        def begin_shutdown(self) -> None:
+            calls.append("admission_closed")
+
+        async def stop(self) -> None:
+            calls.append("coordinator_stopped")
+
     try:
         with session_factory() as db:
             ensure_runtime_control_state(settings=settings, db=db)
@@ -54,31 +67,30 @@ def test_lifespan_shutdown_durably_pauses_automation_with_audit_source(
             )
 
         asyncio.run(
-            _pause_runtime_for_shutdown(
-                settings=settings,
-                session_factory=session_factory,
+            _shutdown_runtime_coordinators(
+                coordinators=(("runtime", Coordinator()),),
             )
         )
 
         with session_factory() as db:
             state = db.get(RuntimeControlState, "global")
             assert state is not None
-            assert state.paused is True
-            assert state.automation_enabled is False
-            assert state.last_transition_source == "lifespan_shutdown"
-            event = db.scalar(
+            assert state.paused is False
+            assert state.kill_switch_enabled is False
+            assert state.last_transition_source == "test"
+            shutdown_event = db.scalar(
                 select(RuntimeControlEvent)
-                .where(RuntimeControlEvent.action == "pause")
+                .where(RuntimeControlEvent.source == "lifespan_shutdown")
                 .order_by(RuntimeControlEvent.occurred_at.desc())
             )
-            assert event is not None
-            assert event.source == "lifespan_shutdown"
+            assert shutdown_event is None
+        assert calls == ["admission_closed", "coordinator_stopped"]
     finally:
         engine.dispose()
 
 
-@pytest.mark.parametrize("initial_state", ["paused", "kill_switch"])
-def test_lifespan_shutdown_never_implicitly_reenables_a_blocked_runtime(
+@pytest.mark.parametrize("initial_state", ["operator_pause", "kill_switch"])
+def test_lifespan_shutdown_preserves_operator_control_state(
     initial_state: str,
     tmp_path,
 ) -> None:
@@ -91,8 +103,22 @@ def test_lifespan_shutdown_never_implicitly_reenables_a_blocked_runtime(
     session_factory = create_session_factory(engine)
     try:
         with session_factory() as db:
-            state = ensure_runtime_control_state(settings=settings, db=db)
-            if initial_state == "kill_switch":
+            ensure_runtime_control_state(settings=settings, db=db)
+            resume_runtime(
+                settings=settings,
+                db=db,
+                command=ControlCommand(source="test", reason="prepare running state"),
+            )
+            if initial_state == "operator_pause":
+                result = pause_runtime(
+                    settings=settings,
+                    db=db,
+                    command=ControlCommand(
+                        source="operator_test",
+                        reason="prepare operator pause",
+                    ),
+                )
+            else:
                 result = enable_kill_switch(
                     settings=settings,
                     db=db,
@@ -101,15 +127,15 @@ def test_lifespan_shutdown_never_implicitly_reenables_a_blocked_runtime(
                         reason="prepare kill-switch state",
                     ),
                 )
-                assert result.outcome == "applied"
-                state = db.get(RuntimeControlState, "global")
-                assert state is not None
+            assert result.outcome == "applied"
+            state = db.get(RuntimeControlState, "global")
+            assert state is not None
             prior_transition_source = state.last_transition_source
+            prior_transition_event_id = state.last_transition_event_id
 
         asyncio.run(
-            _pause_runtime_for_shutdown(
-                settings=settings,
-                session_factory=session_factory,
+            _shutdown_runtime_coordinators(
+                coordinators=(),
             )
         )
 
@@ -117,42 +143,89 @@ def test_lifespan_shutdown_never_implicitly_reenables_a_blocked_runtime(
             state = db.get(RuntimeControlState, "global")
             assert state is not None
             assert state.paused is True
-            assert state.automation_enabled is False
             assert state.kill_switch_enabled is (initial_state == "kill_switch")
             assert state.last_transition_source == prior_transition_source
-            event = db.scalar(
+            assert state.last_transition_event_id == prior_transition_event_id
+            shutdown_event = db.scalar(
                 select(RuntimeControlEvent)
-                .where(RuntimeControlEvent.action == "pause")
+                .where(RuntimeControlEvent.source == "lifespan_shutdown")
                 .order_by(RuntimeControlEvent.occurred_at.desc())
             )
-            assert event is not None
-            assert event.outcome == "noop"
-            assert event.source == "lifespan_shutdown"
+            assert shutdown_event is None
     finally:
         engine.dispose()
 
 
-def test_lifespan_shutdown_pauses_before_stopping_any_coordinator(tmp_path) -> None:
+def test_startup_recovers_only_legacy_lifespan_shutdown_pause(tmp_path) -> None:
     settings = Settings(
-        database_url=f"sqlite:///{tmp_path / 'shutdown-order.db'}",
+        database_url=f"sqlite:///{tmp_path / 'legacy-shutdown-pause.db'}",
         runtime_mode="paper",
     )
     engine = create_db_engine(settings)
     Base.metadata.create_all(engine)
     session_factory = create_session_factory(engine)
-    calls: list[str] = []
+    try:
+        with session_factory() as db:
+            state = ensure_runtime_control_state(settings=settings, db=db)
+            state.paused = True
+            state.kill_switch_enabled = False
+            state.last_transition_action = "pause"
+            state.last_transition_source = "lifespan_shutdown"
+            state.last_transition_reason = "service lifespan shutdown started"
+            state.readiness_reason = "paused by operator; monitoring remains active"
+            legacy_event_id = "legacy-shutdown-event"
+            state.last_transition_event_id = legacy_event_id
+            db.add(
+                RuntimeControlEvent(
+                    id=legacy_event_id,
+                    runtime_control_state_id=state.id,
+                    action="pause",
+                    outcome="applied",
+                    actor=settings.service_name,
+                    source="lifespan_shutdown",
+                    reason="service lifespan shutdown started",
+                    message="runtime paused; monitoring remains active",
+                    previous_state={"paused": False, "kill_switch_enabled": False},
+                    current_state={
+                        "paused": True,
+                        "kill_switch_enabled": False,
+                        "automation_enabled": False,
+                        "readiness_reason": "paused by operator; monitoring remains active",
+                    },
+                    occurred_at=datetime.now(UTC),
+                )
+            )
+            db.commit()
 
-    class Coordinator:
-        def __init__(self, name: str) -> None:
-            self.name = name
+        with session_factory() as db:
+            result = recover_legacy_lifespan_shutdown_pause(settings=settings, db=db)
+            assert result is not None
+            assert result.changed is True
+            recovered = db.get(RuntimeControlState, "global")
+            assert recovered is not None
+            assert recovered.paused is False
+            assert recovered.kill_switch_enabled is False
+            assert recovered.last_transition_action == "legacy_shutdown_pause_recovery"
+            assert recovered.last_transition_source == "startup_recovery"
+            assert recovered.last_transition_event_id != legacy_event_id
+            event = db.get(RuntimeControlEvent, recovered.last_transition_event_id)
+            assert event is not None
+            assert event.action == "legacy_shutdown_pause_recovery"
+            assert event.outcome == "applied"
+            assert event.previous_state["paused"] is True
+            assert event.current_state["paused"] is False
+    finally:
+        engine.dispose()
 
-        async def stop(self) -> None:
-            with session_factory() as db:
-                state = db.get(RuntimeControlState, "global")
-                assert state is not None
-                assert state.paused is True
-            calls.append(self.name)
 
+def test_current_pause_cannot_impersonate_legacy_shutdown_pause(tmp_path) -> None:
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'current-pause-spoof.db'}",
+        runtime_mode="paper",
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
     try:
         with session_factory() as db:
             ensure_runtime_control_state(settings=settings, db=db)
@@ -161,38 +234,418 @@ def test_lifespan_shutdown_pauses_before_stopping_any_coordinator(tmp_path) -> N
                 db=db,
                 command=ControlCommand(source="test", reason="prepare running state"),
             )
-
-        asyncio.run(
-            _shutdown_runtime_coordinators(
+            pause = pause_runtime(
                 settings=settings,
-                session_factory=session_factory,
-                coordinators=(
-                    ("one", Coordinator("one")),
-                    ("two", Coordinator("two")),
+                db=db,
+                command=ControlCommand(
+                    actor=settings.service_name,
+                    source="lifespan_shutdown",
+                    reason="service lifespan shutdown started",
                 ),
             )
-        )
+            assert pause.outcome == "applied"
 
-        assert calls == ["one", "two"]
+        with session_factory() as db:
+            recovered = recover_legacy_lifespan_shutdown_pause(
+                settings=settings,
+                db=db,
+            )
+            state = db.get(RuntimeControlState, "global")
+            assert recovered is None
+            assert state is not None
+            assert state.paused is True
+            assert state.last_transition_action == "pause"
     finally:
         engine.dispose()
 
 
-def test_in_memory_shutdown_drains_shared_connection_before_durable_pause() -> None:
+@pytest.mark.parametrize(
+    "tampered_evidence",
+    ["message", "readiness_reason", "automation_enabled"],
+)
+def test_startup_recovery_requires_complete_legacy_shutdown_evidence(
+    tmp_path,
+    tampered_evidence: str,
+) -> None:
     settings = Settings(
-        database_url="sqlite:///:memory:",
+        database_url=f"sqlite:///{tmp_path / f'legacy-tampered-{tampered_evidence}.db'}",
         runtime_mode="paper",
     )
     engine = create_db_engine(settings)
     Base.metadata.create_all(engine)
     session_factory = create_session_factory(engine)
-    worker_started = threading.Event()
-    release_worker = threading.Event()
-    worker_stopped = threading.Event()
-    pause_insert_seen = threading.Event()
-    worker_errors: list[BaseException] = []
-    calls: list[str] = []
+    legacy_readiness = "paused by operator; monitoring remains active"
+    try:
+        with session_factory() as db:
+            state = ensure_runtime_control_state(settings=settings, db=db)
+            state.paused = True
+            state.kill_switch_enabled = False
+            state.readiness_reason = (
+                "operator pause must survive restart"
+                if tampered_evidence == "readiness_reason"
+                else legacy_readiness
+            )
+            state.last_transition_action = "pause"
+            state.last_transition_source = "lifespan_shutdown"
+            state.last_transition_reason = "service lifespan shutdown started"
+            legacy_event_id = f"legacy-tampered-{tampered_evidence}"
+            state.last_transition_event_id = legacy_event_id
+            db.add(
+                RuntimeControlEvent(
+                    id=legacy_event_id,
+                    runtime_control_state_id=state.id,
+                    action="pause",
+                    outcome="applied",
+                    actor=settings.service_name,
+                    source="lifespan_shutdown",
+                    reason="service lifespan shutdown started",
+                    message=(
+                        "current pause message"
+                        if tampered_evidence == "message"
+                        else "runtime paused; monitoring remains active"
+                    ),
+                    previous_state={"paused": False, "kill_switch_enabled": False},
+                    current_state={
+                        "paused": True,
+                        "kill_switch_enabled": False,
+                        "automation_enabled": (
+                            True if tampered_evidence == "automation_enabled" else False
+                        ),
+                        "readiness_reason": legacy_readiness,
+                    },
+                    occurred_at=datetime.now(UTC),
+                )
+            )
+            db.commit()
 
+        with session_factory() as db:
+            recovered = recover_legacy_lifespan_shutdown_pause(
+                settings=settings,
+                db=db,
+            )
+            state = db.get(RuntimeControlState, "global")
+            assert recovered is None
+            assert state is not None
+            assert state.paused is True
+            assert state.last_transition_event_id == legacy_event_id
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("transition_source", "kill_switch_enabled"),
+    [("operator", False), ("lifespan_shutdown", True)],
+)
+def test_startup_recovery_preserves_operator_pause_and_kill_switch(
+    tmp_path,
+    transition_source: str,
+    kill_switch_enabled: bool,
+) -> None:
+    settings = Settings(
+        database_url=(
+            f"sqlite:///{tmp_path / f'preserve-{transition_source}-{kill_switch_enabled}.db'}"
+        ),
+        runtime_mode="paper",
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    try:
+        with session_factory() as db:
+            state = ensure_runtime_control_state(settings=settings, db=db)
+            state.paused = True
+            state.kill_switch_enabled = kill_switch_enabled
+            state.last_transition_action = "kill_switch" if kill_switch_enabled else "pause"
+            state.last_transition_source = transition_source
+            state.last_transition_event_id = "preserved-control-event"
+            db.commit()
+
+        with session_factory() as db:
+            result = recover_legacy_lifespan_shutdown_pause(settings=settings, db=db)
+            assert result is None
+            preserved = ensure_runtime_control_state(settings=settings, db=db)
+            assert preserved.paused is True
+            assert preserved.kill_switch_enabled is kill_switch_enabled
+            assert preserved.last_transition_source == transition_source
+            assert preserved.last_transition_event_id == "preserved-control-event"
+            assert db.scalar(
+                select(RuntimeControlEvent).where(
+                    RuntimeControlEvent.action == "legacy_shutdown_pause_recovery"
+                )
+            ) is None
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.parametrize("racing_transition", ["pause", "resume", "legacy_recovery"])
+def test_applied_control_transition_cannot_overwrite_concurrent_kill_switch(
+    tmp_path,
+    monkeypatch,
+    racing_transition: str,
+) -> None:
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / f'kill-race-{racing_transition}.db'}",
+        runtime_mode="paper",
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    legacy_readiness = "paused by operator; monitoring remains active"
+    with session_factory() as db:
+        state = ensure_runtime_control_state(settings=settings, db=db)
+        if racing_transition == "pause":
+            resume_runtime(
+                settings=settings,
+                db=db,
+                command=ControlCommand(source="test", reason="prepare running state"),
+            )
+        elif racing_transition == "legacy_recovery":
+            state.paused = True
+            state.kill_switch_enabled = False
+            state.readiness_reason = legacy_readiness
+            state.last_transition_action = "pause"
+            state.last_transition_source = "lifespan_shutdown"
+            state.last_transition_reason = "service lifespan shutdown started"
+            state.last_transition_event_id = "legacy-race-event"
+            db.add(
+                RuntimeControlEvent(
+                    id="legacy-race-event",
+                    runtime_control_state_id=state.id,
+                    action="pause",
+                    outcome="applied",
+                    actor=settings.service_name,
+                    source="lifespan_shutdown",
+                    reason="service lifespan shutdown started",
+                    message="runtime paused; monitoring remains active",
+                    previous_state={"paused": False, "kill_switch_enabled": False},
+                    current_state={
+                        "paused": True,
+                        "kill_switch_enabled": False,
+                        "automation_enabled": False,
+                        "readiness_reason": legacy_readiness,
+                    },
+                    occurred_at=datetime.now(UTC),
+                )
+            )
+            db.commit()
+
+    stale_snapshot_loaded = threading.Event()
+    release_stale_transition = threading.Event()
+    original_state_snapshot = runtime_controls_service._state_snapshot
+    delayed = False
+
+    def delay_stale_transition(state: RuntimeControlState) -> dict[str, object]:
+        nonlocal delayed
+        snapshot = original_state_snapshot(state)
+        if threading.current_thread().name == "stale-control-transition" and not delayed:
+            delayed = True
+            stale_snapshot_loaded.set()
+            assert release_stale_transition.wait(timeout=5)
+        return snapshot
+
+    monkeypatch.setattr(
+        runtime_controls_service,
+        "_state_snapshot",
+        delay_stale_transition,
+    )
+    transition_errors: list[BaseException] = []
+
+    def apply_stale_transition() -> None:
+        try:
+            with session_factory() as db:
+                if racing_transition == "pause":
+                    pause_runtime(
+                        settings=settings,
+                        db=db,
+                        command=ControlCommand(source="test", reason="race pause"),
+                    )
+                elif racing_transition == "resume":
+                    resume_runtime(
+                        settings=settings,
+                        db=db,
+                        command=ControlCommand(source="test", reason="race resume"),
+                    )
+                else:
+                    recover_legacy_lifespan_shutdown_pause(settings=settings, db=db)
+        except BaseException as exc:  # pragma: no cover - asserted below
+            transition_errors.append(exc)
+
+    thread = threading.Thread(
+        target=apply_stale_transition,
+        name="stale-control-transition",
+    )
+    thread.start()
+    assert stale_snapshot_loaded.wait(timeout=5)
+    with session_factory() as db:
+        kill = enable_kill_switch(
+            settings=settings,
+            db=db,
+            command=ControlCommand(source="test", reason="concurrent kill wins"),
+        )
+    assert kill.outcome == "applied"
+    release_stale_transition.set()
+    thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert transition_errors == []
+    with session_factory() as db:
+        state = db.get(RuntimeControlState, "global")
+        assert state is not None
+        assert state.kill_switch_enabled is True
+        assert state.paused is True
+        assert state.last_transition_action == "kill_switch"
+        assert state.last_transition_event_id == kill.event_id
+        reset = reset_kill_switch(
+            settings=settings,
+            db=db,
+            command=ControlCommand(source="test", reason="verify reset remains possible"),
+            expected_current_event_id=kill.event_id,
+        )
+        assert reset.outcome == "applied"
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("racing_transition", "expected_previous_paused", "expected_previous_reason"),
+    [
+        (
+            "pause",
+            True,
+            "new entries paused by operator; monitoring and risk-reducing exits remain active",
+        ),
+        ("resume", False, None),
+    ],
+)
+def test_kill_switch_retries_after_concurrent_control_transition_with_exact_audit(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    racing_transition: str,
+    expected_previous_paused: bool,
+    expected_previous_reason: str | None,
+) -> None:
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / f'kill-audit-race-{racing_transition}.db'}",
+        runtime_mode="paper",
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    with session_factory() as db:
+        ensure_runtime_control_state(settings=settings, db=db)
+        if racing_transition == "pause":
+            resumed = resume_runtime(
+                settings=settings,
+                db=db,
+                command=ControlCommand(source="test", reason="prepare running state"),
+            )
+            assert resumed.outcome == "applied"
+
+    stale_snapshot_loaded = threading.Event()
+    release_kill_switch = threading.Event()
+    original_state_snapshot = runtime_controls_service._state_snapshot
+    delayed = False
+
+    def delay_kill_switch_after_snapshot(
+        state: RuntimeControlState,
+    ) -> dict[str, object]:
+        nonlocal delayed
+        snapshot = original_state_snapshot(state)
+        if threading.current_thread().name == "stale-kill-switch" and not delayed:
+            delayed = True
+            stale_snapshot_loaded.set()
+            assert release_kill_switch.wait(timeout=5)
+        return snapshot
+
+    monkeypatch.setattr(
+        runtime_controls_service,
+        "_state_snapshot",
+        delay_kill_switch_after_snapshot,
+    )
+    kill_results: list[object] = []
+    kill_errors: list[BaseException] = []
+
+    def apply_stale_kill_switch() -> None:
+        try:
+            with session_factory() as db:
+                kill_results.append(
+                    enable_kill_switch(
+                        settings=settings,
+                        db=db,
+                        command=ControlCommand(
+                            source="test",
+                            reason="kill must win after concurrent control change",
+                        ),
+                    )
+                )
+        except BaseException as exc:  # pragma: no cover - asserted below
+            kill_errors.append(exc)
+
+    thread = threading.Thread(
+        target=apply_stale_kill_switch,
+        name="stale-kill-switch",
+    )
+    thread.start()
+    assert stale_snapshot_loaded.wait(timeout=5)
+    with session_factory() as db:
+        command = ControlCommand(
+            source="test",
+            reason=f"concurrent {racing_transition} commits first",
+        )
+        if racing_transition == "pause":
+            raced = pause_runtime(settings=settings, db=db, command=command)
+        else:
+            raced = resume_runtime(settings=settings, db=db, command=command)
+        assert raced.outcome == "applied"
+    release_kill_switch.set()
+    thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert kill_errors == []
+    assert len(kill_results) == 1
+    kill_result = kill_results[0]
+    assert kill_result.outcome == "applied"
+    with session_factory() as db:
+        state = db.get(RuntimeControlState, "global")
+        kill_event = db.get(RuntimeControlEvent, kill_result.event_id)
+        assert state is not None
+        assert kill_event is not None
+        assert state.kill_switch_enabled is True
+        assert state.paused is True
+        assert state.last_transition_action == "kill_switch"
+        assert state.last_transition_event_id == kill_result.event_id
+        assert kill_event.previous_state == {
+            "mode": "paper",
+            "paused": expected_previous_paused,
+            "kill_switch_enabled": False,
+            "automation_enabled": not expected_previous_paused,
+            "hourly_risk_off_active": False,
+            "hourly_risk_off_epoch": 0,
+            "hourly_risk_off_context": None,
+            "readiness_reason": expected_previous_reason,
+        }
+        assert kill_event.current_state["paused"] is True
+        assert kill_event.current_state["kill_switch_enabled"] is True
+        assert kill_event.current_state["automation_enabled"] is False
+        assert kill_event.message == (
+            "kill switch enabled; automated order submission is durably blocked"
+        )
+    engine.dispose()
+
+
+@pytest.mark.parametrize("transition", ["pause", "kill_switch", "kill_switch_reset"])
+def test_control_transition_event_snapshots_include_concurrent_hourly_fence(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    transition: str,
+) -> None:
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / f'control-hourly-race-{transition}.db'}",
+        runtime_mode="paper",
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    active_kill_event_id: str | None = None
     with session_factory() as db:
         ensure_runtime_control_state(settings=settings, db=db)
         resume_runtime(
@@ -200,126 +653,170 @@ def test_in_memory_shutdown_drains_shared_connection_before_durable_pause() -> N
             db=db,
             command=ControlCommand(source="test", reason="prepare running state"),
         )
+        if transition == "kill_switch_reset":
+            kill = enable_kill_switch(
+                settings=settings,
+                db=db,
+                command=ControlCommand(source="test", reason="prepare reset"),
+            )
+            assert kill.outcome == "applied"
+            active_kill_event_id = kill.event_id
 
-    def worker_transaction() -> None:
+    stale_snapshot_loaded = threading.Event()
+    release_transition = threading.Event()
+    original_state_snapshot = runtime_controls_service._state_snapshot
+    delayed = False
+
+    def delay_transition_after_snapshot(
+        state: RuntimeControlState,
+    ) -> dict[str, object]:
+        nonlocal delayed
+        snapshot = original_state_snapshot(state)
+        if threading.current_thread().name == "control-hourly-race" and not delayed:
+            delayed = True
+            stale_snapshot_loaded.set()
+            assert release_transition.wait(timeout=5)
+        return snapshot
+
+    monkeypatch.setattr(
+        runtime_controls_service,
+        "_state_snapshot",
+        delay_transition_after_snapshot,
+    )
+    results: list[object] = []
+    errors: list[BaseException] = []
+
+    def apply_control_transition() -> None:
         try:
             with session_factory() as db:
-                db.execute(select(RuntimeControlState))
-                worker_started.set()
-                assert release_worker.wait(timeout=2)
-                db.rollback()
-        except BaseException as exc:  # pragma: no cover - assertion reports detail
-            worker_errors.append(exc)
-        finally:
-            worker_stopped.set()
+                command = ControlCommand(
+                    source="test",
+                    reason=f"race {transition} with hourly fence",
+                )
+                if transition == "pause":
+                    result = pause_runtime(settings=settings, db=db, command=command)
+                elif transition == "kill_switch":
+                    result = enable_kill_switch(
+                        settings=settings,
+                        db=db,
+                        command=command,
+                    )
+                else:
+                    assert active_kill_event_id is not None
+                    result = reset_kill_switch(
+                        settings=settings,
+                        db=db,
+                        command=command,
+                        expected_current_event_id=active_kill_event_id,
+                    )
+                results.append(result)
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
 
-    worker_thread = threading.Thread(target=worker_transaction)
-    worker_thread.start()
-    assert worker_started.wait(timeout=1)
+    thread = threading.Thread(
+        target=apply_control_transition,
+        name="control-hourly-race",
+    )
+    thread.start()
+    assert stale_snapshot_loaded.wait(timeout=5)
+    risk_off = apply_hourly_plan_judgment_action(
+        settings=settings,
+        risk_flags=3,
+        risk_reasons=["concurrent risk-off"],
+    )
+    assert risk_off["hourly_risk_off"]["active"] is True
+    release_transition.set()
+    thread.join(timeout=5)
 
-    def interrupt_pause_insert(
-        _connection,
-        _cursor,
-        statement: str,
-        _parameters,
-        _context,
-        _executemany: bool,
-    ) -> None:
-        if "INSERT INTO runtime_control_events" not in statement:
-            return
-        calls.append("pause_inserted")
-        pause_insert_seen.set()
-        release_worker.set()
-        assert worker_stopped.wait(timeout=2)
+    assert not thread.is_alive()
+    assert errors == []
+    assert len(results) == 1
+    result = results[0]
+    assert result.outcome == "applied"
+    with session_factory() as db:
+        state = db.get(RuntimeControlState, "global")
+        event_row = db.get(RuntimeControlEvent, result.event_id)
+        assert state is not None
+        assert event_row is not None
+        assert state.hourly_risk_off_active is True
+        assert event_row.previous_state["hourly_risk_off_active"] is True
+        assert event_row.current_state["hourly_risk_off_active"] is True
+        assert event_row.previous_state["hourly_risk_off_epoch"] == (
+            state.hourly_risk_off_epoch
+        )
+        assert event_row.current_state["hourly_risk_off_epoch"] == (
+            state.hourly_risk_off_epoch
+        )
+        assert event_row.previous_state["hourly_risk_off_context"] == (
+            state.hourly_risk_off_context
+        )
+        assert event_row.current_state["hourly_risk_off_context"] == (
+            state.hourly_risk_off_context
+        )
+    engine.dispose()
 
-    event.listen(engine, "after_cursor_execute", interrupt_pause_insert)
+
+def test_lifespan_shutdown_closes_admission_before_stopping_any_coordinator() -> None:
+    calls: list[str] = []
 
     class Coordinator:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
         def begin_shutdown(self) -> None:
-            calls.append("admission_closed")
+            calls.append(f"admission:{self.name}")
 
         async def stop(self) -> None:
-            calls.append("coordinator_stopped")
-            release_worker.set()
-            stopped = await asyncio.to_thread(worker_stopped.wait, 2)
-            assert stopped
+            expected_calls = ["admission:one", "admission:two"]
+            if self.name == "two":
+                expected_calls.append("stop:one")
+            assert calls == expected_calls
+            calls.append(f"stop:{self.name}")
 
-    try:
-        asyncio.run(
-            _shutdown_runtime_coordinators(
-                settings=settings,
-                session_factory=session_factory,
-                coordinators=(("runtime", Coordinator()),),
-            )
+    asyncio.run(
+        _shutdown_runtime_coordinators(
+            coordinators=(
+                ("one", Coordinator("one")),
+                ("two", Coordinator("two")),
+            ),
         )
+    )
 
-        assert calls == [
-            "admission_closed",
-            "coordinator_stopped",
-            "pause_inserted",
-        ]
-        assert pause_insert_seen.is_set() is True
-        assert worker_errors == []
-        with session_factory() as db:
-            state = db.get(RuntimeControlState, "global")
-            assert state is not None
-            assert state.paused is True
-            pause_event = db.scalar(
-                select(RuntimeControlEvent)
-                .where(
-                    RuntimeControlEvent.action == "pause",
-                    RuntimeControlEvent.source == "lifespan_shutdown",
-                )
-                .order_by(RuntimeControlEvent.occurred_at.desc())
-            )
-            assert pause_event is not None
-    finally:
-        event.remove(engine, "after_cursor_execute", interrupt_pause_insert)
-        release_worker.set()
-        worker_thread.join(timeout=2)
-        engine.dispose()
+    assert calls == ["admission:one", "admission:two", "stop:one", "stop:two"]
 
 
-def test_lifespan_closes_broker_admission_before_durable_pause_io(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_lifespan_closes_broker_admission_before_coordinator_drain() -> None:
     async def scenario() -> None:
-        pause_started = asyncio.Event()
-        release_pause = asyncio.Event()
+        stop_started = asyncio.Event()
+        release_stop = asyncio.Event()
         fence = RuntimeCycleFence()
         broker_calls: list[str] = []
-
-        async def delayed_pause(**_kwargs: object) -> None:
-            pause_started.set()
-            await release_pause.wait()
 
         class Coordinator:
             def begin_shutdown(self) -> None:
                 fence.begin_shutdown()
 
             async def stop(self) -> None:
-                return None
+                stop_started.set()
+                await release_stop.wait()
 
         class Adapter:
             def place_order(self, *_args: object, **_kwargs: object) -> object:
                 broker_calls.append("placed")
                 return object()
 
-        monkeypatch.setattr("app.main._pause_runtime_for_shutdown", delayed_pause)
         shutdown_task = asyncio.create_task(
             _shutdown_runtime_coordinators(
-                settings=Settings(database_url="sqlite:///:memory:"),
-                session_factory=None,  # type: ignore[arg-type]
                 coordinators=(("runtime", Coordinator()),),
             )
         )
-        await asyncio.wait_for(pause_started.wait(), timeout=1)
+        await asyncio.wait_for(stop_started.wait(), timeout=1)
 
         with pytest.raises(asyncio.CancelledError):
             GuardedBrokerAdapter(Adapter(), fence).place_order("token", object())
         assert broker_calls == []
 
-        release_pause.set()
+        release_stop.set()
         await asyncio.wait_for(shutdown_task, timeout=1)
 
     asyncio.run(scenario())
@@ -368,42 +865,37 @@ def test_lifespan_waits_for_real_drain_after_bounded_stop_timeout() -> None:
     asyncio.run(scenario())
 
 
-def test_cancelled_lifespan_finishes_pause_before_coordinator_stop(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_cancelled_lifespan_finishes_coordinator_drain() -> None:
     async def scenario() -> None:
-        pause_started = asyncio.Event()
-        release_pause = asyncio.Event()
+        stop_started = asyncio.Event()
+        release_stop = asyncio.Event()
         calls: list[str] = []
 
-        async def delayed_pause(**_kwargs: object) -> None:
-            calls.append("pause:start")
-            pause_started.set()
-            await release_pause.wait()
-            calls.append("pause:done")
-
         class Coordinator:
-            async def stop(self) -> None:
-                calls.append("stop")
+            def begin_shutdown(self) -> None:
+                calls.append("admission_closed")
 
-        monkeypatch.setattr("app.main._pause_runtime_for_shutdown", delayed_pause)
+            async def stop(self) -> None:
+                calls.append("stop:start")
+                stop_started.set()
+                await release_stop.wait()
+                calls.append("stop:done")
+
         shutdown_task = asyncio.create_task(
             _shutdown_runtime_coordinators(
-                settings=Settings(database_url="sqlite:///:memory:"),
-                session_factory=None,  # type: ignore[arg-type]
                 coordinators=(("runtime", Coordinator()),),
             )
         )
-        await asyncio.wait_for(pause_started.wait(), timeout=1)
+        await asyncio.wait_for(stop_started.wait(), timeout=1)
         shutdown_task.cancel()
         await asyncio.sleep(0.02)
 
-        assert calls == ["pause:start"]
+        assert calls == ["admission_closed", "stop:start"]
 
-        release_pause.set()
+        release_stop.set()
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(shutdown_task, timeout=1)
-        assert calls == ["pause:start", "pause:done", "stop"]
+        assert calls == ["admission_closed", "stop:start", "stop:done"]
 
     asyncio.run(scenario())
 

@@ -277,7 +277,7 @@ KAI_EXEC_KIS_ACCOUNT_NUMBER=12345678
 | `KAI_EXEC_RUNTIME_MODE` | `mock`, `paper`, or `live`; default `mock` |
 | `KAI_EXEC_RUNTIME_BROKER_PROVIDER` | primary adapter used by runtime status, daily board, and unqualified broker routes: `kis` (default), `alpaca`, or `upbit`; invalid values fail startup |
 | `KAI_EXEC_DATABASE_URL` | default `sqlite:///./var/kai_trading_exec.db` |
-| `KAI_EXEC_AUTOMATION_ENABLED` | global order automation gate; default `false` |
+| `KAI_EXEC_AUTOMATION_ENABLED` | process-level automation feature gate; default `false`; it never overrides durable pause, kill-switch, or risk fences |
 | `KAI_EXEC_AUTONOMOUS_RUNTIME_ENABLED` | dispatch/monitoring worker gate; default `false` |
 | `KAI_EXEC_DISPATCH_LOOP_INTERVAL_SECONDS` | active-session dispatch cadence; default `1` second |
 | `KAI_EXEC_MONITORING_LOOP_INTERVAL_SECONDS` | active-session monitoring cadence; default `1` second |
@@ -690,7 +690,7 @@ Interactive OpenAPI is available at `/docs` and `/redoc`.
 | --- | --- |
 | Health/runtime | `GET /health`, `/runtime/status`, `/runtime/safety`, `/runtime/daily-board`, `/runtime/monitored-symbol-membership`, `/runtime/portfolio-risk` (`market=all|krx|us`), `/runtime/alpaca-crypto`, `/runtime/alpaca-us-equity`; `POST /runtime/plan-judgment/action` |
 | Broker session | `GET /broker/session`, `POST /broker/session/authenticate`, `POST /broker/session/revoke` |
-| Controls | `POST /controls/pause`, `/controls/resume`, `/controls/kill-switch` |
+| Controls | `POST /controls/pause`, `/controls/resume`, `/controls/kill-switch`, `/controls/kill-switch/reset` |
 | Core v4 delegation | `GET/POST /v4/execution-plans`, `POST /v4/execution-plans/revocations` |
 | Core OPEN authority | `POST /runtime/core-buy-authority/observations` |
 | Legacy/operator plans and jobs | `GET/POST /execution-plans`, `POST /execution-plans/preview`, `GET /execution-jobs`, `POST /execution-jobs/dispatch` |
@@ -894,6 +894,7 @@ CI validates the complete Alembic chain and schema contract on both SQLite and P
 - `ARCHITECTURE.md` — ownership and failure boundaries
 - `RULES.md` and `AGENTS.md` — repository operating rules
 - `docs/API.md` — API contract details
+- `docs/TRADING_RUNTIME_STATE_SPEC.md` — control, monitoring, entry/exit, and recovery state contract
 - `docs/LIVE_VALIDATION.md` — guarded single-cycle live validation
 - `docs/ALPACA_CRYPTO_SETUP.md` — Alpaca account, funding, paper test, and activation
 - `kai-trading-core` — market data, strategy context, decisions, and execution plans

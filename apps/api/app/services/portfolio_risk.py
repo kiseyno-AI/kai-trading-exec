@@ -57,6 +57,7 @@ from app.services.position_identity import (
     build_position_identity,
 )
 from app.services.plan_item_identity import plan_item_entry_family_key
+from app.services.runtime_transitions import ACTIVE_SELL_MONITORING_STATUSES
 
 TOP_SYMBOL_ALLOCATION_WARNING_PCT = Decimal("0.30")
 TOP_THREE_ALLOCATION_WARNING_PCT = Decimal("0.60")
@@ -64,17 +65,7 @@ TOP_ITEM_LIMIT = 5
 UNKNOWN_CURRENCY_KEY = "UNKNOWN"
 CURRENCY_HINT_HISTORY_PER_SYMBOL = 3
 STOP_MONITOR_INTENTS = {"stop_sell", "target_sell", "max_holding_close_sell"}
-ACTIVE_MONITORING_STATUSES = (
-    "target_sell_monitoring",
-    "target_sell_triggered_pending_dispatch",
-    "target_sell_triggered_blocked",
-    "stop_sell_monitoring",
-    "stop_sell_triggered_pending_dispatch",
-    "stop_sell_triggered_blocked",
-    "max_holding_close_sell_monitoring",
-    "max_holding_close_sell_triggered_pending_dispatch",
-    "max_holding_close_sell_triggered_blocked",
-)
+ACTIVE_MONITORING_STATUSES = tuple(sorted(ACTIVE_SELL_MONITORING_STATUSES))
 
 
 @dataclass(frozen=True)

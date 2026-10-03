@@ -11,6 +11,12 @@ from app.models.runtime import RuntimeControlEvent, RuntimeControlState, new_id
 
 RUNTIME_CONTROL_ID = "global"
 DEFAULT_CONTROL_SOURCE = "operator"
+LEGACY_LIFESPAN_SHUTDOWN_SOURCE = "lifespan_shutdown"
+LEGACY_LIFESPAN_SHUTDOWN_REASON = "service lifespan shutdown started"
+LEGACY_LIFESPAN_SHUTDOWN_MESSAGE = "runtime paused; monitoring remains active"
+LEGACY_LIFESPAN_SHUTDOWN_READINESS_REASON = (
+    "paused by operator; monitoring remains active"
+)
 
 
 @dataclass(frozen=True)
@@ -63,19 +69,90 @@ def ensure_runtime_control_state(
     return state
 
 
+def recover_legacy_lifespan_shutdown_pause(
+    *,
+    settings: Settings,
+    db: Session,
+) -> ControlActionResult | None:
+    """Release only the exact durable pause written by the retired shutdown path."""
+
+    state = db.get(RuntimeControlState, RUNTIME_CONTROL_ID)
+    if (
+        state is None
+        or state.mode != settings.runtime_mode
+        or not state.paused
+        or state.kill_switch_enabled
+        or state.last_transition_action != "pause"
+        or state.last_transition_source != LEGACY_LIFESPAN_SHUTDOWN_SOURCE
+        or not state.last_transition_event_id
+    ):
+        return None
+
+    legacy_event = db.get(RuntimeControlEvent, state.last_transition_event_id)
+    current_state = (
+        legacy_event.current_state
+        if legacy_event is not None and isinstance(legacy_event.current_state, dict)
+        else {}
+    )
+    if (
+        legacy_event is None
+        or legacy_event.runtime_control_state_id != state.id
+        or legacy_event.action != "pause"
+        or legacy_event.outcome != "applied"
+        or legacy_event.actor != settings.service_name
+        or legacy_event.source != LEGACY_LIFESPAN_SHUTDOWN_SOURCE
+        or legacy_event.reason != LEGACY_LIFESPAN_SHUTDOWN_REASON
+        or legacy_event.message != LEGACY_LIFESPAN_SHUTDOWN_MESSAGE
+        or state.readiness_reason != LEGACY_LIFESPAN_SHUTDOWN_READINESS_REASON
+        or current_state.get("paused") is not True
+        or current_state.get("kill_switch_enabled") is not False
+        or current_state.get("automation_enabled") is not False
+        or current_state.get("readiness_reason")
+        != LEGACY_LIFESPAN_SHUTDOWN_READINESS_REASON
+    ):
+        return None
+
+    previous_state = _state_snapshot(state)
+    return _apply_control_transition_compare_and_swap(
+        db=db,
+        state=state,
+        command=ControlCommand(
+            actor=settings.service_name,
+            source="startup_recovery",
+            reason="release retired lifespan shutdown pause",
+        ),
+        action="legacy_shutdown_pause_recovery",
+        outcome="applied",
+        message="legacy lifespan shutdown pause released; runtime entry automation restored",
+        previous_state=previous_state,
+        expected_state={
+            "paused": True,
+            "kill_switch_enabled": False,
+            "last_transition_action": "pause",
+            "last_transition_source": LEGACY_LIFESPAN_SHUTDOWN_SOURCE,
+            "last_transition_reason": LEGACY_LIFESPAN_SHUTDOWN_REASON,
+            "last_transition_event_id": legacy_event.id,
+            "readiness_reason": LEGACY_LIFESPAN_SHUTDOWN_READINESS_REASON,
+        },
+        state_values={
+            "mode": settings.runtime_mode,
+            "paused": False,
+            "readiness_reason": None,
+        },
+    )
+
+
 def effective_automation_enabled(state: RuntimeControlState) -> bool:
     return not state.kill_switch_enabled and not state.paused
 
 
 def automated_order_submission_allowed(state: RuntimeControlState) -> bool:
-    return effective_automation_enabled(state)
+    return not state.kill_switch_enabled
 
 
 def automated_order_submission_block_reason(state: RuntimeControlState) -> str | None:
     if state.kill_switch_enabled:
         return "kill_switch"
-    if state.paused:
-        return "paused"
     return None
 
 
@@ -83,6 +160,8 @@ def automated_buy_submission_block_reason(state: RuntimeControlState) -> str | N
     runtime_reason = automated_order_submission_block_reason(state)
     if runtime_reason is not None:
         return runtime_reason
+    if state.paused:
+        return "paused"
     if state.hourly_risk_off_active:
         return "hourly_plan_risk_off"
     return None
@@ -186,7 +265,7 @@ def pause_runtime(
     state, _ = _load_runtime_control_state(
         settings=settings,
         db=db,
-        sync_mode=True,
+        sync_mode=False,
     )
     previous_state = _state_snapshot(state)
 
@@ -197,12 +276,44 @@ def pause_runtime(
         message = "runtime is already paused"
         outcome = "noop"
     else:
-        state.mode = settings.runtime_mode
-        state.paused = True
-        state.automation_enabled = False
-        state.readiness_reason = "paused by operator; monitoring remains active"
-        message = "runtime paused; monitoring remains active"
-        outcome = "applied"
+        readiness_reason = (
+            "new entries paused by operator; monitoring and risk-reducing exits remain active"
+        )
+        message = (
+            "new entries paused; monitoring and risk-reducing exits remain active"
+        )
+        applied = _apply_control_transition_compare_and_swap(
+            db=db,
+            state=state,
+            command=command,
+            action="pause",
+            outcome="applied",
+            message=message,
+            previous_state=previous_state,
+            expected_state={
+                "paused": False,
+                "kill_switch_enabled": False,
+                "last_transition_event_id": state.last_transition_event_id,
+            },
+            state_values={
+                "mode": settings.runtime_mode,
+                "paused": True,
+                "readiness_reason": readiness_reason,
+            },
+        )
+        if applied is not None:
+            return applied
+        state = _reload_runtime_control_state(db=db)
+        previous_state = _state_snapshot(state)
+        if state.kill_switch_enabled:
+            message = "kill switch already active; automated order submission remains blocked"
+            outcome = "noop"
+        elif state.paused:
+            message = "runtime is already paused"
+            outcome = "noop"
+        else:
+            message = "runtime pause rejected; runtime control state changed concurrently"
+            outcome = "rejected"
 
     return _finalize_action(
         db=db,
@@ -224,7 +335,7 @@ def resume_runtime(
     state, _ = _load_runtime_control_state(
         settings=settings,
         db=db,
-        sync_mode=True,
+        sync_mode=False,
     )
     previous_state = _state_snapshot(state)
 
@@ -235,12 +346,39 @@ def resume_runtime(
         message = "runtime is already accepting automated actions"
         outcome = "noop"
     else:
-        state.mode = settings.runtime_mode
-        state.paused = False
-        state.automation_enabled = True
-        state.readiness_reason = None
         message = "runtime resumed; automated actions are enabled"
-        outcome = "applied"
+        applied = _apply_control_transition_compare_and_swap(
+            db=db,
+            state=state,
+            command=command,
+            action="resume",
+            outcome="applied",
+            message=message,
+            previous_state=previous_state,
+            expected_state={
+                "paused": True,
+                "kill_switch_enabled": False,
+                "last_transition_event_id": state.last_transition_event_id,
+            },
+            state_values={
+                "mode": settings.runtime_mode,
+                "paused": False,
+                "readiness_reason": None,
+            },
+        )
+        if applied is not None:
+            return applied
+        state = _reload_runtime_control_state(db=db)
+        previous_state = _state_snapshot(state)
+        if state.kill_switch_enabled:
+            message = "kill switch is active; explicit reset flow is required before resume"
+            outcome = "rejected"
+        elif not state.paused:
+            message = "runtime is already accepting automated actions"
+            outcome = "noop"
+        else:
+            message = "runtime resume rejected; runtime control state changed concurrently"
+            outcome = "rejected"
 
     return _finalize_action(
         db=db,
@@ -264,49 +402,106 @@ def enable_kill_switch(
         db=db,
         sync_mode=False,
     )
-    previous_state = _state_snapshot(state)
+    while True:
+        previous_state = _state_snapshot(state)
+        if state.kill_switch_enabled:
+            return _finalize_action(
+                db=db,
+                state=state,
+                command=command,
+                action="kill_switch",
+                outcome="noop",
+                message="kill switch is already active",
+                previous_state=previous_state,
+            )
 
-    if state.kill_switch_enabled:
-        message = "kill switch is already active"
-        outcome = "noop"
-        return _finalize_action(
+        readiness_reason = (
+            "kill switch enabled by operator; automated order submission is blocked"
+        )
+        applied = _apply_control_transition_compare_and_swap(
             db=db,
             state=state,
             command=command,
             action="kill_switch",
-            outcome=outcome,
-            message=message,
+            outcome="applied",
+            message=(
+                "kill switch enabled; automated order submission is durably blocked"
+            ),
+            previous_state=previous_state,
+            expected_state={
+                "mode": state.mode,
+                "paused": state.paused,
+                "kill_switch_enabled": False,
+                "readiness_reason": state.readiness_reason,
+                "last_transition_event_id": state.last_transition_event_id,
+            },
+            state_values={
+                "mode": settings.runtime_mode,
+                "paused": True,
+                "kill_switch_enabled": True,
+                "readiness_reason": readiness_reason,
+            },
+        )
+        if applied is not None:
+            return applied
+        state = _reload_runtime_control_state(db=db)
+
+
+def reset_kill_switch(
+    *,
+    settings: Settings,
+    db: Session,
+    command: ControlCommand,
+    expected_current_event_id: str,
+) -> ControlActionResult:
+    """Clear the kill switch only for the exact transition the operator reviewed."""
+
+    state, _ = _load_runtime_control_state(
+        settings=settings,
+        db=db,
+        sync_mode=False,
+    )
+    previous_state = _state_snapshot(state)
+    if (
+        not state.kill_switch_enabled
+        or state.last_transition_action != "kill_switch"
+        or state.last_transition_event_id != expected_current_event_id
+    ):
+        return _finalize_action(
+            db=db,
+            state=state,
+            command=command,
+            action="kill_switch_reset",
+            outcome="rejected",
+            message=(
+                "kill switch reset rejected; the expected active kill-switch "
+                "transition does not match"
+            ),
             previous_state=previous_state,
         )
 
     occurred_at = datetime.now(UTC)
     event_id = new_id()
     readiness_reason = (
-        "kill switch enabled by operator; automated order submission is blocked"
+        "kill switch reset; new entries remain paused pending explicit operator resume"
     )
-    current_state = {
+    state_values = {
         "mode": settings.runtime_mode,
         "paused": True,
-        "kill_switch_enabled": True,
-        "automation_enabled": False,
-        "hourly_risk_off_active": state.hourly_risk_off_active,
-        "hourly_risk_off_epoch": state.hourly_risk_off_epoch,
-        "hourly_risk_off_context": state.hourly_risk_off_context,
+        "kill_switch_enabled": False,
         "readiness_reason": readiness_reason,
     }
     result = db.execute(
         update(RuntimeControlState)
         .where(
             RuntimeControlState.id == state.id,
-            RuntimeControlState.kill_switch_enabled.is_(False),
+            RuntimeControlState.kill_switch_enabled.is_(True),
+            RuntimeControlState.last_transition_action == "kill_switch",
+            RuntimeControlState.last_transition_event_id == expected_current_event_id,
         )
         .values(
-            mode=settings.runtime_mode,
-            paused=True,
-            kill_switch_enabled=True,
-            automation_enabled=False,
-            readiness_reason=readiness_reason,
-            last_transition_action="kill_switch",
+            **state_values,
+            last_transition_action="kill_switch_reset",
             last_transition_actor=command.actor,
             last_transition_source=command.source,
             last_transition_reason=command.reason,
@@ -315,16 +510,24 @@ def enable_kill_switch(
         ),
     )
     if result.rowcount:
+        event_previous_state, current_state = _durable_transition_event_snapshots(
+            db=db,
+            state=state,
+            reviewed_previous_state=previous_state,
+            state_values=state_values,
+        )
         event = RuntimeControlEvent(
             id=event_id,
             runtime_control_state_id=state.id,
-            action="kill_switch",
+            action="kill_switch_reset",
             outcome="applied",
             actor=command.actor,
             source=command.source,
             reason=command.reason,
-            message="kill switch enabled; automated order submission is durably blocked",
-            previous_state=previous_state,
+            message=(
+                "kill switch reset; new entries remain paused until explicit resume"
+            ),
+            previous_state=event_previous_state,
             current_state=current_state,
             occurred_at=occurred_at,
         )
@@ -333,23 +536,24 @@ def enable_kill_switch(
         db.refresh(state)
         db.refresh(event)
         return ControlActionResult(
-            action="kill_switch",
+            action="kill_switch_reset",
             outcome="applied",
             message=event.message or "",
             event_id=event.id,
             safety=runtime_safety_payload(state),
         )
 
-    db.refresh(state)
-    if state.mode != settings.runtime_mode:
-        state.mode = settings.runtime_mode
+    db.rollback()
+    state = db.get(RuntimeControlState, RUNTIME_CONTROL_ID)
+    if state is None:
+        raise RuntimeError("runtime control state disappeared during kill switch reset")
     return _finalize_action(
         db=db,
         state=state,
         command=command,
-        action="kill_switch",
-        outcome="noop",
-        message="kill switch is already active",
+        action="kill_switch_reset",
+        outcome="rejected",
+        message="kill switch reset rejected; runtime control state changed concurrently",
         previous_state=_state_snapshot(state),
     )
 
@@ -410,7 +614,6 @@ def _bootstrap_state_values(*, settings: Settings) -> dict[str, object]:
         "mode": settings.runtime_mode,
         "paused": True,
         "kill_switch_enabled": False,
-        "automation_enabled": False,
         "hourly_risk_off_active": False,
         "hourly_risk_off_epoch": 0,
         "hourly_risk_off_context": None,
@@ -428,12 +631,114 @@ def _state_snapshot(state: RuntimeControlState) -> dict[str, object]:
         "mode": state.mode,
         "paused": state.paused,
         "kill_switch_enabled": state.kill_switch_enabled,
-        "automation_enabled": state.automation_enabled,
+        "automation_enabled": effective_automation_enabled(state),
         "hourly_risk_off_active": state.hourly_risk_off_active,
         "hourly_risk_off_epoch": state.hourly_risk_off_epoch,
         "hourly_risk_off_context": state.hourly_risk_off_context,
         "readiness_reason": state.readiness_reason,
     }
+
+
+def _durable_transition_event_snapshots(
+    *,
+    db: Session,
+    state: RuntimeControlState,
+    reviewed_previous_state: dict[str, object],
+    state_values: dict[str, object],
+) -> tuple[dict[str, object], dict[str, object]]:
+    """Build audit snapshots from the row version actually updated by the CAS."""
+
+    db.refresh(state)
+    current_state = _state_snapshot(state)
+    previous_state = dict(current_state)
+    for key in state_values:
+        if key in reviewed_previous_state:
+            previous_state[key] = reviewed_previous_state[key]
+    previous_state["automation_enabled"] = not bool(
+        previous_state.get("paused")
+        or previous_state.get("kill_switch_enabled")
+    )
+    return previous_state, current_state
+
+
+def _reload_runtime_control_state(*, db: Session) -> RuntimeControlState:
+    db.rollback()
+    state = db.get(RuntimeControlState, RUNTIME_CONTROL_ID)
+    if state is None:
+        raise RuntimeError("runtime control state disappeared during control transition")
+    db.refresh(state)
+    return state
+
+
+def _apply_control_transition_compare_and_swap(
+    *,
+    db: Session,
+    state: RuntimeControlState,
+    command: ControlCommand,
+    action: str,
+    outcome: str,
+    message: str,
+    previous_state: dict[str, object],
+    expected_state: dict[str, object],
+    state_values: dict[str, object],
+) -> ControlActionResult | None:
+    """Apply an audited transition only while its reviewed state is still current."""
+
+    occurred_at = datetime.now(UTC)
+    event_id = new_id()
+    predicates = [RuntimeControlState.id == state.id]
+    for attribute_name, expected_value in expected_state.items():
+        column = getattr(RuntimeControlState, attribute_name)
+        predicates.append(
+            column.is_(None) if expected_value is None else column == expected_value
+        )
+    result = db.execute(
+        update(RuntimeControlState)
+        .where(*predicates)
+        .values(
+            **state_values,
+            last_transition_action=action,
+            last_transition_actor=command.actor,
+            last_transition_source=command.source,
+            last_transition_reason=command.reason,
+            last_transition_at=occurred_at,
+            last_transition_event_id=event_id,
+        )
+    )
+    if not result.rowcount:
+        db.rollback()
+        return None
+
+    event_previous_state, current_state = _durable_transition_event_snapshots(
+        db=db,
+        state=state,
+        reviewed_previous_state=previous_state,
+        state_values=state_values,
+    )
+    event = RuntimeControlEvent(
+        id=event_id,
+        runtime_control_state_id=state.id,
+        action=action,
+        outcome=outcome,
+        actor=command.actor,
+        source=command.source,
+        reason=command.reason,
+        message=message,
+        previous_state=event_previous_state,
+        current_state=current_state,
+        occurred_at=occurred_at,
+    )
+    db.add(event)
+    db.commit()
+    db.refresh(state)
+    db.refresh(event)
+    return ControlActionResult(
+        action=action,
+        outcome=outcome,
+        message=message,
+        event_id=event.id,
+        safety=runtime_safety_payload(state),
+    )
 
 
 def _finalize_action(

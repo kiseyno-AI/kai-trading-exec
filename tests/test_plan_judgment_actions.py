@@ -136,7 +136,6 @@ def test_sqlite_risk_off_projection_pending_survives_failure_and_blocks_recovery
                     id="global",
                     mode="live",
                     paused=False,
-                    automation_enabled=True,
                 ),
                 plan,
                 item,
@@ -724,6 +723,7 @@ def test_risk_off_expires_recovery_wait_states_and_restores_each_exact_status(
     monkeypatch.setattr(plan_judgment_actions, "datetime", _FrozenDateTime)
     expected_statuses = {
         "watch-trigger-blocked": "watch_buy_triggered_blocked",
+        "watch-sizing-pending": "watch_sizing_pending",
         "new-buy-blocked": "new_buy_blocked",
         "next-open-retry": "next_open_buy_retry_pending",
     }
@@ -736,7 +736,11 @@ def test_risk_off_expires_recovery_wait_states_and_restores_each_exact_status(
                 plan_item_index=index,
                 symbol=f"{index + 1:06d}",
                 side="buy",
-                intent="intraday_watch_buy" if index == 0 else "next_open_buy",
+                intent=(
+                    "intraday_watch_buy"
+                    if status.startswith("watch_")
+                    else "next_open_buy"
+                ),
                 status=status,
                 trigger_price=100 + index,
                 limit_price=101 + index,

@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 from app.models import EXEC_OWNED_TABLES
 
 
-REQUIRED_ALEMBIC_HEADS = ("202609110003",)
+REQUIRED_ALEMBIC_HEADS = ("202610020002",)
 EXECUTION_POSITION_SCOPE_REMEDIATION_REASON = (
     "non_flat_execution_position_scope_attribution_required"
 )

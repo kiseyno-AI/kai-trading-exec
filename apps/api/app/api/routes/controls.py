@@ -1,16 +1,18 @@
 from typing import Annotated
 
-from fastapi import APIRouter, Body, Depends, Request
+from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 
 from app.api.dependencies import get_db_session, get_settings
-from app.api.schemas.safety import SafetyControlRequest
+from app.api.schemas.safety import KillSwitchResetRequest, SafetyControlRequest
 from app.core.config import Settings
 from app.services.runtime_controls import (
     ControlCommand,
+    LEGACY_LIFESPAN_SHUTDOWN_SOURCE,
     enable_kill_switch,
     pause_runtime,
+    reset_kill_switch,
     resume_runtime,
 )
 
@@ -24,6 +26,14 @@ def pause_control(
     command: SafetyControlRequest | None = Body(default=None),
 ) -> JSONResponse:
     settings: Settings = get_settings(request)
+    if (
+        command is not None
+        and command.source.strip().lower() == LEGACY_LIFESPAN_SHUTDOWN_SOURCE
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="source is reserved for historical system-generated shutdown events",
+        )
     result = pause_runtime(
         settings=settings,
         db=db,
@@ -67,6 +77,22 @@ def kill_switch_control(
         settings=settings,
         db=db,
         command=_command(command),
+    )
+    return JSONResponse(status_code=result.status_code, content=result.payload())
+
+
+@router.post("/kill-switch/reset")
+def kill_switch_reset_control(
+    request: Request,
+    command: KillSwitchResetRequest,
+    db: Annotated[Session, Depends(get_db_session)],
+) -> JSONResponse:
+    settings: Settings = get_settings(request)
+    result = reset_kill_switch(
+        settings=settings,
+        db=db,
+        command=_command(command),
+        expected_current_event_id=command.expected_current_event_id,
     )
     return JSONResponse(status_code=result.status_code, content=result.payload())
 

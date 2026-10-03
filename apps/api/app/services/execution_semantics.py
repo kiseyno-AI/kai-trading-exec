@@ -12,6 +12,8 @@ INTRADAY_WATCH_BUY_INTENTS = frozenset(
     }
 )
 WATCH_BUY_INTENTS = INTRADAY_WATCH_BUY_INTENTS | frozenset({"next_open_buy"})
+PRE_MONITOR_EXEC_AGENT_SIZING_POLICY = "exec_agent_sized"
+TRIGGER_TIME_EXEC_AGENT_SIZING_POLICY = "trigger_time_exec_agent_sized"
 
 KRX_EXCHANGES = frozenset({"KRX", "KOSPI", "KOSDAQ", "NXT", "SOR"})
 KRX_ASSET_CLASS_ALIASES = frozenset(
@@ -44,6 +46,30 @@ def is_short_term_watch_buy_intent(intent: object) -> bool:
 
 def is_watch_buy_intent(intent: object) -> bool:
     return str(intent or "").strip().lower() in WATCH_BUY_INTENTS
+
+
+def is_exec_agent_sizing_policy(quantity_policy: object) -> bool:
+    if not isinstance(quantity_policy, dict):
+        return False
+    return PRE_MONITOR_EXEC_AGENT_SIZING_POLICY in (
+        quantity_policy.get("type"),
+        quantity_policy.get("kind"),
+    )
+
+
+def is_trigger_time_exec_agent_sizing_policy(quantity_policy: object) -> bool:
+    if not isinstance(quantity_policy, dict):
+        return False
+    return not is_exec_agent_sizing_policy(quantity_policy) and (
+        TRIGGER_TIME_EXEC_AGENT_SIZING_POLICY
+        in (quantity_policy.get("type"), quantity_policy.get("kind"))
+    )
+
+
+def is_delegated_exec_agent_sizing_policy(quantity_policy: object) -> bool:
+    return is_exec_agent_sizing_policy(
+        quantity_policy
+    ) or is_trigger_time_exec_agent_sizing_policy(quantity_policy)
 
 
 def watch_buy_direction_from_payloads(*payloads: object) -> str:

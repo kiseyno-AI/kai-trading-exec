@@ -716,11 +716,17 @@ def test_superseded_observation_cannot_project_over_newer_scope_state() -> None:
     engine.dispose()
 
 
-def test_distinct_fresh_observations_recover_and_restore_matching_items() -> None:
+@pytest.mark.parametrize(
+    "initial_status",
+    ["watch_monitoring_active", "watch_sizing_pending"],
+)
+def test_distinct_fresh_observations_recover_and_restore_matching_items(
+    initial_status: str,
+) -> None:
     settings = _settings()
     engine, session_factory = _db(settings)
     blocked_at = datetime(2026, 9, 11, 0, 1, tzinfo=UTC)
-    plan, item = _plan_item(status="watch_monitoring_active")
+    plan, item = _plan_item(status=initial_status)
     with session_factory() as db:
         db.add(plan)
         db.commit()
@@ -761,7 +767,7 @@ def test_distinct_fresh_observations_recover_and_restore_matching_items() -> Non
         assert second.fence_active is False
         assert second.healthy_observation_count == 2
         db.refresh(item)
-        assert item.status == "watch_monitoring_active"
+        assert item.status == initial_status
         assert item.risk_context["core_buy_authority"]["recovery"]["status"] == "resumed"
 
         reblocked_at = second_at + timedelta(seconds=2)

@@ -49,7 +49,6 @@ class RuntimeControlState(TimestampMixin, Base):
     mode: Mapped[str] = mapped_column(String(16), nullable=False, default="mock")
     paused: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     kill_switch_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
-    automation_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     hourly_risk_off_active: Mapped[bool] = mapped_column(
         Boolean,
         nullable=False,

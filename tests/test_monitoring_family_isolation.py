@@ -36,6 +36,7 @@ from app.services.monitoring import (
     materialize_monitoring_plan_items,
 )
 from app.services.position_identity import build_position_identity, execution_scope_payload
+from app.services.runtime_transitions import ACTIVE_SELL_MONITORING_STATUSES
 
 
 def _settings() -> Settings:
@@ -267,6 +268,66 @@ def test_newer_same_symbol_stop_never_supersedes_another_entry_family() -> None:
     assert {item.id for item in reconciled} == {older.id, newer.id}
     assert older.status == "stop_sell_monitoring"
     assert newer.status == "stop_sell_monitoring"
+    db.close()
+    engine.dispose()
+
+
+@pytest.mark.parametrize("status", sorted(ACTIVE_SELL_MONITORING_STATUSES))
+def test_held_position_appends_older_plan_for_every_live_sell_status(
+    status: str,
+) -> None:
+    settings = _settings()
+    engine, _factory, db = _session(settings)
+    if status.startswith("target_sell_"):
+        intent = "target_sell"
+    elif status.startswith("max_holding_close_sell_"):
+        intent = "max_holding_close_sell"
+    else:
+        intent = "stop_sell"
+    older = _sell_item(
+        settings,
+        item_id=f"older-{status}",
+        family_key=f"older-family-{status}",
+        accepted_at=datetime(2026, 9, 9, 12, tzinfo=UTC),
+        intent=intent,
+        status=status,
+    )
+    selected_risk, selected_policy = _bound_item_payloads(
+        settings,
+        quantity=1,
+        family_key=f"selected-watch-{status}",
+        extra_risk={"target_price": "110", "stop_price": "95"},
+    )
+    selected_watch = ExecutionPlanItem(
+        id=f"selected-watch-{status}",
+        plan=_plan(
+            key=f"selected-watch-{status}",
+            accepted_at=datetime(2026, 9, 10, 12, tzinfo=UTC),
+        ),
+        plan_item_index=0,
+        symbol="005930",
+        side="buy",
+        intent="intraday_watch_buy",
+        status="watch_monitoring_active",
+        provider="kis",
+        venue="KRX",
+        asset_class="stock",
+        trigger_price=Decimal("100"),
+        source_plan_item_id=f"selected-watch-family-{status}",
+        quantity_policy=selected_policy,
+        risk_context=selected_risk,
+    )
+    db.add_all([older.plan, selected_watch.plan, _position(settings)])
+    db.commit()
+
+    reconciled = _append_held_active_sell_monitor_reconciliations(
+        settings=settings,
+        db=db,
+        selected_items=[selected_watch],
+    )
+
+    assert {item.id for item in reconciled} == {selected_watch.id, older.id}
+    assert older.status == status
     db.close()
     engine.dispose()
 

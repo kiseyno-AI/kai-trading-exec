@@ -17,11 +17,22 @@ from app.services.position_identity import (
     build_position_identity,
     position_identity_from_columns,
 )
+from app.services.runtime_transitions import (
+    ACTIVE_SELL_MONITORING_STATUSES,
+    SELL_AGENT_ACTIVE_STATUSES,
+)
 
 
-ACTIVE_MAX_HOLDING_STATUSES = (
-    "max_holding_close_sell_pending_config",
-    "max_holding_close_sell_monitoring",
+ACTIVE_MAX_HOLDING_STATUSES = tuple(
+    sorted(
+        {"max_holding_close_sell_pending_config"}
+        | SELL_AGENT_ACTIVE_STATUSES
+        | {
+            status
+            for status in ACTIVE_SELL_MONITORING_STATUSES
+            if status.startswith("max_holding_close_sell_")
+        }
+    )
 )
 
 

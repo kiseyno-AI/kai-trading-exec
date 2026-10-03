@@ -661,7 +661,6 @@ def _place_broker_order_serialized(
     if (
         submission_block_reason is None
         and command.side == "buy"
-        and command.execution_plan_item_id is None
         and _is_new_buy_order(command=command, plan_item=None)
     ):
         submission_block_reason = automated_buy_submission_block_reason(control_state)
@@ -698,7 +697,10 @@ def _place_broker_order_serialized(
         return PlaceBrokerOrderResult(
             status_code=409,
             payload={
-                "message": "automated order submission is blocked by runtime safety controls",
+                "message": (
+                    "automated order submission is blocked by runtime safety controls: "
+                    f"{block_reason}"
+                ),
                 "block_reason": block_reason,
                 "retry_after_at": (
                     retry_after_at.isoformat() if retry_after_at is not None else None

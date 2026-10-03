@@ -31,6 +31,10 @@ from app.services.position_identity import (
     PositionIdentityConflictError,
     build_position_identity,
 )
+from app.services.runtime_transitions import (
+    ACTIVE_SELL_MONITORING_STATUSES,
+    ACTIVE_WATCH_MONITORING_STATUSES,
+)
 
 MAX_REPORTED_QUOTE_FAILURES = 10
 MAX_REPORTED_CONTEXT_FAILURES = 10
@@ -51,24 +55,8 @@ _ROUTE_AUTHORITY_INTENTS = frozenset(
         "next_open_buy",
     }
 )
-_ROUTE_AUTHORITY_STATUSES = frozenset(
-    {
-        "target_sell_monitoring",
-        "stop_sell_monitoring",
-        "max_holding_close_sell_monitoring",
-        "target_sell_triggered_blocked",
-        "stop_sell_triggered_blocked",
-        "target_sell_triggered_pending_dispatch",
-        "stop_sell_triggered_pending_dispatch",
-        "watch_monitoring_pending",
-        "watch_monitoring_active",
-        "watch_buy_triggered",
-        "watch_buy_triggered_blocked",
-        "watch_buy_triggered_pending_dispatch",
-        "triggered_pending_agent",
-        "agent_delay",
-        "agent_approved_pending_submit",
-    }
+_ROUTE_AUTHORITY_STATUSES = (
+    ACTIVE_SELL_MONITORING_STATUSES | ACTIVE_WATCH_MONITORING_STATUSES
 )
 
 

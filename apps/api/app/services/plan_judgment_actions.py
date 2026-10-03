@@ -21,9 +21,14 @@ from app.models.runtime import (
     RuntimeControlState,
 )
 from app.services.runtime_controls import RUNTIME_CONTROL_ID, ensure_runtime_control_state
+from app.services.runtime_transitions import (
+    ACTIVE_WATCH_MONITORING_STATUSES,
+    WATCH_SIZING_PENDING_STATUS,
+)
 
 BUY_WATCH_INTENTS = ("intraday_watch_buy", "next_open_buy")
 BUY_MUTABLE_STATUSES = (
+    WATCH_SIZING_PENDING_STATUS,
     "watch_monitoring_active",
     "watch_monitoring_pending",
     "short_term_watcher_pending",
@@ -33,14 +38,12 @@ BUY_MUTABLE_STATUSES = (
     "next_open_buy_retry_pending",
     "new_buy_blocked",
 )
-RISK_OFF_EXPIRABLE_STATUSES = (
-    *BUY_MUTABLE_STATUSES,
-    "watch_buy_triggered",
-    "watch_buy_triggered_pending_dispatch",
-    "triggered_pending_agent",
-    "agent_delay",
-    "agent_approved_pending_submit",
-    "next_open_buy_dispatching",
+RISK_OFF_EXPIRABLE_STATUSES = tuple(
+    sorted(
+        set(BUY_MUTABLE_STATUSES)
+        | ACTIVE_WATCH_MONITORING_STATUSES
+        | {"next_open_buy_dispatching"}
+    )
 )
 ADJUSTMENT_KEY = "hourly_plan_action"
 SOURCE = "hourly_runtime_check"

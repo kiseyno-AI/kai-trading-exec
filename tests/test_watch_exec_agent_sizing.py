@@ -65,6 +65,7 @@ from app.services.position_identity import (
     execution_scope_payload,
 )
 from app.services.runtime import RuntimeMetadata, build_runtime_daily_board, build_runtime_status
+from app.services.runtime_controls import ControlCommand, resume_runtime
 from app.services.execution_api import create_execution_plan
 from app.services.watch_exec_agent_sizing import (
     _apply_decisions,
@@ -212,7 +213,8 @@ def _watch_item(
         symbol=symbol,
         side="buy",
         intent="intraday_watch_buy",
-        status="watch_monitoring_pending",
+        status="watch_sizing_pending",
+        decision_agent_name="short-term-decider",
         trigger_price=Decimal(trigger_price),
         limit_price=Decimal(limit_price),
         quantity_policy={
@@ -246,7 +248,7 @@ def _next_open_watch_item(
         symbol=symbol,
         side="buy",
         intent="next_open_buy",
-        status="watch_monitoring_pending",
+        status="watch_sizing_pending",
         trigger_price=None,
         limit_price=None,
         time_in_force="day",
@@ -258,6 +260,19 @@ def _next_open_watch_item(
         risk_context=risk_context,
         decision_agent_name="signal-decider",
     )
+
+
+def test_next_open_sizing_treats_kind_alias_as_pre_monitor_delegation() -> None:
+    item = _next_open_watch_item()
+    item.status = "pending"
+    item.quantity_policy = {
+        "type": "shares",
+        "kind": "exec_agent_sized",
+        "quantity": 7,
+    }
+
+    assert watch_sizing._is_untriggered_next_open_sizing_item(item) is True
+    assert watch_sizing._eligible_unsized_item_status(item) is True
 
 
 def _watch_veto_settings(**overrides) -> Settings:
@@ -407,6 +422,7 @@ def _resolve_live_watch_veto(
     risk_context: dict[str, object],
     price: MonitoringPriceRequest,
     quantity_policy: dict[str, object] | None = None,
+    resume_automated_actions: bool = False,
 ) -> tuple[object, dict[str, object] | None, dict[str, object] | None]:
     engine, session, item_id = _watch_veto_plan(
         settings=settings,
@@ -414,6 +430,17 @@ def _resolve_live_watch_veto(
         quantity_policy=quantity_policy,
     )
     try:
+        if resume_automated_actions:
+            resume_result = resume_runtime(
+                settings=settings,
+                db=session,
+                command=ControlCommand(
+                    actor="test",
+                    source="test",
+                    reason="exercise an explicitly enabled watch-buy path",
+                ),
+            )
+            assert resume_result.outcome in {"applied", "noop"}
         item = session.get(ExecutionPlanItem, item_id)
         assert item is not None
         approval = _resolve_watch_buy_order(
@@ -591,6 +618,7 @@ def test_live_watch_buy_downsize_flag_true_permits_market_guardrail_downsizing_i
             settings=_watch_veto_settings(watch_buy_live_market_regime_downsize_allowed=True),
             risk_context=risk_context,
             price=_price(),
+            resume_automated_actions=True,
         )
 
         assert approval.quantity is not None
@@ -655,6 +683,7 @@ def test_stale_breadth_override_and_paper_keep_existing_downsize_path() -> None:
         settings=_watch_veto_settings(),
         risk_context=stale_context,
         price=_price(),
+        resume_automated_actions=True,
     )
     assert live_approval.quantity is not None
     assert live_payload is None
@@ -663,6 +692,7 @@ def test_stale_breadth_override_and_paper_keep_existing_downsize_path() -> None:
         settings=Settings(runtime_mode="paper", automation_enabled=True, market_regime_breadth_max_age_seconds=300),
         risk_context={"market_breadth": stale_context["market_breadth"]},
         price=_price(),
+        resume_automated_actions=True,
     )
     assert paper_approval.quantity is not None
     assert paper_payload is None
@@ -709,6 +739,17 @@ def test_monitoring_cycle_persists_live_veto_status_and_operator_summaries() -> 
             )
             session.add(plan)
             session.commit()
+
+            resume_result = resume_runtime(
+                settings=settings,
+                db=session,
+                command=ControlCommand(
+                    actor="test",
+                    source="test",
+                    reason="exercise live watch-buy veto handling",
+                ),
+            )
+            assert resume_result.outcome == "applied"
 
             result = evaluate_monitoring(
                 settings=settings,
@@ -925,7 +966,7 @@ def test_live_watch_sizing_waits_when_account_snapshot_is_unavailable(tmp_path, 
     with session_factory() as session:
         item = session.get(ExecutionPlanItem, "watch-item-account-unavailable")
         assert item is not None
-        assert item.status == "watch_monitoring_pending"
+        assert item.status == "watch_sizing_pending"
 
     engine.dispose()
 
@@ -1013,7 +1054,7 @@ def test_live_watch_sizing_blocks_when_broker_open_order_truth_is_degraded(
     with session_factory() as session:
         item = session.get(ExecutionPlanItem, "watch-item-open-orders-degraded")
         assert item is not None
-        assert item.status == "watch_monitoring_pending"
+        assert item.status == "watch_sizing_pending"
 
     engine.dispose()
 
@@ -2651,7 +2692,7 @@ def test_short_transaction_rejects_agent_decision_after_candidate_state_changes(
     with session_factory() as session:
         item = session.get(ExecutionPlanItem, item_id)
         assert item is not None
-        assert item.status == "watch_monitoring_pending"
+        assert item.status == "watch_sizing_pending"
         assert item.risk_context["target_price"] == "77000"
         assert item.quantity_policy.get("quantity") is None
 
@@ -2753,7 +2794,7 @@ def test_short_transaction_rechecks_binding_deadline_after_agent_lock_wait(
     with session_factory() as session:
         item = session.get(ExecutionPlanItem, item_id)
         assert item is not None
-        assert item.status == "watch_monitoring_pending"
+        assert item.status == "watch_sizing_pending"
         assert item.quantity_policy.get("quantity") is None
 
     engine.dispose()
@@ -3971,8 +4012,8 @@ def test_apply_decisions_rejects_partial_response_and_leaves_every_item_pending(
             },
         )
 
-    assert plan.items[0].status == "watch_monitoring_pending"
-    assert plan.items[1].status == "watch_monitoring_pending"
+    assert plan.items[0].status == "watch_sizing_pending"
+    assert plan.items[1].status == "watch_sizing_pending"
 
 
 def test_apply_decisions_rejects_unknown_response_contract_version() -> None:
@@ -4846,7 +4887,7 @@ def test_signal_next_open_ingress_persists_then_async_sizes_exactly_one_job(
     with session_factory() as db:
         item = db.get(ExecutionPlanItem, item_id)
         assert item is not None
-        assert item.status == "watch_monitoring_pending"
+        assert item.status == "watch_sizing_pending"
         assert item.quantity_policy["type"] == "exec_agent_sized"
         assert db.scalars(select(ExecutionJob)).all() == []
 

@@ -1722,6 +1722,7 @@ def revoke_core_execution_plan_v4(
             status_code=409,
             status="manual_review_required",
             reason_code="persisted_v4_contract_not_proven",
+            execution_plan_id=plan.id,
         )
 
     requested_by_key = {item.core_item_key: item for item in command.items}
@@ -1758,6 +1759,7 @@ def revoke_core_execution_plan_v4(
             status_code=409,
             status="manual_review_required",
             reason_code="revocation_item_binding_mismatch",
+            execution_plan_id=plan.id,
         )
 
     item_ids = {item.id for item in locked_items}

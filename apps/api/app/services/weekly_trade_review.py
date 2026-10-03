@@ -44,6 +44,7 @@ from app.services.fifo_inventory import (
 )
 from app.services.fill_idempotency import dedupe_execution_fills
 from app.services.fill_economics import closed_trade_economics
+from app.services.runtime_transitions import WATCH_SIZING_PENDING_STATUS
 from app.services.max_holding_actionability import max_holding_actionability_summary
 from app.services.late_entry_actionability import late_entry_actionability_summary
 
@@ -53,6 +54,7 @@ class WeeklyTradeReviewTimeoutError(TimeoutError):
 
 
 WATCH_REVIEW_STATUSES = (
+    WATCH_SIZING_PENDING_STATUS,
     "watch_monitoring_pending",
     "watch_monitoring_active",
     "watch_buy_triggered",
