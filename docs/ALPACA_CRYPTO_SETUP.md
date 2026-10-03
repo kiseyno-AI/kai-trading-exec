@@ -114,13 +114,67 @@ curl http://127.0.0.1:8011/runtime/alpaca-us-equity
 ```
 
 After the account-scope migration, any unscoped legacy strategy state, risk
-state, decision, or strategy-origin order is quarantined authority. While one
-exists, the worker returns `legacy_strategy_scope_requires_manual_review` and
-cannot create a new decision or buy. It still reconciles broker truth and runs
-protective sells first for positions whose current account, strategy family,
-fills, and stop state are all exactly attributable. Confirm those
-`protective_actions` before remediation; never assign a legacy row to the
-current account by inference.
+state, decision, or strategy-origin order is quarantined authority. The worker
+can retire one exact fingerprinted legacy set without rebinding its rows only
+when a broker-authenticated snapshot is no more than five minutes old, holdings
+and open-order coverage are complete, every configured symbol is flat, no
+broker open order exists, and every matching local legacy order is terminal.
+The immutable `legacy_strategy_authority` remediation event binds the account,
+strategy family, row IDs, and material fingerprint; later row drift invalidates
+the retirement. Any non-flat, stale, incomplete, active-order, or changed set
+still returns `legacy_strategy_scope_requires_manual_review`. Protective sells
+continue to run first for exactly scoped positions. Never assign a legacy row
+to the current account by inference.
+
+### Recover a proven non-flat legacy U.S.-equity sleeve
+
+The SPY/QQQ paper lane has a separate, operator-approved recovery path for a
+legacy position that is still open. This path is restricted to
+`paper/alpaca/us_equity/US`. It does not rebind or edit any legacy state, risk,
+decision, order, or fill row. It creates only fresh scoped strategy-state rows
+and one immutable opening-inventory audit event.
+
+Pause the paper runtime and fully drain/stop the port 8011 process before the
+dry-run. Keep it stopped through review and apply. The command does not resume
+the service, and the paper runtime must remain paused after restart until the
+seed and runtime status have been inspected.
+
+```bash
+curl -X POST http://127.0.0.1:8011/controls/pause \
+  -H 'content-type: application/json' \
+  -d '{"actor":"operator","source":"manual","reason":"legacy US sleeve recovery"}'
+
+# Stop/drain start-alpaca-paper.sh after the pause has persisted, then load the
+# same ignored credential environment used by that service.
+set -a
+source ./.env
+[ ! -f ./.env.paper ] || source ./.env.paper
+set +a
+export KAI_EXEC_DATABASE_URL="sqlite:///$PWD/var/alpaca_paper_exec.db"
+
+.venv/bin/python scripts/recover_alpaca_us_legacy_strategy.py
+```
+
+Review the exact scoped-position, authenticated snapshot, decision-to-order,
+broker-order, fill, and strategy/manual quantity partition in the JSON. Apply
+only the unchanged 64-hex `approval_fingerprint` from that dry-run:
+
+```bash
+.venv/bin/python scripts/recover_alpaca_us_legacy_strategy.py \
+  --apply \
+  --approve-fingerprint '<64-hex-dry-run-fingerprint>' \
+  --actor 'operator@example.com' \
+  --reason 'reviewed paper US opening inventory proof'
+```
+
+Apply re-reads all evidence, acquires the shared order-admission lock, and
+re-reads broker truth again while serialized. Any row, holding, order proof,
+scope, or fingerprint drift rolls the transaction back. Both dry-run and apply
+make **zero broker mutations**: no order is placed, amended, or canceled. At
+runtime, the opening strategy quantity plus later exact-scoped strategy fills
+and the independently tracked manual residual must conserve to the complete
+broker holding; any mismatch blocks protective and daily orders before they can
+reach the broker.
 
 ## 5. Paper buy and sell validation
 
