@@ -1279,6 +1279,9 @@ class AutonomousRuntimeCoordinator:
                 self._monitoring_next_no_price_db_check_at = (
                     started_at + MONITORING_NO_PRICE_DB_RESCAN_INTERVAL
                 )
+            submitted_symbols = _submitted_symbols_from_monitoring_payload(
+                result.payload
+            )
             payload = {
                 "status_code": result.status_code,
                 "price_source_configured": self._monitoring_price_source_state.configured,
@@ -1287,7 +1290,9 @@ class AutonomousRuntimeCoordinator:
                 **result.payload,
                 "monitored_symbols": monitored_symbols,
                 "price_count": 0,
-                "broker_action_symbols": symbols,
+                "broker_action_symbols": [
+                    symbol for symbol in symbols if symbol in submitted_symbols
+                ],
                 "broker_action_price_count": 0,
             }
             if post_entry_maintenance_count:
@@ -1381,6 +1386,9 @@ class AutonomousRuntimeCoordinator:
                 )
                 if isinstance(symbol, str) and symbol
             }
+            submitted_symbols = _submitted_symbols_from_monitoring_payload(
+                result.payload
+            )
             payload = {
                 "status_code": result.status_code,
                 "price_source_configured": self._monitoring_price_source_state.configured,
@@ -1389,15 +1397,11 @@ class AutonomousRuntimeCoordinator:
                 **result.payload,
                 "monitored_symbols": monitored_symbols,
                 "price_count": monitored_price_count,
-                "broker_action_symbols": (
-                    [symbol for symbol in symbols if symbol in triggered_symbols]
-                    if self.settings.monitoring_max_broker_actions_per_cycle > 0
-                    else []
-                ),
-                "broker_action_price_count": (
-                    sum(1 for price in prices if price.symbol in triggered_symbols)
-                    if self.settings.monitoring_max_broker_actions_per_cycle > 0
-                    else 0
+                "broker_action_symbols": [
+                    symbol for symbol in symbols if symbol in submitted_symbols
+                ],
+                "broker_action_price_count": sum(
+                    1 for price in prices if price.symbol in submitted_symbols
                 ),
                 "db_evaluation_symbols": symbols,
                 "state_rearm_symbols": [
@@ -2941,6 +2945,19 @@ def _triggered_symbols_from_cached_payload(
         if isinstance(symbol, str) and symbol:
             symbols.add(symbol)
     return symbols
+
+
+def _submitted_symbols_from_monitoring_payload(
+    payload: dict[str, object],
+) -> set[str]:
+    raw_symbols = payload.get("submitted_symbols")
+    if not isinstance(raw_symbols, list):
+        return set()
+    return {
+        symbol
+        for symbol in raw_symbols
+        if isinstance(symbol, str) and symbol
+    }
 
 
 def _parse_decimal(value: object) -> Decimal | None:

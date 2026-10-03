@@ -2626,7 +2626,8 @@ def test_due_cached_max_holding_exit_reaches_db_backed_monitoring_cycle(
     payload = coordinator._monitoring_cycle_sync(started_at)
 
     assert db_calls == [["005930"]]
-    assert payload["broker_action_symbols"] == ["005930"]
+    assert payload["db_evaluation_symbols"] == ["005930"]
+    assert payload["broker_action_symbols"] == []
 
 
 def test_recovered_cached_sell_block_reaches_db_backed_monitoring_cycle(
@@ -2680,6 +2681,19 @@ def test_recovered_cached_sell_block_reaches_db_backed_monitoring_cycle(
     coordinator._monitoring_runtime_snapshot = snapshot
     coordinator._monitoring_maintenance_snapshot_loaded_at = snapshot.loaded_at
     db_calls: list[list[str]] = []
+    db_result_payload: dict[str, object] = {
+        "triggered_item_count": 0,
+        "submitted_order_count": 0,
+        "items": [
+            {
+                "execution_plan_item_id": "recovered-stop",
+                "symbol": "005930",
+                "intent": "stop_sell",
+                "status": "stop_sell_monitoring",
+                "outcome": "waiting",
+            }
+        ],
+    }
 
     class DummySessionContext:
         def __enter__(self):
@@ -2713,19 +2727,7 @@ def test_recovered_cached_sell_block_reaches_db_backed_monitoring_cycle(
             db_calls.append(list(kwargs["symbols"]))
             or SimpleNamespace(
                 status_code=200,
-                payload={
-                    "triggered_item_count": 0,
-                    "submitted_order_count": 0,
-                    "items": [
-                        {
-                            "execution_plan_item_id": "recovered-stop",
-                            "symbol": "005930",
-                            "intent": "stop_sell",
-                            "status": "stop_sell_monitoring",
-                            "outcome": "waiting",
-                        }
-                    ],
-                },
+                payload=dict(db_result_payload),
             )
         ),
     )
@@ -2742,6 +2744,34 @@ def test_recovered_cached_sell_block_reaches_db_backed_monitoring_cycle(
     assert payload["items"][0]["status"] == "stop_sell_monitoring"
     assert payload["state_rearm_symbols"] == []
     assert payload["state_rearm_candidate_symbols"] == ["005930"]
+
+    coordinator.settings = settings.model_copy(
+        update={"monitoring_max_broker_actions_per_cycle": 1}
+    )
+    rearm_only_snapshot = replace(snapshot, items=[snapshot.items[0]])
+    coordinator._monitoring_runtime_snapshot = rearm_only_snapshot
+    coordinator._monitoring_maintenance_snapshot_loaded_at = rearm_only_snapshot.loaded_at
+    monkeypatch.setattr(
+        coordinator,
+        "_refresh_monitoring_runtime_snapshot",
+        lambda **kwargs: rearm_only_snapshot,
+    )
+    db_calls.clear()
+    db_result_payload.clear()
+    db_result_payload.update(
+        {
+            "triggered_item_count": 1,
+            "submitted_order_count": 1,
+            "submitted_symbols": ["005930"],
+            "items": [],
+        }
+    )
+
+    submitted = coordinator._monitoring_cycle_sync(started_at + timedelta(seconds=1))
+
+    assert db_calls == [["005930"]]
+    assert submitted["broker_action_symbols"] == ["005930"]
+    assert submitted["broker_action_price_count"] == 1
 
 
 def test_live_cycle_monitors_local_holdings_without_waiting_for_broker_discovery(
