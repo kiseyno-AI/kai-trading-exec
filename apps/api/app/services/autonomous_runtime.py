@@ -1294,6 +1294,8 @@ class AutonomousRuntimeCoordinator:
                     symbol for symbol in symbols if symbol in submitted_symbols
                 ],
                 "broker_action_price_count": 0,
+                "broker_action_trace_scope": "confirmed_submissions",
+                "db_evaluation_symbols": symbols,
             }
             if post_entry_maintenance_count:
                 payload["pre_cached_post_entry_maintenance_count"] = (
@@ -1400,9 +1402,14 @@ class AutonomousRuntimeCoordinator:
                 "broker_action_symbols": [
                     symbol for symbol in symbols if symbol in submitted_symbols
                 ],
-                "broker_action_price_count": sum(
-                    1 for price in prices if price.symbol in submitted_symbols
+                "broker_action_price_count": len(
+                    {
+                        price.symbol
+                        for price in prices
+                        if price.symbol in submitted_symbols
+                    }
                 ),
+                "broker_action_trace_scope": "confirmed_submissions",
                 "db_evaluation_symbols": symbols,
                 "state_rearm_symbols": [
                     symbol for symbol in symbols if symbol in confirmed_rearm_symbols

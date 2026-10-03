@@ -2681,6 +2681,14 @@ def test_recovered_cached_sell_block_reaches_db_backed_monitoring_cycle(
     coordinator._monitoring_runtime_snapshot = snapshot
     coordinator._monitoring_maintenance_snapshot_loaded_at = snapshot.loaded_at
     db_calls: list[list[str]] = []
+    loaded_prices = [
+        MonitoringPriceRequest(
+            symbol="005930",
+            price=Decimal("101"),
+            bid=Decimal("101"),
+            ask=Decimal("101"),
+        )
+    ]
     db_result_payload: dict[str, object] = {
         "triggered_item_count": 0,
         "submitted_order_count": 0,
@@ -2706,14 +2714,7 @@ def test_recovered_cached_sell_block_reaches_db_backed_monitoring_cycle(
     monkeypatch.setattr(
         coordinator,
         "_load_monitoring_prices",
-        lambda **kwargs: [
-            MonitoringPriceRequest(
-                symbol="005930",
-                price=Decimal("101"),
-                bid=Decimal("101"),
-                ask=Decimal("101"),
-            )
-        ],
+        lambda **kwargs: list(loaded_prices),
     )
     monkeypatch.setattr(
         coordinator,
@@ -2765,6 +2766,14 @@ def test_recovered_cached_sell_block_reaches_db_backed_monitoring_cycle(
             "submitted_symbols": ["005930"],
             "items": [],
         }
+    )
+    loaded_prices.append(
+        MonitoringPriceRequest(
+            symbol="005930",
+            price=Decimal("102"),
+            bid=Decimal("102"),
+            ask=Decimal("102"),
+        )
     )
 
     submitted = coordinator._monitoring_cycle_sync(started_at + timedelta(seconds=1))
@@ -3422,6 +3431,9 @@ def test_repeated_no_price_cycles_skip_database_after_first_checkpoint(
     )
 
     assert first.get("db_scan_skipped") is not True
+    assert first["db_evaluation_symbols"] == ["005930"]
+    assert first["broker_action_symbols"] == []
+    assert first["broker_action_trace_scope"] == "confirmed_submissions"
     assert cached["db_scan_skipped"] is True
     assert session_open_count == 1
 
@@ -3490,6 +3502,9 @@ def test_no_price_cycle_retries_max_holding_pending_dispatch_without_idle_wait(
     payload = coordinator._monitoring_cycle_sync(started_at)
 
     assert payload.get("db_scan_skipped") is not True
+    assert payload["db_evaluation_symbols"] == ["005930"]
+    assert payload["broker_action_symbols"] == []
+    assert payload["broker_action_trace_scope"] == "confirmed_submissions"
     assert session_open_count == 1
 
 
