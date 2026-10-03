@@ -218,6 +218,7 @@ def _alpaca_paper_us_snapshot(
     *,
     account_id: str | None = "alpaca-paper-account-id",
     base_quantity: str = "0.125",
+    average_price: str = "481.25",
     holding_payload: dict[str, object] | None = None,
 ) -> BrokerAccountSnapshot:
     return BrokerAccountSnapshot(
@@ -228,7 +229,7 @@ def _alpaca_paper_us_snapshot(
             BrokerAccountHolding(
                 symbol="QQQ",
                 quantity=0,
-                average_price=Decimal("481.25"),
+                average_price=Decimal(average_price),
                 payload=(
                     holding_payload
                     if holding_payload is not None
@@ -1305,10 +1306,11 @@ def test_alpaca_paper_fractional_legacy_attribution_requires_exact_approved_trut
     spy = _legacy_fractional_position(
         symbol="SPY",
         base_quantity="0.375",
-        average_price="598.50",
+        average_price="766.242213",
     )
     db.add_all([qqq, spy])
     db.commit()
+    db.expire_all()
     adapter = LegacyAttributionAdapter(
         BrokerAccountSnapshot(
             broker_account_id="alpaca-paper-account-id",
@@ -1328,7 +1330,7 @@ def test_alpaca_paper_fractional_legacy_attribution_requires_exact_approved_trut
                 BrokerAccountHolding(
                     symbol="SPY",
                     quantity=0,
-                    average_price=Decimal("598.50"),
+                    average_price=Decimal("766.242213"),
                     payload={
                         "provider": "alpaca",
                         "asset_class": "us_equity",
@@ -1376,6 +1378,12 @@ def test_alpaca_paper_fractional_legacy_attribution_requires_exact_approved_trut
         and isinstance(item["evidence_fingerprint"], str)
         for item in dry_run["items"]
     )
+    spy_item = next(item for item in dry_run["items"] if item["symbol"] == "SPY")
+    assert spy_item["legacy_average_price"] == "766.2422"
+    assert spy_item["broker_average_price"] == "766.242213"
+    assert spy_item["safety_invariants"]["average_price_match_policy"] == (
+        "numeric_18_4_round_half_up_strict_storage_bucket_v1"
+    )
     assert all(position.provider is None for position in (qqq, spy))
 
     result = remediation_service.apply_legacy_position_attribution(
@@ -1414,6 +1422,9 @@ def test_alpaca_paper_fractional_legacy_attribution_requires_exact_approved_trut
         and row.raw_payload["_position_identity"]["exchange"] == "US"
         for row in persisted
     )
+    assert next(row for row in persisted if row.symbol == "SPY").average_price == Decimal(
+        "766.2422"
+    )
     events = db.scalars(select(RuntimeRemediationEvent)).all()
     assert len(events) == 2
     assert all(event.outcome == "position_route_attributed" for event in events)
@@ -1431,6 +1442,55 @@ def test_alpaca_paper_fractional_legacy_attribution_requires_exact_approved_trut
         (["QQQ", "SPY"], "US"),
         (["QQQ", "SPY"], "US"),
     ]
+    db.close()
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    "broker_average_price",
+    ("481.25005", "481.24995", "481.250051"),
+)
+def test_alpaca_legacy_attribution_rejects_average_price_bucket_boundary_or_outside(
+    monkeypatch,
+    broker_average_price: str,
+) -> None:
+    settings, engine, session_factory, db = _session()
+    settings = settings.model_copy(
+        update={
+            "runtime_broker_provider": "alpaca",
+            "alpaca_api_secret": "paper-scope-secret",
+        }
+    )
+    position = _legacy_fractional_position(
+        symbol="QQQ",
+        base_quantity="0.125",
+        average_price="481.2500",
+    )
+    db.add(position)
+    db.commit()
+    db.expire_all()
+    adapter = LegacyAttributionAdapter(
+        _alpaca_paper_us_snapshot(average_price=broker_average_price)
+    )
+    adapter.provider = "alpaca"
+    monkeypatch.setattr(
+        "app.services.position_truth_remediation.ensure_authenticated_broker_session",
+        lambda **kwargs: type("SessionState", (), {"access_token": "test-token"})(),
+    )
+
+    result = remediation_service.analyze_legacy_position_attribution(
+        settings=settings,
+        db=db,
+        auth_session_factory=session_factory,
+        adapter=adapter,
+        exchange="US",
+        now=NOW,
+    )
+
+    assert result["summary"]["eligible_count"] == 0
+    assert result["items"][0]["reason"] == "average_price_mismatch"
+    assert result["items"][0]["evidence_fingerprint"] is None
+    assert db.get(ExecutionPosition, position.id).provider is None
     db.close()
     engine.dispose()
 
@@ -1639,9 +1699,10 @@ def test_alpaca_legacy_attribution_rejects_missing_authenticated_account_id(
             account_id="rotated-alpaca-paper-account-id"
         ),
         _alpaca_paper_us_snapshot(base_quantity="0.126"),
+        _alpaca_paper_us_snapshot(average_price="481.250013"),
     ],
 )
-def test_alpaca_legacy_attribution_apply_rejects_account_or_quantity_drift(
+def test_alpaca_legacy_attribution_apply_rejects_account_quantity_or_price_drift(
     monkeypatch,
     drifted_snapshot: BrokerAccountSnapshot,
 ) -> None:
@@ -1781,10 +1842,11 @@ def test_legacy_otc_attribution_dry_run_is_holdings_only_and_quarantined(
     assert item["disposition"] == "account_attributed_quarantine"
     assert item["query_scope"] == "kis_us_all_holdings_only_v1"
     assert item["safety_policy_version"] == (
-        "legacy-position-attribution-safety-v4"
+        "legacy-position-attribution-safety-v5"
     )
     assert item["safety_invariants"] == {
         "account_scope_source": "stable_hmac",
+        "average_price_match_policy": "exact_decimal_v1",
         "broker_actions_allowed": False,
         "collision_scope": "mode_provider_account_symbol_any_exchange",
         "fractional_quantity_allowed": False,

@@ -182,10 +182,14 @@ This path is rejected outside paper mode or when
 `KAI_EXEC_RUNTIME_BROKER_PROVIDER` is not `alpaca`. A row receives an approval
 fingerprint only when a current, complete, broker-authenticated Alpaca
 US-equity snapshot proves the exact account, symbol, positive fractional
-`base_quantity`, and average price. Apply still requires each dry-run position
-ID and fingerprint separately, re-fetches broker truth under the same locks,
-and rolls back on any drift. `NASD`/`NYSE`/`AMEX` must not be guessed for Alpaca;
-its execution and reconciliation route is exactly `US`.
+`base_quantity`, and average price. For Alpaca only, average price follows the
+declared `NUMERIC(18,4)` storage precision: the raw broker value must fall
+strictly inside the same round-half-up storage bucket, while both raw broker and
+stored values remain bound into the evidence fingerprint. Exact half-quantum
+boundaries are rejected. Apply still requires each dry-run position ID and
+fingerprint separately, re-fetches broker truth under the same locks, and rolls
+back on any drift. `NASD`/`NYSE`/`AMEX` must not be guessed for Alpaca; its
+execution and reconciliation route is exactly `US`.
 
 `OTCB` and `OOTC` are attribution-only exceptions, not trading exchanges. In
 live mode their dry-run uses the fully paginated KIS all-US balance endpoint
