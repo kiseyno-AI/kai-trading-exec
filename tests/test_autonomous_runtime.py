@@ -11,7 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.services import autonomous_runtime
+from app.services import autonomous_runtime, monitoring as monitoring_service
 from app.api.schemas.execution import MonitoringPriceRequest
 from app.core.config import Settings
 from app.db.base import Base
@@ -26,7 +26,10 @@ from app.services.autonomous_runtime import (
     _select_monitoring_symbol_batch,
 )
 from app.services.monitoring import list_autonomous_monitoring_symbols
-from app.services.position_identity import build_position_identity
+from app.services.position_identity import (
+    build_position_identity,
+    payload_with_position_identity,
+)
 from app.services.execution_account_route import bind_kis_account_route
 from app.services.trigger_time_exec_agent import _run_exec_agent_command
 
@@ -1876,6 +1879,209 @@ def test_cached_cycle_persists_review_only_unpriced_us_position_state() -> None:
             "manual_review_recorded_at": started_at.isoformat(),
         }
     engine.dispose()
+
+
+def test_cached_cycle_does_not_relatch_fresh_complete_kis_us_balance_proof() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        execution_position_account_scope="fresh-balance-proof-test",
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    identity = build_position_identity(
+        settings=settings,
+        provider="kis",
+        exchange="NASD",
+    )
+    started_at = datetime(2026, 9, 15, 4, 0, tzinfo=UTC)
+    raw_payload = payload_with_position_identity(
+        {
+            "currency": "USD",
+            "exchange": "NASD",
+            "account_number_masked": "****5678",
+            "holdings_coverage": "complete",
+            "open_orders_coverage": "complete",
+            "balance": {
+                "rt_cd": "0",
+                "output1": [
+                    {
+                        "ovrs_pdno": "APTX",
+                        "ovrs_excg_cd": "NASD",
+                        "ovrs_cblc_qty": "377",
+                        "ord_psbl_qty": "377",
+                        "pchs_avg_pric": "0.0963",
+                        "now_pric2": "0.061",
+                    }
+                ],
+            },
+            "open_orders": {"rt_cd": "0", "output": []},
+            "_position_sync": {
+                "asset_class": "us_equity",
+                "exchange": "NASD",
+                "monitoring_eligible": True,
+            },
+        },
+        identity=identity,
+    )
+    with session_factory() as session:
+        session.add(
+            ExecutionPosition(
+                mode=settings.runtime_mode,
+                provider=identity.provider,
+                account_scope=identity.account_scope,
+                exchange=identity.exchange,
+                symbol="APTX",
+                quantity=377,
+                average_price=Decimal("0.0963"),
+                updated_from="reconciliation",
+                last_reconciled_at=started_at - timedelta(seconds=5),
+                raw_payload=raw_payload,
+            )
+        )
+        session.commit()
+
+    coordinator = AutonomousRuntimeCoordinator(
+        settings=settings,
+        session_factory=session_factory,
+        broker_adapter_factory=lambda settings: None,  # type: ignore[arg-type,return-value]
+    )
+    snapshot = MonitoringRuntimeSnapshot(
+        loaded_at=started_at,
+        symbols=["APTX"],
+        positions_by_symbol={
+            "APTX": CachedMonitoringPosition(
+                symbol="APTX",
+                quantity=377,
+                provider="kis",
+                exchange="NASD",
+            )
+        },
+        items=[],
+        filled_today_symbols=[],
+    )
+
+    result = coordinator._repair_post_entry_exit_monitors_for_cached_cycle(
+        runtime_snapshot=snapshot,
+        prices=[],
+        started_at=started_at,
+        durably_unquoteable_symbols={"APTX"},
+    )
+
+    assert result == (0, 0)
+    with session_factory() as session:
+        position = session.query(ExecutionPosition).filter_by(symbol="APTX").one()
+        assert position.raw_payload["_position_sync"] == {
+            "asset_class": "us_equity",
+            "exchange": "NASD",
+            "monitoring_eligible": True,
+        }
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    "invalid_proof",
+    [
+        "stale",
+        "zero_price",
+        "incomplete_snapshot",
+        "wrong_source_shape",
+        "independent_quarantine",
+        "reserved_quantity",
+        "matching_open_order",
+        "account_mask_mismatch",
+    ],
+)
+def test_kis_us_balance_proof_fails_closed(invalid_proof: str) -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        execution_position_account_scope="invalid-balance-proof-test",
+        kis_account_number="12345678",
+    )
+    identity = build_position_identity(
+        settings=settings,
+        provider="kis",
+        exchange="NASD",
+    )
+    evaluated_at = datetime(2026, 9, 15, 4, 0, tzinfo=UTC)
+    holding = {
+        "ovrs_pdno": "WWBLCM",
+        "ovrs_excg_cd": "NASD",
+        "ovrs_cblc_qty": "75",
+        "ord_psbl_qty": "75",
+        "pchs_avg_pric": "0.9164",
+        "now_pric2": "0.061",
+    }
+    sync_context: dict[str, object] = {
+        "asset_class": "us_equity",
+        "exchange": "NASD",
+        "monitoring_eligible": True,
+    }
+    raw_payload = payload_with_position_identity(
+        {
+            "currency": "USD",
+            "exchange": "NASD",
+            "account_number_masked": "****5678",
+            "holdings_coverage": "complete",
+            "open_orders_coverage": "complete",
+            "balance": {"rt_cd": "0", "output1": [holding]},
+            "open_orders": {"rt_cd": "0", "output": []},
+            "_position_sync": sync_context,
+        },
+        identity=identity,
+    )
+    last_reconciled_at = evaluated_at - timedelta(seconds=5)
+    if invalid_proof == "stale":
+        last_reconciled_at = evaluated_at - timedelta(
+            seconds=settings.exec_agent_max_account_snapshot_age_seconds + 1
+        )
+    elif invalid_proof == "zero_price":
+        holding["now_pric2"] = "0"
+    elif invalid_proof == "incomplete_snapshot":
+        raw_payload["holdings_coverage"] = "incomplete"
+    elif invalid_proof == "wrong_source_shape":
+        holding["pdno"] = holding.pop("ovrs_pdno")
+    elif invalid_proof == "independent_quarantine":
+        sync_context["trade_eligible"] = False
+        sync_context["route_disposition"] = "manual_review"
+    elif invalid_proof == "reserved_quantity":
+        holding["ord_psbl_qty"] = "74"
+    elif invalid_proof == "matching_open_order":
+        raw_payload["open_orders"] = {
+            "rt_cd": "0",
+            "output": [
+                {
+                    "pdno": "WWBLCM",
+                    "odno": "open-sell-1",
+                    "sll_buy_dvsn_cd": "01",
+                    "ft_ord_qty": "1",
+                    "nccs_qty": "1",
+                }
+            ],
+        }
+    elif invalid_proof == "account_mask_mismatch":
+        raw_payload["account_number_masked"] = "****9999"
+
+    position = ExecutionPosition(
+        mode=settings.runtime_mode,
+        provider=identity.provider,
+        account_scope=identity.account_scope,
+        exchange=identity.exchange,
+        symbol="WWBLCM",
+        quantity=75,
+        average_price=Decimal("0.9164"),
+        updated_from="reconciliation",
+        last_reconciled_at=last_reconciled_at,
+        raw_payload=raw_payload,
+    )
+
+    assert not monitoring_service._has_fresh_complete_kis_us_balance_monitoring_proof(
+        settings=settings,
+        position=position,
+        evaluated_at=evaluated_at,
+    )
 
 
 def test_cached_cycle_removes_reviewed_position_from_reported_monitoring_set(

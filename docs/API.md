@@ -776,9 +776,12 @@ complete; the NASD/NYSE/AMEX route and symbol must match exactly; average price,
 Independent trade/route quarantine remains sticky. Zero, missing, conflicting,
 stale, incomplete, or wrong-route price evidence preserves the latch (so a
 zero-priced holding such as WWBLCM stays blocked). A successful transition
-appends a `position_monitoring_manual_review` remediation event. A later durable
-quote failure can latch the position again, and only a snapshot newer than that
-new latch may release it.
+appends a `position_monitoring_manual_review` remediation event. An empty
+overseas minute-price response does not immediately recreate the latch while
+that same exact balance proof remains fresh and complete. This exception does
+not turn `now_pric2` into an executable quote: order submission still requires
+the normal trusted, exchange-timestamped bid. Once the balance proof is stale
+or inconsistent, a durable quote failure latches the position again.
 
 ### FIFO residual isolation repair
 

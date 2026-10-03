@@ -883,14 +883,26 @@ def reconcile_stale_nonterminal_broker_orders(
                     order.last_error_classification = "missing_broker_order_id"
                     order.last_error_message = "stale nonterminal order has no broker_order_id"
                 if order.plan_item is not None:
-                    plan_status = _order_status_to_plan_item_status(order.status)
+                    sibling_outcome_status = (
+                        _authoritative_plan_sibling_outcome_status(
+                            db=db,
+                            order=order,
+                        )
+                    )
+                    plan_status = sibling_outcome_status or (
+                        _order_status_to_plan_item_status(order.status)
+                    )
                     if plan_status is not None:
                         set_plan_item_status(
                             db=db,
                             plan_item=order.plan_item,
                             status=plan_status,
                             source="reconciliation",
-                            reason=repair["reason"],
+                            reason=(
+                                "authoritative plan sibling outcome preserved"
+                                if sibling_outcome_status is not None
+                                else repair["reason"]
+                            ),
                             payload={
                                 "broker_order_pk": order.id,
                                 "broker_order_id": order.broker_order_id,
@@ -898,6 +910,9 @@ def reconcile_stale_nonterminal_broker_orders(
                                 "status_before": status_before,
                                 "status": order.status,
                                 "classification": repair["classification"],
+                                "authoritative_sibling_outcome": (
+                                    sibling_outcome_status
+                                ),
                             },
                             occurred_at=classification_observed_at,
                         )
@@ -1083,6 +1098,41 @@ def reconcile_stale_nonterminal_broker_orders(
     }
 
 
+def _authoritative_plan_sibling_outcome_status(
+    *,
+    db: Session,
+    order: BrokerOrder,
+) -> str | None:
+    if order.execution_plan_item_id is None:
+        return None
+    order_scope = fifo_route_scope_from_order(order)
+    if order_scope is None:
+        return None
+    statuses = set(
+        sibling.status
+        for sibling in db.scalars(
+            select(BrokerOrder).where(
+                BrokerOrder.execution_plan_item_id
+                == order.execution_plan_item_id,
+                BrokerOrder.id != order.id,
+                BrokerOrder.mode == order.mode,
+                BrokerOrder.broker_name == order.broker_name,
+                BrokerOrder.symbol == order.symbol,
+                BrokerOrder.side == order.side,
+                BrokerOrder.status.in_(
+                    tuple(LEGACY_MANUAL_REVIEW_OUTCOME_STATUSES)
+                ),
+            )
+        ).all()
+        if fifo_route_scope_from_order(sibling) == order_scope
+    )
+    if NormalizedBrokerOrderStatus.FILLED.value in statuses:
+        return "filled"
+    if NormalizedBrokerOrderStatus.PARTIALLY_FILLED.value in statuses:
+        return "partially_filled"
+    return None
+
+
 def _empty_legacy_manual_review_resolution() -> dict[str, object]:
     return {
         "minimum_age_seconds": LEGACY_MANUAL_REVIEW_MINIMUM_AGE_SECONDS,
@@ -1127,6 +1177,8 @@ def _reconcile_legacy_manual_review_orders(
     plan_items_by_id: dict[str, ExecutionPlanItem] = {}
     plan_siblings_by_item_id: dict[str, list[BrokerOrder]] = {}
     sibling_fill_counts: dict[str, int] = {}
+    sibling_fills_by_order_id: dict[str, list[ExecutionFill]] = {}
+    sibling_events_by_order_id: dict[str, list[BrokerOrderEvent]] = {}
     active_jobs_by_item_id: dict[str, list[ExecutionJob]] = {}
     if str(adapter.provider or "").strip().lower() != "kis":
         snapshot_failure = "unsupported_broker_provider"
@@ -1202,6 +1254,8 @@ def _reconcile_legacy_manual_review_orders(
         (
             plan_siblings_by_item_id,
             sibling_fill_counts,
+            sibling_fills_by_order_id,
+            sibling_events_by_order_id,
         ) = _load_legacy_manual_review_plan_siblings(
             db=db,
             plan_item_ids=plan_item_ids,
@@ -1271,9 +1325,21 @@ def _reconcile_legacy_manual_review_orders(
                 or sibling_fill_counts.get(sibling.id, 0) > 0
             )
         ]
+        verified_retry_successor = (
+            _verified_legacy_manual_review_retry_successor(
+                settings=settings,
+                order=order,
+                plan_item=plan_item,
+                outcome_bearing_siblings=outcome_bearing_siblings,
+                fills_by_order_id=sibling_fills_by_order_id,
+                events_by_order_id=sibling_events_by_order_id,
+            )
+            if plan_item is not None
+            else None
+        )
         plan_sibling_state = _legacy_manual_review_plan_sibling_state(
             siblings=plan_siblings,
-            fill_counts=sibling_fill_counts,
+            fills_by_order_id=sibling_fills_by_order_id,
         )
         broker_position_match = bool(
             snapshot is not None
@@ -1316,12 +1382,14 @@ def _reconcile_legacy_manual_review_orders(
             or (
                 "outcome_bearing_plan_sibling_present"
                 if outcome_bearing_siblings
+                and verified_retry_successor is None
                 else None
             )
             or (
                 "outcome_bearing_plan_item_status"
                 if plan_item_status
                 in LEGACY_MANUAL_REVIEW_OUTCOME_PLAN_ITEM_STATUSES
+                and verified_retry_successor is None
                 else None
             )
             or (
@@ -1347,6 +1415,7 @@ def _reconcile_legacy_manual_review_orders(
                 active_execution_jobs=active_jobs,
                 plan_sibling_state=plan_sibling_state,
                 plan_item_status=plan_item_status,
+                verified_retry_successor=verified_retry_successor,
                 account_product_code_proof=account_product_code_proof,
                 snapshot_route_product_code=(
                     settings.kis_account_product_code
@@ -1381,6 +1450,12 @@ def _reconcile_legacy_manual_review_orders(
                 ),
                 "plan_item_status": plan_item_status,
                 "plan_sibling_state": plan_sibling_state,
+                "resolution_context": (
+                    "verified_filled_retry_successor"
+                    if verified_retry_successor is not None
+                    else "current_broker_absence"
+                ),
+                "verified_retry_successor": verified_retry_successor,
                 "repair_action": "approval_required" if eligible else "blocked",
             }
         )
@@ -1442,11 +1517,20 @@ def _reconcile_legacy_manual_review_orders(
                 )
 
         assert snapshot is not None
-        repair_reason = "legacy_manual_review_absent_from_complete_broker_truth"
+        default_repair_reason = (
+            "legacy_manual_review_absent_from_complete_broker_truth"
+        )
         for order_id in sorted(approved_order_ids):
             order = order_by_id[order_id]
             item = item_by_order_id[order_id]
             fingerprint = str(item["evidence_fingerprint"])
+            resolution_context = str(item["resolution_context"])
+            verified_retry_successor = item["verified_retry_successor"]
+            repair_reason = (
+                "legacy_manual_review_predecessor_has_verified_filled_retry_successor"
+                if verified_retry_successor is not None
+                else default_repair_reason
+            )
             status_before = order.status
             apply_broker_order_status(
                 order=order,
@@ -1464,8 +1548,10 @@ def _reconcile_legacy_manual_review_orders(
                 result={
                     "evidence_fingerprint": fingerprint,
                     "safety_policy_version": (
-                        "legacy-manual-review-terminal-unknown-v3"
+                        "legacy-manual-review-terminal-unknown-v4"
                     ),
+                    "resolution_context": resolution_context,
+                    "verified_retry_successor": verified_retry_successor,
                     "snapshot_source": snapshot.source,
                     "snapshot_observed_at": snapshot.observed_at.isoformat(),
                     "holdings_complete": snapshot.holdings_complete,
@@ -1506,9 +1592,11 @@ def _reconcile_legacy_manual_review_orders(
                     evidence_summary={
                         "evidence_fingerprint": fingerprint,
                         "safety_policy_version": (
-                            "legacy-manual-review-terminal-unknown-v3"
+                            "legacy-manual-review-terminal-unknown-v4"
                         ),
                         "transition_reason": repair_reason,
+                        "resolution_context": resolution_context,
+                        "verified_retry_successor": verified_retry_successor,
                         "status_before": status_before,
                         "status_after": order.status,
                         "symbol": order.symbol,
@@ -1556,13 +1644,45 @@ def _reconcile_legacy_manual_review_orders(
             if still_reserving:
                 continue
             plan_item = plan_items_by_id.get(plan_item_id)
-            if plan_item is not None and plan_item.status == "manual_review_required":
+            approved_items_for_plan = [
+                item_by_order_id[order_id]
+                for order_id in approved_order_ids
+                if order_by_id[order_id].execution_plan_item_id == plan_item_id
+            ]
+            verified_successors = [
+                item["verified_retry_successor"]
+                for item in approved_items_for_plan
+                if item["verified_retry_successor"] is not None
+            ]
+            if plan_item is not None and verified_successors:
+                set_plan_item_status(
+                    db=db,
+                    plan_item=plan_item,
+                    status="filled",
+                    source="operator_remediation",
+                    reason=(
+                        "verified filled retry successor preserves plan outcome"
+                    ),
+                    payload={
+                        "approved_broker_order_ids": sorted(approved_order_ids),
+                        "verified_retry_successors": verified_successors,
+                        "actor": normalized_actor,
+                        "operator_reason": normalized_reason,
+                        "broker_mutations": 0,
+                        "fills_written": 0,
+                    },
+                    occurred_at=_observation_time(),
+                )
+            elif (
+                plan_item is not None
+                and plan_item.status == "manual_review_required"
+            ):
                 set_plan_item_status(
                     db=db,
                     plan_item=plan_item,
                     status="broker_order_failed",
                     source="operator_remediation",
-                    reason=repair_reason,
+                    reason=default_repair_reason,
                     payload={
                         "approved_broker_order_ids": sorted(approved_order_ids),
                         "actor": normalized_actor,
@@ -1706,9 +1826,14 @@ def _load_legacy_manual_review_plan_siblings(
     db: Session,
     plan_item_ids: set[str],
     for_update: bool,
-) -> tuple[dict[str, list[BrokerOrder]], dict[str, int]]:
+) -> tuple[
+    dict[str, list[BrokerOrder]],
+    dict[str, int],
+    dict[str, list[ExecutionFill]],
+    dict[str, list[BrokerOrderEvent]],
+]:
     if not plan_item_ids:
-        return {}, {}
+        return {}, {}, {}, {}
     sibling_statement = (
         select(BrokerOrder)
         .where(
@@ -1723,6 +1848,12 @@ def _load_legacy_manual_review_plan_siblings(
     siblings = db.scalars(sibling_statement).all()
     sibling_ids = [sibling.id for sibling in siblings]
     fill_counts = {sibling.id: 0 for sibling in siblings}
+    fills_by_order_id: dict[str, list[ExecutionFill]] = {
+        sibling.id: [] for sibling in siblings
+    }
+    events_by_order_id: dict[str, list[BrokerOrderEvent]] = {
+        sibling.id: [] for sibling in siblings
+    }
     if sibling_ids:
         fill_statement = (
             select(ExecutionFill)
@@ -1737,6 +1868,25 @@ def _load_legacy_manual_review_plan_siblings(
             fill_counts[fill.broker_order_pk] = (
                 fill_counts.get(fill.broker_order_pk, 0) + 1
             )
+            fills_by_order_id.setdefault(fill.broker_order_pk, []).append(fill)
+        event_statement = (
+            select(BrokerOrderEvent)
+            .where(BrokerOrderEvent.broker_order_pk.in_(sibling_ids))
+            .order_by(
+                BrokerOrderEvent.broker_order_pk.asc(),
+                BrokerOrderEvent.observed_at.asc(),
+                BrokerOrderEvent.id.asc(),
+            )
+        )
+        if for_update:
+            event_statement = event_statement.with_for_update().execution_options(
+                populate_existing=True
+            )
+        for order_event in db.scalars(event_statement).all():
+            events_by_order_id.setdefault(
+                order_event.broker_order_pk,
+                [],
+            ).append(order_event)
 
     siblings_by_item_id: dict[str, list[BrokerOrder]] = {}
     for sibling in siblings:
@@ -1746,7 +1896,12 @@ def _load_legacy_manual_review_plan_siblings(
             sibling.execution_plan_item_id,
             [],
         ).append(sibling)
-    return siblings_by_item_id, fill_counts
+    return (
+        siblings_by_item_id,
+        fill_counts,
+        fills_by_order_id,
+        events_by_order_id,
+    )
 
 
 def _load_legacy_manual_review_active_jobs(
@@ -1779,16 +1934,229 @@ def _load_legacy_manual_review_active_jobs(
 def _legacy_manual_review_plan_sibling_state(
     *,
     siblings: list[BrokerOrder],
-    fill_counts: dict[str, int],
+    fills_by_order_id: dict[str, list[ExecutionFill]],
 ) -> list[dict[str, object]]:
     return [
         {
             "broker_order_pk": sibling.id,
             "status": sibling.status,
-            "fill_count": fill_counts.get(sibling.id, 0),
+            "fill_count": len(fills_by_order_id.get(sibling.id, [])),
+            "fills": _legacy_manual_review_fill_state(
+                fills_by_order_id.get(sibling.id, [])
+            ),
         }
         for sibling in sorted(siblings, key=lambda sibling: sibling.id)
     ]
+
+
+def _legacy_manual_review_fill_state(
+    fills: list[ExecutionFill],
+) -> list[dict[str, object]]:
+    return [
+        {
+            "fill_id": fill.id,
+            "broker_fill_id": fill.broker_fill_id,
+            "symbol": fill.symbol,
+            "side": fill.side,
+            "quantity": fill.quantity,
+            "base_quantity": _normalized_decimal_evidence_value(
+                fill.base_quantity
+            ),
+            "price": _normalized_decimal_evidence_value(fill.price),
+            "filled_at": _normalized_timestamp_signature(fill.filled_at),
+        }
+        for fill in sorted(fills, key=lambda fill: (fill.filled_at, fill.id))
+    ]
+
+
+def _normalized_decimal_evidence_value(
+    value: Decimal | None,
+) -> str | None:
+    if value is None:
+        return None
+    if value == 0:
+        return "0"
+    return format(value.normalize(), "f")
+
+
+def _verified_legacy_manual_review_retry_successor(
+    *,
+    settings: Settings,
+    order: BrokerOrder,
+    plan_item: ExecutionPlanItem,
+    outcome_bearing_siblings: list[BrokerOrder],
+    fills_by_order_id: dict[str, list[ExecutionFill]],
+    events_by_order_id: dict[str, list[BrokerOrderEvent]],
+) -> dict[str, object] | None:
+    expected_candidate_key = f"monitoring:stop_sell:{plan_item.id}"
+    if (
+        plan_item.intent != "stop_sell"
+        or order.side != "sell"
+        or order.idempotency_key != expected_candidate_key
+        or len(outcome_bearing_siblings) != 1
+    ):
+        return None
+    successor = outcome_bearing_siblings[0]
+    if (
+        successor.status != NormalizedBrokerOrderStatus.FILLED.value
+        or successor.mode != order.mode
+        or successor.mode != settings.runtime_mode
+        or successor.broker_name != order.broker_name
+        or successor.broker_name != "kis"
+        or successor.execution_plan_item_id != order.execution_plan_item_id
+        or successor.symbol != order.symbol
+        or successor.side != order.side
+        or successor.quantity is None
+        or order.quantity is None
+        or successor.quantity != order.quantity
+        or not successor.broker_order_id
+        or successor.submitted_at is None
+    ):
+        return None
+
+    candidate_metadata = (
+        order.request_metadata
+        if isinstance(order.request_metadata, dict)
+        else {}
+    )
+    successor_request_metadata = (
+        successor.request_metadata
+        if isinstance(successor.request_metadata, dict)
+        else {}
+    )
+    successor_response_metadata = (
+        successor.response_metadata
+        if isinstance(successor.response_metadata, dict)
+        else {}
+    )
+    candidate_account_mask = str(
+        candidate_metadata.get("account_number_masked") or ""
+    ).strip()
+    successor_account_mask = str(
+        successor_response_metadata.get("account_number_masked") or ""
+    ).strip()
+    if (
+        str(successor_request_metadata.get("provider") or "").strip().lower()
+        != "kis"
+        or not candidate_account_mask
+        or successor_account_mask != candidate_account_mask
+    ):
+        return None
+
+    successor_submitted_at = _required_evidence_timestamp(
+        successor.submitted_at
+    )
+    if successor_submitted_at is None:
+        return None
+    try:
+        market_timezone = ZoneInfo(settings.market_timezone)
+    except ZoneInfoNotFoundError:
+        market_timezone = UTC
+    expected_successor_key = (
+        f"{order.idempotency_key}:"
+        f"{successor_submitted_at.astimezone(market_timezone).date().isoformat()}"
+    )
+    if successor.idempotency_key != expected_successor_key:
+        return None
+
+    retryable_failures = [
+        event
+        for event in events_by_order_id.get(order.id, [])
+        if event.event_type == "submit_failed"
+        and event.normalized_status
+        == NormalizedBrokerOrderStatus.RETRY_PENDING.value
+        and event.retryable is True
+        and bool(order.last_error_code)
+        and event.broker_status == order.last_error_code
+    ]
+    if not retryable_failures:
+        return None
+    retryable_failure = max(
+        retryable_failures,
+        key=lambda event: (event.observed_at, event.id),
+    )
+    failure_observed_at = _required_evidence_timestamp(
+        retryable_failure.observed_at
+    )
+    if failure_observed_at is None:
+        return None
+    risk_context = (
+        plan_item.risk_context
+        if isinstance(plan_item.risk_context, dict)
+        else {}
+    )
+    monitoring_events = risk_context.get("monitoring_events")
+    if not isinstance(monitoring_events, list):
+        return None
+    matching_rearms: list[tuple[datetime, dict[str, object]]] = []
+    for raw_event in monitoring_events:
+        if not isinstance(raw_event, dict):
+            continue
+        if (
+            raw_event.get("event") != "protective_stop_rearmed"
+            or raw_event.get("reason") != "retryable_session_rejection"
+            or raw_event.get("prior_status") != "broker_order_retry_pending"
+        ):
+            continue
+        recorded_at = _required_evidence_timestamp(
+            raw_event.get("recorded_at")
+        )
+        if recorded_at is None:
+            continue
+        if failure_observed_at <= recorded_at <= successor_submitted_at:
+            matching_rearms.append((recorded_at, raw_event))
+    if not matching_rearms:
+        return None
+    rearmed_at, rearm_event = max(matching_rearms, key=lambda item: item[0])
+
+    successor_fills = fills_by_order_id.get(successor.id, [])
+    if not successor_fills or any(
+        fill.symbol != order.symbol
+        or fill.side != order.side
+        or fill.quantity is None
+        or Decimal(fill.quantity) <= 0
+        for fill in successor_fills
+    ):
+        return None
+    filled_quantity = sum(
+        (Decimal(fill.quantity) for fill in successor_fills),
+        start=Decimal("0"),
+    )
+    if filled_quantity != Decimal(order.quantity):
+        return None
+
+    return {
+        "broker_order_pk": successor.id,
+        "broker_order_id": successor.broker_order_id,
+        "idempotency_key": successor.idempotency_key,
+        "mode": successor.mode,
+        "broker_name": successor.broker_name,
+        "symbol": successor.symbol,
+        "side": successor.side,
+        "status": successor.status,
+        "quantity": successor.quantity,
+        "filled_quantity": str(filled_quantity),
+        "submitted_at": _normalized_timestamp_signature(
+            successor.submitted_at
+        ),
+        "account_number_masked": successor_account_mask,
+        "retryable_failure_event": {
+            "event_id": retryable_failure.id,
+            "observed_at": _normalized_timestamp_signature(
+                retryable_failure.observed_at
+            ),
+            "normalized_status": retryable_failure.normalized_status,
+            "error_classification": retryable_failure.error_classification,
+            "broker_status": retryable_failure.broker_status,
+            "retryable": retryable_failure.retryable,
+        },
+        "rearm_event": {
+            **_json_safe_dict(rearm_event),
+            "recorded_at": _normalized_timestamp_signature(rearmed_at),
+        },
+        "fills": _legacy_manual_review_fill_state(successor_fills),
+        "plan_item_outcome_status": "filled",
+    }
 
 
 def _legacy_manual_review_snapshot_failure(
@@ -1903,6 +2271,7 @@ def _legacy_manual_review_evidence_fingerprint(
     active_execution_jobs: list[ExecutionJob],
     plan_sibling_state: list[dict[str, object]],
     plan_item_status: str | None,
+    verified_retry_successor: dict[str, object] | None,
     account_product_code_proof: str | None,
     snapshot_route_product_code: str,
 ) -> str:
@@ -1912,7 +2281,7 @@ def _legacy_manual_review_evidence_fingerprint(
         else {}
     )
     material = {
-        "policy_version": "legacy-manual-review-terminal-unknown-v3",
+        "policy_version": "legacy-manual-review-terminal-unknown-v4",
         "order": {
             "id": order.id,
             "execution_plan_item_id": order.execution_plan_item_id,
@@ -1961,6 +2330,7 @@ def _legacy_manual_review_evidence_fingerprint(
             ),
             "plan_sibling_state": plan_sibling_state,
             "plan_item_status": plan_item_status,
+            "verified_retry_successor": verified_retry_successor,
         },
         "broker_evidence": {
             "source": snapshot.source if snapshot is not None else None,
@@ -3485,6 +3855,12 @@ def _parse_timestamp(value: object, *, fallback: datetime) -> datetime:
         except ValueError:
             pass
     return fallback
+
+
+def _required_evidence_timestamp(value: object) -> datetime | None:
+    missing = datetime.min.replace(tzinfo=UTC)
+    parsed = _parse_timestamp(value, fallback=missing)
+    return None if parsed == missing else parsed
 
 
 def _observation_time() -> datetime:

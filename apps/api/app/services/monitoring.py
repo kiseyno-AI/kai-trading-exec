@@ -46,6 +46,7 @@ from app.models.runtime import (
     MonitoringCheckpoint,
     new_id,
 )
+from app.services.account_drawdown_recovery import snapshot_is_fresh_for_recovery
 from app.services.broker_auth import ensure_authenticated_broker_session
 from app.services.broker_order_state import CAPITAL_RESERVING_ORDER_STATUSES
 from app.services.fill_economics import effective_fill_quantity
@@ -98,6 +99,7 @@ from app.services.position_identity import (
     PositionIdentityConflictError,
     build_position_identity,
     position_identity_from_columns,
+    position_identity_from_payload,
     stable_account_scope_hmac_key,
 )
 from app.services.risk_sizing import (
@@ -9389,12 +9391,17 @@ def _ensure_existing_position_default_exit_monitors(
     ):
         if not quote_unavailable_is_durable:
             return 0, False
-        _mark_position_monitoring_manual_review(
+        if not _has_fresh_complete_kis_us_balance_monitoring_proof(
+            settings=settings,
             position=position,
-            reason="unpriced_overseas_holding",
-            triggered_at=triggered_at,
-        )
-        return 0, True
+            evaluated_at=triggered_at,
+        ):
+            _mark_position_monitoring_manual_review(
+                position=position,
+                reason="unpriced_overseas_holding",
+                triggered_at=triggered_at,
+            )
+            return 0, True
     market_timezone = (
         ZoneInfo("America/New_York")
         if route["asset_class"] == "us_equity"
@@ -9464,6 +9471,160 @@ def _ensure_existing_position_default_exit_monitors(
         maintenance_count += 1
 
     return maintenance_count, False
+
+
+def _has_fresh_complete_kis_us_balance_monitoring_proof(
+    *,
+    settings: Settings,
+    position: ExecutionPosition,
+    evaluated_at: datetime,
+) -> bool:
+    """Keep position truth distinct from transient executable-quote coverage.
+
+    A KIS overseas balance reference price is not an executable bid.  This
+    proof therefore prevents only a durable manual-review relatch; the live
+    quote trust gates still require exchange-timestamped bid evidence before
+    any sell can be submitted.
+    """
+
+    if position.updated_from != "reconciliation":
+        return False
+    try:
+        column_identity = position_identity_from_columns(position)
+        payload_identity = position_identity_from_payload(position.raw_payload)
+    except PositionIdentityConflictError:
+        return False
+    if (
+        column_identity is None
+        or payload_identity is None
+        or column_identity != payload_identity
+        or column_identity.provider != "kis"
+        or column_identity.exchange not in {"NASD", "NYSE", "AMEX"}
+    ):
+        return False
+
+    raw_payload = position.raw_payload
+    if not isinstance(raw_payload, dict):
+        return False
+    sync_context = raw_payload.get("_position_sync")
+    if not isinstance(sync_context, dict) or not (
+        sync_context.get("asset_class") == "us_equity"
+        and str(sync_context.get("exchange") or "").strip().upper()
+        == column_identity.exchange
+        and sync_context.get("monitoring_eligible") is True
+        and sync_context.get("trade_eligible") is not False
+        and sync_context.get("route_disposition") is None
+    ):
+        return False
+    if (
+        str(raw_payload.get("currency") or "").strip().upper() != "USD"
+        or str(raw_payload.get("exchange") or "").strip().upper()
+        != column_identity.exchange
+        or raw_payload.get("holdings_coverage") != "complete"
+        or raw_payload.get("open_orders_coverage") != "complete"
+    ):
+        return False
+    masked_account = raw_payload.get("account_number_masked")
+    if not isinstance(masked_account, str) or not masked_account.startswith("****"):
+        return False
+    configured_account = str(settings.kis_account_number or "").strip()
+    if configured_account:
+        expected_mask = (
+            configured_account
+            if len(configured_account) <= 4
+            else f"{'*' * (len(configured_account) - 4)}{configured_account[-4:]}"
+        )
+        if masked_account != expected_mask:
+            return False
+
+    balance = raw_payload.get("balance")
+    open_orders = raw_payload.get("open_orders")
+    if (
+        not isinstance(balance, dict)
+        or str(balance.get("rt_cd") or "").strip() != "0"
+        or not isinstance(open_orders, dict)
+        or str(open_orders.get("rt_cd") or "").strip() != "0"
+    ):
+        return False
+    raw_open_rows = open_orders.get("output")
+    open_rows = (
+        [raw_open_rows]
+        if isinstance(raw_open_rows, dict)
+        else [row for row in raw_open_rows if isinstance(row, dict)]
+        if isinstance(raw_open_rows, list)
+        else None
+    )
+    if open_rows is None:
+        return False
+    for row in open_rows:
+        open_symbol = str(
+            row.get("pdno") or row.get("ovrs_pdno") or ""
+        ).strip().upper()
+        if open_symbol != position.symbol:
+            continue
+        remaining_value = row.get("nccs_qty")
+        if remaining_value is None:
+            remaining_value = row.get("ord_uncc_qty")
+        remaining_quantity = _parse_decimal(remaining_value)
+        if remaining_quantity is None or remaining_quantity > 0:
+            return False
+
+    observed_at = position.last_reconciled_at
+    if not isinstance(observed_at, datetime):
+        return False
+    if observed_at.tzinfo is None or observed_at.utcoffset() is None:
+        observed_at = observed_at.replace(tzinfo=UTC)
+    if not snapshot_is_fresh_for_recovery(
+        observed_at=observed_at,
+        now=evaluated_at,
+        settings=settings,
+    ):
+        return False
+
+    raw_rows = balance.get("output1")
+    rows = (
+        [raw_rows]
+        if isinstance(raw_rows, dict)
+        else [row for row in raw_rows if isinstance(row, dict)]
+        if isinstance(raw_rows, list)
+        else []
+    )
+    matches = [
+        row
+        for row in rows
+        if str(row.get("ovrs_pdno") or "").strip().upper() == position.symbol
+        and str(row.get("ovrs_excg_cd") or "").strip().upper()
+        == column_identity.exchange
+    ]
+    if len(matches) != 1:
+        return False
+    holding = matches[0]
+    holding_quantity = _parse_decimal(holding.get("ovrs_cblc_qty"))
+    sellable_quantity = _parse_decimal(holding.get("ord_psbl_qty"))
+    average_price = _parse_decimal(holding.get("pchs_avg_pric"))
+    current_price = _parse_decimal(holding.get("now_pric2"))
+    if (
+        holding_quantity is None
+        or holding_quantity != Decimal(position.quantity)
+        or holding_quantity <= 0
+        or position.base_quantity not in {None, Decimal("0")}
+        or sellable_quantity is None
+        or sellable_quantity != holding_quantity
+        or average_price is None
+        or position.average_price is None
+        or average_price != Decimal(position.average_price)
+        or average_price <= 0
+        or current_price is None
+        or current_price <= 0
+    ):
+        return False
+    for field in ("now_pric", "current_price", "prpr", "last_price"):
+        if field not in holding:
+            continue
+        corroborating_price = _parse_decimal(holding[field])
+        if corroborating_price is None or corroborating_price != current_price:
+            return False
+    return True
 
 
 def _existing_position_monitoring_route(

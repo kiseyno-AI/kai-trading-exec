@@ -904,7 +904,11 @@ def build_portfolio_risk_snapshot(
         if exchange.strip()
     }
     raw_drift_scope_available = bool(
-        position_scope is not None
+        snapshot is not None
+        and position_scope is not None
+        and position_scope.identity.provider == "kis"
+        and raw_balance_valid
+        and raw_balance_fresh
         and len(snapshot_exchanges) == 1
         and all(
             str(position.exchange or "").strip().upper() in snapshot_exchanges

@@ -740,6 +740,16 @@ def test_portfolio_risk_alpaca_us_scope_keeps_fractional_equity_holdings() -> No
     assert set(holdings) == {"QQQ", "SPY"}
     assert holdings["QQQ"]["base_quantity"] == "0.1402"
     assert holdings["SPY"]["base_quantity"] == "0.1318"
+    broker_raw = payload["holdings"]["broker_raw"]
+    assert broker_raw["available"] is False
+    assert broker_raw["valid"] is False
+    assert broker_raw["normalized_drift_scope_status"] == "unavailable"
+    assert broker_raw["normalized_drift_count"] == 0
+    assert broker_raw["normalized_drift"] == []
+    warning_codes = {
+        warning["code"] for warning in payload["warnings"]["concentration"]
+    }
+    assert "broker_raw_normalized_position_drift" not in warning_codes
     engine.dispose()
 
 
