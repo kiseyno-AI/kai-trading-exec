@@ -252,6 +252,11 @@ def infer_account_snapshot_exchange(
             route_source = label
 
     if route_provider == "alpaca":
+        if (
+            route_venue in {"AMEX", "NASD", "NYSE", "US"}
+            or route_asset_class == "us_equity"
+        ):
+            return "US", f"{route_source}:route_metadata"
         return "ALPACA", f"{route_source}:route_metadata"
     if route_provider == "upbit":
         return "UPBIT", f"{route_source}:route_metadata"
@@ -751,7 +756,11 @@ def _portfolio_position_scope(
     elif provider == "alpaca":
         if market_scope == "krx":
             return None, "broker_provider_does_not_support_requested_market_scope"
-        exchanges = ("ALPACA", "US")
+        exchanges = (
+            ("US",)
+            if market_scope == "us"
+            else ("ALPACA", "US")
+        )
     elif provider == "upbit":
         if market_scope in {"krx", "us"}:
             return None, "broker_provider_does_not_support_requested_market_scope"
@@ -1271,6 +1280,7 @@ def _load_account_snapshot_if_available(
         provider=config.provider,
         symbols=symbols,
         metadata_hints=metadata_hints,
+        market_scope=market_scope,
     )
     if exchange is None:
         return None, {
@@ -1631,9 +1641,36 @@ def _account_snapshot_scope(
     provider: str,
     symbols: list[str],
     metadata_hints: dict[str, SymbolRiskMetadataHint],
+    market_scope: str,
 ) -> tuple[str | None, str | None]:
     normalized_provider = _normalized_provider(provider)
     if normalized_provider == "alpaca":
+        if market_scope == "us":
+            return "US", None
+        if market_scope == "all" and symbols:
+            unresolved_symbols = [
+                symbol
+                for symbol in symbols
+                if metadata_hints.get(symbol) is None
+                or metadata_hints[symbol].account_exchange not in {"ALPACA", "US"}
+            ]
+            if unresolved_symbols:
+                return None, (
+                    "Alpaca account snapshot skipped because asset class is unresolved "
+                    f"for symbols={','.join(unresolved_symbols)}; "
+                    "local portfolio truth preserved"
+                )
+            exchanges = {
+                metadata_hints[symbol].account_exchange for symbol in symbols
+            }
+            if exchanges == {"ALPACA"}:
+                return "ALPACA", None
+            if exchanges == {"US"}:
+                return "US", None
+            return None, (
+                "Alpaca account snapshot skipped because mixed crypto and US equity "
+                "assets require separate snapshots; local portfolio truth preserved"
+            )
         return "ALPACA", None
     if normalized_provider == "upbit":
         return "UPBIT", None

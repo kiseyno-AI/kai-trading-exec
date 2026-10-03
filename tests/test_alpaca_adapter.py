@@ -223,6 +223,7 @@ def test_account_snapshot_exposes_transient_account_id_but_redacts_payload() -> 
     assert "stable-alpaca-account-id" not in repr(snapshot)
     assert "stable-alpaca-account-id" not in str(snapshot.payload)
     assert "raw-alpaca-account-number" not in str(snapshot.payload)
+    assert snapshot.payload["asset_class"] == "crypto"
 
 
 def test_generic_account_snapshot_routes_us_equity_truth_by_exchange() -> None:

@@ -21,11 +21,14 @@ from app.services.database_cli_security import (  # noqa: E402
     reject_secret_database_url_argument,
 )
 from app.services.position_truth_remediation import (  # noqa: E402
+    ALPACA_CRYPTO_FLAT_REBIND_EXCHANGE,
     ALPACA_PAPER_LEGACY_ATTRIBUTION_EXCHANGES,
     LEGACY_QUARANTINE_ATTRIBUTION_EXCHANGES,
     SUPPORTED_POSITION_EXCHANGES,
+    analyze_alpaca_crypto_flat_position_rebind,
     analyze_legacy_position_attribution,
     analyze_position_truth_remediation,
+    apply_alpaca_crypto_flat_position_rebind,
     apply_legacy_position_attribution,
     apply_position_truth_remediation,
     legacy_attribution_account_scope_source,
@@ -98,12 +101,14 @@ def main(argv: list[str] | None = None) -> int:
                 SUPPORTED_POSITION_EXCHANGES
                 | ALPACA_PAPER_LEGACY_ATTRIBUTION_EXCHANGES
                 | LEGACY_QUARANTINE_ATTRIBUTION_EXCHANGES
+                | {ALPACA_CRYPTO_FLAT_REBIND_EXCHANGE}
             )
         ),
         help=(
             "Analyze legacy unscoped positions against one exact broker route. "
             "US is the isolated Alpaca paper US-equity route; OTCB/OOTC use "
-            "live KIS all-US holdings evidence and remain quarantined."
+            "live KIS all-US holdings evidence and remain quarantined; ALPACA "
+            "is the paper-only crypto flat-slot rebind route."
         ),
     )
     parser.add_argument("--apply", action="store_true")
@@ -123,9 +128,17 @@ def main(argv: list[str] | None = None) -> int:
         args.legacy_attribution_exchange
         in LEGACY_QUARANTINE_ATTRIBUTION_EXCHANGES
     )
+    alpaca_crypto_flat_rebind = (
+        args.legacy_attribution_exchange
+        == ALPACA_CRYPTO_FLAT_REBIND_EXCHANGE
+    )
     if quarantine_attribution and runtime_mode != "live":
         raise SystemExit(
             "legacy OTC quarantine attribution requires --runtime-mode live"
+        )
+    if alpaca_crypto_flat_rebind and runtime_mode != "paper":
+        raise SystemExit(
+            "Alpaca crypto flat rebind requires --runtime-mode paper"
         )
     reject_secret_database_url_argument(args.database_url)
     environment_database_url = (os.getenv("KAI_EXEC_DATABASE_URL") or "").strip()
@@ -168,11 +181,32 @@ def main(argv: list[str] | None = None) -> int:
     try:
         with session_factory() as db:
             legacy_adapter = (
-                _legacy_attribution_adapter(settings)
+                (
+                    AlpacaBrokerAdapter(settings=settings)
+                    if alpaca_crypto_flat_rebind
+                    else _legacy_attribution_adapter(settings)
+                )
                 if args.legacy_attribution_exchange
                 else None
             )
-            if args.legacy_attribution_exchange and args.apply:
+            if alpaca_crypto_flat_rebind and args.apply:
+                payload = apply_alpaca_crypto_flat_position_rebind(
+                    settings=settings,
+                    db=db,
+                    auth_session_factory=session_factory,
+                    adapter=legacy_adapter,
+                    approved_evidence=approved_evidence,
+                    actor=actor,
+                    reason=reason,
+                )
+            elif alpaca_crypto_flat_rebind:
+                payload = analyze_alpaca_crypto_flat_position_rebind(
+                    settings=settings,
+                    db=db,
+                    auth_session_factory=session_factory,
+                    adapter=legacy_adapter,
+                )
+            elif args.legacy_attribution_exchange and args.apply:
                 payload = apply_legacy_position_attribution(
                     settings=settings,
                     db=db,

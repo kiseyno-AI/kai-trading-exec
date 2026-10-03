@@ -48,7 +48,10 @@ from app.services.execution_failures import (
 )
 from app.services.execution_jobs import dispatch_due_execution_jobs, list_execution_jobs
 from app.services.monitoring import evaluate_monitoring
-from app.services.reconciliation import reconcile_stale_nonterminal_broker_orders
+from app.services.reconciliation import (
+    LegacyManualReviewApprovalConflictError,
+    reconcile_stale_nonterminal_broker_orders,
+)
 from app.services.short_term_watcher import evaluate_short_term_watcher_decision
 
 router = APIRouter(tags=["execution"])
@@ -360,16 +363,22 @@ def reconcile_stale_orders(
             status_code=422,
             detail="stale reconciliation apply requires actor and reason",
         )
-    result = reconcile_stale_nonterminal_broker_orders(
-        settings=settings,
-        db=db,
-        adapter=adapter,
-        older_than_seconds=command.older_than_seconds,
-        symbols=set(command.symbols) if command.symbols is not None else None,
-        dry_run=command.dry_run,
-        actor=command.actor,
-        operator_reason=command.reason,
-    )
+    try:
+        result = reconcile_stale_nonterminal_broker_orders(
+            settings=settings,
+            db=db,
+            adapter=adapter,
+            older_than_seconds=command.older_than_seconds,
+            symbols=set(command.symbols) if command.symbols is not None else None,
+            dry_run=command.dry_run,
+            actor=command.actor,
+            operator_reason=command.reason,
+            manual_review_approvals=command.manual_review_approvals,
+            include_legacy_manual_review=True,
+        )
+    except LegacyManualReviewApprovalConflictError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     if not command.dry_run:
         _invalidate_execution_runtime(
             request,

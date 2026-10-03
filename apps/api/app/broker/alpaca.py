@@ -615,6 +615,7 @@ class AlpacaBrokerAdapter:
             payload={
                 "provider": self.provider,
                 "mode": self.settings.runtime_mode,
+                "asset_class": "crypto",
                 "account": _redacted_account_payload(account),
                 **open_orders_coverage,
                 "holdings_coverage": (

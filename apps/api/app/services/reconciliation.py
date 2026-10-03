@@ -3,17 +3,22 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
+from hashlib import sha256
+import hmac
 from inspect import Parameter, signature
+import json
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text, update
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session, selectinload
 
 from app.broker.base import (
     BrokerAccountHolding,
+    BrokerAccountSnapshot,
     BrokerAdapter,
     BrokerAdapterError,
     BrokerErrorClassification,
@@ -31,11 +36,16 @@ from app.models.runtime import (
     BrokerOrderEvent,
     ExecutionFailure,
     ExecutionFill,
+    ExecutionJob,
+    ExecutionPlanItem,
     ExecutionPosition,
+    RuntimeRemediationEvent,
     new_id,
 )
+from app.services.account_drawdown_recovery import snapshot_is_fresh_for_recovery
 from app.services.broker_auth import ensure_authenticated_broker_session
 from app.services.broker_order_state import (
+    CAPITAL_RESERVING_ORDER_STATUSES,
     NONTERMINAL_ORDER_STATUSES,
     broker_order_observed_at_expr,
 )
@@ -73,6 +83,25 @@ from app.services.runtime_transitions import (
     apply_broker_order_status,
     plan_item_status_for_broker_order_status,
     set_plan_item_status,
+)
+
+
+class LegacyManualReviewApprovalConflictError(ValueError):
+    """An approval no longer matches the exact legacy-order evidence it reviewed."""
+
+
+LEGACY_MANUAL_REVIEW_MINIMUM_AGE_SECONDS = 30 * 24 * 60 * 60
+LEGACY_MANUAL_REVIEW_ACTIVE_JOB_STATUSES = frozenset(
+    {"queued", "scheduled", "running", "retrying"}
+)
+LEGACY_MANUAL_REVIEW_OUTCOME_STATUSES = frozenset(
+    {
+        NormalizedBrokerOrderStatus.FILLED.value,
+        NormalizedBrokerOrderStatus.PARTIALLY_FILLED.value,
+    }
+)
+LEGACY_MANUAL_REVIEW_OUTCOME_PLAN_ITEM_STATUSES = frozenset(
+    {"filled", "partially_filled", "broker_order_partially_filled"}
 )
 
 
@@ -722,6 +751,8 @@ def reconcile_stale_nonterminal_broker_orders(
     dry_run: bool = False,
     actor: str | None = None,
     operator_reason: str | None = None,
+    manual_review_approvals: dict[str, str] | None = None,
+    include_legacy_manual_review: bool = False,
 ) -> dict[str, object]:
     threshold_seconds = (
         older_than_seconds
@@ -968,6 +999,33 @@ def reconcile_stale_nonterminal_broker_orders(
             }
         )
 
+    if include_legacy_manual_review:
+        legacy_manual_review_resolution = _reconcile_legacy_manual_review_orders(
+            settings=settings,
+            db=db,
+            adapter=adapter,
+            stale_before=observed_at
+            - timedelta(
+                seconds=max(
+                    threshold_seconds,
+                    LEGACY_MANUAL_REVIEW_MINIMUM_AGE_SECONDS,
+                )
+            ),
+            symbols=_normalize_symbols(symbols),
+            dry_run=dry_run,
+            actor=actor,
+            operator_reason=operator_reason,
+            approvals=manual_review_approvals or {},
+        )
+    else:
+        if manual_review_approvals:
+            raise LegacyManualReviewApprovalConflictError(
+                "legacy manual-review approvals require explicit discovery opt-in"
+            )
+        legacy_manual_review_resolution = (
+            _empty_legacy_manual_review_resolution()
+        )
+
     expired_failure_cleanup = _resolve_open_failures_for_expired_reconciliation_orders(
         settings=settings,
         db=db,
@@ -1020,8 +1078,915 @@ def reconcile_stale_nonterminal_broker_orders(
             "zeroed": 0,
         },
         "expired_failure_cleanup": expired_failure_cleanup,
+        "legacy_manual_review_resolution": legacy_manual_review_resolution,
         "items": items,
     }
+
+
+def _empty_legacy_manual_review_resolution() -> dict[str, object]:
+    return {
+        "minimum_age_seconds": LEGACY_MANUAL_REVIEW_MINIMUM_AGE_SECONDS,
+        "candidate_order_count": 0,
+        "eligible_order_count": 0,
+        "would_resolve_order_count": 0,
+        "resolved_order_count": 0,
+        "items": [],
+    }
+
+
+def _reconcile_legacy_manual_review_orders(
+    *,
+    settings: Settings,
+    db: Session,
+    adapter: BrokerAdapter,
+    stale_before: datetime,
+    symbols: set[str] | None,
+    dry_run: bool,
+    actor: str | None,
+    operator_reason: str | None,
+    approvals: dict[str, str],
+) -> dict[str, object]:
+    orders = _load_legacy_manual_review_orders(
+        settings=settings,
+        db=db,
+        broker_name=adapter.provider,
+        stale_before=stale_before,
+        symbols=symbols,
+        for_update=False,
+    )
+    if not orders:
+        if approvals:
+            raise LegacyManualReviewApprovalConflictError(
+                "legacy manual-review approval target is no longer a candidate"
+            )
+        return _empty_legacy_manual_review_resolution()
+
+    snapshot: BrokerAccountSnapshot | None = None
+    snapshot_failure: str | None = None
+    access_token = ""
+    plan_items_by_id: dict[str, ExecutionPlanItem] = {}
+    plan_siblings_by_item_id: dict[str, list[BrokerOrder]] = {}
+    sibling_fill_counts: dict[str, int] = {}
+    active_jobs_by_item_id: dict[str, list[ExecutionJob]] = {}
+    if str(adapter.provider or "").strip().lower() != "kis":
+        snapshot_failure = "unsupported_broker_provider"
+    else:
+        session_state = ensure_authenticated_broker_session(
+            settings=settings,
+            db=db,
+            adapter=adapter,
+            source="stale_order_reconciliation",
+            reason="verify legacy manual-review order absence",
+        )
+        access_token = session_state.access_token or ""
+        snapshot = adapter.get_account_snapshot(
+            access_token,
+            symbols=None,
+            exchange="KRX",
+        )
+        snapshot_failure = _legacy_manual_review_snapshot_failure(
+            settings=settings,
+            snapshot=snapshot,
+            evaluated_at=_observation_time(),
+        )
+
+    requested_approval_ids = set(approvals)
+    if not dry_run and requested_approval_ids:
+        initial_order_ids = {order.id for order in orders}
+        if not requested_approval_ids.issubset(initial_order_ids):
+            raise LegacyManualReviewApprovalConflictError(
+                "legacy manual-review approval target is no longer a candidate"
+            )
+        _reserve_sqlite_legacy_manual_review_approval_rows(
+            settings=settings,
+            db=db,
+            broker_name=adapter.provider,
+            stale_before=stale_before,
+            symbols=symbols,
+            approved_order_ids=requested_approval_ids,
+        )
+
+    if not dry_run:
+        orders = _load_legacy_manual_review_orders(
+            settings=settings,
+            db=db,
+            broker_name=adapter.provider,
+            stale_before=stale_before,
+            symbols=symbols,
+            for_update=True,
+        )
+        if requested_approval_ids and not requested_approval_ids.issubset(
+            {order.id for order in orders}
+        ):
+            raise LegacyManualReviewApprovalConflictError(
+                "legacy manual-review approval target drifted during writer reservation"
+            )
+
+    plan_item_ids = {
+        order.execution_plan_item_id
+        for order in orders
+        if order.execution_plan_item_id is not None
+    }
+    if plan_item_ids:
+        plan_item_statement = (
+            select(ExecutionPlanItem)
+            .where(ExecutionPlanItem.id.in_(sorted(plan_item_ids)))
+            .order_by(ExecutionPlanItem.id.asc())
+        )
+        if not dry_run:
+            plan_item_statement = plan_item_statement.with_for_update().execution_options(
+                populate_existing=True
+            )
+        plan_items = db.scalars(plan_item_statement).all()
+        plan_items_by_id = {plan_item.id: plan_item for plan_item in plan_items}
+        (
+            plan_siblings_by_item_id,
+            sibling_fill_counts,
+        ) = _load_legacy_manual_review_plan_siblings(
+            db=db,
+            plan_item_ids=plan_item_ids,
+            for_update=not dry_run,
+        )
+        active_jobs_by_item_id = _load_legacy_manual_review_active_jobs(
+            db=db,
+            plan_item_ids=plan_item_ids,
+            for_update=not dry_run,
+        )
+
+    if not dry_run and snapshot is not None:
+        snapshot = adapter.get_account_snapshot(
+            access_token,
+            symbols=None,
+            exchange="KRX",
+        )
+        snapshot_failure = _legacy_manual_review_snapshot_failure(
+            settings=settings,
+            snapshot=snapshot,
+            evaluated_at=_observation_time(),
+        )
+
+    if not dry_run and requested_approval_ids:
+        _acquire_legacy_manual_review_position_truth_fence(db=db)
+
+    local_positions_statement = select(ExecutionPosition).where(
+        ExecutionPosition.mode == settings.runtime_mode,
+        ExecutionPosition.symbol.in_([order.symbol for order in orders]),
+    )
+    if not dry_run:
+        local_positions_statement = local_positions_statement.with_for_update().execution_options(
+            populate_existing=True
+        )
+    local_position_symbols = {
+        position.symbol
+        for position in db.scalars(local_positions_statement).all()
+        if position.quantity > 0
+        or (position.base_quantity is not None and position.base_quantity > 0)
+    }
+    items: list[dict[str, object]] = []
+    for order in orders:
+        plan_item_id = order.execution_plan_item_id
+        plan_item = (
+            plan_items_by_id.get(plan_item_id)
+            if plan_item_id is not None
+            else None
+        )
+        plan_item_status = plan_item.status if plan_item is not None else None
+        plan_siblings = (
+            plan_siblings_by_item_id.get(plan_item_id, [])
+            if plan_item_id is not None
+            else []
+        )
+        active_jobs = (
+            active_jobs_by_item_id.get(plan_item_id, [])
+            if plan_item_id is not None
+            else []
+        )
+        order_fill_count = sibling_fill_counts.get(order.id, len(order.fills))
+        outcome_bearing_siblings = [
+            sibling
+            for sibling in plan_siblings
+            if sibling.id != order.id
+            and (
+                sibling.status in LEGACY_MANUAL_REVIEW_OUTCOME_STATUSES
+                or sibling_fill_counts.get(sibling.id, 0) > 0
+            )
+        ]
+        plan_sibling_state = _legacy_manual_review_plan_sibling_state(
+            siblings=plan_siblings,
+            fill_counts=sibling_fill_counts,
+        )
+        broker_position_match = bool(
+            snapshot is not None
+            and any(
+                holding.symbol == order.symbol and holding.quantity > 0
+                for holding in snapshot.holdings
+            )
+        )
+        broker_open_order_match = bool(
+            snapshot is not None
+            and any(
+                open_order.symbol == order.symbol
+                and (open_order.remaining_quantity or 0) > 0
+                for open_order in snapshot.open_orders
+            )
+        )
+        route_failure = _legacy_manual_review_order_route_failure(
+            settings=settings,
+            order=order,
+            snapshot=snapshot,
+        )
+        (
+            account_product_code_proof,
+            _account_product_code_failure,
+        ) = _legacy_manual_review_account_product_code_proof(
+            settings=settings,
+            order=order,
+        )
+        reason = (
+            snapshot_failure
+            or route_failure
+            or ("broker_position_present" if broker_position_match else None)
+            or ("broker_open_order_present" if broker_open_order_match else None)
+            or (
+                "local_position_present"
+                if order.symbol in local_position_symbols
+                else None
+            )
+            or ("execution_fills_present" if order_fill_count else None)
+            or (
+                "outcome_bearing_plan_sibling_present"
+                if outcome_bearing_siblings
+                else None
+            )
+            or (
+                "outcome_bearing_plan_item_status"
+                if plan_item_status
+                in LEGACY_MANUAL_REVIEW_OUTCOME_PLAN_ITEM_STATUSES
+                else None
+            )
+            or (
+                "linked_execution_failure_present"
+                if order.execution_failure is not None
+                else None
+            )
+            or (
+                "active_execution_job_present"
+                if active_jobs
+                else None
+            )
+        )
+        eligible = reason is None
+        fingerprint = (
+            _legacy_manual_review_evidence_fingerprint(
+                order=order,
+                snapshot=snapshot,
+                broker_position_match=broker_position_match,
+                broker_open_order_match=broker_open_order_match,
+                local_position_match=order.symbol in local_position_symbols,
+                order_fill_count=order_fill_count,
+                active_execution_jobs=active_jobs,
+                plan_sibling_state=plan_sibling_state,
+                plan_item_status=plan_item_status,
+                account_product_code_proof=account_product_code_proof,
+                snapshot_route_product_code=(
+                    settings.kis_account_product_code
+                ),
+            )
+            if eligible and snapshot is not None
+            else None
+        )
+        items.append(
+            {
+                "broker_order_pk": order.id,
+                "execution_plan_item_id": order.execution_plan_item_id,
+                "symbol": order.symbol,
+                "side": order.side,
+                "status_before": order.status,
+                "eligible": eligible,
+                "reason": reason,
+                "evidence_fingerprint": fingerprint,
+                "broker_position_match": broker_position_match,
+                "broker_open_order_match": broker_open_order_match,
+                "local_position_match": order.symbol in local_position_symbols,
+                "account_product_code_proof": account_product_code_proof,
+                "snapshot_route_product_code": (
+                    settings.kis_account_product_code
+                ),
+                "linked_execution_failure_count": (
+                    1 if order.execution_failure is not None else 0
+                ),
+                "active_execution_job_count": len(active_jobs),
+                "outcome_bearing_sibling_count": len(
+                    outcome_bearing_siblings
+                ),
+                "plan_item_status": plan_item_status,
+                "plan_sibling_state": plan_sibling_state,
+                "repair_action": "approval_required" if eligible else "blocked",
+            }
+        )
+
+    eligible_count = sum(item["eligible"] is True for item in items)
+    resolved_count = 0
+    if not dry_run and approvals:
+        normalized_actor = str(actor or "").strip()
+        normalized_reason = str(operator_reason or "").strip()
+        if not normalized_actor or not normalized_reason:
+            raise LegacyManualReviewApprovalConflictError(
+                "legacy manual-review apply requires actor and reason"
+            )
+        item_by_order_id = {
+            str(item["broker_order_pk"]): item
+            for item in items
+        }
+        order_by_id = {order.id: order for order in orders}
+        unknown_approval_ids = sorted(set(approvals) - set(item_by_order_id))
+        if unknown_approval_ids:
+            raise LegacyManualReviewApprovalConflictError(
+                "legacy manual-review approval target is no longer a candidate"
+            )
+        approved_order_ids: set[str] = set()
+        for order_id, approved_fingerprint in approvals.items():
+            item = item_by_order_id[order_id]
+            current_fingerprint = item.get("evidence_fingerprint")
+            if (
+                item.get("eligible") is not True
+                or not isinstance(current_fingerprint, str)
+                or not hmac.compare_digest(
+                    current_fingerprint,
+                    str(approved_fingerprint),
+                )
+            ):
+                raise LegacyManualReviewApprovalConflictError(
+                    "legacy manual-review approval fingerprint is stale or ineligible"
+                )
+            approved_order_ids.add(order_id)
+
+        approved_plan_item_ids = {
+            order_by_id[order_id].execution_plan_item_id
+            for order_id in approved_order_ids
+            if order_by_id[order_id].execution_plan_item_id is not None
+        }
+        if approved_plan_item_ids:
+            unresolved_siblings = [
+                sibling
+                for plan_item_id in approved_plan_item_ids
+                for sibling in plan_siblings_by_item_id.get(plan_item_id, [])
+                if sibling.status in CAPITAL_RESERVING_ORDER_STATUSES
+            ]
+            if any(
+                sibling.id not in approved_order_ids
+                for sibling in unresolved_siblings
+            ):
+                raise LegacyManualReviewApprovalConflictError(
+                    "legacy manual-review sibling group requires atomic approval"
+                )
+
+        assert snapshot is not None
+        repair_reason = "legacy_manual_review_absent_from_complete_broker_truth"
+        for order_id in sorted(approved_order_ids):
+            order = order_by_id[order_id]
+            item = item_by_order_id[order_id]
+            fingerprint = str(item["evidence_fingerprint"])
+            status_before = order.status
+            apply_broker_order_status(
+                order=order,
+                status=NormalizedBrokerOrderStatus.STALE_TERMINAL_UNKNOWN.value,
+            )
+            _record_stale_order_repair_event(
+                db=db,
+                order=order,
+                status_before=status_before,
+                status_after=order.status,
+                classification="stale_terminal_unknown",
+                reason=repair_reason,
+                observed_broker_code=order.last_error_code,
+                observed_at=_observation_time(),
+                result={
+                    "evidence_fingerprint": fingerprint,
+                    "safety_policy_version": (
+                        "legacy-manual-review-terminal-unknown-v3"
+                    ),
+                    "snapshot_source": snapshot.source,
+                    "snapshot_observed_at": snapshot.observed_at.isoformat(),
+                    "holdings_complete": snapshot.holdings_complete,
+                    "open_orders_complete": snapshot.open_orders_complete,
+                    "broker_position_match": False,
+                    "broker_open_order_match": False,
+                    "local_position_match": False,
+                    "broker_mutations": 0,
+                    "fills_written": 0,
+                    "pnl_inferences": 0,
+                    "execution_scope_inferences": 0,
+                    "historical_outcome": "unknown",
+                    "current_holding_absent": True,
+                    "current_open_order_absent": True,
+                    "fill_inferred": False,
+                    "account_scope_attributed": False,
+                    "account_product_code_proof": item[
+                        "account_product_code_proof"
+                    ],
+                    "snapshot_route_product_code": item[
+                        "snapshot_route_product_code"
+                    ],
+                    "plan_sibling_state": item["plan_sibling_state"],
+                    "plan_item_status": item["plan_item_status"],
+                },
+                actor=normalized_actor,
+                operator_reason=normalized_reason,
+            )
+            db.add(
+                RuntimeRemediationEvent(
+                    mode=settings.runtime_mode,
+                    candidate_type="legacy_manual_review_order",
+                    candidate_key=fingerprint,
+                    subject_id=order.id,
+                    outcome="stale_terminal_unknown",
+                    actor=normalized_actor,
+                    reason=normalized_reason,
+                    evidence_summary={
+                        "evidence_fingerprint": fingerprint,
+                        "safety_policy_version": (
+                            "legacy-manual-review-terminal-unknown-v3"
+                        ),
+                        "transition_reason": repair_reason,
+                        "status_before": status_before,
+                        "status_after": order.status,
+                        "symbol": order.symbol,
+                        "side": order.side,
+                        "snapshot_source": snapshot.source,
+                        "snapshot_observed_at": snapshot.observed_at.isoformat(),
+                        "holdings_complete": snapshot.holdings_complete,
+                        "open_orders_complete": snapshot.open_orders_complete,
+                        "broker_position_match": False,
+                        "broker_open_order_match": False,
+                        "local_position_match": False,
+                        "broker_mutations": 0,
+                        "fills_written": 0,
+                        "pnl_inferences": 0,
+                        "execution_scope_inferences": 0,
+                        "historical_outcome": "unknown",
+                        "current_holding_absent": True,
+                        "current_open_order_absent": True,
+                        "fill_inferred": False,
+                        "account_scope_attributed": False,
+                        "account_product_code_proof": item[
+                            "account_product_code_proof"
+                        ],
+                        "snapshot_route_product_code": item[
+                            "snapshot_route_product_code"
+                        ],
+                        "plan_sibling_state": item[
+                            "plan_sibling_state"
+                        ],
+                        "plan_item_status": item["plan_item_status"],
+                    },
+                    occurred_at=_observation_time(),
+                )
+            )
+            item["repair_action"] = "repaired"
+            item["status_after"] = order.status
+            resolved_count += 1
+
+        db.flush()
+        for plan_item_id in sorted(approved_plan_item_ids):
+            still_reserving = any(
+                sibling.status in CAPITAL_RESERVING_ORDER_STATUSES
+                for sibling in plan_siblings_by_item_id.get(plan_item_id, [])
+            )
+            if still_reserving:
+                continue
+            plan_item = plan_items_by_id.get(plan_item_id)
+            if plan_item is not None and plan_item.status == "manual_review_required":
+                set_plan_item_status(
+                    db=db,
+                    plan_item=plan_item,
+                    status="broker_order_failed",
+                    source="operator_remediation",
+                    reason=repair_reason,
+                    payload={
+                        "approved_broker_order_ids": sorted(approved_order_ids),
+                        "actor": normalized_actor,
+                        "operator_reason": normalized_reason,
+                        "broker_mutations": 0,
+                        "fills_written": 0,
+                    },
+                    occurred_at=_observation_time(),
+                )
+
+    return {
+        "minimum_age_seconds": LEGACY_MANUAL_REVIEW_MINIMUM_AGE_SECONDS,
+        "candidate_order_count": len(orders),
+        "eligible_order_count": eligible_count,
+        "would_resolve_order_count": eligible_count if dry_run else 0,
+        "resolved_order_count": resolved_count,
+        "items": items,
+    }
+
+
+def _load_legacy_manual_review_orders(
+    *,
+    settings: Settings,
+    db: Session,
+    broker_name: str,
+    stale_before: datetime,
+    symbols: set[str] | None,
+    for_update: bool,
+) -> list[BrokerOrder]:
+    where = _legacy_manual_review_order_conditions(
+        settings=settings,
+        broker_name=broker_name,
+        stale_before=stale_before,
+        symbols=symbols,
+    )
+    statement = (
+        select(BrokerOrder)
+        .options(
+            selectinload(BrokerOrder.fills),
+            selectinload(BrokerOrder.execution_failure),
+            selectinload(BrokerOrder.plan_item).selectinload(
+                ExecutionPlanItem.jobs
+            ),
+        )
+        .where(*where)
+        .order_by(BrokerOrder.created_at.asc(), BrokerOrder.id.asc())
+    )
+    if for_update:
+        statement = statement.with_for_update().execution_options(
+            populate_existing=True
+        )
+    return db.scalars(statement).all()
+
+
+def _legacy_manual_review_order_conditions(
+    *,
+    settings: Settings,
+    broker_name: str,
+    stale_before: datetime,
+    symbols: set[str] | None,
+) -> list[Any]:
+    conditions: list[Any] = [
+        BrokerOrder.mode == settings.runtime_mode,
+        BrokerOrder.broker_name == broker_name,
+        BrokerOrder.status
+        == NormalizedBrokerOrderStatus.MANUAL_REVIEW_REQUIRED.value,
+        BrokerOrder.broker_order_id.is_(None),
+        BrokerOrder.submitted_at.is_(None),
+        BrokerOrder.venue.is_(None),
+        BrokerOrder.asset_class.is_(None),
+        BrokerOrder.last_error_classification == "missing_broker_order_id",
+        BrokerOrder.created_at < stale_before,
+    ]
+    if symbols is not None:
+        conditions.append(BrokerOrder.symbol.in_(sorted(symbols)))
+    return conditions
+
+
+def _reserve_sqlite_legacy_manual_review_approval_rows(
+    *,
+    settings: Settings,
+    db: Session,
+    broker_name: str,
+    stale_before: datetime,
+    symbols: set[str] | None,
+    approved_order_ids: set[str],
+) -> None:
+    if not approved_order_ids or db.get_bind().dialect.name != "sqlite":
+        return
+    conditions = _legacy_manual_review_order_conditions(
+        settings=settings,
+        broker_name=broker_name,
+        stale_before=stale_before,
+        symbols=symbols,
+    )
+    conditions.append(BrokerOrder.id.in_(sorted(approved_order_ids)))
+    table = BrokerOrder.__table__
+    statement = (
+        update(table)
+        .where(*conditions)
+        .values(status=table.c.status, updated_at=table.c.updated_at)
+        .execution_options(synchronize_session=False)
+    )
+    try:
+        result = db.execute(statement)
+    except OperationalError as exc:
+        if "locked" in str(exc).lower():
+            raise LegacyManualReviewApprovalConflictError(
+                "legacy manual-review SQLite writer reservation failed: database is locked"
+            ) from exc
+        raise
+    if result.rowcount != len(approved_order_ids):
+        raise LegacyManualReviewApprovalConflictError(
+            "legacy manual-review approval target drifted during writer reservation"
+        )
+
+
+def _acquire_legacy_manual_review_position_truth_fence(*, db: Session) -> None:
+    if db.get_bind().dialect.name != "postgresql":
+        return
+    try:
+        db.execute(
+            text("LOCK TABLE execution_positions IN SHARE MODE NOWAIT")
+        )
+    except OperationalError as exc:
+        original = getattr(exc, "orig", None)
+        sqlstate = getattr(original, "sqlstate", None) or getattr(
+            original,
+            "pgcode",
+            None,
+        )
+        if sqlstate == "55P03":
+            raise LegacyManualReviewApprovalConflictError(
+                "legacy manual-review position-truth fence is busy"
+            ) from exc
+        raise
+
+
+def _load_legacy_manual_review_plan_siblings(
+    *,
+    db: Session,
+    plan_item_ids: set[str],
+    for_update: bool,
+) -> tuple[dict[str, list[BrokerOrder]], dict[str, int]]:
+    if not plan_item_ids:
+        return {}, {}
+    sibling_statement = (
+        select(BrokerOrder)
+        .where(
+            BrokerOrder.execution_plan_item_id.in_(sorted(plan_item_ids)),
+        )
+        .order_by(BrokerOrder.execution_plan_item_id.asc(), BrokerOrder.id.asc())
+    )
+    if for_update:
+        sibling_statement = sibling_statement.with_for_update().execution_options(
+            populate_existing=True
+        )
+    siblings = db.scalars(sibling_statement).all()
+    sibling_ids = [sibling.id for sibling in siblings]
+    fill_counts = {sibling.id: 0 for sibling in siblings}
+    if sibling_ids:
+        fill_statement = (
+            select(ExecutionFill)
+            .where(ExecutionFill.broker_order_pk.in_(sibling_ids))
+            .order_by(ExecutionFill.broker_order_pk.asc(), ExecutionFill.id.asc())
+        )
+        if for_update:
+            fill_statement = fill_statement.with_for_update().execution_options(
+                populate_existing=True
+            )
+        for fill in db.scalars(fill_statement).all():
+            fill_counts[fill.broker_order_pk] = (
+                fill_counts.get(fill.broker_order_pk, 0) + 1
+            )
+
+    siblings_by_item_id: dict[str, list[BrokerOrder]] = {}
+    for sibling in siblings:
+        if sibling.execution_plan_item_id is None:
+            continue
+        siblings_by_item_id.setdefault(
+            sibling.execution_plan_item_id,
+            [],
+        ).append(sibling)
+    return siblings_by_item_id, fill_counts
+
+
+def _load_legacy_manual_review_active_jobs(
+    *,
+    db: Session,
+    plan_item_ids: set[str],
+    for_update: bool,
+) -> dict[str, list[ExecutionJob]]:
+    if not plan_item_ids:
+        return {}
+    statement = (
+        select(ExecutionJob)
+        .where(
+            ExecutionJob.execution_plan_item_id.in_(sorted(plan_item_ids)),
+        )
+        .order_by(ExecutionJob.execution_plan_item_id.asc(), ExecutionJob.id.asc())
+    )
+    if for_update:
+        statement = statement.with_for_update().execution_options(
+            populate_existing=True
+        )
+    jobs_by_item_id: dict[str, list[ExecutionJob]] = {}
+    for job in db.scalars(statement).all():
+        if job.status not in LEGACY_MANUAL_REVIEW_ACTIVE_JOB_STATUSES:
+            continue
+        jobs_by_item_id.setdefault(job.execution_plan_item_id, []).append(job)
+    return jobs_by_item_id
+
+
+def _legacy_manual_review_plan_sibling_state(
+    *,
+    siblings: list[BrokerOrder],
+    fill_counts: dict[str, int],
+) -> list[dict[str, object]]:
+    return [
+        {
+            "broker_order_pk": sibling.id,
+            "status": sibling.status,
+            "fill_count": fill_counts.get(sibling.id, 0),
+        }
+        for sibling in sorted(siblings, key=lambda sibling: sibling.id)
+    ]
+
+
+def _legacy_manual_review_snapshot_failure(
+    *,
+    settings: Settings,
+    snapshot: BrokerAccountSnapshot,
+    evaluated_at: datetime,
+) -> str | None:
+    if snapshot.source != "kis:account_snapshot":
+        return "broker_snapshot_source_invalid"
+    if snapshot.holdings_complete is not True:
+        return "broker_holdings_snapshot_incomplete"
+    if snapshot.open_orders_complete is not True:
+        return "broker_open_orders_snapshot_incomplete"
+    if not snapshot_is_fresh_for_recovery(
+        observed_at=snapshot.observed_at,
+        now=evaluated_at,
+        settings=settings,
+    ):
+        return "broker_snapshot_not_fresh"
+    payload = snapshot.payload if isinstance(snapshot.payload, dict) else {}
+    if str(payload.get("exchange") or "").strip().upper() != "KRX":
+        return "broker_snapshot_route_invalid"
+    if not str(payload.get("account_number_masked") or "").strip():
+        return "broker_snapshot_account_proof_missing"
+    return None
+
+
+def _legacy_manual_review_order_route_failure(
+    *,
+    settings: Settings,
+    order: BrokerOrder,
+    snapshot: BrokerAccountSnapshot | None,
+) -> str | None:
+    metadata = order.request_metadata if isinstance(order.request_metadata, dict) else {}
+    route = metadata.get("route")
+    if not isinstance(route, dict):
+        return "legacy_route_proof_missing"
+    if "execution_scope" in metadata:
+        return "legacy_order_has_canonical_scope"
+    if str(metadata.get("provider") or "").strip().lower() != "kis":
+        return "legacy_provider_proof_invalid"
+    _, account_product_code_failure = (
+        _legacy_manual_review_account_product_code_proof(
+            settings=settings,
+            order=order,
+        )
+    )
+    if account_product_code_failure is not None:
+        return account_product_code_failure
+    if str(route.get("exchange") or "").strip().upper() != "KRX":
+        return "legacy_route_proof_invalid"
+    if metadata.get("endpoint") != "/uapi/domestic-stock/v1/trading/order-cash":
+        return "legacy_endpoint_proof_invalid"
+    if str(metadata.get("method") or "").strip().upper() != "POST":
+        return "legacy_method_proof_invalid"
+    live_prefix = "T" if settings.runtime_mode == "live" else "V"
+    expected_tr_id = (
+        f"{live_prefix}TTC0012U"
+        if str(order.side or "").strip().lower() == "buy"
+        else f"{live_prefix}TTC0011U"
+        if str(order.side or "").strip().lower() == "sell"
+        else None
+    )
+    if expected_tr_id is None or metadata.get("tr_id") != expected_tr_id:
+        return "legacy_transaction_route_proof_invalid"
+    stored_mask = str(metadata.get("account_number_masked") or "").strip()
+    snapshot_payload = (
+        snapshot.payload
+        if snapshot is not None and isinstance(snapshot.payload, dict)
+        else {}
+    )
+    snapshot_mask = str(snapshot_payload.get("account_number_masked") or "").strip()
+    if not stored_mask or not snapshot_mask or stored_mask != snapshot_mask:
+        return "legacy_account_route_proof_invalid"
+    return None
+
+
+def _legacy_manual_review_account_product_code_proof(
+    *,
+    settings: Settings,
+    order: BrokerOrder,
+) -> tuple[str | None, str | None]:
+    metadata = (
+        order.request_metadata
+        if isinstance(order.request_metadata, dict)
+        else {}
+    )
+    configured_product_code = settings.kis_account_product_code
+    if not isinstance(configured_product_code, str) or not configured_product_code:
+        return None, "configured_account_product_code_missing"
+    if "account_product_code" not in metadata:
+        return "legacy_missing", None
+    stored_product_code = metadata.get("account_product_code")
+    if (
+        not isinstance(stored_product_code, str)
+        or not stored_product_code
+        or stored_product_code != configured_product_code
+    ):
+        return None, "legacy_account_product_code_proof_invalid"
+    return "exact_match", None
+
+
+def _legacy_manual_review_evidence_fingerprint(
+    *,
+    order: BrokerOrder,
+    snapshot: BrokerAccountSnapshot | None,
+    broker_position_match: bool,
+    broker_open_order_match: bool,
+    local_position_match: bool,
+    order_fill_count: int,
+    active_execution_jobs: list[ExecutionJob],
+    plan_sibling_state: list[dict[str, object]],
+    plan_item_status: str | None,
+    account_product_code_proof: str | None,
+    snapshot_route_product_code: str,
+) -> str:
+    snapshot_payload = (
+        snapshot.payload
+        if snapshot is not None and isinstance(snapshot.payload, dict)
+        else {}
+    )
+    material = {
+        "policy_version": "legacy-manual-review-terminal-unknown-v3",
+        "order": {
+            "id": order.id,
+            "execution_plan_item_id": order.execution_plan_item_id,
+            "mode": order.mode,
+            "broker_name": order.broker_name,
+            "idempotency_key": order.idempotency_key,
+            "broker_order_id": order.broker_order_id,
+            "symbol": order.symbol,
+            "side": order.side,
+            "status": order.status,
+            "quantity": order.quantity,
+            "base_quantity": order.base_quantity,
+            "quote_notional": order.quote_notional,
+            "venue": order.venue,
+            "asset_class": order.asset_class,
+            "limit_price": order.limit_price,
+            "created_at": (
+                _normalized_timestamp_signature(order.created_at)
+                if order.created_at is not None
+                else None
+            ),
+            "submitted_at": (
+                _normalized_timestamp_signature(order.submitted_at)
+                if order.submitted_at is not None
+                else None
+            ),
+            "last_broker_sync_at": (
+                _normalized_timestamp_signature(order.last_broker_sync_at)
+                if order.last_broker_sync_at is not None
+                else None
+            ),
+            "last_error_classification": order.last_error_classification,
+            "last_error_code": order.last_error_code,
+            "last_error_message": order.last_error_message,
+            "last_error_retryable": order.last_error_retryable,
+            "request_metadata": order.request_metadata,
+            "response_metadata": order.response_metadata,
+            "raw_broker_payload": order.raw_broker_payload,
+            "fill_count": order_fill_count,
+            "linked_execution_failure_count": (
+                1 if order.execution_failure is not None else 0
+            ),
+            "active_execution_jobs": sorted(
+                (job.id, job.status)
+                for job in active_execution_jobs
+            ),
+            "plan_sibling_state": plan_sibling_state,
+            "plan_item_status": plan_item_status,
+        },
+        "broker_evidence": {
+            "source": snapshot.source if snapshot is not None else None,
+            "exchange": snapshot_payload.get("exchange"),
+            "account_number_masked": snapshot_payload.get(
+                "account_number_masked"
+            ),
+            "account_product_code_proof": account_product_code_proof,
+            "snapshot_route_product_code": snapshot_route_product_code,
+            "holdings_complete": (
+                snapshot.holdings_complete if snapshot is not None else False
+            ),
+            "open_orders_complete": (
+                snapshot.open_orders_complete if snapshot is not None else False
+            ),
+            "broker_position_match": broker_position_match,
+            "broker_open_order_match": broker_open_order_match,
+            "local_position_match": local_position_match,
+        },
+    }
+    encoded = json.dumps(
+        _json_safe_value(material),
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return sha256(encoded).hexdigest()
 
 
 def _resolve_open_failures_for_expired_reconciliation_orders(
@@ -1554,6 +2519,7 @@ def sync_execution_positions_from_broker_snapshot(
             "created": 0,
             "updated": 0,
             "zeroed": 0,
+            "monitoring_recovered_count": 0,
             "execution_scope": execution_scope,
             "execution_scope_source": execution_scope_source,
         }
@@ -1602,6 +2568,7 @@ def sync_execution_positions_from_broker_snapshot(
     created = len(created_symbols)
     updated = 0
     zeroed = 0
+    monitoring_recovered_count = 0
     for symbol in sorted(tracked_symbols):
         holding = holding_by_symbol.get(symbol)
         position = position_by_symbol.get(symbol)
@@ -1629,6 +2596,7 @@ def sync_execution_positions_from_broker_snapshot(
                 holding=None,
                 exchange=identity_exchange,
                 identity=position_identity,
+                prior_payload=position.raw_payload,
             )
             continue
 
@@ -1651,13 +2619,52 @@ def sync_execution_positions_from_broker_snapshot(
             position.updated_from = "reconciliation"
             changed = True
         position.last_reconciled_at = observed_at
+        monitoring_recovery_evidence = _unpriced_kis_us_holding_recovery_evidence(
+            settings=settings,
+            snapshot=snapshot,
+            holding=holding,
+            exchange=identity_exchange,
+            prior_payload=position.raw_payload,
+            evaluated_at=_observation_time(),
+        )
         position.raw_payload = _position_snapshot_payload(
             snapshot_payload=snapshot.payload,
             holding=holding,
             exchange=identity_exchange,
             identity=position_identity,
             prior_payload=position.raw_payload,
+            monitoring_recovery_evidence=monitoring_recovery_evidence,
         )
+        if monitoring_recovery_evidence is not None:
+            monitoring_recovered_count += 1
+            prior_recorded_at = monitoring_recovery_evidence[
+                "manual_review_recorded_at"
+            ]
+            candidate_key = sha256(
+                (
+                    "unpriced-kis-us-holding-recovery:v1|"
+                    f"{position.id}|{prior_recorded_at}|"
+                    f"{snapshot.observed_at.isoformat()}"
+                ).encode("utf-8")
+            ).hexdigest()
+            db.add(
+                RuntimeRemediationEvent(
+                    mode=settings.runtime_mode,
+                    candidate_type="position_monitoring_manual_review",
+                    candidate_key=candidate_key,
+                    subject_id=position.id,
+                    outcome="monitoring_reenabled",
+                    actor="system",
+                    reason="fresh_complete_kis_holding_is_priceable_and_sellable",
+                    evidence_summary=monitoring_recovery_evidence
+                    | {
+                        "orders_submitted": 0,
+                        "orders_amended": 0,
+                        "orders_canceled": 0,
+                    },
+                    occurred_at=_observation_time(),
+                )
+            )
         if changed and symbol not in created_symbols:
             updated += 1
 
@@ -1668,6 +2675,7 @@ def sync_execution_positions_from_broker_snapshot(
         "created": created,
         "updated": updated,
         "zeroed": zeroed,
+        "monitoring_recovered_count": monitoring_recovered_count,
         "execution_scope": execution_scope,
         "execution_scope_source": execution_scope_source,
     }
@@ -2019,6 +3027,7 @@ def _position_snapshot_payload(
     exchange: str,
     identity: PositionIdentity,
     prior_payload: dict[str, Any] | None = None,
+    monitoring_recovery_evidence: dict[str, object] | None = None,
 ) -> dict[str, Any] | None:
     payload = _snapshot_payload(snapshot_payload)
     if payload is None:
@@ -2027,7 +3036,21 @@ def _position_snapshot_payload(
         payload = dict(payload)
     normalized_exchange = str(exchange or "").strip().upper()
     payload = payload_with_position_identity(payload, identity=identity)
-    if holding is None or normalized_exchange not in {"NASD", "NYSE", "AMEX"}:
+    prior_sync = (
+        prior_payload.get("_position_sync")
+        if isinstance(prior_payload, dict)
+        else None
+    )
+    if holding is None:
+        if (
+            normalized_exchange in {"NASD", "NYSE", "AMEX"}
+            and isinstance(prior_sync, dict)
+            and prior_sync.get("monitoring_eligible") is False
+            and prior_sync.get("manual_review_required") is True
+        ):
+            payload["_position_sync"] = dict(prior_sync)
+        return payload
+    if normalized_exchange not in {"NASD", "NYSE", "AMEX"}:
         return payload
 
     reported_exchange = _holding_reported_exchange(holding.payload) or normalized_exchange
@@ -2048,15 +3071,11 @@ def _position_snapshot_payload(
             if reported_exchange in {"NASD", "NYSE", "AMEX"}
             else "unsupported_overseas_exchange"
         )
-    prior_sync = (
-        prior_payload.get("_position_sync")
-        if isinstance(prior_payload, dict)
-        else None
-    )
     if (
         isinstance(prior_sync, dict)
         and prior_sync.get("monitoring_eligible") is False
         and prior_sync.get("manual_review_required") is True
+        and monitoring_recovery_evidence is None
     ):
         position_sync["monitoring_eligible"] = False
         for key in (
@@ -2070,6 +3089,108 @@ def _position_snapshot_payload(
                 position_sync[key] = prior_sync[key]
     payload["_position_sync"] = position_sync
     return payload
+
+
+def _unpriced_kis_us_holding_recovery_evidence(
+    *,
+    settings: Settings,
+    snapshot: object,
+    holding: BrokerAccountHolding,
+    exchange: str,
+    prior_payload: dict[str, Any] | None,
+    evaluated_at: datetime,
+) -> dict[str, object] | None:
+    prior_sync = (
+        prior_payload.get("_position_sync")
+        if isinstance(prior_payload, dict)
+        else None
+    )
+    if not isinstance(prior_sync, dict) or not (
+        prior_sync.get("asset_class") == "us_equity"
+        and str(prior_sync.get("exchange") or "").strip().upper()
+        == str(exchange or "").strip().upper()
+        and prior_sync.get("monitoring_eligible") is False
+        and prior_sync.get("manual_review_required") is True
+        and prior_sync.get("manual_review_reason") == "unpriced_overseas_holding"
+    ):
+        return None
+    if (
+        prior_sync.get("trade_eligible") is False
+        or prior_sync.get("route_disposition") is not None
+    ):
+        return None
+    normalized_exchange = str(exchange or "").strip().upper()
+    if normalized_exchange not in {"NASD", "NYSE", "AMEX"}:
+        return None
+    if (
+        getattr(snapshot, "source", None) != "kis:us_equity_account_snapshot"
+        or getattr(snapshot, "holdings_complete", False) is not True
+        or getattr(snapshot, "open_orders_complete", False) is not True
+    ):
+        return None
+    snapshot_exchange = str(
+        (getattr(snapshot, "payload", None) or {}).get("exchange") or ""
+    ).strip().upper()
+    if snapshot_exchange != normalized_exchange:
+        return None
+    snapshot_observed_at = getattr(snapshot, "observed_at", None)
+    if not isinstance(snapshot_observed_at, datetime) or not snapshot_is_fresh_for_recovery(
+        observed_at=snapshot_observed_at,
+        now=evaluated_at,
+        settings=settings,
+    ):
+        return None
+    missing_latch_time = datetime.min.replace(tzinfo=UTC)
+    manual_review_recorded_at = _parse_timestamp(
+        prior_sync.get("manual_review_recorded_at"),
+        fallback=missing_latch_time,
+    )
+    if (
+        manual_review_recorded_at == missing_latch_time
+        or _utc_naive(snapshot_observed_at)
+        <= _utc_naive(manual_review_recorded_at)
+    ):
+        return None
+    reported_exchange = _holding_reported_exchange(holding.payload)
+    average_price = _parse_decimal(holding.average_price)
+    if (
+        reported_exchange != normalized_exchange
+        or holding.quantity <= 0
+        or average_price is None
+        or average_price <= 0
+    ):
+        return None
+    if (
+        holding.sellable_quantity is None
+        or holding.sellable_quantity <= 0
+        or holding.sellable_quantity > holding.quantity
+    ):
+        return None
+    holding_payload = holding.payload if isinstance(holding.payload, dict) else {}
+    current_price = _parse_decimal(holding_payload.get("now_pric2"))
+    if current_price is None or current_price <= 0:
+        return None
+    for field in ("now_pric", "current_price", "prpr", "last_price"):
+        if field not in holding_payload:
+            continue
+        corroborating_price = _parse_decimal(holding_payload[field])
+        if corroborating_price is None or corroborating_price != current_price:
+            return None
+    return {
+        "symbol": holding.symbol,
+        "exchange": normalized_exchange,
+        "snapshot_source": str(snapshot.source),
+        "snapshot_observed_at": snapshot_observed_at.isoformat(),
+        "holdings_complete": True,
+        "open_orders_complete": True,
+        "holding_quantity": holding.quantity,
+        "holding_average_price": str(average_price),
+        "current_price": str(current_price),
+        "current_price_field": "now_pric2",
+        "sellable_quantity": holding.sellable_quantity,
+        "prior_manual_review_reason": prior_sync.get("manual_review_reason"),
+        "manual_review_recorded_at": prior_sync.get("manual_review_recorded_at"),
+    }
 
 
 def _position_belongs_to_sync_scope(
