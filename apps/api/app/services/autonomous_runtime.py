@@ -39,8 +39,10 @@ from app.services.monitoring import (
     SELL_MONITORED_INTENTS,
     WATCH_BUY_INTENTS,
     _active_kis_position_filters,
+    _live_automated_quote_trust_reason_for_side,
     _load_positions_by_symbol,
     _maintain_post_entry_exit_monitors,
+    _quote_stale_reason,
     _sync_positions_for_monitoring_routes,
     list_autonomous_monitoring_symbols,
     run_autonomous_monitoring_cycle,
@@ -49,6 +51,8 @@ from app.services.monitoring import (
 from app.services.runtime_transitions import (
     ACTIVE_SELL_MONITORING_STATUSES,
     AGENT_ACTIVE_MONITORING_STATUSES,
+    SELL_TRIGGERED_BLOCKED_STATUSES,
+    SELL_TRIGGERED_PENDING_DISPATCH_STATUSES,
 )
 from app.services.nxt_eligibility import refresh_nxt_eligible_symbols
 from app.services.position_identity import (
@@ -1107,55 +1111,6 @@ class AutonomousRuntimeCoordinator:
             symbols=symbols,
             observed_at=started_at,
         )
-        if self.settings.monitoring_max_broker_actions_per_cycle <= 0:
-            payload = {
-                "status_code": 200,
-                "monitored_symbols": symbols,
-                "price_count": len(prices),
-                "price_source_configured": self._monitoring_price_source_state.configured,
-                "price_source": self._monitoring_price_source_state.snapshot(),
-                "runtime_snapshot": workset_snapshot.snapshot(),
-                "broker_actions_disabled": True,
-                "triggered_at": started_at.isoformat(),
-                "worker_name": MONITORING_LOOP_WORKER_NAME,
-                "evaluated_item_count": 0,
-                "triggered_item_count": 0,
-                "submitted_order_count": 0,
-                "blocked_item_count": 0,
-                "deferred_item_count": 0,
-                "evaluated_symbol_count": len(symbols),
-                "triggered_symbol_count": 0,
-                "submitted_symbols": [],
-                "protective_stop_coverage": {
-                    "status": "disabled",
-                    "unprotected_position_count": 0,
-                    "position_truth_stale_count": 0,
-                    "repaired_stop_coverage_count": 0,
-                    "affected_symbols": [],
-                    "affected_symbols_count": 0,
-                    "affected_symbols_truncated": False,
-                    "missing_quantities": {},
-                    "issues": [],
-                    "issues_count": 0,
-                    "issues_truncated": False,
-                },
-                "profit_target_coverage": {
-                    "status": "disabled",
-                    "missing_target_coverage_count": 0,
-                    "affected_symbols": [],
-                    "affected_symbols_count": 0,
-                    "affected_symbols_truncated": False,
-                    "missing_quantities": {},
-                    "issues": [],
-                    "issues_count": 0,
-                    "issues_truncated": False,
-                },
-                "items": [],
-                "memory_workset_fast_path": True,
-            }
-            self._store_cycle_payload(worker_key="monitoring", payload=payload)
-            return payload
-
         durably_unquoteable_symbols = _durably_unquoteable_symbols(
             self.monitoring_price_source
         )
@@ -1229,7 +1184,16 @@ class AutonomousRuntimeCoordinator:
                     }
                     self._store_cycle_payload(worker_key="monitoring", payload=payload)
                     return payload
-        if cached_payload["triggered_item_count"] == 0 and prices:
+        rearmable_sell_symbols = {
+            symbol
+            for symbol in cached_payload.get("rearmable_sell_symbols", [])
+            if isinstance(symbol, str) and symbol
+        }
+        if (
+            cached_payload["triggered_item_count"] == 0
+            and prices
+            and not rearmable_sell_symbols
+        ):
             payload = {
                 "status_code": 200,
                 "monitored_symbols": symbols,
@@ -1243,6 +1207,27 @@ class AutonomousRuntimeCoordinator:
                 payload["post_entry_maintenance_count"] = post_entry_maintenance_count
             if post_entry_review_count:
                 payload["post_entry_review_count"] = post_entry_review_count
+            if self.settings.monitoring_max_broker_actions_per_cycle <= 0:
+                payload["broker_actions_disabled"] = True
+            self._store_cycle_payload(worker_key="monitoring", payload=payload)
+            return payload
+
+        if (
+            not prices
+            and self.settings.monitoring_max_broker_actions_per_cycle <= 0
+        ):
+            payload = {
+                "status_code": 200,
+                "price_source_configured": self._monitoring_price_source_state.configured,
+                "price_source": self._monitoring_price_source_state.snapshot(),
+                "runtime_snapshot": workset_snapshot.snapshot(),
+                **cached_payload,
+                "monitored_symbols": monitored_symbols,
+                "price_count": 0,
+                "broker_action_symbols": [],
+                "broker_action_price_count": 0,
+                "broker_actions_disabled": True,
+            }
             self._store_cycle_payload(worker_key="monitoring", payload=payload)
             return payload
 
@@ -1294,6 +1279,9 @@ class AutonomousRuntimeCoordinator:
                 self._monitoring_next_no_price_db_check_at = (
                     started_at + MONITORING_NO_PRICE_DB_RESCAN_INTERVAL
                 )
+            submitted_symbols = _submitted_symbols_from_monitoring_payload(
+                result.payload
+            )
             payload = {
                 "status_code": result.status_code,
                 "price_source_configured": self._monitoring_price_source_state.configured,
@@ -1302,8 +1290,12 @@ class AutonomousRuntimeCoordinator:
                 **result.payload,
                 "monitored_symbols": monitored_symbols,
                 "price_count": 0,
-                "broker_action_symbols": symbols,
+                "broker_action_symbols": [
+                    symbol for symbol in symbols if symbol in submitted_symbols
+                ],
                 "broker_action_price_count": 0,
+                "broker_action_trace_scope": "confirmed_submissions",
+                "db_evaluation_symbols": symbols,
             }
             if post_entry_maintenance_count:
                 payload["pre_cached_post_entry_maintenance_count"] = (
@@ -1331,7 +1323,11 @@ class AutonomousRuntimeCoordinator:
             include_sells=False,
         )
         triggered_symbols = triggered_sell_symbols | triggered_buy_symbols
-        if triggered_symbols and self.settings.monitoring_max_broker_actions_per_cycle <= 0:
+        if (
+            triggered_symbols
+            and self.settings.monitoring_max_broker_actions_per_cycle <= 0
+            and not rearmable_sell_symbols
+        ):
             payload = {
                 "status_code": 200,
                 "monitored_symbols": symbols,
@@ -1344,10 +1340,16 @@ class AutonomousRuntimeCoordinator:
             }
             self._store_cycle_payload(worker_key="monitoring", payload=payload)
             return payload
-        if triggered_symbols:
+        db_evaluation_symbols = triggered_symbols | rearmable_sell_symbols
+        if db_evaluation_symbols:
             broker_action_limit = max(int(self.settings.monitoring_max_broker_actions_per_cycle), 1)
+            sell_evaluation_symbols = (
+                triggered_sell_symbols | rearmable_sell_symbols
+            )
             ordered_triggered_sell_symbols = [
-                symbol for symbol in symbols if symbol in triggered_sell_symbols
+                symbol
+                for symbol in symbols
+                if symbol in sell_evaluation_symbols
             ]
             ordered_triggered_buy_symbols = [
                 symbol for symbol in symbols if symbol in triggered_buy_symbols
@@ -1357,20 +1359,37 @@ class AutonomousRuntimeCoordinator:
                 *[
                     symbol
                     for symbol in ordered_triggered_buy_symbols
-                    if symbol not in triggered_sell_symbols
+                    if symbol not in sell_evaluation_symbols
                 ],
             ]
             symbols = ordered_triggered_symbols
-            prices = [price for price in prices if price.symbol in set(ordered_triggered_symbols)]
+            prices = [
+                price
+                for price in prices
+                if price.symbol in set(ordered_triggered_symbols)
+            ]
             with self._cycle_session_factory() as db:
                 adapter = self._broker_adapter_for_cycle()
                 result = run_autonomous_monitoring_cycle(
-                settings=self.settings,
-                db=db,
-                adapter=adapter,
-                prices=prices,
-                symbols=symbols,
-                now=started_at,
+                    settings=self.settings,
+                    db=db,
+                    adapter=adapter,
+                    prices=prices,
+                    symbols=symbols,
+                    now=started_at,
+                )
+            reported_rearm_symbols = result.payload.get("rearmed_sell_symbols")
+            confirmed_rearm_symbols = {
+                symbol
+                for symbol in (
+                    reported_rearm_symbols
+                    if isinstance(reported_rearm_symbols, list)
+                    else []
+                )
+                if isinstance(symbol, str) and symbol
+            }
+            submitted_symbols = _submitted_symbols_from_monitoring_payload(
+                result.payload
             )
             payload = {
                 "status_code": result.status_code,
@@ -1380,9 +1399,27 @@ class AutonomousRuntimeCoordinator:
                 **result.payload,
                 "monitored_symbols": monitored_symbols,
                 "price_count": monitored_price_count,
-                "broker_action_symbols": symbols,
-                "broker_action_price_count": len(prices),
+                "broker_action_symbols": [
+                    symbol for symbol in symbols if symbol in submitted_symbols
+                ],
+                "broker_action_price_count": len(
+                    {
+                        price.symbol
+                        for price in prices
+                        if price.symbol in submitted_symbols
+                    }
+                ),
+                "broker_action_trace_scope": "confirmed_submissions",
+                "db_evaluation_symbols": symbols,
+                "state_rearm_symbols": [
+                    symbol for symbol in symbols if symbol in confirmed_rearm_symbols
+                ],
+                "state_rearm_candidate_symbols": [
+                    symbol for symbol in symbols if symbol in rearmable_sell_symbols
+                ],
             }
+            if self.settings.monitoring_max_broker_actions_per_cycle <= 0:
+                payload["broker_actions_disabled"] = True
             if post_entry_maintenance_count:
                 payload["pre_cached_post_entry_maintenance_count"] = post_entry_maintenance_count
             if post_entry_review_count:
@@ -2324,6 +2361,7 @@ class AutonomousRuntimeCoordinator:
         triggered_symbols: set[str] = set()
         triggered_sell_symbols: set[str] = set()
         triggered_buy_symbols: set[str] = set()
+        rearmable_sell_symbols: set[str] = set()
         results: list[dict[str, object]] = []
         for item in runtime_snapshot.items:
             position = runtime_snapshot.positions_by_symbol.get(item.symbol)
@@ -2368,6 +2406,29 @@ class AutonomousRuntimeCoordinator:
                 outcome = "triggered"
             else:
                 outcome = "waiting"
+                quote_rejection_reason = None
+                if item.intent in {"stop_sell", "target_sell"}:
+                    quote_rejection_reason = _quote_stale_reason(
+                        settings=self.settings,
+                        price=price,
+                        cycle_at=started_at,
+                    ) or _live_automated_quote_trust_reason_for_side(
+                        settings=self.settings,
+                        provider=item.provider or "kis",
+                        side="sell",
+                        price=price,
+                    )
+                if (
+                    item.intent in {"stop_sell", "target_sell"}
+                    and observed_price is not None
+                    and quote_rejection_reason is None
+                    and item.status
+                    in (
+                        SELL_TRIGGERED_BLOCKED_STATUSES
+                        | SELL_TRIGGERED_PENDING_DISPATCH_STATUSES
+                    )
+                ):
+                    rearmable_sell_symbols.add(item.symbol)
             results.append(
                 {
                     "execution_plan_item_id": item.id,
@@ -2392,6 +2453,7 @@ class AutonomousRuntimeCoordinator:
             "triggered_symbols": sorted(triggered_symbols),
             "triggered_sell_symbols": sorted(triggered_sell_symbols),
             "triggered_buy_symbols": sorted(triggered_buy_symbols),
+            "rearmable_sell_symbols": sorted(rearmable_sell_symbols),
             "submitted_symbols": [],
             "protective_stop_coverage": {
                 "status": "cached",
@@ -2890,6 +2952,19 @@ def _triggered_symbols_from_cached_payload(
         if isinstance(symbol, str) and symbol:
             symbols.add(symbol)
     return symbols
+
+
+def _submitted_symbols_from_monitoring_payload(
+    payload: dict[str, object],
+) -> set[str]:
+    raw_symbols = payload.get("submitted_symbols")
+    if not isinstance(raw_symbols, list):
+        return set()
+    return {
+        symbol
+        for symbol in raw_symbols
+        if isinstance(symbol, str) and symbol
+    }
 
 
 def _parse_decimal(value: object) -> Decimal | None:

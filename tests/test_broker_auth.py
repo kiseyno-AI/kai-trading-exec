@@ -15,7 +15,7 @@ from sqlalchemy import event, select
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm.attributes import flag_modified
 
-from app.api.schemas.execution import PlaceOrderRequest
+from app.api.schemas.execution import MonitoringPriceRequest, PlaceOrderRequest
 from app.broker import alpaca as alpaca_module
 from app.broker import kis as kis_module
 from app.broker.base import (
@@ -9398,6 +9398,224 @@ def test_autonomous_monitoring_cycle_evaluates_watch_buy_without_position() -> N
     engine.dispose()
 
 
+def test_autonomous_monitoring_rearms_blocked_sell_only_from_trusted_fresh_quote() -> None:
+    started_at = datetime.now(UTC)
+
+    class MutableSellPriceSource:
+        trusted = False
+
+        def get_prices(
+            self,
+            *,
+            symbols: list[str],
+            observed_at: datetime,
+            settings: Settings,
+        ) -> list[MonitoringPriceRequest]:
+            del settings
+            if "005930" not in symbols:
+                return []
+            provenance = None
+            freshness_source = "unspecified"
+            if self.trusted:
+                freshness_source = "kis_exchange_orderbook_time"
+                provenance = {
+                    "field_sources": {
+                        "bid": {
+                            "freshness_source": freshness_source,
+                            "observed_at": observed_at.isoformat(),
+                        }
+                    }
+                }
+            return [
+                MonitoringPriceRequest(
+                    symbol="005930",
+                    price=Decimal("101"),
+                    bid=Decimal("101"),
+                    observed_at=observed_at,
+                    freshness_source=freshness_source,
+                    provenance=provenance,
+                )
+            ]
+
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="live",
+            configured=True,
+            api_base_url=KIS_LIVE_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(
+            broker_order_id="blocked-sell-must-not-submit"
+        ),
+        account_snapshot=BrokerAccountSnapshot(
+            available_cash=Decimal("0"),
+            observed_at=started_at,
+            source="stub:blocked-sell-rearm",
+            holdings=[
+                BrokerAccountHolding(
+                    symbol="005930",
+                    quantity=1,
+                    average_price=Decimal("100"),
+                )
+            ],
+        ),
+    )
+    price_source = MutableSellPriceSource()
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="live",
+            kis_app_key="live-key",
+            kis_app_secret="live-secret",
+            kis_account_number="12345678",
+            monitoring_max_broker_actions_per_cycle=0,
+            account_drawdown_gate_enabled=False,
+        ),
+        broker_adapter=broker_adapter,
+        monitoring_price_source=price_source,
+        autonomous_runtime_enabled=True,
+    )
+    route_risk, route_policy = _bound_kis_item_payloads(
+        settings=app.state.settings,
+        risk_context={"exchange": "KRX"},
+        quantity_policy={"kind": "shares", "quantity": 1},
+    )
+    with app.state.db_session_factory() as session:
+        plan = ExecutionPlan(
+            id="plan-cached-blocked-sell-rearm",
+            external_plan_id="plan-cached-blocked-sell-rearm",
+            source="test",
+            mode="live",
+            market_date=started_at.astimezone(ZoneInfo("Asia/Seoul")).date(),
+            accepted_at=started_at,
+            status="accepted",
+        )
+        session.add(plan)
+        session.add(
+            ExecutionPosition(
+                mode="live",
+                symbol="005930",
+                quantity=1,
+                average_price=Decimal("100"),
+                updated_from="reconciliation",
+                last_reconciled_at=started_at,
+                raw_payload={"source": "test"},
+            )
+        )
+        session.add_all(
+            [
+                ExecutionPlanItem(
+                    id="cached-blocked-stop",
+                    plan=plan,
+                    plan_item_index=0,
+                    symbol="005930",
+                    side="sell",
+                    intent="stop_sell",
+                    status="stop_sell_triggered_blocked",
+                    provider="kis",
+                    venue="krx",
+                    asset_class="stock",
+                    quantity_policy=dict(route_policy),
+                    risk_context=dict(route_risk),
+                    trigger_price=Decimal("100"),
+                    time_in_force="day",
+                ),
+                ExecutionPlanItem(
+                    id="cached-active-target",
+                    plan=plan,
+                    plan_item_index=1,
+                    symbol="005930",
+                    side="sell",
+                    intent="target_sell",
+                    status="target_sell_monitoring",
+                    provider="kis",
+                    venue="krx",
+                    asset_class="stock",
+                    quantity_policy=dict(route_policy),
+                    risk_context=dict(route_risk),
+                    trigger_price=Decimal("100"),
+                    time_in_force="day",
+                ),
+            ]
+        )
+        session.commit()
+
+    client = TestClient(app)
+    db_untrusted = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "untrusted quote must preserve the blocked sell latch",
+            "prices": [
+                {
+                    "symbol": "005930",
+                    "price": "101",
+                    "bid": "101",
+                    "observed_at": started_at.isoformat(),
+                    "freshness_source": "transport_received_at_untrusted",
+                }
+            ],
+        },
+    )
+
+    assert db_untrusted.status_code == 200
+    blocked_result = next(
+        item
+        for item in db_untrusted.json()["items"]
+        if item["execution_plan_item_id"] == "cached-blocked-stop"
+    )
+    assert blocked_result["outcome"] == "untrusted_quote_provenance"
+    assert blocked_result["status"] == "stop_sell_triggered_blocked"
+
+    untrusted = app.state.autonomous_runtime._monitoring_cycle_sync(started_at)
+
+    assert untrusted["submitted_order_count"] == 0
+    assert untrusted["rearmable_sell_symbols"] == []
+    with app.state.db_session_factory() as session:
+        assert (
+            session.get(ExecutionPlanItem, "cached-blocked-stop").status
+            == "stop_sell_triggered_blocked"
+        )
+
+    price_source.trusted = True
+    recovered_at = started_at + timedelta(seconds=1)
+    recovered = app.state.autonomous_runtime._monitoring_cycle_sync(recovered_at)
+
+    assert recovered["submitted_order_count"] == 0
+    assert recovered["broker_action_symbols"] == []
+    assert recovered["broker_action_price_count"] == 0
+    assert recovered["broker_actions_disabled"] is True
+    assert recovered["db_evaluation_symbols"] == ["005930"]
+    assert recovered["state_rearm_symbols"] == ["005930"]
+    assert recovered["state_rearm_candidate_symbols"] == ["005930"]
+    assert recovered["rearmed_sell_monitor_count"] == 1
+    assert recovered["rearmed_sell_symbols"] == ["005930"]
+    assert broker_adapter.order_calls == []
+    with app.state.db_session_factory() as session:
+        stop = session.get(ExecutionPlanItem, "cached-blocked-stop")
+        target = session.get(ExecutionPlanItem, "cached-active-target")
+        assert stop.status == "stop_sell_monitoring"
+        assert target.status == "target_sell_triggered_pending_dispatch"
+        assert stop.risk_context["last_monitoring_event"] == {
+            "event": "sell_monitor_rearmed",
+            "reason": "trigger_condition_cleared",
+            "previous_status": "stop_sell_triggered_blocked",
+            "observed_price": "101.0000",
+            "trigger_price": "100.0000",
+            "recorded_at": recovered_at.isoformat(),
+        }
+    cached_stop = next(
+        item
+        for item in app.state.autonomous_runtime._monitoring_runtime_snapshot.items
+        if item.id == "cached-blocked-stop"
+    )
+    assert cached_stop.status == "stop_sell_monitoring"
+
+    engine.dispose()
+
+
 def test_live_autonomous_monitoring_does_not_retry_blocked_watch_buy_without_quote() -> None:
     broker_adapter = StubBrokerAdapter(
         config=BrokerConfig(
@@ -15128,7 +15346,9 @@ def test_monitoring_evaluate_triggers_profit_protection_after_peak_giveback() ->
     engine.dispose()
 
 
-def test_autonomous_retry_preserves_profit_protection_trigger_metadata() -> None:
+def test_autonomous_retry_preserves_profit_protection_trigger_metadata(
+    monkeypatch,
+) -> None:
     broker_adapter = StubBrokerAdapter(
         config=BrokerConfig(
             provider="kis",
@@ -15246,12 +15466,105 @@ def test_autonomous_retry_preserves_profit_protection_trigger_metadata() -> None
             == "profit_protection_trailing_stop"
         )
 
+        stale = run_autonomous_monitoring_cycle(
+            settings=app.state.settings,
+            db=session,
+            adapter=broker_adapter,
+            prices=[
+                MonitoringPriceRequest(
+                    symbol="005930",
+                    price=Decimal("101700.00"),
+                    observed_at=datetime(2026, 5, 27, 1, 0, tzinfo=UTC),
+                )
+            ],
+            now=datetime(2026, 5, 27, 1, 6, tzinfo=UTC),
+        )
+
+        assert stale.payload["submitted_order_count"] == 0
+        session.refresh(profit_item)
+        assert profit_item.status == "target_sell_triggered_pending_dispatch"
+        assert profit_item.risk_context["last_monitoring_event"]["reason"] == "stale_quote"
+        assert profit_item.risk_context["last_monitoring_event"][
+            "persisted_profit_protection_trigger"
+        ]["reason"] == "profit_protection_trailing_stop"
+
+        repeated_stale = run_autonomous_monitoring_cycle(
+            settings=app.state.settings,
+            db=session,
+            adapter=broker_adapter,
+            prices=[
+                MonitoringPriceRequest(
+                    symbol="005930",
+                    price=Decimal("101700.00"),
+                    observed_at=datetime(2026, 5, 27, 1, 0, tzinfo=UTC),
+                )
+            ],
+            now=datetime(2026, 5, 27, 1, 7, tzinfo=UTC),
+        )
+
+        assert repeated_stale.payload["submitted_order_count"] == 0
+        session.refresh(profit_item)
+        assert profit_item.risk_context["last_monitoring_event"][
+            "persisted_profit_protection_trigger"
+        ]["reason"] == "profit_protection_trailing_stop"
+
+        original_place_monitoring_order = monitoring_service._place_monitoring_order
+        monkeypatch.setattr(
+            monitoring_service,
+            "_place_monitoring_order",
+            lambda **kwargs: SimpleNamespace(
+                status_code=202,
+                payload={
+                    "deferred": True,
+                    "message": "regular_session_not_open",
+                    "route": {"next_retry_at": "2026-05-27T01:09:00+00:00"},
+                },
+            ),
+        )
+        deferred = run_autonomous_monitoring_cycle(
+            settings=app.state.settings,
+            db=session,
+            adapter=broker_adapter,
+            prices=[],
+            now=datetime(2026, 5, 27, 1, 8, tzinfo=UTC),
+        )
+
+        assert deferred.payload["submitted_order_count"] == 0
+        assert deferred.payload["deferred_item_count"] == 1
+        session.refresh(profit_item)
+        assert profit_item.risk_context["last_monitoring_event"]["event"] == (
+            "monitoring_order_deferred"
+        )
+        assert profit_item.risk_context["last_monitoring_event"][
+            "persisted_profit_protection_trigger"
+        ]["reason"] == "profit_protection_trailing_stop"
+
+        repeated_deferred = run_autonomous_monitoring_cycle(
+            settings=app.state.settings,
+            db=session,
+            adapter=broker_adapter,
+            prices=[],
+            now=datetime(2026, 5, 27, 1, 9, tzinfo=UTC),
+        )
+
+        assert repeated_deferred.payload["submitted_order_count"] == 0
+        assert repeated_deferred.payload["deferred_item_count"] == 1
+        session.refresh(profit_item)
+        assert profit_item.risk_context["last_monitoring_event"][
+            "persisted_profit_protection_trigger"
+        ]["reason"] == "profit_protection_trailing_stop"
+        monkeypatch.setattr(
+            monitoring_service,
+            "_place_monitoring_order",
+            original_place_monitoring_order,
+        )
+
         retry = run_autonomous_monitoring_cycle(
             settings=app.state.settings,
             db=session,
             adapter=broker_adapter,
             prices=[],
-            now=datetime(2026, 5, 27, 1, 6, tzinfo=UTC),
+            now=datetime(2026, 5, 27, 1, 10, tzinfo=UTC),
         )
 
         assert retry.payload["submitted_order_count"] == 1
@@ -19825,6 +20138,74 @@ def test_live_monitoring_sell_rechecks_executable_bid_after_position_reservation
         assert persisted is not None
         assert persisted.status == f"{intent}_monitoring"
     engine.dispose()
+
+
+def test_profit_protection_no_price_retry_restores_live_sell_trigger_binding() -> None:
+    triggered_at = datetime(2026, 9, 9, 1, 0, tzinfo=UTC)
+    item = ExecutionPlanItem(
+        id="profit-protect-retry-live-boundary",
+        symbol="005930",
+        side="sell",
+        intent="target_sell",
+        status="target_sell_triggered_pending_dispatch",
+        provider="kis",
+        asset_class="stock",
+        trigger_price=Decimal("110000"),
+        risk_context={"exchange": "KRX"},
+    )
+
+    metadata = monitoring_service._monitoring_order_metadata(
+        item=item,
+        observed_price=None,
+        trigger_reason="profit_protection_trailing_stop",
+        trigger_metadata={
+            "last_observed_price": "101700.0000",
+            "peak_price": "103000.0000",
+            "peak_profit_pct": "3.0000",
+            "current_profit_pct": "1.7000",
+            "giveback_pct": "1.3000",
+        },
+        triggered_at=triggered_at,
+        deterministic_sell_quantity_cap=2,
+    )
+
+    assert metadata["monitoring_sell_trigger_binding"] == {
+        "version": 1,
+        "execution_plan_item_id": item.id,
+        "symbol": item.symbol,
+        "intent": item.intent,
+        "trigger_reason": "profit_protection_trailing_stop",
+        "direction": "at_or_below",
+        "trigger_price": "101700.0000",
+    }
+    command = PlaceOrderRequest(
+        idempotency_key="profit-protection-no-price-live-boundary-order",
+        execution_plan_item_id=item.id,
+        provider="kis",
+        asset_class="stock",
+        symbol=item.symbol,
+        side="sell",
+        quantity=2,
+        order_type="market",
+        exchange="KRX",
+        metadata=metadata,
+    )
+    assert (
+        broker_orders_service._final_monitoring_sell_trigger_failure(
+            command=command,
+            plan_item=item,
+            executable_bid=Decimal("101600"),
+        )
+        is None
+    )
+    assert broker_orders_service._final_monitoring_sell_trigger_failure(
+        command=command,
+        plan_item=item,
+        executable_bid=Decimal("101800"),
+    ) == (
+        "live_sell_trigger_not_met",
+        "fresh executable bid no longer satisfies the persisted sell trigger",
+    )
 
 
 def test_live_sell_boundary_rejects_bid_without_field_provenance() -> None:
