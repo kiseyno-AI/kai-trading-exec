@@ -2064,8 +2064,13 @@ def test_trigger_time_missing_account_context_delays_without_agent_call(
     engine.dispose()
 
 
+@pytest.mark.parametrize(
+    "initial_target_status",
+    ["target_sell_monitoring", "target_sell_triggered_blocked"],
+)
 def test_trigger_time_sell_agent_can_adjust_quantity_limit_and_stop(
     monkeypatch: pytest.MonkeyPatch,
+    initial_target_status: str,
 ) -> None:
     app, engine, client, broker_adapter, captured = _build_trigger_agent_app(
         monkeypatch=monkeypatch,
@@ -2113,6 +2118,9 @@ def test_trigger_time_sell_agent_can_adjust_quantity_limit_and_stop(
     assert plan_response.status_code == 201
     target_item_id, stop_item_id = plan_response.json()["persisted_execution_item_ids"]
     with app.state.db_session_factory() as session:
+        target_item = session.get(ExecutionPlanItem, target_item_id)
+        assert target_item is not None
+        target_item.status = initial_target_status
         session.add(
                 _scoped_execution_position(
                     app,

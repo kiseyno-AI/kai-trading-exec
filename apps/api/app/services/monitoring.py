@@ -3173,10 +3173,6 @@ def _evaluate_monitoring_cycle(
             continue
 
         action = symbol_actions.popleft()
-        if action.item.status in (
-            BLOCKED_MONITORING_STATUSES | PENDING_DISPATCH_MONITORING_STATUSES
-        ):
-            action.item.status = _monitoring_status(action.item.intent)
         if action.item.status in AGENT_ACTIVE_STATUSES:
             blocked_item_count += 1
             result_by_item_id[action.item.id] = _monitoring_result_payload(
@@ -3691,6 +3687,7 @@ def _evaluate_monitoring_cycle(
                     message=placement.payload.get("message"),
                 )
             elif placement.payload.get("duplicate") is True:
+                dispatch_action_count -= 1
                 duplicate_quantity = _serialized_order_quantity(placement.payload.get("order"))
                 if is_watch_buy:
                     duplicate_status = _serialized_order_status(
@@ -3704,12 +3701,28 @@ def _evaluate_monitoring_cycle(
                         )
                         if broker_truth_status is not None:
                             action.item.status = broker_truth_status
-                elif duplicate_quantity is not None:
-                    _reserve_remaining_quantity(
-                        remaining_quantities_by_symbol=remaining_quantities_by_symbol,
-                        symbol=action.item.symbol,
-                        quantity=duplicate_quantity,
+                else:
+                    duplicate_status = _serialized_order_status(
+                        placement.payload.get("order")
                     )
+                    if (
+                        duplicate_status in CAPITAL_RESERVING_ORDER_STATUSES
+                        or duplicate_status
+                        == NormalizedBrokerOrderStatus.FILLED.value
+                    ):
+                        broker_truth_status = _plan_item_status_from_order_payload(
+                            placement.payload.get("order")
+                        )
+                        if broker_truth_status is not None:
+                            action.item.status = broker_truth_status
+                        if duplicate_quantity is not None:
+                            _reserve_remaining_quantity(
+                                remaining_quantities_by_symbol=(
+                                    remaining_quantities_by_symbol
+                                ),
+                                symbol=action.item.symbol,
+                                quantity=duplicate_quantity,
+                            )
                 result_by_item_id[action.item.id] = _monitoring_result_payload(
                     item=action.item,
                     observed_price=action.observed_price,
@@ -4405,6 +4418,7 @@ def _claim_trigger_time_agent_action(
         _pending_dispatch_status(item.intent),
         "watch_buy_triggered",
         "watch_buy_triggered_blocked",
+        *SELL_TRIGGERED_BLOCKED_STATUSES,
     }
     local_recovery_event = local_risk_context.get("last_monitoring_event")
     recovered_agent_state_is_claimable = bool(

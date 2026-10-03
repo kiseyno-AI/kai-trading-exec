@@ -9678,6 +9678,197 @@ def test_live_autonomous_monitoring_does_not_retry_blocked_watch_buy_without_quo
     engine.dispose()
 
 
+@pytest.mark.parametrize(
+    (
+        "duplicate_order_status",
+        "expected_item_status",
+        "expected_placement_intents",
+    ),
+    [
+        (
+            "rejected",
+            "stop_sell_triggered_blocked",
+            ["stop_sell", "target_sell"],
+        ),
+        ("submitted", "broker_order_submitted", ["stop_sell"]),
+        ("cancel_pending", "cancel_pending", ["stop_sell"]),
+    ],
+)
+def test_no_price_duplicate_sell_retry_follows_durable_order_truth(
+    monkeypatch: pytest.MonkeyPatch,
+    duplicate_order_status: str,
+    expected_item_status: str,
+    expected_placement_intents: list[str],
+) -> None:
+    retry_at = datetime(2026, 10, 3, 21, 41, 24, tzinfo=UTC)
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="live",
+            configured=True,
+            api_base_url=KIS_LIVE_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(
+            broker_order_id="must-not-submit-no-price-duplicate"
+        ),
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="live",
+            kis_app_key="live-key",
+            kis_app_secret="live-secret",
+            kis_account_number="12345678",
+            monitoring_max_broker_actions_per_cycle=1,
+            account_drawdown_gate_enabled=False,
+        ),
+        broker_adapter=broker_adapter,
+    )
+    prior_event = {
+        "event": "sell_quote_rejected",
+        "reason": "stale_quote",
+        "message": "quote is stale",
+        "observed_price": "99.0000",
+        "recorded_at": (retry_at - timedelta(minutes=1)).isoformat(),
+    }
+    route_risk, route_policy = _bound_kis_item_payloads(
+        settings=app.state.settings,
+        risk_context={
+            "exchange": "KRX",
+            "monitoring_events": [prior_event],
+            "last_monitoring_event": prior_event,
+        },
+        quantity_policy={"kind": "shares", "quantity": 1},
+    )
+    item_id = "no-price-duplicate-blocked-stop"
+    sibling_item_id = "no-price-duplicate-blocked-target"
+    with app.state.db_session_factory() as session:
+        plan = ExecutionPlan(
+            external_plan_id="plan-no-price-duplicate-blocked-stop",
+            source="test",
+            mode="live",
+            market_date=retry_at.astimezone(ZoneInfo("Asia/Seoul")).date(),
+            accepted_at=retry_at,
+            status="accepted",
+        )
+        session.add(plan)
+        session.add(
+            ExecutionPosition(
+                mode="live",
+                symbol="005930",
+                quantity=1,
+                average_price=Decimal("101"),
+                updated_from="reconciliation",
+                last_reconciled_at=retry_at,
+                raw_payload={"source": "test"},
+            )
+        )
+        session.add(
+            ExecutionPlanItem(
+                id=item_id,
+                plan=plan,
+                plan_item_index=0,
+                symbol="005930",
+                side="sell",
+                intent="stop_sell",
+                status="stop_sell_triggered_blocked",
+                provider="kis",
+                venue="krx",
+                asset_class="stock",
+                quantity_policy=route_policy,
+                risk_context=route_risk,
+                trigger_price=Decimal("100"),
+                time_in_force="day",
+            )
+        )
+        session.add(
+            ExecutionPlanItem(
+                id=sibling_item_id,
+                plan=plan,
+                plan_item_index=1,
+                symbol="005930",
+                side="sell",
+                intent="target_sell",
+                status="target_sell_triggered_blocked",
+                provider="kis",
+                venue="krx",
+                asset_class="stock",
+                quantity_policy=dict(route_policy),
+                risk_context=dict(route_risk),
+                trigger_price=Decimal("102"),
+                time_in_force="day",
+            )
+        )
+        session.commit()
+
+    placement_intents: list[str] = []
+
+    def place_monitoring_order(**kwargs: object) -> SimpleNamespace:
+        item = kwargs["item"]
+        assert isinstance(item, ExecutionPlanItem)
+        placement_intents.append(item.intent)
+        if item.intent == "stop_sell":
+            return SimpleNamespace(
+                status_code=200,
+                payload={
+                    "duplicate": True,
+                    "message": "existing order attempt",
+                    "order": {"status": duplicate_order_status, "quantity": 1},
+                },
+            )
+        return SimpleNamespace(
+            status_code=409,
+            payload={
+                "block_reason": "test_sibling_block",
+                "message": "sibling reached placement without a false reservation",
+            },
+        )
+
+    monkeypatch.setattr(
+        monitoring_service,
+        "_place_monitoring_order",
+        place_monitoring_order,
+    )
+
+    with app.state.db_session_factory() as session:
+        result = run_autonomous_monitoring_cycle(
+            settings=app.state.settings,
+            db=session,
+            adapter=broker_adapter,
+            prices=[],
+            symbols=["005930"],
+            now=retry_at,
+        )
+        persisted = session.get(ExecutionPlanItem, item_id)
+        checkpoint = session.scalar(select(MonitoringCheckpoint))
+
+        assert result.payload["submitted_order_count"] == 0
+        assert result.payload["triggered_item_count"] == 2
+        assert result.payload["rearmed_sell_monitor_count"] == 0
+        assert result.payload["rearmed_sell_symbols"] == []
+        item_result = next(
+            item
+            for item in result.payload["items"]
+            if item["execution_plan_item_id"] == item_id
+        )
+        assert item_result["outcome"] == "duplicate"
+        assert persisted is not None
+        assert persisted.status == expected_item_status
+        assert persisted.risk_context["last_monitoring_event"] == prior_event
+        assert all(
+            event.get("event") != "sell_monitor_rearmed"
+            for event in persisted.risk_context["monitoring_events"]
+        )
+        assert checkpoint is not None
+        assert checkpoint.details["retried_triggered_item_count"] == 2
+        assert checkpoint.details["retried_triggered_symbols"] == ["005930"]
+
+    assert placement_intents == expected_placement_intents
+    assert broker_adapter.order_calls == []
+    engine.dispose()
+
+
 def test_watch_buy_drawdown_gate_disabled_releases_prior_block_and_submits() -> None:
     app, engine, client, broker_adapter = _build_watch_buy_test_app(
         order_id="kis-watch-buy-drawdown-release-1"

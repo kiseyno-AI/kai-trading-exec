@@ -171,6 +171,8 @@ BROKER_ORDER_TO_PLAN_ITEM_STATUS = {
     NormalizedBrokerOrderStatus.OPEN.value: "open",
     NormalizedBrokerOrderStatus.PARTIALLY_FILLED.value: "partially_filled",
     NormalizedBrokerOrderStatus.FILLED.value: "filled",
+    NormalizedBrokerOrderStatus.CANCEL_PENDING.value: "cancel_pending",
+    NormalizedBrokerOrderStatus.CANCELED.value: "canceled",
     NormalizedBrokerOrderStatus.REJECTED.value: "broker_order_rejected",
     NormalizedBrokerOrderStatus.RETRY_PENDING.value: "broker_order_retry_pending",
     NormalizedBrokerOrderStatus.FAILED.value: "broker_order_failed",
