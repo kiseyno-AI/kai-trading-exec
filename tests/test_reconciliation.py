@@ -4060,6 +4060,106 @@ def test_reconcile_stale_retry_pending_without_broker_id_is_failed_to_reconcile(
     engine.dispose()
 
 
+def test_reconcile_stale_missing_id_does_not_downgrade_filled_plan_sibling() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        stale_broker_order_reconciliation_threshold_seconds=3600,
+    )
+    engine, db = _session(settings)
+    stale_submitted_at = datetime.now(UTC) - timedelta(days=5)
+    plan, item, filled_order = _plan_backed_order(
+        settings=settings,
+        plan_id="plan-stale-retry-with-filled-sibling",
+        side="sell",
+        intent="stop_sell",
+        broker_order_id="filled-retry-successor",
+        status="filled",
+    )
+    item.status = "filled"
+    stale_retry = BrokerOrder(
+        plan_item=item,
+        broker_name="kis",
+        mode="paper",
+        idempotency_key="stale-retry-before-filled-successor",
+        broker_order_id=None,
+        symbol=item.symbol,
+        side="sell",
+        status="retry_pending",
+        quantity=2,
+        submitted_at=stale_submitted_at,
+        last_broker_sync_at=stale_submitted_at,
+        request_metadata=filled_order.request_metadata,
+    )
+    db.add_all([plan, stale_retry])
+    db.commit()
+
+    reconcile_stale_nonterminal_broker_orders(
+        settings=settings,
+        db=db,
+        adapter=ReconciliationStubBroker(),
+    )
+
+    db.refresh(item)
+    db.refresh(stale_retry)
+    assert stale_retry.status == "manual_review_required"
+    assert item.status == "filled"
+    engine.dispose()
+
+
+@pytest.mark.parametrize("scope_drift", ["mode", "broker", "account"])
+def test_authoritative_plan_sibling_outcome_rejects_scope_drift(
+    scope_drift: str,
+) -> None:
+    settings = Settings(database_url="sqlite:///:memory:", runtime_mode="paper")
+    engine, db = _session(settings)
+    plan, item, sibling = _plan_backed_order(
+        settings=settings,
+        plan_id=f"sibling-outcome-{scope_drift}-drift",
+        side="sell",
+        intent="stop_sell",
+        status="filled",
+    )
+    candidate_metadata = dict(sibling.request_metadata)
+    candidate_scope = dict(candidate_metadata["execution_scope"])
+    candidate_metadata["execution_scope"] = candidate_scope
+    sibling_scope = dict(candidate_scope)
+    sibling.request_metadata = {
+        **sibling.request_metadata,
+        "execution_scope": sibling_scope,
+    }
+    if scope_drift == "mode":
+        sibling.mode = "live"
+    elif scope_drift == "broker":
+        sibling.broker_name = "alpaca"
+        sibling_scope["provider"] = "alpaca"
+    else:
+        sibling_scope["account_scope"] = "b" * 24
+    candidate = BrokerOrder(
+        plan_item=item,
+        broker_name="kis",
+        mode="paper",
+        idempotency_key=f"scope-drift-candidate-{scope_drift}",
+        symbol="005930",
+        side="sell",
+        status="retry_pending",
+        quantity=2,
+        venue=sibling.venue,
+        asset_class=sibling.asset_class,
+        request_metadata=candidate_metadata,
+    )
+    db.add_all([plan, candidate, sibling])
+    db.commit()
+
+    outcome = reconciliation_service._authoritative_plan_sibling_outcome_status(
+        db=db,
+        order=candidate,
+    )
+
+    assert outcome is None
+    engine.dispose()
+
+
 def test_reconcile_stale_orders_dry_run_summarizes_repairs_without_mutating() -> None:
     settings = Settings(
         database_url="sqlite:///:memory:",
@@ -5135,6 +5235,266 @@ def test_reconcile_stale_blocks_plan_group_with_outcome_bearing_sibling(
     assert candidate.status == "manual_review_required"
     assert plan_item.status == "manual_review_required"
     assert db.scalars(select(RuntimeRemediationEvent)).all() == []
+    engine.dispose()
+
+
+def _verified_retry_successor_settings() -> Settings:
+    return Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="live",
+        kis_app_key="test-app-key",
+        kis_app_secret="test-app-secret",
+        kis_account_number="12342504",
+        kis_account_product_code="01",
+        stale_broker_order_reconciliation_threshold_seconds=3600,
+    )
+
+
+def _persist_verified_retry_successor(db):
+    candidate_at = datetime(2026, 5, 28, tzinfo=UTC)
+    rearmed_at = datetime(2026, 5, 29, 2, 57, tzinfo=UTC)
+    successor_at = datetime(2026, 5, 29, 3, tzinfo=UTC)
+    plan = ExecutionPlan(
+        external_plan_id="legacy-verified-retry-successor-plan",
+        source="test",
+        mode="live",
+        market_date=candidate_at.date(),
+    )
+    plan_item = ExecutionPlanItem(
+        plan=plan,
+        plan_item_index=0,
+        symbol="033530",
+        side="sell",
+        intent="stop_sell",
+        status="broker_order_failed",
+        quantity_policy={"kind": "shares", "quantity": 58},
+        risk_context={
+            "monitoring_events": [
+                {
+                    "event": "protective_stop_rearmed",
+                    "reason": "retryable_session_rejection",
+                    "prior_status": "broker_order_retry_pending",
+                    "recorded_at": rearmed_at.isoformat(),
+                }
+            ]
+        },
+    )
+    db.add(plan)
+    db.flush()
+    candidate_key = f"monitoring:stop_sell:{plan_item.id}"
+    candidate = BrokerOrder(
+        plan_item=plan_item,
+        broker_name="kis",
+        mode="live",
+        idempotency_key=candidate_key,
+        symbol="033530",
+        side="sell",
+        status="manual_review_required",
+        quantity=58,
+        created_at=candidate_at,
+        last_broker_sync_at=candidate_at,
+        last_error_classification="missing_broker_order_id",
+        last_error_code="APBK0918",
+        request_metadata={
+            "provider": "kis",
+            "endpoint": "/uapi/domestic-stock/v1/trading/order-cash",
+            "method": "POST",
+            "tr_id": "TTTC0011U",
+            "account_number_masked": "****2504",
+            "route": {"exchange": "KRX"},
+        },
+    )
+    candidate.events.append(
+        BrokerOrderEvent(
+            event_type="submit_failed",
+            normalized_status="retry_pending",
+            broker_status="APBK0918",
+            error_classification="transient",
+            retryable=True,
+            observed_at=candidate_at + timedelta(seconds=1),
+        )
+    )
+    successor = BrokerOrder(
+        plan_item=plan_item,
+        broker_name="kis",
+        mode="live",
+        idempotency_key=f"{candidate_key}:2026-05-29",
+        broker_order_id="0023934900",
+        symbol="033530",
+        side="sell",
+        status="filled",
+        quantity=58,
+        submitted_at=successor_at,
+        created_at=successor_at,
+        request_metadata={"provider": "kis"},
+        response_metadata={"account_number_masked": "****2504"},
+    )
+    successor.fills.append(
+        ExecutionFill(
+            broker_fill_id="verified-retry-successor-fill",
+            symbol="033530",
+            side="sell",
+            quantity=58,
+            price=Decimal("7540"),
+            filled_at=successor_at,
+        )
+    )
+    db.add_all([candidate, successor])
+    db.commit()
+    return plan_item, candidate, successor
+
+
+def test_reconcile_stale_resolves_exact_filled_retry_successor_and_restores_plan_outcome() -> None:
+    settings = _verified_retry_successor_settings()
+    engine, db = _session(settings)
+    plan_item, candidate, successor = _persist_verified_retry_successor(db)
+    broker = ReconciliationStubBroker(
+        account_snapshot=BrokerAccountSnapshot(
+            observed_at=datetime.now(UTC),
+            source="kis:account_snapshot",
+            holdings_complete=True,
+            open_orders_complete=True,
+            payload={
+                "exchange": "KRX",
+                "account_number_masked": "****2504",
+            },
+        )
+    )
+
+    dry_run = reconcile_stale_nonterminal_broker_orders(
+        settings=settings,
+        db=db,
+        adapter=broker,
+        dry_run=True,
+        include_legacy_manual_review=True,
+    )
+    item = dry_run["legacy_manual_review_resolution"]["items"][0]
+    assert item["eligible"] is True
+    assert item["resolution_context"] == "verified_filled_retry_successor"
+    assert item["verified_retry_successor"]["broker_order_pk"] == successor.id
+
+    result = reconcile_stale_nonterminal_broker_orders(
+        settings=settings,
+        db=db,
+        adapter=broker,
+        actor="ops-desk",
+        operator_reason="retire exact legacy retry predecessor",
+        manual_review_approvals={candidate.id: item["evidence_fingerprint"]},
+        include_legacy_manual_review=True,
+    )
+
+    db.refresh(candidate)
+    db.refresh(plan_item)
+    remediation = db.scalar(
+        select(RuntimeRemediationEvent).where(
+            RuntimeRemediationEvent.subject_id == candidate.id
+        )
+    )
+    assert result["legacy_manual_review_resolution"]["resolved_order_count"] == 1
+    assert candidate.status == "stale_terminal_unknown"
+    assert plan_item.status == "filled"
+    assert remediation is not None
+    assert remediation.evidence_summary["historical_outcome"] == "unknown"
+    assert remediation.evidence_summary["verified_retry_successor"][
+        "broker_order_pk"
+    ] == successor.id
+    assert broker.order_calls == []
+    engine.dispose()
+
+
+def test_verified_retry_successor_rejects_mismatched_failure_code() -> None:
+    settings = _verified_retry_successor_settings()
+    engine, db = _session(settings)
+    plan_item, candidate, successor = _persist_verified_retry_successor(db)
+    failure = candidate.events[0]
+    failure.broker_status = "DIFFERENT_ERROR"
+
+    result = reconciliation_service._verified_legacy_manual_review_retry_successor(
+        settings=settings,
+        order=candidate,
+        plan_item=plan_item,
+        outcome_bearing_siblings=[successor],
+        fills_by_order_id={successor.id: list(successor.fills)},
+        events_by_order_id={candidate.id: [failure]},
+    )
+
+    assert result is None
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    "evidence_drift",
+    [
+        "account_mask",
+        "provider",
+        "idempotency_date",
+        "rearm_chronology",
+        "fill_sum",
+        "nonpositive_fill",
+        "multiple_outcome_siblings",
+    ],
+)
+def test_verified_retry_successor_rejects_lineage_drift(
+    evidence_drift: str,
+) -> None:
+    settings = _verified_retry_successor_settings()
+    engine, db = _session(settings)
+    plan_item, candidate, successor = _persist_verified_retry_successor(db)
+    siblings = [successor]
+    if evidence_drift == "account_mask":
+        successor.response_metadata = {"account_number_masked": "****9999"}
+    elif evidence_drift == "provider":
+        successor.request_metadata = {"provider": "alpaca"}
+    elif evidence_drift == "idempotency_date":
+        successor.idempotency_key = (
+            f"monitoring:stop_sell:{plan_item.id}:2026-05-30"
+        )
+    elif evidence_drift == "rearm_chronology":
+        plan_item.risk_context = {
+            "monitoring_events": [
+                {
+                    "event": "protective_stop_rearmed",
+                    "reason": "retryable_session_rejection",
+                    "prior_status": "broker_order_retry_pending",
+                    "recorded_at": datetime(
+                        2026,
+                        5,
+                        29,
+                        3,
+                        1,
+                        tzinfo=UTC,
+                    ).isoformat(),
+                }
+            ]
+        }
+    elif evidence_drift == "fill_sum":
+        successor.fills[0].quantity = 57
+    elif evidence_drift == "nonpositive_fill":
+        successor.fills[0].quantity = 59
+        successor.fills.append(
+            ExecutionFill(
+                broker_fill_id="invalid-negative-fill",
+                symbol="033530",
+                side="sell",
+                quantity=-1,
+                price=Decimal("7540"),
+                filled_at=successor.submitted_at,
+            )
+        )
+    elif evidence_drift == "multiple_outcome_siblings":
+        siblings = [successor, successor]
+
+    result = reconciliation_service._verified_legacy_manual_review_retry_successor(
+        settings=settings,
+        order=candidate,
+        plan_item=plan_item,
+        outcome_bearing_siblings=siblings,
+        fills_by_order_id={successor.id: list(successor.fills)},
+        events_by_order_id={candidate.id: list(candidate.events)},
+    )
+
+    assert result is None
+    db.rollback()
     engine.dispose()
 
 

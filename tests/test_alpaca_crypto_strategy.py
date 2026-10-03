@@ -25,10 +25,12 @@ from app.models.runtime import (
     CryptoStrategyRiskState,
     CryptoStrategyState,
     ExecutionFill,
+    RuntimeRemediationEvent,
 )
 from app.services.alpaca_crypto_strategy import (
     AlpacaCryptoStrategyService,
     _asset_increments,
+    _broker_truth_proves_legacy_strategy_flat,
     _daily_rebalance_order_key,
     _latest_closed_bar_is_fresh,
     _order_key,
@@ -1211,6 +1213,276 @@ def test_legacy_unscoped_strategy_authority_allows_only_scoped_protection(
         assert db.query(CryptoStrategyDecision).count() == int(
             legacy_kind == "decision"
         )
+
+
+def test_verified_flat_snapshot_releases_legacy_strategy_authority_without_rebinding() -> None:
+    observed_at = datetime(2026, 8, 16, 0, 5, tzinfo=UTC)
+    settings = _settings(
+        alpaca_crypto_allowed_symbols="BTC/USD",
+        alpaca_crypto_strategy_decision_minute_utc=10,
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    service = AlpacaCryptoStrategyService(
+        settings=settings,
+        session_factory=session_factory,
+    )
+    coordinator_scope, _ = _execution_scopes(settings)
+    legacy_state = CryptoStrategyState(
+        mode="paper",
+        provider="alpaca",
+        account_scope=None,
+        strategy_family=None,
+        strategy_version="crypto_trend_v1",
+        symbol="BTC/USD",
+        eligible=True,
+        target_fraction=Decimal("0.40"),
+        strategy_owned_base_quantity=Decimal("1"),
+        high_water_price=Decimal("120"),
+        protective_stop_price=Decimal("100"),
+    )
+    legacy_risk = CryptoStrategyRiskState(
+        mode="paper",
+        provider="alpaca",
+        account_scope=None,
+        strategy_family=None,
+        strategy_version="crypto_trend_v1",
+        risk_status="healthy",
+    )
+    legacy_decision = CryptoStrategyDecision(
+        mode="paper",
+        provider="alpaca",
+        account_scope=None,
+        strategy_family=None,
+        strategy_version="crypto_trend_v1",
+        symbol="BTC/USD",
+        decision_bar_at=observed_at - timedelta(days=1),
+        decided_at=observed_at - timedelta(days=1),
+        action="buy",
+        decision_status="submitted",
+        eligible=True,
+        target_fraction=Decimal("0.40"),
+    )
+    legacy_order = BrokerOrder(
+        broker_name="alpaca",
+        mode="paper",
+        idempotency_key="legacy-flat-strategy-order",
+        broker_order_id="legacy-flat-strategy-order",
+        symbol="BTC/USD",
+        side="buy",
+        status="filled",
+        base_quantity=Decimal("1"),
+        venue="alpaca",
+        asset_class="crypto",
+        request_metadata={
+            "source": "alpaca_crypto_strategy:daily_rebalance",
+        },
+    )
+    with session_factory() as db:
+        db.add_all(
+            [legacy_state, legacy_risk, legacy_decision, legacy_order]
+        )
+        db.commit()
+
+    result = service.run_cycle(
+        adapter=FakeStrategyAdapter(observed_at=observed_at),  # type: ignore[arg-type]
+        access_token="test",
+        quotes={"BTC/USD": _quotes(observed_at)["BTC/USD"]},
+        observed_at=observed_at,
+        execution_scope=coordinator_scope,
+    )
+
+    assert result["status"] == "risk_blocked"
+    assert result["reasons"] == ["weekly_baseline_warmup"]
+    assert result["daily_decision"]["status"] == "not_due"
+    with session_factory() as db:
+        persisted_legacy_state = db.get(CryptoStrategyState, legacy_state.id)
+        assert persisted_legacy_state is not None
+        assert persisted_legacy_state.account_scope is None
+        assert persisted_legacy_state.strategy_family is None
+        assert persisted_legacy_state.strategy_owned_base_quantity == Decimal(
+            "1.000000000000"
+        )
+        persisted_legacy_order = db.get(BrokerOrder, legacy_order.id)
+        assert persisted_legacy_order is not None
+        assert persisted_legacy_order.request_metadata == {
+            "source": "alpaca_crypto_strategy:daily_rebalance",
+        }
+        current_state = db.query(CryptoStrategyState).filter_by(
+            account_scope=coordinator_scope["account_scope"],
+            strategy_family="crypto:ALPACA",
+            symbol="BTC/USD",
+        ).one()
+        assert current_state.strategy_owned_base_quantity == Decimal("0E-12")
+        assert current_state.protective_stop_price is None
+        current_risk = db.query(CryptoStrategyRiskState).filter_by(
+            account_scope=coordinator_scope["account_scope"],
+            strategy_family="crypto:ALPACA",
+        ).one()
+        assert current_risk.risk_status == "blocked_entries"
+        assert current_risk.risk_reasons == ["weekly_baseline_warmup"]
+        recovery = db.query(RuntimeRemediationEvent).filter_by(
+            candidate_type="legacy_strategy_authority",
+            outcome="verified_flat_authority_retired",
+        ).one()
+        assert recovery.actor == "alpaca_strategy_recovery"
+        assert recovery.evidence_summary["account_scope"] == coordinator_scope[
+            "account_scope"
+        ]
+        assert recovery.evidence_summary["strategy_family"] == "crypto:ALPACA"
+        assert recovery.evidence_summary["symbols"] == ["BTC/USD"]
+        assert recovery.evidence_summary["legacy_state_ids"] == [legacy_state.id]
+        assert recovery.evidence_summary["legacy_risk_state_ids"] == [
+            legacy_risk.id
+        ]
+        assert recovery.evidence_summary["legacy_decision_ids"] == [
+            legacy_decision.id
+        ]
+        assert recovery.evidence_summary["legacy_order_ids"] == [legacy_order.id]
+
+    nonflat_after_recovery = service.run_cycle(
+        adapter=FakeStrategyAdapter(
+            observed_at=observed_at + timedelta(seconds=1),
+            holdings=[
+                BrokerAccountHolding(
+                    symbol="BTC/USD",
+                    quantity=0,
+                    payload={"base_quantity": "0.25"},
+                )
+            ],
+        ),  # type: ignore[arg-type]
+        access_token="test",
+        quotes={
+            "BTC/USD": _quotes(observed_at + timedelta(seconds=1))["BTC/USD"]
+        },
+        observed_at=observed_at + timedelta(seconds=1),
+        execution_scope=coordinator_scope,
+    )
+
+    assert nonflat_after_recovery.get("reason") != (
+        "legacy_strategy_scope_requires_manual_review"
+    )
+    with session_factory() as db:
+        assert db.query(RuntimeRemediationEvent).filter_by(
+            candidate_type="legacy_strategy_authority",
+            outcome="verified_flat_authority_retired",
+        ).count() == 1
+        drifted = db.get(CryptoStrategyState, legacy_state.id)
+        assert drifted is not None
+        drifted.target_fraction = Decimal("0.50")
+        db.commit()
+
+    drifted_result = service.run_cycle(
+        adapter=FakeStrategyAdapter(
+            observed_at=observed_at + timedelta(seconds=2),
+            holdings=[
+                BrokerAccountHolding(
+                    symbol="BTC/USD",
+                    quantity=0,
+                    payload={"base_quantity": "0.25"},
+                )
+            ],
+        ),  # type: ignore[arg-type]
+        access_token="test",
+        quotes={
+            "BTC/USD": _quotes(observed_at + timedelta(seconds=2))["BTC/USD"]
+        },
+        observed_at=observed_at + timedelta(seconds=2),
+        execution_scope=coordinator_scope,
+    )
+
+    assert drifted_result["status"] == "blocked"
+    assert drifted_result["reason"] == (
+        "legacy_strategy_scope_requires_manual_review"
+    )
+
+
+def test_verified_flat_snapshot_keeps_nonterminal_legacy_order_blocked() -> None:
+    observed_at = datetime(2026, 8, 16, 0, 5, tzinfo=UTC)
+    settings = _settings(
+        alpaca_crypto_allowed_symbols="BTC/USD",
+        alpaca_crypto_strategy_decision_minute_utc=10,
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    service = AlpacaCryptoStrategyService(
+        settings=settings,
+        session_factory=session_factory,
+    )
+    coordinator_scope, _ = _execution_scopes(settings)
+    with session_factory() as db:
+        db.add(
+            BrokerOrder(
+                broker_name="alpaca",
+                mode="paper",
+                idempotency_key="legacy-active-strategy-order",
+                broker_order_id="legacy-active-strategy-order",
+                symbol="BTC/USD",
+                side="buy",
+                status="open",
+                base_quantity=Decimal("1"),
+                venue="alpaca",
+                asset_class="crypto",
+                request_metadata={
+                    "source": "alpaca_crypto_strategy:daily_rebalance",
+                },
+            )
+        )
+        db.commit()
+
+    result = service.run_cycle(
+        adapter=FakeStrategyAdapter(observed_at=observed_at),  # type: ignore[arg-type]
+        access_token="test",
+        quotes={"BTC/USD": _quotes(observed_at)["BTC/USD"]},
+        observed_at=observed_at,
+        execution_scope=coordinator_scope,
+    )
+
+    assert result["status"] == "blocked"
+    assert result["reason"] == "legacy_strategy_scope_requires_manual_review"
+
+
+def test_legacy_strategy_flat_recovery_requires_fresh_complete_broker_truth() -> None:
+    observed_at = datetime(2026, 8, 16, 0, 5, tzinfo=UTC)
+    terminal_order = BrokerOrder(
+        broker_name="alpaca",
+        mode="paper",
+        idempotency_key="legacy-terminal-order",
+        symbol="BTC/USD",
+        side="buy",
+        status="filled",
+        base_quantity=Decimal("1"),
+        venue="alpaca",
+        asset_class="crypto",
+    )
+    fresh_snapshot = FakeStrategyAdapter(
+        observed_at=observed_at
+    ).get_account_snapshot()
+    incomplete_snapshot = FakeStrategyAdapter(
+        observed_at=observed_at,
+        open_orders_complete=False,
+    ).get_account_snapshot()
+
+    assert _broker_truth_proves_legacy_strategy_flat(
+        snapshot=fresh_snapshot,
+        observed_at=observed_at,
+        symbols=("BTC/USD",),
+        legacy_orders=[terminal_order],
+    )
+    assert not _broker_truth_proves_legacy_strategy_flat(
+        snapshot=fresh_snapshot,
+        observed_at=observed_at + timedelta(seconds=301),
+        symbols=("BTC/USD",),
+        legacy_orders=[terminal_order],
+    )
+    assert not _broker_truth_proves_legacy_strategy_flat(
+        snapshot=incomplete_snapshot,
+        observed_at=observed_at,
+        symbols=("BTC/USD",),
+        legacy_orders=[terminal_order],
+    )
 
 
 def test_strategy_revalidates_coordinator_scope_against_own_snapshot() -> None:

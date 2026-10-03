@@ -26,8 +26,15 @@ from app.models.runtime import (
     CryptoStrategyDecision,
     CryptoStrategyRiskState,
     CryptoStrategyState,
+    RuntimeRemediationEvent,
 )
 from app.services.broker_orders import place_broker_order
+from app.services.alpaca_legacy_strategy_recovery import (
+    has_active_alpaca_us_legacy_strategy_recovery,
+    legacy_strategy_authority_fingerprint,
+    legacy_strategy_authority_orders,
+    recovered_alpaca_us_strategy_inventory,
+)
 from app.services.crypto_trend_strategy import (
     DailyBar,
     PortfolioAllocation,
@@ -223,6 +230,8 @@ class AlpacaCryptoStrategyService:
             legacy_strategy_authority = _has_legacy_strategy_authority(
                 settings=self.settings,
                 db=db,
+                snapshot=snapshot,
+                observed_at=observed_at,
                 symbols=symbols,
                 asset_class=self.asset_class,
                 order_origin=self.order_origin,
@@ -237,7 +246,7 @@ class AlpacaCryptoStrategyService:
                 strategy_family=self.strategy_family,
                 create_missing=not legacy_strategy_authority,
             )
-            _refresh_strategy_owned_quantities(
+            inventory_integrity_reason = _refresh_strategy_owned_quantities(
                 settings=self.settings,
                 db=db,
                 states=states,
@@ -246,7 +255,27 @@ class AlpacaCryptoStrategyService:
                 order_origin=self.order_origin,
                 strategy_family=self.strategy_family,
                 route_scope=route_scope,
+                legacy_strategy_authority=legacy_strategy_authority,
+                observed_at=observed_at,
             )
+            if inventory_integrity_reason is not None:
+                db.rollback()
+                return self._remember({
+                    "enabled": True,
+                    "status": "blocked",
+                    "reason": inventory_integrity_reason,
+                    "strategy_version": self.settings.alpaca_crypto_strategy_version,
+                    "strategy_family": self.strategy_family,
+                    "asset_class": self.asset_class,
+                    "mode": self.settings.runtime_mode,
+                    "observed_at": observed_at.isoformat(),
+                    "quote_health": quote_health,
+                    "protective_actions": [],
+                    "daily_decision": {
+                        "status": "blocked",
+                        "reason": inventory_integrity_reason,
+                    },
+                })
             protective_actions = self._run_protective_exits(
                 db=db,
                 adapter=adapter,
@@ -666,7 +695,11 @@ class AlpacaCryptoStrategyService:
                 continue
             state.eligible = feature.eligible
             state.target_fraction = target_weight
+            prior_state_metrics = (
+                state.metrics if isinstance(state.metrics, dict) else {}
+            )
             state.metrics = {
+                **prior_state_metrics,
                 **_feature_payload(feature),
                 "quantity_increment": _decimal_text(increment),
                 "strategy_capital": _decimal_text(strategy_capital),
@@ -985,6 +1018,8 @@ def _has_legacy_strategy_authority(
     *,
     settings: Settings,
     db: Session,
+    snapshot: BrokerAccountSnapshot,
+    observed_at: datetime,
     symbols: tuple[str, ...],
     asset_class: str,
     order_origin: str,
@@ -993,8 +1028,8 @@ def _has_legacy_strategy_authority(
 ) -> bool:
     # A strategy-version bump cannot restore the account/family attribution
     # missing from quarantined rows, so legacy authority remains version-agnostic.
-    if db.scalar(
-        select(CryptoStrategyState.id).where(
+    legacy_states = db.scalars(
+        select(CryptoStrategyState).where(
             CryptoStrategyState.mode == settings.runtime_mode,
             CryptoStrategyState.provider == PROVIDER,
             or_(
@@ -1003,21 +1038,9 @@ def _has_legacy_strategy_authority(
             ),
             CryptoStrategyState.symbol.in_(symbols),
         )
-    ) is not None:
-        return True
-    if db.scalar(
-        select(CryptoStrategyRiskState.id).where(
-            CryptoStrategyRiskState.mode == settings.runtime_mode,
-            CryptoStrategyRiskState.provider == PROVIDER,
-            or_(
-                CryptoStrategyRiskState.account_scope.is_(None),
-                CryptoStrategyRiskState.strategy_family.is_(None),
-            ),
-        )
-    ) is not None:
-        return True
-    if db.scalar(
-        select(CryptoStrategyDecision.id).where(
+    ).all()
+    legacy_decisions = db.scalars(
+        select(CryptoStrategyDecision).where(
             CryptoStrategyDecision.mode == settings.runtime_mode,
             CryptoStrategyDecision.provider == PROVIDER,
             or_(
@@ -1026,11 +1049,30 @@ def _has_legacy_strategy_authority(
             ),
             CryptoStrategyDecision.symbol.in_(symbols),
         )
-    ) is not None:
-        return True
+    ).all()
+    relevant_legacy_versions = {
+        *(row.strategy_version for row in legacy_states),
+        *(row.strategy_version for row in legacy_decisions),
+    }
+    risk_query = select(CryptoStrategyRiskState).where(
+        CryptoStrategyRiskState.mode == settings.runtime_mode,
+        CryptoStrategyRiskState.provider == PROVIDER,
+        or_(
+            CryptoStrategyRiskState.account_scope.is_(None),
+            CryptoStrategyRiskState.strategy_family.is_(None),
+        ),
+    )
+    if relevant_legacy_versions:
+        risk_query = risk_query.where(
+            CryptoStrategyRiskState.strategy_version.in_(
+                relevant_legacy_versions
+            )
+        )
+    legacy_risk_states = db.scalars(risk_query).all()
 
     orders = db.scalars(
         select(BrokerOrder)
+        .options(selectinload(BrokerOrder.fills))
         .where(
             BrokerOrder.mode == settings.runtime_mode,
             BrokerOrder.broker_name == PROVIDER,
@@ -1038,33 +1080,148 @@ def _has_legacy_strategy_authority(
             BrokerOrder.symbol.in_(symbols),
         )
     ).all()
-    expected_scope = _execution_scope_payload(route_scope)
-    for order in orders:
-        request_metadata = (
-            order.request_metadata
-            if isinstance(order.request_metadata, dict)
-            else {}
+    legacy_orders = legacy_strategy_authority_orders(
+        orders=orders,
+        order_origin=order_origin,
+        strategy_family=strategy_family,
+        route_scope=route_scope,
+    )
+
+    if not (
+        legacy_states
+        or legacy_risk_states
+        or legacy_decisions
+        or legacy_orders
+    ):
+        return False
+
+    evidence_fingerprint = legacy_strategy_authority_fingerprint(
+        states=legacy_states,
+        risk_states=legacy_risk_states,
+        decisions=legacy_decisions,
+        orders=legacy_orders,
+    )
+    candidate_key = _legacy_strategy_authority_candidate_key(
+        account_scope=route_scope.account_scope,
+        strategy_family=strategy_family,
+        evidence_fingerprint=evidence_fingerprint,
+    )
+    retired = db.scalar(
+        select(RuntimeRemediationEvent.id).where(
+            RuntimeRemediationEvent.mode == settings.runtime_mode,
+            RuntimeRemediationEvent.candidate_type
+            == "legacy_strategy_authority",
+            RuntimeRemediationEvent.candidate_key == candidate_key,
+            RuntimeRemediationEvent.outcome
+            == "verified_flat_authority_retired",
         )
-        source = str(request_metadata.get("source") or "")
-        if not (
-            source == order_origin or source.startswith(f"{order_origin}:")
-        ):
-            continue
-        stored_route = fifo_route_scope_from_order(order)
-        if stored_route is None:
-            return True
-        if stored_route != route_scope:
-            continue
-        command_metadata = request_metadata.get("metadata")
-        command_metadata = (
-            command_metadata if isinstance(command_metadata, dict) else {}
+    )
+    if retired is not None:
+        return False
+
+    if has_active_alpaca_us_legacy_strategy_recovery(
+        settings=settings,
+        db=db,
+        account_scope=route_scope.account_scope,
+        strategy_family=strategy_family,
+        symbols=symbols,
+        authority_fingerprint=evidence_fingerprint,
+    ):
+        return False
+
+    if not _broker_truth_proves_legacy_strategy_flat(
+        snapshot=snapshot,
+        observed_at=observed_at,
+        symbols=symbols,
+        legacy_orders=legacy_orders,
+    ):
+        return True
+
+    db.add(
+        RuntimeRemediationEvent(
+            mode=settings.runtime_mode,
+            candidate_type="legacy_strategy_authority",
+            candidate_key=candidate_key,
+            subject_id=route_scope.account_scope,
+            outcome="verified_flat_authority_retired",
+            actor="alpaca_strategy_recovery",
+            reason=(
+                "complete authenticated broker truth proved every strategy "
+                "symbol flat with no open orders"
+            ),
+            evidence_summary={
+                "evidence_fingerprint": evidence_fingerprint,
+                "provider": route_scope.provider,
+                "account_scope": route_scope.account_scope,
+                "strategy_family": strategy_family,
+                "symbols": sorted(symbols),
+                "broker_snapshot_observed_at": snapshot.observed_at.isoformat(),
+                "holdings_complete": snapshot.holdings_complete,
+                "open_orders_complete": snapshot.open_orders_complete,
+                "legacy_state_ids": sorted(row.id for row in legacy_states),
+                "legacy_risk_state_ids": sorted(
+                    row.id for row in legacy_risk_states
+                ),
+                "legacy_decision_ids": sorted(
+                    row.id for row in legacy_decisions
+                ),
+                "legacy_order_ids": sorted(row.id for row in legacy_orders),
+            },
         )
-        if (
-            command_metadata.get("strategy_family") != strategy_family
-            or command_metadata.get("expected_execution_scope") != expected_scope
-        ):
-            return True
+    )
+    db.flush()
     return False
+
+
+def _broker_truth_proves_legacy_strategy_flat(
+    *,
+    snapshot: BrokerAccountSnapshot,
+    observed_at: datetime,
+    symbols: tuple[str, ...],
+    legacy_orders: list[BrokerOrder],
+) -> bool:
+    snapshot_age_seconds = (
+        _as_utc(observed_at) - _as_utc(snapshot.observed_at)
+    ).total_seconds()
+    if not (
+        -ALPACA_QUOTE_MAX_FUTURE_SKEW_SECONDS
+        <= snapshot_age_seconds
+        <= ALPACA_ACCOUNT_SNAPSHOT_MAX_AGE_SECONDS
+    ):
+        return False
+    if not snapshot.holdings_complete or not snapshot.open_orders_complete:
+        return False
+    if not _open_orders_coverage_is_complete(snapshot):
+        return False
+    canonical_symbols = {_canonical_snapshot_symbol(symbol) for symbol in symbols}
+    holdings = _holdings_by_symbol(snapshot)
+    if any(
+        _holding_base_quantity(holdings.get(symbol)) != 0
+        for symbol in canonical_symbols
+    ):
+        return False
+    if any(
+        _canonical_snapshot_symbol(order.symbol) in canonical_symbols
+        for order in snapshot.open_orders
+    ):
+        return False
+    return all(
+        str(order.status or "").strip().lower()
+        in PROTECTIVE_EXIT_TERMINAL_STATUSES
+        for order in legacy_orders
+    )
+
+
+def _legacy_strategy_authority_candidate_key(
+    *,
+    account_scope: str,
+    strategy_family: str,
+    evidence_fingerprint: str,
+) -> str:
+    scope_digest = sha256(
+        f"{account_scope}|{strategy_family}".encode("utf-8")
+    ).hexdigest()[:24]
+    return f"{scope_digest}:{evidence_fingerprint}"
 
 
 def _refresh_strategy_owned_quantities(
@@ -1077,10 +1234,12 @@ def _refresh_strategy_owned_quantities(
     order_origin: str,
     strategy_family: str,
     route_scope: FifoRouteScope,
-) -> None:
+    legacy_strategy_authority: bool,
+    observed_at: datetime,
+) -> str | None:
     symbols = tuple(states)
     if not symbols:
-        return
+        return None
     orders = db.scalars(
         select(BrokerOrder)
         .options(selectinload(BrokerOrder.fills))
@@ -1091,6 +1250,26 @@ def _refresh_strategy_owned_quantities(
             BrokerOrder.symbol.in_(symbols),
         )
     ).all()
+    recovered_quantities, recovery_reason = (
+        recovered_alpaca_us_strategy_inventory(
+            settings=settings,
+            db=db,
+            states=states,
+            snapshot=snapshot,
+            orders=orders,
+            route_scope=route_scope,
+            order_origin=order_origin,
+            strategy_family=strategy_family,
+            authority_released=not legacy_strategy_authority,
+            observed_at=observed_at,
+        )
+    )
+    if recovery_reason is not None:
+        return recovery_reason
+    if recovered_quantities is not None:
+        for symbol, state in states.items():
+            state.strategy_owned_base_quantity = recovered_quantities[symbol]
+        return None
     totals = {symbol: Decimal("0") for symbol in symbols}
     for order in orders:
         if not _is_strategy_attributable_order(
@@ -1118,6 +1297,7 @@ def _refresh_strategy_owned_quantities(
         ledger_quantity = max(totals.get(symbol, Decimal("0")), Decimal("0"))
         broker_quantity = _holding_base_quantity(holdings.get(symbol))
         state.strategy_owned_base_quantity = min(ledger_quantity, broker_quantity)
+    return None
 
 
 def _is_strategy_attributable_order(
