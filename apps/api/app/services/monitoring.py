@@ -2596,6 +2596,8 @@ def _evaluate_monitoring_cycle(
     deferred_item_count = 0
     dispatch_action_count = 0
     retried_triggered_item_count = 0
+    rearmed_sell_monitor_count = 0
+    rearmed_sell_symbols: set[str] = set()
     watch_buy_cash_reservation: WatchBuyCashReservation | str | None = None
     drawdown_recovery_sources_by_scope: dict[str, BrokerOrder | None] = {}
 
@@ -2734,33 +2736,49 @@ def _evaluate_monitoring_cycle(
             quote_rejection_reason = quote_stale_reason or quote_trust_reason
             if quote_rejection_reason is not None:
                 blocked_item_count += 1
+                persisted_profit_protection = (
+                    _persisted_profit_protection_trigger(item)
+                    if item.status
+                    in (
+                        BLOCKED_MONITORING_STATUSES
+                        | PENDING_DISPATCH_MONITORING_STATUSES
+                    )
+                    else None
+                )
                 monitoring_status = _monitoring_status(item.intent)
                 if (
-                    item.status != "watch_buy_triggered_blocked"
+                    item.status
+                    not in (
+                        BLOCKED_MONITORING_STATUSES
+                        | PENDING_DISPATCH_MONITORING_STATUSES
+                    )
                     and item.status != monitoring_status
                 ):
                     item.status = monitoring_status
-                _record_monitoring_event(
-                    item=item,
-                    event={
-                        "event": (
-                            "watch_buy_quote_rejected"
-                            if _is_watch_buy_item(item)
-                            else "sell_quote_rejected"
-                        ),
-                        "reason": (
-                            "stale_quote"
-                            if quote_stale_reason is not None
-                            else "untrusted_quote_provenance"
-                        ),
-                        "message": quote_rejection_reason,
-                        "observed_price": _serialize_decimal(observed_price),
-                        "observed_at": _serialize_datetime(
-                            _provided_price_observed_at(price)
-                        ),
-                        "recorded_at": triggered_at.isoformat(),
-                    },
-                )
+                rejection_event: dict[str, object] = {
+                    "event": (
+                        "watch_buy_quote_rejected"
+                        if _is_watch_buy_item(item)
+                        else "sell_quote_rejected"
+                    ),
+                    "reason": (
+                        "stale_quote"
+                        if quote_stale_reason is not None
+                        else "untrusted_quote_provenance"
+                    ),
+                    "message": quote_rejection_reason,
+                    "observed_price": _serialize_decimal(observed_price),
+                    "observed_at": _serialize_datetime(
+                        _provided_price_observed_at(price)
+                    ),
+                    "recorded_at": triggered_at.isoformat(),
+                }
+                if persisted_profit_protection is not None:
+                    rejection_event["persisted_profit_protection_trigger"] = {
+                        "reason": persisted_profit_protection.reason,
+                        "metadata": persisted_profit_protection.metadata,
+                    }
+                _record_monitoring_event(item=item, event=rejection_event)
                 result_by_item_id[item.id] = _monitoring_result_payload(
                     item=item,
                     observed_price=observed_price,
@@ -2857,18 +2875,45 @@ def _evaluate_monitoring_cycle(
                 continue
 
         if trigger_reason is None:
+            previous_status = item.status
+            rearmable_sell_status = (
+                item.intent in SELL_MONITORED_INTENTS
+                and previous_status
+                in (
+                    SELL_TRIGGERED_BLOCKED_STATUSES
+                    | SELL_TRIGGERED_PENDING_DISPATCH_STATUSES
+                )
+            )
             if (
-                item.status
+                previous_status
                 in (BLOCKED_MONITORING_STATUSES | PENDING_DISPATCH_MONITORING_STATUSES)
-                and item.status != "watch_buy_triggered_blocked"
+                and previous_status != "watch_buy_triggered_blocked"
             ):
                 item.status = _monitoring_status(item.intent)
-            result_by_item_id[item.id] = _monitoring_result_payload(
+            if rearmable_sell_status and item.status != previous_status:
+                rearmed_sell_monitor_count += 1
+                rearmed_sell_symbols.add(item.symbol)
+                _record_monitoring_event(
+                    item=item,
+                    event={
+                        "event": "sell_monitor_rearmed",
+                        "reason": "trigger_condition_cleared",
+                        "previous_status": previous_status,
+                        "observed_price": _serialize_decimal(observed_price),
+                        "trigger_price": _serialize_decimal(item.trigger_price),
+                        "recorded_at": triggered_at.isoformat(),
+                    },
+                )
+            waiting_result = _monitoring_result_payload(
                 item=item,
                 observed_price=observed_price,
                 outcome="waiting",
                 message="trigger condition not met",
             )
+            if rearmable_sell_status and item.status != previous_status:
+                waiting_result["state_transition"] = "sell_monitor_rearmed"
+                waiting_result["previous_status"] = previous_status
+            result_by_item_id[item.id] = waiting_result
             continue
 
         if _is_watch_buy_item(item) and observed_price is not None:
@@ -3054,6 +3099,8 @@ def _evaluate_monitoring_cycle(
             "triggered_symbol_count": len(triggered_symbols),
             "retried_triggered_item_count": retried_triggered_item_count,
             "retried_triggered_symbols": sorted(retried_triggered_symbols),
+            "rearmed_sell_monitor_count": rearmed_sell_monitor_count,
+            "rearmed_sell_symbols": sorted(rearmed_sell_symbols),
             "submitted_symbols": [],
             "backlog_item_count": deferred_item_count,
             "backlog_symbols": sorted(backlog_symbols),
@@ -3102,6 +3149,10 @@ def _evaluate_monitoring_cycle(
                 "deferred_item_count": deferred_item_count,
                 "evaluated_symbol_count": checkpoint_details["evaluated_symbol_count"],
                 "triggered_symbol_count": checkpoint_details["triggered_symbol_count"],
+                "rearmed_sell_monitor_count": checkpoint_details[
+                    "rearmed_sell_monitor_count"
+                ],
+                "rearmed_sell_symbols": checkpoint_details["rearmed_sell_symbols"],
                 "submitted_symbols": [],
                 "protective_stop_coverage": checkpoint_details["protective_stop_coverage"],
                 "protective_stop_actionability": checkpoint_details["protective_stop_actionability"],
@@ -3572,16 +3623,22 @@ def _evaluate_monitoring_cycle(
             elif placement.status_code == 202 and placement.payload.get("deferred") is True:
                 deferred_item_count += 1
                 action.item.status = _pending_dispatch_status(action.item.intent)
-                _record_monitoring_event(
-                    item=action.item,
-                    event={
-                        "event": "monitoring_order_deferred",
-                        "reason": placement.payload.get("message"),
-                        "route": placement.payload.get("route"),
-                        "observed_price": _serialize_decimal(action.observed_price),
-                        "recorded_at": triggered_at.isoformat(),
-                    },
-                )
+                deferred_event: dict[str, object] = {
+                    "event": "monitoring_order_deferred",
+                    "reason": placement.payload.get("message"),
+                    "route": placement.payload.get("route"),
+                    "observed_price": _serialize_decimal(action.observed_price),
+                    "recorded_at": triggered_at.isoformat(),
+                }
+                if (
+                    action.trigger_reason in PROFIT_PROTECTION_TRIGGER_REASONS
+                    and isinstance(action.trigger_metadata, dict)
+                ):
+                    deferred_event["persisted_profit_protection_trigger"] = {
+                        "reason": action.trigger_reason,
+                        "metadata": dict(action.trigger_metadata),
+                    }
+                _record_monitoring_event(item=action.item, event=deferred_event)
                 db.commit()
                 result_by_item_id[action.item.id] = _monitoring_result_payload(
                     item=action.item,
@@ -3742,6 +3799,8 @@ def _evaluate_monitoring_cycle(
         "triggered_symbol_count": len(triggered_symbols),
         "retried_triggered_item_count": retried_triggered_item_count,
         "retried_triggered_symbols": sorted(retried_triggered_symbols),
+        "rearmed_sell_monitor_count": rearmed_sell_monitor_count,
+        "rearmed_sell_symbols": sorted(rearmed_sell_symbols),
         "submitted_symbols": sorted(submitted_symbols),
         "backlog_item_count": deferred_item_count,
         "backlog_symbols": sorted(backlog_symbols),
@@ -3799,6 +3858,10 @@ def _evaluate_monitoring_cycle(
             "deferred_item_count": deferred_item_count,
             "evaluated_symbol_count": checkpoint_details["evaluated_symbol_count"],
             "triggered_symbol_count": checkpoint_details["triggered_symbol_count"],
+            "rearmed_sell_monitor_count": checkpoint_details[
+                "rearmed_sell_monitor_count"
+            ],
+            "rearmed_sell_symbols": checkpoint_details["rearmed_sell_symbols"],
             "submitted_symbols": checkpoint_details["submitted_symbols"],
             "protective_stop_coverage": checkpoint_details["protective_stop_coverage"],
             "protective_stop_actionability": checkpoint_details["protective_stop_actionability"],
@@ -11238,6 +11301,18 @@ def _persisted_profit_protection_trigger(
     last_event = risk_context.get("last_monitoring_event")
     if not isinstance(last_event, dict):
         return None
+    persisted_trigger = last_event.get("persisted_profit_protection_trigger")
+    if isinstance(persisted_trigger, dict):
+        persisted_reason = persisted_trigger.get("reason")
+        persisted_metadata = persisted_trigger.get("metadata")
+        if (
+            persisted_reason in PROFIT_PROTECTION_TRIGGER_REASONS
+            and isinstance(persisted_metadata, dict)
+        ):
+            return ProfitProtectionDecision(
+                reason=str(persisted_reason),
+                metadata=dict(persisted_metadata),
+            )
     reason = last_event.get("reason")
     if reason not in PROFIT_PROTECTION_TRIGGER_REASONS:
         return None
@@ -11845,26 +11920,45 @@ def _live_automated_quote_trust_reason(
     item: ExecutionPlanItem,
     price: MonitoringPriceRequest | None,
 ) -> str | None:
-    if settings.runtime_mode != "live":
-        return None
     if not (_is_watch_buy_item(item) or item.side == "sell"):
         return None
     provider = str(item.provider or "kis").strip().lower()
-    if provider not in {"kis", "korea_investment", "korea-investment"}:
-        return None
     side = "buy" if _is_watch_buy_item(item) else "sell"
+    return _live_automated_quote_trust_reason_for_side(
+        settings=settings,
+        provider=provider,
+        side=side,
+        price=price,
+    )
+
+
+def _live_automated_quote_trust_reason_for_side(
+    *,
+    settings: Settings,
+    provider: str,
+    side: str,
+    price: MonitoringPriceRequest | None,
+) -> str | None:
+    if settings.runtime_mode != "live":
+        return None
+    normalized_provider = provider.strip().lower()
+    if normalized_provider not in {"kis", "korea_investment", "korea-investment"}:
+        return None
+    normalized_side = side.strip().lower()
+    if normalized_side not in {"buy", "sell"}:
+        return "live automated KIS quote side is invalid"
     if price is None:
-        return f"live automated KIS {side} requires a fresh exchange quote"
+        return f"live automated KIS {normalized_side} requires a fresh exchange quote"
     if not _is_trusted_exchange_freshness_source(price.freshness_source):
         return (
-            f"live automated KIS {side} quote lacks trusted exchange-time "
+            f"live automated KIS {normalized_side} quote lacks trusted exchange-time "
             "provenance"
         )
-    executable_field = "ask" if side == "buy" else "bid"
+    executable_field = "ask" if normalized_side == "buy" else "bid"
     executable_price = getattr(price, executable_field)
     if executable_price is None or executable_price <= 0:
         return (
-            f"live automated KIS {side} quote lacks a positive executable "
+            f"live automated KIS {normalized_side} quote lacks a positive executable "
             f"{executable_field}"
         )
     provenance = price.provenance if isinstance(price.provenance, dict) else {}
@@ -11878,18 +11972,18 @@ def _live_automated_quote_trust_reason(
         field_source.get("freshness_source")
     ):
         return (
-            f"live automated KIS {side} {executable_field} lacks trusted "
+            f"live automated KIS {normalized_side} {executable_field} lacks trusted "
             "field-level exchange-time provenance"
         )
     field_observed_at = _parse_event_datetime(field_source.get("observed_at"))
     if field_observed_at is None or price.observed_at is None:
         return (
-            f"live automated KIS {side} {executable_field} lacks a verifiable "
+            f"live automated KIS {normalized_side} {executable_field} lacks a verifiable "
             "field timestamp"
         )
     if _normalize_utc(field_observed_at) != _normalize_utc(price.observed_at):
         return (
-            f"live automated KIS {side} {executable_field} timestamp does not "
+            f"live automated KIS {normalized_side} {executable_field} timestamp does not "
             "match the quote freshness boundary"
         )
     return None
@@ -14297,6 +14391,7 @@ def _monitoring_order_metadata(
             item=item,
             observed_price=observed_price,
             trigger_reason=trigger_reason,
+            trigger_metadata=trigger_metadata,
         )
         if trigger_binding is not None:
             metadata["monitoring_sell_trigger_binding"] = trigger_binding
@@ -14315,6 +14410,7 @@ def _monitoring_sell_trigger_binding(
     item: ExecutionPlanItem,
     observed_price: Decimal | None,
     trigger_reason: str | None,
+    trigger_metadata: dict[str, object] | None,
 ) -> dict[str, object] | None:
     reason = trigger_reason or item.intent
     if item.intent == "stop_sell":
@@ -14326,7 +14422,9 @@ def _monitoring_sell_trigger_binding(
             # exit. Bind them to the crossed bid rather than treating them as
             # an ordinary upside target at the final broker boundary.
             direction = "at_or_below"
-            threshold = observed_price
+            threshold = observed_price or _parse_decimal(
+                (trigger_metadata or {}).get("last_observed_price")
+            )
         else:
             direction = "at_or_above"
             threshold = item.trigger_price

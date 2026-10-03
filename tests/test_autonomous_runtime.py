@@ -2422,6 +2422,123 @@ def test_cached_max_holding_exit_triggers_only_on_close_exit_date() -> None:
     assert due["triggered_sell_symbols"] == ["005930"]
 
 
+def test_cached_sell_rearm_requires_an_executable_price() -> None:
+    settings = Settings(database_url="sqlite:///:memory:", runtime_mode="live")
+    coordinator = AutonomousRuntimeCoordinator(
+        settings=settings,
+        session_factory=None,  # type: ignore[arg-type]
+        broker_adapter_factory=lambda settings: None,  # type: ignore[arg-type,return-value]
+    )
+    started_at = datetime(2026, 9, 24, 1, 0, tzinfo=UTC)
+    snapshot = MonitoringRuntimeSnapshot(
+        loaded_at=started_at,
+        symbols=["005930"],
+        positions_by_symbol={
+            "005930": CachedMonitoringPosition(
+                symbol="005930",
+                quantity=1,
+                provider="kis",
+                exchange="KRX",
+            )
+        },
+        items=[
+            CachedMonitoringItem(
+                id="blocked-stop-without-bid",
+                symbol="005930",
+                intent="stop_sell",
+                status="stop_sell_triggered_blocked",
+                trigger_price=Decimal("100"),
+                provider="kis",
+                exchange="KRX",
+            )
+        ],
+        filled_today_symbols=[],
+    )
+
+    payload = coordinator._evaluate_cached_monitoring_cycle(
+        runtime_snapshot=snapshot,
+        prices=[MonitoringPriceRequest(symbol="005930", price=Decimal("101"))],
+        started_at=started_at,
+    )
+
+    assert payload["triggered_item_count"] == 0
+    assert payload["rearmable_sell_symbols"] == []
+
+
+@pytest.mark.parametrize(
+    "price",
+    [
+        MonitoringPriceRequest(
+            symbol="005930",
+            price=Decimal("101"),
+            bid=Decimal("101"),
+            observed_at=datetime(2026, 9, 24, 1, 0, tzinfo=UTC),
+        ),
+        MonitoringPriceRequest(
+            symbol="005930",
+            price=Decimal("101"),
+            bid=Decimal("101"),
+            observed_at=datetime(2026, 9, 24, 0, 59, tzinfo=UTC),
+            freshness_source="kis_exchange_orderbook_time",
+            provenance={
+                "field_sources": {
+                    "bid": {
+                        "freshness_source": "kis_exchange_orderbook_time",
+                        "observed_at": "2026-09-24T00:59:00+00:00",
+                    }
+                }
+            },
+        ),
+    ],
+)
+def test_cached_sell_rearm_rejects_untrusted_or_stale_live_quote(
+    price: MonitoringPriceRequest,
+) -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="live",
+        monitoring_max_quote_age_seconds=30,
+    )
+    coordinator = AutonomousRuntimeCoordinator(
+        settings=settings,
+        session_factory=None,  # type: ignore[arg-type]
+        broker_adapter_factory=lambda settings: None,  # type: ignore[arg-type,return-value]
+    )
+    started_at = datetime(2026, 9, 24, 1, 0, tzinfo=UTC)
+    snapshot = MonitoringRuntimeSnapshot(
+        loaded_at=started_at,
+        symbols=["005930"],
+        positions_by_symbol={
+            "005930": CachedMonitoringPosition(
+                symbol="005930",
+                quantity=1,
+                provider="kis",
+                exchange="KRX",
+            )
+        },
+        items=[
+            CachedMonitoringItem(
+                id="blocked-stop",
+                symbol="005930",
+                intent="stop_sell",
+                status="stop_sell_triggered_blocked",
+                trigger_price=Decimal("100"),
+                provider="kis",
+                exchange="KRX",
+            )
+        ],
+        filled_today_symbols=[],
+    )
+
+    payload = coordinator._evaluate_cached_monitoring_cycle(
+        runtime_snapshot=snapshot,
+        prices=[price],
+        started_at=started_at,
+    )
+
+    assert payload["rearmable_sell_symbols"] == []
+
+
 def test_due_cached_max_holding_exit_reaches_db_backed_monitoring_cycle(
     monkeypatch,
 ) -> None:
@@ -2510,6 +2627,121 @@ def test_due_cached_max_holding_exit_reaches_db_backed_monitoring_cycle(
 
     assert db_calls == [["005930"]]
     assert payload["broker_action_symbols"] == ["005930"]
+
+
+def test_recovered_cached_sell_block_reaches_db_backed_monitoring_cycle(
+    monkeypatch,
+) -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        monitoring_max_broker_actions_per_cycle=0,
+    )
+    coordinator = AutonomousRuntimeCoordinator(
+        settings=settings,
+        session_factory=None,  # type: ignore[arg-type]
+        broker_adapter_factory=lambda settings: object(),
+    )
+    started_at = datetime(2026, 9, 24, 1, 0, tzinfo=UTC)
+    snapshot = MonitoringRuntimeSnapshot(
+        loaded_at=started_at,
+        symbols=["005930"],
+        positions_by_symbol={
+            "005930": CachedMonitoringPosition(
+                symbol="005930",
+                quantity=1,
+                provider="kis",
+                exchange="KRX",
+            )
+        },
+        items=[
+            CachedMonitoringItem(
+                id="recovered-stop",
+                symbol="005930",
+                intent="stop_sell",
+                status="stop_sell_triggered_blocked",
+                trigger_price=Decimal("100"),
+                provider="kis",
+                exchange="KRX",
+            ),
+            CachedMonitoringItem(
+                id="same-symbol-triggered-buy",
+                symbol="005930",
+                intent="intraday_watch_buy",
+                status="watch_monitoring_active",
+                trigger_price=Decimal("100"),
+                trigger_direction="at_or_above",
+                provider="kis",
+                exchange="KRX",
+            ),
+        ],
+        filled_today_symbols=[],
+    )
+    coordinator._monitoring_runtime_snapshot = snapshot
+    coordinator._monitoring_maintenance_snapshot_loaded_at = snapshot.loaded_at
+    db_calls: list[list[str]] = []
+
+    class DummySessionContext:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, exc_type, exc, traceback) -> None:
+            del exc_type, exc, traceback
+
+    coordinator._cycle_session_factory = lambda: DummySessionContext()  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        coordinator,
+        "_load_monitoring_prices",
+        lambda **kwargs: [
+            MonitoringPriceRequest(
+                symbol="005930",
+                price=Decimal("101"),
+                bid=Decimal("101"),
+                ask=Decimal("101"),
+            )
+        ],
+    )
+    monkeypatch.setattr(
+        coordinator,
+        "_repair_post_entry_exit_monitors_for_cached_cycle",
+        lambda **kwargs: (0, 0),
+    )
+    monkeypatch.setattr(
+        autonomous_runtime,
+        "run_autonomous_monitoring_cycle",
+        lambda **kwargs: (
+            db_calls.append(list(kwargs["symbols"]))
+            or SimpleNamespace(
+                status_code=200,
+                payload={
+                    "triggered_item_count": 0,
+                    "submitted_order_count": 0,
+                    "items": [
+                        {
+                            "execution_plan_item_id": "recovered-stop",
+                            "symbol": "005930",
+                            "intent": "stop_sell",
+                            "status": "stop_sell_monitoring",
+                            "outcome": "waiting",
+                        }
+                    ],
+                },
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        coordinator,
+        "_refresh_monitoring_runtime_snapshot",
+        lambda **kwargs: snapshot,
+    )
+
+    payload = coordinator._monitoring_cycle_sync(started_at)
+
+    assert db_calls == [["005930"]]
+    assert payload["submitted_order_count"] == 0
+    assert payload["items"][0]["status"] == "stop_sell_monitoring"
+    assert payload["state_rearm_symbols"] == []
+    assert payload["state_rearm_candidate_symbols"] == ["005930"]
 
 
 def test_live_cycle_monitors_local_holdings_without_waiting_for_broker_discovery(
