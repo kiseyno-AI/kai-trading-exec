@@ -84,6 +84,146 @@ def test_alpaca_legacy_cli_adapter_authenticates_the_us_equity_lane(
     assert calls == ["us_equity"]
 
 
+def test_alpaca_crypto_flat_rebind_routes_exact_dry_run_without_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    db, engine = _stub_runtime(monkeypatch)
+    adapter = object()
+    calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        cli,
+        "AlpacaBrokerAdapter",
+        lambda *, settings: adapter,
+    )
+    monkeypatch.setattr(
+        cli,
+        "analyze_alpaca_crypto_flat_position_rebind",
+        lambda **kwargs: calls.append(kwargs) or {"mode": "dry-run"},
+    )
+    monkeypatch.setattr(
+        cli,
+        "apply_alpaca_crypto_flat_position_rebind",
+        lambda **kwargs: pytest.fail("crypto dry-run attempted mutation"),
+    )
+    monkeypatch.setattr(
+        cli,
+        "analyze_legacy_position_attribution",
+        lambda **kwargs: pytest.fail("crypto route used equity attribution"),
+    )
+
+    assert (
+        cli.main(
+            [
+                "--database-url",
+                "sqlite:///test.db",
+                "--runtime-mode",
+                "paper",
+                "--legacy-attribution-exchange",
+                "ALPACA",
+            ]
+        )
+        == 0
+    )
+
+    assert calls == [
+        {
+            "settings": ANY,
+            "db": db,
+            "auth_session_factory": ANY,
+            "adapter": adapter,
+        }
+    ]
+    assert '"mode": "dry-run"' in capsys.readouterr().out
+    assert engine.disposed is True
+
+
+def test_alpaca_crypto_flat_rebind_apply_routes_complete_approvals(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db, engine = _stub_runtime(monkeypatch)
+    adapter = object()
+    calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        cli,
+        "AlpacaBrokerAdapter",
+        lambda *, settings: adapter,
+    )
+    monkeypatch.setattr(
+        cli,
+        "apply_alpaca_crypto_flat_position_rebind",
+        lambda **kwargs: calls.append(kwargs) or {"mode": "apply"},
+    )
+    monkeypatch.setattr(
+        cli,
+        "apply_legacy_position_attribution",
+        lambda **kwargs: pytest.fail("crypto route used equity attribution"),
+    )
+
+    assert (
+        cli.main(
+            [
+                "--database-url",
+                "sqlite:///test.db",
+                "--runtime-mode",
+                "paper",
+                "--legacy-attribution-exchange",
+                "ALPACA",
+                "--apply",
+                "--approve-position",
+                f"btc-position={'A' * 64}",
+                "--actor",
+                "operator",
+                "--reason",
+                "current flat truth verified",
+            ]
+        )
+        == 0
+    )
+
+    assert calls == [
+        {
+            "settings": ANY,
+            "db": db,
+            "auth_session_factory": ANY,
+            "adapter": adapter,
+            "approved_evidence": {"btc-position": "a" * 64},
+            "actor": "operator",
+            "reason": "current flat truth verified",
+        }
+    ]
+    assert engine.disposed is True
+
+
+@pytest.mark.parametrize("runtime_mode", ["mock", "live"])
+def test_alpaca_crypto_flat_rebind_cli_rejects_non_paper_before_db_open(
+    monkeypatch: pytest.MonkeyPatch,
+    runtime_mode: str,
+) -> None:
+    monkeypatch.setattr(
+        cli,
+        "load_settings",
+        lambda: pytest.fail("non-paper crypto rebind loaded settings"),
+    )
+    monkeypatch.setattr(
+        cli,
+        "create_db_engine",
+        lambda settings: pytest.fail("non-paper crypto rebind opened database"),
+    )
+
+    with pytest.raises(SystemExit, match="requires --runtime-mode paper"):
+        cli.main(
+            [
+                "--database-url",
+                "sqlite:///must-not-open.db",
+                "--runtime-mode",
+                runtime_mode,
+                "--legacy-attribution-exchange",
+                "ALPACA",
+            ]
+        )
+
+
 def test_legacy_attribution_exchange_routes_dry_run_without_mutation(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],

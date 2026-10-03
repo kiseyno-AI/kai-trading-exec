@@ -42,6 +42,7 @@ from app.services.position_identity import (
     POSITION_IDENTITY_KEY,
     PositionIdentity,
     PositionIdentityConflictError,
+    build_authenticated_broker_position_identity,
     build_position_identity,
     payload_with_position_identity,
     position_identity_from_columns,
@@ -53,8 +54,12 @@ from app.services.runtime import position_truth_freshness_payload
 
 POSITION_CANDIDATE_TYPE = "stale_position_truth"
 LEGACY_POSITION_ATTRIBUTION_CANDIDATE_TYPE = "legacy_position_attribution"
+ALPACA_CRYPTO_FLAT_REBIND_CANDIDATE_TYPE = (
+    "alpaca_crypto_flat_position_rebind"
+)
 SUPPORTED_POSITION_EXCHANGES = {"KRX", "NASD", "NYSE", "AMEX"}
 ALPACA_PAPER_LEGACY_ATTRIBUTION_EXCHANGES = frozenset({"US"})
+ALPACA_CRYPTO_FLAT_REBIND_EXCHANGE = "ALPACA"
 LEGACY_QUARANTINE_ATTRIBUTION_EXCHANGES = KIS_US_POSITION_QUARANTINE_EXCHANGES
 LEGACY_QUARANTINE_ROUTE_DISPOSITION = "account_attributed_quarantine"
 LEGACY_ATTRIBUTION_SAFETY_POLICY_VERSION = (
@@ -69,11 +74,408 @@ EXECUTION_POSITION_AVERAGE_PRICE_QUANTUM = Decimal(1).scaleb(
 ALPACA_AVERAGE_PRICE_MATCH_POLICY = (
     "numeric_18_4_round_half_up_strict_storage_bucket_v1"
 )
+ALPACA_CRYPTO_FLAT_REBIND_SAFETY_POLICY_VERSION = (
+    "alpaca-crypto-flat-position-rebind-v1"
+)
 POSITION_EVIDENCE_ORDER_STATUSES = (*ACTIONABLE_OPEN_ORDER_STATUSES, "filled")
 
 
 def _real_utc_now() -> datetime:
     return datetime.now(UTC)
+
+
+def analyze_alpaca_crypto_flat_position_rebind(
+    *,
+    settings: Settings,
+    db: Session,
+    auth_session_factory: sessionmaker[Session],
+    adapter: BrokerAdapter,
+    now: datetime | None = None,
+) -> dict[str, object]:
+    """Prove which legacy flat crypto slots belong to the current Alpaca account.
+
+    A historical flat row does not prove which account produced its old payload.
+    This workflow therefore binds only *current* authenticated flat truth.  It
+    never attributes historical holdings, fills, P&L, or strategy activity.
+    """
+    evaluated_at = now or datetime.now(UTC)
+    _require_alpaca_crypto_flat_rebind_route(
+        settings=settings,
+        adapter=adapter,
+    )
+    configured_symbols = _configured_alpaca_crypto_symbols(settings)
+    legacy_positions = db.scalars(
+        select(ExecutionPosition)
+        .where(
+            ExecutionPosition.mode == settings.runtime_mode,
+            ExecutionPosition.provider.is_(None),
+            ExecutionPosition.account_scope.is_(None),
+            ExecutionPosition.exchange.is_(None),
+            func.upper(func.trim(ExecutionPosition.symbol)).in_(
+                sorted(configured_symbols)
+            ),
+        )
+        .order_by(ExecutionPosition.symbol.asc(), ExecutionPosition.id.asc())
+    ).all()
+    if not legacy_positions:
+        return _alpaca_crypto_flat_rebind_payload(
+            mode="dry-run",
+            settings=settings,
+            evaluated_at=evaluated_at,
+            snapshot_observed_at=None,
+            snapshot_source=None,
+            items=[],
+        )
+
+    normalized_symbols = [
+        _normalized_position_symbol(position.symbol)
+        for position in legacy_positions
+    ]
+    if len(set(normalized_symbols)) != len(normalized_symbols):
+        raise PositionIdentityConflictError(
+            "Alpaca crypto flat rebind found a duplicate legacy position symbol"
+        )
+
+    access_token = _durably_authenticate_for_position_refresh(
+        settings=settings,
+        session_factory=auth_session_factory,
+        adapter=adapter,
+    )
+    snapshot = adapter.get_account_snapshot(
+        access_token,
+        symbols=sorted(normalized_symbols),
+        exchange=ALPACA_CRYPTO_FLAT_REBIND_EXCHANGE,
+    )
+    _require_current_attribution_snapshot(
+        settings=settings,
+        evaluated_at=evaluated_at,
+        snapshot_observed_at=snapshot.observed_at,
+    )
+    _require_alpaca_crypto_flat_snapshot(
+        settings=settings,
+        snapshot=snapshot,
+    )
+    _, items = _alpaca_crypto_flat_items_for_snapshot(
+        settings=settings,
+        db=db,
+        positions=legacy_positions,
+        snapshot=snapshot,
+        configured_symbols=configured_symbols,
+    )
+    return _alpaca_crypto_flat_rebind_payload(
+        mode="dry-run",
+        settings=settings,
+        evaluated_at=evaluated_at,
+        snapshot_observed_at=snapshot.observed_at,
+        snapshot_source=snapshot.source,
+        items=items,
+    )
+
+
+def apply_alpaca_crypto_flat_position_rebind(
+    *,
+    settings: Settings,
+    db: Session,
+    auth_session_factory: sessionmaker[Session],
+    adapter: BrokerAdapter,
+    approved_evidence: dict[str, str],
+    actor: str,
+    reason: str,
+    now: datetime | None = None,
+) -> dict[str, object]:
+    """Bind an operator-approved set of legacy flat slots to current truth."""
+    normalized_actor = str(actor or "").strip()
+    normalized_reason = str(reason or "").strip()
+    normalized_approvals = _validated_alpaca_crypto_flat_approvals(
+        approved_evidence
+    )
+    if not normalized_actor or not normalized_reason:
+        raise ValueError("Alpaca crypto flat rebind requires actor and reason")
+
+    evaluated_at = now or datetime.now(UTC)
+    serialization = None
+    approved_items: list[dict[str, object]] = []
+    try:
+        current = analyze_alpaca_crypto_flat_position_rebind(
+            settings=settings,
+            db=db,
+            auth_session_factory=auth_session_factory,
+            adapter=adapter,
+            now=evaluated_at,
+        )
+        current_items = {
+            str(item["position_id"]): item
+            for item in current["items"]
+            if isinstance(item, dict)
+        }
+        if not current_items:
+            raise PositionIdentityConflictError(
+                "Alpaca crypto flat rebind found no current candidates"
+            )
+        if any(item.get("eligible") is not True for item in current_items.values()):
+            raise PositionIdentityConflictError(
+                "Alpaca crypto flat rebind candidate set is not fully eligible"
+            )
+        if set(normalized_approvals) != set(current_items):
+            raise PositionIdentityConflictError(
+                "Alpaca crypto flat rebind requires the complete current candidate set"
+            )
+        for position_id, approved_fingerprint in normalized_approvals.items():
+            item = current_items[position_id]
+            current_fingerprint = item.get("evidence_fingerprint")
+            if (
+                not isinstance(current_fingerprint, str)
+                or not hmac.compare_digest(
+                    approved_fingerprint,
+                    current_fingerprint,
+                )
+            ):
+                raise PositionIdentityConflictError(
+                    "approved Alpaca crypto flat evidence no longer matches "
+                    "current broker truth"
+                )
+            approved_items.append(item)
+
+        approved_ids = sorted(normalized_approvals)
+        db.rollback()
+        serialization = _acquire_legacy_attribution_apply_serialization(
+            settings=settings,
+            db=db,
+            provider="alpaca",
+            account_scope=str(approved_items[0]["account_scope"]),
+            exchange=ALPACA_CRYPTO_FLAT_REBIND_EXCHANGE,
+        )
+        try:
+            locked_positions = db.scalars(
+                select(ExecutionPosition)
+                .where(
+                    ExecutionPosition.mode == settings.runtime_mode,
+                    ExecutionPosition.provider.is_(None),
+                    ExecutionPosition.account_scope.is_(None),
+                    ExecutionPosition.exchange.is_(None),
+                    func.upper(func.trim(ExecutionPosition.symbol)).in_(
+                        sorted(_configured_alpaca_crypto_symbols(settings))
+                    ),
+                )
+                .order_by(
+                    ExecutionPosition.symbol.asc(),
+                    ExecutionPosition.id.asc(),
+                )
+                .with_for_update(nowait=True)
+                .execution_options(populate_existing=True)
+            ).all()
+        except DBAPIError as exc:
+            raise PositionIdentityConflictError(
+                "Alpaca crypto flat rebind rows are busy; retry from a new dry-run"
+            ) from exc
+        locked_by_id = {position.id: position for position in locked_positions}
+        if set(locked_by_id) != set(approved_ids):
+            raise PositionIdentityConflictError(
+                "approved Alpaca crypto flat position is missing or already bound"
+            )
+
+        # The operator-approved dry-run and the first apply read are only
+        # preliminary evidence.  Once the local scope and target rows are
+        # serialized, authenticate again and obtain a second account snapshot.
+        # Only this lock-after-refetch proof is allowed to mutate the rows.
+        locked_grant = adapter.authenticate()
+        locked_snapshot = adapter.get_account_snapshot(
+            locked_grant.access_token,
+            symbols=sorted(
+                _normalized_position_symbol(position.symbol)
+                for position in locked_positions
+            ),
+            exchange=ALPACA_CRYPTO_FLAT_REBIND_EXCHANGE,
+        )
+        locked_evaluated_at = _real_utc_now()
+        _require_current_attribution_snapshot(
+            settings=settings,
+            evaluated_at=locked_evaluated_at,
+            snapshot_observed_at=locked_snapshot.observed_at,
+        )
+        _require_alpaca_crypto_flat_snapshot(
+            settings=settings,
+            snapshot=locked_snapshot,
+        )
+        _, locked_items = _alpaca_crypto_flat_items_for_snapshot(
+            settings=settings,
+            db=db,
+            positions=locked_positions,
+            snapshot=locked_snapshot,
+            configured_symbols=_configured_alpaca_crypto_symbols(settings),
+        )
+        locked_items_by_id = {
+            str(item["position_id"]): item for item in locked_items
+        }
+        if (
+            set(locked_items_by_id) != set(normalized_approvals)
+            or any(
+                item.get("eligible") is not True
+                for item in locked_items_by_id.values()
+            )
+        ):
+            raise PositionIdentityConflictError(
+                "Alpaca crypto flat rebind evidence changed after row locking"
+            )
+        for position_id, approved_fingerprint in normalized_approvals.items():
+            locked_fingerprint = locked_items_by_id[position_id].get(
+                "evidence_fingerprint"
+            )
+            if (
+                not isinstance(locked_fingerprint, str)
+                or not hmac.compare_digest(
+                    approved_fingerprint,
+                    locked_fingerprint,
+                )
+            ):
+                raise PositionIdentityConflictError(
+                    "approved Alpaca crypto flat evidence changed after row locking"
+                )
+        approved_items = [
+            locked_items_by_id[position_id]
+            for position_id in normalized_approvals
+        ]
+        _reject_locked_scoped_symbol_collisions(
+            settings=settings,
+            db=db,
+            approved_items=approved_items,
+            approved_ids=approved_ids,
+        )
+        current = _alpaca_crypto_flat_rebind_payload(
+            mode="dry-run",
+            settings=settings,
+            evaluated_at=locked_evaluated_at,
+            snapshot_observed_at=locked_snapshot.observed_at,
+            snapshot_source=locked_snapshot.source,
+            items=approved_items,
+        )
+        snapshot_observed_at = locked_snapshot.observed_at
+        _require_current_attribution_snapshot(
+            settings=settings,
+            evaluated_at=locked_evaluated_at,
+            snapshot_observed_at=snapshot_observed_at,
+        )
+        snapshot_source = str(current.get("broker_snapshot_source") or "")
+
+        for item in approved_items:
+            position = locked_by_id[str(item["position_id"])]
+            if not _locked_alpaca_crypto_flat_position_matches(
+                position=position,
+                item=item,
+            ):
+                raise PositionIdentityConflictError(
+                    "approved Alpaca crypto flat position changed while rebind "
+                    "was pending"
+                )
+            identity = PositionIdentity(
+                provider="alpaca",
+                account_scope=str(item["account_scope"]),
+                exchange=ALPACA_CRYPTO_FLAT_REBIND_EXCHANGE,
+            )
+            position.provider = identity.provider
+            position.account_scope = identity.account_scope
+            position.exchange = identity.exchange
+            position.quantity = 0
+            position.base_quantity = Decimal("0")
+            position.average_price = None
+            position.updated_from = "reconciliation"
+            position.last_reconciled_at = snapshot_observed_at
+            position.raw_payload = _alpaca_crypto_current_flat_truth_payload(
+                settings=settings,
+                identity=identity,
+                snapshot_source=snapshot_source,
+                snapshot_observed_at=snapshot_observed_at,
+                absence_proof_digest=str(item["absence_proof_digest"]),
+            )
+            db.add(
+                RuntimeRemediationEvent(
+                    mode=settings.runtime_mode,
+                    candidate_type=ALPACA_CRYPTO_FLAT_REBIND_CANDIDATE_TYPE,
+                    candidate_key=position.id,
+                    subject_id=position.id,
+                    outcome="current_flat_truth_bound",
+                    actor=normalized_actor,
+                    reason=normalized_reason,
+                    evidence_summary={
+                        "symbol": position.symbol,
+                        "provider": identity.provider,
+                        "account_scope": identity.account_scope,
+                        "exchange": identity.exchange,
+                        "prior_updated_from": item["updated_from"],
+                        "prior_last_reconciled_at": item[
+                            "last_reconciled_at"
+                        ],
+                        "legacy_payload_digest": item[
+                            "legacy_payload_digest"
+                        ],
+                        "legacy_integer_quantity": item[
+                            "legacy_integer_quantity"
+                        ],
+                        "legacy_base_quantity": item[
+                            "legacy_base_quantity"
+                        ],
+                        "legacy_average_price": item[
+                            "legacy_average_price"
+                        ],
+                        "broker_snapshot_source": snapshot_source,
+                        "broker_snapshot_observed_at": current[
+                            "broker_snapshot_observed_at"
+                        ],
+                        "absence_proof_digest": item[
+                            "absence_proof_digest"
+                        ],
+                        "evidence_fingerprint": item[
+                            "evidence_fingerprint"
+                        ],
+                        "safety_policy_version": (
+                            ALPACA_CRYPTO_FLAT_REBIND_SAFETY_POLICY_VERSION
+                        ),
+                        "historical_account_attributed": False,
+                        "current_flat_truth_bound": True,
+                        "holding_absent": True,
+                        "open_order_absent": True,
+                        "holdings_complete": True,
+                        "open_orders_complete": True,
+                        "broker_api_mutations": 0,
+                        "orders_submitted": 0,
+                        "orders_amended": 0,
+                        "orders_canceled": 0,
+                        "fills_created": 0,
+                        "fills_deleted": 0,
+                        "pnl_records_mutated": 0,
+                        "strategy_records_mutated": 0,
+                    },
+                    occurred_at=evaluated_at,
+                )
+            )
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        if serialization is not None:
+            serialization.close()
+
+    return {
+        "mode": "apply",
+        "runtime_mode": settings.runtime_mode,
+        "provider": "alpaca",
+        "exchange": ALPACA_CRYPTO_FLAT_REBIND_EXCHANGE,
+        "generated_at": _serialize_datetime(evaluated_at),
+        "broker_snapshot_observed_at": current[
+            "broker_snapshot_observed_at"
+        ],
+        "summary": {
+            "approved_count": len(approved_items),
+            "bound_count": len(approved_items),
+            "historical_account_attributed_count": 0,
+            "broker_api_mutation_count": 0,
+        },
+        "items": [
+            {**item, "outcome": "current_flat_truth_bound"}
+            for item in approved_items
+        ],
+    }
 
 
 def analyze_legacy_position_attribution(
@@ -710,6 +1112,419 @@ def _attributed_position_payload(
         "route_disposition": LEGACY_QUARANTINE_ROUTE_DISPOSITION,
     }
     return attributed_payload
+
+
+def _require_alpaca_crypto_flat_rebind_route(
+    *,
+    settings: Settings,
+    adapter: BrokerAdapter,
+) -> None:
+    if settings.runtime_mode != "paper":
+        raise PositionIdentityConflictError(
+            "Alpaca crypto flat rebind supports only paper mode"
+        )
+    if settings.runtime_broker_provider != "alpaca":
+        raise PositionIdentityConflictError(
+            "Alpaca crypto flat rebind requires runtime broker provider alpaca"
+        )
+    if str(adapter.provider or "").strip().lower() != "alpaca":
+        raise PositionIdentityConflictError(
+            "Alpaca crypto flat rebind requires an Alpaca adapter"
+        )
+
+
+def _configured_alpaca_crypto_symbols(settings: Settings) -> set[str]:
+    configured: set[str] = set()
+    for raw_symbol in settings.alpaca_crypto_allowed_symbols.split(","):
+        stripped = raw_symbol.strip().upper().replace("-", "/")
+        if not stripped:
+            continue
+        if "/" not in stripped and stripped.endswith("USD") and len(stripped) > 3:
+            stripped = f"{stripped[:-3]}/USD"
+        parts = stripped.split("/")
+        if (
+            len(parts) != 2
+            or not all(parts)
+            or any(not part.isalnum() for part in parts)
+        ):
+            raise PositionIdentityConflictError(
+                "Alpaca crypto flat rebind requires canonical configured symbols"
+            )
+        configured.add(stripped)
+    if not configured:
+        raise PositionIdentityConflictError(
+            "Alpaca crypto flat rebind requires configured crypto symbols"
+        )
+    return configured
+
+
+def _require_alpaca_crypto_flat_snapshot(
+    *,
+    settings: Settings,
+    snapshot: object,
+) -> None:
+    payload = getattr(snapshot, "payload", None)
+    if (
+        not isinstance(payload, dict)
+        or payload.get("provider") != "alpaca"
+        or payload.get("mode") != "paper"
+        or payload.get("asset_class") != "crypto"
+        or str(getattr(snapshot, "source", "") or "") != "alpaca:paper"
+        or not str(getattr(snapshot, "broker_account_id", "") or "").strip()
+        or getattr(snapshot, "holdings_complete", None) is not True
+        or getattr(snapshot, "open_orders_complete", None) is not True
+        or payload.get("holdings_coverage") != "complete"
+        or payload.get("open_orders_coverage") != "complete"
+        or settings.runtime_mode != "paper"
+    ):
+        raise PositionIdentityConflictError(
+            "Alpaca paper crypto snapshot proof is unavailable or incomplete"
+        )
+
+
+def _unique_snapshot_symbols(
+    *,
+    rows: list[object],
+    evidence_type: str,
+    allow_repeated_symbols: bool = False,
+) -> set[str]:
+    symbols: list[str] = []
+    for row in rows:
+        raw_symbol = str(getattr(row, "symbol", "") or "").strip()
+        normalized_symbol = _normalized_position_symbol(raw_symbol)
+        if raw_symbol != normalized_symbol:
+            raise PositionIdentityConflictError(
+                f"Alpaca crypto snapshot {evidence_type} symbol is not canonical"
+            )
+        symbols.append(normalized_symbol)
+    if not allow_repeated_symbols and len(set(symbols)) != len(symbols):
+        raise PositionIdentityConflictError(
+            f"Alpaca crypto snapshot contains duplicate {evidence_type} symbols"
+        )
+    return set(symbols)
+
+
+def _alpaca_crypto_flat_items_for_snapshot(
+    *,
+    settings: Settings,
+    db: Session,
+    positions: list[ExecutionPosition],
+    snapshot: object,
+    configured_symbols: set[str],
+) -> tuple[PositionIdentity, list[dict[str, object]]]:
+    identity = build_authenticated_broker_position_identity(
+        settings=settings,
+        provider="alpaca",
+        exchange=ALPACA_CRYPTO_FLAT_REBIND_EXCHANGE,
+        broker_account_id=str(getattr(snapshot, "broker_account_id", "") or ""),
+    )
+    normalized_symbols = [
+        _normalized_position_symbol(position.symbol) for position in positions
+    ]
+    holding_symbols = _unique_snapshot_symbols(
+        rows=list(getattr(snapshot, "holdings", []) or []),
+        evidence_type="holding",
+    )
+    open_order_symbols = _unique_snapshot_symbols(
+        rows=list(getattr(snapshot, "open_orders", []) or []),
+        evidence_type="open order",
+        allow_repeated_symbols=True,
+    )
+    scoped_symbols = set(
+        db.scalars(
+            select(func.upper(func.trim(ExecutionPosition.symbol))).where(
+                func.lower(func.trim(ExecutionPosition.mode))
+                == settings.runtime_mode.strip().lower(),
+                func.lower(func.trim(ExecutionPosition.provider))
+                == identity.provider,
+                func.lower(func.trim(ExecutionPosition.account_scope))
+                == identity.account_scope,
+                func.upper(func.trim(ExecutionPosition.symbol)).in_(
+                    sorted(normalized_symbols)
+                ),
+            )
+        ).all()
+    )
+    absence_proof_digest = _alpaca_crypto_absence_proof_digest(
+        settings=settings,
+        snapshot=snapshot,
+        identity=identity,
+        requested_symbols=normalized_symbols,
+        holding_symbols=holding_symbols,
+        open_order_symbols=open_order_symbols,
+    )
+    items = [
+        _alpaca_crypto_flat_rebind_item(
+            settings=settings,
+            position=position,
+            identity=identity,
+            configured_symbols=configured_symbols,
+            holding_present=(
+                _normalized_position_symbol(position.symbol) in holding_symbols
+            ),
+            open_order_present=(
+                _normalized_position_symbol(position.symbol)
+                in open_order_symbols
+            ),
+            scoped_route_exists=(
+                _normalized_position_symbol(position.symbol) in scoped_symbols
+            ),
+            absence_proof_digest=absence_proof_digest,
+        )
+        for position in positions
+    ]
+    return identity, items
+
+
+def _alpaca_crypto_absence_proof_digest(
+    *,
+    settings: Settings,
+    snapshot: object,
+    identity: PositionIdentity,
+    requested_symbols: list[str],
+    holding_symbols: set[str],
+    open_order_symbols: set[str],
+) -> str:
+    material = {
+        "proof_version": 1,
+        "safety_policy_version": (
+            ALPACA_CRYPTO_FLAT_REBIND_SAFETY_POLICY_VERSION
+        ),
+        "runtime_mode": settings.runtime_mode,
+        "provider": identity.provider,
+        "account_scope": identity.account_scope,
+        "exchange": identity.exchange,
+        "asset_class": "crypto",
+        "snapshot_source": str(getattr(snapshot, "source", "") or ""),
+        "holdings_complete": getattr(snapshot, "holdings_complete", None) is True,
+        "open_orders_complete": (
+            getattr(snapshot, "open_orders_complete", None) is True
+        ),
+        "requested_symbols": sorted(requested_symbols),
+        "holding_symbols": sorted(holding_symbols),
+        "open_order_symbols": sorted(open_order_symbols),
+    }
+    return hashlib.sha256(
+        json.dumps(
+            material,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _alpaca_crypto_flat_rebind_item(
+    *,
+    settings: Settings,
+    position: ExecutionPosition,
+    identity: PositionIdentity,
+    configured_symbols: set[str],
+    holding_present: bool,
+    open_order_present: bool,
+    scoped_route_exists: bool,
+    absence_proof_digest: str,
+) -> dict[str, object]:
+    symbol = _normalized_position_symbol(position.symbol)
+    raw_payload_is_mapping = isinstance(position.raw_payload, dict)
+    stored_route_identity_present = (
+        raw_payload_is_mapping and POSITION_IDENTITY_KEY in position.raw_payload
+    )
+    integer_quantity = _canonical_attribution_decimal(position.quantity)
+    base_quantity = _canonical_attribution_decimal(position.base_quantity)
+    average_price = _canonical_attribution_decimal(position.average_price)
+    base_quantity_is_flat = (
+        position.base_quantity is None or base_quantity == "0"
+    )
+    flat_quantity = integer_quantity == "0" and base_quantity_is_flat
+    average_price_is_valid = (
+        position.average_price is None or average_price is not None
+    )
+
+    if not raw_payload_is_mapping:
+        reason = "legacy_payload_invalid"
+    elif str(position.symbol or "").strip() != symbol:
+        reason = "legacy_symbol_not_canonical"
+    elif symbol not in configured_symbols or "/" not in symbol:
+        reason = "unsupported_alpaca_crypto_symbol"
+    elif stored_route_identity_present:
+        reason = "stored_route_identity_present"
+    elif not flat_quantity:
+        reason = "legacy_position_not_flat"
+    elif not average_price_is_valid:
+        reason = "legacy_average_price_invalid"
+    elif scoped_route_exists:
+        reason = "scoped_route_symbol_collision"
+    elif holding_present:
+        reason = "broker_holding_present"
+    elif open_order_present:
+        reason = "broker_open_order_present"
+    else:
+        reason = "current_broker_flat_truth_proven"
+
+    eligible = reason == "current_broker_flat_truth_proven"
+    evidence = {
+        "safety_policy_version": (
+            ALPACA_CRYPTO_FLAT_REBIND_SAFETY_POLICY_VERSION
+        ),
+        "mode": settings.runtime_mode,
+        "position_id": position.id,
+        "symbol": symbol,
+        "updated_from": position.updated_from,
+        "last_reconciled_at": _serialize_datetime(position.last_reconciled_at),
+        "legacy_payload_digest": _legacy_payload_digest(position.raw_payload),
+        "legacy_integer_quantity": integer_quantity,
+        "legacy_base_quantity": base_quantity,
+        "legacy_average_price": average_price,
+        "provider": identity.provider,
+        "account_scope": identity.account_scope,
+        "exchange": identity.exchange,
+        "asset_class": "crypto",
+        "holding_absent": not holding_present,
+        "open_order_absent": not open_order_present,
+        "absence_proof_digest": absence_proof_digest,
+        "historical_account_attributed": False,
+        "current_flat_truth_bound": True,
+    }
+    fingerprint = (
+        hashlib.sha256(
+            json.dumps(
+                evidence,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        if eligible
+        else None
+    )
+    return {
+        "position_id": position.id,
+        "symbol": symbol,
+        "updated_from": evidence["updated_from"],
+        "last_reconciled_at": evidence["last_reconciled_at"],
+        "legacy_payload_digest": evidence["legacy_payload_digest"],
+        "legacy_integer_quantity": integer_quantity,
+        "legacy_base_quantity": base_quantity,
+        "legacy_average_price": average_price,
+        "provider": identity.provider,
+        "account_scope": identity.account_scope,
+        "exchange": identity.exchange,
+        "asset_class": "crypto",
+        "holding_absent": not holding_present,
+        "open_order_absent": not open_order_present,
+        "absence_proof_digest": absence_proof_digest,
+        "historical_account_attributed": False,
+        "current_flat_truth_bound": True,
+        "eligible": eligible,
+        "reason": reason,
+        "evidence_fingerprint": fingerprint,
+        "safety_policy_version": (
+            ALPACA_CRYPTO_FLAT_REBIND_SAFETY_POLICY_VERSION
+        ),
+    }
+
+
+def _alpaca_crypto_flat_rebind_payload(
+    *,
+    mode: str,
+    settings: Settings,
+    evaluated_at: datetime,
+    snapshot_observed_at: datetime | None,
+    snapshot_source: str | None,
+    items: list[dict[str, object]],
+) -> dict[str, object]:
+    return {
+        "mode": mode,
+        "runtime_mode": settings.runtime_mode,
+        "provider": "alpaca",
+        "exchange": ALPACA_CRYPTO_FLAT_REBIND_EXCHANGE,
+        "asset_class": "crypto",
+        "generated_at": _serialize_datetime(evaluated_at),
+        "broker_snapshot_observed_at": _serialize_datetime(
+            snapshot_observed_at
+        ),
+        "broker_snapshot_source": snapshot_source,
+        "summary": {
+            "candidate_count": len(items),
+            "eligible_count": sum(item["eligible"] is True for item in items),
+            "manual_review_count": sum(
+                item["eligible"] is not True for item in items
+            ),
+        },
+        "items": items,
+    }
+
+
+def _locked_alpaca_crypto_flat_position_matches(
+    *,
+    position: ExecutionPosition,
+    item: dict[str, object],
+) -> bool:
+    return bool(
+        _normalized_position_symbol(position.symbol) == item["symbol"]
+        and position.updated_from == item["updated_from"]
+        and _serialize_datetime(position.last_reconciled_at)
+        == item["last_reconciled_at"]
+        and _legacy_payload_digest(position.raw_payload)
+        == item["legacy_payload_digest"]
+        and _canonical_attribution_decimal(position.quantity)
+        == item["legacy_integer_quantity"]
+        and _canonical_attribution_decimal(position.base_quantity)
+        == item["legacy_base_quantity"]
+        and _canonical_attribution_decimal(position.average_price)
+        == item["legacy_average_price"]
+    )
+
+
+def _alpaca_crypto_current_flat_truth_payload(
+    *,
+    settings: Settings,
+    identity: PositionIdentity,
+    snapshot_source: str,
+    snapshot_observed_at: datetime,
+    absence_proof_digest: str,
+) -> dict[str, object]:
+    return payload_with_position_identity(
+        {
+            "provider": identity.provider,
+            "mode": settings.runtime_mode,
+            "asset_class": "crypto",
+            "exchange": identity.exchange,
+            "snapshot_source": snapshot_source,
+            "snapshot_observed_at": _serialize_datetime(
+                snapshot_observed_at
+            ),
+            "holdings_coverage": "complete",
+            "open_orders_coverage": "complete",
+            "holding_absent": True,
+            "open_order_absent": True,
+            "absence_proof_digest": absence_proof_digest,
+            "historical_account_attributed": False,
+            "current_flat_truth_bound": True,
+        },
+        identity=identity,
+    )
+
+
+def _validated_alpaca_crypto_flat_approvals(
+    approved_evidence: dict[str, str],
+) -> dict[str, str]:
+    if not isinstance(approved_evidence, dict) or not approved_evidence:
+        raise ValueError(
+            "Alpaca crypto flat rebind requires explicit approved evidence"
+        )
+    normalized: dict[str, str] = {}
+    for raw_position_id, raw_fingerprint in approved_evidence.items():
+        position_id = str(raw_position_id or "").strip()
+        fingerprint = str(raw_fingerprint or "").strip().lower()
+        if (
+            not position_id
+            or position_id in normalized
+            or len(fingerprint) != 64
+            or any(character not in "0123456789abcdef" for character in fingerprint)
+        ):
+            raise ValueError("Alpaca crypto flat rebind approval is invalid")
+        normalized[position_id] = fingerprint
+    return normalized
 
 
 def _validated_legacy_attribution_approvals(
