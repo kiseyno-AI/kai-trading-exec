@@ -1496,6 +1496,51 @@ def test_candidate_payload_preserves_unavailable_context_reason_and_source_metad
     assert flow_context["sector_peers"]["reason"] == "no_stored_pykrx_sector_classification_row_for_request_date"
 
 
+def test_candidate_payload_preserves_direct_core_flow_short_sector_context() -> None:
+    flow_short_sector_context = {
+        "status": "available",
+        "investor_flow": {
+            "status": "available",
+            "symbol_flow": {
+                "investor_groups": {
+                    "foreign": {"net_value_krw": 1_250_000_000},
+                },
+            },
+            "market_flow": {
+                "investor_groups": [
+                    {"name": "foreign", "net_value_krw": 8_500_000_000},
+                ],
+            },
+        },
+        "short_selling": {
+            "status": "available",
+            "short_volume": {"short_volume_ratio_pct": 2.1},
+            "short_balance": {"short_balance_ratio_pct": 1.4},
+        },
+        "sector_peers": {
+            "status": "available",
+            "relative_state": "leading",
+            "sector_name": "Semiconductors",
+            "peer_count": 1,
+            "peers": [{"symbol": "000660", "change_pct": 1.8}],
+        },
+        "market_breadth": {
+            "status": "available",
+            "breadth_state": "constructive",
+        },
+    }
+    item = _watch_item(
+        risk_context={"flow_short_sector_context": flow_short_sector_context}
+    )
+
+    payload = _candidate_payload(item)
+
+    assert payload["decider_flow_short_sector_context"] == {
+        "source": "risk_context",
+        "flow_short_sector_context": flow_short_sector_context,
+    }
+
+
 def test_candidate_payload_includes_direct_flow_short_sector_context_blocks() -> None:
     item = _watch_item(
         risk_context={
