@@ -270,6 +270,7 @@ def short_term_plan_payload(
     plan_id: str = "plan-short-term-agent-1",
     source_plan_item_id: str = "watcher-candidate-1",
     exec_agent_decision: dict[str, object] | None = None,
+    source_market_date: str | None = None,
 ) -> dict[str, object]:
     payload: dict[str, object] = {
         "plan_id": plan_id,
@@ -306,6 +307,12 @@ def short_term_plan_payload(
             }
         ],
     }
+    if source_market_date is not None:
+        items = payload["items"]
+        assert isinstance(items, list)
+        item = items[0]
+        assert isinstance(item, dict)
+        item["source_market_date"] = source_market_date
     _bind_precomputed_exec_agent_decisions(payload)
     return payload
 
@@ -957,7 +964,10 @@ def test_short_term_exec_agent_approves_market_open_buy_and_materializes_monitor
     client = TestClient(app)
 
     client.post("/controls/resume", json={"actor": "ops", "source": "test"})
-    response = client.post("/execution-plans", json=short_term_plan_payload())
+    response = client.post(
+        "/execution-plans",
+        json=short_term_plan_payload(source_market_date="2026-05-08"),
+    )
 
     assert response.status_code == 201
     payload = response.json()
@@ -977,7 +987,13 @@ def test_short_term_exec_agent_approves_market_open_buy_and_materializes_monitor
     assert items_by_intent["stop_sell"]["status"] == "stop_sell_monitoring"
     assert items_by_intent["stop_sell"]["trigger_price"] == "47000.0000"
     assert items_by_intent["max_holding_close_sell"]["status"] == "max_holding_close_sell_monitoring"
-    assert items_by_intent["max_holding_close_sell"]["risk_context"]["close_exit_date"] == "2026-05-18"
+    max_holding_context = items_by_intent["max_holding_close_sell"]["risk_context"]
+    assert max_holding_context["close_exit_date"] == "2026-05-15"
+    assert max_holding_context["close_exit_date_status"] == "weekday_provisional"
+    assert max_holding_context["close_exit_date_source"] == "plan_market_date"
+    assert max_holding_context["entry_market_date"] == "2026-05-13"
+    assert max_holding_context["entry_market_date_source"] == "plan_market_date"
+    assert items_by_intent["max_holding_close_sell"]["source_market_date"] == "2026-05-08"
 
     dispatch = dispatch_short_term_jobs_at_the_planned_open(app, adapter)
 
@@ -1022,6 +1038,45 @@ def test_short_term_exec_agent_approves_market_open_buy_and_materializes_monitor
         assert audit["account_snapshot"]["available_cash"] == "500000.0000"
 
     engine.dispose()
+
+
+def test_prefill_monitor_keeps_missing_source_market_date_as_lineage_only() -> None:
+    plan = ExecutionPlan(
+        external_plan_id="prefill-lineage",
+        source="test",
+        mode="paper",
+        market_date=date(2026, 10, 2),
+        status="accepted",
+    )
+    buy_item = ExecutionPlanItem(
+        plan=plan,
+        plan_item_index=0,
+        symbol="005930",
+        side="buy",
+        intent="next_open_buy",
+        status="next_open_buy_scheduled",
+        provider="kis",
+        venue="krx",
+        asset_class="stock",
+        source_market_date=None,
+        risk_context={"exchange": "KRX"},
+    )
+
+    monitor = strict_exec_agent._new_monitoring_item(
+        plan=plan,
+        buy_item=buy_item,
+        decision={"idempotency_key": "prefill-lineage-key", "confidence": "high"},
+        intent="max_holding_close_sell",
+        quantity=1,
+        next_plan_item_index=1,
+        trigger_price=None,
+        max_sessions=2,
+        exit_rule={"kind": "max_holding"},
+    )
+
+    assert monitor.source_market_date is None
+    assert monitor.risk_context["entry_market_date"] == "2026-10-02"
+    assert monitor.risk_context["entry_market_date_status"] == "provisional"
 
 
 def test_market_buy_capital_gate_prefers_verified_exec_agent_audit_over_legacy_context() -> None:

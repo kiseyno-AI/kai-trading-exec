@@ -214,6 +214,9 @@ class OpenLongFillInventoryReplay:
 
     open_quantities: dict[tuple[FifoRouteScope, str], Decimal]
     indeterminate_fill_count: int
+    open_epoch_start_fills: dict[tuple[FifoRouteScope, str], object] = field(
+        default_factory=dict
+    )
 
 
 def ambiguous_fifo_chronology_route_symbols(
@@ -415,6 +418,11 @@ def _fill_time_is_observation_bounded(fill: object) -> bool:
     )
 
 
+def _fill_time_is_explicitly_exact(fill: object) -> bool:
+    payload = getattr(fill, "payload", None)
+    return isinstance(payload, dict) and payload.get("fill_time_precision") == "exact"
+
+
 def _authoritative_fill_sequence(fill: object) -> int | None:
     payload = getattr(fill, "payload", None)
     if not isinstance(payload, dict):
@@ -573,6 +581,9 @@ def replay_open_long_fill_inventory(
     lots_by_route_symbol: dict[
         tuple[FifoRouteScope, str], list[Decimal]
     ] = {}
+    epoch_start_fill_by_route_symbol: dict[
+        tuple[FifoRouteScope, str], object
+    ] = {}
     indeterminate_by_route_symbol: dict[tuple[FifoRouteScope, str], int] = {}
     generation_by_route_symbol: dict[
         tuple[FifoRouteScope, str], datetime | None
@@ -623,16 +634,20 @@ def replay_open_long_fill_inventory(
             and generation_by_route_symbol[route_symbol] != generation_boundary
         ):
             lots.clear()
+            epoch_start_fill_by_route_symbol.pop(route_symbol, None)
             indeterminate_by_route_symbol[route_symbol] = 0
         generation_by_route_symbol[route_symbol] = generation_boundary
         scope_quality_available = True
         if isolation_cursor is not None:
+            had_open_lots = bool(lots)
             scope_quality_available = isolation_cursor.apply_before(
                 route_scope=route_scope,
                 symbol=symbol,
                 observed_at=observed_at,
                 lots=lots,
             )
+            if had_open_lots and not lots:
+                epoch_start_fill_by_route_symbol.pop(route_symbol, None)
         if fifo_chronology_is_ambiguous_at(
             ambiguous_buckets=ambiguous_buckets,
             isolation_cursor=isolation_cursor,
@@ -644,16 +659,24 @@ def replay_open_long_fill_inventory(
             # in this inventory generation is excluded until exact-route,
             # broker-authenticated flat evidence starts a later generation.
             lots.clear()
+            epoch_start_fill_by_route_symbol.pop(route_symbol, None)
             indeterminate_by_route_symbol[route_symbol] = (
                 indeterminate_by_route_symbol.get(route_symbol, 0) + 1
             )
             continue
         if not scope_quality_available:
+            epoch_start_fill_by_route_symbol.pop(route_symbol, None)
             indeterminate_by_route_symbol[route_symbol] = (
                 indeterminate_by_route_symbol.get(route_symbol, 0) + 1
             )
         if side == "buy":
+            starts_open_epoch = not lots
             lots.append(quantity)
+            if starts_open_epoch:
+                if scope_quality_available and _fill_time_is_explicitly_exact(fill):
+                    epoch_start_fill_by_route_symbol[route_symbol] = fill
+                else:
+                    epoch_start_fill_by_route_symbol.pop(route_symbol, None)
             continue
 
         remaining = quantity
@@ -667,6 +690,8 @@ def replay_open_long_fill_inventory(
             indeterminate_by_route_symbol[route_symbol] = (
                 indeterminate_by_route_symbol.get(route_symbol, 0) + 1
             )
+        if not lots:
+            epoch_start_fill_by_route_symbol.pop(route_symbol, None)
 
     if through is not None and isolation_cursor is not None:
         for (route_scope, symbol), lots in lots_by_route_symbol.items():
@@ -687,15 +712,26 @@ def replay_open_long_fill_inventory(
                 observed_at=through,
                 lots=lots,
             ):
+                epoch_start_fill_by_route_symbol.pop(route_symbol, None)
                 indeterminate_by_route_symbol[route_symbol] = (
                     indeterminate_by_route_symbol.get(route_symbol, 0) + 1
                 )
+            if not lots:
+                epoch_start_fill_by_route_symbol.pop(route_symbol, None)
+
+    open_quantities = {
+        route_symbol: sum(lots, Decimal("0"))
+        for route_symbol, lots in lots_by_route_symbol.items()
+        if sum(lots, Decimal("0")) > 0
+    }
 
     return OpenLongFillInventoryReplay(
-        open_quantities={
-            route_symbol: sum(lots, Decimal("0"))
-            for route_symbol, lots in lots_by_route_symbol.items()
-            if sum(lots, Decimal("0")) > 0
+        open_quantities=open_quantities,
+        open_epoch_start_fills={
+            route_symbol: fill
+            for route_symbol, fill in epoch_start_fill_by_route_symbol.items()
+            if route_symbol in open_quantities
+            and indeterminate_by_route_symbol.get(route_symbol, 0) == 0
         },
         indeterminate_fill_count=(
             indeterminate_fill_count + sum(indeterminate_by_route_symbol.values())

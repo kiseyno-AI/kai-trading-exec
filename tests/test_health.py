@@ -5488,18 +5488,26 @@ def test_post_entry_maintenance_preserves_active_sell_agent_state(
                 db=session,
                 entry_item=entry_item,
                 quantity=3,
-                stop_price=Decimal("95"),
-                entry_price=Decimal("100"),
-                triggered_at=datetime(2026, 6, 8, 1, 5, tzinfo=UTC),
+                    stop_price=Decimal("95"),
+                    entry_price=Decimal("100"),
+                    entry_market_date=date(2026, 6, 8),
+                    entry_market_date_source="plan_market_date",
+                    entry_market_date_status="provisional",
+                    entry_market_date_precision="unknown",
+                    triggered_at=datetime(2026, 6, 8, 1, 5, tzinfo=UTC),
             )
         else:
             maintained, _ = _ensure_post_entry_target_monitor(
                 settings=app.state.settings,
                 db=session,
                 entry_item=entry_item,
-                quantity=3,
-                entry_price=Decimal("100"),
-                triggered_at=datetime(2026, 6, 8, 1, 5, tzinfo=UTC),
+                    quantity=3,
+                    entry_price=Decimal("100"),
+                    entry_market_date=date(2026, 6, 8),
+                    entry_market_date_source="plan_market_date",
+                    entry_market_date_status="provisional",
+                    entry_market_date_precision="unknown",
+                    triggered_at=datetime(2026, 6, 8, 1, 5, tzinfo=UTC),
             )
 
         assert maintained is sell_item

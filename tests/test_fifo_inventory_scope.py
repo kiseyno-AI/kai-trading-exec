@@ -116,6 +116,265 @@ def test_fill_inventory_replay_is_quantity_and_chronology_aware() -> None:
     assert replay.indeterminate_fill_count == 1
 
 
+def test_fill_inventory_replay_keeps_open_epoch_start_after_add_on_and_partial_sell() -> None:
+    order = _scoped_order()
+    route = fifo_route_scope_from_order(order)
+    assert route is not None
+    first_buy = _fill_event(
+        order=order,
+        side="buy",
+        quantity="2",
+        observed_at=OBSERVED_AT,
+        fill_id="first-buy",
+        payload={"fill_time_precision": "exact"},
+    )
+    add_on_buy = _fill_event(
+        order=order,
+        side="buy",
+        quantity="3",
+        observed_at=OBSERVED_AT + timedelta(minutes=1),
+        fill_id="add-on-buy",
+        payload={"fill_time_precision": "exact"},
+    )
+
+    replay = replay_open_long_fill_inventory(
+        fills=[
+            first_buy,
+            add_on_buy,
+            _fill_event(
+                order=order,
+                side="sell",
+                quantity="2",
+                observed_at=OBSERVED_AT + timedelta(minutes=2),
+                fill_id="sell-first-lot",
+                payload={"fill_time_precision": "exact"},
+            ),
+        ]
+    )
+
+    assert replay.open_quantities[(route, "AAPL")] == Decimal("3")
+    assert replay.open_epoch_start_fills[(route, "AAPL")] is first_buy
+
+
+def test_fill_inventory_replay_starts_new_epoch_after_flat_then_reentry() -> None:
+    order = _scoped_order()
+    route = fifo_route_scope_from_order(order)
+    assert route is not None
+    old_buy = _fill_event(
+        order=order,
+        side="buy",
+        quantity="2",
+        observed_at=OBSERVED_AT,
+        fill_id="old-buy",
+        payload={"fill_time_precision": "exact"},
+    )
+    reentry_buy = _fill_event(
+        order=order,
+        side="buy",
+        quantity="1",
+        observed_at=OBSERVED_AT + timedelta(minutes=2),
+        fill_id="reentry-buy",
+        payload={"fill_time_precision": "exact"},
+    )
+
+    replay = replay_open_long_fill_inventory(
+        fills=[
+            old_buy,
+            _fill_event(
+                order=order,
+                side="sell",
+                quantity="2",
+                observed_at=OBSERVED_AT + timedelta(minutes=1),
+                fill_id="flat-sell",
+                payload={"fill_time_precision": "exact"},
+            ),
+            reentry_buy,
+        ]
+    )
+
+    assert replay.open_quantities[(route, "AAPL")] == Decimal("1")
+    assert replay.open_epoch_start_fills[(route, "AAPL")] is reentry_buy
+
+
+def test_fill_inventory_replay_does_not_authorize_epoch_after_unmatched_sell() -> None:
+    order = _scoped_order()
+    route = fifo_route_scope_from_order(order)
+    assert route is not None
+
+    replay = replay_open_long_fill_inventory(
+        fills=[
+            _fill_event(
+                order=order,
+                side="sell",
+                quantity="1",
+                observed_at=OBSERVED_AT,
+                fill_id="unmatched-sell",
+                payload={"fill_time_precision": "exact"},
+            ),
+            _fill_event(
+                order=order,
+                side="buy",
+                quantity="10",
+                observed_at=OBSERVED_AT + timedelta(minutes=1),
+                fill_id="later-exact-buy",
+                payload={"fill_time_precision": "exact"},
+            ),
+        ]
+    )
+
+    assert replay.open_quantities[(route, "AAPL")] == Decimal("10")
+    assert replay.indeterminate_fill_count == 1
+    assert replay.open_epoch_start_fills == {}
+
+
+def test_fill_inventory_replay_does_not_authorize_epoch_after_ambiguous_chronology() -> None:
+    order = _scoped_order()
+    route = fifo_route_scope_from_order(order)
+    assert route is not None
+
+    replay = replay_open_long_fill_inventory(
+        fills=[
+            _fill_event(
+                order=order,
+                side="buy",
+                quantity="1",
+                observed_at=OBSERVED_AT,
+                fill_id="ambiguous-buy",
+                payload={"fill_time_precision": "exact"},
+            ),
+            _fill_event(
+                order=order,
+                side="sell",
+                quantity="1",
+                observed_at=OBSERVED_AT,
+                fill_id="ambiguous-sell",
+                payload={"fill_time_precision": "exact"},
+            ),
+            _fill_event(
+                order=order,
+                side="buy",
+                quantity="10",
+                observed_at=OBSERVED_AT + timedelta(minutes=1),
+                fill_id="later-exact-buy",
+                payload={"fill_time_precision": "exact"},
+            ),
+        ]
+    )
+
+    assert replay.indeterminate_fill_count > 0
+    assert replay.open_epoch_start_fills == {}
+
+
+def test_fill_inventory_replay_resets_epoch_at_verified_flat_boundary() -> None:
+    order = _scoped_order()
+    route = fifo_route_scope_from_order(order)
+    assert route is not None
+    boundary_at = OBSERVED_AT + timedelta(minutes=1)
+    post_boundary_buy = _fill_event(
+        order=order,
+        side="buy",
+        quantity="3",
+        observed_at=boundary_at + timedelta(minutes=1),
+        fill_id="post-boundary-buy",
+        payload={"fill_time_precision": "exact"},
+    )
+
+    replay = replay_open_long_fill_inventory(
+        fills=[
+            _fill_event(
+                order=order,
+                side="buy",
+                quantity="2",
+                observed_at=OBSERVED_AT,
+                fill_id="pre-boundary-buy",
+                payload={"fill_time_precision": "exact"},
+            ),
+            _fill_event(
+                order=order,
+                side="sell",
+                quantity="3",
+                observed_at=OBSERVED_AT + timedelta(seconds=30),
+                fill_id="pre-boundary-unmatched-sell",
+                payload={"fill_time_precision": "exact"},
+            ),
+            post_boundary_buy,
+        ],
+        isolation_cursor=FifoIsolationCursor(
+            isolated_at_by_route_symbol={(route, "AAPL"): [boundary_at]}
+        ),
+    )
+
+    assert replay.open_quantities[(route, "AAPL")] == Decimal("3")
+    assert replay.open_epoch_start_fills[(route, "AAPL")] is post_boundary_buy
+
+
+def test_fill_inventory_replay_does_not_expose_epoch_start_for_ambiguous_fill() -> None:
+    order = _scoped_order()
+    bounded_buy = _fill_event(
+        order=order,
+        side="buy",
+        quantity="1",
+        observed_at=OBSERVED_AT,
+        fill_id="bounded-buy",
+        payload={"fill_time_precision": "observed_upper_bound"},
+    )
+
+    replay = replay_open_long_fill_inventory(fills=[bounded_buy])
+
+    assert replay.open_quantities == {}
+    assert replay.open_epoch_start_fills == {}
+
+
+def test_fill_inventory_replay_requires_explicit_exact_epoch_start() -> None:
+    order = _scoped_order()
+    route = fifo_route_scope_from_order(order)
+    assert route is not None
+
+    replay = replay_open_long_fill_inventory(
+        fills=[
+            _fill_event(
+                order=order,
+                side="buy",
+                quantity="1",
+                observed_at=OBSERVED_AT,
+                fill_id="legacy-unmarked-buy",
+            )
+        ]
+    )
+
+    assert replay.open_quantities[(route, "AAPL")] == Decimal("1")
+    assert replay.open_epoch_start_fills == {}
+
+
+def test_fill_inventory_replay_hides_epoch_start_after_unscoped_boundary() -> None:
+    order = _scoped_order()
+    route = fifo_route_scope_from_order(order)
+    assert route is not None
+    boundary_at = OBSERVED_AT + timedelta(minutes=1)
+
+    replay = replay_open_long_fill_inventory(
+        fills=[
+            _fill_event(
+                order=order,
+                side="buy",
+                quantity="1",
+                observed_at=OBSERVED_AT,
+                fill_id="exact-buy-before-legacy-boundary",
+                payload={"fill_time_precision": "exact"},
+            )
+        ],
+        isolation_cursor=FifoIsolationCursor(
+            isolated_at_by_route_symbol={},
+            legacy_unscoped_at_by_symbol={"AAPL": [boundary_at]},
+        ),
+        through=boundary_at + timedelta(minutes=1),
+    )
+
+    assert replay.open_quantities[(route, "AAPL")] == Decimal("1")
+    assert replay.indeterminate_fill_count == 1
+    assert replay.open_epoch_start_fills == {}
+
+
 def test_fill_inventory_replay_reports_exact_flat_only_after_full_sell() -> None:
     order = _scoped_order()
     replay = replay_open_long_fill_inventory(
