@@ -41,6 +41,7 @@ from app.services.monitoring import (
     _active_kis_position_filters,
     _live_automated_quote_trust_reason_for_side,
     _load_positions_by_symbol,
+    _krx_trading_day_resolver,
     _maintain_post_entry_exit_monitors,
     _quote_stale_reason,
     _sync_positions_for_monitoring_routes,
@@ -70,6 +71,7 @@ from app.services.trade_outcome_feedback import (
     REPORT_VERSION as TRADE_OUTCOME_FEEDBACK_VERSION,
     ensure_fresh_trade_outcome_feedback,
 )
+from app.services.trading_sessions import configured_krx_market_holidays
 from app.services.watch_exec_agent_sizing import (
     _inside_sizing_window,
     run_due_watch_exec_agent_sizing,
@@ -377,10 +379,6 @@ class AutonomousRuntimeCoordinator:
     _monitoring_snapshot_generation: int = field(default=0, init=False)
     _monitoring_snapshot_refresh_mutex: threading.Lock = field(
         default_factory=threading.Lock,
-        init=False,
-    )
-    _monitoring_maintenance_snapshot_loaded_at: datetime | None = field(
-        default=None,
         init=False,
     )
     _monitoring_snapshot_last_reconciled_at: datetime | None = field(default=None, init=False)
@@ -1133,14 +1131,12 @@ class AutonomousRuntimeCoordinator:
                 started_at=started_at,
                 durably_unquoteable_symbols=durably_unquoteable_symbols,
             )
-            self._mark_monitoring_maintenance_complete(workset_snapshot)
             if post_entry_maintenance_count or post_entry_review_count:
                 workset_snapshot = self._refresh_monitoring_runtime_snapshot(
                     loaded_at=started_at,
                     reason="cached_monitoring_post_entry_state_change",
                     reconcile_broker=False,
                 )
-                self._mark_monitoring_maintenance_complete(workset_snapshot)
                 workset_symbol_set = set(workset_snapshot.symbols)
                 symbols = [symbol for symbol in symbols if symbol in workset_symbol_set]
                 if not symbols and workset_snapshot.symbols:
@@ -1273,6 +1269,7 @@ class AutonomousRuntimeCoordinator:
                     adapter=adapter,
                     prices=[],
                     symbols=symbols,
+                    auth_session_factory=self.session_factory,
                     now=started_at,
                 )
             with self._lock:
@@ -1376,6 +1373,7 @@ class AutonomousRuntimeCoordinator:
                     adapter=adapter,
                     prices=prices,
                     symbols=symbols,
+                    auth_session_factory=self.session_factory,
                     now=started_at,
                 )
             reported_rearm_symbols = result.payload.get("rearmed_sell_symbols")
@@ -1471,7 +1469,6 @@ class AutonomousRuntimeCoordinator:
         with self._lock:
             self._monitoring_snapshot_generation += 1
             self._monitoring_runtime_snapshot = None
-            self._monitoring_maintenance_snapshot_loaded_at = None
             self._monitoring_next_no_price_db_check_at = None
         self.invalidate_monitoring_price_runtime_context(reason=reason)
         LOGGER.info(
@@ -1490,21 +1487,6 @@ class AutonomousRuntimeCoordinator:
         )
         if callable(invalidate):
             invalidate(reason=reason)
-
-    def _monitoring_maintenance_due(
-        self,
-        snapshot: MonitoringRuntimeSnapshot,
-    ) -> bool:
-        with self._lock:
-            return self._monitoring_maintenance_snapshot_loaded_at != snapshot.loaded_at
-
-    def _mark_monitoring_maintenance_complete(
-        self,
-        snapshot: MonitoringRuntimeSnapshot,
-    ) -> None:
-        with self._lock:
-            if self._monitoring_runtime_snapshot is snapshot:
-                self._monitoring_maintenance_snapshot_loaded_at = snapshot.loaded_at
 
     def _refresh_monitoring_runtime_snapshot(
         self,
@@ -1561,7 +1543,6 @@ class AutonomousRuntimeCoordinator:
                     "monitoring snapshot was invalidated while it was being refreshed"
                 )
             self._monitoring_runtime_snapshot = snapshot
-            self._monitoring_maintenance_snapshot_loaded_at = None
             self._monitoring_next_no_price_db_check_at = None
             if broker_reconciliation_succeeded:
                 self._monitoring_snapshot_last_reconciled_at = loaded_at
@@ -1640,7 +1621,7 @@ class AutonomousRuntimeCoordinator:
         market_date = checked_at.astimezone(KRX_TIMEZONE).date()
         if market_date.weekday() >= 5:
             return
-        configured_holidays = _configured_krx_market_holidays(
+        configured_holidays = configured_krx_market_holidays(
             self.settings.krx_market_holiday_dates
         )
         with self._lock:
@@ -1728,7 +1709,7 @@ class AutonomousRuntimeCoordinator:
         if market_date.weekday() >= 5:
             state = "closed"
             source = "weekend"
-        elif market_date in _configured_krx_market_holidays(
+        elif market_date in configured_krx_market_holidays(
             self.settings.krx_market_holiday_dates
         ):
             state = "closed"
@@ -1849,6 +1830,12 @@ class AutonomousRuntimeCoordinator:
         if not runtime_snapshot.positions_by_symbol:
             return 0, 0
         prices_by_symbol = {price.symbol: price for price in prices}
+        adapter = self._broker_adapter_for_cycle()
+        krx_trading_day = _krx_trading_day_resolver(
+            settings=self.settings,
+            adapter=adapter,
+            auth_session_factory=self.session_factory,
+        )
         with self._cycle_session_factory() as db:
             positions_by_symbol = _load_positions_by_symbol(
                 settings=self.settings,
@@ -1859,6 +1846,8 @@ class AutonomousRuntimeCoordinator:
             maintenance_count, review_count = _maintain_post_entry_exit_monitors(
                 settings=self.settings,
                 db=db,
+                adapter=adapter,
+                krx_trading_day=krx_trading_day,
                 positions_by_symbol=positions_by_symbol,
                 prices=prices_by_symbol,
                 triggered_at=started_at,
@@ -2849,9 +2838,16 @@ def _cached_monitoring_item_triggered(
     triggered_at: datetime,
 ) -> bool:
     if item.intent == "max_holding_close_sell":
+        exchange = str(item.exchange or "").strip().upper()
+        if exchange in KRX_EXCHANGES:
+            market_timezone = KRX_TIMEZONE
+        elif exchange in {"US", "NASD", "NYSE", "AMEX"}:
+            market_timezone = ZoneInfo("America/New_York")
+        else:
+            market_timezone = UTC
         return bool(
             item.close_exit_date is not None
-            and triggered_at.astimezone(UTC).date() >= item.close_exit_date
+            and triggered_at.astimezone(market_timezone).date() >= item.close_exit_date
         )
     if item.intent in WATCH_BUY_INTENTS:
         trigger_price = _cached_watch_buy_trigger_price(item)
@@ -2991,7 +2987,7 @@ def _next_enabled_domestic_session_start(
     trading_days: dict[date, bool] | None = None,
 ) -> datetime | None:
     local_now = now.astimezone(KRX_TIMEZONE)
-    holidays = _configured_krx_market_holidays(settings.krx_market_holiday_dates)
+    holidays = configured_krx_market_holidays(settings.krx_market_holiday_dates)
     authoritative_trading_days = trading_days or {}
     if _is_enabled_domestic_session(
         settings=settings,
@@ -3045,18 +3041,6 @@ def _is_enabled_domestic_session(
         settings=settings,
         session=domestic_market_session(local_now),
     )
-
-
-def _configured_krx_market_holidays(raw_dates: str) -> set[date]:
-    holidays: set[date] = set()
-    for raw_date in str(raw_dates or "").replace(",", " ").split():
-        try:
-            holidays.add(date.fromisoformat(raw_date))
-        except ValueError:
-            # Invalid optional calendar hints fail open: the runtime keeps its
-            # normal cadence instead of assuming the market is closed.
-            continue
-    return holidays
 
 
 def _is_regular_market_session(*, now: datetime, market_timezone: str) -> bool:

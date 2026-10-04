@@ -124,6 +124,30 @@ def test_cached_domestic_order_venue_matches_canonical_krx_position(
     assert item.exchange == exchange
 
 
+def test_cached_krx_max_holding_due_date_uses_kst_boundary() -> None:
+    item = CachedMonitoringItem(
+        id="krx-max-holding",
+        symbol="005930",
+        intent="max_holding_close_sell",
+        status="max_holding_close_sell_monitoring",
+        trigger_price=None,
+        close_exit_date=date(2026, 10, 7),
+        provider="kis",
+        exchange="KRX",
+    )
+
+    assert autonomous_runtime._cached_monitoring_item_triggered(
+        item=item,
+        observed_price=None,
+        triggered_at=datetime(2026, 10, 6, 14, 59, tzinfo=UTC),
+    ) is False
+    assert autonomous_runtime._cached_monitoring_item_triggered(
+        item=item,
+        observed_price=None,
+        triggered_at=datetime(2026, 10, 6, 15, 0, tzinfo=UTC),
+    ) is True
+
+
 @pytest.mark.parametrize("arity", [1, 3])
 def test_price_source_legacy_positional_signatures_are_selected_before_invocation(
     arity: int,
@@ -1803,6 +1827,59 @@ def test_cached_cycle_repairs_held_position_monitors_with_desired_symbols(monkey
     assert maintenance_calls == ["called"]
 
 
+def test_cached_repair_passes_broker_adapter_to_post_entry_maintenance(
+    monkeypatch,
+) -> None:
+    settings = Settings(database_url="sqlite:///:memory:", runtime_mode="paper")
+    engine = create_db_engine(settings)
+    session_factory = create_session_factory(engine)
+    expected_adapter = object()
+    coordinator = AutonomousRuntimeCoordinator(
+        settings=settings,
+        session_factory=session_factory,
+        broker_adapter_factory=lambda settings: expected_adapter,  # type: ignore[return-value]
+    )
+    started_at = datetime(2026, 10, 2, 2, 0, tzinfo=UTC)
+    snapshot = MonitoringRuntimeSnapshot(
+        loaded_at=started_at,
+        symbols=["005930"],
+        positions_by_symbol={
+            "005930": CachedMonitoringPosition(symbol="005930", quantity=1)
+        },
+        items=[],
+        filled_today_symbols=[],
+    )
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        autonomous_runtime,
+        "_load_positions_by_symbol",
+        lambda **kwargs: {"005930": object()},
+    )
+
+    def capture_maintenance(**kwargs: object) -> tuple[int, int]:
+        captured.update(kwargs)
+        return 0, 0
+
+    monkeypatch.setattr(
+        autonomous_runtime,
+        "_maintain_post_entry_exit_monitors",
+        capture_maintenance,
+    )
+
+    result = coordinator._repair_post_entry_exit_monitors_for_cached_cycle(
+        runtime_snapshot=snapshot,
+        prices=[MonitoringPriceRequest(symbol="005930", price=Decimal("70000"))],
+        started_at=started_at,
+    )
+
+    assert result == (0, 0)
+    guarded_adapter = captured["adapter"]
+    assert getattr(guarded_adapter, "_adapter") is expected_adapter
+    assert callable(captured["krx_trading_day"])
+    engine.dispose()
+
+
 def test_cached_cycle_persists_review_only_unpriced_us_position_state() -> None:
     settings = Settings(
         database_url="sqlite:///:memory:",
@@ -2408,12 +2485,12 @@ def test_cached_max_holding_exit_triggers_only_on_close_exit_date() -> None:
     before_due = coordinator._evaluate_cached_monitoring_cycle(
         runtime_snapshot=snapshot,
         prices=[MonitoringPriceRequest(symbol="005930", price=Decimal("70000"))],
-        started_at=datetime(2026, 9, 23, 23, 59, tzinfo=UTC),
+        started_at=datetime(2026, 9, 23, 14, 59, tzinfo=UTC),
     )
     due = coordinator._evaluate_cached_monitoring_cycle(
         runtime_snapshot=snapshot,
         prices=[MonitoringPriceRequest(symbol="005930", price=Decimal("70000"))],
-        started_at=datetime(2026, 9, 24, 0, 0, tzinfo=UTC),
+        started_at=datetime(2026, 9, 23, 15, 0, tzinfo=UTC),
     )
 
     assert before_due["triggered_item_count"] == 0
@@ -2579,7 +2656,6 @@ def test_due_cached_max_holding_exit_reaches_db_backed_monitoring_cycle(
         filled_today_symbols=[],
     )
     coordinator._monitoring_runtime_snapshot = snapshot
-    coordinator._monitoring_maintenance_snapshot_loaded_at = snapshot.loaded_at
     db_calls: list[list[str]] = []
 
     class DummySessionContext:
@@ -2679,7 +2755,6 @@ def test_recovered_cached_sell_block_reaches_db_backed_monitoring_cycle(
         filled_today_symbols=[],
     )
     coordinator._monitoring_runtime_snapshot = snapshot
-    coordinator._monitoring_maintenance_snapshot_loaded_at = snapshot.loaded_at
     db_calls: list[list[str]] = []
     loaded_prices = [
         MonitoringPriceRequest(
@@ -2751,7 +2826,6 @@ def test_recovered_cached_sell_block_reaches_db_backed_monitoring_cycle(
     )
     rearm_only_snapshot = replace(snapshot, items=[snapshot.items[0]])
     coordinator._monitoring_runtime_snapshot = rearm_only_snapshot
-    coordinator._monitoring_maintenance_snapshot_loaded_at = rearm_only_snapshot.loaded_at
     monkeypatch.setattr(
         coordinator,
         "_refresh_monitoring_runtime_snapshot",

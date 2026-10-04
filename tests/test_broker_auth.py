@@ -13,6 +13,7 @@ from fastapi.testclient import TestClient
 import pytest
 from sqlalchemy import event, select
 from sqlalchemy.exc import DBAPIError
+from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.api.schemas.execution import MonitoringPriceRequest, PlaceOrderRequest
@@ -173,6 +174,7 @@ class StubBrokerAdapter:
         account_snapshot: BrokerAccountSnapshot | None = None,
         current_prices: dict[str, Decimal] | None = None,
         krx_market_open: bool | None = True,
+        krx_market_open_by_date: dict[date, bool | None] | None = None,
         auth_error: Exception | None = None,
         approval_error: Exception | None = None,
         order_error: Exception | None = None,
@@ -191,6 +193,7 @@ class StubBrokerAdapter:
         self.account_snapshot = account_snapshot
         self.current_prices = current_prices or {}
         self.krx_market_open = krx_market_open
+        self.krx_market_open_by_date = krx_market_open_by_date or {}
         self.auth_error = auth_error
         self.approval_error = approval_error
         self.order_error = order_error
@@ -269,6 +272,8 @@ class StubBrokerAdapter:
         if self.krx_calendar_error is not None:
             raise self.krx_calendar_error
         assert access_token
+        if market_date in self.krx_market_open_by_date:
+            return self.krx_market_open_by_date[market_date]
         return self.krx_market_open
 
     def get_intraday_liquidity_snapshot(
@@ -13751,31 +13756,37 @@ def _create_filled_buy_position(
     entry_price: str = "100000.00",
     stop_price: str = "95000.00",
     quantity: int = 10,
+    source_market_date: str | None = None,
+    filled_at: str | list[str] | None = None,
+    fill_time_precision: str = "exact",
+    order_status: str = "filled",
+    canonical_fill_quantity: int | None = None,
 ) -> str:
+    item_payload: dict[str, object] = {
+        "provider": "kis",
+        "venue": "krx",
+        "asset_class": "stock",
+        "symbol": "005930",
+        "side": "buy",
+        "intent": "next_open_buy",
+        "quantity_policy": {"kind": "shares", "quantity": quantity},
+        "limit_price": entry_price,
+        "time_in_force": "day",
+        "risk_context": {"exchange": "KRX", "stop_price": stop_price},
+        "source_plan_item_id": source_plan_item_id,
+        "decision_agent_name": "short-term-decider",
+        "decision_snapshot_id": f"{plan_id}-snapshot",
+        "decision_run_id": f"{plan_id}-run",
+    }
+    if source_market_date is not None:
+        item_payload["source_market_date"] = source_market_date
     plan_response = client.post(
         "/execution-plans",
         json={
             "plan_id": plan_id,
             "source": "test-fixture",
             "market_date": market_date,
-            "items": [
-                {
-                    "provider": "kis",
-                    "venue": "krx",
-                    "asset_class": "stock",
-                    "symbol": "005930",
-                    "side": "buy",
-                    "intent": "next_open_buy",
-                    "quantity_policy": {"kind": "shares", "quantity": quantity},
-                    "limit_price": entry_price,
-                    "time_in_force": "day",
-                    "risk_context": {"exchange": "KRX", "stop_price": stop_price},
-                    "source_plan_item_id": source_plan_item_id,
-                    "decision_agent_name": "short-term-decider",
-                    "decision_snapshot_id": f"{plan_id}-snapshot",
-                    "decision_run_id": f"{plan_id}-run",
-                }
-            ],
+            "items": [item_payload],
         },
     )
     assert plan_response.status_code == 201
@@ -13784,33 +13795,53 @@ def _create_filled_buy_position(
     with app.state.db_session_factory() as session:
         buy_item = session.get(ExecutionPlanItem, buy_item_id)
         assert buy_item is not None
-        buy_item.status = "filled"
-        session.add(
-            BrokerOrder(
-                execution_plan_item_id=buy_item_id,
-                broker_name="kis",
-                mode="paper",
-                idempotency_key=f"test-filled-buy:{buy_item_id}",
-                broker_order_id=f"kis-buy-{buy_item_id}",
-                symbol="005930",
-                side="buy",
-                status="filled",
-                quantity=quantity,
-                limit_price=Decimal(entry_price),
-                venue="krx",
-                asset_class="stock",
-                submitted_at=datetime.fromisoformat(f"{market_date}T00:30:00+00:00"),
-                request_metadata={
-                    "source": "test",
-                    "exchange": "KRX",
-                    "execution_scope": _test_kis_execution_scope(
-                        app.state.settings
-                    ),
-                },
-                response_metadata={"source": "test"},
-                raw_broker_payload={"source": "test"},
-            )
+        buy_item.status = order_status
+        broker_order = BrokerOrder(
+            execution_plan_item_id=buy_item_id,
+            broker_name="kis",
+            mode="paper",
+            idempotency_key=f"test-filled-buy:{buy_item_id}",
+            broker_order_id=f"kis-buy-{buy_item_id}",
+            symbol="005930",
+            side="buy",
+            status=order_status,
+            quantity=quantity,
+            limit_price=Decimal(entry_price),
+            venue="krx",
+            asset_class="stock",
+            submitted_at=datetime.fromisoformat(f"{market_date}T00:30:00+00:00"),
+            request_metadata={
+                "source": "test",
+                "exchange": "KRX",
+                "execution_scope": _test_kis_execution_scope(app.state.settings),
+            },
+            response_metadata={"source": "test"},
+            raw_broker_payload={"source": "test"},
         )
+        session.add(broker_order)
+        session.flush()
+        fill_times = [filled_at] if isinstance(filled_at, str) else filled_at or []
+        fill_quantity = canonical_fill_quantity or (
+            quantity
+            if len(fill_times) <= 1
+            else max(1, quantity // len(fill_times))
+        )
+        for fill_index, fill_time in enumerate(fill_times):
+            session.add(
+                ExecutionFill(
+                    broker_order_pk=broker_order.id,
+                    broker_fill_id=f"fill-{buy_item_id}-{fill_index}",
+                    symbol="005930",
+                    side="buy",
+                    quantity=fill_quantity,
+                    price=Decimal(entry_price),
+                    filled_at=datetime.fromisoformat(fill_time),
+                    payload={
+                        "source": "test",
+                        "fill_time_precision": fill_time_precision,
+                    },
+                )
+            )
         session.add(
             ExecutionPosition(
                 mode="paper",
@@ -14578,6 +14609,98 @@ def test_monitoring_tightens_post_entry_stop_after_no_progress_day() -> None:
     engine.dispose()
 
 
+def test_monitoring_does_not_age_post_entry_review_on_krx_holiday() -> None:
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        krx_market_open=None,
+        krx_market_open_by_date={
+            date(2026, 10, 5): False,
+            date(2026, 10, 6): True,
+            date(2026, 10, 7): True,
+        },
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+            exec_agent_stop_loss_pct=Decimal("0.04"),
+            exec_agent_max_holding_trading_sessions=2,
+            account_drawdown_gate_enabled=False,
+        ),
+        broker_adapter=broker_adapter,
+    )
+    client = TestClient(app)
+    _create_filled_buy_position(
+        app,
+        client,
+        plan_id="plan-post-entry-holiday-review",
+        market_date="2026-10-02",
+        source_market_date="2026-10-01",
+        source_plan_item_id="core-post-entry-holiday-review",
+        filled_at="2026-10-02T01:00:00+00:00",
+    )
+
+    holiday_response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "holiday must not age the no-progress review",
+            "observed_at": "2026-10-05T01:00:00Z",
+            "prices": [{"symbol": "005930", "price": "99500.00"}],
+        },
+    )
+    assert holiday_response.status_code == 200
+    with app.state.db_session_factory() as session:
+        stop_item = session.scalar(
+            select(ExecutionPlanItem).where(
+                ExecutionPlanItem.symbol == "005930",
+                ExecutionPlanItem.intent == "stop_sell",
+            )
+        )
+        assert stop_item is not None
+        assert stop_item.trigger_price == Decimal("96000.0000")
+        assert stop_item.risk_context["post_entry_review"]["holding_session"] == 1
+        assert stop_item.risk_context["post_entry_review"]["reasons"] == []
+
+    next_session_response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "next open session may tighten the no-progress stop",
+            "observed_at": "2026-10-06T01:00:00Z",
+            "prices": [{"symbol": "005930", "price": "99500.00"}],
+        },
+    )
+    assert next_session_response.status_code == 200
+    with app.state.db_session_factory() as session:
+        stop_item = session.scalar(
+            select(ExecutionPlanItem).where(
+                ExecutionPlanItem.symbol == "005930",
+                ExecutionPlanItem.intent == "stop_sell",
+            )
+        )
+        assert stop_item is not None
+        assert stop_item.trigger_price == Decimal("99000.0000")
+        assert stop_item.risk_context["post_entry_review"]["holding_session"] == 2
+        assert stop_item.risk_context["post_entry_review"]["reasons"] == [
+            "next_day_no_progress",
+            "max_holding_without_progress",
+        ]
+
+    engine.dispose()
+
+
 def test_monitoring_submits_post_entry_max_holding_close_sell() -> None:
     broker_adapter = StubBrokerAdapter(
         config=BrokerConfig(
@@ -14916,6 +15039,980 @@ def test_monitoring_preserves_trading_session_max_holding_close_date_over_weeken
             select(BrokerOrder).where(BrokerOrder.execution_plan_item_id == max_holding_item.id)
         )
         assert order is None
+
+    engine.dispose()
+
+
+def test_monitoring_anchors_max_holding_to_first_fill_and_skips_krx_holiday() -> None:
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        krx_market_open=None,
+        krx_market_open_by_date={
+            date(2026, 10, 5): False,
+            date(2026, 10, 6): True,
+            date(2026, 10, 7): True,
+        },
+        order_placement=build_order_placement(
+            broker_order_id="kis-post-entry-krx-holiday-close"
+        ),
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+            exec_agent_max_holding_trading_sessions=2,
+            account_drawdown_gate_enabled=False,
+        ),
+        broker_adapter=broker_adapter,
+    )
+    client = TestClient(app)
+
+    _create_filled_buy_position(
+        app,
+        client,
+        plan_id="plan-post-entry-krx-holiday",
+        market_date="2026-10-02",
+        source_market_date="2026-10-01",
+        source_plan_item_id="core-post-entry-krx-holiday",
+        filled_at=[
+            "2026-10-03T01:00:00+00:00",
+            "2026-10-02T01:00:00+00:00",
+        ],
+    )
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "resolve max holding against the KRX calendar",
+            "observed_at": "2026-10-03T02:00:00Z",
+            "prices": [{"symbol": "005930", "price": "101000.00"}],
+        },
+    )
+
+    assert response.status_code == 200
+    with app.state.db_session_factory() as session:
+        item = session.scalar(
+            select(ExecutionPlanItem).where(
+                ExecutionPlanItem.symbol == "005930",
+                ExecutionPlanItem.intent == "max_holding_close_sell",
+            )
+        )
+        assert item is not None
+        assert item.source_market_date == date(2026, 10, 1)
+        assert item.risk_context["entry_market_date"] == "2026-10-02"
+        assert item.risk_context["entry_market_date_source"] == "first_buy_fill_kst"
+        assert item.risk_context["close_exit_date"] == "2026-10-07"
+        assert item.risk_context["close_exit_date_status"] == "authoritative"
+        assert item.risk_context["close_exit_date_source"] == (
+            "broker_adapter_is_krx_trading_day"
+        )
+
+    assert broker_adapter.krx_calendar_calls == [
+        date(2026, 10, 5),
+        date(2026, 10, 6),
+        date(2026, 10, 7),
+    ]
+
+    assert client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "test", "reason": "enable due exit"},
+    ).status_code == 200
+    not_due_response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "first KRX holding session is not the close date",
+            "observed_at": "2026-10-06T01:00:00Z",
+            "prices": [{"symbol": "005930", "price": "100000.00"}],
+        },
+    )
+    assert not_due_response.status_code == 200
+    assert not_due_response.json()["submitted_order_count"] == 0
+
+    due_response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "second KRX holding session is due in KST",
+            "observed_at": "2026-10-06T15:30:00Z",
+            "prices": [{"symbol": "005930", "price": "100000.00"}],
+        },
+    )
+    assert due_response.status_code == 200
+    assert due_response.json()["submitted_order_count"] == 1
+    assert len(broker_adapter.order_calls) == 1
+    assert broker_adapter.order_calls[0].side == "sell"
+    engine.dispose()
+
+
+def test_monitoring_keeps_provisional_entry_and_cleans_legacy_calendar_state() -> None:
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        krx_market_open=None,
+        krx_market_open_by_date={
+            date(2026, 10, 5): False,
+            date(2026, 10, 6): True,
+            date(2026, 10, 7): True,
+        },
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+            exec_agent_max_holding_trading_sessions=2,
+            account_drawdown_gate_enabled=False,
+        ),
+        broker_adapter=broker_adapter,
+    )
+    client = TestClient(app)
+    _create_filled_buy_position(
+        app,
+        client,
+        plan_id="plan-post-entry-bounded-fill",
+        market_date="2026-10-02",
+        source_market_date="2026-10-01",
+        source_plan_item_id="core-post-entry-bounded-fill",
+        filled_at="2026-10-05T01:00:00+00:00",
+        fill_time_precision="observed_upper_bound",
+        order_status="partially_filled",
+    )
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "bounded reconciliation time cannot become an exact entry",
+            "observed_at": "2026-10-05T02:00:00Z",
+            "prices": [{"symbol": "005930", "price": "101000.00"}],
+        },
+    )
+
+    assert response.status_code == 200
+    with app.state.db_session_factory() as session:
+        item = session.scalar(
+            select(ExecutionPlanItem).where(
+                ExecutionPlanItem.symbol == "005930",
+                ExecutionPlanItem.intent == "max_holding_close_sell",
+            )
+        )
+        assert item is not None
+        assert item.source_market_date == date(2026, 10, 1)
+        assert item.risk_context["entry_market_date"] == "2026-10-02"
+        assert item.risk_context["entry_market_date_status"] == "provisional"
+        assert item.risk_context["entry_market_date_precision"] == (
+            "upper_bound_or_unknown"
+        )
+        assert item.risk_context["close_exit_date_status"] == (
+            "entry_date_provisional"
+        )
+        assert item.risk_context["close_exit_calendar_resolution_status"] == (
+            "authoritative"
+        )
+        for write_only_key in (
+            "close_exit_calendar_attempt_count",
+            "close_exit_calendar_last_attempt_at",
+            "close_exit_calendar_last_outcome",
+            "close_exit_calendar_retry_pending",
+        ):
+            assert write_only_key not in item.risk_context
+        initial_audit_count = len(
+            session.scalars(
+                select(ExecutionPlanItemAudit).where(
+                    ExecutionPlanItemAudit.execution_plan_item_id == item.id,
+                )
+            ).all()
+        )
+        initial_update_event_count = sum(
+            event.get("event") == "post_entry_max_holding_monitor_updated"
+            for event in item.risk_context["monitoring_events"]
+        )
+        item.risk_context = {
+            **item.risk_context,
+            "close_exit_calendar_attempt_count": 9,
+            "close_exit_calendar_last_attempt_at": "2026-10-01T00:00:00+00:00",
+            "close_exit_calendar_last_outcome": "weekday_provisional",
+            "close_exit_calendar_retry_pending": True,
+        }
+        flag_modified(item, "risk_context")
+        session.commit()
+
+    repeated_response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "authoritative calendar needs no retry for provisional entry",
+            "observed_at": "2026-10-05T02:00:01Z",
+            "prices": [{"symbol": "005930", "price": "101000.00"}],
+        },
+    )
+    assert repeated_response.status_code == 200
+    with app.state.db_session_factory() as session:
+        item = session.scalar(
+            select(ExecutionPlanItem).where(
+                ExecutionPlanItem.symbol == "005930",
+                ExecutionPlanItem.intent == "max_holding_close_sell",
+            )
+        )
+        assert item is not None
+        assert item.risk_context["close_exit_calendar_resolution_status"] == (
+            "authoritative"
+        )
+        for legacy_key in (
+            "close_exit_calendar_attempt_count",
+            "close_exit_calendar_last_attempt_at",
+            "close_exit_calendar_last_outcome",
+            "close_exit_calendar_retry_pending",
+        ):
+            assert legacy_key not in item.risk_context
+        assert len(
+            session.scalars(
+                select(ExecutionPlanItemAudit).where(
+                    ExecutionPlanItemAudit.execution_plan_item_id == item.id,
+                )
+            ).all()
+        ) == initial_audit_count
+        cleaned_update_event_count = sum(
+            event.get("event") == "post_entry_max_holding_monitor_updated"
+            for event in item.risk_context["monitoring_events"]
+        )
+        assert cleaned_update_event_count == initial_update_event_count + 1
+
+    unchanged_response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "cleaned calendar metadata stays transition-deduplicated",
+            "observed_at": "2026-10-05T02:00:02Z",
+            "prices": [{"symbol": "005930", "price": "101000.00"}],
+        },
+    )
+    assert unchanged_response.status_code == 200
+    with app.state.db_session_factory() as session:
+        item = session.scalar(
+            select(ExecutionPlanItem).where(
+                ExecutionPlanItem.symbol == "005930",
+                ExecutionPlanItem.intent == "max_holding_close_sell",
+            )
+        )
+        assert item is not None
+        assert sum(
+            event.get("event") == "post_entry_max_holding_monitor_updated"
+            for event in item.risk_context["monitoring_events"]
+        ) == cleaned_update_event_count
+        assert len(
+            session.scalars(
+                select(ExecutionPlanItemAudit).where(
+                    ExecutionPlanItemAudit.execution_plan_item_id == item.id,
+                )
+            ).all()
+        ) == initial_audit_count
+
+    engine.dispose()
+
+
+def test_entry_market_date_uses_us_exchange_local_date_for_exact_fill() -> None:
+    plan = ExecutionPlan(
+        external_plan_id="us-entry-anchor",
+        source="test",
+        mode="paper",
+        market_date=date(2026, 10, 2),
+        status="accepted",
+    )
+    entry_item = ExecutionPlanItem(
+        plan=plan,
+        plan_item_index=0,
+        symbol="AAPL",
+        side="buy",
+        intent="next_open_buy",
+        status="filled",
+        provider="kis",
+        venue="kis",
+        asset_class="us_equity",
+        risk_context={"exchange": "NASD"},
+    )
+    anchor = monitoring_service._entry_market_date(
+        entry_item=entry_item,
+        entry_order=SimpleNamespace(
+            submitted_at=datetime(2026, 10, 3, 0, 30, tzinfo=UTC)
+        ),
+        inventory_entry_fill=SimpleNamespace(
+            filled_at=datetime(2026, 10, 3, 1, 30, tzinfo=UTC),
+            payload={"fill_time_precision": "exact"},
+        ),
+        fallback_at=datetime(2026, 10, 3, 2, 0, tzinfo=UTC),
+    )
+
+    assert anchor.market_date == date(2026, 10, 2)
+    assert anchor.source == "first_buy_fill_exchange_local"
+    assert anchor.status == "authoritative"
+
+
+def test_us_max_holding_monitor_records_weekday_calendar_policy() -> None:
+    plan = ExecutionPlan(
+        external_plan_id="us-max-holding-calendar-policy",
+        source="test",
+        mode="paper",
+        market_date=date(2026, 10, 2),
+        status="accepted",
+    )
+    entry_item = ExecutionPlanItem(
+        id="us-max-holding-entry",
+        plan=plan,
+        plan_item_index=0,
+        symbol="AAPL",
+        side="buy",
+        intent="next_open_buy",
+        status="filled",
+        provider="kis",
+        venue="kis",
+        asset_class="us_equity",
+        quantity_policy={"kind": "shares", "quantity": 1},
+        risk_context={"exchange": "NASD"},
+    )
+    added: list[object] = []
+
+    def unexpected_krx_calendar(_market_date: date) -> bool | None:
+        raise AssertionError("US max-holding schedule must not call the KRX calendar")
+
+    monitor, maintenance_count = (
+        monitoring_service._ensure_post_entry_max_holding_monitor(
+            db=SimpleNamespace(add=added.append),
+            entry_item=entry_item,
+            quantity=1,
+            entry_market_date=date(2026, 10, 2),
+            entry_market_date_source="first_buy_fill_exchange_local",
+            entry_market_date_status="authoritative",
+            entry_market_date_precision="exact",
+            triggered_at=datetime(2026, 10, 2, 20, 0, tzinfo=UTC),
+            max_holding_sessions=2,
+            krx_trading_day=unexpected_krx_calendar,
+        )
+    )
+
+    assert maintenance_count == 1
+    assert added == [monitor]
+    assert monitor.risk_context["close_exit_date"] == "2026-10-06"
+    assert monitor.risk_context["close_exit_date_status"] == "weekday_schedule"
+    assert monitor.risk_context["close_exit_calendar_policy"] == "weekday_calendar"
+
+
+@pytest.mark.parametrize(
+    ("exchange", "triggered_at", "calendar", "expected_sessions", "expected_status"),
+    [
+        (
+            "KRX",
+            datetime(2026, 10, 6, 1, 0, tzinfo=UTC),
+            {
+                date(2026, 10, 5): False,
+                date(2026, 10, 6): True,
+            }.get,
+            2,
+            "authoritative",
+        ),
+        (
+            "NASD",
+            datetime(2026, 10, 6, 0, 30, tzinfo=UTC),
+            {}.get,
+            2,
+            "weekday_schedule",
+        ),
+    ],
+)
+def test_persisted_holding_age_matches_shared_date_helper(
+    exchange: str,
+    triggered_at: datetime,
+    calendar,
+    expected_sessions: int,
+    expected_status: str,
+) -> None:
+    plan = ExecutionPlan(
+        external_plan_id=f"holding-age-parity-{exchange.lower()}",
+        source="test",
+        mode="paper",
+        market_date=date(2026, 10, 2),
+        status="accepted",
+    )
+    item = ExecutionPlanItem(
+        plan=plan,
+        plan_item_index=0,
+        symbol="005930" if exchange == "KRX" else "AAPL",
+        side="sell",
+        intent="target_sell",
+        status="monitoring",
+        provider="kis",
+        venue="kis",
+        asset_class="krx_equity" if exchange == "KRX" else "us_equity",
+        risk_context={
+            "exchange": exchange,
+            "entry_market_date": "2026-10-02",
+            "entry_market_date_source": "first_buy_fill_exchange_local",
+            "entry_market_date_status": "authoritative",
+            "entry_market_date_precision": "exact",
+        },
+    )
+
+    persisted_age = monitoring_service._holding_session_age(
+        item=item,
+        triggered_at=triggered_at,
+        krx_trading_day=calendar,
+        max_sessions=3,
+    )
+    shared_age = monitoring_service._holding_session_age_from_date(
+        entry_market_date=date(2026, 10, 2),
+        triggered_at=triggered_at,
+        exchange=exchange,
+        krx_trading_day=calendar,
+        entry_market_date_status="authoritative",
+        max_sessions=3,
+    )
+
+    assert persisted_age == shared_age
+    assert persisted_age.sessions == expected_sessions
+    assert persisted_age.status == expected_status
+
+
+def test_monitoring_rejects_exact_anchor_when_fill_inventory_disagrees_with_position() -> None:
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        krx_market_open=True,
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+            exec_agent_max_holding_trading_sessions=2,
+            account_drawdown_gate_enabled=False,
+        ),
+        broker_adapter=broker_adapter,
+    )
+    client = TestClient(app)
+    _create_filled_buy_position(
+        app,
+        client,
+        plan_id="plan-post-entry-inventory-mismatch",
+        market_date="2026-10-02",
+        source_plan_item_id="core-post-entry-inventory-mismatch",
+        quantity=10,
+        canonical_fill_quantity=9,
+        filled_at="2026-10-03T01:00:00+00:00",
+    )
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "canonical fill inventory must match broker position",
+            "observed_at": "2026-10-03T02:00:00Z",
+            "prices": [{"symbol": "005930", "price": "101000.00"}],
+        },
+    )
+
+    assert response.status_code == 200
+    with app.state.db_session_factory() as session:
+        item = session.scalar(
+            select(ExecutionPlanItem).where(
+                ExecutionPlanItem.symbol == "005930",
+                ExecutionPlanItem.intent == "max_holding_close_sell",
+            )
+        )
+        assert item is not None
+        assert item.risk_context["entry_market_date"] == "2026-10-02"
+        assert item.risk_context["entry_market_date_status"] == "provisional"
+        assert item.risk_context["entry_market_date_precision"] == (
+            "upper_bound_or_unknown"
+        )
+
+    engine.dispose()
+
+
+def test_krx_calendar_authentication_uses_separate_session(
+    monkeypatch,
+) -> None:
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+        ),
+        broker_adapter=broker_adapter,
+    )
+    business_db = app.state.db_session_factory()
+    business_commit_count = 0
+    auth_commit_count = 0
+    auth_sessions: list[Session] = []
+
+    @event.listens_for(business_db, "after_commit")
+    def count_business_commit(_session: Session) -> None:
+        nonlocal business_commit_count
+        business_commit_count += 1
+
+    def authenticate_without_commit(**kwargs: object) -> SimpleNamespace:
+        nonlocal auth_commit_count
+        auth_db = kwargs["db"]
+        assert isinstance(auth_db, Session)
+        auth_sessions.append(auth_db)
+
+        @event.listens_for(auth_db, "after_commit")
+        def count_auth_commit(_session: Session) -> None:
+            nonlocal auth_commit_count
+            auth_commit_count += 1
+
+        return SimpleNamespace(access_token="calendar-token")
+
+    monkeypatch.setattr(
+        monitoring_service,
+        "ensure_authenticated_broker_session",
+        authenticate_without_commit,
+    )
+
+    unavailable = monitoring_service._krx_trading_day_resolver(
+        settings=app.state.settings,
+        adapter=broker_adapter,
+        auth_session_factory=None,
+    )
+    assert unavailable(date(2026, 10, 5)) is None
+    assert auth_sessions == []
+
+    resolver = monitoring_service._krx_trading_day_resolver(
+        settings=app.state.settings,
+        adapter=broker_adapter,
+        auth_session_factory=app.state.db_session_factory,
+    )
+
+    assert resolver(date(2026, 10, 5)) is True
+    assert len(auth_sessions) == 1
+    assert auth_sessions[0] is not business_db
+    assert auth_commit_count == 1
+    assert business_commit_count == 0
+    business_db.close()
+    engine.dispose()
+
+
+def test_krx_calendar_authentication_commits_new_token_in_isolated_session(
+    tmp_path,
+) -> None:
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url=f"sqlite:///{tmp_path / 'calendar-auth.db'}",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+        ),
+        broker_adapter=broker_adapter,
+    )
+    resolver = monitoring_service._krx_trading_day_resolver(
+        settings=app.state.settings,
+        adapter=broker_adapter,
+        auth_session_factory=app.state.db_session_factory,
+    )
+
+    assert resolver(date(2026, 10, 5)) is True
+
+    with app.state.db_session_factory() as session:
+        broker_session = session.get(BrokerSession, "kis:paper")
+        assert broker_session is not None
+        assert broker_session.access_token == "top-secret-token"
+        event_row = session.scalar(
+            select(BrokerSessionEvent).where(
+                BrokerSessionEvent.broker_session_id == "kis:paper",
+                BrokerSessionEvent.action == "authenticate",
+                BrokerSessionEvent.outcome == "applied",
+            )
+        )
+        assert event_row is not None
+
+    engine.dispose()
+
+
+def test_monitoring_audits_weekday_provisional_and_retries_krx_calendar() -> None:
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        krx_market_open=None,
+        krx_market_open_by_date={date(2026, 10, 5): None},
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+            exec_agent_max_holding_trading_sessions=2,
+            account_drawdown_gate_enabled=False,
+        ),
+        broker_adapter=broker_adapter,
+    )
+    client = TestClient(app)
+    _create_filled_buy_position(
+        app,
+        client,
+        plan_id="plan-post-entry-krx-calendar-retry",
+        market_date="2026-10-02",
+        source_market_date="2026-10-01",
+        source_plan_item_id="core-post-entry-krx-calendar-retry",
+        filled_at="2026-10-02T01:00:00+00:00",
+    )
+
+    first_response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "calendar is temporarily unknown",
+            "observed_at": "2026-10-02T02:00:00Z",
+            "prices": [{"symbol": "005930", "price": "101000.00"}],
+        },
+    )
+    assert first_response.status_code == 200
+
+    with app.state.db_session_factory() as session:
+        item = session.scalar(
+            select(ExecutionPlanItem).where(
+                ExecutionPlanItem.symbol == "005930",
+                ExecutionPlanItem.intent == "max_holding_close_sell",
+            )
+        )
+        assert item is not None
+        assert item.risk_context["close_exit_date"] == "2026-10-06"
+        assert item.risk_context["close_exit_date_status"] == "weekday_provisional"
+        assert item.risk_context["close_exit_calendar_resolution_status"] == (
+            "weekday_provisional"
+        )
+        assert item.risk_context["close_exit_calendar_unknown_dates"] == ["2026-10-05"]
+        for write_only_key in (
+            "close_exit_calendar_attempt_count",
+            "close_exit_calendar_last_attempt_at",
+            "close_exit_calendar_last_outcome",
+            "close_exit_calendar_retry_pending",
+        ):
+            assert write_only_key not in item.risk_context
+        assert monitoring_service._max_holding_exit_due(
+            item=item,
+            triggered_at=datetime(2026, 10, 5, 15, 0, tzinfo=UTC),
+        ) is True
+        audit = session.scalar(
+            select(ExecutionPlanItemAudit).where(
+                ExecutionPlanItemAudit.execution_plan_item_id == item.id,
+                ExecutionPlanItemAudit.event_type
+                == "post_entry_max_holding_calendar_provisional",
+            )
+        )
+        assert audit is not None
+        assert audit.payload["calendar_contract"] == (
+            "broker_adapter_is_krx_trading_day"
+        )
+        initial_audit_count = len(
+            session.scalars(
+                select(ExecutionPlanItemAudit).where(
+                    ExecutionPlanItemAudit.execution_plan_item_id == item.id,
+                )
+            ).all()
+        )
+
+    repeated_unknown_response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "identical unknown calendar result is transition-deduplicated",
+            "observed_at": "2026-10-02T02:00:01Z",
+            "prices": [{"symbol": "005930", "price": "101000.00"}],
+        },
+    )
+    assert repeated_unknown_response.status_code == 200
+    with app.state.db_session_factory() as session:
+        item = session.scalar(
+            select(ExecutionPlanItem).where(
+                ExecutionPlanItem.symbol == "005930",
+                ExecutionPlanItem.intent == "max_holding_close_sell",
+            )
+        )
+        assert item is not None
+        assert item.risk_context["close_exit_calendar_resolution_status"] == (
+            "weekday_provisional"
+        )
+        assert len(
+            session.scalars(
+                select(ExecutionPlanItemAudit).where(
+                    ExecutionPlanItemAudit.execution_plan_item_id == item.id,
+                )
+            ).all()
+        ) == initial_audit_count
+        assert not any(
+            event.get("event") == "post_entry_max_holding_monitor_updated"
+            for event in item.risk_context["monitoring_events"]
+        )
+
+    broker_adapter.krx_market_open_by_date = {
+        date(2026, 10, 5): False,
+        date(2026, 10, 6): True,
+        date(2026, 10, 7): True,
+    }
+    second_response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "retry the calendar on the next cycle",
+            "observed_at": "2026-10-02T02:01:00Z",
+            "prices": [{"symbol": "005930", "price": "101000.00"}],
+        },
+    )
+    assert second_response.status_code == 200
+
+    with app.state.db_session_factory() as session:
+        item = session.scalar(
+            select(ExecutionPlanItem).where(
+                ExecutionPlanItem.symbol == "005930",
+                ExecutionPlanItem.intent == "max_holding_close_sell",
+            )
+        )
+        assert item is not None
+        assert item.risk_context["close_exit_date"] == "2026-10-07"
+        assert item.risk_context["close_exit_date_status"] == "authoritative"
+        assert item.risk_context["close_exit_calendar_resolution_status"] == (
+            "authoritative"
+        )
+        assert item.risk_context["close_exit_calendar_unknown_dates"] == []
+        assert session.scalar(
+            select(ExecutionPlanItemAudit).where(
+                ExecutionPlanItemAudit.execution_plan_item_id == item.id,
+                ExecutionPlanItemAudit.event_type
+                == "post_entry_max_holding_calendar_resolved",
+            )
+        ) is not None
+
+    assert broker_adapter.krx_calendar_calls.count(date(2026, 10, 5)) == 3
+    engine.dispose()
+
+
+def test_monitoring_closes_on_weekday_provisional_when_krx_calendar_stays_unknown(
+) -> None:
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(
+            broker_order_id="kis-post-entry-provisional-close"
+        ),
+        krx_market_open=None,
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+            exec_agent_max_holding_trading_sessions=2,
+            account_drawdown_gate_enabled=False,
+        ),
+        broker_adapter=broker_adapter,
+    )
+    client = TestClient(app)
+    assert client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "test", "reason": "enable provisional exit"},
+    ).status_code == 200
+    _create_filled_buy_position(
+        app,
+        client,
+        plan_id="plan-post-entry-krx-calendar-provisional-close",
+        market_date="2026-10-02",
+        source_market_date="2026-10-01",
+        source_plan_item_id="core-post-entry-krx-calendar-provisional-close",
+        filled_at="2026-10-02T01:00:00+00:00",
+    )
+
+    create_response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "create conservative provisional deadline",
+            "observed_at": "2026-10-02T02:00:00Z",
+            "prices": [{"symbol": "005930", "price": "100000.00"}],
+        },
+    )
+    assert create_response.status_code == 200
+    assert create_response.json()["submitted_order_count"] == 0
+
+    due_response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "calendar remains unknown at the conservative deadline",
+            "observed_at": "2026-10-05T15:00:00Z",
+            "prices": [{"symbol": "005930", "price": "100000.00"}],
+        },
+    )
+
+    assert due_response.status_code == 200
+    assert due_response.json()["submitted_order_count"] == 1
+    assert len(broker_adapter.order_calls) == 1
+    assert broker_adapter.order_calls[0].side == "sell"
+    with app.state.db_session_factory() as session:
+        item = session.scalar(
+            select(ExecutionPlanItem).where(
+                ExecutionPlanItem.symbol == "005930",
+                ExecutionPlanItem.intent == "max_holding_close_sell",
+            )
+        )
+        assert item is not None
+        assert item.risk_context["close_exit_date"] == "2026-10-06"
+        assert item.risk_context["close_exit_date_status"] == "weekday_provisional"
+
+    engine.dispose()
+
+
+def test_monitoring_revalidates_authoritative_future_krx_deadline() -> None:
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        krx_market_open=True,
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+            exec_agent_max_holding_trading_sessions=2,
+            account_drawdown_gate_enabled=False,
+        ),
+        broker_adapter=broker_adapter,
+    )
+    client = TestClient(app)
+    _create_filled_buy_position(
+        app,
+        client,
+        plan_id="plan-post-entry-calendar-revalidation",
+        market_date="2026-10-02",
+        source_plan_item_id="core-post-entry-calendar-revalidation",
+        filled_at="2026-10-02T01:00:00+00:00",
+    )
+
+    first = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "record initially authoritative deadline",
+            "observed_at": "2026-10-02T02:00:00Z",
+            "prices": [{"symbol": "005930", "price": "101000.00"}],
+        },
+    )
+    assert first.status_code == 200
+    with app.state.db_session_factory() as session:
+        item = session.scalar(
+            select(ExecutionPlanItem).where(
+                ExecutionPlanItem.symbol == "005930",
+                ExecutionPlanItem.intent == "max_holding_close_sell",
+            )
+        )
+        assert item is not None
+        assert item.risk_context["close_exit_date"] == "2026-10-06"
+
+    broker_adapter.krx_market_open = None
+    broker_adapter.krx_market_open_by_date = {
+        date(2026, 10, 5): False,
+        date(2026, 10, 6): True,
+        date(2026, 10, 7): True,
+    }
+    second = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "calendar correction moves future deadline",
+            "observed_at": "2026-10-02T02:01:00Z",
+            "prices": [{"symbol": "005930", "price": "101000.00"}],
+        },
+    )
+    assert second.status_code == 200
+    with app.state.db_session_factory() as session:
+        item = session.scalar(
+            select(ExecutionPlanItem).where(
+                ExecutionPlanItem.symbol == "005930",
+                ExecutionPlanItem.intent == "max_holding_close_sell",
+            )
+        )
+        assert item is not None
+        assert item.risk_context["close_exit_date"] == "2026-10-07"
+        assert item.risk_context["close_exit_date_status"] == "authoritative"
 
     engine.dispose()
 
@@ -15507,7 +16604,7 @@ def test_monitoring_evaluate_triggers_profit_protection_after_peak_giveback() ->
     assert second.status_code == 200
     payload = second.json()
     assert payload["triggered_item_count"] == 1
-    assert payload["submitted_order_count"] == 1
+    assert payload["submitted_order_count"] == 1, payload["items"]
     item_payload = payload["items"][0]
     assert item_payload["outcome"] == "submitted"
     assert item_payload["trigger_reason"] == "profit_protection_trailing_stop"
@@ -15902,6 +16999,12 @@ def test_monitoring_evaluate_triggers_aged_position_profit_protection() -> None:
         ),
         token_grant=build_token_grant(),
         order_placement=build_order_placement(broker_order_id="kis-aged-profit-protect-100"),
+        krx_market_open=True,
+        krx_market_open_by_date={
+            date(2026, 10, 2): True,
+            date(2026, 10, 5): False,
+            date(2026, 10, 6): True,
+        },
     )
     app, engine = build_test_app(
         settings=Settings(
@@ -15914,6 +17017,8 @@ def test_monitoring_evaluate_triggers_aged_position_profit_protection() -> None:
             profit_protection_giveback_pct=Decimal("1.2"),
             profit_protection_aged_session_min=2,
             profit_protection_aged_min_current_profit_pct=Decimal("0.5"),
+            exec_agent_max_holding_trading_sessions=10,
+            account_drawdown_gate_enabled=False,
         ),
         broker_adapter=broker_adapter,
     )
@@ -15925,53 +17030,62 @@ def test_monitoring_evaluate_triggers_aged_position_profit_protection() -> None:
     )
     assert resume.status_code == 200
 
-    plan_response = client.post(
-        "/execution-plans",
+    _create_filled_buy_position(
+        app,
+        client,
+        plan_id="plan-aged-profit-protect-monitor",
+        market_date="2026-10-02",
+        source_market_date="2026-10-01",
+        source_plan_item_id="core-aged-profit-protect-monitor",
+        quantity=4,
+        filled_at="2026-10-02T01:00:00+00:00",
+    )
+
+    peak_response = client.post(
+        "/monitoring/evaluate",
         json={
-            "plan_id": "plan-aged-profit-protect-monitor",
-            "source": "test-fixture",
-            "market_date": "2026-05-26",
-            "items": [
-                {
-                    "symbol": "005930",
-                    "side": "sell",
-                    "intent": "target_sell",
-                    "quantity_policy": {"kind": "position_exit_from_entry"},
-                    "trigger_price": "110000.00",
-                    "risk_context": {
-                        "exchange": "KRX",
-                        "profit_protection": {
-                            "peak_price": "101800.0000",
-                            "peak_profit_pct": "1.8000",
-                        },
-                    },
-                }
-            ],
+            "actor": "ops",
+            "source": "test",
+            "reason": "establish a sub-threshold profit peak on entry day",
+            "observed_at": "2026-10-02T02:00:00Z",
+            "prices": [{"symbol": "005930", "price": "101800.00"}],
         },
     )
-    assert plan_response.status_code == 201
-    plan_item_id = plan_response.json()["persisted_execution_item_ids"][0]
-
+    assert peak_response.status_code == 200
+    assert peak_response.json()["submitted_order_count"] == 0
     with app.state.db_session_factory() as session:
-        session.add(
-            ExecutionPosition(
-                mode="paper",
-                symbol="005930",
-                quantity=4,
-                average_price=Decimal("100000.0000"),
-                updated_from="reconciliation",
-                raw_payload={"source": "broker"},
+        target_item = session.scalar(
+            select(ExecutionPlanItem).where(
+                ExecutionPlanItem.symbol == "005930",
+                ExecutionPlanItem.intent == "target_sell",
             )
         )
-        session.commit()
+        assert target_item is not None
+        plan_item_id = target_item.id
+        assert target_item.risk_context["profit_protection"]["peak_profit_pct"] == (
+            "1.8000"
+        )
+
+    holiday_response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "holiday does not age profit protection",
+            "observed_at": "2026-10-05T01:00:00Z",
+            "prices": [{"symbol": "005930", "price": "100500.00"}],
+        },
+    )
+    assert holiday_response.status_code == 200
+    assert holiday_response.json()["submitted_order_count"] == 0
 
     response = client.post(
         "/monitoring/evaluate",
         json={
             "actor": "ops",
             "source": "test",
-            "reason": "protect aged positive position",
-            "observed_at": "2026-05-27T01:00:00Z",
+            "reason": "protect positive position on its second KRX session",
+            "observed_at": "2026-10-06T01:00:00Z",
             "prices": [{"symbol": "005930", "price": "100500.00"}],
         },
     )
@@ -15980,15 +17094,33 @@ def test_monitoring_evaluate_triggers_aged_position_profit_protection() -> None:
     payload = response.json()
     assert payload["triggered_item_count"] == 1
     assert payload["submitted_order_count"] == 1
-    item_payload = payload["items"][0]
-    assert item_payload["trigger_reason"] == "aged_position_profit_protection"
-    assert item_payload["trigger"]["holding_session"] == 2
-    assert item_payload["trigger"]["current_profit_pct"] == "0.5000"
-    assert item_payload["trigger"]["giveback_pct"] == "1.3000"
-
     assert len(broker_adapter.order_calls) == 1
-    assert broker_adapter.order_calls[0].execution_plan_item_id == plan_item_id
-    assert broker_adapter.order_calls[0].quantity == 4
+    result = next(
+        item
+        for item in payload["items"]
+        if item["execution_plan_item_id"] == plan_item_id
+    )
+    assert result["trigger_reason"] == "aged_position_profit_protection"
+    assert result["trigger"]["holding_session"] == 2
+    assert result["trigger"]["holding_session_status"] == "authoritative"
+    with app.state.db_session_factory() as session:
+        target_item = session.get(ExecutionPlanItem, plan_item_id)
+        assert target_item is not None
+        holding_age = monitoring_service._holding_session_age(
+            item=target_item,
+            triggered_at=datetime(2026, 10, 6, 1, 0, tzinfo=UTC),
+            krx_trading_day={
+                date(2026, 10, 2): True,
+                date(2026, 10, 5): False,
+                date(2026, 10, 6): True,
+            }.get,
+            max_sessions=2,
+        )
+        assert holding_age.sessions == 2
+        assert holding_age.status == "authoritative"
+        assert target_item.risk_context["profit_protection"]["current_profit_pct"] == (
+            "0.5000"
+        )
 
     engine.dispose()
 

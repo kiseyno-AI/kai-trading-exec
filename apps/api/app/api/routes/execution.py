@@ -301,6 +301,7 @@ def monitoring_evaluate(
         db=db,
         adapter=adapter,
         command=payload,
+        auth_session_factory=request.app.state.db_session_factory,
     )
     if result.status_code < 500:
         _invalidate_execution_runtime(

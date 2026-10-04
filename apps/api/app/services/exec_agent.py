@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from typing import Any, Literal, Protocol
 
@@ -45,13 +45,14 @@ from app.services.position_identity import (
     build_position_identity,
 )
 from app.services.fifo_inventory import fifo_route_scope_from_order
+from app.services.market_regime_guardrails import market_regime_context_from_item_payloads
 from app.services.risk_sizing import (
     RiskSizingRejection,
     RiskSizingResult,
     effective_stop_price,
     resolve_risk_based_buy_quantity,
 )
-from app.services.market_regime_guardrails import market_regime_context_from_item_payloads
+from app.services.trading_sessions import add_weekday_sessions
 from app.services.broker_order_state import (
     CAPITAL_RESERVING_ORDER_STATUSES,
     active_local_broker_order_filters,
@@ -2947,8 +2948,9 @@ def _new_monitoring_item(
     max_sessions: int,
     exit_rule: dict[str, object],
 ) -> ExecutionPlanItem:
-    buy_market_date = buy_item.source_market_date or plan.market_date
-    close_exit_date = _add_trading_sessions(buy_market_date, max_sessions + 1) if buy_market_date else None
+    provisional_entry_date = plan.market_date
+    close_exit_date = add_weekday_sessions(provisional_entry_date, max_sessions)
+    source_market_date = buy_item.source_market_date
     provider = str(buy_item.provider or "kis").strip().lower()
     if provider != "kis":
         raise PositionIdentityConflictError(
@@ -2977,7 +2979,16 @@ def _new_monitoring_item(
         "confidence": decision.get("confidence"),
         "max_holding_trading_sessions": max_sessions,
         "close_exit_date": close_exit_date.isoformat() if close_exit_date else None,
+        "close_exit_date_status": "weekday_provisional",
+        "close_exit_date_source": "plan_market_date",
+        "close_exit_calendar_unknown_dates": [],
         "close_exit_policy": "market_on_or_after_close_exit_date",
+        "entry_market_date": (
+            provisional_entry_date.isoformat() if provisional_entry_date else None
+        ),
+        "entry_market_date_source": "plan_market_date",
+        "entry_market_date_status": "provisional",
+        "entry_market_date_precision": "unknown",
         **({"exchange": exchange} if exchange else {}),
     }
     route_binding = kis_account_route_binding_from_payloads(
@@ -3003,23 +3014,11 @@ def _new_monitoring_item(
             buy_item,
             f"{intent}:{exit_rule.get('stage') or exit_rule.get('kind') or 'default'}",
         ),
-        source_market_date=buy_market_date,
+        source_market_date=source_market_date,
         provider=provider,
         venue=buy_item.venue,
         asset_class=buy_item.asset_class,
     )
-
-
-def _add_trading_sessions(start: date | None, sessions: int) -> date | None:
-    if start is None:
-        return None
-    current = start
-    added = 0
-    while added < sessions:
-        current = current + timedelta(days=1)
-        if current.weekday() < 5:
-            added += 1
-    return current
 
 
 def _monitoring_source_plan_item_id(item: ExecutionPlanItem, intent: str) -> str | None:

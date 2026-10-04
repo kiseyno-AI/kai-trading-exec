@@ -18,7 +18,7 @@ from zoneinfo import ZoneInfo
 
 from sqlalchemy import and_, distinct, func, or_, select, tuple_, update
 from sqlalchemy import inspect as sa_inspect
-from sqlalchemy.orm import Session, load_only, selectinload
+from sqlalchemy.orm import Session, load_only, selectinload, sessionmaker
 from sqlalchemy.orm.attributes import set_committed_value
 
 from app.api.schemas.execution import (
@@ -120,6 +120,15 @@ from app.services.runtime_controls import (
     automated_buy_submission_allowed,
     automated_buy_submission_block_reason,
     ensure_runtime_control_state,
+)
+from app.services.trading_sessions import (
+    TradingSessionDeadline,
+    TradingSessionAge,
+    add_weekday_sessions,
+    count_krx_holding_sessions,
+    count_weekday_holding_sessions,
+    configured_krx_market_holidays,
+    resolve_krx_session_deadline,
 )
 from app.services.runtime_transitions import (
     ACTIVE_SELL_MONITORING_STATUSES,
@@ -315,6 +324,14 @@ LATE_ENTRY_GATE_EVENT_TYPE = "watch_buy_late_entry_gate"
 class EvaluateMonitoringResult:
     status_code: int
     payload: dict[str, object]
+
+
+@dataclass(frozen=True)
+class EntryMarketDateAnchor:
+    market_date: date
+    source: str
+    status: str
+    precision: str
 
 
 @dataclass(frozen=True)
@@ -1073,6 +1090,7 @@ def evaluate_monitoring(
     db: Session,
     adapter: BrokerAdapter,
     command: MonitoringEvaluationRequest,
+    auth_session_factory: sessionmaker[Session] | None = None,
     now: datetime | None = None,
 ) -> EvaluateMonitoringResult:
     prices_by_symbol = {price.symbol: price for price in command.prices}
@@ -1088,6 +1106,11 @@ def evaluate_monitoring(
         triggered_at=_normalize_utc(now or command.observed_at or datetime.now(UTC)),
         allow_persisted_triggered_without_price=False,
         update_checkpoint_if_idle=True,
+        krx_trading_day=_krx_trading_day_resolver(
+            settings=settings,
+            adapter=adapter,
+            auth_session_factory=auth_session_factory,
+        ),
     )
 
 
@@ -1098,6 +1121,7 @@ def run_autonomous_monitoring_cycle(
     adapter: BrokerAdapter,
     prices: list[MonitoringPriceRequest] | None = None,
     symbols: list[str] | set[str] | None = None,
+    auth_session_factory: sessionmaker[Session] | None = None,
     now: datetime | None = None,
 ) -> EvaluateMonitoringResult:
     symbol_scope = _ordered_symbol_scope(symbols)
@@ -1110,6 +1134,11 @@ def run_autonomous_monitoring_cycle(
         triggered_at=_normalize_utc(now or datetime.now(UTC)),
         allow_persisted_triggered_without_price=True,
         update_checkpoint_if_idle=False,
+        krx_trading_day=_krx_trading_day_resolver(
+            settings=settings,
+            adapter=adapter,
+            auth_session_factory=auth_session_factory,
+        ),
     )
 
 
@@ -2385,7 +2414,9 @@ def _evaluate_monitoring_cycle(
     triggered_at: datetime,
     allow_persisted_triggered_without_price: bool,
     update_checkpoint_if_idle: bool,
+    krx_trading_day: Callable[[date], bool | None] | None = None,
 ) -> EvaluateMonitoringResult:
+    resolved_krx_trading_day = krx_trading_day or (lambda _market_date: None)
     cycle_started = time.monotonic()
     checkpoint_execution_scope = _monitoring_checkpoint_execution_scope(
         settings=settings,
@@ -2491,6 +2522,8 @@ def _evaluate_monitoring_cycle(
         post_entry_maintenance_count, post_entry_review_count = _maintain_post_entry_exit_monitors(
             settings=settings,
             db=db,
+            adapter=adapter,
+            krx_trading_day=resolved_krx_trading_day,
             positions_by_symbol=positions_by_symbol,
             prices=prices,
             triggered_at=triggered_at,
@@ -2839,6 +2872,7 @@ def _evaluate_monitoring_cycle(
                 position=item_position,
                 observed_price=observed_price,
                 triggered_at=triggered_at,
+                krx_trading_day=resolved_krx_trading_day,
             )
             if profit_protection is not None:
                 trigger_reason = profit_protection.reason
@@ -9244,6 +9278,8 @@ def _maintain_post_entry_exit_monitors(
     *,
     settings: Settings,
     db: Session,
+    adapter: BrokerAdapter | None = None,
+    krx_trading_day: Callable[[date], bool | None] | None = None,
     positions_by_symbol: dict[str, ExecutionPosition],
     prices: dict[str, MonitoringPriceRequest],
     triggered_at: datetime,
@@ -9251,6 +9287,11 @@ def _maintain_post_entry_exit_monitors(
 ) -> tuple[int, int]:
     maintenance_count = 0
     review_count = 0
+    resolved_krx_trading_day = krx_trading_day or _krx_trading_day_resolver(
+        settings=settings,
+        adapter=adapter,
+        auth_session_factory=None,
+    )
     for symbol, position in positions_by_symbol.items():
         if position.quantity <= 0:
             continue
@@ -9287,10 +9328,30 @@ def _maintain_post_entry_exit_monitors(
             side="sell",
             runtime_mode=settings.runtime_mode,
         )
-        entry_date = _entry_market_date(entry_item=entry_item, entry_order=entry_order)
-        holding_session = _holding_session_age_from_date(
-            entry_market_date=entry_date,
+        inventory_entry_fill = _current_open_inventory_entry_fill(
+            settings=settings,
+            db=db,
+            symbol=symbol,
+            entry_order=entry_order,
+            position_quantity=position.quantity,
+            through=triggered_at,
+        )
+        entry_anchor = _entry_market_date(
+            entry_item=entry_item,
+            entry_order=entry_order,
+            inventory_entry_fill=inventory_entry_fill,
+            fallback_at=triggered_at,
+        )
+        holding_age = _holding_session_age_from_date(
+            entry_market_date=entry_anchor.market_date,
             triggered_at=triggered_at,
+            exchange=_plan_item_exchange(entry_item),
+            krx_trading_day=resolved_krx_trading_day,
+            entry_market_date_status=entry_anchor.status,
+            max_sessions=max(
+                2,
+                settings.exec_agent_max_holding_trading_sessions,
+            ),
         )
         initial_stop = _post_entry_initial_stop_price(
             settings=settings,
@@ -9303,6 +9364,10 @@ def _maintain_post_entry_exit_monitors(
             quantity=position.quantity,
             stop_price=initial_stop,
             entry_price=entry_price,
+            entry_market_date=entry_anchor.market_date,
+            entry_market_date_source=entry_anchor.source,
+            entry_market_date_status=entry_anchor.status,
+            entry_market_date_precision=entry_anchor.precision,
             triggered_at=triggered_at,
         )
         maintenance_count += stop_maintenance_count
@@ -9312,6 +9377,10 @@ def _maintain_post_entry_exit_monitors(
             entry_item=entry_item,
             quantity=position.quantity,
             entry_price=entry_price,
+            entry_market_date=entry_anchor.market_date,
+            entry_market_date_source=entry_anchor.source,
+            entry_market_date_status=entry_anchor.status,
+            entry_market_date_precision=entry_anchor.precision,
             triggered_at=triggered_at,
         )
         maintenance_count += target_maintenance_count
@@ -9319,9 +9388,13 @@ def _maintain_post_entry_exit_monitors(
             db=db,
             entry_item=entry_item,
             quantity=position.quantity,
-            entry_market_date=entry_date,
+            entry_market_date=entry_anchor.market_date,
+            entry_market_date_source=entry_anchor.source,
+            entry_market_date_status=entry_anchor.status,
+            entry_market_date_precision=entry_anchor.precision,
             triggered_at=triggered_at,
             max_holding_sessions=settings.exec_agent_max_holding_trading_sessions,
+            krx_trading_day=resolved_krx_trading_day,
         )
         maintenance_count += max_holding_maintenance_count
 
@@ -9329,7 +9402,10 @@ def _maintain_post_entry_exit_monitors(
             settings=settings,
             entry_price=entry_price,
             observed_price=observed_price,
-            holding_session=holding_session,
+            holding_session=holding_age.sessions,
+            holding_session_status=holding_age.status,
+            holding_session_source=holding_age.source,
+            holding_session_count_capped_at=holding_age.capped_at,
             stop_price=stop_item.trigger_price,
             triggered_at=triggered_at,
         )
@@ -9390,18 +9466,22 @@ def _latest_filled_buy_order(
             active_order_route,
             BrokerOrder.symbol == symbol,
             BrokerOrder.side == "buy",
-            BrokerOrder.status == "filled",
+            BrokerOrder.status.in_(("filled", "partially_filled")),
             ExecutionPlan.mode == settings.runtime_mode,
         )
         .options(
             load_only(
                 BrokerOrder.id,
                 BrokerOrder.execution_plan_item_id,
+                BrokerOrder.broker_name,
                 BrokerOrder.symbol,
                 BrokerOrder.side,
                 BrokerOrder.status,
                 BrokerOrder.quantity,
                 BrokerOrder.limit_price,
+                BrokerOrder.venue,
+                BrokerOrder.asset_class,
+                BrokerOrder.request_metadata,
                 BrokerOrder.submitted_at,
                 BrokerOrder.updated_at,
                 BrokerOrder.created_at,
@@ -9970,27 +10050,273 @@ def _new_existing_position_exit_monitor(
     return item
 
 
+def _current_open_inventory_entry_fill(
+    *,
+    settings: Settings,
+    db: Session,
+    symbol: str,
+    entry_order: BrokerOrder,
+    position_quantity: int,
+    through: datetime,
+) -> ExecutionFill | None:
+    """Return the first fill of the current exact open-inventory epoch.
+
+    The shared FIFO replay owns flat/re-entry, add-on, isolation-boundary, and
+    ambiguous chronology semantics.  This function only selects the active
+    order route and applies the stricter timestamp contract required for a
+    holding-period anchor.
+    """
+
+    route_scope = fifo_route_scope_from_order(entry_order)
+    normalized_symbol = str(symbol or "").strip().upper()
+    if route_scope is None or not normalized_symbol:
+        return None
+    normalized_through = _normalize_utc(through)
+    fills = db.scalars(
+        select(ExecutionFill)
+        .join(BrokerOrder, BrokerOrder.id == ExecutionFill.broker_order_pk)
+        .where(
+            *_active_kis_order_filters(settings=settings),
+            ExecutionFill.symbol == normalized_symbol,
+            ExecutionFill.filled_at <= normalized_through,
+        )
+        .options(
+            load_only(
+                ExecutionFill.id,
+                ExecutionFill.idempotency_key,
+                ExecutionFill.broker_order_pk,
+                ExecutionFill.broker_fill_id,
+                ExecutionFill.symbol,
+                ExecutionFill.side,
+                ExecutionFill.quantity,
+                ExecutionFill.base_quantity,
+                ExecutionFill.quote_notional,
+                ExecutionFill.price,
+                ExecutionFill.settlement_currency,
+                ExecutionFill.transaction_cost,
+                ExecutionFill.transaction_cost_coverage,
+                ExecutionFill.transaction_cost_source,
+                ExecutionFill.filled_at,
+                ExecutionFill.payload,
+            ),
+            selectinload(ExecutionFill.broker_order).load_only(
+                BrokerOrder.id,
+                BrokerOrder.execution_plan_item_id,
+                BrokerOrder.broker_name,
+                BrokerOrder.symbol,
+                BrokerOrder.venue,
+                BrokerOrder.asset_class,
+                BrokerOrder.request_metadata,
+            ),
+        )
+        .order_by(ExecutionFill.filled_at.asc(), ExecutionFill.id.asc())
+    ).all()
+    canonical_fills = dedupe_execution_fills(fills)
+    replay = replay_open_long_fill_inventory(
+        fills=canonical_fills,
+        isolation_cursor=load_fifo_isolation_cursor(
+            db=db,
+            runtime_mode=settings.runtime_mode,
+            through=normalized_through,
+        ),
+        through=normalized_through,
+    )
+    route_symbol = (route_scope, normalized_symbol)
+    if replay.open_quantities.get(route_symbol) != Decimal(position_quantity):
+        return None
+    fill = replay.open_epoch_start_fills.get(route_symbol)
+    payload = fill.payload if fill is not None and isinstance(fill.payload, dict) else {}
+    if payload.get("fill_time_precision") != "exact":
+        return None
+    return fill
+
+
 def _entry_market_date(
     *,
     entry_item: ExecutionPlanItem,
     entry_order: BrokerOrder,
-) -> date:
-    if entry_item.source_market_date is not None:
-        return entry_item.source_market_date
+    inventory_entry_fill: ExecutionFill | None,
+    fallback_at: datetime,
+) -> EntryMarketDateAnchor:
+    market_timezone = _plan_item_market_timezone(entry_item) or KRX_TIMEZONE
+    exchange = _plan_item_exchange(entry_item)
+    if inventory_entry_fill is not None:
+        first_fill_at = _normalize_utc(inventory_entry_fill.filled_at)
+        return EntryMarketDateAnchor(
+            market_date=first_fill_at.astimezone(market_timezone).date(),
+            source=(
+                "first_buy_fill_kst"
+                if exchange in KRX_EXCHANGES
+                else "first_buy_fill_exchange_local"
+            ),
+            status="authoritative",
+            precision="exact",
+        )
+    provisional_candidates: list[tuple[date, str]] = []
     if entry_item.plan is not None and entry_item.plan.market_date is not None:
-        return entry_item.plan.market_date
+        provisional_candidates.append((entry_item.plan.market_date, "plan_market_date"))
     if entry_order.submitted_at is not None:
-        return _normalize_utc(entry_order.submitted_at).astimezone(KRX_TIMEZONE).date()
-    return datetime.now(KRX_TIMEZONE).date()
+        provisional_candidates.append(
+            (
+                _normalize_utc(entry_order.submitted_at)
+                .astimezone(market_timezone)
+                .date(),
+                (
+                    "buy_order_submitted_at_kst"
+                    if exchange in KRX_EXCHANGES
+                    else "buy_order_submitted_at_exchange_local"
+                ),
+            )
+        )
+    if provisional_candidates:
+        market_date, source = min(provisional_candidates, key=lambda candidate: candidate[0])
+        if len({candidate[0] for candidate in provisional_candidates}) > 1:
+            source = "conservative_plan_or_submission_date"
+        return EntryMarketDateAnchor(
+            market_date=market_date,
+            source=source,
+            status="provisional",
+            precision="upper_bound_or_unknown",
+        )
+    return EntryMarketDateAnchor(
+        market_date=_normalize_utc(fallback_at).astimezone(market_timezone).date(),
+        source=(
+            "monitoring_cycle_kst"
+            if exchange in KRX_EXCHANGES
+            else "monitoring_cycle_exchange_local"
+        ),
+        status="provisional",
+        precision="unknown",
+    )
+
+
+def _krx_trading_day_resolver(
+    *,
+    settings: Settings,
+    adapter: BrokerAdapter | None,
+    auth_session_factory: sessionmaker[Session] | None,
+) -> Callable[[date], bool | None]:
+    configured_holidays = configured_krx_market_holidays(
+        settings.krx_market_holiday_dates
+    )
+    cached_results: dict[date, bool | None] = {}
+    broker_access_token: str | None = None
+    authentication_attempted = False
+    calendar_checker = (
+        getattr(adapter, "is_krx_trading_day", None)
+        if adapter is not None
+        else None
+    )
+
+    def resolve(market_date: date) -> bool | None:
+        nonlocal authentication_attempted, broker_access_token
+        if market_date in configured_holidays:
+            return False
+        if market_date in cached_results:
+            return cached_results[market_date]
+        if adapter is None:
+            cached_results[market_date] = None
+            return None
+        if not callable(calendar_checker):
+            cached_results[market_date] = None
+            return None
+        if not authentication_attempted:
+            authentication_attempted = True
+            if auth_session_factory is not None:
+                try:
+                    # Authentication may commit token and audit state. Keep
+                    # that durable work outside the Session that owns
+                    # monitoring locks and plan-item mutations.
+                    with auth_session_factory() as auth_db:
+                        try:
+                            broker_session = ensure_authenticated_broker_session(
+                                settings=settings,
+                                db=auth_db,
+                                adapter=adapter,
+                                source="post_entry_max_holding_calendar",
+                                reason=(
+                                    "resolve KRX sessions for holding-period risk controls"
+                                ),
+                            )
+                            issued_access_token = broker_session.access_token or ""
+                            auth_db.commit()
+                        except Exception:
+                            auth_db.rollback()
+                            raise
+                        broker_access_token = issued_access_token
+                except Exception as exc:
+                    logger.warning(
+                        "post_entry_max_holding_calendar_auth_unavailable",
+                        extra={"error_type": exc.__class__.__name__},
+                    )
+        if broker_access_token is None:
+            cached_results[market_date] = None
+            return None
+        try:
+            resolved = calendar_checker(
+                broker_access_token,
+                market_date=market_date,
+            )
+        except Exception as exc:
+            logger.warning(
+                "post_entry_max_holding_calendar_unavailable",
+                extra={
+                    "market_date": market_date.isoformat(),
+                    "error_type": exc.__class__.__name__,
+                },
+            )
+            resolved = None
+        cached_results[market_date] = resolved if isinstance(resolved, bool) else None
+        return cached_results[market_date]
+
+    return resolve
 
 
 def _holding_session_age_from_date(
     *,
     entry_market_date: date,
     triggered_at: datetime,
-) -> int:
-    market_date = triggered_at.astimezone(KRX_TIMEZONE).date()
-    return max(1, (market_date - entry_market_date).days + 1)
+    exchange: str,
+    krx_trading_day: Callable[[date], bool | None],
+    entry_market_date_status: str,
+    max_sessions: int,
+) -> TradingSessionAge:
+    if exchange in KRX_EXCHANGES:
+        market_date = triggered_at.astimezone(KRX_TIMEZONE).date()
+        age = count_krx_holding_sessions(
+            entry_date=entry_market_date,
+            market_date=market_date,
+            is_trading_day=krx_trading_day,
+            max_sessions=max_sessions,
+        )
+        if entry_market_date_status != "authoritative" and age.status == "authoritative":
+            return TradingSessionAge(
+                sessions=age.sessions,
+                status="entry_date_provisional",
+                source=f"{age.source}_with_provisional_entry",
+                unknown_dates=age.unknown_dates,
+                capped_at=age.capped_at,
+            )
+        return age
+    market_timezone = (
+        ZoneInfo("America/New_York")
+        if exchange in {"US", "NASD", "NYSE", "AMEX"}
+        else UTC
+    )
+    market_date = triggered_at.astimezone(market_timezone).date()
+    return TradingSessionAge(
+        sessions=count_weekday_holding_sessions(entry_market_date, market_date),
+        status=(
+            "weekday_schedule"
+            if entry_market_date_status == "authoritative"
+            else "entry_date_provisional"
+        ),
+        source=(
+            "weekday_calendar"
+            if entry_market_date_status == "authoritative"
+            else "weekday_calendar_with_provisional_entry"
+        ),
+    )
 
 
 def _post_entry_initial_stop_price(
@@ -10022,6 +10348,10 @@ def _ensure_post_entry_stop_monitor(
     quantity: int,
     stop_price: Decimal,
     entry_price: Decimal,
+    entry_market_date: date,
+    entry_market_date_source: str,
+    entry_market_date_status: str,
+    entry_market_date_precision: str,
     triggered_at: datetime,
 ) -> tuple[ExecutionPlanItem, int]:
     plan = entry_item.plan
@@ -10045,10 +10375,20 @@ def _ensure_post_entry_stop_monitor(
             risk_context={
                 "exchange": _plan_item_exchange(entry_item),
                 **_inherited_kis_account_route_context(entry_item),
+                **_entry_market_date_context(
+                    entry_market_date=entry_market_date,
+                    entry_market_date_source=entry_market_date_source,
+                    entry_market_date_status=entry_market_date_status,
+                    entry_market_date_precision=entry_market_date_precision,
+                ),
                 "entry_context": _post_entry_context(
                     entry_item=entry_item,
                     entry_price=entry_price,
                     quantity=quantity,
+                    entry_market_date=entry_market_date,
+                    entry_market_date_source=entry_market_date_source,
+                    entry_market_date_status=entry_market_date_status,
+                    entry_market_date_precision=entry_market_date_precision,
                 ),
                 "deterministic_emergency_stop": True,
                 "post_entry_managed": True,
@@ -10110,12 +10450,24 @@ def _ensure_post_entry_stop_monitor(
     risk_context = dict(existing.risk_context) if isinstance(existing.risk_context, dict) else {}
     risk_context.setdefault("exchange", _plan_item_exchange(entry_item))
     risk_context.update(_inherited_kis_account_route_context(entry_item))
+    risk_context.update(
+        _entry_market_date_context(
+            entry_market_date=entry_market_date,
+            entry_market_date_source=entry_market_date_source,
+            entry_market_date_status=entry_market_date_status,
+            entry_market_date_precision=entry_market_date_precision,
+        )
+    )
     risk_context.setdefault("deterministic_emergency_stop", True)
     risk_context.setdefault("post_entry_managed", True)
     risk_context["entry_context"] = _post_entry_context(
         entry_item=entry_item,
         entry_price=entry_price,
         quantity=quantity,
+        entry_market_date=entry_market_date,
+        entry_market_date_source=entry_market_date_source,
+        entry_market_date_status=entry_market_date_status,
+        entry_market_date_precision=entry_market_date_precision,
     )
     existing.risk_context = risk_context
     if not _quantity_policy_supported(existing.quantity_policy):
@@ -10156,6 +10508,10 @@ def _ensure_post_entry_target_monitor(
     entry_item: ExecutionPlanItem,
     quantity: int,
     entry_price: Decimal,
+    entry_market_date: date,
+    entry_market_date_source: str,
+    entry_market_date_status: str,
+    entry_market_date_precision: str,
     triggered_at: datetime,
 ) -> tuple[ExecutionPlanItem | None, int]:
     target_price = _watch_buy_target_price(entry_item)
@@ -10193,10 +10549,20 @@ def _ensure_post_entry_target_monitor(
             risk_context={
                 "exchange": _plan_item_exchange(entry_item),
                 **_inherited_kis_account_route_context(entry_item),
+                **_entry_market_date_context(
+                    entry_market_date=entry_market_date,
+                    entry_market_date_source=entry_market_date_source,
+                    entry_market_date_status=entry_market_date_status,
+                    entry_market_date_precision=entry_market_date_precision,
+                ),
                 "entry_context": _post_entry_context(
                     entry_item=entry_item,
                     entry_price=entry_price,
                     quantity=quantity,
+                    entry_market_date=entry_market_date,
+                    entry_market_date_source=entry_market_date_source,
+                    entry_market_date_status=entry_market_date_status,
+                    entry_market_date_precision=entry_market_date_precision,
                 ),
                 "post_entry_managed": True,
             },
@@ -10266,11 +10632,23 @@ def _ensure_post_entry_target_monitor(
     risk_context = dict(existing.risk_context) if isinstance(existing.risk_context, dict) else {}
     risk_context.setdefault("exchange", _plan_item_exchange(entry_item))
     risk_context.update(_inherited_kis_account_route_context(entry_item))
+    risk_context.update(
+        _entry_market_date_context(
+            entry_market_date=entry_market_date,
+            entry_market_date_source=entry_market_date_source,
+            entry_market_date_status=entry_market_date_status,
+            entry_market_date_precision=entry_market_date_precision,
+        )
+    )
     risk_context.setdefault("post_entry_managed", True)
     risk_context["entry_context"] = _post_entry_context(
         entry_item=entry_item,
         entry_price=entry_price,
         quantity=quantity,
+        entry_market_date=entry_market_date,
+        entry_market_date_source=entry_market_date_source,
+        entry_market_date_status=entry_market_date_status,
+        entry_market_date_precision=entry_market_date_precision,
     )
     existing.risk_context = risk_context
     return existing, maintenance_count
@@ -10306,8 +10684,12 @@ def _ensure_post_entry_max_holding_monitor(
     entry_item: ExecutionPlanItem,
     quantity: int,
     entry_market_date: date,
+    entry_market_date_source: str,
+    entry_market_date_status: str,
+    entry_market_date_precision: str,
     triggered_at: datetime,
     max_holding_sessions: int,
+    krx_trading_day: Callable[[date], bool | None],
 ) -> tuple[ExecutionPlanItem, int]:
     plan = entry_item.plan
     assert plan is not None
@@ -10316,9 +10698,79 @@ def _ensure_post_entry_max_holding_monitor(
         entry_item=entry_item,
         intent="max_holding_close_sell",
     )
-    close_exit_date = _add_trading_sessions(entry_market_date, max_holding_sessions)
+    exchange = _plan_item_exchange(entry_item)
+    if exchange in KRX_EXCHANGES:
+        calendar_deadline = resolve_krx_session_deadline(
+            entry_date=entry_market_date,
+            sessions=max_holding_sessions,
+            is_trading_day=krx_trading_day,
+        )
+        calendar_resolution_status = calendar_deadline.status
+        calendar_resolution_source = calendar_deadline.source
+        deadline = calendar_deadline
+        if (
+            entry_market_date_status != "authoritative"
+            and calendar_resolution_status == "authoritative"
+        ):
+            deadline = TradingSessionDeadline(
+                close_date=deadline.close_date,
+                status="entry_date_provisional",
+                source="broker_adapter_is_krx_trading_day_with_provisional_entry",
+                unknown_dates=deadline.unknown_dates,
+            )
+    else:
+        weekday_close_date = add_weekday_sessions(
+            entry_market_date,
+            max_holding_sessions,
+        )
+        assert weekday_close_date is not None
+        deadline = TradingSessionDeadline(
+            close_date=weekday_close_date,
+            status=(
+                "weekday_schedule"
+                if entry_market_date_status == "authoritative"
+                else "entry_date_provisional"
+            ),
+            source=(
+                "weekday_calendar"
+                if entry_market_date_status == "authoritative"
+                else "weekday_calendar_with_provisional_entry"
+            ),
+        )
+        calendar_resolution_status = "not_applicable"
+        calendar_resolution_source = "weekday_schedule"
+    deadline_context: dict[str, object] = {
+        "close_exit_date": deadline.close_date.isoformat(),
+        "close_exit_date_status": deadline.status,
+        "close_exit_date_source": deadline.source,
+        "close_exit_calendar_unknown_dates": [
+            unknown_date.isoformat() for unknown_date in deadline.unknown_dates
+        ],
+        "entry_market_date": entry_market_date.isoformat(),
+        "entry_market_date_source": entry_market_date_source,
+        "entry_market_date_status": entry_market_date_status,
+        "entry_market_date_precision": entry_market_date_precision,
+        "max_holding_sessions": max_holding_sessions,
+        "close_exit_calendar_policy": (
+            "broker_adapter_is_krx_trading_day"
+            if exchange in KRX_EXCHANGES
+            else "weekday_calendar"
+        ),
+    }
+    if exchange in KRX_EXCHANGES:
+        deadline_context.update(
+            {
+                "close_exit_calendar_resolution_status": (
+                    calendar_resolution_status
+                ),
+                "close_exit_calendar_resolution_source": (
+                    calendar_resolution_source
+                ),
+            }
+        )
     if existing is None:
         existing = ExecutionPlanItem(
+            id=new_id(),
             plan=plan,
             plan_item_index=_next_plan_item_index(plan),
             symbol=entry_item.symbol,
@@ -10328,14 +10780,17 @@ def _ensure_post_entry_max_holding_monitor(
             quantity_policy={"kind": "position_exit_from_entry"},
             time_in_force=entry_item.time_in_force or "day",
             risk_context={
-                "exchange": _plan_item_exchange(entry_item),
+                "exchange": exchange,
                 **_inherited_kis_account_route_context(entry_item),
-                "close_exit_date": close_exit_date.isoformat(),
-                "max_holding_sessions": max_holding_sessions,
+                **deadline_context,
                 "entry_context": _post_entry_context(
                     entry_item=entry_item,
                     entry_price=None,
                     quantity=quantity,
+                    entry_market_date=entry_market_date,
+                    entry_market_date_source=entry_market_date_source,
+                    entry_market_date_status=entry_market_date_status,
+                    entry_market_date_precision=entry_market_date_precision,
                 ),
                 "post_entry_managed": True,
             },
@@ -10354,47 +10809,146 @@ def _ensure_post_entry_max_holding_monitor(
             event={
                 "event": "post_entry_max_holding_monitor_created",
                 "entry_execution_plan_item_id": entry_item.id,
-                "close_exit_date": close_exit_date.isoformat(),
+                **deadline_context,
                 "recorded_at": triggered_at.isoformat(),
             },
+        )
+        _record_post_entry_max_holding_calendar_audit(
+            db=db,
+            item=existing,
+            deadline=deadline,
+            calendar_resolution_status=calendar_resolution_status,
+            calendar_resolution_source=calendar_resolution_source,
+            entry_market_date=entry_market_date,
+            entry_market_date_source=entry_market_date_source,
+            entry_market_date_status=entry_market_date_status,
+            entry_market_date_precision=entry_market_date_precision,
+            max_holding_sessions=max_holding_sessions,
+            triggered_at=triggered_at,
+            exchange=exchange,
         )
         return existing, 1
 
     risk_context = dict(existing.risk_context) if isinstance(existing.risk_context, dict) else {}
-    if risk_context.get("close_exit_date") != close_exit_date.isoformat():
-        risk_context["close_exit_date"] = close_exit_date.isoformat()
-        risk_context["max_holding_sessions"] = max_holding_sessions
+    removed_legacy_calendar_telemetry = [
+        key
+        for key in (
+            "close_exit_calendar_attempt_count",
+            "close_exit_calendar_last_attempt_at",
+            "close_exit_calendar_last_outcome",
+            "close_exit_calendar_retry_pending",
+        )
+        if key in risk_context
+    ]
+    for key in removed_legacy_calendar_telemetry:
+        risk_context.pop(key)
+    deadline_changed = any(
+        risk_context.get(key) != value
+        for key, value in deadline_context.items()
+    )
+    if deadline_changed or removed_legacy_calendar_telemetry:
+        risk_context.update(deadline_context)
         existing.risk_context = risk_context
         maintenance_count += 1
+        update_event: dict[str, object] = {
+            "event": "post_entry_max_holding_monitor_updated",
+            **deadline_context,
+            "recorded_at": triggered_at.isoformat(),
+        }
+        if removed_legacy_calendar_telemetry:
+            update_event["removed_legacy_calendar_telemetry"] = (
+                removed_legacy_calendar_telemetry
+            )
         _record_monitoring_event(
             item=existing,
-            event={
-                "event": "post_entry_max_holding_monitor_updated",
-                "close_exit_date": close_exit_date.isoformat(),
-                "recorded_at": triggered_at.isoformat(),
-            },
+            event=update_event,
         )
+        if deadline_changed:
+            _record_post_entry_max_holding_calendar_audit(
+                db=db,
+                item=existing,
+                deadline=deadline,
+                calendar_resolution_status=calendar_resolution_status,
+                calendar_resolution_source=calendar_resolution_source,
+                entry_market_date=entry_market_date,
+                entry_market_date_source=entry_market_date_source,
+                entry_market_date_status=entry_market_date_status,
+                entry_market_date_precision=entry_market_date_precision,
+                max_holding_sessions=max_holding_sessions,
+                triggered_at=triggered_at,
+                exchange=exchange,
+            )
         risk_context = dict(existing.risk_context) if isinstance(existing.risk_context, dict) else {}
-    risk_context.setdefault("exchange", _plan_item_exchange(entry_item))
+    risk_context.setdefault("exchange", exchange)
     risk_context.update(_inherited_kis_account_route_context(entry_item))
     risk_context.setdefault("post_entry_managed", True)
     risk_context["entry_context"] = _post_entry_context(
         entry_item=entry_item,
         entry_price=None,
         quantity=quantity,
+        entry_market_date=entry_market_date,
+        entry_market_date_source=entry_market_date_source,
+        entry_market_date_status=entry_market_date_status,
+        entry_market_date_precision=entry_market_date_precision,
     )
     existing.risk_context = risk_context
     return existing, maintenance_count
 
 
-def _add_trading_sessions(start: date, sessions: int) -> date:
-    current = start
-    added = 0
-    while added < max(1, sessions):
-        current = current + timedelta(days=1)
-        if current.weekday() < 5:
-            added += 1
-    return current
+def _record_post_entry_max_holding_calendar_audit(
+    *,
+    db: Session,
+    item: ExecutionPlanItem,
+    deadline: TradingSessionDeadline,
+    calendar_resolution_status: str,
+    calendar_resolution_source: str,
+    entry_market_date: date,
+    entry_market_date_source: str,
+    entry_market_date_status: str,
+    entry_market_date_precision: str,
+    max_holding_sessions: int,
+    triggered_at: datetime,
+    exchange: str,
+) -> None:
+    if exchange not in KRX_EXCHANGES:
+        return
+    event_type = (
+        "post_entry_max_holding_calendar_resolved"
+        if calendar_resolution_status == "authoritative"
+        else "post_entry_max_holding_calendar_provisional"
+    )
+    payload: dict[str, object] = {
+        "status": deadline.status,
+        "source": deadline.source,
+        "calendar_resolution_status": calendar_resolution_status,
+        "calendar_resolution_source": calendar_resolution_source,
+        "calendar_contract": "broker_adapter_is_krx_trading_day",
+        "entry_market_date": entry_market_date.isoformat(),
+        "entry_market_date_source": entry_market_date_source,
+        "entry_market_date_status": entry_market_date_status,
+        "entry_market_date_precision": entry_market_date_precision,
+        "close_exit_date": deadline.close_date.isoformat(),
+        "max_holding_sessions": max_holding_sessions,
+        "unknown_dates": [
+            unknown_date.isoformat() for unknown_date in deadline.unknown_dates
+        ],
+        "recorded_at": triggered_at.isoformat(),
+    }
+    db.add(
+        ExecutionPlanItemAudit(
+            execution_plan_item_id=item.id,
+            event_type=event_type,
+            source=MONITORING_WORKER_NAME,
+            summary={
+                "status": deadline.status,
+                "source": deadline.source,
+                "symbol": item.symbol,
+                "close_exit_date": deadline.close_date.isoformat(),
+            },
+            payload=payload,
+            occurred_at=triggered_at,
+        )
+    )
 
 
 def _active_sibling_monitor(
@@ -10466,6 +11020,10 @@ def _post_entry_context(
     entry_item: ExecutionPlanItem,
     entry_price: Decimal | None,
     quantity: int,
+    entry_market_date: date,
+    entry_market_date_source: str,
+    entry_market_date_status: str,
+    entry_market_date_precision: str,
 ) -> dict[str, object]:
     context: dict[str, object] = {
         "source_plan_item_id": entry_item.source_plan_item_id,
@@ -10473,10 +11031,29 @@ def _post_entry_context(
         "decision_run_id": entry_item.decision_run_id,
         "decision_snapshot_id": entry_item.decision_snapshot_id,
         "entry_quantity": quantity,
+        "entry_market_date": entry_market_date.isoformat(),
+        "entry_market_date_source": entry_market_date_source,
+        "entry_market_date_status": entry_market_date_status,
+        "entry_market_date_precision": entry_market_date_precision,
     }
     if entry_price is not None:
         context["entry_price"] = _serialize_decimal(entry_price)
     return context
+
+
+def _entry_market_date_context(
+    *,
+    entry_market_date: date,
+    entry_market_date_source: str,
+    entry_market_date_status: str,
+    entry_market_date_precision: str,
+) -> dict[str, object]:
+    return {
+        "entry_market_date": entry_market_date.isoformat(),
+        "entry_market_date_source": entry_market_date_source,
+        "entry_market_date_status": entry_market_date_status,
+        "entry_market_date_precision": entry_market_date_precision,
+    }
 
 
 def _inherited_kis_account_route_context(
@@ -10504,6 +11081,9 @@ def _post_entry_review_state(
     entry_price: Decimal,
     observed_price: Decimal | None,
     holding_session: int,
+    holding_session_status: str,
+    holding_session_source: str,
+    holding_session_count_capped_at: int | None,
     stop_price: Decimal | None,
     triggered_at: datetime,
 ) -> dict[str, object]:
@@ -10539,6 +11119,9 @@ def _post_entry_review_state(
         "current_pnl_pct": _serialize_decimal(current_pnl_pct),
         "max_adverse_excursion_pct": _serialize_decimal(adverse_pct),
         "holding_session": holding_session,
+        "holding_session_status": holding_session_status,
+        "holding_session_source": holding_session_source,
+        "holding_session_count_capped_at": holding_session_count_capped_at,
         "tightened_stop_price": _serialize_decimal(tightened_stop),
         "recorded_at": triggered_at.isoformat(),
     }
@@ -11238,6 +11821,7 @@ def _evaluate_profit_protection(
     position: ExecutionPosition | None,
     observed_price: Decimal | None,
     triggered_at: datetime,
+    krx_trading_day: Callable[[date], bool | None],
 ) -> ProfitProtectionDecision | None:
     if item.intent != "target_sell" or observed_price is None:
         return None
@@ -11256,12 +11840,24 @@ def _evaluate_profit_protection(
     )
     peak_profit_pct = _parse_decimal(state.get("peak_profit_pct")) or current_profit_pct
     giveback_pct = peak_profit_pct - current_profit_pct
-    holding_session = _holding_session_age(item=item, triggered_at=triggered_at)
+    holding_age = _holding_session_age(
+        item=item,
+        triggered_at=triggered_at,
+        krx_trading_day=krx_trading_day,
+        max_sessions=settings.profit_protection_aged_session_min,
+    )
+    holding_session = holding_age.sessions
     metadata = {
         **state,
         "current_profit_pct": _serialize_decimal(current_profit_pct),
         "giveback_pct": _serialize_decimal(giveback_pct),
         "holding_session": holding_session,
+        "holding_session_status": holding_age.status,
+        "holding_session_source": holding_age.source,
+        "holding_session_calendar_unknown_dates": [
+            unknown_date.isoformat() for unknown_date in holding_age.unknown_dates
+        ],
+        "holding_session_count_capped_at": holding_age.capped_at,
         "min_peak_pct": _serialize_decimal(settings.profit_protection_min_peak_pct),
         "giveback_threshold_pct": _serialize_decimal(settings.profit_protection_giveback_pct),
         "aged_session_min": settings.profit_protection_aged_session_min,
@@ -11373,12 +11969,72 @@ def _profit_pct(*, current_price: Decimal, average_price: Decimal) -> Decimal:
     return ((current_price - average_price) / average_price) * Decimal("100")
 
 
-def _holding_session_age(*, item: ExecutionPlanItem, triggered_at: datetime) -> int:
-    source_date = item.source_market_date or item.plan.market_date
-    if source_date is None:
-        return 1
-    market_date = triggered_at.astimezone(KRX_TIMEZONE).date()
-    return max(1, (market_date - source_date).days + 1)
+def _holding_session_age(
+    *,
+    item: ExecutionPlanItem,
+    triggered_at: datetime,
+    krx_trading_day: Callable[[date], bool | None],
+    max_sessions: int,
+) -> TradingSessionAge:
+    entry_anchor = _persisted_entry_market_date_anchor(item)
+    if entry_anchor is None:
+        return TradingSessionAge(
+            sessions=1,
+            status="weekday_provisional",
+            source="entry_market_date_unavailable",
+        )
+    return _holding_session_age_from_date(
+        entry_market_date=entry_anchor.market_date,
+        triggered_at=triggered_at,
+        exchange=_plan_item_exchange(item),
+        krx_trading_day=krx_trading_day,
+        entry_market_date_status=entry_anchor.status,
+        max_sessions=max_sessions,
+    )
+
+
+def _persisted_entry_market_date_anchor(
+    item: ExecutionPlanItem,
+) -> EntryMarketDateAnchor | None:
+    risk_context = _loaded_risk_context(item)
+    nested_entry_context = risk_context.get("entry_context")
+    candidates = [
+        (
+            risk_context.get("entry_market_date"),
+            risk_context.get("entry_market_date_source"),
+            risk_context.get("entry_market_date_status"),
+            risk_context.get("entry_market_date_precision"),
+        ),
+        (
+            nested_entry_context.get("entry_market_date"),
+            nested_entry_context.get("entry_market_date_source"),
+            nested_entry_context.get("entry_market_date_status"),
+            nested_entry_context.get("entry_market_date_precision"),
+        )
+        if isinstance(nested_entry_context, dict)
+        else (None, None, None, None),
+    ]
+    for raw_date, raw_source, raw_status, raw_precision in candidates:
+        if not isinstance(raw_date, str):
+            continue
+        try:
+            market_date = date.fromisoformat(raw_date)
+        except ValueError:
+            continue
+        return EntryMarketDateAnchor(
+            market_date=market_date,
+            source=str(raw_source or "persisted_entry_market_date"),
+            status=str(raw_status or "provisional"),
+            precision=str(raw_precision or "unknown"),
+        )
+    if item.plan is not None and item.plan.market_date is not None:
+        return EntryMarketDateAnchor(
+            market_date=item.plan.market_date,
+            source="plan_market_date_legacy_fallback",
+            status="provisional",
+            precision="unknown",
+        )
+    return None
 
 
 def _parse_decimal(value: object) -> Decimal | None:
@@ -11400,7 +12056,8 @@ def _max_holding_exit_due(*, item: ExecutionPlanItem, triggered_at: datetime) ->
         close_exit_date = datetime.strptime(raw_close_exit_date, "%Y-%m-%d").date()
     except ValueError:
         return False
-    return triggered_at.astimezone(UTC).date() >= close_exit_date
+    market_timezone = _plan_item_market_timezone(item) or UTC
+    return triggered_at.astimezone(market_timezone).date() >= close_exit_date
 
 
 def _resolve_sell_quantity(
@@ -14276,13 +14933,17 @@ def _place_monitoring_order(
         exchange=_plan_item_exchange(item),
         metadata=order_metadata,
     )
-    authority_context = dict(_loaded_risk_context(item))
+    authority_context = compact_json_object(dict(_loaded_risk_context(item)))
     authority_context["monitoring_order_authority"] = {
         "policy_version": 1,
         "source": f"monitoring:{MONITORING_WORKER_NAME}",
         "command": order_request.model_dump(mode="json"),
     }
-    item.risk_context = compact_json_object(authority_context)
+    # This is executable authority, so its command must survive verbatim.  In
+    # particular, nested trigger audit fields (for example unknown KRX dates)
+    # may exceed the generic compactor's depth and would otherwise stop the
+    # broker boundary from recognizing the server-owned transform.
+    item.risk_context = authority_context
     # The cycle has already staged a trigger status on this ORM item. Persist
     # that status and its command authority only while the durable row remains
     # claimable; an unconditional flush can resurrect a stale item over a Core
