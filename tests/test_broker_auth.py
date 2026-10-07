@@ -3,6 +3,7 @@ from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from hashlib import sha256
 import hmac
+import socket
 import stat
 from threading import Event, Thread
 import time
@@ -604,6 +605,183 @@ def test_kis_http_client_serializes_request_start_times(monkeypatch) -> None:
     client._wait_for_request_slot()
 
     assert sleeps == [pytest.approx(0.1)]
+
+
+def test_kis_http_client_retries_retryable_network_get_once(monkeypatch) -> None:
+    client = UrllibJsonHttpClient(
+        get_network_retry_attempts=1,
+        get_network_retry_backoff_seconds=0.25,
+    )
+    attempts = 0
+    sleeps: list[float] = []
+
+    def request_json(**kwargs) -> JsonHttpResponse:
+        nonlocal attempts
+        del kwargs
+        attempts += 1
+        if attempts == 1:
+            raise BrokerAdapterError(
+                "temporary network failure",
+                classification=BrokerErrorClassification.NETWORK,
+                retryable=True,
+            )
+        return JsonHttpResponse(status_code=200, headers={}, payload={"ok": True})
+
+    monkeypatch.setattr(client, "_request_json", request_json)
+    monkeypatch.setattr(kis_module.time, "sleep", sleeps.append)
+
+    response = client.get_json(
+        url="https://broker.invalid/quote",
+        headers={},
+        params={"symbol": "005930"},
+        timeout_seconds=1,
+    )
+
+    assert response.payload == {"ok": True}
+    assert attempts == 2
+    assert sleeps == [pytest.approx(0.25)]
+
+
+def test_kis_http_client_retries_direct_read_socket_timeout_for_get(
+    monkeypatch,
+) -> None:
+    client = UrllibJsonHttpClient(
+        get_network_retry_attempts=1,
+        get_network_retry_backoff_seconds=0,
+    )
+    attempts = 0
+
+    class TimeoutResponse:
+        status = 200
+        headers = {}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            raise socket.timeout("timed out")
+
+    class OkResponse:
+        status = 200
+        headers = {}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return b'{"ok": true}'
+
+    def fake_urlopen(*_args, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        return TimeoutResponse() if attempts == 1 else OkResponse()
+
+    monkeypatch.setattr(kis_module, "urlopen", fake_urlopen)
+
+    response = client.get_json(
+        url="https://broker.invalid/quote",
+        headers={},
+        params={"symbol": "005930"},
+        timeout_seconds=1,
+    )
+
+    assert response.payload == {"ok": True}
+    assert attempts == 2
+
+
+def test_kis_http_client_does_not_retry_post_network_failure(monkeypatch) -> None:
+    client = UrllibJsonHttpClient(
+        get_network_retry_attempts=3,
+        get_network_retry_backoff_seconds=0,
+    )
+    attempts = 0
+
+    def request_json(**kwargs) -> JsonHttpResponse:
+        nonlocal attempts
+        del kwargs
+        attempts += 1
+        raise BrokerAdapterError(
+            "temporary network failure",
+            classification=BrokerErrorClassification.NETWORK,
+            retryable=True,
+        )
+
+    monkeypatch.setattr(client, "_request_json", request_json)
+
+    with pytest.raises(BrokerAdapterError, match="temporary network failure"):
+        client.post_json(
+            url="https://broker.invalid/order",
+            headers={},
+            payload={"symbol": "005930"},
+            timeout_seconds=1,
+        )
+
+    assert attempts == 1
+
+
+def test_kis_http_client_normalizes_direct_read_timeout_without_retrying_post(
+    monkeypatch,
+) -> None:
+    client = UrllibJsonHttpClient(
+        get_network_retry_attempts=3,
+        get_network_retry_backoff_seconds=0,
+    )
+    attempts = 0
+
+    class TimeoutResponse:
+        status = 200
+        headers = {}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            raise socket.timeout("timed out")
+
+    def fake_urlopen(*_args, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        return TimeoutResponse()
+
+    monkeypatch.setattr(kis_module, "urlopen", fake_urlopen)
+
+    with pytest.raises(BrokerAdapterError) as exc_info:
+        client.post_json(
+            url="https://broker.invalid/order",
+            headers={},
+            payload={"symbol": "005930"},
+            timeout_seconds=1,
+        )
+
+    assert attempts == 1
+    assert exc_info.value.status_code == 503
+    assert exc_info.value.classification == BrokerErrorClassification.NETWORK
+    assert exc_info.value.retryable is True
+    assert (
+        exc_info.value.normalized_status
+        == NormalizedBrokerOrderStatus.RETRY_PENDING
+    )
+
+
+def test_settings_load_kis_get_network_retry_environment_fields() -> None:
+    settings = load_settings(
+        {
+            "KAI_EXEC_KIS_GET_NETWORK_RETRY_ATTEMPTS": "2",
+            "KAI_EXEC_KIS_GET_NETWORK_RETRY_BACKOFF_SECONDS": "0.5",
+        }
+    )
+
+    assert settings.kis_get_network_retry_attempts == 2
+    assert settings.kis_get_network_retry_backoff_seconds == pytest.approx(0.5)
 
 
 def test_settings_load_profit_protection_environment_fields() -> None:

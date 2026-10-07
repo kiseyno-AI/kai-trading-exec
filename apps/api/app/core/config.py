@@ -263,6 +263,8 @@ class Settings(BaseModel):
     kis_use_hashkey: bool = True
     kis_request_timeout_seconds: int = Field(default=10, ge=1, le=120)
     kis_min_request_interval_seconds: float = Field(default=0.12, ge=0, le=10)
+    kis_get_network_retry_attempts: int = Field(default=1, ge=0, le=3)
+    kis_get_network_retry_backoff_seconds: float = Field(default=0.25, ge=0, le=5)
     kis_token_refresh_margin_seconds: int = Field(default=300, ge=0, le=172_799)
     kis_token_failure_cooldown_seconds: int = Field(default=60, ge=60, le=3600)
     kis_token_request_timeout_seconds: int = Field(default=15, ge=1, le=120)
@@ -678,6 +680,8 @@ _ENV_FIELDS = {
     "KIS_USE_HASHKEY": "kis_use_hashkey",
     "KIS_REQUEST_TIMEOUT_SECONDS": "kis_request_timeout_seconds",
     "KIS_MIN_REQUEST_INTERVAL_SECONDS": "kis_min_request_interval_seconds",
+    "KIS_GET_NETWORK_RETRY_ATTEMPTS": "kis_get_network_retry_attempts",
+    "KIS_GET_NETWORK_RETRY_BACKOFF_SECONDS": "kis_get_network_retry_backoff_seconds",
     "KIS_TOKEN_REFRESH_MARGIN_SECONDS": "kis_token_refresh_margin_seconds",
     "KIS_TOKEN_FAILURE_COOLDOWN_SECONDS": "kis_token_failure_cooldown_seconds",
     "KIS_TOKEN_REQUEST_TIMEOUT_SECONDS": "kis_token_request_timeout_seconds",
