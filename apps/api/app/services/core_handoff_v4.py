@@ -8,6 +8,7 @@ from typing import Any
 
 from pydantic import ValidationError
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
 from app.api.schemas.execution import (
@@ -136,6 +137,17 @@ def create_core_execution_plan_v4(
             },
         )
 
+    duplicate_delta_plan_id = _duplicate_delta_batch_plan_id(
+        db=db,
+        command=command,
+    )
+    if duplicate_delta_plan_id is not None:
+        return _duplicate_delta_failure(
+            settings=settings,
+            command=command,
+            existing_plan_id=duplicate_delta_plan_id,
+        )
+
     if any(item.asset_class == "us_equity" for item in command.items):
         # Exec's current delegated sizing worker is KRW/KRX-specific. Accepting
         # a USD plan here would produce a durable capability acknowledgement,
@@ -198,6 +210,21 @@ def create_core_execution_plan_v4(
                 "runtime": {"mode": settings.runtime_mode},
             },
         )
+    if command.metadata.dispatch_batch_type == "delta":
+        plan.dispatch_batch_key = str(command.metadata.dispatch_batch_key).strip()
+        try:
+            db.flush()
+        except IntegrityError:
+            db.rollback()
+            existing_plan_id = _duplicate_delta_batch_plan_id(
+                db=db,
+                command=command,
+            )
+            return _duplicate_delta_failure(
+                settings=settings,
+                command=command,
+                existing_plan_id=existing_plan_id,
+            )
     protected_family_failure = _protected_entry_family_failure(
         command=command,
         plan=plan,
@@ -276,6 +303,49 @@ def create_core_execution_plan_v4(
             "accepted_item_count": len(plan.items),
             "rejected_item_count": 0,
             **contract_payload,
+        },
+    )
+
+
+def _duplicate_delta_batch_plan_id(
+    *,
+    db: Session,
+    command: CoreExecutionPlanRequestV4,
+) -> str | None:
+    batch_key = _nonempty_text(command.metadata.dispatch_batch_key)
+    if command.metadata.dispatch_batch_type != "delta" or batch_key is None:
+        return None
+    return db.scalar(
+        select(ExecutionPlan.external_plan_id).where(
+            ExecutionPlan.mode == command.mode,
+            ExecutionPlan.source == command.source,
+            ExecutionPlan.dispatch_batch_key == batch_key,
+        )
+    )
+
+
+def _duplicate_delta_failure(
+    *,
+    settings: Settings,
+    command: CoreExecutionPlanRequestV4,
+    existing_plan_id: str | None,
+) -> CreateExecutionPlanResult:
+    return CreateExecutionPlanResult(
+        status_code=409,
+        payload={
+            "plan_id": command.plan_id,
+            "reason_code": "duplicate_delta_batch",
+            "existing_plan_id": existing_plan_id,
+            "accepted_item_count": 0,
+            "rejected_item_count": len(command.items),
+            "validation_failures": [
+                {
+                    "field": "metadata.dispatch_batch_key",
+                    "message": "delta dispatch batch was already persisted",
+                }
+            ],
+            "persisted_execution_item_ids": [],
+            "runtime": {"mode": settings.runtime_mode},
         },
     )
 
@@ -1366,7 +1436,7 @@ def _watch_rejection_policy_matches(
     quantity_policy: dict[str, object],
     item: ExecutionPlanItem,
 ) -> bool:
-    expected_keys = {
+    legacy_keys = {
         "kind",
         "source",
         "reason",
@@ -1376,9 +1446,12 @@ def _watch_rejection_policy_matches(
         "exec_agent_decision_audit",
         "previous_policy",
     }
+    canonical_keys = legacy_keys | {"reason_family", "rejection_disposition"}
     decision = quantity_policy.get("exec_agent_decision")
+    policy_keys = set(quantity_policy)
+    has_canonical_disposition = policy_keys == canonical_keys
     return bool(
-        set(quantity_policy) == expected_keys
+        policy_keys in {frozenset(legacy_keys), frozenset(canonical_keys)}
         and quantity_policy.get("kind") == "exec_agent_rejected"
         and quantity_policy.get("source") == "exec_agent_watch_sizing"
         and quantity_policy.get("previous_policy") == raw_policy
@@ -1390,6 +1463,19 @@ def _watch_rejection_policy_matches(
         and decision.get("execution_plan_item_id") == item.id
         and decision.get("quantity") == 0
         and decision.get("approved_quantity") == 0
+        and (
+            not has_canonical_disposition
+            or (
+                quantity_policy.get("rejection_disposition") == "terminal"
+                and _nonempty_text(quantity_policy.get("reason_family")) is not None
+                and decision.get("rejection_disposition") == "terminal"
+                and decision.get("reason_family")
+                == quantity_policy.get("reason_family")
+                and decision.get("reason_code")
+                == quantity_policy.get("reason_code")
+                and decision.get("reason") == quantity_policy.get("reason")
+            )
+        )
     )
 
 

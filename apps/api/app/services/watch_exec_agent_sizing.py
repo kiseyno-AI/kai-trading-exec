@@ -15,14 +15,21 @@ from time import monotonic
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import and_, select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import Session, selectinload, sessionmaker, undefer
 from sqlalchemy.orm.attributes import set_committed_value
 
 from app.broker.base import BrokerAccountSnapshot, BrokerAdapter, BrokerAdapterError
 from app.core.config import Settings
 from app.db.sqlite_diagnostics import sqlite_write_lock
-from app.models.runtime import ExecutionPlan, ExecutionPlanItem, ExecutionPlanItemAudit
+from app.models.runtime import (
+    BrokerOrder,
+    ExecutionJob,
+    ExecutionPlan,
+    ExecutionPlanItem,
+    ExecutionPlanItemAudit,
+    ExecutionPosition,
+)
 from app.services.broker_auth import ensure_authenticated_broker_session
 from app.services.account_drawdown_recovery import (
     account_snapshot_authority_deadline,
@@ -30,6 +37,7 @@ from app.services.account_drawdown_recovery import (
 )
 from app.services.execution_account_route import (
     bind_kis_account_route,
+    execution_account_scope_binding_from_payloads,
     validate_kis_account_route,
 )
 from app.services.execution_semantics import (
@@ -76,7 +84,7 @@ SIZING_ELIGIBLE_WATCH_STATUSES = frozenset({
 UNSIZED_NEXT_OPEN_STATUSES = frozenset({"pending", "next_open_buy_pending_configuration"})
 WATCH_EXEC_AGENT_BATCH_SIZE = 10
 WATCH_EXEC_AGENT_RESPONSE_VERSION = "manual-exec-agent-watch-sizing-v1"
-WATCH_EXEC_AGENT_BINDING_VERSION = "watch-exec-agent-binding-v1"
+WATCH_EXEC_AGENT_BINDING_VERSION = "watch-exec-agent-binding-v2"
 WATCH_EXEC_AGENT_DEFER_KEY = "watch_exec_agent_deferred"
 WATCH_EXEC_AGENT_DEFER_SECONDS = 300
 RETRYABLE_REJECTION_REASON_CODES = frozenset({
@@ -85,6 +93,35 @@ RETRYABLE_REJECTION_REASON_CODES = frozenset({
     "fresh_quote_missing",
     "spread_evidence_missing",
     "transaction_cost_evidence_missing",
+})
+REJECTION_DISPOSITIONS = frozenset({"retry", "defer", "terminal"})
+_TRANSIENT_DETERMINISTIC_REASONS = frozenset({
+    "transaction_cost_evidence_missing",
+    "transaction_cost_evidence_invalid",
+    "delegated_gate_failed:transaction_cost_evidence_pending_live_delegated_to_exec_watch",
+    "account_cash_unavailable",
+    "account_snapshot_unavailable",
+    "broker_open_orders_truth_unavailable",
+})
+_STRUCTURAL_DETERMINISTIC_REASONS = frozenset({
+    "existing_holding",
+    "duplicate_open_buy_order",
+    "missing_reference_price",
+    "missing_target_price",
+    "invalid_target_distance",
+    "missing_stop_price",
+    "invalid_stop_distance",
+    "invalid_target_stop_geometry",
+})
+_NO_TRADE_TERMINAL_ENTRY_STATUSES = frozenset({
+    "contract_quarantined",
+    "exec_agent_rejected",
+    "manual_review_resolved_no_exposure",
+    "next_open_buy_expired",
+    "rejected",
+    "revoked",
+    "watch_cancelled",
+    "watch_expired",
 })
 
 
@@ -801,6 +838,7 @@ def _candidate_with_decision_binding(
         "provider": payload.get("provider"),
         "asset_class": payload.get("asset_class"),
         "venue": payload.get("venue"),
+        "exchange": payload.get("exchange"),
         "side": payload.get("side"),
         "intent": payload.get("intent"),
     }
@@ -1091,6 +1129,224 @@ def _retryable_watch_rejection(
     )
 
 
+def _rejection_reason_family(reasons: list[str], raw_reason_code: object) -> str:
+    normalized = "_".join([*reasons, str(raw_reason_code or "")]).lower()
+    for separator in ("-", "/", " ", ":"):
+        normalized = normalized.replace(separator, "_")
+    if any(
+        alias in normalized
+        for alias in (
+            "reward_risk",
+            "risk_reward",
+            "reward_to_risk",
+            "poor_rr",
+            "rr_below",
+        )
+    ):
+        return "reward_risk"
+    if "transaction_cost" in normalized or "cost_evidence" in normalized:
+        return "transaction_cost"
+    if "liquidity" in normalized or "turnover" in normalized:
+        return "liquidity"
+    if "envelope" in normalized or "allowed_action" in normalized:
+        return "action_envelope"
+    if "account" in normalized or "cash" in normalized or "holding" in normalized:
+        return "account_state"
+    if "runtime" in normalized or "contract" in normalized:
+        return "runtime_contract"
+    return "agent_rejection"
+
+
+def _deterministic_rejection_disposition(
+    *,
+    settings: Settings,
+    item: ExecutionPlanItem,
+    envelope: dict[str, object],
+    raw_reason_code: object,
+) -> tuple[str, str]:
+    raw_reasons = envelope.get("hard_reject_reasons")
+    reasons = [str(reason) for reason in raw_reasons] if isinstance(raw_reasons, list) else []
+    family = _rejection_reason_family(reasons, raw_reason_code)
+    if any(reason in _TRANSIENT_DETERMINISTIC_REASONS for reason in reasons):
+        return "retry", family
+    if any("reward_risk" in reason for reason in reasons):
+        if _reward_risk_rejection_price_cap(settings=settings, item=item) is not None:
+            return "defer", family
+        return "terminal", family
+    if any(reason in _STRUCTURAL_DETERMINISTIC_REASONS for reason in reasons):
+        return "terminal", family
+    if reasons:
+        return "defer", family
+    # A clean server envelope plus an agent rejection has one deterministic
+    # interpretation: this sizing attempt declined the entry. The free-form
+    # reason does not select control flow; the absence of a retryable server
+    # gate makes the result terminal.
+    return "terminal", family
+
+
+def finalize_completed_no_trade_plan(
+    *,
+    db: Session,
+    settings: Settings,
+    plan: ExecutionPlan,
+) -> dict[str, object]:
+    entries = [
+        item
+        for item in plan.items
+        if item.side == "buy" or item.intent in WATCH_BUY_INTENTS or item.intent == "next_open_buy"
+    ]
+    if not entries or any(
+        item.status not in _NO_TRADE_TERMINAL_ENTRY_STATUSES for item in entries
+    ):
+        return {"completed": False, "entry_count": len(entries), "linked_exit_count": 0}
+
+    plan_item_ids = {item.id for item in plan.items}
+    if db.scalar(
+        select(BrokerOrder.id)
+        .where(BrokerOrder.execution_plan_item_id.in_(plan_item_ids))
+        .limit(1)
+    ) is not None:
+        return {"completed": False, "entry_count": len(entries), "linked_exit_count": 0}
+
+    position_scope_clauses = _entry_position_scope_clauses(
+        settings=settings,
+        entries=entries,
+    )
+    if position_scope_clauses is None:
+        return {"completed": False, "entry_count": len(entries), "linked_exit_count": 0}
+    symbols = {item.symbol for item in entries}
+    legacy_position_clause = and_(
+        ExecutionPosition.symbol.in_(symbols),
+        ExecutionPosition.provider.is_(None),
+        ExecutionPosition.account_scope.is_(None),
+        ExecutionPosition.exchange.is_(None),
+    )
+    if db.scalar(
+        select(ExecutionPosition.id)
+        .where(
+            ExecutionPosition.mode == plan.mode,
+            ExecutionPosition.quantity != 0,
+            or_(legacy_position_clause, *position_scope_clauses),
+        )
+        .limit(1)
+    ) is not None:
+        return {"completed": False, "entry_count": len(entries), "linked_exit_count": 0}
+
+    entry_keys = {
+        key
+        for item in entries
+        if (key := str(item.source_plan_item_id or "").strip())
+    }
+    linked_exits: list[ExecutionPlanItem] = []
+    for item in plan.items:
+        if item.side != "sell":
+            continue
+        policy = item.quantity_policy if isinstance(item.quantity_policy, dict) else {}
+        policy_type = str(policy.get("type") or policy.get("kind") or "").strip()
+        linked_key = str(policy.get("linked_entry_item_key") or "").strip()
+        if policy_type != "position_exit_from_entry" or linked_key not in entry_keys:
+            continue
+        if item.status in {"filled", "submitted", "manual_review_required"}:
+            return {"completed": False, "entry_count": len(entries), "linked_exit_count": 0}
+        linked_exits.append(item)
+
+    linked_exit_ids = {item.id for item in linked_exits}
+    jobs = (
+        db.scalars(
+            select(ExecutionJob)
+            .where(ExecutionJob.execution_plan_item_id.in_(linked_exit_ids))
+            .with_for_update()
+        ).all()
+        if linked_exit_ids
+        else []
+    )
+    for item in linked_exits:
+        prior_status = item.status
+        if prior_status == "not_applicable":
+            continue
+        item.status = "not_applicable"
+        _add_plan_item_audit(
+            db=db,
+            item=item,
+            event_type="linked_exit_not_applicable",
+            summary={
+                "prior_status": prior_status,
+                "reason_code": "entry_family_completed_no_trade",
+            },
+            payload={"execution_plan_id": plan.id},
+        )
+    for job in jobs:
+        if job.status in {"completed", "cancelled", "revoked"}:
+            continue
+        job.status = "cancelled"
+        job.locked_at = None
+        job.last_error = "linked entry family completed without broker exposure"
+    plan.status = "completed_no_trade"
+    return {
+        "completed": True,
+        "entry_count": len(entries),
+        "linked_exit_count": len(linked_exits),
+    }
+
+
+def _entry_position_scope_clauses(
+    *,
+    settings: Settings,
+    entries: list[ExecutionPlanItem],
+) -> list[object] | None:
+    clauses: list[object] = []
+    for item in entries:
+        risk_context = item.risk_context if isinstance(item.risk_context, dict) else {}
+        quantity_policy = (
+            item.quantity_policy if isinstance(item.quantity_policy, dict) else {}
+        )
+        provider = str(item.provider or "").strip().lower()
+        exchange = str(
+            risk_context.get("exchange") or item.venue or ""
+        ).strip().upper()
+        if not provider or not exchange:
+            return None
+        if provider == "kis":
+            if validate_kis_account_route(
+                settings=settings,
+                provider=provider,
+                risk_context=risk_context,
+                quantity_policy=quantity_policy,
+                require_binding=True,
+            ) is not None:
+                return None
+            try:
+                identity = build_position_identity(
+                    settings=settings,
+                    provider=provider,
+                    exchange=exchange,
+                )
+            except PositionIdentityConflictError:
+                return None
+            account_scope = identity.account_scope
+        else:
+            binding = execution_account_scope_binding_from_payloads(
+                risk_context,
+                quantity_policy,
+            )
+            if (
+                not isinstance(binding, dict)
+                or binding.get("provider") != provider
+                or not isinstance(binding.get("account_scope"), str)
+            ):
+                return None
+            account_scope = str(binding["account_scope"])
+        clauses.append(
+            and_(
+                ExecutionPosition.symbol == item.symbol,
+                ExecutionPosition.provider == provider,
+                ExecutionPosition.account_scope == account_scope,
+                ExecutionPosition.exchange == exchange,
+            )
+        )
+    return clauses
+
+
 def _eligible_unsized_item_status(item: ExecutionPlanItem) -> bool:
     if not is_exec_agent_sizing_policy(item.quantity_policy):
         return False
@@ -1184,6 +1440,10 @@ def _candidate_payload(item: ExecutionPlanItem) -> dict[str, object]:
         "venue": str(
             item.venue
             or risk_context.get("exchange")
+            or "KRX"
+        ).strip().upper(),
+        "exchange": str(
+            risk_context.get("exchange")
             or "KRX"
         ).strip().upper(),
         "intent": item.intent,
@@ -1969,7 +2229,7 @@ def _request_exec_agent_decisions(*, settings: Settings, payload: dict[str, obje
 - target_profile은 tactical_2pct, short_swing, standard_breakout, extended_momentum 중 하나입니다.
 - 각 decision은 해당 candidate.binding 객체를 단 하나도 바꾸지 말고 binding 필드로 그대로 echo하세요.
 - 결과는 반드시 JSON만 출력하세요. 스키마:
-{{"version":"manual-exec-agent-watch-sizing-v1","plan_id":"{payload['plan_id']}","decisions":[{{"execution_plan_item_id":"...","symbol":"...","binding":{{"version":"watch-exec-agent-binding-v1","plan_id":"...","item_id":"...","symbol":"...","provider":"...","asset_class":"...","venue":"...","side":"buy","intent":"...","candidate_digest":"...","request_context_digest":"...","valid_until":"..."}},"action":"approve|reject","quantity":1,"approved_notional_krw":12345,"sizing_price":1234,"confidence":0.0,"target_profile":"tactical_2pct","reason_code":"...","reason":"..."}}]}}
+{{"version":"manual-exec-agent-watch-sizing-v1","plan_id":"{payload['plan_id']}","decisions":[{{"execution_plan_item_id":"...","symbol":"...","binding":{{"version":"watch-exec-agent-binding-v2","plan_id":"...","item_id":"...","symbol":"...","provider":"...","asset_class":"...","venue":"...","exchange":"...","side":"buy","intent":"...","candidate_digest":"...","request_context_digest":"...","valid_until":"..."}},"action":"approve|reject","quantity":1,"approved_notional_krw":12345,"sizing_price":1234,"confidence":0.0,"target_profile":"tactical_2pct","reason_code":"...","reason":"..."}}]}}
 
 <request_payload_json>
 {payload_json}
@@ -2282,6 +2542,19 @@ def _validate_exec_agent_decision_payload(
                 "exec-agent response symbol mismatch: "
                 f"item_id={item_id} expected={expected_symbol} actual={response_symbol or '<missing>'}"
             )
+        action = str(decision.get("action") or "").strip().lower()
+        if action not in {"approve", "reject"}:
+            raise ValueError(f"exec-agent response action is invalid for {item_id}")
+        supplied_disposition = decision.get("rejection_disposition")
+        if supplied_disposition is not None:
+            if supplied_disposition not in REJECTION_DISPOSITIONS:
+                raise ValueError(
+                    f"exec-agent response rejection_disposition is invalid for {item_id}"
+                )
+            if action != "reject":
+                raise ValueError(
+                    f"exec-agent response rejection_disposition requires reject action for {item_id}"
+                )
     missing_item_ids = expected_item_ids.difference(seen_item_ids)
     if missing_item_ids:
         raise ValueError(
@@ -2476,6 +2749,7 @@ def _apply_decisions(
     approved = 0
     approved_notional = Decimal("0")
     rejected = 0
+    deferred = 0
     for item in items:
         is_untriggered_next_open = _is_untriggered_next_open_sizing_item(item)
         if settings is not None:
@@ -2772,11 +3046,55 @@ def _apply_decisions(
                 },
             )
         elif action == "reject":
-            if _retryable_watch_rejection(
-                decision,
+            envelope = _allowed_action_envelope_for_item(
                 settings=settings,
                 item=item,
+                account_context=working_account_context,
+                decision=decision,
+            )
+            disposition, reason_family = _deterministic_rejection_disposition(
+                settings=settings,
+                item=item,
+                envelope=envelope,
+                raw_reason_code=decision.get("reason_code"),
+            )
+            existing_risk_context = (
+                item.risk_context if isinstance(item.risk_context, dict) else {}
+            )
+            prior_defer = existing_risk_context.get(WATCH_EXEC_AGENT_DEFER_KEY)
+            prior_attempt_count = (
+                prior_defer.get("attempt_count", 0)
+                if isinstance(prior_defer, dict)
+                else 0
+            )
+            if isinstance(prior_attempt_count, bool) or not isinstance(
+                prior_attempt_count, int
             ):
+                prior_attempt_count = 0
+            defer_attempt_count = prior_attempt_count + 1
+            max_defer_attempts = int(settings.exec_agent_watch_sizing_max_attempts)
+            exhausted = bool(
+                disposition in {"retry", "defer"}
+                and defer_attempt_count >= max_defer_attempts
+            )
+            if exhausted:
+                disposition = "terminal"
+                decision = {
+                    **decision,
+                    "reason_code": "deterministic_retry_exhausted",
+                    "reason": (
+                        "deterministic watch rejection remained unresolved after "
+                        f"{max_defer_attempts} attempts"
+                    ),
+                }
+            record = {
+                **record,
+                "reason_code": decision.get("reason_code"),
+                "reason": decision.get("reason"),
+                "rejection_disposition": disposition,
+                "reason_family": reason_family,
+            }
+            if disposition in {"retry", "defer"}:
                 retry_after = decision_at + timedelta(seconds=WATCH_EXEC_AGENT_DEFER_SECONDS)
                 risk_context = (
                     dict(item.risk_context)
@@ -2785,9 +3103,14 @@ def _apply_decisions(
                 )
                 risk_context[WATCH_EXEC_AGENT_DEFER_KEY] = {
                     "reason_code": decision.get("reason_code"),
+                    "reason_family": reason_family,
+                    "disposition": disposition,
                     "reason": decision.get("reason"),
                     "deferred_at": decision_at.isoformat(),
                     "retry_after": retry_after.isoformat(),
+                    "attempt_count": defer_attempt_count,
+                    "max_attempts": max_defer_attempts,
+                    "deterministic_gate_reasons": envelope.get("hard_reject_reasons"),
                 }
                 reward_risk_cap = _reward_risk_rejection_price_cap(
                     settings=settings,
@@ -2806,16 +3129,31 @@ def _apply_decisions(
                     summary={
                         "symbol": item.symbol,
                         "reason_code": decision.get("reason_code"),
+                        "reason_family": reason_family,
+                        "disposition": disposition,
                         "retry_after": retry_after.isoformat(),
                     },
-                    payload={"decision": _decision_summary(record)},
+                    payload={
+                        "decision": _decision_summary(record),
+                        "allowed_action_envelope": envelope,
+                    },
                 )
+                deferred += 1
                 continue
+            if (
+                isinstance(item.risk_context, dict)
+                and WATCH_EXEC_AGENT_DEFER_KEY in item.risk_context
+            ):
+                terminal_risk_context = dict(item.risk_context)
+                terminal_risk_context.pop(WATCH_EXEC_AGENT_DEFER_KEY, None)
+                item.risk_context = compact_json_object(terminal_risk_context)
             previous_policy = item.quantity_policy if isinstance(item.quantity_policy, dict) else None
             item.quantity_policy = compact_json_object({
                 "kind": "exec_agent_rejected",
                 "source": "exec_agent_watch_sizing",
                 "reason_code": decision.get("reason_code"),
+                "reason_family": reason_family,
+                "rejection_disposition": disposition,
                 "reason": decision.get("reason"),
                 "exec_agent_decision": _decision_summary(record),
                 "short_term_exec_agent_decision": _decision_summary(record),
@@ -2839,15 +3177,22 @@ def _apply_decisions(
         from app.services.execution_jobs import materialize_execution_jobs
 
         materialize_execution_jobs(plan, only_item_ids=approved_next_open_item_ids)
+    no_trade = (
+        finalize_completed_no_trade_plan(db=db, settings=settings, plan=plan)
+        if isinstance(db, Session) and settings is not None
+        else {"completed": False, "entry_count": 0, "linked_exit_count": 0}
+    )
     return {
         "plan_id": plan.external_plan_id,
         "evaluated": len(items),
         "approved": approved,
         "approved_notional_krw": _decimal_text(approved_notional),
         "rejected": rejected,
+        "deferred": deferred,
         "missing": len(missing_ids),
         "missing_item_ids": sorted(missing_ids),
         "ignored_extra": len(extra_ids),
+        "no_trade": no_trade,
     }
 
 
@@ -2941,6 +3286,8 @@ def _decision_summary(record: dict[str, object]) -> dict[str, object]:
         "target_profile": record.get("target_profile"),
         "target_tag": record.get("target_tag"),
         "reason_code": record.get("reason_code"),
+        "reason_family": record.get("reason_family"),
+        "rejection_disposition": record.get("rejection_disposition"),
         "reason": record.get("reason"),
         "decided_at": record.get("decided_at"),
     }
@@ -3319,7 +3666,7 @@ def _allowed_action_envelope_for_candidate(
             settings=settings,
             provider=candidate.get("provider"),
             asset_class=candidate.get("asset_class"),
-            exchange=candidate.get("venue"),
+            exchange=candidate.get("exchange"),
             live_quote_spread_bps=None,
             require_live_quote_spread=False,
         ),

@@ -103,6 +103,13 @@ does not create trading decisions.
   - `last_cycle`
 - `counts.open_orders`
 - `counts.active_execution_jobs`
+- `execution_decisions.completed_no_trade_plans`
+- `execution_decisions.pending_retries`
+- `execution_decisions.pending_deferrals`
+- `execution_decisions.terminal_rejections`
+- `execution_decisions.reason_families`
+  - counts canonical server-owned rejection families; agent free-form reason
+    text does not select retry, defer, or terminal control flow
 - `watch_buy_vetoes.today_count`
 - `watch_buy_vetoes.today_symbols[]`
 - `symbols.monitored`

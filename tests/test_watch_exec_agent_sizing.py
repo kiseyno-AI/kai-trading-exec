@@ -36,7 +36,15 @@ from app.broker.base import (
 from app.core.config import Settings
 from app.db.base import Base
 from app.db.session import create_db_engine, create_session_factory
-from app.models.runtime import BrokerOrder, BrokerOrderEvent, ExecutionJob, ExecutionPlan, ExecutionPlanItem, ExecutionPlanItemAudit
+from app.models.runtime import (
+    BrokerOrder,
+    BrokerOrderEvent,
+    ExecutionJob,
+    ExecutionPlan,
+    ExecutionPlanItem,
+    ExecutionPlanItemAudit,
+    ExecutionPosition,
+)
 from app.services import watch_exec_agent_sizing as watch_sizing
 from app.services.openclaw_runtime_contract import runtime_contract_proof_is_valid
 from openclaw_contract_test_support import (
@@ -64,7 +72,12 @@ from app.services.position_identity import (
     build_position_identity,
     execution_scope_payload,
 )
-from app.services.runtime import RuntimeMetadata, build_runtime_daily_board, build_runtime_status
+from app.services.runtime import (
+    RuntimeMetadata,
+    build_runtime_daily_board,
+    build_runtime_status,
+    runtime_execution_decision_metrics,
+)
 from app.services.runtime_controls import ControlCommand, resume_runtime
 from app.services.execution_api import create_execution_plan
 from app.services.watch_exec_agent_sizing import (
@@ -181,6 +194,426 @@ def test_retryable_watch_rejection_is_deferred_not_terminal() -> None:
         settings=settings,
         item=structural_item,
     )
+
+
+def test_freeform_reward_risk_reason_uses_deterministic_defer_disposition() -> None:
+    settings = Settings(runtime_mode="live", exec_agent_min_reward_risk=Decimal("1.8"))
+    plan = ExecutionPlan(
+        id="plan-1",
+        external_plan_id="plan-freeform-reason",
+        strategy_run_id="strategy-1",
+        source="core-short-term-decider",
+        market_date=date(2026, 6, 4),
+        mode="live",
+        items=[
+            _watch_item(
+                risk_context={
+                    "exchange": "KRX",
+                    "target_price": "7090",
+                    "stop_loss_price": "6090",
+                },
+                trigger_price="6440",
+                limit_price="6550",
+            )
+        ],
+    )
+    plan.items[0].provider = "kis"
+    plan.items[0].venue = "kis"
+    plan.items[0].asset_class = "stock"
+
+    summary = _apply_decisions(
+        db=None,  # type: ignore[arg-type]
+        settings=settings,
+        plan=plan,
+        account_context=_fresh_account_context(),
+        expected_item_ids={"watch-item-1"},
+        request_payload=_DIRECT_APPLY_REQUEST_PAYLOAD,
+        decision_payload={
+            "version": "manual-exec-agent-watch-sizing-v1",
+            "_runtime_provenance": _verified_sizing_runtime(settings),
+            "decisions": [
+                {
+                    "execution_plan_item_id": "watch-item-1",
+                    "symbol": "005930",
+                    "action": "reject",
+                    "quantity": 0,
+                    "approved_notional_krw": 0,
+                    "sizing_price": "6550",
+                    "confidence": 0.9,
+                    "target_profile": "short_swing",
+                    "reason_code": "reward_risk_hard_block",
+                    "reason": "free-form agent wording",
+                }
+            ],
+        },
+    )
+    assert summary["deferred"] == 1
+    assert summary["rejected"] == 0
+    assert plan.items[0].status == watch_sizing.WATCH_SIZING_PENDING_STATUS
+    deferred = plan.items[0].risk_context[watch_sizing.WATCH_EXEC_AGENT_DEFER_KEY]
+    assert deferred["disposition"] == "defer"
+    assert deferred["reason_family"] == "reward_risk"
+
+
+def test_deterministic_defer_becomes_terminal_after_attempt_cap() -> None:
+    settings = Settings(
+        runtime_mode="live",
+        exec_agent_min_reward_risk=Decimal("1.8"),
+        exec_agent_watch_sizing_max_attempts=2,
+    )
+    item = _watch_item(
+        risk_context={
+            "exchange": "KRX",
+            "target_price": "7090",
+            "stop_loss_price": "6090",
+            watch_sizing.WATCH_EXEC_AGENT_DEFER_KEY: {
+                "attempt_count": 1,
+                "retry_after": "2026-06-04T00:00:00+00:00",
+            },
+        },
+        trigger_price="6440",
+        limit_price="6550",
+    )
+    item.provider = "kis"
+    item.venue = "kis"
+    item.asset_class = "stock"
+    plan = ExecutionPlan(
+        id="plan-1",
+        external_plan_id="plan-defer-cap",
+        source="core-short-term-decider",
+        market_date=date(2026, 6, 4),
+        mode="live",
+        items=[item],
+    )
+
+    summary = _apply_decisions(
+        db=None,  # type: ignore[arg-type]
+        settings=settings,
+        plan=plan,
+        account_context=_fresh_account_context(),
+        expected_item_ids={"watch-item-1"},
+        request_payload=_DIRECT_APPLY_REQUEST_PAYLOAD,
+        decision_payload={
+            "version": "manual-exec-agent-watch-sizing-v1",
+            "_runtime_provenance": _verified_sizing_runtime(settings),
+            "decisions": [
+                {
+                    "execution_plan_item_id": "watch-item-1",
+                    "symbol": "005930",
+                    "action": "reject",
+                    "quantity": 0,
+                    "approved_notional_krw": 0,
+                    "sizing_price": "6550",
+                    "confidence": 0.9,
+                    "target_profile": "short_swing",
+                    "reason_code": "reward_risk_hard_block",
+                    "reason": "same dynamic gate after prior defer",
+                }
+            ],
+        },
+    )
+
+    assert summary["deferred"] == 0
+    assert summary["rejected"] == 1
+    assert item.status == "exec_agent_rejected"
+    assert item.quantity_policy["rejection_disposition"] == "terminal"
+    assert item.quantity_policy["reason_code"] == "deterministic_retry_exhausted"
+    assert watch_sizing.WATCH_EXEC_AGENT_DEFER_KEY not in item.risk_context
+
+
+def test_decision_validation_rejects_noncanonical_disposition() -> None:
+    plan = ExecutionPlan(
+        id="plan-1",
+        external_plan_id="plan-invalid-disposition",
+        items=[_watch_item(risk_context={"target_price": "76000", "stop_price": "69000"})],
+    )
+
+    with pytest.raises(ValueError, match="rejection_disposition"):
+        watch_sizing._validate_exec_agent_decision_payload(
+            decision_payload={
+                "version": "manual-exec-agent-watch-sizing-v1",
+                "decisions": [
+                    {
+                        "execution_plan_item_id": "watch-item-1",
+                        "symbol": "005930",
+                        "action": "reject",
+                        "quantity": 0,
+                        "reason_code": "reward_risk_hard_block",
+                        "reason": "free-form agent wording",
+                        "rejection_disposition": "sometimes",
+                    }
+                ],
+            },
+            plan=plan,
+            expected_item_ids={"watch-item-1"},
+        )
+
+
+@pytest.mark.parametrize(
+    "legacy_reason_code",
+    [
+        "reward_risk_below_minimum",
+        "risk_reward_below_minimum",
+        "insufficient-reward-to-risk",
+        "poor_rr_geometry",
+    ],
+)
+def test_legacy_reward_risk_reason_variants_share_canonical_family(
+    legacy_reason_code: str,
+) -> None:
+    assert watch_sizing._rejection_reason_family([], legacy_reason_code) == "reward_risk"
+
+
+def test_terminal_entries_without_exposure_complete_plan_as_no_trade() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="live",
+        execution_position_account_scope="no-trade-test-account",
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    try:
+        with session_factory() as session:
+            entry = _watch_item(
+                item_id="entry-1",
+                risk_context={"exchange": "KRX", "target_price": "76000", "stop_price": "69000"},
+            )
+            entry.status = "exec_agent_rejected"
+            entry.source_plan_item_id = "core-entry-1"
+            entry.provider = "kis"
+            entry.venue = "kis"
+            entry.asset_class = "stock"
+            entry.risk_context, entry.quantity_policy = bind_kis_account_route(
+                settings=settings,
+                provider="kis",
+                risk_context=entry.risk_context,
+                quantity_policy=entry.quantity_policy,
+            )
+            target = ExecutionPlanItem(
+                id="target-1",
+                plan_item_index=1,
+                symbol="005930",
+                side="sell",
+                intent="target_sell",
+                status="target_sell_pending_config",
+                quantity_policy={
+                    "type": "position_exit_from_entry",
+                    "linked_entry_item_key": "core-entry-1",
+                },
+                provider="kis",
+                venue="kis",
+                asset_class="stock",
+            )
+            stop = ExecutionPlanItem(
+                id="stop-1",
+                plan_item_index=2,
+                symbol="005930",
+                side="sell",
+                intent="stop_sell",
+                status="stop_sell_pending_config",
+                quantity_policy={
+                    "type": "position_exit_from_entry",
+                    "linked_entry_item_key": "core-entry-1",
+                },
+                provider="kis",
+                venue="kis",
+                asset_class="stock",
+            )
+            plan = ExecutionPlan(
+                id="plan-1",
+                external_plan_id="plan-completed-no-trade",
+                source="kai-trading-core",
+                mode="live",
+                status="accepted",
+                items=[entry, target, stop],
+            )
+            session.add(plan)
+            session.flush()
+            active_identity = build_position_identity(
+                settings=settings,
+                provider="kis",
+                exchange="KRX",
+            )
+            session.add(
+                ExecutionPosition(
+                    id="foreign-account-same-symbol",
+                    mode="live",
+                    provider="kis",
+                    account_scope="f" * 24,
+                    exchange="KRX",
+                    symbol=entry.symbol,
+                    quantity=7,
+                    updated_from="test",
+                )
+            )
+            assert active_identity.account_scope != "f" * 24
+            session.flush()
+
+            result = watch_sizing.finalize_completed_no_trade_plan(
+                db=session,
+                settings=settings,
+                plan=plan,
+            )
+            session.commit()
+
+            assert result == {
+                "completed": True,
+                "entry_count": 1,
+                "linked_exit_count": 2,
+            }
+            assert plan.status == "completed_no_trade"
+            assert target.status == "not_applicable"
+            assert stop.status == "not_applicable"
+            audits = session.scalars(
+                select(ExecutionPlanItemAudit).where(
+                    ExecutionPlanItemAudit.event_type == "linked_exit_not_applicable"
+                )
+            ).all()
+            assert len(audits) == 2
+
+            exposed_entry = _watch_item(
+                item_id="entry-with-order",
+                symbol="000660",
+                risk_context={"exchange": "KRX"},
+            )
+            exposed_entry.status = "exec_agent_rejected"
+            exposed_entry.source_plan_item_id = "core-entry-with-order"
+            exposed_entry.provider = "kis"
+            exposed_entry.venue = "kis"
+            exposed_entry.asset_class = "stock"
+            (
+                exposed_entry.risk_context,
+                exposed_entry.quantity_policy,
+            ) = bind_kis_account_route(
+                settings=settings,
+                provider="kis",
+                risk_context=exposed_entry.risk_context,
+                quantity_policy=exposed_entry.quantity_policy,
+            )
+            exposed_exit = ExecutionPlanItem(
+                id="exit-with-order",
+                plan_item_index=1,
+                symbol="000660",
+                side="sell",
+                intent="stop_sell",
+                status="stop_sell_pending_config",
+                quantity_policy={
+                    "type": "position_exit_from_entry",
+                    "linked_entry_item_key": "core-entry-with-order",
+                },
+                provider="kis",
+                venue="kis",
+                asset_class="stock",
+            )
+            exposed_plan = ExecutionPlan(
+                id="plan-with-order",
+                external_plan_id="plan-with-order",
+                source="kai-trading-core",
+                mode="live",
+                status="accepted",
+                items=[exposed_entry, exposed_exit],
+            )
+            session.add(exposed_plan)
+            session.flush()
+            session.add(
+                BrokerOrder(
+                    execution_plan_item_id=exposed_entry.id,
+                    broker_name="kis",
+                    mode="live",
+                    idempotency_key="plan-with-order:entry",
+                    broker_order_id="broker-order-1",
+                    symbol="000660",
+                    side="buy",
+                    status="open",
+                    quantity=1,
+                )
+            )
+            session.flush()
+
+            exposed_result = watch_sizing.finalize_completed_no_trade_plan(
+                db=session,
+                settings=settings,
+                plan=exposed_plan,
+            )
+            assert exposed_result["completed"] is False
+            assert exposed_plan.status == "accepted"
+            assert exposed_exit.status == "stop_sell_pending_config"
+    finally:
+        engine.dispose()
+
+
+def test_runtime_metrics_expose_no_trade_retry_and_reason_families() -> None:
+    settings = Settings(database_url="sqlite:///:memory:", runtime_mode="live")
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    try:
+        with session_factory() as session:
+            terminal = _watch_item(item_id="terminal-entry", risk_context={})
+            terminal.status = "exec_agent_rejected"
+            terminal.quantity_policy = {
+                "kind": "exec_agent_rejected",
+                "source": "exec_agent_watch_sizing",
+                "reason_family": "reward_risk",
+                "rejection_disposition": "terminal",
+            }
+            deferred = _watch_item(
+                item_id="retry-entry",
+                symbol="000660",
+                risk_context={},
+            )
+            deferred.risk_context = {
+                **deferred.risk_context,
+                watch_sizing.WATCH_EXEC_AGENT_DEFER_KEY: {
+                    "reason_family": "account_snapshot",
+                    "disposition": "retry",
+                },
+            }
+            session.add_all(
+                [
+                    ExecutionPlan(
+                        id="no-trade-plan",
+                        external_plan_id="no-trade-plan",
+                        source="kai-trading-core",
+                        mode="live",
+                        status="completed_no_trade",
+                        items=[terminal],
+                    ),
+                    ExecutionPlan(
+                        id="retry-plan",
+                        external_plan_id="retry-plan",
+                        source="kai-trading-core",
+                        mode="live",
+                        status="accepted",
+                        items=[deferred],
+                    ),
+                ]
+            )
+            session.commit()
+
+            expected_metrics = {
+                "completed_no_trade_plans": 1,
+                "pending_retries": 1,
+                "pending_deferrals": 0,
+                "terminal_rejections": 1,
+                "reason_families": {
+                    "account_snapshot": 1,
+                    "reward_risk": 1,
+                },
+            }
+            assert runtime_execution_decision_metrics(
+                settings=settings,
+                db=session,
+            ) == expected_metrics
+            status = build_runtime_status(
+                settings=settings,
+                runtime=RuntimeMetadata(started_at=datetime(2026, 10, 7, tzinfo=UTC)),
+                db=session,
+            )
+            assert status["execution_decisions"] == expected_metrics
+    finally:
+        engine.dispose()
 
 
 def test_watch_exec_agent_defer_expires() -> None:
@@ -3599,6 +4032,37 @@ def test_live_sizing_envelope_requires_configured_transaction_cost_policy() -> N
     assert envelope["allowed_actions"] == ["hold", "reject"]
 
 
+def test_live_sizing_uses_risk_exchange_when_kis_is_the_broker_venue() -> None:
+    item = _watch_item(
+        risk_context={
+            "exchange": "KRX",
+            "target_price": "76000",
+            "stop_price": "69000",
+        }
+    )
+    item.provider = "kis"
+    item.venue = "kis"
+    item.asset_class = "stock"
+
+    candidate = _candidate_payload(item)
+    envelope = watch_sizing._allowed_action_envelope_for_candidate(
+        settings=Settings(runtime_mode="live"),
+        candidate=candidate,
+        account_context={
+            "available": True,
+            "orderable_cash_krw": "10000000",
+            "buying_power_krw": "10000000",
+            "holdings": [],
+            "open_orders": [],
+        },
+    )
+
+    assert candidate["venue"] == "KIS"
+    assert candidate["exchange"] == "KRX"
+    assert envelope["estimated_round_trip_cost_bps"] == "50.0000"
+    assert "transaction_cost_evidence_missing" not in envelope["hard_reject_reasons"]
+
+
 @pytest.mark.parametrize(
     "basis",
     [None, "unavailable", "liquidity_tier_estimate", "unknown"],
@@ -4535,6 +4999,9 @@ def test_watch_sizing_request_binding_covers_candidate_account_caps_and_route() 
             },
         },
     )
+    item.provider = "kis"
+    item.venue = "kis"
+    item.asset_class = "stock"
     plan = ExecutionPlan(
         external_plan_id="plan-watch-bound",
         market_date=date(2026, 6, 4),
@@ -4587,11 +5054,13 @@ def test_watch_sizing_request_binding_covers_candidate_account_caps_and_route() 
     )
 
     binding = baseline["candidates"][0]["binding"]  # type: ignore[index]
-    assert binding["version"] == "watch-exec-agent-binding-v1"
+    assert binding["version"] == "watch-exec-agent-binding-v2"
     assert binding["plan_id"] == "plan-watch-bound"
     assert binding["item_id"] == "watch-bound"
     assert binding["provider"] == "kis"
     assert binding["asset_class"] == "stock"
+    assert binding["venue"] == "KIS"
+    assert binding["exchange"] == "KRX"
     assert binding["side"] == "buy"
     assert binding["intent"] == "intraday_watch_buy"
     assert len(binding["candidate_digest"]) == 64
@@ -4605,6 +5074,7 @@ def test_watch_sizing_request_binding_covers_candidate_account_caps_and_route() 
     ("mutation", "expected_error"),
     [
         pytest.param("missing", "binding is missing", id="missing"),
+        pytest.param("missing_exchange", "binding mismatch", id="missing-exchange"),
         pytest.param("mismatch", "binding mismatch", id="mismatch"),
         pytest.param("expired", "binding expired", id="expired"),
         pytest.param("partial", "missing decisions", id="partial"),
@@ -4643,6 +5113,8 @@ def test_watch_sizing_response_requires_exact_current_binding(
     ]
     if mutation == "missing":
         decisions[0].pop("binding")
+    elif mutation == "missing_exchange":
+        decisions[0]["binding"].pop("exchange")
     elif mutation == "mismatch":
         decisions[0]["binding"]["candidate_digest"] = "0" * 64
     elif mutation == "expired":
@@ -5411,6 +5883,8 @@ def test_exec_agent_request_removes_temporary_payload_file(tmp_path, monkeypatch
         Settings().exec_agent_model
     )
     assert '"plan_id": "plan-temp-cleanup"' in captured["message"]
+    assert '"version":"watch-exec-agent-binding-v2"' in captured["message"]
+    assert '"exchange":"..."' in captured["message"]
     assert "Read /" not in captured["message"]
     provenance = response["_runtime_provenance"]
     assert isinstance(provenance, dict)

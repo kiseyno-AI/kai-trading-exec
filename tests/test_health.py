@@ -432,6 +432,12 @@ def test_health_returns_dependency_aware_payload() -> None:
             id="unique-constraint",
         ),
         pytest.param(
+            "get_unique_constraints",
+            "execution_plans",
+            "uq_execution_plans_source_mode_dispatch_batch_key",
+            id="delta-batch-unique-constraint",
+        ),
+        pytest.param(
             "get_check_constraints",
             "execution_positions",
             "ck_execution_positions_scope_complete",
@@ -674,7 +680,7 @@ def test_health_degrades_when_alembic_revision_is_behind_head() -> None:
     assert runtime_schema["status"] == "missing"
     assert runtime_schema["alembic"] == {
         "status": "behind",
-        "expected_heads": ["202610020002"],
+        "expected_heads": ["202610070001"],
         "current_heads": ["202609110001"],
     }
     engine.dispose()
@@ -692,7 +698,7 @@ def test_health_degrades_when_alembic_version_table_is_missing() -> None:
     assert runtime_schema["status"] == "missing"
     assert runtime_schema["alembic"] == {
         "status": "missing",
-        "expected_heads": ["202610020002"],
+        "expected_heads": ["202610070001"],
         "current_heads": [],
     }
     engine.dispose()
@@ -767,7 +773,7 @@ def test_lifespan_keeps_automated_workers_stopped_when_schema_is_behind(
 
         with engine.begin() as connection:
             connection.exec_driver_sql(
-                "UPDATE alembic_version SET version_num = '202610020002'"
+                "UPDATE alembic_version SET version_num = '202610070001'"
             )
 
         repaired_health = client.get("/health").json()
@@ -2027,6 +2033,7 @@ def test_runtime_status_requires_hourly_risk_off_schema_columns() -> None:
 @pytest.mark.parametrize(
     ("table_name", "scope_columns"),
     [
+        ("execution_plans", ("dispatch_batch_key",)),
         ("broker_sessions", ("generation", "refresh_after")),
         (
             "fifo_inventory_isolations",

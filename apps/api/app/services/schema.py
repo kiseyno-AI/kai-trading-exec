@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 from app.models import EXEC_OWNED_TABLES
 
 
-REQUIRED_ALEMBIC_HEADS = ("202610020002",)
+REQUIRED_ALEMBIC_HEADS = ("202610070001",)
 EXECUTION_POSITION_SCOPE_REMEDIATION_REASON = (
     "non_flat_execution_position_scope_attribution_required"
 )
@@ -18,6 +18,7 @@ EXECUTION_POSITION_SCOPE_REMEDIATION = (
 )
 
 REQUIRED_RUNTIME_COLUMNS = {
+    "execution_plans": ("dispatch_batch_key",),
     "broker_sessions": ("generation", "refresh_after"),
     "runtime_control_state": (
         "hourly_risk_off_active",
@@ -55,6 +56,13 @@ REQUIRED_RUNTIME_COLUMNS = {
 }
 
 REQUIRED_UNIQUE_CONSTRAINTS = {
+    "execution_plans": {
+        "uq_execution_plans_source_mode_dispatch_batch_key": (
+            "source",
+            "mode",
+            "dispatch_batch_key",
+        ),
+    },
     "execution_jobs": {
         "uq_execution_jobs_plan_item_job_type": (
             "execution_plan_item_id",

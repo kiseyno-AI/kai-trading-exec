@@ -1,6 +1,7 @@
 from copy import deepcopy
 from datetime import UTC, datetime
 from decimal import Decimal
+import threading
 
 from fastapi.testclient import TestClient
 import pytest
@@ -374,6 +375,102 @@ def test_v4_intake_requires_exact_contract_and_returns_one_to_one_durable_ack() 
     duplicate = client.post("/v4/execution-plans", json=v4_payload)
     assert duplicate.status_code == 409
     assert "contract_ack" not in duplicate.json()
+    engine.dispose()
+
+
+def test_v4_rejects_duplicate_delta_batch_under_a_different_plan_id() -> None:
+    app, engine = _build_test_app()
+    client = TestClient(app)
+    first = _plan_payload(plan_id="core-v4-delta-first")
+    first["metadata"].update(
+        {
+            "dispatch_batch_type": "delta",
+            "dispatch_batch_key": "signal-decider:2026-09-10:delta:1",
+        }
+    )
+    _refresh_material_fingerprint(first)
+    second = deepcopy(first)
+    second["plan_id"] = "core-v4-delta-duplicate"
+    second["metadata"]["dispatch_batch_key"] = (
+        f"  {first['metadata']['dispatch_batch_key']}  "
+    )
+    _refresh_material_fingerprint(second)
+
+    first_response = client.post("/v4/execution-plans", json=first)
+    duplicate_response = client.post("/v4/execution-plans", json=second)
+
+    assert first_response.status_code == 201, first_response.json()
+    assert duplicate_response.status_code == 409
+    assert duplicate_response.json()["reason_code"] == "duplicate_delta_batch"
+    with app.state.db_session_factory() as session:
+        plans = session.scalars(select(ExecutionPlan)).all()
+        assert len(plans) == 1
+        assert plans[0].dispatch_batch_key == first["metadata"]["dispatch_batch_key"]
+    engine.dispose()
+
+
+def test_v4_duplicate_delta_batch_is_atomic_under_concurrent_requests(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    app, engine = _build_test_app(
+        database_url=f"sqlite:///{tmp_path / 'delta-batch-race.db'}"
+    )
+    first = _plan_payload(plan_id="core-v4-delta-race-first")
+    first["metadata"].update(
+        {
+            "dispatch_batch_type": "delta",
+            "dispatch_batch_key": "signal-decider:2026-09-10:delta:race",
+        }
+    )
+    _refresh_material_fingerprint(first)
+    second = deepcopy(first)
+    second["plan_id"] = "core-v4-delta-race-second"
+    _refresh_material_fingerprint(second)
+
+    original_lookup = core_handoff_v4._duplicate_delta_batch_plan_id
+    first_checks = 0
+    checks_lock = threading.Lock()
+    both_checked = threading.Barrier(2)
+
+    def synchronized_lookup(*, db, command):
+        nonlocal first_checks
+        result = original_lookup(db=db, command=command)
+        with checks_lock:
+            first_checks += 1
+            check_number = first_checks
+        if check_number <= 2:
+            both_checked.wait(timeout=5)
+        return result
+
+    monkeypatch.setattr(
+        core_handoff_v4,
+        "_duplicate_delta_batch_plan_id",
+        synchronized_lookup,
+    )
+    responses: list[tuple[int, dict[str, object]]] = []
+
+    def submit(payload: dict[str, object]) -> None:
+        response = TestClient(app).post("/v4/execution-plans", json=payload)
+        responses.append((response.status_code, response.json()))
+
+    threads = [
+        threading.Thread(target=submit, args=(payload,))
+        for payload in (first, second)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert sorted(status for status, _ in responses) == [201, 409]
+    conflict = next(body for status, body in responses if status == 409)
+    assert conflict["reason_code"] == "duplicate_delta_batch"
+    with app.state.db_session_factory() as session:
+        plans = session.scalars(select(ExecutionPlan)).all()
+        assert len(plans) == 1
+        assert plans[0].dispatch_batch_key == first["metadata"]["dispatch_batch_key"]
     engine.dispose()
 
 
@@ -1173,6 +1270,116 @@ def test_v4_watch_sizing_preserves_contract_proof_through_job_claim() -> None:
             job_id=job_id,
             expected_locked_at=lease,
         ) is not None
+    engine.dispose()
+
+
+def test_v4_terminal_watch_rejection_remains_proven_and_is_not_refenced() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        exec_agent_model="openai/gpt-5.6-sol",
+        exec_agent_watch_sizing_max_attempts=1,
+        kis_app_key="mock-key",
+        kis_app_secret="mock-secret",
+        kis_account_number="12345678",
+        kis_account_product_code="01",
+        account_drawdown_recovery_scope_secret=(
+            "core-v4-watch-reject-secret-at-least-32-bytes"
+        ),
+    )
+    app, engine = _build_test_app(settings=settings)
+    client = TestClient(app)
+    payload = _plan_payload(plan_id="core-v4-terminal-watch-rejection-proof")
+    payload["mode"] = "paper"
+    _refresh_material_fingerprint(payload)
+    response = client.post("/v4/execution-plans", json=payload)
+    assert response.status_code == 201, response.json()
+
+    with app.state.db_session_factory() as session:
+        plan = session.scalar(
+            select(ExecutionPlan).options(selectinload(ExecutionPlan.items))
+        )
+        assert plan is not None
+        entry = next(item for item in plan.items if item.side == "buy")
+        request_payload = {"test_scope": "terminal-watch-rejection-proof"}
+        summary = _apply_decisions(
+            db=session,
+            settings=settings,
+            plan=plan,
+            request_payload=request_payload,
+            decision_payload={
+                "version": "manual-exec-agent-watch-sizing-v1",
+                "plan_id": plan.external_plan_id,
+                "_runtime_provenance": verified_runtime_provenance(
+                    settings=settings,
+                    request_payload=request_payload,
+                    session_id="core-v4-watch-reject-session",
+                ),
+                "decisions": [
+                    {
+                        "execution_plan_item_id": entry.id,
+                        "symbol": entry.symbol,
+                        "action": "reject",
+                        "quantity": 0,
+                        "reason_code": "creative_agent_phrase",
+                        "reason": "freeform language must not own authority",
+                    }
+                ],
+            },
+            account_context={
+                "available": False,
+                "unavailable_reasons": ["broker_account_snapshot_unavailable"],
+                "holdings": [],
+                "open_orders": [],
+            },
+            expected_item_ids={entry.id},
+            now=datetime(2026, 9, 9, 23, 30, tzinfo=UTC),
+        )
+        assert summary["rejected"] == 1
+        assert summary["no_trade"]["completed"] is True
+        assert plan.status == "completed_no_trade"
+        assert core_handoff_v4.persisted_core_plan_contract_ack(plan) is not None
+        session.commit()
+
+    v4_readback = client.get(
+        "/v4/execution-plans",
+        params={"external_plan_id": payload["plan_id"]},
+    )
+    assert v4_readback.status_code == 200
+    assert v4_readback.json()[0]["status"] == "completed_no_trade"
+    execution_readback = client.get(
+        "/execution-plans",
+        params={"external_plan_id": payload["plan_id"]},
+    )
+    assert execution_readback.status_code == 200
+    readback_items = execution_readback.json()[0]["items"]
+    assert next(item for item in readback_items if item["side"] == "buy")[
+        "status"
+    ] == "exec_agent_rejected"
+    assert {
+        item["status"] for item in readback_items if item["side"] == "sell"
+    } == {"not_applicable"}
+
+    with app.state.db_session_factory() as session:
+        assert (
+            core_handoff_v4.reconcile_unproven_legacy_core_buy_authority(
+                db=session,
+                runtime_mode="paper",
+            )
+            == 0
+        )
+        assert (
+            core_handoff_v4.reconcile_unproven_legacy_core_buy_authority(
+                db=session,
+                runtime_mode="paper",
+            )
+            == 0
+        )
+        audits = session.scalars(select(ExecutionPlanItemAudit)).all()
+        assert all(
+            audit.event_type != "legacy_core_authority_quarantined"
+            for audit in audits
+        )
     engine.dispose()
 
 

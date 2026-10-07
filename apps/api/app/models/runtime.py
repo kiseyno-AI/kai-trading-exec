@@ -238,6 +238,12 @@ class ExecutionPlan(TimestampMixin, Base):
             "mode",
             name="uq_execution_plans_external_plan_id_mode",
         ),
+        UniqueConstraint(
+            "source",
+            "mode",
+            "dispatch_batch_key",
+            name="uq_execution_plans_source_mode_dispatch_batch_key",
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
@@ -246,6 +252,7 @@ class ExecutionPlan(TimestampMixin, Base):
     market_date: Mapped[date | None] = mapped_column(Date())
     strategy_run_id: Mapped[str | None] = mapped_column(String(128))
     mode: Mapped[str] = mapped_column(String(16), nullable=False)
+    dispatch_batch_key: Mapped[str | None] = mapped_column(String(128))
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="accepted")
     requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     accepted_at: Mapped[datetime] = mapped_column(
