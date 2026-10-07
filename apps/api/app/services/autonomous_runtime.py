@@ -49,6 +49,7 @@ from app.services.monitoring import (
     run_autonomous_monitoring_cycle,
     _load_core_desired_monitoring_symbols,
 )
+from app.services.monitoring_price_source import is_us_regular_session
 from app.services.runtime_transitions import (
     ACTIVE_SELL_MONITORING_STATUSES,
     AGENT_ACTIVE_MONITORING_STATUSES,
@@ -85,6 +86,10 @@ WATCH_EXEC_AGENT_SIZING_WORKER_NAME = "watch_exec_agent_sizing_loop"
 NXT_ELIGIBLE_SYNC_WORKER_NAME = "nxt_eligible_sync_loop"
 MAX_STATUS_DETAIL_ITEMS = 20
 KRX_TIMEZONE = ZoneInfo("Asia/Seoul")
+US_EASTERN_TIMEZONE = ZoneInfo("America/New_York")
+US_EQUITY_EXCHANGES = frozenset(
+    {"US", "NAS", "NASD", "NASDAQ", "NYS", "NYSE", "AMS", "AMEX"}
+)
 DOMESTIC_SESSION_BOUNDARIES = (
     time(8, 0),
     time(8, 30),
@@ -1063,8 +1068,11 @@ class AutonomousRuntimeCoordinator:
             if not self._reconcile_and_refresh_monitoring_snapshot_if_due(started_at):
                 raise RuntimeError("live broker position reconciliation failed")
         workset_snapshot = self._ensure_monitoring_runtime_snapshot(started_at)
-        desired_symbols = list(workset_snapshot.symbols)
-        position_symbols = set(workset_snapshot.positions_by_symbol)
+        desired_symbols, session_inactive_symbols = _session_active_monitoring_symbols(
+            workset_snapshot,
+            now=started_at,
+        )
+        position_symbols = set(workset_snapshot.positions_by_symbol) & set(desired_symbols)
         symbols, self._monitoring_symbol_cursor = _select_monitoring_symbol_batch(
             desired_symbols=desired_symbols,
             priority_symbols=position_symbols,
@@ -1076,8 +1084,11 @@ class AutonomousRuntimeCoordinator:
             symbols=set(symbols),
         ):
             workset_snapshot = self._ensure_monitoring_runtime_snapshot(started_at)
-            desired_symbols = list(workset_snapshot.symbols)
-            position_symbols = set(workset_snapshot.positions_by_symbol)
+            desired_symbols, session_inactive_symbols = _session_active_monitoring_symbols(
+                workset_snapshot,
+                now=started_at,
+            )
+            position_symbols = set(workset_snapshot.positions_by_symbol) & set(desired_symbols)
             symbols, self._monitoring_symbol_cursor = _select_monitoring_symbol_batch(
                 desired_symbols=desired_symbols,
                 priority_symbols=position_symbols,
@@ -1095,6 +1106,7 @@ class AutonomousRuntimeCoordinator:
                 "price_source_configured": self._monitoring_price_source_state.configured,
                 "price_source": self._monitoring_price_source_state.snapshot(),
                 "runtime_snapshot": workset_snapshot.snapshot(),
+                "session_inactive_symbols": session_inactive_symbols,
                 "idle": True,
             }
             self._store_cycle_payload(worker_key="monitoring", payload=payload)
@@ -1139,10 +1151,19 @@ class AutonomousRuntimeCoordinator:
                 )
                 workset_symbol_set = set(workset_snapshot.symbols)
                 symbols = [symbol for symbol in symbols if symbol in workset_symbol_set]
-                if not symbols and workset_snapshot.symbols:
+                desired_symbols, session_inactive_symbols = (
+                    _session_active_monitoring_symbols(
+                        workset_snapshot,
+                        now=started_at,
+                    )
+                )
+                if not symbols and desired_symbols:
                     symbols, self._monitoring_symbol_cursor = _select_monitoring_symbol_batch(
-                        desired_symbols=list(workset_snapshot.symbols),
-                        priority_symbols=set(workset_snapshot.positions_by_symbol),
+                        desired_symbols=desired_symbols,
+                        priority_symbols=(
+                            set(workset_snapshot.positions_by_symbol)
+                            & set(desired_symbols)
+                        ),
                         batch_size=max(
                             int(self.settings.monitoring_max_symbols_per_cycle or 0),
                             1,
@@ -1170,6 +1191,7 @@ class AutonomousRuntimeCoordinator:
                         ),
                         "price_source": self._monitoring_price_source_state.snapshot(),
                         "runtime_snapshot": workset_snapshot.snapshot(),
+                        "session_inactive_symbols": session_inactive_symbols,
                         **cached_payload,
                         "monitored_symbols": [],
                         "price_count": 0,
@@ -1197,6 +1219,7 @@ class AutonomousRuntimeCoordinator:
                 "price_source_configured": self._monitoring_price_source_state.configured,
                 "price_source": self._monitoring_price_source_state.snapshot(),
                 "runtime_snapshot": workset_snapshot.snapshot(),
+                "session_inactive_symbols": session_inactive_symbols,
                 **cached_payload,
             }
             if post_entry_maintenance_count:
@@ -3139,6 +3162,35 @@ def _monitoring_snapshot_for_symbols(
             item for item in snapshot.items if item.symbol in selected_symbol_set
         ],
     )
+
+
+def _session_active_monitoring_symbols(
+    snapshot: MonitoringRuntimeSnapshot,
+    *,
+    now: datetime,
+) -> tuple[list[str], list[str]]:
+    """Exclude US equities from quote polling outside the US regular session."""
+    observed_at = now if now.tzinfo is not None else now.replace(tzinfo=UTC)
+    if is_us_regular_session(observed_at.astimezone(US_EASTERN_TIMEZONE)):
+        return list(snapshot.symbols), []
+
+    exchanges_by_symbol = {
+        symbol: str(position.exchange or "").strip().upper()
+        for symbol, position in snapshot.positions_by_symbol.items()
+        if position.exchange
+    }
+    for item in snapshot.items:
+        if item.exchange and item.symbol not in exchanges_by_symbol:
+            exchanges_by_symbol[item.symbol] = str(item.exchange).strip().upper()
+
+    active: list[str] = []
+    inactive: list[str] = []
+    for symbol in snapshot.symbols:
+        if exchanges_by_symbol.get(symbol) in US_EQUITY_EXCHANGES:
+            inactive.append(symbol)
+        else:
+            active.append(symbol)
+    return active, inactive
 
 
 def _is_krx_symbol(symbol: str) -> bool:
