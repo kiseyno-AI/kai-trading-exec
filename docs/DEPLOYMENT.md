@@ -19,8 +19,10 @@ database.
    read-only and never prints the contract body. Contract location precedence is
    explicit `--openclaw-home`, `OPENCLAW_STATE_DIR`, then `~/.openclaw`.
 5. Start the API with `start-api-no-migrate.sh`. Confirm `/health` reports the
-   expected single Alembic head (`202610020002` for this release), all schema
-   invariants, and a ready startup gate.
+   single Alembic head printed by `.venv/bin/python -m alembic heads` from the
+   exact release checkout (`202610070001` at the time of this update), all
+   schema invariants, and a ready startup gate. Never copy an older literal
+   revision from this runbook into deployment automation.
 6. Start dispatchers and monitoring only after health is ready. Keep the runtime
    paused until account scope, open orders, positions, and risk fences have been
    reviewed.
@@ -57,15 +59,18 @@ response cannot mint its own authorization evidence.
 
 PostgreSQL revisions `202609080002`, `202609090001`, `202609090002`,
 `202609090003`, `202609090004`, `202609110001`, `202609110002`, and
-`202609110003`, plus `202610020001` and `202610020002` require the drain above.
-They add execution-job uniqueness, shared KIS token generations, exact
-FIFO/position route scope, legacy JSON redaction, monitoring/crypto account
-scope, and scoped Core buy-authority state. The latest revision removes the
-redundant persisted `automation_enabled` value; the API compatibility field is
-derived from pause and kill-switch state. The latest data revision reclassifies
-unsized Core signal/short-term watches as sizing-pending so they cannot enter
-monitoring before a verified quantity exists. Some revisions take exclusive
-table locks.
+`202609110003`, plus `202610020001`, `202610020002`, and `202610070001` require
+the drain above. They add execution-job uniqueness, shared KIS token
+generations, exact FIFO/position route scope, legacy JSON redaction,
+monitoring/crypto account scope, scoped Core buy-authority state, and an atomic
+Core delta-dispatch batch key. Revision `202610020001` removes the redundant
+persisted `automation_enabled` value; the API compatibility field is derived
+from pause and kill-switch state. Revision `202610020002` reclassifies unsized
+Core signal/short-term watches as sizing-pending so they cannot enter monitoring
+before a verified quantity exists. Revision `202610070001` scans existing
+execution-plan payloads before adding its unique constraint, so it must not run
+beside an API, dispatcher, monitor, reconciliation loop, or strategy writer.
+Some revisions take exclusive table locks.
 
 Legacy rows whose owner cannot be proved remain null-scoped and quarantined.
 The partial unique indexes intentionally preserve only the legacy key for those
