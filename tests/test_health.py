@@ -1476,6 +1476,26 @@ def test_runtime_status_falls_back_to_autonomous_snapshot_when_database_pool_is_
         "active_recovery_scopes": {},
         "reason": "account_drawdown_gate_state_unavailable",
     }
+    assert payload["freshness"]["position_truth"]["current_broker_account_snapshot"] == {
+        "status": "unavailable",
+        "reason": "database_unavailable",
+        "reachable": False,
+        "fresh": False,
+        "complete": False,
+        "holdings_coverage": "unknown",
+        "open_orders_coverage": "unknown",
+        "unreconciled_live_symbols": [],
+        "last_reconciled_at": None,
+        "oldest_reconciled_at": None,
+        "max_age_seconds": app.state.settings.exec_agent_max_account_snapshot_age_seconds,
+    }
+    assert payload["freshness"]["position_truth"]["historical_execution_integrity"] == {
+        "status": "unavailable",
+        "reason": "database_unavailable",
+        "excluded_indeterminate_order_count": 0,
+        "excluded_indeterminate_fill_count": 0,
+        "excluded_other_route_count": 0,
+    }
     monitoring = payload["liveness"]["monitoring"]
     assert monitoring["source"] == "autonomous_runtime_snapshot"
     assert monitoring["status"] == "running"
@@ -7273,11 +7293,23 @@ def test_fast_runtime_status_surfaces_manual_review_position_monitoring_gap() ->
     assert payload["freshness"]["position_truth"]["manual_review_symbols"] == [
         "OLDCO"
     ]
-    assert any(
-        alert["kind"] == "position_monitoring_manual_review_required"
-        and alert["severity"] == "critical"
-        and alert["symbols"] == ["OLDCO"]
+    alert = next(
+        alert
         for alert in payload["actionable_alerts"]["alerts"]
+        if alert["kind"] == "position_monitoring_manual_review_required"
+    )
+    assert alert["severity"] == "critical"
+    assert alert["symbols"] == ["OLDCO"]
+    assert alert["reasons"] == [
+        {
+            "code": "unpriced_overseas_holding",
+            "count": 1,
+            "symbols": ["OLDCO"],
+        }
+    ]
+    assert alert["message"] == (
+        "held positions cannot be protected automatically because a usable positive "
+        "broker price is unavailable"
     )
     engine.dispose()
 

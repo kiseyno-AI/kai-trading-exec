@@ -440,6 +440,335 @@ def test_runtime_freshness_and_autonomous_fill_cache_use_exact_active_scope() ->
     engine.dispose()
 
 
+def test_position_truth_separates_fresh_broker_snapshot_from_legacy_history() -> None:
+    settings = _settings()
+    engine, _factory, db = _session(settings)
+    now = datetime(2026, 9, 15, 4, 0, tzinfo=UTC)
+    identity = build_position_identity(
+        settings=settings,
+        provider="kis",
+        exchange="NASD",
+    )
+    legacy_filled_buy = _canonical_order(
+        None,
+        key="snapshot-history-legacy-buy",
+        symbol="LEGACY-HISTORY",
+        side="buy",
+        status="filled",
+        observed_at=now - timedelta(days=30),
+    )
+    db.add(legacy_filled_buy)
+    db.add(
+        ExecutionPosition(
+            mode=settings.runtime_mode,
+            provider=identity.provider,
+            account_scope=identity.account_scope,
+            exchange=identity.exchange,
+            symbol="CURRENT-HOLDING",
+            quantity=7,
+            average_price=Decimal("12.50"),
+            updated_from="reconciliation",
+            last_reconciled_at=now - timedelta(seconds=5),
+            raw_payload={
+                "holdings_coverage": "complete",
+                "open_orders_coverage": "complete",
+                "_position_identity": {
+                    "version": "execution-position-route-v2",
+                    "provider": identity.provider,
+                    "account_scope": identity.account_scope,
+                    "exchange": identity.exchange,
+                },
+            },
+        )
+    )
+    db.add(
+        ExecutionPosition(
+            mode=settings.runtime_mode,
+            provider=identity.provider,
+            account_scope=identity.account_scope,
+            exchange=identity.exchange,
+            symbol="HISTORICAL-FLAT",
+            quantity=0,
+            average_price=None,
+            updated_from="reconciliation",
+            last_reconciled_at=now - timedelta(days=30),
+            raw_payload=None,
+        )
+    )
+    db.flush()
+    db.add(
+        _fill(
+            legacy_filled_buy,
+            key="snapshot-history-legacy-fill",
+            quantity=1,
+            filled_at=now - timedelta(days=30),
+        )
+    )
+    db.commit()
+
+    position_truth = runtime_service.position_truth_freshness_payload(
+        settings=settings,
+        db=db,
+        now=now,
+    )
+
+    assert position_truth["current_broker_account_snapshot"] == {
+        "status": "available",
+        "reason": None,
+        "reachable": True,
+        "fresh": True,
+        "complete": True,
+        "holdings_coverage": "complete",
+        "open_orders_coverage": "complete",
+        "unreconciled_live_symbols": [],
+        "last_reconciled_at": (now - timedelta(seconds=5)).isoformat(),
+        "oldest_reconciled_at": (now - timedelta(seconds=5)).isoformat(),
+        "max_age_seconds": settings.exec_agent_max_account_snapshot_age_seconds,
+    }
+    assert position_truth["historical_execution_integrity"] == {
+        "status": "unavailable",
+        "reason": "indeterminate_execution_scope",
+        "excluded_indeterminate_order_count": 1,
+        "excluded_indeterminate_fill_count": 1,
+        "excluded_other_route_count": 0,
+    }
+    assert position_truth["broker_truth_reachable"] is False
+    assert position_truth["evidence_symbol_count"] == 0
+    assert position_truth["tracked_symbol_count"] == 1
+    db.close()
+    engine.dispose()
+
+
+def test_current_broker_snapshot_reports_missing_and_partially_stale_evidence() -> None:
+    settings = _settings()
+    engine, _factory, db = _session(settings)
+    now = datetime(2026, 9, 15, 4, 0, tzinfo=UTC)
+
+    missing_truth = runtime_service.position_truth_freshness_payload(
+        settings=settings,
+        db=db,
+        now=now,
+    )
+
+    assert missing_truth["current_broker_account_snapshot"] == {
+        "status": "unavailable",
+        "reason": "missing_reconciliation_evidence",
+        "reachable": False,
+        "fresh": False,
+        "complete": False,
+        "holdings_coverage": "unknown",
+        "open_orders_coverage": "unknown",
+        "unreconciled_live_symbols": [],
+        "last_reconciled_at": None,
+        "oldest_reconciled_at": None,
+        "max_age_seconds": settings.exec_agent_max_account_snapshot_age_seconds,
+    }
+
+    identity = build_position_identity(
+        settings=settings,
+        provider="kis",
+        exchange="KRX",
+    )
+    stale_at = now - timedelta(
+        seconds=settings.exec_agent_max_account_snapshot_age_seconds + 1
+    )
+    stale_buy = _canonical_order(
+        settings,
+        key="stale-current-snapshot-buy",
+        symbol="STALE-HOLDING",
+        side="buy",
+        status="filled",
+        observed_at=stale_at,
+    )
+    db.add(stale_buy)
+    db.add_all(
+        [
+            ExecutionPosition(
+                mode=settings.runtime_mode,
+                provider=identity.provider,
+                account_scope=identity.account_scope,
+                exchange=identity.exchange,
+                symbol="STALE-HOLDING",
+                quantity=1,
+                average_price=Decimal("100.00"),
+                updated_from="reconciliation",
+                last_reconciled_at=stale_at,
+                raw_payload={
+                    "holdings_coverage": "complete",
+                    "open_orders_coverage": "complete",
+                },
+            ),
+            ExecutionPosition(
+                mode=settings.runtime_mode,
+                provider=identity.provider,
+                account_scope=identity.account_scope,
+                exchange=identity.exchange,
+                symbol="FRESH-FLAT",
+                quantity=0,
+                average_price=None,
+                updated_from="reconciliation",
+                last_reconciled_at=now - timedelta(seconds=5),
+                raw_payload={
+                    "holdings_coverage": "complete",
+                    "open_orders_coverage": "complete",
+                },
+            ),
+        ]
+    )
+    db.flush()
+    db.add(
+        _fill(
+            stale_buy,
+            key="stale-current-snapshot-fill",
+            quantity=1,
+            filled_at=stale_at,
+        )
+    )
+    db.commit()
+
+    stale_truth = runtime_service.position_truth_freshness_payload(
+        settings=settings,
+        db=db,
+        now=now,
+    )
+
+    assert stale_truth["stale_symbols"] == ["STALE-HOLDING"]
+    assert stale_truth["current_broker_account_snapshot"]["status"] == "stale"
+    assert stale_truth["current_broker_account_snapshot"]["reason"] == (
+        "stale_reconciliation_evidence"
+    )
+    assert stale_truth["current_broker_account_snapshot"]["reachable"] is True
+    assert stale_truth["current_broker_account_snapshot"]["fresh"] is False
+    assert stale_truth["current_broker_account_snapshot"]["complete"] is False
+    # The legacy field intentionally keeps its historical latest-row semantics.
+    # Consumers needing current account truth must use the explicit snapshot object.
+    assert stale_truth["broker_truth_reachable"] is True
+    db.close()
+    engine.dispose()
+
+
+def test_current_broker_snapshot_requires_complete_coverage_for_every_fresh_row() -> None:
+    settings = _settings()
+    engine, _factory, db = _session(settings)
+    now = datetime(2026, 9, 15, 4, 0, tzinfo=UTC)
+    identity = build_position_identity(
+        settings=settings,
+        provider="kis",
+        exchange="KRX",
+    )
+    db.add_all(
+        [
+            ExecutionPosition(
+                mode=settings.runtime_mode,
+                provider=identity.provider,
+                account_scope=identity.account_scope,
+                exchange=identity.exchange,
+                symbol="COMPLETE-ROW",
+                quantity=1,
+                average_price=Decimal("100.00"),
+                updated_from="reconciliation",
+                last_reconciled_at=now - timedelta(seconds=5),
+                raw_payload={
+                    "holdings_coverage": "complete",
+                    "open_orders_coverage": "complete",
+                },
+            ),
+            ExecutionPosition(
+                mode=settings.runtime_mode,
+                provider=identity.provider,
+                account_scope=identity.account_scope,
+                exchange=identity.exchange,
+                symbol="UNKNOWN-COVERAGE-ROW",
+                quantity=1,
+                average_price=Decimal("100.00"),
+                updated_from="reconciliation",
+                last_reconciled_at=now - timedelta(seconds=5),
+                raw_payload=None,
+            ),
+        ]
+    )
+    db.commit()
+
+    position_truth = runtime_service.position_truth_freshness_payload(
+        settings=settings,
+        db=db,
+        now=now,
+    )
+
+    snapshot = position_truth["current_broker_account_snapshot"]
+    assert snapshot["status"] == "incomplete"
+    assert snapshot["reason"] == "incomplete_snapshot_coverage"
+    assert snapshot["reachable"] is True
+    assert snapshot["fresh"] is True
+    assert snapshot["complete"] is False
+    assert snapshot["holdings_coverage"] == "unknown"
+    assert snapshot["open_orders_coverage"] == "unknown"
+    assert position_truth["broker_truth_reachable"] is True
+    db.close()
+    engine.dispose()
+
+
+def test_current_broker_snapshot_does_not_promote_unreconciled_live_position() -> None:
+    settings = _settings()
+    engine, _factory, db = _session(settings)
+    now = datetime(2026, 9, 15, 4, 0, tzinfo=UTC)
+    identity = build_position_identity(
+        settings=settings,
+        provider="kis",
+        exchange="KRX",
+    )
+    db.add_all(
+        [
+            ExecutionPosition(
+                mode=settings.runtime_mode,
+                provider=identity.provider,
+                account_scope=identity.account_scope,
+                exchange=identity.exchange,
+                symbol="RECONCILED-HOLDING",
+                quantity=1,
+                average_price=Decimal("100.00"),
+                updated_from="reconciliation",
+                last_reconciled_at=now - timedelta(seconds=5),
+                raw_payload={
+                    "holdings_coverage": "complete",
+                    "open_orders_coverage": "complete",
+                },
+            ),
+            ExecutionPosition(
+                mode=settings.runtime_mode,
+                provider=identity.provider,
+                account_scope=identity.account_scope,
+                exchange=identity.exchange,
+                symbol="UNRECONCILED-HOLDING",
+                quantity=1,
+                average_price=Decimal("101.00"),
+                updated_from="test",
+                last_reconciled_at=now - timedelta(seconds=5),
+                raw_payload=None,
+            ),
+        ]
+    )
+    db.commit()
+
+    position_truth = runtime_service.position_truth_freshness_payload(
+        settings=settings,
+        db=db,
+        now=now,
+    )
+
+    snapshot = position_truth["current_broker_account_snapshot"]
+    assert snapshot["status"] == "incomplete"
+    assert snapshot["reason"] == "missing_live_position_reconciliation_evidence"
+    assert snapshot["reachable"] is True
+    assert snapshot["fresh"] is False
+    assert snapshot["complete"] is False
+    assert snapshot["holdings_coverage"] == "unknown"
+    assert snapshot["open_orders_coverage"] == "unknown"
+    assert snapshot["unreconciled_live_symbols"] == ["UNRECONCILED-HOLDING"]
+    db.close()
+    engine.dispose()
+
+
 def test_position_truth_replays_fill_quantity_and_chronology_for_reentry() -> None:
     settings = _settings()
     engine, _factory, db = _session(settings)
@@ -547,13 +876,65 @@ def test_position_truth_surfaces_manual_review_position_monitoring_gap() -> None
         "severity": "critical",
         "count": 1,
         "symbols": ["OLDCO"],
+        "reasons": [
+            {
+                "code": "unpriced_overseas_holding",
+                "count": 1,
+                "symbols": ["OLDCO"],
+            }
+        ],
         "message": (
-            "held positions cannot be protected automatically until their "
-            "quote and execution route are reviewed"
+            "held positions cannot be protected automatically because a usable "
+            "positive broker price is unavailable"
         ),
     }
     db.close()
     engine.dispose()
+
+
+def test_position_monitoring_alert_groups_mixed_reasons_deterministically() -> None:
+    alerts = runtime_service.runtime_actionable_alerts_payload(
+        monitoring={},
+        freshness={
+            "position_truth": {
+                "manual_review_count": 4,
+                "manual_review_symbols": ["ZZZ", "AAA", "MISSING", "BBB"],
+                "manual_review_reasons": {
+                    "AAA": "unsupported_overseas_exchange",
+                    "BBB": "unpriced_overseas_holding",
+                    "ZZZ": "unpriced_overseas_holding",
+                },
+            }
+        },
+    )
+
+    alert = next(
+        item
+        for item in alerts["alerts"]
+        if item["kind"] == "position_monitoring_manual_review_required"
+    )
+    assert alert["severity"] == "critical"
+    assert alert["reasons"] == [
+        {
+            "code": "position_monitoring_not_eligible",
+            "count": 1,
+            "symbols": ["MISSING"],
+        },
+        {
+            "code": "unpriced_overseas_holding",
+            "count": 2,
+            "symbols": ["BBB", "ZZZ"],
+        },
+        {
+            "code": "unsupported_overseas_exchange",
+            "count": 1,
+            "symbols": ["AAA"],
+        },
+    ]
+    assert alert["message"] == (
+        "held positions cannot be protected automatically until their "
+        "quote and execution route are reviewed"
+    )
 
 
 def test_position_truth_keeps_incomplete_filled_order_detail_as_exposure_evidence() -> None:

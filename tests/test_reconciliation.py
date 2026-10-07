@@ -6423,6 +6423,10 @@ def test_runtime_status_reports_position_truth_freshness_details() -> None:
     assert freshness["oldest_age_seconds"] is not None
     assert freshness["last_reconciled_at"] == stale_reconciled_at.astimezone(UTC).isoformat()
     assert freshness["broker_truth_reachable"] is False
+    assert freshness["current_broker_account_snapshot"]["status"] == "stale"
+    assert freshness["current_broker_account_snapshot"]["reachable"] is False
+    assert freshness["current_broker_account_snapshot"]["fresh"] is False
+    assert freshness["current_broker_account_snapshot"]["complete"] is False
     engine.dispose()
 
 
