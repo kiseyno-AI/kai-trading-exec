@@ -242,6 +242,14 @@ class UrllibJsonHttpClient:
                 retryable=True,
                 normalized_status=NormalizedBrokerOrderStatus.RETRY_PENDING,
             ) from exc
+        except TimeoutError as exc:
+            raise BrokerAdapterError(
+                safe_broker_error_message(exc),
+                status_code=503,
+                classification=BrokerErrorClassification.NETWORK,
+                retryable=True,
+                normalized_status=NormalizedBrokerOrderStatus.RETRY_PENDING,
+            ) from exc
 
     def _wait_for_request_slot(self) -> None:
         if self._min_request_interval_seconds <= 0:
