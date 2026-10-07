@@ -58,6 +58,53 @@ Current foundation response includes:
   - provider-specific readiness/session summaries so KIS, Upbit, and Alpaca can be
     inspected independently
 - `broker_providers.alpaca`
+- `freshness.position_truth.current_broker_account_snapshot`
+  - additive current-snapshot evidence derived only from exact active-scope
+    `execution_positions` rows persisted by reconciliation; broker configuration
+    or session configuration alone never marks it reachable
+  - `status` is `available`, `incomplete`, `stale`, or `unavailable`; `reason`
+    distinguishes missing reconciliation evidence, stale live-position evidence,
+    and incomplete snapshot coverage
+  - `reachable` confirms that at least one reconciliation row is within
+    `max_age_seconds`; `fresh` additionally requires no live candidate symbol to
+    have stale or missing position truth and no live position to lack
+    reconciliation provenance. A partially fresh account can therefore be
+    reachable while not fresh.
+  - `complete` requires a fresh snapshot cohort whose persisted
+    `holdings_coverage` and `open_orders_coverage` are both `complete` for every
+    row. Missing, legacy, or non-canonical coverage is reported as `unknown` and
+    never promoted to complete.
+  - `unreconciled_live_symbols` lists nonzero active-scope position rows whose
+    latest writer is not reconciliation. Their presence keeps the snapshot
+    `incomplete`, makes `fresh` and `complete` false, and reports coverage as
+    `unknown` even when another fresh row says coverage was complete.
+  - `last_reconciled_at` is the newest persisted active-scope reconciliation.
+    `oldest_reconciled_at` is the oldest row in the current cohort (fresh rows
+    when present, otherwise the persisted stale cohort), so an unrelated old flat
+    row does not make a current complete snapshot appear old.
+  - `reachable=false` means current broker reachability is not confirmed by the
+    persisted position evidence. It is not proof of a network outage. In
+    particular, a complete empty-account read does not create an
+    `execution_positions` row, so this read model cannot independently confirm
+    that case.
+- `freshness.position_truth.historical_execution_integrity`
+  - reports historical order/fill execution-scope and FIFO integrity separately
+    from the current broker snapshot, with `status`, `reason`, and excluded
+    indeterminate/other-route counts
+  - missing legacy execution scope remains fail-closed and is never attributed to
+    the current account merely because current reconciliation is fresh
+- The legacy flat `scope_*`, `excluded_*`, and `broker_truth_reachable` fields are
+  retained with their existing composite semantics for compatibility.
+  `broker_truth_reachable` therefore remains false when historical integrity is
+  unavailable even if `current_broker_account_snapshot` is available; new
+  consumers should use the two explicit nested objects instead of interpreting
+  the legacy field as broker connectivity.
+- `actionable_alerts.alerts[]` entries with
+  `kind=position_monitoring_manual_review_required` remain `critical` and now
+  include structured `reasons[]` groups (`code`, `count`, `symbols`). When every
+  affected position is `unpriced_overseas_holding`, the message states that a
+  usable positive broker price is unavailable instead of implying that the
+  already-attributed execution route is unknown.
 
 ### `GET /runtime/alpaca-crypto`
 

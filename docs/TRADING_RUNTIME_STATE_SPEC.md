@@ -96,6 +96,13 @@ pending-dispatch, and agent-active states. `revoked`, `contract_quarantined`,
 `core_activation_pending`, and `cancelled` rows cannot be selected as active
 siblings or mutated back into service.
 
+`unpriced_overseas_holding` remains a critical manual-review latch: the runtime
+does not manufacture a stop, route, or price for it. Runtime status groups the
+manual-review reason by symbol and states specifically that a usable positive
+broker price is unavailable. A separately reported fresh broker-account
+snapshot does not clear the latch; only the reconciliation recovery evidence
+defined by the API contract can make the position monitoring-eligible again.
+
 ## Core-to-Exec handoff and recovery
 
 | Case | Durable interpretation | Recovery action |

@@ -1645,6 +1645,89 @@ def position_truth_freshness_payload(
             if oldest_age_seconds is None or age_seconds > oldest_age_seconds:
                 oldest_age_seconds = age_seconds
 
+    reconciliation_positions = [
+        position
+        for position in positions
+        if position.updated_from == "reconciliation"
+        and position.last_reconciled_at is not None
+    ]
+    fresh_reconciliation_positions = [
+        position
+        for position in reconciliation_positions
+        if _as_utc(position.last_reconciled_at) >= stale_before
+    ]
+    unreconciled_live_symbols = sorted(
+        {
+            position.symbol
+            for position in positions
+            if _position_has_quantity(position)
+            and position.updated_from != "reconciliation"
+        }
+    )
+
+    def _snapshot_coverage(key: str) -> str:
+        values: set[str] = set()
+        for position in fresh_reconciliation_positions:
+            raw_payload = (
+                position.raw_payload
+                if isinstance(position.raw_payload, dict)
+                else {}
+            )
+            value = str(raw_payload.get(key) or "").strip().lower()
+            values.add(value if value in {"complete", "incomplete"} else "unknown")
+        if unreconciled_live_symbols:
+            values.add("unknown")
+        if values == {"complete"}:
+            return "complete"
+        if "incomplete" in values:
+            return "incomplete"
+        return "unknown"
+
+    snapshot_latest_reconciled_at = max(
+        (_as_utc(position.last_reconciled_at) for position in reconciliation_positions),
+        default=None,
+    )
+    current_reconciliation_positions = (
+        fresh_reconciliation_positions
+        if fresh_reconciliation_positions
+        else reconciliation_positions
+    )
+    snapshot_oldest_reconciled_at = min(
+        (
+            _as_utc(position.last_reconciled_at)
+            for position in current_reconciliation_positions
+        ),
+        default=None,
+    )
+    snapshot_reachable = bool(fresh_reconciliation_positions)
+    snapshot_fresh = bool(
+        snapshot_reachable
+        and not stale_symbols
+        and not unreconciled_live_symbols
+    )
+    holdings_coverage = _snapshot_coverage("holdings_coverage")
+    open_orders_coverage = _snapshot_coverage("open_orders_coverage")
+    snapshot_complete = bool(
+        snapshot_fresh
+        and holdings_coverage == "complete"
+        and open_orders_coverage == "complete"
+    )
+    if not reconciliation_positions:
+        snapshot_status = "unavailable"
+        snapshot_reason = "missing_reconciliation_evidence"
+    elif not snapshot_reachable or stale_symbols:
+        snapshot_status = "stale"
+        snapshot_reason = "stale_reconciliation_evidence"
+    elif unreconciled_live_symbols:
+        snapshot_status = "incomplete"
+        snapshot_reason = "missing_live_position_reconciliation_evidence"
+    elif not snapshot_complete:
+        snapshot_status = "incomplete"
+        snapshot_reason = "incomplete_snapshot_coverage"
+    else:
+        snapshot_status = "available"
+        snapshot_reason = None
+
     if evidence.scope_unavailable_reason is not None:
         scope_status = "unavailable"
         scope_reason = evidence.scope_unavailable_reason
@@ -1665,6 +1748,26 @@ def position_truth_freshness_payload(
         "excluded_indeterminate_order_count": evidence.indeterminate_order_count,
         "excluded_indeterminate_fill_count": evidence.indeterminate_fill_count,
         "excluded_other_route_count": evidence.foreign_order_count,
+        "current_broker_account_snapshot": {
+            "status": snapshot_status,
+            "reason": snapshot_reason,
+            "reachable": snapshot_reachable,
+            "fresh": snapshot_fresh,
+            "complete": snapshot_complete,
+            "holdings_coverage": holdings_coverage,
+            "open_orders_coverage": open_orders_coverage,
+            "unreconciled_live_symbols": unreconciled_live_symbols,
+            "last_reconciled_at": _serialize_datetime(snapshot_latest_reconciled_at),
+            "oldest_reconciled_at": _serialize_datetime(snapshot_oldest_reconciled_at),
+            "max_age_seconds": settings.exec_agent_max_account_snapshot_age_seconds,
+        },
+        "historical_execution_integrity": {
+            "status": scope_status,
+            "reason": scope_reason,
+            "excluded_indeterminate_order_count": evidence.indeterminate_order_count,
+            "excluded_indeterminate_fill_count": evidence.indeterminate_fill_count,
+            "excluded_other_route_count": evidence.foreign_order_count,
+        },
         "stale_count": len(stale_symbols),
         "oldest_age_seconds": round(oldest_age_seconds, 3) if oldest_age_seconds is not None else None,
         "oldest_age": _duration_text(oldest_age_seconds),
@@ -1910,16 +2013,49 @@ def runtime_actionable_alerts_payload(
             )
         manual_review_count = int(position_truth.get("manual_review_count") or 0)
         if manual_review_count > 0:
+            manual_review_symbols = [
+                str(symbol)
+                for symbol in position_truth.get("manual_review_symbols") or []
+            ]
+            raw_manual_review_reasons = position_truth.get("manual_review_reasons")
+            manual_review_reasons = (
+                raw_manual_review_reasons
+                if isinstance(raw_manual_review_reasons, dict)
+                else {}
+            )
+            symbols_by_reason: dict[str, list[str]] = {}
+            for symbol in manual_review_symbols:
+                reason = str(
+                    manual_review_reasons.get(symbol)
+                    or "position_monitoring_not_eligible"
+                )
+                symbols_by_reason.setdefault(reason, []).append(symbol)
+            structured_reasons = [
+                {
+                    "code": reason,
+                    "count": len(symbols),
+                    "symbols": sorted(symbols),
+                }
+                for reason, symbols in sorted(symbols_by_reason.items())
+            ]
+            if set(symbols_by_reason) == {"unpriced_overseas_holding"}:
+                message = (
+                    "held positions cannot be protected automatically because a usable "
+                    "positive broker price is unavailable"
+                )
+            else:
+                message = (
+                    "held positions cannot be protected automatically until their "
+                    "quote and execution route are reviewed"
+                )
             alerts.append(
                 {
                     "kind": "position_monitoring_manual_review_required",
                     "severity": "critical",
                     "count": manual_review_count,
-                    "symbols": position_truth.get("manual_review_symbols") or [],
-                    "message": (
-                        "held positions cannot be protected automatically until their "
-                        "quote and execution route are reviewed"
-                    ),
+                    "symbols": manual_review_symbols,
+                    "reasons": structured_reasons,
+                    "message": message,
                 }
             )
 
@@ -3370,6 +3506,26 @@ def build_runtime_status(
             "source": monitoring.get("source") or "autonomous_runtime_snapshot",
         },
         "position_truth": {
+            "current_broker_account_snapshot": {
+                "status": "unavailable",
+                "reason": "position_truth_not_loaded",
+                "reachable": False,
+                "fresh": False,
+                "complete": False,
+                "holdings_coverage": "unknown",
+                "open_orders_coverage": "unknown",
+                "unreconciled_live_symbols": [],
+                "last_reconciled_at": None,
+                "oldest_reconciled_at": None,
+                "max_age_seconds": settings.exec_agent_max_account_snapshot_age_seconds,
+            },
+            "historical_execution_integrity": {
+                "status": "unavailable",
+                "reason": "position_truth_not_loaded",
+                "excluded_indeterminate_order_count": 0,
+                "excluded_indeterminate_fill_count": 0,
+                "excluded_other_route_count": 0,
+            },
             "stale_count": 0,
             "oldest_age_seconds": None,
             "oldest_age": None,
@@ -3554,6 +3710,14 @@ def build_runtime_status(
         dependencies["database"] = "error"
         dependencies["runtime_schema"] = "unknown"
         counts_available = False
+        position_truth = freshness["position_truth"]
+        assert isinstance(position_truth, dict)
+        current_snapshot = position_truth["current_broker_account_snapshot"]
+        historical_integrity = position_truth["historical_execution_integrity"]
+        assert isinstance(current_snapshot, dict)
+        assert isinstance(historical_integrity, dict)
+        current_snapshot["reason"] = "database_unavailable"
+        historical_integrity["reason"] = "database_unavailable"
         safety = default_safety(
             settings,
             f"database unavailable: {exc.__class__.__name__}",
