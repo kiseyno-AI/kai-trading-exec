@@ -375,6 +375,75 @@ def runtime_counts(
     }
 
 
+def runtime_execution_decision_metrics(
+    *,
+    settings: Settings,
+    db: Session,
+) -> dict[str, object]:
+    completed_no_trade_plans = int(
+        db.scalar(
+            select(func.count(ExecutionPlan.id)).where(
+                ExecutionPlan.mode == settings.runtime_mode,
+                ExecutionPlan.status == "completed_no_trade",
+            )
+        )
+        or 0
+    )
+    items = db.scalars(
+        select(ExecutionPlanItem)
+        .join(ExecutionPlanItem.plan)
+        .where(
+            ExecutionPlan.mode == settings.runtime_mode,
+            ExecutionPlanItem.status.in_(
+                {WATCH_SIZING_PENDING_STATUS, "exec_agent_rejected"}
+            ),
+        )
+        .options(
+            load_only(
+                ExecutionPlanItem.status,
+                ExecutionPlanItem.risk_context,
+                ExecutionPlanItem.quantity_policy,
+            )
+        )
+    ).all()
+    pending_retries = 0
+    pending_deferrals = 0
+    terminal_rejections = 0
+    reason_families: dict[str, int] = {}
+    for item in items:
+        risk_context = item.risk_context if isinstance(item.risk_context, dict) else {}
+        quantity_policy = (
+            item.quantity_policy if isinstance(item.quantity_policy, dict) else {}
+        )
+        deferred = risk_context.get("watch_exec_agent_deferred")
+        family: object = None
+        if isinstance(deferred, dict):
+            disposition = deferred.get("disposition")
+            if disposition == "retry":
+                pending_retries += 1
+            elif disposition == "defer":
+                pending_deferrals += 1
+            family = deferred.get("reason_family")
+        elif (
+            item.status == "exec_agent_rejected"
+            and quantity_policy.get("rejection_disposition") == "terminal"
+        ):
+            terminal_rejections += 1
+            family = quantity_policy.get("reason_family")
+        normalized_family = str(family or "").strip()
+        if normalized_family:
+            reason_families[normalized_family] = (
+                reason_families.get(normalized_family, 0) + 1
+            )
+    return {
+        "completed_no_trade_plans": completed_no_trade_plans,
+        "pending_retries": pending_retries,
+        "pending_deferrals": pending_deferrals,
+        "terminal_rejections": terminal_rejections,
+        "reason_families": dict(sorted(reason_families.items())),
+    }
+
+
 def runtime_watch_buy_veto_summary(
     *,
     settings: Settings,
@@ -3208,6 +3277,13 @@ def build_runtime_status(
         "sqlite": sqlite_diagnostics_payload(),
     }
     counts: dict[str, int] = {"open_orders": 0, "active_execution_jobs": 0}
+    execution_decisions: dict[str, object] = {
+        "completed_no_trade_plans": 0,
+        "pending_retries": 0,
+        "pending_deferrals": 0,
+        "terminal_rejections": 0,
+        "reason_families": {},
+    }
     watch_buy_vetoes: dict[str, object] = {"today_count": 0, "today_symbols": []}
     late_entry_gate: dict[str, object] = {
         "event_count": 0,
@@ -3346,6 +3422,10 @@ def build_runtime_status(
             provider=runtime_provider,
             runtime_scope=active_runtime_scope,
         )
+        execution_decisions = runtime_execution_decision_metrics(
+            settings=settings,
+            db=db,
+        )
         watch_buy_vetoes = runtime_watch_buy_veto_summary(
             settings=settings,
             db=db,
@@ -3439,6 +3519,7 @@ def build_runtime_status(
             "broker": broker,
             "broker_providers": broker_providers,
             "counts": counts,
+            "execution_decisions": execution_decisions,
             "watch_buy_vetoes": watch_buy_vetoes,
             "late_entry_gate": late_entry_gate,
             "symbols": symbols,
@@ -3503,6 +3584,7 @@ def build_runtime_status(
             "broker": broker,
             "broker_providers": broker_providers,
             "counts": counts,
+            "execution_decisions": execution_decisions,
             "watch_buy_vetoes": watch_buy_vetoes,
             "late_entry_gate": late_entry_gate,
             "symbols": symbols,
@@ -3568,6 +3650,7 @@ def build_runtime_status(
             "broker": broker,
             "broker_providers": broker_providers,
             "counts": counts,
+            "execution_decisions": execution_decisions,
             "watch_buy_vetoes": watch_buy_vetoes,
             "late_entry_gate": late_entry_gate,
             "symbols": symbols,
@@ -3586,6 +3669,10 @@ def build_runtime_status(
             db=db,
             provider=runtime_provider,
             runtime_scope=active_runtime_scope,
+        )
+        execution_decisions = runtime_execution_decision_metrics(
+            settings=settings,
+            db=db,
         )
         watch_buy_vetoes = runtime_watch_buy_veto_summary(
             settings=settings,
@@ -3782,6 +3869,7 @@ def build_runtime_status(
         "broker": broker,
         "broker_providers": broker_providers,
         "counts": counts,
+        "execution_decisions": execution_decisions,
         "watch_buy_vetoes": watch_buy_vetoes,
         "late_entry_gate": late_entry_gate,
         "symbols": symbols,

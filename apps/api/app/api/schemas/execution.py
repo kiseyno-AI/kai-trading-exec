@@ -323,7 +323,9 @@ class CoreExecutionPlanMetadataV4(BaseModel):
             raise ValueError("agent_name and decision_agent_name must match")
         if self.dispatch_batch_type == "initial" and self.dispatch_batch_key is not None:
             raise ValueError("initial dispatch must not include dispatch_batch_key")
-        if self.dispatch_batch_type == "delta" and self.dispatch_batch_key is None:
+        if self.dispatch_batch_type == "delta" and (
+            self.dispatch_batch_key is None or not self.dispatch_batch_key.strip()
+        ):
             raise ValueError("delta dispatch requires dispatch_batch_key")
         return self
 
