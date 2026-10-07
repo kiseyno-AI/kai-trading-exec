@@ -23,6 +23,7 @@ from app.services.autonomous_runtime import (
     CachedMonitoringPosition,
     MonitoringRuntimeSnapshot,
     _is_krx_symbol,
+    _session_active_monitoring_symbols,
     _select_monitoring_symbol_batch,
 )
 from app.services.monitoring import list_autonomous_monitoring_symbols
@@ -434,6 +435,149 @@ def test_monitoring_cycle_does_not_mix_core_universe_into_active_local_work(
     coordinator._monitoring_cycle_sync(datetime(2026, 8, 26, 1, 0, tzinfo=UTC))
 
     assert requested == ["005930", "AAPL"]
+
+
+def test_session_active_monitoring_symbols_excludes_us_equities_after_close() -> None:
+    now = datetime(2026, 10, 7, 5, 0, tzinfo=UTC)  # 01:00 America/New_York
+    snapshot = MonitoringRuntimeSnapshot(
+        loaded_at=now,
+        symbols=["027710", "APTX", "ASPU"],
+        positions_by_symbol={
+            "027710": CachedMonitoringPosition(
+                symbol="027710", quantity=1012, exchange="KRX"
+            ),
+            "APTX": CachedMonitoringPosition(
+                symbol="APTX", quantity=377, exchange="NASD"
+            ),
+        },
+        items=[
+            CachedMonitoringItem(
+                id="aspu-stop",
+                symbol="ASPU",
+                intent="stop_sell",
+                status="monitoring",
+                trigger_price=Decimal("0.70"),
+                exchange="NASDAQ",
+            )
+        ],
+        filled_today_symbols=[],
+    )
+
+    active, inactive = _session_active_monitoring_symbols(snapshot, now=now)
+
+    assert active == ["027710"]
+    assert inactive == ["APTX", "ASPU"]
+
+
+def test_monitoring_cycle_does_not_request_us_quotes_outside_regular_session(
+    monkeypatch,
+) -> None:
+    now = datetime(2026, 10, 7, 5, 0, tzinfo=UTC)  # 01:00 America/New_York
+    coordinator = AutonomousRuntimeCoordinator(
+        settings=Settings(database_url="sqlite:///:memory:", runtime_mode="paper"),
+        session_factory=None,  # type: ignore[arg-type]
+        broker_adapter_factory=lambda settings: None,  # type: ignore[arg-type,return-value]
+    )
+    coordinator._monitoring_runtime_snapshot = MonitoringRuntimeSnapshot(
+        loaded_at=now,
+        symbols=["APTX"],
+        positions_by_symbol={
+            "APTX": CachedMonitoringPosition(
+                symbol="APTX", quantity=377, exchange="NASD"
+            )
+        },
+        items=[],
+        filled_today_symbols=[],
+    )
+    quote_calls: list[list[str]] = []
+    monkeypatch.setattr(
+        coordinator,
+        "_load_monitoring_prices",
+        lambda **kwargs: quote_calls.append(kwargs["symbols"]) or [],
+    )
+
+    payload = coordinator._monitoring_cycle_sync(now)
+
+    assert quote_calls == []
+    assert payload["idle"] is True
+    assert payload["monitored_symbols"] == []
+    assert payload["session_inactive_symbols"] == ["APTX"]
+
+
+def test_monitoring_cycle_reconciles_closed_session_us_symbols_without_quote_polling(
+    monkeypatch,
+) -> None:
+    now = datetime(2026, 10, 7, 5, 0, tzinfo=UTC)  # 01:00 America/New_York
+    coordinator = AutonomousRuntimeCoordinator(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="live",
+            monitoring_max_symbols_per_cycle=6,
+            monitoring_max_broker_actions_per_cycle=0,
+        ),
+        session_factory=lambda: None,  # type: ignore[arg-type,return-value]
+        broker_adapter_factory=lambda settings: None,  # type: ignore[arg-type,return-value]
+    )
+    coordinator._monitoring_runtime_snapshot = MonitoringRuntimeSnapshot(
+        loaded_at=now,
+        symbols=["005930", "APTX"],
+        positions_by_symbol={
+            "005930": CachedMonitoringPosition(
+                symbol="005930", quantity=1012, exchange="KRX"
+            ),
+            "APTX": CachedMonitoringPosition(
+                symbol="APTX", quantity=377, exchange="NASD"
+            ),
+        },
+        items=[],
+        filled_today_symbols=[],
+    )
+    reconciled_symbols: list[set[str]] = []
+    quote_calls: list[list[str]] = []
+    monkeypatch.setattr(
+        coordinator,
+        "_reconcile_and_refresh_monitoring_snapshot_if_due",
+        lambda now: True,
+    )
+    monkeypatch.setattr(
+        coordinator,
+        "_reconcile_monitoring_orders_if_due",
+        lambda **kwargs: reconciled_symbols.append(set(kwargs["symbols"])) or False,
+    )
+    monkeypatch.setattr(
+        coordinator,
+        "_load_monitoring_prices",
+        lambda **kwargs: quote_calls.append(list(kwargs["symbols"])) or [],
+    )
+
+    payload = coordinator._monitoring_cycle_sync(now)
+
+    assert reconciled_symbols == [{"005930", "APTX"}]
+    assert quote_calls == [["005930"]]
+    assert payload["monitored_symbols"] == ["005930"]
+
+
+def test_session_active_monitoring_symbols_keeps_us_equities_during_regular_session() -> None:
+    now = datetime(2026, 10, 6, 15, 0, tzinfo=UTC)  # 11:00 America/New_York
+    snapshot = MonitoringRuntimeSnapshot(
+        loaded_at=now,
+        symbols=["027710", "APTX"],
+        positions_by_symbol={
+            "027710": CachedMonitoringPosition(
+                symbol="027710", quantity=1012, exchange="KRX"
+            ),
+            "APTX": CachedMonitoringPosition(
+                symbol="APTX", quantity=377, exchange="NASD"
+            ),
+        },
+        items=[],
+        filled_today_symbols=[],
+    )
+
+    active, inactive = _session_active_monitoring_symbols(snapshot, now=now)
+
+    assert active == ["027710", "APTX"]
+    assert inactive == []
 
 
 @pytest.mark.parametrize(
@@ -2255,7 +2399,7 @@ def test_cached_cycle_returns_review_transition_when_every_symbol_is_removed(
         broker_adapter_factory=lambda settings: None,  # type: ignore[arg-type,return-value]
         monitoring_price_source=DurableEmptyPriceSource(),
     )
-    started_at = datetime(2026, 9, 15, 4, 0, tzinfo=UTC)
+    started_at = datetime(2026, 9, 15, 15, 0, tzinfo=UTC)
     initial_snapshot = MonitoringRuntimeSnapshot(
         loaded_at=started_at,
         symbols=["OLDCO"],
