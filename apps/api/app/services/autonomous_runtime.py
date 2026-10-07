@@ -1068,29 +1068,31 @@ class AutonomousRuntimeCoordinator:
             if not self._reconcile_and_refresh_monitoring_snapshot_if_due(started_at):
                 raise RuntimeError("live broker position reconciliation failed")
         workset_snapshot = self._ensure_monitoring_runtime_snapshot(started_at)
-        desired_symbols, session_inactive_symbols = _session_active_monitoring_symbols(
+        monitoring_workset_symbols = list(workset_snapshot.symbols)
+        quote_symbols, session_inactive_symbols = _session_active_monitoring_symbols(
             workset_snapshot,
             now=started_at,
         )
-        position_symbols = set(workset_snapshot.positions_by_symbol) & set(desired_symbols)
+        position_symbols = set(workset_snapshot.positions_by_symbol) & set(quote_symbols)
         symbols, self._monitoring_symbol_cursor = _select_monitoring_symbol_batch(
-            desired_symbols=desired_symbols,
+            desired_symbols=quote_symbols,
             priority_symbols=position_symbols,
             batch_size=max(int(self.settings.monitoring_max_symbols_per_cycle or 0), 1),
             cursor=self._monitoring_symbol_cursor,
         )
         if self.session_factory is not None and self._reconcile_monitoring_orders_if_due(
             now=started_at,
-            symbols=set(symbols),
+            symbols=set(monitoring_workset_symbols),
         ):
             workset_snapshot = self._ensure_monitoring_runtime_snapshot(started_at)
-            desired_symbols, session_inactive_symbols = _session_active_monitoring_symbols(
+            monitoring_workset_symbols = list(workset_snapshot.symbols)
+            quote_symbols, session_inactive_symbols = _session_active_monitoring_symbols(
                 workset_snapshot,
                 now=started_at,
             )
-            position_symbols = set(workset_snapshot.positions_by_symbol) & set(desired_symbols)
+            position_symbols = set(workset_snapshot.positions_by_symbol) & set(quote_symbols)
             symbols, self._monitoring_symbol_cursor = _select_monitoring_symbol_batch(
-                desired_symbols=desired_symbols,
+                desired_symbols=quote_symbols,
                 priority_symbols=position_symbols,
                 batch_size=max(
                     int(self.settings.monitoring_max_symbols_per_cycle or 0),

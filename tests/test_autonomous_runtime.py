@@ -504,6 +504,59 @@ def test_monitoring_cycle_does_not_request_us_quotes_outside_regular_session(
     assert payload["session_inactive_symbols"] == ["APTX"]
 
 
+def test_monitoring_cycle_reconciles_closed_session_us_symbols_without_quote_polling(
+    monkeypatch,
+) -> None:
+    now = datetime(2026, 10, 7, 5, 0, tzinfo=UTC)  # 01:00 America/New_York
+    coordinator = AutonomousRuntimeCoordinator(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="live",
+            monitoring_max_symbols_per_cycle=6,
+            monitoring_max_broker_actions_per_cycle=0,
+        ),
+        session_factory=lambda: None,  # type: ignore[arg-type,return-value]
+        broker_adapter_factory=lambda settings: None,  # type: ignore[arg-type,return-value]
+    )
+    coordinator._monitoring_runtime_snapshot = MonitoringRuntimeSnapshot(
+        loaded_at=now,
+        symbols=["005930", "APTX"],
+        positions_by_symbol={
+            "005930": CachedMonitoringPosition(
+                symbol="005930", quantity=1012, exchange="KRX"
+            ),
+            "APTX": CachedMonitoringPosition(
+                symbol="APTX", quantity=377, exchange="NASD"
+            ),
+        },
+        items=[],
+        filled_today_symbols=[],
+    )
+    reconciled_symbols: list[set[str]] = []
+    quote_calls: list[list[str]] = []
+    monkeypatch.setattr(
+        coordinator,
+        "_reconcile_and_refresh_monitoring_snapshot_if_due",
+        lambda now: True,
+    )
+    monkeypatch.setattr(
+        coordinator,
+        "_reconcile_monitoring_orders_if_due",
+        lambda **kwargs: reconciled_symbols.append(set(kwargs["symbols"])) or False,
+    )
+    monkeypatch.setattr(
+        coordinator,
+        "_load_monitoring_prices",
+        lambda **kwargs: quote_calls.append(list(kwargs["symbols"])) or [],
+    )
+
+    payload = coordinator._monitoring_cycle_sync(now)
+
+    assert reconciled_symbols == [{"005930", "APTX"}]
+    assert quote_calls == [["005930"]]
+    assert payload["monitored_symbols"] == ["005930"]
+
+
 def test_session_active_monitoring_symbols_keeps_us_equities_during_regular_session() -> None:
     now = datetime(2026, 10, 6, 15, 0, tzinfo=UTC)  # 11:00 America/New_York
     snapshot = MonitoringRuntimeSnapshot(
