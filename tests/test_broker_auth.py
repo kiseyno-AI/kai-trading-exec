@@ -606,6 +606,83 @@ def test_kis_http_client_serializes_request_start_times(monkeypatch) -> None:
     assert sleeps == [pytest.approx(0.1)]
 
 
+def test_kis_http_client_retries_retryable_network_get_once(monkeypatch) -> None:
+    client = UrllibJsonHttpClient(
+        get_network_retry_attempts=1,
+        get_network_retry_backoff_seconds=0.25,
+    )
+    attempts = 0
+    sleeps: list[float] = []
+
+    def request_json(**kwargs) -> JsonHttpResponse:
+        nonlocal attempts
+        del kwargs
+        attempts += 1
+        if attempts == 1:
+            raise BrokerAdapterError(
+                "temporary network failure",
+                classification=BrokerErrorClassification.NETWORK,
+                retryable=True,
+            )
+        return JsonHttpResponse(status_code=200, headers={}, payload={"ok": True})
+
+    monkeypatch.setattr(client, "_request_json", request_json)
+    monkeypatch.setattr(kis_module.time, "sleep", sleeps.append)
+
+    response = client.get_json(
+        url="https://broker.invalid/quote",
+        headers={},
+        params={"symbol": "005930"},
+        timeout_seconds=1,
+    )
+
+    assert response.payload == {"ok": True}
+    assert attempts == 2
+    assert sleeps == [pytest.approx(0.25)]
+
+
+def test_kis_http_client_does_not_retry_post_network_failure(monkeypatch) -> None:
+    client = UrllibJsonHttpClient(
+        get_network_retry_attempts=3,
+        get_network_retry_backoff_seconds=0,
+    )
+    attempts = 0
+
+    def request_json(**kwargs) -> JsonHttpResponse:
+        nonlocal attempts
+        del kwargs
+        attempts += 1
+        raise BrokerAdapterError(
+            "temporary network failure",
+            classification=BrokerErrorClassification.NETWORK,
+            retryable=True,
+        )
+
+    monkeypatch.setattr(client, "_request_json", request_json)
+
+    with pytest.raises(BrokerAdapterError, match="temporary network failure"):
+        client.post_json(
+            url="https://broker.invalid/order",
+            headers={},
+            payload={"symbol": "005930"},
+            timeout_seconds=1,
+        )
+
+    assert attempts == 1
+
+
+def test_settings_load_kis_get_network_retry_environment_fields() -> None:
+    settings = load_settings(
+        {
+            "KAI_EXEC_KIS_GET_NETWORK_RETRY_ATTEMPTS": "2",
+            "KAI_EXEC_KIS_GET_NETWORK_RETRY_BACKOFF_SECONDS": "0.5",
+        }
+    )
+
+    assert settings.kis_get_network_retry_attempts == 2
+    assert settings.kis_get_network_retry_backoff_seconds == pytest.approx(0.5)
+
+
 def test_settings_load_profit_protection_environment_fields() -> None:
     settings = load_settings(
         {

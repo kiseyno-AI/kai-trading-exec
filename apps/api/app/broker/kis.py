@@ -138,9 +138,15 @@ class UrllibJsonHttpClient:
         *,
         ssl_context: ssl.SSLContext | None = None,
         min_request_interval_seconds: float = 0.0,
+        get_network_retry_attempts: int = 0,
+        get_network_retry_backoff_seconds: float = 0.0,
     ) -> None:
         self._ssl_context = ssl_context or _default_ssl_context()
         self._min_request_interval_seconds = max(0.0, min_request_interval_seconds)
+        self._get_network_retry_attempts = max(0, get_network_retry_attempts)
+        self._get_network_retry_backoff_seconds = max(
+            0.0, get_network_retry_backoff_seconds
+        )
         self._request_lock = threading.Lock()
         self._last_request_started_at: float | None = None
 
@@ -164,7 +170,25 @@ class UrllibJsonHttpClient:
             headers=headers,
             method="GET",
         )
-        return self._request_json(request=request, timeout_seconds=timeout_seconds)
+        for attempt in range(self._get_network_retry_attempts + 1):
+            try:
+                return self._request_json(
+                    request=request,
+                    timeout_seconds=timeout_seconds,
+                )
+            except BrokerAdapterError as exc:
+                should_retry = (
+                    exc.retryable
+                    and exc.classification == BrokerErrorClassification.NETWORK
+                    and attempt < self._get_network_retry_attempts
+                )
+                if not should_retry:
+                    raise
+                if self._get_network_retry_backoff_seconds > 0:
+                    time.sleep(
+                        self._get_network_retry_backoff_seconds * (attempt + 1)
+                    )
+        raise AssertionError("unreachable KIS GET retry loop")
 
     def post_json(
         self,
@@ -283,6 +307,10 @@ class KisBrokerAdapter(BrokerAdapter):
         self.settings = settings
         delegate = http_client or UrllibJsonHttpClient(
             min_request_interval_seconds=settings.kis_min_request_interval_seconds,
+            get_network_retry_attempts=settings.kis_get_network_retry_attempts,
+            get_network_retry_backoff_seconds=(
+                settings.kis_get_network_retry_backoff_seconds
+            ),
         )
         self.http_client = _TokenInvalidatingJsonHttpClient(
             settings=settings,
