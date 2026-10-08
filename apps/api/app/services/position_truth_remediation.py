@@ -31,6 +31,20 @@ from app.services.account_drawdown_recovery import recovery_account_fingerprint
 from app.services.broker_auth import ensure_authenticated_broker_session
 from app.services.broker_order_state import ACTIONABLE_OPEN_ORDER_STATUSES
 from app.services.fifo_inventory import fifo_route_scope_from_order
+from app.services.kis_krx_flat_rebind_contract import (
+    KIS_KRX_LEGACY_FLAT_REBIND_CANONICAL_BASE_QUANTITY,
+    KIS_KRX_LEGACY_FLAT_REBIND_CANDIDATE_TYPE,
+    KIS_KRX_LEGACY_FLAT_REBIND_EVENT_PROOF_FIELDS,
+    KIS_KRX_LEGACY_FLAT_REBIND_OUTCOME,
+    KIS_KRX_LEGACY_FLAT_REBIND_RAW_PROOF_FIELDS,
+    KIS_KRX_LEGACY_FLAT_REBIND_SAFETY_POLICY_VERSION,
+    KIS_KRX_LEGACY_FLAT_REBIND_ZERO_MUTATION_FIELDS,
+    is_lower_hex_sha256,
+    kis_krx_flat_absence_proof_digest,
+    kis_krx_flat_configured_account_binding_digest,
+    kis_krx_flat_evidence_fingerprint,
+    kis_krx_flat_evidence_material,
+)
 from app.services.order_intent_serialization import (
     alpaca_pre_auth_order_intent_account_scope,
     order_intent_file_lock,
@@ -46,6 +60,7 @@ from app.services.position_identity import (
     build_position_identity,
     payload_with_position_identity,
     position_identity_from_columns,
+    position_identity_from_payload,
     stable_account_scope_hmac_key,
 )
 from app.services.reconciliation import sync_execution_positions_from_broker_snapshot
@@ -82,6 +97,957 @@ POSITION_EVIDENCE_ORDER_STATUSES = (*ACTIONABLE_OPEN_ORDER_STATUSES, "filled")
 
 def _real_utc_now() -> datetime:
     return datetime.now(UTC)
+
+
+def analyze_kis_krx_legacy_flat_position_rebind(
+    *,
+    settings: Settings,
+    db: Session,
+    auth_session_factory: sessionmaker[Session],
+    adapter: BrokerAdapter,
+    symbol: str,
+    now: datetime | None = None,
+) -> dict[str, object]:
+    """Prove one legacy KRX slot is currently absent from the KIS account."""
+    evaluated_at = now or datetime.now(UTC)
+    normalized_symbol = _normalized_kis_krx_flat_rebind_symbol(symbol)
+    _require_kis_krx_flat_rebind_route(settings=settings, adapter=adapter)
+    positions = db.scalars(
+        select(ExecutionPosition)
+        .where(
+            ExecutionPosition.mode == settings.runtime_mode,
+            ExecutionPosition.provider.is_(None),
+            ExecutionPosition.account_scope.is_(None),
+            ExecutionPosition.exchange.is_(None),
+            func.upper(func.trim(ExecutionPosition.symbol)) == normalized_symbol,
+        )
+        .order_by(ExecutionPosition.id.asc())
+    ).all()
+    if len(positions) != 1:
+        raise PositionIdentityConflictError(
+            "KIS KRX flat rebind requires one exact unscoped position"
+        )
+
+    access_token = _durably_authenticate_for_position_refresh(
+        settings=settings,
+        session_factory=auth_session_factory,
+        adapter=adapter,
+    )
+    snapshot = adapter.get_account_snapshot(
+        access_token,
+        symbols=[normalized_symbol],
+        exchange="KRX",
+    )
+    _require_current_attribution_snapshot(
+        settings=settings,
+        evaluated_at=evaluated_at,
+        snapshot_observed_at=snapshot.observed_at,
+    )
+    _require_kis_krx_flat_rebind_snapshot(
+        settings=settings,
+        snapshot=snapshot,
+    )
+    identity = build_position_identity(
+        settings=settings,
+        provider="kis",
+        exchange="KRX",
+        broker_account_id=snapshot.broker_account_id,
+    )
+    holding_symbols = _kis_krx_snapshot_symbols(
+        rows=list(snapshot.holdings),
+        evidence_type="holding",
+        allow_repeated_symbols=False,
+    )
+    open_order_symbols = _kis_krx_snapshot_symbols(
+        rows=list(snapshot.open_orders),
+        evidence_type="open order",
+        allow_repeated_symbols=True,
+    )
+    scoped_route_exists = db.scalar(
+        select(ExecutionPosition.id).where(
+            func.lower(func.trim(ExecutionPosition.mode)) == "live",
+            func.lower(func.trim(ExecutionPosition.provider)) == identity.provider,
+            func.lower(func.trim(ExecutionPosition.account_scope))
+            == identity.account_scope,
+            func.upper(func.trim(ExecutionPosition.symbol)) == normalized_symbol,
+        )
+    ) is not None
+    absence_proof_digest = _kis_krx_flat_absence_proof_digest(
+        settings=settings,
+        snapshot=snapshot,
+        identity=identity,
+        symbol=normalized_symbol,
+        holding_symbols=holding_symbols,
+        open_order_symbols=open_order_symbols,
+    )
+    item = _kis_krx_flat_rebind_item(
+        settings=settings,
+        position=positions[0],
+        identity=identity,
+        snapshot=snapshot,
+        holding_present=normalized_symbol in holding_symbols,
+        open_order_present=normalized_symbol in open_order_symbols,
+        scoped_route_exists=scoped_route_exists,
+        absence_proof_digest=absence_proof_digest,
+    )
+    return _kis_krx_flat_rebind_payload(
+        mode="dry-run",
+        settings=settings,
+        evaluated_at=evaluated_at,
+        snapshot_observed_at=snapshot.observed_at,
+        snapshot_source=snapshot.source,
+        items=[item],
+    )
+
+
+def apply_kis_krx_legacy_flat_position_rebind(
+    *,
+    settings: Settings,
+    db: Session,
+    auth_session_factory: sessionmaker[Session],
+    adapter: BrokerAdapter,
+    symbol: str,
+    approved_evidence: dict[str, str],
+    actor: str,
+    reason: str,
+    now: datetime | None = None,
+) -> dict[str, object]:
+    """Bind one reviewed legacy KRX row to current, complete flat truth."""
+    normalized_actor = str(actor or "").strip()
+    normalized_reason = str(reason or "").strip()
+    normalized_symbol = _normalized_kis_krx_flat_rebind_symbol(symbol)
+    normalized_approvals = _validated_kis_krx_flat_approvals(approved_evidence)
+    if not normalized_actor or not normalized_reason:
+        raise ValueError("KIS KRX flat rebind requires actor and reason")
+    _require_kis_krx_flat_rebind_route(settings=settings, adapter=adapter)
+
+    idempotent = _kis_krx_flat_rebind_idempotent_result(
+        settings=settings,
+        db=db,
+        symbol=normalized_symbol,
+        approved_evidence=normalized_approvals,
+        generated_at=now or datetime.now(UTC),
+    )
+    if idempotent is not None:
+        return idempotent
+
+    evaluated_at = now or datetime.now(UTC)
+    serialization = None
+    approved_item: dict[str, object] | None = None
+    applied_at: datetime | None = None
+    try:
+        current = analyze_kis_krx_legacy_flat_position_rebind(
+            settings=settings,
+            db=db,
+            auth_session_factory=auth_session_factory,
+            adapter=adapter,
+            symbol=normalized_symbol,
+            now=evaluated_at,
+        )
+        current_items = {
+            str(item["position_id"]): item
+            for item in current["items"]
+            if isinstance(item, dict)
+        }
+        if set(normalized_approvals) != set(current_items):
+            raise PositionIdentityConflictError(
+                "KIS KRX flat rebind requires the exact current candidate"
+            )
+        position_id, approved_fingerprint = next(iter(normalized_approvals.items()))
+        approved_item = current_items[position_id]
+        current_fingerprint = approved_item.get("evidence_fingerprint")
+        if (
+            approved_item.get("eligible") is not True
+            or not isinstance(current_fingerprint, str)
+            or not hmac.compare_digest(approved_fingerprint, current_fingerprint)
+        ):
+            raise PositionIdentityConflictError(
+                "approved KIS KRX flat evidence no longer matches current broker truth"
+            )
+
+        # Acquire a durable token from the shared KIS path before reserving a
+        # SQLite writer. The broker snapshot itself is fetched only after the
+        # account/order-intent serialization and row locks are held.
+        db.rollback()
+        locked_access_token = _durably_authenticate_for_position_refresh(
+            settings=settings,
+            session_factory=auth_session_factory,
+            adapter=adapter,
+        )
+        serialization = _acquire_legacy_attribution_apply_serialization(
+            settings=settings,
+            db=db,
+            provider="kis",
+            account_scope=str(approved_item["account_scope"]),
+            exchange="KRX",
+        )
+        try:
+            locked_positions = db.scalars(
+                select(ExecutionPosition)
+                .where(
+                    ExecutionPosition.id == position_id,
+                    ExecutionPosition.mode == settings.runtime_mode,
+                    ExecutionPosition.provider.is_(None),
+                    ExecutionPosition.account_scope.is_(None),
+                    ExecutionPosition.exchange.is_(None),
+                    func.upper(func.trim(ExecutionPosition.symbol))
+                    == normalized_symbol,
+                )
+                .with_for_update(nowait=True)
+                .execution_options(populate_existing=True)
+            ).all()
+        except DBAPIError as exc:
+            raise PositionIdentityConflictError(
+                "KIS KRX flat rebind row is busy; retry from a new dry-run"
+            ) from exc
+        if len(locked_positions) != 1:
+            raise PositionIdentityConflictError(
+                "approved KIS KRX flat position is missing or already bound"
+            )
+
+        _reject_locked_scoped_symbol_collisions(
+            settings=settings,
+            db=db,
+            approved_items=[approved_item],
+            approved_ids=[position_id],
+        )
+        locked_snapshot = adapter.get_account_snapshot(
+            locked_access_token,
+            symbols=[normalized_symbol],
+            exchange="KRX",
+        )
+        locked_evaluated_at = _real_utc_now()
+        _require_current_attribution_snapshot(
+            settings=settings,
+            evaluated_at=locked_evaluated_at,
+            snapshot_observed_at=locked_snapshot.observed_at,
+        )
+        if locked_evaluated_at.astimezone(UTC) < locked_snapshot.observed_at.astimezone(
+            UTC
+        ):
+            raise PositionIdentityConflictError(
+                "KIS KRX flat rebind locked snapshot is ahead of the audit clock"
+            )
+        _require_kis_krx_flat_rebind_snapshot(
+            settings=settings,
+            snapshot=locked_snapshot,
+        )
+        locked_identity = build_position_identity(
+            settings=settings,
+            provider="kis",
+            exchange="KRX",
+            broker_account_id=locked_snapshot.broker_account_id,
+        )
+        holding_symbols = _kis_krx_snapshot_symbols(
+            rows=list(locked_snapshot.holdings),
+            evidence_type="holding",
+            allow_repeated_symbols=False,
+        )
+        open_order_symbols = _kis_krx_snapshot_symbols(
+            rows=list(locked_snapshot.open_orders),
+            evidence_type="open order",
+            allow_repeated_symbols=True,
+        )
+        locked_absence_digest = _kis_krx_flat_absence_proof_digest(
+            settings=settings,
+            snapshot=locked_snapshot,
+            identity=locked_identity,
+            symbol=normalized_symbol,
+            holding_symbols=holding_symbols,
+            open_order_symbols=open_order_symbols,
+        )
+        locked_item = _kis_krx_flat_rebind_item(
+            settings=settings,
+            position=locked_positions[0],
+            identity=locked_identity,
+            snapshot=locked_snapshot,
+            holding_present=normalized_symbol in holding_symbols,
+            open_order_present=normalized_symbol in open_order_symbols,
+            scoped_route_exists=False,
+            absence_proof_digest=locked_absence_digest,
+        )
+        locked_fingerprint = locked_item.get("evidence_fingerprint")
+        if (
+            locked_item.get("eligible") is not True
+            or not isinstance(locked_fingerprint, str)
+            or not hmac.compare_digest(approved_fingerprint, locked_fingerprint)
+        ):
+            raise PositionIdentityConflictError(
+                "approved KIS KRX flat evidence changed after row locking"
+            )
+
+        position = locked_positions[0]
+        position.provider = locked_identity.provider
+        position.account_scope = locked_identity.account_scope
+        position.exchange = locked_identity.exchange
+        position.quantity = 0
+        position.base_quantity = KIS_KRX_LEGACY_FLAT_REBIND_CANONICAL_BASE_QUANTITY
+        position.average_price = None
+        position.updated_from = "reconciliation"
+        position.last_reconciled_at = locked_snapshot.observed_at
+        position.raw_payload = _kis_krx_current_flat_truth_payload(
+            settings=settings,
+            identity=locked_identity,
+            snapshot_source=locked_snapshot.source,
+            snapshot_observed_at=locked_snapshot.observed_at,
+            absence_proof_digest=locked_absence_digest,
+        )
+        db.add(
+            RuntimeRemediationEvent(
+                mode=settings.runtime_mode,
+                candidate_type=KIS_KRX_LEGACY_FLAT_REBIND_CANDIDATE_TYPE,
+                candidate_key=position.id,
+                subject_id=position.id,
+                outcome=KIS_KRX_LEGACY_FLAT_REBIND_OUTCOME,
+                actor=normalized_actor,
+                reason=normalized_reason,
+                evidence_summary={
+                    "symbol": normalized_symbol,
+                    "provider": locked_identity.provider,
+                    "account_scope": locked_identity.account_scope,
+                    "exchange": locked_identity.exchange,
+                    "asset_class": "equity",
+                    "broker_snapshot_source": locked_snapshot.source,
+                    "broker_snapshot_observed_at": _serialize_datetime(
+                        locked_snapshot.observed_at
+                    ),
+                    "holdings_complete": True,
+                    "open_orders_complete": True,
+                    "holding_absent": True,
+                    "open_order_absent": True,
+                    "absence_proof_digest": locked_absence_digest,
+                    "configured_account_binding_digest": (
+                        kis_krx_flat_configured_account_binding_digest(
+                            settings=settings
+                        )
+                    ),
+                    "prior_position_digest": locked_item["prior_position_digest"],
+                    "evidence_fingerprint": locked_fingerprint,
+                    "safety_policy_version": (
+                        KIS_KRX_LEGACY_FLAT_REBIND_SAFETY_POLICY_VERSION
+                    ),
+                    "historical_account_attributed": False,
+                    "current_flat_truth_bound": True,
+                    **{
+                        field: 0
+                        for field in KIS_KRX_LEGACY_FLAT_REBIND_ZERO_MUTATION_FIELDS
+                    },
+                },
+                occurred_at=locked_evaluated_at,
+            )
+        )
+        db.commit()
+        approved_item = locked_item
+        applied_at = locked_evaluated_at
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        if serialization is not None:
+            serialization.close()
+
+    assert approved_item is not None
+    assert applied_at is not None
+    return {
+        "mode": "apply",
+        "runtime_mode": settings.runtime_mode,
+        "provider": "kis",
+        "exchange": "KRX",
+        "generated_at": _serialize_datetime(applied_at),
+        "broker_snapshot_observed_at": approved_item[
+            "broker_snapshot_observed_at"
+        ],
+        "summary": {
+            "approved_count": 1,
+            "bound_count": 1,
+            "idempotent_count": 0,
+            "historical_account_attributed_count": 0,
+            "broker_api_mutation_count": 0,
+        },
+        "items": [
+            {**approved_item, "outcome": KIS_KRX_LEGACY_FLAT_REBIND_OUTCOME}
+        ],
+    }
+
+
+def _kis_krx_flat_rebind_idempotent_result(
+    *,
+    settings: Settings,
+    db: Session,
+    symbol: str,
+    approved_evidence: dict[str, str],
+    generated_at: datetime,
+) -> dict[str, object] | None:
+    position_id, approved_fingerprint = next(iter(approved_evidence.items()))
+    event = db.scalar(
+        select(RuntimeRemediationEvent).where(
+            RuntimeRemediationEvent.mode == settings.runtime_mode,
+            RuntimeRemediationEvent.candidate_type
+            == KIS_KRX_LEGACY_FLAT_REBIND_CANDIDATE_TYPE,
+            RuntimeRemediationEvent.candidate_key == position_id,
+            RuntimeRemediationEvent.subject_id == position_id,
+            RuntimeRemediationEvent.outcome == KIS_KRX_LEGACY_FLAT_REBIND_OUTCOME,
+        )
+    )
+    if event is None:
+        return None
+
+    position = db.get(ExecutionPosition, position_id)
+    evidence = event.evidence_summary
+    expected_identity = build_position_identity(
+        settings=settings,
+        provider="kis",
+        exchange="KRX",
+    )
+    column_identity = (
+        position_identity_from_columns(position) if position is not None else None
+    )
+    payload_identity = (
+        position_identity_from_payload(position.raw_payload)
+        if position is not None
+        else None
+    )
+    raw_payload = (
+        position.raw_payload
+        if position is not None and isinstance(position.raw_payload, dict)
+        else None
+    )
+    snapshot_observed_at = (
+        evidence.get("broker_snapshot_observed_at")
+        if isinstance(evidence, dict)
+        else None
+    )
+    try:
+        parsed_snapshot_observed_at = (
+            datetime.fromisoformat(snapshot_observed_at.replace("Z", "+00:00"))
+            if isinstance(snapshot_observed_at, str)
+            else None
+        )
+    except ValueError:
+        parsed_snapshot_observed_at = None
+    event_occurred_at = event.occurred_at
+    if event_occurred_at.tzinfo is None:
+        event_occurred_at = event_occurred_at.replace(tzinfo=UTC)
+    expected_absence_proof_digest = kis_krx_flat_absence_proof_digest(
+        runtime_mode=settings.runtime_mode,
+        identity=expected_identity,
+        symbol=symbol,
+        snapshot_source="kis:account_snapshot",
+        holdings_complete=True,
+        open_orders_complete=True,
+        holding_absent=True,
+        open_order_absent=True,
+        configured_account_binding_digest=(
+            kis_krx_flat_configured_account_binding_digest(settings=settings)
+        ),
+    )
+    prior_position_digest = (
+        evidence.get("prior_position_digest")
+        if isinstance(evidence, dict)
+        else None
+    )
+    expected_evidence_fingerprint = (
+        kis_krx_flat_evidence_fingerprint(
+            runtime_mode=settings.runtime_mode,
+            position_id=position_id,
+            prior_position_digest=prior_position_digest,
+            identity=expected_identity,
+            symbol=symbol,
+            snapshot_source="kis:account_snapshot",
+            holdings_complete=True,
+            open_orders_complete=True,
+            holding_absent=True,
+            open_order_absent=True,
+            absence_proof_digest=expected_absence_proof_digest,
+            configured_account_binding_digest=(
+                kis_krx_flat_configured_account_binding_digest(settings=settings)
+            ),
+        )
+        if is_lower_hex_sha256(prior_position_digest)
+        else None
+    )
+    if not (
+        position is not None
+        and isinstance(evidence, dict)
+        and set(evidence) == KIS_KRX_LEGACY_FLAT_REBIND_EVENT_PROOF_FIELDS
+        and position.mode == settings.runtime_mode
+        and str(position.symbol or "") == symbol
+        and column_identity == expected_identity
+        and payload_identity == expected_identity
+        and _canonical_attribution_decimal(position.quantity) == "0"
+        and position.base_quantity is not None
+        and _canonical_attribution_decimal(position.base_quantity) == "0"
+        and position.average_price is None
+        and position.updated_from == "reconciliation"
+        and _serialize_datetime(position.last_reconciled_at)
+        == snapshot_observed_at
+        and evidence.get("symbol") == symbol
+        and evidence.get("provider") == expected_identity.provider
+        and evidence.get("account_scope") == expected_identity.account_scope
+        and evidence.get("exchange") == expected_identity.exchange
+        and evidence.get("asset_class") == "equity"
+        and evidence.get("broker_snapshot_source") == "kis:account_snapshot"
+        and parsed_snapshot_observed_at is not None
+        and parsed_snapshot_observed_at.tzinfo is not None
+        and parsed_snapshot_observed_at.utcoffset() is not None
+        and evidence.get("holdings_complete") is True
+        and evidence.get("open_orders_complete") is True
+        and evidence.get("holding_absent") is True
+        and evidence.get("open_order_absent") is True
+        and evidence.get("historical_account_attributed") is False
+        and evidence.get("current_flat_truth_bound") is True
+        and evidence.get("safety_policy_version")
+        == KIS_KRX_LEGACY_FLAT_REBIND_SAFETY_POLICY_VERSION
+        and is_lower_hex_sha256(evidence.get("absence_proof_digest"))
+        and evidence.get("absence_proof_digest")
+        == expected_absence_proof_digest
+        and evidence.get("configured_account_binding_digest")
+        == kis_krx_flat_configured_account_binding_digest(settings=settings)
+        and is_lower_hex_sha256(evidence.get("prior_position_digest"))
+        and is_lower_hex_sha256(evidence.get("evidence_fingerprint"))
+        and expected_evidence_fingerprint is not None
+        and hmac.compare_digest(
+            str(evidence["evidence_fingerprint"]),
+            expected_evidence_fingerprint,
+        )
+        and hmac.compare_digest(
+            approved_fingerprint,
+            str(evidence["evidence_fingerprint"]),
+        )
+        and all(
+            type(evidence.get(field)) is int and evidence.get(field) == 0
+            for field in KIS_KRX_LEGACY_FLAT_REBIND_ZERO_MUTATION_FIELDS
+        )
+        and isinstance(raw_payload, dict)
+        and set(raw_payload) == KIS_KRX_LEGACY_FLAT_REBIND_RAW_PROOF_FIELDS
+        and raw_payload.get("provider") == evidence.get("provider")
+        and raw_payload.get("mode") == settings.runtime_mode
+        and raw_payload.get("asset_class") == evidence.get("asset_class")
+        and raw_payload.get("exchange") == evidence.get("exchange")
+        and raw_payload.get("snapshot_source")
+        == evidence.get("broker_snapshot_source")
+        and raw_payload.get("snapshot_observed_at") == snapshot_observed_at
+        and raw_payload.get("holdings_coverage") == "complete"
+        and raw_payload.get("open_orders_coverage") == "complete"
+        and raw_payload.get("holding_absent") is True
+        and raw_payload.get("open_order_absent") is True
+        and raw_payload.get("absence_proof_digest")
+        == evidence.get("absence_proof_digest")
+        and raw_payload.get("configured_account_binding_digest")
+        == evidence.get("configured_account_binding_digest")
+        and raw_payload.get("historical_account_attributed") is False
+        and raw_payload.get("current_flat_truth_bound") is True
+        and raw_payload.get("safety_policy_version")
+        == KIS_KRX_LEGACY_FLAT_REBIND_SAFETY_POLICY_VERSION
+        and parsed_snapshot_observed_at is not None
+        and event_occurred_at.astimezone(UTC)
+        >= parsed_snapshot_observed_at.astimezone(UTC)
+        and (
+            event_occurred_at.astimezone(UTC)
+            - parsed_snapshot_observed_at.astimezone(UTC)
+        ).total_seconds()
+        <= settings.exec_agent_max_account_snapshot_age_seconds
+    ):
+        raise PositionIdentityConflictError(
+            "existing KIS KRX flat rebind audit no longer matches canonical flat truth"
+        )
+
+    return {
+        "mode": "apply",
+        "runtime_mode": settings.runtime_mode,
+        "provider": "kis",
+        "exchange": "KRX",
+        "generated_at": _serialize_datetime(generated_at),
+        "broker_snapshot_observed_at": snapshot_observed_at,
+        "summary": {
+            "approved_count": 1,
+            "bound_count": 0,
+            "idempotent_count": 1,
+            "historical_account_attributed_count": 0,
+            "broker_api_mutation_count": 0,
+        },
+        "items": [
+            {
+                **evidence,
+                "position_id": position_id,
+                "outcome": "already_current_flat_truth_bound",
+            }
+        ],
+    }
+
+
+def _validated_kis_krx_flat_approvals(
+    approved_evidence: dict[str, str],
+) -> dict[str, str]:
+    if not isinstance(approved_evidence, dict) or len(approved_evidence) != 1:
+        raise ValueError(
+            "KIS KRX flat rebind requires one explicit approved evidence"
+        )
+    normalized: dict[str, str] = {}
+    for raw_position_id, raw_fingerprint in approved_evidence.items():
+        position_id = str(raw_position_id or "").strip()
+        fingerprint = str(raw_fingerprint or "").strip().lower()
+        if (
+            not position_id
+            or len(fingerprint) != 64
+            or any(character not in "0123456789abcdef" for character in fingerprint)
+        ):
+            raise ValueError("KIS KRX flat rebind approval is invalid")
+        normalized[position_id] = fingerprint
+    return normalized
+
+
+def _kis_krx_current_flat_truth_payload(
+    *,
+    settings: Settings,
+    identity: PositionIdentity,
+    snapshot_source: str,
+    snapshot_observed_at: datetime,
+    absence_proof_digest: str,
+) -> dict[str, object]:
+    return payload_with_position_identity(
+        {
+            "provider": identity.provider,
+            "mode": settings.runtime_mode,
+            "asset_class": "equity",
+            "exchange": identity.exchange,
+            "snapshot_source": snapshot_source,
+            "snapshot_observed_at": _serialize_datetime(snapshot_observed_at),
+            "holdings_coverage": "complete",
+            "open_orders_coverage": "complete",
+            "holding_absent": True,
+            "open_order_absent": True,
+            "absence_proof_digest": absence_proof_digest,
+            "configured_account_binding_digest": (
+                kis_krx_flat_configured_account_binding_digest(settings=settings)
+            ),
+            "historical_account_attributed": False,
+            "current_flat_truth_bound": True,
+            "safety_policy_version": (
+                KIS_KRX_LEGACY_FLAT_REBIND_SAFETY_POLICY_VERSION
+            ),
+        },
+        identity=identity,
+    )
+
+
+def _normalized_kis_krx_flat_rebind_symbol(symbol: object) -> str:
+    raw_symbol = str(symbol or "")
+    normalized = raw_symbol.strip().upper()
+    if (
+        raw_symbol != normalized
+        or len(normalized) != 6
+        or not normalized.isascii()
+        or not normalized.isdigit()
+    ):
+        raise ValueError("KIS KRX flat rebind requires one canonical six-digit symbol")
+    return normalized
+
+
+def _require_kis_krx_flat_rebind_route(
+    *,
+    settings: Settings,
+    adapter: BrokerAdapter,
+) -> None:
+    if settings.runtime_mode != "live":
+        raise PositionIdentityConflictError(
+            "KIS KRX flat rebind requires live mode"
+        )
+    if str(settings.runtime_broker_provider or "").strip().lower() != "kis":
+        raise PositionIdentityConflictError(
+            "KIS KRX flat rebind requires runtime broker provider kis"
+        )
+    if str(adapter.provider or "").strip().lower() != "kis":
+        raise PositionIdentityConflictError(
+            "KIS KRX flat rebind requires a KIS adapter"
+        )
+    if not str(settings.kis_account_number or "").strip() or not str(
+        settings.kis_account_product_code or ""
+    ).strip():
+        raise PositionIdentityConflictError(
+            "KIS KRX flat rebind requires a configured KIS account identity"
+        )
+    if legacy_attribution_account_scope_source(settings=settings) is None:
+        raise PositionIdentityConflictError(
+            "KIS KRX flat rebind requires a stable canonical account scope"
+        )
+    kis_krx_flat_configured_account_binding_digest(settings=settings)
+
+
+def _require_kis_krx_flat_rebind_snapshot(
+    *,
+    settings: Settings,
+    snapshot: object,
+) -> None:
+    payload = getattr(snapshot, "payload", None)
+    expected_mask = _masked_account_number(settings.kis_account_number)
+    if (
+        not isinstance(payload, dict)
+        or str(getattr(snapshot, "source", "") or "") != "kis:account_snapshot"
+        or str(payload.get("exchange") or "").strip().upper() != "KRX"
+        or payload.get("account_number_masked") != expected_mask
+        or getattr(snapshot, "holdings_complete", None) is not True
+        or getattr(snapshot, "open_orders_complete", None) is not True
+        or payload.get("holdings_coverage") != "complete"
+        or payload.get("open_orders_coverage") != "complete"
+        or "open_orders_error" not in payload
+        or payload.get("open_orders_error") is not None
+        or not _kis_krx_flat_snapshot_diagnostics_complete(snapshot)
+    ):
+        raise PositionIdentityConflictError(
+            "KIS KRX flat rebind snapshot proof is unavailable or incomplete"
+        )
+
+
+def _kis_krx_flat_snapshot_diagnostics_complete(snapshot: object) -> bool:
+    diagnostics = getattr(snapshot, "diagnostics", None)
+    if not isinstance(diagnostics, dict):
+        return False
+    if str(diagnostics.get("requested_exchange") or "").strip().upper() != "KRX":
+        return False
+    for key in ("holdings_pagination", "open_orders_pagination"):
+        pagination = diagnostics.get(key)
+        if not isinstance(pagination, dict) or pagination.get("complete") is not True:
+            return False
+    for key in ("holdings_parse", "open_orders_parse"):
+        parse = diagnostics.get(key)
+        if not isinstance(parse, dict):
+            return False
+        values = {
+            name: parse.get(name)
+            for name in (
+                "raw_row_count",
+                "parsed_row_count",
+                "omitted_row_count",
+                "invalid_row_count",
+                "duplicate_identity_count",
+            )
+        }
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value < 0
+            for value in values.values()
+        ):
+            return False
+        if (
+            values["raw_row_count"]
+            != values["parsed_row_count"] + values["omitted_row_count"]
+            or values["invalid_row_count"] != 0
+            or values["duplicate_identity_count"] != 0
+        ):
+            return False
+    return True
+
+
+def _masked_account_number(account_number: str | None) -> str | None:
+    normalized = str(account_number or "").strip()
+    if not normalized:
+        return None
+    if len(normalized) <= 4:
+        return normalized
+    return f"{'*' * (len(normalized) - 4)}{normalized[-4:]}"
+
+
+def _kis_krx_snapshot_symbols(
+    *,
+    rows: list[object],
+    evidence_type: str,
+    allow_repeated_symbols: bool,
+) -> set[str]:
+    symbols: list[str] = []
+    for row in rows:
+        symbol = _normalized_kis_krx_flat_rebind_symbol(
+            getattr(row, "symbol", "")
+        )
+        symbols.append(symbol)
+    if not allow_repeated_symbols and len(symbols) != len(set(symbols)):
+        raise PositionIdentityConflictError(
+            f"KIS KRX flat rebind snapshot contains duplicate {evidence_type} symbols"
+        )
+    return set(symbols)
+
+
+def _kis_krx_flat_absence_proof_digest(
+    *,
+    settings: Settings,
+    snapshot: object,
+    identity: PositionIdentity,
+    symbol: str,
+    holding_symbols: set[str],
+    open_order_symbols: set[str],
+) -> str:
+    # The KIS inquiry is account-wide and must be complete, while the approval
+    # is intentionally scoped to one exact symbol. Unrelated account activity
+    # therefore does not invalidate the reviewed target-symbol absence proof.
+    return kis_krx_flat_absence_proof_digest(
+        runtime_mode=settings.runtime_mode,
+        identity=identity,
+        symbol=symbol,
+        snapshot_source=str(getattr(snapshot, "source", "") or ""),
+        holdings_complete=getattr(snapshot, "holdings_complete", None) is True,
+        open_orders_complete=(
+            getattr(snapshot, "open_orders_complete", None) is True
+        ),
+        holding_absent=symbol not in holding_symbols,
+        open_order_absent=symbol not in open_order_symbols,
+        configured_account_binding_digest=(
+            kis_krx_flat_configured_account_binding_digest(settings=settings)
+        ),
+    )
+
+
+def _kis_krx_prior_position_digest(position: ExecutionPosition) -> str:
+    material = {
+        "mode": position.mode,
+        "position_id": position.id,
+        "symbol": position.symbol,
+        "provider": position.provider,
+        "account_scope": position.account_scope,
+        "exchange": position.exchange,
+        "quantity": _canonical_attribution_decimal(position.quantity),
+        "base_quantity": _canonical_attribution_decimal(position.base_quantity),
+        "average_price": _canonical_attribution_decimal(position.average_price),
+        "updated_from": position.updated_from,
+        "last_reconciled_at": _serialize_datetime(position.last_reconciled_at),
+        "raw_payload_digest": _legacy_payload_digest(position.raw_payload),
+    }
+    return hashlib.sha256(
+        json.dumps(material, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+
+
+def _kis_krx_flat_rebind_item(
+    *,
+    settings: Settings,
+    position: ExecutionPosition,
+    identity: PositionIdentity,
+    snapshot: object,
+    holding_present: bool,
+    open_order_present: bool,
+    scoped_route_exists: bool,
+    absence_proof_digest: str,
+) -> dict[str, object]:
+    symbol = _normalized_position_symbol(position.symbol)
+    integer_quantity = _canonical_attribution_decimal(position.quantity)
+    base_quantity = _canonical_attribution_decimal(position.base_quantity)
+    average_price = _canonical_attribution_decimal(position.average_price)
+    base_quantity_is_valid = (
+        position.base_quantity is None or base_quantity is not None
+    )
+    flat_quantity = (
+        integer_quantity == "0"
+        and base_quantity_is_valid
+        and base_quantity in {None, "0"}
+    )
+    average_price_is_valid = position.average_price is None or average_price is not None
+    raw_payload_is_mapping = isinstance(position.raw_payload, dict)
+    stored_route_identity_present = (
+        raw_payload_is_mapping and POSITION_IDENTITY_KEY in position.raw_payload
+    )
+
+    if position.mode != settings.runtime_mode:
+        reason = "legacy_mode_not_canonical"
+    elif not raw_payload_is_mapping:
+        reason = "legacy_payload_invalid"
+    elif str(position.symbol or "") != symbol:
+        reason = "legacy_symbol_not_canonical"
+    elif stored_route_identity_present:
+        reason = "stored_route_identity_present"
+    elif not flat_quantity:
+        reason = "legacy_position_not_flat"
+    elif not average_price_is_valid:
+        reason = "legacy_average_price_invalid"
+    elif scoped_route_exists:
+        reason = "scoped_route_symbol_collision"
+    elif holding_present:
+        reason = "broker_holding_present"
+    elif open_order_present:
+        reason = "broker_open_order_present"
+    else:
+        reason = "current_broker_flat_truth_proven"
+
+    eligible = reason == "current_broker_flat_truth_proven"
+    prior_position_digest = _kis_krx_prior_position_digest(position)
+    evidence = kis_krx_flat_evidence_material(
+        runtime_mode=settings.runtime_mode,
+        position_id=position.id,
+        prior_position_digest=prior_position_digest,
+        identity=identity,
+        symbol=symbol,
+        snapshot_source=str(getattr(snapshot, "source", "") or ""),
+        holdings_complete=True,
+        open_orders_complete=True,
+        holding_absent=not holding_present,
+        open_order_absent=not open_order_present,
+        absence_proof_digest=absence_proof_digest,
+        configured_account_binding_digest=(
+            kis_krx_flat_configured_account_binding_digest(settings=settings)
+        ),
+    )
+    fingerprint = (
+        kis_krx_flat_evidence_fingerprint(
+            runtime_mode=settings.runtime_mode,
+            position_id=position.id,
+            prior_position_digest=prior_position_digest,
+            identity=identity,
+            symbol=symbol,
+            snapshot_source=str(getattr(snapshot, "source", "") or ""),
+            holdings_complete=True,
+            open_orders_complete=True,
+            holding_absent=not holding_present,
+            open_order_absent=not open_order_present,
+            absence_proof_digest=absence_proof_digest,
+            configured_account_binding_digest=(
+                kis_krx_flat_configured_account_binding_digest(settings=settings)
+            ),
+        )
+        if eligible
+        else None
+    )
+    return {
+        **evidence,
+        "broker_snapshot_source": evidence["snapshot_source"],
+        "broker_snapshot_observed_at": _serialize_datetime(
+            getattr(snapshot, "observed_at", None)
+        ),
+        "updated_from": position.updated_from,
+        "last_reconciled_at": _serialize_datetime(position.last_reconciled_at),
+        "legacy_payload_digest": _legacy_payload_digest(position.raw_payload),
+        "legacy_integer_quantity": integer_quantity,
+        "legacy_base_quantity": base_quantity,
+        "legacy_average_price": average_price,
+        "eligible": eligible,
+        "reason": reason,
+        "evidence_fingerprint": fingerprint,
+    }
+
+
+def _kis_krx_flat_rebind_payload(
+    *,
+    mode: str,
+    settings: Settings,
+    evaluated_at: datetime,
+    snapshot_observed_at: datetime | None,
+    snapshot_source: str | None,
+    items: list[dict[str, object]],
+) -> dict[str, object]:
+    return {
+        "mode": mode,
+        "runtime_mode": settings.runtime_mode,
+        "provider": "kis",
+        "exchange": "KRX",
+        "asset_class": "equity",
+        "generated_at": _serialize_datetime(evaluated_at),
+        "broker_snapshot_observed_at": _serialize_datetime(snapshot_observed_at),
+        "broker_snapshot_source": snapshot_source,
+        "summary": {
+            "candidate_count": len(items),
+            "eligible_count": sum(item["eligible"] is True for item in items),
+            "manual_review_count": sum(item["eligible"] is not True for item in items),
+        },
+        "items": items,
+    }
 
 
 def analyze_alpaca_crypto_flat_position_rebind(

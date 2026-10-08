@@ -994,6 +994,20 @@ zeroed; they receive explicit manual-review events. The script has no order
 submission, amendment, or cancellation path and live mode requires an explicit
 database URL.
 
+The dedicated live KIS/KRX flat-row path is
+`--kis-krx-flat-rebind-symbol SYMBOL`. It targets exactly one canonical
+ASCII six-digit legacy row and requires one `POSITION_ID=64HEX` approval on
+apply. The approval includes an opaque proof-only HMAC of the exact configured
+KIS account/product while preserving the existing canonical route scope; it
+uses the stable account-scope secret or the configured KIS app secret. A fresh
+complete account-wide KRX snapshot must prove the symbol absent from both
+holdings and open orders with `open_orders_error` present and null; source,
+account, route,
+timestamp, pagination, parsing, local row, and scoped-collision evidence are all
+rechecked under serialization before the same row ID is rebound. The persisted
+payload is a minimal redacted current-flat proof and the remediation event
+records zero order, fill, broker, P/L, and strategy mutations.
+
 Legacy non-flat positions whose provider/account/exchange fields are still null
 are intentionally excluded from the ordinary stale-truth apply path. After all
 writers are drained, run `--legacy-attribution-exchange` for exactly one of

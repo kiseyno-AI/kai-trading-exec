@@ -834,6 +834,47 @@ python3 scripts/refresh_execution_position_truth.py \
   --runtime-mode live
 ```
 
+A historical flat KRX row with null provider/account/exchange fields needs the
+separate, single-symbol current-flat workflow. Drain every writer first. The
+dry-run accepts only a canonical six-digit symbol and emits one position ID and
+fingerprint:
+
+```bash
+.venv/bin/python scripts/refresh_execution_position_truth.py \
+  --runtime-mode live \
+  --kis-krx-flat-rebind-symbol 029460
+```
+
+Apply only that exact reviewed pair:
+
+```bash
+.venv/bin/python scripts/refresh_execution_position_truth.py \
+  --runtime-mode live \
+  --kis-krx-flat-rebind-symbol 029460 \
+  --apply \
+  --approve-position 'POSITION_ID=64HEX_FROM_DRY_RUN' \
+  --actor 'operator-name' \
+  --reason 'fresh complete KIS KRX flat proof reviewed'
+```
+
+The workflow preserves the deployment's existing canonical account scope while
+binding the approval to an opaque HMAC of the exact configured KIS
+account/product. That proof uses the stable account-scope secret when present,
+or the existing KIS app secret; a non-secret route label alone is not account
+proof. The apply pass adopts the shared KIS token before reserving the database
+writer, then holds the existing account/order-intent and position locks while it
+re-fetches a fresh account-wide KRX snapshot. Holdings and open-order pagination
+and parsing must both be complete, the configured account proof must match,
+`open_orders_error` must be present and null, and the symbol must be absent from
+both collections. `KIER2570`, stale or future
+timestamps, row drift, a scoped-symbol collision, or any broker activity for
+the symbol blocks the operation. A successful apply updates the same row ID to
+canonical zero truth, clears its stale average price, and writes only a
+redacted proof plus a `runtime_remediation_events` audit. It never creates,
+amends, or cancels an order and never mutates fills or P/L. Re-running the exact
+approved command is idempotent only while the canonical row and proof event
+still match byte-for-byte; otherwise it fails closed.
+
 Legacy non-flat rows with no account/route attribution require a separate,
 explicit two-pass workflow. Drain all writers first, then run one exchange at a
 time:

@@ -26,9 +26,11 @@ from app.services.position_truth_remediation import (  # noqa: E402
     LEGACY_QUARANTINE_ATTRIBUTION_EXCHANGES,
     SUPPORTED_POSITION_EXCHANGES,
     analyze_alpaca_crypto_flat_position_rebind,
+    analyze_kis_krx_legacy_flat_position_rebind,
     analyze_legacy_position_attribution,
     analyze_position_truth_remediation,
     apply_alpaca_crypto_flat_position_rebind,
+    apply_kis_krx_legacy_flat_position_rebind,
     apply_legacy_position_attribution,
     apply_position_truth_remediation,
     legacy_attribution_account_scope_source,
@@ -111,6 +113,13 @@ def main(argv: list[str] | None = None) -> int:
             "is the paper-only crypto flat-slot rebind route."
         ),
     )
+    parser.add_argument(
+        "--kis-krx-flat-rebind-symbol",
+        help=(
+            "Analyze one exact six-digit legacy flat KRX position against a "
+            "fresh, complete live KIS account snapshot."
+        ),
+    )
     parser.add_argument("--apply", action="store_true")
     parser.add_argument(
         "--approve-position",
@@ -132,6 +141,19 @@ def main(argv: list[str] | None = None) -> int:
         args.legacy_attribution_exchange
         == ALPACA_CRYPTO_FLAT_REBIND_EXCHANGE
     )
+    kis_krx_flat_rebind = args.kis_krx_flat_rebind_symbol is not None
+    if kis_krx_flat_rebind and args.legacy_attribution_exchange:
+        raise SystemExit(
+            "KIS KRX flat rebind cannot be combined with legacy attribution"
+        )
+    if kis_krx_flat_rebind and (
+        len(args.kis_krx_flat_rebind_symbol) != 6
+        or not args.kis_krx_flat_rebind_symbol.isascii()
+        or not args.kis_krx_flat_rebind_symbol.isdigit()
+    ):
+        raise SystemExit(
+            "KIS KRX flat rebind requires one canonical six-digit symbol"
+        )
     if quarantine_attribution and runtime_mode != "live":
         raise SystemExit(
             "legacy OTC quarantine attribution requires --runtime-mode live"
@@ -140,20 +162,26 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit(
             "Alpaca crypto flat rebind requires --runtime-mode paper"
         )
+    if kis_krx_flat_rebind and runtime_mode != "live":
+        raise SystemExit("KIS KRX flat rebind requires --runtime-mode live")
     reject_secret_database_url_argument(args.database_url)
     environment_database_url = (os.getenv("KAI_EXEC_DATABASE_URL") or "").strip()
     database_url = args.database_url or environment_database_url or None
     actor = (args.actor or "").strip()
     reason = (args.reason or "").strip()
     approved_evidence = _approved_position_evidence(args.approve_position)
-    legacy_apply = bool(args.legacy_attribution_exchange and args.apply)
-    if approved_evidence and not legacy_apply:
+    approved_position_apply = bool(
+        args.apply
+        and (args.legacy_attribution_exchange or kis_krx_flat_rebind)
+    )
+    if approved_evidence and not approved_position_apply:
         raise SystemExit(
-            "--approve-position is valid only with legacy attribution --apply"
+            "--approve-position requires legacy attribution or KIS KRX flat "
+            "rebind --apply"
         )
-    if legacy_apply and not approved_evidence:
+    if approved_position_apply and not approved_evidence:
         raise SystemExit(
-            "legacy attribution apply requires at least one --approve-position"
+            "approved position apply requires at least one --approve-position"
         )
     if runtime_mode == "live" and not database_url:
         raise SystemExit(
@@ -176,25 +204,53 @@ def main(argv: list[str] | None = None) -> int:
             "scope from ACCOUNT_DRAWDOWN_RECOVERY_SCOPE_SECRET of at least 32 "
             "bytes or EXECUTION_POSITION_ACCOUNT_SCOPE"
         )
+    if (
+        kis_krx_flat_rebind
+        and legacy_attribution_account_scope_source(settings=settings) is None
+    ):
+        raise SystemExit(
+            "KIS KRX flat rebind requires a stable canonical account scope"
+        )
     engine = create_db_engine(settings)
     session_factory = create_session_factory(engine)
     try:
         with session_factory() as db:
-            legacy_adapter = (
+            remediation_adapter = (
                 (
                     AlpacaBrokerAdapter(settings=settings)
                     if alpaca_crypto_flat_rebind
                     else _legacy_attribution_adapter(settings)
                 )
                 if args.legacy_attribution_exchange
+                else KisBrokerAdapter(settings=settings)
+                if kis_krx_flat_rebind
                 else None
             )
-            if alpaca_crypto_flat_rebind and args.apply:
+            if kis_krx_flat_rebind and args.apply:
+                payload = apply_kis_krx_legacy_flat_position_rebind(
+                    settings=settings,
+                    db=db,
+                    auth_session_factory=session_factory,
+                    adapter=remediation_adapter,
+                    symbol=args.kis_krx_flat_rebind_symbol,
+                    approved_evidence=approved_evidence,
+                    actor=actor,
+                    reason=reason,
+                )
+            elif kis_krx_flat_rebind:
+                payload = analyze_kis_krx_legacy_flat_position_rebind(
+                    settings=settings,
+                    db=db,
+                    auth_session_factory=session_factory,
+                    adapter=remediation_adapter,
+                    symbol=args.kis_krx_flat_rebind_symbol,
+                )
+            elif alpaca_crypto_flat_rebind and args.apply:
                 payload = apply_alpaca_crypto_flat_position_rebind(
                     settings=settings,
                     db=db,
                     auth_session_factory=session_factory,
-                    adapter=legacy_adapter,
+                    adapter=remediation_adapter,
                     approved_evidence=approved_evidence,
                     actor=actor,
                     reason=reason,
@@ -204,14 +260,14 @@ def main(argv: list[str] | None = None) -> int:
                     settings=settings,
                     db=db,
                     auth_session_factory=session_factory,
-                    adapter=legacy_adapter,
+                    adapter=remediation_adapter,
                 )
             elif args.legacy_attribution_exchange and args.apply:
                 payload = apply_legacy_position_attribution(
                     settings=settings,
                     db=db,
                     auth_session_factory=session_factory,
-                    adapter=legacy_adapter,
+                    adapter=remediation_adapter,
                     exchange=args.legacy_attribution_exchange,
                     approved_evidence=approved_evidence,
                     actor=actor,
@@ -222,7 +278,7 @@ def main(argv: list[str] | None = None) -> int:
                     settings=settings,
                     db=db,
                     auth_session_factory=session_factory,
-                    adapter=legacy_adapter,
+                    adapter=remediation_adapter,
                     exchange=args.legacy_attribution_exchange,
                 )
             elif args.apply:

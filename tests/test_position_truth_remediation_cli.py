@@ -138,6 +138,162 @@ def test_alpaca_crypto_flat_rebind_routes_exact_dry_run_without_mutation(
     assert engine.disposed is True
 
 
+def test_kis_krx_flat_rebind_routes_exact_live_dry_run_without_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    db, engine = _stub_runtime(monkeypatch)
+    adapter = object()
+    calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(cli, "KisBrokerAdapter", lambda *, settings: adapter)
+    monkeypatch.setattr(
+        cli,
+        "analyze_kis_krx_legacy_flat_position_rebind",
+        lambda **kwargs: calls.append(kwargs) or {"mode": "dry-run"},
+        raising=False,
+    )
+    monkeypatch.setattr(
+        cli,
+        "apply_kis_krx_legacy_flat_position_rebind",
+        lambda **kwargs: pytest.fail("KIS KRX dry-run attempted mutation"),
+        raising=False,
+    )
+
+    assert (
+        cli.main(
+            [
+                "--database-url",
+                "sqlite:///test.db",
+                "--runtime-mode",
+                "live",
+                "--kis-krx-flat-rebind-symbol",
+                "029460",
+            ]
+        )
+        == 0
+    )
+
+    assert calls == [
+        {
+            "settings": ANY,
+            "db": db,
+            "auth_session_factory": ANY,
+            "adapter": adapter,
+            "symbol": "029460",
+        }
+    ]
+    assert '"mode": "dry-run"' in capsys.readouterr().out
+    assert engine.disposed is True
+
+
+def test_kis_krx_flat_rebind_apply_routes_exact_approval_and_audit_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db, engine = _stub_runtime(monkeypatch)
+    adapter = object()
+    calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(cli, "KisBrokerAdapter", lambda *, settings: adapter)
+    monkeypatch.setattr(
+        cli,
+        "apply_kis_krx_legacy_flat_position_rebind",
+        lambda **kwargs: calls.append(kwargs) or {"mode": "apply"},
+        raising=False,
+    )
+
+    assert (
+        cli.main(
+            [
+                "--database-url",
+                "sqlite:///test.db",
+                "--runtime-mode",
+                "live",
+                "--kis-krx-flat-rebind-symbol",
+                "029460",
+                "--apply",
+                "--approve-position",
+                f"position-029460={'A' * 64}",
+                "--actor",
+                "operator",
+                "--reason",
+                "fresh complete KIS KRX flat proof",
+            ]
+        )
+        == 0
+    )
+
+    assert calls == [
+        {
+            "settings": ANY,
+            "db": db,
+            "auth_session_factory": ANY,
+            "adapter": adapter,
+            "symbol": "029460",
+            "approved_evidence": {"position-029460": "a" * 64},
+            "actor": "operator",
+            "reason": "fresh complete KIS KRX flat proof",
+        }
+    ]
+    assert engine.disposed is True
+
+
+@pytest.mark.parametrize("runtime_mode", ["mock", "paper"])
+def test_kis_krx_flat_rebind_rejects_non_live_before_settings_or_db_open(
+    monkeypatch: pytest.MonkeyPatch,
+    runtime_mode: str,
+) -> None:
+    monkeypatch.setattr(
+        cli,
+        "load_settings",
+        lambda: pytest.fail("non-live KIS KRX flat rebind loaded settings"),
+    )
+    monkeypatch.setattr(
+        cli,
+        "create_db_engine",
+        lambda settings: pytest.fail("non-live KIS KRX flat rebind opened DB"),
+    )
+
+    with pytest.raises(SystemExit, match="requires --runtime-mode live"):
+        cli.main(
+            [
+                "--database-url",
+                "sqlite:///must-not-open.db",
+                "--runtime-mode",
+                runtime_mode,
+                "--kis-krx-flat-rebind-symbol",
+                "029460",
+            ]
+        )
+
+
+@pytest.mark.parametrize("symbol", ["٠٢٩٤٦٠", "０２９４６０"])
+def test_kis_krx_flat_rebind_rejects_non_ascii_digit_symbol_before_db_open(
+    monkeypatch: pytest.MonkeyPatch,
+    symbol: str,
+) -> None:
+    monkeypatch.setattr(
+        cli,
+        "load_settings",
+        lambda: pytest.fail("invalid KIS KRX symbol loaded settings"),
+    )
+    monkeypatch.setattr(
+        cli,
+        "create_db_engine",
+        lambda settings: pytest.fail("invalid KIS KRX symbol opened DB"),
+    )
+
+    with pytest.raises(SystemExit, match="canonical six-digit symbol"):
+        cli.main(
+            [
+                "--database-url",
+                "sqlite:///must-not-open.db",
+                "--runtime-mode",
+                "live",
+                "--kis-krx-flat-rebind-symbol",
+                symbol,
+            ]
+        )
+
+
 def test_alpaca_crypto_flat_rebind_apply_routes_complete_approvals(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -612,7 +768,7 @@ def test_legacy_attribution_rejects_invalid_or_duplicate_approvals_before_db_ope
     [
         (
             ["--legacy-attribution-exchange", "KRX", "--apply"],
-            "legacy attribution apply requires at least one --approve-position",
+            "approved position apply requires at least one --approve-position",
         ),
         (
             [
@@ -621,7 +777,7 @@ def test_legacy_attribution_rejects_invalid_or_duplicate_approvals_before_db_ope
                 "--approve-position",
                 f"position-1={'a' * 64}",
             ],
-            "--approve-position is valid only with legacy attribution --apply",
+            "--approve-position requires legacy attribution or KIS KRX flat rebind --apply",
         ),
         (
             [
@@ -629,7 +785,7 @@ def test_legacy_attribution_rejects_invalid_or_duplicate_approvals_before_db_ope
                 "--approve-position",
                 f"position-1={'a' * 64}",
             ],
-            "--approve-position is valid only with legacy attribution --apply",
+            "--approve-position requires legacy attribution or KIS KRX flat rebind --apply",
         ),
     ],
 )
