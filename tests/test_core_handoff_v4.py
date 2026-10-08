@@ -4006,6 +4006,7 @@ def test_v4_revocation_atomically_revokes_linked_family_and_invalidates_running_
     [
         "current_live_market_risk_off",
         "current_live_market_evidence_unavailable",
+        "exec_contract_quarantined",
     ],
 )
 def test_v4_revocation_accepts_current_live_market_buy_recall_authority(
@@ -4068,29 +4069,30 @@ def test_v4_revocation_retires_quarantined_family_with_intact_intake_proof_and_n
         plan.status = "contract_quarantined"
         session.commit()
 
+    revocation_payload = _revocation_payload(
+        create_payload,
+        item_acks,
+        reason_code="exec_contract_quarantined",
+    )
+    revocation_payload["replacement_decision_snapshot_id"] = (
+        "observation:exec_contract_quarantined:0123456789abcdef0123"
+    )
+    revocation_payload["replacement_action"] = "reject"
     response = client.post(
         "/v4/execution-plans/revocations",
-        json=_revocation_payload(
-            create_payload,
-            item_acks,
-            reason_code="current_live_market_evidence_unavailable",
-        ),
+        json=revocation_payload,
     )
 
     assert response.status_code == 200
     body = response.json()
     assert body["contract_ack"]["status"] == "revoked"
-    assert body["reason_code"] == "current_live_market_evidence_unavailable"
+    assert body["reason_code"] == "exec_contract_quarantined"
     assert body["revoked_item_count"] == 3
     assert body["manual_review_item_count"] == 0
     assert all(item["status"] == "revoked" for item in body["item_acks"])
     replay = client.post(
         "/v4/execution-plans/revocations",
-        json=_revocation_payload(
-            create_payload,
-            item_acks,
-            reason_code="current_live_market_evidence_unavailable",
-        ),
+        json=revocation_payload,
     )
     assert replay.status_code == 200
     assert replay.json()["contract_ack"]["status"] == "revoked"
@@ -4107,6 +4109,26 @@ def test_v4_revocation_retires_quarantined_family_with_intact_intake_proof_and_n
         assert plan is not None
         assert plan.status == "revoked"
         assert {item.status for item in plan.items} == {"revoked"}
+        revocation_audits = session.scalars(
+            select(ExecutionPlanItemAudit).where(
+                ExecutionPlanItemAudit.event_type == "core_decision_revoked"
+            )
+        ).all()
+        assert len(revocation_audits) == 3
+        assert {
+            (
+                audit.summary["reason_code"],
+                audit.summary["replacement_decision_snapshot_id"],
+                audit.summary["replacement_action"],
+            )
+            for audit in revocation_audits
+        } == {
+            (
+                "exec_contract_quarantined",
+                "observation:exec_contract_quarantined:0123456789abcdef0123",
+                "reject",
+            )
+        }
         assert session.scalars(
             select(ExecutionPlanItemAudit).where(
                 ExecutionPlanItemAudit.event_type
@@ -5047,7 +5069,7 @@ def test_v4_revocation_keeps_quarantined_family_in_manual_review_when_exposure_i
         json=_revocation_payload(
             create_payload,
             item_acks,
-            reason_code="current_live_market_evidence_unavailable",
+            reason_code="exec_contract_quarantined",
         ),
     )
 
