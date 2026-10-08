@@ -1,12 +1,14 @@
+from collections.abc import Iterator
 from copy import deepcopy
-from datetime import UTC, datetime
+from contextlib import contextmanager
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 import threading
 from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 import pytest
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session, selectinload
 
 from app.api.schemas.execution import (
@@ -14,6 +16,7 @@ from app.api.schemas.execution import (
     _SKIP_DISPATCH_MATERIAL_FINGERPRINT_CONTEXT_KEY,
     core_execution_plan_material_fingerprint,
 )
+from app.broker.base import BrokerAccountSnapshot
 from app.core.config import Settings
 from app.db.base import Base
 from app.db.session import create_db_engine, create_session_factory
@@ -26,10 +29,23 @@ from app.models.runtime import (
     ExecutionPlanItem,
     ExecutionPlanItemAudit,
     ExecutionPosition,
+    RuntimeRemediationEvent,
 )
 from app.services import core_handoff_v4
+from app.services import core_revocation_exposure
+from app.services import execution_exposure
+from app.services import position_truth_remediation
 from app.services import watch_exec_agent_sizing as watch_sizing
-from app.services.position_identity import build_position_identity
+from app.services.kis_krx_flat_rebind_contract import (
+    KIS_KRX_LEGACY_FLAT_REBIND_SAFETY_POLICY_VERSION,
+    kis_krx_flat_absence_proof_digest,
+    kis_krx_flat_configured_account_binding_digest,
+    kis_krx_flat_evidence_fingerprint,
+)
+from app.services.position_identity import (
+    build_position_identity,
+    payload_with_position_identity,
+)
 
 
 def test_watch_rejection_policy_is_valid_terminal_core_v4_transition() -> None:
@@ -390,6 +406,59 @@ ACTIVATION_SCHEMA_VERSION = "execution_handoff_activation_v1"
 ACTIVATION_CAPABILITY = "core_confirmed_activation_v1"
 ACTIVATION_BINDING_SCHEMA_VERSION = "core_execution_activation_binding_v1"
 AUTHORITY_GENERATION_FINGERPRINT = "a" * 64
+
+
+class _KisFlatSnapshotAdapter:
+    provider = "kis"
+
+    def __init__(self, snapshot: BrokerAccountSnapshot) -> None:
+        self.snapshot = snapshot
+        self.snapshot_requests: list[tuple[str, list[str] | None, str]] = []
+
+    def authenticate(self):
+        raise AssertionError("flat rebind must use the shared KIS token path")
+
+    def get_account_snapshot(
+        self,
+        access_token: str,
+        *,
+        symbols: list[str] | None = None,
+        exchange: str = "KRX",
+    ) -> BrokerAccountSnapshot:
+        self.snapshot_requests.append((access_token, symbols, exchange))
+        return self.snapshot
+
+
+def _complete_flat_kis_snapshot(*, observed_at: datetime) -> BrokerAccountSnapshot:
+    empty_parse = {
+        "raw_row_count": 0,
+        "parsed_row_count": 0,
+        "omitted_row_count": 0,
+        "invalid_row_count": 0,
+        "duplicate_identity_count": 0,
+    }
+    return BrokerAccountSnapshot(
+        observed_at=observed_at,
+        source="kis:account_snapshot",
+        holdings=[],
+        open_orders=[],
+        holdings_complete=True,
+        open_orders_complete=True,
+        diagnostics={
+            "requested_exchange": "KRX",
+            "holdings_pagination": {"complete": True},
+            "open_orders_pagination": {"complete": True},
+            "holdings_parse": dict(empty_parse),
+            "open_orders_parse": dict(empty_parse),
+        },
+        payload={
+            "exchange": "KRX",
+            "account_number_masked": "****5678",
+            "holdings_coverage": "complete",
+            "open_orders_coverage": "complete",
+            "open_orders_error": None,
+        },
+    )
 
 
 def _refresh_material_fingerprint(payload: dict[str, object]) -> None:
@@ -4047,6 +4116,753 @@ def test_v4_revocation_retires_quarantined_family_with_intact_intake_proof_and_n
     engine.dispose()
 
 
+def test_v4_revocation_consumes_actual_kis_flat_rebind_proof(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="live",
+        runtime_broker_provider="kis",
+        kis_account_number="12345678",
+        kis_account_product_code="01",
+        execution_position_account_scope="primary-kis-live",
+        account_drawdown_recovery_scope_secret="s" * 32,
+        exec_agent_max_account_snapshot_age_seconds=300,
+    )
+    app, engine = _build_test_app(settings=settings)
+    client = TestClient(app)
+    account_reference = "KIS:12345678-01"
+    create_payload = _plan_payload(plan_id="quarantined-029460-real-flat-proof")
+    create_payload["mode"] = "live"
+    create_payload["metadata"]["account_reference"] = account_reference
+    for item in create_payload["items"]:
+        item["symbol"] = "029460"
+        item["risk_context"]["account_reference"] = account_reference
+    _refresh_material_fingerprint(create_payload)
+    created = client.post("/v4/execution-plans", json=create_payload)
+    assert created.status_code == 201
+    item_acks = created.json()["item_acks"]
+
+    reference_at = datetime.now(UTC)
+    snapshot_at = reference_at - timedelta(seconds=2)
+    event_at = reference_at - timedelta(seconds=1)
+    authority_at = reference_at - timedelta(seconds=30)
+    historical_orders = (
+        (
+            "jul-buy",
+            "buy",
+            "filled",
+            6,
+            None,
+            datetime(2026, 7, 1, 0, 50, tzinfo=UTC),
+        ),
+        (
+            "jul-sell",
+            "sell",
+            "filled",
+            6,
+            None,
+            datetime(2026, 7, 1, 1, 6, tzinfo=UTC),
+        ),
+        (
+            "aug-buy",
+            "buy",
+            "filled",
+            8,
+            "kis",
+            datetime(2026, 8, 26, 11, 38, tzinfo=UTC),
+        ),
+        (
+            "aug-expired",
+            "buy",
+            "reconcile_window_expired",
+            8,
+            "kis",
+            datetime(2026, 8, 27, 8, 50, tzinfo=UTC),
+        ),
+        (
+            "aug-sell",
+            "sell",
+            "filled",
+            8,
+            "kis",
+            datetime(2026, 8, 27, 9, 1, tzinfo=UTC),
+        ),
+    )
+    with app.state.db_session_factory() as session:
+        plan = session.scalar(
+            select(ExecutionPlan).options(selectinload(ExecutionPlan.items))
+        )
+        assert plan is not None
+        plan.accepted_at = authority_at
+        plan.created_at = authority_at
+        entry = next(item for item in plan.items if item.side == "buy")
+        entry.quantity_policy = {
+            **entry.quantity_policy,
+            "kind": "shares",
+            "quantity": 999,
+            "source": "unproven-sizing",
+        }
+        entry.status = "contract_quarantined"
+        plan.status = "contract_quarantined"
+        session.add(
+            ExecutionPlanItemAudit(
+                execution_plan_item_id=entry.id,
+                event_type="legacy_core_authority_quarantined",
+                source="kai-trading-exec",
+                occurred_at=authority_at,
+            )
+        )
+        old_plan = ExecutionPlan(
+            id="integration-historical-029460-plan",
+            external_plan_id="integration-historical-029460-plan",
+            source="kai-trading-exec",
+            mode="live",
+            status="completed",
+            requested_at=datetime(2026, 7, 1, tzinfo=UTC),
+            accepted_at=datetime(2026, 7, 1, tzinfo=UTC),
+        )
+        session.add(old_plan)
+        for index, (suffix, side, status, quantity, venue, created_at) in enumerate(
+            historical_orders
+        ):
+            historical_item = ExecutionPlanItem(
+                id=f"integration-historical-029460-{suffix}-item",
+                execution_plan_id=old_plan.id,
+                plan_item_index=index,
+                symbol="029460",
+                side=side,
+                intent="historical_execution",
+                status="filled" if status == "filled" else status,
+                provider="kis",
+                venue=venue,
+                asset_class="stock",
+            )
+            order = BrokerOrder(
+                id=f"integration-historical-029460-{suffix}-order",
+                execution_plan_item_id=historical_item.id,
+                broker_name="kis",
+                mode="live",
+                idempotency_key=f"integration-historical-029460-{suffix}",
+                broker_order_id=f"broker-{suffix}",
+                symbol="029460",
+                side=side,
+                status=status,
+                quantity=quantity,
+                venue=venue,
+                submitted_at=created_at,
+                last_broker_sync_at=created_at + timedelta(minutes=1),
+                created_at=created_at,
+                updated_at=created_at + timedelta(minutes=1),
+            )
+            session.add_all([historical_item, order])
+            if status == "filled":
+                session.add(
+                    ExecutionFill(
+                        broker_order_pk=order.id,
+                        broker_fill_id=f"integration-{suffix}-fill",
+                        symbol="029460",
+                        side=side,
+                        quantity=quantity,
+                        price=Decimal("35000"),
+                        filled_at=created_at,
+                    )
+                )
+        legacy_position = ExecutionPosition(
+            id="integration-legacy-flat-029460-position",
+            mode="live",
+            symbol="029460",
+            quantity=0,
+            base_quantity=None,
+            average_price=Decimal("35800"),
+            updated_from="reconciliation",
+            last_reconciled_at=datetime(2026, 9, 12, tzinfo=UTC),
+            raw_payload={"legacy_scope": "unknown"},
+        )
+        session.add(legacy_position)
+        session.commit()
+
+        monkeypatch.setattr(
+            position_truth_remediation,
+            "ensure_authenticated_broker_session",
+            lambda **_kwargs: SimpleNamespace(access_token="shared-kis-token"),
+        )
+        monkeypatch.setattr(
+            position_truth_remediation,
+            "_real_utc_now",
+            lambda: event_at,
+        )
+        adapter = _KisFlatSnapshotAdapter(
+            _complete_flat_kis_snapshot(observed_at=snapshot_at)
+        )
+        dry_run = (
+            position_truth_remediation.analyze_kis_krx_legacy_flat_position_rebind(
+                settings=settings,
+                db=session,
+                auth_session_factory=app.state.db_session_factory,
+                adapter=adapter,
+                symbol="029460",
+                now=reference_at,
+            )
+        )
+        evidence = dry_run["items"][0]
+        applied = (
+            position_truth_remediation.apply_kis_krx_legacy_flat_position_rebind(
+                settings=settings,
+                db=session,
+                auth_session_factory=app.state.db_session_factory,
+                adapter=adapter,
+                symbol="029460",
+                approved_evidence={
+                    legacy_position.id: evidence["evidence_fingerprint"]
+                },
+                actor="codex-integration-test",
+                reason="prove current flat truth before Core revocation",
+                now=reference_at,
+            )
+        )
+        assert applied["summary"]["bound_count"] == 1
+        assert applied["summary"]["broker_api_mutation_count"] == 0
+        assert len(adapter.snapshot_requests) == 3
+        assert session.scalar(select(func.count()).select_from(BrokerOrder)) == 5
+        assert session.scalar(select(func.count()).select_from(ExecutionFill)) == 4
+
+    response = client.post(
+        "/v4/execution-plans/revocations",
+        json=_revocation_payload(
+            create_payload,
+            item_acks,
+            reason_code="current_live_market_evidence_unavailable",
+        ),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["contract_ack"]["status"] == "revoked"
+    assert body["revoked_item_count"] == 3
+    assert body["manual_review_item_count"] == 0
+    with app.state.db_session_factory() as session:
+        rebound = session.get(ExecutionPosition, legacy_position.id)
+        assert rebound is not None
+        assert rebound.provider == "kis"
+        assert rebound.exchange == "KRX"
+        assert rebound.quantity == 0
+        assert rebound.base_quantity == 0
+        assert rebound.average_price is None
+        event = session.scalar(
+            select(RuntimeRemediationEvent).where(
+                RuntimeRemediationEvent.subject_id == rebound.id
+            )
+        )
+        assert event is not None
+        assert event.outcome == "current_flat_truth_bound"
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    "proof_failure",
+    [
+        None,
+        "missing_position",
+        "legacy_only",
+        "stale_truth",
+        "holdings_incomplete",
+        "open_orders_incomplete",
+        "missing_event",
+        "event_digest_mismatch",
+        "event_before_snapshot",
+        "event_future",
+        "event_mutation_fact",
+        "event_mutation_bool",
+        "configured_account_binding_mismatch",
+        "serialization_busy",
+        "partial_rebind",
+        "canonical_base_missing",
+        "post_authority_order",
+        "post_authority_fill",
+        "current_plan_sibling_order",
+        "unlinked_history",
+        "unknown_terminal_status",
+        "conflicting_venue",
+        "provider_venue_post_proof_sync",
+        "null_venue_post_proof_sync",
+        "positive_alternate_position",
+    ],
+)
+def test_v4_revocation_requires_current_flat_proof_for_terminal_history(
+    proof_failure: str | None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="mock",
+        kis_account_number="12345678",
+        kis_account_product_code="01",
+        account_drawdown_recovery_scope_secret="s" * 32,
+        exec_agent_max_account_snapshot_age_seconds=(
+            1 if proof_failure == "stale_truth" else 300
+        ),
+    )
+    app, engine = _build_test_app(settings=settings)
+    client = TestClient(app)
+    create_payload = _plan_payload(plan_id="quarantined-029460-history")
+    for item in create_payload["items"]:
+        item["symbol"] = "029460"
+    _refresh_material_fingerprint(create_payload)
+    created = client.post("/v4/execution-plans", json=create_payload)
+    assert created.status_code == 201
+    item_acks = created.json()["item_acks"]
+
+    historical_orders = (
+        (
+            "jul-buy",
+            "buy",
+            "filled",
+            6,
+            None,
+            datetime(2026, 7, 1, 0, 50, tzinfo=UTC),
+        ),
+        (
+            "jul-sell",
+            "sell",
+            "filled",
+            6,
+            None,
+            datetime(2026, 7, 1, 1, 6, tzinfo=UTC),
+        ),
+        (
+            "aug-buy",
+            "buy",
+            "filled",
+            8,
+            "kis",
+            datetime(2026, 8, 26, 11, 38, tzinfo=UTC),
+        ),
+        (
+            "aug-expired",
+            "buy",
+            "reconcile_window_expired",
+            8,
+            "kis",
+            datetime(2026, 8, 27, 8, 50, tzinfo=UTC),
+        ),
+        (
+            "aug-sell",
+            "sell",
+            "filled",
+            8,
+            "kis",
+            datetime(2026, 8, 27, 9, 1, tzinfo=UTC),
+        ),
+    )
+    with app.state.db_session_factory() as session:
+        plan = session.scalar(
+            select(ExecutionPlan).options(selectinload(ExecutionPlan.items))
+        )
+        assert plan is not None
+        authority_at = datetime.now(UTC) - timedelta(seconds=30)
+        plan.accepted_at = authority_at
+        plan.created_at = authority_at
+        entry = next(item for item in plan.items if item.side == "buy")
+        current_sibling = next(item for item in plan.items if item.id != entry.id)
+        entry.quantity_policy = {
+            **entry.quantity_policy,
+            "kind": "shares",
+            "quantity": 999,
+            "source": "unproven-sizing",
+        }
+        entry.status = "contract_quarantined"
+        plan.status = "contract_quarantined"
+        session.add(
+            ExecutionPlanItemAudit(
+                execution_plan_item_id=entry.id,
+                event_type="legacy_core_authority_quarantined",
+                source="kai-trading-exec",
+                occurred_at=authority_at,
+            )
+        )
+
+        old_plan = ExecutionPlan(
+            id="historical-029460-plan",
+            external_plan_id="historical-029460-plan",
+            source="kai-trading-exec",
+            mode="mock",
+            status="completed",
+            requested_at=datetime(2026, 7, 1, tzinfo=UTC),
+            accepted_at=datetime(2026, 7, 1, tzinfo=UTC),
+        )
+        session.add(old_plan)
+        for index, (suffix, side, status, quantity, venue, created_at) in enumerate(
+            historical_orders
+        ):
+            effective_status = (
+                "stale_terminal_unknown"
+                if proof_failure == "unknown_terminal_status"
+                and suffix == "aug-expired"
+                else status
+            )
+            effective_created_at = (
+                authority_at + timedelta(seconds=1)
+                if proof_failure == "post_authority_order" and suffix == "aug-expired"
+                else created_at
+            )
+            effective_venue = (
+                "NYSE"
+                if proof_failure == "conflicting_venue" and suffix == "aug-sell"
+                else venue
+            )
+            last_broker_sync_at = (
+                datetime.now(UTC) + timedelta(seconds=1)
+                if (
+                    proof_failure == "provider_venue_post_proof_sync"
+                    and suffix == "aug-sell"
+                )
+                or (
+                    proof_failure == "null_venue_post_proof_sync"
+                    and suffix == "jul-sell"
+                )
+                else effective_created_at + timedelta(minutes=1)
+            )
+            historical_item = ExecutionPlanItem(
+                id=f"historical-029460-{suffix}-item",
+                execution_plan_id=old_plan.id,
+                plan_item_index=index,
+                symbol="029460",
+                side=side,
+                intent="historical_execution",
+                status=(
+                    "filled" if effective_status == "filled" else effective_status
+                ),
+                provider="kis",
+                venue=effective_venue,
+                asset_class="stock",
+            )
+            order = BrokerOrder(
+                id=f"historical-029460-{suffix}-order",
+                execution_plan_item_id=(
+                    None
+                    if proof_failure == "unlinked_history"
+                    and suffix == "aug-expired"
+                    else (
+                        current_sibling.id
+                        if proof_failure == "current_plan_sibling_order"
+                        and suffix == "aug-expired"
+                        else historical_item.id
+                    )
+                ),
+                broker_name="kis",
+                mode="mock",
+                idempotency_key=f"historical-029460-{suffix}",
+                broker_order_id=f"broker-{suffix}",
+                symbol="029460",
+                side=side,
+                status=effective_status,
+                quantity=quantity,
+                venue=effective_venue,
+                submitted_at=effective_created_at,
+                last_broker_sync_at=last_broker_sync_at,
+                created_at=effective_created_at,
+                updated_at=effective_created_at + timedelta(minutes=1),
+            )
+            session.add_all([historical_item, order])
+            if status == "filled":
+                session.add(
+                    ExecutionFill(
+                        broker_order_pk=order.id,
+                        broker_fill_id=f"historical-029460-{suffix}-fill",
+                        symbol="029460",
+                        side=side,
+                        quantity=quantity,
+                        price=Decimal("35000"),
+                        filled_at=(
+                            authority_at + timedelta(seconds=1)
+                            if proof_failure == "post_authority_fill"
+                            and suffix == "aug-buy"
+                            else created_at
+                        ),
+                    )
+                )
+
+        proof_at = (
+            datetime.now(UTC) - timedelta(seconds=5)
+            if proof_failure == "stale_truth"
+            else datetime.now(UTC) + timedelta(microseconds=1)
+        )
+        identity = build_position_identity(
+            settings=settings,
+            provider="kis",
+            exchange="KRX",
+        )
+        configured_account_binding_digest = (
+            kis_krx_flat_configured_account_binding_digest(settings=settings)
+        )
+        persisted_account_binding_digest = (
+            "a" * 64
+            if proof_failure == "configured_account_binding_mismatch"
+            else configured_account_binding_digest
+        )
+        absence_digest = kis_krx_flat_absence_proof_digest(
+            runtime_mode="mock",
+            identity=identity,
+            symbol="029460",
+            snapshot_source="kis:account_snapshot",
+            holdings_complete=True,
+            open_orders_complete=True,
+            holding_absent=True,
+            open_order_absent=True,
+            configured_account_binding_digest=persisted_account_binding_digest,
+        )
+        prior_position_digest = "b" * 64
+        evidence_fingerprint = kis_krx_flat_evidence_fingerprint(
+            runtime_mode="mock",
+            position_id="current-flat-029460-position",
+            symbol="029460",
+            prior_position_digest=prior_position_digest,
+            identity=identity,
+            snapshot_source="kis:account_snapshot",
+            holdings_complete=True,
+            open_orders_complete=True,
+            holding_absent=True,
+            open_order_absent=True,
+            absence_proof_digest=absence_digest,
+            configured_account_binding_digest=persisted_account_binding_digest,
+        )
+        holdings_complete = proof_failure != "holdings_incomplete"
+        open_orders_complete = proof_failure != "open_orders_incomplete"
+        if proof_failure in {"legacy_only", "missing_position"}:
+            if proof_failure == "legacy_only":
+                session.add(
+                    ExecutionPosition(
+                        id="legacy-flat-029460-position",
+                        mode="mock",
+                        symbol="029460",
+                        quantity=0,
+                        updated_from="reconciliation",
+                        last_reconciled_at=datetime(2026, 9, 12, tzinfo=UTC),
+                        raw_payload={"legacy_scope": "unknown"},
+                    )
+                )
+            session.commit()
+            assert execution_exposure.item_has_external_possible_exposure(
+                db=session,
+                plan=plan,
+                item=entry,
+                settings=settings,
+            ) is True
+            assert core_revocation_exposure.item_has_revocation_possible_exposure(
+                db=session,
+                plan=plan,
+                item=entry,
+                settings=settings,
+            ) is True
+        else:
+            position = ExecutionPosition(
+                id="current-flat-029460-position",
+                mode="mock",
+                symbol="029460",
+                provider=identity.provider,
+                account_scope=identity.account_scope,
+                exchange=identity.exchange,
+                quantity=0,
+                base_quantity=(
+                    None
+                    if proof_failure == "canonical_base_missing"
+                    else Decimal("0")
+                ),
+                average_price=(
+                    Decimal("35000") if proof_failure == "partial_rebind" else None
+                ),
+                updated_from="reconciliation",
+                last_reconciled_at=proof_at,
+                raw_payload=payload_with_position_identity(
+                    {
+                        "provider": "kis",
+                        "mode": "mock",
+                        "asset_class": "equity",
+                        "exchange": "KRX",
+                        "snapshot_source": "kis:account_snapshot",
+                        "snapshot_observed_at": proof_at.isoformat(),
+                        "holdings_coverage": (
+                            "complete" if holdings_complete else "incomplete"
+                        ),
+                        "open_orders_coverage": (
+                            "complete" if open_orders_complete else "incomplete"
+                        ),
+                        "holding_absent": holdings_complete,
+                        "open_order_absent": open_orders_complete,
+                        "historical_account_attributed": False,
+                        "current_flat_truth_bound": True,
+                        "absence_proof_digest": absence_digest,
+                        "configured_account_binding_digest": (
+                            persisted_account_binding_digest
+                        ),
+                        "safety_policy_version": (
+                            KIS_KRX_LEGACY_FLAT_REBIND_SAFETY_POLICY_VERSION
+                        ),
+                    },
+                    identity=identity,
+                ),
+            )
+            session.add(position)
+            if proof_failure == "positive_alternate_position":
+                session.add(
+                    ExecutionPosition(
+                        id="alternate-positive-029460-position",
+                        mode="mock",
+                        symbol="029460",
+                        provider="kis",
+                        account_scope="f" * 24,
+                        exchange="KRX",
+                        quantity=1,
+                        base_quantity=Decimal("0"),
+                        updated_from="reconciliation",
+                    )
+                )
+            if proof_failure != "missing_event":
+                session.add(
+                    RuntimeRemediationEvent(
+                        mode="mock",
+                        candidate_type="kis_krx_legacy_flat_position_rebind",
+                        candidate_key=position.id,
+                        subject_id=position.id,
+                        outcome="current_flat_truth_bound",
+                        actor="test",
+                        reason="bind only current broker-flat truth",
+                        occurred_at=(
+                            proof_at - timedelta(seconds=1)
+                            if proof_failure == "event_before_snapshot"
+                            else (
+                                proof_at + timedelta(hours=1)
+                                if proof_failure == "event_future"
+                                else proof_at
+                            )
+                        ),
+                        evidence_summary={
+                            "symbol": "029460",
+                            "provider": identity.provider,
+                            "account_scope": identity.account_scope,
+                            "exchange": identity.exchange,
+                            "asset_class": "equity",
+                            "broker_snapshot_source": "kis:account_snapshot",
+                            "broker_snapshot_observed_at": proof_at.isoformat(),
+                            "holdings_complete": holdings_complete,
+                            "open_orders_complete": open_orders_complete,
+                            "holding_absent": holdings_complete,
+                            "open_order_absent": open_orders_complete,
+                            "historical_account_attributed": False,
+                            "current_flat_truth_bound": True,
+                            "absence_proof_digest": (
+                                "d" * 64
+                                if proof_failure == "event_digest_mismatch"
+                                else absence_digest
+                            ),
+                            "configured_account_binding_digest": (
+                                persisted_account_binding_digest
+                            ),
+                            "prior_position_digest": prior_position_digest,
+                            "evidence_fingerprint": evidence_fingerprint,
+                            "safety_policy_version": (
+                                KIS_KRX_LEGACY_FLAT_REBIND_SAFETY_POLICY_VERSION
+                            ),
+                            "broker_api_mutations": (
+                                False
+                                if proof_failure == "event_mutation_bool"
+                                else 0
+                            ),
+                            "orders_submitted": (
+                                1 if proof_failure == "event_mutation_fact" else 0
+                            ),
+                            "orders_amended": 0,
+                            "orders_canceled": 0,
+                            "fills_created": 0,
+                            "fills_deleted": 0,
+                            "pnl_records_mutated": 0,
+                            "strategy_records_mutated": 0,
+                        },
+                    )
+                )
+            session.commit()
+            assert execution_exposure.item_has_external_possible_exposure(
+                db=session,
+                plan=plan,
+                item=entry,
+                settings=settings,
+            ) is True
+            if proof_failure == "serialization_busy":
+                @contextmanager
+                def raise_serialization_busy(
+                    **_kwargs: object,
+                ) -> Iterator[None]:
+                    raise core_revocation_exposure.RevocationExposureSerializationBusy
+                    yield
+
+                monkeypatch.setattr(
+                    core_handoff_v4,
+                    "serialized_revocation_exposure",
+                    raise_serialization_busy,
+                )
+            else:
+                assert core_revocation_exposure.item_has_revocation_possible_exposure(
+                    db=session,
+                    plan=plan,
+                    item=entry,
+                    settings=settings,
+                    evaluated_at=datetime.now(UTC),
+                ) is (proof_failure is not None)
+
+    response = client.post(
+        "/v4/execution-plans/revocations",
+        json=_revocation_payload(
+            create_payload,
+            item_acks,
+            reason_code="current_live_market_evidence_unavailable",
+        ),
+    )
+
+    if proof_failure == "serialization_busy":
+        assert response.status_code == 409
+        body = response.json()
+        assert body["contract_ack"]["status"] == "blocked"
+        assert body["reason_code"] == "revocation_exposure_scope_busy"
+        with app.state.db_session_factory() as session:
+            persisted = session.scalar(
+                select(ExecutionPlan).where(
+                    ExecutionPlan.external_plan_id == create_payload["plan_id"]
+                )
+            )
+            assert persisted is not None
+            assert persisted.status == "contract_quarantined"
+        engine.dispose()
+        return
+
+    if proof_failure is not None:
+        assert response.status_code == 409
+        body = response.json()
+        assert body["contract_ack"]["status"] == "manual_review_required"
+        assert body["reason_code"] == "broker_commit_or_exposure_possible"
+        assert body["revoked_item_count"] == 0
+        assert body["manual_review_item_count"] == 1
+        engine.dispose()
+        return
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["contract_ack"]["status"] == "revoked"
+    assert body["manual_review_item_count"] == 0
+    assert body["revoked_item_count"] == 3
+    replay = client.post(
+        "/v4/execution-plans/revocations",
+        json=_revocation_payload(
+            create_payload,
+            item_acks,
+            reason_code="current_live_market_evidence_unavailable",
+        ),
+    )
+    assert replay.status_code == 200
+    assert replay.json()["idempotent_replay"] is True
+    engine.dispose()
+
+
 @pytest.mark.parametrize("proof_failure", ["identity_drift", "binding_missing"])
 def test_v4_revocation_refuses_quarantined_family_without_intact_intake_proof(
     proof_failure: str,
@@ -4109,6 +4925,7 @@ def test_v4_revocation_refuses_quarantined_family_without_intact_intake_proof(
         "linked_fill",
         "unlinked_active_order",
         "scoped_position",
+        "alternate_scoped_position",
         "manual_position",
         "scope_unproven",
     ],
@@ -4148,7 +4965,11 @@ def test_v4_revocation_keeps_quarantined_family_in_manual_review_when_exposure_i
                 "_item_exposure_scope_is_proven",
                 lambda **_kwargs: False,
             )
-        elif exposure_kind in {"manual_position", "scoped_position"}:
+        elif exposure_kind in {
+            "manual_position",
+            "scoped_position",
+            "alternate_scoped_position",
+        }:
             identity = build_position_identity(
                 settings=settings,
                 provider="kis",
@@ -4157,20 +4978,26 @@ def test_v4_revocation_keeps_quarantined_family_in_manual_review_when_exposure_i
             session.add(
                 ExecutionPosition(
                     mode="mock",
-                    provider=(
-                        identity.provider
-                        if exposure_kind == "scoped_position"
-                        else None
+                        provider=(
+                            identity.provider
+                            if exposure_kind
+                            in {"scoped_position", "alternate_scoped_position"}
+                            else None
                     ),
                     account_scope=(
-                        identity.account_scope
-                        if exposure_kind == "scoped_position"
-                        else None
+                        "f" * 24
+                        if exposure_kind == "alternate_scoped_position"
+                        else (
+                            identity.account_scope
+                            if exposure_kind == "scoped_position"
+                            else None
+                        )
                     ),
-                    exchange=(
-                        identity.exchange
-                        if exposure_kind == "scoped_position"
-                        else None
+                        exchange=(
+                            identity.exchange
+                            if exposure_kind
+                            in {"scoped_position", "alternate_scoped_position"}
+                            else None
                     ),
                     symbol=entry.symbol,
                     quantity=1,
