@@ -132,6 +132,47 @@ uncoordinated token, or manually replay the failed broker request.
 
 ## Legacy position attribution
 
+### Live KIS/KRX legacy flat row
+
+Do not use positive-holding attribution to repair a historical flat row. Drain
+all Exec writers and run the dedicated exact-symbol dry-run instead:
+
+```bash
+.venv/bin/python scripts/refresh_execution_position_truth.py \
+  --runtime-mode live \
+  --kis-krx-flat-rebind-symbol 029460
+```
+
+Copy the one returned position ID and fingerprint into the apply command:
+
+```bash
+.venv/bin/python scripts/refresh_execution_position_truth.py \
+  --runtime-mode live \
+  --kis-krx-flat-rebind-symbol 029460 \
+  --apply \
+  --approve-position 'POSITION_ID=64HEX_FROM_DRY_RUN' \
+  --actor 'operator-name' \
+  --reason 'fresh complete KIS KRX flat proof reviewed'
+```
+
+The approval is bound to an opaque HMAC of the exact configured KIS
+account/product without changing the deployment's canonical account scope. It
+uses the stable account-scope secret when configured, or the existing KIS app
+secret; a route label alone is not account proof. Apply adopts the shared token
+before reserving the database writer and obtains a second account snapshot after
+serialization and row/collision locks are held. Continue only when both broker
+collections are fully paginated and parsed, the configured account and KRX
+route match, the timestamp is current, `open_orders_error` is present and null,
+and the exact symbol is absent from both holdings and open orders. A
+`KIER2570` daily-order-query response is incomplete proof and must remain
+blocked. The command updates the existing row in place, records a redacted
+current-flat proof and immutable audit event, and has no order/fill/P&L mutation
+path. After apply, run the normal targeted position sync and confirm `created=0`
+and the same position ID remains. An exact apply replay may report idempotent;
+any row/proof mismatch requires a new dry-run rather than repair in place.
+
+### Non-flat positions
+
 Use this only for non-flat `execution_positions` blocked at startup because their
 provider/account/exchange attribution is null. Supported paths are KIS exact
 exchange attribution and the isolated Alpaca paper `US` equity route. Neither
