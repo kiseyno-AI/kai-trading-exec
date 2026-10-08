@@ -759,6 +759,22 @@ def _place_broker_order_serialized(
     )
     if plan_state_error is not None:
         return plan_state_error
+    if (
+        retryable_safety_fenced_order is not None
+        and not retrying_proven_pre_submit_failure
+        and _fresh_monitoring_sell_retrigger_is_authorized(
+            plan_item=plan_item,
+            command=logical_command,
+            request_source=request_source,
+        )
+    ):
+        # Runtime-safety rows prove that the prior attempt never crossed the
+        # broker boundary, but their original monitoring metadata is stale by
+        # definition on a later trigger.  The stable command/account identity
+        # check above still gates reuse of the row; only an exact, newly
+        # persisted monitoring authority may replace the old observed price,
+        # route time, and trigger binding.
+        command = logical_command
     initial_plan_item_identity = _plan_item_submission_identity(plan_item)
 
     account_route_mismatch = _plan_item_account_route_mismatch(
@@ -2545,7 +2561,7 @@ def _place_broker_order_serialized(
                 ),
             )
         if sell_market_evidence is not None:
-            routed_command = _bind_automated_kis_us_sell_limit(
+            routed_command = _bind_automated_kis_sell_limit(
                 command=routed_command,
                 evidence=sell_market_evidence,
             )
@@ -4522,6 +4538,29 @@ def _runtime_safety_replay_command(order: BrokerOrder) -> PlaceOrderRequest | No
         return None
 
 
+def _fresh_monitoring_sell_retrigger_is_authorized(
+    *,
+    plan_item: ExecutionPlanItem | None,
+    command: PlaceOrderRequest,
+    request_source: str,
+) -> bool:
+    if (
+        plan_item is None
+        or command.side != "sell"
+        or plan_item.intent not in {"stop_sell", "target_sell"}
+        or command.execution_plan_item_id != plan_item.id
+    ):
+        return False
+    risk_context = (
+        plan_item.risk_context if isinstance(plan_item.risk_context, dict) else {}
+    )
+    return _server_owned_plan_command_matches(
+        risk_context=risk_context,
+        command=command,
+        request_source=request_source,
+    )
+
+
 def _account_drawdown_recovery_source_matches_command(
     *,
     settings: Settings,
@@ -5762,24 +5801,43 @@ def _final_trigger_time_sell_agent_validity_failure(
     return None
 
 
-def _bind_automated_kis_us_sell_limit(
+def _bind_automated_kis_sell_limit(
     *,
     command: PlaceOrderRequest,
     evidence: AutomatedKisSellMarketEvidence,
 ) -> PlaceOrderRequest:
-    """Keep KIS-US protective day limits executable at the final trusted bid.
+    """Keep price-required KIS protective sells executable at the trusted bid.
 
     KIS-US accepts day limit orders only. Rebinding to the fresh best bid avoids
     leaving a stop stranded at the earlier monitoring quote while retaining a
-    finite price boundary. Domestic sells deliberately keep their existing
-    order type: IOC cancellation cannot yet be durably re-armed without risking
-    loss of protective coverage.
+    finite price boundary. KRX single-price ``07`` is also a limit-price wire
+    contract even when the logical monitoring order was market; bind only that
+    exact server-owned route. Other domestic sessions keep their existing
+    market/closing-price semantics.
     """
 
     context = evidence.context
-    if evidence.is_domestic or context is None or context.bid is None:
+    if context is None or context.bid is None or context.bid <= 0:
         return command
     metadata = dict(command.metadata or {})
+    if evidence.is_domestic:
+        route = metadata.get("route")
+        if not (
+            command.provider == "kis"
+            and command.exchange == "KRX"
+            and command.order_type == "limit"
+            and command.limit_price is None
+            and isinstance(route, dict)
+            and route.get("action") == "submit"
+            and route.get("exchange") == "KRX"
+            and route.get("session") == "krx_after_single_price"
+            and route.get("ord_dvsn") == "07"
+            and route.get("effective_order_type") == "limit"
+            and route.get("price_source") == "single_price_session"
+            and route.get("next_retry_at") is None
+            and route.get("reason") == "krx_after_hours_single_price_enabled"
+        ):
+            return command
     metadata["final_exit_price_bound"] = {
         "source": "fresh_executable_bid",
         "limit_price": str(context.bid),

@@ -12,6 +12,7 @@ from app.broker.base import (
     BrokerAccountSnapshot,
     BrokerAdapterError,
     BrokerErrorClassification,
+    BrokerLiveMarketContext,
 )
 from app.core.config import Settings
 from app.models.runtime import BrokerOrder
@@ -213,6 +214,191 @@ def test_monitoring_source_without_persisted_command_authority_cannot_transform_
 
     assert error is not None
     assert "quantity" in error
+
+
+def test_krx_single_price_protective_sell_binds_fresh_executable_bid() -> None:
+    observed_at = datetime(2026, 9, 10, 7, 0, tzinfo=UTC)
+    logical = _command(
+        execution_plan_item_id="single-price-protective-sell",
+        provider="kis",
+        venue="kis",
+        asset_class="stock",
+        exchange="KRX",
+        symbol="005930",
+        side="sell",
+        quantity=5,
+        order_type="market",
+        limit_price=None,
+        metadata={
+            "order_purpose": "protective_stop",
+            "route": {
+                "action": "submit",
+                "exchange": "KRX",
+                "session": "krx_after_single_price",
+                "ord_dvsn": "07",
+                "effective_order_type": "limit",
+                "price_source": "single_price_session",
+                "next_retry_at": None,
+                "reason": "krx_after_hours_single_price_enabled",
+            },
+        },
+    )
+    routed = logical.model_copy(update={"order_type": "limit"})
+    evidence = broker_orders_service.AutomatedKisSellMarketEvidence(
+        context=BrokerLiveMarketContext(
+            symbol="005930",
+            exchange="KRX",
+            observed_at=observed_at,
+            bid=Decimal("1097"),
+            ask=Decimal("1098"),
+            normal_ordering_available=True,
+            payload={},
+            freshness_source="kis_exchange_orderbook_time",
+        ),
+        is_domestic=True,
+    )
+
+    bound = broker_orders_service._bind_automated_kis_sell_limit(
+        command=routed,
+        evidence=evidence,
+    )
+
+    assert bound.order_type == "limit"
+    assert bound.limit_price == Decimal("1097")
+    assert bound.metadata["route"]["ord_dvsn"] == "07"
+    assert bound.metadata["final_exit_price_bound"] == {
+        "source": "fresh_executable_bid",
+        "limit_price": "1097",
+        "time_in_force": "day",
+    }
+
+
+@pytest.mark.parametrize(
+    ("route_field", "forged_value"),
+    [
+        ("action", "defer"),
+        ("exchange", "SOR"),
+        ("session", "krx_after_close"),
+        ("ord_dvsn", "06"),
+        ("effective_order_type", "market"),
+        ("price_source", "market"),
+        ("reason", "caller_supplied"),
+    ],
+)
+def test_forged_domestic_route_cannot_bind_executable_bid(
+    route_field: str,
+    forged_value: str,
+) -> None:
+    route = {
+        "action": "submit",
+        "exchange": "KRX",
+        "session": "krx_after_single_price",
+        "ord_dvsn": "07",
+        "effective_order_type": "limit",
+        "price_source": "single_price_session",
+        "next_retry_at": None,
+        "reason": "krx_after_hours_single_price_enabled",
+    }
+    route[route_field] = forged_value
+    command = _command(
+        execution_plan_item_id="forged-single-price-route",
+        provider="kis",
+        venue="kis",
+        asset_class="stock",
+        exchange="KRX",
+        symbol="005930",
+        side="sell",
+        quantity=5,
+        order_type="market",
+        limit_price=None,
+        metadata={"order_purpose": "protective_stop", "route": route},
+    ).model_copy(update={"order_type": "limit"})
+    evidence = broker_orders_service.AutomatedKisSellMarketEvidence(
+        context=BrokerLiveMarketContext(
+            symbol="005930",
+            exchange="KRX",
+            observed_at=datetime(2026, 9, 10, 7, 0, tzinfo=UTC),
+            bid=Decimal("1097"),
+            normal_ordering_available=True,
+        ),
+        is_domestic=True,
+    )
+
+    bound = broker_orders_service._bind_automated_kis_sell_limit(
+        command=command,
+        evidence=evidence,
+    )
+
+    assert bound.limit_price is None
+
+
+def test_fresh_monitoring_sell_retrigger_requires_exact_command_authority() -> None:
+    item = _plan_item(
+        id="fresh-protective-retrigger",
+        provider="kis",
+        venue="kis",
+        asset_class="stock",
+        symbol="005930",
+        side="sell",
+        intent="stop_sell",
+        quantity_policy={"kind": "shares", "quantity": 5},
+        limit_price=None,
+        trigger_price=Decimal("100"),
+        risk_context={"exchange": "KRX"},
+    )
+    command = _command(
+        execution_plan_item_id=item.id,
+        provider="kis",
+        venue="kis",
+        asset_class="stock",
+        exchange="KRX",
+        symbol="005930",
+        side="sell",
+        quantity=5,
+        order_type="market",
+        limit_price=None,
+        metadata={
+            "monitoring_worker": "intraday_target_stop_monitor",
+            "order_purpose": "protective_stop",
+            "observed_price": "99.0000",
+            "route_now": "2026-09-10T01:00:00+00:00",
+            "monitoring_sell_trigger_binding": {
+                "version": 1,
+                "execution_plan_item_id": item.id,
+                "symbol": "005930",
+                "intent": "stop_sell",
+                "trigger_reason": "stop_sell",
+                "direction": "at_or_below",
+                "trigger_price": "100.0000",
+            },
+        },
+    )
+    item.risk_context["monitoring_order_authority"] = {
+        "policy_version": 1,
+        "source": "monitoring:intraday_target_stop_monitor",
+        "command": command.model_dump(mode="json"),
+    }
+
+    assert broker_orders_service._fresh_monitoring_sell_retrigger_is_authorized(
+        plan_item=item,
+        command=command,
+        request_source="monitoring:intraday_target_stop_monitor",
+    )
+    forged_binding = dict(command.metadata or {})
+    forged_binding["monitoring_sell_trigger_binding"] = {
+        **forged_binding["monitoring_sell_trigger_binding"],
+        "trigger_price": "102.0000",
+    }
+    assert not broker_orders_service._fresh_monitoring_sell_retrigger_is_authorized(
+        plan_item=item,
+        command=command.model_copy(update={"metadata": forged_binding}),
+        request_source="monitoring:intraday_target_stop_monitor",
+    )
+    assert not broker_orders_service._fresh_monitoring_sell_retrigger_is_authorized(
+        plan_item=item,
+        command=command.model_copy(update={"quantity": 4}),
+        request_source="monitoring:intraday_target_stop_monitor",
+    )
 
 
 @pytest.mark.parametrize("plan_item", [None, _plan_item()])

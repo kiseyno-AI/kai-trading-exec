@@ -4222,6 +4222,15 @@ def test_live_trigger_time_approval_caps_limit_and_resizes_against_final_price(
 ) -> None:
     initial_at = datetime(2026, 6, 5, 0, 30, tzinfo=UTC)
 
+    class DelayedCycleClock:
+        calls = 0
+
+        def monotonic(self) -> float:
+            self.calls += 1
+            return 100.0 if self.calls == 1 else 106.0
+
+    monkeypatch.setattr(monitoring, "time", DelayedCycleClock())
+
     class FreshExecutableAdapter(StubBrokerAdapter):
         def get_current_price(
             self,
@@ -4344,7 +4353,18 @@ def test_live_trigger_time_revalidation_age_includes_refresh_latency(
 ) -> None:
     initial_at = datetime(2026, 6, 5, 0, 30, tzinfo=UTC)
 
+    class CycleClock:
+        value = 100.0
+
+        def monotonic(self) -> float:
+            return self.value
+
+    cycle_clock = CycleClock()
+    monkeypatch.setattr(monitoring, "time", cycle_clock)
+
     class SlowContextAdapter(StubBrokerAdapter):
+        context_call_count = 0
+
         def get_current_price(
             self,
             access_token: str,
@@ -4376,7 +4396,9 @@ def test_live_trigger_time_revalidation_age_includes_refresh_latency(
             reference_price: Decimal | None = None,
         ) -> BrokerLiveMarketContext | None:
             assert access_token
-            time.sleep(1.1)
+            self.context_call_count += 1
+            if self.context_call_count == 2:
+                cycle_clock.value += 2.0
             return BrokerLiveMarketContext(
                 symbol=symbol,
                 exchange=exchange,
