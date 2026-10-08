@@ -875,6 +875,52 @@ amends, or cancels an order and never mutates fills or P/L. Re-running the exact
 approved command is idempotent only while the canonical row and proof event
 still match byte-for-byte; otherwise it fails closed.
 
+If that proof ages out before the quarantined Core authority is revoked, do
+not unbind the row, rewrite the original audit, or use the generic position
+refresh. Roll the proof forward with a new reviewed generation:
+
+```bash
+.venv/bin/python scripts/refresh_execution_position_truth.py \
+  --runtime-mode live \
+  --kis-krx-flat-proof-refresh-symbol 029460
+
+.venv/bin/python scripts/refresh_execution_position_truth.py \
+  --runtime-mode live \
+  --kis-krx-flat-proof-refresh-symbol 029460 \
+  --apply \
+  --approve-position 'POSITION_ID=64HEX_FROM_REFRESH_DRY_RUN' \
+  --actor 'operator-name' \
+  --reason 'refresh exact canonical broker-flat proof generation'
+```
+
+This path validates the exact canonical route, zero quantity and base quantity,
+null average price, reconciliation source, and every immutable proof generation
+back to the original bind. It also recognizes one narrow recovery source: the
+exact live KIS generic-sync payload may have superseded the specialized row only
+when both broker responses succeeded, both collections are complete and
+well-formed, the configured account matches, the target symbol is absent even
+as a zero row, and that reconciliation is newer than the last proof. The generic
+payload is never consumer authority by itself. Apply still takes the same
+account/order-intent and row locks and re-fetches broker truth after locking; the
+new complete snapshot must be newer than the superseding reconciliation and the
+symbol must remain absent.
+
+Only the row's redacted proof and `last_reconciled_at` are updated. Older events
+are not edited or deleted, and a distinct generation-bound refresh event is
+appended. Normal generic reconciliation preserves an intact specialized proof
+without advancing its timestamp only during its hard five-minute authority
+window and only for another complete, successful target-absent snapshot. A
+target holding/open order, malformed complete response, or expired proof causes
+normal reconciliation to supersede the specialized payload so consumers fail
+closed until a new reviewed refresh. An incomplete snapshot never infers target
+absence: when it contains a parsed positive target holding or open order, that
+strong positive evidence is durably persisted before the sync reports its
+incomplete-coverage error; when the target is absent, the row is left unchanged
+and the same error is reported. Exact apply replay is idempotent only while the
+latest specialized row/event remain byte-exact and inside that same five-minute
+window. Any row, full-lineage, broker exposure, freshness, or approval drift
+requires a new dry-run.
+
 Legacy non-flat rows with no account/route attribution require a separate,
 explicit two-pass workflow. Drain all writers first, then run one exchange at a
 time:

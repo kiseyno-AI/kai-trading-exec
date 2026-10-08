@@ -22,7 +22,12 @@ from app.models.runtime import (
     RuntimeRemediationEvent,
 )
 from app.services import position_truth_remediation as remediation_service
+from app.services import reconciliation as reconciliation_service
 from app.services.kis_krx_flat_rebind_contract import (
+    KIS_KRX_FLAT_PROOF_REFRESH_CANDIDATE_TYPE,
+    KIS_KRX_FLAT_PROOF_REFRESH_EVENT_PROOF_FIELDS,
+    KIS_KRX_FLAT_PROOF_REFRESH_OUTCOME,
+    KIS_KRX_FLAT_PROOF_SOURCE_GENERIC_SYNC,
     KIS_KRX_LEGACY_FLAT_REBIND_CANDIDATE_TYPE,
     KIS_KRX_LEGACY_FLAT_REBIND_EVENT_PROOF_FIELDS,
     KIS_KRX_LEGACY_FLAT_REBIND_OUTCOME,
@@ -31,6 +36,11 @@ from app.services.kis_krx_flat_rebind_contract import (
     kis_krx_flat_absence_proof_digest,
     kis_krx_flat_configured_account_binding_digest,
     kis_krx_flat_evidence_fingerprint,
+    kis_krx_flat_proof_refresh_candidate_key,
+)
+from app.services.kis_krx_flat_proof_validation import (
+    canonical_flat_row_matches_latest_proof,
+    load_kis_krx_flat_proof_lineage,
 )
 from app.services.position_identity import (
     PositionIdentityConflictError,
@@ -137,6 +147,57 @@ def _snapshot(
             "open_orders_error": open_orders_error,
         },
     )
+
+
+def _kis_success_response(
+    *,
+    output1: list[dict[str, object]],
+    output2: list[dict[str, object]] | None = None,
+    msg_cd: str = "KIOK0000",
+) -> dict[str, object]:
+    return {
+        "ctx_area_fk100": "",
+        "ctx_area_nk100": "",
+        "msg1": "success",
+        "msg_cd": msg_cd,
+        "output1": output1,
+        "output2": output2 or [],
+        "rt_cd": "0",
+    }
+
+
+def _production_shaped_snapshot(
+    *,
+    observed_at: datetime,
+    holdings: list[BrokerAccountHolding] | None = None,
+    open_orders: list[BrokerAccountOpenOrder] | None = None,
+    raw_holding_rows: list[dict[str, object]] | None = None,
+    raw_open_order_rows: list[dict[str, object]] | None = None,
+    holdings_complete: bool = True,
+    open_orders_complete: bool = True,
+) -> BrokerAccountSnapshot:
+    snapshot = _snapshot(
+        observed_at=observed_at,
+        holdings=holdings,
+        open_orders=open_orders,
+        holdings_complete=holdings_complete,
+        open_orders_complete=open_orders_complete,
+        open_orders_error=None,
+    )
+    snapshot.payload.update(
+        {
+            "balance": _kis_success_response(
+                output1=raw_holding_rows or [],
+                output2=[{"dnca_tot_amt": "1000000"}],
+                msg_cd="KIOK0510",
+            ),
+            "open_orders": _kis_success_response(
+                output1=raw_open_order_rows or [],
+                msg_cd="KIOK0560",
+            ),
+        }
+    )
+    return snapshot
 
 
 def _legacy_flat_position() -> ExecutionPosition:
@@ -1406,6 +1467,1452 @@ def test_kis_krx_flat_rebind_rejects_duplicate_unscoped_target_before_auth(
             db=db,
             session_factory=session_factory,
             adapter=adapter,
+        )
+
+    assert adapter.snapshot_requests == []
+    db.close()
+    engine.dispose()
+
+
+def _bind_current_flat_for_refresh(
+    *,
+    settings: Settings,
+    db,
+    session_factory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[ExecutionPosition, RuntimeRemediationEvent]:
+    position = _legacy_flat_position()
+    db.add(position)
+    db.commit()
+    adapter = KisKrxSnapshotAdapter(
+        [_snapshot(observed_at=NOW), _snapshot(observed_at=NOW), _snapshot(observed_at=NOW)]
+    )
+    _patch_shared_auth(monkeypatch)
+    dry_run = _dry_run(
+        settings=settings,
+        db=db,
+        session_factory=session_factory,
+        adapter=adapter,
+    )
+    remediation_service.apply_kis_krx_legacy_flat_position_rebind(
+        settings=settings,
+        db=db,
+        auth_session_factory=session_factory,
+        adapter=adapter,
+        symbol=TARGET_SYMBOL,
+        approved_evidence={
+            position.id: dry_run["items"][0]["evidence_fingerprint"]
+        },
+        actor="codex",
+        reason="establish immutable initial proof",
+        now=NOW,
+    )
+    event = db.scalar(
+        select(RuntimeRemediationEvent).where(
+            RuntimeRemediationEvent.candidate_type
+            == KIS_KRX_LEGACY_FLAT_REBIND_CANDIDATE_TYPE
+        )
+    )
+    assert event is not None
+    rebound = db.get(ExecutionPosition, position.id)
+    assert rebound is not None
+    return rebound, event
+
+
+def _apply_flat_proof_refresh_generation(
+    *,
+    settings: Settings,
+    db,
+    session_factory,
+    monkeypatch: pytest.MonkeyPatch,
+    position: ExecutionPosition,
+    observed_at: datetime,
+) -> RuntimeRemediationEvent:
+    adapter = KisKrxSnapshotAdapter([_snapshot(observed_at=observed_at)])
+    event_at = observed_at + timedelta(seconds=1)
+    monkeypatch.setattr(remediation_service, "_real_utc_now", lambda: event_at)
+    dry_run = remediation_service.analyze_kis_krx_canonical_flat_proof_refresh(
+        settings=settings,
+        db=db,
+        auth_session_factory=session_factory,
+        adapter=adapter,
+        symbol=TARGET_SYMBOL,
+        now=event_at,
+    )
+    remediation_service.apply_kis_krx_canonical_flat_proof_refresh(
+        settings=settings,
+        db=db,
+        auth_session_factory=session_factory,
+        adapter=adapter,
+        symbol=TARGET_SYMBOL,
+        approved_evidence={
+            position.id: dry_run["items"][0]["evidence_fingerprint"]
+        },
+        actor="codex",
+        reason="append exact flat proof generation",
+        now=event_at,
+    )
+    event = db.scalar(
+        select(RuntimeRemediationEvent)
+        .where(
+            RuntimeRemediationEvent.candidate_type
+            == KIS_KRX_FLAT_PROOF_REFRESH_CANDIDATE_TYPE
+        )
+        .order_by(RuntimeRemediationEvent.occurred_at.desc())
+    )
+    assert event is not None
+    return event
+
+
+def _overwrite_with_live_shaped_generic_sync_payload(
+    *,
+    settings: Settings,
+    db,
+    position: ExecutionPosition,
+    observed_at: datetime,
+) -> dict[str, object]:
+    identity = build_position_identity(
+        settings=settings,
+        provider="kis",
+        exchange="KRX",
+    )
+    snapshot = _production_shaped_snapshot(
+        observed_at=observed_at,
+        raw_holding_rows=[
+            {
+                "pdno": "027710",
+                "hldg_qty": "0",
+                "ord_psbl_qty": "0",
+            }
+        ],
+    )
+    raw_payload = payload_with_position_identity(
+        snapshot.payload,
+        identity=identity,
+    )
+    position.quantity = 0
+    position.base_quantity = Decimal("0")
+    position.average_price = None
+    position.updated_from = "reconciliation"
+    position.last_reconciled_at = observed_at
+    position.raw_payload = raw_payload
+    db.commit()
+    return raw_payload
+
+
+def test_kis_krx_flat_proof_refresh_recovers_exact_generic_sync_supersede(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings, engine, session_factory, db = _session()
+    position, bind_event = _bind_current_flat_for_refresh(
+        settings=settings,
+        db=db,
+        session_factory=session_factory,
+        monkeypatch=monkeypatch,
+    )
+    original_bind = dict(bind_event.evidence_summary)
+    superseded_at = NOW + timedelta(minutes=10)
+    raw_payload = _overwrite_with_live_shaped_generic_sync_payload(
+        settings=settings,
+        db=db,
+        position=position,
+        observed_at=superseded_at,
+    )
+    refresh_snapshot_at = superseded_at + timedelta(minutes=1)
+    refresh_event_at = refresh_snapshot_at + timedelta(seconds=3)
+    adapter = KisKrxSnapshotAdapter(
+        [
+            _snapshot(observed_at=refresh_snapshot_at),
+            _snapshot(observed_at=refresh_snapshot_at + timedelta(seconds=1)),
+            _snapshot(observed_at=refresh_snapshot_at + timedelta(seconds=2)),
+        ]
+    )
+    monkeypatch.setattr(
+        remediation_service,
+        "_real_utc_now",
+        lambda: refresh_event_at,
+    )
+
+    dry_run = remediation_service.analyze_kis_krx_canonical_flat_proof_refresh(
+        settings=settings,
+        db=db,
+        auth_session_factory=session_factory,
+        adapter=adapter,
+        symbol=TARGET_SYMBOL,
+        now=refresh_snapshot_at,
+    )
+    item = dry_run["items"][0]
+    assert item["eligible"] is True
+    assert item["source_row_state"] == KIS_KRX_FLAT_PROOF_SOURCE_GENERIC_SYNC
+    assert item["superseded_reconciliation_observed_at"] == superseded_at.isoformat()
+    assert len(item["superseded_payload_digest"]) == 64
+    assert set(raw_payload) == {
+        "exchange",
+        "balance",
+        "open_orders",
+        "open_orders_error",
+        "holdings_coverage",
+        "open_orders_coverage",
+        "account_number_masked",
+        "_position_identity",
+    }
+
+    applied = remediation_service.apply_kis_krx_canonical_flat_proof_refresh(
+        settings=settings,
+        db=db,
+        auth_session_factory=session_factory,
+        adapter=adapter,
+        symbol=TARGET_SYMBOL,
+        approved_evidence={position.id: item["evidence_fingerprint"]},
+        actor="codex",
+        reason="recover strictly validated generic sync supersede",
+        now=refresh_snapshot_at + timedelta(seconds=1),
+    )
+
+    assert applied["summary"]["refreshed_count"] == 1
+    rebound = db.get(ExecutionPosition, position.id)
+    assert rebound is not None
+    assert set(rebound.raw_payload) == KIS_KRX_LEGACY_FLAT_REBIND_RAW_PROOF_FIELDS
+    events = db.scalars(
+        select(RuntimeRemediationEvent)
+        .where(RuntimeRemediationEvent.subject_id == position.id)
+        .order_by(RuntimeRemediationEvent.occurred_at.asc())
+    ).all()
+    assert len(events) == 2
+    assert events[0].id == bind_event.id
+    assert events[0].evidence_summary == original_bind
+    assert events[1].evidence_summary["source_row_state"] == (
+        KIS_KRX_FLAT_PROOF_SOURCE_GENERIC_SYNC
+    )
+    assert events[1].evidence_summary["superseded_payload_digest"] == item[
+        "superseded_payload_digest"
+    ]
+    assert db.scalar(select(func.count()).select_from(BrokerOrder)) == 0
+    assert db.scalar(select(func.count()).select_from(ExecutionFill)) == 0
+    db.close()
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    "invalid_shape",
+    [
+        "balance_business_error",
+        "holding_output_not_list",
+        "target_zero_holding",
+        "duplicate_holding",
+        "target_open_order",
+        "extra_response_field",
+    ],
+)
+def test_kis_krx_flat_proof_refresh_rejects_unproven_generic_sync_supersede(
+    monkeypatch: pytest.MonkeyPatch,
+    invalid_shape: str,
+) -> None:
+    settings, engine, session_factory, db = _session()
+    position, _event = _bind_current_flat_for_refresh(
+        settings=settings,
+        db=db,
+        session_factory=session_factory,
+        monkeypatch=monkeypatch,
+    )
+    raw = _overwrite_with_live_shaped_generic_sync_payload(
+        settings=settings,
+        db=db,
+        position=position,
+        observed_at=NOW + timedelta(minutes=10),
+    )
+    balance = raw["balance"]
+    open_orders = raw["open_orders"]
+    assert isinstance(balance, dict)
+    assert isinstance(open_orders, dict)
+    if invalid_shape == "balance_business_error":
+        balance["rt_cd"] = "1"
+    elif invalid_shape == "holding_output_not_list":
+        balance["output1"] = {"pdno": "027710", "hldg_qty": "0"}
+    elif invalid_shape == "target_zero_holding":
+        balance["output1"] = [
+            {"pdno": TARGET_SYMBOL, "hldg_qty": "0", "ord_psbl_qty": "0"}
+        ]
+    elif invalid_shape == "duplicate_holding":
+        balance["output1"] = [
+            {"pdno": "027710", "hldg_qty": "0", "ord_psbl_qty": "0"},
+            {"pdno": "027710", "hldg_qty": "0", "ord_psbl_qty": "0"},
+        ]
+    elif invalid_shape == "target_open_order":
+        open_orders["output1"] = [
+            {
+                "pdno": TARGET_SYMBOL,
+                "odno": "target-open-order",
+                "ord_qty": "1",
+                "rmn_qty": "1",
+                "sll_buy_dvsn_cd": "02",
+            }
+        ]
+    else:
+        open_orders["unexpected"] = True
+    position.raw_payload = raw
+    db.commit()
+    adapter = KisKrxSnapshotAdapter(
+        [_snapshot(observed_at=NOW + timedelta(minutes=11))]
+    )
+    monkeypatch.setattr(
+        remediation_service,
+        "ensure_authenticated_broker_session",
+        lambda **kwargs: pytest.fail("invalid generic proof attempted broker auth"),
+    )
+
+    with pytest.raises(
+        PositionIdentityConflictError,
+        match="exact safe generic-sync supersede shape",
+    ):
+        remediation_service.analyze_kis_krx_canonical_flat_proof_refresh(
+            settings=settings,
+            db=db,
+            auth_session_factory=session_factory,
+            adapter=adapter,
+            symbol=TARGET_SYMBOL,
+            now=NOW + timedelta(minutes=11),
+        )
+
+    assert adapter.snapshot_requests == []
+    db.close()
+    engine.dispose()
+
+
+def test_generic_sync_preserves_only_fresh_intact_flat_proof_on_complete_absence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings, engine, session_factory, db = _session()
+    position, _event = _bind_current_flat_for_refresh(
+        settings=settings,
+        db=db,
+        session_factory=session_factory,
+        monkeypatch=monkeypatch,
+    )
+    original_raw = dict(position.raw_payload)
+    original_reconciled_at = position.last_reconciled_at
+    sync_at = NOW + timedelta(seconds=30)
+    monkeypatch.setattr(
+        reconciliation_service,
+        "_observation_time",
+        lambda: sync_at + timedelta(seconds=1),
+    )
+    adapter = KisKrxSnapshotAdapter(
+        [_production_shaped_snapshot(observed_at=sync_at)]
+    )
+
+    result = sync_execution_positions_from_broker_snapshot(
+        settings=settings,
+        db=db,
+        adapter=adapter,
+        symbols={TARGET_SYMBOL},
+        exchange="KRX",
+        authenticated_access_token="shared-kis-token",
+    )
+
+    rebound = db.get(ExecutionPosition, position.id)
+    assert rebound is not None
+    assert result["updated"] == 0
+    assert result["zeroed"] == 0
+    assert rebound.raw_payload == original_raw
+    assert rebound.last_reconciled_at.replace(tzinfo=UTC) == original_reconciled_at
+    db.close()
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    "supersede_reason",
+    ["proof_expired", "open_orders_incomplete", "target_open_order"],
+)
+def test_generic_sync_supersedes_proof_when_it_is_not_safe_to_preserve(
+    monkeypatch: pytest.MonkeyPatch,
+    supersede_reason: str,
+) -> None:
+    settings, engine, session_factory, db = _session()
+    if supersede_reason == "proof_expired":
+        settings = settings.model_copy(
+            update={"exec_agent_max_account_snapshot_age_seconds": 3600}
+        )
+    position, _event = _bind_current_flat_for_refresh(
+        settings=settings,
+        db=db,
+        session_factory=session_factory,
+        monkeypatch=monkeypatch,
+    )
+    sync_at = (
+        NOW + timedelta(seconds=301)
+        if supersede_reason == "proof_expired"
+        else NOW + timedelta(seconds=30)
+    )
+    open_orders: list[BrokerAccountOpenOrder] = []
+    raw_open_orders: list[dict[str, object]] = []
+    open_orders_complete = supersede_reason != "open_orders_incomplete"
+    if supersede_reason == "target_open_order":
+        open_orders = [
+            BrokerAccountOpenOrder(
+                broker_order_id="target-open-order",
+                symbol=TARGET_SYMBOL,
+                side="buy",
+                status="open",
+                quantity=1,
+                remaining_quantity=1,
+                payload={},
+            )
+        ]
+        raw_open_orders = [
+            {
+                "pdno": TARGET_SYMBOL,
+                "odno": "target-open-order",
+                "ord_qty": "1",
+                "rmn_qty": "1",
+                "sll_buy_dvsn_cd": "02",
+            }
+        ]
+    monkeypatch.setattr(
+        reconciliation_service,
+        "_observation_time",
+        lambda: sync_at + timedelta(seconds=1),
+    )
+    adapter = KisKrxSnapshotAdapter(
+        [
+            _production_shaped_snapshot(
+                observed_at=sync_at,
+                open_orders=open_orders,
+                raw_open_order_rows=raw_open_orders,
+                open_orders_complete=open_orders_complete,
+            )
+        ]
+    )
+
+    sync_execution_positions_from_broker_snapshot(
+        settings=settings,
+        db=db,
+        adapter=adapter,
+        symbols={TARGET_SYMBOL},
+        exchange="KRX",
+        authenticated_access_token="shared-kis-token",
+    )
+
+    rebound = db.get(ExecutionPosition, position.id)
+    assert rebound is not None
+    assert set(rebound.raw_payload) != KIS_KRX_LEGACY_FLAT_REBIND_RAW_PROOF_FIELDS
+    assert rebound.last_reconciled_at == sync_at
+    db.close()
+    engine.dispose()
+
+
+def test_old_refresh_approval_cannot_replay_after_generic_sync_supersede(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings, engine, session_factory, db = _session()
+    position, _event = _bind_current_flat_for_refresh(
+        settings=settings,
+        db=db,
+        session_factory=session_factory,
+        monkeypatch=monkeypatch,
+    )
+    refresh_event = _apply_flat_proof_refresh_generation(
+        settings=settings,
+        db=db,
+        session_factory=session_factory,
+        monkeypatch=monkeypatch,
+        position=position,
+        observed_at=NOW + timedelta(minutes=20),
+    )
+    old_approval = refresh_event.evidence_summary["refresh_approval_fingerprint"]
+    assert isinstance(old_approval, str)
+    _overwrite_with_live_shaped_generic_sync_payload(
+        settings=settings,
+        db=db,
+        position=position,
+        observed_at=NOW + timedelta(minutes=21),
+    )
+    adapter = KisKrxSnapshotAdapter(
+        [_snapshot(observed_at=NOW + timedelta(minutes=22))]
+    )
+
+    with pytest.raises(
+        PositionIdentityConflictError,
+        match="approved KIS KRX flat refresh evidence no longer matches",
+    ):
+        remediation_service.apply_kis_krx_canonical_flat_proof_refresh(
+            settings=settings,
+            db=db,
+            auth_session_factory=session_factory,
+            adapter=adapter,
+            symbol=TARGET_SYMBOL,
+            approved_evidence={position.id: old_approval},
+            actor="codex",
+            reason="must not replay stale approval",
+            now=NOW + timedelta(minutes=22),
+        )
+
+    assert len(adapter.snapshot_requests) == 1
+    assert db.scalar(
+        select(func.count())
+        .select_from(RuntimeRemediationEvent)
+        .where(
+            RuntimeRemediationEvent.candidate_type
+            == KIS_KRX_FLAT_PROOF_REFRESH_CANDIDATE_TYPE
+        )
+    ) == 1
+    rebound = db.get(ExecutionPosition, position.id)
+    assert rebound is not None
+    assert rebound.raw_payload["balance"]["rt_cd"] == "0"
+    db.close()
+    engine.dispose()
+
+
+def test_stale_canonical_refresh_approval_cannot_replay_as_current(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings, engine, session_factory, db = _session()
+    settings = settings.model_copy(
+        update={"exec_agent_max_account_snapshot_age_seconds": 3600}
+    )
+    position, _event = _bind_current_flat_for_refresh(
+        settings=settings,
+        db=db,
+        session_factory=session_factory,
+        monkeypatch=monkeypatch,
+    )
+    refresh_observed_at = NOW + timedelta(minutes=20)
+    refresh_event = _apply_flat_proof_refresh_generation(
+        settings=settings,
+        db=db,
+        session_factory=session_factory,
+        monkeypatch=monkeypatch,
+        position=position,
+        observed_at=refresh_observed_at,
+    )
+    old_approval = refresh_event.evidence_summary["refresh_approval_fingerprint"]
+    assert isinstance(old_approval, str)
+    stale_replay_at = refresh_event.occurred_at.replace(tzinfo=UTC) + timedelta(
+        seconds=301
+    )
+    adapter = KisKrxSnapshotAdapter(
+        [_snapshot(observed_at=stale_replay_at)]
+    )
+
+    with pytest.raises(
+        PositionIdentityConflictError,
+        match="approved KIS KRX flat refresh evidence no longer matches",
+    ):
+        remediation_service.apply_kis_krx_canonical_flat_proof_refresh(
+            settings=settings,
+            db=db,
+            auth_session_factory=session_factory,
+            adapter=adapter,
+            symbol=TARGET_SYMBOL,
+            approved_evidence={position.id: old_approval},
+            actor="codex",
+            reason="stale replay must obtain a new approval",
+            now=stale_replay_at,
+        )
+
+    assert len(adapter.snapshot_requests) == 1
+    assert db.scalar(
+        select(func.count())
+        .select_from(RuntimeRemediationEvent)
+        .where(
+            RuntimeRemediationEvent.candidate_type
+            == KIS_KRX_FLAT_PROOF_REFRESH_CANDIDATE_TYPE
+        )
+    ) == 1
+    db.close()
+    engine.dispose()
+
+
+def test_generic_sync_never_preserves_flat_proof_when_target_holding_appears(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings, engine, session_factory, db = _session()
+    position, _event = _bind_current_flat_for_refresh(
+        settings=settings,
+        db=db,
+        session_factory=session_factory,
+        monkeypatch=monkeypatch,
+    )
+    sync_at = NOW + timedelta(seconds=30)
+    holding = BrokerAccountHolding(
+        symbol=TARGET_SYMBOL,
+        quantity=2,
+        average_price=Decimal("35000"),
+        sellable_quantity=2,
+        payload={"pdno": TARGET_SYMBOL, "hldg_qty": "2", "ord_psbl_qty": "2"},
+    )
+    monkeypatch.setattr(
+        reconciliation_service,
+        "_observation_time",
+        lambda: sync_at + timedelta(seconds=1),
+    )
+    adapter = KisKrxSnapshotAdapter(
+        [
+            _production_shaped_snapshot(
+                observed_at=sync_at,
+                holdings=[holding],
+                raw_holding_rows=[dict(holding.payload)],
+            )
+        ]
+    )
+
+    sync_execution_positions_from_broker_snapshot(
+        settings=settings,
+        db=db,
+        adapter=adapter,
+        symbols={TARGET_SYMBOL},
+        exchange="KRX",
+        authenticated_access_token="shared-kis-token",
+    )
+
+    rebound = db.get(ExecutionPosition, position.id)
+    assert rebound is not None
+    assert rebound.quantity == 2
+    assert rebound.average_price == Decimal("35000")
+    assert set(rebound.raw_payload) != KIS_KRX_LEGACY_FLAT_REBIND_RAW_PROOF_FIELDS
+    db.close()
+    engine.dispose()
+
+
+def test_partial_target_holding_durably_supersedes_proof_and_recovers_via_refresh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings, engine, session_factory, db = _session()
+    position, bind_event = _bind_current_flat_for_refresh(
+        settings=settings,
+        db=db,
+        session_factory=session_factory,
+        monkeypatch=monkeypatch,
+    )
+    original_bind_summary = dict(bind_event.evidence_summary)
+    partial_at = NOW + timedelta(seconds=30)
+    holding = BrokerAccountHolding(
+        symbol=TARGET_SYMBOL,
+        quantity=2,
+        average_price=Decimal("35000"),
+        sellable_quantity=2,
+        payload={"pdno": TARGET_SYMBOL, "hldg_qty": "2", "ord_psbl_qty": "2"},
+    )
+    partial_adapter = KisKrxSnapshotAdapter(
+        [
+            _production_shaped_snapshot(
+                observed_at=partial_at,
+                holdings=[holding],
+                raw_holding_rows=[dict(holding.payload)],
+                holdings_complete=False,
+            )
+        ]
+    )
+
+    with pytest.raises(BrokerAdapterError, match="holdings coverage is incomplete"):
+        sync_execution_positions_from_broker_snapshot(
+            settings=settings,
+            db=db,
+            adapter=partial_adapter,
+            symbols={TARGET_SYMBOL},
+            exchange="KRX",
+            authenticated_access_token="shared-kis-token",
+        )
+
+    persisted_db = session_factory()
+    exposed = persisted_db.get(ExecutionPosition, position.id)
+    assert exposed is not None
+    assert exposed.quantity == 2
+    assert exposed.base_quantity is None
+    assert exposed.average_price == Decimal("35000")
+    assert exposed.last_reconciled_at.replace(tzinfo=UTC) == partial_at
+    assert exposed.raw_payload["holdings_coverage"] == "incomplete"
+    assert set(exposed.raw_payload) != KIS_KRX_LEGACY_FLAT_REBIND_RAW_PROOF_FIELDS
+    assert persisted_db.scalar(
+        select(func.count()).select_from(RuntimeRemediationEvent)
+    ) == 1
+    assert persisted_db.scalar(select(func.count()).select_from(BrokerOrder)) == 0
+    assert persisted_db.scalar(select(func.count()).select_from(ExecutionFill)) == 0
+    persisted_db.close()
+    assert len(partial_adapter.snapshot_requests) == 1
+
+    complete_at = partial_at + timedelta(seconds=30)
+    complete_adapter = KisKrxSnapshotAdapter(
+        [_production_shaped_snapshot(observed_at=complete_at)]
+    )
+    complete_result = sync_execution_positions_from_broker_snapshot(
+        settings=settings,
+        db=db,
+        adapter=complete_adapter,
+        symbols={TARGET_SYMBOL},
+        exchange="KRX",
+        authenticated_access_token="shared-kis-token",
+    )
+    db.expire_all()
+    exposed = db.get(ExecutionPosition, position.id)
+    assert exposed is not None
+    assert complete_result["zeroed"] == 1
+    assert exposed.quantity == 0
+    assert exposed.base_quantity == Decimal("0")
+    assert exposed.average_price is None
+    assert exposed.last_reconciled_at.replace(tzinfo=UTC) == complete_at
+
+    refresh_snapshot_at = complete_at + timedelta(seconds=1)
+    refresh_event_at = refresh_snapshot_at + timedelta(seconds=3)
+    refresh_adapter = KisKrxSnapshotAdapter(
+        [
+            _production_shaped_snapshot(observed_at=refresh_snapshot_at),
+            _production_shaped_snapshot(
+                observed_at=refresh_snapshot_at + timedelta(seconds=1)
+            ),
+            _production_shaped_snapshot(
+                observed_at=refresh_snapshot_at + timedelta(seconds=2)
+            ),
+        ]
+    )
+    monkeypatch.setattr(
+        remediation_service,
+        "_real_utc_now",
+        lambda: refresh_event_at,
+    )
+    dry_run = remediation_service.analyze_kis_krx_canonical_flat_proof_refresh(
+        settings=settings,
+        db=db,
+        auth_session_factory=session_factory,
+        adapter=refresh_adapter,
+        symbol=TARGET_SYMBOL,
+        now=refresh_event_at,
+    )
+    assert dry_run["items"][0]["source_row_state"] == (
+        KIS_KRX_FLAT_PROOF_SOURCE_GENERIC_SYNC
+    )
+    applied = remediation_service.apply_kis_krx_canonical_flat_proof_refresh(
+        settings=settings,
+        db=db,
+        auth_session_factory=session_factory,
+        adapter=refresh_adapter,
+        symbol=TARGET_SYMBOL,
+        approved_evidence={
+            position.id: dry_run["items"][0]["evidence_fingerprint"]
+        },
+        actor="codex",
+        reason="restore broker-flat authority after positive partial exposure",
+        now=refresh_event_at,
+    )
+    assert applied["summary"]["refreshed_count"] == 1
+    identity = build_position_identity(
+        settings=settings,
+        provider="kis",
+        exchange="KRX",
+    )
+    lineage = load_kis_krx_flat_proof_lineage(
+        settings=settings,
+        db=db,
+        position_id=position.id,
+        symbol=TARGET_SYMBOL,
+        identity=identity,
+    )
+    assert lineage is not None
+    _latest_event, latest_summary = lineage
+    db.refresh(exposed)
+    assert canonical_flat_row_matches_latest_proof(
+        settings=settings,
+        position=exposed,
+        symbol=TARGET_SYMBOL,
+        identity=identity,
+        latest_summary=latest_summary,
+    )
+    assert bind_event.evidence_summary == original_bind_summary
+    assert db.scalar(select(func.count()).select_from(RuntimeRemediationEvent)) == 2
+    assert db.scalar(select(func.count()).select_from(BrokerOrder)) == 0
+    assert db.scalar(select(func.count()).select_from(ExecutionFill)) == 0
+    assert len(refresh_adapter.snapshot_requests) == 3
+    db.close()
+    engine.dispose()
+
+
+def test_partial_target_holding_commit_false_survives_outer_commit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings, engine, session_factory, db = _session()
+    position, _event = _bind_current_flat_for_refresh(
+        settings=settings,
+        db=db,
+        session_factory=session_factory,
+        monkeypatch=monkeypatch,
+    )
+    partial_at = NOW + timedelta(seconds=30)
+    holding = BrokerAccountHolding(
+        symbol=TARGET_SYMBOL,
+        quantity=3,
+        average_price=Decimal("35100"),
+        sellable_quantity=3,
+        payload={"pdno": TARGET_SYMBOL, "hldg_qty": "3", "ord_psbl_qty": "3"},
+    )
+    adapter = KisKrxSnapshotAdapter(
+        [
+            _production_shaped_snapshot(
+                observed_at=partial_at,
+                holdings=[holding],
+                raw_holding_rows=[dict(holding.payload)],
+                holdings_complete=False,
+            )
+        ]
+    )
+
+    result = sync_execution_positions_from_broker_snapshot(
+        settings=settings,
+        db=db,
+        adapter=adapter,
+        symbols={TARGET_SYMBOL},
+        exchange="KRX",
+        commit=False,
+        authenticated_access_token="shared-kis-token",
+    )
+    assert result["partial_exposure_superseded_count"] == 1
+    assert result["updated"] == 1
+    assert len(adapter.snapshot_requests) == 1
+    db.commit()
+    db.close()
+
+    verify_db = session_factory()
+    exposed = verify_db.get(ExecutionPosition, position.id)
+    assert exposed is not None
+    assert exposed.quantity == 3
+    assert exposed.average_price == Decimal("35100")
+    assert exposed.last_reconciled_at.replace(tzinfo=UTC) == partial_at
+    assert verify_db.scalar(select(func.count()).select_from(RuntimeRemediationEvent)) == 1
+    assert verify_db.scalar(select(func.count()).select_from(BrokerOrder)) == 0
+    assert verify_db.scalar(select(func.count()).select_from(ExecutionFill)) == 0
+    verify_db.close()
+    engine.dispose()
+
+
+def test_partial_target_absence_never_infers_zero_or_rewrites_proof(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings, engine, session_factory, db = _session()
+    position, _event = _bind_current_flat_for_refresh(
+        settings=settings,
+        db=db,
+        session_factory=session_factory,
+        monkeypatch=monkeypatch,
+    )
+    original_raw = dict(position.raw_payload)
+    original_reconciled_at = position.last_reconciled_at
+    adapter = KisKrxSnapshotAdapter(
+        [
+            _production_shaped_snapshot(
+                observed_at=NOW + timedelta(seconds=30),
+                holdings_complete=False,
+            )
+        ]
+    )
+
+    with pytest.raises(BrokerAdapterError, match="holdings coverage is incomplete"):
+        sync_execution_positions_from_broker_snapshot(
+            settings=settings,
+            db=db,
+            adapter=adapter,
+            symbols={TARGET_SYMBOL},
+            exchange="KRX",
+            authenticated_access_token="shared-kis-token",
+        )
+
+    rebound = db.get(ExecutionPosition, position.id)
+    assert rebound is not None
+    assert rebound.raw_payload == original_raw
+    assert rebound.last_reconciled_at == original_reconciled_at
+    assert rebound.quantity == 0
+    assert rebound.base_quantity == Decimal("0")
+    assert db.scalar(select(func.count()).select_from(RuntimeRemediationEvent)) == 1
+    assert db.scalar(select(func.count()).select_from(BrokerOrder)) == 0
+    assert db.scalar(select(func.count()).select_from(ExecutionFill)) == 0
+    assert len(adapter.snapshot_requests) == 1
+    db.close()
+    engine.dispose()
+
+
+def test_partial_target_open_order_supersedes_only_raw_flat_proof(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings, engine, session_factory, db = _session()
+    position, _event = _bind_current_flat_for_refresh(
+        settings=settings,
+        db=db,
+        session_factory=session_factory,
+        monkeypatch=monkeypatch,
+    )
+    original_reconciled_at = position.last_reconciled_at
+    partial_at = NOW + timedelta(seconds=30)
+    open_order = BrokerAccountOpenOrder(
+        broker_order_id="partial-target-order",
+        symbol=TARGET_SYMBOL,
+        side="buy",
+        status="open",
+        quantity=4,
+        remaining_quantity=4,
+        payload={"pdno": TARGET_SYMBOL, "odno": "partial-target-order"},
+    )
+    adapter = KisKrxSnapshotAdapter(
+        [
+            _production_shaped_snapshot(
+                observed_at=partial_at,
+                open_orders=[open_order],
+                raw_open_order_rows=[
+                    {
+                        "pdno": TARGET_SYMBOL,
+                        "odno": "partial-target-order",
+                        "ord_qty": "4",
+                        "rmn_qty": "4",
+                        "sll_buy_dvsn_cd": "02",
+                    }
+                ],
+                holdings_complete=False,
+            )
+        ]
+    )
+
+    with pytest.raises(BrokerAdapterError, match="holdings coverage is incomplete"):
+        sync_execution_positions_from_broker_snapshot(
+            settings=settings,
+            db=db,
+            adapter=adapter,
+            symbols={TARGET_SYMBOL},
+            exchange="KRX",
+            authenticated_access_token="shared-kis-token",
+        )
+
+    persisted_db = session_factory()
+    superseded = persisted_db.get(ExecutionPosition, position.id)
+    assert superseded is not None
+    assert superseded.quantity == 0
+    assert superseded.base_quantity == Decimal("0")
+    assert superseded.average_price is None
+    assert superseded.last_reconciled_at.replace(tzinfo=UTC) == (
+        original_reconciled_at.replace(tzinfo=UTC)
+    )
+    assert superseded.raw_payload["holdings_coverage"] == "incomplete"
+    assert superseded.raw_payload["open_orders"]["output1"][0]["pdno"] == (
+        TARGET_SYMBOL
+    )
+    assert set(superseded.raw_payload) != KIS_KRX_LEGACY_FLAT_REBIND_RAW_PROOF_FIELDS
+    assert persisted_db.scalar(
+        select(func.count()).select_from(RuntimeRemediationEvent)
+    ) == 1
+    assert persisted_db.scalar(select(func.count()).select_from(BrokerOrder)) == 0
+    assert persisted_db.scalar(select(func.count()).select_from(ExecutionFill)) == 0
+    assert len(adapter.snapshot_requests) == 1
+    persisted_db.close()
+    db.close()
+    engine.dispose()
+
+
+def test_kis_krx_flat_proof_refresh_rolls_stale_proof_forward_append_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings, engine, session_factory, db = _session()
+    position, bind_event = _bind_current_flat_for_refresh(
+        settings=settings,
+        db=db,
+        session_factory=session_factory,
+        monkeypatch=monkeypatch,
+    )
+    original_bind_summary = dict(bind_event.evidence_summary)
+    original_bind_occurred_at = bind_event.occurred_at
+    refresh_base = NOW + timedelta(minutes=20)
+    adapter = KisKrxSnapshotAdapter(
+        [
+            _snapshot(observed_at=refresh_base),
+            _snapshot(observed_at=refresh_base + timedelta(seconds=1)),
+            _snapshot(observed_at=refresh_base + timedelta(seconds=2)),
+        ]
+    )
+    monkeypatch.setattr(
+        remediation_service,
+        "_real_utc_now",
+        lambda: refresh_base + timedelta(seconds=3),
+    )
+
+    dry_run = remediation_service.analyze_kis_krx_canonical_flat_proof_refresh(
+        settings=settings,
+        db=db,
+        auth_session_factory=session_factory,
+        adapter=adapter,
+        symbol=TARGET_SYMBOL,
+        now=refresh_base,
+    )
+    item = dry_run["items"][0]
+    assert item["eligible"] is True
+    assert item["previous_proof_event_id"] == bind_event.id
+    assert item["previous_proof_candidate_key"] == position.id
+    assert item["previous_broker_snapshot_observed_at"] == NOW.isoformat()
+    assert len(item["evidence_fingerprint"]) == 64
+    approval = {position.id: item["evidence_fingerprint"]}
+
+    applied = remediation_service.apply_kis_krx_canonical_flat_proof_refresh(
+        settings=settings,
+        db=db,
+        auth_session_factory=session_factory,
+        adapter=adapter,
+        symbol=TARGET_SYMBOL,
+        approved_evidence=approval,
+        actor="codex",
+        reason="refresh stale broker-flat proof without rewriting history",
+        now=refresh_base + timedelta(seconds=1),
+    )
+
+    assert applied["summary"] == {
+        "approved_count": 1,
+        "refreshed_count": 1,
+        "idempotent_count": 0,
+        "broker_api_mutation_count": 0,
+    }
+    rebound = db.get(ExecutionPosition, position.id)
+    assert rebound is not None
+    assert rebound.provider == "kis"
+    assert rebound.quantity == 0
+    assert rebound.base_quantity == 0
+    assert rebound.average_price is None
+    assert rebound.updated_from == "reconciliation"
+    assert rebound.last_reconciled_at == refresh_base + timedelta(seconds=2)
+    assert set(rebound.raw_payload) == KIS_KRX_LEGACY_FLAT_REBIND_RAW_PROOF_FIELDS
+    assert rebound.raw_payload["snapshot_observed_at"] == (
+        refresh_base + timedelta(seconds=2)
+    ).isoformat()
+    events = db.scalars(
+        select(RuntimeRemediationEvent).order_by(
+            RuntimeRemediationEvent.occurred_at.asc()
+        )
+    ).all()
+    assert len(events) == 2
+    persisted_bind = db.get(RuntimeRemediationEvent, bind_event.id)
+    assert persisted_bind is not None
+    assert persisted_bind.evidence_summary == original_bind_summary
+    assert persisted_bind.occurred_at == original_bind_occurred_at
+    refresh_event = events[-1]
+    assert refresh_event.candidate_type == KIS_KRX_FLAT_PROOF_REFRESH_CANDIDATE_TYPE
+    assert refresh_event.outcome == KIS_KRX_FLAT_PROOF_REFRESH_OUTCOME
+    assert set(refresh_event.evidence_summary) == (
+        KIS_KRX_FLAT_PROOF_REFRESH_EVENT_PROOF_FIELDS
+    )
+    assert refresh_event.candidate_key == kis_krx_flat_proof_refresh_candidate_key(
+        position_id=position.id,
+        snapshot_observed_at=(refresh_base + timedelta(seconds=2)).isoformat(),
+        evidence_fingerprint=refresh_event.evidence_summary[
+            "evidence_fingerprint"
+        ],
+        refresh_approval_fingerprint=item["evidence_fingerprint"],
+    )
+    assert db.scalar(select(func.count()).select_from(BrokerOrder)) == 0
+    assert db.scalar(select(func.count()).select_from(ExecutionFill)) == 0
+
+    snapshot_count = len(adapter.snapshot_requests)
+    replay = remediation_service.apply_kis_krx_canonical_flat_proof_refresh(
+        settings=settings,
+        db=db,
+        auth_session_factory=session_factory,
+        adapter=adapter,
+        symbol=TARGET_SYMBOL,
+        approved_evidence=approval,
+        actor="codex",
+        reason="retry response-safe apply",
+        now=refresh_base + timedelta(seconds=4),
+    )
+    assert replay["summary"]["idempotent_count"] == 1
+    assert replay["summary"]["refreshed_count"] == 0
+    assert replay["generated_at"] == (refresh_base + timedelta(seconds=3)).isoformat()
+    assert replay["replayed_at"] == (refresh_base + timedelta(seconds=4)).isoformat()
+    assert replay["items"][0]["evidence_fingerprint"] == approval[position.id]
+    assert replay["items"][0]["broker_flat_evidence_fingerprint"] == (
+        refresh_event.evidence_summary["evidence_fingerprint"]
+    )
+    assert len(adapter.snapshot_requests) == snapshot_count
+    assert db.scalar(select(func.count()).select_from(RuntimeRemediationEvent)) == 2
+
+    next_adapter = KisKrxSnapshotAdapter(
+        [_snapshot(observed_at=refresh_base + timedelta(minutes=1))]
+    )
+    next_dry_run = (
+        remediation_service.analyze_kis_krx_canonical_flat_proof_refresh(
+            settings=settings,
+            db=db,
+            auth_session_factory=session_factory,
+            adapter=next_adapter,
+            symbol=TARGET_SYMBOL,
+            now=refresh_base + timedelta(minutes=1),
+        )
+    )
+    assert (
+        next_dry_run["items"][0]["evidence_fingerprint"]
+        != item["evidence_fingerprint"]
+    )
+    db.close()
+    engine.dispose()
+
+
+def test_kis_krx_flat_proof_refresh_blocks_post_lock_exposure_race(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings, engine, session_factory, db = _session()
+    position, _event = _bind_current_flat_for_refresh(
+        settings=settings,
+        db=db,
+        session_factory=session_factory,
+        monkeypatch=monkeypatch,
+    )
+    refresh_base = NOW + timedelta(minutes=20)
+    open_order = BrokerAccountOpenOrder(
+        broker_order_id="race-open-order",
+        symbol=TARGET_SYMBOL,
+        side="buy",
+        status="accepted",
+        quantity=1,
+        remaining_quantity=1,
+        payload={},
+    )
+    adapter = KisKrxSnapshotAdapter(
+        [
+            _snapshot(observed_at=refresh_base),
+            _snapshot(observed_at=refresh_base + timedelta(seconds=1)),
+            _snapshot(
+                observed_at=refresh_base + timedelta(seconds=2),
+                open_orders=[open_order],
+            ),
+        ]
+    )
+    monkeypatch.setattr(
+        remediation_service,
+        "_real_utc_now",
+        lambda: refresh_base + timedelta(seconds=3),
+    )
+    dry_run = remediation_service.analyze_kis_krx_canonical_flat_proof_refresh(
+        settings=settings,
+        db=db,
+        auth_session_factory=session_factory,
+        adapter=adapter,
+        symbol=TARGET_SYMBOL,
+        now=refresh_base,
+    )
+
+    with pytest.raises(
+        PositionIdentityConflictError,
+        match="changed after row locking",
+    ):
+        remediation_service.apply_kis_krx_canonical_flat_proof_refresh(
+            settings=settings,
+            db=db,
+            auth_session_factory=session_factory,
+            adapter=adapter,
+            symbol=TARGET_SYMBOL,
+            approved_evidence={
+                position.id: dry_run["items"][0]["evidence_fingerprint"]
+            },
+            actor="codex",
+            reason="race must fail closed",
+            now=refresh_base + timedelta(seconds=1),
+        )
+
+    db.refresh(position)
+    assert remediation_service._serialize_datetime(position.last_reconciled_at) == (
+        NOW.isoformat()
+    )
+    assert db.scalar(select(func.count()).select_from(RuntimeRemediationEvent)) == 1
+    assert db.scalar(select(func.count()).select_from(BrokerOrder)) == 0
+    assert db.scalar(select(func.count()).select_from(ExecutionFill)) == 0
+    db.close()
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("quantity", 1),
+        ("base_quantity", None),
+        ("average_price", Decimal("1")),
+        ("updated_from", "order_fill"),
+    ],
+)
+def test_kis_krx_flat_proof_refresh_rejects_canonical_row_drift_before_auth(
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: object,
+) -> None:
+    settings, engine, session_factory, db = _session()
+    position, _event = _bind_current_flat_for_refresh(
+        settings=settings,
+        db=db,
+        session_factory=session_factory,
+        monkeypatch=monkeypatch,
+    )
+    setattr(position, field, value)
+    db.commit()
+    adapter = KisKrxSnapshotAdapter(
+        [_snapshot(observed_at=NOW + timedelta(minutes=20))]
+    )
+    monkeypatch.setattr(
+        remediation_service,
+        "ensure_authenticated_broker_session",
+        lambda **kwargs: pytest.fail("tampered row attempted broker auth"),
+    )
+
+    with pytest.raises(
+        PositionIdentityConflictError,
+        match="intact canonical flat truth",
+    ):
+        remediation_service.analyze_kis_krx_canonical_flat_proof_refresh(
+            settings=settings,
+            db=db,
+            auth_session_factory=session_factory,
+            adapter=adapter,
+            symbol=TARGET_SYMBOL,
+            now=NOW + timedelta(minutes=20),
+        )
+
+    assert adapter.snapshot_requests == []
+    db.close()
+    engine.dispose()
+
+
+def test_kis_krx_flat_proof_refresh_rejects_stale_new_broker_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings, engine, session_factory, db = _session()
+    _position, _event = _bind_current_flat_for_refresh(
+        settings=settings,
+        db=db,
+        session_factory=session_factory,
+        monkeypatch=monkeypatch,
+    )
+    evaluated_at = NOW + timedelta(minutes=20)
+    adapter = KisKrxSnapshotAdapter(
+        [_snapshot(observed_at=evaluated_at - timedelta(minutes=6))]
+    )
+
+    with pytest.raises(BrokerAdapterError, match="snapshot is not current"):
+        remediation_service.analyze_kis_krx_canonical_flat_proof_refresh(
+            settings=settings,
+            db=db,
+            auth_session_factory=session_factory,
+            adapter=adapter,
+            symbol=TARGET_SYMBOL,
+            now=evaluated_at,
+        )
+
+    assert db.scalar(select(func.count()).select_from(RuntimeRemediationEvent)) == 1
+    db.close()
+    engine.dispose()
+
+
+def test_kis_krx_flat_proof_refresh_requires_newer_snapshot_generation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings, engine, session_factory, db = _session()
+    _position, _event = _bind_current_flat_for_refresh(
+        settings=settings,
+        db=db,
+        session_factory=session_factory,
+        monkeypatch=monkeypatch,
+    )
+    adapter = KisKrxSnapshotAdapter([_snapshot(observed_at=NOW)])
+
+    result = remediation_service.analyze_kis_krx_canonical_flat_proof_refresh(
+        settings=settings,
+        db=db,
+        auth_session_factory=session_factory,
+        adapter=adapter,
+        symbol=TARGET_SYMBOL,
+        now=NOW + timedelta(seconds=1),
+    )
+
+    assert result["items"][0]["eligible"] is False
+    assert result["items"][0]["reason"] == (
+        "broker_snapshot_not_newer_than_current_proof"
+    )
+    assert result["items"][0]["evidence_fingerprint"] is None
+    db.close()
+    engine.dispose()
+
+
+@pytest.mark.parametrize("tamper", ["candidate_key", "mutation_fact", "extra_field"])
+def test_kis_krx_flat_proof_refresh_rejects_tampered_source_event_before_auth(
+    monkeypatch: pytest.MonkeyPatch,
+    tamper: str,
+) -> None:
+    settings, engine, session_factory, db = _session()
+    _position, event = _bind_current_flat_for_refresh(
+        settings=settings,
+        db=db,
+        session_factory=session_factory,
+        monkeypatch=monkeypatch,
+    )
+    if tamper == "candidate_key":
+        event.candidate_key = "wrong-position"
+    elif tamper == "mutation_fact":
+        event.evidence_summary = {
+            **event.evidence_summary,
+            "orders_submitted": 1,
+        }
+    else:
+        event.evidence_summary = {
+            **event.evidence_summary,
+            "unexpected": True,
+        }
+    db.commit()
+    adapter = KisKrxSnapshotAdapter(
+        [_snapshot(observed_at=NOW + timedelta(minutes=20))]
+    )
+    monkeypatch.setattr(
+        remediation_service,
+        "ensure_authenticated_broker_session",
+        lambda **kwargs: pytest.fail("tampered event attempted broker auth"),
+    )
+
+    with pytest.raises(
+        PositionIdentityConflictError,
+        match="intact immutable proof event",
+    ):
+        remediation_service.analyze_kis_krx_canonical_flat_proof_refresh(
+            settings=settings,
+            db=db,
+            auth_session_factory=session_factory,
+            adapter=adapter,
+            symbol=TARGET_SYMBOL,
+            now=NOW + timedelta(minutes=20),
+        )
+
+    assert adapter.snapshot_requests == []
+    db.close()
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    ["missing_previous", "previous_candidate_key", "previous_fingerprint"],
+)
+def test_kis_krx_flat_proof_refresh_validates_previous_refresh_generation(
+    monkeypatch: pytest.MonkeyPatch,
+    tamper: str,
+) -> None:
+    settings, engine, session_factory, db = _session()
+    position, _bind_event = _bind_current_flat_for_refresh(
+        settings=settings,
+        db=db,
+        session_factory=session_factory,
+        monkeypatch=monkeypatch,
+    )
+    first_refresh = _apply_flat_proof_refresh_generation(
+        settings=settings,
+        db=db,
+        session_factory=session_factory,
+        monkeypatch=monkeypatch,
+        position=position,
+        observed_at=NOW + timedelta(minutes=20),
+    )
+    second_refresh = _apply_flat_proof_refresh_generation(
+        settings=settings,
+        db=db,
+        session_factory=session_factory,
+        monkeypatch=monkeypatch,
+        position=position,
+        observed_at=NOW + timedelta(minutes=21),
+    )
+    assert second_refresh.evidence_summary["previous_proof_event_id"] == (
+        first_refresh.id
+    )
+    if tamper == "missing_previous":
+        db.delete(first_refresh)
+    elif tamper == "previous_candidate_key":
+        first_refresh.candidate_key = "tampered-prior-generation"
+    else:
+        first_refresh.evidence_summary = {
+            **first_refresh.evidence_summary,
+            "evidence_fingerprint": "f" * 64,
+        }
+    db.commit()
+    adapter = KisKrxSnapshotAdapter(
+        [_snapshot(observed_at=NOW + timedelta(minutes=22))]
+    )
+    monkeypatch.setattr(
+        remediation_service,
+        "ensure_authenticated_broker_session",
+        lambda **kwargs: pytest.fail("invalid proof lineage attempted broker auth"),
+    )
+
+    with pytest.raises(
+        PositionIdentityConflictError,
+        match="flat proof refresh lineage is invalid",
+    ):
+        remediation_service.analyze_kis_krx_canonical_flat_proof_refresh(
+            settings=settings,
+            db=db,
+            auth_session_factory=session_factory,
+            adapter=adapter,
+            symbol=TARGET_SYMBOL,
+            now=NOW + timedelta(minutes=22),
+        )
+
+    assert adapter.snapshot_requests == []
+    db.close()
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    "root_tamper",
+    ["missing", "candidate_key", "fingerprint"],
+)
+def test_kis_krx_flat_proof_refresh_validates_full_lineage_to_bind_root(
+    monkeypatch: pytest.MonkeyPatch,
+    root_tamper: str,
+) -> None:
+    settings, engine, session_factory, db = _session()
+    position, bind_event = _bind_current_flat_for_refresh(
+        settings=settings,
+        db=db,
+        session_factory=session_factory,
+        monkeypatch=monkeypatch,
+    )
+    _apply_flat_proof_refresh_generation(
+        settings=settings,
+        db=db,
+        session_factory=session_factory,
+        monkeypatch=monkeypatch,
+        position=position,
+        observed_at=NOW + timedelta(minutes=20),
+    )
+    _apply_flat_proof_refresh_generation(
+        settings=settings,
+        db=db,
+        session_factory=session_factory,
+        monkeypatch=monkeypatch,
+        position=position,
+        observed_at=NOW + timedelta(minutes=21),
+    )
+    if root_tamper == "missing":
+        db.delete(bind_event)
+    elif root_tamper == "candidate_key":
+        bind_event.candidate_key = "tampered-bind-root"
+    else:
+        bind_event.evidence_summary = {
+            **bind_event.evidence_summary,
+            "evidence_fingerprint": "f" * 64,
+        }
+    db.commit()
+    adapter = KisKrxSnapshotAdapter(
+        [_snapshot(observed_at=NOW + timedelta(minutes=22))]
+    )
+    monkeypatch.setattr(
+        remediation_service,
+        "ensure_authenticated_broker_session",
+        lambda **kwargs: pytest.fail("invalid full lineage attempted broker auth"),
+    )
+
+    with pytest.raises(
+        PositionIdentityConflictError,
+        match="flat proof refresh lineage is invalid",
+    ):
+        remediation_service.analyze_kis_krx_canonical_flat_proof_refresh(
+            settings=settings,
+            db=db,
+            auth_session_factory=session_factory,
+            adapter=adapter,
+            symbol=TARGET_SYMBOL,
+            now=NOW + timedelta(minutes=22),
         )
 
     assert adapter.snapshot_requests == []

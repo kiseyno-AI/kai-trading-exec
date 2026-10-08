@@ -18,6 +18,15 @@ KIS_KRX_LEGACY_FLAT_REBIND_CANDIDATE_TYPE = (
     "kis_krx_legacy_flat_position_rebind"
 )
 KIS_KRX_LEGACY_FLAT_REBIND_OUTCOME = "current_flat_truth_bound"
+KIS_KRX_FLAT_PROOF_REFRESH_CANDIDATE_TYPE = (
+    "kis_krx_canonical_flat_proof_refresh"
+)
+KIS_KRX_FLAT_PROOF_REFRESH_OUTCOME = "current_flat_truth_refreshed"
+KIS_KRX_FLAT_PROOF_SOURCE_CANONICAL = "canonical_flat_proof"
+KIS_KRX_FLAT_PROOF_SOURCE_GENERIC_SYNC = (
+    "canonical_flat_generic_sync_supersede"
+)
+KIS_KRX_FLAT_PROOF_MAX_AGE_SECONDS = 300
 KIS_KRX_LEGACY_FLAT_REBIND_SAFETY_POLICY_VERSION = (
     "kis-krx-legacy-flat-position-rebind-v1"
 )
@@ -52,6 +61,18 @@ KIS_KRX_LEGACY_FLAT_REBIND_RAW_PROOF_FIELDS = frozenset(
         POSITION_IDENTITY_KEY,
     }
 )
+KIS_KRX_FLAT_PROOF_GENERIC_SYNC_RAW_FIELDS = frozenset(
+    {
+        "exchange",
+        "balance",
+        "open_orders",
+        "open_orders_error",
+        "holdings_coverage",
+        "open_orders_coverage",
+        "account_number_masked",
+        POSITION_IDENTITY_KEY,
+    }
+)
 KIS_KRX_LEGACY_FLAT_REBIND_EVENT_PROOF_FIELDS = frozenset(
     {
         "symbol",
@@ -73,6 +94,18 @@ KIS_KRX_LEGACY_FLAT_REBIND_EVENT_PROOF_FIELDS = frozenset(
         "historical_account_attributed",
         "current_flat_truth_bound",
         *KIS_KRX_LEGACY_FLAT_REBIND_ZERO_MUTATION_FIELDS,
+    }
+)
+KIS_KRX_FLAT_PROOF_REFRESH_EVENT_PROOF_FIELDS = frozenset(
+    {
+        *KIS_KRX_LEGACY_FLAT_REBIND_EVENT_PROOF_FIELDS,
+        "previous_proof_event_id",
+        "previous_proof_candidate_key",
+        "previous_broker_snapshot_observed_at",
+        "source_row_state",
+        "superseded_reconciliation_observed_at",
+        "superseded_payload_digest",
+        "refresh_approval_fingerprint",
     }
 )
 
@@ -201,6 +234,73 @@ def kis_krx_flat_evidence_fingerprint(
             absence_proof_digest=absence_proof_digest,
             configured_account_binding_digest=configured_account_binding_digest,
         )
+    )
+
+
+def kis_krx_flat_proof_refresh_approval_fingerprint(
+    *,
+    runtime_mode: str,
+    position_id: str,
+    symbol: str,
+    identity: PositionIdentity,
+    previous_proof_event_id: str,
+    previous_proof_candidate_key: str,
+    previous_snapshot_observed_at: str,
+    source_row_state: str,
+    superseded_reconciliation_observed_at: str | None,
+    superseded_payload_digest: str | None,
+    absence_proof_digest: str,
+    configured_account_binding_digest: str,
+) -> str:
+    """Bind one refresh approval to the exact prior durable proof generation."""
+    return _canonical_sha256(
+        {
+            "safety_policy_version": (
+                KIS_KRX_LEGACY_FLAT_REBIND_SAFETY_POLICY_VERSION
+            ),
+            "operation": "refresh_current_flat_truth",
+            "runtime_mode": runtime_mode,
+            "position_id": position_id,
+            "symbol": symbol,
+            "provider": identity.provider,
+            "account_scope": identity.account_scope,
+            "exchange": identity.exchange,
+            "previous_proof_event_id": previous_proof_event_id,
+            "previous_proof_candidate_key": previous_proof_candidate_key,
+            "previous_broker_snapshot_observed_at": (
+                previous_snapshot_observed_at
+            ),
+            "source_row_state": source_row_state,
+            "superseded_reconciliation_observed_at": (
+                superseded_reconciliation_observed_at
+            ),
+            "superseded_payload_digest": superseded_payload_digest,
+            "absence_proof_digest": absence_proof_digest,
+            "configured_account_binding_digest": (
+                configured_account_binding_digest
+            ),
+        }
+    )
+
+
+def kis_krx_flat_proof_refresh_candidate_key(
+    *,
+    position_id: str,
+    snapshot_observed_at: str,
+    evidence_fingerprint: str,
+    refresh_approval_fingerprint: str,
+) -> str:
+    """Return an immutable, generation-bound refresh-event identity."""
+    return _canonical_sha256(
+        {
+            "event_version": 1,
+            "candidate_type": KIS_KRX_FLAT_PROOF_REFRESH_CANDIDATE_TYPE,
+            "outcome": KIS_KRX_FLAT_PROOF_REFRESH_OUTCOME,
+            "position_id": position_id,
+            "snapshot_observed_at": snapshot_observed_at,
+            "evidence_fingerprint": evidence_fingerprint,
+            "refresh_approval_fingerprint": refresh_approval_fingerprint,
+        }
     )
 
 

@@ -42,7 +42,9 @@ from app.models.runtime import (
     RuntimeRemediationEvent,
     new_id,
 )
-from app.services.account_drawdown_recovery import snapshot_is_fresh_for_recovery
+from app.services.account_drawdown_recovery import (
+    snapshot_is_fresh_for_recovery,
+)
 from app.services.broker_auth import ensure_authenticated_broker_session
 from app.services.broker_order_state import (
     CAPITAL_RESERVING_ORDER_STATUSES,
@@ -68,6 +70,14 @@ from app.services.fill_idempotency import (
     execution_fill_idempotency_key,
 )
 from app.services.fifo_inventory import fifo_route_scope_from_order
+from app.services.kis_krx_flat_proof_validation import (
+    aware_iso_datetime as kis_krx_aware_iso_datetime,
+    canonical_flat_row_matches_latest_proof,
+    event_datetime as kis_krx_event_datetime,
+    generic_sync_snapshot_payload_proves_symbol_absent,
+    kis_krx_flat_proof_timestamp_is_fresh,
+    load_kis_krx_flat_proof_lineage,
+)
 from app.services.position_identity import (
     EXECUTION_SCOPE_POLICY_VERSION,
     PositionIdentity,
@@ -2819,7 +2829,38 @@ def sync_execution_positions_from_broker_snapshot(
         symbols=sorted(normalized_symbols) if normalized_symbols is not None else None,
         exchange=exchange,
     )
+    normalized_provider = str(adapter.provider or "").strip().lower()
     if not snapshot.holdings_complete:
+        partial_exposure = _supersede_kis_krx_flat_proof_from_partial_exposure(
+            settings=settings,
+            db=db,
+            snapshot=snapshot,
+            normalized_provider=normalized_provider,
+            requested_exchange=exchange,
+            symbols=normalized_symbols,
+        )
+        if partial_exposure["superseded_count"]:
+            if commit:
+                db.commit()
+            else:
+                db.flush()
+                return {
+                    "tracked_symbol_count": partial_exposure[
+                        "tracked_symbol_count"
+                    ],
+                    "created": 0,
+                    "updated": partial_exposure["positive_holding_count"],
+                    "zeroed": 0,
+                    "monitoring_recovered_count": 0,
+                    "partial_exposure_superseded_count": partial_exposure[
+                        "superseded_count"
+                    ],
+                    "holdings_complete": False,
+                    "execution_scope": partial_exposure["execution_scope"],
+                    "execution_scope_source": partial_exposure[
+                        "execution_scope_source"
+                    ],
+                }
         raise BrokerAdapterError(
             "broker account snapshot holdings coverage is incomplete; position sync blocked",
             status_code=502,
@@ -2827,7 +2868,6 @@ def sync_execution_positions_from_broker_snapshot(
             response_payload={"diagnostics": snapshot.diagnostics},
             observed_at=snapshot.observed_at,
         )
-    normalized_provider = str(adapter.provider or "").strip().lower()
     identity_exchange = _position_sync_identity_exchange(
         provider=normalized_provider,
         requested_exchange=exchange,
@@ -2950,12 +2990,38 @@ def sync_execution_positions_from_broker_snapshot(
         ):
             continue
         if holding is None:
+            if _preserve_fresh_kis_krx_flat_proof_during_sync(
+                settings=settings,
+                db=db,
+                adapter=adapter,
+                snapshot=snapshot,
+                position=position,
+                identity=position_identity,
+                symbol=symbol,
+                exchange=identity_exchange,
+                evaluated_at=_observation_time(),
+            ):
+                continue
             changed = False
             if position.quantity != 0:
                 position.quantity = 0
                 changed = True
-            if position.base_quantity is not None and position.base_quantity != 0:
+            if (
+                normalized_provider == "kis"
+                and identity_exchange == "KRX"
+                and position.base_quantity != Decimal("0")
+            ):
                 position.base_quantity = Decimal("0")
+                changed = True
+            elif position.base_quantity is not None and position.base_quantity != 0:
+                position.base_quantity = Decimal("0")
+                changed = True
+            if (
+                normalized_provider == "kis"
+                and identity_exchange == "KRX"
+                and position.average_price is not None
+            ):
+                position.average_price = None
                 changed = True
             if changed:
                 zeroed += 1
@@ -3049,6 +3115,251 @@ def sync_execution_positions_from_broker_snapshot(
         "execution_scope": execution_scope,
         "execution_scope_source": execution_scope_source,
     }
+
+
+def _supersede_kis_krx_flat_proof_from_partial_exposure(
+    *,
+    settings: Settings,
+    db: Session,
+    snapshot: BrokerAccountSnapshot,
+    normalized_provider: str,
+    requested_exchange: str,
+    symbols: set[str] | None,
+) -> dict[str, object]:
+    """Persist strong positive exposure without inferring absence from a partial scan."""
+    identity_exchange = _position_sync_identity_exchange(
+        provider=normalized_provider,
+        requested_exchange=requested_exchange,
+    )
+    empty_result: dict[str, object] = {
+        "tracked_symbol_count": 0,
+        "superseded_count": 0,
+        "positive_holding_count": 0,
+        "execution_scope": {
+            "policy_version": EXECUTION_SCOPE_POLICY_VERSION,
+            "provider": normalized_provider,
+            "account_scope": None,
+        },
+        "execution_scope_source": "configured_account_route",
+    }
+    if normalized_provider != "kis" or identity_exchange != "KRX":
+        return empty_result
+    identity = build_position_identity(
+        settings=settings,
+        provider=normalized_provider,
+        exchange=identity_exchange,
+        broker_account_id=snapshot.broker_account_id,
+    )
+    execution_scope = {
+        "policy_version": EXECUTION_SCOPE_POLICY_VERSION,
+        "provider": identity.provider,
+        "account_scope": identity.account_scope,
+    }
+    routed_holdings = _position_sync_holdings_for_route(
+        holdings=snapshot.holdings,
+        provider=normalized_provider,
+        exchange=identity_exchange,
+        observed_at=snapshot.observed_at,
+    )
+    positive_holdings_by_symbol: dict[str, BrokerAccountHolding] = {}
+    for holding in routed_holdings:
+        holding_base_quantity = _holding_base_quantity(holding.payload)
+        if (
+            holding_base_quantity is not None
+            and holding_base_quantity > 0
+        ) or (
+            holding_base_quantity is None
+            and holding.quantity > 0
+        ):
+            positive_holdings_by_symbol[holding.symbol] = holding
+    positive_open_order_symbols = {
+        str(order.symbol or "").strip().upper()
+        for order in snapshot.open_orders
+        if str(order.symbol or "").strip()
+        and (
+            order.remaining_quantity > 0
+            if order.remaining_quantity is not None
+            else order.quantity > 0
+        )
+    }
+    exposure_symbols = set(positive_holdings_by_symbol) | positive_open_order_symbols
+    if symbols is not None:
+        exposure_symbols &= symbols
+    if not exposure_symbols:
+        return {
+            **empty_result,
+            "execution_scope": execution_scope,
+            "execution_scope_source": (
+                "authenticated_broker_account"
+                if snapshot.broker_account_id
+                else "configured_account_route"
+            ),
+        }
+    holdings_by_symbol = {
+        symbol: holding
+        for symbol, holding in positive_holdings_by_symbol.items()
+        if symbol in exposure_symbols
+    }
+    positions = db.scalars(
+        select(ExecutionPosition)
+        .where(
+            ExecutionPosition.mode == settings.runtime_mode,
+            ExecutionPosition.symbol.in_(sorted(exposure_symbols)),
+        )
+        .order_by(ExecutionPosition.symbol.asc(), ExecutionPosition.id.asc())
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    ).all()
+    positions_by_symbol: dict[str, list[ExecutionPosition]] = {}
+    for position in positions:
+        positions_by_symbol.setdefault(position.symbol, []).append(position)
+
+    superseded_count = 0
+    positive_holding_count = 0
+    for symbol in sorted(exposure_symbols):
+        canonical_matches: list[ExecutionPosition] = []
+        for position in positions_by_symbol.get(symbol, []):
+            lineage = load_kis_krx_flat_proof_lineage(
+                settings=settings,
+                db=db,
+                position_id=position.id,
+                symbol=symbol,
+                identity=identity,
+                for_update=True,
+            )
+            if lineage is None:
+                continue
+            latest_event, latest_summary = lineage
+            proof_observed_at = kis_krx_aware_iso_datetime(
+                latest_summary.get("broker_snapshot_observed_at")
+            )
+            proof_occurred_at = kis_krx_event_datetime(latest_event.occurred_at)
+            if (
+                proof_observed_at is None
+                or proof_occurred_at is None
+                or _utc_naive(snapshot.observed_at)
+                <= max(
+                    _utc_naive(proof_observed_at),
+                    _utc_naive(proof_occurred_at),
+                )
+            ):
+                continue
+            if canonical_flat_row_matches_latest_proof(
+                settings=settings,
+                position=position,
+                symbol=symbol,
+                identity=identity,
+                latest_summary=latest_summary,
+            ):
+                canonical_matches.append(position)
+        if len(canonical_matches) != 1:
+            continue
+        position = canonical_matches[0]
+        holding = holdings_by_symbol.get(symbol)
+        if holding is not None:
+            holding_base_quantity = _holding_base_quantity(holding.payload)
+            position.quantity = (
+                0 if holding_base_quantity is not None else holding.quantity
+            )
+            position.base_quantity = holding_base_quantity
+            position.average_price = holding.average_price
+            position.updated_from = "reconciliation"
+            position.last_reconciled_at = snapshot.observed_at
+            positive_holding_count += 1
+        position.raw_payload = _position_snapshot_payload(
+            snapshot_payload=snapshot.payload,
+            holding=holding,
+            exchange=identity_exchange,
+            identity=identity,
+            prior_payload=position.raw_payload,
+        )
+        superseded_count += 1
+    return {
+        "tracked_symbol_count": len(exposure_symbols),
+        "superseded_count": superseded_count,
+        "positive_holding_count": positive_holding_count,
+        "execution_scope": execution_scope,
+        "execution_scope_source": (
+            "authenticated_broker_account"
+            if snapshot.broker_account_id
+            else "configured_account_route"
+        ),
+    }
+
+
+def _preserve_fresh_kis_krx_flat_proof_during_sync(
+    *,
+    settings: Settings,
+    db: Session,
+    adapter: BrokerAdapter,
+    snapshot: BrokerAccountSnapshot,
+    position: ExecutionPosition,
+    identity: PositionIdentity,
+    symbol: str,
+    exchange: str,
+    evaluated_at: datetime,
+) -> bool:
+    """Keep a still-consumable proof through a redundant complete flat sync.
+
+    Once the proof freshness window expires, or the new snapshot cannot prove
+    exact target absence, normal reconciliation intentionally supersedes it.
+    The consumer then fails closed until the audited refresh flow re-proves it.
+    """
+    if not (
+        str(adapter.provider or "").strip().lower() == "kis"
+        and exchange == "KRX"
+        and snapshot.source == "kis:account_snapshot"
+        and snapshot.holdings_complete is True
+        and snapshot.open_orders_complete is True
+        and generic_sync_snapshot_payload_proves_symbol_absent(
+            raw=(snapshot.payload if isinstance(snapshot.payload, dict) else {}),
+            symbol=symbol,
+        )
+        and all(
+            str(getattr(row, "symbol", "") or "").strip().upper() != symbol
+            for row in (*snapshot.holdings, *snapshot.open_orders)
+        )
+        and kis_krx_flat_proof_timestamp_is_fresh(
+            observed_at=snapshot.observed_at,
+            evaluated_at=evaluated_at,
+            settings=settings,
+        )
+    ):
+        return False
+    lineage = load_kis_krx_flat_proof_lineage(
+        settings=settings,
+        db=db,
+        position_id=position.id,
+        symbol=symbol,
+        identity=identity,
+        for_update=True,
+    )
+    if lineage is None:
+        return False
+    latest_event, latest_summary = lineage
+    proof_observed_at = kis_krx_aware_iso_datetime(
+        latest_summary.get("broker_snapshot_observed_at")
+    )
+    proof_occurred_at = kis_krx_event_datetime(latest_event.occurred_at)
+    return bool(
+        canonical_flat_row_matches_latest_proof(
+            settings=settings,
+            position=position,
+            symbol=symbol,
+            identity=identity,
+            latest_summary=latest_summary,
+        )
+        and kis_krx_flat_proof_timestamp_is_fresh(
+            observed_at=proof_observed_at,
+            evaluated_at=evaluated_at,
+            settings=settings,
+        )
+        and kis_krx_flat_proof_timestamp_is_fresh(
+            observed_at=proof_occurred_at,
+            evaluated_at=evaluated_at,
+            settings=settings,
+        )
+    )
 
 
 def _position_sync_identity_exchange(
