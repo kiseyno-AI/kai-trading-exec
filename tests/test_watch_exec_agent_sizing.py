@@ -39,6 +39,7 @@ from app.db.session import create_db_engine, create_session_factory
 from app.models.runtime import (
     BrokerOrder,
     BrokerOrderEvent,
+    ExecutionFill,
     ExecutionJob,
     ExecutionPlan,
     ExecutionPlanItem,
@@ -543,6 +544,288 @@ def test_terminal_entries_without_exposure_complete_plan_as_no_trade() -> None:
         engine.dispose()
 
 
+@pytest.mark.parametrize(
+    ("exposure_kind", "expected_completed"),
+    [
+        ("unlinked_open_order", False),
+        ("unlinked_open_sell", False),
+        ("unlinked_unknown_side", False),
+        ("unlinked_unknown_order", False),
+        ("unlinked_blank_venue", False),
+        ("unlinked_whitespace_venue", False),
+        ("unlinked_fill", False),
+        ("base_quantity_position", False),
+        ("safe_local_failure", True),
+        ("foreign_provider_order", True),
+        ("foreign_exchange_order", True),
+    ],
+)
+def test_no_trade_finalizer_uses_conservative_external_exposure_truth(
+    exposure_kind: str,
+    expected_completed: bool,
+) -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="live",
+        execution_position_account_scope="no-trade-exposure-account",
+        kis_account_number="12345678",
+        kis_account_product_code="01",
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    try:
+        with session_factory() as session:
+            entry = _watch_item(
+                item_id=f"entry-{exposure_kind}",
+                symbol="005930",
+                risk_context={"exchange": "KRX"},
+            )
+            entry.status = "exec_agent_rejected"
+            entry.source_plan_item_id = f"core-entry-{exposure_kind}"
+            entry.provider = "kis"
+            entry.venue = "KRX"
+            entry.asset_class = "stock"
+            entry.risk_context, entry.quantity_policy = bind_kis_account_route(
+                settings=settings,
+                provider="kis",
+                risk_context=entry.risk_context,
+                quantity_policy=entry.quantity_policy,
+            )
+            protective_exit = ExecutionPlanItem(
+                id=f"exit-{exposure_kind}",
+                plan_item_index=1,
+                symbol=entry.symbol,
+                side="sell",
+                intent="stop_sell",
+                status="stop_sell_pending_config",
+                quantity_policy={
+                    "type": "position_exit_from_entry",
+                    "linked_entry_item_key": entry.source_plan_item_id,
+                },
+                provider="kis",
+                venue="KRX",
+                asset_class="stock",
+            )
+            plan = ExecutionPlan(
+                id=f"plan-{exposure_kind}",
+                external_plan_id=f"plan-{exposure_kind}",
+                source="kai-trading-core",
+                mode="live",
+                status="accepted",
+                items=[entry, protective_exit],
+            )
+            session.add(plan)
+            session.flush()
+
+            if exposure_kind == "base_quantity_position":
+                identity = build_position_identity(
+                    settings=settings,
+                    provider="kis",
+                    exchange="KRX",
+                )
+                session.add(
+                    ExecutionPosition(
+                        mode="live",
+                        provider=identity.provider,
+                        account_scope=identity.account_scope,
+                        exchange=identity.exchange,
+                        symbol=entry.symbol,
+                        quantity=0,
+                        base_quantity=Decimal("0.5"),
+                        updated_from="broker_reconciliation",
+                    )
+                )
+            else:
+                order = BrokerOrder(
+                    execution_plan_item_id=None,
+                    broker_name=(
+                        "alpaca"
+                        if exposure_kind == "foreign_provider_order"
+                        else "kis"
+                    ),
+                    mode="live",
+                    idempotency_key=f"unlinked:{exposure_kind}",
+                    broker_order_id=(
+                        "external-123"
+                        if exposure_kind
+                        in {
+                            "unlinked_open_order",
+                            "unlinked_open_sell",
+                            "unlinked_unknown_side",
+                            "unlinked_unknown_order",
+                            "unlinked_blank_venue",
+                            "unlinked_whitespace_venue",
+                            "foreign_provider_order",
+                            "foreign_exchange_order",
+                        }
+                        else None
+                    ),
+                    symbol=entry.symbol,
+                    side=(
+                        "sell"
+                        if exposure_kind == "unlinked_open_sell"
+                        else "mystery"
+                        if exposure_kind == "unlinked_unknown_side"
+                        else "buy"
+                    ),
+                    status=(
+                        "open"
+                        if exposure_kind
+                        in {
+                            "unlinked_open_order",
+                            "unlinked_open_sell",
+                            "unlinked_unknown_side",
+                            "unlinked_blank_venue",
+                            "unlinked_whitespace_venue",
+                            "foreign_provider_order",
+                            "foreign_exchange_order",
+                        }
+                        else "mystery"
+                        if exposure_kind == "unlinked_unknown_order"
+                        else "failed"
+                    ),
+                    quantity=1,
+                    venue=(
+                        "NASDAQ"
+                        if exposure_kind == "foreign_exchange_order"
+                        else ""
+                        if exposure_kind == "unlinked_blank_venue"
+                        else "   "
+                        if exposure_kind == "unlinked_whitespace_venue"
+                        else "KRX"
+                    ),
+                )
+                session.add(order)
+                session.flush()
+                if exposure_kind == "unlinked_fill":
+                    session.add(
+                        ExecutionFill(
+                            broker_order_pk=order.id,
+                            broker_fill_id="unlinked-finalizer-fill",
+                            symbol=entry.symbol,
+                            side="buy",
+                            quantity=1,
+                            price=Decimal("71000"),
+                            filled_at=datetime(2026, 9, 9, 23, 35, tzinfo=UTC),
+                        )
+                    )
+            session.flush()
+
+            result = watch_sizing.finalize_completed_no_trade_plan(
+                db=session,
+                settings=settings,
+                plan=plan,
+            )
+
+            assert result["completed"] is expected_completed
+            assert plan.status == (
+                "completed_no_trade" if expected_completed else "accepted"
+            )
+            assert protective_exit.status == (
+                "not_applicable"
+                if expected_completed
+                else "stop_sell_pending_config"
+            )
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.parametrize(
+    "scope_case",
+    ["missing_binding", "mismatched_binding", "rotated_account"],
+)
+def test_no_trade_finalizer_requires_proven_execution_scope(
+    scope_case: str,
+) -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="live",
+        kis_account_number="12345678",
+        kis_account_product_code="01",
+        account_drawdown_recovery_scope_secret=(
+            "no-trade-finalizer-scope-secret-at-least-32-bytes"
+        ),
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    try:
+        with session_factory() as session:
+            entry = _watch_item(
+                item_id=f"entry-scope-{scope_case}",
+                symbol="005930",
+                risk_context={"exchange": "KRX"},
+            )
+            entry.status = "exec_agent_rejected"
+            entry.source_plan_item_id = f"core-entry-scope-{scope_case}"
+            entry.provider = "kis"
+            entry.venue = "KRX"
+            entry.asset_class = "stock"
+            entry.risk_context, entry.quantity_policy = bind_kis_account_route(
+                settings=settings,
+                provider="kis",
+                risk_context=entry.risk_context,
+                quantity_policy=entry.quantity_policy,
+            )
+            if scope_case == "missing_binding":
+                entry.risk_context.pop("execution_account_route")
+                entry.quantity_policy.pop("execution_account_route", None)
+            elif scope_case == "mismatched_binding":
+                mismatched = dict(entry.risk_context["execution_account_route"])
+                mismatched["provider"] = "alpaca"
+                entry.risk_context["execution_account_route"] = mismatched
+                entry.quantity_policy["execution_account_route"] = mismatched
+            call_settings = settings
+            if scope_case == "rotated_account":
+                call_settings = Settings(
+                    database_url="sqlite:///:memory:",
+                    runtime_mode="live",
+                    kis_account_number="87654321",
+                    kis_account_product_code="01",
+                    account_drawdown_recovery_scope_secret=(
+                        "no-trade-finalizer-scope-secret-at-least-32-bytes"
+                    ),
+                )
+            protective_exit = ExecutionPlanItem(
+                id=f"exit-scope-{scope_case}",
+                plan_item_index=1,
+                symbol=entry.symbol,
+                side="sell",
+                intent="stop_sell",
+                status="stop_sell_pending_config",
+                quantity_policy={
+                    "type": "position_exit_from_entry",
+                    "linked_entry_item_key": entry.source_plan_item_id,
+                },
+                provider="kis",
+                venue="KRX",
+                asset_class="stock",
+            )
+            plan = ExecutionPlan(
+                id=f"plan-scope-{scope_case}",
+                external_plan_id=f"plan-scope-{scope_case}",
+                source="kai-trading-core",
+                mode="live",
+                status="accepted",
+                items=[entry, protective_exit],
+            )
+            session.add(plan)
+            session.flush()
+
+            result = watch_sizing.finalize_completed_no_trade_plan(
+                db=session,
+                settings=call_settings,
+                plan=plan,
+            )
+
+            assert result["completed"] is False
+            assert plan.status == "accepted"
+            assert protective_exit.status == "stop_sell_pending_config"
+    finally:
+        engine.dispose()
+
+
 def test_runtime_metrics_expose_no_trade_retry_and_reason_families() -> None:
     settings = Settings(database_url="sqlite:///:memory:", runtime_mode="live")
     engine = create_db_engine(settings)
@@ -550,13 +833,21 @@ def test_runtime_metrics_expose_no_trade_retry_and_reason_families() -> None:
     session_factory = create_session_factory(engine)
     try:
         with session_factory() as session:
-            terminal = _watch_item(item_id="terminal-entry", risk_context={})
+            current_market_date = datetime.now(ZoneInfo("Asia/Seoul")).date()
+            terminal = _watch_item(
+                item_id="terminal-entry",
+                risk_context={
+                    watch_sizing.WATCH_EXEC_AGENT_DEFER_KEY: {
+                        "reason_family": "stale_defer_must_not_win",
+                        "disposition": "defer",
+                    },
+                },
+            )
             terminal.status = "exec_agent_rejected"
             terminal.quantity_policy = {
                 "kind": "exec_agent_rejected",
                 "source": "exec_agent_watch_sizing",
                 "reason_family": "reward_risk",
-                "rejection_disposition": "terminal",
             }
             deferred = _watch_item(
                 item_id="retry-entry",
@@ -570,6 +861,12 @@ def test_runtime_metrics_expose_no_trade_retry_and_reason_families() -> None:
                     "disposition": "retry",
                 },
             }
+            quarantined = _watch_item(
+                item_id="quarantined-entry",
+                symbol="035420",
+                risk_context={},
+            )
+            quarantined.status = "contract_quarantined"
             session.add_all(
                 [
                     ExecutionPlan(
@@ -577,6 +874,7 @@ def test_runtime_metrics_expose_no_trade_retry_and_reason_families() -> None:
                         external_plan_id="no-trade-plan",
                         source="kai-trading-core",
                         mode="live",
+                        market_date=current_market_date,
                         status="completed_no_trade",
                         items=[terminal],
                     ),
@@ -585,8 +883,18 @@ def test_runtime_metrics_expose_no_trade_retry_and_reason_families() -> None:
                         external_plan_id="retry-plan",
                         source="kai-trading-core",
                         mode="live",
+                        market_date=current_market_date,
                         status="accepted",
                         items=[deferred],
+                    ),
+                    ExecutionPlan(
+                        id="quarantined-plan",
+                        external_plan_id="quarantined-plan",
+                        source="kai-trading-core",
+                        mode="live",
+                        market_date=current_market_date,
+                        status="contract_quarantined",
+                        items=[quarantined],
                     ),
                 ]
             )
@@ -601,6 +909,12 @@ def test_runtime_metrics_expose_no_trade_retry_and_reason_families() -> None:
                     "account_snapshot": 1,
                     "reward_risk": 1,
                 },
+                "current_market_date": current_market_date.isoformat(),
+                "current_contract_quarantines": 1,
+                "current_contract_quarantine_symbols": ["035420"],
+                "current_terminal_rejection_symbols": ["005930"],
+                "current_pending_retry_symbols": ["000660"],
+                "current_pending_deferral_symbols": [],
             }
             assert runtime_execution_decision_metrics(
                 settings=settings,
@@ -612,6 +926,19 @@ def test_runtime_metrics_expose_no_trade_retry_and_reason_families() -> None:
                 db=session,
             )
             assert status["execution_decisions"] == expected_metrics
+            alerts = {
+                alert["kind"]: alert
+                for alert in status["actionable_alerts"]["alerts"]
+            }
+            assert alerts["current_execution_contract_quarantined"]["symbols"] == [
+                "035420"
+            ]
+            assert alerts["current_execution_decisions_rejected"]["symbols"] == [
+                "005930"
+            ]
+            assert alerts["current_execution_decisions_deferred"]["symbols"] == [
+                "000660"
+            ]
     finally:
         engine.dispose()
 
@@ -693,6 +1020,116 @@ def _next_open_watch_item(
         risk_context=risk_context,
         decision_agent_name="signal-decider",
     )
+
+
+@pytest.mark.parametrize(
+    "decision_source",
+    ["openclaw_exec_agent_watch_sizing", "watch_exec_agent_sizing"],
+)
+def test_canonical_terminal_rejection_removes_all_executable_sizing(
+    decision_source: str,
+) -> None:
+    item = _watch_item(
+        item_id="canonical-terminal-reject",
+        risk_context={
+            "target_price": "76000",
+            "stop_price": "69000",
+            watch_sizing.WATCH_EXEC_AGENT_DEFER_KEY: {
+                "disposition": "defer",
+                "retry_after": "2026-10-07T15:00:00+00:00",
+            },
+        },
+    )
+    previous_policy = deepcopy(item.quantity_policy)
+    proposed = {
+        "source": decision_source,
+        "action": "approve",
+        "decision": "approved",
+        "execution_plan_item_id": item.id,
+        "symbol": item.symbol,
+        "quantity": 17,
+        "approved_quantity": 17,
+        "approved_notional_krw": "1215500.0000",
+        "sizing_price": "71500.0000",
+        "reference_price": "71500.0000",
+        "confidence": 0.91,
+        "target_profile": "short_swing",
+        "target_tag": "target_profile:short_swing",
+        "decided_at": "2026-10-07T12:00:00+00:00",
+    }
+
+    final_record, policy = watch_sizing._canonical_terminal_rejection(
+        item=item,
+        record=proposed,
+        previous_policy=previous_policy,
+        reason_code="allowed_action_envelope_blocked",
+        reason_family="action_envelope",
+        reason="deterministic envelope blocked the proposal",
+        audit_event_type="watch_exec_agent_sizing_decision",
+    )
+
+    assert final_record["source"] == decision_source
+    assert final_record["action"] == "reject"
+    assert final_record["decision"] == "rejected"
+    assert final_record["quantity"] == 0
+    assert final_record["approved_quantity"] == 0
+    assert final_record["approved_notional_krw"] is None
+    assert final_record["sizing_price"] is None
+    assert final_record["reference_price"] is None
+    assert final_record["confidence"] is None
+    assert final_record["target_profile"] is None
+    assert final_record["target_tag"] is None
+    assert final_record["rejection_disposition"] == "terminal"
+    assert set(policy) == {
+        "kind",
+        "source",
+        "reason",
+        "reason_code",
+        "reason_family",
+        "rejection_disposition",
+        "exec_agent_decision",
+        "short_term_exec_agent_decision",
+        "exec_agent_decision_audit",
+        "previous_policy",
+    }
+    assert policy["previous_policy"] == previous_policy
+    assert policy["exec_agent_decision"] == policy["short_term_exec_agent_decision"]
+    assert policy["exec_agent_decision"]["quantity"] == 0
+    assert policy["exec_agent_decision"]["approved_quantity"] == 0
+    assert policy["exec_agent_decision"]["approved_notional_krw"] is None
+    assert watch_sizing.WATCH_EXEC_AGENT_DEFER_KEY not in item.risk_context
+
+
+def _assert_canonical_terminal_rejection_policy(
+    policy: dict[str, object],
+    *,
+    reason_code: str,
+) -> None:
+    assert set(policy) == {
+        "kind",
+        "source",
+        "reason",
+        "reason_code",
+        "reason_family",
+        "rejection_disposition",
+        "exec_agent_decision",
+        "short_term_exec_agent_decision",
+        "exec_agent_decision_audit",
+        "previous_policy",
+    }
+    assert policy["kind"] == "exec_agent_rejected"
+    assert policy["source"] == "exec_agent_watch_sizing"
+    assert policy["reason_code"] == reason_code
+    assert policy["rejection_disposition"] == "terminal"
+    decision = policy["exec_agent_decision"]
+    assert isinstance(decision, dict)
+    assert decision == policy["short_term_exec_agent_decision"]
+    assert decision["action"] == "reject"
+    assert decision["decision"] == "rejected"
+    assert decision["quantity"] == 0
+    assert decision["approved_quantity"] == 0
+    assert decision["approved_notional_krw"] is None
+    assert decision["sizing_price"] is None
 
 
 def test_next_open_sizing_treats_kind_alias_as_pre_monitor_delegation() -> None:
@@ -899,6 +1336,28 @@ def _resolve_live_watch_veto(
     finally:
         session.close()
         engine.dispose()
+
+
+def test_live_watch_buy_rejects_reported_unverified_watch_approval() -> None:
+    approval, audit_summary, audit_payload = _resolve_live_watch_veto(
+        settings=_watch_veto_settings(),
+        risk_context={},
+        price=_price(),
+        quantity_policy={
+            "kind": "shares",
+            "quantity": 10,
+            "source": "exec_agent_watch_sizing",
+            "approval_provenance": {
+                "kind": "reported_unverified_exec_agent_watch_sizing",
+                "runtime": {"actual_agent_id": None},
+            },
+        },
+    )
+
+    assert approval.quantity is None
+    assert approval.reason == "unverified_exec_agent_sizing"
+    assert audit_summary is None
+    assert audit_payload is None
 
 
 def test_watch_sizing_treats_decimal_string_share_quantity_as_sized() -> None:
@@ -1616,12 +2075,15 @@ def test_stale_open_order_unknown_broker_status_blocks_watch_sizing_before_agent
                 ExecutionPlanItemAudit.event_type == "watch_exec_agent_sizing_stale_state_blocked"
             )
         )
+        audit_payload = audit.payload if audit is not None else None
 
     assert broker.events.index("reconcile") < broker.events.index("snapshot")
     assert result.payload["applied"][0]["stale_state_blocked_item_ids"] == ["watch-item-stale"]
     assert item.status == "exec_agent_rejected"
-    assert item.quantity_policy["exec_agent_decision"]["reason_code"] == "stale_order_broker_truth_unconfirmed"
-    assert item.quantity_policy["stale_state_blockers"][0]["classification"] == "stale-terminal-unknown"
+    _assert_canonical_terminal_rejection_policy(
+        item.quantity_policy,
+        reason_code="stale_order_broker_truth_unconfirmed",
+    )
     assert order.status == "stale_terminal_unknown"
     assert order.last_error_classification == "unknown_status"
     assert unknown_event.payload["raw_status_details"] == {
@@ -1631,6 +2093,9 @@ def test_stale_open_order_unknown_broker_status_blocks_watch_sizing_before_agent
         "observed_at": "2026-06-04T00:00:00+00:00",
     }
     assert audit is not None
+    assert audit_payload["stale_state_blockers"][0]["classification"] == (
+        "stale-terminal-unknown"
+    )
     engine.dispose()
 
 
@@ -1699,12 +2164,19 @@ def test_stale_open_order_block_survives_account_snapshot_failure(tmp_path, monk
                 ExecutionPlanItemAudit.event_type == "watch_exec_agent_sizing_stale_state_blocked"
             )
         )
+        audit_payload = audit.payload if audit is not None else None
 
     assert broker.events.index("reconcile") < broker.events.index("snapshot")
     assert result.payload["applied"][0]["stale_state_blocked_item_ids"] == ["watch-item-snapshot-fail"]
     assert item.status == "exec_agent_rejected"
-    assert item.quantity_policy["stale_state_blockers"][0]["classification"] == "stale-terminal-unknown"
+    _assert_canonical_terminal_rejection_policy(
+        item.quantity_policy,
+        reason_code="stale_order_broker_truth_unconfirmed",
+    )
     assert audit is not None
+    assert audit_payload["stale_state_blockers"][0]["classification"] == (
+        "stale-terminal-unknown"
+    )
     engine.dispose()
 
 
@@ -2283,6 +2755,11 @@ def test_apply_decisions_allows_small_agent_probe_below_min_notional() -> None:
                     risk_context={
                     "target_price": "78000",
                     "stop_price": "49000",
+                    watch_sizing.WATCH_EXEC_AGENT_DEFER_KEY: {
+                        "reason_family": "reward_risk",
+                        "disposition": "defer",
+                        "retry_after": "2026-06-03T23:00:00+00:00",
+                    },
                     "execution_feasibility_context": {
                         "max_safe_notional_krw": "5000000",
                         "liquidity_tier": "high",
@@ -2334,6 +2811,7 @@ def test_apply_decisions_allows_small_agent_probe_below_min_notional() -> None:
     assert policy["sizing_adjustment"]["final_notional"] == "151500.0000"
     assert policy["sizing_adjustment"]["decision"] == "submit"
     assert policy["sizing_adjustment"]["min_notional_upsize_suppressed"] is True
+    assert watch_sizing.WATCH_EXEC_AGENT_DEFER_KEY not in plan.items[0].risk_context
 
 
 def test_apply_decisions_allows_when_order_lot_minimum_exceeds_agent_cap() -> None:
@@ -2593,7 +3071,10 @@ def test_apply_decisions_rejects_when_allowed_action_envelope_has_no_quantity() 
     assert summary["approved"] == 0
     assert summary["rejected"] == 1
     assert plan.items[0].status == "exec_agent_rejected"
-    assert plan.items[0].quantity_policy["allowed_action_envelope"]["max_quantity"] == 0
+    _assert_canonical_terminal_rejection_policy(
+        plan.items[0].quantity_policy,
+        reason_code="allowed_action_envelope_blocked",
+    )
 
 
 def test_apply_decisions_rejects_when_allowed_action_envelope_has_hard_reject_reason() -> None:
@@ -2648,7 +3129,10 @@ def test_apply_decisions_rejects_when_allowed_action_envelope_has_hard_reject_re
     assert summary["rejected"] == 1
     assert plan.items[0].status == "exec_agent_rejected"
     assert policy["reason_code"] == "allowed_action_envelope_blocked"
-    assert "existing_holding" in policy["allowed_action_envelope"]["hard_reject_reasons"]
+    _assert_canonical_terminal_rejection_policy(
+        policy,
+        reason_code="allowed_action_envelope_blocked",
+    )
     assert "existing_holding" in policy["reason"]
 
 
@@ -2714,8 +3198,106 @@ def test_apply_decisions_rejects_when_allowed_action_envelope_disallows_buy_down
     assert summary["rejected"] == 1
     assert plan.items[0].status == "exec_agent_rejected"
     assert policy["reason_code"] == "allowed_action_envelope_blocked"
-    assert policy["allowed_action_envelope"]["max_quantity"] == 5
+    _assert_canonical_terminal_rejection_policy(
+        policy,
+        reason_code="allowed_action_envelope_blocked",
+    )
     assert policy["reason"] == "allowed action envelope disallows buy/downsize approval"
+
+
+@pytest.mark.parametrize(
+    "terminal_path",
+    ["sizing_skip", "zero_quantity", "agent_terminal"],
+)
+def test_apply_decisions_canonicalizes_every_terminal_rejection_path(
+    terminal_path: str,
+    monkeypatch,
+) -> None:
+    settings = Settings(runtime_mode="live")
+    item = _watch_item(
+        item_id=f"terminal-{terminal_path}",
+        risk_context={"target_price": "76000", "stop_price": "69000"},
+    )
+    plan = ExecutionPlan(
+        id=f"plan-{terminal_path}",
+        external_plan_id=f"plan-{terminal_path}",
+        source="core-short-term-decider",
+        market_date=date(2026, 6, 4),
+        mode="live",
+        items=[item],
+    )
+
+    monkeypatch.setattr(
+        watch_sizing,
+        "_allowed_action_envelope_for_item",
+        lambda **_: {
+            "allowed_actions": ["buy", "downsize", "reject"],
+            "max_quantity": 3,
+            "max_notional_krw": "214500.0000",
+            "hard_reject_reasons": [],
+            "soft_warnings": [],
+        },
+    )
+    if terminal_path in {"sizing_skip", "zero_quantity"}:
+        monkeypatch.setattr(
+            watch_sizing,
+            "_adjust_approved_watch_quantity",
+            lambda **_: {
+                "decision": "skip" if terminal_path == "sizing_skip" else "submit",
+                "reason_code": "minimum_notional_unreachable",
+                "reason": "deterministic sizing left no executable quantity",
+                "quantity": 0,
+                "approved_notional": Decimal("0"),
+                "sizing_price": Decimal("71500"),
+                "adjustment": {
+                    "agent_approved_quantity": 3,
+                    "agent_approved_notional": "214500.0000",
+                    "final_quantity": 0,
+                    "final_notional": "0.0000",
+                },
+            },
+        )
+
+    action = "reject" if terminal_path == "agent_terminal" else "approve"
+    summary = _apply_decisions(
+        db=None,  # type: ignore[arg-type]
+        settings=settings,
+        plan=plan,
+        account_context=_fresh_account_context(),
+        request_payload=_DIRECT_APPLY_REQUEST_PAYLOAD,
+        expected_item_ids={item.id},
+        decision_payload={
+            "version": "manual-exec-agent-watch-sizing-v1",
+            "_runtime_provenance": _verified_sizing_runtime(settings),
+            "decisions": [
+                {
+                    "execution_plan_item_id": item.id,
+                    "symbol": item.symbol,
+                    "action": action,
+                    "quantity": 3,
+                    "approved_notional_krw": "214500.0000",
+                    "sizing_price": "71500",
+                    "confidence": 0.9,
+                    "target_profile": "short_swing",
+                    "reason_code": "minimum_notional_unreachable",
+                    "reason": "proposal must not survive a terminal rejection",
+                }
+            ],
+        },
+    )
+
+    assert summary["approved"] == 0
+    assert summary["rejected"] == 1
+    assert item.status == "exec_agent_rejected"
+    expected_reason_code = (
+        "allowed_action_envelope_blocked"
+        if terminal_path == "zero_quantity"
+        else "minimum_notional_unreachable"
+    )
+    _assert_canonical_terminal_rejection_policy(
+        item.quantity_policy,
+        reason_code=expected_reason_code,
+    )
 
 
 def test_applicable_decision_ids_only_counts_expected_candidates() -> None:
@@ -3395,12 +3977,14 @@ def test_watch_sizing_quarantines_candidates_for_a_different_broker_provider(
         persisted_alpaca = session.get(ExecutionPlanItem, "watch-provider-alpaca")
         assert persisted_alpaca is not None
         assert persisted_alpaca.status == "exec_agent_rejected"
-        assert persisted_alpaca.quantity_policy["type"] == "exec_agent_sized"
         persisted_kis_us = session.get(ExecutionPlanItem, "watch-provider-kis-us")
         assert persisted_kis_us is not None
         assert persisted_kis_us.status == "exec_agent_rejected"
         for persisted in (persisted_alpaca, persisted_kis_us):
-            assert persisted.quantity_policy["type"] == "exec_agent_sized"
+            _assert_canonical_terminal_rejection_policy(
+                persisted.quantity_policy,
+                reason_code="watch_exec_agent_sizing_route_unsupported",
+            )
             audit = session.scalar(
                 select(ExecutionPlanItemAudit).where(
                     ExecutionPlanItemAudit.execution_plan_item_id == persisted.id,
@@ -4818,10 +5402,11 @@ def test_apply_decisions_reserves_cash_between_approvals_in_the_same_response(
         item for item in plan.items if item.status == "exec_agent_rejected"
     ]
     assert len(rejected_items) == expected_rejected
-    assert all(
-        item.quantity_policy["allowed_action_envelope"]["max_quantity"] == 0
-        for item in rejected_items
-    )
+    for item in rejected_items:
+        _assert_canonical_terminal_rejection_policy(
+            item.quantity_policy,
+            reason_code="allowed_action_envelope_blocked",
+        )
     approved_items = [
         item for item in plan.items if item.status == "watch_monitoring_active"
     ]
@@ -5568,11 +6153,22 @@ def test_next_open_sizing_quarantines_a_candidate_bound_to_another_account(
     ]
     with session_factory() as db:
         persisted = db.get(ExecutionPlanItem, item.id)
+        persisted_plan = db.scalar(select(ExecutionPlan))
         assert persisted is not None
+        assert persisted_plan is not None
         assert persisted.status == "exec_agent_rejected"
         assert persisted.risk_context["watch_exec_agent_account_route_guard"][
             "reason_code"
         ] == "account_route_mismatch"
+        _assert_canonical_terminal_rejection_policy(
+            persisted.quantity_policy,
+            reason_code="account_route_mismatch",
+        )
+        # The active settings no longer prove the persisted account scope, so
+        # the finalizer must not claim that this foreign-route family has no
+        # exposure.
+        assert persisted_plan.status == "accepted"
+        assert result.payload["applied"][0]["no_trade"]["completed"] is False
     engine.dispose()
 
 
@@ -5621,8 +6217,40 @@ def test_next_open_approval_at_market_open_is_terminal_without_a_job() -> None:
     assert summary["approved"] == 0
     assert summary["rejected"] == 1
     assert plan.items[0].status == "next_open_buy_expired"
-    assert plan.items[0].quantity_policy["reason_code"] == "missed_next_open_window"
+    _assert_canonical_terminal_rejection_policy(
+        plan.items[0].quantity_policy,
+        reason_code="missed_next_open_window",
+    )
     assert plan.items[0].jobs == []
+
+
+def test_due_next_open_expiry_uses_canonical_terminal_rejection() -> None:
+    item = _next_open_watch_item(item_id="next-open-expiry")
+    plan = ExecutionPlan(
+        id="plan-next-open-expiry",
+        external_plan_id="plan-next-open-expiry",
+        source="core-signal-decider",
+        market_date=date(2026, 6, 4),
+        mode="paper",
+        items=[item],
+    )
+
+    summary = watch_sizing._expire_missed_next_open_items(
+        db=None,
+        plan=plan,
+        now=datetime(2026, 6, 4, 0, 0, tzinfo=UTC),
+    )
+
+    assert summary["rejected"] == 1
+    assert summary["missed_next_open_item_ids"] == [item.id]
+    assert item.status == "next_open_buy_expired"
+    _assert_canonical_terminal_rejection_policy(
+        item.quantity_policy,
+        reason_code="missed_next_open_window",
+    )
+    assert item.quantity_policy["exec_agent_decision"]["source"] == (
+        "watch_exec_agent_sizing"
+    )
 
 
 def test_next_open_approval_without_runtime_provenance_is_rejected_preopen() -> None:
@@ -5748,7 +6376,92 @@ def test_live_intraday_watch_approval_requires_exact_runtime_provenance(
     assert plan.items[0].status == "exec_agent_rejected"
     decision = plan.items[0].quantity_policy["exec_agent_decision"]
     assert decision["reason_code"] == "unverified_exec_agent_runtime"
+    assert decision["quantity"] == 0
+    assert decision["approved_quantity"] == 0
+    assert decision["approved_notional_krw"] is None
+    assert decision["sizing_price"] is None
     assert plan.items[0].jobs == []
+
+
+def test_unverified_approval_keeps_proposed_sizing_only_in_the_audit(tmp_path) -> None:
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'unverified-approval-audit.db'}",
+        runtime_mode="paper",
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    try:
+        with session_factory() as db:
+            item = _watch_item(
+                item_id="unverified-approval-audit-item",
+                risk_context={"target_price": "78000", "stop_price": "69000"},
+            )
+            plan = ExecutionPlan(
+                external_plan_id="unverified-approval-audit-plan",
+                source="kai-trading-core",
+                mode="paper",
+                items=[item],
+            )
+            db.add(plan)
+            db.flush()
+
+            summary = _apply_decisions(
+                db=db,
+                settings=settings,
+                plan=plan,
+                decision_payload={
+                    "version": "manual-exec-agent-watch-sizing-v1",
+                    "plan_id": plan.external_plan_id,
+                    "decisions": [
+                        {
+                            "execution_plan_item_id": item.id,
+                            "symbol": item.symbol,
+                            "action": "approve",
+                            "quantity": 7,
+                            "approved_notional_krw": "500500",
+                            "sizing_price": "71500",
+                            "reason_code": "approved",
+                            "reason": "proposal from an unverified runtime",
+                        }
+                    ],
+                },
+                account_context={
+                    "available": True,
+                    "orderable_cash_krw": "1000000",
+                    "buying_power_krw": "1000000",
+                    "holdings": [],
+                    "open_orders": [],
+                },
+                expected_item_ids={item.id},
+                now=datetime(2026, 6, 3, 23, 30, tzinfo=UTC),
+            )
+            db.flush()
+
+            assert summary["rejected"] == 1
+            final = item.quantity_policy["exec_agent_decision"]
+            assert final["quantity"] == 0
+            assert final["approved_quantity"] == 0
+            assert final["approved_notional_krw"] is None
+            assert final["sizing_price"] is None
+            audit = db.scalar(
+                select(ExecutionPlanItemAudit).where(
+                    ExecutionPlanItemAudit.execution_plan_item_id == item.id,
+                    ExecutionPlanItemAudit.event_type
+                    == "watch_exec_agent_sizing_decision",
+                )
+            )
+            assert audit is not None
+            assert audit.payload["agent_decision"]["action"] == "approve"
+            assert audit.payload["agent_decision"]["quantity"] == 7
+            assert audit.payload["agent_decision"]["approved_notional_krw"] == (
+                "500500"
+            )
+            assert audit.payload["final_decision"]["action"] == "reject"
+            assert audit.payload["final_decision"]["quantity"] == 0
+            assert audit.payload["final_decision"]["approved_quantity"] == 0
+    finally:
+        engine.dispose()
 
 
 def test_apply_decisions_audits_the_final_target_geometry_rejection(tmp_path) -> None:

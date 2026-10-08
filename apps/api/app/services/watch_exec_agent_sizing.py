@@ -15,7 +15,7 @@ from time import monotonic
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import and_, or_, select
+from sqlalchemy import and_, select
 from sqlalchemy.orm import Session, selectinload, sessionmaker, undefer
 from sqlalchemy.orm.attributes import set_committed_value
 
@@ -28,7 +28,6 @@ from app.models.runtime import (
     ExecutionPlan,
     ExecutionPlanItem,
     ExecutionPlanItemAudit,
-    ExecutionPosition,
 )
 from app.services.broker_auth import ensure_authenticated_broker_session
 from app.services.account_drawdown_recovery import (
@@ -37,12 +36,15 @@ from app.services.account_drawdown_recovery import (
 )
 from app.services.execution_account_route import (
     bind_kis_account_route,
-    execution_account_scope_binding_from_payloads,
     validate_kis_account_route,
 )
 from app.services.execution_semantics import (
     WATCH_BUY_INTENTS,
     is_exec_agent_sizing_policy,
+)
+from app.services.execution_exposure import (
+    item_exposure_scope_is_proven,
+    item_has_external_possible_exposure,
 )
 from app.services.exec_agent_approval import (
     SHORT_TERM_LIVE_MIN_NET_REWARD_RISK,
@@ -55,8 +57,10 @@ from app.services.json_compaction import compact_json_object, json_payload_hash
 from app.services.live_market_context import load_live_market_regime_context, merge_live_market_regime_context
 from app.services.market_regime_guardrails import evaluate_market_regime_guardrail
 from app.services.openclaw_runtime_contract import (
+    bind_signed_runtime_agent_identity,
     capture_runtime_contract,
     require_runtime_contract_match,
+    reported_runtime_agent_id,
     runtime_contract_proof_is_valid,
     stable_runtime_contract_proof,
 )
@@ -95,6 +99,10 @@ RETRYABLE_REJECTION_REASON_CODES = frozenset({
     "transaction_cost_evidence_missing",
 })
 REJECTION_DISPOSITIONS = frozenset({"retry", "defer", "terminal"})
+TERMINAL_REJECTION_DECISION_SOURCES = frozenset({
+    "openclaw_exec_agent_watch_sizing",
+    "watch_exec_agent_sizing",
+})
 _TRANSIENT_DETERMINISTIC_REASONS = frozenset({
     "transaction_cost_evidence_missing",
     "transaction_cost_evidence_invalid",
@@ -170,6 +178,7 @@ def run_due_watch_exec_agent_sizing(
         return _result(idle=True, reason="no_unsized_watch_candidates")
 
     provider_mismatch_summaries = _quarantine_provider_mismatched_items(
+        settings=settings,
         db=db,
         plans=plans,
         adapter=adapter,
@@ -184,7 +193,14 @@ def run_due_watch_exec_agent_sizing(
     missed_window_summaries = [
         summary
         for plan in plans
-        if (summary := _expire_missed_next_open_items(db=db, plan=plan, now=cycle_at))["rejected"]
+        if (
+            summary := _expire_missed_next_open_items(
+                db=db,
+                settings=settings,
+                plan=plan,
+                now=cycle_at,
+            )
+        )["rejected"]
     ]
     plans = [plan for plan in plans if _unsized_watch_items(plan)]
     if not plans:
@@ -339,6 +355,7 @@ def _run_due_watch_exec_agent_sizing_short_transactions(
             _load_candidate_plans(settings=settings, db=db, market_date=market_date)
         )
         provider_mismatch_summaries = _quarantine_provider_mismatched_items(
+            settings=settings,
             db=db,
             plans=plans,
             adapter=adapter,
@@ -353,7 +370,14 @@ def _run_due_watch_exec_agent_sizing_short_transactions(
         missed_window_summaries = [
             summary
             for plan in plans
-            if (summary := _expire_missed_next_open_items(db=db, plan=plan, now=cycle_at))["rejected"]
+            if (
+                summary := _expire_missed_next_open_items(
+                    db=db,
+                    settings=settings,
+                    plan=plan,
+                    now=cycle_at,
+                )
+            )["rejected"]
         ]
         if (
             provider_mismatch_summaries
@@ -632,6 +656,7 @@ def _is_untriggered_next_open_sizing_item(item: ExecutionPlanItem) -> bool:
 def _expire_missed_next_open_items(
     *,
     db: Session | None,
+    settings: Settings | None = None,
     plan: ExecutionPlan,
     now: datetime,
 ) -> dict[str, object]:
@@ -645,7 +670,7 @@ def _expire_missed_next_open_items(
         ):
             continue
         previous_policy = item.quantity_policy if isinstance(item.quantity_policy, dict) else None
-        summary = {
+        record = {
             "source": "watch_exec_agent_sizing",
             "action": "reject",
             "decision": "rejected",
@@ -653,20 +678,24 @@ def _expire_missed_next_open_items(
             "symbol": item.symbol,
             "quantity": 0,
             "approved_quantity": 0,
-            "approved_notional_krw": "0.0000",
+            "approved_notional_krw": None,
+            "sizing_price": None,
+            "reference_price": None,
             "reason_code": "missed_next_open_window",
             "reason": "next-open sizing was not completed before the market-open deadline",
             "decided_at": checked_at.isoformat(),
         }
-        item.quantity_policy = compact_json_object({
-            "kind": "exec_agent_rejected",
-            "source": "exec_agent_watch_sizing",
-            "reason_code": "missed_next_open_window",
-            "reason": summary["reason"],
-            "exec_agent_decision": summary,
-            "short_term_exec_agent_decision": summary,
-            "previous_policy": previous_policy,
-        })
+        summary, policy = _canonical_terminal_rejection(
+            item=item,
+            record=record,
+            previous_policy=previous_policy,
+            reason_code="missed_next_open_window",
+            reason_family="timing",
+            reason=str(record["reason"]),
+            audit_event_type="watch_exec_agent_next_open_window_missed",
+            decided_at=checked_at,
+        )
+        item.quantity_policy = policy
         apply_plan_item_status(plan_item=item, status="next_open_buy_expired")
         expired_ids.append(item.id)
         _add_plan_item_audit(
@@ -681,6 +710,11 @@ def _expire_missed_next_open_items(
                 else None,
             },
         )
+    no_trade = (
+        finalize_completed_no_trade_plan(db=db, settings=settings, plan=plan)
+        if expired_ids and isinstance(db, Session) and settings is not None
+        else {"completed": False, "entry_count": 0, "linked_exit_count": 0}
+    )
     return {
         "plan_id": plan.external_plan_id,
         "evaluated": len(expired_ids),
@@ -691,6 +725,7 @@ def _expire_missed_next_open_items(
         "missing_item_ids": [],
         "ignored_extra": 0,
         "missed_next_open_item_ids": expired_ids,
+        "no_trade": no_trade,
     }
 
 
@@ -894,6 +929,7 @@ def _load_candidate_plans(*, settings: Settings, db: Session, market_date) -> li
 
 def _quarantine_provider_mismatched_items(
     *,
+    settings: Settings,
     db: Session,
     plans: list[ExecutionPlan],
     adapter: BrokerAdapter | None,
@@ -934,6 +970,28 @@ def _quarantine_provider_mismatched_items(
                 **risk_context,
                 "watch_exec_agent_provider_guard": detail,
             })
+            previous_policy = (
+                item.quantity_policy
+                if isinstance(item.quantity_policy, dict)
+                else None
+            )
+            _, item.quantity_policy = _canonical_terminal_rejection(
+                item=item,
+                record={
+                    "source": "watch_exec_agent_sizing",
+                    "execution_plan_item_id": item.id,
+                    "symbol": item.symbol,
+                    "decided_at": _utc_datetime(now).isoformat(),
+                },
+                previous_policy=previous_policy,
+                reason_code="watch_exec_agent_sizing_route_unsupported",
+                reason_family="provider_route",
+                reason=(
+                    "candidate route is not supported by the sizing account adapter"
+                ),
+                audit_event_type="watch_exec_agent_sizing_route_unsupported",
+                decided_at=now,
+            )
             apply_plan_item_status(plan_item=item, status="exec_agent_rejected")
             quarantined_ids.append(item.id)
             _add_plan_item_audit(
@@ -945,6 +1003,11 @@ def _quarantine_provider_mismatched_items(
                 error_message="candidate route is not supported by the sizing account adapter",
             )
         if quarantined_ids:
+            no_trade = finalize_completed_no_trade_plan(
+                db=db,
+                settings=settings,
+                plan=plan,
+            )
             summaries.append(
                 {
                     "plan_id": plan.external_plan_id,
@@ -955,6 +1018,7 @@ def _quarantine_provider_mismatched_items(
                     "missing_item_ids": [],
                     "ignored_extra": 0,
                     "provider_mismatch_item_ids": quarantined_ids,
+                    "no_trade": no_trade,
                 }
             )
     return summaries
@@ -999,6 +1063,28 @@ def _quarantine_account_route_mismatched_items(
                     "watch_exec_agent_account_route_guard": detail,
                 }
             )
+            previous_policy = (
+                item.quantity_policy
+                if isinstance(item.quantity_policy, dict)
+                else None
+            )
+            _, item.quantity_policy = _canonical_terminal_rejection(
+                item=item,
+                record={
+                    "source": "watch_exec_agent_sizing",
+                    "execution_plan_item_id": item.id,
+                    "symbol": item.symbol,
+                    "decided_at": _utc_datetime(now).isoformat(),
+                },
+                previous_policy=previous_policy,
+                reason_code=mismatch.reason_code,
+                reason_family="account_route",
+                reason=(
+                    "candidate account route does not match the active sizing account"
+                ),
+                audit_event_type="watch_exec_agent_sizing_account_route_rejected",
+                decided_at=now,
+            )
             apply_plan_item_status(plan_item=item, status="exec_agent_rejected")
             quarantined_ids.append(item.id)
             _add_plan_item_audit(
@@ -1012,6 +1098,11 @@ def _quarantine_account_route_mismatched_items(
                 ),
             )
         if quarantined_ids:
+            no_trade = finalize_completed_no_trade_plan(
+                db=db,
+                settings=settings,
+                plan=plan,
+            )
             summaries.append(
                 {
                     "plan_id": plan.external_plan_id,
@@ -1022,6 +1113,7 @@ def _quarantine_account_route_mismatched_items(
                     "missing_item_ids": [],
                     "ignored_extra": 0,
                     "account_route_mismatch_item_ids": quarantined_ids,
+                    "no_trade": no_trade,
                 }
             )
     return summaries
@@ -1208,28 +1300,13 @@ def finalize_completed_no_trade_plan(
     ) is not None:
         return {"completed": False, "entry_count": len(entries), "linked_exit_count": 0}
 
-    position_scope_clauses = _entry_position_scope_clauses(
-        settings=settings,
-        entries=entries,
-    )
-    if position_scope_clauses is None:
-        return {"completed": False, "entry_count": len(entries), "linked_exit_count": 0}
-    symbols = {item.symbol for item in entries}
-    legacy_position_clause = and_(
-        ExecutionPosition.symbol.in_(symbols),
-        ExecutionPosition.provider.is_(None),
-        ExecutionPosition.account_scope.is_(None),
-        ExecutionPosition.exchange.is_(None),
-    )
-    if db.scalar(
-        select(ExecutionPosition.id)
-        .where(
-            ExecutionPosition.mode == plan.mode,
-            ExecutionPosition.quantity != 0,
-            or_(legacy_position_clause, *position_scope_clauses),
+    if any(
+        not item_exposure_scope_is_proven(item=item, settings=settings)
+        or item_has_external_possible_exposure(
+            db=db, plan=plan, item=item, settings=settings
         )
-        .limit(1)
-    ) is not None:
+        for item in entries
+    ):
         return {"completed": False, "entry_count": len(entries), "linked_exit_count": 0}
 
     entry_keys = {
@@ -1287,64 +1364,6 @@ def finalize_completed_no_trade_plan(
         "entry_count": len(entries),
         "linked_exit_count": len(linked_exits),
     }
-
-
-def _entry_position_scope_clauses(
-    *,
-    settings: Settings,
-    entries: list[ExecutionPlanItem],
-) -> list[object] | None:
-    clauses: list[object] = []
-    for item in entries:
-        risk_context = item.risk_context if isinstance(item.risk_context, dict) else {}
-        quantity_policy = (
-            item.quantity_policy if isinstance(item.quantity_policy, dict) else {}
-        )
-        provider = str(item.provider or "").strip().lower()
-        exchange = str(
-            risk_context.get("exchange") or item.venue or ""
-        ).strip().upper()
-        if not provider or not exchange:
-            return None
-        if provider == "kis":
-            if validate_kis_account_route(
-                settings=settings,
-                provider=provider,
-                risk_context=risk_context,
-                quantity_policy=quantity_policy,
-                require_binding=True,
-            ) is not None:
-                return None
-            try:
-                identity = build_position_identity(
-                    settings=settings,
-                    provider=provider,
-                    exchange=exchange,
-                )
-            except PositionIdentityConflictError:
-                return None
-            account_scope = identity.account_scope
-        else:
-            binding = execution_account_scope_binding_from_payloads(
-                risk_context,
-                quantity_policy,
-            )
-            if (
-                not isinstance(binding, dict)
-                or binding.get("provider") != provider
-                or not isinstance(binding.get("account_scope"), str)
-            ):
-                return None
-            account_scope = str(binding["account_scope"])
-        clauses.append(
-            and_(
-                ExecutionPosition.symbol == item.symbol,
-                ExecutionPosition.provider == provider,
-                ExecutionPosition.account_scope == account_scope,
-                ExecutionPosition.exchange == exchange,
-            )
-        )
-    return clauses
 
 
 def _eligible_unsized_item_status(item: ExecutionPlanItem) -> bool:
@@ -2058,7 +2077,7 @@ def _reject_stale_state_blocked_item(
     item: ExecutionPlanItem,
     blockers: list[dict[str, object]],
 ) -> None:
-    summary = {
+    record = {
         "source": "watch_exec_agent_sizing",
         "action": "reject",
         "decision": "rejected",
@@ -2066,8 +2085,9 @@ def _reject_stale_state_blocked_item(
         "symbol": item.symbol,
         "quantity": 0,
         "approved_quantity": 0,
-        "approved_notional_krw": "0.0000",
-        "sizing_price": _json_decimal(item.limit_price or item.trigger_price),
+        "approved_notional_krw": None,
+        "sizing_price": None,
+        "reference_price": None,
         "confidence": None,
         "target_profile": None,
         "target_tag": None,
@@ -2076,18 +2096,16 @@ def _reject_stale_state_blocked_item(
         "decided_at": datetime.now(UTC).isoformat(),
     }
     previous_policy = item.quantity_policy if isinstance(item.quantity_policy, dict) else None
-    item.quantity_policy = compact_json_object({
-        "kind": "exec_agent_rejected",
-        "source": "watch_exec_agent_sizing",
-        "exec_agent_decision": summary,
-        "short_term_exec_agent_decision": summary,
-        "exec_agent_decision_audit": {
-            "event_type": "watch_exec_agent_sizing_stale_state_blocked",
-            "storage": "execution_plan_item_audits",
-        },
-        "stale_state_blockers": _json_safe(blockers),
-        "previous_policy": previous_policy,
-    })
+    summary, policy = _canonical_terminal_rejection(
+        item=item,
+        record=record,
+        previous_policy=previous_policy,
+        reason_code="stale_order_broker_truth_unconfirmed",
+        reason_family="broker_truth",
+        reason=str(record["reason"]),
+        audit_event_type="watch_exec_agent_sizing_stale_state_blocked",
+    )
+    item.quantity_policy = policy
     item.status = "exec_agent_rejected"
     _add_plan_item_audit(
         db=db,
@@ -2287,6 +2305,15 @@ def _request_exec_agent_decisions(*, settings: Settings, payload: dict[str, obje
         runtime_provenance["requested_session_key"] = session_key
         runtime_provenance["request_sha256"] = request_sha256
         runtime_provenance["runtime_contract"] = contract_proof
+        bind_signed_runtime_agent_identity(
+            runtime_provenance,
+            proof=contract_proof,
+            agent_id=settings.exec_agent_id,
+            expected_model_ref=settings.exec_agent_model,
+            requested_session_key=session_key,
+            reported_session_id=session_id,
+            request_sha256=request_sha256,
+        )
         decision_payload["_runtime_provenance"] = runtime_provenance
         return decision_payload
     finally:
@@ -2402,8 +2429,10 @@ def _openclaw_runtime_provenance(
         agent_meta_payload.get("model")
     )
     actual_model_ref = f"{provider}/{model}" if provider and model else None
-    actual_agent_id = _nonempty_text(agent_meta_payload.get("agentId"))
-    return {
+    actual_agent_id, malformed_agent_id = reported_runtime_agent_id(
+        agent_meta_payload
+    )
+    provenance = {
         "agent_id": actual_agent_id,
         "configured_agent_id": settings.exec_agent_id,
         "configured_model_hint": settings.exec_agent_model,
@@ -2413,6 +2442,9 @@ def _openclaw_runtime_provenance(
         "actual_model_ref": actual_model_ref,
         "session_id": _nonempty_text(agent_meta_payload.get("sessionId")),
     }
+    if malformed_agent_id:
+        provenance["agent_id_metadata_malformed"] = True
+    return provenance
 
 
 def _nonempty_text(value: object) -> str | None:
@@ -2759,8 +2791,14 @@ def _apply_decisions(
                 risk_context=item.risk_context,
                 quantity_policy=item.quantity_policy,
             )
-        decision = decisions[item.id]
+        decision = dict(decisions[item.id])
         action = str(decision.get("action") or "").strip().lower()
+        agent_record = _decision_record(
+            decision=decision,
+            item=item,
+            version=str(decision_payload.get("version") or ""),
+            runtime_provenance=runtime_provenance,
+        )
         if (
             action == "approve"
             and not runtime_is_verified
@@ -2768,6 +2806,10 @@ def _apply_decisions(
             decision = {
                 **decision,
                 "action": "reject",
+                "quantity": 0,
+                "approved_quantity": 0,
+                "approved_notional_krw": None,
+                "sizing_price": None,
                 "reason_code": "unverified_exec_agent_runtime",
                 "reason": "approval lacks exact exec-agent runtime provenance",
             }
@@ -2778,33 +2820,24 @@ def _apply_decisions(
             version=str(decision_payload.get("version") or ""),
             runtime_provenance=runtime_provenance,
         )
-        agent_record = record
         if is_untriggered_next_open and _next_open_window_missed(
             plan=plan,
             item=item,
             now=decision_at,
         ):
-            record = {
-                **record,
-                "action": "reject",
-                "decision": "rejected",
-                "quantity": 0,
-                "approved_quantity": 0,
-                "approved_notional_krw": "0.0000",
-                "reason_code": "missed_next_open_window",
-                "reason": "exec-agent decision arrived at or after the market-open deadline",
-                "decided_at": decision_at.isoformat(),
-            }
             previous_policy = item.quantity_policy if isinstance(item.quantity_policy, dict) else None
-            item.quantity_policy = compact_json_object({
-                "kind": "exec_agent_rejected",
-                "source": "exec_agent_watch_sizing",
-                "reason_code": "missed_next_open_window",
-                "reason": record["reason"],
-                "exec_agent_decision": _decision_summary(record),
-                "short_term_exec_agent_decision": _decision_summary(record),
-                "previous_policy": previous_policy,
-            })
+            record, item.quantity_policy = _canonical_terminal_rejection(
+                item=item,
+                record=record,
+                previous_policy=previous_policy,
+                reason_code="missed_next_open_window",
+                reason_family="timing",
+                reason=(
+                    "exec-agent decision arrived at or after the market-open deadline"
+                ),
+                audit_event_type="watch_exec_agent_sizing_decision",
+                decided_at=decision_at,
+            )
             apply_plan_item_status(plan_item=item, status="next_open_buy_expired")
             rejected += 1
             _add_final_sizing_decision_audit(
@@ -2842,21 +2875,25 @@ def _apply_decisions(
                     runtime_provenance=runtime_provenance,
                 )
                 previous_policy = item.quantity_policy if isinstance(item.quantity_policy, dict) else None
-                item.quantity_policy = compact_json_object({
-                    "kind": "exec_agent_rejected",
-                    "source": "exec_agent_watch_sizing",
-                    "reason_code": "allowed_action_envelope_blocked",
-                    "reason": envelope_block_reason,
-                    "exec_agent_decision": _decision_summary(record),
-                    "short_term_exec_agent_decision": _decision_summary(record),
-                    "exec_agent_decision_audit": {
-                        "event_type": "watch_exec_agent_sizing_decision",
-                        "storage": "execution_plan_item_audits",
-                    },
-                    "allowed_action_envelope": envelope,
-                    "market_regime_guardrail": envelope.get("market_regime_guardrail"),
-                    "previous_policy": previous_policy,
-                })
+                raw_reasons = envelope.get("hard_reject_reasons")
+                hard_reasons = (
+                    [str(reason) for reason in raw_reasons]
+                    if isinstance(raw_reasons, list)
+                    else []
+                )
+                record, item.quantity_policy = _canonical_terminal_rejection(
+                    item=item,
+                    record=record,
+                    previous_policy=previous_policy,
+                    reason_code="allowed_action_envelope_blocked",
+                    reason_family=_rejection_reason_family(
+                        hard_reasons,
+                        "allowed_action_envelope_blocked",
+                    ),
+                    reason=envelope_block_reason,
+                    audit_event_type="watch_exec_agent_sizing_decision",
+                    decided_at=decision_at,
+                )
                 item.status = "exec_agent_rejected"
                 rejected += 1
                 _add_final_sizing_decision_audit(
@@ -2887,28 +2924,25 @@ def _apply_decisions(
                     runtime_provenance=runtime_provenance,
                 )
                 previous_policy = item.quantity_policy if isinstance(item.quantity_policy, dict) else None
-                item.quantity_policy = compact_json_object({
-                    "kind": "exec_agent_rejected",
-                    "source": "exec_agent_watch_sizing",
-                    "reason_code": sizing["reason_code"],
-                    "reason": sizing["reason"],
-                    "exec_agent_decision": _decision_summary(record),
-                    "short_term_exec_agent_decision": _decision_summary(record),
-                    "exec_agent_decision_audit": {
-                        "event_type": "watch_exec_agent_sizing_decision",
-                        "storage": "execution_plan_item_audits",
-                    },
-                    "sizing_adjustment": sizing["adjustment"],
-                    "sizing_explanation": _sizing_explanation(
-                        decision=decision,
-                        record=record,
-                        sizing=sizing,
-                        allowed_action_envelope=envelope,
+                raw_reasons = envelope.get("hard_reject_reasons")
+                hard_reasons = (
+                    [str(reason) for reason in raw_reasons]
+                    if isinstance(raw_reasons, list)
+                    else []
+                )
+                record, item.quantity_policy = _canonical_terminal_rejection(
+                    item=item,
+                    record=record,
+                    previous_policy=previous_policy,
+                    reason_code=str(sizing["reason_code"]),
+                    reason_family=_rejection_reason_family(
+                        hard_reasons,
+                        sizing["reason_code"],
                     ),
-                    "allowed_action_envelope": envelope,
-                    "market_regime_guardrail": envelope.get("market_regime_guardrail"),
-                    "previous_policy": previous_policy,
-                })
+                    reason=str(sizing["reason"]),
+                    audit_event_type="watch_exec_agent_sizing_decision",
+                    decided_at=decision_at,
+                )
                 _add_plan_item_audit(
                     db=db,
                     item=item,
@@ -2949,19 +2983,16 @@ def _apply_decisions(
                     runtime_provenance=runtime_provenance,
                 )
                 previous_policy = item.quantity_policy if isinstance(item.quantity_policy, dict) else None
-                item.quantity_policy = compact_json_object({
-                    "kind": "exec_agent_rejected",
-                    "source": "exec_agent_watch_sizing",
-                    "exec_agent_decision": _decision_summary(record),
-                    "short_term_exec_agent_decision": _decision_summary(record),
-                    "exec_agent_decision_audit": {
-                        "event_type": "watch_exec_agent_sizing_decision",
-                        "storage": "execution_plan_item_audits",
-                    },
-                    "allowed_action_envelope": envelope,
-                    "market_regime_guardrail": envelope.get("market_regime_guardrail"),
-                    "previous_policy": previous_policy,
-                })
+                record, item.quantity_policy = _canonical_terminal_rejection(
+                    item=item,
+                    record=record,
+                    previous_policy=previous_policy,
+                    reason_code="allowed_action_envelope_blocked",
+                    reason_family="action_envelope",
+                    reason="allowed action envelope left no buyable quantity",
+                    audit_event_type="watch_exec_agent_sizing_decision",
+                    decided_at=decision_at,
+                )
                 item.status = "exec_agent_rejected"
                 rejected += 1
                 _add_final_sizing_decision_audit(
@@ -2988,11 +3019,7 @@ def _apply_decisions(
                 "quantity": quantity,
                 "source": "exec_agent_watch_sizing",
                 "approval_provenance": {
-                    "kind": (
-                        "verified_exec_agent_watch_sizing"
-                        if runtime_is_verified
-                        else "reported_unverified_exec_agent_watch_sizing"
-                    ),
+                    "kind": "verified_exec_agent_watch_sizing",
                     "runtime": runtime_provenance,
                 },
                 "sizing_price": _decimal_text(sizing["sizing_price"]),
@@ -3018,6 +3045,7 @@ def _apply_decisions(
                 "market_regime_guardrail": envelope.get("market_regime_guardrail"),
                 "previous_policy": previous_policy,
             })
+            _clear_watch_exec_agent_defer(item)
             if is_untriggered_next_open:
                 item.limit_price = sizing["sizing_price"]
                 item.status = "pending"
@@ -3140,29 +3168,17 @@ def _apply_decisions(
                 )
                 deferred += 1
                 continue
-            if (
-                isinstance(item.risk_context, dict)
-                and WATCH_EXEC_AGENT_DEFER_KEY in item.risk_context
-            ):
-                terminal_risk_context = dict(item.risk_context)
-                terminal_risk_context.pop(WATCH_EXEC_AGENT_DEFER_KEY, None)
-                item.risk_context = compact_json_object(terminal_risk_context)
             previous_policy = item.quantity_policy if isinstance(item.quantity_policy, dict) else None
-            item.quantity_policy = compact_json_object({
-                "kind": "exec_agent_rejected",
-                "source": "exec_agent_watch_sizing",
-                "reason_code": decision.get("reason_code"),
-                "reason_family": reason_family,
-                "rejection_disposition": disposition,
-                "reason": decision.get("reason"),
-                "exec_agent_decision": _decision_summary(record),
-                "short_term_exec_agent_decision": _decision_summary(record),
-                "exec_agent_decision_audit": {
-                    "event_type": "watch_exec_agent_sizing_decision",
-                    "storage": "execution_plan_item_audits",
-                },
-                "previous_policy": previous_policy,
-            })
+            record, item.quantity_policy = _canonical_terminal_rejection(
+                item=item,
+                record=record,
+                previous_policy=previous_policy,
+                reason_code=str(decision.get("reason_code") or "agent_rejected"),
+                reason_family=reason_family,
+                reason=str(decision.get("reason") or "exec-agent rejected sizing"),
+                audit_event_type="watch_exec_agent_sizing_decision",
+                decided_at=decision_at,
+            )
             item.status = "exec_agent_rejected"
             rejected += 1
             _add_final_sizing_decision_audit(
@@ -3209,8 +3225,27 @@ def _verified_runtime_provenance(
         provenance.get("requested_session_key") or ""
     ).strip()
     request_sha256 = json_payload_hash(_json_safe(request_payload))
+    reported_agent_id = provenance.get("actual_agent_id")
+    verified_agent_id = provenance.get("verified_agent_id")
+    reported_agent_id_is_omitted = bool(
+        reported_agent_id is None
+        or isinstance(reported_agent_id, str)
+        and not reported_agent_id.strip()
+    )
+    agent_identity_matches = bool(
+        provenance.get("agent_id_metadata_malformed") is not True
+        and (
+            reported_agent_id == settings.exec_agent_id
+            or (
+                reported_agent_id_is_omitted
+                and verified_agent_id == settings.exec_agent_id
+                and provenance.get("agent_identity_source")
+                == "signed_runtime_contract"
+            )
+        )
+    )
     return bool(
-        provenance.get("actual_agent_id") == settings.exec_agent_id
+        agent_identity_matches
         and provenance.get("actual_model_ref") == settings.exec_agent_model
         and bool(session_id)
         and provenance.get("request_sha256") == request_sha256
@@ -3295,6 +3330,89 @@ def _decision_summary(record: dict[str, object]) -> dict[str, object]:
     if isinstance(runtime_provenance, dict):
         summary["runtime_provenance"] = dict(runtime_provenance)
     return summary
+
+
+def _canonical_terminal_rejection(
+    *,
+    item: ExecutionPlanItem,
+    record: dict[str, object],
+    previous_policy: dict[str, object] | None,
+    reason_code: str,
+    reason_family: str,
+    reason: str,
+    audit_event_type: str,
+    decided_at: datetime | None = None,
+) -> tuple[dict[str, object], dict[str, object]]:
+    """Build the sole durable terminal-reject shape for watch sizing.
+
+    A terminal rejection carries no executable quantity or notional.  The
+    caller keeps the original agent proposal in the item audit payload; only
+    this fail-closed record may be persisted as current execution authority.
+    """
+
+    decision_source = str(record.get("source") or "").strip()
+    if decision_source not in TERMINAL_REJECTION_DECISION_SOURCES:
+        raise ValueError(
+            "terminal watch-sizing rejection has untrusted decision source"
+        )
+    normalized_reason_code = str(reason_code or "").strip()
+    normalized_reason_family = str(reason_family or "").strip()
+    normalized_reason = str(reason or "").strip()
+    if not normalized_reason_code or not normalized_reason_family or not normalized_reason:
+        raise ValueError("terminal watch-sizing rejection reason is incomplete")
+
+    _clear_watch_exec_agent_defer(item)
+
+    final_record = {
+        **record,
+        "source": decision_source,
+        "action": "reject",
+        "decision": "rejected",
+        "execution_plan_item_id": item.id,
+        "symbol": item.symbol,
+        "quantity": 0,
+        "approved_quantity": 0,
+        "approved_notional_krw": None,
+        "sizing_price": None,
+        "reference_price": None,
+        "confidence": None,
+        "target_profile": None,
+        "target_tag": None,
+        "reason_code": normalized_reason_code,
+        "reason_family": normalized_reason_family,
+        "rejection_disposition": "terminal",
+        "reason": normalized_reason,
+        "decided_at": _utc_datetime(decided_at or datetime.now(UTC)).isoformat(),
+    }
+    summary = _decision_summary(final_record)
+    policy = compact_json_object(
+        {
+            "kind": "exec_agent_rejected",
+            "source": "exec_agent_watch_sizing",
+            "reason": normalized_reason,
+            "reason_code": normalized_reason_code,
+            "reason_family": normalized_reason_family,
+            "rejection_disposition": "terminal",
+            "exec_agent_decision": summary,
+            "short_term_exec_agent_decision": summary,
+            "exec_agent_decision_audit": {
+                "event_type": audit_event_type,
+                "storage": "execution_plan_item_audits",
+            },
+            "previous_policy": previous_policy,
+        }
+    )
+    return final_record, policy
+
+
+def _clear_watch_exec_agent_defer(item: ExecutionPlanItem) -> None:
+    if not isinstance(item.risk_context, dict):
+        return
+    if WATCH_EXEC_AGENT_DEFER_KEY not in item.risk_context:
+        return
+    risk_context = dict(item.risk_context)
+    risk_context.pop(WATCH_EXEC_AGENT_DEFER_KEY, None)
+    item.risk_context = compact_json_object(risk_context)
 
 
 def _sizing_explanation(

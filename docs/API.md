@@ -157,6 +157,19 @@ does not create trading decisions.
 - `execution_decisions.reason_families`
   - counts canonical server-owned rejection families; agent free-form reason
     text does not select retry, defer, or terminal control flow
+- `execution_decisions.current_market_date`
+- `execution_decisions.current_contract_quarantines`
+- `execution_decisions.current_contract_quarantine_symbols[]`
+- `execution_decisions.current_terminal_rejection_symbols[]`
+- `execution_decisions.current_pending_retry_symbols[]`
+- `execution_decisions.current_pending_deferral_symbols[]`
+  - these current-KRX-date fields survive terminal status rewrites so an
+    operator can distinguish quarantined, rejected, and still-retryable work
+- `actionable_alerts.alerts[]` includes
+  `current_execution_contract_quarantined`,
+  `current_execution_decisions_rejected`, and
+  `current_execution_decisions_deferred` when those current-date sets are
+  non-empty
 - `watch_buy_vetoes.today_count`
 - `watch_buy_vetoes.today_symbols[]`
 - `symbols.monitored`
@@ -282,6 +295,22 @@ Current response includes:
     - `metadata_status`
     - `plan_item_id`
   - `total_estimated_risk`
+- `protection`
+  - `status` (`ok`, `degraded`)
+  - `protected_position_count`
+  - `unprotected_position_count`
+  - `manual_review_position_count`
+  - `affected_symbols[]`
+  - `positions[]`
+    - `symbol`
+    - `status` (`protected`, `unprotected`, `manual_review_required`)
+    - `reason`
+    - `held_quantity`
+    - `protected_quantity`
+    - `missing_quantity`
+  - a durable `_position_sync.manual_review_required` latch takes precedence
+    over inferred missing-stop state; this read model never creates protection
+    orders or clears manual review
 - `warnings`
   - `concentration[]`
     - warnings such as top-symbol concentration, top-three concentration,
@@ -482,6 +511,80 @@ Safety control and broker auth actions are additionally audited in:
 
 ## Execution plan intake
 
+### `GET /v4/execution-plans`
+
+Returns Core v4 plans for the active runtime mode. Query parameters are
+`external_plan_id`, `limit` (default `100`, range `1..500`), and `offset`
+(default `0`, range `0..10000`). Results are ordered newest first with a stable
+internal-id tie breaker.
+
+Every plan object includes:
+
+- `execution_plan_id`: Exec's durable internal plan id
+- `external_plan_id` and `plan_id`: the Core plan id
+- `status`: current plan status
+- immutable intake proof: `contract_ack`, `item_acks`,
+  `accepted_item_count`, and `rejected_item_count`
+- `item_status_counts`: current operational status counts
+- `item_states[]`, ordered by the original plan item index
+  - `core_item_key`
+  - `execution_plan_item_id`
+  - `status`
+  - `updated_at`
+  - `terminal`
+  - optional compact `decision` with `action`, `decision`, `reason_code`,
+    `reason_family`, `rejection_disposition`, `reason`, and `retry_after`
+    sourced from the current operational status, current quantity policy,
+    active defer state, or durable trigger-time/short-term decision record.
+    A terminal non-success status always wins over an older approval or defer;
+    when no more specific durable rejection exists, `reason_code` is the
+    current item status. Only nonterminal items expose an active defer.
+
+The current terminal taxonomy is:
+
+- success: `filled`
+- cancelled/no execution: `canceled`, `cancelled`, `expired`,
+  `next_open_buy_expired`, `not_applicable`, `revoked`, `superseded`,
+  `watch_cancelled`, `watch_expired`
+- failed/rejected/manual review: `agent_rejected`, `broker_order_failed`,
+  `broker_order_rejected`, `contract_quarantined`, `crypto_paper_failed`,
+  `crypto_paper_rejected`, `exec_agent_rejected`, `manual_review_required`,
+  `manual_review_resolved_no_exposure`, `next_open_buy_failed`, `rejected`,
+  `unsupported_semantics`, `watch_buy_rejected`
+
+`item_acks[].status=accepted` is immutable evidence that intake accepted the
+exact Core item and durable ids. It is not current execution state and must not
+be rewritten after rejection, deferral, or quarantine. Consumers must use
+`item_states` for current truth. A plan whose current executable authority is
+quarantined remains visible when its immutable intake identity is intact; the
+strict authority validator still rejects it for dispatch.
+Pre-fix watch approvals marked `reported_unverified_exec_agent_watch_sizing`
+are never current authority. Reconciliation converts an exact legacy shape to
+a canonical zero-quantity terminal rejection without fencing valid siblings
+only when there is no linked order, same-route order that is not provably local
+and unsubmitted, fill, or nonzero position evidence. Possible exposure prevents
+automatic conversion and routes the entry to manual review while retaining its
+protective exits. Narrowly
+validated pre-fix terminal rejection shapes receive the same item-local
+canonical migration; ambiguous or positive-authority shapes still fail closed.
+When this safely terminates the final entry, exact account-scoped no-exposure
+truth closes the parent as `completed_no_trade` and marks linked exits
+`not_applicable`.
+A persisted `verified_exec_agent_watch_sizing` label alone is also not
+executable authority. Order boundaries require the full mirrored persisted
+runtime-contract proof and decision identity, plus exact agreement among the
+final policy quantity, sizing price, approved notional, decision fields, and
+sizing adjustment; missing or tampered fields fail closed before broker
+submission.
+For Core v4, `exec_agent_watch_sizing` with that complete verified proof is the
+only persisted source that can grant a positive sized entry. Historical
+`exec_agent` and `short_term_exec_agent_v1` shapes do not prove current Core-v4
+authority and are fenced at the affected entry family. This restriction does
+not change legacy/operator plans created through `POST /execution-plans`.
+`not_applicable` linked exits and rejected/expired/manual-review-resolved entry
+states are terminal for this read model. Broker orders already submitted but
+still open remain nonterminal until broker truth reaches a terminal state.
+
 ### `POST /v4/execution-plans`
 This is the only Core delegation endpoint. It requires the exact v4 request metadata and `delegated_final_full_cost_gate_recheck_v1` capability. The executable capability is currently limited to canonical KIS/stock/KRX/KRW plans. USD or US-equity delegated sizing returns 422 with `unsupported_us_equity_exec_agent_sizing` before plan or job persistence. Each supported entry family contains one buy, one linked target sell, and one linked stop sell. Intake is all-or-none: items remain non-claimable while persisted contract proof is checked, then the complete family is activated in the same commit. The response is accepted only when it includes exact contract metadata, counts, and a one-to-one accepted acknowledgement with durable IDs for every `core_item_key`.
 
@@ -493,7 +596,7 @@ durable but dormant: they cannot enter the monitoring universe, supersede a
 current watch, populate a runtime buy cache, or pass the final broker boundary
 before their date.
 
-`POST /v4/execution-plans/revocations` atomically fences the exact submitted items. With no committed order or exposure, entry and exits are revoked. Any order that is not conclusively local pre-submission rejected/failed requires manual review; the stale buy and its lease remain non-claimable while protective target/stop exits are preserved. Every result has an exact per-item acknowledgement. Persisted pre-v4 plans marked as Core-originated are reconciled before job claims and direct order placement: every buy is quarantined regardless of its legacy intent spelling, while sell protection is retained.
+`POST /v4/execution-plans/revocations` atomically fences the exact submitted items. With no committed order or exposure, entry and exits are revoked. Any order that is not conclusively local pre-submission rejected/failed requires manual review; the stale buy and its lease remain non-claimable while protective target/stop exits are preserved. Every result has an exact per-item acknowledgement. Persisted pre-v4 plans marked as Core-originated are reconciled before job claims and direct order placement. When immutable item identity and entry/exit linkage remain exact, only the invalid entry family is fenced and independent verified or retryable siblings remain unchanged. Corrupt counts, duplicate identities, malformed linkage, or another globally ambiguous intake mapping trigger the conservative plan-wide fallback that fences every buy. Sell protection is retained in either case.
 
 ### `POST /execution-plans`
 Accept a legacy operator-import plan. This endpoint and its preview reject `source=kai-trading-core` and any Core schema, contract, or capability marker with an upgrade response before plan, item, or job persistence. Core callers must use the v4 endpoint above; legacy permissive parsing is never a compatibility fallback for delegated authority.

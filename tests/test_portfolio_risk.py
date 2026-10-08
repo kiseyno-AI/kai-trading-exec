@@ -746,10 +746,95 @@ def test_portfolio_risk_alpaca_us_scope_keeps_fractional_equity_holdings() -> No
     assert broker_raw["normalized_drift_scope_status"] == "unavailable"
     assert broker_raw["normalized_drift_count"] == 0
     assert broker_raw["normalized_drift"] == []
+    assert payload["protection"] == {
+        "status": "degraded",
+        "protected_position_count": 0,
+        "unprotected_position_count": 2,
+        "manual_review_position_count": 0,
+        "affected_symbols": ["QQQ", "SPY"],
+        "positions": [
+            {
+                "symbol": "QQQ",
+                "status": "unprotected",
+                "reason": "missing_stop_metadata",
+                "held_quantity": "0.1402",
+                "protected_quantity": "0.0000",
+                "missing_quantity": "0.1402",
+            },
+            {
+                "symbol": "SPY",
+                "status": "unprotected",
+                "reason": "missing_stop_metadata",
+                "held_quantity": "0.1318",
+                "protected_quantity": "0.0000",
+                "missing_quantity": "0.1318",
+            },
+        ],
+    }
     warning_codes = {
         warning["code"] for warning in payload["warnings"]["concentration"]
     }
     assert "broker_raw_normalized_position_drift" not in warning_codes
+    engine.dispose()
+
+
+def test_portfolio_risk_exposes_durable_wwblcm_manual_review_protection_state() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        execution_position_account_scope="wwblcm-manual-review",
+    )
+    engine, _factory, db = _session(settings)
+    now = datetime(2026, 10, 7, 16, 0, tzinfo=UTC)
+    db.add(
+        _execution_position(
+            settings,
+            symbol="WWBLCM",
+            quantity=75,
+            provider="kis",
+            exchange="NASD",
+            average_price=Decimal("0.9164"),
+            updated_from="reconciliation",
+            last_reconciled_at=now,
+            raw_payload={
+                "_position_sync": {
+                    "asset_class": "us_equity",
+                    "exchange": "NASD",
+                    "monitoring_eligible": False,
+                    "manual_review_required": True,
+                    "manual_review_reason": "unpriced_overseas_holding",
+                    "manual_review_recorded_at": "2026-10-07T16:00:00+00:00",
+                }
+            },
+        )
+    )
+    db.commit()
+
+    payload = build_portfolio_risk_snapshot(
+        settings=settings,
+        db=db,
+        adapter=PortfolioRiskStubAdapter(provider="kis"),
+        now=now,
+        market_scope="us",
+    )
+
+    assert payload["protection"] == {
+        "status": "degraded",
+        "protected_position_count": 0,
+        "unprotected_position_count": 0,
+        "manual_review_position_count": 1,
+        "affected_symbols": ["WWBLCM"],
+        "positions": [
+            {
+                "symbol": "WWBLCM",
+                "status": "manual_review_required",
+                "reason": "unpriced_overseas_holding",
+                "held_quantity": "75.0000",
+                "protected_quantity": "0.0000",
+                "missing_quantity": "75.0000",
+            }
+        ],
+    }
     engine.dispose()
 
 
@@ -1929,6 +2014,23 @@ def test_portfolio_risk_endpoint_returns_partial_not_500_for_account_snapshot_ga
     payload = response.json()
     assert payload["source_status"] == "partial"
     assert "no reusable broker access token" in payload["source_reason"]
+    assert payload["protection"] == {
+        "status": "degraded",
+        "protected_position_count": 0,
+        "unprotected_position_count": 1,
+        "manual_review_position_count": 0,
+        "affected_symbols": ["005930"],
+        "positions": [
+            {
+                "symbol": "005930",
+                "status": "unprotected",
+                "reason": "missing_stop_metadata",
+                "held_quantity": "1.0000",
+                "protected_quantity": "0.0000",
+                "missing_quantity": "1.0000",
+            }
+        ],
+    }
     engine.dispose()
 
 

@@ -31,6 +31,28 @@ _WORKSPACE_NAMES = {
 }
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 _NONCE_PATTERN = re.compile(r"[0-9a-f]{32}")
+_PERSISTED_RUNTIME_CONTRACT_PROOF_KEYS = frozenset(
+    {
+        "agent_id",
+        "expected_model_ref",
+        "requested_session_key",
+        "reported_session_id",
+        "request_sha256",
+        "nonce",
+        "version",
+        "expected_sha256",
+        "actual_sha256",
+        "pre_run_actual_sha256",
+        "post_run_actual_sha256",
+        "pre_run_file_fingerprint",
+        "post_run_file_fingerprint",
+        "pre_run_directory_chain",
+        "post_run_directory_chain",
+        "status",
+        "stable_across_run",
+        "attestation",
+    }
+)
 _PROOF_ATTESTATION_KEY = secrets.token_bytes(32)
 _PROOF_CONSUMPTION_LOCK = threading.Lock()
 _PROOF_REGISTRY_TTL_SECONDS = 300.0
@@ -729,3 +751,143 @@ def runtime_contract_proof_is_valid(
         attestation=attestation,
         consume=consume,
     )
+
+
+def persisted_runtime_contract_proof_shape_is_valid(
+    value: object,
+    *,
+    agent_id: str,
+    expected_model_ref: str,
+    requested_session_key: str,
+    reported_session_id: str,
+    request_sha256: str,
+) -> bool:
+    """Validate a reloaded proof's complete non-secret contract shape.
+
+    Process-local issuance state intentionally cannot survive JSON persistence.
+    This check therefore does not replace pre-persistence cryptographic
+    verification; it prevents a bare persisted label from masquerading as the
+    fully mirrored proof that an already verified approval writer emits.
+    """
+
+    if not isinstance(value, dict) or set(value) != (
+        _PERSISTED_RUNTIME_CONTRACT_PROOF_KEYS
+    ):
+        return False
+    hashes = (
+        value.get("expected_sha256"),
+        value.get("actual_sha256"),
+        value.get("pre_run_actual_sha256"),
+        value.get("post_run_actual_sha256"),
+    )
+    if not (
+        value.get("version") == RUNTIME_CONTRACT_VERSION
+        and value.get("agent_id") == agent_id
+        and value.get("expected_model_ref") == expected_model_ref
+        and value.get("requested_session_key") == requested_session_key
+        and value.get("reported_session_id") == reported_session_id
+        and value.get("request_sha256") == request_sha256
+        and _SHA256_PATTERN.fullmatch(request_sha256) is not None
+        and bool(requested_session_key)
+        and bool(reported_session_id)
+        and isinstance(value.get("nonce"), str)
+        and _NONCE_PATTERN.fullmatch(str(value["nonce"])) is not None
+        and value.get("status") == "match"
+        and value.get("stable_across_run") is True
+        and all(
+            isinstance(item, str) and _SHA256_PATTERN.fullmatch(item) is not None
+            for item in hashes
+        )
+        and len(set(hashes)) == 1
+        and isinstance(value.get("attestation"), str)
+        and _SHA256_PATTERN.fullmatch(str(value["attestation"])) is not None
+    ):
+        return False
+    pre_run_fingerprint = _parsed_fingerprint(
+        value.get("pre_run_file_fingerprint")
+    )
+    post_run_fingerprint = _parsed_fingerprint(
+        value.get("post_run_file_fingerprint")
+    )
+    pre_run_directory_chain = _persisted_directory_chain_shape(
+        value.get("pre_run_directory_chain")
+    )
+    post_run_directory_chain = _persisted_directory_chain_shape(
+        value.get("post_run_directory_chain")
+    )
+    return bool(
+        pre_run_fingerprint is not None
+        and pre_run_fingerprint == post_run_fingerprint
+        and pre_run_directory_chain is not None
+        and pre_run_directory_chain == post_run_directory_chain
+    )
+
+
+def _persisted_directory_chain_shape(
+    value: object,
+) -> tuple[str, object] | None:
+    parsed = _parsed_directory_chain(value)
+    if parsed is not None:
+        return "full", parsed
+    if not isinstance(value, list) or not value:
+        return None
+    payload_hashes: list[str] = []
+    for item in value:
+        if not (
+            isinstance(item, dict)
+            and set(item) == {"_compacted_type", "key_count", "payload_hash"}
+            and item.get("_compacted_type") == "dict"
+            and item.get("key_count") == 5
+            and isinstance(item.get("payload_hash"), str)
+            and _SHA256_PATTERN.fullmatch(str(item["payload_hash"])) is not None
+        ):
+            return None
+        payload_hashes.append(str(item["payload_hash"]))
+    return "compacted", tuple(payload_hashes)
+
+
+def bind_signed_runtime_agent_identity(
+    provenance: dict[str, object],
+    *,
+    proof: object,
+    agent_id: str,
+    expected_model_ref: str,
+    requested_session_key: str,
+    reported_session_id: str,
+    request_sha256: str,
+) -> None:
+    """Bind an omitted OpenClaw agent id only to an issued runtime proof.
+
+    Current OpenClaw JSON metadata reports provider, model, and session but no
+    agent id. A reported id is never overwritten; the signed, process-local
+    contract proof is the only supported fallback identity source.
+    """
+    reported_agent_id = provenance.get("actual_agent_id")
+    if provenance.get("agent_id_metadata_malformed") is True:
+        return
+    if reported_agent_id is not None and (
+        not isinstance(reported_agent_id, str) or reported_agent_id.strip()
+    ):
+        return
+    if not runtime_contract_proof_is_valid(
+        proof,
+        agent_id=agent_id,
+        expected_model_ref=expected_model_ref,
+        requested_session_key=requested_session_key,
+        reported_session_id=reported_session_id,
+        request_sha256=request_sha256,
+        consume=False,
+    ):
+        return
+    provenance["verified_agent_id"] = agent_id
+    provenance["agent_identity_source"] = "signed_runtime_contract"
+
+
+def reported_runtime_agent_id(agent_meta: object) -> tuple[object, bool]:
+    """Preserve malformed reported identity instead of treating it as omitted."""
+    if not isinstance(agent_meta, dict) or "agentId" not in agent_meta:
+        return None, False
+    value = agent_meta.get("agentId")
+    if isinstance(value, str):
+        return value.strip() or None, False
+    return value, True

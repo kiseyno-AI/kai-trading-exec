@@ -250,6 +250,7 @@ def dispatch_due_execution_jobs(
     reconcile_unproven_legacy_core_buy_authority(
         db=db,
         runtime_mode=settings.runtime_mode,
+        settings=settings,
     )
     control_state = ensure_runtime_control_state(settings=settings, db=db)
     _converge_retrying_jobs_from_committed_order_truth(
@@ -885,6 +886,7 @@ def _dispatch_job(
         db=db,
         job_id=job_id,
         expected_locked_at=lease_locked_at,
+        settings=settings,
     )
     if submission_job is None:
         return "superseded"
@@ -1129,6 +1131,7 @@ def _lock_job_for_broker_submission(
     db: Session,
     job_id: str,
     expected_locked_at: datetime,
+    settings: Settings | None = None,
 ) -> ExecutionJob | None:
     """Serialize broker submission against a Core revocation transaction.
 
@@ -1149,6 +1152,7 @@ def _lock_job_for_broker_submission(
         if fence_unproven_legacy_core_buy_authority(
             db=db,
             execution_plan_item_id=candidate.execution_plan_item_id,
+            settings=settings,
         ):
             return None
         plan_item = db.scalar(

@@ -520,8 +520,13 @@ Before sizing, duplicate active watches for the same provider/asset/symbol broke
 `KAI_EXEC_EXEC_AGENT_MODEL` is both the explicit OpenClaw CLI model-routing
 override and the expected runtime identity. Its default is
 `openai/gpt-5.6-sol`, matching the shipped `exec-agent` configuration.
-OpenClaw's reported winning `provider/model` and agent ID must match this setting
-exactly or the approval fails closed as `unverified_exec_agent_runtime`.
+OpenClaw's reported winning `provider/model` must match this setting exactly or
+the approval fails closed as `unverified_exec_agent_runtime`. If OpenClaw
+reports an agent ID, it must also match and is never overwritten. Current
+OpenClaw JSON metadata may omit the agent ID; in that case Exec accepts the
+identity only from its non-forgeable, process-local signed runtime-contract
+proof bound to the exact agent, model, session, and request. The configured
+agent string by itself is never sufficient.
 When changing the agent model, update OpenClaw and this setting together and
 verify a paper decision audit before enabling automated buys. `GET
 /runtime/status` exposes the global enable flag, each decision path's configured
@@ -554,12 +559,14 @@ before and after every OpenClaw call. The server-issued proof is bound to the ex
 agent ID, expected model, requested and reported session identities, and canonical
 request digest, then consumed once. A contract changed during the call, an
 agent-authored proof, a proof copied to another request, or a replayed proof fails
-closed and cannot authorize a decision. The contract path resolves in this order:
+closed and cannot authorize a decision. A missing agent ID may be recovered only
+from that signed proof; a present malformed or mismatched value is never treated
+as omission. The contract path resolves in this order:
 explicit `--openclaw-home`, `OPENCLAW_STATE_DIR`, then `~/.openclaw`.
 
 Profitability approval is deterministic. Every live short-term watch buy must show at least KRW 3 billion of timestamp-bound turnover and a cost-adjusted reward/risk ratio of at least 1.80 at trigger time and at the final broker fence, whether or not Core attached a delegated-gate token. `KAI_EXEC_KIS_KRX_ROUND_TRIP_NON_SPREAD_COST_BPS` defaults to a conservative server-owned 50 bps round-trip floor, then Exec adds the fresh executable bid/ask spread. Persisted Core values and agent output cannot reduce or relabel that estimate. Increase the setting when the account's calibrated schedule is higher; invalid or negative configuration is rejected. The default is based on the published [KIS fee and transaction-tax schedule](https://securities.koreainvestment.com/main/customer/guide/_static/TF04ae010000.jsp). Agent confidence, risk flags, tactical labels, or agent-authored market context may reject or reduce an allocation, but cannot invent confirmation/liquidity/cost evidence or relax these floors.
 
-An `exec_agent_sized` policy is never converted to shares by arithmetic fallback. Signal-decider next-open entries remain unsized until the asynchronous worker records an exact, verified agent decision. Before the market opens, an approval becomes one idempotent limit-only job capped at its conservative sizing reference; at and after the opening deadline it terminates without an order. The first attempt requires the current plan date, authoritative session evidence, and the `KAI_EXEC_NEXT_OPEN_BUY_INITIAL_SUBMISSION_GRACE_SECONDS` window, then rechecks the window and executable quote immediately before submission. Missing or invalid target/stop geometry rejects the approval, and legacy scheduled rows produced by the old unverified normalizer are quarantined. Agent output is accepted only as a single raw JSON object with exact identities, unique keys, and finite numbers.
+An `exec_agent_sized` policy is never converted to shares by arithmetic fallback. Signal-decider next-open entries remain unsized until the asynchronous worker records an exact, verified agent decision. Before the market opens, an approval becomes one idempotent limit-only job capped at its conservative sizing reference; at and after the opening deadline it terminates without an order. The first attempt requires the current plan date, authoritative session evidence, and the `KAI_EXEC_NEXT_OPEN_BUY_INITIAL_SUBMISSION_GRACE_SECONDS` window, then rechecks the window and executable quote immediately before submission. Missing or invalid target/stop geometry rejects the approval, and legacy scheduled rows produced by the old unverified normalizer are quarantined. Agent output is accepted only as a single raw JSON object with exact identities, unique keys, and finite numbers. A persisted `verified_exec_agent_watch_sizing` label is not execution authority by itself: the reloaded runtime-contract proof, mirrored decision identity, and final quantity, price, notional, and sizing adjustment must agree exactly. For Core v4, that fully proven `exec_agent_watch_sizing` record is the only persisted source allowed to grant positive sizing; historical `exec_agent` and `short_term_exec_agent_v1` shapes are fenced at their entry family without changing generic non-Core plans. Bounded attempt metadata remains part of the proven transition into either approval or rejection, and either final outcome clears the prior defer latch so stale retry state cannot override current execution truth. On upgrade, narrowly proven pre-fix terminal rejects and reported-unverified approvals are canonicalized item by item only when there is no linked order, same-route order that is not provably local and unsubmitted, fill, or nonzero position evidence. Possible exposure keeps the family in manual review with protective exits preserved. Exact immutable item mapping keeps unrelated verified or retryable families unchanged; globally ambiguous intake identity falls back to fencing every buy. If the migrated item was the final entry, the account route must still be proven and all linked or same-route order, fill, and quantity/base-quantity position truth must prove no exposure before the parent closes as `completed_no_trade` and linked exits become `not_applicable`.
 
 The shared market-regime guardrail **downsizes** risk-off and caution buys using configured multipliers/caps. A downsize becomes a rejection only when another reject rule applies or the result falls below one share. The live watch-buy path is stricter: risk-off remains a hard veto unless `KAI_EXEC_WATCH_BUY_LIVE_MARKET_REGIME_DOWNSIZE_ALLOWED=true`.
 

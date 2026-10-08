@@ -2,6 +2,7 @@ from copy import deepcopy
 from datetime import UTC, datetime
 from decimal import Decimal
 import threading
+from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 import pytest
@@ -19,12 +20,16 @@ from app.db.session import create_db_engine, create_session_factory
 from app.main import create_app
 from app.models.runtime import (
     BrokerOrder,
+    ExecutionFill,
     ExecutionJob,
     ExecutionPlan,
     ExecutionPlanItem,
     ExecutionPlanItemAudit,
+    ExecutionPosition,
 )
 from app.services import core_handoff_v4
+from app.services import watch_exec_agent_sizing as watch_sizing
+from app.services.position_identity import build_position_identity
 
 
 def test_watch_rejection_policy_is_valid_terminal_core_v4_transition() -> None:
@@ -54,6 +59,322 @@ def test_watch_rejection_policy_is_valid_terminal_core_v4_transition() -> None:
         quantity_policy=policy,
         item=item,
     )
+
+
+def test_watch_rejection_policy_accepts_the_durable_attempt_wrapper() -> None:
+    raw_policy = {"type": "exec_agent_sized", "budget_krw": "1000000"}
+    item = ExecutionPlanItem(id="item-attempted-reject", symbol="005930")
+    decision = {
+        "source": "openclaw_exec_agent_watch_sizing",
+        "action": "reject",
+        "decision": "rejected",
+        "execution_plan_item_id": item.id,
+        "quantity": 0,
+        "approved_quantity": 0,
+        "reason_code": "unverified_exec_agent_runtime",
+        "reason_family": "runtime_contract",
+        "rejection_disposition": "terminal",
+        "reason": "approval lacks exact exec-agent runtime provenance",
+    }
+    attempted_policy = {
+        **raw_policy,
+        "exec_agent_watch_sizing_attempt_count": 1,
+        "exec_agent_watch_sizing_max_attempts": 3,
+        "exec_agent_watch_sizing_fallback_allowed": False,
+        "exec_agent_watch_sizing_attempts": [
+            {
+                "attempt": 1,
+                "max_attempts": 3,
+                "success": True,
+                "recorded_at": "2026-10-08T00:00:00+00:00",
+            }
+        ],
+    }
+    policy = {
+        "kind": "exec_agent_rejected",
+        "source": "exec_agent_watch_sizing",
+        "reason": decision["reason"],
+        "reason_code": decision["reason_code"],
+        "reason_family": decision["reason_family"],
+        "rejection_disposition": decision["rejection_disposition"],
+        "exec_agent_decision": decision,
+        "short_term_exec_agent_decision": decision,
+        "exec_agent_decision_audit": {
+            "event_type": "watch_exec_agent_sizing_decision",
+            "storage": "execution_plan_item_audits",
+        },
+        "previous_policy": attempted_policy,
+    }
+
+    assert core_handoff_v4._watch_rejection_policy_matches(
+        raw_policy=raw_policy,
+        quantity_policy=policy,
+        item=item,
+    )
+
+
+@pytest.mark.parametrize(
+    "decision_source",
+    ["openclaw_exec_agent_watch_sizing", "watch_exec_agent_sizing"],
+)
+def test_watch_rejection_policy_accepts_only_canonical_zero_authority(
+    decision_source: str,
+) -> None:
+    raw_policy = {"type": "exec_agent_sized", "budget_krw": "1000000"}
+    item = ExecutionPlanItem(id="item-canonical-reject", symbol="005930")
+    decision = {
+        "source": decision_source,
+        "action": "reject",
+        "decision": "rejected",
+        "execution_plan_item_id": item.id,
+        "quantity": 0,
+        "approved_quantity": 0,
+        "approved_notional_krw": None,
+        "sizing_price": None,
+        "reason_code": "deterministic_block",
+        "reason_family": "action_envelope",
+        "rejection_disposition": "terminal",
+        "reason": "deterministic rejection",
+    }
+    policy = {
+        "kind": "exec_agent_rejected",
+        "source": "exec_agent_watch_sizing",
+        "reason": decision["reason"],
+        "reason_code": decision["reason_code"],
+        "reason_family": decision["reason_family"],
+        "rejection_disposition": decision["rejection_disposition"],
+        "exec_agent_decision": decision,
+        "short_term_exec_agent_decision": decision,
+        "exec_agent_decision_audit": {
+            "event_type": "watch_exec_agent_sizing_decision",
+            "storage": "execution_plan_item_audits",
+        },
+        "previous_policy": raw_policy,
+    }
+
+    assert core_handoff_v4._watch_rejection_policy_matches(
+        raw_policy=raw_policy,
+        quantity_policy=policy,
+        item=item,
+    )
+
+    forged = deepcopy(policy)
+    forged_decision = dict(decision)
+    forged_decision["approved_notional_krw"] = "71500.0000"
+    forged["exec_agent_decision"] = forged_decision
+    forged["short_term_exec_agent_decision"] = forged_decision
+    assert not core_handoff_v4._watch_rejection_policy_matches(
+        raw_policy=raw_policy,
+        quantity_policy=forged,
+        item=item,
+    )
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        "agent_rejected",
+        "crypto_paper_failed",
+        "crypto_paper_rejected",
+        "manual_review_resolved_no_exposure",
+        "not_applicable",
+    ],
+)
+def test_v4_item_state_marks_no_execution_terminal_statuses_terminal(
+    status: str,
+) -> None:
+    state = core_handoff_v4._core_v4_item_state(
+        ExecutionPlanItem(
+            id=f"item-{status}",
+            source_plan_item_id=f"core:{status}",
+            status=status,
+        )
+    )
+
+    assert state["status"] == status
+    assert state["terminal"] is True
+
+
+@pytest.mark.parametrize(
+    ("status", "risk_context", "expected"),
+    [
+        (
+            "agent_rejected",
+            {
+                "last_trigger_time_exec_agent_interaction": {
+                    "decision": {
+                        "decision": "reject",
+                        "reason": "liquidity disappeared",
+                    }
+                }
+            },
+            {
+                "action": "reject",
+                "decision": "rejected",
+                "reason_family": "trigger_time_exec_agent",
+                "rejection_disposition": "terminal",
+                "reason": "liquidity disappeared",
+            },
+        ),
+        (
+            "exec_agent_rejected",
+            {
+                "exec_agent_decision": {
+                    "agent": "short_term_exec_agent_v1",
+                    "decision": "rejected",
+                    "reason": "existing_position",
+                }
+            },
+            {
+                "action": "reject",
+                "decision": "rejected",
+                "reason_code": "existing_position",
+                "reason_family": "short_term_exec_agent",
+                "rejection_disposition": "terminal",
+                "reason": "existing_position",
+            },
+        ),
+    ],
+)
+def test_v4_item_state_compacts_terminal_reasons_from_durable_risk_context(
+    status: str,
+    risk_context: dict[str, object],
+    expected: dict[str, object],
+) -> None:
+    state = core_handoff_v4._core_v4_item_state(
+        ExecutionPlanItem(
+            id=f"item-{status}",
+            source_plan_item_id=f"core:{status}",
+            status=status,
+            quantity_policy={"type": "exec_agent_sized"},
+            risk_context=risk_context,
+        )
+    )
+
+    assert state["terminal"] is True
+    assert state["decision"] == expected
+
+
+@pytest.mark.parametrize(
+    "drift",
+    ["wrong_previous_policy", "mismatched_mirror", "top_level_quantity"],
+)
+def test_legacy_terminal_watch_migration_rejects_ambiguous_shapes(
+    drift: str,
+) -> None:
+    raw_policy = {"type": "exec_agent_sized", "budget_krw": "1000000"}
+    item = ExecutionPlanItem(
+        id="legacy-terminal-item",
+        symbol="005930",
+        status="exec_agent_rejected",
+    )
+    decision = {
+        "source": "openclaw_exec_agent_watch_sizing",
+        "action": "reject",
+        "decision": "rejected",
+        "execution_plan_item_id": item.id,
+        "symbol": item.symbol,
+        "quantity": 3,
+        "approved_quantity": 3,
+        "reason_code": "allowed_action_envelope_blocked",
+        "reason": "legacy terminal decision",
+    }
+    policy = {
+        "kind": "exec_agent_rejected",
+        "source": "exec_agent_watch_sizing",
+        "reason_code": decision["reason_code"],
+        "reason": decision["reason"],
+        "exec_agent_decision": decision,
+        "short_term_exec_agent_decision": decision,
+        "previous_policy": raw_policy,
+    }
+    if drift == "wrong_previous_policy":
+        policy["previous_policy"] = {"type": "shares", "quantity": 3}
+    elif drift == "mismatched_mirror":
+        policy["short_term_exec_agent_decision"] = {
+            **decision,
+            "execution_plan_item_id": "different-item",
+        }
+    else:
+        policy["quantity"] = 3
+
+    assert (
+        core_handoff_v4._legacy_watch_authority_normalization(
+            item=item,
+            raw_policy=raw_policy,
+            quantity_policy=policy,
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        "broker_order_failed",
+        "broker_order_rejected",
+        "next_open_buy_failed",
+    ],
+)
+def test_v4_terminal_failure_never_exposes_stale_sizing_approval(
+    status: str,
+) -> None:
+    state = core_handoff_v4._core_v4_item_state(
+        ExecutionPlanItem(
+            id=f"item-{status}",
+            source_plan_item_id=f"core:{status}",
+            status=status,
+            quantity_policy={
+                "kind": "shares",
+                "exec_agent_decision": {
+                    "action": "approve",
+                    "decision": "approved",
+                    "reason_code": "approved",
+                    "reason": "sizing was approved before broker submission",
+                },
+            },
+        )
+    )
+
+    assert state["terminal"] is True
+    assert state["decision"] == {
+        "action": "reject",
+        "decision": "rejected",
+        "reason_code": status,
+        "reason_family": "execution_status",
+        "rejection_disposition": "terminal",
+        "reason": f"current execution status is {status}",
+    }
+
+
+def test_v4_terminal_failure_never_exposes_stale_defer() -> None:
+    state = core_handoff_v4._core_v4_item_state(
+        ExecutionPlanItem(
+            id="item-terminal-after-defer",
+            source_plan_item_id="core:terminal-after-defer",
+            status="exec_agent_rejected",
+            quantity_policy={"type": "exec_agent_sized"},
+            risk_context={
+                "watch_exec_agent_deferred": {
+                    "disposition": "defer",
+                    "reason_code": "reward_risk_hard_block",
+                    "reason_family": "reward_risk",
+                    "reason": "retry later",
+                    "retry_after": "2026-10-07T15:00:00+00:00",
+                }
+            },
+        )
+    )
+
+    assert state["terminal"] is True
+    assert state["decision"] == {
+        "action": "reject",
+        "decision": "rejected",
+        "reason_code": "exec_agent_rejected",
+        "reason_family": "execution_status",
+        "rejection_disposition": "terminal",
+        "reason": "current execution status is exec_agent_rejected",
+    }
 from app.services.execution_jobs import _claim_job, _lock_job_for_broker_submission
 from app.services.watch_exec_agent_sizing import _apply_decisions
 from openclaw_contract_test_support import verified_runtime_provenance
@@ -181,6 +502,34 @@ def _plan_payload(*, plan_id: str = "core-v4-plan") -> dict[str, object]:
             "dispatch_batch_key": None,
         },
     }
+    _refresh_material_fingerprint(payload)
+    return payload
+
+
+def _multi_family_plan_payload(
+    *,
+    plan_id: str,
+    symbols: tuple[str, ...] = ("005930", "000660", "035420"),
+) -> dict[str, object]:
+    payload = _plan_payload(plan_id=plan_id)
+    template_items = deepcopy(payload["items"])
+    payload["items"] = []
+    for family_index, symbol in enumerate(symbols, start=1):
+        family_prefix = f"core-plan-{family_index}"
+        for template in template_items:
+            item = deepcopy(template)
+            item["core_item_key"] = str(item["core_item_key"]).replace(
+                "core-plan-1", family_prefix
+            )
+            item["source_plan_item_id"] = item["core_item_key"]
+            item["symbol"] = symbol
+            item["decision_snapshot_id"] = str(100 + family_index)
+            linked_key = item["quantity_policy"].get("linked_entry_item_key")
+            if isinstance(linked_key, str):
+                item["quantity_policy"]["linked_entry_item_key"] = (
+                    linked_key.replace("core-plan-1", family_prefix)
+                )
+            payload["items"].append(item)
     _refresh_material_fingerprint(payload)
     return payload
 
@@ -371,6 +720,37 @@ def test_v4_intake_requires_exact_contract_and_returns_one_to_one_durable_ack() 
     assert readback.status_code == 200
     assert readback.json()[0]["contract_ack"] == body["contract_ack"]
     assert readback.json()[0]["item_acks"] == body["item_acks"]
+    assert readback.json()[0]["item_status_counts"] == {
+        "stop_sell_pending_config": 1,
+        "target_sell_pending_config": 1,
+        "watch_sizing_pending": 1,
+    }
+    assert readback.json()[0]["item_states"] == [
+        {
+            "core_item_key": item["core_item_key"],
+            "execution_plan_item_id": ack["execution_plan_item_id"],
+            "status": status,
+            "updated_at": readback.json()[0]["item_states"][index]["updated_at"],
+            "terminal": False,
+            "decision": None,
+        }
+        for index, (item, ack, status) in enumerate(
+            zip(
+                v4_payload["items"],
+                body["item_acks"],
+                [
+                    "watch_sizing_pending",
+                    "target_sell_pending_config",
+                    "stop_sell_pending_config",
+                ],
+                strict=True,
+            )
+        )
+    ]
+    assert all(
+        state["updated_at"] is not None
+        for state in readback.json()[0]["item_states"]
+    )
 
     duplicate = client.post("/v4/execution-plans", json=v4_payload)
     assert duplicate.status_code == 409
@@ -1131,7 +1511,7 @@ def test_v4_contract_proof_preserves_and_pins_server_account_route_binding() -> 
     engine.dispose()
 
 
-def test_v4_contract_proof_allows_exact_exec_agent_sizing_through_job_claim() -> None:
+def test_v4_contract_proof_rejects_unproven_legacy_exec_agent_at_job_claim() -> None:
     app, engine = _build_test_app()
     client = TestClient(app)
     response = client.post(
@@ -1148,6 +1528,21 @@ def test_v4_contract_proof_allows_exact_exec_agent_sizing_through_job_claim() ->
         assert plan is not None
         entry = plan.items[0]
         decision, policy = _exec_agent_approval()
+        decision.update(
+            {
+                "version": "short-term-exec-agent-v1",
+                "execution_plan_item_id": entry.id,
+                "account_snapshot": {
+                    "holdings_complete": True,
+                    "open_orders_complete": True,
+                    "observed_at": "2026-09-09T12:05:00+00:00",
+                },
+                "agent_contract": {
+                    "decision": "buy",
+                    "confidence": "0.82",
+                },
+            }
+        )
         entry.risk_context = {
             **entry.risk_context,
             "exec_agent_decision": decision,
@@ -1171,16 +1566,31 @@ def test_v4_contract_proof_allows_exact_exec_agent_sizing_through_job_claim() ->
             select(ExecutionPlan).options(selectinload(ExecutionPlan.items))
         )
         assert plan is not None
-        assert core_handoff_v4.persisted_core_plan_contract_ack(plan) is not None
+        assert core_handoff_v4.persisted_core_plan_contract_ack(plan) is None
         assert _lock_job_for_broker_submission(
             db=session,
             job_id="core-v4-exact-agent-sizing-job",
             expected_locked_at=lease,
-        ) is not None
+        ) is None
+
+    with app.state.db_session_factory() as session:
+        plan = session.scalar(
+            select(ExecutionPlan).options(selectinload(ExecutionPlan.items))
+        )
+        assert plan is not None
+        entry = next(item for item in plan.items if item.side == "buy")
+        assert entry.status == "contract_quarantined"
+        assert plan.status == "contract_quarantined"
+        assert session.get(
+            ExecutionJob,
+            "core-v4-exact-agent-sizing-job",
+        ).status == "revoked"
     engine.dispose()
 
 
-def test_v4_watch_sizing_preserves_contract_proof_through_job_claim() -> None:
+def test_v4_watch_sizing_preserves_contract_proof_through_job_claim(
+    monkeypatch,
+) -> None:
     settings = Settings(
         database_url="sqlite:///:memory:",
         runtime_mode="paper",
@@ -1217,34 +1627,59 @@ def test_v4_watch_sizing_preserves_contract_proof_through_job_claim() -> None:
         assert plan is not None
         entry = plan.items[0]
         request_payload = {"test_scope": "core-v4-watch-sizing-job-claim"}
+        agent_response = {
+            "version": "manual-exec-agent-watch-sizing-v1",
+            "plan_id": plan.external_plan_id,
+            "_runtime_provenance": verified_runtime_provenance(
+                settings=settings,
+                request_payload=request_payload,
+                session_id="core-v4-watch-sizing-session",
+            ),
+            "decisions": [
+                {
+                    "execution_plan_item_id": entry.id,
+                    "symbol": entry.symbol,
+                    "action": "approve",
+                    "quantity": 2,
+                    "approved_notional_krw": "142000",
+                    "sizing_price": "71000",
+                    "confidence": 0.82,
+                    "target_profile": "short_swing",
+                    "reason_code": "approved",
+                    "reason": "bounded next-open entry",
+                }
+            ],
+        }
+        monkeypatch.setattr(
+            watch_sizing,
+            "_request_exec_agent_decisions",
+            lambda **_: agent_response,
+        )
+        decision_payload = watch_sizing._request_exec_agent_decisions_with_retries(
+            settings=settings,
+            db=session,
+            plan=plan,
+            payload=request_payload,
+            expected_item_ids={entry.id},
+        )
+        assert decision_payload == agent_response
+        assert entry.quantity_policy["exec_agent_watch_sizing_attempt_count"] == 1
+        assert entry.quantity_policy["exec_agent_watch_sizing_attempts"][-1][
+            "success"
+        ] is True
+        session.commit()
+        session.expire_all()
+        plan = session.scalar(
+            select(ExecutionPlan).options(selectinload(ExecutionPlan.items))
+        )
+        assert plan is not None
+        entry = plan.items[0]
         summary = _apply_decisions(
             db=session,
             settings=settings,
             plan=plan,
             request_payload=request_payload,
-            decision_payload={
-                "version": "manual-exec-agent-watch-sizing-v1",
-                "plan_id": plan.external_plan_id,
-                "_runtime_provenance": verified_runtime_provenance(
-                    settings=settings,
-                    request_payload=request_payload,
-                    session_id="core-v4-watch-sizing-session",
-                ),
-                "decisions": [
-                    {
-                        "execution_plan_item_id": entry.id,
-                        "symbol": entry.symbol,
-                        "action": "approve",
-                        "quantity": 2,
-                        "approved_notional_krw": "142000",
-                        "sizing_price": "71000",
-                        "confidence": 0.82,
-                        "target_profile": "short_swing",
-                        "reason_code": "approved",
-                        "reason": "bounded next-open entry",
-                    }
-                ],
-            },
+            decision_payload=decision_payload,
             account_context={
                 "available": True,
                 "orderable_cash_krw": "1000000",
@@ -1258,6 +1693,14 @@ def test_v4_watch_sizing_preserves_contract_proof_through_job_claim() -> None:
         assert summary["approved"] == 1
         assert len(entry.jobs) == 1
         assert core_handoff_v4.persisted_core_plan_contract_ack(plan) is not None
+        assert (
+                core_handoff_v4.reconcile_unproven_legacy_core_buy_authority(
+                    db=session,
+                    runtime_mode="paper",
+                    settings=settings,
+                )
+            == 0
+        )
         entry.status = "next_open_buy_dispatching"
         entry.jobs[0].status = "running"
         entry.jobs[0].locked_at = lease
@@ -1347,6 +1790,13 @@ def test_v4_terminal_watch_rejection_remains_proven_and_is_not_refenced() -> Non
     )
     assert v4_readback.status_code == 200
     assert v4_readback.json()[0]["status"] == "completed_no_trade"
+    v4_states = v4_readback.json()[0]["item_states"]
+    assert [state["status"] for state in v4_states] == [
+        "exec_agent_rejected",
+        "not_applicable",
+        "not_applicable",
+    ]
+    assert all(state["terminal"] is True for state in v4_states)
     execution_readback = client.get(
         "/execution-plans",
         params={"external_plan_id": payload["plan_id"]},
@@ -1380,6 +1830,1575 @@ def test_v4_terminal_watch_rejection_remains_proven_and_is_not_refenced() -> Non
             audit.event_type != "legacy_core_authority_quarantined"
             for audit in audits
         )
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    "terminal_path",
+    [
+        "missed_background",
+        "stale_broker_truth",
+        "missed_response",
+        "allowed_action_envelope",
+        "sizing_skip",
+        "zero_quantity",
+        "agent_terminal",
+    ],
+)
+def test_every_terminal_watch_writer_preserves_core_v4_contract_proof(
+    terminal_path: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        exec_agent_model="openai/gpt-5.6-sol",
+        kis_app_key="mock-key",
+        kis_app_secret="mock-secret",
+        kis_account_number="12345678",
+        kis_account_product_code="01",
+        account_drawdown_recovery_scope_secret=(
+            "core-v4-canonical-reject-secret-at-least-32-bytes"
+        ),
+    )
+    app, engine = _build_test_app(settings=settings)
+    client = TestClient(app)
+    payload = _plan_payload(plan_id=f"core-v4-{terminal_path}")
+    payload["mode"] = "paper"
+    _refresh_material_fingerprint(payload)
+    response = client.post("/v4/execution-plans", json=payload)
+    assert response.status_code == 201, response.json()
+
+    with app.state.db_session_factory() as session:
+        plan = session.scalar(
+            select(ExecutionPlan).options(selectinload(ExecutionPlan.items))
+        )
+        assert plan is not None
+        entry = next(item for item in plan.items if item.side == "buy")
+        decision_at = datetime(2026, 9, 9, 23, 30, tzinfo=UTC)
+
+        if terminal_path == "missed_background":
+            result = watch_sizing._expire_missed_next_open_items(
+                db=session,
+                settings=settings,
+                plan=plan,
+                now=datetime(2026, 9, 10, 0, 0, tzinfo=UTC),
+            )
+            assert result["rejected"] == 1
+            assert result["no_trade"]["completed"] is True
+            assert plan.status == "completed_no_trade"
+        elif terminal_path == "stale_broker_truth":
+            watch_sizing._reject_stale_state_blocked_item(
+                db=session,
+                item=entry,
+                blockers=[
+                    {
+                        "classification": "stale-terminal-unknown",
+                        "broker_order_id": "unknown-order",
+                    }
+                ],
+            )
+        else:
+            if terminal_path in {
+                "allowed_action_envelope",
+                "sizing_skip",
+                "zero_quantity",
+                "agent_terminal",
+            }:
+                monkeypatch.setattr(
+                    watch_sizing,
+                    "_allowed_action_envelope_for_item",
+                    lambda **_: {
+                        "allowed_actions": ["buy", "downsize", "reject"],
+                        "max_quantity": 3,
+                        "max_notional_krw": "213000.0000",
+                        "hard_reject_reasons": (
+                            ["existing_holding"]
+                            if terminal_path == "allowed_action_envelope"
+                            else []
+                        ),
+                        "soft_warnings": [],
+                    },
+                )
+            if terminal_path in {"sizing_skip", "zero_quantity"}:
+                monkeypatch.setattr(
+                    watch_sizing,
+                    "_adjust_approved_watch_quantity",
+                    lambda **_: {
+                        "decision": (
+                            "skip" if terminal_path == "sizing_skip" else "submit"
+                        ),
+                        "reason_code": "minimum_notional_unreachable",
+                        "reason": "deterministic sizing left no executable quantity",
+                        "quantity": 0,
+                        "approved_notional": Decimal("0"),
+                        "sizing_price": Decimal("71000"),
+                        "adjustment": {
+                            "agent_approved_quantity": 3,
+                            "agent_approved_notional": "213000.0000",
+                            "final_quantity": 0,
+                            "final_notional": "0.0000",
+                        },
+                    },
+                )
+            request_payload = {"test_scope": f"core-v4-{terminal_path}"}
+            action = "reject" if terminal_path == "agent_terminal" else "approve"
+            if terminal_path == "missed_response":
+                decision_at = datetime(2026, 9, 10, 0, 0, tzinfo=UTC)
+            result = _apply_decisions(
+                db=session,
+                settings=settings,
+                plan=plan,
+                request_payload=request_payload,
+                decision_payload={
+                    "version": "manual-exec-agent-watch-sizing-v1",
+                    "plan_id": plan.external_plan_id,
+                    "_runtime_provenance": verified_runtime_provenance(
+                        settings=settings,
+                        request_payload=request_payload,
+                        session_id=f"core-v4-{terminal_path}-session",
+                    ),
+                    "decisions": [
+                        {
+                            "execution_plan_item_id": entry.id,
+                            "symbol": entry.symbol,
+                            "action": action,
+                            "quantity": 3,
+                            "approved_notional_krw": "213000.0000",
+                            "sizing_price": "71000",
+                            "confidence": 0.9,
+                            "target_profile": "short_swing",
+                            "reason_code": "minimum_notional_unreachable",
+                            "reason": "proposal must not retain executable authority",
+                        }
+                    ],
+                },
+                account_context={
+                    "available": True,
+                    "orderable_cash_krw": "1000000",
+                    "buying_power_krw": "1000000",
+                    "holdings": [],
+                    "open_orders": [],
+                },
+                expected_item_ids={entry.id},
+                now=decision_at,
+            )
+            assert result["rejected"] == 1
+
+        decision = entry.quantity_policy["exec_agent_decision"]
+        assert entry.quantity_policy["rejection_disposition"] == "terminal"
+        assert decision["quantity"] == 0
+        assert decision["approved_quantity"] == 0
+        assert decision["approved_notional_krw"] is None
+        assert decision["sizing_price"] is None
+        assert core_handoff_v4.persisted_core_plan_contract_ack(plan) is not None
+        session.commit()
+
+    with app.state.db_session_factory() as session:
+        plan = session.scalar(
+            select(ExecutionPlan).options(selectinload(ExecutionPlan.items))
+        )
+        assert plan is not None
+        assert core_handoff_v4.persisted_core_plan_contract_ack(plan) is not None
+        assert (
+            core_handoff_v4.reconcile_unproven_legacy_core_buy_authority(
+                db=session,
+                runtime_mode="paper",
+            )
+            == 0
+        )
+    engine.dispose()
+
+
+@pytest.mark.parametrize("mismatch_kind", ["provider", "account_route"])
+def test_route_mismatch_rejection_does_not_quarantine_deferred_siblings(
+    mismatch_kind: str,
+) -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        kis_app_key="mock-key",
+        kis_app_secret="mock-secret",
+        kis_account_number="12345678",
+        kis_account_product_code="01",
+        account_drawdown_recovery_scope_secret=(
+            "core-v4-route-mismatch-secret-at-least-32-bytes"
+        ),
+    )
+    app, engine = _build_test_app(settings=settings)
+    client = TestClient(app)
+    payload = _multi_family_plan_payload(
+        plan_id=f"core-v4-{mismatch_kind}-sibling-isolation"
+    )
+    payload["mode"] = "paper"
+    _refresh_material_fingerprint(payload)
+    response = client.post("/v4/execution-plans", json=payload)
+    assert response.status_code == 201, response.json()
+
+    with app.state.db_session_factory() as session:
+        plan = session.scalar(
+            select(ExecutionPlan).options(selectinload(ExecutionPlan.items))
+        )
+        assert plan is not None
+        buys = sorted(
+            (item for item in plan.items if item.side == "buy"),
+            key=lambda item: item.plan_item_index,
+        )
+        assert len(buys) == 3
+        for item in buys[1:]:
+            item.risk_context = {
+                **item.risk_context,
+                "watch_exec_agent_deferred": {
+                    "disposition": "defer",
+                    "reason_code": "reward_risk_below_floor",
+                    "reason_family": "reward_risk",
+                    "reason": "await a fresh quote",
+                    "retry_after": "2099-01-01T00:00:00+00:00",
+                },
+            }
+
+        now = datetime(2026, 9, 9, 23, 30, tzinfo=UTC)
+        if mismatch_kind == "provider":
+            summaries = watch_sizing._quarantine_provider_mismatched_items(
+                settings=settings,
+                db=session,
+                plans=[plan],
+                adapter=SimpleNamespace(provider="alpaca"),
+                now=now,
+            )
+            expected_reason = "watch_exec_agent_sizing_route_unsupported"
+            mismatch_key = "provider_mismatch_item_ids"
+        else:
+            rotated = settings.model_copy(
+                update={"kis_account_number": "87654321"}
+            )
+            summaries = watch_sizing._quarantine_account_route_mismatched_items(
+                settings=rotated,
+                db=session,
+                plans=[plan],
+                now=now,
+            )
+            expected_reason = "account_route_mismatch"
+            mismatch_key = "account_route_mismatch_item_ids"
+
+        assert summaries[0][mismatch_key] == [buys[0].id]
+        rejected_decision = buys[0].quantity_policy["exec_agent_decision"]
+        assert buys[0].status == "exec_agent_rejected"
+        assert buys[0].quantity_policy["reason_code"] == expected_reason
+        assert rejected_decision["quantity"] == 0
+        assert rejected_decision["approved_quantity"] == 0
+        assert rejected_decision["approved_notional_krw"] is None
+        assert [item.status for item in buys[1:]] == [
+            "watch_sizing_pending",
+            "watch_sizing_pending",
+        ]
+        assert core_handoff_v4.persisted_core_plan_contract_ack(plan) is not None
+        assert (
+            core_handoff_v4.reconcile_unproven_legacy_core_buy_authority(
+                db=session,
+                runtime_mode="paper",
+            )
+            == 0
+        )
+        assert [item.status for item in buys] == [
+            "exec_agent_rejected",
+            "watch_sizing_pending",
+            "watch_sizing_pending",
+        ]
+    engine.dispose()
+
+
+def test_provider_mismatch_finalizes_an_all_terminal_family_without_exposure() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        kis_account_number="12345678",
+        kis_account_product_code="01",
+        account_drawdown_recovery_scope_secret=(
+            "core-v4-provider-finalizer-secret-at-least-32-bytes"
+        ),
+    )
+    app, engine = _build_test_app(settings=settings)
+    client = TestClient(app)
+    payload = _plan_payload(plan_id="core-v4-provider-finalizer")
+    payload["mode"] = "paper"
+    _refresh_material_fingerprint(payload)
+    response = client.post("/v4/execution-plans", json=payload)
+    assert response.status_code == 201, response.json()
+
+    with app.state.db_session_factory() as session:
+        plan = session.scalar(
+            select(ExecutionPlan).options(selectinload(ExecutionPlan.items))
+        )
+        assert plan is not None
+        summaries = watch_sizing._quarantine_provider_mismatched_items(
+            settings=settings,
+            db=session,
+            plans=[plan],
+            adapter=SimpleNamespace(provider="alpaca"),
+            now=datetime(2026, 9, 9, 23, 30, tzinfo=UTC),
+        )
+
+        assert summaries[0]["no_trade"]["completed"] is True
+        assert plan.status == "completed_no_trade"
+        assert [item.status for item in plan.items] == [
+            "exec_agent_rejected",
+            "not_applicable",
+            "not_applicable",
+        ]
+        assert core_handoff_v4.persisted_core_plan_contract_ack(plan) is not None
+    engine.dispose()
+
+
+def test_v4_mixed_terminal_rejects_do_not_quarantine_retryable_deferred_sibling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        exec_agent_model="openai/gpt-5.6-sol",
+        kis_app_key="mock-key",
+        kis_app_secret="mock-secret",
+        kis_account_number="12345678",
+        kis_account_product_code="01",
+        account_drawdown_recovery_scope_secret=(
+            "core-v4-mixed-outcome-secret-at-least-32-bytes"
+        ),
+    )
+    app, engine = _build_test_app(settings=settings)
+    client = TestClient(app)
+    payload = _multi_family_plan_payload(
+        plan_id="core-v4-mixed-watch-outcomes"
+    )
+    payload["mode"] = "paper"
+    _refresh_material_fingerprint(payload)
+
+    response = client.post("/v4/execution-plans", json=payload)
+    assert response.status_code == 201, response.json()
+
+    with app.state.db_session_factory() as session:
+        plan = session.scalar(
+            select(ExecutionPlan).options(selectinload(ExecutionPlan.items))
+        )
+        assert plan is not None
+        buy_items = sorted(
+            (item for item in plan.items if item.side == "buy"),
+            key=lambda item: item.plan_item_index,
+        )
+        assert len(buy_items) == 3
+        for index, item in enumerate(buy_items, start=1):
+            raw_policy = dict(item.quantity_policy)
+            attempted_policy = {
+                **raw_policy,
+                "exec_agent_watch_sizing_attempt_count": 1,
+                "exec_agent_watch_sizing_max_attempts": 3,
+                "exec_agent_watch_sizing_fallback_allowed": False,
+                "exec_agent_watch_sizing_attempts": [
+                    {
+                        "attempt": 1,
+                        "max_attempts": 3,
+                        "success": True,
+                        "recorded_at": f"2026-10-08T00:0{index}:00+00:00",
+                    }
+                ],
+            }
+            item.quantity_policy = attempted_policy
+        plan.status = "running"
+        monkeypatch.setattr(
+            watch_sizing,
+            "_allowed_action_envelope_for_item",
+            lambda **kwargs: {
+                "allowed_actions": ["buy", "downsize", "reject"],
+                "max_quantity": 3,
+                "max_notional_krw": "213000.0000",
+                "hard_reject_reasons": (
+                    ["reward_risk_below_minimum"]
+                    if kwargs["item"].symbol == "035420"
+                    else []
+                ),
+                "soft_warnings": [],
+            },
+        )
+        monkeypatch.setattr(
+            watch_sizing,
+            "_reward_risk_rejection_price_cap",
+            lambda **kwargs: (
+                Decimal("70000") if kwargs["item"].symbol == "035420" else None
+            ),
+        )
+        request_payload = {"test_scope": "actual-mixed-watch-outcomes"}
+        summary = _apply_decisions(
+            db=session,
+            settings=settings,
+            plan=plan,
+            request_payload=request_payload,
+            decision_payload={
+                "version": "manual-exec-agent-watch-sizing-v1",
+                "plan_id": plan.external_plan_id,
+                "_runtime_provenance": {
+                    "actual_agent_id": "wrong-agent",
+                    "actual_model_ref": settings.exec_agent_model,
+                    "session_id": "unverified-mixed-outcomes",
+                },
+                "decisions": [
+                    {
+                        "execution_plan_item_id": item.id,
+                        "symbol": item.symbol,
+                        "action": "approve" if index <= 2 else "reject",
+                        "quantity": 2 if index <= 2 else 0,
+                        "approved_notional_krw": (
+                            "142000.0000" if index <= 2 else None
+                        ),
+                        "sizing_price": "71000",
+                        "reason_code": (
+                            "agent_approval"
+                            if index <= 2
+                            else "reward_risk_below_floor"
+                        ),
+                        "reason": (
+                            "proposal has invalid runtime provenance"
+                            if index <= 2
+                            else "reward/risk must be recalculated on a fresh quote"
+                        ),
+                    }
+                    for index, item in enumerate(buy_items, start=1)
+                ],
+            },
+            account_context={
+                "available": True,
+                "orderable_cash_krw": "1000000",
+                "buying_power_krw": "1000000",
+                "holdings": [],
+                "open_orders": [],
+            },
+            expected_item_ids={item.id for item in buy_items},
+            now=datetime(2026, 9, 9, 23, 30, tzinfo=UTC),
+        )
+        assert summary["rejected"] == 2
+        assert summary["deferred"] == 1
+        session.commit()
+
+    with app.state.db_session_factory() as session:
+        plan = session.scalar(
+            select(ExecutionPlan).options(selectinload(ExecutionPlan.items))
+        )
+        assert plan is not None
+        assert core_handoff_v4.persisted_core_plan_contract_ack(plan) is not None
+        assert (
+            core_handoff_v4.reconcile_unproven_legacy_core_buy_authority(
+                db=session,
+                runtime_mode="paper",
+            )
+            == 0
+        )
+        buy_statuses = [
+            item.status
+            for item in sorted(plan.items, key=lambda item: item.plan_item_index)
+            if item.side == "buy"
+        ]
+        assert buy_statuses == [
+            "exec_agent_rejected",
+            "exec_agent_rejected",
+            "watch_sizing_pending",
+        ]
+        assert plan.status == "running"
+
+    readback = client.get(
+        "/v4/execution-plans",
+        params={"external_plan_id": payload["plan_id"]},
+    )
+    assert readback.status_code == 200
+    buy_states = [
+        state
+        for state in readback.json()[0]["item_states"]
+        if state["core_item_key"].endswith("next_open_buy")
+    ]
+    assert [state["status"] for state in buy_states] == [
+        "exec_agent_rejected",
+        "exec_agent_rejected",
+        "watch_sizing_pending",
+    ]
+    assert [state["terminal"] for state in buy_states] == [True, True, False]
+    assert buy_states[2]["decision"] == {
+        "action": "defer",
+        "decision": "deferred",
+        "reason_code": "reward_risk_below_floor",
+        "reason_family": "reward_risk",
+        "rejection_disposition": "defer",
+        "reason": "reward/risk must be recalculated on a fresh quote",
+        "retry_after": "2026-09-09T23:35:00+00:00",
+    }
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    "legacy_shape",
+    [
+        "missed_window",
+        "stale_broker_truth",
+        "allowed_action_envelope",
+        "sizing_skip",
+        "zero_quantity",
+    ],
+)
+def test_reconcile_migrates_pre_fix_terminal_reject_without_fencing_siblings(
+    legacy_shape: str,
+) -> None:
+    app, engine = _build_test_app()
+    client = TestClient(app)
+    payload = _multi_family_plan_payload(
+        plan_id="core-v4-pre-fix-terminal-reject",
+    )
+    response = client.post("/v4/execution-plans", json=payload)
+    assert response.status_code == 201, response.json()
+
+    with app.state.db_session_factory() as session:
+        plan = session.scalar(
+            select(ExecutionPlan).options(selectinload(ExecutionPlan.items))
+        )
+        assert plan is not None
+        buys = sorted(
+            (item for item in plan.items if item.side == "buy"),
+            key=lambda item: item.plan_item_index,
+        )
+        terminal, deferred, untouched = buys
+        raw_policy = deepcopy(terminal.quantity_policy)
+        decision_source = (
+            "watch_exec_agent_sizing"
+            if legacy_shape in {"missed_window", "stale_broker_truth"}
+            else "openclaw_exec_agent_watch_sizing"
+        )
+        proposed_quantity = 0 if legacy_shape in {
+            "missed_window",
+            "stale_broker_truth",
+        } else 3
+        reason_code = {
+            "missed_window": "missed_next_open_window",
+            "stale_broker_truth": "stale_order_broker_truth_unconfirmed",
+            "allowed_action_envelope": "allowed_action_envelope_blocked",
+            "sizing_skip": "approved_notional_below_minimum",
+            "zero_quantity": "allowed_action_envelope_blocked",
+        }[legacy_shape]
+        reason = {
+            "missed_window": (
+                "next-open sizing was not completed before the market-open deadline"
+            ),
+            "stale_broker_truth": (
+                "stale local open order could not be confirmed against broker truth"
+            ),
+            "allowed_action_envelope": (
+                "legacy deterministic envelope rejected this proposal"
+            ),
+            "sizing_skip": "approved notional was below the executable minimum",
+            "zero_quantity": "allowed action envelope left no buyable quantity",
+        }[legacy_shape]
+        legacy_decision = {
+            "source": decision_source,
+            "action": "reject",
+            "decision": "rejected",
+            "execution_plan_item_id": terminal.id,
+            "symbol": terminal.symbol,
+            "quantity": proposed_quantity,
+            "approved_quantity": proposed_quantity,
+            "approved_notional_krw": (
+                "0.0000" if proposed_quantity == 0 else "213000.0000"
+            ),
+            "reason_code": reason_code,
+            "reason": reason,
+            "decided_at": "2026-09-09T12:00:00+00:00",
+        }
+        if proposed_quantity:
+            legacy_decision["sizing_price"] = "71000.0000"
+        legacy_policy = {
+            "kind": "exec_agent_rejected",
+            "source": "exec_agent_watch_sizing",
+            "exec_agent_decision": legacy_decision,
+            "short_term_exec_agent_decision": legacy_decision,
+            "previous_policy": raw_policy,
+        }
+        if legacy_shape == "missed_window":
+            legacy_policy.update({"reason_code": reason_code, "reason": reason})
+            terminal.status = "next_open_buy_expired"
+        elif legacy_shape == "stale_broker_truth":
+            legacy_policy.update(
+                {
+                    "exec_agent_decision_audit": {
+                        "event_type": (
+                            "watch_exec_agent_sizing_stale_state_blocked"
+                        ),
+                        "storage": "execution_plan_item_audits",
+                    },
+                    "stale_state_blockers": [
+                        {
+                            "classification": "stale-terminal-unknown",
+                            "broker_order_id": "legacy-unknown-order",
+                        }
+                    ],
+                }
+            )
+            terminal.status = "exec_agent_rejected"
+        else:
+            legacy_policy.update(
+                {
+                    "exec_agent_decision_audit": {
+                        "event_type": "watch_exec_agent_sizing_decision",
+                        "storage": "execution_plan_item_audits",
+                    },
+                    "allowed_action_envelope": {
+                        "allowed_actions": ["reject"],
+                        "hard_reject_reasons": [reason_code],
+                    },
+                    "market_regime_guardrail": {"regime": "risk_off"},
+                }
+            )
+            if legacy_shape != "zero_quantity":
+                legacy_policy.update({"reason_code": reason_code, "reason": reason})
+            if legacy_shape == "sizing_skip":
+                legacy_policy.update(
+                    {
+                        "sizing_adjustment": {
+                            "agent_approved_quantity": 3,
+                            "agent_approved_notional": "213000.0000",
+                            "final_quantity": 0,
+                            "final_notional": "0.0000",
+                        },
+                        "sizing_explanation": {
+                            "reason_code": reason_code,
+                            "agent_proposed_quantity": 3,
+                        },
+                    }
+                )
+            terminal.status = "exec_agent_rejected"
+        terminal.quantity_policy = legacy_policy
+        deferred.risk_context = {
+            **deferred.risk_context,
+            "watch_exec_agent_deferred": {
+                "disposition": "defer",
+                "reason_family": "reward_risk",
+                "reason_code": "reward_risk_hard_block",
+                "reason": "wait for a safer entry",
+                "retry_after": "2026-09-09T12:10:00+00:00",
+            },
+        }
+        sibling_statuses = {
+            deferred.id: deferred.status,
+            untouched.id: untouched.status,
+        }
+        plan.status = "running"
+        session.commit()
+
+    with app.state.db_session_factory() as session:
+        assert (
+            core_handoff_v4.reconcile_unproven_legacy_core_buy_authority(
+                db=session,
+                runtime_mode="mock",
+                settings=app.state.settings,
+            )
+            == 1
+        )
+
+    with app.state.db_session_factory() as session:
+        plan = session.scalar(
+            select(ExecutionPlan).options(selectinload(ExecutionPlan.items))
+        )
+        assert plan is not None
+        buys = sorted(
+            (item for item in plan.items if item.side == "buy"),
+            key=lambda item: item.plan_item_index,
+        )
+        terminal, deferred, untouched = buys
+        decision = terminal.quantity_policy["exec_agent_decision"]
+        assert terminal.status == (
+            "next_open_buy_expired"
+            if legacy_shape == "missed_window"
+            else "exec_agent_rejected"
+        )
+        assert decision["reason_code"] == reason_code
+        assert decision["quantity"] == 0
+        assert decision["approved_quantity"] == 0
+        assert decision["approved_notional_krw"] is None
+        assert terminal.quantity_policy["rejection_disposition"] == "terminal"
+        assert deferred.status == sibling_statuses[deferred.id]
+        assert untouched.status == sibling_statuses[untouched.id]
+        assert plan.status == "running"
+        assert core_handoff_v4.persisted_core_plan_contract_ack(plan) is not None
+        audit = session.scalar(
+            select(ExecutionPlanItemAudit).where(
+                ExecutionPlanItemAudit.execution_plan_item_id == terminal.id,
+                ExecutionPlanItemAudit.event_type
+                == "legacy_watch_authority_canonicalized",
+            )
+        )
+        assert audit is not None
+        assert audit.payload["prior_quantity_policy"]["exec_agent_decision"][
+            "quantity"
+        ] == proposed_quantity
+    engine.dispose()
+
+
+def test_reconcile_zeroes_reported_unverified_watch_approval_only() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        exec_agent_model="openai/gpt-5.6-sol",
+        kis_app_key="mock-key",
+        kis_app_secret="mock-secret",
+        kis_account_number="12345678",
+        kis_account_product_code="01",
+        account_drawdown_recovery_scope_secret=(
+            "core-v4-unverified-migration-secret-at-least-32-bytes"
+        ),
+    )
+    app, engine = _build_test_app(settings=settings)
+    client = TestClient(app)
+    payload = _multi_family_plan_payload(
+        plan_id="core-v4-reported-unverified-watch-approval",
+    )
+    payload["mode"] = "paper"
+    for raw_item in payload["items"]:
+        if raw_item["side"] == "buy":
+            raw_item["intent"] = "intraday_watch_buy"
+            raw_item["trigger_price"] = "70000"
+            raw_item["limit_price"] = "71000"
+        elif raw_item["intent"] == "target_sell":
+            raw_item["trigger_price"] = "76000"
+        elif raw_item["intent"] == "stop_sell":
+            raw_item["trigger_price"] = "69000"
+    _refresh_material_fingerprint(payload)
+    response = client.post("/v4/execution-plans", json=payload)
+    assert response.status_code == 201, response.json()
+
+    with app.state.db_session_factory() as session:
+        plan = session.scalar(
+            select(ExecutionPlan).options(selectinload(ExecutionPlan.items))
+        )
+        assert plan is not None
+        buys = sorted(
+            (item for item in plan.items if item.side == "buy"),
+            key=lambda item: item.plan_item_index,
+        )
+        unverified, deferred, untouched = buys
+        request_payload = {"test_scope": "reported-unverified-migration"}
+        summary = _apply_decisions(
+            db=session,
+            settings=settings,
+            plan=plan,
+            request_payload=request_payload,
+            decision_payload={
+                "version": "manual-exec-agent-watch-sizing-v1",
+                "plan_id": plan.external_plan_id,
+                "_runtime_provenance": verified_runtime_provenance(
+                    settings=settings,
+                    request_payload=request_payload,
+                    session_id="reported-unverified-migration-session",
+                ),
+                "decisions": [
+                    {
+                        "execution_plan_item_id": unverified.id,
+                        "symbol": unverified.symbol,
+                        "action": "approve",
+                        "quantity": 2,
+                        "approved_notional_krw": "142000",
+                        "sizing_price": "71000",
+                        "confidence": 0.82,
+                        "target_profile": "short_swing",
+                        "reason_code": "approved",
+                        "reason": "pre-fix runtime accepted reported metadata",
+                    }
+                ],
+            },
+            account_context={
+                "available": True,
+                "orderable_cash_krw": "1000000",
+                "buying_power_krw": "1000000",
+                "holdings": [],
+                "open_orders": [],
+            },
+            expected_item_ids={unverified.id},
+            now=datetime(2026, 9, 9, 23, 30, tzinfo=UTC),
+        )
+        assert summary["approved"] == 1
+        assert unverified.status == "watch_monitoring_active"
+        legacy_runtime = dict(
+            unverified.quantity_policy["approval_provenance"]["runtime"]
+        )
+        legacy_runtime.pop("runtime_contract")
+        legacy_runtime.pop("verified_agent_id", None)
+        legacy_runtime.pop("agent_identity_source", None)
+        legacy_runtime["actual_agent_id"] = None
+        legacy_runtime["metadata_status"] = "partial"
+        legacy_decision = {
+            **unverified.quantity_policy["exec_agent_decision"],
+            "runtime_provenance": legacy_runtime,
+        }
+        unverified.quantity_policy = {
+            **unverified.quantity_policy,
+            "approval_provenance": {
+                "kind": "reported_unverified_exec_agent_watch_sizing",
+                "runtime": legacy_runtime,
+            },
+            "exec_agent_decision": legacy_decision,
+            "short_term_exec_agent_decision": legacy_decision,
+        }
+        deferred.risk_context = {
+            **deferred.risk_context,
+            "watch_exec_agent_deferred": {
+                "disposition": "defer",
+                "reason_family": "reward_risk",
+                "reason_code": "reward_risk_hard_block",
+                "reason": "wait for a safer entry",
+                "retry_after": "2026-09-09T12:10:00+00:00",
+            },
+        }
+        sibling_statuses = {
+            deferred.id: deferred.status,
+            untouched.id: untouched.status,
+        }
+        session.commit()
+
+    with app.state.db_session_factory() as session:
+        plan = session.scalar(
+            select(ExecutionPlan).options(selectinload(ExecutionPlan.items))
+        )
+        assert plan is not None
+        assert core_handoff_v4.persisted_core_plan_contract_ack(plan) is None
+        assert (
+            core_handoff_v4.reconcile_unproven_legacy_core_buy_authority(
+                db=session,
+                runtime_mode="paper",
+                settings=settings,
+            )
+            == 1
+        )
+
+    with app.state.db_session_factory() as session:
+        plan = session.scalar(
+            select(ExecutionPlan).options(selectinload(ExecutionPlan.items))
+        )
+        assert plan is not None
+        buys = sorted(
+            (item for item in plan.items if item.side == "buy"),
+            key=lambda item: item.plan_item_index,
+        )
+        unverified, deferred, untouched = buys
+        decision = unverified.quantity_policy["exec_agent_decision"]
+        assert unverified.status == "exec_agent_rejected"
+        assert decision["reason_code"] == "unverified_exec_agent_runtime"
+        assert decision["quantity"] == 0
+        assert decision["approved_quantity"] == 0
+        assert decision["approved_notional_krw"] is None
+        assert "approval_provenance" not in unverified.quantity_policy
+        assert deferred.status == sibling_statuses[deferred.id]
+        assert untouched.status == sibling_statuses[untouched.id]
+        assert plan.status != "contract_quarantined"
+        assert core_handoff_v4.persisted_core_plan_contract_ack(plan) is not None
+        audit = session.scalar(
+            select(ExecutionPlanItemAudit).where(
+                ExecutionPlanItemAudit.execution_plan_item_id == unverified.id,
+                ExecutionPlanItemAudit.event_type
+                == "legacy_watch_authority_canonicalized",
+            )
+        )
+        assert audit is not None
+        assert audit.payload["prior_quantity_policy"]["quantity"] == 2
+    engine.dispose()
+
+
+def test_direct_fence_canonicalizes_unverified_watch_approval_before_submission() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        exec_agent_model="openai/gpt-5.6-sol",
+        kis_app_key="mock-key",
+        kis_app_secret="mock-secret",
+        kis_account_number="12345678",
+        kis_account_product_code="01",
+        account_drawdown_recovery_scope_secret=(
+            "core-v4-direct-fence-migration-secret-at-least-32-bytes"
+        ),
+    )
+    app, engine = _build_test_app(settings=settings)
+    client = TestClient(app)
+    payload = _plan_payload(plan_id="core-v4-direct-fence-unverified-approval")
+    payload["mode"] = "paper"
+    payload["items"][0]["intent"] = "intraday_watch_buy"
+    payload["items"][0]["trigger_price"] = "70000"
+    payload["items"][0]["limit_price"] = "71000"
+    payload["items"][1]["trigger_price"] = "76000"
+    payload["items"][2]["trigger_price"] = "69000"
+    _refresh_material_fingerprint(payload)
+    response = client.post("/v4/execution-plans", json=payload)
+    assert response.status_code == 201, response.json()
+
+    with app.state.db_session_factory() as session:
+        plan = session.scalar(
+            select(ExecutionPlan).options(selectinload(ExecutionPlan.items))
+        )
+        assert plan is not None
+        entry = next(item for item in plan.items if item.side == "buy")
+        request_payload = {"test_scope": "direct-fence-unverified-approval"}
+        summary = _apply_decisions(
+            db=session,
+            settings=settings,
+            plan=plan,
+            request_payload=request_payload,
+            decision_payload={
+                "version": "manual-exec-agent-watch-sizing-v1",
+                "plan_id": plan.external_plan_id,
+                "_runtime_provenance": verified_runtime_provenance(
+                    settings=settings,
+                    request_payload=request_payload,
+                    session_id="direct-fence-unverified-approval-session",
+                ),
+                "decisions": [
+                    {
+                        "execution_plan_item_id": entry.id,
+                        "symbol": entry.symbol,
+                        "action": "approve",
+                        "quantity": 2,
+                        "approved_notional_krw": "142000",
+                        "sizing_price": "71000",
+                        "confidence": 0.82,
+                        "target_profile": "short_swing",
+                        "reason_code": "approved",
+                        "reason": "historical runtime trusted reported metadata",
+                    }
+                ],
+            },
+            account_context={
+                "available": True,
+                "orderable_cash_krw": "1000000",
+                "buying_power_krw": "1000000",
+                "holdings": [],
+                "open_orders": [],
+            },
+            expected_item_ids={entry.id},
+            now=datetime(2026, 9, 9, 23, 30, tzinfo=UTC),
+        )
+        assert summary["approved"] == 1
+        entry.quantity_policy = {
+            **entry.quantity_policy,
+            "approval_provenance": {
+                **entry.quantity_policy["approval_provenance"],
+                "kind": "reported_unverified_exec_agent_watch_sizing",
+            },
+        }
+        session.commit()
+        entry_id = entry.id
+
+    with app.state.db_session_factory() as session:
+        assert session.scalars(select(BrokerOrder)).all() == []
+        assert core_handoff_v4.fence_unproven_legacy_core_buy_authority(
+            db=session,
+            execution_plan_item_id=entry_id,
+            settings=settings,
+        ) is True
+        assert session.scalars(select(BrokerOrder)).all() == []
+
+    with app.state.db_session_factory() as session:
+        plan = session.scalar(
+            select(ExecutionPlan).options(selectinload(ExecutionPlan.items))
+        )
+        assert plan is not None
+        entry = next(item for item in plan.items if item.side == "buy")
+        exits = [item for item in plan.items if item.side == "sell"]
+        decision = entry.quantity_policy["exec_agent_decision"]
+        assert entry.status == "exec_agent_rejected"
+        assert decision["quantity"] == 0
+        assert decision["approved_quantity"] == 0
+        assert decision["approved_notional_krw"] is None
+        assert plan.status == "completed_no_trade"
+        assert {item.status for item in exits} == {"not_applicable"}
+        assert core_handoff_v4.persisted_core_plan_contract_ack(plan) is not None
+        assert session.scalars(select(BrokerOrder)).all() == []
+
+    readback = client.get(
+        "/v4/execution-plans",
+        params={"external_plan_id": payload["plan_id"]},
+    )
+    assert readback.status_code == 200
+    assert readback.json()[0]["status"] == "completed_no_trade"
+    assert [state["status"] for state in readback.json()[0]["item_states"]] == [
+        "exec_agent_rejected",
+        "not_applicable",
+        "not_applicable",
+    ]
+    assert all(state["terminal"] for state in readback.json()[0]["item_states"])
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    "exposure_kind",
+    [
+        "linked_broker_order",
+        "scoped_position",
+        "legacy_unscoped_position",
+        "unlinked_active_order",
+        "unlinked_filled_order",
+        "unlinked_fill_evidence",
+        "unlinked_unknown_order",
+        "unlinked_blank_venue",
+    ],
+)
+def test_reconcile_does_not_zero_unverified_approval_with_possible_exposure(
+    exposure_kind: str,
+) -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        exec_agent_model="openai/gpt-5.6-sol",
+        kis_account_number="12345678",
+        kis_account_product_code="01",
+        account_drawdown_recovery_scope_secret=(
+            "core-v4-exposure-migration-secret-at-least-32-bytes"
+        ),
+    )
+    app, engine = _build_test_app(settings=settings)
+    client = TestClient(app)
+    payload = _multi_family_plan_payload(
+        plan_id="core-v4-unverified-with-exposure"
+    )
+    payload["mode"] = "paper"
+    for raw_item in payload["items"]:
+        if raw_item["side"] == "buy":
+            raw_item["intent"] = "intraday_watch_buy"
+            raw_item["trigger_price"] = "70000"
+            raw_item["limit_price"] = "71000"
+        elif raw_item["intent"] == "target_sell":
+            raw_item["trigger_price"] = "76000"
+        elif raw_item["intent"] == "stop_sell":
+            raw_item["trigger_price"] = "69000"
+    _refresh_material_fingerprint(payload)
+    response = client.post("/v4/execution-plans", json=payload)
+    assert response.status_code == 201, response.json()
+
+    with app.state.db_session_factory() as session:
+        plan = session.scalar(
+            select(ExecutionPlan).options(selectinload(ExecutionPlan.items))
+        )
+        assert plan is not None
+        entries = sorted(
+            (item for item in plan.items if item.side == "buy"),
+            key=lambda item: item.plan_item_index,
+        )
+        entry, deferred, untouched = entries
+        request_payload = {"test_scope": "unverified-with-exposure"}
+        summary = _apply_decisions(
+            db=session,
+            settings=settings,
+            plan=plan,
+            request_payload=request_payload,
+            decision_payload={
+                "version": "manual-exec-agent-watch-sizing-v1",
+                "plan_id": plan.external_plan_id,
+                "_runtime_provenance": verified_runtime_provenance(
+                    settings=settings,
+                    request_payload=request_payload,
+                    session_id="unverified-with-exposure-session",
+                ),
+                "decisions": [
+                    {
+                        "execution_plan_item_id": entry.id,
+                        "symbol": entry.symbol,
+                        "action": "approve",
+                        "quantity": 2,
+                        "approved_notional_krw": "142000",
+                        "sizing_price": "71000",
+                        "confidence": 0.82,
+                        "target_profile": "short_swing",
+                        "reason_code": "approved",
+                        "reason": "pre-fix approval with possible exposure",
+                    }
+                ],
+            },
+            account_context={
+                "available": True,
+                "orderable_cash_krw": "1000000",
+                "buying_power_krw": "1000000",
+                "holdings": [],
+                "open_orders": [],
+            },
+            expected_item_ids={entry.id},
+            now=datetime(2026, 9, 9, 23, 30, tzinfo=UTC),
+        )
+        assert summary["approved"] == 1
+        entry.quantity_policy = {
+            **entry.quantity_policy,
+            "approval_provenance": {
+                **entry.quantity_policy["approval_provenance"],
+                "kind": "reported_unverified_exec_agent_watch_sizing",
+            },
+        }
+        deferred.status = "watch_sizing_pending"
+        deferred.risk_context = {
+            **deferred.risk_context,
+            "watch_exec_agent_deferred": {
+                "disposition": "defer",
+                "reason_family": "reward_risk",
+                "reason_code": "reward_risk_hard_block",
+                "reason": "wait for a safer entry",
+                "retry_after": "2026-09-09T12:10:00+00:00",
+            },
+        }
+        for candidate in entries:
+            session.add(
+                ExecutionJob(
+                    id=f"job-{candidate.id}",
+                    execution_plan_item_id=candidate.id,
+                    job_type="intraday_watch_buy",
+                    status="queued",
+                )
+            )
+        sibling_statuses = {
+            item.id: item.status for item in plan.items if item.id != entry.id
+        }
+        if exposure_kind in {"scoped_position", "legacy_unscoped_position"}:
+            identity = build_position_identity(
+                settings=settings,
+                provider="kis",
+                exchange="KRX",
+            )
+            session.add(
+                ExecutionPosition(
+                    mode="paper",
+                    provider=(
+                        identity.provider if exposure_kind == "scoped_position" else None
+                    ),
+                    account_scope=(
+                        identity.account_scope
+                        if exposure_kind == "scoped_position"
+                        else None
+                    ),
+                    exchange=(
+                        identity.exchange if exposure_kind == "scoped_position" else None
+                    ),
+                    symbol=entry.symbol,
+                    quantity=2,
+                    updated_from="broker_reconciliation",
+                )
+            )
+        else:
+            order = BrokerOrder(
+                execution_plan_item_id=(
+                    entry.id if exposure_kind == "linked_broker_order" else None
+                ),
+                broker_name="kis",
+                mode="paper",
+                idempotency_key=f"unverified-with-exposure:{exposure_kind}",
+                broker_order_id=f"broker-order-{exposure_kind}",
+                symbol=entry.symbol,
+                side="buy",
+                status=(
+                    "filled"
+                    if exposure_kind == "unlinked_filled_order"
+                    else "mystery"
+                    if exposure_kind == "unlinked_unknown_order"
+                    else "failed"
+                    if exposure_kind == "unlinked_fill_evidence"
+                    else "open"
+                ),
+                quantity=2,
+                venue=("" if exposure_kind == "unlinked_blank_venue" else "KRX"),
+            )
+            session.add(order)
+            if exposure_kind == "unlinked_fill_evidence":
+                session.flush()
+                session.add(
+                    ExecutionFill(
+                        broker_order_pk=order.id,
+                        broker_fill_id="unlinked-fill-evidence",
+                        symbol=entry.symbol,
+                        side="buy",
+                        quantity=2,
+                        price=Decimal("71000"),
+                        filled_at=datetime(2026, 9, 9, 23, 35, tzinfo=UTC),
+                    )
+                )
+        session.commit()
+
+    with app.state.db_session_factory() as session:
+        assert (
+            core_handoff_v4.reconcile_unproven_legacy_core_buy_authority(
+                db=session,
+                runtime_mode="paper",
+                settings=settings,
+            )
+            == 1
+        )
+
+    with app.state.db_session_factory() as session:
+        plan = session.scalar(
+            select(ExecutionPlan).options(selectinload(ExecutionPlan.items))
+        )
+        assert plan is not None
+        entries = sorted(
+            (item for item in plan.items if item.side == "buy"),
+            key=lambda item: item.plan_item_index,
+        )
+        entry, deferred, untouched = entries
+        protective_exits = [item for item in plan.items if item.side == "sell"]
+        assert entry.status == "manual_review_required"
+        assert entry.quantity_policy["quantity"] == 2
+        assert plan.status == "manual_review_required"
+        assert deferred.status == sibling_statuses[deferred.id]
+        assert untouched.status == sibling_statuses[untouched.id]
+        assert all(
+            item.status == sibling_statuses[item.id] for item in protective_exits
+        )
+        jobs = {
+            job.execution_plan_item_id: job
+            for job in session.scalars(select(ExecutionJob)).all()
+        }
+        assert jobs[entry.id].status == "revoked"
+        assert jobs[deferred.id].status == "queued"
+        assert jobs[untouched.id].status == "queued"
+        assert session.scalar(
+            select(ExecutionPlanItemAudit).where(
+                ExecutionPlanItemAudit.execution_plan_item_id == entry.id,
+                ExecutionPlanItemAudit.event_type
+                == "legacy_watch_authority_canonicalized",
+            )
+        ) is None
+    engine.dispose()
+
+
+def test_invalid_linked_exit_fences_only_its_entry_family() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        exec_agent_model="openai/gpt-5.6-sol",
+        kis_account_number="12345678",
+        kis_account_product_code="01",
+        account_drawdown_recovery_scope_secret=(
+            "core-v4-linked-exit-fence-secret-at-least-32-bytes"
+        ),
+    )
+    app, engine = _build_test_app(settings=settings)
+    client = TestClient(app)
+    payload = _multi_family_plan_payload(
+        plan_id="core-v4-invalid-linked-exit-family"
+    )
+    payload["mode"] = "paper"
+    for raw_item in payload["items"]:
+        if raw_item["side"] == "buy":
+            raw_item["quantity_policy"].update(
+                {
+                    "budget_krw": "200000",
+                    "estimated_reference_price": "71000",
+                }
+            )
+            raw_item["limit_price"] = "71000"
+        elif raw_item["intent"] == "target_sell":
+            raw_item["trigger_price"] = "76000"
+        elif raw_item["intent"] == "stop_sell":
+            raw_item["trigger_price"] = "69000"
+    _refresh_material_fingerprint(payload)
+    response = client.post("/v4/execution-plans", json=payload)
+    assert response.status_code == 201, response.json()
+
+    with app.state.db_session_factory() as session:
+        plan = session.scalar(
+            select(ExecutionPlan).options(selectinload(ExecutionPlan.items))
+        )
+        assert plan is not None
+        entries = sorted(
+            (item for item in plan.items if item.side == "buy"),
+            key=lambda item: item.plan_item_index,
+        )
+        affected, deferred, untouched = entries
+        request_payload = {"test_scope": "valid-sibling-after-family-fence"}
+        summary = _apply_decisions(
+            db=session,
+            settings=settings,
+            plan=plan,
+            request_payload=request_payload,
+            decision_payload={
+                "version": "manual-exec-agent-watch-sizing-v1",
+                "plan_id": plan.external_plan_id,
+                "_runtime_provenance": verified_runtime_provenance(
+                    settings=settings,
+                    request_payload=request_payload,
+                    session_id="valid-sibling-after-family-fence-session",
+                ),
+                "decisions": [
+                    {
+                        "execution_plan_item_id": untouched.id,
+                        "symbol": untouched.symbol,
+                        "action": "approve",
+                        "quantity": 2,
+                        "approved_notional_krw": "142000",
+                        "sizing_price": "71000",
+                        "confidence": 0.82,
+                        "target_profile": "short_swing",
+                        "reason_code": "approved",
+                        "reason": "valid sibling remains executable",
+                    }
+                ],
+            },
+            account_context={
+                "available": True,
+                "orderable_cash_krw": "1000000",
+                "buying_power_krw": "1000000",
+                "holdings": [],
+                "open_orders": [],
+            },
+            expected_item_ids={untouched.id},
+            now=datetime(2026, 9, 9, 23, 30, tzinfo=UTC),
+        )
+        assert summary["approved"] == 1
+        assert len(untouched.jobs) == 1
+        linked_exit = next(
+            item
+            for item in plan.items
+            if item.side == "sell"
+            and item.quantity_policy.get("linked_entry_item_key")
+            == affected.source_plan_item_id
+        )
+        linked_exit.quantity_policy = {
+            **linked_exit.quantity_policy,
+            "linked_entry_item_key": "tampered-entry-key",
+        }
+        deferred.status = "watch_sizing_pending"
+        for entry in (affected, deferred):
+            session.add(
+                ExecutionJob(
+                    id=f"linked-exit-job-{entry.id}",
+                    execution_plan_item_id=entry.id,
+                    job_type="next_open_buy",
+                    status="queued",
+                )
+            )
+        lease = datetime(2026, 9, 9, 23, 40, tzinfo=UTC)
+        untouched.status = "next_open_buy_dispatching"
+        untouched.jobs[0].status = "running"
+        untouched.jobs[0].locked_at = lease
+        untouched_job_id = untouched.jobs[0].id
+        sibling_statuses = {
+            item.id: item.status for item in plan.items if item.id != affected.id
+        }
+        session.commit()
+        affected_id = affected.id
+        deferred_id = deferred.id
+        untouched_id = untouched.id
+
+    with app.state.db_session_factory() as session:
+        plan = session.scalar(
+            select(ExecutionPlan).options(selectinload(ExecutionPlan.items))
+        )
+        assert plan is not None
+        assert core_handoff_v4.persisted_core_plan_contract_ack(plan) is None
+        assert core_handoff_v4.fence_unproven_legacy_core_buy_authority(
+            db=session,
+            execution_plan_item_id=affected_id,
+            settings=settings,
+        ) is True
+        assert core_handoff_v4.fence_unproven_legacy_core_buy_authority(
+            db=session,
+            execution_plan_item_id=deferred_id,
+            settings=settings,
+        ) is False
+        assert _lock_job_for_broker_submission(
+            db=session,
+            job_id=untouched_job_id,
+            expected_locked_at=lease,
+            settings=settings,
+        ) is not None
+
+    with app.state.db_session_factory() as session:
+        plan = session.scalar(
+            select(ExecutionPlan).options(selectinload(ExecutionPlan.items))
+        )
+        assert plan is not None
+        items = {item.id: item for item in plan.items}
+        assert items[affected_id].status == "contract_quarantined"
+        assert items[deferred_id].status == sibling_statuses[deferred_id]
+        assert items[untouched_id].status == sibling_statuses[untouched_id]
+        for item_id, prior_status in sibling_statuses.items():
+            assert items[item_id].status == prior_status
+        jobs = {
+            job.execution_plan_item_id: job
+            for job in session.scalars(select(ExecutionJob)).all()
+        }
+        assert jobs[affected_id].status == "revoked"
+        assert jobs[deferred_id].status == "queued"
+        assert jobs[untouched_id].status == "running"
+        assert plan.status == "manual_review_required"
+    engine.dispose()
+
+
+def test_ambiguous_persisted_item_mapping_fences_all_entry_families() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        kis_account_number="12345678",
+        kis_account_product_code="01",
+        account_drawdown_recovery_scope_secret=(
+            "core-v4-ambiguous-mapping-secret-at-least-32-bytes"
+        ),
+    )
+    app, engine = _build_test_app(settings=settings)
+    client = TestClient(app)
+    payload = _multi_family_plan_payload(
+        plan_id="core-v4-ambiguous-persisted-item-mapping"
+    )
+    payload["mode"] = "paper"
+    _refresh_material_fingerprint(payload)
+    response = client.post("/v4/execution-plans", json=payload)
+    assert response.status_code == 201, response.json()
+
+    with app.state.db_session_factory() as session:
+        plan = session.scalar(
+            select(ExecutionPlan).options(selectinload(ExecutionPlan.items))
+        )
+        assert plan is not None
+        entries = sorted(
+            (item for item in plan.items if item.side == "buy"),
+            key=lambda item: item.plan_item_index,
+        )
+        entries[1].source_plan_item_id = entries[0].source_plan_item_id
+        for entry in entries:
+            session.add(
+                ExecutionJob(
+                    id=f"ambiguous-mapping-job-{entry.id}",
+                    execution_plan_item_id=entry.id,
+                    job_type="next_open_buy",
+                    status="queued",
+                )
+            )
+        exit_statuses = {
+            item.id: item.status for item in plan.items if item.side == "sell"
+        }
+        session.commit()
+        target_entry_id = entries[0].id
+        entry_ids = {item.id for item in entries}
+
+    with app.state.db_session_factory() as session:
+        plan = session.scalar(
+            select(ExecutionPlan).options(selectinload(ExecutionPlan.items))
+        )
+        assert plan is not None
+        assert core_handoff_v4._unproven_core_buy_item_ids(plan) is None
+        assert core_handoff_v4.fence_unproven_legacy_core_buy_authority(
+            db=session,
+            execution_plan_item_id=target_entry_id,
+            settings=settings,
+        ) is True
+
+    with app.state.db_session_factory() as session:
+        plan = session.scalar(
+            select(ExecutionPlan).options(selectinload(ExecutionPlan.items))
+        )
+        assert plan is not None
+        items = {item.id: item for item in plan.items}
+        assert {items[item_id].status for item_id in entry_ids} == {
+            "contract_quarantined"
+        }
+        assert all(
+            items[item_id].status == prior_status
+            for item_id, prior_status in exit_statuses.items()
+        )
+        jobs = session.scalars(select(ExecutionJob)).all()
+        assert {job.status for job in jobs} == {"revoked"}
+        assert plan.status == "contract_quarantined"
+    engine.dispose()
+
+
+def test_v4_readback_keeps_immutable_acks_visible_for_quarantined_current_state() -> None:
+    app, engine = _build_test_app()
+    client = TestClient(app)
+    payload = _plan_payload(plan_id="core-v4-quarantined-readback")
+    create_response = client.post("/v4/execution-plans", json=payload)
+    assert create_response.status_code == 201, create_response.json()
+    immutable_item_acks = create_response.json()["item_acks"]
+
+    with app.state.db_session_factory() as session:
+        plan = session.scalar(
+            select(ExecutionPlan).options(selectinload(ExecutionPlan.items))
+        )
+        assert plan is not None
+        entry = next(item for item in plan.items if item.side == "buy")
+        entry.quantity_policy = {
+            **entry.quantity_policy,
+            "kind": "shares",
+            "quantity": 999,
+            "source": "unproven-sizing",
+            "exec_agent_decision": {
+                "action": "approve",
+                "decision": "approved",
+                "reason_code": "unproven_approval",
+                "reason": "must never override parent quarantine",
+            },
+        }
+        entry.status = "contract_quarantined"
+        plan.status = "contract_quarantined"
+        session.commit()
+
+    with app.state.db_session_factory() as session:
+        plan = session.scalar(
+            select(ExecutionPlan).options(selectinload(ExecutionPlan.items))
+        )
+        assert plan is not None
+        assert core_handoff_v4.persisted_core_plan_contract_ack(plan) is None
+
+    readback = client.get(
+        "/v4/execution-plans",
+        params={"external_plan_id": payload["plan_id"]},
+    )
+    assert readback.status_code == 200
+    assert len(readback.json()) == 1
+    assert readback.json()[0]["item_acks"] == immutable_item_acks
+    entry_state = next(
+        state
+        for state in readback.json()[0]["item_states"]
+        if state["core_item_key"].endswith("next_open_buy")
+    )
+    assert entry_state["status"] == "contract_quarantined"
+    assert entry_state["terminal"] is True
+    assert entry_state["decision"] == {
+        "action": "reject",
+        "decision": "rejected",
+        "reason_code": "persisted_v4_contract_not_proven",
+        "reason_family": "runtime_contract",
+        "rejection_disposition": "terminal",
+        "reason": "current item authority is contract-quarantined",
+    }
+    engine.dispose()
+
+
+def test_v4_readback_paginates_with_bounded_query_parameters() -> None:
+    app, engine = _build_test_app()
+    client = TestClient(app)
+    plan_ids = {f"core-v4-page-{index}" for index in range(3)}
+    for plan_id in sorted(plan_ids):
+        response = client.post(
+            "/v4/execution-plans",
+            json=_plan_payload(plan_id=plan_id),
+        )
+        assert response.status_code == 201, response.json()
+
+    first_page = client.get(
+        "/v4/execution-plans",
+        params={"limit": 2, "offset": 0},
+    )
+    second_page = client.get(
+        "/v4/execution-plans",
+        params={"limit": 2, "offset": 2},
+    )
+
+    assert first_page.status_code == 200
+    assert second_page.status_code == 200
+    assert len(first_page.json()) == 2
+    assert len(second_page.json()) == 1
+    assert {
+        plan["plan_id"] for plan in first_page.json() + second_page.json()
+    } == plan_ids
+    assert client.get("/v4/execution-plans", params={"limit": 0}).status_code == 422
+    assert client.get("/v4/execution-plans", params={"limit": 501}).status_code == 422
+    assert client.get("/v4/execution-plans", params={"offset": -1}).status_code == 422
+    assert (
+        client.get("/v4/execution-plans", params={"offset": 10001}).status_code
+        == 422
+    )
     engine.dispose()
 
 
@@ -1459,7 +3478,7 @@ def test_v4_contract_proof_rejects_exec_agent_policy_decision_drift(
     engine.dispose()
 
 
-def test_v4_contract_proof_allows_exact_short_term_linked_exit_transform() -> None:
+def test_v4_contract_proof_rejects_unproven_short_term_linked_exit_transform() -> None:
     app, engine = _build_test_app()
     client = TestClient(app)
     response = client.post(
@@ -1501,7 +3520,16 @@ def test_v4_contract_proof_allows_exact_short_term_linked_exit_transform() -> No
             }
         session.flush()
 
-        assert core_handoff_v4.persisted_core_plan_contract_ack(plan) is not None
+        assert core_handoff_v4.persisted_core_plan_contract_ack(plan) is None
+        assert core_handoff_v4.fence_unproven_legacy_core_buy_authority(
+            db=session,
+            execution_plan_item_id=entry.id,
+            settings=app.state.settings,
+        ) is True
+        assert entry.status == "contract_quarantined"
+        assert all(
+            item.status != "contract_quarantined" for item in protective_exits
+        )
     engine.dispose()
 
 
