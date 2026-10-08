@@ -50,6 +50,11 @@ from app.services.execution_exposure import (
     item_has_any_broker_exposure as _item_has_any_broker_exposure,
     item_has_external_possible_exposure as _item_has_external_possible_exposure,
 )
+from app.services.core_revocation_exposure import (
+    RevocationExposureSerializationBusy,
+    item_has_revocation_possible_exposure as _item_has_revocation_possible_exposure,
+    serialized_revocation_exposure,
+)
 from app.services.exec_agent_approval import (
     persisted_verified_watch_sizing_provenance,
 )
@@ -2376,6 +2381,55 @@ def revoke_core_execution_plan_v4(
             persisted_items=locked_by_key,
         )
 
+    buy_items = [
+        item
+        for item in locked_items
+        if item.side == "buy" and item.intent in ENTRY_INTENTS
+    ]
+    try:
+        with serialized_revocation_exposure(
+            db=db,
+            settings=settings,
+            items=(
+                buy_items
+                if intake_only_revocation and not already_revoked
+                else ()
+            ),
+        ):
+            return _revoke_locked_core_execution_plan_v4(
+                settings=settings,
+                db=db,
+                command=command,
+                plan=plan,
+                locked_items=locked_items,
+                locked_by_key=locked_by_key,
+                buy_items=buy_items,
+                intake_only_revocation=intake_only_revocation,
+                already_revoked=already_revoked,
+            )
+    except RevocationExposureSerializationBusy:
+        return _revocation_failure(
+            command=command,
+            status_code=409,
+            status="blocked",
+            reason_code="revocation_exposure_scope_busy",
+            execution_plan_id=plan.id,
+            persisted_items=locked_by_key,
+        )
+
+
+def _revoke_locked_core_execution_plan_v4(
+    *,
+    settings: Settings,
+    db: Session,
+    command: CoreExecutionRevocationRequestV4,
+    plan: ExecutionPlan,
+    locked_items: Sequence[ExecutionPlanItem],
+    locked_by_key: dict[str, ExecutionPlanItem],
+    buy_items: Sequence[ExecutionPlanItem],
+    intake_only_revocation: bool,
+    already_revoked: bool,
+) -> CreateExecutionPlanResult:
     item_ids = {item.id for item in locked_items}
     jobs = db.scalars(
         select(ExecutionJob)
@@ -2402,14 +2456,10 @@ def revoke_core_execution_plan_v4(
         for order in broker_orders
         if not _broker_order_is_provably_unsubmitted(order)
     ]
-    buy_items = [
-        item
-        for item in locked_items
-        if item.side == "buy" and item.intent in ENTRY_INTENTS
-    ]
     buy_item_ids = {item.id for item in buy_items}
     quarantined_exposure_possible = bool(
         intake_only_revocation
+        and not already_revoked
         and (
             broker_orders
             or any(
@@ -2418,7 +2468,7 @@ def revoke_core_execution_plan_v4(
                     item=item,
                     settings=settings,
                 )
-                or _item_has_any_broker_exposure(
+                or _item_has_revocation_possible_exposure(
                     db=db,
                     plan=plan,
                     item=item,
