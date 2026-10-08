@@ -1,6 +1,6 @@
 from typing import Annotated
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Request
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 
@@ -132,12 +132,16 @@ def core_execution_plans_v4(
     request: Request,
     db: Annotated[Session, Depends(get_db_session)],
     external_plan_id: str | None = None,
+    limit: Annotated[int, Query(ge=1, le=500)] = 100,
+    offset: Annotated[int, Query(ge=0, le=10_000)] = 0,
 ) -> list[dict[str, object]]:
     settings: Settings = get_settings(request)
     return list_core_execution_plans_v4(
         settings=settings,
         db=db,
         external_plan_id=external_plan_id,
+        limit=limit,
+        offset=offset,
     )
 
 

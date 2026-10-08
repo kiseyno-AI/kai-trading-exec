@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
@@ -39,13 +40,23 @@ from app.models.runtime import (
     ExecutionPlanItemAudit,
     new_id,
 )
-from app.services.execution_account_route import redact_account_references
+from app.services.execution_account_route import (
+    redact_account_references,
+)
 from app.services.execution_api import CreateExecutionPlanResult, create_execution_plan
+from app.services.execution_exposure import (
+    broker_order_is_provably_unsubmitted as _broker_order_is_provably_unsubmitted,
+    item_exposure_scope_is_proven as _item_exposure_scope_is_proven,
+    item_has_any_broker_exposure as _item_has_any_broker_exposure,
+    item_has_external_possible_exposure as _item_has_external_possible_exposure,
+)
+from app.services.exec_agent_approval import (
+    persisted_verified_watch_sizing_provenance,
+)
 from app.services.json_compaction import json_payload_hash
 
 
 ENTRY_INTENTS = frozenset({"next_open_buy", "intraday_watch_buy"})
-SAFE_LOCAL_PRE_SUBMISSION_ORDER_STATUSES = frozenset({"rejected", "failed"})
 CORE_V4_PERSISTED_BINDING_KEY = "_core_v4_contract_binding"
 CORE_V4_PERSISTED_BINDING_VERSION = "core-v4-persisted-binding-v1"
 CORE_V4_ACTIVATION_STATE_KEY = "_core_activation_state"
@@ -56,30 +67,7 @@ CORE_V4_ACTION_FIELDS = (
     "tactical_action",
     "generic_action",
 )
-CORE_V4_SIZED_POLICY_SOURCES = frozenset(
-    {
-        "exec_agent",
-        "exec_agent_watch_sizing",
-        "short_term_exec_agent_v1",
-    }
-)
-CORE_V4_EXEC_AGENT_POLICY_KEYS = frozenset(
-    {
-        "kind",
-        "quantity",
-        "source",
-        "idempotency_key",
-        "sizing_price",
-        "approved_notional",
-        "confidence",
-    }
-)
-CORE_V4_SHORT_TERM_ENTRY_POLICY_KEYS = frozenset(
-    {"kind", "quantity", "source"}
-)
-CORE_V4_SHORT_TERM_EXIT_POLICY_KEYS = frozenset(
-    {"kind", "quantity", "source", "linked_entry_item_key"}
-)
+CORE_V4_SIZED_POLICY_SOURCES = frozenset({"exec_agent_watch_sizing"})
 CORE_V4_WATCH_POLICY_KEYS = frozenset(
     {
         "kind",
@@ -108,6 +96,59 @@ CORE_V4_WATCH_ATTEMPT_POLICY_KEYS = frozenset(
         "exec_agent_watch_sizing_max_attempts",
         "exec_agent_watch_sizing_fallback_allowed",
         "exec_agent_watch_sizing_attempts",
+    }
+)
+CORE_V4_TERMINAL_REJECTION_DECISION_SOURCES = frozenset(
+    {
+        "openclaw_exec_agent_watch_sizing",
+        "watch_exec_agent_sizing",
+    }
+)
+CORE_V4_MIGRATABLE_LEGACY_WATCH_TERMINAL_STATUSES = frozenset(
+    {
+        "exec_agent_rejected",
+        "next_open_buy_expired",
+    }
+)
+CORE_V4_OPERATIONAL_TERMINAL_STATUSES = frozenset(
+    {
+        "agent_rejected",
+        "broker_order_failed",
+        "broker_order_rejected",
+        "canceled",
+        "cancelled",
+        "contract_quarantined",
+        "crypto_paper_failed",
+        "crypto_paper_rejected",
+        "exec_agent_rejected",
+        "expired",
+        "filled",
+        "manual_review_required",
+        "manual_review_resolved_no_exposure",
+        "next_open_buy_expired",
+        "next_open_buy_failed",
+        "not_applicable",
+        "rejected",
+        "revoked",
+        "superseded",
+        "unsupported_semantics",
+        "watch_buy_rejected",
+        "watch_cancelled",
+        "watch_expired",
+    }
+)
+CORE_V4_TERMINAL_SUCCESS_STATUSES = frozenset({"filled"})
+CORE_V4_TERMINAL_CANCELLED_STATUSES = frozenset(
+    {
+        "canceled",
+        "cancelled",
+        "expired",
+        "next_open_buy_expired",
+        "not_applicable",
+        "revoked",
+        "superseded",
+        "watch_cancelled",
+        "watch_expired",
     }
 )
 
@@ -925,6 +966,7 @@ def fence_unproven_legacy_core_buy_authority(
     *,
     db: Session,
     execution_plan_item_id: str,
+    settings: Settings | None = None,
 ) -> bool:
     """Atomically make pre-v4 Core BUY authority nonclaimable.
 
@@ -951,8 +993,20 @@ def fence_unproven_legacy_core_buy_authority(
             plan.source != "kai-trading-core"
             and raw_payload.get("source") != "kai-trading-core"
         )
-        or persisted_core_plan_contract_ack(plan) is not None
     ):
+        return False
+
+    normalized_item_ids = _normalize_safe_legacy_watch_authority(
+        db=db,
+        plan=plan,
+        settings=settings,
+    )
+    if normalized_item_ids:
+        db.flush()
+        if persisted_core_plan_contract_ack(plan) is not None:
+            db.commit()
+            return execution_plan_item_id in normalized_item_ids
+    if persisted_core_plan_contract_ack(plan) is not None:
         return False
 
     locked_items = db.scalars(
@@ -973,7 +1027,7 @@ def fence_unproven_legacy_core_buy_authority(
         if job.job_type in ENTRY_INTENTS
     }
     raw_entry_keys = _raw_core_entry_keys(raw_payload)
-    buy_items = [
+    all_buy_items = [
         item
         for item in locked_items
         if item.side == "buy"
@@ -981,8 +1035,14 @@ def fence_unproven_legacy_core_buy_authority(
         or item.source_plan_item_id in raw_entry_keys
         or item.id in entry_job_item_ids
     ]
+    unproven_item_ids = _unproven_core_buy_item_ids(plan)
+    buy_items = (
+        all_buy_items
+        if unproven_item_ids is None
+        else [item for item in all_buy_items if item.id in unproven_item_ids]
+    )
     buy_item_ids = {item.id for item in buy_items}
-    if not buy_item_ids:
+    if execution_plan_item_id not in buy_item_ids:
         return False
     jobs = [job for job in all_jobs if job.execution_plan_item_id in buy_item_ids]
     broker_orders = db.scalars(
@@ -1000,22 +1060,33 @@ def fence_unproven_legacy_core_buy_authority(
         if broker_order_ids
         else []
     )
-    possible_exposure = bool(
-        fills
-        or any(
-            not (
-                str(order.status or "").strip().lower()
-                in SAFE_LOCAL_PRE_SUBMISSION_ORDER_STATUSES
-                and order.broker_order_id is None
-                and order.submitted_at is None
-            )
-            for order in broker_orders
-        )
-    )
-    fenced_status = (
-        "manual_review_required" if possible_exposure else "contract_quarantined"
-    )
+    orders_by_item: dict[str, list[BrokerOrder]] = {}
+    for order in broker_orders:
+        if order.execution_plan_item_id is not None:
+            orders_by_item.setdefault(order.execution_plan_item_id, []).append(order)
+    filled_order_ids = {fill.broker_order_pk for fill in fills}
+    fenced_statuses: set[str] = set()
     for item in buy_items:
+        item_orders = orders_by_item.get(item.id, [])
+        possible_exposure = bool(
+            any(order.id in filled_order_ids for order in item_orders)
+            or any(
+                not _broker_order_is_provably_unsubmitted(order)
+                for order in item_orders
+            )
+            or _item_has_external_possible_exposure(
+                db=db,
+                plan=plan,
+                item=item,
+                settings=settings,
+            )
+        )
+        fenced_status = (
+            "manual_review_required"
+            if possible_exposure
+            else "contract_quarantined"
+        )
+        fenced_statuses.add(fenced_status)
         prior_status = item.status
         item.status = fenced_status
         if prior_status != fenced_status:
@@ -1039,9 +1110,14 @@ def fence_unproven_legacy_core_buy_authority(
         job.status = "revoked"
         job.locked_at = None
         job.last_error = "legacy Core BUY lacks an exact persisted v4 contract proof"
-    plan.status = fenced_status
+    plan.status = (
+        "manual_review_required"
+        if "manual_review_required" in fenced_statuses
+        or len(buy_item_ids) < len(all_buy_items)
+        else "contract_quarantined"
+    )
     db.commit()
-    return execution_plan_item_id in buy_item_ids
+    return True
 
 
 def _raw_core_entry_keys(raw_payload: object) -> set[str]:
@@ -1066,39 +1142,339 @@ def _raw_core_entry_keys(raw_payload: object) -> set[str]:
     return keys
 
 
+def _unproven_core_buy_item_ids(plan: ExecutionPlan) -> set[str] | None:
+    """Return invalid entry IDs when immutable v4 intake identity is intact."""
+    if _persisted_core_plan_intake_ack(plan) is None:
+        return None
+    try:
+        command = CoreExecutionPlanRequestV4.model_validate(
+            plan.raw_payload,
+            context={
+                _SKIP_DISPATCH_MATERIAL_FINGERPRINT_CONTEXT_KEY: True,
+            },
+        )
+    except ValidationError:
+        return None
+    persisted_items = list(plan.items)
+    if len(persisted_items) != len(command.items):
+        return None
+    persisted_by_source_key = {
+        item.source_plan_item_id: item
+        for item in persisted_items
+        if _nonempty_text(item.source_plan_item_id) is not None
+    }
+    if len(persisted_by_source_key) != len(persisted_items):
+        return None
+    raw_by_source_key = {
+        raw_item.core_item_key: raw_item for raw_item in command.items
+    }
+    if len(raw_by_source_key) != len(command.items):
+        return None
+    payload_sha256 = json_payload_hash(plan.raw_payload)
+    invalid_ids: set[str] = set()
+    for index, (raw_item, item) in enumerate(
+        zip(command.items, persisted_items, strict=True)
+    ):
+        raw_linked_entry_key = raw_item.quantity_policy.get(
+            "linked_entry_item_key"
+        )
+        linked_entry = (
+            persisted_by_source_key.get(raw_linked_entry_key)
+            if isinstance(raw_linked_entry_key, str)
+            else None
+        )
+        if _persisted_item_identity_matches(
+            plan=plan,
+            item=item,
+            raw_item=raw_item,
+            expected_index=index,
+            expected_source_market_date=command.metadata.source_market_date,
+            payload_sha256=payload_sha256,
+        ):
+            continue
+        if raw_item.side == "buy" or raw_item.intent in ENTRY_INTENTS:
+            invalid_ids.add(item.id)
+            continue
+        if isinstance(raw_linked_entry_key, str):
+            raw_linked_entry = raw_by_source_key.get(raw_linked_entry_key)
+            if linked_entry is not None and raw_linked_entry is not None and (
+                raw_linked_entry.side == "buy"
+                or raw_linked_entry.intent in ENTRY_INTENTS
+            ):
+                invalid_ids.add(linked_entry.id)
+                continue
+        return None
+    return invalid_ids
+
+
 def reconcile_unproven_legacy_core_buy_authority(
     *,
     db: Session,
     runtime_mode: str,
+    settings: Settings | None = None,
 ) -> int:
     """Quarantine persisted pre-v4 Core entries before the due-job query."""
-    item_ids = list(
-        db.scalars(
-            select(ExecutionPlanItem.id)
-            .join(ExecutionPlanItem.plan)
-            .where(
-                ExecutionPlan.mode == runtime_mode,
-                ExecutionPlan.source == "kai-trading-core",
-                ExecutionPlanItem.side == "buy",
-                ExecutionPlanItem.status.not_in(
-                    {
-                        "contract_quarantined",
-                        "manual_review_required",
-                        "revoked",
-                    }
-                ),
+    candidate_rows = db.execute(
+        select(ExecutionPlanItem.id, ExecutionPlanItem.execution_plan_id)
+        .join(ExecutionPlanItem.plan)
+        .where(
+            ExecutionPlan.mode == runtime_mode,
+            ExecutionPlan.source == "kai-trading-core",
+            ExecutionPlanItem.side == "buy",
+            ExecutionPlanItem.status.not_in(
+                {
+                    "contract_quarantined",
+                    "manual_review_required",
+                    "revoked",
+                }
+            ),
+        )
+        .order_by(ExecutionPlan.id.asc(), ExecutionPlanItem.plan_item_index.asc())
+    ).all()
+    if not candidate_rows:
+        return 0
+    item_ids = [row.id for row in candidate_rows]
+    plan_ids = {row.execution_plan_id for row in candidate_rows}
+    normalized = 0
+    plans = db.scalars(
+        select(ExecutionPlan)
+        .where(ExecutionPlan.id.in_(plan_ids))
+        .with_for_update()
+        .options(selectinload(ExecutionPlan.items))
+        .order_by(ExecutionPlan.id.asc())
+    ).all()
+    for plan in plans:
+        normalized += len(
+            _normalize_safe_legacy_watch_authority(
+                db=db,
+                plan=plan,
+                settings=settings,
             )
-            .order_by(ExecutionPlan.id.asc(), ExecutionPlanItem.plan_item_index.asc())
-        ).all()
-    )
-    fenced = 0
+        )
+    if normalized:
+        db.commit()
+    fenced = normalized
     for item_id in item_ids:
         if fence_unproven_legacy_core_buy_authority(
             db=db,
             execution_plan_item_id=item_id,
+            settings=settings,
         ):
             fenced += 1
     return fenced
+
+
+def _normalize_safe_legacy_watch_authority(
+    *,
+    db: Session,
+    plan: ExecutionPlan,
+    settings: Settings | None = None,
+) -> set[str]:
+    """Canonicalize narrowly proven pre-fix watch outcomes item by item."""
+    locked_items = db.scalars(
+        select(ExecutionPlanItem)
+        .where(ExecutionPlanItem.execution_plan_id == plan.id)
+        .order_by(ExecutionPlanItem.plan_item_index.asc())
+        .with_for_update()
+    ).all()
+    if len(locked_items) != len(plan.items):
+        return set()
+    if _persisted_core_plan_intake_ack(plan) is None:
+        return set()
+    try:
+        command = CoreExecutionPlanRequestV4.model_validate(
+            plan.raw_payload,
+            context={
+                _SKIP_DISPATCH_MATERIAL_FINGERPRINT_CONTEXT_KEY: True,
+            },
+        )
+    except ValidationError:
+        return set()
+
+    from app.services.watch_exec_agent_sizing import (
+        _canonical_terminal_rejection,
+        finalize_completed_no_trade_plan,
+    )
+
+    normalized_ids: set[str] = set()
+    for raw_item, item in zip(command.items, locked_items, strict=True):
+        raw_policy = raw_item.quantity_policy
+        quantity_policy = (
+            item.quantity_policy if isinstance(item.quantity_policy, dict) else {}
+        )
+        normalization = _legacy_watch_authority_normalization(
+            item=item,
+            raw_policy=raw_policy,
+            quantity_policy=quantity_policy,
+        )
+        if (
+            normalization is None
+            or not _item_exposure_scope_is_proven(
+                item=item,
+                settings=settings,
+            )
+            or _item_has_any_broker_exposure(
+                db=db,
+                plan=plan,
+                item=item,
+                settings=settings,
+            )
+        ):
+            continue
+        reason_code, reason_family, reason, prior_policy = normalization
+        raw_decision = quantity_policy.get("exec_agent_decision")
+        record = dict(raw_decision) if isinstance(raw_decision, dict) else {}
+        if record.get("source") not in CORE_V4_TERMINAL_REJECTION_DECISION_SOURCES:
+            record["source"] = "watch_exec_agent_sizing"
+        _, item.quantity_policy = _canonical_terminal_rejection(
+            item=item,
+            record=record,
+            previous_policy=prior_policy,
+            reason_code=reason_code,
+            reason_family=reason_family,
+            reason=reason,
+            audit_event_type="legacy_watch_authority_canonicalized",
+        )
+        prior_status = item.status
+        if reason_code == "unverified_exec_agent_runtime":
+            item.status = "exec_agent_rejected"
+        item.limit_price = raw_item.limit_price
+        jobs = db.scalars(
+            select(ExecutionJob)
+            .where(ExecutionJob.execution_plan_item_id == item.id)
+            .with_for_update()
+        ).all()
+        for job in jobs:
+            job.status = "revoked"
+            job.locked_at = None
+            job.last_error = "legacy watch authority canonicalized fail-closed"
+        db.add(
+            ExecutionPlanItemAudit(
+                id=new_id(),
+                execution_plan_item_id=item.id,
+                event_type="legacy_watch_authority_canonicalized",
+                source="kai-trading-exec",
+                summary={
+                    "prior_status": prior_status,
+                    "status": item.status,
+                    "reason_code": reason_code,
+                    "sibling_entries_preserved": True,
+                },
+                payload={
+                    "reason_code": reason_code,
+                    "prior_quantity_policy": quantity_policy,
+                },
+            )
+        )
+        normalized_ids.add(item.id)
+    if normalized_ids and settings is not None:
+        finalize_completed_no_trade_plan(
+            db=db,
+            settings=settings,
+            plan=plan,
+        )
+    return normalized_ids
+
+
+def _legacy_watch_authority_normalization(
+    *,
+    item: ExecutionPlanItem,
+    raw_policy: dict[str, object],
+    quantity_policy: dict[str, object],
+) -> tuple[str, str, str, dict[str, object]] | None:
+    if _watch_rejection_policy_matches(
+        raw_policy=raw_policy,
+        quantity_policy=quantity_policy,
+        item=item,
+    ):
+        return None
+    prior_policy = quantity_policy.get("previous_policy")
+    if not isinstance(prior_policy, dict) or not (
+        prior_policy == raw_policy
+        or _watch_attempt_policy_matches(
+            raw_policy=raw_policy,
+            quantity_policy=prior_policy,
+        )
+    ):
+        return None
+
+    provenance = quantity_policy.get("approval_provenance")
+    if (
+        isinstance(provenance, dict)
+        and provenance.get("kind")
+        == "reported_unverified_exec_agent_watch_sizing"
+    ):
+        if not _watch_sizing_policy_shape_matches(
+            raw_policy=raw_policy,
+            quantity_policy=quantity_policy,
+            item=item,
+            approval_provenance_kind=(
+                "reported_unverified_exec_agent_watch_sizing"
+            ),
+        ):
+            return None
+        return (
+            "unverified_exec_agent_runtime",
+            "runtime_contract",
+            "persisted watch approval lacks verified exec-agent runtime provenance",
+            prior_policy,
+        )
+
+    decision = quantity_policy.get("exec_agent_decision")
+    if (
+        item.status not in CORE_V4_MIGRATABLE_LEGACY_WATCH_TERMINAL_STATUSES
+        or quantity_policy.get("kind") != "exec_agent_rejected"
+        or quantity_policy.get("source") != "exec_agent_watch_sizing"
+        or any(
+            field in quantity_policy
+            for field in (
+                "quantity",
+                "planned_quantity",
+                "computed_quantity",
+                "approved_quantity",
+                "approved_notional",
+                "approved_notional_krw",
+                "sizing_price",
+                "reference_price",
+            )
+        )
+        or not isinstance(decision, dict)
+        or decision != quantity_policy.get("short_term_exec_agent_decision")
+        or decision.get("source")
+        not in CORE_V4_TERMINAL_REJECTION_DECISION_SOURCES
+        or decision.get("action") not in {"reject", "rejected"}
+        or decision.get("decision") not in {"reject", "rejected"}
+        or decision.get("execution_plan_item_id") != item.id
+        or decision.get("symbol") != item.symbol
+    ):
+        return None
+    reason_code = _nonempty_text(
+        quantity_policy.get("reason_code") or decision.get("reason_code")
+    )
+    if reason_code is None:
+        return None
+    reason = _nonempty_text(
+        quantity_policy.get("reason") or decision.get("reason")
+    ) or "legacy terminal watch rejection was canonicalized"
+    reason_family = _nonempty_text(
+        quantity_policy.get("reason_family") or decision.get("reason_family")
+    ) or _legacy_watch_reason_family(reason_code)
+    return reason_code, reason_family, reason, prior_policy
+
+
+def _legacy_watch_reason_family(reason_code: str) -> str:
+    normalized = reason_code.lower()
+    if "runtime" in normalized or "agent" in normalized:
+        return "runtime_contract"
+    if "window" in normalized or "missed" in normalized:
+        return "timing"
+    if "broker" in normalized or "stale" in normalized:
+        return "broker_truth"
+    if "envelope" in normalized or "regime" in normalized:
+        return "action_envelope"
+    if "sizing" in normalized or "notional" in normalized:
+        return "risk_sizing"
+    return "legacy_terminal_rejection"
 
 
 def list_core_execution_plans_v4(
@@ -1106,20 +1482,31 @@ def list_core_execution_plans_v4(
     settings: Settings,
     db: Session,
     external_plan_id: str | None = None,
+    limit: int = 100,
+    offset: int = 0,
 ) -> list[dict[str, object]]:
     query = (
         select(ExecutionPlan)
-        .where(ExecutionPlan.mode == settings.runtime_mode)
+        .where(
+            ExecutionPlan.mode == settings.runtime_mode,
+            ExecutionPlan.source == "kai-trading-core",
+        )
         .options(selectinload(ExecutionPlan.items))
-        .order_by(ExecutionPlan.accepted_at.desc(), ExecutionPlan.created_at.desc())
+        .order_by(
+            ExecutionPlan.accepted_at.desc(),
+            ExecutionPlan.created_at.desc(),
+            ExecutionPlan.id.desc(),
+        )
     )
     if external_plan_id:
         query = query.where(ExecutionPlan.external_plan_id == external_plan_id)
+    query = query.offset(offset).limit(limit)
     payloads: list[dict[str, object]] = []
     for plan in db.scalars(query).all():
-        contract_payload = persisted_core_plan_contract_ack(plan)
+        contract_payload = _persisted_core_plan_intake_ack(plan)
         if contract_payload is None:
             continue
+        item_states = [_core_v4_item_state(item) for item in plan.items]
         payloads.append(
             {
                 "execution_plan_id": plan.id,
@@ -1127,13 +1514,180 @@ def list_core_execution_plans_v4(
                 "plan_id": plan.external_plan_id,
                 "status": plan.status,
                 **contract_payload,
+                "item_status_counts": dict(
+                    sorted(Counter(item["status"] for item in item_states).items())
+                ),
+                "item_states": item_states,
             }
         )
     return payloads
 
 
+def _core_v4_item_state(item: ExecutionPlanItem) -> dict[str, object]:
+    quantity_policy = (
+        item.quantity_policy if isinstance(item.quantity_policy, dict) else {}
+    )
+    risk_context = item.risk_context if isinstance(item.risk_context, dict) else {}
+    raw_decision = quantity_policy.get("exec_agent_decision")
+    decision: dict[str, object] | None = None
+    if item.status == "contract_quarantined":
+        decision = {
+            "action": "reject",
+            "decision": "rejected",
+            "reason_code": "persisted_v4_contract_not_proven",
+            "reason_family": "runtime_contract",
+            "rejection_disposition": "terminal",
+            "reason": "current item authority is contract-quarantined",
+        }
+    elif (
+        item.status in CORE_V4_OPERATIONAL_TERMINAL_STATUSES
+        and item.status not in CORE_V4_TERMINAL_SUCCESS_STATUSES
+    ):
+        decision = _core_v4_terminal_decision(
+            item=item,
+            raw_decision=raw_decision,
+            risk_context=risk_context,
+        )
+    elif (
+        item.status not in CORE_V4_OPERATIONAL_TERMINAL_STATUSES
+        and isinstance(
+            deferred := risk_context.get("watch_exec_agent_deferred"),
+            dict,
+        )
+    ):
+        disposition = _nonempty_text(deferred.get("disposition")) or "defer"
+        decision = {
+            "action": disposition,
+            "decision": "deferred",
+            "reason_code": deferred.get("reason_code"),
+            "reason_family": deferred.get("reason_family"),
+            "rejection_disposition": disposition,
+            "reason": deferred.get("reason"),
+            "retry_after": deferred.get("retry_after"),
+        }
+    elif isinstance(raw_decision, dict):
+        decision = {
+            key: raw_decision.get(key)
+            for key in (
+                "action",
+                "decision",
+                "reason_code",
+                "reason_family",
+                "rejection_disposition",
+                "reason",
+            )
+        }
+    if decision is not None:
+        decision = {
+            key: value for key, value in decision.items() if value is not None
+        }
+    return {
+        "core_item_key": item.source_plan_item_id,
+        "execution_plan_item_id": item.id,
+        "status": item.status,
+        "updated_at": (
+            item.updated_at.isoformat()
+            if isinstance(item.updated_at, datetime)
+            else None
+        ),
+        "terminal": item.status in CORE_V4_OPERATIONAL_TERMINAL_STATUSES,
+        "decision": decision,
+    }
+
+
+def _core_v4_terminal_decision(
+    *,
+    item: ExecutionPlanItem,
+    raw_decision: object,
+    risk_context: dict[str, object],
+) -> dict[str, object]:
+    if isinstance(raw_decision, dict):
+        raw_action = str(raw_decision.get("action") or "").strip().lower()
+        raw_outcome = str(raw_decision.get("decision") or "").strip().lower()
+        if raw_action in {"reject", "rejected"} or raw_outcome in {
+            "reject",
+            "rejected",
+        }:
+            return {
+                key: raw_decision.get(key)
+                for key in (
+                    "action",
+                    "decision",
+                    "reason_code",
+                    "reason_family",
+                    "rejection_disposition",
+                    "reason",
+                )
+            }
+
+    trigger_interaction = risk_context.get("last_trigger_time_exec_agent_interaction")
+    trigger_decision = (
+        trigger_interaction.get("decision")
+        if isinstance(trigger_interaction, dict)
+        else None
+    )
+    if isinstance(trigger_decision, dict):
+        trigger_outcome = str(trigger_decision.get("decision") or "").strip().lower()
+        if trigger_outcome in {"reject", "rejected"}:
+            return {
+                "action": "reject",
+                "decision": "rejected",
+                "reason_code": trigger_decision.get("reason_code"),
+                "reason_family": "trigger_time_exec_agent",
+                "rejection_disposition": "terminal",
+                "reason": trigger_decision.get("reason"),
+            }
+
+    short_term_decision = risk_context.get("exec_agent_decision")
+    if isinstance(short_term_decision, dict):
+        short_term_outcome = str(
+            short_term_decision.get("decision") or ""
+        ).strip().lower()
+        if short_term_outcome in {"reject", "rejected"}:
+            reason = short_term_decision.get("reason")
+            return {
+                "action": "reject",
+                "decision": "rejected",
+                "reason_code": reason,
+                "reason_family": "short_term_exec_agent",
+                "rejection_disposition": "terminal",
+                "reason": reason,
+            }
+
+    if item.status in CORE_V4_TERMINAL_CANCELLED_STATUSES:
+        action = "cancel"
+        outcome = "cancelled"
+    else:
+        action = "reject"
+        outcome = "rejected"
+    return {
+        "action": action,
+        "decision": outcome,
+        "reason_code": item.status,
+        "reason_family": "execution_status",
+        "rejection_disposition": "terminal",
+        "reason": f"current execution status is {item.status}",
+    }
+
+
 def persisted_core_plan_contract_ack(
     plan: ExecutionPlan,
+) -> dict[str, object] | None:
+    """Return the accepted v4 contract only while current authority is proven."""
+    return _persisted_core_plan_ack(plan=plan, require_current_authority=True)
+
+
+def _persisted_core_plan_intake_ack(
+    plan: ExecutionPlan,
+) -> dict[str, object] | None:
+    """Return immutable intake proof without treating it as current authority."""
+    return _persisted_core_plan_ack(plan=plan, require_current_authority=False)
+
+
+def _persisted_core_plan_ack(
+    *,
+    plan: ExecutionPlan,
+    require_current_authority: bool,
 ) -> dict[str, object] | None:
     if not isinstance(plan.raw_payload, dict):
         return None
@@ -1165,23 +1719,26 @@ def persisted_core_plan_contract_ack(
     for index, (raw_item, item) in enumerate(
         zip(command.items, persisted_items, strict=True)
     ):
-        raw_linked_entry_key = raw_item.quantity_policy.get(
-            "linked_entry_item_key"
-        )
-        linked_entry = (
-            persisted_by_source_key.get(raw_linked_entry_key)
-            if isinstance(raw_linked_entry_key, str)
-            else None
-        )
-        if not _persisted_item_identity_matches(
+        immutable_identity_matches = _persisted_item_intake_identity_matches(
             plan=plan,
             item=item,
             raw_item=raw_item,
             expected_index=index,
             expected_source_market_date=command.metadata.source_market_date,
             payload_sha256=payload_sha256,
-            linked_entry=linked_entry,
-        ):
+        )
+        current_authority_matches = (
+            not require_current_authority
+            or _persisted_item_identity_matches(
+                plan=plan,
+                item=item,
+                raw_item=raw_item,
+                expected_index=index,
+                expected_source_market_date=command.metadata.source_market_date,
+                payload_sha256=payload_sha256,
+            )
+        )
+        if not immutable_identity_matches or not current_authority_matches:
             return None
         item_id = _nonempty_text(item.id)
         key = raw_item.core_item_key
@@ -1218,6 +1775,41 @@ def persisted_core_plan_contract_ack(
     }
 
 
+def _persisted_item_intake_identity_matches(
+    *,
+    plan: ExecutionPlan,
+    item: ExecutionPlanItem,
+    raw_item: Any,
+    expected_index: int,
+    expected_source_market_date: Any,
+    payload_sha256: str,
+) -> bool:
+    """Validate the immutable item identity used by acceptance acknowledgements."""
+    risk_context = item.risk_context if isinstance(item.risk_context, dict) else {}
+    return bool(
+        item.execution_plan_id == plan.id
+        and item.plan_item_index == expected_index
+        and item.source_plan_item_id == raw_item.core_item_key
+        and item.symbol == raw_item.symbol
+        and item.side == raw_item.side
+        and item.intent == raw_item.intent
+        and item.provider == raw_item.provider
+        and item.venue == raw_item.venue
+        and item.asset_class == raw_item.asset_class
+        and item.decision_agent_name == raw_item.decision_agent_name
+        and item.decision_snapshot_id == raw_item.decision_snapshot_id
+        and item.decision_run_id == plan.strategy_run_id
+        and item.source_market_date == expected_source_market_date
+        and item.time_in_force == raw_item.time_in_force
+        and _persisted_contract_binding_matches(
+            risk_context=risk_context,
+            core_item_key=raw_item.core_item_key,
+            expected_index=expected_index,
+            payload_sha256=payload_sha256,
+        )
+    )
+
+
 def _persisted_plan_identity_matches(
     *,
     plan: ExecutionPlan,
@@ -1242,7 +1834,6 @@ def _persisted_item_identity_matches(
     expected_index: int,
     expected_source_market_date: Any,
     payload_sha256: str,
-    linked_entry: ExecutionPlanItem | None,
 ) -> bool:
     risk_context = item.risk_context if isinstance(item.risk_context, dict) else {}
     session_policy = raw_item.session_policy.model_dump(mode="json")
@@ -1292,10 +1883,8 @@ def _persisted_item_identity_matches(
         and _quantity_policy_matches(
             raw_policy=raw_policy,
             quantity_policy=quantity_policy,
-            risk_context=risk_context,
             side=raw_item.side,
             item=item,
-            linked_entry=linked_entry,
         )
     )
 
@@ -1362,10 +1951,8 @@ def _quantity_policy_matches(
     *,
     raw_policy: object,
     quantity_policy: object,
-    risk_context: dict[str, object],
     side: str,
     item: ExecutionPlanItem,
-    linked_entry: ExecutionPlanItem | None,
 ) -> bool:
     if not isinstance(raw_policy, dict) or not isinstance(quantity_policy, dict):
         return False
@@ -1402,32 +1989,12 @@ def _quantity_policy_matches(
     if side == "buy":
         if raw_type != "exec_agent_sized":
             return False
-        if source == "exec_agent":
-            return _exec_agent_policy_matches(
-                raw_policy=raw_policy,
-                quantity_policy=quantity_policy,
-                risk_context=risk_context,
-                decision=risk_context.get("exec_agent_decision"),
-            )
-        if source == "short_term_exec_agent_v1":
-            return _short_term_entry_policy_matches(
-                quantity_policy=quantity_policy,
-                decision=risk_context.get("exec_agent_decision"),
-            )
         return _watch_sizing_policy_matches(
             raw_policy=raw_policy,
             quantity_policy=quantity_policy,
             item=item,
         )
-    if raw_type != "position_exit_from_entry":
-        return False
-    return _short_term_exit_policy_matches(
-        raw_policy=raw_policy,
-        quantity_policy=quantity_policy,
-        risk_context=risk_context,
-        item=item,
-        linked_entry=linked_entry,
-    )
+    return False
 
 
 def _watch_rejection_policy_matches(
@@ -1448,16 +2015,28 @@ def _watch_rejection_policy_matches(
     }
     canonical_keys = legacy_keys | {"reason_family", "rejection_disposition"}
     decision = quantity_policy.get("exec_agent_decision")
+    previous_policy = quantity_policy.get("previous_policy")
+    previous_policy_matches = bool(
+        previous_policy == raw_policy
+        or (
+            isinstance(previous_policy, dict)
+            and _watch_attempt_policy_matches(
+                raw_policy=raw_policy,
+                quantity_policy=previous_policy,
+            )
+        )
+    )
     policy_keys = set(quantity_policy)
     has_canonical_disposition = policy_keys == canonical_keys
     return bool(
         policy_keys in {frozenset(legacy_keys), frozenset(canonical_keys)}
         and quantity_policy.get("kind") == "exec_agent_rejected"
         and quantity_policy.get("source") == "exec_agent_watch_sizing"
-        and quantity_policy.get("previous_policy") == raw_policy
+        and previous_policy_matches
         and isinstance(decision, dict)
         and decision == quantity_policy.get("short_term_exec_agent_decision")
-        and decision.get("source") == "openclaw_exec_agent_watch_sizing"
+        and decision.get("source")
+        in CORE_V4_TERMINAL_REJECTION_DECISION_SOURCES
         and decision.get("action") == "reject"
         and decision.get("decision") == "rejected"
         and decision.get("execution_plan_item_id") == item.id
@@ -1466,7 +2045,8 @@ def _watch_rejection_policy_matches(
         and (
             not has_canonical_disposition
             or (
-                quantity_policy.get("rejection_disposition") == "terminal"
+                _zero_or_null_decimal(decision.get("approved_notional_krw"))
+                and quantity_policy.get("rejection_disposition") == "terminal"
                 and _nonempty_text(quantity_policy.get("reason_family")) is not None
                 and decision.get("rejection_disposition") == "terminal"
                 and decision.get("reason_family")
@@ -1477,6 +2057,18 @@ def _watch_rejection_policy_matches(
             )
         )
     )
+
+
+def _zero_or_null_decimal(value: object) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, bool):
+        return False
+    try:
+        parsed = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return False
+    return parsed.is_finite() and parsed == 0
 
 
 def _watch_attempt_policy_matches(
@@ -1539,147 +2131,54 @@ def _watch_attempt_event_matches(*, event: object, max_attempts: int) -> bool:
     return parsed_at.tzinfo is not None and parsed_at.utcoffset() is not None
 
 
-def _exec_agent_policy_matches(
-    *,
-    raw_policy: dict[str, object],
-    quantity_policy: dict[str, object],
-    risk_context: dict[str, object],
-    decision: object,
-) -> bool:
-    if (
-        set(quantity_policy) != CORE_V4_EXEC_AGENT_POLICY_KEYS
-        or not isinstance(decision, dict)
-        or decision.get("action") != "approve"
-        or _nonempty_text(decision.get("idempotency_key")) is None
-    ):
-        return False
-    for field_name in (
-        "quantity",
-        "idempotency_key",
-        "sizing_price",
-        "approved_notional",
-        "confidence",
-    ):
-        if quantity_policy.get(field_name) != decision.get(field_name):
-            return False
-    target_price = _positive_decimal(raw_policy.get("target_price"))
-    stop_price = _positive_decimal(
-        raw_policy.get("stop_price") or raw_policy.get("stop_loss_price")
-    )
-    return bool(
-        _positive_decimal(quantity_policy.get("sizing_price")) is not None
-        and _positive_decimal(quantity_policy.get("approved_notional")) is not None
-        and target_price is not None
-        and stop_price is not None
-        and _positive_decimal(decision.get("target_price")) == target_price
-        and _positive_decimal(decision.get("stop_price")) == stop_price
-        and _positive_decimal(risk_context.get("target_price")) == target_price
-        and _positive_decimal(risk_context.get("stop_price")) == stop_price
-    )
-
-
-def _short_term_entry_policy_matches(
-    *,
-    quantity_policy: dict[str, object],
-    decision: object,
-) -> bool:
-    quantity = quantity_policy.get("quantity")
-    if (
-        set(quantity_policy) != CORE_V4_SHORT_TERM_ENTRY_POLICY_KEYS
-        or isinstance(quantity, bool)
-        or not isinstance(quantity, int)
-        or quantity <= 0
-        or not isinstance(decision, dict)
-        or decision.get("agent") != "short_term_exec_agent_v1"
-        or decision.get("decision") != "approved"
-        or decision.get("approved_quantity") != quantity
-    ):
-        return False
-    reference_price = _positive_decimal(decision.get("reference_price"))
-    approved_notional = _positive_decimal(decision.get("approved_notional"))
-    return bool(
-        reference_price is not None
-        and approved_notional is not None
-        and approved_notional == reference_price * Decimal(quantity)
-    )
-
-
-def _short_term_exit_policy_matches(
-    *,
-    raw_policy: dict[str, object],
-    quantity_policy: dict[str, object],
-    risk_context: dict[str, object],
-    item: ExecutionPlanItem,
-    linked_entry: ExecutionPlanItem | None,
-) -> bool:
-    linked_key = raw_policy.get("linked_entry_item_key")
-    quantity = quantity_policy.get("quantity")
-    entry_context = risk_context.get("entry_context")
-    if (
-        quantity_policy.get("source") != "short_term_exec_agent_v1"
-        or set(quantity_policy) != CORE_V4_SHORT_TERM_EXIT_POLICY_KEYS
-        or quantity_policy.get("linked_entry_item_key") != linked_key
-        or not isinstance(entry_context, dict)
-        or set(entry_context)
-        != {
-            "source_plan_item_id",
-            "decision_run_id",
-            "decision_snapshot_id",
-            "entry_quantity",
-            "linked_by",
-        }
-        or entry_context.get("source_plan_item_id") != linked_key
-        or entry_context.get("decision_run_id") != item.decision_run_id
-        or entry_context.get("decision_snapshot_id")
-        != item.decision_snapshot_id
-        or entry_context.get("entry_quantity") != quantity
-        or entry_context.get("linked_by") != "short_term_exec_agent_v1"
-        or linked_entry is None
-    ):
-        return False
-    linked_policy = (
-        linked_entry.quantity_policy
-        if isinstance(linked_entry.quantity_policy, dict)
-        else {}
-    )
-    linked_risk = (
-        linked_entry.risk_context
-        if isinstance(linked_entry.risk_context, dict)
-        else {}
-    )
-    linked_decision = linked_risk.get("exec_agent_decision")
-    return bool(
-        linked_entry.side == "buy"
-        and linked_entry.symbol == item.symbol
-        and linked_entry.decision_run_id == item.decision_run_id
-        and linked_entry.decision_snapshot_id == item.decision_snapshot_id
-        and linked_policy.get("source") == "short_term_exec_agent_v1"
-        and linked_policy.get("quantity") == quantity
-        and _short_term_entry_policy_matches(
-            quantity_policy=linked_policy,
-            decision=linked_decision,
-        )
-    )
-
-
 def _watch_sizing_policy_matches(
     *,
     raw_policy: dict[str, object],
     quantity_policy: dict[str, object],
     item: ExecutionPlanItem,
 ) -> bool:
+    return bool(
+        _watch_sizing_policy_shape_matches(
+            raw_policy=raw_policy,
+            quantity_policy=quantity_policy,
+            item=item,
+            approval_provenance_kind="verified_exec_agent_watch_sizing",
+        )
+        and persisted_verified_watch_sizing_provenance(quantity_policy)
+    )
+
+
+def _watch_sizing_policy_shape_matches(
+    *,
+    raw_policy: dict[str, object],
+    quantity_policy: dict[str, object],
+    item: ExecutionPlanItem,
+    approval_provenance_kind: str,
+) -> bool:
+    """Validate mirrored sizing authority without elevating its provenance."""
     if set(quantity_policy) != CORE_V4_WATCH_POLICY_KEYS:
         return False
     quantity = quantity_policy.get("quantity")
     decision = quantity_policy.get("exec_agent_decision")
     mirrored_decision = quantity_policy.get("short_term_exec_agent_decision")
+    previous_policy = quantity_policy.get("previous_policy")
+    previous_policy_matches = bool(
+        previous_policy == raw_policy
+        or (
+            isinstance(previous_policy, dict)
+            and _watch_attempt_policy_matches(
+                raw_policy=raw_policy,
+                quantity_policy=previous_policy,
+            )
+        )
+    )
     if (
         not isinstance(quantity, int)
         or isinstance(quantity, bool)
         or quantity <= 0
         or not isinstance(decision, dict)
         or decision != mirrored_decision
-        or quantity_policy.get("previous_policy") != raw_policy
+        or not previous_policy_matches
         or decision.get("source") != "openclaw_exec_agent_watch_sizing"
         or decision.get("action") != "approve"
         or decision.get("decision") != "approved"
@@ -1715,11 +2214,8 @@ def _watch_sizing_policy_matches(
     runtime_provenance = decision.get("runtime_provenance")
     if (
         not isinstance(provenance, dict)
-        or provenance.get("kind")
-        not in {
-            "verified_exec_agent_watch_sizing",
-            "reported_unverified_exec_agent_watch_sizing",
-        }
+        or set(provenance) != {"kind", "runtime"}
+        or provenance.get("kind") != approval_provenance_kind
         or provenance.get("runtime") != runtime_provenance
     ):
         return False
@@ -1872,12 +2368,7 @@ def revoke_core_execution_plan_v4(
     possible_exposure_orders = [
         order
         for order in broker_orders
-        if not (
-            str(order.status or "").strip().lower()
-            in SAFE_LOCAL_PRE_SUBMISSION_ORDER_STATUSES
-            and order.broker_order_id is None
-            and order.submitted_at is None
-        )
+        if not _broker_order_is_provably_unsubmitted(order)
     ]
     if fills or possible_exposure_orders:
         buy_item_ids = {

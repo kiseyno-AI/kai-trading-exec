@@ -745,6 +745,7 @@ def _place_broker_order_serialized(
         if fence_unproven_legacy_core_buy_authority(
             db=db,
             execution_plan_item_id=plan_item.id,
+            settings=settings,
         ):
             plan_item = _load_plan_item(
                 settings=settings,

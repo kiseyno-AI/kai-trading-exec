@@ -42,8 +42,10 @@ from app.services.market_regime_guardrails import (
 )
 from app.services.monitoring_price_source import _is_trusted_exchange_freshness_source
 from app.services.openclaw_runtime_contract import (
+    bind_signed_runtime_agent_identity,
     capture_runtime_contract,
     require_runtime_contract_match,
+    reported_runtime_agent_id,
     runtime_contract_proof_is_valid,
     stable_runtime_contract_proof,
 )
@@ -1605,30 +1607,35 @@ def _openclaw_runtime_provenance(response: dict[str, object]) -> dict[str, objec
             else ""
         )
     )
-    actual_agent_id = (
-        str(agent_meta.get("agentId") or "").strip()
-        if isinstance(agent_meta, dict)
-        else ""
-    )
+    actual_agent_id, malformed_agent_id = reported_runtime_agent_id(agent_meta)
     session_id = (
         str(agent_meta.get("sessionId") or "").strip()
         if isinstance(agent_meta, dict)
         else ""
     )
-    if actual_agent_id and provider and model and session_id:
+    if (
+        isinstance(actual_agent_id, str)
+        and actual_agent_id
+        and provider
+        and model
+        and session_id
+    ):
         metadata_status = "reported"
-    elif actual_agent_id or provider or model or session_id:
+    elif actual_agent_id is not None or provider or model or session_id:
         metadata_status = "partial"
     else:
         metadata_status = "unavailable"
-    return {
+    provenance = {
         "metadata_status": metadata_status,
-        "actual_agent_id": actual_agent_id or None,
+        "actual_agent_id": actual_agent_id,
         "actual_provider": provider or None,
         "actual_model": model or None,
         "actual_model_ref": f"{provider}/{model}" if provider and model else None,
         "session_id": session_id or None,
     }
+    if malformed_agent_id:
+        provenance["agent_id_metadata_malformed"] = True
+    return provenance
 
 
 def _normalized_agent_runtime_provenance(value: object) -> dict[str, object]:
@@ -1641,6 +1648,8 @@ def _normalized_agent_runtime_provenance(value: object) -> dict[str, object]:
     requested_session_key = str(payload.get("requested_session_key") or "").strip()
     request_sha256 = str(payload.get("request_sha256") or "").strip()
     runtime_contract = payload.get("runtime_contract")
+    verified_agent_id = str(payload.get("verified_agent_id") or "").strip()
+    agent_identity_source = str(payload.get("agent_identity_source") or "").strip()
     status = str(payload.get("metadata_status") or "").strip()
     if status not in {"reported", "partial", "unavailable"}:
         status = (
@@ -1664,6 +1673,12 @@ def _normalized_agent_runtime_provenance(value: object) -> dict[str, object]:
         normalized["request_sha256"] = request_sha256
     if isinstance(runtime_contract, dict):
         normalized["runtime_contract"] = runtime_contract
+    if verified_agent_id:
+        normalized["verified_agent_id"] = verified_agent_id
+    if agent_identity_source:
+        normalized["agent_identity_source"] = agent_identity_source
+    if payload.get("agent_id_metadata_malformed") is True:
+        normalized["agent_id_metadata_malformed"] = True
     return normalized
 
 
@@ -1680,8 +1695,27 @@ def _verified_runtime_provenance(
         provenance.get("requested_session_key") or ""
     ).strip()
     request_sha256 = json_payload_hash(_json_safe(request_payload))
+    reported_agent_id = provenance.get("actual_agent_id")
+    verified_agent_id = provenance.get("verified_agent_id")
+    reported_agent_id_is_omitted = bool(
+        reported_agent_id is None
+        or isinstance(reported_agent_id, str)
+        and not reported_agent_id.strip()
+    )
+    agent_identity_matches = bool(
+        provenance.get("agent_id_metadata_malformed") is not True
+        and (
+            reported_agent_id == settings.exec_agent_id
+            or (
+                reported_agent_id_is_omitted
+                and verified_agent_id == settings.exec_agent_id
+                and provenance.get("agent_identity_source")
+                == "signed_runtime_contract"
+            )
+        )
+    )
     return bool(
-        provenance.get("actual_agent_id") == settings.exec_agent_id
+        agent_identity_matches
         and provenance.get("actual_model_ref") == settings.exec_agent_model
         and bool(session_id)
         and provenance.get("request_sha256") == request_sha256
@@ -1796,6 +1830,15 @@ def _request_exec_agent_decision(
         runtime_provenance["requested_session_key"] = session_key
         runtime_provenance["request_sha256"] = request_sha256
         runtime_provenance["runtime_contract"] = contract_proof
+        bind_signed_runtime_agent_identity(
+            runtime_provenance,
+            proof=contract_proof,
+            agent_id=settings.exec_agent_id,
+            expected_model_ref=settings.exec_agent_model,
+            requested_session_key=session_key,
+            reported_session_id=session_id,
+            request_sha256=request_sha256,
+        )
         decision_payload["_openclaw_runtime_provenance"] = runtime_provenance
         return decision_payload
     finally:

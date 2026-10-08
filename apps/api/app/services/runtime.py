@@ -389,18 +389,24 @@ def runtime_execution_decision_metrics(
         )
         or 0
     )
-    items = db.scalars(
-        select(ExecutionPlanItem)
+    current_market_date = datetime.now(KRX_TIMEZONE).date()
+    item_rows = db.execute(
+        select(ExecutionPlanItem, ExecutionPlan.market_date)
         .join(ExecutionPlanItem.plan)
         .where(
             ExecutionPlan.mode == settings.runtime_mode,
             ExecutionPlanItem.status.in_(
-                {WATCH_SIZING_PENDING_STATUS, "exec_agent_rejected"}
+                {
+                    WATCH_SIZING_PENDING_STATUS,
+                    "contract_quarantined",
+                    "exec_agent_rejected",
+                }
             ),
         )
         .options(
             load_only(
                 ExecutionPlanItem.status,
+                ExecutionPlanItem.symbol,
                 ExecutionPlanItem.risk_context,
                 ExecutionPlanItem.quantity_policy,
             )
@@ -410,26 +416,43 @@ def runtime_execution_decision_metrics(
     pending_deferrals = 0
     terminal_rejections = 0
     reason_families: dict[str, int] = {}
-    for item in items:
+    current_contract_quarantine_symbols: set[str] = set()
+    current_terminal_rejection_symbols: set[str] = set()
+    current_pending_retry_symbols: set[str] = set()
+    current_pending_deferral_symbols: set[str] = set()
+    for item, item_market_date in item_rows:
         risk_context = item.risk_context if isinstance(item.risk_context, dict) else {}
         quantity_policy = (
             item.quantity_policy if isinstance(item.quantity_policy, dict) else {}
         )
-        deferred = risk_context.get("watch_exec_agent_deferred")
         family: object = None
-        if isinstance(deferred, dict):
+        if item.status == "exec_agent_rejected":
+            terminal_rejections += 1
+            family = quantity_policy.get("reason_family")
+            terminal_decision = quantity_policy.get("exec_agent_decision")
+            if not family and isinstance(terminal_decision, dict):
+                family = terminal_decision.get("reason_family")
+            if item_market_date == current_market_date:
+                current_terminal_rejection_symbols.add(item.symbol)
+        elif (
+            item.status == "contract_quarantined"
+            and item_market_date == current_market_date
+        ):
+            current_contract_quarantine_symbols.add(item.symbol)
+        elif isinstance(
+            deferred := risk_context.get("watch_exec_agent_deferred"),
+            dict,
+        ):
             disposition = deferred.get("disposition")
             if disposition == "retry":
                 pending_retries += 1
+                if item_market_date == current_market_date:
+                    current_pending_retry_symbols.add(item.symbol)
             elif disposition == "defer":
                 pending_deferrals += 1
+                if item_market_date == current_market_date:
+                    current_pending_deferral_symbols.add(item.symbol)
             family = deferred.get("reason_family")
-        elif (
-            item.status == "exec_agent_rejected"
-            and quantity_policy.get("rejection_disposition") == "terminal"
-        ):
-            terminal_rejections += 1
-            family = quantity_policy.get("reason_family")
         normalized_family = str(family or "").strip()
         if normalized_family:
             reason_families[normalized_family] = (
@@ -441,6 +464,20 @@ def runtime_execution_decision_metrics(
         "pending_deferrals": pending_deferrals,
         "terminal_rejections": terminal_rejections,
         "reason_families": dict(sorted(reason_families.items())),
+        "current_market_date": current_market_date.isoformat(),
+        "current_contract_quarantines": len(
+            current_contract_quarantine_symbols
+        ),
+        "current_contract_quarantine_symbols": sorted(
+            current_contract_quarantine_symbols
+        ),
+        "current_terminal_rejection_symbols": sorted(
+            current_terminal_rejection_symbols
+        ),
+        "current_pending_retry_symbols": sorted(current_pending_retry_symbols),
+        "current_pending_deferral_symbols": sorted(
+            current_pending_deferral_symbols
+        ),
     }
 
 
@@ -1867,8 +1904,67 @@ def runtime_actionable_alerts_payload(
     *,
     monitoring: dict[str, object],
     freshness: dict[str, object],
+    execution_decisions: dict[str, object] | None = None,
 ) -> dict[str, object]:
     alerts: list[dict[str, object]] = []
+    execution_decisions = (
+        execution_decisions if isinstance(execution_decisions, dict) else {}
+    )
+    quarantine_symbols = list(
+        execution_decisions.get("current_contract_quarantine_symbols") or []
+    )
+    if quarantine_symbols:
+        alerts.append(
+            {
+                "kind": "current_execution_contract_quarantined",
+                "severity": "critical",
+                "count": len(quarantine_symbols),
+                "symbols": quarantine_symbols,
+                "message": (
+                    "current-market-date execution candidates are contract-"
+                    "quarantined and cannot submit orders"
+                ),
+            }
+        )
+    rejection_symbols = list(
+        execution_decisions.get("current_terminal_rejection_symbols") or []
+    )
+    if rejection_symbols:
+        alerts.append(
+            {
+                "kind": "current_execution_decisions_rejected",
+                "severity": "warning",
+                "count": len(rejection_symbols),
+                "symbols": rejection_symbols,
+                "message": (
+                    "current-market-date execution candidates reached terminal "
+                    "agent rejection"
+                ),
+            }
+        )
+    deferred_symbols = sorted(
+        {
+            *(
+                execution_decisions.get("current_pending_retry_symbols") or []
+            ),
+            *(
+                execution_decisions.get("current_pending_deferral_symbols") or []
+            ),
+        }
+    )
+    if deferred_symbols:
+        alerts.append(
+            {
+                "kind": "current_execution_decisions_deferred",
+                "severity": "warning",
+                "count": len(deferred_symbols),
+                "symbols": deferred_symbols,
+                "message": (
+                    "current-market-date execution candidates remain retryable "
+                    "or deferred"
+                ),
+            }
+        )
     broker_orders = freshness.get("broker_orders")
     stale_nonterminal = (
         broker_orders.get("stale_nonterminal")
@@ -3683,6 +3779,7 @@ def build_runtime_status(
             "actionable_alerts": runtime_actionable_alerts_payload(
                 monitoring=monitoring,
                 freshness=freshness,
+                execution_decisions=execution_decisions,
             ),
             "monthly_pnl": _default_monthly_pnl_payload(
                 settings=settings,
@@ -3969,6 +4066,7 @@ def build_runtime_status(
         actionable_alerts = runtime_actionable_alerts_payload(
             monitoring=monitoring,
             freshness=freshness,
+            execution_decisions=execution_decisions,
         )
     except SQLAlchemyError as exc:
         db.rollback()

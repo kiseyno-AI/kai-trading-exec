@@ -631,20 +631,23 @@ def _runner_response(
     *,
     settings: Settings,
     decision: dict[str, object],
+    include_agent_id: bool = True,
 ) -> subprocess.CompletedProcess[str]:
     provider, model = settings.exec_agent_model.split("/", 1)
+    agent_meta = {
+        "provider": provider,
+        "model": model,
+        "sessionId": "contract-gate-session",
+    }
+    if include_agent_id:
+        agent_meta["agentId"] = settings.exec_agent_id
     return subprocess.CompletedProcess(
         args=[],
         returncode=0,
         stdout=json.dumps(
             {
                 "meta": {
-                    "agentMeta": {
-                        "agentId": settings.exec_agent_id,
-                        "provider": provider,
-                        "model": model,
-                        "sessionId": "contract-gate-session",
-                    }
+                    "agentMeta": agent_meta,
                 },
                 "payloads": [{"text": json.dumps(decision)}],
             }
@@ -816,6 +819,164 @@ def test_decision_paths_attach_stable_contract_proof(path: str, monkeypatch) -> 
     assert contract_proof["status"] == "match"
     assert contract_proof["stable_across_run"] is True
     assert _issued_proof_is_valid(contract_proof)
+
+
+@pytest.mark.parametrize("path", ["trigger", "watch"])
+def test_current_openclaw_schema_binds_missing_agent_id_only_from_signed_contract(
+    path: str,
+    monkeypatch,
+) -> None:
+    settings = Settings(runtime_mode="paper")
+    snapshots = iter([_snapshot(), _snapshot()])
+    request_payload = (
+        _trigger_payload()
+        if path == "trigger"
+        else {"plan_id": "plan-contract-gate", "candidates": []}
+    )
+    decision = (
+        _trigger_response()
+        if path == "trigger"
+        else {
+            "version": "manual-exec-agent-watch-sizing-v1",
+            "plan_id": "plan-contract-gate",
+            "decisions": [],
+        }
+    )
+    module = trigger_time_exec_agent if path == "trigger" else watch_sizing
+    monkeypatch.setattr(module, "capture_runtime_contract", lambda **_: next(snapshots))
+    monkeypatch.setattr(
+        module,
+        "_run_exec_agent_command",
+        lambda *_args, **_kwargs: _runner_response(
+            settings=settings,
+            decision=decision,
+            include_agent_id=False,
+        ),
+    )
+
+    if path == "trigger":
+        response = trigger_time_exec_agent._request_exec_agent_decision(
+            settings=settings,
+            payload=request_payload,
+        )
+        provenance = response["_openclaw_runtime_provenance"]
+        verifier = trigger_time_exec_agent._verified_runtime_provenance
+    else:
+        response = watch_sizing._request_exec_agent_decisions(
+            settings=settings,
+            payload=request_payload,
+        )
+        provenance = response["_runtime_provenance"]
+        verifier = watch_sizing._verified_runtime_provenance
+
+    assert provenance["actual_agent_id"] is None
+    assert provenance["verified_agent_id"] == settings.exec_agent_id
+    assert provenance["agent_identity_source"] == "signed_runtime_contract"
+    assert verifier(
+        settings=settings,
+        provenance=provenance,
+        request_payload=request_payload,
+    )
+
+
+@pytest.mark.parametrize("path", ["trigger", "watch"])
+def test_reported_wrong_agent_id_cannot_be_overridden_by_signed_identity_fallback(
+    path: str,
+) -> None:
+    settings = Settings()
+    request_payload = {"plan_id": "reported-agent-mismatch", "candidates": []}
+    provenance = _bound_provenance(
+        settings=settings,
+        request_payload=request_payload,
+    )
+    provenance.update(
+        {
+            "actual_agent_id": "wrong-agent",
+            "verified_agent_id": settings.exec_agent_id,
+            "agent_identity_source": "signed_runtime_contract",
+        }
+    )
+    verifier = (
+        trigger_time_exec_agent._verified_runtime_provenance
+        if path == "trigger"
+        else watch_sizing._verified_runtime_provenance
+    )
+
+    assert verifier(
+        settings=settings,
+        provenance=provenance,
+        request_payload=request_payload,
+    ) is False
+
+
+@pytest.mark.parametrize("path", ["trigger", "watch"])
+@pytest.mark.parametrize(
+    "malformed_agent_id",
+    [None, 0, {"unexpected": "object"}],
+)
+def test_present_malformed_agent_id_cannot_use_signed_identity_fallback(
+    path: str,
+    malformed_agent_id: object,
+    monkeypatch,
+) -> None:
+    settings = Settings(runtime_mode="paper")
+    snapshots = iter([_snapshot(), _snapshot()])
+    request_payload = (
+        _trigger_payload()
+        if path == "trigger"
+        else {"plan_id": "plan-contract-gate", "candidates": []}
+    )
+    decision = (
+        _trigger_response()
+        if path == "trigger"
+        else {
+            "version": "manual-exec-agent-watch-sizing-v1",
+            "plan_id": "plan-contract-gate",
+            "decisions": [],
+        }
+    )
+    module = trigger_time_exec_agent if path == "trigger" else watch_sizing
+    monkeypatch.setattr(module, "capture_runtime_contract", lambda **_: next(snapshots))
+
+    def malformed_runner(*_args, **_kwargs):
+        completed = _runner_response(
+            settings=settings,
+            decision=decision,
+            include_agent_id=False,
+        )
+        envelope = json.loads(completed.stdout)
+        envelope["meta"]["agentMeta"]["agentId"] = malformed_agent_id
+        return subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=json.dumps(envelope),
+            stderr="",
+        )
+
+    monkeypatch.setattr(module, "_run_exec_agent_command", malformed_runner)
+
+    if path == "trigger":
+        response = trigger_time_exec_agent._request_exec_agent_decision(
+            settings=settings,
+            payload=request_payload,
+        )
+        provenance = response["_openclaw_runtime_provenance"]
+        verifier = trigger_time_exec_agent._verified_runtime_provenance
+    else:
+        response = watch_sizing._request_exec_agent_decisions(
+            settings=settings,
+            payload=request_payload,
+        )
+        provenance = response["_runtime_provenance"]
+        verifier = watch_sizing._verified_runtime_provenance
+
+    assert "verified_agent_id" not in provenance
+    assert "agent_identity_source" not in provenance
+    assert verifier(
+        settings=settings,
+        provenance=provenance,
+        request_payload=request_payload,
+    ) is False
 
 
 @pytest.mark.parametrize("path", ["trigger", "watch"])

@@ -10957,6 +10957,49 @@ def test_watch_buy_drawdown_recovery_revalidates_trigger_and_controls_before_new
     engine.dispose()
 
 
+def _verified_watch_sizing_policy(
+    *,
+    settings: Settings,
+    quantity: int = 10,
+    sizing_price: str = "100.0000",
+    approved_notional: str = "1000.0000",
+) -> dict[str, object]:
+    request_payload = {"test_scope": "persisted-watch-sizing-authority"}
+    runtime = verified_runtime_provenance(
+        settings=settings,
+        request_payload=request_payload,
+        session_id="persisted-watch-sizing-authority-session",
+    )
+    decision = {
+        "source": "openclaw_exec_agent_watch_sizing",
+        "action": "approve",
+        "decision": "approved",
+        "quantity": quantity,
+        "approved_quantity": quantity,
+        "approved_notional_krw": approved_notional,
+        "sizing_price": sizing_price,
+        "runtime_provenance": runtime,
+    }
+    return {
+        "kind": "shares",
+        "quantity": quantity,
+        "source": "exec_agent_watch_sizing",
+        "approval_provenance": {
+            "kind": "verified_exec_agent_watch_sizing",
+            "runtime": runtime,
+        },
+        "sizing_price": sizing_price,
+        "approved_notional": approved_notional,
+        "exec_agent_decision": decision,
+        "short_term_exec_agent_decision": decision,
+        "sizing_adjustment": {
+            "final_quantity": quantity,
+            "final_notional": approved_notional,
+            "cap_notional": approved_notional,
+        },
+    }
+
+
 def test_watch_buy_exec_agent_notional_cap_downsizes_price_drift() -> None:
     app, engine, client, broker_adapter = _build_watch_buy_test_app(
         order_id="kis-watch-buy-agent-cap-drift-1"
@@ -10965,18 +11008,7 @@ def test_watch_buy_exec_agent_notional_cap_downsizes_price_drift() -> None:
         client,
         plan_id="plan-watch-buy-agent-cap-drift-1",
         trigger_price="100.00",
-        quantity_policy={
-            "kind": "shares",
-            "quantity": 10,
-            "source": "exec_agent_watch_sizing",
-            "sizing_price": "100.0000",
-            "approved_notional": "1000.0000",
-            "sizing_adjustment": {
-                "final_quantity": 10,
-                "final_notional": "1000.0000",
-                "cap_notional": "1000.0000",
-            },
-        },
+        quantity_policy=_verified_watch_sizing_policy(settings=app.state.settings),
         risk_context={
             "exchange": "KRX",
             "stop_price": "90.00",
@@ -11028,18 +11060,7 @@ def test_watch_buy_exec_agent_notional_cap_rejects_when_price_exceeds_cap() -> N
         client,
         plan_id="plan-watch-buy-agent-cap-drift-2",
         trigger_price="100.00",
-        quantity_policy={
-            "kind": "shares",
-            "quantity": 10,
-            "source": "exec_agent_watch_sizing",
-            "sizing_price": "100.0000",
-            "approved_notional": "1000.0000",
-            "sizing_adjustment": {
-                "final_quantity": 10,
-                "final_notional": "1000.0000",
-                "cap_notional": "1000.0000",
-            },
-        },
+        quantity_policy=_verified_watch_sizing_policy(settings=app.state.settings),
         risk_context={
             "exchange": "KRX",
             "stop_price": "90.00",
@@ -11073,6 +11094,81 @@ def test_watch_buy_exec_agent_notional_cap_rejects_when_price_exceeds_cap() -> N
         assert event["details"]["exec_agent_approved_notional_cap"] == "1000.0000"
         assert event["details"]["max_quantity_within_cap"] == 0
 
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    "provenance_case",
+    [
+        "bare_label",
+        "mismatched_runtime",
+        "tampered_quantity",
+        "tampered_policy_kind",
+    ],
+)
+def test_watch_buy_structurally_unverified_agent_policy_never_reaches_broker(
+    provenance_case: str,
+) -> None:
+    app, engine, client, broker_adapter = _build_watch_buy_test_app(
+        order_id=f"kis-watch-buy-unverified-{provenance_case}"
+    )
+    policy = _verified_watch_sizing_policy(settings=app.state.settings)
+    if provenance_case == "bare_label":
+        policy["approval_provenance"] = {
+            "kind": "verified_exec_agent_watch_sizing",
+        }
+    elif provenance_case == "mismatched_runtime":
+        provenance = policy["approval_provenance"]
+        assert isinstance(provenance, dict)
+        runtime = provenance["runtime"]
+        assert isinstance(runtime, dict)
+        provenance["runtime"] = {
+            **runtime,
+            "session_id": "mismatched-persisted-session",
+        }
+    elif provenance_case == "tampered_quantity":
+        policy["quantity"] = 11
+    else:
+        policy.pop("quantity")
+        policy["kind"] = "percent"
+        policy["fraction"] = "0.1"
+        policy["budget_krw"] = "1000.0000"
+        policy["approval_provenance"] = {
+            "kind": "verified_exec_agent_watch_sizing",
+        }
+    item_id = _create_watch_buy_candidate(
+        client,
+        plan_id=f"plan-watch-buy-unverified-{provenance_case}",
+        trigger_price="100.00",
+        quantity_policy=policy,
+        risk_context={
+            "exchange": "KRX",
+            "stop_price": "90.00",
+            "trigger_direction": "at_or_above",
+        },
+    )
+
+    response = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "unverified persisted approval must fail closed",
+            "prices": [{"symbol": "005930", "price": "120.00"}],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["submitted_order_count"] == 0
+    assert response.json()["items"][0]["outcome"] == "rejected"
+    assert broker_adapter.order_calls == []
+    with app.state.db_session_factory() as session:
+        item = session.get(ExecutionPlanItem, item_id)
+        assert item is not None
+        assert item.risk_context["last_monitoring_event"]["reason"] == (
+            "unverified_exec_agent_sizing"
+        )
+        assert session.scalars(select(BrokerOrder)).all() == []
     engine.dispose()
 
 
@@ -23891,23 +23987,12 @@ def test_verified_agent_next_open_job_requires_fresh_entry_geometry(
     with app.state.db_session_factory() as session:
         item = session.get(ExecutionPlanItem, item_id)
         assert item is not None
-        item.quantity_policy = {
-            "kind": "shares",
-            "quantity": 2,
-            "source": "exec_agent_watch_sizing",
-            "sizing_price": "71000.0000",
-            "approved_notional": "142000.0000",
-            "exec_agent_decision": {
-                "action": "approve",
-                "quantity": 2,
-                "sizing_price": "71000.0000",
-                "runtime_provenance": {"actual_model_ref": "openai/gpt-5.6-sol"},
-            },
-            "approval_provenance": {
-                "kind": "verified_exec_agent_watch_sizing",
-                "runtime": {"actual_model_ref": "openai/gpt-5.6-sol"},
-            },
-        }
+        item.quantity_policy = _verified_watch_sizing_policy(
+            settings=app.state.settings,
+            quantity=2,
+            sizing_price="71000.0000",
+            approved_notional="142000.0000",
+        )
         session.commit()
 
     with app.state.db_session_factory() as session:
@@ -23936,6 +24021,7 @@ def test_verified_agent_next_open_job_requires_fresh_entry_geometry(
 
 
 def test_verified_agent_next_open_fails_closed_for_unsupported_provider_quote_path() -> None:
+    settings = Settings(runtime_mode="paper")
     item = ExecutionPlanItem(
         id="verified-alpaca-next-open",
         plan_item_index=0,
@@ -23945,20 +24031,12 @@ def test_verified_agent_next_open_fails_closed_for_unsupported_provider_quote_pa
         status="next_open_buy_scheduled",
         provider="alpaca",
         asset_class="us_equity",
-        quantity_policy={
-            "kind": "shares",
-            "quantity": 1,
-            "source": "exec_agent_watch_sizing",
-            "sizing_price": "200",
-            "approved_notional": "200",
-            "exec_agent_decision": {
-                "action": "approve",
-                "runtime_provenance": {"actual_model_ref": "openai/gpt-5.6-sol"},
-            },
-            "approval_provenance": {
-                "kind": "verified_exec_agent_watch_sizing",
-            },
-        },
+        quantity_policy=_verified_watch_sizing_policy(
+            settings=settings,
+            quantity=1,
+            sizing_price="200",
+            approved_notional="200",
+        ),
     )
     command = SimpleNamespace(
         idempotency_key="execution-job:verified-alpaca",
@@ -23975,7 +24053,7 @@ def test_verified_agent_next_open_fails_closed_for_unsupported_provider_quote_pa
     )
 
     reason = execution_jobs_service._verified_agent_next_open_quote_guard(
-        settings=Settings(runtime_mode="paper"),
+        settings=settings,
         db=None,
         adapter=SimpleNamespace(provider="alpaca"),
         job=SimpleNamespace(job_type="next_open_buy", plan_item=item),

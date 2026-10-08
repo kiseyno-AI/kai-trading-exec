@@ -7,7 +7,7 @@ from collections.abc import Iterable
 from typing import Any
 
 from sqlalchemy import func, or_, select
-from sqlalchemy.orm import Session, load_only
+from sqlalchemy.orm import Session, load_only, undefer
 
 from app.broker.base import (
     BrokerAccountHolding,
@@ -1032,6 +1032,11 @@ def build_portfolio_risk_snapshot(
         stop_metadata=stop_metadata,
         ambiguous_symbols=set(stop_metadata_scope["ambiguous_family_symbols"]),
     )
+    protection_payload = _portfolio_protection_payload(
+        holdings=holdings,
+        stop_risk=stop_risk_payload,
+        positions=active_positions,
+    )
     known_stop_risk_count = sum(
         _decimal_or_none(row.get("estimated_risk")) is not None
         for row in stop_risk_payload
@@ -1180,6 +1185,7 @@ def build_portfolio_risk_snapshot(
                 "excluded_other_route_count"
             ],
         },
+        "protection": protection_payload,
         "warnings": {
             "concentration": concentration_warnings,
             "stale_positions": {
@@ -1793,6 +1799,7 @@ def _load_positions(
                 == position_scope.identity.account_scope,
                 ExecutionPosition.exchange.in_(position_scope.exchanges),
             )
+            .options(undefer(ExecutionPosition.raw_payload))
             .order_by(
                 ExecutionPosition.symbol.asc(),
                 ExecutionPosition.provider.asc(),
@@ -2636,6 +2643,106 @@ def _estimated_stop_risk_payload(
                 )
             )
     return rows
+
+
+def _portfolio_protection_payload(
+    *,
+    holdings: list[HoldingRiskRow],
+    stop_risk: list[dict[str, object]],
+    positions: list[ExecutionPosition],
+) -> dict[str, object]:
+    manual_review_reasons: dict[str, str] = {}
+    for position in positions:
+        raw_payload = (
+            position.raw_payload if isinstance(position.raw_payload, dict) else {}
+        )
+        sync_context = raw_payload.get("_position_sync")
+        if not isinstance(sync_context, dict):
+            continue
+        if not (
+            sync_context.get("manual_review_required") is True
+            or sync_context.get("monitoring_eligible") is False
+        ):
+            continue
+        manual_review_reasons[position.symbol] = str(
+            sync_context.get("manual_review_reason")
+            or "position_monitoring_not_eligible"
+        )
+
+    risk_by_symbol: dict[str, list[dict[str, object]]] = {}
+    for row in stop_risk:
+        symbol = str(row.get("symbol") or "").strip()
+        if symbol:
+            risk_by_symbol.setdefault(symbol, []).append(row)
+
+    protection_rows: list[dict[str, object]] = []
+    for holding in sorted(holdings, key=lambda row: row.symbol):
+        held_quantity = (
+            holding.base_quantity
+            if holding.base_quantity is not None and holding.base_quantity > 0
+            else Decimal(holding.quantity)
+        )
+        risk_rows = risk_by_symbol.get(holding.symbol, [])
+        protected_quantity = sum(
+            (
+                _decimal_or_none(row.get("protected_quantity")) or Decimal("0")
+                for row in risk_rows
+                if row.get("metadata_status") == "present"
+            ),
+            Decimal("0"),
+        )
+        protected_quantity = min(protected_quantity, held_quantity)
+        missing_quantity = max(held_quantity - protected_quantity, Decimal("0"))
+        manual_reason = manual_review_reasons.get(holding.symbol)
+        if manual_reason is not None:
+            status = "manual_review_required"
+            reason = manual_reason
+        elif missing_quantity > 0:
+            status = "unprotected"
+            reason = next(
+                (
+                    str(row.get("metadata_reason"))
+                    for row in risk_rows
+                    if row.get("metadata_reason")
+                ),
+                "missing_stop_metadata",
+            )
+        else:
+            status = "protected"
+            reason = None
+        protection_rows.append(
+            {
+                "symbol": holding.symbol,
+                "status": status,
+                "reason": reason,
+                "held_quantity": _decimal_text(held_quantity),
+                "protected_quantity": _decimal_text(protected_quantity),
+                "missing_quantity": _decimal_text(missing_quantity),
+            }
+        )
+
+    protected_count = sum(
+        row["status"] == "protected" for row in protection_rows
+    )
+    manual_review_count = sum(
+        row["status"] == "manual_review_required" for row in protection_rows
+    )
+    unprotected_count = sum(
+        row["status"] == "unprotected" for row in protection_rows
+    )
+    affected_symbols = [
+        str(row["symbol"])
+        for row in protection_rows
+        if row["status"] != "protected"
+    ]
+    return {
+        "status": "degraded" if affected_symbols else "ok",
+        "protected_position_count": protected_count,
+        "unprotected_position_count": unprotected_count,
+        "manual_review_position_count": manual_review_count,
+        "affected_symbols": affected_symbols,
+        "positions": protection_rows,
+    }
 
 
 def _unavailable_stop_risk_row(

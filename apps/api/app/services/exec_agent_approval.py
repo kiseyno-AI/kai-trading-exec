@@ -7,6 +7,9 @@ from datetime import UTC, datetime, time, timedelta
 from decimal import Decimal, DecimalException, InvalidOperation, ROUND_DOWN
 
 from app.services.execution_semantics import canonical_execution_asset_class
+from app.services.openclaw_runtime_contract import (
+    persisted_runtime_contract_proof_shape_is_valid,
+)
 
 
 _ROUND_TRIP_COST_KEYS = frozenset(
@@ -695,12 +698,134 @@ def _validate_finite_json_numbers(value: object) -> None:
 def is_legacy_unverified_exec_agent_sizing(quantity_policy: object) -> bool:
     if not isinstance(quantity_policy, dict):
         return False
-    if str(quantity_policy.get("source") or "").strip() != "watch_buy_handoff_normalizer":
+    source = str(quantity_policy.get("source") or "").strip()
+    if source == "exec_agent_watch_sizing":
+        return not persisted_verified_watch_sizing_provenance(quantity_policy)
+    if source != "watch_buy_handoff_normalizer":
         return False
     if str(quantity_policy.get("original_policy_type") or "").strip() != "exec_agent_sized":
         return False
+    return not persisted_verified_watch_sizing_provenance(quantity_policy)
+
+
+def persisted_verified_watch_sizing_provenance(
+    quantity_policy: dict[str, object],
+) -> bool:
     approval_provenance = quantity_policy.get("approval_provenance")
-    return not (
+    decision = quantity_policy.get("exec_agent_decision")
+    if not (
         isinstance(approval_provenance, dict)
-        and approval_provenance.get("kind") == "verified_exec_agent_watch_sizing"
+        and set(approval_provenance) == {"kind", "runtime"}
+        and approval_provenance.get("kind")
+        == "verified_exec_agent_watch_sizing"
+        and isinstance(decision, dict)
+        and decision == quantity_policy.get("short_term_exec_agent_decision")
+        and decision.get("source") == "openclaw_exec_agent_watch_sizing"
+        and decision.get("action") == "approve"
+        and decision.get("decision") == "approved"
+    ):
+        return False
+    quantity = quantity_policy.get("quantity")
+    sizing_price = _finite_decimal(quantity_policy.get("sizing_price"))
+    decision_sizing_price = _finite_decimal(decision.get("sizing_price"))
+    approved_notional = _finite_decimal(
+        quantity_policy.get("approved_notional")
     )
+    decision_notional = _finite_decimal(
+        decision.get("approved_notional_krw")
+    )
+    adjustment = quantity_policy.get("sizing_adjustment")
+    adjustment_notional = _finite_decimal(
+        adjustment.get("final_notional")
+        if isinstance(adjustment, dict)
+        else None
+    )
+    if not (
+        isinstance(quantity, int)
+        and not isinstance(quantity, bool)
+        and quantity > 0
+        and decision.get("quantity") == quantity
+        and decision.get("approved_quantity") == quantity
+        and sizing_price is not None
+        and sizing_price > 0
+        and sizing_price == decision_sizing_price
+        and approved_notional is not None
+        and approved_notional > 0
+        and approved_notional == decision_notional
+        and approved_notional == sizing_price * Decimal(quantity)
+        and isinstance(adjustment, dict)
+        and adjustment.get("final_quantity") == quantity
+        and adjustment_notional == approved_notional
+    ):
+        return False
+    runtime = approval_provenance.get("runtime")
+    if not (
+        isinstance(runtime, dict)
+        and runtime == decision.get("runtime_provenance")
+        and runtime.get("agent_id_metadata_malformed") is not True
+    ):
+        return False
+    configured_agent_id = _persisted_nonempty_text(
+        runtime.get("configured_agent_id")
+    )
+    raw_actual_agent_id = runtime.get("actual_agent_id")
+    actual_agent_id = _persisted_nonempty_text(raw_actual_agent_id)
+    if configured_agent_id is None:
+        return False
+    if actual_agent_id is not None:
+        if (
+            actual_agent_id != configured_agent_id
+            or runtime.get("agent_id") != actual_agent_id
+        ):
+            return False
+        verified_agent_id = actual_agent_id
+    else:
+        if raw_actual_agent_id is not None and not (
+            isinstance(raw_actual_agent_id, str)
+            and not raw_actual_agent_id.strip()
+        ):
+            return False
+        verified_agent_id = _persisted_nonempty_text(
+            runtime.get("verified_agent_id")
+        )
+        if not (
+            verified_agent_id == configured_agent_id
+            and runtime.get("agent_identity_source")
+            == "signed_runtime_contract"
+            and runtime.get("agent_id") in {None, ""}
+        ):
+            return False
+    configured_model = _persisted_nonempty_text(
+        runtime.get("configured_model_hint")
+    )
+    actual_provider = _persisted_nonempty_text(runtime.get("actual_provider"))
+    actual_model = _persisted_nonempty_text(runtime.get("actual_model"))
+    actual_model_ref = _persisted_nonempty_text(runtime.get("actual_model_ref"))
+    session_id = _persisted_nonempty_text(runtime.get("session_id"))
+    requested_session_key = _persisted_nonempty_text(
+        runtime.get("requested_session_key")
+    )
+    request_sha256 = _persisted_nonempty_text(runtime.get("request_sha256"))
+    if not (
+        configured_model is not None
+        and actual_provider is not None
+        and actual_model is not None
+        and actual_model_ref == f"{actual_provider}/{actual_model}"
+        and actual_model_ref == configured_model
+        and session_id is not None
+        and requested_session_key is not None
+        and request_sha256 is not None
+    ):
+        return False
+    return persisted_runtime_contract_proof_shape_is_valid(
+        runtime.get("runtime_contract"),
+        agent_id=verified_agent_id,
+        expected_model_ref=configured_model,
+        requested_session_key=requested_session_key,
+        reported_session_id=session_id,
+        request_sha256=request_sha256,
+    )
+
+
+def _persisted_nonempty_text(value: object) -> str | None:
+    return value.strip() if isinstance(value, str) and value.strip() else None
