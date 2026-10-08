@@ -585,6 +585,7 @@ class CoreExecutionRevocationRequestV4(BaseModel):
         "execution_control_disabled",
         "current_live_market_risk_off",
         "current_live_market_evidence_unavailable",
+        "exec_contract_quarantined",
     ]
     replacement_decision_snapshot_id: str = Field(min_length=1, max_length=128)
     replacement_action: Literal["buy", "scalp_buy_candidate", "watch_for_trigger", "wait", "reject", "avoid_chase"]
