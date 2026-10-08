@@ -1050,6 +1050,93 @@ def test_kis_adapter_maps_ioc_limit_to_bounded_domestic_wire_order() -> None:
     assert payload["ORD_UNPR"] == "71010"
 
 
+@pytest.mark.parametrize(
+    ("order_division", "limit_price", "expected_wire_price"),
+    [
+        ("05", None, "0"),
+        ("06", None, "0"),
+        ("07", Decimal("1097"), "1097"),
+    ],
+)
+def test_kis_adapter_preserves_domestic_session_price_contract(
+    order_division: str,
+    limit_price: Decimal | None,
+    expected_wire_price: str,
+) -> None:
+    http_client = RecordingHttpClient(
+        {
+            "rt_cd": "0",
+            "msg_cd": "0",
+            "msg1": "accepted",
+            "output": {"ODNO": f"session-{order_division}", "ORD_TMD": "160001"},
+        }
+    )
+    adapter = KisBrokerAdapter(
+        settings=Settings(
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+            kis_use_hashkey=False,
+        ),
+        http_client=http_client,
+    )
+
+    adapter.place_order(
+        "access-token",
+        BrokerOrderPlacementRequest(
+            idempotency_key=f"domestic-session-{order_division}",
+            symbol="005930",
+            side="sell",
+            quantity=5,
+            order_type="limit",
+            limit_price=limit_price,
+            time_in_force="day",
+            exchange="KRX",
+            order_division=order_division,
+            route_session={
+                "05": "krx_preopen_close",
+                "06": "krx_after_close",
+                "07": "krx_after_single_price",
+            }[order_division],
+        ),
+    )
+
+    payload = http_client.calls[-1]["payload"]
+    assert payload["ORD_DVSN"] == order_division
+    assert payload["ORD_UNPR"] == expected_wire_price
+
+
+def test_kis_adapter_rejects_unpriced_single_price_limit() -> None:
+    adapter = KisBrokerAdapter(
+        settings=Settings(
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+            kis_use_hashkey=False,
+        ),
+        http_client=RecordingHttpClient({}),
+    )
+
+    with pytest.raises(BrokerAdapterError, match="limit orders require limit_price"):
+        adapter.place_order(
+            "access-token",
+            BrokerOrderPlacementRequest(
+                idempotency_key="unpriced-single-price",
+                symbol="005930",
+                side="sell",
+                quantity=5,
+                order_type="limit",
+                limit_price=None,
+                time_in_force="day",
+                exchange="KRX",
+                order_division="07",
+                route_session="krx_after_single_price",
+            ),
+        )
+
+
 def test_kis_session_time_rejection_is_retryable() -> None:
     http_client = RecordingHttpClient(
         {
@@ -2762,6 +2849,187 @@ def test_retryable_auth_failure_keeps_protective_stop_rearmable() -> None:
     assert recovered.status_code == 201, recovered.payload
     assert len(broker_adapter.order_calls) == 1
     assert broker_adapter.order_calls[0].quantity == 1
+
+    engine.dispose()
+
+
+@pytest.mark.parametrize("intent", ["stop_sell", "target_sell"])
+def test_runtime_safety_fenced_monitoring_sell_rebinds_fresh_command_authority(
+    intent: str,
+) -> None:
+    triggered_at = datetime(2026, 9, 10, 1, 0, tzinfo=UTC)
+    # The fenced attempt was routed during KRX single-price trading. Reusing
+    # its route_now on the next regular-session trigger would incorrectly keep
+    # the retry on order division 07.
+    stale_triggered_at = datetime(2026, 9, 9, 7, 0, tzinfo=UTC)
+    adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(
+            broker_order_id=f"fresh-{intent}-retry"
+        ),
+        account_snapshot=BrokerAccountSnapshot(
+            available_cash=Decimal("0"),
+            observed_at=triggered_at,
+            source="stub:monitoring-sell-retry",
+            holdings=[
+                BrokerAccountHolding(
+                    symbol="005930",
+                    quantity=5,
+                    sellable_quantity=5,
+                    average_price=Decimal("100"),
+                )
+            ],
+        ),
+    )
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        kis_app_key="paper-key",
+        kis_app_secret="paper-secret",
+        kis_account_number="12345678",
+        account_drawdown_gate_enabled=False,
+        domestic_order_session_routing_enabled=True,
+        allow_krx_after_hours_single_price_orders=True,
+        account_drawdown_recovery_scope_secret=(
+            "monitoring-sell-retry-scope-secret-at-least-32-bytes"
+        ),
+    )
+    app, engine = build_test_app(settings=settings, broker_adapter=adapter)
+    client = TestClient(app)
+    assert client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "test", "reason": "sell retry probe"},
+    ).status_code == 200
+
+    item_id = f"fresh-command-authority-{intent}"
+    with app.state.db_session_factory() as session:
+        risk_context, quantity_policy = _bound_kis_item_payloads(
+            settings=settings,
+            risk_context={"exchange": "KRX"},
+            quantity_policy={"kind": "shares", "quantity": 5},
+        )
+        item = ExecutionPlanItem(
+            id=item_id,
+            plan_item_index=0,
+            symbol="005930",
+            side="sell",
+            intent=intent,
+            status=f"{intent}_monitoring",
+            provider="kis",
+            venue="kis",
+            asset_class="stock",
+            trigger_price=Decimal("100"),
+            time_in_force="day",
+            quantity_policy=quantity_policy,
+            risk_context=risk_context,
+        )
+        session.add(
+            ExecutionPlan(
+                external_plan_id=f"fresh-command-authority-plan-{intent}",
+                source="test",
+                market_date=triggered_at.astimezone(ZoneInfo("Asia/Seoul")).date(),
+                mode="paper",
+                status="accepted",
+                items=[item],
+            )
+        )
+        session.flush()
+        stale_command = PlaceOrderRequest(
+            idempotency_key=f"monitoring:{intent}:{item_id}",
+            execution_plan_item_id=item_id,
+            provider="kis",
+            venue="kis",
+            asset_class="stock",
+            symbol="005930",
+            side="sell",
+            quantity=5,
+            order_type="market",
+            time_in_force="day",
+            exchange="KRX",
+            metadata=monitoring_service._monitoring_order_metadata(
+                item=item,
+                observed_price=Decimal("95"),
+                trigger_reason=intent,
+                trigger_metadata=None,
+                triggered_at=stale_triggered_at,
+                deterministic_sell_quantity_cap=5,
+            ),
+        )
+        session.add(
+            BrokerOrder(
+                broker_name="kis",
+                execution_plan_item_id=item_id,
+                mode="paper",
+                idempotency_key=stale_command.idempotency_key,
+                symbol="005930",
+                side="sell",
+                status="rejected",
+                quantity=5,
+                venue="kis",
+                asset_class="stock",
+                request_metadata={
+                    "source": "monitoring:intraday_target_stop_monitor",
+                    "original_command": broker_orders_service._order_command_payload(
+                        stale_command
+                    ),
+                    "broker_account_scope": {
+                        "policy_version": 1,
+                        "scope": broker_orders_service._account_drawdown_recovery_scope(
+                            settings=settings,
+                            provider="kis",
+                            asset_class="stock",
+                            exchange="KRX",
+                        ),
+                    },
+                },
+                response_metadata={
+                    "runtime_safety_fence": {
+                        "block_reason": "live_sell_quote_future_skew"
+                    }
+                },
+                last_error_classification="runtime_safety_control",
+                last_error_code="live_sell_quote_future_skew",
+                last_error_retryable=True,
+            )
+        )
+        session.commit()
+
+        result = monitoring_service._place_monitoring_order(
+            settings=settings,
+            db=session,
+            adapter=adapter,
+            item=item,
+            quantity=5,
+            observed_price=Decimal("99" if intent == "stop_sell" else "101"),
+            trigger_reason=intent,
+            trigger_metadata=None,
+            triggered_at=triggered_at,
+            freshness_reference_at=triggered_at,
+            deterministic_sell_quantity_cap=5,
+        )
+
+    assert result.status_code == 201, result.payload
+    assert len(adapter.order_calls) == 1
+    submitted = adapter.order_calls[0]
+    assert submitted.order_type == "market"
+    assert submitted.order_division == "01"
+    assert submitted.route_session == "krx_regular"
+    with app.state.db_session_factory() as session:
+        order = session.scalar(
+            select(BrokerOrder).where(BrokerOrder.idempotency_key == stale_command.idempotency_key)
+        )
+        assert order is not None
+        original_command = order.request_metadata["original_command"]
+        assert original_command["metadata"]["observed_price"] == (
+            "99.0000" if intent == "stop_sell" else "101.0000"
+        )
+        assert original_command["metadata"]["route_now"] == triggered_at.isoformat()
 
     engine.dispose()
 
@@ -21710,6 +21978,83 @@ def test_live_monitoring_sell_rechecks_executable_bid_after_position_reservation
             )
         )
         db.commit()
+        stale_item = ExecutionPlanItem(
+            id=item.id,
+            symbol=item.symbol,
+            side="sell",
+            intent=intent,
+            status=item.status,
+            provider="kis",
+            venue="kis",
+            asset_class="stock",
+            trigger_price=(
+                Decimal("98") if intent == "target_sell" else Decimal("102")
+            ),
+            time_in_force="day",
+            quantity_policy=quantity_policy,
+            risk_context=risk_context,
+        )
+        stale_command = PlaceOrderRequest(
+            idempotency_key=f"monitoring:{intent}:{item.id}",
+            execution_plan_item_id=item.id,
+            provider="kis",
+            venue="kis",
+            asset_class="stock",
+            symbol=item.symbol,
+            side="sell",
+            quantity=2,
+            order_type="market",
+            time_in_force="day",
+            exchange="KRX",
+            metadata=monitoring_service._monitoring_order_metadata(
+                item=stale_item,
+                observed_price=(
+                    Decimal("99") if intent == "target_sell" else Decimal("101")
+                ),
+                trigger_reason=intent,
+                trigger_metadata=None,
+                triggered_at=observed_at - timedelta(days=1),
+                deterministic_sell_quantity_cap=2,
+            ),
+        )
+        db.add(
+            BrokerOrder(
+                broker_name="kis",
+                execution_plan_item_id=item.id,
+                mode="live",
+                idempotency_key=stale_command.idempotency_key,
+                symbol=item.symbol,
+                side="sell",
+                status="rejected",
+                quantity=2,
+                venue="kis",
+                asset_class="stock",
+                request_metadata={
+                    "source": "monitoring:intraday_target_stop_monitor",
+                    "original_command": broker_orders_service._order_command_payload(
+                        stale_command
+                    ),
+                    "broker_account_scope": {
+                        "policy_version": 1,
+                        "scope": broker_orders_service._account_drawdown_recovery_scope(
+                            settings=settings,
+                            provider="kis",
+                            asset_class="stock",
+                            exchange="KRX",
+                        ),
+                    },
+                },
+                response_metadata={
+                    "runtime_safety_fence": {
+                        "block_reason": "live_sell_quote_future_skew"
+                    }
+                },
+                last_error_classification="runtime_safety_control",
+                last_error_code="live_sell_quote_future_skew",
+                last_error_retryable=True,
+            )
+        )
+        db.commit()
         result = monitoring_service._place_monitoring_order(
             settings=settings,
             db=db,
@@ -21734,6 +22079,154 @@ def test_live_monitoring_sell_rechecks_executable_bid_after_position_reservation
         persisted = db.get(ExecutionPlanItem, f"final-sell-boundary-{intent}")
         assert persisted is not None
         assert persisted.status == f"{intent}_monitoring"
+    engine.dispose()
+
+
+def test_live_krx_single_price_protective_sell_binds_final_bid() -> None:
+    triggered_at = datetime(2026, 9, 10, 7, 0, tzinfo=UTC)
+    executable_bid = Decimal("99")
+
+    class SinglePriceBidAdapter(StubBrokerAdapter):
+        def get_live_market_context(self, access_token: str, **kwargs: object):
+            assert access_token
+            return BrokerLiveMarketContext(
+                symbol=str(kwargs["symbol"]),
+                exchange=str(kwargs["exchange"]),
+                observed_at=triggered_at,
+                bid=executable_bid,
+                ask=Decimal("100"),
+                normal_ordering_available=True,
+                payload={
+                    "provider": "kis",
+                    "endpoint": (
+                        "/uapi/domestic-stock/v1/quotations/"
+                        "inquire-asking-price-exp-ccn"
+                    ),
+                    "tr_id": "FHKST01010200",
+                    "field_sources": {
+                        "bid": {
+                            "field": "bidp1",
+                            "endpoint": (
+                                "/uapi/domestic-stock/v1/quotations/"
+                                "inquire-asking-price-exp-ccn"
+                            ),
+                            "tr_id": "FHKST01010200",
+                        }
+                    },
+                },
+                freshness_source="kis_exchange_orderbook_time",
+            )
+
+    adapter = SinglePriceBidAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="live",
+            configured=True,
+            api_base_url=KIS_LIVE_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(
+            broker_order_id="single-price-protective-stop"
+        ),
+        account_snapshot=BrokerAccountSnapshot(
+            available_cash=Decimal("0"),
+            observed_at=triggered_at,
+            source="stub:single-price-protective-stop",
+            holdings=[
+                BrokerAccountHolding(
+                    symbol="005930",
+                    quantity=5,
+                    sellable_quantity=5,
+                    average_price=Decimal("105"),
+                )
+            ],
+        ),
+    )
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="live",
+        automation_enabled=False,
+        domestic_order_session_routing_enabled=True,
+        allow_krx_after_hours_single_price_orders=True,
+        kis_app_key="live-key",
+        kis_app_secret="live-secret",
+        kis_account_number="12345678",
+        account_drawdown_recovery_scope_secret=(
+            "single-price-protective-scope-secret-at-least-32-bytes"
+        ),
+        account_drawdown_gate_enabled=False,
+    )
+    app, engine = build_test_app(settings=settings, broker_adapter=adapter)
+    client = TestClient(app)
+    assert client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "test", "reason": "single price sell"},
+    ).status_code == 200
+
+    item_id = "single-price-protective-stop-item"
+    with app.state.db_session_factory() as session:
+        risk_context, quantity_policy = _bound_kis_item_payloads(
+            settings=settings,
+            risk_context={"exchange": "KRX"},
+            quantity_policy={"kind": "shares", "quantity": 5},
+        )
+        item = ExecutionPlanItem(
+            id=item_id,
+            plan_item_index=0,
+            symbol="005930",
+            side="sell",
+            intent="stop_sell",
+            status="stop_sell_monitoring",
+            provider="kis",
+            venue="kis",
+            asset_class="stock",
+            trigger_price=Decimal("100"),
+            time_in_force="day",
+            quantity_policy=quantity_policy,
+            risk_context=risk_context,
+        )
+        session.add(
+            ExecutionPlan(
+                external_plan_id="single-price-protective-stop-plan",
+                source="test",
+                market_date=triggered_at.astimezone(ZoneInfo("Asia/Seoul")).date(),
+                mode="live",
+                status="accepted",
+                items=[item],
+            )
+        )
+        session.commit()
+        result = monitoring_service._place_monitoring_order(
+            settings=settings,
+            db=session,
+            adapter=adapter,
+            item=item,
+            quantity=5,
+            observed_price=executable_bid,
+            trigger_reason="stop_sell",
+            trigger_metadata=None,
+            triggered_at=triggered_at,
+            freshness_reference_at=triggered_at,
+            deterministic_sell_quantity_cap=5,
+        )
+
+    assert result.status_code == 201, result.payload
+    assert len(adapter.order_calls) == 1
+    submitted = adapter.order_calls[0]
+    assert submitted.order_type == "limit"
+    assert submitted.limit_price == executable_bid
+    assert submitted.order_division == "07"
+    assert submitted.route_session == "krx_after_single_price"
+    with app.state.db_session_factory() as session:
+        order = session.scalar(
+            select(BrokerOrder).where(BrokerOrder.execution_plan_item_id == item_id)
+        )
+        assert order is not None
+        assert order.request_metadata["final_broker_command"]["limit_price"] == "99"
+        assert order.request_metadata["final_sell_quote_evidence"][
+            "executable_bid"
+        ] == "99"
+
     engine.dispose()
 
 
