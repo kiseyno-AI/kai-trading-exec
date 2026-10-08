@@ -2298,7 +2298,20 @@ def revoke_core_execution_plan_v4(
             status="not_found",
             reason_code="execution_plan_not_found",
         )
-    if persisted_core_plan_contract_ack(plan) is None:
+    current_contract_proven = persisted_core_plan_contract_ack(plan) is not None
+    intake_contract_proven = _persisted_core_plan_intake_ack(plan) is not None
+    quarantined_intake_proven = bool(
+        not current_contract_proven
+        and plan.status == "contract_quarantined"
+        and intake_contract_proven
+    )
+    retired_intake_replay = bool(
+        not current_contract_proven
+        and plan.status == "revoked"
+        and intake_contract_proven
+    )
+    intake_only_revocation = quarantined_intake_proven or retired_intake_replay
+    if not current_contract_proven and not intake_only_revocation:
         return _revocation_failure(
             command=command,
             status_code=409,
@@ -2332,16 +2345,35 @@ def revoke_core_execution_plan_v4(
             for key, request in requested_by_key.items()
         )
     )
-    if not exact_bindings or not _request_covers_linked_family(
-        plan_items=plan.items,
-        requested_keys=set(requested_by_key),
-    ):
+    family_binding_proven = (
+        _request_covers_persisted_intake_family(
+            plan=plan,
+            requested_keys=set(requested_by_key),
+        )
+        if intake_only_revocation
+        else _request_covers_linked_family(
+            plan_items=plan.items,
+            requested_keys=set(requested_by_key),
+        )
+    )
+    if not exact_bindings or not family_binding_proven:
         return _revocation_failure(
             command=command,
             status_code=409,
             status="manual_review_required",
             reason_code="revocation_item_binding_mismatch",
             execution_plan_id=plan.id,
+        )
+
+    already_revoked = all(item.status == "revoked" for item in locked_items)
+    if retired_intake_replay and not already_revoked:
+        return _revocation_failure(
+            command=command,
+            status_code=409,
+            status="manual_review_required",
+            reason_code="revocation_state_mismatch",
+            execution_plan_id=plan.id,
+            persisted_items=locked_by_key,
         )
 
     item_ids = {item.id for item in locked_items}
@@ -2370,12 +2402,33 @@ def revoke_core_execution_plan_v4(
         for order in broker_orders
         if not _broker_order_is_provably_unsubmitted(order)
     ]
-    if fills or possible_exposure_orders:
-        buy_item_ids = {
-            item.id
-            for item in locked_items
-            if item.side == "buy" and item.intent in ENTRY_INTENTS
-        }
+    buy_items = [
+        item
+        for item in locked_items
+        if item.side == "buy" and item.intent in ENTRY_INTENTS
+    ]
+    buy_item_ids = {item.id for item in buy_items}
+    quarantined_exposure_possible = bool(
+        intake_only_revocation
+        and (
+            broker_orders
+            or any(
+                item.status == "manual_review_required"
+                or not _item_exposure_scope_is_proven(
+                    item=item,
+                    settings=settings,
+                )
+                or _item_has_any_broker_exposure(
+                    db=db,
+                    plan=plan,
+                    item=item,
+                    settings=settings,
+                )
+                for item in buy_items
+            )
+        )
+    )
+    if fills or possible_exposure_orders or quarantined_exposure_possible:
         for item in locked_items:
             if item.id in buy_item_ids:
                 item.status = "manual_review_required"
@@ -2422,7 +2475,6 @@ def revoke_core_execution_plan_v4(
             },
         )
 
-    already_revoked = all(item.status == "revoked" for item in locked_items)
     if not already_revoked:
         for item in locked_items:
             prior_status = item.status
@@ -2503,6 +2555,39 @@ def _request_covers_linked_family(
         )
         if linked_entry_key in requested_entries and item.source_plan_item_id is not None:
             linked_keys.add(str(item.source_plan_item_id))
+    return linked_keys == requested_keys
+
+
+def _request_covers_persisted_intake_family(
+    *,
+    plan: ExecutionPlan,
+    requested_keys: set[str],
+) -> bool:
+    try:
+        command = CoreExecutionPlanRequestV4.model_validate(
+            plan.raw_payload,
+            context={
+                _SKIP_DISPATCH_MATERIAL_FINGERPRINT_CONTEXT_KEY: True,
+            },
+        )
+    except ValidationError:
+        return False
+    requested_entries = {
+        item.core_item_key
+        for item in command.items
+        if item.core_item_key in requested_keys
+        and item.side == "buy"
+        and item.intent in ENTRY_INTENTS
+    }
+    if not requested_entries:
+        return False
+    linked_keys = set(requested_entries)
+    for item in command.items:
+        linked_entry_key = _nonempty_text(
+            item.quantity_policy.get("linked_entry_item_key")
+        )
+        if linked_entry_key in requested_entries:
+            linked_keys.add(item.core_item_key)
     return linked_keys == requested_keys
 
 
