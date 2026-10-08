@@ -4700,14 +4700,17 @@ def _resolve_trigger_time_agent_action(
     if isinstance(claim, TriggerTimeAgentActionResult):
         return claim
     previous_status = claim.previous_status
+    decision_evaluated_at = triggered_at
     if settings.runtime_mode == "live" and _requires_trigger_time_liquidity_snapshot(item):
+        decision_evaluated_at = triggered_at + timedelta(
+            seconds=max(0.0, time.monotonic() - cycle_started)
+        )
         action, liquidity_failure = _refresh_trigger_time_action_liquidity(
             settings=settings,
             db=db,
             adapter=adapter,
             action=action,
-            reference_at=triggered_at
-            + timedelta(seconds=max(0.0, time.monotonic() - cycle_started)),
+            reference_at=decision_evaluated_at,
         )
         if liquidity_failure is not None:
             return _trigger_time_agent_preflight_failure(
@@ -4740,7 +4743,7 @@ def _resolve_trigger_time_agent_action(
         item=item,
         observed_price=action.observed_price,
         observed_at=_price_observed_at_from_action(action=action, fallback=triggered_at),
-        triggered_at=triggered_at,
+        triggered_at=decision_evaluated_at,
         trigger_reason=action.trigger_reason,
         trigger_metadata=action.trigger_metadata,
         live_market_context=action.market_quality_context,

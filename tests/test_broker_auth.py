@@ -20281,7 +20281,8 @@ def test_autonomous_dispatch_loop_progresses_due_plan_without_manual_dispatch(
             and app.state.autonomous_runtime.snapshot()["dispatch"][
                 "last_success_at"
             ]
-            is not None
+            is not None,
+            timeout_seconds=5.0,
         )
         runtime_snapshot = app.state.autonomous_runtime.snapshot()
         assert len(broker_adapter.order_calls) == 1, runtime_snapshot

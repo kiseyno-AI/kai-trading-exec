@@ -4222,6 +4222,15 @@ def test_live_trigger_time_approval_caps_limit_and_resizes_against_final_price(
 ) -> None:
     initial_at = datetime(2026, 6, 5, 0, 30, tzinfo=UTC)
 
+    class DelayedCycleClock:
+        calls = 0
+
+        def monotonic(self) -> float:
+            self.calls += 1
+            return 100.0 if self.calls == 1 else 106.0
+
+    monkeypatch.setattr(monitoring, "time", DelayedCycleClock())
+
     class FreshExecutableAdapter(StubBrokerAdapter):
         def get_current_price(
             self,
