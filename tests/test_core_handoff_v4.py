@@ -3967,6 +3967,291 @@ def test_v4_revocation_accepts_current_live_market_buy_recall_authority(
     engine.dispose()
 
 
+def test_v4_revocation_retires_quarantined_family_with_intact_intake_proof_and_no_exposure() -> None:
+    app, engine = _build_test_app()
+    client = TestClient(app)
+    create_payload = _activation_bound_plan_payload(
+        plan_id="quarantined-no-exposure-plan"
+    )
+    created = client.post("/v4/execution-plans", json=create_payload)
+    assert created.status_code == 201
+    item_acks = created.json()["item_acks"]
+    activation_payload = _activation_payload(create_payload, created.json())
+
+    with app.state.db_session_factory() as session:
+        plan = session.scalar(
+            select(ExecutionPlan).options(selectinload(ExecutionPlan.items))
+        )
+        assert plan is not None
+        entry = next(item for item in plan.items if item.side == "buy")
+        entry.quantity_policy = {
+            **entry.quantity_policy,
+            "kind": "shares",
+            "quantity": 999,
+            "source": "unproven-sizing",
+        }
+        target = next(item for item in plan.items if item.intent == "target_sell")
+        target.quantity_policy = {
+            **target.quantity_policy,
+            "linked_entry_item_key": "runtime-drifted-link",
+        }
+        entry.status = "contract_quarantined"
+        plan.status = "contract_quarantined"
+        session.commit()
+
+    response = client.post(
+        "/v4/execution-plans/revocations",
+        json=_revocation_payload(
+            create_payload,
+            item_acks,
+            reason_code="current_live_market_evidence_unavailable",
+        ),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["contract_ack"]["status"] == "revoked"
+    assert body["reason_code"] == "current_live_market_evidence_unavailable"
+    assert body["revoked_item_count"] == 3
+    assert body["manual_review_item_count"] == 0
+    assert all(item["status"] == "revoked" for item in body["item_acks"])
+    replay = client.post(
+        "/v4/execution-plans/revocations",
+        json=_revocation_payload(
+            create_payload,
+            item_acks,
+            reason_code="current_live_market_evidence_unavailable",
+        ),
+    )
+    assert replay.status_code == 200
+    assert replay.json()["contract_ack"]["status"] == "revoked"
+    assert replay.json()["idempotent_replay"] is True
+    reactivation = client.post(
+        "/v4/execution-plans/activations",
+        json=activation_payload,
+    )
+    assert reactivation.status_code == 409
+    with app.state.db_session_factory() as session:
+        plan = session.scalar(
+            select(ExecutionPlan).options(selectinload(ExecutionPlan.items))
+        )
+        assert plan is not None
+        assert plan.status == "revoked"
+        assert {item.status for item in plan.items} == {"revoked"}
+        assert session.scalars(
+            select(ExecutionPlanItemAudit).where(
+                ExecutionPlanItemAudit.event_type
+                == "core_activation_confirmed"
+            )
+        ).all() == []
+    engine.dispose()
+
+
+@pytest.mark.parametrize("proof_failure", ["identity_drift", "binding_missing"])
+def test_v4_revocation_refuses_quarantined_family_without_intact_intake_proof(
+    proof_failure: str,
+) -> None:
+    app, engine = _build_test_app()
+    client = TestClient(app)
+    create_payload = _plan_payload(
+        plan_id=f"quarantined-intake-proof-{proof_failure}"
+    )
+    created = client.post("/v4/execution-plans", json=create_payload)
+    assert created.status_code == 201
+    item_acks = created.json()["item_acks"]
+
+    with app.state.db_session_factory() as session:
+        plan = session.scalar(
+            select(ExecutionPlan).options(selectinload(ExecutionPlan.items))
+        )
+        assert plan is not None
+        entry = next(item for item in plan.items if item.side == "buy")
+        if proof_failure == "identity_drift":
+            entry.symbol = "000660"
+        else:
+            risk_context = dict(entry.risk_context or {})
+            risk_context.pop(core_handoff_v4.CORE_V4_PERSISTED_BINDING_KEY)
+            entry.risk_context = risk_context
+        entry.status = "contract_quarantined"
+        plan.status = "contract_quarantined"
+        session.commit()
+
+    response = client.post(
+        "/v4/execution-plans/revocations",
+        json=_revocation_payload(
+            create_payload,
+            item_acks,
+            reason_code="current_live_market_evidence_unavailable",
+        ),
+    )
+
+    assert response.status_code == 409
+    body = response.json()
+    assert body["contract_ack"]["status"] == "manual_review_required"
+    assert body["reason_code"] == "persisted_v4_contract_not_proven"
+    assert body["revoked_item_count"] == 0
+    with app.state.db_session_factory() as session:
+        plan = session.scalar(
+            select(ExecutionPlan).options(selectinload(ExecutionPlan.items))
+        )
+        assert plan is not None
+        assert plan.status == "contract_quarantined"
+        assert any(item.status == "contract_quarantined" for item in plan.items)
+        assert all(item.status != "revoked" for item in plan.items)
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    "exposure_kind",
+    [
+        "linked_unsubmitted_order",
+        "protective_unsubmitted_order",
+        "linked_fill",
+        "unlinked_active_order",
+        "scoped_position",
+        "manual_position",
+        "scope_unproven",
+    ],
+)
+def test_v4_revocation_keeps_quarantined_family_in_manual_review_when_exposure_is_possible(
+    exposure_kind: str,
+    monkeypatch,
+) -> None:
+    settings = Settings(database_url="sqlite:///:memory:", runtime_mode="mock")
+    app, engine = _build_test_app(settings=settings)
+    client = TestClient(app)
+    create_payload = _plan_payload(
+        plan_id=f"quarantined-exposure-{exposure_kind}"
+    )
+    created = client.post("/v4/execution-plans", json=create_payload)
+    assert created.status_code == 201
+    item_acks = created.json()["item_acks"]
+    entry_ack = item_acks[0]
+
+    with app.state.db_session_factory() as session:
+        plan = session.scalar(
+            select(ExecutionPlan).options(selectinload(ExecutionPlan.items))
+        )
+        assert plan is not None
+        entry = next(item for item in plan.items if item.side == "buy")
+        entry.quantity_policy = {
+            **entry.quantity_policy,
+            "kind": "shares",
+            "quantity": 999,
+            "source": "unproven-sizing",
+        }
+        entry.status = "contract_quarantined"
+        plan.status = "contract_quarantined"
+        if exposure_kind == "scope_unproven":
+            monkeypatch.setattr(
+                core_handoff_v4,
+                "_item_exposure_scope_is_proven",
+                lambda **_kwargs: False,
+            )
+        elif exposure_kind in {"manual_position", "scoped_position"}:
+            identity = build_position_identity(
+                settings=settings,
+                provider="kis",
+                exchange="KRX",
+            )
+            session.add(
+                ExecutionPosition(
+                    mode="mock",
+                    provider=(
+                        identity.provider
+                        if exposure_kind == "scoped_position"
+                        else None
+                    ),
+                    account_scope=(
+                        identity.account_scope
+                        if exposure_kind == "scoped_position"
+                        else None
+                    ),
+                    exchange=(
+                        identity.exchange
+                        if exposure_kind == "scoped_position"
+                        else None
+                    ),
+                    symbol=entry.symbol,
+                    quantity=1,
+                    updated_from="operator_manual",
+                )
+            )
+        else:
+            order_item_id = entry.id
+            if exposure_kind == "protective_unsubmitted_order":
+                order_item_id = next(
+                    item.id for item in plan.items if item.intent == "stop_sell"
+                )
+            elif exposure_kind == "unlinked_active_order":
+                order_item_id = None
+            order = BrokerOrder(
+                id=f"quarantined-{exposure_kind}-order",
+                execution_plan_item_id=order_item_id,
+                broker_name="kis",
+                mode="mock",
+                idempotency_key=f"quarantined-{exposure_kind}",
+                symbol=entry.symbol,
+                side="buy",
+                status=(
+                    "open" if exposure_kind == "unlinked_active_order" else "failed"
+                ),
+                quantity=1,
+                venue="KRX",
+            )
+            session.add(order)
+            if exposure_kind == "linked_fill":
+                session.flush()
+                session.add(
+                    ExecutionFill(
+                        broker_order_pk=order.id,
+                        broker_fill_id="quarantined-linked-fill",
+                        symbol=entry.symbol,
+                        side="buy",
+                        quantity=1,
+                        price=Decimal("71000"),
+                        filled_at=datetime(2026, 9, 9, 12, 3, tzinfo=UTC),
+                    )
+                )
+        session.commit()
+
+    response = client.post(
+        "/v4/execution-plans/revocations",
+        json=_revocation_payload(
+            create_payload,
+            item_acks,
+            reason_code="current_live_market_evidence_unavailable",
+        ),
+    )
+
+    assert response.status_code == 409
+    body = response.json()
+    assert body["contract_ack"]["status"] == "manual_review_required"
+    assert body["reason_code"] == "broker_commit_or_exposure_possible"
+    assert body["revoked_item_count"] == 0
+    assert body["manual_review_item_count"] == 1
+    assert next(
+        item
+        for item in body["item_acks"]
+        if item["execution_plan_item_id"] == entry_ack["execution_plan_item_id"]
+    )["status"] == "manual_review_required"
+    assert {
+        item["status"]
+        for item in body["item_acks"]
+        if item["execution_plan_item_id"] != entry_ack["execution_plan_item_id"]
+    } == {"preserved_protective_exit"}
+    with app.state.db_session_factory() as session:
+        plan = session.scalar(
+            select(ExecutionPlan).options(selectinload(ExecutionPlan.items))
+        )
+        assert plan is not None
+        assert plan.status == "manual_review_required"
+        entry = next(item for item in plan.items if item.side == "buy")
+        assert entry.status == "manual_review_required"
+        assert all(item.status != "revoked" for item in plan.items)
+    engine.dispose()
+
+
 def test_v4_revocation_contract_proof_failure_keeps_exact_plan_identity(
     monkeypatch,
 ) -> None:
