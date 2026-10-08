@@ -32,6 +32,11 @@ from app.services.broker_auth import ensure_authenticated_broker_session
 from app.services.broker_order_state import ACTIONABLE_OPEN_ORDER_STATUSES
 from app.services.fifo_inventory import fifo_route_scope_from_order
 from app.services.kis_krx_flat_rebind_contract import (
+    KIS_KRX_FLAT_PROOF_REFRESH_CANDIDATE_TYPE,
+    KIS_KRX_FLAT_PROOF_MAX_AGE_SECONDS,
+    KIS_KRX_FLAT_PROOF_REFRESH_OUTCOME,
+    KIS_KRX_FLAT_PROOF_SOURCE_CANONICAL,
+    KIS_KRX_FLAT_PROOF_SOURCE_GENERIC_SYNC,
     KIS_KRX_LEGACY_FLAT_REBIND_CANONICAL_BASE_QUANTITY,
     KIS_KRX_LEGACY_FLAT_REBIND_CANDIDATE_TYPE,
     KIS_KRX_LEGACY_FLAT_REBIND_EVENT_PROOF_FIELDS,
@@ -44,6 +49,20 @@ from app.services.kis_krx_flat_rebind_contract import (
     kis_krx_flat_configured_account_binding_digest,
     kis_krx_flat_evidence_fingerprint,
     kis_krx_flat_evidence_material,
+    kis_krx_flat_proof_refresh_approval_fingerprint,
+    kis_krx_flat_proof_refresh_candidate_key,
+)
+from app.services.kis_krx_flat_proof_validation import (
+    aware_datetime as kis_krx_aware_datetime,
+    aware_iso_datetime as kis_krx_aware_iso_datetime,
+    canonical_flat_row_matches_generic_sync_supersede,
+    canonical_flat_row_matches_latest_proof,
+    event_datetime as kis_krx_event_datetime,
+    generic_sync_payload_digest,
+    kis_krx_flat_proof_event_core_matches,
+    kis_krx_flat_proof_timestamp_is_fresh,
+    load_kis_krx_flat_proof_lineage,
+    serialize_datetime as serialize_kis_krx_datetime,
 )
 from app.services.order_intent_serialization import (
     alpaca_pre_auth_order_intent_account_scope,
@@ -466,6 +485,719 @@ def apply_kis_krx_legacy_flat_position_rebind(
         },
         "items": [
             {**approved_item, "outcome": KIS_KRX_LEGACY_FLAT_REBIND_OUTCOME}
+        ],
+    }
+
+
+def analyze_kis_krx_canonical_flat_proof_refresh(
+    *,
+    settings: Settings,
+    db: Session,
+    auth_session_factory: sessionmaker[Session],
+    adapter: BrokerAdapter,
+    symbol: str,
+    now: datetime | None = None,
+) -> dict[str, object]:
+    """Prove a previously bound canonical flat row is still broker-flat."""
+    evaluated_at = now or datetime.now(UTC)
+    normalized_symbol = _normalized_kis_krx_flat_rebind_symbol(symbol)
+    _require_kis_krx_flat_rebind_route(settings=settings, adapter=adapter)
+    (
+        position,
+        source_event,
+        source_summary,
+        identity,
+        source_row_state,
+        superseded_reconciliation_observed_at,
+        superseded_payload_digest,
+    ) = (
+        _kis_krx_canonical_flat_proof_source(
+            settings=settings,
+            db=db,
+            symbol=normalized_symbol,
+        )
+    )
+
+    access_token = _durably_authenticate_for_position_refresh(
+        settings=settings,
+        session_factory=auth_session_factory,
+        adapter=adapter,
+    )
+    snapshot = adapter.get_account_snapshot(
+        access_token,
+        symbols=[normalized_symbol],
+        exchange="KRX",
+    )
+    _require_current_attribution_snapshot(
+        settings=settings,
+        evaluated_at=evaluated_at,
+        snapshot_observed_at=snapshot.observed_at,
+        max_age_seconds=KIS_KRX_FLAT_PROOF_MAX_AGE_SECONDS,
+    )
+    _require_kis_krx_flat_rebind_snapshot(settings=settings, snapshot=snapshot)
+    snapshot_identity = build_position_identity(
+        settings=settings,
+        provider="kis",
+        exchange="KRX",
+        broker_account_id=snapshot.broker_account_id,
+    )
+    if snapshot_identity != identity:
+        raise PositionIdentityConflictError(
+            "KIS KRX flat proof refresh account identity changed"
+        )
+    item = _kis_krx_flat_proof_refresh_item(
+        settings=settings,
+        position=position,
+        identity=identity,
+        snapshot=snapshot,
+        source_event=source_event,
+        source_summary=source_summary,
+        source_row_state=source_row_state,
+        superseded_reconciliation_observed_at=(
+            superseded_reconciliation_observed_at
+        ),
+        superseded_payload_digest=superseded_payload_digest,
+    )
+    return _kis_krx_flat_rebind_payload(
+        mode="dry-run",
+        settings=settings,
+        evaluated_at=evaluated_at,
+        snapshot_observed_at=snapshot.observed_at,
+        snapshot_source=snapshot.source,
+        items=[item],
+    )
+
+
+def apply_kis_krx_canonical_flat_proof_refresh(
+    *,
+    settings: Settings,
+    db: Session,
+    auth_session_factory: sessionmaker[Session],
+    adapter: BrokerAdapter,
+    symbol: str,
+    approved_evidence: dict[str, str],
+    actor: str,
+    reason: str,
+    now: datetime | None = None,
+) -> dict[str, object]:
+    """Append a new immutable proof generation for one canonical flat row."""
+    normalized_actor = str(actor or "").strip()
+    normalized_reason = str(reason or "").strip()
+    normalized_symbol = _normalized_kis_krx_flat_rebind_symbol(symbol)
+    normalized_approvals = _validated_kis_krx_flat_approvals(approved_evidence)
+    if not normalized_actor or not normalized_reason:
+        raise ValueError("KIS KRX flat proof refresh requires actor and reason")
+    _require_kis_krx_flat_rebind_route(settings=settings, adapter=adapter)
+
+    idempotent = _kis_krx_flat_proof_refresh_idempotent_result(
+        settings=settings,
+        db=db,
+        symbol=normalized_symbol,
+        approved_evidence=normalized_approvals,
+        generated_at=now or datetime.now(UTC),
+    )
+    if idempotent is not None:
+        return idempotent
+
+    evaluated_at = now or datetime.now(UTC)
+    serialization = None
+    approved_item: dict[str, object] | None = None
+    applied_at: datetime | None = None
+    try:
+        current = analyze_kis_krx_canonical_flat_proof_refresh(
+            settings=settings,
+            db=db,
+            auth_session_factory=auth_session_factory,
+            adapter=adapter,
+            symbol=normalized_symbol,
+            now=evaluated_at,
+        )
+        current_items = {
+            str(item["position_id"]): item
+            for item in current["items"]
+            if isinstance(item, dict)
+        }
+        if set(normalized_approvals) != set(current_items):
+            raise PositionIdentityConflictError(
+                "KIS KRX flat proof refresh requires the exact current candidate"
+            )
+        position_id, approved_fingerprint = next(iter(normalized_approvals.items()))
+        approved_item = current_items[position_id]
+        current_fingerprint = approved_item.get("evidence_fingerprint")
+        if (
+            approved_item.get("eligible") is not True
+            or not isinstance(current_fingerprint, str)
+            or not hmac.compare_digest(approved_fingerprint, current_fingerprint)
+        ):
+            raise PositionIdentityConflictError(
+                "approved KIS KRX flat refresh evidence no longer matches broker truth"
+            )
+
+        db.rollback()
+        locked_access_token = _durably_authenticate_for_position_refresh(
+            settings=settings,
+            session_factory=auth_session_factory,
+            adapter=adapter,
+        )
+        serialization = _acquire_legacy_attribution_apply_serialization(
+            settings=settings,
+            db=db,
+            provider="kis",
+            account_scope=str(approved_item["account_scope"]),
+            exchange="KRX",
+        )
+        try:
+            locked_positions = db.scalars(
+                select(ExecutionPosition)
+                .where(
+                    ExecutionPosition.mode == settings.runtime_mode,
+                    ExecutionPosition.symbol == normalized_symbol,
+                )
+                .order_by(ExecutionPosition.id.asc())
+                .with_for_update(nowait=True)
+                .execution_options(populate_existing=True)
+            ).all()
+        except DBAPIError as exc:
+            raise PositionIdentityConflictError(
+                "KIS KRX flat proof refresh row is busy; retry from a new dry-run"
+            ) from exc
+        if len(locked_positions) != 1 or locked_positions[0].id != position_id:
+            raise PositionIdentityConflictError(
+                "approved KIS KRX flat proof row is missing or ambiguous"
+            )
+        (
+            position,
+            source_event,
+            source_summary,
+            locked_identity,
+            source_row_state,
+            superseded_reconciliation_observed_at,
+            superseded_payload_digest,
+        ) = (
+            _kis_krx_canonical_flat_proof_source(
+                settings=settings,
+                db=db,
+                symbol=normalized_symbol,
+                position=locked_positions[0],
+            )
+        )
+        locked_snapshot = adapter.get_account_snapshot(
+            locked_access_token,
+            symbols=[normalized_symbol],
+            exchange="KRX",
+        )
+        locked_evaluated_at = _real_utc_now()
+        _require_current_attribution_snapshot(
+            settings=settings,
+            evaluated_at=locked_evaluated_at,
+            snapshot_observed_at=locked_snapshot.observed_at,
+            max_age_seconds=KIS_KRX_FLAT_PROOF_MAX_AGE_SECONDS,
+        )
+        if locked_evaluated_at.astimezone(UTC) < locked_snapshot.observed_at.astimezone(
+            UTC
+        ):
+            raise PositionIdentityConflictError(
+                "KIS KRX flat proof refresh snapshot is ahead of the audit clock"
+            )
+        source_event_occurred_at = kis_krx_event_datetime(source_event.occurred_at)
+        if (
+            source_event_occurred_at is None
+            or locked_evaluated_at.astimezone(UTC) <= source_event_occurred_at
+        ):
+            raise PositionIdentityConflictError(
+                "KIS KRX flat proof refresh audit clock did not advance"
+            )
+        _require_kis_krx_flat_rebind_snapshot(
+            settings=settings,
+            snapshot=locked_snapshot,
+        )
+        snapshot_identity = build_position_identity(
+            settings=settings,
+            provider="kis",
+            exchange="KRX",
+            broker_account_id=locked_snapshot.broker_account_id,
+        )
+        if snapshot_identity != locked_identity:
+            raise PositionIdentityConflictError(
+                "KIS KRX flat proof refresh account identity changed"
+            )
+        locked_item = _kis_krx_flat_proof_refresh_item(
+            settings=settings,
+            position=position,
+            identity=locked_identity,
+            snapshot=locked_snapshot,
+            source_event=source_event,
+            source_summary=source_summary,
+            source_row_state=source_row_state,
+            superseded_reconciliation_observed_at=(
+                superseded_reconciliation_observed_at
+            ),
+            superseded_payload_digest=superseded_payload_digest,
+        )
+        locked_fingerprint = locked_item.get("evidence_fingerprint")
+        if (
+            locked_item.get("eligible") is not True
+            or not isinstance(locked_fingerprint, str)
+            or not hmac.compare_digest(approved_fingerprint, locked_fingerprint)
+        ):
+            raise PositionIdentityConflictError(
+                "approved KIS KRX flat refresh evidence changed after row locking"
+            )
+
+        snapshot_observed_at = _serialize_datetime(locked_snapshot.observed_at)
+        broker_evidence_fingerprint = str(
+            locked_item["broker_flat_evidence_fingerprint"]
+        )
+        refresh_candidate_key = kis_krx_flat_proof_refresh_candidate_key(
+            position_id=position.id,
+            snapshot_observed_at=str(snapshot_observed_at),
+            evidence_fingerprint=broker_evidence_fingerprint,
+            refresh_approval_fingerprint=approved_fingerprint,
+        )
+        position.last_reconciled_at = locked_snapshot.observed_at
+        position.raw_payload = _kis_krx_current_flat_truth_payload(
+            settings=settings,
+            identity=locked_identity,
+            snapshot_source=locked_snapshot.source,
+            snapshot_observed_at=locked_snapshot.observed_at,
+            absence_proof_digest=str(locked_item["absence_proof_digest"]),
+        )
+        db.add(
+            RuntimeRemediationEvent(
+                mode=settings.runtime_mode,
+                candidate_type=KIS_KRX_FLAT_PROOF_REFRESH_CANDIDATE_TYPE,
+                candidate_key=refresh_candidate_key,
+                subject_id=position.id,
+                outcome=KIS_KRX_FLAT_PROOF_REFRESH_OUTCOME,
+                actor=normalized_actor,
+                reason=normalized_reason,
+                evidence_summary={
+                    "symbol": normalized_symbol,
+                    "provider": locked_identity.provider,
+                    "account_scope": locked_identity.account_scope,
+                    "exchange": locked_identity.exchange,
+                    "asset_class": "equity",
+                    "broker_snapshot_source": locked_snapshot.source,
+                    "broker_snapshot_observed_at": snapshot_observed_at,
+                    "holdings_complete": True,
+                    "open_orders_complete": True,
+                    "holding_absent": True,
+                    "open_order_absent": True,
+                    "absence_proof_digest": locked_item["absence_proof_digest"],
+                    "configured_account_binding_digest": (
+                        kis_krx_flat_configured_account_binding_digest(
+                            settings=settings
+                        )
+                    ),
+                    "prior_position_digest": locked_item["prior_position_digest"],
+                    "evidence_fingerprint": broker_evidence_fingerprint,
+                    "safety_policy_version": (
+                        KIS_KRX_LEGACY_FLAT_REBIND_SAFETY_POLICY_VERSION
+                    ),
+                    "historical_account_attributed": False,
+                    "current_flat_truth_bound": True,
+                    "previous_proof_event_id": source_event.id,
+                    "previous_proof_candidate_key": source_event.candidate_key,
+                    "previous_broker_snapshot_observed_at": source_summary[
+                        "broker_snapshot_observed_at"
+                    ],
+                    "source_row_state": source_row_state,
+                    "superseded_reconciliation_observed_at": (
+                        superseded_reconciliation_observed_at
+                    ),
+                    "superseded_payload_digest": superseded_payload_digest,
+                    "refresh_approval_fingerprint": approved_fingerprint,
+                    **{
+                        field: 0
+                        for field in KIS_KRX_LEGACY_FLAT_REBIND_ZERO_MUTATION_FIELDS
+                    },
+                },
+                occurred_at=locked_evaluated_at,
+            )
+        )
+        db.commit()
+        approved_item = locked_item
+        applied_at = locked_evaluated_at
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        if serialization is not None:
+            serialization.close()
+
+    assert approved_item is not None
+    assert applied_at is not None
+    return {
+        "mode": "apply",
+        "runtime_mode": settings.runtime_mode,
+        "provider": "kis",
+        "exchange": "KRX",
+        "generated_at": _serialize_datetime(applied_at),
+        "broker_snapshot_observed_at": approved_item[
+            "broker_snapshot_observed_at"
+        ],
+        "summary": {
+            "approved_count": 1,
+            "refreshed_count": 1,
+            "idempotent_count": 0,
+            "broker_api_mutation_count": 0,
+        },
+        "items": [
+            {**approved_item, "outcome": KIS_KRX_FLAT_PROOF_REFRESH_OUTCOME}
+        ],
+    }
+
+
+def _kis_krx_canonical_flat_proof_source(
+    *,
+    settings: Settings,
+    db: Session,
+    symbol: str,
+    position: ExecutionPosition | None = None,
+) -> tuple[
+    ExecutionPosition,
+    RuntimeRemediationEvent,
+    dict[str, object],
+    PositionIdentity,
+    str,
+    str | None,
+    str | None,
+]:
+    identity = build_position_identity(
+        settings=settings,
+        provider="kis",
+        exchange="KRX",
+    )
+    if position is None:
+        positions = db.scalars(
+            select(ExecutionPosition)
+            .where(
+                ExecutionPosition.mode == settings.runtime_mode,
+                ExecutionPosition.symbol == symbol,
+            )
+            .order_by(ExecutionPosition.id.asc())
+        ).all()
+        if len(positions) != 1:
+            raise PositionIdentityConflictError(
+                "KIS KRX flat proof refresh requires one exact canonical position"
+            )
+        position = positions[0]
+    lineage = load_kis_krx_flat_proof_lineage(
+        settings=settings,
+        db=db,
+        position_id=position.id,
+        symbol=symbol,
+        identity=identity,
+    )
+    if lineage is None:
+        latest_event = db.scalar(
+            select(RuntimeRemediationEvent)
+            .where(
+                RuntimeRemediationEvent.mode == settings.runtime_mode,
+                RuntimeRemediationEvent.subject_id == position.id,
+                or_(
+                    and_(
+                        RuntimeRemediationEvent.candidate_type
+                        == KIS_KRX_LEGACY_FLAT_REBIND_CANDIDATE_TYPE,
+                        RuntimeRemediationEvent.outcome
+                        == KIS_KRX_LEGACY_FLAT_REBIND_OUTCOME,
+                    ),
+                    and_(
+                        RuntimeRemediationEvent.candidate_type
+                        == KIS_KRX_FLAT_PROOF_REFRESH_CANDIDATE_TYPE,
+                        RuntimeRemediationEvent.outcome
+                        == KIS_KRX_FLAT_PROOF_REFRESH_OUTCOME,
+                    ),
+                ),
+            )
+            .order_by(
+                RuntimeRemediationEvent.occurred_at.desc(),
+                RuntimeRemediationEvent.created_at.desc(),
+                RuntimeRemediationEvent.id.desc(),
+            )
+            .limit(1)
+        )
+        if latest_event is None or not kis_krx_flat_proof_event_core_matches(
+            settings=settings,
+            event=latest_event,
+            position_id=position.id,
+            symbol=symbol,
+            identity=identity,
+        ):
+            raise PositionIdentityConflictError(
+                "KIS KRX flat proof refresh requires an intact immutable proof event"
+            )
+        raise PositionIdentityConflictError(
+            "KIS KRX flat proof refresh lineage is invalid"
+        )
+    event, summary = lineage
+    if canonical_flat_row_matches_latest_proof(
+        settings=settings,
+        position=position,
+        symbol=symbol,
+        identity=identity,
+        latest_summary=summary,
+    ):
+        return (
+            position,
+            event,
+            summary,
+            identity,
+            KIS_KRX_FLAT_PROOF_SOURCE_CANONICAL,
+            None,
+            None,
+        )
+    if canonical_flat_row_matches_generic_sync_supersede(
+        settings=settings,
+        position=position,
+        symbol=symbol,
+        identity=identity,
+        latest_event=event,
+        latest_summary=summary,
+    ):
+        raw_payload = position.raw_payload
+        assert isinstance(raw_payload, dict)
+        return (
+            position,
+            event,
+            summary,
+            identity,
+            KIS_KRX_FLAT_PROOF_SOURCE_GENERIC_SYNC,
+            serialize_kis_krx_datetime(position.last_reconciled_at),
+            generic_sync_payload_digest(raw_payload),
+        )
+    raise PositionIdentityConflictError(
+        "KIS KRX flat proof refresh requires intact canonical flat truth or "
+        "the exact safe generic-sync supersede shape"
+    )
+
+
+def _kis_krx_flat_proof_refresh_item(
+    *,
+    settings: Settings,
+    position: ExecutionPosition,
+    identity: PositionIdentity,
+    snapshot: object,
+    source_event: RuntimeRemediationEvent,
+    source_summary: dict[str, object],
+    source_row_state: str,
+    superseded_reconciliation_observed_at: str | None,
+    superseded_payload_digest: str | None,
+) -> dict[str, object]:
+    holding_symbols = _kis_krx_snapshot_symbols(
+        rows=list(getattr(snapshot, "holdings", [])),
+        evidence_type="holding",
+        allow_repeated_symbols=False,
+    )
+    open_order_symbols = _kis_krx_snapshot_symbols(
+        rows=list(getattr(snapshot, "open_orders", [])),
+        evidence_type="open order",
+        allow_repeated_symbols=True,
+    )
+    holding_present = position.symbol in holding_symbols
+    open_order_present = position.symbol in open_order_symbols
+    absence_digest = _kis_krx_flat_absence_proof_digest(
+        settings=settings,
+        snapshot=snapshot,
+        identity=identity,
+        symbol=position.symbol,
+        holding_symbols=holding_symbols,
+        open_order_symbols=open_order_symbols,
+    )
+    current_observed_at = kis_krx_aware_iso_datetime(
+        source_summary.get("broker_snapshot_observed_at")
+    )
+    superseded_observed_at = kis_krx_aware_iso_datetime(
+        superseded_reconciliation_observed_at
+    )
+    new_observed_at = kis_krx_aware_datetime(
+        getattr(snapshot, "observed_at", None)
+    )
+    if source_row_state == KIS_KRX_FLAT_PROOF_SOURCE_CANONICAL:
+        source_shape_valid = (
+            superseded_reconciliation_observed_at is None
+            and superseded_payload_digest is None
+        )
+        freshness_floor = current_observed_at
+    elif source_row_state == KIS_KRX_FLAT_PROOF_SOURCE_GENERIC_SYNC:
+        source_shape_valid = (
+            superseded_observed_at is not None
+            and isinstance(superseded_payload_digest, str)
+            and is_lower_hex_sha256(superseded_payload_digest)
+        )
+        freshness_floor = superseded_observed_at
+    else:
+        source_shape_valid = False
+        freshness_floor = None
+    if holding_present:
+        item_reason = "broker_holding_present"
+    elif open_order_present:
+        item_reason = "broker_open_order_present"
+    elif not source_shape_valid:
+        item_reason = "source_row_state_invalid"
+    elif (
+        current_observed_at is None
+        or freshness_floor is None
+        or new_observed_at is None
+        or new_observed_at <= freshness_floor
+    ):
+        item_reason = (
+            "broker_snapshot_not_newer_than_current_proof"
+            if source_row_state == KIS_KRX_FLAT_PROOF_SOURCE_CANONICAL
+            else "broker_snapshot_not_newer_than_superseded_reconciliation"
+        )
+    else:
+        item_reason = "current_broker_flat_truth_proven"
+    eligible = item_reason == "current_broker_flat_truth_proven"
+    prior_position_digest = str(source_summary["prior_position_digest"])
+    broker_fingerprint = kis_krx_flat_evidence_fingerprint(
+        runtime_mode=settings.runtime_mode,
+        position_id=position.id,
+        prior_position_digest=prior_position_digest,
+        identity=identity,
+        symbol=position.symbol,
+        snapshot_source=str(getattr(snapshot, "source", "") or ""),
+        holdings_complete=True,
+        open_orders_complete=True,
+        holding_absent=not holding_present,
+        open_order_absent=not open_order_present,
+        absence_proof_digest=absence_digest,
+        configured_account_binding_digest=(
+            kis_krx_flat_configured_account_binding_digest(settings=settings)
+        ),
+    )
+    refresh_fingerprint = kis_krx_flat_proof_refresh_approval_fingerprint(
+        runtime_mode=settings.runtime_mode,
+        position_id=position.id,
+        symbol=position.symbol,
+        identity=identity,
+        previous_proof_event_id=source_event.id,
+        previous_proof_candidate_key=source_event.candidate_key,
+        previous_snapshot_observed_at=str(
+            source_summary["broker_snapshot_observed_at"]
+        ),
+        source_row_state=source_row_state,
+        superseded_reconciliation_observed_at=(
+            superseded_reconciliation_observed_at
+        ),
+        superseded_payload_digest=superseded_payload_digest,
+        absence_proof_digest=absence_digest,
+        configured_account_binding_digest=(
+            kis_krx_flat_configured_account_binding_digest(settings=settings)
+        ),
+    )
+    return {
+        "position_id": position.id,
+        "symbol": position.symbol,
+        "provider": identity.provider,
+        "account_scope": identity.account_scope,
+        "exchange": identity.exchange,
+        "asset_class": "equity",
+        "broker_snapshot_source": str(getattr(snapshot, "source", "") or ""),
+        "broker_snapshot_observed_at": _serialize_datetime(
+            getattr(snapshot, "observed_at", None)
+        ),
+        "holdings_complete": True,
+        "open_orders_complete": True,
+        "holding_absent": not holding_present,
+        "open_order_absent": not open_order_present,
+        "absence_proof_digest": absence_digest,
+        "configured_account_binding_digest": (
+            kis_krx_flat_configured_account_binding_digest(settings=settings)
+        ),
+        "prior_position_digest": prior_position_digest,
+        "broker_flat_evidence_fingerprint": broker_fingerprint,
+        "previous_proof_event_id": source_event.id,
+        "previous_proof_candidate_key": source_event.candidate_key,
+        "previous_broker_snapshot_observed_at": source_summary[
+            "broker_snapshot_observed_at"
+        ],
+        "source_row_state": source_row_state,
+        "superseded_reconciliation_observed_at": (
+            superseded_reconciliation_observed_at
+        ),
+        "superseded_payload_digest": superseded_payload_digest,
+        "evidence_fingerprint": refresh_fingerprint if eligible else None,
+        "eligible": eligible,
+        "reason": item_reason,
+    }
+
+
+def _kis_krx_flat_proof_refresh_idempotent_result(
+    *,
+    settings: Settings,
+    db: Session,
+    symbol: str,
+    approved_evidence: dict[str, str],
+    generated_at: datetime,
+) -> dict[str, object] | None:
+    position_id, approved_fingerprint = next(iter(approved_evidence.items()))
+    position = db.get(ExecutionPosition, position_id)
+    if position is None or position.symbol != symbol:
+        return None
+    (
+        _,
+        event,
+        summary,
+        _,
+        source_row_state,
+        _,
+        _,
+    ) = _kis_krx_canonical_flat_proof_source(
+        settings=settings,
+        db=db,
+        symbol=symbol,
+        position=position,
+    )
+    if not (
+        source_row_state == KIS_KRX_FLAT_PROOF_SOURCE_CANONICAL
+        and event.candidate_type == KIS_KRX_FLAT_PROOF_REFRESH_CANDIDATE_TYPE
+        and event.outcome == KIS_KRX_FLAT_PROOF_REFRESH_OUTCOME
+        and summary.get("refresh_approval_fingerprint") == approved_fingerprint
+        and kis_krx_flat_proof_timestamp_is_fresh(
+            observed_at=kis_krx_aware_iso_datetime(
+                summary.get("broker_snapshot_observed_at")
+            ),
+            evaluated_at=generated_at,
+            settings=settings,
+        )
+        and kis_krx_flat_proof_timestamp_is_fresh(
+            observed_at=kis_krx_event_datetime(event.occurred_at),
+            evaluated_at=generated_at,
+            settings=settings,
+        )
+    ):
+        return None
+    return {
+        "mode": "apply",
+        "runtime_mode": settings.runtime_mode,
+        "provider": "kis",
+        "exchange": "KRX",
+        "generated_at": serialize_kis_krx_datetime(event.occurred_at),
+        "replayed_at": _serialize_datetime(generated_at),
+        "broker_snapshot_observed_at": summary[
+            "broker_snapshot_observed_at"
+        ],
+        "summary": {
+            "approved_count": 1,
+            "refreshed_count": 0,
+            "idempotent_count": 1,
+            "broker_api_mutation_count": 0,
+        },
+        "items": [
+            {
+                **summary,
+                "position_id": position_id,
+                "broker_flat_evidence_fingerprint": summary[
+                    "evidence_fingerprint"
+                ],
+                "evidence_fingerprint": summary[
+                    "refresh_approval_fingerprint"
+                ],
+                "eligible": True,
+                "reason": "current_broker_flat_truth_proven",
+                "outcome": "already_current_flat_truth_refreshed",
+            }
         ],
     }
 
@@ -2566,6 +3298,7 @@ def _require_current_attribution_snapshot(
     settings: Settings,
     evaluated_at: datetime,
     snapshot_observed_at: datetime,
+    max_age_seconds: int | None = None,
 ) -> None:
     if (
         evaluated_at.tzinfo is None
@@ -2579,7 +3312,14 @@ def _require_current_attribution_snapshot(
             classification=BrokerErrorClassification.UNKNOWN,
         )
     age = evaluated_at.astimezone(UTC) - snapshot_observed_at.astimezone(UTC)
-    max_age = timedelta(seconds=settings.exec_agent_max_account_snapshot_age_seconds)
+    max_age = timedelta(
+        seconds=min(
+            settings.exec_agent_max_account_snapshot_age_seconds,
+            max_age_seconds
+            if max_age_seconds is not None
+            else settings.exec_agent_max_account_snapshot_age_seconds,
+        )
+    )
     max_future_skew = timedelta(
         seconds=settings.account_drawdown_recovery_max_snapshot_future_skew_seconds
     )

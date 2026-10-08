@@ -27,10 +27,12 @@ from app.services.position_truth_remediation import (  # noqa: E402
     SUPPORTED_POSITION_EXCHANGES,
     analyze_alpaca_crypto_flat_position_rebind,
     analyze_kis_krx_legacy_flat_position_rebind,
+    analyze_kis_krx_canonical_flat_proof_refresh,
     analyze_legacy_position_attribution,
     analyze_position_truth_remediation,
     apply_alpaca_crypto_flat_position_rebind,
     apply_kis_krx_legacy_flat_position_rebind,
+    apply_kis_krx_canonical_flat_proof_refresh,
     apply_legacy_position_attribution,
     apply_position_truth_remediation,
     legacy_attribution_account_scope_source,
@@ -120,6 +122,13 @@ def main(argv: list[str] | None = None) -> int:
             "fresh, complete live KIS account snapshot."
         ),
     )
+    parser.add_argument(
+        "--kis-krx-flat-proof-refresh-symbol",
+        help=(
+            "Refresh one exact already-canonical KIS KRX flat proof through "
+            "a new complete account snapshot and immutable audit generation."
+        ),
+    )
     parser.add_argument("--apply", action="store_true")
     parser.add_argument(
         "--approve-position",
@@ -142,17 +151,36 @@ def main(argv: list[str] | None = None) -> int:
         == ALPACA_CRYPTO_FLAT_REBIND_EXCHANGE
     )
     kis_krx_flat_rebind = args.kis_krx_flat_rebind_symbol is not None
-    if kis_krx_flat_rebind and args.legacy_attribution_exchange:
-        raise SystemExit(
-            "KIS KRX flat rebind cannot be combined with legacy attribution"
+    kis_krx_flat_proof_refresh = (
+        args.kis_krx_flat_proof_refresh_symbol is not None
+    )
+    if (
+        sum(
+            bool(value)
+            for value in (
+                kis_krx_flat_rebind,
+                kis_krx_flat_proof_refresh,
+                args.legacy_attribution_exchange,
+            )
         )
-    if kis_krx_flat_rebind and (
-        len(args.kis_krx_flat_rebind_symbol) != 6
-        or not args.kis_krx_flat_rebind_symbol.isascii()
-        or not args.kis_krx_flat_rebind_symbol.isdigit()
+        > 1
     ):
         raise SystemExit(
-            "KIS KRX flat rebind requires one canonical six-digit symbol"
+            "KIS KRX flat rebind or proof refresh cannot be combined with "
+            "another attribution mode"
+        )
+    kis_krx_symbol = (
+        args.kis_krx_flat_rebind_symbol
+        if kis_krx_flat_rebind
+        else args.kis_krx_flat_proof_refresh_symbol
+    )
+    if (kis_krx_flat_rebind or kis_krx_flat_proof_refresh) and (
+        len(kis_krx_symbol) != 6
+        or not kis_krx_symbol.isascii()
+        or not kis_krx_symbol.isdigit()
+    ):
+        raise SystemExit(
+            "KIS KRX flat remediation requires one canonical six-digit symbol"
         )
     if quarantine_attribution and runtime_mode != "live":
         raise SystemExit(
@@ -162,8 +190,8 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit(
             "Alpaca crypto flat rebind requires --runtime-mode paper"
         )
-    if kis_krx_flat_rebind and runtime_mode != "live":
-        raise SystemExit("KIS KRX flat rebind requires --runtime-mode live")
+    if (kis_krx_flat_rebind or kis_krx_flat_proof_refresh) and runtime_mode != "live":
+        raise SystemExit("KIS KRX flat remediation requires --runtime-mode live")
     reject_secret_database_url_argument(args.database_url)
     environment_database_url = (os.getenv("KAI_EXEC_DATABASE_URL") or "").strip()
     database_url = args.database_url or environment_database_url or None
@@ -172,7 +200,11 @@ def main(argv: list[str] | None = None) -> int:
     approved_evidence = _approved_position_evidence(args.approve_position)
     approved_position_apply = bool(
         args.apply
-        and (args.legacy_attribution_exchange or kis_krx_flat_rebind)
+        and (
+            args.legacy_attribution_exchange
+            or kis_krx_flat_rebind
+            or kis_krx_flat_proof_refresh
+        )
     )
     if approved_evidence and not approved_position_apply:
         raise SystemExit(
@@ -205,11 +237,11 @@ def main(argv: list[str] | None = None) -> int:
             "bytes or EXECUTION_POSITION_ACCOUNT_SCOPE"
         )
     if (
-        kis_krx_flat_rebind
+        (kis_krx_flat_rebind or kis_krx_flat_proof_refresh)
         and legacy_attribution_account_scope_source(settings=settings) is None
     ):
         raise SystemExit(
-            "KIS KRX flat rebind requires a stable canonical account scope"
+            "KIS KRX flat remediation requires a stable canonical account scope"
         )
     engine = create_db_engine(settings)
     session_factory = create_session_factory(engine)
@@ -223,10 +255,29 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 if args.legacy_attribution_exchange
                 else KisBrokerAdapter(settings=settings)
-                if kis_krx_flat_rebind
+                if kis_krx_flat_rebind or kis_krx_flat_proof_refresh
                 else None
             )
-            if kis_krx_flat_rebind and args.apply:
+            if kis_krx_flat_proof_refresh and args.apply:
+                payload = apply_kis_krx_canonical_flat_proof_refresh(
+                    settings=settings,
+                    db=db,
+                    auth_session_factory=session_factory,
+                    adapter=remediation_adapter,
+                    symbol=args.kis_krx_flat_proof_refresh_symbol,
+                    approved_evidence=approved_evidence,
+                    actor=actor,
+                    reason=reason,
+                )
+            elif kis_krx_flat_proof_refresh:
+                payload = analyze_kis_krx_canonical_flat_proof_refresh(
+                    settings=settings,
+                    db=db,
+                    auth_session_factory=session_factory,
+                    adapter=remediation_adapter,
+                    symbol=args.kis_krx_flat_proof_refresh_symbol,
+                )
+            elif kis_krx_flat_rebind and args.apply:
                 payload = apply_kis_krx_legacy_flat_position_rebind(
                     settings=settings,
                     db=db,

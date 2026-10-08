@@ -167,9 +167,62 @@ and the exact symbol is absent from both holdings and open orders. A
 `KIER2570` daily-order-query response is incomplete proof and must remain
 blocked. The command updates the existing row in place, records a redacted
 current-flat proof and immutable audit event, and has no order/fill/P&L mutation
-path. After apply, run the normal targeted position sync and confirm `created=0`
-and the same position ID remains. An exact apply replay may report idempotent;
-any row/proof mismatch requires a new dry-run rather than repair in place.
+path. Confirm the same position ID remains. A generic position-sync payload is
+not the specialized revocation-proof contract; the normal sync only preserves
+an already-fresh exact proof under the narrow conditions described below.
+An exact apply replay may report idempotent; any row/proof mismatch requires a
+new dry-run rather than repair in place.
+
+If the proof expires before Core consumes it, preserve the canonical row and
+original audit and create a new proof generation:
+
+```bash
+.venv/bin/python scripts/refresh_execution_position_truth.py \
+  --runtime-mode live \
+  --kis-krx-flat-proof-refresh-symbol 029460
+
+.venv/bin/python scripts/refresh_execution_position_truth.py \
+  --runtime-mode live \
+  --kis-krx-flat-proof-refresh-symbol 029460 \
+  --apply \
+  --approve-position 'POSITION_ID=64HEX_FROM_REFRESH_DRY_RUN' \
+  --actor 'operator-name' \
+  --reason 'refresh exact canonical broker-flat proof generation'
+```
+
+The refresh dry-run requires one exact canonical KIS/KRX row, zero quantity and
+base quantity, null average price, reconciliation provenance, and a valid
+immutable chain through every refresh generation to the original bind. A
+generic broker payload is not revocation proof. The command accepts it only as
+a narrow recovery source when it has the exact persisted live-sync shape, both
+KIS responses have `rt_cd=0`, both `output1` values are well-formed lists with
+no duplicate identities, coverage is complete, the configured account matches,
+the target symbol is absent even as a zero row, and its reconciliation timestamp
+is newer than the prior proof event.
+
+Apply obtains the shared KIS token, takes the same
+process/file/PostgreSQL account lock and row boundary, and re-fetches broker
+truth after locking. Holdings and open orders must be complete, current, and
+absent for the symbol, and the snapshot must be newer than the persisted proof
+or generic supersede. Apply changes only `raw_payload` and
+`last_reconciled_at` on the same position row and appends a distinct immutable
+refresh event linked to the prior proof. It does not edit or delete older audits
+and has no broker order, fill, strategy, or P/L mutation path.
+
+Normal position sync preserves the exact specialized row without advancing its
+timestamp only while its broker snapshot and event remain within the hard
+five-minute authority window and the new snapshot is another complete,
+successful target-absent result. A target holding/open order, malformed complete
+response, or expired proof intentionally supersedes the specialized payload;
+Core then fails closed until this reviewed refresh is run. An incomplete
+snapshot never proves absence. If it contains a parsed positive target holding
+or open order, reconciliation durably persists that strong positive exposure
+before returning the existing incomplete-coverage error. If the target is
+absent, reconciliation leaves the row unchanged, infers no zero, and returns the
+same error. Replaying an exact approval returns `refreshed_count=0` only while
+the latest specialized row/event remain byte-exact and fresh. A generic
+supersede, stale proof, or any row/full-lineage drift requires a new dry-run and
+fresh broker reads.
 
 ### Non-flat positions
 

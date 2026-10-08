@@ -19,25 +19,15 @@ from app.models.runtime import (
     ExecutionPlanItem,
     ExecutionPlanItemAudit,
     ExecutionPosition,
-    RuntimeRemediationEvent,
 )
 from app.services.account_drawdown_recovery import (
-    account_snapshot_freshness_failure,
     recovery_account_fingerprint,
 )
 from app.services.execution_account_route import validate_kis_account_route
-from app.services.kis_krx_flat_rebind_contract import (
-    KIS_KRX_LEGACY_FLAT_REBIND_CANONICAL_BASE_QUANTITY,
-    KIS_KRX_LEGACY_FLAT_REBIND_CANDIDATE_TYPE,
-    KIS_KRX_LEGACY_FLAT_REBIND_EVENT_PROOF_FIELDS,
-    KIS_KRX_LEGACY_FLAT_REBIND_OUTCOME,
-    KIS_KRX_LEGACY_FLAT_REBIND_RAW_PROOF_FIELDS,
-    KIS_KRX_LEGACY_FLAT_REBIND_SAFETY_POLICY_VERSION,
-    KIS_KRX_LEGACY_FLAT_REBIND_ZERO_MUTATION_FIELDS,
-    is_lower_hex_sha256,
-    kis_krx_flat_absence_proof_digest,
-    kis_krx_flat_configured_account_binding_digest,
-    kis_krx_flat_evidence_fingerprint,
+from app.services.kis_krx_flat_proof_validation import (
+    canonical_flat_row_matches_latest_proof,
+    kis_krx_flat_proof_timestamp_is_fresh,
+    load_kis_krx_flat_proof_lineage,
 )
 from app.services.order_intent_serialization import (
     order_intent_file_lock,
@@ -275,150 +265,60 @@ def _current_flat_proof_matches(
     proof_cutoff: datetime,
     evaluated_at: datetime,
 ) -> bool:
-    if settings is None or expected_identity is None or len(positions) != 1:
-        return False
-    position = positions[0]
-    proof = position.raw_payload if isinstance(position.raw_payload, dict) else {}
-    try:
-        column_identity = position_identity_from_columns(position)
-        payload_identity = position_identity_from_payload(proof)
-        configured_account_binding_digest = (
-            kis_krx_flat_configured_account_binding_digest(settings=settings)
-        )
-    except PositionIdentityConflictError:
-        return False
-    observed_at = _aware_datetime(proof.get("snapshot_observed_at"))
-    absence_digest = (
-        proof.get("absence_proof_digest")
-        if is_lower_hex_sha256(proof.get("absence_proof_digest"))
-        else None
-    )
-    if not (
-        _position_is_canonical_bound_flat(position)
-        and column_identity == expected_identity
-        and payload_identity == expected_identity
-        and set(proof) == KIS_KRX_LEGACY_FLAT_REBIND_RAW_PROOF_FIELDS
-        and proof.get("provider") == "kis"
-        and proof.get("mode") == plan.mode
-        and proof.get("asset_class") == "equity"
-        and proof.get("exchange") == "KRX"
-        and proof.get("snapshot_source") == "kis:account_snapshot"
-        and observed_at is not None
-        and observed_at > proof_cutoff
-        and _same_instant(position.last_reconciled_at, observed_at)
-        and account_snapshot_freshness_failure(
-            observed_at=observed_at,
-            now=evaluated_at,
-            settings=settings,
-        )
-        is None
-        and proof.get("holdings_coverage") == "complete"
-        and proof.get("open_orders_coverage") == "complete"
-        and proof.get("holding_absent") is True
-        and proof.get("open_order_absent") is True
-        and proof.get("historical_account_attributed") is False
-        and proof.get("current_flat_truth_bound") is True
-        and proof.get("configured_account_binding_digest")
-        == configured_account_binding_digest
-        and proof.get("safety_policy_version")
-        == KIS_KRX_LEGACY_FLAT_REBIND_SAFETY_POLICY_VERSION
-        and absence_digest
-        == kis_krx_flat_absence_proof_digest(
-            runtime_mode=plan.mode,
-            identity=expected_identity,
-            symbol=item.symbol,
-            snapshot_source="kis:account_snapshot",
-            holdings_complete=True,
-            open_orders_complete=True,
-            holding_absent=True,
-            open_order_absent=True,
-            configured_account_binding_digest=configured_account_binding_digest,
-        )
+    if (
+        settings is None
+        or expected_identity is None
+        or len(positions) != 1
+        or settings.runtime_mode != plan.mode
     ):
         return False
-
-    event = db.scalar(
-        select(RuntimeRemediationEvent)
-        .options(undefer(RuntimeRemediationEvent.evidence_summary))
-        .where(
-            RuntimeRemediationEvent.mode == plan.mode,
-            RuntimeRemediationEvent.candidate_type
-            == KIS_KRX_LEGACY_FLAT_REBIND_CANDIDATE_TYPE,
-            RuntimeRemediationEvent.candidate_key == position.id,
-            RuntimeRemediationEvent.subject_id == position.id,
-            RuntimeRemediationEvent.outcome == KIS_KRX_LEGACY_FLAT_REBIND_OUTCOME,
-        )
-        .with_for_update()
+    position = positions[0]
+    try:
+        column_identity = position_identity_from_columns(position)
+        payload_identity = position_identity_from_payload(position.raw_payload)
+    except PositionIdentityConflictError:
+        return False
+    if column_identity != expected_identity or payload_identity != expected_identity:
+        return False
+    lineage = load_kis_krx_flat_proof_lineage(
+        settings=settings,
+        db=db,
+        position_id=position.id,
+        symbol=item.symbol,
+        identity=expected_identity,
+        for_update=True,
     )
-    summary = (
-        event.evidence_summary
-        if event is not None and isinstance(event.evidence_summary, dict)
-        else {}
-    )
-    event_observed_at = _aware_datetime(summary.get("broker_snapshot_observed_at"))
+    if lineage is None:
+        return False
+    event, summary = lineage
+    if not canonical_flat_row_matches_latest_proof(
+        settings=settings,
+        position=position,
+        symbol=item.symbol,
+        identity=expected_identity,
+        latest_summary=summary,
+    ):
+        return False
+    observed_at = _aware_datetime(summary.get("broker_snapshot_observed_at"))
     event_occurred_at = (
         _utc(event.occurred_at)
-        if event is not None and isinstance(event.occurred_at, datetime)
-        else None
-    )
-    prior_digest = (
-        summary.get("prior_position_digest")
-        if is_lower_hex_sha256(summary.get("prior_position_digest"))
-        else None
-    )
-    expected_fingerprint = (
-        kis_krx_flat_evidence_fingerprint(
-            runtime_mode=plan.mode,
-            position_id=position.id,
-            symbol=item.symbol,
-            prior_position_digest=prior_digest,
-            identity=expected_identity,
-            snapshot_source="kis:account_snapshot",
-            holdings_complete=True,
-            open_orders_complete=True,
-            holding_absent=True,
-            open_order_absent=True,
-            absence_proof_digest=absence_digest,
-            configured_account_binding_digest=configured_account_binding_digest,
-        )
-        if prior_digest is not None and absence_digest is not None
+        if isinstance(event.occurred_at, datetime)
         else None
     )
     return bool(
-        event is not None
-        and set(summary) == KIS_KRX_LEGACY_FLAT_REBIND_EVENT_PROOF_FIELDS
-        and summary.get("symbol") == item.symbol
-        and summary.get("provider") == expected_identity.provider
-        and summary.get("account_scope") == expected_identity.account_scope
-        and summary.get("exchange") == expected_identity.exchange
-        and summary.get("asset_class") == "equity"
-        and summary.get("broker_snapshot_source") == proof.get("snapshot_source")
-        and event_observed_at == observed_at
+        observed_at is not None
         and event_occurred_at is not None
-        and event_occurred_at >= observed_at
+        and observed_at > proof_cutoff
         and event_occurred_at > proof_cutoff
-        and account_snapshot_freshness_failure(
-            observed_at=event_occurred_at,
-            now=evaluated_at,
+        and kis_krx_flat_proof_timestamp_is_fresh(
+            observed_at=observed_at,
+            evaluated_at=evaluated_at,
             settings=settings,
         )
-        is None
-        and summary.get("holdings_complete") is True
-        and summary.get("open_orders_complete") is True
-        and summary.get("holding_absent") is True
-        and summary.get("open_order_absent") is True
-        and summary.get("absence_proof_digest") == absence_digest
-        and summary.get("configured_account_binding_digest")
-        == configured_account_binding_digest
-        and prior_digest is not None
-        and summary.get("evidence_fingerprint") == expected_fingerprint
-        and summary.get("safety_policy_version")
-        == KIS_KRX_LEGACY_FLAT_REBIND_SAFETY_POLICY_VERSION
-        and summary.get("historical_account_attributed") is False
-        and summary.get("current_flat_truth_bound") is True
-        and all(
-            type(summary.get(field)) is int and summary[field] == 0
-            for field in KIS_KRX_LEGACY_FLAT_REBIND_ZERO_MUTATION_FIELDS
+        and kis_krx_flat_proof_timestamp_is_fresh(
+            observed_at=event_occurred_at,
+            evaluated_at=evaluated_at,
+            settings=settings,
         )
     )
 
@@ -534,15 +434,6 @@ def _position_is_numerically_flat(position: ExecutionPosition) -> bool:
     return all(value.is_finite() and value == 0 for value in parsed)
 
 
-def _position_is_canonical_bound_flat(position: ExecutionPosition) -> bool:
-    return bool(
-        position.base_quantity == KIS_KRX_LEGACY_FLAT_REBIND_CANONICAL_BASE_QUANTITY
-        and _position_is_numerically_flat(position)
-        and position.average_price is None
-        and position.updated_from == "reconciliation"
-    )
-
-
 def _aware_datetime(value: object) -> datetime | None:
     if not isinstance(value, str) or not value.strip():
         return None
@@ -560,14 +451,6 @@ def _aware_datetime(value: object) -> datetime | None:
 def _unknown_or_matches(actual: object, expected: str) -> bool:
     normalized = str(actual or "").strip().lower()
     return not normalized or not expected or normalized == expected
-
-
-def _same_instant(left: datetime | None, right: datetime | None) -> bool:
-    return bool(
-        isinstance(left, datetime)
-        and isinstance(right, datetime)
-        and _utc(left) == _utc(right)
-    )
 
 
 def _utc(value: datetime) -> datetime:

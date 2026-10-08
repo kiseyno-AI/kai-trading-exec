@@ -16,7 +16,11 @@ from app.api.schemas.execution import (
     _SKIP_DISPATCH_MATERIAL_FINGERPRINT_CONTEXT_KEY,
     core_execution_plan_material_fingerprint,
 )
-from app.broker.base import BrokerAccountSnapshot
+from app.broker.base import (
+    BrokerAccountHolding,
+    BrokerAccountSnapshot,
+    BrokerAdapterError,
+)
 from app.core.config import Settings
 from app.db.base import Base
 from app.db.session import create_db_engine, create_session_factory
@@ -46,6 +50,7 @@ from app.services.position_identity import (
     build_position_identity,
     payload_with_position_identity,
 )
+from app.services.reconciliation import sync_execution_positions_from_broker_snapshot
 
 
 def test_watch_rejection_policy_is_valid_terminal_core_v4_transition() -> None:
@@ -457,7 +462,58 @@ def _complete_flat_kis_snapshot(*, observed_at: datetime) -> BrokerAccountSnapsh
             "holdings_coverage": "complete",
             "open_orders_coverage": "complete",
             "open_orders_error": None,
+            "balance": {
+                "ctx_area_fk100": "",
+                "ctx_area_nk100": "",
+                "msg1": "success",
+                "msg_cd": "KIOK0510",
+                "output1": [],
+                "output2": [{"dnca_tot_amt": "1000000"}],
+                "rt_cd": "0",
+            },
+            "open_orders": {
+                "ctx_area_fk100": "",
+                "ctx_area_nk100": "",
+                "msg1": "success",
+                "msg_cd": "KIOK0560",
+                "output1": [],
+                "output2": [],
+                "rt_cd": "0",
+            },
         },
+    )
+
+
+def _partial_positive_kis_snapshot(*, observed_at: datetime) -> BrokerAccountSnapshot:
+    complete = _complete_flat_kis_snapshot(observed_at=observed_at)
+    holding = BrokerAccountHolding(
+        symbol="029460",
+        quantity=2,
+        average_price=Decimal("35000"),
+        sellable_quantity=2,
+        payload={"pdno": "029460", "hldg_qty": "2", "ord_psbl_qty": "2"},
+    )
+    diagnostics = deepcopy(complete.diagnostics)
+    diagnostics["holdings_pagination"] = {"complete": False}
+    diagnostics["holdings_parse"] = {
+        "raw_row_count": 1,
+        "parsed_row_count": 1,
+        "omitted_row_count": 0,
+        "invalid_row_count": 0,
+        "duplicate_identity_count": 0,
+    }
+    payload = deepcopy(complete.payload)
+    payload["holdings_coverage"] = "incomplete"
+    payload["balance"]["output1"] = [dict(holding.payload)]
+    return BrokerAccountSnapshot(
+        observed_at=observed_at,
+        source="kis:account_snapshot",
+        holdings=[holding],
+        open_orders=[],
+        holdings_complete=False,
+        open_orders_complete=True,
+        diagnostics=diagnostics,
+        payload=payload,
     )
 
 
@@ -4138,7 +4194,23 @@ def test_v4_revocation_retires_quarantined_family_with_intact_intake_proof_and_n
     engine.dispose()
 
 
+@pytest.mark.parametrize(
+    "refresh_tamper",
+    [
+        None,
+        "candidate_key",
+        "lineage",
+        "mutation_fact",
+        "prior_candidate_key",
+        "prior_fingerprint",
+        "root_missing",
+        "root_candidate_key",
+        "root_fingerprint",
+        "partial_positive_holding",
+    ],
+)
 def test_v4_revocation_consumes_actual_kis_flat_rebind_proof(
+    refresh_tamper: str | None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     settings = Settings(
@@ -4349,6 +4421,229 @@ def test_v4_revocation_consumes_actual_kis_flat_rebind_proof(
         assert session.scalar(select(func.count()).select_from(BrokerOrder)) == 5
         assert session.scalar(select(func.count()).select_from(ExecutionFill)) == 4
 
+        generic_superseded_at = datetime.now(UTC) - timedelta(milliseconds=10)
+        generic_snapshot = _complete_flat_kis_snapshot(
+            observed_at=generic_superseded_at
+        )
+        legacy_position.raw_payload = payload_with_position_identity(
+            deepcopy(generic_snapshot.payload),
+            identity=build_position_identity(
+                settings=settings,
+                provider="kis",
+                exchange="KRX",
+            ),
+        )
+        legacy_position.last_reconciled_at = generic_superseded_at
+        session.commit()
+
+        refresh_event_at = datetime.now(UTC)
+        refresh_snapshot_at = refresh_event_at - timedelta(milliseconds=1)
+        monkeypatch.setattr(
+            position_truth_remediation,
+            "_real_utc_now",
+            lambda: refresh_event_at,
+        )
+        refresh_adapter = _KisFlatSnapshotAdapter(
+            _complete_flat_kis_snapshot(observed_at=refresh_snapshot_at)
+        )
+        refresh_dry_run = (
+            position_truth_remediation.analyze_kis_krx_canonical_flat_proof_refresh(
+                settings=settings,
+                db=session,
+                auth_session_factory=app.state.db_session_factory,
+                adapter=refresh_adapter,
+                symbol="029460",
+                now=refresh_event_at,
+            )
+        )
+        assert refresh_dry_run["items"][0]["source_row_state"] == (
+            "canonical_flat_generic_sync_supersede"
+        )
+        assert refresh_dry_run["items"][0][
+            "superseded_reconciliation_observed_at"
+        ] == generic_superseded_at.isoformat()
+        refreshed = (
+            position_truth_remediation.apply_kis_krx_canonical_flat_proof_refresh(
+                settings=settings,
+                db=session,
+                auth_session_factory=app.state.db_session_factory,
+                adapter=refresh_adapter,
+                symbol="029460",
+                approved_evidence={
+                    legacy_position.id: refresh_dry_run["items"][0][
+                        "evidence_fingerprint"
+                    ]
+                },
+                actor="codex-integration-test",
+                reason="roll immutable flat proof forward before Core revocation",
+                now=refresh_event_at,
+            )
+        )
+        assert refreshed["summary"]["refreshed_count"] == 1
+        assert refreshed["summary"]["broker_api_mutation_count"] == 0
+        assert len(refresh_adapter.snapshot_requests) == 3
+        assert session.scalar(select(func.count()).select_from(BrokerOrder)) == 5
+        assert session.scalar(select(func.count()).select_from(ExecutionFill)) == 4
+        session.refresh(legacy_position)
+        refreshed_raw_payload = deepcopy(legacy_position.raw_payload)
+        refreshed_reconciled_at = legacy_position.last_reconciled_at
+        background_sync = sync_execution_positions_from_broker_snapshot(
+            settings=settings,
+            db=session,
+            adapter=refresh_adapter,
+            symbols={"029460"},
+            exchange="KRX",
+            authenticated_access_token="shared-kis-token",
+        )
+        session.refresh(legacy_position)
+        assert background_sync["tracked_symbol_count"] == 1
+        assert legacy_position.raw_payload == refreshed_raw_payload
+        assert legacy_position.last_reconciled_at == refreshed_reconciled_at
+        assert len(refresh_adapter.snapshot_requests) == 4
+        refresh_event = session.scalar(
+            select(RuntimeRemediationEvent).where(
+                RuntimeRemediationEvent.candidate_type
+                == "kis_krx_canonical_flat_proof_refresh"
+            )
+        )
+        assert refresh_event is not None
+        if refresh_tamper == "partial_positive_holding":
+            partial_observed_at = datetime.now(UTC) + timedelta(milliseconds=1)
+            partial_adapter = _KisFlatSnapshotAdapter(
+                _partial_positive_kis_snapshot(observed_at=partial_observed_at)
+            )
+            with pytest.raises(
+                BrokerAdapterError,
+                match="holdings coverage is incomplete",
+            ):
+                sync_execution_positions_from_broker_snapshot(
+                    settings=settings,
+                    db=session,
+                    adapter=partial_adapter,
+                    symbols={"029460"},
+                    exchange="KRX",
+                    authenticated_access_token="shared-kis-token",
+                )
+            persisted_session = app.state.db_session_factory()
+            persisted_exposure = persisted_session.get(
+                ExecutionPosition,
+                legacy_position.id,
+            )
+            assert persisted_exposure is not None
+            assert persisted_exposure.quantity == 2
+            assert persisted_exposure.average_price == Decimal("35000")
+            assert persisted_exposure.last_reconciled_at.replace(tzinfo=UTC) == (
+                partial_observed_at
+            )
+            assert persisted_session.scalar(
+                select(func.count()).select_from(BrokerOrder)
+            ) == 5
+            assert persisted_session.scalar(
+                select(func.count()).select_from(ExecutionFill)
+            ) == 4
+            assert persisted_session.scalar(
+                select(func.count()).select_from(RuntimeRemediationEvent)
+            ) == 2
+            assert len(partial_adapter.snapshot_requests) == 1
+            persisted_session.close()
+        if refresh_tamper in {
+            "root_missing",
+            "root_candidate_key",
+            "root_fingerprint",
+        }:
+            first_refresh_event = refresh_event
+            second_event_at = datetime.now(UTC)
+            second_snapshot_at = second_event_at - timedelta(milliseconds=1)
+            monkeypatch.setattr(
+                position_truth_remediation,
+                "_real_utc_now",
+                lambda: second_event_at,
+            )
+            second_adapter = _KisFlatSnapshotAdapter(
+                _complete_flat_kis_snapshot(observed_at=second_snapshot_at)
+            )
+            second_dry_run = (
+                position_truth_remediation.analyze_kis_krx_canonical_flat_proof_refresh(
+                    settings=settings,
+                    db=session,
+                    auth_session_factory=app.state.db_session_factory,
+                    adapter=second_adapter,
+                    symbol="029460",
+                    now=second_event_at,
+                )
+            )
+            second_applied = (
+                position_truth_remediation.apply_kis_krx_canonical_flat_proof_refresh(
+                    settings=settings,
+                    db=session,
+                    auth_session_factory=app.state.db_session_factory,
+                    adapter=second_adapter,
+                    symbol="029460",
+                    approved_evidence={
+                        legacy_position.id: second_dry_run["items"][0][
+                            "evidence_fingerprint"
+                        ]
+                    },
+                    actor="codex-integration-test",
+                    reason="append second generation for full-lineage validation",
+                    now=second_event_at,
+                )
+            )
+            assert second_applied["summary"]["refreshed_count"] == 1
+            refresh_event = session.scalar(
+                select(RuntimeRemediationEvent)
+                .where(
+                    RuntimeRemediationEvent.candidate_type
+                    == "kis_krx_canonical_flat_proof_refresh"
+                )
+                .order_by(RuntimeRemediationEvent.occurred_at.desc())
+            )
+            assert refresh_event is not None
+            assert refresh_event.evidence_summary["previous_proof_event_id"] == (
+                first_refresh_event.id
+            )
+            root_event = session.get(
+                RuntimeRemediationEvent,
+                first_refresh_event.evidence_summary["previous_proof_event_id"],
+            )
+            assert root_event is not None
+            if refresh_tamper == "root_missing":
+                session.delete(root_event)
+            elif refresh_tamper == "root_candidate_key":
+                root_event.candidate_key = "tampered-bind-root"
+            else:
+                root_event.evidence_summary = {
+                    **root_event.evidence_summary,
+                    "evidence_fingerprint": "f" * 64,
+                }
+        if refresh_tamper == "candidate_key":
+            refresh_event.candidate_key = "a" * 64
+        elif refresh_tamper == "lineage":
+            refresh_event.evidence_summary = {
+                **refresh_event.evidence_summary,
+                "previous_proof_event_id": "missing-bind-event",
+            }
+        elif refresh_tamper == "mutation_fact":
+            refresh_event.evidence_summary = {
+                **refresh_event.evidence_summary,
+                "orders_submitted": 1,
+            }
+        elif refresh_tamper in {"prior_candidate_key", "prior_fingerprint"}:
+            prior_event = session.get(
+                RuntimeRemediationEvent,
+                refresh_event.evidence_summary["previous_proof_event_id"],
+            )
+            assert prior_event is not None
+            if refresh_tamper == "prior_candidate_key":
+                prior_event.candidate_key = "tampered-prior-candidate"
+            else:
+                prior_event.evidence_summary = {
+                    **prior_event.evidence_summary,
+                    "evidence_fingerprint": "f" * 64,
+                }
+        if refresh_tamper is not None:
+            session.commit()
+
     response = client.post(
         "/v4/execution-plans/revocations",
         json=_revocation_payload(
@@ -4357,6 +4652,15 @@ def test_v4_revocation_consumes_actual_kis_flat_rebind_proof(
             reason_code="current_live_market_evidence_unavailable",
         ),
     )
+
+    if refresh_tamper is not None:
+        assert response.status_code == 409
+        body = response.json()
+        assert body["contract_ack"]["status"] == "manual_review_required"
+        assert body["reason_code"] == "broker_commit_or_exposure_possible"
+        assert body["revoked_item_count"] == 0
+        engine.dispose()
+        return
 
     assert response.status_code == 200
     body = response.json()
@@ -4375,9 +4679,15 @@ def test_v4_revocation_consumes_actual_kis_flat_rebind_proof(
             select(RuntimeRemediationEvent).where(
                 RuntimeRemediationEvent.subject_id == rebound.id
             )
+            .order_by(RuntimeRemediationEvent.occurred_at.desc())
         )
         assert event is not None
-        assert event.outcome == "current_flat_truth_bound"
+        assert event.outcome == "current_flat_truth_refreshed"
+        assert session.scalar(
+            select(func.count())
+            .select_from(RuntimeRemediationEvent)
+            .where(RuntimeRemediationEvent.subject_id == rebound.id)
+        ) == 2
     engine.dispose()
 
 

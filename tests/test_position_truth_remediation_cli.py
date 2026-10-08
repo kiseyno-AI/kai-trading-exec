@@ -236,6 +236,128 @@ def test_kis_krx_flat_rebind_apply_routes_exact_approval_and_audit_metadata(
     assert engine.disposed is True
 
 
+def test_kis_krx_flat_proof_refresh_dry_run_routes_without_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    db, engine = _stub_runtime(monkeypatch)
+    adapter = object()
+    calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(cli, "KisBrokerAdapter", lambda *, settings: adapter)
+    monkeypatch.setattr(
+        cli,
+        "analyze_kis_krx_canonical_flat_proof_refresh",
+        lambda **kwargs: calls.append(kwargs) or {"mode": "dry-run"},
+        raising=False,
+    )
+    monkeypatch.setattr(
+        cli,
+        "apply_kis_krx_canonical_flat_proof_refresh",
+        lambda **kwargs: pytest.fail("proof refresh dry-run attempted mutation"),
+        raising=False,
+    )
+
+    assert (
+        cli.main(
+            [
+                "--database-url",
+                "sqlite:///test.db",
+                "--runtime-mode",
+                "live",
+                "--kis-krx-flat-proof-refresh-symbol",
+                "029460",
+            ]
+        )
+        == 0
+    )
+
+    assert calls == [
+        {
+            "settings": ANY,
+            "db": db,
+            "auth_session_factory": ANY,
+            "adapter": adapter,
+            "symbol": "029460",
+        }
+    ]
+    assert '"mode": "dry-run"' in capsys.readouterr().out
+    assert engine.disposed is True
+
+
+def test_kis_krx_flat_proof_refresh_apply_routes_exact_generation_approval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db, engine = _stub_runtime(monkeypatch)
+    adapter = object()
+    calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(cli, "KisBrokerAdapter", lambda *, settings: adapter)
+    monkeypatch.setattr(
+        cli,
+        "apply_kis_krx_canonical_flat_proof_refresh",
+        lambda **kwargs: calls.append(kwargs) or {"mode": "apply"},
+        raising=False,
+    )
+
+    assert (
+        cli.main(
+            [
+                "--database-url",
+                "sqlite:///test.db",
+                "--runtime-mode",
+                "live",
+                "--kis-krx-flat-proof-refresh-symbol",
+                "029460",
+                "--apply",
+                "--approve-position",
+                f"position-029460={'A' * 64}",
+                "--actor",
+                "operator",
+                "--reason",
+                "refresh exact canonical broker-flat proof generation",
+            ]
+        )
+        == 0
+    )
+
+    assert calls == [
+        {
+            "settings": ANY,
+            "db": db,
+            "auth_session_factory": ANY,
+            "adapter": adapter,
+            "symbol": "029460",
+            "approved_evidence": {"position-029460": "a" * 64},
+            "actor": "operator",
+            "reason": "refresh exact canonical broker-flat proof generation",
+        }
+    ]
+    assert engine.disposed is True
+
+
+def test_kis_krx_flat_refresh_and_rebind_modes_are_mutually_exclusive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        cli,
+        "create_db_engine",
+        lambda settings: pytest.fail("conflicting KIS modes opened the database"),
+    )
+
+    with pytest.raises(SystemExit, match="cannot be combined"):
+        cli.main(
+            [
+                "--database-url",
+                "sqlite:///must-not-open.db",
+                "--runtime-mode",
+                "live",
+                "--kis-krx-flat-rebind-symbol",
+                "029460",
+                "--kis-krx-flat-proof-refresh-symbol",
+                "029460",
+            ]
+        )
+
+
 @pytest.mark.parametrize("runtime_mode", ["mock", "paper"])
 def test_kis_krx_flat_rebind_rejects_non_live_before_settings_or_db_open(
     monkeypatch: pytest.MonkeyPatch,
