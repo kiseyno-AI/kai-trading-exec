@@ -48,6 +48,7 @@ from app.services.fifo_inventory import (
     ambiguous_fifo_realized_pnl_sell_count,
     fifo_fill_sort_key,
     fifo_route_scope_from_order,
+    legacy_kis_krx_event_is_isolated,
     load_fifo_isolation_cursor,
     replay_open_long_fill_inventory,
 )
@@ -213,6 +214,7 @@ class RuntimeFillScopeSelection:
     indeterminate_fill_count: int
     scope_unavailable_reason: str | None = None
     chronology_ambiguous_fill_count: int = 0
+    isolated_legacy_fill_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -230,6 +232,8 @@ class RuntimePositionEvidenceSelection:
     indeterminate_fill_count: int
     foreign_order_count: int
     scope_unavailable_reason: str | None = None
+    isolated_legacy_order_count: int = 0
+    isolated_legacy_fill_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -1188,6 +1192,25 @@ def _runtime_scope_for_provider(
     )
 
 
+def _exact_krx_fifo_scope(
+    runtime_scope: RuntimeExecutionScope,
+) -> FifoRouteScope | None:
+    if (
+        not runtime_scope.available
+        or runtime_scope.provider != "kis"
+        or runtime_scope.account_scope is None
+        or "KRX" not in runtime_scope.exchanges
+    ):
+        return None
+    return FifoRouteScope(
+        provider="kis",
+        account_scope=runtime_scope.account_scope,
+        venue="KRX",
+        asset_class="stock",
+        exchange="KRX",
+    )
+
+
 def _runtime_pnl_timezone(
     *,
     settings: Settings | None,
@@ -1516,6 +1539,7 @@ def _active_runtime_fills_for_period(
     end_at: datetime,
     provider: str,
     runtime_scope: RuntimeExecutionScope | None = None,
+    legacy_isolation_cutoff: datetime | None = None,
 ) -> RuntimeFillScopeSelection:
     scope = _runtime_scope_for_provider(
         settings=settings,
@@ -1568,6 +1592,17 @@ def _active_runtime_fills_for_period(
     )
     active_fills: list[ExecutionFill] = []
     indeterminate_fill_count = 0
+    isolated_legacy_fill_count = 0
+    exact_krx_scope = _exact_krx_fifo_scope(scope)
+    isolation_cursor = (
+        load_fifo_isolation_cursor(
+            db=db,
+            runtime_mode=settings.runtime_mode,
+            through=legacy_isolation_cutoff,
+        )
+        if exact_krx_scope is not None and legacy_isolation_cutoff is not None
+        else None
+    )
     for fill in fills:
         classification, _route_scope = _runtime_order_scope_classification(
             settings=settings,
@@ -1578,10 +1613,25 @@ def _active_runtime_fills_for_period(
         if classification == "active":
             active_fills.append(fill)
         elif classification == "indeterminate":
-            indeterminate_fill_count += 1
+            if (
+                isolation_cursor is not None
+                and legacy_isolation_cutoff is not None
+                and legacy_kis_krx_event_is_isolated(
+                    order=fill.broker_order,
+                    event_symbol=fill.symbol,
+                    event_at=_as_utc(fill.filled_at),
+                    through=legacy_isolation_cutoff,
+                    isolation_cursor=isolation_cursor,
+                    exact_route_scope=exact_krx_scope,
+                )
+            ):
+                isolated_legacy_fill_count += 1
+            else:
+                indeterminate_fill_count += 1
     return RuntimeFillScopeSelection(
         fills=active_fills,
         indeterminate_fill_count=indeterminate_fill_count,
+        isolated_legacy_fill_count=isolated_legacy_fill_count,
     )
 
 
@@ -1779,12 +1829,25 @@ def position_truth_freshness_payload(
         and latest_reconciled_at is not None
         and latest_reconciled_at >= stale_before
     )
+    isolated_legacy_count = (
+        evidence.isolated_legacy_order_count + evidence.isolated_legacy_fill_count
+    )
+    historical_integrity_status = (
+        "isolated" if scope_status == "ok" and isolated_legacy_count else scope_status
+    )
+    historical_integrity_reason = (
+        "legacy_pre_flat_history_isolated"
+        if historical_integrity_status == "isolated"
+        else scope_reason
+    )
     return {
         "scope_status": scope_status,
         "scope_reason": scope_reason,
         "excluded_indeterminate_order_count": evidence.indeterminate_order_count,
         "excluded_indeterminate_fill_count": evidence.indeterminate_fill_count,
         "excluded_other_route_count": evidence.foreign_order_count,
+        "isolated_legacy_order_count": evidence.isolated_legacy_order_count,
+        "isolated_legacy_fill_count": evidence.isolated_legacy_fill_count,
         "current_broker_account_snapshot": {
             "status": snapshot_status,
             "reason": snapshot_reason,
@@ -1799,11 +1862,13 @@ def position_truth_freshness_payload(
             "max_age_seconds": settings.exec_agent_max_account_snapshot_age_seconds,
         },
         "historical_execution_integrity": {
-            "status": scope_status,
-            "reason": scope_reason,
+            "status": historical_integrity_status,
+            "reason": historical_integrity_reason,
             "excluded_indeterminate_order_count": evidence.indeterminate_order_count,
             "excluded_indeterminate_fill_count": evidence.indeterminate_fill_count,
             "excluded_other_route_count": evidence.foreign_order_count,
+            "isolated_legacy_order_count": evidence.isolated_legacy_order_count,
+            "isolated_legacy_fill_count": evidence.isolated_legacy_fill_count,
         },
         "stale_count": len(stale_symbols),
         "oldest_age_seconds": round(oldest_age_seconds, 3) if oldest_age_seconds is not None else None,
@@ -2324,7 +2389,66 @@ def _position_truth_evidence_symbols(
         end_at=observed_at + timedelta(microseconds=1),
         provider=provider,
         runtime_scope=runtime_scope,
+        legacy_isolation_cutoff=observed_at,
     )
+    isolation_cursor = load_fifo_isolation_cursor(
+        db=db,
+        runtime_mode=settings.runtime_mode,
+        through=observed_at,
+    )
+    active_scope = _runtime_scope_for_provider(
+        settings=settings,
+        provider=provider,
+        runtime_scope=runtime_scope,
+    )
+    exact_krx_scope = _exact_krx_fifo_scope(active_scope)
+    filled_order_ids = [order.id for order in filled_orders]
+    latest_fill_at_by_order_id = {
+        str(order_id): _as_utc(latest_fill_at)
+        for order_id, latest_fill_at in db.execute(
+            select(
+                ExecutionFill.broker_order_pk,
+                func.max(ExecutionFill.filled_at),
+            )
+            .where(ExecutionFill.broker_order_pk.in_(filled_order_ids))
+            .group_by(ExecutionFill.broker_order_pk)
+        ).all()
+        if latest_fill_at is not None
+    }
+    isolated_legacy_filled_order_ids: set[str] = set()
+    if exact_krx_scope is not None:
+        for order in filled_orders:
+            classification, _route_scope = _runtime_order_scope_classification(
+                settings=settings,
+                order=order,
+                provider=provider,
+                runtime_scope=active_scope,
+            )
+            if classification != "indeterminate":
+                continue
+            order_observations = [
+                _as_utc(value)
+                for value in (
+                    order.submitted_at,
+                    order.last_broker_sync_at,
+                    order.updated_at,
+                    order.created_at,
+                    latest_fill_at_by_order_id.get(order.id),
+                )
+                if value is not None
+            ]
+            if not order_observations:
+                continue
+            observed_through = max(order_observations)
+            if legacy_kis_krx_event_is_isolated(
+                order=order,
+                event_symbol=order.symbol,
+                event_at=observed_through,
+                through=observed_at,
+                isolation_cursor=isolation_cursor,
+                exact_route_scope=exact_krx_scope,
+            ):
+                isolated_legacy_filled_order_ids.add(order.id)
     symbols = {str(order.symbol) for order in reserving_selection.orders}
     fill_quantity_by_order_id: dict[str, Decimal] = {}
     for fill in fill_selection.fills:
@@ -2345,11 +2469,6 @@ def _position_truth_evidence_symbols(
     # must not disappear merely because a symbol-level buy/sell set happens to
     # cancel out.
     symbols.update(str(order.symbol) for order in incomplete_filled_orders)
-    isolation_cursor = load_fifo_isolation_cursor(
-        db=db,
-        runtime_mode=settings.runtime_mode,
-        through=observed_at,
-    )
     inventory = replay_open_long_fill_inventory(
         fills=fill_selection.fills,
         isolation_cursor=isolation_cursor,
@@ -2361,6 +2480,7 @@ def _position_truth_evidence_symbols(
         indeterminate_order_count=(
             reserving_selection.indeterminate_order_count
             + filled_selection.indeterminate_order_count
+            - len(isolated_legacy_filled_order_ids)
         ),
         indeterminate_fill_count=(
             fill_selection.indeterminate_fill_count
@@ -2376,6 +2496,8 @@ def _position_truth_evidence_symbols(
             or filled_selection.scope_unavailable_reason
             or fill_selection.scope_unavailable_reason
         ),
+        isolated_legacy_order_count=len(isolated_legacy_filled_order_ids),
+        isolated_legacy_fill_count=fill_selection.isolated_legacy_fill_count,
     )
 
 
@@ -3621,7 +3743,11 @@ def build_runtime_status(
                 "excluded_indeterminate_order_count": 0,
                 "excluded_indeterminate_fill_count": 0,
                 "excluded_other_route_count": 0,
+                "isolated_legacy_order_count": 0,
+                "isolated_legacy_fill_count": 0,
             },
+            "isolated_legacy_order_count": 0,
+            "isolated_legacy_fill_count": 0,
             "stale_count": 0,
             "oldest_age_seconds": None,
             "oldest_age": None,
@@ -4280,6 +4406,7 @@ def daily_pnl_payload(
         end_at=next_day_start,
         provider=provider,
         runtime_scope=pnl_scope,
+        legacy_isolation_cutoff=day_start,
     )
     isolation_cursor = load_fifo_isolation_cursor(
         db=db,
@@ -4557,6 +4684,7 @@ def _period_realized_pnl_summary(
         end_at=end_at,
         provider=provider,
         runtime_scope=runtime_scope,
+        legacy_isolation_cutoff=start_at,
     )
     isolation_cursor = load_fifo_isolation_cursor(
         db=db,

@@ -9,10 +9,12 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.models.runtime import FifoInventoryIsolation
+from app.services.execution_semantics import KRX_ASSET_CLASS_ALIASES, KRX_EXCHANGES
 from app.services.position_identity import EXECUTION_SCOPE_POLICY_VERSION
 
 
 FIFO_VERIFIED_FLAT_EVIDENCE_SOURCE = "broker_flat_reconciliation"
+KIS_BROKER_NAMES = frozenset({"kis", "korea-investment", "korea_investment"})
 
 
 @dataclass(frozen=True)
@@ -185,7 +187,6 @@ class FifoIsolationCursor:
             ),
             None,
         )
-
     def latest_boundary_through(
         self,
         *,
@@ -206,6 +207,77 @@ class FifoIsolationCursor:
             ),
             None,
         )
+
+
+def legacy_kis_krx_event_matches(
+    *,
+    order: object,
+    event_symbol: str,
+    exact_route_scope: FifoRouteScope | None,
+) -> bool:
+    if (
+        exact_route_scope is None
+        or exact_route_scope.provider != "kis"
+        or exact_route_scope.exchange != "KRX"
+        or fifo_route_scope_from_order(order) is not None
+    ):
+        return False
+    metadata = getattr(order, "request_metadata", None)
+    metadata = metadata if isinstance(metadata, dict) else {}
+    if "execution_scope" in metadata or "broker_account_scope" in metadata:
+        return False
+    order_symbol = str(getattr(order, "symbol", None) or "").strip().upper()
+    if not order_symbol or order_symbol != str(event_symbol or "").strip().upper():
+        return False
+    route_metadata = metadata.get("route")
+    route_metadata = route_metadata if isinstance(route_metadata, dict) else {}
+    explicit_exchange = str(
+        metadata.get("exchange") or route_metadata.get("exchange") or ""
+    ).strip().upper()
+    if explicit_exchange and explicit_exchange not in KRX_EXCHANGES:
+        return False
+    broker_name = str(getattr(order, "broker_name", None) or "").strip().lower()
+    venue = str(getattr(order, "venue", None) or "").strip().upper()
+    asset_class = str(getattr(order, "asset_class", None) or "").strip().lower()
+    if (
+        broker_name not in KIS_BROKER_NAMES
+        or venue not in KRX_EXCHANGES
+        or asset_class not in KRX_ASSET_CLASS_ALIASES
+    ):
+        return False
+    return True
+
+
+def legacy_kis_krx_event_is_isolated(
+    *,
+    order: object,
+    event_symbol: str,
+    event_at: datetime,
+    through: datetime,
+    isolation_cursor: FifoIsolationCursor,
+    exact_route_scope: FifoRouteScope | None,
+) -> bool:
+    """Return whether exact current-account flat proof closes legacy KRX history.
+
+    This deliberately does not attribute the legacy order or fill to the route.
+    It only proves that a KIS domestic event strictly before the exact scoped
+    flat boundary cannot affect the current FIFO generation.
+    """
+
+    if not legacy_kis_krx_event_matches(
+        order=order,
+        event_symbol=event_symbol,
+        exact_route_scope=exact_route_scope,
+    ):
+        return False
+    assert exact_route_scope is not None
+    order_symbol = str(getattr(order, "symbol", None) or "").strip().upper()
+    boundary = isolation_cursor.latest_boundary_through(
+        route_scope=exact_route_scope,
+        symbol=order_symbol,
+        observed_at=through,
+    )
+    return boundary is not None and _as_utc(event_at) < boundary
 
 
 @dataclass(frozen=True)

@@ -32,9 +32,11 @@ from app.services.weekly_trade_review import (
     _weekly_fills,
     _monitoring_checkpoints,
     _plan_item_review_summary,
+    _stale_fifo_inventory_alerts,
     generate_weekly_trade_review,
 )
 from app.services.runtime import runtime_counts
+from app.services.position_identity import build_position_identity
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -492,6 +494,7 @@ def test_weekly_fifo_never_pairs_same_symbol_across_execution_routes() -> None:
 
     rows, truncated = _weekly_closed_trades(
         db=db,
+        settings=settings,
         mode="paper",
         start_at=start_at,
         end_at=end_at,
@@ -609,6 +612,7 @@ def test_weekly_fifo_starts_clean_generation_after_exact_route_verified_flat() -
 
     rows, truncated = _weekly_closed_trades(
         db=db,
+        settings=settings,
         mode="paper",
         start_at=start_at,
         end_at=end_at,
@@ -620,6 +624,106 @@ def test_weekly_fifo_starts_clean_generation_after_exact_route_verified_flat() -
     assert rows[0]["sell_fill_id"] == "weekly-new-generation-sell-fill"
     assert rows[0]["cost_basis_source"] == "fill_fifo"
     assert rows[0]["realized_pnl"] == Decimal("50.0000")
+    db.close()
+    engine.dispose()
+
+
+def test_weekly_fifo_alerts_ignore_only_pre_flat_legacy_krx_history() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        execution_position_account_scope=WEEKLY_TEST_ACCOUNT_SCOPE,
+    )
+    engine, db = _build_db(settings)
+    old_at = datetime(2026, 9, 1, 1, 0, tzinfo=UTC)
+    boundary_at = old_at + timedelta(hours=1)
+    end_at = boundary_at + timedelta(hours=2)
+    identity = build_position_identity(
+        settings=settings,
+        provider="kis",
+        exchange="KRX",
+    )
+    isolated_order = BrokerOrder(
+        id="weekly-isolated-legacy-order",
+        broker_name="kis",
+        mode="paper",
+        idempotency_key="weekly-isolated-legacy-order",
+        symbol="027710",
+        side="buy",
+        status="filled",
+        quantity=1,
+        venue="KRX",
+        asset_class="stock",
+        submitted_at=old_at,
+    )
+    unresolved_order = BrokerOrder(
+        id="weekly-unresolved-legacy-order",
+        broker_name="kis",
+        mode="paper",
+        idempotency_key="weekly-unresolved-legacy-order",
+        symbol="009999",
+        side="buy",
+        status="filled",
+        quantity=1,
+        venue="KRX",
+        asset_class="stock",
+        submitted_at=old_at,
+    )
+    db.add_all(
+        [
+            isolated_order,
+            unresolved_order,
+            FifoInventoryIsolation(
+                mode="paper",
+                provider="kis",
+                account_scope=identity.account_scope,
+                venue="KRX",
+                asset_class="stock",
+                exchange="KRX",
+                symbol="027710",
+                residual_quantity=Decimal("1"),
+                last_local_fill_at=old_at,
+                broker_position_id="weekly-isolated-flat-position",
+                broker_position_quantity=Decimal("0"),
+                broker_reconciled_at=boundary_at,
+                isolated_through_at=boundary_at,
+                evidence_source="broker_flat_reconciliation",
+                actor="test",
+                reason="exact current account flat proof",
+            ),
+            ExecutionFill(
+                id="weekly-isolated-legacy-fill",
+                broker_order=isolated_order,
+                symbol="027710",
+                side="buy",
+                quantity=1,
+                price=Decimal("100"),
+                filled_at=old_at,
+            ),
+            ExecutionFill(
+                id="weekly-unresolved-legacy-fill",
+                broker_order=unresolved_order,
+                symbol="009999",
+                side="buy",
+                quantity=1,
+                price=Decimal("100"),
+                filled_at=old_at,
+            ),
+        ]
+    )
+    db.commit()
+
+    alerts, truncated = _stale_fifo_inventory_alerts(
+        db=db,
+        settings=settings,
+        mode="paper",
+        end_at=end_at,
+        max_rows=100,
+    )
+
+    assert truncated is False
+    assert [alert["symbol"] for alert in alerts] == ["009999"]
+    assert alerts[0]["kind"] == "fifo_execution_scope_unavailable"
     db.close()
     engine.dispose()
 

@@ -1495,6 +1495,8 @@ def test_runtime_status_falls_back_to_autonomous_snapshot_when_database_pool_is_
         "excluded_indeterminate_order_count": 0,
         "excluded_indeterminate_fill_count": 0,
         "excluded_other_route_count": 0,
+        "isolated_legacy_order_count": 0,
+        "isolated_legacy_fill_count": 0,
     }
     monitoring = payload["liveness"]["monitoring"]
     assert monitoring["source"] == "autonomous_runtime_snapshot"

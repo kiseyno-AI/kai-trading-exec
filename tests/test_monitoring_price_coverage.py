@@ -140,6 +140,26 @@ def test_real_quote_request_failure_remains_price_source_outage() -> None:
     assert _first_quote_failure_error(diagnostics) == "temporary rate limit"
 
 
+def test_truncated_quote_failures_cannot_hide_source_outage() -> None:
+    diagnostics = {
+        "quote_failures": [
+            {
+                "symbol": "OLDCO",
+                "code": KIS_OVERSEAS_QUOTE_EMPTY_CODE,
+                "error": "KIS overseas quote is unavailable",
+            }
+        ],
+        "quote_failure_count": 2,
+        "quote_empty_failure_count": 1,
+        "quote_source_failure_count": 1,
+        "quote_failures_truncated": True,
+    }
+
+    assert _first_quote_failure_error(diagnostics) == (
+        "monitoring quote source request failures were truncated"
+    )
+
+
 def test_us_orderability_uses_new_york_regular_session_while_krx_is_closed() -> None:
     context = _derive_orderability_context(
         settings=Settings(domestic_order_session_routing_enabled=True),

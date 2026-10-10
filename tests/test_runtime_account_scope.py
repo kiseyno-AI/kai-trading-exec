@@ -531,6 +531,8 @@ def test_position_truth_separates_fresh_broker_snapshot_from_legacy_history() ->
         "excluded_indeterminate_order_count": 1,
         "excluded_indeterminate_fill_count": 1,
         "excluded_other_route_count": 0,
+        "isolated_legacy_order_count": 0,
+        "isolated_legacy_fill_count": 0,
     }
     assert position_truth["broker_truth_reachable"] is False
     assert position_truth["evidence_symbol_count"] == 0
@@ -2053,6 +2055,145 @@ def test_runtime_pnl_does_not_report_zero_when_fill_scope_is_ambiguous() -> None
         assert payload["net_realized_pnl_krw"] is None
     assert monthly["target_progress_pct"] is None
     assert monthly["mode_recommendation"] == "insufficient_net_pnl_data"
+
+    db.close()
+    engine.dispose()
+
+
+def test_exact_krx_flat_isolation_separates_legacy_history_from_new_generation() -> None:
+    settings = _settings()
+    engine, _factory, db = _session(settings)
+    now = datetime(2026, 10, 12, 4, 0, tzinfo=UTC)
+    old_at = datetime(2026, 9, 17, 1, 0, tzinfo=UTC)
+    boundary_at = datetime(2026, 10, 11, 3, 0, tzinfo=UTC)
+    new_buy_at = now - timedelta(hours=2)
+    new_sell_at = now - timedelta(hours=1)
+    legacy_buy = _canonical_order(
+        None,
+        key="isolated-legacy-buy",
+        symbol="027710",
+        side="buy",
+        status="filled",
+        observed_at=old_at,
+    )
+    new_buy = _canonical_order(
+        settings,
+        key="clean-generation-buy",
+        symbol="005930",
+        side="buy",
+        status="filled",
+        observed_at=new_buy_at,
+    )
+    new_sell = _canonical_order(
+        settings,
+        key="clean-generation-sell",
+        symbol="005930",
+        side="sell",
+        status="filled",
+        observed_at=new_sell_at,
+    )
+    identity = build_position_identity(
+        settings=settings,
+        provider="kis",
+        exchange="KRX",
+    )
+    db.add_all([legacy_buy, new_buy, new_sell])
+    db.flush()
+    db.add_all(
+        [
+            _fill(
+                legacy_buy,
+                key="isolated-legacy-buy-fill",
+                quantity=1,
+                price="100",
+                settlement_currency="KRW",
+                transaction_cost="0",
+                filled_at=old_at,
+            ),
+            _fill(
+                new_buy,
+                key="clean-generation-buy-fill",
+                quantity=1,
+                price="100",
+                settlement_currency="KRW",
+                transaction_cost="0",
+                filled_at=new_buy_at,
+            ),
+            _fill(
+                new_sell,
+                key="clean-generation-sell-fill",
+                quantity=1,
+                price="120",
+                settlement_currency="KRW",
+                transaction_cost="0",
+                filled_at=new_sell_at,
+            ),
+            FifoInventoryIsolation(
+                mode=settings.runtime_mode,
+                provider="kis",
+                account_scope=identity.account_scope,
+                venue="KRX",
+                asset_class="stock",
+                exchange="KRX",
+                symbol="027710",
+                residual_quantity=Decimal("1"),
+                last_local_fill_at=old_at,
+                broker_position_id="isolated-legacy-flat-position",
+                broker_position_quantity=Decimal("0"),
+                broker_reconciled_at=boundary_at,
+                isolated_through_at=boundary_at,
+                evidence_source="broker_flat_reconciliation",
+                actor="test",
+                reason="exact current account flat proof",
+            ),
+            ExecutionPosition(
+                mode=settings.runtime_mode,
+                provider="kis",
+                account_scope=identity.account_scope,
+                exchange="KRX",
+                symbol="027710",
+                quantity=0,
+                base_quantity=Decimal("0"),
+                updated_from="reconciliation",
+                last_reconciled_at=now - timedelta(seconds=5),
+                raw_payload={
+                    "holdings_coverage": "complete",
+                    "open_orders_coverage": "complete",
+                    "_position_identity": {
+                        "version": "execution-position-route-v2",
+                        "provider": "kis",
+                        "account_scope": identity.account_scope,
+                        "exchange": "KRX",
+                    },
+                },
+            ),
+        ]
+    )
+    db.commit()
+
+    truth = runtime_service.position_truth_freshness_payload(
+        settings=settings,
+        db=db,
+        now=now,
+    )
+    daily = runtime_service.daily_pnl_payload(settings=settings, db=db, now=now)
+    weekly = runtime_service.weekly_pnl_payload(settings=settings, db=db, now=now)
+    monthly = runtime_service.monthly_pnl_payload(settings=settings, db=db, now=now)
+
+    assert truth["scope_status"] == "ok"
+    assert truth["broker_truth_reachable"] is True
+    assert truth["isolated_legacy_order_count"] == 1
+    assert truth["isolated_legacy_fill_count"] == 1
+    assert truth["historical_execution_integrity"]["status"] == "isolated"
+    assert truth["historical_execution_integrity"]["reason"] == (
+        "legacy_pre_flat_history_isolated"
+    )
+    assert daily["calculation_status"] == "computed"
+    assert weekly["calculation_status"] == "computed"
+    assert daily["daily_gross_realized_pnl_krw"] == "20.0000"
+    assert weekly["weekly_gross_realized_pnl_krw"] == "20.0000"
+    assert monthly["calculation_status"] == "not_computed"
+    assert monthly["calculation_reason"] == "indeterminate_execution_fill_scope"
 
     db.close()
     engine.dispose()

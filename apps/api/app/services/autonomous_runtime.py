@@ -2822,6 +2822,9 @@ def _first_quote_failure_error(diagnostics: dict[str, object]) -> str | None:
         error = failure.get("error")
         if isinstance(error, str) and error.strip():
             return error
+    source_failure_count = diagnostics.get("quote_source_failure_count")
+    if isinstance(source_failure_count, int) and source_failure_count > 0:
+        return "monitoring quote source request failures were truncated"
     return None
 
 

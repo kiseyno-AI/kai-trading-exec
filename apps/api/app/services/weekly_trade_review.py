@@ -41,6 +41,7 @@ from app.services.fifo_inventory import (
     fifo_chronology_is_ambiguous_at,
     fifo_fill_sort_key,
     fifo_route_scope_from_order,
+    legacy_kis_krx_event_is_isolated,
     load_fifo_isolation_cursor,
 )
 from app.services.fill_idempotency import dedupe_execution_fills
@@ -48,6 +49,10 @@ from app.services.fill_economics import closed_trade_economics
 from app.services.runtime_transitions import WATCH_SIZING_PENDING_STATUS
 from app.services.max_holding_actionability import max_holding_actionability_summary
 from app.services.late_entry_actionability import late_entry_actionability_summary
+from app.services.position_identity import (
+    PositionIdentityConflictError,
+    build_position_identity,
+)
 
 
 class WeeklyTradeReviewTimeoutError(TimeoutError):
@@ -90,6 +95,24 @@ TERMINAL_AUDIT_PLAN_ITEM_STATUSES = frozenset(
         "watch_expired",
     }
 )
+
+
+def _weekly_exact_krx_fifo_scope(settings: Settings) -> FifoRouteScope | None:
+    try:
+        identity = build_position_identity(
+            settings=settings,
+            provider="kis",
+            exchange="KRX",
+        )
+    except PositionIdentityConflictError:
+        return None
+    return FifoRouteScope(
+        provider=identity.provider,
+        account_scope=identity.account_scope,
+        venue="KRX",
+        asset_class="stock",
+        exchange=identity.exchange,
+    )
 
 
 def generate_weekly_trade_review(
@@ -201,6 +224,7 @@ def generate_weekly_trade_review(
     progress("weekly_execution_failures", row_count=len(failures), truncated=failures_truncated)
     closed_trades, closed_trades_truncated = _weekly_closed_trades(
         db=db,
+        settings=settings,
         mode=settings.runtime_mode,
         start_at=start_at,
         end_at=end_at,
@@ -214,6 +238,7 @@ def generate_weekly_trade_review(
     )
     stale_fifo_inventory_alerts, stale_fifo_inventory_alerts_truncated = _stale_fifo_inventory_alerts(
         db=db,
+        settings=settings,
         mode=settings.runtime_mode,
         end_at=end_at,
         max_rows=max_fills,
@@ -885,6 +910,8 @@ def _monitoring_checkpoints(
         MonitoringCheckpoint.id,
         MonitoringCheckpoint.worker_name,
         MonitoringCheckpoint.mode,
+        MonitoringCheckpoint.provider,
+        MonitoringCheckpoint.account_scope,
         MonitoringCheckpoint.status,
         MonitoringCheckpoint.last_heartbeat_at,
         MonitoringCheckpoint.last_success_at,
@@ -942,6 +969,7 @@ def _monitoring_checkpoints(
 def _weekly_closed_trades(
     *,
     db: Session,
+    settings: Settings,
     mode: str,
     start_at: datetime,
     end_at: datetime,
@@ -982,6 +1010,7 @@ def _weekly_closed_trades(
         route_symbols=sell_route_symbols,
     )
     isolation_cursor = load_fifo_isolation_cursor(db=db, runtime_mode=mode, through=end_at)
+    exact_krx_scope = _weekly_exact_krx_fifo_scope(settings)
 
     lots_by_route_symbol: dict[
         tuple[FifoRouteScope, str],
@@ -995,6 +1024,15 @@ def _weekly_closed_trades(
         in_period = start_at <= fill_time < end_at
         route_scope = fifo_route_scope_from_order(fill.broker_order)
         if route_scope is None:
+            if legacy_kis_krx_event_is_isolated(
+                order=fill.broker_order,
+                event_symbol=fill.symbol,
+                event_at=fill_time,
+                through=start_at,
+                isolation_cursor=isolation_cursor,
+                exact_route_scope=exact_krx_scope,
+            ):
+                continue
             if side == "sell" and in_period:
                 closed.append(
                     _closed_trade_row(
@@ -1519,6 +1557,7 @@ def _closed_trade_row(
 def _stale_fifo_inventory_alerts(
     *,
     db: Session,
+    settings: Settings,
     mode: str,
     end_at: datetime,
     max_rows: int,
@@ -1547,6 +1586,7 @@ def _stale_fifo_inventory_alerts(
     fills = dedupe_execution_fills(list(reversed(newest_fills[:max_rows])))
     ambiguous_buckets = ambiguous_fifo_chronology_buckets(fills)
     isolation_cursor = load_fifo_isolation_cursor(db=db, runtime_mode=mode, through=end_at)
+    exact_krx_scope = _weekly_exact_krx_fifo_scope(settings)
     lots_by_route_symbol: dict[tuple[FifoRouteScope, str], list[Decimal]] = {}
     first_fill_at: dict[tuple[FifoRouteScope, str], datetime] = {}
     last_fill_at: dict[tuple[FifoRouteScope, str], datetime] = {}
@@ -1560,6 +1600,15 @@ def _stale_fifo_inventory_alerts(
         quantity = _fill_quantity(fill)
         route_scope = fifo_route_scope_from_order(fill.broker_order)
         if route_scope is None:
+            if legacy_kis_krx_event_is_isolated(
+                order=fill.broker_order,
+                event_symbol=fill.symbol,
+                event_at=observed_at,
+                through=end_at,
+                isolation_cursor=isolation_cursor,
+                exact_route_scope=exact_krx_scope,
+            ):
+                continue
             unavailable_scope_fill_count[fill.symbol] = (
                 unavailable_scope_fill_count.get(fill.symbol, 0) + 1
             )

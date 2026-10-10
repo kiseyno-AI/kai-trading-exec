@@ -273,6 +273,8 @@ class KisCurrentQuoteMonitoringPriceSource:
             "missing_symbols": unique_symbols,
             "quote_failures": [],
             "quote_failure_count": 0,
+            "quote_empty_failure_count": 0,
+            "quote_source_failure_count": 0,
             "quote_failures_truncated": False,
             "durably_unquoteable_symbols": [],
             "empty_quote_consecutive_counts": {},
@@ -301,6 +303,8 @@ class KisCurrentQuoteMonitoringPriceSource:
                     for symbol in unique_symbols[:MAX_REPORTED_QUOTE_FAILURES]
                 ],
                 "quote_failure_count": len(unique_symbols),
+                "quote_empty_failure_count": 0,
+                "quote_source_failure_count": len(unique_symbols),
                 "quote_failures_truncated": len(unique_symbols) > MAX_REPORTED_QUOTE_FAILURES,
                 "durably_unquoteable_symbols": [],
                 "empty_quote_consecutive_counts": {},
@@ -330,6 +334,8 @@ class KisCurrentQuoteMonitoringPriceSource:
                 failures: list[dict[str, object]] = []
                 context_failures: list[dict[str, object]] = []
                 failure_count = 0
+                empty_failure_count = 0
+                source_failure_count = 0
                 context_failure_count = 0
                 durably_unquoteable_symbols: list[str] = []
 
@@ -452,11 +458,13 @@ class KisCurrentQuoteMonitoringPriceSource:
                             isinstance(error, BrokerAdapterError)
                             and error.code == KIS_OVERSEAS_QUOTE_EMPTY_CODE
                         ):
+                            empty_failure_count += 1
                             empty_count = self._empty_quote_counts.get(symbol, 0) + 1
                             self._empty_quote_counts[symbol] = empty_count
                             if empty_count >= DURABLE_EMPTY_QUOTE_OBSERVATION_COUNT:
                                 durably_unquoteable_symbols.append(symbol)
                         else:
+                            source_failure_count += 1
                             self._empty_quote_counts.pop(symbol, None)
                         failure_count += 1
                         if len(failures) < MAX_REPORTED_QUOTE_FAILURES:
@@ -512,6 +520,8 @@ class KisCurrentQuoteMonitoringPriceSource:
                     "missing_symbols": missing_symbols,
                     "quote_failures": failures,
                     "quote_failure_count": failure_count,
+                    "quote_empty_failure_count": empty_failure_count,
+                    "quote_source_failure_count": source_failure_count,
                     "quote_failures_truncated": failure_count > len(failures),
                     "durably_unquoteable_symbols": durably_unquoteable_symbols,
                     "empty_quote_consecutive_counts": {
