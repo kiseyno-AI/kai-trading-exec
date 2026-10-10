@@ -748,6 +748,91 @@ def test_foreign_stop_cannot_suppress_current_account_default_exit_creation() ->
         engine.dispose()
 
 
+def test_existing_position_repair_monitor_inherits_unambiguous_plan_lineage() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        kis_account_number="12345678",
+        kis_account_product_code="01",
+        account_drawdown_recovery_scope_secret="stable-monitor-route-secret-for-tests",
+    )
+    identity = build_position_identity(
+        settings=settings,
+        provider="kis",
+        exchange="KRX",
+    )
+    source_risk, source_policy = bind_kis_account_route(
+        settings=settings,
+        provider="kis",
+        risk_context={"exchange": "KRX"},
+        quantity_policy={"kind": "shares", "quantity": 3},
+    )
+    source_item = ExecutionPlanItem(
+        id="lineage-source-item",
+        plan_item_index=0,
+        symbol="005930",
+        side="buy",
+        intent="watch_buy",
+        status="filled",
+        provider="kis",
+        venue="krx",
+        asset_class="stock",
+        quantity_policy=source_policy,
+        risk_context=source_risk,
+        decision_agent_name="signal-decider",
+        decision_snapshot_id="snapshot-2026-09-08-005930",
+        decision_run_id="decision-run-2026-09-08",
+        source_plan_item_id="core-plan-item-005930",
+        source_market_date=date(2026, 9, 8),
+    )
+    plan = ExecutionPlan(
+        id="repair-lineage-plan",
+        external_plan_id="repair-lineage-plan",
+        source="test",
+        market_date=date(2026, 9, 8),
+        accepted_at=datetime(2026, 9, 8, 7, tzinfo=UTC),
+        mode="paper",
+        status="accepted",
+        items=[source_item],
+    )
+    position = ExecutionPosition(
+        mode="paper",
+        provider=identity.provider,
+        account_scope=identity.account_scope,
+        exchange=identity.exchange,
+        symbol="005930",
+        quantity=3,
+        average_price=Decimal("100"),
+    )
+
+    repaired = monitoring_service._new_existing_position_exit_monitor(
+        settings=settings,
+        plan=plan,
+        position=position,
+        intent="stop_sell",
+        trigger_price=Decimal("96"),
+        source="post_entry_missing_order_stop_repair",
+        exchange="KRX",
+        venue="krx",
+        asset_class="stock",
+        triggered_at=datetime(2026, 9, 10, 1, tzinfo=UTC),
+    )
+
+    assert repaired.decision_agent_name == "signal-decider"
+    assert repaired.decision_snapshot_id == "snapshot-2026-09-08-005930"
+    assert repaired.decision_run_id == "decision-run-2026-09-08"
+    assert repaired.source_market_date == date(2026, 9, 8)
+    assert repaired.risk_context["repair_decision_lineage"] == {
+        "status": "inherited",
+        "source_execution_plan_item_id": "lineage-source-item",
+        "source_plan_item_id": "core-plan-item-005930",
+        "decision_agent_name": "signal-decider",
+        "decision_snapshot_id": "snapshot-2026-09-08-005930",
+        "decision_run_id": "decision-run-2026-09-08",
+        "source_market_date": "2026-09-08",
+    }
+
+
 def test_foreign_newer_stop_cannot_supersede_matching_account_protection() -> None:
     settings = Settings(
         database_url="sqlite:///:memory:",
