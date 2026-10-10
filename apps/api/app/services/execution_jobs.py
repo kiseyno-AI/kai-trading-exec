@@ -54,7 +54,7 @@ from app.services.runtime_controls import (
     hourly_risk_off_retry_after_at,
     runtime_safety_payload,
 )
-from app.services.runtime_transitions import set_execution_job_status
+from app.services.runtime_transitions import set_execution_job_status, set_plan_item_status
 
 LOGGER = logging.getLogger(__name__)
 
@@ -64,6 +64,12 @@ NEXT_OPEN_BUY_JOB_TYPE = "next_open_buy"
 CRYPTO_PAPER_ORDER_JOB_TYPE = "crypto_paper_order"
 UPBIT_PAPER_ALLOWED_SYMBOLS = frozenset({"KRW-BTC", "KRW-ETH"})
 DISPATCHABLE_JOB_STATUSES = ("queued", "scheduled", "retrying")
+TERMINAL_NEXT_OPEN_PLAN_ITEM_STATUS_BY_JOB_STATUS = {
+    "failed": "next_open_buy_failed",
+    "expired": "next_open_buy_expired",
+    "revoked": "revoked",
+    "superseded": "superseded",
+}
 RETRYABLE_ACCOUNT_DRAWDOWN_BLOCK_REASONS = frozenset(
     {
         "account_drawdown_recovery_cooldown",
@@ -252,6 +258,11 @@ def dispatch_due_execution_jobs(
         runtime_mode=settings.runtime_mode,
         settings=settings,
     )
+    _reconcile_terminal_next_open_plan_items(
+        settings=settings,
+        db=db,
+        observed_at=triggered_at,
+    )
     control_state = ensure_runtime_control_state(settings=settings, db=db)
     _converge_retrying_jobs_from_committed_order_truth(
         settings=settings,
@@ -396,6 +407,62 @@ def dispatch_due_execution_jobs(
             "next_dispatch_at": _serialize_datetime(next_dispatch_at),
         },
     )
+
+
+def _reconcile_terminal_next_open_plan_items(
+    *,
+    settings: Settings,
+    db: Session,
+    observed_at: datetime,
+) -> int:
+    """Converge legacy plan-item labels to authoritative terminal job truth.
+
+    Older dispatch paths could persist a terminal execution job while leaving
+    its plan item labelled as scheduled or retry-pending.  Those labels are
+    claimable states and must not survive a restart or appear as active work.
+    Keep the rows for audit, but converge the read/state model before selecting
+    due work.
+    """
+
+    rows = db.execute(
+        select(ExecutionJob, ExecutionPlanItem)
+        .join(ExecutionJob.plan_item)
+        .join(ExecutionPlanItem.plan)
+        .where(
+            ExecutionPlan.mode == settings.runtime_mode,
+            ExecutionJob.job_type == NEXT_OPEN_BUY_JOB_TYPE,
+            ExecutionJob.status.in_(
+                tuple(TERMINAL_NEXT_OPEN_PLAN_ITEM_STATUS_BY_JOB_STATUS)
+            ),
+            ExecutionPlanItem.status.in_(
+                {"next_open_buy_scheduled", "next_open_buy_retry_pending"}
+            ),
+        )
+        .order_by(ExecutionJob.created_at.asc(), ExecutionJob.id.asc())
+        .with_for_update()
+    ).all()
+    for job, plan_item in rows:
+        terminal_status = TERMINAL_NEXT_OPEN_PLAN_ITEM_STATUS_BY_JOB_STATUS[
+            job.status
+        ]
+        set_plan_item_status(
+            db=db,
+            plan_item=plan_item,
+            status=terminal_status,
+            source="execution_job_reconciliation",
+            event_type="terminal_execution_job_plan_item_reconciled",
+            reason="terminal execution job had a stale claimable plan-item status",
+            payload={
+                "execution_job_id": job.id,
+                "execution_job_status": job.status,
+                "job_type": job.job_type,
+                "reconciled_plan_item_status": terminal_status,
+            },
+            occurred_at=observed_at,
+        )
+    if rows:
+        db.commit()
+    return len(rows)
 
 
 def serialize_execution_job(job: ExecutionJob) -> dict[str, object]:

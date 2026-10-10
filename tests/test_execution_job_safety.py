@@ -12,6 +12,7 @@ from app.models.runtime import (
     ExecutionFailure,
     ExecutionJob,
     ExecutionPlanItem,
+    ExecutionPlanItemAudit,
     RuntimeControlState,
 )
 from app.services import exec_agent, execution_api, execution_jobs, plan_judgment_actions
@@ -35,6 +36,59 @@ class _FrozenDateTime(datetime):
         if tz is None:
             return cls.current.replace(tzinfo=None)
         return cls.current.astimezone(tz)
+
+
+def test_terminal_next_open_job_reconciliation_removes_stale_claimable_status(
+    tmp_path,
+) -> None:
+    app, engine, _adapter, item_id = _next_open_app(
+        tmp_path,
+        plan_id="plan-terminal-job-reconciliation",
+    )
+    observed_at = datetime(2026, 10, 10, 15, 0, tzinfo=UTC)
+    with app.state.db_session_factory() as db:
+        item = db.get(ExecutionPlanItem, item_id)
+        job = db.scalar(
+            select(ExecutionJob).where(
+                ExecutionJob.execution_plan_item_id == item_id
+            )
+        )
+        assert item is not None
+        assert job is not None
+        item.status = "next_open_buy_retry_pending"
+        job.status = "failed"
+        job.last_error = "historical dispatch failed"
+        db.commit()
+
+        reconciled = execution_jobs._reconcile_terminal_next_open_plan_items(
+            settings=app.state.settings,
+            db=db,
+            observed_at=observed_at,
+        )
+
+        db.refresh(item)
+        audit = db.scalar(
+            select(ExecutionPlanItemAudit).where(
+                ExecutionPlanItemAudit.execution_plan_item_id == item_id,
+                ExecutionPlanItemAudit.event_type
+                == "terminal_execution_job_plan_item_reconciled",
+            )
+        )
+        assert reconciled == 1
+        assert item.status == "next_open_buy_failed"
+        assert audit is not None
+        assert audit.payload["execution_job_status"] == "failed"
+
+        assert (
+            execution_jobs._reconcile_terminal_next_open_plan_items(
+                settings=app.state.settings,
+                db=db,
+                observed_at=observed_at + timedelta(seconds=1),
+            )
+            == 0
+        )
+
+    engine.dispose()
 
 
 def _next_open_app(tmp_path, *, plan_id: str):

@@ -18,6 +18,7 @@ from app.models.runtime import (
     BrokerOrderEvent,
     ExecutionFailure,
     ExecutionFill,
+    ExecutionJob,
     FifoInventoryIsolation,
     ExecutionPlan,
     ExecutionPlanItem,
@@ -29,6 +30,8 @@ from app.services.weekly_trade_review import (
     _weekly_closed_trades,
     _weekly_fill_attribution_coverage,
     _weekly_fills,
+    _monitoring_checkpoints,
+    _plan_item_review_summary,
     generate_weekly_trade_review,
 )
 from app.services.runtime import runtime_counts
@@ -66,6 +69,150 @@ def _assert_mapping_contains(actual: object, expected: dict[str, object]) -> Non
             _assert_mapping_contains(actual[key], expected_value)
         else:
             assert actual[key] == expected_value
+
+
+def test_plan_item_review_does_not_present_terminal_jobs_as_active_next_open_work() -> None:
+    settings = Settings(database_url="sqlite:///:memory:", runtime_mode="paper")
+    engine, db = _build_db(settings)
+    start_at = datetime(2026, 10, 5, tzinfo=UTC)
+    end_at = datetime(2026, 10, 12, tzinfo=UTC)
+    plan = ExecutionPlan(
+        external_plan_id="plan-review-lifecycle-semantics",
+        source="test",
+        mode="paper",
+        status="accepted",
+    )
+    active_item = ExecutionPlanItem(
+        id="active-next-open-item",
+        plan=plan,
+        symbol="005930",
+        side="buy",
+        intent="next_open_buy",
+        status="next_open_buy_scheduled",
+        created_at=start_at,
+        updated_at=start_at,
+    )
+    stale_terminal_item = ExecutionPlanItem(
+        id="stale-terminal-item",
+        plan=plan,
+        symbol="000660",
+        side="buy",
+        intent="next_open_buy",
+        status="next_open_buy_retry_pending",
+        created_at=start_at,
+        updated_at=start_at,
+    )
+    rejected_item = ExecutionPlanItem(
+        id="terminal-audit-item",
+        plan=plan,
+        symbol="035420",
+        side="buy",
+        intent="intraday_watch_buy",
+        status="exec_agent_rejected",
+        created_at=start_at,
+        updated_at=start_at,
+    )
+    db.add_all(
+        [
+            plan,
+            active_item,
+            stale_terminal_item,
+            rejected_item,
+            ExecutionJob(
+                execution_plan_item_id=active_item.id,
+                job_type="next_open_buy",
+                status="scheduled",
+                scheduled_for=start_at + timedelta(days=1),
+            ),
+            ExecutionJob(
+                execution_plan_item_id=stale_terminal_item.id,
+                job_type="next_open_buy",
+                status="failed",
+                scheduled_for=start_at - timedelta(days=30),
+            ),
+        ]
+    )
+    db.commit()
+
+    summary = _plan_item_review_summary(
+        db=db,
+        mode="paper",
+        start_at=start_at,
+        end_at=end_at,
+    )
+
+    assert [
+        {
+            "status": row["status"],
+            "intent": row["intent"],
+            "count": row["count"],
+        }
+        for row in summary["active_next_open_status_counts"]
+    ] == [
+        {
+            "status": "next_open_buy_scheduled",
+            "intent": "next_open_buy",
+            "count": 1,
+        }
+    ]
+    assert {
+        row["status"] for row in summary["terminal_audit_status_counts"]
+    } == {"exec_agent_rejected"}
+    assert summary["active_watch_status_counts"] == []
+    assert summary["weekly_status_count_semantics"] == (
+        "historical_audit_activity_not_active_work"
+    )
+
+    db.close()
+    engine.dispose()
+
+
+def test_weekly_monitoring_checkpoints_exclude_legacy_and_stale_instances() -> None:
+    settings = Settings(database_url="sqlite:///:memory:", runtime_mode="paper")
+    engine, db = _build_db(settings)
+    active_since = datetime(2026, 10, 5, tzinfo=UTC)
+    db.add_all(
+        [
+            MonitoringCheckpoint(
+                worker_name="current-scoped",
+                mode="paper",
+                provider="kis",
+                account_scope=WEEKLY_TEST_ACCOUNT_SCOPE,
+                status="running",
+                last_heartbeat_at=active_since + timedelta(hours=1),
+            ),
+            MonitoringCheckpoint(
+                worker_name="stale-scoped",
+                mode="paper",
+                provider="kis",
+                account_scope="b" * 24,
+                status="running",
+                last_heartbeat_at=active_since - timedelta(days=1),
+            ),
+            MonitoringCheckpoint(
+                worker_name="legacy-unscoped",
+                mode="paper",
+                status="running",
+                last_heartbeat_at=active_since + timedelta(hours=2),
+            ),
+        ]
+    )
+    db.commit()
+
+    checkpoints, summary = _monitoring_checkpoints(
+        db=db,
+        mode="paper",
+        active_since=active_since,
+        include_json_payloads=False,
+    )
+
+    assert [row["worker_name"] for row in checkpoints] == ["current-scoped"]
+    assert summary["current_scoped_checkpoint_count"] == 1
+    assert summary["excluded_legacy_unscoped_checkpoint_count"] == 1
+    assert summary["excluded_stale_scoped_checkpoint_count"] == 1
+
+    db.close()
+    engine.dispose()
 
 
 def test_weekly_fills_expose_decision_linkage_and_explicit_unknown_coverage() -> None:
@@ -1996,6 +2143,8 @@ def _seed_weekly_review_fixture(*, db, start_at: datetime) -> None:
         id="monitoring-checkpoint",
         worker_name="monitoring",
         mode="paper",
+        provider="kis",
+        account_scope=WEEKLY_TEST_ACCOUNT_SCOPE,
         status="degraded",
         last_heartbeat_at=start_at + timedelta(days=6),
         last_success_at=start_at + timedelta(days=6),

@@ -82,6 +82,14 @@ def apply_fifo_inventory_repairs(
     items = _fifo_inventory_repair_items(db=db, runtime_mode=runtime_mode)
     applied_items: list[dict[str, object]] = []
     applied_blocker_count = 0
+    pending_isolations: dict[
+        tuple[str, str, str, str, str, str, str, datetime],
+        FifoInventoryIsolation,
+    ] = {}
+    pending_applied_items: dict[
+        tuple[str, str, str, str, str, str, str, datetime],
+        dict[str, object],
+    ] = {}
     for item in items:
         if item["eligible"] is not True:
             if _record_remediation_event(
@@ -113,6 +121,38 @@ def apply_fifo_inventory_repairs(
             item["broker_reconciliation_timestamp"],
             fallback=isolated_at,
         )
+        isolation_key = (
+            runtime_mode,
+            str(item["execution_scope"]["provider"]),
+            str(item["execution_scope"]["account_scope"]),
+            str(item["execution_scope"]["venue"]),
+            str(item["execution_scope"]["asset_class"]),
+            str(item["execution_scope"]["exchange"]),
+            str(item["symbol"]),
+            broker_reconciled_at,
+        )
+        pending = pending_isolations.get(isolation_key)
+        if pending is not None:
+            pending.residual_quantity += (
+                _parse_decimal(item["residual_quantity"]) or Decimal("0")
+            )
+            pending.last_local_fill_at = max(
+                pending.last_local_fill_at,
+                _parse_timestamp(item["last_local_fill"], fallback=isolated_at),
+            )
+            audit_payload = dict(pending.audit_payload or {})
+            evidence = list(
+                audit_payload.get("coalesced_evidence")
+                or [audit_payload["evidence"]]
+            )
+            evidence.append(item)
+            audit_payload["coalesced_evidence"] = evidence
+            audit_payload["coalesced_candidate_count"] = len(evidence)
+            pending.audit_payload = audit_payload
+            pending_applied_items[isolation_key]["coalesced_candidate_count"] = len(
+                evidence
+            )
+            continue
         existing = db.scalar(
             select(FifoInventoryIsolation).where(
                 FifoInventoryIsolation.mode == runtime_mode,
@@ -163,7 +203,11 @@ def apply_fifo_inventory_repairs(
             },
         )
         db.add(isolation)
-        applied_items.append(item)
+        pending_isolations[isolation_key] = isolation
+        applied_item = dict(item)
+        applied_item["coalesced_candidate_count"] = 1
+        applied_items.append(applied_item)
+        pending_applied_items[isolation_key] = applied_item
     db.commit()
     items = _annotate_fifo_reviews(
         db=db,
@@ -340,6 +384,7 @@ def _fifo_inventory_repair_items(
         tuple[str, str, str, str],
         list[ExecutionPosition],
     ] = defaultdict(list)
+    scoped_positions_by_symbol: dict[str, list[ExecutionPosition]] = defaultdict(list)
     legacy_position_candidates: dict[str, list[ExecutionPosition]] = defaultdict(list)
     for position in positions:
         identity = _validated_position_identity(position)
@@ -355,6 +400,7 @@ def _fifo_inventory_repair_items(
                 position.symbol,
             )
         ].append(position)
+        scoped_positions_by_symbol[position.symbol].append(position)
     position_by_route_symbol = {
         key: candidates[0]
         for key, candidates in scoped_position_candidates.items()
@@ -397,10 +443,12 @@ def _fifo_inventory_repair_items(
             if route_scope is not None
             else None
         )
+        legacy_positions = legacy_position_candidates.get(symbol, [])
+        exact_symbol_positions = scoped_positions_by_symbol.get(symbol, [])
         ambiguous_positions = (
             scoped_position_candidates.get(route_position_key, [])
             if route_position_key is not None
-            else legacy_position_candidates.get(symbol, [])
+            else legacy_positions or exact_symbol_positions
         )
         if len(ambiguous_positions) > 1:
             items.append(
@@ -430,7 +478,14 @@ def _fifo_inventory_repair_items(
         position = (
             position_by_route_symbol.get(route_position_key)
             if route_position_key is not None
-            else legacy_position_by_symbol.get(symbol)
+            else (
+                legacy_position_by_symbol.get(symbol)
+                or (
+                    exact_symbol_positions[0]
+                    if len(exact_symbol_positions) == 1
+                    else None
+                )
+            )
         )
         if (
             position is None
@@ -443,13 +498,29 @@ def _fifo_inventory_repair_items(
             position.last_reconciled_at,
             fallback=datetime.min.replace(tzinfo=UTC),
         )
+        effective_route_scope = route_scope or _exact_krx_legacy_reset_scope(position)
+        existing_boundary = (
+            isolation_cursor.latest_boundary_through(
+                route_scope=effective_route_scope,
+                symbol=symbol,
+                observed_at=broker_reconciled_at,
+            )
+            if effective_route_scope is not None
+            else None
+        )
+        if existing_boundary is not None and existing_boundary >= last_fill_at:
+            continue
         scope_matches_position = _fifo_position_matches_route(
             position=position,
-            route_scope=route_scope,
+            route_scope=effective_route_scope,
         )
-        scope_available = bool(route_scope is not None and scope_matches_position)
+        scope_available = bool(
+            effective_route_scope is not None and scope_matches_position
+        )
         eligible = scope_available and broker_reconciled_at > last_fill_at
-        if route_scope is None:
+        if route_scope is None and effective_route_scope is not None and eligible:
+            reason = "exact_krx_flat_resets_legacy_generation"
+        elif route_scope is None:
             reason = "execution_scope_unavailable"
         elif not scope_matches_position:
             reason = "broker_position_execution_scope_mismatch"
@@ -468,7 +539,9 @@ def _fifo_inventory_repair_items(
                 "broker_position_id": position.id,
                 "broker_position_quantity": _decimal_text(_position_quantity(position)),
                 "execution_scope": (
-                    route_scope.as_payload() if route_scope is not None else None
+                    effective_route_scope.as_payload()
+                    if effective_route_scope is not None
+                    else None
                 ),
                 "eligible": eligible,
                 "repair_action": "isolate" if eligible else "skip",
@@ -513,6 +586,34 @@ def _fifo_position_matches_route(
         and identity.provider == route_scope.provider
         and identity.account_scope == route_scope.account_scope
         and identity.exchange == route_scope.exchange
+    )
+
+
+def _exact_krx_legacy_reset_scope(
+    position: ExecutionPosition,
+) -> FifoRouteScope | None:
+    """Start a clean scoped generation without attributing legacy fills.
+
+    A unique, current KIS/KRX position row can prove only that this exact
+    account is flat now. That is sufficient to isolate older unscoped history
+    from future FIFO replay, but not to rewrite or value the historical fills.
+    Other routes remain fail-closed because their venue and asset mapping is not
+    established by this remediation path.
+    """
+
+    identity = _validated_position_identity(position)
+    if (
+        identity is None
+        or identity.provider != "kis"
+        or identity.exchange != "KRX"
+    ):
+        return None
+    return FifoRouteScope(
+        provider=identity.provider,
+        account_scope=identity.account_scope,
+        venue="KRX",
+        asset_class="stock",
+        exchange=identity.exchange,
     )
 
 

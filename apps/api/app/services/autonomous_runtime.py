@@ -19,6 +19,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.api.schemas.execution import MonitoringPriceRequest
 from app.broker.base import BrokerAdapter
+from app.broker.kis import KIS_OVERSEAS_QUOTE_EMPTY_CODE
 from app.core.config import Settings
 from app.models.runtime import BrokerOrder
 from app.models.runtime import ExecutionPlan, ExecutionPlanItem, ExecutionPosition
@@ -2811,6 +2812,12 @@ def _first_quote_failure_error(diagnostics: dict[str, object]) -> str | None:
         return None
     for failure in failures:
         if not isinstance(failure, dict):
+            continue
+        if failure.get("code") == KIS_OVERSEAS_QUOTE_EMPTY_CODE:
+            # A successful KIS response with no price rows means this symbol is
+            # currently unquoteable. It must stay fail-closed, but it is not a
+            # transport/source outage and should not poison global readiness as
+            # one.
             continue
         error = failure.get("error")
         if isinstance(error, str) and error.strip():

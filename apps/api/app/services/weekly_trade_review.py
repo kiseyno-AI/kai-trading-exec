@@ -21,6 +21,7 @@ from app.models.runtime import (
     BrokerOrderEvent,
     ExecutionFailure,
     ExecutionFill,
+    ExecutionJob,
     ExecutionPlan,
     ExecutionPlanItem,
     ExecutionPosition,
@@ -53,20 +54,41 @@ class WeeklyTradeReviewTimeoutError(TimeoutError):
     """Raised when a bounded weekly export exceeds its configured deadline."""
 
 
-WATCH_REVIEW_STATUSES = (
+ACTIVE_WATCH_REVIEW_STATUSES = (
     WATCH_SIZING_PENDING_STATUS,
     "watch_monitoring_pending",
     "watch_monitoring_active",
     "watch_buy_triggered",
     "watch_buy_triggered_blocked",
     "watch_buy_triggered_pending_dispatch",
-    "watch_buy_submitted",
-    "watch_buy_rejected",
-    "watch_expired",
-    "watch_cancelled",
     "short_term_watcher_pending",
-    "short_term_watch_blocked",
     "new_buy_blocked",
+)
+ACTIVE_NEXT_OPEN_JOB_STATUSES = frozenset(
+    {"queued", "scheduled", "running", "retrying"}
+)
+ACTIVE_NEXT_OPEN_PLAN_ITEM_STATUSES = frozenset(
+    {
+        "new_buy_blocked",
+        "next_open_buy_scheduled",
+        "next_open_buy_retry_pending",
+        "next_open_buy_dispatching",
+    }
+)
+TERMINAL_AUDIT_PLAN_ITEM_STATUSES = frozenset(
+    {
+        "broker_order_rejected",
+        "exec_agent_rejected",
+        "expired",
+        "next_open_buy_expired",
+        "next_open_buy_failed",
+        "rejected",
+        "short_term_watch_blocked",
+        "watch_buy_submitted",
+        "watch_buy_rejected",
+        "watch_cancelled",
+        "watch_expired",
+    }
 )
 
 
@@ -214,14 +236,16 @@ def generate_weekly_trade_review(
         start_at=start_at,
         end_at=end_at,
     )
-    monitoring_checkpoints = _monitoring_checkpoints(
+    monitoring_checkpoints, monitoring_checkpoint_summary = _monitoring_checkpoints(
         db=db,
         mode=settings.runtime_mode,
+        active_since=start_at,
         include_json_payloads=include_json_payloads,
     )
     protective_stop_actionability = _monitoring_protective_stop_actionability(
         db=db,
         mode=settings.runtime_mode,
+        active_since=start_at,
     )
     max_holding_actionability = max_holding_actionability_summary(
         settings=settings,
@@ -316,6 +340,7 @@ def generate_weekly_trade_review(
         "active_broker_order_summary": active_order_summary,
         "execution_plan_item_summary": plan_item_summary,
         "monitoring_checkpoints": monitoring_checkpoints,
+        "monitoring_checkpoint_summary": monitoring_checkpoint_summary,
         "protective_stop_actionability": protective_stop_actionability,
         "max_holding_actionability": max_holding_actionability,
         "late_entry_actionability": late_entry_actionability,
@@ -757,6 +782,26 @@ def _plan_item_review_summary(
     start_at: datetime,
     end_at: datetime,
 ) -> dict[str, object]:
+    active_next_open_counts = db.execute(
+        select(
+            ExecutionPlanItem.status,
+            ExecutionPlanItem.intent,
+            func.count(ExecutionPlanItem.id).label("count"),
+            func.min(ExecutionPlanItem.updated_at).label("oldest_updated_at"),
+            func.max(ExecutionPlanItem.updated_at).label("newest_updated_at"),
+        )
+        .select_from(ExecutionJob)
+        .join(ExecutionJob.plan_item)
+        .join(ExecutionPlanItem.plan)
+        .where(
+            ExecutionPlan.mode == mode,
+            ExecutionJob.job_type == "next_open_buy",
+            ExecutionJob.status.in_(ACTIVE_NEXT_OPEN_JOB_STATUSES),
+            ExecutionPlanItem.status.in_(ACTIVE_NEXT_OPEN_PLAN_ITEM_STATUSES),
+        )
+        .group_by(ExecutionPlanItem.status, ExecutionPlanItem.intent)
+        .order_by(ExecutionPlanItem.status.asc(), ExecutionPlanItem.intent.asc())
+    ).all()
     active_watch_counts = db.execute(
         select(
             ExecutionPlanItem.status,
@@ -768,7 +813,7 @@ def _plan_item_review_summary(
         .join(ExecutionPlan, ExecutionPlanItem.execution_plan_id == ExecutionPlan.id)
         .where(
             ExecutionPlan.mode == mode,
-            ExecutionPlanItem.status.in_(WATCH_REVIEW_STATUSES),
+            ExecutionPlanItem.status.in_(ACTIVE_WATCH_REVIEW_STATUSES),
         )
         .group_by(ExecutionPlanItem.status, ExecutionPlanItem.intent)
         .order_by(ExecutionPlanItem.status.asc(), ExecutionPlanItem.intent.asc())
@@ -803,10 +848,29 @@ def _plan_item_review_summary(
         .group_by(ExecutionPlanItem.status, ExecutionPlanItem.intent)
         .order_by(ExecutionPlanItem.status.asc(), ExecutionPlanItem.intent.asc())
     ).all()
+    terminal_audit_counts = db.execute(
+        select(
+            ExecutionPlanItem.status,
+            ExecutionPlanItem.intent,
+            func.count(ExecutionPlanItem.id).label("count"),
+            func.min(ExecutionPlanItem.updated_at).label("oldest_updated_at"),
+            func.max(ExecutionPlanItem.updated_at).label("newest_updated_at"),
+        )
+        .join(ExecutionPlan, ExecutionPlanItem.execution_plan_id == ExecutionPlan.id)
+        .where(
+            ExecutionPlan.mode == mode,
+            ExecutionPlanItem.status.in_(TERMINAL_AUDIT_PLAN_ITEM_STATUSES),
+        )
+        .group_by(ExecutionPlanItem.status, ExecutionPlanItem.intent)
+        .order_by(ExecutionPlanItem.status.asc(), ExecutionPlanItem.intent.asc())
+    ).all()
     return {
+        "active_next_open_status_counts": _rows_to_dicts(active_next_open_counts),
         "active_watch_status_counts": _rows_to_dicts(active_watch_counts),
+        "terminal_audit_status_counts": _rows_to_dicts(terminal_audit_counts),
         "weekly_created_status_counts": _rows_to_dicts(created_counts),
         "weekly_updated_status_counts": _rows_to_dicts(updated_counts),
+        "weekly_status_count_semantics": "historical_audit_activity_not_active_work",
     }
 
 
@@ -814,8 +878,9 @@ def _monitoring_checkpoints(
     *,
     db: Session,
     mode: str,
+    active_since: datetime,
     include_json_payloads: bool,
-) -> list[dict[str, object]]:
+) -> tuple[list[dict[str, object]], dict[str, object]]:
     columns = [
         MonitoringCheckpoint.id,
         MonitoringCheckpoint.worker_name,
@@ -828,12 +893,50 @@ def _monitoring_checkpoints(
     ]
     if include_json_payloads:
         columns.append(MonitoringCheckpoint.details)
+    activity_at = func.coalesce(
+        MonitoringCheckpoint.last_heartbeat_at,
+        MonitoringCheckpoint.last_success_at,
+        MonitoringCheckpoint.updated_at,
+    )
     rows = db.execute(
         select(*columns)
-        .where(MonitoringCheckpoint.mode == mode)
+        .where(
+            MonitoringCheckpoint.mode == mode,
+            MonitoringCheckpoint.provider.is_not(None),
+            MonitoringCheckpoint.account_scope.is_not(None),
+            activity_at >= active_since,
+        )
         .order_by(MonitoringCheckpoint.worker_name.asc())
     ).all()
-    return _rows_to_dicts(rows)
+    excluded_legacy_count = int(
+        db.scalar(
+            select(func.count(MonitoringCheckpoint.id)).where(
+                MonitoringCheckpoint.mode == mode,
+                MonitoringCheckpoint.provider.is_(None),
+                MonitoringCheckpoint.account_scope.is_(None),
+            )
+        )
+        or 0
+    )
+    excluded_stale_scoped_count = int(
+        db.scalar(
+            select(func.count(MonitoringCheckpoint.id)).where(
+                MonitoringCheckpoint.mode == mode,
+                MonitoringCheckpoint.provider.is_not(None),
+                MonitoringCheckpoint.account_scope.is_not(None),
+                or_(activity_at < active_since, activity_at.is_(None)),
+            )
+        )
+        or 0
+    )
+    current_rows = _rows_to_dicts(rows)
+    return current_rows, {
+        "current_scoped_checkpoint_count": len(current_rows),
+        "excluded_legacy_unscoped_checkpoint_count": excluded_legacy_count,
+        "excluded_stale_scoped_checkpoint_count": excluded_stale_scoped_count,
+        "active_since": active_since,
+        "semantics": "only_recent_account_scoped_checkpoints_are_current_instances",
+    }
 
 
 def _weekly_closed_trades(
@@ -1687,7 +1790,13 @@ def _monitoring_protective_stop_actionability(
     *,
     db: Session,
     mode: str,
+    active_since: datetime,
 ) -> dict[str, object]:
+    activity_at = func.coalesce(
+        MonitoringCheckpoint.last_heartbeat_at,
+        MonitoringCheckpoint.last_success_at,
+        MonitoringCheckpoint.updated_at,
+    )
     rows = db.execute(
         select(
             MonitoringCheckpoint.worker_name,
@@ -1695,7 +1804,12 @@ def _monitoring_protective_stop_actionability(
             MonitoringCheckpoint.last_heartbeat_at,
             MonitoringCheckpoint.details,
         )
-        .where(MonitoringCheckpoint.mode == mode)
+        .where(
+            MonitoringCheckpoint.mode == mode,
+            MonitoringCheckpoint.provider.is_not(None),
+            MonitoringCheckpoint.account_scope.is_not(None),
+            activity_at >= active_since,
+        )
         .order_by(MonitoringCheckpoint.worker_name.asc())
     ).all()
     warnings: list[dict[str, object]] = []
