@@ -1397,6 +1397,129 @@ def _position_for_monitoring_item(
     return position if actual == expected else None
 
 
+def _authorize_protective_stop_submission(
+    *,
+    settings: Settings,
+    item: ExecutionPlanItem,
+    position: ExecutionPosition | None,
+    requested_quantity: int,
+    observed_price: Decimal | None,
+    price_observed_at: datetime | None,
+    evaluated_at: datetime,
+) -> tuple[bool, str | None]:
+    """Persist current deterministic authority before a protective stop submit.
+
+    Strategy lineage and emergency risk authority are deliberately separate.
+    A broker-discovered legacy position can lack a strategy decision while its
+    protective liquidation remains safe, but current position, route, quantity,
+    and quote-trigger evidence may never be inferred or silently reused.
+    """
+
+    if item.side != "sell" or item.intent != "stop_sell":
+        return True, None
+
+    normalized_evaluated_at = _normalize_utc(evaluated_at)
+    failure_reason: str | None = None
+    if position is None:
+        failure_reason = "protective_stop_position_evidence_unavailable"
+    elif position.quantity <= 0:
+        failure_reason = "protective_stop_position_is_flat"
+    elif requested_quantity <= 0 or requested_quantity > position.quantity:
+        failure_reason = "protective_stop_quantity_inconsistent"
+    elif (
+        _position_for_monitoring_item(
+            settings=settings,
+            item=item,
+            positions_by_symbol={item.symbol: position},
+        )
+        is not position
+    ):
+        failure_reason = "protective_stop_position_route_inconsistent"
+    elif settings.runtime_mode == "live" and position.last_reconciled_at is None:
+        failure_reason = "protective_stop_position_observation_missing"
+    elif settings.runtime_mode == "live":
+        assert position.last_reconciled_at is not None
+        position_observed_at = _normalize_utc(position.last_reconciled_at)
+        position_age = normalized_evaluated_at - position_observed_at
+        if (
+            position_age < timedelta(0)
+            or position_age
+            > timedelta(seconds=settings.exec_agent_max_account_snapshot_age_seconds)
+        ):
+            failure_reason = "protective_stop_position_observation_stale"
+
+    normalized_price_observed_at = (
+        _normalize_utc(price_observed_at)
+        if price_observed_at is not None
+        else None
+    )
+    has_decision_snapshot = bool(item.decision_snapshot_id)
+    has_decision_run = bool(item.decision_run_id)
+    if has_decision_snapshot != has_decision_run and failure_reason is None:
+        failure_reason = "protective_stop_strategy_lineage_partial"
+    strategy_lineage_status = (
+        "complete"
+        if has_decision_snapshot and has_decision_run
+        else "partial"
+        if has_decision_snapshot or has_decision_run
+        else "unavailable"
+    )
+    authorization = {
+        "schema_version": "protective_stop_reauthorization_v1",
+        "authorization_id": new_id(),
+        "authorization_kind": "deterministic_emergency_stop",
+        "status": "approved" if failure_reason is None else "manual_review_required",
+        "reason": failure_reason,
+        "execution_plan_item_id": item.id,
+        "strategy_decision_lineage_status": strategy_lineage_status,
+        "decision_run_id": item.decision_run_id,
+        "decision_snapshot_id": item.decision_snapshot_id,
+        "position": {
+            "position_id": position.id if position is not None else None,
+            "quantity": position.quantity if position is not None else None,
+            "last_reconciled_at": (
+                _serialize_datetime(position.last_reconciled_at)
+                if position is not None
+                else None
+            ),
+            "updated_from": position.updated_from if position is not None else None,
+        },
+        "execution_scope": {
+            "provider": position.provider if position is not None else None,
+            "account_scope": position.account_scope if position is not None else None,
+            "exchange": position.exchange if position is not None else None,
+            "venue": item.venue,
+        },
+        "request": {
+            "quantity": requested_quantity,
+            "observed_price": _serialize_decimal(observed_price),
+            "price_observed_at": _serialize_datetime(normalized_price_observed_at),
+            "fresh_broker_quote_revalidation_required": True,
+        },
+        "evaluated_at": normalized_evaluated_at.isoformat(),
+    }
+    risk_context = dict(_loaded_risk_context(item, allow_file_backed_load=True))
+    risk_context["protective_stop_reauthorization"] = authorization
+    item.risk_context = risk_context
+    if failure_reason is not None:
+        item.status = "manual_review_required"
+        _record_monitoring_event(
+            item=item,
+            event={
+                "event": "protective_stop_reauthorization_manual_review",
+                "authorization_id": authorization["authorization_id"],
+                "reason": failure_reason,
+                "position_quantity": (
+                    position.quantity if position is not None else None
+                ),
+                "requested_quantity": requested_quantity,
+                "strategy_decision_lineage_status": strategy_lineage_status,
+                "recorded_at": normalized_evaluated_at.isoformat(),
+            },
+        )
+    return failure_reason is None, failure_reason
+
+
 def _kis_monitoring_route_rejection(
     *,
     settings: Settings,
@@ -3401,6 +3524,37 @@ def _evaluate_monitoring_cycle(
                     pending_symbols.append(symbol)
                 continue
             deterministic_sell_quantity_cap = quantity
+            if action.item.intent == "stop_sell":
+                protective_stop_authorized, authorization_reason = (
+                    _authorize_protective_stop_submission(
+                        settings=settings,
+                        item=action.item,
+                        position=_position_for_monitoring_item(
+                            settings=settings,
+                            item=action.item,
+                            positions_by_symbol=positions_by_symbol,
+                        ),
+                        requested_quantity=quantity,
+                        observed_price=action.observed_price,
+                        price_observed_at=action.observed_at,
+                        evaluated_at=triggered_at,
+                    )
+                )
+                if not protective_stop_authorized:
+                    blocked_item_count += 1
+                    result_by_item_id[action.item.id] = _monitoring_result_payload(
+                        item=action.item,
+                        observed_price=action.observed_price,
+                        outcome="blocked",
+                        block_reason=authorization_reason,
+                        message=(
+                            "protective stop requires manual review because current "
+                            "position or execution authority evidence is inconsistent"
+                        ),
+                    )
+                    if symbol_actions:
+                        pending_symbols.append(symbol)
+                    continue
             if trigger_time_exec_agent.trigger_time_exec_agent_enabled(
                 settings=settings,
                 item=action.item,
@@ -9990,6 +10144,80 @@ def _is_future_entry_exit_template(item: ExecutionPlanItem) -> bool:
     return isinstance(linked_entry_item_key, str) and bool(linked_entry_item_key.strip())
 
 
+def _existing_position_repair_decision_lineage(
+    *,
+    settings: Settings,
+    plan: ExecutionPlan,
+    symbol: str,
+    exchange: str,
+) -> dict[str, object]:
+    """Return only decision lineage that is unambiguous in the chosen plan.
+
+    A broker-discovered position may predate Exec, so absence is expected and
+    must stay explicit.  We may inherit a decision only when the current plan
+    contains one unique, fully identified decision on the same account route;
+    choosing the newest same-symbol row would manufacture authority.
+    """
+
+    candidates: list[ExecutionPlanItem] = []
+    for candidate in plan.items:
+        if (
+            candidate.symbol != symbol
+            or not candidate.decision_snapshot_id
+            or not candidate.decision_run_id
+            or candidate.decision_agent_name == "post-entry-monitor-repair"
+            or _plan_item_exchange(candidate) != exchange
+            or classify_kis_account_route(
+                settings=settings,
+                provider=candidate.provider,
+                risk_context=_loaded_risk_context(
+                    candidate,
+                    allow_file_backed_load=True,
+                ),
+                quantity_policy=candidate.quantity_policy,
+            )
+            != "active"
+        ):
+            continue
+        candidates.append(candidate)
+
+    lineage_keys = {
+        (
+            candidate.decision_agent_name,
+            candidate.decision_snapshot_id,
+            candidate.decision_run_id,
+            candidate.source_market_date,
+        )
+        for candidate in candidates
+    }
+    if len(lineage_keys) != 1:
+        return {
+            "status": "unavailable",
+            "reason": (
+                "ambiguous_current_plan_decision_lineage"
+                if lineage_keys
+                else "current_plan_decision_lineage_unavailable"
+            ),
+        }
+
+    selected = min(
+        candidates,
+        key=lambda candidate: (
+            candidate.plan_item_index,
+            candidate.id,
+        ),
+    )
+    return {
+        "status": "inherited",
+        "source_execution_plan_item_id": selected.id,
+        "source_plan_item_id": selected.source_plan_item_id,
+        "decision_agent_name": selected.decision_agent_name,
+        "decision_snapshot_id": selected.decision_snapshot_id,
+        "decision_run_id": selected.decision_run_id,
+        "source_market_date": _serialize_date(selected.source_market_date),
+    }
+
+
 def _new_existing_position_exit_monitor(
     *,
     settings: Settings,
@@ -10003,12 +10231,19 @@ def _new_existing_position_exit_monitor(
     asset_class: str,
     triggered_at: datetime,
 ) -> ExecutionPlanItem:
+    decision_lineage = _existing_position_repair_decision_lineage(
+        settings=settings,
+        plan=plan,
+        symbol=position.symbol,
+        exchange=exchange,
+    )
     risk_context, quantity_policy = bind_kis_account_route(
         settings=settings,
         provider="kis",
         risk_context={
             "exchange": exchange,
             "post_entry_managed": True,
+            "repair_decision_lineage": decision_lineage,
             "entry_context": {
                 "entry_price": _serialize_decimal(position.average_price),
                 "entry_quantity": position.quantity,
@@ -10032,11 +10267,33 @@ def _new_existing_position_exit_monitor(
         trigger_price=trigger_price,
         time_in_force="day",
         risk_context=risk_context,
-        decision_agent_name="post-entry-monitor-repair",
+        decision_agent_name=(
+            str(decision_lineage["decision_agent_name"])
+            if decision_lineage.get("status") == "inherited"
+            and decision_lineage.get("decision_agent_name") is not None
+            else "post-entry-monitor-repair"
+        ),
+        decision_snapshot_id=(
+            str(decision_lineage["decision_snapshot_id"])
+            if decision_lineage.get("status") == "inherited"
+            else None
+        ),
+        decision_run_id=(
+            str(decision_lineage["decision_run_id"])
+            if decision_lineage.get("status") == "inherited"
+            else None
+        ),
         source_plan_item_id=f"existing-position-{position.symbol}-{intent}",
-        source_market_date=triggered_at.astimezone(
-            ZoneInfo("America/New_York") if asset_class == "us_equity" else KRX_TIMEZONE
-        ).date(),
+        source_market_date=(
+            date.fromisoformat(str(decision_lineage["source_market_date"]))
+            if decision_lineage.get("status") == "inherited"
+            and decision_lineage.get("source_market_date") is not None
+            else triggered_at.astimezone(
+                ZoneInfo("America/New_York")
+                if asset_class == "us_equity"
+                else KRX_TIMEZONE
+            ).date()
+        ),
         provider="kis",
         venue=venue,
         asset_class=asset_class,
@@ -10047,6 +10304,10 @@ def _new_existing_position_exit_monitor(
             "event": "existing_position_exit_monitor_created",
             "reason": source,
             "trigger_price": _serialize_decimal(trigger_price),
+            "decision_lineage_status": decision_lineage["status"],
+            "lineage_source_execution_plan_item_id": decision_lineage.get(
+                "source_execution_plan_item_id"
+            ),
             "recorded_at": triggered_at.isoformat(),
         },
     )
@@ -15078,6 +15339,17 @@ def _monitoring_order_metadata(
         for key in ("nxt_eligible", "route_now"):
             if key in risk_context:
                 metadata[key] = risk_context[key]
+        protective_stop_reauthorization = risk_context.get(
+            "protective_stop_reauthorization"
+        )
+        if (
+            item.intent == "stop_sell"
+            and isinstance(protective_stop_reauthorization, dict)
+            and protective_stop_reauthorization.get("status") == "approved"
+        ):
+            metadata["protective_stop_reauthorization"] = dict(
+                protective_stop_reauthorization
+            )
     if trigger_metadata is not None:
         metadata["trigger"] = trigger_metadata
     return metadata

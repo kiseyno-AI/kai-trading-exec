@@ -69,6 +69,7 @@ KIS_OVERSEAS_ORDER_PATH = "/uapi/overseas-stock/v1/trading/order"
 KIS_OVERSEAS_MINUTE_PRICE_PATH = (
     "/uapi/overseas-price/v1/quotations/inquire-time-itemchartprice"
 )
+KIS_OVERSEAS_LAST_PRICE_PATH = "/uapi/overseas-price/v1/quotations/price"
 KIS_OVERSEAS_ASKING_PRICE_PATH = (
     "/uapi/overseas-price/v1/quotations/inquire-asking-price"
 )
@@ -85,6 +86,7 @@ KIS_ASKING_PRICE_TR_ID = "FHKST01010200"
 KIS_INTRADAY_MINUTE_PRICE_TR_ID = "FHKST03010200"
 KIS_HOLIDAY_CALENDAR_TR_ID = "CTCA0903R"
 KIS_OVERSEAS_MINUTE_PRICE_TR_ID = "HHDFS76950200"
+KIS_OVERSEAS_LAST_PRICE_TR_ID = "HHDFS00000300"
 KIS_OVERSEAS_ASKING_PRICE_TR_ID = "HHDFS76200100"
 KIS_OVERSEAS_QUOTE_EMPTY_CODE = "KIS_OVERSEAS_QUOTE_EMPTY"
 KIS_TIMEZONE = timezone(timedelta(hours=9))
@@ -876,6 +878,13 @@ class KisBrokerAdapter(BrokerAdapter):
         raw_output_rows = response.payload.get("output2")
         output_rows = _payload_rows(raw_output_rows)
         if raw_output_rows == []:
+            fallback_quote = self._get_us_equity_last_price(
+                access_token,
+                symbol=symbol,
+                exchange=exchange,
+            )
+            if fallback_quote is not None:
+                return fallback_quote
             raise BrokerAdapterError(
                 "KIS overseas minute price response contains no output2 rows",
                 status_code=502,
@@ -904,6 +913,76 @@ class KisBrokerAdapter(BrokerAdapter):
                 freshness_source="kis_overseas_exchange_bar_time",
             )
         return None
+
+    def _get_us_equity_last_price(
+        self,
+        access_token: str,
+        *,
+        symbol: str,
+        exchange: str,
+    ) -> BrokerCurrentPrice | None:
+        """Read the official current-price endpoint after a valid empty minute response.
+
+        The endpoint has no authoritative exchange timestamp, so its value is only
+        a reference price. Monitoring still requires the separately fetched,
+        timestamped order book before a live order can become executable.
+        """
+        config = self._configured()
+        quote_exchange = _overseas_quote_exchange(exchange)
+        response = self.http_client.get_json(
+            url=f"{config.api_base_url}{KIS_OVERSEAS_LAST_PRICE_PATH}",
+            headers=self.build_headers(
+                access_token,
+                transaction_id=KIS_OVERSEAS_LAST_PRICE_TR_ID,
+            ),
+            params={"AUTH": "", "EXCD": quote_exchange, "SYMB": symbol},
+            timeout_seconds=self.settings.kis_request_timeout_seconds,
+        )
+        _raise_if_business_error(response.payload)
+        rows = _payload_rows(response.payload.get("output"))
+        if len(rows) != 1:
+            return None
+        output = rows[0]
+        expected_symbol = symbol.strip().upper()
+        expected_rsym = f"D{quote_exchange}{expected_symbol}"
+        response_symbol = _optional_string(
+            output.get("symb")
+            or output.get("SYMB")
+            or output.get("code")
+            or output.get("CODE")
+        )
+        response_rsym = _optional_string(output.get("rsym") or output.get("RSYM"))
+        if (response_symbol is None and response_rsym is None) or (
+            response_symbol is not None
+            and response_symbol.strip().upper() != expected_symbol
+        ) or (
+            response_rsym is not None
+            and response_rsym.strip().upper() != expected_rsym
+        ):
+            return None
+        price = _first_decimal(output, "last")
+        if price is None or price <= 0:
+            return None
+        received_at = datetime.now(UTC)
+        payload = dict(response.payload)
+        payload.update(
+            {
+                "provider": self.provider,
+                "endpoint": KIS_OVERSEAS_LAST_PRICE_PATH,
+                "tr_id": KIS_OVERSEAS_LAST_PRICE_TR_ID,
+                "requested_exchange": exchange,
+                "quote_exchange": quote_exchange,
+                "fallback_reason": "overseas_minute_rows_empty",
+            }
+        )
+        return BrokerCurrentPrice(
+            symbol=expected_symbol,
+            exchange=exchange,
+            price=price,
+            observed_at=received_at,
+            payload=payload,
+            freshness_source="transport_received_at_untrusted",
+        )
 
     def get_live_market_context(
         self,

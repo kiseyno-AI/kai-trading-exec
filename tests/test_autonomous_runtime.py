@@ -11,7 +11,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.services import autonomous_runtime, monitoring as monitoring_service
+from app.services import (
+    autonomous_runtime,
+    monitoring as monitoring_service,
+    runtime as runtime_service,
+)
 from app.api.schemas.execution import MonitoringPriceRequest
 from app.core.config import Settings
 from app.db.base import Base
@@ -469,6 +473,85 @@ def test_session_active_monitoring_symbols_excludes_us_equities_after_close() ->
     assert inactive == ["APTX", "ASPU"]
 
 
+def test_session_active_monitoring_symbols_excludes_krx_during_us_session() -> None:
+    now = datetime(2026, 10, 7, 19, 0, tzinfo=UTC)  # 15:00 America/New_York
+    snapshot = MonitoringRuntimeSnapshot(
+        loaded_at=now,
+        symbols=["005930", "AAPL"],
+        positions_by_symbol={
+            "005930": CachedMonitoringPosition(
+                symbol="005930", quantity=1, exchange="KRX"
+            ),
+            "AAPL": CachedMonitoringPosition(
+                symbol="AAPL", quantity=1, exchange="NASD"
+            ),
+        },
+        items=[],
+        filled_today_symbols=[],
+    )
+
+    active, inactive = _session_active_monitoring_symbols(
+        snapshot,
+        now=now,
+        settings=Settings(database_url="sqlite:///:memory:", runtime_mode="paper"),
+    )
+
+    assert active == ["AAPL"]
+    assert inactive == ["005930"]
+
+
+def test_session_active_monitoring_symbols_keeps_markets_independent_when_both_closed() -> None:
+    now = datetime(2026, 10, 7, 12, 0, tzinfo=UTC)  # 21:00 Asia/Seoul, 08:00 New York
+    snapshot = MonitoringRuntimeSnapshot(
+        loaded_at=now,
+        symbols=["005930", "AAPL"],
+        positions_by_symbol={
+            "005930": CachedMonitoringPosition(
+                symbol="005930", quantity=1, exchange="KRX"
+            ),
+            "AAPL": CachedMonitoringPosition(
+                symbol="AAPL", quantity=1, exchange="NASD"
+            ),
+        },
+        items=[],
+        filled_today_symbols=[],
+    )
+
+    active, inactive = _session_active_monitoring_symbols(
+        snapshot,
+        now=now,
+        settings=Settings(database_url="sqlite:///:memory:", runtime_mode="paper"),
+    )
+
+    assert active == []
+    assert inactive == ["005930", "AAPL"]
+
+
+def test_closed_overseas_market_failure_does_not_block_domestic_readiness() -> None:
+    autonomous = {
+        "enabled": True,
+        "monitoring": {
+            "last_cycle": {
+                "idle": True,
+                "monitored_symbols": [],
+                "session_inactive_symbols": ["APTX", "ASPU"],
+            },
+            "price_source": {
+                "configured": True,
+                "status": "degraded",
+                "reason": "monitoring price source request failed",
+                "last_symbol_count": 2,
+                "last_price_count": 0,
+            },
+        },
+    }
+
+    assert runtime_service._monitoring_price_source_readiness_reasons(
+        autonomous=autonomous,
+        symbols={"monitored": ["APTX", "ASPU"]},
+    ) == []
+
+
 def test_monitoring_cycle_does_not_request_us_quotes_outside_regular_session(
     monkeypatch,
 ) -> None:
@@ -501,7 +584,10 @@ def test_monitoring_cycle_does_not_request_us_quotes_outside_regular_session(
     assert quote_calls == []
     assert payload["idle"] is True
     assert payload["monitored_symbols"] == []
+    assert payload["session_active_symbols"] == []
     assert payload["session_inactive_symbols"] == ["APTX"]
+    assert payload["market_sessions"]["domestic"]["active"] is True
+    assert payload["market_sessions"]["overseas"]["active"] is False
 
 
 def test_monitoring_cycle_reconciles_closed_session_us_symbols_without_quote_polling(
@@ -557,7 +643,7 @@ def test_monitoring_cycle_reconciles_closed_session_us_symbols_without_quote_pol
     assert payload["monitored_symbols"] == ["005930"]
 
 
-def test_session_active_monitoring_symbols_keeps_us_equities_during_regular_session() -> None:
+def test_session_active_monitoring_symbols_keeps_only_us_equities_during_us_session() -> None:
     now = datetime(2026, 10, 6, 15, 0, tzinfo=UTC)  # 11:00 America/New_York
     snapshot = MonitoringRuntimeSnapshot(
         loaded_at=now,
@@ -576,8 +662,8 @@ def test_session_active_monitoring_symbols_keeps_us_equities_during_regular_sess
 
     active, inactive = _session_active_monitoring_symbols(snapshot, now=now)
 
-    assert active == ["027710", "APTX"]
-    assert inactive == []
+    assert active == ["APTX"]
+    assert inactive == ["027710"]
 
 
 @pytest.mark.parametrize(

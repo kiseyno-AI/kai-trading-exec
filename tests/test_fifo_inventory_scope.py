@@ -18,6 +18,7 @@ from app.services.fifo_inventory import (
     ambiguous_fifo_chronology_fill_count,
     fifo_chronology_ambiguity_reason_at,
     fifo_route_scope_from_order,
+    legacy_kis_krx_event_is_isolated,
     load_fifo_isolation_cursor,
     replay_open_long_fill_inventory,
 )
@@ -25,6 +26,52 @@ from app.services.position_identity import PositionIdentity, execution_scope_pay
 
 
 OBSERVED_AT = datetime(2026, 9, 9, 14, 0, tzinfo=UTC)
+
+
+def test_legacy_krx_isolation_rejects_explicit_or_mismatched_identity() -> None:
+    route = FifoRouteScope(
+        provider="kis",
+        account_scope="a" * 24,
+        venue="KRX",
+        asset_class="stock",
+        exchange="KRX",
+    )
+    cursor = FifoIsolationCursor(
+        isolated_at_by_route_symbol={
+            (route, "027710"): [OBSERVED_AT],
+        }
+    )
+
+    def isolated(
+        metadata: dict[str, object] | None,
+        *,
+        symbol: str = "027710",
+        venue: str | None = "KRX",
+        asset_class: str | None = "stock",
+    ) -> bool:
+        order = SimpleNamespace(
+            broker_name="kis",
+            venue=venue,
+            asset_class=asset_class,
+            symbol="027710",
+            request_metadata=metadata,
+        )
+        return legacy_kis_krx_event_is_isolated(
+            order=order,
+            event_symbol=symbol,
+            event_at=OBSERVED_AT - timedelta(seconds=1),
+            through=OBSERVED_AT,
+            isolation_cursor=cursor,
+            exact_route_scope=route,
+        )
+
+    assert isolated(None) is True
+    assert isolated({"execution_scope": {"policy_version": "wrong", "provider": "alpaca"}}) is False
+    assert isolated({"broker_account_scope": {"policy_version": 99}}) is False
+    assert isolated({"exchange": "NASD"}) is False
+    assert isolated(None, symbol="005930") is False
+    assert isolated(None, venue=None) is False
+    assert isolated(None, asset_class=None) is False
 
 
 def _scoped_order(*, symbol: str = "AAPL") -> SimpleNamespace:

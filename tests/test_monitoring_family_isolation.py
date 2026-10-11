@@ -717,6 +717,102 @@ def test_retry_reactivation_preserves_family_and_policy_route_authority() -> Non
     engine.dispose()
 
 
+def test_protective_stop_reauthorization_records_current_position_evidence() -> None:
+    settings = _settings()
+    item = _sell_item(
+        settings,
+        item_id="aged-repair-stop",
+        family_key=None,
+        accepted_at=datetime(2026, 9, 1, 12, tzinfo=UTC),
+    )
+    item.decision_agent_name = "post-entry-monitor-repair"
+    item.decision_snapshot_id = None
+    item.decision_run_id = None
+    position = _position(settings)
+    position.last_reconciled_at = datetime(2026, 9, 10, 12, tzinfo=UTC)
+    evaluated_at = datetime(2026, 9, 10, 12, 1, tzinfo=UTC)
+
+    approved, reason = monitoring_service._authorize_protective_stop_submission(
+        settings=settings,
+        item=item,
+        position=position,
+        requested_quantity=7,
+        observed_price=Decimal("89"),
+        price_observed_at=datetime(2026, 9, 10, 12, 0, 58, tzinfo=UTC),
+        evaluated_at=evaluated_at,
+    )
+
+    assert approved is True
+    assert reason is None
+    assert item.status == "stop_sell_monitoring"
+    authorization = item.risk_context["protective_stop_reauthorization"]
+    assert authorization["status"] == "approved"
+    assert authorization["authorization_id"]
+    assert authorization["authorization_kind"] == "deterministic_emergency_stop"
+    assert authorization["strategy_decision_lineage_status"] == "unavailable"
+    assert authorization["position"] == {
+        "position_id": position.id,
+        "quantity": 20,
+        "last_reconciled_at": "2026-09-10T12:00:00+00:00",
+        "updated_from": "test",
+    }
+    assert authorization["request"] == {
+        "quantity": 7,
+        "observed_price": "89.0000",
+        "price_observed_at": "2026-09-10T12:00:58+00:00",
+        "fresh_broker_quote_revalidation_required": True,
+    }
+    order_metadata = monitoring_service._monitoring_order_metadata(
+        item=item,
+        observed_price=Decimal("89"),
+        trigger_reason="stop_sell",
+        trigger_metadata=None,
+        triggered_at=evaluated_at,
+        deterministic_sell_quantity_cap=7,
+    )
+    assert order_metadata["protective_stop_reauthorization"] == authorization
+
+
+def test_protective_stop_reauthorization_quarantines_stale_position_truth() -> None:
+    settings = _settings().model_copy(update={"runtime_mode": "live"})
+    item = _sell_item(
+        settings,
+        item_id="stale-position-repair-stop",
+        family_key=None,
+        accepted_at=datetime(2026, 9, 1, 12, tzinfo=UTC),
+    )
+    position = _position(settings)
+    position.last_reconciled_at = datetime(2026, 9, 10, 11, tzinfo=UTC)
+
+    approved, reason = monitoring_service._authorize_protective_stop_submission(
+        settings=settings,
+        item=item,
+        position=position,
+        requested_quantity=7,
+        observed_price=Decimal("89"),
+        price_observed_at=datetime(2026, 9, 10, 12, 0, 58, tzinfo=UTC),
+        evaluated_at=datetime(2026, 9, 10, 12, 1, tzinfo=UTC),
+    )
+
+    assert approved is False
+    assert reason == "protective_stop_position_observation_stale"
+    assert item.status == "manual_review_required"
+    assert item.risk_context["protective_stop_reauthorization"]["status"] == (
+        "manual_review_required"
+    )
+    assert item.risk_context["last_monitoring_event"] == {
+        "event": "protective_stop_reauthorization_manual_review",
+        "authorization_id": item.risk_context[
+            "protective_stop_reauthorization"
+        ]["authorization_id"],
+        "reason": "protective_stop_position_observation_stale",
+        "position_quantity": 20,
+        "requested_quantity": 7,
+        "strategy_decision_lineage_status": "unavailable",
+        "recorded_at": "2026-09-10T12:01:00+00:00",
+    }
+
+
 def test_local_retry_is_not_live_coverage_and_cloned_repair_preserves_identity() -> None:
     settings = _settings()
     engine, _factory, db = _session(settings)

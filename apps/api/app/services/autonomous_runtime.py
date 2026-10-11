@@ -19,6 +19,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.api.schemas.execution import MonitoringPriceRequest
 from app.broker.base import BrokerAdapter
+from app.broker.kis import KIS_OVERSEAS_QUOTE_EMPTY_CODE
 from app.core.config import Settings
 from app.models.runtime import BrokerOrder
 from app.models.runtime import ExecutionPlan, ExecutionPlanItem, ExecutionPosition
@@ -1072,6 +1073,8 @@ class AutonomousRuntimeCoordinator:
         quote_symbols, session_inactive_symbols = _session_active_monitoring_symbols(
             workset_snapshot,
             now=started_at,
+            settings=self.settings,
+            domestic_trading_days=self._krx_trading_days_snapshot(),
         )
         position_symbols = set(workset_snapshot.positions_by_symbol) & set(quote_symbols)
         symbols, self._monitoring_symbol_cursor = _select_monitoring_symbol_batch(
@@ -1089,6 +1092,8 @@ class AutonomousRuntimeCoordinator:
             quote_symbols, session_inactive_symbols = _session_active_monitoring_symbols(
                 workset_snapshot,
                 now=started_at,
+                settings=self.settings,
+                domestic_trading_days=self._krx_trading_days_snapshot(),
             )
             position_symbols = set(workset_snapshot.positions_by_symbol) & set(quote_symbols)
             symbols, self._monitoring_symbol_cursor = _select_monitoring_symbol_batch(
@@ -1108,7 +1113,13 @@ class AutonomousRuntimeCoordinator:
                 "price_source_configured": self._monitoring_price_source_state.configured,
                 "price_source": self._monitoring_price_source_state.snapshot(),
                 "runtime_snapshot": workset_snapshot.snapshot(),
+                "session_active_symbols": quote_symbols,
                 "session_inactive_symbols": session_inactive_symbols,
+                "market_sessions": _monitoring_market_sessions(
+                    settings=self.settings,
+                    now=started_at,
+                    domestic_trading_days=self._krx_trading_days_snapshot(),
+                ),
                 "idle": True,
             }
             self._store_cycle_payload(worker_key="monitoring", payload=payload)
@@ -1157,6 +1168,8 @@ class AutonomousRuntimeCoordinator:
                     _session_active_monitoring_symbols(
                         workset_snapshot,
                         now=started_at,
+                        settings=self.settings,
+                        domestic_trading_days=self._krx_trading_days_snapshot(),
                     )
                 )
                 if not symbols and desired_symbols:
@@ -2812,9 +2825,18 @@ def _first_quote_failure_error(diagnostics: dict[str, object]) -> str | None:
     for failure in failures:
         if not isinstance(failure, dict):
             continue
+        if failure.get("code") == KIS_OVERSEAS_QUOTE_EMPTY_CODE:
+            # A successful KIS response with no price rows means this symbol is
+            # currently unquoteable. It must stay fail-closed, but it is not a
+            # transport/source outage and should not poison global readiness as
+            # one.
+            continue
         error = failure.get("error")
         if isinstance(error, str) and error.strip():
             return error
+    source_failure_count = diagnostics.get("quote_source_failure_count")
+    if isinstance(source_failure_count, int) and source_failure_count > 0:
+        return "monitoring quote source request failures were truncated"
     return None
 
 
@@ -3170,12 +3192,17 @@ def _session_active_monitoring_symbols(
     snapshot: MonitoringRuntimeSnapshot,
     *,
     now: datetime,
+    settings: Settings | None = None,
+    domestic_trading_days: dict[date, bool] | None = None,
 ) -> tuple[list[str], list[str]]:
-    """Exclude US equities from quote polling outside the US regular session."""
-    observed_at = now if now.tzinfo is not None else now.replace(tzinfo=UTC)
-    if is_us_regular_session(observed_at.astimezone(US_EASTERN_TIMEZONE)):
-        return list(snapshot.symbols), []
+    """Partition mixed domestic/overseas worksets by market session.
 
+    Domestic and overseas quote failures must never be coupled by polling one
+    market's symbols during the other market's session. Domestic-only worksets
+    retain their existing coordinator cadence; overseas symbols are always
+    restricted to the US regular session.
+    """
+    observed_at = now if now.tzinfo is not None else now.replace(tzinfo=UTC)
     exchanges_by_symbol = {
         symbol: str(position.exchange or "").strip().upper()
         for symbol, position in snapshot.positions_by_symbol.items()
@@ -3185,14 +3212,70 @@ def _session_active_monitoring_symbols(
         if item.exchange and item.symbol not in exchanges_by_symbol:
             exchanges_by_symbol[item.symbol] = str(item.exchange).strip().upper()
 
+    market_sessions = _monitoring_market_sessions(
+        settings=settings,
+        now=observed_at,
+        domestic_trading_days=domestic_trading_days,
+    )
+    has_overseas_symbols = any(
+        exchanges_by_symbol.get(symbol) in US_EQUITY_EXCHANGES
+        for symbol in snapshot.symbols
+    )
+
     active: list[str] = []
     inactive: list[str] = []
     for symbol in snapshot.symbols:
-        if exchanges_by_symbol.get(symbol) in US_EQUITY_EXCHANGES:
+        exchange = exchanges_by_symbol.get(symbol)
+        is_us_equity = exchange in US_EQUITY_EXCHANGES
+        is_domestic_equity = exchange in KRX_EXCHANGES or (
+            exchange is None and _is_krx_symbol(symbol)
+        )
+        if is_us_equity and not market_sessions["overseas"]["active"]:
+            inactive.append(symbol)
+        elif (
+            is_domestic_equity
+            and has_overseas_symbols
+            and not market_sessions["domestic"]["active"]
+        ):
             inactive.append(symbol)
         else:
             active.append(symbol)
     return active, inactive
+
+
+def _monitoring_market_sessions(
+    *,
+    settings: Settings | None,
+    now: datetime,
+    domestic_trading_days: dict[date, bool] | None = None,
+) -> dict[str, dict[str, object]]:
+    observed_at = now if now.tzinfo is not None else now.replace(tzinfo=UTC)
+    local_now = observed_at.astimezone(KRX_TIMEZONE)
+    if settings is None:
+        domestic_active = bool(
+            local_now.weekday() < 5
+            and time(9, 0) <= local_now.time() <= time(15, 30)
+        )
+    else:
+        domestic_active = _is_enabled_domestic_session(
+            settings=settings,
+            local_now=local_now,
+            holidays=configured_krx_market_holidays(settings.krx_market_holiday_dates),
+            trading_days=domestic_trading_days or {},
+        )
+    overseas_active = is_us_regular_session(
+        observed_at.astimezone(US_EASTERN_TIMEZONE)
+    )
+    return {
+        "domestic": {
+            "active": domestic_active,
+            "timezone": "Asia/Seoul",
+        },
+        "overseas": {
+            "active": overseas_active,
+            "timezone": "America/New_York",
+        },
+    }
 
 
 def _is_krx_symbol(symbol: str) -> bool:

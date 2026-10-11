@@ -27,9 +27,11 @@ from app.broker.kis import (
     KIS_OVERSEAS_BUYING_POWER_PATH,
     KIS_OVERSEAS_CCLD_PATH,
     KIS_OVERSEAS_CURRENT_PRICE_PATH,
+    KIS_OVERSEAS_LAST_PRICE_PATH,
     KIS_OVERSEAS_OPEN_ORDERS_PATH,
     KIS_OVERSEAS_ORDER_PATH,
     KIS_OVERSEAS_QUOTE_EMPTY_CODE,
+    KIS_PAPER_API_BASE_URL,
     KIS_US_EXCHANGES,
     JsonHttpResponse,
     KisBrokerAdapter,
@@ -224,7 +226,10 @@ def test_kis_us_equity_quote_maps_order_exchange_to_quote_exchange() -> None:
 
 def test_kis_us_equity_empty_minute_response_has_durable_quote_code() -> None:
     http = QueueHttpClient(
-        get_payloads=[{"rt_cd": "0", "output2": []}],
+        get_payloads=[
+            {"rt_cd": "0", "output2": []},
+            {"rt_cd": "0", "output": {"last": "0"}},
+        ],
     )
     adapter = KisBrokerAdapter(settings=_settings(), http_client=http)
 
@@ -234,6 +239,70 @@ def test_kis_us_equity_empty_minute_response_has_durable_quote_code() -> None:
     assert exc_info.value.code == KIS_OVERSEAS_QUOTE_EMPTY_CODE
     assert exc_info.value.retryable is False
     assert exc_info.value.observed_at is not None
+
+
+def test_kis_us_equity_empty_minute_response_uses_official_last_price_fallback() -> None:
+    http = QueueHttpClient(
+        get_payloads=[
+            {"rt_cd": "0", "output2": []},
+            {
+                "rt_cd": "0",
+                "output": {
+                    "rsym": "DNASAPTX",
+                    "last": "0.061",
+                },
+            },
+        ],
+    )
+    adapter = KisBrokerAdapter(settings=_settings(), http_client=http)
+
+    quote = adapter.get_current_price("token", symbol="APTX", exchange="NASD")
+
+    assert quote is not None
+    assert quote.price == Decimal("0.061")
+    assert quote.freshness_source == "transport_received_at_untrusted"
+    assert quote.payload["fallback_reason"] == "overseas_minute_rows_empty"
+    assert [call["url"] for call in http.get_calls] == [
+        f"{KIS_PAPER_API_BASE_URL}{KIS_OVERSEAS_CURRENT_PRICE_PATH}",
+        f"{KIS_PAPER_API_BASE_URL}{KIS_OVERSEAS_LAST_PRICE_PATH}",
+    ]
+    assert http.get_calls[1]["headers"]["tr_id"] == "HHDFS00000300"
+
+
+def test_kis_us_equity_last_price_fallback_rejects_conflicting_identity() -> None:
+    http = QueueHttpClient(
+        get_payloads=[
+            {"rt_cd": "0", "output2": []},
+            {
+                "rt_cd": "0",
+                "output": {
+                    "rsym": "DNASMSFT",
+                    "last": "0.061",
+                },
+            },
+        ],
+    )
+    adapter = KisBrokerAdapter(settings=_settings(), http_client=http)
+
+    with pytest.raises(BrokerAdapterError) as exc_info:
+        adapter.get_current_price("token", symbol="APTX", exchange="NASD")
+
+    assert exc_info.value.code == KIS_OVERSEAS_QUOTE_EMPTY_CODE
+
+
+def test_kis_us_equity_last_price_fallback_requires_response_identity() -> None:
+    http = QueueHttpClient(
+        get_payloads=[
+            {"rt_cd": "0", "output2": []},
+            {"rt_cd": "0", "output": {"last": "0.061"}},
+        ],
+    )
+    adapter = KisBrokerAdapter(settings=_settings(), http_client=http)
+
+    with pytest.raises(BrokerAdapterError) as exc_info:
+        adapter.get_current_price("token", symbol="APTX", exchange="NASD")
+
+    assert exc_info.value.code == KIS_OVERSEAS_QUOTE_EMPTY_CODE
 
 
 def test_kis_us_equity_missing_minute_payload_is_not_durable_quote_evidence() -> None:

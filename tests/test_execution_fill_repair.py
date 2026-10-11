@@ -2155,6 +2155,115 @@ def test_fifo_isolation_repair_fails_closed_for_legacy_unscoped_evidence() -> No
     engine.dispose()
 
 
+def test_fifo_repair_starts_exact_krx_generation_after_legacy_flat_rebind() -> None:
+    settings = _settings()
+    engine, db = _session(settings)
+    fill_at = datetime(2026, 8, 20, 1, 0, tzinfo=UTC)
+    flat_at = fill_at + timedelta(hours=1)
+    order = BrokerOrder(
+        broker_name="kis",
+        mode="paper",
+        idempotency_key="legacy-unscoped-before-exact-flat",
+        symbol="009997",
+        side="buy",
+        status="filled",
+        quantity=1,
+        submitted_at=fill_at,
+        venue="KRX",
+        asset_class="stock",
+    )
+    identity = build_position_identity(
+        settings=settings,
+        provider="kis",
+        exchange="KRX",
+    )
+    db.add_all(
+        [
+            order,
+            ExecutionPosition(
+                mode="paper",
+                provider=identity.provider,
+                account_scope=identity.account_scope,
+                exchange=identity.exchange,
+                symbol="009997",
+                quantity=0,
+                base_quantity=Decimal("0"),
+                updated_from="reconciliation",
+                last_reconciled_at=flat_at,
+                raw_payload=payload_with_position_identity(None, identity=identity),
+            ),
+        ]
+    )
+    db.flush()
+    db.add(
+        ExecutionFill(
+            broker_order_pk=order.id,
+            symbol="009997",
+            side="buy",
+            quantity=1,
+            price=Decimal("100"),
+            filled_at=fill_at,
+        )
+    )
+    _add_fill(
+        db,
+        symbol="009997",
+        side="buy",
+        quantity=1,
+        price="101",
+        filled_at=fill_at + timedelta(minutes=1),
+        suffix="exact-scope-before-flat",
+        settings=settings,
+    )
+    db.commit()
+
+    dry_run = analyze_fifo_inventory_repairs(db=db, runtime_mode="paper")
+    applied = apply_fifo_inventory_repairs(
+        db=db,
+        runtime_mode="paper",
+        actor="test-operator",
+        reason="exact current KRX flat truth starts a clean generation",
+        now=flat_at,
+    )
+    repeated = apply_fifo_inventory_repairs(
+        db=db,
+        runtime_mode="paper",
+        actor="test-operator",
+        reason="exact current KRX flat truth starts a clean generation",
+        now=flat_at,
+    )
+    after = analyze_fifo_inventory_repairs(db=db, runtime_mode="paper")
+
+    assert dry_run["summary"]["eligible_isolation_count"] == 2
+    item = next(
+        row
+        for row in dry_run["broker_flat_fifo_residuals"]
+        if row["reason"] == "exact_krx_flat_resets_legacy_generation"
+    )
+    assert item["eligible"] is True
+    assert item["reason"] == "exact_krx_flat_resets_legacy_generation"
+    assert item["execution_scope"] == {
+        "provider": "kis",
+        "account_scope": identity.account_scope,
+        "venue": "KRX",
+        "asset_class": "stock",
+        "exchange": "KRX",
+    }
+    assert applied["summary"]["applied_isolation_count"] == 1
+    assert repeated["summary"]["applied_isolation_count"] == 0
+    assert after["summary"]["broker_flat_residual_count"] == 0
+    isolation = db.scalar(select(FifoInventoryIsolation))
+    assert isolation is not None
+    assert isolation.symbol == "009997"
+    assert isolation.account_scope == identity.account_scope
+    assert isolation.residual_quantity == Decimal("2")
+    assert isolation.audit_payload["coalesced_candidate_count"] == 2
+    assert len(isolation.audit_payload["coalesced_evidence"]) == 2
+    assert isolation.audit_payload["fills_deleted"] == 0
+    assert isolation.audit_payload["fills_fabricated"] == 0
+    engine.dispose()
+
+
 def test_fifo_repair_reports_duplicate_legacy_position_scope_as_ambiguous() -> None:
     settings = _settings()
     engine, db = _session(settings)

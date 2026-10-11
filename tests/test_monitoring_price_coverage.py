@@ -18,6 +18,7 @@ from app.services import monitoring_price_source as monitoring_price_source_modu
 from app.services.monitoring_price_source import KisCurrentQuoteMonitoringPriceSource
 from app.services.monitoring_price_source import _KisMonitoringRuntimeContext
 from app.services.monitoring_price_source import _derive_orderability_context
+from app.services.autonomous_runtime import _first_quote_failure_error
 from app.services.monitoring_price_source import monitoring_price_from_broker_quote
 from app.services.monitoring_price_source import next_us_regular_open
 from app.services.position_identity import build_position_identity
@@ -109,6 +110,54 @@ class LiveMarketContextAdapter(StubBrokerAdapter):
         if symbol_error is not None:
             raise symbol_error
         return self.live_contexts.get(symbol)
+
+
+def test_durable_unpriced_symbol_is_not_reported_as_price_source_outage() -> None:
+    diagnostics = {
+        "quote_failures": [
+            {
+                "symbol": "WWBLCM",
+                "code": KIS_OVERSEAS_QUOTE_EMPTY_CODE,
+                "error": "KIS overseas quote is unavailable",
+            }
+        ]
+    }
+
+    assert _first_quote_failure_error(diagnostics) is None
+
+
+def test_real_quote_request_failure_remains_price_source_outage() -> None:
+    diagnostics = {
+        "quote_failures": [
+            {
+                "symbol": "APTX",
+                "code": "EGW00201",
+                "error": "temporary rate limit",
+            }
+        ]
+    }
+
+    assert _first_quote_failure_error(diagnostics) == "temporary rate limit"
+
+
+def test_truncated_quote_failures_cannot_hide_source_outage() -> None:
+    diagnostics = {
+        "quote_failures": [
+            {
+                "symbol": "OLDCO",
+                "code": KIS_OVERSEAS_QUOTE_EMPTY_CODE,
+                "error": "KIS overseas quote is unavailable",
+            }
+        ],
+        "quote_failure_count": 2,
+        "quote_empty_failure_count": 1,
+        "quote_source_failure_count": 1,
+        "quote_failures_truncated": True,
+    }
+
+    assert _first_quote_failure_error(diagnostics) == (
+        "monitoring quote source request failures were truncated"
+    )
 
 
 def test_us_orderability_uses_new_york_regular_session_while_krx_is_closed() -> None:

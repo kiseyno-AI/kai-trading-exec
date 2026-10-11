@@ -21,6 +21,7 @@ from app.models.runtime import (
     BrokerOrderEvent,
     ExecutionFailure,
     ExecutionFill,
+    ExecutionJob,
     ExecutionPlan,
     ExecutionPlanItem,
     ExecutionPosition,
@@ -40,6 +41,7 @@ from app.services.fifo_inventory import (
     fifo_chronology_is_ambiguous_at,
     fifo_fill_sort_key,
     fifo_route_scope_from_order,
+    legacy_kis_krx_event_is_isolated,
     load_fifo_isolation_cursor,
 )
 from app.services.fill_idempotency import dedupe_execution_fills
@@ -47,27 +49,70 @@ from app.services.fill_economics import closed_trade_economics
 from app.services.runtime_transitions import WATCH_SIZING_PENDING_STATUS
 from app.services.max_holding_actionability import max_holding_actionability_summary
 from app.services.late_entry_actionability import late_entry_actionability_summary
+from app.services.position_identity import (
+    PositionIdentityConflictError,
+    build_position_identity,
+)
 
 
 class WeeklyTradeReviewTimeoutError(TimeoutError):
     """Raised when a bounded weekly export exceeds its configured deadline."""
 
 
-WATCH_REVIEW_STATUSES = (
+ACTIVE_WATCH_REVIEW_STATUSES = (
     WATCH_SIZING_PENDING_STATUS,
     "watch_monitoring_pending",
     "watch_monitoring_active",
     "watch_buy_triggered",
     "watch_buy_triggered_blocked",
     "watch_buy_triggered_pending_dispatch",
-    "watch_buy_submitted",
-    "watch_buy_rejected",
-    "watch_expired",
-    "watch_cancelled",
     "short_term_watcher_pending",
-    "short_term_watch_blocked",
     "new_buy_blocked",
 )
+ACTIVE_NEXT_OPEN_JOB_STATUSES = frozenset(
+    {"queued", "scheduled", "running", "retrying"}
+)
+ACTIVE_NEXT_OPEN_PLAN_ITEM_STATUSES = frozenset(
+    {
+        "new_buy_blocked",
+        "next_open_buy_scheduled",
+        "next_open_buy_retry_pending",
+        "next_open_buy_dispatching",
+    }
+)
+TERMINAL_AUDIT_PLAN_ITEM_STATUSES = frozenset(
+    {
+        "broker_order_rejected",
+        "exec_agent_rejected",
+        "expired",
+        "next_open_buy_expired",
+        "next_open_buy_failed",
+        "rejected",
+        "short_term_watch_blocked",
+        "watch_buy_submitted",
+        "watch_buy_rejected",
+        "watch_cancelled",
+        "watch_expired",
+    }
+)
+
+
+def _weekly_exact_krx_fifo_scope(settings: Settings) -> FifoRouteScope | None:
+    try:
+        identity = build_position_identity(
+            settings=settings,
+            provider="kis",
+            exchange="KRX",
+        )
+    except PositionIdentityConflictError:
+        return None
+    return FifoRouteScope(
+        provider=identity.provider,
+        account_scope=identity.account_scope,
+        venue="KRX",
+        asset_class="stock",
+        exchange=identity.exchange,
+    )
 
 
 def generate_weekly_trade_review(
@@ -179,6 +224,7 @@ def generate_weekly_trade_review(
     progress("weekly_execution_failures", row_count=len(failures), truncated=failures_truncated)
     closed_trades, closed_trades_truncated = _weekly_closed_trades(
         db=db,
+        settings=settings,
         mode=settings.runtime_mode,
         start_at=start_at,
         end_at=end_at,
@@ -192,6 +238,7 @@ def generate_weekly_trade_review(
     )
     stale_fifo_inventory_alerts, stale_fifo_inventory_alerts_truncated = _stale_fifo_inventory_alerts(
         db=db,
+        settings=settings,
         mode=settings.runtime_mode,
         end_at=end_at,
         max_rows=max_fills,
@@ -214,14 +261,16 @@ def generate_weekly_trade_review(
         start_at=start_at,
         end_at=end_at,
     )
-    monitoring_checkpoints = _monitoring_checkpoints(
+    monitoring_checkpoints, monitoring_checkpoint_summary = _monitoring_checkpoints(
         db=db,
         mode=settings.runtime_mode,
+        active_since=start_at,
         include_json_payloads=include_json_payloads,
     )
     protective_stop_actionability = _monitoring_protective_stop_actionability(
         db=db,
         mode=settings.runtime_mode,
+        active_since=start_at,
     )
     max_holding_actionability = max_holding_actionability_summary(
         settings=settings,
@@ -316,6 +365,7 @@ def generate_weekly_trade_review(
         "active_broker_order_summary": active_order_summary,
         "execution_plan_item_summary": plan_item_summary,
         "monitoring_checkpoints": monitoring_checkpoints,
+        "monitoring_checkpoint_summary": monitoring_checkpoint_summary,
         "protective_stop_actionability": protective_stop_actionability,
         "max_holding_actionability": max_holding_actionability,
         "late_entry_actionability": late_entry_actionability,
@@ -757,6 +807,26 @@ def _plan_item_review_summary(
     start_at: datetime,
     end_at: datetime,
 ) -> dict[str, object]:
+    active_next_open_counts = db.execute(
+        select(
+            ExecutionPlanItem.status,
+            ExecutionPlanItem.intent,
+            func.count(ExecutionPlanItem.id).label("count"),
+            func.min(ExecutionPlanItem.updated_at).label("oldest_updated_at"),
+            func.max(ExecutionPlanItem.updated_at).label("newest_updated_at"),
+        )
+        .select_from(ExecutionJob)
+        .join(ExecutionJob.plan_item)
+        .join(ExecutionPlanItem.plan)
+        .where(
+            ExecutionPlan.mode == mode,
+            ExecutionJob.job_type == "next_open_buy",
+            ExecutionJob.status.in_(ACTIVE_NEXT_OPEN_JOB_STATUSES),
+            ExecutionPlanItem.status.in_(ACTIVE_NEXT_OPEN_PLAN_ITEM_STATUSES),
+        )
+        .group_by(ExecutionPlanItem.status, ExecutionPlanItem.intent)
+        .order_by(ExecutionPlanItem.status.asc(), ExecutionPlanItem.intent.asc())
+    ).all()
     active_watch_counts = db.execute(
         select(
             ExecutionPlanItem.status,
@@ -768,7 +838,7 @@ def _plan_item_review_summary(
         .join(ExecutionPlan, ExecutionPlanItem.execution_plan_id == ExecutionPlan.id)
         .where(
             ExecutionPlan.mode == mode,
-            ExecutionPlanItem.status.in_(WATCH_REVIEW_STATUSES),
+            ExecutionPlanItem.status.in_(ACTIVE_WATCH_REVIEW_STATUSES),
         )
         .group_by(ExecutionPlanItem.status, ExecutionPlanItem.intent)
         .order_by(ExecutionPlanItem.status.asc(), ExecutionPlanItem.intent.asc())
@@ -803,10 +873,29 @@ def _plan_item_review_summary(
         .group_by(ExecutionPlanItem.status, ExecutionPlanItem.intent)
         .order_by(ExecutionPlanItem.status.asc(), ExecutionPlanItem.intent.asc())
     ).all()
+    terminal_audit_counts = db.execute(
+        select(
+            ExecutionPlanItem.status,
+            ExecutionPlanItem.intent,
+            func.count(ExecutionPlanItem.id).label("count"),
+            func.min(ExecutionPlanItem.updated_at).label("oldest_updated_at"),
+            func.max(ExecutionPlanItem.updated_at).label("newest_updated_at"),
+        )
+        .join(ExecutionPlan, ExecutionPlanItem.execution_plan_id == ExecutionPlan.id)
+        .where(
+            ExecutionPlan.mode == mode,
+            ExecutionPlanItem.status.in_(TERMINAL_AUDIT_PLAN_ITEM_STATUSES),
+        )
+        .group_by(ExecutionPlanItem.status, ExecutionPlanItem.intent)
+        .order_by(ExecutionPlanItem.status.asc(), ExecutionPlanItem.intent.asc())
+    ).all()
     return {
+        "active_next_open_status_counts": _rows_to_dicts(active_next_open_counts),
         "active_watch_status_counts": _rows_to_dicts(active_watch_counts),
+        "terminal_audit_status_counts": _rows_to_dicts(terminal_audit_counts),
         "weekly_created_status_counts": _rows_to_dicts(created_counts),
         "weekly_updated_status_counts": _rows_to_dicts(updated_counts),
+        "weekly_status_count_semantics": "historical_audit_activity_not_active_work",
     }
 
 
@@ -814,12 +903,15 @@ def _monitoring_checkpoints(
     *,
     db: Session,
     mode: str,
+    active_since: datetime,
     include_json_payloads: bool,
-) -> list[dict[str, object]]:
+) -> tuple[list[dict[str, object]], dict[str, object]]:
     columns = [
         MonitoringCheckpoint.id,
         MonitoringCheckpoint.worker_name,
         MonitoringCheckpoint.mode,
+        MonitoringCheckpoint.provider,
+        MonitoringCheckpoint.account_scope,
         MonitoringCheckpoint.status,
         MonitoringCheckpoint.last_heartbeat_at,
         MonitoringCheckpoint.last_success_at,
@@ -828,17 +920,56 @@ def _monitoring_checkpoints(
     ]
     if include_json_payloads:
         columns.append(MonitoringCheckpoint.details)
+    activity_at = func.coalesce(
+        MonitoringCheckpoint.last_heartbeat_at,
+        MonitoringCheckpoint.last_success_at,
+        MonitoringCheckpoint.updated_at,
+    )
     rows = db.execute(
         select(*columns)
-        .where(MonitoringCheckpoint.mode == mode)
+        .where(
+            MonitoringCheckpoint.mode == mode,
+            MonitoringCheckpoint.provider.is_not(None),
+            MonitoringCheckpoint.account_scope.is_not(None),
+            activity_at >= active_since,
+        )
         .order_by(MonitoringCheckpoint.worker_name.asc())
     ).all()
-    return _rows_to_dicts(rows)
+    excluded_legacy_count = int(
+        db.scalar(
+            select(func.count(MonitoringCheckpoint.id)).where(
+                MonitoringCheckpoint.mode == mode,
+                MonitoringCheckpoint.provider.is_(None),
+                MonitoringCheckpoint.account_scope.is_(None),
+            )
+        )
+        or 0
+    )
+    excluded_stale_scoped_count = int(
+        db.scalar(
+            select(func.count(MonitoringCheckpoint.id)).where(
+                MonitoringCheckpoint.mode == mode,
+                MonitoringCheckpoint.provider.is_not(None),
+                MonitoringCheckpoint.account_scope.is_not(None),
+                or_(activity_at < active_since, activity_at.is_(None)),
+            )
+        )
+        or 0
+    )
+    current_rows = _rows_to_dicts(rows)
+    return current_rows, {
+        "current_scoped_checkpoint_count": len(current_rows),
+        "excluded_legacy_unscoped_checkpoint_count": excluded_legacy_count,
+        "excluded_stale_scoped_checkpoint_count": excluded_stale_scoped_count,
+        "active_since": active_since,
+        "semantics": "only_recent_account_scoped_checkpoints_are_current_instances",
+    }
 
 
 def _weekly_closed_trades(
     *,
     db: Session,
+    settings: Settings,
     mode: str,
     start_at: datetime,
     end_at: datetime,
@@ -879,6 +1010,7 @@ def _weekly_closed_trades(
         route_symbols=sell_route_symbols,
     )
     isolation_cursor = load_fifo_isolation_cursor(db=db, runtime_mode=mode, through=end_at)
+    exact_krx_scope = _weekly_exact_krx_fifo_scope(settings)
 
     lots_by_route_symbol: dict[
         tuple[FifoRouteScope, str],
@@ -892,6 +1024,15 @@ def _weekly_closed_trades(
         in_period = start_at <= fill_time < end_at
         route_scope = fifo_route_scope_from_order(fill.broker_order)
         if route_scope is None:
+            if legacy_kis_krx_event_is_isolated(
+                order=fill.broker_order,
+                event_symbol=fill.symbol,
+                event_at=fill_time,
+                through=start_at,
+                isolation_cursor=isolation_cursor,
+                exact_route_scope=exact_krx_scope,
+            ):
+                continue
             if side == "sell" and in_period:
                 closed.append(
                     _closed_trade_row(
@@ -1416,6 +1557,7 @@ def _closed_trade_row(
 def _stale_fifo_inventory_alerts(
     *,
     db: Session,
+    settings: Settings,
     mode: str,
     end_at: datetime,
     max_rows: int,
@@ -1444,6 +1586,7 @@ def _stale_fifo_inventory_alerts(
     fills = dedupe_execution_fills(list(reversed(newest_fills[:max_rows])))
     ambiguous_buckets = ambiguous_fifo_chronology_buckets(fills)
     isolation_cursor = load_fifo_isolation_cursor(db=db, runtime_mode=mode, through=end_at)
+    exact_krx_scope = _weekly_exact_krx_fifo_scope(settings)
     lots_by_route_symbol: dict[tuple[FifoRouteScope, str], list[Decimal]] = {}
     first_fill_at: dict[tuple[FifoRouteScope, str], datetime] = {}
     last_fill_at: dict[tuple[FifoRouteScope, str], datetime] = {}
@@ -1457,6 +1600,15 @@ def _stale_fifo_inventory_alerts(
         quantity = _fill_quantity(fill)
         route_scope = fifo_route_scope_from_order(fill.broker_order)
         if route_scope is None:
+            if legacy_kis_krx_event_is_isolated(
+                order=fill.broker_order,
+                event_symbol=fill.symbol,
+                event_at=observed_at,
+                through=end_at,
+                isolation_cursor=isolation_cursor,
+                exact_route_scope=exact_krx_scope,
+            ):
+                continue
             unavailable_scope_fill_count[fill.symbol] = (
                 unavailable_scope_fill_count.get(fill.symbol, 0) + 1
             )
@@ -1687,7 +1839,13 @@ def _monitoring_protective_stop_actionability(
     *,
     db: Session,
     mode: str,
+    active_since: datetime,
 ) -> dict[str, object]:
+    activity_at = func.coalesce(
+        MonitoringCheckpoint.last_heartbeat_at,
+        MonitoringCheckpoint.last_success_at,
+        MonitoringCheckpoint.updated_at,
+    )
     rows = db.execute(
         select(
             MonitoringCheckpoint.worker_name,
@@ -1695,7 +1853,12 @@ def _monitoring_protective_stop_actionability(
             MonitoringCheckpoint.last_heartbeat_at,
             MonitoringCheckpoint.details,
         )
-        .where(MonitoringCheckpoint.mode == mode)
+        .where(
+            MonitoringCheckpoint.mode == mode,
+            MonitoringCheckpoint.provider.is_not(None),
+            MonitoringCheckpoint.account_scope.is_not(None),
+            activity_at >= active_since,
+        )
         .order_by(MonitoringCheckpoint.worker_name.asc())
     ).all()
     warnings: list[dict[str, object]] = []
