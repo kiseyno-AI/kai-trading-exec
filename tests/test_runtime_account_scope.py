@@ -2076,6 +2076,8 @@ def test_exact_krx_flat_isolation_separates_legacy_history_from_new_generation()
         status="filled",
         observed_at=old_at,
     )
+    legacy_buy.created_at = old_at
+    legacy_buy.updated_at = old_at
     new_buy = _canonical_order(
         settings,
         key="clean-generation-buy",

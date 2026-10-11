@@ -5997,6 +5997,19 @@ def _monitoring_price_source_readiness_reasons(
     if not autonomous.get("enabled"):
         return []
     monitored_symbols = symbols.get("monitored") or []
+    monitoring = autonomous.get("monitoring")
+    if isinstance(monitoring, dict):
+        last_cycle = monitoring.get("last_cycle")
+        if (
+            isinstance(last_cycle, dict)
+            and last_cycle.get("idle") is True
+            and not (last_cycle.get("monitored_symbols") or [])
+            and bool(last_cycle.get("session_inactive_symbols") or [])
+        ):
+            # A closed market owns its last quote failure. Do not let stale
+            # overseas health block domestic readiness (or vice versa) while
+            # that market has no session-active symbols.
+            return []
     price_source = _autonomous_monitoring_price_source(autonomous)
     last_symbol_count = int(price_source.get("last_symbol_count") or 0)
     if not monitored_symbols and last_symbol_count <= 0:
