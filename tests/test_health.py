@@ -3382,6 +3382,20 @@ def test_price_dependent_sizing_pending_watch_remains_monitorable() -> None:
             )
         ] == ["price-watch-sizing-pending-item"]
 
+        persisted_item = session.get(
+            ExecutionPlanItem,
+            "price-watch-sizing-pending-item",
+        )
+        assert persisted_item is not None
+        persisted_item.status = "watch_monitoring_active"
+        session.commit()
+
+        assert list_autonomous_monitoring_symbols(
+            settings=app.state.settings,
+            db=session,
+            current_market_date=market_date,
+        ) == ["005930"]
+
     engine.dispose()
 
 

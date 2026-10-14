@@ -184,6 +184,81 @@ def test_membership_returns_full_db_set_beyond_monitoring_cycle_batch() -> None:
     engine.dispose()
 
 
+def test_membership_includes_only_quote_monitorable_sizing_deferrals() -> None:
+    settings = _settings()
+    app, engine, session_factory = _app(settings)
+    with session_factory() as db:
+        price_watch_risk, price_watch_policy = bind_kis_account_route(
+            settings=settings,
+            provider="kis",
+            risk_context={
+                "exchange": "KRX",
+                "watch_exec_agent_deferred": {
+                    "reason_family": "reward_risk",
+                    "disposition": "defer",
+                    "price_watch_only": True,
+                },
+            },
+            quantity_policy={"type": "exec_agent_sized", "budget_krw": "150000"},
+        )
+        ordinary_risk, ordinary_policy = bind_kis_account_route(
+            settings=settings,
+            provider="kis",
+            risk_context={
+                "exchange": "KRX",
+                "watch_exec_agent_deferred": {
+                    "reason_family": "account_snapshot",
+                    "disposition": "retry",
+                },
+            },
+            quantity_policy={"type": "exec_agent_sized", "budget_krw": "150000"},
+        )
+        db.add(
+            ExecutionPlan(
+                external_plan_id="price-watch-runtime-membership",
+                source="test",
+                mode=settings.runtime_mode,
+                status="accepted",
+                market_date=_current_krx_market_date(),
+                items=[
+                    ExecutionPlanItem(
+                        symbol="028670",
+                        side="buy",
+                        intent="intraday_watch_buy",
+                        status="watch_sizing_pending",
+                        provider="kis",
+                        venue="KRX",
+                        asset_class="kr_equity",
+                        trigger_price=Decimal("6630"),
+                        risk_context=price_watch_risk,
+                        quantity_policy=price_watch_policy,
+                    ),
+                    ExecutionPlanItem(
+                        symbol="041960",
+                        side="buy",
+                        intent="intraday_watch_buy",
+                        status="watch_sizing_pending",
+                        provider="kis",
+                        venue="KRX",
+                        asset_class="kr_equity",
+                        trigger_price=Decimal("11900"),
+                        risk_context=ordinary_risk,
+                        quantity_policy=ordinary_policy,
+                    ),
+                ],
+            )
+        )
+        db.commit()
+
+    response = TestClient(app).get("/runtime/monitored-symbol-membership")
+
+    assert response.status_code == 200
+    assert response.json()["membership_complete"] is True
+    assert response.json()["symbols"] == ["028670"]
+
+    engine.dispose()
+
+
 def test_membership_allows_authoritative_empty_set() -> None:
     settings = _settings()
     app, engine, _session_factory = _app(settings)

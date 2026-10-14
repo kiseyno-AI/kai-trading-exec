@@ -1380,6 +1380,7 @@ class AutonomousRuntimeCoordinator:
             return payload
         db_evaluation_symbols = triggered_symbols | rearmable_sell_symbols
         if db_evaluation_symbols:
+            evaluated_at = datetime.now(UTC)
             broker_action_limit = max(int(self.settings.monitoring_max_broker_actions_per_cycle), 1)
             sell_evaluation_symbols = (
                 triggered_sell_symbols | rearmable_sell_symbols
@@ -1416,6 +1417,7 @@ class AutonomousRuntimeCoordinator:
                     symbols=symbols,
                     auth_session_factory=self.session_factory,
                     now=started_at,
+                    quote_freshness_at=evaluated_at,
                 )
             reported_rearm_symbols = result.payload.get("rearmed_sell_symbols")
             confirmed_rearm_symbols = {
