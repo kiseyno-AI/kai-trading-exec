@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import and_, or_, select, text, update
 from sqlalchemy.orm import Session, undefer
@@ -48,6 +49,149 @@ RISK_OFF_EXPIRABLE_STATUSES = tuple(
 ADJUSTMENT_KEY = "hourly_plan_action"
 SOURCE = "hourly_runtime_check"
 MAX_MUTATIONS_PER_RUN = 20
+_SEOUL = ZoneInfo("Asia/Seoul")
+
+
+class HourlyPlanJudgmentObservationError(ValueError):
+    def __init__(self, *, reason: str, message: str) -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
+def _accepted_healthy_observation_ids(
+    *,
+    context: dict[str, object],
+    limit: int,
+) -> list[str]:
+    accepted: list[str] = []
+    raw_history = context.get("accepted_healthy_observation_ids")
+    if isinstance(raw_history, list):
+        for item in raw_history:
+            if not isinstance(item, str) or not item or item in accepted:
+                continue
+            accepted.append(item)
+    legacy_last = context.get("last_healthy_observation_id")
+    if (
+        isinstance(legacy_last, str)
+        and legacy_last
+        and legacy_last not in accepted
+    ):
+        accepted.append(legacy_last)
+    return accepted[-limit:]
+
+
+def _validated_healthy_observation(
+    *,
+    settings: Settings,
+    risk_flags: int,
+    context: dict[str, object],
+    active: bool,
+    observation_id: str | None,
+    market_date: date | None,
+    source_observed_at: datetime | None,
+    now: datetime,
+) -> dict[str, object] | None:
+    if risk_flags != 0 or (
+        observation_id is None
+        and market_date is None
+        and source_observed_at is None
+    ):
+        return None
+    if observation_id is None or market_date is None or source_observed_at is None:
+        raise HourlyPlanJudgmentObservationError(
+            reason="healthy_observation_identity_missing",
+            message="healthy observation identity is incomplete",
+        )
+    normalized_now = now.astimezone(UTC)
+    normalized_source = source_observed_at.astimezone(UTC)
+    current_market_date = normalized_now.astimezone(_SEOUL).date()
+    if market_date != current_market_date:
+        raise HourlyPlanJudgmentObservationError(
+            reason="market_date_not_current",
+            message="healthy observation market_date is not the current KRX date",
+        )
+    if normalized_source.astimezone(_SEOUL).date() != market_date:
+        raise HourlyPlanJudgmentObservationError(
+            reason="source_observation_market_date_mismatch",
+            message="source_observed_at does not belong to market_date in Asia/Seoul",
+        )
+    if normalized_source > normalized_now + timedelta(
+        seconds=settings.hourly_plan_judgment_max_future_skew_seconds
+    ):
+        raise HourlyPlanJudgmentObservationError(
+            reason="source_observation_in_future",
+            message="healthy source observation is too far in the future",
+        )
+    if normalized_source < normalized_now - timedelta(
+        seconds=settings.hourly_plan_judgment_max_observation_age_seconds
+    ):
+        raise HourlyPlanJudgmentObservationError(
+            reason="source_observation_stale",
+            message="healthy source observation is stale",
+        )
+    last_risk_at = _utc_datetime(context.get("last_risk_at"))
+    if active and last_risk_at is not None and normalized_source <= last_risk_at:
+        raise HourlyPlanJudgmentObservationError(
+            reason="source_observation_not_after_latest_risk",
+            message="healthy source observation does not postdate the latest risk",
+        )
+    accepted_ids = _accepted_healthy_observation_ids(
+        context=context,
+        limit=settings.hourly_plan_judgment_recovery_required_healthy_observations,
+    )
+    if observation_id in accepted_ids:
+        raise HourlyPlanJudgmentObservationError(
+            reason="duplicate_observation",
+            message="healthy observation_id was already processed",
+        )
+    last_source_observed_at = _utc_datetime(
+        context.get("last_healthy_source_observed_at")
+    )
+    if (
+        last_source_observed_at is not None
+        and normalized_source <= last_source_observed_at
+    ):
+        raise HourlyPlanJudgmentObservationError(
+            reason="source_observation_regressed",
+            message="healthy source observation did not advance its watermark",
+        )
+    if (
+        last_source_observed_at is not None
+        and normalized_source
+        < last_source_observed_at
+        + timedelta(
+            seconds=(
+                settings.hourly_plan_judgment_recovery_min_observation_interval_seconds
+            )
+        )
+    ):
+        raise HourlyPlanJudgmentObservationError(
+            reason="source_observation_interval",
+            message="healthy source observations are too close together",
+        )
+    last_received_at = _utc_datetime(context.get("last_healthy_observed_at"))
+    if (
+        last_received_at is not None
+        and normalized_now
+        < last_received_at
+        + timedelta(
+            seconds=(
+                settings.hourly_plan_judgment_recovery_min_observation_interval_seconds
+            )
+        )
+    ):
+        raise HourlyPlanJudgmentObservationError(
+            reason="receipt_observation_interval",
+            message="healthy observations were received too close together",
+        )
+    return {
+        "observation_id": observation_id,
+        "market_date": market_date.isoformat(),
+        "source_observed_at": normalized_source.isoformat(),
+        "accepted_observation_ids": [*accepted_ids, observation_id][
+            -settings.hourly_plan_judgment_recovery_required_healthy_observations :
+        ],
+    }
 
 
 def _is_core_v4_bound(risk_context: dict[str, object]) -> bool:
@@ -109,10 +253,23 @@ def _hourly_risk_off_fence_values(
     risk_flags: int,
     risk_reasons: list[str],
     now: datetime,
+    observation_id: str | None = None,
+    market_date: date | None = None,
+    source_observed_at: datetime | None = None,
 ) -> tuple[bool, int, dict[str, object] | None, str | None]:
     """Return the authoritative buy-only risk fence transition."""
 
     context = _json_object(raw_context)
+    healthy_observation = _validated_healthy_observation(
+        settings=settings,
+        risk_flags=risk_flags,
+        context=context,
+        active=active,
+        observation_id=observation_id,
+        market_date=market_date,
+        source_observed_at=source_observed_at,
+        now=now,
+    )
     required = settings.hourly_plan_judgment_recovery_required_healthy_observations
     cooldown_seconds = settings.hourly_plan_judgment_recovery_cooldown_seconds
     min_interval_seconds = (
@@ -153,6 +310,10 @@ def _hourly_risk_off_fence_values(
                 ).isoformat(),
                 "min_observation_interval_seconds": min_interval_seconds,
                 "last_healthy_observed_at": None,
+                "last_healthy_observation_id": None,
+                "last_healthy_market_date": None,
+                "last_healthy_source_observed_at": None,
+                "accepted_healthy_observation_ids": [],
                 "projection_pending": True,
                 "projection_started_at": effective_risk_at.isoformat(),
                 "recovery_ready": False,
@@ -181,6 +342,10 @@ def _hourly_risk_off_fence_values(
                 ).isoformat(),
                 "min_observation_interval_seconds": min_interval_seconds,
                 "last_healthy_observed_at": None,
+                "last_healthy_observation_id": None,
+                "last_healthy_market_date": None,
+                "last_healthy_source_observed_at": None,
+                "accepted_healthy_observation_ids": [],
                 "projection_pending": True,
                 "projection_started_at": effective_risk_at.isoformat(),
                 "recovery_ready": False,
@@ -235,6 +400,19 @@ def _hourly_risk_off_fence_values(
             "recovery_ready": recovery_ready,
         }
     )
+    if healthy_observation is not None:
+        updated.update(
+            {
+                "last_healthy_observation_id": healthy_observation["observation_id"],
+                "last_healthy_market_date": healthy_observation["market_date"],
+                "last_healthy_source_observed_at": healthy_observation[
+                    "source_observed_at"
+                ],
+                "accepted_healthy_observation_ids": healthy_observation[
+                    "accepted_observation_ids"
+                ],
+            }
+        )
     updated.pop("projection_completed_at", None)
     return (
         True,
@@ -268,6 +446,9 @@ def _transition_hourly_risk_off_fence_session(
     risk_flags: int,
     risk_reasons: list[str],
     now: datetime,
+    observation_id: str | None = None,
+    market_date: date | None = None,
+    source_observed_at: datetime | None = None,
 ) -> dict[str, object]:
     ensure_runtime_control_state(settings=settings, db=db)
     if db.get_bind().dialect.name == "sqlite":
@@ -309,6 +490,9 @@ def _transition_hourly_risk_off_fence_session(
         risk_flags=risk_flags,
         risk_reasons=risk_reasons,
         now=now,
+        observation_id=observation_id,
+        market_date=market_date,
+        source_observed_at=source_observed_at,
     )
     state_changed = (
         state.hourly_risk_off_active != active
@@ -379,6 +563,9 @@ def _transition_hourly_risk_off_fence_sqlite(
     risk_flags: int,
     risk_reasons: list[str],
     now: datetime,
+    observation_id: str | None = None,
+    market_date: date | None = None,
+    source_observed_at: datetime | None = None,
 ) -> dict[str, object]:
     if not _sqlite_has_hourly_risk_off_fence(conn):
         return _hourly_risk_off_fence_payload(
@@ -412,6 +599,9 @@ def _transition_hourly_risk_off_fence_sqlite(
         risk_flags=risk_flags,
         risk_reasons=risk_reasons,
         now=now,
+        observation_id=observation_id,
+        market_date=market_date,
+        source_observed_at=source_observed_at,
     )
     state_changed = (
         previous["active"] != active
@@ -1029,6 +1219,9 @@ def apply_hourly_plan_judgment_action(
     db: Session | None = None,
     risk_flags: int,
     risk_reasons: list[str],
+    observation_id: str | None = None,
+    market_date: date | None = None,
+    source_observed_at: datetime | None = None,
 ) -> dict[str, object]:
     if urlparse(settings.database_url).scheme not in {"sqlite", "sqlite+pysqlite"}:
         if db is None:
@@ -1038,6 +1231,9 @@ def apply_hourly_plan_judgment_action(
             settings=settings,
             risk_flags=risk_flags,
             risk_reasons=risk_reasons,
+            observation_id=observation_id,
+            market_date=market_date,
+            source_observed_at=source_observed_at,
         )
     fence_persisted = False
     risk_fence: dict[str, object] | None = None
@@ -1051,6 +1247,9 @@ def apply_hourly_plan_judgment_action(
                 risk_flags=risk_flags,
                 risk_reasons=risk_reasons,
                 now=now,
+                observation_id=observation_id,
+                market_date=market_date,
+                source_observed_at=source_observed_at,
             )
             # The global fence is the authoritative broker-boundary control.
             # Commit it before best-effort item projection so a later item/audit
@@ -1503,6 +1702,9 @@ def _apply_hourly_plan_judgment_action_session(
     settings: Settings,
     risk_flags: int,
     risk_reasons: list[str],
+    observation_id: str | None = None,
+    market_date: date | None = None,
+    source_observed_at: datetime | None = None,
 ) -> dict[str, object]:
     changed = 0
     now = datetime.now(UTC)
@@ -1512,6 +1714,9 @@ def _apply_hourly_plan_judgment_action_session(
         risk_flags=risk_flags,
         risk_reasons=risk_reasons,
         now=now,
+        observation_id=observation_id,
+        market_date=market_date,
+        source_observed_at=source_observed_at,
     )
     # Persist the authoritative global fence independently from the denormalized
     # per-item projections. A projection failure may delay recovery visibility,

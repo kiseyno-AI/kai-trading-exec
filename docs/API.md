@@ -356,8 +356,28 @@ for an inactive fence.
 ### `POST /runtime/plan-judgment/action`
 
 Apply one hourly risk judgment to the durable global buy fence and its persisted
-`intraday_watch_buy` and `next_open_buy` projections. The body accepts
-`risk_flags` and `risk_reasons[]`.
+`intraday_watch_buy` and `next_open_buy` projections. The body requires an
+explicit non-negative integer `risk_flags` and explicit string array
+`risk_reasons[]`; booleans, numeric strings, fractional flags, scalar reasons,
+unknown fields, and omitted fields return `422` instead of being coerced into a
+healthy judgment.
+
+For `risk_flags == 0`, the body also requires `observation_id`, `market_date`,
+and timezone-qualified `source_observed_at`. The market date must be today's
+date in Asia/Seoul and must match the source timestamp. Source evidence must be
+no older than `KAI_EXEC_HOURLY_PLAN_JUDGMENT_MAX_OBSERVATION_AGE_SECONDS`
+(default `420`) and no more than
+`KAI_EXEC_HOURLY_PLAN_JUDGMENT_MAX_FUTURE_SKEW_SECONDS` (default `5`) in the
+future. While recovery is active it must also postdate the latest risk. The ID
+and source watermark are stored in the durable fence context. Duplicate IDs,
+non-advancing watermarks, and source observations closer together than the
+configured recovery interval return `409` and cannot advance recovery. Accepted
+IDs are stored as a bounded history for the active recovery epoch, preventing a
+non-consecutive A/B/A replay; a risky reset starts a new history. Existing
+context that predates the history field promotes its legacy last ID without a
+schema migration. Risky observations (`risk_flags >= 1`) retain the legacy
+explicit two-field body so a safety observation is never dependent on recovery
+metadata.
 
 - `risk_flags >= 3` first activates the global buy-only fence, then expires all
   mutable buy watches/jobs and records each prior safe status plus recovery

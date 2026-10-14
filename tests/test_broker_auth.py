@@ -5607,12 +5607,28 @@ def test_next_open_pending_intent_resumes_same_job_once_after_hourly_recovery(
     FrozenHourlyDateTime.current += timedelta(seconds=1)
     first_healthy = client.post(
         "/runtime/plan-judgment/action",
-        json={"risk_flags": 0, "risk_reasons": []},
+        json={
+            "risk_flags": 0,
+            "risk_reasons": [],
+            "observation_id": "pending-intent-recovery-healthy-1",
+            "market_date": FrozenHourlyDateTime.current.astimezone(
+                ZoneInfo("Asia/Seoul")
+            ).date().isoformat(),
+            "source_observed_at": FrozenHourlyDateTime.current.isoformat(),
+        },
     )
     FrozenHourlyDateTime.current += timedelta(seconds=1)
     second_healthy = client.post(
         "/runtime/plan-judgment/action",
-        json={"risk_flags": 0, "risk_reasons": []},
+        json={
+            "risk_flags": 0,
+            "risk_reasons": [],
+            "observation_id": "pending-intent-recovery-healthy-2",
+            "market_date": FrozenHourlyDateTime.current.astimezone(
+                ZoneInfo("Asia/Seoul")
+            ).date().isoformat(),
+            "source_observed_at": FrozenHourlyDateTime.current.isoformat(),
+        },
     )
     assert first_healthy.status_code == 200
     assert first_healthy.json()["recovery_resumed_count"] == 0
@@ -5658,6 +5674,275 @@ def test_next_open_pending_intent_resumes_same_job_once_after_hourly_recovery(
         assert job is not None
         assert job.status == "completed"
 
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"risk_reasons": ["test"]},
+        {"risk_flags": 1},
+        {"risk_flags": 0, "risk_reasons": []},
+    ],
+)
+def test_plan_judgment_endpoint_rejects_incomplete_observation_contract(
+    tmp_path,
+    payload: dict[str, object],
+) -> None:
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'plan-judgment-contract.db'}",
+        runtime_mode="mock",
+    )
+    app, engine = build_test_app(settings=settings)
+
+    response = TestClient(app).post(
+        "/runtime/plan-judgment/action",
+        json=payload,
+    )
+
+    assert response.status_code == 422
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("observation_id", "market_date", "source_observed_at", "expected_reason"),
+    [
+        (
+            "wrong-market-date",
+            "2026-10-12",
+            "2026-10-13T00:59:00Z",
+            "market_date_not_current",
+        ),
+        (
+            "stale-observation",
+            "2026-10-13",
+            "2026-10-13T00:52:59Z",
+            "source_observation_stale",
+        ),
+        (
+            "future-observation",
+            "2026-10-13",
+            "2026-10-13T01:00:06Z",
+            "source_observation_in_future",
+        ),
+        (
+            "source-market-date-mismatch",
+            "2026-10-13",
+            "2026-10-12T14:59:00Z",
+            "source_observation_market_date_mismatch",
+        ),
+        (
+            "source-not-after-risk",
+            "2026-10-13",
+            "2026-10-13T01:00:00Z",
+            "source_observation_not_after_latest_risk",
+        ),
+    ],
+)
+def test_plan_judgment_endpoint_rejects_untrustworthy_healthy_observation_without_mutation(
+    monkeypatch,
+    tmp_path,
+    observation_id: str,
+    market_date: str,
+    source_observed_at: str,
+    expected_reason: str,
+) -> None:
+    class FrozenPlanJudgmentDateTime(datetime):
+        current = datetime(2026, 10, 13, 1, 0, tzinfo=UTC)
+
+        @classmethod
+        def now(cls, tz=None):
+            if tz is None:
+                return cls.current.replace(tzinfo=None)
+            return cls.current.astimezone(tz)
+
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / f'{observation_id}.db'}",
+        runtime_mode="mock",
+        hourly_plan_judgment_recovery_cooldown_seconds=0,
+        hourly_plan_judgment_recovery_min_observation_interval_seconds=1,
+    )
+    app, engine = build_test_app(settings=settings)
+    client = TestClient(app)
+    monkeypatch.setattr(
+        plan_judgment_actions,
+        "datetime",
+        FrozenPlanJudgmentDateTime,
+    )
+    assert client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "test", "reason": "initialize state"},
+    ).status_code == 200
+    activated = client.post(
+        "/runtime/plan-judgment/action",
+        json={"risk_flags": 3, "risk_reasons": ["test risk"]},
+    )
+    assert activated.status_code == 200
+
+    rejected = client.post(
+        "/runtime/plan-judgment/action",
+        json={
+            "risk_flags": 0,
+            "risk_reasons": [],
+            "observation_id": observation_id,
+            "market_date": market_date,
+            "source_observed_at": source_observed_at,
+        },
+    )
+
+    assert rejected.status_code == 409
+    assert rejected.json()["detail"]["reason"] == expected_reason
+    with app.state.db_session_factory() as session:
+        state = session.get(RuntimeControlState, "global")
+        assert state is not None
+        assert state.hourly_risk_off_epoch == 1
+        assert state.hourly_risk_off_context["consecutive_healthy_observations"] == 0
+    engine.dispose()
+
+
+def test_plan_judgment_healthy_identity_is_durable_and_cannot_be_replayed(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    class FrozenPlanJudgmentDateTime(datetime):
+        current = datetime(2026, 10, 13, 1, 0, tzinfo=UTC)
+
+        @classmethod
+        def now(cls, tz=None):
+            if tz is None:
+                return cls.current.replace(tzinfo=None)
+            return cls.current.astimezone(tz)
+
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'healthy-observation-replay.db'}",
+        runtime_mode="mock",
+        hourly_plan_judgment_recovery_required_healthy_observations=3,
+        hourly_plan_judgment_recovery_cooldown_seconds=0,
+        hourly_plan_judgment_recovery_min_observation_interval_seconds=60,
+    )
+    app, engine = build_test_app(settings=settings)
+    client = TestClient(app)
+    monkeypatch.setattr(
+        plan_judgment_actions,
+        "datetime",
+        FrozenPlanJudgmentDateTime,
+    )
+    assert client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "test", "reason": "initialize state"},
+    ).status_code == 200
+    assert client.post(
+        "/runtime/plan-judgment/action",
+        json={"risk_flags": 3, "risk_reasons": ["test risk"]},
+    ).status_code == 200
+
+    FrozenPlanJudgmentDateTime.current = datetime(2026, 10, 13, 1, 1, tzinfo=UTC)
+    first_payload = {
+        "risk_flags": 0,
+        "risk_reasons": [],
+        "observation_id": "healthy-observation-1",
+        "market_date": "2026-10-13",
+        "source_observed_at": "2026-10-13T01:00:30Z",
+    }
+    first = client.post("/runtime/plan-judgment/action", json=first_payload)
+    assert first.status_code == 200
+    first_context = first.json()["hourly_risk_off"]["context"]
+    assert first_context["consecutive_healthy_observations"] == 1
+    assert first_context["last_healthy_observation_id"] == "healthy-observation-1"
+    assert first_context["last_healthy_market_date"] == "2026-10-13"
+    assert first_context["last_healthy_source_observed_at"] == (
+        "2026-10-13T01:00:30+00:00"
+    )
+
+    FrozenPlanJudgmentDateTime.current = datetime(
+        2026,
+        10,
+        13,
+        1,
+        1,
+        30,
+        tzinfo=UTC,
+    )
+    receipt_too_close = client.post(
+        "/runtime/plan-judgment/action",
+        json={
+            **first_payload,
+            "observation_id": "healthy-observation-receipt-too-close",
+            "source_observed_at": "2026-10-13T01:01:30Z",
+        },
+    )
+    assert receipt_too_close.status_code == 409
+    assert receipt_too_close.json()["detail"]["reason"] == (
+        "receipt_observation_interval"
+    )
+
+    FrozenPlanJudgmentDateTime.current = datetime(2026, 10, 13, 1, 2, tzinfo=UTC)
+    duplicate = client.post("/runtime/plan-judgment/action", json=first_payload)
+    assert duplicate.status_code == 409
+    assert duplicate.json()["detail"]["reason"] == "duplicate_observation"
+
+    regressed = client.post(
+        "/runtime/plan-judgment/action",
+        json={
+            **first_payload,
+            "observation_id": "healthy-observation-regressed",
+            "source_observed_at": "2026-10-13T01:00:20Z",
+        },
+    )
+    assert regressed.status_code == 409
+    assert regressed.json()["detail"]["reason"] == "source_observation_regressed"
+
+    too_close = client.post(
+        "/runtime/plan-judgment/action",
+        json={
+            **first_payload,
+            "observation_id": "healthy-observation-too-close",
+            "source_observed_at": "2026-10-13T01:00:45Z",
+        },
+    )
+    assert too_close.status_code == 409
+    assert too_close.json()["detail"]["reason"] == "source_observation_interval"
+
+    with app.state.db_session_factory() as session:
+        state = session.get(RuntimeControlState, "global")
+        assert state is not None
+        assert state.hourly_risk_off_active is True
+        assert state.hourly_risk_off_context["consecutive_healthy_observations"] == 1
+        assert state.hourly_risk_off_context["last_healthy_observation_id"] == (
+            "healthy-observation-1"
+        )
+
+    second_payload = {
+        **first_payload,
+        "observation_id": "healthy-observation-2",
+        "source_observed_at": "2026-10-13T01:01:30Z",
+    }
+    second = client.post("/runtime/plan-judgment/action", json=second_payload)
+    assert second.status_code == 200
+    assert second.json()["hourly_risk_off"]["context"][
+        "consecutive_healthy_observations"
+    ] == 2
+
+    FrozenPlanJudgmentDateTime.current = datetime(2026, 10, 13, 1, 3, tzinfo=UTC)
+    nonconsecutive_replay = client.post(
+        "/runtime/plan-judgment/action",
+        json={
+            **first_payload,
+            "source_observed_at": "2026-10-13T01:02:30Z",
+        },
+    )
+    assert nonconsecutive_replay.status_code == 409
+    assert nonconsecutive_replay.json()["detail"]["reason"] == (
+        "duplicate_observation"
+    )
+    with app.state.db_session_factory() as session:
+        state = session.get(RuntimeControlState, "global")
+        assert state is not None
+        assert state.hourly_risk_off_active is True
+        assert state.hourly_risk_off_context["consecutive_healthy_observations"] == 2
+        assert state.hourly_risk_off_context[
+            "accepted_healthy_observation_ids"
+        ] == ["healthy-observation-1", "healthy-observation-2"]
     engine.dispose()
 
 
