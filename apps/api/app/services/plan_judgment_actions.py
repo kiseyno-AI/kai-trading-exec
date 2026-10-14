@@ -58,6 +58,28 @@ class HourlyPlanJudgmentObservationError(ValueError):
         self.reason = reason
 
 
+def _accepted_healthy_observation_ids(
+    *,
+    context: dict[str, object],
+    limit: int,
+) -> list[str]:
+    accepted: list[str] = []
+    raw_history = context.get("accepted_healthy_observation_ids")
+    if isinstance(raw_history, list):
+        for item in raw_history:
+            if not isinstance(item, str) or not item or item in accepted:
+                continue
+            accepted.append(item)
+    legacy_last = context.get("last_healthy_observation_id")
+    if (
+        isinstance(legacy_last, str)
+        and legacy_last
+        and legacy_last not in accepted
+    ):
+        accepted.append(legacy_last)
+    return accepted[-limit:]
+
+
 def _validated_healthy_observation(
     *,
     settings: Settings,
@@ -113,7 +135,11 @@ def _validated_healthy_observation(
             reason="source_observation_not_after_latest_risk",
             message="healthy source observation does not postdate the latest risk",
         )
-    if context.get("last_healthy_observation_id") == observation_id:
+    accepted_ids = _accepted_healthy_observation_ids(
+        context=context,
+        limit=settings.hourly_plan_judgment_recovery_required_healthy_observations,
+    )
+    if observation_id in accepted_ids:
         raise HourlyPlanJudgmentObservationError(
             reason="duplicate_observation",
             message="healthy observation_id was already processed",
@@ -162,6 +188,9 @@ def _validated_healthy_observation(
         "observation_id": observation_id,
         "market_date": market_date.isoformat(),
         "source_observed_at": normalized_source.isoformat(),
+        "accepted_observation_ids": [*accepted_ids, observation_id][
+            -settings.hourly_plan_judgment_recovery_required_healthy_observations :
+        ],
     }
 
 
@@ -281,6 +310,10 @@ def _hourly_risk_off_fence_values(
                 ).isoformat(),
                 "min_observation_interval_seconds": min_interval_seconds,
                 "last_healthy_observed_at": None,
+                "last_healthy_observation_id": None,
+                "last_healthy_market_date": None,
+                "last_healthy_source_observed_at": None,
+                "accepted_healthy_observation_ids": [],
                 "projection_pending": True,
                 "projection_started_at": effective_risk_at.isoformat(),
                 "recovery_ready": False,
@@ -309,6 +342,10 @@ def _hourly_risk_off_fence_values(
                 ).isoformat(),
                 "min_observation_interval_seconds": min_interval_seconds,
                 "last_healthy_observed_at": None,
+                "last_healthy_observation_id": None,
+                "last_healthy_market_date": None,
+                "last_healthy_source_observed_at": None,
+                "accepted_healthy_observation_ids": [],
                 "projection_pending": True,
                 "projection_started_at": effective_risk_at.isoformat(),
                 "recovery_ready": False,
@@ -370,6 +407,9 @@ def _hourly_risk_off_fence_values(
                 "last_healthy_market_date": healthy_observation["market_date"],
                 "last_healthy_source_observed_at": healthy_observation[
                     "source_observed_at"
+                ],
+                "accepted_healthy_observation_ids": healthy_observation[
+                    "accepted_observation_ids"
                 ],
             }
         )

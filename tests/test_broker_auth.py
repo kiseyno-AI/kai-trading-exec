@@ -5816,7 +5816,7 @@ def test_plan_judgment_healthy_identity_is_durable_and_cannot_be_replayed(
     settings = Settings(
         database_url=f"sqlite:///{tmp_path / 'healthy-observation-replay.db'}",
         runtime_mode="mock",
-        hourly_plan_judgment_recovery_required_healthy_observations=2,
+        hourly_plan_judgment_recovery_required_healthy_observations=3,
         hourly_plan_judgment_recovery_cooldown_seconds=0,
         hourly_plan_judgment_recovery_min_observation_interval_seconds=60,
     )
@@ -5911,6 +5911,38 @@ def test_plan_judgment_healthy_identity_is_durable_and_cannot_be_replayed(
         assert state.hourly_risk_off_context["last_healthy_observation_id"] == (
             "healthy-observation-1"
         )
+
+    second_payload = {
+        **first_payload,
+        "observation_id": "healthy-observation-2",
+        "source_observed_at": "2026-10-13T01:01:30Z",
+    }
+    second = client.post("/runtime/plan-judgment/action", json=second_payload)
+    assert second.status_code == 200
+    assert second.json()["hourly_risk_off"]["context"][
+        "consecutive_healthy_observations"
+    ] == 2
+
+    FrozenPlanJudgmentDateTime.current = datetime(2026, 10, 13, 1, 3, tzinfo=UTC)
+    nonconsecutive_replay = client.post(
+        "/runtime/plan-judgment/action",
+        json={
+            **first_payload,
+            "source_observed_at": "2026-10-13T01:02:30Z",
+        },
+    )
+    assert nonconsecutive_replay.status_code == 409
+    assert nonconsecutive_replay.json()["detail"]["reason"] == (
+        "duplicate_observation"
+    )
+    with app.state.db_session_factory() as session:
+        state = session.get(RuntimeControlState, "global")
+        assert state is not None
+        assert state.hourly_risk_off_active is True
+        assert state.hourly_risk_off_context["consecutive_healthy_observations"] == 2
+        assert state.hourly_risk_off_context[
+            "accepted_healthy_observation_ids"
+        ] == ["healthy-observation-1", "healthy-observation-2"]
     engine.dispose()
 
 

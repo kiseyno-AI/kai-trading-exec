@@ -96,6 +96,148 @@ def _create_plan_judgment_db(path) -> None:
     conn.close()
 
 
+def test_sqlalchemy_fence_rejects_nonconsecutive_healthy_observation_id_replay(
+) -> None:
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    settings = Settings(
+        runtime_mode="live",
+        database_url="postgresql+psycopg://unused/test",
+        hourly_plan_judgment_recovery_required_healthy_observations=3,
+        hourly_plan_judgment_recovery_cooldown_seconds=0,
+        hourly_plan_judgment_recovery_min_observation_interval_seconds=1,
+    )
+    started_at = datetime(2026, 10, 13, 1, 0, tzinfo=UTC)
+    market_date = started_at.date()
+
+    with Session(engine) as db:
+        db.add(RuntimeControlState(id="global", mode="live", paused=False))
+        db.commit()
+        plan_judgment_actions._transition_hourly_risk_off_fence_session(
+            db=db,
+            settings=settings,
+            risk_flags=3,
+            risk_reasons=["test risk"],
+            now=started_at,
+        )
+        db.commit()
+        plan_judgment_actions._transition_hourly_risk_off_fence_session(
+            db=db,
+            settings=settings,
+            risk_flags=0,
+            risk_reasons=[],
+            now=started_at + timedelta(seconds=2),
+            observation_id="healthy-a",
+            market_date=market_date,
+            source_observed_at=started_at + timedelta(seconds=1),
+        )
+        db.commit()
+        plan_judgment_actions._transition_hourly_risk_off_fence_session(
+            db=db,
+            settings=settings,
+            risk_flags=0,
+            risk_reasons=[],
+            now=started_at + timedelta(seconds=4),
+            observation_id="healthy-b",
+            market_date=market_date,
+            source_observed_at=started_at + timedelta(seconds=3),
+        )
+        db.commit()
+
+        with pytest.raises(
+            plan_judgment_actions.HourlyPlanJudgmentObservationError,
+            match="already processed",
+        ):
+            plan_judgment_actions._transition_hourly_risk_off_fence_session(
+                db=db,
+                settings=settings,
+                risk_flags=0,
+                risk_reasons=[],
+                now=started_at + timedelta(seconds=6),
+                observation_id="healthy-a",
+                market_date=market_date,
+                source_observed_at=started_at + timedelta(seconds=5),
+            )
+        db.rollback()
+        state = db.get(RuntimeControlState, "global")
+        assert state is not None
+        assert state.hourly_risk_off_active is True
+        assert state.hourly_risk_off_context["consecutive_healthy_observations"] == 2
+        assert state.hourly_risk_off_context[
+            "accepted_healthy_observation_ids"
+        ] == ["healthy-a", "healthy-b"]
+
+        plan_judgment_actions._transition_hourly_risk_off_fence_session(
+            db=db,
+            settings=settings,
+            risk_flags=1,
+            risk_reasons=["renewed risk"],
+            now=started_at + timedelta(seconds=7),
+        )
+        db.commit()
+        db.refresh(state)
+        assert state.hourly_risk_off_context[
+            "accepted_healthy_observation_ids"
+        ] == []
+
+        plan_judgment_actions._transition_hourly_risk_off_fence_session(
+            db=db,
+            settings=settings,
+            risk_flags=0,
+            risk_reasons=[],
+            now=started_at + timedelta(seconds=9),
+            observation_id="healthy-a",
+            market_date=market_date,
+            source_observed_at=started_at + timedelta(seconds=8),
+        )
+        db.commit()
+        db.refresh(state)
+        assert state.hourly_risk_off_context["consecutive_healthy_observations"] == 1
+        assert state.hourly_risk_off_context[
+            "accepted_healthy_observation_ids"
+        ] == ["healthy-a"]
+    engine.dispose()
+
+
+def test_legacy_single_healthy_id_is_promoted_into_replay_history() -> None:
+    settings = Settings(
+        runtime_mode="live",
+        hourly_plan_judgment_recovery_required_healthy_observations=3,
+        hourly_plan_judgment_recovery_cooldown_seconds=0,
+        hourly_plan_judgment_recovery_min_observation_interval_seconds=1,
+    )
+    started_at = datetime(2026, 10, 13, 1, 0, tzinfo=UTC)
+
+    with pytest.raises(
+        plan_judgment_actions.HourlyPlanJudgmentObservationError,
+        match="already processed",
+    ):
+        plan_judgment_actions._hourly_risk_off_fence_values(
+            active=True,
+            epoch=7,
+            raw_context={
+                "status": "observing",
+                "epoch": 7,
+                "last_risk_at": started_at.isoformat(),
+                "consecutive_healthy_observations": 1,
+                "last_healthy_observed_at": (
+                    started_at + timedelta(seconds=2)
+                ).isoformat(),
+                "last_healthy_observation_id": "legacy-healthy-a",
+                "last_healthy_source_observed_at": (
+                    started_at + timedelta(seconds=1)
+                ).isoformat(),
+            },
+            settings=settings,
+            risk_flags=0,
+            risk_reasons=[],
+            now=started_at + timedelta(seconds=4),
+            observation_id="legacy-healthy-a",
+            market_date=started_at.date(),
+            source_observed_at=started_at + timedelta(seconds=3),
+        )
+
+
 def test_sqlite_risk_off_projection_pending_survives_failure_and_blocks_recovery(
     monkeypatch,
     tmp_path,
