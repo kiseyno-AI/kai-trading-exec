@@ -3312,6 +3312,79 @@ def test_exec_agent_sizing_pending_watch_is_not_monitorable_until_quantity_exist
     engine.dispose()
 
 
+def test_price_dependent_sizing_pending_watch_remains_monitorable() -> None:
+    app, engine = build_test_app(
+        Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+        )
+    )
+    market_date = datetime(2026, 10, 2).date()
+
+    with app.state.db_session_factory() as session:
+        risk_context, quantity_policy = bind_kis_account_route(
+            settings=app.state.settings,
+            provider="kis",
+            risk_context={
+                "exchange": "KRX",
+                "reward_risk_max_entry_price": "71000.0000",
+                "watch_exec_agent_deferred": {
+                    "reason_code": "reward_risk_price_watch",
+                    "reason_family": "reward_risk",
+                    "disposition": "defer",
+                    "price_watch_only": True,
+                },
+            },
+            quantity_policy={
+                "type": "exec_agent_sized",
+                "budget_krw": "150000",
+            },
+        )
+        plan = ExecutionPlan(
+            id="price-watch-sizing-pending-plan",
+            external_plan_id="price-watch-sizing-pending-plan",
+            source="kai-trading-core",
+            market_date=market_date,
+            mode="paper",
+            status="accepted",
+            accepted_at=datetime(2026, 10, 2, 0, 0, tzinfo=UTC),
+            items=[
+                ExecutionPlanItem(
+                    id="price-watch-sizing-pending-item",
+                    plan_item_index=0,
+                    symbol="005930",
+                    side="buy",
+                    intent="intraday_watch_buy",
+                    status="watch_sizing_pending",
+                    decision_agent_name="signal-decider",
+                    trigger_price=Decimal("71000"),
+                    risk_context=risk_context,
+                    quantity_policy=quantity_policy,
+                    provider="kis",
+                )
+            ],
+        )
+        session.add(plan)
+        session.commit()
+
+        assert list_autonomous_monitoring_symbols(
+            settings=app.state.settings,
+            db=session,
+            current_market_date=market_date,
+        ) == ["005930"]
+        assert [
+            item.id
+            for item in _load_monitored_items(
+                settings=app.state.settings,
+                db=session,
+                symbols=["005930"],
+                current_market_date=market_date,
+            )
+        ] == ["price-watch-sizing-pending-item"]
+
+    engine.dispose()
+
+
 def test_autonomous_monitoring_uses_latest_plan_per_symbol_only() -> None:
     app, engine = build_test_app(
         Settings(

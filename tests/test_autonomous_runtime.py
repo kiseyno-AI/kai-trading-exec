@@ -250,6 +250,54 @@ def test_watch_sizing_cycle_refreshes_trade_feedback_before_agent_sizing(
     assert payload["trade_outcome_feedback"]["status"] == "generated"
 
 
+def test_watch_sizing_cycle_invalidates_monitoring_snapshot_after_price_watch_reopen(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'watch-reopen-runtime.db'}",
+        runtime_mode="paper",
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    coordinator = AutonomousRuntimeCoordinator(
+        settings=settings,
+        session_factory=session_factory,
+        broker_adapter_factory=lambda settings: None,  # type: ignore[arg-type,return-value]
+    )
+    invalidations: list[str] = []
+
+    monkeypatch.setattr(
+        autonomous_runtime,
+        "ensure_fresh_trade_outcome_feedback",
+        lambda **_: {"status": "fresh", "version": "trade-outcome-feedback-v2"},
+    )
+    monkeypatch.setattr(
+        autonomous_runtime,
+        "run_due_watch_exec_agent_sizing",
+        lambda **_: SimpleNamespace(
+            status_code=200,
+            payload={
+                "idle": False,
+                "reason": "price_watch_candidates_reopened",
+                "price_watch_reopened_item_ids": ["item-1"],
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        coordinator,
+        "invalidate_monitoring_runtime_snapshot",
+        lambda *, reason: invalidations.append(reason),
+    )
+
+    coordinator._watch_exec_agent_sizing_cycle_sync(
+        datetime(2026, 6, 12, 0, 1, tzinfo=UTC)
+    )
+
+    assert invalidations == ["watch_exec_agent_sizing_changed_plan_items"]
+
+
 def test_watch_sizing_cycle_skips_database_feedback_outside_window(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1800,6 +1848,115 @@ def test_sqlite_monitoring_snapshot_excludes_terminal_watch_items(tmp_path) -> N
         assert snapshot is not None
         assert [item.symbol for item in snapshot.items] == ["111111"]
         assert snapshot.items[0].trigger_direction == "at_or_above"
+    finally:
+        engine.dispose()
+
+
+def test_monitoring_snapshots_include_only_price_watch_sizing_pending_items(
+    tmp_path,
+) -> None:
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'monitoring-price-watch-items.db'}",
+        runtime_mode="paper",
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    coordinator = AutonomousRuntimeCoordinator(
+        settings=settings,
+        session_factory=session_factory,
+        broker_adapter_factory=lambda settings: None,  # type: ignore[arg-type,return-value]
+    )
+    price_watch_risk, price_watch_policy = bind_kis_account_route(
+        settings=settings,
+        provider="kis",
+        risk_context={
+            "exchange": "KRX",
+            "reward_risk_max_entry_price": "1000.0000",
+            "watch_exec_agent_deferred": {
+                "reason_code": "reward_risk_price_watch",
+                "reason_family": "reward_risk",
+                "disposition": "defer",
+                "price_watch_only": True,
+            },
+        },
+        quantity_policy={"type": "exec_agent_sized", "budget_krw": "150000"},
+    )
+    ordinary_pending_risk, ordinary_pending_policy = bind_kis_account_route(
+        settings=settings,
+        provider="kis",
+        risk_context={
+            "exchange": "KRX",
+            "watch_exec_agent_deferred": {
+                "reason_code": "account_snapshot_unavailable",
+                "reason_family": "account_snapshot",
+                "disposition": "retry",
+            },
+        },
+        quantity_policy={"type": "exec_agent_sized", "budget_krw": "150000"},
+    )
+
+    try:
+        with session_factory() as session:
+            session.add(
+                ExecutionPlan(
+                    external_plan_id="price-watch-sizing-pending-items",
+                    source="kai-trading-core",
+                    market_date=date(2026, 10, 2),
+                    mode="paper",
+                    status="accepted",
+                    items=[
+                        ExecutionPlanItem(
+                            id="price-watch-sizing-pending-item",
+                            plan_item_index=0,
+                            symbol="111111",
+                            side="buy",
+                            intent="intraday_watch_buy",
+                            status="watch_sizing_pending",
+                            trigger_price=Decimal("1000"),
+                            provider="kis",
+                            risk_context=price_watch_risk,
+                            quantity_policy=price_watch_policy,
+                        ),
+                        ExecutionPlanItem(
+                            id="ordinary-sizing-pending-item",
+                            plan_item_index=1,
+                            symbol="222222",
+                            side="buy",
+                            intent="intraday_watch_buy",
+                            status="watch_sizing_pending",
+                            trigger_price=Decimal("2000"),
+                            provider="kis",
+                            risk_context=ordinary_pending_risk,
+                            quantity_policy=ordinary_pending_policy,
+                        ),
+                    ],
+                )
+            )
+            session.commit()
+
+            assert coordinator._load_local_desired_monitoring_symbols_from_sqlite() == [
+                "111111"
+            ]
+            raw_snapshot = (
+                coordinator._load_monitoring_runtime_snapshot_for_symbols_from_sqlite(
+                    loaded_at=datetime(2026, 10, 2, 1, tzinfo=UTC),
+                    symbols=["111111", "222222"],
+                )
+            )
+            orm_snapshot = coordinator._load_monitoring_runtime_snapshot_for_symbols_with_session(
+                db=session,
+                loaded_at=datetime(2026, 10, 2, 1, tzinfo=UTC),
+                symbols=["111111", "222222"],
+            )
+
+        assert raw_snapshot is not None
+        assert [item.id for item in raw_snapshot.items] == [
+            "price-watch-sizing-pending-item"
+        ]
+        assert [item.id for item in orm_snapshot.items] == [
+            "price-watch-sizing-pending-item"
+        ]
     finally:
         engine.dispose()
 
