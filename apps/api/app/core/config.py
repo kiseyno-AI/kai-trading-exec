@@ -196,6 +196,16 @@ class Settings(BaseModel):
         ge=1,
         le=3600,
     )
+    hourly_plan_judgment_max_observation_age_seconds: int = Field(
+        default=420,
+        ge=60,
+        le=3600,
+    )
+    hourly_plan_judgment_max_future_skew_seconds: int = Field(
+        default=5,
+        ge=0,
+        le=300,
+    )
     core_buy_authority_max_observation_age_seconds: int = Field(
         default=420,
         ge=60,
@@ -624,6 +634,8 @@ _ENV_FIELDS = {
     "HOURLY_PLAN_JUDGMENT_RECOVERY_REQUIRED_HEALTHY_OBSERVATIONS": "hourly_plan_judgment_recovery_required_healthy_observations",
     "HOURLY_PLAN_JUDGMENT_RECOVERY_COOLDOWN_SECONDS": "hourly_plan_judgment_recovery_cooldown_seconds",
     "HOURLY_PLAN_JUDGMENT_RECOVERY_MIN_OBSERVATION_INTERVAL_SECONDS": "hourly_plan_judgment_recovery_min_observation_interval_seconds",
+    "HOURLY_PLAN_JUDGMENT_MAX_OBSERVATION_AGE_SECONDS": "hourly_plan_judgment_max_observation_age_seconds",
+    "HOURLY_PLAN_JUDGMENT_MAX_FUTURE_SKEW_SECONDS": "hourly_plan_judgment_max_future_skew_seconds",
     "CORE_BUY_AUTHORITY_MAX_OBSERVATION_AGE_SECONDS": "core_buy_authority_max_observation_age_seconds",
     "CORE_BUY_AUTHORITY_MAX_FUTURE_SKEW_SECONDS": "core_buy_authority_max_future_skew_seconds",
     "VOL_CORR_SIZING_ENABLED": "vol_corr_sizing_enabled",
