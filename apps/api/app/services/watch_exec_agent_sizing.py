@@ -91,6 +91,7 @@ WATCH_EXEC_AGENT_RESPONSE_VERSION = "manual-exec-agent-watch-sizing-v1"
 WATCH_EXEC_AGENT_BINDING_VERSION = "watch-exec-agent-binding-v2"
 WATCH_EXEC_AGENT_DEFER_KEY = "watch_exec_agent_deferred"
 WATCH_EXEC_AGENT_DEFER_SECONDS = 300
+WATCH_EXEC_AGENT_PRICE_WATCH_DEFER_SECONDS = 86400
 RETRYABLE_REJECTION_REASON_CODES = frozenset({
     "trigger_confirmation_and_cost_evidence_missing",
     "trigger_confirmation_missing",
@@ -171,11 +172,28 @@ def run_due_watch_exec_agent_sizing(
     if db is None:
         raise ValueError("db or session_factory is required")
     _supersede_duplicate_watch_buys_before_sizing(settings=settings, db=db, now=cycle_at)
+    reopened_price_watch_ids = _reopen_price_watch_terminal_rejections(
+        db=db,
+        settings=settings,
+        market_date=local_today,
+        now=cycle_at,
+    )
+    if reopened_price_watch_ids:
+        with sqlite_write_lock(db):
+            db.commit()
     plans = _prioritize_sizing_plans(
         _load_candidate_plans(settings=settings, db=db, market_date=local_today)
     )
     if not plans:
-        return _result(idle=True, reason="no_unsized_watch_candidates")
+        return _result(
+            idle=not reopened_price_watch_ids,
+            reason=(
+                "price_watch_candidates_reopened"
+                if reopened_price_watch_ids
+                else "no_unsized_watch_candidates"
+            ),
+            price_watch_reopened_item_ids=reopened_price_watch_ids,
+        )
 
     provider_mismatch_summaries = _quarantine_provider_mismatched_items(
         settings=settings,
@@ -351,6 +369,12 @@ def _run_due_watch_exec_agent_sizing_short_transactions(
 ) -> WatchExecAgentSizingResult:
     with session_factory() as db:
         _supersede_duplicate_watch_buys_before_sizing(settings=settings, db=db, now=cycle_at)
+        reopened_price_watch_ids = _reopen_price_watch_terminal_rejections(
+            db=db,
+            settings=settings,
+            market_date=market_date,
+            now=cycle_at,
+        )
         plans = _prioritize_sizing_plans(
             _load_candidate_plans(settings=settings, db=db, market_date=market_date)
         )
@@ -383,6 +407,7 @@ def _run_due_watch_exec_agent_sizing_short_transactions(
             provider_mismatch_summaries
             or account_route_mismatch_summaries
             or missed_window_summaries
+            or reopened_price_watch_ids
         ):
             db.commit()
         plans = [plan for plan in plans if _unsized_watch_items(plan)]
@@ -392,9 +417,16 @@ def _run_due_watch_exec_agent_sizing_short_transactions(
             provider_mismatch_summaries
             or account_route_mismatch_summaries
             or missed_window_summaries
+            or reopened_price_watch_ids
         ):
             return _result(
                 idle=False,
+                reason=(
+                    "price_watch_candidates_reopened"
+                    if reopened_price_watch_ids
+                    else None
+                ),
+                price_watch_reopened_item_ids=reopened_price_watch_ids,
                 applied=[
                     *provider_mismatch_summaries,
                     *account_route_mismatch_summaries,
@@ -925,6 +957,93 @@ def _load_candidate_plans(*, settings: Settings, db: Session, market_date) -> li
         )
         .order_by(ExecutionPlan.accepted_at.asc(), ExecutionPlan.created_at.asc())
     ).all()
+
+
+def _reopen_price_watch_terminal_rejections(
+    *,
+    db: Session,
+    settings: Settings,
+    market_date,
+    now: datetime,
+) -> list[str]:
+    """Recover same-day price-dependent rejects that exhausted timer retries."""
+
+    checked_at = _utc_datetime(now)
+    reopened_ids: list[str] = []
+    items = db.scalars(
+        select(ExecutionPlanItem)
+        .join(ExecutionPlan, ExecutionPlan.id == ExecutionPlanItem.execution_plan_id)
+        .options(undefer(ExecutionPlanItem.risk_context))
+        .where(
+            ExecutionPlan.mode == settings.runtime_mode,
+            ExecutionPlan.market_date == market_date,
+            ExecutionPlanItem.side == "buy",
+            ExecutionPlanItem.intent.in_(tuple(WATCH_BUY_INTENTS)),
+            ExecutionPlanItem.status == "exec_agent_rejected",
+            ~ExecutionPlanItem.jobs.any(),
+            ~ExecutionPlanItem.broker_orders.any(),
+        )
+        .order_by(ExecutionPlanItem.created_at.asc(), ExecutionPlanItem.id.asc())
+    ).all()
+    for item in items:
+        policy = item.quantity_policy if isinstance(item.quantity_policy, dict) else {}
+        previous_policy = policy.get("previous_policy")
+        risk_context = item.risk_context if isinstance(item.risk_context, dict) else {}
+        stored_cap = _decimal_value(risk_context.get("reward_risk_max_entry_price"))
+        trigger_price = _decimal_value(item.trigger_price)
+        if (
+            policy.get("kind") != "exec_agent_rejected"
+            or policy.get("source") != "exec_agent_watch_sizing"
+            or policy.get("reason_code") != "deterministic_retry_exhausted"
+            or policy.get("reason_family") != "reward_risk"
+            or policy.get("rejection_disposition") != "terminal"
+            or not isinstance(previous_policy, dict)
+            or not is_exec_agent_sizing_policy(previous_policy)
+            or stored_cap is None
+            or trigger_price is None
+            or stored_cap < trigger_price
+            or _reward_risk_rejection_price_cap(settings=settings, item=item) is None
+        ):
+            continue
+
+        retry_after = checked_at + timedelta(
+            seconds=WATCH_EXEC_AGENT_PRICE_WATCH_DEFER_SECONDS
+        )
+        next_context = dict(risk_context)
+        next_context[WATCH_EXEC_AGENT_DEFER_KEY] = {
+            "reason_code": "reward_risk_price_watch",
+            "reason_family": "reward_risk",
+            "disposition": "defer",
+            "reason": "wait for the planned trigger without exhausting price-dependent retries",
+            "deferred_at": checked_at.isoformat(),
+            "retry_after": retry_after.isoformat(),
+            "attempt_count": int(settings.exec_agent_watch_sizing_max_attempts),
+            "max_attempts": int(settings.exec_agent_watch_sizing_max_attempts),
+            "price_watch_only": True,
+        }
+        item.risk_context = compact_json_object(next_context)
+        item.quantity_policy = compact_json_object(previous_policy)
+        apply_plan_item_status(
+            plan_item=item,
+            status=WATCH_SIZING_PENDING_STATUS,
+        )
+        _add_plan_item_audit(
+            db=db,
+            item=item,
+            event_type="watch_exec_agent_price_watch_reopened",
+            summary={
+                "symbol": item.symbol,
+                "reason_code": "reward_risk_price_watch",
+                "reward_risk_max_entry_price": _decimal_text(stored_cap),
+                "retry_after": retry_after.isoformat(),
+            },
+            payload={
+                "prior_quantity_policy": policy,
+                "restored_quantity_policy": previous_policy,
+            },
+        )
+        reopened_ids.append(item.id)
+    return reopened_ids
 
 
 def _quarantine_provider_mismatched_items(
@@ -3101,9 +3220,20 @@ def _apply_decisions(
                 prior_attempt_count = 0
             defer_attempt_count = prior_attempt_count + 1
             max_defer_attempts = int(settings.exec_agent_watch_sizing_max_attempts)
+            reward_risk_cap = _reward_risk_rejection_price_cap(
+                settings=settings,
+                item=item,
+            )
+            price_watch_only = bool(
+                disposition == "defer"
+                and reason_family == "reward_risk"
+                and reward_risk_cap is not None
+                and defer_attempt_count >= max_defer_attempts
+            )
             exhausted = bool(
                 disposition in {"retry", "defer"}
                 and defer_attempt_count >= max_defer_attempts
+                and not price_watch_only
             )
             if exhausted:
                 disposition = "terminal"
@@ -3123,7 +3253,13 @@ def _apply_decisions(
                 "reason_family": reason_family,
             }
             if disposition in {"retry", "defer"}:
-                retry_after = decision_at + timedelta(seconds=WATCH_EXEC_AGENT_DEFER_SECONDS)
+                retry_after = decision_at + timedelta(
+                    seconds=(
+                        WATCH_EXEC_AGENT_PRICE_WATCH_DEFER_SECONDS
+                        if price_watch_only
+                        else WATCH_EXEC_AGENT_DEFER_SECONDS
+                    )
+                )
                 risk_context = (
                     dict(item.risk_context)
                     if isinstance(item.risk_context, dict)
@@ -3140,10 +3276,8 @@ def _apply_decisions(
                     "max_attempts": max_defer_attempts,
                     "deterministic_gate_reasons": envelope.get("hard_reject_reasons"),
                 }
-                reward_risk_cap = _reward_risk_rejection_price_cap(
-                    settings=settings,
-                    item=item,
-                )
+                if price_watch_only:
+                    risk_context[WATCH_EXEC_AGENT_DEFER_KEY]["price_watch_only"] = True
                 if reward_risk_cap is not None:
                     risk_context["reward_risk_max_entry_price"] = _decimal_text(
                         reward_risk_cap

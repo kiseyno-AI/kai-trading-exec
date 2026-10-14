@@ -256,7 +256,7 @@ def test_freeform_reward_risk_reason_uses_deterministic_defer_disposition() -> N
     assert deferred["reason_family"] == "reward_risk"
 
 
-def test_deterministic_defer_becomes_terminal_after_attempt_cap() -> None:
+def test_price_dependent_reward_risk_defer_remains_monitored_after_attempt_cap() -> None:
     settings = Settings(
         runtime_mode="live",
         exec_agent_min_reward_risk=Decimal("1.8"),
@@ -291,7 +291,9 @@ def test_deterministic_defer_becomes_terminal_after_attempt_cap() -> None:
         db=None,  # type: ignore[arg-type]
         settings=settings,
         plan=plan,
-        account_context=_fresh_account_context(),
+        account_context=_fresh_account_context(
+            observed_at="2026-06-04T00:05:00+00:00"
+        ),
         expected_item_ids={"watch-item-1"},
         request_payload=_DIRECT_APPLY_REQUEST_PAYLOAD,
         decision_payload={
@@ -312,14 +314,124 @@ def test_deterministic_defer_becomes_terminal_after_attempt_cap() -> None:
                 }
             ],
         },
+        now=datetime(2026, 6, 4, 0, 5, tzinfo=UTC),
     )
 
-    assert summary["deferred"] == 0
-    assert summary["rejected"] == 1
-    assert item.status == "exec_agent_rejected"
-    assert item.quantity_policy["rejection_disposition"] == "terminal"
-    assert item.quantity_policy["reason_code"] == "deterministic_retry_exhausted"
-    assert watch_sizing.WATCH_EXEC_AGENT_DEFER_KEY not in item.risk_context
+    assert summary["deferred"] == 1
+    assert summary["rejected"] == 0
+    assert item.status == watch_sizing.WATCH_SIZING_PENDING_STATUS
+    deferred = item.risk_context[watch_sizing.WATCH_EXEC_AGENT_DEFER_KEY]
+    assert deferred["disposition"] == "defer"
+    assert deferred["reason_family"] == "reward_risk"
+    assert deferred["attempt_count"] == 2
+    assert deferred["max_attempts"] == 2
+    assert deferred["price_watch_only"] is True
+    assert deferred["retry_after"] == "2026-06-05T00:05:00+00:00"
+    assert item.risk_context["reward_risk_max_entry_price"] == "6440.0000"
+
+
+def test_reopens_same_day_price_watch_after_legacy_retry_exhaustion() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="live",
+        exec_agent_min_reward_risk=Decimal("1.8"),
+        exec_agent_watch_sizing_max_attempts=3,
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+
+    with session_factory() as session:
+        eligible = _watch_item(
+            item_id="price-watch-eligible",
+            symbol="028670",
+            risk_context={
+                "exchange": "KRX",
+                "target_price": "7050",
+                "stop_loss_price": "6400",
+                "reward_risk_max_entry_price": "6630.0000",
+            },
+            trigger_price="6630",
+            limit_price="6650",
+        )
+        original_policy = dict(eligible.quantity_policy)
+        eligible.status = "exec_agent_rejected"
+        eligible.quantity_policy = {
+            "kind": "exec_agent_rejected",
+            "source": "exec_agent_watch_sizing",
+            "reason": "deterministic watch rejection remained unresolved after 3 attempts",
+            "reason_code": "deterministic_retry_exhausted",
+            "reason_family": "reward_risk",
+            "rejection_disposition": "terminal",
+            "exec_agent_decision": {
+                "source": "openclaw_exec_agent_watch_sizing",
+                "action": "reject",
+                "decision": "rejected",
+                "execution_plan_item_id": eligible.id,
+                "symbol": eligible.symbol,
+                "quantity": 0,
+                "approved_quantity": 0,
+                "approved_notional_krw": None,
+                "reason_code": "deterministic_retry_exhausted",
+                "reason_family": "reward_risk",
+                "rejection_disposition": "terminal",
+                "reason": "deterministic watch rejection remained unresolved after 3 attempts",
+            },
+            "previous_policy": original_policy,
+        }
+        eligible.quantity_policy["short_term_exec_agent_decision"] = dict(
+            eligible.quantity_policy["exec_agent_decision"]
+        )
+        structural = _watch_item(
+            item_id="price-watch-structural",
+            symbol="041960",
+            risk_context={
+                "exchange": "KRX",
+                "target_price": "12700",
+                "stop_loss_price": "11450",
+            },
+            trigger_price="11900",
+            limit_price="12050",
+        )
+        structural.status = "exec_agent_rejected"
+        structural.quantity_policy = dict(eligible.quantity_policy)
+        structural.quantity_policy["previous_policy"] = dict(structural.quantity_policy)
+        plan = ExecutionPlan(
+            external_plan_id="plan-price-watch-recovery",
+            source="core-short-term-decider",
+            market_date=date(2026, 10, 14),
+            mode="live",
+            status="accepted",
+            items=[eligible, structural],
+        )
+        session.add(plan)
+        session.commit()
+
+        reopened = watch_sizing._reopen_price_watch_terminal_rejections(
+            db=session,
+            settings=settings,
+            market_date=date(2026, 10, 14),
+            now=datetime(2026, 10, 14, 1, 0, tzinfo=UTC),
+        )
+        session.commit()
+
+        assert reopened == ["price-watch-eligible"]
+        assert eligible.status == watch_sizing.WATCH_SIZING_PENDING_STATUS
+        assert eligible.quantity_policy == original_policy
+        deferred = eligible.risk_context[watch_sizing.WATCH_EXEC_AGENT_DEFER_KEY]
+        assert deferred["price_watch_only"] is True
+        assert deferred["retry_after"] == "2026-10-15T01:00:00+00:00"
+        assert structural.status == "exec_agent_rejected"
+        audit = session.scalar(
+            select(ExecutionPlanItemAudit).where(
+                ExecutionPlanItemAudit.execution_plan_item_id == eligible.id,
+                ExecutionPlanItemAudit.event_type
+                == "watch_exec_agent_price_watch_reopened",
+            )
+        )
+        assert audit is not None
+
+    engine.dispose()
 
 
 def test_decision_validation_rejects_noncanonical_disposition() -> None:
@@ -5542,6 +5654,11 @@ def test_run_due_retries_the_entire_batch_after_a_partial_response(monkeypatch) 
         watch_sizing,
         "_supersede_duplicate_watch_buys_before_sizing",
         lambda **_: 0,
+    )
+    monkeypatch.setattr(
+        watch_sizing,
+        "_reopen_price_watch_terminal_rejections",
+        lambda **_: [],
     )
     monkeypatch.setattr(watch_sizing, "_load_sizing_account_context", lambda **_: account_context)
     monkeypatch.setattr(
