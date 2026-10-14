@@ -39,6 +39,7 @@ from app.services.execution_account_route import (
     validate_kis_account_route,
 )
 from app.services.execution_semantics import (
+    KRX_ASSET_CLASS_ALIASES,
     WATCH_BUY_INTENTS,
     is_exec_agent_sizing_policy,
     is_short_term_watch_buy_intent,
@@ -92,6 +93,7 @@ UNSIZED_NEXT_OPEN_STATUSES = frozenset({"pending", "next_open_buy_pending_config
 WATCH_EXEC_AGENT_BATCH_SIZE = 10
 WATCH_EXEC_AGENT_RESPONSE_VERSION = "manual-exec-agent-watch-sizing-v1"
 WATCH_EXEC_AGENT_BINDING_VERSION = "watch-exec-agent-binding-v2"
+SERVER_EFFECTIVE_STOP_POLICY_VERSION = "server_effective_stop_v1"
 WATCH_EXEC_AGENT_DEFER_KEY = "watch_exec_agent_deferred"
 WATCH_EXEC_AGENT_DEFER_SECONDS = 300
 WATCH_EXEC_AGENT_PRICE_WATCH_DEFER_SECONDS = 300
@@ -993,6 +995,120 @@ def _load_candidate_plans(*, settings: Settings, db: Session, market_date) -> li
     ).all()
 
 
+def _reopen_stale_effective_stop_terminal_rejections(
+    *,
+    db: Session,
+    settings: Settings,
+    market_date,
+    now: datetime,
+) -> list[str]:
+    """Reassess same-day RR rejects created before server stop normalization.
+
+    The migration is deliberately one-shot.  Current-policy terminal rejects
+    carry ``effective_stop_policy_version`` and are never reopened here.
+    Existing jobs or broker orders also make the old decision immutable.
+    """
+
+    checked_at = _utc_datetime(now)
+    reopened_ids: list[str] = []
+    items = db.scalars(
+        select(ExecutionPlanItem)
+        .join(ExecutionPlan, ExecutionPlan.id == ExecutionPlanItem.execution_plan_id)
+        .options(
+            undefer(ExecutionPlanItem.quantity_policy),
+            undefer(ExecutionPlanItem.risk_context),
+        )
+        .where(
+            ExecutionPlan.mode == settings.runtime_mode,
+            ExecutionPlan.market_date == market_date,
+            ExecutionPlan.status == "accepted",
+            ExecutionPlanItem.side == "buy",
+            ExecutionPlanItem.intent.in_(tuple(WATCH_BUY_INTENTS)),
+            ExecutionPlanItem.status == "exec_agent_rejected",
+            ~ExecutionPlanItem.jobs.any(),
+            ~ExecutionPlanItem.broker_orders.any(),
+        )
+        .order_by(ExecutionPlanItem.created_at.asc(), ExecutionPlanItem.id.asc())
+    ).all()
+    for item in items:
+        provider = str(item.provider or "").strip().lower()
+        asset_class = str(item.asset_class or "").strip().lower()
+        if (
+            provider not in {"kis", "korea-investment", "korea_investment"}
+            or asset_class not in KRX_ASSET_CLASS_ALIASES
+        ):
+            continue
+        policy = item.quantity_policy if isinstance(item.quantity_policy, dict) else {}
+        previous_policy = policy.get("previous_policy")
+        if (
+            policy.get("kind") != "exec_agent_rejected"
+            or policy.get("source") != "exec_agent_watch_sizing"
+            or policy.get("reason_code") != "reward_risk_below_minimum"
+            or policy.get("reason_family") != "reward_risk"
+            or policy.get("rejection_disposition") != "terminal"
+            or "effective_stop_policy_version" in policy
+            or not isinstance(previous_policy, dict)
+            or not is_exec_agent_sizing_policy(previous_policy)
+        ):
+            continue
+
+        expires_at = _price_watch_session_expiry(settings=settings, item=item)
+        entry_price, _entry_source = _entry_reference_for_item(item)
+        upstream_stop = _upstream_stop_price(item)
+        risk_context = item.risk_context if isinstance(item.risk_context, dict) else {}
+        target_price = _decimal_value(risk_context.get("target_price"))
+        if (
+            expires_at is None
+            or expires_at <= checked_at
+            or entry_price is None
+            or upstream_stop is None
+            or target_price is None
+            or not upstream_stop < entry_price < target_price
+        ):
+            continue
+        normalized_stop = effective_stop_price(
+            settings=settings,
+            entry_price=entry_price,
+            upstream_stop_price=upstream_stop,
+        )
+        reward_risk_entry_cap = _reward_risk_rejection_price_cap(
+            settings=settings,
+            item=item,
+        )
+        if (
+            normalized_stop <= upstream_stop
+            or normalized_stop >= entry_price
+            or reward_risk_entry_cap is None
+        ):
+            continue
+
+        item.quantity_policy = compact_json_object(previous_policy)
+        apply_plan_item_status(
+            plan_item=item,
+            status=WATCH_SIZING_PENDING_STATUS,
+        )
+        _add_plan_item_audit(
+            db=db,
+            item=item,
+            event_type="watch_exec_agent_effective_stop_policy_reopened",
+            summary={
+                "symbol": item.symbol,
+                "reason_code": "effective_stop_policy_reassessment",
+                "upstream_stop_price": _decimal_text(upstream_stop),
+                "effective_stop_price": _decimal_text(normalized_stop),
+                "reward_risk_max_entry_price": _decimal_text(reward_risk_entry_cap),
+                "effective_stop_policy_version": SERVER_EFFECTIVE_STOP_POLICY_VERSION,
+                "expires_at": expires_at.isoformat(),
+            },
+            payload={
+                "prior_quantity_policy": policy,
+                "restored_quantity_policy": previous_policy,
+            },
+        )
+        reopened_ids.append(item.id)
+    return reopened_ids
+
+
 def _reopen_price_watch_terminal_rejections(
     *,
     db: Session,
@@ -1000,10 +1116,15 @@ def _reopen_price_watch_terminal_rejections(
     market_date,
     now: datetime,
 ) -> list[str]:
-    """Recover same-day price-dependent rejects that exhausted timer retries."""
+    """Recover same-day RR rejects that are safe to reassess without exposure."""
 
     checked_at = _utc_datetime(now)
-    reopened_ids: list[str] = []
+    reopened_ids = _reopen_stale_effective_stop_terminal_rejections(
+        db=db,
+        settings=settings,
+        market_date=market_date,
+        now=checked_at,
+    )
     items = db.scalars(
         select(ExecutionPlanItem)
         .join(ExecutionPlan, ExecutionPlan.id == ExecutionPlanItem.execution_plan_id)
@@ -3460,7 +3581,7 @@ def _apply_decisions(
                 ),
                 "allowed_action_envelope": envelope,
                 "market_regime_guardrail": envelope.get("market_regime_guardrail"),
-                "effective_stop_policy_version": "server_effective_stop_v1",
+                "effective_stop_policy_version": SERVER_EFFECTIVE_STOP_POLICY_VERSION,
                 "upstream_stop_price": envelope.get("upstream_stop_price"),
                 "effective_stop_price": envelope.get("effective_stop_price"),
                 "stop_price": envelope.get("effective_stop_price"),
@@ -3854,6 +3975,7 @@ def _canonical_terminal_rejection(
             "reason_code": normalized_reason_code,
             "reason_family": normalized_reason_family,
             "rejection_disposition": "terminal",
+            "effective_stop_policy_version": SERVER_EFFECTIVE_STOP_POLICY_VERSION,
             "exec_agent_decision": summary,
             "short_term_exec_agent_decision": summary,
             "exec_agent_decision_audit": {

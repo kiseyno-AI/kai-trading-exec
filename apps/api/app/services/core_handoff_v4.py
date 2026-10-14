@@ -2033,6 +2033,9 @@ def _watch_rejection_policy_matches(
         "previous_policy",
     }
     canonical_keys = legacy_keys | {"reason_family", "rejection_disposition"}
+    versioned_canonical_keys = canonical_keys | {
+        "effective_stop_policy_version"
+    }
     decision = quantity_policy.get("exec_agent_decision")
     previous_policy = quantity_policy.get("previous_policy")
     previous_policy_matches = bool(
@@ -2046,9 +2049,22 @@ def _watch_rejection_policy_matches(
         )
     )
     policy_keys = set(quantity_policy)
-    has_canonical_disposition = policy_keys == canonical_keys
+    has_canonical_disposition = policy_keys in {
+        frozenset(canonical_keys),
+        frozenset(versioned_canonical_keys),
+    }
     return bool(
-        policy_keys in {frozenset(legacy_keys), frozenset(canonical_keys)}
+        policy_keys
+        in {
+            frozenset(legacy_keys),
+            frozenset(canonical_keys),
+            frozenset(versioned_canonical_keys),
+        }
+        and (
+            policy_keys != versioned_canonical_keys
+            or quantity_policy.get("effective_stop_policy_version")
+            == "server_effective_stop_v1"
+        )
         and quantity_policy.get("kind") == "exec_agent_rejected"
         and quantity_policy.get("source") == "exec_agent_watch_sizing"
         and previous_policy_matches
