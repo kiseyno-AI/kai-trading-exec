@@ -1326,8 +1326,109 @@ class KisBrokerAdapter(BrokerAdapter):
         minute_volume = _parse_decimal(latest.get("cntg_vol"))
         turnover = _parse_decimal(latest.get("acml_tr_pbmn"))
         volume = _parse_decimal(output1.get("acml_vol"))
-        day_high = _parse_decimal(output1.get("stck_hgpr"))
-        day_low = _parse_decimal(output1.get("stck_lwpr"))
+        day_high = _parse_decimal(
+            output1.get("stck_hgpr") or output1.get("STCK_HGPR")
+        )
+        day_low = _parse_decimal(
+            output1.get("stck_lwpr") or output1.get("STCK_LWPR")
+        )
+        day_range_field_source: dict[str, object] = {
+            "endpoint": KIS_INTRADAY_MINUTE_PRICE_PATH,
+            "tr_id": KIS_INTRADAY_MINUTE_PRICE_TR_ID,
+        }
+        if day_high is None or day_low is None:
+            current_quote = self.get_current_price(
+                access_token,
+                symbol=symbol,
+                exchange="KRX",
+            )
+            current_output = (
+                _first_payload_object(current_quote.payload, "output")
+                if current_quote is not None
+                else None
+            )
+            current_symbol = (
+                _optional_string(
+                    current_output.get("stck_shrn_iscd")
+                    or current_output.get("STCK_SHRN_ISCD")
+                )
+                if current_output is not None
+                else None
+            )
+            current_volume = (
+                _parse_decimal(
+                    current_output.get("acml_vol")
+                    or current_output.get("ACML_VOL")
+                )
+                if current_output is not None
+                else None
+            )
+            current_turnover = (
+                _parse_decimal(
+                    current_output.get("acml_tr_pbmn")
+                    or current_output.get("ACML_TR_PBMN")
+                )
+                if current_output is not None
+                else None
+            )
+            current_day_high = (
+                _parse_decimal(
+                    current_output.get("stck_hgpr")
+                    or current_output.get("STCK_HGPR")
+                )
+                if current_output is not None
+                else None
+            )
+            current_day_low = (
+                _parse_decimal(
+                    current_output.get("stck_lwpr")
+                    or current_output.get("STCK_LWPR")
+                )
+                if current_output is not None
+                else None
+            )
+            minute_high = _parse_decimal(
+                latest.get("stck_hgpr") or latest.get("STCK_HGPR")
+            )
+            minute_low = _parse_decimal(
+                latest.get("stck_lwpr") or latest.get("STCK_LWPR")
+            )
+            quote_price = current_quote.price if current_quote is not None else None
+            bound_day_range_is_valid = bool(
+                current_symbol == symbol.strip()
+                and current_volume is not None
+                and volume is not None
+                and current_volume >= volume
+                and current_turnover is not None
+                and turnover is not None
+                and current_turnover >= turnover
+                and current_day_high is not None
+                and current_day_high > 0
+                and current_day_low is not None
+                and current_day_low > 0
+                and current_day_low <= current_day_high
+                and minute_high is not None
+                and minute_low is not None
+                and current_day_low <= minute_low <= minute_high <= current_day_high
+                and quote_price is not None
+                and current_day_low <= quote_price <= current_day_high
+            )
+            if not bound_day_range_is_valid:
+                raise BrokerAdapterError(
+                    "KIS intraday liquidity day-range evidence is invalid",
+                    status_code=502,
+                    classification=BrokerErrorClassification.VALIDATION,
+                    code="kis_intraday_liquidity_day_range_evidence_invalid",
+                )
+            day_high = current_day_high
+            day_low = current_day_low
+            day_range_field_source = {
+                "endpoint": KIS_CURRENT_PRICE_PATH,
+                "tr_id": KIS_CURRENT_PRICE_TR_ID,
+                "bound_endpoint": KIS_INTRADAY_MINUTE_PRICE_PATH,
+                "bound_tr_id": KIS_INTRADAY_MINUTE_PRICE_TR_ID,
+                "binding": "same_symbol_monotonic_cumulative_totals_and_containing_minute_range",
+            }
         if any(
             value is None or value < 0
             for value in (minute_volume, turnover, volume)
@@ -1364,6 +1465,18 @@ class KisBrokerAdapter(BrokerAdapter):
                 "provider": self.provider,
                 "endpoint": KIS_INTRADAY_MINUTE_PRICE_PATH,
                 "tr_id": KIS_INTRADAY_MINUTE_PRICE_TR_ID,
+                "field_sources": {
+                    "volume": {
+                        "endpoint": KIS_INTRADAY_MINUTE_PRICE_PATH,
+                        "tr_id": KIS_INTRADAY_MINUTE_PRICE_TR_ID,
+                    },
+                    "turnover": {
+                        "endpoint": KIS_INTRADAY_MINUTE_PRICE_PATH,
+                        "tr_id": KIS_INTRADAY_MINUTE_PRICE_TR_ID,
+                    },
+                    "day_high": dict(day_range_field_source),
+                    "day_low": dict(day_range_field_source),
+                },
                 "response_metadata": {
                     "status_code": response.status_code,
                 },

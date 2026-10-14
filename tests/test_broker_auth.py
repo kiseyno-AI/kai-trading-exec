@@ -256,6 +256,35 @@ class RecordingHttpClient:
         )
 
 
+class SequencedGetHttpClient(RecordingHttpClient):
+    def __init__(self, get_responses: list[dict[str, object]]) -> None:
+        super().__init__({}, get_response={})
+        self.get_responses = list(get_responses)
+
+    def get_json(
+        self,
+        *,
+        url: str,
+        headers: dict[str, str],
+        params: dict[str, object],
+        timeout_seconds: float,
+    ) -> JsonHttpResponse:
+        self.get_calls.append(
+            {
+                "url": url,
+                "headers": headers,
+                "params": params,
+                "timeout_seconds": timeout_seconds,
+            }
+        )
+        assert self.get_responses, "unexpected extra GET request"
+        return JsonHttpResponse(
+            status_code=200,
+            headers={"content-type": "application/json", "tr_cont": "D"},
+            payload=self.get_responses.pop(0),
+        )
+
+
 class StubBrokerAdapter:
     provider = "kis"
 
@@ -21378,6 +21407,216 @@ def test_kis_adapter_fetches_timestamped_intraday_liquidity_snapshot() -> None:
         "FID_PW_DATA_INCU_YN": "N",
         "FID_ETC_CLS_CODE": "",
     }
+
+
+def test_kis_intraday_liquidity_uses_dated_row_day_range_when_summary_omits_it() -> None:
+    http_client = SequencedGetHttpClient(
+        [
+            {
+                "rt_cd": "0",
+                "output1": {
+                    "acml_vol": "132374",
+                    "acml_tr_pbmn": "10530397800",
+                },
+                "output2": [
+                    {
+                        "stck_bsop_date": "20261014",
+                        "stck_cntg_hour": "150000",
+                        "cntg_vol": "216",
+                        "acml_tr_pbmn": "10530397800",
+                        "stck_hgpr": "79900",
+                        "stck_lwpr": "79800",
+                        "stck_prpr": "79800",
+                    }
+                ],
+            },
+            {
+                "rt_cd": "0",
+                "output": {
+                    "stck_shrn_iscd": "171090",
+                    "stck_prpr": "79800",
+                    "stck_hgpr": "81800",
+                    "stck_lwpr": "75800",
+                    "acml_vol": "132590",
+                    "acml_tr_pbmn": "10547634600",
+                },
+            },
+        ]
+    )
+    adapter = KisBrokerAdapter(
+        settings=Settings(
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+        ),
+        http_client=http_client,
+    )
+
+    snapshot = adapter.get_intraday_liquidity_snapshot(
+        "access-token",
+        symbol="171090",
+        exchange="KOSDAQ",
+        reference_at=datetime(2026, 10, 14, 6, 0, 5, tzinfo=UTC),
+    )
+
+    assert snapshot is not None
+    assert snapshot.observed_at == datetime(2026, 10, 14, 6, 0, tzinfo=UTC)
+    assert snapshot.volume == Decimal("132374")
+    assert snapshot.turnover == Decimal("10530397800")
+    assert snapshot.day_high == Decimal("81800")
+    assert snapshot.day_low == Decimal("75800")
+    assert snapshot.payload["field_sources"]["day_high"] == {
+        "endpoint": "/uapi/domestic-stock/v1/quotations/inquire-price",
+        "tr_id": "FHKST01010100",
+        "bound_endpoint": (
+            "/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice"
+        ),
+        "bound_tr_id": "FHKST03010200",
+        "binding": (
+            "same_symbol_monotonic_cumulative_totals_and_containing_minute_range"
+        ),
+    }
+    assert len(http_client.get_calls) == 2
+    assert http_client.get_calls[0]["url"].endswith(
+        "/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice"
+    )
+    assert http_client.get_calls[1]["url"].endswith(
+        "/uapi/domestic-stock/v1/quotations/inquire-price"
+    )
+    assert http_client.get_calls[1]["params"]["FID_COND_MRKT_DIV_CODE"] == "J"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("stck_shrn_iscd", "999999"),
+        ("acml_vol", "132000"),
+        ("acml_tr_pbmn", "10500000000"),
+        ("stck_hgpr", "79850"),
+        ("stck_lwpr", "79850"),
+        ("stck_hgpr", None),
+        ("stck_lwpr", None),
+        ("stck_prpr", "0"),
+    ],
+    ids=[
+        "symbol-mismatch",
+        "volume-behind",
+        "turnover-behind",
+        "daily-high-misses-minute",
+        "daily-low-misses-minute-and-price",
+        "missing-daily-high",
+        "missing-daily-low",
+        "missing-current-quote",
+    ],
+)
+def test_kis_intraday_liquidity_rejects_unbound_current_day_range(
+    field: str,
+    value: str | None,
+) -> None:
+    current_output: dict[str, object] = {
+        "stck_shrn_iscd": "171090",
+        "stck_prpr": "79800",
+        "stck_hgpr": "81800",
+        "stck_lwpr": "75800",
+        "acml_vol": "132590",
+        "acml_tr_pbmn": "10547634600",
+    }
+    current_output[field] = value
+    http_client = SequencedGetHttpClient(
+        [
+            {
+                "rt_cd": "0",
+                "output1": {
+                    "acml_vol": "132374",
+                    "acml_tr_pbmn": "10530397800",
+                },
+                "output2": [
+                    {
+                        "stck_bsop_date": "20261014",
+                        "stck_cntg_hour": "150000",
+                        "cntg_vol": "216",
+                        "acml_tr_pbmn": "10530397800",
+                        "stck_hgpr": "79900",
+                        "stck_lwpr": "79800",
+                    }
+                ],
+            },
+            {"rt_cd": "0", "output": current_output},
+        ]
+    )
+    adapter = KisBrokerAdapter(
+        settings=Settings(
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+        ),
+        http_client=http_client,
+    )
+
+    with pytest.raises(BrokerAdapterError) as exc_info:
+        adapter.get_intraday_liquidity_snapshot(
+            "access-token",
+            symbol="171090",
+            reference_at=datetime(2026, 10, 14, 6, 0, 5, tzinfo=UTC),
+        )
+
+    assert exc_info.value.code == (
+        "kis_intraday_liquidity_day_range_evidence_invalid"
+    )
+
+
+def test_kis_intraday_liquidity_propagates_bound_current_price_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = KisBrokerAdapter(
+        settings=Settings(
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+        ),
+        http_client=RecordingHttpClient(
+            {},
+            get_response={
+                "rt_cd": "0",
+                "output1": {
+                    "acml_vol": "132374",
+                    "acml_tr_pbmn": "10530397800",
+                },
+                "output2": [
+                    {
+                        "stck_bsop_date": "20261014",
+                        "stck_cntg_hour": "150000",
+                        "cntg_vol": "216",
+                        "acml_tr_pbmn": "10530397800",
+                        "stck_hgpr": "79900",
+                        "stck_lwpr": "79800",
+                    }
+                ],
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        adapter,
+        "get_current_price",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            BrokerAdapterError(
+                "current quote unavailable",
+                classification=BrokerErrorClassification.TRANSIENT,
+                retryable=True,
+                code="kis_current_price_unavailable",
+            )
+        ),
+    )
+
+    with pytest.raises(BrokerAdapterError) as exc_info:
+        adapter.get_intraday_liquidity_snapshot(
+            "access-token",
+            symbol="171090",
+            reference_at=datetime(2026, 10, 14, 6, 0, 5, tzinfo=UTC),
+        )
+
+    assert exc_info.value.code == "kis_current_price_unavailable"
+    assert exc_info.value.retryable is True
 
 
 @pytest.mark.parametrize(
