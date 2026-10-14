@@ -664,6 +664,264 @@ def test_reopens_legacy_price_watch_only_when_cap_matches_direction(
     engine.dispose()
 
 
+def test_reopens_pre_policy_reward_risk_reject_once_for_effective_stop_reassessment() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="live",
+        exec_agent_stop_loss_pct=Decimal("0.025"),
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+
+    with session_factory() as session:
+        stale = _watch_item(
+            item_id="stale-effective-stop-reject",
+            symbol="000020",
+            risk_context={
+                "exchange": "KRX",
+                "target_price": "6130",
+                "stop_loss_price": "5090",
+            },
+            trigger_price="5470",
+            limit_price="5510",
+        )
+        stale.provider = "kis"
+        stale.venue = "KRX"
+        stale.asset_class = "stock"
+        original_policy = {
+            **stale.quantity_policy,
+            "entry_price": "5510.0000",
+            "target_price": "6130.0000",
+            "stop_price": "5090.0000",
+        }
+        stale.status = "exec_agent_rejected"
+        stale.quantity_policy = {
+            "kind": "exec_agent_rejected",
+            "source": "exec_agent_watch_sizing",
+            "reason": "legacy reward-risk calculation rejected the candidate",
+            "reason_code": "reward_risk_below_minimum",
+            "reason_family": "reward_risk",
+            "rejection_disposition": "terminal",
+            "previous_policy": original_policy,
+        }
+
+        already_versioned = _watch_item(
+            item_id="versioned-effective-stop-reject",
+            symbol="041960",
+            risk_context={
+                "exchange": "KRX",
+                "target_price": "12700",
+                "stop_loss_price": "11450",
+            },
+            trigger_price="11900",
+            limit_price="12050",
+        )
+        already_versioned.provider = "kis"
+        already_versioned.venue = "KRX"
+        already_versioned.asset_class = "stock"
+        already_versioned.status = "exec_agent_rejected"
+        already_versioned.quantity_policy = {
+            "kind": "exec_agent_rejected",
+            "source": "exec_agent_watch_sizing",
+            "reason": "current reward-risk calculation rejected the candidate",
+            "reason_code": "reward_risk_below_minimum",
+            "reason_family": "reward_risk",
+            "rejection_disposition": "terminal",
+            "effective_stop_policy_version": "server_effective_stop_v2",
+            "previous_policy": dict(already_versioned.quantity_policy),
+        }
+
+        unchanged_stop = _watch_item(
+            item_id="unchanged-effective-stop-reject",
+            symbol="048910",
+            risk_context={
+                "exchange": "KRX",
+                "target_price": "9300",
+                "stop_loss_price": "8700",
+            },
+            trigger_price="8730",
+            limit_price="8850",
+        )
+        unchanged_stop.provider = "kis"
+        unchanged_stop.venue = "KRX"
+        unchanged_stop.asset_class = "stock"
+        unchanged_stop.status = "exec_agent_rejected"
+        unchanged_stop.quantity_policy = {
+            "kind": "exec_agent_rejected",
+            "source": "exec_agent_watch_sizing",
+            "reason": "reward-risk remains below the threshold",
+            "reason_code": "reward_risk_below_minimum",
+            "reason_family": "reward_risk",
+            "rejection_disposition": "terminal",
+            "previous_policy": dict(unchanged_stop.quantity_policy),
+        }
+
+        no_viable_entry = _watch_item(
+            item_id="no-viable-effective-stop-entry",
+            symbol="005930",
+            risk_context={
+                "exchange": "KRX",
+                "target_price": "5550",
+                "stop_loss_price": "5000",
+                "trigger_direction": "at_or_above",
+            },
+            trigger_price="5500",
+            limit_price="5510",
+        )
+        no_viable_entry.provider = "kis"
+        no_viable_entry.venue = "KRX"
+        no_viable_entry.asset_class = "stock"
+        no_viable_entry.status = "exec_agent_rejected"
+        no_viable_entry.quantity_policy = {
+            "kind": "exec_agent_rejected",
+            "source": "exec_agent_watch_sizing",
+            "reason": "reward-risk remains impossible across the watch range",
+            "reason_code": "reward_risk_below_minimum",
+            "reason_family": "reward_risk",
+            "rejection_disposition": "terminal",
+            "previous_policy": dict(no_viable_entry.quantity_policy),
+        }
+
+        foreign_provider = _watch_item(
+            item_id="foreign-provider-effective-stop-reject",
+            symbol="AAPL",
+            risk_context={
+                "exchange": "KRX",
+                "target_price": "6130",
+                "stop_loss_price": "5090",
+            },
+            trigger_price="5470",
+            limit_price="5510",
+        )
+        foreign_provider.provider = "alpaca"
+        foreign_provider.venue = "KRX"
+        foreign_provider.asset_class = "us_equity"
+        foreign_provider.status = "exec_agent_rejected"
+        foreign_provider.quantity_policy = {
+            "kind": "exec_agent_rejected",
+            "source": "exec_agent_watch_sizing",
+            "reason": "foreign execution must not enter the KRX migration",
+            "reason_code": "reward_risk_below_minimum",
+            "reason_family": "reward_risk",
+            "rejection_disposition": "terminal",
+            "previous_policy": dict(foreign_provider.quantity_policy),
+        }
+
+        completed_item = _watch_item(
+            item_id="completed-plan-effective-stop-reject",
+            symbol="105560",
+            risk_context={
+                "exchange": "KRX",
+                "target_price": "6130",
+                "stop_loss_price": "5090",
+            },
+            trigger_price="5470",
+            limit_price="5510",
+        )
+        completed_item.provider = "kis"
+        completed_item.venue = "KRX"
+        completed_item.asset_class = "stock"
+        completed_item.status = "exec_agent_rejected"
+        completed_item.quantity_policy = {
+            "kind": "exec_agent_rejected",
+            "source": "exec_agent_watch_sizing",
+            "reason": "completed plans must remain terminal",
+            "reason_code": "reward_risk_below_minimum",
+            "reason_family": "reward_risk",
+            "rejection_disposition": "terminal",
+            "previous_policy": dict(completed_item.quantity_policy),
+        }
+
+        session.add(
+            ExecutionPlan(
+                external_plan_id="plan-effective-stop-policy-reassessment",
+                source="core-short-term-decider",
+                market_date=date(2026, 10, 14),
+                mode="live",
+                status="accepted",
+                items=[
+                    stale,
+                    already_versioned,
+                    unchanged_stop,
+                    no_viable_entry,
+                    foreign_provider,
+                ],
+            )
+        )
+        session.add(
+            ExecutionPlan(
+                external_plan_id="completed-effective-stop-policy-reassessment",
+                source="core-short-term-decider",
+                market_date=date(2026, 10, 14),
+                mode="live",
+                status="completed_no_trade",
+                items=[completed_item],
+            )
+        )
+        session.commit()
+
+        reopened = watch_sizing._reopen_price_watch_terminal_rejections(
+            db=session,
+            settings=settings,
+            market_date=date(2026, 10, 14),
+            now=datetime(2026, 10, 14, 5, 0, tzinfo=UTC),
+        )
+        session.commit()
+
+        assert reopened == [stale.id]
+        assert stale.status == watch_sizing.WATCH_SIZING_PENDING_STATUS
+        assert stale.quantity_policy == original_policy
+        assert already_versioned.status == "exec_agent_rejected"
+        assert unchanged_stop.status == "exec_agent_rejected"
+        assert no_viable_entry.status == "exec_agent_rejected"
+        assert foreign_provider.status == "exec_agent_rejected"
+        assert completed_item.status == "exec_agent_rejected"
+        audit = session.scalar(
+            select(ExecutionPlanItemAudit).where(
+                ExecutionPlanItemAudit.execution_plan_item_id == stale.id,
+                ExecutionPlanItemAudit.event_type
+                == "watch_exec_agent_effective_stop_policy_reopened",
+            )
+        )
+        assert audit is not None
+        assert audit.summary["upstream_stop_price"] == "5090.0000"
+        assert audit.summary["effective_stop_price"] == "5372.2500"
+        assert audit.summary["effective_stop_policy_version"] == (
+            "server_effective_stop_v1"
+        )
+
+    engine.dispose()
+
+
+def test_terminal_rejection_records_effective_stop_policy_version() -> None:
+    item = _watch_item(
+        risk_context={
+            "exchange": "KRX",
+            "target_price": "6130",
+            "stop_loss_price": "5090",
+        },
+        trigger_price="5470",
+        limit_price="5510",
+    )
+
+    _record, policy = watch_sizing._canonical_terminal_rejection(
+        item=item,
+        record={
+            "source": "openclaw_exec_agent_watch_sizing",
+            "action": "reject",
+        },
+        previous_policy=dict(item.quantity_policy),
+        reason_code="reward_risk_below_minimum",
+        reason_family="reward_risk",
+        reason="current policy still rejects the candidate",
+        audit_event_type="watch_exec_agent_sizing_decision",
+        decided_at=datetime(2026, 10, 14, 5, 0, tzinfo=UTC),
+    )
+
+    assert policy["effective_stop_policy_version"] == "server_effective_stop_v1"
+
+
 def test_decision_validation_rejects_noncanonical_disposition() -> None:
     plan = ExecutionPlan(
         id="plan-1",
@@ -1644,7 +1902,9 @@ def test_canonical_terminal_rejection_removes_all_executable_sizing(
         "short_term_exec_agent_decision",
         "exec_agent_decision_audit",
         "previous_policy",
+        "effective_stop_policy_version",
     }
+    assert policy["effective_stop_policy_version"] == "server_effective_stop_v1"
     assert policy["previous_policy"] == previous_policy
     assert policy["exec_agent_decision"] == policy["short_term_exec_agent_decision"]
     assert policy["exec_agent_decision"]["quantity"] == 0
@@ -1669,7 +1929,9 @@ def _assert_canonical_terminal_rejection_policy(
         "short_term_exec_agent_decision",
         "exec_agent_decision_audit",
         "previous_policy",
+        "effective_stop_policy_version",
     }
+    assert policy["effective_stop_policy_version"] == "server_effective_stop_v1"
     assert policy["kind"] == "exec_agent_rejected"
     assert policy["source"] == "exec_agent_watch_sizing"
     assert policy["reason_code"] == reason_code
