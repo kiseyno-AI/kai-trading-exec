@@ -1782,7 +1782,7 @@ def list_autonomous_monitoring_symbols(
             effective_plan_filter,
             ExecutionPlanItem.side == "buy",
             ExecutionPlanItem.intent.in_(tuple(WATCH_BUY_INTENTS)),
-            ExecutionPlanItem.status.in_(tuple(ACTIVE_WATCH_MONITORING_STATUSES)),
+            ExecutionPlanItem.status.in_(tuple(LIVE_WATCH_ENTRY_STATUSES)),
         )
         .options(
             load_only(
@@ -1815,7 +1815,7 @@ def list_autonomous_monitoring_symbols(
     active_watch_items = [
         item
         for item in active_watch_items
-        if not is_exec_agent_sizing_policy(item.quantity_policy)
+        if _watch_buy_item_is_quote_monitorable(item)
         and classify_kis_account_route(
             settings=settings,
             provider=str(item.provider or "kis").strip().lower(),
@@ -6578,7 +6578,7 @@ def _load_monitored_items(
                     ExecutionPlanItem.symbol.in_(symbol_list),
                     ExecutionPlanItem.side == "buy",
                     ExecutionPlanItem.intent.in_(tuple(WATCH_BUY_INTENTS)),
-                    ExecutionPlanItem.status.in_(tuple(ACTIVE_WATCH_MONITORING_STATUSES)),
+                    ExecutionPlanItem.status.in_(tuple(LIVE_WATCH_ENTRY_STATUSES)),
                     provider_filter,
                     effective_plan_filter,
                 )
@@ -6669,7 +6669,7 @@ def _load_monitored_items(
                 ExecutionPlanItem.symbol.in_(symbol_list),
                 ExecutionPlanItem.side == "buy",
                 ExecutionPlanItem.intent.in_(tuple(WATCH_BUY_INTENTS)),
-                ExecutionPlanItem.status.in_(tuple(ACTIVE_WATCH_MONITORING_STATUSES)),
+                ExecutionPlanItem.status.in_(tuple(LIVE_WATCH_ENTRY_STATUSES)),
                 provider_filter,
                 effective_plan_filter,
             )
@@ -6841,7 +6841,7 @@ def _canonicalize_loaded_active_watch_buys(
         if not (
             item.side == "buy"
             and item.intent in WATCH_BUY_INTENTS
-            and is_exec_agent_sizing_policy(item.quantity_policy)
+            and not _watch_buy_item_is_quote_monitorable(item)
         )
     ]
     resolved_market_date = current_market_date or datetime.now(KRX_TIMEZONE).date()
@@ -6884,7 +6884,7 @@ def _canonicalize_loaded_active_watch_buys(
         if (
             item.side != "buy"
             or item.intent not in WATCH_BUY_INTENTS
-            or item.status not in ACTIVE_WATCH_MONITORING_STATUSES
+            or not _watch_buy_item_is_quote_monitorable(item)
         ):
             continue
         route_key = _active_watch_route_key(item)
@@ -6900,7 +6900,7 @@ def _canonicalize_loaded_active_watch_buys(
         for item in items
         if item.side != "buy"
         or item.intent not in WATCH_BUY_INTENTS
-        or item.status not in ACTIVE_WATCH_MONITORING_STATUSES
+        or not _watch_buy_item_is_quote_monitorable(item)
         or item.id in canonical_ids
     ]
 
@@ -7009,7 +7009,7 @@ def _quarantine_invalid_kis_watch_routes(
         if (
             item.side != "buy"
             or item.intent not in WATCH_BUY_INTENTS
-            or item.status not in ACTIVE_WATCH_MONITORING_STATUSES
+            or not _watch_buy_item_is_quote_monitorable(item)
         ):
             eligible.append(item)
             continue
@@ -9275,7 +9275,7 @@ def _monitored_item_filter():
         and_(
             ExecutionPlanItem.side == "buy",
             ExecutionPlanItem.intent.in_(tuple(WATCH_BUY_INTENTS)),
-            ExecutionPlanItem.status.in_(tuple(ACTIVE_WATCH_MONITORING_STATUSES)),
+            ExecutionPlanItem.status.in_(tuple(LIVE_WATCH_ENTRY_STATUSES)),
         ),
     )
 
@@ -14239,6 +14239,36 @@ def _parse_fraction(value: object) -> Decimal | None:
 def _is_watch_buy_item(item: ExecutionPlanItem) -> bool:
     return item.side == "buy" and (
         item.intent in WATCH_BUY_INTENTS or item.status in WATCH_LIFECYCLE_STATUSES
+    )
+
+
+def _watch_buy_payload_is_quote_monitorable(
+    *,
+    status: object,
+    risk_context: object,
+    quantity_policy: object,
+) -> bool:
+    normalized_status = str(status or "").strip()
+    delegated_sizing = is_exec_agent_sizing_policy(
+        quantity_policy if isinstance(quantity_policy, dict) else None
+    )
+    if normalized_status in ACTIVE_WATCH_MONITORING_STATUSES:
+        return not delegated_sizing
+    if normalized_status != WATCH_SIZING_PENDING_STATUS or not delegated_sizing:
+        return False
+    context = risk_context if isinstance(risk_context, dict) else {}
+    deferred = context.get("watch_exec_agent_deferred")
+    return bool(
+        isinstance(deferred, dict)
+        and deferred.get("price_watch_only") is True
+    )
+
+
+def _watch_buy_item_is_quote_monitorable(item: ExecutionPlanItem) -> bool:
+    return _watch_buy_payload_is_quote_monitorable(
+        status=item.status,
+        risk_context=_loaded_risk_context(item, allow_file_backed_load=True),
+        quantity_policy=item.quantity_policy,
     )
 
 
