@@ -1620,7 +1620,7 @@ def test_openclaw_exec_agent_client_handoff_builds_context_and_sizes_without_pre
     ]
     assert audit["final_budget"] == "350000.0000"
     assert plan.items[0].quantity_policy["quantity"] == 4
-    assert audit["risk_based_quantity"] == 6
+    assert audit["risk_based_quantity"] == 9
     assert audit["allocation_quantity"] == 4
 
     engine.dispose()

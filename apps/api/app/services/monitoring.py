@@ -31,6 +31,7 @@ from app.broker.base import (
     BrokerAccountSnapshot,
     BrokerAdapter,
     BrokerAdapterError,
+    BrokerErrorClassification,
     BrokerIntradayLiquiditySnapshot,
     NormalizedBrokerOrderStatus,
 )
@@ -5510,12 +5511,11 @@ def _post_agent_live_cost_evidence(
 ) -> dict[str, object]:
     """Build the only cost context trusted for a live trigger-time buy."""
 
-    risk_context = _loaded_risk_context(item)
     return configured_execution_cost_evidence(
         settings=settings,
         provider=item.provider or "kis",
         asset_class=item.asset_class or "stock",
-        exchange=item.venue or risk_context.get("exchange") or "KRX",
+        exchange=_plan_item_exchange(item),
         live_quote_spread_bps=market_context.get("spread_bps"),
         require_live_quote_spread=settings.runtime_mode == "live",
     )
@@ -5832,24 +5832,52 @@ def _merge_trigger_time_liquidity_snapshot(
     loader = getattr(adapter, "get_intraday_liquidity_snapshot", None)
     if not callable(loader):
         return price, "timestamped intraday liquidity endpoint is unavailable"
-    try:
-        snapshot = loader(
-            access_token,
-            symbol=item.symbol,
-            exchange=_plan_item_exchange(item),
+    max_attempts = 1 + min(1, settings.kis_get_network_retry_attempts)
+    attempt_count = 0
+    snapshot: BrokerIntradayLiquiditySnapshot | None = None
+    while attempt_count < max_attempts:
+        attempt_count += 1
+        try:
+            snapshot = loader(
+                access_token,
+                symbol=item.symbol,
+                exchange=_plan_item_exchange(item),
+                reference_at=reference_at,
+            )
+        except BrokerAdapterError as exc:
+            retry_allowed = bool(
+                exc.retryable
+                and exc.classification == BrokerErrorClassification.TRANSIENT
+                and exc.code == "kis_intraday_liquidity_empty_response"
+            )
+            if retry_allowed and attempt_count < max_attempts:
+                continue
+            diagnostic = exc.code or exc.classification.value
+            return price, (
+                f"intraday liquidity refresh failed: {diagnostic}; "
+                f"attempts={attempt_count}; "
+                f"retryable={str(retry_allowed).lower()}"
+            )
+        except Exception as exc:
+            return price, (
+                f"intraday liquidity refresh failed: {exc.__class__.__name__}; "
+                f"attempts={attempt_count}; retryable=false"
+            )
+        if snapshot is None:
+            return price, (
+                "timestamped intraday liquidity endpoint returned no snapshot; "
+                f"attempts={attempt_count}; retryable=false"
+            )
+        reason = _trigger_time_liquidity_snapshot_reason(
+            settings=settings,
+            adapter=adapter,
+            item=item,
+            snapshot=snapshot,
             reference_at=reference_at,
         )
-    except Exception as exc:
-        return price, f"intraday liquidity refresh failed: {exc.__class__.__name__}"
-    reason = _trigger_time_liquidity_snapshot_reason(
-        settings=settings,
-        adapter=adapter,
-        item=item,
-        snapshot=snapshot,
-        reference_at=reference_at,
-    )
-    if reason is not None:
-        return price, reason
+        if reason is not None:
+            return price, reason
+        break
     assert isinstance(snapshot, BrokerIntradayLiquiditySnapshot)
     observed_at = _normalize_utc(snapshot.observed_at)
     payload = snapshot.payload if isinstance(snapshot.payload, dict) else {}
@@ -5859,6 +5887,7 @@ def _merge_trigger_time_liquidity_snapshot(
         "observed_at": observed_at.isoformat(),
         "endpoint": payload.get("endpoint"),
         "tr_id": payload.get("tr_id"),
+        "refresh_attempt_count": attempt_count,
     }
     provenance = dict(price.provenance or {})
     field_sources = dict(provenance.get("field_sources") or {})
@@ -12839,18 +12868,18 @@ def _live_watch_buy_veto_applies(*, settings: Settings, item: ExecutionPlanItem)
     provider = str(item.provider or "kis").strip().lower()
     if provider not in {"kis", "korea_investment", "korea-investment"}:
         return False
+    execution_exchange = _plan_item_exchange(item)
     try:
         asset_class = canonical_execution_asset_class(
             item.asset_class or "stock",
             provider=provider,
-            exchange=item.venue or _plan_item_exchange(item) or "KRX",
+            exchange=execution_exchange,
         )
     except ValueError:
         return False
     if asset_class != "stock":
         return False
-    venue = str(item.venue or _plan_item_exchange(item) or "KRX").strip().upper()
-    return venue in KRX_EXCHANGES
+    return execution_exchange in KRX_EXCHANGES
 
 
 def _live_automated_quote_trust_reason(

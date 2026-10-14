@@ -81,6 +81,7 @@ from app.services.exec_agent_approval import (
     assess_buy_economics,
     configured_execution_cost_evidence,
     delegated_buy_gate_rejections,
+    persisted_verified_watch_sizing_provenance,
     trusted_live_market_decimal,
 )
 from app.services.execution_account_route import (
@@ -129,6 +130,7 @@ from app.services.position_identity import (
     position_identity_from_payload,
     stable_account_scope_hmac_key,
 )
+from app.services.risk_sizing import effective_stop_price
 from app.services.runtime_controls import (
     RUNTIME_CONTROL_ID,
     automated_buy_submission_block_reason,
@@ -5107,7 +5109,7 @@ def _validate_plan_item(
             (command.side == "sell" and plan_item.intent in {"stop_sell", "target_sell"})
             or (
                 command.side == "buy"
-                and plan_item.intent in {"intraday_watch_buy", "next_open_buy"}
+                and is_watch_buy_intent(plan_item.intent)
             )
         )
         and getattr(plan_item, "trigger_price", None) is not None
@@ -5157,7 +5159,7 @@ def _persisted_monitoring_buy_reprice_authority_matches(
     if (
         request_source != "monitoring:intraday_target_stop_monitor"
         or command.side != "buy"
-        or plan_item.intent not in {"intraday_watch_buy", "next_open_buy"}
+        or not is_watch_buy_intent(plan_item.intent)
     ):
         return False
     policy = (
@@ -6016,11 +6018,10 @@ def _automated_kis_buy_market_evidence_failure(
             "target_price",
             "take_profit_price",
         )
-        stop = _first_positive_plan_item_price(
-            plan_item,
-            "updated_stop_price",
-            "stop_price",
-            "stop_loss_price",
+        stop = _final_watch_buy_effective_stop(
+            settings=settings,
+            plan_item=plan_item,
+            execution_reference=execution_reference,
         )
         if target is None:
             return (
@@ -6381,6 +6382,72 @@ def _first_positive_plan_item_price(
             if value.is_finite() and value > 0:
                 return value
     return None
+
+
+def _final_watch_buy_effective_stop(
+    *,
+    settings: Settings,
+    plan_item: ExecutionPlanItem,
+    execution_reference: Decimal,
+) -> Decimal | None:
+    policy = (
+        plan_item.quantity_policy
+        if isinstance(plan_item.quantity_policy, dict)
+        else {}
+    )
+    risk_context = (
+        plan_item.risk_context
+        if isinstance(plan_item.risk_context, dict)
+        else {}
+    )
+    baseline: Decimal | None = None
+    if policy.get("effective_stop_policy_version") == "server_effective_stop_v1":
+        envelope = policy.get("allowed_action_envelope")
+        effective = _positive_decimal(policy.get("effective_stop_price"))
+        upstream = _positive_decimal(policy.get("upstream_stop_price"))
+        sizing_price = _positive_decimal(policy.get("sizing_price"))
+        if not (
+            policy.get("source") == "exec_agent_watch_sizing"
+            and persisted_verified_watch_sizing_provenance(policy)
+            and isinstance(envelope, dict)
+            and effective is not None
+            and upstream is not None
+            and sizing_price is not None
+            and upstream <= effective < sizing_price
+            and _positive_decimal(policy.get("stop_price")) == effective
+            and _positive_decimal(policy.get("stop_loss_price")) == effective
+            and _positive_decimal(envelope.get("upstream_stop_price")) == upstream
+            and _positive_decimal(envelope.get("effective_stop_price")) == effective
+            and _positive_decimal(envelope.get("stop_price")) == effective
+        ):
+            return None
+        current_stop_candidates = [effective]
+        for key in (
+            "updated_stop_price",
+            "effective_stop_price",
+            "upstream_stop_price",
+            "stop_price",
+            "stop_loss_price",
+        ):
+            candidate = _positive_decimal(risk_context.get(key))
+            if candidate is not None:
+                current_stop_candidates.append(candidate)
+        baseline = max(current_stop_candidates)
+    else:
+        baseline = _first_positive_plan_item_price(
+            plan_item,
+            "updated_stop_price",
+            "upstream_stop_price",
+            "stop_price",
+            "stop_loss_price",
+        )
+    if baseline is None:
+        return None
+    return effective_stop_price(
+        settings=settings,
+        entry_price=execution_reference,
+        upstream_stop_price=baseline,
+    )
 
 
 def _validate_upbit_paper_guardrails(

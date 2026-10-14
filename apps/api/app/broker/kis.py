@@ -1254,14 +1254,24 @@ class KisBrokerAdapter(BrokerAdapter):
     ) -> BrokerIntradayLiquiditySnapshot | None:
         normalized_exchange = exchange.strip().upper()
         if normalized_exchange not in {"KRX", "KOSPI", "KOSDAQ"}:
-            return None
+            raise BrokerAdapterError(
+                "KIS intraday liquidity supports Korean equity exchanges only",
+                status_code=422,
+                classification=BrokerErrorClassification.VALIDATION,
+                code="kis_intraday_liquidity_unsupported_exchange",
+            )
         reference_utc = (
             reference_at.astimezone(UTC)
             if reference_at.tzinfo is not None and reference_at.utcoffset() is not None
             else None
         )
         if reference_utc is None:
-            return None
+            raise BrokerAdapterError(
+                "KIS intraday liquidity requires a timezone-aware reference",
+                status_code=422,
+                classification=BrokerErrorClassification.VALIDATION,
+                code="kis_intraday_liquidity_reference_timestamp_invalid",
+            )
         local_reference = reference_utc.astimezone(KIS_TIMEZONE)
         config = self._configured()
         response = self.http_client.get_json(
@@ -1283,17 +1293,36 @@ class KisBrokerAdapter(BrokerAdapter):
         output1 = _first_payload_object(response.payload, "output1")
         output2 = _payload_rows(response.payload.get("output2"))
         if output1 is None or not output2 or not isinstance(output2[0], dict):
-            return None
+            raise BrokerAdapterError(
+                "KIS intraday liquidity response is empty",
+                status_code=502,
+                classification=BrokerErrorClassification.TRANSIENT,
+                retryable=True,
+                code="kis_intraday_liquidity_empty_response",
+                response_metadata={
+                    "status_code": response.status_code,
+                    "msg_cd": _optional_string(response.payload.get("msg_cd")),
+                },
+            )
         latest = output2[0]
         observed_at = _parse_krx_dated_observed_at(
             latest.get("stck_bsop_date") or latest.get("STCK_BSOP_DATE"),
             latest.get("stck_cntg_hour") or latest.get("STCK_CNTG_HOUR"),
         )
-        if (
-            observed_at is None
-            or observed_at.astimezone(KIS_TIMEZONE).date() != local_reference.date()
-        ):
-            return None
+        if observed_at is None:
+            raise BrokerAdapterError(
+                "KIS intraday liquidity timestamp is invalid",
+                status_code=502,
+                classification=BrokerErrorClassification.VALIDATION,
+                code="kis_intraday_liquidity_timestamp_invalid",
+            )
+        if observed_at.astimezone(KIS_TIMEZONE).date() != local_reference.date():
+            raise BrokerAdapterError(
+                "KIS intraday liquidity is not for the requested market date",
+                status_code=502,
+                classification=BrokerErrorClassification.VALIDATION,
+                code="kis_intraday_liquidity_wrong_market_date",
+            )
         minute_volume = _parse_decimal(latest.get("cntg_vol"))
         turnover = _parse_decimal(latest.get("acml_tr_pbmn"))
         volume = _parse_decimal(output1.get("acml_vol"))
@@ -1306,9 +1335,19 @@ class KisBrokerAdapter(BrokerAdapter):
             value is None or value <= 0
             for value in (day_high, day_low)
         ):
-            return None
+            raise BrokerAdapterError(
+                "KIS intraday liquidity numeric evidence is invalid",
+                status_code=502,
+                classification=BrokerErrorClassification.VALIDATION,
+                code="kis_intraday_liquidity_numeric_evidence_invalid",
+            )
         if day_low > day_high:
-            return None
+            raise BrokerAdapterError(
+                "KIS intraday liquidity day range is invalid",
+                status_code=502,
+                classification=BrokerErrorClassification.VALIDATION,
+                code="kis_intraday_liquidity_day_range_invalid",
+            )
         assert turnover is not None
         assert volume is not None
         assert day_high is not None

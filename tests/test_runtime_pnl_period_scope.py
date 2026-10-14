@@ -572,6 +572,45 @@ def test_active_provider_legacy_unscoped_fill_still_fails_closed() -> None:
     engine.dispose()
 
 
+def test_prior_day_legacy_unscoped_fill_does_not_poison_daily_no_activity() -> None:
+    settings = _settings()
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    db = create_session_factory(engine)()
+    now = datetime(2026, 9, 10, 3, 0, tzinfo=UTC)
+    prior_day_legacy = _order(
+        settings=None,
+        key="prior-day-legacy-kis-fill",
+        provider="kis",
+        exchange="KRX",
+        symbol="PRIOR-DAY-UNSCOPED",
+        side="sell",
+    )
+    db.add(prior_day_legacy)
+    db.flush()
+    db.add(
+        _fill(
+            order=prior_day_legacy,
+            key="prior-day-legacy-kis-unscoped-fill",
+            price="100",
+            filled_at=datetime(2026, 9, 8, 2, 30, tzinfo=UTC),
+        )
+    )
+    db.commit()
+
+    payload = runtime_service.daily_pnl_payload(settings=settings, db=db, now=now)
+
+    assert payload["calculation_status"] == "computed"
+    assert payload["calculation_reason"] is None
+    assert payload["daily_realized_pnl"] == "0.0000"
+    assert payload["daily_buy_notional"] == "0.0000"
+    assert payload["daily_sell_notional"] == "0.0000"
+    assert payload["notional_status"] == "no_activity"
+
+    db.close()
+    engine.dispose()
+
+
 def test_unknown_provider_legacy_unscoped_fill_still_fails_closed() -> None:
     settings = _settings()
     engine = create_db_engine(settings)

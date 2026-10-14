@@ -2,7 +2,12 @@ from datetime import UTC, datetime
 from decimal import Decimal
 
 from app.core.config import Settings, load_settings
-from app.services.risk_sizing import RiskSizingRejection, RiskSizingResult, resolve_risk_based_buy_quantity
+from app.services.risk_sizing import (
+    RiskSizingRejection,
+    RiskSizingResult,
+    effective_stop_price,
+    resolve_risk_based_buy_quantity,
+)
 
 
 def test_default_exec_sizing_uses_three_x_short_term_budget_caps() -> None:
@@ -41,6 +46,16 @@ def test_default_downside_guardrails_are_conservative_after_loss_week() -> None:
     assert settings.account_drawdown_gate_enabled is True
     assert settings.exec_agent_trigger_time_timeout_seconds == 900
     assert settings.exec_agent_watch_sizing_timeout_seconds == 900
+
+
+def test_effective_stop_uses_the_declared_configured_stop_policy_without_a_hidden_floor() -> None:
+    settings = Settings(exec_agent_stop_loss_pct=Decimal("0.025"))
+
+    assert effective_stop_price(
+        settings=settings,
+        entry_price=Decimal("100000"),
+        upstream_stop_price=Decimal("90000"),
+    ) == Decimal("97500.0000")
 
 
 def test_risk_sizing_allows_three_x_notional_when_stop_risk_and_caps_allow() -> None:

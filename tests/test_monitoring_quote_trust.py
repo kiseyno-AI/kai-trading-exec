@@ -203,6 +203,24 @@ def test_live_watch_buy_veto_covers_every_domestic_order_route(
     ) is True
 
 
+def test_live_watch_buy_veto_uses_execution_exchange_before_broker_venue() -> None:
+    item = ExecutionPlanItem(
+        symbol="005930",
+        side="buy",
+        intent="intraday_watch_buy",
+        status="watch_monitoring_active",
+        provider="kis",
+        venue="kis",
+        asset_class="stock",
+        risk_context={"exchange": "KRX"},
+    )
+
+    assert _live_watch_buy_veto_applies(
+        settings=_settings(),
+        item=item,
+    ) is True
+
+
 def test_live_quote_trust_gate_blocks_untrusted_protective_sell_trigger() -> None:
     item = ExecutionPlanItem(
         symbol="005930",

@@ -92,6 +92,11 @@ CORE_V4_WATCH_POLICY_KEYS = frozenset(
         "sizing_explanation",
         "allowed_action_envelope",
         "market_regime_guardrail",
+        "effective_stop_policy_version",
+        "upstream_stop_price",
+        "effective_stop_price",
+        "stop_price",
+        "stop_loss_price",
         "previous_policy",
     }
 )
@@ -1342,6 +1347,11 @@ def _normalize_safe_legacy_watch_authority(
         )
         prior_status = item.status
         if reason_code == "unverified_exec_agent_runtime":
+            _restore_linked_stop_contract(
+                plan=plan,
+                command=command,
+                entry_item=item,
+            )
             item.status = "exec_agent_rejected"
         item.limit_price = raw_item.limit_price
         jobs = db.scalars(
@@ -1867,7 +1877,11 @@ def _persisted_item_identity_matches(
             current_limit_price=item.limit_price,
             quantity_policy=quantity_policy,
         )
-        and item.trigger_price == raw_item.trigger_price
+        and _trigger_price_matches(
+            plan=plan,
+            item=item,
+            raw_item=raw_item,
+        )
         and item.base_quantity is None
         and item.quote_notional is None
         and item.quantity_precision is None
@@ -2256,7 +2270,161 @@ def _watch_sizing_policy_shape_matches(
         isinstance(envelope, dict)
         and quantity_policy.get("market_regime_guardrail")
         == envelope.get("market_regime_guardrail")
+        and _server_owned_effective_stop_matches(
+            item=item,
+            quantity_policy=quantity_policy,
+            envelope=envelope,
+        )
     )
+
+
+def _server_owned_effective_stop_matches(
+    *,
+    item: ExecutionPlanItem,
+    quantity_policy: dict[str, object],
+    envelope: dict[str, object],
+) -> bool:
+    if quantity_policy.get("effective_stop_policy_version") != (
+        "server_effective_stop_v1"
+    ):
+        return False
+    sizing_price = _positive_decimal(quantity_policy.get("sizing_price"))
+    upstream_stop = _positive_decimal(
+        quantity_policy.get("upstream_stop_price")
+    )
+    effective_stop = _positive_decimal(
+        quantity_policy.get("effective_stop_price")
+    )
+    if (
+        sizing_price is None
+        or upstream_stop is None
+        or effective_stop is None
+        or effective_stop < upstream_stop
+        or effective_stop >= sizing_price
+        or _positive_decimal(quantity_policy.get("stop_price"))
+        != effective_stop
+        or _positive_decimal(quantity_policy.get("stop_loss_price"))
+        != effective_stop
+        or _positive_decimal(envelope.get("upstream_stop_price"))
+        != upstream_stop
+        or _positive_decimal(envelope.get("effective_stop_price"))
+        != effective_stop
+        or _positive_decimal(envelope.get("stop_price")) != effective_stop
+    ):
+        return False
+
+    linked_stop = _linked_stop_contract(item=item)
+    if linked_stop is None:
+        return False
+    raw_stop, persisted_stop = linked_stop
+    return bool(
+        _positive_decimal(raw_stop.get("trigger_price")) == upstream_stop
+        and persisted_stop.trigger_price == effective_stop
+    )
+
+
+def _linked_stop_contract(
+    *,
+    item: ExecutionPlanItem,
+) -> tuple[dict[str, object], ExecutionPlanItem] | None:
+    plan = item.plan
+    if plan is None or not isinstance(plan.raw_payload, dict):
+        return None
+    entry_key = _nonempty_text(item.source_plan_item_id)
+    raw_items = plan.raw_payload.get("items")
+    if entry_key is None or not isinstance(raw_items, list):
+        return None
+    raw_stops = [
+        raw_item
+        for raw_item in raw_items
+        if isinstance(raw_item, dict)
+        and raw_item.get("side") == "sell"
+        and raw_item.get("intent") == "stop_sell"
+        and isinstance(raw_item.get("quantity_policy"), dict)
+        and raw_item["quantity_policy"].get("linked_entry_item_key")
+        == entry_key
+    ]
+    persisted_stops = [
+        sibling
+        for sibling in plan.items
+        if sibling.side == "sell"
+        and sibling.intent == "stop_sell"
+        and isinstance(sibling.quantity_policy, dict)
+        and sibling.quantity_policy.get("linked_entry_item_key") == entry_key
+    ]
+    if len(raw_stops) != 1 or len(persisted_stops) != 1:
+        return None
+    return raw_stops[0], persisted_stops[0]
+
+
+def _trigger_price_matches(
+    *,
+    plan: ExecutionPlan,
+    item: ExecutionPlanItem,
+    raw_item: Any,
+) -> bool:
+    if item.trigger_price == raw_item.trigger_price:
+        return True
+    if raw_item.side != "sell" or raw_item.intent != "stop_sell":
+        return False
+    raw_policy = raw_item.quantity_policy
+    linked_entry_key = _nonempty_text(
+        raw_policy.get("linked_entry_item_key")
+        if isinstance(raw_policy, dict)
+        else None
+    )
+    if linked_entry_key is None:
+        return False
+    linked_entries = [
+        sibling
+        for sibling in plan.items
+        if sibling.side == "buy"
+        and sibling.source_plan_item_id == linked_entry_key
+    ]
+    if len(linked_entries) != 1:
+        return False
+    entry_policy = (
+        linked_entries[0].quantity_policy
+        if isinstance(linked_entries[0].quantity_policy, dict)
+        else {}
+    )
+    return bool(
+        entry_policy.get("kind") == "shares"
+        and entry_policy.get("source") == "exec_agent_watch_sizing"
+        and entry_policy.get("effective_stop_policy_version")
+        == "server_effective_stop_v1"
+        and _positive_decimal(entry_policy.get("upstream_stop_price"))
+        == raw_item.trigger_price
+        and _positive_decimal(entry_policy.get("effective_stop_price"))
+        == item.trigger_price
+    )
+
+
+def _restore_linked_stop_contract(
+    *,
+    plan: ExecutionPlan,
+    command: CoreExecutionPlanRequestV4,
+    entry_item: ExecutionPlanItem,
+) -> None:
+    entry_key = _nonempty_text(entry_item.source_plan_item_id)
+    if entry_key is None:
+        return
+    persisted_by_key = {
+        sibling.source_plan_item_id: sibling
+        for sibling in plan.items
+        if _nonempty_text(sibling.source_plan_item_id) is not None
+    }
+    for raw_item in command.items:
+        if (
+            raw_item.side != "sell"
+            or raw_item.intent != "stop_sell"
+            or raw_item.quantity_policy.get("linked_entry_item_key")
+            != entry_key
+        ):
+            continue
+        persisted_stop = persisted_by_key.get(raw_item.core_item_key)
+        if persisted_stop is not None:
+            persisted_stop.trigger_price = raw_item.trigger_price
 
 
 def _positive_decimal(value: object) -> Decimal | None:
