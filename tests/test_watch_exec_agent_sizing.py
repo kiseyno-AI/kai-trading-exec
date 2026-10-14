@@ -58,6 +58,7 @@ from app.services.exec_agent_approval import (
     assess_buy_economics,
     configured_execution_cost_evidence,
     delegated_buy_gate_rejections,
+    maximum_entry_price_for_buy_economics,
 )
 from app.services.json_compaction import json_payload_hash
 from app.services.execution_account_route import bind_kis_account_route
@@ -73,6 +74,7 @@ from app.services.position_identity import (
     build_position_identity,
     execution_scope_payload,
 )
+from app.services.risk_sizing import effective_stop_price
 from app.services.runtime import (
     RuntimeMetadata,
     build_runtime_daily_board,
@@ -171,10 +173,17 @@ class WatchSizingBrokerStub:
 def test_retryable_watch_rejection_is_deferred_not_terminal() -> None:
     settings = Settings(runtime_mode="live", exec_agent_min_reward_risk=Decimal("1.8"))
     item = _watch_item(
-        risk_context={"target_price": "7090", "stop_loss_price": "6090"},
+        risk_context={
+            "exchange": "KRX",
+            "target_price": "6900",
+            "stop_loss_price": "6090",
+        },
         trigger_price="6440",
         limit_price="6550",
     )
+    item.provider = "kis"
+    item.venue = "KRX"
+    item.asset_class = "stock"
     assert watch_sizing._retryable_watch_rejection(
         {"reason_code": "trigger_confirmation_and_cost_evidence_missing"},
         settings=settings,
@@ -197,6 +206,194 @@ def test_retryable_watch_rejection_is_deferred_not_terminal() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("symbol", "trigger", "target", "stop", "expected_cap"),
+    [
+        ("028670", "6630", "7050", "6400", "6657.2237"),
+        ("144960", "14650", "16200", "13880", "15297.4503"),
+        ("171090", "80100", "84000", "78300", None),
+    ],
+)
+def test_reward_risk_price_watch_cap_uses_full_cost_effective_stop_economics(
+    symbol: str,
+    trigger: str,
+    target: str,
+    stop: str,
+    expected_cap: str | None,
+) -> None:
+    item = _watch_item(
+        symbol=symbol,
+        risk_context={
+            "exchange": "KRX",
+            "target_price": target,
+            "stop_loss_price": stop,
+            "trigger_direction": "at_or_above",
+        },
+        trigger_price=trigger,
+        limit_price=trigger,
+    )
+    item.provider = "kis"
+    item.asset_class = "stock"
+
+    cap = watch_sizing._reward_risk_rejection_price_cap(
+        settings=Settings(
+            runtime_mode="live",
+            exec_agent_min_reward_risk=Decimal("1.8"),
+            exec_agent_stop_loss_pct=Decimal("0.025"),
+            kis_krx_round_trip_non_spread_cost_bps=Decimal("50"),
+        ),
+        item=item,
+    )
+
+    assert (f"{cap:.4f}" if cap is not None else None) == expected_cap
+
+
+@pytest.mark.parametrize(
+    ("runtime_mode", "intent", "expected_minimum"),
+    [
+        ("paper", "intraday_watch_buy", Decimal("1.30")),
+        ("live", "next_open_buy", Decimal("1.30")),
+        ("live", "intraday_watch_buy", Decimal("1.80")),
+        ("live", "watch_buy", Decimal("1.80")),
+        ("live", "trigger_buy", Decimal("1.80")),
+        ("live", "chase_buy", Decimal("1.80")),
+        ("live", "tactical_buy", Decimal("1.80")),
+    ],
+)
+def test_reward_risk_price_watch_cap_matches_action_envelope_minimum(
+    runtime_mode: str,
+    intent: str,
+    expected_minimum: Decimal,
+) -> None:
+    settings = Settings(
+        runtime_mode=runtime_mode,
+        exec_agent_min_reward_risk=Decimal("1.30"),
+        exec_agent_stop_loss_pct=Decimal("0.025"),
+        kis_krx_round_trip_non_spread_cost_bps=Decimal("50"),
+    )
+    item = _watch_item(
+        risk_context={
+            "exchange": "KRX",
+            "target_price": "7050",
+            "stop_loss_price": "6400",
+            "trigger_direction": "at_or_below",
+        },
+        trigger_price="6700",
+        limit_price="6700",
+    )
+    item.intent = intent
+    item.provider = "kis"
+    item.asset_class = "stock"
+
+    candidate = _candidate_payload(item)
+    envelope = watch_sizing._allowed_action_envelope_for_candidate(
+        settings=settings,
+        candidate=candidate,
+        account_context={
+            "available": True,
+            "orderable_cash_krw": "10000000",
+            "buying_power_krw": "10000000",
+            "holdings": [],
+            "open_orders": [],
+        },
+    )
+    expected_cap = maximum_entry_price_for_buy_economics(
+        target_price=Decimal("7050"),
+        upstream_stop_price=Decimal("6400"),
+        stop_loss_pct=Decimal("0.025"),
+        minimum_reward_risk=expected_minimum,
+        evidence=configured_execution_cost_evidence(
+            settings=settings,
+            provider="kis",
+            asset_class="stock",
+            exchange="KRX",
+            live_quote_spread_bps=None,
+            require_live_quote_spread=False,
+        ),
+        require_cost_evidence=runtime_mode == "live",
+    )
+
+    assert envelope["minimum_reward_risk"] == f"{expected_minimum:.4f}"
+    assert watch_sizing._reward_risk_rejection_price_cap(
+        settings=settings,
+        item=item,
+    ) == expected_cap
+
+
+@pytest.mark.parametrize(
+    ("target", "upstream_stop"),
+    [
+        ("7050", "6400"),
+        ("84000", "78300"),
+        ("10.1", "8.08"),
+    ],
+    ids=[
+        "configured-percent-stop",
+        "upstream-stop",
+        "configured-percent-stop-rounding-boundary",
+    ],
+)
+def test_full_cost_max_entry_is_the_exact_assess_buy_economics_boundary(
+    target: str,
+    upstream_stop: str,
+) -> None:
+    settings = Settings(
+        runtime_mode="live",
+        exec_agent_min_reward_risk=Decimal("1.8"),
+        exec_agent_stop_loss_pct=Decimal("0.025"),
+        kis_krx_round_trip_non_spread_cost_bps=Decimal("50"),
+    )
+    cost_evidence = configured_execution_cost_evidence(
+        settings=settings,
+        provider="kis",
+        asset_class="stock",
+        exchange="KRX",
+        live_quote_spread_bps=None,
+        require_live_quote_spread=False,
+    )
+    cap = maximum_entry_price_for_buy_economics(
+        target_price=Decimal(target),
+        upstream_stop_price=Decimal(upstream_stop),
+        stop_loss_pct=Decimal("0.025"),
+        minimum_reward_risk=Decimal("1.8"),
+        evidence=cost_evidence,
+        require_cost_evidence=True,
+    )
+    assert cap is not None
+
+    at_cap = assess_buy_economics(
+        reference_price=cap,
+        target_price=Decimal(target),
+        stop_price=effective_stop_price(
+            settings=settings,
+            entry_price=cap,
+            upstream_stop_price=Decimal(upstream_stop),
+        ),
+        minimum_reward_risk=Decimal("1.8"),
+        evidence=cost_evidence,
+        require_cost_evidence=True,
+    )
+    above_cap = cap + Decimal("0.0001")
+    above = assess_buy_economics(
+        reference_price=above_cap,
+        target_price=Decimal(target),
+        stop_price=effective_stop_price(
+            settings=settings,
+            entry_price=above_cap,
+            upstream_stop_price=Decimal(upstream_stop),
+        ),
+        minimum_reward_risk=Decimal("1.8"),
+        evidence=cost_evidence,
+        require_cost_evidence=True,
+    )
+
+    assert at_cap.reason is None
+    assert at_cap.net_reward_risk is not None
+    assert at_cap.net_reward_risk >= Decimal("1.8000")
+    assert above.reason == "net_reward_risk_below_minimum"
+    assert above.net_reward_risk == Decimal("1.7999")
+
+
 def test_freeform_reward_risk_reason_uses_deterministic_defer_disposition() -> None:
     settings = Settings(runtime_mode="live", exec_agent_min_reward_risk=Decimal("1.8"))
     plan = ExecutionPlan(
@@ -210,7 +407,7 @@ def test_freeform_reward_risk_reason_uses_deterministic_defer_disposition() -> N
             _watch_item(
                 risk_context={
                     "exchange": "KRX",
-                    "target_price": "7090",
+                    "target_price": "6900",
                     "stop_loss_price": "6090",
                 },
                 trigger_price="6440",
@@ -226,7 +423,9 @@ def test_freeform_reward_risk_reason_uses_deterministic_defer_disposition() -> N
         db=None,  # type: ignore[arg-type]
         settings=settings,
         plan=plan,
-        account_context=_fresh_account_context(),
+        account_context=_fresh_account_context(
+            observed_at="2026-06-04T00:00:00+00:00"
+        ),
         expected_item_ids={"watch-item-1"},
         request_payload=_DIRECT_APPLY_REQUEST_PAYLOAD,
         decision_payload={
@@ -247,6 +446,7 @@ def test_freeform_reward_risk_reason_uses_deterministic_defer_disposition() -> N
                 }
             ],
         },
+        now=datetime(2026, 6, 4, 0, 0, tzinfo=UTC),
     )
     assert summary["deferred"] == 1
     assert summary["rejected"] == 0
@@ -254,6 +454,7 @@ def test_freeform_reward_risk_reason_uses_deterministic_defer_disposition() -> N
     deferred = plan.items[0].risk_context[watch_sizing.WATCH_EXEC_AGENT_DEFER_KEY]
     assert deferred["disposition"] == "defer"
     assert deferred["reason_family"] == "reward_risk"
+    assert deferred["expires_at"] == "2026-06-04T06:30:00+00:00"
 
 
 def test_price_dependent_reward_risk_defer_remains_monitored_after_attempt_cap() -> None:
@@ -265,7 +466,7 @@ def test_price_dependent_reward_risk_defer_remains_monitored_after_attempt_cap()
     item = _watch_item(
         risk_context={
             "exchange": "KRX",
-            "target_price": "7090",
+            "target_price": "6900",
             "stop_loss_price": "6090",
             watch_sizing.WATCH_EXEC_AGENT_DEFER_KEY: {
                 "attempt_count": 1,
@@ -326,11 +527,24 @@ def test_price_dependent_reward_risk_defer_remains_monitored_after_attempt_cap()
     assert deferred["attempt_count"] == 2
     assert deferred["max_attempts"] == 2
     assert deferred["price_watch_only"] is True
-    assert deferred["retry_after"] == "2026-06-05T00:05:00+00:00"
-    assert item.risk_context["reward_risk_max_entry_price"] == "6440.0000"
+    assert deferred["retry_after"] == "2026-06-04T00:10:00+00:00"
+    assert deferred["expires_at"] == "2026-06-04T06:30:00+00:00"
+    assert item.risk_context["reward_risk_max_entry_price"] == "6515.5805"
 
 
-def test_reopens_same_day_price_watch_after_legacy_retry_exhaustion() -> None:
+@pytest.mark.parametrize(
+    ("direction", "trigger_price", "expected_reopened"),
+    [
+        ("at_or_below", "6700", True),
+        ("at_or_above", "6640", False),
+    ],
+    ids=["pullback-cap-below-trigger", "breakout-cap-below-trigger"],
+)
+def test_reopens_legacy_price_watch_only_when_cap_matches_direction(
+    direction: str,
+    trigger_price: str,
+    expected_reopened: bool,
+) -> None:
     settings = Settings(
         database_url="sqlite:///:memory:",
         runtime_mode="live",
@@ -347,13 +561,17 @@ def test_reopens_same_day_price_watch_after_legacy_retry_exhaustion() -> None:
             symbol="028670",
             risk_context={
                 "exchange": "KRX",
+                "trigger_direction": direction,
                 "target_price": "7050",
                 "stop_loss_price": "6400",
                 "reward_risk_max_entry_price": "6630.0000",
             },
-            trigger_price="6630",
+            trigger_price=trigger_price,
             limit_price="6650",
         )
+        eligible.provider = "kis"
+        eligible.venue = "KRX"
+        eligible.asset_class = "stock"
         original_policy = dict(eligible.quantity_policy)
         eligible.status = "exec_agent_rejected"
         eligible.quantity_policy = {
@@ -387,12 +605,15 @@ def test_reopens_same_day_price_watch_after_legacy_retry_exhaustion() -> None:
             symbol="041960",
             risk_context={
                 "exchange": "KRX",
-                "target_price": "12700",
+                "target_price": "12600",
                 "stop_loss_price": "11450",
             },
             trigger_price="11900",
             limit_price="12050",
         )
+        structural.provider = "kis"
+        structural.venue = "KRX"
+        structural.asset_class = "stock"
         structural.status = "exec_agent_rejected"
         structural.quantity_policy = dict(eligible.quantity_policy)
         structural.quantity_policy["previous_policy"] = dict(structural.quantity_policy)
@@ -415,12 +636,21 @@ def test_reopens_same_day_price_watch_after_legacy_retry_exhaustion() -> None:
         )
         session.commit()
 
-        assert reopened == ["price-watch-eligible"]
-        assert eligible.status == watch_sizing.WATCH_SIZING_PENDING_STATUS
-        assert eligible.quantity_policy == original_policy
-        deferred = eligible.risk_context[watch_sizing.WATCH_EXEC_AGENT_DEFER_KEY]
-        assert deferred["price_watch_only"] is True
-        assert deferred["retry_after"] == "2026-10-15T01:00:00+00:00"
+        assert reopened == (
+            ["price-watch-eligible"] if expected_reopened else []
+        )
+        assert eligible.status == (
+            watch_sizing.WATCH_SIZING_PENDING_STATUS
+            if expected_reopened
+            else "exec_agent_rejected"
+        )
+        if expected_reopened:
+            assert eligible.quantity_policy == original_policy
+            deferred = eligible.risk_context[watch_sizing.WATCH_EXEC_AGENT_DEFER_KEY]
+            assert deferred["price_watch_only"] is True
+            assert deferred["retry_after"] == "2026-10-14T01:05:00+00:00"
+            assert deferred["expires_at"] == "2026-10-14T06:30:00+00:00"
+            assert eligible.risk_context["reward_risk_max_entry_price"] == "6657.2237"
         assert structural.status == "exec_agent_rejected"
         audit = session.scalar(
             select(ExecutionPlanItemAudit).where(
@@ -429,7 +659,7 @@ def test_reopens_same_day_price_watch_after_legacy_retry_exhaustion() -> None:
                 == "watch_exec_agent_price_watch_reopened",
             )
         )
-        assert audit is not None
+        assert (audit is not None) is expected_reopened
 
     engine.dispose()
 
@@ -1069,6 +1299,217 @@ def test_watch_exec_agent_defer_expires() -> None:
         item,
         now=now + timedelta(minutes=6),
     )
+
+
+def test_elapsed_price_watch_is_terminalized_before_agent_or_broker_call(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'elapsed-price-watch.db'}",
+        runtime_mode="paper",
+        exec_agent_enabled=True,
+        exec_agent_watch_sizing_enabled=True,
+        exec_agent_watch_sizing_start_local_time="00:00",
+        exec_agent_watch_sizing_end_local_time="20:00",
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    item = _watch_item(
+        item_id="elapsed-price-watch",
+        symbol="028670",
+        risk_context={
+            "exchange": "KRX",
+            "target_price": "7050",
+            "stop_loss_price": "6400",
+            watch_sizing.WATCH_EXEC_AGENT_DEFER_KEY: {
+                "reason_code": "reward_risk_hard_block",
+                "reason_family": "reward_risk",
+                "disposition": "defer",
+                "retry_after": "2026-06-04T06:30:00+00:00",
+                "expires_at": "2026-06-04T06:30:00+00:00",
+                "price_watch_only": True,
+            },
+        },
+        trigger_price="6630",
+        limit_price="6650",
+    )
+    with session_factory() as db:
+        db.add(
+            ExecutionPlan(
+                external_plan_id="elapsed-price-watch-plan",
+                source="kai-trading-core",
+                market_date=date(2026, 6, 4),
+                mode="paper",
+                status="accepted",
+                items=[item],
+            )
+        )
+        db.commit()
+
+    agent_calls = 0
+
+    def unexpected_agent_call(**_kwargs: object) -> dict[str, object]:
+        nonlocal agent_calls
+        agent_calls += 1
+        raise AssertionError("elapsed price watch must not reach exec-agent")
+
+    monkeypatch.setattr(
+        watch_sizing,
+        "_request_exec_agent_decisions",
+        unexpected_agent_call,
+    )
+    adapter = WatchSizingBrokerStub(reconcile_payloads=[])
+
+    result = run_due_watch_exec_agent_sizing(
+        settings=settings,
+        session_factory=session_factory,
+        adapter=adapter,
+        now=datetime(2026, 6, 4, 6, 31, tzinfo=UTC),
+    )
+
+    assert agent_calls == 0
+    assert "snapshot" not in adapter.events
+    assert result.payload["applied"][0]["price_watch_expired_item_ids"] == [
+        item.id
+    ]
+    with session_factory() as db:
+        persisted = db.get(ExecutionPlanItem, item.id)
+        assert persisted is not None
+        assert persisted.status == "watch_expired"
+        assert watch_sizing.WATCH_EXEC_AGENT_DEFER_KEY not in persisted.risk_context
+        _assert_canonical_terminal_rejection_policy(
+            persisted.quantity_policy,
+            reason_code="reward_risk_price_watch_expired",
+        )
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("decision_at", "expected_approved", "expected_status"),
+    [
+        (
+            datetime(2026, 6, 4, 6, 29, tzinfo=UTC),
+            1,
+            "watch_monitoring_active",
+        ),
+        (
+            datetime(2026, 6, 4, 6, 31, tzinfo=UTC),
+            0,
+            "watch_expired",
+        ),
+    ],
+    ids=["before-krx-close", "after-krx-close"],
+)
+def test_krx_close_deadline_controls_late_agent_approval(
+    decision_at: datetime,
+    expected_approved: int,
+    expected_status: str,
+) -> None:
+    settings = Settings(runtime_mode="paper")
+    item = _watch_item(
+        item_id="elapsed-price-watch-approval",
+        symbol="028670",
+        risk_context={
+            "exchange": "KRX",
+            "target_price": "7050",
+            "stop_loss_price": "6400",
+            watch_sizing.WATCH_EXEC_AGENT_DEFER_KEY: {
+                "reason_code": "reward_risk_hard_block",
+                "reason_family": "reward_risk",
+                "disposition": "defer",
+                "retry_after": "2026-06-04T06:28:00+00:00",
+                "expires_at": "2026-06-04T06:30:00+00:00",
+                "price_watch_only": True,
+            },
+        },
+        trigger_price="6630",
+        limit_price="6650",
+    )
+    plan = ExecutionPlan(
+        external_plan_id="elapsed-price-watch-approval-plan",
+        source="kai-trading-core",
+        market_date=date(2026, 6, 4),
+        mode="paper",
+        status="accepted",
+        items=[item],
+    )
+    request_payload = {"test_scope": "elapsed-price-watch-approval"}
+
+    summary = _apply_decisions(
+        db=None,  # type: ignore[arg-type]
+        settings=settings,
+        plan=plan,
+        request_payload=request_payload,
+        decision_payload={
+            "version": "manual-exec-agent-watch-sizing-v1",
+            "plan_id": plan.external_plan_id,
+            "_runtime_provenance": _verified_sizing_runtime(
+                settings,
+                request_payload=request_payload,
+            ),
+            "decisions": [
+                {
+                    "execution_plan_item_id": item.id,
+                    "symbol": item.symbol,
+                    "action": "approve",
+                    "quantity": 10,
+                    "approved_notional_krw": "66300",
+                    "sizing_price": "6630",
+                    "reason_code": "approved",
+                    "reason": "late approval must be ignored",
+                }
+            ],
+        },
+        account_context=_fresh_account_context(
+            observed_at=decision_at.isoformat()
+        ),
+        expected_item_ids={item.id},
+        now=decision_at,
+    )
+
+    assert summary["approved"] == expected_approved
+    assert summary["rejected"] == 1 - expected_approved
+    assert item.status == expected_status
+    assert watch_sizing.WATCH_EXEC_AGENT_DEFER_KEY not in item.risk_context
+    if expected_status == "watch_expired":
+        _assert_canonical_terminal_rejection_policy(
+            item.quantity_policy,
+            reason_code="reward_risk_price_watch_expired",
+        )
+    else:
+        assert item.quantity_policy["kind"] == "shares"
+
+
+@pytest.mark.parametrize("exchange", ["KRX", "KOSPI", "KOSDAQ"])
+def test_price_watch_deadline_uses_regular_krx_close(exchange: str) -> None:
+    settings = Settings(
+        market_timezone="Asia/Seoul",
+        exec_agent_watch_sizing_end_local_time="20:00",
+    )
+    item = _watch_item(
+        risk_context={"exchange": exchange},
+    )
+    ExecutionPlan(market_date=date(2026, 6, 4), items=[item])
+
+    assert watch_sizing._price_watch_session_expiry(
+        settings=settings,
+        item=item,
+    ) == datetime(2026, 6, 4, 6, 30, tzinfo=UTC)
+
+
+@pytest.mark.parametrize("exchange", ["NXT", "SOR", "NASDAQ"])
+def test_price_watch_deadline_does_not_apply_to_unsupported_route(
+    exchange: str,
+) -> None:
+    item = _watch_item(risk_context={"exchange": exchange})
+    ExecutionPlan(market_date=date(2026, 6, 4), items=[item])
+
+    assert watch_sizing._price_watch_session_expiry(
+        settings=Settings(exec_agent_watch_sizing_end_local_time="20:00"),
+        item=item,
+    ) is None
 
 
 def _watch_item(
@@ -4015,6 +4456,28 @@ def test_watch_sizing_quarantines_candidates_for_a_different_broker_provider(
     )
     kis_us_item.provider = "kis"
     kis_us_item.asset_class = "us_equity"
+    nxt_item = _watch_item(
+        item_id="watch-provider-nxt",
+        symbol="000660",
+        risk_context={
+            "exchange": "NXT",
+            "target_price": "220000",
+            "stop_price": "190000",
+        },
+    )
+    nxt_item.provider = "kis"
+    nxt_item.venue = "NXT"
+    sor_item = _watch_item(
+        item_id="watch-provider-sor",
+        symbol="035420",
+        risk_context={
+            "exchange": "SOR",
+            "target_price": "240000",
+            "stop_price": "210000",
+        },
+    )
+    sor_item.provider = "kis"
+    sor_item.venue = "SOR"
     with session_factory() as session:
         session.add(
             ExecutionPlan(
@@ -4022,7 +4485,7 @@ def test_watch_sizing_quarantines_candidates_for_a_different_broker_provider(
                 source="test",
                 market_date=date(2026, 6, 4),
                 mode="paper",
-                items=[kis_item, alpaca_item, kis_us_item],
+                items=[kis_item, alpaca_item, kis_us_item, nxt_item, sor_item],
             )
         )
         session.commit()
@@ -4081,8 +4544,13 @@ def test_watch_sizing_quarantines_candidates_for_a_different_broker_provider(
 
     assert requested_ids == ["watch-provider-kis"]
     assert any(
-        summary.get("provider_mismatch_item_ids")
-        == ["watch-provider-alpaca", "watch-provider-kis-us"]
+        set(summary.get("provider_mismatch_item_ids") or [])
+        == {
+            "watch-provider-alpaca",
+            "watch-provider-kis-us",
+            "watch-provider-nxt",
+            "watch-provider-sor",
+        }
         for summary in result.payload["applied"]
     )
     with session_factory() as session:
@@ -4092,7 +4560,18 @@ def test_watch_sizing_quarantines_candidates_for_a_different_broker_provider(
         persisted_kis_us = session.get(ExecutionPlanItem, "watch-provider-kis-us")
         assert persisted_kis_us is not None
         assert persisted_kis_us.status == "exec_agent_rejected"
-        for persisted in (persisted_alpaca, persisted_kis_us):
+        persisted_nxt = session.get(ExecutionPlanItem, "watch-provider-nxt")
+        assert persisted_nxt is not None
+        assert persisted_nxt.status == "exec_agent_rejected"
+        persisted_sor = session.get(ExecutionPlanItem, "watch-provider-sor")
+        assert persisted_sor is not None
+        assert persisted_sor.status == "exec_agent_rejected"
+        for persisted in (
+            persisted_alpaca,
+            persisted_kis_us,
+            persisted_nxt,
+            persisted_sor,
+        ):
             _assert_canonical_terminal_rejection_policy(
                 persisted.quantity_policy,
                 reason_code="watch_exec_agent_sizing_route_unsupported",
@@ -4702,6 +5181,172 @@ def test_sizing_envelope_rejects_reward_risk_below_deterministic_floor() -> None
 
     assert "reward_risk_below_minimum" in envelope["hard_reject_reasons"]
     assert envelope["allowed_actions"] == ["hold", "reject"]
+
+
+@pytest.mark.parametrize(
+    ("symbol", "entry", "target", "upstream_stop", "expected_effective_stop"),
+    [
+        ("000020", "10000", "11000", "9000", "9750.0000"),
+        ("028670", "6630", "7050", "6400", "6464.2500"),
+        ("041960", "11900", "12700", "11450", "11602.5000"),
+        ("048910", "5000", "5500", "4700", "4875.0000"),
+        ("144960", "14650", "16200", "13880", "14283.7500"),
+        ("171090", "80100", "84000", "78300", "78300.0000"),
+    ],
+)
+def test_watch_sizing_envelope_uses_one_server_owned_effective_stop_basis(
+    symbol: str,
+    entry: str,
+    target: str,
+    upstream_stop: str,
+    expected_effective_stop: str,
+) -> None:
+    envelope = watch_sizing._allowed_action_envelope_for_candidate(
+        settings=Settings(
+            runtime_mode="paper",
+            exec_agent_stop_loss_pct=Decimal("0.025"),
+        ),
+        candidate={
+            "symbol": symbol,
+            "provider": "kis",
+            "asset_class": "stock",
+            "exchange": "KRX",
+            "intent": "intraday_watch_buy",
+            "chase_limit_price": entry,
+            "target_price": target,
+            "stop_loss_price": upstream_stop,
+        },
+        account_context={
+            "available": True,
+            "orderable_cash_krw": "10000000",
+            "buying_power_krw": "10000000",
+            "holdings": [],
+            "open_orders": [],
+        },
+    )
+
+    assert envelope["upstream_stop_price"] == f"{Decimal(upstream_stop):.4f}"
+    assert envelope["effective_stop_price"] == expected_effective_stop
+    assert envelope["stop_price"] == expected_effective_stop
+
+
+def test_approved_watch_sizing_persists_effective_stop_and_updates_stop_child() -> None:
+    settings = Settings(
+        runtime_mode="paper",
+        exec_agent_stop_loss_pct=Decimal("0.025"),
+    )
+    entry = _watch_item(
+        item_id="effective-stop-entry",
+        symbol="000020",
+        risk_context={
+            "exchange": "KRX",
+            "target_price": "11000",
+            "stop_loss_price": "9000",
+        },
+        trigger_price="10000",
+        limit_price="10000",
+    )
+    entry.source_plan_item_id = "core-entry-000020"
+    stop = ExecutionPlanItem(
+        id="effective-stop-child",
+        plan_item_index=1,
+        symbol="000020",
+        side="sell",
+        intent="stop_sell",
+        status="stop_sell_pending_config",
+        trigger_price=Decimal("9000"),
+        quantity_policy={
+            "type": "position_exit_from_entry",
+            "linked_entry_item_key": "core-entry-000020",
+        },
+    )
+    plan = ExecutionPlan(
+        id="effective-stop-plan",
+        external_plan_id="effective-stop-plan",
+        source="core-short-term-decider",
+        market_date=date(2026, 10, 14),
+        mode="paper",
+        items=[entry, stop],
+    )
+
+    summary = _apply_decisions(
+        db=None,  # type: ignore[arg-type]
+        settings=settings,
+        plan=plan,
+        account_context=_fresh_account_context(),
+        expected_item_ids={entry.id},
+        request_payload=_DIRECT_APPLY_REQUEST_PAYLOAD,
+        decision_payload={
+            "version": "manual-exec-agent-watch-sizing-v1",
+            "_runtime_provenance": _verified_sizing_runtime(settings),
+            "decisions": [
+                {
+                    "execution_plan_item_id": entry.id,
+                    "symbol": entry.symbol,
+                    "action": "approve",
+                    "quantity": 10,
+                    "approved_notional_krw": "100000",
+                    "sizing_price": "10000",
+                    "confidence": "0.70",
+                    "target_profile": "short_swing",
+                    "reason_code": "approved",
+                    "reason": "server envelope passed",
+                }
+            ],
+        },
+        now=datetime(2026, 10, 14, 0, 0, tzinfo=UTC),
+    )
+
+    assert summary["approved"] == 1
+    assert entry.risk_context["stop_loss_price"] == "9000"
+    assert entry.quantity_policy["upstream_stop_price"] == "9000.0000"
+    assert entry.quantity_policy["effective_stop_price"] == "9750.0000"
+    assert entry.quantity_policy["effective_stop_policy_version"] == (
+        "server_effective_stop_v1"
+    )
+    assert stop.trigger_price == Decimal("9750.0000")
+
+
+def test_final_watch_quantity_uses_the_same_effective_stop_as_the_envelope() -> None:
+    settings = Settings(
+        runtime_mode="paper",
+        exec_agent_stop_loss_pct=Decimal("0.025"),
+    )
+    item = _watch_item(
+        symbol="000020",
+        risk_context={
+            "exchange": "KRX",
+            "target_price": "11000",
+            "stop_loss_price": "9000",
+        },
+        trigger_price="10000",
+        limit_price="10000",
+    )
+    item.quantity_policy["budget_krw"] = "3000000"
+    envelope = watch_sizing._allowed_action_envelope_for_item(
+        settings=settings,
+        item=item,
+        account_context=_fresh_account_context(),
+        decision={"sizing_price": "10000"},
+    )
+
+    sizing = watch_sizing._adjust_approved_watch_quantity(
+        settings=settings,
+        item=item,
+        decision={
+            "quantity": 300,
+            "approved_notional_krw": "3000000",
+            "sizing_price": "10000",
+            "confidence": "0.70",
+        },
+        account_context=_fresh_account_context(),
+        agent_quantity=300,
+        allowed_action_envelope=envelope,
+    )
+
+    assert envelope["effective_stop_price"] == "9750.0000"
+    assert sizing["quantity"] == 300
+    assert sizing["approved_notional"] == Decimal("3000000")
 
 
 def test_live_sizing_envelope_requires_configured_transaction_cost_policy() -> None:

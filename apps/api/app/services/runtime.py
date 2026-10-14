@@ -3911,13 +3911,15 @@ def build_runtime_status(
                 freshness=freshness,
                 execution_decisions=execution_decisions,
             ),
-            "monthly_pnl": _default_monthly_pnl_payload(
+            "monthly_pnl": monthly_pnl_payload(
                 settings=settings,
+                db=db,
                 provider=runtime_provider,
                 runtime_scope=active_runtime_scope,
             ),
-            "weekly_pnl": _default_weekly_pnl_payload(
+            "weekly_pnl": weekly_pnl_payload(
                 settings=settings,
+                db=db,
                 provider=runtime_provider,
                 runtime_scope=active_runtime_scope,
             ),
@@ -4403,14 +4405,45 @@ def daily_pnl_payload(
         now,
         timezone=pnl_timezone,
     )
-    selection = _active_runtime_fills_for_period(
+    current_period_selection = _active_runtime_fills_for_period(
         settings=settings,
         db=db,
-        start_at=None,
+        start_at=day_start,
         end_at=next_day_start,
         provider=provider,
         runtime_scope=pnl_scope,
-        legacy_isolation_cutoff=day_start,
+    )
+    if (
+        current_period_selection.scope_unavailable_reason is not None
+        or current_period_selection.indeterminate_fill_count > 0
+    ):
+        return _default_daily_pnl_payload(
+            settings=settings,
+            now=now,
+            provider=provider,
+            runtime_scope=pnl_scope,
+            reason=(
+                current_period_selection.scope_unavailable_reason
+                or "indeterminate_execution_fill_scope"
+            ),
+        )
+
+    has_current_sell = any(
+        str(fill.side or "").strip().lower() == "sell"
+        for fill in current_period_selection.fills
+    )
+    selection = (
+        _active_runtime_fills_for_period(
+            settings=settings,
+            db=db,
+            start_at=None,
+            end_at=next_day_start,
+            provider=provider,
+            runtime_scope=pnl_scope,
+            legacy_isolation_cutoff=day_start,
+        )
+        if has_current_sell
+        else current_period_selection
     )
     isolation_cursor = load_fifo_isolation_cursor(
         db=db,

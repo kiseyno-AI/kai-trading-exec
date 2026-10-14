@@ -1818,6 +1818,19 @@ def test_v4_watch_sizing_preserves_contract_proof_through_job_claim(
         assert summary["approved"] == 1
         assert len(entry.jobs) == 1
         assert core_handoff_v4.persisted_core_plan_contract_ack(plan) is not None
+        stop_item = next(item for item in plan.items if item.intent == "stop_sell")
+        assert stop_item.trigger_price == Decimal("69225.0000")
+        approved_policy = entry.quantity_policy
+        entry.quantity_policy = {
+            **approved_policy,
+            "effective_stop_price": "69224.0000",
+        }
+        assert core_handoff_v4.persisted_core_plan_contract_ack(plan) is None
+        entry.quantity_policy = approved_policy
+        stop_item.trigger_price = Decimal("69224.0000")
+        assert core_handoff_v4.persisted_core_plan_contract_ack(plan) is None
+        stop_item.trigger_price = Decimal("69225.0000")
+        assert core_handoff_v4.persisted_core_plan_contract_ack(plan) is not None
         assert (
                 core_handoff_v4.reconcile_unproven_legacy_core_buy_authority(
                     db=session,

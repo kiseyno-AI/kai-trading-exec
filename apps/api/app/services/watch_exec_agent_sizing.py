@@ -41,6 +41,8 @@ from app.services.execution_account_route import (
 from app.services.execution_semantics import (
     WATCH_BUY_INTENTS,
     is_exec_agent_sizing_policy,
+    is_short_term_watch_buy_intent,
+    watch_buy_direction_from_payloads,
 )
 from app.services.execution_exposure import (
     item_exposure_scope_is_proven,
@@ -52,6 +54,7 @@ from app.services.exec_agent_approval import (
     configured_execution_cost_evidence,
     delegated_buy_gate_rejections,
     load_strict_json_object,
+    maximum_entry_price_for_buy_economics,
 )
 from app.services.json_compaction import compact_json_object, json_payload_hash
 from app.services.live_market_context import load_live_market_regime_context, merge_live_market_regime_context
@@ -65,7 +68,7 @@ from app.services.openclaw_runtime_contract import (
     stable_runtime_contract_proof,
 )
 from app.services.reconciliation import reconcile_stale_nonterminal_broker_orders
-from app.services.risk_sizing import apply_vol_corr_quantity_cap
+from app.services.risk_sizing import apply_vol_corr_quantity_cap, effective_stop_price
 from app.services.runtime_transitions import (
     WATCH_SIZING_PENDING_STATUS,
     apply_plan_item_status,
@@ -91,7 +94,7 @@ WATCH_EXEC_AGENT_RESPONSE_VERSION = "manual-exec-agent-watch-sizing-v1"
 WATCH_EXEC_AGENT_BINDING_VERSION = "watch-exec-agent-binding-v2"
 WATCH_EXEC_AGENT_DEFER_KEY = "watch_exec_agent_deferred"
 WATCH_EXEC_AGENT_DEFER_SECONDS = 300
-WATCH_EXEC_AGENT_PRICE_WATCH_DEFER_SECONDS = 86400
+WATCH_EXEC_AGENT_PRICE_WATCH_DEFER_SECONDS = 300
 RETRYABLE_REJECTION_REASON_CODES = frozenset({
     "trigger_confirmation_and_cost_evidence_missing",
     "trigger_confirmation_missing",
@@ -195,6 +198,19 @@ def run_due_watch_exec_agent_sizing(
             price_watch_reopened_item_ids=reopened_price_watch_ids,
         )
 
+    expired_price_watch_summaries = [
+        summary
+        for plan in plans
+        if (
+            summary := _expire_elapsed_price_watch_items(
+                db=db,
+                settings=settings,
+                plan=plan,
+                now=cycle_at,
+            )
+        )["rejected"]
+    ]
+
     provider_mismatch_summaries = _quarantine_provider_mismatched_items(
         settings=settings,
         db=db,
@@ -227,6 +243,7 @@ def run_due_watch_exec_agent_sizing(
         return _result(
             idle=False,
             applied=[
+                *expired_price_watch_summaries,
                 *provider_mismatch_summaries,
                 *account_route_mismatch_summaries,
                 *missed_window_summaries,
@@ -248,6 +265,7 @@ def run_due_watch_exec_agent_sizing(
         return _account_context_blocked_result(account_context)
     plan_payloads: list[dict[str, object]] = []
     applied: list[dict[str, object]] = [
+        *expired_price_watch_summaries,
         *provider_mismatch_summaries,
         *account_route_mismatch_summaries,
         *missed_window_summaries,
@@ -378,6 +396,18 @@ def _run_due_watch_exec_agent_sizing_short_transactions(
         plans = _prioritize_sizing_plans(
             _load_candidate_plans(settings=settings, db=db, market_date=market_date)
         )
+        expired_price_watch_summaries = [
+            summary
+            for plan in plans
+            if (
+                summary := _expire_elapsed_price_watch_items(
+                    db=db,
+                    settings=settings,
+                    plan=plan,
+                    now=cycle_at,
+                )
+            )["rejected"]
+        ]
         provider_mismatch_summaries = _quarantine_provider_mismatched_items(
             settings=settings,
             db=db,
@@ -404,7 +434,8 @@ def _run_due_watch_exec_agent_sizing_short_transactions(
             )["rejected"]
         ]
         if (
-            provider_mismatch_summaries
+            expired_price_watch_summaries
+            or provider_mismatch_summaries
             or account_route_mismatch_summaries
             or missed_window_summaries
             or reopened_price_watch_ids
@@ -414,7 +445,8 @@ def _run_due_watch_exec_agent_sizing_short_transactions(
         db.expunge_all()
     if not plans:
         if (
-            provider_mismatch_summaries
+            expired_price_watch_summaries
+            or provider_mismatch_summaries
             or account_route_mismatch_summaries
             or missed_window_summaries
             or reopened_price_watch_ids
@@ -428,6 +460,7 @@ def _run_due_watch_exec_agent_sizing_short_transactions(
                 ),
                 price_watch_reopened_item_ids=reopened_price_watch_ids,
                 applied=[
+                    *expired_price_watch_summaries,
                     *provider_mismatch_summaries,
                     *account_route_mismatch_summaries,
                     *missed_window_summaries,
@@ -455,6 +488,7 @@ def _run_due_watch_exec_agent_sizing_short_transactions(
     )
     plan_payloads: list[dict[str, object]] = []
     applied: list[dict[str, object]] = [
+        *expired_price_watch_summaries,
         *provider_mismatch_summaries,
         *account_route_mismatch_summaries,
         *missed_window_summaries,
@@ -991,6 +1025,18 @@ def _reopen_price_watch_terminal_rejections(
         risk_context = item.risk_context if isinstance(item.risk_context, dict) else {}
         stored_cap = _decimal_value(risk_context.get("reward_risk_max_entry_price"))
         trigger_price = _decimal_value(item.trigger_price)
+        direction = watch_buy_direction_from_payloads(
+            item.quantity_policy,
+            risk_context,
+        )
+        current_cap = _reward_risk_rejection_price_cap(
+            settings=settings,
+            item=item,
+        )
+        expires_at = _price_watch_session_expiry(
+            settings=settings,
+            item=item,
+        )
         if (
             policy.get("kind") != "exec_agent_rejected"
             or policy.get("source") != "exec_agent_watch_sizing"
@@ -1001,15 +1047,23 @@ def _reopen_price_watch_terminal_rejections(
             or not is_exec_agent_sizing_policy(previous_policy)
             or stored_cap is None
             or trigger_price is None
-            or stored_cap < trigger_price
-            or _reward_risk_rejection_price_cap(settings=settings, item=item) is None
+            or (
+                direction == "at_or_above"
+                and stored_cap < trigger_price
+            )
+            or current_cap is None
+            or expires_at is None
+            or expires_at <= checked_at
         ):
             continue
 
-        retry_after = checked_at + timedelta(
-            seconds=WATCH_EXEC_AGENT_PRICE_WATCH_DEFER_SECONDS
+        retry_after = min(
+            checked_at
+            + timedelta(seconds=WATCH_EXEC_AGENT_PRICE_WATCH_DEFER_SECONDS),
+            expires_at,
         )
         next_context = dict(risk_context)
+        next_context["reward_risk_max_entry_price"] = _decimal_text(current_cap)
         next_context[WATCH_EXEC_AGENT_DEFER_KEY] = {
             "reason_code": "reward_risk_price_watch",
             "reason_family": "reward_risk",
@@ -1017,6 +1071,7 @@ def _reopen_price_watch_terminal_rejections(
             "reason": "wait for the planned trigger without exhausting price-dependent retries",
             "deferred_at": checked_at.isoformat(),
             "retry_after": retry_after.isoformat(),
+            "expires_at": expires_at.isoformat(),
             "attempt_count": int(settings.exec_agent_watch_sizing_max_attempts),
             "max_attempts": int(settings.exec_agent_watch_sizing_max_attempts),
             "price_watch_only": True,
@@ -1034,7 +1089,7 @@ def _reopen_price_watch_terminal_rejections(
             summary={
                 "symbol": item.symbol,
                 "reason_code": "reward_risk_price_watch",
-                "reward_risk_max_entry_price": _decimal_text(stored_cap),
+                "reward_risk_max_entry_price": _decimal_text(current_cap),
                 "retry_after": retry_after.isoformat(),
             },
             payload={
@@ -1069,7 +1124,7 @@ def _quarantine_provider_mismatched_items(
                 adapter_provider == "kis"
                 and item_provider == "kis"
                 and asset_class == "stock"
-                and exchange in {"KRX", "KOSPI", "KOSDAQ", "NXT", "SOR"}
+                and exchange in {"KRX", "KOSPI", "KOSDAQ"}
             )
             if supported_route:
                 continue
@@ -1268,14 +1323,18 @@ def _prioritize_sizing_plans(plans: list[ExecutionPlan]) -> list[ExecutionPlan]:
     return sorted(plans, key=plan_key)
 
 
-def _unsized_watch_items(plan: ExecutionPlan) -> list[ExecutionPlanItem]:
+def _unsized_watch_items(
+    plan: ExecutionPlan,
+    *,
+    now: datetime | None = None,
+) -> list[ExecutionPlanItem]:
     items: list[ExecutionPlanItem] = []
     for item in plan.items:
         if item.intent not in WATCH_BUY_INTENTS or item.side != "buy":
             continue
         if not _eligible_unsized_item_status(item):
             continue
-        if _watch_exec_agent_defer_is_active(item):
+        if _watch_exec_agent_defer_is_active(item, now=now):
             continue
         if _has_exec_agent_decision(item):
             continue
@@ -1297,8 +1356,154 @@ def _watch_exec_agent_defer_is_active(
     deferred = context.get(WATCH_EXEC_AGENT_DEFER_KEY)
     if not isinstance(deferred, dict):
         return False
+    checked_at = _utc_datetime(now or datetime.now(UTC))
+    expires_at = _strict_aware_datetime(deferred.get("expires_at"))
+    if expires_at is not None and expires_at <= checked_at:
+        # Session expiry is a hard terminal boundary.  Keep the item out of
+        # candidate selection until the expiry sweep persists ``watch_expired``.
+        return True
     retry_after = _strict_aware_datetime(deferred.get("retry_after"))
-    return retry_after is not None and retry_after > _utc_datetime(now or datetime.now(UTC))
+    return retry_after is not None and retry_after > checked_at
+
+
+def _price_watch_expiry_deadline(
+    *,
+    settings: Settings,
+    item: ExecutionPlanItem,
+) -> datetime | None:
+    context = item.risk_context if isinstance(item.risk_context, dict) else {}
+    deferred = context.get(WATCH_EXEC_AGENT_DEFER_KEY)
+    if not isinstance(deferred, dict) or not (
+        deferred.get("reason_family") == "reward_risk"
+        or deferred.get("price_watch_only") is True
+    ):
+        return None
+    return _price_watch_session_expiry(settings=settings, item=item)
+
+
+def _expire_elapsed_price_watch_items(
+    *,
+    db: Session | None,
+    settings: Settings,
+    plan: ExecutionPlan,
+    now: datetime,
+    only_item_ids: set[str] | None = None,
+) -> dict[str, object]:
+    checked_at = _utc_datetime(now)
+    expired_ids: list[str] = []
+    for item in plan.items:
+        if (
+            item.side != "buy"
+            or item.intent not in WATCH_BUY_INTENTS
+            or not _eligible_unsized_item_status(item)
+            or (
+                only_item_ids is not None
+                and item.id not in only_item_ids
+            )
+        ):
+            continue
+        expires_at = _price_watch_expiry_deadline(
+            settings=settings,
+            item=item,
+        )
+        if expires_at is None:
+            continue
+        context = (
+            item.risk_context if isinstance(item.risk_context, dict) else {}
+        )
+        prior_defer = context.get(WATCH_EXEC_AGENT_DEFER_KEY)
+        if isinstance(prior_defer, dict) and prior_defer.get(
+            "expires_at"
+        ) != expires_at.isoformat():
+            next_defer = dict(prior_defer)
+            next_defer["expires_at"] = expires_at.isoformat()
+            item.risk_context = compact_json_object(
+                {**context, WATCH_EXEC_AGENT_DEFER_KEY: next_defer}
+            )
+            prior_defer = next_defer
+        if expires_at > checked_at:
+            continue
+        previous_policy = (
+            item.quantity_policy
+            if isinstance(item.quantity_policy, dict)
+            else None
+        )
+        record = {
+            "source": "watch_exec_agent_sizing",
+            "action": "reject",
+            "decision": "rejected",
+            "execution_plan_item_id": item.id,
+            "symbol": item.symbol,
+            "quantity": 0,
+            "approved_quantity": 0,
+            "approved_notional_krw": None,
+            "sizing_price": None,
+            "reference_price": None,
+            "reason_code": "reward_risk_price_watch_expired",
+            "reason": "reward-risk price watch reached the KRX session deadline",
+            "decided_at": checked_at.isoformat(),
+        }
+        summary, item.quantity_policy = _canonical_terminal_rejection(
+            item=item,
+            record=record,
+            previous_policy=previous_policy,
+            reason_code="reward_risk_price_watch_expired",
+            reason_family="timing",
+            reason=str(record["reason"]),
+            audit_event_type="watch_exec_agent_price_watch_expired",
+            decided_at=checked_at,
+        )
+        apply_plan_item_status(plan_item=item, status="watch_expired")
+        expired_ids.append(item.id)
+        _add_plan_item_audit(
+            db=db,
+            item=item,
+            event_type="watch_exec_agent_price_watch_expired",
+            summary=summary,
+            payload={
+                "summary": summary,
+                "expires_at": expires_at.isoformat(),
+                "prior_defer": prior_defer,
+            },
+        )
+    no_trade = (
+        finalize_completed_no_trade_plan(db=db, settings=settings, plan=plan)
+        if expired_ids and isinstance(db, Session)
+        else {"completed": False, "entry_count": 0, "linked_exit_count": 0}
+    )
+    return {
+        "plan_id": plan.external_plan_id,
+        "evaluated": len(expired_ids),
+        "approved": 0,
+        "approved_notional_krw": "0.0000",
+        "rejected": len(expired_ids),
+        "deferred": 0,
+        "missing": 0,
+        "missing_item_ids": [],
+        "ignored_extra": 0,
+        "price_watch_expired_item_ids": expired_ids,
+        "no_trade": no_trade,
+    }
+
+
+def _price_watch_session_expiry(
+    *,
+    settings: Settings,
+    item: ExecutionPlanItem,
+) -> datetime | None:
+    plan = item.plan
+    if plan is None or plan.market_date is None:
+        return None
+    context = item.risk_context if isinstance(item.risk_context, dict) else {}
+    exchange = str(context.get("exchange") or item.venue or "").strip().upper()
+    if exchange not in {"KRX", "KOSPI", "KOSDAQ"}:
+        return None
+    local_deadline = datetime.combine(
+        plan.market_date,
+        time(hour=15, minute=30),
+        tzinfo=ZoneInfo(settings.market_timezone),
+    )
+    return local_deadline.astimezone(UTC)
 
 
 def _reward_risk_rejection_price_cap(
@@ -1310,19 +1515,50 @@ def _reward_risk_rejection_price_cap(
     trigger = _decimal_value(item.trigger_price)
     target = _decimal_value(context.get("target_price"))
     stop = _decimal_value(context.get("stop_loss_price") or context.get("stop_price"))
-    minimum = max(
-        Decimal(str(settings.exec_agent_min_reward_risk)),
-        SHORT_TERM_LIVE_MIN_NET_REWARD_RISK,
+    minimum = _minimum_reward_risk_for_candidate(
+        settings=settings,
+        intent=item.intent,
     )
-    if (
-        trigger is None
-        or target is None
-        or stop is None
-        or not stop < trigger < target
-    ):
+    if trigger is None or target is None or stop is None or not stop < trigger < target:
         return None
-    reward_risk = (target - trigger) / (trigger - stop)
-    return trigger if reward_risk >= minimum else None
+    cap = maximum_entry_price_for_buy_economics(
+        target_price=target,
+        upstream_stop_price=stop,
+        stop_loss_pct=Decimal(str(settings.exec_agent_stop_loss_pct)),
+        minimum_reward_risk=minimum,
+        evidence=configured_execution_cost_evidence(
+            settings=settings,
+            provider=item.provider,
+            asset_class=item.asset_class,
+            exchange=context.get("exchange") or item.venue,
+            live_quote_spread_bps=None,
+            require_live_quote_spread=False,
+        ),
+        require_cost_evidence=settings.runtime_mode == "live",
+    )
+    if cap is None:
+        return None
+    direction = watch_buy_direction_from_payloads(
+        item.quantity_policy,
+        context,
+    )
+    if direction == "at_or_above" and cap < trigger:
+        return None
+    return cap
+
+
+def _minimum_reward_risk_for_candidate(
+    *,
+    settings: Settings,
+    intent: object,
+) -> Decimal:
+    configured = Decimal(str(settings.exec_agent_min_reward_risk))
+    if (
+        settings.runtime_mode == "live"
+        and is_short_term_watch_buy_intent(intent)
+    ):
+        return max(configured, SHORT_TERM_LIVE_MIN_NET_REWARD_RISK)
+    return configured
 
 
 def _retryable_watch_rejection(
@@ -2815,22 +3051,80 @@ def _apply_decisions(
     expected_item_ids: set[str] | None = None,
     now: datetime | None = None,
 ) -> dict[str, object]:
-    expected_ids = expected_item_ids or {item.id for item in _unsized_watch_items(plan)}
     decision_at = _utc_datetime(now or datetime.now(UTC))
+    expected_ids = expected_item_ids or {
+        item.id for item in _unsized_watch_items(plan, now=decision_at)
+    }
+    expired_summary = (
+        _expire_elapsed_price_watch_items(
+            db=db if isinstance(db, Session) else None,
+            settings=settings,
+            plan=plan,
+            now=decision_at,
+            only_item_ids=expected_ids,
+        )
+        if settings is not None
+        else {
+            "rejected": 0,
+            "price_watch_expired_item_ids": [],
+            "no_trade": {
+                "completed": False,
+                "entry_count": 0,
+                "linked_exit_count": 0,
+            },
+        }
+    )
+    expired_ids = set(expired_summary["price_watch_expired_item_ids"])
+    active_expected_ids = expected_ids.difference(expired_ids)
+    if not active_expected_ids:
+        return {
+            "plan_id": plan.external_plan_id,
+            "evaluated": len(expired_ids),
+            "approved": 0,
+            "approved_notional_krw": "0.0000",
+            "rejected": len(expired_ids),
+            "deferred": 0,
+            "missing": 0,
+            "missing_item_ids": [],
+            "ignored_extra": 0,
+            "price_watch_expired_item_ids": sorted(expired_ids),
+            "no_trade": expired_summary["no_trade"],
+        }
     if (
         settings is not None
         and request_payload is not None
         and isinstance(account_context, dict)
         and isinstance(request_payload.get("candidates"), list)
     ):
+        active_request_payload = dict(request_payload)
+        active_request_payload["candidates"] = [
+            candidate
+            for candidate in request_payload["candidates"]
+            if isinstance(candidate, dict)
+            and candidate.get("execution_plan_item_id") in active_expected_ids
+        ]
         _validate_fresh_candidate_bindings(
             settings=settings,
             plan=plan,
-            request_payload=request_payload,
+            request_payload=active_request_payload,
             account_context=account_context,
-            expected_item_ids=expected_ids,
+            expected_item_ids=active_expected_ids,
             reference_at=decision_at,
         )
+    if expired_ids:
+        active_decision_payload = dict(decision_payload)
+        decisions_raw = decision_payload.get("decisions")
+        if isinstance(decisions_raw, list):
+            active_decision_payload["decisions"] = [
+                decision
+                for decision in decisions_raw
+                if not (
+                    isinstance(decision, dict)
+                    and str(decision.get("execution_plan_item_id")) in expired_ids
+                )
+            ]
+        decision_payload = active_decision_payload
+    expected_ids = active_expected_ids
     _validate_exec_agent_decision_payload(
         decision_payload=decision_payload,
         plan=plan,
@@ -2843,7 +3137,11 @@ def _apply_decisions(
     missing_ids = expected_ids.difference(decisions)
     assert not extra_ids
     assert not missing_ids
-    items = [item for item in _unsized_watch_items(plan) if item.id in decisions]
+    items = [
+        item
+        for item in _unsized_watch_items(plan, now=decision_at)
+        if item.id in decisions
+    ]
     if settings is not None:
         for item in items:
             mismatch = validate_kis_account_route(
@@ -2899,7 +3197,7 @@ def _apply_decisions(
     approved_next_open_item_ids: set[str] = set()
     approved = 0
     approved_notional = Decimal("0")
-    rejected = 0
+    rejected = len(expired_ids)
     deferred = 0
     for item in items:
         is_untriggered_next_open = _is_untriggered_next_open_sizing_item(item)
@@ -3162,8 +3460,17 @@ def _apply_decisions(
                 ),
                 "allowed_action_envelope": envelope,
                 "market_regime_guardrail": envelope.get("market_regime_guardrail"),
+                "effective_stop_policy_version": "server_effective_stop_v1",
+                "upstream_stop_price": envelope.get("upstream_stop_price"),
+                "effective_stop_price": envelope.get("effective_stop_price"),
+                "stop_price": envelope.get("effective_stop_price"),
+                "stop_loss_price": envelope.get("effective_stop_price"),
                 "previous_policy": previous_policy,
             })
+            _persist_server_owned_effective_stop(
+                item=item,
+                envelope=envelope,
+            )
             _clear_watch_exec_agent_defer(item)
             if is_untriggered_next_open:
                 item.limit_price = sizing["sizing_price"]
@@ -3224,10 +3531,27 @@ def _apply_decisions(
                 settings=settings,
                 item=item,
             )
+            price_watch_expires_at = (
+                _price_watch_session_expiry(settings=settings, item=item)
+                if disposition == "defer"
+                and reason_family == "reward_risk"
+                and reward_risk_cap is not None
+                else None
+            )
+            if (
+                disposition == "defer"
+                and reason_family == "reward_risk"
+                and (
+                    price_watch_expires_at is None
+                    or price_watch_expires_at <= decision_at
+                )
+            ):
+                disposition = "terminal"
             price_watch_only = bool(
                 disposition == "defer"
                 and reason_family == "reward_risk"
                 and reward_risk_cap is not None
+                and price_watch_expires_at is not None
                 and defer_attempt_count >= max_defer_attempts
             )
             exhausted = bool(
@@ -3254,12 +3578,10 @@ def _apply_decisions(
             }
             if disposition in {"retry", "defer"}:
                 retry_after = decision_at + timedelta(
-                    seconds=(
-                        WATCH_EXEC_AGENT_PRICE_WATCH_DEFER_SECONDS
-                        if price_watch_only
-                        else WATCH_EXEC_AGENT_DEFER_SECONDS
-                    )
+                    seconds=WATCH_EXEC_AGENT_DEFER_SECONDS
                 )
+                if price_watch_expires_at is not None:
+                    retry_after = min(retry_after, price_watch_expires_at)
                 risk_context = (
                     dict(item.risk_context)
                     if isinstance(item.risk_context, dict)
@@ -3278,6 +3600,10 @@ def _apply_decisions(
                 }
                 if price_watch_only:
                     risk_context[WATCH_EXEC_AGENT_DEFER_KEY]["price_watch_only"] = True
+                if price_watch_expires_at is not None:
+                    risk_context[WATCH_EXEC_AGENT_DEFER_KEY]["expires_at"] = (
+                        price_watch_expires_at.isoformat()
+                    )
                 if reward_risk_cap is not None:
                     risk_context["reward_risk_max_entry_price"] = _decimal_text(
                         reward_risk_cap
@@ -3334,7 +3660,7 @@ def _apply_decisions(
     )
     return {
         "plan_id": plan.external_plan_id,
-        "evaluated": len(items),
+        "evaluated": len(items) + len(expired_ids),
         "approved": approved,
         "approved_notional_krw": _decimal_text(approved_notional),
         "rejected": rejected,
@@ -3342,6 +3668,7 @@ def _apply_decisions(
         "missing": len(missing_ids),
         "missing_item_ids": sorted(missing_ids),
         "ignored_extra": len(extra_ids),
+        "price_watch_expired_item_ids": sorted(expired_ids),
         "no_trade": no_trade,
     }
 
@@ -3547,6 +3874,37 @@ def _clear_watch_exec_agent_defer(item: ExecutionPlanItem) -> None:
     risk_context = dict(item.risk_context)
     risk_context.pop(WATCH_EXEC_AGENT_DEFER_KEY, None)
     item.risk_context = compact_json_object(risk_context)
+
+
+def _persist_server_owned_effective_stop(
+    *,
+    item: ExecutionPlanItem,
+    envelope: dict[str, object],
+) -> None:
+    effective_stop = _decimal_value(envelope.get("effective_stop_price"))
+    if effective_stop is None or effective_stop <= 0:
+        return
+
+    plan = item.plan
+    linked_entry_key = str(item.source_plan_item_id or "").strip()
+    if plan is None or not linked_entry_key:
+        return
+    for sibling in plan.items:
+        policy = (
+            sibling.quantity_policy
+            if isinstance(sibling.quantity_policy, dict)
+            else {}
+        )
+        if (
+            sibling.symbol == item.symbol
+            and sibling.side == "sell"
+            and sibling.intent == "stop_sell"
+            and sibling.status
+            in {"stop_sell_pending_config", "stop_sell_pending_configuration"}
+            and str(policy.get("linked_entry_item_key") or "").strip()
+            == linked_entry_key
+        ):
+            sibling.trigger_price = effective_stop
 
 
 def _sizing_explanation(
@@ -3882,10 +4240,20 @@ def _allowed_action_envelope_for_candidate(
             cap_candidates.append(value)
 
     raw_stop_price = candidate.get("stop_loss_price")
-    stop_price = _decimal_value(raw_stop_price)
+    upstream_stop_price = _decimal_value(raw_stop_price)
+    stop_price = upstream_stop_price
     stop_distance_pct: str | None = None
     risk_cap: Decimal | None = None
-    if stop_price is not None and sizing_price > 0 and stop_price < sizing_price:
+    if (
+        upstream_stop_price is not None
+        and sizing_price > 0
+        and upstream_stop_price < sizing_price
+    ):
+        stop_price = effective_stop_price(
+            settings=settings,
+            entry_price=sizing_price,
+            upstream_stop_price=upstream_stop_price,
+        )
         stop_distance = sizing_price - stop_price
         stop_distance_pct = _decimal_text((stop_distance / sizing_price) * Decimal("100"))
         risk_budget = account_basis * Decimal(str(settings.exec_agent_max_trade_risk_pct))
@@ -3905,14 +4273,9 @@ def _allowed_action_envelope_for_candidate(
         reference_price=sizing_price if sizing_price > 0 else None,
         target_price=target_price,
         stop_price=stop_price,
-        minimum_reward_risk=(
-            max(
-                Decimal(str(settings.exec_agent_min_reward_risk)),
-                SHORT_TERM_LIVE_MIN_NET_REWARD_RISK,
-            )
-            if settings.runtime_mode == "live"
-            and candidate.get("intent") == "intraday_watch_buy"
-            else Decimal(str(settings.exec_agent_min_reward_risk))
+        minimum_reward_risk=_minimum_reward_risk_for_candidate(
+            settings=settings,
+            intent=candidate.get("intent"),
         ),
         evidence=configured_execution_cost_evidence(
             settings=settings,
@@ -3975,6 +4338,9 @@ def _allowed_action_envelope_for_candidate(
         "reference_price": _decimal_text(sizing_price),
         "target_price": _decimal_text(target_price),
         "target_distance_pct": target_distance_pct,
+        "upstream_stop_price": _decimal_text(upstream_stop_price),
+        "effective_stop_price": _decimal_text(stop_price),
+        "stop_price": _decimal_text(stop_price),
         "stop_distance_pct": stop_distance_pct,
         "minimum_reward_risk": _decimal_text(economics.minimum_reward_risk),
         "gross_reward_risk": _decimal_text(economics.gross_reward_risk),
@@ -4082,9 +4448,18 @@ def _risk_cap_notional(
     account_basis: Decimal,
     sizing_price: Decimal,
 ) -> Decimal | None:
-    stop_price = _stop_price(item)
-    if stop_price is None or stop_price <= 0 or stop_price >= sizing_price:
+    upstream_stop_price = _upstream_stop_price(item)
+    if (
+        upstream_stop_price is None
+        or upstream_stop_price <= 0
+        or upstream_stop_price >= sizing_price
+    ):
         return None
+    stop_price = effective_stop_price(
+        settings=settings,
+        entry_price=sizing_price,
+        upstream_stop_price=upstream_stop_price,
+    )
     risk_budget = account_basis * Decimal(str(settings.exec_agent_max_trade_risk_pct))
     stop_distance = sizing_price - stop_price
     risk_quantity = _floor_quantity(risk_budget / stop_distance)
@@ -4184,9 +4559,9 @@ def _candidate_max_safe_notional(item: ExecutionPlanItem) -> Decimal | None:
     return None
 
 
-def _stop_price(item: ExecutionPlanItem) -> Decimal | None:
+def _upstream_stop_price(item: ExecutionPlanItem) -> Decimal | None:
     risk_context = item.risk_context if isinstance(item.risk_context, dict) else {}
-    for key in ("stop_loss_price", "stop_price", "effective_stop_price"):
+    for key in ("upstream_stop_price", "stop_loss_price", "stop_price"):
         value = _decimal_value(risk_context.get(key))
         if value is not None and value > 0:
             return value

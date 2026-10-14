@@ -105,6 +105,100 @@ from app.services.watch_exec_agent_sizing import _apply_decisions
 from openclaw_contract_test_support import verified_runtime_provenance
 
 
+@pytest.mark.parametrize(
+    "intent",
+    ("watch_buy", "trigger_buy", "chase_buy", "tactical_buy"),
+)
+def test_plan_validation_accepts_every_watch_buy_alias_with_trigger_limit(
+    intent: str,
+) -> None:
+    item = ExecutionPlanItem(
+        id=f"alias-{intent}",
+        plan_item_index=0,
+        symbol="005930",
+        side="buy",
+        intent=intent,
+        status="watch_buy_triggered",
+        provider="kis",
+        asset_class="stock",
+        trigger_price=Decimal("70000"),
+        quantity_policy={"kind": "shares", "quantity": 1},
+        risk_context={},
+    )
+    command = PlaceOrderRequest(
+        idempotency_key=f"alias-order-{intent}",
+        execution_plan_item_id=item.id,
+        provider="kis",
+        asset_class="stock",
+        symbol="005930",
+        side="buy",
+        quantity=1,
+        order_type="limit",
+        limit_price=Decimal("70000"),
+        time_in_force="day",
+        exchange="KRX",
+    )
+
+    assert broker_orders_service._validate_plan_item(
+        plan_item=item,
+        command=command,
+        request_source="monitoring:intraday_target_stop_monitor",
+    ) is None
+
+
+@pytest.mark.parametrize(
+    "intent",
+    ("watch_buy", "trigger_buy", "chase_buy", "tactical_buy"),
+)
+def test_monitoring_reprice_authority_accepts_every_watch_buy_alias(
+    intent: str,
+) -> None:
+    item = ExecutionPlanItem(
+        id=f"reprice-alias-{intent}",
+        plan_item_index=0,
+        symbol="005930",
+        side="buy",
+        intent=intent,
+        status="watch_buy_triggered",
+        provider="kis",
+        asset_class="stock",
+        trigger_price=Decimal("70000"),
+        quantity_policy={
+            "kind": "shares",
+            "quantity": 1,
+            "exec_trigger_time_liquidity_evidence_v1": {
+                "version": 1,
+                "provider": "kis",
+                "asset_class": "stock",
+                "exchange": "KRX",
+                "symbol": "005930",
+                "observed_at": "2026-10-14T01:00:00+00:00",
+                "freshness_source": "kis_exchange_orderbook_time",
+            },
+        },
+        risk_context={},
+    )
+    command = PlaceOrderRequest(
+        idempotency_key=f"reprice-alias-order-{intent}",
+        execution_plan_item_id=item.id,
+        provider="kis",
+        asset_class="stock",
+        symbol="005930",
+        side="buy",
+        quantity=1,
+        order_type="limit",
+        limit_price=Decimal("70100"),
+        time_in_force="day",
+        exchange="KRX",
+    )
+
+    assert broker_orders_service._persisted_monitoring_buy_reprice_authority_matches(
+        plan_item=item,
+        command=command,
+        request_source="monitoring:intraday_target_stop_monitor",
+    )
+
+
 class RecordingHttpClient:
     def __init__(
         self,
@@ -21287,66 +21381,88 @@ def test_kis_adapter_fetches_timestamped_intraday_liquidity_snapshot() -> None:
 
 
 @pytest.mark.parametrize(
-    "response_payload",
+    ("response_payload", "expected_code", "expected_retryable"),
     [
-        {
-            "rt_cd": "0",
-            "output1": {"acml_vol": "1", "stck_hgpr": "2", "stck_lwpr": "1"},
-            "output2": [],
-        },
-        {
-            "rt_cd": "0",
-            "output1": {"acml_vol": "1", "stck_hgpr": "2", "stck_lwpr": "1"},
-            "output2": [
-                {
-                    "stck_bsop_date": "20260909",
-                    "stck_cntg_hour": "090001",
-                    "cntg_vol": "1",
-                    "acml_tr_pbmn": "1",
-                }
-            ],
-        },
-        {
-            "rt_cd": "0",
-            "output1": {"acml_vol": "1", "stck_hgpr": "2", "stck_lwpr": "1"},
-            "output2": [
-                {
-                    "stck_bsop_date": "20260910",
-                    "stck_cntg_hour": "09xx00xx01",
-                    "cntg_vol": "1",
-                    "acml_tr_pbmn": "1",
-                }
-            ],
-        },
-        {
-            "rt_cd": "0",
-            "output1": {"acml_vol": "NaN", "stck_hgpr": "2", "stck_lwpr": "1"},
-            "output2": [
-                {
-                    "stck_bsop_date": "20260910",
-                    "stck_cntg_hour": "090001",
-                    "cntg_vol": "1",
-                    "acml_tr_pbmn": "1",
-                }
-            ],
-        },
-        {
-            "rt_cd": "0",
-            "output1": {"acml_vol": "1", "stck_hgpr": "2", "stck_lwpr": "1"},
-            "output2": [
-                {
-                    "stck_bsop_date": "20260910",
-                    "stck_cntg_hour": "090001",
-                    "cntg_vol": "1",
-                    "acml_tr_pbmn": "-1",
-                }
-            ],
-        },
+        (
+            {
+                "rt_cd": "0",
+                "output1": {"acml_vol": "1", "stck_hgpr": "2", "stck_lwpr": "1"},
+                "output2": [],
+            },
+            "kis_intraday_liquidity_empty_response",
+            True,
+        ),
+        (
+            {
+                "rt_cd": "0",
+                "output1": {"acml_vol": "1", "stck_hgpr": "2", "stck_lwpr": "1"},
+                "output2": [
+                    {
+                        "stck_bsop_date": "20260909",
+                        "stck_cntg_hour": "090001",
+                        "cntg_vol": "1",
+                        "acml_tr_pbmn": "1",
+                    }
+                ],
+            },
+            "kis_intraday_liquidity_wrong_market_date",
+            False,
+        ),
+        (
+            {
+                "rt_cd": "0",
+                "output1": {"acml_vol": "1", "stck_hgpr": "2", "stck_lwpr": "1"},
+                "output2": [
+                    {
+                        "stck_bsop_date": "20260910",
+                        "stck_cntg_hour": "09xx00xx01",
+                        "cntg_vol": "1",
+                        "acml_tr_pbmn": "1",
+                    }
+                ],
+            },
+            "kis_intraday_liquidity_timestamp_invalid",
+            False,
+        ),
+        (
+            {
+                "rt_cd": "0",
+                "output1": {"acml_vol": "NaN", "stck_hgpr": "2", "stck_lwpr": "1"},
+                "output2": [
+                    {
+                        "stck_bsop_date": "20260910",
+                        "stck_cntg_hour": "090001",
+                        "cntg_vol": "1",
+                        "acml_tr_pbmn": "1",
+                    }
+                ],
+            },
+            "kis_intraday_liquidity_numeric_evidence_invalid",
+            False,
+        ),
+        (
+            {
+                "rt_cd": "0",
+                "output1": {"acml_vol": "1", "stck_hgpr": "2", "stck_lwpr": "1"},
+                "output2": [
+                    {
+                        "stck_bsop_date": "20260910",
+                        "stck_cntg_hour": "090001",
+                        "cntg_vol": "1",
+                        "acml_tr_pbmn": "-1",
+                    }
+                ],
+            },
+            "kis_intraday_liquidity_numeric_evidence_invalid",
+            False,
+        ),
     ],
     ids=["empty", "wrong-date", "malformed-time", "nonfinite", "negative"],
 )
 def test_kis_intraday_liquidity_snapshot_rejects_untrusted_payload(
     response_payload: dict[str, object],
+    expected_code: str,
+    expected_retryable: bool,
 ) -> None:
     adapter = KisBrokerAdapter(
         settings=Settings(
@@ -21357,11 +21473,20 @@ def test_kis_intraday_liquidity_snapshot_rejects_untrusted_payload(
         http_client=RecordingHttpClient({}, get_response=response_payload),
     )
 
-    assert adapter.get_intraday_liquidity_snapshot(
-        "access-token",
-        symbol="005930",
-        reference_at=datetime(2026, 9, 10, 0, 0, 5, tzinfo=UTC),
-    ) is None
+    with pytest.raises(BrokerAdapterError) as exc_info:
+        adapter.get_intraday_liquidity_snapshot(
+            "access-token",
+            symbol="005930",
+            reference_at=datetime(2026, 9, 10, 0, 0, 5, tzinfo=UTC),
+        )
+
+    assert exc_info.value.code == expected_code
+    assert exc_info.value.retryable is expected_retryable
+    assert exc_info.value.classification == (
+        BrokerErrorClassification.TRANSIENT
+        if expected_retryable
+        else BrokerErrorClassification.VALIDATION
+    )
 
 
 @pytest.mark.parametrize("value", ["NaN", "Infinity", "-Infinity"])
@@ -24920,7 +25045,7 @@ def test_live_automated_krx_buy_rechecks_configured_cost_floor_at_broker_boundar
         quantity_policy={"kind": "shares", "quantity": 1, "fee_bps": "0"},
         risk_context={
             "trigger_direction": "at_or_above",
-            "target_price": "109.10",
+            "target_price": "104.55",
             "stop_price": "95",
             "estimated_round_trip_cost_bps": "0",
         },
@@ -24964,6 +25089,130 @@ def test_live_automated_krx_buy_rechecks_configured_cost_floor_at_broker_boundar
 
     assert failure is not None
     assert failure[0] == "live_buy_net_reward_risk_below_minimum"
+
+
+def test_live_automated_krx_buy_uses_server_effective_stop_at_broker_boundary() -> None:
+    reference_at = datetime(2026, 9, 9, 0, 30, tzinfo=UTC)
+    settings = Settings(
+        runtime_mode="live",
+        exec_agent_stop_loss_pct=Decimal("0.025"),
+        exec_agent_min_reward_risk=Decimal("1.30"),
+        kis_krx_round_trip_non_spread_cost_bps=Decimal("0"),
+    )
+    policy = _verified_watch_sizing_policy(
+        settings=settings,
+        quantity=1,
+        sizing_price="100.0000",
+        approved_notional="100.0000",
+    )
+    policy.update(
+        {
+            "effective_stop_policy_version": "server_effective_stop_v1",
+            "upstream_stop_price": "90.0000",
+            "effective_stop_price": "97.5000",
+            "stop_price": "97.5000",
+            "stop_loss_price": "97.5000",
+            "allowed_action_envelope": {
+                "upstream_stop_price": "90.0000",
+                "effective_stop_price": "97.5000",
+                "stop_price": "97.5000",
+            },
+        }
+    )
+    item = ExecutionPlanItem(
+        plan=ExecutionPlan(
+            external_plan_id="server-effective-stop-boundary-plan",
+            source="test",
+            market_date=reference_at.astimezone(ZoneInfo("Asia/Seoul")).date(),
+            mode="live",
+        ),
+        id="server-effective-stop-boundary-buy",
+        plan_item_index=0,
+        symbol="005930",
+        side="buy",
+        intent="intraday_watch_buy",
+        status="broker_order_submission_pending",
+        provider="kis",
+        asset_class="stock",
+        trigger_price=Decimal("100"),
+        quantity_policy=policy,
+        risk_context={
+            "exchange": "KRX",
+            "trigger_direction": "at_or_above",
+            "target_price": "105",
+            "stop_price": "90",
+        },
+    )
+    command = PlaceOrderRequest(
+        idempotency_key="server-effective-stop-boundary-buy",
+        execution_plan_item_id=item.id,
+        provider="kis",
+        asset_class="stock",
+        symbol="005930",
+        side="buy",
+        quantity=1,
+        order_type="limit",
+        limit_price=Decimal("100"),
+        time_in_force="day",
+        exchange="KRX",
+    )
+    evidence = broker_orders_service.AutomatedKisBuyMarketEvidence(
+        is_domestic=True,
+        context=BrokerLiveMarketContext(
+            symbol="005930",
+            exchange="KRX",
+            observed_at=reference_at,
+            bid=Decimal("100"),
+            ask=Decimal("100"),
+            freshness_source="kis_exchange_orderbook_time",
+            normal_ordering_available=True,
+        ),
+        liquidity_snapshot=BrokerIntradayLiquiditySnapshot(
+            symbol="005930",
+            exchange="KRX",
+            observed_at=reference_at,
+            volume=Decimal("1000000"),
+            turnover=Decimal("5000000000"),
+            day_high=Decimal("105"),
+            day_low=Decimal("95"),
+            payload={
+                "provider": "kis",
+                "endpoint": (
+                    "/uapi/domestic-stock/v1/quotations/"
+                    "inquire-time-itemchartprice"
+                ),
+                "tr_id": "FHKST03010200",
+            },
+            freshness_source="kis_exchange_intraday_minute_time",
+        ),
+    )
+
+    failure = broker_orders_service._automated_kis_buy_market_evidence_failure(
+        settings=settings,
+        command=command,
+        plan_item=item,
+        evidence=evidence,
+        reference_at=reference_at,
+    )
+
+    assert failure is None
+    assert broker_orders_service._final_watch_buy_effective_stop(
+        settings=settings,
+        plan_item=item,
+        execution_reference=Decimal("99"),
+    ) == Decimal("97.5000")
+    item.risk_context = {**item.risk_context, "effective_stop_price": "98.0000"}
+    assert broker_orders_service._final_watch_buy_effective_stop(
+        settings=settings,
+        plan_item=item,
+        execution_reference=Decimal("99"),
+    ) == Decimal("98.0000")
+    item.quantity_policy = {**policy, "stop_price": "96.0000"}
+    assert broker_orders_service._final_watch_buy_effective_stop(
+        settings=settings,
+        plan_item=item,
+        execution_reference=Decimal("100"),
+    ) is None
 
 
 def test_live_automated_krx_buy_requires_bid_for_final_cost_evidence() -> None:

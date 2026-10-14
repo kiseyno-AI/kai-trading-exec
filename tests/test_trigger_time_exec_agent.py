@@ -19,6 +19,7 @@ from app.broker.base import (
     BrokerAdapterError,
     BrokerConfig,
     BrokerCurrentPrice,
+    BrokerErrorClassification,
     BrokerIntradayLiquiditySnapshot,
     BrokerLiveMarketContext,
 )
@@ -1804,8 +1805,8 @@ def test_trigger_time_buy_effective_risk_stop_updates_stop_monitor(
         stop_item = session.get(ExecutionPlanItem, stop_item_id)
         assert buy_item is not None
         assert stop_item is not None
-        assert stop_item.trigger_price == Decimal("68232.0000")
-        assert buy_item.risk_context["effective_stop_price"] == "68232.0000"
+        assert stop_item.trigger_price == Decimal("69298.1250")
+        assert buy_item.risk_context["effective_stop_price"] == "69298.1250"
         assert buy_item.risk_context["upstream_stop_price"] == "60000.0000"
         assert buy_item.risk_context["stop_monitor_adjustment"] == "raised_to_effective_risk_stop"
         sizing_events = [
@@ -4844,7 +4845,14 @@ def test_trigger_time_cost_model_replaces_stale_slippage_with_fresh_spread() -> 
         symbol="005930",
         side="buy",
         intent="intraday_watch_buy",
-        risk_context={"estimated_round_trip_cost_bps": "999", "fee_bps": "4"},
+        provider="kis",
+        venue="kis",
+        asset_class="stock",
+        risk_context={
+            "exchange": "KRX",
+            "estimated_round_trip_cost_bps": "999",
+            "fee_bps": "4",
+        },
     )
 
     evidence = monitoring._post_agent_live_cost_evidence(
@@ -5347,6 +5355,196 @@ def test_trigger_time_liquidity_refresh_fails_closed_on_untrusted_evidence(
 
     assert expected_reason in str(reason)
     assert adapter.calls == 1
+
+
+def test_trigger_time_liquidity_refresh_retries_one_empty_snapshot_then_uses_fresh_evidence(
+) -> None:
+    reference_at = datetime(2026, 6, 5, 0, 30, tzinfo=UTC)
+    snapshot = BrokerIntradayLiquiditySnapshot(
+        symbol="005930",
+        exchange="KRX",
+        observed_at=reference_at,
+        volume=Decimal("1250000"),
+        turnover=Decimal("3500000000"),
+        day_high=Decimal("72000"),
+        day_low=Decimal("70000"),
+        freshness_source="kis_exchange_intraday_minute_time",
+        payload={
+            "provider": "kis",
+            "endpoint": (
+                "/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice"
+            ),
+            "tr_id": "FHKST03010200",
+        },
+    )
+
+    class Adapter:
+        provider = "kis"
+        calls = 0
+
+        def get_intraday_liquidity_snapshot(self, *_args: object, **_kwargs: object):
+            self.calls += 1
+            if self.calls == 1:
+                raise BrokerAdapterError(
+                    "temporary empty intraday response",
+                    classification=BrokerErrorClassification.TRANSIENT,
+                    retryable=True,
+                    code="kis_intraday_liquidity_empty_response",
+                )
+            return snapshot
+
+    adapter = Adapter()
+    item = ExecutionPlanItem(
+        execution_plan_id="plan",
+        symbol="005930",
+        side="buy",
+        intent="intraday_watch_buy",
+        provider="kis",
+        asset_class="stock",
+        risk_context={"exchange": "KRX"},
+    )
+    price = MonitoringPriceRequest(
+        symbol="005930",
+        price=Decimal("71000"),
+        observed_at=reference_at,
+        freshness_source="kis_exchange_orderbook_time",
+    )
+
+    merged_price, reason = monitoring._merge_trigger_time_liquidity_snapshot(
+        settings=Settings(
+            runtime_mode="live",
+            monitoring_max_quote_age_seconds=1,
+            monitoring_max_quote_future_skew_seconds=1,
+            kis_get_network_retry_attempts=1,
+        ),
+        adapter=adapter,
+        access_token="token",
+        item=item,
+        price=price,
+        reference_at=reference_at,
+    )
+
+    assert reason is None
+    assert adapter.calls == 2
+    assert merged_price.turnover == Decimal("3500000000")
+    assert merged_price.provenance["intraday_liquidity"][
+        "refresh_attempt_count"
+    ] == 2
+
+
+def test_trigger_time_liquidity_refresh_never_retries_validation_even_if_flagged_retryable(
+) -> None:
+    reference_at = datetime(2026, 6, 5, 0, 30, tzinfo=UTC)
+    snapshot = BrokerIntradayLiquiditySnapshot(
+        symbol="005930",
+        exchange="KRX",
+        observed_at=reference_at,
+        volume=Decimal("1250000"),
+        turnover=Decimal("3500000000"),
+        day_high=Decimal("72000"),
+        day_low=Decimal("70000"),
+        freshness_source="kis_exchange_intraday_minute_time",
+        payload={"provider": "kis"},
+    )
+
+    class Adapter:
+        provider = "kis"
+        calls = 0
+
+        def get_intraday_liquidity_snapshot(self, *_args: object, **_kwargs: object):
+            self.calls += 1
+            if self.calls == 1:
+                raise BrokerAdapterError(
+                    "scope mismatch",
+                    classification=BrokerErrorClassification.VALIDATION,
+                    retryable=True,
+                    code="scope_mismatch",
+                )
+            return snapshot
+
+    adapter = Adapter()
+    item = ExecutionPlanItem(
+        execution_plan_id="plan",
+        symbol="005930",
+        side="buy",
+        intent="intraday_watch_buy",
+        provider="kis",
+        asset_class="stock",
+        risk_context={"exchange": "KRX"},
+    )
+    price = MonitoringPriceRequest(
+        symbol="005930",
+        price=Decimal("71000"),
+        observed_at=reference_at,
+        freshness_source="kis_exchange_orderbook_time",
+    )
+
+    merged_price, reason = monitoring._merge_trigger_time_liquidity_snapshot(
+        settings=Settings(runtime_mode="live", kis_get_network_retry_attempts=3),
+        adapter=adapter,
+        access_token="token",
+        item=item,
+        price=price,
+        reference_at=reference_at,
+    )
+
+    assert merged_price is price
+    assert adapter.calls == 1
+    assert reason == (
+        "intraday liquidity refresh failed: scope_mismatch; "
+        "attempts=1; retryable=false"
+    )
+
+
+def test_trigger_time_liquidity_refresh_bounds_retry_and_reports_adapter_code(
+) -> None:
+    reference_at = datetime(2026, 6, 5, 0, 30, tzinfo=UTC)
+
+    class Adapter:
+        provider = "kis"
+        calls = 0
+
+        def get_intraday_liquidity_snapshot(self, *_args: object, **_kwargs: object):
+            self.calls += 1
+            raise BrokerAdapterError(
+                "temporary empty intraday response",
+                classification=BrokerErrorClassification.TRANSIENT,
+                retryable=True,
+                code="kis_intraday_liquidity_empty_response",
+            )
+
+    adapter = Adapter()
+    item = ExecutionPlanItem(
+        execution_plan_id="plan",
+        symbol="005930",
+        side="buy",
+        intent="intraday_watch_buy",
+        provider="kis",
+        asset_class="stock",
+        risk_context={"exchange": "KRX"},
+    )
+    price = MonitoringPriceRequest(
+        symbol="005930",
+        price=Decimal("71000"),
+        observed_at=reference_at,
+        freshness_source="kis_exchange_orderbook_time",
+    )
+
+    merged_price, reason = monitoring._merge_trigger_time_liquidity_snapshot(
+        settings=Settings(runtime_mode="live", kis_get_network_retry_attempts=3),
+        adapter=adapter,
+        access_token="token",
+        item=item,
+        price=price,
+        reference_at=reference_at,
+    )
+
+    assert merged_price is price
+    assert adapter.calls == 2
+    assert reason == (
+        "intraday liquidity refresh failed: "
+        "kis_intraday_liquidity_empty_response; attempts=2; retryable=true"
+    )
 
 
 @pytest.mark.parametrize(

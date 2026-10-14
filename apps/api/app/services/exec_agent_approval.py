@@ -4,7 +4,13 @@ import json
 import math
 from dataclasses import dataclass
 from datetime import UTC, datetime, time, timedelta
-from decimal import Decimal, DecimalException, InvalidOperation, ROUND_DOWN
+from decimal import (
+    Decimal,
+    DecimalException,
+    InvalidOperation,
+    ROUND_CEILING,
+    ROUND_DOWN,
+)
 
 from app.services.execution_semantics import canonical_execution_asset_class
 from app.services.openclaw_runtime_contract import (
@@ -283,6 +289,107 @@ def assess_buy_economics(
         estimated_round_trip_cost_bps=cost_bps_rounded,
         cost_evidence_source=cost_source,
     )
+
+
+def maximum_entry_price_for_buy_economics(
+    *,
+    target_price: Decimal | None,
+    upstream_stop_price: Decimal | None,
+    stop_loss_pct: Decimal,
+    minimum_reward_risk: Decimal,
+    evidence: object,
+    require_cost_evidence: bool,
+) -> Decimal | None:
+    """Return the highest entry that can satisfy the server cost/RR contract.
+
+    The stop is the tighter of the upstream stop and the configured percentage
+    stop.  This is the same effective-stop rule used for deterministic sizing
+    and final broker submission.
+    """
+
+    values = (
+        target_price,
+        upstream_stop_price,
+        stop_loss_pct,
+        minimum_reward_risk,
+    )
+    if any(
+        value is None or not value.is_finite() or value <= 0
+        for value in values
+    ):
+        return None
+    assert target_price is not None
+    assert upstream_stop_price is not None
+    if (
+        upstream_stop_price >= target_price
+        or stop_loss_pct >= 1
+    ):
+        return None
+
+    cost_bps, _cost_source, invalid_cost = _supplied_round_trip_cost_bps(
+        evidence
+    )
+    if invalid_cost or (cost_bps is None and require_cost_evidence):
+        return None
+    cost_rate = (cost_bps or Decimal("0")) / Decimal("10000")
+    try:
+        stop_transition_price = upstream_stop_price / (
+            Decimal("1") - stop_loss_pct
+        )
+        upstream_stop_cap = (
+            target_price
+            + minimum_reward_risk * upstream_stop_price
+        ) / (
+            (Decimal("1") + minimum_reward_risk)
+            * (Decimal("1") + cost_rate)
+        )
+        percentage_stop_cap = target_price / (
+            Decimal("1")
+            + cost_rate
+            + minimum_reward_risk * (stop_loss_pct + cost_rate)
+        )
+        cap = (
+            percentage_stop_cap
+            if percentage_stop_cap >= stop_transition_price
+            else upstream_stop_cap
+        )
+    except DecimalException:
+        return None
+    cap = _four_places(cap)
+    if cap is None or cap <= upstream_stop_price or cap >= target_price:
+        return None
+    price_tick = Decimal("0.0001")
+    rounding_adjustment_bound = (
+        minimum_reward_risk
+        / (
+            Decimal("1")
+            + cost_rate * (Decimal("1") + minimum_reward_risk)
+        )
+    ).to_integral_value(rounding=ROUND_CEILING)
+    max_adjustment_ticks = min(32, max(1, int(rounding_adjustment_bound)))
+    for adjustment_ticks in range(max_adjustment_ticks + 1):
+        candidate = cap - price_tick * adjustment_ticks
+        if candidate <= upstream_stop_price:
+            return None
+        try:
+            configured_stop = (
+                candidate * (Decimal("1") - stop_loss_pct)
+            ).quantize(price_tick, rounding=ROUND_DOWN)
+        except DecimalException:
+            return None
+        assessment = assess_buy_economics(
+            reference_price=candidate,
+            target_price=target_price,
+            stop_price=max(upstream_stop_price, configured_stop),
+            minimum_reward_risk=minimum_reward_risk,
+            evidence=evidence,
+            require_cost_evidence=require_cost_evidence,
+        )
+        if assessment.reason is None:
+            return candidate
+        if assessment.reason != "net_reward_risk_below_minimum":
+            return None
+    return None
 
 
 def _supplied_round_trip_cost_bps(
