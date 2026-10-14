@@ -378,6 +378,7 @@ class TriggerTimeAgentActionResult:
     limit_price: Decimal | None
     result_payload: dict[str, object]
     refreshed_price: MonitoringPriceRequest | None = None
+    stop_price: Decimal | None = None
 
 
 @dataclass(frozen=True)
@@ -3355,6 +3356,7 @@ def _evaluate_monitoring_cycle(
         if is_watch_buy:
             action.item.status = "watch_buy_triggered"
             trigger_time_agent_quantity: int | None = None
+            trigger_time_agent_stop_price: Decimal | None = None
             control_state = ensure_runtime_control_state(settings=settings, db=db)
             entry_block_reason = automated_buy_submission_block_reason(control_state)
             if entry_block_reason is not None:
@@ -3383,6 +3385,7 @@ def _evaluate_monitoring_cycle(
                             adapter=adapter,
                             action=action,
                             triggered_at=triggered_at,
+                            quote_freshness_at=quote_freshness_at,
                             cycle_started=cycle_started,
                         )
                     else:
@@ -3392,6 +3395,7 @@ def _evaluate_monitoring_cycle(
                             adapter=adapter,
                             action=action,
                             triggered_at=triggered_at,
+                            quote_freshness_at=quote_freshness_at,
                             cycle_started=cycle_started,
                             intended_quantity=None,
                             remaining_quantity=None,
@@ -3410,6 +3414,7 @@ def _evaluate_monitoring_cycle(
                                 pending_symbols.append(symbol)
                             continue
                         trigger_time_agent_quantity = agent_result.quantity
+                        trigger_time_agent_stop_price = agent_result.stop_price
                         limit_price_override = agent_result.limit_price
                 approval = _resolve_watch_buy_order(
                     settings=settings,
@@ -3420,6 +3425,7 @@ def _evaluate_monitoring_cycle(
                     price=prices.get(action.item.symbol),
                     execution_price_override=limit_price_override,
                     requested_quantity=trigger_time_agent_quantity,
+                    stop_price_override=trigger_time_agent_stop_price,
                     trigger_time_agent_approved=trigger_time_agent_quantity is not None,
                     sizing_source=(
                         "trigger_time_exec_agent_approval"
@@ -3542,7 +3548,11 @@ def _evaluate_monitoring_cycle(
                         requested_quantity=quantity,
                         observed_price=action.observed_price,
                         price_observed_at=action.observed_at,
-                        evaluated_at=triggered_at,
+                        evaluated_at=_cycle_evaluated_at(
+                            triggered_at=triggered_at,
+                            quote_freshness_at=quote_freshness_at,
+                            cycle_started=cycle_started,
+                        ),
                     )
                 )
                 if not protective_stop_authorized:
@@ -3570,6 +3580,7 @@ def _evaluate_monitoring_cycle(
                     adapter=adapter,
                     action=action,
                     triggered_at=triggered_at,
+                    quote_freshness_at=quote_freshness_at,
                     cycle_started=cycle_started,
                     intended_quantity=quantity,
                     remaining_quantity=remaining_quantities_by_symbol.get(action.item.symbol),
@@ -3704,8 +3715,10 @@ def _evaluate_monitoring_cycle(
                         if symbol_actions:
                             pending_symbols.append(symbol)
                         continue
-                    pre_submit_at = triggered_at + timedelta(
-                        seconds=max(0.0, time.monotonic() - cycle_started)
+                    pre_submit_at = _cycle_evaluated_at(
+                        triggered_at=triggered_at,
+                        quote_freshness_at=quote_freshness_at,
+                        cycle_started=cycle_started,
                     )
                     pre_submit_price = prices.get(action.item.symbol)
                     pre_submit_quote_reason = (
@@ -3773,9 +3786,10 @@ def _evaluate_monitoring_cycle(
                 trigger_reason=action.trigger_reason,
                 trigger_metadata=action.trigger_metadata,
                 triggered_at=triggered_at,
-                freshness_reference_at=(
-                    triggered_at
-                    + timedelta(seconds=max(0.0, time.monotonic() - cycle_started))
+                freshness_reference_at=_cycle_evaluated_at(
+                    triggered_at=triggered_at,
+                    quote_freshness_at=quote_freshness_at,
+                    cycle_started=cycle_started,
                 ),
                 limit_price_override=limit_price_override,
                 before_success_commit=before_success_commit,
@@ -4839,6 +4853,30 @@ def _cycle_bounded_trigger_agent_settings(
     )
 
 
+def _cycle_evaluated_at(
+    *,
+    triggered_at: datetime,
+    quote_freshness_at: datetime | None,
+    cycle_started: float,
+) -> datetime:
+    """Return the decision clock without erasing the cycle audit timestamp.
+
+    Autonomous price collection can finish well after ``triggered_at``.  The
+    quote freshness boundary records that completion time; elapsed work inside
+    this evaluator is then added so a later exchange timestamp is not compared
+    with the earlier cycle-start timestamp.
+    """
+
+    normalized_triggered_at = _normalize_utc(triggered_at)
+    normalized_freshness_at = _normalize_utc(
+        quote_freshness_at or normalized_triggered_at
+    )
+    reference_at = max(normalized_triggered_at, normalized_freshness_at)
+    return reference_at + timedelta(
+        seconds=max(0.0, time.monotonic() - cycle_started)
+    )
+
+
 def _resolve_trigger_time_agent_action(
     *,
     settings: Settings,
@@ -4846,6 +4884,7 @@ def _resolve_trigger_time_agent_action(
     adapter: BrokerAdapter,
     action: PendingMonitoringAction,
     triggered_at: datetime,
+    quote_freshness_at: datetime | None,
     cycle_started: float,
     intended_quantity: int | None,
     remaining_quantity: int | None,
@@ -4859,11 +4898,12 @@ def _resolve_trigger_time_agent_action(
     if isinstance(claim, TriggerTimeAgentActionResult):
         return claim
     previous_status = claim.previous_status
-    decision_evaluated_at = triggered_at
+    decision_evaluated_at = _cycle_evaluated_at(
+        triggered_at=triggered_at,
+        quote_freshness_at=quote_freshness_at,
+        cycle_started=cycle_started,
+    )
     if settings.runtime_mode == "live" and _requires_trigger_time_liquidity_snapshot(item):
-        decision_evaluated_at = triggered_at + timedelta(
-            seconds=max(0.0, time.monotonic() - cycle_started)
-        )
         action, liquidity_failure = _refresh_trigger_time_action_liquidity(
             settings=settings,
             db=db,
@@ -4881,6 +4921,11 @@ def _resolve_trigger_time_agent_action(
                 recorded_at=triggered_at,
                 reason=liquidity_failure,
             )
+        decision_evaluated_at = _cycle_evaluated_at(
+            triggered_at=triggered_at,
+            quote_freshness_at=quote_freshness_at,
+            cycle_started=cycle_started,
+        )
     bounded_settings = _cycle_bounded_trigger_agent_settings(
         settings=settings,
         cycle_started=cycle_started,
@@ -5040,10 +5085,12 @@ def _resolve_trigger_time_agent_action(
     post_agent_delegated_context = (
         request_market_context if isinstance(request_market_context, dict) else None
     )
-    post_agent_evaluated_at = triggered_at
+    post_agent_evaluated_at = decision_evaluated_at
     if settings.runtime_mode == "live":
-        refresh_started_at = triggered_at + timedelta(
-            seconds=max(0.0, time.monotonic() - cycle_started)
+        refresh_started_at = _cycle_evaluated_at(
+            triggered_at=triggered_at,
+            quote_freshness_at=quote_freshness_at,
+            cycle_started=cycle_started,
         )
         refreshed_price, refresh_error = _refresh_trigger_time_market_price(
             settings=settings,
@@ -5053,8 +5100,10 @@ def _resolve_trigger_time_agent_action(
             reference_at=refresh_started_at,
             trigger_liquidity_price=action.price,
         )
-        revalidated_at = triggered_at + timedelta(
-            seconds=max(0.0, time.monotonic() - cycle_started)
+        revalidated_at = _cycle_evaluated_at(
+            triggered_at=triggered_at,
+            quote_freshness_at=quote_freshness_at,
+            cycle_started=cycle_started,
         )
         if refresh_error is not None or refreshed_price is None:
             return _post_agent_revalidation_failure(
@@ -5194,11 +5243,26 @@ def _resolve_trigger_time_agent_action(
         if refreshed_price is not None
         else action.observed_price
     )
-    enforced_stop = _high_volatility_chase_override_stop_to_enforce(
-        item=item,
-        decision=decision,
+    core_v4_price_contract_bound = _core_v4_price_contract_is_bound(item)
+    enforced_stop = (
+        None
+        if core_v4_price_contract_bound
+        else _high_volatility_chase_override_stop_to_enforce(
+            item=item,
+            decision=decision,
+        )
     )
-    geometry_decision = decision
+    geometry_decision = (
+        decision.model_copy(
+            update={
+                "updated_trigger_price": None,
+                "updated_target_price": None,
+                "updated_stop_price": None,
+            }
+        )
+        if core_v4_price_contract_bound
+        else decision
+    )
     geometry_error: str | None = None
     if enforced_stop is not None:
         if geometry_reference_price is None or geometry_reference_price <= 0:
@@ -5221,13 +5285,10 @@ def _resolve_trigger_time_agent_action(
     economics_message: str | None = None
     economics: BuyEconomicsAssessment | None = None
     if geometry_error is None and _is_watch_buy_item(item):
-        effective_target = (
-            decision.updated_target_price or _watch_buy_target_price(item)
-        )
-        effective_stop = (
-            enforced_stop
-            or decision.updated_stop_price
-            or _watch_buy_stop_price(item)
+        effective_target, effective_stop = _trigger_time_effective_exit_prices(
+            item=item,
+            decision=decision,
+            enforced_stop=enforced_stop,
         )
         execution_geometry_decision = geometry_decision.model_copy(
             update={
@@ -5452,6 +5513,11 @@ def _resolve_trigger_time_agent_action(
         limit_price=decision.limit_price,
         result_payload={},
         refreshed_price=refreshed_price,
+        stop_price=(
+            None
+            if _core_v4_price_contract_is_bound(item)
+            else decision.updated_stop_price
+        ),
     )
 
 
@@ -5630,14 +5696,20 @@ def _resolve_trigger_time_quality_gate_delay(
     adapter: BrokerAdapter,
     action: PendingMonitoringAction,
     triggered_at: datetime,
+    quote_freshness_at: datetime | None,
     cycle_started: float,
 ) -> TriggerTimeAgentActionResult | None:
+    evaluated_at = _cycle_evaluated_at(
+        triggered_at=triggered_at,
+        quote_freshness_at=quote_freshness_at,
+        cycle_started=cycle_started,
+    )
     market_context, stale_reason = trigger_time_exec_agent._market_context(
         settings=settings,
         item=action.item,
         observed_price=action.observed_price,
         observed_at=_price_observed_at_from_action(action=action, fallback=triggered_at),
-        triggered_at=triggered_at,
+        triggered_at=evaluated_at,
         trigger_reason=action.trigger_reason,
         trigger_metadata=action.trigger_metadata,
         live_market_context=action.market_quality_context,
@@ -5650,6 +5722,7 @@ def _resolve_trigger_time_quality_gate_delay(
         adapter=adapter,
         action=action,
         triggered_at=triggered_at,
+        quote_freshness_at=quote_freshness_at,
         cycle_started=cycle_started,
         intended_quantity=None,
         remaining_quantity=None,
@@ -6051,22 +6124,27 @@ def _persist_trigger_time_liquidity_evidence(
     )
     if not isinstance(turnover_source, dict):
         return
-    quantity_policy[TRIGGER_TIME_LIQUIDITY_EVIDENCE_KEY] = {
-        "version": 1,
-        "provider": str(item.provider or "kis").strip().lower(),
-        "asset_class": str(item.asset_class or "stock").strip().lower(),
-        "exchange": _plan_item_exchange(item).strip().upper(),
-        "symbol": item.symbol,
-        "observed_at": turnover_source.get("observed_at"),
-        "freshness_source": turnover_source.get("freshness_source"),
-        "endpoint": turnover_source.get("endpoint"),
-        "tr_id": turnover_source.get("tr_id"),
-        "volume": _serialize_decimal(price.volume),
-        "turnover": _serialize_decimal(price.turnover),
-        "day_high": _serialize_decimal(price.day_high),
-        "day_low": _serialize_decimal(price.day_low),
-    }
-    item.quantity_policy = compact_json_object(quantity_policy)
+    quantity_policy[TRIGGER_TIME_LIQUIDITY_EVIDENCE_KEY] = compact_json_object(
+        {
+            "version": 1,
+            "provider": str(item.provider or "kis").strip().lower(),
+            "asset_class": str(item.asset_class or "stock").strip().lower(),
+            "exchange": _plan_item_exchange(item).strip().upper(),
+            "symbol": item.symbol,
+            "observed_at": turnover_source.get("observed_at"),
+            "freshness_source": turnover_source.get("freshness_source"),
+            "endpoint": turnover_source.get("endpoint"),
+            "tr_id": turnover_source.get("tr_id"),
+            "volume": _serialize_decimal(price.volume),
+            "turnover": _serialize_decimal(price.turnover),
+            "day_high": _serialize_decimal(price.day_high),
+            "day_low": _serialize_decimal(price.day_low),
+        }
+    )
+    # The sizing policy is already bounded when it is persisted. Recompacting
+    # it here mutates signed runtime-provenance placeholders and invalidates
+    # the exact Core v4 authority proof this server-owned evidence extends.
+    item.quantity_policy = quantity_policy
 
 
 def _persist_trigger_time_full_cost_economics(
@@ -6101,8 +6179,6 @@ def _persist_trigger_time_full_cost_economics(
         evidence["provenance"] = provenance
     risk_context[TRIGGER_TIME_FULL_COST_ECONOMICS_KEY] = evidence
     item.risk_context = compact_json_object(risk_context)
-    if isinstance(item.quantity_policy, dict):
-        item.quantity_policy = compact_json_object(item.quantity_policy)
 
 
 def _post_agent_market_quality_reason(
@@ -6181,6 +6257,8 @@ def _post_agent_trigger_still_valid(
         triggered_at=triggered_at,
     ):
         return True
+    if _core_v4_price_contract_is_bound(item):
+        return False
     if not _is_watch_buy_item(item):
         return False
     if _watch_buy_is_pullback_strategy(item):
@@ -6317,7 +6395,13 @@ def _apply_trigger_time_agent_adjustments(
     decision: trigger_time_exec_agent.TriggerTimeExecAgentDecision,
 ) -> None:
     risk_context = dict(item.risk_context) if isinstance(item.risk_context, dict) else {}
-    quantity_policy = dict(item.quantity_policy) if isinstance(item.quantity_policy, dict) else None
+    if _core_v4_price_contract_is_bound(item):
+        # Core v4 prices are part of the persisted execution contract.  The
+        # agent's limit remains an ephemeral order override returned by the
+        # caller, while target/stop recommendations stay in the interaction
+        # audit.  Mutating the item or linked exits here would invalidate the
+        # plan immediately before broker submission.
+        return
     enforced_stop = _high_volatility_chase_override_stop_to_enforce(item=item, decision=decision)
     agent_updated_stop = decision.updated_stop_price
     if enforced_stop is not None:
@@ -6328,9 +6412,6 @@ def _apply_trigger_time_agent_adjustments(
     if decision.updated_target_price is not None:
         risk_context["target_price"] = _serialize_decimal(decision.updated_target_price)
         risk_context["updated_target_price"] = _serialize_decimal(decision.updated_target_price)
-        if quantity_policy is not None:
-            quantity_policy["target_price"] = _serialize_decimal(decision.updated_target_price)
-            quantity_policy["updated_target_price"] = _serialize_decimal(decision.updated_target_price)
         _update_sibling_trigger_price(
             item=item,
             intent="target_sell",
@@ -6341,10 +6422,6 @@ def _apply_trigger_time_agent_adjustments(
         risk_context["stop_price"] = _serialize_decimal(stop_price)
         risk_context["stop_loss_price"] = _serialize_decimal(stop_price)
         risk_context["updated_stop_price"] = _serialize_decimal(stop_price)
-        if quantity_policy is not None:
-            quantity_policy["stop_price"] = _serialize_decimal(stop_price)
-            quantity_policy["stop_loss_price"] = _serialize_decimal(stop_price)
-            quantity_policy["updated_stop_price"] = _serialize_decimal(stop_price)
         if enforced_stop is not None:
             risk_context["trigger_time_override_stop_enforcement"] = {
                 "reason": "high_volatility_chase_override_stop_preserved",
@@ -6357,8 +6434,29 @@ def _apply_trigger_time_agent_adjustments(
             trigger_price=stop_price,
         )
     item.risk_context = compact_json_object(risk_context)
-    if quantity_policy is not None:
-        item.quantity_policy = compact_json_object(quantity_policy)
+
+
+def _core_v4_price_contract_is_bound(item: ExecutionPlanItem) -> bool:
+    return isinstance(
+        _loaded_risk_context(item).get("_core_v4_contract_binding"),
+        dict,
+    )
+
+
+def _trigger_time_effective_exit_prices(
+    *,
+    item: ExecutionPlanItem,
+    decision: trigger_time_exec_agent.TriggerTimeExecAgentDecision,
+    enforced_stop: Decimal | None,
+) -> tuple[Decimal | None, Decimal | None]:
+    persisted_target = _watch_buy_target_price(item)
+    persisted_stop = _watch_buy_stop_price(item)
+    if _core_v4_price_contract_is_bound(item):
+        return persisted_target, persisted_stop
+    return (
+        decision.updated_target_price or persisted_target,
+        enforced_stop or decision.updated_stop_price or persisted_stop,
+    )
 
 
 def _high_volatility_chase_override_stop_to_enforce(
@@ -12424,6 +12522,7 @@ def _resolve_watch_buy_order(
     price: MonitoringPriceRequest | None = None,
     execution_price_override: Decimal | None = None,
     requested_quantity: int | None = None,
+    stop_price_override: Decimal | None = None,
     trigger_time_agent_approved: bool = False,
     sizing_source: str | None = None,
 ) -> WatchBuyOrderApproval:
@@ -12534,7 +12633,7 @@ def _resolve_watch_buy_order(
             message="automated buy submission is blocked by runtime safety controls",
         )
 
-    stop_price = _watch_buy_stop_price(item)
+    stop_price = stop_price_override or _watch_buy_stop_price(item)
     if entry_price is None or stop_price is None:
         return WatchBuyOrderApproval(
             quantity=None,
@@ -12688,12 +12787,6 @@ def _resolve_watch_buy_order(
         event["submission_cap_adjustment"] = exec_agent_cap_adjustment
     if safe_quantity_adjustment is not None:
         event["safe_quantity_cap_adjustment"] = safe_quantity_adjustment
-        policy = dict(item.quantity_policy or {})
-        explanation = dict(policy.get("sizing_explanation") or {})
-        explanation["runtime_safe_quantity_cap"] = safe_quantity_adjustment
-        policy["sizing_explanation"] = explanation
-        policy["quantity"] = approved_quantity
-        item.quantity_policy = compact_json_object(policy)
         db.add(
             ExecutionPlanItemAudit(
                 execution_plan_item_id=item.id,
@@ -14664,6 +14757,12 @@ def _watch_buy_high_volatility_chase_override(
     observed_price: Decimal,
 ) -> dict[str, object] | None:
     risk_context = _loaded_risk_context(item)
+    if _core_v4_price_contract_is_bound(item):
+        # A tighter stop would require changing both the immutable entry risk
+        # payload and its linked stop item.  Until Core emits that price in a
+        # new plan generation, keep this path fail-closed instead of silently
+        # invalidating the execution contract immediately before submission.
+        return None
     override = risk_context.get("high_volatility_chase_override")
     if not isinstance(override, dict) or override.get("enabled") is not True:
         return None
@@ -14682,11 +14781,6 @@ def _watch_buy_high_volatility_chase_override(
     updated_context["stop_price"] = _serialize_decimal(tighter_stop)
     updated_context["stop_loss_price"] = _serialize_decimal(tighter_stop)
     item.risk_context = compact_json_object(updated_context)
-    if isinstance(item.quantity_policy, dict):
-        updated_policy = dict(item.quantity_policy)
-        updated_policy["stop_price"] = _serialize_decimal(tighter_stop)
-        updated_policy["stop_loss_price"] = _serialize_decimal(tighter_stop)
-        item.quantity_policy = compact_json_object(updated_policy)
     return {
         "reason": _bounded_text(reason, max_length=240),
         "prior_stop_price": _serialize_decimal(current_stop),

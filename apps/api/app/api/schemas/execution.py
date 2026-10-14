@@ -373,6 +373,10 @@ class CoreExecutionPlanItemV4(BaseModel):
             raise ValueError("core_item_key and source_plan_item_id must match")
         if self.agent_name != self.decision_agent_name:
             raise ValueError("agent_name and decision_agent_name must match")
+        if "exec_trigger_time_liquidity_evidence_v1" in self.quantity_policy:
+            raise ValueError(
+                "exec_trigger_time_liquidity_evidence_v1 is server-owned"
+            )
         if self.side == "buy" and self.intent not in {"next_open_buy", "intraday_watch_buy"}:
             raise ValueError("buy side requires an entry intent")
         if self.side == "buy":

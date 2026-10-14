@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import Counter
 from collections.abc import Sequence
+from copy import deepcopy
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 import hmac
@@ -58,7 +59,7 @@ from app.services.core_revocation_exposure import (
 from app.services.exec_agent_approval import (
     persisted_verified_watch_sizing_provenance,
 )
-from app.services.json_compaction import json_payload_hash
+from app.services.json_compaction import compact_json_object, json_payload_hash
 
 
 ENTRY_INTENTS = frozenset({"next_open_buy", "intraday_watch_buy"})
@@ -107,6 +108,29 @@ CORE_V4_WATCH_ATTEMPT_POLICY_KEYS = frozenset(
         "exec_agent_watch_sizing_fallback_allowed",
         "exec_agent_watch_sizing_attempts",
     }
+)
+CORE_V4_TRIGGER_TIME_LIQUIDITY_EVIDENCE_KEY = (
+    "exec_trigger_time_liquidity_evidence_v1"
+)
+CORE_V4_TRIGGER_TIME_LIQUIDITY_EVIDENCE_KEYS = frozenset(
+    {
+        "version",
+        "provider",
+        "asset_class",
+        "exchange",
+        "symbol",
+        "observed_at",
+        "freshness_source",
+        "endpoint",
+        "tr_id",
+        "volume",
+        "turnover",
+        "day_high",
+        "day_low",
+    }
+)
+CORE_V4_RECOVERABLE_LIQUIDITY_QUARANTINE_PRIOR_STATUSES = frozenset(
+    {"agent_delay"}
 )
 CORE_V4_TERMINAL_REJECTION_DECISION_SOURCES = frozenset(
     {
@@ -1224,6 +1248,11 @@ def reconcile_unproven_legacy_core_buy_authority(
     settings: Settings | None = None,
 ) -> int:
     """Quarantine persisted pre-v4 Core entries before the due-job query."""
+    recovered = _recover_server_liquidity_evidence_quarantines(
+        db=db,
+        runtime_mode=runtime_mode,
+        settings=settings,
+    )
     candidate_rows = db.execute(
         select(ExecutionPlanItem.id, ExecutionPlanItem.execution_plan_id)
         .join(ExecutionPlanItem.plan)
@@ -1242,7 +1271,7 @@ def reconcile_unproven_legacy_core_buy_authority(
         .order_by(ExecutionPlan.id.asc(), ExecutionPlanItem.plan_item_index.asc())
     ).all()
     if not candidate_rows:
-        return 0
+        return recovered
     item_ids = [row.id for row in candidate_rows]
     plan_ids = {row.execution_plan_id for row in candidate_rows}
     normalized = 0
@@ -1263,7 +1292,7 @@ def reconcile_unproven_legacy_core_buy_authority(
         )
     if normalized:
         db.commit()
-    fenced = normalized
+    fenced = recovered + normalized
     for item_id in item_ids:
         if fence_unproven_legacy_core_buy_authority(
             db=db,
@@ -1272,6 +1301,719 @@ def reconcile_unproven_legacy_core_buy_authority(
         ):
             fenced += 1
     return fenced
+
+
+def _recover_server_liquidity_evidence_quarantines(
+    *,
+    db: Session,
+    runtime_mode: str,
+    settings: Settings | None,
+) -> int:
+    """Restore only watch rows fenced by the pre-fix server evidence mismatch.
+
+    Recovery is deliberately plan-atomic. A mixed plan containing a genuine
+    quarantine, a manual-review row, an inexact audit, or any possible broker
+    exposure remains untouched.
+    """
+    if settings is None:
+        return 0
+    plan_ids = set(
+        db.scalars(
+            select(ExecutionPlanItem.execution_plan_id)
+            .join(ExecutionPlanItem.plan)
+            .where(
+                ExecutionPlan.mode == runtime_mode,
+                ExecutionPlan.source == "kai-trading-core",
+                ExecutionPlan.status.in_(
+                    {"contract_quarantined", "manual_review_required"}
+                ),
+                ExecutionPlanItem.side == "buy",
+                ExecutionPlanItem.status == "contract_quarantined",
+            )
+        ).all()
+    )
+    if not plan_ids:
+        return 0
+
+    plans = db.scalars(
+        select(ExecutionPlan)
+        .where(ExecutionPlan.id.in_(plan_ids))
+        .with_for_update()
+        .options(selectinload(ExecutionPlan.items))
+        .order_by(ExecutionPlan.id.asc())
+    ).all()
+    serialization_items = [
+        item
+        for plan in plans
+        for item in plan.items
+        if item.side == "buy"
+        and item.intent == "intraday_watch_buy"
+        and item.status == "contract_quarantined"
+    ]
+    if not serialization_items:
+        db.rollback()
+        return 0
+    try:
+        with serialized_revocation_exposure(
+            db=db,
+            settings=settings,
+            items=serialization_items,
+        ):
+            recovered = _recover_locked_server_liquidity_evidence_plans(
+                db=db,
+                settings=settings,
+                plans=plans,
+            )
+            if recovered:
+                db.commit()
+            else:
+                db.rollback()
+            return recovered
+    except RevocationExposureSerializationBusy:
+        db.rollback()
+        return 0
+
+
+def _recover_locked_server_liquidity_evidence_plans(
+    *,
+    db: Session,
+    settings: Settings,
+    plans: Sequence[ExecutionPlan],
+) -> int:
+    recovered = 0
+    for plan in plans:
+        locked_items = db.scalars(
+            select(ExecutionPlanItem)
+            .where(ExecutionPlanItem.execution_plan_id == plan.id)
+            .order_by(ExecutionPlanItem.plan_item_index.asc())
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        ).all()
+        if len(locked_items) != len(plan.items) or plan.status not in {
+            "contract_quarantined",
+            "manual_review_required",
+        } or any(
+            item.status == "manual_review_required" for item in locked_items
+        ):
+            continue
+        quarantined_items = [
+            item
+            for item in locked_items
+            if item.status == "contract_quarantined"
+        ]
+        quarantined_buys = [
+            item
+            for item in quarantined_items
+            if item.side == "buy" and item.intent == "intraday_watch_buy"
+        ]
+        all_buys = [
+            item
+            for item in locked_items
+            if item.side == "buy" or item.intent in ENTRY_INTENTS
+        ]
+        expected_quarantine_status = (
+            "contract_quarantined"
+            if len(quarantined_buys) == len(all_buys)
+            else "manual_review_required"
+        )
+        if (
+            not quarantined_buys
+            or len(quarantined_buys) != len(quarantined_items)
+            or plan.status != expected_quarantine_status
+        ):
+            continue
+        quarantined_ids = {item.id for item in quarantined_buys}
+        jobs = db.scalars(
+            select(ExecutionJob)
+            .where(ExecutionJob.execution_plan_item_id.in_(quarantined_ids))
+            .with_for_update()
+        ).all()
+        linked_orders = db.scalars(
+            select(BrokerOrder)
+            .where(BrokerOrder.execution_plan_item_id.in_(quarantined_ids))
+            .with_for_update()
+        ).all()
+        if jobs or linked_orders:
+            continue
+        raw_items_by_key = _raw_core_items_by_key(plan)
+        recoveries: list[
+            tuple[ExecutionPlanItem, str, dict[str, object]]
+        ] = []
+        for item in quarantined_buys:
+            raw_item = raw_items_by_key.get(str(item.source_plan_item_id or ""))
+            audits = _locked_plan_item_audits(db=db, item=item)
+            audit = _unique_latest_plan_item_audit(audits)
+            restored_status = _recoverable_liquidity_quarantine_status(audit)
+            recovery_policy = (
+                _server_liquidity_evidence_recovery_policy(
+                    item=item,
+                    raw_policy=raw_item.quantity_policy,
+                    quarantine_audit=audit,
+                    audits=audits,
+                )
+                if raw_item is not None and audit is not None
+                else None
+            )
+            if (
+                raw_item is None
+                or restored_status is None
+                or recovery_policy is None
+                or not _item_exposure_scope_is_proven(
+                    item=item,
+                    settings=settings,
+                )
+                or _item_has_external_possible_exposure(
+                    db=db,
+                    plan=plan,
+                    item=item,
+                    settings=settings,
+                )
+            ):
+                recoveries = []
+                break
+            recoveries.append((item, restored_status, recovery_policy))
+        if len(recoveries) != len(quarantined_buys):
+            continue
+
+        original_policies = {
+            item.id: item.quantity_policy
+            for item, _restored_status, _policy in recoveries
+        }
+        for item, _restored_status, policy in recoveries:
+            item.quantity_policy = policy
+        with db.no_autoflush:
+            contract_restored = persisted_core_plan_contract_ack(plan) is not None
+        if not contract_restored:
+            for item, _restored_status, _policy in recoveries:
+                item.quantity_policy = original_policies[item.id]
+            continue
+
+        restored_plan_status = "accepted"
+        plan.status = restored_plan_status
+        for item, restored_status, _policy in recoveries:
+            item.status = restored_status
+            db.add(
+                ExecutionPlanItemAudit(
+                    id=new_id(),
+                    execution_plan_item_id=item.id,
+                    event_type=(
+                        "legacy_core_authority_quarantine_recovered"
+                    ),
+                    source="kai-trading-exec",
+                    summary={
+                        "prior_status": "contract_quarantined",
+                        "restored_status": restored_status,
+                        "plan_status": restored_plan_status,
+                    },
+                    payload={
+                        "reason_code": (
+                            "server_liquidity_evidence_contract_fixed"
+                        ),
+                        "broker_exposure": False,
+                        "external_possible_exposure": False,
+                    },
+                )
+            )
+            recovered += 1
+    return recovered
+
+
+def _raw_core_items_by_key(plan: ExecutionPlan) -> dict[str, Any]:
+    if not isinstance(plan.raw_payload, dict):
+        return {}
+    try:
+        command = CoreExecutionPlanRequestV4.model_validate(
+            plan.raw_payload,
+            context={
+                _SKIP_DISPATCH_MATERIAL_FINGERPRINT_CONTEXT_KEY: True,
+            },
+        )
+    except ValidationError:
+        return {}
+    return {raw_item.core_item_key: raw_item for raw_item in command.items}
+
+
+def _locked_plan_item_audits(
+    *,
+    db: Session,
+    item: ExecutionPlanItem,
+) -> list[ExecutionPlanItemAudit]:
+    return list(
+        db.scalars(
+            select(ExecutionPlanItemAudit)
+            .where(ExecutionPlanItemAudit.execution_plan_item_id == item.id)
+            .order_by(
+                ExecutionPlanItemAudit.occurred_at.desc(),
+                ExecutionPlanItemAudit.id.desc(),
+            )
+            .with_for_update()
+        ).all()
+    )
+
+
+def _unique_latest_plan_item_audit(
+    audits: Sequence[ExecutionPlanItemAudit],
+) -> ExecutionPlanItemAudit | None:
+    if not audits:
+        return None
+    latest_at = _normalized_audit_datetime(audits[0].occurred_at)
+    if latest_at is None or (
+        len(audits) > 1
+        and _normalized_audit_datetime(audits[1].occurred_at) == latest_at
+    ):
+        return None
+    return audits[0]
+
+
+def _recoverable_liquidity_quarantine_status(
+    audit: ExecutionPlanItemAudit | None,
+) -> str | None:
+    if audit is None:
+        return None
+    summary = audit.summary if isinstance(audit.summary, dict) else {}
+    payload = audit.payload if isinstance(audit.payload, dict) else {}
+    prior_status = summary.get("prior_status")
+    if (
+        audit.event_type != "legacy_core_authority_quarantined"
+        or audit.source != "kai-trading-exec"
+        or set(summary) != {"prior_status", "protective_exits_preserved"}
+        or summary.get("protective_exits_preserved") is not True
+        or prior_status
+        not in CORE_V4_RECOVERABLE_LIQUIDITY_QUARANTINE_PRIOR_STATUSES
+        or payload
+        != {
+            "reason_code": "persisted_v4_contract_not_proven",
+            "manual_review_required": False,
+        }
+    ):
+        return None
+    return str(prior_status)
+
+
+def _server_liquidity_evidence_recovery_policy(
+    *,
+    item: ExecutionPlanItem,
+    raw_policy: dict[str, object],
+    quarantine_audit: ExecutionPlanItemAudit,
+    audits: Sequence[ExecutionPlanItemAudit],
+) -> dict[str, object] | None:
+    current_policy = (
+        item.quantity_policy if isinstance(item.quantity_policy, dict) else {}
+    )
+    if _server_liquidity_evidence_is_only_policy_extension(
+        raw_policy=raw_policy,
+        item=item,
+        quantity_policy=current_policy,
+    ):
+        return current_policy
+    repaired_policy = _runtime_provenance_repaired_policy_from_sizing_audit(
+        item=item,
+        quantity_policy=current_policy,
+        quarantine_audit=quarantine_audit,
+        audits=audits,
+    )
+    if repaired_policy is None or not (
+        _server_liquidity_evidence_is_only_policy_extension(
+            raw_policy=raw_policy,
+            item=item,
+            quantity_policy=repaired_policy,
+        )
+    ):
+        return None
+    return repaired_policy
+
+
+def _runtime_provenance_repaired_policy_from_sizing_audit(
+    *,
+    item: ExecutionPlanItem,
+    quantity_policy: dict[str, object],
+    quarantine_audit: ExecutionPlanItemAudit,
+    audits: Sequence[ExecutionPlanItemAudit],
+) -> dict[str, object] | None:
+    quarantine_at = _normalized_audit_datetime(quarantine_audit.occurred_at)
+    if quarantine_at is None:
+        return None
+    prior_sizing_audits: list[tuple[datetime, ExecutionPlanItemAudit]] = []
+    for candidate in audits:
+        if candidate.event_type != "watch_exec_agent_sizing_decision":
+            continue
+        sizing_at = _normalized_audit_datetime(candidate.occurred_at)
+        if sizing_at is None or sizing_at >= quarantine_at:
+            return None
+        prior_sizing_audits.append((sizing_at, candidate))
+    if not prior_sizing_audits:
+        return None
+    latest_sizing_at = max(sizing_at for sizing_at, _audit in prior_sizing_audits)
+    latest_sizing_audits = [
+        audit
+        for sizing_at, audit in prior_sizing_audits
+        if sizing_at == latest_sizing_at
+    ]
+    if len(latest_sizing_audits) != 1:
+        return None
+    sizing_audit = latest_sizing_audits[0]
+    if (
+        sizing_audit.execution_plan_item_id != item.id
+        or sizing_audit.source != "watch_exec_agent_sizing"
+    ):
+        return None
+
+    summary = sizing_audit.summary
+    payload = sizing_audit.payload
+    if not isinstance(summary, dict) or not isinstance(payload, dict):
+        return None
+    required_payload_keys = {
+        "schema_version",
+        "agent_decision",
+        "final_decision",
+        "runtime_provenance",
+    }
+    if (
+        payload.get("schema_version")
+        != "watch_exec_agent_sizing_decision_audit_v2"
+        or not required_payload_keys.issubset(payload)
+        or not set(payload).issubset(
+            required_payload_keys | {"deterministic_context"}
+        )
+        or (
+            "deterministic_context" in payload
+            and not isinstance(payload["deterministic_context"], dict)
+        )
+    ):
+        return None
+    agent_decision = payload.get("agent_decision")
+    final_decision = payload.get("final_decision")
+    runtime_provenance = payload.get("runtime_provenance")
+    approval_provenance = quantity_policy.get("approval_provenance")
+    persisted_decision = quantity_policy.get("exec_agent_decision")
+    persisted_mirror = quantity_policy.get("short_term_exec_agent_decision")
+    if not all(
+        isinstance(value, dict)
+        for value in (
+            agent_decision,
+            final_decision,
+            runtime_provenance,
+            approval_provenance,
+            persisted_decision,
+            persisted_mirror,
+        )
+    ):
+        return None
+    assert isinstance(agent_decision, dict)
+    assert isinstance(final_decision, dict)
+    assert isinstance(runtime_provenance, dict)
+    assert isinstance(approval_provenance, dict)
+    assert isinstance(persisted_decision, dict)
+    assert isinstance(persisted_mirror, dict)
+    if (
+        set(approval_provenance) != {"kind", "runtime"}
+        or approval_provenance.get("kind")
+        != "verified_exec_agent_watch_sizing"
+        or persisted_decision != persisted_mirror
+        or summary.get("runtime_provenance") != runtime_provenance
+        or agent_decision.get("runtime_provenance") != runtime_provenance
+        or final_decision.get("runtime_provenance") != runtime_provenance
+        or _without_runtime_provenance(persisted_decision)
+        != _without_runtime_provenance(summary)
+        or not _sizing_audit_decisions_match_item(
+            item=item,
+            quantity_policy=quantity_policy,
+            summary=summary,
+            agent_decision=agent_decision,
+            final_decision=final_decision,
+            deterministic_context=payload.get("deterministic_context"),
+        )
+    ):
+        return None
+
+    repaired_policy = deepcopy(quantity_policy)
+    repaired_policy["approval_provenance"]["runtime"] = deepcopy(
+        runtime_provenance
+    )
+    repaired_policy["exec_agent_decision"]["runtime_provenance"] = deepcopy(
+        runtime_provenance
+    )
+    repaired_policy["short_term_exec_agent_decision"][
+        "runtime_provenance"
+    ] = deepcopy(runtime_provenance)
+    # The pre-fix path compacted the newly written sizing policy once at
+    # creation and then compacted the whole policy again when adding liquidity
+    # evidence. Require the repaired audit shape to reproduce that exact loss.
+    if (
+        compact_json_object(compact_json_object(repaired_policy))
+        != quantity_policy
+        or not persisted_verified_watch_sizing_provenance(repaired_policy)
+    ):
+        return None
+    return repaired_policy
+
+
+def _sizing_audit_decisions_match_item(
+    *,
+    item: ExecutionPlanItem,
+    quantity_policy: dict[str, object],
+    summary: dict[str, object],
+    agent_decision: dict[str, object],
+    final_decision: dict[str, object],
+    deterministic_context: object,
+) -> bool:
+    summary_keys = {
+        "source",
+        "action",
+        "decision",
+        "execution_plan_item_id",
+        "symbol",
+        "quantity",
+        "approved_quantity",
+        "approved_notional_krw",
+        "sizing_price",
+        "confidence",
+        "target_profile",
+        "target_tag",
+        "reason_code",
+        "reason_family",
+        "rejection_disposition",
+        "reason",
+        "decided_at",
+        "runtime_provenance",
+    }
+    final_keys = (
+        summary_keys
+        - {"reason_family", "rejection_disposition"}
+        | {"version", "reference_price"}
+    )
+    if not (
+        set(summary) == summary_keys
+        and frozenset(agent_decision)
+        in {frozenset(final_keys), frozenset(final_keys | {"binding"})}
+        and frozenset(final_decision)
+        in {frozenset(final_keys), frozenset(final_keys | {"binding"})}
+        and summary.get("source") == "openclaw_exec_agent_watch_sizing"
+        and summary.get("action") == "approve"
+        and summary.get("decision") == "approved"
+        and summary.get("execution_plan_item_id") == item.id
+        and summary.get("symbol") == item.symbol
+        and summary.get("reason_family") is None
+        and summary.get("rejection_disposition") is None
+        and isinstance(final_decision.get("version"), str)
+        and bool(str(final_decision["version"]).strip())
+        and agent_decision.get("binding") == final_decision.get("binding")
+    ):
+        return False
+    for key in summary_keys - {
+        "runtime_provenance",
+        "reason_family",
+        "rejection_disposition",
+    }:
+        if final_decision.get(key) != summary.get(key):
+            return False
+    for key in (
+        "version",
+        "source",
+        "action",
+        "decision",
+        "execution_plan_item_id",
+        "symbol",
+        "confidence",
+        "target_profile",
+        "target_tag",
+        "reason_code",
+        "reason",
+    ):
+        if agent_decision.get(key) != final_decision.get(key):
+            return False
+    final_quantity = quantity_policy.get("quantity")
+    final_price = _positive_decimal(quantity_policy.get("sizing_price"))
+    final_notional = _positive_decimal(
+        quantity_policy.get("approved_notional")
+    )
+    agent_quantity = agent_decision.get("quantity")
+    agent_price = _positive_decimal(agent_decision.get("sizing_price"))
+    agent_notional = _positive_decimal(
+        agent_decision.get("approved_notional_krw")
+    )
+    if not (
+        isinstance(final_quantity, int)
+        and not isinstance(final_quantity, bool)
+        and final_quantity > 0
+        and isinstance(agent_quantity, int)
+        and not isinstance(agent_quantity, bool)
+        and agent_quantity > 0
+        and agent_decision.get("approved_quantity") == agent_quantity
+        and agent_price is not None
+        and agent_notional == agent_price * Decimal(agent_quantity)
+        and _positive_decimal(agent_decision.get("reference_price"))
+        == agent_price
+        and final_decision.get("quantity") == final_quantity
+        and final_decision.get("approved_quantity") == final_quantity
+        and _positive_decimal(final_decision.get("sizing_price"))
+        == final_price
+        and _positive_decimal(final_decision.get("approved_notional_krw"))
+        == final_notional
+        and _positive_decimal(final_decision.get("reference_price"))
+        == final_price
+        and final_price is not None
+        and final_notional == final_price * Decimal(final_quantity)
+    ):
+        return False
+    return _sizing_adjustment_matches_audit(
+        quantity_policy=quantity_policy,
+        deterministic_context=deterministic_context,
+        agent_quantity=agent_quantity,
+        agent_price=agent_price,
+        agent_reported_notional=agent_notional,
+        final_quantity=final_quantity,
+        final_price=final_price,
+        final_notional=final_notional,
+    )
+
+
+def _sizing_adjustment_matches_audit(
+    *,
+    quantity_policy: dict[str, object],
+    deterministic_context: object,
+    agent_quantity: int,
+    agent_price: Decimal,
+    agent_reported_notional: Decimal,
+    final_quantity: int,
+    final_price: Decimal,
+    final_notional: Decimal,
+) -> bool:
+    if not isinstance(deterministic_context, dict) or set(
+        deterministic_context
+    ) != {"allowed_action_envelope", "sizing_adjustment"}:
+        return False
+    adjustment = deterministic_context.get("sizing_adjustment")
+    envelope = deterministic_context.get("allowed_action_envelope")
+    explanation = quantity_policy.get("sizing_explanation")
+    if not (
+        isinstance(adjustment, dict)
+        and adjustment == quantity_policy.get("sizing_adjustment")
+        and isinstance(envelope, dict)
+        and envelope == quantity_policy.get("allowed_action_envelope")
+        and isinstance(explanation, dict)
+    ):
+        return False
+    adjustment_keys = {
+        "applied",
+        "agent_quantity",
+        "agent_approved_quantity",
+        "agent_notional",
+        "agent_approved_notional",
+        "target_min_notional",
+        "minimum_required_notional",
+        "cap_notional",
+        "runtime_cap_notional",
+        "agent_cap_notional",
+        "allowed_action_envelope_max_quantity",
+        "effective_target_notional",
+        "min_notional_upsize_suppressed",
+        "adjusted_quantity",
+        "adjusted_notional",
+        "final_quantity",
+        "final_notional",
+        "decision",
+        "reason_code",
+        "reason",
+    }
+    if set(adjustment) not in {
+        frozenset(adjustment_keys),
+        frozenset(adjustment_keys | {"vol_corr_cap"}),
+    }:
+        return False
+    deterministic_agent_notional = final_price * Decimal(agent_quantity)
+    agent_cap_notional = min(
+        deterministic_agent_notional,
+        agent_reported_notional,
+    )
+    runtime_cap_notional = _positive_decimal(
+        adjustment.get("runtime_cap_notional")
+    )
+    cap_notional = _positive_decimal(adjustment.get("cap_notional"))
+    target_notional = _positive_decimal(
+        adjustment.get("target_min_notional")
+    )
+    envelope_max_quantity = envelope.get("max_quantity")
+    if not (
+        adjustment.get("applied") is (agent_quantity != final_quantity)
+        and adjustment.get("agent_quantity") == agent_quantity
+        and adjustment.get("agent_approved_quantity") == agent_quantity
+        and _positive_decimal(adjustment.get("agent_notional"))
+        == deterministic_agent_notional
+        and _positive_decimal(adjustment.get("agent_approved_notional"))
+        == agent_cap_notional
+        and _positive_decimal(adjustment.get("agent_cap_notional"))
+        == agent_cap_notional
+        and runtime_cap_notional is not None
+        and cap_notional == min(runtime_cap_notional, agent_cap_notional)
+        and target_notional is not None
+        and _positive_decimal(adjustment.get("minimum_required_notional"))
+        == target_notional
+        and _positive_decimal(adjustment.get("effective_target_notional"))
+        == min(target_notional, cap_notional)
+        and adjustment.get("min_notional_upsize_suppressed")
+        is (target_notional > deterministic_agent_notional)
+        and isinstance(envelope_max_quantity, int)
+        and not isinstance(envelope_max_quantity, bool)
+        and envelope_max_quantity >= final_quantity
+        and adjustment.get("allowed_action_envelope_max_quantity")
+        == envelope_max_quantity
+        and adjustment.get("adjusted_quantity") == final_quantity
+        and adjustment.get("final_quantity") == final_quantity
+        and _positive_decimal(adjustment.get("adjusted_notional"))
+        == final_notional
+        and _positive_decimal(adjustment.get("final_notional"))
+        == final_notional
+        and adjustment.get("decision") == "submit"
+        and adjustment.get("reason_code") is None
+        and adjustment.get("reason") is None
+        and envelope.get("schema_version") == "allowed_action_envelope_v1"
+        and _positive_decimal(envelope.get("reference_price")) == agent_price
+        and envelope.get("hard_reject_reasons") == []
+        and isinstance(envelope.get("allowed_actions"), list)
+        and {"buy", "downsize"}.issubset(envelope["allowed_actions"])
+    ):
+        return False
+    return bool(
+        explanation.get("schema_version") == "watch_sizing_explanation_v1"
+        and explanation.get("source") == "exec_agent_watch_sizing"
+        and explanation.get("agent_approved_quantity") == agent_quantity
+        and _positive_decimal(explanation.get("agent_approved_notional"))
+        == agent_cap_notional
+        and _positive_decimal(explanation.get("agent_reported_notional"))
+        == agent_reported_notional
+        and _positive_decimal(explanation.get("sizing_price")) == final_price
+        and explanation.get("final_quantity") == final_quantity
+        and _positive_decimal(explanation.get("final_notional"))
+        == final_notional
+        and _positive_decimal(explanation.get("cap_notional")) == cap_notional
+        and _positive_decimal(explanation.get("runtime_cap_notional"))
+        == runtime_cap_notional
+        and _positive_decimal(explanation.get("agent_cap_notional"))
+        == agent_cap_notional
+        and explanation.get("allowed_action_envelope_max_quantity")
+        == envelope_max_quantity
+        and explanation.get("adjustment_applied")
+        is (agent_quantity != final_quantity)
+    )
+
+
+def _without_runtime_provenance(
+    value: dict[str, object],
+) -> dict[str, object]:
+    return {
+        key: nested
+        for key, nested in value.items()
+        if key != "runtime_provenance"
+    }
+
+
+def _normalized_audit_datetime(value: object) -> datetime | None:
+    if not isinstance(value, datetime):
+        return None
+    if value.tzinfo is None or value.utcoffset() is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
 
 
 def _normalize_safe_legacy_watch_authority(
@@ -2191,7 +2933,22 @@ def _watch_sizing_policy_shape_matches(
     approval_provenance_kind: str,
 ) -> bool:
     """Validate mirrored sizing authority without elevating its provenance."""
-    if set(quantity_policy) != CORE_V4_WATCH_POLICY_KEYS:
+    policy_keys = set(quantity_policy)
+    has_liquidity_evidence = (
+        CORE_V4_TRIGGER_TIME_LIQUIDITY_EVIDENCE_KEY in policy_keys
+    )
+    expected_keys = set(CORE_V4_WATCH_POLICY_KEYS)
+    if has_liquidity_evidence:
+        expected_keys.add(CORE_V4_TRIGGER_TIME_LIQUIDITY_EVIDENCE_KEY)
+    if policy_keys != expected_keys or (
+        has_liquidity_evidence
+        and not _server_trigger_time_liquidity_evidence_matches(
+            item=item,
+            evidence=quantity_policy.get(
+                CORE_V4_TRIGGER_TIME_LIQUIDITY_EVIDENCE_KEY
+            ),
+        )
+    ):
         return False
     quantity = quantity_policy.get("quantity")
     decision = quantity_policy.get("exec_agent_decision")
@@ -2290,6 +3047,105 @@ def _watch_sizing_policy_shape_matches(
             item=item,
             quantity_policy=quantity_policy,
             envelope=envelope,
+        )
+    )
+
+
+def _server_trigger_time_liquidity_evidence_matches(
+    *,
+    item: ExecutionPlanItem,
+    evidence: object,
+) -> bool:
+    if (
+        item.side != "buy"
+        or item.intent != "intraday_watch_buy"
+        or not isinstance(evidence, dict)
+        or set(evidence) != CORE_V4_TRIGGER_TIME_LIQUIDITY_EVIDENCE_KEYS
+        or type(evidence.get("version")) is not int
+        or evidence.get("version") != 1
+    ):
+        return False
+    risk_context = item.risk_context if isinstance(item.risk_context, dict) else {}
+    expected_exchange = str(
+        risk_context.get("exchange") or item.venue or ""
+    ).strip().upper()
+    if (
+        str(evidence.get("provider") or "").strip().lower()
+        != str(item.provider or "").strip().lower()
+        or str(evidence.get("asset_class") or "").strip().lower()
+        != str(item.asset_class or "").strip().lower()
+        or str(evidence.get("exchange") or "").strip().upper()
+        != expected_exchange
+        or str(evidence.get("symbol") or "").strip().upper()
+        != str(item.symbol or "").strip().upper()
+        or evidence.get("freshness_source")
+        != "kis_exchange_intraday_minute_time"
+        or evidence.get("endpoint")
+        != (
+            "/uapi/domestic-stock/v1/quotations/"
+            "inquire-time-itemchartprice"
+        )
+        or evidence.get("tr_id") != "FHKST03010200"
+    ):
+        return False
+    observed_at = evidence.get("observed_at")
+    if not isinstance(observed_at, str):
+        return False
+    try:
+        parsed_observed_at = datetime.fromisoformat(
+            observed_at.replace("Z", "+00:00")
+        )
+    except ValueError:
+        return False
+    if (
+        parsed_observed_at.tzinfo is None
+        or parsed_observed_at.utcoffset() is None
+    ):
+        return False
+    volume = _nonnegative_decimal(evidence.get("volume"))
+    turnover = _nonnegative_decimal(evidence.get("turnover"))
+    day_high = _positive_decimal(evidence.get("day_high"))
+    day_low = _positive_decimal(evidence.get("day_low"))
+    return bool(
+        volume is not None
+        and turnover is not None
+        and day_high is not None
+        and day_low is not None
+        and day_low <= day_high
+    )
+
+
+def _server_liquidity_evidence_is_only_policy_extension(
+    *,
+    raw_policy: dict[str, object],
+    item: ExecutionPlanItem,
+    quantity_policy: dict[str, object] | None = None,
+) -> bool:
+    resolved_policy = (
+        quantity_policy
+        if isinstance(quantity_policy, dict)
+        else item.quantity_policy
+        if isinstance(item.quantity_policy, dict)
+        else {}
+    )
+    if set(resolved_policy) != set(CORE_V4_WATCH_POLICY_KEYS) | {
+        CORE_V4_TRIGGER_TIME_LIQUIDITY_EVIDENCE_KEY
+    }:
+        return False
+    base_policy = dict(resolved_policy)
+    evidence = base_policy.pop(
+        CORE_V4_TRIGGER_TIME_LIQUIDITY_EVIDENCE_KEY,
+        None,
+    )
+    return bool(
+        _server_trigger_time_liquidity_evidence_matches(
+            item=item,
+            evidence=evidence,
+        )
+        and _watch_sizing_policy_matches(
+            raw_policy=raw_policy,
+            quantity_policy=base_policy,
+            item=item,
         )
     )
 
@@ -2451,6 +3307,16 @@ def _positive_decimal(value: object) -> Decimal | None:
     except (InvalidOperation, TypeError, ValueError):
         return None
     return parsed if parsed.is_finite() and parsed > 0 else None
+
+
+def _nonnegative_decimal(value: object) -> Decimal | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        parsed = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    return parsed if parsed.is_finite() and parsed >= 0 else None
 
 
 def _same_instant(left: datetime | None, right: datetime | None) -> bool:

@@ -1178,6 +1178,58 @@ def test_monitoring_timeout_does_not_block_next_scheduler_tick() -> None:
     asyncio.run(scenario())
 
 
+def test_monitoring_timeout_expires_only_the_timed_out_cycle_broker_lease() -> None:
+    async def scenario() -> None:
+        settings = Settings(
+            database_url="sqlite:///:memory:",
+            autonomous_runtime_enabled=True,
+            monitoring_cycle_timeout_seconds=0.02,
+            nxt_eligible_sync_enabled=False,
+        )
+        broker_calls: list[str] = []
+        cycle_started = threading.Event()
+        release_cycle = threading.Event()
+
+        class Adapter:
+            provider = "test"
+
+            def place_order(self, *_args: object, **_kwargs: object) -> object:
+                broker_calls.append("placed")
+                return object()
+
+        coordinator = AutonomousRuntimeCoordinator(
+            settings=settings,
+            session_factory=None,  # type: ignore[arg-type]
+            broker_adapter_factory=lambda _settings: Adapter(),  # type: ignore[return-value]
+        )
+
+        def delayed_monitoring_cycle(_started_at: datetime) -> dict[str, object]:
+            cycle_started.set()
+            assert release_cycle.wait(timeout=2)
+            coordinator._broker_adapter_for_cycle().place_order("token", object())
+            return {"status_code": 200}
+
+        coordinator._monitoring_cycle_sync_guarded = delayed_monitoring_cycle  # type: ignore[method-assign]
+        started_at = datetime.now(UTC)
+        try:
+            awaitable = coordinator._run_monitoring_cycle(started_at)
+            result = await coordinator._await_cycle_payload(
+                worker_key="monitoring",
+                awaitable=awaitable,
+            )
+
+            assert result is None
+            assert cycle_started.is_set()
+            release_cycle.set()
+            await coordinator._drain_inflight_cycles(timeout=1)
+            assert broker_calls == []
+        finally:
+            release_cycle.set()
+            await coordinator._drain_inflight_cycles(timeout=1)
+
+    asyncio.run(scenario())
+
+
 def test_stop_drains_monitoring_cycle_that_outlived_scheduler_timeout() -> None:
     async def scenario() -> None:
         settings = Settings(

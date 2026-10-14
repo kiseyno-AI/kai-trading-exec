@@ -1230,6 +1230,153 @@ def test_admitted_broker_call_persists_ack_but_cannot_admit_another_call(
         engine.dispose()
 
 
+def test_expired_cycle_lease_blocks_late_broker_call_without_fencing_other_cycles() -> None:
+    fence = RuntimeCycleFence()
+    expired_lease = fence.capture_cycle_lease()
+    active_lease = fence.capture_cycle_lease()
+    release_cycle = threading.Event()
+    calls: list[str] = []
+    errors: list[BaseException] = []
+
+    class Adapter:
+        def place_order(self, label: str) -> object:
+            calls.append(label)
+            return object()
+
+    adapter = GuardedBrokerAdapter(Adapter(), fence)
+
+    def delayed_cycle() -> None:
+        assert release_cycle.wait(timeout=2)
+        adapter.place_order("expired")
+
+    def run_delayed_cycle() -> None:
+        try:
+            fence.run(
+                expired_lease.generation,
+                delayed_cycle,
+                lease=expired_lease,
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    cycle_thread = threading.Thread(target=run_delayed_cycle)
+    cycle_thread.start()
+    try:
+        fence.expire_cycle_lease(expired_lease)
+        release_cycle.set()
+        cycle_thread.join(timeout=1)
+
+        fence.run(
+            active_lease.generation,
+            lambda: adapter.place_order("active"),
+            lease=active_lease,
+        )
+
+        assert calls == ["active"]
+        assert len(errors) == 1
+        assert isinstance(errors[0], asyncio.CancelledError)
+    finally:
+        release_cycle.set()
+        cycle_thread.join(timeout=1)
+
+
+def test_expired_cycle_lease_blocks_late_database_commit(tmp_path) -> None:
+    settings = Settings(database_url=f"sqlite:///{tmp_path / 'expired-cycle.db'}")
+    engine = create_db_engine(settings)
+    with engine.begin() as connection:
+        connection.execute(text("CREATE TABLE cycle_sentinel (value INTEGER)"))
+    session_factory = create_session_factory(engine)
+    fence = RuntimeCycleFence()
+    guarded_sessions = CommitGuardedSessionFactory(session_factory, fence)
+    lease = fence.capture_cycle_lease()
+    release_cycle = threading.Event()
+    errors: list[BaseException] = []
+
+    def delayed_cycle() -> None:
+        assert release_cycle.wait(timeout=2)
+        with guarded_sessions() as db:
+            db.execute(text("INSERT INTO cycle_sentinel (value) VALUES (1)"))
+            db.commit()
+
+    def run_delayed_cycle() -> None:
+        try:
+            fence.run(lease.generation, delayed_cycle, lease=lease)
+        except BaseException as exc:
+            errors.append(exc)
+
+    cycle_thread = threading.Thread(target=run_delayed_cycle)
+    cycle_thread.start()
+    try:
+        fence.expire_cycle_lease(lease)
+        release_cycle.set()
+        cycle_thread.join(timeout=1)
+
+        with engine.connect() as connection:
+            assert connection.scalar(text("SELECT count(*) FROM cycle_sentinel")) == 0
+        assert len(errors) == 1
+        assert isinstance(errors[0], asyncio.CancelledError)
+    finally:
+        release_cycle.set()
+        cycle_thread.join(timeout=1)
+        engine.dispose()
+
+
+def test_expired_cycle_lease_preserves_already_admitted_broker_outcome(tmp_path) -> None:
+    settings = Settings(database_url=f"sqlite:///{tmp_path / 'expired-cycle-ack.db'}")
+    engine = create_db_engine(settings)
+    with engine.begin() as connection:
+        connection.execute(text("CREATE TABLE broker_ack (value INTEGER)"))
+    session_factory = create_session_factory(engine)
+    fence = RuntimeCycleFence()
+    guarded_sessions = CommitGuardedSessionFactory(session_factory, fence)
+    lease = fence.capture_cycle_lease()
+    broker_entered = threading.Event()
+    release_broker = threading.Event()
+    calls: list[str] = []
+    errors: list[BaseException] = []
+
+    class Adapter:
+        def place_order(self, label: str) -> object:
+            calls.append(label)
+            if label == "first":
+                broker_entered.set()
+                assert release_broker.wait(timeout=2)
+            return object()
+
+    adapter = GuardedBrokerAdapter(Adapter(), fence)
+
+    def cycle() -> None:
+        adapter.place_order("first")
+        with guarded_sessions() as db:
+            db.execute(text("INSERT INTO broker_ack (value) VALUES (1)"))
+            db.commit()
+        adapter.place_order("second")
+
+    def run_cycle() -> None:
+        try:
+            fence.run(lease.generation, cycle, lease=lease)
+        except BaseException as exc:
+            errors.append(exc)
+
+    cycle_thread = threading.Thread(target=run_cycle)
+    cycle_thread.start()
+    try:
+        assert broker_entered.wait(timeout=1)
+        fence.expire_cycle_lease(lease)
+        release_broker.set()
+        cycle_thread.join(timeout=1)
+
+        with engine.connect() as connection:
+            assert connection.scalar(text("SELECT count(*) FROM broker_ack")) == 1
+        assert calls == ["first"]
+        assert len(errors) == 1
+        assert isinstance(errors[0], asyncio.CancelledError)
+    finally:
+        release_broker.set()
+        cycle_thread.join(timeout=1)
+        engine.dispose()
+
+
 def test_nested_transaction_commit_does_not_leak_runtime_fence_lease(
     tmp_path,
 ) -> None:
