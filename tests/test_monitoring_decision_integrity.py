@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
+from copy import deepcopy
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 import json
@@ -4055,6 +4056,7 @@ def test_exec_full_cost_economics_and_liquidity_survive_runtime_compaction() -> 
         estimated_round_trip_cost_bps=Decimal("55.0000"),
         cost_evidence_source="server_config_plus_live_quote_spread",
     )
+    original_quantity_policy = deepcopy(item.quantity_policy)
 
     monitoring_service._persist_trigger_time_full_cost_economics(
         settings=settings,
@@ -4071,6 +4073,246 @@ def test_exec_full_cost_economics_and_liquidity_survive_runtime_compaction() -> 
     assert evidence["provenance"]["source"] == "kai-trading-exec.monitoring"
     assert evidence["provenance"]["binding"]
     assert "exec_trigger_time_liquidity_evidence_v1" in item.quantity_policy
+    assert item.quantity_policy == original_quantity_policy
+
+
+def test_trigger_time_agent_adjustments_do_not_mutate_verified_sizing_policy() -> None:
+    runtime_provenance = {
+        "runtime_contract": {
+            "directory_chain": {
+                f"entry_{index}": {"path": f"/runtime/{index}", "sha256": str(index) * 64}
+                for index in range(8)
+            }
+        }
+    }
+    quantity_policy = {
+        **{f"policy_noise_{index:03d}": index for index in range(80)},
+        "approval_provenance": {
+            "kind": "verified_exec_agent_watch_sizing",
+            "runtime": runtime_provenance,
+        },
+        "exec_agent_decision": {"runtime_provenance": runtime_provenance},
+        "short_term_exec_agent_decision": {"runtime_provenance": runtime_provenance},
+    }
+    item = ExecutionPlanItem(
+        id="verified-adjustment-item",
+        execution_plan_id="verified-adjustment-plan",
+        symbol="048910",
+        side="buy",
+        intent="intraday_watch_buy",
+        provider="kis",
+        venue="KRX",
+        asset_class="stock",
+        risk_context={"exchange": "KRX"},
+        quantity_policy=quantity_policy,
+    )
+    original_quantity_policy = deepcopy(item.quantity_policy)
+    decision = trigger_time_exec_agent_service.TriggerTimeExecAgentDecision(
+        version="trigger-time-exec-agent-v1",
+        plan_id="verified-adjustment-plan",
+        execution_plan_item_id=item.id,
+        symbol=item.symbol,
+        decision="execute_now",
+        side="buy",
+        quantity=1,
+        limit_price=Decimal("8850"),
+        updated_target_price=Decimal("9300"),
+        updated_stop_price=Decimal("8500"),
+        reason="fresh trigger-time adjustment",
+        context_staleness_ok=True,
+    )
+
+    monitoring_service._apply_trigger_time_agent_adjustments(
+        item=item,
+        decision=decision,
+    )
+
+    assert item.risk_context["updated_target_price"] == "9300.0000"
+    assert item.risk_context["updated_stop_price"] == "8500.0000"
+    assert item.quantity_policy == original_quantity_policy
+
+
+def test_trigger_time_agent_adjustments_preserve_core_v4_plan_authority() -> None:
+    entry = ExecutionPlanItem(
+        id="core-v4-adjustment-entry",
+        execution_plan_id="core-v4-adjustment-plan",
+        source_plan_item_id="core-entry",
+        plan_item_index=0,
+        symbol="048910",
+        side="buy",
+        intent="intraday_watch_buy",
+        status="trigger_time_exec_agent_approved_pending_submit",
+        provider="kis",
+        venue="KRX",
+        asset_class="stock",
+        limit_price=Decimal("8850"),
+        risk_context={
+            "exchange": "KRX",
+            "target_price": "9300",
+            "stop_price": "8500",
+            "stop_loss_price": "8500",
+            "_core_v4_contract_binding": {
+                "version": "core-v4-persisted-binding-v1",
+            },
+        },
+        quantity_policy={"kind": "shares", "quantity": 17},
+    )
+    target = ExecutionPlanItem(
+        id="core-v4-adjustment-target",
+        execution_plan_id="core-v4-adjustment-plan",
+        source_plan_item_id="core-target",
+        plan_item_index=1,
+        symbol=entry.symbol,
+        side="sell",
+        intent="target_sell",
+        status="pending_entry_fill",
+        trigger_price=Decimal("9300"),
+        quantity_policy={"linked_entry_item_key": "core-entry"},
+    )
+    stop = ExecutionPlanItem(
+        id="core-v4-adjustment-stop",
+        execution_plan_id="core-v4-adjustment-plan",
+        source_plan_item_id="core-stop",
+        plan_item_index=2,
+        symbol=entry.symbol,
+        side="sell",
+        intent="stop_sell",
+        status="pending_entry_fill",
+        trigger_price=Decimal("8500"),
+        quantity_policy={"linked_entry_item_key": "core-entry"},
+    )
+    ExecutionPlan(
+        id="core-v4-adjustment-plan",
+        external_plan_id="core-v4-adjustment-plan",
+        source="kai-trading-core",
+        items=[entry, target, stop],
+    )
+    original_risk_context = deepcopy(entry.risk_context)
+    original_quantity_policy = deepcopy(entry.quantity_policy)
+    decision = trigger_time_exec_agent_service.TriggerTimeExecAgentDecision(
+        version="trigger-time-exec-agent-v1",
+        plan_id="core-v4-adjustment-plan",
+        execution_plan_item_id=entry.id,
+        symbol=entry.symbol,
+        decision="execute_now",
+        side="buy",
+        quantity=17,
+        limit_price=Decimal("8860"),
+        updated_target_price=Decimal("9400"),
+        updated_stop_price=Decimal("8550"),
+        reason="fresh trigger-time adjustment",
+        context_staleness_ok=True,
+    )
+
+    monitoring_service._apply_trigger_time_agent_adjustments(
+        item=entry,
+        decision=decision,
+    )
+
+    assert entry.limit_price == Decimal("8850")
+    assert entry.risk_context == original_risk_context
+    assert entry.quantity_policy == original_quantity_policy
+    assert target.trigger_price == Decimal("9300")
+    assert stop.trigger_price == Decimal("8500")
+
+
+def test_high_volatility_override_cannot_mutate_core_v4_price_contract() -> None:
+    item = ExecutionPlanItem(
+        id="core-v4-high-volatility-entry",
+        execution_plan_id="core-v4-high-volatility-plan",
+        symbol="048910",
+        side="buy",
+        intent="intraday_watch_buy",
+        provider="kis",
+        venue="KRX",
+        asset_class="stock",
+        risk_context={
+            "exchange": "KRX",
+            "stop_price": "8500",
+            "stop_loss_price": "8500",
+            "high_volatility_chase_override": {
+                "enabled": True,
+                "reason": "fresh absorption confirms continuation with a tighter stop",
+                "tighter_stop_price": "8550",
+            },
+            "_core_v4_contract_binding": {
+                "version": "core-v4-persisted-binding-v1",
+            },
+        },
+        quantity_policy={
+            "kind": "shares",
+            "quantity": 17,
+            "stop_price": "8500",
+            "stop_loss_price": "8500",
+        },
+    )
+    original_risk_context = deepcopy(item.risk_context)
+    original_quantity_policy = deepcopy(item.quantity_policy)
+
+    override = monitoring_service._watch_buy_high_volatility_chase_override(
+        item=item,
+        observed_price=Decimal("8850"),
+    )
+
+    assert override is None
+    assert item.risk_context == original_risk_context
+    assert item.quantity_policy == original_quantity_policy
+
+
+def test_core_v4_trigger_agent_recommendations_cannot_improve_executable_economics() -> None:
+    item = ExecutionPlanItem(
+        id="core-v4-economics-entry",
+        execution_plan_id="core-v4-economics-plan",
+        symbol="048910",
+        side="buy",
+        intent="intraday_watch_buy",
+        provider="kis",
+        venue="KRX",
+        asset_class="stock",
+        trigger_price=Decimal("8850"),
+        risk_context={
+            "exchange": "KRX",
+            "target_price": "9000",
+            "stop_price": "8500",
+            "stop_loss_price": "8500",
+            "trigger_direction": "at_or_above",
+            "_core_v4_contract_binding": {
+                "version": "core-v4-persisted-binding-v1",
+            },
+        },
+        quantity_policy={"kind": "shares", "quantity": 17},
+    )
+    decision = trigger_time_exec_agent_service.TriggerTimeExecAgentDecision(
+        version="trigger-time-exec-agent-v1",
+        plan_id="core-v4-economics-plan",
+        execution_plan_item_id=item.id,
+        symbol=item.symbol,
+        decision="execute_now",
+        side="buy",
+        quantity=17,
+        limit_price=Decimal("8850"),
+        updated_trigger_price=Decimal("8800"),
+        updated_target_price=Decimal("12000"),
+        updated_stop_price=Decimal("8700"),
+        reason="recommend more favorable levels",
+        context_staleness_ok=True,
+    )
+
+    target, stop = monitoring_service._trigger_time_effective_exit_prices(
+        item=item,
+        decision=decision,
+        enforced_stop=None,
+    )
+    still_valid = monitoring_service._post_agent_trigger_still_valid(
+        item=item,
+        price=MonitoringPriceRequest(symbol=item.symbol, price=Decimal("8800")),
+        decision=decision,
+        triggered_at=datetime(2026, 10, 14, 1, tzinfo=UTC),
+    )
+
+    assert target == Decimal("9000")
+    assert stop == Decimal("8500")
+    assert still_valid is False
 
 
 @pytest.mark.parametrize(
@@ -4149,6 +4391,122 @@ def test_trigger_agent_timeout_is_clamped_to_monitoring_cycle_budget(monkeypatch
 
     assert bounded is not None
     assert bounded.exec_agent_trigger_time_timeout_seconds == 14
+
+
+def test_trigger_agent_freshness_reference_includes_prefetch_completion_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cycle_triggered_at = datetime(2026, 10, 14, 6, 18, 2, tzinfo=UTC)
+    quote_freshness_at = cycle_triggered_at + timedelta(seconds=12)
+    monkeypatch.setattr(monitoring_service.time, "monotonic", lambda: 103.0)
+
+    evaluated_at = monitoring_service._cycle_evaluated_at(
+        triggered_at=cycle_triggered_at,
+        quote_freshness_at=quote_freshness_at,
+        cycle_started=100.0,
+    )
+
+    assert evaluated_at == cycle_triggered_at + timedelta(seconds=15)
+
+    item = ExecutionPlanItem(
+        symbol="048910",
+        side="buy",
+        intent="intraday_watch_buy",
+        provider="kis",
+        venue="KRX",
+        asset_class="stock",
+        risk_context={"exchange": "KRX"},
+    )
+    _context, stale_reason = trigger_time_exec_agent_service._market_context(
+        settings=Settings(
+            monitoring_max_quote_age_seconds=30,
+            monitoring_max_quote_future_skew_seconds=5,
+        ),
+        item=item,
+        observed_price=Decimal("8750"),
+        observed_at=cycle_triggered_at + timedelta(seconds=11),
+        triggered_at=evaluated_at,
+        trigger_reason="intraday_watch_buy_day_high_cross",
+        trigger_metadata=None,
+        live_market_context=None,
+    )
+
+    assert stale_reason is None
+
+
+def test_trigger_agent_freshness_reference_still_rejects_true_future_quote(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cycle_triggered_at = datetime(2026, 10, 14, 6, 18, 2, tzinfo=UTC)
+    quote_freshness_at = cycle_triggered_at + timedelta(seconds=12)
+    monkeypatch.setattr(monitoring_service.time, "monotonic", lambda: 100.0)
+    evaluated_at = monitoring_service._cycle_evaluated_at(
+        triggered_at=cycle_triggered_at,
+        quote_freshness_at=quote_freshness_at,
+        cycle_started=100.0,
+    )
+    item = ExecutionPlanItem(
+        symbol="048910",
+        side="buy",
+        intent="intraday_watch_buy",
+        provider="kis",
+        venue="KRX",
+        asset_class="stock",
+        risk_context={"exchange": "KRX"},
+    )
+
+    _context, stale_reason = trigger_time_exec_agent_service._market_context(
+        settings=Settings(monitoring_max_quote_future_skew_seconds=5),
+        item=item,
+        observed_price=Decimal("8750"),
+        observed_at=evaluated_at + timedelta(seconds=6),
+        triggered_at=evaluated_at,
+        trigger_reason="intraday_watch_buy_day_high_cross",
+        trigger_metadata=None,
+        live_market_context=None,
+    )
+
+    assert stale_reason == (
+        "quote timestamp is in the future for trigger-time exec-agent decision: "
+        "6.000s>5s"
+    )
+
+
+def test_trigger_agent_freshness_reference_still_rejects_stale_quote(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cycle_triggered_at = datetime(2026, 10, 14, 6, 18, 2, tzinfo=UTC)
+    quote_freshness_at = cycle_triggered_at + timedelta(seconds=12)
+    monkeypatch.setattr(monitoring_service.time, "monotonic", lambda: 100.0)
+    evaluated_at = monitoring_service._cycle_evaluated_at(
+        triggered_at=cycle_triggered_at,
+        quote_freshness_at=quote_freshness_at,
+        cycle_started=100.0,
+    )
+    item = ExecutionPlanItem(
+        symbol="048910",
+        side="buy",
+        intent="intraday_watch_buy",
+        provider="kis",
+        venue="KRX",
+        asset_class="stock",
+        risk_context={"exchange": "KRX"},
+    )
+
+    _context, stale_reason = trigger_time_exec_agent_service._market_context(
+        settings=Settings(monitoring_max_quote_age_seconds=30),
+        item=item,
+        observed_price=Decimal("8750"),
+        observed_at=evaluated_at - timedelta(seconds=31),
+        triggered_at=evaluated_at,
+        trigger_reason="intraday_watch_buy_day_high_cross",
+        trigger_metadata=None,
+        live_market_context=None,
+    )
+
+    assert stale_reason == (
+        "quote is stale for trigger-time exec-agent decision: 31.000s>30s"
+    )
 
 
 def test_trigger_agent_claim_identity_binds_nontransient_risk_context() -> None:

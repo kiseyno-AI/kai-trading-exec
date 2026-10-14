@@ -153,7 +153,7 @@ def item_has_external_possible_exposure(
                 ExecutionPosition.quantity != 0,
                 ExecutionPosition.base_quantity != 0,
             ),
-        )
+        ).with_for_update()
     ).all()
     if not positions:
         return False

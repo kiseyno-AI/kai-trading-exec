@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session, selectinload
 
 from app.api.schemas.execution import (
     CoreExecutionPlanRequestV4,
+    MonitoringPriceRequest,
     _SKIP_DISPATCH_MATERIAL_FINGERPRINT_CONTEXT_KEY,
     core_execution_plan_material_fingerprint,
 )
@@ -38,13 +39,20 @@ from app.models.runtime import (
 from app.services import core_handoff_v4
 from app.services import core_revocation_exposure
 from app.services import execution_exposure
+from app.services import monitoring as monitoring_service
 from app.services import position_truth_remediation
 from app.services import watch_exec_agent_sizing as watch_sizing
+from app.services.account_drawdown_recovery import recovery_account_fingerprint
 from app.services.kis_krx_flat_rebind_contract import (
     KIS_KRX_LEGACY_FLAT_REBIND_SAFETY_POLICY_VERSION,
     kis_krx_flat_absence_proof_digest,
     kis_krx_flat_configured_account_binding_digest,
     kis_krx_flat_evidence_fingerprint,
+)
+from app.services.json_compaction import compact_json_object
+from app.services.order_intent_serialization import (
+    order_intent_process_lock,
+    order_intent_scope_key_for_account,
 )
 from app.services.position_identity import (
     build_position_identity,
@@ -790,6 +798,164 @@ def _short_term_exec_agent_approval(
         "source": "short_term_exec_agent_v1",
     }
     return decision, policy
+
+
+def _trigger_time_liquidity_evidence(
+    *,
+    symbol: str = "005930",
+    **overrides: object,
+) -> dict[str, object]:
+    evidence: dict[str, object] = {
+        "version": 1,
+        "provider": "kis",
+        "asset_class": "stock",
+        "exchange": "KRX",
+        "symbol": symbol,
+        "observed_at": "2026-09-10T01:02:03+00:00",
+        "freshness_source": "kis_exchange_intraday_minute_time",
+        "endpoint": (
+            "/uapi/domestic-stock/v1/quotations/"
+            "inquire-time-itemchartprice"
+        ),
+        "tr_id": "FHKST03010200",
+        "volume": "100000",
+        "turnover": "7100000000",
+        "day_high": "72000",
+        "day_low": "70000",
+    }
+    evidence.update(overrides)
+    return evidence
+
+
+def _create_approved_intraday_watch_plan(
+    *,
+    app,
+    settings: Settings,
+    plan_id: str,
+    symbols: tuple[str, ...] = ("005930",),
+) -> str:
+    payload = (
+        _plan_payload(plan_id=plan_id)
+        if len(symbols) == 1
+        else _multi_family_plan_payload(plan_id=plan_id, symbols=symbols)
+    )
+    payload["mode"] = settings.runtime_mode
+    for entry_payload in [item for item in payload["items"] if item["side"] == "buy"]:
+        prior_entry_key = entry_payload["core_item_key"]
+        entry_key = f"{str(prior_entry_key).rsplit(':', 1)[0]}:intraday_watch_buy"
+        entry_payload.update(
+            {
+                "core_item_key": entry_key,
+                "source_plan_item_id": entry_key,
+                "intent": "intraday_watch_buy",
+                "limit_price": "71000",
+                "trigger_price": "70000",
+            }
+        )
+        entry_payload["quantity_policy"].update(
+            {
+                "budget_krw": "200000",
+                "estimated_reference_price": "71000",
+            }
+        )
+        for protective_item in payload["items"]:
+            if protective_item["quantity_policy"].get(
+                "linked_entry_item_key"
+            ) == prior_entry_key:
+                protective_item["quantity_policy"]["linked_entry_item_key"] = (
+                    entry_key
+                )
+    for item_payload in payload["items"]:
+        if item_payload["intent"] == "target_sell":
+            item_payload["trigger_price"] = "76000"
+        elif item_payload["intent"] == "stop_sell":
+            item_payload["trigger_price"] = "69000"
+    _refresh_material_fingerprint(payload)
+    response = TestClient(app).post("/v4/execution-plans", json=payload)
+    assert response.status_code == 201, response.json()
+
+    with app.state.db_session_factory() as session:
+        plan = session.scalar(
+            select(ExecutionPlan).options(selectinload(ExecutionPlan.items))
+        )
+        assert plan is not None
+        entries = sorted(
+            (item for item in plan.items if item.side == "buy"),
+            key=lambda item: item.plan_item_index,
+        )
+        request_payload = {"test_scope": plan_id}
+        result = _apply_decisions(
+            db=session,
+            settings=settings,
+            plan=plan,
+            request_payload=request_payload,
+            decision_payload={
+                "version": "manual-exec-agent-watch-sizing-v1",
+                "plan_id": plan.external_plan_id,
+                "_runtime_provenance": verified_runtime_provenance(
+                    settings=settings,
+                    request_payload=request_payload,
+                    session_id=f"{plan_id}-session",
+                ),
+                "decisions": [
+                    {
+                        "execution_plan_item_id": entry.id,
+                        "symbol": entry.symbol,
+                        "action": "approve",
+                        "quantity": 2,
+                        "approved_notional_krw": "142000",
+                        "sizing_price": "71000",
+                        "confidence": 0.82,
+                        "target_profile": "short_swing",
+                        "reason_code": "approved",
+                        "reason": "bounded intraday watch entry",
+                    }
+                    for entry in entries
+                ],
+            },
+            account_context={
+                "available": True,
+                "orderable_cash_krw": "1000000",
+                "buying_power_krw": "1000000",
+                "holdings": [],
+                "open_orders": [],
+            },
+            expected_item_ids={entry.id for entry in entries},
+            now=datetime(2026, 9, 9, 23, 30, tzinfo=UTC),
+        )
+        assert result["approved"] == len(entries), result
+        assert core_handoff_v4.persisted_core_plan_contract_ack(plan) is not None
+        for entry in entries:
+            monitoring_service._persist_trigger_time_liquidity_evidence(
+                item=entry,
+                price=MonitoringPriceRequest(
+                    symbol=entry.symbol,
+                    price=Decimal("71000"),
+                    observed_at=datetime(2026, 9, 10, 1, 2, 3, tzinfo=UTC),
+                    freshness_source="kis_exchange_intraday_minute_time",
+                    volume=Decimal("100000"),
+                    turnover=Decimal("7100000000"),
+                    day_high=Decimal("72000"),
+                    day_low=Decimal("70000"),
+                    provenance={
+                        "field_sources": {
+                            "turnover": {
+                                "observed_at": "2026-09-10T01:02:03+00:00",
+                                "freshness_source": (
+                                    "kis_exchange_intraday_minute_time"
+                                ),
+                                "endpoint": (
+                                    "/uapi/domestic-stock/v1/quotations/"
+                                    "inquire-time-itemchartprice"
+                                ),
+                                "tr_id": "FHKST03010200",
+                            }
+                        }
+                    },
+                ),
+            )
+        session.commit()
+        return entries[0].id
 
 
 def test_v4_intake_requires_exact_contract_and_returns_one_to_one_durable_ack() -> None:
@@ -1545,6 +1711,22 @@ def test_v4_contract_proof_rejects_executable_fields_appended_to_unsized_policy(
     engine.dispose()
 
 
+def test_v4_intake_rejects_caller_supplied_server_liquidity_evidence() -> None:
+    app, engine = _build_test_app()
+    payload = _plan_payload(plan_id="core-v4-forged-liquidity-evidence")
+    payload["items"][0]["quantity_policy"][
+        "exec_trigger_time_liquidity_evidence_v1"
+    ] = _trigger_time_liquidity_evidence()
+    _refresh_material_fingerprint(payload)
+
+    response = TestClient(app).post("/v4/execution-plans", json=payload)
+
+    assert response.status_code == 422
+    assert "server-owned" in str(response.json())
+    assert TestClient(app).get("/execution-plans").json() == []
+    engine.dispose()
+
+
 def test_v4_contract_proof_allows_bounded_watch_attempt_metadata() -> None:
     app, engine = _build_test_app()
     client = TestClient(app)
@@ -1578,6 +1760,805 @@ def test_v4_contract_proof_allows_bounded_watch_attempt_metadata() -> None:
         session.flush()
 
         assert core_handoff_v4.persisted_core_plan_contract_ack(plan) is not None
+    engine.dispose()
+
+
+def test_v4_contract_proof_accepts_only_exact_server_liquidity_evidence() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        exec_agent_model="openai/gpt-5.6-sol",
+        kis_app_key="mock-key",
+        kis_app_secret="mock-secret",
+        kis_account_number="12345678",
+        kis_account_product_code="01",
+        account_drawdown_recovery_scope_secret=(
+            "core-v4-liquidity-proof-secret-at-least-32-bytes"
+        ),
+    )
+    app, engine = _build_test_app(settings=settings)
+    entry_id = _create_approved_intraday_watch_plan(
+        app=app,
+        settings=settings,
+        plan_id="core-v4-server-liquidity-evidence",
+    )
+
+    with app.state.db_session_factory() as session:
+        plan = session.scalar(
+            select(ExecutionPlan).options(selectinload(ExecutionPlan.items))
+        )
+        assert plan is not None
+        entry = session.get(ExecutionPlanItem, entry_id)
+        assert entry is not None
+        valid_policy = deepcopy(entry.quantity_policy)
+        evidence = entry.quantity_policy[
+            "exec_trigger_time_liquidity_evidence_v1"
+        ]
+
+        assert core_handoff_v4.persisted_core_plan_contract_ack(plan) is not None
+
+        invalid_evidence = [
+            {
+                **_trigger_time_liquidity_evidence(symbol=entry.symbol),
+                "caller_supplied_extension": True,
+            },
+            _trigger_time_liquidity_evidence(symbol="000660"),
+            _trigger_time_liquidity_evidence(
+                symbol=entry.symbol,
+                observed_at="2026-09-10T01:02:03",
+            ),
+            _trigger_time_liquidity_evidence(
+                symbol=entry.symbol,
+                endpoint="/untrusted/endpoint",
+            ),
+            _trigger_time_liquidity_evidence(
+                symbol=entry.symbol,
+                volume="-1",
+            ),
+            _trigger_time_liquidity_evidence(
+                symbol=entry.symbol,
+                day_high="69000",
+                day_low="70000",
+            ),
+        ]
+        for evidence in invalid_evidence:
+            entry.quantity_policy = {
+                **valid_policy,
+                "exec_trigger_time_liquidity_evidence_v1": evidence,
+            }
+            assert core_handoff_v4.persisted_core_plan_contract_ack(plan) is None
+
+        entry.quantity_policy = {
+            **valid_policy,
+            "unrecognized_server_extension": {"version": 1},
+        }
+        assert core_handoff_v4.persisted_core_plan_contract_ack(plan) is None
+    engine.dispose()
+
+
+def test_reconcile_recovers_only_bug_quarantined_agent_delay_without_exposure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        exec_agent_model="openai/gpt-5.6-sol",
+        kis_app_key="mock-key",
+        kis_app_secret="mock-secret",
+        kis_account_number="12345678",
+        kis_account_product_code="01",
+        account_drawdown_recovery_scope_secret=(
+            "core-v4-liquidity-recovery-secret-at-least-32-bytes"
+        ),
+    )
+    app, engine = _build_test_app(settings=settings)
+    entry_id = _create_approved_intraday_watch_plan(
+        app=app,
+        settings=settings,
+        plan_id="core-v4-liquidity-evidence-recovery",
+    )
+    quarantine_at = datetime.now(UTC) + timedelta(seconds=1)
+    damaged_policy: dict[str, object] = {}
+
+    with app.state.db_session_factory() as session:
+        plan = session.scalar(
+            select(ExecutionPlan).options(selectinload(ExecutionPlan.items))
+        )
+        assert plan is not None
+        entry = session.get(ExecutionPlanItem, entry_id)
+        assert entry is not None
+        sizing_audit = session.scalar(
+            select(ExecutionPlanItemAudit).where(
+                ExecutionPlanItemAudit.execution_plan_item_id == entry.id,
+                ExecutionPlanItemAudit.event_type
+                == "watch_exec_agent_sizing_decision",
+            )
+        )
+        assert sizing_audit is not None
+        audit_runtime = deepcopy(sizing_audit.payload["runtime_provenance"])
+        sizing_payload = deepcopy(sizing_audit.payload)
+        raw_agent_decision = dict(sizing_payload["agent_decision"])
+        raw_agent_decision.update(
+            {
+                "quantity": 3,
+                "approved_quantity": 3,
+                "approved_notional_krw": "210000",
+                "sizing_price": "70000",
+                "reference_price": "70000",
+            }
+        )
+        sizing_payload["agent_decision"] = raw_agent_decision
+        deterministic_context = dict(sizing_payload["deterministic_context"])
+        allowed_action_envelope = dict(
+            deterministic_context["allowed_action_envelope"]
+        )
+        allowed_action_envelope["reference_price"] = "70000"
+        deterministic_context["allowed_action_envelope"] = (
+            allowed_action_envelope
+        )
+        sizing_adjustment = dict(deterministic_context["sizing_adjustment"])
+        sizing_adjustment.update(
+            {
+                "applied": True,
+                "agent_quantity": 3,
+                "agent_approved_quantity": 3,
+                "agent_notional": "213000.0000",
+                "agent_approved_notional": "210000.0000",
+                "agent_cap_notional": "210000.0000",
+                "cap_notional": "200000.0000",
+                "effective_target_notional": "200000.0000",
+            }
+        )
+        deterministic_context["sizing_adjustment"] = sizing_adjustment
+        sizing_payload["deterministic_context"] = deterministic_context
+        sizing_audit.payload = sizing_payload
+        quantity_policy = deepcopy(entry.quantity_policy)
+        quantity_policy["sizing_adjustment"] = sizing_adjustment
+        quantity_policy["allowed_action_envelope"] = allowed_action_envelope
+        sizing_explanation = dict(quantity_policy["sizing_explanation"])
+        sizing_explanation.update(
+            {
+                "agent_approved_quantity": 3,
+                "agent_approved_notional": "210000.0000",
+                "agent_reported_notional": "210000",
+                "agent_cap_notional": "210000.0000",
+                "cap_notional": "200000.0000",
+                "adjustment_applied": True,
+            }
+        )
+        quantity_policy["sizing_explanation"] = sizing_explanation
+        entry.quantity_policy = quantity_policy
+        session.add(
+            ExecutionPlanItemAudit(
+                execution_plan_item_id=entry.id,
+                event_type="watch_exec_agent_sizing_decision",
+                source="watch_exec_agent_sizing",
+                occurred_at=sizing_audit.occurred_at - timedelta(seconds=1),
+                summary=deepcopy(sizing_audit.summary),
+                payload=deepcopy(sizing_payload),
+            )
+        )
+        entry.quantity_policy = compact_json_object(entry.quantity_policy)
+        damaged_policy = deepcopy(entry.quantity_policy)
+        assert not core_handoff_v4.persisted_verified_watch_sizing_provenance(
+            entry.quantity_policy
+        )
+        assert core_handoff_v4.persisted_core_plan_contract_ack(plan) is None
+        entry.status = "contract_quarantined"
+        plan.status = "contract_quarantined"
+        assert entry.jobs == []
+        session.add(
+            ExecutionPlanItemAudit(
+                execution_plan_item_id=entry.id,
+                event_type="legacy_core_authority_quarantined",
+                source="kai-trading-exec",
+                occurred_at=quarantine_at,
+                summary={
+                    "prior_status": "agent_delay",
+                    "protective_exits_preserved": True,
+                },
+                payload={
+                    "reason_code": "persisted_v4_contract_not_proven",
+                    "manual_review_required": False,
+                },
+            )
+        )
+        session.commit()
+
+    scope = order_intent_scope_key_for_account(
+        provider="kis",
+        runtime_mode=settings.runtime_mode,
+        account_scope=recovery_account_fingerprint(settings),
+        market="KRW",
+    )
+    process_lock = order_intent_process_lock(scope)
+    holder_ready = threading.Event()
+    release_holder = threading.Event()
+
+    def hold_serialization_scope() -> None:
+        with process_lock:
+            holder_ready.set()
+            release_holder.wait(timeout=2)
+
+    holder = threading.Thread(target=hold_serialization_scope)
+    holder.start()
+    assert holder_ready.wait(timeout=2)
+    with app.state.db_session_factory() as session:
+        assert core_handoff_v4.reconcile_unproven_legacy_core_buy_authority(
+            db=session,
+            runtime_mode="paper",
+            settings=settings,
+        ) == 0
+    with app.state.db_session_factory() as session:
+        blocked_plan = session.scalar(
+            select(ExecutionPlan).options(selectinload(ExecutionPlan.items))
+        )
+        blocked_entry = session.get(ExecutionPlanItem, entry_id)
+        assert blocked_plan is not None
+        assert blocked_entry is not None
+        assert blocked_plan.status == "contract_quarantined"
+        assert blocked_entry.status == "contract_quarantined"
+        assert blocked_entry.quantity_policy == damaged_policy
+        assert session.scalar(
+            select(func.count())
+            .select_from(ExecutionPlanItemAudit)
+            .where(
+                ExecutionPlanItemAudit.execution_plan_item_id == entry_id,
+                ExecutionPlanItemAudit.event_type
+                == "legacy_core_authority_quarantine_recovered",
+            )
+        ) == 0
+    release_holder.set()
+    holder.join(timeout=2)
+    assert not holder.is_alive()
+
+    serialization_active = False
+    original_serialization = core_handoff_v4.serialized_revocation_exposure
+
+    @contextmanager
+    def tracked_serialization(**kwargs: object) -> Iterator[None]:
+        nonlocal serialization_active
+        with original_serialization(**kwargs):
+            serialization_active = True
+            try:
+                yield
+            finally:
+                serialization_active = False
+
+    monkeypatch.setattr(
+        core_handoff_v4,
+        "serialized_revocation_exposure",
+        tracked_serialization,
+    )
+    with app.state.db_session_factory() as session:
+        original_commit = session.commit
+
+        def checked_commit() -> None:
+            assert serialization_active
+            original_commit()
+
+        monkeypatch.setattr(session, "commit", checked_commit)
+        assert (
+            core_handoff_v4.reconcile_unproven_legacy_core_buy_authority(
+                db=session,
+                runtime_mode="paper",
+                settings=settings,
+            )
+            == 1
+        )
+        assert (
+            core_handoff_v4.reconcile_unproven_legacy_core_buy_authority(
+                db=session,
+                runtime_mode="paper",
+                settings=settings,
+            )
+            == 0
+        )
+
+    with app.state.db_session_factory() as session:
+        plan = session.scalar(
+            select(ExecutionPlan).options(selectinload(ExecutionPlan.items))
+        )
+        assert plan is not None
+        entry = session.get(ExecutionPlanItem, entry_id)
+        assert entry is not None
+        assert entry.status == "agent_delay"
+        assert plan.status == "accepted"
+        assert core_handoff_v4.persisted_core_plan_contract_ack(plan) is not None
+        assert entry.quantity_policy["approval_provenance"]["runtime"] == audit_runtime
+        assert entry.quantity_policy["exec_agent_decision"][
+            "runtime_provenance"
+        ] == audit_runtime
+        assert entry.quantity_policy["short_term_exec_agent_decision"][
+            "runtime_provenance"
+        ] == audit_runtime
+        restored_with_damaged_runtime = deepcopy(entry.quantity_policy)
+        restored_with_damaged_runtime["approval_provenance"]["runtime"] = (
+            damaged_policy["approval_provenance"]["runtime"]
+        )
+        restored_with_damaged_runtime["exec_agent_decision"][
+            "runtime_provenance"
+        ] = damaged_policy["exec_agent_decision"]["runtime_provenance"]
+        restored_with_damaged_runtime["short_term_exec_agent_decision"][
+            "runtime_provenance"
+        ] = damaged_policy["short_term_exec_agent_decision"][
+            "runtime_provenance"
+        ]
+        assert restored_with_damaged_runtime == damaged_policy
+        assert entry.jobs == []
+        recovery = session.scalar(
+            select(ExecutionPlanItemAudit).where(
+                ExecutionPlanItemAudit.execution_plan_item_id == entry.id,
+                ExecutionPlanItemAudit.event_type
+                == "legacy_core_authority_quarantine_recovered",
+            )
+        )
+        assert recovery is not None
+        assert recovery.summary == {
+            "prior_status": "contract_quarantined",
+            "restored_status": "agent_delay",
+            "plan_status": "accepted",
+        }
+        assert recovery.payload == {
+            "reason_code": "server_liquidity_evidence_contract_fixed",
+            "broker_exposure": False,
+            "external_possible_exposure": False,
+        }
+        assert session.scalar(
+            select(func.count())
+            .select_from(ExecutionPlanItemAudit)
+            .where(
+                ExecutionPlanItemAudit.execution_plan_item_id == entry.id,
+                ExecutionPlanItemAudit.event_type
+                == "legacy_core_authority_quarantine_recovered",
+            )
+        ) == 1
+    engine.dispose()
+
+
+def test_external_exposure_check_locks_matching_position_rows() -> None:
+    class _Rows:
+        def all(self) -> list[object]:
+            return []
+
+    class _CaptureSession:
+        def __init__(self) -> None:
+            self.statements: list[object] = []
+
+        def scalars(self, statement: object) -> _Rows:
+            self.statements.append(statement)
+            return _Rows()
+
+    db = _CaptureSession()
+    plan = ExecutionPlan(id="plan", mode="live")
+    item = ExecutionPlanItem(
+        id="entry",
+        execution_plan_id=plan.id,
+        symbol="048910",
+        side="buy",
+        intent="intraday_watch_buy",
+        provider="kis",
+        venue="KRX",
+        asset_class="stock",
+    )
+
+    assert execution_exposure.item_has_external_possible_exposure(
+        db=db,  # type: ignore[arg-type]
+        plan=plan,
+        item=item,
+        settings=None,
+    ) is False
+
+    position_query = db.statements[-1]
+    assert getattr(position_query, "_for_update_arg", None) is not None
+
+
+@pytest.mark.parametrize(
+    "audit_case",
+    [
+        "missing",
+        "ambiguous",
+        "later",
+        "mismatched",
+        "malformed",
+        "raw_agent_arithmetic",
+        "adjustment_mismatch",
+        "envelope_mismatch",
+        "excessive_compaction",
+    ],
+)
+def test_liquidity_recovery_rejects_unproven_sizing_audit_repair(
+    audit_case: str,
+) -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        exec_agent_model="openai/gpt-5.6-sol",
+        kis_app_key="mock-key",
+        kis_app_secret="mock-secret",
+        kis_account_number="12345678",
+        kis_account_product_code="01",
+        account_drawdown_recovery_scope_secret=(
+            "core-v4-audit-repair-secret-at-least-32-bytes"
+        ),
+    )
+    app, engine = _build_test_app(settings=settings)
+    entry_id = _create_approved_intraday_watch_plan(
+        app=app,
+        settings=settings,
+        plan_id=f"core-v4-audit-repair-{audit_case}",
+    )
+    quarantine_at = datetime.now(UTC) + timedelta(seconds=2)
+
+    with app.state.db_session_factory() as session:
+        plan = session.scalar(
+            select(ExecutionPlan).options(selectinload(ExecutionPlan.items))
+        )
+        assert plan is not None
+        entry = session.get(ExecutionPlanItem, entry_id)
+        assert entry is not None
+        sizing_audit = session.scalar(
+            select(ExecutionPlanItemAudit).where(
+                ExecutionPlanItemAudit.execution_plan_item_id == entry.id,
+                ExecutionPlanItemAudit.event_type
+                == "watch_exec_agent_sizing_decision",
+            )
+        )
+        assert sizing_audit is not None
+        audit_summary = deepcopy(sizing_audit.summary)
+        audit_payload = deepcopy(sizing_audit.payload)
+        entry.quantity_policy = compact_json_object(entry.quantity_policy)
+        if audit_case in {
+            "mismatched",
+            "malformed",
+            "raw_agent_arithmetic",
+            "adjustment_mismatch",
+            "envelope_mismatch",
+        }:
+            session.add(
+                ExecutionPlanItemAudit(
+                    execution_plan_item_id=entry.id,
+                    event_type="watch_exec_agent_sizing_decision",
+                    source="watch_exec_agent_sizing",
+                    occurred_at=sizing_audit.occurred_at - timedelta(seconds=1),
+                    summary=deepcopy(audit_summary),
+                    payload=deepcopy(audit_payload),
+                )
+            )
+        if audit_case in {"missing", "later"}:
+            session.delete(sizing_audit)
+        elif audit_case == "ambiguous":
+            session.add(
+                ExecutionPlanItemAudit(
+                    execution_plan_item_id=entry.id,
+                    event_type="watch_exec_agent_sizing_decision",
+                    source="watch_exec_agent_sizing",
+                    occurred_at=sizing_audit.occurred_at,
+                    summary=audit_summary,
+                    payload=audit_payload,
+                )
+            )
+        elif audit_case == "mismatched":
+            final_decision = dict(audit_payload["final_decision"])
+            final_decision["symbol"] = "000660"
+            audit_payload["final_decision"] = final_decision
+            sizing_audit.payload = audit_payload
+        elif audit_case == "malformed":
+            malformed_runtime = deepcopy(audit_payload["runtime_provenance"])
+            malformed_runtime["request_sha256"] = "f" * 64
+            audit_payload["runtime_provenance"] = malformed_runtime
+            for decision_key in ("agent_decision", "final_decision"):
+                decision = dict(audit_payload[decision_key])
+                decision["runtime_provenance"] = malformed_runtime
+                audit_payload[decision_key] = decision
+            audit_summary["runtime_provenance"] = malformed_runtime
+            sizing_audit.summary = audit_summary
+            sizing_audit.payload = audit_payload
+        elif audit_case == "raw_agent_arithmetic":
+            agent_decision = dict(audit_payload["agent_decision"])
+            agent_decision["approved_notional_krw"] = "1"
+            audit_payload["agent_decision"] = agent_decision
+            sizing_audit.payload = audit_payload
+        elif audit_case in {"adjustment_mismatch", "envelope_mismatch"}:
+            deterministic_context = dict(
+                audit_payload["deterministic_context"]
+            )
+            if audit_case == "adjustment_mismatch":
+                sizing_adjustment = dict(
+                    deterministic_context["sizing_adjustment"]
+                )
+                sizing_adjustment["final_quantity"] = 999
+                deterministic_context["sizing_adjustment"] = sizing_adjustment
+            else:
+                envelope = dict(
+                    deterministic_context["allowed_action_envelope"]
+                )
+                envelope["max_quantity"] = 999
+                deterministic_context["allowed_action_envelope"] = envelope
+            audit_payload["deterministic_context"] = deterministic_context
+            sizing_audit.payload = audit_payload
+        else:
+            entry.quantity_policy = compact_json_object(entry.quantity_policy)
+        entry.status = "contract_quarantined"
+        plan.status = "contract_quarantined"
+        session.add(
+            ExecutionPlanItemAudit(
+                execution_plan_item_id=entry.id,
+                event_type="legacy_core_authority_quarantined",
+                source="kai-trading-exec",
+                occurred_at=quarantine_at,
+                summary={
+                    "prior_status": "agent_delay",
+                    "protective_exits_preserved": True,
+                },
+                payload={
+                    "reason_code": "persisted_v4_contract_not_proven",
+                    "manual_review_required": False,
+                },
+            )
+        )
+        if audit_case == "later":
+            session.add(
+                ExecutionPlanItemAudit(
+                    execution_plan_item_id=entry.id,
+                    event_type="watch_exec_agent_sizing_decision",
+                    source="watch_exec_agent_sizing",
+                    occurred_at=quarantine_at + timedelta(seconds=1),
+                    summary=audit_summary,
+                    payload=audit_payload,
+                )
+            )
+        session.commit()
+
+    with app.state.db_session_factory() as session:
+        assert core_handoff_v4.reconcile_unproven_legacy_core_buy_authority(
+            db=session,
+            runtime_mode="paper",
+            settings=settings,
+        ) == 0
+        entry = session.get(ExecutionPlanItem, entry_id)
+        assert entry is not None
+        assert entry.status == "contract_quarantined"
+        assert not core_handoff_v4.persisted_verified_watch_sizing_provenance(
+            entry.quantity_policy
+        )
+    engine.dispose()
+
+
+def test_reconcile_recovers_one_bug_quarantine_without_mutating_siblings() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        exec_agent_model="openai/gpt-5.6-sol",
+        kis_app_key="mock-key",
+        kis_app_secret="mock-secret",
+        kis_account_number="12345678",
+        kis_account_product_code="01",
+        account_drawdown_recovery_scope_secret=(
+            "core-v4-partial-recovery-secret-at-least-32-bytes"
+        ),
+    )
+    app, engine = _build_test_app(settings=settings)
+    entry_id = _create_approved_intraday_watch_plan(
+        app=app,
+        settings=settings,
+        plan_id="core-v4-partial-liquidity-recovery",
+        symbols=("005930", "000660"),
+    )
+
+    with app.state.db_session_factory() as session:
+        plan = session.scalar(
+            select(ExecutionPlan).options(selectinload(ExecutionPlan.items))
+        )
+        assert plan is not None
+        target = session.get(ExecutionPlanItem, entry_id)
+        assert target is not None
+        untouched = {
+            item.id: (
+                item.status,
+                deepcopy(item.quantity_policy),
+                item.trigger_price,
+            )
+            for item in plan.items
+            if item.id != target.id
+        }
+        target.status = "contract_quarantined"
+        plan.status = "manual_review_required"
+        session.add(
+            ExecutionPlanItemAudit(
+                execution_plan_item_id=target.id,
+                event_type="legacy_core_authority_quarantined",
+                source="kai-trading-exec",
+                occurred_at=datetime.now(UTC) + timedelta(seconds=1),
+                summary={
+                    "prior_status": "agent_delay",
+                    "protective_exits_preserved": True,
+                },
+                payload={
+                    "reason_code": "persisted_v4_contract_not_proven",
+                    "manual_review_required": False,
+                },
+            )
+        )
+        session.commit()
+
+    with app.state.db_session_factory() as session:
+        assert core_handoff_v4.reconcile_unproven_legacy_core_buy_authority(
+            db=session,
+            runtime_mode="paper",
+            settings=settings,
+        ) == 1
+
+    with app.state.db_session_factory() as session:
+        plan = session.scalar(
+            select(ExecutionPlan).options(selectinload(ExecutionPlan.items))
+        )
+        assert plan is not None
+        target = session.get(ExecutionPlanItem, entry_id)
+        assert target is not None
+        assert plan.status == "accepted"
+        assert target.status == "agent_delay"
+        assert {
+            item.id: (
+                item.status,
+                item.quantity_policy,
+                item.trigger_price,
+            )
+            for item in plan.items
+            if item.id != target.id
+        } == untouched
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    "unsafe_case",
+    [
+        "manual_review_status",
+        "unsafe_prior_status",
+        "mismatched_quarantine_audit",
+        "later_audit",
+        "aggregate_status_mismatch",
+        "unexpected_job",
+        "broker_order_exists",
+    ],
+)
+def test_liquidity_evidence_recovery_preserves_real_quarantine_cases(
+    unsafe_case: str,
+) -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        exec_agent_model="openai/gpt-5.6-sol",
+        kis_app_key="mock-key",
+        kis_app_secret="mock-secret",
+        kis_account_number="12345678",
+        kis_account_product_code="01",
+        account_drawdown_recovery_scope_secret=(
+            "core-v4-unsafe-recovery-secret-at-least-32-bytes"
+        ),
+    )
+    app, engine = _build_test_app(settings=settings)
+    entry_id = _create_approved_intraday_watch_plan(
+        app=app,
+        settings=settings,
+        plan_id=f"core-v4-liquidity-no-recovery-{unsafe_case}",
+    )
+    quarantine_at = datetime.now(UTC) + timedelta(seconds=1)
+
+    with app.state.db_session_factory() as session:
+        plan = session.scalar(
+            select(ExecutionPlan).options(selectinload(ExecutionPlan.items))
+        )
+        assert plan is not None
+        entry = session.get(ExecutionPlanItem, entry_id)
+        assert entry is not None
+        entry.status = (
+            "manual_review_required"
+            if unsafe_case == "manual_review_status"
+            else "contract_quarantined"
+        )
+        plan.status = (
+            "manual_review_required"
+            if unsafe_case == "aggregate_status_mismatch"
+            else entry.status
+        )
+        if unsafe_case == "unexpected_job":
+            session.add(
+                ExecutionJob(
+                    execution_plan_item_id=entry.id,
+                    job_type="intraday_watch_buy",
+                    status="queued",
+                )
+            )
+        summary = {
+            "prior_status": (
+                "agent_approved_pending_submit"
+                if unsafe_case == "unsafe_prior_status"
+                else "agent_delay"
+            ),
+            "protective_exits_preserved": True,
+        }
+        payload = {
+            "reason_code": (
+                "other_contract_failure"
+                if unsafe_case == "mismatched_quarantine_audit"
+                else "persisted_v4_contract_not_proven"
+            ),
+            "manual_review_required": (
+                unsafe_case == "manual_review_status"
+            ),
+        }
+        session.add(
+            ExecutionPlanItemAudit(
+                execution_plan_item_id=entry.id,
+                event_type="legacy_core_authority_quarantined",
+                source="kai-trading-exec",
+                occurred_at=quarantine_at,
+                summary=summary,
+                payload=payload,
+            )
+        )
+        if unsafe_case == "later_audit":
+            session.add(
+                ExecutionPlanItemAudit(
+                    execution_plan_item_id=entry.id,
+                    event_type="operator_review_requested",
+                    source="kai-trading-exec",
+                    occurred_at=quarantine_at + timedelta(seconds=1),
+                )
+            )
+        if unsafe_case == "broker_order_exists":
+            session.add(
+                BrokerOrder(
+                    execution_plan_item_id=entry.id,
+                    broker_name="kis",
+                    mode="paper",
+                    idempotency_key=f"unsafe-recovery:{entry.id}",
+                    symbol=entry.symbol,
+                    side="buy",
+                    status="failed",
+                    quantity=2,
+                    venue="KRX",
+                )
+            )
+        session.commit()
+
+    with app.state.db_session_factory() as session:
+        assert (
+            core_handoff_v4.reconcile_unproven_legacy_core_buy_authority(
+                db=session,
+                runtime_mode="paper",
+                settings=settings,
+            )
+            == 0
+        )
+
+    with app.state.db_session_factory() as session:
+        plan = session.scalar(
+            select(ExecutionPlan).options(selectinload(ExecutionPlan.items))
+        )
+        assert plan is not None
+        entry = session.get(ExecutionPlanItem, entry_id)
+        assert entry is not None
+        expected_status = (
+            "manual_review_required"
+            if unsafe_case == "manual_review_status"
+            else "contract_quarantined"
+        )
+        assert entry.status == expected_status
+        expected_plan_status = (
+            "manual_review_required"
+            if unsafe_case == "aggregate_status_mismatch"
+            else expected_status
+        )
+        assert plan.status == expected_plan_status
+        assert session.scalar(
+            select(ExecutionPlanItemAudit).where(
+                ExecutionPlanItemAudit.execution_plan_item_id == entry.id,
+                ExecutionPlanItemAudit.event_type
+                == "legacy_core_authority_quarantine_recovered",
+            )
+        ) is None
     engine.dispose()
 
 

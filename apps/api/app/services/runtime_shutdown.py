@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 import threading
 from typing import Any, Callable, TypeVar
 
@@ -13,6 +14,14 @@ _ResultT = TypeVar("_ResultT")
 
 class RuntimeCycleStopped(asyncio.CancelledError):
     """Signal that a worker belongs to a superseded runtime generation."""
+
+
+@dataclass
+class RuntimeCycleLease:
+    """One independently expirable unit of work within a runtime generation."""
+
+    generation: int
+    expired: bool = False
 
 
 class RuntimeCycleFence:
@@ -29,6 +38,16 @@ class RuntimeCycleFence:
             if self._stopping:
                 raise RuntimeCycleStopped("runtime shutdown is in progress")
             return self._generation
+
+    def capture_cycle_lease(self) -> RuntimeCycleLease:
+        with self._lock:
+            if self._stopping:
+                raise RuntimeCycleStopped("runtime shutdown is in progress")
+            return RuntimeCycleLease(generation=self._generation)
+
+    def expire_cycle_lease(self, lease: RuntimeCycleLease) -> None:
+        with self._lock:
+            lease.expired = True
 
     def begin_shutdown(self) -> None:
         with self._lock:
@@ -47,6 +66,7 @@ class RuntimeCycleFence:
             if generation is not None
             else getattr(self._thread_context, "generation", None)
         )
+        captured_lease = getattr(self._thread_context, "cycle_lease", None)
         with self._lock:
             outcome_persistence_allowed = any(
                 bool(getattr(self._thread_context, name, False))
@@ -58,6 +78,7 @@ class RuntimeCycleFence:
             )
             stale = not outcome_persistence_allowed and (
                 self._stopping
+                or bool(captured_lease is not None and captured_lease.expired)
                 or (
                     captured_generation is not None
                     and captured_generation != self._generation
@@ -71,8 +92,10 @@ class RuntimeCycleFence:
         generation: int,
         operation: Callable[..., _ResultT],
         *args: object,
+        lease: RuntimeCycleLease | None = None,
     ) -> _ResultT:
         previous_generation = getattr(self._thread_context, "generation", None)
+        previous_cycle_lease = getattr(self._thread_context, "cycle_lease", None)
         previous_flags = {
             name: getattr(self._thread_context, name, None)
             for name in (
@@ -82,6 +105,7 @@ class RuntimeCycleFence:
             )
         }
         self._thread_context.generation = generation
+        self._thread_context.cycle_lease = lease
         self._thread_context.broker_call_in_flight = False
         self._thread_context.broker_outcome_pending = False
         self._thread_context.commit_admitted = False
@@ -95,6 +119,11 @@ class RuntimeCycleFence:
                 del self._thread_context.generation
             else:
                 self._thread_context.generation = previous_generation
+            if previous_cycle_lease is None:
+                if hasattr(self._thread_context, "cycle_lease"):
+                    del self._thread_context.cycle_lease
+            else:
+                self._thread_context.cycle_lease = previous_cycle_lease
             for name, previous_value in previous_flags.items():
                 if previous_value is None:
                     if hasattr(self._thread_context, name):
@@ -123,10 +152,11 @@ class RuntimeCycleFence:
         )
         with self._lock:
             captured_generation = getattr(self._thread_context, "generation", None)
+            captured_lease = getattr(self._thread_context, "cycle_lease", None)
             if self._stopping or (
                 captured_generation is not None
                 and captured_generation != self._generation
-            ):
+            ) or bool(captured_lease is not None and captured_lease.expired):
                 raise RuntimeCycleStopped("runtime cycle superseded by shutdown")
             self._thread_context.broker_call_in_flight = True
         try:

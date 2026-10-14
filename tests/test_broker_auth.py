@@ -10139,6 +10139,9 @@ def test_watch_buy_clamps_budget_excess_to_max_safe_quantity() -> None:
     assert broker_adapter.order_calls[0].quantity == 1
     with app.state.db_session_factory() as session:
         item = session.get(ExecutionPlanItem, item_id)
+        assert item is not None
+        assert item.quantity_policy["quantity"] == 5
+        assert item.quantity_policy["max_safe_quantity"] == 1
         events = session.scalars(
             select(ExecutionPlanItemAudit).where(ExecutionPlanItemAudit.execution_plan_item_id == item_id)
         ).all()

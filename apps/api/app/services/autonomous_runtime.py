@@ -69,6 +69,7 @@ from app.services.runtime_shutdown import (
     CommitGuardedSessionFactory,
     GuardedBrokerAdapter,
     RuntimeCycleFence,
+    RuntimeCycleLease,
 )
 from app.services.trade_outcome_feedback import (
     REPORT_VERSION as TRADE_OUTCOME_FEEDBACK_VERSION,
@@ -368,6 +369,11 @@ class AutonomousRuntimeCoordinator:
     _watch_exec_agent_sizing_task: asyncio.Task[None] | None = field(default=None, init=False)
     _nxt_eligible_sync_task: asyncio.Task[None] | None = field(default=None, init=False)
     _inflight_cycles: set[asyncio.Future[Any]] = field(default_factory=set, init=False)
+    _cycle_leases: dict[asyncio.Future[Any], RuntimeCycleLease] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+    )
     _lifecycle_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False)
     _stopping: bool = field(default=False, init=False)
     _shutdown_fence: RuntimeCycleFence = field(
@@ -741,6 +747,10 @@ class AutonomousRuntimeCoordinator:
         if done:
             return task.result()
 
+        lease = self._cycle_leases.get(task)
+        if lease is not None:
+            self._shutdown_fence.expire_cycle_lease(lease)
+
         timeout_seconds = self.settings.monitoring_cycle_timeout_seconds
         timeout_error = f"cycle timed out after {timeout_seconds:g}s"
         timeout_payload: dict[str, object] = {
@@ -864,7 +874,19 @@ class AutonomousRuntimeCoordinator:
         )
 
     async def _run_monitoring_cycle(self, started_at: datetime) -> dict[str, object]:
-        return await self._run_in_thread(self._monitoring_cycle_sync_guarded, started_at)
+        lease = self._shutdown_fence.capture_cycle_lease()
+        task = asyncio.current_task()
+        if task is not None:
+            self._cycle_leases[task] = lease
+        try:
+            return await self._run_in_thread(
+                self._monitoring_cycle_sync_guarded,
+                started_at,
+                lease=lease,
+            )
+        finally:
+            if task is not None:
+                self._cycle_leases.pop(task, None)
 
     def _monitoring_cycle_sync_guarded(self, started_at: datetime) -> dict[str, object]:
         acquired_lock = self._monitoring_cycle_mutex
@@ -930,10 +952,15 @@ class AutonomousRuntimeCoordinator:
         self,
         cycle: Callable[..., _CycleResult],
         *args: object,
+        lease: RuntimeCycleLease | None = None,
     ) -> _CycleResult:
         if self._stopping:
             raise asyncio.CancelledError
-        generation = self._shutdown_fence.capture_generation()
+        generation = (
+            lease.generation
+            if lease is not None
+            else self._shutdown_fence.capture_generation()
+        )
         task = self._track_inflight_cycle(
             asyncio.create_task(
                 asyncio.to_thread(
@@ -941,6 +968,7 @@ class AutonomousRuntimeCoordinator:
                     generation,
                     cycle,
                     *args,
+                    lease=lease,
                 )
             )
         )
@@ -1310,7 +1338,7 @@ class AutonomousRuntimeCoordinator:
                     adapter=adapter,
                     prices=[],
                     symbols=symbols,
-                    auth_session_factory=self.session_factory,
+                    auth_session_factory=self._cycle_session_factory,
                     now=started_at,
                 )
             with self._lock:
@@ -1415,7 +1443,7 @@ class AutonomousRuntimeCoordinator:
                     adapter=adapter,
                     prices=prices,
                     symbols=symbols,
-                    auth_session_factory=self.session_factory,
+                    auth_session_factory=self._cycle_session_factory,
                     now=started_at,
                     quote_freshness_at=evaluated_at,
                 )
@@ -1877,7 +1905,7 @@ class AutonomousRuntimeCoordinator:
         krx_trading_day = _krx_trading_day_resolver(
             settings=self.settings,
             adapter=adapter,
-            auth_session_factory=self.session_factory,
+            auth_session_factory=self._cycle_session_factory,
         )
         with self._cycle_session_factory() as db:
             positions_by_symbol = _load_positions_by_symbol(

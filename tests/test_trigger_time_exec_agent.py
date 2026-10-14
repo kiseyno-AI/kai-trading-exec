@@ -7,6 +7,7 @@ from pathlib import Path
 import subprocess
 from threading import Event, Thread
 import time
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 from fastapi.testclient import TestClient
@@ -5661,6 +5662,80 @@ def test_trigger_time_account_snapshot_freshness_blocks_before_agent_call(
         assert interaction["request_payload"]["account_context"]["available"] is False
         assert interaction["request_payload"]["account_context"]["reason"] == expected_reason
     engine.dispose()
+
+
+def test_account_snapshot_freshness_uses_post_auth_and_fetch_logical_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reference_at = datetime(2026, 10, 14, 0, 30, tzinfo=UTC)
+    monotonic_ticks = iter((100.0, 102.0, 104.0))
+    monkeypatch.setattr(
+        trigger_time_exec_agent,
+        "_monotonic_seconds",
+        lambda: next(monotonic_ticks),
+        raising=False,
+    )
+
+    def authenticate(**_kwargs: object) -> SimpleNamespace:
+        # Consume logical time inside authentication so the regression proves
+        # that token-refresh latency is included, not only the snapshot RPC.
+        trigger_time_exec_agent._monotonic_seconds()
+        return SimpleNamespace(access_token="token")
+
+    monkeypatch.setattr(
+        trigger_time_exec_agent,
+        "ensure_authenticated_broker_session",
+        authenticate,
+    )
+
+    class Adapter:
+        provider = "kis"
+
+        def get_account_snapshot(
+            self,
+            _access_token: str,
+            **_kwargs: object,
+        ) -> BrokerAccountSnapshot:
+            return BrokerAccountSnapshot(
+                available_cash=Decimal("1000000"),
+                buying_power=Decimal("1000000"),
+                observed_at=reference_at + timedelta(seconds=3),
+                source="stub:post_fetch_account_snapshot",
+            )
+
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        account_drawdown_recovery_max_snapshot_future_skew_seconds=0,
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    try:
+        with session_factory() as session:
+            payload = trigger_time_exec_agent._load_account_context(
+                settings=settings,
+                db=session,
+                adapter=Adapter(),  # type: ignore[arg-type]
+                item=ExecutionPlanItem(
+                    execution_plan_id="plan-post-fetch-snapshot",
+                    symbol="005930",
+                    side="buy",
+                    intent="intraday_watch_buy",
+                    provider="kis",
+                    asset_class="stock",
+                    risk_context={"exchange": "KRX"},
+                ),
+                observed_price=Decimal("71000"),
+                observed_at=reference_at,
+            )
+
+        assert payload["available"] is True
+        assert payload["observed_at"] == (
+            reference_at + timedelta(seconds=3)
+        ).isoformat()
+    finally:
+        engine.dispose()
 
 
 def test_trigger_time_account_context_excludes_foreign_local_open_orders() -> None:

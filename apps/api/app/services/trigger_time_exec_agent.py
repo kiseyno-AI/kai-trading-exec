@@ -6,6 +6,7 @@ import os
 import signal
 import subprocess
 import tempfile
+import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
@@ -1297,6 +1298,7 @@ def _load_account_context(
     observed_price: Decimal | None,
     observed_at: datetime,
 ) -> dict[str, object]:
+    account_context_started = _monotonic_seconds()
     try:
         session_state = ensure_authenticated_broker_session(
             settings=settings,
@@ -1314,6 +1316,9 @@ def _load_account_context(
                 else None
             ),
             exchange=_plan_item_exchange(item),
+        )
+        snapshot_evaluated_at = _normalize_utc(observed_at) + timedelta(
+            seconds=max(0.0, _monotonic_seconds() - account_context_started)
         )
     except (BrokerAdapterError, AttributeError, NotImplementedError, RuntimeError, ValueError, TypeError) as exc:
         return {
@@ -1344,7 +1349,7 @@ def _load_account_context(
         snapshot=snapshot,
         provider=adapter.provider,
         exchange=_plan_item_exchange(item),
-        observed_at=observed_at,
+        observed_at=snapshot_evaluated_at,
     )
 
 
@@ -2376,6 +2381,10 @@ def _normalize_utc(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=UTC)
     return value.astimezone(UTC)
+
+
+def _monotonic_seconds() -> float:
+    return time.monotonic()
 
 
 def _decimal_text(value: Decimal | None) -> str | None:
