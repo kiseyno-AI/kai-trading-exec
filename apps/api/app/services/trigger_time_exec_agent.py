@@ -81,6 +81,11 @@ _KIS_INTRADAY_ENDPOINT = (
     "/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice"
 )
 _KIS_INTRADAY_TR_ID = "FHKST03010200"
+_KIS_CURRENT_PRICE_ENDPOINT = "/uapi/domestic-stock/v1/quotations/inquire-price"
+_KIS_CURRENT_PRICE_TR_ID = "FHKST01010100"
+_KIS_DAY_RANGE_BINDING = (
+    "same_symbol_monotonic_cumulative_totals_and_containing_minute_range"
+)
 AGENT_ACTIVE_STATUSES = AGENT_ACTIVE_MONITORING_STATUSES
 ACTIVE_PEER_MONITORING_STATUSES = (
     ACTIVE_SELL_MONITORING_STATUSES | ACTIVE_WATCH_MONITORING_STATUSES
@@ -956,6 +961,9 @@ def _market_context(
             evidence["provider_source"] = source.get("source")
             evidence["endpoint"] = source.get("endpoint")
             evidence["tr_id"] = source.get("tr_id")
+            evidence["bound_endpoint"] = source.get("bound_endpoint")
+            evidence["bound_tr_id"] = source.get("bound_tr_id")
+            evidence["binding"] = source.get("binding")
             field_observed_at = _strict_utc_datetime(source.get("observed_at"))
             evidence["age_seconds"] = (
                 (normalized_triggered_at - field_observed_at).total_seconds()
@@ -2247,12 +2255,23 @@ def _live_buy_field_evidence_reason(
     source = evidence.get("source")
     provider_source = evidence.get("provider_source")
     if field in {"volume", "turnover", "day_high", "day_low"}:
-        if (
-            source != _KIS_INTRADAY_FRESHNESS_SOURCE
-            or provider_source != "broker_intraday_liquidity_snapshot"
-            or evidence.get("endpoint") != _KIS_INTRADAY_ENDPOINT
-            or evidence.get("tr_id") != _KIS_INTRADAY_TR_ID
-        ):
+        trusted_intraday_source = bool(
+            source == _KIS_INTRADAY_FRESHNESS_SOURCE
+            and provider_source == "broker_intraday_liquidity_snapshot"
+            and evidence.get("endpoint") == _KIS_INTRADAY_ENDPOINT
+            and evidence.get("tr_id") == _KIS_INTRADAY_TR_ID
+        )
+        trusted_bound_day_range_source = bool(
+            field in {"day_high", "day_low"}
+            and source == _KIS_INTRADAY_FRESHNESS_SOURCE
+            and provider_source == "broker_intraday_liquidity_snapshot"
+            and evidence.get("endpoint") == _KIS_CURRENT_PRICE_ENDPOINT
+            and evidence.get("tr_id") == _KIS_CURRENT_PRICE_TR_ID
+            and evidence.get("bound_endpoint") == _KIS_INTRADAY_ENDPOINT
+            and evidence.get("bound_tr_id") == _KIS_INTRADAY_TR_ID
+            and evidence.get("binding") == _KIS_DAY_RANGE_BINDING
+        )
+        if not trusted_intraday_source and not trusted_bound_day_range_source:
             return f"{field} evidence source identity is not trusted"
     elif (
         source != _KIS_ORDERBOOK_FRESHNESS_SOURCE

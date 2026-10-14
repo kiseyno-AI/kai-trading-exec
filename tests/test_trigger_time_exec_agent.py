@@ -5375,6 +5375,34 @@ def test_trigger_time_liquidity_refresh_retries_one_empty_snapshot_then_uses_fre
                 "/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice"
             ),
             "tr_id": "FHKST03010200",
+            "field_sources": {
+                "day_high": {
+                    "endpoint": "/uapi/domestic-stock/v1/quotations/inquire-price",
+                    "tr_id": "FHKST01010100",
+                    "bound_endpoint": (
+                        "/uapi/domestic-stock/v1/quotations/"
+                        "inquire-time-itemchartprice"
+                    ),
+                    "bound_tr_id": "FHKST03010200",
+                    "binding": (
+                        "same_symbol_monotonic_cumulative_totals_and_"
+                        "containing_minute_range"
+                    ),
+                },
+                "day_low": {
+                    "endpoint": "/uapi/domestic-stock/v1/quotations/inquire-price",
+                    "tr_id": "FHKST01010100",
+                    "bound_endpoint": (
+                        "/uapi/domestic-stock/v1/quotations/"
+                        "inquire-time-itemchartprice"
+                    ),
+                    "bound_tr_id": "FHKST03010200",
+                    "binding": (
+                        "same_symbol_monotonic_cumulative_totals_and_"
+                        "containing_minute_range"
+                    ),
+                },
+            },
         },
     )
 
@@ -5430,6 +5458,21 @@ def test_trigger_time_liquidity_refresh_retries_one_empty_snapshot_then_uses_fre
     assert merged_price.provenance["intraday_liquidity"][
         "refresh_attempt_count"
     ] == 2
+    assert merged_price.provenance["field_sources"]["day_high"] == {
+        "source": "broker_intraday_liquidity_snapshot",
+        "freshness_source": "kis_exchange_intraday_minute_time",
+        "observed_at": reference_at.isoformat(),
+        "endpoint": "/uapi/domestic-stock/v1/quotations/inquire-price",
+        "tr_id": "FHKST01010100",
+        "refresh_attempt_count": 2,
+        "bound_endpoint": (
+            "/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice"
+        ),
+        "bound_tr_id": "FHKST03010200",
+        "binding": (
+            "same_symbol_monotonic_cumulative_totals_and_containing_minute_range"
+        ),
+    }
 
 
 def test_trigger_time_liquidity_refresh_never_retries_validation_even_if_flagged_retryable(

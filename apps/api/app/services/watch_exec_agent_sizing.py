@@ -96,7 +96,7 @@ WATCH_EXEC_AGENT_BINDING_VERSION = "watch-exec-agent-binding-v2"
 SERVER_EFFECTIVE_STOP_POLICY_VERSION = "server_effective_stop_v1"
 WATCH_EXEC_AGENT_DEFER_KEY = "watch_exec_agent_deferred"
 WATCH_EXEC_AGENT_DEFER_SECONDS = 300
-WATCH_EXEC_AGENT_PRICE_WATCH_DEFER_SECONDS = 300
+WATCH_EXEC_AGENT_PRICE_WATCH_DEFER_SECONDS = 60
 RETRYABLE_REJECTION_REASON_CODES = frozenset({
     "trigger_confirmation_and_cost_evidence_missing",
     "trigger_confirmation_missing",
@@ -681,6 +681,15 @@ def _inside_sizing_window(*, settings: Settings, now: datetime) -> bool:
     )
 
 
+def _price_watch_defer_seconds(settings: Settings) -> float:
+    """Wake price-dependent RR candidates on the next sizing-loop cycle."""
+
+    return min(
+        float(WATCH_EXEC_AGENT_PRICE_WATCH_DEFER_SECONDS),
+        max(1.0, float(settings.exec_agent_watch_sizing_loop_interval_seconds)),
+    )
+
+
 def _utc_datetime(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=UTC)
@@ -1180,7 +1189,7 @@ def _reopen_price_watch_terminal_rejections(
 
         retry_after = min(
             checked_at
-            + timedelta(seconds=WATCH_EXEC_AGENT_PRICE_WATCH_DEFER_SECONDS),
+            + timedelta(seconds=_price_watch_defer_seconds(settings)),
             expires_at,
         )
         next_context = dict(risk_context)
@@ -1484,6 +1493,19 @@ def _watch_exec_agent_defer_is_active(
         # candidate selection until the expiry sweep persists ``watch_expired``.
         return True
     retry_after = _strict_aware_datetime(deferred.get("retry_after"))
+    deferred_at = _strict_aware_datetime(deferred.get("deferred_at"))
+    if (
+        deferred.get("reason_family") == "reward_risk"
+        and expires_at is not None
+        and deferred_at is not None
+        and retry_after is not None
+        and retry_after - deferred_at
+        > timedelta(seconds=WATCH_EXEC_AGENT_PRICE_WATCH_DEFER_SECONDS)
+    ):
+        # Older rows were persisted with five-minute or next-session defers.
+        # Make them eligible on the first sizing cycle after this policy ships;
+        # new rows already carry the configured loop cadence in retry_after.
+        retry_after = deferred_at + timedelta(seconds=1)
     return retry_after is not None and retry_after > checked_at
 
 
@@ -3698,8 +3720,13 @@ def _apply_decisions(
                 "reason_family": reason_family,
             }
             if disposition in {"retry", "defer"}:
+                defer_seconds = (
+                    _price_watch_defer_seconds(settings)
+                    if price_watch_expires_at is not None
+                    else WATCH_EXEC_AGENT_DEFER_SECONDS
+                )
                 retry_after = decision_at + timedelta(
-                    seconds=WATCH_EXEC_AGENT_DEFER_SECONDS
+                    seconds=defer_seconds
                 )
                 if price_watch_expires_at is not None:
                     retry_after = min(retry_after, price_watch_expires_at)

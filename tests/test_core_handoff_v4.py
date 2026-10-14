@@ -2464,7 +2464,7 @@ def test_v4_mixed_terminal_rejects_do_not_quarantine_retryable_deferred_sibling(
         "reason_family": "reward_risk",
         "rejection_disposition": "defer",
         "reason": "reward/risk must be recalculated on a fresh quote",
-        "retry_after": "2026-09-09T23:35:00+00:00",
+        "retry_after": "2026-09-09T23:31:00+00:00",
     }
     engine.dispose()
 

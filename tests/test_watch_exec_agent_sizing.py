@@ -462,6 +462,7 @@ def test_price_dependent_reward_risk_defer_remains_monitored_after_attempt_cap()
         runtime_mode="live",
         exec_agent_min_reward_risk=Decimal("1.8"),
         exec_agent_watch_sizing_max_attempts=2,
+        exec_agent_watch_sizing_loop_interval_seconds=30,
     )
     item = _watch_item(
         risk_context={
@@ -527,7 +528,7 @@ def test_price_dependent_reward_risk_defer_remains_monitored_after_attempt_cap()
     assert deferred["attempt_count"] == 2
     assert deferred["max_attempts"] == 2
     assert deferred["price_watch_only"] is True
-    assert deferred["retry_after"] == "2026-06-04T00:10:00+00:00"
+    assert deferred["retry_after"] == "2026-06-04T00:05:30+00:00"
     assert deferred["expires_at"] == "2026-06-04T06:30:00+00:00"
     assert item.risk_context["reward_risk_max_entry_price"] == "6515.5805"
 
@@ -648,7 +649,7 @@ def test_reopens_legacy_price_watch_only_when_cap_matches_direction(
             assert eligible.quantity_policy == original_policy
             deferred = eligible.risk_context[watch_sizing.WATCH_EXEC_AGENT_DEFER_KEY]
             assert deferred["price_watch_only"] is True
-            assert deferred["retry_after"] == "2026-10-14T01:05:00+00:00"
+            assert deferred["retry_after"] == "2026-10-14T01:01:00+00:00"
             assert deferred["expires_at"] == "2026-10-14T06:30:00+00:00"
             assert eligible.risk_context["reward_risk_max_entry_price"] == "6657.2237"
         assert structural.status == "exec_agent_rejected"
@@ -1556,6 +1557,29 @@ def test_watch_exec_agent_defer_expires() -> None:
     assert not watch_sizing._watch_exec_agent_defer_is_active(
         item,
         now=now + timedelta(minutes=6),
+    )
+
+
+def test_legacy_long_reward_risk_defer_reopens_on_next_sizing_cycle() -> None:
+    now = datetime(2026, 10, 14, 5, 0, tzinfo=UTC)
+    item = ExecutionPlanItem(
+        risk_context={
+            watch_sizing.WATCH_EXEC_AGENT_DEFER_KEY: {
+                "reason_family": "reward_risk",
+                "deferred_at": now.isoformat(),
+                "retry_after": (now + timedelta(minutes=5)).isoformat(),
+                "expires_at": (now + timedelta(hours=1)).isoformat(),
+            }
+        }
+    )
+
+    assert watch_sizing._watch_exec_agent_defer_is_active(
+        item,
+        now=now + timedelta(milliseconds=500),
+    )
+    assert not watch_sizing._watch_exec_agent_defer_is_active(
+        item,
+        now=now + timedelta(seconds=2),
     )
 
 

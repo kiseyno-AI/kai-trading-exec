@@ -5881,7 +5881,7 @@ def _merge_trigger_time_liquidity_snapshot(
     assert isinstance(snapshot, BrokerIntradayLiquiditySnapshot)
     observed_at = _normalize_utc(snapshot.observed_at)
     payload = snapshot.payload if isinstance(snapshot.payload, dict) else {}
-    field_source = {
+    default_field_source = {
         "source": "broker_intraday_liquidity_snapshot",
         "freshness_source": snapshot.freshness_source,
         "observed_at": observed_at.isoformat(),
@@ -5889,13 +5889,30 @@ def _merge_trigger_time_liquidity_snapshot(
         "tr_id": payload.get("tr_id"),
         "refresh_attempt_count": attempt_count,
     }
+    payload_field_sources = payload.get("field_sources")
     provenance = dict(price.provenance or {})
     field_sources = dict(provenance.get("field_sources") or {})
     for field in ("volume", "turnover", "day_high", "day_low"):
-        field_sources[field] = dict(field_source)
+        field_source = dict(default_field_source)
+        raw_field_source = (
+            payload_field_sources.get(field)
+            if isinstance(payload_field_sources, dict)
+            else None
+        )
+        if isinstance(raw_field_source, dict):
+            for key in (
+                "endpoint",
+                "tr_id",
+                "bound_endpoint",
+                "bound_tr_id",
+                "binding",
+            ):
+                if raw_field_source.get(key) is not None:
+                    field_source[key] = raw_field_source[key]
+        field_sources[field] = field_source
     provenance["field_sources"] = field_sources
     provenance["intraday_liquidity"] = {
-        **field_source,
+        **default_field_source,
         "symbol": snapshot.symbol,
         "exchange": snapshot.exchange,
     }

@@ -123,6 +123,68 @@ def _market_context(
     )
 
 
+@pytest.mark.parametrize("field", ["day_high", "day_low"])
+@pytest.mark.parametrize(
+    ("tamper_key", "tamper_value"),
+    [
+        ("bound_endpoint", None),
+        ("bound_tr_id", "WRONG"),
+        ("binding", None),
+    ],
+)
+def test_bound_current_price_day_range_keeps_exact_intraday_freshness_proof(
+    field: str,
+    tamper_key: str,
+    tamper_value: str | None,
+) -> None:
+    item = ExecutionPlanItem(
+        symbol="005930",
+        side="buy",
+        intent="intraday_watch_buy",
+        provider="kis",
+        asset_class="stock",
+    )
+    evidence = {
+        "available": True,
+        "source": "kis_exchange_intraday_minute_time",
+        "provider_source": "broker_intraday_liquidity_snapshot",
+        "observed_at": EVALUATED_AT.isoformat(),
+        "endpoint": "/uapi/domestic-stock/v1/quotations/inquire-price",
+        "tr_id": "FHKST01010100",
+        "bound_endpoint": (
+            "/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice"
+        ),
+        "bound_tr_id": "FHKST03010200",
+        "binding": (
+            "same_symbol_monotonic_cumulative_totals_and_containing_minute_range"
+        ),
+    }
+
+    assert (
+        trigger_time_exec_agent._live_buy_field_evidence_reason(
+            settings=Settings(runtime_mode="live"),
+            item=item,
+            field=field,
+            evidence=evidence,
+            evaluated_at=EVALUATED_AT,
+        )
+        is None
+    )
+
+    tampered_evidence = dict(evidence)
+    if tamper_value is None:
+        tampered_evidence.pop(tamper_key)
+    else:
+        tampered_evidence[tamper_key] = tamper_value
+    assert trigger_time_exec_agent._live_buy_field_evidence_reason(
+        settings=Settings(runtime_mode="live"),
+        item=item,
+        field=field,
+        evidence=tampered_evidence,
+        evaluated_at=EVALUATED_AT,
+    ) == f"{field} evidence source identity is not trusted"
+
+
 def _core_live_breadth_context(
     *,
     up_count: int,
