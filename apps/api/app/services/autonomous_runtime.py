@@ -1047,9 +1047,11 @@ class AutonomousRuntimeCoordinator:
             "trade_outcome_feedback": feedback_status,
             **result.payload,
         }
-        if int(payload.get("approved") or 0) > 0 or int(
-            payload.get("rejected") or 0
-        ) > 0:
+        if (
+            int(payload.get("approved") or 0) > 0
+            or int(payload.get("rejected") or 0) > 0
+            or bool(payload.get("price_watch_reopened_item_ids"))
+        ):
             self.invalidate_monitoring_runtime_snapshot(
                 reason="watch_exec_agent_sizing_changed_plan_items"
             )

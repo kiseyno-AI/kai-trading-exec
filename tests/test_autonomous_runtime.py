@@ -250,6 +250,54 @@ def test_watch_sizing_cycle_refreshes_trade_feedback_before_agent_sizing(
     assert payload["trade_outcome_feedback"]["status"] == "generated"
 
 
+def test_watch_sizing_cycle_invalidates_monitoring_snapshot_after_price_watch_reopen(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'watch-reopen-runtime.db'}",
+        runtime_mode="paper",
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    coordinator = AutonomousRuntimeCoordinator(
+        settings=settings,
+        session_factory=session_factory,
+        broker_adapter_factory=lambda settings: None,  # type: ignore[arg-type,return-value]
+    )
+    invalidations: list[str] = []
+
+    monkeypatch.setattr(
+        autonomous_runtime,
+        "ensure_fresh_trade_outcome_feedback",
+        lambda **_: {"status": "fresh", "version": "trade-outcome-feedback-v2"},
+    )
+    monkeypatch.setattr(
+        autonomous_runtime,
+        "run_due_watch_exec_agent_sizing",
+        lambda **_: SimpleNamespace(
+            status_code=200,
+            payload={
+                "idle": False,
+                "reason": "price_watch_candidates_reopened",
+                "price_watch_reopened_item_ids": ["item-1"],
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        coordinator,
+        "invalidate_monitoring_runtime_snapshot",
+        lambda *, reason: invalidations.append(reason),
+    )
+
+    coordinator._watch_exec_agent_sizing_cycle_sync(
+        datetime(2026, 6, 12, 0, 1, tzinfo=UTC)
+    )
+
+    assert invalidations == ["watch_exec_agent_sizing_changed_plan_items"]
+
+
 def test_watch_sizing_cycle_skips_database_feedback_outside_window(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
