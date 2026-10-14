@@ -73,6 +73,7 @@ from app.services.monitoring import (
     _monitoring_item_is_effective_at,
     _symbols_with_recent_flat_position_truth,
     _symbols_with_unexited_buy_orders,
+    _watch_buy_item_is_quote_monitorable,
     resolve_monitoring_symbol_cycle_limit,
 )
 from app.services.trigger_time_exec_agent import (
@@ -83,6 +84,7 @@ from app.services.trigger_time_exec_agent import (
 )
 from app.services.runtime_transitions import (
     ACTIVE_SELL_MONITORING_STATUSES,
+    LIVE_WATCH_ENTRY_STATUSES,
     WATCH_SIZING_PENDING_STATUS,
 )
 from app.services.broker_auth import build_broker_adapter, build_broker_session_summary
@@ -2759,7 +2761,7 @@ def runtime_monitored_symbols(
     active_watch_filter = and_(
         ExecutionPlanItem.side == "buy",
         ExecutionPlanItem.intent.in_(WATCH_BUY_INTENTS),
-        ExecutionPlanItem.status.in_(tuple(ACTIVE_WATCH_MONITORING_STATUSES)),
+        ExecutionPlanItem.status.in_(tuple(LIVE_WATCH_ENTRY_STATUSES)),
     )
     standard_monitored_filter = (
         active_watch_filter
@@ -2837,6 +2839,8 @@ def runtime_monitored_symbols(
                 effective_at=effective_at,
             )
         ):
+            continue
+        if item.side == "buy" and not _watch_buy_item_is_quote_monitorable(item):
             continue
         exchange = _active_runtime_plan_item_exchange(
             settings=settings,
