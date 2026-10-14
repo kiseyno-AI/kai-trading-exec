@@ -1416,7 +1416,8 @@ class AutonomousRuntimeCoordinator:
                     prices=prices,
                     symbols=symbols,
                     auth_session_factory=self.session_factory,
-                    now=evaluated_at,
+                    now=started_at,
+                    quote_freshness_at=evaluated_at,
                 )
             reported_rearm_symbols = result.payload.get("rearmed_sell_symbols")
             confirmed_rearm_symbols = {

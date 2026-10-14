@@ -1123,15 +1123,18 @@ def run_autonomous_monitoring_cycle(
     symbols: list[str] | set[str] | None = None,
     auth_session_factory: sessionmaker[Session] | None = None,
     now: datetime | None = None,
+    quote_freshness_at: datetime | None = None,
 ) -> EvaluateMonitoringResult:
     symbol_scope = _ordered_symbol_scope(symbols)
+    triggered_at = _normalize_utc(now or datetime.now(UTC))
     return _evaluate_monitoring_cycle(
         settings=settings,
         db=db,
         adapter=adapter,
         prices={price.symbol: price for price in (prices or [])},
         symbols=symbol_scope or None,
-        triggered_at=_normalize_utc(now or datetime.now(UTC)),
+        triggered_at=triggered_at,
+        quote_freshness_at=_normalize_utc(quote_freshness_at or triggered_at),
         allow_persisted_triggered_without_price=True,
         update_checkpoint_if_idle=False,
         krx_trading_day=_krx_trading_day_resolver(
@@ -2535,6 +2538,7 @@ def _evaluate_monitoring_cycle(
     prices: dict[str, MonitoringPriceRequest],
     symbols: list[str] | set[str] | None = None,
     triggered_at: datetime,
+    quote_freshness_at: datetime | None = None,
     allow_persisted_triggered_without_price: bool,
     update_checkpoint_if_idle: bool,
     krx_trading_day: Callable[[date], bool | None] | None = None,
@@ -2882,7 +2886,7 @@ def _evaluate_monitoring_cycle(
             quote_stale_reason = _quote_stale_reason(
                 settings=settings,
                 price=price,
-                cycle_at=triggered_at,
+                cycle_at=quote_freshness_at or triggered_at,
             )
             quote_trust_reason = _live_automated_quote_trust_reason(
                 settings=settings,

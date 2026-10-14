@@ -3045,6 +3045,7 @@ def test_due_cached_max_holding_exit_reaches_db_backed_monitoring_cycle(
     coordinator._monitoring_runtime_snapshot = snapshot
     db_calls: list[list[str]] = []
     db_evaluated_at: list[datetime] = []
+    quote_freshness_at: list[datetime] = []
 
     class DummySessionContext:
         def __enter__(self):
@@ -3072,6 +3073,7 @@ def test_due_cached_max_holding_exit_reaches_db_backed_monitoring_cycle(
         lambda **kwargs: (
             db_calls.append(list(kwargs["symbols"]))
             or db_evaluated_at.append(kwargs["now"])
+            or quote_freshness_at.append(kwargs["quote_freshness_at"])
             or SimpleNamespace(
                 status_code=200,
                 payload={
@@ -3091,7 +3093,8 @@ def test_due_cached_max_holding_exit_reaches_db_backed_monitoring_cycle(
     payload = coordinator._monitoring_cycle_sync(started_at)
 
     assert db_calls == [["005930"]]
-    assert db_evaluated_at[0] > started_at
+    assert db_evaluated_at == [started_at]
+    assert quote_freshness_at[0] > started_at
     assert payload["db_evaluation_symbols"] == ["005930"]
     assert payload["broker_action_symbols"] == []
 
