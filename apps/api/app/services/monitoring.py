@@ -14252,16 +14252,17 @@ def _watch_buy_payload_is_quote_monitorable(
     delegated_sizing = is_exec_agent_sizing_policy(
         quantity_policy if isinstance(quantity_policy, dict) else None
     )
-    if normalized_status in ACTIVE_WATCH_MONITORING_STATUSES:
-        return not delegated_sizing
-    if normalized_status != WATCH_SIZING_PENDING_STATUS or not delegated_sizing:
-        return False
     context = risk_context if isinstance(risk_context, dict) else {}
     deferred = context.get("watch_exec_agent_deferred")
-    return bool(
+    price_watch_only = bool(
         isinstance(deferred, dict)
         and deferred.get("price_watch_only") is True
     )
+    if normalized_status in ACTIVE_WATCH_MONITORING_STATUSES:
+        return not delegated_sizing or price_watch_only
+    if normalized_status != WATCH_SIZING_PENDING_STATUS or not delegated_sizing:
+        return False
+    return price_watch_only
 
 
 def _watch_buy_item_is_quote_monitorable(item: ExecutionPlanItem) -> bool:
