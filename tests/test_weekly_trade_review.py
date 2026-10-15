@@ -32,6 +32,7 @@ from app.services.weekly_trade_review import (
     _weekly_closed_trades,
     _weekly_fill_attribution_coverage,
     _weekly_fills,
+    _weekly_learning_evidence,
     load_weekly_trade_review_artifact,
     _monitoring_checkpoints,
     _plan_item_review_summary,
@@ -75,6 +76,40 @@ def _assert_mapping_contains(actual: object, expected: dict[str, object]) -> Non
             _assert_mapping_contains(actual[key], expected_value)
         else:
             assert actual[key] == expected_value
+
+
+def test_weekly_failure_learning_requires_complete_lineage() -> None:
+    evidence = _weekly_learning_evidence(
+        fill_attribution_coverage={"status": "empty"},
+        realized_pnl_coverage={"status": "complete"},
+        realized_pnl_summary={
+            "transaction_cost_coverage": "complete",
+            "currency_coverage": "complete",
+        },
+        closed_trades=[],
+        weekly_order_status_counts=[{"side": "buy", "status": "rejected", "count": 1}],
+        execution_failures=[
+            {
+                "execution_plan_item_id": "item-1",
+                "strategy_run_id": "run-1",
+                "decision_actor": "signal-decider",
+                "status": "open",
+                "classification": "broker_rejected",
+                "retryable": False,
+            }
+        ],
+        truncated={
+            "fills": False,
+            "weekly_orders": False,
+            "execution_failures": False,
+            "closed_trades": False,
+        },
+    )
+
+    feedback = evidence["failure_and_rejection_feedback"]
+    assert feedback["status"] == "complete"
+    assert feedback["consumer_eligible"] is True
+    assert feedback["blocked_reasons"] == []
 
 
 def test_plan_item_review_does_not_present_terminal_jobs_as_active_next_open_work() -> None:
@@ -776,6 +811,15 @@ def test_weekly_trade_review_exports_bounded_read_only_artifact(tmp_path) -> Non
     assert report["learning_evidence"]["failure_and_rejection_feedback"][
         "execution_failure_count"
     ] == 1
+    assert report["learning_evidence"]["failure_and_rejection_feedback"][
+        "lineage_missing_execution_failure_count"
+    ] == 1
+    assert report["learning_evidence"]["failure_and_rejection_feedback"][
+        "consumer_eligible"
+    ] is False
+    assert "incomplete_execution_failure_lineage" in report["learning_evidence"][
+        "failure_and_rejection_feedback"
+    ]["blocked_reasons"]
     assert report["counts"]["linked_broker_order_count"] == 2
     assert report["counts"]["linked_broker_order_event_count"] == 1
     assert report["counts"]["execution_failure_count"] == 1

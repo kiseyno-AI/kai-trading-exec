@@ -616,6 +616,23 @@ def _weekly_learning_evidence(
     failure_evidence_truncated = bool(
         truncated.get("weekly_orders") or truncated.get("execution_failures")
     )
+    failure_feedback_blocked_reasons: list[str] = []
+    if failure_evidence_truncated:
+        failure_feedback_blocked_reasons.append("source_rows_truncated")
+    if execution_failures and failure_rows_with_lineage != len(execution_failures):
+        failure_feedback_blocked_reasons.append(
+            "incomplete_execution_failure_lineage"
+        )
+    if terminal_order_outcomes and not execution_failures:
+        failure_feedback_blocked_reasons.append(
+            "normalized_execution_failure_evidence_missing"
+        )
+    failure_feedback_has_data = bool(execution_failures or terminal_order_outcomes)
+    failure_feedback_eligible = (
+        failure_feedback_has_data
+        and not failure_feedback_blocked_reasons
+        and bool(execution_failures)
+    )
     return {
         "schema_version": WEEKLY_LEARNING_EVIDENCE_SCHEMA_VERSION,
         "performance_feedback": {
@@ -645,10 +662,16 @@ def _weekly_learning_evidence(
             "status": (
                 "truncated"
                 if failure_evidence_truncated
-                else ("complete" if execution_failures or terminal_order_outcomes else "no_data")
+                else (
+                    "complete"
+                    if failure_feedback_eligible
+                    else "blocked"
+                    if failure_feedback_has_data
+                    else "no_data"
+                )
             ),
-            "consumer_eligible": not failure_evidence_truncated
-            and bool(execution_failures or terminal_order_outcomes),
+            "consumer_eligible": failure_feedback_eligible,
+            "blocked_reasons": failure_feedback_blocked_reasons,
             "execution_failure_count": len(execution_failures),
             "lineage_linked_execution_failure_count": failure_rows_with_lineage,
             "lineage_missing_execution_failure_count": (

@@ -796,6 +796,8 @@ python3.12 scripts/export_weekly_trade_review.py \
 
 Weekly artifacts default to `var/analytics/weekly_trade_review/`. They include FIFO-based realized P/L, gross and eligible net results, transaction-cost coverage, currency-separated summaries, lot-level evidence, and explicit fill-to-plan/decision attribution coverage. Missing local plan or decision identity is reported as incomplete coverage instead of silently disappearing through an inner join; Core-linked fills additionally require the item decision run to match the plan strategy run. Use explicit timezone offsets for trading-date boundaries and load stored JSON payloads only for deliberate deep dives.
 
+The `weekly-trade-review-v2` JSON contract is checksummed with canonical SHA-256 and is consumed only after strict JSON and integrity validation. Performance feedback is eligible only with complete net-P/L, cost, currency, execution-scope, and decision-lineage evidence. Failure and rejection feedback is a separate negative-only channel: it requires complete normalized `ExecutionFailure` lineage, may support only delay/downsize/reject behavior, and cannot approve or increase an order.
+
 ### Fill evidence repair
 
 Inspect broker-flat symbols with residual local FIFO inventory in dry-run mode first:
