@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
 from sqlalchemy import create_engine, event
@@ -12,6 +13,7 @@ from app.core.config import Settings
 from app.db.base import Base
 from app.models.runtime import (
     BrokerOrder,
+    ExecutionFailure,
     ExecutionFill,
     ExecutionPlan,
     ExecutionPlanItem,
@@ -19,10 +21,17 @@ from app.models.runtime import (
     ExecutionPosition,
 )
 from app.services.trade_outcome_feedback import (
+    FeedbackExecutionScope,
     REPORT_VERSION,
+    _failure_matches_feedback_scope,
     ensure_fresh_trade_outcome_feedback,
     generate_trade_outcome_feedback,
     load_latest_trade_outcome_feedback_snippet,
+)
+from app.services.artifact_integrity import (
+    artifact_integrity_is_valid,
+    attach_artifact_integrity,
+    load_strict_json_object,
 )
 from app.services.account_drawdown_gate import (
     _legacy_drawdown_block_is_current,
@@ -65,6 +74,47 @@ COMPLETE_KRW_FILL_ECONOMICS: dict[str, object] = {
     "transaction_cost_source": "test_fixture",
 }
 FEEDBACK_TEST_ACCOUNT_SCOPE = "a" * 24
+
+
+def _write_quality_gated_feedback_artifact(
+    path: Path,
+    *,
+    account_scope: str = FEEDBACK_TEST_ACCOUNT_SCOPE,
+    prompt_snippet: dict[str, object] | None = None,
+) -> None:
+    quality_gate = {
+        "schema_version": "trade-outcome-learning-quality-v1",
+        "status": "ready",
+        "consumer_eligible": True,
+        "blocked_reasons": [],
+    }
+    payload = attach_artifact_integrity(
+        {
+            "version": REPORT_VERSION,
+            "schema_version": REPORT_VERSION,
+            "mode": "paper",
+            "execution_account_scope": {
+                "status": "single",
+                "provider": "kis",
+                "account_scope": account_scope,
+            },
+            "generated_at": datetime.now(UTC).isoformat(),
+            "lookback_days": 20,
+            "closed_trade_count": 1,
+            "summary": {"realized_pnl_krw": "-10000.0000"},
+            "quality_gate": quality_gate,
+            "prompt_snippet": {
+                **(prompt_snippet or {}),
+                "quality_gate": {
+                    "status": "ready",
+                    "consumer_eligible": True,
+                    "blocked_reasons": [],
+                    "instruction": "apply_only_quality_gated_lessons",
+                },
+            },
+        }
+    )
+    path.write_text(json.dumps(payload), encoding="utf-8")
 
 
 class _CapturingPositionSession:
@@ -575,6 +625,10 @@ def test_trade_outcome_feedback_never_matches_same_symbol_across_route_dimension
     )
 
     assert report["closed_trade_count"] == 1
+    assert report["schema_version"] == REPORT_VERSION
+    assert artifact_integrity_is_valid(report)
+    assert report["quality_gate"]["status"] == "blocked"
+    assert report["quality_gate"]["consumer_eligible"] is False
     trade = report["closed_trades"][0]
     assert trade["gross_realized_pnl"] is None
     assert trade["profitability_eligible"] is False
@@ -3398,6 +3452,8 @@ def test_candidate_rule_replay_uses_sell_post_entry_context(tmp_path) -> None:
         status="filled",
         quantity_policy={"kind": "shares", "quantity": 10},
         risk_context={},
+        decision_agent_name="short-term-decider",
+        decision_run_id="decision-sell-context",
     )
     sell_item = ExecutionPlanItem(
         id="item-sell-sell-context",
@@ -3413,6 +3469,8 @@ def test_candidate_rule_replay_uses_sell_post_entry_context(tmp_path) -> None:
                 "reasons": ["gap_down_breached_risk_threshold", "next_day_no_progress"],
             }
         },
+        decision_agent_name="short-term-decider",
+        decision_run_id="decision-sell-context",
     )
     buy_order = BrokerOrder(
         id="order-buy-sell-context",
@@ -3507,29 +3565,14 @@ def test_candidate_rule_replay_uses_sell_post_entry_context(tmp_path) -> None:
 def test_exec_agent_payloads_include_latest_trade_outcome_feedback(tmp_path) -> None:
     engine, session = _session()
     settings = Settings(runtime_mode="paper", trade_outcome_feedback_dir=str(tmp_path))
-    (tmp_path / "latest.json").write_text(
-        json.dumps(
-            {
-                "version": "trade-outcome-feedback-v2",
-                "mode": "paper",
-                "execution_account_scope": {
-                    "status": "single",
-                    "provider": "kis",
-                    "account_scope": FEEDBACK_TEST_ACCOUNT_SCOPE,
-                },
-                "generated_at": datetime.now(UTC).isoformat(),
-                "lookback_days": 20,
-                "closed_trade_count": 1,
-                "summary": {"realized_pnl_krw": "-10000.0000"},
-                "prompt_snippet": {
-                    "summary": "Recent closed trades: pnl=-10000.0000 KRW",
-                    "patterns_to_downsize_or_reject": ["Downsize standard_breakout"],
-                    "positive_expectancy_patterns": [],
-                    "required_hard_gates": ["Reject repeat worst-loss setups"],
-                },
-            }
-        ),
-        encoding="utf-8",
+    _write_quality_gated_feedback_artifact(
+        tmp_path / "latest.json",
+        prompt_snippet={
+            "summary": "Recent closed trades: pnl=-10000.0000 KRW",
+            "patterns_to_downsize_or_reject": ["Downsize standard_breakout"],
+            "positive_expectancy_patterns": [],
+            "required_hard_gates": ["Reject repeat worst-loss setups"],
+        },
     )
     plan = ExecutionPlan(
         id="plan-1",
@@ -3591,26 +3634,122 @@ def test_exec_agent_payloads_include_latest_trade_outcome_feedback(tmp_path) -> 
     engine.dispose()
 
 
+def test_blocked_performance_feedback_still_exposes_lineaged_negative_operational_evidence(
+    tmp_path,
+) -> None:
+    engine, session = _session()
+    settings = Settings(runtime_mode="paper", trade_outcome_feedback_dir=str(tmp_path))
+    observed_at = datetime(2026, 6, 12, tzinfo=UTC)
+    order = BrokerOrder(
+        id="operational-learning-order",
+        broker_name="kis",
+        mode="paper",
+        idempotency_key="operational-learning-order",
+        broker_order_id="operational-learning-order",
+        symbol="005930",
+        side="buy",
+        status="rejected",
+        quantity=1,
+        venue="KRX",
+        asset_class="stock",
+        request_metadata={
+            "provider": "kis",
+            "venue": "KRX",
+            "asset_class": "stock",
+            "exchange": "KRX",
+            "broker_account_scope": {
+                "policy_version": 1,
+                "scope": FEEDBACK_TEST_ACCOUNT_SCOPE,
+            },
+        },
+    )
+    session.add(
+        ExecutionFailure(
+            id="operational-learning-failure",
+            mode="paper",
+            broker_order=order,
+            execution_plan_item_id="operational-learning-item",
+            strategy_run_id="operational-learning-run",
+            decision_actor="short-term-decider",
+            broker_name="kis",
+            idempotency_key=order.idempotency_key,
+            symbol=order.symbol,
+            side=order.side,
+            intent="intraday_watch_buy",
+            requested_quantity=1,
+            classification="broker_rejected",
+            broker_error_message="redacted test rejection",
+            retryable=False,
+            status="open",
+            first_failed_at=observed_at,
+            latest_failed_at=observed_at,
+        )
+    )
+    session.commit()
+
+    report = generate_trade_outcome_feedback(
+        settings=settings,
+        db=session,
+        as_of=observed_at + timedelta(minutes=1),
+        provider="kis",
+        account_scope=FEEDBACK_TEST_ACCOUNT_SCOPE,
+        exchange="KRX",
+    )
+    feedback = load_latest_trade_outcome_feedback_snippet(
+        settings,
+        now=observed_at + timedelta(minutes=1),
+        provider="kis",
+        account_scope=FEEDBACK_TEST_ACCOUNT_SCOPE,
+        exchange="KRX",
+    )
+
+    assert report["quality_gate"]["status"] == "no_data"
+    assert feedback["status"] == "blocked"
+    operational = feedback["operational_learning_context"]
+    assert operational["status"] == "ready"
+    assert operational["consumer_eligible"] is True
+    assert operational["classification_counts"] == {"broker_rejected": 1}
+    assert operational["broker_order_status_counts"] == {"rejected": 1}
+    assert operational["prohibited_effects"] == ["approve", "increase_size"]
+    assert operational["instruction"] == "may_apply_negative_operational_lessons_only"
+
+    session.close()
+    engine.dispose()
+
+
+def test_operational_failure_scope_match_rejects_missing_broker_order() -> None:
+    failure = ExecutionFailure(
+        id="missing-order-failure",
+        mode="paper",
+        broker_order_pk="missing-order",
+        broker_name="kis",
+        idempotency_key="missing-order",
+        symbol="005930",
+        side="buy",
+        requested_quantity=1,
+        classification="broker_rejected",
+        broker_error_message="redacted",
+        retryable=False,
+        status="open",
+        first_failed_at=datetime(2026, 6, 12, tzinfo=UTC),
+        latest_failed_at=datetime(2026, 6, 12, tzinfo=UTC),
+    )
+
+    assert _failure_matches_feedback_scope(
+        failure=failure,
+        requested_scope=FeedbackExecutionScope(
+            provider="kis",
+            account_scope=FEEDBACK_TEST_ACCOUNT_SCOPE,
+            exchange="KRX",
+        ),
+    ) is False
+
+
 def test_latest_trade_outcome_feedback_requires_exact_account_scope(tmp_path) -> None:
     settings = Settings(runtime_mode="paper", trade_outcome_feedback_dir=str(tmp_path))
-    (tmp_path / "latest.json").write_text(
-        json.dumps(
-            {
-                "version": "trade-outcome-feedback-v2",
-                "mode": "paper",
-                "execution_account_scope": {
-                    "status": "single",
-                    "provider": "kis",
-                    "account_scope": FEEDBACK_TEST_ACCOUNT_SCOPE,
-                },
-                "generated_at": datetime.now(UTC).isoformat(),
-                "lookback_days": 20,
-                "closed_trade_count": 1,
-                "summary": {"realized_pnl_krw": "-10000.0000"},
-                "prompt_snippet": {"patterns_to_downsize_or_reject": ["loss-pattern"]},
-            }
-        ),
-        encoding="utf-8",
+    _write_quality_gated_feedback_artifact(
+        tmp_path / "latest.json",
+        prompt_snippet={"patterns_to_downsize_or_reject": ["loss-pattern"]},
     )
 
     assert load_latest_trade_outcome_feedback_snippet(
@@ -3618,17 +3757,100 @@ def test_latest_trade_outcome_feedback_requires_exact_account_scope(tmp_path) ->
         provider="kis",
         account_scope=FEEDBACK_TEST_ACCOUNT_SCOPE,
     ) is not None
-    assert load_latest_trade_outcome_feedback_snippet(
+    mismatched = load_latest_trade_outcome_feedback_snippet(
         settings,
         provider="kis",
         account_scope="b" * 24,
-    ) is None
-    assert load_latest_trade_outcome_feedback_snippet(
+    )
+    assert mismatched["status"] == "unavailable"
+    wrong_provider = load_latest_trade_outcome_feedback_snippet(
         settings,
         provider="alpaca",
         account_scope=FEEDBACK_TEST_ACCOUNT_SCOPE,
-    ) is None
-    assert load_latest_trade_outcome_feedback_snippet(settings) is None
+    )
+    assert wrong_provider["status"] == "unavailable"
+    assert load_latest_trade_outcome_feedback_snippet(settings)["status"] == "unavailable"
+
+
+def test_latest_trade_outcome_feedback_rejects_tampered_checksum(tmp_path) -> None:
+    settings = Settings(runtime_mode="paper", trade_outcome_feedback_dir=str(tmp_path))
+    latest_path = tmp_path / "latest.json"
+    _write_quality_gated_feedback_artifact(latest_path)
+    payload = json.loads(latest_path.read_text(encoding="utf-8"))
+    payload["summary"]["realized_pnl_krw"] = "999999.0000"
+    latest_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    assert artifact_integrity_is_valid(payload) is False
+    feedback = load_latest_trade_outcome_feedback_snippet(
+        settings,
+        provider="kis",
+        account_scope=FEEDBACK_TEST_ACCOUNT_SCOPE,
+    )
+    assert feedback["status"] == "unavailable"
+    assert feedback["consumer_eligible"] is False
+    assert feedback["snippet"]["quality_gate"]["instruction"] == (
+        "do_not_apply_learning_lessons"
+    )
+
+
+@pytest.mark.parametrize(
+    "payload_text",
+    (
+        '{"outer":{"key":1,"key":2}}',
+        '{"value":NaN}',
+        '{"value":Infinity}',
+        '["not-an-object"]',
+    ),
+)
+def test_strict_artifact_json_rejects_ambiguous_payloads(payload_text: str) -> None:
+    with pytest.raises(ValueError):
+        load_strict_json_object(payload_text)
+
+
+def test_artifact_integrity_validation_never_raises_for_noncanonical_values() -> None:
+    payload = {
+        "value": float("nan"),
+        "integrity": {
+            "algorithm": "sha256",
+            "canonicalization": "json-sort-keys-compact-utf8-v1",
+            "payload_sha256": "0" * 64,
+        },
+    }
+
+    assert artifact_integrity_is_valid(payload) is False
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    (
+        lambda text: text.replace(
+            f'"version": "{REPORT_VERSION}"',
+            f'"version": "{REPORT_VERSION}", "version": "{REPORT_VERSION}"',
+            1,
+        ),
+        lambda text: text.replace("{", "{\"non_finite\": NaN,", 1),
+    ),
+)
+def test_latest_trade_outcome_feedback_fails_closed_on_noncanonical_json(
+    tmp_path,
+    mutate,
+) -> None:
+    settings = Settings(runtime_mode="paper", trade_outcome_feedback_dir=str(tmp_path))
+    latest_path = tmp_path / "latest.json"
+    _write_quality_gated_feedback_artifact(latest_path)
+    latest_path.write_text(
+        mutate(latest_path.read_text(encoding="utf-8")),
+        encoding="utf-8",
+    )
+
+    feedback = load_latest_trade_outcome_feedback_snippet(
+        settings,
+        provider="kis",
+        account_scope=FEEDBACK_TEST_ACCOUNT_SCOPE,
+    )
+
+    assert feedback["status"] == "unavailable"
+    assert feedback["consumer_eligible"] is False
 
 
 def test_mixed_account_feedback_is_never_reused_for_agent_decisions(tmp_path) -> None:
@@ -3669,11 +3891,13 @@ def test_mixed_account_feedback_is_never_reused_for_agent_decisions(tmp_path) ->
     )
 
     assert report["execution_account_scope"]["status"] == "mixed"
-    assert load_latest_trade_outcome_feedback_snippet(
+    mixed_context = load_latest_trade_outcome_feedback_snippet(
         settings,
         provider="kis",
         account_scope="a" * 24,
-    ) is None
+    )
+    assert mixed_context["status"] == "unavailable"
+    assert mixed_context["consumer_eligible"] is False
 
     session.close()
     engine.dispose()
@@ -3972,13 +4196,14 @@ def test_feedback_freshness_and_artifacts_are_exact_account_and_exchange_scoped(
     assert feedback_b is not None
     assert feedback_a["summary"]["realized_pnl_krw"] == "100.0000"
     assert feedback_b["summary"]["realized_pnl_krw"] == "-100.0000"
-    assert load_latest_trade_outcome_feedback_snippet(
+    wrong_exchange = load_latest_trade_outcome_feedback_snippet(
         settings,
         now=as_of,
         provider="kis",
         account_scope=account_a,
         exchange="NASD",
-    ) is None
+    )
+    assert wrong_exchange["status"] == "unavailable"
 
     session.close()
     engine.dispose()
@@ -4030,7 +4255,7 @@ def test_latest_trade_outcome_feedback_ignores_other_runtime_modes(tmp_path) -> 
         encoding="utf-8",
     )
 
-    assert load_latest_trade_outcome_feedback_snippet(settings) is None
+    assert load_latest_trade_outcome_feedback_snippet(settings)["status"] == "unavailable"
 
 
 def test_latest_trade_outcome_feedback_ignores_stale_or_unversioned_artifacts(tmp_path) -> None:
@@ -4054,20 +4279,22 @@ def test_latest_trade_outcome_feedback_ignores_stale_or_unversioned_artifacts(tm
         encoding="utf-8",
     )
 
-    assert load_latest_trade_outcome_feedback_snippet(
+    stale = load_latest_trade_outcome_feedback_snippet(
         settings,
         now=datetime(2026, 6, 12, 2, 0, tzinfo=UTC),
-    ) is None
+    )
+    assert stale["status"] == "unavailable"
 
     (tmp_path / "latest.json").write_text(
         '{"version":"trade-outcome-feedback-v2","mode":"paper",'
         '"prompt_snippet":{"patterns_to_downsize_or_reject":[]}}',
         encoding="utf-8",
     )
-    assert load_latest_trade_outcome_feedback_snippet(
+    unversioned = load_latest_trade_outcome_feedback_snippet(
         settings,
         now=datetime(2026, 6, 12, 0, 1, tzinfo=UTC),
-    ) is None
+    )
+    assert unversioned["status"] == "unavailable"
 
     (tmp_path / "latest.json").write_text(
         '{"version":"trade-outcome-feedback-v999","mode":"paper",'
@@ -4075,10 +4302,11 @@ def test_latest_trade_outcome_feedback_ignores_stale_or_unversioned_artifacts(tm
         '"prompt_snippet":{"patterns_to_downsize_or_reject":[]}}',
         encoding="utf-8",
     )
-    assert load_latest_trade_outcome_feedback_snippet(
+    wrong_version = load_latest_trade_outcome_feedback_snippet(
         settings,
         now=datetime(2026, 6, 12, 0, 1, tzinfo=UTC),
-    ) is None
+    )
+    assert wrong_version["status"] == "unavailable"
 
 
 def test_ensure_fresh_trade_outcome_feedback_generates_missing_artifact_once(tmp_path) -> None:

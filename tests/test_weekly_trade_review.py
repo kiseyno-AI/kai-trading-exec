@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
+import pytest
 from sqlalchemy import event, inspect, select, text
 
 from app.core.config import Settings
@@ -26,15 +27,18 @@ from app.models.runtime import (
     MonitoringCheckpoint,
 )
 from app.services.weekly_trade_review import (
+    WEEKLY_TRADE_REVIEW_SCHEMA_VERSION,
     WeeklyTradeReviewTimeoutError,
     _weekly_closed_trades,
     _weekly_fill_attribution_coverage,
     _weekly_fills,
+    load_weekly_trade_review_artifact,
     _monitoring_checkpoints,
     _plan_item_review_summary,
     _stale_fifo_inventory_alerts,
     generate_weekly_trade_review,
 )
+from app.services.artifact_integrity import artifact_integrity_is_valid
 from app.services.runtime import runtime_counts
 from app.services.position_identity import build_position_identity
 
@@ -760,6 +764,18 @@ def test_weekly_trade_review_exports_bounded_read_only_artifact(tmp_path) -> Non
         event.remove(engine, "before_cursor_execute", _capture_sql)
 
     assert report["counts"]["fill_count"] == 2
+    assert report["schema_version"] == WEEKLY_TRADE_REVIEW_SCHEMA_VERSION
+    assert artifact_integrity_is_valid(report)
+    assert report["provenance"]["producer"] == "kai-trading-exec"
+    assert report["learning_evidence"]["performance_feedback"][
+        "consumer_eligible"
+    ] is False
+    assert "incomplete_fill_decision_lineage" in report["learning_evidence"][
+        "performance_feedback"
+    ]["blocked_reasons"]
+    assert report["learning_evidence"]["failure_and_rejection_feedback"][
+        "execution_failure_count"
+    ] == 1
     assert report["counts"]["linked_broker_order_count"] == 2
     assert report["counts"]["linked_broker_order_event_count"] == 1
     assert report["counts"]["execution_failure_count"] == 1
@@ -908,6 +924,15 @@ def test_weekly_trade_review_exports_bounded_read_only_artifact(tmp_path) -> Non
     assert latest_path.exists()
     assert json.loads(artifact_path.read_text(encoding="utf-8"))["counts"]["fill_count"] == 2
     assert json.loads(latest_path.read_text(encoding="utf-8"))["artifact_path"] == str(artifact_path)
+    assert load_weekly_trade_review_artifact(latest_path)["integrity"] == report[
+        "integrity"
+    ]
+
+    tampered = json.loads(latest_path.read_text(encoding="utf-8"))
+    tampered["counts"]["fill_count"] = 999
+    latest_path.write_text(json.dumps(tampered), encoding="utf-8")
+    with pytest.raises(ValueError, match="integrity check failed"):
+        load_weekly_trade_review_artifact(latest_path)
 
     db.close()
     engine.dispose()
@@ -985,6 +1010,27 @@ def test_weekly_json_export_recursively_redacts_account_identifiers(tmp_path) ->
     assert "12345678" not in (tmp_path / "latest.json").read_text(encoding="utf-8")
     db.close()
     engine.dispose()
+
+
+@pytest.mark.parametrize(
+    "payload_text",
+    (
+        (
+            '{"schema_version":"weekly-trade-review-v2",'
+            '"schema_version":"weekly-trade-review-v2"}'
+        ),
+        '{"schema_version":"weekly-trade-review-v2","value":NaN}',
+    ),
+)
+def test_weekly_artifact_loader_rejects_noncanonical_json(
+    tmp_path,
+    payload_text: str,
+) -> None:
+    artifact_path = tmp_path / "latest.json"
+    artifact_path.write_text(payload_text, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="artifact is unreadable"):
+        load_weekly_trade_review_artifact(artifact_path)
 
 
 def test_weekly_active_order_summary_matches_runtime_actionable_semantics(tmp_path) -> None:

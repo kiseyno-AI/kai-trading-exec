@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import sys
+import tempfile
 import time
 from collections.abc import Callable, Iterable, Sequence
 from datetime import UTC, date, datetime, timedelta
@@ -33,6 +34,11 @@ from app.services.broker_order_state import (
     NONTERMINAL_ORDER_STATUSES,
     active_local_broker_order_filters,
 )
+from app.services.artifact_integrity import (
+    artifact_integrity_is_valid,
+    attach_artifact_integrity,
+    load_strict_json_object,
+)
 from app.services.database_cli_security import reject_secret_database_url_argument
 from app.services.execution_account_route import redact_account_references
 from app.services.fifo_inventory import (
@@ -59,6 +65,10 @@ class WeeklyTradeReviewTimeoutError(TimeoutError):
     """Raised when a bounded weekly export exceeds its configured deadline."""
 
 
+WEEKLY_TRADE_REVIEW_SCHEMA_VERSION = "weekly-trade-review-v2"
+WEEKLY_LEARNING_EVIDENCE_SCHEMA_VERSION = "weekly-learning-evidence-v1"
+
+
 ACTIVE_WATCH_REVIEW_STATUSES = (
     WATCH_SIZING_PENDING_STATUS,
     "watch_monitoring_pending",
@@ -69,6 +79,22 @@ ACTIVE_WATCH_REVIEW_STATUSES = (
     "short_term_watcher_pending",
     "new_buy_blocked",
 )
+
+
+def load_weekly_trade_review_artifact(path: Path) -> dict[str, object]:
+    """Load a weekly artifact only when its schema and checksum are valid."""
+
+    try:
+        payload = load_strict_json_object(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ValueError("weekly trade review artifact is unreadable") from exc
+    if payload.get("schema_version") != WEEKLY_TRADE_REVIEW_SCHEMA_VERSION:
+        raise ValueError("weekly trade review artifact schema is unsupported")
+    if not artifact_integrity_is_valid(payload):
+        raise ValueError("weekly trade review artifact integrity check failed")
+    return payload
+
+
 ACTIVE_NEXT_OPEN_JOB_STATUSES = frozenset(
     {"queued", "scheduled", "running", "retrying"}
 )
@@ -286,9 +312,42 @@ def generate_weekly_trade_review(
     )
     progress("monitoring_sections", checkpoint_count=len(monitoring_checkpoints))
 
+    learning_evidence = _weekly_learning_evidence(
+        fill_attribution_coverage=fill_attribution_coverage,
+        realized_pnl_coverage=pnl_coverage,
+        realized_pnl_summary=realized_pnl_summary,
+        closed_trades=closed_trades,
+        weekly_order_status_counts=weekly_order_counts,
+        execution_failures=failures,
+        truncated={
+            "fills": fills_truncated,
+            "weekly_orders": weekly_orders_truncated,
+            "execution_failures": failures_truncated,
+            "closed_trades": closed_trades_truncated,
+        },
+    )
+
     report: dict[str, object] = {
+        "schema_version": WEEKLY_TRADE_REVIEW_SCHEMA_VERSION,
         "generated_at": generated_at,
         "runtime_mode": settings.runtime_mode,
+        "provenance": {
+            "producer": "kai-trading-exec",
+            "artifact_type": "weekly_trade_review",
+            "query_contract": WEEKLY_TRADE_REVIEW_SCHEMA_VERSION,
+            "source_tables": [
+                "execution_fills",
+                "broker_orders",
+                "broker_order_events",
+                "execution_failures",
+                "execution_plan_items",
+                "execution_plans",
+                "execution_positions",
+                "monitoring_checkpoints",
+            ],
+            "runtime_mode": settings.runtime_mode,
+            "generated_at": generated_at,
+        },
         "range": {
             "start_at": start_at,
             "end_at": end_at,
@@ -369,14 +428,15 @@ def generate_weekly_trade_review(
         "protective_stop_actionability": protective_stop_actionability,
         "max_holding_actionability": max_holding_actionability,
         "late_entry_actionability": late_entry_actionability,
+        "learning_evidence": learning_evidence,
     }
 
     artifact_path = target_dir / _artifact_filename(start_at=start_at, end_at=end_at)
     report["artifact_path"] = str(artifact_path)
-    payload = _json_safe(report)
+    payload = attach_artifact_integrity(_json_safe(report))
     text = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
-    artifact_path.write_text(text + "\n", encoding="utf-8")
-    (target_dir / "latest.json").write_text(text + "\n", encoding="utf-8")
+    _atomic_write_text(artifact_path, text + "\n")
+    _atomic_write_text(target_dir / "latest.json", text + "\n")
     progress("write_artifact", artifact_path=str(artifact_path))
     return payload
 
@@ -489,6 +549,136 @@ def _weekly_fill_attribution_coverage(
         "decision_identity_missing_fill_ids": missing_decision_ids,
         "decision_run_mismatch_fill_ids": decision_run_mismatch_ids,
     }
+
+
+def _weekly_learning_evidence(
+    *,
+    fill_attribution_coverage: dict[str, object],
+    realized_pnl_coverage: dict[str, object],
+    realized_pnl_summary: dict[str, object],
+    closed_trades: Sequence[dict[str, object]],
+    weekly_order_status_counts: Sequence[dict[str, object]],
+    execution_failures: Sequence[dict[str, object]],
+    truncated: dict[str, bool],
+) -> dict[str, object]:
+    """Build a stable, fail-closed contract for downstream learning consumers."""
+
+    closed_trade_lineage_missing_ids = sorted(
+        {
+            str(row.get("sell_fill_id"))
+            for row in closed_trades
+            if row.get("source_execution_plan_item_id") is None
+            or row.get("decision_snapshot_id") is None
+            or row.get("decision_run_id") is None
+            or row.get("decision_agent_name") is None
+        }
+    )
+    performance_blocked_reasons: list[str] = []
+    if not closed_trades:
+        performance_status = "no_data"
+        performance_blocked_reasons.append("no_closed_trades")
+    else:
+        if truncated.get("fills") or truncated.get("closed_trades"):
+            performance_blocked_reasons.append("source_rows_truncated")
+        if fill_attribution_coverage.get("status") != "complete":
+            performance_blocked_reasons.append("incomplete_fill_decision_lineage")
+        if realized_pnl_coverage.get("status") != "complete":
+            performance_blocked_reasons.append("incomplete_cost_basis_coverage")
+        if realized_pnl_summary.get("transaction_cost_coverage") != "complete":
+            performance_blocked_reasons.append("incomplete_transaction_cost_coverage")
+        if realized_pnl_summary.get("currency_coverage") != "complete":
+            performance_blocked_reasons.append("incomplete_settlement_currency_coverage")
+        if closed_trade_lineage_missing_ids:
+            performance_blocked_reasons.append("incomplete_closed_trade_decision_lineage")
+        performance_status = "blocked" if performance_blocked_reasons else "ready"
+
+    failure_rows_with_lineage = sum(
+        1
+        for row in execution_failures
+        if row.get("execution_plan_item_id") is not None
+        and row.get("strategy_run_id") is not None
+        and row.get("decision_actor") is not None
+    )
+    failure_status_counts = _count_values(execution_failures, "status")
+    failure_classification_counts = _count_values(execution_failures, "classification")
+    failure_retryability_counts = {
+        "retryable": sum(row.get("retryable") is True for row in execution_failures),
+        "not_retryable": sum(row.get("retryable") is False for row in execution_failures),
+        "unknown": sum(row.get("retryable") is None for row in execution_failures),
+    }
+    terminal_order_outcomes = {
+        f"{str(row.get('side') or 'unknown')}:{str(row.get('status') or 'unknown')}": int(
+            row.get("count") or 0
+        )
+        for row in weekly_order_status_counts
+        if _is_failure_or_rejection_status(str(row.get("status") or ""))
+    }
+    failure_evidence_truncated = bool(
+        truncated.get("weekly_orders") or truncated.get("execution_failures")
+    )
+    return {
+        "schema_version": WEEKLY_LEARNING_EVIDENCE_SCHEMA_VERSION,
+        "performance_feedback": {
+            "status": performance_status,
+            "consumer_eligible": performance_status == "ready",
+            "blocked_reasons": performance_blocked_reasons,
+            "closed_trade_count": len(closed_trades),
+            "profitability_eligible_sell_fill_count": realized_pnl_summary.get(
+                "covered_sell_fill_count"
+            ),
+            "cost_basis_coverage": realized_pnl_coverage.get("status"),
+            "transaction_cost_coverage": realized_pnl_summary.get(
+                "transaction_cost_coverage"
+            ),
+            "settlement_currency_coverage": realized_pnl_summary.get(
+                "currency_coverage"
+            ),
+            "fill_decision_lineage_coverage": fill_attribution_coverage.get("status"),
+            "closed_trade_decision_lineage_missing_count": len(
+                closed_trade_lineage_missing_ids
+            ),
+            "closed_trade_decision_lineage_missing_sell_fill_ids": (
+                closed_trade_lineage_missing_ids
+            ),
+        },
+        "failure_and_rejection_feedback": {
+            "status": (
+                "truncated"
+                if failure_evidence_truncated
+                else ("complete" if execution_failures or terminal_order_outcomes else "no_data")
+            ),
+            "consumer_eligible": not failure_evidence_truncated
+            and bool(execution_failures or terminal_order_outcomes),
+            "execution_failure_count": len(execution_failures),
+            "lineage_linked_execution_failure_count": failure_rows_with_lineage,
+            "lineage_missing_execution_failure_count": (
+                len(execution_failures) - failure_rows_with_lineage
+            ),
+            "failure_status_counts": failure_status_counts,
+            "failure_classification_counts": failure_classification_counts,
+            "failure_retryability_counts": failure_retryability_counts,
+            "terminal_order_outcome_counts": terminal_order_outcomes,
+        },
+    }
+
+
+def _count_values(
+    rows: Sequence[dict[str, object]],
+    key: str,
+) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for row in rows:
+        value = str(row.get(key) or "unknown")
+        counts[value] = counts.get(value, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def _is_failure_or_rejection_status(status: str) -> bool:
+    normalized = status.strip().lower()
+    return any(
+        marker in normalized
+        for marker in ("failed", "rejected", "cancelled", "canceled", "manual_review")
+    )
 
 
 def _linked_broker_orders(
@@ -990,7 +1180,15 @@ def _weekly_closed_trades(
                 BrokerOrder.request_metadata,
                 BrokerOrder.venue,
                 BrokerOrder.asset_class,
-            )
+            ),
+            selectinload(ExecutionFill.broker_order)
+            .selectinload(BrokerOrder.plan_item)
+            .load_only(
+                ExecutionPlanItem.id,
+                ExecutionPlanItem.decision_agent_name,
+                ExecutionPlanItem.decision_snapshot_id,
+                ExecutionPlanItem.decision_run_id,
+            ),
         )
         .order_by(ExecutionFill.filled_at.desc(), ExecutionFill.id.desc())
         .limit(max_rows + 1)
@@ -1510,6 +1708,13 @@ def _closed_trade_row(
     route_scope: FifoRouteScope | None,
 ) -> dict[str, object]:
     sell_price = Decimal(fill.price)
+    buy_item = (
+        buy_fill.broker_order.plan_item
+        if buy_fill is not None and buy_fill.broker_order is not None
+        else None
+    )
+    sell_item = fill.broker_order.plan_item if fill.broker_order is not None else None
+    source_item = buy_item or sell_item
     pnl = ((sell_price - buy_price) * quantity).quantize(Decimal("0.0001")) if buy_price is not None else None
     economics = (
         closed_trade_economics(
@@ -1550,6 +1755,18 @@ def _closed_trade_row(
         "net_realized_pnl": economics.net_realized_pnl if economics is not None else None,
         "transaction_cost_coverage": (
             economics.transaction_cost_coverage if economics is not None else "unknown"
+        ),
+        "source_execution_plan_item_id": (
+            source_item.id if source_item is not None else None
+        ),
+        "decision_snapshot_id": (
+            source_item.decision_snapshot_id if source_item is not None else None
+        ),
+        "decision_run_id": (
+            source_item.decision_run_id if source_item is not None else None
+        ),
+        "decision_agent_name": (
+            source_item.decision_agent_name if source_item is not None else None
         ),
     }
 
@@ -1946,6 +2163,29 @@ def _json_safe(value: object) -> Any:
     if isinstance(value, list):
         return [_json_safe(item) for item in value]
     return value
+
+
+def _atomic_write_text(path: Path, contents: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            handle.write(contents)
+            handle.flush()
+            os.fsync(handle.fileno())
+            temp_path = Path(handle.name)
+        os.replace(temp_path, path)
+        temp_path = None
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
 
 
 def main() -> None:

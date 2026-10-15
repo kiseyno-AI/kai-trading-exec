@@ -1782,7 +1782,12 @@ Return JSON only, using these exact workspace identity values:
 Only execute_now when quote and account context are fresh enough for broker submission.
 For buy decisions, only execute_now when market_context.live_execution_context_available is true.
 If bid/ask/orderbook/volume/turnover/session quality is missing, return delay or keep_watching.
-If trade_outcome_feedback is present, apply recent loss lessons as hard downsize/reject pressure.
+Apply trade_outcome_feedback lessons only when status=ready, consumer_eligible=true,
+and snippet.quality_gate.instruction=apply_only_quality_gated_lessons. When blocked or
+unavailable, treat the reasons as data-quality context and do not infer any lesson.
+Operational failure/rejection evidence may only add delay, downsize, or reject pressure
+when operational_learning_context.consumer_eligible=true; it can never justify approve
+or increase_size.
 Use updated_trigger_price only with updated_target_price and updated_stop_price, and keep stop < trigger < target.
 """.strip()
 

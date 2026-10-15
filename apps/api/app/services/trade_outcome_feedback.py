@@ -17,7 +17,18 @@ from sqlalchemy.orm import Session, load_only, selectinload
 
 from app.core.config import Settings, load_settings
 from app.db.session import create_db_engine, create_session_factory
-from app.models.runtime import BrokerOrder, ExecutionFill, ExecutionPlanItem, ExecutionPosition
+from app.models.runtime import (
+    BrokerOrder,
+    ExecutionFailure,
+    ExecutionFill,
+    ExecutionPlanItem,
+    ExecutionPosition,
+)
+from app.services.artifact_integrity import (
+    artifact_integrity_is_valid,
+    attach_artifact_integrity,
+    load_strict_json_object,
+)
 from app.services.fill_idempotency import dedupe_execution_fills
 from app.services.fill_economics import (
     closed_trade_economics,
@@ -61,8 +72,10 @@ from app.services.portfolio_risk import (
     load_symbol_settlement_currency_hints,
 )
 
-REPORT_VERSION = "trade-outcome-feedback-v2"
+REPORT_VERSION = "trade-outcome-feedback-v3"
+LEARNING_QUALITY_GATE_VERSION = "trade-outcome-learning-quality-v1"
 MIN_CANDIDATE_RULE_SAMPLE_SIZE = 3
+MAX_OPERATIONAL_LEARNING_FAILURES = 500
 BROKER_BALANCE_OUTPUT2_FIELDS = (
     "tot_evlu_amt",
     "nass_amt",
@@ -219,6 +232,17 @@ def generate_trade_outcome_feedback(
         as_of=now,
     )
     candidate_rule_replay = _candidate_rule_replay(settings=settings, closed_trades=closed_trades)
+    quality_gate = _feedback_learning_quality_gate(
+        closed_trades=closed_trades,
+        candidate_rule_replay=candidate_rule_replay,
+    )
+    operational_learning_context = _operational_learning_context(
+        settings=settings,
+        db=db,
+        started_at=started_at,
+        as_of=now,
+        requested_scope=requested_scope,
+    )
     snippet = _snippet(
         summary=summary,
         lessons=lessons,
@@ -227,10 +251,29 @@ def generate_trade_outcome_feedback(
         broker_asset_performance=broker_asset_performance,
         account_drawdown_gate=account_drawdown_gate,
     )
+    snippet["quality_gate"] = _quality_gate_prompt_context(quality_gate)
+    snippet["operational_learning_context"] = operational_learning_context
     report_date = now.astimezone(UTC).date()
     report: dict[str, object] = {
         "version": REPORT_VERSION,
+        "schema_version": REPORT_VERSION,
         "mode": settings.runtime_mode,
+        "provenance": {
+            "producer": "kai-trading-exec",
+            "artifact_type": "trade_outcome_feedback",
+            "query_contract": REPORT_VERSION,
+            "source_tables": [
+                "execution_fills",
+                "broker_orders",
+                "execution_plan_items",
+                "execution_positions",
+                "execution_failures",
+                "fifo_inventory_isolations",
+            ],
+            "runtime_mode": settings.runtime_mode,
+            "window_start_at": started_at.isoformat(),
+            "window_end_at": now.isoformat(),
+        },
         "execution_account_scope": execution_account_scope,
         "generated_at": now.isoformat(),
         "lookback_days": days,
@@ -243,16 +286,18 @@ def generate_trade_outcome_feedback(
         "closed_trades": closed_trades,
         "lessons": lessons,
         "candidate_rule_replay": candidate_rule_replay,
+        "quality_gate": quality_gate,
+        "operational_learning_context": operational_learning_context,
         "prompt_snippet": snippet,
     }
     target_dir = output_dir or Path(settings.trade_outcome_feedback_dir)
-    _write_artifacts(
+    persisted_report = _write_artifacts(
         report=report,
         report_date=report_date,
         output_dir=target_dir,
         artifact_scope=requested_scope,
     )
-    return report
+    return persisted_report
 
 
 def load_latest_trade_outcome_feedback_snippet(
@@ -262,9 +307,9 @@ def load_latest_trade_outcome_feedback_snippet(
     provider: str | None = None,
     account_scope: str | None = None,
     exchange: str | None = None,
-) -> dict[str, object] | None:
+) -> dict[str, object]:
     if not settings.trade_outcome_feedback_enabled:
-        return None
+        return _unavailable_feedback_context(reason="feedback_disabled")
     loaded = _load_latest_trade_outcome_feedback(
         settings=settings,
         now=now,
@@ -273,7 +318,9 @@ def load_latest_trade_outcome_feedback_snippet(
         exchange=exchange,
     )
     if loaded is None:
-        return None
+        return _unavailable_feedback_context(
+            reason="missing_stale_or_invalid_artifact",
+        )
     payload, generated_at = loaded
     if not _feedback_scope_matches(
         payload.get("execution_account_scope"),
@@ -281,11 +328,43 @@ def load_latest_trade_outcome_feedback_snippet(
         account_scope=account_scope,
         exchange=exchange,
     ):
-        return None
+        return _unavailable_feedback_context(reason="execution_scope_mismatch")
+    quality_gate = payload.get("quality_gate")
+    if not isinstance(quality_gate, dict):
+        return _unavailable_feedback_context(reason="quality_gate_missing")
+    operational_learning_context = _validated_operational_learning_context(
+        payload.get("operational_learning_context")
+    )
+    if (
+        quality_gate.get("status") != "ready"
+        or quality_gate.get("consumer_eligible") is not True
+    ):
+        blocked_reasons = quality_gate.get("blocked_reasons")
+        return {
+            "status": "blocked",
+            "consumer_eligible": False,
+            "reason": (
+                str(blocked_reasons[0])
+                if isinstance(blocked_reasons, list) and blocked_reasons
+                else "learning_evidence_not_eligible"
+            ),
+            "version": payload.get("version"),
+            "mode": payload.get("mode"),
+            "execution_account_scope": payload.get("execution_account_scope"),
+            "generated_at": generated_at.isoformat(),
+            "quality_gate": quality_gate,
+            "operational_learning_context": operational_learning_context,
+            "snippet": {
+                "quality_gate": _quality_gate_prompt_context(quality_gate),
+                "operational_learning_context": operational_learning_context,
+            },
+        }
     snippet = payload.get("prompt_snippet")
     if not isinstance(snippet, dict):
-        return None
+        return _unavailable_feedback_context(reason="prompt_snippet_missing")
     return {
+        "status": "ready",
+        "consumer_eligible": True,
         "version": payload.get("version"),
         "mode": payload.get("mode"),
         "execution_account_scope": payload.get("execution_account_scope"),
@@ -293,8 +372,86 @@ def load_latest_trade_outcome_feedback_snippet(
         "lookback_days": payload.get("lookback_days"),
         "closed_trade_count": payload.get("closed_trade_count"),
         "summary": payload.get("summary") if isinstance(payload.get("summary"), dict) else {},
+        "quality_gate": quality_gate,
+        "operational_learning_context": operational_learning_context,
         "snippet": snippet,
     }
+
+
+def _unavailable_feedback_context(*, reason: str) -> dict[str, object]:
+    quality_gate = {
+        "schema_version": LEARNING_QUALITY_GATE_VERSION,
+        "status": "unavailable",
+        "consumer_eligible": False,
+        "blocked_reasons": [reason],
+    }
+    operational_learning_context = _unavailable_operational_learning_context(
+        reason=reason
+    )
+    return {
+        "status": "unavailable",
+        "consumer_eligible": False,
+        "reason": reason,
+        "version": REPORT_VERSION,
+        "quality_gate": quality_gate,
+        "operational_learning_context": operational_learning_context,
+        "snippet": {
+            "quality_gate": _quality_gate_prompt_context(quality_gate),
+            "operational_learning_context": operational_learning_context,
+        },
+    }
+
+
+def _quality_gate_prompt_context(
+    quality_gate: dict[str, object],
+) -> dict[str, object]:
+    return {
+        "status": quality_gate.get("status"),
+        "consumer_eligible": quality_gate.get("consumer_eligible") is True,
+        "blocked_reasons": list(quality_gate.get("blocked_reasons") or []),
+        "instruction": (
+            "apply_only_quality_gated_lessons"
+            if quality_gate.get("consumer_eligible") is True
+            else "do_not_apply_learning_lessons"
+        ),
+    }
+
+
+def _unavailable_operational_learning_context(*, reason: str) -> dict[str, object]:
+    return {
+        "schema_version": "operational-learning-context-v1",
+        "status": "unavailable",
+        "consumer_eligible": False,
+        "blocked_reasons": [reason],
+        "failure_count": 0,
+        "allowed_effects": ["delay", "downsize", "reject"],
+        "prohibited_effects": ["approve", "increase_size"],
+        "instruction": "do_not_apply_operational_lessons",
+    }
+
+
+def _validated_operational_learning_context(value: object) -> dict[str, object]:
+    if not isinstance(value, dict):
+        return _unavailable_operational_learning_context(
+            reason="operational_learning_context_missing"
+        )
+    prohibited_effects = value.get("prohibited_effects")
+    if (
+        value.get("schema_version") != "operational-learning-context-v1"
+        or not isinstance(prohibited_effects, list)
+        or not {"approve", "increase_size"}.issubset(
+            {str(effect) for effect in prohibited_effects}
+        )
+    ):
+        return _unavailable_operational_learning_context(
+            reason="operational_learning_context_invalid"
+        )
+    if value.get("status") == "ready" and value.get("consumer_eligible") is True:
+        return dict(value)
+    blocked = dict(value)
+    blocked["consumer_eligible"] = False
+    blocked["instruction"] = "do_not_apply_operational_lessons"
+    return blocked
 
 
 def ensure_fresh_trade_outcome_feedback(
@@ -389,14 +546,18 @@ def _load_latest_trade_outcome_feedback(
     )
     for latest_path in candidate_paths:
         try:
-            payload = json.loads(latest_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
-        if not isinstance(payload, dict):
+            payload = load_strict_json_object(
+                latest_path.read_text(encoding="utf-8")
+            )
+        except (OSError, ValueError):
             continue
         if payload.get("version") != REPORT_VERSION:
             continue
+        if payload.get("schema_version") != REPORT_VERSION:
+            continue
         if payload.get("mode") != settings.runtime_mode:
+            continue
+        if not artifact_integrity_is_valid(payload):
             continue
         if requested_scope is not None and not _feedback_scope_matches(
             payload.get("execution_account_scope"),
@@ -2605,6 +2766,234 @@ def _lessons(closed_trades: list[dict[str, object]], *, max_lessons: int) -> dic
     }
 
 
+def _feedback_learning_quality_gate(
+    *,
+    closed_trades: list[dict[str, object]],
+    candidate_rule_replay: dict[str, object],
+) -> dict[str, object]:
+    eligible_trades = [
+        trade for trade in closed_trades if trade.get("profitability_eligible") is True
+    ]
+    lineage_eligible_trades = [
+        trade for trade in eligible_trades if _trade_has_learning_lineage(trade)
+    ]
+    cost_complete_count = sum(
+        trade.get("transaction_cost_coverage") == "complete"
+        for trade in closed_trades
+    )
+    currency_known_count = sum(
+        bool(str(trade.get("settlement_currency") or "").strip())
+        for trade in closed_trades
+    )
+    scope_known_count = sum(
+        isinstance(trade.get("execution_scope"), dict)
+        for trade in closed_trades
+    )
+    blocked_reasons: list[str] = []
+    if not closed_trades:
+        status = "no_data"
+        blocked_reasons.append("no_closed_trades")
+    else:
+        if len(eligible_trades) != len(closed_trades):
+            blocked_reasons.append("incomplete_net_profitability_coverage")
+        if cost_complete_count != len(closed_trades):
+            blocked_reasons.append("incomplete_transaction_cost_coverage")
+        if currency_known_count != len(closed_trades):
+            blocked_reasons.append("incomplete_settlement_currency_coverage")
+        if scope_known_count != len(closed_trades):
+            blocked_reasons.append("incomplete_execution_scope_coverage")
+        if len(lineage_eligible_trades) != len(closed_trades):
+            blocked_reasons.append("incomplete_decision_lineage_coverage")
+        if candidate_rule_replay.get("status") != "ready":
+            blocked_reasons.append("candidate_replay_not_ready")
+        status = "blocked" if blocked_reasons else "ready"
+    return {
+        "schema_version": LEARNING_QUALITY_GATE_VERSION,
+        "status": status,
+        "consumer_eligible": status == "ready",
+        "blocked_reasons": blocked_reasons,
+        "closed_trade_count": len(closed_trades),
+        "net_profitability_eligible_trade_count": len(eligible_trades),
+        "transaction_cost_complete_trade_count": cost_complete_count,
+        "settlement_currency_known_trade_count": currency_known_count,
+        "execution_scope_known_trade_count": scope_known_count,
+        "decision_lineage_complete_trade_count": len(lineage_eligible_trades),
+        "candidate_replay_status": candidate_rule_replay.get("status"),
+        "requirements": {
+            "net_profitability": "all_closed_trades",
+            "transaction_cost_coverage": "complete",
+            "settlement_currency": "known",
+            "execution_scope": "known",
+            "decision_lineage": [
+                "source_execution_plan_item_id",
+                "decision_run_id",
+                "decision_agent_name",
+            ],
+        },
+    }
+
+
+def _operational_learning_context(
+    *,
+    settings: Settings,
+    db: Session,
+    started_at: datetime,
+    as_of: datetime,
+    requested_scope: FeedbackExecutionScope | None,
+) -> dict[str, object]:
+    """Aggregate bounded rejection/failure evidence without granting buy authority."""
+
+    failures = list(
+        db.scalars(
+            select(ExecutionFailure)
+            .where(
+                ExecutionFailure.mode == settings.runtime_mode,
+                ExecutionFailure.latest_failed_at >= started_at,
+                ExecutionFailure.latest_failed_at <= as_of,
+            )
+            .options(
+                load_only(
+                    ExecutionFailure.id,
+                    ExecutionFailure.execution_plan_item_id,
+                    ExecutionFailure.strategy_run_id,
+                    ExecutionFailure.decision_actor,
+                    ExecutionFailure.side,
+                    ExecutionFailure.intent,
+                    ExecutionFailure.classification,
+                    ExecutionFailure.retryable,
+                    ExecutionFailure.status,
+                    ExecutionFailure.latest_failed_at,
+                ),
+                selectinload(ExecutionFailure.broker_order).load_only(
+                    BrokerOrder.id,
+                    BrokerOrder.status,
+                    BrokerOrder.broker_name,
+                    BrokerOrder.venue,
+                    BrokerOrder.asset_class,
+                    BrokerOrder.request_metadata,
+                ),
+            )
+            .order_by(
+                ExecutionFailure.latest_failed_at.desc(),
+                ExecutionFailure.id.desc(),
+            )
+            .limit(MAX_OPERATIONAL_LEARNING_FAILURES + 1)
+        )
+    )
+    truncated = len(failures) > MAX_OPERATIONAL_LEARNING_FAILURES
+    failures = failures[:MAX_OPERATIONAL_LEARNING_FAILURES]
+    exact_scope_failures = [
+        failure
+        for failure in failures
+        if _failure_matches_feedback_scope(
+            failure=failure,
+            requested_scope=requested_scope,
+        )
+    ]
+    lineage_complete = [
+        failure
+        for failure in exact_scope_failures
+        if failure.execution_plan_item_id is not None
+        and failure.strategy_run_id is not None
+        and failure.decision_actor is not None
+    ]
+    blocked_reasons: list[str] = []
+    if requested_scope is None:
+        blocked_reasons.append("exact_execution_scope_required")
+    if truncated:
+        blocked_reasons.append("failure_rows_truncated")
+    if len(lineage_complete) != len(exact_scope_failures):
+        blocked_reasons.append("incomplete_failure_decision_lineage")
+    if not exact_scope_failures:
+        status = "no_data" if requested_scope is not None else "blocked"
+    else:
+        status = "blocked" if blocked_reasons else "ready"
+
+    def counts(values: Iterator[str]) -> dict[str, int]:
+        result: dict[str, int] = {}
+        for value in values:
+            key = value or "unknown"
+            result[key] = result.get(key, 0) + 1
+        return dict(sorted(result.items()))
+
+    return {
+        "schema_version": "operational-learning-context-v1",
+        "status": status,
+        "consumer_eligible": status == "ready",
+        "blocked_reasons": blocked_reasons,
+        "scope": requested_scope.as_payload() if requested_scope is not None else None,
+        "window": {
+            "start_at": started_at.isoformat(),
+            "end_at": as_of.isoformat(),
+        },
+        "failure_count": len(exact_scope_failures),
+        "decision_lineage_complete_failure_count": len(lineage_complete),
+        "decision_lineage_missing_failure_count": (
+            len(exact_scope_failures) - len(lineage_complete)
+        ),
+        "classification_counts": counts(
+            str(failure.classification or "unknown")
+            for failure in exact_scope_failures
+        ),
+        "failure_status_counts": counts(
+            str(failure.status or "unknown") for failure in exact_scope_failures
+        ),
+        "broker_order_status_counts": counts(
+            str(failure.broker_order.status or "unknown")
+            for failure in exact_scope_failures
+        ),
+        "side_counts": counts(
+            str(failure.side or "unknown") for failure in exact_scope_failures
+        ),
+        "retryability_counts": {
+            "retryable": sum(failure.retryable is True for failure in exact_scope_failures),
+            "not_retryable": sum(
+                failure.retryable is False for failure in exact_scope_failures
+            ),
+        },
+        "allowed_effects": ["delay", "downsize", "reject"],
+        "prohibited_effects": ["approve", "increase_size"],
+        "instruction": (
+            "may_apply_negative_operational_lessons_only"
+            if status == "ready"
+            else "do_not_apply_operational_lessons"
+        ),
+    }
+
+
+def _failure_matches_feedback_scope(
+    *,
+    failure: ExecutionFailure,
+    requested_scope: FeedbackExecutionScope | None,
+) -> bool:
+    if requested_scope is None:
+        return False
+    if failure.broker_order is None:
+        return False
+    route_scope = fifo_route_scope_from_order(failure.broker_order)
+    if route_scope is None:
+        return False
+    return (
+        route_scope.provider == requested_scope.provider
+        and route_scope.account_scope == requested_scope.account_scope
+        and (
+            requested_scope.exchange is None
+            or route_scope.exchange == requested_scope.exchange
+        )
+    )
+
+
+def _trade_has_learning_lineage(trade: dict[str, object]) -> bool:
+    return all(
+        trade.get(key) is not None
+        for key in (
+            "source_execution_plan_item_id",
+            "decision_run_id",
+            "decision_agent_name",
+        )
+    )
+
+
 def _candidate_rules(settings: Settings) -> list[CandidateRule]:
     return [
         CandidateRule(
@@ -3726,11 +4115,14 @@ def _write_artifacts(
     report_date: date,
     output_dir: Path,
     artifact_scope: FeedbackExecutionScope | None = None,
-) -> None:
+) -> dict[str, object]:
     output_dir.mkdir(parents=True, exist_ok=True)
     json_path = output_dir / f"{report_date.isoformat()}.json"
     md_path = output_dir / f"{report_date.isoformat()}.md"
-    payload = _json_safe(redact_account_references(report))
+    safe_payload = _json_safe(redact_account_references(report))
+    if not isinstance(safe_payload, dict):
+        raise TypeError("trade outcome feedback payload must be an object")
+    payload = attach_artifact_integrity(safe_payload)
     json_text = json.dumps(payload, ensure_ascii=False, indent=2)
     markdown_text = _markdown_report(payload)
     if artifact_scope is not None:
@@ -3774,11 +4166,12 @@ def _write_artifacts(
             ),
             markdown_text,
         )
-        return
+        return payload
     _atomic_write_text(json_path, json_text + "\n")
     _atomic_write_text(output_dir / "latest.json", json_text + "\n")
     _atomic_write_text(md_path, markdown_text)
     _atomic_write_text(output_dir / "latest.md", markdown_text)
+    return payload
 
 
 def _atomic_write_text(path: Path, contents: str) -> None:

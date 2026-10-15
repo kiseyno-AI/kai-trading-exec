@@ -37,6 +37,7 @@ from app.services.position_identity import (
 )
 from app.services.execution_account_route import bind_kis_account_route
 from app.services.trigger_time_exec_agent import _run_exec_agent_command
+from app.services.trade_outcome_feedback import REPORT_VERSION
 
 
 async def _wait_for_thread_event(event: threading.Event) -> None:
@@ -219,7 +220,7 @@ def test_watch_sizing_cycle_refreshes_trade_feedback_before_agent_sizing(
         )
         return {
             "status": "generated",
-            "version": "trade-outcome-feedback-v2",
+            "version": REPORT_VERSION,
             "generated_at": now.isoformat(),
             "closed_trade_count": 0,
         }
@@ -271,7 +272,7 @@ def test_watch_sizing_cycle_invalidates_monitoring_snapshot_after_price_watch_re
     monkeypatch.setattr(
         autonomous_runtime,
         "ensure_fresh_trade_outcome_feedback",
-        lambda **_: {"status": "fresh", "version": "trade-outcome-feedback-v2"},
+        lambda **_: {"status": "fresh", "version": REPORT_VERSION},
     )
     monkeypatch.setattr(
         autonomous_runtime,
@@ -334,7 +335,7 @@ def test_watch_sizing_cycle_skips_database_feedback_outside_window(
     assert payload["reason"] == "outside_sizing_window"
     assert payload["trade_outcome_feedback"] == {
         "status": "skipped",
-        "version": "trade-outcome-feedback-v2",
+        "version": REPORT_VERSION,
         "reason": "outside_sizing_window",
     }
 
@@ -405,7 +406,7 @@ def test_watch_sizing_feedback_fails_closed_without_stable_live_account_scope(
 
     assert payload["trade_outcome_feedback"] == {
         "status": "unavailable",
-        "version": "trade-outcome-feedback-v2",
+        "version": REPORT_VERSION,
         "reason": "active_kis_account_scope_unavailable",
     }
 
