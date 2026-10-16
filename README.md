@@ -798,6 +798,30 @@ Weekly artifacts default to `var/analytics/weekly_trade_review/`. They include F
 
 The `weekly-trade-review-v2` JSON contract is checksummed with canonical SHA-256 and is consumed only after strict JSON and integrity validation. Performance feedback is eligible only with complete net-P/L, cost, currency, execution-scope, and decision-lineage evidence. Failure and rejection feedback is a separate negative-only channel: it requires complete normalized `ExecutionFailure` lineage, may support only delay/downsize/reject behavior, and cannot approve or increase an order.
 
+For `weekly-trade-review-v2`, complete immutable lineage is an exact fail-closed
+predicate. Every identity below must be a string whose `strip()` result is
+non-empty, every date must be a valid ISO calendar date, status must be exactly
+`complete`, and `decision_lineage_source` must be exactly `order_snapshot`,
+`fill_snapshot`, or `order_and_fill_snapshot`. Conflict markers, mutable-plan
+fallbacks, unknown sources, and partial or invalid snapshots are never complete.
+
+- Fill rows require `execution_plan_item_id`, `decision_execution_plan_id`,
+  `decision_external_plan_id`, `source_plan_item_id`, `decision_agent_name`,
+  `decision_snapshot_id`, `decision_run_id`, `execution_plan_source`, and
+  `strategy_run_id`; `source_market_date` and `target_market_date` must be valid;
+  normalized `decision_run_id` must equal normalized `strategy_run_id`.
+- Closed-trade rows require `source_execution_plan_item_id`,
+  `decision_execution_plan_id`, `decision_external_plan_id`,
+  `source_plan_item_id`, `decision_agent_name`, `decision_snapshot_id`,
+  `decision_run_id`, `decision_plan_source`, and `decision_strategy_run_id`;
+  `decision_source_market_date` and `decision_target_market_date` must be valid;
+  normalized `decision_run_id` must equal normalized
+  `decision_strategy_run_id`.
+- An execution failure is lineage-linked only when
+  `execution_plan_item_id`, `strategy_run_id`, and `decision_actor` are all
+  normalized non-empty strings. Empty or whitespace-only values count as
+  missing and block failure-feedback eligibility.
+
 ### Fill evidence repair
 
 New orders snapshot the Core decision lineage in `broker_orders.request_metadata`

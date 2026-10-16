@@ -72,6 +72,50 @@ class WeeklyTradeReviewTimeoutError(TimeoutError):
 WEEKLY_TRADE_REVIEW_SCHEMA_VERSION = "weekly-trade-review-v2"
 WEEKLY_LEARNING_EVIDENCE_SCHEMA_VERSION = "weekly-learning-evidence-v1"
 
+# The v2 artifact exposes the same immutable decision identity under different
+# field names for fill rows and FIFO-derived closed-trade rows.  Keep the
+# complete-lineage predicate centralized so producers and external validators
+# can implement one exact fail-closed contract instead of drifting between the
+# two projections.
+WEEKLY_COMPLETE_LINEAGE_EVIDENCE_SOURCES = frozenset(
+    {"order_snapshot", "fill_snapshot", "order_and_fill_snapshot"}
+)
+WEEKLY_FILL_LINEAGE_TEXT_FIELDS = (
+    "execution_plan_item_id",
+    "decision_execution_plan_id",
+    "decision_external_plan_id",
+    "source_plan_item_id",
+    "decision_agent_name",
+    "decision_snapshot_id",
+    "decision_run_id",
+    "execution_plan_source",
+    "strategy_run_id",
+)
+WEEKLY_FILL_LINEAGE_DATE_FIELDS = (
+    "source_market_date",
+    "target_market_date",
+)
+WEEKLY_CLOSED_TRADE_LINEAGE_TEXT_FIELDS = (
+    "source_execution_plan_item_id",
+    "decision_execution_plan_id",
+    "decision_external_plan_id",
+    "source_plan_item_id",
+    "decision_agent_name",
+    "decision_snapshot_id",
+    "decision_run_id",
+    "decision_plan_source",
+    "decision_strategy_run_id",
+)
+WEEKLY_CLOSED_TRADE_LINEAGE_DATE_FIELDS = (
+    "decision_source_market_date",
+    "decision_target_market_date",
+)
+WEEKLY_EXECUTION_FAILURE_LINEAGE_FIELDS = (
+    "execution_plan_item_id",
+    "strategy_run_id",
+    "decision_actor",
+)
+
 
 ACTIVE_WATCH_REVIEW_STATUSES = (
     WATCH_SIZING_PENDING_STATUS,
@@ -596,6 +640,66 @@ def _lineage_date(value: object) -> date | None:
         return None
 
 
+def _normalized_lineage_text(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    return normalized or None
+
+
+def _weekly_lineage_is_complete(
+    row: dict[str, object],
+    *,
+    text_fields: Sequence[str],
+    date_fields: Sequence[str],
+    strategy_run_field: str,
+) -> bool:
+    """Apply the exact fail-closed lineage predicate for v2 export rows."""
+
+    if row.get("decision_lineage_status") != "complete":
+        return False
+    if (
+        _normalized_lineage_text(row.get("decision_lineage_source"))
+        not in WEEKLY_COMPLETE_LINEAGE_EVIDENCE_SOURCES
+    ):
+        return False
+    if any(
+        _normalized_lineage_text(row.get(field)) is None
+        for field in text_fields
+    ):
+        return False
+    if any(_lineage_date(row.get(field)) is None for field in date_fields):
+        return False
+    return _normalized_lineage_text(row.get("decision_run_id")) == (
+        _normalized_lineage_text(row.get(strategy_run_field))
+    )
+
+
+def _weekly_fill_lineage_is_complete(row: dict[str, object]) -> bool:
+    return _weekly_lineage_is_complete(
+        row,
+        text_fields=WEEKLY_FILL_LINEAGE_TEXT_FIELDS,
+        date_fields=WEEKLY_FILL_LINEAGE_DATE_FIELDS,
+        strategy_run_field="strategy_run_id",
+    )
+
+
+def _weekly_closed_trade_lineage_is_complete(row: dict[str, object]) -> bool:
+    return _weekly_lineage_is_complete(
+        row,
+        text_fields=WEEKLY_CLOSED_TRADE_LINEAGE_TEXT_FIELDS,
+        date_fields=WEEKLY_CLOSED_TRADE_LINEAGE_DATE_FIELDS,
+        strategy_run_field="decision_strategy_run_id",
+    )
+
+
+def _weekly_failure_lineage_is_complete(row: dict[str, object]) -> bool:
+    return all(
+        _normalized_lineage_text(row.get(field)) is not None
+        for field in WEEKLY_EXECUTION_FAILURE_LINEAGE_FIELDS
+    )
+
+
 def _weekly_fill_attribution_coverage(
     fills: Sequence[dict[str, object]],
     *,
@@ -604,33 +708,20 @@ def _weekly_fill_attribution_coverage(
     unlinked_fill_ids = sorted(
         str(row["id"])
         for row in fills
-        if row.get("execution_plan_item_id") is None
+        if _normalized_lineage_text(row.get("execution_plan_item_id")) is None
     )
     decision_run_mismatch_ids = sorted(
         str(row["id"])
         for row in fills
-        if row.get("execution_plan_source") == "kai-trading-core"
-        and (
-            row.get("strategy_run_id") is None
-            or row.get("decision_run_id") != row.get("strategy_run_id")
-        )
+        if _normalized_lineage_text(row.get("decision_run_id")) is not None
+        and _normalized_lineage_text(row.get("strategy_run_id")) is not None
+        and _normalized_lineage_text(row.get("decision_run_id"))
+        != _normalized_lineage_text(row.get("strategy_run_id"))
     )
     missing_decision_ids = sorted(
         str(row["id"])
         for row in fills
-        if row.get("decision_lineage_status") != "complete"
-        or row.get("decision_execution_plan_id") is None
-        or row.get("decision_external_plan_id") is None
-        or row.get("source_plan_item_id") is None
-        or row.get("decision_snapshot_id") is None
-        or row.get("decision_agent_name") is None
-        or row.get("decision_run_id") is None
-        or row.get("source_market_date") is None
-        or row.get("target_market_date") is None
-        or row.get("execution_plan_source") is None
-        or row.get("strategy_run_id") is None
-        or row.get("decision_run_id") != row.get("strategy_run_id")
-        or str(row["id"]) in decision_run_mismatch_ids
+        if not _weekly_fill_lineage_is_complete(row)
     )
     if truncated:
         status = "truncated"
@@ -671,20 +762,7 @@ def _weekly_learning_evidence(
         {
             str(row.get("sell_fill_id"))
             for row in closed_trades
-            if row.get("decision_lineage_status") != "complete"
-            or row.get("decision_execution_plan_id") is None
-            or row.get("decision_external_plan_id") is None
-            or row.get("source_execution_plan_item_id") is None
-            or row.get("source_plan_item_id") is None
-            or row.get("decision_snapshot_id") is None
-            or row.get("decision_run_id") is None
-            or row.get("decision_agent_name") is None
-            or row.get("decision_plan_source") is None
-            or row.get("decision_strategy_run_id") is None
-            or row.get("decision_target_market_date") is None
-            or row.get("decision_source_market_date") is None
-            or row.get("decision_run_id")
-            != row.get("decision_strategy_run_id")
+            if not _weekly_closed_trade_lineage_is_complete(row)
         }
     )
     performance_blocked_reasons: list[str] = []
@@ -709,9 +787,7 @@ def _weekly_learning_evidence(
     failure_rows_with_lineage = sum(
         1
         for row in execution_failures
-        if row.get("execution_plan_item_id") is not None
-        and row.get("strategy_run_id") is not None
-        and row.get("decision_actor") is not None
+        if _weekly_failure_lineage_is_complete(row)
     )
     failure_status_counts = _count_values(execution_failures, "status")
     failure_classification_counts = _count_values(execution_failures, "classification")

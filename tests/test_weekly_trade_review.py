@@ -27,8 +27,14 @@ from app.models.runtime import (
     MonitoringCheckpoint,
 )
 from app.services.weekly_trade_review import (
+    WEEKLY_CLOSED_TRADE_LINEAGE_DATE_FIELDS,
+    WEEKLY_CLOSED_TRADE_LINEAGE_TEXT_FIELDS,
+    WEEKLY_COMPLETE_LINEAGE_EVIDENCE_SOURCES,
+    WEEKLY_FILL_LINEAGE_DATE_FIELDS,
+    WEEKLY_FILL_LINEAGE_TEXT_FIELDS,
     WEEKLY_TRADE_REVIEW_SCHEMA_VERSION,
     WeeklyTradeReviewTimeoutError,
+    _weekly_closed_trade_lineage_is_complete,
     _weekly_closed_trades,
     _weekly_fill_attribution_coverage,
     _weekly_fills,
@@ -111,6 +117,218 @@ def test_weekly_failure_learning_requires_complete_lineage() -> None:
     assert feedback["status"] == "complete"
     assert feedback["consumer_eligible"] is True
     assert feedback["blocked_reasons"] == []
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid_value"),
+    [
+        (field, invalid_value)
+        for field in (
+            "execution_plan_item_id",
+            "strategy_run_id",
+            "decision_actor",
+        )
+        for invalid_value in (None, "", " \t ")
+    ],
+)
+def test_weekly_failure_learning_rejects_missing_or_blank_lineage(
+    field: str,
+    invalid_value: object,
+) -> None:
+    failure = {
+        "execution_plan_item_id": "item-1",
+        "strategy_run_id": "run-1",
+        "decision_actor": "signal-decider",
+        "status": "open",
+        "classification": "broker_rejected",
+        "retryable": False,
+    }
+    failure[field] = invalid_value
+
+    evidence = _weekly_learning_evidence(
+        fill_attribution_coverage={"status": "empty"},
+        realized_pnl_coverage={"status": "complete"},
+        realized_pnl_summary={
+            "transaction_cost_coverage": "complete",
+            "currency_coverage": "complete",
+        },
+        closed_trades=[],
+        weekly_order_status_counts=[
+            {"side": "buy", "status": "rejected", "count": 1}
+        ],
+        execution_failures=[failure],
+        truncated={
+            "fills": False,
+            "weekly_orders": False,
+            "execution_failures": False,
+            "closed_trades": False,
+        },
+    )
+
+    feedback = evidence["failure_and_rejection_feedback"]
+    assert feedback["status"] == "blocked"
+    assert feedback["consumer_eligible"] is False
+    assert feedback["lineage_linked_execution_failure_count"] == 0
+    assert feedback["lineage_missing_execution_failure_count"] == 1
+    assert "incomplete_execution_failure_lineage" in feedback["blocked_reasons"]
+
+
+def _complete_weekly_fill_lineage() -> dict[str, object]:
+    return {
+        "id": "fill-1",
+        "decision_lineage_status": "complete",
+        "decision_lineage_source": "order_and_fill_snapshot",
+        "execution_plan_item_id": "item-1",
+        "decision_execution_plan_id": "plan-1",
+        "decision_external_plan_id": "external-plan-1",
+        "source_plan_item_id": "source-item-1",
+        "decision_agent_name": "signal-decider",
+        "decision_snapshot_id": "snapshot-1",
+        "decision_run_id": "run-1",
+        "execution_plan_source": "kai-trading-core",
+        "strategy_run_id": "run-1",
+        "source_market_date": datetime(2026, 10, 15, tzinfo=UTC).date(),
+        "target_market_date": datetime(2026, 10, 16, tzinfo=UTC).date(),
+    }
+
+
+@pytest.mark.parametrize(
+    "source",
+    sorted(WEEKLY_COMPLETE_LINEAGE_EVIDENCE_SOURCES),
+)
+def test_weekly_fill_lineage_accepts_only_complete_immutable_sources(
+    source: str,
+) -> None:
+    row = _complete_weekly_fill_lineage()
+    row["decision_lineage_source"] = source
+
+    coverage = _weekly_fill_attribution_coverage([row], truncated=False)
+
+    assert coverage["status"] == "complete"
+    assert coverage["decision_identity_missing_fill_ids"] == []
+
+
+@pytest.mark.parametrize("field", WEEKLY_FILL_LINEAGE_TEXT_FIELDS)
+def test_weekly_fill_lineage_rejects_every_blank_required_identity(field: str) -> None:
+    row = _complete_weekly_fill_lineage()
+    row[field] = " \t "
+
+    coverage = _weekly_fill_attribution_coverage([row], truncated=False)
+
+    assert coverage["status"] == "incomplete"
+    assert coverage["decision_identity_missing_fill_ids"] == ["fill-1"]
+    if field == "execution_plan_item_id":
+        assert coverage["execution_plan_item_unlinked_fill_rows"] == 1
+        assert coverage["unlinked_fill_ids"] == ["fill-1"]
+    if field in {"decision_run_id", "strategy_run_id"}:
+        assert coverage["decision_run_mismatch_fill_rows"] == 0
+        assert coverage["decision_run_mismatch_fill_ids"] == []
+
+
+@pytest.mark.parametrize("field", WEEKLY_FILL_LINEAGE_DATE_FIELDS)
+def test_weekly_fill_lineage_rejects_every_invalid_required_date(field: str) -> None:
+    row = _complete_weekly_fill_lineage()
+    row[field] = "not-a-date"
+
+    coverage = _weekly_fill_attribution_coverage([row], truncated=False)
+
+    assert coverage["status"] == "incomplete"
+    assert coverage["decision_identity_missing_fill_ids"] == ["fill-1"]
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid_value"),
+    [
+        ("decision_lineage_status", "partial"),
+        ("decision_lineage_source", "order_fill_snapshot_conflict"),
+        ("decision_lineage_source", "fill_conflict_marker"),
+        ("decision_lineage_source", " \t "),
+        ("strategy_run_id", "different-run"),
+    ],
+)
+def test_weekly_fill_lineage_rejects_noncomplete_or_conflicting_evidence(
+    field: str,
+    invalid_value: object,
+) -> None:
+    row = _complete_weekly_fill_lineage()
+    row[field] = invalid_value
+
+    coverage = _weekly_fill_attribution_coverage([row], truncated=False)
+
+    assert coverage["status"] == "incomplete"
+    assert coverage["decision_identity_missing_fill_ids"] == ["fill-1"]
+
+
+def _complete_weekly_closed_trade_lineage() -> dict[str, object]:
+    return {
+        "sell_fill_id": "sell-fill-1",
+        "decision_lineage_status": "complete",
+        "decision_lineage_source": "order_snapshot",
+        "source_execution_plan_item_id": "item-1",
+        "decision_execution_plan_id": "plan-1",
+        "decision_external_plan_id": "external-plan-1",
+        "source_plan_item_id": "source-item-1",
+        "decision_agent_name": "signal-decider",
+        "decision_snapshot_id": "snapshot-1",
+        "decision_run_id": "run-1",
+        "decision_plan_source": "kai-trading-core",
+        "decision_strategy_run_id": "run-1",
+        "decision_source_market_date": "2026-10-15",
+        "decision_target_market_date": "2026-10-16",
+    }
+
+
+@pytest.mark.parametrize(
+    "source",
+    sorted(WEEKLY_COMPLETE_LINEAGE_EVIDENCE_SOURCES),
+)
+def test_weekly_closed_trade_lineage_accepts_only_complete_immutable_sources(
+    source: str,
+) -> None:
+    row = _complete_weekly_closed_trade_lineage()
+    row["decision_lineage_source"] = source
+
+    assert _weekly_closed_trade_lineage_is_complete(row) is True
+
+
+@pytest.mark.parametrize("field", WEEKLY_CLOSED_TRADE_LINEAGE_TEXT_FIELDS)
+def test_weekly_closed_trade_lineage_rejects_every_blank_required_identity(
+    field: str,
+) -> None:
+    row = _complete_weekly_closed_trade_lineage()
+    row[field] = " \t "
+
+    assert _weekly_closed_trade_lineage_is_complete(row) is False
+
+
+@pytest.mark.parametrize("field", WEEKLY_CLOSED_TRADE_LINEAGE_DATE_FIELDS)
+def test_weekly_closed_trade_lineage_rejects_every_invalid_required_date(
+    field: str,
+) -> None:
+    row = _complete_weekly_closed_trade_lineage()
+    row[field] = "2026-02-30"
+
+    assert _weekly_closed_trade_lineage_is_complete(row) is False
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid_value"),
+    [
+        ("decision_lineage_status", "conflict"),
+        ("decision_lineage_source", "order_fill_snapshot_conflict"),
+        ("decision_lineage_source", "mutable_plan_item_fallback"),
+        ("decision_lineage_source", ""),
+        ("decision_strategy_run_id", "different-run"),
+    ],
+)
+def test_weekly_closed_trade_lineage_rejects_noncomplete_or_conflicting_evidence(
+    field: str,
+    invalid_value: object,
+) -> None:
+    row = _complete_weekly_closed_trade_lineage()
+    row[field] = invalid_value
+
+    assert _weekly_closed_trade_lineage_is_complete(row) is False
 
 
 def test_plan_item_review_does_not_present_terminal_jobs_as_active_next_open_work() -> None:
