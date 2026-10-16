@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -61,6 +61,7 @@ from app.services.account_drawdown_recovery import (
     recovery_policy_fingerprint,
 )
 from app.services import trade_outcome_feedback as feedback_service
+from app.services.execution_lineage import decision_lineage_for_plan_item
 from app.services.fifo_inventory import FifoIsolationCursor, FifoRouteScope
 from app.services.position_identity import PositionIdentity, payload_with_position_identity
 from app.services.trigger_time_exec_agent import _request_payload
@@ -74,6 +75,50 @@ COMPLETE_KRW_FILL_ECONOMICS: dict[str, object] = {
     "transaction_cost_source": "test_fixture",
 }
 FEEDBACK_TEST_ACCOUNT_SCOPE = "a" * 24
+
+
+def test_partial_lineage_is_excluded_from_feedback_profitability_summary() -> None:
+    summary = feedback_service._summary(
+        [
+            {
+                "realized_pnl_krw": "1000",
+                "gross_realized_pnl": "1010",
+                "net_realized_pnl": "1000",
+                "settlement_currency": "KRW",
+                "transaction_cost_coverage": "complete",
+                "profitability_eligible": False,
+                "decision_lineage_status": "partial",
+                "outcome_source": "fifo_exact",
+                "outcome_quality_flags": ["decision_lineage_partial"],
+            }
+        ]
+    )
+
+    assert summary["profitability_status"] == "degraded_decision_lineage"
+    assert summary["profitability_eligible_trade_count"] == 0
+    assert summary["realized_pnl_krw"] is None
+    assert summary["net_realized_pnl_by_currency"] == {"KRW": None}
+    assert summary["win_rate_pct"] is None
+    assert summary["average_win_krw"] is None
+    assert summary["worst_loss_krw"] is None
+    assert summary["gross_realized_pnl_by_currency"] == {"KRW": "1010.0000"}
+
+    snippet = feedback_service._snippet(
+        summary=summary,
+        lessons={
+            "patterns_to_downsize_or_reject": [],
+            "worst_losses": [],
+            "positive_expectancy_patterns": [],
+        },
+        portfolio_risk={"available": False, "source_failed": "test"},
+        candidate_rule_replay={"status": "blocked", "blocked_reason": "test"},
+        broker_asset_performance={"available": False, "source_failed": "test"},
+        account_drawdown_gate={},
+    )
+
+    assert "net profitability unavailable" in snippet["summary"]
+    assert "win_rate=" not in snippet["summary"]
+    assert "worst_loss=" not in snippet["summary"]
 
 
 def _write_quality_gated_feedback_artifact(
@@ -227,9 +272,14 @@ def _add_closed_trade(
     buy_transaction_cost: str = "0",
     sell_transaction_cost: str = "0",
 ) -> None:
+    if plan.market_date is None:
+        plan.market_date = date(2026, 6, filled_day)
+    if plan.strategy_run_id is None:
+        plan.strategy_run_id = f"decision-{suffix}"
     item = ExecutionPlanItem(
         id=f"item-buy-{suffix}",
         plan=plan,
+        execution_plan_id=plan.id,
         symbol=symbol,
         side="buy",
         intent="next_open_buy",
@@ -238,9 +288,14 @@ def _add_closed_trade(
         quantity_policy={"kind": "shares", "quantity": quantity},
         risk_context=risk_context or {},
         decision_agent_name="short-term-decider",
-        decision_run_id=f"decision-{suffix}",
+        decision_snapshot_id=f"snapshot-{suffix}",
+        decision_run_id=plan.strategy_run_id,
         source_plan_item_id=f"core-{suffix}",
+        source_market_date=date(2026, 6, max(1, filled_day - 1)),
     )
+    lineage = decision_lineage_for_plan_item(item)
+    assert lineage is not None
+    assert lineage["status"] == "complete"
     buy_order = BrokerOrder(
         id=f"order-buy-{suffix}",
         plan_item=item,
@@ -255,6 +310,7 @@ def _add_closed_trade(
         venue="KRX",
         asset_class="stock",
         request_metadata={
+            "decision_lineage": lineage,
             "provider": "kis",
             "venue": "KRX",
             "asset_class": "stock",
@@ -336,6 +392,7 @@ def _bind_closed_trade_to_execution_scope(
         order.broker_name = provider
         order.venue = exchange
         order.request_metadata = {
+            **dict(order.request_metadata or {}),
             "execution_scope": {
                 "policy_version": 1,
                 "provider": provider,
@@ -348,8 +405,11 @@ def _bind_closed_trade_to_execution_scope(
 
 
 def _fifo_test_order(*, row_id: str, side: str) -> BrokerOrder:
+    item_id = f"{row_id}-item"
+    decision_run_id = f"{row_id}-run"
     return BrokerOrder(
         id=row_id,
+        execution_plan_item_id=item_id,
         broker_name="kis",
         mode="paper",
         idempotency_key=row_id,
@@ -360,6 +420,21 @@ def _fifo_test_order(*, row_id: str, side: str) -> BrokerOrder:
         venue="KRX",
         asset_class="stock",
         request_metadata={
+            "decision_lineage": {
+                "schema_version": "execution-decision-lineage-v1",
+                "status": "complete",
+                "execution_plan_id": f"{row_id}-plan",
+                "execution_plan_item_id": item_id,
+                "external_plan_id": f"{row_id}-external-plan",
+                "plan_source": "test-fixture",
+                "strategy_run_id": decision_run_id,
+                "target_market_date": "2026-06-10",
+                "source_plan_item_id": f"{row_id}-source-item",
+                "decision_agent_name": "test-decision-agent",
+                "decision_snapshot_id": f"{row_id}-snapshot",
+                "decision_run_id": decision_run_id,
+                "source_market_date": "2026-06-09",
+            },
             "execution_scope": {
                 "policy_version": 1,
                 "provider": "kis",
@@ -729,12 +804,14 @@ def test_generate_trade_outcome_feedback_writes_fifo_report_and_snippet(tmp_path
         id="plan-1",
         external_plan_id="plan-feedback-1",
         source="kai-trading-core",
-        strategy_run_id="run-1",
+        strategy_run_id="decision-run-1",
+        market_date=date(2026, 6, 10),
         mode="paper",
     )
     item = ExecutionPlanItem(
         id="item-buy-1",
         plan=plan,
+        execution_plan_id=plan.id,
         symbol="005930",
         side="buy",
         intent="next_open_buy",
@@ -757,9 +834,14 @@ def test_generate_trade_outcome_feedback_writes_fifo_report_and_snippet(tmp_path
             "trading_value": "90000000000",
         },
         decision_agent_name="short-term-decider",
+        decision_snapshot_id="decision-snapshot-1",
         decision_run_id="decision-run-1",
         source_plan_item_id="core-item-1",
+        source_market_date=date(2026, 6, 9),
     )
+    lineage = decision_lineage_for_plan_item(item)
+    assert lineage is not None
+    assert lineage["status"] == "complete"
     buy_order = BrokerOrder(
         id="order-buy-1",
         plan_item=item,
@@ -774,6 +856,7 @@ def test_generate_trade_outcome_feedback_writes_fifo_report_and_snippet(tmp_path
         venue="KRX",
         asset_class="stock",
         request_metadata={
+            "decision_lineage": lineage,
             "provider": "kis",
             "venue": "KRX",
             "asset_class": "stock",
@@ -2241,6 +2324,7 @@ def test_trade_outcome_feedback_portfolio_risk_and_sell_reason_contributions(tmp
         external_plan_id="plan-risk-1",
         source="kai-trading-core",
         strategy_run_id="run-risk-1",
+        market_date=date(2026, 6, 15),
         mode="paper",
     )
     buy_a = ExecutionPlanItem(
@@ -2303,6 +2387,21 @@ def test_trade_outcome_feedback_portfolio_risk_and_sell_reason_contributions(tmp
         intent="target_sell",
         status="broker_order_submitted",
     )
+    for plan_item in (
+        buy_a,
+        stop_sell,
+        buy_b,
+        target_sell,
+        buy_c,
+        max_holding_sell,
+        open_item,
+    ):
+        plan_item.execution_plan_id = plan.id
+        plan_item.source_plan_item_id = f"core-{plan_item.id}"
+        plan_item.decision_agent_name = "short-term-decider"
+        plan_item.decision_snapshot_id = f"snapshot-{plan_item.id}"
+        plan_item.decision_run_id = plan.strategy_run_id
+        plan_item.source_market_date = date(2026, 6, 14)
     orders = [
         BrokerOrder(
             id="order-buy-a",
@@ -2396,6 +2495,7 @@ def test_trade_outcome_feedback_portfolio_risk_and_sell_reason_contributions(tmp
         order.venue = "KRX"
         order.asset_class = "stock"
         order.request_metadata = {
+            "decision_lineage": decision_lineage_for_plan_item(order.plan_item),
             "provider": "kis",
             "venue": "KRX",
             "asset_class": "stock",
@@ -3442,10 +3542,18 @@ def test_candidate_rule_replay_needs_three_replay_eligible_tightens_for_promotio
 def test_candidate_rule_replay_uses_sell_post_entry_context(tmp_path) -> None:
     engine, session = _session()
     settings = Settings(runtime_mode="paper", trade_outcome_feedback_dir=str(tmp_path))
-    plan = ExecutionPlan(id="plan-replay-sell-context", external_plan_id="plan-replay-sell-context", source="kai-trading-core", mode="paper")
+    plan = ExecutionPlan(
+        id="plan-replay-sell-context",
+        external_plan_id="plan-replay-sell-context",
+        source="kai-trading-core",
+        strategy_run_id="decision-sell-context",
+        market_date=date(2026, 6, 10),
+        mode="paper",
+    )
     buy_item = ExecutionPlanItem(
         id="item-buy-sell-context",
         plan=plan,
+        execution_plan_id=plan.id,
         symbol="SCTX",
         side="buy",
         intent="intraday_watch_buy",
@@ -3453,11 +3561,15 @@ def test_candidate_rule_replay_uses_sell_post_entry_context(tmp_path) -> None:
         quantity_policy={"kind": "shares", "quantity": 10},
         risk_context={},
         decision_agent_name="short-term-decider",
+        decision_snapshot_id="snapshot-buy-sell-context",
         decision_run_id="decision-sell-context",
+        source_plan_item_id="core-buy-sell-context",
+        source_market_date=date(2026, 6, 9),
     )
     sell_item = ExecutionPlanItem(
         id="item-sell-sell-context",
         plan=plan,
+        execution_plan_id=plan.id,
         symbol="SCTX",
         side="sell",
         intent="stop_sell",
@@ -3470,7 +3582,10 @@ def test_candidate_rule_replay_uses_sell_post_entry_context(tmp_path) -> None:
             }
         },
         decision_agent_name="short-term-decider",
+        decision_snapshot_id="snapshot-sell-sell-context",
         decision_run_id="decision-sell-context",
+        source_plan_item_id="core-sell-sell-context",
+        source_market_date=date(2026, 6, 9),
     )
     buy_order = BrokerOrder(
         id="order-buy-sell-context",
@@ -3486,6 +3601,7 @@ def test_candidate_rule_replay_uses_sell_post_entry_context(tmp_path) -> None:
         venue="KRX",
         asset_class="stock",
         request_metadata={
+            "decision_lineage": decision_lineage_for_plan_item(buy_item),
             "provider": "kis",
             "venue": "KRX",
             "asset_class": "stock",
@@ -3510,6 +3626,7 @@ def test_candidate_rule_replay_uses_sell_post_entry_context(tmp_path) -> None:
         venue="KRX",
         asset_class="stock",
         request_metadata={
+            "decision_lineage": decision_lineage_for_plan_item(sell_item),
             "provider": "kis",
             "venue": "KRX",
             "asset_class": "stock",

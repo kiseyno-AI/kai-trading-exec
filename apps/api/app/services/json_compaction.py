@@ -24,6 +24,10 @@ DEFAULT_DROP_KEYS = frozenset(
 )
 
 PLAN_ITEM_SUBMISSION_RISK_KEYS = (
+    # Retained sell rows can be authorized by a newer plan than their immutable
+    # operational FK. This bounded snapshot must survive saturated legacy
+    # contexts or later placement can fall back to a hybrid old parent.
+    "sell_monitor_authority_v1",
     "monitoring_order_authority",
     "short_term_watcher_order_authority",
     "exchange",

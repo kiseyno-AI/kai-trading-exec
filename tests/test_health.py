@@ -48,6 +48,7 @@ from app.models.runtime import (
 from app.services import runtime as runtime_service, runtime_controls
 from app.services import schema as schema_service
 from app.services.execution_account_route import bind_kis_account_route
+from app.services.execution_lineage import decision_lineage_for_plan_item
 from app.services.position_identity import (
     build_position_identity,
     execution_scope_payload,
@@ -64,6 +65,7 @@ from app.services.monitoring import (
     _maintain_post_entry_exit_monitors,
     _load_monitored_items,
     _monitoring_item_is_configured,
+    _monitoring_order_idempotency_key,
     _pending_broker_order_symbols,
     _plan_item_exchange,
     _resolve_sell_quantity,
@@ -3516,6 +3518,7 @@ def test_replanned_sell_monitor_updates_existing_source_row_in_place() -> None:
             "plan_id": "plan-old-replanned-sell",
             "source": "test-fixture",
             "market_date": "2026-05-21",
+            "strategy_run_id": "old-run",
             "items": [
                 {
                     "symbol": "000660",
@@ -3524,7 +3527,10 @@ def test_replanned_sell_monitor_updates_existing_source_row_in_place() -> None:
                     "source_plan_item_id": "core-plan-row-1",
                     "trigger_price": "100.00",
                     "quantity_policy": {"kind": "shares", "quantity": 1},
+                    "decision_agent_name": "old-agent",
                     "decision_snapshot_id": "snapshot-old",
+                    "decision_run_id": "old-run",
+                    "source_market_date": "2026-05-20",
                 },
                 {
                     "symbol": "000660",
@@ -3533,7 +3539,10 @@ def test_replanned_sell_monitor_updates_existing_source_row_in_place() -> None:
                     "source_plan_item_id": "core-plan-row-1",
                     "trigger_price": "90.00",
                     "quantity_policy": {"kind": "shares", "quantity": 1},
+                    "decision_agent_name": "old-agent",
                     "decision_snapshot_id": "snapshot-old",
+                    "decision_run_id": "old-run",
+                    "source_market_date": "2026-05-20",
                 },
             ],
         },
@@ -3541,12 +3550,27 @@ def test_replanned_sell_monitor_updates_existing_source_row_in_place() -> None:
     assert older.status_code == 201
     target_item_id, stop_item_id = older.json()["persisted_execution_item_ids"]
 
+    # Exercise the generic (non-Core-v4) replan path with a context already at
+    # the compaction cap. The newly persisted authority must outrank legacy
+    # keys instead of being dropped as the 61st field.
+    with app.state.db_session_factory() as session:
+        for item_id in (target_item_id, stop_item_id):
+            item = session.get(ExecutionPlanItem, item_id)
+            assert item is not None
+            saturated_context = dict(item.risk_context or {})
+            for index in range(60 - len(saturated_context)):
+                saturated_context[f"legacy_context_{index:02d}"] = index
+            assert len(saturated_context) == 60
+            item.risk_context = saturated_context
+        session.commit()
+
     newer = client.post(
         "/execution-plans",
         json={
             "plan_id": "plan-new-replanned-sell",
             "source": "test-fixture",
             "market_date": "2026-05-21",
+            "strategy_run_id": "new-run",
             "items": [
                 {
                     "symbol": "000660",
@@ -3555,7 +3579,10 @@ def test_replanned_sell_monitor_updates_existing_source_row_in_place() -> None:
                     "source_plan_item_id": "core-plan-row-1",
                     "trigger_price": "112.00",
                     "quantity_policy": {"kind": "shares", "quantity": 3},
+                    "decision_agent_name": "new-agent",
                     "decision_snapshot_id": "snapshot-new",
+                    "decision_run_id": "new-run",
+                    "source_market_date": "2026-05-21",
                 },
                 {
                     "symbol": "000660",
@@ -3564,7 +3591,10 @@ def test_replanned_sell_monitor_updates_existing_source_row_in_place() -> None:
                     "source_plan_item_id": "core-plan-row-1",
                     "trigger_price": "94.00",
                     "quantity_policy": {"kind": "shares", "quantity": 3},
+                    "decision_agent_name": "new-agent",
                     "decision_snapshot_id": "snapshot-new",
+                    "decision_run_id": "new-run",
+                    "source_market_date": "2026-05-21",
                 },
             ],
         },
@@ -3600,6 +3630,26 @@ def test_replanned_sell_monitor_updates_existing_source_row_in_place() -> None:
         assert target_item.risk_context["last_monitoring_event"]["event"] == "sell_monitor_replanned_in_place"
         assert stop_item.risk_context["last_monitoring_event"]["event"] == "sell_monitor_replanned_in_place"
 
+        newer_plan = session.scalar(
+            select(ExecutionPlan).where(
+                ExecutionPlan.external_plan_id == "plan-new-replanned-sell"
+            )
+        )
+        assert newer_plan is not None
+        target_lineage = decision_lineage_for_plan_item(target_item)
+        stop_lineage = decision_lineage_for_plan_item(stop_item)
+        assert target_lineage is not None
+        assert stop_lineage is not None
+        for lineage in (target_lineage, stop_lineage):
+            assert lineage["status"] == "complete"
+            assert lineage["execution_plan_id"] == newer_plan.id
+            assert lineage["external_plan_id"] == "plan-new-replanned-sell"
+            assert lineage["strategy_run_id"] == "new-run"
+            assert lineage["decision_run_id"] == "new-run"
+            assert lineage["decision_agent_name"] == "new-agent"
+        assert "sell_monitor_authority_v1" in target_item.risk_context
+        assert "sell_monitor_authority_v1" in stop_item.risk_context
+
         new_items = [session.get(ExecutionPlanItem, item_id) for item_id in new_item_ids]
         assert [item.status for item in new_items if item is not None] == ["superseded", "superseded"]
 
@@ -3614,6 +3664,48 @@ def test_replanned_sell_monitor_updates_existing_source_row_in_place() -> None:
         assert not (autonomous_item_ids & set(new_item_ids))
 
     engine.dispose()
+
+
+def test_replanned_sell_monitor_uses_authority_generation_idempotency_key() -> None:
+    item = ExecutionPlanItem(
+        id="retained-sell-monitor",
+        intent="target_sell",
+        risk_context={
+            "sell_monitor_authority_v1": {
+                "schema_version": "sell-monitor-authority-v2",
+                "execution_plan_id": "new-plan-1",
+                "external_plan_id": "core-new-plan-1",
+                "strategy_run_id": "decision-run-1",
+                "target_market_date": "2026-05-21",
+            }
+        },
+    )
+
+    first = _monitoring_order_idempotency_key(
+        item=item,
+        is_watch_buy=False,
+        retry_source_order_pk=None,
+    )
+    repeated = _monitoring_order_idempotency_key(
+        item=item,
+        is_watch_buy=False,
+        retry_source_order_pk=None,
+    )
+    item.risk_context["sell_monitor_authority_v1"]["execution_plan_id"] = (
+        "new-plan-2"
+    )
+    item.risk_context["sell_monitor_authority_v1"]["external_plan_id"] = (
+        "core-new-plan-2"
+    )
+    second_generation = _monitoring_order_idempotency_key(
+        item=item,
+        is_watch_buy=False,
+        retry_source_order_pk=None,
+    )
+
+    assert first == repeated
+    assert first.startswith("monitoring:target_sell:retained-sell-monitor:authority:")
+    assert second_generation != first
 
 
 def test_autonomous_monitoring_includes_older_active_sell_monitor_without_same_intent_replacement() -> None:

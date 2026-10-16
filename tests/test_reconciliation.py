@@ -48,6 +48,10 @@ from app.services import monitoring as monitoring_service
 from app.services.execution_jobs import dispatch_due_execution_jobs
 from app.services.execution_account_route import bind_kis_account_route
 from app.services.execution_api import _serialize_execution_fill
+from app.services.execution_lineage import (
+    decision_lineage_for_order,
+    decision_lineage_for_plan_item,
+)
 from app.services.fill_idempotency import (
     duplicate_fill_group_candidate_key,
     execution_fill_dedupe_key,
@@ -170,6 +174,45 @@ def test_reconciliation_metadata_cannot_replace_canonical_execution_scope() -> N
     assert merged["broker_marker"] == "preserved"
     assert merged["exchange"] == "NASD"
     assert merged["execution_scope"] == canonical_scope
+
+
+def test_reconciliation_metadata_preserves_raw_existing_decision_lineage() -> None:
+    existing_lineage = {
+        "schema_version": "execution-decision-lineage-v1",
+        "status": "partial",
+        "execution_plan_item_id": "item-1",
+    }
+
+    merged = reconciliation_service._merge_reconcile_request_metadata(
+        existing={"decision_lineage": existing_lineage},
+        incoming={
+            "provider": "kis",
+            "decision_lineage": {
+                "schema_version": "forged",
+                "status": "complete",
+            },
+        },
+    )
+
+    assert merged["provider"] == "kis"
+    assert merged["decision_lineage"] == existing_lineage
+
+
+def test_reconciliation_metadata_cannot_introduce_decision_lineage() -> None:
+    merged = reconciliation_service._merge_reconcile_request_metadata(
+        existing={"source": "post:/orders"},
+        incoming={
+            "provider": "kis",
+            "decision_lineage": {
+                "schema_version": "execution-decision-lineage-v1",
+                "status": "complete",
+                "execution_plan_item_id": "forged-item",
+            },
+        },
+    )
+
+    assert merged["provider"] == "kis"
+    assert "decision_lineage" not in merged
 
 
 class ReconciliationStubBroker:
@@ -466,6 +509,93 @@ def test_reconcile_full_fill_is_idempotent_and_updates_position_snapshot() -> No
     assert position.quantity == 2
     assert position.average_price == Decimal("71000.0000")
     assert runtime_payload["symbols"]["positions"] == ["005930"]
+    engine.dispose()
+
+
+def test_full_reconciliation_preserves_order_and_fill_decision_lineage() -> None:
+    settings = Settings(database_url="sqlite:///:memory:", runtime_mode="paper")
+    engine, db = _session(settings)
+    plan = ExecutionPlan(
+        id="lineage-reconcile-plan",
+        external_plan_id="core-lineage-reconcile-plan",
+        source="kai-trading-core",
+        market_date=OBSERVED_AT.date(),
+        strategy_run_id="lineage-run-1",
+        mode="paper",
+        status="accepted",
+    )
+    item = ExecutionPlanItem(
+        id="lineage-reconcile-item",
+        plan=plan,
+        execution_plan_id=plan.id,
+        plan_item_index=0,
+        symbol="005930",
+        side="buy",
+        intent="entry",
+        status="broker_order_submitted",
+        source_plan_item_id="core-lineage-item-1",
+        decision_agent_name="krx-decision-agent",
+        decision_snapshot_id="lineage-snapshot-1",
+        decision_run_id="lineage-run-1",
+        source_market_date=OBSERVED_AT.date(),
+    )
+    lineage = decision_lineage_for_plan_item(item)
+    assert lineage is not None
+    assert lineage["status"] == "complete"
+    order = _order(
+        settings=settings,
+        broker_order_id="lineage-reconcile-order",
+        request_metadata={"decision_lineage": lineage},
+    )
+    order.plan_item = item
+    db.add_all([plan, item, order])
+    db.commit()
+    broker = ReconciliationStubBroker(
+        reconcile_payloads=[
+            {
+                "provider": "kis",
+                "broker_order_id": "lineage-reconcile-order",
+                "status": "filled",
+                "filled_quantity": 2,
+                "remaining_quantity": 0,
+                "average_fill_price": "71000",
+                "fills": [
+                    {
+                        "broker_fill_id": "lineage-reconcile-fill",
+                        "symbol": "005930",
+                        "side": "buy",
+                        "quantity": 2,
+                        "price": "71000",
+                        "filled_at": OBSERVED_AT.isoformat(),
+                    }
+                ],
+                "observed_at": OBSERVED_AT.isoformat(),
+                "request_metadata": {
+                    "provider": "kis",
+                    "endpoint": "/uapi/domestic-stock/v1/trading/inquire-daily-ccld",
+                    "decision_lineage": {
+                        "schema_version": "forged",
+                        "status": "complete",
+                    },
+                },
+                "payload": {"odno": "lineage-reconcile-order"},
+            }
+        ]
+    )
+
+    result = reconcile_broker_order(
+        settings=settings,
+        db=db,
+        adapter=broker,
+        order=order,
+    )
+
+    assert result["status"] == "filled"
+    assert decision_lineage_for_order(order) == lineage
+    fill = db.scalar(select(ExecutionFill))
+    assert fill is not None
+    assert fill.payload["decision_lineage"] == lineage
+    assert order.request_metadata["endpoint"].endswith("inquire-daily-ccld")
     engine.dispose()
 
 
@@ -1767,6 +1897,15 @@ def test_reconciliation_error_redacts_kis_account_fields_from_persisted_event() 
     )
     engine, db = _session(settings)
     order = _order(settings=settings, broker_order_id="redaction-error-1")
+    existing_lineage = {
+        "schema_version": "execution-decision-lineage-v1",
+        "status": "partial",
+        "execution_plan_item_id": "historical-item",
+    }
+    order.request_metadata = {
+        **order.request_metadata,
+        "decision_lineage": existing_lineage,
+    }
     db.add(order)
     db.commit()
 
@@ -1838,6 +1977,7 @@ def test_reconciliation_error_redacts_kis_account_fields_from_persisted_event() 
     assert event.payload["response_metadata"]["response_marker"].startswith(
         "broker_error_details_redacted["
     )
+    assert order.request_metadata["decision_lineage"] == existing_lineage
     engine.dispose()
 
 

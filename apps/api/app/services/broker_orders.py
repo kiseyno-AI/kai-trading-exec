@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import case, exists, func, or_, select, text, update
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import DBAPIError, IntegrityError
-from sqlalchemy.orm import Session, selectinload, undefer
+from sqlalchemy.orm import Session, contains_eager, selectinload, undefer
 
 from app.api.schemas.execution import PlaceOrderRequest
 from app.broker.base import (
@@ -76,7 +76,7 @@ from app.services.broker_order_state import CAPITAL_RESERVING_ORDER_STATUSES
 from app.services.domestic_order_router import RouteDecision, resolve_domestic_order_route
 from app.services.execution_failures import record_actionable_execution_failure
 from app.services.execution_lineage import (
-    decision_lineage_for_order,
+    SELL_MONITOR_AUTHORITY_KEY,
     decision_lineage_for_plan_item,
     payload_with_order_decision_lineage,
 )
@@ -1479,6 +1479,7 @@ def _place_broker_order_serialized(
             db=db,
             item_id=plan_item.id,
             lock=False,
+            refresh_authority=True,
         )
         if current_plan_state is None:
             return PlaceBrokerOrderResult(
@@ -1490,6 +1491,17 @@ def _place_broker_order_serialized(
                 },
             )
         current_status, current_risk_context = current_plan_state
+        if (
+            _plan_item_submission_identity(plan_item)
+            != initial_plan_item_identity
+            or _validate_plan_item(
+                plan_item=plan_item,
+                command=logical_command,
+                request_source=request_source,
+            )
+            is not None
+        ):
+            return _plan_item_identity_changed_result()
         if (
             routed_command.side == "buy"
             and _risk_context_has_active_hourly_risk_off(current_risk_context)
@@ -1774,6 +1786,7 @@ def _place_broker_order_serialized(
             db=db,
             item_id=plan_item.id,
             lock=True,
+            refresh_authority=True,
         )
         if current_plan_state is None:
             return PlaceBrokerOrderResult(
@@ -1785,6 +1798,17 @@ def _place_broker_order_serialized(
                 },
             )
         current_status, current_risk_context = current_plan_state
+        if (
+            _plan_item_submission_identity(plan_item)
+            != initial_plan_item_identity
+            or _validate_plan_item(
+                plan_item=plan_item,
+                command=logical_command,
+                request_source=request_source,
+            )
+            is not None
+        ):
+            return _plan_item_identity_changed_result()
         if (
             routed_command.side == "buy"
             and _risk_context_has_active_hourly_risk_off(current_risk_context)
@@ -2277,6 +2301,7 @@ def _place_broker_order_serialized(
                 db=db,
                 item_id=plan_item.id,
                 lock=True,
+                refresh_authority=True,
             )
             if (
                 current_plan_state is None
@@ -2299,6 +2324,7 @@ def _place_broker_order_serialized(
                 plan_item,
                 attribute_names=[
                     "status",
+                    "execution_plan_id",
                     "provider",
                     "venue",
                     "asset_class",
@@ -2314,6 +2340,11 @@ def _place_broker_order_serialized(
                     "price_precision",
                     "risk_context",
                     "quantity_policy",
+                    "decision_agent_name",
+                    "decision_snapshot_id",
+                    "decision_run_id",
+                    "source_plan_item_id",
+                    "source_market_date",
                 ],
             )
             if (
@@ -2762,6 +2793,7 @@ def _place_broker_order_serialized(
                     db=db,
                     item_id=plan_item.id,
                     lock=True,
+                    refresh_authority=True,
                 )
                 if (
                     current_plan_state is None
@@ -2785,6 +2817,7 @@ def _place_broker_order_serialized(
                     plan_item,
                     attribute_names=[
                         "status",
+                        "execution_plan_id",
                         "provider",
                         "venue",
                         "asset_class",
@@ -2800,6 +2833,11 @@ def _place_broker_order_serialized(
                         "price_precision",
                         "risk_context",
                         "quantity_policy",
+                        "decision_agent_name",
+                        "decision_snapshot_id",
+                        "decision_run_id",
+                        "source_plan_item_id",
+                        "source_market_date",
                     ],
                 )
                 if (
@@ -3657,6 +3695,7 @@ def _plan_item_submission_identity(
                 if key in risk_context
             }
         ),
+        json_payload_hash(decision_lineage_for_plan_item(plan_item)),
     )
 
 
@@ -4882,6 +4921,7 @@ def _current_plan_item_state(
     db: Session,
     item_id: str,
     lock: bool,
+    refresh_authority: bool = False,
 ) -> tuple[str, dict[str, object]] | None:
     # Do not autoflush a monitoring cycle's stale status before reading the
     # current durable row. In SQLite the no-op write establishes the same
@@ -4894,15 +4934,30 @@ def _current_plan_item_state(
                 ),
                 {"item_id": item_id},
             )
-        statement = select(
-            ExecutionPlanItem.status,
-            ExecutionPlanItem.risk_context,
-        ).where(ExecutionPlanItem.id == item_id)
+        if refresh_authority:
+            statement = (
+                select(ExecutionPlanItem)
+                .join(ExecutionPlanItem.plan)
+                .options(
+                    contains_eager(ExecutionPlanItem.plan),
+                    undefer(ExecutionPlanItem.risk_context),
+                )
+                .where(ExecutionPlanItem.id == item_id)
+                .execution_options(populate_existing=True)
+            )
+        else:
+            statement = select(
+                ExecutionPlanItem.status,
+                ExecutionPlanItem.risk_context,
+            ).where(ExecutionPlanItem.id == item_id)
         if lock:
             statement = statement.with_for_update()
         row = db.execute(statement).one_or_none()
     if row is None:
         return None
+    if refresh_authority:
+        refreshed_item = row[0]
+        return str(refreshed_item.status), _json_dict(refreshed_item.risk_context)
     return str(row[0]), _json_dict(row[1])
 
 
@@ -4960,7 +5015,7 @@ def _merge_pending_plan_item_risk_context(
 ) -> dict[str, object]:
     merged = dict(persisted)
     for key, value in pending.items():
-        if key == "hourly_plan_action" and key in persisted:
+        if key in {"hourly_plan_action", SELL_MONITOR_AUTHORITY_KEY} and key in persisted:
             continue
         merged[key] = value
     persisted_events = persisted.get("monitoring_events")
@@ -4975,6 +5030,19 @@ def _merge_pending_plan_item_risk_context(
                 combined.append(event)
         merged["monitoring_events"] = combined[-20:]
     return merged
+
+
+def _plan_item_identity_changed_result() -> PlaceBrokerOrderResult:
+    return PlaceBrokerOrderResult(
+        status_code=409,
+        payload={
+            "duplicate": False,
+            "blocked": True,
+            "message": "execution plan item identity changed before order intent commit",
+            "block_reason": "execution_plan_item_identity_changed",
+            "permanent_rejection": True,
+        },
+    )
 
 
 def _validate_plan_item(
@@ -8824,9 +8892,20 @@ def _preserve_decision_lineage(
     """Keep the original decision snapshot stable across safe order retries."""
 
     metadata = dict(request_metadata)
-    existing_lineage = decision_lineage_for_order(existing_order)
-    if existing_lineage is not None:
-        metadata["decision_lineage"] = existing_lineage
+    existing_metadata = (
+        existing_order.request_metadata
+        if existing_order is not None
+        and isinstance(existing_order.request_metadata, dict)
+        else None
+    )
+    if existing_order is not None:
+        if existing_metadata is not None and "decision_lineage" in existing_metadata:
+            metadata["decision_lineage"] = existing_metadata["decision_lineage"]
+        else:
+            # Exact absence is historical evidence too. A retry of a legacy
+            # order must not capture today's mutable plan row and silently
+            # upgrade attribution that was missing at initial submission.
+            metadata.pop("decision_lineage", None)
     return metadata
 
 

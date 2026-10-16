@@ -55,7 +55,7 @@ from app.services.account_drawdown_gate import (
     latest_account_drawdown_gate_state,
 )
 from app.services.execution_account_route import redact_account_references
-from app.services.execution_lineage import decision_lineage_for_order
+from app.services.execution_lineage import resolve_decision_lineage_evidence
 from app.services.broker_raw_holdings import (
     BrokerRawHolding,
     broker_raw_balance_is_fresh,
@@ -1196,7 +1196,16 @@ def _closed_trade(
     )
     hold_minutes = int((_normalize_utc(sell_fill.filled_at) - lot.filled_at).total_seconds() // 60)
     source_item = buy_item or sell_item
-    source_lineage = decision_lineage_for_order(buy_order or sell_order)
+    source_fill = lot.fill if buy_order is not None else sell_fill
+    lineage_evidence = resolve_decision_lineage_evidence(
+        order=buy_order or sell_order,
+        fill_payload=source_fill.payload,
+    )
+    lineage = _feedback_lineage_projection(
+        evidence=lineage_evidence,
+        legacy_item=source_item,
+    )
+    lineage_complete = lineage_evidence["status"] == "complete"
     return {
         "symbol": sell_fill.symbol,
         "execution_scope": route_scope.as_payload(),
@@ -1210,7 +1219,8 @@ def _closed_trade(
         if analysis_pnl is not None
         else "unavailable_incomplete_transaction_costs",
         "profitability_eligible": analysis_pnl is not None
-        and economics.settlement_currency == "KRW",
+        and economics.settlement_currency == "KRW"
+        and lineage_complete,
         "settlement_currency": economics.settlement_currency,
         "buy_settlement_currency": economics.buy_settlement_currency,
         "sell_settlement_currency": economics.sell_settlement_currency,
@@ -1230,20 +1240,9 @@ def _closed_trade(
         "gross_return_pct": _decimal_text(gross_return_pct),
         "hold_minutes": hold_minutes,
         "hold_hours": _decimal_text(Decimal(hold_minutes) / Decimal("60")),
-        "source_execution_plan_item_id": (
-            source_lineage.get("execution_plan_item_id")
-            if source_lineage is not None
-            else (source_item.id if source_item is not None else None)
-        ),
-        "decision_run_id": (
-            source_lineage.get("decision_run_id")
-            if source_lineage is not None
-            else (source_item.decision_run_id if source_item is not None else None)
-        ),
-        "decision_agent_name": (
-            source_lineage.get("decision_agent_name")
-            if source_lineage is not None
-            else (source_item.decision_agent_name if source_item is not None else None)
+        **_feedback_lineage_fields(
+            evidence=lineage_evidence,
+            lineage=lineage,
         ),
         "exec_agent_decision": _exec_agent_decision(source_item),
         "risk_sizing": _risk_sizing_context(source_item),
@@ -1256,7 +1255,12 @@ def _closed_trade(
             if economics.transaction_cost_coverage == "complete"
             else [f"transaction_cost_coverage_{economics.transaction_cost_coverage}"]
         )
-        + ([] if economics.settlement_currency is not None else ["settlement_currency_unknown"]),
+        + ([] if economics.settlement_currency is not None else ["settlement_currency_unknown"])
+        + (
+            []
+            if lineage_complete
+            else [f"decision_lineage_{lineage_evidence['status']}"]
+        ),
         "outcome_bucket": (
             _outcome_bucket(analysis_pnl) if analysis_pnl is not None else "unavailable"
         ),
@@ -1276,7 +1280,14 @@ def _legacy_sell_estimate_trade(
     sell_item = sell_order.plan_item if sell_order is not None else None
     sell_price = Decimal(sell_fill.price)
     source_item = sell_item
-    source_lineage = decision_lineage_for_order(sell_order)
+    lineage_evidence = resolve_decision_lineage_evidence(
+        order=sell_order,
+        fill_payload=sell_fill.payload,
+    )
+    lineage = _feedback_lineage_projection(
+        evidence=lineage_evidence,
+        legacy_item=source_item,
+    )
     if cost_basis is None or not scope_quality_available:
         pnl = None
         return_pct = None
@@ -1312,6 +1323,8 @@ def _legacy_sell_estimate_trade(
         quality_flags.append("settlement_currency_unknown")
     if quality_flag is not None:
         quality_flags.append(quality_flag)
+    if lineage_evidence["status"] != "complete":
+        quality_flags.append(f"decision_lineage_{lineage_evidence['status']}")
     return {
         "symbol": sell_fill.symbol,
         "execution_scope": (
@@ -1362,20 +1375,9 @@ def _legacy_sell_estimate_trade(
         "gross_return_pct": _decimal_text(return_pct),
         "hold_minutes": None,
         "hold_hours": None,
-        "source_execution_plan_item_id": (
-            source_lineage.get("execution_plan_item_id")
-            if source_lineage is not None
-            else (source_item.id if source_item is not None else None)
-        ),
-        "decision_run_id": (
-            source_lineage.get("decision_run_id")
-            if source_lineage is not None
-            else (source_item.decision_run_id if source_item is not None else None)
-        ),
-        "decision_agent_name": (
-            source_lineage.get("decision_agent_name")
-            if source_lineage is not None
-            else (source_item.decision_agent_name if source_item is not None else None)
+        **_feedback_lineage_fields(
+            evidence=lineage_evidence,
+            lineage=lineage,
         ),
         "exec_agent_decision": _exec_agent_decision(source_item),
         "risk_sizing": _risk_sizing_context(source_item),
@@ -1395,23 +1397,73 @@ def _fill_payload(
     item: ExecutionPlanItem | None,
     quantity: Decimal,
 ) -> dict[str, object]:
-    lineage = decision_lineage_for_order(order)
+    evidence = resolve_decision_lineage_evidence(
+        order=order,
+        fill_payload=fill.payload,
+    )
+    lineage = _feedback_lineage_projection(evidence=evidence, legacy_item=item)
     return {
         "filled_at": _normalize_utc(fill.filled_at).isoformat(),
         "quantity": _quantity_value(quantity),
         "price": _decimal_text(Decimal(fill.price)),
         "broker_fill_id": fill.broker_fill_id,
         "broker_order_id": order.broker_order_id if order is not None else None,
-        "execution_plan_item_id": (
-            lineage.get("execution_plan_item_id")
-            if lineage is not None
-            else (item.id if item is not None else None)
-        ),
+        "execution_plan_item_id": lineage.get("execution_plan_item_id"),
         "intent": item.intent if item is not None else None,
-        "source_plan_item_id": (
-            lineage.get("source_plan_item_id")
-            if lineage is not None
-            else (item.source_plan_item_id if item is not None else None)
+        "source_plan_item_id": lineage.get("source_plan_item_id"),
+        "decision_lineage_status": evidence["status"],
+        "decision_lineage_source": evidence["source"],
+    }
+
+
+def _feedback_lineage_projection(
+    *,
+    evidence: dict[str, object],
+    legacy_item: ExecutionPlanItem | None,
+) -> dict[str, object]:
+    lineage = evidence.get("lineage")
+    if isinstance(lineage, dict):
+        return lineage
+    if evidence.get("status") != "legacy_degraded" or legacy_item is None:
+        return {}
+    plan = legacy_item.plan
+    return {
+        "execution_plan_id": legacy_item.execution_plan_id,
+        "execution_plan_item_id": legacy_item.id,
+        "external_plan_id": plan.external_plan_id if plan is not None else None,
+        "plan_source": plan.source if plan is not None else None,
+        "strategy_run_id": plan.strategy_run_id if plan is not None else None,
+        "target_market_date": plan.market_date if plan is not None else None,
+        "source_plan_item_id": legacy_item.source_plan_item_id,
+        "decision_agent_name": legacy_item.decision_agent_name,
+        "decision_snapshot_id": legacy_item.decision_snapshot_id,
+        "decision_run_id": legacy_item.decision_run_id,
+        "source_market_date": legacy_item.source_market_date,
+    }
+
+
+def _feedback_lineage_fields(
+    *,
+    evidence: dict[str, object],
+    lineage: dict[str, object],
+) -> dict[str, object]:
+    return {
+        "decision_lineage_status": evidence["status"],
+        "decision_lineage_source": evidence["source"],
+        "decision_execution_plan_id": lineage.get("execution_plan_id"),
+        "decision_external_plan_id": lineage.get("external_plan_id"),
+        "decision_plan_source": lineage.get("plan_source"),
+        "decision_strategy_run_id": lineage.get("strategy_run_id"),
+        "decision_target_market_date": _date_text(
+            lineage.get("target_market_date")
+        ),
+        "source_execution_plan_item_id": lineage.get("execution_plan_item_id"),
+        "source_plan_item_id": lineage.get("source_plan_item_id"),
+        "decision_agent_name": lineage.get("decision_agent_name"),
+        "decision_snapshot_id": lineage.get("decision_snapshot_id"),
+        "decision_run_id": lineage.get("decision_run_id"),
+        "decision_source_market_date": _date_text(
+            lineage.get("source_market_date")
         ),
     }
 
@@ -1421,9 +1473,12 @@ def _summary(
     *,
     broker_asset_performance: dict[str, object] | None = None,
 ) -> dict[str, object]:
+    eligible_trades = [
+        row for row in closed_trades if row.get("profitability_eligible") is True
+    ]
     pnl_values = [
         value
-        for row in closed_trades
+        for row in eligible_trades
         for value in [_decimal_value(row.get("realized_pnl_krw"))]
         if value is not None
     ]
@@ -1454,10 +1509,17 @@ def _summary(
                 Decimal("0"),
             )
         )
-        net_values = [_decimal_value(row.get("net_realized_pnl")) for row in currency_rows]
+        net_values = [
+            _decimal_value(row.get("net_realized_pnl")) for row in currency_rows
+        ]
         net_by_currency[currency] = (
             _decimal_text(sum((value for value in net_values if value is not None), Decimal("0")))
-            if net_values and all(value is not None for value in net_values)
+            if net_values
+            and all(
+                row.get("decision_lineage_status") == "complete"
+                for row in currency_rows
+            )
+            and all(value is not None for value in net_values)
             else None
         )
     cost_coverages = {
@@ -1473,8 +1535,11 @@ def _summary(
             else "unknown"
         )
     )
-    eligible_trade_count = sum(
-        1 for row in closed_trades if row.get("profitability_eligible") is True
+    eligible_trade_count = len(eligible_trades)
+    incomplete_lineage_trade_count = sum(
+        1
+        for row in closed_trades
+        if row.get("decision_lineage_status") != "complete"
     )
     all_closed_trades_net_eligible = (
         not closed_trades or eligible_trade_count == len(closed_trades)
@@ -1559,7 +1624,15 @@ def _summary(
                     else (
                         "degraded_transaction_cost_coverage"
                         if transaction_cost_coverage != "complete"
-                        else "complete_non_krw"
+                        else (
+                            "degraded_decision_lineage"
+                            if incomplete_lineage_trade_count > 0
+                            else (
+                                "degraded_outcome_quality"
+                                if not all_closed_trades_net_eligible
+                                else "complete_non_krw"
+                            )
+                        )
                     )
                 )
             )
@@ -1570,10 +1643,22 @@ def _summary(
         "loss_count": len(losers),
         "gross_win_count": sum(1 for value in gross_values if value > 0),
         "gross_loss_count": sum(1 for value in gross_values if value < 0),
-        "win_rate_pct": _decimal_text((Decimal(len(winners)) / Decimal(len(pnl_values)) * Decimal("100")) if pnl_values else Decimal("0")),
-        "average_win_krw": _decimal_text(sum(winners, Decimal("0")) / Decimal(len(winners)) if winners else Decimal("0")),
-        "average_loss_krw": _decimal_text(sum(losers, Decimal("0")) / Decimal(len(losers)) if losers else Decimal("0")),
-        "worst_loss_krw": _decimal_text(min(pnl_values) if pnl_values else Decimal("0")),
+        "win_rate_pct": _decimal_text(
+            Decimal(len(winners)) / Decimal(len(pnl_values)) * Decimal("100")
+        )
+        if pnl_values
+        else None,
+        "average_win_krw": _decimal_text(
+            sum(winners, Decimal("0")) / Decimal(len(winners))
+        )
+        if winners
+        else None,
+        "average_loss_krw": _decimal_text(
+            sum(losers, Decimal("0")) / Decimal(len(losers))
+        )
+        if losers
+        else None,
+        "worst_loss_krw": _decimal_text(min(pnl_values)) if pnl_values else None,
         "estimated_trade_count": estimated_count,
         "unavailable_trade_count": unavailable_count,
         "realized_pnl_quality_flags": quality_flags,
@@ -2861,9 +2946,19 @@ def _feedback_learning_quality_gate(
             "settlement_currency": "known",
             "execution_scope": "known",
             "decision_lineage": [
+                "decision_lineage_status=complete",
+                "decision_execution_plan_id",
+                "decision_external_plan_id",
                 "source_execution_plan_item_id",
+                "source_plan_item_id",
+                "decision_snapshot_id",
                 "decision_run_id",
                 "decision_agent_name",
+                "decision_plan_source",
+                "decision_strategy_run_id",
+                "decision_target_market_date",
+                "decision_source_market_date",
+                "decision_run_id=decision_strategy_run_id",
             ],
         },
     }
@@ -3020,13 +3115,25 @@ def _failure_matches_feedback_scope(
 
 
 def _trade_has_learning_lineage(trade: dict[str, object]) -> bool:
-    return all(
-        trade.get(key) is not None
-        for key in (
-            "source_execution_plan_item_id",
-            "decision_run_id",
-            "decision_agent_name",
+    return bool(
+        trade.get("decision_lineage_status") == "complete"
+        and all(
+            _nonempty_text(trade.get(key)) is not None
+            for key in (
+                "decision_execution_plan_id",
+                "decision_external_plan_id",
+                "source_execution_plan_item_id",
+                "source_plan_item_id",
+                "decision_agent_name",
+                "decision_snapshot_id",
+                "decision_run_id",
+                "decision_plan_source",
+                "decision_strategy_run_id",
+                "decision_target_market_date",
+                "decision_source_market_date",
+            )
         )
+        and trade.get("decision_run_id") == trade.get("decision_strategy_run_id")
     )
 
 
@@ -4025,10 +4132,18 @@ def _snippet(
             f"FIFO closed-trade PnL: {fifo_summary}."
         )
     else:
-        snippet_summary = (
-            f"Recent closed trades: pnl={fifo_summary}, "
-            f"win_rate={summary.get('win_rate_pct')}%, worst_loss={summary.get('worst_loss_krw')} KRW."
-        )
+        if summary.get("profitability_eligible_trade_count"):
+            snippet_summary = (
+                f"Recent closed trades: pnl={fifo_summary}, "
+                f"win_rate={summary.get('win_rate_pct')}%, "
+                f"worst_loss={summary.get('worst_loss_krw')} KRW."
+            )
+        else:
+            snippet_summary = (
+                "Recent closed trades: net profitability unavailable because no "
+                "trade passed immutable lineage and economics gates; "
+                f"{fifo_summary}."
+            )
     return {
         "summary": snippet_summary,
         "account_drawdown_gate": account_drawdown_gate_prompt_summary(account_drawdown_gate),
@@ -4749,6 +4864,21 @@ def _quantity_value(value: Decimal) -> int | str:
     if value == value.to_integral_value():
         return int(value)
     return _quantity_text(value)
+
+
+def _nonempty_text(value: object) -> str | None:
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    return normalized or None
+
+
+def _date_text(value: object) -> str | None:
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    return _nonempty_text(value)
 
 
 def _normalize_utc(value: datetime) -> datetime:

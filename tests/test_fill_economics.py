@@ -87,11 +87,15 @@ def _order(
     asset_class: str = "stock",
     account_scope: str | None = None,
     quantity: int = 1,
+    learning_lineage: bool = False,
 ) -> BrokerOrder:
     venue = "KRX" if provider == "kis" else provider.upper()
     exchange = "NASD" if asset_class == "us_equity" else venue
+    item_id = f"{order_id}-item"
+    decision_run_id = f"{order_id}-run"
     return BrokerOrder(
         id=order_id,
+        execution_plan_item_id=item_id if learning_lineage else None,
         broker_name=provider,
         mode="paper",
         idempotency_key=order_id,
@@ -102,6 +106,27 @@ def _order(
         asset_class=asset_class,
         venue=venue,
         request_metadata={
+            **(
+                {
+                    "decision_lineage": {
+                        "schema_version": "execution-decision-lineage-v1",
+                        "status": "complete",
+                        "execution_plan_id": f"{order_id}-plan",
+                        "execution_plan_item_id": item_id,
+                        "external_plan_id": f"{order_id}-external-plan",
+                        "plan_source": "test-fixture",
+                        "strategy_run_id": decision_run_id,
+                        "target_market_date": "2026-09-01",
+                        "source_plan_item_id": f"{order_id}-source-item",
+                        "decision_agent_name": "test-decision-agent",
+                        "decision_snapshot_id": f"{order_id}-snapshot",
+                        "decision_run_id": decision_run_id,
+                        "source_market_date": "2026-08-31",
+                    }
+                }
+                if learning_lineage
+                else {}
+            ),
             "provider": provider,
             "venue": venue,
             "asset_class": asset_class,
@@ -127,6 +152,7 @@ def _bind_order_to_runtime_scope(
         exchange=exchange,
     )
     order.request_metadata = {
+        **metadata,
         "exchange": exchange,
         "execution_scope": execution_scope_payload(
             identity=identity,
@@ -149,7 +175,12 @@ def _kis_us_account_scope(settings: Settings) -> str:
 
 def test_complete_partial_allocations_turn_gross_winner_into_net_loser() -> None:
     buy = _fill(
-        order=_order(order_id="buy", symbol="005930", side="buy"),
+        order=_order(
+            order_id="buy",
+            symbol="005930",
+            side="buy",
+            learning_lineage=True,
+        ),
         fill_id="buy-fill",
         side="buy",
         quantity=10,
@@ -159,7 +190,12 @@ def test_complete_partial_allocations_turn_gross_winner_into_net_loser() -> None
         coverage="complete",
     )
     sell = _fill(
-        order=_order(order_id="sell", symbol="005930", side="sell"),
+        order=_order(
+            order_id="sell",
+            symbol="005930",
+            side="sell",
+            learning_lineage=True,
+        ),
         fill_id="sell-fill",
         side="sell",
         quantity=10,
@@ -1328,7 +1364,12 @@ def test_feedback_does_not_label_usd_as_krw_or_learn_from_unknown_costs() -> Non
 
 def test_feedback_keeps_complete_krw_subtotal_when_usd_trade_is_present() -> None:
     krw_buy = _fill(
-        order=_order(order_id="mixed-feedback-krw-buy", symbol="005930", side="buy"),
+        order=_order(
+            order_id="mixed-feedback-krw-buy",
+            symbol="005930",
+            side="buy",
+            learning_lineage=True,
+        ),
         fill_id="mixed-feedback-krw-buy-fill",
         side="buy",
         quantity=1,
@@ -1338,7 +1379,12 @@ def test_feedback_keeps_complete_krw_subtotal_when_usd_trade_is_present() -> Non
         coverage="complete",
     )
     krw_sell = _fill(
-        order=_order(order_id="mixed-feedback-krw-sell", symbol="005930", side="sell"),
+        order=_order(
+            order_id="mixed-feedback-krw-sell",
+            symbol="005930",
+            side="sell",
+            learning_lineage=True,
+        ),
         fill_id="mixed-feedback-krw-sell-fill",
         side="sell",
         quantity=1,
@@ -1354,6 +1400,7 @@ def test_feedback_keeps_complete_krw_subtotal_when_usd_trade_is_present() -> Non
             symbol="AAPL",
             side="buy",
             asset_class="us_equity",
+            learning_lineage=True,
         ),
         fill_id="mixed-feedback-usd-buy-fill",
         side="buy",
@@ -1369,6 +1416,7 @@ def test_feedback_keeps_complete_krw_subtotal_when_usd_trade_is_present() -> Non
             symbol="AAPL",
             side="sell",
             asset_class="us_equity",
+            learning_lineage=True,
         ),
         fill_id="mixed-feedback-usd-sell-fill",
         side="sell",

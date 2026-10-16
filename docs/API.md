@@ -982,7 +982,10 @@ Exact external broker economics use
 records keyed by both broker order ID and broker fill ID, with separate nonnegative
 `fee` and `tax` values and verified `KRW` KRX scope. Dry-run is the default.
 Aggregate or ambiguous records and conflicts with persisted economics are rejected;
-apply is idempotent, audited, and has no broker-call or allocation path.
+apply is idempotent, audited, and has no broker-call or allocation path. Canonical
+`broker_name`, `source_reference`, and `broker_record_id` form one durable external
+provenance binding. Replaying the same target and normalized economics is a no-op;
+reusing that provenance for another fill or different fee/tax/currency is rejected.
 
 Operators can inspect local FIFO residuals contradicted by a broker-reconciled
 flat position without mutating state:

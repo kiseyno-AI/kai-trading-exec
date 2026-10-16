@@ -77,6 +77,10 @@ from app.services.execution_semantics import (
     is_short_term_watch_buy_intent,
     watch_buy_direction_from_payloads,
 )
+from app.services.execution_lineage import (
+    SELL_MONITOR_AUTHORITY_KEY,
+    SELL_MONITOR_AUTHORITY_VERSION,
+)
 from app.services.reconciliation import (
     reconcile_pending_broker_orders,
     sync_execution_positions_from_broker_snapshot,
@@ -178,7 +182,6 @@ TRIGGER_TIME_FULL_COST_ECONOMICS_KEY = "exec_trigger_time_full_cost_economics_v1
 TRIGGER_TIME_FULL_COST_ECONOMICS_PROVENANCE_VERSION = (
     "exec-trigger-time-full-cost-economics-provenance-v1"
 )
-SELL_MONITOR_AUTHORITY_KEY = "sell_monitor_authority_v1"
 BLOCKED_MONITORING_STATUSES = SELL_TRIGGERED_BLOCKED_STATUSES | frozenset(
     {
         "watch_buy_triggered_blocked",
@@ -588,13 +591,23 @@ def _update_existing_sell_monitors_from_replanned_items(
                 ExecutionPlanItem.risk_context,
                 ExecutionPlanItem.source_plan_item_id,
                 ExecutionPlanItem.source_market_date,
+                ExecutionPlanItem.decision_agent_name,
+                ExecutionPlanItem.decision_snapshot_id,
+                ExecutionPlanItem.decision_run_id,
                 ExecutionPlanItem.provider,
                 ExecutionPlanItem.venue,
                 ExecutionPlanItem.asset_class,
+                ExecutionPlanItem.base_quantity,
+                ExecutionPlanItem.quote_notional,
+                ExecutionPlanItem.quantity_precision,
+                ExecutionPlanItem.price_precision,
                 ExecutionPlanItem.updated_at,
             ),
             selectinload(ExecutionPlanItem.plan).load_only(
                 ExecutionPlan.id,
+                ExecutionPlan.external_plan_id,
+                ExecutionPlan.source,
+                ExecutionPlan.strategy_run_id,
                 ExecutionPlan.mode,
                 ExecutionPlan.market_date,
                 ExecutionPlan.requested_at,
@@ -608,6 +621,8 @@ def _update_existing_sell_monitors_from_replanned_items(
             ExecutionPlanItem.updated_at.desc(),
             ExecutionPlanItem.id.desc(),
         )
+        .with_for_update(of=ExecutionPlanItem)
+        .execution_options(populate_existing=True)
     ).all()
     existing_by_source: dict[
         tuple[str, str, str, tuple[str, str, str, str]],
@@ -931,6 +946,12 @@ def _effective_monitor_plan_filter(
 
 def _sell_plan_authority_payload(plan: ExecutionPlan) -> dict[str, str | None]:
     return {
+        "schema_version": SELL_MONITOR_AUTHORITY_VERSION,
+        "execution_plan_id": str(plan.id or "") or None,
+        "external_plan_id": str(plan.external_plan_id or "") or None,
+        "plan_source": str(plan.source or "") or None,
+        "strategy_run_id": str(plan.strategy_run_id or "") or None,
+        "target_market_date": _serialize_date(plan.market_date),
         "market_date": _serialize_date(plan.market_date),
         "requested_at": (
             _normalize_utc(plan.requested_at).isoformat()
@@ -15473,6 +15494,25 @@ def _monitoring_order_idempotency_key(
     if is_watch_buy:
         return f"monitoring:watch_buy:{item.id}"
     base = f"monitoring:{item.intent}:{item.id}"
+    risk_context = _loaded_risk_context(item, allow_file_backed_load=True)
+    sell_authority = (
+        risk_context.get(SELL_MONITOR_AUTHORITY_KEY)
+        if isinstance(risk_context, dict)
+        else None
+    )
+    if (
+        isinstance(sell_authority, dict)
+        and sell_authority.get("schema_version") == SELL_MONITOR_AUTHORITY_VERSION
+    ):
+        authority_generation = json_payload_hash(
+            {
+                "execution_plan_id": sell_authority.get("execution_plan_id"),
+                "external_plan_id": sell_authority.get("external_plan_id"),
+                "strategy_run_id": sell_authority.get("strategy_run_id"),
+                "target_market_date": sell_authority.get("target_market_date"),
+            }
+        )[:16]
+        base = f"{base}:authority:{authority_generation}"
     if item.intent == "stop_sell" and retry_source_order_pk is not None:
         # One deterministic generation per confirmed terminal rejection.
         # Replays against the same rejected source remain idempotent; a new

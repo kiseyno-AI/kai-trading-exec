@@ -40,6 +40,7 @@ from app.services.weekly_trade_review import (
     generate_weekly_trade_review,
 )
 from app.services.artifact_integrity import artifact_integrity_is_valid
+from app.services.execution_lineage import decision_lineage_for_plan_item
 from app.services.runtime import runtime_counts
 from app.services.position_identity import build_position_identity
 
@@ -273,6 +274,7 @@ def test_weekly_fills_expose_decision_linkage_and_explicit_unknown_coverage() ->
     item = ExecutionPlanItem(
         id="linked-fill-item",
         plan=plan,
+        execution_plan_id=plan.id,
         plan_item_index=0,
         symbol="005930",
         side="buy",
@@ -281,8 +283,12 @@ def test_weekly_fills_expose_decision_linkage_and_explicit_unknown_coverage() ->
         decision_agent_name="short-term-decider",
         decision_snapshot_id="snapshot-101",
         decision_run_id="decision-run-101",
+        source_plan_item_id="core-source-item-101",
         source_market_date=datetime(2026, 9, 1, tzinfo=UTC).date(),
     )
+    lineage = decision_lineage_for_plan_item(item)
+    assert lineage is not None
+    assert lineage["status"] == "complete"
     linked_order = BrokerOrder(
         id="linked-fill-order",
         plan_item=item,
@@ -293,6 +299,7 @@ def test_weekly_fills_expose_decision_linkage_and_explicit_unknown_coverage() ->
         side="buy",
         status="filled",
         quantity=1,
+        request_metadata={"decision_lineage": lineage},
     )
     unknown_order = BrokerOrder(
         id="unknown-fill-order",
@@ -354,6 +361,8 @@ def test_weekly_fills_expose_decision_linkage_and_explicit_unknown_coverage() ->
             "target_market_date": datetime(2026, 9, 2, tzinfo=UTC).date(),
             "execution_plan_source": "kai-trading-core",
             "strategy_run_id": "decision-run-101",
+            "source_plan_item_id": "core-source-item-101",
+            "decision_lineage_status": "complete",
         },
     )
     assert rows_by_id["unknown-fill"]["execution_plan_item_id"] is None
@@ -398,6 +407,31 @@ def test_weekly_fill_attribution_rejects_core_decision_run_mismatch() -> None:
     ]
     assert coverage["decision_run_mismatch_fill_ids"] == [
         "mismatched-core-fill"
+    ]
+
+
+def test_weekly_fill_attribution_rejects_explicit_partial_lineage() -> None:
+    coverage = _weekly_fill_attribution_coverage(
+        [
+            {
+                "id": "partial-lineage-fill",
+                "execution_plan_item_id": "item-1",
+                "source_plan_item_id": "source-item-1",
+                "decision_agent_name": "short-term-decider",
+                "decision_snapshot_id": "snapshot-1",
+                "decision_run_id": "decision-run-1",
+                "execution_plan_source": "kai-trading-core",
+                "strategy_run_id": "decision-run-1",
+                "decision_lineage_status": "partial",
+            }
+        ],
+        truncated=False,
+    )
+
+    assert coverage["status"] == "incomplete"
+    assert coverage["decision_identity_linked_fill_rows"] == 0
+    assert coverage["decision_identity_missing_fill_ids"] == [
+        "partial-lineage-fill"
     ]
 
 

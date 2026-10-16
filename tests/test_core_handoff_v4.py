@@ -50,6 +50,7 @@ from app.services.kis_krx_flat_rebind_contract import (
     kis_krx_flat_evidence_fingerprint,
 )
 from app.services.json_compaction import compact_json_object
+from app.services.execution_lineage import decision_lineage_for_plan_item
 from app.services.order_intent_serialization import (
     order_intent_process_lock,
     order_intent_scope_key_for_account,
@@ -1517,6 +1518,84 @@ def test_v4_canonicalizes_inherited_entry_actions_out_of_protective_exits() -> N
             for item in exits
         )
         assert core_handoff_v4.persisted_core_plan_contract_ack(plan) is not None
+    engine.dispose()
+
+
+def test_v4_sell_replan_persists_complete_new_authority_on_retained_rows() -> None:
+    app, engine = _build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_account_number="00000000",
+            kis_account_product_code="00",
+            account_drawdown_recovery_scope_secret=(
+                "core-v4-replan-route-secret-at-least-32-bytes"
+            ),
+        )
+    )
+    client = TestClient(app)
+    original = _plan_payload(plan_id="core-v4-replan-original")
+    original["mode"] = "paper"
+    _refresh_material_fingerprint(original)
+
+    first = client.post("/v4/execution-plans", json=original)
+    assert first.status_code == 201, first.json()
+    with app.state.db_session_factory() as session:
+        original_plan = session.scalar(
+            select(ExecutionPlan)
+            .where(ExecutionPlan.external_plan_id == "core-v4-replan-original")
+            .options(selectinload(ExecutionPlan.items))
+        )
+        assert original_plan is not None
+        retained_ids = {
+            item.intent: item.id for item in original_plan.items if item.side == "sell"
+        }
+        original_plan_id = original_plan.id
+
+    replanned = _plan_payload(plan_id="core-v4-replan-new-authority")
+    replanned["mode"] = "paper"
+    replanned["strategy_run_id"] = "signal-decider:2026-09-10:replanned"
+    replanned["requested_at"] = "2026-09-09T12:05:00Z"
+    replanned["metadata"]["requested_at"] = "2026-09-09T12:05:00Z"
+    replanned["metadata"]["source_market_date"] = "2026-09-10"
+    for item in replanned["items"]:
+        item["decision_snapshot_id"] = "snapshot-replanned"
+        if item["intent"] == "target_sell":
+            item["trigger_price"] = 73000
+        elif item["intent"] == "stop_sell":
+            item["trigger_price"] = 71000
+    _refresh_material_fingerprint(replanned)
+
+    second = client.post("/v4/execution-plans", json=replanned)
+    assert second.status_code == 201, second.json()
+
+    with app.state.db_session_factory() as session:
+        new_plan = session.scalar(
+            select(ExecutionPlan).where(
+                ExecutionPlan.external_plan_id == "core-v4-replan-new-authority"
+            )
+        )
+        assert new_plan is not None
+        retained = [
+            session.get(ExecutionPlanItem, retained_ids[intent])
+            for intent in ("target_sell", "stop_sell")
+        ]
+        assert all(item is not None for item in retained)
+        for item in retained:
+            assert item is not None
+            assert item.execution_plan_id == original_plan_id
+            assert item.decision_snapshot_id == "snapshot-replanned"
+            assert item.decision_run_id == replanned["strategy_run_id"]
+            assert item.source_market_date.isoformat() == "2026-09-10"
+            lineage = decision_lineage_for_plan_item(item)
+            assert lineage is not None
+            assert lineage["status"] == "complete"
+            assert lineage["execution_plan_id"] == new_plan.id
+            assert lineage["operational_execution_plan_id"] == original_plan_id
+            assert lineage["external_plan_id"] == "core-v4-replan-new-authority"
+            assert lineage["strategy_run_id"] == replanned["strategy_run_id"]
+            assert lineage["decision_run_id"] == replanned["strategy_run_id"]
+            assert lineage["decision_snapshot_id"] == "snapshot-replanned"
     engine.dispose()
 
 

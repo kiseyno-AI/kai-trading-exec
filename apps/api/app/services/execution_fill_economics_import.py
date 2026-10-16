@@ -7,9 +7,10 @@ import json
 from typing import Any
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.models.runtime import BrokerOrder, ExecutionFill
+from app.models.runtime import BrokerOrder, ExecutionFill, RuntimeRemediationEvent
 from app.services.execution_fill_repair import (
     _record_remediation_event,
     _verified_kis_krw_evidence,
@@ -19,6 +20,7 @@ from app.services.execution_lineage import payload_with_order_decision_lineage
 
 EXECUTION_FILL_ECONOMICS_IMPORT_VERSION = "execution-fill-economics-import-v1"
 ECONOMICS_IMPORT_CANDIDATE_TYPE = "execution_fill_economics_import"
+_ECONOMICS_IMPORT_OUTCOME = "exact_economics_attached"
 _RECORD_FIELDS = frozenset(
     {
         "source_reference",
@@ -51,6 +53,7 @@ def analyze_execution_fill_economics_import(
 
     records = _validated_document_records(document)
     duplicate_identities = _duplicate_input_identities(records)
+    duplicate_provenances = _duplicate_input_provenances(records)
     items = [
         _evaluate_record(
             db=db,
@@ -58,6 +61,7 @@ def analyze_execution_fill_economics_import(
             record=record,
             record_index=index,
             duplicate_identities=duplicate_identities,
+            duplicate_provenances=duplicate_provenances,
         )
         for index, record in enumerate(records)
     ]
@@ -84,6 +88,7 @@ def apply_execution_fill_economics_import(
     imported_at = now or datetime.now(UTC)
     records = _validated_document_records(document)
     duplicate_identities = _duplicate_input_identities(records)
+    duplicate_provenances = _duplicate_input_provenances(records)
     initial_items = [
         _evaluate_record(
             db=db,
@@ -91,6 +96,7 @@ def apply_execution_fill_economics_import(
             record=record,
             record_index=index,
             duplicate_identities=duplicate_identities,
+            duplicate_provenances=duplicate_provenances,
         )
         for index, record in enumerate(records)
     ]
@@ -105,6 +111,7 @@ def apply_execution_fill_economics_import(
             record=record,
             record_index=index,
             duplicate_identities=duplicate_identities,
+            duplicate_provenances=duplicate_provenances,
             lock=True,
         )
         if current["status"] != "eligible":
@@ -117,6 +124,64 @@ def apply_execution_fill_economics_import(
         assert fee is not None and tax is not None
         total = fee + tax
         record_sha256 = _record_candidate_key(record)
+        provenance_candidate_key = _external_provenance_candidate_key(record)
+        evidence_summary = {
+            "schema_version": EXECUTION_FILL_ECONOMICS_IMPORT_VERSION,
+            "source_reference": record["source_reference"],
+            "broker_record_id": record["broker_record_id"],
+            "broker_name": record["broker_name"],
+            "broker_order_id": record["broker_order_id"],
+            "broker_fill_id": record["broker_fill_id"],
+            "symbol": record["symbol"],
+            "side": record["side"],
+            "scope": "per_fill",
+            "settlement_currency": "KRW",
+            "fee": _decimal_text(fee),
+            "tax": _decimal_text(tax),
+            "transaction_cost": _decimal_text(total),
+            "identity_match_count": 1,
+            "aggregate_allocation_performed": False,
+            "external_provenance_sha256": provenance_candidate_key,
+            "record_sha256": record_sha256,
+            "fills_deleted": 0,
+            "fills_fabricated": 0,
+            "orders_submitted": 0,
+        }
+        event_created = False
+        try:
+            # Reserve the provenance before changing the fill. The durable unique
+            # key serializes concurrent imports, while the savepoint lets a loser
+            # re-read the winning binding without poisoning the outer transaction.
+            with db.begin_nested():
+                event_created = _record_remediation_event(
+                    db=db,
+                    runtime_mode=runtime_mode,
+                    candidate_type=ECONOMICS_IMPORT_CANDIDATE_TYPE,
+                    candidate_key=provenance_candidate_key,
+                    subject_id=fill.id,
+                    outcome=_ECONOMICS_IMPORT_OUTCOME,
+                    actor=actor,
+                    reason=reason,
+                    occurred_at=imported_at,
+                    evidence_summary=evidence_summary,
+                )
+                if event_created:
+                    db.flush()
+        except IntegrityError:
+            raced = _evaluate_record(
+                db=db,
+                runtime_mode=runtime_mode,
+                record=record,
+                record_index=index,
+                duplicate_identities=duplicate_identities,
+                duplicate_provenances=duplicate_provenances,
+                lock=True,
+            )
+            if raced["status"] == "eligible":
+                raise
+            continue
+        if not event_created:
+            continue
         payload = payload_with_order_decision_lineage(
             fill.payload if isinstance(fill.payload, dict) else {},
             order=fill.broker_order,
@@ -133,6 +198,7 @@ def apply_execution_fill_economics_import(
             "imported_at": imported_at.isoformat(),
             "actor": actor,
             "reason": reason,
+            "external_provenance_sha256": provenance_candidate_key,
             "record_sha256": record_sha256,
         }
         fill.settlement_currency = "KRW"
@@ -141,39 +207,7 @@ def apply_execution_fill_economics_import(
         fill.transaction_cost_source = "broker_economics_import:fee+tax"
         fill.payload = payload
         db.add(fill)
-        if _record_remediation_event(
-            db=db,
-            runtime_mode=runtime_mode,
-            candidate_type=ECONOMICS_IMPORT_CANDIDATE_TYPE,
-            candidate_key=record_sha256,
-            subject_id=fill.id,
-            outcome="exact_economics_attached",
-            actor=actor,
-            reason=reason,
-            occurred_at=imported_at,
-            evidence_summary={
-                "schema_version": EXECUTION_FILL_ECONOMICS_IMPORT_VERSION,
-                "source_reference": record["source_reference"],
-                "broker_record_id": record["broker_record_id"],
-                "broker_name": record["broker_name"],
-                "broker_order_id": record["broker_order_id"],
-                "broker_fill_id": record["broker_fill_id"],
-                "symbol": record["symbol"],
-                "side": record["side"],
-                "scope": "per_fill",
-                "settlement_currency": "KRW",
-                "fee": _decimal_text(fee),
-                "tax": _decimal_text(tax),
-                "transaction_cost": _decimal_text(total),
-                "identity_match_count": 1,
-                "aggregate_allocation_performed": False,
-                "record_sha256": record_sha256,
-                "fills_deleted": 0,
-                "fills_fabricated": 0,
-                "orders_submitted": 0,
-            },
-        ):
-            audit_event_count += 1
+        audit_event_count += 1
         applied_count += 1
     db.commit()
     final_items = [
@@ -183,6 +217,7 @@ def apply_execution_fill_economics_import(
             record=record,
             record_index=index,
             duplicate_identities=duplicate_identities,
+            duplicate_provenances=duplicate_provenances,
         )
         for index, record in enumerate(records)
     ]
@@ -217,6 +252,7 @@ def _evaluate_record(
     record: dict[str, object],
     record_index: int,
     duplicate_identities: set[tuple[str, str, str]],
+    duplicate_provenances: set[tuple[str, str, str]],
     lock: bool = False,
 ) -> dict[str, object]:
     base = {
@@ -234,6 +270,37 @@ def _evaluate_record(
         ),
     }
     validation_error = _record_validation_error(record, base=base)
+    external_provenance = _canonical_external_provenance(record)
+    if external_provenance in duplicate_provenances:
+        return {
+            **base,
+            "status": "rejected",
+            "reason": "duplicate_input_external_provenance",
+        }
+    binding_events = (
+        _external_provenance_binding_events(
+            db=db,
+            runtime_mode=runtime_mode,
+            candidate_key=_external_provenance_candidate_key(record),
+            record=record,
+            lock=lock,
+        )
+        if external_provenance is not None
+        else []
+    )
+    if any(
+        not _binding_event_matches_record(
+            binding_event,
+            record=record,
+            base=base,
+        )
+        for binding_event in binding_events
+    ):
+        return {
+            **base,
+            "status": "rejected",
+            "reason": "external_broker_provenance_conflict",
+        }
     if validation_error is not None:
         return {**base, "status": "rejected", "reason": validation_error}
     identity = (
@@ -300,6 +367,29 @@ def _evaluate_record(
             "status": "rejected",
             "reason": "verified_krx_scope_unavailable",
         }
+    if lock and not binding_events:
+        binding_events = _external_provenance_binding_events(
+            db=db,
+            runtime_mode=runtime_mode,
+            candidate_key=_external_provenance_candidate_key(record),
+            record=record,
+            lock=True,
+        )
+    if any(
+        not _binding_event_matches_record(
+            binding_event,
+            record=record,
+            base=base,
+            execution_fill_id=fill.id,
+        )
+        for binding_event in binding_events
+    ):
+        return {
+            **base,
+            "execution_fill_id": fill.id,
+            "status": "rejected",
+            "reason": "external_broker_provenance_conflict",
+        }
     stored_currency = str(fill.settlement_currency or "").strip().upper()
     if stored_currency and stored_currency != "KRW":
         return {
@@ -331,6 +421,13 @@ def _evaluate_record(
             "tax": _decimal_text(tax),
             "transaction_cost": _decimal_text(total),
             "scope_evidence": scope_evidence,
+        }
+    if binding_events:
+        return {
+            **base,
+            "execution_fill_id": fill.id,
+            "status": "rejected",
+            "reason": "external_broker_provenance_conflict",
         }
     if (
         fill.transaction_cost is not None
@@ -410,12 +507,126 @@ def _persisted_import_matches_record(
         imported.get("schema_version") == EXECUTION_FILL_ECONOMICS_IMPORT_VERSION
         and imported.get("source_reference") == record.get("source_reference")
         and imported.get("broker_record_id") == record.get("broker_record_id")
-        and imported.get("record_sha256") == _record_candidate_key(record)
         and imported.get("scope") == "per_fill"
         and imported.get("settlement_currency") == "KRW"
         and _exact_cost(imported.get("fee")) == fee
         and _exact_cost(imported.get("tax")) == tax
         and _exact_cost(imported.get("transaction_cost")) == fee + tax
+    )
+
+
+def _canonical_external_provenance(
+    record: dict[str, object],
+) -> tuple[str, str, str] | None:
+    if set(record) != _RECORD_FIELDS:
+        return None
+    broker_name = _normalized_text(record.get("broker_name"), lower=True)
+    source_reference = _bounded_text(record.get("source_reference"), 256)
+    broker_record_id = _bounded_text(record.get("broker_record_id"), 256)
+    if (
+        broker_name is None
+        or source_reference is None
+        or broker_record_id is None
+        or record.get("broker_name") != broker_name
+        or record.get("source_reference") != source_reference
+        or record.get("broker_record_id") != broker_record_id
+    ):
+        return None
+    return broker_name, source_reference, broker_record_id
+
+
+def _external_provenance_candidate_key(record: dict[str, object]) -> str:
+    provenance = _canonical_external_provenance(record)
+    if provenance is None:
+        raise ValueError("external broker provenance is not canonical")
+    broker_name, source_reference, broker_record_id = provenance
+    canonical = json.dumps(
+        {
+            "broker_name": broker_name,
+            "broker_record_id": broker_record_id,
+            "source_reference": source_reference,
+        },
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _external_provenance_binding_events(
+    *,
+    db: Session,
+    runtime_mode: str,
+    candidate_key: str,
+    record: dict[str, object],
+    lock: bool,
+) -> list[RuntimeRemediationEvent]:
+    common_predicates = (
+        RuntimeRemediationEvent.mode == runtime_mode,
+        RuntimeRemediationEvent.candidate_type == ECONOMICS_IMPORT_CANDIDATE_TYPE,
+        RuntimeRemediationEvent.outcome == _ECONOMICS_IMPORT_OUTCOME,
+    )
+    query = select(RuntimeRemediationEvent).where(
+        *common_predicates,
+        RuntimeRemediationEvent.candidate_key == candidate_key,
+    )
+    if lock:
+        query = query.with_for_update().execution_options(populate_existing=True)
+    events = list(db.scalars(query).all())
+
+    # The first release keyed audits by the SHA of the entire broker record.
+    # Locate those durable records by their exact external provenance so an
+    # upgrade cannot reuse a previously consumed ledger row on another fill.
+    provenance = _canonical_external_provenance(record)
+    if provenance is None:
+        return events
+    broker_name, source_reference, broker_record_id = provenance
+    legacy_query = select(RuntimeRemediationEvent).where(
+        *common_predicates,
+        RuntimeRemediationEvent.candidate_key != candidate_key,
+        RuntimeRemediationEvent.evidence_summary["broker_name"].as_string()
+        == broker_name,
+        RuntimeRemediationEvent.evidence_summary["source_reference"].as_string()
+        == source_reference,
+        RuntimeRemediationEvent.evidence_summary["broker_record_id"].as_string()
+        == broker_record_id,
+    )
+    if lock:
+        legacy_query = legacy_query.with_for_update().execution_options(
+            populate_existing=True
+        )
+    events.extend(db.scalars(legacy_query).all())
+    return events
+
+
+def _binding_event_matches_record(
+    event: RuntimeRemediationEvent,
+    *,
+    record: dict[str, object],
+    base: dict[str, object],
+    execution_fill_id: str | None = None,
+) -> bool:
+    evidence = event.evidence_summary
+    fee = _exact_cost(record.get("fee"))
+    tax = _exact_cost(record.get("tax"))
+    if not isinstance(evidence, dict) or fee is None or tax is None:
+        return False
+    if execution_fill_id is not None and event.subject_id != execution_fill_id:
+        return False
+    return (
+        evidence.get("schema_version") == EXECUTION_FILL_ECONOMICS_IMPORT_VERSION
+        and evidence.get("source_reference") == base.get("source_reference")
+        and evidence.get("broker_record_id") == base.get("broker_record_id")
+        and evidence.get("broker_name") == base.get("broker_name")
+        and evidence.get("broker_order_id") == base.get("broker_order_id")
+        and evidence.get("broker_fill_id") == base.get("broker_fill_id")
+        and evidence.get("symbol") == base.get("symbol")
+        and evidence.get("side") == base.get("side")
+        and evidence.get("scope") == base.get("scope")
+        and evidence.get("settlement_currency") == base.get("settlement_currency")
+        and _exact_cost(evidence.get("fee")) == fee
+        and _exact_cost(evidence.get("tax")) == tax
+        and _exact_cost(evidence.get("transaction_cost")) == fee + tax
     )
 
 
@@ -431,6 +642,18 @@ def _duplicate_input_identities(
         )
         counts[identity] = counts.get(identity, 0) + 1
     return {identity for identity, count in counts.items() if count > 1}
+
+
+def _duplicate_input_provenances(
+    records: list[dict[str, object]],
+) -> set[tuple[str, str, str]]:
+    counts: dict[tuple[str, str, str], int] = {}
+    for record in records:
+        provenance = _canonical_external_provenance(record)
+        if provenance is None:
+            continue
+        counts[provenance] = counts.get(provenance, 0) + 1
+    return {provenance for provenance, count in counts.items() if count > 1}
 
 
 def _record_candidate_key(record: dict[str, object]) -> str:

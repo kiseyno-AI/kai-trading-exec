@@ -42,8 +42,8 @@ from app.services.artifact_integrity import (
 from app.services.database_cli_security import reject_secret_database_url_argument
 from app.services.execution_account_route import redact_account_references
 from app.services.execution_lineage import (
-    decision_lineage_for_order,
-    decision_lineage_from_metadata,
+    resolve_decision_lineage_evidence,
+    resolve_decision_lineage_payloads,
 )
 from app.services.fifo_inventory import (
     FifoRouteScope,
@@ -473,7 +473,9 @@ def _weekly_fills(
         BrokerOrder.idempotency_key,
         BrokerOrder.execution_plan_item_id,
         BrokerOrder.request_metadata.label("_broker_order_request_metadata"),
+        ExecutionFill.payload.label("_execution_fill_payload"),
         ExecutionPlanItem.intent.label("execution_plan_item_intent"),
+        ExecutionPlanItem.source_plan_item_id,
         ExecutionPlanItem.decision_agent_name,
         ExecutionPlanItem.decision_snapshot_id,
         ExecutionPlanItem.decision_run_id,
@@ -481,9 +483,9 @@ def _weekly_fills(
         ExecutionPlan.market_date.label("target_market_date"),
         ExecutionPlan.source.label("execution_plan_source"),
         ExecutionPlan.strategy_run_id,
+        ExecutionPlan.id.label("decision_execution_plan_id"),
+        ExecutionPlan.external_plan_id.label("decision_external_plan_id"),
     ]
-    if include_json_payloads:
-        columns.append(ExecutionFill.payload)
     rows = db.execute(
         select(*columns)
         .join(BrokerOrder, ExecutionFill.broker_order_pk == BrokerOrder.id)
@@ -505,20 +507,93 @@ def _weekly_fills(
     ).all()
     bounded, truncated = _bounded_rows(rows, max_rows)
     for row in bounded:
-        lineage = decision_lineage_from_metadata(
-            row.pop("_broker_order_request_metadata", None),
+        order_metadata = row.pop("_broker_order_request_metadata", None)
+        fill_payload = row.pop("_execution_fill_payload", None)
+        evidence = resolve_decision_lineage_payloads(
+            order_metadata=order_metadata,
+            fill_payload=fill_payload,
             execution_plan_item_id=row.get("execution_plan_item_id"),
         )
-        if lineage is None:
-            continue
-        row["decision_agent_name"] = lineage.get("decision_agent_name")
-        row["decision_snapshot_id"] = lineage.get("decision_snapshot_id")
-        row["decision_run_id"] = lineage.get("decision_run_id")
-        row["source_market_date"] = lineage.get("source_market_date")
-        row["target_market_date"] = lineage.get("target_market_date")
-        row["execution_plan_source"] = lineage.get("plan_source")
-        row["strategy_run_id"] = lineage.get("strategy_run_id")
+        if include_json_payloads:
+            row["payload"] = fill_payload
+        _apply_weekly_lineage_projection(row=row, evidence=evidence)
     return bounded, truncated
+
+
+def _apply_weekly_lineage_projection(
+    *,
+    row: dict[str, object],
+    evidence: dict[str, object],
+) -> None:
+    row["decision_lineage_status"] = evidence["status"]
+    row["decision_lineage_source"] = evidence["source"]
+    lineage = evidence.get("lineage")
+    if evidence["status"] == "legacy_degraded":
+        return
+    if not isinstance(lineage, dict):
+        for field in (
+            "decision_execution_plan_id",
+            "decision_external_plan_id",
+            "source_plan_item_id",
+            "decision_agent_name",
+            "decision_snapshot_id",
+            "decision_run_id",
+            "source_market_date",
+            "target_market_date",
+            "execution_plan_source",
+            "strategy_run_id",
+        ):
+            row[field] = None
+        return
+    row["decision_execution_plan_id"] = lineage.get("execution_plan_id")
+    row["decision_external_plan_id"] = lineage.get("external_plan_id")
+    row["source_plan_item_id"] = lineage.get("source_plan_item_id")
+    row["decision_agent_name"] = lineage.get("decision_agent_name")
+    row["decision_snapshot_id"] = lineage.get("decision_snapshot_id")
+    row["decision_run_id"] = lineage.get("decision_run_id")
+    row["source_market_date"] = _lineage_date(lineage.get("source_market_date"))
+    row["target_market_date"] = _lineage_date(lineage.get("target_market_date"))
+    row["execution_plan_source"] = lineage.get("plan_source")
+    row["strategy_run_id"] = lineage.get("strategy_run_id")
+
+
+def _lineage_projection(
+    *,
+    evidence: dict[str, object],
+    legacy_item: ExecutionPlanItem | None,
+) -> dict[str, object]:
+    lineage = evidence.get("lineage")
+    if isinstance(lineage, dict):
+        return lineage
+    if evidence.get("status") != "legacy_degraded" or legacy_item is None:
+        return {}
+    plan = legacy_item.plan
+    return {
+        "execution_plan_id": legacy_item.execution_plan_id,
+        "execution_plan_item_id": legacy_item.id,
+        "external_plan_id": plan.external_plan_id if plan is not None else None,
+        "plan_source": plan.source if plan is not None else None,
+        "strategy_run_id": plan.strategy_run_id if plan is not None else None,
+        "target_market_date": plan.market_date if plan is not None else None,
+        "source_plan_item_id": legacy_item.source_plan_item_id,
+        "decision_agent_name": legacy_item.decision_agent_name,
+        "decision_snapshot_id": legacy_item.decision_snapshot_id,
+        "decision_run_id": legacy_item.decision_run_id,
+        "source_market_date": legacy_item.source_market_date,
+    }
+
+
+def _lineage_date(value: object) -> date | None:
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if not isinstance(value, str):
+        return None
+    try:
+        return date.fromisoformat(value.strip())
+    except ValueError:
+        return None
 
 
 def _weekly_fill_attribution_coverage(
@@ -543,9 +618,18 @@ def _weekly_fill_attribution_coverage(
     missing_decision_ids = sorted(
         str(row["id"])
         for row in fills
-        if row.get("decision_snapshot_id") is None
+        if row.get("decision_lineage_status") != "complete"
+        or row.get("decision_execution_plan_id") is None
+        or row.get("decision_external_plan_id") is None
+        or row.get("source_plan_item_id") is None
+        or row.get("decision_snapshot_id") is None
         or row.get("decision_agent_name") is None
         or row.get("decision_run_id") is None
+        or row.get("source_market_date") is None
+        or row.get("target_market_date") is None
+        or row.get("execution_plan_source") is None
+        or row.get("strategy_run_id") is None
+        or row.get("decision_run_id") != row.get("strategy_run_id")
         or str(row["id"]) in decision_run_mismatch_ids
     )
     if truncated:
@@ -587,10 +671,20 @@ def _weekly_learning_evidence(
         {
             str(row.get("sell_fill_id"))
             for row in closed_trades
-            if row.get("source_execution_plan_item_id") is None
+            if row.get("decision_lineage_status") != "complete"
+            or row.get("decision_execution_plan_id") is None
+            or row.get("decision_external_plan_id") is None
+            or row.get("source_execution_plan_item_id") is None
+            or row.get("source_plan_item_id") is None
             or row.get("decision_snapshot_id") is None
             or row.get("decision_run_id") is None
             or row.get("decision_agent_name") is None
+            or row.get("decision_plan_source") is None
+            or row.get("decision_strategy_run_id") is None
+            or row.get("decision_target_market_date") is None
+            or row.get("decision_source_market_date") is None
+            or row.get("decision_run_id")
+            != row.get("decision_strategy_run_id")
         }
     )
     performance_blocked_reasons: list[str] = []
@@ -1758,10 +1852,19 @@ def _closed_trade_row(
     )
     sell_item = fill.broker_order.plan_item if fill.broker_order is not None else None
     source_item = buy_item or sell_item
-    source_lineage = decision_lineage_for_order(
+    source_order = (
         buy_fill.broker_order
         if buy_fill is not None and buy_fill.broker_order is not None
         else fill.broker_order
+    )
+    source_fill = buy_fill if buy_fill is not None else fill
+    lineage_evidence = resolve_decision_lineage_evidence(
+        order=source_order,
+        fill_payload=source_fill.payload,
+    )
+    lineage_projection = _lineage_projection(
+        evidence=lineage_evidence,
+        legacy_item=source_item,
     )
     pnl = ((sell_price - buy_price) * quantity).quantize(Decimal("0.0001")) if buy_price is not None else None
     economics = (
@@ -1805,29 +1908,24 @@ def _closed_trade_row(
             economics.transaction_cost_coverage if economics is not None else "unknown"
         ),
         "source_execution_plan_item_id": (
-            source_lineage.get("execution_plan_item_id")
-            if source_lineage is not None
-            else (source_item.id if source_item is not None else None)
+            lineage_projection.get("execution_plan_item_id")
         ),
-        "decision_snapshot_id": (
-            source_lineage.get("decision_snapshot_id")
-            if source_lineage is not None
-            else (
-                source_item.decision_snapshot_id if source_item is not None else None
-            )
+        "decision_execution_plan_id": lineage_projection.get("execution_plan_id"),
+        "decision_external_plan_id": lineage_projection.get("external_plan_id"),
+        "source_plan_item_id": lineage_projection.get("source_plan_item_id"),
+        "decision_snapshot_id": lineage_projection.get("decision_snapshot_id"),
+        "decision_run_id": lineage_projection.get("decision_run_id"),
+        "decision_agent_name": lineage_projection.get("decision_agent_name"),
+        "decision_plan_source": lineage_projection.get("plan_source"),
+        "decision_strategy_run_id": lineage_projection.get("strategy_run_id"),
+        "decision_target_market_date": _lineage_date(
+            lineage_projection.get("target_market_date")
         ),
-        "decision_run_id": (
-            source_lineage.get("decision_run_id")
-            if source_lineage is not None
-            else (source_item.decision_run_id if source_item is not None else None)
+        "decision_source_market_date": _lineage_date(
+            lineage_projection.get("source_market_date")
         ),
-        "decision_agent_name": (
-            source_lineage.get("decision_agent_name")
-            if source_lineage is not None
-            else (
-                source_item.decision_agent_name if source_item is not None else None
-            )
-        ),
+        "decision_lineage_status": lineage_evidence["status"],
+        "decision_lineage_source": lineage_evidence["source"],
     }
 
 

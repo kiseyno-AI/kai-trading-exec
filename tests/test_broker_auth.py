@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo
 
 from fastapi.testclient import TestClient
 import pytest
-from sqlalchemy import event, select
+from sqlalchemy import event, select, update
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import flag_modified
@@ -27592,6 +27592,11 @@ def test_account_route_is_revalidated_after_auth_before_broker_call(monkeypatch)
         ("trigger_price", Decimal("70500")),
         ("time_in_force", "ioc"),
         ("quantity_policy", {"kind": "shares", "quantity": 2}),
+        ("decision_agent_name", "replacement-agent"),
+        ("decision_snapshot_id", "replacement-snapshot"),
+        ("decision_run_id", "replacement-run"),
+        ("source_plan_item_id", "replacement-source-item"),
+        ("source_market_date", date(2026, 6, 5)),
         ("risk_context.target_price", "79000"),
         (
             "risk_context.monitoring_order_authority",
@@ -27715,20 +27720,120 @@ def test_plan_item_identity_is_revalidated_after_auth_before_broker_call(
                 == "boundary-plan-item-identity-mutation-order"
             )
         )
-        assert order is not None
-        assert order.status == "rejected"
-        assert raw_reference not in str(order.request_metadata)
-        assert "account_reference" not in str(order.request_metadata)
-        events = session.scalars(
-            select(BrokerOrderEvent).where(
-                BrokerOrderEvent.broker_order_pk == order.id
+        assert order is None
+    engine.dispose()
+
+
+def test_plan_item_lineage_is_refetched_when_identity_map_is_stale(
+    monkeypatch,
+) -> None:
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(),
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+            kis_account_product_code="01",
+        ),
+        broker_adapter=broker_adapter,
+    )
+    client = TestClient(app)
+    assert client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "test", "reason": "lineage refresh guard"},
+    ).status_code == 200
+    created = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "stale-lineage-identity-plan",
+            "source": "test-fixture",
+            "market_date": "2026-06-04",
+            "strategy_run_id": "old-run",
+            "items": [
+                {
+                    "symbol": "005930",
+                    "side": "buy",
+                    "intent": "next_open_buy",
+                    "limit_price": "71000",
+                    "quantity_policy": {"kind": "shares", "quantity": 1},
+                    "risk_context": {"exchange": "KRX"},
+                    "source_plan_item_id": "core-source-item",
+                    "source_market_date": "2026-06-03",
+                    "decision_agent_name": "old-agent",
+                    "decision_snapshot_id": "old-snapshot",
+                    "decision_run_id": "old-run",
+                }
+            ],
+        },
+    )
+    assert created.status_code == 201
+    item_id = created.json()["persisted_execution_item_ids"][0]
+    original_authenticate = broker_orders_service.ensure_authenticated_broker_session
+
+    def mutate_lineage_without_synchronizing_identity_map(**kwargs):
+        result = original_authenticate(**kwargs)
+        session = kwargs["db"]
+        cached_item = session.get(ExecutionPlanItem, item_id)
+        assert cached_item is not None
+        assert cached_item.decision_snapshot_id == "old-snapshot"
+        session.execute(
+            update(ExecutionPlanItem)
+            .where(ExecutionPlanItem.id == item_id)
+            .values(
+                decision_agent_name="new-agent",
+                decision_snapshot_id="new-snapshot",
+                decision_run_id="new-run",
             )
-        ).all()
-        assert events
-        assert raw_reference not in str([event.request_payload for event in events])
-        assert "account_reference" not in str(
-            [event.request_payload for event in events]
+            .execution_options(synchronize_session=False)
         )
+        session.execute(
+            update(ExecutionPlan)
+            .where(ExecutionPlan.id == cached_item.execution_plan_id)
+            .values(strategy_run_id="new-run")
+            .execution_options(synchronize_session=False)
+        )
+        session.flush()
+        assert cached_item.decision_snapshot_id == "old-snapshot"
+        assert cached_item.plan.strategy_run_id == "old-run"
+        return result
+
+    monkeypatch.setattr(
+        broker_orders_service,
+        "ensure_authenticated_broker_session",
+        mutate_lineage_without_synchronizing_identity_map,
+    )
+
+    response = client.post(
+        "/orders",
+        json={
+            "idempotency_key": "stale-lineage-identity-order",
+            "execution_plan_item_id": item_id,
+            "symbol": "005930",
+            "side": "buy",
+            "quantity": 1,
+            "order_type": "limit",
+            "limit_price": "71000",
+            "time_in_force": "day",
+            "exchange": "KRX",
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["block_reason"] == "execution_plan_item_identity_changed"
+    assert broker_adapter.order_calls == []
+    with app.state.db_session_factory() as session:
+        assert session.scalar(select(BrokerOrder).where(BrokerOrder.idempotency_key == "stale-lineage-identity-order")) is None
     engine.dispose()
 
 

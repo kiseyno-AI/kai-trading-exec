@@ -5204,6 +5204,10 @@ def _merge_reconcile_request_metadata(
     incoming: dict[str, Any],
 ) -> dict[str, Any]:
     merged = dict(incoming)
+    # Broker reconciliation is never a decision-authority source. An incoming
+    # value cannot create lineage for an order that did not capture it before
+    # submission.
+    merged.pop("decision_lineage", None)
     if not isinstance(existing, dict):
         return merged
     for key in ("source", "metadata", "route", "time_in_force"):
@@ -5212,6 +5216,14 @@ def _merge_reconcile_request_metadata(
     for key in ("exchange", "execution_scope"):
         if key in existing:
             merged[key] = _json_safe_value(existing[key])
+    if "decision_lineage" in existing:
+        # Reconciliation metadata is broker transport evidence, not authority to
+        # rewrite the immutable decision snapshot captured before submission.
+        # Preserve even malformed/partial historical values so a retry cannot
+        # silently heal them and fail open into mutable plan attribution.
+        merged["decision_lineage"] = _json_safe_value(
+            existing["decision_lineage"]
+        )
     return merged
 
 

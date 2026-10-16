@@ -12,12 +12,22 @@ from app.services.execution_lineage import (
     EXECUTION_DECISION_LINEAGE_VERSION,
     decision_lineage_for_order,
     decision_lineage_for_plan_item,
+    payload_with_order_decision_lineage,
+    resolve_decision_lineage_evidence,
 )
 from app.services.broker_orders import _preserve_decision_lineage
 from app.services.reconciliation import _upsert_order_fills
 from app.services.fifo_inventory import FifoRouteScope
-from app.services.trade_outcome_feedback import OpenLot, _closed_trade
-from app.services.weekly_trade_review import _closed_trade_row
+from app.services.trade_outcome_feedback import (
+    OpenLot,
+    _closed_trade,
+    _feedback_learning_quality_gate,
+    _trade_has_learning_lineage,
+)
+from app.services.weekly_trade_review import (
+    _closed_trade_row,
+    _weekly_learning_evidence,
+)
 
 
 def _plan_item() -> ExecutionPlanItem:
@@ -58,6 +68,7 @@ def test_decision_lineage_snapshot_is_complete_and_immutable() -> None:
         "schema_version": EXECUTION_DECISION_LINEAGE_VERSION,
         "status": "complete",
         "execution_plan_id": "plan-db-id",
+        "operational_execution_plan_id": "plan-db-id",
         "execution_plan_item_id": "item-db-id",
         "external_plan_id": "core-plan-20261016",
         "plan_source": "kai-trading-core",
@@ -93,6 +104,30 @@ def test_decision_lineage_snapshot_is_complete_and_immutable() -> None:
     assert persisted["decision_agent_name"] == "krx-decision-agent"
     assert persisted["decision_snapshot_id"] == "snapshot-1"
     assert persisted["decision_run_id"] == "core-run-1"
+
+
+def test_legacy_sell_authority_never_falls_back_to_old_parent_identity() -> None:
+    item = _plan_item()
+    item.risk_context = {
+        "sell_monitor_authority_v1": {
+            "market_date": "2026-10-17",
+            "requested_at": "2026-10-16T01:00:00+00:00",
+            "accepted_at": "2026-10-16T01:00:01+00:00",
+            "source_plan_id": "newer-plan-with-ambiguous-id-kind",
+        }
+    }
+
+    lineage = decision_lineage_for_plan_item(item)
+
+    assert lineage is not None
+    assert lineage["status"] == "partial"
+    assert lineage["execution_plan_id"] is None
+    assert lineage["external_plan_id"] is None
+    assert lineage["plan_source"] is None
+    assert lineage["strategy_run_id"] is None
+    assert lineage["target_market_date"] == "2026-10-17"
+    assert lineage["operational_execution_plan_id"] == "plan-db-id"
+    assert lineage["execution_plan_item_id"] == "item-db-id"
 
 
 def test_reconciled_fill_carries_order_lineage_without_fabricating_costs() -> None:
@@ -175,6 +210,81 @@ def test_unlinked_order_does_not_gain_decision_identity() -> None:
     assert decision_lineage_for_order(order) is None
 
 
+def test_lineage_evidence_distinguishes_legacy_partial_invalid_and_conflict() -> None:
+    item = _plan_item()
+    complete = decision_lineage_for_plan_item(item)
+    assert complete is not None
+    order = BrokerOrder(
+        id="lineage-evidence-order",
+        execution_plan_item_id=item.id,
+        broker_name="kis",
+        mode="live",
+        idempotency_key="lineage-evidence-order",
+        symbol="005930",
+        side="buy",
+        status="filled",
+        quantity=1,
+        venue="KRX",
+        asset_class="stock",
+        request_metadata={},
+    )
+
+    legacy = resolve_decision_lineage_evidence(order=order, fill_payload={})
+    assert legacy["status"] == "legacy_degraded"
+    assert legacy["lineage"] is None
+
+    order.request_metadata = {
+        "decision_lineage": {**complete, "status": "partial"}
+    }
+    partial = resolve_decision_lineage_evidence(order=order, fill_payload={})
+    assert partial["status"] == "partial"
+    assert partial["lineage"]["decision_snapshot_id"] == "snapshot-1"
+
+    order.request_metadata = {"decision_lineage": {"schema_version": "invalid"}}
+    invalid = resolve_decision_lineage_evidence(order=order, fill_payload={})
+    assert invalid["status"] == "invalid"
+    assert invalid["lineage"] is None
+
+    order.request_metadata = {"decision_lineage": complete}
+    conflicting_fill = dict(complete)
+    conflicting_fill["decision_snapshot_id"] = "different-snapshot"
+    conflict = resolve_decision_lineage_evidence(
+        order=order,
+        fill_payload={"decision_lineage": conflicting_fill},
+    )
+    assert conflict["status"] == "conflict"
+    assert conflict["lineage"] is None
+
+
+def test_complete_fill_snapshot_recovers_absent_order_snapshot_without_mutable_fallback() -> None:
+    item = _plan_item()
+    complete = decision_lineage_for_plan_item(item)
+    assert complete is not None
+    order = BrokerOrder(
+        id="fill-snapshot-order",
+        execution_plan_item_id=item.id,
+        broker_name="kis",
+        mode="live",
+        idempotency_key="fill-snapshot-order",
+        symbol="005930",
+        side="buy",
+        status="filled",
+        quantity=1,
+        venue="KRX",
+        asset_class="stock",
+        request_metadata={},
+    )
+
+    evidence = resolve_decision_lineage_evidence(
+        order=order,
+        fill_payload={"decision_lineage": complete},
+    )
+
+    assert evidence["status"] == "complete"
+    assert evidence["source"] == "fill_snapshot"
+    assert evidence["lineage"] == complete
+
+
 def test_retry_preserves_the_original_order_lineage_snapshot() -> None:
     item = _plan_item()
     original = decision_lineage_for_plan_item(item)
@@ -202,6 +312,63 @@ def test_retry_preserves_the_original_order_lineage_snapshot() -> None:
     )
 
     assert metadata["decision_lineage"] == original
+
+
+def test_retry_preserves_legacy_absence_of_order_lineage() -> None:
+    item = _plan_item()
+    generated = decision_lineage_for_plan_item(item)
+    assert generated is not None
+    order = BrokerOrder(
+        id="legacy-retry-order",
+        execution_plan_item_id=item.id,
+        broker_name="kis",
+        mode="live",
+        idempotency_key="legacy-retry-order",
+        symbol="005930",
+        side="buy",
+        status="retry_pending",
+        quantity=1,
+        venue="KRX",
+        asset_class="stock",
+        request_metadata={"source": "legacy"},
+    )
+
+    metadata = _preserve_decision_lineage(
+        request_metadata={"decision_lineage": generated},
+        existing_order=order,
+    )
+
+    assert "decision_lineage" not in metadata
+
+
+def test_fill_lineage_accepts_semantically_equal_older_v1_snapshot() -> None:
+    item = _plan_item()
+    lineage = decision_lineage_for_plan_item(item)
+    assert lineage is not None
+    older_v1_lineage = dict(lineage)
+    older_v1_lineage.pop("operational_execution_plan_id")
+    order = BrokerOrder(
+        id="older-v1-order",
+        execution_plan_item_id=item.id,
+        broker_name="kis",
+        mode="live",
+        idempotency_key="older-v1-order",
+        symbol="005930",
+        side="buy",
+        status="filled",
+        quantity=1,
+        venue="KRX",
+        asset_class="stock",
+        request_metadata={"decision_lineage": older_v1_lineage},
+    )
+
+    payload = payload_with_order_decision_lineage(
+        {"decision_lineage": older_v1_lineage},
+        order=order,
+    )
+
+    assert payload["decision_lineage"] == older_v1_lineage
+    assert "decision_lineage_conflict" not in payload
 
 
 def test_weekly_and_feedback_attribution_prefer_the_order_snapshot() -> None:
@@ -305,3 +472,134 @@ def test_weekly_and_feedback_attribution_prefer_the_order_snapshot() -> None:
     assert weekly["decision_run_id"] == "core-run-1"
     assert feedback["decision_agent_name"] == "krx-decision-agent"
     assert feedback["decision_run_id"] == "core-run-1"
+    assert weekly["decision_lineage_status"] == "complete"
+    assert feedback["decision_lineage_status"] == "complete"
+
+
+def test_partial_snapshot_blocks_weekly_and_feedback_learning_despite_mutable_identity() -> None:
+    item = _plan_item()
+    partial = decision_lineage_for_plan_item(item)
+    assert partial is not None
+    partial["status"] = "partial"
+    buy_order = BrokerOrder(
+        id="partial-buy-order",
+        execution_plan_item_id=item.id,
+        broker_name="kis",
+        mode="live",
+        idempotency_key="partial-buy-order",
+        broker_order_id="partial-buy-broker-order",
+        symbol="005930",
+        side="buy",
+        status="filled",
+        quantity=1,
+        venue="kis",
+        asset_class="stock",
+        request_metadata={"decision_lineage": partial},
+        plan_item=item,
+    )
+    sell_order = BrokerOrder(
+        id="partial-sell-order",
+        execution_plan_item_id=item.id,
+        broker_name="kis",
+        mode="live",
+        idempotency_key="partial-sell-order",
+        broker_order_id="partial-sell-broker-order",
+        symbol="005930",
+        side="sell",
+        status="filled",
+        quantity=1,
+        venue="kis",
+        asset_class="stock",
+        request_metadata={"decision_lineage": partial},
+        plan_item=item,
+    )
+    buy_fill = ExecutionFill(
+        id="partial-buy-fill",
+        broker_order=buy_order,
+        broker_fill_id="partial-buy-fill",
+        symbol="005930",
+        side="buy",
+        quantity=1,
+        price=Decimal("70000"),
+        settlement_currency="KRW",
+        transaction_cost=Decimal("1"),
+        transaction_cost_coverage="complete",
+        transaction_cost_source="test-exact-cost",
+        filled_at=datetime(2026, 10, 16, 0, 2, tzinfo=UTC),
+        payload={"decision_lineage": partial},
+    )
+    sell_fill = ExecutionFill(
+        id="partial-sell-fill",
+        broker_order=sell_order,
+        broker_fill_id="partial-sell-fill",
+        symbol="005930",
+        side="sell",
+        quantity=1,
+        price=Decimal("71000"),
+        settlement_currency="KRW",
+        transaction_cost=Decimal("1"),
+        transaction_cost_coverage="complete",
+        transaction_cost_source="test-exact-cost",
+        filled_at=datetime(2026, 10, 16, 1, 2, tzinfo=UTC),
+        payload={"decision_lineage": partial},
+    )
+    route_scope = FifoRouteScope(
+        provider="kis",
+        account_scope="a" * 24,
+        venue="kis",
+        asset_class="stock",
+        exchange="KRX",
+    )
+
+    weekly = _closed_trade_row(
+        fill=sell_fill,
+        buy_fill=buy_fill,
+        quantity=Decimal("1"),
+        buy_price=Decimal("70000"),
+        cost_basis_source="fifo_exact",
+        cost_basis_observed_at=buy_fill.filled_at,
+        route_scope=route_scope,
+    )
+    feedback = _closed_trade(
+        lot=OpenLot(
+            quantity=Decimal("1"),
+            price=Decimal("70000"),
+            filled_at=buy_fill.filled_at,
+            fill=buy_fill,
+        ),
+        sell_fill=sell_fill,
+        quantity=Decimal("1"),
+        route_scope=route_scope,
+    )
+
+    assert weekly["decision_lineage_status"] == "partial"
+    assert feedback["decision_lineage_status"] == "partial"
+    assert feedback["profitability_eligible"] is False
+    assert _trade_has_learning_lineage(feedback) is False
+    feedback_gate = _feedback_learning_quality_gate(
+        closed_trades=[feedback],
+        candidate_rule_replay={"status": "ready"},
+    )
+    assert feedback_gate["status"] == "blocked"
+    assert "incomplete_decision_lineage_coverage" in feedback_gate["blocked_reasons"]
+
+    weekly_evidence = _weekly_learning_evidence(
+        fill_attribution_coverage={"status": "incomplete"},
+        realized_pnl_coverage={"status": "complete"},
+        realized_pnl_summary={
+            "transaction_cost_coverage": "complete",
+            "currency_coverage": "complete",
+        },
+        closed_trades=[weekly],
+        weekly_order_status_counts=[],
+        execution_failures=[],
+        truncated={
+            "fills": False,
+            "weekly_orders": False,
+            "execution_failures": False,
+            "closed_trades": False,
+        },
+    )
+    performance = weekly_evidence["performance_feedback"]
+    assert performance["status"] == "blocked"
+    assert "incomplete_closed_trade_decision_lineage" in performance["blocked_reasons"]

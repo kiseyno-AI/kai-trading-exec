@@ -249,6 +249,14 @@ def create_core_execution_plan_v4(
         )
 
     legacy_command = ExecutionPlanRequest.model_validate(command.model_dump(mode="json"))
+    # Monitoring materialization may update an older sell row in place before
+    # the strict v4 persistence binder runs. Bind the two plan-level decision
+    # fields up front so that row never receives a hybrid of new material and
+    # missing/old decision authority. The later binder remains the durable
+    # contract-proof step for the newly persisted plan items.
+    for item in legacy_command.items:
+        item.decision_run_id = command.strategy_run_id
+        item.source_market_date = command.metadata.source_market_date
     result = create_execution_plan(
         settings=settings,
         db=db,

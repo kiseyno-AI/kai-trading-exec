@@ -101,7 +101,7 @@ def apply_execution_fill_metadata_repairs(
             .with_for_update()
             .execution_options(populate_existing=True)
         )
-        if fill is None or fill.settlement_currency is not None:
+        if fill is None or _optional_str(fill.settlement_currency) is not None:
             continue
         order = db.get(BrokerOrder, fill.broker_order_pk)
         if order is None:
@@ -110,6 +110,7 @@ def apply_execution_fill_metadata_repairs(
         if current_evidence != item.get("evidence"):
             continue
         before_cost = _decimal_evidence_text(fill.transaction_cost)
+        before_currency = fill.settlement_currency
         before_coverage = fill.transaction_cost_coverage
         before_source = fill.transaction_cost_source
         payload = dict(fill.payload) if isinstance(fill.payload, dict) else {}
@@ -137,7 +138,7 @@ def apply_execution_fill_metadata_repairs(
                 "broker_order_id": order.broker_order_id,
                 "broker_fill_id": fill.broker_fill_id,
                 "symbol": fill.symbol,
-                "settlement_currency_before": None,
+                "settlement_currency_before": before_currency,
                 "settlement_currency_after": "KRW",
                 "evidence": current_evidence,
                 "transaction_cost_before": before_cost,

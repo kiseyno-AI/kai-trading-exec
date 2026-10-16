@@ -15,6 +15,7 @@ from app.models.runtime import (
 )
 from app.services.execution_fill_economics_import import (
     EXECUTION_FILL_ECONOMICS_IMPORT_VERSION,
+    _record_candidate_key,
     analyze_execution_fill_economics_import,
     apply_execution_fill_economics_import,
 )
@@ -181,6 +182,47 @@ def test_fill_metadata_repair_uses_verified_scope_and_leaves_unknown_unmodified(
         engine.dispose()
 
 
+def test_fill_metadata_repair_normalizes_blank_currency_during_locked_apply() -> None:
+    db, engine = _session()
+    try:
+        order = _order(
+            order_id="blank-currency-order",
+            broker_order_id="blank-currency-broker-order",
+            request_metadata={"execution_scope": _canonical_scope()},
+        )
+        fill = _fill(
+            fill_id="blank-currency-fill",
+            order=order,
+            broker_fill_id="blank-currency-broker-fill",
+        )
+        fill.settlement_currency = "   "
+        db.add(fill)
+        db.commit()
+
+        dry_run = analyze_execution_fill_metadata_repairs(
+            db=db,
+            runtime_mode="live",
+        )
+        assert dry_run["summary"]["deterministic_krw_candidate_count"] == 1
+
+        applied = apply_execution_fill_metadata_repairs(
+            db=db,
+            runtime_mode="live",
+            actor="test-operator",
+            reason="normalize verified blank currency",
+            now=datetime(2026, 10, 16, 1, tzinfo=UTC),
+        )
+
+        assert applied["summary"]["applied_settlement_currency_count"] == 1
+        assert fill.settlement_currency == "KRW"
+        event = db.scalar(select(RuntimeRemediationEvent))
+        assert event is not None
+        assert event.evidence_summary["settlement_currency_before"] == "   "
+    finally:
+        db.close()
+        engine.dispose()
+
+
 def _economics_document(
     *,
     broker_order_id: str = "20001",
@@ -318,6 +360,222 @@ def test_economics_import_rejects_aggregate_unknown_and_ambiguous_records() -> N
         )
         assert unknown["items"][0]["status"] == "rejected"
         assert all(fill.transaction_cost is None for fill in db.scalars(select(ExecutionFill)))
+    finally:
+        db.close()
+        engine.dispose()
+
+
+def test_economics_import_binds_external_provenance_to_one_exact_fill() -> None:
+    db, engine = _session()
+    try:
+        first_order = _order(
+            order_id="provenance-order-a",
+            broker_order_id="30001",
+            request_metadata={"execution_scope": _canonical_scope()},
+        )
+        second_order = _order(
+            order_id="provenance-order-b",
+            broker_order_id="30002",
+            request_metadata={"execution_scope": _canonical_scope()},
+        )
+        first_fill = _fill(
+            fill_id="provenance-fill-a",
+            order=first_order,
+            broker_fill_id="broker-fill-30001",
+        )
+        second_fill = _fill(
+            fill_id="provenance-fill-b",
+            order=second_order,
+            broker_fill_id="broker-fill-30002",
+        )
+        db.add_all([first_fill, second_fill])
+        db.commit()
+
+        first_document = _economics_document(
+            broker_order_id="30001",
+            broker_fill_id="broker-fill-30001",
+        )
+        applied = apply_execution_fill_economics_import(
+            db=db,
+            runtime_mode="live",
+            document=first_document,
+            actor="test-operator",
+            reason="bind exact external ledger row",
+        )
+        assert applied["summary"]["applied_record_count"] == 1
+
+        retargeted = _economics_document(
+            broker_order_id="30002",
+            broker_fill_id="broker-fill-30002",
+        )
+        retargeted_result = analyze_execution_fill_economics_import(
+            db=db,
+            runtime_mode="live",
+            document=retargeted,
+        )
+        assert retargeted_result["items"][0]["reason"] == (
+            "external_broker_provenance_conflict"
+        )
+        assert second_fill.transaction_cost is None
+
+        changed_amount = _economics_document(
+            broker_order_id="30001",
+            broker_fill_id="broker-fill-30001",
+        )
+        changed_records = changed_amount["records"]
+        assert isinstance(changed_records, list)
+        assert isinstance(changed_records[0], dict)
+        changed_records[0]["fee"] = "11.25"
+        changed_result = analyze_execution_fill_economics_import(
+            db=db,
+            runtime_mode="live",
+            document=changed_amount,
+        )
+        assert changed_result["items"][0]["reason"] == (
+            "external_broker_provenance_conflict"
+        )
+        assert len(db.scalars(select(RuntimeRemediationEvent)).all()) == 1
+    finally:
+        db.close()
+        engine.dispose()
+
+
+def test_economics_import_honors_legacy_full_record_audit_binding() -> None:
+    db, engine = _session()
+    try:
+        first_order = _order(
+            order_id="legacy-provenance-order-a",
+            broker_order_id="31001",
+            request_metadata={"execution_scope": _canonical_scope()},
+        )
+        second_order = _order(
+            order_id="legacy-provenance-order-b",
+            broker_order_id="31002",
+            request_metadata={"execution_scope": _canonical_scope()},
+        )
+        first_fill = _fill(
+            fill_id="legacy-provenance-fill-a",
+            order=first_order,
+            broker_fill_id="broker-fill-31001",
+        )
+        second_fill = _fill(
+            fill_id="legacy-provenance-fill-b",
+            order=second_order,
+            broker_fill_id="broker-fill-31002",
+        )
+        original_document = _economics_document(
+            broker_order_id="31001",
+            broker_fill_id="broker-fill-31001",
+        )
+        original_record = original_document["records"][0]
+        assert isinstance(original_record, dict)
+        first_fill.settlement_currency = "KRW"
+        first_fill.transaction_cost = Decimal("13")
+        first_fill.transaction_cost_coverage = "complete"
+        first_fill.transaction_cost_source = "broker_economics_import:fee+tax"
+        first_fill.payload = {
+            "broker_economics_import": {
+                "schema_version": EXECUTION_FILL_ECONOMICS_IMPORT_VERSION,
+                "source_reference": original_record["source_reference"],
+                "broker_record_id": original_record["broker_record_id"],
+                "scope": "per_fill",
+                "fee": "10.25",
+                "tax": "2.75",
+                "transaction_cost": "13.00",
+                "settlement_currency": "KRW",
+                "record_sha256": _record_candidate_key(original_record),
+            }
+        }
+        db.add_all([first_fill, second_fill])
+        db.flush()
+        db.add(
+            RuntimeRemediationEvent(
+                mode="live",
+                candidate_type="execution_fill_economics_import",
+                candidate_key=_record_candidate_key(original_record),
+                subject_id=first_fill.id,
+                outcome="exact_economics_attached",
+                actor="legacy-importer",
+                reason="legacy full-record binding",
+                occurred_at=datetime(2026, 10, 16, 1, tzinfo=UTC),
+                evidence_summary={
+                    "schema_version": EXECUTION_FILL_ECONOMICS_IMPORT_VERSION,
+                    **original_record,
+                    "transaction_cost": "13.00",
+                    "identity_match_count": 1,
+                    "aggregate_allocation_performed": False,
+                    "record_sha256": _record_candidate_key(original_record),
+                },
+            )
+        )
+        db.commit()
+
+        original_result = analyze_execution_fill_economics_import(
+            db=db,
+            runtime_mode="live",
+            document=original_document,
+        )
+        assert original_result["items"][0]["status"] == "already_applied"
+
+        retargeted = _economics_document(
+            broker_order_id="31002",
+            broker_fill_id="broker-fill-31002",
+        )
+        retargeted_result = analyze_execution_fill_economics_import(
+            db=db,
+            runtime_mode="live",
+            document=retargeted,
+        )
+
+        assert retargeted_result["items"][0]["reason"] == (
+            "external_broker_provenance_conflict"
+        )
+        assert second_fill.transaction_cost is None
+    finally:
+        db.close()
+        engine.dispose()
+
+
+def test_economics_import_rejects_duplicate_external_provenance_in_batch() -> None:
+    db, engine = _session()
+    try:
+        for suffix, broker_order_id in (("a", "40001"), ("b", "40002")):
+            order = _order(
+                order_id=f"batch-provenance-order-{suffix}",
+                broker_order_id=broker_order_id,
+                request_metadata={"execution_scope": _canonical_scope()},
+            )
+            db.add(
+                _fill(
+                    fill_id=f"batch-provenance-fill-{suffix}",
+                    order=order,
+                    broker_fill_id=f"broker-fill-{broker_order_id}",
+                )
+            )
+        db.commit()
+        first = _economics_document(
+            broker_order_id="40001",
+            broker_fill_id="broker-fill-40001",
+        )["records"][0]
+        second = _economics_document(
+            broker_order_id="40002",
+            broker_fill_id="broker-fill-40002",
+        )["records"][0]
+        document = {
+            "schema_version": EXECUTION_FILL_ECONOMICS_IMPORT_VERSION,
+            "records": [first, second],
+        }
+
+        result = analyze_execution_fill_economics_import(
+            db=db,
+            runtime_mode="live",
+            document=document,
+        )
+
+        assert result["summary"]["eligible_record_count"] == 0
+        assert {
+            item["reason"] for item in result["items"]
+        } == {"duplicate_input_external_provenance"}
     finally:
         db.close()
         engine.dispose()

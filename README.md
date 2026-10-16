@@ -804,9 +804,12 @@ New orders snapshot the Core decision lineage in `broker_orders.request_metadata
 at submission time, and reconciliation copies that snapshot into each fill payload.
 Weekly review and outcome feedback prefer this immutable snapshot over a plan item
 that may later be updated by replanning. The repair tooling does not synthesize or
-backfill historical decision snapshots; legacy coverage retains its existing
-plan-item evidence and remains distinguishable by the absence of the snapshot in
-the order/fill payload.
+backfill historical decision snapshots. A genuinely absent snapshot may still be
+shown as `legacy_degraded` diagnostic context, but it is not learning-eligible.
+Present-but-invalid, `partial`, or conflicting order/fill snapshots never fall
+back to mutable plan rows. Learning eligibility requires `status=complete`, the
+full plan/item/source/actor/snapshot/run/date identity, and matching decision and
+strategy run IDs.
 
 Inspect deterministic settlement-currency candidates without modifying data:
 
@@ -842,7 +845,10 @@ and `settlement_currency=KRW` are accepted, and the combined broker order/fill
 identity must resolve to exactly one local fill with verified KRX scope. Aggregate,
 duplicate, missing, ambiguous, or conflicting evidence is rejected. `--apply`
 requires `--actor` and `--reason`, is idempotent, records provenance, and never
-calls a broker or allocates an order-level total across fills.
+calls a broker or allocates an order-level total across fills. The canonical
+`broker_name` + `source_reference` + `broker_record_id` provenance is durably
+bound to one fill and one normalized fee/tax/currency tuple: an exact replay is
+idempotent, while retargeting or changing the economics is a conflict.
 
 Inspect broker-flat symbols with residual local FIFO inventory in dry-run mode first:
 
