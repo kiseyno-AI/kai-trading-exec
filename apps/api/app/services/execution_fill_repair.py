@@ -4,6 +4,7 @@ from collections import defaultdict
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload, undefer
@@ -35,6 +36,7 @@ from app.services.fill_idempotency import (
     execution_fill_dedupe_key,
     execution_fill_idempotency_key,
 )
+from app.services.execution_lineage import payload_with_order_decision_lineage
 from app.services.fill_economics import (
     COST_COVERAGE_UNKNOWN,
     FillEconomics,
@@ -54,6 +56,115 @@ FIFO_INVENTORY_ISOLATION_SOURCE = "broker_flat_reconciliation"
 MISSING_FILL_CANDIDATE_TYPE = "missing_execution_fill"
 DUPLICATE_FILL_CANDIDATE_TYPE = "duplicate_fill_group"
 FIFO_RESIDUAL_CANDIDATE_TYPE = "fifo_inventory_residual"
+FILL_METADATA_CANDIDATE_TYPE = "execution_fill_metadata"
+_KIS_DOMESTIC_EXCHANGES = frozenset({"KRX", "NXT", "SOR"})
+_KIS_TIMEZONE = ZoneInfo("Asia/Seoul")
+
+
+def analyze_execution_fill_metadata_repairs(
+    *,
+    db: Session,
+    runtime_mode: str,
+) -> dict[str, object]:
+    """Report settlement-currency repairs backed by persisted broker evidence."""
+
+    items = _execution_fill_metadata_items(db=db, runtime_mode=runtime_mode)
+    return _execution_fill_metadata_payload(
+        mode="dry-run",
+        runtime_mode=runtime_mode,
+        items=items,
+        applied_count=0,
+        audit_event_count=0,
+    )
+
+
+def apply_execution_fill_metadata_repairs(
+    *,
+    db: Session,
+    runtime_mode: str,
+    actor: str,
+    reason: str,
+    now: datetime | None = None,
+) -> dict[str, object]:
+    """Attach only deterministic KRW evidence; never alter transaction costs."""
+
+    repaired_at = now or datetime.now(UTC)
+    items = _execution_fill_metadata_items(db=db, runtime_mode=runtime_mode)
+    applied_count = 0
+    audit_event_count = 0
+    for item in items:
+        if item["eligible"] is not True:
+            continue
+        fill = db.scalar(
+            select(ExecutionFill)
+            .where(ExecutionFill.id == str(item["execution_fill_id"]))
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if fill is None or fill.settlement_currency is not None:
+            continue
+        order = db.get(BrokerOrder, fill.broker_order_pk)
+        if order is None:
+            continue
+        current_evidence = _verified_kis_krw_evidence(order)
+        if current_evidence != item.get("evidence"):
+            continue
+        before_cost = _decimal_evidence_text(fill.transaction_cost)
+        before_coverage = fill.transaction_cost_coverage
+        before_source = fill.transaction_cost_source
+        payload = dict(fill.payload) if isinstance(fill.payload, dict) else {}
+        payload["settlement_currency_evidence"] = {
+            **current_evidence,
+            "actor": actor,
+            "reason": reason,
+            "repaired_at": repaired_at.isoformat(),
+        }
+        fill.settlement_currency = "KRW"
+        fill.payload = payload
+        db.add(fill)
+        if _record_remediation_event(
+            db=db,
+            runtime_mode=runtime_mode,
+            candidate_type=FILL_METADATA_CANDIDATE_TYPE,
+            candidate_key=fill.id,
+            subject_id=fill.id,
+            outcome="deterministic_enrichment",
+            actor=actor,
+            reason=reason,
+            occurred_at=repaired_at,
+            evidence_summary={
+                "broker_order_pk": order.id,
+                "broker_order_id": order.broker_order_id,
+                "broker_fill_id": fill.broker_fill_id,
+                "symbol": fill.symbol,
+                "settlement_currency_before": None,
+                "settlement_currency_after": "KRW",
+                "evidence": current_evidence,
+                "transaction_cost_before": before_cost,
+                "transaction_cost_after": _decimal_evidence_text(
+                    fill.transaction_cost
+                ),
+                "transaction_cost_coverage_before": before_coverage,
+                "transaction_cost_coverage_after": fill.transaction_cost_coverage,
+                "transaction_cost_source_before": before_source,
+                "transaction_cost_source_after": fill.transaction_cost_source,
+                "transaction_costs_changed": False,
+                "fills_deleted": 0,
+                "fills_fabricated": 0,
+                "orders_submitted": 0,
+            },
+        ):
+            audit_event_count += 1
+        applied_count += 1
+    db.commit()
+    refreshed = _execution_fill_metadata_items(db=db, runtime_mode=runtime_mode)
+    return _execution_fill_metadata_payload(
+        mode="apply",
+        runtime_mode=runtime_mode,
+        items=refreshed,
+        applied_count=applied_count,
+        audit_event_count=audit_event_count,
+    )
 
 
 def analyze_fifo_inventory_repairs(
@@ -825,18 +936,21 @@ def apply_execution_fill_repairs(
                 transaction_cost_coverage=economics.transaction_cost_coverage,
                 transaction_cost_source=economics.transaction_cost_source,
                 filled_at=filled_at,
-                payload={
-                    "source": "operator_fill_evidence_repair",
-                    "actor": actor,
-                    "reason": reason,
-                    "fill_time_precision": "exact",
-                    "fill_time_source": "broker_payload",
-                    "settlement_currency_conflict": (
-                        economics.settlement_currency_conflict
-                    ),
-                    "repair_evidence": item.get("available_repair_evidence"),
-                    "proposed_fill": _json_safe_value(proposed),
-                },
+                payload=payload_with_order_decision_lineage(
+                    {
+                        "source": "operator_fill_evidence_repair",
+                        "actor": actor,
+                        "reason": reason,
+                        "fill_time_precision": "exact",
+                        "fill_time_source": "broker_payload",
+                        "settlement_currency_conflict": (
+                            economics.settlement_currency_conflict
+                        ),
+                        "repair_evidence": item.get("available_repair_evidence"),
+                        "proposed_fill": _json_safe_value(proposed),
+                    },
+                    order=order,
+                ),
             )
             db.add(fill)
             existing_keys.add(signature)
@@ -1041,6 +1155,194 @@ def _missing_fill_items(*, db: Session, runtime_mode: str) -> list[dict[str, obj
         for order in rows
         if (issue := _terminal_fill_evidence_issue(order)) is not None
     ]
+
+
+def _execution_fill_metadata_items(
+    *,
+    db: Session,
+    runtime_mode: str,
+) -> list[dict[str, object]]:
+    orders = db.scalars(
+        select(BrokerOrder)
+        .where(
+            BrokerOrder.mode == runtime_mode,
+            BrokerOrder.broker_name == "kis",
+        )
+        .options(
+            undefer(BrokerOrder.request_metadata),
+            selectinload(BrokerOrder.fills).undefer(ExecutionFill.payload),
+            selectinload(BrokerOrder.events).undefer(
+                BrokerOrderEvent.response_payload
+            ),
+        )
+        .order_by(BrokerOrder.created_at.asc(), BrokerOrder.id.asc())
+    ).all()
+    items: list[dict[str, object]] = []
+    for order in orders:
+        missing_currency_fills = [
+            fill
+            for fill in order.fills
+            if _optional_str(fill.settlement_currency) is None
+        ]
+        if not missing_currency_fills:
+            continue
+        evidence = _verified_kis_krw_evidence(order)
+        reason = (
+            None
+            if evidence is not None
+            else "verified_domestic_broker_market_scope_unavailable"
+        )
+        for fill in sorted(
+            missing_currency_fills,
+            key=lambda candidate: (
+                _parse_timestamp(
+                    candidate.filled_at,
+                    fallback=datetime.min.replace(tzinfo=UTC),
+                ),
+                str(candidate.id or ""),
+            ),
+        ):
+            items.append(
+                {
+                    "execution_fill_id": fill.id,
+                    "broker_order_pk": order.id,
+                    "broker_order_id": order.broker_order_id,
+                    "broker_fill_id": fill.broker_fill_id,
+                    "symbol": fill.symbol,
+                    "side": fill.side,
+                    "filled_at": _serialize_datetime(fill.filled_at),
+                    "settlement_currency": fill.settlement_currency,
+                    "transaction_cost": _decimal_evidence_text(
+                        fill.transaction_cost
+                    ),
+                    "transaction_cost_coverage": fill.transaction_cost_coverage,
+                    "eligible": evidence is not None,
+                    "reason": reason,
+                    "proposed_settlement_currency": (
+                        "KRW" if evidence is not None else None
+                    ),
+                    "evidence": evidence,
+                    "cost_repair_proposed": False,
+                }
+            )
+    return items
+
+
+def _verified_kis_krw_evidence(order: BrokerOrder) -> dict[str, object] | None:
+    """Return exact domestic scope evidence without inferring from ticker shape."""
+
+    if str(order.broker_name or "").strip().lower() != "kis":
+        return None
+    metadata = order.request_metadata if isinstance(order.request_metadata, dict) else {}
+    if isinstance(metadata.get("execution_scope"), dict):
+        route_scope = fifo_route_scope_from_order(order)
+        if (
+            route_scope is not None
+            and route_scope.provider == "kis"
+            and route_scope.exchange in _KIS_DOMESTIC_EXCHANGES
+        ):
+            return {
+                "source": "canonical_execution_scope",
+                "exchange": route_scope.exchange,
+                "venue": route_scope.venue,
+                "settlement_currency": "KRW",
+            }
+
+    broker_order_id = _optional_str(order.broker_order_id)
+    expected_symbol = str(order.symbol or "").strip().upper()
+    submitted_date = (
+        _normalize_aware_utc(order.submitted_at).astimezone(_KIS_TIMEZONE).strftime(
+            "%Y%m%d"
+        )
+        if order.submitted_at is not None
+        else None
+    )
+    if broker_order_id is None or not expected_symbol or submitted_date is None:
+        return None
+
+    matches: list[tuple[str, str]] = []
+    for event in order.events:
+        if str(event.event_source or "").strip().lower() != "reconciliation":
+            continue
+        response = event.response_payload
+        if not isinstance(response, dict):
+            continue
+        row = response.get("order")
+        if not isinstance(row, dict):
+            continue
+        row_order_id = _optional_str(
+            _case_insensitive_payload_value(row, "odno", "ord_no")
+        )
+        row_symbol = _optional_str(_case_insensitive_payload_value(row, "pdno"))
+        row_date = _optional_str(_case_insensitive_payload_value(row, "ord_dt"))
+        exchange = _optional_str(
+            _case_insensitive_payload_value(row, "excg_id_dvsn_cd")
+        )
+        normalized_exchange = str(exchange or "").strip().upper()
+        if (
+            row_order_id == broker_order_id
+            and str(row_symbol or "").strip().upper() == expected_symbol
+            and row_date == submitted_date
+            and normalized_exchange in _KIS_DOMESTIC_EXCHANGES
+        ):
+            matches.append((event.id, normalized_exchange))
+    exchanges = {exchange for _, exchange in matches}
+    if len(exchanges) != 1:
+        return None
+    exchange = next(iter(exchanges))
+    return {
+        "source": "broker_reconciliation_order_identity",
+        "exchange": exchange,
+        "venue": _optional_str(order.venue),
+        "settlement_currency": "KRW",
+        "broker_order_event_ids": sorted(event_id for event_id, _ in matches),
+        "identity_fields": ["broker_order_id", "symbol", "submitted_date", "exchange"],
+    }
+
+
+def _execution_fill_metadata_payload(
+    *,
+    mode: str,
+    runtime_mode: str,
+    items: list[dict[str, object]],
+    applied_count: int,
+    audit_event_count: int,
+) -> dict[str, object]:
+    eligible_count = sum(1 for item in items if item["eligible"] is True)
+    return {
+        "mode": mode,
+        "runtime_mode": runtime_mode,
+        "summary": {
+            "missing_settlement_currency_fill_count": len(items),
+            "deterministic_krw_candidate_count": eligible_count,
+            "unresolved_settlement_currency_fill_count": len(items) - eligible_count,
+            "applied_settlement_currency_count": applied_count,
+            "transaction_cost_repair_count": 0,
+            "audit_event_count": audit_event_count,
+        },
+        "items": items,
+    }
+
+
+def _case_insensitive_payload_value(
+    payload: dict[str, object],
+    *expected_keys: str,
+) -> object | None:
+    expected = {key.casefold() for key in expected_keys}
+    values = [
+        value
+        for key, value in payload.items()
+        if str(key).casefold() in expected
+    ]
+    if not values or any(value != values[0] for value in values[1:]):
+        return None
+    return values[0]
+
+
+def _normalize_aware_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
 
 
 def _missing_fill_item(

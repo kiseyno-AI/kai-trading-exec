@@ -962,6 +962,28 @@ or inconsistent, a durable quote failure latches the position again.
 
 ### FIFO residual isolation repair
 
+Settlement-currency remediation is a separate dry-run-first scope:
+
+```bash
+python3 scripts/repair_execution_fill_evidence.py \
+  --runtime-mode live \
+  --scope fill-metadata
+```
+
+It proposes `KRW` only from canonical KIS KRX/NXT/SOR scope or from a persisted
+reconciliation row with exact broker order ID, symbol, submission date, and
+exchange identity. Apply requires actor/reason audit metadata and never edits fee,
+tax, or transaction-cost fields. The KIS daily order readback currently provides
+no exact per-fill fee/tax fields, so costs remain unknown.
+
+Exact external broker economics use
+`scripts/import_execution_fill_economics.py`. Its
+`execution-fill-economics-import-v1` contract accepts only explicit per-fill KIS
+records keyed by both broker order ID and broker fill ID, with separate nonnegative
+`fee` and `tax` values and verified `KRW` KRX scope. Dry-run is the default.
+Aggregate or ambiguous records and conflicts with persisted economics are rejected;
+apply is idempotent, audited, and has no broker-call or allocation path.
+
 Operators can inspect local FIFO residuals contradicted by a broker-reconciled
 flat position without mutating state:
 

@@ -55,6 +55,7 @@ from app.services.account_drawdown_gate import (
     latest_account_drawdown_gate_state,
 )
 from app.services.execution_account_route import redact_account_references
+from app.services.execution_lineage import decision_lineage_for_order
 from app.services.broker_raw_holdings import (
     BrokerRawHolding,
     broker_raw_balance_is_fresh,
@@ -1195,6 +1196,7 @@ def _closed_trade(
     )
     hold_minutes = int((_normalize_utc(sell_fill.filled_at) - lot.filled_at).total_seconds() // 60)
     source_item = buy_item or sell_item
+    source_lineage = decision_lineage_for_order(buy_order or sell_order)
     return {
         "symbol": sell_fill.symbol,
         "execution_scope": route_scope.as_payload(),
@@ -1228,9 +1230,21 @@ def _closed_trade(
         "gross_return_pct": _decimal_text(gross_return_pct),
         "hold_minutes": hold_minutes,
         "hold_hours": _decimal_text(Decimal(hold_minutes) / Decimal("60")),
-        "source_execution_plan_item_id": source_item.id if source_item is not None else None,
-        "decision_run_id": source_item.decision_run_id if source_item is not None else None,
-        "decision_agent_name": source_item.decision_agent_name if source_item is not None else None,
+        "source_execution_plan_item_id": (
+            source_lineage.get("execution_plan_item_id")
+            if source_lineage is not None
+            else (source_item.id if source_item is not None else None)
+        ),
+        "decision_run_id": (
+            source_lineage.get("decision_run_id")
+            if source_lineage is not None
+            else (source_item.decision_run_id if source_item is not None else None)
+        ),
+        "decision_agent_name": (
+            source_lineage.get("decision_agent_name")
+            if source_lineage is not None
+            else (source_item.decision_agent_name if source_item is not None else None)
+        ),
         "exec_agent_decision": _exec_agent_decision(source_item),
         "risk_sizing": _risk_sizing_context(source_item),
         "trigger_time": _trigger_time_context(source_item),
@@ -1262,6 +1276,7 @@ def _legacy_sell_estimate_trade(
     sell_item = sell_order.plan_item if sell_order is not None else None
     sell_price = Decimal(sell_fill.price)
     source_item = sell_item
+    source_lineage = decision_lineage_for_order(sell_order)
     if cost_basis is None or not scope_quality_available:
         pnl = None
         return_pct = None
@@ -1347,9 +1362,21 @@ def _legacy_sell_estimate_trade(
         "gross_return_pct": _decimal_text(return_pct),
         "hold_minutes": None,
         "hold_hours": None,
-        "source_execution_plan_item_id": source_item.id if source_item is not None else None,
-        "decision_run_id": source_item.decision_run_id if source_item is not None else None,
-        "decision_agent_name": source_item.decision_agent_name if source_item is not None else None,
+        "source_execution_plan_item_id": (
+            source_lineage.get("execution_plan_item_id")
+            if source_lineage is not None
+            else (source_item.id if source_item is not None else None)
+        ),
+        "decision_run_id": (
+            source_lineage.get("decision_run_id")
+            if source_lineage is not None
+            else (source_item.decision_run_id if source_item is not None else None)
+        ),
+        "decision_agent_name": (
+            source_lineage.get("decision_agent_name")
+            if source_lineage is not None
+            else (source_item.decision_agent_name if source_item is not None else None)
+        ),
         "exec_agent_decision": _exec_agent_decision(source_item),
         "risk_sizing": _risk_sizing_context(source_item),
         "trigger_time": _trigger_time_context(source_item),
@@ -1368,15 +1395,24 @@ def _fill_payload(
     item: ExecutionPlanItem | None,
     quantity: Decimal,
 ) -> dict[str, object]:
+    lineage = decision_lineage_for_order(order)
     return {
         "filled_at": _normalize_utc(fill.filled_at).isoformat(),
         "quantity": _quantity_value(quantity),
         "price": _decimal_text(Decimal(fill.price)),
         "broker_fill_id": fill.broker_fill_id,
         "broker_order_id": order.broker_order_id if order is not None else None,
-        "execution_plan_item_id": item.id if item is not None else None,
+        "execution_plan_item_id": (
+            lineage.get("execution_plan_item_id")
+            if lineage is not None
+            else (item.id if item is not None else None)
+        ),
         "intent": item.intent if item is not None else None,
-        "source_plan_item_id": item.source_plan_item_id if item is not None else None,
+        "source_plan_item_id": (
+            lineage.get("source_plan_item_id")
+            if lineage is not None
+            else (item.source_plan_item_id if item is not None else None)
+        ),
     }
 
 

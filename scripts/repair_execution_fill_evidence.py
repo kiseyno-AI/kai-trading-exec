@@ -20,8 +20,10 @@ from app.services.database_cli_security import (  # noqa: E402
 from app.services.execution_fill_repair import (  # noqa: E402
     analyze_fifo_inventory_repairs,
     analyze_execution_fill_repairs,
+    analyze_execution_fill_metadata_repairs,
     apply_fifo_inventory_repairs,
     apply_execution_fill_repairs,
+    apply_execution_fill_metadata_repairs,
 )
 
 
@@ -50,11 +52,13 @@ def main() -> int:
     )
     parser.add_argument(
         "--scope",
-        choices=("fill-evidence", "fifo-residuals"),
+        choices=("fill-evidence", "fill-metadata", "fifo-residuals"),
         default="fill-evidence",
         help=(
             "Repair scope. fifo-residuals reports or isolates local FIFO inventory "
-            "only when newer broker reconciliation proves the symbol flat."
+            "only when newer broker reconciliation proves the symbol flat. "
+            "fill-metadata attaches deterministic settlement currency from persisted "
+            "canonical or broker reconciliation scope and never changes costs."
         ),
     )
     parser.add_argument(
@@ -105,6 +109,18 @@ def main() -> int:
                 )
             elif args.scope == "fifo-residuals":
                 payload = analyze_fifo_inventory_repairs(
+                    db=db,
+                    runtime_mode=settings.runtime_mode,
+                )
+            elif args.scope == "fill-metadata" and args.apply:
+                payload = apply_execution_fill_metadata_repairs(
+                    db=db,
+                    runtime_mode=settings.runtime_mode,
+                    actor=actor,
+                    reason=reason,
+                )
+            elif args.scope == "fill-metadata":
+                payload = analyze_execution_fill_metadata_repairs(
                     db=db,
                     runtime_mode=settings.runtime_mode,
                 )

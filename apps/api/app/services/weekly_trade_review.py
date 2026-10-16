@@ -41,6 +41,10 @@ from app.services.artifact_integrity import (
 )
 from app.services.database_cli_security import reject_secret_database_url_argument
 from app.services.execution_account_route import redact_account_references
+from app.services.execution_lineage import (
+    decision_lineage_for_order,
+    decision_lineage_from_metadata,
+)
 from app.services.fifo_inventory import (
     FifoRouteScope,
     ambiguous_fifo_chronology_buckets,
@@ -468,6 +472,7 @@ def _weekly_fills(
         BrokerOrder.submitted_at.label("broker_order_submitted_at"),
         BrokerOrder.idempotency_key,
         BrokerOrder.execution_plan_item_id,
+        BrokerOrder.request_metadata.label("_broker_order_request_metadata"),
         ExecutionPlanItem.intent.label("execution_plan_item_intent"),
         ExecutionPlanItem.decision_agent_name,
         ExecutionPlanItem.decision_snapshot_id,
@@ -498,7 +503,22 @@ def _weekly_fills(
         .order_by(ExecutionFill.filled_at.asc(), ExecutionFill.id.asc())
         .limit(max_rows + 1)
     ).all()
-    return _bounded_rows(rows, max_rows)
+    bounded, truncated = _bounded_rows(rows, max_rows)
+    for row in bounded:
+        lineage = decision_lineage_from_metadata(
+            row.pop("_broker_order_request_metadata", None),
+            execution_plan_item_id=row.get("execution_plan_item_id"),
+        )
+        if lineage is None:
+            continue
+        row["decision_agent_name"] = lineage.get("decision_agent_name")
+        row["decision_snapshot_id"] = lineage.get("decision_snapshot_id")
+        row["decision_run_id"] = lineage.get("decision_run_id")
+        row["source_market_date"] = lineage.get("source_market_date")
+        row["target_market_date"] = lineage.get("target_market_date")
+        row["execution_plan_source"] = lineage.get("plan_source")
+        row["strategy_run_id"] = lineage.get("strategy_run_id")
+    return bounded, truncated
 
 
 def _weekly_fill_attribution_coverage(
@@ -1738,6 +1758,11 @@ def _closed_trade_row(
     )
     sell_item = fill.broker_order.plan_item if fill.broker_order is not None else None
     source_item = buy_item or sell_item
+    source_lineage = decision_lineage_for_order(
+        buy_fill.broker_order
+        if buy_fill is not None and buy_fill.broker_order is not None
+        else fill.broker_order
+    )
     pnl = ((sell_price - buy_price) * quantity).quantize(Decimal("0.0001")) if buy_price is not None else None
     economics = (
         closed_trade_economics(
@@ -1780,16 +1805,28 @@ def _closed_trade_row(
             economics.transaction_cost_coverage if economics is not None else "unknown"
         ),
         "source_execution_plan_item_id": (
-            source_item.id if source_item is not None else None
+            source_lineage.get("execution_plan_item_id")
+            if source_lineage is not None
+            else (source_item.id if source_item is not None else None)
         ),
         "decision_snapshot_id": (
-            source_item.decision_snapshot_id if source_item is not None else None
+            source_lineage.get("decision_snapshot_id")
+            if source_lineage is not None
+            else (
+                source_item.decision_snapshot_id if source_item is not None else None
+            )
         ),
         "decision_run_id": (
-            source_item.decision_run_id if source_item is not None else None
+            source_lineage.get("decision_run_id")
+            if source_lineage is not None
+            else (source_item.decision_run_id if source_item is not None else None)
         ),
         "decision_agent_name": (
-            source_item.decision_agent_name if source_item is not None else None
+            source_lineage.get("decision_agent_name")
+            if source_lineage is not None
+            else (
+                source_item.decision_agent_name if source_item is not None else None
+            )
         ),
     }
 

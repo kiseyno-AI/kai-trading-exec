@@ -1897,18 +1897,27 @@ class KisBrokerAdapter(BrokerAdapter):
         submitted_at: datetime | None = None,
         expected_symbol: str | None = None,
     ) -> dict[str, Any] | None:
+        normalized_exchange = exchange.strip().upper()
         normalized_submitted_at = (
             _normalize_utc_datetime(submitted_at)
             if submitted_at is not None
             else None
         )
-        if exchange in {"NASD", "NYSE", "AMEX"}:
+        if normalized_exchange in {"NASD", "NYSE", "AMEX"}:
             return self._reconcile_us_equity_order(
                 access_token,
                 broker_order_id,
-                exchange=exchange,
+                exchange=normalized_exchange,
                 submitted_at=normalized_submitted_at,
                 expected_symbol=expected_symbol,
+            )
+        if normalized_exchange not in KIS_DOMESTIC_EXCHANGES:
+            raise BrokerAdapterError(
+                f"unsupported exchange for KIS order reconciliation: {exchange}",
+                status_code=422,
+                classification=BrokerErrorClassification.VALIDATION,
+                retryable=False,
+                code="kis_reconcile_exchange_unsupported",
             )
         config = self._configured()
         observed_at = datetime.now(UTC)
@@ -1923,7 +1932,7 @@ class KisBrokerAdapter(BrokerAdapter):
             self.settings,
             broker_order_id,
             observed_at,
-            exchange=exchange,
+            exchange=normalized_exchange,
             submitted_at=normalized_submitted_at,
             expected_symbol=expected_symbol,
         )
@@ -1959,7 +1968,7 @@ class KisBrokerAdapter(BrokerAdapter):
                 if normalized_submitted_at is not None
                 else observed_at.astimezone(KIS_TIMEZONE).date()
             ),
-            expected_exchange=exchange,
+            expected_exchange=normalized_exchange,
         )
         if normalized_order is None:
             return {
@@ -1993,6 +2002,18 @@ class KisBrokerAdapter(BrokerAdapter):
             "fill_time_precision": normalized_order["fill_time_precision"],
             "fill_time_source": normalized_order["fill_time_source"],
             "observed_at": normalized_order["observed_at"].isoformat(),
+            # The domestic endpoint and exchange code deterministically bind
+            # settlement to KRW. Its documented order row does not expose an
+            # exact per-fill fee/tax breakdown, so costs remain unknown.
+            "economics": {
+                "settlement_currency": "KRW",
+                "transaction_cost": None,
+                "transaction_cost_coverage": "unknown",
+                "transaction_cost_source": (
+                    "kis:inquire-daily-ccld:fee_tax_not_provided"
+                ),
+                "transaction_cost_scope": "cumulative",
+            },
             "request_metadata": request_metadata,
             "response_metadata": {
                 "status_code": response.status_code,

@@ -56,6 +56,7 @@ from app.services.execution_failures import (
     record_actionable_execution_failure,
     resolve_execution_failure_for_order,
 )
+from app.services.execution_lineage import payload_with_order_decision_lineage
 from app.services.fill_economics import (
     COST_COVERAGE_COMPLETE,
     COST_COVERAGE_UNKNOWN,
@@ -5000,6 +5001,12 @@ def _upsert_order_fills(
         existing_fill = existing_fills_by_key.get(fill_signature)
         if existing_fill is not None:
             _enrich_existing_fill_economics(existing=existing_fill, incoming=fill)
+            enriched_payload = payload_with_order_decision_lineage(
+                existing_fill.payload if isinstance(existing_fill.payload, dict) else {},
+                order=order,
+            )
+            if enriched_payload != existing_fill.payload:
+                existing_fill.payload = _copy_payload(enriched_payload)
             continue
 
         new_fill = ExecutionFill(
@@ -5022,7 +5029,12 @@ def _upsert_order_fills(
                 fill["filled_at"],
                 fallback=_observation_time(),
             ),
-            payload=_copy_payload(fill),
+            payload=_copy_payload(
+                payload_with_order_decision_lineage(
+                    _copy_payload(fill),
+                    order=order,
+                )
+            ),
         )
         db.add(new_fill)
         added += 1

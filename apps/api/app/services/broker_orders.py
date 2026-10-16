@@ -75,6 +75,11 @@ from app.services.broker_auth import ensure_authenticated_broker_session
 from app.services.broker_order_state import CAPITAL_RESERVING_ORDER_STATUSES
 from app.services.domestic_order_router import RouteDecision, resolve_domestic_order_route
 from app.services.execution_failures import record_actionable_execution_failure
+from app.services.execution_lineage import (
+    decision_lineage_for_order,
+    decision_lineage_for_plan_item,
+    payload_with_order_decision_lineage,
+)
 from app.services.exec_agent_approval import (
     SHORT_TERM_LIVE_MIN_NET_REWARD_RISK,
     SHORT_TERM_LIVE_MIN_TURNOVER_KRW,
@@ -1919,6 +1924,7 @@ def _place_broker_order_serialized(
         plan_item.risk_context if plan_item is not None else None,
         plan_item.quantity_policy if plan_item is not None else None,
     )
+    decision_lineage = decision_lineage_for_plan_item(plan_item)
     request_metadata = {
         "source": request_source,
         "trusted_order_origin": _trusted_order_origin(request_source),
@@ -1932,6 +1938,11 @@ def _place_broker_order_serialized(
         **(
             {"plan_item_status_before_submission": plan_item.status}
             if plan_item is not None
+            else {}
+        ),
+        **(
+            {"decision_lineage": decision_lineage}
+            if decision_lineage is not None
             else {}
         ),
         **(
@@ -1976,6 +1987,10 @@ def _place_broker_order_serialized(
             if retrying_proven_pre_submit_failure
             else retryable_safety_fenced_order
         ),
+    )
+    request_metadata = _preserve_decision_lineage(
+        request_metadata=request_metadata,
+        existing_order=retryable_safety_fenced_order,
     )
     request_metadata = _redacted_payload(request_metadata) or {}
     pre_submit_failure = prepared_broker_session_exception is not None
@@ -3160,21 +3175,24 @@ def _place_broker_order_serialized(
                 if isinstance(sanitized_request_metadata, dict)
                 else {}
             )
-            order.request_metadata = _redacted_payload(
-                _merge_order_request_metadata(
-                    base={**pre_error_request_metadata, **error_request_metadata},
-                    command=routed_command,
-                    request_source=request_source,
-                    route_decision=route_decision,
-                    canonical_execution_scope=(
-                        pre_error_request_metadata.get("execution_scope")
-                        if isinstance(
-                            pre_error_request_metadata.get("execution_scope"), dict
-                        )
-                        else None
-                    ),
-                )
-            ) or {}
+            merged_error_metadata = _merge_order_request_metadata(
+                base={**pre_error_request_metadata, **error_request_metadata},
+                command=routed_command,
+                request_source=request_source,
+                route_decision=route_decision,
+                canonical_execution_scope=(
+                    pre_error_request_metadata.get("execution_scope")
+                    if isinstance(
+                        pre_error_request_metadata.get("execution_scope"), dict
+                    )
+                    else None
+                ),
+            )
+            merged_error_metadata = _preserve_decision_lineage(
+                request_metadata=merged_error_metadata,
+                existing_order=order,
+            )
+            order.request_metadata = _redacted_payload(merged_error_metadata) or {}
         order.response_metadata = _redacted_error_payload(exc.response_metadata) or None
         order.last_error_classification = classification
         order.last_error_code = error_code
@@ -3374,6 +3392,10 @@ def _place_broker_order_serialized(
             if isinstance(pre_ack_request_metadata.get("execution_scope"), dict)
             else None
         ),
+    )
+    order_request_metadata = _preserve_decision_lineage(
+        request_metadata=order_request_metadata,
+        existing_order=order,
     )
     stable_account_scope = pre_ack_request_metadata.get("broker_account_scope")
     if isinstance(stable_account_scope, dict):
@@ -8472,6 +8494,7 @@ def _persist_account_gate_block(
             # just locked. Otherwise a monitoring caller can commit its stale
             # pre-snapshot status after this function returns.
             db.refresh(plan_item, attribute_names=["status", "risk_context"])
+    decision_lineage = decision_lineage_for_plan_item(plan_item)
     request_metadata = {
         "source": request_source,
         "requested_at": observed_at.isoformat(),
@@ -8499,6 +8522,11 @@ def _persist_account_gate_block(
         "sizing": _sizing_payload(command),
         "account_drawdown_gate": sanitized_decision_summary,
         **(
+            {"decision_lineage": decision_lineage}
+            if decision_lineage is not None
+            else {}
+        ),
+        **(
             {"metadata": redact_account_references(command.metadata)}
             if command.metadata is not None
             else {}
@@ -8524,6 +8552,10 @@ def _persist_account_gate_block(
         )
     else:
         order = existing_order
+        request_metadata = _preserve_decision_lineage(
+            request_metadata=request_metadata,
+            existing_order=existing_order,
+        )
     apply_broker_order_status(
         order=order,
         status=NormalizedBrokerOrderStatus.REJECTED.value,
@@ -8784,6 +8816,20 @@ def _preserve_canonical_execution_scope(
     return metadata
 
 
+def _preserve_decision_lineage(
+    *,
+    request_metadata: dict[str, object],
+    existing_order: BrokerOrder | None,
+) -> dict[str, object]:
+    """Keep the original decision snapshot stable across safe order retries."""
+
+    metadata = dict(request_metadata)
+    existing_lineage = decision_lineage_for_order(existing_order)
+    if existing_lineage is not None:
+        metadata["decision_lineage"] = existing_lineage
+    return metadata
+
+
 def _merge_order_request_metadata(
     *,
     base: dict[str, object] | None,
@@ -8949,16 +8995,21 @@ def _record_upbit_paper_simulated_fill(
         transaction_cost_coverage=COST_COVERAGE_UNKNOWN,
         transaction_cost_source="paper_simulator:no_transaction_cost_model",
         filled_at=observed_at,
-        payload={
-            "provider": "upbit",
-            "mode": "paper",
-            "simulated": True,
-            "asset_class": "crypto",
-            "venue": "upbit",
-            "base_quantity": str(base_quantity),
-            "quote_notional": str(quote_notional) if quote_notional is not None else None,
-            "price": str(fill_price),
-        },
+        payload=payload_with_order_decision_lineage(
+            {
+                "provider": "upbit",
+                "mode": "paper",
+                "simulated": True,
+                "asset_class": "crypto",
+                "venue": "upbit",
+                "base_quantity": str(base_quantity),
+                "quote_notional": (
+                    str(quote_notional) if quote_notional is not None else None
+                ),
+                "price": str(fill_price),
+            },
+            order=order,
+        ),
     )
     db.add(fill)
     db.add(

@@ -800,6 +800,50 @@ The `weekly-trade-review-v2` JSON contract is checksummed with canonical SHA-256
 
 ### Fill evidence repair
 
+New orders snapshot the Core decision lineage in `broker_orders.request_metadata`
+at submission time, and reconciliation copies that snapshot into each fill payload.
+Weekly review and outcome feedback prefer this immutable snapshot over a plan item
+that may later be updated by replanning. The repair tooling does not synthesize or
+backfill historical decision snapshots; legacy coverage retains its existing
+plan-item evidence and remains distinguishable by the absence of the snapshot in
+the order/fill payload.
+
+Inspect deterministic settlement-currency candidates without modifying data:
+
+```bash
+python3.12 scripts/repair_execution_fill_evidence.py \
+  --runtime-mode live \
+  --scope fill-metadata
+```
+
+`fill-metadata` proposes KRW only from a valid canonical KIS KRX/NXT/SOR execution
+scope or a persisted reconciliation row whose broker order ID, symbol, submission
+date, and exchange all match. Apply additionally requires `--actor` and `--reason`
+and writes a remediation audit event. It never changes transaction costs. Rows
+without exact market-scope evidence remain unresolved.
+
+The KIS `inquire-daily-ccld` order readback does not provide an exact per-fill
+fee/tax breakdown. Its estimated-expense aggregate is not ingested or allocated,
+and the separate period-profit fee/tax totals are likewise too aggregated to map
+to a fill. Those costs therefore remain `unknown`, never zero or estimated.
+
+An operator can validate a separately obtained exact broker ledger in dry-run mode:
+
+```bash
+python3.12 scripts/import_execution_fill_economics.py exact-fill-economics.json \
+  --runtime-mode live
+```
+
+The versioned `execution-fill-economics-import-v1` document contains `records`.
+Each record must have exactly `source_reference`, `broker_record_id`, `broker_name`,
+`broker_order_id`, `broker_fill_id`, `symbol`, `side`, `scope`,
+`settlement_currency`, `fee`, and `tax`. Only `broker_name=kis`, `scope=per_fill`,
+and `settlement_currency=KRW` are accepted, and the combined broker order/fill
+identity must resolve to exactly one local fill with verified KRX scope. Aggregate,
+duplicate, missing, ambiguous, or conflicting evidence is rejected. `--apply`
+requires `--actor` and `--reason`, is idempotent, records provenance, and never
+calls a broker or allocates an order-level total across fills.
+
 Inspect broker-flat symbols with residual local FIFO inventory in dry-run mode first:
 
 ```bash

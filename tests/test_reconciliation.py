@@ -7122,6 +7122,9 @@ def test_kis_reconcile_order_reports_cumulative_quantity_without_synthetic_fill(
                     "tot_ccld_qty": "2",
                     "rmn_qty": "0",
                     "avg_pric": "71000",
+                    # KIS describes this aggregate as estimated expenses, not
+                    # an exact per-fill fee/tax breakdown. It must be ignored.
+                    "prsm_tlex_smtl": "1234",
                     "ord_dt": "20260513",
                     "ord_tmd": "090501",
                     "ord_st_dvsn_cd_name": "체결",
@@ -7144,9 +7147,40 @@ def test_kis_reconcile_order_reports_cumulative_quantity_without_synthetic_fill(
     assert payload["filled_at"] == payload["observed_at"]
     assert payload["fill_time_precision"] == "observed_upper_bound"
     assert payload["fill_time_source"] == "reconciliation_observed_at"
+    assert payload["economics"] == {
+        "settlement_currency": "KRW",
+        "transaction_cost": None,
+        "transaction_cost_coverage": "unknown",
+        "transaction_cost_source": "kis:inquire-daily-ccld:fee_tax_not_provided",
+        "transaction_cost_scope": "cumulative",
+    }
     assert payload["payload"]["order"]["ord_tmd"] == "090501"
     assert "fills" not in payload
     assert http_client.calls[0]["params"]["ODNO"] == "0033196600"
+
+
+def test_kis_reconcile_order_rejects_unverified_market_scope() -> None:
+    settings = Settings(
+        runtime_mode="live",
+        kis_app_key="***",
+        kis_app_secret="***",
+        kis_account_number="12345678",
+        kis_account_product_code="01",
+    )
+    http_client = KisReconcileHttpClient({})
+    adapter = KisBrokerAdapter(settings=settings, http_client=http_client)
+
+    with pytest.raises(BrokerAdapterError) as exc_info:
+        adapter.reconcile_order(
+            "top-secret-token",
+            "0033196600",
+            exchange="UNKNOWN",
+            submitted_at=datetime(2026, 5, 13, tzinfo=UTC),
+            expected_symbol="005930",
+        )
+
+    assert exc_info.value.code == "kis_reconcile_exchange_unsupported"
+    assert http_client.calls == []
 
 
 def test_kis_reconcile_order_uses_avg_prvs_as_average_fill_price() -> None:
