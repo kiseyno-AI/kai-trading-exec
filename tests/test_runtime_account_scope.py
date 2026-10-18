@@ -885,6 +885,12 @@ def test_position_truth_surfaces_manual_review_position_monitoring_gap() -> None
                 "symbols": ["OLDCO"],
             }
         ],
+        "runtime_impact": {
+            "scope": "listed_symbols_only",
+            "blocks_global_runtime_resume": False,
+            "blocks_unrelated_krx_new_buys": False,
+            "blocks_affected_position_monitoring": True,
+        },
         "message": (
             "held positions cannot be protected automatically because a usable "
             "positive broker price is unavailable"
@@ -916,6 +922,12 @@ def test_position_monitoring_alert_groups_mixed_reasons_deterministically() -> N
         if item["kind"] == "position_monitoring_manual_review_required"
     )
     assert alert["severity"] == "critical"
+    assert alert["runtime_impact"] == {
+        "scope": "listed_symbols_only",
+        "blocks_global_runtime_resume": False,
+        "blocks_unrelated_krx_new_buys": False,
+        "blocks_affected_position_monitoring": True,
+    }
     assert alert["reasons"] == [
         {
             "code": "position_monitoring_not_eligible",

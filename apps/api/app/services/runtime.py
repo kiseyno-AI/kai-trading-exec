@@ -2218,6 +2218,12 @@ def runtime_actionable_alerts_payload(
                     "count": manual_review_count,
                     "symbols": manual_review_symbols,
                     "reasons": structured_reasons,
+                    "runtime_impact": {
+                        "scope": "listed_symbols_only",
+                        "blocks_global_runtime_resume": False,
+                        "blocks_unrelated_krx_new_buys": False,
+                        "blocks_affected_position_monitoring": True,
+                    },
                     "message": message,
                 }
             )

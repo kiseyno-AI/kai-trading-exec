@@ -581,7 +581,7 @@ def test_transiently_unpriced_supported_us_holding_is_not_quarantined() -> None:
     engine.dispose()
 
 
-def test_manual_review_us_holding_stays_out_of_monitoring_despite_plan_history() -> None:
+def test_manual_review_us_holding_stays_out_without_removing_krx_monitoring() -> None:
     settings, engine, db = _session()
     _add_item(
         db,
@@ -589,6 +589,19 @@ def test_manual_review_us_holding_stays_out_of_monitoring_despite_plan_history()
         asset_class="us_equity",
         risk_context={"exchange": "NASD"},
     )
+    _add_item(
+        db,
+        symbol="005930",
+        asset_class="stock",
+        risk_context={"exchange": "KRX"},
+    )
+    domestic_item = db.scalar(
+        select(ExecutionPlanItem).where(ExecutionPlanItem.symbol == "005930")
+    )
+    assert domestic_item is not None
+    assert domestic_item.plan is not None
+    domestic_item.status = "watch_monitoring_active"
+    domestic_item.plan.market_date = datetime(2026, 9, 15).date()
     identity = build_position_identity(
         settings=settings,
         provider="kis",
@@ -619,7 +632,8 @@ def test_manual_review_us_holding_stays_out_of_monitoring_despite_plan_history()
     assert monitoring.list_autonomous_monitoring_symbols(
         settings=settings,
         db=db,
-    ) == []
+        current_market_date=datetime(2026, 9, 15).date(),
+    ) == ["005930"]
     historical_item = db.scalar(
         select(ExecutionPlanItem).where(ExecutionPlanItem.symbol == "OLDCO")
     )

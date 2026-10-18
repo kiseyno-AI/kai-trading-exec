@@ -21229,7 +21229,8 @@ def test_autonomous_monitoring_loop_retries_pending_dispatch_after_restart_with_
         wait_for(
             lambda: len(restarted_adapter.order_calls) == 1
             and restarted_app.state.autonomous_runtime.snapshot()["monitoring"]["last_cycle"]
-            is not None
+            is not None,
+            timeout_seconds=5.0,
         )
 
         runtime_status = restarted_client.get("/runtime/status")
@@ -22006,7 +22007,7 @@ def test_kis_us_live_market_context_rejects_conflicting_response_identity() -> N
         "trusted",
     ],
 )
-def test_live_automated_krx_buy_requires_calendar_and_exchange_orderbook_at_boundary(
+def test_manual_review_us_holding_does_not_override_krx_buy_boundary_guards(
     calendar_open: bool | None,
     freshness_source: str,
     ask: Decimal | None,
@@ -22068,6 +22069,31 @@ def test_live_automated_krx_buy_requires_calendar_and_exchange_orderbook_at_boun
         json={"actor": "ops", "source": "test", "reason": "run durable state"},
     ).status_code == 200
     with app.state.db_session_factory() as db:
+        us_identity = build_position_identity(
+            settings=settings,
+            provider="kis",
+            exchange="NASD",
+        )
+        db.add(
+            ExecutionPosition(
+                mode="live",
+                provider=us_identity.provider,
+                account_scope=us_identity.account_scope,
+                exchange=us_identity.exchange,
+                symbol="WWBLCM",
+                quantity=75,
+                average_price=None,
+                updated_from="broker_snapshot",
+                last_reconciled_at=observed_at,
+                raw_payload={
+                    "_position_sync": {
+                        "monitoring_eligible": False,
+                        "manual_review_required": True,
+                        "manual_review_reason": "unpriced_overseas_holding",
+                    }
+                },
+            )
+        )
         case_key = f"{calendar_open}-{freshness_source[:3]}-{ask or 'none'}"
         item = ExecutionPlanItem(
             id=f"boundary-{case_key}"[:36],

@@ -102,6 +102,12 @@ manual-review reason by symbol and states specifically that a usable positive
 broker price is unavailable. A separately reported fresh broker-account
 snapshot does not clear the latch; only the reconciliation recovery evidence
 defined by the API contract can make the position monitoring-eligible again.
+This latch is symbol-scoped. Its actionable alert reports
+`runtime_impact.scope=listed_symbols_only`, does not block global runtime resume,
+and does not itself block unrelated KRX new buys. Separate route, account,
+quote, session, and risk gates remain authoritative. A deployment must use the
+durable `safety.paused` and `safety.kill_switch_enabled` controls for global
+admission; it must not promote this position alert into a route-wide pause.
 
 ## Core-to-Exec handoff and recovery
 
