@@ -7467,9 +7467,24 @@ def test_fast_runtime_status_surfaces_manual_review_position_monitoring_gap() ->
         )
         session.commit()
 
-    payload = TestClient(app).get("/runtime/status").json()
+    client = TestClient(app)
+    resumed = client.post(
+        "/controls/resume",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "unrelated domestic entries remain eligible",
+        },
+    )
+    assert resumed.status_code == 200
+
+    payload = client.get("/runtime/status").json()
 
     assert payload["freshness"]["summary_source"] == "fast_autonomous_runtime_snapshot"
+    assert payload["ready"] is True
+    assert payload["readiness"]["reasons"] == []
+    assert payload["safety"]["paused"] is False
+    assert payload["safety"]["automated_buy_submission_allowed"] is True
     assert payload["freshness"]["position_truth"]["manual_review_count"] == 1
     assert payload["freshness"]["position_truth"]["manual_review_symbols"] == [
         "OLDCO"
@@ -7481,6 +7496,12 @@ def test_fast_runtime_status_surfaces_manual_review_position_monitoring_gap() ->
     )
     assert alert["severity"] == "critical"
     assert alert["symbols"] == ["OLDCO"]
+    assert alert["runtime_impact"] == {
+        "scope": "listed_symbols_only",
+        "blocks_global_runtime_resume": False,
+        "blocks_unrelated_krx_new_buys": False,
+        "blocks_affected_position_monitoring": True,
+    }
     assert alert["reasons"] == [
         {
             "code": "unpriced_overseas_holding",

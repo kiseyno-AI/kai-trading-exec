@@ -105,6 +105,13 @@ Current foundation response includes:
   affected position is `unpriced_overseas_holding`, the message states that a
   usable positive broker price is unavailable instead of implying that the
   already-attributed execution route is unknown.
+  `runtime_impact` makes the safety boundary explicit: the alert reports a
+  monitoring/protection gap for the listed positions only. The alert itself
+  does not block global runtime resume or unrelated KRX new buys; separate route,
+  account, quote, session, and risk gates remain authoritative for every order.
+  Operators and deployment automation must not infer a global pause
+  requirement from `severity=critical`; pause and kill state remain
+  authoritative in `safety`.
 
 ### `GET /runtime/alpaca-crypto`
 
