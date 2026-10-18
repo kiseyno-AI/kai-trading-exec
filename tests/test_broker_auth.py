@@ -21229,7 +21229,8 @@ def test_autonomous_monitoring_loop_retries_pending_dispatch_after_restart_with_
         wait_for(
             lambda: len(restarted_adapter.order_calls) == 1
             and restarted_app.state.autonomous_runtime.snapshot()["monitoring"]["last_cycle"]
-            is not None
+            is not None,
+            timeout_seconds=5.0,
         )
 
         runtime_status = restarted_client.get("/runtime/status")
