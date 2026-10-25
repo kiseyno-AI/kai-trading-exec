@@ -1,8 +1,9 @@
 import json
-from datetime import date
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from urllib.error import URLError
 
+import pytest
 from sqlalchemy import inspect
 
 from app.core.config import Settings
@@ -34,6 +35,43 @@ def _settings() -> Settings:
     )
 
 
+def _observation_item(symbol: str) -> dict[str, object]:
+    return {
+        "symbol": symbol,
+        "monitoring_statuses": ["signal_wait_observation_only"],
+        "exec_monitoring_active": False,
+        "exec_agent_approved": False,
+        "planned_intents": [],
+        "tactical_actions": [],
+        "handoff_intents": [],
+        "trigger_price": None,
+        "chase_limit_price": None,
+        "exec_runtime_exclusion_reason": "observation_only_no_order_authority",
+    }
+
+
+def _observation_payload(
+    *,
+    now: datetime,
+    symbols: list[str] | None = None,
+) -> dict[str, object]:
+    symbols = symbols or ["032080"]
+    return {
+        "market_date": "2026-10-26",
+        "source_coverage": {"membership_complete": True},
+        "freshness": {
+            "market_date": "2026-10-26",
+            "generated_at": now.isoformat(),
+        },
+        "realtime_subscription": {
+            "desired_symbols": list(symbols),
+            "observation_only_symbols": list(symbols),
+            "max_subscriptions": 40,
+        },
+        "items": [_observation_item(symbol) for symbol in symbols],
+    }
+
+
 def test_core_monitoring_symbol_read_uses_cached_handoff(monkeypatch) -> None:
     monitoring._CORE_DESIRED_MONITORING_SYMBOL_CACHE.clear()
     requested_urls: list[str] = []
@@ -51,6 +89,182 @@ def test_core_monitoring_symbol_read_uses_cached_handoff(monkeypatch) -> None:
 
     assert symbols == ["005930", "000660"]
     assert requested_urls == ["http://core.test/execution/runtime/monitored-symbols?refresh=false"]
+
+
+def test_core_observation_only_handoff_requires_fresh_same_day_non_actionable_items(
+    monkeypatch,
+) -> None:
+    monitoring._CORE_DESIRED_MONITORING_SYMBOL_CACHE.clear()
+    now = datetime(2026, 10, 26, 0, 1, tzinfo=UTC)
+    payload = _observation_payload(now=now)
+    payload["freshness"].update(
+        generated_at=(now - timedelta(seconds=120)).isoformat(),
+        status="stale",
+    )
+    payload["realtime_subscription"]["desired_symbols"] = [
+        "035420",
+        "032080",
+        "005930",
+    ]
+    monkeypatch.setattr(
+        monitoring,
+        "urlopen",
+        lambda *_args, **_kwargs: _CoreMonitoringResponse(payload),
+    )
+
+    handoff = monitoring._load_core_monitoring_symbol_handoff(
+        settings=_settings(),
+        observed_at=now,
+    )
+
+    assert list(handoff.desired_symbols) == ["035420", "032080", "005930"]
+    assert list(handoff.observation_only_symbols) == ["032080"]
+
+
+def test_environment_priority_never_becomes_observation_only_authority(
+    monkeypatch,
+) -> None:
+    now = datetime(2026, 10, 26, 0, 1, tzinfo=UTC)
+    monkeypatch.setenv("KAI_EXEC_MONITORING_SYMBOL_PRIORITY", "111111,222222")
+    monkeypatch.setattr(
+        monitoring,
+        "urlopen",
+        lambda *_args, **_kwargs: _CoreMonitoringResponse(
+            _observation_payload(now=now)
+        ),
+    )
+
+    handoff = monitoring._load_core_monitoring_symbol_handoff(
+        settings=_settings(),
+        observed_at=now,
+    )
+
+    assert list(handoff.desired_symbols) == ["111111", "222222"]
+    assert list(handoff.observation_only_symbols) == ["032080"]
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_desired"),
+    [
+        (
+            lambda payload, now: payload["freshness"].update(
+                generated_at=(now - timedelta(seconds=301)).isoformat()
+            ),
+            ["032080"],
+        ),
+        (
+            lambda payload, now: payload["freshness"].update(
+                generated_at=(now + timedelta(microseconds=1)).isoformat()
+            ),
+            ["032080"],
+        ),
+        (
+            lambda payload, now: payload.update(market_date="2026-10-25"),
+            ["032080"],
+        ),
+        (
+            lambda payload, now: payload["source_coverage"].update(
+                membership_complete=False
+            ),
+            ["032080"],
+        ),
+        (
+            lambda payload, now: payload["realtime_subscription"].update(
+                observation_only_symbols=["005930"]
+            ),
+            ["032080"],
+        ),
+        (
+            lambda payload, now: payload["items"][0].update(
+                monitoring_statuses=["watch_monitoring_active"]
+            ),
+            ["032080"],
+        ),
+        (
+            lambda payload, now: payload["realtime_subscription"].update(
+                observation_only_symbols=["１２３４５６"]
+            ),
+            ["032080"],
+        ),
+    ],
+)
+def test_core_observation_only_handoff_fails_closed_on_invalid_contract(
+    monkeypatch,
+    mutation,
+    expected_desired,
+) -> None:
+    now = datetime(2026, 10, 26, 0, 1, tzinfo=UTC)
+    payload = _observation_payload(now=now)
+    mutation(payload, now)
+    monkeypatch.setattr(
+        monitoring,
+        "urlopen",
+        lambda *_args, **_kwargs: _CoreMonitoringResponse(payload),
+    )
+
+    handoff = monitoring._load_core_monitoring_symbol_handoff(
+        settings=_settings(),
+        observed_at=now,
+    )
+
+    assert list(handoff.desired_symbols) == expected_desired
+    assert list(handoff.observation_only_symbols) == []
+
+
+def test_core_observation_only_handoff_loader_failure_keeps_priority_only(
+    monkeypatch,
+) -> None:
+    monitoring._CORE_DESIRED_MONITORING_SYMBOL_CACHE["http://core.test"] = (
+        100.0,
+        ("032080",),
+    )
+    monkeypatch.setattr(monitoring.time, "monotonic", lambda: 100.0)
+    monkeypatch.setattr(
+        monitoring,
+        "urlopen",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(URLError("offline")),
+    )
+
+    handoff = monitoring._load_core_monitoring_symbol_handoff(
+        settings=_settings(),
+        observed_at=datetime(2026, 10, 26, 0, 1, tzinfo=UTC),
+    )
+
+    assert list(handoff.desired_symbols) == ["032080"]
+    assert list(handoff.observation_only_symbols) == []
+
+
+def test_core_observation_universe_is_not_rejected_by_quote_batch_size(
+    monkeypatch,
+) -> None:
+    now = datetime(2026, 10, 26, 0, 1, tzinfo=UTC)
+    symbols = [
+        "012030",
+        "032080",
+        "033560",
+        "070590",
+        "079940",
+        "086060",
+        "089890",
+        "323350",
+        "398120",
+    ]
+    payload = _observation_payload(now=now, symbols=symbols)
+    monkeypatch.setattr(
+        monitoring,
+        "urlopen",
+        lambda *_args, **_kwargs: _CoreMonitoringResponse(payload),
+    )
+    settings = _settings().model_copy(
+        update={"monitoring_max_symbols_per_cycle": 6}
+    )
+
+    handoff = monitoring._load_core_monitoring_symbol_handoff(
+        settings=settings,
+        observed_at=now,
+    )
+
+    assert list(handoff.observation_only_symbols) == symbols
 
 
 def test_core_monitoring_symbol_read_uses_recent_success_on_transient_failure(monkeypatch) -> None:
